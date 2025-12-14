@@ -228,9 +228,19 @@ exception_handler:
     b       hang
 
 /*
- * IRQ handler - save context, call Rust, restore and return
+ * IRQ handler - check if from user mode and handle accordingly
  */
 irq_handler:
+    /* Check if IRQ came from EL0 (user mode) by examining SPSR_EL1.M[3:0] */
+    mrs     x9, spsr_el1
+    and     x9, x9, #0xf            // Extract M[3:0] - exception level
+    cbnz    x9, irq_from_kernel     // If not 0, came from EL1 (kernel)
+    b       irq_from_user           // Came from EL0 (user)
+
+/*
+ * IRQ from kernel mode - simple save/restore on kernel stack
+ */
+irq_from_kernel:
     /* Save all caller-saved registers */
     stp     x29, x30, [sp, #-16]!
     stp     x27, x28, [sp, #-16]!
@@ -249,7 +259,8 @@ irq_handler:
     stp     x1, x2, [sp, #-16]!
     str     x0, [sp, #-8]!
 
-    /* Call Rust IRQ handler */
+    /* Call Rust IRQ handler (no preemption for kernel IRQs) */
+    mov     x0, #0                  // from_user = false
     bl      irq_handler_rust
 
     /* Restore registers */
@@ -271,6 +282,115 @@ irq_handler:
     ldp     x29, x30, [sp], #16
 
     /* Return from exception */
+    eret
+
+/*
+ * IRQ from user mode - save to trap frame, potentially switch tasks
+ * Similar to svc_handler but for asynchronous preemption
+ */
+irq_from_user:
+    /*
+     * CRITICAL: Switch TTBR0 to kernel identity mapping BEFORE any stack access!
+     * Use TPIDR_EL1 as scratch to save x9.
+     */
+    msr     tpidr_el1, x9           // Save original x9 to scratch register
+
+    /* Switch to kernel TTBR0 */
+    adrp    x9, KERNEL_TTBR0
+    ldr     x9, [x9, :lo12:KERNEL_TTBR0]
+    msr     ttbr0_el1, x9
+    isb
+
+    /* Now kernel stack is accessible - save x10 to stack */
+    str     x10, [sp, #-8]!
+
+    /* Get pointer to current task's trap frame */
+    adrp    x9, CURRENT_TRAP_FRAME
+    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+
+    /* Save all general purpose registers to trap frame */
+    stp     x0, x1, [x9, #0]        // x0=0, x1=8
+    stp     x2, x3, [x9, #16]       // x2=16, x3=24
+    stp     x4, x5, [x9, #32]       // x4=32, x5=40
+    stp     x6, x7, [x9, #48]       // x6=48, x7=56
+    str     x8, [x9, #64]           // x8=64
+    /* Get original x9 from TPIDR_EL1, original x10 from stack */
+    mrs     x10, tpidr_el1          // x10 = original x9
+    ldr     x11, [sp], #8           // x11 = original x10
+    stp     x10, x11, [x9, #72]     // x9=72, x10=80
+    str     x11, [x9, #88]          // x11=88
+    stp     x12, x13, [x9, #96]     // x12=96, x13=104
+    stp     x14, x15, [x9, #112]    // x14=112, x15=120
+    stp     x16, x17, [x9, #128]    // x16=128, x17=136
+    stp     x18, x19, [x9, #144]    // x18=144, x19=152
+    stp     x20, x21, [x9, #160]    // x20=160, x21=168
+    stp     x22, x23, [x9, #176]    // x22=176, x23=184
+    stp     x24, x25, [x9, #192]    // x24=192, x25=200
+    stp     x26, x27, [x9, #208]    // x26=208, x27=216
+    stp     x28, x29, [x9, #224]    // x28=224, x29=232
+    str     x30, [x9, #240]         // x30=240
+
+    /* Save special registers */
+    mrs     x10, sp_el0
+    mrs     x11, elr_el1
+    mrs     x12, spsr_el1
+    str     x10, [x9, #248]         // sp_el0
+    str     x11, [x9, #256]         // elr_el1
+    str     x12, [x9, #264]         // spsr_el1
+
+    /* Call Rust IRQ handler with from_user = true */
+    mov     x0, #1                  // from_user = true
+    bl      irq_handler_rust
+
+    /* irq_handler_rust may have scheduled a different task */
+    /* Reload CURRENT_TRAP_FRAME (may have changed!) */
+    adrp    x9, CURRENT_TRAP_FRAME
+    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+
+    /* Restore special registers from trap frame */
+    ldr     x10, [x9, #248]         // sp_el0
+    ldr     x11, [x9, #256]         // elr_el1
+    ldr     x12, [x9, #264]         // spsr_el1
+    msr     sp_el0, x10
+    msr     elr_el1, x11
+    msr     spsr_el1, x12
+
+    /* Load CURRENT_TTBR0 (may be different task's address space) */
+    adrp    x10, CURRENT_TTBR0
+    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    msr     ttbr0_el1, x10
+    isb
+    tlbi    vmalle1
+    dsb     sy
+    isb
+
+    /* Convert x9 (trap frame pointer) from physical to TTBR1 virtual address */
+    movz    x10, #0xFFFF, lsl #48
+    orr     x9, x9, x10
+
+    /* Restore all general purpose registers from trap frame */
+    ldp     x0, x1, [x9, #0]
+    ldp     x2, x3, [x9, #16]
+    ldp     x4, x5, [x9, #32]
+    ldp     x6, x7, [x9, #48]
+    ldr     x8, [x9, #64]
+    /* Skip x9 for now, load x10-x30 */
+    ldr     x10, [x9, #80]
+    ldr     x11, [x9, #88]
+    ldp     x12, x13, [x9, #96]
+    ldp     x14, x15, [x9, #112]
+    ldp     x16, x17, [x9, #128]
+    ldp     x18, x19, [x9, #144]
+    ldp     x20, x21, [x9, #160]
+    ldp     x22, x23, [x9, #176]
+    ldp     x24, x25, [x9, #192]
+    ldp     x26, x27, [x9, #208]
+    ldp     x28, x29, [x9, #224]
+    ldr     x30, [x9, #240]
+    /* Finally restore x9 */
+    ldr     x9, [x9, #72]
+
+    /* Return to user mode (possibly different task!) */
     eret
 
 /*

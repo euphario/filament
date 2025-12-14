@@ -412,12 +412,11 @@ pub fn get_test_elf() -> &'static [u8] {
 // Testing
 // ============================================================================
 
-/// A minimal test ELF binary (AArch64)
-/// This is a hand-crafted ELF that:
-/// 1. Writes "Hi!" to debug console via syscall
-/// 2. Exits with code 42
+/// A minimal test ELF binary (AArch64) - LOOPING version for preemption testing
+/// This program loops forever, printing 'A' periodically.
+/// The timer preemption should switch between processes.
 ///
-/// Entry point at 0x10000
+/// Entry point at 0x40010000
 const TEST_ELF: &[u8] = &[
     // ELF Header (64 bytes)
     0x7f, b'E', b'L', b'F',  // Magic
@@ -429,7 +428,7 @@ const TEST_ELF: &[u8] = &[
     2, 0,                     // Type: ET_EXEC
     183, 0,                   // Machine: AArch64
     1, 0, 0, 0,              // Version
-    0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // Entry: 0x40010000 (in DRAM region, not device)
+    0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // Entry: 0x40010000
     0x40, 0, 0, 0, 0, 0, 0, 0,           // PHoff: 64
     0, 0, 0, 0, 0, 0, 0, 0,              // SHoff: 0
     0, 0, 0, 0,                          // Flags
@@ -446,30 +445,34 @@ const TEST_ELF: &[u8] = &[
     0x78, 0, 0, 0, 0, 0, 0, 0,           // Offset: 120 (where code starts)
     0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // VAddr: 0x40010000
     0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // PAddr: 0x40010000
-    0x20, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 32 bytes
-    0x20, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 32 bytes
+    0x24, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 36 bytes
+    0x24, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 36 bytes
     0x00, 0x10, 0, 0, 0, 0, 0, 0,        // Align: 0x1000
 
     // Code starts at offset 120 (0x78)
-    // mov x8, #1       ; syscall = DebugWrite
+    // loop:
+    //   mov x8, #1       ; syscall = DebugWrite
     0x28, 0x00, 0x80, 0xd2,
-    // adr x0, msg      ; buffer = msg (PC-relative, +24 bytes to 0x1001c)
-    0xc0, 0x00, 0x00, 0x10,
-    // mov x1, #3       ; len = 3
-    0x61, 0x00, 0x80, 0xd2,
-    // svc #0           ; syscall
+    //   adr x0, char     ; buffer = char (PC-relative, +28 bytes)
+    0xe0, 0x00, 0x00, 0x10,
+    //   mov x1, #1       ; len = 1
+    0x21, 0x00, 0x80, 0xd2,
+    //   svc #0           ; syscall
     0x01, 0x00, 0x00, 0xd4,
-    // mov x8, #0       ; syscall = Exit
-    0x08, 0x00, 0x80, 0xd2,
-    // mov x0, #42      ; code = 42
-    0x40, 0x05, 0x80, 0xd2,
-    // svc #0           ; syscall
-    0x01, 0x00, 0x00, 0xd4,
-    // msg: "Hi!\n"
-    b'H', b'i', b'!', b'\n',
+    //   mov x9, #0x40000 ; delay counter (~262K iterations)
+    0x89, 0x00, 0xa0, 0xd2,
+    // wait:
+    //   sub x9, x9, #1
+    0x29, 0x05, 0x00, 0xd1,
+    //   cbnz x9, wait    ; loop if not zero
+    0xe9, 0xff, 0xff, 0xb5,
+    //   b loop           ; back to start
+    0xf9, 0xff, 0xff, 0x17,
+    // char: 'A'
+    b'A', 0, 0, 0,           // Padded to 4 bytes
 ];
 
-/// Second test ELF - prints "Yo!" and exits with code 7
+/// Second test ELF - LOOPING version, prints 'B' periodically
 /// Entry point at 0x40020000 (different from first ELF)
 const TEST_ELF2: &[u8] = &[
     // ELF Header (64 bytes)
@@ -499,27 +502,31 @@ const TEST_ELF2: &[u8] = &[
     0x78, 0, 0, 0, 0, 0, 0, 0,           // Offset: 120 (where code starts)
     0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // VAddr: 0x40020000
     0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // PAddr: 0x40020000
-    0x20, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 32 bytes
-    0x20, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 32 bytes
+    0x24, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 36 bytes
+    0x24, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 36 bytes
     0x00, 0x10, 0, 0, 0, 0, 0, 0,        // Align: 0x1000
 
     // Code starts at offset 120 (0x78)
-    // mov x8, #1       ; syscall = DebugWrite
+    // loop:
+    //   mov x8, #1       ; syscall = DebugWrite
     0x28, 0x00, 0x80, 0xd2,
-    // adr x0, msg      ; buffer = msg (PC-relative, +24 bytes)
-    0xc0, 0x00, 0x00, 0x10,
-    // mov x1, #3       ; len = 3
-    0x61, 0x00, 0x80, 0xd2,
-    // svc #0           ; syscall
+    //   adr x0, char     ; buffer = char (PC-relative, +28 bytes)
+    0xe0, 0x00, 0x00, 0x10,
+    //   mov x1, #1       ; len = 1
+    0x21, 0x00, 0x80, 0xd2,
+    //   svc #0           ; syscall
     0x01, 0x00, 0x00, 0xd4,
-    // mov x8, #0       ; syscall = Exit
-    0x08, 0x00, 0x80, 0xd2,
-    // mov x0, #7       ; code = 7
-    0xe0, 0x00, 0x80, 0xd2,
-    // svc #0           ; syscall
-    0x01, 0x00, 0x00, 0xd4,
-    // msg: "Yo!\n"
-    b'Y', b'o', b'!', b'\n',
+    //   mov x9, #0x40000 ; delay counter (~262K iterations)
+    0x89, 0x00, 0xa0, 0xd2,
+    // wait:
+    //   sub x9, x9, #1
+    0x29, 0x05, 0x00, 0xd1,
+    //   cbnz x9, wait    ; loop if not zero
+    0xe9, 0xff, 0xff, 0xb5,
+    //   b loop           ; back to start
+    0xf9, 0xff, 0xff, 0x17,
+    // char: 'B'
+    b'B', 0, 0, 0,           // Padded to 4 bytes
 ];
 
 /// Get the second test ELF binary

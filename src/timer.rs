@@ -17,6 +17,8 @@ mod ctl {
 pub struct Timer {
     frequency: u64,
     tick_count: u64,
+    /// Current time slice in milliseconds
+    time_slice_ms: u64,
 }
 
 impl Timer {
@@ -24,6 +26,7 @@ impl Timer {
         Self {
             frequency: 0,
             tick_count: 0,
+            time_slice_ms: 10, // Default 10ms time slice
         }
     }
 
@@ -40,7 +43,9 @@ impl Timer {
     }
 
     /// Start the timer with an interval in milliseconds
-    pub fn start(&self, interval_ms: u64) {
+    pub fn start(&mut self, interval_ms: u64) {
+        self.time_slice_ms = interval_ms;
+
         // Calculate ticks for the interval
         let ticks = (self.frequency * interval_ms) / 1000;
 
@@ -63,8 +68,8 @@ impl Timer {
         if (ctl & ctl::ISTATUS) != 0 {
             self.tick_count += 1;
 
-            // Reload timer for next interval (1 second)
-            let ticks = self.frequency; // 1 second worth of ticks
+            // Reload timer for next time slice
+            let ticks = (self.frequency * self.time_slice_ms) / 1000;
             Self::write_tval(ticks);
 
             // Re-enable (clearing ISTATUS implicitly)
@@ -144,7 +149,7 @@ pub fn init() {
 /// Start timer with interval in ms
 pub fn start(interval_ms: u64) {
     unsafe {
-        (*core::ptr::addr_of!(TIMER)).start(interval_ms);
+        (*core::ptr::addr_of_mut!(TIMER)).start(interval_ms);
     }
 }
 

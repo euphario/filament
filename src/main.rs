@@ -192,6 +192,10 @@ pub extern "C" fn kmain() -> ! {
             core::arch::asm!("mrs {}, vbar_el1", out(reg) vbar);
         }
         println!("  VBAR_EL1:  0x{:016x}", vbar);
+
+        // Start timer for preemption (10ms time slice)
+        timer::start(10);
+        println!("  Timer started: 10ms time slice");
         println!();
 
         // Enter user mode - scheduler will switch between processes
@@ -207,8 +211,9 @@ pub extern "C" fn kmain() -> ! {
 }
 
 /// IRQ handler called from assembly
+/// from_user: true if IRQ came from user mode (EL0), false if from kernel (EL1)
 #[no_mangle]
-pub extern "C" fn irq_handler_rust() {
+pub extern "C" fn irq_handler_rust(from_user: u64) {
     // Acknowledge the interrupt from GIC
     let irq = gic::ack_irq();
 
@@ -220,10 +225,35 @@ pub extern "C" fn irq_handler_rust() {
     // Handle timer interrupt (PPI 30)
     if irq == 30 {
         if timer::handle_irq() {
-            let ticks = timer::ticks();
-            print!("Tick {} ", ticks);
-            if ticks % 10 == 0 {
-                println!(); // Newline every 10 ticks
+            // Timer tick - potentially preempt user process
+            if from_user != 0 {
+                // Preempt: schedule next task
+                unsafe {
+                    let sched = task::scheduler();
+
+                    // Mark current as ready (it was running)
+                    if let Some(ref mut current) = sched.tasks[sched.current] {
+                        if current.state == task::TaskState::Running {
+                            current.state = task::TaskState::Ready;
+                        }
+                    }
+
+                    // Find next task
+                    if let Some(next_slot) = sched.schedule() {
+                        if next_slot != sched.current {
+                            sched.current = next_slot;
+                            if let Some(ref mut next_task) = sched.tasks[next_slot] {
+                                next_task.state = task::TaskState::Running;
+                            }
+                            task::update_current_task_globals();
+                        } else {
+                            // Same task, mark as running again
+                            if let Some(ref mut current) = sched.tasks[sched.current] {
+                                current.state = task::TaskState::Running;
+                            }
+                        }
+                    }
+                }
             }
         }
     } else {
