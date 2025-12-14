@@ -1,0 +1,641 @@
+//! Task Management and Context Switching
+//!
+//! Provides task structures and context switching for the microkernel.
+//! Each task has its own saved CPU state and address space.
+
+use crate::addrspace::AddressSpace;
+use crate::pmm;
+use crate::println;
+
+/// Task states
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TaskState {
+    /// Task is ready to run
+    Ready = 0,
+    /// Task is currently running
+    Running = 1,
+    /// Task is blocked (waiting for IPC, etc.)
+    Blocked = 2,
+    /// Task has exited
+    Terminated = 3,
+}
+
+/// Trap frame saved on kernel stack during exceptions
+/// Must match the layout in boot.S exactly!
+/// This captures the full user-mode state.
+#[repr(C)]
+pub struct TrapFrame {
+    // General purpose registers (saved in reverse order by stp)
+    pub x0: u64,
+    pub x1: u64,
+    pub x2: u64,
+    pub x3: u64,
+    pub x4: u64,
+    pub x5: u64,
+    pub x6: u64,
+    pub x7: u64,
+    pub x8: u64,
+    pub x9: u64,
+    pub x10: u64,
+    pub x11: u64,
+    pub x12: u64,
+    pub x13: u64,
+    pub x14: u64,
+    pub x15: u64,
+    pub x16: u64,
+    pub x17: u64,
+    pub x18: u64,
+    pub x19: u64,
+    pub x20: u64,
+    pub x21: u64,
+    pub x22: u64,
+    pub x23: u64,
+    pub x24: u64,
+    pub x25: u64,
+    pub x26: u64,
+    pub x27: u64,
+    pub x28: u64,
+    pub x29: u64,   // Frame pointer
+    pub x30: u64,   // Link register
+    // Special registers
+    pub sp_el0: u64,   // User stack pointer
+    pub elr_el1: u64,  // Exception return address (user PC)
+    pub spsr_el1: u64, // Saved program status
+}
+
+impl TrapFrame {
+    pub const fn new() -> Self {
+        Self {
+            x0: 0, x1: 0, x2: 0, x3: 0, x4: 0, x5: 0, x6: 0, x7: 0,
+            x8: 0, x9: 0, x10: 0, x11: 0, x12: 0, x13: 0, x14: 0, x15: 0,
+            x16: 0, x17: 0, x18: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
+            x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
+            sp_el0: 0, elr_el1: 0, spsr_el1: 0,
+        }
+    }
+
+    /// Initialize for user mode entry
+    /// SPSR: EL0t (user mode), all interrupts enabled
+    pub fn init_user(&mut self, entry: u64, user_stack: u64) {
+        self.elr_el1 = entry;
+        self.sp_el0 = user_stack;
+        // SPSR for EL0t: M[4:0] = 0b00000 (EL0t), DAIF = 0 (interrupts enabled)
+        self.spsr_el1 = 0;
+    }
+}
+
+/// Saved CPU context for kernel-to-kernel context switching
+/// Used for kernel threads (not user processes)
+#[repr(C)]
+pub struct CpuContext {
+    // Callee-saved registers (x19-x30)
+    pub x19: u64,
+    pub x20: u64,
+    pub x21: u64,
+    pub x22: u64,
+    pub x23: u64,
+    pub x24: u64,
+    pub x25: u64,
+    pub x26: u64,
+    pub x27: u64,
+    pub x28: u64,
+    pub x29: u64,  // Frame pointer
+    pub x30: u64,  // Link register (return address)
+    pub sp: u64,   // Stack pointer
+    pub pc: u64,   // Program counter (entry point for new tasks)
+}
+
+impl CpuContext {
+    pub const fn new() -> Self {
+        Self {
+            x19: 0, x20: 0, x21: 0, x22: 0,
+            x23: 0, x24: 0, x25: 0, x26: 0,
+            x27: 0, x28: 0, x29: 0, x30: 0,
+            sp: 0, pc: 0,
+        }
+    }
+}
+
+/// Task ID type
+pub type TaskId = u32;
+
+/// Stack size for kernel tasks (16KB)
+pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
+
+/// Maximum number of tasks
+pub const MAX_TASKS: usize = 16;
+
+/// Task Control Block
+pub struct Task {
+    /// Unique task ID
+    pub id: TaskId,
+    /// Current state
+    pub state: TaskState,
+    /// Saved CPU context (for kernel threads)
+    pub context: CpuContext,
+    /// Saved trap frame (for user processes) - at top of kernel stack
+    pub trap_frame: TrapFrame,
+    /// Kernel stack base (physical address)
+    pub kernel_stack: u64,
+    /// Kernel stack size
+    pub kernel_stack_size: usize,
+    /// User address space (None for kernel tasks)
+    pub address_space: Option<AddressSpace>,
+    /// Is this a user-mode task?
+    pub is_user: bool,
+    /// Task name for debugging
+    pub name: [u8; 16],
+}
+
+impl Task {
+    /// Create a new kernel task
+    pub fn new_kernel(id: TaskId, entry: fn() -> !, name: &str) -> Option<Self> {
+        // Allocate kernel stack (4 pages = 16KB)
+        let stack_pages = KERNEL_STACK_SIZE / 4096;
+        let stack_base = pmm::alloc_pages(stack_pages)?;
+
+        // Stack grows down, so SP starts at top
+        let stack_top = stack_base + KERNEL_STACK_SIZE;
+
+        // Initialize context
+        let mut context = CpuContext::new();
+        context.sp = stack_top as u64;
+        context.pc = entry as u64;
+        context.x30 = entry as u64;  // Return address for initial ret
+
+        // Copy name
+        let mut task_name = [0u8; 16];
+        let name_bytes = name.as_bytes();
+        let copy_len = core::cmp::min(name_bytes.len(), 15);
+        task_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+        Some(Self {
+            id,
+            state: TaskState::Ready,
+            context,
+            trap_frame: TrapFrame::new(),
+            kernel_stack: stack_base as u64,
+            kernel_stack_size: KERNEL_STACK_SIZE,
+            address_space: None,
+            is_user: false,
+            name: task_name,
+        })
+    }
+
+    /// Create a new user task with its own address space
+    /// Entry point and user stack must be set separately via set_user_entry()
+    pub fn new_user(id: TaskId, name: &str) -> Option<Self> {
+        // Allocate kernel stack for syscall handling
+        let stack_pages = KERNEL_STACK_SIZE / 4096;
+        let stack_base = pmm::alloc_pages(stack_pages)?;
+
+        // Create address space
+        let address_space = AddressSpace::new()?;
+
+        let context = CpuContext::new();
+        let trap_frame = TrapFrame::new();
+
+        let mut task_name = [0u8; 16];
+        let name_bytes = name.as_bytes();
+        let copy_len = core::cmp::min(name_bytes.len(), 15);
+        task_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+        Some(Self {
+            id,
+            state: TaskState::Ready,
+            context,
+            trap_frame,
+            kernel_stack: stack_base as u64,
+            kernel_stack_size: KERNEL_STACK_SIZE,
+            address_space: Some(address_space),
+            is_user: true,
+            name: task_name,
+        })
+    }
+
+    /// Set user-mode entry point and stack
+    pub fn set_user_entry(&mut self, entry: u64, user_stack: u64) {
+        self.trap_frame.init_user(entry, user_stack);
+    }
+
+    /// Get task name as string
+    pub fn name_str(&self) -> &str {
+        let len = self.name.iter().position(|&c| c == 0).unwrap_or(16);
+        core::str::from_utf8(&self.name[..len]).unwrap_or("???")
+    }
+
+    /// Get mutable reference to address space
+    pub fn address_space_mut(&mut self) -> Option<&mut AddressSpace> {
+        self.address_space.as_mut()
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        // Free kernel stack
+        let stack_pages = self.kernel_stack_size / 4096;
+        pmm::free_pages(self.kernel_stack as usize, stack_pages);
+        // address_space is automatically dropped
+    }
+}
+
+// Context switch assembly for kernel threads
+// Switches from current task to next task
+// Arguments:
+//   x0 = pointer to current task's CpuContext
+//   x1 = pointer to next task's CpuContext
+core::arch::global_asm!(r#"
+.global context_switch
+.type context_switch, @function
+context_switch:
+    // Save current task's callee-saved registers
+    stp     x19, x20, [x0, #0]
+    stp     x21, x22, [x0, #16]
+    stp     x23, x24, [x0, #32]
+    stp     x25, x26, [x0, #48]
+    stp     x27, x28, [x0, #64]
+    stp     x29, x30, [x0, #80]
+    mov     x9, sp
+    str     x9, [x0, #96]        // Save SP
+
+    // Load next task's callee-saved registers
+    ldp     x19, x20, [x1, #0]
+    ldp     x21, x22, [x1, #16]
+    ldp     x23, x24, [x1, #32]
+    ldp     x25, x26, [x1, #48]
+    ldp     x27, x28, [x1, #64]
+    ldp     x29, x30, [x1, #80]
+    ldr     x9, [x1, #96]        // Load SP
+    mov     sp, x9
+
+    // Return to next task (x30 has return address)
+    ret
+
+// Enter user mode from kernel
+// Arguments:
+//   x0 = pointer to TrapFrame
+//   x1 = TTBR0 value for user address space
+// This function never returns - it erets to user mode
+.global enter_usermode
+.type enter_usermode, @function
+enter_usermode:
+    // Save TTBR0 value
+    mov     x9, x1
+
+    // Load special registers from trap frame
+    // TrapFrame layout: x0-x30 (31*8=248), sp_el0, elr_el1, spsr_el1
+    ldr     x2, [x0, #248]      // sp_el0
+    ldr     x3, [x0, #256]      // elr_el1
+    ldr     x4, [x0, #264]      // spsr_el1
+
+    msr     sp_el0, x2
+    msr     elr_el1, x3
+    msr     spsr_el1, x4
+
+    // Debug: write '1' before TTBR1 jump
+    mov     x10, #0x11000000
+    mov     x11, #'1'
+    str     w11, [x10]
+
+    // Jump to TTBR1 address space before switching TTBR0
+    // This allows us to safely flush TLB without losing access to kernel code
+    adr     x10, 1f                 // Get physical address of trampoline
+    movz    x11, #0xFFFF, lsl #48   // KERNEL_VIRT_BASE = 0xFFFF000000000000
+    orr     x10, x10, x11           // Convert to TTBR1 virtual address
+
+    // Debug: write '2' and then jump target address
+    stp     x10, x11, [sp, #-16]!   // Save x10, x11
+    mov     x12, #0x11000000
+    mov     x13, #'2'
+    str     w13, [x12]
+    ldp     x10, x11, [sp], #16     // Restore
+
+    br      x10                     // Jump to TTBR1 space
+
+1:
+    // Debug: write '3' after TTBR1 jump succeeded (still using TTBR0 identity map)
+    mov     x12, #0x11000000
+    mov     x13, #'3'
+    str     w13, [x12]
+
+    // Now executing from TTBR1 space - safe to modify TTBR0
+    msr     ttbr0_el1, x9
+    isb
+    tlbi    vmalle1                 // Flush all TLB entries
+    dsb     sy
+    isb
+
+    // Debug: write '4' using TTBR1 address for UART (TTBR0 no longer has device map)
+    movz    x12, #0x1100, lsl #16   // 0x11000000
+    movz    x13, #0xFFFF, lsl #48   // KERNEL_VIRT_BASE high bits
+    orr     x12, x12, x13           // 0xFFFF000011000000
+    mov     x13, #'4'
+    str     w13, [x12]
+
+    // Zero all registers for clean user entry
+    mov     x0, #0
+    mov     x1, #0
+    mov     x2, #0
+    mov     x3, #0
+    mov     x4, #0
+    mov     x5, #0
+    mov     x6, #0
+    mov     x7, #0
+    mov     x8, #0
+    mov     x9, #0
+    mov     x10, #0
+    mov     x11, #0
+    mov     x12, #0
+    mov     x13, #0
+    mov     x14, #0
+    mov     x15, #0
+    mov     x16, #0
+    mov     x17, #0
+    mov     x18, #0
+    mov     x19, #0
+    mov     x20, #0
+    mov     x21, #0
+    mov     x22, #0
+    mov     x23, #0
+    mov     x24, #0
+    mov     x25, #0
+    mov     x26, #0
+    mov     x27, #0
+    mov     x28, #0
+    mov     x29, #0
+    mov     x30, #0
+
+    // Debug: write 'E' to UART before eret (using TTBR1 address)
+    movz    x10, #0x1100, lsl #16   // 0x11000000
+    movz    x11, #0xFFFF, lsl #48
+    orr     x10, x10, x11           // 0xFFFF000011000000
+    mov     x11, #'E'
+    str     w11, [x10]
+
+    // Return to user mode
+    eret
+"#);
+
+extern "C" {
+    /// Switch CPU context from current to next task
+    /// # Safety
+    /// Both pointers must point to valid CpuContext structures
+    fn context_switch(current: *mut CpuContext, next: *const CpuContext);
+
+    /// Enter user mode with given trap frame and address space
+    /// # Safety
+    /// trap_frame must point to valid TrapFrame, ttbr0 must be valid page table
+    fn enter_usermode(trap_frame: *const TrapFrame, ttbr0: u64) -> !;
+}
+
+/// Perform a context switch between two tasks
+/// # Safety
+/// Must be called with interrupts disabled
+pub unsafe fn switch_context(current: &mut Task, next: &Task) {
+    // Switch address space if needed
+    if let Some(ref addr_space) = next.address_space {
+        addr_space.activate();
+    }
+
+    // Switch CPU context
+    context_switch(&mut current.context, &next.context);
+}
+
+/// Simple scheduler state
+pub struct Scheduler {
+    /// All tasks
+    tasks: [Option<Task>; MAX_TASKS],
+    /// Currently running task index
+    current: usize,
+    /// Next task ID to assign
+    next_id: TaskId,
+}
+
+impl Scheduler {
+    pub const fn new() -> Self {
+        const NONE: Option<Task> = None;
+        Self {
+            tasks: [NONE; MAX_TASKS],
+            current: 0,
+            next_id: 1,
+        }
+    }
+
+    /// Add a kernel task to the scheduler
+    pub fn add_kernel_task(&mut self, entry: fn() -> !, name: &str) -> Option<TaskId> {
+        // Find empty slot
+        let slot = self.tasks.iter().position(|t| t.is_none())?;
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        self.tasks[slot] = Task::new_kernel(id, entry, name);
+        if self.tasks[slot].is_some() {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Add a user task to the scheduler
+    pub fn add_user_task(&mut self, name: &str) -> Option<(TaskId, usize)> {
+        let slot = self.tasks.iter().position(|t| t.is_none())?;
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        self.tasks[slot] = Task::new_user(id, name);
+        if self.tasks[slot].is_some() {
+            Some((id, slot))
+        } else {
+            None
+        }
+    }
+
+    /// Get task by slot index mutably
+    pub fn task_mut(&mut self, slot: usize) -> Option<&mut Task> {
+        self.tasks.get_mut(slot).and_then(|t| t.as_mut())
+    }
+
+    /// Get current task
+    pub fn current_task(&self) -> Option<&Task> {
+        self.tasks[self.current].as_ref()
+    }
+
+    /// Get current task mutably
+    pub fn current_task_mut(&mut self) -> Option<&mut Task> {
+        self.tasks[self.current].as_mut()
+    }
+
+    /// Get current task ID
+    pub fn current_task_id(&self) -> Option<TaskId> {
+        self.tasks[self.current].as_ref().map(|t| t.id)
+    }
+
+    /// Terminate current task
+    pub fn terminate_current(&mut self, _exit_code: i32) {
+        if let Some(ref mut task) = self.tasks[self.current] {
+            task.state = TaskState::Terminated;
+        }
+    }
+
+    /// Remove terminated tasks and free resources
+    pub fn reap_terminated(&mut self) {
+        for slot in self.tasks.iter_mut() {
+            if let Some(ref task) = slot {
+                if task.state == TaskState::Terminated {
+                    *slot = None; // Drop will free resources
+                }
+            }
+        }
+    }
+
+    /// Run a specific user task (enter user mode)
+    /// This never returns to the caller - it erets to user mode
+    /// # Safety
+    /// Task must be properly set up with valid trap frame and address space
+    pub unsafe fn run_user_task(&mut self, slot: usize) -> ! {
+        self.current = slot;
+
+        if let Some(ref mut task) = self.tasks[slot] {
+            task.state = TaskState::Running;
+
+            if let Some(ref addr_space) = task.address_space {
+                let ttbr0 = addr_space.get_ttbr0();
+                let trap_frame = &task.trap_frame as *const TrapFrame;
+
+                println!("  Entering user mode:");
+                println!("    Entry:  0x{:016x}", task.trap_frame.elr_el1);
+                println!("    Stack:  0x{:016x}", task.trap_frame.sp_el0);
+                println!("    TTBR0:  0x{:016x}", ttbr0);
+
+                enter_usermode(trap_frame, ttbr0);
+            }
+        }
+
+        // Should never reach here
+        panic!("run_user_task: invalid task or no address space");
+    }
+
+    /// Check if there are any runnable tasks
+    pub fn has_runnable_tasks(&self) -> bool {
+        self.tasks.iter().any(|slot| {
+            if let Some(ref task) = slot {
+                task.state == TaskState::Ready || task.state == TaskState::Running
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Simple round-robin scheduling: find next ready task
+    pub fn schedule(&mut self) -> Option<usize> {
+        let start = self.current;
+        let mut next = (start + 1) % MAX_TASKS;
+
+        while next != start {
+            if let Some(ref task) = self.tasks[next] {
+                if task.state == TaskState::Ready {
+                    return Some(next);
+                }
+            }
+            next = (next + 1) % MAX_TASKS;
+        }
+
+        // Check if current task is still runnable
+        if let Some(ref task) = self.tasks[start] {
+            if task.state == TaskState::Running || task.state == TaskState::Ready {
+                return Some(start);
+            }
+        }
+
+        None
+    }
+
+    /// Perform a context switch to the next ready task
+    /// # Safety
+    /// Must be called with interrupts disabled
+    pub unsafe fn switch_to_next(&mut self) {
+        if let Some(next_idx) = self.schedule() {
+            if next_idx != self.current {
+                // Mark current as ready (if still running)
+                if let Some(ref mut current) = self.tasks[self.current] {
+                    if current.state == TaskState::Running {
+                        current.state = TaskState::Ready;
+                    }
+                }
+
+                // Get pointers to current and next contexts
+                let current_ctx = if let Some(ref mut t) = self.tasks[self.current] {
+                    &mut t.context as *mut CpuContext
+                } else {
+                    return;
+                };
+
+                let next_ctx = if let Some(ref t) = self.tasks[next_idx] {
+                    &t.context as *const CpuContext
+                } else {
+                    return;
+                };
+
+                // Switch address space if next task has one
+                if let Some(ref task) = self.tasks[next_idx] {
+                    if let Some(ref addr_space) = task.address_space {
+                        addr_space.activate();
+                    }
+                }
+
+                // Update current index
+                let old_current = self.current;
+                self.current = next_idx;
+
+                // Mark next as running
+                if let Some(ref mut t) = self.tasks[next_idx] {
+                    t.state = TaskState::Running;
+                }
+
+                // Actually switch
+                context_switch(current_ctx, next_ctx);
+
+                // We return here when switched back to this task
+            }
+        }
+    }
+
+    /// Print scheduler state
+    pub fn print_info(&self) {
+        println!("  Tasks:");
+        for (i, slot) in self.tasks.iter().enumerate() {
+            if let Some(ref task) = slot {
+                let state_str = match task.state {
+                    TaskState::Ready => "ready",
+                    TaskState::Running => "RUNNING",
+                    TaskState::Blocked => "blocked",
+                    TaskState::Terminated => "terminated",
+                };
+                let marker = if i == self.current { ">" } else { " " };
+                println!("    {} [{}] {} ({})", marker, task.id, task.name_str(), state_str);
+            }
+        }
+    }
+}
+
+/// Global scheduler instance
+static mut SCHEDULER: Scheduler = Scheduler::new();
+
+/// Get the global scheduler
+/// # Safety
+/// Must ensure proper synchronization (interrupts disabled)
+pub unsafe fn scheduler() -> &'static mut Scheduler {
+    &mut *core::ptr::addr_of_mut!(SCHEDULER)
+}
+
+/// Test context switching
+pub fn test() {
+    println!("  Context switch test:");
+    println!("    TrapFrame size: {} bytes", core::mem::size_of::<TrapFrame>());
+    println!("    CpuContext size: {} bytes", core::mem::size_of::<CpuContext>());
+    println!("    Task size: {} bytes", core::mem::size_of::<Task>());
+    println!("    [OK] Structures initialized");
+}

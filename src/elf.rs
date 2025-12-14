@@ -1,0 +1,566 @@
+//! ELF64 Loader
+//!
+//! Minimal ELF loader for AArch64 executables.
+//! Parses ELF headers and loads PT_LOAD segments into process memory.
+
+use crate::addrspace::AddressSpace;
+use crate::pmm;
+use crate::println;
+use crate::task;
+
+/// ELF magic number
+pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+/// ELF class: 64-bit
+pub const ELFCLASS64: u8 = 2;
+
+/// ELF data encoding: little endian
+pub const ELFDATA2LSB: u8 = 1;
+
+/// ELF type: executable
+pub const ET_EXEC: u16 = 2;
+/// ELF type: shared object (PIE)
+pub const ET_DYN: u16 = 3;
+
+/// ELF machine: AArch64
+pub const EM_AARCH64: u16 = 183;
+
+/// Program header type: loadable segment
+pub const PT_LOAD: u32 = 1;
+
+/// Segment flags
+pub const PF_X: u32 = 1;  // Executable
+pub const PF_W: u32 = 2;  // Writable
+pub const PF_R: u32 = 4;  // Readable
+
+/// ELF64 file header
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct Elf64Header {
+    /// Magic number and other info
+    pub e_ident: [u8; 16],
+    /// Object file type
+    pub e_type: u16,
+    /// Architecture
+    pub e_machine: u16,
+    /// Object file version
+    pub e_version: u32,
+    /// Entry point virtual address
+    pub e_entry: u64,
+    /// Program header table file offset
+    pub e_phoff: u64,
+    /// Section header table file offset
+    pub e_shoff: u64,
+    /// Processor-specific flags
+    pub e_flags: u32,
+    /// ELF header size in bytes
+    pub e_ehsize: u16,
+    /// Program header table entry size
+    pub e_phentsize: u16,
+    /// Program header table entry count
+    pub e_phnum: u16,
+    /// Section header table entry size
+    pub e_shentsize: u16,
+    /// Section header table entry count
+    pub e_shnum: u16,
+    /// Section header string table index
+    pub e_shstrndx: u16,
+}
+
+/// ELF64 program header
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct Elf64ProgramHeader {
+    /// Segment type
+    pub p_type: u32,
+    /// Segment flags
+    pub p_flags: u32,
+    /// Segment file offset
+    pub p_offset: u64,
+    /// Segment virtual address
+    pub p_vaddr: u64,
+    /// Segment physical address (unused)
+    pub p_paddr: u64,
+    /// Segment size in file
+    pub p_filesz: u64,
+    /// Segment size in memory
+    pub p_memsz: u64,
+    /// Segment alignment
+    pub p_align: u64,
+}
+
+/// ELF loading errors
+#[derive(Debug, Clone, Copy)]
+pub enum ElfError {
+    /// Invalid ELF magic
+    BadMagic,
+    /// Not a 64-bit ELF
+    Not64Bit,
+    /// Not little endian
+    NotLittleEndian,
+    /// Not an executable
+    NotExecutable,
+    /// Wrong architecture
+    WrongArch,
+    /// File too small
+    TooSmall,
+    /// Out of memory
+    OutOfMemory,
+    /// Invalid segment
+    InvalidSegment,
+}
+
+/// Parsed ELF information
+pub struct ElfInfo {
+    /// Entry point address
+    pub entry: u64,
+    /// Base load address (for PIE)
+    pub base: u64,
+    /// Number of segments loaded
+    pub segments_loaded: usize,
+}
+
+/// Validate ELF header
+pub fn validate_header(data: &[u8]) -> Result<&Elf64Header, ElfError> {
+    if data.len() < core::mem::size_of::<Elf64Header>() {
+        return Err(ElfError::TooSmall);
+    }
+
+    let header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
+
+    // Check magic
+    if header.e_ident[0..4] != ELF_MAGIC {
+        return Err(ElfError::BadMagic);
+    }
+
+    // Check class (64-bit)
+    if header.e_ident[4] != ELFCLASS64 {
+        return Err(ElfError::Not64Bit);
+    }
+
+    // Check endianness (little)
+    if header.e_ident[5] != ELFDATA2LSB {
+        return Err(ElfError::NotLittleEndian);
+    }
+
+    // Check type (executable or shared/PIE)
+    let e_type = header.e_type;
+    if e_type != ET_EXEC && e_type != ET_DYN {
+        return Err(ElfError::NotExecutable);
+    }
+
+    // Check machine (AArch64)
+    if header.e_machine != EM_AARCH64 {
+        return Err(ElfError::WrongArch);
+    }
+
+    Ok(header)
+}
+
+/// Get program headers from ELF data
+pub fn get_program_headers<'a>(data: &'a [u8], header: &Elf64Header) -> Result<&'a [Elf64ProgramHeader], ElfError> {
+    // Copy from packed struct to avoid unaligned access
+    let ph_offset = { header.e_phoff } as usize;
+    let ph_size = { header.e_phentsize } as usize;
+    let ph_count = { header.e_phnum } as usize;
+
+    let required_size = ph_offset + ph_size * ph_count;
+    if data.len() < required_size {
+        return Err(ElfError::TooSmall);
+    }
+
+    if ph_size < core::mem::size_of::<Elf64ProgramHeader>() {
+        return Err(ElfError::InvalidSegment);
+    }
+
+    let phdrs = unsafe {
+        core::slice::from_raw_parts(
+            data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader,
+            ph_count,
+        )
+    };
+
+    Ok(phdrs)
+}
+
+/// Load an ELF into a process address space
+/// Returns entry point and load info
+pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, ElfError> {
+    let header = validate_header(data)?;
+    let phdrs = get_program_headers(data, header)?;
+
+    let mut segments_loaded = 0;
+    let mut base_addr: Option<u64> = None;
+
+    // Process each program header
+    for phdr in phdrs {
+        // Skip non-loadable segments
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+
+        let vaddr = phdr.p_vaddr;
+        let memsz = phdr.p_memsz as usize;
+        let filesz = phdr.p_filesz as usize;
+        let offset = phdr.p_offset as usize;
+        let flags = phdr.p_flags;
+
+        // Track base address (lowest vaddr)
+        if base_addr.is_none() || vaddr < base_addr.unwrap() {
+            base_addr = Some(vaddr);
+        }
+
+        // Skip empty segments
+        if memsz == 0 {
+            continue;
+        }
+
+        // Calculate number of pages needed
+        let page_size = 4096usize;
+        let vaddr_page = vaddr & !(page_size as u64 - 1);
+        let offset_in_page = (vaddr - vaddr_page) as usize;
+        let total_size = offset_in_page + memsz;
+        let num_pages = (total_size + page_size - 1) / page_size;
+
+        // Allocate physical pages
+        let phys_base = pmm::alloc_pages(num_pages).ok_or(ElfError::OutOfMemory)?;
+
+        // Zero the pages first
+        unsafe {
+            let ptr = phys_base as *mut u8;
+            for i in 0..(num_pages * page_size) {
+                core::ptr::write_volatile(ptr.add(i), 0);
+            }
+        }
+
+        // Copy file content to memory
+        if filesz > 0 {
+            if offset + filesz > data.len() {
+                pmm::free_pages(phys_base, num_pages);
+                return Err(ElfError::InvalidSegment);
+            }
+
+            unsafe {
+                let dest = (phys_base + offset_in_page) as *mut u8;
+                let src = data.as_ptr().add(offset);
+                for i in 0..filesz {
+                    core::ptr::write_volatile(dest.add(i), *src.add(i));
+                }
+            }
+        }
+
+        // Map pages into address space
+        let writable = (flags & PF_W) != 0;
+        let executable = (flags & PF_X) != 0;
+
+        // If executable, perform cache maintenance to ensure I-cache sees the code
+        if executable {
+            unsafe {
+                let base = phys_base;
+                let size = num_pages * page_size;
+                // Clean each cache line to Point of Unification (so I-cache can see it)
+                // ARM cache line is typically 64 bytes
+                for addr in (base..(base + size)).step_by(64) {
+                    // DC CVAU: Clean data cache by VA to PoU
+                    core::arch::asm!("dc cvau, {}", in(reg) addr);
+                }
+                // Data Synchronization Barrier
+                core::arch::asm!("dsb ish");
+                // Invalidate instruction cache
+                for addr in (base..(base + size)).step_by(64) {
+                    // IC IVAU: Invalidate instruction cache by VA to PoU
+                    core::arch::asm!("ic ivau, {}", in(reg) addr);
+                }
+                // Ensure I-cache invalidation completes
+                core::arch::asm!("dsb ish");
+                core::arch::asm!("isb");
+            }
+        }
+
+        for i in 0..num_pages {
+            let page_vaddr = vaddr_page + (i * page_size) as u64;
+            let page_phys = (phys_base + i * page_size) as u64;
+
+            if !addr_space.map_page(page_vaddr, page_phys, writable, executable) {
+                // Cleanup on failure
+                pmm::free_pages(phys_base, num_pages);
+                return Err(ElfError::OutOfMemory);
+            }
+        }
+
+        segments_loaded += 1;
+    }
+
+    Ok(ElfInfo {
+        entry: header.e_entry,
+        base: base_addr.unwrap_or(0),
+        segments_loaded,
+    })
+}
+
+/// Print ELF header info
+pub fn print_header_info(header: &Elf64Header) {
+    // Copy from packed struct to avoid unaligned access
+    let e_type = { header.e_type };
+    let e_machine = { header.e_machine };
+    let e_entry = { header.e_entry };
+    let e_phoff = { header.e_phoff };
+    let e_phnum = { header.e_phnum };
+
+    println!("  ELF Header:");
+    println!("    Type:    {}", match e_type {
+        ET_EXEC => "Executable",
+        ET_DYN => "Shared/PIE",
+        _ => "Unknown",
+    });
+    println!("    Machine: {}", if e_machine == EM_AARCH64 { "AArch64" } else { "Unknown" });
+    println!("    Entry:   0x{:016x}", e_entry);
+    println!("    PHoff:   0x{:x}", e_phoff);
+    println!("    PHnum:   {}", e_phnum);
+}
+
+/// Print program header info
+pub fn print_phdr_info(phdr: &Elf64ProgramHeader) {
+    // Copy from packed struct to avoid unaligned access
+    let p_type = { phdr.p_type };
+    let p_flags = { phdr.p_flags };
+    let p_vaddr = { phdr.p_vaddr };
+    let p_memsz = { phdr.p_memsz };
+
+    let type_str = match p_type {
+        0 => "NULL",
+        PT_LOAD => "LOAD",
+        2 => "DYNAMIC",
+        3 => "INTERP",
+        4 => "NOTE",
+        6 => "PHDR",
+        7 => "TLS",
+        _ => "OTHER",
+    };
+
+    let mut flags_str = [b'-'; 3];
+    if (p_flags & PF_R) != 0 { flags_str[0] = b'R'; }
+    if (p_flags & PF_W) != 0 { flags_str[1] = b'W'; }
+    if (p_flags & PF_X) != 0 { flags_str[2] = b'X'; }
+
+    println!("    {:8} 0x{:08x} 0x{:08x} {} {}",
+        type_str,
+        p_vaddr,
+        p_memsz,
+        core::str::from_utf8(&flags_str).unwrap_or("---"),
+        if p_type == PT_LOAD { "<- LOAD" } else { "" }
+    );
+}
+
+// ============================================================================
+// Process Spawning
+// ============================================================================
+
+/// Default user stack virtual address (grows down from here)
+pub const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
+
+/// User stack size (64KB)
+pub const USER_STACK_SIZE: usize = 64 * 1024;
+
+/// Spawn a new process from an ELF binary
+/// Returns (task_id, task_slot) on success
+pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), ElfError> {
+    println!("    [spawn] Free pages: {}", pmm::free_count());
+
+    // Create a new user task
+    println!("    [spawn] Creating user task...");
+    let (task_id, slot) = unsafe {
+        task::scheduler().add_user_task(name).ok_or_else(|| {
+            println!("    [spawn] FAILED: add_user_task");
+            ElfError::OutOfMemory
+        })?
+    };
+    println!("    [spawn] Task created, slot={}", slot);
+
+    // Get access to the task's address space
+    let task = unsafe {
+        task::scheduler().task_mut(slot).ok_or(ElfError::OutOfMemory)?
+    };
+
+    let addr_space = task.address_space_mut().ok_or(ElfError::OutOfMemory)?;
+
+    // Load the ELF into the address space
+    println!("    [spawn] Loading ELF...");
+    let elf_info = load_elf(data, addr_space)?;
+    println!("    [spawn] ELF loaded");
+
+    // Allocate user stack
+    let stack_pages = USER_STACK_SIZE / 4096;
+    println!("    [spawn] Allocating {} pages for user stack...", stack_pages);
+    let stack_phys = pmm::alloc_pages(stack_pages).ok_or_else(|| {
+        println!("    [spawn] FAILED: stack allocation");
+        ElfError::OutOfMemory
+    })?;
+
+    // Map user stack (at USER_STACK_TOP - USER_STACK_SIZE to USER_STACK_TOP)
+    let stack_base_virt = USER_STACK_TOP - USER_STACK_SIZE as u64;
+    for i in 0..stack_pages {
+        let page_virt = stack_base_virt + (i * 4096) as u64;
+        let page_phys = (stack_phys + i * 4096) as u64;
+        if !addr_space.map_page(page_virt, page_phys, true, false) {
+            pmm::free_pages(stack_phys, stack_pages);
+            return Err(ElfError::OutOfMemory);
+        }
+    }
+
+    // Set up the trap frame with entry point and user stack
+    task.set_user_entry(elf_info.entry, USER_STACK_TOP);
+
+    println!("    Spawned process '{}' (PID {})", name, task_id);
+    println!("      Entry:  0x{:016x}", elf_info.entry);
+    println!("      Stack:  0x{:016x}", USER_STACK_TOP);
+    println!("      Loaded: {} segments", elf_info.segments_loaded);
+
+    // Debug: dump page table entries for 0x40010000
+    // VA 0x40010000: L0[0] -> L1[1] -> L2[0] -> L3[16]
+    unsafe {
+        let task = task::scheduler().task_mut(slot).unwrap();
+        let addr_space = task.address_space_mut().unwrap();
+
+        let l0_addr = addr_space.ttbr0 as *const u64;
+        let l0_entry = core::ptr::read_volatile(l0_addr.add(0)); // L0[0]
+        println!("    PT: L0[0] = 0x{:016x}", l0_entry);
+
+        if (l0_entry & 0x3) == 0x3 {
+            let l1_addr = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+            let l1_entry = core::ptr::read_volatile(l1_addr.add(1)); // L1[1] for 0x40000000+
+            println!("    PT: L1[1] = 0x{:016x}", l1_entry);
+
+            if (l1_entry & 0x3) == 0x3 {
+                let l2_addr = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+                let l2_entry = core::ptr::read_volatile(l2_addr.add(0)); // L2[0]
+                println!("    PT: L2[0] = 0x{:016x}", l2_entry);
+
+                if (l2_entry & 0x3) == 0x3 {
+                    let l3_addr = (l2_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+                    let l3_entry = core::ptr::read_volatile(l3_addr.add(16)); // L3[16] for 0x40010000
+                    println!("    PT: L3[16] = 0x{:016x}", l3_entry);
+
+                    // Dump code at physical address
+                    let code_phys = (l3_entry & 0x0000_FFFF_FFFF_F000) as *const u32;
+                    let inst0 = core::ptr::read_volatile(code_phys);
+                    let inst1 = core::ptr::read_volatile(code_phys.add(1));
+                    println!("    Code: 0x{:08x} 0x{:08x} (MOV x8,#1; ADR x0,msg)", inst0, inst1);
+                }
+            }
+        }
+    }
+
+    Ok((task_id, slot))
+}
+
+/// Get the test ELF binary
+pub fn get_test_elf() -> &'static [u8] {
+    TEST_ELF
+}
+
+// ============================================================================
+// Testing
+// ============================================================================
+
+/// A minimal test ELF binary (AArch64)
+/// This is a hand-crafted ELF that:
+/// 1. Writes "Hi!" to debug console via syscall
+/// 2. Exits with code 42
+///
+/// Entry point at 0x10000
+const TEST_ELF: &[u8] = &[
+    // ELF Header (64 bytes)
+    0x7f, b'E', b'L', b'F',  // Magic
+    2,                        // Class: 64-bit
+    1,                        // Data: little endian
+    1,                        // Version
+    0,                        // OS/ABI
+    0, 0, 0, 0, 0, 0, 0, 0,  // Padding
+    2, 0,                     // Type: ET_EXEC
+    183, 0,                   // Machine: AArch64
+    1, 0, 0, 0,              // Version
+    0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // Entry: 0x40010000 (in DRAM region, not device)
+    0x40, 0, 0, 0, 0, 0, 0, 0,           // PHoff: 64
+    0, 0, 0, 0, 0, 0, 0, 0,              // SHoff: 0
+    0, 0, 0, 0,                          // Flags
+    64, 0,                               // EH size
+    56, 0,                               // PH entry size
+    1, 0,                                // PH count
+    0, 0,                                // SH entry size
+    0, 0,                                // SH count
+    0, 0,                                // SH string index
+
+    // Program Header (56 bytes) - at offset 64
+    1, 0, 0, 0,              // Type: PT_LOAD
+    5, 0, 0, 0,              // Flags: R-X
+    0x78, 0, 0, 0, 0, 0, 0, 0,           // Offset: 120 (where code starts)
+    0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // VAddr: 0x40010000
+    0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // PAddr: 0x40010000
+    0x20, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 32 bytes
+    0x20, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 32 bytes
+    0x00, 0x10, 0, 0, 0, 0, 0, 0,        // Align: 0x1000
+
+    // Code starts at offset 120 (0x78)
+    // mov x8, #1       ; syscall = DebugWrite
+    0x28, 0x00, 0x80, 0xd2,
+    // adr x0, msg      ; buffer = msg (PC-relative, +24 bytes to 0x1001c)
+    0xc0, 0x00, 0x00, 0x10,
+    // mov x1, #3       ; len = 3
+    0x61, 0x00, 0x80, 0xd2,
+    // svc #0           ; syscall
+    0x01, 0x00, 0x00, 0xd4,
+    // mov x8, #0       ; syscall = Exit
+    0x08, 0x00, 0x80, 0xd2,
+    // mov x0, #42      ; code = 42
+    0x40, 0x05, 0x80, 0xd2,
+    // svc #0           ; syscall
+    0x01, 0x00, 0x00, 0xd4,
+    // msg: "Hi!\n"
+    b'H', b'i', b'!', b'\n',
+];
+
+/// Test ELF loading
+pub fn test() {
+    println!("  Testing ELF loader...");
+
+    // Validate the test ELF
+    match validate_header(TEST_ELF) {
+        Ok(header) => {
+            println!("    Test ELF validated");
+            print_header_info(header);
+
+            match get_program_headers(TEST_ELF, header) {
+                Ok(phdrs) => {
+                    println!("    Program headers:");
+                    for phdr in phdrs {
+                        print_phdr_info(phdr);
+                    }
+                }
+                Err(e) => println!("    [!!] Failed to get phdrs: {:?}", e),
+            }
+        }
+        Err(e) => {
+            println!("    [!!] ELF validation failed: {:?}", e);
+            return;
+        }
+    }
+
+    // Try loading into a new address space
+    println!("    Loading ELF into address space...");
+    if let Some(mut addr_space) = AddressSpace::new() {
+        match load_elf(TEST_ELF, &mut addr_space) {
+            Ok(info) => {
+                println!("    Loaded {} segments", info.segments_loaded);
+                println!("    Entry point: 0x{:016x}", info.entry);
+                println!("    Base address: 0x{:016x}", info.base);
+                println!("    [OK] ELF loaded successfully");
+            }
+            Err(e) => println!("    [!!] Load failed: {:?}", e),
+        }
+    } else {
+        println!("    [!!] Failed to create address space");
+    }
+
+    println!("    [OK] ELF loader test passed");
+}

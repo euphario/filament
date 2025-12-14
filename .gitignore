@@ -1,0 +1,17 @@
+# Build artifacts
+/target/
+*.bin
+
+# Cargo lock (optional - some prefer to commit it)
+# Cargo.lock
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
