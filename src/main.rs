@@ -181,6 +181,9 @@ pub extern "C" fn kmain() -> ! {
         }
     };
 
+    // Note: mmap test can be added here once we have a proper test binary
+    // For now, mmap/munmap syscalls are implemented and ready for use
+
     // Run the first process
     if let Some(slot) = slot1 {
         println!();

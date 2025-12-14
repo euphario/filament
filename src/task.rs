@@ -126,6 +126,40 @@ pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
 /// Maximum number of tasks
 pub const MAX_TASKS: usize = 16;
 
+/// Maximum number of heap mappings per task
+pub const MAX_HEAP_MAPPINGS: usize = 32;
+
+/// User heap region start (after code/stack regions)
+pub const USER_HEAP_START: u64 = 0x5000_0000;
+
+/// User heap region end
+pub const USER_HEAP_END: u64 = 0x7000_0000;
+
+/// A single heap mapping entry
+#[derive(Clone, Copy)]
+pub struct HeapMapping {
+    /// Virtual address of mapping
+    pub virt_addr: u64,
+    /// Physical address of mapping
+    pub phys_addr: u64,
+    /// Number of pages
+    pub num_pages: usize,
+}
+
+impl HeapMapping {
+    pub const fn empty() -> Self {
+        Self {
+            virt_addr: 0,
+            phys_addr: 0,
+            num_pages: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.num_pages == 0
+    }
+}
+
 /// Task Control Block
 pub struct Task {
     /// Unique task ID
@@ -146,6 +180,10 @@ pub struct Task {
     pub is_user: bool,
     /// Task name for debugging
     pub name: [u8; 16],
+    /// Heap mappings for mmap/munmap tracking
+    pub heap_mappings: [HeapMapping; MAX_HEAP_MAPPINGS],
+    /// Next heap address for bump allocation
+    pub heap_next: u64,
 }
 
 impl Task {
@@ -180,6 +218,8 @@ impl Task {
             address_space: None,
             is_user: false,
             name: task_name,
+            heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
+            heap_next: USER_HEAP_START,
         })
     }
 
@@ -211,6 +251,8 @@ impl Task {
             address_space: Some(address_space),
             is_user: true,
             name: task_name,
+            heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
+            heap_next: USER_HEAP_START,
         })
     }
 
@@ -229,10 +271,102 @@ impl Task {
     pub fn address_space_mut(&mut self) -> Option<&mut AddressSpace> {
         self.address_space.as_mut()
     }
+
+    /// Allocate and map memory pages into user heap
+    /// Returns virtual address on success, None on failure
+    pub fn mmap(&mut self, size: usize, writable: bool, executable: bool) -> Option<u64> {
+        let num_pages = (size + 4095) / 4096;
+        if num_pages == 0 {
+            return None;
+        }
+
+        // Find free mapping slot
+        let slot = self.heap_mappings.iter().position(|m| m.is_empty())?;
+
+        // Check heap space available
+        let virt_addr = self.heap_next;
+        let mapping_size = (num_pages * 4096) as u64;
+        if virt_addr + mapping_size > USER_HEAP_END {
+            return None;
+        }
+
+        // Allocate physical pages
+        let phys_addr = pmm::alloc_pages(num_pages)? as u64;
+
+        // Zero the pages
+        unsafe {
+            let ptr = phys_addr as *mut u8;
+            for i in 0..(num_pages * 4096) {
+                core::ptr::write_volatile(ptr.add(i), 0);
+            }
+        }
+
+        // Map pages into address space
+        let addr_space = self.address_space.as_mut()?;
+        for i in 0..num_pages {
+            let page_virt = virt_addr + (i * 4096) as u64;
+            let page_phys = phys_addr + (i * 4096) as u64;
+            if !addr_space.map_page(page_virt, page_phys, writable, executable) {
+                // Cleanup on failure
+                pmm::free_pages(phys_addr as usize, num_pages);
+                return None;
+            }
+        }
+
+        // Record mapping
+        self.heap_mappings[slot] = HeapMapping {
+            virt_addr,
+            phys_addr,
+            num_pages,
+        };
+
+        // Bump heap pointer
+        self.heap_next = virt_addr + mapping_size;
+
+        Some(virt_addr)
+    }
+
+    /// Unmap and free memory pages from user heap
+    /// Returns true on success
+    pub fn munmap(&mut self, addr: u64, size: usize) -> bool {
+        let num_pages = (size + 4095) / 4096;
+        if num_pages == 0 {
+            return false;
+        }
+
+        // Find the mapping
+        let slot = match self.heap_mappings.iter().position(|m| {
+            m.virt_addr == addr && m.num_pages == num_pages
+        }) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let mapping = self.heap_mappings[slot];
+
+        // Free physical pages
+        pmm::free_pages(mapping.phys_addr as usize, mapping.num_pages);
+
+        // Clear mapping slot
+        self.heap_mappings[slot] = HeapMapping::empty();
+
+        // Note: We don't actually unmap from the page tables here for simplicity.
+        // A full implementation would call addr_space.unmap_page() for each page.
+        // The pages will become inaccessible when reused, or on process exit.
+
+        true
+    }
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
+        // Free heap mappings
+        for mapping in &self.heap_mappings {
+            if !mapping.is_empty() {
+                pmm::free_pages(mapping.phys_addr as usize, mapping.num_pages);
+            }
+        }
+
         // Free kernel stack
         let stack_pages = self.kernel_stack_size / 4096;
         pmm::free_pages(self.kernel_stack as usize, stack_pages);

@@ -534,6 +534,14 @@ pub fn get_test_elf2() -> &'static [u8] {
     TEST_ELF2
 }
 
+// Note: A proper mmap test ELF would need to be compiled from assembly
+// The mmap syscall interface is:
+//   x8 = 4 (Mmap)
+//   x0 = addr hint (0 for any)
+//   x1 = size in bytes
+//   x2 = prot flags (1=read, 2=write, 4=exec)
+// Returns virtual address or negative error
+
 /// Test ELF loading
 pub fn test() {
     println!("  Testing ELF loader...");

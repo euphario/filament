@@ -250,27 +250,51 @@ fn sys_gettime() -> i64 {
     }
 }
 
-/// Map memory pages
-fn sys_mmap(addr: u64, size: usize, _prot: u32) -> i64 {
-    // Simplified: allocate pages and return address
-    // In full implementation, would map into current task's address space
-    let pages = (size + 4095) / 4096;
-    if pages == 0 {
+/// Map memory pages into user address space
+/// Args: addr (hint, ignored for now), size, prot
+/// Returns: virtual address on success, negative error on failure
+fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
+    if size == 0 {
         return SyscallError::InvalidArgument as i64;
     }
 
-    match crate::pmm::alloc_pages(pages) {
-        Some(phys_addr) => phys_addr as i64,
-        None => SyscallError::OutOfMemory as i64,
+    // Parse protection flags (simplified: bit 0 = write, bit 1 = exec)
+    let writable = (prot & 0x2) != 0;  // PROT_WRITE
+    let executable = (prot & 0x4) != 0; // PROT_EXEC
+
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            match task.mmap(size, writable, executable) {
+                Some(virt_addr) => virt_addr as i64,
+                None => SyscallError::OutOfMemory as i64,
+            }
+        } else {
+            SyscallError::InvalidArgument as i64
+        }
     }
 }
 
-/// Unmap memory pages
+/// Unmap memory pages from user address space
+/// Args: addr, size
+/// Returns: 0 on success, negative error on failure
 fn sys_munmap(addr: u64, size: usize) -> i64 {
-    // Simplified: just free the pages
-    let pages = (size + 4095) / 4096;
-    crate::pmm::free_pages(addr as usize, pages);
-    SyscallError::Success as i64
+    if size == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if task.munmap(addr, size) {
+                SyscallError::Success as i64
+            } else {
+                SyscallError::InvalidArgument as i64
+            }
+        } else {
+            SyscallError::InvalidArgument as i64
+        }
+    }
 }
 
 /// Send IPC message on a channel
