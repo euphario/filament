@@ -151,36 +151,57 @@ pub extern "C" fn kmain() -> ! {
     }
     println!("[OK] Interrupts enabled");
 
-    // Spawn and run the test ELF
+    // Spawn multiple processes
     println!();
     println!("========================================");
-    println!("  Spawning user process from test ELF");
+    println!("  Spawning user processes");
     println!("========================================");
 
-    match elf::spawn_from_elf(elf::get_test_elf(), "init") {
+    // Spawn first process
+    let slot1 = match elf::spawn_from_elf(elf::get_test_elf(), "init") {
         Ok((_task_id, slot)) => {
-            println!();
-            println!("  Running user process...");
-
-            // Debug: print VBAR_EL1 to verify it's the kernel VA
-            let vbar: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, vbar_el1", out(reg) vbar);
-            }
-            println!("  VBAR_EL1:  0x{:016x}", vbar);
-            println!();
-
-            // Enter user mode - this never returns
-            unsafe {
-                task::scheduler().run_user_task(slot);
-            }
+            println!("  Process 'init' spawned at slot {}", slot);
+            Some(slot)
         }
         Err(e) => {
-            println!("  [!!] Failed to spawn process: {:?}", e);
-            println!("  Halting.");
-            loop {
-                unsafe { core::arch::asm!("wfi"); }
-            }
+            println!("  [!!] Failed to spawn init: {:?}", e);
+            None
+        }
+    };
+
+    // Spawn second process
+    let _slot2 = match elf::spawn_from_elf(elf::get_test_elf2(), "worker") {
+        Ok((_task_id, slot)) => {
+            println!("  Process 'worker' spawned at slot {}", slot);
+            Some(slot)
+        }
+        Err(e) => {
+            println!("  [!!] Failed to spawn worker: {:?}", e);
+            None
+        }
+    };
+
+    // Run the first process
+    if let Some(slot) = slot1 {
+        println!();
+        println!("  Starting scheduler with process at slot {}...", slot);
+
+        // Debug: print VBAR_EL1 to verify it's the kernel VA
+        let vbar: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, vbar_el1", out(reg) vbar);
+        }
+        println!("  VBAR_EL1:  0x{:016x}", vbar);
+        println!();
+
+        // Enter user mode - scheduler will switch between processes
+        unsafe {
+            task::scheduler().run_user_task(slot);
+        }
+    } else {
+        println!("  No processes to run - halting.");
+        loop {
+            unsafe { core::arch::asm!("wfi"); }
         }
     }
 }

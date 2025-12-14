@@ -71,11 +71,16 @@ const MAIR_VALUE: u64 = 0x00_00_00_00_00_00_FF_00;
 /// - TG0 = 0 (4KB granule for TTBR0)
 /// - TG1 = 2 (4KB granule for TTBR1)
 /// - IPS = 5 (48-bit PA)
-const TCR_VALUE: u64 = (16 << 0)      // T0SZ
-                     | (16 << 16)     // T1SZ
-                     | (0b00 << 14)   // TG0 = 4KB
-                     | (0b10 << 30)   // TG1 = 4KB
-                     | (0b101 << 32); // IPS = 48-bit
+/// - IRGN0/ORGN0 = Write-Back (for TTBR0 page table walks)
+/// - SH0 = Inner Shareable (for TTBR0 page table walks)
+const TCR_VALUE: u64 = (16 << 0)       // T0SZ = 16 (48-bit VA)
+                     | (16 << 16)      // T1SZ = 16 (48-bit VA)
+                     | (0b00 << 14)    // TG0 = 4KB
+                     | (0b10 << 30)    // TG1 = 4KB
+                     | (0b101 << 32)   // IPS = 48-bit PA
+                     | (0b01 << 8)     // IRGN0 = Write-Back Write-Allocate
+                     | (0b01 << 10)    // ORGN0 = Write-Back Write-Allocate
+                     | (0b11 << 12);   // SH0 = Inner Shareable
 
 /// Page table (512 entries, 4KB aligned)
 #[repr(C, align(4096))]

@@ -175,12 +175,6 @@ curr_el_spx_serror:
 /* Lower EL using AArch64 */
 .balign 0x80
 lower_el_aarch64_sync:
-    /* Debug: write 'L' to UART using TTBR1 address (TTBR0 has user page tables) */
-    movz    x10, #0x1100, lsl #16   // 0x11000000
-    movz    x11, #0xFFFF, lsl #48   // KERNEL_VIRT_BASE
-    orr     x10, x10, x11           // 0xFFFF000011000000
-    mov     x11, #'L'
-    str     w11, [x10]
     /* Check if this is an SVC (syscall) */
     mrs     x9, esr_el1
     lsr     x9, x9, #26         // Extract EC (exception class)
@@ -215,6 +209,12 @@ lower_el_aarch32_serror:
  * Simple exception handler - just prints and hangs
  */
 exception_handler:
+    /* Switch to kernel TTBR0 first (user TTBR0 doesn't map kernel/UART) */
+    adrp    x9, KERNEL_TTBR0
+    ldr     x9, [x9, :lo12:KERNEL_TTBR0]
+    msr     ttbr0_el1, x9
+    isb
+
     stp     x29, x30, [sp, #-16]!
     stp     x0, x1, [sp, #-16]!
 
@@ -275,69 +275,124 @@ irq_handler:
 
 /*
  * SVC (Syscall) handler
- * Arguments are in x0-x5, syscall number in x8
- * Return value goes in x0
+ * Saves full user state to CURRENT_TRAP_FRAME, handles syscall,
+ * then restores from CURRENT_TRAP_FRAME (which may be a different task after scheduling)
  */
 svc_handler:
-    /* Save user TTBR0 and switch to kernel identity mapping */
-    mrs     x9, ttbr0_el1           // Save user TTBR0 in x9
-    adrp    x10, KERNEL_TTBR0
-    ldr     x10, [x10, :lo12:KERNEL_TTBR0]
-    msr     ttbr0_el1, x10          // Switch to kernel TTBR0
+    /*
+     * CRITICAL: Switch TTBR0 to kernel identity mapping BEFORE any stack access!
+     * The kernel stack is at a physical address that isn't mapped in user TTBR0.
+     * Use TPIDR_EL1 as scratch to save x9.
+     */
+    msr     tpidr_el1, x9           // Save original x9 to scratch register
+
+    /* Switch to kernel TTBR0 - adrp generates TTBR1 address (PC-relative) */
+    adrp    x9, KERNEL_TTBR0
+    ldr     x9, [x9, :lo12:KERNEL_TTBR0]
+    msr     ttbr0_el1, x9
     isb
 
-    /* Save all caller-saved registers to stack (including x9 with user TTBR0) */
-    stp     x29, x30, [sp, #-16]!
-    stp     x27, x28, [sp, #-16]!
-    stp     x25, x26, [sp, #-16]!
-    stp     x23, x24, [sp, #-16]!
-    stp     x21, x22, [sp, #-16]!
-    stp     x19, x20, [sp, #-16]!
-    stp     x17, x18, [sp, #-16]!
-    stp     x15, x16, [sp, #-16]!
-    stp     x13, x14, [sp, #-16]!
-    stp     x11, x12, [sp, #-16]!
-    stp     x9, x10, [sp, #-16]!    // x9 = user TTBR0
-    stp     x7, x8, [sp, #-16]!
-    stp     x5, x6, [sp, #-16]!
-    stp     x3, x4, [sp, #-16]!
-    stp     x1, x2, [sp, #-16]!
-    str     x0, [sp, #-8]!
+    /* Now kernel stack is accessible - save x10 to stack */
+    str     x10, [sp, #-8]!
+
+    /* Get pointer to current task's trap frame */
+    adrp    x9, CURRENT_TRAP_FRAME
+    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+
+    /* Save all general purpose registers to trap frame */
+    /* TrapFrame layout: x0(0) x1(8) x2(16) ... x30(240), sp_el0(248), elr_el1(256), spsr_el1(264) */
+    stp     x0, x1, [x9, #0]        // x0=0, x1=8
+    stp     x2, x3, [x9, #16]       // x2=16, x3=24
+    stp     x4, x5, [x9, #32]       // x4=32, x5=40
+    stp     x6, x7, [x9, #48]       // x6=48, x7=56
+    str     x8, [x9, #64]           // x8=64
+    /* Get original x9 from TPIDR_EL1, original x10 from stack */
+    mrs     x10, tpidr_el1          // x10 = original x9
+    ldr     x11, [sp], #8           // x11 = original x10
+    stp     x10, x11, [x9, #72]     // x9=72, x10=80
+    str     x11, [x9, #88]          // x11=88
+    stp     x12, x13, [x9, #96]     // x12=96, x13=104
+    stp     x14, x15, [x9, #112]    // x14=112, x15=120
+    stp     x16, x17, [x9, #128]    // x16=128, x17=136
+    stp     x18, x19, [x9, #144]    // x18=144, x19=152
+    stp     x20, x21, [x9, #160]    // x20=160, x21=168
+    stp     x22, x23, [x9, #176]    // x22=176, x23=184
+    stp     x24, x25, [x9, #192]    // x24=192, x25=200
+    stp     x26, x27, [x9, #208]    // x26=208, x27=216
+    stp     x28, x29, [x9, #224]    // x28=224, x29=232
+    str     x30, [x9, #240]         // x30=240
+
+    /* Save special registers */
+    mrs     x10, sp_el0
+    mrs     x11, elr_el1
+    mrs     x12, spsr_el1
+    str     x10, [x9, #248]         // sp_el0
+    str     x11, [x9, #256]         // elr_el1
+    str     x12, [x9, #264]         // spsr_el1
 
     /*
      * Call Rust syscall handler
      * syscall_handler_rust(arg0, arg1, arg2, arg3, arg4, arg5, unused, num)
-     * Arguments already in x0-x5, need to pass x8 as syscall number
-     * x6 = unused (0), x7 = syscall number (was in x8)
      */
-    mov     x6, #0              // unused
-    mov     x7, x8              // syscall number
+    ldp     x0, x1, [x9, #0]        // arg0, arg1
+    ldp     x2, x3, [x9, #16]       // arg2, arg3
+    ldp     x4, x5, [x9, #32]       // arg4, arg5
+    mov     x6, #0                  // unused
+    ldr     x7, [x9, #64]           // syscall number (was x8)
     bl      syscall_handler_rust
 
-    /* Return value is in x0 - store it where we saved original x0 */
-    str     x0, [sp]            // Overwrite saved x0 with return value
+    /* syscall_handler_rust may have scheduled a different task */
+    /* Reload CURRENT_TRAP_FRAME (may have changed!) */
+    adrp    x9, CURRENT_TRAP_FRAME
+    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
-    /* Restore all registers including modified x0 */
-    ldr     x0, [sp], #8        // x0 now has syscall return value
-    ldp     x1, x2, [sp], #16
-    ldp     x3, x4, [sp], #16
-    ldp     x5, x6, [sp], #16
-    ldp     x7, x8, [sp], #16
-    ldp     x9, x10, [sp], #16  // x9 = user TTBR0
-    ldp     x11, x12, [sp], #16
-    ldp     x13, x14, [sp], #16
-    ldp     x15, x16, [sp], #16
-    ldp     x17, x18, [sp], #16
-    ldp     x19, x20, [sp], #16
-    ldp     x21, x22, [sp], #16
-    ldp     x23, x24, [sp], #16
-    ldp     x25, x26, [sp], #16
-    ldp     x27, x28, [sp], #16
-    ldp     x29, x30, [sp], #16
+    /* Store syscall return value in trap frame x0 */
+    str     x0, [x9, #0]
 
-    /* Restore user TTBR0 before returning */
-    msr     ttbr0_el1, x9
+    /* Restore special registers from trap frame */
+    ldr     x10, [x9, #248]         // sp_el0
+    ldr     x11, [x9, #256]         // elr_el1
+    ldr     x12, [x9, #264]         // spsr_el1
+    msr     sp_el0, x10
+    msr     elr_el1, x11
+    msr     spsr_el1, x12
+
+    /* Load CURRENT_TTBR0 (may be different task's address space) */
+    adrp    x10, CURRENT_TTBR0
+    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    msr     ttbr0_el1, x10
+    isb
+    tlbi    vmalle1
+    dsb     sy
     isb
 
-    /* Return to user mode */
+    /* Convert x9 (trap frame pointer) from physical to TTBR1 virtual address.
+     * After TTBR0 switch, we can only access kernel memory via TTBR1. */
+    movz    x10, #0xFFFF, lsl #48
+    orr     x9, x9, x10
+
+    /* Restore all general purpose registers from trap frame */
+    /* x9 now holds TTBR1 virtual address of trap frame */
+    ldp     x0, x1, [x9, #0]        // x0=0, x1=8
+    ldp     x2, x3, [x9, #16]       // x2=16, x3=24
+    ldp     x4, x5, [x9, #32]       // x4=32, x5=40
+    ldp     x6, x7, [x9, #48]       // x6=48, x7=56
+    ldr     x8, [x9, #64]           // x8=64
+    /* Skip x9 for now, load x10-x30 */
+    ldr     x10, [x9, #80]          // x10=80
+    ldr     x11, [x9, #88]          // x11=88
+    ldp     x12, x13, [x9, #96]     // x12=96, x13=104
+    ldp     x14, x15, [x9, #112]    // x14=112, x15=120
+    ldp     x16, x17, [x9, #128]    // x16=128, x17=136
+    ldp     x18, x19, [x9, #144]    // x18=144, x19=152
+    ldp     x20, x21, [x9, #160]    // x20=160, x21=168
+    ldp     x22, x23, [x9, #176]    // x22=176, x23=184
+    ldp     x24, x25, [x9, #192]    // x24=192, x25=200
+    ldp     x26, x27, [x9, #208]    // x26=208, x27=216
+    ldp     x28, x29, [x9, #224]    // x28=224, x29=232
+    ldr     x30, [x9, #240]         // x30=240
+    /* Finally restore x9 */
+    ldr     x9, [x9, #72]           // x9=72
+
+    /* Return to user mode (possibly different task!) */
     eret

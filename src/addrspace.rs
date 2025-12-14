@@ -32,11 +32,9 @@ impl AddressSpace {
     pub fn new() -> Option<Self> {
         // Allocate L0 table
         let l0_phys = pmm::alloc_page()?;
-        crate::println!("    [addrspace] L0 table at 0x{:08x}", l0_phys);
 
         // Allocate L1 table
         let l1_phys = pmm::alloc_page()?;
-        crate::println!("    [addrspace] L1 table at 0x{:08x}", l1_phys);
 
         // Zero out the tables
         unsafe {
@@ -136,9 +134,6 @@ impl AddressSpace {
         let l1_index = ((virt_addr >> 30) & 0x1FF) as usize;
         let l2_index = ((virt_addr >> 21) & 0x1FF) as usize;
         let l3_index = ((virt_addr >> 12) & 0x1FF) as usize;
-
-        crate::println!("    [map] 0x{:x} -> 0x{:x} L1[{}] L2[{}] L3[{}] w={} x={}",
-            virt_addr, phys_addr, l1_index, l2_index, l3_index, writable, executable);
 
         // For simplicity, this implementation only supports a single L2/L3 chain
         // A full implementation would track multiple L2/L3 tables
@@ -244,7 +239,6 @@ impl AddressSpace {
 
     /// Get the TTBR0 value for this address space
     pub fn get_ttbr0(&self) -> u64 {
-        crate::println!("    [addrspace] get_ttbr0 returning 0x{:08x}", self.ttbr0);
         self.ttbr0
     }
 }

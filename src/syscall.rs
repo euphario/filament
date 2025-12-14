@@ -157,17 +157,59 @@ fn sys_exit(code: i32) -> i64 {
     println!("  Process exited with code: {}", code);
     println!("========================================");
 
-    // Terminate current task
     unsafe {
-        crate::task::scheduler().terminate_current(code);
-    }
+        let sched = crate::task::scheduler();
+        sched.terminate_current(code);
+        sched.reap_terminated();
 
-    // For now, halt since we only have one process
-    // In full implementation, would switch to next task
-    println!("  No more processes - halting.");
-    loop {
-        unsafe { core::arch::asm!("wfi"); }
+        // Try to schedule next task
+        if let Some(next_slot) = sched.schedule() {
+            // Mark next task as running and update globals
+            sched.current = next_slot;
+            if let Some(ref mut task) = sched.tasks[next_slot] {
+                task.state = crate::task::TaskState::Running;
+            }
+            crate::task::update_current_task_globals();
+            println!("  Switching to task {}", next_slot);
+            // Return - svc_handler will load new task's state and eret
+            0
+        } else {
+            // No more tasks - halt
+            println!("  No more processes - halting.");
+            loop {
+                core::arch::asm!("wfi");
+            }
+        }
     }
+}
+
+/// Yield CPU to another process
+fn sys_yield() -> i64 {
+    unsafe {
+        let sched = crate::task::scheduler();
+
+        // Mark current as ready (not running)
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            task.state = crate::task::TaskState::Ready;
+        }
+
+        // Find next task
+        if let Some(next_slot) = sched.schedule() {
+            if next_slot != sched.current {
+                sched.current = next_slot;
+                if let Some(ref mut task) = sched.tasks[next_slot] {
+                    task.state = crate::task::TaskState::Running;
+                }
+                crate::task::update_current_task_globals();
+            } else {
+                // Same task, mark as running again
+                if let Some(ref mut task) = sched.tasks[sched.current] {
+                    task.state = crate::task::TaskState::Running;
+                }
+            }
+        }
+    }
+    0
 }
 
 /// Write to debug console
@@ -189,13 +231,6 @@ fn sys_debug_write(buf_ptr: u64, len: usize) -> i64 {
     }
 
     len as i64
-}
-
-/// Yield CPU
-fn sys_yield() -> i64 {
-    // In full implementation, would call scheduler
-    // unsafe { crate::task::scheduler().switch_to_next(); }
-    SyscallError::Success as i64
 }
 
 /// Get current process ID
@@ -369,9 +404,6 @@ fn sys_port_accept(listen_channel: u32) -> i64 {
 pub extern "C" fn syscall_handler_rust(
     arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, _unused: u64, num: u64
 ) -> i64 {
-    // Debug: show we got a syscall
-    crate::println!("[SYSCALL] num={} arg0=0x{:x} arg1=0x{:x}", num, arg0, arg1);
-
     let args = SyscallArgs {
         num,
         arg0,

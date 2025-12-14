@@ -293,45 +293,20 @@ enter_usermode:
     msr     elr_el1, x3
     msr     spsr_el1, x4
 
-    // Debug: write '1' before TTBR1 jump
-    mov     x10, #0x11000000
-    mov     x11, #'1'
-    str     w11, [x10]
-
     // Jump to TTBR1 address space before switching TTBR0
     // This allows us to safely flush TLB without losing access to kernel code
     adr     x10, 1f                 // Get physical address of trampoline
     movz    x11, #0xFFFF, lsl #48   // KERNEL_VIRT_BASE = 0xFFFF000000000000
     orr     x10, x10, x11           // Convert to TTBR1 virtual address
-
-    // Debug: write '2' and then jump target address
-    stp     x10, x11, [sp, #-16]!   // Save x10, x11
-    mov     x12, #0x11000000
-    mov     x13, #'2'
-    str     w13, [x12]
-    ldp     x10, x11, [sp], #16     // Restore
-
     br      x10                     // Jump to TTBR1 space
 
 1:
-    // Debug: write '3' after TTBR1 jump succeeded (still using TTBR0 identity map)
-    mov     x12, #0x11000000
-    mov     x13, #'3'
-    str     w13, [x12]
-
     // Now executing from TTBR1 space - safe to modify TTBR0
     msr     ttbr0_el1, x9
     isb
     tlbi    vmalle1                 // Flush all TLB entries
     dsb     sy
     isb
-
-    // Debug: write '4' using TTBR1 address for UART (TTBR0 no longer has device map)
-    movz    x12, #0x1100, lsl #16   // 0x11000000
-    movz    x13, #0xFFFF, lsl #48   // KERNEL_VIRT_BASE high bits
-    orr     x12, x12, x13           // 0xFFFF000011000000
-    mov     x13, #'4'
-    str     w13, [x12]
 
     // Zero all registers for clean user entry
     mov     x0, #0
@@ -366,13 +341,6 @@ enter_usermode:
     mov     x29, #0
     mov     x30, #0
 
-    // Debug: write 'E' to UART before eret (using TTBR1 address)
-    movz    x10, #0x1100, lsl #16   // 0x11000000
-    movz    x11, #0xFFFF, lsl #48
-    orr     x10, x10, x11           // 0xFFFF000011000000
-    mov     x11, #'E'
-    str     w11, [x10]
-
     // Return to user mode
     eret
 "#);
@@ -405,9 +373,9 @@ pub unsafe fn switch_context(current: &mut Task, next: &Task) {
 /// Simple scheduler state
 pub struct Scheduler {
     /// All tasks
-    tasks: [Option<Task>; MAX_TASKS],
+    pub tasks: [Option<Task>; MAX_TASKS],
     /// Currently running task index
-    current: usize,
+    pub current: usize,
     /// Next task ID to assign
     next_id: TaskId,
 }
@@ -503,14 +471,18 @@ impl Scheduler {
 
             if let Some(ref addr_space) = task.address_space {
                 let ttbr0 = addr_space.get_ttbr0();
-                let trap_frame = &task.trap_frame as *const TrapFrame;
+                let trap_frame = &mut task.trap_frame as *mut TrapFrame;
+
+                // Set globals for exception handler
+                CURRENT_TRAP_FRAME = trap_frame;
+                CURRENT_TTBR0 = ttbr0;
 
                 println!("  Entering user mode:");
                 println!("    Entry:  0x{:016x}", task.trap_frame.elr_el1);
                 println!("    Stack:  0x{:016x}", task.trap_frame.sp_el0);
                 println!("    TTBR0:  0x{:016x}", ttbr0);
 
-                enter_usermode(trap_frame, ttbr0);
+                enter_usermode(trap_frame as *const TrapFrame, ttbr0);
             }
         }
 
@@ -624,11 +596,32 @@ impl Scheduler {
 /// Global scheduler instance
 static mut SCHEDULER: Scheduler = Scheduler::new();
 
+/// Current task's trap frame pointer - used by exception handler
+#[no_mangle]
+pub static mut CURRENT_TRAP_FRAME: *mut TrapFrame = core::ptr::null_mut();
+
+/// Current task's TTBR0 value - used by exception handler
+#[no_mangle]
+pub static mut CURRENT_TTBR0: u64 = 0;
+
 /// Get the global scheduler
 /// # Safety
 /// Must ensure proper synchronization (interrupts disabled)
 pub unsafe fn scheduler() -> &'static mut Scheduler {
     &mut *core::ptr::addr_of_mut!(SCHEDULER)
+}
+
+/// Update the current task globals after scheduling decision
+/// # Safety
+/// Must be called with valid current task
+pub unsafe fn update_current_task_globals() {
+    let sched = scheduler();
+    if let Some(ref mut task) = sched.tasks[sched.current] {
+        CURRENT_TRAP_FRAME = &mut task.trap_frame as *mut TrapFrame;
+        if let Some(ref addr_space) = task.address_space {
+            CURRENT_TTBR0 = addr_space.get_ttbr0();
+        }
+    }
 }
 
 /// Test context switching

@@ -365,17 +365,10 @@ pub const USER_STACK_SIZE: usize = 64 * 1024;
 /// Spawn a new process from an ELF binary
 /// Returns (task_id, task_slot) on success
 pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), ElfError> {
-    println!("    [spawn] Free pages: {}", pmm::free_count());
-
     // Create a new user task
-    println!("    [spawn] Creating user task...");
     let (task_id, slot) = unsafe {
-        task::scheduler().add_user_task(name).ok_or_else(|| {
-            println!("    [spawn] FAILED: add_user_task");
-            ElfError::OutOfMemory
-        })?
+        task::scheduler().add_user_task(name).ok_or(ElfError::OutOfMemory)?
     };
-    println!("    [spawn] Task created, slot={}", slot);
 
     // Get access to the task's address space
     let task = unsafe {
@@ -385,17 +378,11 @@ pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), 
     let addr_space = task.address_space_mut().ok_or(ElfError::OutOfMemory)?;
 
     // Load the ELF into the address space
-    println!("    [spawn] Loading ELF...");
     let elf_info = load_elf(data, addr_space)?;
-    println!("    [spawn] ELF loaded");
 
     // Allocate user stack
     let stack_pages = USER_STACK_SIZE / 4096;
-    println!("    [spawn] Allocating {} pages for user stack...", stack_pages);
-    let stack_phys = pmm::alloc_pages(stack_pages).ok_or_else(|| {
-        println!("    [spawn] FAILED: stack allocation");
-        ElfError::OutOfMemory
-    })?;
+    let stack_phys = pmm::alloc_pages(stack_pages).ok_or(ElfError::OutOfMemory)?;
 
     // Map user stack (at USER_STACK_TOP - USER_STACK_SIZE to USER_STACK_TOP)
     let stack_base_virt = USER_STACK_TOP - USER_STACK_SIZE as u64;
@@ -411,45 +398,7 @@ pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), 
     // Set up the trap frame with entry point and user stack
     task.set_user_entry(elf_info.entry, USER_STACK_TOP);
 
-    println!("    Spawned process '{}' (PID {})", name, task_id);
-    println!("      Entry:  0x{:016x}", elf_info.entry);
-    println!("      Stack:  0x{:016x}", USER_STACK_TOP);
-    println!("      Loaded: {} segments", elf_info.segments_loaded);
-
-    // Debug: dump page table entries for 0x40010000
-    // VA 0x40010000: L0[0] -> L1[1] -> L2[0] -> L3[16]
-    unsafe {
-        let task = task::scheduler().task_mut(slot).unwrap();
-        let addr_space = task.address_space_mut().unwrap();
-
-        let l0_addr = addr_space.ttbr0 as *const u64;
-        let l0_entry = core::ptr::read_volatile(l0_addr.add(0)); // L0[0]
-        println!("    PT: L0[0] = 0x{:016x}", l0_entry);
-
-        if (l0_entry & 0x3) == 0x3 {
-            let l1_addr = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
-            let l1_entry = core::ptr::read_volatile(l1_addr.add(1)); // L1[1] for 0x40000000+
-            println!("    PT: L1[1] = 0x{:016x}", l1_entry);
-
-            if (l1_entry & 0x3) == 0x3 {
-                let l2_addr = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
-                let l2_entry = core::ptr::read_volatile(l2_addr.add(0)); // L2[0]
-                println!("    PT: L2[0] = 0x{:016x}", l2_entry);
-
-                if (l2_entry & 0x3) == 0x3 {
-                    let l3_addr = (l2_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
-                    let l3_entry = core::ptr::read_volatile(l3_addr.add(16)); // L3[16] for 0x40010000
-                    println!("    PT: L3[16] = 0x{:016x}", l3_entry);
-
-                    // Dump code at physical address
-                    let code_phys = (l3_entry & 0x0000_FFFF_FFFF_F000) as *const u32;
-                    let inst0 = core::ptr::read_volatile(code_phys);
-                    let inst1 = core::ptr::read_volatile(code_phys.add(1));
-                    println!("    Code: 0x{:08x} 0x{:08x} (MOV x8,#1; ADR x0,msg)", inst0, inst1);
-                }
-            }
-        }
-    }
+    println!("    Spawned '{}' (PID {}) entry=0x{:x}", name, task_id, elf_info.entry);
 
     Ok((task_id, slot))
 }
@@ -519,6 +468,64 @@ const TEST_ELF: &[u8] = &[
     // msg: "Hi!\n"
     b'H', b'i', b'!', b'\n',
 ];
+
+/// Second test ELF - prints "Yo!" and exits with code 7
+/// Entry point at 0x40020000 (different from first ELF)
+const TEST_ELF2: &[u8] = &[
+    // ELF Header (64 bytes)
+    0x7f, b'E', b'L', b'F',  // Magic
+    2,                        // Class: 64-bit
+    1,                        // Data: little endian
+    1,                        // Version
+    0,                        // OS/ABI
+    0, 0, 0, 0, 0, 0, 0, 0,  // Padding
+    2, 0,                     // Type: ET_EXEC
+    183, 0,                   // Machine: AArch64
+    1, 0, 0, 0,              // Version
+    0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // Entry: 0x40020000
+    0x40, 0, 0, 0, 0, 0, 0, 0,           // PHoff: 64
+    0, 0, 0, 0, 0, 0, 0, 0,              // SHoff: 0
+    0, 0, 0, 0,                          // Flags
+    64, 0,                               // EH size
+    56, 0,                               // PH entry size
+    1, 0,                                // PH count
+    0, 0,                                // SH entry size
+    0, 0,                                // SH count
+    0, 0,                                // SH string index
+
+    // Program Header (56 bytes) - at offset 64
+    1, 0, 0, 0,              // Type: PT_LOAD
+    5, 0, 0, 0,              // Flags: R-X
+    0x78, 0, 0, 0, 0, 0, 0, 0,           // Offset: 120 (where code starts)
+    0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // VAddr: 0x40020000
+    0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // PAddr: 0x40020000
+    0x20, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 32 bytes
+    0x20, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 32 bytes
+    0x00, 0x10, 0, 0, 0, 0, 0, 0,        // Align: 0x1000
+
+    // Code starts at offset 120 (0x78)
+    // mov x8, #1       ; syscall = DebugWrite
+    0x28, 0x00, 0x80, 0xd2,
+    // adr x0, msg      ; buffer = msg (PC-relative, +24 bytes)
+    0xc0, 0x00, 0x00, 0x10,
+    // mov x1, #3       ; len = 3
+    0x61, 0x00, 0x80, 0xd2,
+    // svc #0           ; syscall
+    0x01, 0x00, 0x00, 0xd4,
+    // mov x8, #0       ; syscall = Exit
+    0x08, 0x00, 0x80, 0xd2,
+    // mov x0, #7       ; code = 7
+    0xe0, 0x00, 0x80, 0xd2,
+    // svc #0           ; syscall
+    0x01, 0x00, 0x00, 0xd4,
+    // msg: "Yo!\n"
+    b'Y', b'o', b'!', b'\n',
+];
+
+/// Get the second test ELF binary
+pub fn get_test_elf2() -> &'static [u8] {
+    TEST_ELF2
+}
 
 /// Test ELF loading
 pub fn test() {
