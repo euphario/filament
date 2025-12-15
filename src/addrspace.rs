@@ -7,6 +7,15 @@ use crate::mmu::{self, PageTable, PAGE_SIZE, flags, attr};
 use crate::pmm;
 use crate::println;
 
+/// Kernel virtual address base for accessing physical memory via TTBR1
+const KERNEL_VIRT_BASE: u64 = 0xFFFF_0000_0000_0000;
+
+/// Convert a physical address to a kernel virtual address for access via TTBR1
+#[inline(always)]
+fn phys_to_virt(phys: u64) -> *mut u64 {
+    (KERNEL_VIRT_BASE | phys) as *mut u64
+}
+
 /// Maximum number of L1 entries we support for user space
 /// Entry 0 (0x00000000-0x3FFFFFFF) is typically reserved/device
 /// Entry 1+ (0x40000000+) can be used for user programs
@@ -36,19 +45,16 @@ impl AddressSpace {
         // Allocate L1 table
         let l1_phys = pmm::alloc_page()?;
 
-        // Zero out the tables
+        // Zero out the tables (must use TTBR1 mapping since MMU is enabled)
         unsafe {
-            let l0_ptr = l0_phys as *mut u64;
-            let l1_ptr = l1_phys as *mut u64;
+            let l0_ptr = phys_to_virt(l0_phys as u64);
+            let l1_ptr = phys_to_virt(l1_phys as u64);
             for i in 0..512 {
                 core::ptr::write_volatile(l0_ptr.add(i), 0);
                 core::ptr::write_volatile(l1_ptr.add(i), 0);
             }
-        }
 
-        // Set up L0 -> L1 table entry
-        unsafe {
-            let l0_ptr = l0_phys as *mut u64;
+            // Set up L0 -> L1 table entry
             // Entry 0: points to L1 table
             core::ptr::write_volatile(
                 l0_ptr,
@@ -104,7 +110,7 @@ impl AddressSpace {
         let xn = if executable { 0 } else { flags::UXN };
 
         unsafe {
-            let l1_ptr = l1_phys as *mut u64;
+            let l1_ptr = phys_to_virt(l1_phys);
             core::ptr::write_volatile(
                 l1_ptr.add(l1_index),
                 phys_start
@@ -141,7 +147,7 @@ impl AddressSpace {
         // Get or allocate L2 table
         let l1_phys = self.page_tables[1];
         let l2_phys = unsafe {
-            let l1_ptr = l1_phys as *mut u64;
+            let l1_ptr = phys_to_virt(l1_phys);
             let entry = core::ptr::read_volatile(l1_ptr.add(l1_index));
 
             if entry == 0 {
@@ -154,7 +160,7 @@ impl AddressSpace {
                     None => return false,
                 };
                 // Zero the new table
-                let new_ptr = new_l2 as *mut u64;
+                let new_ptr = phys_to_virt(new_l2 as u64);
                 for i in 0..512 {
                     core::ptr::write_volatile(new_ptr.add(i), 0);
                 }
@@ -177,7 +183,7 @@ impl AddressSpace {
 
         // Get or allocate L3 table
         let l3_phys = unsafe {
-            let l2_ptr = l2_phys as *mut u64;
+            let l2_ptr = phys_to_virt(l2_phys);
             let entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
 
             if entry == 0 {
@@ -190,7 +196,7 @@ impl AddressSpace {
                     None => return false,
                 };
                 // Zero the new table
-                let new_ptr = new_l3 as *mut u64;
+                let new_ptr = phys_to_virt(new_l3 as u64);
                 for i in 0..512 {
                     core::ptr::write_volatile(new_ptr.add(i), 0);
                 }
@@ -214,7 +220,7 @@ impl AddressSpace {
         let xn = if executable { 0 } else { flags::UXN };
 
         unsafe {
-            let l3_ptr = l3_phys as *mut u64;
+            let l3_ptr = phys_to_virt(l3_phys);
             core::ptr::write_volatile(
                 l3_ptr.add(l3_index),
                 phys_addr
@@ -248,7 +254,7 @@ impl AddressSpace {
         // Get or allocate L2 table
         let l1_phys = self.page_tables[1];
         let l2_phys = unsafe {
-            let l1_ptr = l1_phys as *mut u64;
+            let l1_ptr = phys_to_virt(l1_phys);
             let entry = core::ptr::read_volatile(l1_ptr.add(l1_index));
 
             if entry == 0 {
@@ -260,7 +266,7 @@ impl AddressSpace {
                     Some(addr) => addr,
                     None => return false,
                 };
-                let new_ptr = new_l2 as *mut u64;
+                let new_ptr = phys_to_virt(new_l2 as u64);
                 for i in 0..512 {
                     core::ptr::write_volatile(new_ptr.add(i), 0);
                 }
@@ -280,7 +286,7 @@ impl AddressSpace {
 
         // Get or allocate L3 table
         let l3_phys = unsafe {
-            let l2_ptr = l2_phys as *mut u64;
+            let l2_ptr = phys_to_virt(l2_phys);
             let entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
 
             if entry == 0 {
@@ -291,7 +297,7 @@ impl AddressSpace {
                     Some(addr) => addr,
                     None => return false,
                 };
-                let new_ptr = new_l3 as *mut u64;
+                let new_ptr = phys_to_virt(new_l3 as u64);
                 for i in 0..512 {
                     core::ptr::write_volatile(new_ptr.add(i), 0);
                 }
@@ -313,7 +319,7 @@ impl AddressSpace {
         let ap = if writable { flags::AP_RW_ALL } else { flags::AP_RO_ALL };
 
         unsafe {
-            let l3_ptr = l3_phys as *mut u64;
+            let l3_ptr = phys_to_virt(l3_phys);
             core::ptr::write_volatile(
                 l3_ptr.add(l3_index),
                 phys_addr
@@ -343,7 +349,7 @@ impl AddressSpace {
 
         unsafe {
             // Check L1 entry
-            let l1_ptr = l1_phys as *mut u64;
+            let l1_ptr = phys_to_virt(l1_phys);
             let l1_entry = core::ptr::read_volatile(l1_ptr.add(l1_index));
 
             if (l1_entry & flags::VALID) == 0 {
@@ -357,7 +363,7 @@ impl AddressSpace {
 
             // Get L2 table
             let l2_phys = l1_entry & 0x0000_FFFF_FFFF_F000;
-            let l2_ptr = l2_phys as *mut u64;
+            let l2_ptr = phys_to_virt(l2_phys);
             let l2_entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
 
             if (l2_entry & flags::VALID) == 0 {
@@ -371,7 +377,7 @@ impl AddressSpace {
 
             // Get L3 table
             let l3_phys = l2_entry & 0x0000_FFFF_FFFF_F000;
-            let l3_ptr = l3_phys as *mut u64;
+            let l3_ptr = phys_to_virt(l3_phys);
             let l3_entry = core::ptr::read_volatile(l3_ptr.add(l3_index));
 
             if (l3_entry & flags::VALID) == 0 {

@@ -16,11 +16,10 @@ use userlib::{println, print, syscall};
 
 // Physical addresses (for MMIO scheme)
 const SSUSB1_MAC_PHYS: u64 = 0x1120_0000;
-const SSUSB1_MAC_SIZE: u64 = 0x4000;
-const SSUSB1_IPPC_PHYS: u64 = 0x1120_3e00;
-const SSUSB1_IPPC_SIZE: u64 = 0x0200;
+const SSUSB1_MAC_SIZE: u64 = 0x4000;      // Includes IPPC at offset 0x3e00
+const SSUSB1_IPPC_OFFSET: usize = 0x3e00; // IPPC is within MAC region
 const SSUSB1_U2PHY_PHYS: u64 = 0x11c5_0000;
-const SSUSB1_U2PHY_SIZE: u64 = 0x0800;
+const SSUSB1_U2PHY_SIZE: u64 = 0x1000;    // Must be page-aligned (actual regs ~0x800)
 
 const SSUSB1_IRQ: u32 = 172;
 
@@ -215,8 +214,7 @@ fn print_hex32(val: u32) {
 // =============================================================================
 
 struct UsbDriver {
-    mac: MmioRegion,
-    ippc: MmioRegion,
+    mac: MmioRegion,  // Also contains IPPC at offset 0x3e00
     phy: MmioRegion,
     caplength: u32,
     num_ports: u32,
@@ -227,14 +225,9 @@ impl UsbDriver {
         println!("  Mapping MMIO regions...");
 
         let mac = MmioRegion::open(SSUSB1_MAC_PHYS, SSUSB1_MAC_SIZE)?;
-        print!("    MAC @ 0x");
+        print!("    MAC+IPPC @ 0x");
         print_hex32(SSUSB1_MAC_PHYS as u32);
-        println!(" -> OK");
-
-        let ippc = MmioRegion::open(SSUSB1_IPPC_PHYS, SSUSB1_IPPC_SIZE)?;
-        print!("    IPPC @ 0x");
-        print_hex32(SSUSB1_IPPC_PHYS as u32);
-        println!(" -> OK");
+        println!(" -> OK (IPPC at +0x3e00)");
 
         let phy = MmioRegion::open(SSUSB1_U2PHY_PHYS, SSUSB1_U2PHY_SIZE)?;
         print!("    PHY @ 0x");
@@ -243,11 +236,22 @@ impl UsbDriver {
 
         Some(Self {
             mac,
-            ippc,
             phy,
             caplength: 0,
             num_ports: 0,
         })
+    }
+
+    /// Read from IPPC registers (offset from MAC base)
+    #[inline(always)]
+    fn ippc_read32(&self, offset: usize) -> u32 {
+        self.mac.read32(SSUSB1_IPPC_OFFSET + offset)
+    }
+
+    /// Write to IPPC registers (offset from MAC base)
+    #[inline(always)]
+    fn ippc_write32(&self, offset: usize, value: u32) {
+        self.mac.write32(SSUSB1_IPPC_OFFSET + offset, value)
     }
 
     fn init(&mut self) -> bool {
@@ -256,18 +260,18 @@ impl UsbDriver {
 
         // Software reset
         println!("  Software reset...");
-        self.ippc.write32(ippc::IP_PW_CTRL0, ippc::IP_SW_RST);
+        self.ippc_write32(ippc::IP_PW_CTRL0, ippc::IP_SW_RST);
         delay(1000);
-        self.ippc.write32(ippc::IP_PW_CTRL0, 0);
+        self.ippc_write32(ippc::IP_PW_CTRL0, 0);
         delay(1000);
 
         // Power on host, power down device
         println!("  Host power on...");
-        self.ippc.write32(ippc::IP_PW_CTRL2, ippc::IP_DEV_PDN);
-        self.ippc.write32(ippc::IP_PW_CTRL1, 0); // Clear host PDN
+        self.ippc_write32(ippc::IP_PW_CTRL2, ippc::IP_DEV_PDN);
+        self.ippc_write32(ippc::IP_PW_CTRL1, 0); // Clear host PDN
 
         // Read port counts
-        let cap = self.ippc.read32(ippc::IP_XHCI_CAP);
+        let cap = self.ippc_read32(ippc::IP_XHCI_CAP);
         let u3_ports = (cap >> 8) & 0xF;
         let u2_ports = cap & 0xF;
         println!("  Ports: {} USB3, {} USB2", u3_ports, u2_ports);
@@ -275,26 +279,26 @@ impl UsbDriver {
         // Configure U3 ports (if any)
         for i in 0..u3_ports {
             let offset = ippc::U3_CTRL_P0 + (i as usize * 8);
-            let mut ctrl = self.ippc.read32(offset);
+            let mut ctrl = self.ippc_read32(offset);
             ctrl &= !(ippc::PORT_PDN | ippc::PORT_DIS);
             ctrl |= ippc::PORT_HOST_SEL;
-            self.ippc.write32(offset, ctrl);
+            self.ippc_write32(offset, ctrl);
         }
 
         // Configure U2 ports
         for i in 0..u2_ports {
             let offset = ippc::U2_CTRL_P0 + (i as usize * 8);
-            let mut ctrl = self.ippc.read32(offset);
+            let mut ctrl = self.ippc_read32(offset);
             ctrl &= !(ippc::PORT_PDN | ippc::PORT_DIS);
             ctrl |= ippc::PORT_HOST_SEL;
-            self.ippc.write32(offset, ctrl);
+            self.ippc_write32(offset, ctrl);
         }
 
         // Wait for clocks
         println!("  Waiting for clocks...");
         let required = ippc::SYSPLL_STABLE | ippc::REF_RST | ippc::SYS125_RST | ippc::XHCI_RST;
         for _ in 0..1000 {
-            let sts = self.ippc.read32(ippc::IP_PW_STS1);
+            let sts = self.ippc_read32(ippc::IP_PW_STS1);
             if (sts & required) == required {
                 println!("  Clocks stable");
                 break;
