@@ -28,7 +28,6 @@ mod task;
 mod timer;
 mod uaccess;
 mod uart;
-mod usb;
 
 use core::arch::global_asm;
 
@@ -183,10 +182,8 @@ pub extern "C" fn kmain() -> ! {
     println!("Testing SD/eMMC...");
     sd::test();
 
-    // Test USB (xHCI initialization)
-    println!();
-    println!("Testing USB...");
-    usb::test();
+    // Note: USB is now handled by userspace driver (bin/usbtest)
+    // The userspace driver uses MMIO and IRQ schemes to access hardware
 
     // Initialize ramfs (initrd)
     // The initrd address/size would typically be passed by U-Boot
