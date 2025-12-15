@@ -162,6 +162,9 @@ impl HeapMapping {
     }
 }
 
+/// Maximum number of children a process can have
+pub const MAX_CHILDREN: usize = 16;
+
 /// Task Control Block
 pub struct Task {
     /// Unique task ID
@@ -190,6 +193,14 @@ pub struct Task {
     pub fd_table: FdTable,
     /// Event queue for async notifications
     pub event_queue: EventQueue,
+    /// Parent task ID (0 for orphan/init)
+    pub parent_id: TaskId,
+    /// Child task IDs
+    pub children: [TaskId; MAX_CHILDREN],
+    /// Number of children
+    pub num_children: usize,
+    /// Exit code (valid when state is Terminated)
+    pub exit_code: i32,
 }
 
 impl Task {
@@ -228,6 +239,10 @@ impl Task {
             heap_next: USER_HEAP_START,
             fd_table: FdTable::new(),
             event_queue: EventQueue::new(),
+            parent_id: 0,
+            children: [0; MAX_CHILDREN],
+            num_children: 0,
+            exit_code: 0,
         })
     }
 
@@ -263,7 +278,47 @@ impl Task {
             heap_next: USER_HEAP_START,
             fd_table: FdTable::new(),
             event_queue: EventQueue::new(),
+            parent_id: 0,
+            children: [0; MAX_CHILDREN],
+            num_children: 0,
+            exit_code: 0,
         })
+    }
+
+    /// Set parent ID
+    pub fn set_parent(&mut self, parent_id: TaskId) {
+        self.parent_id = parent_id;
+    }
+
+    /// Add a child task ID
+    pub fn add_child(&mut self, child_id: TaskId) -> bool {
+        if self.num_children >= MAX_CHILDREN {
+            return false;
+        }
+        self.children[self.num_children] = child_id;
+        self.num_children += 1;
+        true
+    }
+
+    /// Remove a child task ID (when child is reaped)
+    pub fn remove_child(&mut self, child_id: TaskId) -> bool {
+        for i in 0..self.num_children {
+            if self.children[i] == child_id {
+                // Shift remaining children down
+                for j in i..self.num_children - 1 {
+                    self.children[j] = self.children[j + 1];
+                }
+                self.children[self.num_children - 1] = 0;
+                self.num_children -= 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if this task has any children
+    pub fn has_children(&self) -> bool {
+        self.num_children > 0
     }
 
     /// Set user-mode entry point and stack
@@ -354,15 +409,41 @@ impl Task {
 
         let mapping = self.heap_mappings[slot];
 
-        // Free physical pages
+        // Unmap pages from page tables
+        if let Some(ref mut addr_space) = self.address_space {
+            for i in 0..mapping.num_pages {
+                let page_virt = mapping.virt_addr + (i * 4096) as u64;
+                addr_space.unmap_page(page_virt);
+            }
+        }
+
+        // Invalidate TLB entries for the unmapped pages
+        // Use tlbi vale1is (VA, Last level, EL1, Inner Shareable) for each page
+        for i in 0..mapping.num_pages {
+            let page_virt = mapping.virt_addr + (i * 4096) as u64;
+            // TLBI expects VA[55:12] in bits[43:0] of the operand
+            let tlbi_addr = page_virt >> 12;
+            unsafe {
+                core::arch::asm!(
+                    "tlbi vale1is, {addr}",
+                    addr = in(reg) tlbi_addr,
+                );
+            }
+        }
+
+        // Ensure TLB invalidation completes before freeing physical memory
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",  // Ensure TLB invalidation completes
+                "isb",      // Synchronize instruction stream
+            );
+        }
+
+        // Free physical pages (safe now that TLB is invalidated)
         pmm::free_pages(mapping.phys_addr as usize, mapping.num_pages);
 
         // Clear mapping slot
         self.heap_mappings[slot] = HeapMapping::empty();
-
-        // Note: We don't actually unmap from the page tables here for simplicity.
-        // A full implementation would call addr_space.unmap_page() for each page.
-        // The pages will become inaccessible when reused, or on process exit.
 
         true
     }

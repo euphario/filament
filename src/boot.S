@@ -358,8 +358,9 @@ irq_from_user:
     msr     ttbr0_el1, x9
     isb
 
-    /* Now kernel stack is accessible - save x10 to stack */
-    str     x10, [sp, #-8]!
+    /* Now kernel stack is accessible - save x10, x11, x12 to stack */
+    stp     x10, x11, [sp, #-16]!
+    str     x12, [sp, #-8]!
 
     /* Get pointer to current task's trap frame */
     adrp    x9, CURRENT_TRAP_FRAME
@@ -371,12 +372,14 @@ irq_from_user:
     stp     x4, x5, [x9, #32]       // x4=32, x5=40
     stp     x6, x7, [x9, #48]       // x6=48, x7=56
     str     x8, [x9, #64]           // x8=64
-    /* Get original x9 from TPIDR_EL1, original x10 from stack */
+    /* Get original x9-x12 from their temp locations */
     mrs     x10, tpidr_el1          // x10 = original x9
-    ldr     x11, [sp], #8           // x11 = original x10
+    ldr     x11, [sp], #8           // x11 = original x12
+    str     x11, [x9, #96]          // x12=96
+    ldp     x11, x12, [sp], #16     // x11 = original x10, x12 = original x11
     stp     x10, x11, [x9, #72]     // x9=72, x10=80
-    str     x11, [x9, #88]          // x11=88
-    stp     x12, x13, [x9, #96]     // x12=96, x13=104
+    str     x12, [x9, #88]          // x11=88
+    str     x13, [x9, #104]         // x13=104
     stp     x14, x15, [x9, #112]    // x14=112, x15=120
     stp     x16, x17, [x9, #128]    // x16=128, x17=136
     stp     x18, x19, [x9, #144]    // x18=144, x19=152
@@ -469,8 +472,9 @@ svc_handler:
     msr     ttbr0_el1, x9
     isb
 
-    /* Now kernel stack is accessible - save x10 to stack */
-    str     x10, [sp, #-8]!
+    /* Now kernel stack is accessible - save x10, x11, x12 to stack */
+    stp     x10, x11, [sp, #-16]!
+    str     x12, [sp, #-8]!
 
     /* Get pointer to current task's trap frame */
     adrp    x9, CURRENT_TRAP_FRAME
@@ -483,12 +487,14 @@ svc_handler:
     stp     x4, x5, [x9, #32]       // x4=32, x5=40
     stp     x6, x7, [x9, #48]       // x6=48, x7=56
     str     x8, [x9, #64]           // x8=64
-    /* Get original x9 from TPIDR_EL1, original x10 from stack */
+    /* Get original x9-x12 from their temp locations */
     mrs     x10, tpidr_el1          // x10 = original x9
-    ldr     x11, [sp], #8           // x11 = original x10
+    ldr     x11, [sp], #8           // x11 = original x12
+    str     x11, [x9, #96]          // x12=96
+    ldp     x11, x12, [sp], #16     // x11 = original x10, x12 = original x11
     stp     x10, x11, [x9, #72]     // x9=72, x10=80
-    str     x11, [x9, #88]          // x11=88
-    stp     x12, x13, [x9, #96]     // x12=96, x13=104
+    str     x12, [x9, #88]          // x11=88
+    str     x13, [x9, #104]         // x13=104
     stp     x14, x15, [x9, #112]    // x14=112, x15=120
     stp     x16, x17, [x9, #128]    // x16=128, x17=136
     stp     x18, x19, [x9, #144]    // x18=144, x19=152

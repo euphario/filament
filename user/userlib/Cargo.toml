@@ -1,0 +1,10 @@
+[package]
+name = "userlib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# No external dependencies - uses core::fmt for formatting
+
+[features]
+default = []

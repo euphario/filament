@@ -174,6 +174,14 @@ pub fn try_getc() -> Option<char> {
     }
 }
 
+/// Read a character (blocking)
+pub fn getc() -> char {
+    // SAFETY: Single-threaded bare-metal environment
+    unsafe {
+        (*core::ptr::addr_of!(UART)).getc() as char
+    }
+}
+
 /// Print formatted output to the console
 #[macro_export]
 macro_rules! print {

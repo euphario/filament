@@ -38,6 +38,14 @@ impl Timer {
         // Disable timer while configuring
         Self::write_ctl(0);
 
+        // Enable EL0 access to virtual counter (CNTVCT_EL0)
+        // CNTKCTL_EL1: bit 1 = EL0VCTEN (enable virtual counter for EL0)
+        //              bit 0 = EL0PCTEN (enable physical counter for EL0)
+        unsafe {
+            core::arch::asm!("msr cntkctl_el1, {}", in(reg) 0x3u64);
+            core::arch::asm!("isb");
+        }
+
         // Enable timer interrupt in GIC (PPI 30)
         gic::enable_irq(TIMER_IRQ);
     }

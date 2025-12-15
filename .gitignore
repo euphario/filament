@@ -1,6 +1,13 @@
 # Build artifacts
 /target/
+user/target/
+user/shell/target/
 *.bin
+*.img
+*.tar
+
+# Keep ELF files for initrd but ignore intermediate build files
+!user/bin/*.elf
 
 # Cargo lock (optional - some prefer to commit it)
 # Cargo.lock

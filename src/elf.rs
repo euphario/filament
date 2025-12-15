@@ -365,6 +365,13 @@ pub const USER_STACK_SIZE: usize = 64 * 1024;
 /// Spawn a new process from an ELF binary
 /// Returns (task_id, task_slot) on success
 pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), ElfError> {
+    spawn_from_elf_with_parent(data, name, 0)
+}
+
+/// Spawn a new process from an ELF binary with a parent process
+/// Sets up parent-child relationship
+/// Returns (task_id, task_slot) on success
+pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::TaskId) -> Result<(task::TaskId, usize), ElfError> {
     // Create a new user task
     let (task_id, slot) = unsafe {
         task::scheduler().add_user_task(name).ok_or(ElfError::OutOfMemory)?
@@ -396,11 +403,115 @@ pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), 
     }
 
     // Set up the trap frame with entry point and user stack
+    let task = unsafe {
+        task::scheduler().task_mut(slot).ok_or(ElfError::OutOfMemory)?
+    };
     task.set_user_entry(elf_info.entry, USER_STACK_TOP);
 
-    println!("    Spawned '{}' (PID {}) entry=0x{:x}", name, task_id, elf_info.entry);
+    // Set up parent-child relationship
+    if parent_id != 0 {
+        task.set_parent(parent_id);
+
+        // Add child to parent's children list
+        unsafe {
+            let sched = task::scheduler();
+            for task_opt in sched.tasks.iter_mut() {
+                if let Some(ref mut parent_task) = task_opt {
+                    if parent_task.id == parent_id {
+                        parent_task.add_child(task_id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    println!("    Spawned '{}' (PID {}) entry=0x{:x} parent={}", name, task_id, elf_info.entry, parent_id);
 
     Ok((task_id, slot))
+}
+
+/// Built-in ELF binary IDs for spawn syscall (legacy)
+pub const ELF_ID_TEST1: u32 = 0;  // First test binary (prints 'A')
+pub const ELF_ID_TEST2: u32 = 1;  // Second test binary (prints 'B')
+
+/// Get ELF binary by ID (for spawn syscall - legacy)
+pub fn get_elf_by_id(id: u32) -> Option<&'static [u8]> {
+    match id {
+        ELF_ID_TEST1 => Some(TEST_ELF),
+        ELF_ID_TEST2 => Some(TEST_ELF2),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// Ramfs-based process spawning
+// ============================================================================
+
+/// Spawn a process from a file path in ramfs
+/// Searches /bin/<name> and /<name>
+pub fn spawn_from_path(path: &str) -> Result<(task::TaskId, usize), ElfError> {
+    spawn_from_path_with_parent(path, 0)
+}
+
+/// Spawn a process from a file path with a parent
+pub fn spawn_from_path_with_parent(path: &str, parent_id: task::TaskId) -> Result<(task::TaskId, usize), ElfError> {
+    // Try to find the file in ramfs
+    let data = find_executable(path).ok_or(ElfError::NotExecutable)?;
+
+    // Extract name from path for the process name
+    let name = path.rsplit('/').next().unwrap_or(path);
+
+    spawn_from_elf_with_parent(data, name, parent_id)
+}
+
+/// Find an executable in ramfs
+/// Searches: exact path, /bin/<name>, /<name>
+fn find_executable(path: &str) -> Option<&'static [u8]> {
+    use crate::ramfs;
+
+    // Try exact path first
+    if let Some(entry) = ramfs::find(path) {
+        if entry.is_file() {
+            return Some(entry.data_slice());
+        }
+    }
+
+    // Try with bin/ prefix
+    if !path.starts_with("bin/") && !path.starts_with("/bin/") {
+        let mut bin_path = [0u8; 128];
+        let prefix = b"bin/";
+        let path_bytes = path.as_bytes();
+        if prefix.len() + path_bytes.len() < bin_path.len() {
+            bin_path[..prefix.len()].copy_from_slice(prefix);
+            bin_path[prefix.len()..prefix.len() + path_bytes.len()].copy_from_slice(path_bytes);
+            let full_path = core::str::from_utf8(&bin_path[..prefix.len() + path_bytes.len()]).ok()?;
+            if let Some(entry) = ramfs::find(full_path) {
+                if entry.is_file() {
+                    return Some(entry.data_slice());
+                }
+            }
+        }
+    }
+
+    // Try ./bin/<name> (tar format often uses ./)
+    if !path.starts_with("./") {
+        let mut dot_path = [0u8; 128];
+        let prefix = b"./bin/";
+        let path_bytes = path.as_bytes();
+        if prefix.len() + path_bytes.len() < dot_path.len() {
+            dot_path[..prefix.len()].copy_from_slice(prefix);
+            dot_path[prefix.len()..prefix.len() + path_bytes.len()].copy_from_slice(path_bytes);
+            let full_path = core::str::from_utf8(&dot_path[..prefix.len() + path_bytes.len()]).ok()?;
+            if let Some(entry) = ramfs::find(full_path) {
+                if entry.is_file() {
+                    return Some(entry.data_slice());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Get the test ELF binary

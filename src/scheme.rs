@@ -381,6 +381,136 @@ impl KernelScheme for TimeScheme {
 /// IRQ scheme - allows processes to register for IRQ events
 pub struct IrqScheme;
 
+/// IRQ registration entry
+#[derive(Clone, Copy)]
+pub struct IrqRegistration {
+    /// IRQ number
+    pub irq_num: u32,
+    /// Process that registered for this IRQ
+    pub owner_pid: u32,
+    /// Whether an IRQ is pending (occurred but not yet read)
+    pub pending: bool,
+    /// Count of pending IRQs (allows coalescing)
+    pub pending_count: u32,
+}
+
+impl IrqRegistration {
+    pub const fn empty() -> Self {
+        Self {
+            irq_num: 0xFFFFFFFF,
+            owner_pid: 0,
+            pending: false,
+            pending_count: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.irq_num == 0xFFFFFFFF
+    }
+}
+
+/// Maximum IRQ registrations
+pub const MAX_IRQ_REGISTRATIONS: usize = 32;
+
+/// Global IRQ registration table
+static mut IRQ_REGISTRATIONS: [IrqRegistration; MAX_IRQ_REGISTRATIONS] =
+    [IrqRegistration::empty(); MAX_IRQ_REGISTRATIONS];
+
+/// Get IRQ registration table (unsafe, requires synchronization)
+pub unsafe fn irq_table() -> &'static mut [IrqRegistration; MAX_IRQ_REGISTRATIONS] {
+    &mut *core::ptr::addr_of_mut!(IRQ_REGISTRATIONS)
+}
+
+/// Register a process for an IRQ
+pub fn irq_register(irq_num: u32, pid: u32) -> bool {
+    unsafe {
+        let table = irq_table();
+
+        // Check if already registered
+        for reg in table.iter() {
+            if !reg.is_empty() && reg.irq_num == irq_num {
+                return false; // IRQ already taken
+            }
+        }
+
+        // Find empty slot
+        for reg in table.iter_mut() {
+            if reg.is_empty() {
+                reg.irq_num = irq_num;
+                reg.owner_pid = pid;
+                reg.pending = false;
+                reg.pending_count = 0;
+
+                // Enable the IRQ in the GIC
+                crate::gic::enable_irq(irq_num);
+
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Unregister a process from an IRQ
+pub fn irq_unregister(irq_num: u32, pid: u32) -> bool {
+    unsafe {
+        let table = irq_table();
+
+        for reg in table.iter_mut() {
+            if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
+                // Disable the IRQ in the GIC
+                crate::gic::disable_irq(irq_num);
+
+                *reg = IrqRegistration::empty();
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Called from IRQ handler when an interrupt fires
+/// Returns the PID to wake up, if any
+pub fn irq_notify(irq_num: u32) -> Option<u32> {
+    unsafe {
+        let table = irq_table();
+
+        for reg in table.iter_mut() {
+            if !reg.is_empty() && reg.irq_num == irq_num {
+                reg.pending = true;
+                reg.pending_count += 1;
+
+                // Send event to the process
+                let event = crate::event::Event::irq(irq_num);
+                crate::event::send_event(reg.owner_pid, event);
+
+                return Some(reg.owner_pid);
+            }
+        }
+        None
+    }
+}
+
+/// Check if an IRQ is pending for a process
+pub fn irq_check_pending(irq_num: u32, pid: u32) -> Option<u32> {
+    unsafe {
+        let table = irq_table();
+
+        for reg in table.iter_mut() {
+            if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
+                if reg.pending {
+                    let count = reg.pending_count;
+                    reg.pending = false;
+                    reg.pending_count = 0;
+                    return Some(count);
+                }
+                return None;
+            }
+        }
+        None
+    }
+}
+
 impl IrqScheme {
     // Handle encodes the IRQ number
 }
@@ -401,31 +531,158 @@ impl KernelScheme for IrqScheme {
             return Err(-22);
         }
 
+        // Get current process PID
+        let pid = unsafe {
+            let sched = crate::task::scheduler();
+            sched.tasks[sched.current]
+                .as_ref()
+                .map(|t| t.id)
+                .ok_or(-1)?
+        };
+
+        // Register for this IRQ
+        if !irq_register(irq_num, pid) {
+            return Err(-16); // EBUSY - IRQ already registered
+        }
+
         Ok(SchemeHandle {
             scheme_id: 0,
             handle: irq_num as u64,
+            flags: pid,  // Store PID in flags for close()
+        })
+    }
+
+    fn read(&self, handle: &SchemeHandle, buf: &mut [u8]) -> Result<usize, i32> {
+        if buf.len() < 4 {
+            return Err(-22);
+        }
+
+        let irq_num = handle.handle as u32;
+        let pid = handle.flags;
+
+        // Check if IRQ is pending
+        if let Some(count) = irq_check_pending(irq_num, pid) {
+            // Return the count of IRQs that fired
+            buf[..4].copy_from_slice(&count.to_le_bytes());
+            Ok(4)
+        } else {
+            // No pending IRQ - return EAGAIN (caller should wait on event)
+            Err(-11) // EAGAIN
+        }
+    }
+
+    fn write(&self, _handle: &SchemeHandle, _buf: &[u8]) -> Result<usize, i32> {
+        // Writing could be used to acknowledge/clear the IRQ
+        // For now, reading clears it automatically
+        Err(-1) // EPERM
+    }
+
+    fn close(&self, handle: &SchemeHandle) -> Result<(), i32> {
+        let irq_num = handle.handle as u32;
+        let pid = handle.flags;
+
+        // Unregister IRQ handler
+        irq_unregister(irq_num, pid);
+        Ok(())
+    }
+}
+
+/// Console scheme - provides UART serial console I/O
+/// Path format: empty or "0" for UART0
+pub struct ConsoleScheme;
+
+impl ConsoleScheme {
+    /// Handle types
+    const HANDLE_IN: u64 = 0;   // Read from console (stdin)
+    const HANDLE_OUT: u64 = 1;  // Write to console (stdout)
+    const HANDLE_ERR: u64 = 2;  // Write to console (stderr)
+    const HANDLE_RW: u64 = 3;   // Bidirectional
+}
+
+impl KernelScheme for ConsoleScheme {
+    fn name(&self) -> &'static str {
+        "console"
+    }
+
+    fn open(&self, path: &[u8], flags: u32) -> Result<SchemeHandle, i32> {
+        let path_str = core::str::from_utf8(path).map_err(|_| -22)?;
+
+        // Determine handle type based on path and flags
+        let handle = match path_str {
+            "" | "0" => {
+                // Check open flags
+                let access = flags & 0x3;
+                match access {
+                    0 => Self::HANDLE_IN,  // O_RDONLY
+                    1 => Self::HANDLE_OUT, // O_WRONLY
+                    2 => Self::HANDLE_RW,  // O_RDWR
+                    _ => Self::HANDLE_RW,
+                }
+            }
+            "in" | "stdin" => Self::HANDLE_IN,
+            "out" | "stdout" => Self::HANDLE_OUT,
+            "err" | "stderr" => Self::HANDLE_ERR,
+            _ => return Err(-2), // ENOENT
+        };
+
+        Ok(SchemeHandle {
+            scheme_id: 0,
+            handle,
             flags: 0,
         })
     }
 
     fn read(&self, handle: &SchemeHandle, buf: &mut [u8]) -> Result<usize, i32> {
-        // Reading from IRQ handle would block until IRQ fires
-        // For now, return the IRQ number
-        if buf.len() < 4 {
-            return Err(-22);
+        // Can only read from HANDLE_IN or HANDLE_RW
+        if handle.handle != Self::HANDLE_IN && handle.handle != Self::HANDLE_RW {
+            return Err(-9); // EBADF
         }
-        let irq = handle.handle as u32;
-        buf[..4].copy_from_slice(&irq.to_le_bytes());
-        Ok(4)
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Non-blocking read from UART
+        // Read as many characters as available (up to buf.len())
+        let mut count = 0;
+        while count < buf.len() {
+            match crate::uart::try_getc() {
+                Some(c) => {
+                    buf[count] = c as u8;
+                    count += 1;
+                    // Echo the character back for interactive use
+                    crate::uart::putc(c);
+                    if c == '\n' || c == '\r' {
+                        break; // Line-based input
+                    }
+                }
+                None => break, // No more characters available
+            }
+        }
+
+        if count > 0 {
+            Ok(count)
+        } else {
+            Err(-11) // EAGAIN - would block
+        }
     }
 
-    fn write(&self, _handle: &SchemeHandle, _buf: &[u8]) -> Result<usize, i32> {
-        Err(-1)
+    fn write(&self, handle: &SchemeHandle, buf: &[u8]) -> Result<usize, i32> {
+        // Can only write to HANDLE_OUT, HANDLE_ERR, or HANDLE_RW
+        if handle.handle == Self::HANDLE_IN {
+            return Err(-9); // EBADF
+        }
+
+        // Write all bytes to UART
+        for &byte in buf {
+            crate::uart::putc(byte as char);
+        }
+
+        Ok(buf.len())
     }
 
     fn close(&self, _handle: &SchemeHandle) -> Result<(), i32> {
-        // Unregister IRQ handler
-        Ok(())
+        Ok(()) // Nothing to clean up
     }
 }
 
@@ -490,6 +747,165 @@ impl KernelScheme for ZeroScheme {
     }
 }
 
+/// MMIO scheme - maps device memory into userspace
+/// Path format: <phys_addr_hex>/<size_hex>
+/// Example: mmio:10000000/1000 maps 0x1000 bytes at physical 0x10000000
+///
+/// Security: This scheme should only be accessible to privileged driver processes
+pub struct MmioScheme;
+
+impl MmioScheme {
+    /// Parse hex address from string
+    fn parse_hex(s: &str) -> Option<u64> {
+        let s = s.trim_start_matches("0x").trim_start_matches("0X");
+        u64::from_str_radix(s, 16).ok()
+    }
+
+    /// Allocate virtual address in device region
+    /// Uses a simple bump allocator in the device MMIO region
+    fn alloc_device_virt(num_pages: usize) -> Option<u64> {
+        const DEVICE_VIRT_START: u64 = 0x2000_0000; // 512MB mark for device mappings
+        const DEVICE_VIRT_END: u64 = 0x3000_0000;   // 768MB mark
+
+        unsafe {
+            static mut NEXT_VIRT: u64 = DEVICE_VIRT_START;
+            let virt = *core::ptr::addr_of!(NEXT_VIRT);
+            let new_virt = virt + (num_pages * 4096) as u64;
+
+            if new_virt > DEVICE_VIRT_END {
+                return None;
+            }
+
+            *core::ptr::addr_of_mut!(NEXT_VIRT) = new_virt;
+            Some(virt)
+        }
+    }
+}
+
+impl KernelScheme for MmioScheme {
+    fn name(&self) -> &'static str {
+        "mmio"
+    }
+
+    fn open(&self, path: &[u8], _flags: u32) -> Result<SchemeHandle, i32> {
+        let path_str = core::str::from_utf8(path).map_err(|_| -22)?;
+
+        // Parse phys_addr/size (no Vec in no_std, manual split)
+        let slash_pos = path_str.find('/').ok_or(-22)?;
+        let phys_str = &path_str[..slash_pos];
+        let size_str = &path_str[slash_pos + 1..];
+
+        if phys_str.is_empty() || size_str.is_empty() {
+            return Err(-22); // EINVAL
+        }
+
+        let phys_addr = Self::parse_hex(phys_str).ok_or(-22)?;
+        let size = Self::parse_hex(size_str).ok_or(-22)? as usize;
+
+        if size == 0 {
+            return Err(-22);
+        }
+
+        // Check alignment (must be page-aligned)
+        if phys_addr & 0xFFF != 0 || size & 0xFFF != 0 {
+            return Err(-22);
+        }
+
+        let num_pages = size / 4096;
+
+        // Allocate virtual address space
+        let virt_addr = Self::alloc_device_virt(num_pages).ok_or(-12)?; // ENOMEM
+
+        // Get current task and map device pages
+        unsafe {
+            let sched = crate::task::scheduler();
+            if let Some(ref mut task) = sched.tasks[sched.current] {
+                if let Some(ref mut addr_space) = task.address_space {
+                    for i in 0..num_pages {
+                        let page_virt = virt_addr + (i * 4096) as u64;
+                        let page_phys = phys_addr + (i * 4096) as u64;
+                        if !addr_space.map_device_page(page_virt, page_phys, true) {
+                            // Cleanup on failure (would need unmap logic)
+                            return Err(-12);
+                        }
+                    }
+
+                    // Invalidate TLB for the new mappings
+                    for i in 0..num_pages {
+                        let page_virt = virt_addr + (i * 4096) as u64;
+                        let tlbi_addr = page_virt >> 12;
+                        core::arch::asm!(
+                            "tlbi vale1is, {addr}",
+                            addr = in(reg) tlbi_addr,
+                        );
+                    }
+                    core::arch::asm!("dsb ish", "isb");
+                } else {
+                    return Err(-1); // Not a user task
+                }
+            } else {
+                return Err(-1);
+            }
+        }
+
+        // Encode virt_addr, phys_addr, and num_pages in handle
+        // For simplicity, store virt_addr in handle, phys/size available via path
+        Ok(SchemeHandle {
+            scheme_id: 0,
+            handle: virt_addr,
+            flags: ((num_pages as u32) << 16) | ((phys_addr >> 12) as u32 & 0xFFFF),
+        })
+    }
+
+    fn read(&self, handle: &SchemeHandle, buf: &mut [u8]) -> Result<usize, i32> {
+        // Return the virtual address as a u64
+        if buf.len() >= 8 {
+            buf[..8].copy_from_slice(&handle.handle.to_le_bytes());
+            Ok(8)
+        } else {
+            Err(-22)
+        }
+    }
+
+    fn write(&self, _handle: &SchemeHandle, _buf: &[u8]) -> Result<usize, i32> {
+        // MMIO scheme doesn't support write - access memory directly
+        Err(-22)
+    }
+
+    fn close(&self, handle: &SchemeHandle) -> Result<(), i32> {
+        let virt_addr = handle.handle;
+        let num_pages = (handle.flags >> 16) as usize;
+
+        if num_pages == 0 {
+            return Ok(());
+        }
+
+        // Unmap pages from current task's address space
+        unsafe {
+            let sched = crate::task::scheduler();
+            if let Some(ref mut task) = sched.tasks[sched.current] {
+                if let Some(ref mut addr_space) = task.address_space {
+                    for i in 0..num_pages {
+                        let page_virt = virt_addr + (i * 4096) as u64;
+                        addr_space.unmap_page(page_virt);
+
+                        // Invalidate TLB
+                        let tlbi_addr = page_virt >> 12;
+                        core::arch::asm!(
+                            "tlbi vale1is, {addr}",
+                            addr = in(reg) tlbi_addr,
+                        );
+                    }
+                    core::arch::asm!("dsb ish", "isb");
+                }
+            }
+        }
+
+        // Note: We don't track physical pages for MMIO - they're device memory, not RAM
+        Ok(())
+    }
+}
+
 // ============================================================================
 // Global scheme instances
 // ============================================================================
@@ -499,6 +915,19 @@ static TIME_SCHEME: TimeScheme = TimeScheme;
 static IRQ_SCHEME: IrqScheme = IrqScheme;
 static NULL_SCHEME: NullScheme = NullScheme;
 static ZERO_SCHEME: ZeroScheme = ZeroScheme;
+static CONSOLE_SCHEME: ConsoleScheme = ConsoleScheme;
+static MMIO_SCHEME: MmioScheme = MmioScheme;
+
+/// Kernel scheme IDs (must match registration order in init())
+pub mod scheme_ids {
+    pub const MEMORY: u16 = 0;
+    pub const TIME: u16 = 1;
+    pub const IRQ: u16 = 2;
+    pub const NULL: u16 = 3;
+    pub const ZERO: u16 = 4;
+    pub const CONSOLE: u16 = 5;
+    pub const MMIO: u16 = 6;
+}
 
 /// Get kernel scheme by name
 pub fn get_kernel_scheme(name: &str) -> Option<&'static dyn KernelScheme> {
@@ -508,6 +937,22 @@ pub fn get_kernel_scheme(name: &str) -> Option<&'static dyn KernelScheme> {
         "irq" => Some(&IRQ_SCHEME),
         "null" => Some(&NULL_SCHEME),
         "zero" => Some(&ZERO_SCHEME),
+        "console" => Some(&CONSOLE_SCHEME),
+        "mmio" => Some(&MMIO_SCHEME),
+        _ => None,
+    }
+}
+
+/// Get kernel scheme by ID
+pub fn get_kernel_scheme_by_id(id: u16) -> Option<&'static dyn KernelScheme> {
+    match id {
+        scheme_ids::MEMORY => Some(&MEMORY_SCHEME),
+        scheme_ids::TIME => Some(&TIME_SCHEME),
+        scheme_ids::IRQ => Some(&IRQ_SCHEME),
+        scheme_ids::NULL => Some(&NULL_SCHEME),
+        scheme_ids::ZERO => Some(&ZERO_SCHEME),
+        scheme_ids::CONSOLE => Some(&CONSOLE_SCHEME),
+        scheme_ids::MMIO => Some(&MMIO_SCHEME),
         _ => None,
     }
 }
@@ -570,27 +1015,107 @@ pub fn open_url(url: &[u8], flags: u32) -> Result<(FdEntry, SchemeHandle), i32> 
 
     // Check user schemes
     unsafe {
-        if let Some(_entry) = registry().find(scheme_name) {
-            // Would need to forward to user daemon via IPC
-            return Err(-38); // ENOSYS - not implemented
+        if let Some(entry) = registry().find(scheme_name) {
+            if entry.scheme_type == SchemeType::User {
+                // Forward to user daemon via IPC
+                return open_user_scheme(entry, path, flags);
+            }
         }
     }
 
     Err(-2) // ENOENT - scheme not found
 }
 
+/// Open a user scheme - sends request to daemon via IPC
+fn open_user_scheme(
+    entry: &SchemeEntry,
+    path: &str,
+    flags: u32,
+) -> Result<(FdEntry, SchemeHandle), i32> {
+    use crate::ipc::{self, Message, MessageType};
+
+    let daemon_channel = entry.channel_id;
+    let daemon_pid = entry.owner_pid;
+
+    // Get caller PID
+    let caller_pid = unsafe {
+        let sched = crate::task::scheduler();
+        sched.tasks[sched.current]
+            .as_ref()
+            .map(|t| t.id)
+            .ok_or(-1)?
+    };
+
+    // Create a channel pair for this connection
+    let (client_ch, server_ch) = unsafe {
+        ipc::channel_table()
+            .create_pair(caller_pid, daemon_pid)
+            .ok_or(-12)? // ENOMEM
+    };
+
+    // Build open request message
+    // Format: flags (4 bytes) + path (remaining bytes)
+    let mut payload = [0u8; ipc::MAX_INLINE_PAYLOAD];
+    payload[0..4].copy_from_slice(&flags.to_le_bytes());
+    let path_bytes = path.as_bytes();
+    let path_len = core::cmp::min(path_bytes.len(), ipc::MAX_INLINE_PAYLOAD - 4);
+    payload[4..4 + path_len].copy_from_slice(&path_bytes[..path_len]);
+
+    // Create connect message
+    let msg = Message {
+        header: crate::ipc::MessageHeader {
+            msg_type: MessageType::Connect,
+            sender: caller_pid,
+            msg_id: server_ch, // Send the server channel so daemon knows where to respond
+            payload_len: (4 + path_len) as u32,
+            flags: 0,
+        },
+        payload,
+    };
+
+    // Send to daemon's main channel
+    unsafe {
+        let table = ipc::channel_table();
+        table.send(daemon_channel, msg).map_err(|e| e.to_errno())?;
+    }
+
+    // For non-blocking operation, we return immediately with the client channel
+    // The daemon will process the request and send a response
+    // For full blocking, we'd wait for a response here
+
+    // Create FD entry that wraps the channel
+    let fd_entry = FdEntry {
+        fd_type: FdType::Channel(client_ch),
+        flags: FdFlags {
+            readable: true,
+            writable: (flags & 0x3) != 0,
+            nonblocking: (flags & 0x800) != 0,
+        },
+        offset: 0,
+    };
+
+    let handle = SchemeHandle {
+        scheme_id: entry.id,
+        handle: client_ch as u64,
+        flags,
+    };
+
+    Ok((fd_entry, handle))
+}
+
 /// Initialize kernel schemes
 pub fn init() {
     unsafe {
         let reg = registry();
-        reg.register_kernel("memory");
-        reg.register_kernel("time");
-        reg.register_kernel("irq");
-        reg.register_kernel("null");
-        reg.register_kernel("zero");
-        reg.register_kernel("console");
+        reg.register_kernel("memory");   // ID 0
+        reg.register_kernel("time");     // ID 1
+        reg.register_kernel("irq");      // ID 2
+        reg.register_kernel("null");     // ID 3
+        reg.register_kernel("zero");     // ID 4
+        reg.register_kernel("console");  // ID 5
+        reg.register_kernel("mmio");     // ID 6
     }
-    println!("  Registered kernel schemes: memory, time, irq, null, zero, console");
+    println!("  Registered kernel schemes: memory, time, irq, null, zero, console, mmio");
 }
 
 /// Test scheme system

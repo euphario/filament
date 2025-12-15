@@ -12,18 +12,21 @@ mod eth;
 mod event;
 mod fd;
 mod gic;
+mod initrd;
 mod ipc;
 mod mmu;
 mod panic;
 mod pmm;
 mod port;
 mod process;
+mod ramfs;
 mod scheme;
 mod sd;
 mod smp;
 mod syscall;
 mod task;
 mod timer;
+mod uaccess;
 mod uart;
 
 use core::arch::global_asm;
@@ -179,6 +182,15 @@ pub extern "C" fn kmain() -> ! {
     println!("Testing SD/eMMC...");
     sd::test();
 
+    // Initialize ramfs (initrd)
+    // The initrd address/size would typically be passed by U-Boot
+    // For now, check if an initrd was loaded at a known address
+    println!();
+    println!("========================================");
+    println!("  Initializing ramfs");
+    println!("========================================");
+    init_ramfs();
+
     // Enable IRQs before entering user mode
     println!();
     println!("Enabling interrupts...");
@@ -187,32 +199,20 @@ pub extern "C" fn kmain() -> ! {
     }
     println!("[OK] Interrupts enabled");
 
-    // Spawn multiple processes
+    // Spawn shell process
     println!();
     println!("========================================");
-    println!("  Spawning user processes");
+    println!("  Spawning shell");
     println!("========================================");
 
-    // Spawn first process
-    let slot1 = match elf::spawn_from_elf(elf::get_test_elf(), "init") {
+    // Spawn interactive shell from ramfs
+    let slot1 = match elf::spawn_from_path("bin/shell") {
         Ok((_task_id, slot)) => {
-            println!("  Process 'init' spawned at slot {}", slot);
+            println!("  Process 'shell' spawned at slot {}", slot);
             Some(slot)
         }
         Err(e) => {
-            println!("  [!!] Failed to spawn init: {:?}", e);
-            None
-        }
-    };
-
-    // Spawn second process
-    let _slot2 = match elf::spawn_from_elf(elf::get_test_elf2(), "worker") {
-        Ok((_task_id, slot)) => {
-            println!("  Process 'worker' spawned at slot {}", slot);
-            Some(slot)
-        }
-        Err(e) => {
-            println!("  [!!] Failed to spawn worker: {:?}", e);
+            println!("  [!!] Failed to spawn shell: {:?}", e);
             None
         }
     };
@@ -296,7 +296,24 @@ pub extern "C" fn irq_handler_rust(from_user: u64) {
             }
         }
     } else {
-        println!("[IRQ] Unhandled interrupt: {}", irq);
+        // Check if this IRQ is registered by a userspace driver
+        if let Some(owner_pid) = scheme::irq_notify(irq) {
+            // Wake the owner process if blocked
+            unsafe {
+                let sched = task::scheduler();
+                for task_opt in sched.tasks.iter_mut() {
+                    if let Some(ref mut task) = task_opt {
+                        if task.id == owner_pid && task.state == task::TaskState::Blocked {
+                            task.state = task::TaskState::Ready;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Truly unhandled interrupt
+            println!("[IRQ] Unhandled interrupt: {}", irq);
+        }
     }
 
     // Signal end of interrupt
@@ -339,5 +356,36 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
 
     loop {
         unsafe { core::arch::asm!("wfe"); }
+    }
+}
+
+/// Initialize ramfs from embedded or external initrd
+fn init_ramfs() {
+    // First, try embedded initrd (compiled into kernel)
+    if let Some((addr, size)) = initrd::get_embedded_initrd() {
+        println!("  Found embedded initrd at 0x{:08x} ({} bytes)", addr, size);
+        let count = ramfs::init(addr, size);
+        println!("  Loaded {} files from embedded initrd", count);
+        ramfs::list();
+        return;
+    }
+
+    // Fall back to external initrd at fixed address
+    const INITRD_ADDR: usize = 0x4800_0000;
+    const INITRD_MAX_SIZE: usize = 16 * 1024 * 1024;
+
+    // Check for TAR magic (ustar at offset 257)
+    let magic_check = unsafe {
+        let ptr = INITRD_ADDR as *const u8;
+        let ustar_magic = core::slice::from_raw_parts(ptr.add(257), 5);
+        ustar_magic == b"ustar"
+    };
+
+    if magic_check {
+        let count = ramfs::init(INITRD_ADDR, INITRD_MAX_SIZE);
+        println!("  Loaded {} files from external initrd at 0x{:08x}", count, INITRD_ADDR);
+        ramfs::list();
+    } else {
+        println!("  No initrd found (build with: cd user && ./mkinitrd.sh)");
     }
 }

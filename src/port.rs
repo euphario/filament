@@ -363,6 +363,41 @@ pub fn sys_port_accept(listen_channel: ChannelId, caller: Pid) -> Result<Channel
 }
 
 // ============================================================================
+// Buffer-based syscall wrappers (for use after copy_from_user)
+// These take kernel buffers directly instead of user pointers
+// ============================================================================
+
+/// Register a port using a kernel buffer
+pub fn sys_port_register_buf(name: &[u8], caller: Pid) -> Result<ChannelId, PortError> {
+    if name.is_empty() || name.len() > MAX_PORT_NAME - 1 {
+        return Err(PortError::InvalidMessage);
+    }
+
+    let name_str = core::str::from_utf8(name).map_err(|_| PortError::InvalidMessage)?;
+    unsafe { port_registry().register(name_str, caller) }
+}
+
+/// Unregister a port using a kernel buffer
+pub fn sys_port_unregister_buf(name: &[u8], caller: Pid) -> Result<(), PortError> {
+    if name.is_empty() || name.len() > MAX_PORT_NAME - 1 {
+        return Err(PortError::InvalidMessage);
+    }
+
+    let name_str = core::str::from_utf8(name).map_err(|_| PortError::InvalidMessage)?;
+    unsafe { port_registry().unregister(name_str, caller) }
+}
+
+/// Connect to a port using a kernel buffer
+pub fn sys_port_connect_buf(name: &[u8], caller: Pid) -> Result<ChannelId, PortError> {
+    if name.is_empty() || name.len() > MAX_PORT_NAME - 1 {
+        return Err(PortError::InvalidMessage);
+    }
+
+    let name_str = core::str::from_utf8(name).map_err(|_| PortError::InvalidMessage)?;
+    unsafe { port_registry().connect(name_str, caller) }
+}
+
+// ============================================================================
 // Testing
 // ============================================================================
 

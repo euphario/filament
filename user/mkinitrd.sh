@@ -1,0 +1,62 @@
+#!/bin/bash
+# Create initrd TAR archive for BPI-R4 kernel
+#
+# Usage: ./mkinitr.sh [output.tar]
+#
+# This script builds all user programs and packages them into a TAR archive
+# that can be loaded by U-Boot as an initrd.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+OUTPUT="${1:-initrd.tar}"
+
+echo "Building initrd: $OUTPUT"
+echo ""
+
+# Build user programs first
+./build.sh
+
+# Create staging directory
+STAGING="$SCRIPT_DIR/initrd_staging"
+rm -rf "$STAGING"
+mkdir -p "$STAGING/bin"
+
+# Copy ELF binaries to staging
+echo "Staging files..."
+for elf in bin/*.elf; do
+    if [ -f "$elf" ]; then
+        name=$(basename "$elf" .elf)
+        cp "$elf" "$STAGING/bin/$name"
+        echo "  bin/$name"
+    fi
+done
+
+# Create the TAR archive (POSIX format for compatibility)
+echo ""
+echo "Creating TAR archive..."
+cd "$STAGING"
+tar --format=ustar -cvf "$SCRIPT_DIR/$OUTPUT" .
+
+# Show result
+cd "$SCRIPT_DIR"
+echo ""
+echo "Created: $OUTPUT ($(ls -lh "$OUTPUT" | awk '{print $5}'))"
+echo ""
+
+# Also create a binary blob that can be embedded or loaded
+# Add padding to align to 4KB for easier loading
+PADDED_SIZE=$(( (($(stat -f%z "$OUTPUT") + 4095) / 4096) * 4096 ))
+dd if=/dev/zero bs=1 count=$PADDED_SIZE of="${OUTPUT%.tar}.img" 2>/dev/null
+dd if="$OUTPUT" of="${OUTPUT%.tar}.img" conv=notrunc 2>/dev/null
+echo "Created: ${OUTPUT%.tar}.img ($(ls -lh "${OUTPUT%.tar}.img" | awk '{print $5}'), 4KB aligned)"
+
+# Cleanup staging
+rm -rf "$STAGING"
+
+echo ""
+echo "To load with U-Boot:"
+echo "  fatload mmc 0:1 \$ramdisk_addr_r initrd.img"
+echo "  booti \$kernel_addr_r \$ramdisk_addr_r:\$filesize \$fdt_addr_r"

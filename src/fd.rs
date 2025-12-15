@@ -3,6 +3,8 @@
 //! Provides file descriptor abstraction for user processes.
 //! In Redox style, everything is a file - console, devices, IPC, etc.
 
+use crate::ipc::{self, MessageType};
+use crate::process::Pid;
 use crate::uart;
 
 /// Maximum file descriptors per process
@@ -51,8 +53,17 @@ pub enum FdType {
     Null,
     /// IPC channel
     Channel(u32),  // Channel ID
-    // Future: scheme-based file
-    // Scheme { scheme_id: u32, handle: u64 },
+    /// Scheme-based file (kernel or user scheme)
+    Scheme {
+        scheme_id: u16,
+        handle: u64,
+    },
+    /// MMIO mapping (device memory mapped to userspace)
+    Mmio {
+        virt_addr: u64,    // Virtual address in user space
+        phys_addr: u64,    // Physical address of device
+        num_pages: usize,  // Number of pages mapped
+    },
 }
 
 /// A file descriptor entry
@@ -194,54 +205,142 @@ impl FdTable {
 
 /// Read from a file descriptor
 /// Returns number of bytes read, or negative error
-pub fn fd_read(entry: &FdEntry, buf: &mut [u8]) -> isize {
+/// caller_pid: Required for channel operations (permission check)
+pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
     if !entry.flags.readable {
-        return -1; // EBADF
+        return -9; // EBADF
     }
 
     match entry.fd_type {
-        FdType::None => -1,
+        FdType::None => -9, // EBADF
         FdType::ConsoleIn => {
-            // Read from UART (blocking for now)
-            // For simplicity, just read one character if available
+            // Read from UART
             if buf.is_empty() {
                 return 0;
             }
-            // Non-blocking read attempt
-            match uart::try_getc() {
-                Some(c) => {
-                    buf[0] = c as u8;
-                    1
+
+            if entry.flags.nonblocking {
+                // Non-blocking: return immediately
+                match uart::try_getc() {
+                    Some(c) => {
+                        buf[0] = c as u8;
+                        1
+                    }
+                    None => -11, // EAGAIN
                 }
-                None => {
+            } else {
+                // Blocking: wait for data, reading as much as available
+                // First character is blocking
+                let c = uart::getc();
+                buf[0] = c as u8;
+                let mut count = 1;
+
+                // Read more if available (non-blocking for subsequent chars)
+                while count < buf.len() {
+                    match uart::try_getc() {
+                        Some(c) => {
+                            buf[count] = c as u8;
+                            count += 1;
+                        }
+                        None => break,
+                    }
+                }
+                count as isize
+            }
+        }
+        FdType::ConsoleOut => -9, // EBADF - Can't read from output
+        FdType::Null => 0,        // EOF
+        FdType::Channel(channel_id) => {
+            // Read from IPC channel
+            match ipc::sys_receive(channel_id, caller_pid) {
+                Ok(msg) => {
+                    // Only process data-like messages for read()
+                    match msg.header.msg_type {
+                        MessageType::Data | MessageType::Reply => {
+                            let payload = msg.payload_slice();
+                            let copy_len = core::cmp::min(payload.len(), buf.len());
+                            buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                            copy_len as isize
+                        }
+                        MessageType::Close => {
+                            // Peer closed - return EOF
+                            0
+                        }
+                        MessageType::Error => {
+                            // Extract error code from payload
+                            if msg.header.payload_len >= 4 {
+                                let err_bytes: [u8; 4] = msg.payload[0..4].try_into().unwrap();
+                                i32::from_le_bytes(err_bytes) as isize
+                            } else {
+                                -5 // EIO
+                            }
+                        }
+                        _ => {
+                            // Other message types (Request, Connect, Accept)
+                            // For simple read(), treat as data
+                            let payload = msg.payload_slice();
+                            let copy_len = core::cmp::min(payload.len(), buf.len());
+                            buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                            copy_len as isize
+                        }
+                    }
+                }
+                Err(ipc::IpcError::WouldBlock) => {
                     if entry.flags.nonblocking {
                         -11 // EAGAIN
                     } else {
-                        // Would block - for now return 0
-                        0
+                        // Register for blocking - syscall layer handles actual blocking
+                        unsafe {
+                            let _ = ipc::channel_table().block_receiver(channel_id, caller_pid);
+                        }
+                        -11 // EAGAIN - caller should block and retry
                     }
                 }
+                Err(ipc::IpcError::PeerClosed) => 0, // EOF
+                Err(ipc::IpcError::InvalidChannel) => -9, // EBADF
+                Err(_) => -5, // EIO
             }
         }
-        FdType::ConsoleOut => -1, // Can't read from output
-        FdType::Null => 0,        // EOF
-        FdType::Channel(_id) => {
-            // TODO: Read from IPC channel
-            -1
+        FdType::Scheme { scheme_id, handle } => {
+            // Read from kernel scheme
+            if let Some(scheme) = crate::scheme::get_kernel_scheme_by_id(scheme_id) {
+                let scheme_handle = crate::scheme::SchemeHandle {
+                    scheme_id,
+                    handle,
+                    flags: 0,
+                };
+                match scheme.read(&scheme_handle, buf) {
+                    Ok(n) => n as isize,
+                    Err(e) => e as isize,
+                }
+            } else {
+                -9 // EBADF
+            }
+        }
+        FdType::Mmio { virt_addr, .. } => {
+            // For MMIO FDs, read returns the mapped virtual address
+            // (User can then access memory directly via mmap-style access)
+            if buf.len() >= 8 {
+                buf[..8].copy_from_slice(&virt_addr.to_le_bytes());
+                8
+            } else {
+                -22 // EINVAL
+            }
         }
     }
 }
 
 /// Write to a file descriptor
 /// Returns number of bytes written, or negative error
-pub fn fd_write(entry: &FdEntry, buf: &[u8]) -> isize {
+/// caller_pid: Required for channel operations (permission check)
+pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
     if !entry.flags.writable {
-        return -1; // EBADF
+        return -9; // EBADF
     }
 
     match entry.fd_type {
-        FdType::None => -1,
-        FdType::ConsoleIn => -1, // Can't write to input
+        FdType::None => -9, // EBADF
+        FdType::ConsoleIn => -9, // EBADF - Can't write to input
         FdType::ConsoleOut => {
             // Write to UART
             for &byte in buf {
@@ -250,9 +349,52 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8]) -> isize {
             buf.len() as isize
         }
         FdType::Null => buf.len() as isize, // Discard
-        FdType::Channel(_id) => {
-            // TODO: Write to IPC channel
-            -1
+        FdType::Channel(channel_id) => {
+            // Write to IPC channel
+            // Split data into chunks if needed (max payload is MAX_INLINE_PAYLOAD)
+            let max_payload = ipc::MAX_INLINE_PAYLOAD;
+            let chunk = if buf.len() > max_payload {
+                &buf[..max_payload]
+            } else {
+                buf
+            };
+
+            match ipc::sys_send(channel_id, caller_pid, chunk) {
+                Ok(()) => chunk.len() as isize,
+                Err(ipc::IpcError::QueueFull) => {
+                    if entry.flags.nonblocking {
+                        -11 // EAGAIN
+                    } else {
+                        // Would block - for now return EAGAIN
+                        // Full blocking would require blocking the sender
+                        -11
+                    }
+                }
+                Err(ipc::IpcError::PeerClosed) => -32, // EPIPE
+                Err(ipc::IpcError::InvalidChannel) => -9, // EBADF
+                Err(ipc::IpcError::PermissionDenied) => -13, // EACCES
+                Err(_) => -5, // EIO
+            }
+        }
+        FdType::Scheme { scheme_id, handle } => {
+            // Write to kernel scheme
+            if let Some(scheme) = crate::scheme::get_kernel_scheme_by_id(scheme_id) {
+                let scheme_handle = crate::scheme::SchemeHandle {
+                    scheme_id,
+                    handle,
+                    flags: 0,
+                };
+                match scheme.write(&scheme_handle, buf) {
+                    Ok(n) => n as isize,
+                    Err(e) => e as isize,
+                }
+            } else {
+                -9 // EBADF
+            }
+        }
+        FdType::Mmio { .. } => {
+            // MMIO FDs don't support write() - access memory directly
+            -22 // EINVAL
         }
     }
 }

@@ -1,0 +1,18 @@
+[build]
+target = "aarch64-unknown-none"
+# Use separate target directory to avoid conflicts with kernel
+target-dir = "target"
+
+[target.aarch64-unknown-none]
+# Override kernel's linker script with user program linker script
+# This completely replaces the parent config's rustflags
+rustflags = [
+    "-C", "link-arg=-Tuser.ld",
+    "-C", "link-arg=--gc-sections",
+    "-C", "link-arg=-n",
+]
+linker = "rust-lld"
+
+[unstable]
+build-std = ["core"]
+build-std-features = ["compiler-builtins-mem"]

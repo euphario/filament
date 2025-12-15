@@ -293,6 +293,13 @@ pub fn enable_irq(irq: u32) {
     }
 }
 
+/// Disable an IRQ
+pub fn disable_irq(irq: u32) {
+    unsafe {
+        (*core::ptr::addr_of_mut!(GIC)).disable_irq(irq);
+    }
+}
+
 /// Acknowledge IRQ
 pub fn ack_irq() -> u32 {
     unsafe { (*core::ptr::addr_of!(GIC)).ack_irq() }

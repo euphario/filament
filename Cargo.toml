@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["Your Name"]
 description = "Bare-metal kernel for Banana Pi BPI-R4 (MT7988A)"
 
+[features]
+default = ["embed-initrd"]
+embed-initrd = []  # Embed user/initrd.tar in kernel binary
+
 [dependencies]
 
 [profile.dev]
