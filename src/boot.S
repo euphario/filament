@@ -132,6 +132,63 @@ hang:
     wfe
     b       hang
 
+/*
+ * Secondary CPU entry point
+ * Called via PSCI CPU_ON or when mailbox is set
+ */
+.global secondary_start
+secondary_start:
+    /* Disable interrupts */
+    msr     daifset, #0xf
+
+    /* Get CPU ID */
+    mrs     x0, mpidr_el1
+    and     x0, x0, #0xff
+
+    /* Check if we're at EL2, drop to EL1 if needed */
+    mrs     x1, currentel
+    lsr     x1, x1, #2
+    and     x1, x1, #0x3
+    cmp     x1, #2
+    b.ne    secondary_el1_entry
+
+    /* EL2 -> EL1 setup for secondary */
+    mov     x1, #(1 << 31)
+    msr     hcr_el2, x1
+    mov     x1, #0b1111000101
+    msr     spsr_el2, x1
+    adr     x1, secondary_el1_entry
+    msr     elr_el2, x1
+    mrs     x1, cnthctl_el2
+    orr     x1, x1, #3
+    msr     cnthctl_el2, x1
+    msr     cntvoff_el2, xzr
+    mov     x1, #0x33ff
+    msr     cptr_el2, x1
+    eret
+
+secondary_el1_entry:
+    /* x0 still has CPU ID */
+
+    /* Load stack pointer from per-CPU stacks */
+    /* Stack address = CPU_STACKS + (cpu_id + 1) * CPU_STACK_SIZE */
+    ldr     x1, =CPU_STACKS
+    mov     x2, #(16 * 1024)        // CPU_STACK_SIZE
+    add     x3, x0, #1
+    mul     x2, x2, x3
+    add     sp, x1, x2
+
+    /* Set up VBAR_EL1 to kernel's exception vectors */
+    ldr     x1, =exception_vectors
+    /* Convert to kernel virtual address */
+    mov     x2, #0xffff000000000000
+    orr     x1, x1, x2
+    msr     vbar_el1, x1
+
+    /* Call Rust secondary CPU entry with CPU ID in x0 */
+    bl      secondary_cpu_entry
+
+    /* Should not return, but if it does, halt */
 secondary_hang:
     wfe
     b       secondary_hang

@@ -304,3 +304,26 @@ pub fn eoi(irq: u32) {
         (*core::ptr::addr_of!(GIC)).eoi(irq);
     }
 }
+
+/// Initialize GIC CPU interface for secondary CPUs
+/// Called from secondary CPU entry after coming online
+pub fn init_cpu() {
+    unsafe {
+        // Enable system register access (ICC_SRE_EL1)
+        let mut sre: u64;
+        core::arch::asm!("mrs {}, S3_0_C12_C12_5", out(reg) sre); // ICC_SRE_EL1
+        sre |= 0x7; // Enable SRE, DFB, DIB
+        core::arch::asm!("msr S3_0_C12_C12_5, {}", in(reg) sre);
+        core::arch::asm!("isb");
+
+        // Set priority mask to allow all priorities (ICC_PMR_EL1)
+        let pmr: u64 = 0xFF;
+        core::arch::asm!("msr S3_0_C4_C6_0, {}", in(reg) pmr);
+
+        // Enable Group 1 interrupts (ICC_IGRPEN1_EL1)
+        let igrpen: u64 = 1;
+        core::arch::asm!("msr S3_0_C12_C12_7, {}", in(reg) igrpen);
+
+        core::arch::asm!("isb");
+    }
+}

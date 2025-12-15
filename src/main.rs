@@ -8,6 +8,7 @@
 
 mod addrspace;
 mod elf;
+mod eth;
 mod event;
 mod fd;
 mod gic;
@@ -18,6 +19,8 @@ mod pmm;
 mod port;
 mod process;
 mod scheme;
+mod sd;
+mod smp;
 mod syscall;
 mod task;
 mod timer;
@@ -156,6 +159,25 @@ pub extern "C" fn kmain() -> ! {
     timer::init();
     println!("[OK] Timer initialized");
     timer::print_info();
+
+    // Initialize SMP
+    println!();
+    println!("Initializing SMP...");
+    smp::init();
+    smp::test();
+
+    // Optionally start secondary CPUs (disabled for now to avoid complications)
+    // smp::start_secondary_cpus();
+
+    // Test ethernet (register access only - full init needs PHY setup)
+    println!();
+    println!("Testing Ethernet...");
+    eth::test();
+
+    // Test SD/eMMC (register access only - full init needs card present)
+    println!();
+    println!("Testing SD/eMMC...");
+    sd::test();
 
     // Enable IRQs before entering user mode
     println!();
