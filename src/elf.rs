@@ -414,6 +414,7 @@ pub fn get_test_elf() -> &'static [u8] {
 
 /// A minimal test ELF binary (AArch64) - LOOPING version for preemption testing
 /// This program loops forever, printing 'A' periodically.
+/// Uses FD-based Write syscall (syscall 21) with fd=1 (stdout).
 /// The timer preemption should switch between processes.
 ///
 /// Entry point at 0x40010000
@@ -445,18 +446,20 @@ const TEST_ELF: &[u8] = &[
     0x78, 0, 0, 0, 0, 0, 0, 0,           // Offset: 120 (where code starts)
     0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // VAddr: 0x40010000
     0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // PAddr: 0x40010000
-    0x24, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 36 bytes
-    0x24, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 36 bytes
+    0x28, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 40 bytes
+    0x28, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 40 bytes
     0x00, 0x10, 0, 0, 0, 0, 0, 0,        // Align: 0x1000
 
     // Code starts at offset 120 (0x78)
     // loop:
-    //   mov x8, #1       ; syscall = DebugWrite
-    0x28, 0x00, 0x80, 0xd2,
-    //   adr x0, char     ; buffer = char (PC-relative, +28 bytes)
-    0xe0, 0x00, 0x00, 0x10,
-    //   mov x1, #1       ; len = 1
-    0x21, 0x00, 0x80, 0xd2,
+    //   mov x8, #21      ; syscall = Write (FD-based)
+    0xa8, 0x02, 0x80, 0xd2,
+    //   mov x0, #1       ; fd = stdout
+    0x20, 0x00, 0x80, 0xd2,
+    //   adr x1, char     ; buffer = char (PC-relative, +28 bytes from here)
+    0xe1, 0x00, 0x00, 0x10,
+    //   mov x2, #1       ; len = 1
+    0x22, 0x00, 0x80, 0xd2,
     //   svc #0           ; syscall
     0x01, 0x00, 0x00, 0xd4,
     //   mov x9, #0x40000 ; delay counter (~262K iterations)
@@ -467,12 +470,13 @@ const TEST_ELF: &[u8] = &[
     //   cbnz x9, wait    ; loop if not zero
     0xe9, 0xff, 0xff, 0xb5,
     //   b loop           ; back to start
-    0xf9, 0xff, 0xff, 0x17,
+    0xf8, 0xff, 0xff, 0x17,
     // char: 'A'
     b'A', 0, 0, 0,           // Padded to 4 bytes
 ];
 
 /// Second test ELF - LOOPING version, prints 'B' periodically
+/// Uses FD-based Write syscall (syscall 21) with fd=1 (stdout).
 /// Entry point at 0x40020000 (different from first ELF)
 const TEST_ELF2: &[u8] = &[
     // ELF Header (64 bytes)
@@ -502,18 +506,20 @@ const TEST_ELF2: &[u8] = &[
     0x78, 0, 0, 0, 0, 0, 0, 0,           // Offset: 120 (where code starts)
     0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // VAddr: 0x40020000
     0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // PAddr: 0x40020000
-    0x24, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 36 bytes
-    0x24, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 36 bytes
+    0x28, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 40 bytes
+    0x28, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 40 bytes
     0x00, 0x10, 0, 0, 0, 0, 0, 0,        // Align: 0x1000
 
     // Code starts at offset 120 (0x78)
     // loop:
-    //   mov x8, #1       ; syscall = DebugWrite
-    0x28, 0x00, 0x80, 0xd2,
-    //   adr x0, char     ; buffer = char (PC-relative, +28 bytes)
-    0xe0, 0x00, 0x00, 0x10,
-    //   mov x1, #1       ; len = 1
-    0x21, 0x00, 0x80, 0xd2,
+    //   mov x8, #21      ; syscall = Write (FD-based)
+    0xa8, 0x02, 0x80, 0xd2,
+    //   mov x0, #1       ; fd = stdout
+    0x20, 0x00, 0x80, 0xd2,
+    //   adr x1, char     ; buffer = char (PC-relative, +28 bytes from here)
+    0xe1, 0x00, 0x00, 0x10,
+    //   mov x2, #1       ; len = 1
+    0x22, 0x00, 0x80, 0xd2,
     //   svc #0           ; syscall
     0x01, 0x00, 0x00, 0xd4,
     //   mov x9, #0x40000 ; delay counter (~262K iterations)
@@ -524,7 +530,7 @@ const TEST_ELF2: &[u8] = &[
     //   cbnz x9, wait    ; loop if not zero
     0xe9, 0xff, 0xff, 0xb5,
     //   b loop           ; back to start
-    0xf9, 0xff, 0xff, 0x17,
+    0xf8, 0xff, 0xff, 0x17,
     // char: 'B'
     b'B', 0, 0, 0,           // Padded to 4 bytes
 ];

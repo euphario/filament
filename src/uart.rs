@@ -97,6 +97,16 @@ impl Uart {
         unsafe { (self.read_reg(regs::LSR) & lsr::DR) != 0 }
     }
 
+    /// Try to read a single byte (non-blocking)
+    /// Returns Some(byte) if data available, None otherwise
+    pub fn try_getc(&self) -> Option<u8> {
+        if self.data_available() {
+            Some(unsafe { self.read_reg(regs::THR) as u8 })
+        } else {
+            None
+        }
+    }
+
     /// Write a string to the UART
     pub fn puts(&self, s: &str) {
         for byte in s.bytes() {
@@ -153,6 +163,14 @@ pub fn putc(c: char) {
     // SAFETY: Single-threaded bare-metal environment
     unsafe {
         (*core::ptr::addr_of_mut!(UART)).putc(c as u8);
+    }
+}
+
+/// Try to read a character (non-blocking)
+pub fn try_getc() -> Option<char> {
+    // SAFETY: Single-threaded bare-metal environment
+    unsafe {
+        (*core::ptr::addr_of!(UART)).try_getc().map(|b| b as char)
     }
 }
 

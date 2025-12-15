@@ -54,6 +54,18 @@ pub enum SyscallNumber {
     PortConnect = 16,
     /// Accept a connection on a port
     PortAccept = 17,
+    /// Open a file/resource
+    Open = 18,
+    /// Close a file descriptor
+    Close = 19,
+    /// Read from a file descriptor
+    Read = 20,
+    /// Write to a file descriptor
+    Write = 21,
+    /// Duplicate a file descriptor
+    Dup = 22,
+    /// Duplicate to specific FD number
+    Dup2 = 23,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -79,6 +91,12 @@ impl From<u64> for SyscallNumber {
             15 => SyscallNumber::PortUnregister,
             16 => SyscallNumber::PortConnect,
             17 => SyscallNumber::PortAccept,
+            18 => SyscallNumber::Open,
+            19 => SyscallNumber::Close,
+            20 => SyscallNumber::Read,
+            21 => SyscallNumber::Write,
+            22 => SyscallNumber::Dup,
+            23 => SyscallNumber::Dup2,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -132,6 +150,12 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::PortUnregister => sys_port_unregister(args.arg0, args.arg1 as usize),
         SyscallNumber::PortConnect => sys_port_connect(args.arg0, args.arg1 as usize),
         SyscallNumber::PortAccept => sys_port_accept(args.arg0 as u32),
+        SyscallNumber::Open => sys_open(args.arg0, args.arg1 as usize, args.arg2 as u32),
+        SyscallNumber::Close => sys_close(args.arg0 as u32),
+        SyscallNumber::Read => sys_read(args.arg0 as u32, args.arg1, args.arg2 as usize),
+        SyscallNumber::Write => sys_write(args.arg0 as u32, args.arg1, args.arg2 as usize),
+        SyscallNumber::Dup => sys_dup(args.arg0 as u32),
+        SyscallNumber::Dup2 => sys_dup2(args.arg0 as u32, args.arg1 as u32),
         SyscallNumber::Spawn | SyscallNumber::Wait => {
             // Not implemented yet
             SyscallError::InvalidSyscall as i64
@@ -420,6 +444,127 @@ fn sys_port_accept(listen_channel: u32) -> i64 {
         Ok(channel_id) => channel_id as i64,
         Err(e) => e.to_errno() as i64,
     }
+}
+
+/// Open a file by path
+/// Args: path_ptr, path_len, flags
+/// Returns: file descriptor on success, negative error on failure
+fn sys_open(path_ptr: u64, path_len: usize, flags: u32) -> i64 {
+    if path_len == 0 || path_len > 256 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Read path from user space
+    let path = unsafe {
+        core::slice::from_raw_parts(path_ptr as *const u8, path_len)
+    };
+
+    // Try to open the path
+    let entry = match crate::fd::open_path(path, flags) {
+        Some(e) => e,
+        None => return SyscallError::NotFound as i64,
+    };
+
+    // Allocate an FD in the current process
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if let Some(fd) = task.fd_table.alloc() {
+                task.fd_table.set(fd, entry);
+                return fd as i64;
+            } else {
+                return SyscallError::OutOfMemory as i64; // No free FDs
+            }
+        }
+    }
+    SyscallError::InvalidArgument as i64
+}
+
+/// Close a file descriptor
+/// Args: fd
+/// Returns: 0 on success, negative error on failure
+fn sys_close(fd: u32) -> i64 {
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if task.fd_table.close(fd) {
+                return SyscallError::Success as i64;
+            }
+        }
+    }
+    SyscallError::InvalidArgument as i64
+}
+
+/// Read from a file descriptor
+/// Args: fd, buf_ptr, buf_len
+/// Returns: bytes read on success, negative error on failure
+fn sys_read(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
+    if buf_len == 0 {
+        return 0;
+    }
+
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref task) = sched.tasks[sched.current] {
+            if let Some(entry) = task.fd_table.get(fd) {
+                // Create a mutable buffer slice in user space
+                let buf = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len);
+                return crate::fd::fd_read(entry, buf) as i64;
+            }
+        }
+    }
+    SyscallError::InvalidArgument as i64
+}
+
+/// Write to a file descriptor
+/// Args: fd, buf_ptr, buf_len
+/// Returns: bytes written on success, negative error on failure
+fn sys_write(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
+    if buf_len == 0 {
+        return 0;
+    }
+
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref task) = sched.tasks[sched.current] {
+            if let Some(entry) = task.fd_table.get(fd) {
+                // Create a buffer slice from user space
+                let buf = core::slice::from_raw_parts(buf_ptr as *const u8, buf_len);
+                return crate::fd::fd_write(entry, buf) as i64;
+            }
+        }
+    }
+    SyscallError::InvalidArgument as i64
+}
+
+/// Duplicate a file descriptor
+/// Args: old_fd
+/// Returns: new fd on success, negative error on failure
+fn sys_dup(old_fd: u32) -> i64 {
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if let Some(new_fd) = task.fd_table.dup(old_fd) {
+                return new_fd as i64;
+            }
+        }
+    }
+    SyscallError::InvalidArgument as i64
+}
+
+/// Duplicate a file descriptor to a specific number
+/// Args: old_fd, new_fd
+/// Returns: new_fd on success, negative error on failure
+fn sys_dup2(old_fd: u32, new_fd: u32) -> i64 {
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if task.fd_table.dup2(old_fd, new_fd) {
+                return new_fd as i64;
+            }
+        }
+    }
+    SyscallError::InvalidArgument as i64
 }
 
 /// Syscall handler called from exception vector (assembly)

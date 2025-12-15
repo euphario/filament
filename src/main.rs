@@ -8,6 +8,7 @@
 
 mod addrspace;
 mod elf;
+mod fd;
 mod gic;
 mod ipc;
 mod mmu;
