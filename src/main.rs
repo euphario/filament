@@ -28,6 +28,7 @@ mod task;
 mod timer;
 mod uaccess;
 mod uart;
+mod usb;
 
 use core::arch::global_asm;
 
@@ -181,6 +182,11 @@ pub extern "C" fn kmain() -> ! {
     println!();
     println!("Testing SD/eMMC...");
     sd::test();
+
+    // Test USB (xHCI initialization)
+    println!();
+    println!("Testing USB...");
+    usb::test();
 
     // Initialize ramfs (initrd)
     // The initrd address/size would typically be passed by U-Boot
