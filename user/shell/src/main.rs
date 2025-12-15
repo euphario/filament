@@ -170,6 +170,8 @@ fn execute_command(cmd: &[u8]) {
         println!("Yielded CPU");
     } else if cmd_eq(cmd, b"panic") {
         panic!("User requested panic");
+    } else if cmd_eq(cmd, b"usb") {
+        cmd_run_program("bin/usbtest");
     } else {
         print!("Unknown command: ");
         print_bytes(cmd);
@@ -187,6 +189,7 @@ fn cmd_help() {
     println!("  mem         - Test memory allocation");
     println!("  echo <msg>  - Echo a message");
     println!("  spawn <id>  - Spawn process by ELF ID");
+    println!("  usb         - Run USB userspace driver test");
     println!("  yield       - Yield CPU to other processes");
     println!("  panic       - Trigger a panic (test)");
 }
@@ -298,4 +301,41 @@ fn cmd_spawn(arg: &[u8]) {
 /// Print a byte slice to stdout
 fn print_bytes(bytes: &[u8]) {
     let _ = syscall::write(syscall::STDOUT, bytes);
+}
+
+/// Run a program from ramfs by path
+fn cmd_run_program(path: &str) {
+    println!("Running {}...", path);
+    let result = syscall::exec(path);
+
+    if result >= 0 {
+        let pid = result as u32;
+        println!("Spawned process with PID {}", pid);
+
+        // Wait for child to complete
+        // Loop until child exits - kernel handles blocking
+        loop {
+            let wait_result = syscall::wait(pid as i32);
+
+            if wait_result >= 0 {
+                // Success - child exited
+                let exit_code = (wait_result & 0xFF) as i32;
+                println!("Process {} exited with code {}", pid, exit_code);
+                break;
+            } else if wait_result == -11 {
+                // EAGAIN - child still running, just retry
+                // Don't call yield_now() - it would undo the Blocked state
+                continue;
+            } else if wait_result == -10 {
+                // ECHILD - no such child
+                println!("Child {} no longer exists", pid);
+                break;
+            } else {
+                println!("wait failed: {}", wait_result);
+                break;
+            }
+        }
+    } else {
+        println!("exec failed: {}", result);
+    }
 }

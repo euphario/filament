@@ -235,8 +235,15 @@ pub fn exec(path: &str) -> i64 {
 
 /// Wait for a child process to exit
 /// Returns (pid << 32 | exit_code) on success, or negative error code
+/// pid: -1 = any child, >0 = specific child
 pub fn wait(pid: i32) -> i64 {
-    syscall1(SYS_WAIT, pid as u64)
+    syscall2(SYS_WAIT, pid as u64, 0) // 0 = no status pointer
+}
+
+/// Wait for a child process and get exit status
+/// Returns child pid on success, writes exit status to status_out
+pub fn waitpid(pid: i32, status_out: &mut i32) -> i64 {
+    syscall2(SYS_WAIT, pid as u64, status_out as *mut i32 as u64)
 }
 
 // IPC syscalls
@@ -302,3 +309,52 @@ pub const O_NONBLOCK: u32 = 0x800;
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
+
+// Scheme syscalls
+
+/// Open a scheme URL (e.g., "mmio:11200000/4000", "irq:172")
+/// Returns file descriptor, or negative error code
+pub fn scheme_open(url: &str, flags: u32) -> i32 {
+    syscall3(SYS_SCHEME_OPEN, url.as_ptr() as u64, url.len() as u64, flags as u64) as i32
+}
+
+/// Get system time in nanoseconds
+pub fn gettime() -> u64 {
+    syscall0(SYS_GETTIME) as u64
+}
+
+// Event syscalls
+
+/// Event types (must match kernel)
+pub mod event_type {
+    pub const IPC_READY: u32 = 0;
+    pub const TIMER: u32 = 1;
+    pub const IRQ: u32 = 2;
+    pub const CHILD_EXIT: u32 = 3;
+    pub const FD_READABLE: u32 = 4;
+    pub const FD_WRITABLE: u32 = 5;
+    pub const SIGNAL: u32 = 6;
+}
+
+/// Subscribe to an event type
+/// Returns 0 on success, negative error on failure
+pub fn event_subscribe(event_type: u32, filter: u64) -> i32 {
+    syscall2(SYS_EVENT_SUBSCRIBE, event_type as u64, filter) as i32
+}
+
+/// Unsubscribe from an event type
+pub fn event_unsubscribe(event_type: u32) -> i32 {
+    syscall1(SYS_EVENT_UNSUBSCRIBE, event_type as u64) as i32
+}
+
+/// Wait for an event
+/// Returns event data (type << 32 | data) on success, negative error on failure
+/// timeout_ns: 0 = non-blocking, u64::MAX = block forever
+pub fn event_wait(timeout_ns: u64) -> i64 {
+    syscall1(SYS_EVENT_WAIT, timeout_ns)
+}
+
+/// Post an event to another process
+pub fn event_post(target_pid: u32, event_type: u32, data: u64) -> i32 {
+    syscall3(SYS_EVENT_POST, target_pid as u64, event_type as u64, data) as i32
+}

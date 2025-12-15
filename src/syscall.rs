@@ -1046,10 +1046,22 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
             }
         }
 
-        // No terminated children found - would block
-        // Mark parent as blocked waiting for children
+        // No terminated children found - need to block
+        // Mark parent as blocked and switch to another task
         if let Some(ref mut parent) = sched.tasks[caller_slot] {
             parent.state = crate::task::TaskState::Blocked;
+        }
+
+        // Force a context switch to let child run
+        // Find next runnable task
+        if let Some(next_slot) = sched.schedule() {
+            if next_slot != caller_slot {
+                sched.current = next_slot;
+                if let Some(ref mut next) = sched.tasks[next_slot] {
+                    next.state = crate::task::TaskState::Running;
+                }
+                crate::task::update_current_task_globals();
+            }
         }
 
         SyscallError::WouldBlock as i64

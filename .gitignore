@@ -2,6 +2,7 @@
 /target/
 user/target/
 user/shell/target/
+user/usbtest/target/
 *.bin
 *.img
 *.tar

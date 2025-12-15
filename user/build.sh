@@ -10,14 +10,15 @@ cd "$SCRIPT_DIR"
 mkdir -p bin
 
 # List of programs to build
-PROGRAMS="shell"
+PROGRAMS="shell usbtest"
 
 # Build each program
 for prog in $PROGRAMS; do
     echo "Building $prog..."
 
     # Build with cargo (from the program's directory)
-    (cd "$prog" && cargo build --release)
+    # Override rustflags to prevent kernel's linker script from being used
+    (cd "$prog" && RUSTFLAGS="-C link-arg=-Tuser.ld -C link-arg=--gc-sections -C link-arg=-n" cargo build --release)
 
     # Copy ELF to bin directory
     cp "target/aarch64-unknown-none/release/$prog" "bin/$prog.elf"

@@ -999,9 +999,12 @@ pub fn open_url(url: &[u8], flags: u32) -> Result<(FdEntry, SchemeHandle), i32> 
             }
         }
 
-        // Create FD entry
+        // Create FD entry with scheme type
         let fd_entry = FdEntry {
-            fd_type: FdType::None, // We'll add a Scheme variant later
+            fd_type: FdType::Scheme {
+                scheme_id: handle.scheme_id,
+                handle: handle.handle,
+            },
             flags: FdFlags {
                 readable: true,
                 writable: (flags & 0x3) != 0, // O_WRONLY or O_RDWR
