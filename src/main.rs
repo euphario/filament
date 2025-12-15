@@ -8,6 +8,7 @@
 
 mod addrspace;
 mod elf;
+mod event;
 mod fd;
 mod gic;
 mod ipc;
@@ -16,6 +17,7 @@ mod panic;
 mod pmm;
 mod port;
 mod process;
+mod scheme;
 mod syscall;
 mod task;
 mod timer;
@@ -131,6 +133,17 @@ pub extern "C" fn kmain() -> ! {
     println!();
     println!("Testing port registry...");
     port::test();
+
+    // Test event system
+    println!();
+    println!("Testing event system...");
+    event::test();
+
+    // Initialize scheme system
+    println!();
+    println!("Initializing scheme system...");
+    scheme::init();
+    scheme::test();
 
     // Test ELF loader
     println!();

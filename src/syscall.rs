@@ -66,6 +66,16 @@ pub enum SyscallNumber {
     Dup = 22,
     /// Duplicate to specific FD number
     Dup2 = 23,
+    /// Subscribe to events
+    EventSubscribe = 24,
+    /// Unsubscribe from events
+    EventUnsubscribe = 25,
+    /// Wait for an event
+    EventWait = 26,
+    /// Post an event to another process
+    EventPost = 27,
+    /// Open a scheme URL (scheme:path)
+    SchemeOpen = 28,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -97,6 +107,11 @@ impl From<u64> for SyscallNumber {
             21 => SyscallNumber::Write,
             22 => SyscallNumber::Dup,
             23 => SyscallNumber::Dup2,
+            24 => SyscallNumber::EventSubscribe,
+            25 => SyscallNumber::EventUnsubscribe,
+            26 => SyscallNumber::EventWait,
+            27 => SyscallNumber::EventPost,
+            28 => SyscallNumber::SchemeOpen,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -156,6 +171,21 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Write => sys_write(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::Dup => sys_dup(args.arg0 as u32),
         SyscallNumber::Dup2 => sys_dup2(args.arg0 as u32, args.arg1 as u32),
+        SyscallNumber::EventSubscribe => {
+            crate::event::sys_event_subscribe(args.arg0 as u32, args.arg1, current_pid())
+        }
+        SyscallNumber::EventUnsubscribe => {
+            crate::event::sys_event_unsubscribe(args.arg0 as u32, args.arg1, current_pid())
+        }
+        SyscallNumber::EventWait => {
+            crate::event::sys_event_wait(args.arg0, args.arg1 as u32)
+        }
+        SyscallNumber::EventPost => {
+            crate::event::sys_event_post(args.arg0 as u32, args.arg1 as u32, args.arg2, current_pid())
+        }
+        SyscallNumber::SchemeOpen => {
+            sys_scheme_open(args.arg0, args.arg1 as usize, args.arg2 as u32)
+        }
         SyscallNumber::Spawn | SyscallNumber::Wait => {
             // Not implemented yet
             SyscallError::InvalidSyscall as i64
@@ -565,6 +595,38 @@ fn sys_dup2(old_fd: u32, new_fd: u32) -> i64 {
         }
     }
     SyscallError::InvalidArgument as i64
+}
+
+/// Open a scheme URL (scheme:path)
+/// Args: url_ptr, url_len, flags
+/// Returns: file descriptor on success, negative error on failure
+fn sys_scheme_open(url_ptr: u64, url_len: usize, flags: u32) -> i64 {
+    if url_len == 0 || url_len > 256 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Read URL from user space
+    let url = unsafe {
+        core::slice::from_raw_parts(url_ptr as *const u8, url_len)
+    };
+
+    // Try to open via scheme system
+    match crate::scheme::open_url(url, flags) {
+        Ok((fd_entry, _handle)) => {
+            // Allocate FD and store entry
+            unsafe {
+                let sched = crate::task::scheduler();
+                if let Some(ref mut task) = sched.tasks[sched.current] {
+                    if let Some(fd) = task.fd_table.alloc() {
+                        task.fd_table.set(fd, fd_entry);
+                        return fd as i64;
+                    }
+                }
+            }
+            SyscallError::OutOfMemory as i64
+        }
+        Err(e) => e as i64,
+    }
 }
 
 /// Syscall handler called from exception vector (assembly)

@@ -4,6 +4,7 @@
 //! Each task has its own saved CPU state and address space.
 
 use crate::addrspace::AddressSpace;
+use crate::event::EventQueue;
 use crate::fd::FdTable;
 use crate::pmm;
 use crate::println;
@@ -187,6 +188,8 @@ pub struct Task {
     pub heap_next: u64,
     /// File descriptor table
     pub fd_table: FdTable,
+    /// Event queue for async notifications
+    pub event_queue: EventQueue,
 }
 
 impl Task {
@@ -224,6 +227,7 @@ impl Task {
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
             fd_table: FdTable::new(),
+            event_queue: EventQueue::new(),
         })
     }
 
@@ -258,6 +262,7 @@ impl Task {
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
             fd_table: FdTable::new(),
+            event_queue: EventQueue::new(),
         })
     }
 

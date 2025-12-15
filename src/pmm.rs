@@ -215,6 +215,11 @@ pub fn free_count() -> usize {
     unsafe { (*core::ptr::addr_of!(PMM)).free_count() }
 }
 
+/// Get total page count
+pub fn total_count() -> usize {
+    unsafe { (*core::ptr::addr_of!(PMM)).total_count() }
+}
+
 /// Print memory info
 pub fn print_info() {
     unsafe {
