@@ -33,7 +33,7 @@ use usb::{
     // TRB
     Trb, trb_type, trb_cc,
     // USB types
-    usb_req, hub, ep_type,
+    usb_req, usb_hub as hub, ep_type,
     InputContext, DeviceContext,
     SsHubDescriptor, PortStatus,
     DeviceDescriptor, ConfigurationDescriptor, InterfaceDescriptor,

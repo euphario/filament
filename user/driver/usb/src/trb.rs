@@ -57,6 +57,7 @@ pub mod trb_type {
     pub const EVALUATE_CONTEXT: u32 = 13;
     pub const RESET_ENDPOINT: u32 = 14;
     pub const STOP_ENDPOINT: u32 = 15;
+    pub const SET_TR_DEQUEUE: u32 = 16;
     pub const NOOP_CMD: u32 = 23;
 
     // Event TRB types

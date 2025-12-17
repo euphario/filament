@@ -15,12 +15,16 @@ pub mod ring;
 pub mod mmio;
 pub mod protocol;
 pub mod transfer;
+pub mod hub;
+pub mod enumeration;
+pub mod controller;
+pub mod hal;
 
 // Re-export commonly used items at crate root
 pub use consts::*;
 pub use trb::{Trb, trb_type, trb_cc};
 pub use usb::{
-    usb_req, hub, ep_type,
+    usb_req, hub as usb_hub, ep_type,
     SlotContext, EndpointContext, InputControlContext, InputContext, DeviceContext,
     HubDescriptor, SsHubDescriptor, PortStatus,
     DeviceDescriptor, ConfigurationDescriptor, InterfaceDescriptor, EndpointDescriptor,
@@ -45,3 +49,27 @@ pub use transfer::{
     build_link_trb, build_normal_trb,
     flush_trb, flush_trb_range, dsb,
 };
+pub use hub::{
+    port_feature, port_status, port_change,
+    get_hub_descriptor_setup, get_port_status_setup,
+    set_port_feature_setup, clear_port_feature_setup, set_hub_depth_setup,
+    parse_ss_hub_descriptor, HubInfo, OverCurrentMode,
+    ParsedPortStatus, DeviceSpeed,
+};
+pub use enumeration::{
+    slot_state, endpoint_state, endpoint_type, device_speed,
+    build_enable_slot_trb, build_disable_slot_trb, build_address_device_trb,
+    build_configure_endpoint_trb, build_evaluate_context_trb,
+    build_reset_endpoint_trb, build_stop_endpoint_trb, build_set_tr_dequeue_trb,
+    build_noop_trb,
+    init_slot_context, init_ep0_context, init_bulk_endpoint_context,
+    init_input_control_for_address, init_input_control_for_configure,
+    endpoint_address_to_dci, default_max_packet_size,
+};
+pub use controller::{
+    PortLinkState, PortSpeed, portsc, ParsedPortsc,
+    event_completion_code, event_slot_id, event_endpoint_id, event_port_id,
+    event_trb_pointer, event_transfer_length, event_is_short_packet,
+    event_type, completion_code, doorbell,
+};
+pub use hal::{SocHal, ControllerId, XhciController, mt7988a};
