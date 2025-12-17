@@ -15,15 +15,13 @@ use userlib::{println, print, syscall};
 
 // Import from the usb driver library
 use usb::{
-    // Hardware addresses
-    SSUSB_MAC_SIZE, SSUSB_IPPC_OFFSET,
-    // Clock/reset control
+    // GPIO IPC
+    GPIO_CMD_USB_VBUS,
+    // Clock/reset control (for diagnostics)
     INFRACFG_AO_BASE, INFRACFG_AO_SIZE,
     INFRA_RST0_STA, INFRA_RST1_CLR, INFRA_RST1_STA,
     INFRA_CG0_STA, INFRA_CG1_CLR, INFRA_CG1_STA, INFRA_CG2_STA,
     RST1_SSUSB_TOP0, RST1_SSUSB_TOP1, CG1_SSUSB0, CG1_SSUSB1,
-    // GPIO IPC
-    GPIO_CMD_USB_VBUS,
     // xHCI registers
     xhci_op, xhci_port, xhci_rt, xhci_ir,
     // TRB
@@ -41,7 +39,7 @@ use usb::{
     // MMIO helpers
     MmioRegion, format_mmio_url, delay_ms, delay, print_hex64, print_hex32, print_hex8,
     // Controller helpers
-    ParsedPortsc, portsc, XhciController, ControllerId,
+    ParsedPortsc, portsc, XhciController,
     event_completion_code, event_slot_id, event_port_id,
     completion_code, doorbell,
     // Enumeration helpers
@@ -49,8 +47,8 @@ use usb::{
     // Hub helpers
     get_hub_descriptor_setup, get_port_status_setup,
     set_port_feature_setup, clear_port_feature_setup,
-    // HAL
-    mt7988a,
+    // HAL - MediaTek MT7988A specific
+    SocHal, Mt7988aHal, mt7988a,
 };
 
 // Module definitions now imported from usb crate
@@ -79,20 +77,23 @@ struct UsbDriver {
 
 impl UsbDriver {
     fn new(controller_id: u32) -> Option<Self> {
-        // Get addresses from HAL
-        let (mac_phys, phy_phys, phy_size) = match controller_id {
-            0 => (mt7988a::SSUSB0_MAC_PHYS, mt7988a::SSUSB0_PHY_PHYS, mt7988a::SSUSB0_PHY_SIZE),
-            1 => (mt7988a::SSUSB1_MAC_PHYS, mt7988a::SSUSB1_PHY_PHYS, mt7988a::SSUSB1_PHY_SIZE),
-            _ => return None,
-        };
+        // Create HAL for the target SoC
+        let mut hal = Mt7988aHal::new(controller_id);
+
+        // Get addresses from HAL trait
+        let mac_phys = hal.mac_base() as u64;
+        let phy_phys = hal.phy_base() as u64;
+        let phy_size = hal.phy_size();
 
         println!("  Mapping SSUSB{} MMIO regions...", controller_id);
 
-        let mac = MmioRegion::open(mac_phys, SSUSB_MAC_SIZE)?;
+        // Map MAC (xHCI + IPPC) region
+        let mac = MmioRegion::open(mac_phys, mt7988a::MAC_SIZE as u64)?;
         print!("    MAC+IPPC @ 0x");
         print_hex32(mac_phys as u32);
-        println!(" -> OK (IPPC at +0x3e00)");
+        println!(" -> OK (IPPC at +0x{:x})", mt7988a::IPPC_OFFSET);
 
+        // Map PHY region
         let phy = MmioRegion::open(phy_phys, phy_size as u64)?;
         print!("    PHY @ 0x");
         print_hex32(phy_phys as u32);
@@ -100,23 +101,18 @@ impl UsbDriver {
         print_hex32(phy_size as u32);
         println!(" -> OK");
 
-        // Create XhciController with the mapped regions
-        let xhci = XhciController {
-            mac,
-            phy: Some(phy),
-            id: ControllerId {
-                index: controller_id,
-                name: if controller_id == 0 { "SSUSB0" } else { "SSUSB1" },
-            },
-            caplength: 0,
-            op_base: 0,
-            rt_base: 0,
-            db_base: 0,
-            port_base: 0,
-            num_ports: 0,
-            max_slots: 0,
-            ippc_offset: Some(mt7988a::IPPC_OFFSET),
-        };
+        // Provide MMIO regions to the HAL
+        hal.set_mac(mac);
+        hal.set_phy(phy);
+
+        // Run SoC-specific initialization (IPPC + T-PHY)
+        if !hal.phy_init() {
+            println!("  ERROR: HAL phy_init() failed");
+            return None;
+        }
+
+        // Extract xHCI controller from HAL (consumes the HAL)
+        let xhci = hal.into_controller()?;
 
         Some(Self {
             xhci,
@@ -199,69 +195,10 @@ impl UsbDriver {
     }
 
     fn init(&mut self) -> bool {
-        // === IPPC Initialization (MediaTek-specific) ===
-        // This uses helper methods which delegate to self.xhci
-        use usb::phy::ippc;
-
-        println!();
-        println!("=== IPPC Initialization ===");
-
-        // Software reset
-        println!("  Software reset...");
-        self.ippc_write32(ippc::IP_PW_CTRL0, ippc::IP_SW_RST);
-        delay(1000);
-        self.ippc_write32(ippc::IP_PW_CTRL0, 0);
-        delay(1000);
-
-        // Power on host, power down device
-        println!("  Host power on...");
-        self.ippc_write32(ippc::IP_PW_CTRL2, ippc::IP_DEV_PDN);
-        self.ippc_write32(ippc::IP_PW_CTRL1, 0);
-
-        // Read port counts
-        let cap = self.ippc_read32(ippc::IP_XHCI_CAP);
-        let u3_ports = (cap >> 8) & 0xF;
-        let u2_ports = cap & 0xF;
-        println!("  Ports: {} USB3, {} USB2", u3_ports, u2_ports);
-
-        // Configure U3 ports
-        for i in 0..u3_ports {
-            let offset = ippc::U3_CTRL_P0 + (i as usize * 8);
-            let mut ctrl = self.ippc_read32(offset);
-            ctrl &= !(ippc::PORT_PDN | ippc::PORT_DIS);
-            ctrl |= ippc::PORT_HOST_SEL;
-            self.ippc_write32(offset, ctrl);
-        }
-
-        // Configure U2 ports
-        for i in 0..u2_ports {
-            let offset = ippc::U2_CTRL_P0 + (i as usize * 8);
-            let mut ctrl = self.ippc_read32(offset);
-            ctrl &= !(ippc::PORT_PDN | ippc::PORT_DIS);
-            ctrl |= ippc::PORT_HOST_SEL;
-            self.ippc_write32(offset, ctrl);
-        }
-
-        // Wait for clocks
-        println!("  Waiting for clocks...");
-        let required = ippc::SYSPLL_STABLE | ippc::REF_RST | ippc::SYS125_RST | ippc::XHCI_RST;
-        for i in 0..1000 {
-            let sts = self.ippc_read32(ippc::IP_PW_STS1);
-            if (sts & required) == required {
-                println!("  Clocks stable (after {} iterations)", i);
-                break;
-            }
-            if i == 999 {
-                print!("  Clock timeout! IP_PW_STS1=0x");
-                print_hex32(sts);
-                println!();
-                return false;
-            }
-            delay(1000);
-        }
+        // NOTE: SoC-specific initialization (IPPC, PHY) was done in new() via the HAL.
+        // This function only handles generic xHCI initialization.
 
         // === xHCI Capability Registers (generic xHCI) ===
-        // Use library method
         if self.xhci.read_capabilities().is_none() {
             println!("  ERROR: Failed to read xHCI capabilities");
             return false;
@@ -274,79 +211,6 @@ impl UsbDriver {
         if !self.xhci.halt_and_reset() {
             return false;
         }
-
-        // === PHY Initialization (MediaTek T-PHY specific) ===
-        use usb::phy::tphy;
-
-        println!();
-        println!("=== PHY Initialization ===");
-
-        let phy = match &self.xhci.phy {
-            Some(p) => p,
-            None => {
-                println!("  ERROR: No PHY region");
-                return false;
-            }
-        };
-
-        let offsets_to_try: &[(usize, &str)] = &[
-            (0x300, "COM+0x300"),
-            (0x000, "base+0x000"),
-            (0x100, "base+0x100"),
-            (0x400, "base+0x400"),
-        ];
-
-        let phy_name = if self.xhci.id.index == 0 { "XFI T-PHY" } else { "T-PHY v2" };
-        println!("  Configuring {} for host mode...", phy_name);
-
-        let mut found_offset: Option<usize> = None;
-        for &(base_off, name) in offsets_to_try {
-            let dtm1_off = base_off + 0x6C;
-            let dtm1 = phy.read32(dtm1_off);
-            if dtm1 != 0 || base_off == 0x300 {
-                print!("    {} DTM1@0x{:x}=0x", name, dtm1_off);
-                print_hex32(dtm1);
-                println!();
-                if found_offset.is_none() {
-                    found_offset = Some(base_off);
-                }
-            }
-        }
-
-        let com_offset = found_offset.unwrap_or(0x300);
-        let dtm1_offset = com_offset + 0x6C;
-
-        let dtm1 = phy.read32(dtm1_offset);
-        print!("    Using offset 0x{:x}, DTM1 before: 0x", dtm1_offset);
-        print_hex32(dtm1);
-        println!();
-
-        let new_dtm1 = dtm1 | tphy::HOST_MODE;
-        phy.write32(dtm1_offset, new_dtm1);
-        delay(1000);
-
-        let dtm1_after = phy.read32(dtm1_offset);
-        print!("    After:  DTM1=0x");
-        print_hex32(dtm1_after);
-        if dtm1_after != dtm1 {
-            println!(" (host mode configured)");
-        } else {
-            println!(" (WARNING: register unchanged!)");
-        }
-
-        // Force USB2 PHY power on
-        println!();
-        println!("=== Forcing USB2 PHY Power ===");
-        let pll = self.ippc_read32(ippc::U2_PHY_PLL);
-        print!("  U2_PHY_PLL before: 0x");
-        print_hex32(pll);
-        println!();
-        self.ippc_write32(ippc::U2_PHY_PLL, pll | 1);
-        delay(1000);
-        let pll_after = self.ippc_read32(ippc::U2_PHY_PLL);
-        print!("  U2_PHY_PLL after:  0x");
-        print_hex32(pll_after);
-        println!(" (PHY power forced on)");
 
         // === xHCI Data Structures (driver-specific allocation) ===
         println!();
@@ -4299,7 +4163,7 @@ fn main() {
     // Also open SSUSB0 for monitoring (Type-A might be there)
     println!();
     println!("=== Opening SSUSB0 for monitoring ===");
-    let ssusb0_mac = MmioRegion::open(mt7988a::SSUSB0_MAC_PHYS, SSUSB_MAC_SIZE);
+    let ssusb0_mac = MmioRegion::open(mt7988a::SSUSB0_MAC_PHYS, mt7988a::MAC_SIZE as u64);
 
     // Poll ports on BOTH controllers
     println!();
@@ -4311,7 +4175,7 @@ fn main() {
 
         // Check SSUSB0 ports
         if let Some(ref mac0) = ssusb0_mac {
-            let cap0 = mac0.read32(SSUSB_IPPC_OFFSET + 0x24);  // IP_XHCI_CAP
+            let cap0 = mac0.read32(mt7988a::IPPC_OFFSET + 0x24);  // IP_XHCI_CAP
             let num_ports0 = ((cap0 >> 8) & 0xF) + (cap0 & 0xF);
             let caplength0 = mac0.read32(0) & 0xFF;
             let port_base0 = caplength0 as usize + 0x400;
