@@ -447,6 +447,9 @@ pub fn irq_register(irq_num: u32, pid: u32) -> bool {
                 // Enable the IRQ in the GIC
                 crate::gic::enable_irq(irq_num);
 
+                // Debug: show GIC state for this IRQ
+                crate::gic::debug_irq(irq_num);
+
                 return true;
             }
         }
@@ -475,7 +478,9 @@ pub fn irq_unregister(irq_num: u32, pid: u32) -> bool {
 /// Called from IRQ handler when an interrupt fires
 /// Returns the PID to wake up, if any
 pub fn irq_notify(irq_num: u32) -> Option<u32> {
-    println!("[IRQ] irq_notify: IRQ {} fired", irq_num);
+    // Mask the IRQ immediately to prevent interrupt storm (level-triggered)
+    // Userspace will unmask by reading from the irq: scheme
+    crate::gic::disable_irq(irq_num);
 
     unsafe {
         let table = irq_table();
@@ -484,7 +489,6 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
             if !reg.is_empty() && reg.irq_num == irq_num {
                 reg.pending = true;
                 reg.pending_count += 1;
-                println!("[IRQ] irq_notify: found registration, blocked_pid={}", reg.blocked_pid);
 
                 // Wake up blocked process if any
                 let wake_pid = if reg.blocked_pid != 0 {
@@ -530,6 +534,7 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
 }
 
 /// Check if an IRQ is pending for a process
+/// If pending, clears the flag and re-enables the IRQ at the GIC
 pub fn irq_check_pending(irq_num: u32, pid: u32) -> Option<u32> {
     unsafe {
         let table = irq_table();
@@ -540,6 +545,11 @@ pub fn irq_check_pending(irq_num: u32, pid: u32) -> Option<u32> {
                     let count = reg.pending_count;
                     reg.pending = false;
                     reg.pending_count = 0;
+
+                    // Re-enable the IRQ at the GIC (it was masked when it fired)
+                    // This allows the next interrupt to be delivered
+                    crate::gic::enable_irq(irq_num);
+
                     return Some(count);
                 }
                 return None;

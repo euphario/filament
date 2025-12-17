@@ -23,12 +23,12 @@ use userlib::{println, print, syscall};
 // SSUSB0 (first USB controller) - from MT7988A DTS
 const SSUSB0_MAC_PHYS: u64 = 0x1119_0000;
 const SSUSB0_PHY_PHYS: u64 = 0x11f2_0000;  // XFI T-PHY (xfi_tphy0), NOT 0x11e10000!
-const SSUSB0_IRQ: u32 = 173;  // GIC SPI 173
+const SSUSB0_IRQ: u32 = 173 + 32;  // GIC SPI 173 = interrupt ID 205
 
 // SSUSB1 (second USB controller)
 const SSUSB1_MAC_PHYS: u64 = 0x1120_0000;
 const SSUSB1_PHY_PHYS: u64 = 0x11c5_0000;  // T-PHY v2
-const SSUSB1_IRQ: u32 = 172;  // GIC SPI 172
+const SSUSB1_IRQ: u32 = 172 + 32;  // GIC SPI 172 = interrupt ID 204
 
 // =============================================================================
 // Clock and Reset Control (INFRACFG_AO)
@@ -735,6 +735,117 @@ struct InquiryResponse {
 struct ReadCapacity10Response {
     last_lba: u32,        // Last Logical Block Address (big-endian)
     block_size: u32,      // Block size in bytes (big-endian)
+}
+
+// =============================================================================
+// Bulk Transfer Context - for cleaner SCSI command handling
+// =============================================================================
+
+/// Context for bulk transfers (holds all the state needed for CBW/CSW/Data)
+struct BulkContext {
+    slot_id: u32,
+    bulk_in_dci: u32,
+    bulk_out_dci: u32,
+    bulk_in_ring: *mut Trb,
+    bulk_in_ring_phys: u64,
+    bulk_out_ring: *mut Trb,
+    _bulk_out_ring_phys: u64,
+    data_buf: *mut u8,
+    data_phys: u64,
+    device_ctx: *mut DeviceContext,
+    // Ring enqueue positions (tracks where we are in the ring)
+    out_enqueue: usize,
+    in_enqueue: usize,
+    // CBW tag counter
+    tag: u32,
+}
+
+/// Result of a bulk transfer
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TransferResult {
+    Success,
+    ShortPacket,
+    Timeout,
+    Error(u32),  // Completion code
+}
+
+// Buffer offsets within the 4KB data buffer
+const CBW_OFFSET: usize = 0;       // CBW at offset 0
+const CSW_OFFSET: usize = 64;      // CSW at offset 64
+const DATA_OFFSET: usize = 512;    // Data at offset 512 (aligned for DMA)
+
+impl BulkContext {
+    /// Create a new bulk context
+    fn new(
+        slot_id: u32,
+        bulk_in_dci: u32,
+        bulk_out_dci: u32,
+        bulk_in_ring: *mut Trb,
+        bulk_in_ring_phys: u64,
+        bulk_out_ring: *mut Trb,
+        bulk_out_ring_phys: u64,
+        data_buf: *mut u8,
+        data_phys: u64,
+        device_ctx: *mut DeviceContext,
+    ) -> Self {
+        Self {
+            slot_id,
+            bulk_in_dci,
+            bulk_out_dci,
+            bulk_in_ring,
+            bulk_in_ring_phys,
+            bulk_out_ring,
+            _bulk_out_ring_phys: bulk_out_ring_phys,
+            data_buf,
+            data_phys,
+            device_ctx,
+            out_enqueue: 0,
+            in_enqueue: 0,
+            tag: 1,
+        }
+    }
+
+    /// Get current DCS (Dequeue Cycle State) for bulk IN endpoint from device context
+    fn get_bulk_in_dcs(&self) -> u32 {
+        unsafe {
+            let dev_ctx = &*self.device_ctx;
+            let bulk_in_idx = (self.bulk_in_dci - 1) as usize;
+            let bulk_in_ctx = &dev_ctx.endpoints[bulk_in_idx];
+
+            // Invalidate cache before reading
+            let ctx_addr = bulk_in_ctx as *const _ as u64;
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            core::arch::asm!("dc civac, {}", in(reg) ctx_addr, options(nostack));
+            core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+
+            (core::ptr::read_volatile(&bulk_in_ctx.dw2) & 1) as u32
+        }
+    }
+
+    /// Flush a buffer to main memory (for DMA)
+    fn flush_buffer(&self, addr: u64, _size: usize) {
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack));
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+    }
+
+    /// Invalidate a buffer from cache (before reading DMA data)
+    fn invalidate_buffer(&self, addr: u64, _size: usize) {
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            core::arch::asm!("dc civac, {}", in(reg) addr, options(nostack));
+            core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+        }
+    }
+
+    /// Get next tag and increment
+    fn next_tag(&mut self) -> u32 {
+        let t = self.tag;
+        self.tag += 1;
+        t
+    }
 }
 
 /// Ring size (number of TRBs) - must be power of 2 for easy wrap
@@ -3864,7 +3975,7 @@ impl UsbDriver {
             return;
         }
 
-        // SCSI INQUIRY
+        // SCSI INQUIRY (old code - uses TEST_UNIT_READY)
         self.scsi_inquiry(
             slot_id, bulk_in_dci, bulk_out_dci,
             bulk_in_ring_virt as *mut Trb, bulk_in_ring_phys,
@@ -3872,6 +3983,26 @@ impl UsbDriver {
             data_virt as *mut u8, data_phys,
             device_ctx_virt
         );
+
+        // Run new refactored SCSI tests (READ_CAPACITY, READ_10)
+        // Need a fresh data buffer since the old code used offsets differently
+        let mut test_data_phys: u64 = 0;
+        let test_data_virt = syscall::mmap_dma(4096, &mut test_data_phys);
+        if test_data_virt >= 0 {
+            let mut ctx = BulkContext::new(
+                slot_id,
+                bulk_in_dci,
+                bulk_out_dci,
+                bulk_in_ring_virt as *mut Trb,
+                bulk_in_ring_phys,
+                bulk_out_ring_virt as *mut Trb,
+                bulk_out_ring_phys,
+                test_data_virt as *mut u8,
+                test_data_phys,
+                device_ctx_virt,
+            );
+            self.run_scsi_tests(&mut ctx);
+        }
     }
 
     /// Perform SCSI TEST_UNIT_READY command (helps wake up device)
@@ -4217,6 +4348,353 @@ impl UsbDriver {
         false
     }
 
+    // =========================================================================
+    // Refactored SCSI command helpers
+    // =========================================================================
+
+    /// Send CBW (Command Block Wrapper) on bulk OUT and wait for completion
+    /// Returns true if CBW was sent successfully
+    fn send_cbw(&mut self, ctx: &mut BulkContext, cbw: &Cbw) -> bool {
+        // Write CBW to buffer
+        unsafe {
+            let cbw_ptr = ctx.data_buf.add(CBW_OFFSET) as *mut Cbw;
+            core::ptr::write_volatile(cbw_ptr, *cbw);
+            ctx.flush_buffer(cbw_ptr as u64, 31);
+        }
+
+        // Create TRB for CBW (31 bytes)
+        unsafe {
+            let trb = &mut *ctx.bulk_out_ring.add(ctx.out_enqueue);
+            trb.param = ctx.data_phys + CBW_OFFSET as u64;
+            trb.status = 31;  // CBW is 31 bytes
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | 1;  // IOC, cycle=1
+            ctx.flush_buffer(trb as *const _ as u64, 16);
+            ctx.out_enqueue += 1;
+        }
+
+        // Ring doorbell
+        self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
+
+        // Poll for completion (CBW is fast, no need for IRQ)
+        if let Some(ref mut event_ring) = self.event_ring {
+            for _ in 0..100 {
+                if let Some(evt) = event_ring.dequeue() {
+                    if evt.get_type() == trb_type::TRANSFER_EVENT {
+                        let cc = (evt.status >> 24) & 0xFF;
+                        // Update ERDP
+                        let erdp = event_ring.erdp() | (1 << 3);
+                        self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp);
+                        return cc == trb_cc::SUCCESS;
+                    }
+                }
+                syscall::yield_now();
+            }
+        }
+        false
+    }
+
+    /// Wait for a transfer event via IRQ
+    /// Returns (success, completion_code)
+    fn wait_transfer_irq(&mut self, timeout_ms: u32) -> (TransferResult, u64) {
+        let mac_base = self.mac.base;
+        let rt_base = self.rt_base;
+        let op_base = self.op_base;
+
+        // Clear IMAN.IP before waiting
+        unsafe {
+            let iman_addr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::IMAN) as u64) as *mut u32;
+            let iman = core::ptr::read_volatile(iman_addr);
+            if (iman & 1) != 0 {
+                core::ptr::write_volatile(iman_addr, iman | 1);
+            }
+
+            // Clear EINT in USBSTS
+            let usbsts_addr = (mac_base + op_base as u64 + xhci_op::USBSTS as u64) as *mut u32;
+            let usbsts = core::ptr::read_volatile(usbsts_addr);
+            if (usbsts & 0x8) != 0 {
+                core::ptr::write_volatile(usbsts_addr, 0x8);
+            }
+        }
+
+        // Wait for IRQ with retry loop
+        let max_irq_waits = 10;
+        for _irq_attempt in 0..max_irq_waits {
+            if !self.wait_for_irq(timeout_ms) {
+                return (TransferResult::Timeout, 0);
+            }
+
+            // Check event ring
+            if let Some(ref mut event_ring) = self.event_ring {
+                if let Some(evt) = event_ring.dequeue() {
+                    let evt_type = evt.get_type();
+                    let cc = (evt.status >> 24) & 0xFF;
+
+                    // Update ERDP
+                    let erdp = event_ring.erdp() | (1 << 3);
+                    unsafe {
+                        let ptr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64) as *mut u64;
+                        core::ptr::write_volatile(ptr, erdp);
+                    }
+
+                    if evt_type == trb_type::TRANSFER_EVENT {
+                        // Get residue from TRB pointer field bits [23:0] of status
+                        let residue = evt.status & 0xFFFFFF;
+                        return match cc {
+                            x if x == trb_cc::SUCCESS => (TransferResult::Success, residue as u64),
+                            x if x == trb_cc::SHORT_PACKET => (TransferResult::ShortPacket, residue as u64),
+                            _ => (TransferResult::Error(cc), residue as u64),
+                        };
+                    }
+                    // Got non-transfer event, continue waiting
+                }
+                // No event yet, continue waiting
+            }
+        }
+        (TransferResult::Timeout, 0)
+    }
+
+    /// Receive data on bulk IN using IRQ-based waiting
+    /// Returns (result, bytes_transferred)
+    fn receive_bulk_in_irq(&mut self, ctx: &mut BulkContext, offset: usize, length: usize) -> (TransferResult, usize) {
+        let phys_addr = ctx.data_phys + offset as u64;
+
+        // Invalidate destination buffer before DMA
+        ctx.invalidate_buffer(phys_addr, length);
+
+        // Get current DCS from endpoint context
+        let dcs = ctx.get_bulk_in_dcs();
+
+        // Create TRB for bulk IN
+        unsafe {
+            let trb = &mut *ctx.bulk_in_ring.add(ctx.in_enqueue);
+            trb.param = phys_addr;
+            trb.status = length as u32;
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | dcs;  // IOC, cycle=DCS
+            ctx.flush_buffer(trb as *const _ as u64, 16);
+            ctx.in_enqueue += 1;
+        }
+
+        // Ring doorbell
+        self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
+
+        // Wait for transfer via IRQ
+        let (result, residue) = self.wait_transfer_irq(5000);
+
+        // Calculate bytes transferred
+        let bytes = if residue as usize <= length {
+            length - residue as usize
+        } else {
+            length
+        };
+
+        (result, bytes)
+    }
+
+    /// Receive CSW (Command Status Wrapper) on bulk IN
+    /// Returns (result, CSW)
+    fn receive_csw_irq(&mut self, ctx: &mut BulkContext) -> (TransferResult, Option<Csw>) {
+        let (result, _bytes) = self.receive_bulk_in_irq(ctx, CSW_OFFSET, 13);
+
+        if result == TransferResult::Success || result == TransferResult::ShortPacket {
+            // Read CSW from buffer
+            unsafe {
+                let csw_ptr = ctx.data_buf.add(CSW_OFFSET) as *const Csw;
+                ctx.invalidate_buffer(csw_ptr as u64, 13);
+                let csw = core::ptr::read_volatile(csw_ptr);
+                return (result, Some(csw));
+            }
+        }
+
+        (result, None)
+    }
+
+    /// Execute a complete SCSI command: CBW -> optional Data IN -> CSW
+    /// For commands with data phase, data is placed at DATA_OFFSET in the buffer
+    fn scsi_command_in(&mut self, ctx: &mut BulkContext, cmd: &[u8], data_length: u32) -> (TransferResult, Option<Csw>) {
+        let tag = ctx.next_tag();
+
+        // Build CBW
+        let cbw = Cbw::new(tag, data_length, true, 0, cmd);
+
+        // Send CBW
+        if !self.send_cbw(ctx, &cbw) {
+            println!("    CBW send failed");
+            return (TransferResult::Error(0), None);
+        }
+
+        // Data phase (if any)
+        if data_length > 0 {
+            let (result, bytes) = self.receive_bulk_in_irq(ctx, DATA_OFFSET, data_length as usize);
+            if result != TransferResult::Success && result != TransferResult::ShortPacket {
+                println!("    Data phase failed: {:?}", result);
+                return (result, None);
+            }
+            println!("    Data received: {} bytes", bytes);
+        }
+
+        // CSW phase
+        self.receive_csw_irq(ctx)
+    }
+
+    /// SCSI READ(10) command - read sectors from device
+    /// lba: starting logical block address
+    /// count: number of blocks to read (each block is typically 512 bytes)
+    /// Returns (success, data slice)
+    fn scsi_read_10<'a>(&mut self, ctx: &'a mut BulkContext, lba: u32, count: u16) -> Option<&'a [u8]> {
+        // READ(10) CDB format:
+        // [0] = 0x28 (READ_10 opcode)
+        // [1] = flags (0)
+        // [2-5] = LBA (big-endian)
+        // [6] = group number (0)
+        // [7-8] = transfer length in blocks (big-endian)
+        // [9] = control (0)
+        let cmd = [
+            scsi::READ_10,
+            0,
+            ((lba >> 24) & 0xFF) as u8,
+            ((lba >> 16) & 0xFF) as u8,
+            ((lba >> 8) & 0xFF) as u8,
+            (lba & 0xFF) as u8,
+            0,
+            ((count >> 8) & 0xFF) as u8,
+            (count & 0xFF) as u8,
+            0,
+        ];
+
+        // Assume 512 bytes per block
+        let data_length = (count as u32) * 512;
+        println!("  SCSI READ(10): LBA={}, count={}, bytes={}", lba, count, data_length);
+
+        let (result, csw) = self.scsi_command_in(ctx, &cmd, data_length);
+
+        if let Some(csw) = csw {
+            // Copy fields from packed struct to avoid unaligned references
+            let sig = csw.signature;
+            let tag = csw.tag;
+            let residue = csw.data_residue;
+            let status = csw.status;
+
+            if sig == msc::CSW_SIGNATURE {
+                print!("    CSW: tag={}, residue={}, status=", tag, residue);
+                match status {
+                    0 => println!("PASSED"),
+                    1 => println!("FAILED"),
+                    2 => println!("PHASE_ERROR"),
+                    _ => println!("{}", status),
+                }
+
+                if status == msc::CSW_STATUS_PASSED && (result == TransferResult::Success || result == TransferResult::ShortPacket) {
+                    // Return slice to data
+                    let actual_bytes = (data_length - residue) as usize;
+                    unsafe {
+                        let data_ptr = ctx.data_buf.add(DATA_OFFSET);
+                        return Some(core::slice::from_raw_parts(data_ptr, actual_bytes));
+                    }
+                }
+            } else {
+                print!("    Invalid CSW signature: ");
+                print_hex32(sig);
+                println!();
+            }
+        } else {
+            println!("    No CSW received: {:?}", result);
+        }
+
+        None
+    }
+
+    /// SCSI READ_CAPACITY(10) - get device capacity
+    /// Returns (last_lba, block_size) or None on error
+    fn scsi_read_capacity_10(&mut self, ctx: &mut BulkContext) -> Option<(u32, u32)> {
+        // READ_CAPACITY(10) CDB: just the opcode, rest is zeros
+        let cmd = [scsi::READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        println!("  SCSI READ_CAPACITY(10)...");
+
+        let (result, csw) = self.scsi_command_in(ctx, &cmd, 8);
+
+        if let Some(csw) = csw {
+            if csw.signature == msc::CSW_SIGNATURE && csw.status == msc::CSW_STATUS_PASSED {
+                // Parse response (8 bytes, big-endian)
+                unsafe {
+                    let resp_ptr = ctx.data_buf.add(DATA_OFFSET);
+                    ctx.invalidate_buffer(resp_ptr as u64, 8);
+
+                    let last_lba = u32::from_be_bytes([
+                        *resp_ptr.add(0), *resp_ptr.add(1),
+                        *resp_ptr.add(2), *resp_ptr.add(3)
+                    ]);
+                    let block_size = u32::from_be_bytes([
+                        *resp_ptr.add(4), *resp_ptr.add(5),
+                        *resp_ptr.add(6), *resp_ptr.add(7)
+                    ]);
+
+                    println!("    Last LBA: {}", last_lba);
+                    println!("    Block size: {} bytes", block_size);
+                    println!("    Capacity: {} MB", ((last_lba as u64 + 1) * block_size as u64) / (1024 * 1024));
+
+                    return Some((last_lba, block_size));
+                }
+            }
+        }
+
+        println!("    READ_CAPACITY failed: {:?}", result);
+        None
+    }
+
+    /// Run SCSI tests using the new refactored code
+    fn run_scsi_tests(&mut self, ctx: &mut BulkContext) {
+        println!();
+        println!("=== Running SCSI Tests (refactored) ===");
+
+        // Read capacity first to know device size
+        if let Some((last_lba, block_size)) = self.scsi_read_capacity_10(ctx) {
+            println!();
+
+            // Read first sector (LBA 0) - usually contains MBR or GPT
+            if let Some(data) = self.scsi_read_10(ctx, 0, 1) {
+                println!("    Read {} bytes from LBA 0", data.len());
+
+                // Dump first 64 bytes
+                println!("    First 64 bytes:");
+                for row in 0..4 {
+                    print!("      {:04x}: ", row * 16);
+                    for col in 0..16 {
+                        if row * 16 + col < data.len() {
+                            print_hex8(data[row * 16 + col]);
+                            print!(" ");
+                        }
+                    }
+                    println!();
+                }
+
+                // Check for MBR signature (0x55, 0xAA at offset 510)
+                if data.len() >= 512 {
+                    if data[510] == 0x55 && data[511] == 0xAA {
+                        println!("    MBR signature found! (valid partition table)");
+                    } else {
+                        print!("    No MBR signature (bytes 510-511: ");
+                        print_hex8(data[510]);
+                        print!(" ");
+                        print_hex8(data[511]);
+                        println!(")");
+                    }
+                }
+            }
+
+            // Also try reading last sector if device is large enough
+            if last_lba > 0 && block_size == 512 {
+                println!();
+                println!("  Reading last sector (LBA {})...", last_lba);
+                if let Some(data) = self.scsi_read_10(ctx, last_lba, 1) {
+                    println!("    Read {} bytes from last sector", data.len());
+                }
+            }
+        } else {
+            println!("  Cannot run read tests without knowing device capacity");
+        }
+    }
+
     /// Perform SCSI INQUIRY command
     fn scsi_inquiry(
         &mut self,
@@ -4506,10 +4984,18 @@ impl UsbDriver {
             println!();
         }
 
-        // Wait for CSW - Poll with cache invalidation to diagnose event generation
-        println!("    Step 3: Waiting for CSW (poll with cache invalidation)...");
+        // Wait for CSW using IRQ-based waiting
+        println!("    Step 3: Waiting for CSW (IRQ-based)...");
 
-        // Clear IMAN.IP before waiting - so we know if NEW event arrives
+        // Get timer frequency for timing measurements
+        let timer_freq: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) timer_freq); }
+
+        // Record start time (right after doorbell was rung)
+        let start_time: u64;
+        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start_time); }
+
+        // Clear IMAN.IP before waiting - so we get a fresh interrupt
         unsafe {
             let iman_addr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::IMAN) as u64) as *mut u32;
             let iman = core::ptr::read_volatile(iman_addr);
@@ -4529,36 +5015,29 @@ impl UsbDriver {
             }
         }
 
-        // Poll for CSW completion
-        // Note: Interrupt-based waiting doesn't work - xHCI doesn't complete transfer when CPU is idle.
-        // Active polling keeps the bus/memory subsystem active which seems necessary.
-        println!("    Waiting for CSW...");
-
-        // Initial wait before polling - give device time to process command
-        println!("    Waiting 2 seconds before first check...");
-        delay_ms(2000);
-        println!("    Wait complete, now checking for event...");
+        // Use IRQ-based waiting - blocks until xHCI interrupt fires
+        // Loop until we get the CSW event (may need multiple IRQs if earlier events pending)
+        println!("    Waiting for IRQ...");
 
         let mut csw_received = false;
-        let mut poll_iterations = 0u32;
+        let max_irq_waits = 10;  // Prevent infinite loop
 
-        // Get start timestamp
-        let start_ts: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start_ts); }
-        println!("      Start timestamp: {}", start_ts);
+        for irq_attempt in 0..max_irq_waits {
+            let irq_received = self.wait_for_irq(5000);
 
-        if let Some(ref mut event_ring) = self.event_ring {
-            for i in 0..5000 {
-                poll_iterations = i;
+            if !irq_received {
+                println!("    IRQ wait failed (fd={})!", self.irq_fd);
+                break;
+            }
 
-                // Progress every 500 iterations with timestamp
-                if i > 0 && i % 500 == 0 {
-                    let ts: u64;
-                    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) ts); }
-                    println!("      Still waiting... iteration {} (ts={})", i, ts);
-                }
+            if irq_attempt > 0 {
+                println!("    IRQ #{} received, checking event ring...", irq_attempt + 1);
+            } else {
+                println!("    IRQ received, checking event ring...");
+            }
 
-                // Check for event with cache invalidation
+            // Check event ring for CSW completion
+            if let Some(ref mut event_ring) = self.event_ring {
                 if let Some(evt) = event_ring.dequeue() {
                     let evt_type = evt.get_type();
                     let cc = (evt.status >> 24) & 0xFF;
@@ -4566,7 +5045,12 @@ impl UsbDriver {
                     if evt_type == trb_type::TRANSFER_EVENT {
                         if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET {
                             csw_received = true;
-                            println!("      CSW received at iteration {}", i);
+                            // Calculate elapsed time
+                            let end_time: u64;
+                            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) end_time); }
+                            let elapsed_ticks = end_time - start_time;
+                            let elapsed_us = (elapsed_ticks * 1_000_000) / timer_freq;
+                            println!("      CSW received via IRQ in {} us ({} ticks)", elapsed_us, elapsed_ticks);
                         } else {
                             print!("      Transfer failed CC=");
                             print_hex32(cc);
@@ -4579,16 +5063,25 @@ impl UsbDriver {
                             core::ptr::write_volatile(ptr, erdp);
                         }
                         break;
+                    } else {
+                        // Got some other event type, update ERDP and wait for more
+                        println!("      Got event type {} (not transfer), waiting for more...", evt_type);
+                        let erdp = event_ring.erdp() | (1 << 3);
+                        unsafe {
+                            let ptr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64) as *mut u64;
+                            core::ptr::write_volatile(ptr, erdp);
+                        }
                     }
+                } else {
+                    // No event in ring yet - the IRQ might have been for something else
+                    // or the event hasn't been written yet. Wait for another IRQ.
+                    println!("      No event in ring, waiting for another IRQ...");
                 }
-
-                // 1ms delay between polls using hardware timer
-                delay_ms(1);
             }
         }
 
         if !csw_received {
-            println!("      CSW timeout after {} attempts", poll_iterations);
+            println!("      CSW not received after {} IRQ attempts", max_irq_waits);
 
             // Basic diagnostics
             unsafe {
@@ -4610,26 +5103,127 @@ impl UsbDriver {
                 let ep_state = ep_dw0 & 0x7;
                 println!("      Bulk IN EP state={} (1=Running, 2=Halted)", ep_state);
             }
-
-            // Try one more dequeue with fresh cache invalidation
-            if let Some(ref mut event_ring) = self.event_ring {
-                if let Some(evt) = event_ring.dequeue() {
-                    let evt_type = evt.get_type();
-                    let cc = (evt.status >> 24) & 0xFF;
-                    println!("      Late event found! type={}, CC={}", evt_type, cc);
-                    if evt_type == trb_type::TRANSFER_EVENT && (cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET) {
-                        csw_received = true;
-                        let erdp = event_ring.erdp() | (1 << 3);
-                        unsafe {
-                            let ptr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64) as *mut u64;
-                            core::ptr::write_volatile(ptr, erdp);
-                        }
-                    }
-                }
-
-            }
             return;
         }
+
+        // =========================================================================
+        // OLD POLLING-BASED APPROACH (kept for reference)
+        // =========================================================================
+        // // Poll for CSW completion
+        // // Note: Interrupt-based waiting doesn't work - xHCI doesn't complete transfer when CPU is idle.
+        // // Active polling keeps the bus/memory subsystem active which seems necessary.
+        // println!("    Waiting for CSW...");
+        //
+        // // Initial wait before polling - give device time to process command
+        // // Check IMAN before/after to see when interrupt fires
+        // unsafe {
+        //     let iman = core::ptr::read_volatile(
+        //         (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::IMAN) as u64) as *const u32
+        //     );
+        //     println!("    IMAN before delay: IP={}, IE={}", iman & 1, (iman >> 1) & 1);
+        // }
+        // println!("    Waiting 2 seconds before first check...");
+        // delay_ms(2000);
+        // unsafe {
+        //     let iman = core::ptr::read_volatile(
+        //         (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::IMAN) as u64) as *const u32
+        //     );
+        //     println!("    IMAN after delay: IP={}, IE={}", iman & 1, (iman >> 1) & 1);
+        // }
+        // println!("    Wait complete, now checking for event...");
+        //
+        // let mut csw_received = false;
+        // let mut poll_iterations = 0u32;
+        //
+        // // Get start timestamp
+        // let start_ts: u64;
+        // unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start_ts); }
+        // println!("      Start timestamp: {}", start_ts);
+        //
+        // if let Some(ref mut event_ring) = self.event_ring {
+        //     for i in 0..5000 {
+        //         poll_iterations = i;
+        //
+        //         // Progress every 500 iterations with timestamp
+        //         if i > 0 && i % 500 == 0 {
+        //             let ts: u64;
+        //             unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) ts); }
+        //             println!("      Still waiting... iteration {} (ts={})", i, ts);
+        //         }
+        //
+        //         // Check for event with cache invalidation
+        //         if let Some(evt) = event_ring.dequeue() {
+        //             let evt_type = evt.get_type();
+        //             let cc = (evt.status >> 24) & 0xFF;
+        //
+        //             if evt_type == trb_type::TRANSFER_EVENT {
+        //                 if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET {
+        //                     csw_received = true;
+        //                     println!("      CSW received at iteration {}", i);
+        //                 } else {
+        //                     print!("      Transfer failed CC=");
+        //                     print_hex32(cc);
+        //                     println!();
+        //                 }
+        //                 // Update ERDP
+        //                 let erdp = event_ring.erdp() | (1 << 3);
+        //                 unsafe {
+        //                     let ptr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64) as *mut u64;
+        //                     core::ptr::write_volatile(ptr, erdp);
+        //                 }
+        //                 break;
+        //             }
+        //         }
+        //
+        //         // 1ms delay between polls using hardware timer
+        //         delay_ms(1);
+        //     }
+        // }
+        //
+        // if !csw_received {
+        //     println!("      CSW timeout after {} attempts", poll_iterations);
+        //
+        //     // Basic diagnostics
+        //     unsafe {
+        //         let iman = core::ptr::read_volatile(
+        //             (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::IMAN) as u64) as *const u32
+        //         );
+        //         print!("      IMAN=");
+        //         print_hex32(iman);
+        //         println!(" (IP={}, IE={})", iman & 1, (iman >> 1) & 1);
+        //
+        //         // Check EP state
+        //         let dev_ctx = &*device_ctx_virt;
+        //         let bulk_in_idx = (bulk_in_dci - 1) as usize;
+        //         let bulk_in_ctx = &dev_ctx.endpoints[bulk_in_idx];
+        //         let ctx_addr = bulk_in_ctx as *const _ as u64;
+        //         core::arch::asm!("dc civac, {}", in(reg) ctx_addr, options(nostack));
+        //         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        //         let ep_dw0 = core::ptr::read_volatile(&bulk_in_ctx.dw0);
+        //         let ep_state = ep_dw0 & 0x7;
+        //         println!("      Bulk IN EP state={} (1=Running, 2=Halted)", ep_state);
+        //     }
+        //
+        //     // Try one more dequeue with fresh cache invalidation
+        //     if let Some(ref mut event_ring) = self.event_ring {
+        //         if let Some(evt) = event_ring.dequeue() {
+        //             let evt_type = evt.get_type();
+        //             let cc = (evt.status >> 24) & 0xFF;
+        //             println!("      Late event found! type={}, CC={}", evt_type, cc);
+        //             if evt_type == trb_type::TRANSFER_EVENT && (cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET) {
+        //                 csw_received = true;
+        //                 let erdp = event_ring.erdp() | (1 << 3);
+        //                 unsafe {
+        //                     let ptr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64) as *mut u64;
+        //                     core::ptr::write_volatile(ptr, erdp);
+        //                 }
+        //             }
+        //         }
+        //
+        //     }
+        //     return;
+        // }
+        // =========================================================================
 
         // CSW received successfully - read the CSW data
         unsafe {
@@ -4992,9 +5586,10 @@ fn main() {
     driver.print_port_status();
 
     // Register for IRQ
+    // GIC SPI 172 = GIC interrupt ID 204 (SPI numbers start at GIC ID 32)
     println!();
     println!("=== IRQ Registration ===");
-    let irq_url = "irq:172";
+    let irq_url = "irq:204";
     let irq_fd = syscall::scheme_open(irq_url, 0);
     if irq_fd >= 0 {
         println!("  IRQ {} registered (fd={})", SSUSB1_IRQ, irq_fd);
