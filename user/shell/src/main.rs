@@ -177,7 +177,7 @@ fn execute_command(cmd: &[u8]) {
     } else if cmd_eq(cmd, b"panic") {
         panic!("User requested panic");
     } else if cmd_eq(cmd, b"usb") {
-        cmd_run_program("bin/usbtest");
+        cmd_run_program("bin/usbd");
     } else if cmd_eq(cmd, b"gpio") {
         cmd_run_program("bin/gpio");
     } else if cmd_eq(cmd, b"ps") {

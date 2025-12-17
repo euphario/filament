@@ -9,16 +9,25 @@ cd "$SCRIPT_DIR"
 # Create output directory
 mkdir -p bin
 
-# List of programs to build
-PROGRAMS="shell gpio usbtest"
+# List of programs to build (name:path pairs, path defaults to name if not specified)
+# Note: usbd replaces usbtest as the main USB daemon
+# msc: Mass Storage Class driver (communicates with usbd via IPC)
+PROGRAMS="shell gpio usbd:driver/usbd msc:driver/msc"
 
 # Build each program
-for prog in $PROGRAMS; do
-    echo "Building $prog..."
+for entry in $PROGRAMS; do
+    # Split name:path, default path to name
+    prog="${entry%%:*}"
+    path="${entry#*:}"
+    if [ "$path" = "$prog" ]; then
+        path="$prog"
+    fi
+
+    echo "Building $prog (from $path)..."
 
     # Build with cargo (from the program's directory)
     # Override rustflags to prevent kernel's linker script from being used
-    (cd "$prog" && RUSTFLAGS="-C link-arg=-Tuser.ld -C link-arg=--gc-sections -C link-arg=-n" cargo build --release)
+    (cd "$path" && RUSTFLAGS="-C link-arg=-Tuser.ld -C link-arg=--gc-sections -C link-arg=-n" cargo build --release)
 
     # Copy ELF to bin directory
     cp "target/aarch64-unknown-none/release/$prog" "bin/$prog.elf"
