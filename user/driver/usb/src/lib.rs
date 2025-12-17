@@ -67,9 +67,10 @@ pub use enumeration::{
     endpoint_address_to_dci, default_max_packet_size,
 };
 pub use controller::{
-    PortLinkState, PortSpeed, portsc, ParsedPortsc,
+    PortLinkState, PortSpeed, portsc, ParsedPortsc, XhciCapabilities,
     event_completion_code, event_slot_id, event_endpoint_id, event_port_id,
     event_trb_pointer, event_transfer_length, event_is_short_packet,
     event_type, completion_code, doorbell,
 };
 pub use hal::{SocHal, ControllerId, XhciController, mt7988a};
+pub use hal::mt7988a::Mt7988aHal;

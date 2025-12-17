@@ -1,9 +1,17 @@
 //! xHCI Controller Helpers
 //!
-//! This module provides xHCI controller-related utilities including
-//! event TRB parsing and port status interpretation.
+//! This module provides xHCI controller-related utilities including:
+//! - Port status interpretation (PORTSC parsing)
+//! - Event TRB parsing
+//! - Generic xHCI initialization functions
+//!
+//! These are standardized xHCI operations that work on any hardware.
 
 use crate::trb::Trb;
+use crate::hal::XhciController;
+use crate::xhci::{xhci_cap, xhci_op, usbcmd, usbsts, xhci_rt, xhci_ir};
+use crate::mmio::{delay, print_hex32};
+use userlib::{print, println};
 
 /// Port Link State values from PORTSC register
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -328,5 +336,231 @@ pub mod doorbell {
             let is_in = (ep_addr & 0x80) != 0;
             (2 * ep_num as u32) + if is_in { 1 } else { 0 }
         }
+    }
+}
+
+// =============================================================================
+// Generic xHCI Initialization Functions
+// =============================================================================
+
+/// xHCI capability information read from controller
+#[derive(Debug, Clone)]
+pub struct XhciCapabilities {
+    pub version: u16,
+    pub caplength: u32,
+    pub num_ports: u32,
+    pub max_slots: u32,
+    pub max_scratchpad: u32,
+    pub op_base: usize,
+    pub rt_base: usize,
+    pub db_base: usize,
+    pub port_base: usize,
+}
+
+impl XhciController {
+    /// Read xHCI capability registers and calculate offsets
+    ///
+    /// This is a standard xHCI operation that works on any compliant controller.
+    /// Updates the controller's offset fields (op_base, rt_base, db_base, etc.)
+    ///
+    /// Returns capability information on success.
+    pub fn read_capabilities(&mut self) -> Option<XhciCapabilities> {
+        println!();
+        println!("=== xHCI Capability Registers ===");
+
+        // Read capability length and version
+        let cap_reg = self.mac.read32(xhci_cap::CAPLENGTH);
+        self.caplength = cap_reg & 0xFF;
+        let version = ((cap_reg >> 16) & 0xFFFF) as u16;
+        println!("  xHCI version: {}.{}", version >> 8, version & 0xFF);
+        println!("  Capability length: 0x{:x}", self.caplength);
+
+        // Read structural parameters
+        let hcsparams1 = self.mac.read32(xhci_cap::HCSPARAMS1);
+        self.num_ports = (hcsparams1 >> 24) & 0xFF;
+        self.max_slots = hcsparams1 & 0xFF;
+        println!("  Max ports: {}, Max slots: {}", self.num_ports, self.max_slots);
+
+        let hcsparams2 = self.mac.read32(xhci_cap::HCSPARAMS2);
+        let max_scratchpad = ((hcsparams2 >> 27) & 0x1F) | ((hcsparams2 >> 16) & 0x3E0);
+        println!("  Max scratchpad buffers: {}", max_scratchpad);
+
+        // Calculate register offsets
+        self.op_base = self.caplength as usize;
+        self.rt_base = self.mac.read32(xhci_cap::RTSOFF) as usize & !0x1F;
+        self.db_base = self.mac.read32(xhci_cap::DBOFF) as usize & !0x3;
+        self.port_base = self.op_base + 0x400;
+        println!("  Op base: 0x{:x}, Runtime: 0x{:x}, Doorbell: 0x{:x}",
+                 self.op_base, self.rt_base, self.db_base);
+
+        Some(XhciCapabilities {
+            version,
+            caplength: self.caplength,
+            num_ports: self.num_ports,
+            max_slots: self.max_slots,
+            max_scratchpad,
+            op_base: self.op_base,
+            rt_base: self.rt_base,
+            db_base: self.db_base,
+            port_base: self.port_base,
+        })
+    }
+
+    /// Print current port status (for debugging before reset)
+    pub fn print_port_status_before_reset(&self) {
+        println!();
+        println!("=== Current Port Status (before reset) ===");
+        for p in 0..self.num_ports {
+            let portsc_off = self.port_base + (p as usize * 0x10);
+            let portsc = self.mac.read32(portsc_off);
+            print!("  Port {}: PORTSC=0x", p + 1);
+            print_hex32(portsc);
+            let ccs = portsc & 1;
+            let ped = (portsc >> 1) & 1;
+            let pls = (portsc >> 5) & 0xF;
+            let speed = (portsc >> 10) & 0xF;
+            println!(" CCS={} PED={} PLS={} Speed={}", ccs, ped, pls, speed);
+        }
+    }
+
+    /// Halt and reset the xHCI controller
+    ///
+    /// This is a standard xHCI operation:
+    /// 1. Clear R/S bit to stop the controller
+    /// 2. Wait for HCH (halted) bit
+    /// 3. Set HCRST to reset
+    /// 4. Wait for HCRST to clear and CNR to clear
+    ///
+    /// Returns true on success.
+    pub fn halt_and_reset(&mut self) -> bool {
+        println!();
+        println!("=== xHCI Reset ===");
+
+        // Halt controller
+        println!("  Halting controller...");
+        let cmd = self.op_read32(xhci_op::USBCMD);
+        self.op_write32(xhci_op::USBCMD, cmd & !usbcmd::RUN);
+
+        // Wait for halt
+        for _ in 0..100 {
+            let sts = self.op_read32(xhci_op::USBSTS);
+            if (sts & usbsts::HCH) != 0 {
+                break;
+            }
+            delay(1000);
+        }
+
+        // Reset
+        println!("  Resetting...");
+        self.op_write32(xhci_op::USBCMD, usbcmd::HCRST);
+
+        // Wait for reset complete
+        for _ in 0..100 {
+            let cmd = self.op_read32(xhci_op::USBCMD);
+            let sts = self.op_read32(xhci_op::USBSTS);
+            if (cmd & usbcmd::HCRST) == 0 && (sts & usbsts::CNR) == 0 {
+                println!("  Reset complete");
+                return true;
+            }
+            delay(1000);
+        }
+
+        println!("  ERROR: Reset timeout!");
+        false
+    }
+
+    /// Program xHCI operational registers
+    ///
+    /// Sets up:
+    /// - MaxSlotsEn (CONFIG register)
+    /// - DCBAAP (device context base address array pointer)
+    /// - CRCR (command ring control register)
+    ///
+    /// # Arguments
+    /// * `dcbaa_phys` - Physical address of DCBAA
+    /// * `cmd_ring_phys` - Physical address of command ring
+    pub fn program_operational_registers(&mut self, dcbaa_phys: u64, cmd_ring_phys: u64) {
+        println!();
+        println!("=== Programming xHCI Registers ===");
+
+        // Set max device slots
+        let config = self.max_slots.min(16);  // Limit to 16 slots
+        self.op_write32(xhci_op::CONFIG, config);
+        println!("  MaxSlotsEn = {}", config);
+
+        // Set DCBAAP (Device Context Base Address Array Pointer)
+        self.op_write64(xhci_op::DCBAAP, dcbaa_phys);
+        println!("  DCBAAP = 0x{:x}", dcbaa_phys);
+
+        // Set CRCR (Command Ring Control Register)
+        // Bit 0 = RCS (Ring Cycle State) = 1
+        self.op_write64(xhci_op::CRCR, cmd_ring_phys | 1);
+        println!("  CRCR = 0x{:x}", cmd_ring_phys | 1);
+    }
+
+    /// Program interrupter 0 for event ring
+    ///
+    /// # Arguments
+    /// * `erst_phys` - Physical address of ERST (Event Ring Segment Table)
+    /// * `evt_ring_phys` - Physical address of event ring
+    pub fn program_interrupter(&mut self, erst_phys: u64, evt_ring_phys: u64) {
+        let ir0 = xhci_rt::IR0;
+
+        // Set ERSTSZ (Event Ring Segment Table Size) = 1 segment
+        self.rt_write32(ir0 + xhci_ir::ERSTSZ, 1);
+
+        // Set ERDP (Event Ring Dequeue Pointer)
+        self.rt_write64(ir0 + xhci_ir::ERDP, evt_ring_phys);
+
+        // Set ERSTBA (Event Ring Segment Table Base Address)
+        // This must be done after ERSTSZ
+        self.rt_write64(ir0 + xhci_ir::ERSTBA, erst_phys);
+        println!("  Interrupter 0 configured");
+
+        // Enable interrupter
+        self.rt_write32(ir0 + xhci_ir::IMAN, 0x2);  // IE=1, IP=0
+    }
+
+    /// Start the xHCI controller
+    ///
+    /// Sets R/S bit and INTE to enable interrupts.
+    /// Returns true if controller starts successfully.
+    pub fn start(&mut self) -> bool {
+        println!();
+        println!("=== Starting Controller ===");
+
+        // Start controller with interrupt enable
+        let cmd = self.op_read32(xhci_op::USBCMD);
+        self.op_write32(xhci_op::USBCMD, cmd | usbcmd::RUN | usbcmd::INTE);
+
+        // Wait for running
+        delay(10000);
+        let sts = self.op_read32(xhci_op::USBSTS);
+        if (sts & usbsts::HCH) == 0 {
+            println!("  Controller running");
+            true
+        } else {
+            println!("  ERROR: Controller not running!");
+            false
+        }
+    }
+
+    /// Power on all ports
+    ///
+    /// Sets the PP (Port Power) bit on each port's PORTSC register.
+    pub fn power_on_ports(&mut self) {
+        println!("  Powering ports...");
+        for p in 0..self.num_ports {
+            let portsc_off = self.port_base + (p as usize * 0x10);
+            let portsc = self.mac.read32(portsc_off);
+            // Set PP (Port Power) bit 9
+            self.mac.write32(portsc_off, portsc | portsc::PP);
+        }
+    }
+
+    /// Wait for link stabilization after port power
+    pub fn wait_for_link(&self, delay_us: u32) {
+        println!("  Waiting for link...");
+        delay(delay_us);
     }
 }

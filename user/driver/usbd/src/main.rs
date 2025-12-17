@@ -16,8 +16,6 @@ use userlib::{println, print, syscall};
 // Import from the usb driver library
 use usb::{
     // Hardware addresses
-    SSUSB0_MAC_PHYS, SSUSB0_PHY_PHYS, SSUSB0_PHY_SIZE, SSUSB0_IRQ,
-    SSUSB1_MAC_PHYS, SSUSB1_PHY_PHYS, SSUSB1_PHY_SIZE, SSUSB1_IRQ,
     SSUSB_MAC_SIZE, SSUSB_IPPC_OFFSET,
     // Clock/reset control
     INFRACFG_AO_BASE, INFRACFG_AO_SIZE,
@@ -26,10 +24,8 @@ use usb::{
     RST1_SSUSB_TOP0, RST1_SSUSB_TOP1, CG1_SSUSB0, CG1_SSUSB1,
     // GPIO IPC
     GPIO_CMD_USB_VBUS,
-    // PHY modules
-    ippc, tphy,
     // xHCI registers
-    xhci_cap, xhci_op, usbcmd, usbsts, xhci_port, xhci_rt, xhci_ir,
+    xhci_op, xhci_port, xhci_rt, xhci_ir,
     // TRB
     Trb, trb_type, trb_cc,
     // USB types
@@ -45,7 +41,7 @@ use usb::{
     // MMIO helpers
     MmioRegion, format_mmio_url, delay_ms, delay, print_hex64, print_hex32, print_hex8,
     // Controller helpers
-    ParsedPortsc, portsc,
+    ParsedPortsc, portsc, XhciController, ControllerId,
     event_completion_code, event_slot_id, event_port_id,
     completion_code, doorbell,
     // Enumeration helpers
@@ -53,6 +49,8 @@ use usb::{
     // Hub helpers
     get_hub_descriptor_setup, get_port_status_setup,
     set_port_feature_setup, clear_port_feature_setup,
+    // HAL
+    mt7988a,
 };
 
 // Module definitions now imported from usb crate
@@ -68,18 +66,8 @@ use usb::{
 const XHCI_MEM_SIZE: usize = 4096 * 3;  // 3 pages
 
 struct UsbDriver {
-    controller: u32,        // 0 = SSUSB0 (XS-PHY), 1 = SSUSB1 (T-PHY)
-    mac: MmioRegion,        // Also contains IPPC at offset 0x3e00
-    phy: MmioRegion,
-    // xHCI register offsets (from mac.base)
-    op_base: usize,         // Operational registers
-    rt_base: usize,         // Runtime registers
-    db_base: usize,         // Doorbell registers
-    port_base: usize,       // Port register array
-    // Capability info
-    caplength: u32,
-    num_ports: u32,
-    max_slots: u32,
+    // xHCI controller abstraction (from library)
+    xhci: XhciController,
     // xHCI data structures
     xhci_mem: u64,          // Virtual address of allocated xHCI memory
     xhci_phys: u64,         // Physical address of allocated xHCI memory
@@ -90,38 +78,48 @@ struct UsbDriver {
 }
 
 impl UsbDriver {
-    fn new(controller: u32) -> Option<Self> {
-        let (mac_phys, phy_phys, phy_size, _irq) = match controller {
-            0 => (SSUSB0_MAC_PHYS, SSUSB0_PHY_PHYS, SSUSB0_PHY_SIZE, SSUSB0_IRQ),
-            1 => (SSUSB1_MAC_PHYS, SSUSB1_PHY_PHYS, SSUSB1_PHY_SIZE, SSUSB1_IRQ),
+    fn new(controller_id: u32) -> Option<Self> {
+        // Get addresses from HAL
+        let (mac_phys, phy_phys, phy_size) = match controller_id {
+            0 => (mt7988a::SSUSB0_MAC_PHYS, mt7988a::SSUSB0_PHY_PHYS, mt7988a::SSUSB0_PHY_SIZE),
+            1 => (mt7988a::SSUSB1_MAC_PHYS, mt7988a::SSUSB1_PHY_PHYS, mt7988a::SSUSB1_PHY_SIZE),
             _ => return None,
         };
 
-        println!("  Mapping SSUSB{} MMIO regions...", controller);
+        println!("  Mapping SSUSB{} MMIO regions...", controller_id);
 
         let mac = MmioRegion::open(mac_phys, SSUSB_MAC_SIZE)?;
         print!("    MAC+IPPC @ 0x");
         print_hex32(mac_phys as u32);
         println!(" -> OK (IPPC at +0x3e00)");
 
-        let phy = MmioRegion::open(phy_phys, phy_size)?;
+        let phy = MmioRegion::open(phy_phys, phy_size as u64)?;
         print!("    PHY @ 0x");
         print_hex32(phy_phys as u32);
         print!(" size=0x");
         print_hex32(phy_size as u32);
         println!(" -> OK");
 
-        Some(Self {
-            controller,
+        // Create XhciController with the mapped regions
+        let xhci = XhciController {
             mac,
-            phy,
+            phy: Some(phy),
+            id: ControllerId {
+                index: controller_id,
+                name: if controller_id == 0 { "SSUSB0" } else { "SSUSB1" },
+            },
+            caplength: 0,
             op_base: 0,
             rt_base: 0,
             db_base: 0,
             port_base: 0,
-            caplength: 0,
             num_ports: 0,
             max_slots: 0,
+            ippc_offset: Some(mt7988a::IPPC_OFFSET),
+        };
+
+        Some(Self {
+            xhci,
             xhci_mem: 0,
             xhci_phys: 0,
             cmd_ring: None,
@@ -130,76 +128,55 @@ impl UsbDriver {
         })
     }
 
-    /// Read from IPPC registers (offset from MAC base)
+    // Delegate register access to XhciController methods
     #[inline(always)]
     fn ippc_read32(&self, offset: usize) -> u32 {
-        self.mac.read32(SSUSB_IPPC_OFFSET + offset)
+        self.xhci.ippc_read32(offset)
     }
 
-    /// Write to IPPC registers (offset from MAC base)
     #[inline(always)]
     fn ippc_write32(&self, offset: usize, value: u32) {
-        self.mac.write32(SSUSB_IPPC_OFFSET + offset, value)
+        self.xhci.ippc_write32(offset, value)
     }
 
-    /// Read operational register
     #[inline(always)]
     fn op_read32(&self, offset: usize) -> u32 {
-        self.mac.read32(self.op_base + offset)
+        self.xhci.op_read32(offset)
     }
 
-    /// Write operational register
     #[inline(always)]
     fn op_write32(&self, offset: usize, value: u32) {
-        self.mac.write32(self.op_base + offset, value)
+        self.xhci.op_write32(offset, value)
     }
 
-    /// Write 64-bit operational register
     #[inline(always)]
     fn op_write64(&self, offset: usize, value: u64) {
-        self.mac.write64(self.op_base + offset, value)
+        self.xhci.op_write64(offset, value)
     }
 
-    /// Read runtime register
     #[inline(always)]
     fn rt_read32(&self, offset: usize) -> u32 {
-        self.mac.read32(self.rt_base + offset)
+        self.xhci.rt_read32(offset)
     }
 
-    /// Read 64-bit runtime register
     #[inline(always)]
     fn rt_read64(&self, offset: usize) -> u64 {
-        self.mac.read64(self.rt_base + offset)
+        self.xhci.rt_read64(offset)
     }
 
-    /// Write runtime register
     #[inline(always)]
     fn rt_write32(&self, offset: usize, value: u32) {
-        self.mac.write32(self.rt_base + offset, value)
+        self.xhci.rt_write32(offset, value)
     }
 
-    /// Write 64-bit runtime register
     #[inline(always)]
     fn rt_write64(&self, offset: usize, value: u64) {
-        self.mac.write64(self.rt_base + offset, value)
+        self.xhci.rt_write64(offset, value)
     }
 
-    /// Ring doorbell
-    /// Includes memory barrier and PCIe serialization to ensure DMA writes are visible
     #[inline(always)]
     fn ring_doorbell(&self, slot: u32, target: u32) {
-        // Data synchronization barrier to ensure all memory writes
-        // (including DMA ring TRBs) are complete from CPU perspective
-        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-
-        // CRITICAL: On non-coherent ARM systems, we need to force PCIe write serialization.
-        // Reading from the device forces any pending PCIe writes to complete before
-        // the doorbell write goes out. This prevents a race where xHCI sees the doorbell
-        // before seeing the TRB data. (Based on Linux xHCI driver fix for VL805)
-        let _ = self.mac.read32(self.db_base);  // Read doorbell[0] to force serialization
-
-        // Now write the actual doorbell
-        self.mac.write32(self.db_base + (slot as usize * 4), target);
+        self.xhci.ring_doorbell(slot, target)
     }
 
     /// Set the IRQ file descriptor for interrupt-based waiting
@@ -222,6 +199,10 @@ impl UsbDriver {
     }
 
     fn init(&mut self) -> bool {
+        // === IPPC Initialization (MediaTek-specific) ===
+        // This uses helper methods which delegate to self.xhci
+        use usb::phy::ippc;
+
         println!();
         println!("=== IPPC Initialization ===");
 
@@ -235,7 +216,7 @@ impl UsbDriver {
         // Power on host, power down device
         println!("  Host power on...");
         self.ippc_write32(ippc::IP_PW_CTRL2, ippc::IP_DEV_PDN);
-        self.ippc_write32(ippc::IP_PW_CTRL1, 0); // Clear host PDN
+        self.ippc_write32(ippc::IP_PW_CTRL1, 0);
 
         // Read port counts
         let cap = self.ippc_read32(ippc::IP_XHCI_CAP);
@@ -243,7 +224,7 @@ impl UsbDriver {
         let u2_ports = cap & 0xF;
         println!("  Ports: {} USB3, {} USB2", u3_ports, u2_ports);
 
-        // Configure U3 ports (if any)
+        // Configure U3 ports
         for i in 0..u3_ports {
             let offset = ippc::U3_CTRL_P0 + (i as usize * 8);
             let mut ctrl = self.ippc_read32(offset);
@@ -279,103 +260,50 @@ impl UsbDriver {
             delay(1000);
         }
 
-        println!();
-        println!("=== xHCI Capability Registers ===");
-
-        // Read capability registers
-        self.caplength = self.mac.read32(xhci_cap::CAPLENGTH) & 0xFF;
-        let version = (self.mac.read32(xhci_cap::CAPLENGTH) >> 16) & 0xFFFF;
-        println!("  xHCI version: {}.{}", version >> 8, version & 0xFF);
-        println!("  Capability length: 0x{:x}", self.caplength);
-
-        let hcsparams1 = self.mac.read32(xhci_cap::HCSPARAMS1);
-        self.num_ports = (hcsparams1 >> 24) & 0xFF;
-        self.max_slots = hcsparams1 & 0xFF;
-        println!("  Max ports: {}, Max slots: {}", self.num_ports, self.max_slots);
-
-        let hcsparams2 = self.mac.read32(xhci_cap::HCSPARAMS2);
-        let max_scratchpad = ((hcsparams2 >> 27) & 0x1F) | ((hcsparams2 >> 16) & 0x3E0);
-        println!("  Max scratchpad buffers: {}", max_scratchpad);
-
-        // Calculate register offsets
-        self.op_base = self.caplength as usize;
-        self.rt_base = self.mac.read32(xhci_cap::RTSOFF) as usize & !0x1F;
-        self.db_base = self.mac.read32(xhci_cap::DBOFF) as usize & !0x3;
-        self.port_base = self.op_base + 0x400;
-        println!("  Op base: 0x{:x}, Runtime: 0x{:x}, Doorbell: 0x{:x}",
-                 self.op_base, self.rt_base, self.db_base);
-
-        // Check port status BEFORE touching anything
-        println!();
-        println!("=== Current Port Status (before reset) ===");
-        for p in 0..self.num_ports {
-            let portsc_off = self.port_base + (p as usize * 0x10);
-            let portsc = self.mac.read32(portsc_off);
-            print!("  Port {}: PORTSC=0x", p + 1);
-            print_hex32(portsc);
-            let ccs = portsc & 1;
-            let ped = (portsc >> 1) & 1;
-            let pls = (portsc >> 5) & 0xF;
-            let speed = (portsc >> 10) & 0xF;
-            println!(" CCS={} PED={} PLS={} Speed={}", ccs, ped, pls, speed);
+        // === xHCI Capability Registers (generic xHCI) ===
+        // Use library method
+        if self.xhci.read_capabilities().is_none() {
+            println!("  ERROR: Failed to read xHCI capabilities");
+            return false;
         }
 
-        println!();
-        println!("=== xHCI Reset ===");
+        // Print port status before reset (for debugging)
+        self.xhci.print_port_status_before_reset();
 
-        // Halt controller
-        println!("  Halting controller...");
-        let cmd = self.op_read32(xhci_op::USBCMD);
-        self.op_write32(xhci_op::USBCMD, cmd & !usbcmd::RUN);
-
-        // Wait for halt
-        for _ in 0..100 {
-            let sts = self.op_read32(xhci_op::USBSTS);
-            if (sts & usbsts::HCH) != 0 {
-                break;
-            }
-            delay(1000);
+        // === xHCI Halt and Reset (generic xHCI) ===
+        if !self.xhci.halt_and_reset() {
+            return false;
         }
 
-        // Reset
-        println!("  Resetting...");
-        self.op_write32(xhci_op::USBCMD, usbcmd::HCRST);
+        // === PHY Initialization (MediaTek T-PHY specific) ===
+        use usb::phy::tphy;
 
-        // Wait for reset complete
-        for _ in 0..100 {
-            let cmd = self.op_read32(xhci_op::USBCMD);
-            let sts = self.op_read32(xhci_op::USBSTS);
-            if (cmd & usbcmd::HCRST) == 0 && (sts & usbsts::CNR) == 0 {
-                println!("  Reset complete");
-                break;
-            }
-            delay(1000);
-        }
-
-        // Initialize PHY for host mode
-        // Both SSUSB0 (XFI T-PHY) and SSUSB1 (T-PHY v2) use similar register layout
         println!();
         println!("=== PHY Initialization ===");
 
-        // T-PHY v2 has USB2 PHY at COM bank offset 0x300
-        // Try multiple offsets to find the right one
+        let phy = match &self.xhci.phy {
+            Some(p) => p,
+            None => {
+                println!("  ERROR: No PHY region");
+                return false;
+            }
+        };
+
         let offsets_to_try: &[(usize, &str)] = &[
-            (0x300, "COM+0x300"),      // Standard T-PHY v2 COM bank
-            (0x000, "base+0x000"),     // Direct offset
-            (0x100, "base+0x100"),     // Alternative
-            (0x400, "base+0x400"),     // Another alternative
+            (0x300, "COM+0x300"),
+            (0x000, "base+0x000"),
+            (0x100, "base+0x100"),
+            (0x400, "base+0x400"),
         ];
 
-        let phy_name = if self.controller == 0 { "XFI T-PHY" } else { "T-PHY v2" };
+        let phy_name = if self.xhci.id.index == 0 { "XFI T-PHY" } else { "T-PHY v2" };
         println!("  Configuring {} for host mode...", phy_name);
 
-        // Scan for valid PHY registers (non-zero reads indicate valid registers)
         let mut found_offset: Option<usize> = None;
         for &(base_off, name) in offsets_to_try {
             let dtm1_off = base_off + 0x6C;
-            let dtm1 = self.phy.read32(dtm1_off);
+            let dtm1 = phy.read32(dtm1_off);
             if dtm1 != 0 || base_off == 0x300 {
-                // Either we read non-zero, or try the standard offset
                 print!("    {} DTM1@0x{:x}=0x", name, dtm1_off);
                 print_hex32(dtm1);
                 println!();
@@ -385,22 +313,19 @@ impl UsbDriver {
             }
         }
 
-        // Use the found offset or default to standard T-PHY layout
         let com_offset = found_offset.unwrap_or(0x300);
         let dtm1_offset = com_offset + 0x6C;
 
-        let dtm1 = self.phy.read32(dtm1_offset);
+        let dtm1 = phy.read32(dtm1_offset);
         print!("    Using offset 0x{:x}, DTM1 before: 0x", dtm1_offset);
         print_hex32(dtm1);
         println!();
 
-        // Set host mode bits: force vbusvalid/avalid, set vbusvalid/avalid
         let new_dtm1 = dtm1 | tphy::HOST_MODE;
-        self.phy.write32(dtm1_offset, new_dtm1);
-
+        phy.write32(dtm1_offset, new_dtm1);
         delay(1000);
 
-        let dtm1_after = self.phy.read32(dtm1_offset);
+        let dtm1_after = phy.read32(dtm1_offset);
         print!("    After:  DTM1=0x");
         print_hex32(dtm1_after);
         if dtm1_after != dtm1 {
@@ -409,26 +334,24 @@ impl UsbDriver {
             println!(" (WARNING: register unchanged!)");
         }
 
-        // Force USB2 PHY power on via IPPC U2_PHY_PLL register
-        // This is critical for device detection!
+        // Force USB2 PHY power on
         println!();
         println!("=== Forcing USB2 PHY Power ===");
         let pll = self.ippc_read32(ippc::U2_PHY_PLL);
         print!("  U2_PHY_PLL before: 0x");
         print_hex32(pll);
         println!();
-        self.ippc_write32(ippc::U2_PHY_PLL, pll | 1);  // Set bit 0 to force power on
+        self.ippc_write32(ippc::U2_PHY_PLL, pll | 1);
         delay(1000);
         let pll_after = self.ippc_read32(ippc::U2_PHY_PLL);
         print!("  U2_PHY_PLL after:  0x");
         print_hex32(pll_after);
         println!(" (PHY power forced on)");
 
+        // === xHCI Data Structures (driver-specific allocation) ===
         println!();
         println!("=== xHCI Data Structures ===");
 
-        // Allocate DMA-capable memory for xHCI structures
-        // This returns both virtual and physical addresses
         let mut phys_addr: u64 = 0;
         let mem_addr = syscall::mmap_dma(XHCI_MEM_SIZE, &mut phys_addr);
         if mem_addr < 0 {
@@ -443,11 +366,7 @@ impl UsbDriver {
         print_hex32(self.xhci_phys as u32);
         println!(" ({} bytes)", XHCI_MEM_SIZE);
 
-        // Memory layout:
-        // Page 0 (0x000): DCBAA (2KB, 64-byte aligned)
-        // Page 0 (0x800): ERST (64 bytes, 64-byte aligned)
-        // Page 1 (0x1000): Command Ring (64 TRBs)
-        // Page 2 (0x2000): Event Ring (64 TRBs)
+        // Memory layout
         let dcbaa_virt = self.xhci_mem as *mut u64;
         let dcbaa_phys = self.xhci_phys;
         let erst_virt = (self.xhci_mem + 0x800) as *mut ErstEntry;
@@ -457,13 +376,11 @@ impl UsbDriver {
         let evt_ring_virt = (self.xhci_mem + 0x2000) as *mut Trb;
         let evt_ring_phys = self.xhci_phys + 0x2000;
 
-        // Zero DCBAA
+        // Zero and flush DCBAA
         unsafe {
             for i in 0..256 {
                 *dcbaa_virt.add(i) = 0;
             }
-            // U-Boot pattern: flush DCBAA to memory after CPU writes
-            // DCBAA is 2KB (256 * 8 bytes), flush all cache lines
             for i in 0..256 {
                 let addr = dcbaa_virt.add(i) as u64;
                 core::arch::asm!(
@@ -476,80 +393,28 @@ impl UsbDriver {
         }
         println!("  DCBAA initialized at 0x{:x}", dcbaa_phys);
 
-        // Initialize Command Ring
+        // Initialize rings
         self.cmd_ring = Some(Ring::init(cmd_ring_virt, cmd_ring_phys));
         println!("  Command Ring at 0x{:x}", cmd_ring_phys);
 
-        // Initialize Event Ring
-        // Pass USBSTS address for PCIe serialization on non-coherent ARM systems
-        let usbsts_addr = self.mac.base + self.op_base as u64 + xhci_op::USBSTS as u64;
+        let usbsts_addr = self.xhci.mac.base + self.xhci.op_base as u64 + xhci_op::USBSTS as u64;
         self.event_ring = Some(EventRing::init(evt_ring_virt, evt_ring_phys,
                                                 erst_virt, erst_phys, usbsts_addr));
         println!("  Event Ring at 0x{:x}, ERST at 0x{:x}", evt_ring_phys, erst_phys);
 
-        println!();
-        println!("=== Programming xHCI Registers ===");
+        // === Programming xHCI Registers (generic xHCI) ===
+        // Use library methods
+        self.xhci.program_operational_registers(dcbaa_phys, cmd_ring_phys);
+        self.xhci.program_interrupter(erst_phys, evt_ring_phys);
 
-        // Set max device slots
-        let config = self.max_slots.min(16);  // Limit to 16 slots
-        self.op_write32(xhci_op::CONFIG, config);
-        println!("  MaxSlotsEn = {}", config);
-
-        // Set DCBAAP (Device Context Base Address Array Pointer)
-        self.op_write64(xhci_op::DCBAAP, dcbaa_phys);
-        println!("  DCBAAP = 0x{:x}", dcbaa_phys);
-
-        // Set CRCR (Command Ring Control Register)
-        // Bit 0 = RCS (Ring Cycle State) = 1
-        self.op_write64(xhci_op::CRCR, cmd_ring_phys | 1);
-        println!("  CRCR = 0x{:x}", cmd_ring_phys | 1);
-
-        // Program Event Ring: Interrupter 0
-        let ir0 = xhci_rt::IR0;
-
-        // Set ERSTSZ (Event Ring Segment Table Size) = 1 segment
-        self.rt_write32(ir0 + xhci_ir::ERSTSZ, 1);
-
-        // Set ERDP (Event Ring Dequeue Pointer)
-        self.rt_write64(ir0 + xhci_ir::ERDP, evt_ring_phys);
-
-        // Set ERSTBA (Event Ring Segment Table Base Address)
-        // This must be done after ERSTSZ
-        self.rt_write64(ir0 + xhci_ir::ERSTBA, erst_phys);
-        println!("  Interrupter 0 configured");
-
-        // Enable interrupter
-        self.rt_write32(ir0 + xhci_ir::IMAN, 0x2);  // IE=1, IP=0
-
-        println!();
-        println!("=== Starting Controller ===");
-
-        // Start controller with interrupt enable
-        let cmd = self.op_read32(xhci_op::USBCMD);
-        self.op_write32(xhci_op::USBCMD, cmd | usbcmd::RUN | usbcmd::INTE);
-
-        // Wait for running
-        delay(10000);
-        let sts = self.op_read32(xhci_op::USBSTS);
-        if (sts & usbsts::HCH) == 0 {
-            println!("  Controller running");
-        } else {
-            println!("  ERROR: Controller not running!");
+        // === Start Controller (generic xHCI) ===
+        if !self.xhci.start() {
             return false;
         }
 
-        // Power on ports
-        println!("  Powering ports...");
-        for p in 0..self.num_ports {
-            let portsc_off = self.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
-            let portsc = self.mac.read32(portsc_off);
-            // Set PP (Port Power) bit 9
-            self.mac.write32(portsc_off, portsc | (1 << 9));
-        }
-
-        // Wait for link stabilization
-        println!("  Waiting for link...");
-        delay(100000);
+        // === Power on ports (generic xHCI) ===
+        self.xhci.power_on_ports();
+        self.xhci.wait_for_link(100000);
 
         true
     }
@@ -641,18 +506,18 @@ impl UsbDriver {
 
     /// Handle port status change
     fn handle_port_change(&mut self, port_id: u32) {
-        if port_id == 0 || port_id > self.num_ports {
+        if port_id == 0 || port_id > self.xhci.num_ports {
             return;
         }
 
-        let portsc_off = self.port_base + ((port_id - 1) as usize * 0x10) + xhci_port::PORTSC;
-        let raw = self.mac.read32(portsc_off);
+        let portsc_off = self.xhci.port_base + ((port_id - 1) as usize * 0x10) + xhci_port::PORTSC;
+        let raw = self.xhci.mac.read32(portsc_off);
         let status = ParsedPortsc::from_raw(raw);
 
         // Clear status change bits by writing 1 to them (W1C)
         let clear_bits = raw & portsc::CHANGE_BITS;
         if clear_bits != 0 {
-            self.mac.write32(portsc_off, status.clear_changes_value());
+            self.xhci.mac.write32(portsc_off, status.clear_changes_value());
         }
 
         print!("    Port {}: ", port_id);
@@ -672,9 +537,9 @@ impl UsbDriver {
         println!();
         println!("=== Port Status ===");
 
-        for p in 0..self.num_ports {
-            let portsc_off = self.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
-            let raw = self.mac.read32(portsc_off);
+        for p in 0..self.xhci.num_ports {
+            let portsc_off = self.xhci.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
+            let raw = self.xhci.mac.read32(portsc_off);
             let status = ParsedPortsc::from_raw(raw);
 
             print!("  Port {}: PORTSC=0x", p + 1);
@@ -710,9 +575,9 @@ impl UsbDriver {
         let mut all_powered = true;
         let mut any_connected = false;
 
-        for p in 0..self.num_ports {
-            let portsc_off = self.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
-            let raw = self.mac.read32(portsc_off);
+        for p in 0..self.xhci.num_ports {
+            let portsc_off = self.xhci.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
+            let raw = self.xhci.mac.read32(portsc_off);
             let status = ParsedPortsc::from_raw(raw);
 
             print!("  Port {}: PP={}", p + 1, if status.powered { 1 } else { 0 });
@@ -756,14 +621,14 @@ impl UsbDriver {
 
     /// Reset a port to trigger device enumeration
     fn reset_port(&self, port: u32) -> bool {
-        if port == 0 || port > self.num_ports {
+        if port == 0 || port > self.xhci.num_ports {
             return false;
         }
 
-        let portsc_off = self.port_base + ((port - 1) as usize * 0x10) + xhci_port::PORTSC;
+        let portsc_off = self.xhci.port_base + ((port - 1) as usize * 0x10) + xhci_port::PORTSC;
 
         // Read current PORTSC
-        let raw = self.mac.read32(portsc_off);
+        let raw = self.xhci.mac.read32(portsc_off);
         let status = ParsedPortsc::from_raw(raw);
 
         print!("  Port {}: ", port);
@@ -784,17 +649,17 @@ impl UsbDriver {
 
         // Set PR (Port Reset) bit, preserve PP
         let write_val = (raw & portsc::PRESERVE_MASK) | portsc::PR;
-        self.mac.write32(portsc_off, write_val);
+        self.xhci.mac.write32(portsc_off, write_val);
 
         // Wait for reset to complete
         for _ in 0..100 {
             delay(10000);
-            let raw = self.mac.read32(portsc_off);
+            let raw = self.xhci.mac.read32(portsc_off);
             let status = ParsedPortsc::from_raw(raw);
 
             if !status.reset && status.reset_change {
                 // Reset complete, clear PRC
-                self.mac.write32(portsc_off, raw | portsc::PRC);
+                self.xhci.mac.write32(portsc_off, raw | portsc::PRC);
                 println!("    Reset complete");
                 return true;
             }
@@ -970,8 +835,8 @@ impl UsbDriver {
         }
 
         // Get port speed from PORTSC using library helpers
-        let portsc_off = self.port_base + ((port - 1) as usize * 0x10);
-        let raw = self.mac.read32(portsc_off);
+        let portsc_off = self.xhci.port_base + ((port - 1) as usize * 0x10);
+        let raw = self.xhci.mac.read32(portsc_off);
         let status = ParsedPortsc::from_raw(raw);
         let speed = status.speed;
         let speed_raw = speed.to_slot_speed();
@@ -2799,9 +2664,9 @@ impl UsbDriver {
         }
 
         // Debug: print doorbell info and check USBSTS before ringing
-        let mac_base = self.mac.base;
-        let rt_base = self.rt_base;
-        let op_base = self.op_base;
+        let mac_base = self.xhci.mac.base;
+        let rt_base = self.xhci.rt_base;
+        let op_base = self.xhci.op_base;
 
         unsafe {
             let usbsts = core::ptr::read_volatile(
@@ -2812,7 +2677,7 @@ impl UsbDriver {
             println!();
         }
 
-        let db_addr = self.mac.base + self.db_base as u64 + (slot_id as u64 * 4);
+        let db_addr = self.xhci.mac.base + self.xhci.db_base as u64 + (slot_id as u64 * 4);
         print!("    Doorbell: slot={}, target={}, addr=", slot_id, bulk_out_dci);
         print_hex64(db_addr);
         println!();
@@ -3125,9 +2990,9 @@ impl UsbDriver {
     /// Wait for a transfer event via IRQ
     /// Returns (success, completion_code)
     fn wait_transfer_irq(&mut self, timeout_ms: u32) -> (TransferResult, u64) {
-        let mac_base = self.mac.base;
-        let rt_base = self.rt_base;
-        let op_base = self.op_base;
+        let mac_base = self.xhci.mac.base;
+        let rt_base = self.xhci.rt_base;
+        let op_base = self.xhci.op_base;
 
         // Clear IMAN.IP before waiting
         unsafe {
@@ -3443,9 +3308,9 @@ impl UsbDriver {
         let mut in_enqueue = 0usize;
 
         // Cache register bases
-        let mac_base = self.mac.base;
-        let rt_base = self.rt_base;
-        let op_base = self.op_base;
+        let mac_base = self.xhci.mac.base;
+        let rt_base = self.xhci.rt_base;
+        let op_base = self.xhci.op_base;
 
         // Clear any pending interrupts before starting
         unsafe {
@@ -4296,9 +4161,9 @@ fn main() {
 
                 // Poll for up to 2 seconds for device connection
                 for attempt in 0..20 {
-                    for p in 0..d.num_ports {
-                        let portsc_off = d.port_base + (p as usize * 0x10);
-                        let portsc = d.mac.read32(portsc_off);
+                    for p in 0..d.xhci.num_ports {
+                        let portsc_off = d.xhci.port_base + (p as usize * 0x10);
+                        let portsc = d.xhci.mac.read32(portsc_off);
 
                         if attempt == 0 || attempt == 19 {
                             // Print PORTSC on first and last attempt
@@ -4390,7 +4255,7 @@ fn main() {
     // Try port reset to detect devices
     println!();
     println!("=== Trying Port Reset ===");
-    for p in 1..=driver.num_ports {
+    for p in 1..=driver.xhci.num_ports {
         driver.reset_port(p);
         delay(50000);  // Wait after reset
     }
@@ -4419,7 +4284,7 @@ fn main() {
     let irq_url = "irq:204";
     let irq_fd = syscall::scheme_open(irq_url, 0);
     if irq_fd >= 0 {
-        println!("  IRQ {} registered (fd={})", SSUSB1_IRQ, irq_fd);
+        println!("  IRQ {} registered (fd={})", mt7988a::SSUSB1_IRQ, irq_fd);
         driver.set_irq_fd(irq_fd);
     } else {
         println!("  IRQ registration failed: {}", irq_fd);
@@ -4434,7 +4299,7 @@ fn main() {
     // Also open SSUSB0 for monitoring (Type-A might be there)
     println!();
     println!("=== Opening SSUSB0 for monitoring ===");
-    let ssusb0_mac = MmioRegion::open(SSUSB0_MAC_PHYS, SSUSB_MAC_SIZE);
+    let ssusb0_mac = MmioRegion::open(mt7988a::SSUSB0_MAC_PHYS, SSUSB_MAC_SIZE);
 
     // Poll ports on BOTH controllers
     println!();
@@ -4465,9 +4330,9 @@ fn main() {
 
         // Check SSUSB1 ports (using driver)
         let mut connected_port: Option<u32> = None;
-        for p in 0..driver.num_ports {
-            let portsc_off = driver.port_base + (p as usize * 0x10);
-            let portsc = driver.mac.read32(portsc_off);
+        for p in 0..driver.xhci.num_ports {
+            let portsc_off = driver.xhci.port_base + (p as usize * 0x10);
+            let portsc = driver.xhci.mac.read32(portsc_off);
             let ccs = portsc & 1;
             if ccs != 0 {
                 print!("  [{}s] SSUSB1 Port {} CONNECTED! PORTSC=0x", round, p + 1);

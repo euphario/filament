@@ -193,18 +193,325 @@ impl XhciController {
 }
 
 // =============================================================================
-// MediaTek MT7988A HAL Implementation (Reference)
+// MediaTek MT7988A HAL Implementation
 // =============================================================================
 
-/// MT7988A SSUSB controller configuration
+/// MT7988A SSUSB controller configuration and HAL
 pub mod mt7988a {
+    use super::{SocHal, XhciController, ControllerId, MmioRegion};
+    use crate::phy::{ippc, tphy};
+    use crate::mmio::{delay, print_hex32};
+    use userlib::{print, println};
+
     /// Controller indices for MT7988A
-    pub const SSUSB0: u32 = 0;  // XS-PHY controller
-    pub const SSUSB1: u32 = 1;  // T-PHY controller
+    pub const SSUSB0: u32 = 0;  // XS-PHY controller (XFI T-PHY)
+    pub const SSUSB1: u32 = 1;  // T-PHY v2 controller
 
     /// IPPC offset from MAC base
     pub const IPPC_OFFSET: usize = 0x3E00;
 
     /// Default MAC region size
     pub const MAC_SIZE: usize = 0x4000;
+
+    /// MT7988A physical addresses
+    pub const SSUSB0_MAC_PHYS: u64 = 0x1119_0000;
+    pub const SSUSB0_PHY_PHYS: u64 = 0x11f2_0000;  // XFI T-PHY
+    pub const SSUSB0_IRQ: u32 = 173 + 32;  // GIC SPI 173
+
+    pub const SSUSB1_MAC_PHYS: u64 = 0x1120_0000;
+    pub const SSUSB1_PHY_PHYS: u64 = 0x11c5_0000;  // T-PHY v2
+    pub const SSUSB1_IRQ: u32 = 172 + 32;  // GIC SPI 172
+
+    pub const SSUSB0_PHY_SIZE: usize = 0x10000;  // XFI T-PHY is 64KB
+    pub const SSUSB1_PHY_SIZE: usize = 0x1000;   // T-PHY v2 is 4KB
+
+    /// MT7988A SSUSB HAL implementation
+    ///
+    /// Handles MediaTek-specific IPPC and PHY initialization.
+    pub struct Mt7988aHal {
+        controller_id: u32,
+        mac: Option<MmioRegion>,
+        phy: Option<MmioRegion>,
+    }
+
+    impl Mt7988aHal {
+        /// Create a new MT7988A HAL for the specified controller
+        pub fn new(controller_id: u32) -> Self {
+            Self {
+                controller_id,
+                mac: None,
+                phy: None,
+            }
+        }
+
+        /// Set MAC MMIO region (call after mapping)
+        pub fn set_mac(&mut self, mac: MmioRegion) {
+            self.mac = Some(mac);
+        }
+
+        /// Set PHY MMIO region (call after mapping)
+        pub fn set_phy(&mut self, phy: MmioRegion) {
+            self.phy = Some(phy);
+        }
+
+        /// Get MAC region reference
+        pub fn mac(&self) -> Option<&MmioRegion> {
+            self.mac.as_ref()
+        }
+
+        /// Get PHY region reference
+        pub fn phy(&self) -> Option<&MmioRegion> {
+            self.phy.as_ref()
+        }
+
+        /// Read IPPC register
+        fn ippc_read32(&self, offset: usize) -> u32 {
+            self.mac.as_ref().map_or(0, |m| m.read32(IPPC_OFFSET + offset))
+        }
+
+        /// Write IPPC register
+        fn ippc_write32(&self, offset: usize, value: u32) {
+            if let Some(m) = &self.mac {
+                m.write32(IPPC_OFFSET + offset, value);
+            }
+        }
+
+        /// Initialize IPPC (IP Port Control) - MediaTek specific
+        ///
+        /// This handles:
+        /// - Software reset
+        /// - Host power on / device power down
+        /// - Port configuration (U3/U2)
+        /// - Clock stabilization wait
+        ///
+        /// Returns (u3_ports, u2_ports) on success, None on failure
+        pub fn ippc_init(&mut self) -> Option<(u32, u32)> {
+            println!();
+            println!("=== IPPC Initialization ===");
+
+            // Software reset
+            println!("  Software reset...");
+            self.ippc_write32(ippc::IP_PW_CTRL0, ippc::IP_SW_RST);
+            delay(1000);
+            self.ippc_write32(ippc::IP_PW_CTRL0, 0);
+            delay(1000);
+
+            // Power on host, power down device
+            println!("  Host power on...");
+            self.ippc_write32(ippc::IP_PW_CTRL2, ippc::IP_DEV_PDN);
+            self.ippc_write32(ippc::IP_PW_CTRL1, 0); // Clear host PDN
+
+            // Read port counts
+            let cap = self.ippc_read32(ippc::IP_XHCI_CAP);
+            let u3_ports = (cap >> 8) & 0xF;
+            let u2_ports = cap & 0xF;
+            println!("  Ports: {} USB3, {} USB2", u3_ports, u2_ports);
+
+            // Configure U3 ports (if any)
+            for i in 0..u3_ports {
+                let offset = ippc::U3_CTRL_P0 + (i as usize * 8);
+                let mut ctrl = self.ippc_read32(offset);
+                ctrl &= !(ippc::PORT_PDN | ippc::PORT_DIS);
+                ctrl |= ippc::PORT_HOST_SEL;
+                self.ippc_write32(offset, ctrl);
+            }
+
+            // Configure U2 ports
+            for i in 0..u2_ports {
+                let offset = ippc::U2_CTRL_P0 + (i as usize * 8);
+                let mut ctrl = self.ippc_read32(offset);
+                ctrl &= !(ippc::PORT_PDN | ippc::PORT_DIS);
+                ctrl |= ippc::PORT_HOST_SEL;
+                self.ippc_write32(offset, ctrl);
+            }
+
+            // Wait for clocks
+            println!("  Waiting for clocks...");
+            let required = ippc::SYSPLL_STABLE | ippc::REF_RST | ippc::SYS125_RST | ippc::XHCI_RST;
+            for i in 0..1000 {
+                let sts = self.ippc_read32(ippc::IP_PW_STS1);
+                if (sts & required) == required {
+                    println!("  Clocks stable (after {} iterations)", i);
+                    return Some((u3_ports, u2_ports));
+                }
+                if i == 999 {
+                    print!("  Clock timeout! IP_PW_STS1=0x");
+                    print_hex32(sts);
+                    println!();
+                    return None;
+                }
+                delay(1000);
+            }
+
+            Some((u3_ports, u2_ports))
+        }
+
+        /// Initialize T-PHY for host mode - MediaTek specific
+        ///
+        /// Sets up the USB2 PHY for host mode by configuring VBUS and session signals.
+        pub fn tphy_init(&mut self) -> bool {
+            let phy = match &self.phy {
+                Some(p) => p,
+                None => return false,
+            };
+
+            println!();
+            println!("=== PHY Initialization ===");
+
+            // T-PHY v2 has USB2 PHY at COM bank offset 0x300
+            // Try multiple offsets to find the right one
+            let offsets_to_try: &[(usize, &str)] = &[
+                (0x300, "COM+0x300"),      // Standard T-PHY v2 COM bank
+                (0x000, "base+0x000"),     // Direct offset
+                (0x100, "base+0x100"),     // Alternative
+                (0x400, "base+0x400"),     // Another alternative
+            ];
+
+            let phy_name = if self.controller_id == 0 { "XFI T-PHY" } else { "T-PHY v2" };
+            println!("  Configuring {} for host mode...", phy_name);
+
+            // Scan for valid PHY registers (non-zero reads indicate valid registers)
+            let mut found_offset: Option<usize> = None;
+            for &(base_off, name) in offsets_to_try {
+                let dtm1_off = base_off + 0x6C;
+                let dtm1 = phy.read32(dtm1_off);
+                if dtm1 != 0 || base_off == 0x300 {
+                    // Either we read non-zero, or try the standard offset
+                    print!("    {} DTM1@0x{:x}=0x", name, dtm1_off);
+                    print_hex32(dtm1);
+                    println!();
+                    if found_offset.is_none() {
+                        found_offset = Some(base_off);
+                    }
+                }
+            }
+
+            // Use the found offset or default to standard T-PHY layout
+            let com_offset = found_offset.unwrap_or(0x300);
+            let dtm1_offset = com_offset + 0x6C;
+
+            let dtm1 = phy.read32(dtm1_offset);
+            print!("    Using offset 0x{:x}, DTM1 before: 0x", dtm1_offset);
+            print_hex32(dtm1);
+            println!();
+
+            // Set host mode bits: force vbusvalid/avalid, set vbusvalid/avalid
+            let new_dtm1 = dtm1 | tphy::HOST_MODE;
+            phy.write32(dtm1_offset, new_dtm1);
+
+            delay(1000);
+
+            let dtm1_after = phy.read32(dtm1_offset);
+            print!("    After:  DTM1=0x");
+            print_hex32(dtm1_after);
+            if dtm1_after != dtm1 {
+                println!(" (host mode configured)");
+            } else {
+                println!(" (WARNING: register unchanged!)");
+            }
+
+            // Force USB2 PHY power on via IPPC U2_PHY_PLL register
+            // This is critical for device detection!
+            println!();
+            println!("=== Forcing USB2 PHY Power ===");
+            let pll = self.ippc_read32(ippc::U2_PHY_PLL);
+            print!("  U2_PHY_PLL before: 0x");
+            print_hex32(pll);
+            println!();
+            self.ippc_write32(ippc::U2_PHY_PLL, pll | 1);  // Set bit 0 to force power on
+            delay(1000);
+            let pll_after = self.ippc_read32(ippc::U2_PHY_PLL);
+            print!("  U2_PHY_PLL after:  0x");
+            print_hex32(pll_after);
+            println!(" (PHY power forced on)");
+
+            true
+        }
+
+        /// Create an XhciController from this HAL (after init)
+        ///
+        /// Call this after IPPC and PHY initialization to get an XhciController
+        /// that can be used for generic xHCI operations.
+        pub fn into_controller(self) -> Option<XhciController> {
+            let mac = self.mac?;
+            Some(XhciController {
+                mac,
+                phy: self.phy,
+                id: ControllerId {
+                    index: self.controller_id,
+                    name: if self.controller_id == 0 { "SSUSB0" } else { "SSUSB1" },
+                },
+                caplength: 0,
+                op_base: 0,
+                rt_base: 0,
+                db_base: 0,
+                port_base: 0,
+                num_ports: 0,
+                max_slots: 0,
+                ippc_offset: Some(IPPC_OFFSET),
+            })
+        }
+    }
+
+    impl SocHal for Mt7988aHal {
+        fn mac_base(&self) -> usize {
+            match self.controller_id {
+                0 => SSUSB0_MAC_PHYS as usize,
+                _ => SSUSB1_MAC_PHYS as usize,
+            }
+        }
+
+        fn phy_base(&self) -> usize {
+            match self.controller_id {
+                0 => SSUSB0_PHY_PHYS as usize,
+                _ => SSUSB1_PHY_PHYS as usize,
+            }
+        }
+
+        fn phy_size(&self) -> usize {
+            match self.controller_id {
+                0 => SSUSB0_PHY_SIZE,
+                _ => SSUSB1_PHY_SIZE,
+            }
+        }
+
+        fn irq_number(&self) -> u32 {
+            match self.controller_id {
+                0 => SSUSB0_IRQ,
+                _ => SSUSB1_IRQ,
+            }
+        }
+
+        fn clock_enable(&mut self) -> bool {
+            // MT7988A clocks are typically enabled by the bootloader
+            // If needed, this would use INFRACFG_AO registers
+            true
+        }
+
+        fn reset_deassert(&mut self) -> bool {
+            // MT7988A resets are typically handled by bootloader
+            // The IPPC software reset is done in ippc_init()
+            true
+        }
+
+        fn phy_init(&mut self) -> bool {
+            // First do IPPC init, then PHY init
+            if self.ippc_init().is_none() {
+                return false;
+            }
+            self.tphy_init()
+        }
+
+        fn apply_quirks(&mut self) {
+            // No additional quirks needed for MT7988A currently
+        }
+
+        fn ippc_offset(&self) -> Option<usize> {
+            Some(IPPC_OFFSET)
+        }
+
+        fn is_usb3(&self) -> bool {
+            true
+        }
+    }
 }
