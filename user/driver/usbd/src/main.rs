@@ -21,8 +21,8 @@ use usb::{
     SSUSB_MAC_SIZE, SSUSB_IPPC_OFFSET,
     // Clock/reset control
     INFRACFG_AO_BASE, INFRACFG_AO_SIZE,
-    INFRA_RST0_STA, INFRA_RST1_SET, INFRA_RST1_CLR, INFRA_RST1_STA,
-    INFRA_CG0_STA, INFRA_CG1_SET, INFRA_CG1_CLR, INFRA_CG1_STA, INFRA_CG2_STA,
+    INFRA_RST0_STA, INFRA_RST1_CLR, INFRA_RST1_STA,
+    INFRA_CG0_STA, INFRA_CG1_CLR, INFRA_CG1_STA, INFRA_CG2_STA,
     RST1_SSUSB_TOP0, RST1_SSUSB_TOP1, CG1_SSUSB0, CG1_SSUSB1,
     // GPIO IPC
     GPIO_CMD_USB_VBUS,
@@ -44,6 +44,15 @@ use usb::{
     Ring, EventRing, ErstEntry, RING_SIZE,
     // MMIO helpers
     MmioRegion, format_mmio_url, delay_ms, delay, print_hex64, print_hex32, print_hex8,
+    // Controller helpers
+    ParsedPortsc, portsc,
+    event_completion_code, event_slot_id, event_port_id,
+    completion_code, doorbell,
+    // Enumeration helpers
+    build_enable_slot_trb, build_noop_trb,
+    // Hub helpers
+    get_hub_descriptor_setup, get_port_status_setup,
+    set_port_feature_setup, clear_port_feature_setup,
 };
 
 // Module definitions now imported from usb crate
@@ -554,13 +563,12 @@ impl UsbDriver {
 
         println!("  Sending No-Op command...");
 
-        let mut trb = Trb::new();
-        trb.set_type(trb_type::NOOP_CMD);
-
+        // Use library helper to build TRB
+        let trb = build_noop_trb();
         cmd_ring.enqueue(&trb);
 
-        // Ring doorbell 0 (host controller) with target 0 (command ring)
-        self.ring_doorbell(0, 0);
+        // Ring doorbell for command ring
+        self.ring_doorbell(0, doorbell::COMMAND_RING);
 
         true
     }
@@ -590,22 +598,22 @@ impl UsbDriver {
 
         // Process collected events
         for i in 0..event_count {
-            if let Some(trb) = events[i] {
-                let trb_type = trb.get_type();
-                let completion_code = (trb.status >> 24) & 0xFF;
+            if let Some(ref trb) = events[i] {
+                let evt_type = trb.get_type();
+                let cc = event_completion_code(trb);
 
-                match trb_type {
+                match evt_type {
                     trb_type::COMMAND_COMPLETION => {
                         print!("  Event: Command Completion, CC=");
-                        print_hex32(completion_code);
-                        if completion_code == trb_cc::SUCCESS {
-                            println!(" (Success)");
+                        print_hex32(cc);
+                        if completion_code::is_success(cc) {
+                            println!(" ({})", completion_code::name(cc));
                         } else {
-                            println!(" (Error)");
+                            println!(" ({})", completion_code::name(cc));
                         }
                     }
                     trb_type::PORT_STATUS_CHANGE => {
-                        let port_id = (trb.param >> 24) as u32 & 0xFF;
+                        let port_id = event_port_id(trb);
                         println!("  Event: Port {} Status Change", port_id);
                         self.handle_port_change(port_id);
                     }
@@ -617,7 +625,7 @@ impl UsbDriver {
                     }
                     _ => {
                         print!("  Event: Unknown type ");
-                        print_hex32(trb_type);
+                        print_hex32(evt_type);
                         println!();
                     }
                 }
@@ -638,32 +646,21 @@ impl UsbDriver {
         }
 
         let portsc_off = self.port_base + ((port_id - 1) as usize * 0x10) + xhci_port::PORTSC;
-        let portsc = self.mac.read32(portsc_off);
+        let raw = self.mac.read32(portsc_off);
+        let status = ParsedPortsc::from_raw(raw);
 
         // Clear status change bits by writing 1 to them (W1C)
-        // Preserve PP (bit 9), clear PRC (bit 21), CSC (bit 17), etc.
-        let clear_bits = portsc & 0x00FE0000;  // Status change bits
+        let clear_bits = raw & portsc::CHANGE_BITS;
         if clear_bits != 0 {
-            self.mac.write32(portsc_off, (portsc & 0xFE01FFFF) | clear_bits);
+            self.mac.write32(portsc_off, status.clear_changes_value());
         }
 
-        let ccs = (portsc >> 0) & 1;
-        let ped = (portsc >> 1) & 1;
-        let speed = (portsc >> 10) & 0xF;
-
         print!("    Port {}: ", port_id);
-        if ccs == 0 {
+        if !status.connected {
             println!("Disconnected");
         } else {
-            let speed_str = match speed {
-                1 => "Full Speed",
-                2 => "Low Speed",
-                3 => "High Speed",
-                4 => "Super Speed",
-                _ => "Unknown",
-            };
-            print!("Connected ({})", speed_str);
-            if ped != 0 {
+            print!("Connected ({})", status.speed.full_name());
+            if status.enabled {
                 println!(" [Enabled]");
             } else {
                 println!(" [Not enabled yet]");
@@ -677,57 +674,26 @@ impl UsbDriver {
 
         for p in 0..self.num_ports {
             let portsc_off = self.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
-            let portsc = self.mac.read32(portsc_off);
-
-            let ccs = (portsc >> 0) & 1;
-            let ped = (portsc >> 1) & 1;
-            let pp = (portsc >> 9) & 1;
-            let speed = (portsc >> 10) & 0xF;
-            let pls = (portsc >> 5) & 0xF;
+            let raw = self.mac.read32(portsc_off);
+            let status = ParsedPortsc::from_raw(raw);
 
             print!("  Port {}: PORTSC=0x", p + 1);
-            print_hex32(portsc);
+            print_hex32(raw);
 
-            if pp == 0 {
+            if !status.powered {
                 println!(" [Not powered]");
                 continue;
             }
 
-            let pls_str = match pls {
-                0 => "U0",
-                1 => "U1",
-                2 => "U2",
-                3 => "U3",
-                4 => "Disabled",
-                5 => "RxDetect",
-                6 => "Inactive",
-                7 => "Polling",
-                8 => "Recovery",
-                9 => "Hot Reset",
-                10 => "Compliance",
-                11 => "Test",
-                15 => "Resume",
-                _ => "?",
-            };
+            print!(" PLS={}", status.link_state.as_str());
 
-            print!(" PLS={}", pls_str);
-
-            if ccs == 0 {
+            if !status.connected {
                 println!(" [No device]");
                 continue;
             }
 
-            let speed_str = match speed {
-                1 => "FS",
-                2 => "LS",
-                3 => "HS",
-                4 => "SS",
-                5 => "SS+",
-                _ => "?",
-            };
-
-            print!(" {}Speed", speed_str);
-            if ped == 1 {
+            print!(" {}Speed", status.speed.as_str());
+            if status.enabled {
                 print!(" [Enabled]");
             }
             println!();
@@ -746,40 +712,26 @@ impl UsbDriver {
 
         for p in 0..self.num_ports {
             let portsc_off = self.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
-            let portsc = self.mac.read32(portsc_off);
+            let raw = self.mac.read32(portsc_off);
+            let status = ParsedPortsc::from_raw(raw);
 
-            let ccs = (portsc >> 0) & 1;  // Current Connect Status
-            let pp = (portsc >> 9) & 1;   // Port Power
-            let pls = (portsc >> 5) & 0xF; // Port Link State
+            print!("  Port {}: PP={}", p + 1, if status.powered { 1 } else { 0 });
 
-            print!("  Port {}: PP={}", p + 1, pp);
-
-            if pp == 0 {
+            if !status.powered {
                 print!(" [NO POWER!]");
                 all_powered = false;
             } else {
                 print!(" [POWERED]");
             }
 
-            if ccs != 0 {
+            if status.connected {
                 print!(" Device connected");
                 any_connected = true;
             } else {
                 print!(" No device");
             }
 
-            // Show link state for debugging
-            let pls_str = match pls {
-                0 => "U0",
-                1 => "U1",
-                2 => "U2",
-                3 => "U3",
-                5 => "RxDetect",
-                6 => "Inactive",
-                7 => "Polling",
-                _ => "?",
-            };
-            println!(" PLS={}", pls_str);
+            println!(" PLS={}", status.link_state.as_str());
         }
 
         println!();
@@ -811,41 +763,38 @@ impl UsbDriver {
         let portsc_off = self.port_base + ((port - 1) as usize * 0x10) + xhci_port::PORTSC;
 
         // Read current PORTSC
-        let portsc = self.mac.read32(portsc_off);
-        let ccs = portsc & 1;
-        let pp = (portsc >> 9) & 1;
+        let raw = self.mac.read32(portsc_off);
+        let status = ParsedPortsc::from_raw(raw);
 
         print!("  Port {}: ", port);
 
         // Skip if not powered
-        if pp == 0 {
+        if !status.powered {
             println!("not powered, skipping");
             return false;
         }
 
         // Skip if no device connected
-        if ccs == 0 {
+        if !status.connected {
             println!("no device connected, skipping reset");
             return false;
         }
 
         println!("device present, resetting...");
 
-        // Set PR (Port Reset) bit 4, preserve PP bit 9
-        // Write 1 to clear status change bits (17-23) first
-        let write_val = (portsc & 0x0E00C3E0) | (1 << 4);  // Keep PP, PLS write strobe, set PR
+        // Set PR (Port Reset) bit, preserve PP
+        let write_val = (raw & portsc::PRESERVE_MASK) | portsc::PR;
         self.mac.write32(portsc_off, write_val);
 
         // Wait for reset to complete
         for _ in 0..100 {
             delay(10000);
-            let portsc = self.mac.read32(portsc_off);
-            let pr = (portsc >> 4) & 1;
-            let prc = (portsc >> 21) & 1;
+            let raw = self.mac.read32(portsc_off);
+            let status = ParsedPortsc::from_raw(raw);
 
-            if pr == 0 && prc == 1 {
+            if !status.reset && status.reset_change {
                 // Reset complete, clear PRC
-                self.mac.write32(portsc_off, portsc | (1 << 21));
+                self.mac.write32(portsc_off, raw | portsc::PRC);
                 println!("    Reset complete");
                 return true;
             }
@@ -892,13 +841,10 @@ impl UsbDriver {
 
         println!("  Enabling slot...");
 
-        // Drain any pending events first
-        // (moved outside borrow)
-
-        let mut trb = Trb::new();
-        trb.set_type(trb_type::ENABLE_SLOT);
+        // Use library helper to build TRB
+        let trb = build_enable_slot_trb();
         cmd_ring.enqueue(&trb);
-        self.ring_doorbell(0, 0);
+        self.ring_doorbell(0, doorbell::COMMAND_RING);
 
         // Wait for completion
         delay(10000);
@@ -916,8 +862,8 @@ impl UsbDriver {
 
                     let evt_type = evt.get_type();
                     if evt_type == trb_type::COMMAND_COMPLETION {
-                        let cc = (evt.status >> 24) & 0xFF;
-                        let slot_id = (evt.control >> 24) & 0xFF;
+                        let cc = event_completion_code(&evt);
+                        let slot_id = event_slot_id(&evt);
                         println!("    Enable Slot event: CC={}, slot={}", cc, slot_id);
                         result = Some((cc, slot_id));
                         break;
@@ -1023,30 +969,17 @@ impl UsbDriver {
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
 
-        // Get port speed from PORTSC
+        // Get port speed from PORTSC using library helpers
         let portsc_off = self.port_base + ((port - 1) as usize * 0x10);
-        let portsc = self.mac.read32(portsc_off);
-        let speed = (portsc >> 10) & 0xF;
+        let raw = self.mac.read32(portsc_off);
+        let status = ParsedPortsc::from_raw(raw);
+        let speed = status.speed;
+        let speed_raw = speed.to_slot_speed();
 
-        let speed_str = match speed {
-            1 => "Full",
-            2 => "Low",
-            3 => "High",
-            4 => "Super",
-            5 => "Super+",
-            _ => "Unknown",
-        };
-        println!("  Port {} speed: {} ({})", port, speed, speed_str);
+        println!("  Port {} speed: {} ({})", port, speed_raw, speed.full_name());
 
         // Max packet size for EP0 based on speed
-        let max_packet_size = match speed {
-            1 => 8,    // Full speed
-            2 => 8,    // Low speed
-            3 => 64,   // High speed
-            4 => 512,  // Super speed
-            5 => 512,  // Super speed+
-            _ => 8,
-        };
+        let max_packet_size = speed.default_ep0_max_packet();
 
         // Step 3: Initialize Input Context
         unsafe {
@@ -1058,7 +991,7 @@ impl UsbDriver {
 
             // Slot Context
             input.slot.set_route_string(0);
-            input.slot.set_speed(speed);
+            input.slot.set_speed(speed_raw);
             input.slot.set_context_entries(1);  // Only EP0
             input.slot.set_root_hub_port(port);
 
@@ -1654,16 +1587,18 @@ impl UsbDriver {
         println!("  Getting Hub Descriptor...");
 
         // For USB3 hubs, use SS Hub Descriptor type (0x2A)
+        // Use hub helper to get setup packet values
+        let setup = get_hub_descriptor_setup(true);  // true = SuperSpeed
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
-            hub::RT_HUB_GET,
-            hub::GET_DESCRIPTOR,
-            (usb_req::DESC_SS_HUB << 8) as u16,  // wValue: descriptor type << 8
-            0,
+            setup.request_type,
+            setup.request,
+            setup.value,
+            setup.index,
             buf_phys,
-            12  // SS Hub descriptor is 12 bytes
+            setup.length
         ) {
-            Some((cc, len)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
+            Some((cc, len)) if completion_code::is_success(cc) => {
                 println!("    Got {} bytes", len);
                 Some(len as u8)
             }
@@ -1682,16 +1617,17 @@ impl UsbDriver {
 
     /// Get port status from hub
     fn hub_get_port_status(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, port: u16, buf_virt: u64, buf_phys: u64) -> Option<PortStatus> {
+        let setup = get_port_status_setup(port);
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
-            hub::RT_PORT_GET,
-            hub::GET_STATUS,
-            0,
-            port,
+            setup.request_type,
+            setup.request,
+            setup.value,
+            setup.index,
             buf_phys,
-            4
+            setup.length
         ) {
-            Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
+            Some((cc, _)) if completion_code::is_success(cc) => {
                 // U-Boot pattern: invalidate cache before reading data that hardware wrote
                 unsafe {
                     core::arch::asm!(
@@ -1710,12 +1646,13 @@ impl UsbDriver {
 
     /// Set a port feature
     fn hub_set_port_feature(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, port: u16, feature: u16) -> bool {
+        let setup = set_port_feature_setup(port, feature);
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
-            hub::RT_PORT_SET,
-            hub::SET_FEATURE,
-            feature,
-            port,
+            setup.request_type,
+            setup.request,
+            setup.value,
+            setup.index,
             0, 0
         ) {
             Some((cc, _)) if cc == trb_cc::SUCCESS => true,
@@ -1725,12 +1662,13 @@ impl UsbDriver {
 
     /// Clear a port feature
     fn hub_clear_port_feature(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, port: u16, feature: u16) -> bool {
+        let setup = clear_port_feature_setup(port, feature);
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
-            hub::RT_PORT_SET,
-            hub::CLEAR_FEATURE,
-            feature,
-            port,
+            setup.request_type,
+            setup.request,
+            setup.value,
+            setup.index,
             0, 0
         ) {
             Some((cc, _)) if cc == trb_cc::SUCCESS => true,
