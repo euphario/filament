@@ -2999,28 +2999,8 @@ impl UsbDriver {
     /// count: number of blocks to read (each block is typically 512 bytes)
     /// Returns (success, data slice)
     fn scsi_read_10<'a>(&mut self, ctx: &'a mut BulkContext, lba: u32, count: u16) -> Option<&'a [u8]> {
-        // READ(10) CDB format:
-        // [0] = 0x28 (READ_10 opcode)
-        // [1] = flags (0)
-        // [2-5] = LBA (big-endian)
-        // [6] = group number (0)
-        // [7-8] = transfer length in blocks (big-endian)
-        // [9] = control (0)
-        let cmd = [
-            scsi::READ_10,
-            0,
-            ((lba >> 24) & 0xFF) as u8,
-            ((lba >> 16) & 0xFF) as u8,
-            ((lba >> 8) & 0xFF) as u8,
-            (lba & 0xFF) as u8,
-            0,
-            ((count >> 8) & 0xFF) as u8,
-            (count & 0xFF) as u8,
-            0,
-        ];
-
-        // Assume 512 bytes per block
-        let data_length = (count as u32) * 512;
+        // Use library CDB builder (assumes 512 bytes per block)
+        let (cmd, data_length) = scsi::build_read_10(lba, count, 512);
         println!("  SCSI READ(10): LBA={}, count={}, bytes={}", lba, count, data_length);
 
         let (result, csw) = self.scsi_command_in(ctx, &cmd, data_length);
@@ -3064,34 +3044,27 @@ impl UsbDriver {
     /// SCSI READ_CAPACITY(10) - get device capacity
     /// Returns (last_lba, block_size) or None on error
     fn scsi_read_capacity_10(&mut self, ctx: &mut BulkContext) -> Option<(u32, u32)> {
-        // READ_CAPACITY(10) CDB: just the opcode, rest is zeros
-        let cmd = [scsi::READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // Use library CDB builder
+        let (cmd, data_length) = scsi::build_read_capacity_10();
 
         println!("  SCSI READ_CAPACITY(10)...");
 
-        let (result, csw) = self.scsi_command_in(ctx, &cmd, 8);
+        let (result, csw) = self.scsi_command_in(ctx, &cmd, data_length);
 
         if let Some(csw) = csw {
             if csw.signature == msc::CSW_SIGNATURE && csw.status == msc::CSW_STATUS_PASSED {
-                // Parse response (8 bytes, big-endian)
+                // Use library parser
                 unsafe {
                     let resp_ptr = ctx.data_buf.add(DATA_OFFSET);
                     ctx.invalidate_buffer(resp_ptr as u64, 8);
 
-                    let last_lba = u32::from_be_bytes([
-                        *resp_ptr.add(0), *resp_ptr.add(1),
-                        *resp_ptr.add(2), *resp_ptr.add(3)
-                    ]);
-                    let block_size = u32::from_be_bytes([
-                        *resp_ptr.add(4), *resp_ptr.add(5),
-                        *resp_ptr.add(6), *resp_ptr.add(7)
-                    ]);
-
-                    println!("    Last LBA: {}", last_lba);
-                    println!("    Block size: {} bytes", block_size);
-                    println!("    Capacity: {} MB", ((last_lba as u64 + 1) * block_size as u64) / (1024 * 1024));
-
-                    return Some((last_lba, block_size));
+                    let data = core::slice::from_raw_parts(resp_ptr, 8);
+                    if let Some((last_lba, block_size)) = scsi::parse_read_capacity_10(data) {
+                        println!("    Last LBA: {}", last_lba);
+                        println!("    Block size: {} bytes", block_size);
+                        println!("    Capacity: {} MB", ((last_lba as u64 + 1) * block_size as u64) / (1024 * 1024));
+                        return Some((last_lba, block_size));
+                    }
                 }
             }
         }

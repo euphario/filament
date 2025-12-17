@@ -29,7 +29,12 @@ pub use usb::{
     HubDescriptor, SsHubDescriptor, PortStatus,
     DeviceDescriptor, ConfigurationDescriptor, InterfaceDescriptor, EndpointDescriptor,
 };
-pub use msc::{msc as msc_const, scsi, Cbw, Csw, BulkContext, TransferResult, CBW_OFFSET, CSW_OFFSET, DATA_OFFSET};
+pub use msc::{
+    msc as msc_const, scsi, sense_key,
+    Cbw, Csw, BulkContext, TransferResult,
+    InquiryResponse, ReadCapacity10Response, SenseData,
+    CBW_OFFSET, CSW_OFFSET, DATA_OFFSET,
+};
 pub use ring::{Ring, EventRing, ErstEntry, Dcbaa, RING_SIZE};
 pub use mmio::{MmioRegion, format_mmio_url, format_hex, delay_ms, delay, print_hex64, print_hex32, print_hex8};
 pub use phy::{ippc, tphy, xsphy};

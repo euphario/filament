@@ -73,12 +73,92 @@ pub struct Csw {
 // =============================================================================
 
 pub mod scsi {
+    // SCSI operation codes
     pub const TEST_UNIT_READY: u8 = 0x00;
     pub const REQUEST_SENSE: u8 = 0x03;
     pub const INQUIRY: u8 = 0x12;
     pub const READ_CAPACITY_10: u8 = 0x25;
     pub const READ_10: u8 = 0x28;
     pub const WRITE_10: u8 = 0x2A;
+
+    /// Build a TEST UNIT READY CDB (6 bytes)
+    /// Returns (cdb, data_length)
+    pub fn build_test_unit_ready() -> ([u8; 10], u32) {
+        ([TEST_UNIT_READY, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0)
+    }
+
+    /// Build an INQUIRY CDB (6 bytes, but we use 10 for consistency)
+    /// allocation_length: typically 36 bytes for standard inquiry
+    /// Returns (cdb, data_length)
+    pub fn build_inquiry(allocation_length: u8) -> ([u8; 10], u32) {
+        ([INQUIRY, 0, 0, 0, allocation_length, 0, 0, 0, 0, 0], allocation_length as u32)
+    }
+
+    /// Build a READ CAPACITY (10) CDB
+    /// Returns (cdb, data_length) - response is 8 bytes
+    pub fn build_read_capacity_10() -> ([u8; 10], u32) {
+        ([READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], 8)
+    }
+
+    /// Build a READ (10) CDB
+    /// lba: starting logical block address
+    /// count: number of blocks to read
+    /// block_size: size of each block (typically 512)
+    /// Returns (cdb, data_length)
+    pub fn build_read_10(lba: u32, count: u16, block_size: u32) -> ([u8; 10], u32) {
+        let cdb = [
+            READ_10,
+            0,
+            ((lba >> 24) & 0xFF) as u8,
+            ((lba >> 16) & 0xFF) as u8,
+            ((lba >> 8) & 0xFF) as u8,
+            (lba & 0xFF) as u8,
+            0,
+            ((count >> 8) & 0xFF) as u8,
+            (count & 0xFF) as u8,
+            0,
+        ];
+        (cdb, count as u32 * block_size)
+    }
+
+    /// Build a WRITE (10) CDB
+    /// lba: starting logical block address
+    /// count: number of blocks to write
+    /// block_size: size of each block (typically 512)
+    /// Returns (cdb, data_length)
+    pub fn build_write_10(lba: u32, count: u16, block_size: u32) -> ([u8; 10], u32) {
+        let cdb = [
+            WRITE_10,
+            0,
+            ((lba >> 24) & 0xFF) as u8,
+            ((lba >> 16) & 0xFF) as u8,
+            ((lba >> 8) & 0xFF) as u8,
+            (lba & 0xFF) as u8,
+            0,
+            ((count >> 8) & 0xFF) as u8,
+            (count & 0xFF) as u8,
+            0,
+        ];
+        (cdb, count as u32 * block_size)
+    }
+
+    /// Build a REQUEST SENSE CDB
+    /// allocation_length: typically 18 bytes for standard sense data
+    /// Returns (cdb, data_length)
+    pub fn build_request_sense(allocation_length: u8) -> ([u8; 10], u32) {
+        ([REQUEST_SENSE, 0, 0, 0, allocation_length, 0, 0, 0, 0, 0], allocation_length as u32)
+    }
+
+    /// Parse READ CAPACITY (10) response (8 bytes, big-endian)
+    /// Returns (last_lba, block_size)
+    pub fn parse_read_capacity_10(data: &[u8]) -> Option<(u32, u32)> {
+        if data.len() < 8 {
+            return None;
+        }
+        let last_lba = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let block_size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        Some((last_lba, block_size))
+    }
 }
 
 /// SCSI Inquiry Response (36 bytes)
@@ -98,12 +178,129 @@ pub struct InquiryResponse {
     pub revision: [u8; 4],    // Product revision
 }
 
+impl InquiryResponse {
+    /// Parse inquiry data from a byte slice
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 36 {
+            return None;
+        }
+        let mut resp = Self::default();
+        resp.peripheral = data[0];
+        resp.removable = data[1];
+        resp.version = data[2];
+        resp.response_format = data[3];
+        resp.additional_length = data[4];
+        resp.flags1 = data[5];
+        resp.flags2 = data[6];
+        resp.flags3 = data[7];
+        resp.vendor.copy_from_slice(&data[8..16]);
+        resp.product.copy_from_slice(&data[16..32]);
+        resp.revision.copy_from_slice(&data[32..36]);
+        Some(resp)
+    }
+
+    /// Get device type (bits 0-4 of peripheral)
+    pub fn device_type(&self) -> u8 {
+        self.peripheral & 0x1F
+    }
+
+    /// Check if device is removable
+    pub fn is_removable(&self) -> bool {
+        (self.removable & 0x80) != 0
+    }
+
+    /// Get vendor string (trimmed)
+    pub fn vendor_str(&self) -> &[u8] {
+        trim_ascii(&self.vendor)
+    }
+
+    /// Get product string (trimmed)
+    pub fn product_str(&self) -> &[u8] {
+        trim_ascii(&self.product)
+    }
+
+    /// Get revision string (trimmed)
+    pub fn revision_str(&self) -> &[u8] {
+        trim_ascii(&self.revision)
+    }
+}
+
 /// SCSI Read Capacity (10) Response (8 bytes)
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct ReadCapacity10Response {
     pub last_lba: u32,        // Last Logical Block Address (big-endian)
     pub block_size: u32,      // Block size in bytes (big-endian)
+}
+
+/// SCSI Sense Data (fixed format, 18 bytes minimum)
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+pub struct SenseData {
+    pub response_code: u8,    // 0x70 for current errors, 0x71 for deferred
+    pub segment_number: u8,
+    pub sense_key: u8,        // Bits 0-3
+    pub information: [u8; 4],
+    pub additional_length: u8,
+    pub command_specific: [u8; 4],
+    pub asc: u8,              // Additional Sense Code
+    pub ascq: u8,             // Additional Sense Code Qualifier
+    pub fruc: u8,             // Field Replaceable Unit Code
+    pub sense_key_specific: [u8; 3],
+}
+
+impl SenseData {
+    /// Parse sense data from a byte slice
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 18 {
+            return None;
+        }
+        Some(Self {
+            response_code: data[0],
+            segment_number: data[1],
+            sense_key: data[2],
+            information: [data[3], data[4], data[5], data[6]],
+            additional_length: data[7],
+            command_specific: [data[8], data[9], data[10], data[11]],
+            asc: data[12],
+            ascq: data[13],
+            fruc: data[14],
+            sense_key_specific: [data[15], data[16], data[17]],
+        })
+    }
+
+    /// Get sense key (bits 0-3 of sense_key field)
+    pub fn key(&self) -> u8 {
+        self.sense_key & 0x0F
+    }
+
+    /// Check if this is a valid sense response
+    pub fn is_valid(&self) -> bool {
+        (self.response_code & 0x70) == 0x70
+    }
+}
+
+/// SCSI sense key values
+pub mod sense_key {
+    pub const NO_SENSE: u8 = 0x00;
+    pub const RECOVERED_ERROR: u8 = 0x01;
+    pub const NOT_READY: u8 = 0x02;
+    pub const MEDIUM_ERROR: u8 = 0x03;
+    pub const HARDWARE_ERROR: u8 = 0x04;
+    pub const ILLEGAL_REQUEST: u8 = 0x05;
+    pub const UNIT_ATTENTION: u8 = 0x06;
+    pub const DATA_PROTECT: u8 = 0x07;
+    pub const BLANK_CHECK: u8 = 0x08;
+    pub const ABORTED_COMMAND: u8 = 0x0B;
+}
+
+/// Trim trailing spaces from ASCII string
+fn trim_ascii(s: &[u8]) -> &[u8] {
+    let mut end = s.len();
+    while end > 0 && (s[end - 1] == b' ' || s[end - 1] == 0) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // =============================================================================
