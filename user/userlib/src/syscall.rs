@@ -37,6 +37,12 @@ pub const SYS_SCHEME_OPEN: u64 = 28;
 pub const SYS_SCHEME_REGISTER: u64 = 29;
 pub const SYS_SCHEME_UNREGISTER: u64 = 30;
 pub const SYS_EXEC: u64 = 31;
+pub const SYS_DAEMONIZE: u64 = 32;
+pub const SYS_KILL: u64 = 33;
+pub const SYS_PS_INFO: u64 = 34;
+pub const SYS_SET_LOG_LEVEL: u64 = 35;
+pub const SYS_MMAP_DMA: u64 = 36;
+pub const SYS_RESET: u64 = 37;
 
 // Raw syscall functions
 
@@ -216,6 +222,12 @@ pub fn mmap(addr: u64, size: usize, prot: u32) -> i64 {
     syscall3(SYS_MMAP, addr, size as u64, prot as u64)
 }
 
+/// Allocate DMA-capable memory, returns (virtual_addr, physical_addr)
+/// The physical address is written to the provided pointer
+pub fn mmap_dma(size: usize, phys_out: &mut u64) -> i64 {
+    syscall2(SYS_MMAP_DMA, size as u64, phys_out as *mut u64 as u64)
+}
+
 /// Unmap memory
 pub fn munmap(addr: u64, size: usize) -> i32 {
     syscall2(SYS_MUNMAP, addr, size as u64) as i32
@@ -357,4 +369,95 @@ pub fn event_wait(timeout_ns: u64) -> i64 {
 /// Post an event to another process
 pub fn event_post(target_pid: u32, event_type: u32, data: u64) -> i32 {
     syscall3(SYS_EVENT_POST, target_pid as u64, event_type as u64, data) as i32
+}
+
+// Process management syscalls
+
+/// Process info structure for ps_info syscall
+/// Must match kernel definition
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub state: u8,      // 0=Ready, 1=Running, 2=Blocked, 3=Terminated
+    pub _pad: [u8; 3],  // Alignment padding
+    pub name: [u8; 16],
+}
+
+impl ProcessInfo {
+    pub const fn empty() -> Self {
+        Self {
+            pid: 0,
+            parent_pid: 0,
+            state: 0,
+            _pad: [0; 3],
+            name: [0; 16],
+        }
+    }
+
+    /// Get name as string slice
+    pub fn name_str(&self) -> &str {
+        let len = self.name.iter().position(|&c| c == 0).unwrap_or(16);
+        core::str::from_utf8(&self.name[..len]).unwrap_or("???")
+    }
+
+    /// Get state as string
+    pub fn state_str(&self) -> &'static str {
+        match self.state {
+            0 => "Ready",
+            1 => "Running",
+            2 => "Blocked",
+            3 => "Zombie",
+            _ => "???",
+        }
+    }
+}
+
+/// Daemonize - detach from parent and become a daemon
+/// Returns 0 on success
+pub fn daemonize() -> i32 {
+    syscall0(SYS_DAEMONIZE) as i32
+}
+
+/// Kill a process by PID
+/// Returns 0 on success, negative error on failure
+pub fn kill(pid: u32) -> i32 {
+    syscall1(SYS_KILL, pid as u64) as i32
+}
+
+/// Get process info list
+/// Returns number of entries written to buf
+pub fn ps_info(buf: &mut [ProcessInfo]) -> usize {
+    let ret = syscall2(SYS_PS_INFO, buf.as_mut_ptr() as u64, buf.len() as u64);
+    if ret < 0 {
+        0
+    } else {
+        ret as usize
+    }
+}
+
+/// Set kernel log level
+/// level: 0=Error, 1=Warn, 2=Info, 3=Debug, 4=Trace
+pub fn set_log_level(level: u8) -> i32 {
+    syscall1(SYS_SET_LOG_LEVEL, level as u64) as i32
+}
+
+// Log level constants for convenience
+pub mod log_level {
+    pub const ERROR: u8 = 0;
+    pub const WARN: u8 = 1;
+    pub const INFO: u8 = 2;
+    pub const DEBUG: u8 = 3;
+    pub const TRACE: u8 = 4;
+}
+
+/// Reset/reboot the system
+/// This does not return on success
+pub fn reset() -> ! {
+    syscall0(SYS_RESET);
+    // Should never return, but just in case
+    loop {
+        unsafe { core::arch::asm!("wfe") };
+    }
 }

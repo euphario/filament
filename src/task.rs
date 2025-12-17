@@ -358,11 +358,12 @@ impl Task {
         // Allocate physical pages
         let phys_addr = pmm::alloc_pages(num_pages)? as u64;
 
-        // Zero the pages
+        // Zero the pages using kernel virtual address (via TTBR1)
+        // During syscalls, TTBR0 points to user page tables
         unsafe {
-            let ptr = phys_addr as *mut u8;
+            let kva = (crate::mmu::KERNEL_VIRT_BASE | phys_addr) as *mut u8;
             for i in 0..(num_pages * 4096) {
-                core::ptr::write_volatile(ptr.add(i), 0);
+                core::ptr::write_volatile(kva.add(i), 0);
             }
         }
 
@@ -389,6 +390,90 @@ impl Task {
         self.heap_next = virt_addr + mapping_size;
 
         Some(virt_addr)
+    }
+
+    /// Allocate DMA-capable memory, returning both virtual and physical addresses
+    pub fn mmap_dma(&mut self, size: usize) -> Option<(u64, u64)> {
+        let num_pages = (size + 4095) / 4096;
+        if num_pages == 0 {
+            return None;
+        }
+
+        // Find free mapping slot
+        let slot = self.heap_mappings.iter().position(|m| m.is_empty())?;
+
+        // Check heap space available
+        let virt_addr = self.heap_next;
+        let mapping_size = (num_pages * 4096) as u64;
+        if virt_addr + mapping_size > USER_HEAP_END {
+            return None;
+        }
+
+        // Allocate physical pages
+        let phys_addr = pmm::alloc_pages(num_pages)? as u64;
+
+        // Zero the pages using kernel's TTBR1 mapping (high addresses)
+        // During syscalls, TTBR0 points to user page tables, so we must use kernel VA
+        // Then flush cache so DMA device sees zeros
+        unsafe {
+            // Use kernel virtual address (via TTBR1) to access physical memory
+            let kva = (crate::mmu::KERNEL_VIRT_BASE | phys_addr) as *mut u8;
+            for i in 0..(num_pages * 4096) {
+                core::ptr::write_volatile(kva.add(i), 0);
+            }
+            // Flush cache for the zeroed memory - xHCI needs to see clean memory
+            // DC CIVAC = Clean and Invalidate by VA to Point of Coherency
+            // Use kernel virtual addresses for cache ops
+            for page in 0..num_pages {
+                let page_kva = crate::mmu::KERNEL_VIRT_BASE | (phys_addr + (page * 4096) as u64);
+                // Flush each cache line (64 bytes on Cortex-A73)
+                for offset in (0..4096).step_by(64) {
+                    let addr = page_kva + offset;
+                    core::arch::asm!("dc civac, {}", in(reg) addr);
+                }
+            }
+            core::arch::asm!("dsb sy");  // Ensure cache ops complete
+        }
+
+        // Map pages into address space as Normal Non-Cacheable (for DMA coherency)
+        let addr_space = self.address_space.as_mut()?;
+        for i in 0..num_pages {
+            let page_virt = virt_addr + (i * 4096) as u64;
+            let page_phys = phys_addr + (i * 4096) as u64;
+            // DMA memory uses Normal Non-Cacheable attributes
+            if !addr_space.map_dma_page(page_virt, page_phys, true) {
+                // Cleanup on failure
+                pmm::free_pages(phys_addr as usize, num_pages);
+                return None;
+            }
+        }
+
+        // Invalidate TLB entries for the newly mapped pages
+        // This ensures the CPU uses the new device memory attributes
+        unsafe {
+            for i in 0..num_pages {
+                let page_virt = virt_addr + (i * 4096) as u64;
+                // TLBI expects VA[55:12] in bits[43:0] of the operand
+                let tlbi_addr = page_virt >> 12;
+                core::arch::asm!(
+                    "tlbi vale1is, {addr}",
+                    addr = in(reg) tlbi_addr,
+                );
+            }
+            core::arch::asm!("dsb ish", "isb");
+        }
+
+        // Record mapping
+        self.heap_mappings[slot] = HeapMapping {
+            virt_addr,
+            phys_addr,
+            num_pages,
+        };
+
+        // Bump heap pointer
+        self.heap_next = virt_addr + mapping_size;
+
+        Some((virt_addr, phys_addr))
     }
 
     /// Unmap and free memory pages from user heap
@@ -829,6 +914,11 @@ pub static mut CURRENT_TRAP_FRAME: *mut TrapFrame = core::ptr::null_mut();
 #[no_mangle]
 pub static mut CURRENT_TTBR0: u64 = 0;
 
+/// Flag: set to 1 when syscall switched tasks, 0 otherwise
+/// Assembly checks this to skip storing return value when switched
+#[no_mangle]
+pub static mut SYSCALL_SWITCHED_TASK: u64 = 0;
+
 /// Get the global scheduler
 /// # Safety
 /// Must ensure proper synchronization (interrupts disabled)
@@ -847,6 +937,63 @@ pub unsafe fn update_current_task_globals() {
             CURRENT_TTBR0 = addr_space.get_ttbr0();
         }
     }
+}
+
+/// Yield CPU to another task (callable from kernel code like schemes)
+/// This switches to another ready task while keeping current task in its current state
+/// (Ready or Blocked depending on what caller set).
+///
+/// When the yielded task is scheduled again, this function returns.
+/// # Safety
+/// Must be called from kernel context with interrupts properly managed
+pub unsafe fn yield_cpu() {
+    let sched = scheduler();
+    let caller_slot = sched.current;
+
+    // Find next ready task
+    if let Some(next_slot) = sched.schedule() {
+        if next_slot != caller_slot {
+            // Get contexts for switch
+            let current_ctx = if let Some(ref mut t) = sched.tasks[caller_slot] {
+                &mut t.context as *mut CpuContext
+            } else {
+                return;
+            };
+
+            let next_ctx = if let Some(ref t) = sched.tasks[next_slot] {
+                &t.context as *const CpuContext
+            } else {
+                return;
+            };
+
+            // Switch address space if next task has one
+            if let Some(ref task) = sched.tasks[next_slot] {
+                if let Some(ref addr_space) = task.address_space {
+                    addr_space.activate();
+                }
+            }
+
+            // Update current index
+            sched.current = next_slot;
+
+            // Mark next as running
+            if let Some(ref mut t) = sched.tasks[next_slot] {
+                t.state = TaskState::Running;
+            }
+
+            // Actually switch contexts
+            context_switch(current_ctx, next_ctx);
+
+            // We return here when switched back to this task
+            // Restore our address space
+            if let Some(ref task) = sched.tasks[sched.current] {
+                if let Some(ref addr_space) = task.address_space {
+                    addr_space.activate();
+                }
+            }
+        }
+    }
+    // If no other task to run, just return and continue current task
 }
 
 /// Test context switching

@@ -57,6 +57,7 @@ pub enum FdType {
     Scheme {
         scheme_id: u16,
         handle: u64,
+        scheme_flags: u32,  // Extra data for scheme (e.g., owner pid for IRQ scheme)
     },
     /// MMIO mapping (device memory mapped to userspace)
     Mmio {
@@ -301,13 +302,13 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                 Err(_) => -5, // EIO
             }
         }
-        FdType::Scheme { scheme_id, handle } => {
+        FdType::Scheme { scheme_id, handle, scheme_flags } => {
             // Read from kernel scheme
             if let Some(scheme) = crate::scheme::get_kernel_scheme_by_id(scheme_id) {
                 let scheme_handle = crate::scheme::SchemeHandle {
                     scheme_id,
                     handle,
-                    flags: 0,
+                    flags: scheme_flags,
                 };
                 match scheme.read(&scheme_handle, buf) {
                     Ok(n) => n as isize,
@@ -376,13 +377,13 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
                 Err(_) => -5, // EIO
             }
         }
-        FdType::Scheme { scheme_id, handle } => {
+        FdType::Scheme { scheme_id, handle, scheme_flags } => {
             // Write to kernel scheme
             if let Some(scheme) = crate::scheme::get_kernel_scheme_by_id(scheme_id) {
                 let scheme_handle = crate::scheme::SchemeHandle {
                     scheme_id,
                     handle,
-                    flags: 0,
+                    flags: scheme_flags,
                 };
                 match scheme.write(&scheme_handle, buf) {
                     Ok(n) => n as isize,

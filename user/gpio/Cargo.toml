@@ -1,0 +1,14 @@
+[package]
+name = "gpio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+userlib = { path = "../userlib" }
+
+[profile.release]
+opt-level = "s"       # Optimize for size
+lto = true            # Link-time optimization
+codegen-units = 1     # Better optimization
+panic = "abort"       # No unwinding
+strip = true          # Strip symbols

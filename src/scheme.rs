@@ -392,6 +392,8 @@ pub struct IrqRegistration {
     pub pending: bool,
     /// Count of pending IRQs (allows coalescing)
     pub pending_count: u32,
+    /// PID of process blocked waiting for this IRQ (0 = none)
+    pub blocked_pid: u32,
 }
 
 impl IrqRegistration {
@@ -401,6 +403,7 @@ impl IrqRegistration {
             owner_pid: 0,
             pending: false,
             pending_count: 0,
+            blocked_pid: 0,
         }
     }
 
@@ -472,6 +475,8 @@ pub fn irq_unregister(irq_num: u32, pid: u32) -> bool {
 /// Called from IRQ handler when an interrupt fires
 /// Returns the PID to wake up, if any
 pub fn irq_notify(irq_num: u32) -> Option<u32> {
+    println!("[IRQ] irq_notify: IRQ {} fired", irq_num);
+
     unsafe {
         let table = irq_table();
 
@@ -479,14 +484,47 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
             if !reg.is_empty() && reg.irq_num == irq_num {
                 reg.pending = true;
                 reg.pending_count += 1;
+                println!("[IRQ] irq_notify: found registration, blocked_pid={}", reg.blocked_pid);
 
-                // Send event to the process
-                let event = crate::event::Event::irq(irq_num);
-                crate::event::send_event(reg.owner_pid, event);
+                // Wake up blocked process if any
+                let wake_pid = if reg.blocked_pid != 0 {
+                    let pid = reg.blocked_pid;
+                    reg.blocked_pid = 0;
 
-                return Some(reg.owner_pid);
+                    // Find task by PID (not slot index - they may differ!)
+                    let sched = crate::task::scheduler();
+                    let mut found_slot = None;
+                    for (slot, task_opt) in sched.tasks.iter().enumerate() {
+                        if let Some(ref task) = task_opt {
+                            if task.id == pid {
+                                found_slot = Some(slot);
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(slot) = found_slot {
+                        if let Some(ref mut task) = sched.tasks[slot] {
+                            if matches!(task.state, crate::task::TaskState::Blocked) {
+                                println!("[IRQ] irq_notify: waking pid {} in slot {}", pid, slot);
+                                task.state = crate::task::TaskState::Ready;
+                            }
+                        }
+                    } else {
+                        println!("[IRQ] irq_notify: could not find task with pid {}", pid);
+                    }
+                    Some(pid)
+                } else {
+                    // Send event to the process (fallback for non-blocking mode)
+                    let event = crate::event::Event::irq(irq_num);
+                    crate::event::send_event(reg.owner_pid, event);
+                    Some(reg.owner_pid)
+                };
+
+                return wake_pid;
             }
         }
+        println!("[IRQ] irq_notify: no registration found for IRQ {}", irq_num);
         None
     }
 }
@@ -508,6 +546,103 @@ pub fn irq_check_pending(irq_num: u32, pid: u32) -> Option<u32> {
             }
         }
         None
+    }
+}
+
+/// Block waiting for an IRQ (called from syscall context)
+/// Returns pending count when IRQ fires, or error
+pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
+    // Check if IRQ is already pending
+    if let Some(count) = irq_check_pending(irq_num, pid) {
+        println!("[IRQ] irq_wait: IRQ {} already pending, count={}", irq_num, count);
+        return Ok(count);
+    }
+
+    // Not pending - set up for blocking
+    unsafe {
+        let table = irq_table();
+        let mut found = false;
+
+        for reg in table.iter_mut() {
+            if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
+                reg.blocked_pid = pid;
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            println!("[IRQ] irq_wait: IRQ {} not registered for pid {}", irq_num, pid);
+            return Err(-22); // EINVAL - not registered for this IRQ
+        }
+
+        println!("[IRQ] irq_wait: blocking pid {} on IRQ {}", pid, irq_num);
+
+        // Mark current task as Blocked and switch to another task
+        // Uses same mechanism as sys_yield() - updates globals and sets SYSCALL_SWITCHED_TASK
+        let sched = crate::task::scheduler();
+        let caller_slot = sched.current;
+
+        // First, check if there's another task to switch to (before marking blocked)
+        // We mark current as Blocked temporarily to exclude it from scheduling
+        if let Some(ref mut task) = sched.tasks[caller_slot] {
+            task.state = crate::task::TaskState::Blocked;
+        }
+
+        // Find next ready task
+        if let Some(next_slot) = sched.schedule() {
+            if next_slot != caller_slot {
+                // Debug: show what we're switching to
+                if let Some(ref next_task) = sched.tasks[next_slot] {
+                    println!("[IRQ] switching from slot {} (pid {}) to slot {} (pid {}, state={:?})",
+                             caller_slot,
+                             sched.tasks[caller_slot].as_ref().map(|t| t.id).unwrap_or(0),
+                             next_slot,
+                             next_task.id,
+                             next_task.state);
+                    println!("[IRQ] next task ELR=0x{:x}", next_task.trap_frame.elr_el1);
+                }
+
+                // Adjust ELR to restart the syscall when this task resumes
+                if let Some(ref mut task) = sched.tasks[caller_slot] {
+                    task.trap_frame.elr_el1 = task.trap_frame.elr_el1.wrapping_sub(4);
+                }
+
+                sched.current = next_slot;
+                if let Some(ref mut task) = sched.tasks[next_slot] {
+                    task.state = crate::task::TaskState::Running;
+                }
+                crate::task::update_current_task_globals();
+                crate::task::SYSCALL_SWITCHED_TASK = 1;
+
+                println!("[IRQ] task switch complete, returning...");
+
+                // Return value is ignored since we switched tasks
+                return Err(-11); // EAGAIN
+            }
+        }
+
+        // No other task to switch to - spin-wait in kernel with interrupts enabled
+        println!("[IRQ] no other task, spin-waiting for IRQ {}", irq_num);
+        if let Some(ref mut task) = sched.tasks[caller_slot] {
+            task.state = crate::task::TaskState::Running;
+        }
+
+        // Spin-wait with interrupts enabled until IRQ fires
+        // This is less efficient than true blocking but works when there's only one task
+        loop {
+            // Enable interrupts so IRQ can fire
+            core::arch::asm!("msr daifclr, #2"); // Unmask IRQs
+
+            // Wait for interrupt (puts CPU in low-power state until next IRQ)
+            core::arch::asm!("wfi");
+
+            // Check if our IRQ is now pending
+            if let Some(count) = irq_check_pending(irq_num, pid) {
+                println!("[IRQ] spin-wait complete, IRQ {} fired, count={}", irq_num, count);
+                return Ok(count);
+            }
+        }
     }
 }
 
@@ -560,15 +695,12 @@ impl KernelScheme for IrqScheme {
         let irq_num = handle.handle as u32;
         let pid = handle.flags;
 
-        // Check if IRQ is pending
-        if let Some(count) = irq_check_pending(irq_num, pid) {
-            // Return the count of IRQs that fired
-            buf[..4].copy_from_slice(&count.to_le_bytes());
-            Ok(4)
-        } else {
-            // No pending IRQ - return EAGAIN (caller should wait on event)
-            Err(-11) // EAGAIN
-        }
+        // Blocking wait for IRQ - blocks until IRQ fires
+        let count = irq_wait(irq_num, pid)?;
+
+        // Return the count of IRQs that fired
+        buf[..4].copy_from_slice(&count.to_le_bytes());
+        Ok(4)
     }
 
     fn write(&self, _handle: &SchemeHandle, _buf: &[u8]) -> Result<usize, i32> {
@@ -907,6 +1039,108 @@ impl KernelScheme for MmioScheme {
 }
 
 // ============================================================================
+// I2C Scheme - provides I2C bus access to userspace
+// ============================================================================
+
+/// I2C scheme - provides I2C bus access
+/// Path format: <bus>/<addr_hex>
+/// Example: i2c:0/20 opens I2C bus 0, device address 0x20
+///
+/// Operations:
+/// - read(buf): Read bytes from device (first byte is register address)
+/// - write(buf): Write bytes to device (first byte is register address)
+pub struct I2cScheme;
+
+impl I2cScheme {
+    fn parse_hex(s: &str) -> Option<u32> {
+        let s = s.trim_start_matches("0x").trim_start_matches("0X");
+        u32::from_str_radix(s, 16).ok()
+    }
+}
+
+impl KernelScheme for I2cScheme {
+    fn name(&self) -> &'static str {
+        "i2c"
+    }
+
+    fn open(&self, path: &[u8], _flags: u32) -> Result<SchemeHandle, i32> {
+        let path_str = core::str::from_utf8(path).map_err(|_| -22)?;
+
+        // Parse bus/addr
+        let slash_pos = path_str.find('/').ok_or(-22)?;
+        let bus_str = &path_str[..slash_pos];
+        let addr_str = &path_str[slash_pos + 1..];
+
+        if bus_str.is_empty() || addr_str.is_empty() {
+            return Err(-22); // EINVAL
+        }
+
+        let bus: u32 = bus_str.parse().map_err(|_| -22)?;
+        let addr = Self::parse_hex(addr_str).ok_or(-22)?;
+
+        if bus > 2 {
+            return Err(-19); // ENODEV - only I2C0-2 supported
+        }
+
+        if addr > 0x7F {
+            return Err(-22); // EINVAL - 7-bit address max
+        }
+
+        // Verify we can access the I2C controller
+        if crate::i2c::get_controller(bus).is_none() {
+            return Err(-19); // ENODEV
+        }
+
+        // Encode bus and addr in handle
+        // handle: upper 32 bits = bus, lower 32 bits = addr
+        let handle = ((bus as u64) << 32) | (addr as u64);
+
+        Ok(SchemeHandle {
+            scheme_id: 0,
+            handle,
+            flags: 0,
+        })
+    }
+
+    fn read(&self, handle: &SchemeHandle, buf: &mut [u8]) -> Result<usize, i32> {
+        let bus = (handle.handle >> 32) as u32;
+        let addr = (handle.handle & 0xFF) as u8;
+
+        let ctrl = crate::i2c::get_controller(bus).ok_or(-19)?;
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Read from device
+        ctrl.read(addr, buf)?;
+
+        Ok(buf.len())
+    }
+
+    fn write(&self, handle: &SchemeHandle, buf: &[u8]) -> Result<usize, i32> {
+        let bus = (handle.handle >> 32) as u32;
+        let addr = (handle.handle & 0xFF) as u8;
+
+        let ctrl = crate::i2c::get_controller(bus).ok_or(-19)?;
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Write to device
+        ctrl.write(addr, buf)?;
+
+        Ok(buf.len())
+    }
+
+    fn close(&self, _handle: &SchemeHandle) -> Result<(), i32> {
+        // Nothing to clean up for I2C
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Global scheme instances
 // ============================================================================
 
@@ -917,6 +1151,7 @@ static NULL_SCHEME: NullScheme = NullScheme;
 static ZERO_SCHEME: ZeroScheme = ZeroScheme;
 static CONSOLE_SCHEME: ConsoleScheme = ConsoleScheme;
 static MMIO_SCHEME: MmioScheme = MmioScheme;
+static I2C_SCHEME: I2cScheme = I2cScheme;
 
 /// Kernel scheme IDs (must match registration order in init())
 pub mod scheme_ids {
@@ -927,6 +1162,7 @@ pub mod scheme_ids {
     pub const ZERO: u16 = 4;
     pub const CONSOLE: u16 = 5;
     pub const MMIO: u16 = 6;
+    pub const I2C: u16 = 7;
 }
 
 /// Get kernel scheme by name
@@ -939,6 +1175,7 @@ pub fn get_kernel_scheme(name: &str) -> Option<&'static dyn KernelScheme> {
         "zero" => Some(&ZERO_SCHEME),
         "console" => Some(&CONSOLE_SCHEME),
         "mmio" => Some(&MMIO_SCHEME),
+        "i2c" => Some(&I2C_SCHEME),
         _ => None,
     }
 }
@@ -953,6 +1190,7 @@ pub fn get_kernel_scheme_by_id(id: u16) -> Option<&'static dyn KernelScheme> {
         scheme_ids::ZERO => Some(&ZERO_SCHEME),
         scheme_ids::CONSOLE => Some(&CONSOLE_SCHEME),
         scheme_ids::MMIO => Some(&MMIO_SCHEME),
+        scheme_ids::I2C => Some(&I2C_SCHEME),
         _ => None,
     }
 }
@@ -1004,6 +1242,7 @@ pub fn open_url(url: &[u8], flags: u32) -> Result<(FdEntry, SchemeHandle), i32> 
             fd_type: FdType::Scheme {
                 scheme_id: handle.scheme_id,
                 handle: handle.handle,
+                scheme_flags: handle.flags,
             },
             flags: FdFlags {
                 readable: true,
@@ -1117,8 +1356,9 @@ pub fn init() {
         reg.register_kernel("zero");     // ID 4
         reg.register_kernel("console");  // ID 5
         reg.register_kernel("mmio");     // ID 6
+        reg.register_kernel("i2c");      // ID 7
     }
-    println!("  Registered kernel schemes: memory, time, irq, null, zero, console, mmio");
+    println!("  Registered kernel schemes: memory, time, irq, null, zero, console, mmio, i2c");
 }
 
 /// Test scheme system

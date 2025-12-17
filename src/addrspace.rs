@@ -337,6 +337,108 @@ impl AddressSpace {
         true
     }
 
+    /// Map a 4KB DMA buffer page at a specific virtual address
+    /// Uses Normal Non-Cacheable memory for proper DMA coherency
+    pub fn map_dma_page(
+        &mut self,
+        virt_addr: u64,
+        phys_addr: u64,
+        writable: bool,
+    ) -> bool {
+        // Extract table indices from virtual address
+        let l1_index = ((virt_addr >> 30) & 0x1FF) as usize;
+        let l2_index = ((virt_addr >> 21) & 0x1FF) as usize;
+        let l3_index = ((virt_addr >> 12) & 0x1FF) as usize;
+
+        // Get or allocate L2 table
+        let l1_phys = self.page_tables[1];
+        let l2_phys = unsafe {
+            let l1_ptr = phys_to_virt(l1_phys);
+            let entry = core::ptr::read_volatile(l1_ptr.add(l1_index));
+
+            if entry == 0 {
+                if self.num_tables >= 16 {
+                    return false;
+                }
+                let new_l2 = match pmm::alloc_page() {
+                    Some(addr) => addr,
+                    None => return false,
+                };
+                let new_ptr = phys_to_virt(new_l2 as u64);
+                for i in 0..512 {
+                    core::ptr::write_volatile(new_ptr.add(i), 0);
+                }
+                core::ptr::write_volatile(
+                    l1_ptr.add(l1_index),
+                    new_l2 as u64 | flags::VALID | flags::TABLE
+                );
+                self.page_tables[self.num_tables] = new_l2 as u64;
+                self.num_tables += 1;
+                new_l2 as u64
+            } else if (entry & flags::TABLE) != 0 {
+                entry & 0x0000_FFFF_FFFF_F000
+            } else {
+                return false;
+            }
+        };
+
+        // Get or allocate L3 table
+        let l3_phys = unsafe {
+            let l2_ptr = phys_to_virt(l2_phys);
+            let entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
+
+            if entry == 0 {
+                if self.num_tables >= 16 {
+                    return false;
+                }
+                let new_l3 = match pmm::alloc_page() {
+                    Some(addr) => addr,
+                    None => return false,
+                };
+                let new_ptr = phys_to_virt(new_l3 as u64);
+                for i in 0..512 {
+                    core::ptr::write_volatile(new_ptr.add(i), 0);
+                }
+                core::ptr::write_volatile(
+                    l2_ptr.add(l2_index),
+                    new_l3 as u64 | flags::VALID | flags::TABLE
+                );
+                self.page_tables[self.num_tables] = new_l3 as u64;
+                self.num_tables += 1;
+                new_l3 as u64
+            } else if (entry & flags::TABLE) != 0 {
+                entry & 0x0000_FFFF_FFFF_F000
+            } else {
+                return false;
+            }
+        };
+
+        // Set the L3 page entry with Normal Cacheable memory for DMA
+        // U-Boot pattern: use cacheable memory + explicit cache operations
+        // - Flush (DC CVAC) before hardware reads (CPU wrote data)
+        // - Invalidate (DC CIVAC) before CPU reads (hardware wrote data)
+        // This is how MT7988A works in non-coherent PCIe mode
+        let ap = if writable { flags::AP_RW_ALL } else { flags::AP_RO_ALL };
+
+        unsafe {
+            let l3_ptr = phys_to_virt(l3_phys);
+            core::ptr::write_volatile(
+                l3_ptr.add(l3_index),
+                phys_addr
+                    | flags::VALID
+                    | flags::PAGE
+                    | flags::AF
+                    | flags::SH_INNER   // Inner shareable for multi-core
+                    | attr::NORMAL      // Normal cacheable - requires explicit cache ops
+                    | ap
+                    | flags::UXN
+                    | flags::PXN
+            );
+        }
+
+        true
+    }
+
     /// Unmap a 4KB page at a specific virtual address
     /// Returns the physical address that was mapped, or None if not mapped
     pub fn unmap_page(&mut self, virt_addr: u64) -> Option<u64> {

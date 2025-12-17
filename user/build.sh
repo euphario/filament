@@ -10,7 +10,7 @@ cd "$SCRIPT_DIR"
 mkdir -p bin
 
 # List of programs to build
-PROGRAMS="shell usbtest"
+PROGRAMS="shell gpio usbtest"
 
 # Build each program
 for prog in $PROGRAMS; do

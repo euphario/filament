@@ -85,6 +85,18 @@ pub enum SyscallNumber {
     SchemeUnregister = 30,
     /// Execute a program from path (ramfs)
     Exec = 31,
+    /// Detach from parent and become a daemon
+    Daemonize = 32,
+    /// Kill (terminate) a process by PID
+    Kill = 33,
+    /// Get process list info
+    PsInfo = 34,
+    /// Set kernel log level
+    SetLogLevel = 35,
+    /// Allocate DMA-capable memory (returns VA, writes PA to pointer)
+    MmapDma = 36,
+    /// Reset/reboot the system
+    Reset = 37,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -124,6 +136,12 @@ impl From<u64> for SyscallNumber {
             29 => SyscallNumber::SchemeRegister,
             30 => SyscallNumber::SchemeUnregister,
             31 => SyscallNumber::Exec,
+            32 => SyscallNumber::Daemonize,
+            33 => SyscallNumber::Kill,
+            34 => SyscallNumber::PsInfo,
+            35 => SyscallNumber::SetLogLevel,
+            36 => SyscallNumber::MmapDma,
+            37 => SyscallNumber::Reset,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -235,6 +253,12 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Spawn => sys_spawn(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::Wait => sys_wait(args.arg0 as i32, args.arg1),
         SyscallNumber::Exec => sys_exec(args.arg0, args.arg1 as usize),
+        SyscallNumber::Daemonize => sys_daemonize(),
+        SyscallNumber::Kill => sys_kill(args.arg0 as u32),
+        SyscallNumber::PsInfo => sys_ps_info(args.arg0, args.arg1 as usize),
+        SyscallNumber::SetLogLevel => sys_set_log_level(args.arg0 as u8),
+        SyscallNumber::MmapDma => sys_mmap_dma(args.arg0 as usize, args.arg1),
+        SyscallNumber::Reset => sys_reset(),
         SyscallNumber::Invalid => {
             println!("[SYSCALL] Invalid syscall number: {}", args.num);
             SyscallError::NotImplemented as i64
@@ -287,9 +311,13 @@ fn sys_exit(code: i32) -> i64 {
                     }
                 }
             }
+        } else {
+            // Orphan process (no parent) - auto-reap immediately
+            // No one will wait() on it, so free the slot now
+            sched.tasks[current_slot] = None;
         }
 
-        // Try to schedule next task (don't reap yet - parent needs to wait())
+        // Try to schedule next task
         if let Some(next_slot) = sched.schedule() {
             // Mark next task as running and update globals
             sched.current = next_slot;
@@ -311,26 +339,38 @@ fn sys_exit(code: i32) -> i64 {
 }
 
 /// Yield CPU to another process
+/// If no other task is ready, waits for an interrupt (WFI) before returning.
+/// This ensures yield() actually pauses when used for polling delays.
 fn sys_yield() -> i64 {
     unsafe {
         let sched = crate::task::scheduler();
+        let caller_slot = sched.current;
 
         // Mark current as ready (not running)
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(ref mut task) = sched.tasks[caller_slot] {
             task.state = crate::task::TaskState::Ready;
+            // Pre-store return value in caller's trap frame
+            task.trap_frame.x0 = 0;
         }
 
         // Find next task
         if let Some(next_slot) = sched.schedule() {
-            if next_slot != sched.current {
+            if next_slot != caller_slot {
                 sched.current = next_slot;
                 if let Some(ref mut task) = sched.tasks[next_slot] {
                     task.state = crate::task::TaskState::Running;
                 }
                 crate::task::update_current_task_globals();
+                // Signal to assembly not to store return value
+                crate::task::SYSCALL_SWITCHED_TASK = 1;
             } else {
-                // Same task, mark as running again
-                if let Some(ref mut task) = sched.tasks[sched.current] {
+                // Same task - no other task ready to run
+                // Use WFI to actually wait for an interrupt before returning
+                // This makes yield() useful for polling loops that need real delays
+                core::arch::asm!("wfi");
+
+                // Mark as running again after waking from WFI
+                if let Some(ref mut task) = sched.tasks[caller_slot] {
                     task.state = crate::task::TaskState::Running;
                 }
             }
@@ -402,6 +442,45 @@ fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
         if let Some(ref mut task) = sched.tasks[sched.current] {
             match task.mmap(size, writable, executable) {
                 Some(virt_addr) => virt_addr as i64,
+                None => SyscallError::OutOfMemory as i64,
+            }
+        } else {
+            SyscallError::InvalidArgument as i64
+        }
+    }
+}
+
+/// Allocate DMA-capable memory
+/// Args: size, phys_ptr (pointer to u64 for physical address)
+/// Returns: virtual address on success, writes physical address to phys_ptr
+/// SECURITY: Writes to user pointer via page table translation
+fn sys_mmap_dma(size: usize, phys_ptr: u64) -> i64 {
+    if size == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Validate phys_ptr
+    if phys_ptr != 0 {
+        if let Err(e) = uaccess::validate_user_write(phys_ptr, core::mem::size_of::<u64>()) {
+            return uaccess_to_errno(e);
+        }
+    }
+
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            match task.mmap_dma(size) {
+                Some((virt_addr, phys_addr)) => {
+                    // Write physical address to user pointer
+                    if phys_ptr != 0 {
+                        if let Err(e) = uaccess::put_user::<u64>(phys_ptr, phys_addr) {
+                            // Unmap the allocation since we couldn't return the phys addr
+                            task.munmap(virt_addr, size);
+                            return uaccess_to_errno(e);
+                        }
+                    }
+                    virt_addr as i64
+                }
                 None => SyscallError::OutOfMemory as i64,
             }
         } else {
@@ -1046,14 +1125,14 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
             }
         }
 
-        // No terminated children found - need to block
-        // Mark parent as blocked and switch to another task
+        // No terminated children found - need to block and switch
         if let Some(ref mut parent) = sched.tasks[caller_slot] {
             parent.state = crate::task::TaskState::Blocked;
+            // Pre-store return value in caller's trap frame
+            parent.trap_frame.x0 = SyscallError::WouldBlock as i64 as u64;
         }
 
-        // Force a context switch to let child run
-        // Find next runnable task
+        // Find another task to run
         if let Some(next_slot) = sched.schedule() {
             if next_slot != caller_slot {
                 sched.current = next_slot;
@@ -1061,6 +1140,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
                     next.state = crate::task::TaskState::Running;
                 }
                 crate::task::update_current_task_globals();
+                crate::task::SYSCALL_SWITCHED_TASK = 1;
             }
         }
 
@@ -1120,6 +1200,251 @@ fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
         }
     }
     SyscallError::InvalidArgument as i64
+}
+
+/// Process info structure for ps_info syscall
+/// Must match userlib definition
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub state: u8,      // 0=Ready, 1=Running, 2=Blocked, 3=Terminated
+    pub _pad: [u8; 3],  // Alignment padding
+    pub name: [u8; 16],
+}
+
+impl ProcessInfo {
+    pub const fn empty() -> Self {
+        Self {
+            pid: 0,
+            parent_pid: 0,
+            state: 0,
+            _pad: [0; 3],
+            name: [0; 16],
+        }
+    }
+}
+
+/// Daemonize - detach from parent and become a daemon
+fn sys_daemonize() -> i64 {
+    let caller_pid = current_pid();
+
+    unsafe {
+        let sched = crate::task::scheduler();
+
+        // Find the calling task
+        let mut parent_id = 0u32;
+        for task_opt in sched.tasks.iter_mut() {
+            if let Some(ref mut task) = task_opt {
+                if task.id == caller_pid {
+                    // Save parent ID and clear it
+                    parent_id = task.parent_id;
+                    task.parent_id = 0;
+                    break;
+                }
+            }
+        }
+
+        // Remove from parent's children list and wake parent if blocked
+        if parent_id != 0 {
+            for task_opt in sched.tasks.iter_mut() {
+                if let Some(ref mut task) = task_opt {
+                    if task.id == parent_id {
+                        task.remove_child(caller_pid);
+                        // Wake up parent if it's blocked (likely waiting on wait())
+                        if task.state == crate::task::TaskState::Blocked {
+                            task.state = crate::task::TaskState::Ready;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    0  // Success
+}
+
+/// Kill a process by PID
+fn sys_kill(pid: u32) -> i64 {
+    if pid == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    let caller_pid = current_pid();
+
+    unsafe {
+        let sched = crate::task::scheduler();
+
+        // Find the target task
+        let mut target_slot = None;
+        let mut parent_id = 0u32;
+
+        for (i, task_opt) in sched.tasks.iter().enumerate() {
+            if let Some(ref task) = task_opt {
+                if task.id == pid {
+                    target_slot = Some(i);
+                    parent_id = task.parent_id;
+                    break;
+                }
+            }
+        }
+
+        let slot = match target_slot {
+            Some(s) => s,
+            None => return SyscallError::NoProcess as i64,
+        };
+
+        // Mark as terminated with SIGKILL-style exit code
+        if let Some(ref mut task) = sched.tasks[slot] {
+            task.exit_code = -9;  // SIGKILL
+            task.state = crate::task::TaskState::Terminated;
+        }
+
+        // Wake parent if blocked (waiting on wait())
+        if parent_id != 0 {
+            for task_opt in sched.tasks.iter_mut() {
+                if let Some(ref mut task) = task_opt {
+                    if task.id == parent_id && task.state == crate::task::TaskState::Blocked {
+                        task.state = crate::task::TaskState::Ready;
+                        // Send ChildExit event
+                        let event = crate::event::Event::child_exit(pid, -9);
+                        task.event_queue.push(event);
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Orphan process (no parent) - auto-reap immediately
+            // No one will wait() on it, so free the slot now
+            sched.tasks[slot] = None;
+        }
+
+        // If killing current task, schedule next
+        if pid == caller_pid {
+            if let Some(next_slot) = sched.schedule() {
+                sched.current = next_slot;
+                if let Some(ref mut next) = sched.tasks[next_slot] {
+                    next.state = crate::task::TaskState::Running;
+                }
+                crate::task::update_current_task_globals();
+                // Signal to assembly not to store return value into the new task
+                crate::task::SYSCALL_SWITCHED_TASK = 1;
+            }
+        }
+    }
+
+    0  // Success
+}
+
+/// Get process info list
+/// Args: buf_ptr (pointer to ProcessInfo array), max_entries
+/// Returns: number of entries written
+fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
+    if max_entries == 0 {
+        return 0;
+    }
+
+    // Validate user pointer
+    let entry_size = core::mem::size_of::<ProcessInfo>();
+    if let Err(e) = uaccess::validate_user_write(buf_ptr, entry_size * max_entries) {
+        return uaccess_to_errno(e);
+    }
+
+    let mut count = 0usize;
+
+    unsafe {
+        let sched = crate::task::scheduler();
+
+        for task_opt in sched.tasks.iter() {
+            if count >= max_entries {
+                break;
+            }
+
+            if let Some(ref task) = task_opt {
+                let info = ProcessInfo {
+                    pid: task.id,
+                    parent_pid: task.parent_id,
+                    state: task.state as u8,
+                    _pad: [0; 3],
+                    name: task.name,
+                };
+
+                // Write to user buffer
+                let offset = (count * entry_size) as u64;
+                let info_bytes = core::slice::from_raw_parts(
+                    &info as *const ProcessInfo as *const u8,
+                    entry_size
+                );
+
+                if let Err(_) = uaccess::copy_to_user(buf_ptr + offset, info_bytes) {
+                    break;
+                }
+
+                count += 1;
+            }
+        }
+    }
+
+    count as i64
+}
+
+/// Set kernel log level
+/// Args: level (0=Error, 1=Warn, 2=Info, 3=Debug, 4=Trace)
+fn sys_set_log_level(level: u8) -> i64 {
+    match crate::log::LogLevel::from_u8(level) {
+        Some(lvl) => {
+            crate::log::set_level(lvl);
+            0
+        }
+        None => SyscallError::InvalidArgument as i64,
+    }
+}
+
+/// Reset/reboot the system using MT7988A watchdog
+fn sys_reset() -> ! {
+    println!();
+    println!("========================================");
+    println!("  System Reset Requested");
+    println!("========================================");
+
+    // MT7988A TOPRGU (Top Reset Generation Unit) registers
+    // Physical address, accessed via kernel virtual mapping
+    const TOPRGU_BASE: u64 = crate::mmu::KERNEL_VIRT_BASE | 0x1001_C000;
+    const WDT_MODE: usize = 0x00;
+    const WDT_SWRST: usize = 0x14;
+
+    // WDT_MODE bits
+    const WDT_MODE_KEY: u32 = 0x2200_0000;  // Magic key for writes
+    const WDT_MODE_EXTEN: u32 = 1 << 2;      // Enable external reset
+    const WDT_MODE_EN: u32 = 1 << 0;         // Enable watchdog
+
+    // WDT_SWRST key
+    const WDT_SWRST_KEY: u32 = 0x1209;
+
+    unsafe {
+        let wdt_mode = (TOPRGU_BASE + WDT_MODE as u64) as *mut u32;
+        let wdt_swrst = (TOPRGU_BASE + WDT_SWRST as u64) as *mut u32;
+
+        // Enable watchdog with external reset
+        core::ptr::write_volatile(wdt_mode, WDT_MODE_KEY | WDT_MODE_EXTEN | WDT_MODE_EN);
+
+        // Ensure the write completes
+        core::arch::asm!("dsb sy");
+
+        // Trigger software reset
+        core::ptr::write_volatile(wdt_swrst, WDT_SWRST_KEY);
+
+        // Ensure the write completes
+        core::arch::asm!("dsb sy");
+    }
+
+    // Should not reach here, but loop just in case
+    println!("Reset triggered, waiting...");
+    loop {
+        unsafe { core::arch::asm!("wfi"); }
+    }
 }
 
 /// Syscall handler called from exception vector (assembly)

@@ -10,8 +10,14 @@ use userlib::{println, print, syscall, Stdin};
 /// Maximum command line length
 const MAX_LINE: usize = 128;
 
+/// Maximum background jobs to track
+const MAX_BG_JOBS: usize = 16;
+
 /// Static line buffer (in .bss) to avoid stack allocation issues
 static mut LINE_BUF: [u8; MAX_LINE] = [0u8; MAX_LINE];
+
+/// Background job PIDs (0 = empty slot)
+static mut BG_PIDS: [u32; MAX_BG_JOBS] = [0; MAX_BG_JOBS];
 
 #[unsafe(no_mangle)]
 fn main() {
@@ -172,6 +178,20 @@ fn execute_command(cmd: &[u8]) {
         panic!("User requested panic");
     } else if cmd_eq(cmd, b"usb") {
         cmd_run_program("bin/usbtest");
+    } else if cmd_eq(cmd, b"gpio") {
+        cmd_run_program("bin/gpio");
+    } else if cmd_eq(cmd, b"ps") {
+        cmd_ps();
+    } else if cmd_starts_with(cmd, b"kill ") {
+        cmd_kill(&cmd[5..]);
+    } else if cmd_starts_with(cmd, b"bg ") {
+        cmd_bg(&cmd[3..]);
+    } else if cmd_eq(cmd, b"jobs") {
+        cmd_jobs();
+    } else if cmd_starts_with(cmd, b"log ") {
+        cmd_log(&cmd[4..]);
+    } else if cmd_eq(cmd, b"reset") || cmd_eq(cmd, b"reboot") {
+        cmd_reset();
     } else {
         print!("Unknown command: ");
         print_bytes(cmd);
@@ -182,16 +202,23 @@ fn execute_command(cmd: &[u8]) {
 
 fn cmd_help() {
     println!("Available commands:");
-    println!("  help, ?     - Show this help");
-    println!("  exit, quit  - Exit the shell");
-    println!("  pid         - Show current process ID");
-    println!("  uptime      - Show system uptime (ticks)");
-    println!("  mem         - Test memory allocation");
-    println!("  echo <msg>  - Echo a message");
-    println!("  spawn <id>  - Spawn process by ELF ID");
-    println!("  usb         - Run USB userspace driver test");
-    println!("  yield       - Yield CPU to other processes");
-    println!("  panic       - Trigger a panic (test)");
+    println!("  help, ?       - Show this help");
+    println!("  exit, quit    - Exit the shell");
+    println!("  pid           - Show current process ID");
+    println!("  uptime        - Show system uptime (ticks)");
+    println!("  mem           - Test memory allocation");
+    println!("  echo <msg>    - Echo a message");
+    println!("  spawn <id>    - Spawn process by ELF ID");
+    println!("  usb           - Run USB userspace driver test");
+    println!("  gpio          - Run GPIO control utility");
+    println!("  yield         - Yield CPU to other processes");
+    println!("  panic         - Trigger a panic (test)");
+    println!("  ps            - Show running processes");
+    println!("  kill <pid>    - Terminate a process");
+    println!("  bg <path>     - Run program in background");
+    println!("  jobs          - Show background jobs");
+    println!("  log <level>   - Set log level (error/warn/info/debug/trace)");
+    println!("  reset, reboot - Reset the system");
 }
 
 fn cmd_pid() {
@@ -327,8 +354,8 @@ fn cmd_run_program(path: &str) {
                 // Don't call yield_now() - it would undo the Blocked state
                 continue;
             } else if wait_result == -10 {
-                // ECHILD - no such child
-                println!("Child {} no longer exists", pid);
+                // ECHILD - no such child (probably daemonized)
+                println!("Process {} detached (daemonized)", pid);
                 break;
             } else {
                 println!("wait failed: {}", wait_result);
@@ -338,4 +365,178 @@ fn cmd_run_program(path: &str) {
     } else {
         println!("exec failed: {}", result);
     }
+}
+
+/// Parse decimal number from byte slice
+fn parse_decimal(input: &[u8]) -> Option<u32> {
+    let trimmed = trim(input);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut value: u32 = 0;
+    for &ch in trimmed {
+        if ch >= b'0' && ch <= b'9' {
+            value = value.saturating_mul(10).saturating_add((ch - b'0') as u32);
+        } else {
+            return None;
+        }
+    }
+    Some(value)
+}
+
+/// Show process list
+fn cmd_ps() {
+    let mut buf: [syscall::ProcessInfo; 16] = [syscall::ProcessInfo::empty(); 16];
+    let count = syscall::ps_info(&mut buf);
+
+    println!("PID   PPID  STATE      NAME");
+    println!("----  ----  ---------  ---------------");
+
+    for i in 0..count {
+        let info = &buf[i];
+        print!("{:4}  {:4}  {:9}  ", info.pid, info.parent_pid, info.state_str());
+        print_bytes(&info.name);
+        println!();
+    }
+}
+
+/// Kill a process by PID
+fn cmd_kill(arg: &[u8]) {
+    match parse_decimal(arg) {
+        Some(pid) => {
+            let result = syscall::kill(pid);
+            if result == 0 {
+                println!("Killed process {}", pid);
+            } else {
+                println!("Failed to kill {}: error {}", pid, result);
+            }
+        }
+        None => {
+            println!("Usage: kill <pid>");
+        }
+    }
+}
+
+/// Run a program in background
+fn cmd_bg(arg: &[u8]) {
+    // Convert bytes to str for exec
+    let path = match core::str::from_utf8(trim(arg)) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Invalid path");
+            return;
+        }
+    };
+
+    if path.is_empty() {
+        println!("Usage: bg <path>");
+        return;
+    }
+
+    let result = syscall::exec(path);
+
+    if result >= 0 {
+        let pid = result as u32;
+        println!("[{}] Started background process PID {}", track_bg_job(pid), pid);
+    } else {
+        println!("exec failed: {}", result);
+    }
+}
+
+/// Track a background job, returns job number (1-based)
+fn track_bg_job(pid: u32) -> usize {
+    unsafe {
+        for i in 0..MAX_BG_JOBS {
+            if BG_PIDS[i] == 0 {
+                BG_PIDS[i] = pid;
+                return i + 1;
+            }
+        }
+    }
+    0  // No slot available
+}
+
+/// Show background jobs
+fn cmd_jobs() {
+    let mut buf: [syscall::ProcessInfo; 16] = [syscall::ProcessInfo::empty(); 16];
+    let count = syscall::ps_info(&mut buf);
+
+    println!("JOB  PID   STATE      NAME");
+    println!("---  ----  ---------  ---------------");
+
+    let mut found = false;
+
+    unsafe {
+        for i in 0..MAX_BG_JOBS {
+            let pid = BG_PIDS[i];
+            if pid == 0 {
+                continue;
+            }
+
+            // Look up process info
+            let mut still_exists = false;
+            for j in 0..count {
+                if buf[j].pid == pid {
+                    print!("{:3}  {:4}  {:9}  ", i + 1, pid, buf[j].state_str());
+                    print_bytes(&buf[j].name);
+                    println!();
+                    still_exists = true;
+                    found = true;
+
+                    // If terminated, clean up the slot
+                    if buf[j].state == 3 {  // Terminated
+                        BG_PIDS[i] = 0;
+                    }
+                    break;
+                }
+            }
+
+            // Process no longer exists - clean up
+            if !still_exists {
+                BG_PIDS[i] = 0;
+            }
+        }
+    }
+
+    if !found {
+        println!("No background jobs");
+    }
+}
+
+/// Set kernel log level
+fn cmd_log(arg: &[u8]) {
+    let level_str = trim(arg);
+
+    let level = if cmd_eq(level_str, b"error") {
+        syscall::log_level::ERROR
+    } else if cmd_eq(level_str, b"warn") {
+        syscall::log_level::WARN
+    } else if cmd_eq(level_str, b"info") {
+        syscall::log_level::INFO
+    } else if cmd_eq(level_str, b"debug") {
+        syscall::log_level::DEBUG
+    } else if cmd_eq(level_str, b"trace") {
+        syscall::log_level::TRACE
+    } else {
+        println!("Unknown log level. Use: error, warn, info, debug, trace");
+        return;
+    };
+
+    let result = syscall::set_log_level(level);
+    if result == 0 {
+        print!("Log level set to ");
+        print_bytes(level_str);
+        println!();
+    } else {
+        println!("Failed to set log level: {}", result);
+    }
+}
+
+/// Reset the system
+fn cmd_reset() {
+    println!("Resetting system...");
+    syscall::reset();
+    // Should not return, but just in case
+    println!("Reset failed!");
 }

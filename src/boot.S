@@ -517,6 +517,10 @@ svc_handler:
      * Call Rust syscall handler
      * syscall_handler_rust(arg0, arg1, arg2, arg3, arg4, arg5, unused, num)
      */
+    /* Clear switch flag before syscall */
+    adrp    x10, SYSCALL_SWITCHED_TASK
+    str     xzr, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+
     ldp     x0, x1, [x9, #0]        // arg0, arg1
     ldp     x2, x3, [x9, #16]       // arg2, arg3
     ldp     x4, x5, [x9, #32]       // arg4, arg5
@@ -529,8 +533,15 @@ svc_handler:
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
-    /* Store syscall return value in trap frame x0 */
+    /* Check if syscall switched tasks - if so, skip storing return value */
+    /* (the switched-to task already has its own x0, we shouldn't overwrite it) */
+    adrp    x10, SYSCALL_SWITCHED_TASK
+    ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    cbnz    x10, .Lskip_store_retval
+
+    /* Store syscall return value in trap frame x0 (only if same task) */
     str     x0, [x9, #0]
+.Lskip_store_retval:
 
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]         // sp_el0

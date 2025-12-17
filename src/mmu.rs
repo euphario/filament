@@ -44,6 +44,8 @@ pub mod flags {
     pub const TABLE: u64 = 1 << 1;  // For L0-L2: points to next level table
     pub const PAGE: u64 = 1 << 1;   // For L3: this is a page entry
     pub const AF: u64 = 1 << 10;    // Access flag (must be 1)
+    pub const SH_NONE: u64 = 0 << 8;   // Non-shareable
+    pub const SH_OUTER: u64 = 2 << 8;  // Outer shareable (for DMA with bus masters)
     pub const SH_INNER: u64 = 3 << 8;  // Inner shareable
     pub const AP_RW_EL1: u64 = 0 << 6;  // Read-write at EL1 only
     pub const AP_RW_ALL: u64 = 1 << 6;  // Read-write at all ELs
@@ -56,14 +58,16 @@ pub mod flags {
 
 /// Memory attribute indices (for MAIR_EL1)
 pub mod attr {
-    pub const DEVICE: u64 = 0 << 2;  // Attr index 0: Device-nGnRnE
-    pub const NORMAL: u64 = 1 << 2;  // Attr index 1: Normal memory (cacheable)
+    pub const DEVICE: u64 = 0 << 2;     // Attr index 0: Device-nGnRnE
+    pub const NORMAL: u64 = 1 << 2;     // Attr index 1: Normal memory (cacheable)
+    pub const NORMAL_NC: u64 = 2 << 2;  // Attr index 2: Normal Non-Cacheable (for DMA buffers)
 }
 
 /// MAIR_EL1 value
-/// Attr0: Device-nGnRnE (0x00)
-/// Attr1: Normal, Write-Back (0xFF)
-const MAIR_VALUE: u64 = 0x00_00_00_00_00_00_FF_00;
+/// Attr0: Device-nGnRnE (0x00) - for MMIO registers
+/// Attr1: Normal, Write-Back (0xFF) - for regular memory
+/// Attr2: Normal, Non-Cacheable (0x44) - for DMA buffers
+const MAIR_VALUE: u64 = 0x00_00_00_00_00_44_FF_00;
 
 /// TCR_EL1 configuration
 /// - T0SZ = 16 (48-bit VA for TTBR0)
@@ -263,6 +267,7 @@ pub fn enable() {
         sctlr |= 1 << 0;   // M: Enable MMU
         sctlr |= 1 << 2;   // C: Enable data cache
         sctlr |= 1 << 12;  // I: Enable instruction cache
+        sctlr |= 1 << 26;  // UCI: Allow cache maintenance (DC CVAC, DC CIVAC) from EL0
 
         core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr);
         core::arch::asm!("isb");
