@@ -4,9 +4,17 @@
 //! IMPORTANT: This driver does NOT rely on U-Boot initialization.
 //! All clocks, resets, PHY, and xHCI must be configured from scratch.
 //!
+//! ## Architecture
+//!
+//! This driver uses the layered USB architecture:
+//! - Board: BPI-R4 specific configuration (GPIO, power)
+//! - SoC: MT7988A IPPC wrapper (clock, reset, port control)
+//! - PHY: T-PHY v2 driver (host mode configuration)
+//! - xHCI: Standard xHCI controller (portable)
+//!
+//! ## MMIO Regions
 //! - MMIO scheme for device register access
 //! - IRQ scheme for interrupt handling
-//! - Complete clock/reset, IPPC, PHY, and xHCI initialization
 
 #![no_std]
 #![no_main]
@@ -35,11 +43,11 @@ use usb::{
     msc_const as msc, scsi, Cbw, Csw, BulkContext, TransferResult,
     CBW_OFFSET, CSW_OFFSET, DATA_OFFSET,
     // Ring structures
-    Ring, EventRing, ErstEntry, RING_SIZE,
+    Ring, EventRing, ErstEntry,
     // MMIO helpers
     MmioRegion, format_mmio_url, delay_ms, delay, print_hex64, print_hex32, print_hex8,
-    // Controller helpers
-    ParsedPortsc, portsc, XhciController,
+    // Port status parsing (still needed for legacy code)
+    ParsedPortsc, portsc,
     event_completion_code, event_slot_id, event_port_id,
     completion_code, doorbell,
     // Enumeration helpers
@@ -47,9 +55,15 @@ use usb::{
     // Hub helpers
     get_hub_descriptor_setup, get_port_status_setup,
     set_port_feature_setup, clear_port_feature_setup,
-    // HAL - MediaTek MT7988A specific
-    SocHal, Mt7988aHal, mt7988a,
 };
+
+// New modular architecture imports
+use usb::board::{Board, BpiR4};
+use usb::soc::{SocUsb, Mt7988aSoc};
+use usb::phy::{PhyDriver, Mt7988aTphy};
+use usb::xhci::Controller as XhciController;
+// Legacy mt7988a constants (for IRQ, addresses still used in some places)
+use usb::mt7988a;
 
 // Module definitions now imported from usb crate
 
@@ -64,57 +78,77 @@ use usb::{
 const XHCI_MEM_SIZE: usize = 4096 * 3;  // 3 pages
 
 struct UsbDriver {
-    // xHCI controller abstraction (from library)
+    // New architecture: separate SoC and PHY drivers
+    soc: Mt7988aSoc,
+    phy: Mt7988aTphy,
+
+    // Pure xHCI controller (new modular architecture)
     xhci: XhciController,
+
     // xHCI data structures
     xhci_mem: u64,          // Virtual address of allocated xHCI memory
     xhci_phys: u64,         // Physical address of allocated xHCI memory
     cmd_ring: Option<Ring>,
     event_ring: Option<EventRing>,
+
     // IRQ support
     irq_fd: i32,            // IRQ file descriptor (-1 if not registered)
 }
 
 impl UsbDriver {
     fn new(controller_id: u32) -> Option<Self> {
-        // Create HAL for the target SoC
-        let mut hal = Mt7988aHal::new(controller_id);
+        // === Board Configuration ===
+        // Use the BPI-R4 board configuration to get addresses
+        let board = if controller_id == 0 {
+            BpiR4::ssusb0()
+        } else {
+            BpiR4::ssusb1()
+        };
 
-        // Get addresses from HAL trait
-        let mac_phys = hal.mac_base() as u64;
-        let phy_phys = hal.phy_base() as u64;
-        let phy_size = hal.phy_size();
+        let config = board.controller_config(controller_id as u8)?;
+        println!("=== {} Initialization ===", config.name);
 
-        println!("  Mapping SSUSB{} MMIO regions...", controller_id);
+        // === Create SoC Wrapper ===
+        let mut soc = board.create_soc(controller_id as u8)?;
 
         // Map MAC (xHCI + IPPC) region
-        let mac = MmioRegion::open(mac_phys, mt7988a::MAC_SIZE as u64)?;
+        println!("  Mapping MMIO regions...");
+        let mac = MmioRegion::open(config.mac_base, config.mac_size as u64)?;
         print!("    MAC+IPPC @ 0x");
-        print_hex32(mac_phys as u32);
-        println!(" -> OK (IPPC at +0x{:x})", mt7988a::IPPC_OFFSET);
-
-        // Map PHY region
-        let phy = MmioRegion::open(phy_phys, phy_size as u64)?;
-        print!("    PHY @ 0x");
-        print_hex32(phy_phys as u32);
-        print!(" size=0x");
-        print_hex32(phy_size as u32);
+        print_hex32(config.mac_base as u32);
         println!(" -> OK");
 
-        // Provide MMIO regions to the HAL
-        hal.set_mac(mac);
-        hal.set_phy(phy);
+        // Provide MAC region to SoC wrapper
+        soc.set_mac(mac.clone());
 
-        // Run SoC-specific initialization (IPPC + T-PHY)
-        if !hal.phy_init() {
-            println!("  ERROR: HAL phy_init() failed");
+        // === SoC Pre-init (IPPC) ===
+        // This initializes clocks, power, and reads port counts
+        if soc.pre_init().is_err() {
+            println!("  ERROR: SoC pre_init() failed");
             return None;
         }
 
-        // Extract xHCI controller from HAL (consumes the HAL)
-        let xhci = hal.into_controller()?;
+        // === Create PHY Driver ===
+        let mut phy = board.create_phy(controller_id as u8)?;
+
+        // Map PHY region
+        let phy_mmio = MmioRegion::open(config.phy_base, config.phy_size as u64)?;
+        print!("    PHY @ 0x");
+        print_hex32(config.phy_base as u32);
+        print!(" size=0x");
+        print_hex32(config.phy_size as u32);
+        println!(" -> OK");
+
+        // Provide PHY region to PHY driver
+        phy.set_mmio(phy_mmio.clone());
+
+        // === Create xHCI Controller ===
+        // The new Controller is pure xHCI - no vendor code
+        let xhci = XhciController::new(mac);
 
         Some(Self {
+            soc,
+            phy,
             xhci,
             xhci_mem: 0,
             xhci_phys: 0,
@@ -126,43 +160,13 @@ impl UsbDriver {
 
     // Delegate register access to XhciController methods
     #[inline(always)]
-    fn ippc_read32(&self, offset: usize) -> u32 {
-        self.xhci.ippc_read32(offset)
-    }
-
-    #[inline(always)]
-    fn ippc_write32(&self, offset: usize, value: u32) {
-        self.xhci.ippc_write32(offset, value)
-    }
-
-    #[inline(always)]
     fn op_read32(&self, offset: usize) -> u32 {
         self.xhci.op_read32(offset)
     }
 
     #[inline(always)]
-    fn op_write32(&self, offset: usize, value: u32) {
-        self.xhci.op_write32(offset, value)
-    }
-
-    #[inline(always)]
-    fn op_write64(&self, offset: usize, value: u64) {
-        self.xhci.op_write64(offset, value)
-    }
-
-    #[inline(always)]
-    fn rt_read32(&self, offset: usize) -> u32 {
-        self.xhci.rt_read32(offset)
-    }
-
-    #[inline(always)]
     fn rt_read64(&self, offset: usize) -> u64 {
         self.xhci.rt_read64(offset)
-    }
-
-    #[inline(always)]
-    fn rt_write32(&self, offset: usize, value: u32) {
-        self.xhci.rt_write32(offset, value)
     }
 
     #[inline(always)]
@@ -172,7 +176,12 @@ impl UsbDriver {
 
     #[inline(always)]
     fn ring_doorbell(&self, slot: u32, target: u32) {
-        self.xhci.ring_doorbell(slot, target)
+        self.xhci.ring_doorbell(slot as u8, target as u8)
+    }
+
+    /// Get max ports
+    fn num_ports(&self) -> u8 {
+        self.xhci.max_ports()
     }
 
     /// Set the IRQ file descriptor for interrupt-based waiting
@@ -199,16 +208,38 @@ impl UsbDriver {
         // This function only handles generic xHCI initialization.
 
         // === xHCI Capability Registers (generic xHCI) ===
-        if self.xhci.read_capabilities().is_none() {
-            println!("  ERROR: Failed to read xHCI capabilities");
-            return false;
-        }
+        let caps = match self.xhci.read_capabilities() {
+            Some(c) => c,
+            None => {
+                println!("  ERROR: Failed to read xHCI capabilities");
+                return false;
+            }
+        };
+        println!("  xHCI v{:x}.{:x}, {} ports, {} slots",
+                 caps.version >> 8, caps.version & 0xff,
+                 caps.max_ports, caps.max_slots);
 
         // Print port status before reset (for debugging)
-        self.xhci.print_port_status_before_reset();
+        println!("=== Port Status (before reset) ===");
+        self.xhci.print_all_ports();
 
         // === xHCI Halt and Reset (generic xHCI) ===
-        if !self.xhci.halt_and_reset() {
+        let (halt_ok, reset_ok) = self.xhci.halt_and_reset();
+        if !halt_ok {
+            println!("  WARNING: Controller halt timed out");
+        }
+        if !reset_ok {
+            println!("  WARNING: Controller reset timed out (may complete after PHY init)");
+        }
+
+        // === Post-reset PHY Configuration (using new layered architecture) ===
+        // Original working order: T-PHY host mode THEN USB2 PHY power, both AFTER xHCI reset
+        if self.phy.set_host_mode().is_err() {
+            println!("  ERROR: PHY set_host_mode() failed");
+            return false;
+        }
+        if self.soc.force_usb2_phy_power().is_err() {
+            println!("  ERROR: SoC force_usb2_phy_power() failed");
             return false;
         }
 
@@ -261,24 +292,42 @@ impl UsbDriver {
         self.cmd_ring = Some(Ring::init(cmd_ring_virt, cmd_ring_phys));
         println!("  Command Ring at 0x{:x}", cmd_ring_phys);
 
-        let usbsts_addr = self.xhci.mac.base + self.xhci.op_base as u64 + xhci_op::USBSTS as u64;
+        let usbsts_addr = self.xhci.mmio_base() + self.xhci.op_offset() as u64 + xhci_op::USBSTS as u64;
         self.event_ring = Some(EventRing::init(evt_ring_virt, evt_ring_phys,
                                                 erst_virt, erst_phys, usbsts_addr));
         println!("  Event Ring at 0x{:x}, ERST at 0x{:x}", evt_ring_phys, erst_phys);
 
         // === Programming xHCI Registers (generic xHCI) ===
-        // Use library methods
-        self.xhci.program_operational_registers(dcbaa_phys, cmd_ring_phys);
-        self.xhci.program_interrupter(erst_phys, evt_ring_phys);
+        // Set max enabled slots
+        self.xhci.set_max_slots(self.xhci.max_slots());
+        // Set DCBAA pointer
+        self.xhci.set_dcbaap(dcbaa_phys);
+        // Set command ring (with cycle bit = 1)
+        self.xhci.set_crcr(cmd_ring_phys, true);
+        // Program interrupter 0 with ERST
+        self.xhci.program_interrupter(0, erst_phys, 1, evt_ring_phys);
 
         // === Start Controller (generic xHCI) ===
         if !self.xhci.start() {
+            println!("  ERROR: Controller failed to start");
             return false;
         }
+        println!("  Controller started");
 
         // === Power on ports (generic xHCI) ===
-        self.xhci.power_on_ports();
-        self.xhci.wait_for_link(100000);
+        println!("  max_ports={}, mmio_base=0x{:x}, port_offset=0x{:x}",
+                 self.xhci.max_ports(), self.xhci.mmio_base(), self.xhci.port_offset());
+        self.xhci.power_on_all_ports();
+        println!("  Waiting for device connection...");
+        if self.xhci.max_ports() > 0 {
+            if let Some(port) = self.xhci.wait_for_connection(100000) {
+                println!("  Device connected on port {}", port + 1);
+            } else {
+                println!("  No device detected (timeout)");
+            }
+        } else {
+            println!("  No ports to check!");
+        }
 
         true
     }
@@ -370,18 +419,18 @@ impl UsbDriver {
 
     /// Handle port status change
     fn handle_port_change(&mut self, port_id: u32) {
-        if port_id == 0 || port_id > self.xhci.num_ports {
+        if port_id == 0 || port_id > self.xhci.max_ports() as u32 {
             return;
         }
 
-        let portsc_off = self.xhci.port_base + ((port_id - 1) as usize * 0x10) + xhci_port::PORTSC;
-        let raw = self.xhci.mac.read32(portsc_off);
+        let port = (port_id - 1) as u8;
+        let raw = self.xhci.read_portsc(port);
         let status = ParsedPortsc::from_raw(raw);
 
         // Clear status change bits by writing 1 to them (W1C)
         let clear_bits = raw & portsc::CHANGE_BITS;
         if clear_bits != 0 {
-            self.xhci.mac.write32(portsc_off, status.clear_changes_value());
+            self.xhci.write_portsc(port, status.clear_changes_value());
         }
 
         print!("    Port {}: ", port_id);
@@ -401,9 +450,8 @@ impl UsbDriver {
         println!();
         println!("=== Port Status ===");
 
-        for p in 0..self.xhci.num_ports {
-            let portsc_off = self.xhci.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
-            let raw = self.xhci.mac.read32(portsc_off);
+        for p in 0..self.xhci.max_ports() {
+            let raw = self.xhci.read_portsc(p);
             let status = ParsedPortsc::from_raw(raw);
 
             print!("  Port {}: PORTSC=0x", p + 1);
@@ -439,9 +487,8 @@ impl UsbDriver {
         let mut all_powered = true;
         let mut any_connected = false;
 
-        for p in 0..self.xhci.num_ports {
-            let portsc_off = self.xhci.port_base + (p as usize * 0x10) + xhci_port::PORTSC;
-            let raw = self.xhci.mac.read32(portsc_off);
+        for p in 0..self.xhci.max_ports() {
+            let raw = self.xhci.read_portsc(p);
             let status = ParsedPortsc::from_raw(raw);
 
             print!("  Port {}: PP={}", p + 1, if status.powered { 1 } else { 0 });
@@ -485,14 +532,14 @@ impl UsbDriver {
 
     /// Reset a port to trigger device enumeration
     fn reset_port(&self, port: u32) -> bool {
-        if port == 0 || port > self.xhci.num_ports {
+        if port == 0 || port > self.xhci.max_ports() as u32 {
             return false;
         }
 
-        let portsc_off = self.xhci.port_base + ((port - 1) as usize * 0x10) + xhci_port::PORTSC;
+        let port_idx = (port - 1) as u8;
 
         // Read current PORTSC
-        let raw = self.xhci.mac.read32(portsc_off);
+        let raw = self.xhci.read_portsc(port_idx);
         let status = ParsedPortsc::from_raw(raw);
 
         print!("  Port {}: ", port);
@@ -509,21 +556,27 @@ impl UsbDriver {
             return false;
         }
 
-        println!("device present, resetting...");
+        // Skip if port is already enabled - device is working, don't disrupt it
+        if status.enabled {
+            println!("already enabled (device working), skipping reset");
+            return true;  // Return true since device is present and working
+        }
+
+        println!("device present but not enabled, resetting...");
 
         // Set PR (Port Reset) bit, preserve PP
         let write_val = (raw & portsc::PRESERVE_MASK) | portsc::PR;
-        self.xhci.mac.write32(portsc_off, write_val);
+        self.xhci.write_portsc(port_idx, write_val);
 
         // Wait for reset to complete
         for _ in 0..100 {
             delay(10000);
-            let raw = self.xhci.mac.read32(portsc_off);
+            let raw = self.xhci.read_portsc(port_idx);
             let status = ParsedPortsc::from_raw(raw);
 
             if !status.reset && status.reset_change {
                 // Reset complete, clear PRC
-                self.xhci.mac.write32(portsc_off, raw | portsc::PRC);
+                self.xhci.write_portsc(port_idx, raw | portsc::PRC);
                 println!("    Reset complete");
                 return true;
             }
@@ -531,37 +584,6 @@ impl UsbDriver {
 
         println!("    Reset timeout");
         false
-    }
-
-    /// Drain any pending events from the event ring
-    /// This ensures the event ring is in a clean state before critical operations
-    fn drain_pending_events(&mut self) {
-        let mut count = 0u32;
-        let mut erdp_to_update: Option<u64> = None;
-
-        if let Some(ref mut event_ring) = self.event_ring {
-            loop {
-                if let Some(evt) = event_ring.dequeue() {
-                    erdp_to_update = Some(event_ring.erdp());
-                    count += 1;
-                    // Just consume the event
-                    let evt_type = evt.get_type();
-                    if evt_type != trb_type::COMMAND_COMPLETION && evt_type != trb_type::TRANSFER_EVENT {
-                        print!("    [drained event type={}]", evt_type);
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        if let Some(erdp) = erdp_to_update {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
-        }
-
-        if count > 0 {
-            println!("    Drained {} pending events", count);
-        }
     }
 
     /// Enable a slot for a new device
@@ -699,8 +721,7 @@ impl UsbDriver {
         }
 
         // Get port speed from PORTSC using library helpers
-        let portsc_off = self.xhci.port_base + ((port - 1) as usize * 0x10);
-        let raw = self.xhci.mac.read32(portsc_off);
+        let raw = self.xhci.read_portsc((port - 1) as u8);
         let status = ParsedPortsc::from_raw(raw);
         let speed = status.speed;
         let speed_raw = speed.to_slot_speed();
@@ -2295,7 +2316,7 @@ impl UsbDriver {
         let mut cmd = Trb::new();
         cmd.param = input_ctx_phys;
         cmd.status = 0;
-        cmd.control = (slot_id << 24);
+        cmd.control = slot_id << 24;
         cmd.set_type(trb_type::CONFIGURE_ENDPOINT);
 
         if let Some(ref mut cmd_ring) = self.cmd_ring {
@@ -2493,9 +2514,9 @@ impl UsbDriver {
     /// Wait for a transfer event via IRQ
     /// Returns (success, completion_code)
     fn wait_transfer_irq(&mut self, timeout_ms: u32) -> (TransferResult, u64) {
-        let mac_base = self.xhci.mac.base;
-        let rt_base = self.xhci.rt_base;
-        let op_base = self.xhci.op_base;
+        let mac_base = self.xhci.mmio_base();
+        let rt_base = self.xhci.rt_offset();
+        let op_base = self.xhci.op_offset();
 
         // Clear IMAN.IP before waiting
         unsafe {
@@ -2554,9 +2575,10 @@ impl UsbDriver {
     /// Returns (result, bytes_transferred)
     fn receive_bulk_in_irq(&mut self, ctx: &mut BulkContext, offset: usize, length: usize) -> (TransferResult, usize) {
         let phys_addr = ctx.data_phys + offset as u64;
+        let virt_addr = ctx.data_buf as u64 + offset as u64;
 
-        // Invalidate destination buffer before DMA
-        ctx.invalidate_buffer(phys_addr, length);
+        // Invalidate destination buffer before DMA (uses VIRTUAL address for cache ops)
+        ctx.invalidate_buffer(virt_addr, length);
 
         // Get current DCS from endpoint context
         let dcs = ctx.get_bulk_in_dcs();
@@ -2964,7 +2986,6 @@ fn request_vbus_enable() -> bool {
 
 use usb::{
     UsbRequest, UsbStatus, UsbMessageHeader, UsbResponseHeader,
-    BulkTransferRequest, BulkTransferResponse,
     USB_MSG_MAX_SIZE,
 };
 
@@ -3090,9 +3111,7 @@ fn main() {
     // Wait for power to stabilize after VBUS enable
     println!();
     println!("  Waiting for VBUS power stabilization...");
-    for _ in 0..100 {
-        delay(10000);  // ~100ms total
-    }
+    delay_ms(100);  // 100ms
 
     // Initialize USB clocks and deassert resets
     // This is needed when NOT relying on U-Boot
@@ -3108,13 +3127,19 @@ fn main() {
     let mut driver: Option<UsbDriver> = None;
     let mut active_controller = 0u32;
 
-    // Try SSUSB0 first, then SSUSB1
-    for ctrl in 0..=1 {
+    // Try SSUSB1 first (USB-A ports), then SSUSB0 (M.2 slot)
+    // SSUSB1 is more likely to work - it's the main USB port on BPI-R4
+    for ctrl in [1u32, 0u32] {
         println!();
         println!("--- Trying SSUSB{} ---", ctrl);
 
         if let Some(mut d) = UsbDriver::new(ctrl) {
             if d.init() {
+                // Skip controllers with no ports (not properly initialized)
+                if d.xhci.max_ports() == 0 {
+                    println!("  SSUSB{} has 0 ports - skipping (PHY not initialized?)", ctrl);
+                    continue;
+                }
                 // Check and display port power status (VBUS diagnostic)
                 d.check_power_status();
 
@@ -3124,9 +3149,8 @@ fn main() {
 
                 // Poll for up to 2 seconds for device connection
                 for attempt in 0..20 {
-                    for p in 0..d.xhci.num_ports {
-                        let portsc_off = d.xhci.port_base + (p as usize * 0x10);
-                        let portsc = d.xhci.mac.read32(portsc_off);
+                    for p in 0..d.xhci.max_ports() {
+                        let portsc = d.xhci.read_portsc(p);
 
                         if attempt == 0 || attempt == 19 {
                             // Print PORTSC on first and last attempt
@@ -3148,17 +3172,21 @@ fn main() {
                     }
 
                     // Wait 100ms between polls
-                    for _ in 0..100 {
-                        delay(1000);
-                    }
+                    delay_ms(100);
                 }
 
+                // Keep the driver even if no device found - we can monitor for hotplug
+                driver = Some(d);
+                active_controller = ctrl;
+
                 if has_device {
-                    driver = Some(d);
-                    active_controller = ctrl;
+                    println!("  Device found, using SSUSB{}", ctrl);
                     break;
                 } else {
-                    println!("  No devices found on SSUSB{} after 2s", ctrl);
+                    println!("  No devices found on SSUSB{} after 2s, but keeping driver", ctrl);
+                    // Continue to try the other controller - but only if we prefer finding a device
+                    // For now, just use the first working controller
+                    break;
                 }
             }
         } else {
@@ -3166,31 +3194,13 @@ fn main() {
         }
     }
 
-    // If no device found initially, use whichever controller initialized successfully
+    // Use whichever controller initialized successfully
     let mut driver = match driver {
         Some(d) => d,
         None => {
             println!();
-            println!("No USB devices found during initial probe");
-            println!("Will monitor SSUSB1 for device connection...");
-            active_controller = 1;
-            // Try to use SSUSB1 since its PHY works
-            match UsbDriver::new(1) {
-                Some(mut d) => {
-                    if d.init() {
-                        // Check power status in fallback case too
-                        d.check_power_status();
-                        d
-                    } else {
-                        println!("ERROR: Failed to initialize SSUSB1");
-                        syscall::exit(1);
-                    }
-                }
-                None => {
-                    println!("ERROR: Failed to map SSUSB1");
-                    syscall::exit(1);
-                }
-            }
+            println!("ERROR: No USB controller could be initialized!");
+            syscall::exit(1);
         }
     };
 
@@ -3205,7 +3215,7 @@ fn main() {
     driver.send_noop();
 
     // Poll for command completion
-    delay(10000);
+    delay_ms(10);
     driver.poll_events();
 
     // Check for any pending port status change events
@@ -3218,9 +3228,9 @@ fn main() {
     // Try port reset to detect devices
     println!();
     println!("=== Trying Port Reset ===");
-    for p in 1..=driver.xhci.num_ports {
+    for p in 1..=driver.xhci.max_ports() as u32 {
         driver.reset_port(p);
-        delay(50000);  // Wait after reset
+        delay_ms(50);  // Wait after reset
     }
 
     // Check port status again
@@ -3231,7 +3241,7 @@ fn main() {
     println!("=== Post-Reset Events ===");
     for _ in 0..5 {
         if driver.poll_events() {
-            delay(10000);
+            delay_ms(10);
         } else {
             break;
         }
@@ -3293,16 +3303,15 @@ fn main() {
 
         // Check SSUSB1 ports (using driver)
         let mut connected_port: Option<u32> = None;
-        for p in 0..driver.xhci.num_ports {
-            let portsc_off = driver.xhci.port_base + (p as usize * 0x10);
-            let portsc = driver.xhci.mac.read32(portsc_off);
+        for p in 0..driver.xhci.max_ports() {
+            let portsc = driver.xhci.read_portsc(p);
             let ccs = portsc & 1;
             if ccs != 0 {
                 print!("  [{}s] SSUSB1 Port {} CONNECTED! PORTSC=0x", round, p + 1);
                 print_hex32(portsc);
                 println!();
                 found = true;
-                connected_port = Some(p + 1);  // Ports are 1-indexed
+                connected_port = Some((p + 1) as u32);  // Ports are 1-indexed
             }
         }
 
@@ -3316,10 +3325,8 @@ fn main() {
         if round % 5 == 0 {
             println!("  [{}s] Waiting for device on either controller...", round);
         }
-        // Wait ~1 second
-        for _ in 0..1000 {
-            delay(1000);
-        }
+        // Wait 1 second
+        delay_ms(1000);
     }
 
     // Final status

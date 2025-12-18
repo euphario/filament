@@ -159,26 +159,115 @@ pub fn build_normal_trb(data_phys: u64, length: u32, ioc: bool, cycle: u32) -> T
     }
 }
 
+// =============================================================================
+// Cache Maintenance Operations (ARM64)
+// =============================================================================
+//
+// These functions handle cache coherency for DMA operations on non-coherent
+// ARM systems. The MT7988A requires explicit cache maintenance because the
+// USB controller (xHCI) uses DMA but doesn't snoop the CPU cache.
+//
+// Operations:
+// - DC CVAC (Clean by VA to PoC): Write cache line to memory
+// - DC CIVAC (Clean & Invalidate by VA to PoC): Write to memory and invalidate
+// - DSB SY (Data Synchronization Barrier): Ensure memory operations complete
+
+/// Memory barrier (data synchronization barrier - system)
+///
+/// Ensures all memory accesses (loads and stores) complete before continuing.
+/// Must be used after cache maintenance operations.
+#[inline]
+pub fn dsb() {
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Instruction synchronization barrier
+///
+/// Flushes the pipeline and ensures all previous instructions are complete.
+#[inline]
+pub fn isb() {
+    unsafe {
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+/// Flush (clean) a cache line to memory
+///
+/// Use before DMA reads (hardware reading data that CPU wrote).
+/// This ensures the data is visible to the DMA controller.
+#[inline]
+pub fn flush_cache_line(addr: u64) {
+    unsafe {
+        core::arch::asm!(
+            "dc cvac, {addr}",
+            addr = in(reg) addr,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Invalidate a cache line
+///
+/// Use before CPU reads (CPU reading data that hardware wrote via DMA).
+/// This ensures the CPU sees fresh data from memory, not stale cache.
+#[inline]
+pub fn invalidate_cache_line(addr: u64) {
+    unsafe {
+        core::arch::asm!(
+            "dc civac, {addr}",
+            addr = in(reg) addr,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Flush a buffer to memory (for DMA reads by hardware)
+///
+/// Cleans all cache lines covering the buffer and issues a barrier.
+/// Use before hardware DMA reads data that CPU wrote.
+#[inline]
+pub fn flush_buffer(addr: u64, size: usize) {
+    const CACHE_LINE: usize = 64;
+    let start = addr & !(CACHE_LINE as u64 - 1);
+    let end = (addr + size as u64 + CACHE_LINE as u64 - 1) & !(CACHE_LINE as u64 - 1);
+
+    let mut a = start;
+    while a < end {
+        flush_cache_line(a);
+        a += CACHE_LINE as u64;
+    }
+    dsb();
+}
+
+/// Invalidate a buffer from cache (for CPU reads after DMA writes)
+///
+/// Cleans and invalidates all cache lines covering the buffer and issues barriers.
+/// Use before CPU reads data that hardware wrote via DMA.
+#[inline]
+pub fn invalidate_buffer(addr: u64, size: usize) {
+    const CACHE_LINE: usize = 64;
+    let start = addr & !(CACHE_LINE as u64 - 1);
+    let end = (addr + size as u64 + CACHE_LINE as u64 - 1) & !(CACHE_LINE as u64 - 1);
+
+    dsb();
+    let mut a = start;
+    while a < end {
+        invalidate_cache_line(a);
+        a += CACHE_LINE as u64;
+    }
+    dsb();
+    isb();
+}
+
 /// Flush a TRB to memory (cache clean)
 ///
 /// # Safety
 /// The pointer must be valid and properly aligned
 #[inline]
 pub unsafe fn flush_trb(trb: *const Trb) {
-    let addr = trb as u64;
-    core::arch::asm!(
-        "dc cvac, {addr}",
-        addr = in(reg) addr,
-        options(nostack, preserves_flags)
-    );
-}
-
-/// Memory barrier (data synchronization)
-#[inline]
-pub fn dsb() {
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-    }
+    flush_cache_line(trb as u64);
 }
 
 /// Flush a range of TRBs and issue memory barrier

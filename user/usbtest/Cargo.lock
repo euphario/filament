@@ -3,9 +3,17 @@
 version = 4
 
 [[package]]
+name = "usb"
+version = "0.1.0"
+dependencies = [
+ "userlib",
+]
+
+[[package]]
 name = "usbtest"
 version = "0.1.0"
 dependencies = [
+ "usb",
  "userlib",
 ]
 

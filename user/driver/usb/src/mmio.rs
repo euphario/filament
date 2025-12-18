@@ -2,6 +2,11 @@
 
 use userlib::syscall;
 
+/// MMIO region handle
+///
+/// Note: Clone copies fd and base. Multiple clones share the same mapped region.
+/// When cloning, be aware that closing fd on one clone affects all clones.
+#[derive(Clone)]
 pub struct MmioRegion {
     pub fd: i32,
     pub base: u64,

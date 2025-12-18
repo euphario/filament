@@ -9,7 +9,7 @@
 
 use crate::trb::Trb;
 use crate::hal::XhciController;
-use crate::xhci::{xhci_cap, xhci_op, usbcmd, usbsts, xhci_rt, xhci_ir};
+use crate::xhci_regs::{xhci_cap, xhci_op, usbcmd, usbsts, xhci_rt, xhci_ir};
 use crate::mmio::{delay, print_hex32};
 use userlib::{print, println};
 
@@ -437,14 +437,22 @@ impl XhciController {
         println!("=== xHCI Reset ===");
 
         // Halt controller
-        println!("  Halting controller...");
         let cmd = self.op_read32(xhci_op::USBCMD);
+        let sts = self.op_read32(xhci_op::USBSTS);
+        print!("  Initial: USBCMD=0x");
+        print_hex32(cmd);
+        print!(" USBSTS=0x");
+        print_hex32(sts);
+        println!();
+
+        println!("  Halting controller...");
         self.op_write32(xhci_op::USBCMD, cmd & !usbcmd::RUN);
 
         // Wait for halt
-        for _ in 0..100 {
+        for i in 0..100 {
             let sts = self.op_read32(xhci_op::USBSTS);
             if (sts & usbsts::HCH) != 0 {
+                println!("  Halted after {} iterations", i);
                 break;
             }
             delay(1000);
@@ -455,6 +463,7 @@ impl XhciController {
         self.op_write32(xhci_op::USBCMD, usbcmd::HCRST);
 
         // Wait for reset complete
+        // Note: On MT7988A, reset may not complete until after PHY init
         for _ in 0..100 {
             let cmd = self.op_read32(xhci_op::USBCMD);
             let sts = self.op_read32(xhci_op::USBSTS);
@@ -465,8 +474,9 @@ impl XhciController {
             delay(1000);
         }
 
-        println!("  ERROR: Reset timeout!");
-        false
+        // Continue anyway - PHY init may be required for reset to complete
+        println!("  Reset pending (continuing with PHY init)");
+        true
     }
 
     /// Program xHCI operational registers

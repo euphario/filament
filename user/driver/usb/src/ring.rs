@@ -1,6 +1,7 @@
 //! xHCI Ring structures (Command, Transfer, Event rings)
 
 use crate::trb::{Trb, trb_type};
+use crate::transfer::{flush_cache_line, invalidate_cache_line, dsb, isb};
 
 /// Ring size (number of TRBs) - must be power of 2 for easy wrap
 pub const RING_SIZE: usize = 64;
@@ -29,16 +30,11 @@ impl Ring {
             link.set_type(trb_type::LINK);
             link.control |= 1 << 1;  // Toggle Cycle bit (TC) - bit 1, NOT bit 5 (IOC)
 
-            // U-Boot pattern: flush entire ring to memory after CPU writes
+            // Flush entire ring to memory after CPU writes (for DMA)
             for i in 0..RING_SIZE {
-                let addr = virt.add(i) as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",  // Clean by VA to PoC
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
+                flush_cache_line(virt.add(i) as u64);
             }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            dsb();
         }
 
         Self {
@@ -61,14 +57,9 @@ impl Ring {
             // Set control with our cycle bit
             dest.control = (trb.control & !1) | (self.cycle as u32);
 
-            // U-Boot pattern: flush TRB to memory after CPU writes (before hardware reads)
-            let addr = dest as *const _ as u64;
-            core::arch::asm!(
-                "dc cvac, {addr}",  // Clean by VA to PoC
-                addr = in(reg) addr,
-                options(nostack, preserves_flags)
-            );
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush TRB to memory after CPU writes (before hardware reads)
+            flush_cache_line(dest as *const _ as u64);
+            dsb();
         }
 
         let trb_phys = self.phys_addr + (idx * 16) as u64;
@@ -82,13 +73,8 @@ impl Ring {
                 link.set_cycle(self.cycle);
 
                 // Flush the link TRB too
-                let addr = link as *const _ as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
-                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                flush_cache_line(link as *const _ as u64);
+                dsb();
             }
             self.cycle = !self.cycle;
             self.enqueue = 0;
@@ -129,17 +115,11 @@ impl EventRing {
                 *trbs_virt.add(i) = Trb::new();
             }
 
-            // U-Boot pattern: flush TRBs to memory after CPU writes (before hardware reads)
-            // Flush entire event ring (64 TRBs * 16 bytes = 1024 bytes)
+            // Flush entire event ring to memory (for DMA)
             for i in 0..RING_SIZE {
-                let addr = trbs_virt.add(i) as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",  // Clean by VA to PoC
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
+                flush_cache_line(trbs_virt.add(i) as u64);
             }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            dsb();
 
             // Set up ERST with single segment
             let erst = &mut *erst_virt;
@@ -148,13 +128,8 @@ impl EventRing {
             erst._reserved = 0;
 
             // Flush ERST to memory
-            let erst_addr = erst_virt as u64;
-            core::arch::asm!(
-                "dc cvac, {addr}",
-                addr = in(reg) erst_addr,
-                options(nostack, preserves_flags)
-            );
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            flush_cache_line(erst_virt as u64);
+            dsb();
         }
 
         Self {
@@ -169,22 +144,16 @@ impl EventRing {
     }
 
     /// Dequeue an event TRB (returns None if no event pending)
-    /// U-Boot pattern: invalidate cache before CPU reads from DMA buffer
+    /// Invalidate cache before CPU reads from DMA buffer
     pub fn dequeue(&mut self) -> Option<Trb> {
         unsafe {
             let target = self.dequeue;
             let ptr = self.trbs.add(target);
 
-            // DC CIVAC directly on the TRB address (not cache-line aligned)
-            // This is exactly what the diagnostic scan does
-            let trb_addr = ptr as u64;
-            core::arch::asm!(
-                "dc civac, {addr}",
-                addr = in(reg) trb_addr,
-                options(nostack, preserves_flags)
-            );
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-            core::arch::asm!("isb", options(nostack, preserves_flags));
+            // Invalidate cache before reading DMA data
+            invalidate_cache_line(ptr as u64);
+            dsb();
+            isb();
 
             // Now read the TRB as a single struct
             let trb = core::ptr::read_volatile(ptr);
@@ -225,14 +194,10 @@ impl EventRing {
             print(": raw=");
             print_hex64(trb1.get_type() as u64);
 
-            // Step 2: DC CIVAC then read
-            core::arch::asm!(
-                "dc civac, {addr}",
-                addr = in(reg) trb_addr,
-                options(nostack, preserves_flags)
-            );
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-            core::arch::asm!("isb", options(nostack, preserves_flags));
+            // Step 2: Invalidate then read
+            invalidate_cache_line(trb_addr);
+            dsb();
+            isb();
             let trb2 = core::ptr::read_volatile(ptr);
             print(", civac=");
             print_hex64(trb2.get_type() as u64);

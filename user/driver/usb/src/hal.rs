@@ -113,6 +113,99 @@ impl XhciController {
         }
     }
 
+    /// Configure T-PHY for host mode (MediaTek specific)
+    ///
+    /// This must be called AFTER xHCI reset.
+    /// Sets host mode bits in the T-PHY DTM1 register.
+    pub fn configure_tphy_host_mode(&self) {
+        use crate::phy_regs::tphy;
+        use crate::mmio::{delay, print_hex32};
+        use userlib::{print, println};
+
+        let phy = match &self.phy {
+            Some(p) => p,
+            None => return,
+        };
+
+        println!();
+        println!("=== PHY Initialization ===");
+
+        let phy_name = if self.id.index == 0 { "XFI T-PHY" } else { "T-PHY v2" };
+        println!("  Configuring {} for host mode...", phy_name);
+
+        // T-PHY v2 has USB2 PHY at COM bank offset 0x300
+        let offsets_to_try: &[(usize, &str)] = &[
+            (0x300, "COM+0x300"),
+            (0x000, "base+0x000"),
+            (0x100, "base+0x100"),
+            (0x400, "base+0x400"),
+        ];
+
+        let mut found_offset: Option<usize> = None;
+        for &(base_off, name) in offsets_to_try {
+            let dtm1_off = base_off + 0x6C;
+            let dtm1 = phy.read32(dtm1_off);
+            if dtm1 != 0 || base_off == 0x300 {
+                print!("    {} DTM1@0x{:x}=0x", name, dtm1_off);
+                print_hex32(dtm1);
+                println!();
+                if found_offset.is_none() {
+                    found_offset = Some(base_off);
+                }
+            }
+        }
+
+        let com_offset = found_offset.unwrap_or(0x300);
+        let dtm1_offset = com_offset + 0x6C;
+
+        let dtm1 = phy.read32(dtm1_offset);
+        print!("    Using offset 0x{:x}, DTM1 before: 0x", dtm1_offset);
+        print_hex32(dtm1);
+        println!();
+
+        // Set host mode bits
+        let new_dtm1 = dtm1 | tphy::HOST_MODE;
+        phy.write32(dtm1_offset, new_dtm1);
+
+        delay(1000);
+
+        let dtm1_after = phy.read32(dtm1_offset);
+        print!("    After:  DTM1=0x");
+        print_hex32(dtm1_after);
+        if dtm1_after != dtm1 {
+            println!(" (host mode configured)");
+        } else {
+            println!(" (WARNING: register unchanged!)");
+        }
+    }
+
+    /// Force USB2 PHY power on (MediaTek specific)
+    ///
+    /// This must be called AFTER xHCI reset for proper device detection.
+    /// Sets bit 0 of U2_PHY_PLL IPPC register.
+    pub fn force_usb2_phy_power(&self) {
+        use crate::phy_regs::ippc;
+        use crate::mmio::{delay, print_hex32};
+        use userlib::{print, println};
+
+        if self.ippc_offset.is_none() {
+            return;
+        }
+
+        println!();
+        println!("=== Forcing USB2 PHY Power ===");
+        let pll = self.ippc_read32(ippc::U2_PHY_PLL);
+        print!("  U2_PHY_PLL before: 0x");
+        print_hex32(pll);
+        println!();
+        self.ippc_write32(ippc::U2_PHY_PLL, pll | 1);  // Set bit 0 to force power on
+        delay(1000);
+        let pll_after = self.ippc_read32(ippc::U2_PHY_PLL);
+        print!("  U2_PHY_PLL after:  0x");
+        print_hex32(pll_after);
+        println!(" (PHY power forced on)");
+    }
+
     /// Read operational register
     #[inline]
     pub fn op_read32(&self, offset: usize) -> u32 {
@@ -199,7 +292,7 @@ impl XhciController {
 /// MT7988A SSUSB controller configuration and HAL
 pub mod mt7988a {
     use super::{SocHal, XhciController, ControllerId, MmioRegion};
-    use crate::phy::{ippc, tphy};
+    use crate::phy_regs::ippc;
     use crate::mmio::{delay, print_hex32};
     use userlib::{print, println};
 
@@ -346,88 +439,6 @@ pub mod mt7988a {
             Some((u3_ports, u2_ports))
         }
 
-        /// Initialize T-PHY for host mode - MediaTek specific
-        ///
-        /// Sets up the USB2 PHY for host mode by configuring VBUS and session signals.
-        pub fn tphy_init(&mut self) -> bool {
-            let phy = match &self.phy {
-                Some(p) => p,
-                None => return false,
-            };
-
-            println!();
-            println!("=== PHY Initialization ===");
-
-            // T-PHY v2 has USB2 PHY at COM bank offset 0x300
-            // Try multiple offsets to find the right one
-            let offsets_to_try: &[(usize, &str)] = &[
-                (0x300, "COM+0x300"),      // Standard T-PHY v2 COM bank
-                (0x000, "base+0x000"),     // Direct offset
-                (0x100, "base+0x100"),     // Alternative
-                (0x400, "base+0x400"),     // Another alternative
-            ];
-
-            let phy_name = if self.controller_id == 0 { "XFI T-PHY" } else { "T-PHY v2" };
-            println!("  Configuring {} for host mode...", phy_name);
-
-            // Scan for valid PHY registers (non-zero reads indicate valid registers)
-            let mut found_offset: Option<usize> = None;
-            for &(base_off, name) in offsets_to_try {
-                let dtm1_off = base_off + 0x6C;
-                let dtm1 = phy.read32(dtm1_off);
-                if dtm1 != 0 || base_off == 0x300 {
-                    // Either we read non-zero, or try the standard offset
-                    print!("    {} DTM1@0x{:x}=0x", name, dtm1_off);
-                    print_hex32(dtm1);
-                    println!();
-                    if found_offset.is_none() {
-                        found_offset = Some(base_off);
-                    }
-                }
-            }
-
-            // Use the found offset or default to standard T-PHY layout
-            let com_offset = found_offset.unwrap_or(0x300);
-            let dtm1_offset = com_offset + 0x6C;
-
-            let dtm1 = phy.read32(dtm1_offset);
-            print!("    Using offset 0x{:x}, DTM1 before: 0x", dtm1_offset);
-            print_hex32(dtm1);
-            println!();
-
-            // Set host mode bits: force vbusvalid/avalid, set vbusvalid/avalid
-            let new_dtm1 = dtm1 | tphy::HOST_MODE;
-            phy.write32(dtm1_offset, new_dtm1);
-
-            delay(1000);
-
-            let dtm1_after = phy.read32(dtm1_offset);
-            print!("    After:  DTM1=0x");
-            print_hex32(dtm1_after);
-            if dtm1_after != dtm1 {
-                println!(" (host mode configured)");
-            } else {
-                println!(" (WARNING: register unchanged!)");
-            }
-
-            // Force USB2 PHY power on via IPPC U2_PHY_PLL register
-            // This is critical for device detection!
-            println!();
-            println!("=== Forcing USB2 PHY Power ===");
-            let pll = self.ippc_read32(ippc::U2_PHY_PLL);
-            print!("  U2_PHY_PLL before: 0x");
-            print_hex32(pll);
-            println!();
-            self.ippc_write32(ippc::U2_PHY_PLL, pll | 1);  // Set bit 0 to force power on
-            delay(1000);
-            let pll_after = self.ippc_read32(ippc::U2_PHY_PLL);
-            print!("  U2_PHY_PLL after:  0x");
-            print_hex32(pll_after);
-            println!(" (PHY power forced on)");
-
-            true
-        }
-
         /// Create an XhciController from this HAL (after init)
         ///
         /// Call this after IPPC and PHY initialization to get an XhciController
@@ -495,11 +506,9 @@ pub mod mt7988a {
         }
 
         fn phy_init(&mut self) -> bool {
-            // First do IPPC init, then PHY init
-            if self.ippc_init().is_none() {
-                return false;
-            }
-            self.tphy_init()
+            // Only IPPC init here - this must complete before xHCI can be accessed
+            // T-PHY host mode and USB2 PHY power are done AFTER xHCI reset
+            self.ippc_init().is_some()
         }
 
         fn apply_quirks(&mut self) {

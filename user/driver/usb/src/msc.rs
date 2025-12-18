@@ -373,6 +373,8 @@ impl BulkContext {
 
     /// Get current DCS (Dequeue Cycle State) for bulk IN endpoint from device context
     pub fn get_bulk_in_dcs(&self) -> u32 {
+        use crate::transfer::{invalidate_cache_line, dsb, isb};
+
         unsafe {
             let dev_ctx = &*self.device_ctx;
             let bulk_in_idx = (self.bulk_in_dci - 1) as usize;
@@ -380,30 +382,23 @@ impl BulkContext {
 
             // Invalidate cache before reading
             let ctx_addr = bulk_in_ctx as *const _ as u64;
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-            core::arch::asm!("dc civac, {}", in(reg) ctx_addr, options(nostack));
-            core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+            dsb();
+            invalidate_cache_line(ctx_addr);
+            dsb();
+            isb();
 
             (core::ptr::read_volatile(&bulk_in_ctx.dw2) & 1) as u32
         }
     }
 
     /// Flush a buffer to main memory (for DMA)
-    pub fn flush_buffer(&self, addr: u64, _size: usize) {
-        unsafe {
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-            core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack));
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-        }
+    pub fn flush_buffer(&self, addr: u64, size: usize) {
+        crate::transfer::flush_buffer(addr, size);
     }
 
     /// Invalidate a buffer from cache (before reading DMA data)
-    pub fn invalidate_buffer(&self, addr: u64, _size: usize) {
-        unsafe {
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-            core::arch::asm!("dc civac, {}", in(reg) addr, options(nostack));
-            core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
-        }
+    pub fn invalidate_buffer(&self, addr: u64, size: usize) {
+        crate::transfer::invalidate_buffer(addr, size);
     }
 
     /// Get next tag and increment
