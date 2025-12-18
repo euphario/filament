@@ -6,9 +6,11 @@
 
 pub mod syscall;
 pub mod io;
+pub mod ring;
 
 pub use syscall::*;
 pub use io::{Stdout, Stdin, Stderr};
+pub use ring::{Ring, BlockRing, BlockRequest, BlockResponse};
 
 // Entry point - called by _start
 unsafe extern "Rust" {

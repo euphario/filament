@@ -24,6 +24,7 @@ mod process;
 mod ramfs;
 mod scheme;
 mod sd;
+mod shmem;
 mod smp;
 mod syscall;
 mod task;
@@ -114,6 +115,9 @@ pub extern "C" fn kmain() -> ! {
     println!("[OK] PMM initialized");
     pmm::print_info();
     pmm::test();
+
+    // Initialize shared memory subsystem
+    shmem::init();
 
     // Test address space management
     println!();

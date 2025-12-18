@@ -99,6 +99,18 @@ pub enum SyscallNumber {
     Reset = 37,
     /// Seek to position in file descriptor
     Lseek = 38,
+    /// Create shared memory region
+    ShmemCreate = 39,
+    /// Map existing shared memory region
+    ShmemMap = 40,
+    /// Allow another process to map shared memory
+    ShmemAllow = 41,
+    /// Wait for shared memory notification
+    ShmemWait = 42,
+    /// Notify shared memory waiters
+    ShmemNotify = 43,
+    /// Destroy shared memory region
+    ShmemDestroy = 44,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -145,6 +157,12 @@ impl From<u64> for SyscallNumber {
             36 => SyscallNumber::MmapDma,
             37 => SyscallNumber::Reset,
             38 => SyscallNumber::Lseek,
+            39 => SyscallNumber::ShmemCreate,
+            40 => SyscallNumber::ShmemMap,
+            41 => SyscallNumber::ShmemAllow,
+            42 => SyscallNumber::ShmemWait,
+            43 => SyscallNumber::ShmemNotify,
+            44 => SyscallNumber::ShmemDestroy,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -263,6 +281,12 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::MmapDma => sys_mmap_dma(args.arg0 as usize, args.arg1),
         SyscallNumber::Reset => sys_reset(),
         SyscallNumber::Lseek => sys_lseek(args.arg0 as u32, args.arg1 as i64, args.arg2 as u32),
+        SyscallNumber::ShmemCreate => sys_shmem_create(args.arg0 as usize, args.arg1, args.arg2),
+        SyscallNumber::ShmemMap => sys_shmem_map(args.arg0 as u32, args.arg1, args.arg2),
+        SyscallNumber::ShmemAllow => sys_shmem_allow(args.arg0 as u32, args.arg1 as u32),
+        SyscallNumber::ShmemWait => sys_shmem_wait(args.arg0 as u32, args.arg1 as u32),
+        SyscallNumber::ShmemNotify => sys_shmem_notify(args.arg0 as u32),
+        SyscallNumber::ShmemDestroy => sys_shmem_destroy(args.arg0 as u32),
         SyscallNumber::Invalid => {
             println!("[SYSCALL] Invalid syscall number: {}", args.num);
             SyscallError::NotImplemented as i64
@@ -1536,4 +1560,134 @@ pub fn test() {
     println!("    Address validation: OK");
 
     println!("    [OK] Syscall infrastructure ready");
+}
+
+// =============================================================================
+// Shared Memory Syscalls
+// =============================================================================
+
+/// Create a new shared memory region
+/// Args: size, vaddr_ptr, paddr_ptr
+/// Returns: shmem_id on success, negative error on failure
+fn sys_shmem_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
+    if size == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Validate output pointers
+    if vaddr_ptr != 0 {
+        if let Err(e) = uaccess::validate_user_write(vaddr_ptr, core::mem::size_of::<u64>()) {
+            return uaccess_to_errno(e);
+        }
+    }
+    if paddr_ptr != 0 {
+        if let Err(e) = uaccess::validate_user_write(paddr_ptr, core::mem::size_of::<u64>()) {
+            return uaccess_to_errno(e);
+        }
+    }
+
+    let caller_pid = current_pid();
+
+    match crate::shmem::create(caller_pid, size) {
+        Ok((shmem_id, vaddr, paddr)) => {
+            // Write output values
+            if vaddr_ptr != 0 {
+                if let Err(e) = uaccess::put_user::<u64>(vaddr_ptr, vaddr) {
+                    return uaccess_to_errno(e);
+                }
+            }
+            if paddr_ptr != 0 {
+                if let Err(e) = uaccess::put_user::<u64>(paddr_ptr, paddr) {
+                    return uaccess_to_errno(e);
+                }
+            }
+            shmem_id as i64
+        }
+        Err(e) => e,
+    }
+}
+
+/// Map an existing shared memory region
+/// Args: shmem_id, vaddr_ptr, paddr_ptr
+/// Returns: 0 on success, negative error on failure
+fn sys_shmem_map(shmem_id: u32, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
+    // Validate output pointers
+    if vaddr_ptr != 0 {
+        if let Err(e) = uaccess::validate_user_write(vaddr_ptr, core::mem::size_of::<u64>()) {
+            return uaccess_to_errno(e);
+        }
+    }
+    if paddr_ptr != 0 {
+        if let Err(e) = uaccess::validate_user_write(paddr_ptr, core::mem::size_of::<u64>()) {
+            return uaccess_to_errno(e);
+        }
+    }
+
+    let caller_pid = current_pid();
+
+    match crate::shmem::map(caller_pid, shmem_id) {
+        Ok((vaddr, paddr)) => {
+            // Write output values
+            if vaddr_ptr != 0 {
+                if let Err(e) = uaccess::put_user::<u64>(vaddr_ptr, vaddr) {
+                    return uaccess_to_errno(e);
+                }
+            }
+            if paddr_ptr != 0 {
+                if let Err(e) = uaccess::put_user::<u64>(paddr_ptr, paddr) {
+                    return uaccess_to_errno(e);
+                }
+            }
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+/// Allow another process to map shared memory
+/// Args: shmem_id, peer_pid
+/// Returns: 0 on success, negative error on failure
+fn sys_shmem_allow(shmem_id: u32, peer_pid: u32) -> i64 {
+    let caller_pid = current_pid();
+
+    match crate::shmem::allow(caller_pid, shmem_id, peer_pid) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// Wait for shared memory notification
+/// Args: shmem_id, timeout_ms
+/// Returns: 0 on notify, negative error on failure/timeout
+fn sys_shmem_wait(shmem_id: u32, timeout_ms: u32) -> i64 {
+    let caller_pid = current_pid();
+
+    match crate::shmem::wait(caller_pid, shmem_id, timeout_ms) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// Notify shared memory waiters
+/// Args: shmem_id
+/// Returns: number of waiters woken, or negative error
+fn sys_shmem_notify(shmem_id: u32) -> i64 {
+    let caller_pid = current_pid();
+
+    match crate::shmem::notify(caller_pid, shmem_id) {
+        Ok(woken) => woken as i64,
+        Err(e) => e,
+    }
+}
+
+/// Destroy a shared memory region
+/// Args: shmem_id
+/// Returns: 0 on success, negative error on failure
+fn sys_shmem_destroy(shmem_id: u32) -> i64 {
+    let caller_pid = current_pid();
+
+    match crate::shmem::destroy(caller_pid, shmem_id) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }

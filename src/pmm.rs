@@ -210,6 +210,17 @@ pub fn free_pages(addr: usize, count: usize) {
     unsafe { (*core::ptr::addr_of_mut!(PMM)).free_pages(addr, count) }
 }
 
+/// Allocate contiguous physical pages (alias for alloc_pages)
+/// For shared memory / DMA buffers that need physical contiguity
+pub fn alloc_contiguous(count: usize) -> Option<usize> {
+    alloc_pages(count)
+}
+
+/// Free contiguous physical pages (alias for free_pages)
+pub fn free_contiguous(addr: usize, count: usize) {
+    free_pages(addr, count)
+}
+
 /// Get free page count
 pub fn free_count() -> usize {
     unsafe { (*core::ptr::addr_of!(PMM)).free_count() }

@@ -12,7 +12,7 @@ mkdir -p bin
 # List of programs to build (name:path pairs, path defaults to name if not specified)
 # Note: usbd replaces usbtest as the main USB daemon
 # msc: Mass Storage Class driver (communicates with usbd via IPC)
-PROGRAMS="shell gpio usbd:driver/usbd msc:driver/msc fatfs:driver/fatfs"
+PROGRAMS="shell gpio usbd:driver/usbd msc:driver/msc fatfs:driver/fatfs usbd2:driver/usbd2 fatfs2:driver/fatfs2"
 
 # Build each program
 for entry in $PROGRAMS; do

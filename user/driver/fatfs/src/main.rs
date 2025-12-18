@@ -1,7 +1,7 @@
 //! FAT Filesystem Driver
 //!
 //! Userspace FAT12/16/32 filesystem driver that reads from USB mass storage
-//! via IPC to usbd.
+//! via ring buffers to usbd.
 
 #![no_std]
 #![no_main]
@@ -9,11 +9,9 @@
 use userlib::{println, print, syscall};
 
 mod fat;
-mod block;
 
 use fat::{FatFilesystem, FatType};
-use block::BlockDevice;
-// Use USB library's BlockClient for zero-copy DMA access
+// Use USB library's BlockClient for ring buffer access
 use usb::BlockClient;
 
 // Entry point
@@ -21,17 +19,16 @@ use usb::BlockClient;
 fn main() {
     println!("[fatfs] FAT filesystem driver starting...");
 
-    // Connect to usbd via "usb" port
-    let usb_channel = syscall::port_connect(b"usb");
-    if usb_channel < 0 {
-        println!("[fatfs] ERROR: Failed to connect to usb port: {}", usb_channel);
-        syscall::exit(1);
-    }
-    let usb_channel = usb_channel as u32;
-    println!("[fatfs] Connected to usbd on channel {}", usb_channel);
-
-    // Create block device client
-    let mut block = BlockDevice::new(usb_channel);
+    // Connect to usbd via "usb" port using ring buffer protocol
+    println!("[fatfs] Connecting to usbd...");
+    let mut block = match BlockClient::connect(b"usb") {
+        Some(b) => b,
+        None => {
+            println!("[fatfs] ERROR: Failed to connect to usbd");
+            syscall::exit(1);
+        }
+    };
+    println!("[fatfs] Connected via ring buffer (data buffer: {} bytes)", block.buffer_size());
 
     // Get block device info (retry if device not ready yet)
     println!("[fatfs] Waiting for block device...");
@@ -56,10 +53,11 @@ fn main() {
 
     // Read sector 0 (could be MBR or FAT boot sector)
     let mut sector0 = [0u8; 512];
-    if !block.read_sector(0, &mut sector0) {
+    if block.read_sector(0).is_none() {
         println!("[fatfs] ERROR: Failed to read sector 0");
         syscall::exit(1);
     }
+    sector0.copy_from_slice(&block.data()[..512]);
 
     // Check if this is an MBR (partition table) or direct FAT boot sector
     // FAT boot sector starts with jump: EB xx 90 or E9 xx xx
@@ -130,10 +128,11 @@ fn main() {
     if partition_start == 0 {
         boot_sector.copy_from_slice(&sector0);
     } else {
-        if !block.read_sector(partition_start, &mut boot_sector) {
+        if block.read_sector(partition_start).is_none() {
             println!("[fatfs] ERROR: Failed to read FAT boot sector at LBA {}", partition_start);
             syscall::exit(1);
         }
+        boot_sector.copy_from_slice(&block.data()[..512]);
     }
 
     // Parse FAT filesystem
@@ -164,114 +163,78 @@ fn main() {
     println!("[fatfs] Root directory:");
     list_root_directory(&fs, &mut block);
 
-    // Write performance test (IPC copy mode)
-    println!("[fatfs] Running write performance test (IPC copy)...");
-    write_performance_test(&mut block, block_count);
-
-    // Zero-copy DMA performance test
-    println!("[fatfs] Running zero-copy DMA performance test...");
-    dma_performance_test(usb_channel, block_count);
+    // Read performance test (now uses ring buffer / DMA)
+    println!("[fatfs] Running read performance test...");
+    read_performance_test(&mut block, block_count);
 
     println!("[fatfs] Done.");
     syscall::exit(0);
 }
 
-/// Simple write performance test
-/// Writes sectors to a safe location that won't corrupt filesystem
-fn write_performance_test(block: &mut BlockDevice, _block_count: u64) {
-    // Use LBA 1000 - safe zone that avoids:
-    // - Sector 0 (MBR)
-    // - Partition start (usually 2048+)
-    // NOTE: Don't use "near end of device" - fake capacity drives report
-    // wrong size and writes to non-existent sectors can corrupt data!
-    let test_lba = 1000u64;
-
-    // Create test pattern
-    let mut test_sector = [0u8; 512];
-    for i in 0..512 {
-        test_sector[i] = (i & 0xFF) as u8;
-    }
-
-    // Get timer frequency for timing
+/// Read performance test using ring buffer / DMA
+fn read_performance_test(block: &mut BlockClient, _block_count: u64) {
+    // Get timer frequency
     let freq: u64;
     unsafe {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
     }
 
-    // Write test: 1000 sectors (512KB) sequentially
-    let write_count = 1000u32;
-    println!("[fatfs] Writing {} sectors ({} KB) starting at LBA {}...",
-        write_count, write_count / 2, test_lba);
+    // Test read with different sector counts
+    let test_lba = 1000u64;  // Safe test location
+    let test_sizes = [1u32, 4, 8, 16, 32, 64];
+    let iterations = 100u32;
 
-    let start: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
-    }
+    println!("[fatfs] === Ring Buffer Read Performance ===");
+    for &sectors in &test_sizes {
+        let start: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
+        }
 
-    let mut success_count = 0u32;
-    for i in 0..write_count {
-        // Modify test pattern slightly for each sector
-        test_sector[0] = (i & 0xFF) as u8;
-        test_sector[1] = ((i >> 8) & 0xFF) as u8;
-        test_sector[510] = (i & 0xFF) as u8;
-        test_sector[511] = ((i >> 8) & 0xFF) as u8;
+        let mut success = 0u32;
+        for _ in 0..iterations {
+            if block.read(test_lba, sectors).is_some() {
+                success += 1;
+            }
+        }
 
-        if block.write_sector(test_lba + i as u64, &test_sector) {
-            success_count += 1;
+        let end: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) end);
+        }
+
+        let elapsed_ticks = end - start;
+        let elapsed_us = (elapsed_ticks * 1_000_000) / freq;
+        let bytes_transferred = (success as u64) * (sectors as u64) * 512;
+
+        if elapsed_us > 0 && success > 0 {
+            let kb_per_sec = (bytes_transferred * 1_000_000) / (elapsed_us * 1024);
+            println!("[fatfs]   Read {}x{}: {}/{} OK, {} KB/s",
+                sectors, iterations, success, iterations, kb_per_sec);
         } else {
-            println!("[fatfs]   Write failed at sector {}", i);
-            break;
+            println!("[fatfs]   Read {}x{}: {}/{} OK",
+                sectors, iterations, success, iterations);
         }
     }
 
-    let end: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) end);
-    }
-
-    let elapsed_ticks = end - start;
-    let elapsed_us = (elapsed_ticks * 1_000_000) / freq;
-    let bytes_written = (success_count as u64) * 512;
-
-    println!("[fatfs] Write test complete:");
-    println!("[fatfs]   Sectors written: {}/{}", success_count, write_count);
-    println!("[fatfs]   Time: {} ms", elapsed_us / 1000);
-    if elapsed_us > 0 {
-        let bytes_per_sec = (bytes_written * 1_000_000) / elapsed_us;
-        println!("[fatfs]   Throughput: {} KB/s ({} MB/s)",
-            bytes_per_sec / 1024, bytes_per_sec / (1024 * 1024));
-    }
-
-    // Verify a sample of the written data (every 100th sector)
-    println!("[fatfs] Verifying sample of written data...");
-    let mut verify_sector = [0u8; 512];
-    let mut verify_ok = true;
-    let mut verified_count = 0u32;
-
-    for i in (0..success_count).step_by(100) {
-        if !block.read_sector(test_lba + i as u64, &mut verify_sector) {
-            println!("[fatfs]   Read failed at sector {}", i);
-            verify_ok = false;
-            break;
+    // Verify we can read actual data
+    println!("[fatfs] Verifying read data...");
+    if let Some(bytes) = block.read(0, 1) {
+        // Check for MBR signature or FAT boot sector
+        let data = block.data();
+        let sig0 = data[510];
+        let sig1 = data[511];
+        if sig0 == 0x55 && sig1 == 0xAA {
+            println!("[fatfs]   Read {} bytes, MBR/boot signature OK!", bytes);
+        } else {
+            println!("[fatfs]   Read {} bytes (sig: {:02x} {:02x})", bytes, sig0, sig1);
         }
-
-        // Check expected pattern
-        let expected_lo = (i & 0xFF) as u8;
-        let expected_hi = ((i >> 8) & 0xFF) as u8;
-        if verify_sector[0] != expected_lo || verify_sector[1] != expected_hi ||
-           verify_sector[510] != expected_lo || verify_sector[511] != expected_hi {
-            println!("[fatfs]   Verify mismatch at sector {}", i);
-            verify_ok = false;
-        }
-        verified_count += 1;
-    }
-
-    if verify_ok && verified_count > 0 {
-        println!("[fatfs] Verified {} samples - all passed!", verified_count);
+    } else {
+        println!("[fatfs]   Read failed!");
     }
 }
 
-fn list_root_directory(fs: &FatFilesystem, block: &mut BlockDevice) {
+fn list_root_directory(fs: &FatFilesystem, block: &mut BlockClient) {
     let mut sector_buf = [0u8; 512];
 
     // For FAT12/16, root directory is at a fixed location
@@ -286,10 +249,11 @@ fn list_root_directory(fs: &FatFilesystem, block: &mut BlockDevice) {
     println!("[fatfs] Reading root directory at sector {}", root_start_sector);
 
     // Read first sector of root directory
-    if !block.read_sector(root_start_sector as u64, &mut sector_buf) {
+    if block.read_sector(root_start_sector as u64).is_none() {
         println!("  (failed to read root directory)");
         return;
     }
+    sector_buf.copy_from_slice(&block.data()[..512]);
 
     // Parse directory entries (32 bytes each)
     for i in 0..16 {
@@ -341,76 +305,3 @@ fn list_root_directory(fs: &FatFilesystem, block: &mut BlockDevice) {
     }
 }
 
-/// Zero-copy DMA performance test using USB library's BlockClient
-/// Compares read performance using DMA (zero-copy) vs IPC (with data copy)
-fn dma_performance_test(channel: u32, _block_count: u64) {
-    // Create BlockClient from USB library (handles DMA internally)
-    let mut block_client = match BlockClient::from_channel(channel) {
-        Some(b) => b,
-        None => {
-            println!("[fatfs] Failed to create BlockClient");
-            return;
-        }
-    };
-    println!("[fatfs] BlockClient created (DMA buffer: {} bytes)", block_client.buffer_size());
-
-    // Get timer frequency
-    let freq: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
-    }
-
-    // Test read with different sector counts
-    let test_lba = 1000u64;  // Safe test location
-    let test_sizes = [1u32, 4, 8, 16, 32, 64];
-    let iterations = 100u32;
-
-    println!("[fatfs] === Zero-Copy DMA Read Performance (via USB lib) ===");
-    for &sectors in &test_sizes {
-        let start: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
-        }
-
-        let mut success = 0u32;
-        for _ in 0..iterations {
-            if block_client.read(test_lba, sectors).is_some() {
-                success += 1;
-            }
-        }
-
-        let end: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, cntpct_el0", out(reg) end);
-        }
-
-        let elapsed_ticks = end - start;
-        let elapsed_us = (elapsed_ticks * 1_000_000) / freq;
-        let bytes_transferred = (success as u64) * (sectors as u64) * 512;
-
-        if elapsed_us > 0 && success > 0 {
-            let kb_per_sec = (bytes_transferred * 1_000_000) / (elapsed_us * 1024);
-            println!("[fatfs]   DMA Read {}x{}: {}/{} OK, {} KB/s",
-                sectors, iterations, success, iterations, kb_per_sec);
-        } else {
-            println!("[fatfs]   DMA Read {}x{}: {}/{} OK",
-                sectors, iterations, success, iterations);
-        }
-    }
-
-    // Verify we can read actual data
-    println!("[fatfs] Verifying DMA read data...");
-    if let Some(bytes) = block_client.read(0, 1) {
-        // Check for MBR signature or FAT boot sector
-        let data = block_client.data();
-        let sig0 = data[510];
-        let sig1 = data[511];
-        if sig0 == 0x55 && sig1 == 0xAA {
-            println!("[fatfs]   Read {} bytes, MBR/boot signature OK!", bytes);
-        } else {
-            println!("[fatfs]   Read {} bytes (sig: {:02x} {:02x})", bytes, sig0, sig1);
-        }
-    } else {
-        println!("[fatfs]   DMA read failed!");
-    }
-}

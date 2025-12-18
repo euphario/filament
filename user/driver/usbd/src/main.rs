@@ -20,6 +20,7 @@
 #![no_main]
 
 use userlib::{println, print, syscall};
+use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 
 // Import from the usb driver library
 use usb::{
@@ -2911,6 +2912,14 @@ impl UsbDriver {
         None
     }
 
+    /// Write blocks directly from client's DMA buffer (zero-copy)
+    /// Returns bytes written on success
+    fn block_write_dma(&mut self, _lba: u64, _count: u32, _source_phys: u64) -> Option<usize> {
+        // TODO: Implement SCSI WRITE(10) with DMA from source buffer
+        // For now, return error - we'll implement this when needed
+        None
+    }
+
     /// Get block device info
     fn get_block_info(&self) -> Option<(u32, u64)> {
         self.msc_device.as_ref().map(|msc| (msc.block_size, msc.block_count))
@@ -3081,12 +3090,179 @@ use usb::{
     BlockWriteDmaRequest, BlockWriteDmaResponse,
 };
 
-/// Connected IPC client
+/// Ring buffer client for block device operations
+/// Uses shared ring buffers for high-performance zero-copy transfers
+struct RingClient {
+    channel: u32,
+    ring: Option<BlockRing>,
+    client_pid: u32,
+    msg_buf: [u8; 64],
+}
+
+impl RingClient {
+    /// Create a new ring client from an accepted channel
+    fn new(channel: u32) -> Self {
+        Self {
+            channel,
+            ring: None,
+            client_pid: 0,
+            msg_buf: [0u8; 64],
+        }
+    }
+
+    /// Complete handshake with client - returns true if handshake succeeds
+    fn try_handshake(&mut self) -> bool {
+        // Wait for client's PID
+        let recv_len = syscall::receive(self.channel, &mut self.msg_buf);
+        if recv_len < 4 {
+            return false;
+        }
+
+        self.client_pid = u32::from_le_bytes([
+            self.msg_buf[0], self.msg_buf[1], self.msg_buf[2], self.msg_buf[3]
+        ]);
+
+        // Create ring buffer (64 entries, 1MB data buffer for DMA)
+        let ring = match BlockRing::create(64, 1024 * 1024) {
+            Some(r) => r,
+            None => {
+                println!("[usbd] Failed to create ring buffer");
+                return false;
+            }
+        };
+
+        // Allow client to map our ring
+        if !ring.allow(self.client_pid) {
+            println!("[usbd] Failed to allow client access to ring");
+            return false;
+        }
+
+        // Send shmem_id to client
+        let shmem_id_bytes = ring.shmem_id().to_le_bytes();
+        self.msg_buf[..4].copy_from_slice(&shmem_id_bytes);
+        syscall::send(self.channel, &self.msg_buf[..4]);
+
+        self.ring = Some(ring);
+        true
+    }
+
+    /// Check if ring is ready
+    fn is_ready(&self) -> bool {
+        self.ring.is_some()
+    }
+
+    /// Process pending ring requests - returns number of requests processed
+    fn process_requests(&self, driver: &mut UsbDriver) -> u32 {
+        let ring = match &self.ring {
+            Some(r) => r,
+            None => return 0,
+        };
+
+        let mut processed = 0u32;
+
+        // Process all pending requests
+        while let Some(req) = ring.next_request() {
+            let resp = self.handle_request(driver, ring, &req);
+            ring.complete(&resp);
+            processed += 1;
+        }
+
+        // Notify client if we processed any requests
+        if processed > 0 {
+            ring.notify();
+        }
+
+        processed
+    }
+
+    /// Handle a single block request
+    fn handle_request(&self, driver: &mut UsbDriver, ring: &BlockRing, req: &BlockRequest) -> BlockResponse {
+        match req.cmd {
+            BlockRequest::CMD_INFO => {
+                // Return device info from MSC device
+                if let Some(ref msc) = driver.msc_device {
+                    BlockResponse::info(req.tag, msc.block_size, msc.block_count)
+                } else {
+                    BlockResponse::error(req.tag, -19) // ENODEV
+                }
+            }
+            BlockRequest::CMD_READ => {
+                self.handle_read(driver, ring, req)
+            }
+            BlockRequest::CMD_WRITE => {
+                self.handle_write(driver, ring, req)
+            }
+            _ => {
+                BlockResponse::error(req.tag, -38) // ENOSYS
+            }
+        }
+    }
+
+    /// Handle a read request
+    fn handle_read(&self, driver: &mut UsbDriver, ring: &BlockRing, req: &BlockRequest) -> BlockResponse {
+        // Validate request
+        if req.count == 0 {
+            return BlockResponse::error(req.tag, -22); // EINVAL
+        }
+
+        let block_size = driver.msc_device.as_ref().map(|m| m.block_size).unwrap_or(512);
+        let bytes = (req.count as u64) * (block_size as u64);
+        let buf_offset = req.buf_offset as usize;
+
+        // Check buffer bounds
+        if buf_offset + bytes as usize > ring.data_size() {
+            return BlockResponse::error(req.tag, -22);
+        }
+
+        // Get physical address of target buffer in ring
+        let target_phys = ring.data_phys() + buf_offset as u64;
+
+        // Perform DMA read directly to ring buffer
+        match driver.block_read_dma(req.lba, req.count, target_phys) {
+            Some(bytes_read) => BlockResponse::ok(req.tag, bytes_read as u32),
+            None => BlockResponse::error(req.tag, -5), // EIO
+        }
+    }
+
+    /// Handle a write request
+    fn handle_write(&self, driver: &mut UsbDriver, ring: &BlockRing, req: &BlockRequest) -> BlockResponse {
+        // Validate request
+        if req.count == 0 {
+            return BlockResponse::error(req.tag, -22); // EINVAL
+        }
+
+        let block_size = driver.msc_device.as_ref().map(|m| m.block_size).unwrap_or(512);
+        let bytes = (req.count as u64) * (block_size as u64);
+        let buf_offset = req.buf_offset as usize;
+
+        // Check buffer bounds
+        if buf_offset + bytes as usize > ring.data_size() {
+            return BlockResponse::error(req.tag, -22);
+        }
+
+        // Get physical address of source buffer in ring
+        let source_phys = ring.data_phys() + buf_offset as u64;
+
+        // Perform DMA write from ring buffer
+        match driver.block_write_dma(req.lba, req.count, source_phys) {
+            Some(bytes_written) => BlockResponse::ok(req.tag, bytes_written as u32),
+            None => BlockResponse::error(req.tag, -5), // EIO
+        }
+    }
+}
+
+// =============================================================================
+// Legacy IPC Client (for non-block operations)
+// =============================================================================
+
+/// Connected IPC client (legacy, for non-block operations)
+#[allow(dead_code)]
 struct IpcClient {
     channel: u32,
     msg_buf: [u8; USB_MSG_MAX_SIZE],
 }
 
+#[allow(dead_code)]
 impl IpcClient {
     fn new(channel: u32) -> Self {
         Self {
@@ -3095,99 +3271,7 @@ impl IpcClient {
         }
     }
 
-    /// Try to receive and handle one IPC message (non-blocking would be ideal)
-    fn handle_message(&mut self, driver: &mut UsbDriver) -> bool {
-        // Try to receive (this may block - future: use poll/select)
-        let recv_result = syscall::receive(self.channel, &mut self.msg_buf);
-        if recv_result <= 0 {
-            return false;
-        }
-
-        let recv_len = recv_result as usize;
-        if recv_len < UsbMessageHeader::SIZE {
-            self.send_error(UsbStatus::InvalidRequest);
-            return true;
-        }
-
-        // Parse request header
-        let header = match UsbMessageHeader::from_bytes(&self.msg_buf) {
-            Some(h) => h,
-            None => {
-                self.send_error(UsbStatus::InvalidRequest);
-                return true;
-            }
-        };
-
-        // Handle request based on type
-        match header.request {
-            UsbRequest::ListDevices => {
-                self.handle_list_devices(driver);
-            }
-            UsbRequest::GetDeviceInfo => {
-                // TODO: implement
-                self.send_error(UsbStatus::InvalidRequest);
-            }
-            UsbRequest::ControlTransfer => {
-                // TODO: implement
-                self.send_error(UsbStatus::InvalidRequest);
-            }
-            UsbRequest::BulkOut => {
-                // TODO: implement bulk OUT
-                self.send_error(UsbStatus::InvalidRequest);
-            }
-            UsbRequest::BulkIn => {
-                // TODO: implement bulk IN
-                self.send_error(UsbStatus::InvalidRequest);
-            }
-            UsbRequest::ConfigureDevice => {
-                // TODO: implement
-                self.send_error(UsbStatus::InvalidRequest);
-            }
-            UsbRequest::SetupEndpoints => {
-                // TODO: implement
-                self.send_error(UsbStatus::InvalidRequest);
-            }
-            UsbRequest::BlockRead => {
-                // Copy payload to avoid borrow conflict
-                let mut payload = [0u8; 32];
-                let payload_len = core::cmp::min(32, recv_len - UsbMessageHeader::SIZE);
-                payload[..payload_len].copy_from_slice(&self.msg_buf[UsbMessageHeader::SIZE..UsbMessageHeader::SIZE + payload_len]);
-                self.handle_block_read(driver, &payload[..payload_len]);
-            }
-            UsbRequest::BlockInfo => {
-                self.handle_block_info(driver);
-            }
-            UsbRequest::BlockWrite => {
-                // Copy payload and data to avoid borrow conflict
-                // BlockWriteRequest is 24 bytes, followed by data
-                let payload_len = recv_len - UsbMessageHeader::SIZE;
-                let mut payload = [0u8; 576];  // Max: 24 byte header + 512 byte sector
-                let copy_len = core::cmp::min(576, payload_len);
-                payload[..copy_len].copy_from_slice(&self.msg_buf[UsbMessageHeader::SIZE..UsbMessageHeader::SIZE + copy_len]);
-                self.handle_block_write(driver, &payload[..copy_len]);
-            }
-            UsbRequest::BlockReadDma => {
-                // Zero-copy read: client provides DMA buffer physical address
-                let mut payload = [0u8; 32];
-                let payload_len = core::cmp::min(32, recv_len - UsbMessageHeader::SIZE);
-                payload[..payload_len].copy_from_slice(&self.msg_buf[UsbMessageHeader::SIZE..UsbMessageHeader::SIZE + payload_len]);
-                self.handle_block_read_dma(driver, &payload[..payload_len]);
-            }
-            UsbRequest::BlockWriteDma => {
-                // Zero-copy write: client provides DMA buffer physical address
-                let mut payload = [0u8; 32];
-                let payload_len = core::cmp::min(32, recv_len - UsbMessageHeader::SIZE);
-                payload[..payload_len].copy_from_slice(&self.msg_buf[UsbMessageHeader::SIZE..UsbMessageHeader::SIZE + payload_len]);
-                self.handle_block_write_dma(driver, &payload[..payload_len]);
-            }
-        }
-
-        true
-    }
-
     fn handle_list_devices(&mut self, _driver: &UsbDriver) {
-        // For now, just return empty list
-        // TODO: maintain device list in UsbDriver
         let resp = UsbResponseHeader::new(UsbStatus::Ok, 0);
         let resp_bytes = resp.to_bytes();
         self.msg_buf[..UsbResponseHeader::SIZE].copy_from_slice(&resp_bytes);
@@ -3199,153 +3283,6 @@ impl IpcClient {
         let resp_bytes = resp.to_bytes();
         self.msg_buf[..UsbResponseHeader::SIZE].copy_from_slice(&resp_bytes);
         let _ = syscall::send(self.channel, &self.msg_buf[..UsbResponseHeader::SIZE]);
-    }
-
-    fn handle_block_read(&mut self, driver: &mut UsbDriver, payload: &[u8]) {
-        // Parse request
-        let req = match BlockReadRequest::from_bytes(payload) {
-            Some(r) => r,
-            None => {
-                self.send_error(UsbStatus::InvalidRequest);
-                return;
-            }
-        };
-
-        // Perform the read
-        match driver.block_read(req.lba, req.block_count) {
-            Some(bytes_read) => {
-                // Get pointer to data buffer
-                if let Some(data_ptr) = driver.get_data_buffer() {
-                    // Build response header
-                    let resp = BlockReadResponse::new(UsbStatus::Ok, bytes_read as u32);
-                    let resp_bytes = resp.to_bytes();
-
-                    // Copy response header to msg_buf
-                    self.msg_buf[..BlockReadResponse::SIZE].copy_from_slice(&resp_bytes);
-
-                    // Copy data after response header (limited to buffer size)
-                    let max_data = USB_MSG_MAX_SIZE - BlockReadResponse::SIZE;
-                    let copy_len = core::cmp::min(bytes_read, max_data);
-
-                    // Invalidate cache before reading DMA buffer
-                    unsafe {
-                        for offset in (0..copy_len).step_by(64) {
-                            let addr = data_ptr.add(offset) as u64;
-                            core::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-                        }
-                        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-
-                        let data_slice = core::slice::from_raw_parts(data_ptr, copy_len);
-                        self.msg_buf[BlockReadResponse::SIZE..BlockReadResponse::SIZE + copy_len]
-                            .copy_from_slice(data_slice);
-                    }
-
-                    // Send response with data
-                    let total_len = BlockReadResponse::SIZE + copy_len;
-                    let _ = syscall::send(self.channel, &self.msg_buf[..total_len]);
-                } else {
-                    self.send_error(UsbStatus::Error);
-                }
-            }
-            None => {
-                self.send_error(UsbStatus::Error);
-            }
-        }
-    }
-
-    fn handle_block_info(&mut self, driver: &UsbDriver) {
-        match driver.get_block_info() {
-            Some((block_size, block_count)) => {
-                println!("[usbd] BlockInfo request: {} blocks x {} bytes", block_count, block_size);
-                let resp = BlockInfoResponse::new(UsbStatus::Ok, block_size, block_count);
-                let resp_bytes = resp.to_bytes();
-                self.msg_buf[..BlockInfoResponse::SIZE].copy_from_slice(&resp_bytes);
-                let _ = syscall::send(self.channel, &self.msg_buf[..BlockInfoResponse::SIZE]);
-            }
-            None => {
-                // No device - MSC not enumerated yet or no device connected
-                println!("[usbd] BlockInfo request: no MSC device available");
-                self.send_error(UsbStatus::NotFound);
-            }
-        }
-    }
-
-    fn handle_block_write(&mut self, driver: &mut UsbDriver, payload: &[u8]) {
-        // Parse request header (24 bytes)
-        let req = match BlockWriteRequest::from_bytes(payload) {
-            Some(r) => r,
-            None => {
-                self.send_error(UsbStatus::InvalidRequest);
-                return;
-            }
-        };
-
-        // Data follows the header
-        let data_offset = BlockWriteRequest::SIZE;
-        let expected_bytes = (req.block_count as usize) * 512;
-
-        if payload.len() < data_offset + expected_bytes {
-            self.send_error(UsbStatus::InvalidRequest);
-            return;
-        }
-
-        let data = &payload[data_offset..data_offset + expected_bytes];
-
-        // Perform the write
-        match driver.block_write(req.lba, data) {
-            Some(bytes_written) => {
-                let resp = BlockWriteResponse::new(UsbStatus::Ok, bytes_written as u32);
-                let resp_bytes = resp.to_bytes();
-                self.msg_buf[..BlockWriteResponse::SIZE].copy_from_slice(&resp_bytes);
-                let _ = syscall::send(self.channel, &self.msg_buf[..BlockWriteResponse::SIZE]);
-            }
-            None => {
-                self.send_error(UsbStatus::Error);
-            }
-        }
-    }
-
-    /// Handle zero-copy block read (DMA directly to client's buffer)
-    fn handle_block_read_dma(&mut self, driver: &mut UsbDriver, payload: &[u8]) {
-        // Parse request
-        let req = match BlockReadDmaRequest::from_bytes(payload) {
-            Some(r) => r,
-            None => {
-                self.send_error(UsbStatus::InvalidRequest);
-                return;
-            }
-        };
-
-        // Perform the read directly to client's buffer
-        match driver.block_read_dma(req.lba, req.block_count, req.target_phys) {
-            Some(bytes_read) => {
-                // Send response (no data - it's already in client's buffer!)
-                let resp = BlockReadDmaResponse::new(UsbStatus::Ok, bytes_read as u32);
-                let resp_bytes = resp.to_bytes();
-                self.msg_buf[..BlockReadDmaResponse::SIZE].copy_from_slice(&resp_bytes);
-                let _ = syscall::send(self.channel, &self.msg_buf[..BlockReadDmaResponse::SIZE]);
-            }
-            None => {
-                self.send_error(UsbStatus::Error);
-            }
-        }
-    }
-
-    /// Handle zero-copy block write (DMA directly from client's buffer)
-    fn handle_block_write_dma(&mut self, driver: &mut UsbDriver, payload: &[u8]) {
-        // Parse request
-        let req = match BlockWriteDmaRequest::from_bytes(payload) {
-            Some(r) => r,
-            None => {
-                self.send_error(UsbStatus::InvalidRequest);
-                return;
-            }
-        };
-
-        // TODO: Implement block_write_dma in UsbDriver
-        // For now, return error - we'll implement this after testing reads
-        let _ = req;
-        self.send_error(UsbStatus::InvalidRequest);
     }
 }
 
@@ -3479,10 +3416,10 @@ fn main() {
     // Daemonize
     let result = syscall::daemonize();
     if result == 0 {
-        println!("USB daemon running");
+        println!("USB daemon running (ring buffer mode)");
 
         const MAX_CLIENTS: usize = 4;
-        let mut clients: [Option<IpcClient>; MAX_CLIENTS] = [None, None, None, None];
+        let mut clients: [Option<RingClient>; MAX_CLIENTS] = [None, None, None, None];
         let mut num_clients = 0usize;
         let mut poll_counter = 0u32;
 
@@ -3493,27 +3430,35 @@ fn main() {
                 driver.poll_events();
             }
 
+            // Accept new client connections
             let accept_result = syscall::port_accept(usb_port);
             if accept_result > 0 && num_clients < MAX_CLIENTS {
                 let client_channel = accept_result as u32;
-                for i in 0..MAX_CLIENTS {
-                    if clients[i].is_none() {
-                        clients[i] = Some(IpcClient::new(client_channel));
-                        num_clients += 1;
-                        break;
+                println!("[usbd] Client connected on channel {}", client_channel);
+
+                // Create RingClient and attempt handshake
+                let mut client = RingClient::new(client_channel);
+                if client.try_handshake() {
+                    println!("[usbd] Ring handshake complete for PID {}", client.client_pid);
+                    // Add to clients array
+                    for i in 0..MAX_CLIENTS {
+                        if clients[i].is_none() {
+                            clients[i] = Some(client);
+                            num_clients += 1;
+                            break;
+                        }
                     }
+                } else {
+                    println!("[usbd] Ring handshake failed");
                 }
             }
 
-            // Handle messages from connected clients
-            // Note: This is a simple round-robin approach
-            // A better approach would use poll/select for non-blocking I/O
+            // Process ring requests from all ready clients
             for i in 0..MAX_CLIENTS {
-                if let Some(ref mut client) = clients[i] {
-                    // TODO: Use non-blocking receive when available
-                    // For now, we skip clients that don't have pending messages
-                    // This won't work well without proper async I/O support
-                    let _ = client.handle_message(&mut driver);
+                if let Some(ref client) = clients[i] {
+                    if client.is_ready() {
+                        client.process_requests(&mut driver);
+                    }
                 }
             }
 

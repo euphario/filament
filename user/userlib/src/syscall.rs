@@ -44,6 +44,12 @@ pub const SYS_SET_LOG_LEVEL: u64 = 35;
 pub const SYS_MMAP_DMA: u64 = 36;
 pub const SYS_RESET: u64 = 37;
 pub const SYS_LSEEK: u64 = 38;
+pub const SYS_SHMEM_CREATE: u64 = 39;
+pub const SYS_SHMEM_MAP: u64 = 40;
+pub const SYS_SHMEM_ALLOW: u64 = 41;
+pub const SYS_SHMEM_WAIT: u64 = 42;
+pub const SYS_SHMEM_NOTIFY: u64 = 43;
+pub const SYS_SHMEM_DESTROY: u64 = 44;
 
 // SEEK whence constants
 pub const SEEK_SET: u32 = 0;
@@ -473,4 +479,56 @@ pub fn reset() -> ! {
     loop {
         unsafe { core::arch::asm!("wfe") };
     }
+}
+
+// =============================================================================
+// Shared Memory Syscalls
+// =============================================================================
+
+/// Create a new shared memory region
+/// Returns shmem_id on success, negative error on failure
+/// vaddr and paddr are populated with the virtual and physical addresses
+pub fn shmem_create(size: usize, vaddr: &mut u64, paddr: &mut u64) -> i64 {
+    syscall3(
+        SYS_SHMEM_CREATE,
+        size as u64,
+        vaddr as *mut u64 as u64,
+        paddr as *mut u64 as u64,
+    )
+}
+
+/// Map an existing shared memory region into this process
+/// Returns 0 on success, negative error on failure
+/// vaddr and paddr are populated with the virtual and physical addresses
+pub fn shmem_map(shmem_id: u32, vaddr: &mut u64, paddr: &mut u64) -> i64 {
+    syscall3(
+        SYS_SHMEM_MAP,
+        shmem_id as u64,
+        vaddr as *mut u64 as u64,
+        paddr as *mut u64 as u64,
+    )
+}
+
+/// Allow another process to map this shared memory region
+/// Returns 0 on success, negative error on failure
+pub fn shmem_allow(shmem_id: u32, peer_pid: u32) -> i64 {
+    syscall2(SYS_SHMEM_ALLOW, shmem_id as u64, peer_pid as u64)
+}
+
+/// Wait for notification on shared memory (blocks)
+/// Returns 0 on notify, negative error on failure/timeout
+pub fn shmem_wait(shmem_id: u32, timeout_ms: u32) -> i64 {
+    syscall2(SYS_SHMEM_WAIT, shmem_id as u64, timeout_ms as u64)
+}
+
+/// Notify all waiters on shared memory
+/// Returns number of waiters woken, or negative error
+pub fn shmem_notify(shmem_id: u32) -> i64 {
+    syscall1(SYS_SHMEM_NOTIFY, shmem_id as u64)
+}
+
+/// Destroy a shared memory region (only owner can do this)
+/// Returns 0 on success, negative error on failure
+pub fn shmem_destroy(shmem_id: u32) -> i64 {
+    syscall1(SYS_SHMEM_DESTROY, shmem_id as u64)
 }

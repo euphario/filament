@@ -188,8 +188,8 @@ pub use protocol::{
     BlockWriteDmaRequest, BlockWriteDmaResponse,
 };
 
-// Block device client
-pub use block_client::{BlockClient, DMA_BUFFER_SIZE};
+// Block device client (ring buffer based)
+pub use block_client::BlockClient;
 
 // =============================================================================
 // Legacy Re-exports (for backward compatibility with existing code)

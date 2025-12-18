@@ -1,11 +1,11 @@
-//! Block Device Client
+//! Block Device Client (Ring Buffer Version)
 //!
 //! Provides a clean abstraction for block device access via usbd.
-//! Handles IPC communication and DMA buffer management internally.
+//! Uses shared ring buffers for high-performance zero-copy transfers.
 //!
 //! # Example
 //! ```
-//! let mut block = BlockClient::connect("usb")?;
+//! let mut block = BlockClient::connect(b"usb")?;
 //! let (block_size, block_count) = block.get_info()?;
 //!
 //! // Read sectors - data is available via block.data()
@@ -13,187 +13,174 @@
 //! let data = block.data();
 //! ```
 
-use crate::{
-    UsbRequest, UsbStatus, UsbMessageHeader,
-    BlockInfoResponse,
-    BlockReadDmaRequest, BlockReadDmaResponse,
-    delay_ms,
-};
-
-/// Default DMA buffer size (32KB = 64 sectors)
-pub const DMA_BUFFER_SIZE: usize = 32768;
+use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
+use userlib::syscall;
 
 /// Block device client
 ///
 /// Connects to usbd and provides block-level read/write access.
-/// Uses zero-copy DMA internally for efficient transfers.
+/// Uses shared ring buffers for zero-copy transfers.
 pub struct BlockClient {
+    /// IPC channel to server
     channel: u32,
-    msg_buf: [u8; 128],
-    dma_virt: *mut u8,
-    dma_phys: u64,
-    dma_size: usize,
+    /// Shared ring buffer
+    ring: BlockRing,
+    /// Message buffer for IPC handshake
+    msg_buf: [u8; 64],
+    /// Block size (cached from get_info)
     block_size: u32,
+    /// Total block count (cached from get_info)
     block_count: u64,
+    /// Next request tag
+    next_tag: u32,
 }
 
-// BlockClient needs to be Send for potential future async use
-// The raw pointers are to DMA memory we own exclusively
+// BlockClient is Send because ring buffer access is synchronized
 unsafe impl Send for BlockClient {}
 
 impl BlockClient {
-    /// Connect to usbd via the specified port name
-    /// Returns None if connection or DMA allocation fails
+    /// Connect to block device server via the specified port name
+    /// Returns None if connection or ring setup fails
     pub fn connect(port_name: &[u8]) -> Option<Self> {
-        // Connect to usbd
-        let channel = userlib::syscall::port_connect(port_name);
+        // Connect to server
+        let channel = syscall::port_connect(port_name);
         if channel < 0 {
             return None;
         }
         let channel = channel as u32;
 
-        // Allocate DMA buffer
-        let mut dma_phys: u64 = 0;
-        let dma_virt = userlib::syscall::mmap_dma(DMA_BUFFER_SIZE, &mut dma_phys);
-        if dma_virt < 0 {
-            return None;
-        }
-
-        Some(Self {
-            channel,
-            msg_buf: [0u8; 128],
-            dma_virt: dma_virt as *mut u8,
-            dma_phys,
-            dma_size: DMA_BUFFER_SIZE,
-            block_size: 512,  // Default, updated by get_info()
-            block_count: 0,
-        })
+        Self::setup_with_channel(channel)
     }
 
     /// Connect using an existing channel (for when connection is done externally)
     pub fn from_channel(channel: u32) -> Option<Self> {
-        // Allocate DMA buffer
-        let mut dma_phys: u64 = 0;
-        let dma_virt = userlib::syscall::mmap_dma(DMA_BUFFER_SIZE, &mut dma_phys);
-        if dma_virt < 0 {
+        Self::setup_with_channel(channel)
+    }
+
+    /// Common setup after channel is established
+    fn setup_with_channel(channel: u32) -> Option<Self> {
+        let mut msg_buf = [0u8; 64];
+
+        // Send our PID to server
+        let my_pid = syscall::getpid() as u32;
+        msg_buf[..4].copy_from_slice(&my_pid.to_le_bytes());
+        syscall::send(channel, &msg_buf[..4]);
+
+        // Wait for shmem_id from server
+        for _ in 0..100 {
+            let recv_len = syscall::receive(channel, &mut msg_buf);
+            if recv_len >= 4 {
+                break;
+            }
+            syscall::yield_now();
+        }
+
+        let shmem_id = u32::from_le_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]]);
+        if shmem_id == 0 {
             return None;
         }
 
+        // Map the ring buffer
+        let ring = BlockRing::map(shmem_id)?;
+
         Some(Self {
             channel,
-            msg_buf: [0u8; 128],
-            dma_virt: dma_virt as *mut u8,
-            dma_phys,
-            dma_size: DMA_BUFFER_SIZE,
-            block_size: 512,
+            ring,
+            msg_buf,
+            block_size: 512,  // Default, updated by get_info()
             block_count: 0,
+            next_tag: 1,
         })
+    }
+
+    /// Get next request tag
+    fn next_tag(&mut self) -> u32 {
+        let tag = self.next_tag;
+        self.next_tag = self.next_tag.wrapping_add(1);
+        if self.next_tag == 0 {
+            self.next_tag = 1;
+        }
+        tag
+    }
+
+    /// Wait for a completion with the given tag
+    fn wait_completion(&self, expected_tag: u32) -> Option<BlockResponse> {
+        for _ in 0..500 {
+            // Check for pending completions
+            if self.ring.cq_pending() > 0 {
+                if let Some(resp) = self.ring.next_completion() {
+                    if resp.tag == expected_tag {
+                        return Some(resp);
+                    }
+                    // Wrong tag - could be out-of-order, but for now just continue
+                }
+            }
+
+            // Wait for notification
+            if !self.ring.wait(100) {
+                // Timeout - check again
+                syscall::yield_now();
+            }
+        }
+        None
     }
 
     /// Get block device info (block_size, block_count)
     /// Also caches the values internally
     pub fn get_info(&mut self) -> Option<(u32, u64)> {
-        // Build request
-        let header = UsbMessageHeader::new(UsbRequest::BlockInfo, 0);
-        let header_bytes = header.to_bytes();
-        self.msg_buf[..UsbMessageHeader::SIZE].copy_from_slice(&header_bytes);
+        let tag = self.next_tag();
+        let req = BlockRequest::info(tag);
 
-        // Send request
-        if userlib::syscall::send(self.channel, &self.msg_buf[..UsbMessageHeader::SIZE]) < 0 {
+        if !self.ring.submit(&req) {
+            return None;
+        }
+        self.ring.notify();
+
+        let resp = self.wait_completion(tag)?;
+        if resp.status != 0 {
             return None;
         }
 
-        // Receive response
-        let expected_type = UsbRequest::BlockInfo as u8;
-        for _ in 0..100 {
-            let recv_result = userlib::syscall::receive(self.channel, &mut self.msg_buf);
-            if recv_result < 1 {
-                delay_ms(10);
-                userlib::syscall::yield_now();
-                continue;
-            }
-
-            let resp_type = self.msg_buf[0];
-            if resp_type == expected_type && recv_result >= BlockInfoResponse::SIZE as isize {
-                let resp: BlockInfoResponse = unsafe {
-                    let mut arr = [0u8; BlockInfoResponse::SIZE];
-                    arr.copy_from_slice(&self.msg_buf[..BlockInfoResponse::SIZE]);
-                    core::mem::transmute(arr)
-                };
-
-                if resp.status != UsbStatus::Ok {
-                    return None;
-                }
-
-                self.block_size = resp.block_size;
-                self.block_count = resp.block_count;
-                return Some((resp.block_size, resp.block_count));
-            }
-        }
-
-        None
+        self.block_size = resp.block_size;
+        self.block_count = resp.block_count;
+        Some((resp.block_size, resp.block_count))
     }
 
     /// Read blocks from the device
     ///
-    /// Data is stored in the internal DMA buffer and can be accessed via `data()`.
+    /// Data is stored in the ring's data buffer and can be accessed via `data()`.
     /// Returns the number of bytes read, or None on error.
     ///
     /// # Arguments
     /// * `lba` - Logical Block Address to start reading from
-    /// * `count` - Number of blocks to read (max 64 for 32KB buffer)
+    /// * `count` - Number of blocks to read
+    /// * `buf_offset` - Offset into the data buffer (default 0)
+    pub fn read_at(&mut self, lba: u64, count: u32, buf_offset: u32) -> Option<usize> {
+        let max_bytes = self.ring.data_size();
+        let requested_bytes = (count as usize) * (self.block_size as usize);
+        if buf_offset as usize + requested_bytes > max_bytes {
+            return None;
+        }
+
+        let tag = self.next_tag();
+        let req = BlockRequest::read(tag, lba, count, buf_offset);
+
+        if !self.ring.submit(&req) {
+            return None;
+        }
+        self.ring.notify();
+
+        let resp = self.wait_completion(tag)?;
+        if resp.status != 0 {
+            return None;
+        }
+
+        Some(resp.bytes as usize)
+    }
+
+    /// Read blocks from the device (offset 0)
     pub fn read(&mut self, lba: u64, count: u32) -> Option<usize> {
-        let max_blocks = self.dma_size / self.block_size as usize;
-        if count == 0 || count as usize > max_blocks {
-            return None;
-        }
-
-        // Build request
-        let header = UsbMessageHeader::new(UsbRequest::BlockReadDma, BlockReadDmaRequest::SIZE as u32);
-        let header_bytes = header.to_bytes();
-        self.msg_buf[..UsbMessageHeader::SIZE].copy_from_slice(&header_bytes);
-
-        let req = BlockReadDmaRequest::new(0, lba, count, self.dma_phys);
-        let req_bytes = req.to_bytes();
-        self.msg_buf[UsbMessageHeader::SIZE..UsbMessageHeader::SIZE + BlockReadDmaRequest::SIZE]
-            .copy_from_slice(&req_bytes);
-
-        // Send request
-        let msg_len = UsbMessageHeader::SIZE + BlockReadDmaRequest::SIZE;
-        if userlib::syscall::send(self.channel, &self.msg_buf[..msg_len]) < 0 {
-            return None;
-        }
-
-        // Wait for response
-        let expected_type = UsbRequest::BlockReadDma as u8;
-        for _ in 0..100 {
-            let recv_result = userlib::syscall::receive(self.channel, &mut self.msg_buf);
-            if recv_result < 1 {
-                delay_ms(10);
-                userlib::syscall::yield_now();
-                continue;
-            }
-
-            let resp_type = self.msg_buf[0];
-            if resp_type == expected_type && recv_result >= BlockReadDmaResponse::SIZE as isize {
-                let resp: BlockReadDmaResponse = unsafe {
-                    let mut arr = [0u8; BlockReadDmaResponse::SIZE];
-                    arr.copy_from_slice(&self.msg_buf[..BlockReadDmaResponse::SIZE]);
-                    core::mem::transmute(arr)
-                };
-
-                if resp.status != UsbStatus::Ok {
-                    return None;
-                }
-
-                // Invalidate cache to see DMA-written data
-                self.invalidate_cache(resp.bytes_read as usize);
-
-                return Some(resp.bytes_read as usize);
-            }
-        }
-
-        None
+        self.read_at(lba, count, 0)
     }
 
     /// Read a single sector
@@ -201,25 +188,67 @@ impl BlockClient {
         self.read(lba, 1)
     }
 
+    /// Write blocks to the device
+    ///
+    /// Data should be placed in the ring's data buffer before calling.
+    /// Use `data_mut()` to access the buffer.
+    ///
+    /// # Arguments
+    /// * `lba` - Logical Block Address to start writing to
+    /// * `count` - Number of blocks to write
+    /// * `buf_offset` - Offset into the data buffer where data is located
+    pub fn write_at(&mut self, lba: u64, count: u32, buf_offset: u32) -> Option<usize> {
+        let max_bytes = self.ring.data_size();
+        let requested_bytes = (count as usize) * (self.block_size as usize);
+        if buf_offset as usize + requested_bytes > max_bytes {
+            return None;
+        }
+
+        let tag = self.next_tag();
+        let req = BlockRequest::write(tag, lba, count, buf_offset);
+
+        if !self.ring.submit(&req) {
+            return None;
+        }
+        self.ring.notify();
+
+        let resp = self.wait_completion(tag)?;
+        if resp.status != 0 {
+            return None;
+        }
+
+        Some(resp.bytes as usize)
+    }
+
+    /// Write blocks to the device (offset 0)
+    pub fn write(&mut self, lba: u64, count: u32) -> Option<usize> {
+        self.write_at(lba, count, 0)
+    }
+
     /// Get a slice of the data buffer after a read operation
     ///
     /// The slice is valid until the next read operation.
     pub fn data(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.dma_virt, self.dma_size) }
+        self.ring.data()
+    }
+
+    /// Get a mutable slice of the data buffer (for writing data before write operation)
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        self.ring.data_mut()
     }
 
     /// Get a slice of specific length from the data buffer
     pub fn data_slice(&self, len: usize) -> &[u8] {
-        let actual_len = core::cmp::min(len, self.dma_size);
-        unsafe { core::slice::from_raw_parts(self.dma_virt, actual_len) }
+        let data = self.ring.data();
+        let actual_len = core::cmp::min(len, data.len());
+        &data[..actual_len]
     }
 
-    /// Copy data from DMA buffer to provided slice
+    /// Copy data from ring buffer to provided slice
     pub fn copy_to(&self, dst: &mut [u8], len: usize) {
-        let copy_len = core::cmp::min(len, core::cmp::min(dst.len(), self.dma_size));
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.dma_virt, dst.as_mut_ptr(), copy_len);
-        }
+        let data = self.ring.data();
+        let copy_len = core::cmp::min(len, core::cmp::min(dst.len(), data.len()));
+        dst[..copy_len].copy_from_slice(&data[..copy_len]);
     }
 
     /// Get the block size (typically 512)
@@ -232,24 +261,18 @@ impl BlockClient {
         self.block_count
     }
 
-    /// Get the DMA buffer capacity in bytes
+    /// Get the data buffer capacity in bytes
     pub fn buffer_size(&self) -> usize {
-        self.dma_size
+        self.ring.data_size()
     }
 
     /// Get the maximum number of blocks that can be read at once
     pub fn max_blocks_per_read(&self) -> u32 {
-        (self.dma_size / self.block_size as usize) as u32
+        (self.ring.data_size() / self.block_size as usize) as u32
     }
 
-    /// Invalidate cache for DMA buffer (internal use)
-    fn invalidate_cache(&self, len: usize) {
-        unsafe {
-            for offset in (0..len).step_by(64) {
-                let addr = self.dma_virt.add(offset) as u64;
-                core::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-        }
+    /// Get the physical address of the data buffer (for DMA)
+    pub fn data_phys(&self) -> u64 {
+        self.ring.data_phys()
     }
 }
