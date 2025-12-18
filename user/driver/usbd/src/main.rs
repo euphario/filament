@@ -2097,9 +2097,10 @@ impl UsbDriver {
         let freq: u64;
         unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq); }
 
-        // Test different transfer sizes
-        // Note: Large transfers may fail due to device/controller limits
-        let transfer_sizes = [1u16, 8, 16, 32, 48, 64]; // sectors per transfer
+        // Test different transfer sizes (small to large)
+        // This way we get good data before potentially breaking the device
+        let transfer_sizes = [1u16, 4, 8, 16, 32, 64]; // Ascending order
+        let mut max_reliable_size = 1u16;
 
         for &sectors_per_transfer in &transfer_sizes {
             let bytes_per_transfer = sectors_per_transfer as usize * 512;
@@ -2151,6 +2152,11 @@ impl UsbDriver {
             println!("  Write {}x{} sectors: {}/{} OK, {} KB/s",
                 sectors_per_transfer, write_count, success, write_count, throughput_kbs);
 
+            // Track max reliable size (update as we find larger working sizes)
+            if success == write_count {
+                max_reliable_size = sectors_per_transfer;
+            }
+
             // Read test: 100 transfers
             let start: u64;
             unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start); }
@@ -2178,7 +2184,10 @@ impl UsbDriver {
                 sectors_per_transfer, write_count, success, write_count, throughput_kbs);
         }
 
-        println!("=== Performance Test Complete ===\n");
+        println!("=== Performance Test Complete ===");
+        println!("  Max reliable transfer: {} sectors ({} KB)",
+            max_reliable_size, max_reliable_size as u32 * 512 / 1024);
+        println!();
     }
 
     /// Performance write helper - direct SCSI write without IPC overhead
@@ -2339,7 +2348,7 @@ impl UsbDriver {
             cmd_ring.enqueue(&reset_out);
         }
         self.ring_doorbell(0, 0);
-        self.wait_command_complete(50);
+        self.wait_command_complete(100);
 
         // Reset bulk IN endpoint
         let reset_in = usb::enumeration::build_reset_endpoint_trb(ctx.slot_id, ctx.bulk_in_dci, false);
@@ -2347,7 +2356,7 @@ impl UsbDriver {
             cmd_ring.enqueue(&reset_in);
         }
         self.ring_doorbell(0, 0);
-        self.wait_command_complete(50);
+        self.wait_command_complete(100);
 
         // Reset ring state - start fresh
         ctx.out_enqueue = 0;
@@ -2363,7 +2372,7 @@ impl UsbDriver {
             cmd_ring.enqueue(&set_deq_out);
         }
         self.ring_doorbell(0, 0);
-        self.wait_command_complete(50);
+        self.wait_command_complete(100);
 
         // Set TR Dequeue Pointer for IN endpoint
         let set_deq_in = usb::enumeration::build_set_tr_dequeue_trb(
@@ -2373,10 +2382,10 @@ impl UsbDriver {
             cmd_ring.enqueue(&set_deq_in);
         }
         self.ring_doorbell(0, 0);
-        self.wait_command_complete(50);
+        self.wait_command_complete(100);
 
         // Small delay to let device settle
-        delay_ms(10);
+        delay_ms(50);
     }
 
     /// Wait for command completion (for recovery)
@@ -2399,12 +2408,27 @@ impl UsbDriver {
         false
     }
 
-    /// Wait for transfer event completion (simplified polling)
+    /// Wait for transfer event completion (optimized polling)
     fn wait_transfer_complete(&mut self, max_polls: u32) -> bool {
         let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
             + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
 
         if let Some(ref mut event_ring) = self.event_ring {
+            // First, spin locally without yielding (USB should be fast)
+            for _ in 0..1000 {
+                if let Some(evt) = event_ring.dequeue() {
+                    let erdp = event_ring.erdp() | (1 << 3);
+                    unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+
+                    if evt.get_type() == trb_type::TRANSFER_EVENT {
+                        let cc = (evt.status >> 24) & 0xFF;
+                        return cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET;
+                    }
+                }
+                core::hint::spin_loop();
+            }
+
+            // If still waiting, use slower polling with yields
             for _ in 0..max_polls {
                 if let Some(evt) = event_ring.dequeue() {
                     let erdp = event_ring.erdp() | (1 << 3);
