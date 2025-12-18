@@ -56,6 +56,16 @@ pub enum UsbRequest {
     /// Payload: BlockWriteRequest + data
     /// Response: BlockWriteResponse
     BlockWrite = 0x12,
+
+    /// Zero-copy block read: client provides DMA buffer physical address
+    /// Payload: BlockReadDmaRequest
+    /// Response: BlockReadDmaResponse (data is in client's buffer)
+    BlockReadDma = 0x13,
+
+    /// Zero-copy block write: client provides DMA buffer physical address
+    /// Payload: BlockWriteDmaRequest
+    /// Response: BlockWriteDmaResponse
+    BlockWriteDma = 0x14,
 }
 
 /// USB IPC Response Status
@@ -458,6 +468,157 @@ impl BlockWriteResponse {
     pub fn new(status: UsbStatus, bytes_written: u32) -> Self {
         Self {
             response_type: UsbRequest::BlockWrite as u8,
+            status,
+            _pad: [0; 2],
+            bytes_written,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        unsafe { core::mem::transmute(*self) }
+    }
+}
+
+// ============================================================================
+// Zero-Copy DMA Block Protocol
+// ============================================================================
+
+/// Zero-copy Block Read Request
+/// Client allocates DMA buffer and passes physical address.
+/// usbd reads directly into client's buffer - no IPC data copy needed.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct BlockReadDmaRequest {
+    /// USB slot ID of the mass storage device
+    pub slot_id: u32,
+    /// Logical Block Address to start reading from
+    pub lba: u64,
+    /// Number of blocks to read
+    pub block_count: u32,
+    pub _pad: u32,
+    /// Physical address of client's DMA buffer (must be cache-aligned)
+    pub target_phys: u64,
+}
+
+impl BlockReadDmaRequest {
+    pub const SIZE: usize = core::mem::size_of::<BlockReadDmaRequest>();
+
+    pub fn new(slot_id: u32, lba: u64, block_count: u32, target_phys: u64) -> Self {
+        Self {
+            slot_id,
+            lba,
+            block_count,
+            _pad: 0,
+            target_phys,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        unsafe { core::mem::transmute(*self) }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SIZE {
+            return None;
+        }
+        let mut arr = [0u8; Self::SIZE];
+        arr.copy_from_slice(&bytes[..Self::SIZE]);
+        Some(unsafe { core::mem::transmute(arr) })
+    }
+}
+
+/// Zero-copy Block Read Response
+/// Data is already in the client's DMA buffer - response only contains status.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct BlockReadDmaResponse {
+    /// Response type - always UsbRequest::BlockReadDma (0x13)
+    pub response_type: u8,
+    pub status: UsbStatus,
+    pub _pad: [u8; 2],
+    /// Number of bytes read
+    pub bytes_read: u32,
+}
+
+impl BlockReadDmaResponse {
+    pub const SIZE: usize = core::mem::size_of::<BlockReadDmaResponse>();
+
+    pub fn new(status: UsbStatus, bytes_read: u32) -> Self {
+        Self {
+            response_type: UsbRequest::BlockReadDma as u8,
+            status,
+            _pad: [0; 2],
+            bytes_read,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        unsafe { core::mem::transmute(*self) }
+    }
+}
+
+/// Zero-copy Block Write Request
+/// Client puts data in DMA buffer and passes physical address.
+/// usbd writes directly from client's buffer - no IPC data copy needed.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct BlockWriteDmaRequest {
+    /// USB slot ID of the mass storage device
+    pub slot_id: u32,
+    /// Logical Block Address to start writing to
+    pub lba: u64,
+    /// Number of blocks to write
+    pub block_count: u32,
+    pub _pad: u32,
+    /// Physical address of client's DMA buffer with data to write
+    pub source_phys: u64,
+}
+
+impl BlockWriteDmaRequest {
+    pub const SIZE: usize = core::mem::size_of::<BlockWriteDmaRequest>();
+
+    pub fn new(slot_id: u32, lba: u64, block_count: u32, source_phys: u64) -> Self {
+        Self {
+            slot_id,
+            lba,
+            block_count,
+            _pad: 0,
+            source_phys,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        unsafe { core::mem::transmute(*self) }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SIZE {
+            return None;
+        }
+        let mut arr = [0u8; Self::SIZE];
+        arr.copy_from_slice(&bytes[..Self::SIZE]);
+        Some(unsafe { core::mem::transmute(arr) })
+    }
+}
+
+/// Zero-copy Block Write Response
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct BlockWriteDmaResponse {
+    /// Response type - always UsbRequest::BlockWriteDma (0x14)
+    pub response_type: u8,
+    pub status: UsbStatus,
+    pub _pad: [u8; 2],
+    /// Number of bytes written
+    pub bytes_written: u32,
+}
+
+impl BlockWriteDmaResponse {
+    pub const SIZE: usize = core::mem::size_of::<BlockWriteDmaResponse>();
+
+    pub fn new(status: UsbStatus, bytes_written: u32) -> Self {
+        Self {
+            response_type: UsbRequest::BlockWriteDma as u8,
             status,
             _pad: [0; 2],
             bytes_written,

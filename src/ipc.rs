@@ -13,8 +13,9 @@ use crate::pmm;
 use crate::println;
 use crate::process::{Pid, ProcessState};
 
-/// Maximum inline message payload size (keep small for embedded)
-pub const MAX_INLINE_PAYLOAD: usize = 64;
+/// Maximum inline message payload size
+/// 576 bytes = 512 (sector) + 64 (headers/overhead)
+pub const MAX_INLINE_PAYLOAD: usize = 576;
 
 /// Maximum messages in a queue
 pub const MAX_QUEUE_SIZE: usize = 8;

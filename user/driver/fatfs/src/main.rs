@@ -13,6 +13,8 @@ mod block;
 
 use fat::{FatFilesystem, FatType};
 use block::BlockDevice;
+// Use USB library's BlockClient for zero-copy DMA access
+use usb::BlockClient;
 
 // Entry point
 #[unsafe(no_mangle)]
@@ -162,24 +164,27 @@ fn main() {
     println!("[fatfs] Root directory:");
     list_root_directory(&fs, &mut block);
 
-    // Write performance test
-    println!("[fatfs] Running write performance test...");
+    // Write performance test (IPC copy mode)
+    println!("[fatfs] Running write performance test (IPC copy)...");
     write_performance_test(&mut block, block_count);
+
+    // Zero-copy DMA performance test
+    println!("[fatfs] Running zero-copy DMA performance test...");
+    dma_performance_test(usb_channel, block_count);
 
     println!("[fatfs] Done.");
     syscall::exit(0);
 }
 
 /// Simple write performance test
-/// Writes sectors to the end of the device where there's likely free space
-fn write_performance_test(block: &mut BlockDevice, block_count: u64) {
-    // Use sectors near the end of the device (last 2000 sectors)
-    // This avoids corrupting filesystem data in most cases
-    let test_lba = block_count.saturating_sub(2000);
-    if test_lba == 0 {
-        println!("[fatfs] Device too small for write test");
-        return;
-    }
+/// Writes sectors to a safe location that won't corrupt filesystem
+fn write_performance_test(block: &mut BlockDevice, _block_count: u64) {
+    // Use LBA 1000 - safe zone that avoids:
+    // - Sector 0 (MBR)
+    // - Partition start (usually 2048+)
+    // NOTE: Don't use "near end of device" - fake capacity drives report
+    // wrong size and writes to non-existent sectors can corrupt data!
+    let test_lba = 1000u64;
 
     // Create test pattern
     let mut test_sector = [0u8; 512];
@@ -333,5 +338,79 @@ fn list_root_directory(fs: &FatFilesystem, block: &mut BlockDevice) {
         } else {
             println!("  {:>8} {}", size, name_str);
         }
+    }
+}
+
+/// Zero-copy DMA performance test using USB library's BlockClient
+/// Compares read performance using DMA (zero-copy) vs IPC (with data copy)
+fn dma_performance_test(channel: u32, _block_count: u64) {
+    // Create BlockClient from USB library (handles DMA internally)
+    let mut block_client = match BlockClient::from_channel(channel) {
+        Some(b) => b,
+        None => {
+            println!("[fatfs] Failed to create BlockClient");
+            return;
+        }
+    };
+    println!("[fatfs] BlockClient created (DMA buffer: {} bytes)", block_client.buffer_size());
+
+    // Get timer frequency
+    let freq: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
+    }
+
+    // Test read with different sector counts
+    let test_lba = 1000u64;  // Safe test location
+    let test_sizes = [1u32, 4, 8, 16, 32, 64];
+    let iterations = 100u32;
+
+    println!("[fatfs] === Zero-Copy DMA Read Performance (via USB lib) ===");
+    for &sectors in &test_sizes {
+        let start: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
+        }
+
+        let mut success = 0u32;
+        for _ in 0..iterations {
+            if block_client.read(test_lba, sectors).is_some() {
+                success += 1;
+            }
+        }
+
+        let end: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) end);
+        }
+
+        let elapsed_ticks = end - start;
+        let elapsed_us = (elapsed_ticks * 1_000_000) / freq;
+        let bytes_transferred = (success as u64) * (sectors as u64) * 512;
+
+        if elapsed_us > 0 && success > 0 {
+            let kb_per_sec = (bytes_transferred * 1_000_000) / (elapsed_us * 1024);
+            println!("[fatfs]   DMA Read {}x{}: {}/{} OK, {} KB/s",
+                sectors, iterations, success, iterations, kb_per_sec);
+        } else {
+            println!("[fatfs]   DMA Read {}x{}: {}/{} OK",
+                sectors, iterations, success, iterations);
+        }
+    }
+
+    // Verify we can read actual data
+    println!("[fatfs] Verifying DMA read data...");
+    if let Some(bytes) = block_client.read(0, 1) {
+        // Check for MBR signature or FAT boot sector
+        let data = block_client.data();
+        let sig0 = data[510];
+        let sig1 = data[511];
+        if sig0 == 0x55 && sig1 == 0xAA {
+            println!("[fatfs]   Read {} bytes, MBR/boot signature OK!", bytes);
+        } else {
+            println!("[fatfs]   Read {} bytes (sig: {:02x} {:02x})", bytes, sig0, sig1);
+        }
+    } else {
+        println!("[fatfs]   DMA read failed!");
     }
 }

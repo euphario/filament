@@ -1,6 +1,7 @@
 //! Block Device IPC Client
 //!
 //! Communicates with usbd to read blocks from USB mass storage devices.
+//! For zero-copy DMA mode, use `usb::BlockClient` instead.
 
 use userlib::{println, syscall};
 use usb::{
@@ -241,3 +242,13 @@ impl BlockDevice {
         false
     }
 }
+
+// =============================================================================
+// Zero-Copy DMA Block Device
+// =============================================================================
+//
+// DMA block device functionality has been moved to the USB library.
+// Use `usb::BlockClient` for zero-copy DMA access to block devices.
+//
+// The BlockDevice above is kept for IPC-copy mode which is useful for
+// single-sector reads and compatibility with the existing API.

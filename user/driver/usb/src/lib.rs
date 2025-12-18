@@ -86,6 +86,9 @@ pub mod msc;
 /// IPC protocol definitions
 pub mod protocol;
 
+/// Block device client (for userspace drivers like fatfs)
+pub mod block_client;
+
 /// MMIO region helpers
 pub mod mmio;
 
@@ -131,7 +134,7 @@ pub use usb::{
 pub use msc::{
     msc as msc_const, scsi, sense_key,
     Cbw, Csw, BulkContext, TransferResult,
-    InquiryResponse, ReadCapacity10Response, SenseData,
+    InquiryResponse, ReadCapacity10Response, SenseData, BlockLimits,
     CBW_OFFSET, CSW_OFFSET, DATA_OFFSET,
     RING_USABLE,
 };
@@ -180,7 +183,13 @@ pub use protocol::{
     BlockReadRequest, BlockReadResponse,
     BlockInfoRequest, BlockInfoResponse,
     BlockWriteRequest, BlockWriteResponse,
+    // Zero-copy DMA block protocol
+    BlockReadDmaRequest, BlockReadDmaResponse,
+    BlockWriteDmaRequest, BlockWriteDmaResponse,
 };
+
+// Block device client
+pub use block_client::{BlockClient, DMA_BUFFER_SIZE};
 
 // =============================================================================
 // Legacy Re-exports (for backward compatibility with existing code)

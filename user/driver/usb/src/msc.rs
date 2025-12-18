@@ -149,6 +149,98 @@ pub mod scsi {
         ([REQUEST_SENSE, 0, 0, 0, allocation_length, 0, 0, 0, 0, 0], allocation_length as u32)
     }
 
+    /// Build an INQUIRY for VPD (Vital Product Data) page
+    /// page_code: VPD page to retrieve (0x00=supported pages, 0xB0=block limits, 0xB1=block characteristics)
+    /// allocation_length: size of response buffer
+    /// Returns (cdb, data_length)
+    pub fn build_inquiry_vpd(page_code: u8, allocation_length: u16) -> ([u8; 10], u32) {
+        // INQUIRY with EVPD=1 (bit 0 of byte 1)
+        let cdb = [
+            INQUIRY,
+            0x01,  // EVPD=1
+            page_code,
+            ((allocation_length >> 8) & 0xFF) as u8,
+            (allocation_length & 0xFF) as u8,
+            0, 0, 0, 0, 0,
+        ];
+        (cdb, allocation_length as u32)
+    }
+
+    /// VPD page codes
+    pub const VPD_SUPPORTED_PAGES: u8 = 0x00;
+    pub const VPD_BLOCK_LIMITS: u8 = 0xB0;
+    pub const VPD_BLOCK_CHARACTERISTICS: u8 = 0xB1;
+
+    /// Block Limits from VPD page 0xB0
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct BlockLimits {
+        /// Optimal transfer length granularity (in blocks)
+        pub optimal_transfer_granularity: u16,
+        /// Maximum transfer length (in blocks) - 0 means no limit reported
+        pub max_transfer_length: u32,
+        /// Optimal transfer length (in blocks) - 0 means no preference
+        pub optimal_transfer_length: u32,
+        /// Maximum prefetch/write same length (in blocks)
+        pub max_prefetch_length: u32,
+    }
+
+    /// Parse VPD page 0xB0 (Block Limits)
+    /// Returns BlockLimits struct with max/optimal transfer sizes
+    pub fn parse_vpd_block_limits(data: &[u8]) -> Option<BlockLimits> {
+        // Minimum response is 16 bytes, but full response can be 64+ bytes
+        if data.len() < 16 {
+            return None;
+        }
+        // Verify page code
+        if data[1] != VPD_BLOCK_LIMITS {
+            return None;
+        }
+
+        // Page length at bytes 2-3 (big endian)
+        let page_length = u16::from_be_bytes([data[2], data[3]]) as usize;
+
+        let mut limits = BlockLimits::default();
+
+        // Optimal transfer length granularity at bytes 6-7 (if page_length >= 4)
+        if page_length >= 4 && data.len() >= 8 {
+            limits.optimal_transfer_granularity = u16::from_be_bytes([data[6], data[7]]);
+        }
+
+        // Maximum transfer length at bytes 8-11 (if page_length >= 8)
+        if page_length >= 8 && data.len() >= 12 {
+            limits.max_transfer_length = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        }
+
+        // Optimal transfer length at bytes 12-15 (if page_length >= 12)
+        if page_length >= 12 && data.len() >= 16 {
+            limits.optimal_transfer_length = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+        }
+
+        // Maximum prefetch/write same length at bytes 16-19
+        if page_length >= 16 && data.len() >= 20 {
+            limits.max_prefetch_length = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        }
+
+        Some(limits)
+    }
+
+    /// Parse VPD page 0x00 (Supported VPD Pages)
+    /// Returns list of supported page codes
+    pub fn parse_vpd_supported_pages(data: &[u8]) -> Option<&[u8]> {
+        if data.len() < 4 {
+            return None;
+        }
+        if data[1] != VPD_SUPPORTED_PAGES {
+            return None;
+        }
+        let page_length = data[3] as usize;
+        if data.len() >= 4 + page_length {
+            Some(&data[4..4 + page_length])
+        } else {
+            None
+        }
+    }
+
     /// Parse READ CAPACITY (10) response (8 bytes, big-endian)
     /// Returns (last_lba, block_size)
     pub fn parse_read_capacity_10(data: &[u8]) -> Option<(u32, u32)> {
@@ -160,6 +252,9 @@ pub mod scsi {
         Some((last_lba, block_size))
     }
 }
+
+// Re-export BlockLimits from scsi module for convenience
+pub use scsi::BlockLimits;
 
 /// SCSI Inquiry Response (36 bytes)
 #[repr(C, packed)]
@@ -331,6 +426,15 @@ pub struct BulkContext {
     pub in_cycle: bool,
     // CBW tag counter
     pub tag: u32,
+    // USB endpoint addresses (for CLEAR_FEATURE)
+    pub bulk_in_addr: u8,   // e.g., 0x81 for EP1 IN
+    pub bulk_out_addr: u8,  // e.g., 0x02 for EP2 OUT
+    // Interface number (for BOT Reset)
+    pub interface_num: u8,
+    // EP0 ring for control transfers (for USB recovery)
+    pub ep0_ring: *mut Trb,
+    pub ep0_ring_phys: u64,
+    pub ep0_enqueue: usize,
 }
 
 /// Result of a bulk transfer
@@ -360,6 +464,11 @@ impl BulkContext {
         data_buf: *mut u8,
         data_phys: u64,
         device_ctx: *mut DeviceContext,
+        bulk_in_addr: u8,
+        bulk_out_addr: u8,
+        interface_num: u8,
+        ep0_ring: *mut Trb,
+        ep0_ring_phys: u64,
     ) -> Self {
         Self {
             slot_id,
@@ -377,7 +486,21 @@ impl BulkContext {
             out_cycle: true,  // Producer starts with cycle=1
             in_cycle: true,   // Producer starts with cycle=1
             tag: 1,
+            bulk_in_addr,
+            bulk_out_addr,
+            interface_num,
+            ep0_ring,
+            ep0_ring_phys,
+            ep0_enqueue: 0,
         }
+    }
+
+    /// Convert DCI to USB endpoint address
+    /// DCI 2 = EP1 OUT (0x01), DCI 3 = EP1 IN (0x81), etc.
+    pub fn dci_to_ep_addr(dci: u32) -> u8 {
+        let ep_num = dci / 2;
+        let is_in = (dci & 1) == 1;
+        if is_in { 0x80 | ep_num as u8 } else { ep_num as u8 }
     }
 
     /// Advance bulk OUT enqueue pointer with wrap-around

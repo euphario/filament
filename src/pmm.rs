@@ -17,8 +17,8 @@ const DRAM_END: usize = 0x80000000; // 1GB usable
 /// Kernel load address
 const KERNEL_START: usize = 0x46000000;
 
-/// Kernel reserved size (1MB should be plenty)
-const KERNEL_SIZE: usize = 0x100000;
+/// Kernel reserved size (2MB for kernel + embedded initrd + IPC buffers)
+const KERNEL_SIZE: usize = 0x200000;
 
 /// Number of pages we manage
 const NUM_PAGES: usize = (DRAM_END - DRAM_START) / PAGE_SIZE;

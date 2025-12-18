@@ -180,6 +180,8 @@ fn execute_command(cmd: &[u8]) {
         cmd_run_program("bin/usbd");
     } else if cmd_eq(cmd, b"gpio") {
         cmd_run_program("bin/gpio");
+    } else if cmd_eq(cmd, b"fatfs") {
+        cmd_run_program("bin/fatfs");
     } else if cmd_eq(cmd, b"ps") {
         cmd_ps();
     } else if cmd_starts_with(cmd, b"kill ") {
@@ -209,8 +211,9 @@ fn cmd_help() {
     println!("  mem           - Test memory allocation");
     println!("  echo <msg>    - Echo a message");
     println!("  spawn <id>    - Spawn process by ELF ID");
-    println!("  usb           - Run USB userspace driver test");
+    println!("  usb           - Run USB userspace driver");
     println!("  gpio          - Run GPIO control utility");
+    println!("  fatfs         - Run FAT filesystem driver");
     println!("  yield         - Yield CPU to other processes");
     println!("  panic         - Trigger a panic (test)");
     println!("  ps            - Show running processes");
