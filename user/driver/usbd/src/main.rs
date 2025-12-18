@@ -25,13 +25,12 @@ use userlib::{println, print, syscall};
 use usb::{
     // GPIO IPC
     GPIO_CMD_USB_VBUS,
-    // Clock/reset control (for diagnostics)
+    // Clock/reset control
     INFRACFG_AO_BASE, INFRACFG_AO_SIZE,
-    INFRA_RST0_STA, INFRA_RST1_CLR, INFRA_RST1_STA,
-    INFRA_CG0_STA, INFRA_CG1_CLR, INFRA_CG1_STA, INFRA_CG2_STA,
+    INFRA_RST1_CLR, INFRA_CG1_CLR,
     RST1_SSUSB_TOP0, RST1_SSUSB_TOP1, CG1_SSUSB0, CG1_SSUSB1,
     // xHCI registers
-    xhci_op, xhci_port, xhci_rt, xhci_ir,
+    xhci_op, xhci_rt, xhci_ir,
     // TRB
     Trb, trb_type, trb_cc,
     // USB types
@@ -45,7 +44,7 @@ use usb::{
     // Ring structures
     Ring, EventRing, ErstEntry,
     // MMIO helpers
-    MmioRegion, format_mmio_url, delay_ms, delay, print_hex64, print_hex32, print_hex8,
+    MmioRegion, format_mmio_url, delay_ms, delay, print_hex32,
     // Port status parsing (still needed for legacy code)
     ParsedPortsc, portsc,
     event_completion_code, event_slot_id, event_port_id,
@@ -280,22 +279,14 @@ impl UsbDriver {
             Some(r) => r,
             None => return false,
         };
-
-        println!("  Sending No-Op command...");
-
-        // Use library helper to build TRB
         let trb = build_noop_trb();
         cmd_ring.enqueue(&trb);
-
-        // Ring doorbell for command ring
         self.ring_doorbell(0, doorbell::COMMAND_RING);
-
         true
     }
 
-    /// Poll for and process events
+    /// Poll for and process events (silent unless error)
     fn poll_events(&mut self) -> bool {
-        // Collect events first to avoid borrow issues
         let mut events: [Option<Trb>; 16] = [None; 16];
         let mut event_count = 0;
         let mut final_erdp = 0u64;
@@ -316,312 +307,139 @@ impl UsbDriver {
             return false;
         }
 
-        // Process collected events
         for i in 0..event_count {
             if let Some(ref trb) = events[i] {
                 let evt_type = trb.get_type();
-                let cc = event_completion_code(trb);
-
                 match evt_type {
-                    trb_type::COMMAND_COMPLETION => {
-                        print!("  Event: Command Completion, CC=");
-                        print_hex32(cc);
-                        if completion_code::is_success(cc) {
-                            println!(" ({})", completion_code::name(cc));
-                        } else {
-                            println!(" ({})", completion_code::name(cc));
-                        }
-                    }
                     trb_type::PORT_STATUS_CHANGE => {
-                        let port_id = event_port_id(trb);
-                        println!("  Event: Port {} Status Change", port_id);
-                        self.handle_port_change(port_id);
-                    }
-                    trb_type::TRANSFER_EVENT => {
-                        println!("  Event: Transfer Complete");
+                        self.handle_port_change(event_port_id(trb));
                     }
                     trb_type::HOST_CONTROLLER => {
-                        println!("  Event: Host Controller Error!");
+                        println!("ERROR: Host Controller Error!");
                     }
-                    _ => {
-                        print!("  Event: Unknown type ");
-                        print_hex32(evt_type);
-                        println!();
-                    }
+                    _ => {}
                 }
             }
         }
 
-        // Update ERDP to acknowledge events
         let ir0 = xhci_rt::IR0;
-        self.rt_write64(ir0 + xhci_ir::ERDP, final_erdp | (1 << 3)); // EHB bit
-
+        self.rt_write64(ir0 + xhci_ir::ERDP, final_erdp | (1 << 3));
         true
     }
 
-    /// Handle port status change
+    /// Handle port status change (silent)
     fn handle_port_change(&mut self, port_id: u32) {
         if port_id == 0 || port_id > self.xhci.max_ports() as u32 {
             return;
         }
-
         let port = (port_id - 1) as u8;
         let raw = self.xhci.read_portsc(port);
         let status = ParsedPortsc::from_raw(raw);
-
-        // Clear status change bits by writing 1 to them (W1C)
         let clear_bits = raw & portsc::CHANGE_BITS;
         if clear_bits != 0 {
             self.xhci.write_portsc(port, status.clear_changes_value());
         }
-
-        print!("    Port {}: ", port_id);
-        if !status.connected {
-            println!("Disconnected");
-        } else {
-            print!("Connected ({})", status.speed.full_name());
-            if status.enabled {
-                println!(" [Enabled]");
-            } else {
-                println!(" [Not enabled yet]");
-            }
-        }
     }
 
     fn print_port_status(&self) {
-        println!();
-        println!("=== Port Status ===");
-
         for p in 0..self.xhci.max_ports() {
             let raw = self.xhci.read_portsc(p);
             let status = ParsedPortsc::from_raw(raw);
-
-            print!("  Port {}: PORTSC=0x", p + 1);
-            print_hex32(raw);
-
             if !status.powered {
-                println!(" [Not powered]");
                 continue;
             }
 
-            print!(" PLS={}", status.link_state.as_str());
-
-            if !status.connected {
-                println!(" [No device]");
-                continue;
-            }
-
-            print!(" {}Speed", status.speed.as_str());
-            if status.enabled {
-                print!(" [Enabled]");
-            }
-            println!();
-        }
-    }
-
-    /// Check and display USB port power status
-    /// This helps diagnose whether VBUS is properly enabled
-    fn check_power_status(&self) {
-        println!();
-        println!("=== USB PORT POWER STATUS ===");
-        println!("  (PP=1 means port has power, VBUS is OK)");
-
-        let mut all_powered = true;
-        let mut any_connected = false;
-
-        for p in 0..self.xhci.max_ports() {
-            let raw = self.xhci.read_portsc(p);
-            let status = ParsedPortsc::from_raw(raw);
-
-            print!("  Port {}: PP={}", p + 1, if status.powered { 1 } else { 0 });
-
-            if !status.powered {
-                print!(" [NO POWER!]");
-                all_powered = false;
-            } else {
-                print!(" [POWERED]");
-            }
-
+            // Only print if device connected
             if status.connected {
-                print!(" Device connected");
-                any_connected = true;
-            } else {
-                print!(" No device");
+                print!("  Port {}: {} {}", p + 1, status.speed.as_str(),
+                       if status.enabled { "[Enabled]" } else { "" });
+                println!();
             }
-
-            println!(" PLS={}", status.link_state.as_str());
         }
-
-        println!();
-        if all_powered {
-            println!("  VBUS Status: ALL PORTS POWERED - OK");
-        } else {
-            println!("  VBUS Status: SOME PORTS HAVE NO POWER!");
-            println!("  Possible causes:");
-            println!("    - U-Boot did not enable USB power");
-            println!("    - Hardware VBUS enable is not working");
-        }
-
-        if any_connected {
-            println!("  Device Status: Device(s) detected");
-        } else {
-            println!("  Device Status: No devices connected");
-            println!("    - Is a USB device plugged in?");
-            println!("    - BPI-R4 has internal VL822 hub on Type-A port");
-        }
-        println!();
     }
 
-    /// Reset a port to trigger device enumeration
+    /// Check port power status (silent - just returns status)
+    fn check_power_status(&self) {
+        // Silent - power status check no longer prints
+    }
+
+    /// Reset a port to trigger device enumeration (silent unless error)
     fn reset_port(&self, port: u32) -> bool {
         if port == 0 || port > self.xhci.max_ports() as u32 {
             return false;
         }
-
         let port_idx = (port - 1) as u8;
-
-        // Read current PORTSC
         let raw = self.xhci.read_portsc(port_idx);
         let status = ParsedPortsc::from_raw(raw);
 
-        print!("  Port {}: ", port);
-
-        // Skip if not powered
-        if !status.powered {
-            println!("not powered, skipping");
+        if !status.powered || !status.connected {
             return false;
         }
-
-        // Skip if no device connected
-        if !status.connected {
-            println!("no device connected, skipping reset");
-            return false;
-        }
-
-        // Skip if port is already enabled - device is working, don't disrupt it
         if status.enabled {
-            println!("already enabled (device working), skipping reset");
-            return true;  // Return true since device is present and working
+            return true;  // Already working
         }
 
-        println!("device present but not enabled, resetting...");
-
-        // Set PR (Port Reset) bit, preserve PP
+        // Set PR (Port Reset) bit
         let write_val = (raw & portsc::PRESERVE_MASK) | portsc::PR;
         self.xhci.write_portsc(port_idx, write_val);
 
-        // Wait for reset to complete
         for _ in 0..100 {
             delay(10000);
             let raw = self.xhci.read_portsc(port_idx);
             let status = ParsedPortsc::from_raw(raw);
-
             if !status.reset && status.reset_change {
-                // Reset complete, clear PRC
                 self.xhci.write_portsc(port_idx, raw | portsc::PRC);
-                println!("    Reset complete");
                 return true;
             }
         }
-
-        println!("    Reset timeout");
         false
     }
 
-    /// Enable a slot for a new device
+    /// Enable a slot for a new device (silent)
     fn enable_slot(&mut self) -> Option<u32> {
         let cmd_ring = self.cmd_ring.as_mut()?;
-
-        println!("  Enabling slot...");
-
-        // Use library helper to build TRB
         let trb = build_enable_slot_trb();
         cmd_ring.enqueue(&trb);
         self.ring_doorbell(0, doorbell::COMMAND_RING);
-
-        // Wait for completion
         delay(10000);
 
-        // Poll for event - collect result first to avoid borrow issues
-        let mut result: Option<(u32, u32)> = None;  // (cc, slot_id)
+        let mut result: Option<(u32, u32)> = None;
         let mut erdp_to_update: Option<u64> = None;
-        let mut other_events = 0u32;
 
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..20 {
                 if let Some(evt) = event_ring.dequeue() {
-                    // Always track ERDP for any consumed event
                     erdp_to_update = Some(event_ring.erdp());
-
-                    let evt_type = evt.get_type();
-                    if evt_type == trb_type::COMMAND_COMPLETION {
-                        let cc = event_completion_code(&evt);
-                        let slot_id = event_slot_id(&evt);
-                        println!("    Enable Slot event: CC={}, slot={}", cc, slot_id);
-                        result = Some((cc, slot_id));
+                    if evt.get_type() == trb_type::COMMAND_COMPLETION {
+                        result = Some((event_completion_code(&evt), event_slot_id(&evt)));
                         break;
-                    } else {
-                        // Count other events
-                        other_events += 1;
                     }
                 }
                 delay(1000);
             }
         }
 
-        if other_events > 0 {
-            println!("    (skipped {} other events)", other_events);
-        }
-
-        // Update ERDP for all consumed events
         if let Some(erdp) = erdp_to_update {
             self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
-            // Verify ERDP was written
-            let erdp_readback = self.rt_read64(xhci_rt::IR0 + xhci_ir::ERDP);
-            if (erdp_readback & !0xF) != (erdp & !0xF) {
-                print!("    WARNING: ERDP mismatch! wrote=");
-                print_hex64(erdp);
-                print!(", read=");
-                print_hex64(erdp_readback);
-                println!();
-            }
         }
 
-        // Process result
         if let Some((cc, slot_id)) = result {
             if cc == trb_cc::SUCCESS {
-                println!("    Got slot {}", slot_id);
                 return Some(slot_id);
-            } else {
-                print!("    Enable Slot failed: CC=");
-                print_hex32(cc);
-                println!();
-                return None;
             }
         }
-
-        println!("    No response");
         None
     }
 
     /// Enumerate a device on the given port
-    /// Returns the slot ID if successful
     fn enumerate_device(&mut self, port: u32) -> Option<u32> {
-        println!();
-        println!("=== Enumerating Device on Port {} ===", port);
-
-        // Step 1: Enable slot
         let slot_id = self.enable_slot()?;
 
-        // Step 2: Allocate memory for device context and input context
-        // We'll use a simple bump allocator from after the event ring
-        // Input Context: ~1088 bytes, Device Context: ~1024 bytes
-        // EP0 Transfer Ring: 64 * 16 = 1024 bytes
-        let ctx_size = 4096;  // One page for all contexts
+        // Allocate memory for device context and input context
+        let ctx_size = 4096;
         let mut ctx_phys: u64 = 0;
         let ctx_virt = syscall::mmap_dma(ctx_size, &mut ctx_phys);
         if ctx_virt < 0 {
-            println!("  Failed to allocate context memory");
             return None;
         }
 
@@ -668,7 +486,7 @@ impl UsbDriver {
         let speed = status.speed;
         let speed_raw = speed.to_slot_speed();
 
-        println!("  Port {} speed: {} ({})", port, speed_raw, speed.full_name());
+        print!("  {} device on port {}", speed.full_name(), port);
 
         // Max packet size for EP0 based on speed
         let max_packet_size = speed.default_ep0_max_packet();
@@ -740,65 +558,29 @@ impl UsbDriver {
             );
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
-        print!("  DCBAA[{}] = 0x", slot_id);
-        print_hex32(device_ctx_phys as u32);
-        println!();
-
-        // Step 5: Address Device command
-        println!("  Sending Address Device command...");
-        let cmd_trb_phys: u64;
+        // Address Device command
         {
             let cmd_ring = self.cmd_ring.as_mut()?;
-            println!("    Cmd ring: enq={}, cycle={}", cmd_ring.enqueue, cmd_ring.cycle);
             let mut trb = Trb::new();
             trb.param = input_ctx_phys;
             trb.set_type(trb_type::ADDRESS_DEVICE);
-            trb.control |= (slot_id & 0xFF) << 24;  // Slot ID in control[31:24]
-            // BSR=0 (assign address immediately)
-            cmd_trb_phys = cmd_ring.enqueue(&trb);
-            print!("    TRB at ");
-            print_hex64(cmd_trb_phys);
-            println!();
+            trb.control |= (slot_id & 0xFF) << 24;
+            cmd_ring.enqueue(&trb);
             self.ring_doorbell(0, 0);
         }
 
-        // Wait for completion
         delay(50000);
 
-        // Debug: dump event ring state and first few raw entries
-        if let Some(ref event_ring) = self.event_ring {
-            println!("    Event ring: deq={}, cycle={}", event_ring.dequeue, event_ring.cycle);
-            // Dump first 4 event TRBs to see raw state
-            for i in 0..4usize {
-                unsafe {
-                    let trb = &*event_ring.trbs.add(i);
-                    print!("    EvtTRB[{}]: ctrl={:08x} ", i, trb.control);
-                    let cycle = trb.control & 1;
-                    println!("(cycle={})", cycle);
-                }
-            }
-        }
-
-        // Collect events first to avoid borrow issues
+        // Wait for Address Device completion
         let mut addr_result: Option<u32> = None;
-        let mut last_cc: Option<u32> = None;
         let mut erdp_to_write: Option<u64> = None;
-        let mut event_count = 0u32;
 
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..50 {
                 if let Some(evt) = event_ring.dequeue() {
-                    let evt_type = evt.get_type();
-                    // Store for printing later
-                    println!("  Event: type={}, status={:08x}, ctrl={:08x}",
-                             evt_type, evt.status, evt.control);
-                    event_count += 1;
-
                     erdp_to_write = Some(event_ring.erdp());
-
-                    if evt_type == trb_type::COMMAND_COMPLETION {
+                    if evt.get_type() == trb_type::COMMAND_COMPLETION {
                         let cc = (evt.status >> 24) & 0xFF;
-                        last_cc = Some(cc);
                         if cc == trb_cc::SUCCESS {
                             addr_result = Some(slot_id);
                         }
@@ -809,48 +591,27 @@ impl UsbDriver {
             }
         }
 
-        // Update ERDP outside the borrow
         if let Some(erdp) = erdp_to_write {
             self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
         }
 
-        // Report result
-        if addr_result.is_some() {
-            println!("  Address Device succeeded");
-        } else if let Some(cc) = last_cc {
-            print!("  Address Device failed: CC=");
-            print_hex32(cc);
-            println!();
-            return None;
-        } else {
-            println!("  Address Device: no response (events={})", event_count);
+        if addr_result.is_none() {
+            println!(" - Address failed");
             return None;
         }
 
-        // Read back device address from Device Context
-        // U-Boot pattern: invalidate cache before reading data that hardware wrote
-        let dev_addr = unsafe {
+        // Read back device address
+        unsafe {
             let device_addr = device_ctx_virt as u64;
-            core::arch::asm!(
-                "dc civac, {addr}",
-                addr = in(reg) device_addr,
-                options(nostack, preserves_flags)
-            );
+            core::arch::asm!("dc civac, {addr}", addr = in(reg) device_addr, options(nostack, preserves_flags));
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
 
-            let device = &*device_ctx_virt;
-            device.slot.dw3 & 0xFF
-        };
-        println!("  Device address: {}", dev_addr);
+        // Get Device Descriptor
 
-        // Step 6: Get Device Descriptor
-        println!("  Getting Device Descriptor...");
-
-        // Allocate buffer for descriptor (64 bytes to be safe)
         let mut desc_phys: u64 = 0;
         let desc_virt = syscall::mmap_dma(4096, &mut desc_phys);
         if desc_virt < 0 {
-            println!("  Failed to allocate descriptor buffer");
             return Some(slot_id);
         }
         let desc_buf = desc_virt as *mut u8;
@@ -939,59 +700,33 @@ impl UsbDriver {
 
         // Process transfer result
         let mut transfer_ok = false;
-        if let Some((cc, remaining)) = transfer_result {
-
+        if let Some((cc, _remaining)) = transfer_result {
             if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET {
                 transfer_ok = true;
-                // Update enqueue position: used Setup(0), Data(1), Status(2) -> next is 3
                 ep0_enqueue = 3;
-                println!("  Transfer complete, {} bytes remaining", remaining);
-            } else {
-                print!("  Transfer failed: CC=");
-                print_hex32(cc);
-                println!();
             }
-        } else {
-            println!("  No transfer event received (timeout)");
         }
 
         if transfer_ok {
-            // Parse and print device descriptor
-            // U-Boot pattern: invalidate cache before reading data that hardware wrote
             unsafe {
                 let buf_addr = desc_buf as u64;
-                core::arch::asm!(
-                    "dc civac, {addr}",
-                    addr = in(reg) buf_addr,
-                    options(nostack, preserves_flags)
-                );
+                core::arch::asm!("dc civac, {addr}", addr = in(reg) buf_addr, options(nostack, preserves_flags));
                 core::arch::asm!("dsb sy", options(nostack, preserves_flags));
 
                 let desc = &*(desc_buf as *const DeviceDescriptor);
-                println!();
-                println!("  === Device Descriptor ===");
-                println!("  USB Version: {}.{}", desc.bcd_usb >> 8, (desc.bcd_usb >> 4) & 0xF);
-                println!("  Class: {}, Subclass: {}, Protocol: {}",
-                         desc.device_class, desc.device_subclass, desc.device_protocol);
-                print!("  Vendor ID: 0x");
-                print_hex32(desc.vendor_id as u32);
-                print!(", Product ID: 0x");
-                print_hex32(desc.product_id as u32);
-                println!();
-                println!("  Max Packet Size EP0: {}", desc.max_packet_size0);
-                println!("  Configurations: {}", desc.num_configurations);
 
-                // Check if it's a mass storage device (class 8) or hub (class 9)
-                if desc.device_class == 0 {
-                    println!("  Class defined at interface level");
-                } else if desc.device_class == 8 {
-                    println!("  Mass Storage Device!");
+                // Print device class type
+                if desc.device_class == 8 {
+                    println!(", Mass Storage");
                 } else if desc.device_class == 9 {
-                    println!("  Hub Device - will enumerate downstream devices");
-                    // Enumerate devices connected through this hub
+                    println!(", Hub");
                     self.enumerate_hub(slot_id, port, ep0_ring_virt, ep0_ring_phys, &mut ep0_enqueue);
+                } else {
+                    println!();
                 }
             }
+        } else {
+            println!(" - Descriptor failed");
         }
 
         Some(slot_id)
@@ -1101,30 +836,9 @@ impl UsbDriver {
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
 
-            // Debug: print TRBs for slot 2 (hub device)
-            if slot_id == 2 {
-                print!("    TRB[{}] Setup: ctrl=", start_idx);
-                print_hex32((*ep0_ring_virt.add(start_idx)).control);
-                println!();
-                if has_data {
-                    print!("    TRB[{}] Data:  ctrl=", start_idx + 1);
-                    print_hex32((*ep0_ring_virt.add(start_idx + 1)).control);
-                    println!();
-                    print!("    TRB[{}] Status: ctrl=", start_idx + 2);
-                    print_hex32((*ep0_ring_virt.add(start_idx + 2)).control);
-                    println!();
-                } else {
-                    print!("    TRB[{}] Status: ctrl=", start_idx + 1);
-                    print_hex32((*ep0_ring_virt.add(start_idx + 1)).control);
-                    println!();
-                }
-            }
         }
 
         // Ring doorbell for EP0
-        if slot_id == 2 {
-            println!("    Ringing doorbell: slot={}, target=1", slot_id);
-        }
         self.ring_doorbell(slot_id, 1);
 
         // Wait for completion - longer wait for hub devices
@@ -1134,8 +848,6 @@ impl UsbDriver {
         // Poll for transfer event
         let mut result: Option<(u32, u32)> = None;
         let mut erdp_to_update: Option<u64> = None;
-        let mut event_count = 0u32;
-        let mut other_event_types = 0u32;
 
         // Use more iterations for downstream hub devices
         let max_iterations = if slot_id == 2 { 300 } else { 100 };
@@ -1144,93 +856,41 @@ impl UsbDriver {
             for _ in 0..max_iterations {
                 if let Some(evt) = event_ring.dequeue() {
                     let evt_type = evt.get_type();
-                    event_count += 1;
-                    // Always update ERDP for any consumed event
                     erdp_to_update = Some(event_ring.erdp());
 
                     if evt_type == trb_type::TRANSFER_EVENT {
                         let cc = (evt.status >> 24) & 0xFF;
                         let remaining = evt.status & 0xFFFFFF;
-                        let evt_slot = (evt.control >> 24) & 0xFF;
-                        println!("  Transfer event: slot={}, CC={}, remain={}", evt_slot, cc, remaining);
                         result = Some((cc, remaining));
                         break;
-                    } else {
-                        // Track other event types
-                        other_event_types |= 1 << evt_type;
                     }
                 }
                 delay(1000);
             }
-
         }
 
         // If no events found but EINT is set, retry with extra delay
-        if result.is_none() && event_count == 0 {
+        if result.is_none() {
             let usbsts = self.op_read32(xhci_op::USBSTS);
-            if (usbsts & (1 << 3)) != 0 {  // EINT set
-                if slot_id == 2 {
-                    println!("    EINT set, retrying poll...");
-                }
-                delay(50000);  // Extra 50ms wait
+            if (usbsts & (1 << 3)) != 0 {
+                delay(50000);
                 if let Some(ref mut event_ring) = self.event_ring {
                     for _ in 0..100 {
                         if let Some(evt) = event_ring.dequeue() {
                             let evt_type = evt.get_type();
-                            event_count += 1;
                             erdp_to_update = Some(event_ring.erdp());
 
                             if evt_type == trb_type::TRANSFER_EVENT {
                                 let cc = (evt.status >> 24) & 0xFF;
                                 let remaining = evt.status & 0xFFFFFF;
-                                let evt_slot = (evt.control >> 24) & 0xFF;
-                                println!("  Transfer event (retry): slot={}, CC={}, remain={}", evt_slot, cc, remaining);
                                 result = Some((cc, remaining));
                                 break;
-                            } else {
-                                other_event_types |= 1 << evt_type;
                             }
                         }
                         delay(1000);
                     }
                 }
             }
-        }
-
-        if event_count == 0 {
-            println!("  (no events received)");
-            // Debug for slot 2: check USBSTS and EP context
-            if slot_id == 2 {
-                let usbsts = self.op_read32(xhci_op::USBSTS);
-                print!("    USBSTS=");
-                print_hex32(usbsts);
-                if usbsts & (1 << 2) != 0 { print!(" HSE"); }  // Host System Error
-                if usbsts & (1 << 3) != 0 { print!(" EINT"); } // Event Interrupt
-                if usbsts & (1 << 4) != 0 { print!(" PCD"); }  // Port Change Detect
-                if usbsts & (1 << 12) != 0 { print!(" HCE"); } // Host Controller Error
-                println!();
-
-                // Dump raw event ring entries to debug
-                if let Some(ref event_ring) = self.event_ring {
-                    println!("    Event ring state: deq={}, cycle={}", event_ring.dequeue, event_ring.cycle);
-                    unsafe {
-                        for i in 0..4usize {
-                            let idx = event_ring.dequeue + i;
-                            if idx < 64 {
-                                let trb = &*event_ring.trbs.add(idx);
-                                print!("    Raw TRB[{}]: ctrl=", idx);
-                                print_hex32(trb.control);
-                                let trb_cycle = trb.control & 1;
-                                print!(" cycle={}", trb_cycle);
-                                let trb_type = (trb.control >> 10) & 0x3F;
-                                println!(" type={}", trb_type);
-                            }
-                        }
-                    }
-                }
-            }
-        } else if result.is_none() {
-            println!("  ({} events, no transfer, types=0x{:x})", event_count, other_event_types);
         }
 
         // Update ERDP outside the borrow
@@ -1246,10 +906,8 @@ impl UsbDriver {
         }
     }
 
-    /// Send SET_CONFIGURATION request
+    /// Send SET_CONFIGURATION request (silent unless error)
     fn set_configuration(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, config: u8) -> bool {
-        println!("  SET_CONFIGURATION({})...", config);
-
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
             0x00,  // Host-to-device, standard, device
@@ -1257,53 +915,21 @@ impl UsbDriver {
             config as u16,
             0, 0, 0
         ) {
-            Some((cc, _)) if cc == trb_cc::SUCCESS => {
-                println!("    Configuration set");
-                true
-            }
-            Some((cc, _)) => {
-                print!("    Failed: CC=");
-                print_hex32(cc);
-                println!();
-                false
-            }
-            None => {
-                println!("    No response");
-                false
-            }
+            Some((cc, _)) if cc == trb_cc::SUCCESS => true,
+            _ => false
         }
     }
 
-    /// Get Hub Descriptor (SuperSpeed)
+    /// Get Hub Descriptor (SuperSpeed) - silent
     fn get_hub_descriptor(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, buf_phys: u64) -> Option<u8> {
-        println!("  Getting Hub Descriptor...");
-
-        // For USB3 hubs, use SS Hub Descriptor type (0x2A)
-        // Use hub helper to get setup packet values
-        let setup = get_hub_descriptor_setup(true);  // true = SuperSpeed
+        let setup = get_hub_descriptor_setup(true);
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
-            setup.request_type,
-            setup.request,
-            setup.value,
-            setup.index,
-            buf_phys,
-            setup.length
+            setup.request_type, setup.request, setup.value, setup.index,
+            buf_phys, setup.length
         ) {
-            Some((cc, len)) if completion_code::is_success(cc) => {
-                println!("    Got {} bytes", len);
-                Some(len as u8)
-            }
-            Some((cc, _)) => {
-                print!("    Failed: CC=");
-                print_hex32(cc);
-                println!();
-                None
-            }
-            None => {
-                println!("    No response");
-                None
-            }
+            Some((cc, len)) if completion_code::is_success(cc) => Some(len as u8),
+            _ => None
         }
     }
 
@@ -1369,102 +995,57 @@ impl UsbDriver {
     }
 
     /// Enumerate devices connected through a hub
+    /// Enumerate hub - mostly silent, only prints port count and connected devices
     fn enumerate_hub(&mut self, hub_slot: u32, hub_port: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize) {
-        println!();
-        println!("=== Enumerating Hub (Slot {}) ===", hub_slot);
-
         // Allocate buffer for hub descriptor and port status
         let mut buf_phys: u64 = 0;
         let buf_virt = syscall::mmap_dma(4096, &mut buf_phys);
         if buf_virt < 0 {
-            println!("  Failed to allocate buffer");
             return;
         }
 
-        // Step 1: Set configuration to activate hub
+        // Set configuration to activate hub
         if !self.set_configuration(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, 1) {
             return;
         }
 
-        // Step 1.5: Set hub depth (required for USB3 hubs before get_hub_descriptor)
-        // Hub depth = 0 for hubs directly connected to root port
-        println!("  SET_HUB_DEPTH(0)...");
-        match self.control_transfer(
+        // Set hub depth (required for USB3 hubs)
+        let _ = self.control_transfer(
             hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
-            0x20,  // Host-to-device, Class, Device
-            hub::SET_HUB_DEPTH,
-            0,     // wValue: depth = 0 (directly connected to root)
-            0, 0, 0
-        ) {
-            Some((cc, _)) if cc == trb_cc::SUCCESS => {
-                println!("    Hub depth set");
-            }
-            Some((cc, _)) => {
-                print!("    SET_HUB_DEPTH failed: CC=");
-                print_hex32(cc);
-                println!();
-                // Continue anyway - some hubs might not require this
-            }
-            None => {
-                println!("    SET_HUB_DEPTH: no response (continuing anyway)");
-            }
-        }
+            0x20, hub::SET_HUB_DEPTH, 0, 0, 0, 0
+        );
 
-        // Step 2: Get hub descriptor to find port count
+        // Get hub descriptor to find port count
         let _hub_desc_len = match self.get_hub_descriptor(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, buf_phys) {
             Some(len) => len,
-            None => {
-                println!("  Failed to get hub descriptor");
-                return;
-            }
+            None => return,
         };
 
-        // U-Boot pattern: invalidate cache before reading data that hardware wrote
         unsafe {
-            core::arch::asm!(
-                "dc civac, {addr}",
-                addr = in(reg) buf_virt,
-                options(nostack, preserves_flags)
-            );
+            core::arch::asm!("dc civac, {addr}", addr = in(reg) buf_virt, options(nostack, preserves_flags));
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
         let hub_desc = unsafe { &*(buf_virt as *const SsHubDescriptor) };
         let num_ports = hub_desc.num_ports;
-        let pwr_time = hub_desc.pwr_on_2_pwr_good as u32 * 2;  // Convert to ms
-        println!("  Hub has {} ports, power-on time: {}ms", num_ports, pwr_time);
+        let pwr_time = hub_desc.pwr_on_2_pwr_good as u32 * 2;
+        println!("    {} ports", num_ports);
 
-        // Step 2.5: Update hub's Slot Context via EVALUATE_CONTEXT
-        // This tells xHCI that this device is a hub so it can route downstream devices
-        println!("  Configuring hub slot context...");
+        // Update hub's Slot Context via EVALUATE_CONTEXT
         {
-            // Allocate input context for evaluate
             let mut eval_ctx_phys: u64 = 0;
             let eval_ctx_virt = syscall::mmap_dma(4096, &mut eval_ctx_phys);
             if eval_ctx_virt >= 0 {
                 unsafe {
                     let input = eval_ctx_virt as *mut InputContext;
                     *input = InputContext::new();
-
-                    // Only evaluating Slot Context (A0 = 1)
                     (*input).control.add_flags = 0x1;
-
-                    // Set Slot Context fields properly:
-                    // dw0: Hub bit [26], Speed [23:20], Context Entries [31:27]
-                    // dw1: Root Hub Port [23:16], Number of Ports [31:24]
                     (*input).slot.set_hub(true);
-                    (*input).slot.set_speed(4);  // SuperSpeed
+                    (*input).slot.set_speed(4);
                     (*input).slot.set_context_entries(1);
                     (*input).slot.set_root_hub_port(hub_port);
                     (*input).slot.set_num_ports(num_ports as u32);
-
-                    print!("    Slot ctx: dw0=");
-                    print_hex32((*input).slot.dw0);
-                    print!(", dw1=");
-                    print_hex32((*input).slot.dw1);
-                    println!();
                 }
 
-                // Send EVALUATE_CONTEXT command
                 if let Some(ref mut cmd_ring) = self.cmd_ring {
                     let mut trb = Trb::new();
                     trb.param = eval_ctx_phys;
@@ -1472,87 +1053,48 @@ impl UsbDriver {
                     trb.control |= (hub_slot & 0xFF) << 24;
                     cmd_ring.enqueue(&trb);
                     self.ring_doorbell(0, 0);
-
                     delay(10000);
 
-                    // Check result - properly handle all events
-                    let mut eval_result: Option<u32> = None;
                     let mut erdp_to_update: Option<u64> = None;
-
                     if let Some(ref mut event_ring) = self.event_ring {
                         for _ in 0..20 {
                             if let Some(evt) = event_ring.dequeue() {
-                                // Always track ERDP for any consumed event
                                 erdp_to_update = Some(event_ring.erdp());
-
                                 if evt.get_type() == trb_type::COMMAND_COMPLETION {
-                                    let cc = (evt.status >> 24) & 0xFF;
-                                    eval_result = Some(cc);
                                     break;
                                 }
-                                // Ignore other events but acknowledge them
                             }
                             delay(1000);
                         }
                     }
-
-                    // Update ERDP for all consumed events
                     if let Some(erdp) = erdp_to_update {
                         self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
-                    }
-
-                    if let Some(cc) = eval_result {
-                        if cc == trb_cc::SUCCESS {
-                            println!("    Hub context updated");
-                        } else {
-                            print!("    Evaluate Context failed: CC=");
-                            print_hex32(cc);
-                            println!();
-                        }
                     }
                 }
             }
         }
 
-        // Step 3: Power on all ports
-        println!("  Powering hub ports...");
+        // Power on all ports (silent)
         for port in 1..=num_ports as u16 {
-            if self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::PORT_POWER) {
-                print!("    Port {} powered", port);
-            } else {
-                print!("    Port {} power failed", port);
-            }
-            println!();
+            self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::PORT_POWER);
         }
 
-        // Wait for power stabilization (use hub's time + extra margin)
-        let wait_time = pwr_time.max(500);  // At least 500ms
-        print!("  Waiting {}ms for power stabilization", wait_time);
-        for i in 0..wait_time {
+        // Wait for power stabilization
+        let wait_time = pwr_time.max(500);
+        for _ in 0..wait_time {
             delay(1000);
-            if i % 100 == 99 {
-                print!(".");
-            }
         }
-        println!(" done");
 
-        // Step 4: Check port status and enumerate connected devices
-        println!("  Checking port status...");
+        // Check port status and enumerate connected devices
         let buf_virt_u64 = buf_virt as u64;
         for port in 1..=num_ports as u16 {
             if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
-                print!("    Port {}: status=0x{:04x} change=0x{:04x}", port, ps.status, ps.change);
-
                 if (ps.status & hub::PS_CONNECTION) != 0 {
-                    println!(" [CONNECTED]");
-
                     // Clear connection change
                     self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::C_PORT_CONNECTION);
 
                     // Reset the port
-                    println!("    Resetting port {}...", port);
                     if !self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::PORT_RESET) {
-                        println!("      Reset failed");
                         continue;
                     }
 
@@ -1561,53 +1103,34 @@ impl UsbDriver {
                         delay(10000);
                         if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
                             if (ps2.change & hub::PS_C_RESET) != 0 {
-                                // Clear reset change
                                 self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::C_PORT_RESET);
-
                                 if (ps2.status & hub::PS_ENABLE) != 0 {
-                                    println!("      Port enabled after reset");
-                                    // Wait for device to be ready after reset (USB 3.0: 10ms min)
-                                    println!("      Waiting 100ms for device...");
                                     for _ in 0..100 {
                                         delay(1000);
                                     }
-                                    // Now enumerate the device!
                                     self.enumerate_hub_device(hub_slot, hub_port, port as u32);
-                                } else {
-                                    println!("      Port not enabled after reset");
                                 }
                                 break;
                             }
                         }
                     }
-                } else {
-                    println!(" [empty]");
                 }
-            } else {
-                println!("    Port {}: status read failed", port);
             }
         }
     }
 
-    /// Enumerate a device connected to a hub port
+    /// Enumerate a device connected to a hub port (mostly silent)
     fn enumerate_hub_device(&mut self, hub_slot: u32, root_port: u32, hub_port: u32) {
-        println!();
-        println!("=== Enumerating Device on Hub Port {} ===", hub_port);
-
-        // Step 1: Enable a new slot for this device
+        // Enable a new slot for this device
         let slot_id = match self.enable_slot() {
             Some(id) => id,
-            None => {
-                println!("  Failed to enable slot");
-                return;
-            }
+            None => return,
         };
 
-        // Step 2: Allocate context memory
+        // Allocate context memory
         let mut ctx_phys: u64 = 0;
         let ctx_virt = syscall::mmap_dma(4096, &mut ctx_phys);
         if ctx_virt < 0 {
-            println!("  Failed to allocate context memory");
             return;
         }
 
@@ -1627,162 +1150,79 @@ impl UsbDriver {
             link.param = ep0_ring_phys;
             link.set_type(trb_type::LINK);
             link.control |= 1 << 5;
-
-            // U-Boot pattern: flush EP0 ring to memory after initialization
             for i in 0..64 {
                 let addr = ep0_ring_virt.add(i) as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
+                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
 
-        // Get hub's port status to determine device speed
-        // For now, assume SuperSpeed since we came from a USB3 hub
-        let speed = 4u32;  // SuperSpeed
+        // Assume SuperSpeed since we came from a USB3 hub
+        let speed = 4u32;
         let max_packet_size = 512u32;
 
-        println!("  Slot {} for hub port {} device", slot_id, hub_port);
-
-        // Step 3: Initialize Input Context
+        // Initialize Input Context for Address Device command
+        // Add flags 0x3 = add Slot Context (bit 0) and EP0 Context (bit 1)
         unsafe {
             let input = &mut *input_ctx_virt;
             *input = InputContext::new();
             input.control.add_flags = 0x3;
 
-            // Slot Context - include hub info
-            // Route String: for tier-1 hub device, route string = port number (1-15)
+            // Slot Context: route string identifies path through hub topology
+            // For tier-1 hub device, route string = hub port number (1-15)
             input.slot.set_route_string(hub_port);
             input.slot.set_speed(speed);
             input.slot.set_context_entries(1);
             input.slot.set_root_hub_port(root_port);
 
-            // dw2 fields for hub-attached devices:
-            // - dw2[7:0]  = Hub Slot ID
-            // - dw2[15:8] = Parent Port Number
-            // - dw2[22:16] = TT Hub Slot ID (LS/FS behind HS hub only)
-            // - dw2[31:24] = TT Port Number (LS/FS behind HS hub only)
-            //
-            // For SuperSpeed devices behind SuperSpeed hubs, the xHCI spec says
-            // Hub Slot ID should be set, BUT setting it causes CC=17 (Slot Not Enabled)
-            // errors. The routing is handled by Route String in dw0 for SS.
-            // Keep dw2=0 for SuperSpeed devices - control and bulk OUT work fine.
-            if speed <= 2 {
-                // Low/Full-Speed needs TT info
-                input.slot.dw2 = (hub_slot << 0) | (hub_port << 8);
-                println!("  Setting Hub Slot ID={}, Parent Port={} (LS/FS)", hub_slot, hub_port);
-            } else {
-                // SuperSpeed/High-Speed - route string handles it
-                input.slot.dw2 = 0;
-                println!("  SuperSpeed device - routing via route string only");
-            }
+            // dw2: Hub Slot ID and Parent Port (only for LS/FS behind HS hub)
+            // SuperSpeed devices use route string for routing, not dw2
+            input.slot.dw2 = if speed <= 2 { (hub_slot << 0) | (hub_port << 8) } else { 0 };
 
-            print!("  Child slot ctx: dw0=");
-            print_hex32(input.slot.dw0);
-            print!(", dw1=");
-            print_hex32(input.slot.dw1);
-            print!(", dw2=");
-            print_hex32(input.slot.dw2);
-            println!();
-            println!("    Route={}, Speed={}, RootPort={}", hub_port, speed, root_port);
-
-            // EP0 Context
+            // EP0 Context: control endpoint with max packet size for speed
             input.endpoints[0].set_ep_type(ep_type::CONTROL);
             input.endpoints[0].set_max_packet_size(max_packet_size);
-            input.endpoints[0].set_cerr(3);
-            input.endpoints[0].set_tr_dequeue_ptr(ep0_ring_phys, true);
+            input.endpoints[0].set_cerr(3);  // 3 retries on error
+            input.endpoints[0].set_tr_dequeue_ptr(ep0_ring_phys, true);  // DCS=1
             input.endpoints[0].set_average_trb_length(8);
 
-            // U-Boot pattern: flush input context to memory
+            // Flush input context to memory (CPU wrote, xHCI will read via DMA)
             let input_addr = input_ctx_virt as u64;
             let input_size = core::mem::size_of::<InputContext>();
             for offset in (0..input_size).step_by(64) {
                 let addr = input_addr + offset as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
+                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
 
+            // Initialize output Device Context (xHCI will write to this)
             let device = &mut *device_ctx_virt;
             *device = DeviceContext::new();
-
-            // U-Boot pattern: flush device context to memory
             let device_addr = device_ctx_virt as u64;
             let device_size = core::mem::size_of::<DeviceContext>();
             for offset in (0..device_size).step_by(64) {
                 let addr = device_addr + offset as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
+                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
 
-        // Step 4: Set DCBAA entry
+        // Set DCBAA entry - xHCI uses this to find the device's output context
         let dcbaa = self.xhci_mem as *mut u64;
         unsafe {
-            // Debug: show hub's DCBAA entry to verify it's still valid
-            let hub_dcbaa_entry = *dcbaa.add(hub_slot as usize);
-            print!("  DCBAA[{}] (hub) = ", hub_slot);
-            print_hex64(hub_dcbaa_entry);
-            println!();
-
             *dcbaa.add(slot_id as usize) = device_ctx_phys;
-
-            // U-Boot pattern: flush DCBAA entry to memory
+            // Flush DCBAA entry to memory
             let dcbaa_entry_addr = dcbaa.add(slot_id as usize) as u64;
-            core::arch::asm!(
-                "dc cvac, {addr}",
-                addr = in(reg) dcbaa_entry_addr,
-                options(nostack, preserves_flags)
-            );
+            core::arch::asm!("dc cvac, {addr}", addr = in(reg) dcbaa_entry_addr, options(nostack, preserves_flags));
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-
-            print!("  DCBAA[{}] (child) = ", slot_id);
-            print_hex64(device_ctx_phys);
-            println!();
-
-            // Verify input context values
-            let input = &*input_ctx_virt;
-            print!("  Input control: add=");
-            print_hex32(input.control.add_flags);
-            print!(", drop=");
-            print_hex32(input.control.drop_flags);
-            println!();
-
-            print!("  Input EP0: dw0=");
-            print_hex32(input.endpoints[0].dw0);
-            print!(", dw1=");
-            print_hex32(input.endpoints[0].dw1);
-            print!(", tr_dequeue=");
-            // TR Dequeue is in dw2 (lo) and dw3 (hi)
-            let tr_dequeue = (input.endpoints[0].dw2 as u64) | ((input.endpoints[0].dw3 as u64) << 32);
-            print_hex64(tr_dequeue);
-            println!();
         }
 
-        // Add a delay to ensure Enable Slot has fully completed and device is ready
-        println!("  Waiting 200ms before addressing...");
+        // Wait 200ms before addressing - device needs time after reset
         for _ in 0..200 {
             delay(1000);
         }
 
-        // Step 5: Address Device
-        println!("  Addressing device (slot {})...", slot_id);
-
-        // Debug: show command ring state
-        if let Some(ref cmd_ring) = self.cmd_ring {
-            println!("    Cmd ring: enq={}, cycle={}", cmd_ring.enqueue, cmd_ring.cycle);
-        }
-
+        // Address Device command
         {
             let cmd_ring = match self.cmd_ring.as_mut() {
                 Some(r) => r,
@@ -1792,160 +1232,82 @@ impl UsbDriver {
             trb.param = input_ctx_phys;
             trb.set_type(trb_type::ADDRESS_DEVICE);
             trb.control |= (slot_id & 0xFF) << 24;
-            let trb_addr = cmd_ring.enqueue(&trb);
-            print!("    TRB at ");
-            print_hex64(trb_addr);
-            print!(", input_ctx=");
-            print_hex64(input_ctx_phys);
-            println!();
+            cmd_ring.enqueue(&trb);
             self.ring_doorbell(0, 0);
         }
 
-        // Wait for Address Device (can take longer for devices behind hubs)
         for _ in 0..100 {
             delay(1000);
         }
 
-        // Debug: show event ring state
-        if let Some(ref event_ring) = self.event_ring {
-            println!("    Event ring: deq={}, cycle={}", event_ring.dequeue, event_ring.cycle);
-        }
-
-        // Poll for Address Device completion - properly handle all events
+        // Poll for Address Device completion
         let mut addr_result: Option<u32> = None;
         let mut erdp_to_update: Option<u64> = None;
 
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..50 {
                 if let Some(evt) = event_ring.dequeue() {
-                    // Always track ERDP for any consumed event
                     erdp_to_update = Some(event_ring.erdp());
-
-                    println!("    Event: type={}, status={:08x}, ctrl={:08x}",
-                             evt.get_type(), evt.status, evt.control);
                     if evt.get_type() == trb_type::COMMAND_COMPLETION {
                         let cc = (evt.status >> 24) & 0xFF;
                         addr_result = Some(cc);
                         break;
                     }
-                    // Ignore other events but acknowledge them
                 }
                 delay(1000);
             }
         }
 
-        // Update ERDP for all consumed events
         if let Some(erdp) = erdp_to_update {
             self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
         }
 
         let addr_ok = match addr_result {
             Some(cc) if cc == trb_cc::SUCCESS => true,
-            Some(cc) => {
-                print!("  Address failed: CC=");
-                print_hex32(cc);
-                println!();
-                false
-            }
-            None => false,
+            _ => false,
         };
 
         if !addr_ok {
-            println!("  Failed to address device");
             return;
         }
 
-        let dev_addr = unsafe { (*device_ctx_virt).slot.dw3 & 0xFF };
-        println!("  Device address: {}", dev_addr);
-
-        // Debug: Dump device context after Address Device
-        unsafe {
-            let dev_ctx = &*device_ctx_virt;
-            print!("  Output slot ctx: dw0=");
-            print_hex32(dev_ctx.slot.dw0);
-            print!(", dw3=");
-            print_hex32(dev_ctx.slot.dw3);
-            println!();
-            print!("  Output EP0 ctx: dw0=");
-            print_hex32(dev_ctx.endpoints[0].dw0);
-            print!(", dw1=");
-            print_hex32(dev_ctx.endpoints[0].dw1);
-            println!();
-            // Print TR Dequeue Pointer from output context
-            let tr_deq_lo = dev_ctx.endpoints[0].dw2;
-            let tr_deq_hi = dev_ctx.endpoints[0].dw3;
-            let tr_dequeue_out = (tr_deq_lo as u64) | ((tr_deq_hi as u64) << 32);
-            print!("    TR Dequeue (output): ");
-            print_hex64(tr_dequeue_out);
-            print!(" (expected: ");
-            print_hex64(ep0_ring_phys | 1);  // with DCS=1
-            println!(")");
-            let ep0_state = dev_ctx.endpoints[0].dw0 & 0x7;
-            println!("    EP0 state: {} (0=Disabled, 1=Running, 2=Halted, 3=Stopped)",
-                     ep0_state);
-        }
-
-        // Add delay for device to be ready
-        println!("  Waiting 100ms for device ready...");
+        // Wait for device ready
         for _ in 0..100 {
             delay(1000);
         }
 
-        // Step 6: Get Device Descriptor
-        println!("  Getting Device Descriptor...");
+        // Get Device Descriptor
         let mut desc_phys: u64 = 0;
         let desc_virt = syscall::mmap_dma(4096, &mut desc_phys);
         if desc_virt < 0 {
             return;
         }
 
-        // Track EP0 ring position for this device
         let mut dev_ep0_enqueue = 0usize;
 
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue,
-            0x80, usb_req::GET_DESCRIPTOR,
-            (usb_req::DESC_DEVICE << 8) as u16,
+            0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_DEVICE << 8) as u16,
             0, desc_phys, 18
         ) {
-            Some((cc, len)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
-                println!("  Got {} bytes", len);
+            Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
                 let desc = unsafe { &*(desc_virt as *const DeviceDescriptor) };
-                println!();
-                println!("  === Device Descriptor ===");
-                println!("  USB Version: {}.{}", desc.bcd_usb >> 8, (desc.bcd_usb >> 4) & 0xF);
-                println!("  Class: {}, Subclass: {}, Protocol: {}",
-                         desc.device_class, desc.device_subclass, desc.device_protocol);
-                print!("  Vendor ID: 0x");
-                print_hex32(desc.vendor_id as u32);
-                print!(", Product ID: 0x");
-                print_hex32(desc.product_id as u32);
-                println!();
-                println!("  Configurations: {}", desc.num_configurations);
-
-                // Check if we should probe for mass storage
-                let should_probe_msc = desc.device_class == 0 || desc.device_class == msc::CLASS;
-
-                if should_probe_msc {
-                    // Get Configuration Descriptor to find interfaces and endpoints
+                print!("  Hub port {}: ", hub_port);
+                if desc.device_class == 8 || desc.device_class == 0 {
+                    println!("Mass Storage");
                     self.configure_mass_storage(
                         slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue,
                         desc_virt as *mut u8, desc_phys, device_ctx_virt
                     );
+                } else {
+                    println!("Device class {}", desc.device_class);
                 }
             }
-            Some((cc, _)) => {
-                print!("  Get descriptor failed: CC=");
-                print_hex32(cc);
-                println!();
-            }
-            None => {
-                println!("  No response");
-            }
+            _ => {}
         }
     }
 
-    /// Configure a mass storage device
+    /// Configure a mass storage device (silent unless error)
     fn configure_mass_storage(
         &mut self,
         slot_id: u32,
@@ -1956,81 +1318,50 @@ impl UsbDriver {
         buf_phys: u64,
         device_ctx_virt: *mut DeviceContext,
     ) {
-        println!();
-        println!("=== Probing for Mass Storage ===");
-
-        // Step 1: Get Configuration Descriptor (first 9 bytes to get total length)
-        println!("  Reading Configuration Descriptor...");
+        // Get Configuration Descriptor (first 9 bytes to get total length)
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
-            0x80, usb_req::GET_DESCRIPTOR,
-            (usb_req::DESC_CONFIGURATION << 8) as u16,
+            0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_CONFIGURATION << 8) as u16,
             0, buf_phys, 9
         ) {
             Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
-                // U-Boot pattern: invalidate cache before reading data that hardware wrote
                 unsafe {
-                    core::arch::asm!(
-                        "dc civac, {addr}",
-                        addr = in(reg) buf_virt,
-                        options(nostack, preserves_flags)
-                    );
+                    core::arch::asm!("dc civac, {addr}", addr = in(reg) buf_virt, options(nostack, preserves_flags));
                     core::arch::asm!("dsb sy", options(nostack, preserves_flags));
                 }
                 let config = unsafe { &*(buf_virt as *const ConfigurationDescriptor) };
                 let total_len = config.total_length;
-                println!("  Config: {} interfaces, total {} bytes",
-                         config.num_interfaces, total_len);
 
-                // Now get the full configuration descriptor
                 if total_len > 9 && total_len <= 256 {
                     delay(10000);
                     match self.control_transfer(
                         slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
-                        0x80, usb_req::GET_DESCRIPTOR,
-                        (usb_req::DESC_CONFIGURATION << 8) as u16,
+                        0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_CONFIGURATION << 8) as u16,
                         0, buf_phys, total_len
                     ) {
                         Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
-                            // Invalidate cache for full config descriptor
                             unsafe {
-                                // Invalidate multiple cache lines for the full buffer
                                 let lines = (total_len as usize + 63) / 64;
                                 for i in 0..lines {
                                     let addr = (buf_virt as u64) + (i * 64) as u64;
-                                    core::arch::asm!(
-                                        "dc civac, {addr}",
-                                        addr = in(reg) addr,
-                                        options(nostack, preserves_flags)
-                                    );
+                                    core::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
                                 }
                                 core::arch::asm!("dsb sy", options(nostack, preserves_flags));
                             }
-                            // Parse the configuration descriptor hierarchy
                             self.parse_config_descriptor(
                                 slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
                                 buf_virt, total_len as usize, device_ctx_virt
                             );
                         }
-                        Some((cc, _)) => {
-                            print!("  Full config read failed: CC=");
-                            print_hex32(cc);
-                            println!();
-                        }
-                        None => println!("  No response to full config read"),
+                        _ => {}
                     }
                 }
             }
-            Some((cc, _)) => {
-                print!("  Config descriptor failed: CC=");
-                print_hex32(cc);
-                println!();
-            }
-            None => println!("  No response"),
+            _ => {}
         }
     }
 
-    /// Parse configuration descriptor and set up mass storage if found
+    /// Parse configuration descriptor and set up mass storage if found (silent)
     fn parse_config_descriptor(
         &mut self,
         slot_id: u32,
@@ -2048,9 +1379,6 @@ impl UsbDriver {
         let mut bulk_in_max_packet = 0u16;
         let mut bulk_out_max_packet = 0u16;
         let mut is_mass_storage = false;
-        let mut _interface_num = 0u8;
-
-        println!("  Parsing {} bytes of config data...", total_len);
 
         while offset + 2 <= total_len {
             let len = unsafe { *buf.add(offset) } as usize;
@@ -2062,54 +1390,27 @@ impl UsbDriver {
 
             match desc_type {
                 2 => {
-                    // Configuration Descriptor
                     if len >= 9 {
                         let config = unsafe { &*(buf.add(offset) as *const ConfigurationDescriptor) };
                         config_value = config.configuration_value;
-                        println!("    Configuration {}", config_value);
                     }
                 }
                 4 => {
-                    // Interface Descriptor
                     if len >= 9 {
                         let iface = unsafe { &*(buf.add(offset) as *const InterfaceDescriptor) };
-                        _interface_num = iface.interface_number;
-                        println!("    Interface {}: Class={}, Subclass={}, Protocol={}",
-                                 iface.interface_number, iface.interface_class,
-                                 iface.interface_subclass, iface.interface_protocol);
-
-                        // Check for Mass Storage Class
                         if iface.interface_class == msc::CLASS &&
                            iface.interface_subclass == msc::SUBCLASS_SCSI &&
                            iface.interface_protocol == msc::PROTOCOL_BOT {
-                            println!("    *** MASS STORAGE (SCSI/BOT) ***");
                             is_mass_storage = true;
                         }
                     }
                 }
                 5 => {
-                    // Endpoint Descriptor
                     if len >= 7 {
-                        // Read packed struct fields safely to avoid alignment issues
                         let ep_addr = unsafe { core::ptr::read_unaligned(buf.add(offset + 2)) };
                         let ep_attr = unsafe { core::ptr::read_unaligned(buf.add(offset + 3)) };
-                        let ep_max_pkt = unsafe {
-                            core::ptr::read_unaligned(buf.add(offset + 4) as *const u16)
-                        };
+                        let ep_max_pkt = unsafe { core::ptr::read_unaligned(buf.add(offset + 4) as *const u16) };
 
-                        let ep_num = ep_addr & 0x0F;
-                        let ep_dir = if (ep_addr & 0x80) != 0 { "IN" } else { "OUT" };
-                        let ep_type_str = match ep_attr & 0x03 {
-                            0 => "Control",
-                            1 => "Isochronous",
-                            2 => "Bulk",
-                            3 => "Interrupt",
-                            _ => "Unknown",
-                        };
-                        println!("      EP{} {}: {} (max {} bytes)",
-                                 ep_num, ep_dir, ep_type_str, ep_max_pkt);
-
-                        // Track bulk endpoints for mass storage
                         if is_mass_storage && (ep_attr & 0x03) == 2 {
                             if (ep_addr & 0x80) != 0 {
                                 bulk_in_ep = ep_addr;
@@ -2121,40 +1422,20 @@ impl UsbDriver {
                         }
                     }
                 }
-                _ => {
-                    // Skip other descriptors
-                }
+                _ => {}
             }
-
             offset += len;
         }
 
-        // If we found a mass storage interface with bulk endpoints, configure it
         if is_mass_storage && bulk_in_ep != 0 && bulk_out_ep != 0 {
-            println!();
-            println!("  Found Mass Storage device:");
-            print!("    Bulk IN:  EP");
-            print_hex8(bulk_in_ep);
-            println!(" (max {} bytes)", bulk_in_max_packet);
-            print!("    Bulk OUT: EP");
-            print_hex8(bulk_out_ep);
-            println!(" (max {} bytes)", bulk_out_max_packet);
-
-            // Set Configuration (use existing function, add delay)
             if self.set_configuration(slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, config_value) {
-                delay(50000);  // Wait for device to configure
+                delay(50000);
             }
-
-            // Configure bulk endpoints
-            self.setup_bulk_endpoints(
-                slot_id, device_ctx_virt,
-                bulk_in_ep, bulk_in_max_packet,
-                bulk_out_ep, bulk_out_max_packet
-            );
+            self.setup_bulk_endpoints(slot_id, device_ctx_virt, bulk_in_ep, bulk_in_max_packet, bulk_out_ep, bulk_out_max_packet);
         }
     }
 
-    /// Set up bulk endpoints for mass storage
+    /// Set up bulk endpoints for mass storage (silent)
     fn setup_bulk_endpoints(
         &mut self,
         slot_id: u32,
@@ -2164,60 +1445,42 @@ impl UsbDriver {
         bulk_out_ep: u8,
         bulk_out_max_packet: u16,
     ) {
-        println!();
-        println!("  Setting up bulk endpoints...");
-
         // Allocate transfer rings for bulk endpoints
         let mut bulk_in_ring_phys: u64 = 0;
         let bulk_in_ring_virt = syscall::mmap_dma(4096, &mut bulk_in_ring_phys);
-        if bulk_in_ring_virt < 0 {
-            println!("    Failed to allocate bulk IN ring");
-            return;
-        }
+        if bulk_in_ring_virt < 0 { return; }
 
         let mut bulk_out_ring_phys: u64 = 0;
         let bulk_out_ring_virt = syscall::mmap_dma(4096, &mut bulk_out_ring_phys);
-        if bulk_out_ring_virt < 0 {
-            println!("    Failed to allocate bulk OUT ring");
-            return;
-        }
+        if bulk_out_ring_virt < 0 { return; }
 
-        // Initialize the rings (sets up link TRBs)
+        // Initialize transfer rings with link TRBs
         let _bulk_in_ring = Ring::init(bulk_in_ring_virt as *mut Trb, bulk_in_ring_phys);
         let _bulk_out_ring = Ring::init(bulk_out_ring_virt as *mut Trb, bulk_out_ring_phys);
 
-        // Calculate DCI (Device Context Index) for each endpoint
+        // Calculate Device Context Index (DCI) for each endpoint
         // DCI = (endpoint_number * 2) + direction (0=OUT, 1=IN)
         let bulk_in_num = (bulk_in_ep & 0x0F) as u32;
         let bulk_out_num = (bulk_out_ep & 0x0F) as u32;
         let bulk_in_dci = bulk_in_num * 2 + 1;   // IN endpoint
         let bulk_out_dci = bulk_out_num * 2;     // OUT endpoint
 
-        println!("    Bulk IN DCI: {}, Bulk OUT DCI: {}", bulk_in_dci, bulk_out_dci);
-
         // Allocate Input Context for Configure Endpoint command
         let mut input_ctx_phys: u64 = 0;
         let input_ctx_virt = syscall::mmap_dma(4096, &mut input_ctx_phys);
-        if input_ctx_virt < 0 {
-            println!("    Failed to allocate input context");
-            return;
-        }
+        if input_ctx_virt < 0 { return; }
 
         // Set up Input Context for Configure Endpoint
         unsafe {
             let input = &mut *(input_ctx_virt as *mut InputContext);
-
-            // Clear the input context
             core::ptr::write_bytes(input, 0, 1);
 
-            // Input Control Context - add slot and both bulk endpoints
             // Add flags: bit 0 = slot, bit N = endpoint DCI N
             input.control.add_flags = 1 | (1 << bulk_in_dci) | (1 << bulk_out_dci);
 
-            // Copy current slot context and update context entries
+            // Copy current slot context and update context entries count
             let dev_ctx = &*device_ctx_virt;
             input.slot = dev_ctx.slot;
-            // Update context entries to include our new endpoints
             let max_dci = bulk_in_dci.max(bulk_out_dci);
             input.slot.set_context_entries(max_dci);
 
@@ -2239,22 +1502,17 @@ impl UsbDriver {
             input.endpoints[bulk_out_idx].set_tr_dequeue_ptr(bulk_out_ring_phys, true);
             input.endpoints[bulk_out_idx].set_average_trb_length(1024);
 
-            // U-Boot pattern: flush input context to memory after CPU writes
+            // Flush input context to memory
             let input_addr = input_ctx_virt as u64;
             let input_size = core::mem::size_of::<InputContext>();
             for offset in (0..input_size).step_by(64) {
                 let addr = input_addr + offset as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
+                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
 
         // Issue Configure Endpoint command
-        println!("    Sending Configure Endpoint command...");
         let mut cmd = Trb::new();
         cmd.param = input_ctx_phys;
         cmd.status = 0;
@@ -2265,7 +1523,6 @@ impl UsbDriver {
             cmd_ring.enqueue(&cmd);
         }
         self.ring_doorbell(0, 0);
-
         delay(50000);
 
         // Poll for completion
@@ -2275,15 +1532,7 @@ impl UsbDriver {
                 if let Some(evt) = event_ring.dequeue() {
                     if evt.get_type() == trb_type::COMMAND_COMPLETION {
                         let cc = (evt.status >> 24) & 0xFF;
-                        if cc == trb_cc::SUCCESS {
-                            println!("    Configure Endpoint: SUCCESS");
-                            config_ok = true;
-                        } else {
-                            print!("    Configure Endpoint failed: CC=");
-                            print_hex32(cc);
-                            println!();
-                        }
-                        // Update ERDP
+                        config_ok = cc == trb_cc::SUCCESS;
                         let erdp = event_ring.erdp() | (1 << 3);
                         self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp);
                         break;
@@ -2293,117 +1542,29 @@ impl UsbDriver {
             }
         }
 
-        if !config_ok {
-            println!("    Configure Endpoint did not complete");
-            return;
-        }
+        if !config_ok { return; }
 
-        // Debug: Check endpoint states after Configure Endpoint
-        // CRITICAL: Invalidate cache first - xHCI wrote to output context via DMA
+        // Invalidate device context cache
         unsafe {
             let dev_ctx_addr = device_ctx_virt as u64;
             let dev_ctx_size = core::mem::size_of::<DeviceContext>();
             for offset in (0..dev_ctx_size).step_by(64) {
                 let addr = dev_ctx_addr + offset as u64;
-                core::arch::asm!(
-                    "dc civac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
+                core::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-
-            let dev_ctx = &*device_ctx_virt;
-            println!("    Endpoint context details after configure:");
-
-            // Print slot context entries to verify it was updated
-            let slot_ctx_entries = (dev_ctx.slot.dw0 >> 27) & 0x1F;
-            println!("      Slot Context Entries: {} (should be {})", slot_ctx_entries, bulk_in_dci);
-
-            // Bulk OUT (DCI=2, index=1 in endpoints array)
-            let bulk_out_ctx = &dev_ctx.endpoints[(bulk_out_dci - 1) as usize];
-            let out_state = bulk_out_ctx.dw0 & 0x7;
-            let out_ep_type = (bulk_out_ctx.dw1 >> 3) & 0x7;
-            let out_max_pkt = (bulk_out_ctx.dw1 >> 16) & 0xFFFF;
-            let out_cerr = (bulk_out_ctx.dw1 >> 1) & 0x3;
-            print!("      EP OUT (DCI={}): ", bulk_out_dci);
-            print!("state={}, type={} (2=BulkOUT), ", out_state, out_ep_type);
-            print!("maxpkt={}, cerr={}", out_max_pkt, out_cerr);
-            println!();
-
-            // Bulk IN (DCI=5, index=4 in endpoints array)
-            let bulk_in_ctx = &dev_ctx.endpoints[(bulk_in_dci - 1) as usize];
-            let in_state = bulk_in_ctx.dw0 & 0x7;
-            let in_ep_type = (bulk_in_ctx.dw1 >> 3) & 0x7;
-            let in_max_pkt = (bulk_in_ctx.dw1 >> 16) & 0xFFFF;
-            let in_cerr = (bulk_in_ctx.dw1 >> 1) & 0x3;
-            print!("      EP IN (DCI={}): ", bulk_in_dci);
-            print!("state={}, type={} (6=BulkIN), ", in_state, in_ep_type);
-            print!("maxpkt={}, cerr={}", in_max_pkt, in_cerr);
-            println!();
-
-            // Print full dw0/dw1 for analysis
-            print!("      EP OUT raw: dw0=");
-            print_hex32(bulk_out_ctx.dw0);
-            print!(", dw1=");
-            print_hex32(bulk_out_ctx.dw1);
-            println!();
-            print!("      EP IN raw: dw0=");
-            print_hex32(bulk_in_ctx.dw0);
-            print!(", dw1=");
-            print_hex32(bulk_in_ctx.dw1);
-            println!();
-
-            // Print TR dequeue pointers with DCS bits
-            let out_deq_raw = (bulk_out_ctx.dw2 as u64) | ((bulk_out_ctx.dw3 as u64) << 32);
-            let out_dcs = bulk_out_ctx.dw2 & 1;
-            let in_deq_raw = (bulk_in_ctx.dw2 as u64) | ((bulk_in_ctx.dw3 as u64) << 32);
-            let in_dcs = bulk_in_ctx.dw2 & 1;
-            print!("      EP OUT TR Dequeue: ");
-            print_hex64(out_deq_raw & !0xF);
-            println!(", DCS={}", out_dcs);
-            print!("      EP IN TR Dequeue: ");
-            print_hex64(in_deq_raw & !0xF);
-            println!(", DCS={}", in_dcs);
-
-            // Verify against ring physical addresses
-            print!("      Expected OUT ring: ");
-            print_hex64(bulk_out_ring_phys);
-            println!();
-            print!("      Expected IN ring: ");
-            print_hex64(bulk_in_ring_phys);
-            println!();
-            if (out_deq_raw & !0xF) != bulk_out_ring_phys {
-                println!("      *** WARNING: OUT dequeue doesn't match ring base! ***");
-            }
-            if (in_deq_raw & !0xF) != bulk_in_ring_phys {
-                println!("      *** WARNING: IN dequeue doesn't match ring base! ***");
-            }
-            if out_dcs != 1 || in_dcs != 1 {
-                println!("      *** WARNING: DCS not 1 - cycle bits may mismatch! ***");
-            }
         }
 
         // Allocate data buffer for SCSI commands
         let mut data_phys: u64 = 0;
         let data_virt = syscall::mmap_dma(4096, &mut data_phys);
-        if data_virt < 0 {
-            println!("  Failed to allocate data buffer");
-            return;
-        }
+        if data_virt < 0 { return; }
 
-        // Create BulkContext and run SCSI tests
         let mut ctx = BulkContext::new(
-            slot_id,
-            bulk_in_dci,
-            bulk_out_dci,
-            bulk_in_ring_virt as *mut Trb,
-            bulk_in_ring_phys,
-            bulk_out_ring_virt as *mut Trb,
-            bulk_out_ring_phys,
-            data_virt as *mut u8,
-            data_phys,
-            device_ctx_virt,
+            slot_id, bulk_in_dci, bulk_out_dci,
+            bulk_in_ring_virt as *mut Trb, bulk_in_ring_phys,
+            bulk_out_ring_virt as *mut Trb, bulk_out_ring_phys,
+            data_virt as *mut u8, data_phys, device_ctx_virt,
         );
         self.run_scsi_tests(&mut ctx);
     }
@@ -2700,73 +1861,36 @@ impl UsbDriver {
     }
 
     /// Run SCSI tests using the new refactored code
+    /// Run SCSI tests - only prints capacity result
     fn run_scsi_tests(&mut self, ctx: &mut BulkContext) {
-        println!();
-        println!("=== Running SCSI Tests ===");
-
-        // First, wait for device to be ready with TEST_UNIT_READY
-        println!("  Waiting for device to initialize...");
+        // Wait for device to be ready
         let mut ready = false;
-        for attempt in 0..10 {
+        for _ in 0..10 {
             if self.scsi_test_unit_ready_ctx(ctx) {
                 ready = true;
                 break;
             }
-            // Wait a bit before retrying
-            println!("    Retry {} of 10...", attempt + 1);
             delay_ms(500);
         }
 
-        if !ready {
-            println!("  Device not ready after 10 attempts");
-            return;
-        }
+        if !ready { return; }
 
-        // Read capacity to know device size
+        // Read capacity and report
         if let Some((last_lba, block_size)) = self.scsi_read_capacity_10(ctx) {
-            println!();
-
-            // Read first sector (LBA 0) - usually contains MBR or GPT
-            if let Some(data) = self.scsi_read_10(ctx, 0, 1) {
-                println!("    Read {} bytes from LBA 0", data.len());
-
-                // Dump first 64 bytes
-                println!("    First 64 bytes:");
-                for row in 0..4 {
-                    print!("      {:04x}: ", row * 16);
-                    for col in 0..16 {
-                        if row * 16 + col < data.len() {
-                            print_hex8(data[row * 16 + col]);
-                            print!(" ");
-                        }
-                    }
-                    println!();
-                }
-
-                // Check for MBR signature (0x55, 0xAA at offset 510)
-                if data.len() >= 512 {
-                    if data[510] == 0x55 && data[511] == 0xAA {
-                        println!("    MBR signature found! (valid partition table)");
-                    } else {
-                        print!("    No MBR signature (bytes 510-511: ");
-                        print_hex8(data[510]);
-                        print!(" ");
-                        print_hex8(data[511]);
-                        println!(")");
-                    }
-                }
+            // Calculate and print size
+            let size_bytes = (last_lba as u64 + 1) * block_size as u64;
+            let size_mb = size_bytes / (1024 * 1024);
+            let size_gb = size_mb / 1024;
+            if size_gb > 0 {
+                println!("    Capacity: {} GB", size_gb);
+            } else {
+                println!("    Capacity: {} MB", size_mb);
             }
 
-            // Also try reading last sector if device is large enough
-            if last_lba > 0 && block_size == 512 {
-                println!();
-                println!("  Reading last sector (LBA {})...", last_lba);
-                if let Some(data) = self.scsi_read_10(ctx, last_lba, 1) {
-                    println!("    Read {} bytes from last sector", data.len());
-                }
+            // Verify we can read
+            if self.scsi_read_10(ctx, 0, 1).is_some() {
+                println!("    Read test: OK");
             }
-        } else {
-            println!("  Cannot run read tests without knowing device capacity");
         }
     }
 }
@@ -2778,41 +1902,22 @@ impl UsbDriver {
 // USB Clock and Reset Control
 // =============================================================================
 
-/// Initialize USB subsystem clocks and deassert resets
-/// This is required when NOT relying on U-Boot initialization
+/// Initialize USB subsystem clocks and deassert resets (silent)
 fn init_usb_clocks_and_resets() -> bool {
-    println!("=== USB Clock/Reset Initialization ===");
-    println!("  (Not relying on U-Boot)");
-
-    // Open infracfg_ao MMIO region
     let mut url_buf = [0u8; 32];
     let url_len = format_mmio_url(&mut url_buf, INFRACFG_AO_BASE, INFRACFG_AO_SIZE);
     let url = unsafe { core::str::from_utf8_unchecked(&url_buf[..url_len]) };
 
-    let fd = syscall::scheme_open(url, 2);  // O_RDWR
-    if fd < 0 {
-        println!("  Failed to open infracfg_ao: {}", fd);
-        return false;
-    }
+    let fd = syscall::scheme_open(url, 2);
+    if fd < 0 { return false; }
 
-    // Read virtual address
     let mut virt_buf = [0u8; 8];
     if syscall::read(fd as u32, &mut virt_buf) < 8 {
-        println!("  Failed to read infracfg_ao VA");
         syscall::close(fd as u32);
         return false;
     }
     let base = u64::from_le_bytes(virt_buf);
 
-    // Helper to read register
-    let read_reg = |offset: usize| -> u32 {
-        unsafe {
-            let ptr = (base + offset as u64) as *const u32;
-            core::ptr::read_volatile(ptr)
-        }
-    };
-
-    // Helper to write register
     let write_reg = |offset: usize, value: u32| {
         unsafe {
             let ptr = (base + offset as u64) as *mut u32;
@@ -2820,48 +1925,14 @@ fn init_usb_clocks_and_resets() -> bool {
         }
     };
 
-    // Dump current state for diagnostics
-    println!();
-    println!("  Current register state:");
-    print!("    RST0_STA=0x"); print_hex32(read_reg(INFRA_RST0_STA)); println!();
-    print!("    RST1_STA=0x"); print_hex32(read_reg(INFRA_RST1_STA)); println!();
-    print!("    CG0_STA=0x"); print_hex32(read_reg(INFRA_CG0_STA)); println!();
-    print!("    CG1_STA=0x"); print_hex32(read_reg(INFRA_CG1_STA)); println!();
-    print!("    CG2_STA=0x"); print_hex32(read_reg(INFRA_CG2_STA)); println!();
-
-    // Step 1: Deassert USB resets (write to CLR register)
-    println!();
-    println!("  Deasserting USB resets...");
+    // Deassert USB resets
     let usb_rst_bits = RST1_SSUSB_TOP0 | RST1_SSUSB_TOP1;
     write_reg(INFRA_RST1_CLR, usb_rst_bits);
     delay(1000);
 
-    // Verify resets deasserted
-    let rst1_after = read_reg(INFRA_RST1_STA);
-    print!("    RST1_STA after: 0x"); print_hex32(rst1_after);
-    if (rst1_after & usb_rst_bits) == 0 {
-        println!(" (resets deasserted)");
-    } else {
-        println!(" (WARNING: resets still asserted)");
-    }
-
-    // Step 2: Ungate USB clocks (write to CLR register to clear gate bits)
-    println!();
-    println!("  Ungating USB clocks...");
+    // Ungate USB clocks
     let usb_cg_bits = CG1_SSUSB0 | CG1_SSUSB1;
     write_reg(INFRA_CG1_CLR, usb_cg_bits);
-    delay(1000);
-
-    // Verify clocks ungated
-    let cg1_after = read_reg(INFRA_CG1_STA);
-    print!("    CG1_STA after: 0x"); print_hex32(cg1_after);
-    if (cg1_after & usb_cg_bits) == 0 {
-        println!(" (clocks ungated)");
-    } else {
-        println!(" (WARNING: clocks still gated)");
-    }
-
-    // Additional delay for clocks to stabilize
     delay(10000);
 
     syscall::close(fd as u32);
@@ -2872,54 +1943,23 @@ fn init_usb_clocks_and_resets() -> bool {
 // VBUS Power Control via GPIO Driver IPC
 // =============================================================================
 
-/// Request USB VBUS enable from the GPIO expander driver
-/// Returns true if successful, false if GPIO driver not available
-///
-/// BPI-R4 has a PCA9555 GPIO expander on I2C2 that controls USB VBUS.
-/// The GPIO driver must be started FIRST (`gpio` command) to enable VBUS.
-/// If VBUS isn't enabled, the integrated USB hub won't be powered and
-/// devices will appear directly on the root port instead of through the hub.
+/// Request USB VBUS enable from the GPIO expander driver (silent)
 fn request_vbus_enable() -> bool {
-    println!("=== Requesting USB VBUS Power ===");
-    println!("  Note: Run 'gpio' command first to enable USB VBUS");
-
-    // Connect to the GPIO driver
     let channel = syscall::port_connect(b"gpio");
-    if channel < 0 {
-        println!("  GPIO driver not available (error {})", channel);
-        println!("  WARNING: USB VBUS may not be enabled!");
-        println!("  Run 'gpio' command first, then 'usb'");
-        return false;
-    }
+    if channel < 0 { return false; }
     let ch = channel as u32;
-    println!("  Connected to GPIO driver (channel {})", ch);
 
-    // Send USB VBUS enable command: [GPIO_CMD_USB_VBUS, enable=1]
     let cmd = [GPIO_CMD_USB_VBUS, 1];
-    let send_result = syscall::send(ch, &cmd);
-    if send_result < 0 {
-        println!("  Failed to send VBUS enable command: {}", send_result);
+    if syscall::send(ch, &cmd) < 0 {
         syscall::channel_close(ch);
         return false;
     }
 
-    // Wait for response
     let mut response = [0u8; 1];
     let recv_result = syscall::receive(ch, &mut response);
     syscall::channel_close(ch);
 
-    if recv_result <= 0 {
-        println!("  No response from GPIO driver");
-        return false;
-    }
-
-    if response[0] as i8 == 0 {
-        println!("  USB VBUS power enabled!");
-        return true;
-    } else {
-        println!("  GPIO driver returned error: {}", response[0] as i8);
-        return false;
-    }
+    recv_result > 0 && response[0] as i8 == 0
 }
 
 // =============================================================================
@@ -3025,17 +2065,12 @@ impl IpcClient {
 
 #[unsafe(no_mangle)]
 fn main() {
-    println!("========================================");
-    println!("  USB Userspace Driver");
-    println!("  MT7988A SSUSB (Full Init)");
-    println!("========================================");
-    println!();
+    println!("USB driver starting...");
 
     // Register the "usb" port to ensure only one instance runs
-    // If another USB daemon is already running, this will fail
     let port_result = syscall::port_register(b"usb");
     if port_result < 0 {
-        if port_result == -17 {  // EEXIST
+        if port_result == -17 {
             println!("ERROR: USB daemon already running");
         } else {
             println!("ERROR: Failed to register USB port: {}", port_result);
@@ -3043,265 +2078,134 @@ fn main() {
         syscall::exit(1);
     }
     let usb_port = port_result as u32;
-    println!("  Registered 'usb' port (channel {})", usb_port);
 
-    // Request VBUS enable from GPIO driver before probing
-    // This powers the USB ports via the PCA9555 GPIO expander
-    println!();
+    // Request VBUS enable and wait for power stabilization
     let _vbus_ok = request_vbus_enable();
-
-    // Wait for power to stabilize after VBUS enable
-    println!();
-    println!("  Waiting for VBUS power stabilization...");
-    delay_ms(100);  // 100ms
+    delay_ms(100);
 
     // Initialize USB clocks and deassert resets
-    // This is needed when NOT relying on U-Boot
-    println!();
-    if !init_usb_clocks_and_resets() {
-        println!("WARNING: Clock/reset init failed - continuing anyway");
-    }
-
-    // Try both USB controllers to find one with a device
-    println!();
-    println!("=== Probing USB Controllers ===");
+    let _ = init_usb_clocks_and_resets();
 
     let mut driver: Option<UsbDriver> = None;
     let mut active_controller = 0u32;
 
     // Try SSUSB1 first (USB-A ports), then SSUSB0 (M.2 slot)
-    // SSUSB1 is more likely to work - it's the main USB port on BPI-R4
     for ctrl in [1u32, 0u32] {
-        println!();
-        println!("--- Trying SSUSB{} ---", ctrl);
-
         if let Some(mut d) = UsbDriver::new(ctrl) {
             if d.init() {
-                // Skip controllers with no ports (not properly initialized)
                 if d.xhci.max_ports() == 0 {
-                    println!("  SSUSB{} has 0 ports - skipping (PHY not initialized?)", ctrl);
                     continue;
                 }
-                // Check and display port power status (VBUS diagnostic)
-                d.check_power_status();
 
-                // Wait for hub/device to power up and connect (USB hubs need ~500ms)
-                println!("  Waiting for device connection...");
+                // Poll for device connection (up to 2 seconds)
                 let mut has_device = false;
-
-                // Poll for up to 2 seconds for device connection
-                for attempt in 0..20 {
+                for _ in 0..20 {
                     for p in 0..d.xhci.max_ports() {
-                        let portsc = d.xhci.read_portsc(p);
-
-                        if attempt == 0 || attempt == 19 {
-                            // Print PORTSC on first and last attempt
-                            print!("    Port {} PORTSC=0x", p + 1);
-                            print_hex32(portsc);
-                            let pls = (portsc >> 5) & 0xF;
-                            let ccs = portsc & 1;
-                            println!(" CCS={} PLS={}", ccs, pls);
-                        }
-
-                        if (portsc & 1) != 0 {  // CCS bit
+                        if (d.xhci.read_portsc(p) & 1) != 0 {
                             has_device = true;
-                            println!("  Found device on port {}!", p + 1);
+                            break;
                         }
                     }
-
-                    if has_device {
-                        break;
-                    }
-
-                    // Wait 100ms between polls
+                    if has_device { break; }
                     delay_ms(100);
                 }
 
-                // Keep the driver even if no device found - we can monitor for hotplug
                 driver = Some(d);
                 active_controller = ctrl;
-
-                if has_device {
-                    println!("  Device found, using SSUSB{}", ctrl);
-                    break;
-                } else {
-                    println!("  No devices found on SSUSB{} after 2s, but keeping driver", ctrl);
-                    // Continue to try the other controller - but only if we prefer finding a device
-                    // For now, just use the first working controller
-                    break;
-                }
+                break;
             }
-        } else {
-            println!("  Failed to map SSUSB{}", ctrl);
         }
     }
 
-    // Use whichever controller initialized successfully
     let mut driver = match driver {
         Some(d) => d,
         None => {
-            println!();
-            println!("ERROR: No USB controller could be initialized!");
+            println!("ERROR: No USB controller initialized");
             syscall::exit(1);
         }
     };
 
-    println!();
-    println!("=== Monitoring SSUSB{} ===", active_controller);
-
-    driver.print_port_status();
-
-    // Test command ring with No-Op
-    println!();
-    println!("=== Testing Command Ring ===");
+    // Test command ring and process events
     driver.send_noop();
-
-    // Poll for command completion
     delay_ms(10);
     driver.poll_events();
 
-    // Check for any pending port status change events
-    println!();
-    println!("=== Checking for Events ===");
-    if !driver.poll_events() {
-        println!("  No pending events");
-    }
-
     // Try port reset to detect devices
-    println!();
-    println!("=== Trying Port Reset ===");
     for p in 1..=driver.xhci.max_ports() as u32 {
         driver.reset_port(p);
-        delay_ms(50);  // Wait after reset
+        delay_ms(50);
     }
 
-    // Check port status again
-    driver.print_port_status();
-
-    // Poll for port status change events
-    println!();
-    println!("=== Post-Reset Events ===");
+    // Process post-reset events
     for _ in 0..5 {
-        if driver.poll_events() {
-            delay_ms(10);
-        } else {
-            break;
-        }
+        if !driver.poll_events() { break; }
+        delay_ms(10);
     }
-
-    // Final port status
-    driver.print_port_status();
 
     // Register for IRQ
-    // GIC SPI 172 = GIC interrupt ID 204 (SPI numbers start at GIC ID 32)
-    println!();
-    println!("=== IRQ Registration ===");
-    let irq_url = "irq:204";
-    let irq_fd = syscall::scheme_open(irq_url, 0);
+    let irq_fd = syscall::scheme_open("irq:204", 0);
     if irq_fd >= 0 {
-        println!("  IRQ {} registered (fd={})", mt7988a::SSUSB1_IRQ, irq_fd);
         driver.set_irq_fd(irq_fd);
-    } else {
-        println!("  IRQ registration failed: {}", irq_fd);
     }
 
-    println!();
-    println!("========================================");
-    println!("  USB initialization complete!");
-    println!("  Monitoring ports - plug in a device");
-    println!("========================================");
-
-    // Also open SSUSB0 for monitoring (Type-A might be there)
-    println!();
-    println!("=== Opening SSUSB0 for monitoring ===");
+    // Open SSUSB0 for monitoring
     let ssusb0_mac = MmioRegion::open(mt7988a::SSUSB0_MAC_PHYS, mt7988a::MAC_SIZE as u64);
 
-    // Poll ports on BOTH controllers
-    println!();
-    println!("=== Port Monitor (30 seconds) ===");
-    println!("  Monitoring SSUSB0 and SSUSB1 - try plugging device into different ports");
-
+    // Poll ports on BOTH controllers for device
     for round in 0..30 {
         let mut found = false;
+        let mut connected_port: Option<u32> = None;
 
         // Check SSUSB0 ports
         if let Some(ref mac0) = ssusb0_mac {
-            let cap0 = mac0.read32(mt7988a::IPPC_OFFSET + 0x24);  // IP_XHCI_CAP
+            let cap0 = mac0.read32(mt7988a::IPPC_OFFSET + 0x24);
             let num_ports0 = ((cap0 >> 8) & 0xF) + (cap0 & 0xF);
             let caplength0 = mac0.read32(0) & 0xFF;
             let port_base0 = caplength0 as usize + 0x400;
-
             for p in 0..num_ports0 {
-                let portsc = mac0.read32(port_base0 + (p as usize * 0x10));
-                let ccs = portsc & 1;
-                if ccs != 0 {
-                    print!("  [{}s] SSUSB0 Port {} CONNECTED! PORTSC=0x", round, p + 1);
-                    print_hex32(portsc);
-                    println!();
+                if (mac0.read32(port_base0 + (p as usize * 0x10)) & 1) != 0 {
                     found = true;
                 }
             }
         }
 
-        // Check SSUSB1 ports (using driver)
-        let mut connected_port: Option<u32> = None;
+        // Check SSUSB1 ports
         for p in 0..driver.xhci.max_ports() {
-            let portsc = driver.xhci.read_portsc(p);
-            let ccs = portsc & 1;
-            if ccs != 0 {
-                print!("  [{}s] SSUSB1 Port {} CONNECTED! PORTSC=0x", round, p + 1);
-                print_hex32(portsc);
-                println!();
+            if (driver.xhci.read_portsc(p) & 1) != 0 {
                 found = true;
-                connected_port = Some((p + 1) as u32);  // Ports are 1-indexed
+                connected_port = Some((p + 1) as u32);
             }
         }
 
         if found {
-            // Enumerate the connected device
             if let Some(port) = connected_port {
                 driver.enumerate_device(port);
             }
             break;
         }
-        if round % 5 == 0 {
-            println!("  [{}s] Waiting for device on either controller...", round);
-        }
-        // Wait 1 second
         delay_ms(1000);
     }
 
-    // Final status
-    driver.print_port_status();
-
-    // Daemonize - detach from shell and run in background
+    // Daemonize
     let result = syscall::daemonize();
     if result == 0 {
-        println!("  Daemonized - running as background USB driver");
-        println!("  Use 'ps' to see status, 'kill <pid>' to stop");
-        println!("  IPC: Listening for class driver connections on 'usb' port");
+        println!("USB daemon running");
 
-        // IPC client list (simple array for now)
         const MAX_CLIENTS: usize = 4;
         let mut clients: [Option<IpcClient>; MAX_CLIENTS] = [None, None, None, None];
         let mut num_clients = 0usize;
-
-        // Run forever as daemon, polling for USB events and handling IPC
         let mut poll_counter = 0u32;
+
         loop {
-            // Poll for USB events periodically
             poll_counter += 1;
             if poll_counter >= 100 {
                 poll_counter = 0;
                 driver.poll_events();
             }
 
-            // Try to accept new client connections (non-blocking)
             let accept_result = syscall::port_accept(usb_port);
             if accept_result > 0 && num_clients < MAX_CLIENTS {
                 let client_channel = accept_result as u32;
-                println!("  IPC: New client connected (channel {})", client_channel);
-                // Find empty slot
                 for i in 0..MAX_CLIENTS {
                     if clients[i].is_none() {
                         clients[i] = Some(IpcClient::new(client_channel));
