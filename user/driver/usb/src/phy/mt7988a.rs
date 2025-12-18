@@ -15,7 +15,6 @@
 
 use super::{PhyDriver, PhyError, PhyStatus};
 use crate::mmio::MmioRegion;
-use userlib::{print, println};
 
 /// T-PHY v2 register definitions
 mod tphy_regs {
@@ -89,40 +88,18 @@ impl Default for Mt7988aTphy {
 impl PhyDriver for Mt7988aTphy {
     fn init(&mut self) -> Result<(), PhyError> {
         // T-PHY doesn't need explicit init - it's ready after reset
-        // The main configuration is done in set_host_mode()
-        println!("  T-PHY v2: initialized");
         Ok(())
     }
 
     fn set_host_mode(&mut self) -> Result<(), PhyError> {
-        use crate::mmio::{delay_ms, print_hex32};
+        use crate::mmio::delay_ms;
 
-        println!();
-        println!("=== T-PHY v2 Host Mode Configuration ===");
-
-        // DTM1 is at offset 0x6C from USB2 PHY base (0x11c50000)
-        // Set host mode: force VBUS valid and A-valid signals
+        // Set host mode bits in DTM1 register (0x33):
+        // FORCE_VBUSVALID, FORCE_AVALID, RG_VBUSVALID, RG_AVALID
         let dtm1 = self.read32(tphy_regs::DTM1)?;
-        print!("    DTM1@0x{:x} before: 0x", tphy_regs::DTM1);
-        print_hex32(dtm1);
-        println!();
-
-        // Set host mode bits (0x33):
-        // - FORCE_VBUSVALID (bit 5) + RG_VBUSVALID (bit 1)
-        // - FORCE_AVALID (bit 4) + RG_AVALID (bit 0)
         let new_dtm1 = dtm1 | tphy_regs::HOST_MODE;
         self.write32(tphy_regs::DTM1, new_dtm1)?;
-
-        delay_ms(1);  // Wait for register to take effect
-
-        let dtm1_after = self.read32(tphy_regs::DTM1)?;
-        print!("    DTM1 after: 0x");
-        print_hex32(dtm1_after);
-        if dtm1_after != dtm1 {
-            println!(" (host mode configured)");
-        } else {
-            println!(" (WARNING: register unchanged!)");
-        }
+        delay_ms(1);
 
         self.host_mode = true;
         Ok(())
@@ -185,14 +162,12 @@ impl Default for Mt7988aXsphy {
 
 impl PhyDriver for Mt7988aXsphy {
     fn init(&mut self) -> Result<(), PhyError> {
-        println!("  XFI T-PHY (XS-PHY): initialized");
         Ok(())
     }
 
     fn set_host_mode(&mut self) -> Result<(), PhyError> {
         // XS-PHY configuration is more complex due to combo nature
         // For now, assume bootloader configured it
-        println!("  XS-PHY: host mode (using bootloader config)");
         self.host_mode = true;
         Ok(())
     }

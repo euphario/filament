@@ -23,7 +23,6 @@
 
 use super::{SocUsb, SocError, PortCount};
 use crate::mmio::MmioRegion;
-use userlib::{print, println};
 
 /// IPPC register offsets (from MAC base + IPPC_OFFSET)
 mod ippc {
@@ -187,64 +186,28 @@ impl Mt7988aSoc {
 
     /// Initialize IPPC (called during pre_init)
     fn ippc_init(&mut self) -> Result<(), SocError> {
-        use crate::mmio::{delay, print_hex32};
+        use crate::mmio::delay;
 
-        let ctrl_name = match self.id {
-            ControllerId::Ssusb0 => "SSUSB0",
-            ControllerId::Ssusb1 => "SSUSB1",
-        };
-
-        println!();
-        println!("=== {} IPPC Initialization ===", ctrl_name);
-
-        // Read initial status
+        // Read initial status to get port counts
         let sts1 = self.ippc_read32(ippc::IP_PW_STS1)?;
-        print!("  IP_PW_STS1 = 0x");
-        print_hex32(sts1);
 
-        // Extract port counts (MT7988A format may differ - cap to sane values)
+        // Extract port counts (cap to reasonable values)
         let mut usb3_raw = ((sts1 & ippc::sts::U3_PORT_NUM_MASK) >> ippc::sts::U3_PORT_NUM_SHIFT) as u8;
         let mut usb2_raw = (sts1 & ippc::sts::U2_PORT_NUM_MASK) as u8;
-        // MT7988A SSUSB1 has 1 USB3 + 1 USB2 port, SSUSB0 has 1 USB3 + 1 USB2
-        // Cap to reasonable values to avoid runaway loops
         if usb3_raw > 4 { usb3_raw = 1; }
         if usb2_raw > 4 { usb2_raw = 1; }
         self.usb3_ports = usb3_raw;
         self.usb2_ports = usb2_raw;
-        println!(" (raw USB3: {}, USB2: {}) -> using ({}, {})",
-                 ((sts1 & ippc::sts::U3_PORT_NUM_MASK) >> ippc::sts::U3_PORT_NUM_SHIFT),
-                 (sts1 & ippc::sts::U2_PORT_NUM_MASK),
-                 self.usb3_ports, self.usb2_ports);
-
-        // Power on sequence
-        let ctrl0 = self.ippc_read32(ippc::IP_PW_CTRL0)?;
-        print!("  IP_PW_CTRL0 before: 0x");
-        print_hex32(ctrl0);
-        println!();
 
         // Clear power down and reset bits
+        let ctrl0 = self.ippc_read32(ippc::IP_PW_CTRL0)?;
         let new_ctrl0 = ctrl0 & !(ippc::ctrl::IP_SW_RST | ippc::ctrl::REF_CK_GATE);
         self.ippc_write32(ippc::IP_PW_CTRL0, new_ctrl0)?;
 
         // Wait for clocks to stabilize
-        for i in 0..1000 {
-            let sts = self.ippc_read32(ippc::IP_PW_STS1)?;
-            // Check for stable clocks (implementation may vary)
-            if i == 999 {
-                print!("  Clock stabilization: 0x");
-                print_hex32(sts);
-                println!();
-            }
-            delay(1000);
-            if i > 10 {
-                break; // Don't wait too long
-            }
-        }
+        delay(10000);
 
-        // Port control bits:
-        // - Bit 0: PORT_DIS - disable port
-        // - Bit 1: PORT_PDN - power down (PHY off when set)
-        // - Bit 2: PORT_HOST_SEL - host mode (1=host, 0=device)
+        // Port control bits
         const PORT_DIS: u32 = 1 << 0;
         const PORT_PDN: u32 = 1 << 1;
         const PORT_HOST_SEL: u32 = 1 << 2;
@@ -253,32 +216,21 @@ impl Mt7988aSoc {
         for p in 0..self.usb3_ports {
             let offset = ippc::U3_CTRL_0P + (p as usize * 0x08);
             let ctrl = self.ippc_read32(offset)?;
-            print!("    U3_CTRL_P{} before: 0x", p);
-            print_hex32(ctrl);
             let new_ctrl = (ctrl & !(PORT_DIS | PORT_PDN)) | PORT_HOST_SEL;
             self.ippc_write32(offset, new_ctrl)?;
-            print!(" -> 0x");
-            print_hex32(new_ctrl);
-            println!();
         }
 
         // Enable USB2 ports: clear DIS/PDN, set HOST_SEL
         for p in 0..self.usb2_ports {
             let offset = ippc::U2_CTRL_0P + (p as usize * 0x08);
             let ctrl = self.ippc_read32(offset)?;
-            print!("    U2_CTRL_P{} before: 0x", p);
-            print_hex32(ctrl);
             let new_ctrl = (ctrl & !(PORT_DIS | PORT_PDN)) | PORT_HOST_SEL;
             self.ippc_write32(offset, new_ctrl)?;
-            print!(" -> 0x");
-            print_hex32(new_ctrl);
-            println!();
         }
 
         // Wait for PHY power-up
         delay(10000);
 
-        println!("  IPPC initialization complete");
         Ok(())
     }
 }
@@ -327,26 +279,12 @@ impl SocUsb for Mt7988aSoc {
     }
 
     fn force_usb2_phy_power(&mut self) -> Result<(), SocError> {
-        use crate::mmio::{delay, print_hex32};
-
-        println!();
-        println!("=== Forcing USB2 PHY Power ===");
+        use crate::mmio::delay;
 
         let pll = self.ippc_read32(ippc::U2_PHY_PLL)?;
-        print!("  U2_PHY_PLL before: 0x");
-        print_hex32(pll);
-        println!();
-
         // Set bit 0 to force PHY power on
         self.ippc_write32(ippc::U2_PHY_PLL, pll | 1)?;
-
         delay(1000);
-
-        let pll_after = self.ippc_read32(ippc::U2_PHY_PLL)?;
-        print!("  U2_PHY_PLL after:  0x");
-        print_hex32(pll_after);
-        println!();
-
         Ok(())
     }
 }

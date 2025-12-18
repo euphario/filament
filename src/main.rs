@@ -313,11 +313,6 @@ pub extern "C" fn irq_handler_rust(from_user: u64) {
             }
         }
     } else {
-        // Debug: log xHCI interrupt (GIC SPI 172 = IRQ 204)
-        if irq == 204 {
-            println!("[IRQ] xHCI interrupt 204 (SPI 172) fired!");
-        }
-
         // Check if this IRQ is registered by a userspace driver
         if let Some(owner_pid) = scheme::irq_notify(irq) {
             // Wake the owner process if blocked

@@ -106,40 +106,24 @@ impl UsbDriver {
         };
 
         let config = board.controller_config(controller_id as u8)?;
-        println!("=== {} Initialization ===", config.name);
+        println!("Initializing {}...", config.name);
 
         // === Create SoC Wrapper ===
         let mut soc = board.create_soc(controller_id as u8)?;
 
         // Map MAC (xHCI + IPPC) region
-        println!("  Mapping MMIO regions...");
         let mac = MmioRegion::open(config.mac_base, config.mac_size as u64)?;
-        print!("    MAC+IPPC @ 0x");
-        print_hex32(config.mac_base as u32);
-        println!(" -> OK");
-
-        // Provide MAC region to SoC wrapper
         soc.set_mac(mac.clone());
 
-        // === SoC Pre-init (IPPC) ===
-        // This initializes clocks, power, and reads port counts
+        // SoC pre-init (IPPC clocks, power, port control)
         if soc.pre_init().is_err() {
-            println!("  ERROR: SoC pre_init() failed");
+            println!("  ERROR: SoC pre_init failed");
             return None;
         }
 
         // === Create PHY Driver ===
         let mut phy = board.create_phy(controller_id as u8)?;
-
-        // Map PHY region
         let phy_mmio = MmioRegion::open(config.phy_base, config.phy_size as u64)?;
-        print!("    PHY @ 0x");
-        print_hex32(config.phy_base as u32);
-        print!(" size=0x");
-        print_hex32(config.phy_size as u32);
-        println!(" -> OK");
-
-        // Provide PHY region to PHY driver
         phy.set_mmio(phy_mmio.clone());
 
         // === Create xHCI Controller ===
@@ -204,10 +188,7 @@ impl UsbDriver {
     }
 
     fn init(&mut self) -> bool {
-        // NOTE: SoC-specific initialization (IPPC, PHY) was done in new() via the HAL.
-        // This function only handles generic xHCI initialization.
-
-        // === xHCI Capability Registers (generic xHCI) ===
+        // Read xHCI capabilities
         let caps = match self.xhci.read_capabilities() {
             Some(c) => c,
             None => {
@@ -215,38 +196,21 @@ impl UsbDriver {
                 return false;
             }
         };
-        println!("  xHCI v{:x}.{:x}, {} ports, {} slots",
-                 caps.version >> 8, caps.version & 0xff,
-                 caps.max_ports, caps.max_slots);
+        print!("  xHCI v{:x}.{:x}, {} ports, {} slots",
+               caps.version >> 8, caps.version & 0xff,
+               caps.max_ports, caps.max_slots);
 
-        // Print port status before reset (for debugging)
-        println!("=== Port Status (before reset) ===");
-        self.xhci.print_all_ports();
+        // Halt and reset xHCI
+        self.xhci.halt_and_reset();
 
-        // === xHCI Halt and Reset (generic xHCI) ===
-        let (halt_ok, reset_ok) = self.xhci.halt_and_reset();
-        if !halt_ok {
-            println!("  WARNING: Controller halt timed out");
-        }
-        if !reset_ok {
-            println!("  WARNING: Controller reset timed out (may complete after PHY init)");
-        }
-
-        // === Post-reset PHY Configuration (using new layered architecture) ===
-        // Original working order: T-PHY host mode THEN USB2 PHY power, both AFTER xHCI reset
+        // Configure PHY for host mode (after xHCI reset)
         if self.phy.set_host_mode().is_err() {
-            println!("  ERROR: PHY set_host_mode() failed");
+            println!("  ERROR: PHY set_host_mode failed");
             return false;
         }
-        if self.soc.force_usb2_phy_power().is_err() {
-            println!("  ERROR: SoC force_usb2_phy_power() failed");
-            return false;
-        }
+        let _ = self.soc.force_usb2_phy_power();
 
-        // === xHCI Data Structures (driver-specific allocation) ===
-        println!();
-        println!("=== xHCI Data Structures ===");
-
+        // Allocate DMA memory for xHCI data structures
         let mut phys_addr: u64 = 0;
         let mem_addr = syscall::mmap_dma(XHCI_MEM_SIZE, &mut phys_addr);
         if mem_addr < 0 {
@@ -255,11 +219,6 @@ impl UsbDriver {
         }
         self.xhci_mem = mem_addr as u64;
         self.xhci_phys = phys_addr;
-        print!("  Allocated xHCI memory: VA=0x");
-        print_hex32(self.xhci_mem as u32);
-        print!(", PA=0x");
-        print_hex32(self.xhci_phys as u32);
-        println!(" ({} bytes)", XHCI_MEM_SIZE);
 
         // Memory layout
         let dcbaa_virt = self.xhci_mem as *mut u64;
@@ -278,55 +237,38 @@ impl UsbDriver {
             }
             for i in 0..256 {
                 let addr = dcbaa_virt.add(i) as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
+                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
-        println!("  DCBAA initialized at 0x{:x}", dcbaa_phys);
 
         // Initialize rings
         self.cmd_ring = Some(Ring::init(cmd_ring_virt, cmd_ring_phys));
-        println!("  Command Ring at 0x{:x}", cmd_ring_phys);
-
         let usbsts_addr = self.xhci.mmio_base() + self.xhci.op_offset() as u64 + xhci_op::USBSTS as u64;
-        self.event_ring = Some(EventRing::init(evt_ring_virt, evt_ring_phys,
-                                                erst_virt, erst_phys, usbsts_addr));
-        println!("  Event Ring at 0x{:x}, ERST at 0x{:x}", evt_ring_phys, erst_phys);
+        self.event_ring = Some(EventRing::init(evt_ring_virt, evt_ring_phys, erst_virt, erst_phys, usbsts_addr));
 
-        // === Programming xHCI Registers (generic xHCI) ===
-        // Set max enabled slots
+        // Program xHCI registers
         self.xhci.set_max_slots(self.xhci.max_slots());
-        // Set DCBAA pointer
         self.xhci.set_dcbaap(dcbaa_phys);
-        // Set command ring (with cycle bit = 1)
         self.xhci.set_crcr(cmd_ring_phys, true);
-        // Program interrupter 0 with ERST
         self.xhci.program_interrupter(0, erst_phys, 1, evt_ring_phys);
 
-        // === Start Controller (generic xHCI) ===
+        // Start controller
         if !self.xhci.start() {
             println!("  ERROR: Controller failed to start");
             return false;
         }
-        println!("  Controller started");
 
-        // === Power on ports (generic xHCI) ===
-        println!("  max_ports={}, mmio_base=0x{:x}, port_offset=0x{:x}",
-                 self.xhci.max_ports(), self.xhci.mmio_base(), self.xhci.port_offset());
+        // Power on ports and wait for connection
         self.xhci.power_on_all_ports();
-        println!("  Waiting for device connection...");
         if self.xhci.max_ports() > 0 {
             if let Some(port) = self.xhci.wait_for_connection(100000) {
-                println!("  Device connected on port {}", port + 1);
+                println!(", device on port {}", port + 1);
             } else {
-                println!("  No device detected (timeout)");
+                println!(", no device");
             }
         } else {
-            println!("  No ports to check!");
+            println!();
         }
 
         true

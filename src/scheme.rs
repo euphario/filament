@@ -510,12 +510,9 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
                     if let Some(slot) = found_slot {
                         if let Some(ref mut task) = sched.tasks[slot] {
                             if matches!(task.state, crate::task::TaskState::Blocked) {
-                                println!("[IRQ] irq_notify: waking pid {} in slot {}", pid, slot);
                                 task.state = crate::task::TaskState::Ready;
                             }
                         }
-                    } else {
-                        println!("[IRQ] irq_notify: could not find task with pid {}", pid);
                     }
                     Some(pid)
                 } else {
@@ -528,7 +525,6 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
                 return wake_pid;
             }
         }
-        println!("[IRQ] irq_notify: no registration found for IRQ {}", irq_num);
         None
     }
 }
@@ -564,7 +560,6 @@ pub fn irq_check_pending(irq_num: u32, pid: u32) -> Option<u32> {
 pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
     // Check if IRQ is already pending
     if let Some(count) = irq_check_pending(irq_num, pid) {
-        println!("[IRQ] irq_wait: IRQ {} already pending, count={}", irq_num, count);
         return Ok(count);
     }
 
@@ -582,19 +577,14 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
         }
 
         if !found {
-            println!("[IRQ] irq_wait: IRQ {} not registered for pid {}", irq_num, pid);
             return Err(-22); // EINVAL - not registered for this IRQ
         }
 
-        println!("[IRQ] irq_wait: blocking pid {} on IRQ {}", pid, irq_num);
-
         // Mark current task as Blocked and switch to another task
-        // Uses same mechanism as sys_yield() - updates globals and sets SYSCALL_SWITCHED_TASK
         let sched = crate::task::scheduler();
         let caller_slot = sched.current;
 
-        // First, check if there's another task to switch to (before marking blocked)
-        // We mark current as Blocked temporarily to exclude it from scheduling
+        // Mark current as Blocked to exclude it from scheduling
         if let Some(ref mut task) = sched.tasks[caller_slot] {
             task.state = crate::task::TaskState::Blocked;
         }
@@ -602,17 +592,6 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
         // Find next ready task
         if let Some(next_slot) = sched.schedule() {
             if next_slot != caller_slot {
-                // Debug: show what we're switching to
-                if let Some(ref next_task) = sched.tasks[next_slot] {
-                    println!("[IRQ] switching from slot {} (pid {}) to slot {} (pid {}, state={:?})",
-                             caller_slot,
-                             sched.tasks[caller_slot].as_ref().map(|t| t.id).unwrap_or(0),
-                             next_slot,
-                             next_task.id,
-                             next_task.state);
-                    println!("[IRQ] next task ELR=0x{:x}", next_task.trap_frame.elr_el1);
-                }
-
                 // Adjust ELR to restart the syscall when this task resumes
                 if let Some(ref mut task) = sched.tasks[caller_slot] {
                     task.trap_frame.elr_el1 = task.trap_frame.elr_el1.wrapping_sub(4);
@@ -625,31 +604,22 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
                 crate::task::update_current_task_globals();
                 crate::task::SYSCALL_SWITCHED_TASK = 1;
 
-                println!("[IRQ] task switch complete, returning...");
-
                 // Return value is ignored since we switched tasks
                 return Err(-11); // EAGAIN
             }
         }
 
         // No other task to switch to - spin-wait in kernel with interrupts enabled
-        println!("[IRQ] no other task, spin-waiting for IRQ {}", irq_num);
         if let Some(ref mut task) = sched.tasks[caller_slot] {
             task.state = crate::task::TaskState::Running;
         }
 
         // Spin-wait with interrupts enabled until IRQ fires
-        // This is less efficient than true blocking but works when there's only one task
         loop {
-            // Enable interrupts so IRQ can fire
             core::arch::asm!("msr daifclr, #2"); // Unmask IRQs
-
-            // Wait for interrupt (puts CPU in low-power state until next IRQ)
             core::arch::asm!("wfi");
 
-            // Check if our IRQ is now pending
             if let Some(count) = irq_check_pending(irq_num, pid) {
-                println!("[IRQ] spin-wait complete, IRQ {} fired, count={}", irq_num, count);
                 return Ok(count);
             }
         }

@@ -139,18 +139,12 @@ impl Gic {
             // Read number of interrupt lines
             let typer = self.gicd_read(gicd::TYPER);
             let it_lines = ((typer & 0x1f) + 1) * 32;
-            crate::println!("[GIC] GICD_TYPER=0x{:08x}, {} IRQ lines", typer, it_lines);
-
             // Configure all SPIs (interrupts 32+) as Group 1, priority 0xa0
             for i in (32..it_lines).step_by(32) {
                 let reg_idx = (i / 32) as usize;
                 // Set all to Group 1 (non-secure)
                 self.gicd_write(gicd::IGROUPR + reg_idx * 4, 0xffffffff);
             }
-
-            // Verify Group 1 setting for reg 6 (covers IRQ 192-223 including 204)
-            let igroupr6 = self.gicd_read(gicd::IGROUPR + 6 * 4);
-            crate::println!("[GIC] IGROUPR[6] after init: 0x{:08x}", igroupr6);
 
             // Set default priority for SPIs
             for i in (32..it_lines).step_by(4) {
@@ -165,12 +159,7 @@ impl Gic {
                 | gicd_ctlr::ARE_S
                 | gicd_ctlr::ARE_NS
                 | gicd_ctlr::DS;  // Disable security to allow Group configuration
-            crate::println!("[GIC] Writing GICD_CTLR=0x{:08x}", ctlr);
             self.gicd_write(gicd::CTLR, ctlr);
-
-            // Read back CTLR
-            let ctlr_readback = self.gicd_read(gicd::CTLR);
-            crate::println!("[GIC] GICD_CTLR readback: 0x{:08x}", ctlr_readback);
         }
     }
 
@@ -201,22 +190,14 @@ impl Gic {
         } else {
             // SPI - use distributor
             unsafe {
-                crate::println!("[GIC] Enabling SPI {} (GIC ID {})", irq - 32, irq);
-
                 // Configure routing to CPU 0 (IROUTER with affinity = 0)
-                // IROUTER is at offset 0x6000 + (irq - 32) * 8
                 let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
-                self.gicd_write64(irouter_offset, 0); // Route to CPU 0
-                crate::println!("[GIC]   IROUTER offset 0x{:x} = 0", irouter_offset);
+                self.gicd_write64(irouter_offset, 0);
 
                 // Enable the interrupt
                 let reg_idx = (irq / 32) as usize;
                 let bit = 1u32 << (irq % 32);
                 self.gicd_write(gicd::ISENABLER + reg_idx * 4, bit);
-
-                // Read back to verify
-                let isenabler = self.gicd_read(gicd::ISENABLER + reg_idx * 4);
-                crate::println!("[GIC]   ISENABLER[{}] = 0x{:08x}", reg_idx, isenabler);
             }
         }
     }
@@ -233,13 +214,6 @@ impl Gic {
                 let reg_idx = (irq / 32) as usize;
                 let bit = 1u32 << (irq % 32);
                 self.gicd_write(gicd::ICENABLER + reg_idx * 4, bit);
-
-                // Verify disable took effect
-                let isenabler = self.gicd_read(gicd::ISENABLER + reg_idx * 4);
-                let still_enabled = (isenabler >> (irq % 32)) & 1;
-                if still_enabled != 0 {
-                    crate::println!("[GIC] WARNING: disable_irq({}) failed! ISENABLER still has bit set", irq);
-                }
             }
         }
     }
