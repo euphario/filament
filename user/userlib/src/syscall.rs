@@ -43,6 +43,12 @@ pub const SYS_PS_INFO: u64 = 34;
 pub const SYS_SET_LOG_LEVEL: u64 = 35;
 pub const SYS_MMAP_DMA: u64 = 36;
 pub const SYS_RESET: u64 = 37;
+pub const SYS_LSEEK: u64 = 38;
+
+// SEEK whence constants
+pub const SEEK_SET: u32 = 0;
+pub const SEEK_CUR: u32 = 1;
+pub const SEEK_END: u32 = 2;
 
 // Raw syscall functions
 
@@ -214,6 +220,13 @@ pub fn dup(fd: u32) -> i32 {
 /// Duplicate a file descriptor to a specific number
 pub fn dup2(old_fd: u32, new_fd: u32) -> i32 {
     syscall2(SYS_DUP2, old_fd as u64, new_fd as u64) as i32
+}
+
+/// Seek to a position in a file descriptor
+/// whence: SEEK_SET(0), SEEK_CUR(1), SEEK_END(2)
+/// Returns new position, or negative error code
+pub fn lseek(fd: u32, offset: i64, whence: u32) -> i64 {
+    syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64)
 }
 
 /// Map memory

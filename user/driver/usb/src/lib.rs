@@ -133,6 +133,7 @@ pub use msc::{
     Cbw, Csw, BulkContext, TransferResult,
     InquiryResponse, ReadCapacity10Response, SenseData,
     CBW_OFFSET, CSW_OFFSET, DATA_OFFSET,
+    RING_USABLE,
 };
 
 // Transfer helpers
@@ -175,6 +176,10 @@ pub use protocol::{
     SetupEndpointsRequest, SetupEndpointsResponse, EndpointInfo,
     UsbMessageHeader, UsbResponseHeader,
     USB_MSG_MAX_SIZE, USB_DATA_MAX_SIZE,
+    // Block device protocol
+    BlockReadRequest, BlockReadResponse,
+    BlockInfoRequest, BlockInfoResponse,
+    BlockWriteRequest, BlockWriteResponse,
 };
 
 // =============================================================================

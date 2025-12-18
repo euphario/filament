@@ -40,7 +40,7 @@ use usb::{
     DeviceDescriptor, ConfigurationDescriptor, InterfaceDescriptor,
     // MSC/SCSI
     msc_const as msc, scsi, Cbw, Csw, BulkContext, TransferResult,
-    CBW_OFFSET, CSW_OFFSET, DATA_OFFSET,
+    CBW_OFFSET, CSW_OFFSET, DATA_OFFSET, RING_USABLE,
     // Ring structures
     Ring, EventRing, ErstEntry,
     // MMIO helpers
@@ -92,6 +92,36 @@ struct UsbDriver {
 
     // IRQ support
     irq_fd: i32,            // IRQ file descriptor (-1 if not registered)
+
+    // MSC device info (for block device access)
+    msc_device: Option<MscDeviceInfo>,
+}
+
+/// Mass Storage Class device info for block operations
+/// Stores all state needed to perform bulk transfers without BulkContext
+struct MscDeviceInfo {
+    slot_id: u32,
+    bulk_in_dci: u32,
+    bulk_out_dci: u32,
+    block_size: u32,
+    block_count: u64,
+    // Bulk IN ring
+    bulk_in_ring: *mut Trb,
+    bulk_in_ring_phys: u64,
+    // Bulk OUT ring
+    bulk_out_ring: *mut Trb,
+    bulk_out_ring_phys: u64,
+    // Data buffer
+    data_buf: *mut u8,
+    data_phys: u64,
+    // Device context
+    device_ctx: *mut DeviceContext,
+    // Ring state (persisted between calls)
+    out_enqueue: usize,
+    in_enqueue: usize,
+    out_cycle: bool,  // Cycle bit for bulk out ring
+    in_cycle: bool,   // Cycle bit for bulk in ring
+    tag: u32,
 }
 
 impl UsbDriver {
@@ -138,6 +168,7 @@ impl UsbDriver {
             cmd_ring: None,
             event_ring: None,
             irq_fd: -1,
+            msc_device: None,
         })
     }
 
@@ -1089,32 +1120,45 @@ impl UsbDriver {
         let buf_virt_u64 = buf_virt as u64;
         for port in 1..=num_ports as u16 {
             if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
+                println!("    Hub port {}: status=0x{:04x} change=0x{:04x}", port, ps.status, ps.change);
                 if (ps.status & hub::PS_CONNECTION) != 0 {
+                    println!("      -> Device connected, resetting...");
                     // Clear connection change
                     self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::C_PORT_CONNECTION);
 
                     // Reset the port
                     if !self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::PORT_RESET) {
+                        println!("      -> Reset failed");
                         continue;
                     }
 
                     // Wait for reset to complete
+                    let mut reset_ok = false;
                     for _ in 0..50 {
                         delay(10000);
                         if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
                             if (ps2.change & hub::PS_C_RESET) != 0 {
                                 self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::C_PORT_RESET);
                                 if (ps2.status & hub::PS_ENABLE) != 0 {
+                                    println!("      -> Port enabled, enumerating device");
                                     for _ in 0..100 {
                                         delay(1000);
                                     }
                                     self.enumerate_hub_device(hub_slot, hub_port, port as u32);
+                                    reset_ok = true;
+                                } else {
+                                    println!("      -> Reset complete but port not enabled");
                                 }
                                 break;
                             }
                         }
                     }
+                    if !reset_ok {
+                        println!("      -> Reset timeout");
+                    }
                 }
+            } else {
+                println!("    Hub port {}: failed to get status", port);
             }
         }
     }
@@ -1454,9 +1498,44 @@ impl UsbDriver {
         let bulk_out_ring_virt = syscall::mmap_dma(4096, &mut bulk_out_ring_phys);
         if bulk_out_ring_virt < 0 { return; }
 
-        // Initialize transfer rings with link TRBs
-        let _bulk_in_ring = Ring::init(bulk_in_ring_virt as *mut Trb, bulk_in_ring_phys);
-        let _bulk_out_ring = Ring::init(bulk_out_ring_virt as *mut Trb, bulk_out_ring_phys);
+        // Initialize transfer rings with Link TRBs at index 255 (for 256-entry rings)
+        // Note: Ring::init() uses RING_SIZE=64, but bulk rings need 256 entries
+        unsafe {
+            use usb::transfer::{flush_cache_line, dsb};
+            use usb::trb::trb_type;
+
+            // Initialize bulk IN ring (256 TRBs, Link at index 255)
+            let in_ring = bulk_in_ring_virt as *mut Trb;
+            for i in 0..256 {
+                *in_ring.add(i) = Trb::new();
+            }
+            // Set up Link TRB at index 255
+            let in_link = &mut *in_ring.add(255);
+            in_link.param = bulk_in_ring_phys;  // Points back to start
+            in_link.set_type(trb_type::LINK);
+            in_link.control |= 1 << 1;  // Toggle Cycle bit (TC)
+            // Flush entire ring
+            for i in 0..256 {
+                flush_cache_line(in_ring.add(i) as u64);
+            }
+            dsb();
+
+            // Initialize bulk OUT ring (256 TRBs, Link at index 255)
+            let out_ring = bulk_out_ring_virt as *mut Trb;
+            for i in 0..256 {
+                *out_ring.add(i) = Trb::new();
+            }
+            // Set up Link TRB at index 255
+            let out_link = &mut *out_ring.add(255);
+            out_link.param = bulk_out_ring_phys;  // Points back to start
+            out_link.set_type(trb_type::LINK);
+            out_link.control |= 1 << 1;  // Toggle Cycle bit (TC)
+            // Flush entire ring
+            for i in 0..256 {
+                flush_cache_line(out_ring.add(i) as u64);
+            }
+            dsb();
+        }
 
         // Calculate Device Context Index (DCI) for each endpoint
         // DCI = (endpoint_number * 2) + direction (0=OUT, 1=IN)
@@ -1583,28 +1662,33 @@ impl UsbDriver {
             ctx.flush_buffer(cbw_ptr as u64, 31);
         }
 
-        // Create TRB for CBW (31 bytes)
+        // Create TRB for CBW (31 bytes) with proper cycle bit
+        let (idx, cycle) = ctx.advance_out();
         unsafe {
-            let trb = &mut *ctx.bulk_out_ring.add(ctx.out_enqueue);
+            let trb = &mut *ctx.bulk_out_ring.add(idx);
             trb.param = ctx.data_phys + CBW_OFFSET as u64;
             trb.status = 31;  // CBW is 31 bytes
-            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | 1;  // IOC, cycle=1
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;  // IOC, cycle
             ctx.flush_buffer(trb as *const _ as u64, 16);
-            ctx.out_enqueue += 1;
         }
 
         // Ring doorbell
         self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
 
+        // Get ERDP register address for direct writes (avoids borrow conflict)
+        let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
+            + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
+
         // Poll for completion (CBW is fast, no need for IRQ)
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..100 {
                 if let Some(evt) = event_ring.dequeue() {
-                    if evt.get_type() == trb_type::TRANSFER_EVENT {
-                        let cc = (evt.status >> 24) & 0xFF;
-                        // Update ERDP
-                        let erdp = event_ring.erdp() | (1 << 3);
-                        self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp);
+                    let evt_type = evt.get_type();
+                    let cc = (evt.status >> 24) & 0xFF;
+                    // Update ERDP for all events
+                    let erdp = event_ring.erdp() | (1 << 3);
+                    unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+                    if evt_type == trb_type::TRANSFER_EVENT {
                         return cc == trb_cc::SUCCESS;
                     }
                 }
@@ -1683,17 +1767,14 @@ impl UsbDriver {
         // Invalidate destination buffer before DMA (uses VIRTUAL address for cache ops)
         ctx.invalidate_buffer(virt_addr, length);
 
-        // Get current DCS from endpoint context
-        let dcs = ctx.get_bulk_in_dcs();
-
-        // Create TRB for bulk IN
+        // Create TRB for bulk IN with proper cycle bit
+        let (idx, cycle) = ctx.advance_in();
         unsafe {
-            let trb = &mut *ctx.bulk_in_ring.add(ctx.in_enqueue);
+            let trb = &mut *ctx.bulk_in_ring.add(idx);
             trb.param = phys_addr;
             trb.status = length as u32;
-            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | dcs;  // IOC, cycle=DCS
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;  // IOC, cycle
             ctx.flush_buffer(trb as *const _ as u64, 16);
-            ctx.in_enqueue += 1;
         }
 
         // Ring doorbell
@@ -1746,16 +1827,103 @@ impl UsbDriver {
 
         // Data phase (if any)
         if data_length > 0 {
-            let (result, bytes) = self.receive_bulk_in_irq(ctx, DATA_OFFSET, data_length as usize);
+            let (result, _bytes) = self.receive_bulk_in_irq(ctx, DATA_OFFSET, data_length as usize);
             if result != TransferResult::Success && result != TransferResult::ShortPacket {
                 println!("    Data phase failed: {:?}", result);
                 return (result, None);
             }
-            println!("    Data received: {} bytes", bytes);
         }
 
         // CSW phase
         self.receive_csw_irq(ctx)
+    }
+
+    /// Execute a complete SCSI command with data OUT: CBW -> Data OUT -> CSW
+    fn scsi_command_out(&mut self, ctx: &mut BulkContext, cmd: &[u8], data: &[u8]) -> (TransferResult, Option<Csw>) {
+        let tag = ctx.next_tag();
+        let data_length = data.len() as u32;
+
+        // Build CBW (direction = false for OUT)
+        let cbw = Cbw::new(tag, data_length, false, 0, cmd);
+
+        // Send CBW
+        if !self.send_cbw(ctx, &cbw) {
+            println!("    CBW send failed");
+            return (TransferResult::Error(0), None);
+        }
+
+        // Data OUT phase (if any)
+        if data_length > 0 {
+            // Copy data to buffer at DATA_OFFSET
+            unsafe {
+                let data_ptr = ctx.data_buf.add(DATA_OFFSET);
+                core::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
+                ctx.flush_buffer(data_ptr as u64, data.len());
+            }
+
+            // Create TRB for data OUT with proper cycle bit
+            let (idx, cycle) = ctx.advance_out();
+            unsafe {
+                let trb = &mut *ctx.bulk_out_ring.add(idx);
+                trb.param = ctx.data_phys + DATA_OFFSET as u64;
+                trb.status = data_length;
+                trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;  // IOC, cycle
+                ctx.flush_buffer(trb as *const _ as u64, 16);
+            }
+
+            // Ring doorbell and wait for completion
+            self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
+
+            // Get ERDP register address for direct writes (avoids borrow conflict)
+            let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
+                + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
+
+            // Poll for completion
+            if let Some(ref mut event_ring) = self.event_ring {
+                let mut completed = false;
+                for _ in 0..100 {
+                    if let Some(evt) = event_ring.dequeue() {
+                        let evt_type = evt.get_type();
+                        let cc = (evt.status >> 24) & 0xFF;
+                        // Update ERDP for all events
+                        let erdp = event_ring.erdp() | (1 << 3);
+                        unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+                        if evt_type == trb_type::TRANSFER_EVENT {
+                            if cc != trb_cc::SUCCESS && cc != trb_cc::SHORT_PACKET {
+                                println!("[DATA] error cc={} at TRB {:x}", cc, evt.param);
+                                return (TransferResult::Error(cc), None);
+                            }
+                            completed = true;
+                            break;
+                        }
+                    }
+                    syscall::yield_now();
+                }
+                if !completed {
+                    println!("[DATA] timeout at idx={}", idx);
+                    return (TransferResult::Error(0), None);
+                }
+            }
+        }
+
+        // CSW phase
+        self.receive_csw_irq(ctx)
+    }
+
+    /// SCSI WRITE(10) command - write sectors to device
+    fn scsi_write_10(&mut self, ctx: &mut BulkContext, lba: u32, data: &[u8]) -> bool {
+        let count = (data.len() / 512) as u16;
+        let (cmd, _data_length) = scsi::build_write_10(lba, count, 512);
+
+        let (_result, csw) = self.scsi_command_out(ctx, &cmd, data);
+
+        if let Some(csw) = csw {
+            let status = csw.status;
+            if csw.signature == msc::CSW_SIGNATURE && status == msc::CSW_STATUS_PASSED {
+                return true;
+            }
+        }
+        false
     }
 
     /// SCSI READ(10) command - read sectors from device
@@ -1765,41 +1933,23 @@ impl UsbDriver {
     fn scsi_read_10<'a>(&mut self, ctx: &'a mut BulkContext, lba: u32, count: u16) -> Option<&'a [u8]> {
         // Use library CDB builder (assumes 512 bytes per block)
         let (cmd, data_length) = scsi::build_read_10(lba, count, 512);
-        println!("  SCSI READ(10): LBA={}, count={}, bytes={}", lba, count, data_length);
 
         let (result, csw) = self.scsi_command_in(ctx, &cmd, data_length);
 
         if let Some(csw) = csw {
-            // Copy fields from packed struct to avoid unaligned references
             let sig = csw.signature;
-            let tag = csw.tag;
             let residue = csw.data_residue;
             let status = csw.status;
 
-            if sig == msc::CSW_SIGNATURE {
-                print!("    CSW: tag={}, residue={}, status=", tag, residue);
-                match status {
-                    0 => println!("PASSED"),
-                    1 => println!("FAILED"),
-                    2 => println!("PHASE_ERROR"),
-                    _ => println!("{}", status),
+            if sig == msc::CSW_SIGNATURE && status == msc::CSW_STATUS_PASSED &&
+               (result == TransferResult::Success || result == TransferResult::ShortPacket) {
+                let actual_bytes = (data_length - residue) as usize;
+                unsafe {
+                    let data_ptr = ctx.data_buf.add(DATA_OFFSET);
+                    ctx.invalidate_buffer(data_ptr as u64, actual_bytes);
+                    return Some(core::slice::from_raw_parts(data_ptr, actual_bytes));
                 }
-
-                if status == msc::CSW_STATUS_PASSED && (result == TransferResult::Success || result == TransferResult::ShortPacket) {
-                    // Return slice to data
-                    let actual_bytes = (data_length - residue) as usize;
-                    unsafe {
-                        let data_ptr = ctx.data_buf.add(DATA_OFFSET);
-                        return Some(core::slice::from_raw_parts(data_ptr, actual_bytes));
-                    }
-                }
-            } else {
-                print!("    Invalid CSW signature: ");
-                print_hex32(sig);
-                println!();
             }
-        } else {
-            println!("    No CSW received: {:?}", result);
         }
 
         None
@@ -1862,6 +2012,7 @@ impl UsbDriver {
 
     /// Run SCSI tests using the new refactored code
     /// Run SCSI tests - only prints capacity result
+    /// Also stores device info for block access via IPC
     fn run_scsi_tests(&mut self, ctx: &mut BulkContext) {
         // Wait for device to be ready
         let mut ready = false;
@@ -1878,7 +2029,8 @@ impl UsbDriver {
         // Read capacity and report
         if let Some((last_lba, block_size)) = self.scsi_read_capacity_10(ctx) {
             // Calculate and print size
-            let size_bytes = (last_lba as u64 + 1) * block_size as u64;
+            let block_count = last_lba as u64 + 1;
+            let size_bytes = block_count * block_size as u64;
             let size_mb = size_bytes / (1024 * 1024);
             let size_gb = size_mb / 1024;
             if size_gb > 0 {
@@ -1890,7 +2042,511 @@ impl UsbDriver {
             // Verify we can read
             if self.scsi_read_10(ctx, 0, 1).is_some() {
                 println!("    Read test: OK");
+
+                // Store device info for block access via IPC
+                // Copy all BulkContext state so we can perform reads later
+                self.msc_device = Some(MscDeviceInfo {
+                    slot_id: ctx.slot_id,
+                    bulk_in_dci: ctx.bulk_in_dci,
+                    bulk_out_dci: ctx.bulk_out_dci,
+                    block_size,
+                    block_count,
+                    bulk_in_ring: ctx.bulk_in_ring,
+                    bulk_in_ring_phys: ctx.bulk_in_ring_phys,
+                    bulk_out_ring: ctx.bulk_out_ring,
+                    bulk_out_ring_phys: ctx._bulk_out_ring_phys,
+                    data_buf: ctx.data_buf,
+                    data_phys: ctx.data_phys,
+                    device_ctx: ctx.device_ctx,
+                    out_enqueue: ctx.out_enqueue,
+                    in_enqueue: ctx.in_enqueue,
+                    out_cycle: ctx.out_cycle,
+                    in_cycle: ctx.in_cycle,
+                    tag: ctx.tag,
+                });
+                println!("    Block device ready: {} blocks x {} bytes", block_count, block_size);
+
+                // Run performance test
+                self.run_performance_test(ctx, block_count);
             }
+        }
+    }
+
+    /// Run direct USB performance test (bypasses IPC)
+    fn run_performance_test(&mut self, ctx: &mut BulkContext, block_count: u64) {
+        println!("\n=== USB Performance Test ===");
+        println!("  Ring state: OUT idx={} cycle={}, IN idx={} cycle={}",
+            ctx.out_enqueue, ctx.out_cycle as u8, ctx.in_enqueue, ctx.in_cycle as u8);
+
+        // Allocate a larger DMA buffer for performance testing (64KB)
+        let mut perf_buf_phys: u64 = 0;
+        let perf_buf_virt = syscall::mmap_dma(65536, &mut perf_buf_phys);
+        if perf_buf_virt < 0 {
+            println!("  Failed to allocate performance buffer");
+            return;
+        }
+
+        // Test parameters
+        let test_lba = block_count.saturating_sub(2000) as u32; // Near end of device
+        if test_lba == 0 {
+            println!("  Device too small for test");
+            return;
+        }
+
+        // Get timer frequency
+        let freq: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq); }
+
+        // Test different transfer sizes
+        // Note: Large transfers may fail due to device/controller limits
+        let transfer_sizes = [1u16, 8, 16, 32, 48, 64]; // sectors per transfer
+
+        for &sectors_per_transfer in &transfer_sizes {
+            let bytes_per_transfer = sectors_per_transfer as usize * 512;
+            if bytes_per_transfer > 65536 {
+                continue;
+            }
+
+            // Fill buffer with test pattern
+            unsafe {
+                let buf = perf_buf_virt as *mut u8;
+                for i in 0..bytes_per_transfer {
+                    *buf.add(i) = (i & 0xFF) as u8;
+                }
+                // Flush buffer
+                for offset in (0..bytes_per_transfer).step_by(64) {
+                    core::arch::asm!("dc cvac, {}", in(reg) buf.add(offset) as u64, options(nostack));
+                }
+                core::arch::asm!("dsb sy", options(nostack));
+            }
+
+            // Write test: 100 transfers
+            let write_count = 100u32;
+
+            let start: u64;
+            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start); }
+
+            let mut success = 0u32;
+            for i in 0..write_count {
+                let lba = test_lba + i * sectors_per_transfer as u32;
+                if self.perf_write(ctx, lba, perf_buf_phys, bytes_per_transfer) {
+                    success += 1;
+                } else {
+                    if success == 0 {
+                        println!("  First write failed at OUT idx={}", ctx.out_enqueue);
+                    }
+                    // Recovery: reset endpoints and clear device error
+                    self.recover_endpoints(ctx);
+                    break;
+                }
+            }
+
+            let end: u64;
+            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) end); }
+
+            let elapsed_us = ((end - start) * 1_000_000) / freq;
+            let bytes_written = success as u64 * bytes_per_transfer as u64;
+            let throughput_kbs = if elapsed_us > 0 { (bytes_written * 1_000_000) / (elapsed_us * 1024) } else { 0 };
+
+            println!("  Write {}x{} sectors: {}/{} OK, {} KB/s",
+                sectors_per_transfer, write_count, success, write_count, throughput_kbs);
+
+            // Read test: 100 transfers
+            let start: u64;
+            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start); }
+
+            let mut success = 0u32;
+            for i in 0..write_count {
+                let lba = test_lba + i * sectors_per_transfer as u32;
+                if self.perf_read(ctx, lba, sectors_per_transfer, perf_buf_phys, bytes_per_transfer) {
+                    success += 1;
+                } else {
+                    // Recovery: reset endpoints and clear device error
+                    self.recover_endpoints(ctx);
+                    break;
+                }
+            }
+
+            let end: u64;
+            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) end); }
+
+            let elapsed_us = ((end - start) * 1_000_000) / freq;
+            let bytes_read = success as u64 * bytes_per_transfer as u64;
+            let throughput_kbs = if elapsed_us > 0 { (bytes_read * 1_000_000) / (elapsed_us * 1024) } else { 0 };
+
+            println!("  Read  {}x{} sectors: {}/{} OK, {} KB/s",
+                sectors_per_transfer, write_count, success, write_count, throughput_kbs);
+        }
+
+        println!("=== Performance Test Complete ===\n");
+    }
+
+    /// Performance write helper - direct SCSI write without IPC overhead
+    /// data_phys: physical address of pre-flushed DMA buffer
+    fn perf_write(&mut self, ctx: &mut BulkContext, lba: u32, data_phys: u64, len: usize) -> bool {
+        let count = (len / 512) as u16;
+        let (cmd, data_length) = scsi::build_write_10(lba, count, 512);
+
+        // Build CBW
+        let tag = ctx.next_tag();
+        let cbw = Cbw::new(tag, data_length, false, 0, &cmd);
+
+        // Write CBW to ctx data buffer
+        unsafe {
+            let cbw_ptr = ctx.data_buf.add(CBW_OFFSET) as *mut Cbw;
+            core::ptr::write_volatile(cbw_ptr, cbw);
+            ctx.flush_buffer(cbw_ptr as u64, 31);
+        }
+
+        // Send CBW
+        let (idx, cycle) = ctx.advance_out();
+        unsafe {
+            let trb = &mut *ctx.bulk_out_ring.add(idx);
+            trb.param = ctx.data_phys + CBW_OFFSET as u64;
+            trb.status = 31;
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;
+            ctx.flush_buffer(trb as *const _ as u64, 16);
+        }
+        self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
+
+        // Wait for CBW completion
+        if !self.wait_transfer_complete(100) { return false; }
+
+        // Send Data OUT - use the external DMA buffer directly
+        let (idx, cycle) = ctx.advance_out();
+        unsafe {
+            let trb = &mut *ctx.bulk_out_ring.add(idx);
+            trb.param = data_phys;  // Use external DMA buffer physical address
+            trb.status = len as u32;
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;
+            ctx.flush_buffer(trb as *const _ as u64, 16);
+        }
+        self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
+
+        // Wait for data completion - longer timeout for large transfers
+        let timeout = 100 + (len / 512) as u32 * 10; // ~10 polls per sector
+        if !self.wait_transfer_complete(timeout) { return false; }
+
+        // Receive CSW
+        let (idx, cycle) = ctx.advance_in();
+        unsafe {
+            let trb = &mut *ctx.bulk_in_ring.add(idx);
+            trb.param = ctx.data_phys + CSW_OFFSET as u64;
+            trb.status = 13 | (1 << 17); // 13 bytes, TRB size
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;
+            ctx.flush_buffer(trb as *const _ as u64, 16);
+        }
+        self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
+
+        // Wait for CSW
+        if !self.wait_transfer_complete(100) { return false; }
+
+        // Check CSW
+        unsafe {
+            let csw_ptr = ctx.data_buf.add(CSW_OFFSET);
+            ctx.invalidate_buffer(csw_ptr as u64, 13);
+            let csw = core::ptr::read_volatile(csw_ptr as *const Csw);
+            csw.signature == msc::CSW_SIGNATURE && csw.status == msc::CSW_STATUS_PASSED
+        }
+    }
+
+    /// Performance read helper
+    /// data_phys: physical address of DMA buffer to receive data
+    fn perf_read(&mut self, ctx: &mut BulkContext, lba: u32, count: u16, data_phys: u64, len: usize) -> bool {
+        let (cmd, data_length) = scsi::build_read_10(lba, count, 512);
+
+        // Build CBW
+        let tag = ctx.next_tag();
+        let cbw = Cbw::new(tag, data_length, true, 0, &cmd);
+
+        // Write CBW
+        unsafe {
+            let cbw_ptr = ctx.data_buf.add(CBW_OFFSET) as *mut Cbw;
+            core::ptr::write_volatile(cbw_ptr, cbw);
+            ctx.flush_buffer(cbw_ptr as u64, 31);
+        }
+
+        // Send CBW
+        let (idx, cycle) = ctx.advance_out();
+        unsafe {
+            let trb = &mut *ctx.bulk_out_ring.add(idx);
+            trb.param = ctx.data_phys + CBW_OFFSET as u64;
+            trb.status = 31;
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;
+            ctx.flush_buffer(trb as *const _ as u64, 16);
+        }
+        self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
+
+        if !self.wait_transfer_complete(100) { return false; }
+
+        // Receive Data IN - use external DMA buffer directly
+        let (idx, cycle) = ctx.advance_in();
+        unsafe {
+            let trb = &mut *ctx.bulk_in_ring.add(idx);
+            trb.param = data_phys;  // Use external DMA buffer
+            trb.status = (len as u32) | (1 << 17);
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;
+            ctx.flush_buffer(trb as *const _ as u64, 16);
+        }
+        self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
+
+        // Wait for data completion - longer timeout for large transfers
+        let timeout = 100 + (len / 512) as u32 * 10;
+        if !self.wait_transfer_complete(timeout) { return false; }
+
+        // Receive CSW
+        let (idx, cycle) = ctx.advance_in();
+        unsafe {
+            let trb = &mut *ctx.bulk_in_ring.add(idx);
+            trb.param = ctx.data_phys + CSW_OFFSET as u64;
+            trb.status = 13 | (1 << 17);
+            trb.control = (trb_type::NORMAL << 10) | (1 << 5) | cycle;
+            ctx.flush_buffer(trb as *const _ as u64, 16);
+        }
+        self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
+
+        if !self.wait_transfer_complete(200) { return false; }
+
+        // Check CSW
+        unsafe {
+            let csw_ptr = ctx.data_buf.add(CSW_OFFSET);
+            ctx.invalidate_buffer(csw_ptr as u64, 13);
+            let csw = core::ptr::read_volatile(csw_ptr as *const Csw);
+            csw.signature == msc::CSW_SIGNATURE && csw.status == msc::CSW_STATUS_PASSED
+        }
+    }
+
+    /// Recover endpoints after a failed transfer
+    /// Resets both bulk endpoints and clears any pending state
+    fn recover_endpoints(&mut self, ctx: &mut BulkContext) {
+        // Drain any pending events first
+        let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
+            + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
+        if let Some(ref mut event_ring) = self.event_ring {
+            for _ in 0..50 {
+                if let Some(_evt) = event_ring.dequeue() {
+                    let erdp = event_ring.erdp() | (1 << 3);
+                    unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Reset bulk OUT endpoint
+        let reset_out = usb::enumeration::build_reset_endpoint_trb(ctx.slot_id, ctx.bulk_out_dci, false);
+        if let Some(ref mut cmd_ring) = self.cmd_ring {
+            cmd_ring.enqueue(&reset_out);
+        }
+        self.ring_doorbell(0, 0);
+        self.wait_command_complete(50);
+
+        // Reset bulk IN endpoint
+        let reset_in = usb::enumeration::build_reset_endpoint_trb(ctx.slot_id, ctx.bulk_in_dci, false);
+        if let Some(ref mut cmd_ring) = self.cmd_ring {
+            cmd_ring.enqueue(&reset_in);
+        }
+        self.ring_doorbell(0, 0);
+        self.wait_command_complete(50);
+
+        // Reset ring state - start fresh
+        ctx.out_enqueue = 0;
+        ctx.in_enqueue = 0;
+        ctx.out_cycle = true;
+        ctx.in_cycle = true;
+
+        // Set TR Dequeue Pointer for OUT endpoint
+        let set_deq_out = usb::enumeration::build_set_tr_dequeue_trb(
+            ctx.slot_id, ctx.bulk_out_dci, ctx._bulk_out_ring_phys, true
+        );
+        if let Some(ref mut cmd_ring) = self.cmd_ring {
+            cmd_ring.enqueue(&set_deq_out);
+        }
+        self.ring_doorbell(0, 0);
+        self.wait_command_complete(50);
+
+        // Set TR Dequeue Pointer for IN endpoint
+        let set_deq_in = usb::enumeration::build_set_tr_dequeue_trb(
+            ctx.slot_id, ctx.bulk_in_dci, ctx.bulk_in_ring_phys, true
+        );
+        if let Some(ref mut cmd_ring) = self.cmd_ring {
+            cmd_ring.enqueue(&set_deq_in);
+        }
+        self.ring_doorbell(0, 0);
+        self.wait_command_complete(50);
+
+        // Small delay to let device settle
+        delay_ms(10);
+    }
+
+    /// Wait for command completion (for recovery)
+    fn wait_command_complete(&mut self, max_polls: u32) -> bool {
+        let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
+            + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
+
+        if let Some(ref mut event_ring) = self.event_ring {
+            for _ in 0..max_polls {
+                if let Some(evt) = event_ring.dequeue() {
+                    let erdp = event_ring.erdp() | (1 << 3);
+                    unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+                    if evt.get_type() == trb_type::COMMAND_COMPLETION {
+                        return true;
+                    }
+                }
+                syscall::yield_now();
+            }
+        }
+        false
+    }
+
+    /// Wait for transfer event completion (simplified polling)
+    fn wait_transfer_complete(&mut self, max_polls: u32) -> bool {
+        let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
+            + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
+
+        if let Some(ref mut event_ring) = self.event_ring {
+            for _ in 0..max_polls {
+                if let Some(evt) = event_ring.dequeue() {
+                    let erdp = event_ring.erdp() | (1 << 3);
+                    unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+
+                    if evt.get_type() == trb_type::TRANSFER_EVENT {
+                        let cc = (evt.status >> 24) & 0xFF;
+                        return cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET;
+                    }
+                }
+                syscall::yield_now();
+            }
+        }
+        false
+    }
+
+    /// Read blocks from the MSC device (for IPC handler)
+    /// Returns bytes read on success, writes data to internal buffer
+    fn block_read(&mut self, lba: u64, count: u32) -> Option<usize> {
+        // Check limits
+        if count == 0 || count > 64 {
+            return None; // Max 64 blocks (32KB at 512 bytes/block)
+        }
+
+        // Check if we have an MSC device - take ownership temporarily
+        let mut msc = self.msc_device.take()?;
+
+        // Reconstruct BulkContext from stored MscDeviceInfo
+        let mut ctx = BulkContext {
+            slot_id: msc.slot_id,
+            bulk_in_dci: msc.bulk_in_dci,
+            bulk_out_dci: msc.bulk_out_dci,
+            bulk_in_ring: msc.bulk_in_ring,
+            bulk_in_ring_phys: msc.bulk_in_ring_phys,
+            bulk_out_ring: msc.bulk_out_ring,
+            _bulk_out_ring_phys: msc.bulk_out_ring_phys,
+            data_buf: msc.data_buf,
+            data_phys: msc.data_phys,
+            device_ctx: msc.device_ctx,
+            out_enqueue: msc.out_enqueue,
+            in_enqueue: msc.in_enqueue,
+            out_cycle: msc.out_cycle,
+            in_cycle: msc.in_cycle,
+            tag: msc.tag,
+        };
+
+        // Perform the read and extract length immediately
+        let bytes_read = self.scsi_read_10(&mut ctx, lba as u32, count as u16)
+            .map(|data| data.len());
+
+        // Update ring state in MscDeviceInfo (result no longer borrows ctx)
+        msc.out_enqueue = ctx.out_enqueue;
+        msc.in_enqueue = ctx.in_enqueue;
+        msc.out_cycle = ctx.out_cycle;
+        msc.in_cycle = ctx.in_cycle;
+        msc.tag = ctx.tag;
+
+        // Restore the device info
+        self.msc_device = Some(msc);
+
+        // Return bytes read
+        bytes_read
+    }
+
+    /// Get block device info
+    fn get_block_info(&self) -> Option<(u32, u64)> {
+        self.msc_device.as_ref().map(|msc| (msc.block_size, msc.block_count))
+    }
+
+    /// Get pointer to data buffer (after block_read)
+    fn get_data_buffer(&self) -> Option<*const u8> {
+        self.msc_device.as_ref().map(|msc| {
+            unsafe { msc.data_buf.add(DATA_OFFSET) as *const u8 }
+        })
+    }
+
+    /// Get mutable pointer to data buffer (for block_write)
+    fn get_data_buffer_mut(&mut self) -> Option<*mut u8> {
+        self.msc_device.as_ref().map(|msc| {
+            unsafe { msc.data_buf.add(DATA_OFFSET) }
+        })
+    }
+
+    /// Write blocks to the MSC device (for IPC handler)
+    /// Returns bytes written on success
+    fn block_write(&mut self, lba: u64, data: &[u8]) -> Option<usize> {
+        // Check limits (max 64 blocks = 32KB at 512 bytes/block)
+        if data.is_empty() || data.len() > 32768 {
+            return None;
+        }
+
+        // Check if we have an MSC device - take ownership temporarily
+        let mut msc = self.msc_device.take()?;
+
+        // Reconstruct BulkContext from stored MscDeviceInfo
+        let mut ctx = BulkContext {
+            slot_id: msc.slot_id,
+            bulk_in_dci: msc.bulk_in_dci,
+            bulk_out_dci: msc.bulk_out_dci,
+            bulk_in_ring: msc.bulk_in_ring,
+            bulk_in_ring_phys: msc.bulk_in_ring_phys,
+            bulk_out_ring: msc.bulk_out_ring,
+            _bulk_out_ring_phys: msc.bulk_out_ring_phys,
+            data_buf: msc.data_buf,
+            data_phys: msc.data_phys,
+            device_ctx: msc.device_ctx,
+            out_enqueue: msc.out_enqueue,
+            in_enqueue: msc.in_enqueue,
+            out_cycle: msc.out_cycle,
+            in_cycle: msc.in_cycle,
+            tag: msc.tag,
+        };
+
+        // Copy data to DMA buffer
+        unsafe {
+            let data_ptr = ctx.data_buf.add(DATA_OFFSET);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
+            // Clean cache for the data area before DMA write
+            for offset in (0..data.len()).step_by(64) {
+                let addr = data_ptr.add(offset) as u64;
+                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
+            }
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        // Perform the write
+        let success = self.scsi_write_10(&mut ctx, lba as u32, data);
+
+        // Update ring state in MscDeviceInfo
+        msc.out_enqueue = ctx.out_enqueue;
+        msc.in_enqueue = ctx.in_enqueue;
+        msc.out_cycle = ctx.out_cycle;
+        msc.in_cycle = ctx.in_cycle;
+        msc.tag = ctx.tag;
+
+        // Restore the device info
+        self.msc_device = Some(msc);
+
+        if success {
+            Some(data.len())
+        } else {
+            None
         }
     }
 }
@@ -1969,6 +2625,8 @@ fn request_vbus_enable() -> bool {
 use usb::{
     UsbRequest, UsbStatus, UsbMessageHeader, UsbResponseHeader,
     USB_MSG_MAX_SIZE,
+    BlockReadRequest, BlockReadResponse, BlockInfoRequest, BlockInfoResponse,
+    BlockWriteRequest, BlockWriteResponse,
 };
 
 /// Connected IPC client
@@ -2037,6 +2695,25 @@ impl IpcClient {
                 // TODO: implement
                 self.send_error(UsbStatus::InvalidRequest);
             }
+            UsbRequest::BlockRead => {
+                // Copy payload to avoid borrow conflict
+                let mut payload = [0u8; 32];
+                let payload_len = core::cmp::min(32, recv_len - UsbMessageHeader::SIZE);
+                payload[..payload_len].copy_from_slice(&self.msg_buf[UsbMessageHeader::SIZE..UsbMessageHeader::SIZE + payload_len]);
+                self.handle_block_read(driver, &payload[..payload_len]);
+            }
+            UsbRequest::BlockInfo => {
+                self.handle_block_info(driver);
+            }
+            UsbRequest::BlockWrite => {
+                // Copy payload and data to avoid borrow conflict
+                // BlockWriteRequest is 24 bytes, followed by data
+                let payload_len = recv_len - UsbMessageHeader::SIZE;
+                let mut payload = [0u8; 576];  // Max: 24 byte header + 512 byte sector
+                let copy_len = core::cmp::min(576, payload_len);
+                payload[..copy_len].copy_from_slice(&self.msg_buf[UsbMessageHeader::SIZE..UsbMessageHeader::SIZE + copy_len]);
+                self.handle_block_write(driver, &payload[..copy_len]);
+            }
         }
 
         true
@@ -2056,6 +2733,110 @@ impl IpcClient {
         let resp_bytes = resp.to_bytes();
         self.msg_buf[..UsbResponseHeader::SIZE].copy_from_slice(&resp_bytes);
         let _ = syscall::send(self.channel, &self.msg_buf[..UsbResponseHeader::SIZE]);
+    }
+
+    fn handle_block_read(&mut self, driver: &mut UsbDriver, payload: &[u8]) {
+        // Parse request
+        let req = match BlockReadRequest::from_bytes(payload) {
+            Some(r) => r,
+            None => {
+                self.send_error(UsbStatus::InvalidRequest);
+                return;
+            }
+        };
+
+        // Perform the read
+        match driver.block_read(req.lba, req.block_count) {
+            Some(bytes_read) => {
+                // Get pointer to data buffer
+                if let Some(data_ptr) = driver.get_data_buffer() {
+                    // Build response header
+                    let resp = BlockReadResponse::new(UsbStatus::Ok, bytes_read as u32);
+                    let resp_bytes = resp.to_bytes();
+
+                    // Copy response header to msg_buf
+                    self.msg_buf[..BlockReadResponse::SIZE].copy_from_slice(&resp_bytes);
+
+                    // Copy data after response header (limited to buffer size)
+                    let max_data = USB_MSG_MAX_SIZE - BlockReadResponse::SIZE;
+                    let copy_len = core::cmp::min(bytes_read, max_data);
+
+                    // Invalidate cache before reading DMA buffer
+                    unsafe {
+                        for offset in (0..copy_len).step_by(64) {
+                            let addr = data_ptr.add(offset) as u64;
+                            core::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
+                        }
+                        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+
+                        let data_slice = core::slice::from_raw_parts(data_ptr, copy_len);
+                        self.msg_buf[BlockReadResponse::SIZE..BlockReadResponse::SIZE + copy_len]
+                            .copy_from_slice(data_slice);
+                    }
+
+                    // Send response with data
+                    let total_len = BlockReadResponse::SIZE + copy_len;
+                    let _ = syscall::send(self.channel, &self.msg_buf[..total_len]);
+                } else {
+                    self.send_error(UsbStatus::Error);
+                }
+            }
+            None => {
+                self.send_error(UsbStatus::Error);
+            }
+        }
+    }
+
+    fn handle_block_info(&mut self, driver: &UsbDriver) {
+        match driver.get_block_info() {
+            Some((block_size, block_count)) => {
+                println!("[usbd] BlockInfo request: {} blocks x {} bytes", block_count, block_size);
+                let resp = BlockInfoResponse::new(UsbStatus::Ok, block_size, block_count);
+                let resp_bytes = resp.to_bytes();
+                self.msg_buf[..BlockInfoResponse::SIZE].copy_from_slice(&resp_bytes);
+                let _ = syscall::send(self.channel, &self.msg_buf[..BlockInfoResponse::SIZE]);
+            }
+            None => {
+                // No device - MSC not enumerated yet or no device connected
+                println!("[usbd] BlockInfo request: no MSC device available");
+                self.send_error(UsbStatus::NotFound);
+            }
+        }
+    }
+
+    fn handle_block_write(&mut self, driver: &mut UsbDriver, payload: &[u8]) {
+        // Parse request header (24 bytes)
+        let req = match BlockWriteRequest::from_bytes(payload) {
+            Some(r) => r,
+            None => {
+                self.send_error(UsbStatus::InvalidRequest);
+                return;
+            }
+        };
+
+        // Data follows the header
+        let data_offset = BlockWriteRequest::SIZE;
+        let expected_bytes = (req.block_count as usize) * 512;
+
+        if payload.len() < data_offset + expected_bytes {
+            self.send_error(UsbStatus::InvalidRequest);
+            return;
+        }
+
+        let data = &payload[data_offset..data_offset + expected_bytes];
+
+        // Perform the write
+        match driver.block_write(req.lba, data) {
+            Some(bytes_written) => {
+                let resp = BlockWriteResponse::new(UsbStatus::Ok, bytes_written as u32);
+                let resp_bytes = resp.to_bytes();
+                self.msg_buf[..BlockWriteResponse::SIZE].copy_from_slice(&resp_bytes);
+                let _ = syscall::send(self.channel, &self.msg_buf[..BlockWriteResponse::SIZE]);
+            }
+            None => {
+                self.send_error(UsbStatus::Error);
+            }
+        }
     }
 }
 

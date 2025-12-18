@@ -307,6 +307,10 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 // Bulk Transfer Context - for cleaner SCSI command handling
 // =============================================================================
 
+/// Ring size constants
+pub const RING_SIZE: usize = 256;
+pub const RING_USABLE: usize = 255;  // Last entry is Link TRB
+
 /// Context for bulk transfers (holds all the state needed for CBW/CSW/Data)
 pub struct BulkContext {
     pub slot_id: u32,
@@ -322,6 +326,9 @@ pub struct BulkContext {
     // Ring enqueue positions (tracks where we are in the ring)
     pub out_enqueue: usize,
     pub in_enqueue: usize,
+    // Cycle bits for producer side
+    pub out_cycle: bool,
+    pub in_cycle: bool,
     // CBW tag counter
     pub tag: u32,
 }
@@ -367,8 +374,80 @@ impl BulkContext {
             device_ctx,
             out_enqueue: 0,
             in_enqueue: 0,
+            out_cycle: true,  // Producer starts with cycle=1
+            in_cycle: true,   // Producer starts with cycle=1
             tag: 1,
         }
+    }
+
+    /// Advance bulk OUT enqueue pointer with wrap-around
+    /// Returns the current index (before advancing) and cycle bit to use
+    /// IMPORTANT: Updates the Link TRB's cycle bit when wrapping
+    ///
+    /// The Link TRB's cycle bit must match the controller's DCS (Dequeue Cycle State).
+    /// After we toggle our cycle, the controller's DCS is the OLD value (opposite of new).
+    /// So Link TRB cycle = !new_cycle = old_cycle.
+    pub fn advance_out(&mut self) -> (usize, u32) {
+        let idx = self.out_enqueue;
+        let cycle = if self.out_cycle { 1 } else { 0 };
+
+        self.out_enqueue += 1;
+        if self.out_enqueue >= RING_USABLE {
+            self.out_enqueue = 0;
+            self.out_cycle = !self.out_cycle;
+            unsafe {
+                // Update Link TRB cycle to OLD cycle (matches controller's DCS)
+                // Old cycle = !new_cycle (opposite of our new cycle state)
+                let link_trb = &mut *self.bulk_out_ring.add(RING_SIZE - 1);
+                crate::transfer::invalidate_cache_line(link_trb as *const _ as u64);
+                crate::transfer::dsb();
+
+                let old_ctrl = core::ptr::read_volatile(&link_trb.control);
+                let new_ctrl = if !self.out_cycle {
+                    old_ctrl | 1  // Set cycle bit (controller DCS is 1)
+                } else {
+                    old_ctrl & !1 // Clear cycle bit (controller DCS is 0)
+                };
+                core::ptr::write_volatile(&mut link_trb.control, new_ctrl);
+                self.flush_buffer(link_trb as *const _ as u64, 16);
+                crate::transfer::dsb();
+            }
+        }
+
+        (idx, cycle)
+    }
+
+    /// Advance bulk IN enqueue pointer with wrap-around
+    /// Returns the current index (before advancing) and cycle bit to use
+    /// IMPORTANT: Updates the Link TRB's cycle bit when wrapping
+    pub fn advance_in(&mut self) -> (usize, u32) {
+        let idx = self.in_enqueue;
+        let cycle = if self.in_cycle { 1 } else { 0 };
+
+        self.in_enqueue += 1;
+        if self.in_enqueue >= RING_USABLE {
+            self.in_enqueue = 0;
+            self.in_cycle = !self.in_cycle;
+            unsafe {
+                // Update Link TRB cycle to OLD cycle (matches controller's DCS)
+                // Old cycle = !new_cycle (opposite of our new cycle state)
+                let link_trb = &mut *self.bulk_in_ring.add(RING_SIZE - 1);
+                crate::transfer::invalidate_cache_line(link_trb as *const _ as u64);
+                crate::transfer::dsb();
+
+                let old_ctrl = core::ptr::read_volatile(&link_trb.control);
+                let new_ctrl = if !self.in_cycle {
+                    old_ctrl | 1  // Set cycle bit (controller DCS is 1)
+                } else {
+                    old_ctrl & !1 // Clear cycle bit (controller DCS is 0)
+                };
+                core::ptr::write_volatile(&mut link_trb.control, new_ctrl);
+                self.flush_buffer(link_trb as *const _ as u64, 16);
+                crate::transfer::dsb();
+            }
+        }
+
+        (idx, cycle)
     }
 
     /// Get current DCS (Dequeue Cycle State) for bulk IN endpoint from device context
@@ -406,5 +485,21 @@ impl BulkContext {
         let t = self.tag;
         self.tag += 1;
         t
+    }
+
+    /// Debug: get Link TRB contents for bulk OUT ring
+    /// Returns (param, status, control)
+    pub fn debug_out_link_trb(&self) -> (u64, u32, u32) {
+        unsafe {
+            let link_trb = &*self.bulk_out_ring.add(RING_SIZE - 1);
+            crate::transfer::invalidate_cache_line(link_trb as *const _ as u64);
+            crate::transfer::dsb();
+            crate::transfer::isb();
+            (
+                core::ptr::read_volatile(&link_trb.param),
+                core::ptr::read_volatile(&link_trb.status),
+                core::ptr::read_volatile(&link_trb.control),
+            )
+        }
     }
 }

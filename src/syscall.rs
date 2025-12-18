@@ -97,6 +97,8 @@ pub enum SyscallNumber {
     MmapDma = 36,
     /// Reset/reboot the system
     Reset = 37,
+    /// Seek to position in file descriptor
+    Lseek = 38,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -142,6 +144,7 @@ impl From<u64> for SyscallNumber {
             35 => SyscallNumber::SetLogLevel,
             36 => SyscallNumber::MmapDma,
             37 => SyscallNumber::Reset,
+            38 => SyscallNumber::Lseek,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -259,6 +262,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::SetLogLevel => sys_set_log_level(args.arg0 as u8),
         SyscallNumber::MmapDma => sys_mmap_dma(args.arg0 as usize, args.arg1),
         SyscallNumber::Reset => sys_reset(),
+        SyscallNumber::Lseek => sys_lseek(args.arg0 as u32, args.arg1 as i64, args.arg2 as u32),
         SyscallNumber::Invalid => {
             println!("[SYSCALL] Invalid syscall number: {}", args.num);
             SyscallError::NotImplemented as i64
@@ -528,7 +532,7 @@ fn sys_send(channel_id: u32, data_ptr: u64, data_len: usize) -> i64 {
     let caller_pid = current_pid();
 
     // Copy from user space if we have data
-    let mut kernel_buf = [0u8; 256]; // MAX_INLINE_PAYLOAD
+    let mut kernel_buf = [0u8; crate::ipc::MAX_INLINE_PAYLOAD];
     if data_len > 0 {
         match uaccess::copy_from_user(&mut kernel_buf[..data_len], data_ptr) {
             Ok(_) => {}
@@ -847,6 +851,45 @@ fn sys_dup2(old_fd: u32, new_fd: u32) -> i64 {
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if task.fd_table.dup2(old_fd, new_fd) {
                 return new_fd as i64;
+            }
+        }
+    }
+    SyscallError::BadFd as i64
+}
+
+/// Seek to a position in a file descriptor
+/// Args: fd, offset, whence (SEEK_SET=0, SEEK_CUR=1, SEEK_END=2)
+/// Returns: new position on success, negative error on failure
+fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
+    unsafe {
+        let sched = crate::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if let Some(entry) = task.fd_table.get_mut(fd) {
+                let new_pos = match whence {
+                    0 => {
+                        // SEEK_SET: absolute position
+                        if offset < 0 {
+                            return SyscallError::InvalidArgument as i64;
+                        }
+                        offset as u64
+                    }
+                    1 => {
+                        // SEEK_CUR: relative to current position
+                        let current = entry.offset as i64;
+                        let new = current + offset;
+                        if new < 0 {
+                            return SyscallError::InvalidArgument as i64;
+                        }
+                        new as u64
+                    }
+                    2 => {
+                        // SEEK_END: relative to end of file (not supported yet)
+                        return SyscallError::NotImplemented as i64;
+                    }
+                    _ => return SyscallError::InvalidArgument as i64,
+                };
+                entry.offset = new_pos;
+                return new_pos as i64;
             }
         }
     }
