@@ -7,6 +7,47 @@
 use crate::trb::{Trb, trb_type};
 use crate::usb::{SlotContext, EndpointContext, InputControlContext};
 
+// =============================================================================
+// Memory Layout Constants for Per-Device Context Allocation
+// =============================================================================
+//
+// When allocating a 4KB page for device contexts, we use this layout:
+//
+// Offset 0x000: InputContext (1056 bytes = 32 + 32 + 31*32)
+// Offset 0x500: DeviceContext (1024 bytes = 32 + 31*32)
+// Offset 0x900: EP0 transfer ring (112 * 16 = 1792 bytes)
+//
+// This fits in a single 4KB page with room to spare.
+
+/// Offset of InputContext within per-device 4KB allocation
+pub const CTX_OFFSET_INPUT: u64 = 0x000;
+
+/// Offset of DeviceContext within per-device 4KB allocation
+pub const CTX_OFFSET_DEVICE: u64 = 0x500;
+
+/// Offset of EP0 transfer ring within per-device 4KB allocation
+pub const CTX_OFFSET_EP0_RING: u64 = 0x900;
+
+// =============================================================================
+// Memory Layout Constants for Global xHCI Structures (3-page allocation)
+// =============================================================================
+//
+// Page 0 (0x0000): DCBAA (256 * 8 = 2KB) + ERST (64B) + padding
+// Page 1 (0x1000): Command Ring (64 TRBs * 16 = 1KB)
+// Page 2 (0x2000): Event Ring (64 TRBs * 16 = 1KB)
+
+/// Offset of ERST within global xHCI memory
+pub const XHCI_OFFSET_ERST: u64 = 0x800;
+
+/// Offset of Command Ring within global xHCI memory
+pub const XHCI_OFFSET_CMD_RING: u64 = 0x1000;
+
+/// Offset of Event Ring within global xHCI memory
+pub const XHCI_OFFSET_EVT_RING: u64 = 0x2000;
+
+/// Total size of global xHCI memory allocation (3 pages)
+pub const XHCI_MEM_SIZE: usize = 4096 * 3;
+
 /// Slot state values (from xHCI spec)
 pub mod slot_state {
     pub const DISABLED: u32 = 0;

@@ -14,6 +14,7 @@ pub mod port_feature {
     pub const SUSPEND: u16 = 2;
     pub const OVER_CURRENT: u16 = 3;
     pub const RESET: u16 = 4;
+    pub const LINK_STATE: u16 = 5;
     pub const POWER: u16 = 8;
     pub const LOW_SPEED: u16 = 9;
     pub const C_CONNECTION: u16 = 16;
@@ -26,7 +27,7 @@ pub mod port_feature {
     pub const C_BH_PORT_RESET: u16 = 29;
 }
 
-/// Hub port status bits
+/// Hub port status bits (wPortStatus - lower 16 bits of GetPortStatus response)
 pub mod port_status {
     pub const CONNECTION: u16 = 1 << 0;
     pub const ENABLE: u16 = 1 << 1;

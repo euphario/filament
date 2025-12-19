@@ -37,8 +37,13 @@ pub mod usb_req {
 // =============================================================================
 // USB Hub Definitions
 // =============================================================================
+// Note: These constants are re-exported here for backward compatibility.
+// The canonical definitions are in hub.rs (port_feature::, port_status::, port_change::).
 
 pub mod hub {
+    // Import canonical definitions from hub.rs
+    use crate::hub::{port_feature, port_status, port_change};
+
     // Hub class request types
     pub const RT_HUB_GET: u8 = 0xA0;      // Device-to-host, class, device
     pub const RT_HUB_SET: u8 = 0x20;      // Host-to-device, class, device
@@ -51,30 +56,30 @@ pub mod hub {
     pub const SET_FEATURE: u8 = 3;
     pub const GET_DESCRIPTOR: u8 = 6;
 
-    // Port features
-    pub const PORT_CONNECTION: u16 = 0;
-    pub const PORT_ENABLE: u16 = 1;
-    pub const PORT_RESET: u16 = 4;
-    pub const PORT_POWER: u16 = 8;
-    pub const C_PORT_CONNECTION: u16 = 16;
-    pub const C_PORT_RESET: u16 = 20;
-    pub const PORT_LINK_STATE: u16 = 5;
-    pub const BH_PORT_RESET: u16 = 28;    // USB3 warm reset
-    pub const C_BH_PORT_RESET: u16 = 29;  // Clear USB3 warm reset change
-
     // Hub class requests
     pub const SET_HUB_DEPTH: u8 = 12;     // USB3 hub depth setting
 
-    // Port status bits (wPortStatus)
-    pub const PS_CONNECTION: u16 = 1 << 0;
-    pub const PS_ENABLE: u16 = 1 << 1;
-    pub const PS_RESET: u16 = 1 << 4;
-    pub const PS_POWER: u16 = 1 << 9;
+    // Port features (re-exported from hub.rs port_feature::)
+    pub const PORT_CONNECTION: u16 = port_feature::CONNECTION;
+    pub const PORT_ENABLE: u16 = port_feature::ENABLE;
+    pub const PORT_RESET: u16 = port_feature::RESET;
+    pub const PORT_POWER: u16 = port_feature::POWER;
+    pub const PORT_LINK_STATE: u16 = port_feature::LINK_STATE;
+    pub const C_PORT_CONNECTION: u16 = port_feature::C_CONNECTION;
+    pub const C_PORT_RESET: u16 = port_feature::C_RESET;
+    pub const BH_PORT_RESET: u16 = port_feature::BH_PORT_RESET;
+    pub const C_BH_PORT_RESET: u16 = port_feature::C_BH_PORT_RESET;
 
-    // Port status change bits (wPortChange) - in high word
-    pub const PS_C_CONNECTION: u16 = 1 << 0;
-    pub const PS_C_ENABLE: u16 = 1 << 1;
-    pub const PS_C_RESET: u16 = 1 << 4;
+    // Port status bits (re-exported from hub.rs port_status::)
+    pub const PS_CONNECTION: u16 = port_status::CONNECTION;
+    pub const PS_ENABLE: u16 = port_status::ENABLE;
+    pub const PS_RESET: u16 = port_status::RESET;
+    pub const PS_POWER: u16 = port_status::POWER;
+
+    // Port status change bits (re-exported from hub.rs port_change::)
+    pub const PS_C_CONNECTION: u16 = port_change::C_CONNECTION;
+    pub const PS_C_ENABLE: u16 = port_change::C_ENABLE;
+    pub const PS_C_RESET: u16 = port_change::C_RESET;
 }
 
 /// USB Hub Descriptor (USB 2.0)

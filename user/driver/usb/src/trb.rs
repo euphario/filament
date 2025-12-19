@@ -77,3 +77,29 @@ pub mod trb_cc {
     pub const TRB_ERROR: u32 = 5;
     pub const BABBLE: u32 = 3;
 }
+
+// TRB Control Field Bit Positions
+pub mod trb_ctrl {
+    /// Cycle bit (bit 0) - indicates TRB ownership
+    pub const CYCLE: u32 = 1 << 0;
+    /// Toggle Cycle bit (bit 1) - for Link TRBs
+    pub const TC: u32 = 1 << 1;
+    /// Interrupt on Short Packet (bit 2)
+    pub const ISP: u32 = 1 << 2;
+    /// No Snoop (bit 3)
+    pub const NS: u32 = 1 << 3;
+    /// Chain bit (bit 4)
+    pub const CH: u32 = 1 << 4;
+    /// Interrupt On Completion (bit 5)
+    pub const IOC: u32 = 1 << 5;
+    /// Immediate Data (bit 6) - for Setup TRBs
+    pub const IDT: u32 = 1 << 6;
+    /// Block Set Address Request (bit 9) - for Address Device
+    pub const BSR: u32 = 1 << 9;
+    /// Direction bit (bit 16) - for Data/Status TRBs (1=IN, 0=OUT)
+    pub const DIR_IN: u32 = 1 << 16;
+    /// Transfer Type field (bits 16-17) for Setup TRB
+    pub const TRT_NO_DATA: u32 = 0 << 16;
+    pub const TRT_OUT: u32 = 2 << 16;
+    pub const TRT_IN: u32 = 3 << 16;
+}

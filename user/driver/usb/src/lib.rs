@@ -93,8 +93,8 @@ pub mod consts;
 // =============================================================================
 
 // Core types
-pub use trb::{Trb, trb_type, trb_cc};
-pub use ring::{Ring, EventRing, ErstEntry, Dcbaa, RING_SIZE};
+pub use trb::{Trb, trb_type, trb_cc, trb_ctrl};
+pub use ring::{Ring, EventRing, ErstEntry, Dcbaa, RING_SIZE, EP0_RING_SIZE, EP0_RING_USABLE, BULK_RING_SIZE, BULK_RING_USABLE};
 pub use mmio::{MmioRegion, format_mmio_url, format_hex, delay_ms, delay, print_hex64, print_hex32, print_hex8};
 
 // xHCI types and helpers
@@ -137,6 +137,12 @@ pub use transfer::{
     flush_trb, flush_trb_range, dsb, isb,
     flush_cache_line, invalidate_cache_line,
     flush_buffer, invalidate_buffer,
+    // Timing constants
+    DELAY_POST_RESET_US, DELAY_POST_ADDRESS_US, DELAY_POLL_INTERVAL_US,
+    DELAY_DOWNSTREAM_DEVICE_US, DELAY_DIRECT_DEVICE_US, DELAY_POST_CONFIG_US,
+    DELAY_INTER_CMD_US, POLL_MAX_DIRECT, POLL_MAX_DOWNSTREAM, POLL_MAX_DESCRIPTOR,
+    // Register bit constants
+    ERDP_EHB, USBSTS_EINT, USBSTS_PCD,
 };
 
 // Hub helpers
@@ -158,6 +164,9 @@ pub use enumeration::{
     init_slot_context, init_ep0_context, init_bulk_endpoint_context,
     init_input_control_for_address, init_input_control_for_configure,
     endpoint_address_to_dci, default_max_packet_size,
+    // Memory layout constants
+    CTX_OFFSET_INPUT, CTX_OFFSET_DEVICE, CTX_OFFSET_EP0_RING,
+    XHCI_OFFSET_ERST, XHCI_OFFSET_CMD_RING, XHCI_OFFSET_EVT_RING, XHCI_MEM_SIZE,
 };
 
 // Block device client (ring buffer based)

@@ -6,6 +6,53 @@
 
 use crate::trb::{Trb, trb_type};
 
+// =============================================================================
+// Timing Constants (microseconds unless noted)
+// =============================================================================
+
+/// Delay after port reset before addressing device (microseconds)
+pub const DELAY_POST_RESET_US: u32 = 50_000;
+
+/// Delay after ADDRESS_DEVICE command (microseconds)
+pub const DELAY_POST_ADDRESS_US: u32 = 100_000;
+
+/// Delay between poll iterations (microseconds)
+pub const DELAY_POLL_INTERVAL_US: u32 = 1_000;
+
+/// Delay before control transfer for devices behind hubs (microseconds)
+pub const DELAY_DOWNSTREAM_DEVICE_US: u32 = 100_000;
+
+/// Delay before control transfer for direct devices (microseconds)
+pub const DELAY_DIRECT_DEVICE_US: u32 = 50_000;
+
+/// Post-configuration delay (microseconds)
+pub const DELAY_POST_CONFIG_US: u32 = 50_000;
+
+/// Short inter-command delay (microseconds)
+pub const DELAY_INTER_CMD_US: u32 = 10_000;
+
+/// Maximum poll iterations for direct devices
+pub const POLL_MAX_DIRECT: usize = 100;
+
+/// Maximum poll iterations for devices behind hubs
+pub const POLL_MAX_DOWNSTREAM: usize = 300;
+
+/// Maximum poll iterations for descriptor transfers
+pub const POLL_MAX_DESCRIPTOR: usize = 3000;
+
+// =============================================================================
+// xHCI Register Bit Constants
+// =============================================================================
+
+/// ERDP Event Handler Busy bit (bit 3)
+pub const ERDP_EHB: u64 = 1 << 3;
+
+/// USBSTS Event Interrupt bit (bit 3)
+pub const USBSTS_EINT: u32 = 1 << 3;
+
+/// USBSTS Port Change Detect bit (bit 4)
+pub const USBSTS_PCD: u32 = 1 << 4;
+
 /// USB Setup Packet (8 bytes)
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]

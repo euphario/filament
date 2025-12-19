@@ -3,8 +3,24 @@
 use crate::trb::{Trb, trb_type};
 use crate::transfer::{flush_cache_line, invalidate_cache_line, dsb, isb};
 
-/// Ring size (number of TRBs) - must be power of 2 for easy wrap
+// =============================================================================
+// Ring Size Constants
+// =============================================================================
+
+/// Command/Event ring size (number of TRBs) - must be power of 2 for easy wrap
 pub const RING_SIZE: usize = 64;
+
+/// EP0 (control endpoint) transfer ring size
+/// 112 TRBs total: 111 usable + 1 Link TRB at the end
+pub const EP0_RING_SIZE: usize = 112;
+/// Number of usable TRBs in EP0 ring (excluding Link TRB)
+pub const EP0_RING_USABLE: usize = EP0_RING_SIZE - 1;
+
+/// Bulk endpoint transfer ring size
+/// 256 TRBs total: 255 usable + 1 Link TRB at the end
+pub const BULK_RING_SIZE: usize = 256;
+/// Number of usable TRBs in bulk ring (excluding Link TRB)
+pub const BULK_RING_USABLE: usize = BULK_RING_SIZE - 1;
 
 /// Command/Transfer Ring structure
 pub struct Ring {

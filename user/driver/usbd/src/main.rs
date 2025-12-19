@@ -29,7 +29,7 @@ use usb::{
     // xHCI registers
     xhci_op, xhci_rt, xhci_ir,
     // TRB
-    Trb, trb_type, trb_cc,
+    Trb, trb_type, trb_cc, trb_ctrl,
     // USB types
     usb_req, usb_hub as hub, ep_type,
     InputContext, DeviceContext,
@@ -40,6 +40,7 @@ use usb::{
     CBW_OFFSET, CSW_OFFSET, DATA_OFFSET,
     // Ring structures
     Ring, EventRing, ErstEntry,
+    EP0_RING_SIZE, EP0_RING_USABLE, BULK_RING_SIZE,
     // MMIO helpers
     MmioRegion, delay_ms, delay,
     // Port status parsing
@@ -48,11 +49,20 @@ use usb::{
     completion_code, doorbell,
     // Enumeration helpers
     build_enable_slot_trb, build_noop_trb,
+    // Memory layout constants
+    CTX_OFFSET_DEVICE, CTX_OFFSET_EP0_RING,
+    XHCI_OFFSET_ERST, XHCI_OFFSET_CMD_RING, XHCI_OFFSET_EVT_RING, XHCI_MEM_SIZE,
     // Hub helpers
     get_hub_descriptor_setup, get_port_status_setup,
     set_port_feature_setup, clear_port_feature_setup,
     // Cache ops (ARM64 cache maintenance for DMA)
     flush_cache_line, invalidate_cache_line, flush_buffer, invalidate_buffer, dsb,
+    // Timing constants
+    DELAY_POST_ADDRESS_US, DELAY_POLL_INTERVAL_US,
+    DELAY_DOWNSTREAM_DEVICE_US, DELAY_DIRECT_DEVICE_US, DELAY_POST_CONFIG_US,
+    DELAY_INTER_CMD_US, POLL_MAX_DIRECT, POLL_MAX_DOWNSTREAM, POLL_MAX_DESCRIPTOR,
+    // Register bit constants
+    ERDP_EHB, USBSTS_EINT, USBSTS_PCD,
 };
 
 // Modular architecture - Board abstraction hides SoC details
@@ -66,12 +76,6 @@ use usb::xhci::Controller as XhciController;
 // =============================================================================
 // USB Driver
 // =============================================================================
-
-/// Memory layout for xHCI structures (allocated via mmap)
-/// Page 0: DCBAA (2KB) + ERST (64B) + padding
-/// Page 1: Command Ring (64 TRBs * 16 = 1KB)
-/// Page 2: Event Ring (64 TRBs * 16 = 1KB)
-const XHCI_MEM_SIZE: usize = 4096 * 3;  // 3 pages
 
 struct UsbDriver {
     // New architecture: separate SoC and PHY drivers
@@ -296,15 +300,15 @@ impl UsbDriver {
         self.xhci_mem = mem_addr as u64;
         self.xhci_phys = phys_addr;
 
-        // Memory layout
+        // Memory layout (using constants from enumeration module)
         let dcbaa_virt = self.xhci_mem as *mut u64;
         let dcbaa_phys = self.xhci_phys;
-        let erst_virt = (self.xhci_mem + 0x800) as *mut ErstEntry;
-        let erst_phys = self.xhci_phys + 0x800;
-        let cmd_ring_virt = (self.xhci_mem + 0x1000) as *mut Trb;
-        let cmd_ring_phys = self.xhci_phys + 0x1000;
-        let evt_ring_virt = (self.xhci_mem + 0x2000) as *mut Trb;
-        let evt_ring_phys = self.xhci_phys + 0x2000;
+        let erst_virt = (self.xhci_mem + XHCI_OFFSET_ERST) as *mut ErstEntry;
+        let erst_phys = self.xhci_phys + XHCI_OFFSET_ERST;
+        let cmd_ring_virt = (self.xhci_mem + XHCI_OFFSET_CMD_RING) as *mut Trb;
+        let cmd_ring_phys = self.xhci_phys + XHCI_OFFSET_CMD_RING;
+        let evt_ring_virt = (self.xhci_mem + XHCI_OFFSET_EVT_RING) as *mut Trb;
+        let evt_ring_phys = self.xhci_phys + XHCI_OFFSET_EVT_RING;
 
         // Zero and flush DCBAA
         unsafe {
@@ -368,8 +372,8 @@ impl UsbDriver {
 
         // Check USBSTS for pending events
         let usbsts = self.op_read32(xhci_op::USBSTS);
-        let eint = (usbsts & (1 << 3)) != 0;
-        let pcd = (usbsts & (1 << 4)) != 0;
+        let eint = (usbsts & USBSTS_EINT) != 0;
+        let pcd = (usbsts & USBSTS_PCD) != 0;
 
         if let Some(ref mut event_ring) = self.event_ring {
             while event_count < 16 {
@@ -386,7 +390,7 @@ impl UsbDriver {
         if event_count == 0 {
             // Clear sticky EINT and PCD bits if no actual events found
             if eint || pcd {
-                self.op_write32(xhci_op::USBSTS, (1 << 3) | (1 << 4));  // Clear EINT and PCD
+                self.op_write32(xhci_op::USBSTS, USBSTS_EINT | USBSTS_PCD);
             }
             return 0;
         }
@@ -440,7 +444,7 @@ impl UsbDriver {
         }
 
         let ir0 = xhci_rt::IR0;
-        self.rt_write64(ir0 + xhci_ir::ERDP, final_erdp | (1 << 3));
+        self.rt_write64(ir0 + xhci_ir::ERDP, final_erdp | ERDP_EHB);
         ports_to_enumerate
     }
 
@@ -462,11 +466,11 @@ impl UsbDriver {
         }
 
         if drained > 0 {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, last_erdp | (1 << 3));
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, last_erdp | ERDP_EHB);
         }
 
         // Clear sticky USBSTS bits (W1C)
-        self.op_write32(xhci_op::USBSTS, (1 << 3) | (1 << 4));  // Clear EINT and PCD
+        self.op_write32(xhci_op::USBSTS, USBSTS_EINT | USBSTS_PCD);
     }
 
     /// Handle port status change event
@@ -587,9 +591,9 @@ impl UsbDriver {
         }
 
         if let Some(erdp) = erdp_to_update {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
             // Clear EINT bit (W1C) to acknowledge we processed the event
-            self.op_write32(xhci_op::USBSTS, 1 << 3);
+            self.op_write32(xhci_op::USBSTS, USBSTS_EINT);
         }
 
         if let Some((cc, slot_id)) = result {
@@ -666,23 +670,22 @@ impl UsbDriver {
         // 0x900: EP0 Transfer Ring (1024 bytes, 64-aligned)
         let input_ctx_virt = ctx_base as *mut InputContext;
         let input_ctx_phys = ctx_phys_base;
-        let device_ctx_virt = (ctx_base + 0x500) as *mut DeviceContext;
-        let device_ctx_phys = ctx_phys_base + 0x500;
-        let ep0_ring_virt = (ctx_base + 0x900) as *mut Trb;
-        let ep0_ring_phys = ctx_phys_base + 0x900;
+        let device_ctx_virt = (ctx_base + CTX_OFFSET_DEVICE) as *mut DeviceContext;
+        let device_ctx_phys = ctx_phys_base + CTX_OFFSET_DEVICE;
+        let ep0_ring_virt = (ctx_base + CTX_OFFSET_EP0_RING) as *mut Trb;
+        let ep0_ring_phys = ctx_phys_base + CTX_OFFSET_EP0_RING;
 
-        // Initialize EP0 transfer ring (112 TRBs - fits in 1792 bytes at 0x900)
-        // This gives us 111 usable slots, enough for hub enumeration without wrapping
-        const EP0_RING_SIZE: usize = 112;
+        // Initialize EP0 transfer ring (EP0_RING_SIZE TRBs - fits at CTX_OFFSET_EP0_RING)
+        // This gives us EP0_RING_USABLE slots, enough for hub enumeration without wrapping
         unsafe {
             for i in 0..EP0_RING_SIZE {
                 *ep0_ring_virt.add(i) = Trb::new();
             }
-            // Link TRB at end (index 111)
-            let link = &mut *ep0_ring_virt.add(EP0_RING_SIZE - 1);
+            // Link TRB at end
+            let link = &mut *ep0_ring_virt.add(EP0_RING_USABLE);
             link.param = ep0_ring_phys;
             link.set_type(trb_type::LINK);
-            link.control |= 1 << 1;  // Toggle Cycle (TC) bit - bit 1, NOT bit 5
+            link.control |= trb_ctrl::TC;  // Toggle Cycle
 
             // Flush EP0 ring to memory
             flush_buffer(ep0_ring_virt as u64, EP0_RING_SIZE * core::mem::size_of::<Trb>());
@@ -776,9 +779,9 @@ impl UsbDriver {
         }
 
         if let Some(erdp) = erdp_to_write {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
             // Clear EINT bit (W1C) to acknowledge we processed the event
-            self.op_write32(xhci_op::USBSTS, 1 << 3);
+            self.op_write32(xhci_op::USBSTS, USBSTS_EINT);
         }
 
         if addr_result.is_none() {
@@ -874,9 +877,9 @@ impl UsbDriver {
 
         // Update ERDP for all consumed events
         if let Some(erdp) = erdp_to_update {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
             // Clear EINT bit (W1C) to acknowledge we processed the event
-            self.op_write32(xhci_op::USBSTS, 1 << 3);
+            self.op_write32(xhci_op::USBSTS, USBSTS_EINT);
         }
 
         // Process transfer result
@@ -940,8 +943,7 @@ impl UsbDriver {
         let is_in = (request_type & 0x80) != 0;
         let has_data = length > 0;
 
-        // EP0 ring is 112 TRBs (111 usable + link at 111)
-        const EP0_RING_USABLE: usize = 111;
+        // EP0 ring uses EP0_RING_SIZE TRBs (EP0_RING_USABLE usable + link at end)
         let trbs_needed = if has_data { 3 } else { 2 };
 
         // If not enough space before link TRB, wrap to beginning
@@ -972,7 +974,7 @@ impl UsbDriver {
                 let link = &mut *ep0_ring_virt.add(EP0_RING_USABLE);
                 // Set Link TRB cycle bit to current cycle (hardware will process it)
                 // Keep TC bit set (bit 1) so hardware toggles when following link
-                link.control = (trb_type::LINK << 10) | (1 << 1) | cycle_bit;
+                link.control = (trb_type::LINK << 10) | trb_ctrl::TC | cycle_bit;
                 flush_cache_line(link as *const _ as u64);
             }
             // Toggle software cycle and wrap enqueue
@@ -1058,7 +1060,7 @@ impl UsbDriver {
         // If no events found but EINT is set, retry with extra delay
         if result.is_none() {
             let usbsts = self.op_read32(xhci_op::USBSTS);
-            if (usbsts & (1 << 3)) != 0 {
+            if (usbsts & USBSTS_EINT) != 0 {
                 delay(50000);
                 if let Some(ref mut event_ring) = self.event_ring {
                     for _ in 0..100 {
@@ -1081,9 +1083,9 @@ impl UsbDriver {
 
         // Update ERDP outside the borrow
         if let Some(erdp) = erdp_to_update {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
             // Clear EINT bit (W1C) to acknowledge we processed the event
-            self.op_write32(xhci_op::USBSTS, 1 << 3);
+            self.op_write32(xhci_op::USBSTS, USBSTS_EINT);
         }
 
         if let Some((cc, remaining)) = result {
@@ -1212,8 +1214,6 @@ impl UsbDriver {
         ep0_ring_phys: u64,
         ep0_enqueue: usize,
     ) -> bool {
-        use usb::transfer::{flush_cache_line, dsb};
-
         // Allocate interrupt transfer ring (small - 16 entries is enough)
         let mut int_ring_phys: u64 = 0;
         let int_ring_virt = syscall::mmap_dma(4096, &mut int_ring_phys);
@@ -1234,12 +1234,9 @@ impl UsbDriver {
             let link = &mut *ring.add(15);
             link.param = int_ring_phys;
             link.set_type(trb_type::LINK);
-            link.control |= 1 << 1;  // Toggle Cycle (TC)
-            // Flush
-            for i in 0..16 {
-                flush_cache_line(ring.add(i) as u64);
-            }
-            dsb();
+            link.control |= trb_ctrl::TC;  // Toggle Cycle
+            // Flush entire ring
+            flush_buffer(ring as u64, 16 * core::mem::size_of::<Trb>());
         }
 
         // Calculate DCI for interrupt IN endpoint
@@ -1307,7 +1304,7 @@ impl UsbDriver {
                 }
             }
             if let Some(erdp) = erdp_to_update {
-                self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+                self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
             }
         }
 
@@ -1362,8 +1359,6 @@ impl UsbDriver {
             let cycle = hub.int_in_cycle;
 
             unsafe {
-                use usb::transfer::{flush_cache_line, dsb};
-
                 let ring = hub.int_in_ring;
                 let trb = &mut *ring.add(hub.int_in_enqueue);
 
@@ -1657,7 +1652,7 @@ impl UsbDriver {
                         }
                     }
                     if let Some(erdp) = erdp_to_update {
-                        self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+                        self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
                     }
                 }
             }
@@ -1906,21 +1901,20 @@ impl UsbDriver {
 
         let input_ctx_virt = ctx_virt as *mut InputContext;
         let input_ctx_phys = ctx_phys;
-        let device_ctx_virt = (ctx_virt as u64 + 0x500) as *mut DeviceContext;
-        let device_ctx_phys = ctx_phys + 0x500;
-        let ep0_ring_virt = (ctx_virt as u64 + 0x900) as *mut Trb;
-        let ep0_ring_phys = ctx_phys + 0x900;
+        let device_ctx_virt = (ctx_virt as u64 + CTX_OFFSET_DEVICE) as *mut DeviceContext;
+        let device_ctx_phys = ctx_phys + CTX_OFFSET_DEVICE;
+        let ep0_ring_virt = (ctx_virt as u64 + CTX_OFFSET_EP0_RING) as *mut Trb;
+        let ep0_ring_phys = ctx_phys + CTX_OFFSET_EP0_RING;
 
-        // Initialize EP0 transfer ring (112 TRBs - same as enumerate_device)
-        const EP0_RING_SIZE: usize = 112;
+        // Initialize EP0 transfer ring (same as enumerate_device)
         unsafe {
             for i in 0..EP0_RING_SIZE {
                 *ep0_ring_virt.add(i) = Trb::new();
             }
-            let link = &mut *ep0_ring_virt.add(EP0_RING_SIZE - 1);
+            let link = &mut *ep0_ring_virt.add(EP0_RING_USABLE);
             link.param = ep0_ring_phys;
             link.set_type(trb_type::LINK);
-            link.control |= 1 << 1;  // Toggle Cycle (TC) bit - bit 1, NOT bit 5
+            link.control |= trb_ctrl::TC;  // Toggle Cycle
             // Flush EP0 ring to memory
             flush_buffer(ep0_ring_virt as u64, EP0_RING_SIZE * core::mem::size_of::<Trb>());
         }
@@ -2015,7 +2009,7 @@ impl UsbDriver {
         }
 
         if let Some(erdp) = erdp_to_update {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
         }
 
         let addr_ok = match addr_result {
@@ -2236,43 +2230,33 @@ impl UsbDriver {
         let bulk_out_ring_virt = syscall::mmap_dma(4096, &mut bulk_out_ring_phys);
         if bulk_out_ring_virt < 0 { return; }
 
-        // Initialize transfer rings with Link TRBs at index 255 (for 256-entry rings)
-        // Note: Ring::init() uses RING_SIZE=64, but bulk rings need 256 entries
+        // Initialize transfer rings with Link TRBs (BULK_RING_SIZE entries)
         unsafe {
-            use usb::transfer::{flush_cache_line, dsb};
-            use usb::trb::trb_type;
-
-            // Initialize bulk IN ring (256 TRBs, Link at index 255)
+            // Initialize bulk IN ring
             let in_ring = bulk_in_ring_virt as *mut Trb;
-            for i in 0..256 {
+            for i in 0..BULK_RING_SIZE {
                 *in_ring.add(i) = Trb::new();
             }
-            // Set up Link TRB at index 255
-            let in_link = &mut *in_ring.add(255);
+            // Set up Link TRB at last position
+            let in_link = &mut *in_ring.add(BULK_RING_SIZE - 1);
             in_link.param = bulk_in_ring_phys;  // Points back to start
             in_link.set_type(trb_type::LINK);
-            in_link.control |= 1 << 1;  // Toggle Cycle bit (TC)
-            // Flush entire ring
-            for i in 0..256 {
-                flush_cache_line(in_ring.add(i) as u64);
-            }
-            dsb();
+            in_link.control |= trb_ctrl::TC;  // Toggle Cycle
+            // Flush entire ring using bulk flush
+            flush_buffer(in_ring as u64, BULK_RING_SIZE * core::mem::size_of::<Trb>());
 
-            // Initialize bulk OUT ring (256 TRBs, Link at index 255)
+            // Initialize bulk OUT ring
             let out_ring = bulk_out_ring_virt as *mut Trb;
-            for i in 0..256 {
+            for i in 0..BULK_RING_SIZE {
                 *out_ring.add(i) = Trb::new();
             }
-            // Set up Link TRB at index 255
-            let out_link = &mut *out_ring.add(255);
+            // Set up Link TRB at last position
+            let out_link = &mut *out_ring.add(BULK_RING_SIZE - 1);
             out_link.param = bulk_out_ring_phys;  // Points back to start
             out_link.set_type(trb_type::LINK);
-            out_link.control |= 1 << 1;  // Toggle Cycle bit (TC)
-            // Flush entire ring
-            for i in 0..256 {
-                flush_cache_line(out_ring.add(i) as u64);
-            }
-            dsb();
+            out_link.control |= trb_ctrl::TC;  // Toggle Cycle
+            // Flush entire ring using bulk flush
+            flush_buffer(out_ring as u64, BULK_RING_SIZE * core::mem::size_of::<Trb>());
         }
 
         // Calculate Device Context Index (DCI) for each endpoint
@@ -2344,7 +2328,7 @@ impl UsbDriver {
                     if evt.get_type() == trb_type::COMMAND_COMPLETION {
                         let cc = (evt.status >> 24) & 0xFF;
                         config_ok = cc == trb_cc::SUCCESS;
-                        let erdp = event_ring.erdp() | (1 << 3);
+                        let erdp = event_ring.erdp() | ERDP_EHB;
                         self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp);
                         break;
                     }
@@ -2413,7 +2397,7 @@ impl UsbDriver {
                     let evt_type = evt.get_type();
                     let cc = (evt.status >> 24) & 0xFF;
                     // Update ERDP for all events
-                    let erdp = event_ring.erdp() | (1 << 3);
+                    let erdp = event_ring.erdp() | ERDP_EHB;
                     unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
                     if evt_type == trb_type::TRANSFER_EVENT {
                         return cc == trb_cc::SUCCESS;
@@ -2462,7 +2446,7 @@ impl UsbDriver {
                     let cc = (evt.status >> 24) & 0xFF;
 
                     // Update ERDP
-                    let erdp = event_ring.erdp() | (1 << 3);
+                    let erdp = event_ring.erdp() | ERDP_EHB;
                     unsafe {
                         let ptr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64) as *mut u64;
                         core::ptr::write_volatile(ptr, erdp);
@@ -2668,7 +2652,7 @@ impl UsbDriver {
                         let evt_type = evt.get_type();
                         let cc = (evt.status >> 24) & 0xFF;
                         // Update ERDP for all events
-                        let erdp = event_ring.erdp() | (1 << 3);
+                        let erdp = event_ring.erdp() | ERDP_EHB;
                         unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
                         if evt_type == trb_type::TRANSFER_EVENT {
                             if cc != trb_cc::SUCCESS && cc != trb_cc::SHORT_PACKET {
@@ -3226,7 +3210,7 @@ impl UsbDriver {
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..50 {
                 if let Some(_evt) = event_ring.dequeue() {
-                    let erdp = event_ring.erdp() | (1 << 3);
+                    let erdp = event_ring.erdp() | ERDP_EHB;
                     unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
                 } else {
                     break;
@@ -3289,9 +3273,6 @@ impl UsbDriver {
         // Step 6: Reinitialize the transfer rings (clear old TRBs, reset Link TRB)
         println!("  [Recovery] Reinitializing transfer rings...");
         unsafe {
-            use usb::transfer::{flush_cache_line, dsb};
-            use usb::trb::trb_type;
-
             // Reinitialize bulk OUT ring
             let out_ring = ctx.bulk_out_ring;
             for i in 0..256 {
@@ -3304,12 +3285,9 @@ impl UsbDriver {
             let out_link = &mut *out_ring.add(255);
             out_link.param = ctx._bulk_out_ring_phys;
             out_link.set_type(trb_type::LINK);
-            out_link.control |= 1 << 1;  // Toggle Cycle bit (TC)
+            out_link.control |= trb_ctrl::TC;  // Toggle Cycle
             // Link TRB cycle = 0 (opposite of producer cycle=1)
-            for i in 0..256 {
-                flush_cache_line(out_ring.add(i) as u64);
-            }
-            dsb();
+            flush_buffer(out_ring as u64, BULK_RING_SIZE * core::mem::size_of::<Trb>());
 
             // Reinitialize bulk IN ring
             let in_ring = ctx.bulk_in_ring;
@@ -3323,12 +3301,9 @@ impl UsbDriver {
             let in_link = &mut *in_ring.add(255);
             in_link.param = ctx.bulk_in_ring_phys;
             in_link.set_type(trb_type::LINK);
-            in_link.control |= 1 << 1;  // Toggle Cycle bit (TC)
+            in_link.control |= trb_ctrl::TC;  // Toggle Cycle
             // Link TRB cycle = 0 (opposite of producer cycle=1)
-            for i in 0..256 {
-                flush_cache_line(in_ring.add(i) as u64);
-            }
-            dsb();
+            flush_buffer(in_ring as u64, BULK_RING_SIZE * core::mem::size_of::<Trb>());
         }
 
         // Reset ring state - start fresh
@@ -3430,7 +3405,7 @@ impl UsbDriver {
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..max_polls {
                 if let Some(evt) = event_ring.dequeue() {
-                    let erdp = event_ring.erdp() | (1 << 3);
+                    let erdp = event_ring.erdp() | ERDP_EHB;
                     unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
                     if evt.get_type() == trb_type::COMMAND_COMPLETION {
                         return true;
@@ -3453,7 +3428,7 @@ impl UsbDriver {
             // First, spin locally without yielding (USB should be fast)
             for _ in 0..spin_count {
                 if let Some(evt) = event_ring.dequeue() {
-                    let erdp = event_ring.erdp() | (1 << 3);
+                    let erdp = event_ring.erdp() | ERDP_EHB;
                     unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
 
                     if evt.get_type() == trb_type::TRANSFER_EVENT {
@@ -3467,7 +3442,7 @@ impl UsbDriver {
             // If still waiting, use slower polling with yields
             for _ in 0..max_polls {
                 if let Some(evt) = event_ring.dequeue() {
-                    let erdp = event_ring.erdp() | (1 << 3);
+                    let erdp = event_ring.erdp() | ERDP_EHB;
                     unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
 
                     if evt.get_type() == trb_type::TRANSFER_EVENT {
