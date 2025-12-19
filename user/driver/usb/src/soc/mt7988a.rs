@@ -93,9 +93,9 @@ pub mod addrs {
     /// IPPC offset from MAC base
     pub const IPPC_OFFSET: usize = 0x3E00;
 
-    /// IRQ numbers
-    pub const SSUSB0_IRQ: u32 = 243;
-    pub const SSUSB1_IRQ: u32 = 244;
+    /// IRQ numbers (GIC: SPI + 32)
+    pub const SSUSB0_IRQ: u32 = 173 + 32;  // SPI 173 = IRQ 205
+    pub const SSUSB1_IRQ: u32 = 172 + 32;  // SPI 172 = IRQ 204
 
     // INFRACFG_AO - Clock and Reset Control
     pub const INFRACFG_AO_BASE: u64 = 0x1000_1000;
@@ -255,13 +255,16 @@ impl Mt7988aSoc {
     /// Initialize IPPC (called during pre_init)
     fn ippc_init(&mut self) -> Result<(), SocError> {
         use crate::mmio::delay;
+        use userlib::println;
 
         // Read initial status to get port counts
         let sts1 = self.ippc_read32(ippc::IP_PW_STS1)?;
+        println!("  IPPC STS1: 0x{:08x}", sts1);
 
         // Extract port counts (cap to reasonable values)
         let mut usb3_raw = ((sts1 & ippc::sts::U3_PORT_NUM_MASK) >> ippc::sts::U3_PORT_NUM_SHIFT) as u8;
         let mut usb2_raw = (sts1 & ippc::sts::U2_PORT_NUM_MASK) as u8;
+        println!("  Port counts: USB3={}, USB2={}", usb3_raw, usb2_raw);
         if usb3_raw > 4 { usb3_raw = 1; }
         if usb2_raw > 4 { usb2_raw = 1; }
         self.usb3_ports = usb3_raw;
@@ -286,6 +289,7 @@ impl Mt7988aSoc {
             let ctrl = self.ippc_read32(offset)?;
             let new_ctrl = (ctrl & !(PORT_DIS | PORT_PDN)) | PORT_HOST_SEL;
             self.ippc_write32(offset, new_ctrl)?;
+            println!("  U3_CTRL[{}]: 0x{:08x} -> 0x{:08x}", p, ctrl, new_ctrl);
         }
 
         // Enable USB2 ports: clear DIS/PDN, set HOST_SEL
@@ -294,6 +298,7 @@ impl Mt7988aSoc {
             let ctrl = self.ippc_read32(offset)?;
             let new_ctrl = (ctrl & !(PORT_DIS | PORT_PDN)) | PORT_HOST_SEL;
             self.ippc_write32(offset, new_ctrl)?;
+            println!("  U2_CTRL[{}]: 0x{:08x} -> 0x{:08x}", p, ctrl, new_ctrl);
         }
 
         // Wait for PHY power-up

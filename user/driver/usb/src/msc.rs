@@ -435,6 +435,7 @@ pub struct BulkContext {
     pub ep0_ring: *mut Trb,
     pub ep0_ring_phys: u64,
     pub ep0_enqueue: usize,
+    pub ep0_cycle: bool,  // Cycle bit for EP0 ring wrapping
 }
 
 /// Result of a bulk transfer
@@ -492,6 +493,7 @@ impl BulkContext {
             ep0_ring,
             ep0_ring_phys,
             ep0_enqueue: 0,
+            ep0_cycle: true,  // EP0 producer starts with cycle=1
         }
     }
 

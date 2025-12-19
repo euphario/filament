@@ -209,6 +209,18 @@ impl EventRing {
     pub fn erdp(&self) -> u64 {
         self.trbs_phys + (self.dequeue * 16) as u64
     }
+
+    /// Debug: return current state (dequeue_idx, expected_cycle, trb_control_at_dequeue)
+    pub fn debug_state(&self) -> (usize, bool, u32) {
+        unsafe {
+            let ptr = self.trbs.add(self.dequeue);
+            invalidate_cache_line(ptr as u64);
+            dsb();
+            isb();
+            let trb = core::ptr::read_volatile(ptr);
+            (self.dequeue, self.cycle, trb.control)
+        }
+    }
 }
 
 /// Device Context Base Address Array

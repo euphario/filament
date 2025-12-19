@@ -12,7 +12,7 @@ mod fat;
 
 use fat::{FatFilesystem, FatType};
 // Use USB library's BlockClient for ring buffer access
-use usb::BlockClient;
+use usb::{BlockClient, delay_ms};
 
 // Entry point
 #[unsafe(no_mangle)]
@@ -42,10 +42,8 @@ fn main() {
             println!("[fatfs] ERROR: Timeout waiting for block device (30 retries)");
             syscall::exit(1);
         }
-        // Small delay - yield CPU and wait
-        for _ in 0..100000 {
-            core::hint::spin_loop();
-        }
+        // Wait 500ms between retries (30 retries = 15 seconds total timeout)
+        delay_ms(500);
         syscall::yield_now();
     };
     println!("[fatfs] Device ready after {} retries", retries);

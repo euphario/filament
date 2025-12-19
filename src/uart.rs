@@ -81,6 +81,7 @@ impl Uart {
     }
 
     /// Read a single byte from the UART (blocking)
+    /// Spins waiting for input - for cooperative multitasking, use try_getc() instead
     pub fn getc(&self) -> u8 {
         unsafe {
             // Wait until data is available

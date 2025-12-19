@@ -92,6 +92,38 @@ struct UsbDriver {
 
     // MSC device info (for block device access)
     msc_device: Option<MscDeviceInfo>,
+
+    // Hub device info (for interrupt-based port monitoring)
+    hub_device: Option<HubDeviceInfo>,
+
+    // Track which ports have enumerated devices (for event-driven model)
+    // Bit N = 1 means port N+1 has an enumerated device
+    enumerated_ports: u32,
+}
+
+/// Hub device info for interrupt-based port status monitoring
+struct HubDeviceInfo {
+    slot_id: u32,
+    num_ports: u8,
+    hub_port: u32,          // xHCI port this hub is on
+    // Interrupt endpoint
+    int_in_dci: u32,        // Device Context Index for interrupt IN
+    int_in_ring: *mut Trb,
+    int_in_ring_phys: u64,
+    int_in_enqueue: usize,
+    int_in_cycle: bool,
+    // Status buffer (DMA target for interrupt transfers)
+    status_buf: *mut u8,
+    status_phys: u64,
+    // EP0 for control transfers
+    ep0_ring: *mut Trb,
+    ep0_ring_phys: u64,
+    ep0_enqueue: usize,
+    ep0_cycle: bool,  // Cycle bit for EP0 ring wrapping
+    // Device context
+    device_ctx: *mut DeviceContext,
+    // Pending transfer flag
+    transfer_pending: bool,
 }
 
 /// Mass Storage Class device info for block operations
@@ -128,6 +160,7 @@ struct MscDeviceInfo {
     ep0_ring: *mut Trb,
     ep0_ring_phys: u64,
     ep0_enqueue: usize,
+    ep0_cycle: bool,  // Cycle bit for EP0 ring wrapping
 }
 
 impl UsbDriver {
@@ -175,6 +208,8 @@ impl UsbDriver {
             event_ring: None,
             irq_fd: -1,
             msc_device: None,
+            hub_device: None,
+            enumerated_ports: 0,
         })
     }
 
@@ -182,6 +217,11 @@ impl UsbDriver {
     #[inline(always)]
     fn op_read32(&self, offset: usize) -> u32 {
         self.xhci.op_read32(offset)
+    }
+
+    #[inline(always)]
+    fn op_write32(&self, offset: usize, value: u32) {
+        self.xhci.op_write32(offset, value)
     }
 
     #[inline(always)]
@@ -318,11 +358,18 @@ impl UsbDriver {
         true
     }
 
-    /// Poll for and process events (silent unless error)
-    fn poll_events(&mut self) -> bool {
+    /// Poll for and process events
+    /// Returns a bitmask of ports that need enumeration (bit N = port N+1 needs enumeration)
+    fn poll_events(&mut self) -> u32 {
         let mut events: [Option<Trb>; 16] = [None; 16];
         let mut event_count = 0;
         let mut final_erdp = 0u64;
+        let mut ports_to_enumerate = 0u32;
+
+        // Check USBSTS for pending events
+        let usbsts = self.op_read32(xhci_op::USBSTS);
+        let eint = (usbsts & (1 << 3)) != 0;
+        let pcd = (usbsts & (1 << 4)) != 0;
 
         if let Some(ref mut event_ring) = self.event_ring {
             while event_count < 16 {
@@ -337,7 +384,11 @@ impl UsbDriver {
         }
 
         if event_count == 0 {
-            return false;
+            // Clear sticky EINT and PCD bits if no actual events found
+            if eint || pcd {
+                self.op_write32(xhci_op::USBSTS, (1 << 3) | (1 << 4));  // Clear EINT and PCD
+            }
+            return 0;
         }
 
         for i in 0..event_count {
@@ -345,7 +396,40 @@ impl UsbDriver {
                 let evt_type = trb.get_type();
                 match evt_type {
                     trb_type::PORT_STATUS_CHANGE => {
-                        self.handle_port_change(event_port_id(trb));
+                        if let Some(port_id) = self.handle_port_change(event_port_id(trb)) {
+                            // Mark this port for enumeration (port_id is 1-based)
+                            if port_id > 0 && port_id <= 32 {
+                                ports_to_enumerate |= 1 << (port_id - 1);
+                            }
+                        }
+                    }
+                    trb_type::TRANSFER_EVENT => {
+                        // Check if this is a hub interrupt transfer completion
+                        let slot_id = event_slot_id(trb);
+                        let endpoint_id = ((trb.control >> 16) & 0x1F) as u32;
+                        let cc = (trb.status >> 24) & 0xFF;
+                        let transfer_len = trb.status & 0xFFFFFF;
+
+                        // Check if this is our hub's interrupt endpoint
+                        let is_hub_int = self.hub_device.as_ref()
+                            .map(|h| slot_id == h.slot_id && endpoint_id == h.int_in_dci)
+                            .unwrap_or(false);
+
+                        if is_hub_int {
+                            if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET {
+                                // Handle the hub status change
+                                let status_bitmap = self.handle_hub_status_transfer(transfer_len);
+                                if status_bitmap != 0 {
+                                    self.process_hub_port_changes(status_bitmap);
+                                } else {
+                                    // No changes - re-queue the transfer
+                                    self.queue_hub_status_transfer();
+                                }
+                            } else {
+                                println!("[usbd] Hub interrupt error: cc={}", cc);
+                                self.queue_hub_status_transfer();
+                            }
+                        }
                     }
                     trb_type::HOST_CONTROLLER => {
                         println!("ERROR: Host Controller Error!");
@@ -357,21 +441,71 @@ impl UsbDriver {
 
         let ir0 = xhci_rt::IR0;
         self.rt_write64(ir0 + xhci_ir::ERDP, final_erdp | (1 << 3));
-        true
+        ports_to_enumerate
     }
 
-    /// Handle port status change (silent)
-    fn handle_port_change(&mut self, port_id: u32) {
+    /// Resync event ring state before daemon loop
+    /// This drains any pending events and ensures ERDP is properly synchronized with hardware
+    fn resync_event_ring(&mut self) {
+        // Drain any remaining events (up to 256 to avoid infinite loop)
+        let mut drained = 0;
+        let mut last_erdp = 0u64;
+        if let Some(ref mut event_ring) = self.event_ring {
+            for _ in 0..256 {
+                if let Some(_evt) = event_ring.dequeue() {
+                    drained += 1;
+                    last_erdp = event_ring.erdp();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if drained > 0 {
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, last_erdp | (1 << 3));
+        }
+
+        // Clear sticky USBSTS bits (W1C)
+        self.op_write32(xhci_op::USBSTS, (1 << 3) | (1 << 4));  // Clear EINT and PCD
+    }
+
+    /// Handle port status change event
+    /// Returns Some(port_id) if a new device was connected and needs enumeration
+    fn handle_port_change(&mut self, port_id: u32) -> Option<u32> {
         if port_id == 0 || port_id > self.xhci.max_ports() as u32 {
-            return;
+            return None;
         }
         let port = (port_id - 1) as u8;
         let raw = self.xhci.read_portsc(port);
         let status = ParsedPortsc::from_raw(raw);
+
+        // Clear all change bits first
         let clear_bits = raw & portsc::RW1C_BITS;
         if clear_bits != 0 {
             self.xhci.write_portsc(port, status.clear_changes_value());
         }
+
+        // Check for connect status change
+        if status.connect_change {
+            let port_mask = 1u32 << port;
+
+            if status.connected {
+                // Device connected - check if not already enumerated
+                if (self.enumerated_ports & port_mask) == 0 {
+                    println!("[usbd] Device connected on port {}", port_id);
+                    return Some(port_id);
+                }
+            } else {
+                // Device disconnected - mark as not enumerated
+                if (self.enumerated_ports & port_mask) != 0 {
+                    println!("[usbd] Device disconnected from port {}", port_id);
+                    self.enumerated_ports &= !port_mask;
+                    // TODO: Clean up device resources
+                }
+            }
+        }
+
+        None
     }
 
     fn print_port_status(&self) {
@@ -454,6 +588,8 @@ impl UsbDriver {
 
         if let Some(erdp) = erdp_to_update {
             self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            // Clear EINT bit (W1C) to acknowledge we processed the event
+            self.op_write32(xhci_op::USBSTS, 1 << 3);
         }
 
         if let Some((cc, slot_id)) = result {
@@ -462,6 +598,51 @@ impl UsbDriver {
             }
         }
         None
+    }
+
+    /// Enumerate a port (reset + enumerate + mark as enumerated)
+    /// Called when a new device is detected via port status change event
+    fn enumerate_port(&mut self, port: u32) -> Option<u32> {
+        println!("[usbd] Enumerating port {}...", port);
+
+        // Check port status first
+        let port_idx = (port - 1) as u8;
+        let raw = self.xhci.read_portsc(port_idx);
+        let status = ParsedPortsc::from_raw(raw);
+        println!("[usbd]   PORTSC: connected={} enabled={} speed={}",
+                 status.connected, status.enabled, status.speed.as_str());
+
+        // Reset the port first (unless already enabled)
+        if !status.enabled {
+            if !self.reset_port(port) {
+                println!("[usbd]   Port {} reset failed", port);
+                return None;
+            }
+            // Small delay after reset
+            delay_ms(50);
+        }
+
+        // Enumerate the device
+        let slot_id = self.enumerate_device(port)?;
+
+        // Mark port as enumerated
+        if port > 0 && port <= 32 {
+            self.enumerated_ports |= 1 << (port - 1);
+        }
+
+        println!("[usbd]   Port {} enumerated as slot {}", port, slot_id);
+        Some(slot_id)
+    }
+
+    /// Enumerate all ports in a bitmask
+    fn enumerate_pending_ports(&mut self, ports_mask: u32) {
+        println!("[usbd] enumerate_pending_ports: mask=0x{:x}", ports_mask);
+        for bit in 0..32 {
+            if (ports_mask & (1 << bit)) != 0 {
+                let port = bit + 1;  // Ports are 1-based
+                self.enumerate_port(port);
+            }
+        }
     }
 
     /// Enumerate a device on the given port
@@ -490,19 +671,21 @@ impl UsbDriver {
         let ep0_ring_virt = (ctx_base + 0x900) as *mut Trb;
         let ep0_ring_phys = ctx_phys_base + 0x900;
 
-        // Initialize EP0 transfer ring (64 TRBs)
+        // Initialize EP0 transfer ring (112 TRBs - fits in 1792 bytes at 0x900)
+        // This gives us 111 usable slots, enough for hub enumeration without wrapping
+        const EP0_RING_SIZE: usize = 112;
         unsafe {
-            for i in 0..64 {
+            for i in 0..EP0_RING_SIZE {
                 *ep0_ring_virt.add(i) = Trb::new();
             }
-            // Link TRB at end
-            let link = &mut *ep0_ring_virt.add(63);
+            // Link TRB at end (index 111)
+            let link = &mut *ep0_ring_virt.add(EP0_RING_SIZE - 1);
             link.param = ep0_ring_phys;
             link.set_type(trb_type::LINK);
-            link.control |= 1 << 5;  // Toggle cycle
+            link.control |= 1 << 1;  // Toggle Cycle (TC) bit - bit 1, NOT bit 5
 
             // Flush EP0 ring to memory
-            flush_buffer(ep0_ring_virt as u64, 64 * core::mem::size_of::<Trb>());
+            flush_buffer(ep0_ring_virt as u64, EP0_RING_SIZE * core::mem::size_of::<Trb>());
         }
 
         // Get port speed from PORTSC using library helpers
@@ -567,15 +750,15 @@ impl UsbDriver {
             self.ring_doorbell(0, 0);
         }
 
-        delay(50000);
+        // Wait for completion (longer timeout for reliability)
+        delay_ms(100);
 
-        // Wait for Address Device completion
         let mut addr_result: Option<u32> = None;
         let mut erdp_to_write: Option<u64> = None;
         let mut fail_cc: Option<u32> = None;
 
         if let Some(ref mut event_ring) = self.event_ring {
-            for _ in 0..50 {
+            for _ in 0..100 {
                 if let Some(evt) = event_ring.dequeue() {
                     erdp_to_write = Some(event_ring.erdp());
                     if evt.get_type() == trb_type::COMMAND_COMPLETION {
@@ -588,12 +771,14 @@ impl UsbDriver {
                         break;
                     }
                 }
-                delay(1000);
+                delay(2000);
             }
         }
 
         if let Some(erdp) = erdp_to_write {
             self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            // Clear EINT bit (W1C) to acknowledge we processed the event
+            self.op_write32(xhci_op::USBSTS, 1 << 3);
         }
 
         if addr_result.is_none() {
@@ -626,8 +811,9 @@ impl UsbDriver {
             ((0 as u64) << 32) |          // wIndex: 0
             ((18 as u64) << 48);          // wLength: 18 bytes
 
-        // EP0 transfer ring - track enqueue position for subsequent transfers
+        // EP0 transfer ring - track enqueue position and cycle bit for ring wrapping
         let mut ep0_enqueue = 0usize;  // Start at beginning
+        let mut ep0_cycle = true;  // Cycle starts at 1
 
         unsafe {
             // Setup TRB
@@ -689,6 +875,8 @@ impl UsbDriver {
         // Update ERDP for all consumed events
         if let Some(erdp) = erdp_to_update {
             self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            // Clear EINT bit (W1C) to acknowledge we processed the event
+            self.op_write32(xhci_op::USBSTS, 1 << 3);
         }
 
         // Process transfer result
@@ -711,7 +899,7 @@ impl UsbDriver {
                     println!(", Mass Storage");
                 } else if desc.device_class == 9 {
                     println!(", Hub");
-                    self.enumerate_hub(slot_id, port, ep0_ring_virt, ep0_ring_phys, &mut ep0_enqueue);
+                    self.enumerate_hub(slot_id, port, ep0_ring_virt, ep0_ring_phys, &mut ep0_enqueue, &mut ep0_cycle, device_ctx_virt);
                 } else {
                     println!();
                 }
@@ -726,12 +914,14 @@ impl UsbDriver {
     /// Perform a control transfer on the given slot's EP0
     /// Returns the completion code and bytes transferred
     /// ep0_enqueue tracks the current position in the ring (updated after transfer)
+    /// ep0_cycle tracks the cycle bit (toggled when ring wraps)
     fn control_transfer(
         &mut self,
         slot_id: u32,
         ep0_ring_virt: *mut Trb,
         ep0_ring_phys: u64,
         ep0_enqueue: &mut usize,
+        ep0_cycle: &mut bool,
         request_type: u8,
         request: u8,
         value: u16,
@@ -750,32 +940,48 @@ impl UsbDriver {
         let is_in = (request_type & 0x80) != 0;
         let has_data = length > 0;
 
-        // Check if we have enough space before link TRB (index 63)
-        // Need up to 3 TRBs (Setup, Data, Status)
+        // EP0 ring is 112 TRBs (111 usable + link at 111)
+        const EP0_RING_USABLE: usize = 111;
         let trbs_needed = if has_data { 3 } else { 2 };
-        if *ep0_enqueue + trbs_needed >= 63 {
-            // Wrap around - reset to beginning
-            // Clear old TRBs and reset enqueue pointer
-            unsafe {
-                for i in 0..63 {
-                    let trb = &mut *ep0_ring_virt.add(i);
-                    trb.param = 0;
-                    trb.status = 0;
-                    trb.control = 0;
-                }
-                // Re-setup link TRB
-                let link = &mut *ep0_ring_virt.add(63);
-                link.param = ep0_ring_phys;
-                link.status = 0;
-                link.control = (trb_type::LINK << 10) | (1 << 5) | 1;  // Toggle cycle, cycle=1
 
-                // Flush EP0 ring to memory after reset
-                flush_buffer(ep0_ring_virt as u64, 64 * core::mem::size_of::<Trb>());
+        // If not enough space before link TRB, wrap to beginning
+        if *ep0_enqueue + trbs_needed >= EP0_RING_USABLE {
+            unsafe {
+                let cycle_bit = *ep0_cycle as u32;
+
+                // Fill gap from current position to Link TRB with No-Op TRBs
+                // so hardware can advance past them to reach the Link TRB
+                for i in *ep0_enqueue..EP0_RING_USABLE {
+                    let noop = &mut *ep0_ring_virt.add(i);
+                    noop.param = 0;
+                    noop.status = 0;
+                    // No-Op Transfer TRB with current cycle bit
+                    noop.control = (trb_type::NOOP_TRANSFER << 10) | cycle_bit;
+                }
+
+                // Flush the No-Op TRBs
+                if *ep0_enqueue < EP0_RING_USABLE {
+                    let gap_size = EP0_RING_USABLE - *ep0_enqueue;
+                    flush_buffer(
+                        ep0_ring_virt.add(*ep0_enqueue) as u64,
+                        gap_size * core::mem::size_of::<Trb>()
+                    );
+                }
+
+                // Update Link TRB with current cycle bit before wrapping
+                let link = &mut *ep0_ring_virt.add(EP0_RING_USABLE);
+                // Set Link TRB cycle bit to current cycle (hardware will process it)
+                // Keep TC bit set (bit 1) so hardware toggles when following link
+                link.control = (trb_type::LINK << 10) | (1 << 1) | cycle_bit;
+                flush_cache_line(link as *const _ as u64);
             }
+            // Toggle software cycle and wrap enqueue
+            *ep0_cycle = !*ep0_cycle;
             *ep0_enqueue = 0;
         }
 
         let start_idx = *ep0_enqueue;
+        let cycle_bit = *ep0_cycle as u32;
 
         unsafe {
             // Setup TRB
@@ -783,7 +989,7 @@ impl UsbDriver {
             setup_trb.param = setup_data;
             setup_trb.status = 8;
             let trt = if !has_data { 0 } else if is_in { 3 } else { 2 };
-            setup_trb.control = (trb_type::SETUP << 10) | (trt << 16) | (1 << 6) | 1;
+            setup_trb.control = (trb_type::SETUP << 10) | (trt << 16) | (1 << 6) | cycle_bit;
 
             let mut next_idx = start_idx + 1;
 
@@ -793,7 +999,7 @@ impl UsbDriver {
                 data_trb.param = data_buf_phys;
                 data_trb.status = length as u32;
                 let dir = if is_in { 1 << 16 } else { 0 };
-                data_trb.control = (trb_type::DATA << 10) | dir | 1;
+                data_trb.control = (trb_type::DATA << 10) | dir | cycle_bit;
                 next_idx += 1;
             }
 
@@ -803,7 +1009,7 @@ impl UsbDriver {
             status_trb.status = 0;
             // DIR is opposite of data direction (or IN if no data)
             let status_dir = if has_data && is_in { 0 } else { 1 << 16 };
-            status_trb.control = (trb_type::STATUS << 10) | status_dir | (1 << 5) | 1;
+            status_trb.control = (trb_type::STATUS << 10) | status_dir | (1 << 5) | cycle_bit;
 
             *ep0_enqueue = next_idx + 1;
 
@@ -815,16 +1021,22 @@ impl UsbDriver {
         // Ring doorbell for EP0
         self.ring_doorbell(slot_id, 1);
 
-        // Wait for completion - longer wait for hub devices
-        let initial_wait = if slot_id == 2 { 100000 } else { 50000 };
+        // Debug: check USBSTS before waiting
+        let usbsts_before = self.op_read32(xhci_op::USBSTS);
+
+        // Wait for completion - longer wait for hub and downstream devices
+        // slot_id 1 = hub, slot_id >= 2 = devices behind hub
+        let initial_wait = if slot_id >= 2 { 100000 } else { 50000 };
         delay(initial_wait);
+
+        let _ = usbsts_before;  // Suppress warning
 
         // Poll for transfer event
         let mut result: Option<(u32, u32)> = None;
         let mut erdp_to_update: Option<u64> = None;
 
         // Use more iterations for downstream hub devices
-        let max_iterations = if slot_id == 2 { 300 } else { 100 };
+        let max_iterations = if slot_id >= 2 { 300 } else { 100 };
 
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..max_iterations {
@@ -870,6 +1082,8 @@ impl UsbDriver {
         // Update ERDP outside the borrow
         if let Some(erdp) = erdp_to_update {
             self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            // Clear EINT bit (W1C) to acknowledge we processed the event
+            self.op_write32(xhci_op::USBSTS, 1 << 3);
         }
 
         if let Some((cc, remaining)) = result {
@@ -881,9 +1095,9 @@ impl UsbDriver {
     }
 
     /// Send SET_CONFIGURATION request (silent unless error)
-    fn set_configuration(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, config: u8) -> bool {
+    fn set_configuration(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, ep0_cycle: &mut bool, config: u8) -> bool {
         match self.control_transfer(
-            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
             0x00,  // Host-to-device, standard, device
             usb_req::SET_CONFIGURATION,
             config as u16,
@@ -895,10 +1109,23 @@ impl UsbDriver {
     }
 
     /// Get Hub Descriptor (SuperSpeed) - silent
-    fn get_hub_descriptor(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, buf_phys: u64) -> Option<u8> {
+    fn get_hub_descriptor(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, ep0_cycle: &mut bool, buf_phys: u64) -> Option<u8> {
         let setup = get_hub_descriptor_setup(true);
         match self.control_transfer(
-            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
+            setup.request_type, setup.request, setup.value, setup.index,
+            buf_phys, setup.length
+        ) {
+            Some((cc, len)) if completion_code::is_success(cc) => Some(len as u8),
+            _ => None
+        }
+    }
+
+    /// Get Hub Descriptor (USB 2.0) - silent
+    fn get_usb2_hub_descriptor(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, ep0_cycle: &mut bool, buf_phys: u64) -> Option<u8> {
+        let setup = get_hub_descriptor_setup(false);  // false = USB 2.0 hub descriptor (0x29)
+        match self.control_transfer(
+            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
             setup.request_type, setup.request, setup.value, setup.index,
             buf_phys, setup.length
         ) {
@@ -908,10 +1135,10 @@ impl UsbDriver {
     }
 
     /// Get port status from hub
-    fn hub_get_port_status(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, port: u16, buf_virt: u64, buf_phys: u64) -> Option<PortStatus> {
+    fn hub_get_port_status(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, ep0_cycle: &mut bool, port: u16, buf_virt: u64, buf_phys: u64) -> Option<PortStatus> {
         let setup = get_port_status_setup(port);
         match self.control_transfer(
-            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
             setup.request_type,
             setup.request,
             setup.value,
@@ -929,11 +1156,363 @@ impl UsbDriver {
         }
     }
 
+    /// Parse hub configuration descriptor to find interrupt IN endpoint
+    /// Returns (ep_addr, max_packet, interval) if found
+    fn parse_hub_config_descriptor(&self, buf: *const u8, total_len: usize) -> Option<(u8, u16, u8)> {
+        let mut offset = 0usize;
+        let mut in_hub_interface = false;
+
+        while offset + 2 <= total_len {
+            let len = unsafe { *buf.add(offset) } as usize;
+            let desc_type = unsafe { *buf.add(offset + 1) };
+
+            if len < 2 || offset + len > total_len {
+                break;
+            }
+
+            match desc_type {
+                4 => {  // Interface descriptor
+                    if len >= 9 {
+                        let iface_class = unsafe { *buf.add(offset + 5) };
+                        // Hub class = 0x09
+                        in_hub_interface = iface_class == 0x09;
+                    }
+                }
+                5 => {  // Endpoint descriptor
+                    if len >= 7 && in_hub_interface {
+                        let ep_addr = unsafe { *buf.add(offset + 2) };
+                        let ep_attr = unsafe { *buf.add(offset + 3) };
+                        let ep_max_pkt = unsafe { core::ptr::read_unaligned(buf.add(offset + 4) as *const u16) };
+                        let ep_interval = unsafe { *buf.add(offset + 6) };
+
+                        // Interrupt IN endpoint: attr & 0x03 == 3, addr & 0x80 != 0
+                        if (ep_attr & 0x03) == 3 && (ep_addr & 0x80) != 0 {
+                            return Some((ep_addr, ep_max_pkt, ep_interval));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            offset += len;
+        }
+        None
+    }
+
+    /// Set up hub interrupt endpoint for status change notifications
+    fn setup_hub_interrupt_endpoint(
+        &mut self,
+        hub_slot: u32,
+        hub_port: u32,
+        num_ports: u8,
+        int_ep_addr: u8,
+        int_max_packet: u16,
+        int_interval: u8,
+        device_ctx_virt: *mut DeviceContext,
+        ep0_ring_virt: *mut Trb,
+        ep0_ring_phys: u64,
+        ep0_enqueue: usize,
+    ) -> bool {
+        use usb::transfer::{flush_cache_line, dsb};
+
+        // Allocate interrupt transfer ring (small - 16 entries is enough)
+        let mut int_ring_phys: u64 = 0;
+        let int_ring_virt = syscall::mmap_dma(4096, &mut int_ring_phys);
+        if int_ring_virt < 0 { return false; }
+
+        // Allocate status buffer (1 byte for hub status bitmap)
+        let mut status_phys: u64 = 0;
+        let status_virt = syscall::mmap_dma(4096, &mut status_phys);
+        if status_virt < 0 { return false; }
+
+        // Initialize interrupt ring with Link TRB at index 15
+        unsafe {
+            let ring = int_ring_virt as *mut Trb;
+            for i in 0..16 {
+                *ring.add(i) = Trb::new();
+            }
+            // Link TRB at index 15
+            let link = &mut *ring.add(15);
+            link.param = int_ring_phys;
+            link.set_type(trb_type::LINK);
+            link.control |= 1 << 1;  // Toggle Cycle (TC)
+            // Flush
+            for i in 0..16 {
+                flush_cache_line(ring.add(i) as u64);
+            }
+            dsb();
+        }
+
+        // Calculate DCI for interrupt IN endpoint
+        let ep_num = (int_ep_addr & 0x0F) as u32;
+        let int_in_dci = ep_num * 2 + 1;  // IN endpoint
+
+        // Allocate Input Context for Configure Endpoint
+        let mut input_ctx_phys: u64 = 0;
+        let input_ctx_virt = syscall::mmap_dma(4096, &mut input_ctx_phys);
+        if input_ctx_virt < 0 { return false; }
+
+        // Set up Input Context
+        unsafe {
+            let input = &mut *(input_ctx_virt as *mut InputContext);
+            core::ptr::write_bytes(input, 0, 1);
+
+            // Add flags: slot + interrupt endpoint
+            input.control.add_flags = 1 | (1 << int_in_dci);
+
+            // Copy current slot context
+            let dev_ctx = &*device_ctx_virt;
+            input.slot = dev_ctx.slot;
+            input.slot.set_context_entries(int_in_dci);
+
+            // Configure interrupt IN endpoint
+            let ep_idx = (int_in_dci - 1) as usize;
+            input.endpoints[ep_idx].set_ep_type(ep_type::INTERRUPT_IN);
+            input.endpoints[ep_idx].set_max_packet_size(int_max_packet as u32);
+            input.endpoints[ep_idx].set_max_burst_size(0);
+            input.endpoints[ep_idx].set_cerr(3);
+            input.endpoints[ep_idx].set_tr_dequeue_ptr(int_ring_phys, true);
+            input.endpoints[ep_idx].set_average_trb_length(1);
+            // Interval: for SS, value is 2^(interval-1) * 125us
+            // For hub status, we can use a reasonable polling interval
+            input.endpoints[ep_idx].set_interval(int_interval as u32);
+
+            // Flush input context
+            flush_buffer(input_ctx_virt as u64, core::mem::size_of::<InputContext>());
+        }
+
+        // Issue CONFIGURE_ENDPOINT command
+        let mut cmd_success = false;
+        if let Some(ref mut cmd_ring) = self.cmd_ring {
+            let mut trb = Trb::new();
+            trb.param = input_ctx_phys;
+            trb.set_type(trb_type::CONFIGURE_ENDPOINT);
+            trb.control |= (hub_slot & 0xFF) << 24;
+            cmd_ring.enqueue(&trb);
+            self.ring_doorbell(0, doorbell::HOST_CONTROLLER);
+            delay(10000);
+
+            // Wait for command completion
+            let mut erdp_to_update: Option<u64> = None;
+            if let Some(ref mut event_ring) = self.event_ring {
+                for _ in 0..50 {
+                    if let Some(evt) = event_ring.dequeue() {
+                        erdp_to_update = Some(event_ring.erdp());
+                        if evt.get_type() == trb_type::COMMAND_COMPLETION {
+                            let cc = (evt.status >> 24) & 0xFF;
+                            cmd_success = cc == trb_cc::SUCCESS;
+                            break;
+                        }
+                    }
+                    delay(1000);
+                }
+            }
+            if let Some(erdp) = erdp_to_update {
+                self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | (1 << 3));
+            }
+        }
+
+        if !cmd_success {
+            println!("    CONFIGURE_ENDPOINT for hub interrupt failed");
+            return false;
+        }
+
+        println!("    Hub interrupt endpoint configured (DCI={})", int_in_dci);
+
+        // Store hub device info
+        // Note: ep0_cycle is true because we haven't wrapped the ring yet during enumeration
+        self.hub_device = Some(HubDeviceInfo {
+            slot_id: hub_slot,
+            num_ports,
+            hub_port,
+            int_in_dci,
+            int_in_ring: int_ring_virt as *mut Trb,
+            int_in_ring_phys: int_ring_phys,
+            int_in_enqueue: 0,
+            int_in_cycle: true,
+            status_buf: status_virt as *mut u8,
+            status_phys,
+            ep0_ring: ep0_ring_virt,
+            ep0_ring_phys,
+            ep0_enqueue,
+            ep0_cycle: true,  // Cycle starts at 1, toggled when ring wraps
+            device_ctx: device_ctx_virt,
+            transfer_pending: false,
+        });
+
+        true
+    }
+
+    /// Queue an interrupt transfer on the hub's status endpoint
+    fn queue_hub_status_transfer(&mut self) -> bool {
+        // Extract values we need before borrowing self mutably for doorbell
+        let (slot_id, int_in_dci) = {
+            let hub = match self.hub_device.as_mut() {
+                Some(h) => h,
+                None => return false,
+            };
+
+            if hub.transfer_pending {
+                return true;  // Already have a transfer queued
+            }
+
+            // Build Normal TRB for interrupt transfer
+            // Status bitmap is 1 byte for hubs with <= 7 ports
+            let transfer_len = ((hub.num_ports as usize + 8) / 8).max(1);
+            let enqueue_idx = hub.int_in_enqueue;
+            let cycle = hub.int_in_cycle;
+
+            unsafe {
+                use usb::transfer::{flush_cache_line, dsb};
+
+                let ring = hub.int_in_ring;
+                let trb = &mut *ring.add(hub.int_in_enqueue);
+
+                trb.param = hub.status_phys;
+                trb.status = transfer_len as u32;
+                // Normal TRB: ISP (bit 2), IOC (bit 5), cycle bit (bit 0)
+                // ISP = Interrupt on Short Packet (for IN endpoints)
+                // IOC = Interrupt On Completion
+                // Interrupter Target = 0 (bits 22-31)
+                trb.control = (trb_type::NORMAL << 10) | (1 << 5) | (1 << 2) | (hub.int_in_cycle as u32);
+
+                flush_cache_line(trb as *const Trb as u64);
+                dsb();
+
+                // Advance enqueue pointer
+                hub.int_in_enqueue += 1;
+                if hub.int_in_enqueue >= 15 {  // Link TRB at 15
+                    hub.int_in_enqueue = 0;
+                    hub.int_in_cycle = !hub.int_in_cycle;
+                }
+            }
+
+            hub.transfer_pending = true;
+            (hub.slot_id, hub.int_in_dci)
+        };
+        let _ = int_in_dci;  // Suppress warning
+
+        // Ring the doorbell for the interrupt endpoint
+        self.ring_doorbell(slot_id, int_in_dci as u32);
+
+        true
+    }
+
+    /// Handle hub status change interrupt transfer completion
+    /// Returns bitmask of ports with status changes
+    fn handle_hub_status_transfer(&mut self, transfer_len: u32) -> u8 {
+        let hub = match self.hub_device.as_mut() {
+            Some(h) => h,
+            None => return 0,
+        };
+
+        hub.transfer_pending = false;
+
+        if transfer_len == 0 {
+            return 0;
+        }
+
+        // Invalidate status buffer
+        invalidate_buffer(hub.status_buf as u64, transfer_len as usize);
+
+        // Read status bitmap - bit N indicates port N has a change
+        // Bit 0 = hub status change, bits 1-N = port 1-N changes
+        let status = unsafe { *hub.status_buf };
+
+        status
+    }
+
+    /// Process hub port changes from interrupt transfer
+    /// Called when we receive a Transfer Event for the hub's interrupt endpoint
+    fn process_hub_port_changes(&mut self, status_bitmap: u8) {
+        // Get hub info - we need to copy what we need before borrowing self mutably
+        let (hub_slot, num_ports, root_port, ep0_ring, ep0_ring_phys, mut ep0_enqueue, mut ep0_cycle) = {
+            let hub = match self.hub_device.as_ref() {
+                Some(h) => h,
+                None => return,
+            };
+            (hub.slot_id, hub.num_ports, hub.hub_port, hub.ep0_ring, hub.ep0_ring_phys, hub.ep0_enqueue, hub.ep0_cycle)
+        };
+
+        println!("[usbd] Hub status change: bitmap=0x{:02x}", status_bitmap);
+
+        // Allocate buffer for port status queries
+        let mut buf_phys: u64 = 0;
+        let buf_virt = syscall::mmap_dma(4096, &mut buf_phys);
+        if buf_virt < 0 {
+            return;
+        }
+
+        // Bit 0 = hub status change (ignored for now)
+        // Bit N (1-7) = port N has status change
+        for port in 1..=num_ports {
+            if (status_bitmap & (1 << port)) != 0 {
+                println!("  Port {} has status change", port);
+
+                // Get port status
+                if let Some(ps) = self.hub_get_port_status(
+                    hub_slot, ep0_ring, ep0_ring_phys, &mut ep0_enqueue, &mut ep0_cycle,
+                    port as u16, buf_virt as u64, buf_phys
+                ) {
+                    println!("    status=0x{:04x} change=0x{:04x}", ps.status, ps.change);
+
+                    // Clear any change bits first
+                    if (ps.change & hub::PS_C_CONNECTION) != 0 {
+                        self.hub_clear_port_feature(hub_slot, ep0_ring, ep0_ring_phys, &mut ep0_enqueue, &mut ep0_cycle, port as u16, hub::C_PORT_CONNECTION);
+                    }
+
+                    // Check if device is connected
+                    if (ps.status & hub::PS_CONNECTION) != 0 {
+                        println!("    Device connected, resetting port...");
+
+                        // Reset the port
+                        if self.hub_set_port_feature(hub_slot, ep0_ring, ep0_ring_phys, &mut ep0_enqueue, &mut ep0_cycle, port as u16, hub::PORT_RESET) {
+                            // Wait for reset to complete
+                            delay_ms(100);
+
+                            // Check port status again
+                            if let Some(ps2) = self.hub_get_port_status(
+                                hub_slot, ep0_ring, ep0_ring_phys, &mut ep0_enqueue, &mut ep0_cycle,
+                                port as u16, buf_virt as u64, buf_phys
+                            ) {
+                                // Clear reset change
+                                if (ps2.change & hub::PS_C_RESET) != 0 {
+                                    self.hub_clear_port_feature(hub_slot, ep0_ring, ep0_ring_phys, &mut ep0_enqueue, &mut ep0_cycle, port as u16, hub::C_PORT_RESET);
+                                }
+
+                                if (ps2.status & hub::PS_ENABLE) != 0 {
+                                    println!("    Port enabled, enumerating device...");
+                                    delay_ms(100);  // Give device time to stabilize
+                                    self.enumerate_hub_device(hub_slot, root_port, port as u32);
+                                } else {
+                                    println!("    Port not enabled after reset");
+                                }
+                            }
+                        } else {
+                            println!("    Port reset failed");
+                        }
+                    } else {
+                        println!("    Device disconnected");
+                        // TODO: Handle device disconnection (disable slot, etc.)
+                    }
+                }
+            }
+        }
+
+        // Update ep0_enqueue and ep0_cycle in hub_device
+        if let Some(ref mut hub) = self.hub_device {
+            hub.ep0_enqueue = ep0_enqueue;
+            hub.ep0_cycle = ep0_cycle;
+        }
+
+        // Re-queue the interrupt transfer for next status change
+        self.queue_hub_status_transfer();
+    }
+
     /// Set a port feature
-    fn hub_set_port_feature(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, port: u16, feature: u16) -> bool {
+    fn hub_set_port_feature(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, ep0_cycle: &mut bool, port: u16, feature: u16) -> bool {
         let setup = set_port_feature_setup(port, feature);
         match self.control_transfer(
-            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
             setup.request_type,
             setup.request,
             setup.value,
@@ -946,10 +1525,10 @@ impl UsbDriver {
     }
 
     /// Clear a port feature
-    fn hub_clear_port_feature(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, port: u16, feature: u16) -> bool {
+    fn hub_clear_port_feature(&mut self, slot_id: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, ep0_cycle: &mut bool, port: u16, feature: u16) -> bool {
         let setup = clear_port_feature_setup(port, feature);
         match self.control_transfer(
-            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
             setup.request_type,
             setup.request,
             setup.value,
@@ -963,7 +1542,7 @@ impl UsbDriver {
 
     /// Enumerate devices connected through a hub
     /// Enumerate hub - mostly silent, only prints port count and connected devices
-    fn enumerate_hub(&mut self, hub_slot: u32, hub_port: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize) {
+    fn enumerate_hub(&mut self, hub_slot: u32, hub_port: u32, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, ep0_cycle: &mut bool, device_ctx_virt: *mut DeviceContext) {
         // Allocate buffer for hub descriptor and port status
         let mut buf_phys: u64 = 0;
         let buf_virt = syscall::mmap_dma(4096, &mut buf_phys);
@@ -971,19 +1550,64 @@ impl UsbDriver {
             return;
         }
 
-        // Set configuration to activate hub
-        if !self.set_configuration(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, 1) {
+        // =====================================================================
+        // Step 1: Get configuration descriptor to find interrupt endpoint
+        // =====================================================================
+        let mut int_ep_info: Option<(u8, u16, u8)> = None;
+
+        // Get config descriptor (first 9 bytes to get total length)
+        match self.control_transfer(
+            hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
+            0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_CONFIGURATION << 8) as u16,
+            0, buf_phys, 9
+        ) {
+            Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
+                invalidate_buffer(buf_virt as u64, 9);
+                let config = unsafe { &*(buf_virt as *const ConfigurationDescriptor) };
+                let total_len = config.total_length;
+
+                if total_len > 9 && total_len <= 256 {
+                    delay(10000);
+                    // Get full config descriptor
+                    match self.control_transfer(
+                        hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
+                        0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_CONFIGURATION << 8) as u16,
+                        0, buf_phys, total_len
+                    ) {
+                        Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
+                            invalidate_buffer(buf_virt as u64, total_len as usize);
+                            // Parse to find interrupt IN endpoint
+                            int_ep_info = self.parse_hub_config_descriptor(buf_virt as *const u8, total_len as usize);
+                            if let Some((ep_addr, max_pkt, interval)) = int_ep_info {
+                                println!("    Interrupt EP: addr=0x{:02x}, max_pkt={}, interval={}", ep_addr, max_pkt, interval);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => println!("    Failed to get hub config descriptor"),
+        }
+
+        // =====================================================================
+        // Step 2: Set configuration to activate hub
+        // =====================================================================
+        if !self.set_configuration(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, 1) {
             return;
         }
 
         // Set hub depth (required for USB3 hubs)
-        let _ = self.control_transfer(
-            hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+        // Depth 0 = directly connected to root hub
+        match self.control_transfer(
+            hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
             0x20, hub::SET_HUB_DEPTH, 0, 0, 0, 0
-        );
+        ) {
+            Some((cc, _)) => println!("    SET_HUB_DEPTH: cc={}", cc),
+            None => println!("    SET_HUB_DEPTH: FAILED"),
+        }
 
         // Get hub descriptor to find port count
-        let hub_desc_len = match self.get_hub_descriptor(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, buf_phys) {
+        let hub_desc_len = match self.get_hub_descriptor(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, buf_phys) {
             Some(len) => len,
             None => return,
         };
@@ -1039,100 +1663,239 @@ impl UsbDriver {
             }
         }
 
-        // Power on all ports (silent)
+        // =====================================================================
+        // Step 3: Set up hub interrupt endpoint for status change notifications
+        // =====================================================================
+        if let Some((int_ep_addr, int_max_packet, int_interval)) = int_ep_info {
+            if self.setup_hub_interrupt_endpoint(
+                hub_slot, hub_port, num_ports,
+                int_ep_addr, int_max_packet, int_interval,
+                device_ctx_virt, ep0_ring_virt, ep0_ring_phys, *ep0_enqueue
+            ) {
+                println!("    Hub interrupt endpoint ready");
+            } else {
+                println!("    Failed to set up hub interrupt endpoint");
+            }
+        }
+
+        // =====================================================================
+        // Step 4: Power on all ports and warm reset for USB 3.0 link training
+        // =====================================================================
+        println!("    Powering hub ports...");
         for port in 1..=num_ports as u16 {
-            self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::PORT_POWER);
+            self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::PORT_POWER);
         }
 
         // Wait for power stabilization (use hub-specified time, minimum 100ms)
         let wait_time = (pwr_time as u32 * 2).max(100);
+        println!("    pwr_time={}, waiting {}ms for power...", pwr_time, wait_time);
         delay_ms(wait_time);
 
-        // Poll for device connection (USB 3.0 link training can take time)
-        // Check each port multiple times over ~2 seconds
-        let buf_virt_u64 = buf_virt as u64;
-        let mut ports_to_check: u16 = (1 << num_ports) - 1;  // Bitmask of ports to check
+        // Warm reset (BH_PORT_RESET) all ports - needed for USB 3.0 link establishment
+        println!("    Warm-resetting hub ports (USB 3.0)...");
+        for port in 1..=num_ports as u16 {
+            self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::BH_PORT_RESET);
+        }
+        delay_ms(500);  // Wait for warm reset
 
-        for poll in 0..10 {
-            if ports_to_check == 0 {
-                break;  // All ports checked
-            }
-
-            for port in 1..=num_ports as u16 {
-                let port_mask = 1 << (port - 1);
-                if (ports_to_check & port_mask) == 0 {
-                    continue;  // Already found device on this port
-                }
-
-                if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
-                    if poll == 9 || (ps.status & hub::PS_CONNECTION) != 0 {
-                        // Final poll or device found - print status
-                        if poll == 9 {
-                            println!("    Hub port {}: status=0x{:04x} change=0x{:04x}", port, ps.status, ps.change);
-                        }
-                        ports_to_check &= !port_mask;  // Mark port as checked
-                    }
-                }
-            }
-
-            if ports_to_check != 0 {
-                delay_ms(200);  // Wait before next poll
-            }
+        // Clear warm reset change bits
+        for port in 1..=num_ports as u16 {
+            self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_BH_PORT_RESET);
         }
 
-        // Now enumerate devices on connected ports
+        // =====================================================================
+        // Step 5: Wait for link training and do initial port poll
+        // =====================================================================
+        // USB 3.0 link training can take time - wait before checking ports
+        println!("    Waiting 2s for USB 3.0 link training...");
+        delay_ms(2000);
+
+        // Do initial port poll to find devices that connected during warm reset
+        // The interrupt endpoint only reports NEW status changes
+        let buf_virt_u64 = buf_virt as u64;
         for port in 1..=num_ports as u16 {
-            if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
+            if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt_u64, buf_phys) {
                 println!("    Hub port {}: status=0x{:04x} change=0x{:04x}", port, ps.status, ps.change);
+
+                // Clear any pending change bits
+                if (ps.change & hub::PS_C_CONNECTION) != 0 {
+                    self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_PORT_CONNECTION);
+                }
+
+                // If device connected, reset and enumerate
                 if (ps.status & hub::PS_CONNECTION) != 0 {
                     println!("      -> Device connected, resetting...");
-                    // Clear connection change
-                    self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::C_PORT_CONNECTION);
-
-                    // Reset the port
-                    if !self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::PORT_RESET) {
-                        println!("      -> Reset failed");
-                        continue;
-                    }
-
-                    // Wait for reset to complete
-                    let mut reset_ok = false;
-                    for _ in 0..50 {
-                        delay(10000);
-                        if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
+                    if self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::PORT_RESET) {
+                        delay_ms(100);
+                        if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt_u64, buf_phys) {
                             if (ps2.change & hub::PS_C_RESET) != 0 {
-                                self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::C_PORT_RESET);
-                                if (ps2.status & hub::PS_ENABLE) != 0 {
-                                    println!("      -> Port enabled, enumerating device");
-                                    for _ in 0..100 {
-                                        delay(1000);
-                                    }
-                                    self.enumerate_hub_device(hub_slot, hub_port, port as u32);
-                                    reset_ok = true;
-                                } else {
-                                    println!("      -> Reset complete but port not enabled");
-                                }
-                                break;
+                                self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_PORT_RESET);
+                            }
+                            if (ps2.status & hub::PS_ENABLE) != 0 {
+                                println!("      -> Port enabled, enumerating device");
+                                delay_ms(100);
+                                self.enumerate_hub_device(hub_slot, hub_port, port as u32);
+                            } else {
+                                println!("      -> Port not enabled after reset (status=0x{:04x})", ps2.status);
                             }
                         }
                     }
-                    if !reset_ok {
-                        println!("      -> Reset timeout");
+                }
+            }
+        }
+
+        // =====================================================================
+        // Step 6: Update hub_device.ep0_enqueue and ep0_cycle with final values
+        // =====================================================================
+        // IMPORTANT: hub_device was stored earlier with stale ep0_enqueue/cycle values.
+        // After all the PORT_POWER, BH_PORT_RESET, hub_get_port_status operations,
+        // ep0_enqueue has advanced (and cycle may have toggled if ring wrapped).
+        // We MUST update hub_device with the final values or daemon loop will fail.
+        if let Some(ref mut hub) = self.hub_device {
+            println!("    Updating hub ep0_enqueue: {} -> {}, ep0_cycle: {} -> {}",
+                     hub.ep0_enqueue, *ep0_enqueue, hub.ep0_cycle, *ep0_cycle);
+            hub.ep0_enqueue = *ep0_enqueue;
+            hub.ep0_cycle = *ep0_cycle;
+        }
+
+        // =====================================================================
+        // Step 7: Queue interrupt transfer for future status changes
+        // =====================================================================
+        if self.hub_device.is_some() {
+            self.queue_hub_status_transfer();
+        }
+    }
+
+    /// Poll hub ports once (fallback when interrupt endpoint is not available)
+    fn poll_hub_ports_once(&mut self, hub_slot: u32, root_port: u32, num_ports: u8, ep0_ring_virt: *mut Trb, ep0_ring_phys: u64, ep0_enqueue: &mut usize, ep0_cycle: &mut bool, buf_virt: u64, buf_phys: u64) {
+        // Wait for devices to connect (USB 3.0 link training can take time)
+        println!("    Waiting 2s for USB 3.0 link training...");
+        delay_ms(2000);
+
+        for port in 1..=num_ports as u16 {
+            if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt, buf_phys) {
+                println!("    Hub port {}: status=0x{:04x} change=0x{:04x}", port, ps.status, ps.change);
+                if (ps.status & hub::PS_CONNECTION) != 0 {
+                    println!("      -> Device connected, resetting...");
+                    self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_PORT_CONNECTION);
+                    if self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::PORT_RESET) {
+                        delay_ms(100);
+                        if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt, buf_phys) {
+                            if (ps2.status & hub::PS_ENABLE) != 0 {
+                                println!("      -> Port enabled, enumerating device");
+                                self.enumerate_hub_device(hub_slot, root_port, port as u32);
+                            }
+                        }
                     }
                 }
-            } else {
-                println!("    Hub port {}: failed to get status", port);
             }
         }
     }
 
-    /// Enumerate a device connected to a hub port (mostly silent)
+    /// Quick hub port poll for daemon loop (no delays)
+    /// Uses stored hub_device info to poll all hub ports for status changes
+    fn poll_hub_ports_quick(&mut self) {
+        // Extract hub info first to avoid borrow issues
+        let (hub_slot, num_ports, root_port, ep0_ring, ep0_phys, mut ep0_enqueue, mut ep0_cycle, device_ctx) = {
+            match self.hub_device.as_ref() {
+                Some(h) => (h.slot_id, h.num_ports, h.hub_port, h.ep0_ring, h.ep0_ring_phys, h.ep0_enqueue, h.ep0_cycle, h.device_ctx),
+                None => {
+                    println!("[hub] poll_quick: no hub_device!");
+                    return;
+                }
+            }
+        };
+
+        // Debug: Check EP0 endpoint context state and xHCI operational state
+        let usbcmd = self.op_read32(xhci_op::USBCMD);
+        let usbsts = self.op_read32(xhci_op::USBSTS);
+        let ep0_state: u32;
+        let ep0_trdp: u64;
+        unsafe {
+            use usb::transfer::invalidate_buffer;
+            invalidate_buffer(device_ctx as u64, 128);  // Invalidate slot + EP0 contexts
+            // DeviceContext: SlotContext (32 bytes) + endpoints[31] (31 * 32 bytes)
+            // EP0 context is at offset 32 (after SlotContext)
+            let ep0_ctx = (device_ctx as *const u8).add(32) as *const u32;
+            let dw0 = core::ptr::read_volatile(ep0_ctx);
+            let dw2 = core::ptr::read_volatile(ep0_ctx.add(2));
+            let dw3 = core::ptr::read_volatile(ep0_ctx.add(3));
+            ep0_state = dw0 & 0x7;  // EP state is bits 0-2
+            ep0_trdp = ((dw3 as u64) << 32) | (dw2 as u64);
+        }
+        let ep_state_name = match ep0_state {
+            0 => "Disabled",
+            1 => "Running",
+            2 => "Halted",
+            3 => "Stopped",
+            4 => "Error",
+            _ => "Unknown",
+        };
+        let _ = (usbcmd, usbsts, ep0_state, ep_state_name, ep0_trdp);  // Suppress warnings
+
+        // Allocate a temp buffer for port status (4 bytes)
+        let mut buf_phys: u64 = 0;
+        let buf_virt = syscall::mmap_dma(4096, &mut buf_phys);
+        if buf_virt < 0 {
+            return;
+        }
+        let buf_virt_u64 = buf_virt as u64;
+
+        for port in 1..=num_ports as u16 {
+            let ps_result = self.hub_get_port_status(hub_slot, ep0_ring, ep0_phys, &mut ep0_enqueue, &mut ep0_cycle, port, buf_virt_u64, buf_phys);
+            if ps_result.is_none() {
+                println!("[hub] Port {}: get_status failed", port);
+                continue;
+            }
+            let ps = ps_result.unwrap();
+
+            // Only clear connection change bit (bit 0) for now - other bits may cause issues
+            if (ps.change & 0x0001) != 0 {
+                self.hub_clear_port_feature(hub_slot, ep0_ring, ep0_phys, &mut ep0_enqueue, &mut ep0_cycle, port, 16);
+            }
+
+            // Check for connection change
+            if (ps.change & hub::PS_C_CONNECTION) != 0 {
+                if (ps.status & hub::PS_CONNECTION) != 0 {
+                    // Device connected - reset and enumerate
+                    println!("[hub] Port {}: Device connected", port);
+                    if self.hub_set_port_feature(hub_slot, ep0_ring, ep0_phys, &mut ep0_enqueue, &mut ep0_cycle, port, hub::PORT_RESET) {
+                        delay_ms(50);
+                        if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring, ep0_phys, &mut ep0_enqueue, &mut ep0_cycle, port, buf_virt_u64, buf_phys) {
+                            if (ps2.status & hub::PS_ENABLE) != 0 {
+                                self.enumerate_hub_device(hub_slot, root_port, port as u32);
+                            }
+                        }
+                    }
+                } else {
+                    // Device disconnected
+                    println!("[hub] Port {}: Device disconnected", port);
+                    // TODO: Clean up device slot
+                }
+            }
+        }
+
+        // Update stored ep0_enqueue and ep0_cycle
+        if let Some(ref mut h) = self.hub_device {
+            h.ep0_enqueue = ep0_enqueue;
+            h.ep0_cycle = ep0_cycle;
+        }
+
+        // Free temp buffer
+        syscall::munmap(buf_virt as u64, 4096);
+    }
+
+    /// Enumerate a device connected to a hub port
     fn enumerate_hub_device(&mut self, hub_slot: u32, root_port: u32, hub_port: u32) {
         // Enable a new slot for this device
         let slot_id = match self.enable_slot() {
             Some(id) => id,
-            None => return,
+            None => {
+                println!("[hub] Port {}: Failed to get slot", hub_port);
+                return;
+            }
         };
+        let _ = hub_slot;  // Suppress warning
 
         // Allocate context memory
         let mut ctx_phys: u64 = 0;
@@ -1148,17 +1911,18 @@ impl UsbDriver {
         let ep0_ring_virt = (ctx_virt as u64 + 0x900) as *mut Trb;
         let ep0_ring_phys = ctx_phys + 0x900;
 
-        // Initialize EP0 transfer ring
+        // Initialize EP0 transfer ring (112 TRBs - same as enumerate_device)
+        const EP0_RING_SIZE: usize = 112;
         unsafe {
-            for i in 0..64 {
+            for i in 0..EP0_RING_SIZE {
                 *ep0_ring_virt.add(i) = Trb::new();
             }
-            let link = &mut *ep0_ring_virt.add(63);
+            let link = &mut *ep0_ring_virt.add(EP0_RING_SIZE - 1);
             link.param = ep0_ring_phys;
             link.set_type(trb_type::LINK);
-            link.control |= 1 << 5;
+            link.control |= 1 << 1;  // Toggle Cycle (TC) bit - bit 1, NOT bit 5
             // Flush EP0 ring to memory
-            flush_buffer(ep0_ring_virt as u64, 64 * core::mem::size_of::<Trb>());
+            flush_buffer(ep0_ring_virt as u64, EP0_RING_SIZE * core::mem::size_of::<Trb>());
         }
 
         // Assume SuperSpeed since we came from a USB3 hub
@@ -1255,8 +2019,17 @@ impl UsbDriver {
         }
 
         let addr_ok = match addr_result {
-            Some(cc) if cc == trb_cc::SUCCESS => true,
-            _ => false,
+            Some(cc) if cc == trb_cc::SUCCESS => {
+                true
+            }
+            Some(cc) => {
+                println!("[hub] Port {}: Address failed (cc={})", hub_port, cc);
+                false
+            }
+            None => {
+                println!("[hub] Port {}: Address timeout", hub_port);
+                false
+            }
         };
 
         if !addr_ok {
@@ -1276,26 +2049,40 @@ impl UsbDriver {
         }
 
         let mut dev_ep0_enqueue = 0usize;
+        let mut dev_ep0_cycle = true;  // Cycle starts at 1 for new ring
 
         match self.control_transfer(
-            slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue,
+            slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue, &mut dev_ep0_cycle,
             0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_DEVICE << 8) as u16,
             0, desc_phys, 18
         ) {
-            Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
-                let desc = unsafe { &*(desc_virt as *const DeviceDescriptor) };
-                print!("  Hub port {}: ", hub_port);
-                if desc.device_class == 8 || desc.device_class == 0 {
-                    println!("Mass Storage");
+            Some((cc, _len)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
+                let desc_ptr = desc_virt as *const u8;
+                let device_class = unsafe { *desc_ptr.add(4) };  // offset 4 = bDeviceClass
+                let vendor_id = unsafe {
+                    let p = desc_ptr.add(8) as *const u16;
+                    core::ptr::read_unaligned(p)
+                };
+                let product_id = unsafe {
+                    let p = desc_ptr.add(10) as *const u16;
+                    core::ptr::read_unaligned(p)
+                };
+                if device_class == 8 || device_class == 0 {
+                    println!("[hub] Port {}: Mass Storage (VID={:04x} PID={:04x})", hub_port, vendor_id, product_id);
                     self.configure_mass_storage(
-                        slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue,
+                        slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue, &mut dev_ep0_cycle,
                         desc_virt as *mut u8, desc_phys, device_ctx_virt
                     );
                 } else {
-                    println!("Device class {}", desc.device_class);
+                    println!("[hub] Port {}: Device class {} (VID={:04x} PID={:04x})", hub_port, device_class, vendor_id, product_id);
                 }
             }
-            _ => {}
+            Some((cc, _)) => {
+                println!("[hub] Port {}: Descriptor failed (cc={})", hub_port, cc);
+            }
+            None => {
+                println!("[hub] Port {}: Descriptor timeout", hub_port);
+            }
         }
     }
 
@@ -1306,13 +2093,14 @@ impl UsbDriver {
         ep0_ring_virt: *mut Trb,
         ep0_ring_phys: u64,
         ep0_enqueue: &mut usize,
+        ep0_cycle: &mut bool,
         buf_virt: *mut u8,
         buf_phys: u64,
         device_ctx_virt: *mut DeviceContext,
     ) {
         // Get Configuration Descriptor (first 9 bytes to get total length)
         match self.control_transfer(
-            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+            slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
             0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_CONFIGURATION << 8) as u16,
             0, buf_phys, 9
         ) {
@@ -1325,7 +2113,7 @@ impl UsbDriver {
                 if total_len > 9 && total_len <= 256 {
                     delay(10000);
                     match self.control_transfer(
-                        slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+                        slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
                         0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_CONFIGURATION << 8) as u16,
                         0, buf_phys, total_len
                     ) {
@@ -1333,7 +2121,7 @@ impl UsbDriver {
                             // Invalidate full config descriptor
                             invalidate_buffer(buf_virt as u64, total_len as usize);
                             self.parse_config_descriptor(
-                                slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
+                                slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
                                 buf_virt, total_len as usize, device_ctx_virt
                             );
                         }
@@ -1352,6 +2140,7 @@ impl UsbDriver {
         ep0_ring_virt: *mut Trb,
         ep0_ring_phys: u64,
         ep0_enqueue: &mut usize,
+        ep0_cycle: &mut bool,
         buf: *mut u8,
         total_len: usize,
         device_ctx_virt: *mut DeviceContext,
@@ -1414,7 +2203,7 @@ impl UsbDriver {
         }
 
         if is_mass_storage && bulk_in_ep != 0 && bulk_out_ep != 0 {
-            if self.set_configuration(slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, config_value) {
+            if self.set_configuration(slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, config_value) {
                 delay(50000);
             }
             self.setup_bulk_endpoints(
@@ -2132,6 +2921,7 @@ impl UsbDriver {
                     ep0_ring: ctx.ep0_ring,
                     ep0_ring_phys: ctx.ep0_ring_phys,
                     ep0_enqueue: ctx.ep0_enqueue,
+                    ep0_cycle: ctx.ep0_cycle,
                 });
                 println!("    Block device ready: {} blocks x {} bytes", block_count, block_size);
 
@@ -2448,7 +3238,7 @@ impl UsbDriver {
         // bmRequestType=0x21 (class, interface), bRequest=0xFF, wIndex=interface
         println!("  [Recovery] Sending BOT Reset to interface {}...", ctx.interface_num);
         let result = self.control_transfer(
-            ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue,
+            ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue, &mut ctx.ep0_cycle,
             0x21, 0xFF, 0, ctx.interface_num as u16, 0, 0
         );
         match result {
@@ -2461,7 +3251,7 @@ impl UsbDriver {
         // bmRequestType=0x02 (endpoint), bRequest=1 (CLEAR_FEATURE), wValue=0 (HALT), wIndex=endpoint
         println!("  [Recovery] Clearing HALT on bulk OUT endpoint 0x{:02x}...", ctx.bulk_out_addr);
         let result = self.control_transfer(
-            ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue,
+            ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue, &mut ctx.ep0_cycle,
             0x02, 1, 0, ctx.bulk_out_addr as u16, 0, 0
         );
         match result {
@@ -2472,7 +3262,7 @@ impl UsbDriver {
         // Step 3: CLEAR_FEATURE(ENDPOINT_HALT) for bulk IN
         println!("  [Recovery] Clearing HALT on bulk IN endpoint 0x{:02x}...", ctx.bulk_in_addr);
         let result = self.control_transfer(
-            ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue,
+            ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue, &mut ctx.ep0_cycle,
             0x02, 1, 0, ctx.bulk_in_addr as u16, 0, 0
         );
         match result {
@@ -2736,6 +3526,7 @@ impl UsbDriver {
             ep0_ring: msc.ep0_ring,
             ep0_ring_phys: msc.ep0_ring_phys,
             ep0_enqueue: msc.ep0_enqueue,
+            ep0_cycle: msc.ep0_cycle,
         };
 
         // Perform the read and extract length immediately
@@ -2791,6 +3582,7 @@ impl UsbDriver {
             ep0_ring: msc.ep0_ring,
             ep0_ring_phys: msc.ep0_ring_phys,
             ep0_enqueue: msc.ep0_enqueue,
+            ep0_cycle: msc.ep0_cycle,
         };
 
         // Build READ(10) command
@@ -2883,6 +3675,7 @@ impl UsbDriver {
             ep0_ring: msc.ep0_ring,
             ep0_ring_phys: msc.ep0_ring_phys,
             ep0_enqueue: msc.ep0_enqueue,
+            ep0_cycle: msc.ep0_cycle,
         };
 
         // Copy data to DMA buffer
@@ -3190,19 +3983,7 @@ fn main() {
                     continue;
                 }
 
-                // Poll for device connection (up to 2 seconds)
-                let mut has_device = false;
-                for _ in 0..20 {
-                    for p in 0..d.xhci.max_ports() {
-                        if (d.xhci.read_portsc(p) & 1) != 0 {
-                            has_device = true;
-                            break;
-                        }
-                    }
-                    if has_device { break; }
-                    delay_ms(100);
-                }
-
+                // Controller initialized successfully
                 driver = Some(d);
                 active_config = Some(&controllers[idx as usize]);
                 break;
@@ -3218,75 +3999,113 @@ fn main() {
         }
     };
 
-    // Test command ring and process events
+    // Test command ring
     driver.send_noop();
     delay_ms(10);
-    driver.poll_events();
 
-    // Try port reset to detect devices
-    for p in 1..=driver.xhci.max_ports() as u32 {
-        driver.reset_port(p);
-        delay_ms(50);
-    }
-
-    // Process post-reset events
-    for _ in 0..5 {
-        if !driver.poll_events() { break; }
-        delay_ms(10);
-    }
-
-    // Register for IRQ (get IRQ number from controller config)
+    // Register for IRQ BEFORE polling events (so we don't miss any)
     let irq_url = format_irq_url(config.irq);
     let irq_fd = syscall::scheme_open(&irq_url, 0);
     if irq_fd >= 0 {
         driver.set_irq_fd(irq_fd);
     }
 
-    // Poll for device connection on the active controller
-    for _round in 0..30 {
-        let mut connected_port: Option<u32> = None;
+    // === Event-Driven Device Detection ===
+    // Wait for PORT_STATUS_CHANGE events from xHCI
+    // Devices already connected at boot will generate CSC events
+    println!("Waiting for USB devices (event-driven)...");
 
-        for p in 0..driver.xhci.max_ports() {
-            if (driver.xhci.read_portsc(p) & 1) != 0 {
-                connected_port = Some((p + 1) as u32);
-                break;
-            }
+    // Debug: Print all port status before polling events
+    println!("Port status before event polling:");
+    for p in 0..driver.xhci.max_ports() {
+        let raw = driver.xhci.read_portsc(p);
+        let status = ParsedPortsc::from_raw(raw);
+        println!("  Port {}: raw=0x{:08x} connected={} enabled={} speed={}",
+                 p + 1, raw, status.connected, status.enabled, status.speed.as_str());
+    }
+
+    // Process initial events (CSC events for already-connected devices)
+    let initial_ports = driver.poll_events();
+    if initial_ports != 0 {
+        println!("Initial device(s) detected, enumerating...");
+        driver.enumerate_pending_ports(initial_ports);
+    }
+
+    // Check if port 2 has anything (USB 2.0 portion of hub?)
+    if driver.xhci.max_ports() >= 2 {
+        let raw = driver.xhci.read_portsc(1);  // Port 2 (0-indexed)
+        let status = ParsedPortsc::from_raw(raw);
+        println!("xHCI Port 2: raw=0x{:08x} connected={} enabled={} speed={}",
+                 raw, status.connected, status.enabled, status.speed.as_str());
+        if status.connected && driver.enumerated_ports & 2 == 0 {
+            println!("Port 2 has device, attempting enumeration...");
+            driver.enumerate_port(2);
+        }
+    }
+
+    // Wait up to 5 seconds for additional device connections
+    let mut wait_count = 0;
+    while driver.enumerated_ports == 0 && wait_count < 50 {
+        wait_count += 1;
+
+        // Wait for IRQ or timeout
+        if driver.irq_fd >= 0 {
+            driver.wait_for_irq(100);
+        } else {
+            delay_ms(100);
         }
 
-        if let Some(port) = connected_port {
-            driver.enumerate_device(port);
-            break;
+        // Poll events and enumerate any new devices
+        let ports_to_enum = driver.poll_events();
+        if ports_to_enum != 0 {
+            driver.enumerate_pending_ports(ports_to_enum);
         }
-        delay_ms(1000);
+    }
+
+    if driver.enumerated_ports == 0 {
+        println!("No USB devices found after 5 seconds");
     }
 
     // Daemonize
     let result = syscall::daemonize();
     if result == 0 {
         println!("USB daemon running (ring buffer mode)");
+        // Resync event ring before daemon loop - drain any pending events and update ERDP
+        driver.resync_event_ring();
 
         const MAX_CLIENTS: usize = 4;
         let mut clients: [Option<BlockServer>; MAX_CLIENTS] = [None, None, None, None];
         let mut num_clients = 0usize;
-        let mut poll_counter = 0u32;
+        let mut heartbeat_counter = 0u32;
 
         loop {
-            poll_counter += 1;
-            if poll_counter >= 100 {
-                poll_counter = 0;
-                driver.poll_events();
+            heartbeat_counter += 1;
+
+            // Reset heartbeat counter every 2 seconds
+            if heartbeat_counter >= 200 {
+                heartbeat_counter = 0;
             }
+
+            // Poll xHCI events every iteration for responsive hotplug
+            let ports_to_enum = driver.poll_events();
+            if ports_to_enum != 0 {
+                driver.enumerate_pending_ports(ports_to_enum);
+            }
+
+            // Poll hub ports every ~1 second (100 iterations) for hotplug detection
+            if heartbeat_counter % 100 == 0 && heartbeat_counter > 0 {
+                driver.poll_hub_ports_quick();
+            }
+
 
             // Accept new client connections
             let accept_result = syscall::port_accept(usb_port);
             if accept_result > 0 && num_clients < MAX_CLIENTS {
                 let client_channel = accept_result as u32;
-                println!("[usbd] Client connected on channel {}", client_channel);
 
                 // Create BlockServer and complete handshake
                 let mut client = BlockServer::new(client_channel);
                 if client.try_handshake() {
-                    println!("[usbd] Ring handshake complete for PID {}", client.client_pid);
                     // Add to clients array
                     for i in 0..MAX_CLIENTS {
                         if clients[i].is_none() {
@@ -3295,8 +4114,6 @@ fn main() {
                             break;
                         }
                     }
-                } else {
-                    println!("[usbd] Ring handshake failed");
                 }
             }
 
@@ -3309,7 +4126,8 @@ fn main() {
                 }
             }
 
-            syscall::yield_now();
+            // Use a short delay instead of yield for testing
+            delay_ms(10);
         }
     } else {
         println!("  Daemonize failed: {}", result);

@@ -230,23 +230,46 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                     None => -11, // EAGAIN
                 }
             } else {
-                // Blocking: wait for data, reading as much as available
-                // First character is blocking
-                let c = uart::getc();
-                buf[0] = c as u8;
-                let mut count = 1;
-
-                // Read more if available (non-blocking for subsequent chars)
-                while count < buf.len() {
-                    match uart::try_getc() {
-                        Some(c) => {
-                            buf[count] = c as u8;
-                            count += 1;
+                // "Blocking" read: if no data, switch tasks and return EAGAIN
+                // Caller should retry. This allows other tasks to run.
+                match uart::try_getc() {
+                    Some(c) => {
+                        buf[0] = c as u8;
+                        let mut count = 1;
+                        // Read more if available (non-blocking for subsequent chars)
+                        while count < buf.len() {
+                            match uart::try_getc() {
+                                Some(c) => {
+                                    buf[count] = c as u8;
+                                    count += 1;
+                                }
+                                None => break,
+                            }
                         }
-                        None => break,
+                        count as isize
+                    }
+                    None => {
+                        // No data available - switch to another task if possible
+                        unsafe {
+                            let sched = crate::task::scheduler();
+                            if let Some(next_slot) = sched.schedule() {
+                                if next_slot != sched.current {
+                                    // Mark current as ready and switch
+                                    if let Some(ref mut current) = sched.tasks[sched.current] {
+                                        current.state = crate::task::TaskState::Ready;
+                                    }
+                                    sched.current = next_slot;
+                                    if let Some(ref mut next) = sched.tasks[next_slot] {
+                                        next.state = crate::task::TaskState::Running;
+                                    }
+                                    crate::task::update_current_task_globals();
+                                    crate::task::SYSCALL_SWITCHED_TASK = 1;
+                                }
+                            }
+                        }
+                        -11 // EAGAIN - caller should retry
                     }
                 }
-                count as isize
             }
         }
         FdType::ConsoleOut => -9, // EBADF - Can't read from output

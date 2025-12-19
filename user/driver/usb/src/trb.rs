@@ -48,6 +48,7 @@ pub mod trb_type {
     pub const DATA: u32 = 3;
     pub const STATUS: u32 = 4;
     pub const LINK: u32 = 6;
+    pub const NOOP_TRANSFER: u32 = 8;  // No-Op for transfer rings
 
     // Command TRB types
     pub const ENABLE_SLOT: u32 = 9;

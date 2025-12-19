@@ -60,6 +60,7 @@ pub mod hub {
     pub const C_PORT_RESET: u16 = 20;
     pub const PORT_LINK_STATE: u16 = 5;
     pub const BH_PORT_RESET: u16 = 28;    // USB3 warm reset
+    pub const C_BH_PORT_RESET: u16 = 29;  // Clear USB3 warm reset change
 
     // Hub class requests
     pub const SET_HUB_DEPTH: u8 = 12;     // USB3 hub depth setting

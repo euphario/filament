@@ -285,32 +285,30 @@ pub extern "C" fn irq_handler_rust(from_user: u64) {
                 }
             }
 
-            // Timer tick - potentially preempt user process
-            if from_user != 0 {
-                // Preempt: schedule next task
-                unsafe {
-                    let sched = task::scheduler();
+            // Timer tick - preempt current task (from user or kernel mode)
+            // Kernel preemption is safe because we only preempt in spin loops (getc)
+            unsafe {
+                let sched = task::scheduler();
 
-                    // Mark current as ready (it was running)
-                    if let Some(ref mut current) = sched.tasks[sched.current] {
-                        if current.state == task::TaskState::Running {
-                            current.state = task::TaskState::Ready;
-                        }
+                // Mark current as ready (it was running)
+                if let Some(ref mut current) = sched.tasks[sched.current] {
+                    if current.state == task::TaskState::Running {
+                        current.state = task::TaskState::Ready;
                     }
+                }
 
-                    // Find next task
-                    if let Some(next_slot) = sched.schedule() {
-                        if next_slot != sched.current {
-                            sched.current = next_slot;
-                            if let Some(ref mut next_task) = sched.tasks[next_slot] {
-                                next_task.state = task::TaskState::Running;
-                            }
-                            task::update_current_task_globals();
-                        } else {
-                            // Same task, mark as running again
-                            if let Some(ref mut current) = sched.tasks[sched.current] {
-                                current.state = task::TaskState::Running;
-                            }
+                // Find next task
+                if let Some(next_slot) = sched.schedule() {
+                    if next_slot != sched.current {
+                        sched.current = next_slot;
+                        if let Some(ref mut next_task) = sched.tasks[next_slot] {
+                            next_task.state = task::TaskState::Running;
+                        }
+                        task::update_current_task_globals();
+                    } else {
+                        // Same task, mark as running again
+                        if let Some(ref mut current) = sched.tasks[sched.current] {
+                            current.state = task::TaskState::Running;
                         }
                     }
                 }

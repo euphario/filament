@@ -1020,6 +1020,13 @@ pub unsafe fn yield_cpu() {
     let sched = scheduler();
     let caller_slot = sched.current;
 
+    // Mark current task as Ready so it can be scheduled again
+    if let Some(ref mut t) = sched.tasks[caller_slot] {
+        if t.state == TaskState::Running {
+            t.state = TaskState::Ready;
+        }
+    }
+
     // Find next ready task
     if let Some(next_slot) = sched.schedule() {
         if next_slot != caller_slot {
@@ -1055,6 +1062,10 @@ pub unsafe fn yield_cpu() {
             context_switch(current_ctx, next_ctx);
 
             // We return here when switched back to this task
+            // Mark ourselves as Running again
+            if let Some(ref mut t) = sched.tasks[sched.current] {
+                t.state = TaskState::Running;
+            }
             // Restore our address space
             if let Some(ref task) = sched.tasks[sched.current] {
                 if let Some(ref addr_space) = task.address_space {
