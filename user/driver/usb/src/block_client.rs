@@ -1,16 +1,28 @@
-//! Block Device Client (Ring Buffer Version)
+//! Block Device Client
 //!
-//! Provides a clean abstraction for block device access via usbd.
-//! Uses shared ring buffers for high-performance zero-copy transfers.
+//! Zero-copy block device access via shared DMA ring buffer.
+//!
+//! # Architecture
+//!
+//! ```text
+//! BlockClient ←──shared memory──→ usbd (BlockServer)
+//!                                      ↓
+//!                               xHCI DMA directly
+//!                               into shared buffer
+//! ```
+//!
+//! After initial connection handshake, all block I/O goes through a shared
+//! ring buffer. Read operations DMA directly into the shared data buffer -
+//! no copies between usbd and client.
 //!
 //! # Example
 //! ```
 //! let mut block = BlockClient::connect(b"usb")?;
 //! let (block_size, block_count) = block.get_info()?;
 //!
-//! // Read sectors - data is available via block.data()
+//! // Read sectors - USB DMA writes directly to ring.data()
 //! block.read(lba, count)?;
-//! let data = block.data();
+//! let data = block.data();  // Zero-copy access
 //! ```
 
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
@@ -19,16 +31,16 @@ use crate::transfer::invalidate_buffer;
 
 /// Block device client
 ///
-/// Connects to usbd and provides block-level read/write access.
-/// Uses shared ring buffers for zero-copy transfers.
+/// Provides zero-copy block access via shared DMA ring buffer.
+/// After connection, USB hardware DMAs directly into the shared buffer.
 pub struct BlockClient {
-    /// Shared ring buffer
+    /// Shared DMA ring buffer (submission queue + completion queue + data buffer)
     ring: BlockRing,
-    /// Block size (cached from get_info)
+    /// Block size in bytes (cached from get_info, typically 512)
     block_size: u32,
     /// Total block count (cached from get_info)
     block_count: u64,
-    /// Next request tag
+    /// Request tag counter for matching responses
     next_tag: u32,
 }
 
@@ -37,52 +49,59 @@ unsafe impl Send for BlockClient {}
 
 impl BlockClient {
     /// Connect to block device server via the specified port name
-    /// Returns None if connection or ring setup fails
+    ///
+    /// Performs handshake to establish shared ring buffer, then returns.
+    /// Returns None if connection or handshake fails.
     pub fn connect(port_name: &[u8]) -> Option<Self> {
-        // Connect to server
         let channel = syscall::port_connect(port_name);
         if channel < 0 {
             return None;
         }
-        let channel = channel as u32;
-
-        Self::setup_with_channel(channel)
+        Self::complete_handshake(channel as u32)
     }
 
-    /// Connect using an existing channel (for when connection is done externally)
+    /// Connect using an existing channel
     pub fn from_channel(channel: u32) -> Option<Self> {
-        Self::setup_with_channel(channel)
+        Self::complete_handshake(channel)
     }
 
-    /// Common setup after channel is established
-    fn setup_with_channel(channel: u32) -> Option<Self> {
-        let mut msg_buf = [0u8; 64];
+    /// Complete handshake with server to establish shared ring buffer
+    ///
+    /// Handshake protocol:
+    /// 1. Client sends PID to server
+    /// 2. Server creates shared ring buffer, grants access to client
+    /// 3. Server sends shmem_id back to client
+    /// 4. Client maps the shared memory
+    /// 5. (Channel no longer used - all I/O via ring buffer)
+    fn complete_handshake(channel: u32) -> Option<Self> {
+        let mut buf = [0u8; 64];
 
-        // Send our PID to server
+        // Step 1: Send our PID so server can grant shmem access
         let my_pid = syscall::getpid() as u32;
-        msg_buf[..4].copy_from_slice(&my_pid.to_le_bytes());
-        syscall::send(channel, &msg_buf[..4]);
+        buf[..4].copy_from_slice(&my_pid.to_le_bytes());
+        syscall::send(channel, &buf[..4]);
 
-        // Wait for shmem_id from server
+        // Step 2-3: Wait for shmem_id from server
         for _ in 0..100 {
-            let recv_len = syscall::receive(channel, &mut msg_buf);
+            let recv_len = syscall::receive(channel, &mut buf);
             if recv_len >= 4 {
                 break;
             }
             syscall::yield_now();
         }
 
-        let shmem_id = u32::from_le_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]]);
+        let shmem_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if shmem_id == 0 {
             return None;
         }
 
-        // Map the ring buffer - channel is no longer needed after this
+        // Step 4: Map the shared ring buffer into our address space
         let ring = BlockRing::map(shmem_id)?;
 
+        // Handshake complete - channel no longer needed
         Some(Self {
             ring,
-            block_size: 512,  // Default, updated by get_info()
+            block_size: 512,  // Updated by get_info()
             block_count: 0,
             next_tag: 1,
         })

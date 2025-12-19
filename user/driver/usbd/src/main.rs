@@ -24,7 +24,7 @@ use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 
 // Import from the usb driver library
 use usb::{
-    // GPIO IPC
+    // GPIO commands
     GPIO_CMD_USB_VBUS,
     // xHCI registers
     xhci_op, xhci_rt, xhci_ir,
@@ -1044,14 +1044,43 @@ impl UsbDriver {
             self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, hub::PORT_POWER);
         }
 
-        // Wait for power stabilization
-        let wait_time = pwr_time.max(500);
-        for _ in 0..wait_time {
-            delay(1000);
+        // Wait for power stabilization (use hub-specified time, minimum 100ms)
+        let wait_time = (pwr_time as u32 * 2).max(100);
+        delay_ms(wait_time);
+
+        // Poll for device connection (USB 3.0 link training can take time)
+        // Check each port multiple times over ~2 seconds
+        let buf_virt_u64 = buf_virt as u64;
+        let mut ports_to_check: u16 = (1 << num_ports) - 1;  // Bitmask of ports to check
+
+        for poll in 0..10 {
+            if ports_to_check == 0 {
+                break;  // All ports checked
+            }
+
+            for port in 1..=num_ports as u16 {
+                let port_mask = 1 << (port - 1);
+                if (ports_to_check & port_mask) == 0 {
+                    continue;  // Already found device on this port
+                }
+
+                if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
+                    if poll == 9 || (ps.status & hub::PS_CONNECTION) != 0 {
+                        // Final poll or device found - print status
+                        if poll == 9 {
+                            println!("    Hub port {}: status=0x{:04x} change=0x{:04x}", port, ps.status, ps.change);
+                        }
+                        ports_to_check &= !port_mask;  // Mark port as checked
+                    }
+                }
+            }
+
+            if ports_to_check != 0 {
+                delay_ms(200);  // Wait before next poll
+            }
         }
 
-        // Check port status and enumerate connected devices
-        let buf_virt_u64 = buf_virt as u64;
+        // Now enumerate devices on connected ports
         for port in 1..=num_ports as u16 {
             if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, port, buf_virt_u64, buf_phys) {
                 println!("    Hub port {}: status=0x{:04x} change=0x{:04x}", port, ps.status, ps.change);
@@ -2022,9 +2051,8 @@ impl UsbDriver {
         None
     }
 
-    /// Run SCSI tests using the new refactored code
     /// Run SCSI tests - only prints capacity result
-    /// Also stores device info for block access via IPC
+    /// Also stores device info for block access via ring buffer
     fn run_scsi_tests(&mut self, ctx: &mut BulkContext) {
         // Wait for device to be ready
         let mut ready = false;
@@ -2078,7 +2106,7 @@ impl UsbDriver {
             if self.scsi_read_10(ctx, 0, 1).is_some() {
                 println!("    Read test: OK");
 
-                // Store device info for block access via IPC
+                // Store device info for ring buffer block access
                 // Copy all BulkContext state so we can perform reads later
                 self.msc_device = Some(MscDeviceInfo {
                     slot_id: ctx.slot_id,
@@ -2122,7 +2150,7 @@ impl UsbDriver {
         }
     }
 
-    /// Run direct USB performance test (bypasses IPC)
+    /// Run direct USB performance test (uses internal buffer)
     fn run_performance_test(&mut self, ctx: &mut BulkContext, block_count: u64) {
         println!("\n=== USB Performance Test ===");
         println!("  Ring state: OUT idx={} cycle={}, IN idx={} cycle={}",
@@ -2674,7 +2702,7 @@ impl UsbDriver {
         self.wait_transfer_complete_ex(10000, max_polls)
     }
 
-    /// Read blocks from the MSC device (for IPC handler)
+    /// Read blocks from the MSC device (for ring buffer handler)
     /// Returns bytes read on success, writes data to internal buffer
     fn block_read(&mut self, lba: u64, count: u32) -> Option<usize> {
         // Check limits
@@ -2821,7 +2849,7 @@ impl UsbDriver {
         })
     }
 
-    /// Write blocks to the MSC device (for IPC handler)
+    /// Write blocks to the MSC device (for ring buffer handler)
     /// Returns bytes written on success
     fn block_write(&mut self, lba: u64, data: &[u8]) -> Option<usize> {
         // Check limits (max 64 blocks = 32KB at 512 bytes/block)
@@ -2908,7 +2936,7 @@ fn format_irq_url(irq: u32) -> &'static str {
 }
 
 // =============================================================================
-// VBUS Power Control via GPIO Driver IPC
+// VBUS Power Control via GPIO Driver
 // =============================================================================
 
 /// Request USB VBUS enable from the GPIO expander driver (silent)
@@ -2931,42 +2959,52 @@ fn request_vbus_enable() -> bool {
 }
 
 // =============================================================================
-// Ring Buffer Client for block device operations
+// Block Device Server (Ring Buffer)
 // =============================================================================
 
-/// Ring buffer client for block device operations
-/// Uses shared ring buffers for high-performance zero-copy transfers
-struct RingClient {
-    channel: u32,
+/// Block device server - handles requests from BlockClient via shared ring buffer
+///
+/// Uses zero-copy DMA: client requests specify offset in shared data buffer,
+/// USB DMA writes directly to that buffer, client reads without copy.
+struct BlockServer {
+    /// Channel used only for initial handshake (PID + shmem_id exchange)
+    handshake_channel: u32,
+    /// Shared ring buffer for all block operations after handshake
     ring: Option<BlockRing>,
+    /// Client process ID (for shmem_allow)
     client_pid: u32,
-    msg_buf: [u8; 64],
+    /// Temporary buffer for handshake messages only
+    handshake_buf: [u8; 64],
 }
 
-impl RingClient {
-    /// Create a new ring client from an accepted channel
+impl BlockServer {
+    /// Create a new block server from an accepted connection channel
     fn new(channel: u32) -> Self {
         Self {
-            channel,
+            handshake_channel: channel,
             ring: None,
             client_pid: 0,
-            msg_buf: [0u8; 64],
+            handshake_buf: [0u8; 64],
         }
     }
 
-    /// Complete handshake with client - returns true if handshake succeeds
+    /// Complete handshake with client - exchange PID and shmem_id
+    ///
+    /// After handshake, all communication goes through the ring buffer.
+    /// The handshake channel is no longer used.
     fn try_handshake(&mut self) -> bool {
-        // Wait for client's PID
-        let recv_len = syscall::receive(self.channel, &mut self.msg_buf);
+        // Receive client's PID
+        let recv_len = syscall::receive(self.handshake_channel, &mut self.handshake_buf);
         if recv_len < 4 {
             return false;
         }
 
         self.client_pid = u32::from_le_bytes([
-            self.msg_buf[0], self.msg_buf[1], self.msg_buf[2], self.msg_buf[3]
+            self.handshake_buf[0], self.handshake_buf[1],
+            self.handshake_buf[2], self.handshake_buf[3]
         ]);
 
-        // Create ring buffer (64 entries, 1MB data buffer for DMA)
+        // Create shared ring buffer (64 entries, 1MB DMA data buffer)
         let ring = match BlockRing::create(64, 1024 * 1024) {
             Some(r) => r,
             None => {
@@ -2975,17 +3013,18 @@ impl RingClient {
             }
         };
 
-        // Allow client to map our ring
+        // Grant client permission to map the shared memory
         if !ring.allow(self.client_pid) {
             println!("[usbd] Failed to allow client access to ring");
             return false;
         }
 
-        // Send shmem_id to client
+        // Send shmem_id to client (final handshake message)
         let shmem_id_bytes = ring.shmem_id().to_le_bytes();
-        self.msg_buf[..4].copy_from_slice(&shmem_id_bytes);
-        syscall::send(self.channel, &self.msg_buf[..4]);
+        self.handshake_buf[..4].copy_from_slice(&shmem_id_bytes);
+        syscall::send(self.handshake_channel, &self.handshake_buf[..4]);
 
+        // Handshake complete - all further communication via ring
         self.ring = Some(ring);
         true
     }
@@ -3227,7 +3266,7 @@ fn main() {
         println!("USB daemon running (ring buffer mode)");
 
         const MAX_CLIENTS: usize = 4;
-        let mut clients: [Option<RingClient>; MAX_CLIENTS] = [None, None, None, None];
+        let mut clients: [Option<BlockServer>; MAX_CLIENTS] = [None, None, None, None];
         let mut num_clients = 0usize;
         let mut poll_counter = 0u32;
 
@@ -3244,8 +3283,8 @@ fn main() {
                 let client_channel = accept_result as u32;
                 println!("[usbd] Client connected on channel {}", client_channel);
 
-                // Create RingClient and attempt handshake
-                let mut client = RingClient::new(client_channel);
+                // Create BlockServer and complete handshake
+                let mut client = BlockServer::new(client_channel);
                 if client.try_handshake() {
                     println!("[usbd] Ring handshake complete for PID {}", client.client_pid);
                     // Add to clients array
