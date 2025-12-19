@@ -211,6 +211,82 @@ impl BlockClient {
         self.read(lba, 1)
     }
 
+    // =========================================================================
+    // Pipelined API - submit multiple requests before waiting
+    // =========================================================================
+
+    /// Submit a read request without waiting for completion
+    /// Returns the tag for this request, or None if submission failed
+    pub fn submit_read(&mut self, lba: u64, count: u32, buf_offset: u32) -> Option<u32> {
+        let max_bytes = self.ring.data_size();
+        let requested_bytes = (count as usize) * (self.block_size as usize);
+        if buf_offset as usize + requested_bytes > max_bytes {
+            return None;
+        }
+
+        let tag = self.next_tag();
+        let req = BlockRequest::read(tag, lba, count, buf_offset);
+
+        if self.ring.submit(&req) {
+            Some(tag)
+        } else {
+            None
+        }
+    }
+
+    /// Notify server of pending requests (call after submitting batch)
+    pub fn notify(&self) {
+        self.ring.notify();
+    }
+
+    /// Wait for at least `count` completions to be available
+    /// Returns number of completions available
+    pub fn wait_completions(&self, count: u32, timeout_ms: u32) -> u32 {
+        let deadline = timeout_ms;
+        let mut waited = 0u32;
+
+        while self.ring.cq_pending() < count && waited < deadline {
+            if !self.ring.wait(100) {
+                waited += 100;
+            }
+        }
+        self.ring.cq_pending()
+    }
+
+    /// Collect one completion, invalidating cache for the data region
+    /// Returns (tag, bytes_read) or None if no completions available
+    pub fn collect_completion(&mut self) -> Option<(u32, usize)> {
+        let resp = self.ring.next_completion()?;
+
+        if resp.status != 0 {
+            return Some((resp.tag, 0)); // Error
+        }
+
+        let bytes_read = resp.bytes as usize;
+        if bytes_read > 0 {
+            // Invalidate the entire data buffer since we don't track per-request offsets
+            // For optimal performance, caller should track buf_offset per tag
+            let data = self.ring.data();
+            invalidate_buffer(data.as_ptr() as u64, bytes_read);
+        }
+
+        Some((resp.tag, bytes_read))
+    }
+
+    /// Get number of pending completions
+    pub fn completions_pending(&self) -> u32 {
+        self.ring.cq_pending()
+    }
+
+    /// Get number of pending submissions (requests not yet completed)
+    pub fn submissions_pending(&self) -> u32 {
+        self.ring.sq_pending()
+    }
+
+    // =========================================================================
+    // Synchronous API (original)
+    // =========================================================================
+
     /// Write blocks to the device
     ///
     /// Data should be placed in the ring's data buffer before calling.

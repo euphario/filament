@@ -57,6 +57,14 @@ fn main() {
     }
     sector0.copy_from_slice(&block.data()[..512]);
 
+    // Debug: dump first 16 bytes and last 2 bytes of sector 0
+    print!("[fatfs] Sector 0 first 16 bytes: ");
+    for i in 0..16 {
+        print!("{:02x} ", sector0[i]);
+    }
+    println!();
+    println!("[fatfs] Sector 0 signature bytes [510..512]: {:02x} {:02x}", sector0[510], sector0[511]);
+
     // Check if this is an MBR (partition table) or direct FAT boot sector
     // FAT boot sector starts with jump: EB xx 90 or E9 xx xx
     // MBR starts with executable code (often 33 C0 = xor ax,ax)
@@ -177,12 +185,14 @@ fn read_performance_test(block: &mut BlockClient, _block_count: u64) {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
     }
 
-    // Test read with different sector counts
-    let test_lba = 1000u64;  // Safe test location
+    let block_size = block.block_size();
+
+    // Test 1: Synchronous reads (baseline)
+    println!("[fatfs] === Synchronous Read Performance ===");
+    let test_lba = 1000u64;
     let test_sizes = [1u32, 4, 8, 16, 32, 64];
     let iterations = 100u32;
 
-    println!("[fatfs] === Ring Buffer Read Performance ===");
     for &sectors in &test_sizes {
         let start: u64;
         unsafe {
@@ -207,11 +217,81 @@ fn read_performance_test(block: &mut BlockClient, _block_count: u64) {
 
         if elapsed_us > 0 && success > 0 {
             let kb_per_sec = (bytes_transferred * 1_000_000) / (elapsed_us * 1024);
-            println!("[fatfs]   Read {}x{}: {}/{} OK, {} KB/s",
+            println!("[fatfs]   Sync {}x{}: {}/{} OK, {} KB/s",
                 sectors, iterations, success, iterations, kb_per_sec);
-        } else {
-            println!("[fatfs]   Read {}x{}: {}/{} OK",
-                sectors, iterations, success, iterations);
+        }
+    }
+
+    // Test 2: Pipelined reads (submit batch, then collect)
+    println!("[fatfs] === Pipelined Read Performance ===");
+    let pipeline_depths = [4u32, 8, 16, 32];
+    let sectors_per_read = 16u32;  // 8KB per read
+    let bytes_per_read = (sectors_per_read * block_size) as usize;
+
+    for &depth in &pipeline_depths {
+        // Calculate how many reads fit in buffer
+        let max_reads = block.buffer_size() / bytes_per_read;
+        let actual_depth = depth.min(max_reads as u32);
+        let total_reads = 100u32;
+
+        let start: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
+        }
+
+        let mut success = 0u32;
+        let mut submitted = 0u32;
+        let mut completed = 0u32;
+
+        // Initial batch submission
+        while submitted < actual_depth && submitted < total_reads {
+            let buf_offset = (submitted as usize % actual_depth as usize) * bytes_per_read;
+            let lba = test_lba + (submitted as u64 * sectors_per_read as u64);
+            if block.submit_read(lba, sectors_per_read, buf_offset as u32).is_some() {
+                submitted += 1;
+            } else {
+                break;
+            }
+        }
+        block.notify();
+
+        // Pipeline: as completions come in, submit more
+        while completed < total_reads {
+            // Wait for at least one completion
+            block.wait_completions(1, 5000);
+
+            // Collect all available completions
+            while let Some((tag, bytes)) = block.collect_completion() {
+                if bytes > 0 {
+                    success += 1;
+                }
+                completed += 1;
+
+                // Submit another if we have more to do
+                if submitted < total_reads {
+                    let buf_offset = (submitted as usize % actual_depth as usize) * bytes_per_read;
+                    let lba = test_lba + (submitted as u64 * sectors_per_read as u64);
+                    if block.submit_read(lba, sectors_per_read, buf_offset as u32).is_some() {
+                        submitted += 1;
+                        block.notify();
+                    }
+                }
+            }
+        }
+
+        let end: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) end);
+        }
+
+        let elapsed_ticks = end - start;
+        let elapsed_us = (elapsed_ticks * 1_000_000) / freq;
+        let bytes_transferred = (success as u64) * bytes_per_read as u64;
+
+        if elapsed_us > 0 && success > 0 {
+            let kb_per_sec = (bytes_transferred * 1_000_000) / (elapsed_us * 1024);
+            println!("[fatfs]   Pipeline depth={} ({}x{}): {}/{} OK, {} KB/s",
+                actual_depth, sectors_per_read, total_reads, success, total_reads, kb_per_sec);
         }
     }
 
