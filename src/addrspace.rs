@@ -414,10 +414,8 @@ impl AddressSpace {
         };
 
         // Set the L3 page entry with Normal Cacheable memory for DMA
-        // U-Boot pattern: use cacheable memory + explicit cache operations
-        // - Flush (DC CVAC) before hardware reads (CPU wrote data)
-        // - Invalidate (DC CIVAC) before CPU reads (hardware wrote data)
-        // This is how MT7988A works in non-coherent PCIe mode
+        // MT7988A requires cacheable memory + explicit cache operations.
+        // Userspace must flush before DMA reads and invalidate after DMA writes.
         let ap = if writable { flags::AP_RW_ALL } else { flags::AP_RO_ALL };
 
         unsafe {

@@ -23,9 +23,11 @@
 
 mod regs;
 mod controller;
+mod helpers;
 
 pub use regs::*;
 pub use controller::*;
+pub use helpers::*;
 
 // Re-export TRB and Ring from parent (they're already pure xHCI)
 pub use crate::trb::{Trb, trb_type, trb_cc};

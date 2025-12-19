@@ -96,6 +96,24 @@ pub mod addrs {
     /// IRQ numbers
     pub const SSUSB0_IRQ: u32 = 243;
     pub const SSUSB1_IRQ: u32 = 244;
+
+    // INFRACFG_AO - Clock and Reset Control
+    pub const INFRACFG_AO_BASE: u64 = 0x1000_1000;
+    pub const INFRACFG_AO_SIZE: u64 = 0x1000;
+
+    // Reset registers
+    pub const INFRA_RST1_CLR: usize = 0x44;  // Write 1 to deassert reset
+
+    // Clock gate registers
+    pub const INFRA_CG1_CLR: usize = 0x8C;   // Write 1 to ungate (enable) clock
+
+    // USB reset bits (in RST1)
+    pub const RST1_SSUSB_TOP0: u32 = 1 << 7;
+    pub const RST1_SSUSB_TOP1: u32 = 1 << 8;
+
+    // USB clock gate bits (in CG1)
+    pub const CG1_SSUSB0: u32 = 1 << 18;
+    pub const CG1_SSUSB1: u32 = 1 << 19;
 }
 
 /// MT7988A USB controller index
@@ -168,6 +186,56 @@ impl Mt7988aSoc {
             ControllerId::Ssusb0 => addrs::SSUSB0_PHY_SIZE,
             ControllerId::Ssusb1 => addrs::SSUSB1_PHY_SIZE,
         }
+    }
+
+    /// Global USB initialization - deassert resets and enable clocks
+    ///
+    /// This must be called once before initializing any USB controller.
+    /// It configures the INFRACFG_AO registers to:
+    /// - Deassert USB controller resets
+    /// - Enable USB clock gates
+    ///
+    /// Returns true on success, false on failure.
+    pub fn global_init() -> bool {
+        use crate::mmio::{MmioRegion, delay, format_mmio_url};
+        use userlib::syscall;
+
+        // Format URL for INFRACFG_AO
+        let mut url_buf = [0u8; 32];
+        let url_len = format_mmio_url(&mut url_buf, addrs::INFRACFG_AO_BASE, addrs::INFRACFG_AO_SIZE);
+        let url = unsafe { core::str::from_utf8_unchecked(&url_buf[..url_len]) };
+
+        let fd = syscall::scheme_open(url, 2);
+        if fd < 0 {
+            return false;
+        }
+
+        let mut virt_buf = [0u8; 8];
+        if syscall::read(fd as u32, &mut virt_buf) < 8 {
+            syscall::close(fd as u32);
+            return false;
+        }
+        let base = u64::from_le_bytes(virt_buf);
+
+        let write_reg = |offset: usize, value: u32| {
+            unsafe {
+                let ptr = (base + offset as u64) as *mut u32;
+                core::ptr::write_volatile(ptr, value);
+            }
+        };
+
+        // Deassert USB resets for both controllers
+        let usb_rst_bits = addrs::RST1_SSUSB_TOP0 | addrs::RST1_SSUSB_TOP1;
+        write_reg(addrs::INFRA_RST1_CLR, usb_rst_bits);
+        delay(1000);
+
+        // Enable USB clocks for both controllers
+        let usb_cg_bits = addrs::CG1_SSUSB0 | addrs::CG1_SSUSB1;
+        write_reg(addrs::INFRA_CG1_CLR, usb_cg_bits);
+        delay(10000);
+
+        syscall::close(fd as u32);
+        true
     }
 
     /// Read IPPC register

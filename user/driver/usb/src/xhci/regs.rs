@@ -191,8 +191,11 @@ pub mod portsc {
     /// Bits that are write-1-to-clear (RW1C) - don't write 1 accidentally
     pub const RW1C_BITS: u32 = CSC | PEC | WRC | OCC | PRC | PLC | CEC;
 
-    /// Bits that are preserved on write (RsvdP)
-    pub const PRESERVE_BITS: u32 = CCS | OCA | PLS_MASK | PP | SPEED_MASK | PIC_MASK | DR;
+    /// Bits to preserve when writing PORTSC (only actual RW bits)
+    /// Note: CCS, OCA, SPEED, DR are read-only (ignored on write)
+    /// PLS is RWS but only written if LWS=1
+    /// PP and PIC are the only bits that must be explicitly preserved
+    pub const PRESERVE_BITS: u32 = PP | PIC_MASK;
 }
 
 // =============================================================================

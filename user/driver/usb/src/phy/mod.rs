@@ -16,7 +16,7 @@
 //! - `mt7988a_xsphy` - MediaTek XS-PHY (used on BPI-R4 SSUSB0)
 //! - `none` - No-op for platforms that don't need PHY configuration
 
-mod mt7988a;
+pub mod mt7988a;
 
 pub use mt7988a::{Mt7988aTphy, Mt7988aXsphy};
 

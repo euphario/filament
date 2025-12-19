@@ -438,26 +438,23 @@ impl Task {
             for i in 0..(num_pages * 4096) {
                 core::ptr::write_volatile(kva.add(i), 0);
             }
-            // Flush cache for the zeroed memory - xHCI needs to see clean memory
-            // DC CIVAC = Clean and Invalidate by VA to Point of Coherency
-            // Use kernel virtual addresses for cache ops
+            // Flush cache for the zeroed memory - DMA devices need to see clean memory
             for page in 0..num_pages {
                 let page_kva = crate::mmu::KERNEL_VIRT_BASE | (phys_addr + (page * 4096) as u64);
-                // Flush each cache line (64 bytes on Cortex-A73)
                 for offset in (0..4096).step_by(64) {
                     let addr = page_kva + offset;
                     core::arch::asm!("dc civac, {}", in(reg) addr);
                 }
             }
-            core::arch::asm!("dsb sy");  // Ensure cache ops complete
+            core::arch::asm!("dsb sy");
         }
 
-        // Map pages into address space as Normal Non-Cacheable (for DMA coherency)
+        // Map pages into address space (cacheable, userspace handles cache ops)
         let addr_space = self.address_space.as_mut()?;
         for i in 0..num_pages {
             let page_virt = virt_addr + (i * 4096) as u64;
             let page_phys = phys_addr + (i * 4096) as u64;
-            // DMA memory uses Normal Non-Cacheable attributes
+            // DMA memory uses cacheable attributes - userspace must do cache maintenance
             if !addr_space.map_dma_page(page_virt, page_phys, true) {
                 // Cleanup on failure
                 pmm::free_pages(phys_addr as usize, num_pages);
@@ -512,12 +509,12 @@ impl Task {
             return None;
         }
 
-        // Map pages into address space as Normal Non-Cacheable (for DMA coherency)
+        // Map pages into address space (cacheable, userspace handles cache ops)
         let addr_space = self.address_space.as_mut()?;
         for i in 0..num_pages {
             let page_virt = virt_addr + (i * 4096) as u64;
             let page_phys = phys_addr + (i * 4096) as u64;
-            // Shared memory uses Normal Non-Cacheable attributes (like DMA)
+            // Shared memory uses cacheable attributes - userspace does cache maintenance
             if !addr_space.map_dma_page(page_virt, page_phys, true) {
                 return None;
             }

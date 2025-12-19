@@ -26,24 +26,17 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! ## New Modular Architecture
+//! ## Modules
 //!
 //! - `xhci` - Pure xHCI controller (NO vendor code)
 //! - `phy` - PHY driver trait and implementations
 //! - `soc` - SoC USB wrapper trait and implementations
 //! - `board` - Board configuration trait and implementations
-//!
-//! ## Legacy Modules (for backward compatibility)
-//!
-//! - `xhci_regs` - Old xHCI register definitions
-//! - `phy_regs` - Old MediaTek PHY register definitions
-//! - `hal` - Old HAL (being phased out)
-//! - `controller` - Old controller helpers
 
 #![no_std]
 
 // =============================================================================
-// New Modular Architecture
+// Modular Architecture
 // =============================================================================
 
 /// Pure xHCI implementation (100% portable, NO vendor code)
@@ -83,7 +76,7 @@ pub mod enumeration;
 /// Mass Storage Class (MSC) and SCSI
 pub mod msc;
 
-/// IPC protocol definitions
+/// IPC protocol definitions (ring buffer based)
 pub mod protocol;
 
 /// Block device client (for userspace drivers like fatfs)
@@ -92,26 +85,8 @@ pub mod block_client;
 /// MMIO region helpers
 pub mod mmio;
 
-// =============================================================================
-// Legacy Modules (backward compatibility)
-// =============================================================================
-
-/// Old xHCI register definitions (use xhci::regs instead)
-#[path = "xhci_regs.rs"]
-pub mod xhci_regs;
-
-/// Old MediaTek PHY register definitions
-#[path = "phy_regs.rs"]
-pub mod phy_regs;
-
-/// Old hardware addresses (MediaTek specific)
+/// MT7988A hardware addresses and constants
 pub mod consts;
-
-/// Old HAL (being phased out - use soc/phy/board instead)
-pub mod hal;
-
-/// Old controller helpers (being merged into xhci module)
-pub mod controller;
 
 // =============================================================================
 // Re-exports for convenience
@@ -121,6 +96,21 @@ pub mod controller;
 pub use trb::{Trb, trb_type, trb_cc};
 pub use ring::{Ring, EventRing, ErstEntry, Dcbaa, RING_SIZE};
 pub use mmio::{MmioRegion, format_mmio_url, format_hex, delay_ms, delay, print_hex64, print_hex32, print_hex8};
+
+// xHCI types and helpers
+pub use xhci::{
+    // Register definitions
+    cap as xhci_cap, op as xhci_op, rt as xhci_rt, ir as xhci_ir, port as xhci_port,
+    usbcmd, usbsts, portsc, iman,
+    // Controller
+    Controller as XhciController, XhciCaps,
+    // Port status parsing
+    ParsedPortsc, PortLinkState, PortSpeed,
+    // Event helpers
+    event_completion_code, event_slot_id, event_endpoint_id, event_port_id,
+    event_trb_pointer, event_transfer_length, event_is_short_packet,
+    completion_code, doorbell,
+};
 
 // USB types
 pub use usb::{
@@ -170,44 +160,16 @@ pub use enumeration::{
     endpoint_address_to_dci, default_max_packet_size,
 };
 
-// Protocol types
-pub use protocol::{
-    UsbRequest, UsbStatus, UsbDeviceEntry, UsbDeviceInfo,
-    ControlTransferRequest, ControlTransferResponse,
-    BulkTransferRequest, BulkTransferResponse,
-    ConfigureDeviceRequest, ConfigureDeviceResponse,
-    SetupEndpointsRequest, SetupEndpointsResponse, EndpointInfo,
-    UsbMessageHeader, UsbResponseHeader,
-    USB_MSG_MAX_SIZE, USB_DATA_MAX_SIZE,
-    // Block device protocol
-    BlockReadRequest, BlockReadResponse,
-    BlockInfoRequest, BlockInfoResponse,
-    BlockWriteRequest, BlockWriteResponse,
-    // Zero-copy DMA block protocol
-    BlockReadDmaRequest, BlockReadDmaResponse,
-    BlockWriteDmaRequest, BlockWriteDmaResponse,
-};
-
 // Block device client (ring buffer based)
 pub use block_client::BlockClient;
 
-// =============================================================================
-// Legacy Re-exports (for backward compatibility with existing code)
-// =============================================================================
-
-// Old register definitions (aliased to new location)
-pub use xhci_regs::{xhci_cap, xhci_op, usbcmd, usbsts, xhci_port, xhci_rt, xhci_ir};
-pub use phy_regs::{ippc, tphy, xsphy};
+// Hardware constants
 pub use consts::*;
 
-// Old controller helpers
-pub use controller::{
-    PortLinkState, PortSpeed, portsc, ParsedPortsc, XhciCapabilities,
-    event_completion_code, event_slot_id, event_endpoint_id, event_port_id,
-    event_trb_pointer, event_transfer_length, event_is_short_packet,
-    event_type, completion_code, doorbell,
-};
-
-// Old HAL (still used by usbd until migration)
-pub use hal::{SocHal, ControllerId, XhciController, mt7988a};
-pub use hal::mt7988a::Mt7988aHal;
+// SoC and PHY types
+pub use soc::{SocUsb, SocError, PortCount};
+pub use soc::mt7988a::{Mt7988aSoc, ControllerId, addrs as mt7988a};
+pub use phy::{PhyDriver, PhyError};
+pub use phy::mt7988a::Mt7988aTphy;
+pub use board::{Board, BoardError};
+pub use board::bpi_r4::BpiR4;

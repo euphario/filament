@@ -34,7 +34,7 @@ const BPI_R4_USB_CONTROLLERS: &[UsbControllerConfig] = &[
         mac_size: 0x4000,
         phy_base: 0x11E10000,
         phy_size: 0x10000,
-        irq: 243,
+        irq: 205,  // GIC SPI 173 + 32 = 205
     },
     // SSUSB1 - Main USB ports via VL822 hub
     UsbControllerConfig {
@@ -44,7 +44,7 @@ const BPI_R4_USB_CONTROLLERS: &[UsbControllerConfig] = &[
         mac_size: 0x4000,
         phy_base: 0x11C50000,  // T-PHY v2: USB2 at +0 (0x700), USB3 at +0x700 (0x900)
         phy_size: 0x1000,      // USB2 + USB3 = 0x700 + 0x900 = 0x1000
-        irq: 244,
+        irq: 204,  // GIC SPI 172 + 32 = 204
     },
 ];
 
@@ -124,8 +124,14 @@ impl Board for BpiR4 {
 
     fn pre_init(&mut self) -> Result<(), BoardError> {
         println!("=== {} Board Init ===", self.name());
-        // No special pre-init needed for BPI-R4
-        // Power rails are managed by the board's power management
+
+        // Initialize SoC-level clocks and resets
+        // This must be done once before any USB controller is accessed
+        if !crate::soc::Mt7988aSoc::global_init() {
+            println!("  ERROR: SoC global init failed");
+            return Err(BoardError::PowerFailed);
+        }
+
         Ok(())
     }
 

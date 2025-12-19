@@ -15,18 +15,15 @@
 
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 use userlib::syscall;
+use crate::transfer::invalidate_buffer;
 
 /// Block device client
 ///
 /// Connects to usbd and provides block-level read/write access.
 /// Uses shared ring buffers for zero-copy transfers.
 pub struct BlockClient {
-    /// IPC channel to server
-    channel: u32,
     /// Shared ring buffer
     ring: BlockRing,
-    /// Message buffer for IPC handshake
-    msg_buf: [u8; 64],
     /// Block size (cached from get_info)
     block_size: u32,
     /// Total block count (cached from get_info)
@@ -80,13 +77,11 @@ impl BlockClient {
             return None;
         }
 
-        // Map the ring buffer
+        // Map the ring buffer - channel is no longer needed after this
         let ring = BlockRing::map(shmem_id)?;
 
         Some(Self {
-            channel,
             ring,
-            msg_buf,
             block_size: 512,  // Default, updated by get_info()
             block_count: 0,
             next_tag: 1,
@@ -175,7 +170,16 @@ impl BlockClient {
             return None;
         }
 
-        Some(resp.bytes as usize)
+        // Invalidate CPU cache for the data region - DMA wrote to physical memory
+        // but CPU may have stale data in cache
+        let bytes_read = resp.bytes as usize;
+        if bytes_read > 0 {
+            let data = self.ring.data();
+            let data_addr = data.as_ptr() as u64 + buf_offset as u64;
+            invalidate_buffer(data_addr, bytes_read);
+        }
+
+        Some(bytes_read)
     }
 
     /// Read blocks from the device (offset 0)

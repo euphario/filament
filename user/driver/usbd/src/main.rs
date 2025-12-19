@@ -26,10 +26,6 @@ use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 use usb::{
     // GPIO IPC
     GPIO_CMD_USB_VBUS,
-    // Clock/reset control
-    INFRACFG_AO_BASE, INFRACFG_AO_SIZE,
-    INFRA_RST1_CLR, INFRA_CG1_CLR,
-    RST1_SSUSB_TOP0, RST1_SSUSB_TOP1, CG1_SSUSB0, CG1_SSUSB1,
     // xHCI registers
     xhci_op, xhci_rt, xhci_ir,
     // TRB
@@ -41,12 +37,12 @@ use usb::{
     DeviceDescriptor, ConfigurationDescriptor, InterfaceDescriptor,
     // MSC/SCSI
     msc_const as msc, scsi, Cbw, Csw, BulkContext, TransferResult,
-    CBW_OFFSET, CSW_OFFSET, DATA_OFFSET, RING_USABLE,
+    CBW_OFFSET, CSW_OFFSET, DATA_OFFSET,
     // Ring structures
     Ring, EventRing, ErstEntry,
     // MMIO helpers
-    MmioRegion, format_mmio_url, delay_ms, delay, print_hex32,
-    // Port status parsing (still needed for legacy code)
+    MmioRegion, delay_ms, delay,
+    // Port status parsing
     ParsedPortsc, portsc,
     event_completion_code, event_slot_id, event_port_id,
     completion_code, doorbell,
@@ -55,15 +51,15 @@ use usb::{
     // Hub helpers
     get_hub_descriptor_setup, get_port_status_setup,
     set_port_feature_setup, clear_port_feature_setup,
+    // Cache ops (ARM64 cache maintenance for DMA)
+    flush_cache_line, invalidate_cache_line, flush_buffer, invalidate_buffer, dsb,
 };
 
-// New modular architecture imports
-use usb::board::{Board, BpiR4};
+// Modular architecture - Board abstraction hides SoC details
+use usb::board::{Board, BpiR4, UsbControllerConfig};
 use usb::soc::{SocUsb, Mt7988aSoc};
 use usb::phy::{PhyDriver, Mt7988aTphy};
 use usb::xhci::Controller as XhciController;
-// Legacy mt7988a constants (for IRQ, addresses still used in some places)
-use usb::mt7988a;
 
 // Module definitions now imported from usb crate
 
@@ -275,11 +271,7 @@ impl UsbDriver {
             for i in 0..256 {
                 *dcbaa_virt.add(i) = 0;
             }
-            for i in 0..256 {
-                let addr = dcbaa_virt.add(i) as u64;
-                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            flush_buffer(dcbaa_virt as u64, 256 * 8);
         }
 
         // Initialize rings
@@ -322,7 +314,7 @@ impl UsbDriver {
         };
         let trb = build_noop_trb();
         cmd_ring.enqueue(&trb);
-        self.ring_doorbell(0, doorbell::COMMAND_RING);
+        self.ring_doorbell(0, doorbell::HOST_CONTROLLER);
         true
     }
 
@@ -376,7 +368,7 @@ impl UsbDriver {
         let port = (port_id - 1) as u8;
         let raw = self.xhci.read_portsc(port);
         let status = ParsedPortsc::from_raw(raw);
-        let clear_bits = raw & portsc::CHANGE_BITS;
+        let clear_bits = raw & portsc::RW1C_BITS;
         if clear_bits != 0 {
             self.xhci.write_portsc(port, status.clear_changes_value());
         }
@@ -421,7 +413,7 @@ impl UsbDriver {
         }
 
         // Set PR (Port Reset) bit
-        let write_val = (raw & portsc::PRESERVE_MASK) | portsc::PR;
+        let write_val = (raw & portsc::PRESERVE_BITS) | portsc::PR;
         self.xhci.write_portsc(port_idx, write_val);
 
         for _ in 0..100 {
@@ -441,7 +433,7 @@ impl UsbDriver {
         let cmd_ring = self.cmd_ring.as_mut()?;
         let trb = build_enable_slot_trb();
         cmd_ring.enqueue(&trb);
-        self.ring_doorbell(0, doorbell::COMMAND_RING);
+        self.ring_doorbell(0, doorbell::HOST_CONTROLLER);
         delay(10000);
 
         let mut result: Option<(u32, u32)> = None;
@@ -509,16 +501,8 @@ impl UsbDriver {
             link.set_type(trb_type::LINK);
             link.control |= 1 << 5;  // Toggle cycle
 
-            // U-Boot pattern: flush EP0 ring to memory after initialization
-            for i in 0..64 {
-                let addr = ep0_ring_virt.add(i) as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush EP0 ring to memory
+            flush_buffer(ep0_ring_virt as u64, 64 * core::mem::size_of::<Trb>());
         }
 
         // Get port speed from PORTSC using library helpers
@@ -553,51 +537,24 @@ impl UsbDriver {
             input.endpoints[0].set_tr_dequeue_ptr(ep0_ring_phys, true);  // DCS=1
             input.endpoints[0].set_average_trb_length(8);
 
-            // U-Boot pattern: flush input context to memory after CPU writes
-            // InputContext is ~1088 bytes, flush entire structure
-            let input_addr = input_ctx_virt as u64;
-            let input_size = core::mem::size_of::<InputContext>();
-            for offset in (0..input_size).step_by(64) {
-                let addr = input_addr + offset as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush input context to memory
+            flush_buffer(input_ctx_virt as u64, core::mem::size_of::<InputContext>());
 
             // Initialize Device Context
             let device = &mut *device_ctx_virt;
             *device = DeviceContext::new();
 
-            // U-Boot pattern: flush device context to memory
-            let device_addr = device_ctx_virt as u64;
-            let device_size = core::mem::size_of::<DeviceContext>();
-            for offset in (0..device_size).step_by(64) {
-                let addr = device_addr + offset as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush device context to memory
+            flush_buffer(device_ctx_virt as u64, core::mem::size_of::<DeviceContext>());
         }
 
         // Step 4: Set DCBAA entry for this slot
         let dcbaa = self.xhci_mem as *mut u64;
         unsafe {
             *dcbaa.add(slot_id as usize) = device_ctx_phys;
-
-            // U-Boot pattern: flush DCBAA entry to memory
-            let dcbaa_entry_addr = dcbaa.add(slot_id as usize) as u64;
-            core::arch::asm!(
-                "dc cvac, {addr}",
-                addr = in(reg) dcbaa_entry_addr,
-                options(nostack, preserves_flags)
-            );
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush DCBAA entry
+            flush_cache_line(dcbaa.add(slot_id as usize) as u64);
+            dsb();
         }
         // Address Device command
         {
@@ -615,6 +572,7 @@ impl UsbDriver {
         // Wait for Address Device completion
         let mut addr_result: Option<u32> = None;
         let mut erdp_to_write: Option<u64> = None;
+        let mut fail_cc: Option<u32> = None;
 
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..50 {
@@ -624,6 +582,8 @@ impl UsbDriver {
                         let cc = (evt.status >> 24) & 0xFF;
                         if cc == trb_cc::SUCCESS {
                             addr_result = Some(slot_id);
+                        } else {
+                            fail_cc = Some(cc);
                         }
                         break;
                     }
@@ -637,16 +597,16 @@ impl UsbDriver {
         }
 
         if addr_result.is_none() {
-            println!(" - Address failed");
+            if let Some(cc) = fail_cc {
+                println!(" - Address failed (cc={})", cc);
+            } else {
+                println!(" - Address failed (no event)");
+            }
             return None;
         }
 
-        // Read back device address
-        unsafe {
-            let device_addr = device_ctx_virt as u64;
-            core::arch::asm!("dc civac, {addr}", addr = in(reg) device_addr, options(nostack, preserves_flags));
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-        }
+        // Invalidate device context before reading (xHCI wrote to it)
+        invalidate_buffer(device_ctx_virt as u64, core::mem::size_of::<DeviceContext>());
 
         // Get Device Descriptor
 
@@ -691,16 +651,8 @@ impl UsbDriver {
             status_trb.status = 0;
             status_trb.control = (trb_type::STATUS << 10) | (1 << 5) | 1;  // IOC=1, DIR=0 (OUT), Cycle=1
 
-            // U-Boot pattern: flush TRBs to memory after CPU writes (before hardware reads)
-            for i in 0..3 {
-                let addr = ep0_ring_virt.add(ep0_enqueue + i) as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush TRBs to memory before doorbell
+            flush_buffer(ep0_ring_virt.add(ep0_enqueue) as u64, 3 * core::mem::size_of::<Trb>());
         }
 
         // Ring doorbell for EP0 (target = 1 for EP0)
@@ -749,11 +701,9 @@ impl UsbDriver {
         }
 
         if transfer_ok {
+            // Invalidate descriptor buffer after xHCI DMA write
+            invalidate_buffer(desc_buf as u64, 18);
             unsafe {
-                let buf_addr = desc_buf as u64;
-                core::arch::asm!("dc civac, {addr}", addr = in(reg) buf_addr, options(nostack, preserves_flags));
-                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-
                 let desc = &*(desc_buf as *const DeviceDescriptor);
 
                 // Print device class type
@@ -819,16 +769,8 @@ impl UsbDriver {
                 link.status = 0;
                 link.control = (trb_type::LINK << 10) | (1 << 5) | 1;  // Toggle cycle, cycle=1
 
-                // Flush entire ring after reset
-                for i in 0..64 {
-                    let addr = ep0_ring_virt.add(i) as u64;
-                    core::arch::asm!(
-                        "dc cvac, {addr}",
-                        addr = in(reg) addr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                // Flush EP0 ring to memory after reset
+                flush_buffer(ep0_ring_virt as u64, 64 * core::mem::size_of::<Trb>());
             }
             *ep0_enqueue = 0;
         }
@@ -865,18 +807,9 @@ impl UsbDriver {
 
             *ep0_enqueue = next_idx + 1;
 
-            // U-Boot pattern: flush TRBs to memory after CPU writes (before hardware reads)
-            // Flush all TRBs we just wrote (Setup, optionally Data, Status)
-            for i in start_idx..=next_idx {
-                let addr = ep0_ring_virt.add(i) as u64;
-                core::arch::asm!(
-                    "dc cvac, {addr}",
-                    addr = in(reg) addr,
-                    options(nostack, preserves_flags)
-                );
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-
+            // Flush TRBs to memory before doorbell
+            let trbs_written = next_idx + 1 - start_idx;
+            flush_buffer(ep0_ring_virt.add(start_idx) as u64, trbs_written * core::mem::size_of::<Trb>());
         }
 
         // Ring doorbell for EP0
@@ -987,15 +920,8 @@ impl UsbDriver {
             setup.length
         ) {
             Some((cc, _)) if completion_code::is_success(cc) => {
-                // U-Boot pattern: invalidate cache before reading data that hardware wrote
-                unsafe {
-                    core::arch::asm!(
-                        "dc civac, {addr}",
-                        addr = in(reg) buf_virt,
-                        options(nostack, preserves_flags)
-                    );
-                    core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-                }
+                // Invalidate port status buffer after xHCI DMA write
+                invalidate_buffer(buf_virt, core::mem::size_of::<PortStatus>());
                 let ps = unsafe { *(buf_virt as *const PortStatus) };
                 Some(ps)
             }
@@ -1057,15 +983,13 @@ impl UsbDriver {
         );
 
         // Get hub descriptor to find port count
-        let _hub_desc_len = match self.get_hub_descriptor(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, buf_phys) {
+        let hub_desc_len = match self.get_hub_descriptor(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, buf_phys) {
             Some(len) => len,
             None => return,
         };
 
-        unsafe {
-            core::arch::asm!("dc civac, {addr}", addr = in(reg) buf_virt, options(nostack, preserves_flags));
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-        }
+        // Invalidate hub descriptor buffer after xHCI DMA write
+        invalidate_buffer(buf_virt as u64, hub_desc_len as usize);
         let hub_desc = unsafe { &*(buf_virt as *const SsHubDescriptor) };
         let num_ports = hub_desc.num_ports;
         let pwr_time = hub_desc.pwr_on_2_pwr_good as u32 * 2;
@@ -1204,11 +1128,8 @@ impl UsbDriver {
             link.param = ep0_ring_phys;
             link.set_type(trb_type::LINK);
             link.control |= 1 << 5;
-            for i in 0..64 {
-                let addr = ep0_ring_virt.add(i) as u64;
-                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush EP0 ring to memory
+            flush_buffer(ep0_ring_virt as u64, 64 * core::mem::size_of::<Trb>());
         }
 
         // Assume SuperSpeed since we came from a USB3 hub
@@ -1240,35 +1161,23 @@ impl UsbDriver {
             input.endpoints[0].set_tr_dequeue_ptr(ep0_ring_phys, true);  // DCS=1
             input.endpoints[0].set_average_trb_length(8);
 
-            // Flush input context to memory (CPU wrote, xHCI will read via DMA)
-            let input_addr = input_ctx_virt as u64;
-            let input_size = core::mem::size_of::<InputContext>();
-            for offset in (0..input_size).step_by(64) {
-                let addr = input_addr + offset as u64;
-                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush input context to memory
+            flush_buffer(input_ctx_virt as u64, core::mem::size_of::<InputContext>());
 
             // Initialize output Device Context (xHCI will write to this)
             let device = &mut *device_ctx_virt;
             *device = DeviceContext::new();
-            let device_addr = device_ctx_virt as u64;
-            let device_size = core::mem::size_of::<DeviceContext>();
-            for offset in (0..device_size).step_by(64) {
-                let addr = device_addr + offset as u64;
-                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush device context to memory
+            flush_buffer(device_ctx_virt as u64, core::mem::size_of::<DeviceContext>());
         }
 
         // Set DCBAA entry - xHCI uses this to find the device's output context
         let dcbaa = self.xhci_mem as *mut u64;
         unsafe {
             *dcbaa.add(slot_id as usize) = device_ctx_phys;
-            // Flush DCBAA entry to memory
-            let dcbaa_entry_addr = dcbaa.add(slot_id as usize) as u64;
-            core::arch::asm!("dc cvac, {addr}", addr = in(reg) dcbaa_entry_addr, options(nostack, preserves_flags));
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush DCBAA entry
+            flush_cache_line(dcbaa.add(slot_id as usize) as u64);
+            dsb();
         }
 
         // Wait 200ms before addressing - device needs time after reset
@@ -1379,10 +1288,8 @@ impl UsbDriver {
             0, buf_phys, 9
         ) {
             Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
-                unsafe {
-                    core::arch::asm!("dc civac, {addr}", addr = in(reg) buf_virt, options(nostack, preserves_flags));
-                    core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-                }
+                // Invalidate first 9 bytes of config descriptor
+                invalidate_buffer(buf_virt as u64, 9);
                 let config = unsafe { &*(buf_virt as *const ConfigurationDescriptor) };
                 let total_len = config.total_length;
 
@@ -1394,14 +1301,8 @@ impl UsbDriver {
                         0, buf_phys, total_len
                     ) {
                         Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
-                            unsafe {
-                                let lines = (total_len as usize + 63) / 64;
-                                for i in 0..lines {
-                                    let addr = (buf_virt as u64) + (i * 64) as u64;
-                                    core::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-                                }
-                                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-                            }
+                            // Invalidate full config descriptor
+                            invalidate_buffer(buf_virt as u64, total_len as usize);
                             self.parse_config_descriptor(
                                 slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue,
                                 buf_virt, total_len as usize, device_ctx_virt
@@ -1601,13 +1502,7 @@ impl UsbDriver {
             input.endpoints[bulk_out_idx].set_average_trb_length(1024);
 
             // Flush input context to memory
-            let input_addr = input_ctx_virt as u64;
-            let input_size = core::mem::size_of::<InputContext>();
-            for offset in (0..input_size).step_by(64) {
-                let addr = input_addr + offset as u64;
-                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            flush_buffer(input_ctx_virt as u64, core::mem::size_of::<InputContext>());
         }
 
         // Issue Configure Endpoint command
@@ -1642,16 +1537,8 @@ impl UsbDriver {
 
         if !config_ok { return; }
 
-        // Invalidate device context cache
-        unsafe {
-            let dev_ctx_addr = device_ctx_virt as u64;
-            let dev_ctx_size = core::mem::size_of::<DeviceContext>();
-            for offset in (0..dev_ctx_size).step_by(64) {
-                let addr = dev_ctx_addr + offset as u64;
-                core::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-        }
+        // Invalidate device context after xHCI wrote to it
+        invalidate_buffer(device_ctx_virt as u64, core::mem::size_of::<DeviceContext>());
 
         // Allocate data buffer for SCSI commands
         let mut data_phys: u64 = 0;
@@ -1900,7 +1787,6 @@ impl UsbDriver {
 
         // Send CBW
         if !self.send_cbw(ctx, &cbw) {
-            println!("    CBW send failed");
             return (TransferResult::Error(0), None);
         }
 
@@ -1908,7 +1794,6 @@ impl UsbDriver {
         if data_length > 0 {
             let (result, _bytes) = self.receive_bulk_in_irq(ctx, DATA_OFFSET, data_length as usize);
             if result != TransferResult::Success && result != TransferResult::ShortPacket {
-                println!("    Data phase failed: {:?}", result);
                 return (result, None);
             }
         }
@@ -2277,11 +2162,8 @@ impl UsbDriver {
                 for i in 0..bytes_per_transfer {
                     *buf.add(i) = (i & 0xFF) as u8;
                 }
-                // Flush buffer
-                for offset in (0..bytes_per_transfer).step_by(64) {
-                    core::arch::asm!("dc cvac, {}", in(reg) buf.add(offset) as u64, options(nostack));
-                }
-                core::arch::asm!("dsb sy", options(nostack));
+                // Flush buffer to memory for DMA
+                flush_buffer(perf_buf_virt as u64, bytes_per_transfer);
             }
 
             // Write test: 100 transfers
@@ -2355,8 +2237,8 @@ impl UsbDriver {
             for i in 0..512 {
                 *buf.add(i) = 0xAA;  // Different pattern
             }
-            core::arch::asm!("dc cvac, {}", in(reg) buf as u64, options(nostack));
-            core::arch::asm!("dsb sy", options(nostack));
+            // Flush buffer to memory for DMA
+            flush_buffer(perf_buf_virt as u64, 512);
         }
 
         let write_ok = self.perf_write(ctx, test_lba, perf_buf_phys, bytes_per_transfer);
@@ -2979,12 +2861,8 @@ impl UsbDriver {
         unsafe {
             let data_ptr = ctx.data_buf.add(DATA_OFFSET);
             core::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
-            // Clean cache for the data area before DMA write
-            for offset in (0..data.len()).step_by(64) {
-                let addr = data_ptr.add(offset) as u64;
-                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
-            }
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            // Flush data to memory for DMA
+            flush_buffer(data_ptr as u64, data.len());
         }
 
         // Perform the write
@@ -3013,44 +2891,20 @@ impl UsbDriver {
 // Functionality consolidated into BulkContext-based scsi_test_unit_ready_ctx() and run_scsi_tests().
 
 // =============================================================================
-// USB Clock and Reset Control
+// Helper Functions
 // =============================================================================
 
-/// Initialize USB subsystem clocks and deassert resets (silent)
-fn init_usb_clocks_and_resets() -> bool {
-    let mut url_buf = [0u8; 32];
-    let url_len = format_mmio_url(&mut url_buf, INFRACFG_AO_BASE, INFRACFG_AO_SIZE);
-    let url = unsafe { core::str::from_utf8_unchecked(&url_buf[..url_len]) };
-
-    let fd = syscall::scheme_open(url, 2);
-    if fd < 0 { return false; }
-
-    let mut virt_buf = [0u8; 8];
-    if syscall::read(fd as u32, &mut virt_buf) < 8 {
-        syscall::close(fd as u32);
-        return false;
+/// Format an IRQ scheme URL from IRQ number
+/// Returns a static string for common IRQs
+fn format_irq_url(irq: u32) -> &'static str {
+    // MT7988A USB controller IRQs (GIC SPI + 32)
+    // SSUSB0: SPI 173 + 32 = 205
+    // SSUSB1: SPI 172 + 32 = 204
+    match irq {
+        204 => "irq:204",
+        205 => "irq:205",
+        _ => "irq:204",  // Default to SSUSB1
     }
-    let base = u64::from_le_bytes(virt_buf);
-
-    let write_reg = |offset: usize, value: u32| {
-        unsafe {
-            let ptr = (base + offset as u64) as *mut u32;
-            core::ptr::write_volatile(ptr, value);
-        }
-    };
-
-    // Deassert USB resets
-    let usb_rst_bits = RST1_SSUSB_TOP0 | RST1_SSUSB_TOP1;
-    write_reg(INFRA_RST1_CLR, usb_rst_bits);
-    delay(1000);
-
-    // Ungate USB clocks
-    let usb_cg_bits = CG1_SSUSB0 | CG1_SSUSB1;
-    write_reg(INFRA_CG1_CLR, usb_cg_bits);
-    delay(10000);
-
-    syscall::close(fd as u32);
-    true
 }
 
 // =============================================================================
@@ -3077,18 +2931,8 @@ fn request_vbus_enable() -> bool {
 }
 
 // =============================================================================
-// IPC Handler for USB scheme
+// Ring Buffer Client for block device operations
 // =============================================================================
-
-use usb::{
-    UsbRequest, UsbStatus, UsbMessageHeader, UsbResponseHeader,
-    USB_MSG_MAX_SIZE,
-    BlockReadRequest, BlockReadResponse, BlockInfoRequest, BlockInfoResponse,
-    BlockWriteRequest, BlockWriteResponse,
-    // Zero-copy DMA
-    BlockReadDmaRequest, BlockReadDmaResponse,
-    BlockWriteDmaRequest, BlockWriteDmaResponse,
-};
 
 /// Ring buffer client for block device operations
 /// Uses shared ring buffers for high-performance zero-copy transfers
@@ -3252,41 +3096,6 @@ impl RingClient {
 }
 
 // =============================================================================
-// Legacy IPC Client (for non-block operations)
-// =============================================================================
-
-/// Connected IPC client (legacy, for non-block operations)
-#[allow(dead_code)]
-struct IpcClient {
-    channel: u32,
-    msg_buf: [u8; USB_MSG_MAX_SIZE],
-}
-
-#[allow(dead_code)]
-impl IpcClient {
-    fn new(channel: u32) -> Self {
-        Self {
-            channel,
-            msg_buf: [0u8; USB_MSG_MAX_SIZE],
-        }
-    }
-
-    fn handle_list_devices(&mut self, _driver: &UsbDriver) {
-        let resp = UsbResponseHeader::new(UsbStatus::Ok, 0);
-        let resp_bytes = resp.to_bytes();
-        self.msg_buf[..UsbResponseHeader::SIZE].copy_from_slice(&resp_bytes);
-        let _ = syscall::send(self.channel, &self.msg_buf[..UsbResponseHeader::SIZE]);
-    }
-
-    fn send_error(&mut self, status: UsbStatus) {
-        let resp = UsbResponseHeader::new(status, 0);
-        let resp_bytes = resp.to_bytes();
-        self.msg_buf[..UsbResponseHeader::SIZE].copy_from_slice(&resp_bytes);
-        let _ = syscall::send(self.channel, &self.msg_buf[..UsbResponseHeader::SIZE]);
-    }
-}
-
-// =============================================================================
 // Main
 // =============================================================================
 
@@ -3306,19 +3115,37 @@ fn main() {
     }
     let usb_port = port_result as u32;
 
+    // === Board Initialization ===
+    // The board abstraction handles all platform-specific setup:
+    // - SoC clock/reset initialization
+    // - VBUS power control
+    // - Controller configuration
+    let mut board = BpiR4::new();
+
     // Request VBUS enable and wait for power stabilization
     let _vbus_ok = request_vbus_enable();
     delay_ms(100);
 
-    // Initialize USB clocks and deassert resets
-    let _ = init_usb_clocks_and_resets();
+    // Board pre-init handles SoC-level clocks and resets
+    if board.pre_init().is_err() {
+        println!("ERROR: Board pre-init failed");
+        syscall::exit(1);
+    }
 
+    // === Controller Initialization ===
+    // Try controllers in board-defined priority order (SSUSB1 first, then SSUSB0)
     let mut driver: Option<UsbDriver> = None;
-    let mut active_controller = 0u32;
+    let mut active_config: Option<&UsbControllerConfig> = None;
 
-    // Try SSUSB1 first (USB-A ports), then SSUSB0 (M.2 slot)
-    for ctrl in [1u32, 0u32] {
-        if let Some(mut d) = UsbDriver::new(ctrl) {
+    // Get controllers from board (portable - no hardcoded indices)
+    let controllers = board.usb_controllers();
+    // Try SSUSB1 first (index 1), then SSUSB0 (index 0)
+    for &idx in &[1u8, 0u8] {
+        if idx as usize >= controllers.len() {
+            continue;
+        }
+
+        if let Some(mut d) = UsbDriver::new(idx as u32) {
             if d.init() {
                 if d.xhci.max_ports() == 0 {
                     continue;
@@ -3338,15 +3165,15 @@ fn main() {
                 }
 
                 driver = Some(d);
-                active_controller = ctrl;
+                active_config = Some(&controllers[idx as usize]);
                 break;
             }
         }
     }
 
-    let mut driver = match driver {
-        Some(d) => d,
-        None => {
+    let (mut driver, config) = match (driver, active_config) {
+        (Some(d), Some(c)) => (d, c),
+        _ => {
             println!("ERROR: No USB controller initialized");
             syscall::exit(1);
         }
@@ -3369,45 +3196,26 @@ fn main() {
         delay_ms(10);
     }
 
-    // Register for IRQ
-    let irq_fd = syscall::scheme_open("irq:204", 0);
+    // Register for IRQ (get IRQ number from controller config)
+    let irq_url = format_irq_url(config.irq);
+    let irq_fd = syscall::scheme_open(&irq_url, 0);
     if irq_fd >= 0 {
         driver.set_irq_fd(irq_fd);
     }
 
-    // Open SSUSB0 for monitoring
-    let ssusb0_mac = MmioRegion::open(mt7988a::SSUSB0_MAC_PHYS, mt7988a::MAC_SIZE as u64);
-
-    // Poll ports on BOTH controllers for device
-    for round in 0..30 {
-        let mut found = false;
+    // Poll for device connection on the active controller
+    for _round in 0..30 {
         let mut connected_port: Option<u32> = None;
 
-        // Check SSUSB0 ports
-        if let Some(ref mac0) = ssusb0_mac {
-            let cap0 = mac0.read32(mt7988a::IPPC_OFFSET + 0x24);
-            let num_ports0 = ((cap0 >> 8) & 0xF) + (cap0 & 0xF);
-            let caplength0 = mac0.read32(0) & 0xFF;
-            let port_base0 = caplength0 as usize + 0x400;
-            for p in 0..num_ports0 {
-                if (mac0.read32(port_base0 + (p as usize * 0x10)) & 1) != 0 {
-                    found = true;
-                }
-            }
-        }
-
-        // Check SSUSB1 ports
         for p in 0..driver.xhci.max_ports() {
             if (driver.xhci.read_portsc(p) & 1) != 0 {
-                found = true;
                 connected_port = Some((p + 1) as u32);
+                break;
             }
         }
 
-        if found {
-            if let Some(port) = connected_port {
-                driver.enumerate_device(port);
-            }
+        if let Some(port) = connected_port {
+            driver.enumerate_device(port);
             break;
         }
         delay_ms(1000);

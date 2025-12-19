@@ -18,7 +18,7 @@
 //! - **BPI-R4**: SSUSB1 -> VL822 hub -> 4x USB-A
 //! - **Other board**: Same SoC, different GPIO, different port layout
 
-mod bpi_r4;
+pub mod bpi_r4;
 
 pub use bpi_r4::BpiR4;
 
