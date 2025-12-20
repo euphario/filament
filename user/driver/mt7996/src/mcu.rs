@@ -13,67 +13,18 @@
 //! ## Firmware Loading Flow
 //!
 //! 1. Reset MCU
-//! 2. Load ROM patch via DMA
-//! 3. Wait for patch ready
-//! 4. Load WM firmware via DMA chunks
-//! 5. Wait for WM ready
-//! 6. Load WA firmware
-//! 7. Wait for WA ready
+//! 2. Initialize WFDMA
+//! 3. Load ROM patch via DMA
+//! 4. Wait for patch ready
+//! 5. Load WM firmware via DMA chunks
+//! 6. Wait for WM ready
+//! 7. Load WA firmware
+//! 8. Wait for WA ready
 
 use crate::device::Mt7996Device;
+use crate::dma::{Wfdma, mcu_cmd};
 use crate::firmware::{Firmware, FirmwareError};
 use userlib::syscall;
-
-/// MCU register offsets (relative to WFDMA base)
-pub mod mcu_regs {
-    /// WFDMA0 host DMA base
-    pub const WFDMA0_BASE: u32 = 0xd4000;
-
-    /// MCU interrupt status
-    pub const MCU_INT_STATUS: u32 = 0x9010;
-
-    /// MCU interrupt enable
-    pub const MCU_INT_ENA: u32 = 0x9014;
-
-    /// MCU to host interrupt
-    pub const MCU2HOST_INT: u32 = 0xc0fc;
-
-    /// Host to MCU interrupt
-    pub const HOST2MCU_INT: u32 = 0xc0f0;
-
-    /// Firmware download ring base
-    pub const FWDL_RING_BASE: u32 = WFDMA0_BASE + 0x604;
-
-    /// Firmware download doorbell
-    pub const FWDL_DOORBELL: u32 = WFDMA0_BASE + 0x10;
-
-    /// MCU reset control
-    pub const MCU_RESET: u32 = 0x70002600;
-
-    /// Semaphore for MCU access
-    pub const SEMAPHORE: u32 = 0x70004104;
-
-    /// Patch semaphore
-    pub const PATCH_SEMAPHORE: u32 = 0x7c0241f4;
-}
-
-/// MCU command types
-#[repr(u8)]
-#[derive(Debug, Clone, Copy)]
-pub enum McuCmd {
-    /// Target address for firmware download
-    TargetAddr = 0x0,
-    /// Start firmware download
-    StartDl = 0x1,
-    /// Patch start
-    PatchStart = 0x5,
-    /// Patch finish
-    PatchFinish = 0x7,
-    /// Init command
-    Init = 0x8,
-    /// Reset command
-    Reset = 0x9,
-}
 
 /// MCU state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,9 +41,13 @@ pub enum McuState {
     Error,
 }
 
+/// Firmware chunk size for DMA transfer (4KB)
+const FW_CHUNK_SIZE: usize = 4096;
+
 /// MCU interface for MT7996
 pub struct Mcu<'a> {
     dev: &'a Mt7996Device,
+    wfdma: Wfdma<'a>,
     state: McuState,
 }
 
@@ -100,6 +55,7 @@ impl<'a> Mcu<'a> {
     /// Create new MCU interface
     pub fn new(dev: &'a Mt7996Device) -> Self {
         Self {
+            wfdma: Wfdma::new(dev),
             dev,
             state: McuState::Uninit,
         }
@@ -110,48 +66,54 @@ impl<'a> Mcu<'a> {
         self.state
     }
 
-    /// Reset the MCU
-    pub fn reset(&mut self) {
-        // Write to MCU reset register
-        self.dev.write32_raw(0x70002600 & 0xFFFF, 1);
+    /// Reset the MCU and initialize WFDMA
+    pub fn reset(&mut self) -> bool {
+        // Check current MCU state
+        let mcu_state = self.wfdma.mcu_state();
+        userlib::println!("  MCU state before reset: 0x{:08x}", mcu_state);
 
-        // Wait a bit
-        for _ in 0..10 {
-            syscall::yield_now();
+        // If already in normal state, we might need to restart
+        if (mcu_state & mcu_cmd::NORMAL_STATE) != 0 {
+            userlib::println!("  MCU already running, issuing stop");
+            self.wfdma.set_mcu_cmd(mcu_cmd::STOP_DMA);
+
+            // Wait for DMA to stop
+            for _ in 0..100 {
+                syscall::yield_now();
+            }
         }
 
-        // Clear reset
-        self.dev.write32_raw(0x70002600 & 0xFFFF, 0);
+        // Initialize WFDMA
+        if !self.wfdma.init() {
+            userlib::println!("  WFDMA init failed");
+            return false;
+        }
 
         self.state = McuState::Uninit;
+        true
     }
 
-    /// Load ROM patch firmware
+    /// Load ROM patch firmware via DMA
     pub fn load_rom_patch(&mut self, fw: &Firmware) -> Result<(), FirmwareError> {
         userlib::println!("  Loading ROM patch ({} bytes)...", fw.size);
 
-        // For now, just verify we can read the firmware
         let data = fw.data();
         if data.len() < 32 {
             return Err(FirmwareError::InvalidHeader);
         }
 
-        // Check for valid firmware magic (first 4 bytes)
-        // MT7996 firmware typically starts with specific patterns
+        // Show firmware header info
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         userlib::println!("  ROM patch magic: 0x{:08x}", magic);
 
-        // TODO: Implement actual DMA transfer sequence:
-        // 1. Set target address via MCU command
-        // 2. Transfer firmware chunks via DMA
-        // 3. Signal patch complete
-        // 4. Wait for MCU acknowledgment
+        // Transfer firmware via DMA
+        self.transfer_firmware(fw)?;
 
         self.state = McuState::Patched;
         Ok(())
     }
 
-    /// Load WM (WiFi Manager) firmware
+    /// Load WM (WiFi Manager) firmware via DMA
     pub fn load_wm(&mut self, fw: &Firmware) -> Result<(), FirmwareError> {
         if self.state != McuState::Patched {
             userlib::println!("  Warning: Loading WM without ROM patch");
@@ -167,14 +129,14 @@ impl<'a> Mcu<'a> {
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         userlib::println!("  WM magic: 0x{:08x}", magic);
 
-        // TODO: Implement actual firmware loading
-        // WM is loaded in chunks and requires handshaking
+        // Transfer firmware via DMA
+        self.transfer_firmware(fw)?;
 
         self.state = McuState::WmLoaded;
         Ok(())
     }
 
-    /// Load WA (WiFi Agent) firmware
+    /// Load WA (WiFi Agent) firmware via DMA
     pub fn load_wa(&mut self, fw: &Firmware) -> Result<(), FirmwareError> {
         if self.state != McuState::WmLoaded {
             userlib::println!("  Warning: Loading WA without WM");
@@ -190,9 +152,46 @@ impl<'a> Mcu<'a> {
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         userlib::println!("  WA magic: 0x{:08x}", magic);
 
-        // TODO: Implement actual firmware loading
+        // Transfer firmware via DMA
+        self.transfer_firmware(fw)?;
 
         self.state = McuState::Ready;
+        Ok(())
+    }
+
+    /// Transfer firmware data via DMA in chunks
+    fn transfer_firmware(&mut self, fw: &Firmware) -> Result<(), FirmwareError> {
+        let total_size = fw.size;
+        let mut offset = 0usize;
+        let mut chunks = 0u32;
+
+        while offset < total_size {
+            let remaining = total_size - offset;
+            let chunk_size = core::cmp::min(remaining, FW_CHUNK_SIZE);
+            let is_last = offset + chunk_size >= total_size;
+
+            // Calculate physical address for this chunk
+            let chunk_paddr = fw.paddr + offset as u64;
+
+            // Send chunk via DMA
+            if !self.wfdma.send_firmware_chunk(chunk_paddr, chunk_size, is_last) {
+                userlib::println!("  DMA send failed at offset {}", offset);
+                return Err(FirmwareError::DeviceError);
+            }
+
+            // Wait for DMA completion every few chunks or on last chunk
+            if chunks % 8 == 7 || is_last {
+                if !self.wfdma.wait_dma_done(100) {
+                    userlib::println!("  DMA timeout at offset {}", offset);
+                    return Err(FirmwareError::Timeout);
+                }
+            }
+
+            offset += chunk_size;
+            chunks += 1;
+        }
+
+        userlib::println!("  Transferred {} chunks ({} bytes)", chunks, total_size);
         Ok(())
     }
 
@@ -203,9 +202,12 @@ impl<'a> Mcu<'a> {
         userlib::println!();
         userlib::println!("=== Loading MT7996 Firmware ===");
 
-        // Reset MCU first
+        // Reset MCU and init WFDMA
         userlib::print!("Resetting MCU... ");
-        self.reset();
+        if !self.reset() {
+            userlib::println!("FAILED");
+            return Err(FirmwareError::DeviceError);
+        }
         userlib::println!("OK");
 
         // Load ROM patch

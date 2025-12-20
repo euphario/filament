@@ -19,7 +19,9 @@ pub mod regs;
 pub mod device;
 pub mod firmware;
 pub mod mcu;
+pub mod dma;
 
 pub use regs::ChipVariant;
 pub use device::{Mt7996Device, Mt7996Error};
 pub use firmware::{Firmware, FirmwareError};
+pub use dma::Wfdma;
