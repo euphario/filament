@@ -914,8 +914,17 @@ fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
                         new as u64
                     }
                     2 => {
-                        // SEEK_END: relative to end of file (not supported yet)
-                        return SyscallError::NotImplemented as i64;
+                        // SEEK_END: relative to end of file
+                        // Get file size based on fd type
+                        let file_size = match entry.fd_type {
+                            crate::fd::FdType::Ramfs { size, .. } => size as i64,
+                            _ => return SyscallError::NotImplemented as i64,
+                        };
+                        let new = file_size + offset;
+                        if new < 0 {
+                            return SyscallError::InvalidArgument as i64;
+                        }
+                        new as u64
                     }
                     _ => return SyscallError::InvalidArgument as i64,
                 };
