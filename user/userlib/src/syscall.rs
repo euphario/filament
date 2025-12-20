@@ -210,7 +210,13 @@ pub fn write(fd: u32, buf: &[u8]) -> isize {
 /// Open a file/resource by path
 /// Returns file descriptor, or negative error code
 pub fn open(path: &[u8], flags: u32) -> i32 {
-    syscall2(SYS_OPEN, path.as_ptr() as u64, flags as u64) as i32
+    syscall3(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags as u64) as i32
+}
+
+/// Open a file/resource by string path
+/// Returns file descriptor, or negative error code
+pub fn open_str(path: &str, flags: u32) -> i32 {
+    open(path.as_bytes(), flags)
 }
 
 /// Close a file descriptor

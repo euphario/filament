@@ -276,15 +276,6 @@ pub extern "C" fn irq_handler_rust(from_user: u64) {
     // Handle timer interrupt (PPI 30)
     if irq == 30 {
         if timer::handle_irq() {
-            // Periodic debug: print every ~5 seconds (assuming 100Hz timer)
-            static mut TICK_COUNT: u64 = 0;
-            unsafe {
-                TICK_COUNT += 1;
-                if TICK_COUNT % 500 == 0 {
-                    println!("[TIMER] tick {}, from_user={}", TICK_COUNT, from_user);
-                }
-            }
-
             // Timer tick - preempt current task (from user or kernel mode)
             // Kernel preemption is safe because we only preempt in spin loops (getc)
             unsafe {

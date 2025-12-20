@@ -3,17 +3,17 @@
 version = 4
 
 [[package]]
-name = "usb"
+name = "mt7996"
 version = "0.1.0"
 dependencies = [
+ "pcie",
  "userlib",
 ]
 
 [[package]]
-name = "usbtest"
+name = "pcie"
 version = "0.1.0"
 dependencies = [
- "usb",
  "userlib",
 ]
 

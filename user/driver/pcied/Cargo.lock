@@ -3,9 +3,17 @@
 version = 4
 
 [[package]]
-name = "usbd2"
+name = "pcie"
 version = "0.1.0"
 dependencies = [
+ "userlib",
+]
+
+[[package]]
+name = "pcied"
+version = "0.1.0"
+dependencies = [
+ "pcie",
  "userlib",
 ]
 

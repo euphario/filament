@@ -1,0 +1,167 @@
+//! PCIe Client for Device Discovery
+//!
+//! Connects to pcied to query discovered PCIe devices.
+//!
+//! # Protocol
+//!
+//! The client sends a query and receives device info:
+//! - Query: vendor_id (2), device_id (2), class_mask (3)
+//! - Response: count, then for each device: port, bdf, ids, bar0_addr, bar0_size
+
+use userlib::syscall;
+
+/// Maximum devices in a query response
+pub const MAX_DEVICES: usize = 16;
+
+/// Device info returned from pcied
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PcieDeviceInfo {
+    /// PCIe port number (0-3)
+    pub port: u8,
+    /// Bus number
+    pub bus: u8,
+    /// Device number
+    pub device: u8,
+    /// Function number
+    pub function: u8,
+    /// Vendor ID
+    pub vendor_id: u16,
+    /// Device ID
+    pub device_id: u16,
+    /// Class code (24-bit)
+    pub class_code: u32,
+    /// BAR0 physical address
+    pub bar0_addr: u64,
+    /// BAR0 size in bytes
+    pub bar0_size: u32,
+}
+
+/// PCIe client for querying devices from pcied
+pub struct PcieClient {
+    channel: u32,
+}
+
+impl PcieClient {
+    /// Connect to pcied
+    pub fn connect() -> Option<Self> {
+        let channel = syscall::port_connect(b"pcie");
+        if channel < 0 {
+            return None;
+        }
+        Some(Self { channel: channel as u32 })
+    }
+
+    /// Find devices matching the given criteria
+    ///
+    /// - vendor_id: 0xFFFF means any
+    /// - device_id: 0xFFFF means any
+    ///
+    /// Returns list of matching devices.
+    pub fn find_devices(&self, vendor_id: u16, device_id: u16) -> DeviceList {
+        let mut buf = [0u8; 128];
+
+        // Build query: cmd(1) + vendor(2) + device(2)
+        buf[0] = 0x01; // FIND_DEVICE command
+        buf[1..3].copy_from_slice(&vendor_id.to_le_bytes());
+        buf[3..5].copy_from_slice(&device_id.to_le_bytes());
+
+        // Send query
+        syscall::send(self.channel, &buf[..5]);
+
+        // Wait for response
+        let mut devices = DeviceList::new();
+
+        for _ in 0..100 {
+            let len = syscall::receive(self.channel, &mut buf);
+            if len > 0 {
+                // Parse response
+                let count = buf[0] as usize;
+                let mut offset = 1;
+
+                for _ in 0..count {
+                    if offset + 24 > len as usize {
+                        break;
+                    }
+
+                    let info = PcieDeviceInfo {
+                        port: buf[offset],
+                        bus: buf[offset + 1],
+                        device: buf[offset + 2],
+                        function: buf[offset + 3],
+                        vendor_id: u16::from_le_bytes([buf[offset + 4], buf[offset + 5]]),
+                        device_id: u16::from_le_bytes([buf[offset + 6], buf[offset + 7]]),
+                        class_code: u32::from_le_bytes([
+                            buf[offset + 8], buf[offset + 9], buf[offset + 10], 0
+                        ]),
+                        bar0_addr: u64::from_le_bytes([
+                            buf[offset + 11], buf[offset + 12], buf[offset + 13], buf[offset + 14],
+                            buf[offset + 15], buf[offset + 16], buf[offset + 17], buf[offset + 18],
+                        ]),
+                        bar0_size: u32::from_le_bytes([
+                            buf[offset + 19], buf[offset + 20], buf[offset + 21], buf[offset + 22],
+                        ]),
+                    };
+
+                    devices.push(info);
+                    offset += 23;
+                }
+
+                return devices;
+            }
+            syscall::yield_now();
+        }
+
+        devices
+    }
+
+    /// Find all MediaTek WiFi devices (MT7996 family)
+    pub fn find_mt7996_devices(&self) -> DeviceList {
+        // Query for MediaTek vendor, any device
+        self.find_devices(0x14C3, 0xFFFF)
+    }
+}
+
+impl Drop for PcieClient {
+    fn drop(&mut self) {
+        syscall::close(self.channel);
+    }
+}
+
+/// List of device info (fixed-size, no heap)
+pub struct DeviceList {
+    devices: [Option<PcieDeviceInfo>; MAX_DEVICES],
+    count: usize,
+}
+
+impl DeviceList {
+    /// Create empty list
+    pub fn new() -> Self {
+        Self {
+            devices: [None; MAX_DEVICES],
+            count: 0,
+        }
+    }
+
+    /// Add a device
+    pub fn push(&mut self, info: PcieDeviceInfo) {
+        if self.count < MAX_DEVICES {
+            self.devices[self.count] = Some(info);
+            self.count += 1;
+        }
+    }
+
+    /// Get count
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Iterate
+    pub fn iter(&self) -> impl Iterator<Item = &PcieDeviceInfo> {
+        self.devices[..self.count].iter().filter_map(|d| d.as_ref())
+    }
+}

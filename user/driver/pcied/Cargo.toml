@@ -1,11 +1,11 @@
 [package]
-name = "usbtest"
+name = "pcied"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-userlib = { path = "../userlib" }
-usb = { path = "../driver/usb" }
+userlib = { path = "../../userlib" }
+pcie = { path = "../pcie" }
 
 [profile.release]
 opt-level = "s"       # Optimize for size

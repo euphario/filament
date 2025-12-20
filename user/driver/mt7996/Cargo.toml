@@ -1,0 +1,11 @@
+[package]
+name = "mt7996"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+userlib = { path = "../../userlib" }
+pcie = { path = "../pcie" }

@@ -795,12 +795,19 @@ fn sys_read(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 
     unsafe {
         let sched = crate::task::scheduler();
-        if let Some(ref task) = sched.tasks[sched.current] {
+        if let Some(ref mut task) = sched.tasks[sched.current] {
             let caller_pid = task.id;
             if let Some(entry) = task.fd_table.get(fd) {
                 bytes_read = crate::fd::fd_read(entry, &mut kernel_buf[..buf_len], caller_pid);
             } else {
                 return SyscallError::BadFd as i64;
+            }
+
+            // Update file offset for seekable file types (like Ramfs)
+            if bytes_read > 0 {
+                if let Some(entry) = task.fd_table.get_mut(fd) {
+                    entry.offset += bytes_read as u64;
+                }
             }
         } else {
             return SyscallError::BadFd as i64;

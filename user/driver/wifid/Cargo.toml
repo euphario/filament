@@ -1,0 +1,13 @@
+[package]
+name = "wifid"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "wifid"
+path = "src/main.rs"
+
+[dependencies]
+userlib = { path = "../../userlib" }
+pcie = { path = "../pcie" }
+mt7996 = { path = "../mt7996" }

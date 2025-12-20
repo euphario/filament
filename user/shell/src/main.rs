@@ -182,12 +182,10 @@ fn execute_command(cmd: &[u8]) {
         cmd_run_program("bin/gpio");
     } else if cmd_eq(cmd, b"fatfs") {
         cmd_run_program("bin/fatfs");
-    } else if cmd_eq(cmd, b"usbd2") {
-        cmd_run_program("bin/usbd2");
-    } else if cmd_eq(cmd, b"fatfs2") {
-        cmd_run_program("bin/fatfs2");
-    } else if cmd_eq(cmd, b"ringtest") {
-        cmd_ringtest();
+    } else if cmd_eq(cmd, b"pcied") {
+        cmd_run_program("bin/pcied");
+    } else if cmd_eq(cmd, b"wifi") {
+        cmd_run_program("bin/wifid");
     } else if cmd_eq(cmd, b"ps") {
         cmd_ps();
     } else if cmd_starts_with(cmd, b"kill ") {
@@ -220,9 +218,8 @@ fn cmd_help() {
     println!("  usb           - Run USB userspace driver");
     println!("  gpio          - Run GPIO control utility");
     println!("  fatfs         - Run FAT filesystem driver");
-    println!("  usbd2         - Run ring buffer block server");
-    println!("  fatfs2        - Run ring buffer block client");
-    println!("  ringtest      - Test ring buffer (usbd2 + fatfs2)");
+    println!("  pcied         - Start PCIe daemon (background)");
+    println!("  wifi          - Run WiFi driver (MT7996)");
     println!("  yield         - Yield CPU to other processes");
     println!("  panic         - Trigger a panic (test)");
     println!("  ps            - Show running processes");
@@ -379,57 +376,17 @@ fn cmd_run_program(path: &str) {
     }
 }
 
-/// Run ring buffer test (usbd2 server + fatfs2 client)
-fn cmd_ringtest() {
-    println!("=== Ring Buffer Test ===");
-    println!("Starting usbd2 (block server)...");
+/// Run a program in the background (don't wait for completion)
+fn cmd_run_program_bg(path: &str) {
+    println!("Starting {} in background...", path);
+    let result = syscall::exec(path);
 
-    // Start usbd2 in background
-    let server_result = syscall::exec("bin/usbd2");
-    if server_result < 0 {
-        println!("Failed to start usbd2: {}", server_result);
-        return;
+    if result >= 0 {
+        let pid = result as u32;
+        println!("[{}] Started background daemon PID {}", track_bg_job(pid), pid);
+    } else {
+        println!("exec failed: {}", result);
     }
-    let server_pid = server_result as u32;
-    println!("usbd2 started with PID {}", server_pid);
-
-    // Give server time to register port
-    println!("Waiting for server to initialize...");
-    for _ in 0..50 {
-        syscall::yield_now();
-    }
-
-    // Run fatfs2 client
-    println!("Starting fatfs2 (block client)...");
-    let client_result = syscall::exec("bin/fatfs2");
-    if client_result < 0 {
-        println!("Failed to start fatfs2: {}", client_result);
-        // Kill the server
-        syscall::kill(server_pid);
-        return;
-    }
-    let client_pid = client_result as u32;
-    println!("fatfs2 started with PID {}", client_pid);
-
-    // Wait for client to complete
-    loop {
-        let wait_result = syscall::wait(client_pid as i32);
-        if wait_result >= 0 {
-            let exit_code = (wait_result & 0xFF) as i32;
-            println!("fatfs2 exited with code {}", exit_code);
-            break;
-        } else if wait_result == -11 {
-            continue;
-        } else {
-            println!("wait failed: {}", wait_result);
-            break;
-        }
-    }
-
-    // Kill the server (it loops forever)
-    println!("Stopping usbd2...");
-    syscall::kill(server_pid);
-    println!("=== Ring Buffer Test Complete ===");
 }
 
 /// Parse decimal number from byte slice

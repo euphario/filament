@@ -34,6 +34,22 @@ for elf in bin/*.elf; do
     fi
 done
 
+# Copy firmware files if present
+FIRMWARE_DIR="$SCRIPT_DIR/../firmware/mediatek/mt7996"
+if [ -d "$FIRMWARE_DIR" ]; then
+    echo ""
+    echo "Staging firmware files..."
+    mkdir -p "$STAGING/lib/firmware/mediatek/mt7996"
+    for fw in "$FIRMWARE_DIR"/*.bin; do
+        if [ -f "$fw" ]; then
+            name=$(basename "$fw")
+            cp "$fw" "$STAGING/lib/firmware/mediatek/mt7996/$name"
+            size=$(ls -lh "$fw" | awk '{print $5}')
+            echo "  lib/firmware/mediatek/mt7996/$name ($size)"
+        fi
+    done
+fi
+
 # Create the TAR archive (POSIX format for compatibility)
 echo ""
 echo "Creating TAR archive..."

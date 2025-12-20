@@ -65,6 +65,11 @@ pub enum FdType {
         phys_addr: u64,    // Physical address of device
         num_pages: usize,  // Number of pages mapped
     },
+    /// Ramfs file (from initrd)
+    Ramfs {
+        entry_idx: usize,  // Index into ramfs entries
+        size: usize,       // File size (cached for convenience)
+    },
 }
 
 /// A file descriptor entry
@@ -351,6 +356,30 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                 -22 // EINVAL
             }
         }
+        FdType::Ramfs { entry_idx, size } => {
+            // Read from ramfs file
+            let offset = entry.offset as usize;
+            if offset >= size {
+                return 0; // EOF
+            }
+
+            // Get the ramfs entry
+            if let Some(ramfs_entry) = crate::ramfs::ramfs().get(entry_idx) {
+                let data = ramfs_entry.data_slice();
+                let remaining = size - offset;
+                let to_read = core::cmp::min(buf.len(), remaining);
+
+                if to_read > 0 && offset < data.len() {
+                    let actual_read = core::cmp::min(to_read, data.len() - offset);
+                    buf[..actual_read].copy_from_slice(&data[offset..offset + actual_read]);
+                    actual_read as isize
+                } else {
+                    0 // EOF
+                }
+            } else {
+                -5 // EIO - entry not found
+            }
+        }
     }
 }
 
@@ -420,6 +449,10 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
             // MMIO FDs don't support write() - access memory directly
             -22 // EINVAL
         }
+        FdType::Ramfs { .. } => {
+            // Ramfs is read-only
+            -30 // EROFS (read-only file system)
+        }
     }
 }
 
@@ -435,7 +468,7 @@ pub mod open_flags {
 }
 
 /// Open a file by path
-/// For now, only supports special paths: "null:", "console:"
+/// Supports special paths ("null:", "console:") and ramfs files
 pub fn open_path(path: &[u8], flags: u32) -> Option<FdEntry> {
     // Parse access mode
     let access = flags & 0x3;
@@ -465,7 +498,34 @@ pub fn open_path(path: &[u8], flags: u32) -> Option<FdEntry> {
             offset: 0,
         })
     } else {
-        // Unknown path - will be handled by scheme system later
+        // Try to find file in ramfs
+        let path_str = core::str::from_utf8(path).ok()?;
+
+        // Strip leading "/" for ramfs lookup
+        let lookup_path = path_str.trim_start_matches('/');
+
+        // Search through ramfs entries to find matching file
+        let ramfs = crate::ramfs::ramfs();
+        for idx in 0..ramfs.len() {
+            if let Some(entry) = ramfs.get(idx) {
+                let entry_name = entry.name_str();
+                // Strip leading "./" from tar entries
+                let entry_clean = entry_name.trim_start_matches("./");
+
+                if entry_clean == lookup_path && entry.is_file() {
+                    return Some(FdEntry {
+                        fd_type: FdType::Ramfs {
+                            entry_idx: idx,
+                            size: entry.size,
+                        },
+                        flags: FdFlags::read_only(), // ramfs is read-only
+                        offset: 0,
+                    });
+                }
+            }
+        }
+
+        // Not found
         None
     }
 }
