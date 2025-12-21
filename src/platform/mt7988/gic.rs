@@ -324,15 +324,15 @@ pub fn debug_irq(irq: u32) {
         let irouter_lo = gic.gicd_read(irouter_offset);
         let irouter_hi = gic.gicd_read(irouter_offset + 4);
 
-        crate::println!("[GIC] IRQ {} state:", irq);
-        crate::println!("  Enabled: {}", enabled);
-        crate::println!("  Pending: {}", pending);
-        crate::println!("  Group:   {} (1=NS)", group);
-        crate::println!("  IROUTER: 0x{:08x}_{:08x}", irouter_hi, irouter_lo);
+        crate::logln!("[GIC] IRQ {} state:", irq);
+        crate::logln!("  Enabled: {}", enabled);
+        crate::logln!("  Pending: {}", pending);
+        crate::logln!("  Group:   {} (1=NS)", group);
+        crate::logln!("  IROUTER: 0x{:08x}_{:08x}", irouter_hi, irouter_lo);
 
         // Read GICD_CTLR
         let ctlr = gic.gicd_read(gicd::CTLR);
-        crate::println!("  GICD_CTLR: 0x{:08x}", ctlr);
+        crate::logln!("  GICD_CTLR: 0x{:08x}", ctlr);
     }
 }
 

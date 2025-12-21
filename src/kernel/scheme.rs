@@ -12,7 +12,7 @@
 //! - `console:` - serial console I/O
 
 use super::fd::{FdEntry, FdFlags, FdType};
-use crate::println;
+use crate::logln;
 
 /// Maximum number of registered schemes
 pub const MAX_SCHEMES: usize = 32;
@@ -1338,28 +1338,28 @@ pub fn init() {
         reg.register_kernel("mmio");     // ID 6
         reg.register_kernel("i2c");      // ID 7
     }
-    println!("  Registered kernel schemes: memory, time, irq, null, zero, console, mmio, i2c");
+    logln!("  Registered kernel schemes: memory, time, irq, null, zero, console, mmio, i2c");
 }
 
 /// Test scheme system
 pub fn test() {
-    println!("  Testing scheme system...");
+    logln!("  Testing scheme system...");
 
     // Test URL parsing
     let url = b"memory:info";
     if let Some((scheme, path)) = parse_url(url) {
-        println!("    Parsed 'memory:info' -> scheme='{}', path='{}'", scheme, path);
+        logln!("    Parsed 'memory:info' -> scheme='{}', path='{}'", scheme, path);
     }
 
     // Test memory scheme
     if let Some(scheme) = get_kernel_scheme("memory") {
-        println!("    Found memory scheme");
+        logln!("    Found memory scheme");
         if let Ok(handle) = scheme.open(b"info", 0) {
-            println!("    Opened memory:info, handle={}", handle.handle);
+            logln!("    Opened memory:info, handle={}", handle.handle);
             let mut buf = [0u8; 64];
             if let Ok(n) = scheme.read(&handle, &mut buf) {
                 let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
-                println!("    Read {} bytes: {}", n, s.trim());
+                logln!("    Read {} bytes: {}", n, s.trim());
             }
         }
     }
@@ -1370,18 +1370,18 @@ pub fn test() {
             let mut buf = [0u8; 8];
             if let Ok(_) = scheme.read(&handle, &mut buf) {
                 let ns = u64::from_le_bytes(buf);
-                println!("    time:now = {} ns", ns);
+                logln!("    time:now = {} ns", ns);
             }
         }
     }
 
     // List registered schemes
-    println!("    Registered schemes:");
+    logln!("    Registered schemes:");
     unsafe {
         for entry in registry().list() {
-            println!("      {}: ({:?})", entry.name_str(), entry.scheme_type);
+            logln!("      {}: ({:?})", entry.name_str(), entry.scheme_type);
         }
     }
 
-    println!("    [OK] Scheme system test passed");
+    logln!("    [OK] Scheme system test passed");
 }

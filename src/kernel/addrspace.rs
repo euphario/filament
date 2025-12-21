@@ -5,7 +5,7 @@
 
 use crate::arch::aarch64::mmu::{self, PageTable, PAGE_SIZE, flags, attr};
 use super::pmm;
-use crate::println;
+use crate::logln;
 
 /// Kernel virtual address base for accessing physical memory via TTBR1
 const KERNEL_VIRT_BASE: u64 = 0xFFFF_0000_0000_0000;
@@ -521,32 +521,32 @@ impl Drop for AddressSpace {
 
 /// Test the address space manager
 pub fn test() {
-    println!("  Testing address space creation...");
+    logln!("  Testing address space creation...");
 
     if let Some(mut addr_space) = AddressSpace::new() {
-        println!("    Created address space, TTBR0: 0x{:016x}", addr_space.ttbr0);
+        logln!("    Created address space, TTBR0: 0x{:016x}", addr_space.ttbr0);
 
         // Allocate a physical page for user code
         if let Some(user_page) = pmm::alloc_page() {
-            println!("    Allocated user page at 0x{:08x}", user_page);
+            logln!("    Allocated user page at 0x{:08x}", user_page);
 
             // Map it into the address space at a user address
             let user_virt = 0x4000_0000u64;  // 1GB mark
             if addr_space.map_page(user_virt, user_page as u64, true, true) {
-                println!("    Mapped 0x{:08x} -> 0x{:016x}", user_page, user_virt);
-                println!("    [OK] Address space test passed");
+                logln!("    Mapped 0x{:08x} -> 0x{:016x}", user_page, user_virt);
+                logln!("    [OK] Address space test passed");
             } else {
-                println!("    [!!] Failed to map page");
+                logln!("    [!!] Failed to map page");
             }
 
             pmm::free_page(user_page);
         } else {
-            println!("    [!!] Failed to allocate user page");
+            logln!("    [!!] Failed to allocate user page");
         }
 
         // addr_space will be dropped here, freeing page tables
-        println!("    Address space cleaned up");
+        logln!("    Address space cleaned up");
     } else {
-        println!("    [!!] Failed to create address space");
+        logln!("    [!!] Failed to create address space");
     }
 }

@@ -3,12 +3,12 @@
 //! Provides low-level I2C bus access for the MediaTek MT7988A SoC.
 //! Uses polling mode (no DMA) for simplicity.
 
-use crate::mmu::KERNEL_VIRT_BASE;
+use crate::arch::aarch64::mmio::MmioRegion;
 
 /// MT7988A I2C controller base addresses
-const I2C0_BASE: u64 = 0x11003000;
-const I2C1_BASE: u64 = 0x11004000;
-const I2C2_BASE: u64 = 0x11005000;
+const I2C0_BASE: usize = 0x11003000;
+const I2C1_BASE: usize = 0x11004000;
+const I2C2_BASE: usize = 0x11005000;
 
 /// MT7988A I2C register offsets (v3 layout)
 mod regs {
@@ -51,13 +51,13 @@ mod intr {
 
 /// I2C controller instance
 pub struct I2cController {
-    base: u64,  // Kernel virtual address
+    mmio: MmioRegion,
 }
 
 impl I2cController {
     /// Create controller for specified bus
     pub fn new(bus: u32) -> Option<Self> {
-        let phys_base = match bus {
+        let base = match bus {
             0 => I2C0_BASE,
             1 => I2C1_BASE,
             2 => I2C2_BASE,
@@ -65,32 +65,14 @@ impl I2cController {
         };
 
         Some(Self {
-            base: KERNEL_VIRT_BASE | phys_base,
+            mmio: MmioRegion::new(base),
         })
-    }
-
-    /// Read register
-    #[inline(always)]
-    fn read32(&self, offset: usize) -> u32 {
-        unsafe {
-            let ptr = (self.base + offset as u64) as *const u32;
-            core::ptr::read_volatile(ptr)
-        }
-    }
-
-    /// Write register
-    #[inline(always)]
-    fn write32(&self, offset: usize, value: u32) {
-        unsafe {
-            let ptr = (self.base + offset as u64) as *mut u32;
-            core::ptr::write_volatile(ptr, value);
-        }
     }
 
     /// Initialize the I2C controller
     pub fn init(&self) {
         // Soft reset
-        self.write32(regs::SOFTRESET, 1);
+        self.mmio.write32(regs::SOFTRESET, 1);
 
         // Small delay
         for _ in 0..1000 {
@@ -98,37 +80,37 @@ impl I2cController {
         }
 
         // Clear soft reset
-        self.write32(regs::SOFTRESET, 0);
+        self.mmio.write32(regs::SOFTRESET, 0);
 
         // Configure timing for ~100kHz (assuming 26MHz clock)
         // TIMING register: [15:8] = high time, [7:0] = low time
         // For 100kHz with 26MHz source: period = 260 clocks, half = 130
-        self.write32(regs::TIMING, (130 << 8) | 130);
+        self.mmio.write32(regs::TIMING, (130 << 8) | 130);
 
         // Configure IO - use open drain mode
-        self.write32(regs::IO_CONFIG, 0x3);  // SDA and SCL open drain
+        self.mmio.write32(regs::IO_CONFIG, 0x3);  // SDA and SCL open drain
 
         // Clear interrupts
-        self.write32(regs::INTR_STAT, 0xFFFF);
+        self.mmio.write32(regs::INTR_STAT, 0xFFFF);
 
         // Disable all interrupts (we'll poll)
-        self.write32(regs::INTR_MASK, 0);
+        self.mmio.write32(regs::INTR_MASK, 0);
     }
 
     /// Wait for transaction complete or error
     fn wait_complete(&self) -> Result<(), i32> {
         for _ in 0..100000 {
-            let stat = self.read32(regs::INTR_STAT);
+            let stat = self.mmio.read32(regs::INTR_STAT);
 
             if (stat & intr::ACKERR) != 0 {
                 // Clear and return error
-                self.write32(regs::INTR_STAT, intr::ACKERR);
+                self.mmio.write32(regs::INTR_STAT, intr::ACKERR);
                 return Err(-5);  // EIO
             }
 
             if (stat & intr::TRANSAC_COMP) != 0 {
                 // Clear and return success
-                self.write32(regs::INTR_STAT, intr::TRANSAC_COMP);
+                self.mmio.write32(regs::INTR_STAT, intr::TRANSAC_COMP);
                 return Ok(());
             }
 
@@ -148,30 +130,30 @@ impl I2cController {
         }
 
         // Clear FIFO
-        self.write32(regs::FIFO_ADDR_CLR, 1);
+        self.mmio.write32(regs::FIFO_ADDR_CLR, 1);
 
         // Set slave address (write mode = address << 1)
-        self.write32(regs::SLAVE_ADDR, (addr as u32) << 1);
+        self.mmio.write32(regs::SLAVE_ADDR, (addr as u32) << 1);
 
         // Set transfer length
-        self.write32(regs::TRANSFER_LEN, data.len() as u32);
+        self.mmio.write32(regs::TRANSFER_LEN, data.len() as u32);
 
         // Set transaction length (1 message)
-        self.write32(regs::TRANSAC_LEN, 1);
+        self.mmio.write32(regs::TRANSAC_LEN, 1);
 
         // Control: enable ACK error detection, no DMA
-        self.write32(regs::CONTROL, ctrl::ACKERR_DET_EN);
+        self.mmio.write32(regs::CONTROL, ctrl::ACKERR_DET_EN);
 
         // Write data to FIFO
         for &byte in data {
-            self.write32(regs::DATA_PORT, byte as u32);
+            self.mmio.write32(regs::DATA_PORT, byte as u32);
         }
 
         // Clear any pending interrupts
-        self.write32(regs::INTR_STAT, 0xFFFF);
+        self.mmio.write32(regs::INTR_STAT, 0xFFFF);
 
         // Start transfer
-        self.write32(regs::START, 1);
+        self.mmio.write32(regs::START, 1);
 
         // Wait for completion
         self.wait_complete()
@@ -184,32 +166,32 @@ impl I2cController {
         }
 
         // Clear FIFO
-        self.write32(regs::FIFO_ADDR_CLR, 1);
+        self.mmio.write32(regs::FIFO_ADDR_CLR, 1);
 
         // Set slave address (read mode = (address << 1) | 1)
-        self.write32(regs::SLAVE_ADDR, ((addr as u32) << 1) | 1);
+        self.mmio.write32(regs::SLAVE_ADDR, ((addr as u32) << 1) | 1);
 
         // Set transfer length
-        self.write32(regs::TRANSFER_LEN, data.len() as u32);
+        self.mmio.write32(regs::TRANSFER_LEN, data.len() as u32);
 
         // Set transaction length (1 message)
-        self.write32(regs::TRANSAC_LEN, 1);
+        self.mmio.write32(regs::TRANSAC_LEN, 1);
 
         // Control: enable ACK error detection, no DMA
-        self.write32(regs::CONTROL, ctrl::ACKERR_DET_EN);
+        self.mmio.write32(regs::CONTROL, ctrl::ACKERR_DET_EN);
 
         // Clear any pending interrupts
-        self.write32(regs::INTR_STAT, 0xFFFF);
+        self.mmio.write32(regs::INTR_STAT, 0xFFFF);
 
         // Start transfer
-        self.write32(regs::START, 1);
+        self.mmio.write32(regs::START, 1);
 
         // Wait for completion
         self.wait_complete()?;
 
         // Read data from FIFO
         for byte in data.iter_mut() {
-            *byte = self.read32(regs::DATA_PORT) as u8;
+            *byte = self.mmio.read32(regs::DATA_PORT) as u8;
         }
 
         Ok(())
@@ -225,37 +207,37 @@ impl I2cController {
         }
 
         // Clear FIFO
-        self.write32(regs::FIFO_ADDR_CLR, 1);
+        self.mmio.write32(regs::FIFO_ADDR_CLR, 1);
 
         // Set slave address (write first)
-        self.write32(regs::SLAVE_ADDR, (addr as u32) << 1);
+        self.mmio.write32(regs::SLAVE_ADDR, (addr as u32) << 1);
 
         // Set transfer lengths for write phase
-        self.write32(regs::TRANSFER_LEN, write_data.len() as u32);
+        self.mmio.write32(regs::TRANSFER_LEN, write_data.len() as u32);
 
         // For write-then-read, we need 2 transactions with repeated start
-        self.write32(regs::TRANSAC_LEN, 2);
+        self.mmio.write32(regs::TRANSAC_LEN, 2);
 
         // Control: repeated start, direction change, ACK error detection
-        self.write32(regs::CONTROL, ctrl::RS | ctrl::DIR_CHANGE | ctrl::ACKERR_DET_EN | ctrl::TRANSFER_LEN_CHANGE);
+        self.mmio.write32(regs::CONTROL, ctrl::RS | ctrl::DIR_CHANGE | ctrl::ACKERR_DET_EN | ctrl::TRANSFER_LEN_CHANGE);
 
         // Write data to FIFO
         for &byte in write_data {
-            self.write32(regs::DATA_PORT, byte as u32);
+            self.mmio.write32(regs::DATA_PORT, byte as u32);
         }
 
         // Clear any pending interrupts
-        self.write32(regs::INTR_STAT, 0xFFFF);
+        self.mmio.write32(regs::INTR_STAT, 0xFFFF);
 
         // Start transfer
-        self.write32(regs::START, 1);
+        self.mmio.write32(regs::START, 1);
 
         // Wait for completion
         self.wait_complete()?;
 
         // Read data from FIFO
         for byte in read_data.iter_mut() {
-            *byte = self.read32(regs::DATA_PORT) as u8;
+            *byte = self.mmio.read32(regs::DATA_PORT) as u8;
         }
 
         Ok(())

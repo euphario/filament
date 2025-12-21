@@ -14,7 +14,7 @@
 //! [20:12] - L3 index (9 bits, 512 entries)
 //! [11:0]  - Page offset (12 bits, 4KB)
 
-use crate::println;
+use crate::logln;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -322,7 +322,7 @@ pub fn is_enabled() -> bool {
 
 /// Print MMU info
 pub fn print_info() {
-    println!("  TTBR0_EL1: 0x{:016x} (user/identity)", ttbr0());
-    println!("  TTBR1_EL1: 0x{:016x} (kernel)", ttbr1());
-    println!("  MMU:       {}", if is_enabled() { "enabled" } else { "disabled" });
+    logln!("  TTBR0_EL1: 0x{:016x} (user/identity)", ttbr0());
+    logln!("  TTBR1_EL1: 0x{:016x} (kernel)", ttbr1());
+    logln!("  MMU:       {}", if is_enabled() { "enabled" } else { "disabled" });
 }

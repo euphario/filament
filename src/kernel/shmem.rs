@@ -20,7 +20,7 @@
 
 use super::pmm;
 use super::process::Pid;
-use crate::println;
+use crate::logln;
 
 /// Maximum number of shared memory regions
 const MAX_SHMEM_REGIONS: usize = 32;
@@ -141,7 +141,7 @@ pub fn init() {
         }
         NEXT_SHMEM_ID = 1;
     }
-    println!("[shmem] Initialized ({} max regions)", MAX_SHMEM_REGIONS);
+    logln!("[shmem] Initialized ({} max regions)", MAX_SHMEM_REGIONS);
 }
 
 /// Create a new shared memory region

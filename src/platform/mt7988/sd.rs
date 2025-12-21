@@ -3,8 +3,8 @@
 //! Basic SD/eMMC driver for MediaTek MT7988's MSDC controller.
 //! Supports basic block read/write operations.
 
-use core::ptr::{read_volatile, write_volatile};
-use crate::println;
+use crate::arch::aarch64::mmio::MmioRegion;
+use crate::logln;
 
 /// Block size (always 512 for SD/eMMC)
 pub const BLOCK_SIZE: usize = 512;
@@ -106,8 +106,8 @@ pub enum CardType {
 
 /// SD driver state
 pub struct SdDriver {
-    /// Base address (MSDC0 or MSDC1)
-    base: usize,
+    /// MMIO region for this controller
+    mmio: MmioRegion,
     /// Card type detected
     card_type: CardType,
     /// Relative Card Address
@@ -121,7 +121,7 @@ pub struct SdDriver {
 impl SdDriver {
     pub const fn new(base: usize) -> Self {
         Self {
-            base,
+            mmio: MmioRegion::new(base),
             card_type: CardType::Unknown,
             rca: 0,
             capacity: 0,
@@ -129,32 +129,20 @@ impl SdDriver {
         }
     }
 
-    /// Read a register
-    #[inline]
-    unsafe fn read_reg(&self, offset: usize) -> u32 {
-        read_volatile((self.base + offset) as *const u32)
-    }
-
-    /// Write a register
-    #[inline]
-    unsafe fn write_reg(&self, offset: usize, val: u32) {
-        write_volatile((self.base + offset) as *mut u32, val);
-    }
-
     /// Wait for command to complete
-    unsafe fn wait_cmd_done(&self) -> Result<(), &'static str> {
+    fn wait_cmd_done(&self) -> Result<(), &'static str> {
         for _ in 0..100000 {
-            let int_status = self.read_reg(regs::MSDC_INT);
+            let int_status = self.mmio.read32(regs::MSDC_INT);
             if int_status & regs::MSDC_INT_CMDRDY != 0 {
-                self.write_reg(regs::MSDC_INT, regs::MSDC_INT_CMDRDY);
+                self.mmio.write32(regs::MSDC_INT, regs::MSDC_INT_CMDRDY);
                 return Ok(());
             }
             if int_status & regs::MSDC_INT_CMDTMO != 0 {
-                self.write_reg(regs::MSDC_INT, regs::MSDC_INT_CMDTMO);
+                self.mmio.write32(regs::MSDC_INT, regs::MSDC_INT_CMDTMO);
                 return Err("Command timeout");
             }
             if int_status & regs::MSDC_INT_RSPCRCERR != 0 {
-                self.write_reg(regs::MSDC_INT, regs::MSDC_INT_RSPCRCERR);
+                self.mmio.write32(regs::MSDC_INT, regs::MSDC_INT_RSPCRCERR);
                 return Err("Response CRC error");
             }
             core::hint::spin_loop();
@@ -163,19 +151,19 @@ impl SdDriver {
     }
 
     /// Wait for data transfer to complete
-    unsafe fn wait_data_done(&self) -> Result<(), &'static str> {
+    fn wait_data_done(&self) -> Result<(), &'static str> {
         for _ in 0..1000000 {
-            let int_status = self.read_reg(regs::MSDC_INT);
+            let int_status = self.mmio.read32(regs::MSDC_INT);
             if int_status & regs::MSDC_INT_XFER_COMPL != 0 {
-                self.write_reg(regs::MSDC_INT, regs::MSDC_INT_XFER_COMPL);
+                self.mmio.write32(regs::MSDC_INT, regs::MSDC_INT_XFER_COMPL);
                 return Ok(());
             }
             if int_status & regs::MSDC_INT_DATTMO != 0 {
-                self.write_reg(regs::MSDC_INT, regs::MSDC_INT_DATTMO);
+                self.mmio.write32(regs::MSDC_INT, regs::MSDC_INT_DATTMO);
                 return Err("Data timeout");
             }
             if int_status & regs::MSDC_INT_DATCRCERR != 0 {
-                self.write_reg(regs::MSDC_INT, regs::MSDC_INT_DATCRCERR);
+                self.mmio.write32(regs::MSDC_INT, regs::MSDC_INT_DATCRCERR);
                 return Err("Data CRC error");
             }
             core::hint::spin_loop();
@@ -184,73 +172,71 @@ impl SdDriver {
     }
 
     /// Send a command
-    unsafe fn send_cmd(&self, cmd_idx: u32, arg: u32, resp_type: u32) -> Result<u32, &'static str> {
+    fn send_cmd(&self, cmd_idx: u32, arg: u32, resp_type: u32) -> Result<u32, &'static str> {
         // Wait for controller ready
-        while self.read_reg(regs::SDC_STS) & (regs::SDC_STS_CMDBUSY | regs::SDC_STS_SDCBUSY) != 0 {
+        while self.mmio.read32(regs::SDC_STS) & (regs::SDC_STS_CMDBUSY | regs::SDC_STS_SDCBUSY) != 0 {
             core::hint::spin_loop();
         }
 
         // Clear interrupts
-        self.write_reg(regs::MSDC_INT, 0xFFFFFFFF);
+        self.mmio.write32(regs::MSDC_INT, 0xFFFFFFFF);
 
         // Set argument
-        self.write_reg(regs::SDC_ARG, arg);
+        self.mmio.write32(regs::SDC_ARG, arg);
 
         // Send command
         let cmd_val = cmd_idx | resp_type;
-        self.write_reg(regs::SDC_CMD, cmd_val);
+        self.mmio.write32(regs::SDC_CMD, cmd_val);
 
         // Wait for completion
         self.wait_cmd_done()?;
 
         // Return response
-        Ok(self.read_reg(regs::SDC_RESP0))
+        Ok(self.mmio.read32(regs::SDC_RESP0))
     }
 
     /// Send application command (preceded by CMD55)
-    unsafe fn send_acmd(&self, cmd_idx: u32, arg: u32, resp_type: u32) -> Result<u32, &'static str> {
+    fn send_acmd(&self, cmd_idx: u32, arg: u32, resp_type: u32) -> Result<u32, &'static str> {
         self.send_cmd(cmd::APP_CMD, self.rca << 16, regs::SDC_CMD_RSPTYP_R1)?;
         self.send_cmd(cmd_idx, arg, resp_type)
     }
 
     /// Initialize the SD controller and card
     pub fn init(&mut self) -> Result<(), &'static str> {
-        println!("    Initializing SD/MMC controller...");
+        logln!("    Initializing SD/MMC controller...");
 
-        unsafe {
-            // Reset controller
-            let cfg = self.read_reg(regs::MSDC_CFG);
-            self.write_reg(regs::MSDC_CFG, cfg | regs::MSDC_CFG_RST);
-            for _ in 0..10000 {
-                core::hint::spin_loop();
-            }
-            self.write_reg(regs::MSDC_CFG, cfg & !regs::MSDC_CFG_RST);
+        // Reset controller
+        let cfg = self.mmio.read32(regs::MSDC_CFG);
+        self.mmio.write32(regs::MSDC_CFG, cfg | regs::MSDC_CFG_RST);
+        for _ in 0..10000 {
+            core::hint::spin_loop();
+        }
+        self.mmio.write32(regs::MSDC_CFG, cfg & !regs::MSDC_CFG_RST);
 
-            // Enable card detect
-            let ps = self.read_reg(regs::MSDC_PS);
-            self.write_reg(regs::MSDC_PS, ps | regs::MSDC_PS_CDEN);
+        // Enable card detect
+        let ps = self.mmio.read32(regs::MSDC_PS);
+        self.mmio.write32(regs::MSDC_PS, ps | regs::MSDC_PS_CDEN);
 
-            // Check card presence
-            let ps = self.read_reg(regs::MSDC_PS);
-            if ps & regs::MSDC_PS_CDSTS != 0 {
-                println!("    No card detected");
-                return Err("No card");
-            }
-
-            // Initialize card
-            self.init_card()?;
+        // Check card presence
+        let ps = self.mmio.read32(regs::MSDC_PS);
+        if ps & regs::MSDC_PS_CDSTS != 0 {
+            logln!("    No card detected");
+            return Err("No card");
         }
 
+        // Initialize card
+        self.init_card()?;
+
         self.initialized = true;
-        println!("    [OK] SD card initialized");
-        println!("    Type: {:?}", self.card_type);
-        println!("    Capacity: {} MB", self.capacity * BLOCK_SIZE as u64 / (1024 * 1024));
+        logln!("    [OK] SD card initialized");
+        logln!("    Type: {:?}", self.card_type);
+        logln!("    Capacity: {} MB", self.capacity * BLOCK_SIZE as u64 / (1024 * 1024));
 
         Ok(())
     }
 
     /// Initialize the card (SD protocol)
-    unsafe fn init_card(&mut self) -> Result<(), &'static str> {
+    fn init_card(&mut self) -> Result<(), &'static str> {
         // GO_IDLE_STATE (CMD0)
         self.send_cmd(cmd::GO_IDLE_STATE, 0, regs::SDC_CMD_RSPTYP_NONE)?;
 
@@ -316,7 +302,7 @@ impl SdDriver {
     }
 
     /// Initialize as MMC/eMMC card
-    unsafe fn init_mmc(&mut self) -> Result<(), &'static str> {
+    fn init_mmc(&mut self) -> Result<(), &'static str> {
         // SEND_OP_COND (CMD1) for MMC
         for _ in 0..1000 {
             match self.send_cmd(cmd::SEND_OP_COND, 0x40FF8000, regs::SDC_CMD_RSPTYP_R3) {
@@ -360,45 +346,43 @@ impl SdDriver {
             (lba * BLOCK_SIZE as u64) as u32
         };
 
-        unsafe {
-            // Set block count
-            self.write_reg(regs::SDC_BLK_NUM, num_blocks as u32);
+        // Set block count
+        self.mmio.write32(regs::SDC_BLK_NUM, num_blocks as u32);
 
-            // Send read command
-            let cmd = if num_blocks == 1 {
-                cmd::READ_SINGLE_BLOCK
-            } else {
-                cmd::READ_MULTIPLE_BLOCK
-            };
+        // Send read command
+        let cmd = if num_blocks == 1 {
+            cmd::READ_SINGLE_BLOCK
+        } else {
+            cmd::READ_MULTIPLE_BLOCK
+        };
 
-            let cmd_val = cmd | regs::SDC_CMD_RSPTYP_R1 |
-                if num_blocks == 1 { regs::SDC_CMD_DTYPE_SINGLE } else { regs::SDC_CMD_DTYPE_MULTI };
+        let cmd_val = cmd | regs::SDC_CMD_RSPTYP_R1 |
+            if num_blocks == 1 { regs::SDC_CMD_DTYPE_SINGLE } else { regs::SDC_CMD_DTYPE_MULTI };
 
-            self.write_reg(regs::SDC_ARG, addr);
-            self.write_reg(regs::SDC_CMD, cmd_val);
+        self.mmio.write32(regs::SDC_ARG, addr);
+        self.mmio.write32(regs::SDC_CMD, cmd_val);
 
-            self.wait_cmd_done()?;
+        self.wait_cmd_done()?;
 
-            // Read data from FIFO
-            for block in 0..num_blocks {
-                for word in 0..(BLOCK_SIZE / 4) {
-                    // Wait for FIFO data
-                    while self.read_reg(regs::MSDC_FIFOCS) & 0xFF == 0 {
-                        core::hint::spin_loop();
-                    }
-
-                    let data = self.read_reg(regs::MSDC_RXDATA);
-                    let offset = block * BLOCK_SIZE + word * 4;
-                    buf[offset..offset + 4].copy_from_slice(&data.to_le_bytes());
+        // Read data from FIFO
+        for block in 0..num_blocks {
+            for word in 0..(BLOCK_SIZE / 4) {
+                // Wait for FIFO data
+                while self.mmio.read32(regs::MSDC_FIFOCS) & 0xFF == 0 {
+                    core::hint::spin_loop();
                 }
-            }
 
-            self.wait_data_done()?;
-
-            // Stop transmission for multi-block
-            if num_blocks > 1 {
-                self.send_cmd(cmd::STOP_TRANSMISSION, 0, regs::SDC_CMD_RSPTYP_R1B)?;
+                let data = self.mmio.read32(regs::MSDC_RXDATA);
+                let offset = block * BLOCK_SIZE + word * 4;
+                buf[offset..offset + 4].copy_from_slice(&data.to_le_bytes());
             }
+        }
+
+        self.wait_data_done()?;
+
+        // Stop transmission for multi-block
+        if num_blocks > 1 {
+            self.send_cmd(cmd::STOP_TRANSMISSION, 0, regs::SDC_CMD_RSPTYP_R1B)?;
         }
 
         Ok(())
@@ -421,47 +405,45 @@ impl SdDriver {
             (lba * BLOCK_SIZE as u64) as u32
         };
 
-        unsafe {
-            // Set block count
-            self.write_reg(regs::SDC_BLK_NUM, num_blocks as u32);
+        // Set block count
+        self.mmio.write32(regs::SDC_BLK_NUM, num_blocks as u32);
 
-            // Send write command
-            let cmd = if num_blocks == 1 {
-                cmd::WRITE_SINGLE_BLOCK
-            } else {
-                cmd::WRITE_MULTIPLE_BLOCK
-            };
+        // Send write command
+        let cmd = if num_blocks == 1 {
+            cmd::WRITE_SINGLE_BLOCK
+        } else {
+            cmd::WRITE_MULTIPLE_BLOCK
+        };
 
-            let cmd_val = cmd | regs::SDC_CMD_RSPTYP_R1 | regs::SDC_CMD_WR |
-                if num_blocks == 1 { regs::SDC_CMD_DTYPE_SINGLE } else { regs::SDC_CMD_DTYPE_MULTI };
+        let cmd_val = cmd | regs::SDC_CMD_RSPTYP_R1 | regs::SDC_CMD_WR |
+            if num_blocks == 1 { regs::SDC_CMD_DTYPE_SINGLE } else { regs::SDC_CMD_DTYPE_MULTI };
 
-            self.write_reg(regs::SDC_ARG, addr);
-            self.write_reg(regs::SDC_CMD, cmd_val);
+        self.mmio.write32(regs::SDC_ARG, addr);
+        self.mmio.write32(regs::SDC_CMD, cmd_val);
 
-            self.wait_cmd_done()?;
+        self.wait_cmd_done()?;
 
-            // Write data to FIFO
-            for block in 0..num_blocks {
-                for word in 0..(BLOCK_SIZE / 4) {
-                    // Wait for FIFO space
-                    while self.read_reg(regs::MSDC_FIFOCS) & 0xFF00 == 0 {
-                        core::hint::spin_loop();
-                    }
-
-                    let offset = block * BLOCK_SIZE + word * 4;
-                    let data = u32::from_le_bytes([
-                        buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]
-                    ]);
-                    self.write_reg(regs::MSDC_TXDATA, data);
+        // Write data to FIFO
+        for block in 0..num_blocks {
+            for word in 0..(BLOCK_SIZE / 4) {
+                // Wait for FIFO space
+                while self.mmio.read32(regs::MSDC_FIFOCS) & 0xFF00 == 0 {
+                    core::hint::spin_loop();
                 }
-            }
 
-            self.wait_data_done()?;
-
-            // Stop transmission for multi-block
-            if num_blocks > 1 {
-                self.send_cmd(cmd::STOP_TRANSMISSION, 0, regs::SDC_CMD_RSPTYP_R1B)?;
+                let offset = block * BLOCK_SIZE + word * 4;
+                let data = u32::from_le_bytes([
+                    buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]
+                ]);
+                self.mmio.write32(regs::MSDC_TXDATA, data);
             }
+        }
+
+        self.wait_data_done()?;
+
+        // Stop transmission for multi-block
+        if num_blocks > 1 {
+            self.send_cmd(cmd::STOP_TRANSMISSION, 0, regs::SDC_CMD_RSPTYP_R1B)?;
         }
 
         Ok(())
@@ -474,10 +456,8 @@ impl SdDriver {
 
     /// Check if card is present
     pub fn card_present(&self) -> bool {
-        unsafe {
-            let ps = self.read_reg(regs::MSDC_PS);
-            (ps & regs::MSDC_PS_CDSTS) == 0
-        }
+        let ps = self.mmio.read32(regs::MSDC_PS);
+        (ps & regs::MSDC_PS_CDSTS) == 0
     }
 }
 
@@ -507,16 +487,16 @@ pub fn init_emmc() -> Result<(), &'static str> {
 
 /// Test SD/eMMC
 pub fn test() {
-    println!("  Testing SD/eMMC...");
+    logln!("  Testing SD/eMMC...");
 
     // Just check if we can read registers without crashing
-    unsafe {
-        let cfg0 = read_volatile(regs::MSDC0_BASE as *const u32);
-        let cfg1 = read_volatile(regs::MSDC1_BASE as *const u32);
-        println!("    MSDC0 CFG: 0x{:08x}", cfg0);
-        println!("    MSDC1 CFG: 0x{:08x}", cfg1);
-    }
+    let msdc0 = MmioRegion::new(regs::MSDC0_BASE);
+    let msdc1 = MmioRegion::new(regs::MSDC1_BASE);
+    let cfg0 = msdc0.read32(regs::MSDC_CFG);
+    let cfg1 = msdc1.read32(regs::MSDC_CFG);
+    logln!("    MSDC0 CFG: 0x{:08x}", cfg0);
+    logln!("    MSDC1 CFG: 0x{:08x}", cfg1);
 
-    println!("    Note: Full SD test requires card insertion");
-    println!("    [OK] SD/eMMC registers accessible");
+    logln!("    Note: Full SD test requires card insertion");
+    logln!("    [OK] SD/eMMC registers accessible");
 }

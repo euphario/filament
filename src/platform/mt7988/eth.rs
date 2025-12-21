@@ -5,8 +5,8 @@
 //!
 //! This is a minimal driver for basic packet TX/RX.
 
-use core::ptr::{read_volatile, write_volatile};
-use crate::println;
+use crate::arch::aarch64::mmio::{MmioRegion, dsb};
+use crate::logln;
 
 /// Ethernet frame constants
 pub const ETH_FRAME_MIN: usize = 64;
@@ -32,11 +32,11 @@ mod regs {
     /// PPE (Packet Processing Engine) base
     pub const PPE_BASE: usize = FE_BASE + 0x2000;
 
-    /// Frame Engine global registers
-    pub const FE_GLO_CFG: usize = FE_BASE + 0x00;
-    pub const FE_RST_GL: usize = FE_BASE + 0x04;
-    pub const FE_INT_STATUS: usize = FE_BASE + 0x08;
-    pub const FE_INT_ENABLE: usize = FE_BASE + 0x0C;
+    /// Frame Engine global registers (offsets from FE_BASE)
+    pub const FE_GLO_CFG: usize = 0x00;
+    pub const FE_RST_GL: usize = 0x04;
+    pub const FE_INT_STATUS: usize = 0x08;
+    pub const FE_INT_ENABLE: usize = 0x0C;
 
     /// GMAC registers (offset from GMAC_BASE)
     pub const GMAC_PIAC: usize = 0x04;       // PHY Indirect Access Control
@@ -49,21 +49,21 @@ mod regs {
     pub const MCR_RX_EN: u32 = 1 << 13;
     pub const MCR_FORCE_LINK: u32 = 1 << 0;
 
-    /// PDMA TX ring registers
-    pub const PDMA_TX_BASE: usize = PDMA_BASE + 0x000;
-    pub const PDMA_TX_CNT: usize = PDMA_BASE + 0x004;
-    pub const PDMA_TX_CPU_IDX: usize = PDMA_BASE + 0x008;
-    pub const PDMA_TX_DMA_IDX: usize = PDMA_BASE + 0x00C;
+    /// PDMA TX ring registers (offsets from PDMA_BASE)
+    pub const PDMA_TX_BASE: usize = 0x000;
+    pub const PDMA_TX_CNT: usize = 0x004;
+    pub const PDMA_TX_CPU_IDX: usize = 0x008;
+    pub const PDMA_TX_DMA_IDX: usize = 0x00C;
 
-    /// PDMA RX ring registers
-    pub const PDMA_RX_BASE: usize = PDMA_BASE + 0x100;
-    pub const PDMA_RX_CNT: usize = PDMA_BASE + 0x104;
-    pub const PDMA_RX_CPU_IDX: usize = PDMA_BASE + 0x108;
-    pub const PDMA_RX_DMA_IDX: usize = PDMA_BASE + 0x10C;
+    /// PDMA RX ring registers (offsets from PDMA_BASE)
+    pub const PDMA_RX_BASE: usize = 0x100;
+    pub const PDMA_RX_CNT: usize = 0x104;
+    pub const PDMA_RX_CPU_IDX: usize = 0x108;
+    pub const PDMA_RX_DMA_IDX: usize = 0x10C;
 
-    /// PDMA global config
-    pub const PDMA_GLO_CFG: usize = PDMA_BASE + 0x204;
-    pub const PDMA_RST_IDX: usize = PDMA_BASE + 0x208;
+    /// PDMA global config (offsets from PDMA_BASE)
+    pub const PDMA_GLO_CFG: usize = 0x204;
+    pub const PDMA_RST_IDX: usize = 0x208;
 
     /// PDMA global config bits
     pub const PDMA_TX_DMA_EN: u32 = 1 << 0;
@@ -155,8 +155,12 @@ static mut PACKET_BUFFERS: PacketBuffers = PacketBuffers {
 
 /// Ethernet driver state
 pub struct EthDriver {
-    /// Base address
-    base: usize,
+    /// Frame Engine MMIO region
+    fe: MmioRegion,
+    /// GMAC MMIO region
+    gmac: MmioRegion,
+    /// PDMA MMIO region
+    pdma: MmioRegion,
     /// Our MAC address
     mac_addr: MacAddr,
     /// TX ring index
@@ -170,7 +174,9 @@ pub struct EthDriver {
 impl EthDriver {
     pub const fn new() -> Self {
         Self {
-            base: regs::FE_BASE,
+            fe: MmioRegion::new(regs::FE_BASE),
+            gmac: MmioRegion::new(regs::GMAC_BASE),
+            pdma: MmioRegion::new(regs::PDMA_BASE),
             mac_addr: MacAddr::new(0x02, 0x00, 0x00, 0x00, 0x00, 0x01), // Local MAC
             tx_idx: 0,
             rx_idx: 0,
@@ -178,43 +184,31 @@ impl EthDriver {
         }
     }
 
-    /// Read a register
-    #[inline]
-    unsafe fn read_reg(&self, addr: usize) -> u32 {
-        read_volatile(addr as *const u32)
-    }
-
-    /// Write a register
-    #[inline]
-    unsafe fn write_reg(&self, addr: usize, val: u32) {
-        write_volatile(addr as *mut u32, val);
-    }
-
     /// Initialize the ethernet controller
     pub fn init(&mut self) -> Result<(), &'static str> {
-        println!("    Initializing MT7988 Ethernet...");
+        logln!("    Initializing MT7988 Ethernet...");
 
-        unsafe {
-            // Reset frame engine
-            self.write_reg(regs::FE_RST_GL, 0x1);
-            for _ in 0..10000 {
-                core::hint::spin_loop();
-            }
-            self.write_reg(regs::FE_RST_GL, 0x0);
-
-            // Initialize DMA rings
-            self.init_dma_rings()?;
-
-            // Configure GMAC
-            self.init_gmac()?;
-
-            // Enable DMA
-            self.enable_dma();
+        // Reset frame engine
+        self.fe.write32(regs::FE_RST_GL, 0x1);
+        dsb(); // Ensure reset is seen by hardware
+        for _ in 0..10000 {
+            core::hint::spin_loop();
         }
+        self.fe.write32(regs::FE_RST_GL, 0x0);
+        dsb();
+
+        // Initialize DMA rings
+        self.init_dma_rings()?;
+
+        // Configure GMAC
+        self.init_gmac()?;
+
+        // Enable DMA
+        self.enable_dma();
 
         self.initialized = true;
-        println!("    [OK] Ethernet initialized");
-        println!("    MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        logln!("    [OK] Ethernet initialized");
+        logln!("    MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             self.mac_addr.0[0], self.mac_addr.0[1], self.mac_addr.0[2],
             self.mac_addr.0[3], self.mac_addr.0[4], self.mac_addr.0[5]);
 
@@ -222,48 +216,53 @@ impl EthDriver {
     }
 
     /// Initialize DMA descriptor rings
-    unsafe fn init_dma_rings(&mut self) -> Result<(), &'static str> {
-        let rings = &mut *core::ptr::addr_of_mut!(DMA_RINGS);
-        let bufs = &mut *core::ptr::addr_of_mut!(PACKET_BUFFERS);
+    fn init_dma_rings(&mut self) -> Result<(), &'static str> {
+        unsafe {
+            let rings = &mut *core::ptr::addr_of_mut!(DMA_RINGS);
+            let bufs = &mut *core::ptr::addr_of_mut!(PACKET_BUFFERS);
 
-        // Initialize TX ring
-        for i in 0..TX_RING_SIZE {
-            rings.tx_ring[i].buf_addr = bufs.tx_buffers[i].as_ptr() as u32;
-            rings.tx_ring[i].buf_addr_hi = 0;
-            rings.tx_ring[i].ctrl1 = 0; // Not owned by DMA yet
-            rings.tx_ring[i].ctrl2 = 0;
+            // Initialize TX ring
+            for i in 0..TX_RING_SIZE {
+                rings.tx_ring[i].buf_addr = bufs.tx_buffers[i].as_ptr() as u32;
+                rings.tx_ring[i].buf_addr_hi = 0;
+                rings.tx_ring[i].ctrl1 = 0; // Not owned by DMA yet
+                rings.tx_ring[i].ctrl2 = 0;
+            }
+
+            // Initialize RX ring
+            for i in 0..RX_RING_SIZE {
+                rings.rx_ring[i].buf_addr = bufs.rx_buffers[i].as_ptr() as u32;
+                rings.rx_ring[i].buf_addr_hi = 0;
+                // Mark as owned by DMA, ready to receive
+                rings.rx_ring[i].ctrl1 = desc::DDONE | (2048 & desc::LEN_MASK);
+                rings.rx_ring[i].ctrl2 = 0;
+            }
+
+            // Ensure descriptor writes complete before DMA sees them
+            dsb();
+
+            // Set up PDMA registers
+            let tx_ring_addr = rings.tx_ring.as_ptr() as u32;
+            let rx_ring_addr = rings.rx_ring.as_ptr() as u32;
+
+            self.pdma.write32(regs::PDMA_TX_BASE, tx_ring_addr);
+            self.pdma.write32(regs::PDMA_TX_CNT, TX_RING_SIZE as u32);
+            self.pdma.write32(regs::PDMA_TX_CPU_IDX, 0);
+
+            self.pdma.write32(regs::PDMA_RX_BASE, rx_ring_addr);
+            self.pdma.write32(regs::PDMA_RX_CNT, RX_RING_SIZE as u32);
+            self.pdma.write32(regs::PDMA_RX_CPU_IDX, (RX_RING_SIZE - 1) as u32);
         }
-
-        // Initialize RX ring
-        for i in 0..RX_RING_SIZE {
-            rings.rx_ring[i].buf_addr = bufs.rx_buffers[i].as_ptr() as u32;
-            rings.rx_ring[i].buf_addr_hi = 0;
-            // Mark as owned by DMA, ready to receive
-            rings.rx_ring[i].ctrl1 = desc::DDONE | (2048 & desc::LEN_MASK);
-            rings.rx_ring[i].ctrl2 = 0;
-        }
-
-        // Set up PDMA registers
-        let tx_ring_addr = rings.tx_ring.as_ptr() as u32;
-        let rx_ring_addr = rings.rx_ring.as_ptr() as u32;
-
-        self.write_reg(regs::PDMA_TX_BASE, tx_ring_addr);
-        self.write_reg(regs::PDMA_TX_CNT, TX_RING_SIZE as u32);
-        self.write_reg(regs::PDMA_TX_CPU_IDX, 0);
-
-        self.write_reg(regs::PDMA_RX_BASE, rx_ring_addr);
-        self.write_reg(regs::PDMA_RX_CNT, RX_RING_SIZE as u32);
-        self.write_reg(regs::PDMA_RX_CPU_IDX, (RX_RING_SIZE - 1) as u32);
 
         Ok(())
     }
 
     /// Initialize GMAC
-    unsafe fn init_gmac(&mut self) -> Result<(), &'static str> {
+    fn init_gmac(&mut self) -> Result<(), &'static str> {
         // Set MAC control register
         // Force mode, enable TX/RX, force link up
         let mcr = regs::MCR_FORCE_MODE | regs::MCR_TX_EN | regs::MCR_RX_EN | regs::MCR_FORCE_LINK;
-        self.write_reg(regs::GMAC_BASE + regs::GMAC_PORT_MCR, mcr);
+        self.gmac.write32(regs::GMAC_PORT_MCR, mcr);
 
         // TODO: Configure PHY via MDIO
         // TODO: Set up MAC address filter
@@ -272,9 +271,10 @@ impl EthDriver {
     }
 
     /// Enable DMA engine
-    unsafe fn enable_dma(&mut self) {
+    fn enable_dma(&mut self) {
         let cfg = regs::PDMA_TX_DMA_EN | regs::PDMA_RX_DMA_EN | regs::PDMA_TX_WB_DDONE;
-        self.write_reg(regs::PDMA_GLO_CFG, cfg);
+        self.pdma.write32(regs::PDMA_GLO_CFG, cfg);
+        dsb(); // Ensure DMA enable is visible
     }
 
     /// Transmit a packet
@@ -306,12 +306,12 @@ impl EthDriver {
             // Set up descriptor
             desc.ctrl1 = desc::DDONE | desc::FS | desc::LS | (data.len() as u32 & desc::LEN_MASK);
 
-            // Memory barrier
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            // Ensure descriptor and buffer writes complete before DMA sees them
+            dsb();
 
             // Update TX index
             self.tx_idx = (idx + 1) % TX_RING_SIZE;
-            self.write_reg(regs::PDMA_TX_CPU_IDX, self.tx_idx as u32);
+            self.pdma.write32(regs::PDMA_TX_CPU_IDX, self.tx_idx as u32);
         }
 
         Ok(())
@@ -346,12 +346,12 @@ impl EthDriver {
             // Return descriptor to DMA
             desc.ctrl1 = desc::DDONE | (2048 & desc::LEN_MASK);
 
-            // Memory barrier
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            // Ensure descriptor write completes before telling DMA
+            dsb();
 
             // Update RX index
             self.rx_idx = (idx + 1) % RX_RING_SIZE;
-            self.write_reg(regs::PDMA_RX_CPU_IDX, idx as u32);
+            self.pdma.write32(regs::PDMA_RX_CPU_IDX, idx as u32);
 
             Some(copy_len)
         }
@@ -363,11 +363,9 @@ impl EthDriver {
             return false;
         }
 
-        unsafe {
-            let status = self.read_reg(regs::GMAC_BASE + regs::GMAC_PORT_STS);
-            // Bit 0 is typically link status
-            (status & 0x1) != 0
-        }
+        let status = self.gmac.read32(regs::GMAC_PORT_STS);
+        // Bit 0 is typically link status
+        (status & 0x1) != 0
     }
 
     /// Get MAC address
@@ -406,15 +404,14 @@ pub fn link_status() -> bool {
 
 /// Test ethernet (basic init check)
 pub fn test() {
-    println!("  Testing ethernet...");
+    logln!("  Testing ethernet...");
 
     // Just check if we can read registers without crashing
     // Real testing requires network connectivity
-    unsafe {
-        let fe_cfg = read_volatile(regs::FE_GLO_CFG as *const u32);
-        println!("    FE_GLO_CFG: 0x{:08x}", fe_cfg);
-    }
+    let fe = MmioRegion::new(regs::FE_BASE);
+    let fe_cfg = fe.read32(regs::FE_GLO_CFG);
+    logln!("    FE_GLO_CFG: 0x{:08x}", fe_cfg);
 
-    println!("    Note: Full ethernet test requires network connection");
-    println!("    [OK] Ethernet registers accessible");
+    logln!("    Note: Full ethernet test requires network connection");
+    logln!("    [OK] Ethernet registers accessible");
 }

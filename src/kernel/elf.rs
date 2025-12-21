@@ -5,7 +5,7 @@
 
 use super::addrspace::AddressSpace;
 use super::pmm;
-use crate::println;
+use crate::logln;
 use super::task;
 
 /// ELF magic number
@@ -307,16 +307,16 @@ pub fn print_header_info(header: &Elf64Header) {
     let e_phoff = { header.e_phoff };
     let e_phnum = { header.e_phnum };
 
-    println!("  ELF Header:");
-    println!("    Type:    {}", match e_type {
+    logln!("  ELF Header:");
+    logln!("    Type:    {}", match e_type {
         ET_EXEC => "Executable",
         ET_DYN => "Shared/PIE",
         _ => "Unknown",
     });
-    println!("    Machine: {}", if e_machine == EM_AARCH64 { "AArch64" } else { "Unknown" });
-    println!("    Entry:   0x{:016x}", e_entry);
-    println!("    PHoff:   0x{:x}", e_phoff);
-    println!("    PHnum:   {}", e_phnum);
+    logln!("    Machine: {}", if e_machine == EM_AARCH64 { "AArch64" } else { "Unknown" });
+    logln!("    Entry:   0x{:016x}", e_entry);
+    logln!("    PHoff:   0x{:x}", e_phoff);
+    logln!("    PHnum:   {}", e_phnum);
 }
 
 /// Print program header info
@@ -343,7 +343,7 @@ pub fn print_phdr_info(phdr: &Elf64ProgramHeader) {
     if (p_flags & PF_W) != 0 { flags_str[1] = b'W'; }
     if (p_flags & PF_X) != 0 { flags_str[2] = b'X'; }
 
-    println!("    {:8} 0x{:08x} 0x{:08x} {} {}",
+    logln!("    {:8} 0x{:08x} 0x{:08x} {} {}",
         type_str,
         p_vaddr,
         p_memsz,
@@ -426,7 +426,7 @@ pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::Task
         }
     }
 
-    println!("    Spawned '{}' (PID {}) entry=0x{:x} parent={}", name, task_id, elf_info.entry, parent_id);
+    logln!("    Spawned '{}' (PID {}) entry=0x{:x} parent={}", name, task_id, elf_info.entry, parent_id);
 
     Ok((task_id, slot))
 }
@@ -661,45 +661,45 @@ pub fn get_test_elf2() -> &'static [u8] {
 
 /// Test ELF loading
 pub fn test() {
-    println!("  Testing ELF loader...");
+    logln!("  Testing ELF loader...");
 
     // Validate the test ELF
     match validate_header(TEST_ELF) {
         Ok(header) => {
-            println!("    Test ELF validated");
+            logln!("    Test ELF validated");
             print_header_info(header);
 
             match get_program_headers(TEST_ELF, header) {
                 Ok(phdrs) => {
-                    println!("    Program headers:");
+                    logln!("    Program headers:");
                     for phdr in phdrs {
                         print_phdr_info(phdr);
                     }
                 }
-                Err(e) => println!("    [!!] Failed to get phdrs: {:?}", e),
+                Err(e) => logln!("    [!!] Failed to get phdrs: {:?}", e),
             }
         }
         Err(e) => {
-            println!("    [!!] ELF validation failed: {:?}", e);
+            logln!("    [!!] ELF validation failed: {:?}", e);
             return;
         }
     }
 
     // Try loading into a new address space
-    println!("    Loading ELF into address space...");
+    logln!("    Loading ELF into address space...");
     if let Some(mut addr_space) = AddressSpace::new() {
         match load_elf(TEST_ELF, &mut addr_space) {
             Ok(info) => {
-                println!("    Loaded {} segments", info.segments_loaded);
-                println!("    Entry point: 0x{:016x}", info.entry);
-                println!("    Base address: 0x{:016x}", info.base);
-                println!("    [OK] ELF loaded successfully");
+                logln!("    Loaded {} segments", info.segments_loaded);
+                logln!("    Entry point: 0x{:016x}", info.entry);
+                logln!("    Base address: 0x{:016x}", info.base);
+                logln!("    [OK] ELF loaded successfully");
             }
-            Err(e) => println!("    [!!] Load failed: {:?}", e),
+            Err(e) => logln!("    [!!] Load failed: {:?}", e),
         }
     } else {
-        println!("    [!!] Failed to create address space");
+        logln!("    [!!] Failed to create address space");
     }
 
-    println!("    [OK] ELF loader test passed");
+    logln!("    [OK] ELF loader test passed");
 }

@@ -5,6 +5,9 @@ use crate::println;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Flush any pending log messages before panic output
+    crate::kernel::log::flush();
+
     println!();
     println!("=== KERNEL PANIC ===");
 

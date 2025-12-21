@@ -2,7 +2,7 @@
 //!
 //! Uses the EL1 Physical Timer (CNTP_*) which generates the timer PPI.
 
-use crate::println;
+use crate::logln;
 use super::{gic, irq};
 
 /// Timer control bits
@@ -182,5 +182,5 @@ pub fn counter() -> u64 {
 /// Print timer info
 pub fn print_info() {
     let freq = frequency();
-    println!("  Frequency: {} Hz ({} MHz)", freq, freq / 1_000_000);
+    logln!("  Frequency: {} Hz ({} MHz)", freq, freq / 1_000_000);
 }

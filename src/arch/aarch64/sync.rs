@@ -157,7 +157,7 @@ mod tests {
     use super::*;
 
     pub fn test() {
-        crate::println!("  Testing sync primitives...");
+        crate::logln!("  Testing sync primitives...");
 
         // Test IrqGuard
         let before: u64;
@@ -184,6 +184,6 @@ mod tests {
         assert!(flags.check_and_clear_resched());
         assert!(!flags.need_resched());
 
-        crate::println!("    [OK] Sync primitives working");
+        crate::logln!("    [OK] Sync primitives working");
     }
 }

@@ -3,7 +3,7 @@
 //! Provides access to files from a TAR archive loaded into memory at boot.
 //! The initrd can be loaded by U-Boot alongside the kernel.
 
-use crate::println;
+use crate::logln;
 
 /// TAR block size
 const BLOCK_SIZE: usize = 512;
@@ -192,11 +192,11 @@ impl Ramfs {
 
     /// List all files (for debugging)
     pub fn list(&self) {
-        println!("  Ramfs contents ({} files):", self.count);
+        logln!("  Ramfs contents ({} files):", self.count);
         for i in 0..self.count {
             let entry = &self.entries[i];
             let type_char = if entry.is_dir() { 'd' } else { '-' };
-            println!("    {} {:>8} {}", type_char, entry.size, entry.name_str());
+            logln!("    {} {:>8} {}", type_char, entry.size, entry.name_str());
         }
     }
 }
@@ -246,14 +246,14 @@ pub fn list() {
 
 /// Test ramfs functionality
 pub fn test() {
-    println!("  Testing ramfs...");
+    logln!("  Testing ramfs...");
 
     let fs = ramfs();
     if fs.is_empty() {
-        println!("    No initrd loaded");
+        logln!("    No initrd loaded");
         return;
     }
 
     list();
-    println!("    [OK] Ramfs initialized");
+    logln!("    [OK] Ramfs initialized");
 }

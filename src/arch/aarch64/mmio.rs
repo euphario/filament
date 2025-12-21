@@ -330,5 +330,5 @@ pub fn delay_ms(ms: u64) {
 
 #[cfg(test)]
 pub fn test() {
-    crate::println!("  MMIO module ready");
+    crate::logln!("  MMIO module ready");
 }

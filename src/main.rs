@@ -343,6 +343,9 @@ pub extern "C" fn irq_exit_resched() {
     unsafe {
         task::do_resched_if_needed();
     }
+
+    // Safe point: flush deferred log buffer before returning to user
+    kernel::log::flush();
 }
 
 /// Exception handler called from assembly

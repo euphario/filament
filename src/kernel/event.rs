@@ -3,7 +3,7 @@
 //! Provides async notification mechanism for processes.
 //! Similar to Redox's event system - processes can wait on multiple events.
 
-use crate::println;
+use crate::logln;
 
 /// Maximum events per process
 pub const MAX_EVENTS: usize = 32;
@@ -428,18 +428,18 @@ pub fn sys_event_post(target_pid: u32, event_type: u32, data: u64, caller_pid: u
 
 /// Test the event system
 pub fn test() {
-    println!("  Testing event system...");
+    logln!("  Testing event system...");
 
     let mut queue = EventQueue::new();
 
     // Test subscription
     assert!(queue.subscribe(EventType::IpcReady, 0));
-    println!("    Subscribed to IpcReady events");
+    logln!("    Subscribed to IpcReady events");
 
     // Test event push/pop
     let event = Event::ipc_ready(1, 2);
     assert!(queue.push(event));
-    println!("    Pushed IpcReady event");
+    logln!("    Pushed IpcReady event");
 
     assert!(queue.has_events());
     assert_eq!(queue.len(), 1);
@@ -449,8 +449,8 @@ pub fn test() {
     let e = popped.unwrap();
     assert_eq!(e.event_type, EventType::IpcReady);
     assert_eq!(e.data, 1);
-    println!("    Popped event: type={:?}, data={}", e.event_type, e.data);
+    logln!("    Popped event: type={:?}, data={}", e.event_type, e.data);
 
     assert!(!queue.has_events());
-    println!("    [OK] Event system test passed");
+    logln!("    [OK] Event system test passed");
 }

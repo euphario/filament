@@ -10,7 +10,7 @@
 //! - Ports: Named endpoints for service discovery
 
 use super::pmm;
-use crate::println;
+use crate::logln;
 use super::process::{Pid, ProcessState};
 
 /// Maximum inline message payload size
@@ -560,38 +560,38 @@ pub fn sys_channel_transfer(channel_id: ChannelId, from: Pid, to: Pid) -> Result
 
 /// Test IPC functionality
 pub fn test() {
-    println!("  Testing IPC...");
+    logln!("  Testing IPC...");
 
     unsafe {
         let table = channel_table();
 
         // Create a channel pair
         if let Some((ch_a, ch_b)) = table.create_pair(1, 2) {
-            println!("    Created channel pair: {} <-> {}", ch_a, ch_b);
+            logln!("    Created channel pair: {} <-> {}", ch_a, ch_b);
 
             // Send a message from A to B
             let test_data = b"Hello IPC!";
             let msg = Message::data(1, test_data);
 
             match table.send(ch_a, msg) {
-                Ok(_) => println!("    Sent message on channel {}", ch_a),
-                Err(e) => println!("    [!!] Send failed: {:?}", e),
+                Ok(_) => logln!("    Sent message on channel {}", ch_a),
+                Err(e) => logln!("    [!!] Send failed: {:?}", e),
             }
 
             // Check queue
-            println!("    Channel {} queue length: {}", ch_b, table.queue_len(ch_b));
+            logln!("    Channel {} queue length: {}", ch_b, table.queue_len(ch_b));
 
             // Receive on B
             match table.receive(ch_b) {
                 Ok(recv_msg) => {
                     let payload = recv_msg.payload_slice();
-                    println!("    Received {} bytes from PID {}",
+                    logln!("    Received {} bytes from PID {}",
                         payload.len(), recv_msg.header.sender);
                     if payload == test_data {
-                        println!("    Message content verified!");
+                        logln!("    Message content verified!");
                     }
                 }
-                Err(e) => println!("    [!!] Receive failed: {:?}", e),
+                Err(e) => logln!("    [!!] Receive failed: {:?}", e),
             }
 
             // Test request/reply pattern
@@ -599,7 +599,7 @@ pub fn test() {
             let _ = table.send(ch_a, req_msg);
 
             if let Ok(req) = table.receive(ch_b) {
-                println!("    Received request with msg_id={}", req.header.msg_id);
+                logln!("    Received request with msg_id={}", req.header.msg_id);
 
                 // Send reply
                 let reply_msg = Message::reply(2, req.header.msg_id, b"pong");
@@ -608,47 +608,47 @@ pub fn test() {
                 if let Ok(reply) = table.receive(ch_a) {
                     if reply.header.msg_type == MessageType::Reply &&
                        reply.header.msg_id == 42 {
-                        println!("    Request/reply pattern works!");
+                        logln!("    Request/reply pattern works!");
                     }
                 }
             }
 
             // Test blocking receive (on empty queue)
-            println!("    Testing blocking receive...");
+            logln!("    Testing blocking receive...");
             match sys_receive_blocking(ch_a, 1) {
-                Ok(_) => println!("    [!!] Should have blocked"),
+                Ok(_) => logln!("    [!!] Should have blocked"),
                 Err(IpcError::WouldBlock) => {
-                    println!("    Correctly returned WouldBlock");
+                    logln!("    Correctly returned WouldBlock");
                     // Check that receiver was registered
                     if table.endpoints.iter()
                         .find(|e| e.id == ch_a)
                         .map(|e| e.blocked_receiver)
                         .flatten() == Some(1)
                     {
-                        println!("    Blocked receiver registered: PID 1");
+                        logln!("    Blocked receiver registered: PID 1");
                     }
                 }
-                Err(e) => println!("    [!!] Unexpected error: {:?}", e),
+                Err(e) => logln!("    [!!] Unexpected error: {:?}", e),
             }
 
             // Send message which should wake the blocked receiver
             let wake_msg = Message::data(2, b"wake up!");
             match table.send(ch_b, wake_msg) {
                 Ok(maybe_pid) => {
-                    println!("    Sent wake message, blocked PID: {:?}", maybe_pid);
+                    logln!("    Sent wake message, blocked PID: {:?}", maybe_pid);
                 }
-                Err(e) => println!("    [!!] Send failed: {:?}", e),
+                Err(e) => logln!("    [!!] Send failed: {:?}", e),
             }
 
             // Close channels
             table.close(ch_a);
             table.close(ch_b);
-            println!("    Channels closed");
+            logln!("    Channels closed");
 
         } else {
-            println!("    [!!] Failed to create channel pair");
+            logln!("    [!!] Failed to create channel pair");
         }
     }
 
-    println!("    [OK] IPC test passed");
+    logln!("    [OK] IPC test passed");
 }

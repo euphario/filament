@@ -14,7 +14,7 @@
 //!
 //! SECURITY: All user pointers are validated before access using the uaccess module.
 
-use crate::println;
+use crate::logln;
 use super::uaccess::{self, UAccessError};
 
 /// Syscall numbers
@@ -288,7 +288,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::ShmemNotify => sys_shmem_notify(args.arg0 as u32),
         SyscallNumber::ShmemDestroy => sys_shmem_destroy(args.arg0 as u32),
         SyscallNumber::Invalid => {
-            println!("[SYSCALL] Invalid syscall number: {}", args.num);
+            logln!("[SYSCALL] Invalid syscall number: {}", args.num);
             SyscallError::NotImplemented as i64
         }
     }
@@ -303,10 +303,10 @@ fn current_pid() -> u32 {
 
 /// Exit current process
 fn sys_exit(code: i32) -> i64 {
-    println!();
-    println!("========================================");
-    println!("  Process exited with code: {}", code);
-    println!("========================================");
+    logln!();
+    logln!("========================================");
+    logln!("  Process exited with code: {}", code);
+    logln!("========================================");
 
     unsafe {
         let sched = super::task::scheduler();
@@ -353,12 +353,12 @@ fn sys_exit(code: i32) -> i64 {
                 task.state = super::task::TaskState::Running;
             }
             super::task::update_current_task_globals();
-            println!("  Switching to task {}", next_slot);
+            logln!("  Switching to task {}", next_slot);
             // Return - svc_handler will load new task's state and eret
             0
         } else {
             // No more tasks - halt
-            println!("  No more processes - halting.");
+            logln!("  No more processes - halting.");
             loop {
                 core::arch::asm!("wfi");
             }
@@ -1487,10 +1487,10 @@ fn sys_set_log_level(level: u8) -> i64 {
 
 /// Reset/reboot the system using MT7988A watchdog
 fn sys_reset() -> ! {
-    println!();
-    println!("========================================");
-    println!("  System Reset Requested");
-    println!("========================================");
+    logln!();
+    logln!("========================================");
+    logln!("  System Reset Requested");
+    logln!("========================================");
 
     // MT7988A TOPRGU (Top Reset Generation Unit) registers
     use crate::arch::aarch64::mmio::MmioRegion;
@@ -1522,7 +1522,7 @@ fn sys_reset() -> ! {
     crate::arch::aarch64::mmio::dsb();
 
     // Should not reach here, but loop just in case
-    println!("Reset triggered, waiting...");
+    logln!("Reset triggered, waiting...");
     loop {
         unsafe { core::arch::asm!("wfi"); }
     }
@@ -1552,36 +1552,39 @@ pub extern "C" fn syscall_handler_rust(
         super::task::do_resched_if_needed();
     }
 
+    // Safe point: flush deferred log buffer before returning to user
+    super::log::flush();
+
     result
 }
 
 /// Test syscall handling
 pub fn test() {
-    println!("  Testing syscall infrastructure...");
+    logln!("  Testing syscall infrastructure...");
 
     // Test debug write - uses kernel addresses during boot, so skip validation test
     let msg = "Hello from syscall!\n";
     // Note: This works during kernel init because we're using kernel pointers
     // In real user mode, user pointers would be validated
     let result = sys_debug_write(msg.as_ptr() as u64, msg.len());
-    println!("    debug_write returned: {}", result);
+    logln!("    debug_write returned: {}", result);
 
     // Test getpid
     let pid = sys_getpid();
-    println!("    getpid returned: {}", pid);
+    logln!("    getpid returned: {}", pid);
 
     // Test gettime
     let time = sys_gettime();
-    println!("    gettime returned: {} ns", time);
+    logln!("    gettime returned: {} ns", time);
 
     // Test user address validation
-    println!("    Testing address validation...");
+    logln!("    Testing address validation...");
     assert!(uaccess::is_user_address(0x4000_0000));
     assert!(!uaccess::is_user_address(0xFFFF_0000_0000_0000));
     assert!(!uaccess::is_user_address(0)); // Null pointer
-    println!("    Address validation: OK");
+    logln!("    Address validation: OK");
 
-    println!("    [OK] Syscall infrastructure ready");
+    logln!("    [OK] Syscall infrastructure ready");
 }
 
 // =============================================================================

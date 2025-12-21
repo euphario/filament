@@ -3,7 +3,7 @@
 //! Simple bitmap-based page frame allocator.
 //! Each bit represents a 4KB page: 1 = used, 0 = free
 
-use crate::println;
+use crate::logln;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -237,18 +237,18 @@ pub fn print_info() {
         let pmm = &*core::ptr::addr_of!(PMM);
         let free_mb = pmm.free_memory() / (1024 * 1024);
         let total_mb = (pmm.total_count() * PAGE_SIZE) / (1024 * 1024);
-        println!("  Total:  {} pages ({} MB)", pmm.total_count(), total_mb);
-        println!("  Free:   {} pages ({} MB)", pmm.free_count(), free_mb);
+        logln!("  Total:  {} pages ({} MB)", pmm.total_count(), total_mb);
+        logln!("  Free:   {} pages ({} MB)", pmm.free_count(), free_mb);
     }
 }
 
 /// Test the allocator
 pub fn test() {
-    println!("  Testing allocation...");
+    logln!("  Testing allocation...");
 
     // Allocate a page
     if let Some(addr) = alloc_page() {
-        println!("    Allocated page at 0x{:08x}", addr);
+        logln!("    Allocated page at 0x{:08x}", addr);
 
         // Write test pattern
         unsafe {
@@ -256,16 +256,16 @@ pub fn test() {
             core::ptr::write_volatile(ptr, 0xDEADBEEF_CAFEBABE);
             let val = core::ptr::read_volatile(ptr);
             if val == 0xDEADBEEF_CAFEBABE {
-                println!("    Write/read test: OK");
+                logln!("    Write/read test: OK");
             } else {
-                println!("    Write/read test: FAILED");
+                logln!("    Write/read test: FAILED");
             }
         }
 
         // Free it
         free_page(addr);
-        println!("    Freed page");
+        logln!("    Freed page");
     } else {
-        println!("    Allocation failed!");
+        logln!("    Allocation failed!");
     }
 }

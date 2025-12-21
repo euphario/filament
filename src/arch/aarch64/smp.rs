@@ -4,7 +4,7 @@
 //! Uses PSCI (Power State Coordination Interface) for CPU power management.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
-use crate::println;
+use crate::logln;
 
 /// Maximum number of CPUs supported
 pub const MAX_CPUS: usize = 4;
@@ -202,13 +202,13 @@ pub fn cpu_affinity_info(cpu: u32) -> i32 {
 /// Initialize SMP - called from primary CPU
 pub fn init() {
     let cpu = cpu_id();
-    println!("  Primary CPU: {}", cpu);
+    logln!("  Primary CPU: {}", cpu);
 
     // Check PSCI version
     if let Some((major, minor)) = psci_version() {
-        println!("  PSCI version: {}.{}", major, minor);
+        logln!("  PSCI version: {}.{}", major, minor);
     } else {
-        println!("  PSCI not available (may be in EL1 without EL2/EL3)");
+        logln!("  PSCI not available (may be in EL1 without EL2/EL3)");
     }
 
     // Initialize primary CPU's per-CPU data
@@ -218,7 +218,7 @@ pub fn init() {
         pcpu.set_state(CpuState::Online);
     }
 
-    println!("  CPU {} online", cpu);
+    logln!("  CPU {} online", cpu);
 }
 
 /// Secondary CPU entry point (called from assembly)
@@ -243,7 +243,7 @@ pub extern "C" fn secondary_cpu_entry(cpu_id: u64) {
         core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) ctl);
     }
 
-    println!("  CPU {} online", cpu);
+    logln!("  CPU {} online", cpu);
 
     // Enter idle loop - scheduler will assign tasks
     loop {
@@ -265,7 +265,7 @@ pub extern "C" fn secondary_cpu_entry(cpu_id: u64) {
 /// Start secondary CPUs
 pub fn start_secondary_cpus() {
     let primary = cpu_id();
-    println!("  Starting secondary CPUs from CPU {}...", primary);
+    logln!("  Starting secondary CPUs from CPU {}...", primary);
 
     // Get the physical address of secondary_start from boot.S
     extern "C" {
@@ -291,20 +291,20 @@ pub fn start_secondary_cpus() {
         // Try to wake CPU via PSCI
         match cpu_on(cpu, entry, cpu as u64) {
             Ok(()) => {
-                println!("    CPU {} start requested", cpu);
+                logln!("    CPU {} start requested", cpu);
             }
             Err(psci::ALREADY_ON) => {
-                println!("    CPU {} already on", cpu);
+                logln!("    CPU {} already on", cpu);
             }
             Err(psci::NOT_SUPPORTED) => {
                 // PSCI not available, try sending event
-                println!("    CPU {} PSCI not supported, sending SEV", cpu);
+                logln!("    CPU {} PSCI not supported, sending SEV", cpu);
                 unsafe {
                     core::arch::asm!("sev");
                 }
             }
             Err(e) => {
-                println!("    CPU {} start failed: {}", cpu, e);
+                logln!("    CPU {} start failed: {}", cpu, e);
             }
         }
     }
@@ -323,7 +323,7 @@ pub fn start_secondary_cpus() {
             }
         }
     }
-    println!("  {} CPUs online", online);
+    logln!("  {} CPUs online", online);
 }
 
 /// Get number of online CPUs
@@ -402,10 +402,10 @@ impl Drop for SpinLockGuard<'_> {
 
 /// Test SMP functionality
 pub fn test() {
-    println!("  Testing SMP...");
+    logln!("  Testing SMP...");
 
     let cpu = cpu_id();
-    println!("    Current CPU: {}", cpu);
+    logln!("    Current CPU: {}", cpu);
 
     // Test spinlock
     static TEST_LOCK: SpinLock = SpinLock::new();
@@ -415,10 +415,10 @@ pub fn test() {
         let _guard = SpinLockGuard::new(&TEST_LOCK);
         TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     }
-    println!("    Spinlock test: counter = {}", TEST_COUNTER.load(Ordering::Relaxed));
+    logln!("    Spinlock test: counter = {}", TEST_COUNTER.load(Ordering::Relaxed));
 
     // Show online CPUs
-    println!("    Online CPUs: {}", online_cpus());
+    logln!("    Online CPUs: {}", online_cpus());
 
-    println!("    [OK] SMP test passed");
+    logln!("    [OK] SMP test passed");
 }

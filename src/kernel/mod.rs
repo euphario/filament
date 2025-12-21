@@ -24,3 +24,4 @@ pub mod elf;
 pub mod pmm;
 pub mod addrspace;
 pub mod uaccess;
+pub mod log;

@@ -7,7 +7,7 @@ use super::addrspace::AddressSpace;
 use super::event::EventQueue;
 use super::fd::FdTable;
 use super::pmm;
-use crate::println;
+use crate::logln;
 
 /// Task states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -857,10 +857,10 @@ impl Scheduler {
                 CURRENT_TRAP_FRAME = trap_frame;
                 CURRENT_TTBR0 = ttbr0;
 
-                println!("  Entering user mode:");
-                println!("    Entry:  0x{:016x}", task.trap_frame.elr_el1);
-                println!("    Stack:  0x{:016x}", task.trap_frame.sp_el0);
-                println!("    TTBR0:  0x{:016x}", ttbr0);
+                logln!("  Entering user mode:");
+                logln!("    Entry:  0x{:016x}", task.trap_frame.elr_el1);
+                logln!("    Stack:  0x{:016x}", task.trap_frame.sp_el0);
+                logln!("    TTBR0:  0x{:016x}", ttbr0);
 
                 enter_usermode(trap_frame as *const TrapFrame, ttbr0);
             }
@@ -957,7 +957,7 @@ impl Scheduler {
 
     /// Print scheduler state
     pub fn print_info(&self) {
-        println!("  Tasks:");
+        logln!("  Tasks:");
         for (i, slot) in self.tasks.iter().enumerate() {
             if let Some(ref task) = slot {
                 let state_str = match task.state {
@@ -967,7 +967,7 @@ impl Scheduler {
                     TaskState::Terminated => "terminated",
                 };
                 let marker = if i == self.current { ">" } else { " " };
-                println!("    {} [{}] {} ({})", marker, task.id, task.name_str(), state_str);
+                logln!("    {} [{}] {} ({})", marker, task.id, task.name_str(), state_str);
             }
         }
     }
@@ -1026,7 +1026,7 @@ pub unsafe fn do_resched_if_needed() {
     // Log any unhandled IRQs from interrupt context (deferred logging)
     let (unhandled_count, last_irq) = crate::arch::aarch64::sync::cpu_flags().get_unhandled_stats();
     if unhandled_count > 0 {
-        crate::println!("[IRQ] {} unhandled interrupt(s), last: {}", unhandled_count, last_irq);
+        crate::logln!("[IRQ] {} unhandled interrupt(s), last: {}", unhandled_count, last_irq);
         crate::arch::aarch64::sync::cpu_flags().clear_unhandled_stats();
     }
 
@@ -1130,9 +1130,9 @@ pub unsafe fn yield_cpu() {
 
 /// Test context switching
 pub fn test() {
-    println!("  Context switch test:");
-    println!("    TrapFrame size: {} bytes", core::mem::size_of::<TrapFrame>());
-    println!("    CpuContext size: {} bytes", core::mem::size_of::<CpuContext>());
-    println!("    Task size: {} bytes", core::mem::size_of::<Task>());
-    println!("    [OK] Structures initialized");
+    logln!("  Context switch test:");
+    logln!("    TrapFrame size: {} bytes", core::mem::size_of::<TrapFrame>());
+    logln!("    CpuContext size: {} bytes", core::mem::size_of::<CpuContext>());
+    logln!("    Task size: {} bytes", core::mem::size_of::<Task>());
+    logln!("    [OK] Structures initialized");
 }
