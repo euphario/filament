@@ -7,6 +7,7 @@
 #![no_main]
 
 use userlib::{println, print, syscall};
+use userlib::firmware::{FirmwareRequest, FirmwareReply, FATFS_PORT, error as fw_error};
 
 mod fat;
 
@@ -241,13 +242,139 @@ fn main() {
         }
     }
 
-    // Read performance test (now uses ring buffer / DMA)
-    println!();
-    println!("[fatfs] Running read performance test...");
-    read_performance_test(&mut block, block_count);
+    // Skip performance test for faster startup, go straight to service mode
+    // read_performance_test(&mut block, block_count);
 
-    println!("[fatfs] Done.");
-    syscall::exit(0);
+    // Register as firmware service
+    println!();
+    println!("[fatfs] Registering as firmware service...");
+    let listen_channel = syscall::port_register(FATFS_PORT);
+    if listen_channel < 0 {
+        println!("[fatfs] ERROR: Failed to register port: {}", listen_channel);
+        syscall::exit(1);
+    }
+    let listen_channel = listen_channel as u32;
+    println!("[fatfs] Listening on port 'fatfs' (channel {})", listen_channel);
+
+    // Service loop
+    firmware_service_loop(&fs, &mut block, listen_channel);
+}
+
+/// Handle firmware requests from clients
+fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_channel: u32) {
+    let mut request_buf = [0u8; core::mem::size_of::<FirmwareRequest>()];
+    let my_pid = syscall::getpid();
+
+    loop {
+        // Accept a connection
+        let client_channel = syscall::port_accept(listen_channel);
+        if client_channel < 0 {
+            // No pending connections, yield and try again
+            syscall::yield_now();
+            continue;
+        }
+        let client_channel = client_channel as u32;
+
+        // First message is handshake - receive ping, send our PID
+        let mut ping_buf = [0u8; 4];
+        let n = syscall::receive(client_channel, &mut ping_buf);
+        if n < 0 {
+            syscall::channel_close(client_channel);
+            continue;
+        }
+
+        // Send our PID so client can shmem_allow us
+        let pid_bytes = my_pid.to_le_bytes();
+        if syscall::send(client_channel, &pid_bytes) < 0 {
+            syscall::channel_close(client_channel);
+            continue;
+        }
+
+        // Now receive actual firmware request
+        let n = syscall::receive(client_channel, &mut request_buf);
+        if n < 0 {
+            println!("[fatfs] Receive error: {}", n);
+            syscall::channel_close(client_channel);
+            continue;
+        }
+
+        let request = match FirmwareRequest::from_bytes(&request_buf[..n as usize]) {
+            Some(r) => r,
+            None => {
+                println!("[fatfs] Invalid request (size={})", n);
+                let reply = FirmwareReply::error(fw_error::READ_ERROR);
+                syscall::send(client_channel, reply.as_bytes());
+                syscall::channel_close(client_channel);
+                continue;
+            }
+        };
+
+        let filename = request.filename_str();
+        let filename_str = core::str::from_utf8(filename).unwrap_or("???");
+        println!("[fatfs] Request: {} (shmem={}, max={})",
+            filename_str, request.shmem_id, request.max_size);
+
+        // Allow the requester to access the shmem (they created it, we need to map it)
+        // Actually, the requester owns it, we need them to allow US
+        // The protocol should have requester call shmem_allow(shmem_id, fatfs_pid)
+        // For now, try to map it directly
+
+        // Map the shared memory
+        let mut vaddr: u64 = 0;
+        let mut paddr: u64 = 0;
+        let map_result = syscall::shmem_map(request.shmem_id, &mut vaddr, &mut paddr);
+        if map_result < 0 {
+            println!("[fatfs] Failed to map shmem {}: {}", request.shmem_id, map_result);
+            let reply = FirmwareReply::error(fw_error::NO_MEMORY);
+            syscall::send(client_channel, reply.as_bytes());
+            syscall::channel_close(client_channel);
+            continue;
+        }
+
+        // Find the file
+        let file = match find_file(fs, block, filename) {
+            Some(f) => f,
+            None => {
+                println!("[fatfs] File not found: {}", filename_str);
+                let reply = FirmwareReply::error(fw_error::NOT_FOUND);
+                syscall::send(client_channel, reply.as_bytes());
+                syscall::channel_close(client_channel);
+                continue;
+            }
+        };
+
+        // Check size
+        if file.size > request.max_size {
+            println!("[fatfs] File too large: {} > {}", file.size, request.max_size);
+            let reply = FirmwareReply::error(fw_error::TOO_LARGE);
+            syscall::send(client_channel, reply.as_bytes());
+            syscall::channel_close(client_channel);
+            continue;
+        }
+
+        // Read file into shared memory
+        let buffer = unsafe {
+            core::slice::from_raw_parts_mut(vaddr as *mut u8, request.max_size as usize)
+        };
+
+        let bytes_read = match read_file(fs, block, &file, buffer) {
+            Some(n) => n,
+            None => {
+                println!("[fatfs] Read error");
+                let reply = FirmwareReply::error(fw_error::READ_ERROR);
+                syscall::send(client_channel, reply.as_bytes());
+                syscall::channel_close(client_channel);
+                continue;
+            }
+        };
+
+        println!("[fatfs] Loaded {} bytes", bytes_read);
+
+        // Send success reply
+        let reply = FirmwareReply::success(bytes_read);
+        syscall::send(client_channel, reply.as_bytes());
+        syscall::channel_close(client_channel);
+    }
 }
 
 /// Read performance test using ring buffer / DMA

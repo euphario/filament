@@ -19,6 +19,7 @@
 //! 4. Load DSP firmware (optional)
 
 use userlib::syscall;
+use userlib::firmware::FirmwareClient;
 
 /// Firmware loading error
 #[derive(Debug, Clone, Copy)]
@@ -39,18 +40,29 @@ pub enum FirmwareError {
     DeviceError,
     /// Timeout waiting for response
     Timeout,
+    /// USB/fatfs service not available
+    UsbNotAvailable,
 }
 
 /// Maximum firmware size (4MB should be enough for the largest file)
 pub const MAX_FIRMWARE_SIZE: usize = 4 * 1024 * 1024;
 
-/// Firmware file paths
+/// Firmware file paths (ramfs)
 pub mod paths {
     pub const ROM_PATCH: &str = "lib/firmware/mediatek/mt7996/mt7996_rom_patch.bin";
     pub const WM: &str = "lib/firmware/mediatek/mt7996/mt7996_wm.bin";
     pub const WA: &str = "lib/firmware/mediatek/mt7996/mt7996_wa.bin";
     pub const DSP: &str = "lib/firmware/mediatek/mt7996/mt7996_dsp.bin";
     pub const EEPROM: &str = "lib/firmware/mediatek/mt7996/mt7996_eeprom.bin";
+}
+
+/// Firmware filenames for USB loading (just the filename, no path)
+pub mod usb_names {
+    pub const ROM_PATCH: &[u8] = b"mt7996_rom_patch.bin";
+    pub const WM: &[u8] = b"mt7996_wm.bin";
+    pub const WA: &[u8] = b"mt7996_wa.bin";
+    pub const DSP: &[u8] = b"mt7996_dsp.bin";
+    pub const EEPROM: &[u8] = b"mt7996_eeprom.bin";
 }
 
 /// Firmware data buffer with DMA physical address
@@ -161,4 +173,54 @@ pub fn check_firmware_files() -> bool {
         syscall::close(fd as u32);
     }
     true
+}
+
+/// Check if fatfs service is available (for USB firmware loading)
+pub fn check_usb_available() -> bool {
+    FirmwareClient::connect().is_some()
+}
+
+/// Firmware loaded from USB with shared memory handle
+pub struct UsbFirmware {
+    /// Virtual address of firmware data
+    pub vaddr: u64,
+    /// Physical address for DMA
+    pub paddr: u64,
+    /// Size of firmware data
+    pub size: usize,
+    /// Shared memory ID (for cleanup)
+    shmem_id: u32,
+}
+
+impl UsbFirmware {
+    /// Load firmware from USB via fatfs service
+    pub fn load(client: &FirmwareClient, filename: &[u8]) -> Result<Self, FirmwareError> {
+        match client.load_alloc(filename, MAX_FIRMWARE_SIZE) {
+            Ok((vaddr, paddr, size, shmem_id)) => {
+                Ok(Self { vaddr, paddr, size, shmem_id })
+            }
+            Err(code) => {
+                if code == userlib::firmware::error::NOT_FOUND {
+                    Err(FirmwareError::FileNotFound)
+                } else if code == userlib::firmware::error::TOO_LARGE {
+                    Err(FirmwareError::TooLarge)
+                } else if code == userlib::firmware::error::NO_MEMORY {
+                    Err(FirmwareError::DmaAllocFailed)
+                } else {
+                    Err(FirmwareError::ReadFailed)
+                }
+            }
+        }
+    }
+
+    /// Get firmware data as a slice
+    pub fn data(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.vaddr as *const u8, self.size) }
+    }
+}
+
+impl Drop for UsbFirmware {
+    fn drop(&mut self) {
+        syscall::shmem_destroy(self.shmem_id);
+    }
 }
