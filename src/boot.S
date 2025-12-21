@@ -402,7 +402,12 @@ irq_from_user:
     mov     x0, #1                  // from_user = true
     bl      irq_handler_rust
 
-    /* irq_handler_rust may have scheduled a different task */
+    /* Safe point: check NEED_RESCHED flag and do deferred scheduling.
+     * This is where timer preemption actually happens - the IRQ handler
+     * just sets the flag, this function does the actual task switch. */
+    bl      irq_exit_resched
+
+    /* irq_exit_resched may have scheduled a different task */
     /* Reload CURRENT_TRAP_FRAME (may have changed!) */
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]

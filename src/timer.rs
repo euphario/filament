@@ -1,11 +1,8 @@
 //! ARM Generic Timer driver
 //!
-//! Uses the EL1 Physical Timer (CNTP_*) which generates PPI 30.
+//! Uses the EL1 Physical Timer (CNTP_*) which generates the timer PPI.
 
-use crate::{gic, println};
-
-/// Timer interrupt is PPI 30 (ID 30 in GIC)
-const TIMER_IRQ: u32 = 30;
+use crate::{gic, platform, println};
 
 /// Timer control bits
 mod ctl {
@@ -46,8 +43,8 @@ impl Timer {
             core::arch::asm!("isb");
         }
 
-        // Enable timer interrupt in GIC (PPI 30)
-        gic::enable_irq(TIMER_IRQ);
+        // Enable timer interrupt in GIC
+        gic::enable_irq(platform::irq::TIMER_PPI);
     }
 
     /// Start the timer with an interval in milliseconds

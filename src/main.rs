@@ -16,8 +16,10 @@ mod i2c;
 mod initrd;
 mod ipc;
 mod log;
+mod mmio;
 mod mmu;
 mod panic;
+mod platform;
 mod pmm;
 mod port;
 mod process;
@@ -26,6 +28,7 @@ mod scheme;
 mod sd;
 mod shmem;
 mod smp;
+mod sync;
 mod syscall;
 mod task;
 mod timer;
@@ -114,82 +117,100 @@ pub extern "C" fn kmain() -> ! {
     pmm::init();
     println!("[OK] PMM initialized");
     pmm::print_info();
-    pmm::test();
 
     // Initialize shared memory subsystem
     shmem::init();
 
-    // Test address space management
-    println!();
-    println!("Testing address space manager...");
-    addrspace::test();
-
-    // Test task/context switch structures
-    println!();
-    println!("Testing task structures...");
-    task::test();
-
-    // Test syscall infrastructure
-    println!();
-    println!("Testing syscall infrastructure...");
-    syscall::test();
-
-    // Test process management
-    println!();
-    println!("Testing process management...");
-    process::test();
-
-    // Test IPC
-    println!();
-    println!("Testing IPC...");
-    ipc::test();
-
-    // Test port registry
-    println!();
-    println!("Testing port registry...");
-    port::test();
-
-    // Test event system
-    println!();
-    println!("Testing event system...");
-    event::test();
-
-    // Initialize scheme system
+    // Initialize scheme system (needed for userspace drivers)
     println!();
     println!("Initializing scheme system...");
     scheme::init();
-    scheme::test();
 
-    // Test ELF loader
-    println!();
-    println!("Testing ELF loader...");
-    elf::test();
-
-    // Initialize timer (but don't start it - user process will control flow)
+    // Initialize timer
     println!();
     println!("Initializing timer...");
     timer::init();
     println!("[OK] Timer initialized");
     timer::print_info();
 
-    // Initialize SMP
+    // Initialize SMP (but don't start secondary CPUs yet)
     println!();
     println!("Initializing SMP...");
     smp::init();
-    smp::test();
 
-    // Optionally start secondary CPUs (disabled for now to avoid complications)
-    // smp::start_secondary_cpus();
+    // =========================================================================
+    // Self-tests (only when compiled with --features selftest)
+    // =========================================================================
+    #[cfg(feature = "selftest")]
+    {
+        println!();
+        println!("========================================");
+        println!("  Running Self-Tests");
+        println!("========================================");
 
-    // Test ethernet (register access only - full init needs PHY setup)
-    println!();
-    println!("Testing Ethernet...");
-    eth::test();
+        println!();
+        println!("Testing PMM...");
+        pmm::test();
 
-    // Test SD/eMMC (register access only - full init needs card present)
-    println!();
-    println!("Testing SD/eMMC...");
-    sd::test();
+        println!();
+        println!("Testing address space manager...");
+        addrspace::test();
+
+        println!();
+        println!("Testing task structures...");
+        task::test();
+
+        println!();
+        println!("Testing syscall infrastructure...");
+        syscall::test();
+
+        println!();
+        println!("Testing process management...");
+        process::test();
+
+        println!();
+        println!("Testing IPC...");
+        ipc::test();
+
+        println!();
+        println!("Testing port registry...");
+        port::test();
+
+        println!();
+        println!("Testing event system...");
+        event::test();
+
+        println!();
+        println!("Testing scheme system...");
+        scheme::test();
+
+        println!();
+        println!("Testing ELF loader...");
+        elf::test();
+
+        println!();
+        println!("Testing SMP...");
+        smp::test();
+
+        println!();
+        println!("Testing Ethernet (register access)...");
+        eth::test();
+
+        println!();
+        println!("Testing SD/eMMC (register access)...");
+        sd::test();
+
+        println!();
+        println!("========================================");
+        println!("  Self-Tests Complete");
+        println!("========================================");
+    }
+
+    #[cfg(not(feature = "selftest"))]
+    {
+        println!();
+        println!("  (self-tests skipped, use --features selftest to enable)");
+    }
 
     // Note: USB is now handled by userspace driver (bin/usbtest)
     // The userspace driver uses MMIO and IRQ schemes to access hardware
@@ -263,71 +284,67 @@ pub extern "C" fn kmain() -> ! {
 
 /// IRQ handler called from assembly
 /// from_user: true if IRQ came from user mode (EL0), false if from kernel (EL1)
+///
+/// DESIGN: This handler does minimal work:
+/// 1. Ack the interrupt
+/// 2. Set flags for deferred processing
+/// 3. EOI and return
+///
+/// Actual scheduling happens at safe points (syscall exit, exception return).
+/// This prevents reentrancy issues and scheduler corruption.
 #[no_mangle]
-pub extern "C" fn irq_handler_rust(from_user: u64) {
+pub extern "C" fn irq_handler_rust(_from_user: u64) {
     // Acknowledge the interrupt from GIC
     let irq = gic::ack_irq();
 
     // Check for spurious interrupt
-    if irq >= 1020 {
+    if irq >= platform::irq::SPURIOUS_THRESHOLD {
         return; // Spurious, ignore
     }
 
     // Handle timer interrupt (PPI 30)
-    if irq == 30 {
+    if irq == platform::irq::TIMER_PPI {
         if timer::handle_irq() {
-            // Timer tick - preempt current task (from user or kernel mode)
-            // Kernel preemption is safe because we only preempt in spin loops (getc)
-            unsafe {
-                let sched = task::scheduler();
-
-                // Mark current as ready (it was running)
-                if let Some(ref mut current) = sched.tasks[sched.current] {
-                    if current.state == task::TaskState::Running {
-                        current.state = task::TaskState::Ready;
-                    }
-                }
-
-                // Find next task
-                if let Some(next_slot) = sched.schedule() {
-                    if next_slot != sched.current {
-                        sched.current = next_slot;
-                        if let Some(ref mut next_task) = sched.tasks[next_slot] {
-                            next_task.state = task::TaskState::Running;
-                        }
-                        task::update_current_task_globals();
-                    } else {
-                        // Same task, mark as running again
-                        if let Some(ref mut current) = sched.tasks[sched.current] {
-                            current.state = task::TaskState::Running;
-                        }
-                    }
-                }
-            }
+            // Timer tick - just set the flag, don't reschedule here
+            sync::cpu_flags().tick();
+            sync::cpu_flags().set_need_resched();
         }
     } else {
         // Check if this IRQ is registered by a userspace driver
         if let Some(owner_pid) = scheme::irq_notify(irq) {
             // Wake the owner process if blocked
+            // This is a minimal state change - actual switch happens at safe point
             unsafe {
+                let _guard = sync::IrqGuard::new(); // Ensure atomicity
                 let sched = task::scheduler();
                 for task_opt in sched.tasks.iter_mut() {
                     if let Some(ref mut task) = task_opt {
                         if task.id == owner_pid && task.state == task::TaskState::Blocked {
                             task.state = task::TaskState::Ready;
+                            // Also set need_resched so we switch to woken task
+                            sync::cpu_flags().set_need_resched();
                             break;
                         }
                     }
                 }
             }
         } else {
-            // Truly unhandled interrupt
-            println!("[IRQ] Unhandled interrupt: {}", irq);
+            // Record unhandled IRQ (don't print in IRQ context!)
+            sync::cpu_flags().record_unhandled_irq(irq);
         }
     }
 
     // Signal end of interrupt
     gic::eoi(irq);
+}
+
+/// Called from assembly after IRQ handler, at the safe point before eret.
+/// This is where deferred scheduling actually happens for timer preemption.
+#[no_mangle]
+pub extern "C" fn irq_exit_resched() {
+    unsafe {
+        task::do_resched_if_needed();
+    }
 }
 
 /// Exception handler called from assembly
@@ -380,20 +397,17 @@ fn init_ramfs() {
         return;
     }
 
-    // Fall back to external initrd at fixed address
-    const INITRD_ADDR: usize = 0x4800_0000;
-    const INITRD_MAX_SIZE: usize = 16 * 1024 * 1024;
-
+    // Fall back to external initrd at fixed address (from platform constants)
     // Check for TAR magic (ustar at offset 257)
     let magic_check = unsafe {
-        let ptr = INITRD_ADDR as *const u8;
+        let ptr = platform::INITRD_ADDR as *const u8;
         let ustar_magic = core::slice::from_raw_parts(ptr.add(257), 5);
         ustar_magic == b"ustar"
     };
 
     if magic_check {
-        let count = ramfs::init(INITRD_ADDR, INITRD_MAX_SIZE);
-        println!("  Loaded {} files from external initrd at 0x{:08x}", count, INITRD_ADDR);
+        let count = ramfs::init(platform::INITRD_ADDR, platform::INITRD_MAX_SIZE);
+        println!("  Loaded {} files from external initrd at 0x{:08x}", count, platform::INITRD_ADDR);
         ramfs::list();
     } else {
         println!("  No initrd found (build with: cd user && ./mkinitrd.sh)");

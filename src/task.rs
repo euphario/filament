@@ -1009,6 +1009,57 @@ pub unsafe fn update_current_task_globals() {
     }
 }
 
+/// Check NEED_RESCHED flag and perform reschedule if needed.
+/// Called at safe points (syscall exit, exception return).
+///
+/// This is the "bottom half" of preemption - the timer IRQ just sets a flag,
+/// and this function does the actual work.
+///
+/// # Safety
+/// Must be called from kernel context (not IRQ context).
+pub unsafe fn do_resched_if_needed() {
+    // Check and clear the flag atomically
+    if !crate::sync::cpu_flags().check_and_clear_resched() {
+        return; // No reschedule needed
+    }
+
+    // Log any unhandled IRQs from interrupt context (deferred logging)
+    let (unhandled_count, last_irq) = crate::sync::cpu_flags().get_unhandled_stats();
+    if unhandled_count > 0 {
+        crate::println!("[IRQ] {} unhandled interrupt(s), last: {}", unhandled_count, last_irq);
+        crate::sync::cpu_flags().clear_unhandled_stats();
+    }
+
+    // Now do the reschedule with IRQs disabled for the critical section
+    let _guard = crate::sync::IrqGuard::new();
+    let sched = scheduler();
+
+    // Mark current as ready (it was running)
+    if let Some(ref mut current) = sched.tasks[sched.current] {
+        if current.state == TaskState::Running {
+            current.state = TaskState::Ready;
+        }
+    }
+
+    // Find next task
+    if let Some(next_slot) = sched.schedule() {
+        if next_slot != sched.current {
+            sched.current = next_slot;
+            if let Some(ref mut next_task) = sched.tasks[next_slot] {
+                next_task.state = TaskState::Running;
+            }
+            update_current_task_globals();
+            // Signal to assembly that we switched tasks
+            SYSCALL_SWITCHED_TASK = 1;
+        } else {
+            // Same task, mark as running again
+            if let Some(ref mut current) = sched.tasks[sched.current] {
+                current.state = TaskState::Running;
+            }
+        }
+    }
+}
+
 /// Yield CPU to another task (callable from kernel code like schemes)
 /// This switches to another ready task while keeping current task in its current state
 /// (Ready or Blocked depending on what caller set).

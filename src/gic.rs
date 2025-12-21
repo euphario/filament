@@ -1,16 +1,9 @@
 //! ARM GICv3 (Generic Interrupt Controller) driver for MT7988A
 //!
-//! GIC base addresses for MT7988:
-//! - GICD (Distributor):    0x0c000000
-//! - GICR (Redistributor):  0x0c080000
+//! Uses platform constants for base addresses.
 
-use core::ptr::{read_volatile, write_volatile};
-
-/// GIC Distributor base address
-const GICD_BASE: usize = 0x0c000000;
-
-/// GIC Redistributor base address (CPU 0)
-const GICR_BASE: usize = 0x0c080000;
+use crate::mmio::MmioRegion;
+use crate::platform;
 
 /// GICD Register offsets
 mod gicd {
@@ -63,15 +56,15 @@ mod gicr_waker {
 }
 
 pub struct Gic {
-    gicd_base: usize,
-    gicr_base: usize,
+    gicd: MmioRegion,
+    gicr: MmioRegion,
 }
 
 impl Gic {
     pub const fn new() -> Self {
         Self {
-            gicd_base: GICD_BASE,
-            gicr_base: GICR_BASE,
+            gicd: MmioRegion::new(platform::GICD_BASE),
+            gicr: MmioRegion::new(platform::GICR_BASE),
         }
     }
 
@@ -112,109 +105,95 @@ impl Gic {
 
     /// Wake up the redistributor
     fn gicr_wake(&self) {
-        unsafe {
-            let waker = self.gicr_read(gicr::WAKER);
+        let waker = self.gicr_read(gicr::WAKER);
 
-            // Clear ProcessorSleep bit
-            self.gicr_write(gicr::WAKER, waker & !gicr_waker::PROCESSOR_SLEEP);
+        // Clear ProcessorSleep bit
+        self.gicr_write(gicr::WAKER, waker & !gicr_waker::PROCESSOR_SLEEP);
 
-            // Wait for ChildrenAsleep to clear
-            while (self.gicr_read(gicr::WAKER) & gicr_waker::CHILDREN_ASLEEP) != 0 {
-                core::hint::spin_loop();
-            }
+        // Wait for ChildrenAsleep to clear
+        while (self.gicr_read(gicr::WAKER) & gicr_waker::CHILDREN_ASLEEP) != 0 {
+            core::hint::spin_loop();
         }
     }
 
     /// Initialize the distributor
     fn gicd_init(&self) {
-        unsafe {
-            // Disable distributor while configuring
-            self.gicd_write(gicd::CTLR, 0);
+        // Disable distributor while configuring
+        self.gicd_write(gicd::CTLR, 0);
 
-            // Wait for RWP (Register Write Pending) to clear
-            while (self.gicd_read(gicd::CTLR) & (1 << 31)) != 0 {
-                core::hint::spin_loop();
-            }
-
-            // Read number of interrupt lines
-            let typer = self.gicd_read(gicd::TYPER);
-            let it_lines = ((typer & 0x1f) + 1) * 32;
-            // Configure all SPIs (interrupts 32+) as Group 1, priority 0xa0
-            for i in (32..it_lines).step_by(32) {
-                let reg_idx = (i / 32) as usize;
-                // Set all to Group 1 (non-secure)
-                self.gicd_write(gicd::IGROUPR + reg_idx * 4, 0xffffffff);
-            }
-
-            // Set default priority for SPIs
-            for i in (32..it_lines).step_by(4) {
-                let reg_idx = (i / 4) as usize;
-                self.gicd_write(gicd::IPRIORITYR + reg_idx * 4, 0xa0a0a0a0);
-            }
-
-            // Enable distributor with affinity routing
-            // DS (bit 6) = Disable Security - makes all interrupts non-secure
-            let ctlr = gicd_ctlr::ENABLE_GRP1_NS
-                | gicd_ctlr::ENABLE_GRP1_S
-                | gicd_ctlr::ARE_S
-                | gicd_ctlr::ARE_NS
-                | gicd_ctlr::DS;  // Disable security to allow Group configuration
-            self.gicd_write(gicd::CTLR, ctlr);
+        // Wait for RWP (Register Write Pending) to clear
+        while (self.gicd_read(gicd::CTLR) & (1 << 31)) != 0 {
+            core::hint::spin_loop();
         }
+
+        // Read number of interrupt lines
+        let typer = self.gicd_read(gicd::TYPER);
+        let it_lines = ((typer & 0x1f) + 1) * 32;
+        // Configure all SPIs (interrupts 32+) as Group 1, priority 0xa0
+        for i in (32..it_lines).step_by(32) {
+            let reg_idx = (i / 32) as usize;
+            // Set all to Group 1 (non-secure)
+            self.gicd_write(gicd::IGROUPR + reg_idx * 4, 0xffffffff);
+        }
+
+        // Set default priority for SPIs
+        for i in (32..it_lines).step_by(4) {
+            let reg_idx = (i / 4) as usize;
+            self.gicd_write(gicd::IPRIORITYR + reg_idx * 4, 0xa0a0a0a0);
+        }
+
+        // Enable distributor with affinity routing
+        // DS (bit 6) = Disable Security - makes all interrupts non-secure
+        let ctlr = gicd_ctlr::ENABLE_GRP1_NS
+            | gicd_ctlr::ENABLE_GRP1_S
+            | gicd_ctlr::ARE_S
+            | gicd_ctlr::ARE_NS
+            | gicd_ctlr::DS;  // Disable security to allow Group configuration
+        self.gicd_write(gicd::CTLR, ctlr);
     }
 
     /// Initialize the redistributor for SGIs/PPIs
     fn gicr_init(&self) {
-        unsafe {
-            // Configure SGIs (0-15) and PPIs (16-31) as Group 1
-            self.gicr_write(gicr::IGROUPR0, 0xffffffff);
+        // Configure SGIs (0-15) and PPIs (16-31) as Group 1
+        self.gicr_write(gicr::IGROUPR0, 0xffffffff);
 
-            // Set default priority
-            for i in 0..8 {
-                self.gicr_write(gicr::IPRIORITYR + i * 4, 0xa0a0a0a0);
-            }
-
-            // Enable all SGIs (for software interrupts)
-            self.gicr_write(gicr::ISENABLER0, 0x0000ffff);
+        // Set default priority
+        for i in 0..8 {
+            self.gicr_write(gicr::IPRIORITYR + i * 4, 0xa0a0a0a0);
         }
+
+        // Enable all SGIs (for software interrupts)
+        self.gicr_write(gicr::ISENABLER0, 0x0000ffff);
     }
 
     /// Enable a specific SPI (interrupt number 32+)
     pub fn enable_irq(&self, irq: u32) {
         if irq < 32 {
             // SGI/PPI - use redistributor
-            unsafe {
-                let bit = 1u32 << irq;
-                self.gicr_write(gicr::ISENABLER0, bit);
-            }
+            let bit = 1u32 << irq;
+            self.gicr_write(gicr::ISENABLER0, bit);
         } else {
             // SPI - use distributor
-            unsafe {
-                // Configure routing to CPU 0 (IROUTER with affinity = 0)
-                let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
-                self.gicd_write64(irouter_offset, 0);
+            // Configure routing to CPU 0 (IROUTER with affinity = 0)
+            let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
+            self.gicd_write64(irouter_offset, 0);
 
-                // Enable the interrupt
-                let reg_idx = (irq / 32) as usize;
-                let bit = 1u32 << (irq % 32);
-                self.gicd_write(gicd::ISENABLER + reg_idx * 4, bit);
-            }
+            // Enable the interrupt
+            let reg_idx = (irq / 32) as usize;
+            let bit = 1u32 << (irq % 32);
+            self.gicd_write(gicd::ISENABLER + reg_idx * 4, bit);
         }
     }
 
     /// Disable a specific interrupt
     pub fn disable_irq(&self, irq: u32) {
         if irq < 32 {
-            unsafe {
-                let bit = 1u32 << irq;
-                self.gicr_write(gicr::ICENABLER0, bit);
-            }
+            let bit = 1u32 << irq;
+            self.gicr_write(gicr::ICENABLER0, bit);
         } else {
-            unsafe {
-                let reg_idx = (irq / 32) as usize;
-                let bit = 1u32 << (irq % 32);
-                self.gicd_write(gicd::ICENABLER + reg_idx * 4, bit);
-            }
+            let reg_idx = (irq / 32) as usize;
+            let bit = 1u32 << (irq % 32);
+            self.gicd_write(gicd::ICENABLER + reg_idx * 4, bit);
         }
     }
 
@@ -236,45 +215,41 @@ impl Gic {
 
     /// Get GIC version info
     pub fn version(&self) -> (u32, u32) {
-        unsafe {
-            let iidr = self.gicd_read(gicd::IIDR);
-            let product = (iidr >> 24) & 0xff;
-            let variant = (iidr >> 16) & 0xf;
-            (product, variant)
-        }
+        let iidr = self.gicd_read(gicd::IIDR);
+        let product = (iidr >> 24) & 0xff;
+        let variant = (iidr >> 16) & 0xf;
+        (product, variant)
     }
 
     /// Get number of supported IRQ lines
     pub fn num_irqs(&self) -> u32 {
-        unsafe {
-            let typer = self.gicd_read(gicd::TYPER);
-            ((typer & 0x1f) + 1) * 32
-        }
+        let typer = self.gicd_read(gicd::TYPER);
+        ((typer & 0x1f) + 1) * 32
     }
 
     #[inline]
-    unsafe fn gicd_read(&self, offset: usize) -> u32 {
-        read_volatile((self.gicd_base + offset) as *const u32)
+    fn gicd_read(&self, offset: usize) -> u32 {
+        self.gicd.read32(offset)
     }
 
     #[inline]
-    unsafe fn gicd_write(&self, offset: usize, value: u32) {
-        write_volatile((self.gicd_base + offset) as *mut u32, value);
+    fn gicd_write(&self, offset: usize, value: u32) {
+        self.gicd.write32(offset, value);
     }
 
     #[inline]
-    unsafe fn gicd_write64(&self, offset: usize, value: u64) {
-        write_volatile((self.gicd_base + offset) as *mut u64, value);
+    fn gicd_write64(&self, offset: usize, value: u64) {
+        self.gicd.write64(offset, value);
     }
 
     #[inline]
-    unsafe fn gicr_read(&self, offset: usize) -> u32 {
-        read_volatile((self.gicr_base + offset) as *const u32)
+    fn gicr_read(&self, offset: usize) -> u32 {
+        self.gicr.read32(offset)
     }
 
     #[inline]
-    unsafe fn gicr_write(&self, offset: usize, value: u32) {
-        write_volatile((self.gicr_base + offset) as *mut u32, value);
+    fn gicr_write(&self, offset: usize, value: u32) {
+        self.gicr.write32(offset, value);
     }
 }
 
@@ -326,40 +301,38 @@ pub fn eoi(irq: u32) {
 
 /// Debug: dump GIC state for an IRQ
 pub fn debug_irq(irq: u32) {
-    unsafe {
-        let gic = &*core::ptr::addr_of!(GIC);
+    let gic = unsafe { &*core::ptr::addr_of!(GIC) };
 
-        if irq >= 32 {
-            let reg_idx = (irq / 32) as usize;
-            let bit_pos = irq % 32;
+    if irq >= 32 {
+        let reg_idx = (irq / 32) as usize;
+        let bit_pos = irq % 32;
 
-            // Read ISENABLER (is enabled?)
-            let isenabler = gic.gicd_read(gicd::ISENABLER + reg_idx * 4);
-            let enabled = (isenabler >> bit_pos) & 1;
+        // Read ISENABLER (is enabled?)
+        let isenabler = gic.gicd_read(gicd::ISENABLER + reg_idx * 4);
+        let enabled = (isenabler >> bit_pos) & 1;
 
-            // Read ISPENDR (is pending at GIC?)
-            let ispendr = gic.gicd_read(gicd::ISPENDR + reg_idx * 4);
-            let pending = (ispendr >> bit_pos) & 1;
+        // Read ISPENDR (is pending at GIC?)
+        let ispendr = gic.gicd_read(gicd::ISPENDR + reg_idx * 4);
+        let pending = (ispendr >> bit_pos) & 1;
 
-            // Read IGROUPR
-            let igroupr = gic.gicd_read(gicd::IGROUPR + reg_idx * 4);
-            let group = (igroupr >> bit_pos) & 1;
+        // Read IGROUPR
+        let igroupr = gic.gicd_read(gicd::IGROUPR + reg_idx * 4);
+        let group = (igroupr >> bit_pos) & 1;
 
-            // Read IROUTER
-            let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
-            let irouter_lo = gic.gicd_read(irouter_offset);
-            let irouter_hi = gic.gicd_read(irouter_offset + 4);
+        // Read IROUTER
+        let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
+        let irouter_lo = gic.gicd_read(irouter_offset);
+        let irouter_hi = gic.gicd_read(irouter_offset + 4);
 
-            crate::println!("[GIC] IRQ {} state:", irq);
-            crate::println!("  Enabled: {}", enabled);
-            crate::println!("  Pending: {}", pending);
-            crate::println!("  Group:   {} (1=NS)", group);
-            crate::println!("  IROUTER: 0x{:08x}_{:08x}", irouter_hi, irouter_lo);
+        crate::println!("[GIC] IRQ {} state:", irq);
+        crate::println!("  Enabled: {}", enabled);
+        crate::println!("  Pending: {}", pending);
+        crate::println!("  Group:   {} (1=NS)", group);
+        crate::println!("  IROUTER: 0x{:08x}_{:08x}", irouter_hi, irouter_lo);
 
-            // Read GICD_CTLR
-            let ctlr = gic.gicd_read(gicd::CTLR);
-            crate::println!("  GICD_CTLR: 0x{:08x}", ctlr);
-        }
+        // Read GICD_CTLR
+        let ctlr = gic.gicd_read(gicd::CTLR);
+        crate::println!("  GICD_CTLR: 0x{:08x}", ctlr);
     }
 }
 

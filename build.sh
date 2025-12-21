@@ -1,14 +1,27 @@
 #!/bin/bash
 # Build script for BPI-R4 kernel
 # Creates kernel.bin ready for loading via U-Boot xmodem
+#
+# Usage:
+#   ./build.sh           # Normal build (no self-tests)
+#   ./build.sh --test    # Build with self-tests enabled
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Parse arguments
+FEATURES=""
+BUILD_TYPE="Production"
+if [ "$1" = "--test" ] || [ "$1" = "-t" ]; then
+    FEATURES="--features selftest"
+    BUILD_TYPE="Development (with self-tests)"
+fi
+
 echo "========================================"
 echo "  BPI-R4 Kernel Build"
+echo "  Mode: $BUILD_TYPE"
 echo "========================================"
 echo
 
@@ -24,7 +37,7 @@ echo
 
 # Step 3: Build kernel
 echo "Step 3: Building kernel..."
-cargo build --release 2>&1 | grep -E "^(   Compiling|    Finished|error|warning:.*generated)" || true
+cargo build --release $FEATURES 2>&1 | grep -E "^(   Compiling|    Finished|error|warning:.*generated)" || true
 echo
 
 # Step 4: Create binary

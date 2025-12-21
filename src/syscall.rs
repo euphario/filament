@@ -1493,8 +1493,11 @@ fn sys_reset() -> ! {
     println!("========================================");
 
     // MT7988A TOPRGU (Top Reset Generation Unit) registers
-    // Physical address, accessed via kernel virtual mapping
-    const TOPRGU_BASE: u64 = crate::mmu::KERNEL_VIRT_BASE | 0x1001_C000;
+    use crate::mmio::MmioRegion;
+    use crate::platform;
+
+    let wdt = MmioRegion::new(platform::phys_to_virt(platform::TOPRGU_BASE));
+
     const WDT_MODE: usize = 0x00;
     const WDT_SWRST: usize = 0x14;
 
@@ -1506,22 +1509,17 @@ fn sys_reset() -> ! {
     // WDT_SWRST key
     const WDT_SWRST_KEY: u32 = 0x1209;
 
-    unsafe {
-        let wdt_mode = (TOPRGU_BASE + WDT_MODE as u64) as *mut u32;
-        let wdt_swrst = (TOPRGU_BASE + WDT_SWRST as u64) as *mut u32;
+    // Enable watchdog with external reset
+    wdt.write32(WDT_MODE, WDT_MODE_KEY | WDT_MODE_EXTEN | WDT_MODE_EN);
 
-        // Enable watchdog with external reset
-        core::ptr::write_volatile(wdt_mode, WDT_MODE_KEY | WDT_MODE_EXTEN | WDT_MODE_EN);
+    // Ensure the write completes
+    crate::mmio::dsb();
 
-        // Ensure the write completes
-        core::arch::asm!("dsb sy");
+    // Trigger software reset
+    wdt.write32(WDT_SWRST, WDT_SWRST_KEY);
 
-        // Trigger software reset
-        core::ptr::write_volatile(wdt_swrst, WDT_SWRST_KEY);
-
-        // Ensure the write completes
-        core::arch::asm!("dsb sy");
-    }
+    // Ensure the write completes
+    crate::mmio::dsb();
 
     // Should not reach here, but loop just in case
     println!("Reset triggered, waiting...");
@@ -1546,7 +1544,15 @@ pub extern "C" fn syscall_handler_rust(
         arg5,
     };
 
-    handle(&args)
+    let result = handle(&args);
+
+    // Safe point: check for deferred reschedule before returning to user
+    // This is where timer preemption actually happens (not in IRQ handler)
+    unsafe {
+        crate::task::do_resched_if_needed();
+    }
+
+    result
 }
 
 /// Test syscall handling

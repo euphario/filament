@@ -1,15 +1,13 @@
 //! MediaTek MT7988A UART driver (8250/16550 compatible)
 //!
 //! The MT7988A uses a standard 8250-style UART with 32-bit register spacing.
-//! UART0 (debug console) is at base address 0x11002000.
+//! Uses platform constants for base address.
 
 #![allow(dead_code)]
 
 use core::fmt::{self, Write};
-use core::ptr::{read_volatile, write_volatile};
-
-/// UART0 base address for MT7988A (confirmed working)
-const UART_BASE: usize = 0x11000000;
+use crate::mmio::MmioRegion;
+use crate::platform;
 
 /// UART register offsets (32-bit aligned, multiply standard 8250 offsets by 4)
 mod regs {
@@ -39,13 +37,13 @@ mod lsr {
 
 /// UART driver instance
 pub struct Uart {
-    base: usize,
+    regs: MmioRegion,
 }
 
 impl Uart {
     /// Create a new UART instance at the default MT7988A address
     pub const fn new() -> Self {
-        Self { base: UART_BASE }
+        Self { regs: MmioRegion::new(platform::UART0_BASE) }
     }
 
     /// Initialize the UART
@@ -53,56 +51,50 @@ impl Uart {
     /// Note: U-Boot has already configured baud rate and other settings,
     /// so we just need to ensure the UART is in a known state.
     pub fn init(&self) {
-        unsafe {
-            // Disable all interrupts
-            self.write_reg(regs::IER, 0x00);
+        // Disable all interrupts
+        self.regs.write32(regs::IER, 0x00);
 
-            // Enable FIFO, clear buffers, set 1-byte trigger
-            self.write_reg(regs::FCR, 0x07);
+        // Enable FIFO, clear buffers, set 1-byte trigger
+        self.regs.write32(regs::FCR, 0x07);
 
-            // 8 data bits, 1 stop bit, no parity (8N1)
-            self.write_reg(regs::LCR, 0x03);
+        // 8 data bits, 1 stop bit, no parity (8N1)
+        self.regs.write32(regs::LCR, 0x03);
 
-            // Enable DTR and RTS
-            self.write_reg(regs::MCR, 0x03);
-        }
+        // Enable DTR and RTS
+        self.regs.write32(regs::MCR, 0x03);
     }
 
     /// Write a single byte to the UART
     pub fn putc(&self, byte: u8) {
-        unsafe {
-            // Wait until transmit holding register is empty
-            while (self.read_reg(regs::LSR) & lsr::THRE) == 0 {
-                core::hint::spin_loop();
-            }
-            // Write the byte
-            self.write_reg(regs::THR, byte as u32);
+        // Wait until transmit holding register is empty
+        while (self.regs.read32(regs::LSR) & lsr::THRE) == 0 {
+            core::hint::spin_loop();
         }
+        // Write the byte
+        self.regs.write32(regs::THR, byte as u32);
     }
 
     /// Read a single byte from the UART (blocking)
     /// Spins waiting for input - for cooperative multitasking, use try_getc() instead
     pub fn getc(&self) -> u8 {
-        unsafe {
-            // Wait until data is available
-            while (self.read_reg(regs::LSR) & lsr::DR) == 0 {
-                core::hint::spin_loop();
-            }
-            // Read the byte
-            self.read_reg(regs::THR) as u8
+        // Wait until data is available
+        while (self.regs.read32(regs::LSR) & lsr::DR) == 0 {
+            core::hint::spin_loop();
         }
+        // Read the byte
+        self.regs.read32(regs::THR) as u8
     }
 
     /// Check if data is available to read
     pub fn data_available(&self) -> bool {
-        unsafe { (self.read_reg(regs::LSR) & lsr::DR) != 0 }
+        (self.regs.read32(regs::LSR) & lsr::DR) != 0
     }
 
     /// Try to read a single byte (non-blocking)
     /// Returns Some(byte) if data available, None otherwise
     pub fn try_getc(&self) -> Option<u8> {
         if self.data_available() {
-            Some(unsafe { self.read_reg(regs::THR) as u8 })
+            Some(self.regs.read32(regs::THR) as u8)
         } else {
             None
         }
@@ -116,18 +108,6 @@ impl Uart {
             }
             self.putc(byte);
         }
-    }
-
-    /// Write to a UART register
-    #[inline]
-    unsafe fn write_reg(&self, offset: usize, value: u32) {
-        write_volatile((self.base + offset) as *mut u32, value);
-    }
-
-    /// Read from a UART register
-    #[inline]
-    unsafe fn read_reg(&self, offset: usize) -> u32 {
-        read_volatile((self.base + offset) as *const u32)
     }
 }
 
