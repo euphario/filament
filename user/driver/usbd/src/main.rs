@@ -19,6 +19,9 @@
 #![no_std]
 #![no_main]
 
+mod device;
+
+use device::{is_msc_bbb, is_hub_class};
 use userlib::{println, print, syscall};
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 
@@ -106,65 +109,65 @@ struct UsbDriver {
 }
 
 /// Hub device info for interrupt-based port status monitoring
-struct HubDeviceInfo {
-    slot_id: u32,
-    num_ports: u8,
-    hub_port: u32,          // xHCI port this hub is on
+pub struct HubDeviceInfo {
+    pub slot_id: u32,
+    pub num_ports: u8,
+    pub hub_port: u32,          // xHCI port this hub is on
     // Interrupt endpoint
-    int_in_dci: u32,        // Device Context Index for interrupt IN
-    int_in_ring: *mut Trb,
-    int_in_ring_phys: u64,
-    int_in_enqueue: usize,
-    int_in_cycle: bool,
+    pub int_in_dci: u32,        // Device Context Index for interrupt IN
+    pub int_in_ring: *mut Trb,
+    pub int_in_ring_phys: u64,
+    pub int_in_enqueue: usize,
+    pub int_in_cycle: bool,
     // Status buffer (DMA target for interrupt transfers)
-    status_buf: *mut u8,
-    status_phys: u64,
+    pub status_buf: *mut u8,
+    pub status_phys: u64,
     // EP0 for control transfers
-    ep0_ring: *mut Trb,
-    ep0_ring_phys: u64,
-    ep0_enqueue: usize,
-    ep0_cycle: bool,  // Cycle bit for EP0 ring wrapping
+    pub ep0_ring: *mut Trb,
+    pub ep0_ring_phys: u64,
+    pub ep0_enqueue: usize,
+    pub ep0_cycle: bool,  // Cycle bit for EP0 ring wrapping
     // Device context
-    device_ctx: *mut DeviceContext,
+    pub device_ctx: *mut DeviceContext,
     // Pending transfer flag
-    transfer_pending: bool,
+    pub transfer_pending: bool,
 }
 
 /// Mass Storage Class device info for block operations
 /// Stores all state needed to perform bulk transfers without BulkContext
-struct MscDeviceInfo {
-    slot_id: u32,
-    bulk_in_dci: u32,
-    bulk_out_dci: u32,
-    block_size: u32,
-    block_count: u64,
+pub struct MscDeviceInfo {
+    pub slot_id: u32,
+    pub bulk_in_dci: u32,
+    pub bulk_out_dci: u32,
+    pub block_size: u32,
+    pub block_count: u64,
     // Bulk IN ring
-    bulk_in_ring: *mut Trb,
-    bulk_in_ring_phys: u64,
+    pub bulk_in_ring: *mut Trb,
+    pub bulk_in_ring_phys: u64,
     // Bulk OUT ring
-    bulk_out_ring: *mut Trb,
-    bulk_out_ring_phys: u64,
+    pub bulk_out_ring: *mut Trb,
+    pub bulk_out_ring_phys: u64,
     // Data buffer
-    data_buf: *mut u8,
-    data_phys: u64,
+    pub data_buf: *mut u8,
+    pub data_phys: u64,
     // Device context
-    device_ctx: *mut DeviceContext,
+    pub device_ctx: *mut DeviceContext,
     // Ring state (persisted between calls)
-    out_enqueue: usize,
-    in_enqueue: usize,
-    out_cycle: bool,  // Cycle bit for bulk out ring
-    in_cycle: bool,   // Cycle bit for bulk in ring
-    tag: u32,
+    pub out_enqueue: usize,
+    pub in_enqueue: usize,
+    pub out_cycle: bool,  // Cycle bit for bulk out ring
+    pub in_cycle: bool,   // Cycle bit for bulk in ring
+    pub tag: u32,
     // USB endpoint addresses (for CLEAR_FEATURE)
-    bulk_in_addr: u8,
-    bulk_out_addr: u8,
+    pub bulk_in_addr: u8,
+    pub bulk_out_addr: u8,
     // Interface number (for BOT Reset)
-    interface_num: u8,
+    pub interface_num: u8,
     // EP0 ring for control transfers (for USB recovery)
-    ep0_ring: *mut Trb,
-    ep0_ring_phys: u64,
-    ep0_enqueue: usize,
-    ep0_cycle: bool,  // Cycle bit for EP0 ring wrapping
+    pub ep0_ring: *mut Trb,
+    pub ep0_ring_phys: u64,
+    pub ep0_enqueue: usize,
+    pub ep0_cycle: bool,  // Cycle bit for EP0 ring wrapping
 }
 
 impl UsbDriver {
@@ -900,9 +903,7 @@ impl UsbDriver {
                 let desc = &*(desc_buf as *const DeviceDescriptor);
 
                 // Print device class type
-                if desc.device_class == 8 {
-                    println!(", Mass Storage");
-                } else if desc.device_class == 9 {
+                if is_hub_class(desc.device_class) {
                     println!(", Hub");
                     self.enumerate_hub(slot_id, port, ep0_ring_virt, ep0_ring_phys, &mut ep0_enqueue, &mut ep0_cycle, device_ctx_virt);
                 } else {
@@ -2063,7 +2064,8 @@ impl UsbDriver {
                     let p = desc_ptr.add(10) as *const u16;
                     core::ptr::read_unaligned(p)
                 };
-                if device_class == 8 || device_class == 0 {
+                if device_class == msc::CLASS || device_class == 0 {
+                    // Class 0 means class is defined at interface level (common for MSC)
                     println!("[hub] Port {}: Mass Storage (VID={:04x} PID={:04x})", hub_port, vendor_id, product_id);
                     self.configure_mass_storage(
                         slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue, &mut dev_ep0_cycle,
@@ -2168,9 +2170,7 @@ impl UsbDriver {
                 4 => {
                     if len >= 9 {
                         let iface = unsafe { &*(buf.add(offset) as *const InterfaceDescriptor) };
-                        if iface.interface_class == msc::CLASS &&
-                           iface.interface_subclass == msc::SUBCLASS_SCSI &&
-                           iface.interface_protocol == msc::PROTOCOL_BOT {
+                        if is_msc_bbb(iface.interface_class, iface.interface_subclass, iface.interface_protocol) {
                             is_mass_storage = true;
                             msc_interface_num = iface.interface_number;
                         }

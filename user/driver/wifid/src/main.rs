@@ -1,30 +1,31 @@
 //! WiFi Daemon
 //!
-//! Connects to pcied to find MT7996 WiFi devices, loads firmware, and initializes them.
+//! Generic WiFi device manager that discovers PCIe WiFi devices and
+//! initializes them using the appropriate driver.
+//!
+//! ## Supported Devices
+//!
+//! - MediaTek MT7996/MT7992/MT7990 family
+//!
+//! ## Architecture
+//!
+//! Drivers implement the WifiDriver trait. Currently drivers are linked
+//! directly; in the future they can be separate processes accessed via IPC.
 
 #![no_std]
 #![no_main]
 
+mod driver;
+mod drivers;
+
 use userlib::{println, print, syscall};
 use pcie::{PcieClient, consts};
-use mt7996::{Mt7996Device, mcu::Mcu, firmware};
+use driver::AnyWifiDriver;
 
 #[unsafe(no_mangle)]
 fn main() {
-    println!("=== MT7996 WiFi Driver ===");
+    println!("=== WiFi Daemon ===");
     println!();
-
-    // Check for firmware files first
-    print!("Checking firmware files... ");
-    if firmware::check_firmware_files() {
-        println!("OK");
-    } else {
-        println!("MISSING");
-        println!("  Required: mt7996_rom_patch.bin, mt7996_wm.bin, mt7996_wa.bin");
-        println!("  Place in: /lib/firmware/mediatek/mt7996/");
-        syscall::exit(1);
-        return;
-    }
 
     // Connect to pcied
     print!("Connecting to pcied... ");
@@ -33,93 +34,91 @@ fn main() {
         None => {
             println!("FAILED (is pcied running?)");
             syscall::exit(1);
-            return;
         }
     };
     println!("OK");
 
-    // Query for MediaTek WiFi devices
-    print!("Querying for MT7996 devices... ");
-    let devices = client.find_devices(consts::vendor::MEDIATEK, 0xFFFF);
-    println!("found {} MediaTek device(s)", devices.len());
+    // Query for WiFi devices (check common WiFi vendors)
+    let vendors = [
+        (consts::vendor::MEDIATEK, "MediaTek"),
+        // Future: Qualcomm, Intel, Realtek, etc.
+    ];
 
-    let mut wifi_found = false;
+    let mut wifi_count = 0;
 
-    for info in devices.iter() {
-        // Check if this is an MT7996 family device
-        if !is_mt7996_device(info.device_id) {
-            continue;
-        }
+    for (vendor_id, vendor_name) in vendors {
+        print!("Scanning {} devices... ", vendor_name);
+        let devices = client.find_devices(vendor_id, 0xFFFF);
+        println!("found {}", devices.len());
 
-        println!();
-        println!("Found MT7996 on pcie{}", info.port);
-        println!("  Device: {:04x}:{:04x}", info.vendor_id, info.device_id);
-        println!("  BDF: {:02x}:{:02x}.{}", info.bus, info.device, info.function);
-        println!("  BAR0: 0x{:016x} ({}KB)", info.bar0_addr, info.bar0_size / 1024);
+        for info in devices.iter() {
+            // Try to find a driver for this device
+            if let Some(mut driver) = AnyWifiDriver::probe(info) {
+                wifi_count += 1;
+                let dev_info = driver.device_info();
 
-        // Initialize the MT7996 device
-        match Mt7996Device::init_from_info(info) {
-            Ok(wifi) => {
-                wifi_found = true;
-                print_device_info(&wifi);
+                println!();
+                println!("=== {} WiFi Device ===", dev_info.chip_name);
+                println!("  Driver: {}", driver.driver_name());
+                println!("  Device: {:04x}:{:04x}", dev_info.vendor_id, dev_info.device_id);
+                println!("  State: {:?}", driver.state());
 
-                // Try to load firmware
-                let mut mcu = Mcu::new(&wifi);
-                match mcu.load_firmware() {
-                    Ok(()) => {
-                        println!("MCU state: {:?}", mcu.state());
+                // Check firmware availability
+                print!("  Firmware: ");
+                if driver.firmware_available() {
+                    println!("available");
+
+                    // Load firmware
+                    print!("  Loading firmware... ");
+                    match driver.load_firmware() {
+                        Ok(()) => {
+                            println!("OK");
+                            println!("  State: {:?}", driver.state());
+
+                            // Initialize device
+                            print!("  Initializing... ");
+                            match driver.init() {
+                                Ok(()) => {
+                                    println!("OK");
+                                    println!("  State: {:?}", driver.state());
+                                }
+                                Err(e) => {
+                                    println!("FAILED: {:?}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("FAILED: {:?}", e);
+                        }
                     }
-                    Err(e) => {
-                        println!("Firmware load FAILED: {:?}", e);
-                    }
+                } else {
+                    println!("NOT FOUND");
+                    println!("  Hint: Place firmware on USB drive or in initrd");
                 }
-            }
-            Err(e) => {
-                println!("  Init FAILED: {:?}", e);
+
+                // Print driver-specific info if available
+                print_driver_debug(&driver);
             }
         }
     }
 
     println!();
-    if wifi_found {
-        println!("=== WiFi device initialized ===");
+    if wifi_count > 0 {
+        println!("=== {} WiFi device(s) processed ===", wifi_count);
     } else {
-        println!("No MT7996 WiFi device found");
+        println!("No supported WiFi devices found");
     }
 
     syscall::exit(0);
 }
 
-/// Check if device ID is MT7996 family
-fn is_mt7996_device(device_id: u16) -> bool {
-    matches!(device_id,
-        mt7996::regs::device_id::MT7996 |
-        mt7996::regs::device_id::MT7996_2 |
-        mt7996::regs::device_id::MT7992 |
-        mt7996::regs::device_id::MT7992_2 |
-        mt7996::regs::device_id::MT7990 |
-        mt7996::regs::device_id::MT7990_2
-    )
-}
-
-/// Print device information
-fn print_device_info(wifi: &Mt7996Device) {
-    println!("  BAR0 size: {}KB", wifi.bar0_size() / 1024);
-    println!("  BAR0 virt: 0x{:016x}", wifi.bar0_virt());
-
-    // Try raw reads at various offsets
-    println!("  Raw[0x000]: 0x{:08x}", wifi.read32_raw(0x000));
-    println!("  Raw[0x004]: 0x{:08x}", wifi.read32_raw(0x004));
-
-    // Try some different offsets that might be more interesting
-    println!("  Raw[0x100]: 0x{:08x}", wifi.read32_raw(0x100));
-    println!("  Raw[0x1000]: 0x{:08x}", wifi.read32_raw(0x1000));
-    println!("  Raw[0x10000]: 0x{:08x}", wifi.read32_raw(0x10000));
-
-    // The HIF (Host Interface) base for MT7996 is typically at 0x4000
-    println!("  Raw[0x4000]: 0x{:08x}", wifi.read32_raw(0x4000));
-    println!("  Raw[0x4004]: 0x{:08x}", wifi.read32_raw(0x4004));
-
-    let variant = wifi.variant();
-    println!("  Variant: {:?}", variant);
+/// Print driver-specific debug info
+fn print_driver_debug(driver: &AnyWifiDriver) {
+    // For MT7996, we can downcast and print extra info
+    match driver {
+        AnyWifiDriver::Mt7996(_) => {
+            // In the future, drivers could expose a debug_info() method
+            println!("  (use mt7996-specific tools for detailed info)");
+        }
+    }
 }

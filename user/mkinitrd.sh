@@ -16,20 +16,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Parse arguments
-INCLUDE_FIRMWARE=true
+# Default: no firmware (load from USB via fatfs)
+INCLUDE_FIRMWARE=false
 OUTPUT="initrd.tar"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --no-firmware)
-            INCLUDE_FIRMWARE=false
+        --with-firmware)
+            INCLUDE_FIRMWARE=true
             shift
             ;;
         --help|-h)
             echo "Usage: ./mkinitrd.sh [options] [output.tar]"
             echo ""
             echo "Options:"
-            echo "  --no-firmware    Skip firmware files (smaller initrd for faster xmodem)"
+            echo "  --with-firmware  Include firmware files (default: load from USB)"
             echo "  --help           Show this help"
             exit 0
             ;;
@@ -41,8 +42,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "Building initrd: $OUTPUT"
-if [ "$INCLUDE_FIRMWARE" = false ]; then
-    echo "  (skipping firmware - use USB for firmware files)"
+if [ "$INCLUDE_FIRMWARE" = true ]; then
+    echo "  (including firmware files)"
+else
+    echo "  (firmware loaded from USB via fatfs)"
 fi
 echo ""
 
@@ -78,9 +81,10 @@ if [ "$INCLUDE_FIRMWARE" = true ] && [ -d "$FIRMWARE_DIR" ]; then
             echo "  lib/firmware/mediatek/mt7996/$name ($size)"
         fi
     done
-elif [ "$INCLUDE_FIRMWARE" = false ]; then
+else
     echo ""
-    echo "Skipping firmware (--no-firmware specified)"
+    echo "Firmware will be loaded from USB via fatfs"
+    echo "  (use --with-firmware to embed in initrd)"
 fi
 
 # Create the TAR archive (POSIX format for compatibility)

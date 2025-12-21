@@ -1935,6 +1935,9 @@ fn sys_pci_claim(bdf: u32) -> i64 {
 pub extern "C" fn syscall_handler_rust(
     arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, _unused: u64, num: u64
 ) -> i64 {
+    // NOTE: Cannot use logln!() here - vtables contain physical addresses
+    // which aren't mapped after TTBR0 switches to user page table.
+
     let args = SyscallArgs {
         num,
         arg0,

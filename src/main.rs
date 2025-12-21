@@ -106,6 +106,7 @@ pub extern "C" fn kmain() -> ! {
     println!("    [3] 0xC0000000: Normal (DRAM)");
     println!("Enabling MMU...");
     mmu::enable();
+    mmu::init_kernel_ttbr0();  // Initialize KERNEL_TTBR0 for syscall handlers
     println!("[OK] MMU enabled");
     mmu::print_info();
 
@@ -363,20 +364,38 @@ pub extern "C" fn irq_exit_resched() {
     kernel::log::flush();
 }
 
+/// Print a hex value directly to UART (no allocations, no logging)
+fn print_hex_uart(val: u64) {
+    for i in (0..16).rev() {
+        let nibble = ((val >> (i * 4)) & 0xf) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        uart::putc(c as char);
+    }
+}
+
+fn print_str_uart(s: &str) {
+    for c in s.chars() {
+        uart::putc(c);
+    }
+}
+
 /// Exception handler called from assembly
 #[no_mangle]
 pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
-    // Force UART output
-    for c in "\n=== EXCEPTION ===\n".chars() {
-        crate::uart::putc(c);
-    }
-    println!();
-    println!("  ESR_EL1: 0x{:016x}", esr);
-    println!("  ELR_EL1: 0x{:016x}", elr);
-    println!("  FAR_EL1: 0x{:016x}", far);
+    // Use only direct UART output - no println! which may fault
+    print_str_uart("\n=== EXCEPTION ===\n");
+    print_str_uart("  ESR: 0x");
+    print_hex_uart(esr);
+    print_str_uart("\n  ELR: 0x");
+    print_hex_uart(elr);
+    print_str_uart("\n  FAR: 0x");
+    print_hex_uart(far);
 
     // Decode exception class
     let ec = (esr >> 26) & 0x3f;
+    print_str_uart("\n  EC:  0x");
+    print_hex_uart(ec);
+    print_str_uart(" = ");
     let exception_name = match ec {
         0b000000 => "Unknown reason",
         0b000001 => "Trapped WFI/WFE",
@@ -392,10 +411,8 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
         0b111100 => "BRK instruction (breakpoint)",
         _ => "Other",
     };
-    println!("  EC:      0x{:02x} ({})", ec, exception_name);
-    println!("=================");
-    println!();
-    println!("System halted.");
+    print_str_uart(exception_name);
+    print_str_uart("\n=================\nSystem halted.\n");
 
     loop {
         unsafe { core::arch::asm!("wfe"); }

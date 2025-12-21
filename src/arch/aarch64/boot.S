@@ -264,14 +264,10 @@ lower_el_aarch32_serror:
 
 /*
  * Simple exception handler - just prints and hangs
+ * Note: Kernel stack is at TTBR1 address, so we can access it directly
+ * without switching TTBR0. User TTBR0 remains active.
  */
 exception_handler:
-    /* Switch to kernel TTBR0 first (user TTBR0 doesn't map kernel/UART) */
-    adrp    x9, KERNEL_TTBR0
-    ldr     x9, [x9, :lo12:KERNEL_TTBR0]
-    msr     ttbr0_el1, x9
-    isb
-
     stp     x29, x30, [sp, #-16]!
     stp     x0, x1, [sp, #-16]!
 
@@ -344,21 +340,19 @@ irq_from_kernel:
 /*
  * IRQ from user mode - save to trap frame, potentially switch tasks
  * Similar to svc_handler but for asynchronous preemption
+ *
+ * Must switch TTBR0 to kernel identity for vtables to work.
  */
 irq_from_user:
-    /*
-     * CRITICAL: Switch TTBR0 to kernel identity mapping BEFORE any stack access!
-     * Use TPIDR_EL1 as scratch to save x9.
-     */
+    /* Save x9 and switch TTBR0 to kernel identity (for vtables) */
     msr     tpidr_el1, x9           // Save original x9 to scratch register
 
-    /* Switch to kernel TTBR0 */
     adrp    x9, KERNEL_TTBR0
     ldr     x9, [x9, :lo12:KERNEL_TTBR0]
     msr     ttbr0_el1, x9
     isb
 
-    /* Now kernel stack is accessible - save x10, x11, x12 to stack */
+    /* Now save x10-x12 to kernel stack */
     stp     x10, x11, [sp, #-16]!
     str     x12, [sp, #-8]!
 
@@ -366,7 +360,7 @@ irq_from_user:
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
-    /* Save all general purpose registers to trap frame */
+    /* Save all general purpose registers to trap frame (now via TTBR1) */
     stp     x0, x1, [x9, #0]        // x0=0, x1=8
     stp     x2, x3, [x9, #16]       // x2=16, x3=24
     stp     x4, x5, [x9, #32]       // x4=32, x5=40
@@ -418,6 +412,21 @@ irq_from_user:
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
+    /* Always switch TTBR0 back to current task's user address space.
+     * We switched to kernel identity on entry, must switch back.
+     * Always do TLBI to avoid TLB conflict. */
+    adrp    x10, CURRENT_TTBR0
+    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    msr     ttbr0_el1, x10
+    isb
+    tlbi    vmalle1
+    dsb     sy
+    isb
+
+    /* Convert trap frame pointer to TTBR1 for access after TTBR0 switch */
+    movz    x10, #0xFFFF, lsl #48
+    orr     x9, x9, x10
+
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]         // sp_el0
     ldr     x11, [x9, #256]         // elr_el1
@@ -425,29 +434,8 @@ irq_from_user:
     msr     sp_el0, x10
     msr     elr_el1, x11
     msr     spsr_el1, x12
-
-    /* Load CURRENT_TTBR0 (may be different task's address space) */
-    adrp    x10, CURRENT_TTBR0
-    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
-    msr     ttbr0_el1, x10
-    isb
-
-    /* ONLY invalidate TLB if we actually switched tasks.
-     * This is a major performance optimization - TLB invalidation on every
-     * IRQ return would make the MMU useless under interrupt load. */
-    adrp    x11, SYSCALL_SWITCHED_TASK
-    ldr     x11, [x11, :lo12:SYSCALL_SWITCHED_TASK]
-    cbz     x11, .Lirq_skip_tlbi
-    tlbi    vmalle1
-    dsb     sy
-.Lirq_skip_tlbi:
-    isb
-
-    /* Convert x9 (trap frame pointer) from physical to TTBR1 virtual address */
-    movz    x10, #0xFFFF, lsl #48
-    orr     x9, x9, x10
-
     /* Restore all general purpose registers from trap frame */
+    /* x9 already holds TTBR1 virtual address */
     ldp     x0, x1, [x9, #0]
     ldp     x2, x3, [x9, #16]
     ldp     x4, x5, [x9, #32]
@@ -479,9 +467,9 @@ irq_from_user:
  */
 svc_handler:
     /*
-     * CRITICAL: Switch TTBR0 to kernel identity mapping BEFORE any stack access!
-     * The kernel stack is at a physical address that isn't mapped in user TTBR0.
-     * Use TPIDR_EL1 as scratch to save x9.
+     * Switch TTBR0 to kernel identity mapping.
+     * This is required because Rust vtables contain physical addresses.
+     * SP is a TTBR1 address but indirect calls (blr) need physical addresses mapped.
      */
     msr     tpidr_el1, x9           // Save original x9 to scratch register
 
@@ -491,7 +479,7 @@ svc_handler:
     msr     ttbr0_el1, x9
     isb
 
-    /* Now kernel stack is accessible - save x10, x11, x12 to stack */
+    /* Now kernel code can use vtables - save x10, x11, x12 to stack */
     stp     x10, x11, [sp, #-16]!
     str     x12, [sp, #-8]!
 
@@ -552,16 +540,31 @@ svc_handler:
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
-    /* Check if syscall switched tasks - if so, skip storing return value */
-    /* (the switched-to task already has its own x0, we shouldn't overwrite it) */
+    /* Check if syscall switched tasks - only store return value if same task */
     adrp    x10, SYSCALL_SWITCHED_TASK
     ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
-    cbnz    x10, .Lskip_store_retval
+    cbnz    x10, .Lsvc_skip_retval
 
-    /* Store syscall return value in trap frame x0 (only if same task) */
+    /* Same task: store syscall return value */
     str     x0, [x9, #0]
-.Lskip_store_retval:
 
+.Lsvc_skip_retval:
+    /* Always switch TTBR0 back to current task's user address space.
+     * We switched to kernel identity mapping on entry, must switch back.
+     * Always do TLBI because kernel TTBR0 (1GB blocks) and user TTBR0 (4KB pages)
+     * create conflicting TLB entries for the same virtual addresses.
+     * TODO: Use ASIDs to avoid TLBI on every syscall. */
+    adrp    x10, CURRENT_TTBR0
+    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    msr     ttbr0_el1, x10
+    isb
+    tlbi    vmalle1
+    dsb     sy
+    isb
+
+    /* Convert trap frame pointer to TTBR1 address for access after TTBR0 switch */
+    movz    x10, #0xFFFF, lsl #48
+    orr     x9, x9, x10
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]         // sp_el0
     ldr     x11, [x9, #256]         // elr_el1
@@ -570,30 +573,8 @@ svc_handler:
     msr     elr_el1, x11
     msr     spsr_el1, x12
 
-    /* Load CURRENT_TTBR0 (may be different task's address space) */
-    adrp    x10, CURRENT_TTBR0
-    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
-    msr     ttbr0_el1, x10
-    isb
-
-    /* ONLY invalidate TLB if we actually switched tasks.
-     * This is a major performance optimization - TLB invalidation on every
-     * syscall return would make the MMU useless under load. */
-    adrp    x10, SYSCALL_SWITCHED_TASK
-    ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
-    cbz     x10, .Lsyscall_skip_tlbi
-    tlbi    vmalle1
-    dsb     sy
-.Lsyscall_skip_tlbi:
-    isb
-
-    /* Convert x9 (trap frame pointer) from physical to TTBR1 virtual address.
-     * After TTBR0 switch, we can only access kernel memory via TTBR1. */
-    movz    x10, #0xFFFF, lsl #48
-    orr     x9, x9, x10
-
     /* Restore all general purpose registers from trap frame */
-    /* x9 now holds TTBR1 virtual address of trap frame */
+    /* x9 already holds TTBR1 virtual address of trap frame */
     ldp     x0, x1, [x9, #0]        // x0=0, x1=8
     ldp     x2, x3, [x9, #16]       // x2=16, x3=24
     ldp     x4, x5, [x9, #32]       // x4=32, x5=40

@@ -4,15 +4,22 @@
 //! volatile semantics and memory barriers.
 //!
 //! All device register access should go through this module.
+//!
+//! After MMU is enabled, MMIO addresses are accessed via TTBR1 (kernel virtual
+//! addresses) to avoid dependency on TTBR0 which may be pointing to user space.
 
 #![allow(dead_code)]  // Many methods are infrastructure for drivers
 
 use core::ptr::{read_volatile, write_volatile};
+use crate::arch::aarch64::mmu;
 
 /// A memory-mapped I/O region.
 ///
 /// Wraps a base address and provides methods for reading/writing registers
 /// with correct volatile semantics and optional barriers.
+///
+/// Before MMU is enabled, uses physical addresses directly.
+/// After MMU is enabled, converts to TTBR1 virtual addresses.
 ///
 /// # Example
 /// ```
@@ -23,6 +30,7 @@ use core::ptr::{read_volatile, write_volatile};
 /// ```
 #[derive(Clone, Copy)]
 pub struct MmioRegion {
+    /// Physical base address
     base: usize,
 }
 
@@ -31,6 +39,19 @@ impl MmioRegion {
     #[inline]
     pub const fn new(base: usize) -> Self {
         Self { base }
+    }
+
+    /// Get the effective address for MMIO access.
+    /// Before MMU: returns physical address
+    /// After MMU: returns TTBR1 virtual address
+    #[inline]
+    fn effective_addr(&self, offset: usize) -> usize {
+        let phys = self.base + offset;
+        if mmu::is_enabled() {
+            phys | mmu::KERNEL_VIRT_BASE as usize
+        } else {
+            phys
+        }
     }
 
     /// Get the base address of this region.
@@ -46,13 +67,13 @@ impl MmioRegion {
     /// Read an 8-bit register at the given offset.
     #[inline]
     pub fn read8(&self, offset: usize) -> u8 {
-        unsafe { read_volatile((self.base + offset) as *const u8) }
+        unsafe { read_volatile(self.effective_addr(offset) as *const u8) }
     }
 
     /// Write an 8-bit register at the given offset.
     #[inline]
     pub fn write8(&self, offset: usize, value: u8) {
-        unsafe { write_volatile((self.base + offset) as *mut u8, value) }
+        unsafe { write_volatile(self.effective_addr(offset) as *mut u8, value) }
     }
 
     // =========================================================================
@@ -62,13 +83,13 @@ impl MmioRegion {
     /// Read a 16-bit register at the given offset.
     #[inline]
     pub fn read16(&self, offset: usize) -> u16 {
-        unsafe { read_volatile((self.base + offset) as *const u16) }
+        unsafe { read_volatile(self.effective_addr(offset) as *const u16) }
     }
 
     /// Write a 16-bit register at the given offset.
     #[inline]
     pub fn write16(&self, offset: usize, value: u16) {
-        unsafe { write_volatile((self.base + offset) as *mut u16, value) }
+        unsafe { write_volatile(self.effective_addr(offset) as *mut u16, value) }
     }
 
     // =========================================================================
@@ -78,13 +99,13 @@ impl MmioRegion {
     /// Read a 32-bit register at the given offset.
     #[inline]
     pub fn read32(&self, offset: usize) -> u32 {
-        unsafe { read_volatile((self.base + offset) as *const u32) }
+        unsafe { read_volatile(self.effective_addr(offset) as *const u32) }
     }
 
     /// Write a 32-bit register at the given offset.
     #[inline]
     pub fn write32(&self, offset: usize, value: u32) {
-        unsafe { write_volatile((self.base + offset) as *mut u32, value) }
+        unsafe { write_volatile(self.effective_addr(offset) as *mut u32, value) }
     }
 
     /// Write a 32-bit register and read it back (for ordering).
@@ -128,13 +149,13 @@ impl MmioRegion {
     /// Read a 64-bit register at the given offset.
     #[inline]
     pub fn read64(&self, offset: usize) -> u64 {
-        unsafe { read_volatile((self.base + offset) as *const u64) }
+        unsafe { read_volatile(self.effective_addr(offset) as *const u64) }
     }
 
     /// Write a 64-bit register at the given offset.
     #[inline]
     pub fn write64(&self, offset: usize, value: u64) {
-        unsafe { write_volatile((self.base + offset) as *mut u64, value) }
+        unsafe { write_volatile(self.effective_addr(offset) as *mut u64, value) }
     }
 
     // =========================================================================

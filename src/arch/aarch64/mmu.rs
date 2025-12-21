@@ -232,6 +232,11 @@ pub fn init() {
 }
 
 /// Enable the MMU with separate kernel and user address spaces
+///
+/// After this function returns:
+/// - TTBR0: identity mapping (for initial boot, will be replaced by user page tables)
+/// - TTBR1: kernel virtual addresses (0xFFFF_0000_xxxx_xxxx)
+/// - SP: converted to TTBR1 address so kernel never needs TTBR0
 pub fn enable() {
     unsafe {
         let id_tables = &*core::ptr::addr_of!(IDENTITY_TABLES);
@@ -245,11 +250,8 @@ pub fn enable() {
         // Set TCR_EL1
         core::arch::asm!("msr tcr_el1, {}", in(reg) TCR_VALUE);
 
-        // Set TTBR0_EL1 (user space / identity mapping)
+        // Set TTBR0_EL1 (user space / identity mapping for boot)
         core::arch::asm!("msr ttbr0_el1, {}", in(reg) ttbr0);
-
-        // Save kernel TTBR0 for syscall handler to restore when entering kernel
-        *core::ptr::addr_of_mut!(KERNEL_TTBR0) = ttbr0;
 
         // Set TTBR1_EL1 (kernel space)
         core::arch::asm!("msr ttbr1_el1, {}", in(reg) ttbr1);
@@ -273,6 +275,49 @@ pub fn enable() {
 
         core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr);
         core::arch::asm!("isb");
+
+        // Jump to TTBR1 address space.
+        // After MMU enable, PC is still using physical addresses (via TTBR0 identity mapping).
+        // We need to switch PC to TTBR1 virtual addresses so kernel code continues to work
+        // even after TTBR0 is switched to user page tables.
+        //
+        // Strategy: Get current PC, convert to TTBR1, branch there.
+        // Also convert SP and LR (return address) to TTBR1.
+        core::arch::asm!(
+            // Get address of next instruction (after this asm block)
+            "adr {tmp}, 1f",
+            // Convert to TTBR1 virtual address
+            "orr {tmp}, {tmp}, {base}",
+            // Convert SP to TTBR1
+            "mov {tmp2}, sp",
+            "orr {tmp2}, {tmp2}, {base}",
+            "mov sp, {tmp2}",
+            // Convert LR (return address) to TTBR1
+            "orr x30, x30, {base}",
+            // Jump to TTBR1 space - after this, PC is in TTBR1
+            "br {tmp}",
+            "1:",
+            tmp = out(reg) _,
+            tmp2 = out(reg) _,
+            base = in(reg) KERNEL_VIRT_BASE,
+            // x30 (LR) is modified
+            out("x30") _,
+        );
+    }
+}
+
+/// Kernel TTBR0 value (identity mapping) - accessible from assembly
+/// This is set during MMU init and used by syscall handler to switch back to kernel space.
+/// Required because vtables contain physical addresses.
+#[no_mangle]
+pub static mut KERNEL_TTBR0: u64 = 0;
+
+/// Initialize KERNEL_TTBR0 after MMU enable
+/// Must be called after mmu::enable()
+pub fn init_kernel_ttbr0() {
+    unsafe {
+        let id_tables = &*core::ptr::addr_of!(IDENTITY_TABLES);
+        KERNEL_TTBR0 = &id_tables.l0 as *const _ as u64;
     }
 }
 
@@ -290,10 +335,6 @@ pub unsafe fn switch_user_space(ttbr0_phys: u64) {
     );
 }
 
-/// Kernel TTBR0 value (identity mapping) - accessible from assembly
-/// This is set during MMU init and used by syscall handler to switch back to kernel space
-#[no_mangle]
-pub static mut KERNEL_TTBR0: u64 = 0;
 
 /// Get current TTBR0 value
 pub fn ttbr0() -> u64 {
