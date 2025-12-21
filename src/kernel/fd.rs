@@ -3,9 +3,9 @@
 //! Provides file descriptor abstraction for user processes.
 //! In Redox style, everything is a file - console, devices, IPC, etc.
 
-use crate::ipc::{self, MessageType};
-use crate::process::Pid;
-use crate::uart;
+use super::ipc::{self, MessageType};
+use super::process::Pid;
+use crate::platform::mt7988::uart;
 
 /// Maximum file descriptors per process
 pub const MAX_FDS: usize = 32;
@@ -256,19 +256,19 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                     None => {
                         // No data available - switch to another task if possible
                         unsafe {
-                            let sched = crate::task::scheduler();
+                            let sched = super::task::scheduler();
                             if let Some(next_slot) = sched.schedule() {
                                 if next_slot != sched.current {
                                     // Mark current as ready and switch
                                     if let Some(ref mut current) = sched.tasks[sched.current] {
-                                        current.state = crate::task::TaskState::Ready;
+                                        current.state = super::task::TaskState::Ready;
                                     }
                                     sched.current = next_slot;
                                     if let Some(ref mut next) = sched.tasks[next_slot] {
-                                        next.state = crate::task::TaskState::Running;
+                                        next.state = super::task::TaskState::Running;
                                     }
-                                    crate::task::update_current_task_globals();
-                                    crate::task::SYSCALL_SWITCHED_TASK = 1;
+                                    super::task::update_current_task_globals();
+                                    super::task::SYSCALL_SWITCHED_TASK = 1;
                                 }
                             }
                         }
@@ -332,8 +332,8 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
         }
         FdType::Scheme { scheme_id, handle, scheme_flags } => {
             // Read from kernel scheme
-            if let Some(scheme) = crate::scheme::get_kernel_scheme_by_id(scheme_id) {
-                let scheme_handle = crate::scheme::SchemeHandle {
+            if let Some(scheme) = super::scheme::get_kernel_scheme_by_id(scheme_id) {
+                let scheme_handle = super::scheme::SchemeHandle {
                     scheme_id,
                     handle,
                     flags: scheme_flags,
@@ -431,8 +431,8 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
         }
         FdType::Scheme { scheme_id, handle, scheme_flags } => {
             // Write to kernel scheme
-            if let Some(scheme) = crate::scheme::get_kernel_scheme_by_id(scheme_id) {
-                let scheme_handle = crate::scheme::SchemeHandle {
+            if let Some(scheme) = super::scheme::get_kernel_scheme_by_id(scheme_id) {
+                let scheme_handle = super::scheme::SchemeHandle {
                     scheme_id,
                     handle,
                     flags: scheme_flags,

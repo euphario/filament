@@ -15,7 +15,7 @@
 //! SECURITY: All user pointers are validated before access using the uaccess module.
 
 use crate::println;
-use crate::uaccess::{self, UAccessError};
+use super::uaccess::{self, UAccessError};
 
 /// Syscall numbers
 #[repr(u64)]
@@ -251,16 +251,16 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Dup => sys_dup(args.arg0 as u32),
         SyscallNumber::Dup2 => sys_dup2(args.arg0 as u32, args.arg1 as u32),
         SyscallNumber::EventSubscribe => {
-            crate::event::sys_event_subscribe(args.arg0 as u32, args.arg1, current_pid())
+            super::event::sys_event_subscribe(args.arg0 as u32, args.arg1, current_pid())
         }
         SyscallNumber::EventUnsubscribe => {
-            crate::event::sys_event_unsubscribe(args.arg0 as u32, args.arg1, current_pid())
+            super::event::sys_event_unsubscribe(args.arg0 as u32, args.arg1, current_pid())
         }
         SyscallNumber::EventWait => {
             sys_event_wait(args.arg0, args.arg1 as u32)
         }
         SyscallNumber::EventPost => {
-            crate::event::sys_event_post(args.arg0 as u32, args.arg1 as u32, args.arg2, current_pid())
+            super::event::sys_event_post(args.arg0 as u32, args.arg1 as u32, args.arg2, current_pid())
         }
         SyscallNumber::SchemeOpen => {
             sys_scheme_open(args.arg0, args.arg1 as usize, args.arg2 as u32)
@@ -297,7 +297,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
 /// Get current process ID from scheduler
 fn current_pid() -> u32 {
     unsafe {
-        crate::task::scheduler().current_task_id().unwrap_or(1)
+        super::task::scheduler().current_task_id().unwrap_or(1)
     }
 }
 
@@ -309,7 +309,7 @@ fn sys_exit(code: i32) -> i64 {
     println!("========================================");
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         let current_slot = sched.current;
 
         // Get current task's info before terminating
@@ -322,18 +322,18 @@ fn sys_exit(code: i32) -> i64 {
         // Set exit code and mark as terminated
         if let Some(ref mut task) = sched.tasks[current_slot] {
             task.exit_code = code;
-            task.state = crate::task::TaskState::Terminated;
+            task.state = super::task::TaskState::Terminated;
         }
 
         // Wake up parent if it's blocked (waiting for children)
         if parent_id != 0 {
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut task) = task_opt {
-                    if task.id == parent_id && task.state == crate::task::TaskState::Blocked {
+                    if task.id == parent_id && task.state == super::task::TaskState::Blocked {
                         // Wake up the parent
-                        task.state = crate::task::TaskState::Ready;
+                        task.state = super::task::TaskState::Ready;
                         // Send ChildExit event
-                        let event = crate::event::Event::child_exit(pid, code);
+                        let event = super::event::Event::child_exit(pid, code);
                         task.event_queue.push(event);
                         break;
                     }
@@ -350,9 +350,9 @@ fn sys_exit(code: i32) -> i64 {
             // Mark next task as running and update globals
             sched.current = next_slot;
             if let Some(ref mut task) = sched.tasks[next_slot] {
-                task.state = crate::task::TaskState::Running;
+                task.state = super::task::TaskState::Running;
             }
-            crate::task::update_current_task_globals();
+            super::task::update_current_task_globals();
             println!("  Switching to task {}", next_slot);
             // Return - svc_handler will load new task's state and eret
             0
@@ -371,12 +371,12 @@ fn sys_exit(code: i32) -> i64 {
 /// This ensures yield() actually pauses when used for polling delays.
 fn sys_yield() -> i64 {
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         let caller_slot = sched.current;
 
         // Mark current as ready (not running)
         if let Some(ref mut task) = sched.tasks[caller_slot] {
-            task.state = crate::task::TaskState::Ready;
+            task.state = super::task::TaskState::Ready;
             // Pre-store return value in caller's trap frame
             task.trap_frame.x0 = 0;
         }
@@ -386,11 +386,11 @@ fn sys_yield() -> i64 {
             if next_slot != caller_slot {
                 sched.current = next_slot;
                 if let Some(ref mut task) = sched.tasks[next_slot] {
-                    task.state = crate::task::TaskState::Running;
+                    task.state = super::task::TaskState::Running;
                 }
-                crate::task::update_current_task_globals();
+                super::task::update_current_task_globals();
                 // Signal to assembly not to store return value
-                crate::task::SYSCALL_SWITCHED_TASK = 1;
+                super::task::SYSCALL_SWITCHED_TASK = 1;
             } else {
                 // Same task - no other task ready to run
                 // Use WFI to actually wait for an interrupt before returning
@@ -399,7 +399,7 @@ fn sys_yield() -> i64 {
 
                 // Mark as running again after waking from WFI
                 if let Some(ref mut task) = sched.tasks[caller_slot] {
-                    task.state = crate::task::TaskState::Running;
+                    task.state = super::task::TaskState::Running;
                 }
             }
         }
@@ -430,7 +430,7 @@ fn sys_debug_write(buf_ptr: u64, len: usize) -> i64 {
         if byte == 0 {
             break;
         }
-        crate::uart::putc(byte as char);
+        crate::platform::mt7988::uart::putc(byte as char);
     }
 
     len as i64
@@ -443,8 +443,8 @@ fn sys_getpid() -> i64 {
 
 /// Get system time in nanoseconds
 fn sys_gettime() -> i64 {
-    let counter = crate::timer::counter();
-    let freq = crate::timer::frequency();
+    let counter = crate::platform::mt7988::timer::counter();
+    let freq = crate::platform::mt7988::timer::frequency();
     // Convert counter to nanoseconds
     if freq > 0 {
         ((counter as u128 * 1_000_000_000) / freq as u128) as i64
@@ -466,7 +466,7 @@ fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
     let executable = (prot & 0x4) != 0; // PROT_EXEC
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             match task.mmap(size, writable, executable) {
                 Some(virt_addr) => virt_addr as i64,
@@ -495,7 +495,7 @@ fn sys_mmap_dma(size: usize, phys_ptr: u64) -> i64 {
     }
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             match task.mmap_dma(size) {
                 Some((virt_addr, phys_addr)) => {
@@ -531,7 +531,7 @@ fn sys_munmap(addr: u64, size: usize) -> i64 {
     }
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if task.munmap(addr, size) {
                 SyscallError::Success as i64
@@ -549,14 +549,14 @@ fn sys_munmap(addr: u64, size: usize) -> i64 {
 /// SECURITY: Copies user buffer via page table translation
 fn sys_send(channel_id: u32, data_ptr: u64, data_len: usize) -> i64 {
     // Validate length
-    if data_len > crate::ipc::MAX_INLINE_PAYLOAD {
+    if data_len > super::ipc::MAX_INLINE_PAYLOAD {
         return SyscallError::InvalidArgument as i64;
     }
 
     let caller_pid = current_pid();
 
     // Copy from user space if we have data
-    let mut kernel_buf = [0u8; crate::ipc::MAX_INLINE_PAYLOAD];
+    let mut kernel_buf = [0u8; super::ipc::MAX_INLINE_PAYLOAD];
     if data_len > 0 {
         match uaccess::copy_from_user(&mut kernel_buf[..data_len], data_ptr) {
             Ok(_) => {}
@@ -566,7 +566,7 @@ fn sys_send(channel_id: u32, data_ptr: u64, data_len: usize) -> i64 {
 
     // Send via IPC
     let data = if data_len > 0 { &kernel_buf[..data_len] } else { &[] };
-    match crate::ipc::sys_send(channel_id, caller_pid, data) {
+    match super::ipc::sys_send(channel_id, caller_pid, data) {
         Ok(()) => SyscallError::Success as i64,
         Err(e) => e.to_errno() as i64,
     }
@@ -586,7 +586,7 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 
     let caller_pid = current_pid();
 
-    match crate::ipc::sys_receive(channel_id, caller_pid) {
+    match super::ipc::sys_receive(channel_id, caller_pid) {
         Ok(msg) => {
             // Copy message to user buffer
             let copy_len = core::cmp::min(msg.header.payload_len as usize, buf_len);
@@ -608,7 +608,7 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 fn sys_channel_create() -> i64 {
     let caller_pid = current_pid();
 
-    match crate::ipc::sys_channel_create(caller_pid) {
+    match super::ipc::sys_channel_create(caller_pid) {
         Ok((ch_a, ch_b)) => {
             // Pack both channel IDs into return value
             ((ch_b as i64) << 32) | (ch_a as i64)
@@ -621,7 +621,7 @@ fn sys_channel_create() -> i64 {
 fn sys_channel_close(channel_id: u32) -> i64 {
     let caller_pid = current_pid();
 
-    match crate::ipc::sys_channel_close(channel_id, caller_pid) {
+    match super::ipc::sys_channel_close(channel_id, caller_pid) {
         Ok(()) => SyscallError::Success as i64,
         Err(e) => e.to_errno() as i64,
     }
@@ -631,7 +631,7 @@ fn sys_channel_close(channel_id: u32) -> i64 {
 fn sys_channel_transfer(channel_id: u32, to_pid: u32) -> i64 {
     let caller_pid = current_pid();
 
-    match crate::ipc::sys_channel_transfer(channel_id, caller_pid, to_pid) {
+    match super::ipc::sys_channel_transfer(channel_id, caller_pid, to_pid) {
         Ok(()) => SyscallError::Success as i64,
         Err(e) => e.to_errno() as i64,
     }
@@ -641,7 +641,7 @@ fn sys_channel_transfer(channel_id: u32, to_pid: u32) -> i64 {
 /// SECURITY: Copies user name buffer via page table translation
 fn sys_port_register(name_ptr: u64, name_len: usize) -> i64 {
     // Validate length
-    if name_len == 0 || name_len > crate::port::MAX_PORT_NAME {
+    if name_len == 0 || name_len > super::port::MAX_PORT_NAME {
         return SyscallError::InvalidArgument as i64;
     }
 
@@ -655,7 +655,7 @@ fn sys_port_register(name_ptr: u64, name_len: usize) -> i64 {
     let caller_pid = current_pid();
 
     // Register port using kernel buffer
-    match crate::port::sys_port_register_buf(&name_buf[..name_len], caller_pid) {
+    match super::port::sys_port_register_buf(&name_buf[..name_len], caller_pid) {
         Ok(channel_id) => channel_id as i64,
         Err(e) => e.to_errno() as i64,
     }
@@ -665,7 +665,7 @@ fn sys_port_register(name_ptr: u64, name_len: usize) -> i64 {
 /// SECURITY: Copies user name buffer via page table translation
 fn sys_port_unregister(name_ptr: u64, name_len: usize) -> i64 {
     // Validate length
-    if name_len == 0 || name_len > crate::port::MAX_PORT_NAME {
+    if name_len == 0 || name_len > super::port::MAX_PORT_NAME {
         return SyscallError::InvalidArgument as i64;
     }
 
@@ -678,7 +678,7 @@ fn sys_port_unregister(name_ptr: u64, name_len: usize) -> i64 {
 
     let caller_pid = current_pid();
 
-    match crate::port::sys_port_unregister_buf(&name_buf[..name_len], caller_pid) {
+    match super::port::sys_port_unregister_buf(&name_buf[..name_len], caller_pid) {
         Ok(()) => SyscallError::Success as i64,
         Err(e) => e.to_errno() as i64,
     }
@@ -688,7 +688,7 @@ fn sys_port_unregister(name_ptr: u64, name_len: usize) -> i64 {
 /// SECURITY: Copies user name buffer via page table translation
 fn sys_port_connect(name_ptr: u64, name_len: usize) -> i64 {
     // Validate length
-    if name_len == 0 || name_len > crate::port::MAX_PORT_NAME {
+    if name_len == 0 || name_len > super::port::MAX_PORT_NAME {
         return SyscallError::InvalidArgument as i64;
     }
 
@@ -701,7 +701,7 @@ fn sys_port_connect(name_ptr: u64, name_len: usize) -> i64 {
 
     let caller_pid = current_pid();
 
-    match crate::port::sys_port_connect_buf(&name_buf[..name_len], caller_pid) {
+    match super::port::sys_port_connect_buf(&name_buf[..name_len], caller_pid) {
         Ok(channel_id) => channel_id as i64,
         Err(e) => e.to_errno() as i64,
     }
@@ -711,7 +711,7 @@ fn sys_port_connect(name_ptr: u64, name_len: usize) -> i64 {
 fn sys_port_accept(listen_channel: u32) -> i64 {
     let caller_pid = current_pid();
 
-    match crate::port::sys_port_accept(listen_channel, caller_pid) {
+    match super::port::sys_port_accept(listen_channel, caller_pid) {
         Ok(channel_id) => channel_id as i64,
         Err(e) => e.to_errno() as i64,
     }
@@ -735,14 +735,14 @@ fn sys_open(path_ptr: u64, path_len: usize, flags: u32) -> i64 {
     }
 
     // Try to open the path
-    let entry = match crate::fd::open_path(&path_buf[..path_len], flags) {
+    let entry = match super::fd::open_path(&path_buf[..path_len], flags) {
         Some(e) => e,
         None => return SyscallError::NotFound as i64,
     };
 
     // Allocate an FD in the current process
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if let Some(fd) = task.fd_table.alloc() {
                 task.fd_table.set(fd, entry);
@@ -760,7 +760,7 @@ fn sys_open(path_ptr: u64, path_len: usize, flags: u32) -> i64 {
 /// Returns: 0 on success, negative error on failure
 fn sys_close(fd: u32) -> i64 {
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if task.fd_table.close(fd) {
                 return SyscallError::Success as i64;
@@ -794,11 +794,11 @@ fn sys_read(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
     let bytes_read: isize;
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             let caller_pid = task.id;
             if let Some(entry) = task.fd_table.get(fd) {
-                bytes_read = crate::fd::fd_read(entry, &mut kernel_buf[..buf_len], caller_pid);
+                bytes_read = super::fd::fd_read(entry, &mut kernel_buf[..buf_len], caller_pid);
             } else {
                 return SyscallError::BadFd as i64;
             }
@@ -847,11 +847,11 @@ fn sys_write(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
     }
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref task) = sched.tasks[sched.current] {
             let caller_pid = task.id;
             if let Some(entry) = task.fd_table.get(fd) {
-                return crate::fd::fd_write(entry, &kernel_buf[..buf_len], caller_pid) as i64;
+                return super::fd::fd_write(entry, &kernel_buf[..buf_len], caller_pid) as i64;
             }
         }
     }
@@ -863,7 +863,7 @@ fn sys_write(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 /// Returns: new fd on success, negative error on failure
 fn sys_dup(old_fd: u32) -> i64 {
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if let Some(new_fd) = task.fd_table.dup(old_fd) {
                 return new_fd as i64;
@@ -878,7 +878,7 @@ fn sys_dup(old_fd: u32) -> i64 {
 /// Returns: new_fd on success, negative error on failure
 fn sys_dup2(old_fd: u32, new_fd: u32) -> i64 {
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if task.fd_table.dup2(old_fd, new_fd) {
                 return new_fd as i64;
@@ -893,7 +893,7 @@ fn sys_dup2(old_fd: u32, new_fd: u32) -> i64 {
 /// Returns: new position on success, negative error on failure
 fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if let Some(entry) = task.fd_table.get_mut(fd) {
                 let new_pos = match whence {
@@ -917,7 +917,7 @@ fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
                         // SEEK_END: relative to end of file
                         // Get file size based on fd type
                         let file_size = match entry.fd_type {
-                            crate::fd::FdType::Ramfs { size, .. } => size as i64,
+                            super::fd::FdType::Ramfs { size, .. } => size as i64,
                             _ => return SyscallError::NotImplemented as i64,
                         };
                         let new = file_size + offset;
@@ -954,11 +954,11 @@ fn sys_scheme_open(url_ptr: u64, url_len: usize, flags: u32) -> i64 {
     }
 
     // Try to open via scheme system
-    match crate::scheme::open_url(&url_buf[..url_len], flags) {
+    match super::scheme::open_url(&url_buf[..url_len], flags) {
         Ok((fd_entry, _handle)) => {
             // Allocate FD and store entry
             unsafe {
-                let sched = crate::task::scheduler();
+                let sched = super::task::scheduler();
                 if let Some(ref mut task) = sched.tasks[sched.current] {
                     if let Some(fd) = task.fd_table.alloc() {
                         task.fd_table.set(fd, fd_entry);
@@ -999,13 +999,13 @@ fn sys_scheme_register(name_ptr: u64, name_len: usize, channel_id: u32) -> i64 {
     };
 
     // Check if name conflicts with kernel schemes
-    if crate::scheme::get_kernel_scheme(name).is_some() {
+    if super::scheme::get_kernel_scheme(name).is_some() {
         return SyscallError::AlreadyExists as i64;
     }
 
     // Register the user scheme
     unsafe {
-        let reg = crate::scheme::registry();
+        let reg = super::scheme::registry();
         if reg.register_user(name, owner_pid, channel_id).is_some() {
             0
         } else {
@@ -1042,10 +1042,10 @@ fn sys_scheme_unregister(name_ptr: u64, name_len: usize) -> i64 {
 
     // Check ownership and unregister
     unsafe {
-        let reg = crate::scheme::registry();
+        let reg = super::scheme::registry();
         if let Some(entry) = reg.find(name) {
             // Verify ownership
-            if entry.scheme_type != crate::scheme::SchemeType::User {
+            if entry.scheme_type != super::scheme::SchemeType::User {
                 return SyscallError::PermissionDenied as i64;
             }
             if entry.owner_pid != owner_pid {
@@ -1081,7 +1081,7 @@ fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
     }
 
     // Get the ELF binary by ID
-    let elf_data = match crate::elf::get_elf_by_id(elf_id) {
+    let elf_data = match super::elf::get_elf_by_id(elf_id) {
         Some(data) => data,
         None => return SyscallError::NotFound as i64,
     };
@@ -1093,7 +1093,7 @@ fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
     let parent_id = current_pid();
 
     // Spawn the child process
-    match crate::elf::spawn_from_elf_with_parent(elf_data, name, parent_id) {
+    match super::elf::spawn_from_elf_with_parent(elf_data, name, parent_id) {
         Ok((child_id, _slot)) => child_id as i64,
         Err(_) => SyscallError::OutOfMemory as i64,
     }
@@ -1126,9 +1126,9 @@ fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
     let parent_id = current_pid();
 
     // Try to spawn from ramfs path
-    match crate::elf::spawn_from_path_with_parent(path, parent_id) {
+    match super::elf::spawn_from_path_with_parent(path, parent_id) {
         Ok((child_id, _slot)) => child_id as i64,
-        Err(crate::elf::ElfError::NotExecutable) => SyscallError::NotFound as i64,
+        Err(super::elf::ElfError::NotExecutable) => SyscallError::NotFound as i64,
         Err(_) => SyscallError::OutOfMemory as i64,
     }
 }
@@ -1148,7 +1148,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
     }
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
 
         // Find the calling task
         let caller_slot = sched.current;
@@ -1176,7 +1176,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
                 }
 
                 // Check if terminated
-                if task.state == crate::task::TaskState::Terminated {
+                if task.state == super::task::TaskState::Terminated {
                     let child_pid = task.id;
                     let exit_code = task.exit_code;
 
@@ -1210,7 +1210,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
 
         // No terminated children found - need to block and switch
         if let Some(ref mut parent) = sched.tasks[caller_slot] {
-            parent.state = crate::task::TaskState::Blocked;
+            parent.state = super::task::TaskState::Blocked;
             // Pre-store return value in caller's trap frame
             parent.trap_frame.x0 = SyscallError::WouldBlock as i64 as u64;
         }
@@ -1220,10 +1220,10 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
             if next_slot != caller_slot {
                 sched.current = next_slot;
                 if let Some(ref mut next) = sched.tasks[next_slot] {
-                    next.state = crate::task::TaskState::Running;
+                    next.state = super::task::TaskState::Running;
                 }
-                crate::task::update_current_task_globals();
-                crate::task::SYSCALL_SWITCHED_TASK = 1;
+                super::task::update_current_task_globals();
+                super::task::SYSCALL_SWITCHED_TASK = 1;
             }
         }
 
@@ -1237,20 +1237,20 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
 /// SECURITY: Writes Event struct via page table translation
 fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
     // Validate user pointer for writing an Event struct
-    let event_size = core::mem::size_of::<crate::event::Event>();
+    let event_size = core::mem::size_of::<super::event::Event>();
     if let Err(e) = uaccess::validate_user_write(event_buf, event_size) {
         return uaccess_to_errno(e);
     }
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             // First check for pending events in global system
             let pid = task.id;
-            if let Some(event) = crate::event::event_system().get_pending_for(pid) {
+            if let Some(event) = super::event::event_system().get_pending_for(pid) {
                 // Copy event to user buffer via page table translation
                 let event_bytes = core::slice::from_raw_parts(
-                    &event as *const crate::event::Event as *const u8,
+                    &event as *const super::event::Event as *const u8,
                     event_size
                 );
                 if let Err(e) = uaccess::copy_to_user(event_buf, event_bytes) {
@@ -1262,7 +1262,7 @@ fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
             // Check task's event queue
             if let Some(event) = task.event_queue.pop() {
                 let event_bytes = core::slice::from_raw_parts(
-                    &event as *const crate::event::Event as *const u8,
+                    &event as *const super::event::Event as *const u8,
                     event_size
                 );
                 if let Err(e) = uaccess::copy_to_user(event_buf, event_bytes) {
@@ -1278,7 +1278,7 @@ fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
             }
 
             // Would block - mark task as waiting
-            task.state = crate::task::TaskState::Blocked;
+            task.state = super::task::TaskState::Blocked;
             return SyscallError::WouldBlock as i64;
         }
     }
@@ -1314,7 +1314,7 @@ fn sys_daemonize() -> i64 {
     let caller_pid = current_pid();
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
 
         // Find the calling task
         let mut parent_id = 0u32;
@@ -1336,8 +1336,8 @@ fn sys_daemonize() -> i64 {
                     if task.id == parent_id {
                         task.remove_child(caller_pid);
                         // Wake up parent if it's blocked (likely waiting on wait())
-                        if task.state == crate::task::TaskState::Blocked {
-                            task.state = crate::task::TaskState::Ready;
+                        if task.state == super::task::TaskState::Blocked {
+                            task.state = super::task::TaskState::Ready;
                         }
                         break;
                     }
@@ -1358,7 +1358,7 @@ fn sys_kill(pid: u32) -> i64 {
     let caller_pid = current_pid();
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
 
         // Find the target task
         let mut target_slot = None;
@@ -1382,17 +1382,17 @@ fn sys_kill(pid: u32) -> i64 {
         // Mark as terminated with SIGKILL-style exit code
         if let Some(ref mut task) = sched.tasks[slot] {
             task.exit_code = -9;  // SIGKILL
-            task.state = crate::task::TaskState::Terminated;
+            task.state = super::task::TaskState::Terminated;
         }
 
         // Wake parent if blocked (waiting on wait())
         if parent_id != 0 {
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut task) = task_opt {
-                    if task.id == parent_id && task.state == crate::task::TaskState::Blocked {
-                        task.state = crate::task::TaskState::Ready;
+                    if task.id == parent_id && task.state == super::task::TaskState::Blocked {
+                        task.state = super::task::TaskState::Ready;
                         // Send ChildExit event
-                        let event = crate::event::Event::child_exit(pid, -9);
+                        let event = super::event::Event::child_exit(pid, -9);
                         task.event_queue.push(event);
                         break;
                     }
@@ -1409,11 +1409,11 @@ fn sys_kill(pid: u32) -> i64 {
             if let Some(next_slot) = sched.schedule() {
                 sched.current = next_slot;
                 if let Some(ref mut next) = sched.tasks[next_slot] {
-                    next.state = crate::task::TaskState::Running;
+                    next.state = super::task::TaskState::Running;
                 }
-                crate::task::update_current_task_globals();
+                super::task::update_current_task_globals();
                 // Signal to assembly not to store return value into the new task
-                crate::task::SYSCALL_SWITCHED_TASK = 1;
+                super::task::SYSCALL_SWITCHED_TASK = 1;
             }
         }
     }
@@ -1438,7 +1438,7 @@ fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
     let mut count = 0usize;
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
 
         for task_opt in sched.tasks.iter() {
             if count >= max_entries {
@@ -1493,8 +1493,8 @@ fn sys_reset() -> ! {
     println!("========================================");
 
     // MT7988A TOPRGU (Top Reset Generation Unit) registers
-    use crate::mmio::MmioRegion;
-    use crate::platform;
+    use crate::arch::aarch64::mmio::MmioRegion;
+    use crate::platform::mt7988 as platform;
 
     let wdt = MmioRegion::new(platform::phys_to_virt(platform::TOPRGU_BASE));
 
@@ -1513,13 +1513,13 @@ fn sys_reset() -> ! {
     wdt.write32(WDT_MODE, WDT_MODE_KEY | WDT_MODE_EXTEN | WDT_MODE_EN);
 
     // Ensure the write completes
-    crate::mmio::dsb();
+    crate::arch::aarch64::mmio::dsb();
 
     // Trigger software reset
     wdt.write32(WDT_SWRST, WDT_SWRST_KEY);
 
     // Ensure the write completes
-    crate::mmio::dsb();
+    crate::arch::aarch64::mmio::dsb();
 
     // Should not reach here, but loop just in case
     println!("Reset triggered, waiting...");
@@ -1549,7 +1549,7 @@ pub extern "C" fn syscall_handler_rust(
     // Safe point: check for deferred reschedule before returning to user
     // This is where timer preemption actually happens (not in IRQ handler)
     unsafe {
-        crate::task::do_resched_if_needed();
+        super::task::do_resched_if_needed();
     }
 
     result
@@ -1610,7 +1610,7 @@ fn sys_shmem_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
 
     let caller_pid = current_pid();
 
-    match crate::shmem::create(caller_pid, size) {
+    match super::shmem::create(caller_pid, size) {
         Ok((shmem_id, vaddr, paddr)) => {
             // Write output values
             if vaddr_ptr != 0 {
@@ -1647,7 +1647,7 @@ fn sys_shmem_map(shmem_id: u32, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
 
     let caller_pid = current_pid();
 
-    match crate::shmem::map(caller_pid, shmem_id) {
+    match super::shmem::map(caller_pid, shmem_id) {
         Ok((vaddr, paddr)) => {
             // Write output values
             if vaddr_ptr != 0 {
@@ -1672,7 +1672,7 @@ fn sys_shmem_map(shmem_id: u32, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
 fn sys_shmem_allow(shmem_id: u32, peer_pid: u32) -> i64 {
     let caller_pid = current_pid();
 
-    match crate::shmem::allow(caller_pid, shmem_id, peer_pid) {
+    match super::shmem::allow(caller_pid, shmem_id, peer_pid) {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -1684,7 +1684,7 @@ fn sys_shmem_allow(shmem_id: u32, peer_pid: u32) -> i64 {
 fn sys_shmem_wait(shmem_id: u32, timeout_ms: u32) -> i64 {
     let caller_pid = current_pid();
 
-    match crate::shmem::wait(caller_pid, shmem_id, timeout_ms) {
+    match super::shmem::wait(caller_pid, shmem_id, timeout_ms) {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -1696,7 +1696,7 @@ fn sys_shmem_wait(shmem_id: u32, timeout_ms: u32) -> i64 {
 fn sys_shmem_notify(shmem_id: u32) -> i64 {
     let caller_pid = current_pid();
 
-    match crate::shmem::notify(caller_pid, shmem_id) {
+    match super::shmem::notify(caller_pid, shmem_id) {
         Ok(woken) => woken as i64,
         Err(e) => e,
     }
@@ -1708,7 +1708,7 @@ fn sys_shmem_notify(shmem_id: u32) -> i64 {
 fn sys_shmem_destroy(shmem_id: u32) -> i64 {
     let caller_pid = current_pid();
 
-    match crate::shmem::destroy(caller_pid, shmem_id) {
+    match super::shmem::destroy(caller_pid, shmem_id) {
         Ok(()) => 0,
         Err(e) => e,
     }

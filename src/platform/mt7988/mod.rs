@@ -1,9 +1,25 @@
-//! Platform-Specific Constants for MT7988A SoC
+//! Platform Support for MediaTek MT7988A SoC
+//!
+//! This module contains all SoC-specific code for the MT7988A:
+//! - Hardware addresses and IRQ numbers (constants below)
+//! - GIC interrupt controller driver
+//! - UART driver
+//! - Timer driver
+//! - Peripheral drivers (Ethernet, SD, I2C)
 //!
 //! All SoC-specific addresses, IRQ numbers, and hardware constants live here.
 //! This is the ONE place to look for "what is the magic number for X?"
-//!
-//! Other code should import from here, not hardcode addresses.
+
+pub mod gic;
+pub mod uart;
+pub mod timer;
+pub mod eth;
+pub mod sd;
+pub mod i2c;
+
+// =============================================================================
+// Platform Constants
+// =============================================================================
 
 /// Kernel virtual address base (TTBR1 region)
 pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_0000_0000_0000;

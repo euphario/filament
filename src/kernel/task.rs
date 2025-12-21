@@ -3,10 +3,10 @@
 //! Provides task structures and context switching for the microkernel.
 //! Each task has its own saved CPU state and address space.
 
-use crate::addrspace::AddressSpace;
-use crate::event::EventQueue;
-use crate::fd::FdTable;
-use crate::pmm;
+use super::addrspace::AddressSpace;
+use super::event::EventQueue;
+use super::fd::FdTable;
+use super::pmm;
 use crate::println;
 
 /// Task states
@@ -378,7 +378,7 @@ impl Task {
         // Zero the pages using kernel virtual address (via TTBR1)
         // During syscalls, TTBR0 points to user page tables
         unsafe {
-            let kva = (crate::mmu::KERNEL_VIRT_BASE | phys_addr) as *mut u8;
+            let kva = (crate::arch::aarch64::mmu::KERNEL_VIRT_BASE | phys_addr) as *mut u8;
             for i in 0..(num_pages * 4096) {
                 core::ptr::write_volatile(kva.add(i), 0);
             }
@@ -434,13 +434,13 @@ impl Task {
         // Then flush cache so DMA device sees zeros
         unsafe {
             // Use kernel virtual address (via TTBR1) to access physical memory
-            let kva = (crate::mmu::KERNEL_VIRT_BASE | phys_addr) as *mut u8;
+            let kva = (crate::arch::aarch64::mmu::KERNEL_VIRT_BASE | phys_addr) as *mut u8;
             for i in 0..(num_pages * 4096) {
                 core::ptr::write_volatile(kva.add(i), 0);
             }
             // Flush cache for the zeroed memory - DMA devices need to see clean memory
             for page in 0..num_pages {
-                let page_kva = crate::mmu::KERNEL_VIRT_BASE | (phys_addr + (page * 4096) as u64);
+                let page_kva = crate::arch::aarch64::mmu::KERNEL_VIRT_BASE | (phys_addr + (page * 4096) as u64);
                 for offset in (0..4096).step_by(64) {
                     let addr = page_kva + offset;
                     core::arch::asm!("dc civac, {}", in(reg) addr);
@@ -1019,19 +1019,19 @@ pub unsafe fn update_current_task_globals() {
 /// Must be called from kernel context (not IRQ context).
 pub unsafe fn do_resched_if_needed() {
     // Check and clear the flag atomically
-    if !crate::sync::cpu_flags().check_and_clear_resched() {
+    if !crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched() {
         return; // No reschedule needed
     }
 
     // Log any unhandled IRQs from interrupt context (deferred logging)
-    let (unhandled_count, last_irq) = crate::sync::cpu_flags().get_unhandled_stats();
+    let (unhandled_count, last_irq) = crate::arch::aarch64::sync::cpu_flags().get_unhandled_stats();
     if unhandled_count > 0 {
         crate::println!("[IRQ] {} unhandled interrupt(s), last: {}", unhandled_count, last_irq);
-        crate::sync::cpu_flags().clear_unhandled_stats();
+        crate::arch::aarch64::sync::cpu_flags().clear_unhandled_stats();
     }
 
     // Now do the reschedule with IRQs disabled for the critical section
-    let _guard = crate::sync::IrqGuard::new();
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
     let sched = scheduler();
 
     // Mark current as ready (it was running)

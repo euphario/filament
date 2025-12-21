@@ -7,8 +7,8 @@
 //! When a client connects to a port, the kernel creates a channel pair
 //! and gives one end to the client and one to the service.
 
-use crate::ipc::{self, ChannelId, Message, MessageType};
-use crate::process::Pid;
+use super::ipc::{self, ChannelId, Message, MessageType};
+use super::process::Pid;
 use crate::println;
 
 /// Maximum port name length

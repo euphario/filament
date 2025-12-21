@@ -3,10 +3,10 @@
 //! Minimal ELF loader for AArch64 executables.
 //! Parses ELF headers and loads PT_LOAD segments into process memory.
 
-use crate::addrspace::AddressSpace;
-use crate::pmm;
+use super::addrspace::AddressSpace;
+use super::pmm;
 use crate::println;
-use crate::task;
+use super::task;
 
 /// ELF magic number
 pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];

@@ -1,44 +1,42 @@
 //! BPI-R4 Bare-Metal Kernel
 //!
-//! A minimal "Hello World" kernel for the Banana Pi BPI-R4
-//! running on the MediaTek MT7988A SoC.
+//! A microkernel for the Banana Pi BPI-R4 running on the MediaTek MT7988A SoC.
+//!
+//! # Module Organization
+//!
+//! - `arch/aarch64/` - Architecture-specific code (boot, MMU, barriers, SMP)
+//! - `platform/mt7988/` - SoC-specific drivers and constants
+//! - `kernel/` - Portable kernel core (tasks, IPC, syscalls, schemes)
 
 #![no_std]
 #![no_main]
 
-mod addrspace;
-mod elf;
-mod eth;
-mod event;
-mod fd;
-mod gic;
-mod i2c;
+// Architecture support (AArch64)
+mod arch {
+    pub mod aarch64;
+}
+
+// Platform support (MT7988A)
+mod platform {
+    pub mod mt7988;
+}
+
+// Kernel core
+mod kernel;
+
+// Remaining top-level modules (to be organized later)
 mod initrd;
-mod ipc;
 mod log;
-mod mmio;
-mod mmu;
 mod panic;
-mod platform;
-mod pmm;
-mod port;
-mod process;
 mod ramfs;
-mod scheme;
-mod sd;
-mod shmem;
-mod smp;
-mod sync;
-mod syscall;
-mod task;
-mod timer;
-mod uaccess;
-mod uart;
 
-use core::arch::global_asm;
+// Convenient aliases - use full paths to avoid ambiguity
+use arch::aarch64::{mmu, sync, smp, mmio};
+use platform::mt7988::{gic, uart, timer, eth, sd, i2c};
+use kernel::{task, process, syscall, ipc, scheme, port, event, fd, shmem, elf, pmm, addrspace, uaccess};
 
-// Include the assembly startup code
-global_asm!(include_str!("boot.S"));
+// Alias for platform constants (platform::mt7988::INITRD_ADDR, etc.)
+use platform::mt7988 as plat;
 
 /// Kernel entry point - called from boot.S after dropping to EL1
 #[no_mangle]
@@ -298,12 +296,12 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
     let irq = gic::ack_irq();
 
     // Check for spurious interrupt
-    if irq >= platform::irq::SPURIOUS_THRESHOLD {
+    if irq >= plat::irq::SPURIOUS_THRESHOLD {
         return; // Spurious, ignore
     }
 
     // Handle timer interrupt (PPI 30)
-    if irq == platform::irq::TIMER_PPI {
+    if irq == plat::irq::TIMER_PPI {
         if timer::handle_irq() {
             // Timer tick - just set the flag, don't reschedule here
             sync::cpu_flags().tick();
@@ -400,14 +398,14 @@ fn init_ramfs() {
     // Fall back to external initrd at fixed address (from platform constants)
     // Check for TAR magic (ustar at offset 257)
     let magic_check = unsafe {
-        let ptr = platform::INITRD_ADDR as *const u8;
+        let ptr = plat::INITRD_ADDR as *const u8;
         let ustar_magic = core::slice::from_raw_parts(ptr.add(257), 5);
         ustar_magic == b"ustar"
     };
 
     if magic_check {
-        let count = ramfs::init(platform::INITRD_ADDR, platform::INITRD_MAX_SIZE);
-        println!("  Loaded {} files from external initrd at 0x{:08x}", count, platform::INITRD_ADDR);
+        let count = ramfs::init(plat::INITRD_ADDR, plat::INITRD_MAX_SIZE);
+        println!("  Loaded {} files from external initrd at 0x{:08x}", count, plat::INITRD_ADDR);
         ramfs::list();
     } else {
         println!("  No initrd found (build with: cd user && ./mkinitrd.sh)");

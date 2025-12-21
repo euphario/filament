@@ -13,8 +13,8 @@
 //! 1. Translate user VA to PA using the user's page tables
 //! 2. Access the physical memory via TTBR1 (kernel virtual address)
 
-use crate::mmu::{flags, PAGE_SIZE};
-use crate::task;
+use crate::arch::aarch64::mmu::{flags, PAGE_SIZE};
+use super::task;
 
 /// Kernel virtual address base (TTBR1)
 const KERNEL_VIRT_BASE: u64 = 0xFFFF_0000_0000_0000;

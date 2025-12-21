@@ -11,7 +11,7 @@
 //! - `zero:` - zero device (infinite zeros on read)
 //! - `console:` - serial console I/O
 
-use crate::fd::{FdEntry, FdFlags, FdType};
+use super::fd::{FdEntry, FdFlags, FdType};
 use crate::println;
 
 /// Maximum number of registered schemes
@@ -243,8 +243,8 @@ impl KernelScheme for MemoryScheme {
         match handle.handle {
             Self::HANDLE_INFO => {
                 // Return memory info as text
-                let total = crate::pmm::total_count();
-                let free = crate::pmm::free_count();
+                let total = super::pmm::total_count();
+                let free = super::pmm::free_count();
                 let s = format_memory_info(total, free);
                 let bytes = s.as_bytes();
                 let len = core::cmp::min(bytes.len(), buf.len());
@@ -352,15 +352,15 @@ impl KernelScheme for TimeScheme {
 
         let value: u64 = match handle.handle {
             Self::HANDLE_NOW | Self::HANDLE_UPTIME => {
-                let counter = crate::timer::counter();
-                let freq = crate::timer::frequency();
+                let counter = crate::platform::mt7988::timer::counter();
+                let freq = crate::platform::mt7988::timer::frequency();
                 if freq > 0 {
                     (counter as u128 * 1_000_000_000 / freq as u128) as u64
                 } else {
                     0
                 }
             }
-            Self::HANDLE_FREQ => crate::timer::frequency(),
+            Self::HANDLE_FREQ => crate::platform::mt7988::timer::frequency(),
             _ => return Err(-22),
         };
 
@@ -445,10 +445,10 @@ pub fn irq_register(irq_num: u32, pid: u32) -> bool {
                 reg.pending_count = 0;
 
                 // Enable the IRQ in the GIC
-                crate::gic::enable_irq(irq_num);
+                crate::platform::mt7988::gic::enable_irq(irq_num);
 
                 // Debug: show GIC state for this IRQ
-                crate::gic::debug_irq(irq_num);
+                crate::platform::mt7988::gic::debug_irq(irq_num);
 
                 return true;
             }
@@ -465,7 +465,7 @@ pub fn irq_unregister(irq_num: u32, pid: u32) -> bool {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
                 // Disable the IRQ in the GIC
-                crate::gic::disable_irq(irq_num);
+                crate::platform::mt7988::gic::disable_irq(irq_num);
 
                 *reg = IrqRegistration::empty();
                 return true;
@@ -480,7 +480,7 @@ pub fn irq_unregister(irq_num: u32, pid: u32) -> bool {
 pub fn irq_notify(irq_num: u32) -> Option<u32> {
     // Mask the IRQ immediately to prevent interrupt storm (level-triggered)
     // Userspace will unmask by reading from the irq: scheme
-    crate::gic::disable_irq(irq_num);
+    crate::platform::mt7988::gic::disable_irq(irq_num);
 
     unsafe {
         let table = irq_table();
@@ -496,7 +496,7 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
                     reg.blocked_pid = 0;
 
                     // Find task by PID (not slot index - they may differ!)
-                    let sched = crate::task::scheduler();
+                    let sched = super::task::scheduler();
                     let mut found_slot = None;
                     for (slot, task_opt) in sched.tasks.iter().enumerate() {
                         if let Some(ref task) = task_opt {
@@ -509,16 +509,16 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
 
                     if let Some(slot) = found_slot {
                         if let Some(ref mut task) = sched.tasks[slot] {
-                            if matches!(task.state, crate::task::TaskState::Blocked) {
-                                task.state = crate::task::TaskState::Ready;
+                            if matches!(task.state, super::task::TaskState::Blocked) {
+                                task.state = super::task::TaskState::Ready;
                             }
                         }
                     }
                     Some(pid)
                 } else {
                     // Send event to the process (fallback for non-blocking mode)
-                    let event = crate::event::Event::irq(irq_num);
-                    crate::event::send_event(reg.owner_pid, event);
+                    let event = super::event::Event::irq(irq_num);
+                    super::event::send_event(reg.owner_pid, event);
                     Some(reg.owner_pid)
                 };
 
@@ -544,7 +544,7 @@ pub fn irq_check_pending(irq_num: u32, pid: u32) -> Option<u32> {
 
                     // Re-enable the IRQ at the GIC (it was masked when it fired)
                     // This allows the next interrupt to be delivered
-                    crate::gic::enable_irq(irq_num);
+                    crate::platform::mt7988::gic::enable_irq(irq_num);
 
                     return Some(count);
                 }
@@ -581,12 +581,12 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
         }
 
         // Mark current task as Blocked and switch to another task
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         let caller_slot = sched.current;
 
         // Mark current as Blocked to exclude it from scheduling
         if let Some(ref mut task) = sched.tasks[caller_slot] {
-            task.state = crate::task::TaskState::Blocked;
+            task.state = super::task::TaskState::Blocked;
         }
 
         // Find next ready task
@@ -599,10 +599,10 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
 
                 sched.current = next_slot;
                 if let Some(ref mut task) = sched.tasks[next_slot] {
-                    task.state = crate::task::TaskState::Running;
+                    task.state = super::task::TaskState::Running;
                 }
-                crate::task::update_current_task_globals();
-                crate::task::SYSCALL_SWITCHED_TASK = 1;
+                super::task::update_current_task_globals();
+                super::task::SYSCALL_SWITCHED_TASK = 1;
 
                 // Return value is ignored since we switched tasks
                 return Err(-11); // EAGAIN
@@ -611,7 +611,7 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
 
         // No other task to switch to - spin-wait in kernel with interrupts enabled
         if let Some(ref mut task) = sched.tasks[caller_slot] {
-            task.state = crate::task::TaskState::Running;
+            task.state = super::task::TaskState::Running;
         }
 
         // Spin-wait with interrupts enabled until IRQ fires
@@ -648,7 +648,7 @@ impl KernelScheme for IrqScheme {
 
         // Get current process PID
         let pid = unsafe {
-            let sched = crate::task::scheduler();
+            let sched = super::task::scheduler();
             sched.tasks[sched.current]
                 .as_ref()
                 .map(|t| t.id)
@@ -758,12 +758,12 @@ impl KernelScheme for ConsoleScheme {
         // Read as many characters as available (up to buf.len())
         let mut count = 0;
         while count < buf.len() {
-            match crate::uart::try_getc() {
+            match crate::platform::mt7988::uart::try_getc() {
                 Some(c) => {
                     buf[count] = c as u8;
                     count += 1;
                     // Echo the character back for interactive use
-                    crate::uart::putc(c);
+                    crate::platform::mt7988::uart::putc(c);
                     if c == '\n' || c == '\r' {
                         break; // Line-based input
                     }
@@ -787,7 +787,7 @@ impl KernelScheme for ConsoleScheme {
 
         // Write all bytes to UART
         for &byte in buf {
-            crate::uart::putc(byte as char);
+            crate::platform::mt7988::uart::putc(byte as char);
         }
 
         Ok(buf.len())
@@ -930,7 +930,7 @@ impl KernelScheme for MmioScheme {
 
         // Get current task and map device pages
         unsafe {
-            let sched = crate::task::scheduler();
+            let sched = super::task::scheduler();
             if let Some(ref mut task) = sched.tasks[sched.current] {
                 if let Some(ref mut addr_space) = task.address_space {
                     for i in 0..num_pages {
@@ -994,7 +994,7 @@ impl KernelScheme for MmioScheme {
 
         // Unmap pages from current task's address space
         unsafe {
-            let sched = crate::task::scheduler();
+            let sched = super::task::scheduler();
             if let Some(ref mut task) = sched.tasks[sched.current] {
                 if let Some(ref mut addr_space) = task.address_space {
                     for i in 0..num_pages {
@@ -1067,7 +1067,7 @@ impl KernelScheme for I2cScheme {
         }
 
         // Verify we can access the I2C controller
-        if crate::i2c::get_controller(bus).is_none() {
+        if crate::platform::mt7988::i2c::get_controller(bus).is_none() {
             return Err(-19); // ENODEV
         }
 
@@ -1086,7 +1086,7 @@ impl KernelScheme for I2cScheme {
         let bus = (handle.handle >> 32) as u32;
         let addr = (handle.handle & 0xFF) as u8;
 
-        let ctrl = crate::i2c::get_controller(bus).ok_or(-19)?;
+        let ctrl = crate::platform::mt7988::i2c::get_controller(bus).ok_or(-19)?;
 
         if buf.is_empty() {
             return Ok(0);
@@ -1102,7 +1102,7 @@ impl KernelScheme for I2cScheme {
         let bus = (handle.handle >> 32) as u32;
         let addr = (handle.handle & 0xFF) as u8;
 
-        let ctrl = crate::i2c::get_controller(bus).ok_or(-19)?;
+        let ctrl = crate::platform::mt7988::i2c::get_controller(bus).ok_or(-19)?;
 
         if buf.is_empty() {
             return Ok(0);
@@ -1254,14 +1254,14 @@ fn open_user_scheme(
     path: &str,
     flags: u32,
 ) -> Result<(FdEntry, SchemeHandle), i32> {
-    use crate::ipc::{self, Message, MessageType};
+    use super::ipc::{self, Message, MessageType};
 
     let daemon_channel = entry.channel_id;
     let daemon_pid = entry.owner_pid;
 
     // Get caller PID
     let caller_pid = unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         sched.tasks[sched.current]
             .as_ref()
             .map(|t| t.id)
@@ -1285,7 +1285,7 @@ fn open_user_scheme(
 
     // Create connect message
     let msg = Message {
-        header: crate::ipc::MessageHeader {
+        header: super::ipc::MessageHeader {
             msg_type: MessageType::Connect,
             sender: caller_pid,
             msg_id: server_ch, // Send the server channel so daemon knows where to respond

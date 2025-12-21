@@ -18,8 +18,8 @@
 //! - `shmem_notify(id)` - Wake all waiters
 //! - `shmem_destroy(id)` - Destroy region
 
-use crate::pmm;
-use crate::process::Pid;
+use super::pmm;
+use super::process::Pid;
 use crate::println;
 
 /// Maximum number of shared memory regions
@@ -260,12 +260,12 @@ pub fn wait(pid: Pid, shmem_id: u32, _timeout_ms: u32) -> Result<(), i64> {
     // When we return from this syscall, the scheduler will pick another task.
     // We'll be woken when notify() is called.
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         let current_slot = sched.current;
 
         if let Some(ref mut task) = sched.tasks[current_slot] {
-            task.state = crate::task::TaskState::Blocked;
-            task.wait_reason = Some(crate::task::WaitReason::ShmemNotify(shmem_id));
+            task.state = super::task::TaskState::Blocked;
+            task.wait_reason = Some(super::task::WaitReason::ShmemNotify(shmem_id));
             // Pre-store return value in caller's trap frame (success = 0)
             task.trap_frame.x0 = 0;
         }
@@ -274,11 +274,11 @@ pub fn wait(pid: Pid, shmem_id: u32, _timeout_ms: u32) -> Result<(), i64> {
         if let Some(next_slot) = sched.schedule() {
             sched.current = next_slot;
             if let Some(ref mut task) = sched.tasks[next_slot] {
-                task.state = crate::task::TaskState::Running;
+                task.state = super::task::TaskState::Running;
             }
-            crate::task::update_current_task_globals();
+            super::task::update_current_task_globals();
             // Signal to assembly not to store return value
-            crate::task::SYSCALL_SWITCHED_TASK = 1;
+            super::task::SYSCALL_SWITCHED_TASK = 1;
         }
     }
 
@@ -301,7 +301,7 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
     // Wake all waiters
     let mut woken = 0u32;
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         for waiter_pid in waiters.iter() {
             if *waiter_pid == NO_PID {
                 continue;
@@ -310,9 +310,9 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut task) = task_opt {
                     if task.id == *waiter_pid {
-                        if let Some(crate::task::WaitReason::ShmemNotify(id)) = task.wait_reason {
+                        if let Some(super::task::WaitReason::ShmemNotify(id)) = task.wait_reason {
                             if id == shmem_id {
-                                task.state = crate::task::TaskState::Ready;
+                                task.state = super::task::TaskState::Ready;
                                 task.wait_reason = None;
                                 woken += 1;
                             }
@@ -378,7 +378,7 @@ unsafe fn find_region_slot(shmem_id: u32) -> Result<usize, i64> {
 /// Map physical memory into a process's address space
 fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
 
         // Find the task
         for task_opt in sched.tasks.iter_mut() {

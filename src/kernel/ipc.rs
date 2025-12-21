@@ -9,9 +9,9 @@
 //! - Blocking: Processes can block waiting for messages
 //! - Ports: Named endpoints for service discovery
 
-use crate::pmm;
+use super::pmm;
 use crate::println;
-use crate::process::{Pid, ProcessState};
+use super::process::{Pid, ProcessState};
 
 /// Maximum inline message payload size
 /// 576 bytes = 512 (sector) + 64 (headers/overhead)
@@ -490,7 +490,7 @@ pub fn sys_send(channel_id: ChannelId, caller: Pid, data: &[u8]) -> Result<(), I
             Ok(maybe_blocked) => {
                 // If there's a blocked process, wake it
                 if let Some(blocked_pid) = maybe_blocked {
-                    crate::process::process_table().wake(blocked_pid);
+                    super::process::process_table().wake(blocked_pid);
                 }
                 Ok(())
             }
@@ -529,7 +529,7 @@ pub fn sys_receive_blocking(channel_id: ChannelId, caller: Pid) -> Result<Messag
                 // No message - register as blocked receiver
                 table.block_receiver(channel_id, caller)?;
                 // Mark process as blocked
-                if let Some(proc) = crate::process::process_table().get_mut(caller) {
+                if let Some(proc) = super::process::process_table().get_mut(caller) {
                     proc.block_on_receive(channel_id);
                 }
                 Err(IpcError::WouldBlock)

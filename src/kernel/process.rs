@@ -8,9 +8,9 @@
 //!
 //! For a Redox-style microkernel, most drivers run as processes.
 
-use crate::addrspace::AddressSpace;
-use crate::mmu;
-use crate::pmm;
+use super::addrspace::AddressSpace;
+use crate::arch::aarch64::mmu;
+use super::pmm;
 use crate::println;
 
 /// Process ID type

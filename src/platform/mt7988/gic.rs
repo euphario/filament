@@ -2,8 +2,8 @@
 //!
 //! Uses platform constants for base addresses.
 
-use crate::mmio::MmioRegion;
-use crate::platform;
+use crate::arch::aarch64::mmio::MmioRegion;
+use super::{GICD_BASE, GICR_BASE};
 
 /// GICD Register offsets
 mod gicd {
@@ -63,8 +63,8 @@ pub struct Gic {
 impl Gic {
     pub const fn new() -> Self {
         Self {
-            gicd: MmioRegion::new(platform::GICD_BASE),
-            gicr: MmioRegion::new(platform::GICR_BASE),
+            gicd: MmioRegion::new(GICD_BASE),
+            gicr: MmioRegion::new(GICR_BASE),
         }
     }
 

@@ -2,7 +2,8 @@
 //!
 //! Uses the EL1 Physical Timer (CNTP_*) which generates the timer PPI.
 
-use crate::{gic, platform, println};
+use crate::println;
+use super::{gic, irq};
 
 /// Timer control bits
 mod ctl {
@@ -44,7 +45,7 @@ impl Timer {
         }
 
         // Enable timer interrupt in GIC
-        gic::enable_irq(platform::irq::TIMER_PPI);
+        gic::enable_irq(irq::TIMER_PPI);
     }
 
     /// Start the timer with an interval in milliseconds

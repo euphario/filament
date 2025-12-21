@@ -327,7 +327,7 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
     };
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if task.event_queue.subscribe(ev_type, filter) {
                 return 0;
@@ -351,7 +351,7 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
     };
 
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if task.event_queue.unsubscribe(ev_type, filter) {
                 return 0;
@@ -366,7 +366,7 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
 /// Returns: 1 if event received, 0 if would block, negative error
 pub fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
     unsafe {
-        let sched = crate::task::scheduler();
+        let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             // First check for pending events in global system
             let pid = task.id;
@@ -391,7 +391,7 @@ pub fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
             }
 
             // Would block - mark task as waiting
-            task.state = crate::task::TaskState::Blocked;
+            task.state = super::task::TaskState::Blocked;
             // Scheduler will handle waking us up
             return -11; // EAGAIN - caller should yield
         }
@@ -410,11 +410,11 @@ pub fn sys_event_post(target_pid: u32, event_type: u32, data: u64, caller_pid: u
     if send_event(target_pid, event) {
         // Try to wake target if blocked
         unsafe {
-            let sched = crate::task::scheduler();
+            let sched = super::task::scheduler();
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut task) = task_opt {
-                    if task.id == target_pid && task.state == crate::task::TaskState::Blocked {
-                        task.state = crate::task::TaskState::Ready;
+                    if task.id == target_pid && task.state == super::task::TaskState::Blocked {
+                        task.state = super::task::TaskState::Ready;
                         break;
                     }
                 }

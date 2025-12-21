@@ -6,8 +6,8 @@
 #![allow(dead_code)]
 
 use core::fmt::{self, Write};
-use crate::mmio::MmioRegion;
-use crate::platform;
+use crate::arch::aarch64::mmio::MmioRegion;
+use super::UART0_BASE;
 
 /// UART register offsets (32-bit aligned, multiply standard 8250 offsets by 4)
 mod regs {
@@ -43,7 +43,7 @@ pub struct Uart {
 impl Uart {
     /// Create a new UART instance at the default MT7988A address
     pub const fn new() -> Self {
-        Self { regs: MmioRegion::new(platform::UART0_BASE) }
+        Self { regs: MmioRegion::new(UART0_BASE) }
     }
 
     /// Initialize the UART
@@ -170,7 +170,7 @@ macro_rules! print {
         use core::fmt::Write;
         // SAFETY: Single-threaded bare-metal environment
         unsafe {
-            let _ = write!(&mut *core::ptr::addr_of_mut!($crate::uart::UART), $($arg)*);
+            let _ = write!(&mut *core::ptr::addr_of_mut!($crate::platform::mt7988::uart::UART), $($arg)*);
         }
     }};
 }
