@@ -278,11 +278,15 @@ impl PciDeviceRegistry {
     }
 
     /// Release all devices owned by a process
-    pub fn release_all(&mut self, pid: u32) {
+    /// Returns BDFs of released devices (for MSI cleanup)
+    pub fn release_all(&mut self, pid: u32) -> [Option<PciBdf>; MAX_PCI_DEVICES] {
+        let mut released = [None; MAX_PCI_DEVICES];
         for i in 0..self.count {
             if self.devices[i].owner_pid == pid {
+                released[i] = Some(self.devices[i].bdf);
                 self.devices[i].owner_pid = 0;
             }
         }
+        released
     }
 }

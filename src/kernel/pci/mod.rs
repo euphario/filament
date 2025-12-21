@@ -401,9 +401,16 @@ pub fn release_device(bdf: PciBdf, pid: u32) -> PciResult<()> {
 }
 
 /// Release all devices owned by a process (called on process exit)
+/// Also frees any MSI vectors allocated to those devices
 pub fn release_all_devices(pid: u32) {
     if let Some(pci) = subsystem_mut() {
-        pci.registry.release_all(pid);
+        let released = pci.registry.release_all(pid);
+        // Free MSI vectors for each released device
+        for bdf_opt in released.iter() {
+            if let Some(bdf) = bdf_opt {
+                pci.msi.free(*bdf);
+            }
+        }
     }
 }
 

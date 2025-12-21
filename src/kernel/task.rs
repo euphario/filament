@@ -607,6 +607,61 @@ impl Task {
         Some(virt_addr)
     }
 
+    /// Map device memory (MMIO/PCI BARs) into user address space
+    /// Uses non-cacheable device memory attributes (nGnRnE)
+    /// Returns virtual address on success
+    pub fn mmap_device(&mut self, phys_addr: u64, size: usize) -> Option<u64> {
+        let num_pages = (size + 4095) / 4096;
+        if num_pages == 0 {
+            return None;
+        }
+
+        // Find free mapping slot
+        let slot = self.heap_mappings.iter().position(|m| m.is_empty())?;
+
+        // Check heap space available
+        let virt_addr = self.heap_next;
+        let mapping_size = (num_pages * 4096) as u64;
+        if virt_addr + mapping_size > USER_HEAP_END {
+            return None;
+        }
+
+        // Map pages with device memory attributes (non-cacheable, nGnRnE)
+        let addr_space = self.address_space.as_mut()?;
+        for i in 0..num_pages {
+            let page_virt = virt_addr + (i * 4096) as u64;
+            let page_phys = phys_addr + (i * 4096) as u64;
+            if !addr_space.map_device_page(page_virt, page_phys, true) {
+                return None;
+            }
+        }
+
+        // Invalidate TLB entries for the newly mapped pages
+        unsafe {
+            for i in 0..num_pages {
+                let page_virt = virt_addr + (i * 4096) as u64;
+                let tlbi_addr = page_virt >> 12;
+                core::arch::asm!(
+                    "tlbi vale1is, {addr}",
+                    addr = in(reg) tlbi_addr,
+                );
+            }
+            core::arch::asm!("dsb ish", "isb");
+        }
+
+        // Record mapping
+        self.heap_mappings[slot] = HeapMapping {
+            virt_addr,
+            phys_addr,
+            num_pages,
+        };
+
+        // Bump heap pointer
+        self.heap_next = virt_addr + mapping_size;
+
+        Some(virt_addr)
+    }
+
     /// Unmap and free memory pages from user heap
     /// Returns true on success
     pub fn munmap(&mut self, addr: u64, size: usize) -> bool {

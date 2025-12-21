@@ -477,6 +477,21 @@ pub fn irq_unregister(irq_num: u32, pid: u32) -> bool {
     }
 }
 
+/// Clean up all IRQ registrations for a process (called on process exit)
+pub fn process_cleanup(pid: u32) {
+    unsafe {
+        let table = irq_table();
+
+        for reg in table.iter_mut() {
+            if !reg.is_empty() && reg.owner_pid == pid {
+                // Disable the IRQ in the GIC
+                crate::platform::mt7988::gic::disable_irq(reg.irq_num);
+                *reg = IrqRegistration::empty();
+            }
+        }
+    }
+}
+
 /// Called from IRQ handler when an interrupt fires
 /// Returns the PID to wake up, if any
 pub fn irq_notify(irq_num: u32) -> Option<u32> {

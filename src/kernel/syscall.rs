@@ -372,6 +372,11 @@ fn sys_exit(code: i32) -> i64 {
             (0, 0)
         };
 
+        // Clean up process resources
+        super::shmem::process_cleanup(pid);
+        super::scheme::process_cleanup(pid);
+        super::pci::release_all_devices(pid);
+
         // Set exit code and mark as terminated
         if let Some(ref mut task) = sched.tasks[current_slot] {
             task.exit_code = code;
@@ -1841,13 +1846,14 @@ fn sys_pci_bar_map(bdf: u32, bar: u8, size_out_ptr: u64) -> i64 {
         return SyscallError::InvalidArgument as i64;
     }
 
-    // Map into process address space
+    // Map into process address space with device memory attributes (nGnRnE)
+    // PCI BARs are MMIO and must use non-cacheable device memory
     unsafe {
         let sched = super::task::scheduler();
         for task_opt in sched.tasks.iter_mut() {
             if let Some(ref mut task) = task_opt {
                 if task.id == pid {
-                    match task.mmap_phys(phys_addr, size as usize) {
+                    match task.mmap_device(phys_addr, size as usize) {
                         Some(vaddr) => {
                             // Write size to output pointer if valid
                             if size_out_ptr != 0 {
