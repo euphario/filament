@@ -24,4 +24,4 @@ pub mod dma;
 pub use regs::ChipVariant;
 pub use device::{Mt7996Device, Mt7996Error};
 pub use firmware::{Firmware, FirmwareError};
-pub use dma::Wfdma;
+pub use dma::{Wfdma, PatchHeader, PatchSection};

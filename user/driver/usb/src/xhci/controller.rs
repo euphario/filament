@@ -205,7 +205,7 @@ impl Controller {
 
     /// Get MMIO base address
     pub fn mmio_base(&self) -> u64 {
-        self.mmio.base
+        self.mmio.virt_base()
     }
 
     /// Get operational registers offset

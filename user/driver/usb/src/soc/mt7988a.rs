@@ -197,7 +197,7 @@ impl Mt7988aSoc {
     ///
     /// Returns true on success, false on failure.
     pub fn global_init() -> bool {
-        use crate::mmio::{MmioRegion, delay, format_mmio_url};
+        use crate::mmio::{delay, format_mmio_url};
         use userlib::syscall;
 
         // Format URL for INFRACFG_AO

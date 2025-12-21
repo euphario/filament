@@ -143,12 +143,26 @@ impl PcieController {
     /// Programs the translation table to map CPU addresses to PCIe bus addresses.
     /// Uses 1:1 mapping for simplicity (CPU addr == PCIe addr).
     fn setup_atu(mac: &MmioRegion, cpu_addr: u64, pci_addr: u64, size: u64) {
+        // Validate size - must be non-zero and power of 2 for ATU
+        if size == 0 {
+            return; // Cannot program ATU with zero size
+        }
+
         // Calculate size encoding per Linux pcie-mediatek-gen3.c:
         // #define PCIE_ATR_SIZE(size) (((((size) - 1) << 1) & GENMASK(6, 1)) | PCIE_ATR_EN)
         // Where size = fls(bytes) - 1, and PCIE_ATR_EN = bit 0 (enable)
         // This goes in the SOURCE ADDRESS LSB register, not a separate param register!
-        let size_log2 = 63 - size.leading_zeros();  // fls(size) - 1
-        let atr_size = (((size_log2 - 1) << 1) & 0x7E) | 0x01;  // Shifted + enable bit
+        let leading = size.leading_zeros();
+        if leading >= 63 {
+            return; // Size too small (< 2 bytes)
+        }
+        let size_log2 = 63 - leading;  // fls(size) - 1
+        // Ensure size_log2 >= 1 to avoid underflow
+        let atr_size = if size_log2 >= 1 {
+            (((size_log2 - 1) << 1) & 0x7E) | 0x01  // Shifted + enable bit
+        } else {
+            0x01  // Minimum size, just enable bit
+        };
 
         // Use translation table 0 for memory
         let table_base = regs::PCIE_TRANS_TABLE_BASE_REG;
@@ -258,15 +272,39 @@ impl PcieController {
             return (0, 0);
         }
 
-        // Calculate size (lowest set bit)
+        // Calculate size (lowest set bit) - use checked arithmetic
         let size = (!size_mask).wrapping_add(1) & size_mask;
+        if size == 0 {
+            cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
+            return (0, 0);
+        }
 
-        // Align next_mem_addr to BAR size
-        let aligned_addr = (self.next_mem_addr + (size as u64) - 1) & !((size as u64) - 1);
+        // Align next_mem_addr to BAR size (use checked arithmetic)
+        let size64 = size as u64;
+        let aligned_addr = match self.next_mem_addr.checked_add(size64 - 1) {
+            Some(addr) => addr & !(size64 - 1),
+            None => {
+                cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
+                return (0, 0); // Overflow
+            }
+        };
 
-        // Check if we have space
-        let end_addr = aligned_addr + (size as u64);
-        if end_addr > self.config.mem_base + self.config.mem_size {
+        // Check if we have space (use checked arithmetic)
+        let end_addr = match aligned_addr.checked_add(size64) {
+            Some(addr) => addr,
+            None => {
+                cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
+                return (0, 0); // Overflow
+            }
+        };
+        let mem_end = match self.config.mem_base.checked_add(self.config.mem_size) {
+            Some(end) => end,
+            None => {
+                cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
+                return (0, 0); // Config overflow
+            }
+        };
+        if end_addr > mem_end {
             // Out of memory window space
             cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
             return (0, 0);
@@ -392,27 +430,43 @@ impl PcieController {
     }
 }
 
+/// Maximum devices that can be tracked
+pub const MAX_PCIE_DEVICES: usize = 16;
+
 /// List of discovered PCIe devices (fixed-size, no heap)
 pub struct PcieDeviceList {
-    devices: [Option<PcieDevice>; 16],
+    devices: [Option<PcieDevice>; MAX_PCIE_DEVICES],
     count: usize,
+    /// Number of devices dropped due to overflow
+    overflow_count: usize,
 }
 
 impl PcieDeviceList {
     /// Create empty device list
     pub fn new() -> Self {
         Self {
-            devices: [const { None }; 16],
+            devices: [const { None }; MAX_PCIE_DEVICES],
             count: 0,
+            overflow_count: 0,
         }
     }
 
     /// Add a device to the list
-    pub fn push(&mut self, device: PcieDevice) {
-        if self.count < 16 {
+    /// Returns false if the list is full (device dropped)
+    pub fn push(&mut self, device: PcieDevice) -> bool {
+        if self.count < MAX_PCIE_DEVICES {
             self.devices[self.count] = Some(device);
             self.count += 1;
+            true
+        } else {
+            self.overflow_count += 1;
+            false
         }
+    }
+
+    /// Get number of devices dropped due to overflow
+    pub fn overflow_count(&self) -> usize {
+        self.overflow_count
     }
 
     /// Get number of devices

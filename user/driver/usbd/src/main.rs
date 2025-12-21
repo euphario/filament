@@ -183,9 +183,10 @@ impl UsbDriver {
         // === Create SoC Wrapper ===
         let mut soc = board.create_soc(controller_id as u8)?;
 
-        // Map MAC (xHCI + IPPC) region
-        let mac = MmioRegion::open(config.mac_base, config.mac_size as u64)?;
-        soc.set_mac(mac.clone());
+        // Map MAC (xHCI + IPPC) region - soc and xhci need separate handles
+        // Opening the same physical region twice gives us independent fds
+        let soc_mac = MmioRegion::open(config.mac_base, config.mac_size as u64)?;
+        soc.set_mac(soc_mac);
 
         // SoC pre-init (IPPC clocks, power, port control)
         if soc.pre_init().is_err() {
@@ -196,11 +197,12 @@ impl UsbDriver {
         // === Create PHY Driver ===
         let mut phy = board.create_phy(controller_id as u8)?;
         let phy_mmio = MmioRegion::open(config.phy_base, config.phy_size as u64)?;
-        phy.set_mmio(phy_mmio.clone());
+        phy.set_mmio(phy_mmio);
 
         // === Create xHCI Controller ===
-        // The new Controller is pure xHCI - no vendor code
-        let xhci = XhciController::new(mac);
+        // Open separate MAC region for xHCI (needs its own fd)
+        let xhci_mac = MmioRegion::open(config.mac_base, config.mac_size as u64)?;
+        let xhci = XhciController::new(xhci_mac);
 
         Some(Self {
             soc,

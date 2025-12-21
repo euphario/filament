@@ -153,12 +153,7 @@ impl<'a> PcieConfigSpace<'a> {
     pub fn write32(&self, bdf: PcieBdf, reg: u16, value: u32) {
         self.setup_tlp(bdf, reg, 4);
         let offset = PCIE_CFG_OFFSET_ADDR + ((reg as usize) & !0x3);
-        unsafe {
-            core::ptr::write_volatile(
-                (self.mac.base + offset as u64) as *mut u32,
-                value
-            );
-        }
+        self.mac.write32(offset, value);
     }
 
     /// Check if a device exists at the given BDF
