@@ -10,7 +10,7 @@ use userlib::{println, print, syscall};
 
 mod fat;
 
-use fat::{FatFilesystem, FatType};
+use fat::{FatFilesystem, FatType, LfnCollector};
 // Use USB library's BlockClient for ring buffer access
 use usb::{BlockClient, delay_ms};
 
@@ -198,7 +198,51 @@ fn main() {
     println!("[fatfs] Root directory:");
     list_root_directory(&fs, &mut block);
 
+    // Test file reading - try to find and read a small test file
+    println!();
+    println!("[fatfs] Testing file read...");
+
+    // Try to find README.TXT or any .TXT file
+    if let Some(file) = find_file(&fs, &mut block, b"README.TXT") {
+        println!("[fatfs] Found README.TXT: cluster={}, size={}", file.start_cluster, file.size);
+
+        // Read first 256 bytes
+        let mut buf = [0u8; 256];
+        let read_size = core::cmp::min(256, file.size as usize);
+        if let Some(bytes_read) = read_file(&fs, &mut block, &file, &mut buf[..read_size]) {
+            println!("[fatfs] Read {} bytes:", bytes_read);
+            // Print as text if it looks like ASCII
+            if let Ok(text) = core::str::from_utf8(&buf[..bytes_read]) {
+                for line in text.lines().take(5) {
+                    println!("  {}", line);
+                }
+            }
+        }
+    } else {
+        println!("[fatfs] README.TXT not found (normal if not present)");
+    }
+
+    // Try to find MT7996 firmware files (now with LFN support!)
+    let firmware_files = [
+        b"mt7996_rom_patch.bin" as &[u8],
+        b"mt7996_wm.bin",
+        b"mt7996_wa.bin",
+        b"mt7996_dsp.bin",
+        b"mt7996_eeprom.bin",
+    ];
+    println!();
+    println!("[fatfs] Searching for MT7996 firmware files:");
+    for fw_name in firmware_files {
+        let name = core::str::from_utf8(fw_name).unwrap_or("?");
+        if let Some(file) = find_file(&fs, &mut block, fw_name) {
+            println!("[fatfs]   Found {}: {} bytes", name, file.size);
+        } else {
+            println!("[fatfs]   {} not found", name);
+        }
+    }
+
     // Read performance test (now uses ring buffer / DMA)
+    println!();
     println!("[fatfs] Running read performance test...");
     read_performance_test(&mut block, block_count);
 
@@ -343,10 +387,8 @@ fn read_performance_test(block: &mut BlockClient, _block_count: u64) {
 
 fn list_root_directory(fs: &FatFilesystem, block: &mut BlockClient) {
     let mut sector_buf = [0u8; 512];
+    let mut lfn = LfnCollector::new();
 
-    // For FAT12/16, root directory is at a fixed location
-    // For FAT32, it starts at root_cluster
-    // All methods now include partition_start offset
     let root_start_sector = if fs.fat_type == FatType::Fat32 {
         fs.cluster_to_sector(fs.root_cluster)
     } else {
@@ -355,60 +397,244 @@ fn list_root_directory(fs: &FatFilesystem, block: &mut BlockClient) {
 
     println!("[fatfs] Reading root directory at sector {}", root_start_sector);
 
-    // Read first sector of root directory
-    if block.read_sector(root_start_sector as u64).is_none() {
-        println!("  (failed to read root directory)");
-        return;
-    }
-    sector_buf.copy_from_slice(&block.data()[..512]);
-
-    // Parse directory entries (32 bytes each)
-    for i in 0..16 {
-        let entry = &sector_buf[i * 32..(i + 1) * 32];
-        if entry[0] == 0 {
-            break; // End of directory
-        }
-        if entry[0] == 0xE5 {
-            continue; // Deleted entry
-        }
-        if entry[11] == 0x0F {
-            continue; // Long filename entry (skip for now)
-        }
-
-        // Parse 8.3 filename
-        let mut name = [0u8; 12];
-        let mut name_len = 0;
-
-        // Copy name (8 chars)
-        for j in 0..8 {
-            if entry[j] != 0x20 {
-                name[name_len] = entry[j];
-                name_len += 1;
+    // Read multiple sectors to show more entries
+    for sector_offset in 0..4u32 {
+        if block.read_sector((root_start_sector + sector_offset) as u64).is_none() {
+            if sector_offset == 0 {
+                println!("  (failed to read root directory)");
             }
+            return;
         }
+        sector_buf.copy_from_slice(&block.data()[..512]);
 
-        // Add dot and extension if present
-        if entry[8] != 0x20 {
-            name[name_len] = b'.';
-            name_len += 1;
-            for j in 8..11 {
+        for i in 0..16 {
+            let entry = &sector_buf[i * 32..(i + 1) * 32];
+
+            if entry[0] == 0 {
+                return; // End of directory
+            }
+            if entry[0] == 0xE5 {
+                lfn.reset();
+                continue;
+            }
+
+            // LFN entry - collect it
+            if entry[11] == 0x0F {
+                lfn.add_lfn_entry(entry);
+                continue;
+            }
+
+            // Regular entry - use LFN if available, else 8.3
+            let display_name: &[u8];
+            let mut short_name = [0u8; 12];
+            let mut short_len = 0;
+
+            // Build 8.3 name
+            for j in 0..8 {
                 if entry[j] != 0x20 {
-                    name[name_len] = entry[j];
-                    name_len += 1;
+                    short_name[short_len] = entry[j];
+                    short_len += 1;
                 }
             }
-        }
+            if entry[8] != 0x20 {
+                short_name[short_len] = b'.';
+                short_len += 1;
+                for j in 8..11 {
+                    if entry[j] != 0x20 {
+                        short_name[short_len] = entry[j];
+                        short_len += 1;
+                    }
+                }
+            }
 
-        let attr = entry[11];
-        let is_dir = (attr & 0x10) != 0;
-        let size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
+            // Use LFN if complete, otherwise use short name
+            if lfn.is_complete() {
+                display_name = lfn.name_slice();
+            } else {
+                display_name = &short_name[..short_len];
+            }
 
-        let name_str = core::str::from_utf8(&name[..name_len]).unwrap_or("???");
-        if is_dir {
-            println!("  <DIR> {}", name_str);
-        } else {
-            println!("  {:>8} {}", size, name_str);
+            let attr = entry[11];
+            let is_dir = (attr & 0x10) != 0;
+            let size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
+
+            let name_str = core::str::from_utf8(display_name).unwrap_or("???");
+            if is_dir {
+                println!("  <DIR> {}", name_str);
+            } else {
+                println!("  {:>8} {}", size, name_str);
+            }
+
+            lfn.reset();
         }
     }
+}
+
+/// File info returned by find_file
+#[derive(Debug, Clone, Copy)]
+pub struct FileInfo {
+    pub start_cluster: u32,
+    pub size: u32,
+}
+
+/// Case-insensitive byte slice comparison
+fn name_matches(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i].to_ascii_uppercase() != b[i].to_ascii_uppercase() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Find a file in the root directory by name (supports both 8.3 and LFN)
+fn find_file(fs: &FatFilesystem, block: &mut BlockClient, filename: &[u8]) -> Option<FileInfo> {
+    let mut sector_buf = [0u8; 512];
+    let mut lfn = LfnCollector::new();
+
+    let root_start_sector = if fs.fat_type == FatType::Fat32 {
+        fs.cluster_to_sector(fs.root_cluster)
+    } else {
+        fs.root_dir_absolute_sector()
+    };
+
+    // Search multiple sectors (up to 32 sectors = 512 entries)
+    for sector_offset in 0..32u32 {
+        if block.read_sector((root_start_sector + sector_offset) as u64).is_none() {
+            break;
+        }
+        sector_buf.copy_from_slice(&block.data()[..512]);
+
+        for i in 0..16 {
+            let entry = &sector_buf[i * 32..(i + 1) * 32];
+
+            // End of directory
+            if entry[0] == 0 {
+                return None;
+            }
+
+            // Deleted entry - reset LFN
+            if entry[0] == 0xE5 {
+                lfn.reset();
+                continue;
+            }
+
+            // LFN entry
+            if entry[11] == 0x0F {
+                lfn.add_lfn_entry(entry);
+                continue;
+            }
+
+            // Regular 8.3 entry - check if we have a matching LFN or 8.3 name
+            let has_lfn = lfn.is_complete();
+
+            // Try LFN match first
+            if has_lfn {
+                let lfn_name = lfn.name_slice();
+                if name_matches(lfn_name, filename) {
+                    let start_cluster = u32::from_le_bytes([entry[26], entry[27], entry[20], entry[21]]);
+                    let size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
+                    return Some(FileInfo { start_cluster, size });
+                }
+            }
+
+            // Try 8.3 name match
+            let mut short_name = [0u8; 12];
+            let mut short_len = 0;
+            for j in 0..8 {
+                if entry[j] != 0x20 {
+                    short_name[short_len] = entry[j];
+                    short_len += 1;
+                }
+            }
+            if entry[8] != 0x20 {
+                short_name[short_len] = b'.';
+                short_len += 1;
+                for j in 8..11 {
+                    if entry[j] != 0x20 {
+                        short_name[short_len] = entry[j];
+                        short_len += 1;
+                    }
+                }
+            }
+
+            if name_matches(&short_name[..short_len], filename) {
+                let start_cluster = u32::from_le_bytes([entry[26], entry[27], entry[20], entry[21]]);
+                let size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
+                return Some(FileInfo { start_cluster, size });
+            }
+
+            // Reset LFN for next entry
+            lfn.reset();
+        }
+    }
+    None
+}
+
+/// Read file contents into buffer, following cluster chain
+/// Returns number of bytes read, or None on error
+fn read_file(
+    fs: &FatFilesystem,
+    block: &mut BlockClient,
+    file: &FileInfo,
+    buffer: &mut [u8],
+) -> Option<usize> {
+    if file.size == 0 {
+        return Some(0);
+    }
+
+    let bytes_per_cluster = fs.bytes_per_cluster() as usize;
+    let sectors_per_cluster = fs.sectors_per_cluster_u32();
+    let mut bytes_read = 0usize;
+    let mut current_cluster = file.start_cluster;
+    let max_bytes = core::cmp::min(buffer.len(), file.size as usize);
+
+    let mut fat_sector_buf = [0u8; 512];
+    let mut cached_fat_sector: Option<u32> = None;
+
+    while bytes_read < max_bytes && current_cluster >= 2 {
+        // Read this cluster's data
+        let cluster_start = fs.cluster_to_sector(current_cluster);
+
+        for sector_offset in 0..sectors_per_cluster {
+            if bytes_read >= max_bytes {
+                break;
+            }
+
+            let sector = cluster_start + sector_offset;
+            if block.read_sector(sector as u64).is_none() {
+                println!("[fatfs] Read error at sector {}", sector);
+                return None;
+            }
+
+            let data = block.data();
+            let bytes_to_copy = core::cmp::min(512, max_bytes - bytes_read);
+            buffer[bytes_read..bytes_read + bytes_to_copy].copy_from_slice(&data[..bytes_to_copy]);
+            bytes_read += bytes_to_copy;
+        }
+
+        // Get next cluster from FAT
+        let (fat_sector, offset) = fs.fat_sector_for_cluster(current_cluster);
+
+        // Cache FAT sector reads
+        if cached_fat_sector != Some(fat_sector) {
+            if block.read_sector(fat_sector as u64).is_none() {
+                println!("[fatfs] FAT read error at sector {}", fat_sector);
+                return None;
+            }
+            fat_sector_buf.copy_from_slice(&block.data()[..512]);
+            cached_fat_sector = Some(fat_sector);
+        }
+
+        match fs.next_cluster_from_sector(&fat_sector_buf, current_cluster, offset) {
+            Some(next) => current_cluster = next,
+            None => break, // End of chain
+        }
+    }
+
+    Some(bytes_read)
 }
 

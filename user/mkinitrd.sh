@@ -1,7 +1,11 @@
 #!/bin/bash
 # Create initrd TAR archive for BPI-R4 kernel
 #
-# Usage: ./mkinitr.sh [output.tar]
+# Usage: ./mkinitrd.sh [options] [output.tar]
+#
+# Options:
+#   --no-firmware    Skip firmware files (smaller initrd for faster xmodem)
+#   --help           Show this help
 #
 # This script builds all user programs and packages them into a TAR archive
 # that can be loaded by U-Boot as an initrd.
@@ -11,9 +15,35 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-OUTPUT="${1:-initrd.tar}"
+# Parse arguments
+INCLUDE_FIRMWARE=true
+OUTPUT="initrd.tar"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --no-firmware)
+            INCLUDE_FIRMWARE=false
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: ./mkinitrd.sh [options] [output.tar]"
+            echo ""
+            echo "Options:"
+            echo "  --no-firmware    Skip firmware files (smaller initrd for faster xmodem)"
+            echo "  --help           Show this help"
+            exit 0
+            ;;
+        *)
+            OUTPUT="$1"
+            shift
+            ;;
+    esac
+done
 
 echo "Building initrd: $OUTPUT"
+if [ "$INCLUDE_FIRMWARE" = false ]; then
+    echo "  (skipping firmware - use USB for firmware files)"
+fi
 echo ""
 
 # Build user programs first
@@ -34,9 +64,9 @@ for elf in bin/*.elf; do
     fi
 done
 
-# Copy firmware files if present
+# Copy firmware files if present and requested
 FIRMWARE_DIR="$SCRIPT_DIR/../firmware/mediatek/mt7996"
-if [ -d "$FIRMWARE_DIR" ]; then
+if [ "$INCLUDE_FIRMWARE" = true ] && [ -d "$FIRMWARE_DIR" ]; then
     echo ""
     echo "Staging firmware files..."
     mkdir -p "$STAGING/lib/firmware/mediatek/mt7996"
@@ -48,6 +78,9 @@ if [ -d "$FIRMWARE_DIR" ]; then
             echo "  lib/firmware/mediatek/mt7996/$name ($size)"
         fi
     done
+elif [ "$INCLUDE_FIRMWARE" = false ]; then
+    echo ""
+    echo "Skipping firmware (--no-firmware specified)"
 fi
 
 # Create the TAR archive (POSIX format for compatibility)

@@ -136,15 +136,77 @@ impl FatFilesystem {
         self.partition_start + self.root_dir_sector
     }
 
-    /// Get the next cluster in the chain from the FAT
-    pub fn next_cluster(&self, _fat_data: &[u8], cluster: u32) -> Option<u32> {
-        // TODO: implement FAT table reading
-        // For now, just return None (end of chain)
-        if cluster >= 2 && cluster < self.total_clusters + 2 {
+    /// Get the sector number where a given cluster's FAT entry lives
+    pub fn fat_sector_for_cluster(&self, cluster: u32) -> (u32, usize) {
+        let fat_offset = match self.fat_type {
+            FatType::Fat12 => cluster + (cluster / 2), // 1.5 bytes per entry
+            FatType::Fat16 => cluster * 2,
+            FatType::Fat32 => cluster * 4,
+        };
+        let fat_sector = self.partition_start + self.reserved_sectors as u32
+            + (fat_offset / self.bytes_per_sector as u32);
+        let offset_in_sector = (fat_offset % self.bytes_per_sector as u32) as usize;
+        (fat_sector, offset_in_sector)
+    }
+
+    /// Get the next cluster in the chain from FAT sector data
+    /// `fat_sector_data` should contain the FAT sector for this cluster
+    /// Returns None if end-of-chain or bad cluster
+    pub fn next_cluster_from_sector(&self, fat_sector_data: &[u8], cluster: u32, offset: usize) -> Option<u32> {
+        let next = match self.fat_type {
+            FatType::Fat12 => {
+                // FAT12: 12-bit entries, can span sector boundaries
+                if offset + 1 >= fat_sector_data.len() {
+                    return None; // Would need cross-sector read
+                }
+                let word = u16::from_le_bytes([fat_sector_data[offset], fat_sector_data[offset + 1]]);
+                if cluster & 1 == 1 {
+                    (word >> 4) as u32
+                } else {
+                    (word & 0x0FFF) as u32
+                }
+            }
+            FatType::Fat16 => {
+                if offset + 1 >= fat_sector_data.len() {
+                    return None;
+                }
+                u16::from_le_bytes([fat_sector_data[offset], fat_sector_data[offset + 1]]) as u32
+            }
+            FatType::Fat32 => {
+                if offset + 3 >= fat_sector_data.len() {
+                    return None;
+                }
+                u32::from_le_bytes([
+                    fat_sector_data[offset],
+                    fat_sector_data[offset + 1],
+                    fat_sector_data[offset + 2],
+                    fat_sector_data[offset + 3],
+                ]) & 0x0FFFFFFF // Mask off reserved bits
+            }
+        };
+
+        // Check for end-of-chain or bad cluster markers
+        let is_eoc = match self.fat_type {
+            FatType::Fat12 => next >= 0xFF8,
+            FatType::Fat16 => next >= 0xFFF8,
+            FatType::Fat32 => next >= 0x0FFFFFF8,
+        };
+
+        if is_eoc || next < 2 {
             None
         } else {
-            None
+            Some(next)
         }
+    }
+
+    /// Calculate how many sectors are needed for one cluster
+    pub fn sectors_per_cluster_u32(&self) -> u32 {
+        self.sectors_per_cluster as u32
+    }
+
+    /// Calculate bytes per cluster
+    pub fn bytes_per_cluster(&self) -> u32 {
+        self.bytes_per_sector as u32 * self.sectors_per_cluster as u32
     }
 }
 
@@ -164,6 +226,132 @@ pub struct DirEntry {
     pub modify_date: u16,
     pub cluster_lo: u16,
     pub file_size: u32,
+}
+
+/// Long Filename (LFN) entry parser
+/// LFN entries have attr=0x0F and contain 13 UTF-16 characters each
+pub struct LfnCollector {
+    /// Buffer for assembled name (max 255 chars)
+    pub name: [u8; 256],
+    /// Current length
+    pub len: usize,
+    /// Expected sequence number (counts down from first entry)
+    pub expected_seq: u8,
+    /// Checksum from LFN entries (must match 8.3 entry)
+    pub checksum: u8,
+}
+
+impl LfnCollector {
+    pub const fn new() -> Self {
+        Self {
+            name: [0u8; 256],
+            len: 0,
+            expected_seq: 0,
+            checksum: 0,
+        }
+    }
+
+    /// Reset the collector for a new name
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.expected_seq = 0;
+        self.checksum = 0;
+    }
+
+    /// Process an LFN entry (attr = 0x0F)
+    /// Returns true if this is a valid continuation
+    pub fn add_lfn_entry(&mut self, entry: &[u8]) -> bool {
+        let seq = entry[0];
+        let checksum = entry[13];
+
+        // Check for start of new LFN (bit 6 set = last entry, which comes first)
+        if seq & 0x40 != 0 {
+            self.reset();
+            self.expected_seq = seq & 0x1F;
+            self.checksum = checksum;
+        } else {
+            // Continuation - check sequence and checksum
+            let expected = self.expected_seq.saturating_sub(1);
+            if (seq & 0x1F) != expected || checksum != self.checksum {
+                self.reset();
+                return false;
+            }
+            self.expected_seq = expected;
+        }
+
+        // Extract 13 UTF-16LE characters from LFN entry
+        // Positions: 1-10 (5 chars), 14-25 (6 chars), 28-31 (2 chars)
+        let positions: [(usize, usize); 3] = [(1, 5), (14, 6), (28, 2)];
+
+        // Calculate position in final string (entries come in reverse order)
+        let entry_num = (seq & 0x1F) as usize;
+        let base_pos = (entry_num - 1) * 13;
+
+        let mut char_idx = 0;
+        for &(start, count) in &positions {
+            for i in 0..count {
+                let offset = start + i * 2;
+                if offset + 1 >= entry.len() {
+                    break;
+                }
+                let ch = u16::from_le_bytes([entry[offset], entry[offset + 1]]);
+
+                // Stop at null terminator
+                if ch == 0 || ch == 0xFFFF {
+                    // Update length if this is where string ends
+                    let pos = base_pos + char_idx;
+                    if pos < 256 && (self.len == 0 || pos >= self.len) {
+                        // Don't update len here, will be set when complete
+                    }
+                    char_idx += 1;
+                    continue;
+                }
+
+                let pos = base_pos + char_idx;
+                if pos < 256 {
+                    // Convert UTF-16 to ASCII (simple conversion for common chars)
+                    if ch < 128 {
+                        self.name[pos] = ch as u8;
+                        if pos + 1 > self.len {
+                            self.len = pos + 1;
+                        }
+                    } else {
+                        self.name[pos] = b'?'; // Non-ASCII placeholder
+                        if pos + 1 > self.len {
+                            self.len = pos + 1;
+                        }
+                    }
+                }
+                char_idx += 1;
+            }
+        }
+
+        true
+    }
+
+    /// Check if we have a complete LFN (sequence reached 1)
+    pub fn is_complete(&self) -> bool {
+        self.expected_seq == 1 && self.len > 0
+    }
+
+    /// Verify checksum against 8.3 name
+    pub fn verify_checksum(&self, short_name: &[u8; 11]) -> bool {
+        let mut sum: u8 = 0;
+        for &b in short_name {
+            sum = sum.rotate_right(1).wrapping_add(b);
+        }
+        sum == self.checksum
+    }
+
+    /// Get the long filename as a slice
+    pub fn name_slice(&self) -> &[u8] {
+        // Trim trailing nulls/spaces
+        let mut end = self.len;
+        while end > 0 && (self.name[end - 1] == 0 || self.name[end - 1] == b' ') {
+            end -= 1;
+        }
+        &self.name[..end]
+    }
 }
 
 impl DirEntry {
