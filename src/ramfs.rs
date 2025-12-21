@@ -1,4 +1,6 @@
 //! RAM Filesystem (initrd) support
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Provides access to files from a TAR archive loaded into memory at boot.
 //! The initrd can be loaded by U-Boot alongside the kernel.
@@ -147,7 +149,7 @@ impl Ramfs {
 
     /// Find a file by name
     pub fn find(&self, name: &str) -> Option<&RamfsEntry> {
-        let name_bytes = name.as_bytes();
+        let _name_bytes = name.as_bytes();
         for i in 0..self.count {
             let entry = &self.entries[i];
             let entry_name = entry.name_str();
@@ -221,7 +223,7 @@ static mut RAMFS: Ramfs = Ramfs::new();
 /// Initialize the global ramfs from a TAR archive
 /// Call this at boot with the address and size of the initrd
 pub fn init(base: usize, size: usize) -> usize {
-    unsafe { RAMFS.init(base, size) }
+    unsafe { (*core::ptr::addr_of_mut!(RAMFS)).init(base, size) }
 }
 
 /// Get a reference to the global ramfs

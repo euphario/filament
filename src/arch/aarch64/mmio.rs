@@ -5,6 +5,8 @@
 //!
 //! All device register access should go through this module.
 
+#![allow(dead_code)]  // Many methods are infrastructure for drivers
+
 use core::ptr::{read_volatile, write_volatile};
 
 /// A memory-mapped I/O region.

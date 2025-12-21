@@ -243,6 +243,7 @@ pub fn print_info() {
 }
 
 /// Test the allocator
+#[allow(dead_code)] // Test infrastructure
 pub fn test() {
     logln!("  Testing allocation...");
 

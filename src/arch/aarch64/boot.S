@@ -402,9 +402,15 @@ irq_from_user:
     mov     x0, #1                  // from_user = true
     bl      irq_handler_rust
 
+    /* Clear SYSCALL_SWITCHED_TASK before calling irq_exit_resched
+     * so we can detect if it actually switched tasks */
+    adrp    x10, SYSCALL_SWITCHED_TASK
+    str     xzr, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+
     /* Safe point: check NEED_RESCHED flag and do deferred scheduling.
      * This is where timer preemption actually happens - the IRQ handler
-     * just sets the flag, this function does the actual task switch. */
+     * just sets the flag, this function does the actual task switch.
+     * If it switches tasks, it sets SYSCALL_SWITCHED_TASK = 1. */
     bl      irq_exit_resched
 
     /* irq_exit_resched may have scheduled a different task */
@@ -425,8 +431,16 @@ irq_from_user:
     ldr     x10, [x10, :lo12:CURRENT_TTBR0]
     msr     ttbr0_el1, x10
     isb
+
+    /* ONLY invalidate TLB if we actually switched tasks.
+     * This is a major performance optimization - TLB invalidation on every
+     * IRQ return would make the MMU useless under interrupt load. */
+    adrp    x11, SYSCALL_SWITCHED_TASK
+    ldr     x11, [x11, :lo12:SYSCALL_SWITCHED_TASK]
+    cbz     x11, .Lirq_skip_tlbi
     tlbi    vmalle1
     dsb     sy
+.Lirq_skip_tlbi:
     isb
 
     /* Convert x9 (trap frame pointer) from physical to TTBR1 virtual address */
@@ -561,8 +575,16 @@ svc_handler:
     ldr     x10, [x10, :lo12:CURRENT_TTBR0]
     msr     ttbr0_el1, x10
     isb
+
+    /* ONLY invalidate TLB if we actually switched tasks.
+     * This is a major performance optimization - TLB invalidation on every
+     * syscall return would make the MMU useless under load. */
+    adrp    x10, SYSCALL_SWITCHED_TASK
+    ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    cbz     x10, .Lsyscall_skip_tlbi
     tlbi    vmalle1
     dsb     sy
+.Lsyscall_skip_tlbi:
     isb
 
     /* Convert x9 (trap frame pointer) from physical to TTBR1 virtual address.

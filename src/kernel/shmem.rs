@@ -1,4 +1,6 @@
 //! Shared Memory Subsystem
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Provides DMA-capable shared memory regions that can be mapped into
 //! multiple processes. Used as a building block for high-performance
@@ -136,10 +138,10 @@ static mut NEXT_SHMEM_ID: u32 = 1;
 /// Initialize shared memory subsystem
 pub fn init() {
     unsafe {
-        for slot in SHMEM_TABLE.iter_mut() {
+        for slot in (*core::ptr::addr_of_mut!(SHMEM_TABLE)).iter_mut() {
             *slot = None;
         }
-        NEXT_SHMEM_ID = 1;
+        *core::ptr::addr_of_mut!(NEXT_SHMEM_ID) = 1;
     }
     logln!("[shmem] Initialized ({} max regions)", MAX_SHMEM_REGIONS);
 }
@@ -163,15 +165,15 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
     // Find free slot in table
     let (slot_idx, shmem_id) = unsafe {
         let mut found = None;
-        for (i, slot) in SHMEM_TABLE.iter().enumerate() {
+        for (i, slot) in (*core::ptr::addr_of!(SHMEM_TABLE)).iter().enumerate() {
             if slot.is_none() {
                 found = Some(i);
                 break;
             }
         }
         let idx = found.ok_or(-12i64)?; // ENOMEM (no slots)
-        let id = NEXT_SHMEM_ID;
-        NEXT_SHMEM_ID += 1;
+        let id = *core::ptr::addr_of!(NEXT_SHMEM_ID);
+        *core::ptr::addr_of_mut!(NEXT_SHMEM_ID) += 1;
         (idx, id)
     };
 
@@ -195,7 +197,7 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
 
     // Store in table
     unsafe {
-        SHMEM_TABLE[slot_idx] = Some(region);
+        (*core::ptr::addr_of_mut!(SHMEM_TABLE))[slot_idx] = Some(region);
     }
 
     Ok((shmem_id, vaddr, phys_addr as u64))
@@ -353,7 +355,7 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
 
 /// Find a region by ID and return mutable reference
 unsafe fn find_region_mut(shmem_id: u32) -> Result<&'static mut SharedMem, i64> {
-    for slot in SHMEM_TABLE.iter_mut() {
+    for slot in (*core::ptr::addr_of_mut!(SHMEM_TABLE)).iter_mut() {
         if let Some(ref mut region) = slot {
             if region.id == shmem_id {
                 return Ok(region);
@@ -365,7 +367,7 @@ unsafe fn find_region_mut(shmem_id: u32) -> Result<&'static mut SharedMem, i64> 
 
 /// Find a region's slot index by ID
 unsafe fn find_region_slot(shmem_id: u32) -> Result<usize, i64> {
-    for (i, slot) in SHMEM_TABLE.iter().enumerate() {
+    for (i, slot) in (*core::ptr::addr_of!(SHMEM_TABLE)).iter().enumerate() {
         if let Some(ref region) = slot {
             if region.id == shmem_id {
                 return Ok(i);
@@ -398,7 +400,7 @@ fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
 /// Called when a process exits - clean up any shared memory it owns
 pub fn process_cleanup(pid: Pid) {
     unsafe {
-        for slot in SHMEM_TABLE.iter_mut() {
+        for slot in (*core::ptr::addr_of_mut!(SHMEM_TABLE)).iter_mut() {
             if let Some(ref mut region) = slot {
                 // Remove from waiters if present
                 region.remove_waiter(pid);

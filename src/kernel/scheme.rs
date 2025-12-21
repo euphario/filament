@@ -1,4 +1,6 @@
 //! Scheme System
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Redox-style scheme handling for `scheme:path` URLs.
 //! Schemes are like virtual filesystems that handle specific resource types.
@@ -1121,6 +1123,363 @@ impl KernelScheme for I2cScheme {
 }
 
 // ============================================================================
+// PCIe Scheme
+// ============================================================================
+
+/// PCIe scheme - provides access to PCI devices
+///
+/// Path formats:
+/// - `pcie:list` - list all devices (read returns JSON-like device info)
+/// - `pcie:PPBB:DD.F/config` - config space (read/write at handle offset)
+/// - `pcie:PPBB:DD.F/bar0` through `bar5` - map BAR (returns mapped vaddr)
+/// - `pcie:PPBB:DD.F/msi` - allocate MSI (write count, read returns IRQ)
+/// - `pcie:PPBB:DD.F/claim` - claim device ownership
+///
+/// Where PP=port, BB=bus, DD=device, F=function (all hex)
+/// Example: pcie:0001:00.0/config for port 0, bus 1, device 0, function 0
+pub struct PcieScheme;
+
+/// PcieScheme handle types
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PcieHandleType {
+    List = 0,
+    Config = 1,
+    Bar = 2,
+    Msi = 3,
+    Claim = 4,
+}
+
+impl PcieScheme {
+    /// Parse BDF from path segment "PPBB:DD.F"
+    fn parse_bdf(s: &str) -> Option<super::pci::PciBdf> {
+        // Format: PPBB:DD.F where PP=port, BB=bus, DD=device, F=function
+        let colon_pos = s.find(':')?;
+        let dot_pos = s.find('.')?;
+
+        if colon_pos < 2 || dot_pos <= colon_pos + 1 {
+            return None;
+        }
+
+        let port_bus = &s[..colon_pos];
+        let device = &s[colon_pos + 1..dot_pos];
+        let function = &s[dot_pos + 1..];
+
+        // Parse port and bus from PPBB
+        if port_bus.len() != 4 {
+            return None;
+        }
+        let port = u8::from_str_radix(&port_bus[0..2], 16).ok()?;
+        let bus = u8::from_str_radix(&port_bus[2..4], 16).ok()?;
+        let dev = u8::from_str_radix(device, 16).ok()?;
+        let func = u8::from_str_radix(function, 16).ok()?;
+
+        if dev > 31 || func > 7 {
+            return None;
+        }
+
+        Some(super::pci::PciBdf::with_port(port, bus, dev, func))
+    }
+
+    /// Encode handle: type(8) | bar(8) | bdf(32) | offset(16)
+    fn encode_handle(handle_type: PcieHandleType, bar: u8, bdf: super::pci::PciBdf, offset: u16) -> u64 {
+        ((handle_type as u64) << 56)
+            | ((bar as u64) << 48)
+            | ((bdf.to_u32() as u64) << 16)
+            | (offset as u64)
+    }
+
+    /// Decode handle
+    fn decode_handle(handle: u64) -> (PcieHandleType, u8, super::pci::PciBdf, u16) {
+        let handle_type = match (handle >> 56) as u8 {
+            0 => PcieHandleType::List,
+            1 => PcieHandleType::Config,
+            2 => PcieHandleType::Bar,
+            3 => PcieHandleType::Msi,
+            4 => PcieHandleType::Claim,
+            _ => PcieHandleType::List,
+        };
+        let bar = ((handle >> 48) & 0xFF) as u8;
+        let bdf = super::pci::PciBdf::from_u32(((handle >> 16) & 0xFFFFFFFF) as u32);
+        let offset = (handle & 0xFFFF) as u16;
+        (handle_type, bar, bdf, offset)
+    }
+
+    /// Format device list
+    fn format_device_list(buf: &mut [u8]) -> usize {
+        use core::fmt::Write;
+
+        struct BufWriter<'a> {
+            buf: &'a mut [u8],
+            pos: usize,
+        }
+
+        impl<'a> Write for BufWriter<'a> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let remaining = self.buf.len() - self.pos;
+                let to_write = bytes.len().min(remaining);
+                self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
+                self.pos += to_write;
+                Ok(())
+            }
+        }
+
+        let mut writer = BufWriter { buf, pos: 0 };
+
+        for dev in super::pci::devices() {
+            let _ = writeln!(
+                writer,
+                "{:02x}{:02x}:{:02x}.{} {:04x}:{:04x} {}",
+                dev.bdf.port, dev.bdf.bus, dev.bdf.device, dev.bdf.function,
+                dev.vendor_id, dev.device_id,
+                dev.class_name()
+            );
+        }
+
+        writer.pos
+    }
+}
+
+impl KernelScheme for PcieScheme {
+    fn name(&self) -> &'static str {
+        "pcie"
+    }
+
+    fn open(&self, path: &[u8], _flags: u32) -> Result<SchemeHandle, i32> {
+        let path_str = core::str::from_utf8(path).map_err(|_| -22)?;
+
+        // Handle "list" path
+        if path_str == "list" {
+            return Ok(SchemeHandle {
+                scheme_id: scheme_ids::PCIE,
+                handle: Self::encode_handle(PcieHandleType::List, 0, super::pci::PciBdf::new(0, 0, 0), 0),
+                flags: 0,
+            });
+        }
+
+        // Parse BDF and resource type from path
+        let slash_pos = path_str.find('/').ok_or(-22)?;
+        let bdf_str = &path_str[..slash_pos];
+        let resource = &path_str[slash_pos + 1..];
+
+        let bdf = Self::parse_bdf(bdf_str).ok_or(-22)?;
+
+        // Check device exists
+        if super::pci::find_by_bdf(bdf).is_none() {
+            return Err(-2); // ENOENT
+        }
+
+        let (handle_type, bar) = match resource {
+            "config" => (PcieHandleType::Config, 0),
+            "bar0" => (PcieHandleType::Bar, 0),
+            "bar1" => (PcieHandleType::Bar, 1),
+            "bar2" => (PcieHandleType::Bar, 2),
+            "bar3" => (PcieHandleType::Bar, 3),
+            "bar4" => (PcieHandleType::Bar, 4),
+            "bar5" => (PcieHandleType::Bar, 5),
+            "msi" => (PcieHandleType::Msi, 0),
+            "claim" => (PcieHandleType::Claim, 0),
+            _ => return Err(-22), // EINVAL
+        };
+
+        Ok(SchemeHandle {
+            scheme_id: scheme_ids::PCIE,
+            handle: Self::encode_handle(handle_type, bar, bdf, 0),
+            flags: 0,
+        })
+    }
+
+    fn read(&self, handle: &SchemeHandle, buf: &mut [u8]) -> Result<usize, i32> {
+        let (handle_type, bar, bdf, offset) = Self::decode_handle(handle.handle);
+
+        match handle_type {
+            PcieHandleType::List => {
+                // Return device list
+                let len = Self::format_device_list(buf);
+                Ok(len)
+            }
+
+            PcieHandleType::Config => {
+                // Read config space at current offset
+                if buf.len() < 4 {
+                    return Err(-22);
+                }
+
+                match super::pci::config_read32(bdf, offset) {
+                    Ok(val) => {
+                        buf[..4].copy_from_slice(&val.to_le_bytes());
+                        Ok(4)
+                    }
+                    Err(_) => Err(-5), // EIO
+                }
+            }
+
+            PcieHandleType::Bar => {
+                // Read returns BAR info (phys_addr:8, size:8)
+                if buf.len() < 16 {
+                    return Err(-22);
+                }
+
+                match super::pci::bar_info(bdf, bar) {
+                    Ok((addr, size)) => {
+                        buf[..8].copy_from_slice(&addr.to_le_bytes());
+                        buf[8..16].copy_from_slice(&size.to_le_bytes());
+                        Ok(16)
+                    }
+                    Err(_) => Err(-22),
+                }
+            }
+
+            PcieHandleType::Msi => {
+                // Read returns allocated IRQ number
+                // For now, just return device's MSI capability info
+                if let Some(dev) = super::pci::find_by_bdf(bdf) {
+                    if buf.len() >= 2 {
+                        buf[0] = dev.msi_cap;
+                        buf[1] = dev.msix_cap;
+                        Ok(2)
+                    } else {
+                        Err(-22)
+                    }
+                } else {
+                    Err(-2) // ENOENT
+                }
+            }
+
+            PcieHandleType::Claim => {
+                // Read returns ownership status
+                if let Some(dev) = super::pci::find_by_bdf(bdf) {
+                    if buf.len() >= 4 {
+                        buf[..4].copy_from_slice(&dev.owner_pid.to_le_bytes());
+                        Ok(4)
+                    } else {
+                        Err(-22)
+                    }
+                } else {
+                    Err(-2)
+                }
+            }
+        }
+    }
+
+    fn write(&self, handle: &SchemeHandle, buf: &[u8]) -> Result<usize, i32> {
+        let (handle_type, bar, bdf, offset) = Self::decode_handle(handle.handle);
+        let pid = unsafe { super::task::scheduler().current_task_id().unwrap_or(0) };
+
+        match handle_type {
+            PcieHandleType::List => {
+                // Can't write to list
+                Err(-1) // EPERM
+            }
+
+            PcieHandleType::Config => {
+                // Write config space - requires ownership
+                if let Some(dev) = super::pci::find_by_bdf(bdf) {
+                    if dev.owner_pid != pid {
+                        return Err(-1); // EPERM
+                    }
+                } else {
+                    return Err(-2);
+                }
+
+                if buf.len() < 4 {
+                    return Err(-22);
+                }
+
+                let val = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                match super::pci::config_write32(bdf, offset, val) {
+                    Ok(()) => Ok(4),
+                    Err(_) => Err(-5), // EIO
+                }
+            }
+
+            PcieHandleType::Bar => {
+                // Write to BAR handle maps it and returns vaddr
+                // Requires ownership
+                if let Some(dev) = super::pci::find_by_bdf(bdf) {
+                    if dev.owner_pid != pid {
+                        return Err(-1); // EPERM
+                    }
+                } else {
+                    return Err(-2);
+                }
+
+                // Get BAR info
+                let (phys_addr, size) = match super::pci::bar_info(bdf, bar) {
+                    Ok(info) => info,
+                    Err(_) => return Err(-22),
+                };
+
+                if size == 0 {
+                    return Err(-22);
+                }
+
+                // Map into process address space
+                unsafe {
+                    let sched = super::task::scheduler();
+                    for task_opt in sched.tasks.iter_mut() {
+                        if let Some(ref mut task) = task_opt {
+                            if task.id == pid {
+                                match task.mmap_phys(phys_addr, size as usize) {
+                                    Some(_vaddr) => return Ok(buf.len()),
+                                    None => return Err(-12), // ENOMEM
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(-3) // ESRCH
+            }
+
+            PcieHandleType::Msi => {
+                // Write count to allocate MSI vectors
+                if let Some(dev) = super::pci::find_by_bdf(bdf) {
+                    if dev.owner_pid != pid {
+                        return Err(-1);
+                    }
+                } else {
+                    return Err(-2);
+                }
+
+                if buf.is_empty() {
+                    return Err(-22);
+                }
+
+                let count = buf[0];
+                match super::pci::msi_alloc(bdf, count) {
+                    Ok(_irq) => Ok(1),
+                    Err(super::pci::PciError::NoMsiVectors) => Err(-12),
+                    Err(_) => Err(-5),
+                }
+            }
+
+            PcieHandleType::Claim => {
+                // Write to claim device
+                match super::pci::claim_device(bdf, pid) {
+                    Ok(()) => Ok(buf.len()),
+                    Err(super::pci::PciError::NotFound) => Err(-2),
+                    Err(super::pci::PciError::PermissionDenied) => Err(-1),
+                    Err(_) => Err(-5),
+                }
+            }
+        }
+    }
+
+    fn close(&self, handle: &SchemeHandle) -> Result<(), i32> {
+        let (handle_type, _bar, _bdf, _offset) = Self::decode_handle(handle.handle);
+
+        // If closing a claimed device, we could optionally release ownership
+        // For now, ownership persists until process exit
+        if handle_type == PcieHandleType::Claim {
+            // Could call pci::release_device here if desired
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Global scheme instances
 // ============================================================================
 
@@ -1132,6 +1491,7 @@ static ZERO_SCHEME: ZeroScheme = ZeroScheme;
 static CONSOLE_SCHEME: ConsoleScheme = ConsoleScheme;
 static MMIO_SCHEME: MmioScheme = MmioScheme;
 static I2C_SCHEME: I2cScheme = I2cScheme;
+static PCIE_SCHEME: PcieScheme = PcieScheme;
 
 /// Kernel scheme IDs (must match registration order in init())
 pub mod scheme_ids {
@@ -1143,6 +1503,7 @@ pub mod scheme_ids {
     pub const CONSOLE: u16 = 5;
     pub const MMIO: u16 = 6;
     pub const I2C: u16 = 7;
+    pub const PCIE: u16 = 8;
 }
 
 /// Get kernel scheme by name
@@ -1156,6 +1517,7 @@ pub fn get_kernel_scheme(name: &str) -> Option<&'static dyn KernelScheme> {
         "console" => Some(&CONSOLE_SCHEME),
         "mmio" => Some(&MMIO_SCHEME),
         "i2c" => Some(&I2C_SCHEME),
+        "pcie" => Some(&PCIE_SCHEME),
         _ => None,
     }
 }
@@ -1171,6 +1533,7 @@ pub fn get_kernel_scheme_by_id(id: u16) -> Option<&'static dyn KernelScheme> {
         scheme_ids::CONSOLE => Some(&CONSOLE_SCHEME),
         scheme_ids::MMIO => Some(&MMIO_SCHEME),
         scheme_ids::I2C => Some(&I2C_SCHEME),
+        scheme_ids::PCIE => Some(&PCIE_SCHEME),
         _ => None,
     }
 }
@@ -1337,8 +1700,9 @@ pub fn init() {
         reg.register_kernel("console");  // ID 5
         reg.register_kernel("mmio");     // ID 6
         reg.register_kernel("i2c");      // ID 7
+        reg.register_kernel("pcie");     // ID 8
     }
-    logln!("  Registered kernel schemes: memory, time, irq, null, zero, console, mmio, i2c");
+    logln!("  Registered kernel schemes: memory, time, irq, null, zero, console, mmio, i2c, pcie");
 }
 
 /// Test scheme system

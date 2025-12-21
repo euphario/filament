@@ -538,3 +538,197 @@ pub fn shmem_notify(shmem_id: u32) -> i64 {
 pub fn shmem_destroy(shmem_id: u32) -> i64 {
     syscall1(SYS_SHMEM_DESTROY, shmem_id as u64)
 }
+
+// =============================================================================
+// PCI Syscalls
+// =============================================================================
+
+pub const SYS_PCI_ENUMERATE: u64 = 50;
+pub const SYS_PCI_CONFIG_READ: u64 = 51;
+pub const SYS_PCI_CONFIG_WRITE: u64 = 52;
+pub const SYS_PCI_BAR_MAP: u64 = 53;
+pub const SYS_PCI_MSI_ALLOC: u64 = 54;
+pub const SYS_PCI_CLAIM: u64 = 55;
+
+/// PCI Bus/Device/Function address
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct PciBdf {
+    /// Port number (for multi-port controllers)
+    pub port: u8,
+    /// Bus number
+    pub bus: u8,
+    /// Device number (0-31)
+    pub device: u8,
+    /// Function number (0-7)
+    pub function: u8,
+}
+
+impl PciBdf {
+    /// Create new BDF address
+    pub const fn new(bus: u8, device: u8, function: u8) -> Self {
+        Self { port: 0, bus, device, function }
+    }
+
+    /// Create BDF with port
+    pub const fn with_port(port: u8, bus: u8, device: u8, function: u8) -> Self {
+        Self { port, bus, device, function }
+    }
+
+    /// Convert to u32 for syscall passing
+    /// Format: port(8) | bus(8) | device(5) | function(3)
+    pub const fn to_u32(&self) -> u32 {
+        ((self.port as u32) << 24)
+            | ((self.bus as u32) << 16)
+            | ((self.device as u32) << 8)
+            | (self.function as u32)
+    }
+
+    /// Create from u32
+    pub const fn from_u32(val: u32) -> Self {
+        Self {
+            port: ((val >> 24) & 0xFF) as u8,
+            bus: ((val >> 16) & 0xFF) as u8,
+            device: ((val >> 8) & 0x1F) as u8,
+            function: (val & 0x07) as u8,
+        }
+    }
+}
+
+/// PCI device info returned from enumerate syscall
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PciDeviceInfo {
+    /// BDF as u32 (port:8 | bus:8 | device:5 | function:3)
+    pub bdf: u32,
+    /// Vendor ID
+    pub vendor_id: u16,
+    /// Device ID
+    pub device_id: u16,
+    /// Class code (24-bit)
+    pub class_code: u32,
+    /// Revision
+    pub revision: u8,
+    /// Has MSI capability
+    pub has_msi: u8,
+    /// Has MSI-X capability
+    pub has_msix: u8,
+    /// Padding
+    pub _pad: u8,
+    /// BAR0 physical address
+    pub bar0_addr: u64,
+    /// BAR0 size
+    pub bar0_size: u64,
+}
+
+impl PciDeviceInfo {
+    /// Get BDF as struct
+    pub fn bdf(&self) -> PciBdf {
+        PciBdf::from_u32(self.bdf)
+    }
+
+    /// Get base class
+    pub fn base_class(&self) -> u8 {
+        ((self.class_code >> 16) & 0xFF) as u8
+    }
+
+    /// Get subclass
+    pub fn subclass(&self) -> u8 {
+        ((self.class_code >> 8) & 0xFF) as u8
+    }
+
+    /// Check if MSI capable
+    pub fn has_msi(&self) -> bool {
+        self.has_msi != 0
+    }
+
+    /// Check if MSI-X capable
+    pub fn has_msix(&self) -> bool {
+        self.has_msix != 0
+    }
+}
+
+/// Enumerate PCI devices
+/// Returns number of devices written to buf, or negative error
+pub fn pci_enumerate(buf: &mut [PciDeviceInfo]) -> i64 {
+    syscall2(SYS_PCI_ENUMERATE, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+
+/// Read PCI config space
+/// bdf: device address
+/// offset: register offset
+/// size: 1, 2, or 4 bytes
+/// Returns: value or negative error
+pub fn pci_config_read(bdf: PciBdf, offset: u16, size: u8) -> i64 {
+    syscall3(SYS_PCI_CONFIG_READ, bdf.to_u32() as u64, offset as u64, size as u64)
+}
+
+/// Read 32-bit value from PCI config space
+pub fn pci_config_read32(bdf: PciBdf, offset: u16) -> Result<u32, i32> {
+    let ret = pci_config_read(bdf, offset, 4);
+    if ret < 0 {
+        Err(ret as i32)
+    } else {
+        Ok(ret as u32)
+    }
+}
+
+/// Read 16-bit value from PCI config space
+pub fn pci_config_read16(bdf: PciBdf, offset: u16) -> Result<u16, i32> {
+    let ret = pci_config_read(bdf, offset, 2);
+    if ret < 0 {
+        Err(ret as i32)
+    } else {
+        Ok(ret as u16)
+    }
+}
+
+/// Write PCI config space
+/// bdf: device address
+/// offset: register offset
+/// size: 1, 2, or 4 bytes
+/// value: value to write
+/// Returns: 0 or negative error
+pub fn pci_config_write(bdf: PciBdf, offset: u16, size: u8, value: u32) -> i32 {
+    syscall4(SYS_PCI_CONFIG_WRITE, bdf.to_u32() as u64, offset as u64, size as u64, value as u64) as i32
+}
+
+/// Write 32-bit value to PCI config space
+pub fn pci_config_write32(bdf: PciBdf, offset: u16, value: u32) -> i32 {
+    pci_config_write(bdf, offset, 4, value)
+}
+
+/// Map PCI BAR into process address space
+/// bdf: device address
+/// bar: BAR number (0-5)
+/// Returns: (virtual_address, size) or negative error
+pub fn pci_bar_map(bdf: PciBdf, bar: u8) -> Result<(u64, u64), i32> {
+    let mut size: u64 = 0;
+    let ret = syscall3(SYS_PCI_BAR_MAP, bdf.to_u32() as u64, bar as u64, &mut size as *mut u64 as u64);
+    if ret < 0 {
+        Err(ret as i32)
+    } else {
+        Ok((ret as u64, size))
+    }
+}
+
+/// Allocate MSI vector(s) for a device
+/// bdf: device address
+/// count: number of vectors requested
+/// Returns: first IRQ number or negative error
+pub fn pci_msi_alloc(bdf: PciBdf, count: u8) -> Result<u32, i32> {
+    let ret = syscall2(SYS_PCI_MSI_ALLOC, bdf.to_u32() as u64, count as u64);
+    if ret < 0 {
+        Err(ret as i32)
+    } else {
+        Ok(ret as u32)
+    }
+}
+
+/// Claim ownership of a PCI device
+/// Must be called before config writes, BAR mapping, or MSI allocation
+/// bdf: device address
+/// Returns: 0 or negative error
+pub fn pci_claim(bdf: PciBdf) -> i32 {
+    syscall1(SYS_PCI_CLAIM, bdf.to_u32() as u64) as i32
+}

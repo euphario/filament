@@ -1,4 +1,6 @@
 //! ELF64 Loader
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Minimal ELF loader for AArch64 executables.
 //! Parses ELF headers and loads PT_LOAD segments into process memory.

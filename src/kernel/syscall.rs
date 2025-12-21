@@ -111,6 +111,18 @@ pub enum SyscallNumber {
     ShmemNotify = 43,
     /// Destroy shared memory region
     ShmemDestroy = 44,
+    /// Enumerate PCI devices
+    PciEnumerate = 50,
+    /// Read PCI config space
+    PciConfigRead = 51,
+    /// Write PCI config space
+    PciConfigWrite = 52,
+    /// Map PCI BAR into process address space
+    PciBarMap = 53,
+    /// Allocate MSI vector(s) for a device
+    PciMsiAlloc = 54,
+    /// Claim ownership of a PCI device
+    PciClaim = 55,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -163,6 +175,12 @@ impl From<u64> for SyscallNumber {
             42 => SyscallNumber::ShmemWait,
             43 => SyscallNumber::ShmemNotify,
             44 => SyscallNumber::ShmemDestroy,
+            50 => SyscallNumber::PciEnumerate,
+            51 => SyscallNumber::PciConfigRead,
+            52 => SyscallNumber::PciConfigWrite,
+            53 => SyscallNumber::PciBarMap,
+            54 => SyscallNumber::PciMsiAlloc,
+            55 => SyscallNumber::PciClaim,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -171,6 +189,7 @@ impl From<u64> for SyscallNumber {
 /// Syscall error codes (POSIX-like)
 #[repr(i64)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Infrastructure: some variants reserved for future use
 pub enum SyscallError {
     Success = 0,
     /// EPERM - Operation not permitted
@@ -287,6 +306,20 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::ShmemWait => sys_shmem_wait(args.arg0 as u32, args.arg1 as u32),
         SyscallNumber::ShmemNotify => sys_shmem_notify(args.arg0 as u32),
         SyscallNumber::ShmemDestroy => sys_shmem_destroy(args.arg0 as u32),
+        SyscallNumber::PciEnumerate => sys_pci_enumerate(args.arg0, args.arg1 as usize),
+        SyscallNumber::PciConfigRead => {
+            sys_pci_config_read(args.arg0 as u32, args.arg1 as u16, args.arg2 as u8)
+        }
+        SyscallNumber::PciConfigWrite => {
+            sys_pci_config_write(args.arg0 as u32, args.arg1 as u16, args.arg2 as u8, args.arg3 as u32)
+        }
+        SyscallNumber::PciBarMap => {
+            sys_pci_bar_map(args.arg0 as u32, args.arg1 as u8, args.arg2)
+        }
+        SyscallNumber::PciMsiAlloc => {
+            sys_pci_msi_alloc(args.arg0 as u32, args.arg1 as u8)
+        }
+        SyscallNumber::PciClaim => sys_pci_claim(args.arg0 as u32),
         SyscallNumber::Invalid => {
             logln!("[SYSCALL] Invalid syscall number: {}", args.num);
             SyscallError::NotImplemented as i64
@@ -1298,6 +1331,7 @@ pub struct ProcessInfo {
 }
 
 impl ProcessInfo {
+    #[allow(dead_code)] // Infrastructure for future use
     pub const fn empty() -> Self {
         Self {
             pid: 0,
@@ -1528,6 +1562,284 @@ fn sys_reset() -> ! {
     }
 }
 
+// ============================================================================
+// PCI Syscalls
+// ============================================================================
+
+/// PCI device info structure for enumerate syscall
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PciDeviceInfo {
+    /// BDF as u32 (port:8 | bus:8 | device:5 | function:3)
+    pub bdf: u32,
+    /// Vendor ID
+    pub vendor_id: u16,
+    /// Device ID
+    pub device_id: u16,
+    /// Class code (24-bit)
+    pub class_code: u32,
+    /// Revision
+    pub revision: u8,
+    /// Has MSI capability
+    pub has_msi: u8,
+    /// Has MSI-X capability
+    pub has_msix: u8,
+    /// Padding
+    pub _pad: u8,
+    /// BAR0 physical address
+    pub bar0_addr: u64,
+    /// BAR0 size
+    pub bar0_size: u64,
+}
+
+/// Enumerate PCI devices
+/// buf_ptr: pointer to array of PciDeviceInfo
+/// buf_len: number of entries in array
+/// Returns: number of devices written (or -errno)
+fn sys_pci_enumerate(buf_ptr: u64, buf_len: usize) -> i64 {
+    use super::pci;
+
+    // Validate buffer
+    let entry_size = core::mem::size_of::<PciDeviceInfo>();
+    let total_size = buf_len.saturating_mul(entry_size);
+
+    if uaccess::validate_user_write(buf_ptr, total_size).is_err() {
+        return SyscallError::BadAddress as i64;
+    }
+
+    let mut count = 0usize;
+    for dev in pci::devices() {
+        if count >= buf_len {
+            break;
+        }
+
+        let info = PciDeviceInfo {
+            bdf: dev.bdf.to_u32(),
+            vendor_id: dev.vendor_id,
+            device_id: dev.device_id,
+            class_code: dev.class_code,
+            revision: dev.revision,
+            has_msi: if dev.has_msi() { 1 } else { 0 },
+            has_msix: if dev.has_msix() { 1 } else { 0 },
+            _pad: 0,
+            bar0_addr: dev.bar0_addr,
+            bar0_size: dev.bar0_size,
+        };
+
+        let dest = buf_ptr + (count * entry_size) as u64;
+        unsafe {
+            core::ptr::write(dest as *mut PciDeviceInfo, info);
+        }
+        count += 1;
+    }
+
+    count as i64
+}
+
+/// Read PCI config space
+/// bdf: device address (port:8 | bus:8 | device:5 | function:3)
+/// offset: register offset (must be aligned)
+/// size: 1, 2, or 4 bytes
+/// Returns: value or -errno
+fn sys_pci_config_read(bdf: u32, offset: u16, size: u8) -> i64 {
+    use super::pci::{self, PciBdf};
+
+    let bdf = PciBdf::from_u32(bdf);
+
+    // Check device exists and caller has access
+    let dev = match pci::find_by_bdf(bdf) {
+        Some(d) => d,
+        None => return SyscallError::NotFound as i64,
+    };
+
+    // Check ownership (0 = unclaimed, anyone can read)
+    let pid = current_pid();
+    if dev.owner_pid != 0 && dev.owner_pid != pid {
+        return SyscallError::PermissionDenied as i64;
+    }
+
+    match pci::config_read32(bdf, offset & !0x3) {
+        Ok(val32) => {
+            // Extract the requested portion
+            match size {
+                1 => {
+                    let shift = (offset & 3) * 8;
+                    ((val32 >> shift) & 0xFF) as i64
+                }
+                2 => {
+                    let shift = (offset & 2) * 8;
+                    ((val32 >> shift) & 0xFFFF) as i64
+                }
+                4 => val32 as i64,
+                _ => SyscallError::InvalidArgument as i64,
+            }
+        }
+        Err(_) => SyscallError::IoError as i64,
+    }
+}
+
+/// Write PCI config space
+/// bdf: device address
+/// offset: register offset
+/// size: 1, 2, or 4 bytes
+/// value: value to write
+/// Returns: 0 or -errno
+fn sys_pci_config_write(bdf: u32, offset: u16, size: u8, value: u32) -> i64 {
+    use super::pci::{self, PciBdf};
+
+    let bdf = PciBdf::from_u32(bdf);
+
+    // Check device exists and caller owns it
+    let dev = match pci::find_by_bdf(bdf) {
+        Some(d) => d,
+        None => return SyscallError::NotFound as i64,
+    };
+
+    let pid = current_pid();
+    if dev.owner_pid != pid {
+        return SyscallError::PermissionDenied as i64;
+    }
+
+    // For partial writes, do read-modify-write
+    let aligned_offset = offset & !0x3;
+
+    let result = if size == 4 {
+        pci::config_write32(bdf, aligned_offset, value)
+    } else {
+        // Read current value
+        let current = match pci::config_read32(bdf, aligned_offset) {
+            Ok(v) => v,
+            Err(_) => return SyscallError::IoError as i64,
+        };
+
+        let (mask, shift) = match size {
+            1 => (0xFFu32, ((offset & 3) * 8) as u32),
+            2 => (0xFFFFu32, ((offset & 2) * 8) as u32),
+            _ => return SyscallError::InvalidArgument as i64,
+        };
+
+        let new_val = (current & !(mask << shift)) | ((value & mask) << shift);
+        pci::config_write32(bdf, aligned_offset, new_val)
+    };
+
+    match result {
+        Ok(()) => 0,
+        Err(_) => SyscallError::IoError as i64,
+    }
+}
+
+/// Map PCI BAR into process address space
+/// bdf: device address
+/// bar: BAR number (0-5)
+/// size_out_ptr: pointer to write actual size
+/// Returns: virtual address or -errno
+fn sys_pci_bar_map(bdf: u32, bar: u8, size_out_ptr: u64) -> i64 {
+    use super::pci::{self, PciBdf};
+
+    if bar > 5 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    let bdf = PciBdf::from_u32(bdf);
+    let pid = current_pid();
+
+    // Check device exists and caller owns it
+    let dev = match pci::find_by_bdf(bdf) {
+        Some(d) => d,
+        None => return SyscallError::NotFound as i64,
+    };
+
+    if dev.owner_pid != pid {
+        return SyscallError::PermissionDenied as i64;
+    }
+
+    // Get BAR info
+    let (phys_addr, size) = match pci::bar_info(bdf, bar) {
+        Ok(info) => info,
+        Err(_) => return SyscallError::InvalidArgument as i64,
+    };
+
+    if size == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Map into process address space
+    unsafe {
+        let sched = super::task::scheduler();
+        for task_opt in sched.tasks.iter_mut() {
+            if let Some(ref mut task) = task_opt {
+                if task.id == pid {
+                    match task.mmap_phys(phys_addr, size as usize) {
+                        Some(vaddr) => {
+                            // Write size to output pointer if valid
+                            if size_out_ptr != 0 {
+                                if uaccess::validate_user_write(size_out_ptr, 8).is_ok() {
+                                    core::ptr::write(size_out_ptr as *mut u64, size);
+                                }
+                            }
+                            return vaddr as i64;
+                        }
+                        None => return SyscallError::OutOfMemory as i64,
+                    }
+                }
+            }
+        }
+    }
+
+    SyscallError::NoProcess as i64
+}
+
+/// Allocate MSI vector(s) for a device
+/// bdf: device address
+/// count: number of vectors requested (power of 2)
+/// Returns: first IRQ number or -errno
+fn sys_pci_msi_alloc(bdf: u32, count: u8) -> i64 {
+    use super::pci::{self, PciBdf};
+
+    let bdf = PciBdf::from_u32(bdf);
+    let pid = current_pid();
+
+    // Check device exists and caller owns it
+    let dev = match pci::find_by_bdf(bdf) {
+        Some(d) => d,
+        None => return SyscallError::NotFound as i64,
+    };
+
+    if dev.owner_pid != pid {
+        return SyscallError::PermissionDenied as i64;
+    }
+
+    // Check device supports MSI
+    if !dev.has_msi() && !dev.has_msix() {
+        return SyscallError::NotImplemented as i64;
+    }
+
+    // Allocate vectors
+    match pci::msi_alloc(bdf, count) {
+        Ok(irq) => irq as i64,
+        Err(pci::PciError::NoMsiVectors) => SyscallError::OutOfMemory as i64,
+        Err(_) => SyscallError::IoError as i64,
+    }
+}
+
+/// Claim ownership of a PCI device
+/// bdf: device address
+/// Returns: 0 or -errno
+fn sys_pci_claim(bdf: u32) -> i64 {
+    use super::pci::{self, PciBdf};
+
+    let bdf = PciBdf::from_u32(bdf);
+    let pid = current_pid();
+
+    // Find and claim device via the pci module's claim function
+    match pci::claim_device(bdf, pid) {
+        Ok(()) => 0,
+        Err(pci::PciError::NotFound) => SyscallError::NotFound as i64,
+        Err(pci::PciError::PermissionDenied) => SyscallError::PermissionDenied as i64,
+        Err(_) => SyscallError::IoError as i64,
+    }
+}
+
 /// Syscall handler called from exception vector (assembly)
 /// This is the entry point from the SVC handler in boot.S
 #[no_mangle]
@@ -1559,6 +1871,7 @@ pub extern "C" fn syscall_handler_rust(
 }
 
 /// Test syscall handling
+#[allow(dead_code)] // Test infrastructure
 pub fn test() {
     logln!("  Testing syscall infrastructure...");
 

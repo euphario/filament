@@ -9,9 +9,10 @@
 //! - Blocking: Processes can block waiting for messages
 //! - Ports: Named endpoints for service discovery
 
-use super::pmm;
+#![allow(dead_code)]  // Some message types and methods are for future use
+
 use crate::logln;
-use super::process::{Pid, ProcessState};
+use super::process::Pid;
 
 /// Maximum inline message payload size
 /// 576 bytes = 512 (sector) + 64 (headers/overhead)
@@ -536,6 +537,55 @@ pub fn sys_receive_blocking(channel_id: ChannelId, caller: Pid) -> Result<Messag
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Synchronous call: send a request and wait for reply
+/// This combines send + block-for-reply in one operation.
+/// Returns the reply message or error.
+///
+/// Note: For true fast-path performance, the scheduler would need to
+/// directly switch to the callee and back. This version uses the
+/// standard blocking mechanism.
+pub fn sys_call(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) -> Result<Message, IpcError> {
+    // Send the request
+    let msg = Message::request(caller, msg_id, data);
+    unsafe {
+        let table = channel_table();
+        if table.get_owner(channel_id) != Some(caller) {
+            return Err(IpcError::PermissionDenied);
+        }
+
+        // Send the request message
+        if let Some(blocked_pid) = table.send(channel_id, msg)? {
+            super::process::process_table().wake(blocked_pid);
+        }
+
+        // Now block waiting for a reply with matching msg_id
+        // For simplicity, we just do blocking receive and check
+        table.block_receiver(channel_id, caller)?;
+        if let Some(proc) = super::process::process_table().get_mut(caller) {
+            proc.block_on_receive(channel_id);
+        }
+        Err(IpcError::WouldBlock) // Syscall layer will handle retry after wakeup
+    }
+}
+
+/// Reply to a request on a channel
+/// Used by servers responding to sys_call requests.
+pub fn sys_reply(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) -> Result<(), IpcError> {
+    let msg = Message::reply(caller, msg_id, data);
+    unsafe {
+        let table = channel_table();
+        if table.get_owner(channel_id) != Some(caller) {
+            return Err(IpcError::PermissionDenied);
+        }
+
+        if let Some(blocked_pid) = table.send(channel_id, msg)? {
+            // Wake the caller that's waiting for reply
+            super::process::process_table().wake(blocked_pid);
+        }
+        Ok(())
     }
 }
 

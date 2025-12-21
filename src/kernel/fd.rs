@@ -1,4 +1,6 @@
 //! File Descriptor Management
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Provides file descriptor abstraction for user processes.
 //! In Redox style, everything is a file - console, devices, IPC, etc.

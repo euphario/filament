@@ -3,6 +3,8 @@
 //! Provides multi-core support for MT7988A's 4x Cortex-A73 cores.
 //! Uses PSCI (Power State Coordination Interface) for CPU power management.
 
+#![allow(dead_code)]  // SMP infrastructure for future multi-core support
+
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
 use crate::logln;
 

@@ -1,4 +1,6 @@
 //! Named Port Registry
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Allows services to register named ports (e.g., "uart:", "fs:", "net:")
 //! and clients to connect to them by name.
@@ -113,12 +115,8 @@ impl PortRegistry {
 
     /// Find a port by name
     fn find_by_name(&self, name: &str) -> Option<usize> {
-        let name_bytes = name.as_bytes();
         self.ports.iter().position(|p| {
-            p.state == PortState::Open && {
-                let pname = p.name_str();
-                pname == name
-            }
+            p.state == PortState::Open && p.name_str() == name
         })
     }
 

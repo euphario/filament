@@ -10,19 +10,22 @@
 //! All SoC-specific addresses, IRQ numbers, and hardware constants live here.
 //! This is the ONE place to look for "what is the magic number for X?"
 
+#![allow(dead_code)]  // Many constants are defined for completeness/documentation
+
 pub mod gic;
 pub mod uart;
 pub mod timer;
 pub mod eth;
 pub mod sd;
 pub mod i2c;
+pub mod wdt;
 
 // =============================================================================
 // Platform Constants
 // =============================================================================
 
-/// Kernel virtual address base (TTBR1 region)
-pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_0000_0000_0000;
+// Re-export KERNEL_VIRT_BASE from arch layer (single source of truth)
+pub use crate::arch::aarch64::mmu::KERNEL_VIRT_BASE;
 
 // =============================================================================
 // Memory Map

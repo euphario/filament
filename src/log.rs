@@ -1,4 +1,6 @@
 //! Kernel Logging Infrastructure
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Provides structured logging with timestamps, log levels, and module names.
 

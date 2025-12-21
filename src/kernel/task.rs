@@ -3,6 +3,8 @@
 //! Provides task structures and context switching for the microkernel.
 //! Each task has its own saved CPU state and address space.
 
+#![allow(dead_code)]  // Some wait reasons and methods are for future use
+
 use super::addrspace::AddressSpace;
 use super::event::EventQueue;
 use super::fd::FdTable;
@@ -34,6 +36,25 @@ pub enum WaitReason {
     Event,
     /// Waiting for shared memory notification
     ShmemNotify(u32),
+}
+
+/// Task priority levels
+/// Lower number = higher priority
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Priority {
+    /// High priority - drivers and critical services
+    High = 0,
+    /// Normal priority - regular applications
+    Normal = 1,
+    /// Low priority - background tasks
+    Low = 2,
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Priority::Normal
+    }
 }
 
 /// Trap frame saved on kernel stack during exceptions
@@ -138,6 +159,10 @@ pub type TaskId = u32;
 /// Stack size for kernel tasks (16KB)
 pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
 
+/// Guard page size (4KB) - placed at bottom of kernel stack
+/// If stack overflows, it will write to this page which can be detected
+pub const GUARD_PAGE_SIZE: usize = 4096;
+
 /// Maximum number of tasks
 pub const MAX_TASKS: usize = 16;
 
@@ -184,14 +209,18 @@ pub struct Task {
     pub id: TaskId,
     /// Current state
     pub state: TaskState,
+    /// Scheduling priority
+    pub priority: Priority,
     /// Saved CPU context (for kernel threads)
     pub context: CpuContext,
     /// Saved trap frame (for user processes) - at top of kernel stack
     pub trap_frame: TrapFrame,
-    /// Kernel stack base (physical address)
+    /// Kernel stack base (physical address, after guard page)
     pub kernel_stack: u64,
-    /// Kernel stack size
+    /// Kernel stack size (not including guard)
     pub kernel_stack_size: usize,
+    /// Guard page physical address (for debugging overflows)
+    pub guard_page: u64,
     /// User address space (None for kernel tasks)
     pub address_space: Option<AddressSpace>,
     /// Is this a user-mode task?
@@ -216,15 +245,22 @@ pub struct Task {
     pub exit_code: i32,
     /// Reason for blocking (when state is Blocked)
     pub wait_reason: Option<WaitReason>,
+    /// Capability set for this task
+    pub capabilities: super::caps::Capabilities,
 }
 
 impl Task {
     /// Create a new kernel task
     pub fn new_kernel(id: TaskId, entry: fn() -> !, name: &str) -> Option<Self> {
-        // Allocate kernel stack (4 pages = 16KB)
-        let stack_pages = KERNEL_STACK_SIZE / 4096;
-        let stack_base = pmm::alloc_pages(stack_pages)?;
+        // Allocate kernel stack + guard page
+        // Layout: [guard page][stack pages...]
+        let total_pages = (KERNEL_STACK_SIZE / 4096) + 1; // +1 for guard
+        let alloc_base = pmm::alloc_pages(total_pages)?;
 
+        // Guard page is at the base
+        let guard_page = alloc_base;
+        // Usable stack starts after guard page
+        let stack_base = alloc_base + GUARD_PAGE_SIZE;
         // Stack grows down, so SP starts at top
         let stack_top = stack_base + KERNEL_STACK_SIZE;
 
@@ -243,10 +279,12 @@ impl Task {
         Some(Self {
             id,
             state: TaskState::Ready,
+            priority: Priority::Normal,  // Kernel tasks default to Normal
             context,
             trap_frame: TrapFrame::new(),
             kernel_stack: stack_base as u64,
             kernel_stack_size: KERNEL_STACK_SIZE,
+            guard_page: guard_page as u64,
             address_space: None,
             is_user: false,
             name: task_name,
@@ -259,15 +297,20 @@ impl Task {
             num_children: 0,
             exit_code: 0,
             wait_reason: None,
+            capabilities: super::caps::Capabilities::ALL,  // Kernel tasks get all capabilities
         })
     }
 
     /// Create a new user task with its own address space
     /// Entry point and user stack must be set separately via set_user_entry()
     pub fn new_user(id: TaskId, name: &str) -> Option<Self> {
-        // Allocate kernel stack for syscall handling
-        let stack_pages = KERNEL_STACK_SIZE / 4096;
-        let stack_base = pmm::alloc_pages(stack_pages)?;
+        // Allocate kernel stack for syscall handling + guard page
+        let total_pages = (KERNEL_STACK_SIZE / 4096) + 1; // +1 for guard
+        let alloc_base = pmm::alloc_pages(total_pages)?;
+
+        // Guard page at base, usable stack after it
+        let guard_page = alloc_base;
+        let stack_base = alloc_base + GUARD_PAGE_SIZE;
 
         // Create address space
         let address_space = AddressSpace::new()?;
@@ -283,10 +326,12 @@ impl Task {
         Some(Self {
             id,
             state: TaskState::Ready,
+            priority: Priority::Normal,  // User tasks default to Normal
             context,
             trap_frame,
             kernel_stack: stack_base as u64,
             kernel_stack_size: KERNEL_STACK_SIZE,
+            guard_page: guard_page as u64,
             address_space: Some(address_space),
             is_user: true,
             name: task_name,
@@ -299,7 +344,23 @@ impl Task {
             num_children: 0,
             exit_code: 0,
             wait_reason: None,
+            capabilities: super::caps::Capabilities::DRIVER_DEFAULT,  // User tasks default to driver caps
         })
+    }
+
+    /// Set task capabilities
+    pub fn set_capabilities(&mut self, caps: super::caps::Capabilities) {
+        self.capabilities = caps;
+    }
+
+    /// Check if task has a capability
+    pub fn has_capability(&self, cap: super::caps::Capabilities) -> bool {
+        self.capabilities.has(cap)
+    }
+
+    /// Set task priority
+    pub fn set_priority(&mut self, priority: Priority) {
+        self.priority = priority;
     }
 
     /// Set parent ID
@@ -613,9 +674,10 @@ impl Drop for Task {
             }
         }
 
-        // Free kernel stack
-        let stack_pages = self.kernel_stack_size / 4096;
-        pmm::free_pages(self.kernel_stack as usize, stack_pages);
+        // Free kernel stack + guard page (allocated together)
+        // The guard page is at guard_page, stack follows it
+        let total_pages = (self.kernel_stack_size / 4096) + 1; // +1 for guard
+        pmm::free_pages(self.guard_page as usize, total_pages);
         // address_space is automatically dropped
     }
 }
@@ -756,8 +818,10 @@ pub struct Scheduler {
     pub tasks: [Option<Task>; MAX_TASKS],
     /// Currently running task index
     pub current: usize,
-    /// Next task ID to assign
-    next_id: TaskId,
+    /// Generation counter per slot - increments when slot is reused
+    /// PID = (slot + 1) | (generation << 8)
+    /// This ensures stale PIDs from terminated tasks don't match new tasks
+    generations: [u32; MAX_TASKS],
 }
 
 impl Scheduler {
@@ -766,8 +830,57 @@ impl Scheduler {
         Self {
             tasks: [NONE; MAX_TASKS],
             current: 0,
-            next_id: 1,
+            generations: [0; MAX_TASKS],
         }
+    }
+
+    /// Generate a PID for a given slot
+    /// PID format: bits[7:0] = slot + 1 (1-16), bits[31:8] = generation
+    fn make_pid(&self, slot: usize) -> TaskId {
+        let slot_bits = (slot + 1) as u32;  // +1 to avoid PID 0
+        let gen_bits = self.generations[slot] << 8;
+        slot_bits | gen_bits
+    }
+
+    /// Extract slot from PID (returns None if invalid)
+    fn slot_from_pid(pid: TaskId) -> Option<usize> {
+        let slot_bits = (pid & 0xFF) as usize;
+        if slot_bits == 0 || slot_bits > MAX_TASKS {
+            return None;
+        }
+        Some(slot_bits - 1)
+    }
+
+    /// Increment generation for a slot (call when task terminates)
+    fn bump_generation(&mut self, slot: usize) {
+        self.generations[slot] = self.generations[slot].wrapping_add(1);
+    }
+
+    /// Look up slot by PID - O(1) with generation verification
+    /// Returns Some(slot) if found and valid, None if stale/invalid
+    pub fn slot_by_pid(&self, pid: TaskId) -> Option<usize> {
+        let slot = Self::slot_from_pid(pid)?;
+        // Verify the task exists and PID matches (generation check)
+        if let Some(ref task) = self.tasks[slot] {
+            if task.id == pid {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    /// Wake a task by PID - O(1) lookup
+    /// Returns true if task was woken
+    pub fn wake_by_pid(&mut self, pid: TaskId) -> bool {
+        if let Some(slot) = self.slot_by_pid(pid) {
+            if let Some(ref mut task) = self.tasks[slot] {
+                if task.state == TaskState::Blocked {
+                    task.state = TaskState::Ready;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Add a kernel task to the scheduler
@@ -775,8 +888,8 @@ impl Scheduler {
         // Find empty slot
         let slot = self.tasks.iter().position(|t| t.is_none())?;
 
-        let id = self.next_id;
-        self.next_id += 1;
+        // Generate PID with current generation for this slot
+        let id = self.make_pid(slot);
 
         self.tasks[slot] = Task::new_kernel(id, entry, name);
         if self.tasks[slot].is_some() {
@@ -790,8 +903,8 @@ impl Scheduler {
     pub fn add_user_task(&mut self, name: &str) -> Option<(TaskId, usize)> {
         let slot = self.tasks.iter().position(|t| t.is_none())?;
 
-        let id = self.next_id;
-        self.next_id += 1;
+        // Generate PID with current generation for this slot
+        let id = self.make_pid(slot);
 
         self.tasks[slot] = Task::new_user(id, name);
         if self.tasks[slot].is_some() {
@@ -830,11 +943,17 @@ impl Scheduler {
 
     /// Remove terminated tasks and free resources
     pub fn reap_terminated(&mut self) {
-        for slot in self.tasks.iter_mut() {
-            if let Some(ref task) = slot {
-                if task.state == TaskState::Terminated {
-                    *slot = None; // Drop will free resources
-                }
+        for slot_idx in 0..MAX_TASKS {
+            let should_reap = self.tasks[slot_idx]
+                .as_ref()
+                .map(|t| t.state == TaskState::Terminated)
+                .unwrap_or(false);
+
+            if should_reap {
+                // Bump generation so any stale PIDs for this slot become invalid
+                self.bump_generation(slot_idx);
+                // Drop the task (frees resources)
+                self.tasks[slot_idx] = None;
             }
         }
     }
@@ -881,24 +1000,42 @@ impl Scheduler {
         })
     }
 
-    /// Simple round-robin scheduling: find next ready task
+    /// Priority-based scheduling with round-robin within same priority
+    /// Higher priority tasks (lower Priority value) always run first.
+    /// Among same-priority tasks, uses round-robin for fairness.
     pub fn schedule(&mut self) -> Option<usize> {
-        let start = self.current;
-        let mut next = (start + 1) % MAX_TASKS;
+        let mut best_slot: Option<usize> = None;
+        let mut best_priority = Priority::Low;  // Start with lowest priority
 
-        while next != start {
-            if let Some(ref task) = self.tasks[next] {
+        // First pass: find the highest priority ready task
+        // Use round-robin starting from current+1 for fairness
+        let start = (self.current + 1) % MAX_TASKS;
+        for i in 0..MAX_TASKS {
+            let slot = (start + i) % MAX_TASKS;
+            if let Some(ref task) = self.tasks[slot] {
                 if task.state == TaskState::Ready {
-                    return Some(next);
+                    // Lower priority value = higher priority
+                    if best_slot.is_none() || task.priority < best_priority {
+                        best_slot = Some(slot);
+                        best_priority = task.priority;
+                        // If we found a High priority task, no need to look further
+                        if best_priority == Priority::High {
+                            break;
+                        }
+                    }
                 }
             }
-            next = (next + 1) % MAX_TASKS;
         }
 
-        // Check if current task is still runnable
-        if let Some(ref task) = self.tasks[start] {
+        // If we found a ready task, return it
+        if best_slot.is_some() {
+            return best_slot;
+        }
+
+        // Check if current task is still runnable (fallback)
+        if let Some(ref task) = self.tasks[self.current] {
             if task.state == TaskState::Running || task.state == TaskState::Ready {
-                return Some(start);
+                return Some(self.current);
             }
         }
 
@@ -939,7 +1076,6 @@ impl Scheduler {
                 }
 
                 // Update current index
-                let old_current = self.current;
                 self.current = next_idx;
 
                 // Mark next as running
@@ -1015,6 +1151,9 @@ pub unsafe fn update_current_task_globals() {
 /// This is the "bottom half" of preemption - the timer IRQ just sets a flag,
 /// and this function does the actual work.
 ///
+/// This function ONLY handles scheduling - no logging or other side effects.
+/// Log flushing and other deferred work should be done separately.
+///
 /// # Safety
 /// Must be called from kernel context (not IRQ context).
 pub unsafe fn do_resched_if_needed() {
@@ -1023,14 +1162,7 @@ pub unsafe fn do_resched_if_needed() {
         return; // No reschedule needed
     }
 
-    // Log any unhandled IRQs from interrupt context (deferred logging)
-    let (unhandled_count, last_irq) = crate::arch::aarch64::sync::cpu_flags().get_unhandled_stats();
-    if unhandled_count > 0 {
-        crate::logln!("[IRQ] {} unhandled interrupt(s), last: {}", unhandled_count, last_irq);
-        crate::arch::aarch64::sync::cpu_flags().clear_unhandled_stats();
-    }
-
-    // Now do the reschedule with IRQs disabled for the critical section
+    // Do the reschedule with IRQs disabled for the critical section
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
     let sched = scheduler();
 
@@ -1065,9 +1197,26 @@ pub unsafe fn do_resched_if_needed() {
 /// (Ready or Blocked depending on what caller set).
 ///
 /// When the yielded task is scheduled again, this function returns.
+///
+/// This is the safe variant that handles IRQ disabling internally.
 /// # Safety
-/// Must be called from kernel context with interrupts properly managed
+/// Must be called from kernel context (not IRQ handlers).
 pub unsafe fn yield_cpu() {
+    // Use IrqGuard to ensure IRQs are disabled during the switch.
+    // The guard will re-enable IRQs after we return (if they were enabled).
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    yield_cpu_locked();
+}
+
+/// Yield CPU with IRQs already disabled.
+///
+/// Use this variant when you're already in a critical section with IRQs disabled
+/// (e.g., holding an IrqGuard). Avoids redundant IRQ masking.
+///
+/// # Safety
+/// - Must be called with IRQs disabled
+/// - Must be called from kernel context (not IRQ handlers)
+pub unsafe fn yield_cpu_locked() {
     let sched = scheduler();
     let caller_slot = sched.current;
 

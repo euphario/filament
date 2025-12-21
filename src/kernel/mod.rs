@@ -25,3 +25,5 @@ pub mod pmm;
 pub mod addrspace;
 pub mod uaccess;
 pub mod log;
+pub mod caps;
+pub mod pci;

@@ -14,6 +14,8 @@
 //! [20:12] - L3 index (9 bits, 512 entries)
 //! [11:0]  - Page offset (12 bits, 4KB)
 
+#![allow(dead_code)]  // Many items are infrastructure for future use
+
 use crate::logln;
 
 /// Page size (4KB)

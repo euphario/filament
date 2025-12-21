@@ -31,9 +31,9 @@ mod panic;
 mod ramfs;
 
 // Convenient aliases - use full paths to avoid ambiguity
-use arch::aarch64::{mmu, sync, smp, mmio};
-use platform::mt7988::{gic, uart, timer, eth, sd, i2c};
-use kernel::{task, process, syscall, ipc, scheme, port, event, fd, shmem, elf, pmm, addrspace, uaccess};
+use arch::aarch64::{mmu, sync, smp};
+use platform::mt7988::{gic, uart, timer};
+use kernel::{task, scheme, shmem, elf, pmm};
 
 // Alias for platform constants (platform::mt7988::INITRD_ADDR, etc.)
 use platform::mt7988 as plat;
@@ -310,20 +310,13 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
     } else {
         // Check if this IRQ is registered by a userspace driver
         if let Some(owner_pid) = scheme::irq_notify(irq) {
-            // Wake the owner process if blocked
-            // This is a minimal state change - actual switch happens at safe point
+            // Wake the owner process if blocked - O(1) lookup via pid_to_slot map
             unsafe {
                 let _guard = sync::IrqGuard::new(); // Ensure atomicity
                 let sched = task::scheduler();
-                for task_opt in sched.tasks.iter_mut() {
-                    if let Some(ref mut task) = task_opt {
-                        if task.id == owner_pid && task.state == task::TaskState::Blocked {
-                            task.state = task::TaskState::Ready;
-                            // Also set need_resched so we switch to woken task
-                            sync::cpu_flags().set_need_resched();
-                            break;
-                        }
-                    }
+                if sched.wake_by_pid(owner_pid) {
+                    // Task was woken, set need_resched so we switch to it
+                    sync::cpu_flags().set_need_resched();
                 }
             }
         } else {
@@ -337,14 +330,25 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
 }
 
 /// Called from assembly after IRQ handler, at the safe point before eret.
-/// This is where deferred scheduling actually happens for timer preemption.
+/// This is where deferred work happens:
+/// 1. Reschedule if timer set the flag
+/// 2. Log any deferred messages (e.g., unhandled IRQs)
+/// 3. Flush log buffer before returning to user
 #[no_mangle]
 pub extern "C" fn irq_exit_resched() {
+    // 1. Handle deferred reschedule
     unsafe {
         task::do_resched_if_needed();
     }
 
-    // Safe point: flush deferred log buffer before returning to user
+    // 2. Log any unhandled IRQs from interrupt context (deferred logging)
+    let (unhandled_count, last_irq) = sync::cpu_flags().get_unhandled_stats();
+    if unhandled_count > 0 {
+        logln!("[IRQ] {} unhandled interrupt(s), last: {}", unhandled_count, last_irq);
+        sync::cpu_flags().clear_unhandled_stats();
+    }
+
+    // 3. Flush deferred log buffer before returning to user
     kernel::log::flush();
 }
 

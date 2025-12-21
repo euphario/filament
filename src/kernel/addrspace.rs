@@ -3,12 +3,11 @@
 //! Manages per-process virtual address spaces using the PMM for page table allocation.
 //! Each process gets its own page tables loaded into TTBR0 during context switch.
 
-use crate::arch::aarch64::mmu::{self, PageTable, PAGE_SIZE, flags, attr};
+#![allow(dead_code)]
+
+use crate::arch::aarch64::mmu::{self, KERNEL_VIRT_BASE, flags, attr};
 use super::pmm;
 use crate::logln;
-
-/// Kernel virtual address base for accessing physical memory via TTBR1
-const KERNEL_VIRT_BASE: u64 = 0xFFFF_0000_0000_0000;
 
 /// Convert a physical address to a kernel virtual address for access via TTBR1
 #[inline(always)]

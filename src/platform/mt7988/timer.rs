@@ -74,6 +74,9 @@ impl Timer {
         if (ctl & ctl::ISTATUS) != 0 {
             self.tick_count += 1;
 
+            // Kick the watchdog to prevent system reset
+            super::wdt::kick();
+
             // Reload timer for next time slice
             let ticks = (self.frequency * self.time_slice_ms) / 1000;
             Self::write_tval(ticks);

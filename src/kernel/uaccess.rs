@@ -1,4 +1,6 @@
 //! User Space Memory Access Validation
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Provides safe functions for accessing user space memory from syscalls.
 //! This is critical for kernel security - prevents userspace from tricking
@@ -13,11 +15,8 @@
 //! 1. Translate user VA to PA using the user's page tables
 //! 2. Access the physical memory via TTBR1 (kernel virtual address)
 
-use crate::arch::aarch64::mmu::{flags, PAGE_SIZE};
+use crate::arch::aarch64::mmu::{flags, PAGE_SIZE, KERNEL_VIRT_BASE};
 use super::task;
-
-/// Kernel virtual address base (TTBR1)
-const KERNEL_VIRT_BASE: u64 = 0xFFFF_0000_0000_0000;
 
 /// Maximum valid user space address (48-bit, upper half is kernel)
 pub const USER_SPACE_END: u64 = 0x0000_FFFF_FFFF_FFFF;

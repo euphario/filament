@@ -1,4 +1,6 @@
 //! Event System
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Provides async notification mechanism for processes.
 //! Similar to Redox's event system - processes can wait on multiple events.
@@ -314,7 +316,7 @@ pub fn send_event(pid: u32, event: Event) -> bool {
 /// Subscribe to events
 /// Args: event_type, filter
 /// Returns: 0 on success, negative error
-pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
+pub fn sys_event_subscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
     let ev_type = match event_type {
         1 => EventType::IpcReady,
         2 => EventType::Timer,

@@ -1,4 +1,6 @@
 //! Embedded initrd support
+
+#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! This module includes the initrd TAR archive at compile time.
 //! The data is compiled directly into the kernel binary via include_bytes!.

@@ -75,12 +75,14 @@ impl LogBuffer {
 
     /// Check if buffer has data
     #[inline]
+    #[allow(dead_code)] // Infrastructure for future use
     fn has_data(&self) -> bool {
         self.write_pos.load(Ordering::Acquire) != self.read_pos.load(Ordering::Acquire)
     }
 
     /// Get number of bytes in buffer
     #[inline]
+    #[allow(dead_code)] // Infrastructure for future use
     fn len(&self) -> usize {
         let write = self.write_pos.load(Ordering::Acquire);
         let read = self.read_pos.load(Ordering::Acquire);
@@ -124,11 +126,13 @@ pub fn flush() {
 }
 
 /// Check if log buffer has pending data
+#[allow(dead_code)] // Infrastructure for future use
 pub fn has_pending() -> bool {
     unsafe { (*core::ptr::addr_of!(LOG_BUFFER)).has_data() }
 }
 
 /// Get number of bytes pending in log buffer
+#[allow(dead_code)] // Infrastructure for future use
 pub fn pending_bytes() -> usize {
     unsafe { (*core::ptr::addr_of!(LOG_BUFFER)).len() }
 }
@@ -139,6 +143,7 @@ macro_rules! log {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
         // SAFETY: Single-threaded or IRQ context with atomic operations
+        #[allow(unused_unsafe)]
         unsafe {
             let _ = write!(&mut *core::ptr::addr_of_mut!($crate::kernel::log::LOG_BUFFER), $($arg)*);
         }

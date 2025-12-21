@@ -17,6 +17,6 @@ pub mod mmio;
 // Include the assembly startup code
 global_asm!(include_str!("boot.S"));
 
-// Re-export commonly used items
-pub use sync::IrqGuard;
-pub use mmio::MmioRegion;
+// Re-exports available if needed:
+// pub use sync::IrqGuard;
+// pub use mmio::MmioRegion;
