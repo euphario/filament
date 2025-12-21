@@ -29,7 +29,7 @@ impl Capabilities {
     pub const DRIVER_DEFAULT: Self = Self(
         Self::IPC.0 | Self::MEMORY.0 | Self::SPAWN.0 |
         Self::SCHEME_CREATE.0 | Self::IRQ_CLAIM.0 | Self::MMIO.0 |
-        Self::DMA.0
+        Self::DMA.0 | Self::RAW_DEVICE.0
     );
 
     // Individual capability bits

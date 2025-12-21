@@ -188,11 +188,10 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
     // Map into owner's address space
     let vaddr = map_into_process(owner_pid, phys_addr as u64, aligned_size)?;
 
-    // Zero the memory
+    // Zero the memory through kernel's direct-map
     unsafe {
-        // Use physical address directly since we're in kernel
-        // The user mapping will see zeroed memory
-        core::ptr::write_bytes(phys_addr as *mut u8, 0, aligned_size);
+        let kern_vaddr = crate::arch::aarch64::mmu::phys_to_virt(phys_addr as u64);
+        core::ptr::write_bytes(kern_vaddr as *mut u8, 0, aligned_size);
     }
 
     // Store in table
@@ -242,9 +241,11 @@ pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
 }
 
 /// Wait for notification on shared memory
-/// Returns 0 on notify, -ETIMEDOUT on timeout
+/// Returns Err(-EAGAIN) to signal caller should block.
+/// The syscall layer handles actual blocking and rescheduling.
+/// TODO: timeout_ms is currently ignored
 pub fn wait(pid: Pid, shmem_id: u32, _timeout_ms: u32) -> Result<(), i64> {
-    // Add to waiters list
+    // Add to waiters list and mark task as blocked
     unsafe {
         let region = find_region_mut(shmem_id)?;
 
@@ -258,36 +259,21 @@ pub fn wait(pid: Pid, shmem_id: u32, _timeout_ms: u32) -> Result<(), i64> {
         }
     }
 
-    // Block the current task
-    // When we return from this syscall, the scheduler will pick another task.
-    // We'll be woken when notify() is called.
+    // Mark task as blocked - syscall layer will handle scheduling
     unsafe {
         let sched = super::task::scheduler();
-        let current_slot = sched.current;
-
-        if let Some(ref mut task) = sched.tasks[current_slot] {
+        if let Some(ref mut task) = sched.tasks[sched.current] {
             task.state = super::task::TaskState::Blocked;
             task.wait_reason = Some(super::task::WaitReason::ShmemNotify(shmem_id));
-            // Pre-store return value in caller's trap frame (success = 0)
-            task.trap_frame.x0 = 0;
-        }
-
-        // Find next task to run
-        if let Some(next_slot) = sched.schedule() {
-            sched.current = next_slot;
-            if let Some(ref mut task) = sched.tasks[next_slot] {
-                task.state = super::task::TaskState::Running;
-            }
-            super::task::update_current_task_globals();
-            // Signal to assembly not to store return value
-            super::task::SYSCALL_SWITCHED_TASK = 1;
         }
     }
 
-    Ok(())
+    // Return "would block" - syscall exit path will reschedule
+    Err(-11) // EAGAIN
 }
 
 /// Notify all waiters on shared memory
+/// Uses O(1) wake via PID→slot map
 pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
     let waiters = unsafe {
         let region = find_region_mut(shmem_id)?;
@@ -300,7 +286,7 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
         region.drain_waiters()
     };
 
-    // Wake all waiters
+    // Wake all waiters using O(1) PID→slot lookup
     let mut woken = 0u32;
     unsafe {
         let sched = super::task::scheduler();
@@ -308,20 +294,8 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
             if *waiter_pid == NO_PID {
                 continue;
             }
-            // Find the task and wake it
-            for task_opt in sched.tasks.iter_mut() {
-                if let Some(ref mut task) = task_opt {
-                    if task.id == *waiter_pid {
-                        if let Some(super::task::WaitReason::ShmemNotify(id)) = task.wait_reason {
-                            if id == shmem_id {
-                                task.state = super::task::TaskState::Ready;
-                                task.wait_reason = None;
-                                woken += 1;
-                            }
-                        }
-                        break;
-                    }
-                }
+            if sched.wake_by_pid(*waiter_pid) {
+                woken += 1;
             }
         }
     }

@@ -479,6 +479,18 @@ pub fn sys_channel_close(channel_id: ChannelId, caller: Pid) -> Result<(), IpcEr
 
 /// Send a message (non-blocking)
 pub fn sys_send(channel_id: ChannelId, caller: Pid, data: &[u8]) -> Result<(), IpcError> {
+    sys_send_internal(channel_id, caller, data, false)
+}
+
+/// Send a message with direct switch to receiver (fast-path IPC)
+/// If receiver is blocked waiting, directly switch to it.
+/// Returns when switched back (receiver yielded/blocked/preempted).
+pub fn sys_send_direct(channel_id: ChannelId, caller: Pid, data: &[u8]) -> Result<(), IpcError> {
+    sys_send_internal(channel_id, caller, data, true)
+}
+
+/// Internal send implementation
+fn sys_send_internal(channel_id: ChannelId, caller: Pid, data: &[u8], direct: bool) -> Result<(), IpcError> {
     unsafe {
         let table = channel_table();
         // Verify ownership
@@ -492,6 +504,14 @@ pub fn sys_send(channel_id: ChannelId, caller: Pid, data: &[u8]) -> Result<(), I
                 // If there's a blocked process, wake it
                 if let Some(blocked_pid) = maybe_blocked {
                     super::process::process_table().wake(blocked_pid);
+                    let sched = super::task::scheduler();
+                    sched.wake_by_pid(blocked_pid);
+
+                    // Direct switch: donate timeslice to receiver
+                    if direct {
+                        sched.direct_switch_to(blocked_pid);
+                        // Returns here when switched back
+                    }
                 }
                 Ok(())
             }
@@ -559,6 +579,7 @@ pub fn sys_call(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) ->
         // Send the request message
         if let Some(blocked_pid) = table.send(channel_id, msg)? {
             super::process::process_table().wake(blocked_pid);
+            super::task::scheduler().wake_by_pid(blocked_pid);
         }
 
         // Now block waiting for a reply with matching msg_id
@@ -584,6 +605,7 @@ pub fn sys_reply(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) -
         if let Some(blocked_pid) = table.send(channel_id, msg)? {
             // Wake the caller that's waiting for reply
             super::process::process_table().wake(blocked_pid);
+            super::task::scheduler().wake_by_pid(blocked_pid);
         }
         Ok(())
     }

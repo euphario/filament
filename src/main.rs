@@ -32,8 +32,8 @@ mod ramfs;
 
 // Convenient aliases - use full paths to avoid ambiguity
 use arch::aarch64::{mmu, sync, smp};
-use platform::mt7988::{gic, uart, timer};
-use kernel::{task, scheme, shmem, elf, pmm};
+use platform::mt7988::{gic, uart, timer, wdt};
+use kernel::{task, scheme, shmem, elf, pmm, pci};
 
 // Alias for platform constants (platform::mt7988::INITRD_ADDR, etc.)
 use platform::mt7988 as plat;
@@ -123,6 +123,17 @@ pub extern "C" fn kmain() -> ! {
     println!();
     println!("Initializing scheme system...");
     scheme::init();
+
+    // Initialize PCI subsystem
+    println!();
+    println!("Initializing PCI subsystem...");
+    pci::init();
+
+    // Initialize watchdog timer (but don't enable yet)
+    println!();
+    println!("Initializing watchdog...");
+    wdt::init();
+    println!("[OK] Watchdog initialized (disabled)");
 
     // Initialize timer
     println!();

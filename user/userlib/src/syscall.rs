@@ -50,6 +50,7 @@ pub const SYS_SHMEM_ALLOW: u64 = 41;
 pub const SYS_SHMEM_WAIT: u64 = 42;
 pub const SYS_SHMEM_NOTIFY: u64 = 43;
 pub const SYS_SHMEM_DESTROY: u64 = 44;
+pub const SYS_SEND_DIRECT: u64 = 45;
 
 // SEEK whence constants
 pub const SEEK_SET: u32 = 0;
@@ -299,6 +300,13 @@ pub fn channel_close(channel_id: u32) -> i32 {
 /// Send data on a channel
 pub fn send(channel_id: u32, data: &[u8]) -> i32 {
     syscall3(SYS_SEND, channel_id as u64, data.as_ptr() as u64, data.len() as u64) as i32
+}
+
+/// Send data on a channel with direct switch to receiver (fast-path IPC)
+/// If the receiver is blocked waiting, directly switches to it.
+/// Returns when the receiver yields or is preempted.
+pub fn send_direct(channel_id: u32, data: &[u8]) -> i32 {
+    syscall3(SYS_SEND_DIRECT, channel_id as u64, data.as_ptr() as u64, data.len() as u64) as i32
 }
 
 /// Receive data from a channel

@@ -16,6 +16,7 @@
 
 use crate::logln;
 use super::uaccess::{self, UAccessError};
+use super::caps::Capabilities;
 
 /// Syscall numbers
 #[repr(u64)]
@@ -111,6 +112,8 @@ pub enum SyscallNumber {
     ShmemNotify = 43,
     /// Destroy shared memory region
     ShmemDestroy = 44,
+    /// Send with direct switch to receiver (fast-path IPC)
+    SendDirect = 45,
     /// Enumerate PCI devices
     PciEnumerate = 50,
     /// Read PCI config space
@@ -175,6 +178,7 @@ impl From<u64> for SyscallNumber {
             42 => SyscallNumber::ShmemWait,
             43 => SyscallNumber::ShmemNotify,
             44 => SyscallNumber::ShmemDestroy,
+            45 => SyscallNumber::SendDirect,
             50 => SyscallNumber::PciEnumerate,
             51 => SyscallNumber::PciConfigRead,
             52 => SyscallNumber::PciConfigWrite,
@@ -255,6 +259,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Mmap => sys_mmap(args.arg0, args.arg1 as usize, args.arg2 as u32),
         SyscallNumber::Munmap => sys_munmap(args.arg0, args.arg1 as usize),
         SyscallNumber::Send => sys_send(args.arg0 as u32, args.arg1, args.arg2 as usize),
+        SyscallNumber::SendDirect => sys_send_direct(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::Receive => sys_receive(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::ChannelCreate => sys_channel_create(),
         SyscallNumber::ChannelClose => sys_channel_close(args.arg0 as u32),
@@ -332,6 +337,21 @@ fn current_pid() -> u32 {
     unsafe {
         super::task::scheduler().current_task_id().unwrap_or(1)
     }
+}
+
+/// Check if current task has the required capability
+/// Returns Ok(()) if the capability is present, or an error code if not
+fn require_capability(cap: Capabilities) -> Result<(), i64> {
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref task) = sched.tasks[sched.current] {
+            if task.has_capability(cap) {
+                return Ok(());
+            }
+        }
+    }
+    logln!("[SYSCALL] Capability check failed: {:?}", cap);
+    Err(SyscallError::PermissionDenied as i64)
 }
 
 /// Exit current process
@@ -516,6 +536,11 @@ fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
 /// Returns: virtual address on success, writes physical address to phys_ptr
 /// SECURITY: Writes to user pointer via page table translation
 fn sys_mmap_dma(size: usize, phys_ptr: u64) -> i64 {
+    // Check DMA capability
+    if let Err(e) = require_capability(Capabilities::DMA) {
+        return e;
+    }
+
     if size == 0 {
         return SyscallError::InvalidArgument as i64;
     }
@@ -605,6 +630,34 @@ fn sys_send(channel_id: u32, data_ptr: u64, data_len: usize) -> i64 {
     }
 }
 
+/// Send IPC message with direct switch to receiver (fast-path)
+/// Args: channel_id, data_ptr, data_len
+/// SECURITY: Copies user buffer via page table translation
+fn sys_send_direct(channel_id: u32, data_ptr: u64, data_len: usize) -> i64 {
+    // Validate length
+    if data_len > super::ipc::MAX_INLINE_PAYLOAD {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    let caller_pid = current_pid();
+
+    // Copy from user space if we have data
+    let mut kernel_buf = [0u8; super::ipc::MAX_INLINE_PAYLOAD];
+    if data_len > 0 {
+        match uaccess::copy_from_user(&mut kernel_buf[..data_len], data_ptr) {
+            Ok(_) => {}
+            Err(e) => return uaccess_to_errno(e),
+        }
+    }
+
+    // Send via IPC with direct switch
+    let data = if data_len > 0 { &kernel_buf[..data_len] } else { &[] };
+    match super::ipc::sys_send_direct(channel_id, caller_pid, data) {
+        Ok(()) => SyscallError::Success as i64,
+        Err(e) => e.to_errno() as i64,
+    }
+}
+
 /// Receive IPC message from a channel
 /// Args: channel_id, buf_ptr, buf_len
 /// Returns: message length on success, negative error on failure
@@ -631,6 +684,16 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             }
             // Return actual message length (so caller knows if truncated)
             msg.header.payload_len as i64
+        }
+        Err(super::ipc::IpcError::WouldBlock) => {
+            // Mark task as blocked so scheduler switches away
+            unsafe {
+                let sched = super::task::scheduler();
+                if let Some(ref mut task) = sched.tasks[sched.current] {
+                    task.state = super::task::TaskState::Blocked;
+                }
+            }
+            SyscallError::WouldBlock as i64
         }
         Err(e) => e.to_errno() as i64,
     }
@@ -1010,6 +1073,11 @@ fn sys_scheme_open(url_ptr: u64, url_len: usize, flags: u32) -> i64 {
 /// Returns: 0 on success, negative error on failure
 /// SECURITY: Copies user name buffer via page table translation
 fn sys_scheme_register(name_ptr: u64, name_len: usize, channel_id: u32) -> i64 {
+    // Check SCHEME_CREATE capability
+    if let Err(e) = require_capability(Capabilities::SCHEME_CREATE) {
+        return e;
+    }
+
     // Validate name length
     if name_len == 0 || name_len > 31 {
         return SyscallError::InvalidArgument as i64;
@@ -1101,6 +1169,11 @@ fn sys_scheme_unregister(name_ptr: u64, name_len: usize) -> i64 {
 /// Returns: child PID on success, negative error on failure
 /// SECURITY: Copies user name buffer via page table translation
 fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
+    // Check SPAWN capability
+    if let Err(e) = require_capability(Capabilities::SPAWN) {
+        return e;
+    }
+
     // Validate name length
     if name_len == 0 || name_len > 15 {
         return SyscallError::InvalidArgument as i64;
@@ -1520,7 +1593,12 @@ fn sys_set_log_level(level: u8) -> i64 {
 }
 
 /// Reset/reboot the system using MT7988A watchdog
-fn sys_reset() -> ! {
+fn sys_reset() -> i64 {
+    // Only processes with ALL capabilities can reset the system
+    if let Err(e) = require_capability(Capabilities::ALL) {
+        return e;
+    }
+
     logln!();
     logln!("========================================");
     logln!("  System Reset Requested");
@@ -1826,6 +1904,11 @@ fn sys_pci_msi_alloc(bdf: u32, count: u8) -> i64 {
 /// bdf: device address
 /// Returns: 0 or -errno
 fn sys_pci_claim(bdf: u32) -> i64 {
+    // Check RAW_DEVICE capability for PCI access
+    if let Err(e) = require_capability(Capabilities::RAW_DEVICE) {
+        return e;
+    }
+
     use super::pci::{self, PciBdf};
 
     let bdf = PciBdf::from_u32(bdf);
@@ -2002,6 +2085,17 @@ fn sys_shmem_wait(shmem_id: u32, timeout_ms: u32) -> i64 {
 
     match super::shmem::wait(caller_pid, shmem_id, timeout_ms) {
         Ok(()) => 0,
+        Err(-11) => {
+            // EAGAIN = blocked, pre-store success return value
+            // When woken by notify, task will resume and see 0
+            unsafe {
+                let sched = super::task::scheduler();
+                if let Some(ref mut task) = sched.tasks[sched.current] {
+                    task.trap_frame.x0 = 0;
+                }
+            }
+            SyscallError::WouldBlock as i64
+        }
         Err(e) => e,
     }
 }

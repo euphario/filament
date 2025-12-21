@@ -4,7 +4,7 @@
 //!
 //! Provides structured logging with timestamps, log levels, and module names.
 
-use crate::println;
+use crate::logln;
 
 /// Log levels from most to least severe
 #[repr(u8)]
@@ -113,7 +113,7 @@ pub fn _log(level: LogLevel, module: &str, args: core::fmt::Arguments) {
         .next()
         .unwrap_or(module);
 
-    println!(
+    logln!(
         "[{:8}.{:03}] {} [{}] {}",
         secs, millis, level.as_str(), short_module, args
     );

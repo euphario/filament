@@ -876,6 +876,7 @@ impl Scheduler {
             if let Some(ref mut task) = self.tasks[slot] {
                 if task.state == TaskState::Blocked {
                     task.state = TaskState::Ready;
+                    task.wait_reason = None;
                     return true;
                 }
             }
@@ -1089,6 +1090,75 @@ impl Scheduler {
                 // We return here when switched back to this task
             }
         }
+    }
+
+    /// Direct switch to a specific task by PID (for IPC fast-path)
+    /// Returns true if switch happened, false if target not found/not ready
+    ///
+    /// This bypasses normal scheduling for synchronous IPC - the sender
+    /// directly donates its timeslice to the receiver.
+    ///
+    /// # Safety
+    /// Must be called with interrupts disabled
+    pub unsafe fn direct_switch_to(&mut self, target_pid: TaskId) -> bool {
+        // Find target slot
+        let target_slot = match self.slot_by_pid(target_pid) {
+            Some(slot) => slot,
+            None => return false,
+        };
+
+        // Don't switch to self
+        if target_slot == self.current {
+            return false;
+        }
+
+        // Verify target is ready (or we just woke it)
+        if let Some(ref task) = self.tasks[target_slot] {
+            if task.state != TaskState::Ready && task.state != TaskState::Running {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        // Mark current as ready (donating timeslice)
+        if let Some(ref mut current) = self.tasks[self.current] {
+            if current.state == TaskState::Running {
+                current.state = TaskState::Ready;
+            }
+        }
+
+        // Get context pointers
+        let current_ctx = if let Some(ref mut t) = self.tasks[self.current] {
+            &mut t.context as *mut CpuContext
+        } else {
+            return false;
+        };
+
+        let next_ctx = if let Some(ref t) = self.tasks[target_slot] {
+            &t.context as *const CpuContext
+        } else {
+            return false;
+        };
+
+        // Switch address space
+        if let Some(ref task) = self.tasks[target_slot] {
+            if let Some(ref addr_space) = task.address_space {
+                addr_space.activate();
+            }
+        }
+
+        // Update current and mark target as running
+        self.current = target_slot;
+        if let Some(ref mut t) = self.tasks[target_slot] {
+            t.state = TaskState::Running;
+        }
+
+        // Perform the switch
+        context_switch(current_ctx, next_ctx);
+
+        // Returned here when switched back
+        true
     }
 
     /// Print scheduler state
