@@ -663,13 +663,19 @@ impl KernelScheme for IrqScheme {
             return Err(-22);
         }
 
-        // Get current process PID
+        // Get current process PID and check IRQ_CLAIM capability
         let pid = unsafe {
             let sched = super::task::scheduler();
-            sched.tasks[sched.current]
+            let task = sched.tasks[sched.current]
                 .as_ref()
-                .map(|t| t.id)
-                .ok_or(-1)?
+                .ok_or(-1)?;
+
+            // Require IRQ_CLAIM capability
+            if !task.has_capability(super::caps::Capabilities::IRQ_CLAIM) {
+                return Err(-1); // EPERM
+            }
+
+            task.id
         };
 
         // Register for this IRQ

@@ -450,6 +450,8 @@ fn get_current_ttbr0() -> Result<u64, UAccessError> {
 /// using the user's page tables, then accesses the physical memory via TTBR1.
 /// This is necessary because during syscall handling, TTBR0 points to the kernel's
 /// identity mapping, not the user's address space.
+///
+/// Optimization: Copies in page-aligned chunks to minimize VA→PA translations.
 pub fn copy_from_user(kernel_buf: &mut [u8], user_ptr: u64) -> Result<usize, UAccessError> {
     let len = kernel_buf.len();
     if len == 0 {
@@ -459,19 +461,26 @@ pub fn copy_from_user(kernel_buf: &mut [u8], user_ptr: u64) -> Result<usize, UAc
     validate_user_read(user_ptr, len)?;
     let ttbr0 = get_current_ttbr0()?;
 
-    // Copy byte by byte, handling page boundaries
-    // (A more efficient implementation would copy page-at-a-time)
+    // Copy in page-aligned chunks to minimize VA→PA translations
     let mut copied = 0;
     while copied < len {
         let user_addr = user_ptr + copied as u64;
         let phys_addr = user_virt_to_phys(ttbr0, user_addr)?;
 
+        // Calculate how many bytes remain in this page
+        let page_offset = (phys_addr & (PAGE_SIZE as u64 - 1)) as usize;
+        let bytes_in_page = PAGE_SIZE - page_offset;
+        let bytes_remaining = len - copied;
+        let chunk_size = bytes_in_page.min(bytes_remaining);
+
         // Access physical memory via TTBR1 kernel mapping
         let kernel_va = KERNEL_VIRT_BASE | phys_addr;
         unsafe {
-            kernel_buf[copied] = core::ptr::read_volatile(kernel_va as *const u8);
+            let src = kernel_va as *const u8;
+            let dst = kernel_buf.as_mut_ptr().add(copied);
+            core::ptr::copy_nonoverlapping(src, dst, chunk_size);
         }
-        copied += 1;
+        copied += chunk_size;
     }
 
     Ok(len)
@@ -483,6 +492,8 @@ pub fn copy_from_user(kernel_buf: &mut [u8], user_ptr: u64) -> Result<usize, UAc
 ///
 /// IMPORTANT: This function translates user virtual addresses to physical addresses
 /// using the user's page tables, then accesses the physical memory via TTBR1.
+///
+/// Optimization: Copies in page-aligned chunks to minimize VA→PA translations.
 pub fn copy_to_user(user_ptr: u64, kernel_buf: &[u8]) -> Result<usize, UAccessError> {
     let len = kernel_buf.len();
     if len == 0 {
@@ -492,18 +503,26 @@ pub fn copy_to_user(user_ptr: u64, kernel_buf: &[u8]) -> Result<usize, UAccessEr
     validate_user_write(user_ptr, len)?;
     let ttbr0 = get_current_ttbr0()?;
 
-    // Copy byte by byte, handling page boundaries
+    // Copy in page-aligned chunks to minimize VA→PA translations
     let mut copied = 0;
     while copied < len {
         let user_addr = user_ptr + copied as u64;
         let phys_addr = user_virt_to_phys(ttbr0, user_addr)?;
 
+        // Calculate how many bytes remain in this page
+        let page_offset = (phys_addr & (PAGE_SIZE as u64 - 1)) as usize;
+        let bytes_in_page = PAGE_SIZE - page_offset;
+        let bytes_remaining = len - copied;
+        let chunk_size = bytes_in_page.min(bytes_remaining);
+
         // Access physical memory via TTBR1 kernel mapping
         let kernel_va = KERNEL_VIRT_BASE | phys_addr;
         unsafe {
-            core::ptr::write_volatile(kernel_va as *mut u8, kernel_buf[copied]);
+            let src = kernel_buf.as_ptr().add(copied);
+            let dst = kernel_va as *mut u8;
+            core::ptr::copy_nonoverlapping(src, dst, chunk_size);
         }
-        copied += 1;
+        copied += chunk_size;
     }
 
     Ok(len)

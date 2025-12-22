@@ -356,6 +356,11 @@ fn require_capability(cap: Capabilities) -> Result<(), i64> {
 
 /// Exit current process
 fn sys_exit(code: i32) -> i64 {
+    // Flush UART buffer so pending output from this process appears first
+    while crate::platform::mt7988::uart::has_buffered_output() {
+        crate::platform::mt7988::uart::flush_buffer();
+    }
+
     logln!();
     logln!("========================================");
     logln!("  Process exited with code: {}", code);
@@ -412,6 +417,9 @@ fn sys_exit(code: i32) -> i64 {
                 task.state = super::task::TaskState::Running;
             }
             super::task::update_current_task_globals();
+            // CRITICAL: Tell assembly we switched tasks so it doesn't
+            // overwrite the new task's x0 with our return value
+            super::task::SYSCALL_SWITCHED_TASK = 1;
             logln!("  Switching to task {}", next_slot);
             // Return - svc_handler will load new task's state and eret
             0
@@ -821,6 +829,7 @@ fn sys_port_connect(name_ptr: u64, name_len: usize) -> i64 {
 }
 
 /// Accept a connection on a port
+/// Returns channel ID on success, -EAGAIN if no connection pending
 fn sys_port_accept(listen_channel: u32) -> i64 {
     let caller_pid = current_pid();
 
@@ -1285,8 +1294,10 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
             return SyscallError::NoChild as i64;
         }
 
-        // Look for terminated children
-        for task_opt in sched.tasks.iter() {
+        // Look for terminated children - first pass: find terminated child info
+        let mut found_child: Option<(usize, u32, i32)> = None; // (slot, pid, exit_code)
+
+        for (slot, task_opt) in sched.tasks.iter().enumerate() {
             if let Some(ref task) = task_opt {
                 // Check if this is a child of the caller
                 if task.parent_id != caller_pid {
@@ -1300,35 +1311,31 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
 
                 // Check if terminated
                 if task.state == super::task::TaskState::Terminated {
-                    let child_pid = task.id;
-                    let exit_code = task.exit_code;
-
-                    // Write exit status to user space if pointer provided
-                    if status_ptr != 0 {
-                        if let Err(e) = uaccess::put_user::<i32>(status_ptr, exit_code) {
-                            return uaccess_to_errno(e);
-                        }
-                    }
-
-                    // Remove child from parent's list and reap the task
-                    // We need mutable access, so we'll do this in a second pass
-                    let child_slot = sched.tasks.iter().position(|t| {
-                        t.as_ref().map(|t| t.id == child_pid).unwrap_or(false)
-                    });
-
-                    if let Some(slot) = child_slot {
-                        // Get mutable reference to parent and remove child
-                        if let Some(ref mut parent) = sched.tasks[caller_slot] {
-                            parent.remove_child(child_pid);
-                        }
-
-                        // Free the child task's resources
-                        sched.tasks[slot] = None;
-                    }
-
-                    return child_pid as i64;
+                    found_child = Some((slot, task.id, task.exit_code));
+                    break;
                 }
             }
+        }
+
+        // Second pass: reap the child if found (outside of iterator)
+        if let Some((child_slot, child_pid, exit_code)) = found_child {
+            // Write exit status to user space if pointer provided
+            if status_ptr != 0 {
+                if let Err(e) = uaccess::put_user::<i32>(status_ptr, exit_code) {
+                    return uaccess_to_errno(e);
+                }
+            }
+
+            // Remove child from parent's list
+            if let Some(ref mut parent) = sched.tasks[caller_slot] {
+                parent.remove_child(child_pid);
+            }
+
+            // Free the child task's resources
+            sched.tasks[child_slot] = None;
+
+            // Return (pid << 32 | exit_code) as documented
+            return ((child_pid as i64) << 32) | ((exit_code as i64) & 0xFFFFFFFF);
         }
 
         // No terminated children found - need to block and switch
@@ -1739,6 +1746,26 @@ fn sys_pci_enumerate(buf_ptr: u64, buf_len: usize) -> i64 {
 fn sys_pci_config_read(bdf: u32, offset: u16, size: u8) -> i64 {
     use super::pci::{self, PciBdf};
 
+    // Require RAW_DEVICE capability for PCI config access
+    if let Err(e) = require_capability(Capabilities::RAW_DEVICE) {
+        return e;
+    }
+
+    // Validate offset and size
+    // PCIe extended config space is 4096 bytes (0x000-0xFFF)
+    // Standard PCI config is 256 bytes (0x00-0xFF)
+    const PCI_CONFIG_MAX: u16 = 4096;
+    if offset >= PCI_CONFIG_MAX || (size != 1 && size != 2 && size != 4) {
+        return SyscallError::InvalidArgument as i64;
+    }
+    if (offset as u32) + (size as u32) > PCI_CONFIG_MAX as u32 {
+        return SyscallError::InvalidArgument as i64;
+    }
+    // Check alignment (2-byte access must be 2-aligned, 4-byte must be 4-aligned)
+    if (size == 2 && (offset & 1) != 0) || (size == 4 && (offset & 3) != 0) {
+        return SyscallError::InvalidArgument as i64;
+    }
+
     let bdf = PciBdf::from_u32(bdf);
 
     // Check device exists and caller has access
@@ -1781,6 +1808,25 @@ fn sys_pci_config_read(bdf: u32, offset: u16, size: u8) -> i64 {
 /// Returns: 0 or -errno
 fn sys_pci_config_write(bdf: u32, offset: u16, size: u8, value: u32) -> i64 {
     use super::pci::{self, PciBdf};
+
+    // Require RAW_DEVICE capability for PCI config access
+    if let Err(e) = require_capability(Capabilities::RAW_DEVICE) {
+        return e;
+    }
+
+    // Validate offset and size
+    // PCIe extended config space is 4096 bytes (0x000-0xFFF)
+    const PCI_CONFIG_MAX: u16 = 4096;
+    if offset >= PCI_CONFIG_MAX || (size != 1 && size != 2 && size != 4) {
+        return SyscallError::InvalidArgument as i64;
+    }
+    if (offset as u32) + (size as u32) > PCI_CONFIG_MAX as u32 {
+        return SyscallError::InvalidArgument as i64;
+    }
+    // Check alignment (2-byte access must be 2-aligned, 4-byte must be 4-aligned)
+    if (size == 2 && (offset & 1) != 0) || (size == 4 && (offset & 3) != 0) {
+        return SyscallError::InvalidArgument as i64;
+    }
 
     let bdf = PciBdf::from_u32(bdf);
 
@@ -1830,6 +1876,11 @@ fn sys_pci_config_write(bdf: u32, offset: u16, size: u8, value: u32) -> i64 {
 /// Returns: virtual address or -errno
 fn sys_pci_bar_map(bdf: u32, bar: u8, size_out_ptr: u64) -> i64 {
     use super::pci::{self, PciBdf};
+
+    // Require MMIO capability for device memory mapping
+    if let Err(e) = require_capability(Capabilities::MMIO) {
+        return e;
+    }
 
     if bar > 5 {
         return SyscallError::InvalidArgument as i64;
