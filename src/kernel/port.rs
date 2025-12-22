@@ -305,6 +305,23 @@ pub unsafe fn port_registry() -> &'static mut PortRegistry {
     &mut *core::ptr::addr_of_mut!(PORT_REGISTRY)
 }
 
+/// Clean up all ports owned by a process (called on process exit)
+pub fn process_cleanup(pid: Pid) {
+    unsafe {
+        let registry = port_registry();
+        for port in registry.ports.iter_mut() {
+            if port.state == PortState::Open && port.owner == pid {
+                logln!("  Port cleanup: unregistering '{}' (owned by PID {})",
+                       port.name_str(), pid);
+                // Close the listen channel
+                ipc::channel_table().close(port.listen_channel);
+                // Mark as free
+                port.state = PortState::Free;
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Syscall wrappers
 // ============================================================================

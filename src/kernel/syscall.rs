@@ -376,6 +376,7 @@ fn sys_exit(code: i32) -> i64 {
         super::shmem::process_cleanup(pid);
         super::scheme::process_cleanup(pid);
         super::pci::release_all_devices(pid);
+        super::port::process_cleanup(pid);
 
         // Set exit code and mark as terminated
         if let Some(ref mut task) = sched.tasks[current_slot] {
