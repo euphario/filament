@@ -77,6 +77,17 @@ impl Timer {
             // Kick the watchdog to prevent system reset
             super::wdt::kick();
 
+            // Flush kernel log buffer (logln! output)
+            crate::kernel::log::flush();
+
+            // Flush UART output buffer (userspace console output)
+            super::uart::flush_buffer();
+
+            // Check for timed-out blocked tasks and wake them
+            unsafe {
+                crate::kernel::task::scheduler().check_timeouts(self.tick_count);
+            }
+
             // Reload timer for next time slice
             let ticks = (self.frequency * self.time_slice_ms) / 1000;
             Self::write_tval(ticks);

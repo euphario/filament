@@ -271,6 +271,8 @@ pub struct Task {
     pub exit_code: i32,
     /// Reason for blocking (when state is Blocked)
     pub wait_reason: Option<WaitReason>,
+    /// Timer tick count at which to wake this task (0 = no timeout)
+    pub wake_at: u64,
     /// Capability set for this task
     pub capabilities: super::caps::Capabilities,
 }
@@ -323,6 +325,7 @@ impl Task {
             num_children: 0,
             exit_code: 0,
             wait_reason: None,
+            wake_at: 0,
             capabilities: super::caps::Capabilities::ALL,  // Kernel tasks get all capabilities
         })
     }
@@ -370,6 +373,7 @@ impl Task {
             num_children: 0,
             exit_code: 0,
             wait_reason: None,
+            wake_at: 0,
             capabilities: super::caps::Capabilities::DRIVER_DEFAULT,  // User tasks default to driver caps
         })
     }
@@ -971,11 +975,33 @@ impl Scheduler {
                 if task.state == TaskState::Blocked {
                     task.state = TaskState::Ready;
                     task.wait_reason = None;
+                    task.wake_at = 0;
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Check for timed-out blocked tasks and wake them
+    /// Called from timer tick handler
+    /// Returns number of tasks woken
+    pub fn check_timeouts(&mut self, current_tick: u64) -> usize {
+        let mut woken = 0;
+        for task_opt in self.tasks.iter_mut() {
+            if let Some(ref mut task) = task_opt {
+                if task.state == TaskState::Blocked && task.wake_at != 0 {
+                    if current_tick >= task.wake_at {
+                        // Timeout expired - wake the task
+                        task.state = TaskState::Ready;
+                        task.wait_reason = None;
+                        task.wake_at = 0;
+                        woken += 1;
+                    }
+                }
+            }
+        }
+        woken
     }
 
     /// Add a kernel task to the scheduler
@@ -1339,6 +1365,21 @@ pub static mut SYSCALL_SWITCHED_TASK: u64 = 0;
 /// Must ensure proper synchronization (interrupts disabled)
 pub unsafe fn scheduler() -> &'static mut Scheduler {
     &mut *core::ptr::addr_of_mut!(SCHEDULER)
+}
+
+/// Execute a closure with exclusive access to the scheduler.
+/// Automatically disables interrupts for the duration.
+///
+/// Use this instead of `unsafe { scheduler() }` for safe access:
+/// ```
+/// with_scheduler(|sched| {
+///     sched.wake(pid);
+/// });
+/// ```
+#[inline]
+pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    unsafe { f(scheduler()) }
 }
 
 /// Update the current task globals after scheduling decision

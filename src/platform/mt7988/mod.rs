@@ -184,6 +184,9 @@ pub mod irq {
     /// MSDC1 (SD) interrupt
     pub const MSDC1: u32 = 135;
 
+    /// UART0 interrupt (SPI 123 -> IRQ 155)
+    pub const UART0: u32 = 155;
+
     /// Convert SPI number to GIC IRQ number
     #[inline]
     pub const fn spi_to_irq(spi: u32) -> u32 {

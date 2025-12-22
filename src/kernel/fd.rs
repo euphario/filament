@@ -237,8 +237,7 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                     None => -11, // EAGAIN
                 }
             } else {
-                // "Blocking" read: if no data, switch tasks and return EAGAIN
-                // Caller should retry. This allows other tasks to run.
+                // Blocking read: if no data, actually block waiting for UART IRQ
                 match uart::try_getc() {
                     Some(c) => {
                         buf[0] = c as u8;
@@ -253,28 +252,61 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                                 None => break,
                             }
                         }
+                        // Re-enable UART RX interrupt for next read
+                        uart::reenable_rx_interrupt();
                         count as isize
                     }
                     None => {
-                        // No data available - switch to another task if possible
+                        // No data available - try to block waiting for UART RX interrupt
                         unsafe {
                             let sched = super::task::scheduler();
-                            if let Some(next_slot) = sched.schedule() {
-                                if next_slot != sched.current {
-                                    // Mark current as ready and switch
-                                    if let Some(ref mut current) = sched.tasks[sched.current] {
-                                        current.state = super::task::TaskState::Ready;
+                            let current_slot = sched.current;
+                            let current_pid = sched.tasks[current_slot]
+                                .as_ref().map(|t| t.id).unwrap_or(0);
+
+                            // Check if there's another task to switch to FIRST
+                            // (schedule() checks for Ready tasks excluding Blocked ones)
+                            // Temporarily mark as Ready to see if there's anyone else
+                            let has_other_task = sched.tasks.iter().enumerate().any(|(slot, t)| {
+                                slot != current_slot &&
+                                t.as_ref().map(|task| task.state == super::task::TaskState::Ready).unwrap_or(false)
+                            });
+
+                            if has_other_task {
+                                // There's another task - we can safely block
+                                if uart::block_for_input(current_pid) {
+                                    // Block the task
+                                    if let Some(ref mut current) = sched.tasks[current_slot] {
+                                        current.state = super::task::TaskState::Blocked;
+                                        // Pre-store EAGAIN - will be retried when woken
+                                        current.trap_frame.x0 = (-11i64) as u64;
                                     }
-                                    sched.current = next_slot;
-                                    if let Some(ref mut next) = sched.tasks[next_slot] {
-                                        next.state = super::task::TaskState::Running;
+
+                                    // Switch to another task
+                                    if let Some(next_slot) = sched.schedule() {
+                                        sched.current = next_slot;
+                                        if let Some(ref mut next) = sched.tasks[next_slot] {
+                                            next.state = super::task::TaskState::Running;
+                                        }
+                                        super::task::update_current_task_globals();
+                                        super::task::SYSCALL_SWITCHED_TASK = 1;
                                     }
-                                    super::task::update_current_task_globals();
-                                    super::task::SYSCALL_SWITCHED_TASK = 1;
                                 }
+                            } else {
+                                // No other task - can't block, use WFI to wait for IRQ
+                                // Flush any buffered output first (so user sees prompt)
+                                while uart::has_buffered_output() {
+                                    uart::flush_buffer();
+                                }
+                                // Register for wakeup but stay Ready (not Blocked)
+                                uart::block_for_input(current_pid);
+                                // WFI until any interrupt arrives (UART or timer)
+                                core::arch::asm!("wfi");
+                                // Clear the registration since we're returning to retry
+                                uart::clear_blocked();
                             }
                         }
-                        -11 // EAGAIN - caller should retry
+                        -11 // EAGAIN - caller retries after being woken
                     }
                 }
             }
@@ -397,10 +429,9 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
         FdType::None => -9, // EBADF
         FdType::ConsoleIn => -9, // EBADF - Can't write to input
         FdType::ConsoleOut => {
-            // Write to UART
-            for &byte in buf {
-                uart::putc(byte as char);
-            }
+            // Write to UART output buffer (non-blocking)
+            // Buffer is flushed asynchronously by timer
+            uart::write_buffered(buf);
             buf.len() as isize
         }
         FdType::Null => buf.len() as isize, // Discard

@@ -229,6 +229,16 @@ impl PhysicalMemoryManager {
 /// Global PMM instance
 static mut PMM: PhysicalMemoryManager = PhysicalMemoryManager::new();
 
+/// Execute a closure with exclusive access to the PMM.
+/// Automatically disables interrupts for the duration.
+/// Use this for compound operations that need to be atomic.
+#[inline]
+#[allow(dead_code)]
+pub fn with_pmm<R, F: FnOnce(&mut PhysicalMemoryManager) -> R>(f: F) -> R {
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    unsafe { f(&mut *core::ptr::addr_of_mut!(PMM)) }
+}
+
 /// Initialize the physical memory manager
 pub fn init() {
     unsafe {

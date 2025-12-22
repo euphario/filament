@@ -354,8 +354,8 @@ fn cmd_run_program(path: &str) {
             let wait_result = syscall::wait(pid as i32);
 
             if wait_result >= 0 {
-                // Success - child exited
-                let exit_code = (wait_result & 0xFF) as i32;
+                // Success - child exited, unpack (pid << 32 | exit_code)
+                let exit_code = (wait_result & 0xFFFFFFFF) as i32;
                 println!("Process {} exited with code {}", pid, exit_code);
                 break;
             } else if wait_result == -11 {

@@ -402,6 +402,14 @@ pub unsafe fn port_registry() -> &'static mut PortRegistry {
     &mut *core::ptr::addr_of_mut!(PORT_REGISTRY)
 }
 
+/// Execute a closure with exclusive access to the port registry.
+/// Automatically disables interrupts for the duration.
+#[inline]
+pub fn with_port_registry<R, F: FnOnce(&mut PortRegistry) -> R>(f: F) -> R {
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    unsafe { f(port_registry()) }
+}
+
 /// Clean up all ports owned by a process (called on process exit)
 pub fn process_cleanup(pid: Pid) {
     unsafe {

@@ -448,6 +448,14 @@ pub unsafe fn channel_table() -> &'static mut ChannelTable {
     &mut *core::ptr::addr_of_mut!(CHANNEL_TABLE)
 }
 
+/// Execute a closure with exclusive access to the channel table.
+/// Automatically disables interrupts for the duration.
+#[inline]
+pub fn with_channel_table<R, F: FnOnce(&mut ChannelTable) -> R>(f: F) -> R {
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    unsafe { f(channel_table()) }
+}
+
 // ============================================================================
 // Syscall interface
 // ============================================================================

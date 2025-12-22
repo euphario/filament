@@ -92,6 +92,10 @@ pub extern "C" fn kmain() -> ! {
     println!("  Variant:  0x{:x}", variant);
     println!("  IRQ lines: {}", num_irqs);
 
+    // Enable UART RX interrupt for blocking reads
+    uart::enable_rx_interrupt();
+    println!("  UART RX IRQ enabled (IRQ {})", plat::irq::UART0);
+
     // MMU was already initialized by boot.S before Rust code runs.
     // The kernel is linked at TTBR1 virtual address (0xFFFF_0000_4600_0000).
     println!();
@@ -321,6 +325,24 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
             sync::cpu_flags().tick();
             sync::cpu_flags().set_need_resched();
         }
+    } else if irq == plat::irq::UART0 {
+        // UART RX interrupt - wake any blocked reader
+        if uart::handle_rx_irq() {
+            // Disable UART RX interrupt to prevent re-triggering
+            // (will be re-enabled when shell reads the data)
+            uart::disable_rx_interrupt();
+
+            let blocked_pid = uart::get_blocked_pid();
+            if blocked_pid != 0 {
+                unsafe {
+                    let sched = task::scheduler();
+                    if sched.wake_by_pid(blocked_pid) {
+                        uart::clear_blocked();
+                        sync::cpu_flags().set_need_resched();
+                    }
+                }
+            }
+        }
     } else {
         // Check if this IRQ is registered by a userspace driver
         if let Some(owner_pid) = scheme::irq_notify(irq) {
@@ -384,6 +406,11 @@ fn print_str_uart(s: &str) {
 /// Exception handler called from assembly
 #[no_mangle]
 pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
+    // Flush any buffered UART output first so we don't lose pre-crash messages
+    while uart::has_buffered_output() {
+        uart::flush_buffer();
+    }
+
     // Use only direct UART output - no println! which may fault
     // Use \r\n for proper terminal line endings
     print_str_uart("\r\n=== EXCEPTION ===\r\n");
@@ -393,6 +420,19 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
     print_hex_uart(elr);
     print_str_uart("\r\n  FAR: 0x");
     print_hex_uart(far);
+
+    // Print SP_EL0 (user stack pointer)
+    let sp_el0: u64;
+    unsafe { core::arch::asm!("mrs {}, sp_el0", out(reg) sp_el0); }
+    print_str_uart("\r\n  SP:  0x");
+    print_hex_uart(sp_el0);
+
+    // Print current PID (from scheduler)
+    let pid = unsafe {
+        kernel::task::scheduler().current_task_id().unwrap_or(0)
+    };
+    print_str_uart("\r\n  PID: ");
+    print_hex_uart(pid as u64);
 
     // Decode exception class
     let ec = (esr >> 26) & 0x3f;

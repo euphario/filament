@@ -8,6 +8,11 @@ fn panic(info: &PanicInfo) -> ! {
     // Flush any pending log messages before panic output
     crate::kernel::log::flush();
 
+    // Flush UART output buffer (userspace writes)
+    while crate::platform::mt7988::uart::has_buffered_output() {
+        crate::platform::mt7988::uart::flush_buffer();
+    }
+
     println!();
     println!("=== KERNEL PANIC ===");
 

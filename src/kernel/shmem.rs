@@ -135,6 +135,15 @@ static mut SHMEM_TABLE: [Option<SharedMem>; MAX_SHMEM_REGIONS] = [None; MAX_SHME
 /// Next ID to assign
 static mut NEXT_SHMEM_ID: u32 = 1;
 
+/// Execute a closure with exclusive access to the shmem table.
+/// Automatically disables interrupts for the duration.
+#[inline]
+#[allow(dead_code)]
+pub fn with_shmem_table<R, F: FnOnce(&mut [Option<SharedMem>; MAX_SHMEM_REGIONS]) -> R>(f: F) -> R {
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    unsafe { f(&mut *core::ptr::addr_of_mut!(SHMEM_TABLE)) }
+}
+
 /// Initialize shared memory subsystem
 pub fn init() {
     unsafe {
@@ -259,8 +268,9 @@ pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
 /// Wait for notification on shared memory
 /// Returns Err(-EAGAIN) to signal caller should block.
 /// The syscall layer handles actual blocking and rescheduling.
-/// TODO: timeout_ms is currently ignored
-pub fn wait(pid: Pid, shmem_id: u32, _timeout_ms: u32) -> Result<(), i64> {
+/// If timeout_ms > 0, the wait will automatically complete after the timeout.
+/// timeout_ms = 0 means wait indefinitely.
+pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
     // Add to waiters list and mark task as blocked
     unsafe {
         let region = find_region_mut(shmem_id)?;
@@ -281,6 +291,17 @@ pub fn wait(pid: Pid, shmem_id: u32, _timeout_ms: u32) -> Result<(), i64> {
         if let Some(ref mut task) = sched.tasks[sched.current] {
             task.state = super::task::TaskState::Blocked;
             task.wait_reason = Some(super::task::WaitReason::ShmemNotify(shmem_id));
+
+            // Set wake timeout if specified
+            if timeout_ms > 0 {
+                // Timer runs at 100 Hz (10ms per tick), so timeout_ms / 10 = ticks
+                // Add 1 to round up and avoid 0-tick timeouts
+                let timeout_ticks = (timeout_ms as u64 + 9) / 10;
+                let current_tick = crate::platform::mt7988::timer::ticks();
+                task.wake_at = current_tick + timeout_ticks;
+            } else {
+                task.wake_at = 0; // No timeout
+            }
         }
     }
 

@@ -14,7 +14,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::{println, print, logln, flush_log, syscall};
+use userlib::{println, syscall};
 
 // =============================================================================
 // I2C Addresses
@@ -309,51 +309,50 @@ fn main() {
         // Main loop - handle IPC requests
         let mut msg_buf = [0u8; 16];
         loop {
-            // Try to accept connections on the listen channel
+            // Accept connection
             let client = syscall::port_accept(listen_channel);
-            if client >= 0 {
-                let client_ch = client as u32;
+            if client < 0 {
+                syscall::yield_now();
+                continue;
+            }
+            let client_ch = client as u32;
 
-                // Read request
-                let len = syscall::receive(client_ch, &mut msg_buf);
-                if len > 0 {
-                    let cmd = msg_buf[0];
-                    let response = match cmd {
-                        GPIO_CMD_SET_PIN if len >= 3 => {
-                            let pin = msg_buf[1];
-                            let value = msg_buf[2] != 0;
-                            if gpio.set_output(pin, value) { 0i8 } else { -1i8 }
+            // Read request
+            let len = syscall::receive(client_ch, &mut msg_buf);
+            if len > 0 {
+                let cmd = msg_buf[0];
+                let response = match cmd {
+                    GPIO_CMD_SET_PIN if len >= 3 => {
+                        let pin = msg_buf[1];
+                        let value = msg_buf[2] != 0;
+                        if gpio.set_output(pin, value) { 0i8 } else { -1i8 }
+                    }
+                    GPIO_CMD_GET_PIN if len >= 2 => {
+                        let pin = msg_buf[1];
+                        match gpio.read_pin(pin) {
+                            Some(true) => 1i8,
+                            Some(false) => 0i8,
+                            None => -1i8,
                         }
-                        GPIO_CMD_GET_PIN if len >= 2 => {
-                            let pin = msg_buf[1];
-                            match gpio.read_pin(pin) {
-                                Some(true) => 1i8,
-                                Some(false) => 0i8,
-                                None => -1i8,
-                            }
-                        }
-                        GPIO_CMD_USB_VBUS if len >= 2 => {
-                            let enable = msg_buf[1] != 0;
-                            let ok = if enable {
-                                gpio.enable_usb_vbus()
-                            } else {
-                                gpio.disable_usb_vbus()
-                            };
-                            if ok { 0i8 } else { -1i8 }
-                        }
-                        _ => -22i8,  // EINVAL
-                    };
+                    }
+                    GPIO_CMD_USB_VBUS if len >= 2 => {
+                        let enable = msg_buf[1] != 0;
+                        let ok = if enable {
+                            gpio.enable_usb_vbus()
+                        } else {
+                            gpio.disable_usb_vbus()
+                        };
+                        if ok { 0i8 } else { -1i8 }
+                    }
+                    _ => -22i8,  // EINVAL
+                };
 
-                    // Send response
-                    let resp = [response as u8];
-                    let _ = syscall::send(client_ch, &resp);
-                }
-
-                syscall::channel_close(client_ch);
+                // Send response
+                let resp = [response as u8];
+                let _ = syscall::send(client_ch, &resp);
             }
 
-            flush_log();
-            syscall::yield_now();
+            syscall::channel_close(client_ch);
         }
     } else {
         println!("  Daemonize failed: {}", result);
