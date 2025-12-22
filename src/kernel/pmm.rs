@@ -1,7 +1,10 @@
 //! Physical Memory Manager (PMM)
 //!
-//! Simple bitmap-based page frame allocator.
-//! Each bit represents a 4KB page: 1 = used, 0 = free
+//! Hybrid allocator combining:
+//! - Free list for O(1) single-page allocation
+//! - Bitmap for contiguous allocation and sanity checking
+//!
+//! Each free page's first 8 bytes stores the next pointer (intrusive list).
 
 use crate::logln;
 
@@ -28,12 +31,14 @@ const BITMAP_SIZE: usize = NUM_PAGES / 8;
 
 /// Physical page frame allocator
 pub struct PhysicalMemoryManager {
-    /// Bitmap: 1 = used, 0 = free
+    /// Bitmap: 1 = used, 0 = free (kept for contiguous alloc and validation)
     bitmap: [u8; BITMAP_SIZE],
     /// Total pages
     total_pages: usize,
     /// Free pages count
     free_pages: usize,
+    /// Head of free list (physical address, 0 = empty)
+    free_list_head: usize,
 }
 
 impl PhysicalMemoryManager {
@@ -42,6 +47,7 @@ impl PhysicalMemoryManager {
             bitmap: [0; BITMAP_SIZE],
             total_pages: NUM_PAGES,
             free_pages: 0,
+            free_list_head: 0,
         }
     }
 
@@ -52,42 +58,74 @@ impl PhysicalMemoryManager {
             *byte = 0;
         }
         self.free_pages = self.total_pages;
+        self.free_list_head = 0;
 
-        // Mark kernel region as used
+        // Mark kernel region as used (don't add to free list)
         let kernel_start_page = (KERNEL_START - DRAM_START) / PAGE_SIZE;
         let kernel_pages = KERNEL_SIZE / PAGE_SIZE;
         for i in kernel_start_page..(kernel_start_page + kernel_pages) {
-            self.mark_used(i);
+            self.mark_used_no_list(i);
         }
 
         // Mark first few pages as used (safety buffer)
         for i in 0..16 {
-            self.mark_used(i);
+            self.mark_used_no_list(i);
+        }
+
+        // Build free list from all free pages
+        // Walk bitmap and add free pages to list
+        for page_idx in 0..self.total_pages {
+            if self.is_free(page_idx) {
+                let phys_addr = DRAM_START + page_idx * PAGE_SIZE;
+                self.push_free_list(phys_addr);
+            }
         }
     }
 
-    /// Allocate a single page, returns physical address or None
-    pub fn alloc_page(&mut self) -> Option<usize> {
-        // Find first free page
-        for (byte_idx, byte) in self.bitmap.iter_mut().enumerate() {
-            if *byte != 0xFF {
-                // Found a byte with at least one free bit
-                for bit in 0..8 {
-                    if (*byte & (1 << bit)) == 0 {
-                        // Found free page
-                        *byte |= 1 << bit;
-                        self.free_pages -= 1;
-                        let page_idx = byte_idx * 8 + bit;
-                        let phys_addr = DRAM_START + page_idx * PAGE_SIZE;
-                        return Some(phys_addr);
-                    }
-                }
-            }
+    /// Push a page onto the free list (O(1))
+    #[inline]
+    fn push_free_list(&mut self, phys_addr: usize) {
+        // Store current head in the page's first 8 bytes
+        let ptr = phys_addr as *mut usize;
+        unsafe {
+            core::ptr::write_volatile(ptr, self.free_list_head);
         }
-        None
+        self.free_list_head = phys_addr;
+    }
+
+    /// Pop a page from the free list (O(1))
+    #[inline]
+    fn pop_free_list(&mut self) -> Option<usize> {
+        if self.free_list_head == 0 {
+            return None;
+        }
+        let phys_addr = self.free_list_head;
+        // Read next pointer from the page
+        let ptr = phys_addr as *const usize;
+        unsafe {
+            self.free_list_head = core::ptr::read_volatile(ptr);
+        }
+        Some(phys_addr)
+    }
+
+    /// Allocate a single page, returns physical address or None (O(1) amortized)
+    pub fn alloc_page(&mut self) -> Option<usize> {
+        // Pop from free list, skipping stale entries (pages allocated via alloc_pages)
+        loop {
+            let phys_addr = self.pop_free_list()?;
+            let page_idx = (phys_addr - DRAM_START) / PAGE_SIZE;
+
+            // Check if page is actually free (not stale entry from contiguous alloc)
+            if self.is_free(page_idx) {
+                self.mark_used_no_list(page_idx);
+                return Some(phys_addr);
+            }
+            // Stale entry - continue to next
+        }
     }
 
     /// Allocate contiguous pages, returns starting physical address or None
+    /// Note: O(n) for contiguous allocation, but this is rare (DMA buffers only)
     pub fn alloc_pages(&mut self, count: usize) -> Option<usize> {
         if count == 0 {
             return None;
@@ -96,7 +134,7 @@ impl PhysicalMemoryManager {
             return self.alloc_page();
         }
 
-        // Find contiguous free pages (simple linear search)
+        // Find contiguous free pages using bitmap (linear search)
         let mut start_page = 0;
         let mut consecutive = 0;
 
@@ -107,9 +145,11 @@ impl PhysicalMemoryManager {
                 }
                 consecutive += 1;
                 if consecutive == count {
-                    // Found enough contiguous pages, mark them used
+                    // Found enough contiguous pages, mark them used in bitmap
+                    // Note: pages remain on free list as stale entries
+                    // alloc_page will skip them via bitmap check
                     for i in start_page..(start_page + count) {
-                        self.mark_used(i);
+                        self.mark_used_no_list(i);
                     }
                     let phys_addr = DRAM_START + start_page * PAGE_SIZE;
                     return Some(phys_addr);
@@ -121,13 +161,17 @@ impl PhysicalMemoryManager {
         None
     }
 
-    /// Free a single page
+    /// Free a single page (O(1))
     pub fn free_page(&mut self, phys_addr: usize) {
         if phys_addr < DRAM_START || phys_addr >= DRAM_END {
             return; // Invalid address
         }
         let page_idx = (phys_addr - DRAM_START) / PAGE_SIZE;
-        self.mark_free(page_idx);
+        // Only free if currently allocated (avoid double-free)
+        if !self.is_free(page_idx) {
+            self.mark_free_no_list(page_idx);
+            self.push_free_list(phys_addr);
+        }
     }
 
     /// Free contiguous pages
@@ -159,8 +203,9 @@ impl PhysicalMemoryManager {
         (self.bitmap[byte_idx] & (1 << bit)) == 0
     }
 
+    /// Mark page as used in bitmap only (doesn't touch free list)
     #[inline]
-    fn mark_used(&mut self, page_idx: usize) {
+    fn mark_used_no_list(&mut self, page_idx: usize) {
         let byte_idx = page_idx / 8;
         let bit = page_idx % 8;
         if self.is_free(page_idx) {
@@ -169,8 +214,9 @@ impl PhysicalMemoryManager {
         }
     }
 
+    /// Mark page as free in bitmap only (doesn't touch free list)
     #[inline]
-    fn mark_free(&mut self, page_idx: usize) {
+    fn mark_free_no_list(&mut self, page_idx: usize) {
         let byte_idx = page_idx / 8;
         let bit = page_idx % 8;
         if !self.is_free(page_idx) {
