@@ -158,6 +158,10 @@ pub fn validate_user_write(ptr: u64, len: usize) -> Result<(), UAccessError> {
 
 /// Validate a user string (null-terminated)
 /// Returns the length if valid (not including null terminator)
+///
+/// IMPORTANT: This function translates user VA to PA and reads via TTBR1.
+/// During syscall handling, TTBR0 points to kernel's identity mapping,
+/// not the user's address space, so direct pointer dereference would be WRONG.
 pub fn validate_user_string(ptr: u64, max_len: usize) -> Result<usize, UAccessError> {
     if ptr == 0 {
         return Err(UAccessError::NullPointer);
@@ -166,6 +170,9 @@ pub fn validate_user_string(ptr: u64, max_len: usize) -> Result<usize, UAccessEr
     if !is_user_address(ptr) {
         return Err(UAccessError::KernelAddress);
     }
+
+    // Get user's page table root for VA→PA translation
+    let ttbr0 = get_current_ttbr0()?;
 
     // Scan for null terminator, checking each page as we go
     let mut len = 0;
@@ -183,8 +190,12 @@ pub fn validate_user_string(ptr: u64, max_len: usize) -> Result<usize, UAccessEr
             checked_page = true;
         }
 
-        // Read the byte
-        let byte = unsafe { core::ptr::read_volatile(addr as *const u8) };
+        // Translate user VA to PA and read via kernel mapping (TTBR1)
+        // CRITICAL: Do NOT directly dereference user pointer - TTBR0 is switched!
+        let phys_addr = user_virt_to_phys(ttbr0, addr)?;
+        let kernel_va = KERNEL_VIRT_BASE | phys_addr;
+        let byte = unsafe { core::ptr::read_volatile(kernel_va as *const u8) };
+
         if byte == 0 {
             return Ok(len);
         }
