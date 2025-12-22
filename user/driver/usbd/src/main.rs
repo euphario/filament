@@ -52,7 +52,7 @@ use usb::{
     event_completion_code, event_slot_id, event_port_id,
     completion_code, doorbell,
     // Enumeration helpers
-    build_enable_slot_trb, build_noop_trb,
+    build_enable_slot_trb, build_disable_slot_trb, build_noop_trb,
     // Memory layout constants
     CTX_OFFSET_DEVICE, CTX_OFFSET_EP0_RING,
     XHCI_OFFSET_ERST, XHCI_OFFSET_CMD_RING, XHCI_OFFSET_EVT_RING, XHCI_MEM_SIZE,
@@ -545,7 +545,8 @@ impl UsbDriver {
                 if (self.enumerated_ports & port_mask) != 0 {
                     println!("[usbd] Device disconnected from port {}", port_id);
                     self.enumerated_ports &= !port_mask;
-                    // TODO: Clean up device resources
+                    // Clean up device resources (slot, DMA buffers)
+                    self.cleanup_port_device(port_id);
                 }
             }
         }
@@ -643,6 +644,123 @@ impl UsbDriver {
             }
         }
         None
+    }
+
+    /// Disable a slot when a device is disconnected
+    fn disable_slot(&mut self, slot_id: u32) -> bool {
+        let cmd_ring = match self.cmd_ring.as_mut() {
+            Some(r) => r,
+            None => return false,
+        };
+
+        // Send DISABLE_SLOT command
+        let trb = build_disable_slot_trb(slot_id);
+        cmd_ring.enqueue(&trb);
+        self.ring_doorbell(0, doorbell::HOST_CONTROLLER);
+        delay(10000);
+
+        let mut result: Option<u32> = None;
+        let mut erdp_to_update: Option<u64> = None;
+
+        if let Some(ref mut event_ring) = self.event_ring {
+            for _ in 0..20 {
+                if let Some(evt) = event_ring.dequeue() {
+                    erdp_to_update = Some(event_ring.erdp());
+                    if evt.get_type() == trb_type::COMMAND_COMPLETION {
+                        result = Some(event_completion_code(&evt));
+                        break;
+                    }
+                }
+                delay(1000);
+            }
+        }
+
+        if let Some(erdp) = erdp_to_update {
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
+            self.op_write32(xhci_op::USBSTS, USBSTS_EINT);
+        }
+
+        // Clear DCBAA entry for this slot
+        let dcbaa = self.xhci_mem as *mut u64;
+        unsafe {
+            *dcbaa.add(slot_id as usize) = 0;
+            flush_cache_line(dcbaa.add(slot_id as usize) as u64);
+        }
+
+        if let Some(cc) = result {
+            cc == trb_cc::SUCCESS
+        } else {
+            false
+        }
+    }
+
+    /// Clean up MSC device resources when disconnected
+    fn cleanup_msc_device(&mut self) {
+        if let Some(msc) = self.msc_device.take() {
+            println!("[usbd] Cleaning up MSC device slot {}", msc.slot_id);
+
+            // Disable the slot in xHCI
+            self.disable_slot(msc.slot_id);
+
+            // Free DMA buffers - each is a 4KB page except data_buf which is larger
+            // These were allocated with mmap_dma, so munmap them
+            syscall::munmap(msc.bulk_in_ring as u64, 4096);
+            syscall::munmap(msc.bulk_out_ring as u64, 4096);
+            syscall::munmap(msc.data_buf as u64, 64 * 1024);  // DATA_BUFFER_SIZE
+            // device_ctx and ep0_ring are in the same allocation (ctx_virt)
+            // The context allocation includes input_ctx + device_ctx + ep0_ring
+            // Calculate base of the allocation (device_ctx is at CTX_OFFSET_DEVICE)
+            let ctx_base = (msc.device_ctx as u64) - CTX_OFFSET_DEVICE;
+            syscall::munmap(ctx_base, 4096);
+
+            println!("[usbd] MSC device cleanup complete");
+        }
+    }
+
+    /// Clean up Hub device resources when disconnected
+    fn cleanup_hub_device(&mut self) {
+        if let Some(hub) = self.hub_device.take() {
+            println!("[usbd] Cleaning up Hub device slot {}", hub.slot_id);
+
+            // Disable the slot in xHCI
+            self.disable_slot(hub.slot_id);
+
+            // Free DMA buffers
+            // int_in_ring is a separate 4KB allocation
+            syscall::munmap(hub.int_in_ring as u64, 4096);
+            // status_buf is a separate 4KB allocation
+            syscall::munmap(hub.status_buf as u64, 4096);
+            // device_ctx and ep0_ring are in the same allocation
+            let ctx_base = (hub.device_ctx as u64) - CTX_OFFSET_DEVICE;
+            syscall::munmap(ctx_base, 4096);
+
+            println!("[usbd] Hub device cleanup complete");
+        }
+    }
+
+    /// Clean up device on a specific port
+    fn cleanup_port_device(&mut self, port: u32) {
+        // Check if MSC device is on this port
+        if let Some(ref msc) = self.msc_device {
+            // MSC devices come through the hub, check hub_port
+            // For now, just clean up if we detect disconnect
+            let _ = msc;  // suppress warning
+        }
+
+        // Check if Hub device is on this port
+        if let Some(ref hub) = self.hub_device {
+            if hub.hub_port == port {
+                // Hub is on this port, clean it up
+                // First clean up any MSC device connected through the hub
+                self.cleanup_msc_device();
+                self.cleanup_hub_device();
+                return;
+            }
+        }
+
+        // If we get here, might be a direct MSC device on this port
+        // For simplicity, clean up MSC if it exists
+        self.cleanup_msc_device();
     }
 
     /// Enumerate a port (reset + enumerate + mark as enumerated)
@@ -1563,7 +1681,8 @@ impl UsbDriver {
                         }
                     } else {
                         println!("    Device disconnected");
-                        // TODO: Handle device disconnection (disable slot, etc.)
+                        // Clean up MSC device (hub child devices go through here)
+                        self.cleanup_msc_device();
                     }
                 }
             }
@@ -1941,7 +2060,8 @@ impl UsbDriver {
                 } else {
                     // Device disconnected
                     println!("[hub] Port {}: Device disconnected", port);
-                    // TODO: Clean up device slot
+                    // Clean up MSC device connected through this hub port
+                    self.cleanup_msc_device();
                 }
             }
         }
