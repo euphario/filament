@@ -175,6 +175,24 @@ pub const USER_HEAP_START: u64 = 0x5000_0000;
 /// User heap region end
 pub const USER_HEAP_END: u64 = 0x7000_0000;
 
+/// Mapping ownership kind - determines cleanup behavior
+///
+/// CRITICAL: This enum prevents memory corruption bugs:
+/// - OwnedAnon/OwnedDma: Kernel allocated pages, free on unmap
+/// - BorrowedShmem: Pages owned by shmem region, just unmap PTEs
+/// - DeviceMmio: Physical MMIO addresses, NEVER free (not RAM!)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MappingKind {
+    /// Anonymous memory allocated by mmap() - kernel owns pages
+    OwnedAnon,
+    /// DMA-capable memory allocated by mmap_dma() - kernel owns pages
+    OwnedDma,
+    /// Shared memory mapped via mmap_phys() - pages owned elsewhere
+    BorrowedShmem,
+    /// Device MMIO mapped via mmap_device() - not RAM, never free
+    DeviceMmio,
+}
+
 /// A single heap mapping entry
 #[derive(Clone, Copy)]
 pub struct HeapMapping {
@@ -184,6 +202,8 @@ pub struct HeapMapping {
     pub phys_addr: u64,
     /// Number of pages
     pub num_pages: usize,
+    /// Ownership kind - determines if pages should be freed on unmap
+    pub kind: MappingKind,
 }
 
 impl HeapMapping {
@@ -192,11 +212,17 @@ impl HeapMapping {
             virt_addr: 0,
             phys_addr: 0,
             num_pages: 0,
+            kind: MappingKind::OwnedAnon, // Default doesn't matter for empty
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.num_pages == 0
+    }
+
+    /// Returns true if this mapping owns its physical pages (should free on unmap)
+    pub fn owns_pages(&self) -> bool {
+        matches!(self.kind, MappingKind::OwnedAnon | MappingKind::OwnedDma)
     }
 }
 
@@ -457,11 +483,12 @@ impl Task {
             }
         }
 
-        // Record mapping
+        // Record mapping - OwnedAnon because kernel allocated these pages
         self.heap_mappings[slot] = HeapMapping {
             virt_addr,
             phys_addr,
             num_pages,
+            kind: MappingKind::OwnedAnon,
         };
 
         // Bump heap pointer
@@ -538,11 +565,12 @@ impl Task {
             core::arch::asm!("dsb ish", "isb");
         }
 
-        // Record mapping
+        // Record mapping - OwnedDma because kernel allocated these pages for DMA
         self.heap_mappings[slot] = HeapMapping {
             virt_addr,
             phys_addr,
             num_pages,
+            kind: MappingKind::OwnedDma,
         };
 
         // Bump heap pointer
@@ -593,11 +621,13 @@ impl Task {
             core::arch::asm!("dsb ish", "isb");
         }
 
-        // Record mapping (phys_addr is the shared region's physical address)
+        // Record mapping - BorrowedShmem because pages are owned by shmem region
+        // CRITICAL: Do NOT free these pages on unmap - they belong to the shmem owner
         self.heap_mappings[slot] = HeapMapping {
             virt_addr,
             phys_addr,
             num_pages,
+            kind: MappingKind::BorrowedShmem,
         };
 
         // Bump heap pointer
@@ -648,11 +678,13 @@ impl Task {
             core::arch::asm!("dsb ish", "isb");
         }
 
-        // Record mapping
+        // Record mapping - DeviceMmio because this is MMIO, NOT RAM
+        // CRITICAL: NEVER free these "pages" - they are hardware registers!
         self.heap_mappings[slot] = HeapMapping {
             virt_addr,
             phys_addr,
             num_pages,
+            kind: MappingKind::DeviceMmio,
         };
 
         // Bump heap pointer
@@ -709,8 +741,13 @@ impl Task {
             );
         }
 
-        // Free physical pages (safe now that TLB is invalidated)
-        pmm::free_pages(mapping.phys_addr as usize, mapping.num_pages);
+        // Only free physical pages if we own them
+        // CRITICAL: BorrowedShmem and DeviceMmio must NOT free pages!
+        // - BorrowedShmem: pages belong to the shmem region owner
+        // - DeviceMmio: physical addresses are hardware registers, not RAM
+        if mapping.owns_pages() {
+            pmm::free_pages(mapping.phys_addr as usize, mapping.num_pages);
+        }
 
         // Clear mapping slot
         self.heap_mappings[slot] = HeapMapping::empty();
@@ -721,11 +758,14 @@ impl Task {
 
 impl Drop for Task {
     fn drop(&mut self) {
-        // Free heap mappings
+        // Free heap mappings - but only if we own the pages
         for mapping in &self.heap_mappings {
-            if !mapping.is_empty() {
+            if !mapping.is_empty() && mapping.owns_pages() {
                 pmm::free_pages(mapping.phys_addr as usize, mapping.num_pages);
             }
+            // Note: BorrowedShmem and DeviceMmio mappings are NOT freed here
+            // - BorrowedShmem: pages owned by shmem region, will be freed when region destroyed
+            // - DeviceMmio: not RAM, never free
         }
 
         // Free kernel stack + guard page (allocated together)

@@ -652,7 +652,7 @@ impl KernelScheme for IrqScheme {
         "irq"
     }
 
-    fn open(&self, path: &[u8], _flags: u32) -> Result<SchemeHandle, i32> {
+    fn open(&self, path: &[u8], flags: u32) -> Result<SchemeHandle, i32> {
         let path_str = core::str::from_utf8(path).map_err(|_| -22)?;
 
         // Parse IRQ number from path
@@ -677,9 +677,14 @@ impl KernelScheme for IrqScheme {
             return Err(-16); // EBUSY - IRQ already registered
         }
 
+        // Store O_NONBLOCK in high bit of handle (bit 31)
+        // irq_num uses bits 0-8, plenty of room
+        const O_NONBLOCK: u32 = 0x800;
+        let nonblock_bit = if (flags & O_NONBLOCK) != 0 { 1u64 << 31 } else { 0 };
+
         Ok(SchemeHandle {
             scheme_id: 0,
-            handle: irq_num as u64,
+            handle: (irq_num as u64) | nonblock_bit,
             flags: pid,  // Store PID in flags for close()
         })
     }
@@ -689,15 +694,25 @@ impl KernelScheme for IrqScheme {
             return Err(-22);
         }
 
-        let irq_num = handle.handle as u32;
+        // Extract nonblock flag from high bit of handle
+        let is_nonblock = (handle.handle & (1u64 << 31)) != 0;
+        let irq_num = (handle.handle & 0x1FF) as u32;  // Low 9 bits
         let pid = handle.flags;
 
-        // Blocking wait for IRQ - blocks until IRQ fires
-        let count = irq_wait(irq_num, pid)?;
-
-        // Return the count of IRQs that fired
-        buf[..4].copy_from_slice(&count.to_le_bytes());
-        Ok(4)
+        if is_nonblock {
+            // Non-blocking mode: check if IRQ is pending, return EAGAIN if not
+            if let Some(count) = irq_check_pending(irq_num, pid) {
+                buf[..4].copy_from_slice(&count.to_le_bytes());
+                Ok(4)
+            } else {
+                Err(-11) // EAGAIN - no IRQ pending
+            }
+        } else {
+            // Blocking wait for IRQ - blocks until IRQ fires
+            let count = irq_wait(irq_num, pid)?;
+            buf[..4].copy_from_slice(&count.to_le_bytes());
+            Ok(4)
+        }
     }
 
     fn write(&self, _handle: &SchemeHandle, _buf: &[u8]) -> Result<usize, i32> {
@@ -707,7 +722,8 @@ impl KernelScheme for IrqScheme {
     }
 
     fn close(&self, handle: &SchemeHandle) -> Result<(), i32> {
-        let irq_num = handle.handle as u32;
+        // Mask out nonblock bit to get IRQ number
+        let irq_num = (handle.handle & 0x1FF) as u32;
         let pid = handle.flags;
 
         // Unregister IRQ handler
