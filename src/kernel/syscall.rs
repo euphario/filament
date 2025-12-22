@@ -691,12 +691,23 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             msg.header.payload_len as i64
         }
         Err(super::ipc::IpcError::WouldBlock) => {
-            // Mark task as blocked so scheduler switches away
+            // Mark task as blocked and register as waiting on this channel
             unsafe {
                 let sched = super::task::scheduler();
-                if let Some(ref mut task) = sched.tasks[sched.current] {
+                let current_slot = sched.current;
+                let pid = sched.tasks[current_slot].as_ref().map(|t| t.id).unwrap_or(0);
+
+                // Register this process as blocked waiting on the channel
+                // so that send() can wake it up
+                let _ = super::ipc::channel_table().block_receiver(channel_id, pid);
+
+                if let Some(ref mut task) = sched.tasks[current_slot] {
                     task.state = super::task::TaskState::Blocked;
+                    // Pre-store return value before switching
+                    task.trap_frame.x0 = SyscallError::WouldBlock as u64;
                 }
+                // Set resched flag so svc_handler triggers context switch
+                crate::arch::aarch64::sync::cpu_flags().set_need_resched();
             }
             SyscallError::WouldBlock as i64
         }

@@ -200,7 +200,7 @@ fn format_hex(buf: &mut [u8], val: u64) -> usize {
 
 /// Delay for approximately `ms` milliseconds using the ARM timer
 ///
-/// This reads the hardware counter and cannot be optimized away.
+/// This yields to the scheduler between timer checks, allowing other tasks to run.
 pub fn delay_ms(ms: u32) {
     let freq: u64;
     let start: u64;
@@ -216,11 +216,15 @@ pub fn delay_ms(ms: u32) {
         if now >= end {
             break;
         }
-        core::hint::spin_loop();
+        // Yield to scheduler instead of busy-spinning
+        syscall::yield_now();
     }
 }
 
 /// Delay for approximately `us` microseconds using the ARM timer
+///
+/// For very short delays (<100us), this uses spin_loop() to avoid scheduler overhead.
+/// For longer delays, yields to the scheduler between checks.
 pub fn delay_us(us: u32) {
     let freq: u64;
     let start: u64;
@@ -230,13 +234,22 @@ pub fn delay_us(us: u32) {
     }
     let ticks_needed = (freq / 1_000_000) * us as u64;
     let end = start + ticks_needed;
+
+    // For very short delays, spin to avoid scheduler overhead
+    // For longer delays, yield to allow other tasks to run
+    let use_yield = us >= 100;
+
     loop {
         let now: u64;
         unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now); }
         if now >= end {
             break;
         }
-        core::hint::spin_loop();
+        if use_yield {
+            syscall::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 

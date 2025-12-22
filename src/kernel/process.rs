@@ -13,6 +13,7 @@
 use super::addrspace::AddressSpace;
 use super::pmm;
 use crate::logln;
+use crate::arch::aarch64::mmu;
 
 /// Process ID type
 pub type Pid = u32;
@@ -208,9 +209,9 @@ impl Process {
         let pages = (code.len() + 4095) / 4096;
         let phys = pmm::alloc_pages(pages)? as u64;
 
-        // Copy program to physical memory
+        // Copy program to physical memory (use TTBR1 virtual address)
         unsafe {
-            let dest = phys as *mut u8;
+            let dest = mmu::phys_to_virt(phys) as *mut u8;
             for (i, &byte) in code.iter().enumerate() {
                 core::ptr::write_volatile(dest.add(i), byte);
             }

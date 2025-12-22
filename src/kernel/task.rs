@@ -575,7 +575,6 @@ impl Task {
         for i in 0..num_pages {
             let page_virt = virt_addr + (i * 4096) as u64;
             let page_phys = phys_addr + (i * 4096) as u64;
-            // Shared memory uses cacheable attributes - userspace does cache maintenance
             if !addr_space.map_dma_page(page_virt, page_phys, true) {
                 return None;
             }
@@ -1104,15 +1103,17 @@ impl Scheduler {
     pub unsafe fn switch_to_next(&mut self) {
         if let Some(next_idx) = self.schedule() {
             if next_idx != self.current {
+                let caller_slot = self.current;  // Save our slot before switching
+
                 // Mark current as ready (if still running)
-                if let Some(ref mut current) = self.tasks[self.current] {
+                if let Some(ref mut current) = self.tasks[caller_slot] {
                     if current.state == TaskState::Running {
                         current.state = TaskState::Ready;
                     }
                 }
 
                 // Get pointers to current and next contexts
-                let current_ctx = if let Some(ref mut t) = self.tasks[self.current] {
+                let current_ctx = if let Some(ref mut t) = self.tasks[caller_slot] {
                     &mut t.context as *mut CpuContext
                 } else {
                     return;
@@ -1139,10 +1140,29 @@ impl Scheduler {
                     t.state = TaskState::Running;
                 }
 
+                // CRITICAL: Update globals BEFORE context_switch so the target task
+                // uses the correct trap frame when returning to user mode.
+                update_current_task_globals();
+                SYSCALL_SWITCHED_TASK = 1;
+
                 // Actually switch
                 context_switch(current_ctx, next_ctx);
 
-                // We return here when switched back to this task
+                // We return here when switched back to this task.
+                // Restore our slot (was saved on stack before switch).
+                self.current = caller_slot;
+
+                // Mark ourselves as Running again
+                if let Some(ref mut t) = self.tasks[caller_slot] {
+                    t.state = TaskState::Running;
+                }
+                // Restore our address space and globals
+                if let Some(ref task) = self.tasks[caller_slot] {
+                    if let Some(ref addr_space) = task.address_space {
+                        addr_space.activate();
+                    }
+                }
+                update_current_task_globals();
             }
         }
     }
@@ -1176,15 +1196,17 @@ impl Scheduler {
             return false;
         }
 
+        let caller_slot = self.current;  // Save our slot before switching
+
         // Mark current as ready (donating timeslice)
-        if let Some(ref mut current) = self.tasks[self.current] {
+        if let Some(ref mut current) = self.tasks[caller_slot] {
             if current.state == TaskState::Running {
                 current.state = TaskState::Ready;
             }
         }
 
         // Get context pointers
-        let current_ctx = if let Some(ref mut t) = self.tasks[self.current] {
+        let current_ctx = if let Some(ref mut t) = self.tasks[caller_slot] {
             &mut t.context as *mut CpuContext
         } else {
             return false;
@@ -1209,10 +1231,32 @@ impl Scheduler {
             t.state = TaskState::Running;
         }
 
+        // CRITICAL: Update globals BEFORE context_switch so the target task
+        // uses the correct trap frame when returning to user mode.
+        // The target task will reload CURRENT_TRAP_FRAME from the global
+        // in svc_handler/irq_from_user before eret.
+        update_current_task_globals();
+        SYSCALL_SWITCHED_TASK = 1;
+
         // Perform the switch
         context_switch(current_ctx, next_ctx);
 
-        // Returned here when switched back
+        // Returned here when switched back to this task.
+        // Restore our slot (was saved on stack before switch).
+        self.current = caller_slot;
+
+        // Mark ourselves as Running again
+        if let Some(ref mut t) = self.tasks[caller_slot] {
+            t.state = TaskState::Running;
+        }
+        // Restore our address space and globals
+        if let Some(ref task) = self.tasks[caller_slot] {
+            if let Some(ref addr_space) = task.address_space {
+                addr_space.activate();
+            }
+        }
+        update_current_task_globals();
+
         true
     }
 
@@ -1262,11 +1306,48 @@ pub unsafe fn scheduler() -> &'static mut Scheduler {
 /// Must be called with valid current task
 pub unsafe fn update_current_task_globals() {
     let sched = scheduler();
+
+    // Defensive check: validate current slot is in bounds
+    if sched.current >= MAX_TASKS {
+        crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: current slot out of bounds!\r\n");
+        loop { core::arch::asm!("wfe"); }
+    }
+
     if let Some(ref mut task) = sched.tasks[sched.current] {
-        CURRENT_TRAP_FRAME = &mut task.trap_frame as *mut TrapFrame;
-        if let Some(ref addr_space) = task.address_space {
-            CURRENT_TTBR0 = addr_space.get_ttbr0();
+        let trap_ptr = &mut task.trap_frame as *mut TrapFrame;
+        let trap_addr = trap_ptr as u64;
+
+        // Defensive check: trap frame should be in kernel space (0xFFFF...)
+        if trap_addr < 0xFFFF_0000_0000_0000 {
+            crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: trap_frame not in kernel space!\r\n");
+            loop { core::arch::asm!("wfe"); }
         }
+
+        CURRENT_TRAP_FRAME = trap_ptr;
+
+        if let Some(ref addr_space) = task.address_space {
+            let ttbr0 = addr_space.get_ttbr0();
+
+            // Defensive check: TTBR0 should be a valid physical address in DRAM (>= 0x40000000)
+            // and properly aligned (4KB page table)
+            if ttbr0 < 0x4000_0000 || ttbr0 >= 0x1_0000_0000 || (ttbr0 & 0xFFF) != 0 {
+                crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: invalid TTBR0=0x");
+                // Print hex value
+                for i in (0..16).rev() {
+                    let nibble = ((ttbr0 >> (i * 4)) & 0xf) as u8;
+                    let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+                    crate::platform::mt7988::uart::putc(c as char);
+                }
+                crate::platform::mt7988::uart::print("\r\n");
+                loop { core::arch::asm!("wfe"); }
+            }
+
+            CURRENT_TTBR0 = ttbr0;
+        }
+    } else {
+        // No task at current slot - this is also a bug
+        crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: no task at current slot!\r\n");
+        loop { core::arch::asm!("wfe"); }
     }
 }
 
@@ -1276,22 +1357,36 @@ pub unsafe fn update_current_task_globals() {
 /// This is the "bottom half" of preemption - the timer IRQ just sets a flag,
 /// and this function does the actual work.
 ///
+/// Also reschedules if current task is Blocked (e.g., after blocking syscall).
+///
 /// This function ONLY handles scheduling - no logging or other side effects.
 /// Log flushing and other deferred work should be done separately.
 ///
 /// # Safety
 /// Must be called from kernel context (not IRQ context).
-pub unsafe fn do_resched_if_needed() {
-    // Check and clear the flag atomically
-    if !crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched() {
-        return; // No reschedule needed
-    }
+#[no_mangle]
+pub unsafe extern "C" fn do_resched_if_needed() {
+    // Check and clear the flag atomically (before taking lock)
+    let need_resched = crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched();
 
     // Do the reschedule with IRQs disabled for the critical section
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
     let sched = scheduler();
 
-    // Mark current as ready (it was running)
+    // Check if current task is blocked - must switch away immediately
+    let current_blocked = if let Some(ref task) = sched.tasks[sched.current] {
+        task.state == TaskState::Blocked
+    } else {
+        false
+    };
+
+    // Skip if no reason to reschedule
+    if !need_resched && !current_blocked {
+        return;
+    }
+
+    // Mark current as ready (it was running) - but only if it was Running
+    // (don't change Blocked tasks)
     if let Some(ref mut current) = sched.tasks[sched.current] {
         if current.state == TaskState::Running {
             current.state = TaskState::Ready;
@@ -1309,10 +1404,39 @@ pub unsafe fn do_resched_if_needed() {
             // Signal to assembly that we switched tasks
             SYSCALL_SWITCHED_TASK = 1;
         } else {
-            // Same task, mark as running again
+            // Same task selected - only mark as running if it was Ready
             if let Some(ref mut current) = sched.tasks[sched.current] {
-                current.state = TaskState::Running;
+                if current.state == TaskState::Ready {
+                    current.state = TaskState::Running;
+                }
             }
+        }
+    } else if current_blocked {
+        // Current task is blocked but no other task is ready
+        // We MUST wait for an interrupt to wake something up
+        // Re-enable IRQs and wait in a loop
+        drop(_guard);
+
+        loop {
+            // Wait for interrupt - timer tick or device IRQ will wake a task
+            core::arch::asm!("wfi");
+
+            // Disable IRQs to check scheduler state
+            let _guard2 = crate::arch::aarch64::sync::IrqGuard::new();
+            let sched2 = scheduler();
+
+            if let Some(next_slot) = sched2.schedule() {
+                // Found a ready task - switch to it
+                sched2.current = next_slot;
+                if let Some(ref mut next_task) = sched2.tasks[next_slot] {
+                    next_task.state = TaskState::Running;
+                }
+                update_current_task_globals();
+                SYSCALL_SWITCHED_TASK = 1;
+                // Note: _guard2 will be dropped here, re-enabling IRQs
+                return;
+            }
+            // No ready task yet, _guard2 drops here and we loop back to WFI
         }
     }
 }
@@ -1383,20 +1507,30 @@ pub unsafe fn yield_cpu_locked() {
                 t.state = TaskState::Running;
             }
 
+            // CRITICAL: Update globals BEFORE context_switch so the target task
+            // uses the correct trap frame when returning to user mode.
+            update_current_task_globals();
+            SYSCALL_SWITCHED_TASK = 1;
+
             // Actually switch contexts
             context_switch(current_ctx, next_ctx);
 
-            // We return here when switched back to this task
+            // We return here when switched back to this task.
+            // IMPORTANT: sched.current was changed by whoever switched back to us.
+            // We must restore it to OUR slot (caller_slot was saved on stack before switch).
+            sched.current = caller_slot;
+
             // Mark ourselves as Running again
-            if let Some(ref mut t) = sched.tasks[sched.current] {
+            if let Some(ref mut t) = sched.tasks[caller_slot] {
                 t.state = TaskState::Running;
             }
-            // Restore our address space
-            if let Some(ref task) = sched.tasks[sched.current] {
+            // Restore our address space and globals for this task
+            if let Some(ref task) = sched.tasks[caller_slot] {
                 if let Some(ref addr_space) = task.address_space {
                     addr_space.activate();
                 }
             }
+            update_current_task_globals();
         }
     }
     // If no other task to run, just return and continue current task

@@ -92,10 +92,10 @@ pub extern "C" fn kmain() -> ! {
     println!("  Variant:  0x{:x}", variant);
     println!("  IRQ lines: {}", num_irqs);
 
-    // Initialize MMU with kernel/user separation
+    // MMU was already initialized by boot.S before Rust code runs.
+    // The kernel is linked at TTBR1 virtual address (0xFFFF_0000_4600_0000).
     println!();
-    println!("Initializing MMU...");
-    mmu::init();
+    println!("MMU status (initialized by boot.S):");
     println!("  Address space layout:");
     println!("    TTBR0 (user):   0x0000_xxxx -> identity mapped");
     println!("    TTBR1 (kernel): 0xFFFF_xxxx -> physical memory");
@@ -104,10 +104,6 @@ pub extern "C" fn kmain() -> ! {
     println!("    [1] 0x40000000: Normal (DRAM)");
     println!("    [2] 0x80000000: Normal (DRAM)");
     println!("    [3] 0xC0000000: Normal (DRAM)");
-    println!("Enabling MMU...");
-    mmu::enable();
-    mmu::init_kernel_ttbr0();  // Initialize KERNEL_TTBR0 for syscall handlers
-    println!("[OK] MMU enabled");
     mmu::print_info();
 
     // Initialize physical memory manager
@@ -252,6 +248,12 @@ pub extern "C" fn kmain() -> ! {
     let slot1 = match elf::spawn_from_path("bin/shell") {
         Ok((_task_id, slot)) => {
             println!("  Process 'shell' spawned at slot {}", slot);
+            // Give shell ALL capabilities (it's the root shell)
+            unsafe {
+                if let Some(ref mut task) = task::scheduler().tasks[slot] {
+                    task.set_capabilities(kernel::caps::Capabilities::ALL);
+                }
+            }
             Some(slot)
         }
         Err(e) => {
@@ -383,17 +385,18 @@ fn print_str_uart(s: &str) {
 #[no_mangle]
 pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
     // Use only direct UART output - no println! which may fault
-    print_str_uart("\n=== EXCEPTION ===\n");
+    // Use \r\n for proper terminal line endings
+    print_str_uart("\r\n=== EXCEPTION ===\r\n");
     print_str_uart("  ESR: 0x");
     print_hex_uart(esr);
-    print_str_uart("\n  ELR: 0x");
+    print_str_uart("\r\n  ELR: 0x");
     print_hex_uart(elr);
-    print_str_uart("\n  FAR: 0x");
+    print_str_uart("\r\n  FAR: 0x");
     print_hex_uart(far);
 
     // Decode exception class
     let ec = (esr >> 26) & 0x3f;
-    print_str_uart("\n  EC:  0x");
+    print_str_uart("\r\n  EC:  0x");
     print_hex_uart(ec);
     print_str_uart(" = ");
     let exception_name = match ec {
@@ -412,7 +415,7 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
         _ => "Other",
     };
     print_str_uart(exception_name);
-    print_str_uart("\n=================\nSystem halted.\n");
+    print_str_uart("\r\n=================\r\nSystem halted.\r\n");
 
     loop {
         unsafe { core::arch::asm!("wfe"); }

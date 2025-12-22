@@ -8,6 +8,7 @@
 use super::addrspace::AddressSpace;
 use super::pmm;
 use crate::logln;
+use crate::arch::aarch64::mmu;
 use super::task;
 
 /// ELF magic number
@@ -227,9 +228,10 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
         // Allocate physical pages
         let phys_base = pmm::alloc_pages(num_pages).ok_or(ElfError::OutOfMemory)?;
 
-        // Zero the pages first
+        // Zero the pages first (use TTBR1 virtual address to access physical memory)
         unsafe {
-            let ptr = phys_base as *mut u8;
+            let virt_base = mmu::phys_to_virt(phys_base as u64);
+            let ptr = virt_base as *mut u8;
             for i in 0..(num_pages * page_size) {
                 core::ptr::write_volatile(ptr.add(i), 0);
             }
@@ -243,7 +245,8 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
             }
 
             unsafe {
-                let dest = (phys_base + offset_in_page) as *mut u8;
+                let virt_base = mmu::phys_to_virt(phys_base as u64);
+                let dest = (virt_base as usize + offset_in_page) as *mut u8;
                 let src = data.as_ptr().add(offset);
                 for i in 0..filesz {
                     core::ptr::write_volatile(dest.add(i), *src.add(i));
@@ -258,18 +261,18 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
         // If executable, perform cache maintenance to ensure I-cache sees the code
         if executable {
             unsafe {
-                let base = phys_base;
+                let virt_base = mmu::phys_to_virt(phys_base as u64) as usize;
                 let size = num_pages * page_size;
                 // Clean each cache line to Point of Unification (so I-cache can see it)
                 // ARM cache line is typically 64 bytes
-                for addr in (base..(base + size)).step_by(64) {
+                for addr in (virt_base..(virt_base + size)).step_by(64) {
                     // DC CVAU: Clean data cache by VA to PoU
                     core::arch::asm!("dc cvau, {}", in(reg) addr);
                 }
                 // Data Synchronization Barrier
                 core::arch::asm!("dsb ish");
                 // Invalidate instruction cache
-                for addr in (base..(base + size)).step_by(64) {
+                for addr in (virt_base..(virt_base + size)).step_by(64) {
                     // IC IVAU: Invalidate instruction cache by VA to PoU
                     core::arch::asm!("ic ivau, {}", in(reg) addr);
                 }

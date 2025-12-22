@@ -58,12 +58,8 @@ use usb::{
     // Hub helpers
     get_hub_descriptor_setup, get_port_status_setup,
     set_port_feature_setup, clear_port_feature_setup,
-    // Cache ops (ARM64 cache maintenance for DMA)
-    flush_cache_line, invalidate_cache_line, flush_buffer, invalidate_buffer, dsb,
-    // Timing constants
-    DELAY_POST_ADDRESS_US, DELAY_POLL_INTERVAL_US,
-    DELAY_DOWNSTREAM_DEVICE_US, DELAY_DIRECT_DEVICE_US, DELAY_POST_CONFIG_US,
-    DELAY_INTER_CMD_US, POLL_MAX_DIRECT, POLL_MAX_DOWNSTREAM, POLL_MAX_DESCRIPTOR,
+    // Cache ops (ARM64 cache maintenance for DMA) - kept for potential future use
+    flush_cache_line, flush_buffer, invalidate_buffer, dsb,
     // Register bit constants
     ERDP_EHB, USBSTS_EINT, USBSTS_PCD,
 };
@@ -281,19 +277,31 @@ impl UsbDriver {
                 return false;
             }
         };
-        print!("  xHCI v{:x}.{:x}, {} ports, {} slots",
+        println!("  xHCI v{:x}.{:x}, {} ports, {} slots",
                caps.version >> 8, caps.version & 0xff,
                caps.max_ports, caps.max_slots);
 
-        // Halt and reset xHCI
-        self.xhci.halt_and_reset();
+        // Halt and reset xHCI (critical for warm resets)
+        print!("  [1:halt]");
+        let (halt_ok, reset_ok) = self.xhci.halt_and_reset();
+        if !halt_ok {
+            print!(" halt_failed");
+        }
+        if !reset_ok {
+            print!(" reset_failed");
+        }
+        // Extra delay after reset for controller to stabilize
+        delay_ms(50);
+        print!(" [2:reset_done]");
 
         // Configure PHY for host mode (after xHCI reset)
         if self.phy.set_host_mode().is_err() {
             println!("  ERROR: PHY set_host_mode failed");
             return false;
         }
+        print!(" [3]");
         let _ = self.soc.force_usb2_phy_power();
+        print!(" [4]");
 
         // Allocate DMA memory for xHCI data structures
         let mut phys_addr: u64 = 0;
@@ -304,6 +312,7 @@ impl UsbDriver {
         }
         self.xhci_mem = mem_addr as u64;
         self.xhci_phys = phys_addr;
+        print!(" [5]");
 
         // Memory layout (using constants from enumeration module)
         let dcbaa_virt = self.xhci_mem as *mut u64;
@@ -322,34 +331,42 @@ impl UsbDriver {
             }
             flush_buffer(dcbaa_virt as u64, 256 * 8);
         }
+        print!(" [6]");
 
         // Initialize rings
         self.cmd_ring = Some(Ring::init(cmd_ring_virt, cmd_ring_phys));
         let usbsts_addr = self.xhci.mmio_base() + self.xhci.op_offset() as u64 + xhci_op::USBSTS as u64;
         self.event_ring = Some(EventRing::init(evt_ring_virt, evt_ring_phys, erst_virt, erst_phys, usbsts_addr));
+        print!(" [7]");
 
         // Program xHCI registers
         self.xhci.set_max_slots(self.xhci.max_slots());
         self.xhci.set_dcbaap(dcbaa_phys);
         self.xhci.set_crcr(cmd_ring_phys, true);
         self.xhci.program_interrupter(0, erst_phys, 1, evt_ring_phys);
+        print!(" [8]");
 
         // Start controller
         if !self.xhci.start() {
             println!("  ERROR: Controller failed to start");
             return false;
         }
+        print!(" [9]");
 
         // Power on ports and wait for connection
         self.xhci.power_on_all_ports();
-        if self.xhci.max_ports() > 0 {
+        print!(" [10]");
+        let mp = self.xhci.max_ports();
+        print!(" [11:mp={}]", mp);
+        if mp > 0 {
+            print!(" [12:wait]");
             if let Some(port) = self.xhci.wait_for_connection(100000) {
-                println!(", device on port {}", port + 1);
+                println!(" [13:port={}]", port + 1);
             } else {
-                println!(", no device");
+                println!(" [13:none]");
             }
         } else {
-            println!();
+            println!(" [13:noports]");
         }
 
         true
@@ -611,36 +628,56 @@ impl UsbDriver {
 
     /// Enumerate a port (reset + enumerate + mark as enumerated)
     /// Called when a new device is detected via port status change event
+    /// Includes retry logic for flaky USB devices
     fn enumerate_port(&mut self, port: u32) -> Option<u32> {
         println!("[usbd] Enumerating port {}...", port);
 
-        // Check port status first
-        let port_idx = (port - 1) as u8;
-        let raw = self.xhci.read_portsc(port_idx);
-        let status = ParsedPortsc::from_raw(raw);
-        println!("[usbd]   PORTSC: connected={} enabled={} speed={}",
-                 status.connected, status.enabled, status.speed.as_str());
+        // Retry the entire enumeration process
+        for attempt in 0..3 {
+            if attempt > 0 {
+                println!("[usbd]   Retry {} for port {}", attempt, port);
+                delay_ms(200);
+            }
 
-        // Reset the port first (unless already enabled)
-        if !status.enabled {
-            if !self.reset_port(port) {
-                println!("[usbd]   Port {} reset failed", port);
+            // Check port status first
+            let port_idx = (port - 1) as u8;
+            let raw = self.xhci.read_portsc(port_idx);
+            let status = ParsedPortsc::from_raw(raw);
+
+            if attempt == 0 {
+                println!("[usbd]   PORTSC: connected={} enabled={} speed={}",
+                         status.connected, status.enabled, status.speed.as_str());
+            }
+
+            if !status.connected {
+                println!("[usbd]   Port {} not connected", port);
                 return None;
             }
-            // Small delay after reset
-            delay_ms(50);
+
+            // Reset the port first (unless already enabled)
+            if !status.enabled {
+                if !self.reset_port(port) {
+                    println!("[usbd]   Port {} reset failed", port);
+                    continue; // Retry
+                }
+                // Small delay after reset
+                delay_ms(50);
+            }
+
+            // Enumerate the device
+            if let Some(slot_id) = self.enumerate_device(port) {
+                // Mark port as enumerated
+                if port > 0 && port <= 32 {
+                    self.enumerated_ports |= 1 << (port - 1);
+                }
+                println!("[usbd]   Port {} enumerated as slot {}", port, slot_id);
+                return Some(slot_id);
+            }
+            // enumerate_device failed, will retry
         }
 
-        // Enumerate the device
-        let slot_id = self.enumerate_device(port)?;
-
-        // Mark port as enumerated
-        if port > 0 && port <= 32 {
-            self.enumerated_ports |= 1 << (port - 1);
-        }
-
-        println!("[usbd]   Port {} enumerated as slot {}", port, slot_id);
-        Some(slot_id)
+        println!("[usbd]   Port {} enumeration failed after 3 attempts", port);
+        None
     }
 
     /// Enumerate all ports in a bitmask
@@ -2084,7 +2121,7 @@ impl UsbDriver {
         }
     }
 
-    /// Configure a mass storage device (silent unless error)
+    /// Configure a mass storage device
     fn configure_mass_storage(
         &mut self,
         slot_id: u32,
@@ -2096,6 +2133,7 @@ impl UsbDriver {
         buf_phys: u64,
         device_ctx_virt: *mut DeviceContext,
     ) {
+        println!("    [MSC] Getting config descriptor...");
         // Get Configuration Descriptor (first 9 bytes to get total length)
         match self.control_transfer(
             slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
@@ -2107,27 +2145,43 @@ impl UsbDriver {
                 invalidate_buffer(buf_virt as u64, 9);
                 let config = unsafe { &*(buf_virt as *const ConfigurationDescriptor) };
                 let total_len = config.total_length;
+                println!("    [MSC] Config descriptor total_len={}", total_len);
 
                 if total_len > 9 && total_len <= 256 {
                     delay(10000);
+                    println!("    [MSC] Getting full config descriptor...");
                     match self.control_transfer(
                         slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
                         0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_CONFIGURATION << 8) as u16,
                         0, buf_phys, total_len
                     ) {
                         Some((cc, _)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
+                            println!("    [MSC] Parsing config descriptor...");
                             // Invalidate full config descriptor
                             invalidate_buffer(buf_virt as u64, total_len as usize);
                             self.parse_config_descriptor(
                                 slot_id, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
                                 buf_virt, total_len as usize, device_ctx_virt
                             );
+                            println!("    [MSC] Configuration done");
                         }
-                        _ => {}
+                        Some((cc, _)) => {
+                            println!("    [MSC] Full config failed cc={}", cc);
+                        }
+                        None => {
+                            println!("    [MSC] Full config timeout");
+                        }
                     }
+                } else {
+                    println!("    [MSC] Invalid total_len");
                 }
             }
-            _ => {}
+            Some((cc, _)) => {
+                println!("    [MSC] Config descriptor failed cc={}", cc);
+            }
+            None => {
+                println!("    [MSC] Config descriptor timeout");
+            }
         }
     }
 
@@ -2509,9 +2563,6 @@ impl UsbDriver {
     /// Receive bulk IN data directly to an external physical address (zero-copy DMA)
     /// For use by other processes that pass their own DMA buffer
     fn receive_bulk_in_dma(&mut self, ctx: &mut BulkContext, target_phys: u64, length: usize) -> (TransferResult, usize) {
-        // NOTE: We don't invalidate cache here - the target is in another process's address space
-        // The client is responsible for cache management on their buffer
-
         // Create TRB for bulk IN with proper cycle bit
         let (idx, cycle) = ctx.advance_in();
         unsafe {
@@ -2864,8 +2915,20 @@ impl UsbDriver {
             println!("    VPD Block Limits not supported (common for USB drives)");
         }
 
-        // Read capacity and report
-        if let Some((last_lba, block_size)) = self.scsi_read_capacity_10(ctx) {
+        // Read capacity with retry (USB devices can be slow after wake)
+        let mut capacity = None;
+        for attempt in 0..3 {
+            if let Some(cap) = self.scsi_read_capacity_10(ctx) {
+                capacity = Some(cap);
+                break;
+            }
+            if attempt < 2 {
+                println!("    Retrying READ_CAPACITY...");
+                delay_ms(500);
+            }
+        }
+
+        if let Some((last_lba, block_size)) = capacity {
             // Calculate and print size
             let block_count = last_lba as u64 + 1;
             let size_bytes = block_count * block_size as u64;
@@ -3599,6 +3662,77 @@ impl UsbDriver {
         None
     }
 
+    /// Read blocks to internal buffer (for copy-based transfer)
+    /// Data ends up in the MSC device's internal buffer at DATA_OFFSET
+    fn block_read_internal(&mut self, lba: u64, count: u32) -> Option<usize> {
+        if count == 0 || count > 64 {
+            return None;
+        }
+
+        let mut msc = self.msc_device.take()?;
+
+        let mut ctx = BulkContext {
+            slot_id: msc.slot_id,
+            bulk_in_dci: msc.bulk_in_dci,
+            bulk_out_dci: msc.bulk_out_dci,
+            bulk_in_ring: msc.bulk_in_ring,
+            bulk_in_ring_phys: msc.bulk_in_ring_phys,
+            bulk_out_ring: msc.bulk_out_ring,
+            _bulk_out_ring_phys: msc.bulk_out_ring_phys,
+            data_buf: msc.data_buf,
+            data_phys: msc.data_phys,
+            device_ctx: msc.device_ctx,
+            out_enqueue: msc.out_enqueue,
+            in_enqueue: msc.in_enqueue,
+            out_cycle: msc.out_cycle,
+            in_cycle: msc.in_cycle,
+            tag: msc.tag,
+            bulk_in_addr: msc.bulk_in_addr,
+            bulk_out_addr: msc.bulk_out_addr,
+            interface_num: msc.interface_num,
+            ep0_ring: msc.ep0_ring,
+            ep0_ring_phys: msc.ep0_ring_phys,
+            ep0_enqueue: msc.ep0_enqueue,
+            ep0_cycle: msc.ep0_cycle,
+        };
+
+        // Build and execute READ(10) to internal buffer
+        let (cmd, data_length) = scsi::build_read_10(lba as u32, count as u16, 512);
+        let (result, csw) = self.scsi_command_in(&mut ctx, &cmd, data_length);
+
+        // Update ring state
+        msc.out_enqueue = ctx.out_enqueue;
+        msc.in_enqueue = ctx.in_enqueue;
+        msc.out_cycle = ctx.out_cycle;
+        msc.in_cycle = ctx.in_cycle;
+        msc.tag = ctx.tag;
+        msc.ep0_enqueue = ctx.ep0_enqueue;
+
+        self.msc_device = Some(msc);
+
+        if let Some(csw) = csw {
+            if csw.signature == msc::CSW_SIGNATURE && csw.status == msc::CSW_STATUS_PASSED &&
+               (result == TransferResult::Success || result == TransferResult::ShortPacket) {
+                let actual_bytes = (data_length - csw.data_residue) as usize;
+                return Some(actual_bytes);
+            }
+        }
+
+        None
+    }
+
+    /// Get pointer to internal data buffer (for copying after block_read_internal)
+    fn get_data_ptr(&self) -> Option<*const u8> {
+        self.msc_device.as_ref().map(|msc| {
+            // Invalidate cache first so we see what DMA wrote
+            unsafe {
+                let ptr = msc.data_buf.add(DATA_OFFSET);
+                invalidate_buffer(ptr as u64, 32768); // Invalidate up to 64 blocks
+                ptr as *const u8
+            }
+        })
+    }
+
     /// Get block device info
     fn get_block_info(&self) -> Option<(u32, u64)> {
         self.msc_device.as_ref().map(|msc| (msc.block_size, msc.block_count))
@@ -3805,8 +3939,8 @@ impl BlockServer {
     }
 
     /// Process pending ring requests - returns number of requests processed
-    fn process_requests(&self, driver: &mut UsbDriver) -> u32 {
-        let ring = match &self.ring {
+    fn process_requests(&mut self, driver: &mut UsbDriver) -> u32 {
+        let ring = match &mut self.ring {
             Some(r) => r,
             None => return 0,
         };
@@ -3815,7 +3949,7 @@ impl BlockServer {
 
         // Process all pending requests
         while let Some(req) = ring.next_request() {
-            let resp = self.handle_request(driver, ring, &req);
+            let resp = Self::handle_request_static(driver, ring, &req);
             ring.complete(&resp);
             processed += 1;
         }
@@ -3828,8 +3962,8 @@ impl BlockServer {
         processed
     }
 
-    /// Handle a single block request
-    fn handle_request(&self, driver: &mut UsbDriver, ring: &BlockRing, req: &BlockRequest) -> BlockResponse {
+    /// Handle a single block request (static to avoid borrow issues)
+    fn handle_request_static(driver: &mut UsbDriver, ring: &mut BlockRing, req: &BlockRequest) -> BlockResponse {
         match req.cmd {
             BlockRequest::CMD_INFO => {
                 // Return device info from MSC device
@@ -3840,10 +3974,10 @@ impl BlockServer {
                 }
             }
             BlockRequest::CMD_READ => {
-                self.handle_read(driver, ring, req)
+                Self::handle_read_static(driver, ring, req)
             }
             BlockRequest::CMD_WRITE => {
-                self.handle_write(driver, ring, req)
+                Self::handle_write_static(driver, ring, req)
             }
             _ => {
                 BlockResponse::error(req.tag, -38) // ENOSYS
@@ -3851,8 +3985,8 @@ impl BlockServer {
         }
     }
 
-    /// Handle a read request
-    fn handle_read(&self, driver: &mut UsbDriver, ring: &BlockRing, req: &BlockRequest) -> BlockResponse {
+    /// Handle a read request (static)
+    fn handle_read_static(driver: &mut UsbDriver, ring: &mut BlockRing, req: &BlockRequest) -> BlockResponse {
         // Validate request
         if req.count == 0 {
             return BlockResponse::error(req.tag, -22); // EINVAL
@@ -3867,18 +4001,23 @@ impl BlockServer {
             return BlockResponse::error(req.tag, -22);
         }
 
-        // Get physical address of target buffer in ring
+        // Zero-copy DMA: read directly into shared memory ring buffer
+        // Shared memory uses non-cacheable attributes, so no cache ops needed
         let target_phys = ring.data_phys() + buf_offset as u64;
 
-        // Perform DMA read directly to ring buffer
         match driver.block_read_dma(req.lba, req.count, target_phys) {
-            Some(bytes_read) => BlockResponse::ok(req.tag, bytes_read as u32),
-            None => BlockResponse::error(req.tag, -5), // EIO
+            Some(bytes_read) => {
+                BlockResponse::ok(req.tag, bytes_read as u32)
+            },
+            None => {
+                println!("[usbd] READ: DMA failed");
+                BlockResponse::error(req.tag, -5) // EIO
+            }
         }
     }
 
     /// Handle a write request
-    fn handle_write(&self, driver: &mut UsbDriver, ring: &BlockRing, req: &BlockRequest) -> BlockResponse {
+    fn handle_write_static(driver: &mut UsbDriver, ring: &BlockRing, req: &BlockRequest) -> BlockResponse {
         // Validate request
         if req.count == 0 {
             return BlockResponse::error(req.tag, -22); // EINVAL
@@ -3912,17 +4051,8 @@ impl BlockServer {
 fn main() {
     println!("USB driver starting...");
 
-    // Register the "usb" port to ensure only one instance runs
-    let port_result = syscall::port_register(b"usb");
-    if port_result < 0 {
-        if port_result == -17 {
-            println!("ERROR: USB daemon already running");
-        } else {
-            println!("ERROR: Failed to register USB port: {}", port_result);
-        }
-        syscall::exit(1);
-    }
-    let usb_port = port_result as u32;
+    // NOTE: We delay port registration until MSC device is ready.
+    // This way clients (fatfs) block on port_connect() until we can serve them.
 
     // === Board Initialization ===
     // The board abstraction handles all platform-specific setup:
@@ -4020,17 +4150,15 @@ fn main() {
         }
     }
 
-    // Wait up to 5 seconds for additional device connections
+    // Wait up to 5 seconds for USB device enumeration
     let mut wait_count = 0;
-    while driver.enumerated_ports == 0 && wait_count < 50 {
+    while driver.msc_device.is_none() && wait_count < 50 {
         wait_count += 1;
-
-        // Wait for IRQ or timeout
-        if driver.irq_fd >= 0 {
-            driver.wait_for_irq(100);
-        } else {
-            delay_ms(100);
+        if wait_count % 10 == 1 {
+            println!("[usbd] Waiting for MSC device... ({}/50)", wait_count);
         }
+
+        delay_ms(100);
 
         // Poll events and enumerate any new devices
         let ports_to_enum = driver.poll_events();
@@ -4039,27 +4167,68 @@ fn main() {
         }
     }
 
-    if driver.enumerated_ports == 0 {
-        println!("No USB devices found after 5 seconds");
+    if driver.msc_device.is_none() {
+        println!("No USB mass storage device found after 5 seconds");
+        syscall::exit(1);
+    }
+
+    // Now that MSC is ready, register the "usb" port
+    // Clients (fatfs) will have been blocking on port_connect() until now
+    println!("[usbd] MSC device ready, registering 'usb' port...");
+    let port_result = syscall::port_register(b"usb");
+    if port_result < 0 {
+        if port_result == -17 {
+            println!("ERROR: USB daemon already running");
+        } else {
+            println!("ERROR: Failed to register USB port: {}", port_result);
+        }
+        syscall::exit(1);
+    }
+    let usb_port = port_result as u32;
+    println!("[usbd] Port registered, ready to accept connections");
+
+    // Initialize client tracking
+    const MAX_CLIENTS: usize = 4;
+    let mut clients: [Option<BlockServer>; MAX_CLIENTS] = [None, None, None, None];
+    let mut num_clients = 0usize;
+
+    // Accept any immediately pending connections
+    loop {
+        let accept_result = syscall::port_accept(usb_port);
+        if accept_result <= 0 {
+            break;
+        }
+        let client_channel = accept_result as u32;
+        let mut client = BlockServer::new(client_channel);
+        if client.try_handshake() && num_clients < MAX_CLIENTS {
+            for i in 0..MAX_CLIENTS {
+                if clients[i].is_none() {
+                    clients[i] = Some(client);
+                    num_clients += 1;
+                    println!("[usbd] Client {} connected", num_clients);
+                    break;
+                }
+            }
+        }
     }
 
     // Daemonize
+    println!("[usbd] About to daemonize, num_clients={}", num_clients);
     let result = syscall::daemonize();
+    println!("[usbd] daemonize returned {}", result);
     if result == 0 {
         println!("USB daemon running (ring buffer mode)");
         // Resync event ring before daemon loop - drain any pending events and update ERDP
         driver.resync_event_ring();
 
-        const MAX_CLIENTS: usize = 4;
-        let mut clients: [Option<BlockServer>; MAX_CLIENTS] = [None, None, None, None];
-        let mut num_clients = 0usize;
+        // clients array already initialized above (may have connections from init phase)
         let mut heartbeat_counter = 0u32;
 
         loop {
             heartbeat_counter += 1;
 
-            // Reset heartbeat counter every 2 seconds
-            if heartbeat_counter >= 200 {
+            // Reset heartbeat counter
+            if heartbeat_counter >= 10000 {
                 heartbeat_counter = 0;
             }
 
@@ -4078,11 +4247,14 @@ fn main() {
             // Accept new client connections
             let accept_result = syscall::port_accept(usb_port);
             if accept_result > 0 && num_clients < MAX_CLIENTS {
+                println!("[usbd] port_accept returned {} - accepting client", accept_result);
                 let client_channel = accept_result as u32;
 
                 // Create BlockServer and complete handshake
                 let mut client = BlockServer::new(client_channel);
+                println!("[usbd] calling try_handshake on ch {}", client_channel);
                 if client.try_handshake() {
+                    println!("[usbd] handshake succeeded");
                     // Add to clients array
                     for i in 0..MAX_CLIENTS {
                         if clients[i].is_none() {
@@ -4091,12 +4263,14 @@ fn main() {
                             break;
                         }
                     }
+                } else {
+                    println!("[usbd] handshake failed");
                 }
             }
 
             // Process ring requests from all ready clients
             for i in 0..MAX_CLIENTS {
-                if let Some(ref client) = clients[i] {
+                if let Some(ref mut client) = clients[i] {
                     if client.is_ready() {
                         client.process_requests(&mut driver);
                     }

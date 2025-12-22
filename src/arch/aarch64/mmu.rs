@@ -2,6 +2,9 @@
 //!
 //! Implements 4-level page tables with 4KB pages for kernel/user separation.
 //!
+//! The kernel is linked at virtual address 0xFFFF_0000_4600_0000 (TTBR1).
+//! MMU is enabled in boot.S before any Rust code runs.
+//!
 //! Address Space Layout:
 //! - TTBR0_EL1: User space (0x0000_0000_0000_0000 - 0x0000_FFFF_FFFF_FFFF)
 //! - TTBR1_EL1: Kernel space (0xFFFF_0000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF)
@@ -65,28 +68,9 @@ pub mod attr {
     pub const NORMAL_NC: u64 = 2 << 2;  // Attr index 2: Normal Non-Cacheable (for DMA buffers)
 }
 
-/// MAIR_EL1 value
-/// Attr0: Device-nGnRnE (0x00) - for MMIO registers
-/// Attr1: Normal, Write-Back (0xFF) - for regular memory
-/// Attr2: Normal, Non-Cacheable (0x44) - for DMA buffers
-const MAIR_VALUE: u64 = 0x00_00_00_00_00_44_FF_00;
-
-/// TCR_EL1 configuration
-/// - T0SZ = 16 (48-bit VA for TTBR0)
-/// - T1SZ = 16 (48-bit VA for TTBR1)
-/// - TG0 = 0 (4KB granule for TTBR0)
-/// - TG1 = 2 (4KB granule for TTBR1)
-/// - IPS = 5 (48-bit PA)
-/// - IRGN0/ORGN0 = Write-Back (for TTBR0 page table walks)
-/// - SH0 = Inner Shareable (for TTBR0 page table walks)
-const TCR_VALUE: u64 = (16 << 0)       // T0SZ = 16 (48-bit VA)
-                     | (16 << 16)      // T1SZ = 16 (48-bit VA)
-                     | (0b00 << 14)    // TG0 = 4KB
-                     | (0b10 << 30)    // TG1 = 4KB
-                     | (0b101 << 32)   // IPS = 48-bit PA
-                     | (0b01 << 8)     // IRGN0 = Write-Back Write-Allocate
-                     | (0b01 << 10)    // ORGN0 = Write-Back Write-Allocate
-                     | (0b11 << 12);   // SH0 = Inner Shareable
+// Note: MMU configuration (MAIR, TCR, page tables) is set up in boot.S
+// before any Rust code runs. This module provides helper functions for
+// runtime page table manipulation.
 
 /// Page table (512 entries, 4KB aligned)
 #[repr(C, align(4096))]
@@ -161,164 +145,27 @@ impl PageTable {
     }
 
     /// Get physical address of this table
+    /// Note: Returns virtual address when kernel is linked at virtual address.
+    /// Use virt_to_phys() to convert if needed.
     pub fn phys_addr(&self) -> u64 {
-        self as *const _ as u64
+        virt_to_phys(self as *const _ as u64)
     }
 }
 
-/// Static page tables for kernel (TTBR1)
-#[repr(C, align(4096))]
-struct KernelPageTables {
-    l0: PageTable,
-    l1: PageTable,
+// Boot page table addresses from boot.S (physical addresses)
+extern "C" {
+    pub static BOOT_TTBR0: u64;
+    pub static BOOT_TTBR1: u64;
 }
 
-static mut KERNEL_TABLES: KernelPageTables = KernelPageTables {
-    l0: PageTable::new(),
-    l1: PageTable::new(),
-};
-
-/// Static page tables for identity mapping (TTBR0) - used during boot and as template
-#[repr(C, align(4096))]
-struct IdentityPageTables {
-    l0: PageTable,
-    l1: PageTable,
+/// Get the boot TTBR0 physical address (identity mapping)
+pub fn boot_ttbr0() -> u64 {
+    unsafe { BOOT_TTBR0 }
 }
 
-static mut IDENTITY_TABLES: IdentityPageTables = IdentityPageTables {
-    l0: PageTable::new(),
-    l1: PageTable::new(),
-};
-
-/// Initialize MMU with kernel/user separation
-pub fn init() {
-    unsafe {
-        // Set up identity mapping (TTBR0) for user space / boot
-        let id_tables = &mut *core::ptr::addr_of_mut!(IDENTITY_TABLES);
-        let id_l1_addr = &id_tables.l1 as *const _ as u64;
-        id_tables.l0.set_table(0, id_l1_addr);
-
-        // Identity map: VA = PA for lower 4GB
-        id_tables.l1.set_block(0, 0x00000000, true);  // Device (peripherals)
-        id_tables.l1.set_block(1, 0x40000000, false); // Normal (DRAM)
-        id_tables.l1.set_block(2, 0x80000000, false); // More DRAM
-        id_tables.l1.set_block(3, 0xC0000000, false); // More DRAM
-
-        // Set up kernel mapping (TTBR1) for upper half
-        // 0xFFFF_0000_0000_0000 maps to 0x0000_0000_0000_0000
-        let kern_tables = &mut *core::ptr::addr_of_mut!(KERNEL_TABLES);
-        let kern_l1_addr = &kern_tables.l1 as *const _ as u64;
-        kern_tables.l0.set_table(0, kern_l1_addr);
-
-        // Kernel space mapping with UXN (unprivileged execute never)
-        // Block 0: Device memory (UART, GIC)
-        kern_tables.l1.set_block_with_flags(
-            0,
-            0x00000000,
-            flags::UXN | flags::PXN,  // No execute from device memory
-            attr::DEVICE
-        );
-        // Block 1: Kernel code/data (DRAM) - allow kernel execute
-        kern_tables.l1.set_block_with_flags(
-            1,
-            0x40000000,
-            flags::UXN,  // User can't execute, kernel can
-            attr::NORMAL
-        );
-        // Block 2-3: More DRAM
-        kern_tables.l1.set_block_with_flags(2, 0x80000000, flags::UXN, attr::NORMAL);
-        kern_tables.l1.set_block_with_flags(3, 0xC0000000, flags::UXN, attr::NORMAL);
-    }
-}
-
-/// Enable the MMU with separate kernel and user address spaces
-///
-/// After this function returns:
-/// - TTBR0: identity mapping (for initial boot, will be replaced by user page tables)
-/// - TTBR1: kernel virtual addresses (0xFFFF_0000_xxxx_xxxx)
-/// - SP: converted to TTBR1 address so kernel never needs TTBR0
-pub fn enable() {
-    unsafe {
-        let id_tables = &*core::ptr::addr_of!(IDENTITY_TABLES);
-        let kern_tables = &*core::ptr::addr_of!(KERNEL_TABLES);
-        let ttbr0 = &id_tables.l0 as *const _ as u64;
-        let ttbr1 = &kern_tables.l0 as *const _ as u64;
-
-        // Set MAIR_EL1
-        core::arch::asm!("msr mair_el1, {}", in(reg) MAIR_VALUE);
-
-        // Set TCR_EL1
-        core::arch::asm!("msr tcr_el1, {}", in(reg) TCR_VALUE);
-
-        // Set TTBR0_EL1 (user space / identity mapping for boot)
-        core::arch::asm!("msr ttbr0_el1, {}", in(reg) ttbr0);
-
-        // Set TTBR1_EL1 (kernel space)
-        core::arch::asm!("msr ttbr1_el1, {}", in(reg) ttbr1);
-
-        // Ensure all writes complete
-        core::arch::asm!("isb");
-
-        // Invalidate TLBs
-        core::arch::asm!("tlbi vmalle1is");
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-
-        // Enable MMU via SCTLR_EL1
-        let mut sctlr: u64;
-        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr);
-
-        sctlr |= 1 << 0;   // M: Enable MMU
-        sctlr |= 1 << 2;   // C: Enable data cache
-        sctlr |= 1 << 12;  // I: Enable instruction cache
-        sctlr |= 1 << 26;  // UCI: Allow cache maintenance (DC CVAC, DC CIVAC) from EL0
-
-        core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr);
-        core::arch::asm!("isb");
-
-        // Jump to TTBR1 address space.
-        // After MMU enable, PC is still using physical addresses (via TTBR0 identity mapping).
-        // We need to switch PC to TTBR1 virtual addresses so kernel code continues to work
-        // even after TTBR0 is switched to user page tables.
-        //
-        // Strategy: Get current PC, convert to TTBR1, branch there.
-        // Also convert SP and LR (return address) to TTBR1.
-        core::arch::asm!(
-            // Get address of next instruction (after this asm block)
-            "adr {tmp}, 1f",
-            // Convert to TTBR1 virtual address
-            "orr {tmp}, {tmp}, {base}",
-            // Convert SP to TTBR1
-            "mov {tmp2}, sp",
-            "orr {tmp2}, {tmp2}, {base}",
-            "mov sp, {tmp2}",
-            // Convert LR (return address) to TTBR1
-            "orr x30, x30, {base}",
-            // Jump to TTBR1 space - after this, PC is in TTBR1
-            "br {tmp}",
-            "1:",
-            tmp = out(reg) _,
-            tmp2 = out(reg) _,
-            base = in(reg) KERNEL_VIRT_BASE,
-            // x30 (LR) is modified
-            out("x30") _,
-        );
-    }
-}
-
-/// Kernel TTBR0 value (identity mapping) - accessible from assembly
-/// This is set during MMU init and used by syscall handler to switch back to kernel space.
-/// Required because vtables contain physical addresses.
-#[no_mangle]
-pub static mut KERNEL_TTBR0: u64 = 0;
-
-/// Initialize KERNEL_TTBR0 after MMU enable
-/// Must be called after mmu::enable()
-pub fn init_kernel_ttbr0() {
-    unsafe {
-        let id_tables = &*core::ptr::addr_of!(IDENTITY_TABLES);
-        KERNEL_TTBR0 = &id_tables.l0 as *const _ as u64;
-    }
+/// Get the boot TTBR1 physical address (kernel mapping)
+pub fn boot_ttbr1() -> u64 {
+    unsafe { BOOT_TTBR1 }
 }
 
 /// Switch to a new user address space (change TTBR0)

@@ -51,6 +51,63 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use core::marker::PhantomData;
 use crate::syscall;
 
+// ============================================================================
+// Cache management for shared memory coherency
+// ============================================================================
+
+/// Data synchronization barrier
+#[inline]
+fn dsb() {
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Flush (clean) a cache line to memory
+#[inline]
+fn flush_cache_line(addr: u64) {
+    unsafe {
+        core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack, preserves_flags));
+    }
+}
+
+/// Invalidate a cache line
+#[inline]
+fn invalidate_cache_line(addr: u64) {
+    unsafe {
+        core::arch::asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags));
+    }
+}
+
+/// Flush a buffer to memory (after CPU writes, before other process reads)
+#[inline]
+fn flush_buffer(addr: u64, size: usize) {
+    const CACHE_LINE: usize = 64;
+    let start = addr & !(CACHE_LINE as u64 - 1);
+    let end = (addr + size as u64 + CACHE_LINE as u64 - 1) & !(CACHE_LINE as u64 - 1);
+    let mut a = start;
+    while a < end {
+        flush_cache_line(a);
+        a += CACHE_LINE as u64;
+    }
+    dsb();
+}
+
+/// Invalidate a buffer from cache (before CPU reads data written by other process)
+#[inline]
+fn invalidate_buffer(addr: u64, size: usize) {
+    const CACHE_LINE: usize = 64;
+    let start = addr & !(CACHE_LINE as u64 - 1);
+    let end = (addr + size as u64 + CACHE_LINE as u64 - 1) & !(CACHE_LINE as u64 - 1);
+    dsb();
+    let mut a = start;
+    while a < end {
+        invalidate_cache_line(a);
+        a += CACHE_LINE as u64;
+    }
+    dsb();
+}
+
 /// Ring buffer magic number
 pub const RING_MAGIC: u32 = 0x52494E47; // "RING"
 
@@ -177,6 +234,8 @@ impl<S: Copy, C: Copy> Ring<S, C> {
             (*header)._padding = [0; 4];
         }
 
+        // No cache flush needed - shmem uses non-cacheable memory
+
         Some(Self {
             shmem_id: shmem_id as u32,
             base,
@@ -197,6 +256,8 @@ impl<S: Copy, C: Copy> Ring<S, C> {
         }
 
         let base = vaddr as *mut u8;
+
+        // No cache invalidation needed - shmem uses non-cacheable memory
 
         // Validate header
         unsafe {
@@ -272,6 +333,16 @@ impl<S: Copy, C: Copy> Ring<S, C> {
         unsafe { self.base.add(self.header().data_offset as usize) }
     }
 
+    /// Get base address (for debugging)
+    pub fn base_addr(&self) -> u64 {
+        self.base as u64
+    }
+
+    /// Get data offset from header (for debugging)
+    pub fn data_offset(&self) -> u32 {
+        self.header().data_offset
+    }
+
     /// Get slice of data buffer
     pub fn data(&self) -> &[u8] {
         unsafe {
@@ -290,6 +361,29 @@ impl<S: Copy, C: Copy> Ring<S, C> {
                 self.header().data_size as usize
             )
         }
+    }
+
+    // === DMA Cache Management ===
+
+    /// Prepare data buffer region for DMA read (device writes to memory)
+    /// Call BEFORE starting DMA to ensure no dirty cache lines interfere
+    pub fn prepare_dma_read(&self, offset: usize, len: usize) {
+        let addr = self.data_ptr() as u64 + offset as u64;
+        invalidate_buffer(addr, len);
+    }
+
+    /// Complete DMA read (device wrote to memory)
+    /// Call AFTER DMA completes to ensure CPU sees fresh data
+    pub fn complete_dma_read(&self, offset: usize, len: usize) {
+        let addr = self.data_ptr() as u64 + offset as u64;
+        invalidate_buffer(addr, len);
+    }
+
+    /// Prepare data buffer region for DMA write (device reads from memory)
+    /// Call BEFORE starting DMA to flush CPU writes to memory
+    pub fn prepare_dma_write(&self, offset: usize, len: usize) {
+        let addr = self.data_ptr() as u64 + offset as u64;
+        flush_buffer(addr, len);
     }
 
     // === Submission Queue (Client -> Server) ===

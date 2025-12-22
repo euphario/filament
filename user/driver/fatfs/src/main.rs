@@ -13,7 +13,7 @@ mod fat;
 
 use fat::{FatFilesystem, FatType, LfnCollector};
 // Use USB library's BlockClient for ring buffer access
-use usb::{BlockClient, delay_ms};
+use usb::BlockClient;
 
 // Entry point
 #[unsafe(no_mangle)]
@@ -31,32 +31,48 @@ fn main() {
     };
     println!("[fatfs] Connected via ring buffer (data buffer: {} bytes)", block.buffer_size());
 
-    // Get block device info (retry if device not ready yet)
-    println!("[fatfs] Waiting for block device...");
-    let mut retries = 0;
-    let (block_size, block_count) = loop {
-        if let Some(info) = block.get_info() {
-            break info;
+    // Debug: Test buffer mapping by touching pages
+    {
+        let data = block.data();
+        let ptr = data.as_ptr();
+        println!("[fatfs] Data buffer at 0x{:x}, testing mapping...", ptr as u64);
+
+        // Touch every 4KB page to verify mapping
+        let page_size = 4096usize;
+        let num_pages = (block.buffer_size() + page_size - 1) / page_size;
+        for i in 0..num_pages {
+            let offset = i * page_size;
+            if offset < data.len() {
+                // Read one byte from each page
+                let _byte = unsafe { core::ptr::read_volatile(ptr.add(offset)) };
+                if i < 5 || i == num_pages - 1 {
+                    println!("[fatfs]   Page {} (offset 0x{:x}): OK", i, offset);
+                } else if i == 5 {
+                    println!("[fatfs]   ... testing remaining pages ...");
+                }
+            }
         }
-        retries += 1;
-        if retries >= 30 {
-            println!("[fatfs] ERROR: Timeout waiting for block device (30 retries)");
+        println!("[fatfs] All {} pages accessible!", num_pages);
+    }
+
+    // Get block device info
+    // NOTE: port_connect() blocks until usbd has MSC ready, so this should succeed immediately
+    let (block_size, block_count) = match block.get_info() {
+        Some(info) => info,
+        None => {
+            println!("[fatfs] ERROR: Failed to get block device info");
             syscall::exit(1);
         }
-        // Wait 500ms between retries (30 retries = 15 seconds total timeout)
-        delay_ms(500);
-        syscall::yield_now();
     };
-    println!("[fatfs] Device ready after {} retries", retries);
     println!("[fatfs] Block device: {} blocks x {} bytes", block_count, block_size);
 
     // Read sector 0 (could be MBR or FAT boot sector)
-    // Support up to 4096-byte logical sectors
     let bs = block_size as usize;
     if bs > 4096 {
-        println!("[fatfs] ERROR: Block size {} too large (max 4096)", bs);
+        println!("[fatfs] ERROR: Block size {} too large", bs);
         syscall::exit(1);
     }
+
     let mut sector0 = [0u8; 4096];
     if block.read_sector(0).is_none() {
         println!("[fatfs] ERROR: Failed to read sector 0");
@@ -64,30 +80,15 @@ fn main() {
     }
     sector0[..bs].copy_from_slice(&block.data()[..bs]);
 
-    // Debug: dump first 16 bytes of sector 0
-    print!("[fatfs] Sector 0 first 16 bytes: ");
-    for i in 0..16 {
-        print!("{:02x} ", sector0[i]);
-    }
-    println!();
-
-    // Signature location depends on logical sector size
-    // For MBR, signature is at end of first 512 bytes (offsets 510/511)
-    // For 4K native, signature could be at bs-2, but MBR is still in first 512 bytes
-    // Try end of logical sector first, then fall back to 510/511
+    // Check boot signature
     let (sig0, sig1) = if bs >= 512 {
         let end_sig = (sector0[bs - 2], sector0[bs - 1]);
         let std_sig = (sector0[510], sector0[511]);
         if end_sig == (0x55, 0xAA) {
-            println!("[fatfs] Signature at sector end (offset {})", bs - 2);
             end_sig
         } else if std_sig == (0x55, 0xAA) {
-            println!("[fatfs] Signature at standard offset 510");
             std_sig
         } else {
-            println!("[fatfs] Checking both sig locations: end={:02x}{:02x}, 510={:02x}{:02x}",
-                     end_sig.0, end_sig.1, std_sig.0, std_sig.1);
-            // Default to standard location
             std_sig
         }
     } else {
@@ -255,6 +256,12 @@ fn main() {
     }
     let listen_channel = listen_channel as u32;
     println!("[fatfs] Listening on port 'fatfs' (channel {})", listen_channel);
+
+    // Daemonize - detach from parent so shell can continue
+    let result = syscall::daemonize();
+    if result != 0 {
+        println!("[fatfs] WARNING: daemonize failed: {}", result);
+    }
 
     // Service loop
     firmware_service_loop(&fs, &mut block, listen_channel);

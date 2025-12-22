@@ -192,6 +192,20 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
     unsafe {
         let kern_vaddr = crate::arch::aarch64::mmu::phys_to_virt(phys_addr as u64);
         core::ptr::write_bytes(kern_vaddr as *mut u8, 0, aligned_size);
+
+        // CRITICAL: Flush kernel cache to physical memory and invalidate
+        // Userspace maps this as non-cacheable, so we must ensure kernel's
+        // cached zeros are written to memory and won't later overwrite
+        // userspace writes when evicted
+        for offset in (0..aligned_size).step_by(64) {
+            let addr = kern_vaddr + offset as u64;
+            core::arch::asm!(
+                "dc civac, {addr}",  // Clean and Invalidate by VA to PoC
+                addr = in(reg) addr,
+                options(nostack, preserves_flags)
+            );
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 
     // Store in table

@@ -412,9 +412,8 @@ impl AddressSpace {
             }
         };
 
-        // Set the L3 page entry with Normal Cacheable memory for DMA
-        // MT7988A requires cacheable memory + explicit cache operations.
-        // Userspace must flush before DMA reads and invalidate after DMA writes.
+        // Set the L3 page entry with Normal Non-Cacheable memory for DMA
+        // This makes DMA transparent without explicit cache management.
         let ap = if writable { flags::AP_RW_ALL } else { flags::AP_RO_ALL };
 
         unsafe {
@@ -426,7 +425,7 @@ impl AddressSpace {
                     | flags::PAGE
                     | flags::AF
                     | flags::SH_INNER   // Inner shareable for multi-core
-                    | attr::NORMAL      // Normal cacheable - requires explicit cache ops
+                    | attr::NORMAL_NC   // Normal Non-Cacheable - DMA coherent
                     | ap
                     | flags::UXN
                     | flags::PXN

@@ -192,17 +192,13 @@ impl PortRegistry {
         connect_msg.header.msg_type = MessageType::Connect;
         connect_msg.header.sender = client_pid;
         connect_msg.header.payload_len = 4;
-        // Put server channel ID in payload
         connect_msg.payload[0..4].copy_from_slice(&server_ch.to_le_bytes());
 
         unsafe {
-            // To put a message in listen_channel's queue, we must send on its peer
-            // (send() delivers to the peer's queue)
             let table = ipc::channel_table();
             if let Some(slot) = table.endpoints.iter().position(|e| e.id == port.listen_channel) {
                 let peer_id = table.endpoints[slot].peer;
                 if peer_id != 0 {
-                    // Send on peer, which delivers to listen_channel's queue
                     let _ = table.send(peer_id, connect_msg);
                 }
             }

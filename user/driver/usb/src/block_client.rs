@@ -27,7 +27,6 @@
 
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 use userlib::syscall;
-use crate::transfer::invalidate_buffer;
 
 /// Block device client
 ///
@@ -172,6 +171,7 @@ impl BlockClient {
     pub fn read_at(&mut self, lba: u64, count: u32, buf_offset: u32) -> Option<usize> {
         let max_bytes = self.ring.data_size();
         let requested_bytes = (count as usize) * (self.block_size as usize);
+
         if buf_offset as usize + requested_bytes > max_bytes {
             return None;
         }
@@ -189,16 +189,7 @@ impl BlockClient {
             return None;
         }
 
-        // Invalidate CPU cache for the data region - DMA wrote to physical memory
-        // but CPU may have stale data in cache
-        let bytes_read = resp.bytes as usize;
-        if bytes_read > 0 {
-            let data = self.ring.data();
-            let data_addr = data.as_ptr() as u64 + buf_offset as u64;
-            invalidate_buffer(data_addr, bytes_read);
-        }
-
-        Some(bytes_read)
+        Some(resp.bytes as usize)
     }
 
     /// Read blocks from the device (offset 0)
@@ -253,7 +244,7 @@ impl BlockClient {
         self.ring.cq_pending()
     }
 
-    /// Collect one completion, invalidating cache for the data region
+    /// Collect one completion
     /// Returns (tag, bytes_read) or None if no completions available
     pub fn collect_completion(&mut self) -> Option<(u32, usize)> {
         let resp = self.ring.next_completion()?;
@@ -262,13 +253,8 @@ impl BlockClient {
             return Some((resp.tag, 0)); // Error
         }
 
+        // No cache invalidation needed - shared memory uses non-cacheable attributes
         let bytes_read = resp.bytes as usize;
-        if bytes_read > 0 {
-            // Invalidate the entire data buffer since we don't track per-request offsets
-            // For optimal performance, caller should track buf_offset per tag
-            let data = self.ring.data();
-            invalidate_buffer(data.as_ptr() as u64, bytes_read);
-        }
 
         Some((resp.tag, bytes_read))
     }

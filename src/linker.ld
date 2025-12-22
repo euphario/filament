@@ -3,20 +3,34 @@
  *
  * Memory layout for MT7988A:
  * - DRAM starts at 0x40000000
- * - We load at 0x46000000 (U-Boot convention)
- * - Stack grows downward from load address
+ * - U-Boot loads us at physical 0x46000000
+ * - Kernel runs at virtual 0xFFFF000046000000 (TTBR1)
+ *
+ * The kernel is linked at the TTBR1 virtual address so that all
+ * symbol references (including vtables) contain virtual addresses.
+ * Early boot code calculates the phys/virt offset and enables MMU
+ * before any Rust code runs.
+ *
+ * Physical: 0x0000_0000_4600_0000
+ * Virtual:  0xFFFF_0000_4600_0000
  */
 
 ENTRY(_start)
 
+/* Physical load address (where U-Boot puts us) */
+KERNEL_PHYS_BASE = 0x46000000;
+
+/* Virtual address base (TTBR1 upper half) */
+KERNEL_VIRT_BASE = 0xFFFF000000000000;
+
 MEMORY
 {
     /*
-     * RAM region where U-Boot loads us
-     * 0x46000000 is the default loadaddr in U-Boot
-     * We allocate 16MB for the kernel
+     * RAM region - linked at TTBR1 virtual address
+     * Physical load address is 0x46000000
+     * Virtual address is 0xFFFF000046000000
      */
-    RAM (rwx) : ORIGIN = 0x46000000, LENGTH = 16M
+    RAM (rwx) : ORIGIN = KERNEL_VIRT_BASE + KERNEL_PHYS_BASE, LENGTH = 16M
 }
 
 SECTIONS
@@ -66,3 +80,7 @@ SECTIONS
 /* Export symbols for assembly and Rust */
 __kernel_start = ORIGIN(RAM);
 __kernel_end = .;
+
+/* Physical base for boot code (used to compute phys/virt offset) */
+__kernel_phys_base = KERNEL_PHYS_BASE;
+__kernel_virt_base = KERNEL_VIRT_BASE;

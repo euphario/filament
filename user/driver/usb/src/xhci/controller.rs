@@ -448,15 +448,28 @@ impl Controller {
     ///
     /// Returns the first port with a connection, or None if timeout.
     pub fn wait_for_connection(&self, timeout_us: u32) -> Option<u8> {
+        use userlib::print;
+        print!(" [W:iter={}]", timeout_us / 1000);
         let iterations = timeout_us / 1000;
-        for _ in 0..iterations {
+        for i in 0..iterations {
+            if i == 0 {
+                print!(" [W:loop0]");
+            }
             for p in 0..self.max_ports {
+                if i == 0 && p == 0 {
+                    print!(" [W:p0]");
+                }
                 if self.port_connected(p) {
+                    print!(" [W:found p={}]", p);
                     return Some(p);
                 }
             }
             crate::mmio::delay_ms(1);
+            if i == 0 {
+                print!(" [W:delay0]");
+            }
         }
+        print!(" [W:timeout]");
         None
     }
 

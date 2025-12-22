@@ -3,6 +3,15 @@
  *
  * This code runs immediately after U-Boot jumps to us.
  * U-Boot leaves us at EL2 with MMU off.
+ *
+ * The kernel is linked at virtual address 0xFFFF_0000_4600_0000 (TTBR1)
+ * but loaded by U-Boot at physical address 0x4600_0000.
+ * This boot code enables MMU before calling any Rust code, so that
+ * all symbol references (including vtables) work correctly.
+ *
+ * Key register usage in early boot (before MMU):
+ *   x28 = phys-virt offset (add to virtual addr to get physical)
+ *   x27 = preserved (callee-saved)
  */
 
 .section .text.boot
@@ -83,22 +92,27 @@ el2_setup:
 
 /*
  * EL1 Entry Point
+ *
+ * At this point:
+ * - Running at physical address ~0x46000000
+ * - Symbols contain virtual addresses ~0xFFFF000046000000
+ * - Must enable MMU before using any Rust code
  */
 el1_entry:
     /*
-     * Set up exception vectors (before anything else can fault)
-     * We use the TTBR1 (kernel) virtual address so exception vectors remain
-     * accessible after switching TTBR0 to user address space.
-     * Physical address ~= 0x4600_xxxx, TTBR1 VA = 0xFFFF_0000_4600_xxxx
+     * Compute virtual-to-physical offset.
+     * adr gives us the runtime (physical) address
+     * ldr =symbol gives us the link-time (virtual) address
+     * offset = physical - virtual (negative since virt > phys)
+     *
+     * To convert virtual to physical: phys = virt + offset
      */
-    adr     x0, exception_vectors
-    // Load KERNEL_VIRT_BASE (0xFFFF_0000_0000_0000) using explicit encoding
-    movz    x1, #0xFFFF, lsl #48    // x1 = 0xFFFF000000000000
-    orr     x0, x0, x1              // Convert to kernel VA
-    msr     vbar_el1, x0
+    adr     x28, _start             // x28 = physical address of _start
+    ldr     x0, =_start             // x0 = virtual address of _start
+    sub     x28, x28, x0            // x28 = phys - virt (preserved in x28)
 
     /*
-     * Enable FPU/SIMD (CPACR_EL1)
+     * Enable FPU/SIMD (CPACR_EL1) - needed before any code that might use FP
      * FPEN bits [21:20] = 0b11 enables EL0 and EL1 access
      */
     mov     x0, #(3 << 20)
@@ -106,16 +120,20 @@ el1_entry:
     isb
 
     /*
-     * Set up the stack pointer
+     * Set up temporary stack for early boot (before MMU).
+     * Use physical address of stack.
      */
     ldr     x0, =__stack_top
+    add     x0, x0, x28             // Convert virtual to physical
     mov     sp, x0
 
     /*
-     * Zero out BSS section
+     * Zero out BSS section (using physical addresses)
      */
     ldr     x0, =__bss_start
+    add     x0, x0, x28             // Convert to physical
     ldr     x1, =__bss_end
+    add     x1, x1, x28             // Convert to physical
 bss_loop:
     cmp     x0, x1
     b.ge    bss_done
@@ -124,7 +142,166 @@ bss_loop:
 
 bss_done:
     /*
-     * Jump to Rust entry point
+     * Set up page tables and enable MMU.
+     * After this, we'll be running at virtual addresses.
+     * x28 still contains phys-virt offset.
+     */
+
+    /* Get physical address of page tables */
+    ldr     x0, =boot_l0_ttbr0
+    add     x0, x0, x28             // x0 = phys addr of TTBR0 L0
+    ldr     x1, =boot_l1_ttbr0
+    add     x1, x1, x28             // x1 = phys addr of TTBR0 L1
+    ldr     x2, =boot_l0_ttbr1
+    add     x2, x2, x28             // x2 = phys addr of TTBR1 L0
+    ldr     x3, =boot_l1_ttbr1
+    add     x3, x3, x28             // x3 = phys addr of TTBR1 L1
+
+    /* Initialize TTBR0 L0: entry 0 points to L1 */
+    orr     x4, x1, #3              // Table descriptor: valid + table
+    str     x4, [x0]
+
+    /* Block descriptor flags:
+     * Bit 0: Valid = 1
+     * Bits 4:2: AttrIndx (0 = Device, 1 = Normal)
+     * Bit 10: AF (Access Flag) = 1
+     * For Device: 0x401 = Valid(1) + AF(0x400) + AttrIndx=0
+     * For Normal: 0x405 = Valid(1) + AF(0x400) + AttrIndx=1 (0x4)
+     */
+
+    /* Initialize TTBR0 L1: identity map first 4GB */
+    /* Block 0: 0x00000000 - Device memory (peripherals) */
+    mov     x4, #0x401              // Valid + AF + Device (attr 0)
+    str     x4, [x1, #0]
+    /* Block 1: 0x40000000 - Normal memory (DRAM) */
+    mov     x4, #0x40000000
+    add     x4, x4, #0x405          // Valid + AF + Normal (attr 1)
+    str     x4, [x1, #8]
+    /* Block 2: 0x80000000 - Normal memory (DRAM) */
+    mov     x4, #0x80000000
+    add     x4, x4, #0x405
+    str     x4, [x1, #16]
+    /* Block 3: 0xC0000000 - Normal memory (DRAM) */
+    mov     x4, #0xC0000000
+    add     x4, x4, #0x405
+    str     x4, [x1, #24]
+
+    /* Initialize TTBR1 L0: entry 0 points to L1 */
+    orr     x4, x3, #3              // Table descriptor: valid + table
+    str     x4, [x2]
+
+    /* Initialize TTBR1 L1: map kernel virtual to physical
+     * 0xFFFF_0000_0000_0000 -> 0x0000_0000_0000_0000
+     * Same as identity map, just accessed via high addresses */
+    /* Block 0: Device memory with UXN|PXN */
+    mov     x4, #0x401              // Valid + AF + Device
+    movk    x4, #0x0060, lsl #48    // UXN (bit 54) + PXN (bit 53)
+    str     x4, [x3, #0]
+    /* Block 1: Normal memory with UXN (kernel code) */
+    mov     x4, #0x40000000
+    add     x4, x4, #0x405          // Valid + AF + Normal
+    movk    x4, #0x0040, lsl #48    // UXN (bit 54)
+    str     x4, [x3, #8]
+    /* Block 2-3: Normal memory with UXN */
+    mov     x4, #0x80000000
+    add     x4, x4, #0x405
+    movk    x4, #0x0040, lsl #48
+    str     x4, [x3, #16]
+    mov     x4, #0xC0000000
+    add     x4, x4, #0x405
+    movk    x4, #0x0040, lsl #48
+    str     x4, [x3, #24]
+
+    /* Set MAIR_EL1: Memory Attribute Indirection Register
+     * Attr0: Device-nGnRnE (0x00)
+     * Attr1: Normal Write-Back (0xFF)
+     * Attr2: Normal Non-Cacheable (0x44)
+     */
+    ldr     x4, =0x000000000044FF00
+    msr     mair_el1, x4
+
+    /* Set TCR_EL1: Translation Control Register
+     * T0SZ = 16 (48-bit VA for TTBR0)
+     * T1SZ = 16 (48-bit VA for TTBR1)
+     * TG0 = 0 (4KB granule)
+     * TG1 = 2 (4KB granule)
+     * IPS = 5 (48-bit PA)
+     * IRGN0/ORGN0 = Write-Back
+     * SH0 = Inner Shareable
+     */
+    ldr     x4, =0x00000005B5103510
+    msr     tcr_el1, x4
+
+    /* Set TTBR0_EL1 (user/identity mapping) */
+    msr     ttbr0_el1, x0
+
+    /* Set TTBR1_EL1 (kernel mapping) */
+    msr     ttbr1_el1, x2
+
+    /* Ensure all writes complete */
+    dsb     ish
+    isb
+
+    /* Invalidate TLBs */
+    tlbi    vmalle1is
+    dsb     ish
+    isb
+
+    /* Enable MMU via SCTLR_EL1 */
+    mrs     x4, sctlr_el1
+    orr     x4, x4, #(1 << 0)       // M: Enable MMU
+    orr     x4, x4, #(1 << 2)       // C: Enable data cache
+    orr     x4, x4, #(1 << 12)      // I: Enable instruction cache
+    mov     x5, #(1 << 26)
+    orr     x4, x4, x5              // UCI: Allow cache maint from EL0
+    msr     sctlr_el1, x4
+    isb
+
+    /*
+     * MMU is now enabled. We're still running at physical address
+     * via the TTBR0 identity mapping. Jump to TTBR1 virtual address.
+     */
+    ldr     x0, =post_mmu_entry     // Virtual address
+    br      x0
+
+/*
+ * Post-MMU entry point.
+ * Now running at virtual address 0xFFFF_0000_46xx_xxxx.
+ * Stack already set (still valid via TTBR1).
+ * Can use symbols directly without offset adjustment.
+ */
+post_mmu_entry:
+    /* Re-set stack pointer to virtual address */
+    ldr     x0, =__stack_top
+    mov     sp, x0
+
+    /*
+     * Set up exception vectors using virtual address.
+     * Since we're now running in TTBR1 space, the symbol value is correct.
+     */
+    ldr     x0, =exception_vectors
+    msr     vbar_el1, x0
+
+    /* Store boot page table addresses for use by Rust MMU code */
+    ldr     x0, =boot_l0_ttbr0
+    ldr     x1, =boot_l0_ttbr1
+    /* Convert to physical for TTBR values */
+    adr     x2, _start
+    ldr     x3, =_start
+    sub     x2, x2, x3              // x2 = phys-virt offset
+
+    add     x0, x0, x2              // physical addr of TTBR0 tables
+    add     x1, x1, x2              // physical addr of TTBR1 tables
+
+    /* Store in globals for Rust */
+    adrp    x3, BOOT_TTBR0
+    str     x0, [x3, :lo12:BOOT_TTBR0]
+    adrp    x3, BOOT_TTBR1
+    str     x1, [x3, :lo12:BOOT_TTBR1]
+
+    /*
+     * Jump to Rust entry point.
+     * Rust code now runs with MMU enabled, all symbols valid.
      */
     bl      kmain
 
@@ -170,19 +347,16 @@ secondary_start:
 secondary_el1_entry:
     /* x0 still has CPU ID */
 
-    /* Load stack pointer from per-CPU stacks */
-    /* Stack address = CPU_STACKS + (cpu_id + 1) * CPU_STACK_SIZE */
+    /* Secondary CPUs start with MMU already enabled by primary.
+     * Load stack pointer from per-CPU stacks (virtual address) */
     ldr     x1, =CPU_STACKS
     mov     x2, #(16 * 1024)        // CPU_STACK_SIZE
     add     x3, x0, #1
     mul     x2, x2, x3
     add     sp, x1, x2
 
-    /* Set up VBAR_EL1 to kernel's exception vectors */
+    /* Set up VBAR_EL1 to kernel's exception vectors (virtual address) */
     ldr     x1, =exception_vectors
-    /* Convert to kernel virtual address */
-    mov     x2, #0xffff000000000000
-    orr     x1, x1, x2
     msr     vbar_el1, x1
 
     /* Call Rust secondary CPU entry with CPU ID in x0 */
@@ -341,38 +515,31 @@ irq_from_kernel:
  * IRQ from user mode - save to trap frame, potentially switch tasks
  * Similar to svc_handler but for asynchronous preemption
  *
- * Must switch TTBR0 to kernel identity for vtables to work.
+ * With kernel linked at TTBR1 virtual address, vtables contain virtual
+ * addresses that work directly. No need to switch TTBR0 on entry.
+ * Kernel stack and trap frames are in TTBR1 space, always accessible.
  */
 irq_from_user:
-    /* Save x9 and switch TTBR0 to kernel identity (for vtables) */
-    msr     tpidr_el1, x9           // Save original x9 to scratch register
+    /* Save x9-x12 to kernel stack (which is in TTBR1 space) */
+    stp     x9, x10, [sp, #-16]!
+    stp     x11, x12, [sp, #-16]!
 
-    adrp    x9, KERNEL_TTBR0
-    ldr     x9, [x9, :lo12:KERNEL_TTBR0]
-    msr     ttbr0_el1, x9
-    isb
-
-    /* Now save x10-x12 to kernel stack */
-    stp     x10, x11, [sp, #-16]!
-    str     x12, [sp, #-8]!
-
-    /* Get pointer to current task's trap frame */
+    /* Get pointer to current task's trap frame (already a virtual address) */
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
-    /* Save all general purpose registers to trap frame (now via TTBR1) */
+    /* Save all general purpose registers to trap frame */
     stp     x0, x1, [x9, #0]        // x0=0, x1=8
     stp     x2, x3, [x9, #16]       // x2=16, x3=24
     stp     x4, x5, [x9, #32]       // x4=32, x5=40
     stp     x6, x7, [x9, #48]       // x6=48, x7=56
     str     x8, [x9, #64]           // x8=64
-    /* Get original x9-x12 from their temp locations */
-    mrs     x10, tpidr_el1          // x10 = original x9
-    ldr     x11, [sp], #8           // x11 = original x12
+    /* Get original x9-x12 from stack */
+    ldp     x10, x11, [sp], #16     // x10 = original x11, x11 = original x12
     str     x11, [x9, #96]          // x12=96
-    ldp     x11, x12, [sp], #16     // x11 = original x10, x12 = original x11
+    str     x10, [x9, #88]          // x11=88
+    ldp     x10, x11, [sp], #16     // x10 = original x9, x11 = original x10
     stp     x10, x11, [x9, #72]     // x9=72, x10=80
-    str     x12, [x9, #88]          // x11=88
     str     x13, [x9, #104]         // x13=104
     stp     x14, x15, [x9, #112]    // x14=112, x15=120
     stp     x16, x17, [x9, #128]    // x16=128, x17=136
@@ -412,20 +579,15 @@ irq_from_user:
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
-    /* Always switch TTBR0 back to current task's user address space.
-     * We switched to kernel identity on entry, must switch back.
-     * Always do TLBI to avoid TLB conflict. */
+    /* Switch TTBR0 to current task's user address space for eret.
+     * Use TLBI to ensure no stale TLB entries. */
     adrp    x10, CURRENT_TTBR0
     ldr     x10, [x10, :lo12:CURRENT_TTBR0]
     msr     ttbr0_el1, x10
     isb
     tlbi    vmalle1
-    dsb     sy
+    dsb     ish
     isb
-
-    /* Convert trap frame pointer to TTBR1 for access after TTBR0 switch */
-    movz    x10, #0xFFFF, lsl #48
-    orr     x9, x9, x10
 
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]         // sp_el0
@@ -434,8 +596,8 @@ irq_from_user:
     msr     sp_el0, x10
     msr     elr_el1, x11
     msr     spsr_el1, x12
+
     /* Restore all general purpose registers from trap frame */
-    /* x9 already holds TTBR1 virtual address */
     ldp     x0, x1, [x9, #0]
     ldp     x2, x3, [x9, #16]
     ldp     x4, x5, [x9, #32]
@@ -464,26 +626,16 @@ irq_from_user:
  * SVC (Syscall) handler
  * Saves full user state to CURRENT_TRAP_FRAME, handles syscall,
  * then restores from CURRENT_TRAP_FRAME (which may be a different task after scheduling)
+ *
+ * With kernel linked at TTBR1 virtual address, vtables contain virtual
+ * addresses that work directly. No need to switch TTBR0 on entry.
  */
 svc_handler:
-    /*
-     * Switch TTBR0 to kernel identity mapping.
-     * This is required because Rust vtables contain physical addresses.
-     * SP is a TTBR1 address but indirect calls (blr) need physical addresses mapped.
-     */
-    msr     tpidr_el1, x9           // Save original x9 to scratch register
+    /* Save x9-x12 to kernel stack (which is in TTBR1 space) */
+    stp     x9, x10, [sp, #-16]!
+    stp     x11, x12, [sp, #-16]!
 
-    /* Switch to kernel TTBR0 - adrp generates TTBR1 address (PC-relative) */
-    adrp    x9, KERNEL_TTBR0
-    ldr     x9, [x9, :lo12:KERNEL_TTBR0]
-    msr     ttbr0_el1, x9
-    isb
-
-    /* Now kernel code can use vtables - save x10, x11, x12 to stack */
-    stp     x10, x11, [sp, #-16]!
-    str     x12, [sp, #-8]!
-
-    /* Get pointer to current task's trap frame */
+    /* Get pointer to current task's trap frame (already a virtual address) */
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
@@ -494,13 +646,12 @@ svc_handler:
     stp     x4, x5, [x9, #32]       // x4=32, x5=40
     stp     x6, x7, [x9, #48]       // x6=48, x7=56
     str     x8, [x9, #64]           // x8=64
-    /* Get original x9-x12 from their temp locations */
-    mrs     x10, tpidr_el1          // x10 = original x9
-    ldr     x11, [sp], #8           // x11 = original x12
+    /* Get original x9-x12 from stack */
+    ldp     x10, x11, [sp], #16     // x10 = original x11, x11 = original x12
     str     x11, [x9, #96]          // x12=96
-    ldp     x11, x12, [sp], #16     // x11 = original x10, x12 = original x11
+    str     x10, [x9, #88]          // x11=88
+    ldp     x10, x11, [sp], #16     // x10 = original x9, x11 = original x10
     stp     x10, x11, [x9, #72]     // x9=72, x10=80
-    str     x12, [x9, #88]          // x11=88
     str     x13, [x9, #104]         // x13=104
     stp     x14, x15, [x9, #112]    // x14=112, x15=120
     stp     x16, x17, [x9, #128]    // x16=128, x17=136
@@ -535,36 +686,42 @@ svc_handler:
     ldr     x7, [x9, #64]           // syscall number (was x8)
     bl      syscall_handler_rust
 
-    /* syscall_handler_rust may have scheduled a different task */
+    /* Save syscall return value temporarily */
+    mov     x19, x0
+
+    /* Check if syscall already switched tasks */
+    adrp    x10, SYSCALL_SWITCHED_TASK
+    ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    cbnz    x10, .Lsvc_already_switched
+
+    /* Syscall didn't switch - check if reschedule is needed (e.g., task blocked on IPC) */
+    bl      do_resched_if_needed
+
+.Lsvc_already_switched:
+    /* syscall_handler_rust or do_resched_if_needed may have scheduled a different task */
     /* Reload CURRENT_TRAP_FRAME (may have changed!) */
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
-    /* Check if syscall switched tasks - only store return value if same task */
+    /* Check if we switched tasks - only store return value if same task */
     adrp    x10, SYSCALL_SWITCHED_TASK
     ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
     cbnz    x10, .Lsvc_skip_retval
 
     /* Same task: store syscall return value */
-    str     x0, [x9, #0]
+    str     x19, [x9, #0]
 
 .Lsvc_skip_retval:
-    /* Always switch TTBR0 back to current task's user address space.
-     * We switched to kernel identity mapping on entry, must switch back.
-     * Always do TLBI because kernel TTBR0 (1GB blocks) and user TTBR0 (4KB pages)
-     * create conflicting TLB entries for the same virtual addresses.
-     * TODO: Use ASIDs to avoid TLBI on every syscall. */
+    /* Switch TTBR0 to current task's user address space for eret.
+     * Use TLBI to ensure no stale TLB entries. */
     adrp    x10, CURRENT_TTBR0
     ldr     x10, [x10, :lo12:CURRENT_TTBR0]
     msr     ttbr0_el1, x10
     isb
     tlbi    vmalle1
-    dsb     sy
+    dsb     ish
     isb
 
-    /* Convert trap frame pointer to TTBR1 address for access after TTBR0 switch */
-    movz    x10, #0xFFFF, lsl #48
-    orr     x9, x9, x10
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]         // sp_el0
     ldr     x11, [x9, #256]         // elr_el1
@@ -574,7 +731,6 @@ svc_handler:
     msr     spsr_el1, x12
 
     /* Restore all general purpose registers from trap frame */
-    /* x9 already holds TTBR1 virtual address of trap frame */
     ldp     x0, x1, [x9, #0]        // x0=0, x1=8
     ldp     x2, x3, [x9, #16]       // x2=16, x3=24
     ldp     x4, x5, [x9, #32]       // x4=32, x5=40
@@ -598,3 +754,49 @@ svc_handler:
 
     /* Return to user mode (possibly different task!) */
     eret
+
+/* =============================================================================
+ * Data Section - Boot Page Tables
+ * =============================================================================
+ * These page tables are used during early boot before Rust MMU code runs.
+ * They provide identity mapping (TTBR0) and kernel mapping (TTBR1).
+ *
+ * L0 table: 512 entries, each covers 512GB
+ * L1 table: 512 entries, each covers 1GB (block descriptors)
+ *
+ * We only need entry 0 in L0 (pointing to L1), and entries 0-3 in L1
+ * (covering 0-4GB for peripherals and DRAM).
+ */
+
+.section .data
+.balign 4096
+.global boot_l0_ttbr0
+boot_l0_ttbr0:
+    .fill 512, 8, 0             // 512 entries, all zero initially
+
+.balign 4096
+.global boot_l1_ttbr0
+boot_l1_ttbr0:
+    .fill 512, 8, 0             // 512 entries, all zero initially
+
+.balign 4096
+.global boot_l0_ttbr1
+boot_l0_ttbr1:
+    .fill 512, 8, 0             // 512 entries, all zero initially
+
+.balign 4096
+.global boot_l1_ttbr1
+boot_l1_ttbr1:
+    .fill 512, 8, 0             // 512 entries, all zero initially
+
+/* Global variables for Rust MMU code */
+.section .data
+.balign 8
+.global BOOT_TTBR0
+BOOT_TTBR0:
+    .quad 0                     // Physical address of boot TTBR0 L0 table
+
+.balign 8
+.global BOOT_TTBR1
+BOOT_TTBR1:
+    .quad 0                     // Physical address of boot TTBR1 L0 table
