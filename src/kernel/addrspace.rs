@@ -2,12 +2,89 @@
 //!
 //! Manages per-process virtual address spaces using the PMM for page table allocation.
 //! Each process gets its own page tables loaded into TTBR0 during context switch.
+//!
+//! ASID (Address Space ID) support:
+//! - Each address space gets a unique 8-bit ASID (256 values, 0 reserved)
+//! - ASID is encoded in TTBR0 bits [63:48] for hardware tagging
+//! - Allows per-ASID TLB invalidation instead of global flush
 
 #![allow(dead_code)]
 
 use crate::arch::aarch64::mmu::{self, KERNEL_VIRT_BASE, flags, attr};
 use super::pmm;
 use crate::logln;
+
+// ============================================================================
+// ASID Allocator
+// ============================================================================
+
+/// Maximum ASID value (8-bit ASIDs, 0 reserved for kernel)
+const MAX_ASID: u16 = 255;
+
+/// ASID allocator - simple bitmap for 255 ASIDs (ASID 0 reserved)
+struct AsidAllocator {
+    /// Bitmap: bit N = 1 if ASID N+1 is in use
+    bitmap: [u64; 4],  // 256 bits
+    /// Next ASID to try (for faster allocation)
+    next_hint: u16,
+}
+
+impl AsidAllocator {
+    const fn new() -> Self {
+        Self {
+            bitmap: [0; 4],
+            next_hint: 1,  // Start at ASID 1 (0 reserved)
+        }
+    }
+
+    /// Allocate an ASID, returns None if all exhausted
+    fn alloc(&mut self) -> Option<u16> {
+        // Try from hint first
+        for _ in 0..MAX_ASID {
+            let asid = self.next_hint;
+            if asid == 0 || asid > MAX_ASID {
+                self.next_hint = 1;
+                continue;
+            }
+
+            let word = (asid - 1) as usize / 64;
+            let bit = (asid - 1) as usize % 64;
+
+            if (self.bitmap[word] & (1u64 << bit)) == 0 {
+                // Found free ASID
+                self.bitmap[word] |= 1u64 << bit;
+                self.next_hint = if asid < MAX_ASID { asid + 1 } else { 1 };
+                return Some(asid);
+            }
+
+            self.next_hint = if asid < MAX_ASID { asid + 1 } else { 1 };
+        }
+        None  // All ASIDs in use
+    }
+
+    /// Free an ASID
+    fn free(&mut self, asid: u16) {
+        if asid == 0 || asid > MAX_ASID {
+            return;
+        }
+        let word = (asid - 1) as usize / 64;
+        let bit = (asid - 1) as usize % 64;
+        self.bitmap[word] &= !(1u64 << bit);
+    }
+}
+
+/// Global ASID allocator
+static mut ASID_ALLOCATOR: AsidAllocator = AsidAllocator::new();
+
+/// Allocate an ASID
+fn alloc_asid() -> Option<u16> {
+    unsafe { ASID_ALLOCATOR.alloc() }
+}
+
+/// Free an ASID
+fn free_asid(asid: u16) {
+    unsafe { ASID_ALLOCATOR.free(asid) }
+}
 
 /// Convert a physical address to a kernel virtual address for access via TTBR1
 #[inline(always)]
@@ -30,6 +107,8 @@ pub const USER_SPACE_END: u64 = 0x0000_0001_0000_0000;
 pub struct AddressSpace {
     /// Physical address of L0 page table (loaded into TTBR0)
     pub ttbr0: u64,
+    /// ASID for this address space (1-255, 0 = none allocated)
+    asid: u16,
     /// Physical addresses of allocated page tables (for cleanup)
     page_tables: [u64; 16],  // L0 + L1 + some L2/L3
     num_tables: usize,
@@ -38,6 +117,9 @@ pub struct AddressSpace {
 impl AddressSpace {
     /// Create a new empty address space
     pub fn new() -> Option<Self> {
+        // Allocate ASID for this address space
+        let asid = alloc_asid().unwrap_or(0);
+
         // Allocate L0 table
         let l0_phys = pmm::alloc_page()?;
 
@@ -67,6 +149,7 @@ impl AddressSpace {
 
         Some(Self {
             ttbr0: l0_phys as u64,
+            asid,
             page_tables: {
                 let mut tables = [0u64; 16];
                 tables[0] = l0_phys as u64;
@@ -500,14 +583,29 @@ impl AddressSpace {
         mmu::switch_user_space(self.ttbr0);
     }
 
-    /// Get the TTBR0 value for this address space
+    /// Get the TTBR0 value for this address space (includes ASID in bits [63:48])
     pub fn get_ttbr0(&self) -> u64 {
-        self.ttbr0
+        // Encode ASID in upper 16 bits of TTBR0
+        // Hardware uses bits [63:48] for ASID when TCR_EL1.A1 = 0
+        self.ttbr0 | ((self.asid as u64) << 48)
+    }
+
+    /// Get the ASID for this address space
+    pub fn get_asid(&self) -> u16 {
+        self.asid
     }
 }
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        // Invalidate TLB entries for this ASID before freeing
+        if self.asid != 0 {
+            unsafe {
+                mmu::invalidate_asid(self.asid);
+            }
+            free_asid(self.asid);
+        }
+
         // Free all allocated page tables
         for i in 0..self.num_tables {
             if self.page_tables[i] != 0 {

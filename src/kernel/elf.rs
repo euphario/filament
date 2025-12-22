@@ -367,6 +367,9 @@ pub const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
 /// User stack size (64KB)
 pub const USER_STACK_SIZE: usize = 64 * 1024;
 
+/// Guard page size (4KB) - unmapped page below stack to catch overflow
+pub const USER_GUARD_PAGE_SIZE: usize = 4096;
+
 /// Spawn a new process from an ELF binary
 /// Returns (task_id, task_slot) on success
 pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), ElfError> {
@@ -396,8 +399,17 @@ pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::Task
     let stack_pages = USER_STACK_SIZE / 4096;
     let stack_phys = pmm::alloc_pages(stack_pages).ok_or(ElfError::OutOfMemory)?;
 
-    // Map user stack (at USER_STACK_TOP - USER_STACK_SIZE to USER_STACK_TOP)
-    let stack_base_virt = USER_STACK_TOP - USER_STACK_SIZE as u64;
+    // Map user stack with guard page below
+    // Layout (addresses grow up):
+    //   [guard page - NOT MAPPED - will fault on access]  <- catches stack overflow
+    //   [usable stack pages]
+    //   [USER_STACK_TOP - 1]  <- initial SP points here
+    //
+    // Guard page virtual address (not mapped - any access faults)
+    let guard_page_virt = USER_STACK_TOP - USER_STACK_SIZE as u64 - USER_GUARD_PAGE_SIZE as u64;
+    let stack_base_virt = guard_page_virt + USER_GUARD_PAGE_SIZE as u64;
+
+    // Only map the usable stack pages (guard page left unmapped)
     for i in 0..stack_pages {
         let page_virt = stack_base_virt + (i * 4096) as u64;
         let page_phys = (stack_phys + i * 4096) as u64;
@@ -406,6 +418,9 @@ pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::Task
             return Err(ElfError::OutOfMemory);
         }
     }
+
+    // Note: guard_page_virt is intentionally NOT mapped
+    // Any stack overflow that reaches it will trigger a page fault
 
     // Set up the trap frame with entry point and user stack
     let task = unsafe {

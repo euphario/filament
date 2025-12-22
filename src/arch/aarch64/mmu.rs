@@ -169,16 +169,43 @@ pub fn boot_ttbr1() -> u64 {
 }
 
 /// Switch to a new user address space (change TTBR0)
+/// With ASID support, TTBR0 should include the ASID in bits [63:48].
+/// We don't need to flush TLB on context switch since entries are ASID-tagged.
 /// # Safety
 /// The page table must be valid and properly set up
-pub unsafe fn switch_user_space(ttbr0_phys: u64) {
+pub unsafe fn switch_user_space(ttbr0_with_asid: u64) {
     core::arch::asm!(
-        "msr ttbr0_el1, {}",
+        "msr ttbr0_el1, {0}",
         "isb",
-        "tlbi vmalle1is",  // Invalidate all TLB entries
+        // No TLB flush needed - entries are ASID-tagged
+        in(reg) ttbr0_with_asid
+    );
+}
+
+/// Invalidate TLB entries for a specific ASID
+/// Call this when an address space is destroyed to free TLB resources
+/// # Safety
+/// The ASID must be valid (1-255)
+pub unsafe fn invalidate_asid(asid: u16) {
+    // tlbi aside1is, <Xt> - Invalidate by ASID, Inner Shareable
+    // Xt contains ASID in bits [63:48], other bits are ignored
+    let asid_val = (asid as u64) << 48;
+    core::arch::asm!(
+        "tlbi aside1is, {0}",
         "dsb ish",
         "isb",
-        in(reg) ttbr0_phys
+        in(reg) asid_val
+    );
+}
+
+/// Invalidate all TLB entries (for cases where ASID is not available)
+/// # Safety
+/// This is a heavyweight operation - use sparingly
+pub unsafe fn invalidate_all_tlb() {
+    core::arch::asm!(
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb"
     );
 }
 

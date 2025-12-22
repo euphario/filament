@@ -1367,10 +1367,12 @@ pub unsafe fn update_current_task_globals() {
 
         if let Some(ref addr_space) = task.address_space {
             let ttbr0 = addr_space.get_ttbr0();
+            // Extract physical address (bits [47:0], mask out ASID in bits [63:48])
+            let ttbr0_phys = ttbr0 & 0x0000_FFFF_FFFF_FFFF;
 
-            // Defensive check: TTBR0 should be a valid physical address in DRAM (>= 0x40000000)
+            // Defensive check: physical address should be valid DRAM (>= 0x40000000)
             // and properly aligned (4KB page table)
-            if ttbr0 < 0x4000_0000 || ttbr0 >= 0x1_0000_0000 || (ttbr0 & 0xFFF) != 0 {
+            if ttbr0_phys < 0x4000_0000 || ttbr0_phys >= 0x1_0000_0000 || (ttbr0_phys & 0xFFF) != 0 {
                 crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: invalid TTBR0=0x");
                 // Print hex value
                 for i in (0..16).rev() {
