@@ -22,7 +22,8 @@
 mod device;
 
 use device::{is_msc_bbb, is_hub_class};
-use userlib::{println, print, logln, flush_log, syscall};
+use userlib::{println, print, syscall};
+use userlib::syscall::O_NONBLOCK;
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 
 // Import from the usb driver library
@@ -257,15 +258,33 @@ impl UsbDriver {
     /// Wait for xHCI interrupt (blocking)
     /// Now uses kernel blocking - read() will block until IRQ fires
     /// The timeout_ms parameter is currently ignored as the kernel handles blocking
-    fn wait_for_irq(&self, _timeout_ms: u32) -> bool {
+    fn wait_for_irq(&self, timeout_ms: u32) -> bool {
         if self.irq_fd < 0 {
             return false;
         }
 
         let mut buf = [0u8; 4];
-        // Blocking read - kernel will wake us when IRQ fires
-        let result = syscall::read(self.irq_fd as u32, &mut buf);
-        result > 0
+
+        // Poll with timeout using non-blocking read and gettime
+        let start = syscall::gettime();
+        let timeout_ns = (timeout_ms as u64) * 1_000_000;
+
+        loop {
+            // Try non-blocking read
+            let result = syscall::read(self.irq_fd as u32, &mut buf);
+            if result > 0 {
+                return true;
+            }
+
+            // Check timeout
+            let elapsed = syscall::gettime() - start;
+            if elapsed >= timeout_ns {
+                return false;
+            }
+
+            // Yield to scheduler
+            syscall::yield_now();
+        }
     }
 
     fn init(&mut self) -> bool {
@@ -452,7 +471,7 @@ impl UsbDriver {
                                     self.queue_hub_status_transfer();
                                 }
                             } else {
-                                logln!("[usbd] Hub interrupt error: cc={}", cc);
+                                println!("[usbd] Hub interrupt error: cc={}", cc);
                                 self.queue_hub_status_transfer();
                             }
                         }
@@ -518,13 +537,13 @@ impl UsbDriver {
             if status.connected {
                 // Device connected - check if not already enumerated
                 if (self.enumerated_ports & port_mask) == 0 {
-                    logln!("[usbd] Device connected on port {}", port_id);
+                    println!("[usbd] Device connected on port {}", port_id);
                     return Some(port_id);
                 }
             } else {
                 // Device disconnected - mark as not enumerated
                 if (self.enumerated_ports & port_mask) != 0 {
-                    logln!("[usbd] Device disconnected from port {}", port_id);
+                    println!("[usbd] Device disconnected from port {}", port_id);
                     self.enumerated_ports &= !port_mask;
                     // TODO: Clean up device resources
                 }
@@ -630,12 +649,12 @@ impl UsbDriver {
     /// Called when a new device is detected via port status change event
     /// Includes retry logic for flaky USB devices
     fn enumerate_port(&mut self, port: u32) -> Option<u32> {
-        logln!("[usbd] Enumerating port {}...", port);
+        println!("[usbd] Enumerating port {}...", port);
 
         // Retry the entire enumeration process
         for attempt in 0..3 {
             if attempt > 0 {
-                logln!("[usbd]   Retry {} for port {}", attempt, port);
+                println!("[usbd]   Retry {} for port {}", attempt, port);
                 delay_ms(200);
             }
 
@@ -645,19 +664,19 @@ impl UsbDriver {
             let status = ParsedPortsc::from_raw(raw);
 
             if attempt == 0 {
-                logln!("[usbd]   PORTSC: connected={} enabled={} speed={}",
+                println!("[usbd]   PORTSC: connected={} enabled={} speed={}",
                          status.connected, status.enabled, status.speed.as_str());
             }
 
             if !status.connected {
-                logln!("[usbd]   Port {} not connected", port);
+                println!("[usbd]   Port {} not connected", port);
                 return None;
             }
 
             // Reset the port first (unless already enabled)
             if !status.enabled {
                 if !self.reset_port(port) {
-                    logln!("[usbd]   Port {} reset failed", port);
+                    println!("[usbd]   Port {} reset failed", port);
                     continue; // Retry
                 }
                 // Small delay after reset
@@ -670,19 +689,19 @@ impl UsbDriver {
                 if port > 0 && port <= 32 {
                     self.enumerated_ports |= 1 << (port - 1);
                 }
-                logln!("[usbd]   Port {} enumerated as slot {}", port, slot_id);
+                println!("[usbd]   Port {} enumerated as slot {}", port, slot_id);
                 return Some(slot_id);
             }
             // enumerate_device failed, will retry
         }
 
-        logln!("[usbd]   Port {} enumeration failed after 3 attempts", port);
+        println!("[usbd]   Port {} enumeration failed after 3 attempts", port);
         None
     }
 
     /// Enumerate all ports in a bitmask
     fn enumerate_pending_ports(&mut self, ports_mask: u32) {
-        logln!("[usbd] enumerate_pending_ports: mask=0x{:x}", ports_mask);
+        println!("[usbd] enumerate_pending_ports: mask=0x{:x}", ports_mask);
         for bit in 0..32 {
             if (ports_mask & (1 << bit)) != 0 {
                 let port = bit + 1;  // Ports are 1-based
@@ -832,6 +851,8 @@ impl UsbDriver {
             } else {
                 println!(" - Address failed (no event)");
             }
+            // Clean up allocated DMA buffer on failure
+            syscall::munmap(ctx_virt as u64, 4096);
             return None;
         }
 
@@ -950,6 +971,9 @@ impl UsbDriver {
         } else {
             println!(" - Descriptor failed");
         }
+
+        // Free temporary descriptor buffer
+        syscall::munmap(desc_virt as u64, 4096);
 
         Some(slot_id)
     }
@@ -1262,7 +1286,10 @@ impl UsbDriver {
         // Allocate status buffer (1 byte for hub status bitmap)
         let mut status_phys: u64 = 0;
         let status_virt = syscall::mmap_dma(4096, &mut status_phys);
-        if status_virt < 0 { return false; }
+        if status_virt < 0 {
+            syscall::munmap(int_ring_virt as u64, 4096);
+            return false;
+        }
 
         // Initialize interrupt ring with Link TRB at index 15
         unsafe {
@@ -1286,7 +1313,11 @@ impl UsbDriver {
         // Allocate Input Context for Configure Endpoint
         let mut input_ctx_phys: u64 = 0;
         let input_ctx_virt = syscall::mmap_dma(4096, &mut input_ctx_phys);
-        if input_ctx_virt < 0 { return false; }
+        if input_ctx_virt < 0 {
+            syscall::munmap(int_ring_virt as u64, 4096);
+            syscall::munmap(status_virt as u64, 4096);
+            return false;
+        }
 
         // Set up Input Context
         unsafe {
@@ -1348,8 +1379,13 @@ impl UsbDriver {
             }
         }
 
+        // Free temporary input context - no longer needed after command
+        syscall::munmap(input_ctx_virt as u64, 4096);
+
         if !cmd_success {
             println!("    CONFIGURE_ENDPOINT for hub interrupt failed");
+            syscall::munmap(int_ring_virt as u64, 4096);
+            syscall::munmap(status_virt as u64, 4096);
             return false;
         }
 
@@ -1468,7 +1504,7 @@ impl UsbDriver {
             (hub.slot_id, hub.num_ports, hub.hub_port, hub.ep0_ring, hub.ep0_ring_phys, hub.ep0_enqueue, hub.ep0_cycle)
         };
 
-        logln!("[usbd] Hub status change: bitmap=0x{:02x}", status_bitmap);
+        println!("[usbd] Hub status change: bitmap=0x{:02x}", status_bitmap);
 
         // Allocate buffer for port status queries
         let mut buf_phys: u64 = 0;
@@ -2016,7 +2052,10 @@ impl UsbDriver {
         {
             let cmd_ring = match self.cmd_ring.as_mut() {
                 Some(r) => r,
-                None => return,
+                None => {
+                    syscall::munmap(ctx_virt as u64, 4096);
+                    return;
+                }
             };
             let mut trb = Trb::new();
             trb.param = input_ctx_phys;
@@ -2067,6 +2106,7 @@ impl UsbDriver {
         };
 
         if !addr_ok {
+            syscall::munmap(ctx_virt as u64, 4096);
             return;
         }
 
@@ -2079,6 +2119,8 @@ impl UsbDriver {
         let mut desc_phys: u64 = 0;
         let desc_virt = syscall::mmap_dma(4096, &mut desc_phys);
         if desc_virt < 0 {
+            // Note: ctx_virt is needed for the addressed device, don't free it here
+            // The device is successfully addressed, just can't read descriptor
             return;
         }
 
@@ -2119,6 +2161,9 @@ impl UsbDriver {
                 println!("[hub] Port {}: Descriptor timeout", hub_port);
             }
         }
+
+        // Free temporary descriptor buffer
+        syscall::munmap(desc_virt as u64, 4096);
     }
 
     /// Configure a mass storage device
@@ -2284,7 +2329,10 @@ impl UsbDriver {
 
         let mut bulk_out_ring_phys: u64 = 0;
         let bulk_out_ring_virt = syscall::mmap_dma(4096, &mut bulk_out_ring_phys);
-        if bulk_out_ring_virt < 0 { return; }
+        if bulk_out_ring_virt < 0 {
+            syscall::munmap(bulk_in_ring_virt as u64, 4096);
+            return;
+        }
 
         // Initialize transfer rings with Link TRBs (BULK_RING_SIZE entries)
         unsafe {
@@ -2325,7 +2373,11 @@ impl UsbDriver {
         // Allocate Input Context for Configure Endpoint command
         let mut input_ctx_phys: u64 = 0;
         let input_ctx_virt = syscall::mmap_dma(4096, &mut input_ctx_phys);
-        if input_ctx_virt < 0 { return; }
+        if input_ctx_virt < 0 {
+            syscall::munmap(bulk_in_ring_virt as u64, 4096);
+            syscall::munmap(bulk_out_ring_virt as u64, 4096);
+            return;
+        }
 
         // Set up Input Context for Configure Endpoint
         unsafe {
@@ -2393,7 +2445,14 @@ impl UsbDriver {
             }
         }
 
-        if !config_ok { return; }
+        // Free temporary input context
+        syscall::munmap(input_ctx_virt as u64, 4096);
+
+        if !config_ok {
+            syscall::munmap(bulk_in_ring_virt as u64, 4096);
+            syscall::munmap(bulk_out_ring_virt as u64, 4096);
+            return;
+        }
 
         // Invalidate device context after xHCI wrote to it
         invalidate_buffer(device_ctx_virt as u64, core::mem::size_of::<DeviceContext>());
@@ -2401,7 +2460,12 @@ impl UsbDriver {
         // Allocate data buffer for SCSI commands
         let mut data_phys: u64 = 0;
         let data_virt = syscall::mmap_dma(4096, &mut data_phys);
-        if data_virt < 0 { return; }
+        if data_virt < 0 {
+            // Endpoints configured but no data buffer - cleanup rings
+            syscall::munmap(bulk_in_ring_virt as u64, 4096);
+            syscall::munmap(bulk_out_ring_virt as u64, 4096);
+            return;
+        }
 
         let mut ctx = BulkContext::new(
             slot_id, bulk_in_dci, bulk_out_dci,
@@ -2803,7 +2867,59 @@ impl UsbDriver {
         }
 
         println!("    READ_CAPACITY failed: {:?}", result);
+        // Get sense data to see what went wrong
+        self.scsi_request_sense(ctx);
         None
+    }
+
+    /// SCSI REQUEST_SENSE - get error information after a failed command
+    fn scsi_request_sense(&mut self, ctx: &mut BulkContext) {
+        let (cmd, data_length) = scsi::build_request_sense(18);  // Standard 18-byte sense data
+
+        let (result, csw) = self.scsi_command_in(ctx, &cmd, data_length);
+
+        if let Some(csw) = csw {
+            if csw.signature == msc::CSW_SIGNATURE && csw.status == msc::CSW_STATUS_PASSED {
+                unsafe {
+                    let resp_ptr = ctx.data_buf.add(DATA_OFFSET);
+                    ctx.invalidate_buffer(resp_ptr as u64, 18);
+                    let data = core::slice::from_raw_parts(resp_ptr, 18);
+
+                    // Parse sense data
+                    let sense_key = data[2] & 0x0F;
+                    let asc = data[12];  // Additional Sense Code
+                    let ascq = data[13]; // Additional Sense Code Qualifier
+
+                    let sense_name = match sense_key {
+                        0x00 => "NO SENSE",
+                        0x01 => "RECOVERED ERROR",
+                        0x02 => "NOT READY",
+                        0x03 => "MEDIUM ERROR",
+                        0x04 => "HARDWARE ERROR",
+                        0x05 => "ILLEGAL REQUEST",
+                        0x06 => "UNIT ATTENTION",
+                        0x07 => "DATA PROTECT",
+                        0x0B => "ABORTED COMMAND",
+                        _ => "OTHER",
+                    };
+
+                    println!("    SENSE: {} (key=0x{:02x}, ASC=0x{:02x}, ASCQ=0x{:02x})",
+                             sense_name, sense_key, asc, ascq);
+
+                    // Common ASC/ASCQ combinations
+                    match (asc, ascq) {
+                        (0x04, 0x01) => println!("           -> Logical unit is in process of becoming ready"),
+                        (0x04, 0x02) => println!("           -> Initializing command required"),
+                        (0x28, 0x00) => println!("           -> Not ready to ready transition"),
+                        (0x29, 0x00) => println!("           -> Power on, reset, or bus device reset"),
+                        (0x3A, 0x00) => println!("           -> Medium not present"),
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            println!("    REQUEST_SENSE failed: {:?}", result);
+        }
     }
 
     /// SCSI TEST_UNIT_READY - check if device is ready
@@ -3912,14 +4028,14 @@ impl BlockServer {
         let ring = match BlockRing::create(64, 1024 * 1024) {
             Some(r) => r,
             None => {
-                logln!("[usbd] Failed to create ring buffer");
+                println!("[usbd] Failed to create ring buffer");
                 return false;
             }
         };
 
         // Grant client permission to map the shared memory
         if !ring.allow(self.client_pid) {
-            logln!("[usbd] Failed to allow client access to ring");
+            println!("[usbd] Failed to allow client access to ring");
             return false;
         }
 
@@ -4010,7 +4126,7 @@ impl BlockServer {
                 BlockResponse::ok(req.tag, bytes_read as u32)
             },
             None => {
-                logln!("[usbd] READ: DMA failed");
+                println!("[usbd] READ: DMA failed");
                 BlockResponse::error(req.tag, -5) // EIO
             }
         }
@@ -4111,8 +4227,9 @@ fn main() {
     delay_ms(10);
 
     // Register for IRQ BEFORE polling events (so we don't miss any)
+    // Open with O_NONBLOCK so wait_for_irq can implement proper timeout
     let irq_url = format_irq_url(config.irq);
-    let irq_fd = syscall::scheme_open(&irq_url, 0);
+    let irq_fd = syscall::scheme_open(&irq_url, O_NONBLOCK);
     if irq_fd >= 0 {
         driver.set_irq_fd(irq_fd);
     }
@@ -4155,7 +4272,7 @@ fn main() {
     while driver.msc_device.is_none() && wait_count < 50 {
         wait_count += 1;
         if wait_count % 10 == 1 {
-            logln!("[usbd] Waiting for MSC device... ({}/50)", wait_count);
+            println!("[usbd] Waiting for MSC device... ({}/50)", wait_count);
         }
 
         delay_ms(100);
@@ -4174,7 +4291,7 @@ fn main() {
 
     // Now that MSC is ready, register the "usb" port
     // Clients (fatfs) will have been blocking on port_connect() until now
-    logln!("[usbd] MSC device ready, registering 'usb' port...");
+    println!("[usbd] MSC device ready, registering 'usb' port...");
     let port_result = syscall::port_register(b"usb");
     if port_result < 0 {
         if port_result == -17 {
@@ -4185,7 +4302,7 @@ fn main() {
         syscall::exit(1);
     }
     let usb_port = port_result as u32;
-    logln!("[usbd] Port registered, ready to accept connections");
+    println!("[usbd] Port registered, ready to accept connections");
 
     // Initialize client tracking
     const MAX_CLIENTS: usize = 4;
@@ -4205,7 +4322,7 @@ fn main() {
                 if clients[i].is_none() {
                     clients[i] = Some(client);
                     num_clients += 1;
-                    logln!("[usbd] Client {} connected", num_clients);
+                    println!("[usbd] Client {} connected", num_clients);
                     break;
                 }
             }
@@ -4213,22 +4330,31 @@ fn main() {
     }
 
     // Daemonize
-    logln!("[usbd] About to daemonize, num_clients={}", num_clients);
+    println!("[usbd] About to daemonize, num_clients={}", num_clients);
     let result = syscall::daemonize();
-    logln!("[usbd] daemonize returned {}", result);
+    println!("[usbd] daemonize returned {}", result);
     if result == 0 {
         println!("USB daemon running (ring buffer mode)");
         // Resync event ring before daemon loop - drain any pending events and update ERDP
+        println!("[usbd] Resyncing event ring...");
         driver.resync_event_ring();
+        println!("[usbd] Event ring resynced, entering daemon loop");
 
         // clients array already initialized above (may have connections from init phase)
         let mut heartbeat_counter = 0u32;
+        println!("[usbd] About to enter main loop");
 
+        let mut first_iteration = true;
         loop {
             heartbeat_counter += 1;
+            if first_iteration {
+                println!("[usbd] First loop iteration");
+                first_iteration = false;
+            }
 
-            // Reset heartbeat counter
+            // Reset heartbeat counter and print heartbeat every ~100s
             if heartbeat_counter >= 10000 {
+                println!("[usbd] heartbeat");
                 heartbeat_counter = 0;
             }
 
@@ -4247,14 +4373,14 @@ fn main() {
             // Accept new client connections
             let accept_result = syscall::port_accept(usb_port);
             if accept_result > 0 && num_clients < MAX_CLIENTS {
-                logln!("[usbd] port_accept returned {} - accepting client", accept_result);
+                println!("[usbd] port_accept returned {} - accepting client", accept_result);
                 let client_channel = accept_result as u32;
 
                 // Create BlockServer and complete handshake
                 let mut client = BlockServer::new(client_channel);
-                logln!("[usbd] calling try_handshake on ch {}", client_channel);
+                println!("[usbd] calling try_handshake on ch {}", client_channel);
                 if client.try_handshake() {
-                    logln!("[usbd] handshake succeeded");
+                    println!("[usbd] handshake succeeded");
                     // Add to clients array
                     for i in 0..MAX_CLIENTS {
                         if clients[i].is_none() {
@@ -4264,7 +4390,7 @@ fn main() {
                         }
                     }
                 } else {
-                    logln!("[usbd] handshake failed");
+                    println!("[usbd] handshake failed");
                 }
             }
 
@@ -4276,9 +4402,6 @@ fn main() {
                     }
                 }
             }
-
-            // Flush buffered log output
-            flush_log();
 
             // Use a short delay instead of yield for testing
             delay_ms(10);

@@ -157,10 +157,18 @@ pub struct RingHeader {
 impl RingHeader {
     /// Check if the header is valid
     pub fn is_valid(&self) -> bool {
-        self.magic == RING_MAGIC && self.version == RING_VERSION
+        self.magic == RING_MAGIC &&
+        self.version == RING_VERSION &&
+        self.is_power_of_two()
+    }
+
+    /// Check if entry_count is a power of 2 (required for mask() to work)
+    fn is_power_of_two(&self) -> bool {
+        self.entry_count > 0 && (self.entry_count & (self.entry_count - 1)) == 0
     }
 
     /// Get the mask for index wrapping (entry_count - 1)
+    /// SAFETY: Only valid if entry_count is power of 2 (checked by is_valid)
     pub fn mask(&self) -> u32 {
         self.entry_count - 1
     }
@@ -191,20 +199,23 @@ impl<S: Copy, C: Copy> Ring<S, C> {
     /// # Arguments
     /// * `entry_count` - Number of entries (will be rounded to power of 2)
     /// * `data_size` - Size of the data buffer in bytes
+    ///
+    /// Returns None if parameters would cause overflow or allocation fails.
     pub fn create(entry_count: u32, data_size: usize) -> Option<Self> {
-        // Round entry count to power of 2
-        let entry_count = entry_count.next_power_of_two();
+        // Validate entry_count won't overflow when rounded up
+        // next_power_of_two() returns 0 on overflow for u32
+        let entry_count = entry_count.checked_next_power_of_two()?;
 
-        // Calculate sizes
+        // Calculate sizes with overflow checks
         let header_size = core::mem::size_of::<RingHeader>();
-        let sq_size = (entry_count as usize) * core::mem::size_of::<S>();
-        let cq_size = (entry_count as usize) * core::mem::size_of::<C>();
+        let sq_size = (entry_count as usize).checked_mul(core::mem::size_of::<S>())?;
+        let cq_size = (entry_count as usize).checked_mul(core::mem::size_of::<C>())?;
 
-        // Align each section to cache line
-        let sq_offset = (header_size + 63) & !63;
-        let cq_offset = (sq_offset + sq_size + 63) & !63;
-        let data_offset = (cq_offset + cq_size + 63) & !63;
-        let total_size = data_offset + data_size;
+        // Align each section to cache line (with overflow checks)
+        let sq_offset = header_size.checked_add(63)? & !63;
+        let cq_offset = sq_offset.checked_add(sq_size)?.checked_add(63)? & !63;
+        let data_offset = cq_offset.checked_add(cq_size)?.checked_add(63)? & !63;
+        let total_size = data_offset.checked_add(data_size)?;
 
         // Create shared memory region
         let mut vaddr: u64 = 0;
@@ -266,10 +277,11 @@ impl<S: Copy, C: Copy> Ring<S, C> {
                 return None;
             }
 
-            // Calculate total size from header
+            // Calculate total size from header (with overflow check)
+            // These values come from shared memory and may be malicious
             let data_offset = (*header).data_offset as usize;
             let data_size = (*header).data_size as usize;
-            let total_size = data_offset + data_size;
+            let total_size = data_offset.checked_add(data_size)?;
 
             Some(Self {
                 shmem_id,
