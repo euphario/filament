@@ -6,6 +6,7 @@
 
 pub mod syscall;
 pub mod io;
+pub mod log;
 pub mod ring;
 pub mod mmio;
 pub mod trace;
@@ -13,6 +14,7 @@ pub mod firmware;
 
 pub use syscall::*;
 pub use io::{Stdout, Stdin, Stderr};
+pub use log::flush as flush_log;
 pub use ring::{Ring, BlockRing, BlockRequest, BlockResponse};
 pub use mmio::{MmioRegion, delay_ms, delay_us, poll_until, poll_interval};
 pub use firmware::{FirmwareClient, FirmwareRequest, FirmwareReply};

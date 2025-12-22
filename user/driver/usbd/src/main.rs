@@ -22,7 +22,7 @@
 mod device;
 
 use device::{is_msc_bbb, is_hub_class};
-use userlib::{println, print, syscall};
+use userlib::{println, print, logln, flush_log, syscall};
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 
 // Import from the usb driver library
@@ -452,7 +452,7 @@ impl UsbDriver {
                                     self.queue_hub_status_transfer();
                                 }
                             } else {
-                                println!("[usbd] Hub interrupt error: cc={}", cc);
+                                logln!("[usbd] Hub interrupt error: cc={}", cc);
                                 self.queue_hub_status_transfer();
                             }
                         }
@@ -518,13 +518,13 @@ impl UsbDriver {
             if status.connected {
                 // Device connected - check if not already enumerated
                 if (self.enumerated_ports & port_mask) == 0 {
-                    println!("[usbd] Device connected on port {}", port_id);
+                    logln!("[usbd] Device connected on port {}", port_id);
                     return Some(port_id);
                 }
             } else {
                 // Device disconnected - mark as not enumerated
                 if (self.enumerated_ports & port_mask) != 0 {
-                    println!("[usbd] Device disconnected from port {}", port_id);
+                    logln!("[usbd] Device disconnected from port {}", port_id);
                     self.enumerated_ports &= !port_mask;
                     // TODO: Clean up device resources
                 }
@@ -630,12 +630,12 @@ impl UsbDriver {
     /// Called when a new device is detected via port status change event
     /// Includes retry logic for flaky USB devices
     fn enumerate_port(&mut self, port: u32) -> Option<u32> {
-        println!("[usbd] Enumerating port {}...", port);
+        logln!("[usbd] Enumerating port {}...", port);
 
         // Retry the entire enumeration process
         for attempt in 0..3 {
             if attempt > 0 {
-                println!("[usbd]   Retry {} for port {}", attempt, port);
+                logln!("[usbd]   Retry {} for port {}", attempt, port);
                 delay_ms(200);
             }
 
@@ -645,19 +645,19 @@ impl UsbDriver {
             let status = ParsedPortsc::from_raw(raw);
 
             if attempt == 0 {
-                println!("[usbd]   PORTSC: connected={} enabled={} speed={}",
+                logln!("[usbd]   PORTSC: connected={} enabled={} speed={}",
                          status.connected, status.enabled, status.speed.as_str());
             }
 
             if !status.connected {
-                println!("[usbd]   Port {} not connected", port);
+                logln!("[usbd]   Port {} not connected", port);
                 return None;
             }
 
             // Reset the port first (unless already enabled)
             if !status.enabled {
                 if !self.reset_port(port) {
-                    println!("[usbd]   Port {} reset failed", port);
+                    logln!("[usbd]   Port {} reset failed", port);
                     continue; // Retry
                 }
                 // Small delay after reset
@@ -670,19 +670,19 @@ impl UsbDriver {
                 if port > 0 && port <= 32 {
                     self.enumerated_ports |= 1 << (port - 1);
                 }
-                println!("[usbd]   Port {} enumerated as slot {}", port, slot_id);
+                logln!("[usbd]   Port {} enumerated as slot {}", port, slot_id);
                 return Some(slot_id);
             }
             // enumerate_device failed, will retry
         }
 
-        println!("[usbd]   Port {} enumeration failed after 3 attempts", port);
+        logln!("[usbd]   Port {} enumeration failed after 3 attempts", port);
         None
     }
 
     /// Enumerate all ports in a bitmask
     fn enumerate_pending_ports(&mut self, ports_mask: u32) {
-        println!("[usbd] enumerate_pending_ports: mask=0x{:x}", ports_mask);
+        logln!("[usbd] enumerate_pending_ports: mask=0x{:x}", ports_mask);
         for bit in 0..32 {
             if (ports_mask & (1 << bit)) != 0 {
                 let port = bit + 1;  // Ports are 1-based
@@ -1468,7 +1468,7 @@ impl UsbDriver {
             (hub.slot_id, hub.num_ports, hub.hub_port, hub.ep0_ring, hub.ep0_ring_phys, hub.ep0_enqueue, hub.ep0_cycle)
         };
 
-        println!("[usbd] Hub status change: bitmap=0x{:02x}", status_bitmap);
+        logln!("[usbd] Hub status change: bitmap=0x{:02x}", status_bitmap);
 
         // Allocate buffer for port status queries
         let mut buf_phys: u64 = 0;
@@ -3912,14 +3912,14 @@ impl BlockServer {
         let ring = match BlockRing::create(64, 1024 * 1024) {
             Some(r) => r,
             None => {
-                println!("[usbd] Failed to create ring buffer");
+                logln!("[usbd] Failed to create ring buffer");
                 return false;
             }
         };
 
         // Grant client permission to map the shared memory
         if !ring.allow(self.client_pid) {
-            println!("[usbd] Failed to allow client access to ring");
+            logln!("[usbd] Failed to allow client access to ring");
             return false;
         }
 
@@ -4010,7 +4010,7 @@ impl BlockServer {
                 BlockResponse::ok(req.tag, bytes_read as u32)
             },
             None => {
-                println!("[usbd] READ: DMA failed");
+                logln!("[usbd] READ: DMA failed");
                 BlockResponse::error(req.tag, -5) // EIO
             }
         }
@@ -4155,7 +4155,7 @@ fn main() {
     while driver.msc_device.is_none() && wait_count < 50 {
         wait_count += 1;
         if wait_count % 10 == 1 {
-            println!("[usbd] Waiting for MSC device... ({}/50)", wait_count);
+            logln!("[usbd] Waiting for MSC device... ({}/50)", wait_count);
         }
 
         delay_ms(100);
@@ -4174,7 +4174,7 @@ fn main() {
 
     // Now that MSC is ready, register the "usb" port
     // Clients (fatfs) will have been blocking on port_connect() until now
-    println!("[usbd] MSC device ready, registering 'usb' port...");
+    logln!("[usbd] MSC device ready, registering 'usb' port...");
     let port_result = syscall::port_register(b"usb");
     if port_result < 0 {
         if port_result == -17 {
@@ -4185,7 +4185,7 @@ fn main() {
         syscall::exit(1);
     }
     let usb_port = port_result as u32;
-    println!("[usbd] Port registered, ready to accept connections");
+    logln!("[usbd] Port registered, ready to accept connections");
 
     // Initialize client tracking
     const MAX_CLIENTS: usize = 4;
@@ -4205,7 +4205,7 @@ fn main() {
                 if clients[i].is_none() {
                     clients[i] = Some(client);
                     num_clients += 1;
-                    println!("[usbd] Client {} connected", num_clients);
+                    logln!("[usbd] Client {} connected", num_clients);
                     break;
                 }
             }
@@ -4213,9 +4213,9 @@ fn main() {
     }
 
     // Daemonize
-    println!("[usbd] About to daemonize, num_clients={}", num_clients);
+    logln!("[usbd] About to daemonize, num_clients={}", num_clients);
     let result = syscall::daemonize();
-    println!("[usbd] daemonize returned {}", result);
+    logln!("[usbd] daemonize returned {}", result);
     if result == 0 {
         println!("USB daemon running (ring buffer mode)");
         // Resync event ring before daemon loop - drain any pending events and update ERDP
@@ -4247,14 +4247,14 @@ fn main() {
             // Accept new client connections
             let accept_result = syscall::port_accept(usb_port);
             if accept_result > 0 && num_clients < MAX_CLIENTS {
-                println!("[usbd] port_accept returned {} - accepting client", accept_result);
+                logln!("[usbd] port_accept returned {} - accepting client", accept_result);
                 let client_channel = accept_result as u32;
 
                 // Create BlockServer and complete handshake
                 let mut client = BlockServer::new(client_channel);
-                println!("[usbd] calling try_handshake on ch {}", client_channel);
+                logln!("[usbd] calling try_handshake on ch {}", client_channel);
                 if client.try_handshake() {
-                    println!("[usbd] handshake succeeded");
+                    logln!("[usbd] handshake succeeded");
                     // Add to clients array
                     for i in 0..MAX_CLIENTS {
                         if clients[i].is_none() {
@@ -4264,7 +4264,7 @@ fn main() {
                         }
                     }
                 } else {
-                    println!("[usbd] handshake failed");
+                    logln!("[usbd] handshake failed");
                 }
             }
 
@@ -4276,6 +4276,9 @@ fn main() {
                     }
                 }
             }
+
+            // Flush buffered log output
+            flush_log();
 
             // Use a short delay instead of yield for testing
             delay_ms(10);

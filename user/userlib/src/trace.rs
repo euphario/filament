@@ -124,7 +124,7 @@ pub fn get_mask() -> u32 {
     TRACE_MASK.load(Ordering::Relaxed)
 }
 
-/// Trace macro - prints with subsystem prefix if enabled
+/// Trace macro - logs with subsystem prefix if enabled (buffered, non-blocking)
 ///
 /// # Examples
 ///
@@ -137,7 +137,7 @@ pub fn get_mask() -> u32 {
 macro_rules! trace {
     ($subsys:ident, $($arg:tt)*) => {{
         if $crate::trace::is_enabled($crate::trace::Subsystem::$subsys) {
-            $crate::println!("[{}] {}", $crate::trace::Subsystem::$subsys.name(), format_args!($($arg)*));
+            $crate::logln!("[{}] {}", $crate::trace::Subsystem::$subsys.name(), format_args!($($arg)*));
         }
     }};
 }
@@ -164,7 +164,7 @@ macro_rules! trace_enabled {
 macro_rules! trace_reg_read {
     ($offset:expr, $val:expr) => {{
         if $crate::trace::is_enabled($crate::trace::Subsystem::REG) {
-            $crate::println!("[REG] R 0x{:08x} = 0x{:08x}", $offset, $val);
+            $crate::logln!("[REG] R 0x{:08x} = 0x{:08x}", $offset, $val);
         }
     }};
 }
@@ -174,16 +174,17 @@ macro_rules! trace_reg_read {
 macro_rules! trace_reg_write {
     ($offset:expr, $val:expr) => {{
         if $crate::trace::is_enabled($crate::trace::Subsystem::REG) {
-            $crate::println!("[REG] W 0x{:08x} <- 0x{:08x}", $offset, $val);
+            $crate::logln!("[REG] W 0x{:08x} <- 0x{:08x}", $offset, $val);
         }
     }};
 }
 
 /// Trace an error condition (ERR subsystem, always important)
+/// Uses direct println! for immediate output since errors are critical
 #[macro_export]
 macro_rules! trace_err {
     ($($arg:tt)*) => {{
-        // ERR always prints, regardless of mask
+        // ERR always prints immediately, regardless of mask
         $crate::println!("[ERR] {}", format_args!($($arg)*));
     }};
 }

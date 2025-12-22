@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::{println, print, syscall};
+use userlib::{println, print, logln, flush_log, syscall};
 use userlib::firmware::{FirmwareRequest, FirmwareReply, FATFS_PORT, error as fw_error};
 
 mod fat;
@@ -18,24 +18,24 @@ use usb::BlockClient;
 // Entry point
 #[unsafe(no_mangle)]
 fn main() {
-    println!("[fatfs] FAT filesystem driver starting...");
+    logln!("[fatfs] FAT filesystem driver starting...");
 
     // Connect to usbd via "usb" port using ring buffer protocol
-    println!("[fatfs] Connecting to usbd...");
+    logln!("[fatfs] Connecting to usbd...");
     let mut block = match BlockClient::connect(b"usb") {
         Some(b) => b,
         None => {
-            println!("[fatfs] ERROR: Failed to connect to usbd");
+            logln!("[fatfs] ERROR: Failed to connect to usbd");
             syscall::exit(1);
         }
     };
-    println!("[fatfs] Connected via ring buffer (data buffer: {} bytes)", block.buffer_size());
+    logln!("[fatfs] Connected via ring buffer (data buffer: {} bytes)", block.buffer_size());
 
     // Debug: Test buffer mapping by touching pages
     {
         let data = block.data();
         let ptr = data.as_ptr();
-        println!("[fatfs] Data buffer at 0x{:x}, testing mapping...", ptr as u64);
+        logln!("[fatfs] Data buffer at 0x{:x}, testing mapping...", ptr as u64);
 
         // Touch every 4KB page to verify mapping
         let page_size = 4096usize;
@@ -46,13 +46,13 @@ fn main() {
                 // Read one byte from each page
                 let _byte = unsafe { core::ptr::read_volatile(ptr.add(offset)) };
                 if i < 5 || i == num_pages - 1 {
-                    println!("[fatfs]   Page {} (offset 0x{:x}): OK", i, offset);
+                    logln!("[fatfs]   Page {} (offset 0x{:x}): OK", i, offset);
                 } else if i == 5 {
-                    println!("[fatfs]   ... testing remaining pages ...");
+                    logln!("[fatfs]   ... testing remaining pages ...");
                 }
             }
         }
-        println!("[fatfs] All {} pages accessible!", num_pages);
+        logln!("[fatfs] All {} pages accessible!", num_pages);
     }
 
     // Get block device info
@@ -60,22 +60,22 @@ fn main() {
     let (block_size, block_count) = match block.get_info() {
         Some(info) => info,
         None => {
-            println!("[fatfs] ERROR: Failed to get block device info");
+            logln!("[fatfs] ERROR: Failed to get block device info");
             syscall::exit(1);
         }
     };
-    println!("[fatfs] Block device: {} blocks x {} bytes", block_count, block_size);
+    logln!("[fatfs] Block device: {} blocks x {} bytes", block_count, block_size);
 
     // Read sector 0 (could be MBR or FAT boot sector)
     let bs = block_size as usize;
     if bs > 4096 {
-        println!("[fatfs] ERROR: Block size {} too large", bs);
+        logln!("[fatfs] ERROR: Block size {} too large", bs);
         syscall::exit(1);
     }
 
     let mut sector0 = [0u8; 4096];
     if block.read_sector(0).is_none() {
-        println!("[fatfs] ERROR: Failed to read sector 0");
+        logln!("[fatfs] ERROR: Failed to read sector 0");
         syscall::exit(1);
     }
     sector0[..bs].copy_from_slice(&block.data()[..bs]);
@@ -94,24 +94,24 @@ fn main() {
     } else {
         (sector0[bs - 2], sector0[bs - 1])
     };
-    println!("[fatfs] Boot signature: {:02x} {:02x}", sig0, sig1);
+    logln!("[fatfs] Boot signature: {:02x} {:02x}", sig0, sig1);
 
     // Check if this is an MBR (partition table) or direct FAT boot sector
     // FAT boot sector starts with jump: EB xx 90 or E9 xx xx
     // MBR starts with executable code (often 33 C0 = xor ax,ax)
     let partition_start = if sector0[0] == 0xEB || sector0[0] == 0xE9 {
         // Direct FAT boot sector (no partition table)
-        println!("[fatfs] Direct FAT boot sector (no MBR)");
+        logln!("[fatfs] Direct FAT boot sector (no MBR)");
         0u64
     } else {
         // Check MBR signature
         if sig0 != 0x55 || sig1 != 0xAA {
-            println!("[fatfs] ERROR: Invalid MBR signature");
+            logln!("[fatfs] ERROR: Invalid MBR signature");
             syscall::exit(1);
         }
 
         // Parse partition table (starts at offset 0x1BE)
-        println!("[fatfs] MBR detected, scanning partitions...");
+        logln!("[fatfs] MBR detected, scanning partitions...");
         let mut found_lba = 0u64;
 
         for i in 0..4 {
@@ -140,7 +140,7 @@ fn main() {
                     0xEE => "GPT",
                     _ => "Unknown",
                 };
-                println!("[fatfs]   Partition {}: type=0x{:02x} ({}) LBA={} size={}",
+                logln!("[fatfs]   Partition {}: type=0x{:02x} ({}) LBA={} size={}",
                     i, part_type, type_name, lba_start, size_sectors);
 
                 // Use first FAT partition found
@@ -152,11 +152,11 @@ fn main() {
         }
 
         if found_lba == 0 {
-            println!("[fatfs] ERROR: No FAT partition found");
+            logln!("[fatfs] ERROR: No FAT partition found");
             syscall::exit(1);
         }
 
-        println!("[fatfs] Using partition at LBA {}", found_lba);
+        logln!("[fatfs] Using partition at LBA {}", found_lba);
         found_lba
     };
 
@@ -166,7 +166,7 @@ fn main() {
         boot_sector.copy_from_slice(&sector0);
     } else {
         if block.read_sector(partition_start).is_none() {
-            println!("[fatfs] ERROR: Failed to read FAT boot sector at LBA {}", partition_start);
+            logln!("[fatfs] ERROR: Failed to read FAT boot sector at LBA {}", partition_start);
             syscall::exit(1);
         }
         boot_sector.copy_from_slice(&block.data()[..512]);
@@ -180,8 +180,8 @@ fn main() {
             fs
         }
         None => {
-            println!("[fatfs] ERROR: Failed to mount FAT filesystem");
-            println!("[fatfs] Boot sector dump:");
+            logln!("[fatfs] ERROR: Failed to mount FAT filesystem");
+            logln!("[fatfs] Boot sector dump:");
             for i in 0..64 {
                 if i % 16 == 0 { print!("  {:04x}: ", i); }
                 print!("{:02x} ", boot_sector[i]);
@@ -191,28 +191,28 @@ fn main() {
         }
     };
 
-    println!("[fatfs] Mounted {:?} filesystem", fs.fat_type);
-    println!("[fatfs]   Bytes per sector: {}", fs.bytes_per_sector);
-    println!("[fatfs]   Sectors per cluster: {}", fs.sectors_per_cluster);
-    println!("[fatfs]   Total clusters: {}", fs.total_clusters);
+    logln!("[fatfs] Mounted {:?} filesystem", fs.fat_type);
+    logln!("[fatfs]   Bytes per sector: {}", fs.bytes_per_sector);
+    logln!("[fatfs]   Sectors per cluster: {}", fs.sectors_per_cluster);
+    logln!("[fatfs]   Total clusters: {}", fs.total_clusters);
 
     // List root directory
-    println!("[fatfs] Root directory:");
+    logln!("[fatfs] Root directory:");
     list_root_directory(&fs, &mut block);
 
     // Test file reading - try to find and read a small test file
     println!();
-    println!("[fatfs] Testing file read...");
+    logln!("[fatfs] Testing file read...");
 
     // Try to find README.TXT or any .TXT file
     if let Some(file) = find_file(&fs, &mut block, b"README.TXT") {
-        println!("[fatfs] Found README.TXT: cluster={}, size={}", file.start_cluster, file.size);
+        logln!("[fatfs] Found README.TXT: cluster={}, size={}", file.start_cluster, file.size);
 
         // Read first 256 bytes
         let mut buf = [0u8; 256];
         let read_size = core::cmp::min(256, file.size as usize);
         if let Some(bytes_read) = read_file(&fs, &mut block, &file, &mut buf[..read_size]) {
-            println!("[fatfs] Read {} bytes:", bytes_read);
+            logln!("[fatfs] Read {} bytes:", bytes_read);
             // Print as text if it looks like ASCII
             if let Ok(text) = core::str::from_utf8(&buf[..bytes_read]) {
                 for line in text.lines().take(5) {
@@ -221,7 +221,7 @@ fn main() {
             }
         }
     } else {
-        println!("[fatfs] README.TXT not found (normal if not present)");
+        logln!("[fatfs] README.TXT not found (normal if not present)");
     }
 
     // Try to find MT7996 firmware files (now with LFN support!)
@@ -233,13 +233,13 @@ fn main() {
         b"mt7996_eeprom.bin",
     ];
     println!();
-    println!("[fatfs] Searching for MT7996 firmware files:");
+    logln!("[fatfs] Searching for MT7996 firmware files:");
     for fw_name in firmware_files {
         let name = core::str::from_utf8(fw_name).unwrap_or("?");
         if let Some(file) = find_file(&fs, &mut block, fw_name) {
-            println!("[fatfs]   Found {}: {} bytes", name, file.size);
+            logln!("[fatfs]   Found {}: {} bytes", name, file.size);
         } else {
-            println!("[fatfs]   {} not found", name);
+            logln!("[fatfs]   {} not found", name);
         }
     }
 
@@ -248,19 +248,19 @@ fn main() {
 
     // Register as firmware service
     println!();
-    println!("[fatfs] Registering as firmware service...");
+    logln!("[fatfs] Registering as firmware service...");
     let listen_channel = syscall::port_register(FATFS_PORT);
     if listen_channel < 0 {
-        println!("[fatfs] ERROR: Failed to register port: {}", listen_channel);
+        logln!("[fatfs] ERROR: Failed to register port: {}", listen_channel);
         syscall::exit(1);
     }
     let listen_channel = listen_channel as u32;
-    println!("[fatfs] Listening on port 'fatfs' (channel {})", listen_channel);
+    logln!("[fatfs] Listening on port 'fatfs' (channel {})", listen_channel);
 
     // Daemonize - detach from parent so shell can continue
     let result = syscall::daemonize();
     if result != 0 {
-        println!("[fatfs] WARNING: daemonize failed: {}", result);
+        logln!("[fatfs] WARNING: daemonize failed: {}", result);
     }
 
     // Service loop
@@ -276,7 +276,8 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
         // Accept a connection
         let client_channel = syscall::port_accept(listen_channel);
         if client_channel < 0 {
-            // No pending connections, yield and try again
+            // No pending connections, flush logs and yield
+            flush_log();
             syscall::yield_now();
             continue;
         }
@@ -300,7 +301,7 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
         // Now receive actual firmware request
         let n = syscall::receive(client_channel, &mut request_buf);
         if n < 0 {
-            println!("[fatfs] Receive error: {}", n);
+            logln!("[fatfs] Receive error: {}", n);
             syscall::channel_close(client_channel);
             continue;
         }
@@ -308,7 +309,7 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
         let request = match FirmwareRequest::from_bytes(&request_buf[..n as usize]) {
             Some(r) => r,
             None => {
-                println!("[fatfs] Invalid request (size={})", n);
+                logln!("[fatfs] Invalid request (size={})", n);
                 let reply = FirmwareReply::error(fw_error::READ_ERROR);
                 syscall::send(client_channel, reply.as_bytes());
                 syscall::channel_close(client_channel);
@@ -318,7 +319,7 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
 
         let filename = request.filename_str();
         let filename_str = core::str::from_utf8(filename).unwrap_or("???");
-        println!("[fatfs] Request: {} (shmem={}, max={})",
+        logln!("[fatfs] Request: {} (shmem={}, max={})",
             filename_str, request.shmem_id, request.max_size);
 
         // Allow the requester to access the shmem (they created it, we need to map it)
@@ -331,7 +332,7 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
         let mut paddr: u64 = 0;
         let map_result = syscall::shmem_map(request.shmem_id, &mut vaddr, &mut paddr);
         if map_result < 0 {
-            println!("[fatfs] Failed to map shmem {}: {}", request.shmem_id, map_result);
+            logln!("[fatfs] Failed to map shmem {}: {}", request.shmem_id, map_result);
             let reply = FirmwareReply::error(fw_error::NO_MEMORY);
             syscall::send(client_channel, reply.as_bytes());
             syscall::channel_close(client_channel);
@@ -342,7 +343,7 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
         let file = match find_file(fs, block, filename) {
             Some(f) => f,
             None => {
-                println!("[fatfs] File not found: {}", filename_str);
+                logln!("[fatfs] File not found: {}", filename_str);
                 let reply = FirmwareReply::error(fw_error::NOT_FOUND);
                 syscall::send(client_channel, reply.as_bytes());
                 syscall::channel_close(client_channel);
@@ -352,7 +353,7 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
 
         // Check size
         if file.size > request.max_size {
-            println!("[fatfs] File too large: {} > {}", file.size, request.max_size);
+            logln!("[fatfs] File too large: {} > {}", file.size, request.max_size);
             let reply = FirmwareReply::error(fw_error::TOO_LARGE);
             syscall::send(client_channel, reply.as_bytes());
             syscall::channel_close(client_channel);
@@ -367,7 +368,7 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
         let bytes_read = match read_file(fs, block, &file, buffer) {
             Some(n) => n,
             None => {
-                println!("[fatfs] Read error");
+                logln!("[fatfs] Read error");
                 let reply = FirmwareReply::error(fw_error::READ_ERROR);
                 syscall::send(client_channel, reply.as_bytes());
                 syscall::channel_close(client_channel);
@@ -375,12 +376,15 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
             }
         };
 
-        println!("[fatfs] Loaded {} bytes", bytes_read);
+        logln!("[fatfs] Loaded {} bytes", bytes_read);
 
         // Send success reply
         let reply = FirmwareReply::success(bytes_read);
         syscall::send(client_channel, reply.as_bytes());
         syscall::channel_close(client_channel);
+
+        // Flush buffered log output
+        flush_log();
     }
 }
 
@@ -395,7 +399,7 @@ fn read_performance_test(block: &mut BlockClient, _block_count: u64) {
     let block_size = block.block_size();
 
     // Test 1: Synchronous reads (baseline)
-    println!("[fatfs] === Synchronous Read Performance ===");
+    logln!("[fatfs] === Synchronous Read Performance ===");
     let test_lba = 1000u64;
     let test_sizes = [1u32, 4, 8, 16, 32, 64];
     let iterations = 100u32;
@@ -424,13 +428,13 @@ fn read_performance_test(block: &mut BlockClient, _block_count: u64) {
 
         if elapsed_us > 0 && success > 0 {
             let kb_per_sec = (bytes_transferred * 1_000_000) / (elapsed_us * 1024);
-            println!("[fatfs]   Sync {}x{}: {}/{} OK, {} KB/s",
+            logln!("[fatfs]   Sync {}x{}: {}/{} OK, {} KB/s",
                 sectors, iterations, success, iterations, kb_per_sec);
         }
     }
 
     // Test 2: Pipelined reads (submit batch, then collect)
-    println!("[fatfs] === Pipelined Read Performance ===");
+    logln!("[fatfs] === Pipelined Read Performance ===");
     let pipeline_depths = [4u32, 8, 16, 32];
     let sectors_per_read = 16u32;  // 8KB per read
     let bytes_per_read = (sectors_per_read * block_size) as usize;
@@ -497,25 +501,25 @@ fn read_performance_test(block: &mut BlockClient, _block_count: u64) {
 
         if elapsed_us > 0 && success > 0 {
             let kb_per_sec = (bytes_transferred * 1_000_000) / (elapsed_us * 1024);
-            println!("[fatfs]   Pipeline depth={} ({}x{}): {}/{} OK, {} KB/s",
+            logln!("[fatfs]   Pipeline depth={} ({}x{}): {}/{} OK, {} KB/s",
                 actual_depth, sectors_per_read, total_reads, success, total_reads, kb_per_sec);
         }
     }
 
     // Verify we can read actual data
-    println!("[fatfs] Verifying read data...");
+    logln!("[fatfs] Verifying read data...");
     if let Some(bytes) = block.read(0, 1) {
         // Check for MBR signature or FAT boot sector
         let data = block.data();
         let sig0 = data[510];
         let sig1 = data[511];
         if sig0 == 0x55 && sig1 == 0xAA {
-            println!("[fatfs]   Read {} bytes, MBR/boot signature OK!", bytes);
+            logln!("[fatfs]   Read {} bytes, MBR/boot signature OK!", bytes);
         } else {
-            println!("[fatfs]   Read {} bytes (sig: {:02x} {:02x})", bytes, sig0, sig1);
+            logln!("[fatfs]   Read {} bytes (sig: {:02x} {:02x})", bytes, sig0, sig1);
         }
     } else {
-        println!("[fatfs]   Read failed!");
+        logln!("[fatfs]   Read failed!");
     }
 }
 
@@ -529,7 +533,7 @@ fn list_root_directory(fs: &FatFilesystem, block: &mut BlockClient) {
         fs.root_dir_absolute_sector()
     };
 
-    println!("[fatfs] Reading root directory at sector {}", root_start_sector);
+    logln!("[fatfs] Reading root directory at sector {}", root_start_sector);
 
     // Read multiple sectors to show more entries
     for sector_offset in 0..4u32 {
@@ -740,7 +744,7 @@ fn read_file(
 
             let sector = cluster_start + sector_offset;
             if block.read_sector(sector as u64).is_none() {
-                println!("[fatfs] Read error at sector {}", sector);
+                logln!("[fatfs] Read error at sector {}", sector);
                 return None;
             }
 
@@ -756,7 +760,7 @@ fn read_file(
         // Cache FAT sector reads
         if cached_fat_sector != Some(fat_sector) {
             if block.read_sector(fat_sector as u64).is_none() {
-                println!("[fatfs] FAT read error at sector {}", fat_sector);
+                logln!("[fatfs] FAT read error at sector {}", fat_sector);
                 return None;
             }
             fat_sector_buf.copy_from_slice(&block.data()[..512]);
