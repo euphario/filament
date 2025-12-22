@@ -158,11 +158,8 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
     let aligned_size = (size + page_size - 1) & !(page_size - 1);
     let num_pages = aligned_size / page_size;
 
-    // Allocate contiguous physical pages for DMA
-    let phys_addr = pmm::alloc_contiguous(num_pages)
-        .ok_or(-12i64)?; // ENOMEM
-
-    // Find free slot in table
+    // CRITICAL: Find free slot BEFORE allocating physical memory
+    // This prevents memory leak if no slots are available
     let (slot_idx, shmem_id) = unsafe {
         let mut found = None;
         for (i, slot) in (*core::ptr::addr_of!(SHMEM_TABLE)).iter().enumerate() {
@@ -176,6 +173,11 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
         *core::ptr::addr_of_mut!(NEXT_SHMEM_ID) += 1;
         (idx, id)
     };
+
+    // Now allocate contiguous physical pages for DMA
+    // If this fails, we haven't modified any state yet
+    let phys_addr = pmm::alloc_contiguous(num_pages)
+        .ok_or(-12i64)?; // ENOMEM
 
     // Create the region descriptor
     let mut region = SharedMem::new();
@@ -328,17 +330,47 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
                 return Err(-1); // EPERM
             }
 
-            // Free physical memory
-            let num_pages = region.size / 4096;
-            pmm::free_contiguous(region.phys_addr as usize, num_pages);
+            let phys_addr = region.phys_addr;
+            let size = region.size;
+            let num_pages = size / 4096;
 
-            // TODO: Unmap from all processes that have it mapped
-            // For now, we just remove from table
+            // CRITICAL: Unmap from ALL processes that have this shmem mapped
+            // This prevents use-after-free when we free the physical memory
+            unmap_from_all_processes(phys_addr, size);
+
+            // Now safe to free physical memory - no more mappings exist
+            pmm::free_contiguous(phys_addr as usize, num_pages);
         }
 
         SHMEM_TABLE[slot_idx] = None;
     }
     Ok(())
+}
+
+/// Unmap a physical address range from all processes
+/// Used when destroying shared memory to prevent use-after-free
+unsafe fn unmap_from_all_processes(phys_addr: u64, size: usize) {
+    let sched = super::task::scheduler();
+
+    for task_opt in sched.tasks.iter_mut() {
+        if let Some(ref mut task) = task_opt {
+            // Search task's heap mappings for this physical address
+            // First find the virtual address, then unmap (avoids borrow issues)
+            let mut virt_to_unmap = None;
+            for mapping in task.heap_mappings.iter() {
+                if !mapping.is_empty() && mapping.phys_addr == phys_addr {
+                    virt_to_unmap = Some(mapping.virt_addr);
+                    break; // Each task should only have one mapping to this phys
+                }
+            }
+
+            // Now unmap if we found a mapping
+            // Note: munmap() won't free pages because kind is BorrowedShmem
+            if let Some(virt_addr) = virt_to_unmap {
+                task.munmap(virt_addr, size);
+            }
+        }
+    }
 }
 
 /// Find a region by ID and return mutable reference
@@ -393,10 +425,16 @@ pub fn process_cleanup(pid: Pid) {
                 // Remove from waiters if present
                 region.remove_waiter(pid);
 
-                // If owner, destroy the region
+                // If owner, destroy the region (same as destroy() but without permission check)
                 if region.owner_pid == pid {
-                    let num_pages = region.size / 4096;
-                    pmm::free_contiguous(region.phys_addr as usize, num_pages);
+                    let phys_addr = region.phys_addr;
+                    let size = region.size;
+                    let num_pages = size / 4096;
+
+                    // CRITICAL: Unmap from ALL other processes before freeing
+                    unmap_from_all_processes(phys_addr, size);
+
+                    pmm::free_contiguous(phys_addr as usize, num_pages);
                     *slot = None;
                 }
             }
