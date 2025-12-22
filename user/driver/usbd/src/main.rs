@@ -1802,6 +1802,13 @@ impl UsbDriver {
             None => return,
         };
 
+        // Validate descriptor length before casting
+        const SS_HUB_DESC_SIZE: usize = core::mem::size_of::<SsHubDescriptor>();
+        if (hub_desc_len as usize) < SS_HUB_DESC_SIZE {
+            println!("    ERROR: Hub descriptor too short: {} < {}", hub_desc_len, SS_HUB_DESC_SIZE);
+            return;
+        }
+
         // Invalidate hub descriptor buffer after xHCI DMA write
         invalidate_buffer(buf_virt as u64, hub_desc_len as usize);
         let hub_desc = unsafe { &*(buf_virt as *const SsHubDescriptor) };
@@ -4406,6 +4413,9 @@ fn main() {
 
     if driver.msc_device.is_none() {
         println!("No USB mass storage device found after 5 seconds");
+        if irq_fd >= 0 {
+            syscall::close(irq_fd as u32);
+        }
         syscall::exit(1);
     }
 
@@ -4418,6 +4428,9 @@ fn main() {
             println!("ERROR: USB daemon already running");
         } else {
             println!("ERROR: Failed to register USB port: {}", port_result);
+        }
+        if irq_fd >= 0 {
+            syscall::close(irq_fd as u32);
         }
         syscall::exit(1);
     }
