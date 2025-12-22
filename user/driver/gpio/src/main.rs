@@ -14,7 +14,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::{println, print, syscall};
+use userlib::{println, print, logln, flush_log, syscall};
 
 // =============================================================================
 // I2C Addresses
@@ -352,6 +352,7 @@ fn main() {
                 syscall::channel_close(client_ch);
             }
 
+            flush_log();
             syscall::yield_now();
         }
     } else {

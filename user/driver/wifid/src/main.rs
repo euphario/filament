@@ -18,7 +18,7 @@
 mod driver;
 mod drivers;
 
-use userlib::{println, print, syscall};
+use userlib::{println, print, logln, flush_log, syscall};
 use pcie::{PcieClient, consts};
 use driver::AnyWifiDriver;
 
@@ -109,6 +109,8 @@ fn main() {
         println!("No supported WiFi devices found");
     }
 
+    // Flush any buffered log output before exit
+    flush_log();
     syscall::exit(0);
 }
 

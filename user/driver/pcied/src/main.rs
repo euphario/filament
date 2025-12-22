@@ -15,7 +15,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::{println, print, syscall};
+use userlib::{println, print, logln, log, flush_log, syscall};
 use pcie::{
     Board, BpiR4, PcieInit, SocPcie,
     PcieController, PcieDevice,
@@ -72,11 +72,11 @@ impl DeviceRegistry {
 }
 
 fn debug_print(s: &str) {
-    print!("{} ", s);
+    log!("{} ", s);
 }
 
 fn debug_status(val: u32) {
-    print!("[{:08x}] ", val);
+    log!("[{:08x}] ", val);
 }
 
 #[unsafe(no_mangle)]
@@ -208,6 +208,7 @@ fn main() {
         // Accept connection
         let channel = syscall::port_accept(listen_channel as u32);
         if channel < 0 {
+            flush_log();
             syscall::yield_now();
             continue;
         }
