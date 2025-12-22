@@ -254,6 +254,11 @@ bss_done:
     orr     x4, x4, #(1 << 12)      // I: Enable instruction cache
     mov     x5, #(1 << 26)
     orr     x4, x4, x5              // UCI: Allow cache maint from EL0
+    /* Enable PAN (Privileged Access Never) for security
+     * SPAN (bit 23) = 0 means PSTATE.PAN = 1 on exception entry
+     * This prevents kernel from accidentally accessing user memory */
+    mov     x5, #(1 << 23)
+    bic     x4, x4, x5              // Clear SPAN to enable PAN
     msr     sctlr_el1, x4
     isb
 
