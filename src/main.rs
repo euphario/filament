@@ -253,17 +253,17 @@ pub extern "C" fn kmain() -> ! {
     }
     println!("[OK] Interrupts enabled");
 
-    // Spawn shell process
+    // Spawn devd (device supervisor / init)
     println!();
     println!("========================================");
-    println!("  Spawning shell");
+    println!("  Spawning devd (PID 1)");
     println!("========================================");
 
-    // Spawn interactive shell from ramfs
-    let slot1 = match elf::spawn_from_path("bin/shell") {
+    // Spawn device supervisor from ramfs - it will spawn shell and drivers
+    let slot1 = match elf::spawn_from_path("bin/devd") {
         Ok((_task_id, slot)) => {
-            println!("  Process 'shell' spawned at slot {}", slot);
-            // Give shell ALL capabilities (it's the root shell)
+            println!("  Process 'devd' spawned at slot {}", slot);
+            // Give devd ALL capabilities (it's init/PID 1)
             unsafe {
                 if let Some(ref mut task) = task::scheduler().tasks[slot] {
                     task.set_capabilities(kernel::caps::Capabilities::ALL);
@@ -272,7 +272,7 @@ pub extern "C" fn kmain() -> ! {
             Some(slot)
         }
         Err(e) => {
-            println!("  [!!] Failed to spawn shell: {:?}", e);
+            println!("  [!!] Failed to spawn devd: {:?}", e);
             None
         }
     };
