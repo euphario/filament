@@ -911,15 +911,33 @@ pub unsafe fn switch_context(current: &mut Task, next: &Task) {
 }
 
 /// Simple scheduler state
+///
+/// The scheduler manages all tasks and their state. For SMP safety:
+/// - Task array modifications are protected by IrqGuard (single-core) or SpinLock (SMP)
+/// - Current task index is stored per-CPU via percpu module
+/// - The `current` field is deprecated - use `current_slot()` function instead
 pub struct Scheduler {
-    /// All tasks
+    /// All tasks (shared across CPUs)
     pub tasks: [Option<Task>; MAX_TASKS],
-    /// Currently running task index
+    /// Currently running task index (DEPRECATED - use current_slot())
+    /// Kept for backwards compatibility during migration
     pub current: usize,
     /// Generation counter per slot - increments when slot is reused
     /// PID = (slot + 1) | (generation << 8)
     /// This ensures stale PIDs from terminated tasks don't match new tasks
     generations: [u32; MAX_TASKS],
+}
+
+/// Get current CPU's running task slot index (SMP-safe)
+#[inline]
+pub fn current_slot() -> usize {
+    super::percpu::cpu_local().get_current_slot()
+}
+
+/// Set current CPU's running task slot index (SMP-safe)
+#[inline]
+pub fn set_current_slot(slot: usize) {
+    super::percpu::cpu_local().set_current_slot(slot);
 }
 
 impl Scheduler {
@@ -1047,24 +1065,25 @@ impl Scheduler {
         self.tasks.get_mut(slot).and_then(|t| t.as_mut())
     }
 
-    /// Get current task
+    /// Get current task (uses per-CPU slot)
     pub fn current_task(&self) -> Option<&Task> {
-        self.tasks[self.current].as_ref()
+        self.tasks[current_slot()].as_ref()
     }
 
-    /// Get current task mutably
+    /// Get current task mutably (uses per-CPU slot)
     pub fn current_task_mut(&mut self) -> Option<&mut Task> {
-        self.tasks[self.current].as_mut()
+        self.tasks[current_slot()].as_mut()
     }
 
-    /// Get current task ID
+    /// Get current task ID (uses per-CPU slot)
     pub fn current_task_id(&self) -> Option<TaskId> {
-        self.tasks[self.current].as_ref().map(|t| t.id)
+        self.tasks[current_slot()].as_ref().map(|t| t.id)
     }
 
-    /// Terminate current task
+    /// Terminate current task (uses per-CPU slot)
     pub fn terminate_current(&mut self, _exit_code: i32) {
-        if let Some(ref mut task) = self.tasks[self.current] {
+        let slot = current_slot();
+        if let Some(ref mut task) = self.tasks[slot] {
             task.state = TaskState::Terminated;
         }
     }
@@ -1091,6 +1110,8 @@ impl Scheduler {
     /// # Safety
     /// Task must be properly set up with valid trap frame and address space
     pub unsafe fn run_user_task(&mut self, slot: usize) -> ! {
+        // Update both per-CPU and legacy field
+        set_current_slot(slot);
         self.current = slot;
 
         if let Some(ref mut task) = self.tasks[slot] {
@@ -1132,12 +1153,13 @@ impl Scheduler {
     /// Higher priority tasks (lower Priority value) always run first.
     /// Among same-priority tasks, uses round-robin for fairness.
     pub fn schedule(&mut self) -> Option<usize> {
+        let my_slot = current_slot();  // Use per-CPU current slot
         let mut best_slot: Option<usize> = None;
         let mut best_priority = Priority::Low;  // Start with lowest priority
 
         // First pass: find the highest priority ready task
         // Use round-robin starting from current+1 for fairness
-        let start = (self.current + 1) % MAX_TASKS;
+        let start = (my_slot + 1) % MAX_TASKS;
         for i in 0..MAX_TASKS {
             let slot = (start + i) % MAX_TASKS;
             if let Some(ref task) = self.tasks[slot] {
@@ -1161,9 +1183,9 @@ impl Scheduler {
         }
 
         // Check if current task is still runnable (fallback)
-        if let Some(ref task) = self.tasks[self.current] {
+        if let Some(ref task) = self.tasks[my_slot] {
             if task.state == TaskState::Running || task.state == TaskState::Ready {
-                return Some(self.current);
+                return Some(my_slot);
             }
         }
 
@@ -1174,9 +1196,11 @@ impl Scheduler {
     /// # Safety
     /// Must be called with interrupts disabled
     pub unsafe fn switch_to_next(&mut self) {
+        let my_slot = current_slot();  // Use per-CPU current slot
+
         if let Some(next_idx) = self.schedule() {
-            if next_idx != self.current {
-                let caller_slot = self.current;  // Save our slot before switching
+            if next_idx != my_slot {
+                let caller_slot = my_slot;  // Save our slot before switching
 
                 // Mark current as ready (if still running)
                 if let Some(ref mut current) = self.tasks[caller_slot] {
@@ -1205,7 +1229,8 @@ impl Scheduler {
                     }
                 }
 
-                // Update current index
+                // Update current index (both per-CPU and legacy field)
+                set_current_slot(next_idx);
                 self.current = next_idx;
 
                 // Mark next as running
@@ -1223,6 +1248,7 @@ impl Scheduler {
 
                 // We return here when switched back to this task.
                 // Restore our slot (was saved on stack before switch).
+                set_current_slot(caller_slot);
                 self.current = caller_slot;
 
                 // Mark ourselves as Running again
@@ -1249,6 +1275,8 @@ impl Scheduler {
     /// # Safety
     /// Must be called with interrupts disabled
     pub unsafe fn direct_switch_to(&mut self, target_pid: TaskId) -> bool {
+        let my_slot = current_slot();  // Use per-CPU current slot
+
         // Find target slot
         let target_slot = match self.slot_by_pid(target_pid) {
             Some(slot) => slot,
@@ -1256,7 +1284,7 @@ impl Scheduler {
         };
 
         // Don't switch to self
-        if target_slot == self.current {
+        if target_slot == my_slot {
             return false;
         }
 
@@ -1269,7 +1297,7 @@ impl Scheduler {
             return false;
         }
 
-        let caller_slot = self.current;  // Save our slot before switching
+        let caller_slot = my_slot;  // Save our slot before switching
 
         // Mark current as ready (donating timeslice)
         if let Some(ref mut current) = self.tasks[caller_slot] {
@@ -1298,7 +1326,8 @@ impl Scheduler {
             }
         }
 
-        // Update current and mark target as running
+        // Update current (both per-CPU and legacy field) and mark target as running
+        set_current_slot(target_slot);
         self.current = target_slot;
         if let Some(ref mut t) = self.tasks[target_slot] {
             t.state = TaskState::Running;
@@ -1316,6 +1345,7 @@ impl Scheduler {
 
         // Returned here when switched back to this task.
         // Restore our slot (was saved on stack before switch).
+        set_current_slot(caller_slot);
         self.current = caller_slot;
 
         // Mark ourselves as Running again
