@@ -7,11 +7,17 @@
 //! - Each address space gets a unique 8-bit ASID (256 values, 0 reserved)
 //! - ASID is encoded in TTBR0 bits [63:48] for hardware tagging
 //! - Allows per-ASID TLB invalidation instead of global flush
+//!
+//! ## Thread Safety
+//!
+//! The ASID allocator is protected by a SpinLock with IRQ-save semantics,
+//! making it safe to call from both process and interrupt context.
 
 #![allow(dead_code)]
 
 use crate::arch::aarch64::mmu::{self, KERNEL_VIRT_BASE, flags, attr};
 use super::pmm;
+use super::lock::SpinLock;
 use crate::logln;
 
 // ============================================================================
@@ -22,11 +28,16 @@ use crate::logln;
 const MAX_ASID: u16 = 255;
 
 /// ASID allocator - simple bitmap for 255 ASIDs (ASID 0 reserved)
+///
+/// This allocator uses a rotor-style hint to find free ASIDs quickly.
+/// Thread-safe when accessed through the SpinLock wrapper.
 struct AsidAllocator {
     /// Bitmap: bit N = 1 if ASID N+1 is in use
     bitmap: [u64; 4],  // 256 bits
     /// Next ASID to try (for faster allocation)
     next_hint: u16,
+    /// Count of allocated ASIDs (for debugging)
+    allocated_count: u16,
 }
 
 impl AsidAllocator {
@@ -34,6 +45,7 @@ impl AsidAllocator {
         Self {
             bitmap: [0; 4],
             next_hint: 1,  // Start at ASID 1 (0 reserved)
+            allocated_count: 0,
         }
     }
 
@@ -54,6 +66,7 @@ impl AsidAllocator {
                 // Found free ASID
                 self.bitmap[word] |= 1u64 << bit;
                 self.next_hint = if asid < MAX_ASID { asid + 1 } else { 1 };
+                self.allocated_count += 1;
                 return Some(asid);
             }
 
@@ -69,21 +82,38 @@ impl AsidAllocator {
         }
         let word = (asid - 1) as usize / 64;
         let bit = (asid - 1) as usize % 64;
-        self.bitmap[word] &= !(1u64 << bit);
+
+        // Only decrement count if actually allocated
+        if (self.bitmap[word] & (1u64 << bit)) != 0 {
+            self.bitmap[word] &= !(1u64 << bit);
+            self.allocated_count = self.allocated_count.saturating_sub(1);
+        }
+    }
+
+    /// Get count of allocated ASIDs
+    #[allow(dead_code)]
+    fn count(&self) -> u16 {
+        self.allocated_count
     }
 }
 
-/// Global ASID allocator
-static mut ASID_ALLOCATOR: AsidAllocator = AsidAllocator::new();
+/// Global ASID allocator protected by SpinLock
+///
+/// The SpinLock provides:
+/// - IRQ-safe access (disables interrupts while held)
+/// - SMP-safe access (atomic spinlock for multi-core)
+static ASID_ALLOCATOR: SpinLock<AsidAllocator> = SpinLock::new(AsidAllocator::new());
 
-/// Allocate an ASID
+/// Allocate an ASID (thread-safe)
 fn alloc_asid() -> Option<u16> {
-    unsafe { ASID_ALLOCATOR.alloc() }
+    let mut guard = ASID_ALLOCATOR.lock();
+    guard.alloc()
 }
 
-/// Free an ASID
+/// Free an ASID (thread-safe)
 fn free_asid(asid: u16) {
-    unsafe { ASID_ALLOCATOR.free(asid) }
+    let mut guard = ASID_ALLOCATOR.lock();
+    guard.free(asid);
 }
 
 /// Convert a physical address to a kernel virtual address for access via TTBR1

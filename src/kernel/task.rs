@@ -9,6 +9,7 @@ use super::addrspace::AddressSpace;
 use super::event::EventQueue;
 use super::fd::FdTable;
 use super::pmm;
+use crate::arch::aarch64::tlb;
 use crate::logln;
 
 /// Task states
@@ -555,19 +556,9 @@ impl Task {
         }
 
         // Invalidate TLB entries for the newly mapped pages
-        // This ensures the CPU uses the new device memory attributes
-        unsafe {
-            for i in 0..num_pages {
-                let page_virt = virt_addr + (i * 4096) as u64;
-                // TLBI expects VA[55:12] in bits[43:0] of the operand
-                let tlbi_addr = page_virt >> 12;
-                core::arch::asm!(
-                    "tlbi vale1is, {addr}",
-                    addr = in(reg) tlbi_addr,
-                );
-            }
-            core::arch::asm!("dsb ish", "isb");
-        }
+        // This ensures the CPU uses the new DMA memory attributes
+        let asid = self.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
+        tlb::invalidate_va_range(asid, virt_addr, num_pages);
 
         // Record mapping - OwnedDma because kernel allocated these pages for DMA
         self.heap_mappings[slot] = HeapMapping {
@@ -613,17 +604,8 @@ impl Task {
         }
 
         // Invalidate TLB entries for the newly mapped pages
-        unsafe {
-            for i in 0..num_pages {
-                let page_virt = virt_addr + (i * 4096) as u64;
-                let tlbi_addr = page_virt >> 12;
-                core::arch::asm!(
-                    "tlbi vale1is, {addr}",
-                    addr = in(reg) tlbi_addr,
-                );
-            }
-            core::arch::asm!("dsb ish", "isb");
-        }
+        let asid = self.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
+        tlb::invalidate_va_range(asid, virt_addr, num_pages);
 
         // Record mapping - BorrowedShmem because pages are owned by shmem region
         // CRITICAL: Do NOT free these pages on unmap - they belong to the shmem owner
@@ -670,17 +652,8 @@ impl Task {
         }
 
         // Invalidate TLB entries for the newly mapped pages
-        unsafe {
-            for i in 0..num_pages {
-                let page_virt = virt_addr + (i * 4096) as u64;
-                let tlbi_addr = page_virt >> 12;
-                core::arch::asm!(
-                    "tlbi vale1is, {addr}",
-                    addr = in(reg) tlbi_addr,
-                );
-            }
-            core::arch::asm!("dsb ish", "isb");
-        }
+        let asid = self.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
+        tlb::invalidate_va_range(asid, virt_addr, num_pages);
 
         // Record mapping - DeviceMmio because this is MMIO, NOT RAM
         // CRITICAL: NEVER free these "pages" - they are hardware registers!
@@ -724,26 +697,9 @@ impl Task {
         }
 
         // Invalidate TLB entries for the unmapped pages
-        // Use tlbi vale1is (VA, Last level, EL1, Inner Shareable) for each page
-        for i in 0..mapping.num_pages {
-            let page_virt = mapping.virt_addr + (i * 4096) as u64;
-            // TLBI expects VA[55:12] in bits[43:0] of the operand
-            let tlbi_addr = page_virt >> 12;
-            unsafe {
-                core::arch::asm!(
-                    "tlbi vale1is, {addr}",
-                    addr = in(reg) tlbi_addr,
-                );
-            }
-        }
-
-        // Ensure TLB invalidation completes before freeing physical memory
-        unsafe {
-            core::arch::asm!(
-                "dsb ish",  // Ensure TLB invalidation completes
-                "isb",      // Synchronize instruction stream
-            );
-        }
+        // Use centralized TLB API with proper ASID tagging
+        let asid = self.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
+        tlb::invalidate_va_range(asid, mapping.virt_addr, mapping.num_pages);
 
         // Only free physical pages if we own them
         // CRITICAL: BorrowedShmem and DeviceMmio must NOT free pages!

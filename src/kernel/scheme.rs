@@ -14,6 +14,7 @@
 //! - `console:` - serial console I/O
 
 use super::fd::{FdEntry, FdFlags, FdType};
+use crate::arch::aarch64::tlb;
 use crate::logln;
 
 /// Maximum number of registered schemes
@@ -981,16 +982,9 @@ impl KernelScheme for MmioScheme {
                         }
                     }
 
-                    // Invalidate TLB for the new mappings
-                    for i in 0..num_pages {
-                        let page_virt = virt_addr + (i * 4096) as u64;
-                        let tlbi_addr = page_virt >> 12;
-                        core::arch::asm!(
-                            "tlbi vale1is, {addr}",
-                            addr = in(reg) tlbi_addr,
-                        );
-                    }
-                    core::arch::asm!("dsb ish", "isb");
+                    // Invalidate TLB for the new mappings using centralized API
+                    let asid = addr_space.get_asid();
+                    tlb::invalidate_va_range(asid, virt_addr, num_pages);
                 } else {
                     return Err(-1); // Not a user task
                 }
@@ -1036,18 +1030,15 @@ impl KernelScheme for MmioScheme {
             let sched = super::task::scheduler();
             if let Some(ref mut task) = sched.tasks[sched.current] {
                 if let Some(ref mut addr_space) = task.address_space {
+                    // Unmap all pages first
                     for i in 0..num_pages {
                         let page_virt = virt_addr + (i * 4096) as u64;
                         addr_space.unmap_page(page_virt);
-
-                        // Invalidate TLB
-                        let tlbi_addr = page_virt >> 12;
-                        core::arch::asm!(
-                            "tlbi vale1is, {addr}",
-                            addr = in(reg) tlbi_addr,
-                        );
                     }
-                    core::arch::asm!("dsb ish", "isb");
+
+                    // Invalidate TLB using centralized API
+                    let asid = addr_space.get_asid();
+                    tlb::invalidate_va_range(asid, virt_addr, num_pages);
                 }
             }
         }
