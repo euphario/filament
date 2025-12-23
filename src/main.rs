@@ -51,6 +51,10 @@ pub extern "C" fn kmain() -> ! {
     // Initialize per-CPU infrastructure early (sets TPIDR_EL1)
     percpu::init_boot_cpu();
 
+    // Verify PAN (Privileged Access Never) is enabled for security
+    // This prevents kernel from accidentally accessing user memory directly
+    sync::verify_pan_enabled();
+
     // Initialize logging (after UART so we can print)
     log::init();
 

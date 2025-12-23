@@ -1,19 +1,36 @@
 //! User Space Memory Access Validation
-
-#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Provides safe functions for accessing user space memory from syscalls.
 //! This is critical for kernel security - prevents userspace from tricking
 //! the kernel into reading/writing arbitrary memory.
 //!
-//! Memory layout (48-bit VA):
+//! # Security Model (PAN-Safe Design)
+//!
+//! This module is designed to work with ARM's PAN (Privileged Access Never)
+//! feature. When PAN is enabled (which it is - see boot.S), the kernel
+//! cannot directly dereference user pointers. This prevents bugs like:
+//! - Accidentally treating user pointers as kernel pointers
+//! - TOCTOU races where user memory changes between check and use
+//!
+//! Instead, we use a translation-based approach:
+//! 1. Walk the user's page tables to translate VA → PA
+//! 2. Access the physical memory via TTBR1 (kernel virtual address)
+//!
+//! This means we NEVER clear PAN - user memory is always accessed through
+//! explicit translation. Any code that tries to directly dereference a
+//! user pointer will fault with a permission error.
+//!
+//! # Memory Layout (48-bit VA)
+//!
 //! - User space:   0x0000_0000_0000_0000 - 0x0000_FFFF_FFFF_FFFF (TTBR0)
 //! - Kernel space: 0xFFFF_0000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF (TTBR1)
 //!
-//! IMPORTANT: During syscall handling, TTBR0 is switched to the kernel's identity
-//! mapping. To access user memory, we must:
-//! 1. Translate user VA to PA using the user's page tables
+//! During syscall handling, TTBR0 may point to kernel identity mapping.
+//! To access user memory safely, we:
+//! 1. Translate user VA to PA using the user's saved page tables
 //! 2. Access the physical memory via TTBR1 (kernel virtual address)
+
+#![allow(dead_code)]  // Infrastructure for future use
 
 use crate::arch::aarch64::mmu::{self, flags, PAGE_SIZE, KERNEL_VIRT_BASE};
 use super::task;

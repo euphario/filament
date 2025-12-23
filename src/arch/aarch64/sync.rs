@@ -160,6 +160,50 @@ pub fn in_interrupt_context() -> bool {
     (daif & (1 << 7)) != 0
 }
 
+// ============================================================================
+// PAN (Privileged Access Never) Support
+// ============================================================================
+
+/// Check if PAN (Privileged Access Never) is currently enabled.
+///
+/// PAN prevents the kernel from accidentally accessing user memory directly.
+/// When PAN is enabled, any load/store to user addresses from EL1 causes a fault.
+///
+/// This is a security feature - the kernel should always access user memory
+/// through explicit uaccess helpers that translate VA→PA and access via TTBR1.
+#[inline]
+pub fn is_pan_enabled() -> bool {
+    let pstate: u64;
+    unsafe {
+        // Read PSTATE.PAN via the PAN system register
+        core::arch::asm!("mrs {}, S3_0_C4_C2_3", out(reg) pstate);
+    }
+    // PAN bit is bit 22 in PSTATE
+    (pstate & (1 << 22)) != 0
+}
+
+/// Verify that PAN is enabled and working correctly.
+///
+/// This should be called early in kernel initialization to ensure
+/// the security feature is active. Panics if PAN is not enabled.
+pub fn verify_pan_enabled() {
+    if !is_pan_enabled() {
+        panic!("PAN (Privileged Access Never) is not enabled! Security risk.");
+    }
+}
+
+/// Debug: Get SCTLR_EL1 for checking SPAN bit
+/// SPAN=0 means PAN is set on exception entry
+#[inline]
+pub fn get_sctlr_span() -> bool {
+    let sctlr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr);
+    }
+    // SPAN is bit 23
+    (sctlr & (1 << 23)) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,7 +22,60 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+// ============================================================================
+// Debug Statistics (for diagnosing lock contention)
+// ============================================================================
+
+#[cfg(debug_assertions)]
+mod stats {
+    use super::*;
+
+    /// Per-CPU lock nesting depth
+    static LOCK_DEPTH: [AtomicU32; 4] = [
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+    ];
+
+    /// Maximum allowed lock nesting depth
+    pub const MAX_LOCK_DEPTH: u32 = 8;
+
+    /// Increment lock depth, panic if too deep
+    pub fn increment_depth(cpu: u32) {
+        if (cpu as usize) < LOCK_DEPTH.len() {
+            let depth = LOCK_DEPTH[cpu as usize].fetch_add(1, Ordering::Relaxed) + 1;
+            if depth > MAX_LOCK_DEPTH {
+                panic!(
+                    "Lock nesting too deep ({} > {}) on CPU {} - possible deadlock or bad design",
+                    depth, MAX_LOCK_DEPTH, cpu
+                );
+            }
+        }
+    }
+
+    /// Decrement lock depth
+    pub fn decrement_depth(cpu: u32) {
+        if (cpu as usize) < LOCK_DEPTH.len() {
+            let old = LOCK_DEPTH[cpu as usize].fetch_sub(1, Ordering::Relaxed);
+            if old == 0 {
+                // This should never happen - indicates mismatched lock/unlock
+                panic!("Lock depth underflow on CPU {} - mismatched lock/unlock", cpu);
+            }
+        }
+    }
+
+    /// Get current lock depth for a CPU
+    pub fn get_depth(cpu: u32) -> u32 {
+        if (cpu as usize) < LOCK_DEPTH.len() {
+            LOCK_DEPTH[cpu as usize].load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    }
+}
 
 /// A spinlock that protects data with IRQ-safe semantics.
 ///
@@ -90,11 +143,16 @@ impl<T> SpinLock<T> {
         }
 
         #[cfg(debug_assertions)]
-        self.owner_cpu.store(cpu, Ordering::Relaxed);
+        {
+            self.owner_cpu.store(cpu, Ordering::Relaxed);
+            stats::increment_depth(cpu);
+        }
 
         SpinLockGuard {
             lock: self,
             irqs_were_enabled,
+            #[cfg(debug_assertions)]
+            owner_cpu: cpu,
         }
     }
 
@@ -114,11 +172,18 @@ impl<T> SpinLock<T> {
         }
 
         #[cfg(debug_assertions)]
-        self.owner_cpu.store(cpu_id(), Ordering::Relaxed);
+        let cpu = cpu_id();
+        #[cfg(debug_assertions)]
+        {
+            self.owner_cpu.store(cpu, Ordering::Relaxed);
+            stats::increment_depth(cpu);
+        }
 
         Some(SpinLockGuard {
             lock: self,
             irqs_were_enabled,
+            #[cfg(debug_assertions)]
+            owner_cpu: cpu,
         })
     }
 
@@ -160,6 +225,8 @@ impl<T> SpinLock<T> {
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
     irqs_were_enabled: bool,
+    #[cfg(debug_assertions)]
+    owner_cpu: u32,
 }
 
 impl<'a, T> Deref for SpinLockGuard<'a, T> {
@@ -183,9 +250,12 @@ impl<'a, T> DerefMut for SpinLockGuard<'a, T> {
 impl<'a, T> Drop for SpinLockGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
-        // Step 1: Clear owner (debug only)
+        // Step 1: Update debug stats and clear owner
         #[cfg(debug_assertions)]
-        self.lock.owner_cpu.store(u32::MAX, Ordering::Relaxed);
+        {
+            stats::decrement_depth(self.owner_cpu);
+            self.lock.owner_cpu.store(u32::MAX, Ordering::Relaxed);
+        }
 
         // Step 2: Release spinlock
         self.lock.locked.store(false, Ordering::Release);
@@ -228,6 +298,42 @@ fn cpu_id() -> u32 {
     // Extract Aff0 (CPU ID within cluster)
     (mpidr & 0xFF) as u32
 }
+
+/// Get the current lock nesting depth for this CPU (debug builds only).
+///
+/// Returns 0 if no locks are held, or the number of nested locks.
+/// This is useful for debugging and ensuring locks are properly released.
+#[cfg(debug_assertions)]
+pub fn current_lock_depth() -> u32 {
+    stats::get_depth(cpu_id())
+}
+
+/// Get the current lock nesting depth for this CPU.
+/// Always returns 0 in release builds.
+#[cfg(not(debug_assertions))]
+pub fn current_lock_depth() -> u32 {
+    0
+}
+
+/// Assert that no locks are currently held on this CPU.
+///
+/// Use this before blocking operations or at context switch points.
+/// Panics in debug builds if any locks are held.
+#[cfg(debug_assertions)]
+pub fn assert_no_locks_held() {
+    let depth = current_lock_depth();
+    if depth > 0 {
+        panic!(
+            "assert_no_locks_held failed: {} lock(s) still held on CPU {}",
+            depth, cpu_id()
+        );
+    }
+}
+
+/// Assert that no locks are currently held (no-op in release builds).
+#[cfg(not(debug_assertions))]
+#[inline]
+pub fn assert_no_locks_held() {}
 
 // ============================================================================
 // Read-Write Lock (for future use)
