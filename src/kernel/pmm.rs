@@ -7,9 +7,15 @@
 //! Each free page's first 8 bytes stores the next pointer (intrusive list).
 //! Note: Free list entries store physical addresses, but access is done
 //! through kernel virtual addresses (KERNEL_VIRT_BASE | phys_addr).
+//!
+//! ## Thread Safety
+//!
+//! All operations are protected by a SpinLock with IRQ-save semantics.
+//! This is safe to call from both process and interrupt context.
 
 use crate::logln;
 use crate::arch::aarch64::mmu::KERNEL_VIRT_BASE;
+use super::lock::SpinLock;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -20,11 +26,23 @@ const DRAM_START: usize = 0x40000000;
 /// End of usable DRAM (4GB total, but we'll use 1GB for now)
 const DRAM_END: usize = 0x80000000; // 1GB usable
 
-/// Kernel load address
-const KERNEL_START: usize = 0x46000000;
+// Linker symbols for kernel boundaries (virtual addresses)
+extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
 
-/// Kernel reserved size (2MB for kernel + embedded initrd + IPC buffers)
-const KERNEL_SIZE: usize = 0x200000;
+/// Kernel physical load address (must match linker script)
+const KERNEL_PHYS_BASE: usize = 0x46000000;
+
+/// Get kernel size in bytes (computed from linker symbols)
+fn kernel_size() -> usize {
+    unsafe {
+        let virt_end = &__kernel_end as *const u8 as usize;
+        let virt_start = &__kernel_start as *const u8 as usize;
+        virt_end - virt_start
+    }
+}
 
 /// Number of pages we manage
 const NUM_PAGES: usize = (DRAM_END - DRAM_START) / PAGE_SIZE;
@@ -63,14 +81,22 @@ impl PhysicalMemoryManager {
         self.free_pages = self.total_pages;
         self.free_list_head = 0;
 
+        // Get kernel boundaries from linker symbols (dynamic size, not hardcoded)
+        let k_start = KERNEL_PHYS_BASE;
+        let k_size = kernel_size();
+        // Round up kernel size to page boundary and add safety margin (256KB)
+        let k_reserved = ((k_size + PAGE_SIZE - 1) / PAGE_SIZE + 64) * PAGE_SIZE;
+
         // Mark kernel region as used (don't add to free list)
-        let kernel_start_page = (KERNEL_START - DRAM_START) / PAGE_SIZE;
-        let kernel_pages = KERNEL_SIZE / PAGE_SIZE;
+        let kernel_start_page = (k_start - DRAM_START) / PAGE_SIZE;
+        let kernel_pages = k_reserved / PAGE_SIZE;
         for i in kernel_start_page..(kernel_start_page + kernel_pages) {
-            self.mark_used_no_list(i);
+            if i < self.total_pages {
+                self.mark_used_no_list(i);
+            }
         }
 
-        // Mark first few pages as used (safety buffer)
+        // Mark first few pages as used (safety buffer for U-Boot, DTB, etc.)
         for i in 0..16 {
             self.mark_used_no_list(i);
         }
@@ -232,44 +258,50 @@ impl PhysicalMemoryManager {
     }
 }
 
-/// Global PMM instance
-static mut PMM: PhysicalMemoryManager = PhysicalMemoryManager::new();
+/// Global PMM instance protected by SpinLock
+///
+/// The SpinLock provides:
+/// - IRQ-safe access (disables interrupts while held)
+/// - SMP-safe access (atomic spinlock for multi-core)
+static PMM: SpinLock<PhysicalMemoryManager> = SpinLock::new(PhysicalMemoryManager::new());
 
 /// Execute a closure with exclusive access to the PMM.
-/// Automatically disables interrupts for the duration.
-/// Use this for compound operations that need to be atomic.
+/// The SpinLock automatically handles IRQ disable/enable.
 #[inline]
 #[allow(dead_code)]
 pub fn with_pmm<R, F: FnOnce(&mut PhysicalMemoryManager) -> R>(f: F) -> R {
-    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
-    unsafe { f(&mut *core::ptr::addr_of_mut!(PMM)) }
+    let mut guard = PMM.lock();
+    f(&mut *guard)
 }
 
 /// Initialize the physical memory manager
 pub fn init() {
-    unsafe {
-        (*core::ptr::addr_of_mut!(PMM)).init();
-    }
+    let mut guard = PMM.lock();
+    guard.init();
 }
 
 /// Allocate a page
 pub fn alloc_page() -> Option<usize> {
-    unsafe { (*core::ptr::addr_of_mut!(PMM)).alloc_page() }
+    let mut guard = PMM.lock();
+    guard.alloc_page()
 }
 
 /// Allocate contiguous pages
 pub fn alloc_pages(count: usize) -> Option<usize> {
-    unsafe { (*core::ptr::addr_of_mut!(PMM)).alloc_pages(count) }
+    let mut guard = PMM.lock();
+    guard.alloc_pages(count)
 }
 
 /// Free a page
 pub fn free_page(addr: usize) {
-    unsafe { (*core::ptr::addr_of_mut!(PMM)).free_page(addr) }
+    let mut guard = PMM.lock();
+    guard.free_page(addr);
 }
 
 /// Free contiguous pages
 pub fn free_pages(addr: usize, count: usize) {
-    unsafe { (*core::ptr::addr_of_mut!(PMM)).free_pages(addr, count) }
+    let mut guard = PMM.lock();
+    guard.free_pages(addr, count);
 }
 
 /// Allocate contiguous physical pages (alias for alloc_pages)
@@ -285,23 +317,23 @@ pub fn free_contiguous(addr: usize, count: usize) {
 
 /// Get free page count
 pub fn free_count() -> usize {
-    unsafe { (*core::ptr::addr_of!(PMM)).free_count() }
+    let guard = PMM.lock();
+    guard.free_count()
 }
 
 /// Get total page count
 pub fn total_count() -> usize {
-    unsafe { (*core::ptr::addr_of!(PMM)).total_count() }
+    let guard = PMM.lock();
+    guard.total_count()
 }
 
 /// Print memory info
 pub fn print_info() {
-    unsafe {
-        let pmm = &*core::ptr::addr_of!(PMM);
-        let free_mb = pmm.free_memory() / (1024 * 1024);
-        let total_mb = (pmm.total_count() * PAGE_SIZE) / (1024 * 1024);
-        logln!("  Total:  {} pages ({} MB)", pmm.total_count(), total_mb);
-        logln!("  Free:   {} pages ({} MB)", pmm.free_count(), free_mb);
-    }
+    let guard = PMM.lock();
+    let free_mb = guard.free_memory() / (1024 * 1024);
+    let total_mb = (guard.total_count() * PAGE_SIZE) / (1024 * 1024);
+    logln!("  Total:  {} pages ({} MB)", guard.total_count(), total_mb);
+    logln!("  Free:   {} pages ({} MB)", guard.free_count(), free_mb);
 }
 
 /// Test the allocator
