@@ -620,7 +620,7 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
                     task.state = super::task::TaskState::Running;
                 }
                 super::task::update_current_task_globals();
-                super::task::SYSCALL_SWITCHED_TASK = 1;
+                super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
 
                 // Return value is ignored since we switched tasks
                 return Err(-11); // EAGAIN

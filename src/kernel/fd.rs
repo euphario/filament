@@ -339,7 +339,7 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                                             next.state = super::task::TaskState::Running;
                                         }
                                         super::task::update_current_task_globals();
-                                        super::task::SYSCALL_SWITCHED_TASK = 1;
+                                        super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
                                     }
                                 }
                             } else {
@@ -381,8 +381,8 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                         }
                         MessageType::Error => {
                             // Extract error code from payload
-                            if msg.header.payload_len >= 4 {
-                                let err_bytes: [u8; 4] = msg.payload[0..4].try_into().unwrap();
+                            if let Some(err_bytes) = msg.payload.get(0..4)
+                                .and_then(|s| <[u8; 4]>::try_from(s).ok()) {
                                 i32::from_le_bytes(err_bytes) as isize
                             } else {
                                 -5 // EIO

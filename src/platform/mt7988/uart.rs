@@ -6,6 +6,8 @@
 //!
 //! Features buffered output - writes go to a ring buffer and are flushed
 //! asynchronously (on timer tick) to avoid blocking userspace.
+//!
+//! SMP-safe: All access protected by SpinLock.
 
 #![allow(dead_code)]
 
@@ -13,6 +15,7 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch::aarch64::mmio::MmioRegion;
 use crate::hal::Uart as UartTrait;
+use crate::kernel::lock::SpinLock;
 use super::UART0_BASE;
 
 // ============================================================================
@@ -76,8 +79,8 @@ impl UartBuffer {
     }
 }
 
-/// Global UART output buffer
-static mut UART_BUFFER: UartBuffer = UartBuffer::new();
+/// Global UART output buffer (SMP-safe)
+static UART_BUFFER: SpinLock<UartBuffer> = SpinLock::new(UartBuffer::new());
 
 // ============================================================================
 // UART Hardware Driver
@@ -255,48 +258,33 @@ impl UartTrait for Uart {
     }
 }
 
-/// Global UART instance (using raw pointer for Rust 2024 compatibility)
+/// Global UART instance (SMP-safe)
 /// pub for macro access
-pub static mut UART: Uart = Uart::new();
+pub static UART: SpinLock<Uart> = SpinLock::new(Uart::new());
 
 /// Initialize the global UART
 pub fn init() {
-    // SAFETY: Single-threaded bare-metal environment, called once at startup
-    unsafe {
-        (*core::ptr::addr_of_mut!(UART)).init();
-    }
+    UART.lock().init();
 }
 
 /// Print a string to the console
 pub fn print(s: &str) {
-    // SAFETY: Single-threaded bare-metal environment
-    unsafe {
-        (*core::ptr::addr_of_mut!(UART)).puts(s);
-    }
+    UART.lock().puts(s);
 }
 
 /// Print a single character
 pub fn putc(c: char) {
-    // SAFETY: Single-threaded bare-metal environment
-    unsafe {
-        (*core::ptr::addr_of_mut!(UART)).putc(c as u8);
-    }
+    UART.lock().putc(c as u8);
 }
 
 /// Try to read a character (non-blocking)
 pub fn try_getc() -> Option<char> {
-    // SAFETY: Single-threaded bare-metal environment
-    unsafe {
-        (*core::ptr::addr_of!(UART)).try_getc().map(|b| b as char)
-    }
+    UART.lock().try_getc().map(|b| b as char)
 }
 
 /// Read a character (blocking)
 pub fn getc() -> char {
-    // SAFETY: Single-threaded bare-metal environment
-    unsafe {
-        (*core::ptr::addr_of!(UART)).getc() as char
-    }
+    UART.lock().getc() as char
 }
 
 /// Print formatted output to the console
@@ -304,10 +292,7 @@ pub fn getc() -> char {
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        // SAFETY: Single-threaded bare-metal environment
-        unsafe {
-            let _ = write!(&mut *core::ptr::addr_of_mut!($crate::platform::mt7988::uart::UART), $($arg)*);
-        }
+        let _ = write!(&mut *$crate::platform::mt7988::uart::UART.lock(), $($arg)*);
     }};
 }
 
@@ -321,10 +306,10 @@ macro_rules! println {
     }};
 }
 
-/// Get mutable reference to global UART (unsafe)
-/// SAFETY: Caller must ensure single-threaded access
-pub unsafe fn get_uart() -> &'static mut Uart {
-    &mut *core::ptr::addr_of_mut!(UART)
+/// Get access to UART via lock guard
+/// Returns a guard that provides mutable access to UART
+pub fn get_uart_lock() -> crate::kernel::lock::SpinLockGuard<'static, Uart> {
+    UART.lock()
 }
 
 // ============================================================================
@@ -334,31 +319,43 @@ pub unsafe fn get_uart() -> &'static mut Uart {
 /// Write a string to the output buffer (non-blocking)
 /// Used by sys_write for STDOUT - doesn't block waiting for UART
 pub fn print_buffered(s: &str) {
-    unsafe {
-        let buf = &mut *core::ptr::addr_of_mut!(UART_BUFFER);
-        for byte in s.bytes() {
-            if byte == b'\n' {
-                let _ = buf.push(b'\r');
+    let mut buf = UART_BUFFER.lock();
+    for byte in s.bytes() {
+        if byte == b'\n' {
+            let _ = buf.push(b'\r');
+        }
+        if !buf.push(byte) {
+            // Buffer full - flush directly while holding lock
+            let uart = UART.lock();
+            for _ in 0..64 {
+                if let Some(b) = buf.pop() {
+                    uart.putc(b);
+                } else {
+                    break;
+                }
             }
-            if !buf.push(byte) {
-                // Buffer full - flush and retry
-                flush_buffer();
-                let _ = buf.push(byte);
-            }
+            drop(uart);
+            let _ = buf.push(byte);
         }
     }
 }
 
 /// Write raw bytes to the output buffer (non-blocking)
 pub fn write_buffered(data: &[u8]) {
-    unsafe {
-        let buf = &mut *core::ptr::addr_of_mut!(UART_BUFFER);
-        for &byte in data {
-            if !buf.push(byte) {
-                // Buffer full - flush and retry
-                flush_buffer();
-                let _ = buf.push(byte);
+    let mut buf = UART_BUFFER.lock();
+    for &byte in data {
+        if !buf.push(byte) {
+            // Buffer full - flush directly while holding lock
+            let uart = UART.lock();
+            for _ in 0..64 {
+                if let Some(b) = buf.pop() {
+                    uart.putc(b);
+                } else {
+                    break;
+                }
             }
+            drop(uart);
+            let _ = buf.push(byte);
         }
     }
 }
@@ -366,27 +363,23 @@ pub fn write_buffered(data: &[u8]) {
 /// Flush the output buffer to UART hardware
 /// Called from timer interrupt or explicitly
 pub fn flush_buffer() {
-    unsafe {
-        let buf = &mut *core::ptr::addr_of_mut!(UART_BUFFER);
-        let uart = &*core::ptr::addr_of!(UART);
+    let mut buf = UART_BUFFER.lock();
+    let uart = UART.lock();
 
-        // Drain up to 64 bytes per flush call to limit time spent
-        // (will continue on next timer tick if more data)
-        for _ in 0..64 {
-            if let Some(byte) = buf.pop() {
-                uart.putc(byte);
-            } else {
-                break;
-            }
+    // Drain up to 64 bytes per flush call to limit time spent
+    // (will continue on next timer tick if more data)
+    for _ in 0..64 {
+        if let Some(byte) = buf.pop() {
+            uart.putc(byte);
+        } else {
+            break;
         }
     }
 }
 
 /// Check if output buffer has pending data
 pub fn has_buffered_output() -> bool {
-    unsafe {
-        (*core::ptr::addr_of!(UART_BUFFER)).has_data()
-    }
+    UART_BUFFER.lock().has_data()
 }
 
 // ============================================================================
@@ -400,29 +393,20 @@ static CONSOLE_BLOCKED_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Enable UART RX interrupt
 pub fn enable_rx_interrupt() {
-    unsafe {
-        let uart = &*core::ptr::addr_of!(UART);
-        // Enable RX data available interrupt
-        uart.regs.write32(regs::IER, ier::ERBFI);
-    }
+    // Enable RX data available interrupt
+    UART.lock().regs.write32(regs::IER, ier::ERBFI);
     // Enable in GIC
     super::gic::enable_irq(super::irq::UART0);
 }
 
 /// Disable UART RX interrupt (called from IRQ handler to prevent re-triggering)
 pub fn disable_rx_interrupt() {
-    unsafe {
-        let uart = &*core::ptr::addr_of!(UART);
-        uart.regs.write32(regs::IER, 0);
-    }
+    UART.lock().regs.write32(regs::IER, 0);
 }
 
 /// Re-enable UART RX interrupt (called after reading data)
 pub fn reenable_rx_interrupt() {
-    unsafe {
-        let uart = &*core::ptr::addr_of!(UART);
-        uart.regs.write32(regs::IER, ier::ERBFI);
-    }
+    UART.lock().regs.write32(regs::IER, ier::ERBFI);
 }
 
 /// Register a process as blocked waiting for console input
@@ -447,21 +431,54 @@ pub fn get_blocked_pid() -> u32 {
 
 /// Handle UART RX interrupt - returns true if it was handled
 pub fn handle_rx_irq() -> bool {
-    unsafe {
-        let uart = &*core::ptr::addr_of!(UART);
-        // Check if data is available
-        if (uart.regs.read32(regs::LSR) & lsr::DR) != 0 {
-            // Data available - clear interrupt by reading (but don't consume)
-            // The blocked process will read the actual data
-            return true;
-        }
+    let uart = UART.lock();
+    // Check if data is available
+    if (uart.regs.read32(regs::LSR) & lsr::DR) != 0 {
+        // Data available - clear interrupt by reading (but don't consume)
+        // The blocked process will read the actual data
+        return true;
     }
     false
 }
 
+// ============================================================================
+// HAL Uart Wrapper (for trait object access)
+// ============================================================================
+
+/// Wrapper struct that implements the HAL Uart trait by locking the global UART
+/// This allows returning a &dyn Uart from platform code
+pub struct UartWrapper;
+
+/// Static instance for returning as trait object
+static UART_WRAPPER: UartWrapper = UartWrapper;
+
+impl UartTrait for UartWrapper {
+    fn init(&self) {
+        UART.lock().init();
+    }
+
+    fn putc(&self, c: u8) {
+        UART.lock().putc(c);
+    }
+
+    fn getc(&self) -> Option<u8> {
+        UART.lock().try_getc()
+    }
+
+    fn tx_ready(&self) -> bool {
+        UART.lock().tx_ready()
+    }
+
+    fn rx_ready(&self) -> bool {
+        UART.lock().rx_ready()
+    }
+
+    fn flush(&self) {
+        UART.lock().flush();
+    }
+}
+
 /// Get a reference to the UART as a Uart trait object
-/// # Safety
-/// Must only be called after init()
 pub fn as_uart() -> &'static dyn UartTrait {
-    unsafe { &*core::ptr::addr_of!(UART) }
+    &UART_WRAPPER
 }

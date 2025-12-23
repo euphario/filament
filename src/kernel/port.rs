@@ -585,9 +585,11 @@ pub fn test() {
 
                 // The service (PID 1) should now have a Connect message
                 // Let's simulate accepting it
-                let uart_port = registry.ports.iter()
-                    .find(|p| p.name_str() == "uart:")
-                    .unwrap();
+                let Some(uart_port) = registry.ports.iter()
+                    .find(|p| p.name_str() == "uart:") else {
+                    logln!("    [!!] Failed to find uart: port in registry");
+                    return;
+                };
                 let listen_ch = uart_port.listen_channel;
 
                 match registry.accept(listen_ch, 1) {

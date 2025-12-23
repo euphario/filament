@@ -429,7 +429,7 @@ fn sys_exit(code: i32) -> i64 {
             super::task::update_current_task_globals();
             // CRITICAL: Tell assembly we switched tasks so it doesn't
             // overwrite the new task's x0 with our return value
-            super::task::SYSCALL_SWITCHED_TASK = 1;
+            super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
             logln!("  Switching to task {}", next_slot);
             // Return - svc_handler will load new task's state and eret
             0
@@ -467,7 +467,7 @@ fn sys_yield() -> i64 {
                 }
                 super::task::update_current_task_globals();
                 // Signal to assembly not to store return value
-                super::task::SYSCALL_SWITCHED_TASK = 1;
+                super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
             } else {
                 // Same task - no other task ready to run
                 // Use WFI to actually wait for an interrupt before returning
@@ -1439,7 +1439,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
                     next.state = super::task::TaskState::Running;
                 }
                 super::task::update_current_task_globals();
-                super::task::SYSCALL_SWITCHED_TASK = 1;
+                super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
             }
         }
 
@@ -1670,7 +1670,7 @@ fn sys_kill(pid: u32) -> i64 {
                 }
                 super::task::update_current_task_globals();
                 // Signal to assembly not to store return value into the new task
-                super::task::SYSCALL_SWITCHED_TASK = 1;
+                super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
             }
         }
     }
