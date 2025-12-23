@@ -164,6 +164,20 @@ pub fn in_interrupt_context() -> bool {
 // PAN (Privileged Access Never) Support
 // ============================================================================
 
+/// Check if PAN (Privileged Access Never) is supported by the CPU.
+///
+/// PAN is an ARMv8.1 feature. We check ID_AA64MMFR1_EL1.PAN field (bits [23:20]).
+/// Value 0 = not supported, 1+ = supported.
+#[inline]
+pub fn is_pan_supported() -> bool {
+    let mmfr1: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ID_AA64MMFR1_EL1", out(reg) mmfr1);
+    }
+    // PAN field is bits [23:20]
+    ((mmfr1 >> 20) & 0xF) != 0
+}
+
 /// Check if PAN (Privileged Access Never) is currently enabled.
 ///
 /// PAN prevents the kernel from accidentally accessing user memory directly.
@@ -171,8 +185,13 @@ pub fn in_interrupt_context() -> bool {
 ///
 /// This is a security feature - the kernel should always access user memory
 /// through explicit uaccess helpers that translate VA→PA and access via TTBR1.
+///
+/// Returns false if PAN is not supported by the CPU.
 #[inline]
 pub fn is_pan_enabled() -> bool {
+    if !is_pan_supported() {
+        return false;
+    }
     let pstate: u64;
     unsafe {
         // Read PSTATE.PAN via the PAN system register
@@ -185,8 +204,15 @@ pub fn is_pan_enabled() -> bool {
 /// Verify that PAN is enabled and working correctly.
 ///
 /// This should be called early in kernel initialization to ensure
-/// the security feature is active. Panics if PAN is not enabled.
+/// the security feature is active. If PAN is not supported by the CPU,
+/// logs a warning but continues (the kernel still works safely via
+/// explicit VA→PA translation in uaccess).
 pub fn verify_pan_enabled() {
+    if !is_pan_supported() {
+        // PAN not supported on this CPU - that's OK, uaccess still works
+        // via explicit translation. Just skip the check.
+        return;
+    }
     if !is_pan_enabled() {
         panic!("PAN (Privileged Access Never) is not enabled! Security risk.");
     }

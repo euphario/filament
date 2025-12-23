@@ -1135,9 +1135,9 @@ impl Scheduler {
                 let ttbr0 = addr_space.get_ttbr0();
                 let trap_frame = &mut task.trap_frame as *mut TrapFrame;
 
-                // Set globals for exception handler
-                CURRENT_TRAP_FRAME = trap_frame;
-                CURRENT_TTBR0 = ttbr0;
+                // Set globals for exception handler (atomic for SMP safety)
+                CURRENT_TRAP_FRAME.store(trap_frame, Ordering::Release);
+                CURRENT_TTBR0.store(ttbr0, Ordering::Release);
 
                 logln!("  Entering user mode:");
                 logln!("    Entry:  0x{:016x}", task.trap_frame.elr_el1);
@@ -1255,7 +1255,7 @@ impl Scheduler {
                 // CRITICAL: Update globals BEFORE context_switch so the target task
                 // uses the correct trap frame when returning to user mode.
                 update_current_task_globals();
-                SYSCALL_SWITCHED_TASK = 1;
+                SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
 
                 // Actually switch
                 context_switch(current_ctx, next_ctx);
@@ -1352,7 +1352,7 @@ impl Scheduler {
         // The target task will reload CURRENT_TRAP_FRAME from the global
         // in svc_handler/irq_from_user before eret.
         update_current_task_globals();
-        SYSCALL_SWITCHED_TASK = 1;
+        SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
 
         // Perform the switch
         context_switch(current_ctx, next_ctx);
@@ -1395,21 +1395,34 @@ impl Scheduler {
     }
 }
 
+use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
+
 /// Global scheduler instance
 static mut SCHEDULER: Scheduler = Scheduler::new();
 
+/// Early boot trap frame - used before any tasks are created
+/// This ensures exception handlers have a valid place to save state
+/// even if an exception occurs during very early boot.
+static mut EARLY_BOOT_TRAP_FRAME: TrapFrame = TrapFrame::new();
+
 /// Current task's trap frame pointer - used by exception handler
+/// Atomic to ensure safe access from multiple CPUs (SMP safety)
+/// Initialized to early boot trap frame to handle exceptions before tasks exist.
 #[no_mangle]
-pub static mut CURRENT_TRAP_FRAME: *mut TrapFrame = core::ptr::null_mut();
+pub static CURRENT_TRAP_FRAME: AtomicPtr<TrapFrame> = AtomicPtr::new(
+    unsafe { core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAME) }
+);
 
 /// Current task's TTBR0 value - used by exception handler
+/// Atomic to ensure safe access from multiple CPUs (SMP safety)
 #[no_mangle]
-pub static mut CURRENT_TTBR0: u64 = 0;
+pub static CURRENT_TTBR0: AtomicU64 = AtomicU64::new(0);
 
 /// Flag: set to 1 when syscall switched tasks, 0 otherwise
 /// Assembly checks this to skip storing return value when switched
+/// Atomic to ensure safe access from multiple CPUs (SMP safety)
 #[no_mangle]
-pub static mut SYSCALL_SWITCHED_TASK: u64 = 0;
+pub static SYSCALL_SWITCHED_TASK: AtomicU64 = AtomicU64::new(0);
 
 /// Get the global scheduler
 /// # Safety
@@ -1455,7 +1468,7 @@ pub unsafe fn update_current_task_globals() {
             loop { core::arch::asm!("wfe"); }
         }
 
-        CURRENT_TRAP_FRAME = trap_ptr;
+        CURRENT_TRAP_FRAME.store(trap_ptr, Ordering::Release);
 
         if let Some(ref addr_space) = task.address_space {
             let ttbr0 = addr_space.get_ttbr0();
@@ -1476,7 +1489,7 @@ pub unsafe fn update_current_task_globals() {
                 loop { core::arch::asm!("wfe"); }
             }
 
-            CURRENT_TTBR0 = ttbr0;
+            CURRENT_TTBR0.store(ttbr0, Ordering::Release);
         }
     } else {
         // No task at current slot - this is also a bug
@@ -1536,7 +1549,7 @@ pub unsafe extern "C" fn do_resched_if_needed() {
             }
             update_current_task_globals();
             // Signal to assembly that we switched tasks
-            SYSCALL_SWITCHED_TASK = 1;
+            SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
         } else {
             // Same task selected - only mark as running if it was Ready
             if let Some(ref mut current) = sched.tasks[sched.current] {
@@ -1566,7 +1579,7 @@ pub unsafe extern "C" fn do_resched_if_needed() {
                     next_task.state = TaskState::Running;
                 }
                 update_current_task_globals();
-                SYSCALL_SWITCHED_TASK = 1;
+                SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
                 // Note: _guard2 will be dropped here, re-enabling IRQs
                 return;
             }
@@ -1644,7 +1657,7 @@ pub unsafe fn yield_cpu_locked() {
             // CRITICAL: Update globals BEFORE context_switch so the target task
             // uses the correct trap frame when returning to user mode.
             update_current_task_globals();
-            SYSCALL_SWITCHED_TASK = 1;
+            SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
 
             // Actually switch contexts
             context_switch(current_ctx, next_ctx);
