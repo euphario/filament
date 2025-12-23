@@ -1893,11 +1893,26 @@ impl UsbDriver {
         for port in 1..=num_ports as u16 {
             self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::BH_PORT_RESET);
         }
-        delay_ms(500);  // Wait for warm reset
 
-        // Clear warm reset change bits
+        // Wait for warm reset completion by polling port status (max 500ms with backoff)
+        // BH Reset change bit is bit 5 in port status change field
+        const C_BH_RESET: u16 = 1 << 5;
+        let buf_virt_u64 = buf_virt as u64;
         for port in 1..=num_ports as u16 {
-            self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_BH_PORT_RESET);
+            for attempt in 0..50 {  // 50 attempts * 10ms = 500ms max
+                if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt_u64, buf_phys) {
+                    if (ps.change & C_BH_RESET) != 0 {
+                        // Warm reset complete - clear the change bit
+                        self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_BH_PORT_RESET);
+                        break;
+                    }
+                }
+                delay_ms(10);
+                if attempt == 49 {
+                    // Timeout - clear change bit anyway in case we missed it
+                    self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_BH_PORT_RESET);
+                }
+            }
         }
 
         // =====================================================================
@@ -1909,7 +1924,7 @@ impl UsbDriver {
 
         // Do initial port poll to find devices that connected during warm reset
         // The interrupt endpoint only reports NEW status changes
-        let buf_virt_u64 = buf_virt as u64;
+        // (buf_virt_u64 already declared above)
         for port in 1..=num_ports as u16 {
             if let Some(ps) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt_u64, buf_phys) {
                 println!("    Hub port {}: status=0x{:04x} change=0x{:04x}", port, ps.status, ps.change);
@@ -1923,18 +1938,25 @@ impl UsbDriver {
                 if (ps.status & hub::PS_CONNECTION) != 0 {
                     println!("      -> Device connected, resetting...");
                     if self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::PORT_RESET) {
-                        delay_ms(100);
-                        if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt_u64, buf_phys) {
-                            if (ps2.change & hub::PS_C_RESET) != 0 {
-                                self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_PORT_RESET);
+                        // Poll for reset completion (max 100ms with backoff)
+                        let mut reset_done = false;
+                        for attempt in 0..20 {  // 20 attempts * 5ms = 100ms max
+                            if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt_u64, buf_phys) {
+                                if (ps2.change & hub::PS_C_RESET) != 0 {
+                                    self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_PORT_RESET);
+                                    if (ps2.status & hub::PS_ENABLE) != 0 {
+                                        println!("      -> Port enabled after {} attempts, enumerating device", attempt + 1);
+                                        delay_ms(50);  // Brief stabilization before enumeration
+                                        self.enumerate_hub_device(hub_slot, hub_port, port as u32);
+                                        reset_done = true;
+                                    }
+                                    break;
+                                }
                             }
-                            if (ps2.status & hub::PS_ENABLE) != 0 {
-                                println!("      -> Port enabled, enumerating device");
-                                delay_ms(100);
-                                self.enumerate_hub_device(hub_slot, hub_port, port as u32);
-                            } else {
-                                println!("      -> Port not enabled after reset (status=0x{:04x})", ps2.status);
-                            }
+                            delay_ms(5);
+                        }
+                        if !reset_done {
+                            println!("      -> Port reset timed out or not enabled");
                         }
                     }
                 }
@@ -2636,18 +2658,30 @@ impl UsbDriver {
         // Get ERDP register address for direct writes (avoids borrow conflict)
         let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
             + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
+        let slot_id = ctx.slot_id;
+        let out_dci = ctx.bulk_out_dci;
 
-        // Poll for completion (CBW is fast, no need for IRQ)
+        // Poll for completion with proper event matching (CBW is fast, no need for IRQ)
         if let Some(ref mut event_ring) = self.event_ring {
             for _ in 0..100 {
-                if let Some(evt) = event_ring.dequeue() {
-                    let evt_type = evt.get_type();
-                    let cc = (evt.status >> 24) & 0xFF;
-                    // Update ERDP for all events
-                    let erdp = event_ring.erdp() | ERDP_EHB;
-                    unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
-                    if evt_type == trb_type::TRANSFER_EVENT {
-                        return cc == trb_cc::SUCCESS;
+                // Drain events looking for matching transfer completion
+                for _ in 0..32 {
+                    if let Some(evt) = event_ring.dequeue() {
+                        // Update ERDP for all events
+                        let erdp = event_ring.erdp() | ERDP_EHB;
+                        unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+
+                        let evt_type = evt.get_type();
+                        if evt_type == trb_type::TRANSFER_EVENT {
+                            // Only accept events matching our slot and endpoint
+                            if evt.matches_transfer(slot_id, out_dci) {
+                                let cc = evt.event_completion_code();
+                                return cc == trb_cc::SUCCESS;
+                            }
+                            // Non-matching transfer event: discard and continue
+                        }
+                    } else {
+                        break; // No more events
                     }
                 }
                 syscall::yield_now();
@@ -2656,11 +2690,12 @@ impl UsbDriver {
         false
     }
 
-    /// Wait for a transfer event via IRQ, matching specific slot and endpoint
+    /// Wait for a transfer event via IRQ, matching specific slot, endpoint, and optionally TRB
     /// Drains the event ring looking for a matching transfer event.
     /// Non-matching events are consumed but ignored (prevents BOT desync).
+    /// If expected_trb_phys != 0, also validates that the event's TRB pointer matches.
     /// Returns (result, residue)
-    fn wait_transfer_irq(&mut self, slot_id: u32, dci: u32, timeout_ms: u32) -> (TransferResult, u64) {
+    fn wait_transfer_irq(&mut self, slot_id: u32, dci: u32, expected_trb_phys: u64, timeout_ms: u32) -> (TransferResult, u64) {
         let mac_base = self.xhci.mmio_base();
         let rt_base = self.xhci.rt_offset();
         let op_base = self.xhci.op_offset();
@@ -2702,8 +2737,13 @@ impl UsbDriver {
                         let evt_type = evt.get_type();
 
                         if evt_type == trb_type::TRANSFER_EVENT {
-                            // Check if this event matches our expected slot and endpoint
-                            if evt.matches_transfer(slot_id, dci) {
+                            // Check if this event matches our expected slot, endpoint, and TRB
+                            let matches = if expected_trb_phys != 0 {
+                                evt.matches_transfer_exact(slot_id, dci, expected_trb_phys)
+                            } else {
+                                evt.matches_transfer(slot_id, dci)
+                            };
+                            if matches {
                                 let cc = evt.event_completion_code();
                                 let residue = evt.event_residue();
                                 return match cc {
@@ -2740,6 +2780,8 @@ impl UsbDriver {
 
         // Create TRB for bulk IN with proper cycle bit
         let (idx, cycle) = ctx.advance_in();
+        // Calculate TRB physical address for exact matching
+        let trb_phys = ctx.bulk_in_ring_phys + (idx * 16) as u64;
         unsafe {
             let trb = &mut *ctx.bulk_in_ring.add(idx);
             trb.param = phys_addr;
@@ -2751,8 +2793,8 @@ impl UsbDriver {
         // Ring doorbell
         self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
 
-        // Wait for transfer via IRQ - matching IN endpoint
-        let (result, residue) = self.wait_transfer_irq(ctx.slot_id, ctx.bulk_in_dci, 5000);
+        // Wait for transfer via IRQ - matching IN endpoint and exact TRB
+        let (result, residue) = self.wait_transfer_irq(ctx.slot_id, ctx.bulk_in_dci, trb_phys, 5000);
 
         // Calculate bytes transferred
         let bytes = if residue as usize <= length {
@@ -2769,6 +2811,8 @@ impl UsbDriver {
     fn receive_bulk_in_dma(&mut self, ctx: &mut BulkContext, target_phys: u64, length: usize) -> (TransferResult, usize) {
         // Create TRB for bulk IN with proper cycle bit
         let (idx, cycle) = ctx.advance_in();
+        // Calculate TRB physical address for exact matching
+        let trb_phys = ctx.bulk_in_ring_phys + (idx * 16) as u64;
         unsafe {
             let trb = &mut *ctx.bulk_in_ring.add(idx);
             trb.param = target_phys;  // Direct to client's DMA buffer
@@ -2780,8 +2824,8 @@ impl UsbDriver {
         // Ring doorbell
         self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
 
-        // Wait for transfer via IRQ - matching IN endpoint
-        let (result, residue) = self.wait_transfer_irq(ctx.slot_id, ctx.bulk_in_dci, 5000);
+        // Wait for transfer via IRQ - matching IN endpoint and exact TRB
+        let (result, residue) = self.wait_transfer_irq(ctx.slot_id, ctx.bulk_in_dci, trb_phys, 5000);
 
         // Calculate bytes transferred
         let bytes = if residue as usize <= length {
@@ -2945,27 +2989,42 @@ impl UsbDriver {
             // Get ERDP register address for direct writes (avoids borrow conflict)
             let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
                 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
+            let slot_id = ctx.slot_id;
+            let out_dci = ctx.bulk_out_dci;
 
-            // Poll for completion
+            // Poll for completion with proper event matching
             if let Some(ref mut event_ring) = self.event_ring {
                 let mut completed = false;
                 for _ in 0..100 {
-                    if let Some(evt) = event_ring.dequeue() {
-                        let evt_type = evt.get_type();
-                        let cc = (evt.status >> 24) & 0xFF;
-                        // Update ERDP for all events
-                        let erdp = event_ring.erdp() | ERDP_EHB;
-                        unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
-                        if evt_type == trb_type::TRANSFER_EVENT {
-                            if cc != trb_cc::SUCCESS && cc != trb_cc::SHORT_PACKET {
-                                println!("[DATA] error cc={} at TRB {:x}", cc, evt.param);
-                                // Data phase failed - recover and return error
-                                self.recover_endpoints(ctx);
-                                return (TransferResult::Error(cc), None);
+                    // Drain events looking for matching transfer completion
+                    for _ in 0..32 {
+                        if let Some(evt) = event_ring.dequeue() {
+                            // Update ERDP for all events
+                            let erdp = event_ring.erdp() | ERDP_EHB;
+                            unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+
+                            let evt_type = evt.get_type();
+                            if evt_type == trb_type::TRANSFER_EVENT {
+                                // Only accept events matching our slot and endpoint
+                                if evt.matches_transfer(slot_id, out_dci) {
+                                    let cc = evt.event_completion_code();
+                                    if cc != trb_cc::SUCCESS && cc != trb_cc::SHORT_PACKET {
+                                        println!("[DATA] error cc={} at TRB {:x}", cc, evt.param);
+                                        // Data phase failed - recover and return error
+                                        self.recover_endpoints(ctx);
+                                        return (TransferResult::Error(cc), None);
+                                    }
+                                    completed = true;
+                                    break;
+                                }
+                                // Non-matching transfer event: discard and continue
                             }
-                            completed = true;
-                            break;
+                        } else {
+                            break; // No more events
                         }
+                    }
+                    if completed {
+                        break;
                     }
                     syscall::yield_now();
                 }

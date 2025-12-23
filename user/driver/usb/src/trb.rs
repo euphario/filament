@@ -77,6 +77,15 @@ impl Trb {
     pub fn matches_transfer(&self, slot_id: u32, endpoint_dci: u32) -> bool {
         self.event_slot_id() == slot_id && self.event_endpoint_id() == endpoint_dci
     }
+
+    /// For Transfer Event TRBs: check if this event matches slot, endpoint, AND TRB pointer
+    /// This is the strictest matching - ensures we got completion for the exact TRB we posted
+    #[inline]
+    pub fn matches_transfer_exact(&self, slot_id: u32, endpoint_dci: u32, trb_phys: u64) -> bool {
+        self.event_slot_id() == slot_id
+            && self.event_endpoint_id() == endpoint_dci
+            && self.event_trb_pointer() == trb_phys
+    }
 }
 
 // TRB Types
