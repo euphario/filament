@@ -1,8 +1,10 @@
 //! ARM Generic Timer driver
 //!
 //! Uses the EL1 Physical Timer (CNTP_*) which generates the timer PPI.
+//! Implements the HAL Timer trait for portability.
 
 use crate::logln;
+use crate::hal::Timer as TimerTrait;
 use super::{gic, irq};
 
 /// Timer control bits
@@ -162,6 +164,73 @@ impl Timer {
     }
 }
 
+// ============================================================================
+// HAL Timer Implementation
+// ============================================================================
+
+impl TimerTrait for Timer {
+    fn init(&mut self) {
+        self.frequency = Self::read_frequency();
+        Self::write_ctl(0);
+
+        // Enable EL0 access to virtual counter
+        unsafe {
+            core::arch::asm!("msr cntkctl_el1, {}", in(reg) 0x3u64);
+            core::arch::asm!("isb");
+        }
+
+        gic::enable_irq(irq::TIMER_PPI);
+    }
+
+    fn start(&mut self, interval_ms: u64) {
+        self.time_slice_ms = interval_ms;
+        let ticks = (self.frequency * interval_ms) / 1000;
+        Self::write_tval(ticks);
+        Self::write_ctl(ctl::ENABLE);
+    }
+
+    fn stop(&self) {
+        Self::write_ctl(0);
+    }
+
+    fn handle_irq(&mut self) -> bool {
+        let ctl_val = Self::read_ctl();
+
+        if (ctl_val & ctl::ISTATUS) != 0 {
+            self.tick_count += 1;
+
+            super::wdt::kick();
+            crate::kernel::log::flush();
+            super::uart::flush_buffer();
+
+            unsafe {
+                crate::kernel::task::scheduler().check_timeouts(self.tick_count);
+                crate::kernel::task::scheduler().reap_terminated();
+            }
+
+            let ticks = (self.frequency * self.time_slice_ms) / 1000;
+            Self::write_tval(ticks);
+            Self::write_ctl(ctl::ENABLE);
+
+            true
+        } else {
+            false
+        }
+    }
+
+    fn ticks(&self) -> u64 {
+        self.tick_count
+    }
+
+    fn frequency(&self) -> u64 {
+        self.frequency
+    }
+
+    fn counter(&self) -> u64 {
+        Self::read_cntpct()
+    }
+}
+
 /// Global timer instance
 static mut TIMER: Timer = Timer::new();
 
@@ -203,4 +272,11 @@ pub fn counter() -> u64 {
 pub fn print_info() {
     let freq = frequency();
     logln!("  Frequency: {} Hz ({} MHz)", freq, freq / 1_000_000);
+}
+
+/// Get a mutable reference to the timer as a Timer trait object
+/// # Safety
+/// Must only be called after init()
+pub fn as_timer() -> &'static mut dyn TimerTrait {
+    unsafe { &mut *core::ptr::addr_of_mut!(TIMER) }
 }

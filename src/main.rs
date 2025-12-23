@@ -21,6 +21,9 @@ mod platform {
     pub mod mt7988;
 }
 
+// Hardware Abstraction Layer
+mod hal;
+
 // Kernel core
 mod kernel;
 

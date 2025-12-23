@@ -2,6 +2,7 @@
 //!
 //! The MT7988A uses a standard 8250-style UART with 32-bit register spacing.
 //! Uses platform constants for base address.
+//! Implements the HAL Uart trait for portability.
 //!
 //! Features buffered output - writes go to a ring buffer and are flushed
 //! asynchronously (on timer tick) to avoid blocking userspace.
@@ -11,6 +12,7 @@
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch::aarch64::mmio::MmioRegion;
+use crate::hal::Uart as UartTrait;
 use super::UART0_BASE;
 
 // ============================================================================
@@ -194,6 +196,54 @@ impl Write for Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.puts(s);
         Ok(())
+    }
+}
+
+// ============================================================================
+// HAL Uart Implementation
+// ============================================================================
+
+impl UartTrait for Uart {
+    fn init(&self) {
+        // Disable all interrupts
+        self.regs.write32(regs::IER, 0x00);
+        // Enable FIFO, clear buffers, set 1-byte trigger
+        self.regs.write32(regs::FCR, 0x07);
+        // 8 data bits, 1 stop bit, no parity (8N1)
+        self.regs.write32(regs::LCR, 0x03);
+        // Enable DTR and RTS
+        self.regs.write32(regs::MCR, 0x03);
+    }
+
+    fn putc(&self, c: u8) {
+        // Wait until transmit holding register is empty
+        while (self.regs.read32(regs::LSR) & lsr::THRE) == 0 {
+            core::hint::spin_loop();
+        }
+        self.regs.write32(regs::THR, c as u32);
+    }
+
+    fn getc(&self) -> Option<u8> {
+        if (self.regs.read32(regs::LSR) & lsr::DR) != 0 {
+            Some(self.regs.read32(regs::THR) as u8)
+        } else {
+            None
+        }
+    }
+
+    fn tx_ready(&self) -> bool {
+        (self.regs.read32(regs::LSR) & lsr::THRE) != 0
+    }
+
+    fn rx_ready(&self) -> bool {
+        (self.regs.read32(regs::LSR) & lsr::DR) != 0
+    }
+
+    fn flush(&self) {
+        // Wait until transmitter is empty
+        while (self.regs.read32(regs::LSR) & lsr::TEMT) == 0 {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -399,4 +449,11 @@ pub fn handle_rx_irq() -> bool {
         }
     }
     false
+}
+
+/// Get a reference to the UART as a Uart trait object
+/// # Safety
+/// Must only be called after init()
+pub fn as_uart() -> &'static dyn UartTrait {
+    unsafe { &*core::ptr::addr_of!(UART) }
 }

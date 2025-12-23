@@ -1,9 +1,11 @@
 //! ARM GICv3 (Generic Interrupt Controller) driver for MT7988A
 //!
 //! Uses platform constants for base addresses.
+//! Implements the HAL InterruptController trait for portability.
 
 use crate::arch::aarch64::mmio::MmioRegion;
-use super::{GICD_BASE, GICR_BASE};
+use crate::hal::InterruptController;
+use super::{GICD_BASE, GICR_BASE, irq};
 
 /// GICD Register offsets
 mod gicd {
@@ -253,6 +255,87 @@ impl Gic {
     }
 }
 
+// ============================================================================
+// HAL InterruptController Implementation
+// ============================================================================
+
+impl InterruptController for Gic {
+    fn init(&self) {
+        // Re-use existing init logic but called through trait
+        // Note: The actual init is done in Gic::init() which is &mut self
+        // For the trait, we need &self. The initialization is done via
+        // the module-level init() function.
+    }
+
+    fn init_cpu(&self) {
+        // Initialize CPU interface for this CPU (secondary CPUs)
+        unsafe {
+            // Enable system register access (ICC_SRE_EL1)
+            let mut sre: u64;
+            core::arch::asm!("mrs {}, S3_0_C12_C12_5", out(reg) sre);
+            sre |= 0x7;
+            core::arch::asm!("msr S3_0_C12_C12_5, {}", in(reg) sre);
+            core::arch::asm!("isb");
+
+            // Set priority mask
+            let pmr: u64 = 0xFF;
+            core::arch::asm!("msr S3_0_C4_C6_0, {}", in(reg) pmr);
+
+            // Enable Group 1 interrupts
+            let igrpen: u64 = 1;
+            core::arch::asm!("msr S3_0_C12_C12_7, {}", in(reg) igrpen);
+            core::arch::asm!("isb");
+        }
+    }
+
+    fn enable_irq(&self, irq: u32) {
+        if irq < 32 {
+            let bit = 1u32 << irq;
+            self.gicr_write(gicr::ISENABLER0, bit);
+        } else {
+            let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
+            self.gicd_write64(irouter_offset, 0);
+            let reg_idx = (irq / 32) as usize;
+            let bit = 1u32 << (irq % 32);
+            self.gicd_write(gicd::ISENABLER + reg_idx * 4, bit);
+        }
+    }
+
+    fn disable_irq(&self, irq: u32) {
+        if irq < 32 {
+            let bit = 1u32 << irq;
+            self.gicr_write(gicr::ICENABLER0, bit);
+        } else {
+            let reg_idx = (irq / 32) as usize;
+            let bit = 1u32 << (irq % 32);
+            self.gicd_write(gicd::ICENABLER + reg_idx * 4, bit);
+        }
+    }
+
+    fn ack_irq(&self) -> u32 {
+        let irq: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, S3_0_C12_C12_0", out(reg) irq);
+        }
+        irq as u32
+    }
+
+    fn eoi(&self, irq: u32) {
+        unsafe {
+            core::arch::asm!("msr S3_0_C12_C12_1, {}", in(reg) irq as u64);
+        }
+    }
+
+    fn is_spurious(&self, irq: u32) -> bool {
+        irq >= irq::SPURIOUS_THRESHOLD
+    }
+
+    fn num_irqs(&self) -> u32 {
+        let typer = self.gicd_read(gicd::TYPER);
+        ((typer & 0x1f) + 1) * 32
+    }
+}
+
 /// Global GIC instance
 static mut GIC: Gic = Gic::new();
 
@@ -357,4 +440,11 @@ pub fn init_cpu() {
 
         core::arch::asm!("isb");
     }
+}
+
+/// Get a reference to the GIC as an InterruptController trait object
+/// # Safety
+/// Must only be called after init()
+pub fn as_interrupt_controller() -> &'static dyn InterruptController {
+    unsafe { &*core::ptr::addr_of!(GIC) }
 }
