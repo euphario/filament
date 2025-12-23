@@ -88,6 +88,12 @@ impl Timer {
                 crate::kernel::task::scheduler().check_timeouts(self.tick_count);
             }
 
+            // Reap terminated tasks (orphan processes that exited)
+            // Safe to do here since we're not running on the terminated task's stack
+            unsafe {
+                crate::kernel::task::scheduler().reap_terminated();
+            }
+
             // Reload timer for next time slice
             let ticks = (self.frequency * self.time_slice_ms) / 1000;
             Self::write_tval(ticks);

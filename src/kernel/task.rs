@@ -950,7 +950,7 @@ impl Scheduler {
     }
 
     /// Increment generation for a slot (call when task terminates)
-    fn bump_generation(&mut self, slot: usize) {
+    pub fn bump_generation(&mut self, slot: usize) {
         self.generations[slot] = self.generations[slot].wrapping_add(1);
     }
 
@@ -973,6 +973,13 @@ impl Scheduler {
         if let Some(slot) = self.slot_by_pid(pid) {
             if let Some(ref mut task) = self.tasks[slot] {
                 if task.state == TaskState::Blocked {
+                    // If task was blocked on IPC, set x0 to EAGAIN (-11)
+                    // so it retries the receive and gets the message.
+                    // This is needed because receive_timeout pre-sets x0 to
+                    // ETIMEDOUT (-110) before blocking.
+                    if task.wait_reason == Some(WaitReason::Ipc) {
+                        task.trap_frame.x0 = (-11i64) as u64; // EAGAIN
+                    }
                     task.state = TaskState::Ready;
                     task.wait_reason = None;
                     task.wake_at = 0;

@@ -127,6 +127,9 @@ pub mod error {
     pub const TIMEOUT: i64 = -6;
 }
 
+/// Default timeout for IPC operations (in milliseconds)
+const IPC_TIMEOUT_MS: u32 = 5000; // 5 seconds
+
 /// Client for loading firmware from fatfs
 pub struct FirmwareClient {
     channel: u32,
@@ -135,10 +138,11 @@ pub struct FirmwareClient {
 }
 
 impl FirmwareClient {
-    /// Connect to fatfs service
+    /// Connect to fatfs service with timeout
     pub fn connect() -> Option<Self> {
         let result = syscall::port_connect(FATFS_PORT);
         if result < 0 {
+            crate::println!("[FwClient] port_connect failed: {}", result);
             return None;
         }
         let channel = result as u32;
@@ -151,17 +155,21 @@ impl FirmwareClient {
         // Send empty request to trigger handshake
         let ping = [0u8; 4]; // PID query
         if syscall::send(channel, &ping) < 0 {
+            crate::println!("[FwClient] send ping failed");
             syscall::channel_close(channel);
             return None;
         }
 
-        // Receive server PID
-        if syscall::receive(channel, &mut pid_buf) < 0 {
+        // Receive server PID with timeout
+        let n = syscall::receive_timeout(channel, &mut pid_buf, IPC_TIMEOUT_MS);
+        if n < 0 {
+            crate::println!("[FwClient] receive PID failed: {} (timeout={}ms)", n, IPC_TIMEOUT_MS);
             syscall::channel_close(channel);
             return None;
         }
 
         let server_pid = u32::from_le_bytes(pid_buf);
+        crate::println!("[FwClient] connected, server PID={}", server_pid);
 
         Some(Self { channel, server_pid })
     }
@@ -180,10 +188,13 @@ impl FirmwareClient {
             return error::CONNECT_FAILED;
         }
 
-        // Wait for reply
+        // Wait for reply with timeout (file reads can take a while)
         let mut reply_buf = [0u8; core::mem::size_of::<FirmwareReply>()];
-        let n = syscall::receive(self.channel, &mut reply_buf);
+        let n = syscall::receive_timeout(self.channel, &mut reply_buf, IPC_TIMEOUT_MS * 2); // Double timeout for file I/O
         if n < 0 {
+            if n == -110 {
+                return error::TIMEOUT;
+            }
             return error::READ_ERROR;
         }
 

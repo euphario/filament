@@ -51,6 +51,7 @@ pub const SYS_SHMEM_WAIT: u64 = 42;
 pub const SYS_SHMEM_NOTIFY: u64 = 43;
 pub const SYS_SHMEM_DESTROY: u64 = 44;
 pub const SYS_SEND_DIRECT: u64 = 45;
+pub const SYS_RECEIVE_TIMEOUT: u64 = 46;
 
 // SEEK whence constants
 pub const SEEK_SET: u32 = 0;
@@ -312,6 +313,20 @@ pub fn send_direct(channel_id: u32, data: &[u8]) -> i32 {
 /// Receive data from a channel
 pub fn receive(channel_id: u32, buf: &mut [u8]) -> isize {
     syscall3(SYS_RECEIVE, channel_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as isize
+}
+
+/// Receive data from a channel with timeout
+/// timeout_ms: 0 = non-blocking (return immediately if no message)
+/// Returns: message length on success, -110 (ETIMEDOUT) on timeout, negative error otherwise
+pub fn receive_timeout(channel_id: u32, buf: &mut [u8], timeout_ms: u32) -> isize {
+    loop {
+        let result = syscall4(SYS_RECEIVE_TIMEOUT, channel_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_ms as u64) as isize;
+        if result == -11 {
+            // EAGAIN - woken by sender, retry to get the message
+            continue;
+        }
+        return result;
+    }
 }
 
 // Port syscalls

@@ -177,7 +177,16 @@ pub fn check_firmware_files() -> bool {
 
 /// Check if fatfs service is available (for USB firmware loading)
 pub fn check_usb_available() -> bool {
-    FirmwareClient::connect().is_some()
+    match FirmwareClient::connect() {
+        Some(_client) => {
+            userlib::println!("[fw] fatfs connection OK");
+            true
+        }
+        None => {
+            userlib::println!("[fw] fatfs connection FAILED");
+            false
+        }
+    }
 }
 
 /// Firmware loaded from USB with shared memory handle

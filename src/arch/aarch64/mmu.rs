@@ -170,14 +170,14 @@ pub fn boot_ttbr1() -> u64 {
 
 /// Switch to a new user address space (change TTBR0)
 /// With ASID support, TTBR0 should include the ASID in bits [63:48].
-/// We don't need to flush TLB on context switch since entries are ASID-tagged.
+/// TLB entries are tagged with ASID, so no flush needed on context switch.
 /// # Safety
 /// The page table must be valid and properly set up
 pub unsafe fn switch_user_space(ttbr0_with_asid: u64) {
     core::arch::asm!(
         "msr ttbr0_el1, {0}",
         "isb",
-        // No TLB flush needed - entries are ASID-tagged
+        // No TLB flush - entries are ASID-tagged
         in(reg) ttbr0_with_asid
     );
 }

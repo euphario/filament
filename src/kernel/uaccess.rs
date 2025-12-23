@@ -347,6 +347,13 @@ fn check_permissions(entry: u64, needs_write: bool) -> Result<(), UAccessError> 
     }
 }
 
+/// Validate a physical address is in valid DRAM range
+#[inline]
+fn is_valid_phys(phys: u64) -> bool {
+    // Valid DRAM is 0x40000000 - 0x80000000 on BPI-R4
+    phys >= 0x4000_0000 && phys < 0x8000_0000
+}
+
 /// Translate a user virtual address to physical address using the user's page tables
 /// This is needed because during syscall, TTBR0 points to kernel's identity mapping,
 /// not the user's address space. We must walk the user's page tables to find the PA.
@@ -360,7 +367,13 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
 
     unsafe {
         // Read L0 entry - page tables are at physical addresses, access via TTBR1
-        let l0_table_phys = ttbr0;
+        let l0_table_phys = ttbr0 & 0x0000_FFFF_FFFF_F000; // Mask out ASID
+
+        // Validate L0 table physical address
+        if !is_valid_phys(l0_table_phys) {
+            return Err(UAccessError::NotMapped);
+        }
+
         let l0_table = (KERNEL_VIRT_BASE | l0_table_phys) as *const u64;
         let l0_entry = core::ptr::read_volatile(l0_table.add(l0_index));
 
@@ -375,6 +388,12 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
 
         // Read L1 entry
         let l1_table_phys = l0_entry & 0x0000_FFFF_FFFF_F000;
+
+        // Validate L1 table physical address
+        if !is_valid_phys(l1_table_phys) {
+            return Err(UAccessError::NotMapped);
+        }
+
         let l1_table = (KERNEL_VIRT_BASE | l1_table_phys) as *const u64;
         let l1_entry = core::ptr::read_volatile(l1_table.add(l1_index));
 
@@ -387,11 +406,21 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
             // 1GB block mapping
             let block_base = l1_entry & 0x0000_FFFC_0000_0000; // Bits 47:30
             let offset = virt_addr & 0x3FFF_FFFF; // Lower 30 bits
-            return Ok(block_base | offset);
+            let phys = block_base | offset;
+            if !is_valid_phys(phys) {
+                return Err(UAccessError::NotMapped);
+            }
+            return Ok(phys);
         }
 
         // Read L2 entry
         let l2_table_phys = l1_entry & 0x0000_FFFF_FFFF_F000;
+
+        // Validate L2 table physical address
+        if !is_valid_phys(l2_table_phys) {
+            return Err(UAccessError::NotMapped);
+        }
+
         let l2_table = (KERNEL_VIRT_BASE | l2_table_phys) as *const u64;
         let l2_entry = core::ptr::read_volatile(l2_table.add(l2_index));
 
@@ -404,11 +433,21 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
             // 2MB block mapping
             let block_base = l2_entry & 0x0000_FFFF_FFE0_0000; // Bits 47:21
             let offset = virt_addr & 0x001F_FFFF; // Lower 21 bits
-            return Ok(block_base | offset);
+            let phys = block_base | offset;
+            if !is_valid_phys(phys) {
+                return Err(UAccessError::NotMapped);
+            }
+            return Ok(phys);
         }
 
         // Read L3 entry
         let l3_table_phys = l2_entry & 0x0000_FFFF_FFFF_F000;
+
+        // Validate L3 table physical address
+        if !is_valid_phys(l3_table_phys) {
+            return Err(UAccessError::NotMapped);
+        }
+
         let l3_table = (KERNEL_VIRT_BASE | l3_table_phys) as *const u64;
         let l3_entry = core::ptr::read_volatile(l3_table.add(l3_index));
 
@@ -422,6 +461,12 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
         }
 
         let page_base = l3_entry & 0x0000_FFFF_FFFF_F000;
+
+        // Validate final physical address
+        if !is_valid_phys(page_base) {
+            return Err(UAccessError::NotMapped);
+        }
+
         Ok(page_base | page_offset)
     }
 }

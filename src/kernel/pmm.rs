@@ -5,8 +5,11 @@
 //! - Bitmap for contiguous allocation and sanity checking
 //!
 //! Each free page's first 8 bytes stores the next pointer (intrusive list).
+//! Note: Free list entries store physical addresses, but access is done
+//! through kernel virtual addresses (KERNEL_VIRT_BASE | phys_addr).
 
 use crate::logln;
+use crate::arch::aarch64::mmu::KERNEL_VIRT_BASE;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -86,7 +89,9 @@ impl PhysicalMemoryManager {
     #[inline]
     fn push_free_list(&mut self, phys_addr: usize) {
         // Store current head in the page's first 8 bytes
-        let ptr = phys_addr as *mut usize;
+        // Access via kernel virtual address (TTBR1 mapping)
+        let virt_addr = KERNEL_VIRT_BASE | (phys_addr as u64);
+        let ptr = virt_addr as *mut usize;
         unsafe {
             core::ptr::write_volatile(ptr, self.free_list_head);
         }
@@ -100,8 +105,9 @@ impl PhysicalMemoryManager {
             return None;
         }
         let phys_addr = self.free_list_head;
-        // Read next pointer from the page
-        let ptr = phys_addr as *const usize;
+        // Read next pointer from the page via kernel virtual address (TTBR1 mapping)
+        let virt_addr = KERNEL_VIRT_BASE | (phys_addr as u64);
+        let ptr = virt_addr as *const usize;
         unsafe {
             self.free_list_head = core::ptr::read_volatile(ptr);
         }

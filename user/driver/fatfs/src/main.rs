@@ -258,10 +258,27 @@ fn main() {
     firmware_service_loop(&fs, &mut block, listen_channel);
 }
 
+/// Receive with retry on EAGAIN
+/// When a blocked receive is woken (e.g., by close notification), it returns
+/// EAGAIN (-11) and needs to retry to get the actual message.
+fn receive_with_retry(channel: u32, buf: &mut [u8]) -> isize {
+    loop {
+        let n = syscall::receive(channel, buf);
+        if n == -11 {
+            // EAGAIN - woken from blocking, yield and retry
+            syscall::yield_now();
+            continue;
+        }
+        return n;
+    }
+}
+
 /// Handle firmware requests from clients
 fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_channel: u32) {
     let mut request_buf = [0u8; core::mem::size_of::<FirmwareRequest>()];
     let my_pid = syscall::getpid();
+
+    println!("[fatfs] Service loop started (my_pid={})", my_pid);
 
     loop {
         // Accept a connection
@@ -272,26 +289,41 @@ fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_cha
             continue;
         }
         let client_channel = client_channel as u32;
+        println!("[fatfs] Accepted connection (channel={})", client_channel);
 
         // First message is handshake - receive ping, send our PID
+        // Note: receive() returns -11 (EAGAIN) when woken from blocking,
+        // need to retry to get actual message
         let mut ping_buf = [0u8; 4];
-        let n = syscall::receive(client_channel, &mut ping_buf);
+        println!("[fatfs] Waiting for handshake ping...");
+        let n = receive_with_retry(client_channel, &mut ping_buf);
         if n < 0 {
+            println!("[fatfs] Handshake receive failed: {}", n);
             syscall::channel_close(client_channel);
             continue;
         }
+        println!("[fatfs] Received handshake ping ({} bytes)", n);
 
         // Send our PID so client can shmem_allow us
         let pid_bytes = my_pid.to_le_bytes();
-        if syscall::send(client_channel, &pid_bytes) < 0 {
+        let send_result = syscall::send(client_channel, &pid_bytes);
+        if send_result < 0 {
+            println!("[fatfs] Handshake send PID failed: {}", send_result);
             syscall::channel_close(client_channel);
             continue;
         }
+        println!("[fatfs] Sent PID response");
 
         // Now receive actual firmware request
-        let n = syscall::receive(client_channel, &mut request_buf);
+        let n = receive_with_retry(client_channel, &mut request_buf);
         if n < 0 {
-            println!("[fatfs] Receive error: {}", n);
+            // Negative but not EAGAIN means real error (e.g., channel closed)
+            syscall::channel_close(client_channel);
+            continue;
+        }
+        if n == 0 {
+            // 0-byte message = channel close notification, client disconnected
+            // This is normal when client just probes availability
             syscall::channel_close(client_channel);
             continue;
         }

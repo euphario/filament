@@ -186,6 +186,11 @@ fn execute_command(cmd: &[u8]) {
         cmd_run_program("bin/pcied");
     } else if cmd_eq(cmd, b"wifi") {
         cmd_run_program("bin/wifid");
+    } else if cmd_eq(cmd, b"fan") {
+        // Start PWM driver in background
+        cmd_bg(b"bin/pwm");
+    } else if cmd_starts_with(cmd, b"fan ") {
+        cmd_fan(&cmd[4..]);
     } else if cmd_eq(cmd, b"ps") {
         cmd_ps();
     } else if cmd_starts_with(cmd, b"kill ") {
@@ -220,6 +225,8 @@ fn cmd_help() {
     println!("  fatfs         - Run FAT filesystem driver");
     println!("  pcied         - Start PCIe daemon (background)");
     println!("  wifi          - Run WiFi driver (MT7996)");
+    println!("  fan           - Start PWM fan driver");
+    println!("  fan <0-100>   - Set fan speed (percent)");
     println!("  yield         - Yield CPU to other processes");
     println!("  panic         - Trigger a panic (test)");
     println!("  ps            - Show running processes");
@@ -523,6 +530,56 @@ fn cmd_jobs() {
 
     if !found {
         println!("No background jobs");
+    }
+}
+
+/// Set fan speed via PWM driver IPC
+fn cmd_fan(arg: &[u8]) {
+    let arg = trim(arg);
+
+    // Parse percentage (0-100)
+    let mut percent: u32 = 0;
+    for &ch in arg {
+        if ch >= b'0' && ch <= b'9' {
+            percent = percent * 10 + (ch - b'0') as u32;
+        } else {
+            println!("Invalid fan speed. Use: fan <0-100>");
+            return;
+        }
+    }
+
+    if percent > 100 {
+        println!("Fan speed must be 0-100");
+        return;
+    }
+
+    // Connect to PWM driver
+    let ch = syscall::port_connect(b"pwm");
+    if ch < 0 {
+        println!("Failed to connect to PWM driver (not running?)");
+        println!("Start it with: fan");
+        return;
+    }
+    let ch = ch as u32;
+
+    // Send set fan speed command: [1, percent]
+    let cmd = [1u8, percent as u8];
+    let sent = syscall::send(ch, &cmd);
+    if sent < 0 {
+        println!("Failed to send command");
+        syscall::channel_close(ch);
+        return;
+    }
+
+    // Receive response
+    let mut resp = [0u8; 1];
+    let received = syscall::receive(ch, &mut resp);
+    syscall::channel_close(ch);
+
+    if received > 0 {
+        println!("Fan speed set to {}%", resp[0]);
+    } else {
+        println!("No response from PWM driver");
     }
 }
 

@@ -38,6 +38,45 @@ impl Trb {
     pub fn get_cycle(&self) -> bool {
         (self.control & 1) != 0
     }
+
+    // === Transfer Event TRB helpers ===
+    // For parsing TRANSFER_EVENT TRBs from the event ring
+
+    /// For Transfer Event TRBs: extract slot_id from bits [31:24] of control
+    #[inline]
+    pub fn event_slot_id(&self) -> u32 {
+        (self.control >> 24) & 0xFF
+    }
+
+    /// For Transfer Event TRBs: extract endpoint DCI from bits [20:16] of control
+    #[inline]
+    pub fn event_endpoint_id(&self) -> u32 {
+        (self.control >> 16) & 0x1F
+    }
+
+    /// For Transfer Event TRBs: get completion code from bits [31:24] of status
+    #[inline]
+    pub fn event_completion_code(&self) -> u32 {
+        (self.status >> 24) & 0xFF
+    }
+
+    /// For Transfer Event TRBs: get transfer length/residue from bits [23:0] of status
+    #[inline]
+    pub fn event_residue(&self) -> u32 {
+        self.status & 0xFFFFFF
+    }
+
+    /// For Transfer Event TRBs: get the TRB pointer (address of completed TRB)
+    #[inline]
+    pub fn event_trb_pointer(&self) -> u64 {
+        self.param
+    }
+
+    /// For Transfer Event TRBs: check if this event matches expected slot and endpoint
+    #[inline]
+    pub fn matches_transfer(&self, slot_id: u32, endpoint_dci: u32) -> bool {
+        self.event_slot_id() == slot_id && self.event_endpoint_id() == endpoint_dci
+    }
 }
 
 // TRB Types

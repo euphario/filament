@@ -313,14 +313,20 @@ impl ChannelTable {
     }
 
     /// Close a channel endpoint
-    pub fn close(&mut self, id: ChannelId) -> bool {
+    /// Returns Ok(Option<Pid>) with blocked receiver PID if any, or Err if channel not found
+    pub fn close(&mut self, id: ChannelId) -> Result<Option<Pid>, ()> {
         if let Some(slot) = self.find_by_id(id) {
             let peer_id = self.endpoints[slot].peer;
             self.endpoints[slot].state = ChannelState::Closed;
 
+            let mut blocked_pid = None;
+
             // Notify peer if it exists
             if peer_id != 0 {
                 if let Some(peer_slot) = self.find_by_id(peer_id) {
+                    // Get blocked receiver before pushing message
+                    blocked_pid = self.endpoints[peer_slot].blocked_receiver;
+
                     // Send close notification to peer's queue
                     let close_msg = Message {
                         header: MessageHeader {
@@ -333,14 +339,19 @@ impl ChannelTable {
                         payload: [0; MAX_INLINE_PAYLOAD],
                     };
                     let _ = self.endpoints[peer_slot].queue.push(close_msg);
+
+                    // Clear blocked receiver since we're waking them
+                    if blocked_pid.is_some() {
+                        self.endpoints[peer_slot].blocked_receiver = None;
+                    }
                 }
             }
 
             // Reset the endpoint
             self.endpoints[slot].reset();
-            true
+            Ok(blocked_pid)
         } else {
-            false
+            Err(())
         }
     }
 
@@ -477,10 +488,15 @@ pub fn sys_channel_close(channel_id: ChannelId, caller: Pid) -> Result<(), IpcEr
         if table.get_owner(channel_id) != Some(caller) {
             return Err(IpcError::PermissionDenied);
         }
-        if table.close(channel_id) {
-            Ok(())
-        } else {
-            Err(IpcError::InvalidChannel)
+        match table.close(channel_id) {
+            Ok(Some(blocked_pid)) => {
+                // Wake up the blocked receiver on the peer channel
+                super::process::process_table().wake(blocked_pid);
+                super::task::scheduler().wake_by_pid(blocked_pid);
+                Ok(())
+            }
+            Ok(None) => Ok(()), // Channel closed, no blocked receiver
+            Err(()) => Err(IpcError::InvalidChannel),
         }
     }
 }

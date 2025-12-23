@@ -2656,12 +2656,15 @@ impl UsbDriver {
         false
     }
 
-    /// Wait for a transfer event via IRQ
-    /// Returns (success, completion_code)
-    fn wait_transfer_irq(&mut self, timeout_ms: u32) -> (TransferResult, u64) {
+    /// Wait for a transfer event via IRQ, matching specific slot and endpoint
+    /// Drains the event ring looking for a matching transfer event.
+    /// Non-matching events are consumed but ignored (prevents BOT desync).
+    /// Returns (result, residue)
+    fn wait_transfer_irq(&mut self, slot_id: u32, dci: u32, timeout_ms: u32) -> (TransferResult, u64) {
         let mac_base = self.xhci.mmio_base();
         let rt_base = self.xhci.rt_offset();
         let op_base = self.xhci.op_offset();
+        let erdp_addr = mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
 
         // Clear IMAN.IP before waiting
         unsafe {
@@ -2682,35 +2685,45 @@ impl UsbDriver {
         // Wait for IRQ with retry loop
         let max_irq_waits = 10;
         for _irq_attempt in 0..max_irq_waits {
-            if !self.wait_for_irq(timeout_ms) {
-                return (TransferResult::Timeout, 0);
+            let irq_received = self.wait_for_irq(timeout_ms);
+
+            // IMPORTANT: Always check event ring, even on timeout!
+            // Drain ALL events looking for a matching transfer event.
+            if let Some(ref mut event_ring) = self.event_ring {
+                // Drain up to 32 events per IRQ (handle stale event buildup)
+                for _ in 0..32 {
+                    if let Some(evt) = event_ring.dequeue() {
+                        // Always update ERDP for consumed event
+                        let erdp = event_ring.erdp() | ERDP_EHB;
+                        unsafe {
+                            core::ptr::write_volatile(erdp_addr as *mut u64, erdp);
+                        }
+
+                        let evt_type = evt.get_type();
+
+                        if evt_type == trb_type::TRANSFER_EVENT {
+                            // Check if this event matches our expected slot and endpoint
+                            if evt.matches_transfer(slot_id, dci) {
+                                let cc = evt.event_completion_code();
+                                let residue = evt.event_residue();
+                                return match cc {
+                                    x if x == trb_cc::SUCCESS => (TransferResult::Success, residue as u64),
+                                    x if x == trb_cc::SHORT_PACKET => (TransferResult::ShortPacket, residue as u64),
+                                    _ => (TransferResult::Error(cc), residue as u64),
+                                };
+                            }
+                            // Non-matching transfer event: discard and continue draining
+                        }
+                        // Non-transfer event (PORT_STATUS_CHANGE, etc): discard
+                    } else {
+                        break; // No more events in ring
+                    }
+                }
             }
 
-            // Check event ring
-            if let Some(ref mut event_ring) = self.event_ring {
-                if let Some(evt) = event_ring.dequeue() {
-                    let evt_type = evt.get_type();
-                    let cc = (evt.status >> 24) & 0xFF;
-
-                    // Update ERDP
-                    let erdp = event_ring.erdp() | ERDP_EHB;
-                    unsafe {
-                        let ptr = (mac_base + rt_base as u64 + (xhci_rt::IR0 + xhci_ir::ERDP) as u64) as *mut u64;
-                        core::ptr::write_volatile(ptr, erdp);
-                    }
-
-                    if evt_type == trb_type::TRANSFER_EVENT {
-                        // Get residue from TRB pointer field bits [23:0] of status
-                        let residue = evt.status & 0xFFFFFF;
-                        return match cc {
-                            x if x == trb_cc::SUCCESS => (TransferResult::Success, residue as u64),
-                            x if x == trb_cc::SHORT_PACKET => (TransferResult::ShortPacket, residue as u64),
-                            _ => (TransferResult::Error(cc), residue as u64),
-                        };
-                    }
-                    // Got non-transfer event, continue waiting
-                }
-                // No event yet, continue waiting
+            // If wait_for_irq timed out and no matching event found, return timeout
+            if !irq_received {
+                return (TransferResult::Timeout, 0);
             }
         }
         (TransferResult::Timeout, 0)
@@ -2738,8 +2751,8 @@ impl UsbDriver {
         // Ring doorbell
         self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
 
-        // Wait for transfer via IRQ
-        let (result, residue) = self.wait_transfer_irq(5000);
+        // Wait for transfer via IRQ - matching IN endpoint
+        let (result, residue) = self.wait_transfer_irq(ctx.slot_id, ctx.bulk_in_dci, 5000);
 
         // Calculate bytes transferred
         let bytes = if residue as usize <= length {
@@ -2767,8 +2780,8 @@ impl UsbDriver {
         // Ring doorbell
         self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
 
-        // Wait for transfer via IRQ
-        let (result, residue) = self.wait_transfer_irq(5000);
+        // Wait for transfer via IRQ - matching IN endpoint
+        let (result, residue) = self.wait_transfer_irq(ctx.slot_id, ctx.bulk_in_dci, 5000);
 
         // Calculate bytes transferred
         let bytes = if residue as usize <= length {
@@ -2790,6 +2803,8 @@ impl UsbDriver {
 
         // Send CBW (uses internal buffer)
         if !self.send_cbw(ctx, &cbw) {
+            // CBW failed - recover and return error
+            self.recover_endpoints(ctx);
             return (TransferResult::Error(0), None);
         }
 
@@ -2797,17 +2812,24 @@ impl UsbDriver {
         if data_length > 0 {
             let (result, _bytes) = self.receive_bulk_in_dma(ctx, target_phys, data_length as usize);
             if result != TransferResult::Success && result != TransferResult::ShortPacket {
+                // Data phase failed - recover and return error
+                self.recover_endpoints(ctx);
                 return (result, None);
             }
         }
 
-        // CSW phase (uses internal buffer)
-        self.receive_csw_irq(ctx)
+        // CSW phase (uses internal buffer) - validates signature, tag, status
+        let (result, csw) = self.receive_csw_irq(ctx, tag);
+        if csw.is_none() {
+            // CSW failed or invalid - recover
+            self.recover_endpoints(ctx);
+        }
+        (result, csw)
     }
 
-    /// Receive CSW (Command Status Wrapper) on bulk IN
-    /// Returns (result, CSW)
-    fn receive_csw_irq(&mut self, ctx: &mut BulkContext) -> (TransferResult, Option<Csw>) {
+    /// Receive CSW (Command Status Wrapper) on bulk IN with strict validation
+    /// Returns (result, CSW) - CSW is only returned if valid (signature + tag match + valid status)
+    fn receive_csw_irq(&mut self, ctx: &mut BulkContext, expected_tag: u32) -> (TransferResult, Option<Csw>) {
         let (result, _bytes) = self.receive_bulk_in_irq(ctx, CSW_OFFSET, 13);
 
         if result == TransferResult::Success || result == TransferResult::ShortPacket {
@@ -2816,6 +2838,31 @@ impl UsbDriver {
                 let csw_ptr = ctx.data_buf.add(CSW_OFFSET) as *const Csw;
                 ctx.invalidate_buffer(csw_ptr as u64, 13);
                 let csw = core::ptr::read_volatile(csw_ptr);
+
+                // Strict CSW validation per BOT spec
+                // Copy packed fields to avoid unaligned references
+                let sig = csw.signature;
+                let tag = csw.tag;
+                let status = csw.status;
+
+                // 1. Signature must be 'USBS'
+                if sig != msc::CSW_SIGNATURE {
+                    println!("[CSW] Bad signature: 0x{:08x}", sig);
+                    return (TransferResult::Error(0), None);
+                }
+
+                // 2. Tag must match CBW tag
+                if tag != expected_tag {
+                    println!("[CSW] Tag mismatch: expected {} got {}", expected_tag, tag);
+                    return (TransferResult::Error(0), None);
+                }
+
+                // 3. Status must be valid (0=passed, 1=failed, 2=phase error)
+                if status > msc::CSW_STATUS_PHASE_ERROR {
+                    println!("[CSW] Invalid status: {}", status);
+                    return (TransferResult::Error(0), None);
+                }
+
                 return (result, Some(csw));
             }
         }
@@ -2833,6 +2880,8 @@ impl UsbDriver {
 
         // Send CBW
         if !self.send_cbw(ctx, &cbw) {
+            // CBW failed - recover and return error
+            self.recover_endpoints(ctx);
             return (TransferResult::Error(0), None);
         }
 
@@ -2840,12 +2889,19 @@ impl UsbDriver {
         if data_length > 0 {
             let (result, _bytes) = self.receive_bulk_in_irq(ctx, DATA_OFFSET, data_length as usize);
             if result != TransferResult::Success && result != TransferResult::ShortPacket {
+                // Data phase failed - recover and return error
+                self.recover_endpoints(ctx);
                 return (result, None);
             }
         }
 
-        // CSW phase
-        self.receive_csw_irq(ctx)
+        // CSW phase - validates signature, tag, status
+        let (result, csw) = self.receive_csw_irq(ctx, tag);
+        if csw.is_none() {
+            // CSW failed or invalid - recover
+            self.recover_endpoints(ctx);
+        }
+        (result, csw)
     }
 
     /// Execute a complete SCSI command with data OUT: CBW -> Data OUT -> CSW
@@ -2859,6 +2915,8 @@ impl UsbDriver {
         // Send CBW
         if !self.send_cbw(ctx, &cbw) {
             println!("    CBW send failed");
+            // CBW failed - recover and return error
+            self.recover_endpoints(ctx);
             return (TransferResult::Error(0), None);
         }
 
@@ -2901,6 +2959,8 @@ impl UsbDriver {
                         if evt_type == trb_type::TRANSFER_EVENT {
                             if cc != trb_cc::SUCCESS && cc != trb_cc::SHORT_PACKET {
                                 println!("[DATA] error cc={} at TRB {:x}", cc, evt.param);
+                                // Data phase failed - recover and return error
+                                self.recover_endpoints(ctx);
                                 return (TransferResult::Error(cc), None);
                             }
                             completed = true;
@@ -2911,13 +2971,20 @@ impl UsbDriver {
                 }
                 if !completed {
                     println!("[DATA] timeout at idx={}", idx);
+                    // Data phase timed out - recover and return error
+                    self.recover_endpoints(ctx);
                     return (TransferResult::Error(0), None);
                 }
             }
         }
 
-        // CSW phase
-        self.receive_csw_irq(ctx)
+        // CSW phase - validates signature, tag, status
+        let (result, csw) = self.receive_csw_irq(ctx, tag);
+        if csw.is_none() {
+            // CSW failed or invalid - recover
+            self.recover_endpoints(ctx);
+        }
+        (result, csw)
     }
 
     /// SCSI WRITE(10) command - write sectors to device
@@ -3411,9 +3478,9 @@ impl UsbDriver {
         // Ring doorbell once for both TRBs
         self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
 
-        // Wait for data completion (single wait for both TRBs)
+        // Wait for data completion (single wait for both TRBs) - matching OUT endpoint
         let timeout = 100 + (len / 512) as u32 * 10;
-        if !self.wait_transfer_complete(timeout) { return false; }
+        if !self.wait_transfer_complete(ctx.slot_id, ctx.bulk_out_dci, timeout) { return false; }
 
         // Queue CSW TRB
         let (idx, cycle) = ctx.advance_in();
@@ -3426,8 +3493,8 @@ impl UsbDriver {
         }
         self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
 
-        // Wait for CSW
-        if !self.wait_transfer_complete(100) { return false; }
+        // Wait for CSW - matching IN endpoint
+        if !self.wait_transfer_complete(ctx.slot_id, ctx.bulk_in_dci, 100) { return false; }
 
         // Check CSW
         unsafe {
@@ -3464,7 +3531,8 @@ impl UsbDriver {
             ctx.flush_buffer(trb as *const _ as u64, 16);
         }
         self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
-        if !self.wait_transfer_complete(100) { return false; }
+        // Wait for CBW - matching OUT endpoint
+        if !self.wait_transfer_complete(ctx.slot_id, ctx.bulk_out_dci, 100) { return false; }
 
         // Queue Data IN TRB (no IOC)
         let (idx, cycle) = ctx.advance_in();
@@ -3489,10 +3557,10 @@ impl UsbDriver {
         // Ring doorbell once for both IN TRBs
         self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
 
-        // Wait for CSW completion (covers both data and CSW)
+        // Wait for CSW completion (covers both data and CSW) - matching IN endpoint
         // Use high spin count for reads since device needs to fetch from flash
         let timeout = 100 + (len / 512) as u32 * 10;
-        if !self.wait_transfer_complete_read(timeout) { return false; }
+        if !self.wait_transfer_complete_read(ctx.slot_id, ctx.bulk_in_dci, timeout) { return false; }
 
         // Check CSW
         unsafe {
@@ -3682,7 +3750,8 @@ impl UsbDriver {
             ctx.flush_buffer(trb as *const _ as u64, 16);
         }
         self.ring_doorbell(ctx.slot_id, ctx.bulk_out_dci);
-        if !self.wait_transfer_complete(50) { return false; }
+        // Wait for CBW - matching OUT endpoint
+        if !self.wait_transfer_complete(ctx.slot_id, ctx.bulk_out_dci, 50) { return false; }
 
         // Receive CSW
         let (idx, cycle) = ctx.advance_in();
@@ -3694,7 +3763,8 @@ impl UsbDriver {
             ctx.flush_buffer(trb as *const _ as u64, 16);
         }
         self.ring_doorbell(ctx.slot_id, ctx.bulk_in_dci);
-        if !self.wait_transfer_complete(50) { return false; }
+        // Wait for CSW - matching IN endpoint
+        if !self.wait_transfer_complete(ctx.slot_id, ctx.bulk_in_dci, 50) { return false; }
 
         // Check CSW
         unsafe {
@@ -3728,20 +3798,31 @@ impl UsbDriver {
     /// Wait for transfer event completion (optimized polling)
     /// spin_count: number of spin iterations before falling back to yield
     /// max_polls: maximum yield iterations after spin
-    fn wait_transfer_complete_ex(&mut self, spin_count: u32, max_polls: u32) -> bool {
+    /// slot_id: expected slot ID for matching events
+    /// dci: expected endpoint DCI for matching events
+    fn wait_transfer_complete_ex(&mut self, slot_id: u32, dci: u32, spin_count: u32, max_polls: u32) -> bool {
         let erdp_addr = self.xhci.mmio_base() + self.xhci.rt_offset() as u64
             + (xhci_rt::IR0 + xhci_ir::ERDP) as u64;
 
         if let Some(ref mut event_ring) = self.event_ring {
             // First, spin locally without yielding (USB should be fast)
             for _ in 0..spin_count {
-                if let Some(evt) = event_ring.dequeue() {
-                    let erdp = event_ring.erdp() | ERDP_EHB;
-                    unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+                // Drain all available events looking for our match
+                for _ in 0..32 {
+                    if let Some(evt) = event_ring.dequeue() {
+                        let erdp = event_ring.erdp() | ERDP_EHB;
+                        unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
 
-                    if evt.get_type() == trb_type::TRANSFER_EVENT {
-                        let cc = (evt.status >> 24) & 0xFF;
-                        return cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET;
+                        if evt.get_type() == trb_type::TRANSFER_EVENT {
+                            // Only accept events matching our slot and endpoint
+                            if evt.matches_transfer(slot_id, dci) {
+                                let cc = evt.event_completion_code();
+                                return cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET;
+                            }
+                            // Non-matching transfer event: discard and continue draining
+                        }
+                    } else {
+                        break; // No more events in ring
                     }
                 }
                 core::hint::spin_loop();
@@ -3749,13 +3830,22 @@ impl UsbDriver {
 
             // If still waiting, use slower polling with yields
             for _ in 0..max_polls {
-                if let Some(evt) = event_ring.dequeue() {
-                    let erdp = event_ring.erdp() | ERDP_EHB;
-                    unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
+                // Drain all available events looking for our match
+                for _ in 0..32 {
+                    if let Some(evt) = event_ring.dequeue() {
+                        let erdp = event_ring.erdp() | ERDP_EHB;
+                        unsafe { core::ptr::write_volatile(erdp_addr as *mut u64, erdp); }
 
-                    if evt.get_type() == trb_type::TRANSFER_EVENT {
-                        let cc = (evt.status >> 24) & 0xFF;
-                        return cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET;
+                        if evt.get_type() == trb_type::TRANSFER_EVENT {
+                            // Only accept events matching our slot and endpoint
+                            if evt.matches_transfer(slot_id, dci) {
+                                let cc = evt.event_completion_code();
+                                return cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET;
+                            }
+                            // Non-matching transfer event: discard and continue draining
+                        }
+                    } else {
+                        break; // No more events in ring
                     }
                 }
                 syscall::yield_now();
@@ -3765,14 +3855,14 @@ impl UsbDriver {
     }
 
     /// Wait for transfer completion with default spin count (for writes/CBW)
-    fn wait_transfer_complete(&mut self, max_polls: u32) -> bool {
-        self.wait_transfer_complete_ex(1000, max_polls)
+    fn wait_transfer_complete(&mut self, slot_id: u32, dci: u32, max_polls: u32) -> bool {
+        self.wait_transfer_complete_ex(slot_id, dci, 1000, max_polls)
     }
 
     /// Wait for transfer completion with high spin count (for reads from flash)
     /// Reads need more spin time because device must fetch data from flash storage
-    fn wait_transfer_complete_read(&mut self, max_polls: u32) -> bool {
-        self.wait_transfer_complete_ex(10000, max_polls)
+    fn wait_transfer_complete_read(&mut self, slot_id: u32, dci: u32, max_polls: u32) -> bool {
+        self.wait_transfer_complete_ex(slot_id, dci, 10000, max_polls)
     }
 
     /// Read blocks from the MSC device (for ring buffer handler)

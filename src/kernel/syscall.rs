@@ -114,6 +114,8 @@ pub enum SyscallNumber {
     ShmemDestroy = 44,
     /// Send with direct switch to receiver (fast-path IPC)
     SendDirect = 45,
+    /// Receive IPC message with timeout
+    ReceiveTimeout = 46,
     /// Enumerate PCI devices
     PciEnumerate = 50,
     /// Read PCI config space
@@ -179,6 +181,7 @@ impl From<u64> for SyscallNumber {
             43 => SyscallNumber::ShmemNotify,
             44 => SyscallNumber::ShmemDestroy,
             45 => SyscallNumber::SendDirect,
+            46 => SyscallNumber::ReceiveTimeout,
             50 => SyscallNumber::PciEnumerate,
             51 => SyscallNumber::PciConfigRead,
             52 => SyscallNumber::PciConfigWrite,
@@ -261,6 +264,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Send => sys_send(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::SendDirect => sys_send_direct(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::Receive => sys_receive(args.arg0 as u32, args.arg1, args.arg2 as usize),
+        SyscallNumber::ReceiveTimeout => sys_receive_timeout(args.arg0 as u32, args.arg1, args.arg2 as usize, args.arg3 as u32),
         SyscallNumber::ChannelCreate => sys_channel_create(),
         SyscallNumber::ChannelClose => sys_channel_close(args.arg0 as u32),
         SyscallNumber::ChannelTransfer => sys_channel_transfer(args.arg0 as u32, args.arg1 as u32),
@@ -404,9 +408,10 @@ fn sys_exit(code: i32) -> i64 {
                 }
             }
         } else {
-            // Orphan process (no parent) - auto-reap immediately
-            // No one will wait() on it, so free the slot now
-            sched.tasks[current_slot] = None;
+            // Orphan process (no parent) - mark for later cleanup
+            // We can't free the slot now because we're still running on this task's kernel stack!
+            // The scheduler's reap_terminated() will clean it up after context switch.
+            // Task stays as Terminated until then.
         }
 
         // Try to schedule next task
@@ -714,6 +719,74 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                     task.state = super::task::TaskState::Blocked;
                     // Pre-store return value before switching
                     task.trap_frame.x0 = SyscallError::WouldBlock as u64;
+                }
+                // Set resched flag so svc_handler triggers context switch
+                crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+            }
+            SyscallError::WouldBlock as i64
+        }
+        Err(e) => e.to_errno() as i64,
+    }
+}
+
+/// Receive IPC message from a channel with timeout
+/// Args: channel_id, buf_ptr, buf_len, timeout_ms (0 = block forever)
+/// Returns: message length on success, -ETIMEDOUT on timeout, negative error on failure
+/// SECURITY: Copies to user buffer via page table translation
+fn sys_receive_timeout(channel_id: u32, buf_ptr: u64, buf_len: usize, timeout_ms: u32) -> i64 {
+    // Validate user pointer if we have a buffer
+    if buf_len > 0 {
+        if let Err(e) = uaccess::validate_user_write(buf_ptr, buf_len) {
+            return uaccess_to_errno(e);
+        }
+    }
+
+    let caller_pid = current_pid();
+
+    match super::ipc::sys_receive(channel_id, caller_pid) {
+        Ok(msg) => {
+            // Copy message to user buffer
+            let copy_len = core::cmp::min(msg.header.payload_len as usize, buf_len);
+            if copy_len > 0 {
+                // Use copy_to_user for proper VA-to-PA translation
+                if let Err(e) = uaccess::copy_to_user(buf_ptr, &msg.payload[..copy_len]) {
+                    return uaccess_to_errno(e);
+                }
+            }
+            // Return actual message length (so caller knows if truncated)
+            msg.header.payload_len as i64
+        }
+        Err(super::ipc::IpcError::WouldBlock) => {
+            // No message available - either block with timeout or return immediately
+            if timeout_ms == 0 {
+                // Non-blocking mode requested via timeout=0 - return immediately
+                // Note: This is different from "wait forever" which would be u32::MAX
+                return SyscallError::WouldBlock as i64;
+            }
+
+            // Mark task as blocked and register as waiting on this channel
+            unsafe {
+                let sched = super::task::scheduler();
+                let current_slot = sched.current;
+                let pid = sched.tasks[current_slot].as_ref().map(|t| t.id).unwrap_or(0);
+
+                // Register this process as blocked waiting on the channel
+                // so that send() can wake it up
+                let _ = super::ipc::channel_table().block_receiver(channel_id, pid);
+
+                if let Some(ref mut task) = sched.tasks[current_slot] {
+                    task.state = super::task::TaskState::Blocked;
+                    task.wait_reason = Some(super::task::WaitReason::Ipc);
+
+                    // Set wake timeout
+                    // Timer runs at 100 Hz (10ms per tick), so timeout_ms / 10 = ticks
+                    let timeout_ticks = (timeout_ms as u64 + 9) / 10;
+                    let current_tick = crate::platform::mt7988::timer::ticks();
+                    task.wake_at = current_tick + timeout_ticks;
+
+                    // Pre-store timeout error in trap frame - this is what task will see
+                    // if it wakes from timeout rather than receiving a message
+                    task.trap_frame.x0 = (-110i64) as u64; // ETIMEDOUT
                 }
                 // Set resched flag so svc_handler triggers context switch
                 crate::arch::aarch64::sync::cpu_flags().set_need_resched();
@@ -1332,6 +1405,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
             }
 
             // Free the child task's resources
+            sched.bump_generation(child_slot);  // Ensure next task in this slot gets new PID
             sched.tasks[child_slot] = None;
 
             // Return (pid << 32 | exit_code) as documented
@@ -1530,9 +1604,14 @@ fn sys_kill(pid: u32) -> i64 {
                 }
             }
         } else {
-            // Orphan process (no parent) - auto-reap immediately
-            // No one will wait() on it, so free the slot now
-            sched.tasks[slot] = None;
+            // Orphan process (no parent)
+            // If killing a DIFFERENT task, we can free it immediately
+            // If killing OURSELVES, defer to reap_terminated (we're still on our stack!)
+            if pid != caller_pid {
+                sched.bump_generation(slot);
+                sched.tasks[slot] = None;
+            }
+            // Otherwise, task stays as Terminated until timer reaps it
         }
 
         // If killing current task, schedule next
