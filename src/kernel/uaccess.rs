@@ -15,7 +15,7 @@
 //! 1. Translate user VA to PA using the user's page tables
 //! 2. Access the physical memory via TTBR1 (kernel virtual address)
 
-use crate::arch::aarch64::mmu::{flags, PAGE_SIZE, KERNEL_VIRT_BASE};
+use crate::arch::aarch64::mmu::{self, flags, PAGE_SIZE, KERNEL_VIRT_BASE};
 use super::task;
 
 /// Maximum valid user space address (48-bit, upper half is kernel)
@@ -193,7 +193,7 @@ pub fn validate_user_string(ptr: u64, max_len: usize) -> Result<usize, UAccessEr
         // Translate user VA to PA and read via kernel mapping (TTBR1)
         // CRITICAL: Do NOT directly dereference user pointer - TTBR0 is switched!
         let phys_addr = user_virt_to_phys(ttbr0, addr)?;
-        let kernel_va = KERNEL_VIRT_BASE | phys_addr;
+        let kernel_va = mmu::phys_to_virt(phys_addr);
         let byte = unsafe { core::ptr::read_volatile(kernel_va as *const u8) };
 
         if byte == 0 {
@@ -261,7 +261,7 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
         if !is_valid_phys(l0_table_phys) {
             return Err(UAccessError::NotMapped);
         }
-        let l0_table = (KERNEL_VIRT_BASE | l0_table_phys) as *const u64;
+        let l0_table = mmu::phys_to_virt(l0_table_phys) as *const u64;
         let l0_entry = core::ptr::read_volatile(l0_table.add(l0_index));
 
         if (l0_entry & flags::VALID) == 0 {
@@ -278,7 +278,7 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
         if !is_valid_phys(l1_table_phys) {
             return Err(UAccessError::NotMapped);
         }
-        let l1_table = (KERNEL_VIRT_BASE | l1_table_phys) as *const u64;
+        let l1_table = mmu::phys_to_virt(l1_table_phys) as *const u64;
         let l1_entry = core::ptr::read_volatile(l1_table.add(l1_index));
 
         if (l1_entry & flags::VALID) == 0 {
@@ -300,7 +300,7 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
         if !is_valid_phys(l2_table_phys) {
             return Err(UAccessError::NotMapped);
         }
-        let l2_table = (KERNEL_VIRT_BASE | l2_table_phys) as *const u64;
+        let l2_table = mmu::phys_to_virt(l2_table_phys) as *const u64;
         let l2_entry = core::ptr::read_volatile(l2_table.add(l2_index));
 
         if (l2_entry & flags::VALID) == 0 {
@@ -322,7 +322,7 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
         if !is_valid_phys(l3_table_phys) {
             return Err(UAccessError::NotMapped);
         }
-        let l3_table = (KERNEL_VIRT_BASE | l3_table_phys) as *const u64;
+        let l3_table = mmu::phys_to_virt(l3_table_phys) as *const u64;
         let l3_entry = core::ptr::read_volatile(l3_table.add(l3_index));
 
         if (l3_entry & flags::VALID) == 0 {
@@ -405,7 +405,7 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
             return Err(UAccessError::NotMapped);
         }
 
-        let l0_table = (KERNEL_VIRT_BASE | l0_table_phys) as *const u64;
+        let l0_table = mmu::phys_to_virt(l0_table_phys) as *const u64;
         let l0_entry = core::ptr::read_volatile(l0_table.add(l0_index));
 
         if (l0_entry & flags::VALID) == 0 {
@@ -425,7 +425,7 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
             return Err(UAccessError::NotMapped);
         }
 
-        let l1_table = (KERNEL_VIRT_BASE | l1_table_phys) as *const u64;
+        let l1_table = mmu::phys_to_virt(l1_table_phys) as *const u64;
         let l1_entry = core::ptr::read_volatile(l1_table.add(l1_index));
 
         if (l1_entry & flags::VALID) == 0 {
@@ -452,7 +452,7 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
             return Err(UAccessError::NotMapped);
         }
 
-        let l2_table = (KERNEL_VIRT_BASE | l2_table_phys) as *const u64;
+        let l2_table = mmu::phys_to_virt(l2_table_phys) as *const u64;
         let l2_entry = core::ptr::read_volatile(l2_table.add(l2_index));
 
         if (l2_entry & flags::VALID) == 0 {
@@ -479,7 +479,7 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
             return Err(UAccessError::NotMapped);
         }
 
-        let l3_table = (KERNEL_VIRT_BASE | l3_table_phys) as *const u64;
+        let l3_table = mmu::phys_to_virt(l3_table_phys) as *const u64;
         let l3_entry = core::ptr::read_volatile(l3_table.add(l3_index));
 
         if (l3_entry & flags::VALID) == 0 {
@@ -550,7 +550,7 @@ pub fn copy_from_user(kernel_buf: &mut [u8], user_ptr: u64) -> Result<usize, UAc
         let chunk_size = bytes_in_page.min(bytes_remaining);
 
         // Access physical memory via TTBR1 kernel mapping
-        let kernel_va = KERNEL_VIRT_BASE | phys_addr;
+        let kernel_va = mmu::phys_to_virt(phys_addr);
         unsafe {
             let src = kernel_va as *const u8;
             let dst = kernel_buf.as_mut_ptr().add(copied);
@@ -592,7 +592,7 @@ pub fn copy_to_user(user_ptr: u64, kernel_buf: &[u8]) -> Result<usize, UAccessEr
         let chunk_size = bytes_in_page.min(bytes_remaining);
 
         // Access physical memory via TTBR1 kernel mapping
-        let kernel_va = KERNEL_VIRT_BASE | phys_addr;
+        let kernel_va = mmu::phys_to_virt(phys_addr);
         unsafe {
             let src = kernel_buf.as_ptr().add(copied);
             let dst = kernel_va as *mut u8;
@@ -618,7 +618,7 @@ pub fn get_user<T: Copy>(user_ptr: u64) -> Result<T, UAccessError> {
     validate_user_read(user_ptr, size)?;
     let ttbr0 = get_current_ttbr0()?;
     let phys_addr = user_virt_to_phys(ttbr0, user_ptr)?;
-    let kernel_va = KERNEL_VIRT_BASE | phys_addr;
+    let kernel_va = mmu::phys_to_virt(phys_addr);
 
     unsafe {
         Ok(core::ptr::read_volatile(kernel_va as *const T))
@@ -639,7 +639,7 @@ pub fn put_user<T: Copy>(user_ptr: u64, value: T) -> Result<(), UAccessError> {
     validate_user_write(user_ptr, size)?;
     let ttbr0 = get_current_ttbr0()?;
     let phys_addr = user_virt_to_phys(ttbr0, user_ptr)?;
-    let kernel_va = KERNEL_VIRT_BASE | phys_addr;
+    let kernel_va = mmu::phys_to_virt(phys_addr);
 
     unsafe {
         core::ptr::write_volatile(kernel_va as *mut T, value);

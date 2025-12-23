@@ -6,7 +6,7 @@
 //!
 //! Each free page's first 8 bytes stores the next pointer (intrusive list).
 //! Note: Free list entries store physical addresses, but access is done
-//! through kernel virtual addresses (KERNEL_VIRT_BASE | phys_addr).
+//! through kernel virtual addresses (mmu::phys_to_virt(phys_addr)).
 //!
 //! ## Thread Safety
 //!
@@ -14,7 +14,7 @@
 //! This is safe to call from both process and interrupt context.
 
 use crate::logln;
-use crate::arch::aarch64::mmu::KERNEL_VIRT_BASE;
+use crate::arch::aarch64::mmu;
 use super::lock::SpinLock;
 
 /// Page size (4KB)
@@ -116,7 +116,7 @@ impl PhysicalMemoryManager {
     fn push_free_list(&mut self, phys_addr: usize) {
         // Store current head in the page's first 8 bytes
         // Access via kernel virtual address (TTBR1 mapping)
-        let virt_addr = KERNEL_VIRT_BASE | (phys_addr as u64);
+        let virt_addr = mmu::phys_to_virt(phys_addr as u64);
         let ptr = virt_addr as *mut usize;
         unsafe {
             core::ptr::write_volatile(ptr, self.free_list_head);
@@ -132,7 +132,7 @@ impl PhysicalMemoryManager {
         }
         let phys_addr = self.free_list_head;
         // Read next pointer from the page via kernel virtual address (TTBR1 mapping)
-        let virt_addr = KERNEL_VIRT_BASE | (phys_addr as u64);
+        let virt_addr = mmu::phys_to_virt(phys_addr as u64);
         let ptr = virt_addr as *const usize;
         unsafe {
             self.free_list_head = core::ptr::read_volatile(ptr);

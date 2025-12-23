@@ -119,7 +119,7 @@ fn free_asid(asid: u16) {
 /// Convert a physical address to a kernel virtual address for access via TTBR1
 #[inline(always)]
 fn phys_to_virt(phys: u64) -> *mut u64 {
-    (KERNEL_VIRT_BASE | phys) as *mut u64
+    mmu::phys_to_virt(phys) as *mut u64
 }
 
 /// Maximum number of L1 entries we support for user space

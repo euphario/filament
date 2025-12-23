@@ -9,7 +9,7 @@ use super::addrspace::AddressSpace;
 use super::event::EventQueue;
 use super::fd::FdTable;
 use super::pmm;
-use crate::arch::aarch64::tlb;
+use crate::arch::aarch64::{mmu, tlb};
 use crate::logln;
 
 /// Task states
@@ -225,6 +225,89 @@ impl HeapMapping {
     pub fn owns_pages(&self) -> bool {
         matches!(self.kind, MappingKind::OwnedAnon | MappingKind::OwnedDma)
     }
+}
+
+// ============================================================================
+// Unified Mapping API
+// ============================================================================
+
+/// Flags for map_region()
+#[derive(Clone, Copy, Debug)]
+pub struct MapFlags {
+    /// Page is writable
+    pub writable: bool,
+    /// Page is executable
+    pub executable: bool,
+    /// Zero pages after allocation
+    pub zero: bool,
+    /// Flush cache after zeroing (for DMA)
+    pub flush_cache: bool,
+    /// Use device memory attributes (nGnRnE) instead of normal cacheable
+    pub device: bool,
+}
+
+impl MapFlags {
+    /// Anonymous memory mapping (normal cacheable, zeroed)
+    pub const fn anon(writable: bool, executable: bool) -> Self {
+        Self {
+            writable,
+            executable,
+            zero: true,
+            flush_cache: false,
+            device: false,
+        }
+    }
+
+    /// DMA memory mapping (cacheable, zeroed, cache flushed)
+    pub const fn dma() -> Self {
+        Self {
+            writable: true,
+            executable: false,
+            zero: true,
+            flush_cache: true,
+            device: false,
+        }
+    }
+
+    /// Shared memory mapping (no allocation, no zeroing)
+    pub const fn shared() -> Self {
+        Self {
+            writable: true,
+            executable: false,
+            zero: false,
+            flush_cache: false,
+            device: false,
+        }
+    }
+
+    /// Device MMIO mapping (non-cacheable, no zeroing)
+    pub const fn device() -> Self {
+        Self {
+            writable: true,
+            executable: false,
+            zero: false,
+            flush_cache: false,
+            device: true,
+        }
+    }
+}
+
+/// Source of physical memory for mapping
+#[derive(Clone, Copy, Debug)]
+pub enum MapSource {
+    /// Allocate new physical pages
+    Allocate,
+    /// Use specified physical address (don't allocate)
+    Fixed(u64),
+}
+
+/// Result of map_region
+#[derive(Clone, Copy, Debug)]
+pub struct MapResult {
+    /// Virtual address of the mapping
+    pub virt_addr: u64,
+    /// Physical address of the mapping
+    pub phys_addr: u64,
 }
 
 /// Maximum number of children a process can have
@@ -446,9 +529,33 @@ impl Task {
         self.address_space.as_mut()
     }
 
-    /// Allocate and map memory pages into user heap
-    /// Returns virtual address on success, None on failure
-    pub fn mmap(&mut self, size: usize, writable: bool, executable: bool) -> Option<u64> {
+    // ========================================================================
+    // Unified Memory Mapping API
+    // ========================================================================
+
+    /// Map a region of memory into user address space
+    ///
+    /// This is the unified mapping function that handles all cases:
+    /// - Anonymous memory (allocate + zero)
+    /// - DMA memory (allocate + zero + cache flush)
+    /// - Shared memory (fixed address, no allocation)
+    /// - Device MMIO (fixed address, non-cacheable)
+    ///
+    /// # Arguments
+    /// * `size` - Size of the region in bytes (will be rounded up to page size)
+    /// * `source` - Where to get physical memory from
+    /// * `flags` - Mapping attributes
+    /// * `kind` - Ownership kind (determines cleanup behavior)
+    ///
+    /// # Returns
+    /// MapResult with virtual and physical addresses on success
+    pub fn map_region(
+        &mut self,
+        size: usize,
+        source: MapSource,
+        flags: MapFlags,
+        kind: MappingKind,
+    ) -> Option<MapResult> {
         let num_pages = (size + 4095) / 4096;
         if num_pages == 0 {
             return None;
@@ -464,210 +571,155 @@ impl Task {
             return None;
         }
 
-        // Allocate physical pages
-        let phys_addr = pmm::alloc_pages(num_pages)? as u64;
-
-        // Zero the pages using kernel virtual address (via TTBR1)
-        // During syscalls, TTBR0 points to user page tables
-        unsafe {
-            let kva = (crate::arch::aarch64::mmu::KERNEL_VIRT_BASE | phys_addr) as *mut u8;
-            for i in 0..(num_pages * 4096) {
-                core::ptr::write_volatile(kva.add(i), 0);
-            }
-        }
-
-        // Map pages into address space
-        let addr_space = self.address_space.as_mut()?;
-        for i in 0..num_pages {
-            let page_virt = virt_addr + (i * 4096) as u64;
-            let page_phys = phys_addr + (i * 4096) as u64;
-            if !addr_space.map_page(page_virt, page_phys, writable, executable) {
-                // Cleanup on failure
-                pmm::free_pages(phys_addr as usize, num_pages);
-                return None;
-            }
-        }
-
-        // Record mapping - OwnedAnon because kernel allocated these pages
-        self.heap_mappings[slot] = HeapMapping {
-            virt_addr,
-            phys_addr,
-            num_pages,
-            kind: MappingKind::OwnedAnon,
+        // Get or allocate physical memory
+        let phys_addr = match source {
+            MapSource::Allocate => pmm::alloc_pages(num_pages)? as u64,
+            MapSource::Fixed(addr) => addr,
         };
 
-        // Bump heap pointer
-        self.heap_next = virt_addr + mapping_size;
-
-        Some(virt_addr)
-    }
-
-    /// Allocate DMA-capable memory, returning both virtual and physical addresses
-    pub fn mmap_dma(&mut self, size: usize) -> Option<(u64, u64)> {
-        let num_pages = (size + 4095) / 4096;
-        if num_pages == 0 {
-            return None;
-        }
-
-        // Find free mapping slot
-        let slot = self.heap_mappings.iter().position(|m| m.is_empty())?;
-
-        // Check heap space available
-        let virt_addr = self.heap_next;
-        let mapping_size = (num_pages * 4096) as u64;
-        if virt_addr + mapping_size > USER_HEAP_END {
-            return None;
-        }
-
-        // Allocate physical pages
-        let phys_addr = pmm::alloc_pages(num_pages)? as u64;
-
-        // Zero the pages using kernel's TTBR1 mapping (high addresses)
-        // During syscalls, TTBR0 points to user page tables, so we must use kernel VA
-        // Then flush cache so DMA device sees zeros
-        unsafe {
-            // Use kernel virtual address (via TTBR1) to access physical memory
-            let kva = (crate::arch::aarch64::mmu::KERNEL_VIRT_BASE | phys_addr) as *mut u8;
-            for i in 0..(num_pages * 4096) {
-                core::ptr::write_volatile(kva.add(i), 0);
-            }
-            // Flush cache for the zeroed memory - DMA devices need to see clean memory
-            for page in 0..num_pages {
-                let page_kva = crate::arch::aarch64::mmu::KERNEL_VIRT_BASE | (phys_addr + (page * 4096) as u64);
-                for offset in (0..4096).step_by(64) {
-                    let addr = page_kva + offset;
-                    core::arch::asm!("dc civac, {}", in(reg) addr);
+        // Zero pages if requested (using kernel virtual address via TTBR1)
+        if flags.zero {
+            unsafe {
+                let kva = mmu::phys_to_virt(phys_addr) as *mut u8;
+                for i in 0..(num_pages * 4096) {
+                    core::ptr::write_volatile(kva.add(i), 0);
                 }
             }
-            core::arch::asm!("dsb sy");
         }
 
-        // Map pages into address space (cacheable, userspace handles cache ops)
-        let addr_space = self.address_space.as_mut()?;
-        for i in 0..num_pages {
-            let page_virt = virt_addr + (i * 4096) as u64;
-            let page_phys = phys_addr + (i * 4096) as u64;
-            // DMA memory uses cacheable attributes - userspace must do cache maintenance
-            if !addr_space.map_dma_page(page_virt, page_phys, true) {
-                // Cleanup on failure
-                pmm::free_pages(phys_addr as usize, num_pages);
-                return None;
+        // Flush cache if requested (for DMA)
+        if flags.flush_cache {
+            unsafe {
+                for page in 0..num_pages {
+                    let page_kva = mmu::phys_to_virt(phys_addr + (page * 4096) as u64);
+                    for offset in (0..4096).step_by(64) {
+                        let addr = page_kva + offset;
+                        core::arch::asm!("dc civac, {}", in(reg) addr);
+                    }
+                }
+                core::arch::asm!("dsb sy");
             }
         }
 
-        // Invalidate TLB entries for the newly mapped pages
-        // This ensures the CPU uses the new DMA memory attributes
+        // Map pages into address space with appropriate attributes
+        let addr_space = self.address_space.as_mut()?;
+        let map_result = if flags.device {
+            // Device memory (nGnRnE)
+            for i in 0..num_pages {
+                let page_virt = virt_addr + (i * 4096) as u64;
+                let page_phys = phys_addr + (i * 4096) as u64;
+                if !addr_space.map_device_page(page_virt, page_phys, flags.writable) {
+                    // Cleanup on failure if we allocated
+                    if matches!(source, MapSource::Allocate) {
+                        pmm::free_pages(phys_addr as usize, num_pages);
+                    }
+                    return None;
+                }
+            }
+            true
+        } else if kind == MappingKind::OwnedAnon && !flags.flush_cache {
+            // Normal cacheable memory
+            for i in 0..num_pages {
+                let page_virt = virt_addr + (i * 4096) as u64;
+                let page_phys = phys_addr + (i * 4096) as u64;
+                if !addr_space.map_page(page_virt, page_phys, flags.writable, flags.executable) {
+                    // Cleanup on failure if we allocated
+                    if matches!(source, MapSource::Allocate) {
+                        pmm::free_pages(phys_addr as usize, num_pages);
+                    }
+                    return None;
+                }
+            }
+            true
+        } else {
+            // DMA or shared memory (cacheable but with DMA attributes)
+            for i in 0..num_pages {
+                let page_virt = virt_addr + (i * 4096) as u64;
+                let page_phys = phys_addr + (i * 4096) as u64;
+                if !addr_space.map_dma_page(page_virt, page_phys, flags.writable) {
+                    // Cleanup on failure if we allocated
+                    if matches!(source, MapSource::Allocate) {
+                        pmm::free_pages(phys_addr as usize, num_pages);
+                    }
+                    return None;
+                }
+            }
+            true
+        };
+
+        if !map_result {
+            return None;
+        }
+
+        // Invalidate TLB entries for newly mapped pages
         let asid = self.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
         tlb::invalidate_va_range(asid, virt_addr, num_pages);
 
-        // Record mapping - OwnedDma because kernel allocated these pages for DMA
+        // Record mapping
         self.heap_mappings[slot] = HeapMapping {
             virt_addr,
             phys_addr,
             num_pages,
-            kind: MappingKind::OwnedDma,
+            kind,
         };
 
         // Bump heap pointer
         self.heap_next = virt_addr + mapping_size;
 
-        Some((virt_addr, phys_addr))
+        Some(MapResult { virt_addr, phys_addr })
+    }
+
+    // ========================================================================
+    // Legacy Mapping Functions (wrappers around map_region)
+    // ========================================================================
+
+    /// Allocate and map memory pages into user heap
+    /// Returns virtual address on success, None on failure
+    #[inline]
+    pub fn mmap(&mut self, size: usize, writable: bool, executable: bool) -> Option<u64> {
+        self.map_region(
+            size,
+            MapSource::Allocate,
+            MapFlags::anon(writable, executable),
+            MappingKind::OwnedAnon,
+        ).map(|r| r.virt_addr)
+    }
+
+    /// Allocate DMA-capable memory, returning both virtual and physical addresses
+    #[inline]
+    pub fn mmap_dma(&mut self, size: usize) -> Option<(u64, u64)> {
+        self.map_region(
+            size,
+            MapSource::Allocate,
+            MapFlags::dma(),
+            MappingKind::OwnedDma,
+        ).map(|r| (r.virt_addr, r.phys_addr))
     }
 
     /// Map existing physical memory into user address space (for shared memory)
     /// Does NOT allocate physical memory - just creates the mapping
     /// Returns virtual address on success
+    #[inline]
     pub fn mmap_phys(&mut self, phys_addr: u64, size: usize) -> Option<u64> {
-        let num_pages = (size + 4095) / 4096;
-        if num_pages == 0 {
-            return None;
-        }
-
-        // Find free mapping slot
-        let slot = self.heap_mappings.iter().position(|m| m.is_empty())?;
-
-        // Check heap space available
-        let virt_addr = self.heap_next;
-        let mapping_size = (num_pages * 4096) as u64;
-        if virt_addr + mapping_size > USER_HEAP_END {
-            return None;
-        }
-
-        // Map pages into address space (cacheable, userspace handles cache ops)
-        let addr_space = self.address_space.as_mut()?;
-        for i in 0..num_pages {
-            let page_virt = virt_addr + (i * 4096) as u64;
-            let page_phys = phys_addr + (i * 4096) as u64;
-            if !addr_space.map_dma_page(page_virt, page_phys, true) {
-                return None;
-            }
-        }
-
-        // Invalidate TLB entries for the newly mapped pages
-        let asid = self.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
-        tlb::invalidate_va_range(asid, virt_addr, num_pages);
-
-        // Record mapping - BorrowedShmem because pages are owned by shmem region
-        // CRITICAL: Do NOT free these pages on unmap - they belong to the shmem owner
-        self.heap_mappings[slot] = HeapMapping {
-            virt_addr,
-            phys_addr,
-            num_pages,
-            kind: MappingKind::BorrowedShmem,
-        };
-
-        // Bump heap pointer
-        self.heap_next = virt_addr + mapping_size;
-
-        Some(virt_addr)
+        self.map_region(
+            size,
+            MapSource::Fixed(phys_addr),
+            MapFlags::shared(),
+            MappingKind::BorrowedShmem,
+        ).map(|r| r.virt_addr)
     }
 
     /// Map device memory (MMIO/PCI BARs) into user address space
     /// Uses non-cacheable device memory attributes (nGnRnE)
     /// Returns virtual address on success
+    #[inline]
     pub fn mmap_device(&mut self, phys_addr: u64, size: usize) -> Option<u64> {
-        let num_pages = (size + 4095) / 4096;
-        if num_pages == 0 {
-            return None;
-        }
-
-        // Find free mapping slot
-        let slot = self.heap_mappings.iter().position(|m| m.is_empty())?;
-
-        // Check heap space available
-        let virt_addr = self.heap_next;
-        let mapping_size = (num_pages * 4096) as u64;
-        if virt_addr + mapping_size > USER_HEAP_END {
-            return None;
-        }
-
-        // Map pages with device memory attributes (non-cacheable, nGnRnE)
-        let addr_space = self.address_space.as_mut()?;
-        for i in 0..num_pages {
-            let page_virt = virt_addr + (i * 4096) as u64;
-            let page_phys = phys_addr + (i * 4096) as u64;
-            if !addr_space.map_device_page(page_virt, page_phys, true) {
-                return None;
-            }
-        }
-
-        // Invalidate TLB entries for the newly mapped pages
-        let asid = self.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
-        tlb::invalidate_va_range(asid, virt_addr, num_pages);
-
-        // Record mapping - DeviceMmio because this is MMIO, NOT RAM
-        // CRITICAL: NEVER free these "pages" - they are hardware registers!
-        self.heap_mappings[slot] = HeapMapping {
-            virt_addr,
-            phys_addr,
-            num_pages,
-            kind: MappingKind::DeviceMmio,
-        };
-
-        // Bump heap pointer
-        self.heap_next = virt_addr + mapping_size;
-
-        Some(virt_addr)
+        self.map_region(
+            size,
+            MapSource::Fixed(phys_addr),
+            MapFlags::device(),
+            MappingKind::DeviceMmio,
+        ).map(|r| r.virt_addr)
     }
 
     /// Unmap and free memory pages from user heap
