@@ -501,13 +501,10 @@ pub mod log_level {
 }
 
 /// Reset/reboot the system
-/// This does not return on success
-pub fn reset() -> ! {
-    syscall0(SYS_RESET);
-    // Should never return, but just in case
-    loop {
-        unsafe { core::arch::asm!("wfe") };
-    }
+/// Returns 0 on success (though success means reboot, so this won't return)
+/// Returns negative error code on failure (e.g., permission denied)
+pub fn reset() -> i64 {
+    syscall0(SYS_RESET)
 }
 
 // =============================================================================

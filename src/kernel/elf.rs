@@ -211,7 +211,7 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
         let flags = phdr.p_flags;
 
         // Track base address (lowest vaddr)
-        if base_addr.is_none() || vaddr < base_addr.unwrap() {
+        if base_addr.map_or(true, |base| vaddr < base) {
             base_addr = Some(vaddr);
         }
 
@@ -435,13 +435,26 @@ pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::Task
     };
     task.set_user_entry(elf_info.entry, USER_STACK_TOP);
 
-    // Set up parent-child relationship
+    // Set up parent-child relationship and inherit capabilities
+    // TODO: Implement exec_with_caps syscall for explicit capability grants per-process
+    //       instead of blanket inheritance (security improvement)
     if parent_id != 0 {
         task.set_parent(parent_id);
 
-        // Add child to parent's children list
+        // Add child to parent's children list and inherit capabilities
         unsafe {
             let sched = task::scheduler();
+            // First pass: find parent's capabilities
+            let mut parent_caps = None;
+            for task_opt in sched.tasks.iter() {
+                if let Some(ref parent_task) = task_opt {
+                    if parent_task.id == parent_id {
+                        parent_caps = Some(parent_task.capabilities);
+                        break;
+                    }
+                }
+            }
+            // Second pass: add child and set capabilities
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut parent_task) = task_opt {
                     if parent_task.id == parent_id {
@@ -449,6 +462,11 @@ pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::Task
                         break;
                     }
                 }
+            }
+            // Apply inherited capabilities to the child
+            if let Some(caps) = parent_caps {
+                let child_task = sched.task_mut(slot).expect("just created");
+                child_task.set_capabilities(caps);
             }
         }
     }

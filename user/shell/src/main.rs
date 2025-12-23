@@ -615,7 +615,8 @@ fn cmd_log(arg: &[u8]) {
 /// Reset the system
 fn cmd_reset() {
     println!("Resetting system...");
-    syscall::reset();
-    // Should not return, but just in case
-    println!("Reset failed!");
+    let result = syscall::reset();
+    if result < 0 {
+        println!("Reset failed: error {}", result);
+    }
 }
