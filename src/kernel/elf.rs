@@ -167,7 +167,9 @@ pub fn get_program_headers<'a>(data: &'a [u8], header: &Elf64Header) -> Result<&
     let ph_size = { header.e_phentsize } as usize;
     let ph_count = { header.e_phnum } as usize;
 
-    let required_size = ph_offset + ph_size * ph_count;
+    // Use checked arithmetic to prevent overflow attacks from malicious ELF
+    let headers_size = ph_size.checked_mul(ph_count).ok_or(ElfError::InvalidSegment)?;
+    let required_size = ph_offset.checked_add(headers_size).ok_or(ElfError::InvalidSegment)?;
     if data.len() < required_size {
         return Err(ElfError::TooSmall);
     }
@@ -218,12 +220,12 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
             continue;
         }
 
-        // Calculate number of pages needed
+        // Calculate number of pages needed (with overflow checks)
         let page_size = 4096usize;
         let vaddr_page = vaddr & !(page_size as u64 - 1);
         let offset_in_page = (vaddr - vaddr_page) as usize;
-        let total_size = offset_in_page + memsz;
-        let num_pages = (total_size + page_size - 1) / page_size;
+        let total_size = offset_in_page.checked_add(memsz).ok_or(ElfError::InvalidSegment)?;
+        let num_pages = (total_size.checked_add(page_size - 1).ok_or(ElfError::InvalidSegment)?) / page_size;
 
         // Allocate physical pages
         let phys_base = pmm::alloc_pages(num_pages).ok_or(ElfError::OutOfMemory)?;
@@ -239,7 +241,12 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
 
         // Copy file content to memory
         if filesz > 0 {
-            if offset + filesz > data.len() {
+            // Use checked arithmetic for bounds check
+            let end_offset = offset.checked_add(filesz).ok_or_else(|| {
+                pmm::free_pages(phys_base, num_pages);
+                ElfError::InvalidSegment
+            })?;
+            if end_offset > data.len() {
                 pmm::free_pages(phys_base, num_pages);
                 return Err(ElfError::InvalidSegment);
             }

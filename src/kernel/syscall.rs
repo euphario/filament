@@ -786,7 +786,8 @@ fn sys_receive_timeout(channel_id: u32, buf_ptr: u64, buf_len: usize, timeout_ms
                     // Timer runs at 100 Hz (10ms per tick), so timeout_ms / 10 = ticks
                     let timeout_ticks = (timeout_ms as u64 + 9) / 10;
                     let current_tick = crate::platform::mt7988::timer::ticks();
-                    task.wake_at = current_tick + timeout_ticks;
+                    // Use saturating_add to prevent overflow (would cause immediate wake)
+                    task.wake_at = current_tick.saturating_add(timeout_ticks);
 
                     // Pre-store timeout error in trap frame - this is what task will see
                     // if it wakes from timeout rather than receiving a message

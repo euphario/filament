@@ -4,6 +4,7 @@
 //!
 //! Provides structured logging with timestamps, log levels, and module names.
 
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use crate::logln;
 
 /// Log levels from most to least severe
@@ -40,42 +41,44 @@ impl LogLevel {
     }
 }
 
-/// Current log level - messages at or below this level are printed
-static mut LOG_LEVEL: LogLevel = LogLevel::Info;
+/// Current log level - messages at or below this level are printed (atomic for SMP safety)
+static LOG_LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Info as u8);
 
-/// Boot time in counter ticks
-static mut BOOT_TIME: u64 = 0;
+/// Boot time in counter ticks (atomic for SMP safety - written once at init)
+static BOOT_TIME: AtomicU64 = AtomicU64::new(0);
 
-/// Counter frequency in Hz
-static mut COUNTER_FREQ: u64 = 24_000_000; // Default 24MHz
+/// Counter frequency in Hz (atomic for SMP safety - written once at init)
+static COUNTER_FREQ: AtomicU64 = AtomicU64::new(24_000_000); // Default 24MHz
 
 /// Initialize the logging system
 pub fn init() {
+    let boot_time: u64;
+    let counter_freq: u64;
     unsafe {
         // Read current counter as boot time
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) BOOT_TIME);
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) boot_time);
 
         // Read counter frequency
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) COUNTER_FREQ);
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) counter_freq);
     }
+    BOOT_TIME.store(boot_time, Ordering::Release);
+    COUNTER_FREQ.store(counter_freq, Ordering::Release);
 }
 
 /// Set the current log level
 pub fn set_level(level: LogLevel) {
-    unsafe {
-        LOG_LEVEL = level;
-    }
+    LOG_LEVEL.store(level as u8, Ordering::Release);
 }
 
 /// Get the current log level
 pub fn get_level() -> LogLevel {
-    unsafe { LOG_LEVEL }
+    LogLevel::from_u8(LOG_LEVEL.load(Ordering::Acquire)).unwrap_or(LogLevel::Info)
 }
 
 /// Check if a log level is enabled
 #[inline]
 pub fn is_enabled(level: LogLevel) -> bool {
-    unsafe { level as u8 <= LOG_LEVEL as u8 }
+    level as u8 <= LOG_LEVEL.load(Ordering::Relaxed)
 }
 
 /// Get milliseconds since boot
@@ -83,15 +86,17 @@ pub fn timestamp_ms() -> u64 {
     let now: u64;
     unsafe {
         core::arch::asm!("mrs {}, cntpct_el0", out(reg) now);
-        let elapsed = now.wrapping_sub(BOOT_TIME);
-        // Convert to milliseconds: elapsed * 1000 / freq
-        // To avoid overflow, do: elapsed / (freq / 1000)
-        let divisor = COUNTER_FREQ / 1000;
-        if divisor > 0 {
-            elapsed / divisor
-        } else {
-            elapsed / 24_000 // Fallback for 24MHz
-        }
+    }
+    let boot = BOOT_TIME.load(Ordering::Acquire);
+    let freq = COUNTER_FREQ.load(Ordering::Acquire);
+    let elapsed = now.wrapping_sub(boot);
+    // Convert to milliseconds: elapsed * 1000 / freq
+    // To avoid overflow, do: elapsed / (freq / 1000)
+    let divisor = freq / 1000;
+    if divisor > 0 {
+        elapsed / divisor
+    } else {
+        elapsed / 24_000 // Fallback for 24MHz
     }
 }
 

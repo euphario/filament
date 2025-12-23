@@ -152,10 +152,29 @@ impl AddressSpace {
         let asid = alloc_asid().unwrap_or(0);
 
         // Allocate L0 table
-        let l0_phys = pmm::alloc_page()?;
+        let l0_phys = match pmm::alloc_page() {
+            Some(addr) => addr,
+            None => {
+                // Clean up ASID on failure
+                if asid != 0 {
+                    free_asid(asid);
+                }
+                return None;
+            }
+        };
 
         // Allocate L1 table
-        let l1_phys = pmm::alloc_page()?;
+        let l1_phys = match pmm::alloc_page() {
+            Some(addr) => addr,
+            None => {
+                // Clean up L0 and ASID on failure
+                pmm::free_page(l0_phys);
+                if asid != 0 {
+                    free_asid(asid);
+                }
+                return None;
+            }
+        };
 
         // Zero out the tables (must use TTBR1 mapping since MMU is enabled)
         unsafe {

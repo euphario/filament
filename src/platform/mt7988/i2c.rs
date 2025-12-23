@@ -244,25 +244,45 @@ impl I2cController {
     }
 }
 
-/// Global I2C controllers (initialized on first use)
-static mut I2C_CONTROLLERS: [Option<I2cController>; 3] = [None, None, None];
-static mut I2C_INITIALIZED: [bool; 3] = [false, false, false];
+use crate::kernel::lock::SpinLock;
 
-/// Get I2C controller for bus
-pub fn get_controller(bus: u32) -> Option<&'static I2cController> {
+/// I2C subsystem state (protected by SpinLock for SMP safety)
+struct I2cState {
+    controllers: [Option<I2cController>; 3],
+    initialized: [bool; 3],
+}
+
+impl I2cState {
+    const fn new() -> Self {
+        Self {
+            controllers: [None, None, None],
+            initialized: [false, false, false],
+        }
+    }
+}
+
+/// Global I2C state protected by SpinLock
+static I2C: SpinLock<I2cState> = SpinLock::new(I2cState::new());
+
+/// Get I2C controller for bus and perform operation under lock
+/// Returns None if bus is invalid or initialization failed
+pub fn with_controller<R, F: FnOnce(&I2cController) -> R>(bus: u32, f: F) -> Option<R> {
     if bus > 2 {
         return None;
     }
 
-    unsafe {
-        if !I2C_INITIALIZED[bus as usize] {
-            if let Some(ctrl) = I2cController::new(bus) {
-                ctrl.init();
-                I2C_CONTROLLERS[bus as usize] = Some(ctrl);
-                I2C_INITIALIZED[bus as usize] = true;
-            }
-        }
+    let mut guard = I2C.lock();
+    let idx = bus as usize;
 
-        I2C_CONTROLLERS[bus as usize].as_ref()
+    // Initialize on first use
+    if !guard.initialized[idx] {
+        if let Some(ctrl) = I2cController::new(bus) {
+            ctrl.init();
+            guard.controllers[idx] = Some(ctrl);
+            guard.initialized[idx] = true;
+        }
     }
+
+    // Call the user function with the controller
+    guard.controllers[idx].as_ref().map(f)
 }

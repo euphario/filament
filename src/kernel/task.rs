@@ -425,8 +425,14 @@ impl Task {
         let guard_page = alloc_base;
         let stack_base = alloc_base + GUARD_PAGE_SIZE;
 
-        // Create address space
-        let address_space = AddressSpace::new()?;
+        // Create address space (clean up stack on failure)
+        let address_space = match AddressSpace::new() {
+            Some(addr_space) => addr_space,
+            None => {
+                pmm::free_pages(alloc_base, total_pages);
+                return None;
+            }
+        };
 
         let context = CpuContext::new();
         let trap_frame = TrapFrame::new();

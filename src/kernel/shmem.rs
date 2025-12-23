@@ -22,6 +22,7 @@
 
 use super::pmm;
 use super::process::Pid;
+use super::lock::SpinLock;
 use crate::logln;
 
 /// Maximum number of shared memory regions
@@ -129,29 +130,43 @@ impl SharedMem {
     }
 }
 
-/// Global shared memory table
-static mut SHMEM_TABLE: [Option<SharedMem>; MAX_SHMEM_REGIONS] = [None; MAX_SHMEM_REGIONS];
+/// Shared memory subsystem state (protected by SpinLock for SMP safety)
+struct ShmemState {
+    table: [Option<SharedMem>; MAX_SHMEM_REGIONS],
+    next_id: u32,
+}
 
-/// Next ID to assign
-static mut NEXT_SHMEM_ID: u32 = 1;
+impl ShmemState {
+    const fn new() -> Self {
+        // Use array initialization that's const-compatible
+        const NONE: Option<SharedMem> = None;
+        Self {
+            table: [NONE; MAX_SHMEM_REGIONS],
+            next_id: 1,
+        }
+    }
+}
+
+/// Global shared memory table protected by SpinLock (SMP-safe)
+static SHMEM: SpinLock<ShmemState> = SpinLock::new(ShmemState::new());
 
 /// Execute a closure with exclusive access to the shmem table.
-/// Automatically disables interrupts for the duration.
+/// SpinLock provides both IRQ and SMP safety.
 #[inline]
 #[allow(dead_code)]
 pub fn with_shmem_table<R, F: FnOnce(&mut [Option<SharedMem>; MAX_SHMEM_REGIONS]) -> R>(f: F) -> R {
-    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
-    unsafe { f(&mut *core::ptr::addr_of_mut!(SHMEM_TABLE)) }
+    let mut guard = SHMEM.lock();
+    f(&mut guard.table)
 }
 
 /// Initialize shared memory subsystem
 pub fn init() {
-    unsafe {
-        for slot in (*core::ptr::addr_of_mut!(SHMEM_TABLE)).iter_mut() {
-            *slot = None;
-        }
-        *core::ptr::addr_of_mut!(NEXT_SHMEM_ID) = 1;
+    let mut guard = SHMEM.lock();
+    for slot in guard.table.iter_mut() {
+        *slot = None;
     }
+    guard.next_id = 1;
+    drop(guard);
     logln!("[shmem] Initialized ({} max regions)", MAX_SHMEM_REGIONS);
 }
 
@@ -169,17 +184,18 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
 
     // CRITICAL: Find free slot BEFORE allocating physical memory
     // This prevents memory leak if no slots are available
-    let (slot_idx, shmem_id) = unsafe {
+    let (slot_idx, shmem_id) = {
+        let mut guard = SHMEM.lock();
         let mut found = None;
-        for (i, slot) in (*core::ptr::addr_of!(SHMEM_TABLE)).iter().enumerate() {
+        for (i, slot) in guard.table.iter().enumerate() {
             if slot.is_none() {
                 found = Some(i);
                 break;
             }
         }
         let idx = found.ok_or(-12i64)?; // ENOMEM (no slots)
-        let id = *core::ptr::addr_of!(NEXT_SHMEM_ID);
-        *core::ptr::addr_of_mut!(NEXT_SHMEM_ID) += 1;
+        let id = guard.next_id;
+        guard.next_id += 1;
         (idx, id)
     };
 
@@ -196,8 +212,14 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
     region.size = aligned_size;
     region.ref_count = 1; // Owner's mapping
 
-    // Map into owner's address space
-    let vaddr = map_into_process(owner_pid, phys_addr as u64, aligned_size)?;
+    // Map into owner's address space (clean up phys pages on failure)
+    let vaddr = match map_into_process(owner_pid, phys_addr as u64, aligned_size) {
+        Ok(addr) => addr,
+        Err(e) => {
+            pmm::free_contiguous(phys_addr, num_pages);
+            return Err(e);
+        }
+    };
 
     // Zero the memory through kernel's direct-map
     unsafe {
@@ -220,8 +242,9 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
     }
 
     // Store in table
-    unsafe {
-        (*core::ptr::addr_of_mut!(SHMEM_TABLE))[slot_idx] = Some(region);
+    {
+        let mut guard = SHMEM.lock();
+        guard.table[slot_idx] = Some(region);
     }
 
     Ok((shmem_id, vaddr, phys_addr as u64))
@@ -230,16 +253,23 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
 /// Map an existing shared memory region into a process
 /// Returns (vaddr, paddr) or error
 pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
-    let (phys_addr, size) = unsafe {
-        let region = find_region_mut(shmem_id)?;
-
-        // Check if allowed
-        if !region.is_allowed(pid) {
-            return Err(-13); // EACCES
+    let (phys_addr, size) = {
+        let mut guard = SHMEM.lock();
+        let mut found = None;
+        for slot in guard.table.iter_mut() {
+            if let Some(ref mut region) = slot {
+                if region.id == shmem_id {
+                    // Check if allowed
+                    if !region.is_allowed(pid) {
+                        return Err(-13); // EACCES
+                    }
+                    region.ref_count += 1;
+                    found = Some((region.phys_addr, region.size));
+                    break;
+                }
+            }
         }
-
-        region.ref_count += 1;
-        (region.phys_addr, region.size)
+        found.ok_or(-2i64)? // ENOENT
     };
 
     // Map into process's address space
@@ -251,40 +281,48 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
 /// Unmap shared memory from a process (decrements ref_count)
 /// Called when a process unmaps shmem or exits
 pub fn unmap(pid: Pid, shmem_id: u32) -> Result<(), i64> {
-    unsafe {
-        let region = find_region_mut(shmem_id)?;
+    let mut guard = SHMEM.lock();
+    for slot in guard.table.iter_mut() {
+        if let Some(ref mut region) = slot {
+            if region.id == shmem_id {
+                // Check if this process has it mapped (must be allowed)
+                if !region.is_allowed(pid) {
+                    return Err(-13); // EACCES
+                }
 
-        // Check if this process has it mapped (must be allowed)
-        if !region.is_allowed(pid) {
-            return Err(-13); // EACCES
+                // Decrement ref_count (but never below 0)
+                if region.ref_count > 0 {
+                    region.ref_count -= 1;
+                }
+
+                // Also remove from waiters if waiting
+                region.remove_waiter(pid);
+                return Ok(());
+            }
         }
-
-        // Decrement ref_count (but never below 0)
-        if region.ref_count > 0 {
-            region.ref_count -= 1;
-        }
-
-        // Also remove from waiters if waiting
-        region.remove_waiter(pid);
     }
-    Ok(())
+    Err(-2) // ENOENT
 }
 
 /// Grant another process permission to map this shared memory
 pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
-    unsafe {
-        let region = find_region_mut(shmem_id)?;
+    let mut guard = SHMEM.lock();
+    for slot in guard.table.iter_mut() {
+        if let Some(ref mut region) = slot {
+            if region.id == shmem_id {
+                // Only owner can grant access
+                if region.owner_pid != owner_pid {
+                    return Err(-1); // EPERM
+                }
 
-        // Only owner can grant access
-        if region.owner_pid != owner_pid {
-            return Err(-1); // EPERM
-        }
-
-        if !region.allow_pid(peer_pid) {
-            return Err(-12); // ENOMEM (no space in allowed list)
+                if !region.allow_pid(peer_pid) {
+                    return Err(-12); // ENOMEM (no space in allowed list)
+                }
+                return Ok(());
+            }
         }
     }
-    Ok(())
+    Err(-2) // ENOENT
 }
 
 /// Wait for notification on shared memory
@@ -293,19 +331,31 @@ pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
 /// If timeout_ms > 0, the wait will automatically complete after the timeout.
 /// timeout_ms = 0 means wait indefinitely.
 pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
-    // Add to waiters list and mark task as blocked
-    unsafe {
-        let region = find_region_mut(shmem_id)?;
+    // Add to waiters list under shmem lock
+    {
+        let mut guard = SHMEM.lock();
+        let mut found = false;
+        for slot in guard.table.iter_mut() {
+            if let Some(ref mut region) = slot {
+                if region.id == shmem_id {
+                    // Check access
+                    if !region.is_allowed(pid) {
+                        return Err(-13); // EACCES
+                    }
 
-        // Check access
-        if !region.is_allowed(pid) {
-            return Err(-13); // EACCES
+                    if !region.add_waiter(pid) {
+                        return Err(-12); // ENOMEM (no space in waiters)
+                    }
+                    found = true;
+                    break;
+                }
+            }
         }
-
-        if !region.add_waiter(pid) {
-            return Err(-12); // ENOMEM (no space in waiters)
+        if !found {
+            return Err(-2); // ENOENT
         }
     }
+    // shmem lock released here before touching scheduler
 
     // Mark task as blocked - syscall layer will handle scheduling
     unsafe {
@@ -320,7 +370,8 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
                 // Add 1 to round up and avoid 0-tick timeouts
                 let timeout_ticks = (timeout_ms as u64 + 9) / 10;
                 let current_tick = crate::platform::mt7988::timer::ticks();
-                task.wake_at = current_tick + timeout_ticks;
+                // Use saturating_add to prevent overflow (would cause immediate wake)
+                task.wake_at = current_tick.saturating_add(timeout_ticks);
             } else {
                 task.wake_at = 0; // No timeout
             }
@@ -334,16 +385,25 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
 /// Notify all waiters on shared memory
 /// Uses O(1) wake via PID→slot map
 pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
-    let waiters = unsafe {
-        let region = find_region_mut(shmem_id)?;
-
-        // Check access (anyone with access can notify)
-        if !region.is_allowed(pid) {
-            return Err(-13); // EACCES
+    // Drain waiters under shmem lock
+    let waiters = {
+        let mut guard = SHMEM.lock();
+        let mut found_waiters = None;
+        for slot in guard.table.iter_mut() {
+            if let Some(ref mut region) = slot {
+                if region.id == shmem_id {
+                    // Check access (anyone with access can notify)
+                    if !region.is_allowed(pid) {
+                        return Err(-13); // EACCES
+                    }
+                    found_waiters = Some(region.drain_waiters());
+                    break;
+                }
+            }
         }
-
-        region.drain_waiters()
+        found_waiters.ok_or(-2i64)? // ENOENT
     };
+    // shmem lock released here before touching scheduler
 
     // Wake all waiters using O(1) PID→slot lookup
     let mut woken = 0u32;
@@ -368,37 +428,50 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
 /// This prevents use-after-free where destroying shared memory while another process
 /// is actively using it would cause memory corruption.
 pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
-    unsafe {
-        let slot_idx = find_region_slot(shmem_id)?;
+    // Extract info and validate under shmem lock
+    let (phys_addr, size, slot_idx) = {
+        let guard = SHMEM.lock();
+        let mut found = None;
+        for (i, slot) in guard.table.iter().enumerate() {
+            if let Some(ref region) = slot {
+                if region.id == shmem_id {
+                    // Only owner can destroy
+                    if region.owner_pid != owner_pid {
+                        return Err(-1); // EPERM
+                    }
 
-        if let Some(ref region) = SHMEM_TABLE[slot_idx] {
-            // Only owner can destroy
-            if region.owner_pid != owner_pid {
-                return Err(-1); // EPERM
+                    // SECURITY: Refuse to destroy if other processes still have it mapped
+                    // ref_count of 1 means only the owner has it mapped (safe to destroy)
+                    // ref_count > 1 means other processes still have active mappings
+                    if region.ref_count > 1 {
+                        logln!("[shmem] Refusing to destroy region {} - ref_count={} (other processes still mapped)",
+                               shmem_id, region.ref_count);
+                        return Err(-16); // EBUSY - resource busy
+                    }
+
+                    found = Some((region.phys_addr, region.size, i));
+                    break;
+                }
             }
-
-            // SECURITY: Refuse to destroy if other processes still have it mapped
-            // ref_count of 1 means only the owner has it mapped (safe to destroy)
-            // ref_count > 1 means other processes still have active mappings
-            if region.ref_count > 1 {
-                logln!("[shmem] Refusing to destroy region {} - ref_count={} (other processes still mapped)",
-                       shmem_id, region.ref_count);
-                return Err(-16); // EBUSY - resource busy
-            }
-
-            let phys_addr = region.phys_addr;
-            let size = region.size;
-            let num_pages = size / 4096;
-
-            // Safe to unmap and free - only owner has it mapped
-            unmap_from_all_processes(phys_addr, size);
-
-            // Now safe to free physical memory - no more mappings exist
-            pmm::free_contiguous(phys_addr as usize, num_pages);
         }
+        found.ok_or(-2i64)? // ENOENT
+    };
+    // shmem lock released here before touching scheduler
 
-        SHMEM_TABLE[slot_idx] = None;
+    // Safe to unmap - only owner has it mapped
+    unsafe {
+        unmap_from_all_processes(phys_addr, size);
     }
+
+    // Clear slot and free physical memory
+    {
+        let mut guard = SHMEM.lock();
+        guard.table[slot_idx] = None;
+    }
+
+    let num_pages = size / 4096;
+    pmm::free_contiguous(phys_addr as usize, num_pages);
+
     Ok(())
 }
 
@@ -428,30 +501,6 @@ unsafe fn unmap_from_all_processes(phys_addr: u64, size: usize) {
     }
 }
 
-/// Find a region by ID and return mutable reference
-unsafe fn find_region_mut(shmem_id: u32) -> Result<&'static mut SharedMem, i64> {
-    for slot in (*core::ptr::addr_of_mut!(SHMEM_TABLE)).iter_mut() {
-        if let Some(ref mut region) = slot {
-            if region.id == shmem_id {
-                return Ok(region);
-            }
-        }
-    }
-    Err(-2) // ENOENT
-}
-
-/// Find a region's slot index by ID
-unsafe fn find_region_slot(shmem_id: u32) -> Result<usize, i64> {
-    for (i, slot) in (*core::ptr::addr_of!(SHMEM_TABLE)).iter().enumerate() {
-        if let Some(ref region) = slot {
-            if region.id == shmem_id {
-                return Ok(i);
-            }
-        }
-    }
-    Err(-2) // ENOENT
-}
-
 /// Map physical memory into a process's address space
 fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
     unsafe {
@@ -474,8 +523,14 @@ fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
 
 /// Called when a process exits - clean up any shared memory it owns or has mapped
 pub fn process_cleanup(pid: Pid) {
-    unsafe {
-        for slot in (*core::ptr::addr_of_mut!(SHMEM_TABLE)).iter_mut() {
+    // Collect regions owned by this process (need to unmap outside lock)
+    let mut owned_regions: [(u64, usize, usize); MAX_SHMEM_REGIONS] = [(0, 0, 0); MAX_SHMEM_REGIONS];
+    let mut owned_count = 0;
+
+    // First pass: update ref counts and collect owned regions
+    {
+        let mut guard = SHMEM.lock();
+        for (i, slot) in guard.table.iter_mut().enumerate() {
             if let Some(ref mut region) = slot {
                 // Remove from waiters if present
                 region.remove_waiter(pid);
@@ -488,19 +543,32 @@ pub fn process_cleanup(pid: Pid) {
                     }
                 }
 
-                // If owner, destroy the region (same as destroy() but without permission check)
+                // If owner, mark for destruction
                 if region.owner_pid == pid {
-                    let phys_addr = region.phys_addr;
-                    let size = region.size;
-                    let num_pages = size / 4096;
-
-                    // CRITICAL: Unmap from ALL other processes before freeing
-                    unmap_from_all_processes(phys_addr, size);
-
-                    pmm::free_contiguous(phys_addr as usize, num_pages);
-                    *slot = None;
+                    owned_regions[owned_count] = (region.phys_addr, region.size, i);
+                    owned_count += 1;
                 }
             }
         }
+    }
+    // shmem lock released before touching scheduler
+
+    // Second pass: destroy owned regions (unmap from other processes)
+    for i in 0..owned_count {
+        let (phys_addr, size, slot_idx) = owned_regions[i];
+        let num_pages = size / 4096;
+
+        // CRITICAL: Unmap from ALL other processes before freeing
+        unsafe {
+            unmap_from_all_processes(phys_addr, size);
+        }
+
+        // Clear the slot
+        {
+            let mut guard = SHMEM.lock();
+            guard.table[slot_idx] = None;
+        }
+
+        pmm::free_contiguous(phys_addr as usize, num_pages);
     }
 }

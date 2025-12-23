@@ -1096,8 +1096,10 @@ impl KernelScheme for I2cScheme {
             return Err(-22); // EINVAL - 7-bit address max
         }
 
-        // Verify we can access the I2C controller
-        if crate::platform::mt7988::i2c::get_controller(bus).is_none() {
+        // Verify we can access the I2C controller (initializes on first use)
+        let valid = crate::platform::mt7988::i2c::with_controller(bus, |_| true)
+            .unwrap_or(false);
+        if !valid {
             return Err(-19); // ENODEV
         }
 
@@ -1116,14 +1118,14 @@ impl KernelScheme for I2cScheme {
         let bus = (handle.handle >> 32) as u32;
         let addr = (handle.handle & 0xFF) as u8;
 
-        let ctrl = crate::platform::mt7988::i2c::get_controller(bus).ok_or(-19)?;
-
         if buf.is_empty() {
             return Ok(0);
         }
 
-        // Read from device
-        ctrl.read(addr, buf)?;
+        // Read from device under lock
+        crate::platform::mt7988::i2c::with_controller(bus, |ctrl| {
+            ctrl.read(addr, buf)
+        }).ok_or(-19)??;
 
         Ok(buf.len())
     }
@@ -1132,14 +1134,14 @@ impl KernelScheme for I2cScheme {
         let bus = (handle.handle >> 32) as u32;
         let addr = (handle.handle & 0xFF) as u8;
 
-        let ctrl = crate::platform::mt7988::i2c::get_controller(bus).ok_or(-19)?;
-
         if buf.is_empty() {
             return Ok(0);
         }
 
-        // Write to device
-        ctrl.write(addr, buf)?;
+        // Write to device under lock
+        crate::platform::mt7988::i2c::with_controller(bus, |ctrl| {
+            ctrl.write(addr, buf)
+        }).ok_or(-19)??;
 
         Ok(buf.len())
     }
