@@ -387,6 +387,11 @@ fn sys_exit(code: i32) -> i64 {
         super::pci::release_all_devices(pid);
         super::port::process_cleanup(pid);
 
+        // Close all file descriptors (releases scheme handles, channels, etc.)
+        if let Some(ref mut task) = sched.tasks[current_slot] {
+            task.fd_table.close_all(pid);
+        }
+
         // Set exit code and mark as terminated
         if let Some(ref mut task) = sched.tasks[current_slot] {
             task.exit_code = code;
@@ -959,10 +964,11 @@ fn sys_open(path_ptr: u64, path_len: usize, flags: u32) -> i64 {
 /// Args: fd
 /// Returns: 0 on success, negative error on failure
 fn sys_close(fd: u32) -> i64 {
+    let caller_pid = current_pid();
     unsafe {
         let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
-            if task.fd_table.close(fd) {
+            if task.fd_table.close_with_pid(fd, caller_pid) {
                 return SyscallError::Success as i64;
             }
         }
@@ -1077,10 +1083,11 @@ fn sys_dup(old_fd: u32) -> i64 {
 /// Args: old_fd, new_fd
 /// Returns: new_fd on success, negative error on failure
 fn sys_dup2(old_fd: u32, new_fd: u32) -> i64 {
+    let caller_pid = current_pid();
     unsafe {
         let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
-            if task.fd_table.dup2(old_fd, new_fd) {
+            if task.fd_table.dup2(old_fd, new_fd, caller_pid) {
                 return new_fd as i64;
             }
         }
@@ -1617,8 +1624,15 @@ fn sys_kill(pid: u32) -> i64 {
             return SyscallError::PermissionDenied as i64;
         }
 
-        // Mark as terminated with SIGKILL-style exit code
+        // Clean up process resources (same as sys_exit)
+        super::shmem::process_cleanup(pid);
+        super::scheme::process_cleanup(pid);
+        super::pci::release_all_devices(pid);
+        super::port::process_cleanup(pid);
+
+        // Close all file descriptors and mark as terminated
         if let Some(ref mut task) = sched.tasks[slot] {
+            task.fd_table.close_all(pid);
             task.exit_code = -9;  // SIGKILL
             task.state = super::task::TaskState::Terminated;
         }

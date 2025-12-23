@@ -1568,6 +1568,20 @@ pub fn get_kernel_scheme_by_id(id: u16) -> Option<&'static dyn KernelScheme> {
     }
 }
 
+/// Close a kernel scheme handle by ID
+/// Called when a file descriptor is closed
+pub fn close_kernel_scheme(scheme_id: u16, handle: u64, flags: u32) {
+    if let Some(scheme) = get_kernel_scheme_by_id(scheme_id) {
+        let scheme_handle = SchemeHandle {
+            scheme_id,
+            handle,
+            flags,
+        };
+        // Ignore errors on close - process is cleaning up anyway
+        let _ = scheme.close(&scheme_handle);
+    }
+}
+
 // ============================================================================
 // Path parsing and scheme routing
 // ============================================================================

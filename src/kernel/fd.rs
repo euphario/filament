@@ -170,14 +170,60 @@ impl FdTable {
         }
     }
 
-    /// Close a file descriptor
-    pub fn close(&mut self, fd: Fd) -> bool {
+    /// Close a file descriptor with proper resource cleanup
+    /// caller_pid: Required for channel close permission check
+    pub fn close_with_pid(&mut self, fd: Fd, caller_pid: Pid) -> bool {
         let idx = fd as usize;
         if idx < MAX_FDS && !self.entries[idx].is_empty() {
+            // Clean up scheme resources before clearing the entry
+            self.cleanup_fd_resources(&self.entries[idx], caller_pid);
             self.entries[idx] = FdEntry::empty();
             true
         } else {
             false
+        }
+    }
+
+    /// Close a file descriptor (simple version for backward compatibility)
+    pub fn close(&mut self, fd: Fd) -> bool {
+        let idx = fd as usize;
+        if idx < MAX_FDS && !self.entries[idx].is_empty() {
+            // For simple close without PID, just close schemes (channels need PID)
+            if let FdType::Scheme { scheme_id, handle, scheme_flags } = self.entries[idx].fd_type {
+                super::scheme::close_kernel_scheme(scheme_id, handle, scheme_flags);
+            }
+            self.entries[idx] = FdEntry::empty();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Close all file descriptors (called on process exit)
+    /// caller_pid: The PID of the exiting process
+    pub fn close_all(&mut self, caller_pid: Pid) {
+        for idx in 0..MAX_FDS {
+            if !self.entries[idx].is_empty() {
+                self.cleanup_fd_resources(&self.entries[idx], caller_pid);
+                self.entries[idx] = FdEntry::empty();
+            }
+        }
+    }
+
+    /// Clean up resources associated with an FD entry
+    fn cleanup_fd_resources(&self, entry: &FdEntry, caller_pid: Pid) {
+        match entry.fd_type {
+            FdType::Scheme { scheme_id, handle, scheme_flags } => {
+                // Call scheme's close handler
+                super::scheme::close_kernel_scheme(scheme_id, handle, scheme_flags);
+            }
+            FdType::Channel(channel_id) => {
+                // Close IPC channel
+                let _ = super::ipc::sys_channel_close(channel_id, caller_pid);
+            }
+            // Other FD types don't need special cleanup
+            FdType::None | FdType::ConsoleIn | FdType::ConsoleOut |
+            FdType::Null | FdType::Ramfs { .. } | FdType::Mmio { .. } => {}
         }
     }
 
@@ -190,7 +236,8 @@ impl FdTable {
     }
 
     /// Duplicate a file descriptor to a specific number
-    pub fn dup2(&mut self, old_fd: Fd, new_fd: Fd) -> bool {
+    /// caller_pid: Required for channel close permission check if new_fd was open
+    pub fn dup2(&mut self, old_fd: Fd, new_fd: Fd, caller_pid: Pid) -> bool {
         if old_fd == new_fd {
             return self.get(old_fd).is_some();
         }
@@ -205,7 +252,10 @@ impl FdTable {
             return false;
         }
 
-        // Close new_fd if open
+        // Close new_fd if open (with proper cleanup)
+        if !self.entries[new_idx].is_empty() {
+            self.cleanup_fd_resources(&self.entries[new_idx], caller_pid);
+        }
         self.entries[new_idx] = old_entry;
         true
     }
