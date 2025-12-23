@@ -37,12 +37,16 @@ use kernel::{task, scheme, shmem, elf, pmm, pci};
 
 // Alias for platform constants (platform::mt7988::INITRD_ADDR, etc.)
 use platform::mt7988 as plat;
+use kernel::percpu;
 
 /// Kernel entry point - called from boot.S after dropping to EL1
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
-    // Initialize UART
+    // Initialize UART first (needed for printing)
     uart::init();
+
+    // Initialize per-CPU infrastructure early (sets TPIDR_EL1)
+    percpu::init_boot_cpu();
 
     // Initialize logging (after UART so we can print)
     log::init();
