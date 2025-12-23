@@ -245,6 +245,9 @@ fn verify_mapping(addr: u64, len: usize, needs_write: bool) -> Result<(), UAcces
 
 /// Check if a single page is mapped in the page tables
 /// NOTE: Accesses page tables via TTBR1 kernel mapping since TTBR0 is switched during syscall
+///
+/// SECURITY: Also validates that the resolved physical address is in valid DRAM range.
+/// This prevents user processes from having page table entries pointing to MMIO or kernel memory.
 fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(), UAccessError> {
     // Extract table indices from virtual address
     let l0_index = ((virt_addr >> 39) & 0x1FF) as usize;
@@ -254,7 +257,11 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
 
     unsafe {
         // Read L0 entry via TTBR1 mapping (page tables are at physical addresses)
-        let l0_table = (KERNEL_VIRT_BASE | ttbr0) as *const u64;
+        let l0_table_phys = ttbr0 & 0x0000_FFFF_FFFF_F000; // Mask out ASID
+        if !is_valid_phys(l0_table_phys) {
+            return Err(UAccessError::NotMapped);
+        }
+        let l0_table = (KERNEL_VIRT_BASE | l0_table_phys) as *const u64;
         let l0_entry = core::ptr::read_volatile(l0_table.add(l0_index));
 
         if (l0_entry & flags::VALID) == 0 {
@@ -268,6 +275,9 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
 
         // Read L1 entry via TTBR1 mapping
         let l1_table_phys = l0_entry & 0x0000_FFFF_FFFF_F000;
+        if !is_valid_phys(l1_table_phys) {
+            return Err(UAccessError::NotMapped);
+        }
         let l1_table = (KERNEL_VIRT_BASE | l1_table_phys) as *const u64;
         let l1_entry = core::ptr::read_volatile(l1_table.add(l1_index));
 
@@ -277,12 +287,19 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
 
         // Check if L1 is a block entry (1GB block) or table entry
         if (l1_entry & flags::TABLE) == 0 {
-            // 1GB block mapping - check permissions
+            // 1GB block mapping - validate physical address and check permissions
+            let block_base = l1_entry & 0x0000_FFFC_0000_0000;
+            if !is_valid_phys(block_base) {
+                return Err(UAccessError::NotMapped);
+            }
             return check_permissions(l1_entry, needs_write);
         }
 
         // Read L2 entry via TTBR1 mapping
         let l2_table_phys = l1_entry & 0x0000_FFFF_FFFF_F000;
+        if !is_valid_phys(l2_table_phys) {
+            return Err(UAccessError::NotMapped);
+        }
         let l2_table = (KERNEL_VIRT_BASE | l2_table_phys) as *const u64;
         let l2_entry = core::ptr::read_volatile(l2_table.add(l2_index));
 
@@ -292,12 +309,19 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
 
         // Check if L2 is a block entry (2MB block) or table entry
         if (l2_entry & flags::TABLE) == 0 {
-            // 2MB block mapping - check permissions
+            // 2MB block mapping - validate physical address and check permissions
+            let block_base = l2_entry & 0x0000_FFFF_FFE0_0000;
+            if !is_valid_phys(block_base) {
+                return Err(UAccessError::NotMapped);
+            }
             return check_permissions(l2_entry, needs_write);
         }
 
         // Read L3 entry via TTBR1 mapping
         let l3_table_phys = l2_entry & 0x0000_FFFF_FFFF_F000;
+        if !is_valid_phys(l3_table_phys) {
+            return Err(UAccessError::NotMapped);
+        }
         let l3_table = (KERNEL_VIRT_BASE | l3_table_phys) as *const u64;
         let l3_entry = core::ptr::read_volatile(l3_table.add(l3_index));
 
@@ -307,6 +331,13 @@ fn verify_page_mapped(ttbr0: u64, virt_addr: u64, needs_write: bool) -> Result<(
 
         // L3 entries use PAGE bit, not TABLE
         if (l3_entry & flags::PAGE) == 0 {
+            return Err(UAccessError::NotMapped);
+        }
+
+        // SECURITY: Validate the final physical address is in valid DRAM
+        // This prevents user processes from having mappings to MMIO or kernel memory
+        let page_phys = l3_entry & 0x0000_FFFF_FFFF_F000;
+        if !is_valid_phys(page_phys) {
             return Err(UAccessError::NotMapped);
         }
 

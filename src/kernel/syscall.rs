@@ -1555,9 +1555,20 @@ fn sys_daemonize() -> i64 {
 }
 
 /// Kill a process by PID
+///
+/// SECURITY: Only allows killing:
+/// - The caller itself (suicide)
+/// - Children of the caller
+/// - Processes with CAP_KILL capability can kill any process except init (PID 1)
 fn sys_kill(pid: u32) -> i64 {
     if pid == 0 {
         return SyscallError::InvalidArgument as i64;
+    }
+
+    // SECURITY: Never allow killing init (PID 1) - system would become unstable
+    if pid == 1 {
+        logln!("[SYSCALL] Refusing to kill init (PID 1)");
+        return SyscallError::PermissionDenied as i64;
     }
 
     let caller_pid = current_pid();
@@ -1565,15 +1576,17 @@ fn sys_kill(pid: u32) -> i64 {
     unsafe {
         let sched = super::task::scheduler();
 
-        // Find the target task
+        // Find the target task and get its info
         let mut target_slot = None;
         let mut parent_id = 0u32;
+        let mut target_parent_id = 0u32;
 
         for (i, task_opt) in sched.tasks.iter().enumerate() {
             if let Some(ref task) = task_opt {
                 if task.id == pid {
                     target_slot = Some(i);
                     parent_id = task.parent_id;
+                    target_parent_id = task.parent_id;
                     break;
                 }
             }
@@ -1583,6 +1596,21 @@ fn sys_kill(pid: u32) -> i64 {
             Some(s) => s,
             None => return SyscallError::NoProcess as i64,
         };
+
+        // SECURITY: Authorization check
+        // Allow if:
+        // 1. Killing self (suicide)
+        // 2. Target is a child of caller
+        // 3. Caller has CAP_KILL capability
+        let is_suicide = pid == caller_pid;
+        let is_child = target_parent_id == caller_pid;
+        let has_cap_kill = require_capability(Capabilities::KILL).is_ok();
+
+        if !is_suicide && !is_child && !has_cap_kill {
+            logln!("[SYSCALL] Kill denied: PID {} cannot kill PID {} (not owner/child)",
+                   caller_pid, pid);
+            return SyscallError::PermissionDenied as i64;
+        }
 
         // Mark as terminated with SIGKILL-style exit code
         if let Some(ref mut task) = sched.tasks[slot] {

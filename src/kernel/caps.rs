@@ -67,8 +67,8 @@ impl Capabilities {
     /// Can grant capabilities to children (delegation)
     pub const GRANT: Self = Self(1 << 10);
 
-    /// Reserved for future use
-    pub const RESERVED_11: Self = Self(1 << 11);
+    /// Can kill any process (except init)
+    pub const KILL: Self = Self(1 << 11);
     pub const RESERVED_12: Self = Self(1 << 12);
     pub const RESERVED_13: Self = Self(1 << 13);
     pub const RESERVED_14: Self = Self(1 << 14);

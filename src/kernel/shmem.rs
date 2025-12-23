@@ -248,6 +248,28 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
     Ok((vaddr, phys_addr))
 }
 
+/// Unmap shared memory from a process (decrements ref_count)
+/// Called when a process unmaps shmem or exits
+pub fn unmap(pid: Pid, shmem_id: u32) -> Result<(), i64> {
+    unsafe {
+        let region = find_region_mut(shmem_id)?;
+
+        // Check if this process has it mapped (must be allowed)
+        if !region.is_allowed(pid) {
+            return Err(-13); // EACCES
+        }
+
+        // Decrement ref_count (but never below 0)
+        if region.ref_count > 0 {
+            region.ref_count -= 1;
+        }
+
+        // Also remove from waiters if waiting
+        region.remove_waiter(pid);
+    }
+    Ok(())
+}
+
 /// Grant another process permission to map this shared memory
 pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
     unsafe {
@@ -341,6 +363,10 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
 }
 
 /// Destroy a shared memory region (only owner can do this)
+///
+/// SECURITY: Refuses to destroy if ref_count > 1 (other processes still have it mapped).
+/// This prevents use-after-free where destroying shared memory while another process
+/// is actively using it would cause memory corruption.
 pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
     unsafe {
         let slot_idx = find_region_slot(shmem_id)?;
@@ -351,12 +377,20 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
                 return Err(-1); // EPERM
             }
 
+            // SECURITY: Refuse to destroy if other processes still have it mapped
+            // ref_count of 1 means only the owner has it mapped (safe to destroy)
+            // ref_count > 1 means other processes still have active mappings
+            if region.ref_count > 1 {
+                logln!("[shmem] Refusing to destroy region {} - ref_count={} (other processes still mapped)",
+                       shmem_id, region.ref_count);
+                return Err(-16); // EBUSY - resource busy
+            }
+
             let phys_addr = region.phys_addr;
             let size = region.size;
             let num_pages = size / 4096;
 
-            // CRITICAL: Unmap from ALL processes that have this shmem mapped
-            // This prevents use-after-free when we free the physical memory
+            // Safe to unmap and free - only owner has it mapped
             unmap_from_all_processes(phys_addr, size);
 
             // Now safe to free physical memory - no more mappings exist
@@ -438,13 +472,21 @@ fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
     Err(-3) // ESRCH - no such process
 }
 
-/// Called when a process exits - clean up any shared memory it owns
+/// Called when a process exits - clean up any shared memory it owns or has mapped
 pub fn process_cleanup(pid: Pid) {
     unsafe {
         for slot in (*core::ptr::addr_of_mut!(SHMEM_TABLE)).iter_mut() {
             if let Some(ref mut region) = slot {
                 // Remove from waiters if present
                 region.remove_waiter(pid);
+
+                // If this process had it mapped (is in allowed list), decrement ref_count
+                // This handles non-owner processes that had mapped the shmem
+                if region.is_allowed(pid) && region.owner_pid != pid {
+                    if region.ref_count > 0 {
+                        region.ref_count -= 1;
+                    }
+                }
 
                 // If owner, destroy the region (same as destroy() but without permission check)
                 if region.owner_pid == pid {

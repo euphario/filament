@@ -285,29 +285,40 @@ impl ChannelTable {
 
     /// Create a channel pair (bidirectional)
     /// Returns (endpoint_a, endpoint_b) IDs
+    ///
+    /// CORRECTNESS: This function is atomic - it either creates both endpoints
+    /// or neither. We find both slots BEFORE modifying any state to prevent
+    /// leaving the table in an inconsistent state on failure.
     pub fn create_pair(&mut self, owner_a: Pid, owner_b: Pid) -> Option<(ChannelId, ChannelId)> {
+        // CRITICAL: Find both slots BEFORE modifying any state
+        // This prevents a race where we mark slot_a as Open but then fail
+        // to find slot_b, leaving slot_a in an inconsistent state
         let slot_a = self.find_free_slot()?;
+
+        // Find second slot, excluding slot_a
+        let slot_b = self.endpoints.iter()
+            .enumerate()
+            .position(|(i, e)| i != slot_a && e.state == ChannelState::Free)?;
+
+        // Now that we have both slots, allocate IDs
         let id_a = self.alloc_id();
-
-        // Temporarily mark slot_a as used so find_free_slot finds a different slot
-        self.endpoints[slot_a].state = ChannelState::Open;
-
-        let slot_b = self.find_free_slot()?;
         let id_b = self.alloc_id();
 
-        // Set up endpoint A
+        // Set up endpoint A (atomically - all fields at once)
         self.endpoints[slot_a].id = id_a;
         self.endpoints[slot_a].owner = owner_a;
         self.endpoints[slot_a].peer = id_b;
-        self.endpoints[slot_a].state = ChannelState::Open;
         self.endpoints[slot_a].queue = MessageQueue::new();
+        self.endpoints[slot_a].blocked_receiver = None;
+        self.endpoints[slot_a].state = ChannelState::Open; // Set state LAST
 
-        // Set up endpoint B
+        // Set up endpoint B (atomically - all fields at once)
         self.endpoints[slot_b].id = id_b;
         self.endpoints[slot_b].owner = owner_b;
         self.endpoints[slot_b].peer = id_a;
-        self.endpoints[slot_b].state = ChannelState::Open;
         self.endpoints[slot_b].queue = MessageQueue::new();
+        self.endpoints[slot_b].blocked_receiver = None;
+        self.endpoints[slot_b].state = ChannelState::Open; // Set state LAST
 
         Some((id_a, id_b))
     }
