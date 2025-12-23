@@ -215,12 +215,14 @@ pub fn init() {
 
     // Initialize primary CPU's per-CPU data
     unsafe {
-        let pcpu = get_cpu_mut(cpu).unwrap();
-        pcpu.stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
-        pcpu.set_state(CpuState::Online);
+        if let Some(pcpu) = get_cpu_mut(cpu) {
+            pcpu.stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
+            pcpu.set_state(CpuState::Online);
+            logln!("  CPU {} online", cpu);
+        } else {
+            logln!("  [!!] CPU {} init failed - invalid CPU ID", cpu);
+        }
     }
-
-    logln!("  CPU {} online", cpu);
 }
 
 /// Secondary CPU entry point (called from assembly)
@@ -281,10 +283,18 @@ pub fn start_secondary_cpus() {
         }
 
         // Set up stack for this CPU
-        unsafe {
-            let pcpu = get_cpu_mut(cpu).unwrap();
-            pcpu.stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
-            pcpu.set_state(CpuState::Starting);
+        let setup_ok = unsafe {
+            if let Some(pcpu) = get_cpu_mut(cpu) {
+                pcpu.stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
+                pcpu.set_state(CpuState::Starting);
+                true
+            } else {
+                logln!("    [!!] CPU {} has invalid ID, skipping", cpu);
+                false
+            }
+        };
+        if !setup_ok {
+            continue;
         }
 
         // Store entry point in mailbox

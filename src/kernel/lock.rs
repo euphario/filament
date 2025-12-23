@@ -22,7 +22,9 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(debug_assertions)]
+use core::sync::atomic::AtomicU32;
 
 // ============================================================================
 // Debug Statistics (for diagnosing lock contention)

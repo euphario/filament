@@ -103,6 +103,13 @@ impl DmaDescriptor {
             _reserved: [0; 4],
         }
     }
+
+    /// Set buffer address from a 64-bit pointer (splits into low/high parts)
+    #[inline]
+    pub fn set_buf_addr(&mut self, addr: u64) {
+        self.buf_addr = addr as u32;
+        self.buf_addr_hi = (addr >> 32) as u32;
+    }
 }
 
 /// Descriptor control bits
@@ -223,16 +230,14 @@ impl EthDriver {
 
             // Initialize TX ring
             for i in 0..TX_RING_SIZE {
-                rings.tx_ring[i].buf_addr = bufs.tx_buffers[i].as_ptr() as u32;
-                rings.tx_ring[i].buf_addr_hi = 0;
+                rings.tx_ring[i].set_buf_addr(bufs.tx_buffers[i].as_ptr() as u64);
                 rings.tx_ring[i].ctrl1 = 0; // Not owned by DMA yet
                 rings.tx_ring[i].ctrl2 = 0;
             }
 
             // Initialize RX ring
             for i in 0..RX_RING_SIZE {
-                rings.rx_ring[i].buf_addr = bufs.rx_buffers[i].as_ptr() as u32;
-                rings.rx_ring[i].buf_addr_hi = 0;
+                rings.rx_ring[i].set_buf_addr(bufs.rx_buffers[i].as_ptr() as u64);
                 // Mark as owned by DMA, ready to receive
                 rings.rx_ring[i].ctrl1 = desc::DDONE | (2048 & desc::LEN_MASK);
                 rings.rx_ring[i].ctrl2 = 0;
@@ -242,14 +247,19 @@ impl EthDriver {
             dsb();
 
             // Set up PDMA registers
-            let tx_ring_addr = rings.tx_ring.as_ptr() as u32;
-            let rx_ring_addr = rings.rx_ring.as_ptr() as u32;
+            // Note: PDMA_TX/RX_BASE are 32-bit registers - rings must be in low memory
+            let tx_ring_addr = rings.tx_ring.as_ptr() as usize;
+            let rx_ring_addr = rings.rx_ring.as_ptr() as usize;
 
-            self.pdma.write32(regs::PDMA_TX_BASE, tx_ring_addr);
+            // Verify ring addresses fit in 32 bits (PDMA limitation)
+            debug_assert!(tx_ring_addr <= u32::MAX as usize, "TX ring address exceeds 32-bit PDMA limit");
+            debug_assert!(rx_ring_addr <= u32::MAX as usize, "RX ring address exceeds 32-bit PDMA limit");
+
+            self.pdma.write32(regs::PDMA_TX_BASE, tx_ring_addr as u32);
             self.pdma.write32(regs::PDMA_TX_CNT, TX_RING_SIZE as u32);
             self.pdma.write32(regs::PDMA_TX_CPU_IDX, 0);
 
-            self.pdma.write32(regs::PDMA_RX_BASE, rx_ring_addr);
+            self.pdma.write32(regs::PDMA_RX_BASE, rx_ring_addr as u32);
             self.pdma.write32(regs::PDMA_RX_CNT, RX_RING_SIZE as u32);
             self.pdma.write32(regs::PDMA_RX_CPU_IDX, (RX_RING_SIZE - 1) as u32);
         }

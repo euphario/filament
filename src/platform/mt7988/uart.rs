@@ -145,13 +145,21 @@ impl Uart {
     }
 
     /// Write a single byte to the UART
-    pub fn putc(&self, byte: u8) {
-        // Wait until transmit holding register is empty
+    /// Returns false if timeout (character dropped), true if sent successfully
+    pub fn putc(&self, byte: u8) -> bool {
+        // Wait until transmit holding register is empty (with timeout)
+        const MAX_RETRIES: u32 = 100_000;
+        let mut retries = 0;
         while (self.regs.read32(regs::LSR) & lsr::THRE) == 0 {
+            retries += 1;
+            if retries >= MAX_RETRIES {
+                return false; // Drop character rather than hang
+            }
             core::hint::spin_loop();
         }
         // Write the byte
         self.regs.write32(regs::THR, byte as u32);
+        true
     }
 
     /// Read a single byte from the UART (blocking)

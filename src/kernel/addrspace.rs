@@ -15,7 +15,8 @@
 
 #![allow(dead_code)]
 
-use crate::arch::aarch64::mmu::{self, KERNEL_VIRT_BASE, flags, attr};
+use crate::arch::aarch64::mmu::{self, flags, attr};
+use crate::arch::aarch64::tlb;
 use super::pmm;
 use super::lock::SpinLock;
 use crate::logln;
@@ -239,295 +240,79 @@ impl AddressSpace {
         true
     }
 
-    /// Map a 4KB page at a specific virtual address
-    /// This requires allocating L2 and L3 tables as needed
-    pub fn map_page(
+    // ========================================================================
+    // Page Mapping - Core Implementation
+    // ========================================================================
+
+    /// Mask to extract physical address from page table entry
+    const PHYS_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    /// Internal helper: Get or allocate a next-level table
+    /// Returns the physical address of the table, or None on failure
+    fn get_or_alloc_table(&mut self, parent_phys: u64, index: usize) -> Option<u64> {
+        unsafe {
+            let parent_ptr = phys_to_virt(parent_phys);
+            let entry = core::ptr::read_volatile(parent_ptr.add(index));
+
+            if entry == 0 {
+                // Allocate new table
+                if self.num_tables >= 16 {
+                    return None; // Out of tracking space
+                }
+                let new_table = pmm::alloc_page()? as u64;
+
+                // Zero the new table
+                let new_ptr = phys_to_virt(new_table);
+                core::ptr::write_bytes(new_ptr, 0, 512);
+
+                // Set parent entry to point to new table
+                core::ptr::write_volatile(
+                    parent_ptr.add(index),
+                    new_table | flags::VALID | flags::TABLE
+                );
+                self.page_tables[self.num_tables] = new_table;
+                self.num_tables += 1;
+                Some(new_table)
+            } else if (entry & flags::TABLE) != 0 {
+                // Already a table entry - extract physical address
+                Some(entry & Self::PHYS_ADDR_MASK)
+            } else {
+                // It's a block entry, can't map pages here
+                None
+            }
+        }
+    }
+
+    /// Internal helper: Map a page with specified attributes
+    /// memory_attr: attr::NORMAL, attr::DEVICE, or attr::NORMAL_NC
+    /// executable: only applies to NORMAL memory (others are always XN)
+    fn map_page_internal(
         &mut self,
         virt_addr: u64,
         phys_addr: u64,
         writable: bool,
         executable: bool,
+        memory_attr: u64,
     ) -> bool {
         // Extract table indices from virtual address
         let l1_index = ((virt_addr >> 30) & 0x1FF) as usize;
         let l2_index = ((virt_addr >> 21) & 0x1FF) as usize;
         let l3_index = ((virt_addr >> 12) & 0x1FF) as usize;
 
-        // For simplicity, this implementation only supports a single L2/L3 chain
-        // A full implementation would track multiple L2/L3 tables
-
-        // Get or allocate L2 table
+        // Walk/create page tables: L1 -> L2 -> L3
         let l1_phys = self.page_tables[1];
-        let l2_phys = unsafe {
-            let l1_ptr = phys_to_virt(l1_phys);
-            let entry = core::ptr::read_volatile(l1_ptr.add(l1_index));
-
-            if entry == 0 {
-                // Need to allocate L2 table
-                if self.num_tables >= 16 {
-                    return false;  // Out of tracking space
-                }
-                let new_l2 = match pmm::alloc_page() {
-                    Some(addr) => addr,
-                    None => return false,
-                };
-                // Zero the new table
-                let new_ptr = phys_to_virt(new_l2 as u64);
-                for i in 0..512 {
-                    core::ptr::write_volatile(new_ptr.add(i), 0);
-                }
-                // Set L1 entry to point to L2
-                core::ptr::write_volatile(
-                    l1_ptr.add(l1_index),
-                    new_l2 as u64 | flags::VALID | flags::TABLE
-                );
-                self.page_tables[self.num_tables] = new_l2 as u64;
-                self.num_tables += 1;
-                new_l2 as u64
-            } else if (entry & flags::TABLE) != 0 {
-                // Already a table entry
-                entry & 0x0000_FFFF_FFFF_F000
-            } else {
-                // It's a block entry, can't map pages here
-                return false;
-            }
+        let l2_phys = match self.get_or_alloc_table(l1_phys, l1_index) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let l3_phys = match self.get_or_alloc_table(l2_phys, l2_index) {
+            Some(addr) => addr,
+            None => return false,
         };
 
-        // Get or allocate L3 table
-        let l3_phys = unsafe {
-            let l2_ptr = phys_to_virt(l2_phys);
-            let entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
-
-            if entry == 0 {
-                // Need to allocate L3 table
-                if self.num_tables >= 16 {
-                    return false;
-                }
-                let new_l3 = match pmm::alloc_page() {
-                    Some(addr) => addr,
-                    None => return false,
-                };
-                // Zero the new table
-                let new_ptr = phys_to_virt(new_l3 as u64);
-                for i in 0..512 {
-                    core::ptr::write_volatile(new_ptr.add(i), 0);
-                }
-                // Set L2 entry to point to L3
-                core::ptr::write_volatile(
-                    l2_ptr.add(l2_index),
-                    new_l3 as u64 | flags::VALID | flags::TABLE
-                );
-                self.page_tables[self.num_tables] = new_l3 as u64;
-                self.num_tables += 1;
-                new_l3 as u64
-            } else if (entry & flags::TABLE) != 0 {
-                entry & 0x0000_FFFF_FFFF_F000
-            } else {
-                return false;
-            }
-        };
-
-        // Set the L3 page entry
+        // Build page entry flags
         let ap = if writable { flags::AP_RW_ALL } else { flags::AP_RO_ALL };
-        let xn = if executable { 0 } else { flags::UXN };
-
-        unsafe {
-            let l3_ptr = phys_to_virt(l3_phys);
-            core::ptr::write_volatile(
-                l3_ptr.add(l3_index),
-                phys_addr
-                    | flags::VALID
-                    | flags::PAGE  // L3 entries use PAGE bit
-                    | flags::AF
-                    | flags::SH_INNER
-                    | attr::NORMAL
-                    | ap
-                    | xn
-                    | flags::PXN
-            );
-        }
-
-        true
-    }
-
-    /// Map a 4KB device page at a specific virtual address
-    /// Similar to map_page but uses device memory attributes (non-cacheable)
-    pub fn map_device_page(
-        &mut self,
-        virt_addr: u64,
-        phys_addr: u64,
-        writable: bool,
-    ) -> bool {
-        // Extract table indices from virtual address
-        let l1_index = ((virt_addr >> 30) & 0x1FF) as usize;
-        let l2_index = ((virt_addr >> 21) & 0x1FF) as usize;
-        let l3_index = ((virt_addr >> 12) & 0x1FF) as usize;
-
-        // Get or allocate L2 table
-        let l1_phys = self.page_tables[1];
-        let l2_phys = unsafe {
-            let l1_ptr = phys_to_virt(l1_phys);
-            let entry = core::ptr::read_volatile(l1_ptr.add(l1_index));
-
-            if entry == 0 {
-                // Need to allocate L2 table
-                if self.num_tables >= 16 {
-                    return false;
-                }
-                let new_l2 = match pmm::alloc_page() {
-                    Some(addr) => addr,
-                    None => return false,
-                };
-                let new_ptr = phys_to_virt(new_l2 as u64);
-                for i in 0..512 {
-                    core::ptr::write_volatile(new_ptr.add(i), 0);
-                }
-                core::ptr::write_volatile(
-                    l1_ptr.add(l1_index),
-                    new_l2 as u64 | flags::VALID | flags::TABLE
-                );
-                self.page_tables[self.num_tables] = new_l2 as u64;
-                self.num_tables += 1;
-                new_l2 as u64
-            } else if (entry & flags::TABLE) != 0 {
-                entry & 0x0000_FFFF_FFFF_F000
-            } else {
-                return false;
-            }
-        };
-
-        // Get or allocate L3 table
-        let l3_phys = unsafe {
-            let l2_ptr = phys_to_virt(l2_phys);
-            let entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
-
-            if entry == 0 {
-                if self.num_tables >= 16 {
-                    return false;
-                }
-                let new_l3 = match pmm::alloc_page() {
-                    Some(addr) => addr,
-                    None => return false,
-                };
-                let new_ptr = phys_to_virt(new_l3 as u64);
-                for i in 0..512 {
-                    core::ptr::write_volatile(new_ptr.add(i), 0);
-                }
-                core::ptr::write_volatile(
-                    l2_ptr.add(l2_index),
-                    new_l3 as u64 | flags::VALID | flags::TABLE
-                );
-                self.page_tables[self.num_tables] = new_l3 as u64;
-                self.num_tables += 1;
-                new_l3 as u64
-            } else if (entry & flags::TABLE) != 0 {
-                entry & 0x0000_FFFF_FFFF_F000
-            } else {
-                return false;
-            }
-        };
-
-        // Set the L3 page entry with device memory attributes
-        let ap = if writable { flags::AP_RW_ALL } else { flags::AP_RO_ALL };
-
-        unsafe {
-            let l3_ptr = phys_to_virt(l3_phys);
-            core::ptr::write_volatile(
-                l3_ptr.add(l3_index),
-                phys_addr
-                    | flags::VALID
-                    | flags::PAGE  // L3 entries use PAGE bit
-                    | flags::AF
-                    | flags::SH_INNER
-                    | attr::DEVICE  // Device memory - non-cacheable
-                    | ap
-                    | flags::UXN   // No user execute
-                    | flags::PXN   // No kernel execute
-            );
-        }
-
-        true
-    }
-
-    /// Map a 4KB DMA buffer page at a specific virtual address
-    /// Uses Normal Non-Cacheable memory for proper DMA coherency
-    pub fn map_dma_page(
-        &mut self,
-        virt_addr: u64,
-        phys_addr: u64,
-        writable: bool,
-    ) -> bool {
-        // Extract table indices from virtual address
-        let l1_index = ((virt_addr >> 30) & 0x1FF) as usize;
-        let l2_index = ((virt_addr >> 21) & 0x1FF) as usize;
-        let l3_index = ((virt_addr >> 12) & 0x1FF) as usize;
-
-        // Get or allocate L2 table
-        let l1_phys = self.page_tables[1];
-        let l2_phys = unsafe {
-            let l1_ptr = phys_to_virt(l1_phys);
-            let entry = core::ptr::read_volatile(l1_ptr.add(l1_index));
-
-            if entry == 0 {
-                if self.num_tables >= 16 {
-                    return false;
-                }
-                let new_l2 = match pmm::alloc_page() {
-                    Some(addr) => addr,
-                    None => return false,
-                };
-                let new_ptr = phys_to_virt(new_l2 as u64);
-                for i in 0..512 {
-                    core::ptr::write_volatile(new_ptr.add(i), 0);
-                }
-                core::ptr::write_volatile(
-                    l1_ptr.add(l1_index),
-                    new_l2 as u64 | flags::VALID | flags::TABLE
-                );
-                self.page_tables[self.num_tables] = new_l2 as u64;
-                self.num_tables += 1;
-                new_l2 as u64
-            } else if (entry & flags::TABLE) != 0 {
-                entry & 0x0000_FFFF_FFFF_F000
-            } else {
-                return false;
-            }
-        };
-
-        // Get or allocate L3 table
-        let l3_phys = unsafe {
-            let l2_ptr = phys_to_virt(l2_phys);
-            let entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
-
-            if entry == 0 {
-                if self.num_tables >= 16 {
-                    return false;
-                }
-                let new_l3 = match pmm::alloc_page() {
-                    Some(addr) => addr,
-                    None => return false,
-                };
-                let new_ptr = phys_to_virt(new_l3 as u64);
-                for i in 0..512 {
-                    core::ptr::write_volatile(new_ptr.add(i), 0);
-                }
-                core::ptr::write_volatile(
-                    l2_ptr.add(l2_index),
-                    new_l3 as u64 | flags::VALID | flags::TABLE
-                );
-                self.page_tables[self.num_tables] = new_l3 as u64;
-                self.num_tables += 1;
-                new_l3 as u64
-            } else if (entry & flags::TABLE) != 0 {
-                entry & 0x0000_FFFF_FFFF_F000
-            } else {
-                return false;
-            }
-        };
-
-        // Set the L3 page entry with Normal Non-Cacheable memory for DMA
-        // This makes DMA transparent without explicit cache management.
-        let ap = if writable { flags::AP_RW_ALL } else { flags::AP_RO_ALL };
+        let xn = if executable && memory_attr == attr::NORMAL { 0 } else { flags::UXN };
 
         unsafe {
             let l3_ptr = phys_to_virt(l3_phys);
@@ -537,15 +322,49 @@ impl AddressSpace {
                     | flags::VALID
                     | flags::PAGE
                     | flags::AF
-                    | flags::SH_INNER   // Inner shareable for multi-core
-                    | attr::NORMAL_NC   // Normal Non-Cacheable - DMA coherent
+                    | flags::SH_INNER
+                    | memory_attr
                     | ap
-                    | flags::UXN
+                    | xn
                     | flags::PXN
             );
         }
 
         true
+    }
+
+    /// Map a 4KB page at a specific virtual address (normal cacheable memory)
+    #[inline]
+    pub fn map_page(
+        &mut self,
+        virt_addr: u64,
+        phys_addr: u64,
+        writable: bool,
+        executable: bool,
+    ) -> bool {
+        self.map_page_internal(virt_addr, phys_addr, writable, executable, attr::NORMAL)
+    }
+
+    /// Map a 4KB device page (non-cacheable, for MMIO)
+    #[inline]
+    pub fn map_device_page(
+        &mut self,
+        virt_addr: u64,
+        phys_addr: u64,
+        writable: bool,
+    ) -> bool {
+        self.map_page_internal(virt_addr, phys_addr, writable, false, attr::DEVICE)
+    }
+
+    /// Map a 4KB DMA page (normal non-cacheable, for DMA coherency)
+    #[inline]
+    pub fn map_dma_page(
+        &mut self,
+        virt_addr: u64,
+        phys_addr: u64,
+        writable: bool,
+    ) -> bool {
+        self.map_page_internal(virt_addr, phys_addr, writable, false, attr::NORMAL_NC)
     }
 
     /// Unmap a 4KB page at a specific virtual address
@@ -573,7 +392,7 @@ impl AddressSpace {
             }
 
             // Get L2 table
-            let l2_phys = l1_entry & 0x0000_FFFF_FFFF_F000;
+            let l2_phys = l1_entry & Self::PHYS_ADDR_MASK;
             let l2_ptr = phys_to_virt(l2_phys);
             let l2_entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
 
@@ -587,7 +406,7 @@ impl AddressSpace {
             }
 
             // Get L3 table
-            let l3_phys = l2_entry & 0x0000_FFFF_FFFF_F000;
+            let l3_phys = l2_entry & Self::PHYS_ADDR_MASK;
             let l3_ptr = phys_to_virt(l3_phys);
             let l3_entry = core::ptr::read_volatile(l3_ptr.add(l3_index));
 
@@ -596,7 +415,7 @@ impl AddressSpace {
             }
 
             // Get the physical address before clearing
-            let phys_addr = l3_entry & 0x0000_FFFF_FFFF_F000;
+            let phys_addr = l3_entry & Self::PHYS_ADDR_MASK;
 
             // Clear the L3 entry (mark as invalid)
             core::ptr::write_volatile(l3_ptr.add(l3_index), 0);
@@ -630,9 +449,7 @@ impl Drop for AddressSpace {
     fn drop(&mut self) {
         // Invalidate TLB entries for this ASID before freeing
         if self.asid != 0 {
-            unsafe {
-                mmu::invalidate_asid(self.asid);
-            }
+            tlb::invalidate_asid(self.asid);
             free_asid(self.asid);
         }
 

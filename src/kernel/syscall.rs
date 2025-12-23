@@ -1741,9 +1741,10 @@ fn sys_reset() -> i64 {
 
     // MT7988A TOPRGU (Top Reset Generation Unit) registers
     use crate::arch::aarch64::mmio::MmioRegion;
+    use crate::arch::aarch64::mmu;
     use crate::platform::mt7988 as platform;
 
-    let wdt = MmioRegion::new(platform::phys_to_virt(platform::TOPRGU_BASE));
+    let wdt = MmioRegion::new(mmu::phys_to_virt(platform::TOPRGU_BASE as u64) as usize);
 
     const WDT_MODE: usize = 0x00;
     const WDT_SWRST: usize = 0x14;

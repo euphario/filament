@@ -32,7 +32,7 @@
 
 #![allow(dead_code)]  // Infrastructure for future use
 
-use crate::arch::aarch64::mmu::{self, flags, PAGE_SIZE, KERNEL_VIRT_BASE};
+use crate::arch::aarch64::mmu::{self, flags, PAGE_SIZE};
 use super::task;
 
 /// Maximum valid user space address (48-bit, upper half is kernel)
@@ -665,29 +665,9 @@ pub fn put_user<T: Copy>(user_ptr: u64, value: T) -> Result<(), UAccessError> {
     Ok(())
 }
 
-/// DEPRECATED: This function does NOT work correctly!
-///
-/// During syscall handling, TTBR0 points to kernel's identity mapping, not user's.
-/// The returned slice would point to wrong physical memory.
-///
-/// Use `copy_from_user()` instead to safely read user memory.
-#[deprecated(note = "Use copy_from_user() - user slices don't work with TTBR0 switching")]
-pub unsafe fn user_slice(_ptr: u64, _len: usize) -> Result<&'static [u8], UAccessError> {
-    // This function cannot work correctly - user VA != correct PA during syscall
-    Err(UAccessError::NotMapped)
-}
-
-/// DEPRECATED: This function does NOT work correctly!
-///
-/// During syscall handling, TTBR0 points to kernel's identity mapping, not user's.
-/// The returned slice would point to wrong physical memory.
-///
-/// Use `copy_to_user()` instead to safely write user memory.
-#[deprecated(note = "Use copy_to_user() - user slices don't work with TTBR0 switching")]
-pub unsafe fn user_slice_mut(_ptr: u64, _len: usize) -> Result<&'static mut [u8], UAccessError> {
-    // This function cannot work correctly - user VA != correct PA during syscall
-    Err(UAccessError::NotMapped)
-}
+// NOTE: user_slice() and user_slice_mut() were removed because they cannot work
+// correctly during syscall handling (TTBR0 points to kernel identity mapping).
+// Use copy_from_user() / copy_to_user() instead for safe user memory access.
 
 #[cfg(test)]
 mod tests {

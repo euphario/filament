@@ -4,7 +4,8 @@
 //! used in the Banana Pi BPI-R4 router board.
 
 use crate::hal::{InterruptController, Timer, Uart, Platform, PlatformInfo};
-use super::{gic, timer, uart, wdt, irq, DRAM_BASE, DRAM_SIZE, PAGE_SIZE, KERNEL_VIRT_BASE};
+use crate::arch::aarch64::mmu;
+use super::{gic, timer, uart, wdt, irq, DRAM_BASE, DRAM_SIZE, PAGE_SIZE};
 
 /// Static platform info for MT7988A
 static PLATFORM_INFO: PlatformInfo = PlatformInfo {
@@ -71,11 +72,11 @@ impl Platform for Mt7988Platform {
     }
 
     fn phys_to_virt(&self, phys: usize) -> usize {
-        phys | (KERNEL_VIRT_BASE as usize)
+        mmu::phys_to_virt(phys as u64) as usize
     }
 
     fn virt_to_phys(&self, virt: usize) -> usize {
-        virt & !(KERNEL_VIRT_BASE as usize)
+        mmu::virt_to_phys(virt as u64) as usize
     }
 }
 

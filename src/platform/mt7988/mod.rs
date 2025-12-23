@@ -223,30 +223,7 @@ pub const PAGE_SHIFT: usize = 12;
 // =============================================================================
 // Helper Functions
 // =============================================================================
-
-/// Convert physical address to kernel virtual address (TTBR1)
-#[inline]
-pub const fn phys_to_virt(phys: usize) -> usize {
-    phys | (KERNEL_VIRT_BASE as usize)
-}
-
-/// Convert physical address to kernel virtual address (u64 version)
-#[inline]
-pub const fn phys_to_virt64(phys: u64) -> u64 {
-    phys | KERNEL_VIRT_BASE
-}
-
-/// Convert kernel virtual address to physical address
-#[inline]
-pub const fn virt_to_phys(virt: usize) -> usize {
-    virt & !(KERNEL_VIRT_BASE as usize)
-}
-
-/// Check if an address is in the kernel virtual range (TTBR1)
-#[inline]
-pub const fn is_kernel_addr(addr: u64) -> bool {
-    (addr & KERNEL_VIRT_BASE) == KERNEL_VIRT_BASE
-}
+// NOTE: phys_to_virt/virt_to_phys removed - use arch::aarch64::mmu instead
 
 /// Check if an address is in the user virtual range (TTBR0)
 #[inline]

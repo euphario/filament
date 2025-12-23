@@ -182,29 +182,7 @@ pub unsafe fn switch_user_space(ttbr0_with_asid: u64) {
     );
 }
 
-/// Invalidate TLB entries for a specific ASID
-/// Call this when an address space is destroyed to free TLB resources
-///
-/// NOTE: Prefer using `arch::aarch64::tlb::invalidate_asid()` directly.
-/// This function is kept for backwards compatibility.
-///
-/// # Safety
-/// The ASID must be valid (1-255)
-pub unsafe fn invalidate_asid(asid: u16) {
-    super::tlb::invalidate_asid(asid);
-}
-
-/// Invalidate all TLB entries (for cases where ASID is not available)
-///
-/// NOTE: Prefer using `arch::aarch64::tlb::invalidate_all()` directly.
-/// This function is kept for backwards compatibility.
-///
-/// # Safety
-/// This is a heavyweight operation - use sparingly
-pub unsafe fn invalidate_all_tlb() {
-    super::tlb::invalidate_all();
-}
-
+// NOTE: TLB invalidation wrappers removed - use arch::aarch64::tlb directly
 
 /// Get current TTBR0 value
 pub fn ttbr0() -> u64 {

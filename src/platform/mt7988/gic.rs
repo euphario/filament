@@ -112,8 +112,14 @@ impl Gic {
         // Clear ProcessorSleep bit
         self.gicr_write(gicr::WAKER, waker & !gicr_waker::PROCESSOR_SLEEP);
 
-        // Wait for ChildrenAsleep to clear
+        // Wait for ChildrenAsleep to clear (with timeout)
+        const MAX_RETRIES: u32 = 100_000;
+        let mut retries = 0;
         while (self.gicr_read(gicr::WAKER) & gicr_waker::CHILDREN_ASLEEP) != 0 {
+            retries += 1;
+            if retries >= MAX_RETRIES {
+                panic!("GIC: GICR wakeup timeout - ChildrenAsleep stuck");
+            }
             core::hint::spin_loop();
         }
     }
@@ -123,8 +129,14 @@ impl Gic {
         // Disable distributor while configuring
         self.gicd_write(gicd::CTLR, 0);
 
-        // Wait for RWP (Register Write Pending) to clear
+        // Wait for RWP (Register Write Pending) to clear (with timeout)
+        const MAX_RETRIES: u32 = 100_000;
+        let mut retries = 0;
         while (self.gicd_read(gicd::CTLR) & (1 << 31)) != 0 {
+            retries += 1;
+            if retries >= MAX_RETRIES {
+                panic!("GIC: GICD RWP timeout - register write pending stuck");
+            }
             core::hint::spin_loop();
         }
 
