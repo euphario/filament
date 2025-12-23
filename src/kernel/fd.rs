@@ -353,9 +353,9 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                         -11 // EAGAIN
                     } else {
                         // Register for blocking - syscall layer handles actual blocking
-                        unsafe {
-                            let _ = ipc::channel_table().block_receiver(channel_id, caller_pid);
-                        }
+                        ipc::with_channel_table(|table| {
+                            let _ = table.block_receiver(channel_id, caller_pid);
+                        });
                         -11 // EAGAIN - caller should block and retry
                     }
                 }

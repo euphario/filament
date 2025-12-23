@@ -712,8 +712,10 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                 let pid = sched.tasks[current_slot].as_ref().map(|t| t.id).unwrap_or(0);
 
                 // Register this process as blocked waiting on the channel
-                // so that send() can wake it up
-                let _ = super::ipc::channel_table().block_receiver(channel_id, pid);
+                // so that send() can wake it up (thread-safe)
+                super::ipc::with_channel_table(|table| {
+                    let _ = table.block_receiver(channel_id, pid);
+                });
 
                 if let Some(ref mut task) = sched.tasks[current_slot] {
                     task.state = super::task::TaskState::Blocked;
@@ -771,8 +773,10 @@ fn sys_receive_timeout(channel_id: u32, buf_ptr: u64, buf_len: usize, timeout_ms
                 let pid = sched.tasks[current_slot].as_ref().map(|t| t.id).unwrap_or(0);
 
                 // Register this process as blocked waiting on the channel
-                // so that send() can wake it up
-                let _ = super::ipc::channel_table().block_receiver(channel_id, pid);
+                // so that send() can wake it up (thread-safe)
+                super::ipc::with_channel_table(|table| {
+                    let _ = table.block_receiver(channel_id, pid);
+                });
 
                 if let Some(ref mut task) = sched.tasks[current_slot] {
                     task.state = super::task::TaskState::Blocked;

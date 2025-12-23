@@ -224,10 +224,9 @@ impl PortRegistry {
         let slot = self.find_free().ok_or(PortError::NoSpace)?;
 
         // Create a channel for this port (owner gets both ends initially)
-        let (listen_ch, _connect_ch) = unsafe {
-            ipc::channel_table().create_pair(owner, owner)
-                .ok_or(PortError::NoChannels)?
-        };
+        let (listen_ch, _connect_ch) = ipc::with_channel_table(|table| {
+            table.create_pair(owner, owner)
+        }).ok_or(PortError::NoChannels)?;
 
         // Set up the port
         let port = &mut self.ports[slot];
@@ -258,9 +257,9 @@ impl PortRegistry {
         self.hash_remove(name);
 
         // Close the listen channel
-        unsafe {
-            ipc::channel_table().close(self.ports[slot].listen_channel);
-        }
+        let _ = ipc::with_channel_table(|table| {
+            table.close(self.ports[slot].listen_channel)
+        });
 
         // Mark as free
         self.ports[slot].state = PortState::Free;
@@ -274,10 +273,9 @@ impl PortRegistry {
         let port = &mut self.ports[slot];
 
         // Create a channel pair for this connection
-        let (client_ch, server_ch) = unsafe {
-            ipc::channel_table().create_pair(client_pid, port.owner)
-                .ok_or(PortError::NoChannels)?
-        };
+        let (client_ch, server_ch) = ipc::with_channel_table(|table| {
+            table.create_pair(client_pid, port.owner)
+        }).ok_or(PortError::NoChannels)?;
 
         // Send connection notification to the service via its listen channel
         // The service will receive the server_ch endpoint
@@ -287,17 +285,26 @@ impl PortRegistry {
         connect_msg.header.payload_len = 4;
         connect_msg.payload[0..4].copy_from_slice(&server_ch.to_le_bytes());
 
-        unsafe {
-            let table = ipc::channel_table();
-            if let Some(slot) = table.endpoints.iter().position(|e| e.id == port.listen_channel) {
-                let peer_id = table.endpoints[slot].peer;
+        // Send connect message and get blocked receiver if any
+        let listen_channel = port.listen_channel;
+        let blocked_pid = ipc::with_channel_table(|table| {
+            if let Some(ep_slot) = table.endpoints.iter().position(|e| e.id == listen_channel) {
+                let peer_id = table.endpoints[ep_slot].peer;
                 if peer_id != 0 {
-                    // Send Connect message and wake blocked accepter if any
-                    if let Ok(Some(blocked_pid)) = table.send(peer_id, connect_msg) {
-                        super::process::process_table().wake(blocked_pid);
-                        super::task::scheduler().wake_by_pid(blocked_pid);
+                    // Send Connect message
+                    if let Ok(blocked) = table.send(peer_id, connect_msg) {
+                        return blocked;
                     }
                 }
+            }
+            None
+        });
+
+        // Wake blocked accepter outside lock
+        if let Some(pid) = blocked_pid {
+            unsafe {
+                super::process::process_table().wake(pid);
+                super::task::scheduler().wake_by_pid(pid);
             }
         }
 
@@ -317,8 +324,8 @@ impl PortRegistry {
         }
 
         // Try to receive a Connect message from the listen channel
-        unsafe {
-            match ipc::channel_table().receive(listen_channel) {
+        ipc::with_channel_table(|table| {
+            match table.receive(listen_channel) {
                 Ok(msg) if msg.header.msg_type == MessageType::Connect => {
                     // Extract server channel from payload
                     if msg.header.payload_len >= 4 {
@@ -334,7 +341,7 @@ impl PortRegistry {
                 Ok(_) => Err(PortError::InvalidMessage),
                 Err(_) => Err(PortError::WouldBlock),
             }
-        }
+        })
     }
 
     /// List all registered ports
@@ -442,7 +449,7 @@ pub fn process_cleanup(pid: Pid) {
                     registry.hash_remove(name);
                 }
                 // Close the listen channel
-                ipc::channel_table().close(listen_ch);
+                let _ = ipc::with_channel_table(|table| table.close(listen_ch));
                 // Mark as free
                 registry.ports[i].state = PortState::Free;
             }

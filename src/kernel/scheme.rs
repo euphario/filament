@@ -1660,11 +1660,9 @@ fn open_user_scheme(
     };
 
     // Create a channel pair for this connection
-    let (client_ch, server_ch) = unsafe {
-        ipc::channel_table()
-            .create_pair(caller_pid, daemon_pid)
-            .ok_or(-12)? // ENOMEM
-    };
+    let (client_ch, server_ch) = ipc::with_channel_table(|table| {
+        table.create_pair(caller_pid, daemon_pid)
+    }).ok_or(-12)?; // ENOMEM
 
     // Build open request message
     // Format: flags (4 bytes) + path (remaining bytes)
@@ -1687,9 +1685,16 @@ fn open_user_scheme(
     };
 
     // Send to daemon's main channel
-    unsafe {
-        let table = ipc::channel_table();
-        table.send(daemon_channel, msg).map_err(|e| e.to_errno())?;
+    let blocked_pid = ipc::with_channel_table(|table| {
+        table.send(daemon_channel, msg)
+    }).map_err(|e| e.to_errno())?;
+
+    // Wake blocked receiver outside lock
+    if let Some(pid) = blocked_pid {
+        unsafe {
+            super::process::process_table().wake(pid);
+            super::task::scheduler().wake_by_pid(pid);
+        }
     }
 
     // For non-blocking operation, we return immediately with the client channel
