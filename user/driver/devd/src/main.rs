@@ -1113,25 +1113,39 @@ fn main() -> ! {
     println!("[devd] Hardware discovery via hw:list, hw:bus, hw:device/<path>");
     println!();
 
-    // Phase 5: Subscribe to events
+    // Phase 5: Subscribe to events (CRITICAL - failure means system unusable)
     println!("[devd] Subscribing to events...");
 
-    // Subscribe to ChildExit events (filter=0 means any child)
+    // Subscribe to ChildExit events - CRITICAL for driver supervision
+    // If this fails, devd cannot detect crashed drivers and system will hang
     let result = syscall::event_subscribe(event_type::CHILD_EXIT, 0);
-    println!("[devd]   ChildExit: {}", if result == 0 { "OK" } else { "FAILED" });
+    if result != 0 {
+        println!("[devd] FATAL: Failed to subscribe to ChildExit events (error {})", result);
+        println!("[devd] Cannot supervise drivers - system will hang. Watchdog should reset.");
+        panic!("[devd] FATAL: ChildExit subscription failed");
+    }
+    println!("[devd]   ChildExit: OK");
 
-    // Subscribe to IpcReady for hw: channel
+    // Subscribe to IpcReady for hw: channel - CRITICAL for hw: scheme
     if hw_channel_valid {
         let result = syscall::event_subscribe(event_type::IPC_READY, hw_channel as u64);
-        println!("[devd]   IpcReady(hw:{}): {}", hw_channel, if result == 0 { "OK" } else { "FAILED" });
+        if result != 0 {
+            println!("[devd] FATAL: Failed to subscribe to IpcReady for hw: channel (error {})", result);
+            panic!("[devd] FATAL: hw: channel subscription failed");
+        }
+        println!("[devd]   IpcReady(hw:{}): OK", hw_channel);
     }
 
-    // Subscribe to IpcReady for bus control channels
+    // Subscribe to IpcReady for bus control channels - CRITICAL
     for i in 0..mgr.bus_count {
         if mgr.buses[i].connected {
             let ch = mgr.buses[i].channel;
             let result = syscall::event_subscribe(event_type::IPC_READY, ch as u64);
-            println!("[devd]   IpcReady(bus:{}): {}", ch, if result == 0 { "OK" } else { "FAILED" });
+            if result != 0 {
+                println!("[devd] FATAL: Failed to subscribe to IpcReady for bus channel {} (error {})", ch, result);
+                panic!("[devd] FATAL: Bus channel subscription failed");
+            }
+            println!("[devd]   IpcReady(bus:{}): OK", ch);
         }
     }
 

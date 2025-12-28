@@ -13,6 +13,9 @@ pub const MAX_EVENTS: usize = 24;
 /// Maximum events in critical queue (ChildExit, Signal - never dropped)
 pub const MAX_CRITICAL_EVENTS: usize = 8;
 
+/// Maximum subscriptions per event type (prevents exhaustion attacks)
+pub const MAX_SUBSCRIPTIONS_PER_TYPE: usize = 8;
+
 /// Event types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -174,17 +177,33 @@ impl EventQueue {
         matches!(event_type, EventType::ChildExit | EventType::Signal)
     }
 
-    /// Subscribe to an event type
-    pub fn subscribe(&mut self, event_type: EventType, filter: u64) -> bool {
+    /// Subscribe to an event type with per-type limits
+    /// Returns: Ok(()) on success, Err(-12) if no slots, Err(-28) if type limit reached
+    pub fn subscribe(&mut self, event_type: EventType, filter: u64) -> Result<(), i64> {
+        // Count existing subscriptions for this type to prevent exhaustion
+        let type_count = self.subscriptions.iter()
+            .filter(|s| s.active && s.event_type == event_type)
+            .count();
+
+        if type_count >= MAX_SUBSCRIPTIONS_PER_TYPE {
+            return Err(-28); // ENOSPC - too many subscriptions of this type
+        }
+
+        // Find a free slot
         for sub in self.subscriptions.iter_mut() {
             if !sub.active {
                 sub.event_type = event_type;
                 sub.filter = filter;
                 sub.active = true;
-                return true;
+                return Ok(());
             }
         }
-        false
+        Err(-12) // ENOMEM - no free subscription slots
+    }
+
+    /// Subscribe (legacy bool interface for compatibility)
+    pub fn subscribe_bool(&mut self, event_type: EventType, filter: u64) -> bool {
+        self.subscribe(event_type, filter).is_ok()
     }
 
     /// Unsubscribe from an event type
@@ -358,12 +377,13 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
     unsafe {
         let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
-            if task.event_queue.subscribe(ev_type, filter) {
-                return 0;
+            match task.event_queue.subscribe(ev_type, filter) {
+                Ok(()) => return 0,
+                Err(e) => return e,
             }
         }
     }
-    -12 // ENOMEM - no free subscription slots
+    -1 // No current task
 }
 
 /// Unsubscribe from events
@@ -445,7 +465,7 @@ pub fn test() {
     let mut queue = EventQueue::new();
 
     // Test subscription
-    assert!(queue.subscribe(EventType::IpcReady, 0));
+    assert!(queue.subscribe(EventType::IpcReady, 0).is_ok());
     logln!("    Subscribed to IpcReady events");
 
     // Test event push/pop

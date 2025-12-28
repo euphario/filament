@@ -30,3 +30,4 @@ pub mod lock;
 pub mod percpu;
 pub mod pci;
 pub mod bus;
+pub mod security_log;
