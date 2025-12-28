@@ -1,105 +1,305 @@
 //! Device Supervisor Daemon (devd)
 //!
 //! The unified device manager and service supervisor for the microkernel.
-//! Acts as PID 1 (init) - detects devices, spawns drivers, supervises all.
-//!
-//! ## Responsibilities
-//! - Scan buses (Platform, PCIe, USB reports)
-//! - Match devices to drivers via compiled rules
-//! - Spawn and supervise driver daemons
-//! - Restart crashed drivers (with backoff)
-//! - Provide device query/subscribe API for clients
+//! Acts as PID 1 (init) - connects to bus control ports, enumerates devices,
+//! spawns drivers, and supervises all with proper state machines.
 //!
 //! ## Architecture
+//!
 //! ```text
 //! devd (PID 1)
-//!  ├─ detects UART → spawns shell
-//!  ├─ detects xHCI → spawns usbd
-//!  │   └─ usbd reports USB devices back
-//!  └─ supervises all, restarts on crash
+//!  ├─ connects to /kernel/bus/pcie0, /kernel/bus/usb0
+//!  ├─ receives StateSnapshot from kernel
+//!  ├─ enumerates devices on each bus
+//!  ├─ matches devices to drivers, spawns driver daemons
+//!  ├─ tracks device state machines (DISCOVERED→BINDING→BOUND→...)
+//!  └─ handles faults with escalation (device reset → link reset → bus reset)
 //! ```
+//!
+//! ## State Machines
+//!
+//! Every device has an explicit state machine. See ARCHITECTURE-MASTER.md.
 
 #![no_std]
 #![no_main]
 
 use userlib::println;
-use userlib::syscall::{self, PciDeviceInfo};
+use userlib::syscall::{self, PciDeviceInfo, Event, event_type, event_flags};
 
 // =============================================================================
 // Constants
 // =============================================================================
 
+const MAX_BUSES: usize = 8;
 const MAX_DRIVERS: usize = 16;
 const MAX_DEVICES: usize = 32;
 const MAX_RESTARTS: u32 = 3;
 const RESTART_DELAY_MS: u64 = 1000;
+const BIND_TIMEOUT_NS: u64 = 30_000_000_000;  // 30s in nanoseconds - USB enumeration can be slow
+const QUIET_PERIOD_MS: u64 = 60_000;
 
 // PCI class codes
-const PCI_CLASS_USB: u32 = 0x0C0300;  // USB controller (class 0C, subclass 03)
+const PCI_CLASS_USB: u32 = 0x0C0300;
+
+// Bus control message types (must match kernel bus.rs)
+const MSG_STATE_SNAPSHOT: u8 = 0;
+const MSG_STATE_CHANGED: u8 = 1;
+const MSG_ENABLE_BUS_MASTERING: u8 = 16;
+const MSG_DISABLE_BUS_MASTERING: u8 = 17;
+const MSG_REQUEST_RESET: u8 = 20;
+
+// hw: scheme message types
+const HW_MSG_OPEN: u8 = 1;
+const HW_MSG_READ: u8 = 2;
+const HW_MSG_CLOSE: u8 = 3;
+const HW_MSG_RESPONSE: u8 = 128;
 
 // =============================================================================
-// Data Structures
+// Bus Types and State
 // =============================================================================
 
-/// Bus types for device identification
+/// Hardware bus types (must match kernel)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum BusType {
-    /// Platform devices (UART, timers, etc. - always present)
-    Platform,
-    /// PCI Express devices
-    PCIe,
-    /// USB devices (reported by usbd)
-    USB,
+    PCIe = 0,
+    Usb = 1,
 }
+
+/// Bus state as reported by kernel
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KernelBusState {
+    Safe = 0,
+    Claimed = 1,
+    Resetting = 2,
+}
+
+/// Our connection to a kernel bus controller
+pub struct BusConnection {
+    /// Bus type
+    pub bus_type: BusType,
+    /// Bus index (0, 1, ...)
+    pub bus_index: u8,
+    /// Channel to kernel bus controller
+    pub channel: u32,
+    /// Last known kernel state
+    pub kernel_state: KernelBusState,
+    /// Are we connected?
+    pub connected: bool,
+}
+
+impl BusConnection {
+    pub const fn empty() -> Self {
+        Self {
+            bus_type: BusType::PCIe,
+            bus_index: 0,
+            channel: 0,
+            kernel_state: KernelBusState::Safe,
+            connected: false,
+        }
+    }
+}
+
+// =============================================================================
+// Device State Machine
+// =============================================================================
+
+/// Device state machine
+/// See ARCHITECTURE-MASTER.md for full state diagram
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceState {
+    /// Device discovered, no driver assigned yet
+    Discovered,
+    /// Driver is being bound (timeout in progress)
+    Binding { deadline: u64 },
+    /// Driver successfully bound, operating normally
+    Bound,
+    /// Device has faulted, tracking escalation
+    Faulted,
+    /// Device is being reset at current escalation level
+    Resetting,
+    /// Bus is resetting, device suspended
+    Suspended,
+    /// Device has failed permanently
+    Dead,
+}
+
+impl DeviceState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeviceState::Discovered => "discovered",
+            DeviceState::Binding { .. } => "binding",
+            DeviceState::Bound => "bound",
+            DeviceState::Faulted => "faulted",
+            DeviceState::Resetting => "resetting",
+            DeviceState::Suspended => "suspended",
+            DeviceState::Dead => "dead",
+        }
+    }
+}
+
+// =============================================================================
+// Fault Tracker (Escalation)
+// =============================================================================
+
+/// Escalation levels for fault handling
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EscalationLevel {
+    /// Function-level reset or D3→D0 power cycle
+    DeviceReset = 0,
+    /// PCIe link retrain (LTSSM reset)
+    LinkRetrain = 1,
+    /// Secondary bus reset (affects slot/segment)
+    SegmentReset = 2,
+    /// Full bus reset via kernel (nuclear option)
+    BusReset = 3,
+    /// Give up - device is dead
+    Dead = 4,
+}
+
+impl EscalationLevel {
+    pub fn next(self) -> Self {
+        match self {
+            EscalationLevel::DeviceReset => EscalationLevel::LinkRetrain,
+            EscalationLevel::LinkRetrain => EscalationLevel::SegmentReset,
+            EscalationLevel::SegmentReset => EscalationLevel::BusReset,
+            EscalationLevel::BusReset => EscalationLevel::Dead,
+            EscalationLevel::Dead => EscalationLevel::Dead,
+        }
+    }
+
+    pub fn max_attempts(self) -> u32 {
+        match self {
+            EscalationLevel::DeviceReset => 3,
+            EscalationLevel::LinkRetrain => 2,
+            EscalationLevel::SegmentReset => 2,
+            EscalationLevel::BusReset => 1,
+            EscalationLevel::Dead => 0,
+        }
+    }
+}
+
+/// Tracks fault escalation for a device
+#[derive(Clone, Copy)]
+pub struct FaultTracker {
+    /// Current escalation level
+    pub level: EscalationLevel,
+    /// Attempts at current level
+    pub attempts: u32,
+    /// Backoff time in ms
+    pub backoff_ms: u32,
+    /// Time of last fault
+    pub last_fault: u64,
+    /// Consecutive successful operations (for de-escalation)
+    pub consecutive_success: u32,
+}
+
+impl FaultTracker {
+    pub const fn new() -> Self {
+        Self {
+            level: EscalationLevel::DeviceReset,
+            attempts: 0,
+            backoff_ms: 100,
+            last_fault: 0,
+            consecutive_success: 0,
+        }
+    }
+
+    /// Record a fault and get the action to take
+    pub fn escalate(&mut self, now: u64) -> (EscalationLevel, u64) {
+        // If quiet for a while, reset escalation
+        if now > self.last_fault + QUIET_PERIOD_MS {
+            self.level = EscalationLevel::DeviceReset;
+            self.attempts = 0;
+            self.backoff_ms = 100;
+        }
+
+        self.attempts += 1;
+        self.last_fault = now;
+        self.consecutive_success = 0;
+
+        // Escalate if we've exhausted attempts at this level
+        if self.attempts > self.level.max_attempts() {
+            self.level = self.level.next();
+            self.attempts = 1;
+            self.backoff_ms = 100;
+        }
+
+        let wait = self.backoff_ms as u64;
+        self.backoff_ms = (self.backoff_ms * 2).min(5000);
+
+        (self.level, wait)
+    }
+
+    /// Record a successful operation
+    pub fn record_success(&mut self) {
+        self.consecutive_success += 1;
+        // De-escalate after many successful operations
+        if self.consecutive_success > 100 && self.level > EscalationLevel::DeviceReset {
+            self.level = EscalationLevel::DeviceReset;
+            self.consecutive_success = 0;
+            self.attempts = 0;
+        }
+    }
+}
+
+// =============================================================================
+// Device and Driver Structures
+// =============================================================================
 
 /// Device class for matching
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceClass {
-    /// Serial console (UART)
     Serial,
-    /// USB host controller
     UsbController,
-    /// Mass storage device
     Storage,
-    /// Network interface
     Network,
-    /// Human interface device (keyboard, mouse)
     Hid,
-    /// Unknown/other
     Other,
 }
 
 /// A discovered device
 #[derive(Clone)]
 pub struct Device {
-    /// Unique device path (e.g., "/platform/uart", "/pcie/0/usb")
+    /// Unique device ID
+    pub id: u16,
+    /// Device path
     pub path: [u8; 64],
     pub path_len: usize,
-    /// Bus type
-    pub bus: BusType,
+    /// Bus this device is on
+    pub bus_index: u8,
+    pub bus_type: BusType,
     /// Device class
     pub class: DeviceClass,
-    /// Vendor ID (if applicable)
+    /// Vendor/Device IDs
     pub vendor_id: u16,
-    /// Device ID (if applicable)
     pub device_id: u16,
-    /// PCI BDF (if PCIe device)
+    /// PCI BDF (if PCIe)
     pub pci_bdf: u32,
-    /// Whether a driver is assigned
-    pub driver_assigned: bool,
+    /// Current state
+    pub state: DeviceState,
+    /// Assigned driver
+    pub driver_id: Option<usize>,
+    /// Fault tracker
+    pub fault_tracker: FaultTracker,
 }
 
 impl Device {
     pub const fn empty() -> Self {
         Self {
+            id: 0,
             path: [0; 64],
             path_len: 0,
-            bus: BusType::Platform,
+            bus_index: 0,
+            bus_type: BusType::PCIe,
             class: DeviceClass::Other,
             vendor_id: 0,
             device_id: 0,
             pci_bdf: 0,
-            driver_assigned: false,
+            state: DeviceState::Discovered,
+            driver_id: None,
+            fault_tracker: FaultTracker::new(),
         }
     }
 
@@ -113,34 +313,35 @@ impl Device {
     pub fn path_str(&self) -> &str {
         core::str::from_utf8(&self.path[..self.path_len]).unwrap_or("")
     }
+
+    /// Transition to a new state (with logging)
+    pub fn transition(&mut self, new_state: DeviceState) {
+        if self.state != new_state {
+            println!("[devd] Device {} {:?} -> {:?}",
+                     self.path_str(), self.state, new_state);
+            self.state = new_state;
+        }
+    }
 }
 
 /// Driver state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverState {
-    /// Not started
     Stopped,
-    /// Running normally
+    Starting,
     Running,
-    /// Crashed, pending restart
     Crashed,
-    /// Failed permanently (max restarts exceeded)
     Failed,
 }
 
 /// A supervised driver
 pub struct DriverEntry {
-    /// Binary name (e.g., "shell", "usbd")
     pub binary: &'static str,
-    /// Process ID (0 if not running)
     pub pid: u32,
-    /// Current state
     pub state: DriverState,
-    /// Number of restarts
     pub restart_count: u32,
-    /// Device path this driver manages
-    pub device_path: [u8; 64],
-    pub device_path_len: usize,
+    pub device_id: Option<u16>,
+    pub restart_at: u64,
 }
 
 impl DriverEntry {
@@ -150,8 +351,8 @@ impl DriverEntry {
             pid: 0,
             state: DriverState::Stopped,
             restart_count: 0,
-            device_path: [0; 64],
-            device_path_len: 0,
+            device_id: None,
+            restart_at: 0,
         }
     }
 
@@ -160,38 +361,31 @@ impl DriverEntry {
     }
 }
 
-/// Match rule: which driver handles which device
+/// Match rule
 pub struct MatchRule {
-    /// Bus type to match (None = any)
     pub bus: Option<BusType>,
-    /// Device class to match (None = any)
     pub class: Option<DeviceClass>,
-    /// PCI class code to match (None = any)
     pub pci_class: Option<u32>,
-    /// Driver binary to spawn
     pub driver: &'static str,
 }
 
 // =============================================================================
-// Match Rules (compiled-in for v1)
+// Match Rules
 // =============================================================================
 
 static MATCH_RULES: &[MatchRule] = &[
-    // Platform UART → shell
     MatchRule {
-        bus: Some(BusType::Platform),
+        bus: Some(BusType::PCIe),
         class: Some(DeviceClass::Serial),
         pci_class: None,
         driver: "shell",
     },
-    // Platform USB controller (MT7988A SSUSB) → usbd
     MatchRule {
-        bus: Some(BusType::Platform),
+        bus: Some(BusType::Usb),
         class: Some(DeviceClass::UsbController),
         pci_class: None,
         driver: "usbd",
     },
-    // PCIe USB controller → usbd (for future/other boards)
     MatchRule {
         bus: Some(BusType::PCIe),
         class: None,
@@ -205,38 +399,138 @@ static MATCH_RULES: &[MatchRule] = &[
 // =============================================================================
 
 struct DeviceManager {
+    buses: [BusConnection; MAX_BUSES],
+    bus_count: usize,
     devices: [Device; MAX_DEVICES],
     device_count: usize,
+    next_device_id: u16,
     drivers: [DriverEntry; MAX_DRIVERS],
     driver_count: usize,
 }
 
 impl DeviceManager {
     const fn new() -> Self {
+        const EMPTY_BUS: BusConnection = BusConnection::empty();
         const EMPTY_DEV: Device = Device::empty();
         const EMPTY_DRV: DriverEntry = DriverEntry::empty();
         Self {
+            buses: [EMPTY_BUS; MAX_BUSES],
+            bus_count: 0,
             devices: [EMPTY_DEV; MAX_DEVICES],
             device_count: 0,
+            next_device_id: 1,
             drivers: [EMPTY_DRV; MAX_DRIVERS],
             driver_count: 0,
         }
     }
 
-    /// Add a discovered device
-    fn add_device(&mut self, device: Device) -> bool {
-        if self.device_count >= MAX_DEVICES {
-            println!("[devd] Device table full!");
+    /// Connect to a kernel bus control port
+    fn connect_bus(&mut self, bus_type: BusType, index: u8) -> bool {
+        if self.bus_count >= MAX_BUSES {
+            println!("[devd] Bus table full!");
             return false;
         }
-        self.devices[self.device_count] = device;
-        self.device_count += 1;
+
+        // Build port name
+        let name: &[u8] = match bus_type {
+            BusType::PCIe => match index {
+                0 => b"/kernel/bus/pcie0",
+                1 => b"/kernel/bus/pcie1",
+                2 => b"/kernel/bus/pcie2",
+                _ => return false,
+            },
+            BusType::Usb => match index {
+                0 => b"/kernel/bus/usb0",
+                1 => b"/kernel/bus/usb1",
+                _ => return false,
+            },
+        };
+
+        let channel = syscall::port_connect(name);
+        if channel < 0 {
+            println!("[devd] Failed to connect to {:?}{}: {}",
+                     bus_type, index, channel);
+            return false;
+        }
+
+        let slot = self.bus_count;
+        self.buses[slot].bus_type = bus_type;
+        self.buses[slot].bus_index = index;
+        self.buses[slot].channel = channel as u32;
+        self.buses[slot].connected = true;
+        self.bus_count += 1;
+
+        println!("[devd] Connected to {:?}{} (channel {})",
+                 bus_type, index, channel);
+
+        // Wait for StateSnapshot from kernel
+        let mut buf = [0u8; 64];
+        let len = syscall::receive(channel as u32, &mut buf);
+        if len > 0 && buf[0] == MSG_STATE_SNAPSHOT {
+            let kernel_state = match buf[3] {
+                0 => KernelBusState::Safe,
+                1 => KernelBusState::Claimed,
+                2 => KernelBusState::Resetting,
+                _ => KernelBusState::Safe,
+            };
+            self.buses[slot].kernel_state = kernel_state;
+            println!("[devd]   Kernel state: {:?}", kernel_state);
+        }
+
         true
     }
 
+    /// Add a discovered device
+    fn add_device(&mut self, mut device: Device) -> Option<u16> {
+        if self.device_count >= MAX_DEVICES {
+            println!("[devd] Device table full!");
+            return None;
+        }
+
+        device.id = self.next_device_id;
+        self.next_device_id += 1;
+        device.state = DeviceState::Discovered;
+
+        let slot = self.device_count;
+        self.devices[slot] = device;
+        self.device_count += 1;
+
+        Some(self.devices[slot].id)
+    }
+
+    /// Find a device by ID
+    fn find_device(&mut self, id: u16) -> Option<&mut Device> {
+        self.devices[..self.device_count].iter_mut().find(|d| d.id == id)
+    }
+
+    /// Request bus reset from kernel for a device's bus
+    fn request_bus_reset(&mut self, device_id: u16) {
+        // Find the device to get its bus type
+        let bus_info = self.devices[..self.device_count]
+            .iter()
+            .find(|d| d.id == device_id)
+            .map(|d| (d.bus_type, d.bus_index));
+
+        if let Some((bus_type, bus_index)) = bus_info {
+            // Find the bus connection
+            if let Some(bus) = self.buses[..self.bus_count]
+                .iter()
+                .find(|b| b.bus_type == bus_type && b.bus_index == bus_index)
+            {
+                println!("[devd] Requesting reset for {:?}{}", bus_type, bus_index);
+
+                // Send reset request to kernel bus controller
+                let msg = [MSG_REQUEST_RESET];
+                let result = syscall::send(bus.channel, &msg);
+                if result < 0 {
+                    println!("[devd] Failed to send reset request: {}", result);
+                }
+            }
+        }
+    }
+
     /// Spawn a driver for a device
-    fn spawn_driver(&mut self, binary: &'static str, device_path: &str) -> Option<u32> {
-        // Find empty driver slot
+    fn spawn_driver(&mut self, binary: &'static str, device_id: u16) -> Option<u32> {
         let slot = self.drivers[..self.driver_count]
             .iter()
             .position(|d| !d.is_active())
@@ -247,118 +541,404 @@ impl DeviceManager {
             return None;
         }
 
-        // Spawn the process
         let pid = syscall::exec(binary);
         if pid < 0 {
-            println!("[devd] Failed to spawn {}: error {}", binary, pid);
+            println!("[devd] Failed to spawn {}: {}", binary, pid);
             return None;
         }
 
         let pid = pid as u32;
-        println!("[devd] Spawned {} (PID {}) for {}", binary, pid, device_path);
 
-        // Record driver entry
+        // Update driver entry
         let entry = &mut self.drivers[slot];
         entry.binary = binary;
         entry.pid = pid;
         entry.state = DriverState::Running;
         entry.restart_count = 0;
-
-        let path_bytes = device_path.as_bytes();
-        let len = path_bytes.len().min(entry.device_path.len());
-        entry.device_path[..len].copy_from_slice(&path_bytes[..len]);
-        entry.device_path_len = len;
+        entry.device_id = Some(device_id);
+        entry.restart_at = 0;
 
         if slot >= self.driver_count {
             self.driver_count = slot + 1;
         }
 
+        // Update device state
+        if let Some(device) = self.find_device(device_id) {
+            device.driver_id = Some(slot);
+            let deadline = syscall::gettime() as u64 + BIND_TIMEOUT_NS;
+            device.transition(DeviceState::Binding { deadline });
+            println!("[devd] Spawned {} (PID {}) for device {}",
+                     binary, pid, device.path_str());
+        }
+
         Some(pid)
     }
 
-    /// Handle a child process exit
-    fn handle_exit(&mut self, pid: u32, exit_code: i32) {
-        // Find which driver this was
+    /// Handle driver exit
+    fn handle_driver_exit(&mut self, pid: u32, exit_code: i32) {
+        // Find the driver index first
+        let driver_idx = match (0..self.driver_count).find(|&i| self.drivers[i].pid == pid) {
+            Some(idx) => idx,
+            None => {
+                println!("[devd] Unknown child PID {} exited", pid);
+                return;
+            }
+        };
+
+        let binary = self.drivers[driver_idx].binary;
+        let device_id = self.drivers[driver_idx].device_id;
+
+        if exit_code == 0 {
+            println!("[devd] {} (PID {}) exited normally", binary, pid);
+            self.drivers[driver_idx].state = DriverState::Stopped;
+            self.drivers[driver_idx].pid = 0;
+
+            // Clean unbind - device goes back to DISCOVERED
+            if let Some(dev_id) = device_id {
+                if let Some(device) = self.find_device(dev_id) {
+                    device.transition(DeviceState::Discovered);
+                    device.driver_id = None;
+                }
+            }
+        } else {
+            println!("[devd] {} (PID {}) crashed (code {})", binary, pid, exit_code);
+            self.drivers[driver_idx].state = DriverState::Crashed;
+            self.drivers[driver_idx].restart_count += 1;
+            self.drivers[driver_idx].pid = 0;
+
+            // Device goes to FAULTED and escalate
+            if let Some(dev_id) = device_id {
+                let now = syscall::gettime() as u64;
+
+                // Request bus reset before restarting
+                self.request_bus_reset(dev_id);
+
+                // Find device and escalate
+                let (level, wait, is_dead) = if let Some(dev_slot) = self.devices[..self.device_count]
+                    .iter()
+                    .position(|d| d.id == dev_id)
+                {
+                    self.devices[dev_slot].transition(DeviceState::Faulted);
+                    let (level, wait) = self.devices[dev_slot].fault_tracker.escalate(now);
+                    let is_dead = level == EscalationLevel::Dead;
+
+                    if is_dead {
+                        self.devices[dev_slot].transition(DeviceState::Dead);
+                        println!("[devd] {} marked as DEAD", self.devices[dev_slot].path_str());
+                    }
+
+                    (level, wait, is_dead)
+                } else {
+                    return;
+                };
+
+                if is_dead {
+                    self.drivers[driver_idx].state = DriverState::Failed;
+                } else {
+                    self.drivers[driver_idx].restart_at = now + wait;
+                    println!("[devd] {} will retry in {}ms (level {:?})", binary, wait, level);
+                }
+            }
+        }
+    }
+
+    /// Process pending restarts and binding timeouts
+    fn process_timers(&mut self) {
+        let now = syscall::gettime() as u64;
+
+        // Check binding timeouts
+        for i in 0..self.device_count {
+            if let DeviceState::Binding { deadline } = self.devices[i].state {
+                if now >= deadline {
+                    println!("[devd] Device {} bind timeout", self.devices[i].path_str());
+                    self.devices[i].transition(DeviceState::Faulted);
+
+                    // Escalate
+                    let (level, wait) = self.devices[i].fault_tracker.escalate(now);
+                    if level == EscalationLevel::Dead {
+                        self.devices[i].transition(DeviceState::Dead);
+                    }
+                }
+            }
+        }
+
+        // Check driver restarts
+        for i in 0..self.driver_count {
+            let entry = &mut self.drivers[i];
+            if entry.restart_at > 0 && now >= entry.restart_at {
+                let binary = entry.binary;
+                let device_id = entry.device_id;
+                entry.restart_at = 0;
+
+                if entry.restart_count > MAX_RESTARTS {
+                    entry.state = DriverState::Failed;
+                    println!("[devd] {} exceeded max restarts, marking failed", binary);
+
+                    if let Some(dev_id) = device_id {
+                        if let Some(device) = self.find_device(dev_id) {
+                            device.transition(DeviceState::Dead);
+                        }
+                    }
+                } else {
+                    // Respawn
+                    let new_pid = syscall::exec(binary);
+                    if new_pid > 0 {
+                        entry.pid = new_pid as u32;
+                        entry.state = DriverState::Running;
+                        println!("[devd] {} restarted as PID {}", binary, new_pid);
+
+                        if let Some(dev_id) = device_id {
+                            if let Some(device) = self.find_device(dev_id) {
+                                let deadline = now + BIND_TIMEOUT_NS;
+                                device.transition(DeviceState::Binding { deadline });
+                            }
+                        }
+                    } else {
+                        println!("[devd] Failed to restart {}", binary);
+                        entry.state = DriverState::Failed;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mark driver bind as complete
+    pub fn driver_bind_complete(&mut self, pid: u32) {
         for i in 0..self.driver_count {
             if self.drivers[i].pid == pid {
-                let entry = &mut self.drivers[i];
-                let binary = entry.binary;
-
-                if exit_code == 0 {
-                    println!("[devd] {} (PID {}) exited normally", binary, pid);
-                    entry.state = DriverState::Stopped;
-                    entry.pid = 0;
-                } else {
-                    println!("[devd] {} (PID {}) crashed with code {}", binary, pid, exit_code);
-                    entry.restart_count += 1;
-
-                    if entry.restart_count > MAX_RESTARTS {
-                        println!("[devd] {} exceeded max restarts, marking failed", binary);
-                        entry.state = DriverState::Failed;
-                        entry.pid = 0;
-                    } else {
-                        println!("[devd] Restarting {} (attempt {}/{})",
-                                 binary, entry.restart_count, MAX_RESTARTS);
-                        entry.state = DriverState::Crashed;
-                        entry.pid = 0;
-
-                        // Delay before restart (spin-wait using gettime)
-                        let start = syscall::gettime();
-                        while syscall::gettime() < start + RESTART_DELAY_MS {
-                            syscall::yield_now();
-                        }
-
-                        // Respawn
-                        let new_pid = syscall::exec(binary);
-                        if new_pid > 0 {
-                            entry.pid = new_pid as u32;
-                            entry.state = DriverState::Running;
-                            println!("[devd] {} restarted as PID {}", binary, new_pid);
-                        } else {
-                            println!("[devd] Failed to restart {}", binary);
-                            entry.state = DriverState::Failed;
+                if let Some(dev_id) = self.drivers[i].device_id {
+                    if let Some(device) = self.find_device(dev_id) {
+                        if matches!(device.state, DeviceState::Binding { .. }) {
+                            device.transition(DeviceState::Bound);
+                            device.fault_tracker.record_success();
+                            println!("[devd] Device {} bound successfully", device.path_str());
                         }
                     }
                 }
                 return;
             }
         }
-
-        println!("[devd] Unknown child PID {} exited", pid);
     }
+
+    // =========================================================================
+    // hw: Scheme Handler
+    // =========================================================================
+
+    /// Format device list for hw:list
+    pub fn format_device_list(&self, buf: &mut [u8]) -> usize {
+        let mut pos = 0;
+
+        // Header (use \r\n for serial terminal)
+        pos += write_str(&mut buf[pos..], "# Hardware Devices\r\n");
+        pos += write_str(&mut buf[pos..], "# path,bus,class,vendor:device,state\r\n");
+
+        // List all devices
+        for i in 0..self.device_count {
+            let dev = &self.devices[i];
+            // Format: path,bus_type,class,vendor:device,state
+            pos += write_str(&mut buf[pos..], dev.path_str());
+            pos += write_str(&mut buf[pos..], ",");
+            pos += write_str(&mut buf[pos..], match dev.bus_type {
+                BusType::PCIe => "pcie",
+                BusType::Usb => "usb",
+            });
+            pos += write_str(&mut buf[pos..], ",");
+            pos += write_str(&mut buf[pos..], match dev.class {
+                DeviceClass::UsbController => "usb",
+                DeviceClass::Serial => "serial",
+                DeviceClass::Storage => "storage",
+                DeviceClass::Network => "network",
+                DeviceClass::Hid => "hid",
+                DeviceClass::Other => "other",
+            });
+            pos += write_str(&mut buf[pos..], ",");
+            pos += write_hex16(&mut buf[pos..], dev.vendor_id);
+            pos += write_str(&mut buf[pos..], ":");
+            pos += write_hex16(&mut buf[pos..], dev.device_id);
+            pos += write_str(&mut buf[pos..], ",");
+            pos += write_str(&mut buf[pos..], dev.state.as_str());
+            pos += write_str(&mut buf[pos..], "\r\n");
+        }
+
+        pos
+    }
+
+    /// Format bus list for hw:bus/list
+    pub fn format_bus_list(&self, buf: &mut [u8]) -> usize {
+        let mut pos = 0;
+
+        pos += write_str(&mut buf[pos..], "# Bus Controllers\r\n");
+        pos += write_str(&mut buf[pos..], "# name,type,state,connected\r\n");
+
+        for i in 0..self.bus_count {
+            let bus = &self.buses[i];
+            // Format: name,type,state,connected
+            pos += write_str(&mut buf[pos..], match bus.bus_type {
+                BusType::PCIe => "pcie",
+                BusType::Usb => "usb",
+            });
+            pos += write_num(&mut buf[pos..], bus.bus_index as usize);
+            pos += write_str(&mut buf[pos..], ",");
+            pos += write_str(&mut buf[pos..], match bus.bus_type {
+                BusType::PCIe => "pcie",
+                BusType::Usb => "usb",
+            });
+            pos += write_str(&mut buf[pos..], ",");
+            pos += write_str(&mut buf[pos..], match bus.kernel_state {
+                KernelBusState::Safe => "safe",
+                KernelBusState::Claimed => "claimed",
+                KernelBusState::Resetting => "resetting",
+            });
+            pos += write_str(&mut buf[pos..], ",");
+            pos += write_str(&mut buf[pos..], if bus.connected { "true" } else { "false" });
+            pos += write_str(&mut buf[pos..], "\r\n");
+        }
+
+        pos
+    }
+
+    /// Format device info for hw:device/<path>
+    pub fn format_device_info(&self, path: &str, buf: &mut [u8]) -> usize {
+        // Find device by path
+        for i in 0..self.device_count {
+            let dev = &self.devices[i];
+            if dev.path_str() == path {
+                let mut pos = 0;
+                pos += write_str(&mut buf[pos..], "path=");
+                pos += write_str(&mut buf[pos..], dev.path_str());
+                pos += write_str(&mut buf[pos..], "\r\nbus=");
+                pos += write_str(&mut buf[pos..], match dev.bus_type {
+                    BusType::PCIe => "pcie",
+                    BusType::Usb => "usb",
+                });
+                pos += write_num(&mut buf[pos..], dev.bus_index as usize);
+                pos += write_str(&mut buf[pos..], "\r\nclass=");
+                pos += write_str(&mut buf[pos..], match dev.class {
+                    DeviceClass::UsbController => "usb-controller",
+                    DeviceClass::Serial => "serial",
+                    DeviceClass::Storage => "storage",
+                    DeviceClass::Network => "network",
+                    DeviceClass::Hid => "hid",
+                    DeviceClass::Other => "other",
+                });
+                pos += write_str(&mut buf[pos..], "\r\nvendor=");
+                pos += write_hex16(&mut buf[pos..], dev.vendor_id);
+                pos += write_str(&mut buf[pos..], "\r\ndevice=");
+                pos += write_hex16(&mut buf[pos..], dev.device_id);
+                pos += write_str(&mut buf[pos..], "\r\nstate=");
+                pos += write_str(&mut buf[pos..], dev.state.as_str());
+                if let Some(drv_idx) = dev.driver_id {
+                    if drv_idx < self.driver_count {
+                        pos += write_str(&mut buf[pos..], "\r\ndriver=");
+                        pos += write_str(&mut buf[pos..], self.drivers[drv_idx].binary);
+                        pos += write_str(&mut buf[pos..], "\r\ndriver_pid=");
+                        pos += write_num(&mut buf[pos..], self.drivers[drv_idx].pid as usize);
+                    }
+                }
+                pos += write_str(&mut buf[pos..], "\r\n");
+                return pos;
+            }
+        }
+
+        // Not found
+        write_str(buf, "error=not_found\r\n")
+    }
+
+    /// Handle hw: scheme request
+    pub fn handle_hw_request(&self, path: &str, buf: &mut [u8]) -> usize {
+        match path {
+            "list" | "" => self.format_device_list(buf),
+            "bus" | "bus/list" => self.format_bus_list(buf),
+            _ => {
+                // Check for device/<path> format
+                if let Some(dev_path) = path.strip_prefix("device/") {
+                    self.format_device_info(dev_path, buf)
+                } else if let Some(dev_path) = path.strip_prefix("/") {
+                    // Allow hw:/platform/uart0 format
+                    self.format_device_info(dev_path, buf)
+                } else {
+                    write_str(buf, "error=invalid_path\n")
+                }
+            }
+        }
+    }
+}
+
+// Helper functions for formatting
+fn write_str(buf: &mut [u8], s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(buf.len());
+    buf[..len].copy_from_slice(&bytes[..len]);
+    len
+}
+
+fn write_num(buf: &mut [u8], n: usize) -> usize {
+    if n == 0 {
+        if !buf.is_empty() {
+            buf[0] = b'0';
+            return 1;
+        }
+        return 0;
+    }
+
+    let mut digits = [0u8; 10];
+    let mut i = 0;
+    let mut val = n;
+    while val > 0 && i < 10 {
+        digits[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+
+    let len = i.min(buf.len());
+    for j in 0..len {
+        buf[j] = digits[i - 1 - j];
+    }
+    len
+}
+
+fn write_hex16(buf: &mut [u8], val: u16) -> usize {
+    const HEX: &[u8] = b"0123456789abcdef";
+    if buf.len() < 4 {
+        return 0;
+    }
+    buf[0] = HEX[(val >> 12) as usize & 0xF];
+    buf[1] = HEX[(val >> 8) as usize & 0xF];
+    buf[2] = HEX[(val >> 4) as usize & 0xF];
+    buf[3] = HEX[val as usize & 0xF];
+    4
 }
 
 // =============================================================================
 // Bus Scanning
 // =============================================================================
 
-/// Scan platform devices (UART, USB controllers are always present on MT7988A)
 fn scan_platform(mgr: &mut DeviceManager) {
     println!("[devd] Scanning platform devices...");
 
-    // UART0 is always present
+    // UART0 - always present, triggers shell
     let mut uart = Device::empty();
     uart.set_path("/platform/uart0");
-    uart.bus = BusType::Platform;
+    uart.bus_type = BusType::PCIe;  // Use PCIe bus 0 for platform
+    uart.bus_index = 0;
     uart.class = DeviceClass::Serial;
 
-    if mgr.add_device(uart) {
-        println!("[devd]   Found: /platform/uart0 (Serial)");
+    if let Some(id) = mgr.add_device(uart) {
+        println!("[devd]   Found: /platform/uart0 (id={})", id);
     }
 
-    // SSUSB1 - USB-A ports (xHCI at 0x11200000)
-    // This is the one with the external USB ports on BPI-R4
+    // SSUSB1 - USB-A ports
     let mut usb1 = Device::empty();
     usb1.set_path("/platform/ssusb1");
-    usb1.bus = BusType::Platform;
+    usb1.bus_type = BusType::Usb;
+    usb1.bus_index = 1;
     usb1.class = DeviceClass::UsbController;
 
-    if mgr.add_device(usb1) {
-        println!("[devd]   Found: /platform/ssusb1 (USB Controller)");
+    if let Some(id) = mgr.add_device(usb1) {
+        println!("[devd]   Found: /platform/ssusb1 (id={})", id);
     }
 }
 
-/// Scan PCIe bus for devices
 fn scan_pcie(mgr: &mut DeviceManager) {
     println!("[devd] Scanning PCIe bus...");
 
@@ -375,9 +955,8 @@ fn scan_pcie(mgr: &mut DeviceManager) {
 
     for i in 0..count {
         let pci = &devices[i];
-        let class = pci.class_code >> 8;  // Base class + subclass
+        let class = pci.class_code >> 8;
 
-        // Determine device class
         let dev_class = match class {
             0x0C03 => DeviceClass::UsbController,
             0x0200 => DeviceClass::Network,
@@ -390,9 +969,7 @@ fn scan_pcie(mgr: &mut DeviceManager) {
         let dev = (bdf >> 3) & 0x1F;
         let func = bdf & 0x7;
 
-        // Create device path
         let mut device = Device::empty();
-        // Format path manually since we don't have format!
         let path = match dev_class {
             DeviceClass::UsbController => "/pcie/usb",
             DeviceClass::Network => "/pcie/net",
@@ -400,59 +977,58 @@ fn scan_pcie(mgr: &mut DeviceManager) {
             _ => "/pcie/unknown",
         };
         device.set_path(path);
-        device.bus = BusType::PCIe;
+        device.bus_type = BusType::PCIe;
+        device.bus_index = 0;
         device.class = dev_class;
         device.vendor_id = pci.vendor_id;
         device.device_id = pci.device_id;
         device.pci_bdf = bdf;
 
-        println!("[devd]   {:04x}:{:02x}:{:02x}.{} - {:04x}:{:04x} class {:06x} ({:?})",
+        println!("[devd]   {:04x}:{:02x}:{:02x}.{} - {:04x}:{:04x} ({:?})",
                  (bdf >> 16) & 0xFF, bus, dev, func,
-                 pci.vendor_id, pci.device_id, pci.class_code, dev_class);
+                 pci.vendor_id, pci.device_id, dev_class);
 
         mgr.add_device(device);
     }
 }
 
 // =============================================================================
-// Main Loop
+// Driver Matching
 // =============================================================================
 
-fn spawn_drivers_for_devices(mgr: &mut DeviceManager) {
+fn match_and_spawn(mgr: &mut DeviceManager) {
     println!("[devd] Matching devices to drivers...");
 
     for i in 0..mgr.device_count {
-        // Copy out what we need to avoid borrow issues
-        let bus = mgr.devices[i].bus;
-        let class = mgr.devices[i].class;
-        let assigned = mgr.devices[i].driver_assigned;
+        let device = &mgr.devices[i];
 
-        if assigned {
+        // Skip if already has driver or not in DISCOVERED state
+        if device.driver_id.is_some() || device.state != DeviceState::Discovered {
             continue;
         }
 
-        // Find matching driver
+        // Find matching rule
         let mut driver_to_spawn: Option<&'static str> = None;
 
         for rule in MATCH_RULES {
             let mut matched = true;
 
             if let Some(rule_bus) = rule.bus {
-                if rule_bus != bus {
+                if rule_bus != device.bus_type {
                     matched = false;
                 }
             }
 
             if let Some(rule_class) = rule.class {
-                if rule_class != class {
+                if rule_class != device.class {
                     matched = false;
                 }
             }
 
             if let Some(pci_class) = rule.pci_class {
-                if bus != BusType::PCIe {
+                if device.bus_type != BusType::PCIe {
                     matched = false;
-                } else if pci_class == PCI_CLASS_USB && class != DeviceClass::UsbController {
+                } else if pci_class == PCI_CLASS_USB && device.class != DeviceClass::UsbController {
                     matched = false;
                 }
             }
@@ -463,64 +1039,206 @@ fn spawn_drivers_for_devices(mgr: &mut DeviceManager) {
             }
         }
 
-        // Spawn if we found a match
         if let Some(driver) = driver_to_spawn {
-            let path = mgr.devices[i].path_str();
-            // Need to copy path since spawn_driver borrows mgr mutably
-            let mut path_buf = [0u8; 64];
-            let path_bytes = path.as_bytes();
-            let len = path_bytes.len().min(64);
-            path_buf[..len].copy_from_slice(&path_bytes[..len]);
-
-            if let Ok(path_str) = core::str::from_utf8(&path_buf[..len]) {
-                if mgr.spawn_driver(driver, path_str).is_some() {
-                    mgr.devices[i].driver_assigned = true;
-                }
-            }
+            let device_id = mgr.devices[i].id;
+            mgr.spawn_driver(driver, device_id);
         }
     }
 }
+
+// =============================================================================
+// Main Loop
+// =============================================================================
 
 #[unsafe(no_mangle)]
 fn main() -> ! {
     println!();
     println!("========================================");
     println!("  devd - Device Supervisor");
-    println!("  BPI-R4 / MT7988A");
+    println!("  State Machine Architecture");
     println!("========================================");
     println!();
 
     let mut mgr = DeviceManager::new();
 
-    // Phase 1: Scan buses
+    // Phase 1: Connect to kernel bus control ports
+    println!("[devd] Connecting to bus control ports...");
+
+    // Connect to USB buses (these are what we have working)
+    mgr.connect_bus(BusType::Usb, 0);
+    mgr.connect_bus(BusType::Usb, 1);
+
+    // Connect to PCIe buses
+    mgr.connect_bus(BusType::PCIe, 0);
+    mgr.connect_bus(BusType::PCIe, 1);
+    mgr.connect_bus(BusType::PCIe, 2);
+
+    // Phase 2: Scan buses for devices
+    println!();
     scan_platform(&mut mgr);
     scan_pcie(&mut mgr);
 
-    // Phase 2: Match and spawn drivers
-    spawn_drivers_for_devices(&mut mgr);
-
+    // Phase 3: Match and spawn drivers
     println!();
-    println!("[devd] Supervision started ({} devices, {} drivers)",
-             mgr.device_count, mgr.driver_count);
+    match_and_spawn(&mut mgr);
+
+    // Phase 4: Register hw: scheme for device discovery
     println!();
+    println!("[devd] Registering hw: scheme...");
 
-    // Phase 3: Supervision loop - wait for children, restart on crash
-    loop {
-        let mut status: i32 = 0;
-        let pid = syscall::waitpid(-1, &mut status);
-
-        if pid > 0 {
-            mgr.handle_exit(pid as u32, status);
-        } else if pid == -10 {
-            // ECHILD - no children, shouldn't happen if drivers are running
-            // Wait a bit and continue
-            let start = syscall::gettime();
-            while syscall::gettime() < start + 1000 {
-                syscall::yield_now();
-            }
+    // Create a channel for hw: scheme requests
+    // channel_create returns (ch_b << 32) | ch_a
+    // When kernel sends to ch_a, message goes to ch_b's queue (peer)
+    // So: register ch_a with scheme, receive on ch_b
+    let hw_channel_pair = syscall::channel_create();
+    let mut hw_channel_valid = false;
+    let hw_daemon_channel = (hw_channel_pair & 0xFFFFFFFF) as u32;  // Register this
+    let hw_channel = ((hw_channel_pair >> 32) & 0xFFFFFFFF) as u32; // Receive on this
+    if hw_channel_pair < 0 {
+        println!("[devd] Failed to create hw: channel: {}", hw_channel_pair);
+    } else {
+        let result = syscall::scheme_register("hw", hw_daemon_channel);
+        if result < 0 {
+            println!("[devd] Failed to register hw: scheme: {}", result);
         } else {
-            // Other error or would-block, just yield
+            println!("[devd] Registered hw: scheme (daemon_ch={}, recv_ch={})",
+                     hw_daemon_channel, hw_channel);
+            hw_channel_valid = true;
+        }
+    }
+
+    println!();
+    println!("[devd] Supervision started ({} buses, {} devices, {} drivers)",
+             mgr.bus_count, mgr.device_count, mgr.driver_count);
+    println!("[devd] Hardware discovery via hw:list, hw:bus, hw:device/<path>");
+    println!();
+
+    // Phase 5: Subscribe to events
+    println!("[devd] Subscribing to events...");
+
+    // Subscribe to ChildExit events (filter=0 means any child)
+    let result = syscall::event_subscribe(event_type::CHILD_EXIT, 0);
+    println!("[devd]   ChildExit: {}", if result == 0 { "OK" } else { "FAILED" });
+
+    // Subscribe to IpcReady for hw: channel
+    if hw_channel_valid {
+        let result = syscall::event_subscribe(event_type::IPC_READY, hw_channel as u64);
+        println!("[devd]   IpcReady(hw:{}): {}", hw_channel, if result == 0 { "OK" } else { "FAILED" });
+    }
+
+    // Subscribe to IpcReady for bus control channels
+    for i in 0..mgr.bus_count {
+        if mgr.buses[i].connected {
+            let ch = mgr.buses[i].channel;
+            let result = syscall::event_subscribe(event_type::IPC_READY, ch as u64);
+            println!("[devd]   IpcReady(bus:{}): {}", ch, if result == 0 { "OK" } else { "FAILED" });
+        }
+    }
+
+    println!();
+
+    // Phase 6: Main supervision loop (event-driven)
+    println!("[devd] === ENTERING EVENT LOOP ===");
+    let mut loop_count = 0u32;
+    let mut event = Event::empty();
+
+    loop {
+        // Wait for an event (blocking)
+        let result = syscall::event_wait(&mut event, event_flags::BLOCKING);
+
+        if result == -11 {
+            // EAGAIN - kernel marked us blocked, yield and retry
             syscall::yield_now();
+            continue;
+        }
+
+        if result < 0 {
+            println!("[devd] event_wait error: {}", result);
+            syscall::yield_now();
+            continue;
+        }
+
+        if result == 0 {
+            // No event (shouldn't happen with blocking wait)
+            syscall::yield_now();
+            continue;
+        }
+
+        // Got an event!
+        loop_count = loop_count.wrapping_add(1);
+
+        match event.event_type {
+            et if et == event_type::CHILD_EXIT => {
+                // Child process exited
+                let child_pid = event.data as u32;
+                let exit_code = event.flags as i32;
+                println!("[devd] Event: ChildExit pid={} code={}", child_pid, exit_code);
+                mgr.handle_driver_exit(child_pid, exit_code);
+            }
+
+            et if et == event_type::IPC_READY => {
+                // IPC message available on a channel
+                let channel = event.data as u32;
+
+                if hw_channel_valid && channel == hw_channel {
+                    // hw: scheme request
+                    let mut buf = [0u8; 256];
+                    let len = syscall::receive(hw_channel, &mut buf);
+                    if len >= 8 {
+                        let server_ch = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        let _flags = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                        let path = core::str::from_utf8(&buf[8..len as usize]).unwrap_or("");
+
+                        println!("[devd] hw: request path='{}' server_ch={}", path, server_ch);
+
+                        let mut response = [0u8; 1024];
+                        let data_len = mgr.handle_hw_request(path, &mut response);
+
+                        let result = syscall::send(server_ch, &response[..data_len]);
+                        if result < 0 {
+                            println!("[devd] hw: send failed: {}", result);
+                        }
+                    }
+                } else {
+                    // Check if it's a bus control channel
+                    for i in 0..mgr.bus_count {
+                        if mgr.buses[i].connected && mgr.buses[i].channel == channel {
+                            let mut buf = [0u8; 64];
+                            let len = syscall::receive(channel, &mut buf);
+                            if len > 0 && buf[0] == MSG_STATE_SNAPSHOT {
+                                let new_state = match buf[3] {
+                                    0 => KernelBusState::Safe,
+                                    1 => KernelBusState::Claimed,
+                                    2 => KernelBusState::Resetting,
+                                    _ => mgr.buses[i].kernel_state,
+                                };
+                                if new_state != mgr.buses[i].kernel_state {
+                                    println!("[devd] {:?}{} state: {:?} -> {:?}",
+                                             mgr.buses[i].bus_type, mgr.buses[i].bus_index,
+                                             mgr.buses[i].kernel_state, new_state);
+                                    mgr.buses[i].kernel_state = new_state;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            et if et == event_type::TIMER => {
+                // Timer expired - process binding timeouts and restart delays
+                mgr.process_timers();
+            }
+
+            _ => {
+                println!("[devd] Unknown event type: {}", event.event_type);
+            }
+        }
+
+        // Process timers periodically (every 100 events for now)
+        // TODO: Use timer events for this
+        if loop_count % 100 == 0 {
+            mgr.process_timers();
         }
     }
 }

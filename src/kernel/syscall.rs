@@ -116,6 +116,8 @@ pub enum SyscallNumber {
     SendDirect = 45,
     /// Receive IPC message with timeout
     ReceiveTimeout = 46,
+    /// Unmap shared memory region from this process
+    ShmemUnmap = 47,
     /// Enumerate PCI devices
     PciEnumerate = 50,
     /// Read PCI config space
@@ -182,6 +184,7 @@ impl From<u64> for SyscallNumber {
             44 => SyscallNumber::ShmemDestroy,
             45 => SyscallNumber::SendDirect,
             46 => SyscallNumber::ReceiveTimeout,
+            47 => SyscallNumber::ShmemUnmap,
             50 => SyscallNumber::PciEnumerate,
             51 => SyscallNumber::PciConfigRead,
             52 => SyscallNumber::PciConfigWrite,
@@ -300,7 +303,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
             sys_scheme_unregister(args.arg0, args.arg1 as usize)
         }
         SyscallNumber::Spawn => sys_spawn(args.arg0 as u32, args.arg1, args.arg2 as usize),
-        SyscallNumber::Wait => sys_wait(args.arg0 as i32, args.arg1),
+        SyscallNumber::Wait => sys_wait(args.arg0 as i32, args.arg1, args.arg2 as u32),
         SyscallNumber::Exec => sys_exec(args.arg0, args.arg1 as usize),
         SyscallNumber::Daemonize => sys_daemonize(),
         SyscallNumber::Kill => sys_kill(args.arg0 as u32),
@@ -315,6 +318,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::ShmemWait => sys_shmem_wait(args.arg0 as u32, args.arg1 as u32),
         SyscallNumber::ShmemNotify => sys_shmem_notify(args.arg0 as u32),
         SyscallNumber::ShmemDestroy => sys_shmem_destroy(args.arg0 as u32),
+        SyscallNumber::ShmemUnmap => sys_shmem_unmap(args.arg0 as u32),
         SyscallNumber::PciEnumerate => sys_pci_enumerate(args.arg0, args.arg1 as usize),
         SyscallNumber::PciConfigRead => {
             sys_pci_config_read(args.arg0 as u32, args.arg1 as u16, args.arg2 as u8)
@@ -372,10 +376,12 @@ fn sys_exit(code: i32) -> i64 {
 
     unsafe {
         let sched = super::task::scheduler();
-        let current_slot = sched.current;
+        let current_slot = super::task::current_slot();  // Use per-CPU slot for consistency
 
         // Get current task's info before terminating
         let (pid, parent_id) = if let Some(ref task) = sched.tasks[current_slot] {
+            logln!("[sys_exit] task pid={} parent={} name={:?}",
+                   task.id, task.parent_id, task.name_str());
             (task.id, task.parent_id)
         } else {
             (0, 0)
@@ -386,6 +392,7 @@ fn sys_exit(code: i32) -> i64 {
         super::scheme::process_cleanup(pid);
         super::pci::release_all_devices(pid);
         super::port::process_cleanup(pid);
+        super::bus::process_cleanup(pid);
 
         // Close all file descriptors (releases scheme handles, channels, etc.)
         if let Some(ref mut task) = sched.tasks[current_slot] {
@@ -419,9 +426,24 @@ fn sys_exit(code: i32) -> i64 {
             // Task stays as Terminated until then.
         }
 
+        // Debug: show task states before scheduling
+        logln!("  Task states at exit (current_slot={}):", super::task::current_slot());
+        for (i, task_opt) in sched.tasks.iter().enumerate() {
+            if let Some(ref task) = task_opt {
+                let state_str = match task.state {
+                    super::task::TaskState::Ready => "Ready",
+                    super::task::TaskState::Running => "Running",
+                    super::task::TaskState::Blocked => "Blocked",
+                    super::task::TaskState::Terminated => "Terminated",
+                };
+                logln!("    [{}] {} - {}", i, task.name_str(), state_str);
+            }
+        }
+
         // Try to schedule next task
         if let Some(next_slot) = sched.schedule() {
             // Mark next task as running and update globals
+            super::task::set_current_slot(next_slot);
             sched.current = next_slot;
             if let Some(ref mut task) = sched.tasks[next_slot] {
                 task.state = super::task::TaskState::Running;
@@ -430,7 +452,15 @@ fn sys_exit(code: i32) -> i64 {
             // CRITICAL: Tell assembly we switched tasks so it doesn't
             // overwrite the new task's x0 with our return value
             super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
-            logln!("  Switching to task {}", next_slot);
+
+            // Debug: show the trap frame and TTBR0 we're switching to
+            if let Some(ref task) = sched.tasks[next_slot] {
+                let ttbr0 = task.address_space.as_ref().map(|a| a.get_ttbr0()).unwrap_or(0);
+                logln!("  Switching to task {} '{}' elr=0x{:x} sp=0x{:x} spsr=0x{:x} x0=0x{:x} ttbr0=0x{:x}",
+                       next_slot, task.name_str(),
+                       task.trap_frame.elr_el1, task.trap_frame.sp_el0,
+                       task.trap_frame.spsr_el1, task.trap_frame.x0, ttbr0);
+            }
             // Return - svc_handler will load new task's state and eret
             0
         } else {
@@ -449,7 +479,7 @@ fn sys_exit(code: i32) -> i64 {
 fn sys_yield() -> i64 {
     unsafe {
         let sched = super::task::scheduler();
-        let caller_slot = sched.current;
+        let caller_slot = super::task::current_slot();
 
         // Mark current as ready (not running)
         if let Some(ref mut task) = sched.tasks[caller_slot] {
@@ -461,6 +491,7 @@ fn sys_yield() -> i64 {
         // Find next task
         if let Some(next_slot) = sched.schedule() {
             if next_slot != caller_slot {
+                super::task::set_current_slot(next_slot);
                 sched.current = next_slot;
                 if let Some(ref mut task) = sched.tasks[next_slot] {
                     task.state = super::task::TaskState::Running;
@@ -646,6 +677,26 @@ fn sys_send(channel_id: u32, data_ptr: u64, data_len: usize) -> i64 {
         }
     }
 
+    // Check if this is a message to a kernel bus controller
+    // If so, process it synchronously instead of queuing
+    let is_kernel_bus = super::ipc::with_channel_table(|table| {
+        // Find the peer channel
+        if let Some(slot) = table.endpoints.iter().position(|e| e.id == channel_id) {
+            let peer_id = table.endpoints[slot].peer;
+            if let Some(peer_slot) = table.endpoints.iter().position(|e| e.id == peer_id) {
+                // Kernel channels have owner PID 0
+                return table.endpoints[peer_slot].owner == 0;
+            }
+        }
+        false
+    });
+
+    if is_kernel_bus && data_len > 0 {
+        // Process kernel bus message synchronously
+        super::bus::process_bus_message(channel_id, &kernel_buf[..data_len]);
+        return SyscallError::Success as i64;
+    }
+
     // Send via IPC
     let data = if data_len > 0 { &kernel_buf[..data_len] } else { &[] };
     match super::ipc::sys_send(channel_id, caller_pid, data) {
@@ -696,7 +747,11 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 
     let caller_pid = current_pid();
 
-    match super::ipc::sys_receive(channel_id, caller_pid) {
+    // Use sys_receive_blocking which atomically checks queue and registers
+    // as blocked receiver while holding the lock. This prevents a race where
+    // a sender/closer could queue a message after we check but before we
+    // register as blocked (leaving us blocked forever with a message waiting).
+    match super::ipc::sys_receive_blocking(channel_id, caller_pid) {
         Ok(msg) => {
             // Copy message to user buffer
             let copy_len = core::cmp::min(msg.header.payload_len as usize, buf_len);
@@ -710,17 +765,11 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             msg.header.payload_len as i64
         }
         Err(super::ipc::IpcError::WouldBlock) => {
-            // Mark task as blocked and register as waiting on this channel
+            // Task is already registered as blocked receiver by sys_receive_blocking
+            // Just mark task as blocked and trigger reschedule
             unsafe {
                 let sched = super::task::scheduler();
                 let current_slot = sched.current;
-                let pid = sched.tasks[current_slot].as_ref().map(|t| t.id).unwrap_or(0);
-
-                // Register this process as blocked waiting on the channel
-                // so that send() can wake it up (thread-safe)
-                super::ipc::with_channel_table(|table| {
-                    let _ = table.block_receiver(channel_id, pid);
-                });
 
                 if let Some(ref mut task) = sched.tasks[current_slot] {
                     task.state = super::task::TaskState::Blocked;
@@ -750,7 +799,27 @@ fn sys_receive_timeout(channel_id: u32, buf_ptr: u64, buf_len: usize, timeout_ms
 
     let caller_pid = current_pid();
 
-    match super::ipc::sys_receive(channel_id, caller_pid) {
+    // For non-blocking (timeout=0), use simple non-blocking receive
+    if timeout_ms == 0 {
+        match super::ipc::sys_receive(channel_id, caller_pid) {
+            Ok(msg) => {
+                let copy_len = core::cmp::min(msg.header.payload_len as usize, buf_len);
+                if copy_len > 0 {
+                    if let Err(e) = uaccess::copy_to_user(buf_ptr, &msg.payload[..copy_len]) {
+                        return uaccess_to_errno(e);
+                    }
+                }
+                return msg.header.payload_len as i64;
+            }
+            Err(e) => return e.to_errno() as i64,
+        }
+    }
+
+    // Use sys_receive_blocking which atomically checks queue and registers
+    // as blocked receiver while holding the lock. This prevents a race where
+    // a sender/closer could queue a message after we check but before we
+    // register as blocked (leaving us blocked forever with a message waiting).
+    match super::ipc::sys_receive_blocking(channel_id, caller_pid) {
         Ok(msg) => {
             // Copy message to user buffer
             let copy_len = core::cmp::min(msg.header.payload_len as usize, buf_len);
@@ -764,24 +833,11 @@ fn sys_receive_timeout(channel_id: u32, buf_ptr: u64, buf_len: usize, timeout_ms
             msg.header.payload_len as i64
         }
         Err(super::ipc::IpcError::WouldBlock) => {
-            // No message available - either block with timeout or return immediately
-            if timeout_ms == 0 {
-                // Non-blocking mode requested via timeout=0 - return immediately
-                // Note: This is different from "wait forever" which would be u32::MAX
-                return SyscallError::WouldBlock as i64;
-            }
-
-            // Mark task as blocked and register as waiting on this channel
+            // Task is already registered as blocked receiver by sys_receive_blocking
+            // Now set up the timeout and block
             unsafe {
                 let sched = super::task::scheduler();
-                let current_slot = sched.current;
-                let pid = sched.tasks[current_slot].as_ref().map(|t| t.id).unwrap_or(0);
-
-                // Register this process as blocked waiting on the channel
-                // so that send() can wake it up (thread-safe)
-                super::ipc::with_channel_table(|table| {
-                    let _ = table.block_receiver(channel_id, pid);
-                });
+                let current_slot = super::task::current_slot();  // Use per-CPU slot for consistency
 
                 if let Some(ref mut task) = sched.tasks[current_slot] {
                     task.state = super::task::TaskState::Blocked;
@@ -997,37 +1053,88 @@ fn sys_read(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 
     // Read into kernel buffer first
     let mut kernel_buf = [0u8; 4096];
-    let bytes_read: isize;
 
-    unsafe {
+    // For blocking channel reads, use the blocking receive path
+    let (is_channel, channel_id, is_blocking) = unsafe {
         let sched = super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
-            let caller_pid = task.id;
+        if let Some(ref task) = sched.tasks[sched.current] {
             if let Some(entry) = task.fd_table.get(fd) {
-                bytes_read = super::fd::fd_read(entry, &mut kernel_buf[..buf_len], caller_pid);
+                if let super::fd::FdType::Channel(ch) = entry.fd_type {
+                    (true, ch, !entry.flags.nonblocking)
+                } else {
+                    (false, 0, false)
+                }
             } else {
                 return SyscallError::BadFd as i64;
-            }
-
-            // Update file offset for seekable file types (like Ramfs)
-            if bytes_read > 0 {
-                if let Some(entry) = task.fd_table.get_mut(fd) {
-                    entry.offset += bytes_read as u64;
-                }
             }
         } else {
             return SyscallError::BadFd as i64;
         }
-    }
+    };
 
-    // If read succeeded, copy to user space
-    if bytes_read > 0 {
-        match uaccess::copy_to_user(buf_ptr, &kernel_buf[..bytes_read as usize]) {
-            Ok(_) => bytes_read as i64,
-            Err(e) => uaccess_to_errno(e),
+    // For blocking channel reads, use blocking receive
+    if is_channel && is_blocking {
+        let caller_pid = current_pid();
+        match super::ipc::sys_receive_blocking(channel_id, caller_pid) {
+            Ok(msg) => {
+                let payload = msg.payload_slice();
+                let copy_len = core::cmp::min(payload.len(), buf_len);
+                kernel_buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                match uaccess::copy_to_user(buf_ptr, &kernel_buf[..copy_len]) {
+                    Ok(_) => copy_len as i64,
+                    Err(e) => uaccess_to_errno(e),
+                }
+            }
+            Err(super::ipc::IpcError::WouldBlock) => {
+                // Block the task
+                unsafe {
+                    let sched = super::task::scheduler();
+                    let current_slot = sched.current;
+                    if let Some(ref mut task) = sched.tasks[current_slot] {
+                        task.state = super::task::TaskState::Blocked;
+                        task.wait_reason = Some(super::task::WaitReason::Ipc);
+                    }
+                    crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+                }
+                SyscallError::WouldBlock as i64
+            }
+            Err(super::ipc::IpcError::PeerClosed) => 0, // EOF
+            Err(_) => -5, // EIO
         }
     } else {
-        bytes_read as i64
+        // Non-channel or non-blocking read
+        let bytes_read: isize;
+
+        unsafe {
+            let sched = super::task::scheduler();
+            if let Some(ref mut task) = sched.tasks[sched.current] {
+                let caller_pid = task.id;
+                if let Some(entry) = task.fd_table.get(fd) {
+                    bytes_read = super::fd::fd_read(entry, &mut kernel_buf[..buf_len], caller_pid);
+                } else {
+                    return SyscallError::BadFd as i64;
+                }
+
+                // Update file offset for seekable file types (like Ramfs)
+                if bytes_read > 0 {
+                    if let Some(entry) = task.fd_table.get_mut(fd) {
+                        entry.offset += bytes_read as u64;
+                    }
+                }
+            } else {
+                return SyscallError::BadFd as i64;
+            }
+        }
+
+        // If read succeeded, copy to user space
+        if bytes_read > 0 {
+            match uaccess::copy_to_user(buf_ptr, &kernel_buf[..bytes_read as usize]) {
+                Ok(_) => bytes_read as i64,
+                Err(e) => uaccess_to_errno(e),
+            }
+        } else {
+            bytes_read as i64
+        }
     }
 }
 
@@ -1341,6 +1448,7 @@ fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
 
     // Get current PID as parent
     let parent_id = current_pid();
+    logln!("[sys_exec] {} called by pid {}", path, parent_id);
 
     // Try to spawn from ramfs path
     match super::elf::spawn_from_path_with_parent(path, parent_id) {
@@ -1350,12 +1458,17 @@ fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
     }
 }
 
+/// Wait flags
+pub const WNOHANG: u32 = 1;  // Don't block if no child has exited
+
 /// Wait for a child process to exit
-/// Args: pid (-1 = any child, >0 = specific child), status_ptr (pointer to i32 for exit status)
-/// Returns: PID of exited child on success, 0 if no children/would block, negative error
+/// Args: pid (-1 = any child, >0 = specific child), status_ptr (pointer to i32 for exit status), flags
+/// flags: 0 = block until child exits, WNOHANG (1) = return immediately if no child exited
+/// Returns: PID of exited child on success, 0 if WNOHANG and no child exited, negative error
 /// SECURITY: Writes to user status pointer via page table translation
-fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
+fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
     let caller_pid = current_pid();
+    logln!("[sys_wait] ENTER: caller_pid={} wait_for={} flags={}", caller_pid, pid, flags);
 
     // Validate status pointer if provided
     if status_ptr != 0 {
@@ -1368,7 +1481,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
         let sched = super::task::scheduler();
 
         // Find the calling task
-        let caller_slot = sched.current;
+        let caller_slot = super::task::current_slot();  // Use per-CPU slot for consistency
         let caller_task = match &sched.tasks[caller_slot] {
             Some(t) if t.id == caller_pid => t,
             _ => return SyscallError::InvalidArgument as i64,
@@ -1376,8 +1489,11 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
 
         // Check if caller has any children
         if !caller_task.has_children() {
+            logln!("[sys_wait] pid {} (slot {}) has no children", caller_pid, caller_slot);
             return SyscallError::NoChild as i64;
         }
+        logln!("[sys_wait] pid {} has {} children, looking for terminated...",
+               caller_pid, caller_task.num_children);
 
         // Look for terminated children - first pass: find terminated child info
         let mut found_child: Option<(usize, u32, i32)> = None; // (slot, pid, exit_code)
@@ -1388,6 +1504,15 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
                 if task.parent_id != caller_pid {
                     continue;
                 }
+
+                // This is a child - log its state
+                let state_str = match task.state {
+                    super::task::TaskState::Ready => "Ready",
+                    super::task::TaskState::Running => "Running",
+                    super::task::TaskState::Blocked => "Blocked",
+                    super::task::TaskState::Terminated => "Terminated",
+                };
+                logln!("[sys_wait]   child slot={} pid={} state={}", slot, task.id, state_str);
 
                 // Check if waiting for specific PID or any child
                 if pid > 0 && task.id != pid as u32 {
@@ -1404,6 +1529,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
 
         // Second pass: reap the child if found (outside of iterator)
         if let Some((child_slot, child_pid, exit_code)) = found_child {
+            logln!("[sys_wait] FOUND: reaping child pid={} slot={} exit_code={}", child_pid, child_slot, exit_code);
             // Write exit status to user space if pointer provided
             if status_ptr != 0 {
                 if let Err(e) = uaccess::put_user::<i32>(status_ptr, exit_code) {
@@ -1424,7 +1550,13 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
             return ((child_pid as i64) << 32) | ((exit_code as i64) & 0xFFFFFFFF);
         }
 
-        // No terminated children found - need to block and switch
+        // No terminated children found
+        // If WNOHANG is set, return 0 immediately without blocking
+        if (flags & WNOHANG) != 0 {
+            return 0;  // No child exited, but don't block
+        }
+
+        // Block and switch to another task
         if let Some(ref mut parent) = sched.tasks[caller_slot] {
             parent.state = super::task::TaskState::Blocked;
             // Pre-store return value in caller's trap frame
@@ -1434,6 +1566,7 @@ fn sys_wait(pid: i32, status_ptr: u64) -> i64 {
         // Find another task to run
         if let Some(next_slot) = sched.schedule() {
             if next_slot != caller_slot {
+                super::task::set_current_slot(next_slot);
                 sched.current = next_slot;
                 if let Some(ref mut next) = sched.tasks[next_slot] {
                     next.state = super::task::TaskState::Running;
@@ -1629,6 +1762,7 @@ fn sys_kill(pid: u32) -> i64 {
         super::scheme::process_cleanup(pid);
         super::pci::release_all_devices(pid);
         super::port::process_cleanup(pid);
+        super::bus::process_cleanup(pid);
 
         // Close all file descriptors and mark as terminated
         if let Some(ref mut task) = sched.tasks[slot] {
@@ -1664,6 +1798,7 @@ fn sys_kill(pid: u32) -> i64 {
         // If killing current task, schedule next
         if pid == caller_pid {
             if let Some(next_slot) = sched.schedule() {
+                super::task::set_current_slot(next_slot);
                 sched.current = next_slot;
                 if let Some(ref mut next) = sched.tasks[next_slot] {
                     next.state = super::task::TaskState::Running;
@@ -2125,9 +2260,6 @@ fn sys_pci_claim(bdf: u32) -> i64 {
 pub extern "C" fn syscall_handler_rust(
     arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, _unused: u64, num: u64
 ) -> i64 {
-    // NOTE: Cannot use logln!() here - vtables contain physical addresses
-    // which aren't mapped after TTBR0 switches to user page table.
-
     let args = SyscallArgs {
         num,
         arg0,
@@ -2140,11 +2272,8 @@ pub extern "C" fn syscall_handler_rust(
 
     let result = handle(&args);
 
-    // Safe point: check for deferred reschedule before returning to user
-    // This is where timer preemption actually happens (not in IRQ handler)
-    unsafe {
-        super::task::do_resched_if_needed();
-    }
+    // NOTE: do_resched_if_needed is called by assembly svc_handler after we return
+    // Don't call it here - would cause infinite WFI loop when task blocks
 
     // Safe point: flush deferred log buffer before returning to user
     super::log::flush();
@@ -2318,6 +2447,18 @@ fn sys_shmem_destroy(shmem_id: u32) -> i64 {
     let caller_pid = current_pid();
 
     match super::shmem::destroy(caller_pid, shmem_id) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// Unmap a shared memory region from this process
+/// Args: shmem_id
+/// Returns: 0 on success, negative error on failure
+fn sys_shmem_unmap(shmem_id: u32) -> i64 {
+    let caller_pid = current_pid();
+
+    match super::shmem::unmap(caller_pid, shmem_id) {
         Ok(()) => 0,
         Err(e) => e,
     }

@@ -50,6 +50,7 @@ pub const SYS_SHMEM_ALLOW: u64 = 41;
 pub const SYS_SHMEM_WAIT: u64 = 42;
 pub const SYS_SHMEM_NOTIFY: u64 = 43;
 pub const SYS_SHMEM_DESTROY: u64 = 44;
+pub const SYS_SHMEM_UNMAP: u64 = 47;
 pub const SYS_SEND_DIRECT: u64 = 45;
 pub const SYS_RECEIVE_TIMEOUT: u64 = 46;
 
@@ -276,13 +277,23 @@ pub fn exec(path: &str) -> i64 {
 /// Returns (pid << 32 | exit_code) on success, or negative error code
 /// pid: -1 = any child, >0 = specific child
 pub fn wait(pid: i32) -> i64 {
-    syscall2(SYS_WAIT, pid as u64, 0) // 0 = no status pointer
+    syscall3(SYS_WAIT, pid as u64, 0, 0) // 0 = no status pointer, 0 = blocking
 }
 
-/// Wait for a child process and get exit status
+/// Wait flags
+pub const WNOHANG: u32 = 1;  // Don't block if no child has exited
+
+/// Wait for a child process and get exit status (blocking)
 /// Returns child pid on success, writes exit status to status_out
 pub fn waitpid(pid: i32, status_out: &mut i32) -> i64 {
-    syscall2(SYS_WAIT, pid as u64, status_out as *mut i32 as u64)
+    syscall3(SYS_WAIT, pid as u64, status_out as *mut i32 as u64, 0)
+}
+
+/// Wait for a child process with flags
+/// flags: 0 = block, WNOHANG = return immediately if no child exited
+/// Returns: child pid on success, 0 if WNOHANG and no child exited, negative error
+pub fn waitpid_flags(pid: i32, status_out: &mut i32, flags: u32) -> i64 {
+    syscall3(SYS_WAIT, pid as u64, status_out as *mut i32 as u64, flags as u64)
 }
 
 // IPC syscalls
@@ -322,7 +333,12 @@ pub fn receive_timeout(channel_id: u32, buf: &mut [u8], timeout_ms: u32) -> isiz
     loop {
         let result = syscall4(SYS_RECEIVE_TIMEOUT, channel_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_ms as u64) as isize;
         if result == -11 {
-            // EAGAIN - woken by sender, retry to get the message
+            // EAGAIN/WouldBlock
+            // For non-blocking calls (timeout=0), return immediately - no message available
+            // For blocking calls, retry (spurious wakeup from sender notification)
+            if timeout_ms == 0 {
+                return result;
+            }
             continue;
         }
         return result;
@@ -378,6 +394,37 @@ pub fn scheme_open(url: &str, flags: u32) -> i32 {
     syscall3(SYS_SCHEME_OPEN, url.as_ptr() as u64, url.len() as u64, flags as u64) as i32
 }
 
+/// Register a user scheme (e.g., "hw", "fs", "net")
+///
+/// The calling process becomes the handler for this scheme.
+/// When clients open "scheme:path", the kernel sends messages to `channel_id`.
+///
+/// Message format for open requests:
+/// - header.msg_type = Connect
+/// - header.msg_id = server_channel (for responses)
+/// - payload[0..4] = flags
+/// - payload[4..] = path
+///
+/// Returns 0 on success, negative error code on failure
+pub fn scheme_register(name: &str, channel_id: u32) -> i32 {
+    syscall3(
+        SYS_SCHEME_REGISTER,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        channel_id as u64,
+    ) as i32
+}
+
+/// Unregister a user scheme
+/// Returns 0 on success, negative error code on failure
+pub fn scheme_unregister(name: &str) -> i32 {
+    syscall2(
+        SYS_SCHEME_UNREGISTER,
+        name.as_ptr() as u64,
+        name.len() as u64,
+    ) as i32
+}
+
 /// Get system time in nanoseconds
 pub fn gettime() -> u64 {
     syscall0(SYS_GETTIME) as u64
@@ -385,33 +432,110 @@ pub fn gettime() -> u64 {
 
 // Event syscalls
 
-/// Event types (must match kernel)
+/// Event types (must match kernel event.rs)
 pub mod event_type {
-    pub const IPC_READY: u32 = 0;
-    pub const TIMER: u32 = 1;
-    pub const IRQ: u32 = 2;
-    pub const CHILD_EXIT: u32 = 3;
-    pub const FD_READABLE: u32 = 4;
-    pub const FD_WRITABLE: u32 = 5;
-    pub const SIGNAL: u32 = 6;
+    pub const NONE: u32 = 0;
+    pub const IPC_READY: u32 = 1;
+    pub const TIMER: u32 = 2;
+    pub const IRQ: u32 = 3;
+    pub const CHILD_EXIT: u32 = 4;
+    pub const FD_READABLE: u32 = 5;
+    pub const FD_WRITABLE: u32 = 6;
+    pub const SIGNAL: u32 = 7;
+}
+
+/// Event wait flags
+pub mod event_flags {
+    pub const BLOCKING: u32 = 0;     // Block until event available
+    pub const NON_BLOCKING: u32 = 1; // Return immediately if no event
+}
+
+/// Event structure (must match kernel event.rs)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Event {
+    /// Type of event (see event_type module)
+    pub event_type: u32,
+    /// Padding for alignment
+    pub _pad: u32,
+    /// Event-specific data (e.g., channel ID, timer ID, child PID)
+    pub data: u64,
+    /// Additional flags (e.g., exit code for ChildExit)
+    pub flags: u32,
+    /// Source PID (for IPC events, child exit, signals)
+    pub source_pid: u32,
+}
+
+impl Event {
+    pub const fn empty() -> Self {
+        Self {
+            event_type: 0,
+            _pad: 0,
+            data: 0,
+            flags: 0,
+            source_pid: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.event_type == event_type::NONE
+    }
+
+    /// Get event type as a descriptive string
+    pub fn type_name(&self) -> &'static str {
+        match self.event_type {
+            event_type::NONE => "none",
+            event_type::IPC_READY => "ipc_ready",
+            event_type::TIMER => "timer",
+            event_type::IRQ => "irq",
+            event_type::CHILD_EXIT => "child_exit",
+            event_type::FD_READABLE => "fd_readable",
+            event_type::FD_WRITABLE => "fd_writable",
+            event_type::SIGNAL => "signal",
+            _ => "unknown",
+        }
+    }
 }
 
 /// Subscribe to an event type
+/// event_type: one of event_type::*
+/// filter: 0 = any, or specific value (channel ID, child PID, etc.)
 /// Returns 0 on success, negative error on failure
 pub fn event_subscribe(event_type: u32, filter: u64) -> i32 {
     syscall2(SYS_EVENT_SUBSCRIBE, event_type as u64, filter) as i32
 }
 
 /// Unsubscribe from an event type
-pub fn event_unsubscribe(event_type: u32) -> i32 {
-    syscall1(SYS_EVENT_UNSUBSCRIBE, event_type as u64) as i32
+pub fn event_unsubscribe(event_type: u32, filter: u64) -> i32 {
+    syscall2(SYS_EVENT_UNSUBSCRIBE, event_type as u64, filter) as i32
 }
 
-/// Wait for an event
-/// Returns event data (type << 32 | data) on success, negative error on failure
-/// timeout_ns: 0 = non-blocking, u64::MAX = block forever
-pub fn event_wait(timeout_ns: u64) -> i64 {
-    syscall1(SYS_EVENT_WAIT, timeout_ns)
+/// Wait for an event (blocking or non-blocking)
+/// event_out: pointer to Event structure to receive the event
+/// flags: event_flags::BLOCKING or event_flags::NON_BLOCKING
+/// Returns: 1 if event received, 0 if non-blocking and no event, negative error
+pub fn event_wait(event_out: &mut Event, flags: u32) -> i64 {
+    syscall2(SYS_EVENT_WAIT, event_out as *mut Event as u64, flags as u64)
+}
+
+/// Wait for an event, blocking until one is available
+/// Returns the event, or an error
+pub fn event_wait_blocking(event_out: &mut Event) -> i64 {
+    loop {
+        let result = event_wait(event_out, event_flags::BLOCKING);
+        if result == -11 {
+            // EAGAIN - kernel marked us blocked, yield and retry
+            yield_now();
+            continue;
+        }
+        return result;
+    }
+}
+
+/// Check for an event without blocking
+/// Returns: 1 if event received, 0 if no event available, negative error
+pub fn event_poll(event_out: &mut Event) -> i64 {
+    event_wait(event_out, event_flags::NON_BLOCKING)
 }
 
 /// Post an event to another process
@@ -557,6 +681,12 @@ pub fn shmem_notify(shmem_id: u32) -> i64 {
 /// Returns 0 on success, negative error on failure
 pub fn shmem_destroy(shmem_id: u32) -> i64 {
     syscall1(SYS_SHMEM_DESTROY, shmem_id as u64)
+}
+
+/// Unmap a shared memory region from this process
+/// Returns 0 on success, negative error on failure
+pub fn shmem_unmap(shmem_id: u32) -> i64 {
+    syscall1(SYS_SHMEM_UNMAP, shmem_id as u64)
 }
 
 // =============================================================================

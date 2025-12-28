@@ -834,7 +834,7 @@ context_switch:
 .global enter_usermode
 .type enter_usermode, @function
 enter_usermode:
-    // Save TTBR0 value
+    // Save TTBR0 value (x1 arg) before we use other registers
     mov     x9, x1
 
     // Load special registers from trap frame
@@ -849,9 +849,9 @@ enter_usermode:
 
     // Jump to TTBR1 address space before switching TTBR0
     // This allows us to safely flush TLB without losing access to kernel code
-    adr     x10, 1f                 // Get physical address of trampoline
+    adr     x10, 1f                 // Get PC-relative address of trampoline
     movz    x11, #0xFFFF, lsl #48   // KERNEL_VIRT_BASE = 0xFFFF000000000000
-    orr     x10, x10, x11           // Convert to TTBR1 virtual address
+    orr     x10, x10, x11           // Ensure TTBR1 virtual address
     br      x10                     // Jump to TTBR1 space
 
 1:
@@ -861,6 +861,8 @@ enter_usermode:
     tlbi    vmalle1                 // Flush all TLB entries
     dsb     sy
     isb
+
+    // UART is accessible via TTBR1: 0xFFFF_0000_1100_0000
 
     // Zero all registers for clean user entry
     mov     x0, #0
@@ -1143,6 +1145,9 @@ impl Scheduler {
                 logln!("    Entry:  0x{:016x}", task.trap_frame.elr_el1);
                 logln!("    Stack:  0x{:016x}", task.trap_frame.sp_el0);
                 logln!("    TTBR0:  0x{:016x}", ttbr0);
+
+                // Flush log buffer before entering userspace
+                super::log::flush();
 
                 enter_usermode(trap_frame as *const TrapFrame, ttbr0);
             }
@@ -1519,9 +1524,10 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     // Do the reschedule with IRQs disabled for the critical section
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
     let sched = scheduler();
+    let my_slot = current_slot();  // Use per-CPU slot for consistency with schedule()
 
     // Check if current task is blocked - must switch away immediately
-    let current_blocked = if let Some(ref task) = sched.tasks[sched.current] {
+    let current_blocked = if let Some(ref task) = sched.tasks[my_slot] {
         task.state == TaskState::Blocked
     } else {
         false
@@ -1534,7 +1540,7 @@ pub unsafe extern "C" fn do_resched_if_needed() {
 
     // Mark current as ready (it was running) - but only if it was Running
     // (don't change Blocked tasks)
-    if let Some(ref mut current) = sched.tasks[sched.current] {
+    if let Some(ref mut current) = sched.tasks[my_slot] {
         if current.state == TaskState::Running {
             current.state = TaskState::Ready;
         }
@@ -1542,7 +1548,9 @@ pub unsafe extern "C" fn do_resched_if_needed() {
 
     // Find next task
     if let Some(next_slot) = sched.schedule() {
-        if next_slot != sched.current {
+        if next_slot != my_slot {
+            // Update both per-CPU slot and legacy field
+            set_current_slot(next_slot);
             sched.current = next_slot;
             if let Some(ref mut next_task) = sched.tasks[next_slot] {
                 next_task.state = TaskState::Running;
@@ -1552,7 +1560,7 @@ pub unsafe extern "C" fn do_resched_if_needed() {
             SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
         } else {
             // Same task selected - only mark as running if it was Ready
-            if let Some(ref mut current) = sched.tasks[sched.current] {
+            if let Some(ref mut current) = sched.tasks[my_slot] {
                 if current.state == TaskState::Ready {
                     current.state = TaskState::Running;
                 }
@@ -1574,6 +1582,8 @@ pub unsafe extern "C" fn do_resched_if_needed() {
 
             if let Some(next_slot) = sched2.schedule() {
                 // Found a ready task - switch to it
+                // Update both per-CPU slot and legacy field
+                set_current_slot(next_slot);
                 sched2.current = next_slot;
                 if let Some(ref mut next_task) = sched2.tasks[next_slot] {
                     next_task.state = TaskState::Running;
@@ -1614,7 +1624,7 @@ pub unsafe fn yield_cpu() {
 /// - Must be called from kernel context (not IRQ handlers)
 pub unsafe fn yield_cpu_locked() {
     let sched = scheduler();
-    let caller_slot = sched.current;
+    let caller_slot = current_slot();  // Use per-CPU slot for consistency with schedule()
 
     // Mark current task as Ready so it can be scheduled again
     if let Some(ref mut t) = sched.tasks[caller_slot] {
@@ -1646,7 +1656,8 @@ pub unsafe fn yield_cpu_locked() {
                 }
             }
 
-            // Update current index
+            // Update current index (BOTH per-CPU slot and legacy field!)
+            set_current_slot(next_slot);
             sched.current = next_slot;
 
             // Mark next as running
@@ -1665,6 +1676,7 @@ pub unsafe fn yield_cpu_locked() {
             // We return here when switched back to this task.
             // IMPORTANT: sched.current was changed by whoever switched back to us.
             // We must restore it to OUR slot (caller_slot was saved on stack before switch).
+            set_current_slot(caller_slot);
             sched.current = caller_slot;
 
             // Mark ourselves as Running again

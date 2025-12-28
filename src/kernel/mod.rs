@@ -29,3 +29,4 @@ pub mod caps;
 pub mod lock;
 pub mod percpu;
 pub mod pci;
+pub mod bus;

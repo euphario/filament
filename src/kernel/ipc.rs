@@ -453,6 +453,28 @@ impl ChannelTable {
         self.find_by_id(channel_id).map(|slot| self.endpoints[slot].owner)
     }
 
+    /// Get peer's owner PID
+    pub fn get_peer_owner(&self, channel_id: ChannelId) -> Option<Pid> {
+        let slot = self.find_by_id(channel_id)?;
+        let peer_id = self.endpoints[slot].peer;
+        if peer_id == 0 {
+            return None;
+        }
+        let peer_slot = self.find_by_id(peer_id)?;
+        Some(self.endpoints[peer_slot].owner)
+    }
+
+    /// Get peer's channel ID
+    pub fn get_peer_id(&self, channel_id: ChannelId) -> Option<ChannelId> {
+        let slot = self.find_by_id(channel_id)?;
+        let peer_id = self.endpoints[slot].peer;
+        if peer_id == 0 {
+            None
+        } else {
+            Some(peer_id)
+        }
+    }
+
     /// Check if a channel has messages waiting
     pub fn has_messages(&self, channel_id: ChannelId) -> bool {
         self.find_by_id(channel_id)
@@ -607,13 +629,44 @@ fn sys_send_internal(channel_id: ChannelId, caller: Pid, data: &[u8], direct: bo
     let msg = Message::data(caller, data);
 
     // Hold lock only for ownership check and send, release before waking
-    let blocked_pid = with_channel_table(|table| {
+    // Also get peer info for event notification
+    let (blocked_pid, peer_owner, peer_channel) = with_channel_table(|table| {
         // Verify ownership atomically with send
         if table.get_owner(channel_id) != Some(caller) {
             return Err(IpcError::PermissionDenied);
         }
-        table.send(channel_id, msg)
+        let peer_owner = table.get_peer_owner(channel_id);
+        let peer_channel = table.get_peer_id(channel_id);
+        let blocked = table.send(channel_id, msg)?;
+        Ok((blocked, peer_owner, peer_channel))
     })?;
+
+    // Push IpcReady event to peer's event queue (for event-driven processes)
+    // Do this outside the channel lock to avoid deadlock
+    if let (Some(peer_pid), Some(peer_ch)) = (peer_owner, peer_channel) {
+        // Only push if peer is a userspace process (PID != 0)
+        if peer_pid != 0 {
+            unsafe {
+                let sched = super::task::scheduler();
+                for task_opt in sched.tasks.iter_mut() {
+                    if let Some(ref mut task) = task_opt {
+                        if task.id == peer_pid {
+                            // Check if subscribed to IpcReady events for this channel
+                            let event = super::event::Event::ipc_ready(peer_ch, caller);
+                            if task.event_queue.is_subscribed(&event) {
+                                task.event_queue.push(event);
+                                // Wake task if blocked on event_wait
+                                if task.state == super::task::TaskState::Blocked {
+                                    task.state = super::task::TaskState::Ready;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Wake blocked process outside the channel lock to avoid deadlock
     if let Some(pid) = blocked_pid {
