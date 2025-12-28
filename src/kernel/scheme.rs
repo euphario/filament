@@ -536,7 +536,7 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
                 } else {
                     // Send event to the process (fallback for non-blocking mode)
                     let event = super::event::Event::irq(irq_num);
-                    super::event::send_event(reg.owner_pid, event);
+                    super::event::deliver_event_to_task(reg.owner_pid, event);
                     Some(reg.owner_pid)
                 };
 
@@ -600,7 +600,7 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
 
         // Mark current task as Blocked and switch to another task
         let sched = super::task::scheduler();
-        let caller_slot = sched.current;
+        let caller_slot = super::task::current_slot();
 
         // Mark current as Blocked to exclude it from scheduling
         if let Some(ref mut task) = sched.tasks[caller_slot] {
@@ -615,6 +615,7 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
                     task.trap_frame.elr_el1 = task.trap_frame.elr_el1.wrapping_sub(4);
                 }
 
+                super::task::set_current_slot(next_slot);
                 sched.current = next_slot;
                 if let Some(ref mut task) = sched.tasks[next_slot] {
                     task.state = super::task::TaskState::Running;
@@ -1681,29 +1682,37 @@ fn open_user_scheme(
     }).ok_or(-12)?; // ENOMEM
 
     // Build open request message
-    // Format: flags (4 bytes) + path (remaining bytes)
+    // Format: server_ch (4 bytes) + flags (4 bytes) + path (remaining bytes)
+    // The server_ch is included so the daemon knows where to send responses
     let mut payload = [0u8; ipc::MAX_INLINE_PAYLOAD];
-    payload[0..4].copy_from_slice(&flags.to_le_bytes());
+    payload[0..4].copy_from_slice(&server_ch.to_le_bytes());
+    payload[4..8].copy_from_slice(&flags.to_le_bytes());
     let path_bytes = path.as_bytes();
-    let path_len = core::cmp::min(path_bytes.len(), ipc::MAX_INLINE_PAYLOAD - 4);
-    payload[4..4 + path_len].copy_from_slice(&path_bytes[..path_len]);
+    let path_len = core::cmp::min(path_bytes.len(), ipc::MAX_INLINE_PAYLOAD - 8);
+    payload[8..8 + path_len].copy_from_slice(&path_bytes[..path_len]);
 
     // Create connect message
     let msg = Message {
         header: super::ipc::MessageHeader {
             msg_type: MessageType::Connect,
             sender: caller_pid,
-            msg_id: server_ch, // Send the server channel so daemon knows where to respond
-            payload_len: (4 + path_len) as u32,
+            msg_id: server_ch, // Also in payload for easier access
+            payload_len: (8 + path_len) as u32,
             flags: 0,
         },
         payload,
     };
 
     // Send to daemon's main channel
+    logln!("  scheme_open: sending to daemon_channel={} (path='{}', server_ch={})",
+           daemon_channel, path, server_ch);
     let blocked_pid = ipc::with_channel_table(|table| {
         table.send(daemon_channel, msg)
-    }).map_err(|e| e.to_errno())?;
+    }).map_err(|e| {
+        logln!("  scheme_open: send failed: {:?}", e);
+        e.to_errno()
+    })?;
+    logln!("  scheme_open: sent, blocked_pid={:?}", blocked_pid);
 
     // Wake blocked receiver outside lock
     if let Some(pid) = blocked_pid {

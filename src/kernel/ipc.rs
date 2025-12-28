@@ -643,24 +643,25 @@ fn sys_send_internal(channel_id: ChannelId, caller: Pid, data: &[u8], direct: bo
 
     // Push IpcReady event to peer's event queue (for event-driven processes)
     // Do this outside the channel lock to avoid deadlock
+    // SECURITY: Use IrqGuard to prevent preemption during scheduler access
     if let (Some(peer_pid), Some(peer_ch)) = (peer_owner, peer_channel) {
         // Only push if peer is a userspace process (PID != 0)
         if peer_pid != 0 {
+            // Disable IRQs to prevent preemption during scheduler modification
+            let _guard = crate::arch::aarch64::sync::IrqGuard::new();
             unsafe {
                 let sched = super::task::scheduler();
-                for task_opt in sched.tasks.iter_mut() {
-                    if let Some(ref mut task) = task_opt {
-                        if task.id == peer_pid {
-                            // Check if subscribed to IpcReady events for this channel
-                            let event = super::event::Event::ipc_ready(peer_ch, caller);
-                            if task.event_queue.is_subscribed(&event) {
-                                task.event_queue.push(event);
-                                // Wake task if blocked on event_wait
-                                if task.state == super::task::TaskState::Blocked {
-                                    task.state = super::task::TaskState::Ready;
-                                }
+                // Use generation-aware PID lookup to prevent TOCTOU
+                if let Some(slot) = sched.slot_by_pid(peer_pid) {
+                    if let Some(ref mut task) = sched.tasks[slot] {
+                        // Check if subscribed to IpcReady events for this channel
+                        let event = super::event::Event::ipc_ready(peer_ch, caller);
+                        if task.event_queue.is_subscribed(&event) {
+                            task.event_queue.push(event);
+                            // Wake task if blocked on event_wait
+                            if task.state == super::task::TaskState::Blocked {
+                                task.state = super::task::TaskState::Ready;
                             }
-                            break;
                         }
                     }
                 }

@@ -1594,21 +1594,7 @@ fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
     unsafe {
         let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
-            // First check for pending events in global system
-            let pid = task.id;
-            if let Some(event) = super::event::event_system().get_pending_for(pid) {
-                // Copy event to user buffer via page table translation
-                let event_bytes = core::slice::from_raw_parts(
-                    &event as *const super::event::Event as *const u8,
-                    event_size
-                );
-                if let Err(e) = uaccess::copy_to_user(event_buf, event_bytes) {
-                    return uaccess_to_errno(e);
-                }
-                return 1;
-            }
-
-            // Check task's event queue
+            // Check task's event queue directly (no global system)
             if let Some(event) = task.event_queue.pop() {
                 let event_bytes = core::slice::from_raw_parts(
                     &event as *const super::event::Event as *const u8,

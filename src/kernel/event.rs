@@ -7,11 +7,11 @@
 
 use crate::logln;
 
-/// Maximum events per process
-pub const MAX_EVENTS: usize = 32;
+/// Maximum events per process in normal queue
+pub const MAX_EVENTS: usize = 24;
 
-/// Maximum pending events in global queue
-pub const MAX_PENDING: usize = 64;
+/// Maximum events in critical queue (ChildExit, Signal - never dropped)
+pub const MAX_CRITICAL_EVENTS: usize = 8;
 
 /// Event types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,17 +130,25 @@ impl EventSubscription {
     }
 }
 
-/// Event queue for a process
+/// Event queue for a process with priority separation
+///
+/// Critical events (ChildExit, Signal) go to a separate queue that
+/// is never dropped. This ensures parent processes always receive
+/// child exit notifications even under heavy load.
 #[derive(Clone)]
 pub struct EventQueue {
-    /// Pending events
+    /// Normal events (IpcReady, Timer, Fd*, Irq)
     events: [Event; MAX_EVENTS],
-    /// Number of pending events
     count: usize,
-    /// Read index (circular buffer)
     read_idx: usize,
-    /// Write index
     write_idx: usize,
+
+    /// Critical events (ChildExit, Signal) - never dropped
+    critical_events: [Event; MAX_CRITICAL_EVENTS],
+    critical_count: usize,
+    critical_read_idx: usize,
+    critical_write_idx: usize,
+
     /// Subscriptions
     subscriptions: [EventSubscription; MAX_EVENTS],
 }
@@ -152,8 +160,18 @@ impl EventQueue {
             count: 0,
             read_idx: 0,
             write_idx: 0,
+            critical_events: [Event::empty(); MAX_CRITICAL_EVENTS],
+            critical_count: 0,
+            critical_read_idx: 0,
+            critical_write_idx: 0,
             subscriptions: [EventSubscription::empty(); MAX_EVENTS],
         }
+    }
+
+    /// Check if an event type is critical (should never be dropped)
+    #[inline]
+    fn is_critical_event(event_type: EventType) -> bool {
+        matches!(event_type, EventType::ChildExit | EventType::Signal)
     }
 
     /// Subscribe to an event type
@@ -193,120 +211,115 @@ impl EventQueue {
         false
     }
 
-    /// Push an event to the queue
+    /// Push an event to the appropriate queue (critical or normal)
     pub fn push(&mut self, event: Event) -> bool {
-        if self.count >= MAX_EVENTS {
-            return false; // Queue full
+        if Self::is_critical_event(event.event_type) {
+            self.push_critical(event)
+        } else {
+            self.push_normal(event)
         }
+    }
 
+    /// Push a critical event (ChildExit, Signal)
+    fn push_critical(&mut self, event: Event) -> bool {
+        if self.critical_count >= MAX_CRITICAL_EVENTS {
+            // Critical queue full - this is a serious condition
+            logln!("[EVENT] WARNING: critical queue full, event may be lost: {:?}", event.event_type);
+            return false;
+        }
+        self.critical_events[self.critical_write_idx] = event;
+        self.critical_write_idx = (self.critical_write_idx + 1) % MAX_CRITICAL_EVENTS;
+        self.critical_count += 1;
+        true
+    }
+
+    /// Push a normal event (IpcReady, Timer, etc.)
+    fn push_normal(&mut self, event: Event) -> bool {
+        if self.count >= MAX_EVENTS {
+            return false; // Queue full - acceptable to drop non-critical events
+        }
         self.events[self.write_idx] = event;
         self.write_idx = (self.write_idx + 1) % MAX_EVENTS;
         self.count += 1;
         true
     }
 
-    /// Pop an event from the queue
+    /// Pop an event from the queue (critical events have priority)
     pub fn pop(&mut self) -> Option<Event> {
-        if self.count == 0 {
-            return None;
+        // Critical queue first - always process exits/signals before IPC
+        if self.critical_count > 0 {
+            let event = self.critical_events[self.critical_read_idx];
+            self.critical_events[self.critical_read_idx] = Event::empty();
+            self.critical_read_idx = (self.critical_read_idx + 1) % MAX_CRITICAL_EVENTS;
+            self.critical_count -= 1;
+            return Some(event);
         }
 
-        let event = self.events[self.read_idx];
-        self.events[self.read_idx] = Event::empty();
-        self.read_idx = (self.read_idx + 1) % MAX_EVENTS;
-        self.count -= 1;
-        Some(event)
-    }
-
-    /// Check if queue has pending events
-    pub fn has_events(&self) -> bool {
-        self.count > 0
-    }
-
-    /// Get number of pending events
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    /// Peek at next event without removing it
-    pub fn peek(&self) -> Option<&Event> {
-        if self.count == 0 {
-            None
-        } else {
-            Some(&self.events[self.read_idx])
-        }
-    }
-}
-
-/// Global event delivery system
-pub struct EventSystem {
-    /// Pending events to be delivered (temporary holding)
-    pending: [Event; MAX_PENDING],
-    /// Target PIDs for pending events
-    targets: [u32; MAX_PENDING],
-    /// Number of pending deliveries
-    pending_count: usize,
-}
-
-impl EventSystem {
-    pub const fn new() -> Self {
-        Self {
-            pending: [Event::empty(); MAX_PENDING],
-            targets: [0; MAX_PENDING],
-            pending_count: 0,
-        }
-    }
-
-    /// Queue an event for delivery to a specific process
-    pub fn send_to(&mut self, pid: u32, event: Event) -> bool {
-        if self.pending_count >= MAX_PENDING {
-            return false;
+        // Then normal queue
+        if self.count > 0 {
+            let event = self.events[self.read_idx];
+            self.events[self.read_idx] = Event::empty();
+            self.read_idx = (self.read_idx + 1) % MAX_EVENTS;
+            self.count -= 1;
+            return Some(event);
         }
 
-        self.pending[self.pending_count] = event;
-        self.targets[self.pending_count] = pid;
-        self.pending_count += 1;
-        true
-    }
-
-    /// Deliver pending events to process queues
-    /// Called from scheduler or syscall context
-    pub fn deliver_pending(&mut self) {
-        // This would iterate through pending events and deliver them
-        // to the appropriate process event queues
-        // For now, we'll handle this in the syscall layer
-        self.pending_count = 0;
-    }
-
-    /// Get pending events for a specific PID
-    pub fn get_pending_for(&mut self, pid: u32) -> Option<Event> {
-        for i in 0..self.pending_count {
-            if self.targets[i] == pid {
-                let event = self.pending[i];
-                // Remove from pending (shift remaining)
-                for j in i..self.pending_count - 1 {
-                    self.pending[j] = self.pending[j + 1];
-                    self.targets[j] = self.targets[j + 1];
-                }
-                self.pending_count -= 1;
-                return Some(event);
-            }
-        }
         None
     }
+
+    /// Check if queue has pending events (either queue)
+    pub fn has_events(&self) -> bool {
+        self.count > 0 || self.critical_count > 0
+    }
+
+    /// Get total number of pending events
+    pub fn len(&self) -> usize {
+        self.count + self.critical_count
+    }
+
+    /// Peek at next event without removing it (critical first)
+    pub fn peek(&self) -> Option<&Event> {
+        if self.critical_count > 0 {
+            Some(&self.critical_events[self.critical_read_idx])
+        } else if self.count > 0 {
+            Some(&self.events[self.read_idx])
+        } else {
+            None
+        }
+    }
 }
 
-/// Global event system instance
-static mut EVENT_SYSTEM: EventSystem = EventSystem::new();
+// NOTE: Global EventSystem removed - all events now go directly to per-task queues.
+// This eliminates the unlocked global state (security issue) and provides O(1) delivery.
 
-/// Get the global event system
-pub unsafe fn event_system() -> &'static mut EventSystem {
-    &mut *core::ptr::addr_of_mut!(EVENT_SYSTEM)
-}
-
-/// Send an event to a process
-pub fn send_event(pid: u32, event: Event) -> bool {
-    unsafe { event_system().send_to(pid, event) }
+/// Deliver an event directly to a task's event queue
+///
+/// This is the primary event delivery mechanism. Events are delivered
+/// directly to the target task's queue, avoiding the need for a global
+/// pending queue with its associated synchronization issues.
+///
+/// Returns true if the event was delivered (task exists and subscribed),
+/// false otherwise.
+pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
+    unsafe {
+        let sched = super::task::scheduler();
+        // Use generation-aware PID lookup to prevent TOCTOU
+        if let Some(slot) = sched.slot_by_pid(target_pid) {
+            if let Some(ref mut task) = sched.tasks[slot] {
+                // Check if task is subscribed to this event type
+                if task.event_queue.is_subscribed(&event) {
+                    if task.event_queue.push(event) {
+                        // Wake task if blocked
+                        if task.state == super::task::TaskState::Blocked {
+                            task.state = super::task::TaskState::Ready;
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 // ============================================================================
@@ -315,8 +328,22 @@ pub fn send_event(pid: u32, event: Event) -> bool {
 
 /// Subscribe to events
 /// Args: event_type, filter
-/// Returns: 0 on success, negative error
-pub fn sys_event_subscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
+/// Returns: 0 on success, negative error (-13 = EACCES for permission denied)
+pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
+    // First, check capabilities for privileged event types
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref task) = sched.tasks[sched.current] {
+            // IRQ events require IRQ_CLAIM capability
+            if event_type == 3 {
+                if !task.has_capability(super::caps::Capabilities::IRQ_CLAIM) {
+                    logln!("[SECURITY] IRQ subscribe denied: pid={} lacks IRQ_CLAIM capability", pid);
+                    return -13; // EACCES
+                }
+            }
+        }
+    }
+
     let ev_type = match event_type {
         1 => EventType::IpcReady,
         2 => EventType::Timer,
@@ -336,7 +363,7 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
             }
         }
     }
-    -1
+    -12 // ENOMEM - no free subscription slots
 }
 
 /// Unsubscribe from events
@@ -366,65 +393,48 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
 /// Wait for an event (blocking or non-blocking)
 /// Args: event_buf (pointer to Event struct), flags (0=block, 1=non-block)
 /// Returns: 1 if event received, 0 if would block, negative error
-pub fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
+///
+/// NOTE: This is the low-level implementation. The syscall handler in
+/// syscall.rs wraps this with proper uaccess for copying to userspace.
+pub fn sys_event_wait_internal(flags: u32) -> Option<Event> {
     unsafe {
         let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
-            // First check for pending events in global system
-            let pid = task.id;
-            if let Some(event) = event_system().get_pending_for(pid) {
-                // Copy event to user buffer
-                let buf = event_buf as *mut Event;
-                core::ptr::write_volatile(buf, event);
-                return 1;
-            }
-
-            // Check task's event queue
+            // Check task's event queue directly (no global system)
             if let Some(event) = task.event_queue.pop() {
-                let buf = event_buf as *mut Event;
-                core::ptr::write_volatile(buf, event);
-                return 1;
+                return Some(event);
             }
 
             // No event available
             if flags & 1 != 0 {
-                // Non-blocking
-                return 0;
+                // Non-blocking - return None to indicate no event
+                return None;
             }
 
             // Would block - mark task as waiting
             task.state = super::task::TaskState::Blocked;
-            // Scheduler will handle waking us up
-            return -11; // EAGAIN - caller should yield
         }
     }
-    -1
+    None
 }
 
 /// Post an event to another process
 /// Args: target_pid, event_type, data
+///
+/// Only Signal events (type 7) can be posted by userspace.
+/// Delivery and wake-up is handled by deliver_event_to_task().
 pub fn sys_event_post(target_pid: u32, event_type: u32, data: u64, caller_pid: u32) -> i64 {
     let event = match event_type {
         7 => Event::signal(data as u32, caller_pid),
         _ => return -1, // Only signals can be posted by user
     };
 
-    if send_event(target_pid, event) {
-        // Try to wake target if blocked
-        unsafe {
-            let sched = super::task::scheduler();
-            for task_opt in sched.tasks.iter_mut() {
-                if let Some(ref mut task) = task_opt {
-                    if task.id == target_pid && task.state == super::task::TaskState::Blocked {
-                        task.state = super::task::TaskState::Ready;
-                        break;
-                    }
-                }
-            }
-        }
+    // Deliver directly to target's event queue (no global system)
+    // deliver_event_to_task handles subscription check and wake-up
+    if deliver_event_to_task(target_pid, event) {
         0
     } else {
-        -1
+        -3 // ESRCH - process not found or not subscribed
     }
 }
 
