@@ -281,18 +281,36 @@ impl BusType {
 // =============================================================================
 
 /// Bus controller states
+/// Bus State Machine
+///
+/// ```text
+///                    ┌─────────────────────────────────┐
+///                    │                                 │
+///                    ▼                                 │
+///   ┌──────┐  driver claims   ┌─────────┐  owner crashes/exits
+///   │ Safe │ ───────────────► │ Claimed │ ─────────────┘
+///   └──────┘                  └─────────┘
+///       ▲                          │
+///       │                          │ driver requests reset
+///       │      ┌───────────┐       │
+///       └───── │ Resetting │ ◄─────┘
+///              └───────────┘
+/// ```
+///
+/// **Key invariant**: Drivers can ONLY claim a bus from `Safe` state.
+/// When owner exits/crashes, bus auto-resets to `Safe` for next driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BusState {
-    /// Bus in safe mode - no DMA possible, waiting for devd to connect
+    /// Bus in safe mode - no DMA possible, driver can claim
     /// Invariants: bus_mastering=false, iommu_mappings=empty, owner=None
     Safe = 0,
 
-    /// Bus owned by devd, normal operation
+    /// Bus owned by driver, normal operation
     /// Invariants: owner.is_some()
     Claimed = 1,
 
-    /// Nuclear reset in progress
+    /// Hardware reset in progress
     /// Invariants: owner=None, actively resetting hardware
     Resetting = 2,
 }
@@ -355,6 +373,10 @@ pub enum BusControlMsgType {
 
     /// Atomic handoff to new owner (for live update)
     Handoff = 21,
+
+    /// Set driver PID (devd tells kernel which process is using the bus)
+    /// When this PID exits, kernel auto-resets bus and notifies devd
+    SetDriver = 22,
 
     // ─── Responses ───
 
@@ -419,6 +441,10 @@ pub enum StateChangeReason {
     ResetComplete = 4,
     /// Handoff to new owner
     Handoff = 5,
+    /// Driver claimed bus via SetDriver
+    DriverClaimed = 6,
+    /// Driver process exited
+    DriverExited = 7,
 }
 
 // =============================================================================
@@ -456,6 +482,11 @@ pub struct BusController {
     /// Owner's PID (for cleanup on process exit)
     pub owner_pid: Option<Pid>,
 
+    /// Driver PID - the actual process using the hardware
+    /// Set by devd via SetDriver message. When this PID exits,
+    /// kernel auto-resets bus and notifies devd via owner_channel.
+    pub driver_pid: Option<Pid>,
+
     /// Control port name (e.g., "/kernel/bus/pcie0")
     pub port_name: [u8; 32],
     pub port_name_len: usize,
@@ -483,6 +514,7 @@ impl BusController {
             state_entered_at: 0,
             owner_channel: None,
             owner_pid: None,
+            driver_pid: None,
             port_name: [0; 32],
             port_name_len: 0,
             listen_channel: None,
@@ -552,18 +584,18 @@ impl BusController {
     pub fn check_invariants(&self) -> bool {
         match self.state {
             BusState::Safe => {
-                self.owner_channel.is_none() &&
-                self.owner_pid.is_none() &&
+                // Safe: bus mastering off, owner (devd) MAY be connected
+                // Owner stays connected so it can receive notifications and restart drivers
                 !self.bus_master_enabled
-                // Note: devices may still be tracked, but bus mastering should be off
             }
             BusState::Claimed => {
+                // Claimed: owner must be connected, driver is managing hardware
                 self.owner_channel.is_some() &&
                 self.owner_pid.is_some()
             }
             BusState::Resetting => {
-                self.owner_channel.is_none() &&
-                self.owner_pid.is_none()
+                // Resetting: temporary state, owner stays so we can notify after reset
+                !self.bus_master_enabled
             }
         }
     }
@@ -585,8 +617,9 @@ impl BusController {
         // Enforce invariants based on new state
         match new_state {
             BusState::Safe => {
-                self.owner_channel = None;
-                self.owner_pid = None;
+                // Keep owner_channel/owner_pid - devd stays connected to manage bus
+                // Only clear driver_pid (driver is gone)
+                self.driver_pid = None;
                 self.bus_master_enabled = false;
                 self.disable_all_bus_mastering();
             }
@@ -594,8 +627,9 @@ impl BusController {
                 // Owner should already be set before calling transition
             }
             BusState::Resetting => {
-                self.owner_channel = None;
-                self.owner_pid = None;
+                // Keep owner_channel/owner_pid - need to notify after reset
+                // Clear driver since it crashed
+                self.driver_pid = None;
                 self.bus_master_enabled = false;
                 self.disable_all_bus_mastering();
             }
@@ -660,6 +694,36 @@ impl BusController {
 
             // Reset complete - go to SAFE
             self.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
+        }
+    }
+
+    /// Handle driver process exit
+    ///
+    /// Called when the driver_pid process exits. Resets the bus and notifies
+    /// the supervisor (devd) via owner_channel so it can restart the driver.
+    pub fn handle_driver_exit(&mut self, driver_pid: Pid) {
+        logln!("  Bus {}: driver PID {} exited, resetting bus",
+               self.port_name_str(), driver_pid);
+
+        // Clear driver_pid
+        self.driver_pid = None;
+
+        // Reset bus if claimed
+        if self.state == BusState::Claimed {
+            self.transition_to(BusState::Resetting, StateChangeReason::DriverExited);
+            self.perform_hardware_reset();
+            self.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
+        }
+
+        // Notify supervisor (devd) via owner_channel that bus is Safe
+        // This wakes devd so it can restart the driver
+        if let Some(channel) = self.owner_channel {
+            logln!("  Bus {}: notifying supervisor on channel {}",
+                   self.port_name_str(), channel);
+            if let Err(e) = self.send_state_snapshot(channel) {
+                logln!("  Bus {}: failed to notify supervisor: {:?}",
+                       self.port_name_str(), e);
+            }
         }
     }
 
@@ -941,16 +1005,18 @@ impl BusController {
         logln!("    USB{}: MAC=0x{:08x} IPPC=0x{:08x}", index, mac_base, ippc_base);
 
         // Step 1: Reset the whole SSUSB IP
+        // CRITICAL: This stops xHCI DMA. We must wait for in-flight DMA to complete
+        // before freeing any DMA buffers (shmem), otherwise freed pages get corrupted.
         logln!("    Step 1: IP software reset...");
         let ctrl0 = ippc.read32(usb_hw::IP_PW_CTRL0);
         logln!("      CTRL0 before: 0x{:08x}", ctrl0);
         ippc.write32(usb_hw::IP_PW_CTRL0, ctrl0 | usb_hw::CTRL0_IP_SW_RST);
         dsb();
-        delay_us(1);
+        delay_us(10);  // Hold reset active
         ippc.write32(usb_hw::IP_PW_CTRL0, ctrl0 & !usb_hw::CTRL0_IP_SW_RST);
         dsb();
-        delay_us(100);  // Allow reset to complete
-        logln!("      IP reset complete");
+        delay_ms(1);  // Wait for in-flight DMA to complete (1ms safety margin)
+        logln!("      IP reset complete, DMA quiesced");
 
         // Step 2: Power down device IP (we only want host mode)
         logln!("    Step 2: Power down device IP...");
@@ -1148,10 +1214,6 @@ impl BusController {
 
     /// Handle a control message from devd
     pub fn handle_message(&mut self, msg: &Message) -> Result<(), BusError> {
-        if self.state != BusState::Claimed {
-            return Err(BusError::NotClaimed);
-        }
-
         if msg.header.payload_len == 0 {
             return Err(BusError::InvalidMessage);
         }
@@ -1160,6 +1222,10 @@ impl BusController {
 
         match msg_type {
             x if x == BusControlMsgType::EnableBusMastering as u8 => {
+                // Requires Claimed state
+                if self.state != BusState::Claimed {
+                    return Err(BusError::NotClaimed);
+                }
                 // payload[1..3] = device_id
                 if msg.header.payload_len < 3 {
                     return Err(BusError::InvalidMessage);
@@ -1168,6 +1234,10 @@ impl BusController {
                 self.enable_bus_mastering(device_id)
             }
             x if x == BusControlMsgType::DisableBusMastering as u8 => {
+                // Requires Claimed state
+                if self.state != BusState::Claimed {
+                    return Err(BusError::NotClaimed);
+                }
                 if msg.header.payload_len < 3 {
                     return Err(BusError::InvalidMessage);
                 }
@@ -1175,8 +1245,15 @@ impl BusController {
                 self.disable_bus_mastering(device_id)
             }
             x if x == BusControlMsgType::RequestReset as u8 => {
-                // Owner is requesting hardware reset
-                logln!("  Bus {}: reset requested by owner", self.port_name_str());
+                // Reset can be requested from Claimed OR Safe state
+                // Always perform full hardware reset - devd knows best
+                if self.state == BusState::Resetting {
+                    // Already resetting - don't nest
+                    return Err(BusError::Busy);
+                }
+
+                logln!("  Bus {}: reset requested (current state: {:?})",
+                       self.port_name_str(), self.state);
 
                 // Transition to Resetting state
                 self.transition_to(BusState::Resetting, StateChangeReason::ResetRequested);
@@ -1184,12 +1261,34 @@ impl BusController {
                 // Perform actual hardware reset
                 self.perform_hardware_reset();
 
-                // Transition back to Safe (driver should reconnect)
+                // Transition to Safe (driver can now claim)
                 self.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
 
                 // Clear owner info - they need to reconnect
                 self.owner_channel = None;
                 self.owner_pid = None;
+
+                Ok(())
+            }
+            x if x == BusControlMsgType::SetDriver as u8 => {
+                // devd tells us which PID is the actual driver
+                // When this PID exits, we auto-reset and notify devd
+                if msg.header.payload_len < 5 {
+                    return Err(BusError::InvalidMessage);
+                }
+                let driver_pid = u32::from_le_bytes([
+                    msg.payload[1], msg.payload[2], msg.payload[3], msg.payload[4]
+                ]);
+
+                logln!("  Bus {}: driver PID set to {} (supervisor PID {:?})",
+                       self.port_name_str(), driver_pid, self.owner_pid);
+
+                self.driver_pid = Some(driver_pid);
+
+                // Transition to Claimed state now that we have a driver
+                if self.state == BusState::Safe {
+                    self.transition_to(BusState::Claimed, StateChangeReason::DriverClaimed);
+                }
 
                 Ok(())
             }
@@ -1496,7 +1595,14 @@ impl BusRegistry {
     /// Process cleanup when a process exits
     pub fn process_cleanup(&mut self, pid: Pid) {
         for bus in self.buses[..self.bus_count].iter_mut() {
-            if bus.owner_pid == Some(pid) {
+            // Check if this is the driver (usbd, etc.)
+            // If so, reset bus and notify supervisor (devd)
+            if bus.driver_pid == Some(pid) {
+                bus.handle_driver_exit(pid);
+            }
+            // Check if this is the supervisor (devd)
+            // If so, trigger full disconnect
+            else if bus.owner_pid == Some(pid) {
                 logln!("  Bus {}: owner PID {} exited, triggering disconnect",
                        bus.port_name_str(), pid);
                 bus.handle_disconnect(StateChangeReason::OwnerCrashed);
@@ -1508,10 +1614,11 @@ impl BusRegistry {
     pub fn print_info(&self) {
         logln!("  Bus controllers:");
         for bus in self.buses[..self.bus_count].iter() {
-            logln!("    {} state={:?} owner={:?} verified={}",
+            logln!("    {} state={:?} owner={:?} driver={:?} verified={}",
                    bus.port_name_str(),
                    bus.state,
                    bus.owner_pid,
+                   bus.driver_pid,
                    bus.hardware_verified);
         }
     }

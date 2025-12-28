@@ -114,12 +114,31 @@ impl PhysicalMemoryManager {
     /// Push a page onto the free list (O(1))
     #[inline]
     fn push_free_list(&mut self, phys_addr: usize) {
+        // Validate address before pushing
+        if phys_addr < DRAM_START || phys_addr >= DRAM_END {
+            logln!("[PMM] ERROR: push_free_list invalid addr=0x{:x}", phys_addr);
+            return;
+        }
+        if phys_addr & (PAGE_SIZE - 1) != 0 {
+            logln!("[PMM] ERROR: push_free_list unaligned addr=0x{:x}", phys_addr);
+            return;
+        }
+
         // Store current head in the page's first 8 bytes
         // Access via kernel virtual address (TTBR1 mapping)
         let virt_addr = mmu::phys_to_virt(phys_addr as u64);
         let ptr = virt_addr as *mut usize;
+        let old_head = self.free_list_head;
         unsafe {
-            core::ptr::write_volatile(ptr, self.free_list_head);
+            core::ptr::write_volatile(ptr, old_head);
+            // Data synchronization barrier to ensure write completes
+            core::arch::asm!("dsb sy");
+            // Verify write
+            let readback = core::ptr::read_volatile(ptr);
+            if readback != old_head {
+                logln!("[PMM] WRITE FAILED: wrote 0x{:x} to 0x{:x}, read back 0x{:x}",
+                       old_head, phys_addr, readback);
+            }
         }
         self.free_list_head = phys_addr;
     }
@@ -131,12 +150,34 @@ impl PhysicalMemoryManager {
             return None;
         }
         let phys_addr = self.free_list_head;
+
+        // Validate free_list_head is in DRAM range before dereferencing
+        if phys_addr < DRAM_START || phys_addr >= DRAM_END {
+            logln!("[PMM] CORRUPTION: free_list_head=0x{:x} outside DRAM!", phys_addr);
+            panic!("PMM free list corrupted");
+        }
+        // Check page alignment
+        if phys_addr & (PAGE_SIZE - 1) != 0 {
+            logln!("[PMM] CORRUPTION: free_list_head=0x{:x} not page-aligned!", phys_addr);
+            panic!("PMM free list corrupted");
+        }
+
         // Read next pointer from the page via kernel virtual address (TTBR1 mapping)
         let virt_addr = mmu::phys_to_virt(phys_addr as u64);
         let ptr = virt_addr as *const usize;
         unsafe {
             self.free_list_head = core::ptr::read_volatile(ptr);
         }
+
+        // Validate new head (if non-zero)
+        if self.free_list_head != 0 {
+            if self.free_list_head < DRAM_START || self.free_list_head >= DRAM_END {
+                logln!("[PMM] CORRUPTION detected after pop: new head=0x{:x} from page 0x{:x}",
+                       self.free_list_head, phys_addr);
+                panic!("PMM free list corrupted");
+            }
+        }
+
         Some(phys_addr)
     }
 
@@ -150,9 +191,34 @@ impl PhysicalMemoryManager {
             // Check if page is actually free (not stale entry from contiguous alloc)
             if self.is_free(page_idx) {
                 self.mark_used_no_list(page_idx);
+                // Debug: log when specific page is allocated
+                if phys_addr == 0x4006c000 {
+                    logln!("[PMM] Allocating page 0x4006c000!");
+                }
                 return Some(phys_addr);
             }
             // Stale entry - continue to next
+        }
+    }
+
+    /// Rebuild the free list from scratch using the bitmap
+    /// This removes any stale entries that might have corrupted pointers
+    fn rebuild_free_list(&mut self) {
+        self.free_list_head = 0;
+        // Walk bitmap and rebuild free list
+        // We iterate in reverse so lower addresses end up at the head
+        // (better for locality when allocating)
+        for page_idx in (0..self.total_pages).rev() {
+            if self.is_free(page_idx) {
+                let phys_addr = DRAM_START + page_idx * PAGE_SIZE;
+                // Store current head in the page's first 8 bytes
+                let virt_addr = mmu::phys_to_virt(phys_addr as u64);
+                let ptr = virt_addr as *mut usize;
+                unsafe {
+                    core::ptr::write_volatile(ptr, self.free_list_head);
+                }
+                self.free_list_head = phys_addr;
+            }
         }
     }
 
@@ -178,12 +244,16 @@ impl PhysicalMemoryManager {
                 consecutive += 1;
                 if consecutive == count {
                     // Found enough contiguous pages, mark them used in bitmap
-                    // Note: pages remain on free list as stale entries
-                    // alloc_page will skip them via bitmap check
                     for i in start_page..(start_page + count) {
                         self.mark_used_no_list(i);
                     }
                     let phys_addr = DRAM_START + start_page * PAGE_SIZE;
+
+                    // CRITICAL: Rebuild free list to remove stale entries
+                    // Without this, stale entries pointing to now-used pages will have
+                    // their "next pointer" corrupted when the page is written to (e.g., ELF code)
+                    self.rebuild_free_list();
+
                     return Some(phys_addr);
                 }
             } else {
@@ -201,8 +271,14 @@ impl PhysicalMemoryManager {
         let page_idx = (phys_addr - DRAM_START) / PAGE_SIZE;
         // Only free if currently allocated (avoid double-free)
         if !self.is_free(page_idx) {
+            // Debug: log when specific page is freed
+            if phys_addr == 0x4006c000 {
+                logln!("[PMM] Freeing page 0x4006c000!");
+            }
             self.mark_free_no_list(page_idx);
             self.push_free_list(phys_addr);
+        } else if phys_addr == 0x4006c000 {
+            logln!("[PMM] DOUBLE-FREE attempt on 0x4006c000 (already free)");
         }
     }
 

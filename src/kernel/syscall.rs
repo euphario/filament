@@ -406,11 +406,12 @@ fn sys_exit(code: i32) -> i64 {
         };
 
         // Clean up process resources
+        // CRITICAL: bus cleanup MUST come FIRST to stop DMA before freeing buffers!
+        super::bus::process_cleanup(pid);
         super::shmem::process_cleanup(pid);
         super::scheme::process_cleanup(pid);
         super::pci::release_all_devices(pid);
         super::port::process_cleanup(pid);
-        super::bus::process_cleanup(pid);
 
         // Close all file descriptors (releases scheme handles, channels, etc.)
         if let Some(ref mut task) = sched.tasks[current_slot] {
@@ -1830,11 +1831,12 @@ fn sys_kill(pid: u32) -> i64 {
         }
 
         // Clean up process resources (same as sys_exit)
+        // CRITICAL: bus cleanup MUST come FIRST to stop DMA before freeing buffers!
+        super::bus::process_cleanup(pid);
         super::shmem::process_cleanup(pid);
         super::scheme::process_cleanup(pid);
         super::pci::release_all_devices(pid);
         super::port::process_cleanup(pid);
-        super::bus::process_cleanup(pid);
 
         // Close all file descriptors and mark as terminated
         if let Some(ref mut task) = sched.tasks[slot] {
@@ -1843,11 +1845,13 @@ fn sys_kill(pid: u32) -> i64 {
             task.state = super::task::TaskState::Terminated;
         }
 
-        // Send ChildExit event to parent (always, regardless of parent state)
+        // Send ChildExit event to parent and remove from child list
         if parent_id != 0 {
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut task) = task_opt {
                     if task.id == parent_id {
+                        // Remove from parent's child list
+                        task.remove_child(pid);
                         // Queue ChildExit event
                         let event = super::event::Event::child_exit(pid, -9);
                         task.event_queue.push(event);
@@ -1859,6 +1863,8 @@ fn sys_kill(pid: u32) -> i64 {
                     }
                 }
             }
+            // Task has parent but will be reaped by reap_terminated
+            // (parent receives event but doesn't need to call wait())
         } else {
             // Orphan process (no parent)
             // If killing a DIFFERENT task, we can free it immediately
