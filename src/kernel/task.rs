@@ -361,6 +361,12 @@ pub struct Task {
     pub wait_reason: Option<WaitReason>,
     /// Timer tick count at which to wake this task (0 = no timeout)
     pub wake_at: u64,
+    /// Timer tick count at which to deliver Timer event (0 = no timer)
+    /// Set via timer_set syscall, delivers EventType::Timer when reached
+    pub timer_deadline: u64,
+    /// Last heartbeat tick count (0 = never sent heartbeat)
+    /// Privileged processes should send heartbeats periodically
+    pub last_heartbeat: u64,
     /// Capability set for this task
     pub capabilities: super::caps::Capabilities,
     /// Signal allowlist - PIDs allowed to send signals to this process
@@ -419,6 +425,8 @@ impl Task {
             exit_code: 0,
             wait_reason: None,
             wake_at: 0,
+            timer_deadline: 0,
+            last_heartbeat: 0,
             capabilities: super::caps::Capabilities::ALL,  // Kernel tasks get all capabilities
             signal_allowlist: [0; MAX_SIGNAL_SENDERS],
             signal_allowlist_count: 0,  // Allow from all (kernel tasks)
@@ -475,6 +483,8 @@ impl Task {
             exit_code: 0,
             wait_reason: None,
             wake_at: 0,
+            timer_deadline: 0,
+            last_heartbeat: 0,
             capabilities: super::caps::Capabilities::DRIVER_DEFAULT,  // User tasks default to driver caps
             signal_allowlist: [0; MAX_SIGNAL_SENDERS],
             signal_allowlist_count: 0,  // Allow from all (backwards compat)
@@ -1083,19 +1093,35 @@ impl Scheduler {
         false
     }
 
-    /// Check for timed-out blocked tasks and wake them
+    /// Check for timed-out blocked tasks, deliver timer events, and wake them
     /// Called from timer tick handler
     /// Returns number of tasks woken
     pub fn check_timeouts(&mut self, current_tick: u64) -> usize {
         let mut woken = 0;
         for task_opt in self.tasks.iter_mut() {
             if let Some(ref mut task) = task_opt {
+                // Check blocking timeout (for receive with timeout, etc.)
                 if task.state == TaskState::Blocked && task.wake_at != 0 {
                     if current_tick >= task.wake_at {
                         // Timeout expired - wake the task
                         task.state = TaskState::Ready;
                         task.wait_reason = None;
                         task.wake_at = 0;
+                        woken += 1;
+                    }
+                }
+
+                // Check timer_deadline - deliver Timer event if reached
+                // This works for both Blocked and Ready tasks
+                if task.timer_deadline != 0 && current_tick >= task.timer_deadline {
+                    // Deliver Timer event to task's event queue
+                    let timer_event = super::event::Event::timer(task.timer_deadline);
+                    task.event_queue.push(timer_event);
+                    task.timer_deadline = 0;  // Clear (one-shot timer)
+
+                    // Wake task if blocked
+                    if task.state == TaskState::Blocked {
+                        task.state = TaskState::Ready;
                         woken += 1;
                     }
                 }
@@ -1628,10 +1654,15 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     } else if current_blocked {
         // Current task is blocked but no other task is ready
         // We MUST wait for an interrupt to wake something up
-        // Re-enable IRQs and wait in a loop
         drop(_guard);
 
         loop {
+            // CRITICAL: Explicitly enable IRQs before WFI!
+            // After syscall, hardware leaves IRQs disabled (PSTATE.I set).
+            // IrqGuard saw them disabled, so drop() didn't re-enable them.
+            // We must enable IRQs here or WFI will wait forever.
+            core::arch::asm!("msr daifclr, #2");  // Clear I bit = enable IRQs
+
             // Wait for interrupt - timer tick or device IRQ will wake a task
             core::arch::asm!("wfi");
 
@@ -1657,102 +1688,12 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     }
 }
 
-/// Yield CPU to another task (callable from kernel code like schemes)
-/// This switches to another ready task while keeping current task in its current state
-/// (Ready or Blocked depending on what caller set).
-///
-/// When the yielded task is scheduled again, this function returns.
-///
-/// This is the safe variant that handles IRQ disabling internally.
-/// # Safety
-/// Must be called from kernel context (not IRQ handlers).
-pub unsafe fn yield_cpu() {
-    // Use IrqGuard to ensure IRQs are disabled during the switch.
-    // The guard will re-enable IRQs after we return (if they were enabled).
-    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
-    yield_cpu_locked();
-}
-
-/// Yield CPU with IRQs already disabled.
-///
-/// Use this variant when you're already in a critical section with IRQs disabled
-/// (e.g., holding an IrqGuard). Avoids redundant IRQ masking.
-///
-/// # Safety
-/// - Must be called with IRQs disabled
-/// - Must be called from kernel context (not IRQ handlers)
-pub unsafe fn yield_cpu_locked() {
-    let sched = scheduler();
-    let caller_slot = current_slot();  // Use per-CPU slot for consistency with schedule()
-
-    // Mark current task as Ready so it can be scheduled again
-    if let Some(ref mut t) = sched.tasks[caller_slot] {
-        if t.state == TaskState::Running {
-            t.state = TaskState::Ready;
-        }
-    }
-
-    // Find next ready task
-    if let Some(next_slot) = sched.schedule() {
-        if next_slot != caller_slot {
-            // Get contexts for switch
-            let current_ctx = if let Some(ref mut t) = sched.tasks[caller_slot] {
-                &mut t.context as *mut CpuContext
-            } else {
-                return;
-            };
-
-            let next_ctx = if let Some(ref t) = sched.tasks[next_slot] {
-                &t.context as *const CpuContext
-            } else {
-                return;
-            };
-
-            // Switch address space if next task has one
-            if let Some(ref task) = sched.tasks[next_slot] {
-                if let Some(ref addr_space) = task.address_space {
-                    addr_space.activate();
-                }
-            }
-
-            // Update current index (BOTH per-CPU slot and legacy field!)
-            set_current_slot(next_slot);
-            sched.current = next_slot;
-
-            // Mark next as running
-            if let Some(ref mut t) = sched.tasks[next_slot] {
-                t.state = TaskState::Running;
-            }
-
-            // CRITICAL: Update globals BEFORE context_switch so the target task
-            // uses the correct trap frame when returning to user mode.
-            update_current_task_globals();
-            SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
-
-            // Actually switch contexts
-            context_switch(current_ctx, next_ctx);
-
-            // We return here when switched back to this task.
-            // IMPORTANT: sched.current was changed by whoever switched back to us.
-            // We must restore it to OUR slot (caller_slot was saved on stack before switch).
-            set_current_slot(caller_slot);
-            sched.current = caller_slot;
-
-            // Mark ourselves as Running again
-            if let Some(ref mut t) = sched.tasks[caller_slot] {
-                t.state = TaskState::Running;
-            }
-            // Restore our address space and globals for this task
-            if let Some(ref task) = sched.tasks[caller_slot] {
-                if let Some(ref addr_space) = task.address_space {
-                    addr_space.activate();
-                }
-            }
-            update_current_task_globals();
-        }
-    }
-    // If no other task to run, just return and continue current task
-}
+// NOTE: yield_cpu() and yield_cpu_locked() have been removed.
+// They used context_switch() which is for kernel-to-kernel switching,
+// not user tasks. For user task scheduling, use:
+// - sched::yield_current() - kernel-internal yield
+// - sched::reschedule() - kernel-internal reschedule
+// - sys_yield() in syscall.rs - syscall entry point
 
 /// Test context switching
 pub fn test() {

@@ -310,23 +310,32 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                         // No data available - try to block waiting for UART RX interrupt
                         unsafe {
                             let sched = super::task::scheduler();
-                            let current_slot = sched.current;
-                            let current_pid = sched.tasks[current_slot]
+                            let my_slot = super::task::current_slot();
+                            let current_pid = sched.tasks[my_slot]
                                 .as_ref().map(|t| t.id).unwrap_or(0);
 
                             // Check if there's another task to switch to FIRST
                             // (schedule() checks for Ready tasks excluding Blocked ones)
-                            // Temporarily mark as Ready to see if there's anyone else
                             let has_other_task = sched.tasks.iter().enumerate().any(|(slot, t)| {
-                                slot != current_slot &&
+                                slot != my_slot &&
                                 t.as_ref().map(|task| task.state == super::task::TaskState::Ready).unwrap_or(false)
                             });
 
                             if has_other_task {
                                 // There's another task - we can safely block
+                                // First, clear any stale registration from ourselves
+                                // (can happen if we were woken by something other than UART RX)
+                                if uart::get_blocked_pid() == current_pid {
+                                    uart::clear_blocked();
+                                }
+
                                 if uart::block_for_input(current_pid) {
+                                    // CRITICAL: Ensure RX interrupt is enabled before blocking!
+                                    // It may have been disabled by IRQ handler while we were in a syscall.
+                                    uart::reenable_rx_interrupt();
+
                                     // Block the task
-                                    if let Some(ref mut current) = sched.tasks[current_slot] {
+                                    if let Some(ref mut current) = sched.tasks[my_slot] {
                                         current.state = super::task::TaskState::Blocked;
                                         // Pre-store EAGAIN - will be retried when woken
                                         current.trap_frame.x0 = (-11i64) as u64;
@@ -334,6 +343,8 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
 
                                     // Switch to another task
                                     if let Some(next_slot) = sched.schedule() {
+                                        // Update both per-CPU slot and legacy field
+                                        super::task::set_current_slot(next_slot);
                                         sched.current = next_slot;
                                         if let Some(ref mut next) = sched.tasks[next_slot] {
                                             next.state = super::task::TaskState::Running;
@@ -351,7 +362,10 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                                 // Register for wakeup but stay Ready (not Blocked)
                                 uart::block_for_input(current_pid);
                                 // WFI until any interrupt arrives (UART or timer)
+                                // CRITICAL: Enable IRQs before WFI, otherwise interrupts can't fire!
+                                core::arch::asm!("msr daifclr, #2");  // Enable IRQs
                                 core::arch::asm!("wfi");
+                                core::arch::asm!("msr daifset, #2");  // Disable IRQs again
                                 // Clear the registration since we're returning to retry
                                 uart::clear_blocked();
                             }
@@ -479,9 +493,9 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
         FdType::None => -9, // EBADF
         FdType::ConsoleIn => -9, // EBADF - Can't write to input
         FdType::ConsoleOut => {
-            // Write to UART output buffer (non-blocking)
-            // Buffer is flushed asynchronously by timer
+            // Write to UART and flush immediately for debugging
             uart::write_buffered(buf);
+            uart::flush_buffer();
             buf.len() as isize
         }
         FdType::Null => buf.len() as isize, // Discard

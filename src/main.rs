@@ -36,7 +36,7 @@ mod ramfs;
 // Convenient aliases - use full paths to avoid ambiguity
 use arch::aarch64::{mmu, sync, smp};
 use platform::mt7988::{gic, uart, timer, wdt};
-use kernel::{task, scheme, shmem, elf, pmm, pci};
+use kernel::{task, scheme, shmem, elf, pmm, pci, bus};
 
 // Alias for platform constants (platform::mt7988::INITRD_ADDR, etc.)
 use platform::mt7988 as plat;
@@ -58,7 +58,7 @@ pub extern "C" fn kmain() -> ! {
     // Initialize logging (after UART so we can print)
     log::init();
 
-    // Print banner
+    // Print banner (flush immediately - timer not running yet)
     println!();
     println!("========================================");
     println!("  BPI-R4 Bare-Metal Kernel");
@@ -67,6 +67,7 @@ pub extern "C" fn kmain() -> ! {
     println!();
     println!("Hello World from BPI-R4!");
     println!();
+    kernel::log::flush();
 
     // Read CPU info
     let midr: u64;
@@ -106,6 +107,7 @@ pub extern "C" fn kmain() -> ! {
     // Enable UART RX interrupt for blocking reads
     uart::enable_rx_interrupt();
     println!("  UART RX IRQ enabled (IRQ {})", plat::irq::UART0);
+    kernel::log::flush();
 
     // MMU was already initialized by boot.S before Rust code runs.
     // The kernel is linked at TTBR1 virtual address (0xFFFF_0000_4600_0000).
@@ -140,6 +142,15 @@ pub extern "C" fn kmain() -> ! {
     println!();
     println!("Initializing PCI subsystem...");
     pci::init();
+
+    // Initialize bus controllers with state machines
+    // This creates control ports for each bus (/kernel/bus/pcie0, /kernel/bus/usb0, etc.)
+    // Buses start in SAFE state - devd will connect to claim them
+    println!();
+    println!("Initializing bus controllers...");
+    kernel::log::flush();
+    bus::init(0);  // Kernel PID = 0
+    kernel::log::flush();
 
     // Initialize watchdog timer (but don't enable yet)
     println!();

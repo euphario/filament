@@ -12,8 +12,8 @@
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Log buffer size (4KB)
-const LOG_BUFFER_SIZE: usize = 4096;
+/// Log buffer size (16KB - enough for verbose boot output)
+const LOG_BUFFER_SIZE: usize = 16384;
 
 /// Ring buffer for log messages
 /// Using raw array + atomic indices for lock-free operation
@@ -125,6 +125,24 @@ pub fn flush() {
     }
 }
 
+/// Try to flush log buffer to UART (non-blocking, IRQ-safe)
+/// Returns true if flush was performed, false if UART lock was held
+/// Safe to call from timer interrupt
+pub fn try_flush() -> bool {
+    // Try to acquire UART lock - if held by syscall, skip this tick
+    let Some(uart) = crate::platform::mt7988::uart::UART.try_lock() else {
+        return false;
+    };
+
+    // SAFETY: Single CPU, called from safe context
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(LOG_BUFFER) };
+
+    while let Some(byte) = buffer.pop() {
+        uart.putc(byte);
+    }
+    true
+}
+
 /// Check if log buffer has pending data
 #[allow(dead_code)] // Infrastructure for future use
 pub fn has_pending() -> bool {
@@ -137,25 +155,15 @@ pub fn pending_bytes() -> usize {
     unsafe { (*core::ptr::addr_of!(LOG_BUFFER)).len() }
 }
 
-/// Log formatted output to the ring buffer (IRQ-safe, deferred)
+/// Log formatted output (alias for print! - both use LOG_BUFFER)
 #[macro_export]
 macro_rules! log {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        // SAFETY: Single-threaded or IRQ context with atomic operations
-        #[allow(unused_unsafe)]
-        unsafe {
-            let _ = write!(&mut *core::ptr::addr_of_mut!($crate::kernel::log::LOG_BUFFER), $($arg)*);
-        }
-    }};
+    ($($arg:tt)*) => { $crate::print!($($arg)*) };
 }
 
-/// Log with newline (IRQ-safe, deferred)
+/// Log with newline (alias for println! - both use LOG_BUFFER)
 #[macro_export]
 macro_rules! logln {
-    () => ($crate::log!("\n"));
-    ($($arg:tt)*) => {{
-        $crate::log!($($arg)*);
-        $crate::log!("\n");
-    }};
+    () => { $crate::println!() };
+    ($($arg:tt)*) => { $crate::println!($($arg)*) };
 }

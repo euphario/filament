@@ -47,6 +47,7 @@ const MSG_STATE_CHANGED: u8 = 1;
 const MSG_ENABLE_BUS_MASTERING: u8 = 16;
 const MSG_DISABLE_BUS_MASTERING: u8 = 17;
 const MSG_REQUEST_RESET: u8 = 20;
+const MSG_SET_DRIVER: u8 = 22;
 
 // hw: scheme message types
 const HW_MSG_OPEN: u8 = 1;
@@ -200,7 +201,7 @@ impl FaultTracker {
         Self {
             level: EscalationLevel::DeviceReset,
             attempts: 0,
-            backoff_ms: 100,
+            backoff_ms: 5000,  // 5 seconds for debugging
             last_fault: 0,
             consecutive_success: 0,
         }
@@ -212,7 +213,7 @@ impl FaultTracker {
         if now > self.last_fault + QUIET_PERIOD_MS {
             self.level = EscalationLevel::DeviceReset;
             self.attempts = 0;
-            self.backoff_ms = 100;
+            self.backoff_ms = 5000;  // 5 seconds for debugging
         }
 
         self.attempts += 1;
@@ -223,7 +224,7 @@ impl FaultTracker {
         if self.attempts > self.level.max_attempts() {
             self.level = self.level.next();
             self.attempts = 1;
-            self.backoff_ms = 100;
+            self.backoff_ms = 5000;  // 5 seconds for debugging
         }
 
         let wait = self.backoff_ms as u64;
@@ -529,6 +530,37 @@ impl DeviceManager {
         }
     }
 
+    /// Register driver PID with kernel for a device's bus
+    ///
+    /// Tells the kernel which process is the actual driver for this bus.
+    /// When this PID exits, kernel will auto-reset the bus and notify us.
+    fn set_driver_pid(&mut self, device_id: u16, driver_pid: u32) {
+        // Find the device to get its bus type
+        let bus_info = self.devices[..self.device_count]
+            .iter()
+            .find(|d| d.id == device_id)
+            .map(|d| (d.bus_type, d.bus_index));
+
+        if let Some((bus_type, bus_index)) = bus_info {
+            // Find the bus connection
+            if let Some(bus) = self.buses[..self.bus_count]
+                .iter()
+                .find(|b| b.bus_type == bus_type && b.bus_index == bus_index)
+            {
+                println!("[devd] Registering driver PID {} for {:?}{}",
+                         driver_pid, bus_type, bus_index);
+
+                // Send SetDriver message to kernel bus controller
+                let pid_bytes = driver_pid.to_le_bytes();
+                let msg = [MSG_SET_DRIVER, pid_bytes[0], pid_bytes[1], pid_bytes[2], pid_bytes[3]];
+                let result = syscall::send(bus.channel, &msg);
+                if result < 0 {
+                    println!("[devd] Failed to register driver PID: {}", result);
+                }
+            }
+        }
+    }
+
     /// Spawn a driver for a device
     fn spawn_driver(&mut self, binary: &'static str, device_id: u16) -> Option<u32> {
         let slot = self.drivers[..self.driver_count]
@@ -571,6 +603,10 @@ impl DeviceManager {
                      binary, pid, device.path_str());
         }
 
+        // Register driver PID with kernel so it knows to auto-reset
+        // the bus when this driver exits
+        self.set_driver_pid(device_id, pid);
+
         Some(pid)
     }
 
@@ -608,18 +644,19 @@ impl DeviceManager {
 
             // Device goes to FAULTED and escalate
             if let Some(dev_id) = device_id {
-                let now = syscall::gettime() as u64;
+                let now_ns = syscall::gettime() as u64;
+                let now_ms = now_ns / 1_000_000;  // Convert to ms for fault tracker
 
-                // Request bus reset before restarting
-                self.request_bus_reset(dev_id);
+                // Note: Kernel auto-resets bus when driver_pid exits
+                // We will receive a StateSnapshot on our bus channel when it's Safe
 
                 // Find device and escalate
-                let (level, wait, is_dead) = if let Some(dev_slot) = self.devices[..self.device_count]
+                let (level, wait_ms, is_dead) = if let Some(dev_slot) = self.devices[..self.device_count]
                     .iter()
                     .position(|d| d.id == dev_id)
                 {
                     self.devices[dev_slot].transition(DeviceState::Faulted);
-                    let (level, wait) = self.devices[dev_slot].fault_tracker.escalate(now);
+                    let (level, wait_ms) = self.devices[dev_slot].fault_tracker.escalate(now_ms);
                     let is_dead = level == EscalationLevel::Dead;
 
                     if is_dead {
@@ -627,7 +664,7 @@ impl DeviceManager {
                         println!("[devd] {} marked as DEAD", self.devices[dev_slot].path_str());
                     }
 
-                    (level, wait, is_dead)
+                    (level, wait_ms, is_dead)
                 } else {
                     return;
                 };
@@ -635,8 +672,11 @@ impl DeviceManager {
                 if is_dead {
                     self.drivers[driver_idx].state = DriverState::Failed;
                 } else {
-                    self.drivers[driver_idx].restart_at = now + wait;
-                    println!("[devd] {} will retry in {}ms (level {:?})", binary, wait, level);
+                    // Schedule restart via kernel timer
+                    let wait_ns = wait_ms * 1_000_000;
+                    self.drivers[driver_idx].restart_at = now_ns + wait_ns;
+                    syscall::timer_set(wait_ns);
+                    println!("[devd] {} will retry in {}ms (level {:?})", binary, wait_ms, level);
                 }
             }
         }
@@ -644,17 +684,18 @@ impl DeviceManager {
 
     /// Process pending restarts and binding timeouts
     fn process_timers(&mut self) {
-        let now = syscall::gettime() as u64;
+        let now_ns = syscall::gettime() as u64;
+        let now_ms = now_ns / 1_000_000;
 
         // Check binding timeouts
         for i in 0..self.device_count {
             if let DeviceState::Binding { deadline } = self.devices[i].state {
-                if now >= deadline {
+                if now_ns >= deadline {
                     println!("[devd] Device {} bind timeout", self.devices[i].path_str());
                     self.devices[i].transition(DeviceState::Faulted);
 
-                    // Escalate
-                    let (level, wait) = self.devices[i].fault_tracker.escalate(now);
+                    // Escalate (uses milliseconds)
+                    let (level, _wait_ms) = self.devices[i].fault_tracker.escalate(now_ms);
                     if level == EscalationLevel::Dead {
                         self.devices[i].transition(DeviceState::Dead);
                     }
@@ -665,7 +706,7 @@ impl DeviceManager {
         // Check driver restarts
         for i in 0..self.driver_count {
             let entry = &mut self.drivers[i];
-            if entry.restart_at > 0 && now >= entry.restart_at {
+            if entry.restart_at > 0 && now_ns >= entry.restart_at {
                 let binary = entry.binary;
                 let device_id = entry.device_id;
                 entry.restart_at = 0;
@@ -689,9 +730,11 @@ impl DeviceManager {
 
                         if let Some(dev_id) = device_id {
                             if let Some(device) = self.find_device(dev_id) {
-                                let deadline = now + BIND_TIMEOUT_NS;
+                                let deadline = now_ns + BIND_TIMEOUT_NS;
                                 device.transition(DeviceState::Binding { deadline });
                             }
+                            // Register new driver PID with kernel
+                            self.set_driver_pid(dev_id, new_pid as u32);
                         }
                     } else {
                         println!("[devd] Failed to restart {}", binary);
@@ -1126,6 +1169,14 @@ fn main() -> ! {
     }
     println!("[devd]   ChildExit: OK");
 
+    // Subscribe to Timer events - for driver restart scheduling
+    let result = syscall::event_subscribe(event_type::TIMER, 0);
+    if result != 0 {
+        println!("[devd] FATAL: Failed to subscribe to Timer events (error {})", result);
+        panic!("[devd] FATAL: Timer subscription failed");
+    }
+    println!("[devd]   Timer: OK");
+
     // Subscribe to IpcReady for hw: channel - CRITICAL for hw: scheme
     if hw_channel_valid {
         let result = syscall::event_subscribe(event_type::IPC_READY, hw_channel as u64);
@@ -1157,7 +1208,7 @@ fn main() -> ! {
     let mut event = Event::empty();
 
     loop {
-        // Wait for an event (blocking)
+        // Wait for an event (blocking - will wake on Timer, ChildExit, IpcReady)
         let result = syscall::event_wait(&mut event, event_flags::BLOCKING);
 
         if result == -11 {
@@ -1240,19 +1291,13 @@ fn main() -> ! {
             }
 
             et if et == event_type::TIMER => {
-                // Timer expired - process binding timeouts and restart delays
+                // Timer expired - process driver restarts and binding timeouts
                 mgr.process_timers();
             }
 
             _ => {
                 println!("[devd] Unknown event type: {}", event.event_type);
             }
-        }
-
-        // Process timers periodically (every 100 events for now)
-        // TODO: Use timer events for this
-        if loop_count % 100 == 0 {
-            mgr.process_timers();
         }
     }
 }

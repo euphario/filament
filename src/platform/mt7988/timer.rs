@@ -80,10 +80,12 @@ impl Timer {
             super::wdt::kick();
 
             // Flush kernel log buffer (logln! output)
-            crate::kernel::log::flush();
+            // Use try_flush to avoid deadlock if syscall is holding UART lock
+            crate::kernel::log::try_flush();
 
             // Flush UART output buffer (userspace console output)
-            super::uart::flush_buffer();
+            // Use try_flush to avoid deadlock if syscall is holding UART lock
+            super::uart::try_flush_buffer();
 
             // Check for timed-out blocked tasks and wake them
             unsafe {
@@ -200,8 +202,9 @@ impl TimerTrait for Timer {
             self.tick_count += 1;
 
             super::wdt::kick();
-            crate::kernel::log::flush();
-            super::uart::flush_buffer();
+            // Use try_flush to avoid deadlock if syscall is holding UART lock
+            crate::kernel::log::try_flush();
+            super::uart::try_flush_buffer();
 
             unsafe {
                 crate::kernel::task::scheduler().check_timeouts(self.tick_count);

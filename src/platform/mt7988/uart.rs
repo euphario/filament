@@ -287,22 +287,47 @@ pub fn getc() -> char {
     UART.lock().getc() as char
 }
 
-/// Print formatted output to the console
+/// Print formatted output to the console (BUFFERED - unified with logln!)
+/// Output goes to LOG_BUFFER and is flushed by timer tick or explicit flush.
+/// Use print_direct! for panic handler or early boot where timer isn't running.
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        let _ = write!(&mut *$crate::platform::mt7988::uart::UART.lock(), $($arg)*);
+        #[allow(unused_unsafe)]
+        unsafe {
+            let _ = write!(&mut *core::ptr::addr_of_mut!($crate::kernel::log::LOG_BUFFER), $($arg)*);
+        }
     }};
 }
 
-/// Print formatted output with newline
+/// Print formatted output with newline (BUFFERED - unified with logln!)
 #[macro_export]
 macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => {{
         $crate::print!($($arg)*);
         $crate::print!("\n");
+    }};
+}
+
+/// Print directly to UART (BLOCKING - bypasses buffer)
+/// Use only for panic handler, early boot, or debugging where immediate output is critical.
+#[macro_export]
+macro_rules! print_direct {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!(&mut *$crate::platform::mt7988::uart::UART.lock(), $($arg)*);
+    }};
+}
+
+/// Print directly to UART with newline (BLOCKING - bypasses buffer)
+#[macro_export]
+macro_rules! println_direct {
+    () => ($crate::print_direct!("\n"));
+    ($($arg:tt)*) => {{
+        $crate::print_direct!($($arg)*);
+        $crate::print_direct!("\n");
     }};
 }
 
@@ -375,6 +400,31 @@ pub fn flush_buffer() {
             break;
         }
     }
+}
+
+/// Try to flush the output buffer (non-blocking, IRQ-safe)
+/// Returns true if flush was performed, false if lock was held
+/// Safe to call from timer interrupt - skips flush if buffer lock is held
+pub fn try_flush_buffer() -> bool {
+    // Try to acquire buffer lock - if held by syscall, skip this tick
+    let Some(mut buf) = UART_BUFFER.try_lock() else {
+        return false;
+    };
+
+    // Try to acquire UART lock - if held, skip this tick
+    let Some(uart) = UART.try_lock() else {
+        return false;
+    };
+
+    // Drain up to 64 bytes per flush call
+    for _ in 0..64 {
+        if let Some(byte) = buf.pop() {
+            uart.putc(byte);
+        } else {
+            break;
+        }
+    }
+    true
 }
 
 /// Check if output buffer has pending data

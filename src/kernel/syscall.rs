@@ -132,6 +132,10 @@ pub enum SyscallNumber {
     PciClaim = 55,
     /// Allow a PID to send signals to this process
     SignalAllow = 56,
+    /// Set a timer - delivers Timer event after duration_ns nanoseconds
+    TimerSet = 57,
+    /// Send heartbeat - updates last_heartbeat for monitoring
+    Heartbeat = 58,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -194,6 +198,8 @@ impl From<u64> for SyscallNumber {
             54 => SyscallNumber::PciMsiAlloc,
             55 => SyscallNumber::PciClaim,
             56 => SyscallNumber::SignalAllow,
+            57 => SyscallNumber::TimerSet,
+            58 => SyscallNumber::Heartbeat,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -337,6 +343,8 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         }
         SyscallNumber::PciClaim => sys_pci_claim(args.arg0 as u32),
         SyscallNumber::SignalAllow => sys_signal_allow(args.arg0 as u32),
+        SyscallNumber::TimerSet => sys_timer_set(args.arg0),
+        SyscallNumber::Heartbeat => sys_heartbeat(),
         SyscallNumber::Invalid => {
             logln!("[SYSCALL] Invalid syscall number: {}", args.num);
             SyscallError::NotImplemented as i64
@@ -415,16 +423,18 @@ fn sys_exit(code: i32) -> i64 {
             task.state = super::task::TaskState::Terminated;
         }
 
-        // Wake up parent if it's blocked (waiting for children)
+        // Send ChildExit event to parent (always, regardless of parent state)
         if parent_id != 0 {
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut task) = task_opt {
-                    if task.id == parent_id && task.state == super::task::TaskState::Blocked {
-                        // Wake up the parent
-                        task.state = super::task::TaskState::Ready;
-                        // Send ChildExit event
+                    if task.id == parent_id {
+                        // Queue ChildExit event
                         let event = super::event::Event::child_exit(pid, code);
                         task.event_queue.push(event);
+                        // Wake parent if blocked
+                        if task.state == super::task::TaskState::Blocked {
+                            task.state = super::task::TaskState::Ready;
+                        }
                         break;
                     }
                 }
@@ -483,45 +493,95 @@ fn sys_exit(code: i32) -> i64 {
     }
 }
 
-/// Yield CPU to another process
-/// If no other task is ready, waits for an interrupt (WFI) before returning.
-/// This ensures yield() actually pauses when used for polling delays.
+/// Yield CPU to another process.
+///
+/// SYSCALL ENTRY POINT - wraps internal sched::yield_current().
+///
+/// Key behavior:
+/// - If current task is Running, it becomes Ready and we reschedule
+/// - If current task is Blocked (waiting for event), it STAYS Blocked!
+///   This is critical - a blocked task calling yield should not become Ready.
+/// - If no other task is ready AND current is Blocked, we WFI until woken
+///
+/// This ensures proper event-driven behavior where blocked tasks only run
+/// when their event arrives.
 fn sys_yield() -> i64 {
+    let caller_slot = super::task::current_slot();
+
+    // Pre-store return value in caller's trap frame
     unsafe {
         let sched = super::task::scheduler();
-        let caller_slot = super::task::current_slot();
-
-        // Mark current as ready (not running)
         if let Some(ref mut task) = sched.tasks[caller_slot] {
-            task.state = super::task::TaskState::Ready;
-            // Pre-store return value in caller's trap frame
             task.trap_frame.x0 = 0;
         }
+    }
 
-        // Find next task
-        if let Some(next_slot) = sched.schedule() {
-            if next_slot != caller_slot {
-                super::task::set_current_slot(next_slot);
-                sched.current = next_slot;
-                if let Some(ref mut task) = sched.tasks[next_slot] {
-                    task.state = super::task::TaskState::Running;
-                }
-                super::task::update_current_task_globals();
-                // Signal to assembly not to store return value
-                super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
-            } else {
-                // Same task - no other task ready to run
-                // Use WFI to actually wait for an interrupt before returning
-                // This makes yield() useful for polling loops that need real delays
+    // Check if current task is blocked BEFORE yielding
+    let is_blocked = super::sched::is_current_blocked();
+
+    // Try to yield (this respects Blocked state - won't change it to Ready)
+    let switched = super::sched::yield_current();
+
+    if switched {
+        // We switched to another task
+        return 0;
+    }
+
+    // We're still the current task (no other ready task found)
+    // If we're Blocked, we MUST wait for an interrupt to wake us
+    // If we're Ready, just return (busy-wait caller will retry)
+
+    if is_blocked {
+        // Blocked task with no other ready tasks - must WFI until woken
+        // WFI loop until we're woken OR another task becomes ready
+        loop {
+            // Enable IRQs, WFI, disable IRQs
+            unsafe {
+                core::arch::asm!("msr daifclr, #2");  // Enable IRQs
                 core::arch::asm!("wfi");
+                core::arch::asm!("msr daifset, #2");  // Disable IRQs
+            }
 
-                // Mark as running again after waking from WFI
-                if let Some(ref mut task) = sched.tasks[caller_slot] {
-                    task.state = super::task::TaskState::Running;
-                }
+            // CRITICAL: Try to reschedule after WFI!
+            // The timer might have woken a DIFFERENT task (e.g., devd's timer fired).
+            // If another task became Ready and we switched to it, return immediately
+            // so svc_handler can perform the actual context switch.
+            if super::sched::reschedule() {
+                // We've set up a switch to another task - return now to execute it
+                return 0;
+            }
+
+            // Check if the ORIGINAL caller has been woken (Blocked → Ready)
+            let still_blocked = unsafe {
+                let sched = super::task::scheduler();
+                sched.tasks[caller_slot]
+                    .as_ref()
+                    .map(|t| t.state == super::task::TaskState::Blocked)
+                    .unwrap_or(false)
+            };
+            if !still_blocked {
+                break;
+            }
+        }
+    } else {
+        // Not blocked, just no other tasks - do one WFI for power saving
+        unsafe {
+            core::arch::asm!("msr daifclr, #2");  // Enable IRQs
+            core::arch::asm!("wfi");
+            core::arch::asm!("msr daifset, #2");  // Disable IRQs
+        }
+    }
+
+    // Ensure we're marked Running before returning to userspace
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[caller_slot] {
+            if task.state == super::task::TaskState::Ready {
+                task.state = super::task::TaskState::Running;
             }
         }
     }
+
     0
 }
 
@@ -1603,8 +1663,9 @@ fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
 
     unsafe {
         let sched = super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
-            // Check task's event queue directly (no global system)
+        let slot = sched.current;
+        if let Some(ref mut task) = sched.tasks[slot] {
+            // Check task's event queue
             if let Some(event) = task.event_queue.pop() {
                 let event_bytes = core::slice::from_raw_parts(
                     &event as *const super::event::Event as *const u8,
@@ -1618,12 +1679,15 @@ fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
 
             // No event available
             if flags & 1 != 0 {
-                // Non-blocking
+                // Non-blocking - return immediately
                 return 0;
             }
 
-            // Would block - mark task as waiting
+            // Would block - mark task as waiting (use sched module for proper state)
             task.state = super::task::TaskState::Blocked;
+            task.wait_reason = Some(super::task::WaitReason::Event);
+            // Trigger context switch so another task can run
+            crate::arch::aarch64::sync::cpu_flags().set_need_resched();
             return SyscallError::WouldBlock as i64;
         }
     }
@@ -1637,9 +1701,19 @@ fn sys_event_wait(event_buf: u64, flags: u32) -> i64 {
 pub struct ProcessInfo {
     pub pid: u32,
     pub parent_pid: u32,
-    pub state: u8,      // 0=Ready, 1=Running, 2=Blocked, 3=Terminated
-    pub _pad: [u8; 3],  // Alignment padding
+    pub state: u8,           // 0=Ready, 1=Running, 2=Blocked, 3=Terminated
+    pub heartbeat_status: u8, // 0=never, 1=alive (<1s), 2=stale (1-5s), 3=dead (>5s)
+    pub _pad: [u8; 2],       // Alignment padding
+    pub heartbeat_age_ms: u32, // Milliseconds since last heartbeat (0 if never)
     pub name: [u8; 16],
+}
+
+/// Heartbeat status values
+pub mod heartbeat_status {
+    pub const NEVER: u8 = 0;   // Never sent heartbeat
+    pub const ALIVE: u8 = 1;   // Last heartbeat < 1 second ago
+    pub const STALE: u8 = 2;   // Last heartbeat 1-5 seconds ago
+    pub const DEAD: u8 = 3;    // Last heartbeat > 5 seconds ago
 }
 
 impl ProcessInfo {
@@ -1649,7 +1723,9 @@ impl ProcessInfo {
             pid: 0,
             parent_pid: 0,
             state: 0,
-            _pad: [0; 3],
+            heartbeat_status: 0,
+            _pad: [0; 2],
+            heartbeat_age_ms: 0,
             name: [0; 16],
         }
     }
@@ -1767,15 +1843,18 @@ fn sys_kill(pid: u32) -> i64 {
             task.state = super::task::TaskState::Terminated;
         }
 
-        // Wake parent if blocked (waiting on wait())
+        // Send ChildExit event to parent (always, regardless of parent state)
         if parent_id != 0 {
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut task) = task_opt {
-                    if task.id == parent_id && task.state == super::task::TaskState::Blocked {
-                        task.state = super::task::TaskState::Ready;
-                        // Send ChildExit event
+                    if task.id == parent_id {
+                        // Queue ChildExit event
                         let event = super::event::Event::child_exit(pid, -9);
                         task.event_queue.push(event);
+                        // Wake parent if blocked
+                        if task.state == super::task::TaskState::Blocked {
+                            task.state = super::task::TaskState::Ready;
+                        }
                         break;
                     }
                 }
@@ -1834,11 +1913,32 @@ fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
             }
 
             if let Some(ref task) = task_opt {
+                // Calculate heartbeat age and status
+                let current_tick = crate::platform::mt7988::timer::ticks();
+                let (hb_status, hb_age_ms) = if task.last_heartbeat == 0 {
+                    (heartbeat_status::NEVER, 0u32)
+                } else {
+                    // Timer runs at 100 Hz (10ms per tick)
+                    let age_ticks = current_tick.saturating_sub(task.last_heartbeat);
+                    let age_ms = (age_ticks * 10) as u32;  // 10ms per tick
+
+                    let status = if age_ms < 1000 {
+                        heartbeat_status::ALIVE  // < 1 second
+                    } else if age_ms < 5000 {
+                        heartbeat_status::STALE  // 1-5 seconds
+                    } else {
+                        heartbeat_status::DEAD   // > 5 seconds
+                    };
+                    (status, age_ms)
+                };
+
                 let info = ProcessInfo {
                     pid: task.id,
                     parent_pid: task.parent_id,
                     state: task.state as u8,
-                    _pad: [0; 3],
+                    heartbeat_status: hb_status,
+                    _pad: [0; 2],
+                    heartbeat_age_ms: hb_age_ms,
                     name: task.name,
                 };
 
@@ -2266,6 +2366,49 @@ fn sys_signal_allow(sender_pid: u32) -> i64 {
             } else {
                 return SyscallError::OutOfMemory as i64; // Allowlist full (-12)
             }
+        }
+    }
+    SyscallError::NoProcess as i64
+}
+
+/// Set a timer - delivers Timer event after duration_ns nanoseconds
+/// Args: duration_ns (0 to cancel)
+/// Returns: 0 on success, negative error
+fn sys_timer_set(duration_ns: u64) -> i64 {
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if duration_ns == 0 {
+                // Cancel timer
+                task.timer_deadline = 0;
+                return 0;
+            }
+
+            // Timer runs at 100 Hz (10ms per tick)
+            // Convert nanoseconds to ticks: duration_ns / 10_000_000
+            let duration_ticks = duration_ns / 10_000_000;
+
+            // Use the timer's tick_count (same counter that check_timeouts receives)
+            let current_tick = crate::platform::mt7988::timer::ticks();
+
+            // Set deadline (minimum 1 tick in future)
+            task.timer_deadline = current_tick.saturating_add(duration_ticks.max(1));
+            return 0;
+        }
+    }
+    SyscallError::NoProcess as i64
+}
+
+/// Send heartbeat - updates last_heartbeat timestamp for monitoring
+/// Returns: 0 on success, negative error
+fn sys_heartbeat() -> i64 {
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            // Update last_heartbeat to current tick
+            let current_tick = crate::platform::mt7988::timer::ticks();
+            task.last_heartbeat = current_tick;
+            return 0;
         }
     }
     SyscallError::NoProcess as i64
