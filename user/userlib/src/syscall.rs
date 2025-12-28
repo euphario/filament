@@ -699,6 +699,7 @@ pub const SYS_PCI_CONFIG_WRITE: u64 = 52;
 pub const SYS_PCI_BAR_MAP: u64 = 53;
 pub const SYS_PCI_MSI_ALLOC: u64 = 54;
 pub const SYS_PCI_CLAIM: u64 = 55;
+pub const SYS_SIGNAL_ALLOW: u64 = 56;
 
 /// PCI Bus/Device/Function address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -881,4 +882,14 @@ pub fn pci_msi_alloc(bdf: PciBdf, count: u8) -> Result<u32, i32> {
 /// Returns: 0 or negative error
 pub fn pci_claim(bdf: PciBdf) -> i32 {
     syscall1(SYS_PCI_CLAIM, bdf.to_u32() as u64) as i32
+}
+
+/// Allow a specific PID to send signals to this process.
+///
+/// By default (empty allowlist), any process can send signals. Once at least one
+/// PID is added, only those PIDs (and the parent) can send signals.
+///
+/// Returns 0 on success, negative error code on failure.
+pub fn signal_allow(sender_pid: u32) -> i32 {
+    syscall1(SYS_SIGNAL_ALLOW, sender_pid as u64) as i32
 }

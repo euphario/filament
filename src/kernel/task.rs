@@ -313,6 +313,10 @@ pub struct MapResult {
 /// Maximum number of children a process can have
 pub const MAX_CHILDREN: usize = 16;
 
+/// Maximum number of PIDs allowed to send signals to this process
+/// Used for receiver opt-in rate limiting
+pub const MAX_SIGNAL_SENDERS: usize = 8;
+
 /// Task Control Block
 pub struct Task {
     /// Unique task ID
@@ -359,6 +363,11 @@ pub struct Task {
     pub wake_at: u64,
     /// Capability set for this task
     pub capabilities: super::caps::Capabilities,
+    /// Signal allowlist - PIDs allowed to send signals to this process
+    /// Empty allowlist (count=0) means allow from all (backwards compat)
+    pub signal_allowlist: [u32; MAX_SIGNAL_SENDERS],
+    /// Number of entries in signal allowlist
+    pub signal_allowlist_count: usize,
 }
 
 impl Task {
@@ -411,6 +420,8 @@ impl Task {
             wait_reason: None,
             wake_at: 0,
             capabilities: super::caps::Capabilities::ALL,  // Kernel tasks get all capabilities
+            signal_allowlist: [0; MAX_SIGNAL_SENDERS],
+            signal_allowlist_count: 0,  // Allow from all (kernel tasks)
         })
     }
 
@@ -465,6 +476,8 @@ impl Task {
             wait_reason: None,
             wake_at: 0,
             capabilities: super::caps::Capabilities::DRIVER_DEFAULT,  // User tasks default to driver caps
+            signal_allowlist: [0; MAX_SIGNAL_SENDERS],
+            signal_allowlist_count: 0,  // Allow from all (backwards compat)
         })
     }
 
@@ -476,6 +489,52 @@ impl Task {
     /// Check if task has a capability
     pub fn has_capability(&self, cap: super::caps::Capabilities) -> bool {
         self.capabilities.has(cap)
+    }
+
+    /// Add a PID to the signal allowlist
+    /// Returns true if added, false if list is full or already present
+    pub fn allow_signals_from(&mut self, sender_pid: u32) -> bool {
+        // Check if already in allowlist
+        for i in 0..self.signal_allowlist_count {
+            if self.signal_allowlist[i] == sender_pid {
+                return true; // Already allowed
+            }
+        }
+
+        // Add if space available
+        if self.signal_allowlist_count < MAX_SIGNAL_SENDERS {
+            self.signal_allowlist[self.signal_allowlist_count] = sender_pid;
+            self.signal_allowlist_count += 1;
+            true
+        } else {
+            false // List full
+        }
+    }
+
+    /// Check if a sender PID is allowed to send signals to this task
+    /// Returns true if:
+    /// - Allowlist is empty (count=0) - allows all (backwards compat)
+    /// - Sender is in allowlist
+    /// - Sender is parent (always allowed)
+    pub fn can_receive_signal_from(&self, sender_pid: u32) -> bool {
+        // Empty allowlist means accept from anyone (backwards compatibility)
+        if self.signal_allowlist_count == 0 {
+            return true;
+        }
+
+        // Parent can always send signals
+        if sender_pid == self.parent_id && self.parent_id != 0 {
+            return true;
+        }
+
+        // Check allowlist
+        for i in 0..self.signal_allowlist_count {
+            if self.signal_allowlist[i] == sender_pid {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Set task priority

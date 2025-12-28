@@ -130,6 +130,8 @@ pub enum SyscallNumber {
     PciMsiAlloc = 54,
     /// Claim ownership of a PCI device
     PciClaim = 55,
+    /// Allow a PID to send signals to this process
+    SignalAllow = 56,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -191,6 +193,7 @@ impl From<u64> for SyscallNumber {
             53 => SyscallNumber::PciBarMap,
             54 => SyscallNumber::PciMsiAlloc,
             55 => SyscallNumber::PciClaim,
+            56 => SyscallNumber::SignalAllow,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -333,6 +336,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
             sys_pci_msi_alloc(args.arg0 as u32, args.arg1 as u8)
         }
         SyscallNumber::PciClaim => sys_pci_claim(args.arg0 as u32),
+        SyscallNumber::SignalAllow => sys_signal_allow(args.arg0 as u32),
         SyscallNumber::Invalid => {
             logln!("[SYSCALL] Invalid syscall number: {}", args.num);
             SyscallError::NotImplemented as i64
@@ -356,9 +360,15 @@ fn require_capability(cap: Capabilities) -> Result<(), i64> {
             if task.has_capability(cap) {
                 return Ok(());
             }
+            // Log via security infrastructure
+            super::security_log::log_security_event(
+                super::security_log::SecurityEvent::CapabilityDenied,
+                task.id,
+                "", // cap name logged separately
+            );
+            logln!("[SECURITY]   capability={:?}", cap);
         }
     }
-    logln!("[SYSCALL] Capability check failed: {:?}", cap);
     Err(SyscallError::PermissionDenied as i64)
 }
 
@@ -2238,6 +2248,27 @@ fn sys_pci_claim(bdf: u32) -> i64 {
         Err(pci::PciError::PermissionDenied) => SyscallError::PermissionDenied as i64,
         Err(_) => SyscallError::IoError as i64,
     }
+}
+
+/// Allow a specific PID to send signals to this process.
+///
+/// By default (empty allowlist), all processes can send signals. Once at least
+/// one PID is added to the allowlist, only those PIDs (plus the parent) can send.
+///
+/// Args: sender_pid - PID to allow signals from
+/// Returns: 0 on success, negative error
+fn sys_signal_allow(sender_pid: u32) -> i64 {
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if task.allow_signals_from(sender_pid) {
+                return 0;
+            } else {
+                return SyscallError::OutOfMemory as i64; // Allowlist full (-12)
+            }
+        }
+    }
+    SyscallError::NoProcess as i64
 }
 
 /// Syscall handler called from exception vector (assembly)

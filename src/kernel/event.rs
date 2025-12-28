@@ -7,6 +7,28 @@
 
 use crate::logln;
 
+// ============================================================================
+// Debug Assertions
+// ============================================================================
+
+/// Assert that IRQs are disabled (for SMP safety)
+/// This ensures that queue operations are not interrupted.
+#[cfg(debug_assertions)]
+#[inline]
+fn assert_irqs_disabled() {
+    let daif: u64;
+    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif); }
+    debug_assert!(
+        (daif & (1 << 7)) != 0,
+        "IRQs must be disabled during event queue operations"
+    );
+}
+
+/// No-op in release builds
+#[cfg(not(debug_assertions))]
+#[inline]
+fn assert_irqs_disabled() {}
+
 /// Maximum events per process in normal queue
 pub const MAX_EVENTS: usize = 24;
 
@@ -320,6 +342,8 @@ impl EventQueue {
 /// Returns true if the event was delivered (task exists and subscribed),
 /// false otherwise.
 pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
+    assert_irqs_disabled();
+
     unsafe {
         let sched = super::task::scheduler();
         // Use generation-aware PID lookup to prevent TOCTOU
@@ -442,12 +466,33 @@ pub fn sys_event_wait_internal(flags: u32) -> Option<Event> {
 /// Args: target_pid, event_type, data
 ///
 /// Only Signal events (type 7) can be posted by userspace.
+/// Signal delivery is subject to the receiver's allowlist (if set).
 /// Delivery and wake-up is handled by deliver_event_to_task().
 pub fn sys_event_post(target_pid: u32, event_type: u32, data: u64, caller_pid: u32) -> i64 {
-    let event = match event_type {
-        7 => Event::signal(data as u32, caller_pid),
-        _ => return -1, // Only signals can be posted by user
-    };
+    // Only signals can be posted by userspace
+    if event_type != 7 {
+        return -1;
+    }
+
+    // Disable IRQs for entire operation (allowlist check + delivery)
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+
+    // Check signal allowlist before delivering
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(slot) = sched.slot_by_pid(target_pid) {
+            if let Some(ref task) = sched.tasks[slot] {
+                if !task.can_receive_signal_from(caller_pid) {
+                    super::security_log::log_signal_blocked(target_pid, caller_pid);
+                    return -13; // EACCES - sender not in allowlist
+                }
+            }
+        } else {
+            return -3; // ESRCH - process not found
+        }
+    }
+
+    let event = Event::signal(data as u32, caller_pid);
 
     // Deliver directly to target's event queue (no global system)
     // deliver_event_to_task handles subscription check and wake-up
