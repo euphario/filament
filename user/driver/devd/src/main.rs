@@ -25,7 +25,7 @@
 #![allow(dead_code)]  // Device manager state machine reserved for future use
 
 use userlib::println;
-use userlib::syscall::{self, PciDeviceInfo, Event, event_type, event_flags};
+use userlib::syscall::{self, Event, event_type, event_flags};
 use userlib::ipc::protocols::devd::{
     DevdRequest, DevdResponse, Node, NodeList, PropertyList, EventType,
     MAX_PATH, MAX_NODES,
@@ -117,17 +117,7 @@ impl BusConnection {
     }
 }
 
-// MT7988A bus controller addresses
-const PCIE_MAC_BASES: [u32; 4] = [
-    0x1130_0000,  // PCIe0
-    0x1131_0000,  // PCIe1
-    0x1128_0000,  // PCIe2
-    0x1129_0000,  // PCIe3
-];
-const USB_MAC_BASES: [u32; 2] = [
-    0x1119_0000,  // SSUSB0 (M.2 slot)
-    0x1120_0000,  // SSUSB1 (USB-A ports)
-];
+// Bus base addresses now come from kernel (DTB) via bus_list syscall
 
 // =============================================================================
 // Device State Machine
@@ -814,34 +804,18 @@ impl DeviceManager {
         }
     }
 
-    /// Connect to a kernel bus control port and register the bus as a device
-    fn connect_bus(&mut self, bus_type: BusType, index: u8) -> bool {
+    /// Connect to a bus using kernel-provided path (single source of truth)
+    fn connect_bus_by_path(&mut self, bus_type: BusType, index: u8, path: &str, base_addr: u32) -> bool {
         if self.bus_count >= MAX_BUSES {
             println!("[devd] Bus table full!");
             return false;
         }
 
-        // Build port name
-        let name: &[u8] = match bus_type {
-            BusType::Platform => b"/kernel/bus/platform",
-            BusType::PCIe => match index {
-                0 => b"/kernel/bus/pcie0",
-                1 => b"/kernel/bus/pcie1",
-                2 => b"/kernel/bus/pcie2",
-                3 => b"/kernel/bus/pcie3",
-                _ => return false,
-            },
-            BusType::Usb => match index {
-                0 => b"/kernel/bus/usb0",
-                1 => b"/kernel/bus/usb1",
-                _ => return false,
-            },
-        };
-
-        let channel = syscall::port_connect(name);
+        // Convert path string to bytes for port_connect
+        let path_bytes = path.as_bytes();
+        let channel = syscall::port_connect(path_bytes);
         if channel < 0 {
-            println!("[devd] Failed to connect to {:?}{}: {}",
-                     bus_type, index, channel);
+            println!("[devd] Failed to connect to {}: {}", path, channel);
             return false;
         }
 
@@ -850,16 +824,11 @@ impl DeviceManager {
         self.buses[slot].bus_index = index;
         self.buses[slot].channel = channel as u32;
         self.buses[slot].connected = true;
-        // Set controller base address
-        self.buses[slot].base_addr = match bus_type {
-            BusType::Platform => 0,  // No MMIO base for pseudo-bus
-            BusType::PCIe => PCIE_MAC_BASES.get(index as usize).copied().unwrap_or(0),
-            BusType::Usb => USB_MAC_BASES.get(index as usize).copied().unwrap_or(0),
-        };
+        self.buses[slot].base_addr = base_addr;  // Use kernel-provided base address
         self.bus_count += 1;
 
-        println!("[devd] Connected to {:?}{} @ 0x{:08x} (channel {})",
-                 bus_type, index, self.buses[slot].base_addr, channel);
+        println!("[devd] Connected to {} @ 0x{:08x} (channel {})",
+                 path, base_addr, channel);
 
         // Wait for StateSnapshot from kernel
         let mut buf = [0u8; 64];
@@ -876,9 +845,6 @@ impl DeviceManager {
         };
         self.buses[slot].kernel_state = kernel_state;
         println!("[devd]   Kernel state: {:?}", kernel_state);
-
-        // Note: Buses are NOT added as devices - they're shown separately in hw list
-        // from the buses array. Only enumerated devices go in the devices array.
 
         true
     }
@@ -1450,59 +1416,10 @@ fn scan_platform(mgr: &mut DeviceManager) {
 
     // Note: USB controllers (ssusb0, ssusb1) are buses, not devices
     // They're listed under /bus/usb0, /bus/usb1
-}
 
-fn scan_pcie(mgr: &mut DeviceManager) {
-    println!("[devd] Scanning PCIe bus...");
-
-    let mut devices = [PciDeviceInfo::default(); 16];
-    let count = syscall::pci_enumerate(&mut devices);
-
-    if count < 0 {
-        println!("[devd]   PCIe enumeration failed: {}", count);
-        return;
-    }
-
-    let count = count as usize;
-    println!("[devd]   Found {} PCIe device(s)", count);
-
-    for i in 0..count {
-        let pci = &devices[i];
-        let class = pci.class_code >> 8;
-
-        let dev_class = match class {
-            0x0C03 => DeviceClass::UsbController,
-            0x0200 => DeviceClass::Network,
-            0x0100 | 0x0106 => DeviceClass::Storage,
-            _ => DeviceClass::Other,
-        };
-
-        let bdf = pci.bdf;
-        let bus = (bdf >> 8) & 0xFF;
-        let dev = (bdf >> 3) & 0x1F;
-        let func = bdf & 0x7;
-
-        let mut device = Device::empty();
-        let path = match dev_class {
-            DeviceClass::UsbController => "/pcie/usb",
-            DeviceClass::Network => "/pcie/net",
-            DeviceClass::Storage => "/pcie/storage",
-            _ => "/pcie/unknown",
-        };
-        device.set_path(path);
-        device.bus_type = BusType::PCIe;
-        device.bus_index = 0;
-        device.class = dev_class;
-        device.vendor_id = pci.vendor_id;
-        device.device_id = pci.device_id;
-        device.pci_bdf = bdf;
-
-        println!("[devd]   {:04x}:{:02x}:{:02x}.{} - {:04x}:{:04x} ({:?})",
-                 (bdf >> 16) & 0xFF, bus, dev, func,
-                 pci.vendor_id, pci.device_id, dev_class);
-
-        mgr.add_device(device);
-    }
+    // Note: PCIe and USB devices are NOT scanned here.
+    // They are enumerated by their respective bus drivers (pcied, usbd)
+    // which report discovered devices back to devd via IPC.
 }
 
 // =============================================================================
@@ -1633,26 +1550,38 @@ fn main() -> ! {
     let mut mgr = DeviceManager::new();
     let mut tree = DeviceTree::new();
 
-    // Phase 1: Connect to kernel bus control ports
+    // Phase 1: Query kernel for available buses and connect
+    println!("[devd] Discovering buses from kernel...");
+
+    // Query kernel for bus list (single source of truth)
+    let mut buses = [syscall::BusInfo::empty(); 16];
+    let bus_count = syscall::bus_list(&mut buses);
+    if bus_count < 0 {
+        println!("[devd] FATAL: Failed to query bus list: {}", bus_count);
+        loop { syscall::exit(1); }
+    }
+    let bus_count = bus_count as usize;
+    println!("[devd] Kernel reports {} bus(es)", bus_count);
+
+    // Connect to each bus using kernel-provided path
     println!("[devd] Connecting to bus control ports...");
+    for i in 0..bus_count {
+        let info = &buses[i];
+        let bus_type = match info.bus_type {
+            syscall::bus_type::PCIE => BusType::PCIe,
+            syscall::bus_type::USB => BusType::Usb,
+            syscall::bus_type::PLATFORM => BusType::Platform,
+            _ => continue,
+        };
+        // Use kernel-provided path (single source of truth)
+        mgr.connect_bus_by_path(bus_type, info.bus_index, info.path_str(), info.base_addr);
+    }
 
-    // Connect to platform bus (uart, gpio, i2c, spi, etc.)
-    mgr.connect_bus(BusType::Platform, 0);
-
-    // Connect to USB buses
-    mgr.connect_bus(BusType::Usb, 0);
-    mgr.connect_bus(BusType::Usb, 1);
-
-    // Connect to PCIe buses (4 ports on BPI-R4)
-    mgr.connect_bus(BusType::PCIe, 0);
-    mgr.connect_bus(BusType::PCIe, 1);
-    mgr.connect_bus(BusType::PCIe, 2);
-    mgr.connect_bus(BusType::PCIe, 3);
-
-    // Phase 2: Scan buses for devices
+    // Phase 2: Scan platform bus for static devices
+    // (uart0, gpio - these are always present on platform bus)
+    // Note: PCIe/USB devices are discovered dynamically by their bus drivers
     println!();
-    scan_platform(&mut mgr);  // Enumerates uart0, gpio, etc. on platform bus
-    scan_pcie(&mut mgr);
+    scan_platform(&mut mgr);
 
     // Phase 3: Match and spawn drivers
     println!();
@@ -1722,14 +1651,16 @@ fn main() -> ! {
     }
     println!("[devd]   Timer: OK");
 
-    // Subscribe to IpcReady for hw: channel - CRITICAL for hw: scheme
+    // Subscribe to IpcReady for hw: channel (non-critical - just disables hw: scheme queries)
     if hw_channel_valid {
         let result = syscall::event_subscribe(event_type::IPC_READY, hw_channel as u64);
         if result != 0 {
-            println!("[devd] FATAL: Failed to subscribe to IpcReady for hw: channel (error {})", result);
-            panic!("[devd] FATAL: hw: channel subscription failed");
+            println!("[devd] WARNING: Failed to subscribe to IpcReady for hw: channel (error {})", result);
+            println!("[devd]   hw: scheme queries disabled, supervision continues");
+            hw_channel_valid = false;
+        } else {
+            println!("[devd]   IpcReady(hw:{}): OK", hw_channel);
         }
-        println!("[devd]   IpcReady(hw:{}): OK", hw_channel);
     }
 
     // Subscribe to IpcReady for bus control channels - CRITICAL
@@ -1745,14 +1676,16 @@ fn main() -> ! {
         }
     }
 
-    // Subscribe to IpcReady for devd protocol port
+    // Subscribe to IpcReady for devd protocol port (non-critical - just disables protocol queries)
     if devd_port_valid {
         let result = syscall::event_subscribe(event_type::IPC_READY, devd_port as u64);
         if result != 0 {
-            println!("[devd] FATAL: Failed to subscribe to IpcReady for devd port (error {})", result);
-            panic!("[devd] FATAL: devd port subscription failed");
+            println!("[devd] WARNING: Failed to subscribe to IpcReady for devd port (error {})", result);
+            println!("[devd]   Protocol queries disabled, supervision continues");
+            devd_port_valid = false;
+        } else {
+            println!("[devd]   IpcReady(devd:{}): OK", devd_port);
         }
-        println!("[devd]   IpcReady(devd:{}): OK", devd_port);
     }
 
     println!();

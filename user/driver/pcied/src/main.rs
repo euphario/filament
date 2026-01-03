@@ -264,10 +264,60 @@ fn main() {
     println!("  INFRA0={:08x} INFRA3={:08x} RST={:08x}", infra0, infra3, rst);
     println!();
 
-    // Step 3: Initialize each port and enumerate devices
+    // Step 3: Claim bus ports from kernel
+    // Query kernel for available buses (single source of truth from DTB)
+    let mut buses = [syscall::BusInfo::empty(); 16];
+    let bus_count = syscall::bus_list(&mut buses);
+    if bus_count < 0 {
+        println!("Failed to query bus list: {}", bus_count);
+        syscall::exit(1);
+        return;
+    }
+
+    let mut bus_channels: [i64; 4] = [-1; 4];  // Channel for each claimed port
+    let mut claimed_ports = 0u8;
+
+    println!("Claiming PCIe bus ports (from kernel)...");
+    for i in 0..(bus_count as usize) {
+        let info = &buses[i];
+        // Only claim PCIe buses
+        if info.bus_type != syscall::bus_type::PCIE {
+            continue;
+        }
+
+        let port = info.bus_index;
+        if port as usize >= 4 {
+            continue;  // Our array only supports 4 ports
+        }
+
+        let path_bytes = info.path_str().as_bytes();
+        let ch = syscall::port_connect(path_bytes);
+        if ch < 0 {
+            println!("  {}: not available (error {})", info.path_str(), ch);
+            continue;
+        }
+
+        bus_channels[port as usize] = ch;
+        claimed_ports |= 1 << port;
+        println!("  {}: claimed (channel {})", info.path_str(), ch);
+    }
+
+    if claimed_ports == 0 {
+        println!("No PCIe ports available - is devd running?");
+        syscall::exit(1);
+        return;
+    }
+    println!();
+
+    // Step 4: Initialize each CLAIMED port and enumerate devices
     let mut any_device_found = false;
 
     for port in 0..board.soc().port_count() {
+        // Skip ports we didn't claim
+        if (claimed_ports & (1 << port)) == 0 {
+            continue;
+        }
+
         let slot = match board.slot_info(port) {
             Some(s) => s,
             None => continue,

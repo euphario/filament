@@ -34,8 +34,10 @@ pub const MAX_INLINE_PAYLOAD: usize = 576;
 /// Maximum messages in a queue
 pub const MAX_QUEUE_SIZE: usize = 8;
 
-/// Maximum number of channels (keep small for now)
-pub const MAX_CHANNELS: usize = 32;
+/// Maximum number of channels
+/// Scales with MAX_BUSES: each bus needs ~4 channels (control + scheme opens)
+/// Formula: MAX_BUSES * 4 + 32 base provides headroom
+pub const MAX_CHANNELS: usize = super::bus::MAX_BUSES * 4 + 32;
 
 /// Channel ID type
 pub type ChannelId = u32;

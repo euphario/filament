@@ -36,7 +36,9 @@ pub const MAX_EVENTS: usize = 24;
 pub const MAX_CRITICAL_EVENTS: usize = 8;
 
 /// Maximum subscriptions per event type (prevents exhaustion attacks)
-pub const MAX_SUBSCRIPTIONS_PER_TYPE: usize = 8;
+/// Scales with MAX_BUSES: devd needs (buses + 4) IpcReady subscriptions
+/// Formula: MAX_BUSES * 2 + 8 provides headroom for multiple subscribers
+pub const MAX_SUBSCRIPTIONS_PER_TYPE: usize = super::bus::MAX_BUSES * 2 + 8;
 
 /// Event types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

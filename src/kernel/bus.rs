@@ -279,6 +279,47 @@ impl BusType {
     }
 }
 
+/// Bus information returned by bus_list syscall
+/// Layout must match userlib::syscall::BusInfo
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct BusInfo {
+    /// Bus type (0=PCIe, 1=USB, 2=Platform)
+    pub bus_type: u8,
+    /// Bus index within type (e.g., 0 for pcie0)
+    pub bus_index: u8,
+    /// Current state (0=Safe, 1=Claimed, 2=Resetting)
+    pub state: u8,
+    /// Padding for alignment
+    pub _pad: u8,
+    /// MMIO base address (from DTB/hardcoded)
+    pub base_addr: u32,
+    /// Owner PID (0 if no owner)
+    pub owner_pid: u32,
+    /// Port path (e.g., "/kernel/bus/pcie0")
+    pub path: [u8; 32],
+    /// Length of path string
+    pub path_len: u8,
+    /// Reserved for future use
+    pub _reserved: [u8; 3],
+}
+
+impl BusInfo {
+    pub const fn empty() -> Self {
+        Self {
+            bus_type: 0,
+            bus_index: 0,
+            state: 0,
+            _pad: 0,
+            base_addr: 0,
+            owner_pid: 0,
+            path: [0; 32],
+            path_len: 0,
+            _reserved: [0; 3],
+        }
+    }
+}
+
 // =============================================================================
 // Bus State Machine
 // =============================================================================
@@ -569,6 +610,45 @@ impl BusController {
         core::str::from_utf8(&self.port_name[..self.port_name_len]).unwrap_or("???")
     }
 
+    /// Convert to BusInfo for syscall
+    pub fn to_info(&self) -> BusInfo {
+        let base_addr = match self.bus_type {
+            BusType::PCIe => {
+                if (self.bus_index as usize) < pcie_hw::MAC_BASES.len() {
+                    pcie_hw::MAC_BASES[self.bus_index as usize] as u32
+                } else {
+                    0
+                }
+            }
+            BusType::Usb => {
+                if (self.bus_index as usize) < usb_hw::MAC_BASES.len() {
+                    usb_hw::MAC_BASES[self.bus_index as usize] as u32
+                } else {
+                    0
+                }
+            }
+            BusType::Platform => 0, // Platform devices have individual addresses
+        };
+
+        let mut info = BusInfo {
+            bus_type: self.bus_type as u8,
+            bus_index: self.bus_index,
+            state: self.state as u8,
+            _pad: 0,
+            base_addr,
+            owner_pid: self.owner_pid.unwrap_or(0),
+            path: [0; 32],
+            path_len: self.port_name_len as u8,
+            _reserved: [0; 3],
+        };
+
+        // Copy port name
+        let len = self.port_name_len.min(32);
+        info.path[..len].copy_from_slice(&self.port_name[..len]);
+
+        info
+    }
+
     /// Register the bus control port
     /// Called during kernel init
     pub fn register_port(&mut self, kernel_pid: Pid) -> Result<(), PortError> {
@@ -662,24 +742,37 @@ impl BusController {
     }
 
     /// Handle a new connection to the bus control port
-    /// First connection (devd) just supervises - bus stays Safe
-    /// Second connection (driver) claims the bus via handoff
+    /// First connection (devd) becomes supervisor - bus stays Safe
+    /// Second connection (driver) claims the bus if supervisor present
     pub fn handle_connect(&mut self, client_channel: ChannelId, client_pid: Pid) -> Result<(), BusError> {
         match self.state {
             BusState::Safe => {
-                // First connection is supervisor (devd) - bus stays Safe
-                // Store channel for communication but don't claim
-                self.owner_channel = Some(client_channel);
-                self.owner_pid = Some(client_pid);
-                // Don't transition to Claimed - stay Safe until driver claims
+                if self.owner_pid.is_none() {
+                    // First connection is supervisor (devd) - bus stays Safe
+                    self.owner_channel = Some(client_channel);
+                    self.owner_pid = Some(client_pid);
+                    logln!("  Bus {}: supervisor PID {} connected",
+                           self.port_name_str(), client_pid);
+                } else if self.driver_pid.is_none() {
+                    // Second connection is driver claiming the bus
+                    // Only allowed if supervisor is connected
+                    self.driver_pid = Some(client_pid);
+                    self.transition_to(BusState::Claimed, StateChangeReason::DriverClaimed);
+                    logln!("  Bus {}: driver PID {} claimed (supervisor {:?})",
+                           self.port_name_str(), client_pid, self.owner_pid);
+                } else {
+                    // Already has supervisor and driver - reject
+                    logln!("  Bus {}: rejecting connect from PID {} (already has driver {:?})",
+                           self.port_name_str(), client_pid, self.driver_pid);
+                    return Err(BusError::AlreadyClaimed);
+                }
 
-                // Send StateSnapshot to supervisor
+                // Send StateSnapshot to new connection
                 self.send_state_snapshot(client_channel)?;
-
                 Ok(())
             }
             BusState::Claimed => {
-                // Already owned - reject (driver should use handoff)
+                // Already claimed - reject (driver should use handoff)
                 Err(BusError::AlreadyClaimed)
             }
             BusState::Resetting => {
@@ -1710,9 +1803,9 @@ pub fn init(kernel_pid: Pid) {
     logln!("Initializing bus controllers...");
 
     with_bus_registry(|registry| {
-        // PCIe ports - MT7988A has 3 active PCIe ports (0, 1, 2)
-        // Port 3 exists but is typically not used on BPI-R4
-        for i in 0..3u8 {
+        // PCIe ports - MT7988A has 4 PCIe ports
+        // All 4 are present in DTB, pcie3 hosts M.2 NVMe slot
+        for i in 0..4u8 {
             if let Some(bus) = registry.add(BusType::PCIe, i) {
                 logln!("  Initializing {}...", bus.port_name_str());
 
@@ -1784,7 +1877,7 @@ pub fn process_cleanup(pid: Pid) {
 
 /// Handle port_connect for kernel bus ports
 /// Called synchronously from port::connect() for /kernel/bus/* ports
-/// suffix is the part after "/kernel/bus/" e.g. "usb0", "pcie1", "platform"
+/// suffix is the part after "/kernel/bus/" e.g. "usb0", "pcie1", "platform0"
 pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: Pid) -> Result<(), BusError> {
     // Parse bus type and index from suffix
     let (bus_type, index) = if suffix.starts_with("usb") {
@@ -1793,8 +1886,9 @@ pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: 
     } else if suffix.starts_with("pcie") {
         let idx = suffix[4..].parse::<u8>().map_err(|_| BusError::NotFound)?;
         (BusType::PCIe, idx)
-    } else if suffix == "platform" {
-        (BusType::Platform, 0)
+    } else if suffix.starts_with("platform") {
+        let idx = suffix[8..].parse::<u8>().map_err(|_| BusError::NotFound)?;
+        (BusType::Platform, idx)
     } else {
         return Err(BusError::NotFound);
     };
@@ -1847,6 +1941,23 @@ pub fn process_bus_message(client_channel: ChannelId, data: &[u8]) {
         }
         logln!("  process_bus_message: no bus owns channel {}", server_ch);
     });
+}
+
+/// Get list of all buses for bus_list syscall
+/// Returns number of buses written to buffer
+pub fn get_bus_list(buf: &mut [BusInfo]) -> usize {
+    with_bus_registry(|registry| {
+        let count = registry.bus_count.min(buf.len());
+        for i in 0..count {
+            buf[i] = registry.buses[i].to_info();
+        }
+        count
+    })
+}
+
+/// Get total number of buses (for sizing buffer)
+pub fn get_bus_count() -> usize {
+    with_bus_registry(|registry| registry.bus_count)
 }
 
 // =============================================================================

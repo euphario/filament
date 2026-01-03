@@ -136,6 +136,8 @@ pub enum SyscallNumber {
     TimerSet = 57,
     /// Send heartbeat - updates last_heartbeat for monitoring
     Heartbeat = 58,
+    /// List available buses (returns BusInfo array)
+    BusList = 59,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -200,6 +202,7 @@ impl From<u64> for SyscallNumber {
             56 => SyscallNumber::SignalAllow,
             57 => SyscallNumber::TimerSet,
             58 => SyscallNumber::Heartbeat,
+            59 => SyscallNumber::BusList,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -345,6 +348,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::SignalAllow => sys_signal_allow(args.arg0 as u32),
         SyscallNumber::TimerSet => sys_timer_set(args.arg0),
         SyscallNumber::Heartbeat => sys_heartbeat(),
+        SyscallNumber::BusList => sys_bus_list(args.arg0, args.arg1),
         SyscallNumber::Invalid => {
             logln!("[SYSCALL] Invalid syscall number: {}", args.num);
             SyscallError::NotImplemented as i64
@@ -2425,6 +2429,43 @@ fn sys_heartbeat() -> i64 {
         }
     }
     SyscallError::NoProcess as i64
+}
+
+/// List available buses
+/// Args: buf_ptr (pointer to BusInfo array), max_count
+/// Returns: number of buses written, or negative error
+fn sys_bus_list(buf_ptr: u64, max_count: u64) -> i64 {
+    use super::bus::{BusInfo, get_bus_list};
+
+    if buf_ptr == 0 {
+        // Just return count
+        return super::bus::get_bus_count() as i64;
+    }
+
+    let max = max_count as usize;
+    if max == 0 {
+        return 0;
+    }
+
+    // Validate user buffer for writing
+    let buf_size = max * core::mem::size_of::<BusInfo>();
+    if super::uaccess::validate_user_write(buf_ptr, buf_size).is_err() {
+        return SyscallError::BadAddress as i64;
+    }
+
+    // Create temporary buffer on stack (max 16 buses)
+    let mut temp = [BusInfo::empty(); 16];
+    let count = get_bus_list(&mut temp[..max.min(16)]);
+
+    // Copy to userspace
+    unsafe {
+        let user_buf = buf_ptr as *mut BusInfo;
+        for i in 0..count {
+            core::ptr::write(user_buf.add(i), temp[i]);
+        }
+    }
+
+    count as i64
 }
 
 /// Syscall handler called from exception vector (assembly)

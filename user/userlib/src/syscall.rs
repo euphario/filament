@@ -756,6 +756,7 @@ pub const SYS_PCI_CLAIM: u64 = 55;
 pub const SYS_SIGNAL_ALLOW: u64 = 56;
 pub const SYS_TIMER_SET: u64 = 57;
 pub const SYS_HEARTBEAT: u64 = 58;
+pub const SYS_BUS_LIST: u64 = 59;
 
 /// PCI Bus/Device/Function address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -968,4 +969,94 @@ pub fn timer_set(duration_ns: u64) -> i32 {
 /// Returns 0 on success, negative error code on failure.
 pub fn heartbeat() -> i32 {
     syscall0(SYS_HEARTBEAT) as i32
+}
+
+// =============================================================================
+// Bus Discovery
+// =============================================================================
+
+/// Bus type constants (must match kernel)
+pub mod bus_type {
+    pub const PCIE: u8 = 0;
+    pub const USB: u8 = 1;
+    pub const PLATFORM: u8 = 2;
+}
+
+/// Bus state constants (must match kernel)
+pub mod bus_state {
+    pub const SAFE: u8 = 0;
+    pub const CLAIMED: u8 = 1;
+    pub const RESETTING: u8 = 2;
+}
+
+/// Bus information returned by bus_list syscall
+/// Layout must match kernel's bus::BusInfo
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct BusInfo {
+    /// Bus type (0=PCIe, 1=USB, 2=Platform)
+    pub bus_type: u8,
+    /// Bus index within type (e.g., 0 for pcie0)
+    pub bus_index: u8,
+    /// Current state (0=Safe, 1=Claimed, 2=Resetting)
+    pub state: u8,
+    /// Padding
+    pub _pad: u8,
+    /// MMIO base address
+    pub base_addr: u32,
+    /// Owner PID (0 if no owner)
+    pub owner_pid: u32,
+    /// Port path (e.g., "/kernel/bus/pcie0")
+    pub path: [u8; 32],
+    /// Length of path string
+    pub path_len: u8,
+    /// Reserved
+    pub _reserved: [u8; 3],
+}
+
+impl BusInfo {
+    pub const fn empty() -> Self {
+        Self {
+            bus_type: 0,
+            bus_index: 0,
+            state: 0,
+            _pad: 0,
+            base_addr: 0,
+            owner_pid: 0,
+            path: [0; 32],
+            path_len: 0,
+            _reserved: [0; 3],
+        }
+    }
+
+    /// Get port path as string slice
+    pub fn path_str(&self) -> &str {
+        core::str::from_utf8(&self.path[..self.path_len as usize]).unwrap_or("")
+    }
+
+    /// Check if this is a PCIe bus
+    pub fn is_pcie(&self) -> bool {
+        self.bus_type == bus_type::PCIE
+    }
+
+    /// Check if this is a USB bus
+    pub fn is_usb(&self) -> bool {
+        self.bus_type == bus_type::USB
+    }
+
+    /// Check if this is a Platform bus
+    pub fn is_platform(&self) -> bool {
+        self.bus_type == bus_type::PLATFORM
+    }
+}
+
+/// Get count of available buses
+pub fn bus_count() -> i64 {
+    syscall2(SYS_BUS_LIST, 0, 0)
+}
+
+/// List available buses from kernel
+/// Returns number of buses written to buf, or negative error
+pub fn bus_list(buf: &mut [BusInfo]) -> i64 {
+    syscall2(SYS_BUS_LIST, buf.as_mut_ptr() as u64, buf.len() as u64)
 }
