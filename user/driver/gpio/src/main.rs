@@ -1,20 +1,28 @@
 //! PCA9555 GPIO Expander Driver
 //!
 //! Userspace driver for the BPI-R4's PCA9555 GPIO expander.
-//! Accessed via PCA9545 I2C multiplexer on I2C bus 0.
+//! Accessed via PCA9545 I2C multiplexer on I2C bus 2.
 //!
 //! I2C Topology:
-//!   I2C0 -> PCA9545@0x70 (channel 3) -> PCA9555@0x20
+//!   I2C2 -> PCA9545@0x70 (channel 3) -> PCA9555@0x20
 //!
 //! GPIO Assignments (BPI-R4):
-//!   Pin 9:  USB VBUS enable (active high)
+//!   Pin 11: USB VBUS enable (active high)
 //!   Pin 11: SFP LED
 //!   Pins 12-14: SFP controls
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]  // Constants/registers for future use
 
 use userlib::{println, syscall};
+use userlib::syscall::{Event, event_type, event_flags};
+use userlib::ipc::{Server, Connection, IpcError, DevdClient};
+use userlib::ipc::protocols::{GpioProtocol, GpioRequest, GpioResponse};
+use userlib::ipc::protocols::devd::PropertyList;
+
+/// Polling interval for input change detection (100ms in nanoseconds)
+const POLL_INTERVAL_NS: u64 = 100_000_000;
 
 // =============================================================================
 // I2C Addresses
@@ -39,30 +47,55 @@ mod pca9555 {
 }
 
 // GPIO pin definitions for BPI-R4
-// PCA_A_IO1_3/VBUS_AB_PDN = Port 1, bit 3 = pin 11
-// Active LOW for power-down, so HIGH enables VBUS
 pub const GPIO_USB_VBUS: u8 = 11;  // USB 5V power enable (IO1_3)
+
+// Pin name mappings (index = pin number)
+const PIN_NAMES: [&str; 16] = [
+    "io0_0", "io0_1", "io0_2", "io0_3",       // Port 0: pins 0-3
+    "io0_4", "io0_5", "io0_6", "io0_7",       // Port 0: pins 4-7
+    "sfp_txfault", "sfp_los", "sfp_present",  // Port 1: pins 8-10 (SFP status)
+    "usb_vbus",                                // Port 1: pin 11 (USB power)
+    "sfp_txdis", "sfp_rate", "sfp_led",       // Port 1: pins 12-14 (SFP control)
+    "io1_7",                                   // Port 1: pin 15 (spare)
+];
+
+// Full paths for device tree (index = pin number)
+const PIN_PATHS: [&str; 16] = [
+    "/bus/i2c2/pca9555@20/io0_0",
+    "/bus/i2c2/pca9555@20/io0_1",
+    "/bus/i2c2/pca9555@20/io0_2",
+    "/bus/i2c2/pca9555@20/io0_3",
+    "/bus/i2c2/pca9555@20/io0_4",
+    "/bus/i2c2/pca9555@20/io0_5",
+    "/bus/i2c2/pca9555@20/io0_6",
+    "/bus/i2c2/pca9555@20/io0_7",
+    "/bus/i2c2/pca9555@20/sfp_txfault",
+    "/bus/i2c2/pca9555@20/sfp_los",
+    "/bus/i2c2/pca9555@20/sfp_present",
+    "/bus/i2c2/pca9555@20/usb_vbus",
+    "/bus/i2c2/pca9555@20/sfp_txdis",
+    "/bus/i2c2/pca9555@20/sfp_rate",
+    "/bus/i2c2/pca9555@20/sfp_led",
+    "/bus/i2c2/pca9555@20/io1_7",
+];
 
 // =============================================================================
 // GPIO Expander Driver
 // =============================================================================
 
 struct GpioExpander {
-    i2c_mux_fd: i32,   // FD for PCA9545 multiplexer
-    i2c_gpio_fd: i32,  // FD for PCA9555 expander
-    output_state: [u8; 2],  // Current output state (port 0 and 1)
-    config_state: [u8; 2],  // Current config state (0=output, 1=input)
+    i2c_mux_fd: i32,
+    i2c_gpio_fd: i32,
+    output_state: [u8; 2],
+    config_state: [u8; 2],
+    /// Cached input state for change detection
+    input_state: [u8; 2],
 }
 
 impl GpioExpander {
     fn new() -> Option<Self> {
-        // Open I2C devices via i2c scheme
-        // Format: i2c:bus/addr
-        // Use O_RDWR (2) for read/write access
-
         // Open PCA9545 multiplexer on I2C2 @ 0x70
-        // (BPI-R4 has PCA9545 on i2c2, not i2c0)
-        let mux_fd = syscall::scheme_open("i2c:2/70", 2);  // O_RDWR
+        let mux_fd = syscall::scheme_open("i2c:2/70", 2);
         if mux_fd < 0 {
             println!("  Failed to open I2C mux: {}", mux_fd);
             return None;
@@ -70,9 +103,7 @@ impl GpioExpander {
         println!("  PCA9545 mux opened (fd={})", mux_fd);
 
         // Open PCA9555 expander on I2C2 @ 0x20
-        // Note: The kernel I2C scheme doesn't know about the mux,
-        // so we access via the same bus but different address
-        let gpio_fd = syscall::scheme_open("i2c:2/20", 2);  // O_RDWR
+        let gpio_fd = syscall::scheme_open("i2c:2/20", 2);
         if gpio_fd < 0 {
             println!("  Failed to open I2C GPIO: {}", gpio_fd);
             syscall::close(mux_fd as u32);
@@ -83,14 +114,13 @@ impl GpioExpander {
         Some(Self {
             i2c_mux_fd: mux_fd,
             i2c_gpio_fd: gpio_fd,
-            output_state: [0xFF, 0xFF],  // Default all high
-            config_state: [0xFF, 0xFF],  // Default all inputs
+            output_state: [0xFF, 0xFF],
+            config_state: [0xFF, 0xFF],
+            input_state: [0xFF, 0xFF],
         })
     }
 
-    /// Select the multiplexer channel for PCA9555 access
     fn select_mux_channel(&self) -> bool {
-        // Write channel selection to PCA9545
         let data = [MUX_CHANNEL_3];
         let result = syscall::write(self.i2c_mux_fd as u32, &data);
         if result < 0 {
@@ -100,53 +130,38 @@ impl GpioExpander {
         true
     }
 
-    /// Write to PCA9555 register
     fn write_reg(&self, reg: u8, value: u8) -> bool {
-        // Must select mux channel first
         if !self.select_mux_channel() {
             return false;
         }
-
-        // Write register address and value
         let data = [reg, value];
-        let result = syscall::write(self.i2c_gpio_fd as u32, &data);
-        result >= 0
+        syscall::write(self.i2c_gpio_fd as u32, &data) >= 0
     }
 
-    /// Read from PCA9555 register
     fn read_reg(&self, reg: u8) -> Option<u8> {
-        // Must select mux channel first
         if !self.select_mux_channel() {
             return None;
         }
-
-        // Write register address
         let addr = [reg];
         if syscall::write(self.i2c_gpio_fd as u32, &addr) < 0 {
             return None;
         }
-
-        // Read value
         let mut buf = [0u8];
         if syscall::read(self.i2c_gpio_fd as u32, &mut buf) < 0 {
             return None;
         }
-
         Some(buf[0])
     }
 
-    /// Initialize the GPIO expander
     fn init(&mut self) -> bool {
         println!("  Initializing PCA9555...");
 
-        // Select mux channel
         if !self.select_mux_channel() {
             println!("    Failed to select mux channel");
             return false;
         }
         println!("    Mux channel 3 selected");
 
-        // Read current state
         if let Some(out0) = self.read_reg(pca9555::OUTPUT_PORT0) {
             self.output_state[0] = out0;
             println!("    Output port 0: 0x{:02x}", out0);
@@ -170,11 +185,66 @@ impl GpioExpander {
             println!("    Config port 1: 0x{:02x}", cfg1);
         }
 
+        // Read initial input state
+        if let Some(in0) = self.read_reg(pca9555::INPUT_PORT0) {
+            self.input_state[0] = in0;
+            println!("    Input port 0: 0x{:02x}", in0);
+        }
+        if let Some(in1) = self.read_reg(pca9555::INPUT_PORT1) {
+            self.input_state[1] = in1;
+            println!("    Input port 1: 0x{:02x}", in1);
+        }
+
         println!("    PCA9555 initialized");
         true
     }
 
-    /// Set a GPIO pin as output with given value
+    /// Read current input state (both ports)
+    fn read_inputs(&self) -> Option<[u8; 2]> {
+        let in0 = self.read_reg(pca9555::INPUT_PORT0)?;
+        let in1 = self.read_reg(pca9555::INPUT_PORT1)?;
+        Some([in0, in1])
+    }
+
+    /// Poll for input changes and notify devd of any changes
+    /// Returns the number of pins that changed
+    fn poll_changes(&mut self, devd: &mut Option<DevdClient>) -> usize {
+        let current = match self.read_inputs() {
+            Some(v) => v,
+            None => return 0,
+        };
+
+        let mut changed_count = 0;
+
+        // Check each port for changes
+        for port in 0..2 {
+            let old = self.input_state[port];
+            let new = current[port];
+            let changed = old ^ new;
+
+            if changed != 0 {
+                // Find which bits changed
+                for bit in 0..8 {
+                    if (changed >> bit) & 1 != 0 {
+                        let pin = (port * 8 + bit) as u8;
+                        // Only notify for input pins (config bit = 1)
+                        if (self.config_state[port] >> bit) & 1 != 0 {
+                            changed_count += 1;
+                            // Update devd if connected
+                            if let Some(client) = devd {
+                                self.update_pin_in_devd(client, pin);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update cached state
+        self.input_state = current;
+        changed_count
+    }
+
     fn set_output(&mut self, pin: u8, high: bool) -> bool {
         if pin >= 16 {
             return false;
@@ -205,7 +275,6 @@ impl GpioExpander {
         self.write_reg(output_reg, self.output_state[port])
     }
 
-    /// Read a GPIO pin value
     fn read_pin(&self, pin: u8) -> Option<bool> {
         if pin >= 16 {
             return None;
@@ -218,33 +287,79 @@ impl GpioExpander {
         self.read_reg(input_reg).map(|v| (v >> bit) & 1 != 0)
     }
 
-    /// Enable USB VBUS power
-    fn enable_usb_vbus(&mut self) -> bool {
-        println!("  Enabling USB VBUS (pin {})...", GPIO_USB_VBUS);
-        if self.set_output(GPIO_USB_VBUS, true) {
-            println!("    USB VBUS enabled");
-            true
-        } else {
-            println!("    Failed to enable USB VBUS");
-            false
+    /// Handle a GPIO request
+    fn handle_request(&mut self, request: &GpioRequest, devd: &mut Option<DevdClient>) -> GpioResponse {
+        match request {
+            GpioRequest::SetPin { pin, high } => {
+                if self.set_output(*pin, *high) {
+                    // Update devd with new state
+                    if let Some(client) = devd {
+                        self.update_pin_in_devd(client, *pin);
+                    }
+                    GpioResponse::Ok
+                } else {
+                    GpioResponse::Error(-1)
+                }
+            }
+            GpioRequest::GetPin { pin } => {
+                match self.read_pin(*pin) {
+                    Some(value) => GpioResponse::PinValue(value),
+                    None => GpioResponse::Error(-1),
+                }
+            }
         }
     }
 
-    /// Disable USB VBUS power
-    fn disable_usb_vbus(&mut self) -> bool {
-        println!("  Disabling USB VBUS (pin {})...", GPIO_USB_VBUS);
-        self.set_output(GPIO_USB_VBUS, false)
+    /// Register all GPIO pins with devd
+    fn register_with_devd(&self, devd: &mut DevdClient) {
+        for pin in 0u8..16 {
+            let port = pin / 8;
+            let bit = pin % 8;
+            let is_output = (self.config_state[port as usize] >> bit) & 1 == 0;
+            let value = if is_output {
+                (self.output_state[port as usize] >> bit) & 1 != 0
+            } else {
+                self.read_pin(pin).unwrap_or(false)
+            };
+
+            let path = PIN_PATHS[pin as usize];
+            let props = PropertyList::new()
+                .add("type", "gpio")
+                .add("dir", if is_output { "out" } else { "in" })
+                .add("val", if value { "1" } else { "0" })
+                .add("name", PIN_NAMES[pin as usize]);
+
+            if let Err(e) = devd.register(path, props) {
+                println!("  Failed to register {} with devd: {:?}", path, e);
+            }
+        }
+    }
+
+    /// Update a single pin's state in devd
+    fn update_pin_in_devd(&self, devd: &mut DevdClient, pin: u8) {
+        if pin >= 16 {
+            return;
+        }
+
+        let port = pin / 8;
+        let bit = pin % 8;
+        let is_output = (self.config_state[port as usize] >> bit) & 1 == 0;
+        let value = if is_output {
+            (self.output_state[port as usize] >> bit) & 1 != 0
+        } else {
+            self.read_pin(pin).unwrap_or(false)
+        };
+
+        let path = PIN_PATHS[pin as usize];
+        let props = PropertyList::new()
+            .add("type", "gpio")
+            .add("dir", if is_output { "out" } else { "in" })
+            .add("val", if value { "1" } else { "0" })
+            .add("name", PIN_NAMES[pin as usize]);
+
+        let _ = devd.update(path, props);
     }
 }
-
-// =============================================================================
-// IPC Message Protocol
-// =============================================================================
-
-// GPIO IPC commands
-const GPIO_CMD_SET_PIN: u8 = 1;    // Set pin high/low: [1, pin, value]
-const GPIO_CMD_GET_PIN: u8 = 2;    // Get pin value: [2, pin] -> [value]
-const GPIO_CMD_USB_VBUS: u8 = 3;   // Control USB VBUS: [3, enable]
 
 // =============================================================================
 // Main
@@ -258,21 +373,7 @@ fn main() {
     println!("========================================");
     println!();
 
-    // Register the "gpio" port
-    let port_result = syscall::port_register(b"gpio");
-    if port_result < 0 {
-        if port_result == -17 {  // EEXIST
-            println!("ERROR: GPIO driver already running");
-        } else {
-            println!("ERROR: Failed to register GPIO port: {}", port_result);
-        }
-        syscall::exit(1);
-    }
-    let listen_channel = port_result as u32;
-    println!("  Registered 'gpio' port (channel {})", listen_channel);
-
     // Create and initialize GPIO expander
-    println!();
     println!("=== I2C Initialization ===");
     let mut gpio = match GpioExpander::new() {
         Some(g) => g,
@@ -289,74 +390,129 @@ fn main() {
         syscall::exit(1);
     }
 
-    // Enable USB VBUS by default
+    // Enable USB VBUS by default (pin 11)
     println!();
     println!("=== Enabling USB Power ===");
-    if !gpio.enable_usb_vbus() {
-        println!("WARNING: Failed to enable USB VBUS");
+    if gpio.set_output(GPIO_USB_VBUS, true) {
+        println!("  USB VBUS enabled (pin {})", GPIO_USB_VBUS);
+    } else {
+        println!("  WARNING: Failed to enable USB VBUS");
     }
 
-    // Daemonize
+    // Register GPIO server
+    println!();
+    let server = match Server::<GpioProtocol>::register() {
+        Ok(s) => {
+            println!("  Registered 'gpio' port");
+            s
+        }
+        Err(IpcError::ResourceBusy) => {
+            println!("ERROR: GPIO driver already running");
+            syscall::exit(1);
+        }
+        Err(e) => {
+            println!("ERROR: Failed to register GPIO port: {:?}", e);
+            syscall::exit(1);
+        }
+    };
+
+    // Connect to devd and register pins
+    println!();
+    println!("=== Registering with devd ===");
+    let mut devd_client: Option<DevdClient> = match DevdClient::connect() {
+        Ok(mut client) => {
+            println!("  Connected to devd");
+            gpio.register_with_devd(&mut client);
+            println!("  Registered {} GPIO pins", 16);
+            Some(client)
+        }
+        Err(e) => {
+            println!("  WARNING: Failed to connect to devd: {:?}", e);
+            println!("  GPIO pins will not be visible in device tree");
+            None
+        }
+    };
+
+    // Subscribe to events
+    println!();
+    println!("=== Setting up event handling ===");
+
+    // Subscribe to IPC events for GPIO port
+    let gpio_channel = server.listen_channel();
+    let result = syscall::event_subscribe(event_type::IPC_READY, gpio_channel as u64);
+    if result != 0 {
+        println!("ERROR: Failed to subscribe to IPC events: {}", result);
+        syscall::exit(1);
+    }
+    println!("  IpcReady(gpio:{}): OK", gpio_channel);
+
+    // Subscribe to timer events for polling
+    let result = syscall::event_subscribe(event_type::TIMER, 0);
+    if result != 0 {
+        println!("ERROR: Failed to subscribe to Timer events: {}", result);
+        syscall::exit(1);
+    }
+    println!("  Timer: OK");
+
+    // Set initial polling timer
+    syscall::timer_set(POLL_INTERVAL_NS);
+
     println!();
     println!("========================================");
-    println!("  GPIO driver initialized!");
+    println!("  GPIO driver ready (polling every 100ms)");
     println!("========================================");
 
-    let result = syscall::daemonize();
-    if result == 0 {
-        println!("  Daemonized - running as background GPIO driver");
+    // Event-driven main loop
+    let mut event = Event::empty();
 
-        // Main loop - handle IPC requests
-        let mut msg_buf = [0u8; 16];
-        loop {
-            // Accept connection
-            let client = syscall::port_accept(listen_channel);
-            if client < 0 {
-                syscall::yield_now();
-                continue;
-            }
-            let client_ch = client as u32;
+    loop {
+        let result = syscall::event_wait(&mut event, event_flags::BLOCKING);
 
-            // Read request
-            let len = syscall::receive(client_ch, &mut msg_buf);
-            if len > 0 {
-                let cmd = msg_buf[0];
-                let response = match cmd {
-                    GPIO_CMD_SET_PIN if len >= 3 => {
-                        let pin = msg_buf[1];
-                        let value = msg_buf[2] != 0;
-                        if gpio.set_output(pin, value) { 0i8 } else { -1i8 }
-                    }
-                    GPIO_CMD_GET_PIN if len >= 2 => {
-                        let pin = msg_buf[1];
-                        match gpio.read_pin(pin) {
-                            Some(true) => 1i8,
-                            Some(false) => 0i8,
-                            None => -1i8,
-                        }
-                    }
-                    GPIO_CMD_USB_VBUS if len >= 2 => {
-                        let enable = msg_buf[1] != 0;
-                        let ok = if enable {
-                            gpio.enable_usb_vbus()
-                        } else {
-                            gpio.disable_usb_vbus()
-                        };
-                        if ok { 0i8 } else { -1i8 }
-                    }
-                    _ => -22i8,  // EINVAL
-                };
-
-                // Send response
-                let resp = [response as u8];
-                let _ = syscall::send(client_ch, &resp);
-            }
-
-            syscall::channel_close(client_ch);
+        if result == -11 {
+            // EAGAIN - yield and retry
+            syscall::yield_now();
+            continue;
         }
-    } else {
-        println!("  Daemonize failed: {}", result);
-    }
 
-    syscall::exit(0);
+        if result <= 0 {
+            syscall::yield_now();
+            continue;
+        }
+
+        match event.event_type {
+            et if et == event_type::IPC_READY => {
+                let channel = event.data as u32;
+                if channel == gpio_channel {
+                    // Accept connection on GPIO port
+                    let mut conn: Connection<GpioProtocol> = match server.accept() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+
+                    // Handle request
+                    match conn.receive() {
+                        Ok(request) => {
+                            let response = gpio.handle_request(&request, &mut devd_client);
+                            let _ = conn.send(&response);
+                        }
+                        Err(_) => {}
+                    }
+                    // Connection dropped here
+                }
+            }
+
+            et if et == event_type::TIMER => {
+                // Poll for input changes
+                let changed = gpio.poll_changes(&mut devd_client);
+                if changed > 0 {
+                    println!("[gpio] {} input pin(s) changed", changed);
+                }
+
+                // Re-arm timer for next poll
+                syscall::timer_set(POLL_INTERVAL_NS);
+            }
+
+            _ => {}
+        }
+    }
 }

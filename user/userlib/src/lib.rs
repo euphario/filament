@@ -11,6 +11,7 @@ pub mod ring;
 pub mod mmio;
 pub mod trace;
 pub mod firmware;
+pub mod ipc;
 
 pub use syscall::*;
 pub use io::{Stdout, Stdin, Stderr};

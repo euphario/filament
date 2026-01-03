@@ -10,6 +10,7 @@
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]  // PWM constants for different channels
 
 use userlib::{println, syscall, MmioRegion};
 
@@ -289,53 +290,43 @@ fn main() {
     println!("  PWM6 PWMDWIDTH: {}", pwm.pwm.read32(ch_off + pwm_reg::PWMDWIDTH));
     println!("  PWM6 PWMTHRES: {}", pwm.pwm.read32(ch_off + pwm_reg::PWMTHRES));
 
-    // Daemonize
     println!();
     println!("========================================");
     println!("  PWM Fan driver initialized!");
     println!("========================================");
 
-    let result = syscall::daemonize();
-    if result == 0 {
-        println!("  Daemonized - running as background PWM driver");
-
-        // Main loop - handle IPC requests
-        let mut msg_buf = [0u8; 16];
-        loop {
-            // Accept connection
-            let client = syscall::port_accept(listen_channel);
-            if client < 0 {
-                syscall::yield_now();
-                continue;
-            }
-            let client_ch = client as u32;
-
-            // Read request
-            let len = syscall::receive(client_ch, &mut msg_buf);
-            if len > 0 {
-                let cmd = msg_buf[0];
-                let response = match cmd {
-                    PWM_CMD_SET_FAN if len >= 2 => {
-                        let percent = msg_buf[1] as u32;
-                        pwm.set_fan_speed(percent);
-                        percent as i8
-                    }
-                    PWM_CMD_GET_FAN => {
-                        pwm.get_fan_speed() as i8
-                    }
-                    _ => -22i8,  // EINVAL
-                };
-
-                // Send response
-                let resp = [response as u8];
-                let _ = syscall::send(client_ch, &resp);
-            }
-
-            syscall::channel_close(client_ch);
+    // Main loop - handle IPC requests (devd supervises us, no need to daemonize)
+    let mut msg_buf = [0u8; 16];
+    loop {
+        // Accept connection
+        let client = syscall::port_accept(listen_channel);
+        if client < 0 {
+            syscall::yield_now();
+            continue;
         }
-    } else {
-        println!("  Daemonize failed: {}", result);
-    }
+        let client_ch = client as u32;
 
-    syscall::exit(0);
+        // Read request
+        let len = syscall::receive(client_ch, &mut msg_buf);
+        if len > 0 {
+            let cmd = msg_buf[0];
+            let response = match cmd {
+                PWM_CMD_SET_FAN if len >= 2 => {
+                    let percent = msg_buf[1] as u32;
+                    pwm.set_fan_speed(percent);
+                    percent as i8
+                }
+                PWM_CMD_GET_FAN => {
+                    pwm.get_fan_speed() as i8
+                }
+                _ => -22i8,  // EINVAL
+            };
+
+            // Send response
+            let resp = [response as u8];
+            let _ = syscall::send(client_ch, &resp);
+        }
+
+        syscall::channel_close(client_ch);
+    }
 }

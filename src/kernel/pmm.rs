@@ -1,41 +1,63 @@
 //! Physical Memory Manager (PMM)
 //!
-//! Hybrid allocator combining:
-//! - Free list for O(1) single-page allocation
-//! - Bitmap for contiguous allocation and sanity checking
+//! External metadata allocator - production-quality page frame management.
 //!
-//! Each free page's first 8 bytes stores the next pointer (intrusive list).
-//! Note: Free list entries store physical addresses, but access is done
-//! through kernel virtual addresses (mmu::phys_to_virt(phys_addr)).
+//! ## Design
+//!
+//! Each physical page has a corresponding `PageFrame` struct stored in an
+//! external array (not in the page data itself). This allows:
+//! - Page content to be modified without corrupting the allocator
+//! - Reference counting for shared pages
+//! - Page flags (kernel, user, DMA, reserved)
+//! - O(1) allocation and freeing
+//!
+//! The PageFrame array is allocated at boot from reserved memory after the
+//! kernel, not embedded in the kernel image. This keeps the kernel small
+//! and allows adaptation to different RAM sizes.
+//!
+//! ## Memory Layout
+//!
+//! ```text
+//! DRAM_BASE ──────────────────────────────────────────
+//!            │ Reserved (U-Boot, DTB, etc.)        │
+//!            ├─────────────────────────────────────────
+//!            │ Kernel code + data + BSS            │
+//! __kernel_end ────────────────────────────────────────
+//!            │ Kernel reserved (stack margin)      │
+//! PMM_FRAMES_BASE ─────────────────────────────────────
+//!            │ PageFrame array (8 bytes per page)  │
+//!            │ For 4GB: 1M pages × 8 = 8MB         │
+//! ─────────────────────────────────────────────────────
+//!            │ Free memory for allocation          │
+//! DRAM_END ──────────────────────────────────────────
+//! ```
 //!
 //! ## Thread Safety
 //!
 //! All operations are protected by a SpinLock with IRQ-save semantics.
-//! This is safe to call from both process and interrupt context.
+//! Safe to call from both process and interrupt context.
 
 use crate::logln;
 use crate::arch::aarch64::mmu;
+use crate::platform::mt7988::{DRAM_BASE, DRAM_END};
 use super::lock::SpinLock;
 
-/// Page size (4KB)
-pub const PAGE_SIZE: usize = 4096;
+/// Page size (4KB) - re-exported for other modules
+pub const PAGE_SIZE: usize = crate::platform::mt7988::PAGE_SIZE;
 
-/// Start of usable DRAM
-const DRAM_START: usize = 0x40000000;
+/// Sentinel value for end of free list
+const FREE_LIST_END: u32 = u32::MAX;
 
-/// End of usable DRAM (4GB total, but we'll use 1GB for now)
-const DRAM_END: usize = 0x80000000; // 1GB usable
+/// Kernel physical load address (must match linker script)
+const KERNEL_PHYS_BASE: usize = 0x46000000;
 
-// Linker symbols for kernel boundaries (virtual addresses)
+// Linker symbols for kernel boundaries
 extern "C" {
     static __kernel_start: u8;
     static __kernel_end: u8;
 }
 
-/// Kernel physical load address (must match linker script)
-const KERNEL_PHYS_BASE: usize = 0x46000000;
-
-/// Get kernel size in bytes (computed from linker symbols)
+/// Get kernel size in bytes
 fn kernel_size() -> usize {
     unsafe {
         let virt_end = &__kernel_end as *const u8 as usize;
@@ -44,186 +66,218 @@ fn kernel_size() -> usize {
     }
 }
 
-/// Number of pages we manage
-const NUM_PAGES: usize = (DRAM_END - DRAM_START) / PAGE_SIZE;
+// ============================================================================
+// Page Frame Metadata
+// ============================================================================
 
-/// Bitmap size in bytes (1 bit per page)
-const BITMAP_SIZE: usize = NUM_PAGES / 8;
-
-/// Physical page frame allocator
-pub struct PhysicalMemoryManager {
-    /// Bitmap: 1 = used, 0 = free (kept for contiguous alloc and validation)
-    bitmap: [u8; BITMAP_SIZE],
-    /// Total pages
-    total_pages: usize,
-    /// Free pages count
-    free_pages: usize,
-    /// Head of free list (physical address, 0 = empty)
-    free_list_head: usize,
+/// Page state flags
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PageState {
+    /// Page is free and available for allocation
+    Free = 0,
+    /// Page is allocated and in use
+    Used = 1,
+    /// Page is reserved (kernel, metadata, U-Boot, etc.)
+    Reserved = 2,
 }
+
+/// External metadata for each physical page frame
+///
+/// This struct lives OUTSIDE the page data, so page content can be
+/// freely modified without affecting the allocator.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct PageFrame {
+    /// Index of next free page (FREE_LIST_END = end of list)
+    next_free: u32,
+    /// Page state
+    state: PageState,
+    /// Reference count (for shared pages, copy-on-write)
+    ref_count: u8,
+    /// Reserved for future use
+    _reserved: [u8; 2],
+}
+
+impl PageFrame {
+    const fn new() -> Self {
+        Self {
+            next_free: FREE_LIST_END,
+            state: PageState::Free,
+            ref_count: 0,
+            _reserved: [0; 2],
+        }
+    }
+}
+
+// Compile-time check: PageFrame should be 8 bytes
+const _: () = assert!(core::mem::size_of::<PageFrame>() == 8);
+
+// ============================================================================
+// Physical Memory Manager
+// ============================================================================
+
+/// Physical page frame allocator with external metadata
+pub struct PhysicalMemoryManager {
+    /// Pointer to PageFrame array (allocated at boot, not in kernel image)
+    frames: *mut PageFrame,
+    /// Number of page frames
+    num_frames: usize,
+    /// Head of free list (page index, FREE_LIST_END = empty)
+    free_list_head: u32,
+    /// Number of free pages
+    free_pages: usize,
+    /// First allocatable page index (after metadata region)
+    first_free_page: usize,
+    /// Whether PMM is initialized
+    initialized: bool,
+}
+
+// Safety: PMM is protected by SpinLock and only accessed through lock
+unsafe impl Send for PhysicalMemoryManager {}
+unsafe impl Sync for PhysicalMemoryManager {}
 
 impl PhysicalMemoryManager {
     pub const fn new() -> Self {
         Self {
-            bitmap: [0; BITMAP_SIZE],
-            total_pages: NUM_PAGES,
+            frames: core::ptr::null_mut(),
+            num_frames: 0,
+            free_list_head: FREE_LIST_END,
             free_pages: 0,
-            free_list_head: 0,
+            first_free_page: 0,
+            initialized: false,
         }
     }
 
+    /// Get a frame by index
+    #[inline]
+    fn frame(&self, idx: usize) -> &PageFrame {
+        debug_assert!(idx < self.num_frames);
+        unsafe { &*self.frames.add(idx) }
+    }
+
+    /// Get a mutable frame by index
+    #[inline]
+    fn frame_mut(&mut self, idx: usize) -> &mut PageFrame {
+        debug_assert!(idx < self.num_frames);
+        unsafe { &mut *self.frames.add(idx) }
+    }
+
     /// Initialize the allocator
+    ///
+    /// Memory layout after init:
+    /// - Pages 0..16: Reserved (U-Boot, DTB)
+    /// - Pages kernel_start..kernel_end+margin: Reserved (kernel)
+    /// - Pages metadata_start..metadata_end: Reserved (PageFrame array)
+    /// - Pages metadata_end..: Free for allocation
     pub fn init(&mut self) {
-        // Mark all pages as free initially
-        for byte in self.bitmap.iter_mut() {
-            *byte = 0;
+        if self.initialized {
+            return;
         }
-        self.free_pages = self.total_pages;
-        self.free_list_head = 0;
 
-        // Get kernel boundaries from linker symbols (dynamic size, not hardcoded)
-        let k_start = KERNEL_PHYS_BASE;
+        // Calculate number of pages in system
+        let total_pages = (DRAM_END - DRAM_BASE) / PAGE_SIZE;
+        self.num_frames = total_pages;
+
+        // Calculate kernel reserved region (with 256KB safety margin)
         let k_size = kernel_size();
-        // Round up kernel size to page boundary and add safety margin (256KB)
-        let k_reserved = ((k_size + PAGE_SIZE - 1) / PAGE_SIZE + 64) * PAGE_SIZE;
+        let k_reserved_pages = (k_size + PAGE_SIZE - 1) / PAGE_SIZE + 64;
+        let kernel_start_page = (KERNEL_PHYS_BASE - DRAM_BASE) / PAGE_SIZE;
+        let kernel_end_page = kernel_start_page + k_reserved_pages;
 
-        // Mark kernel region as used (don't add to free list)
-        let kernel_start_page = (k_start - DRAM_START) / PAGE_SIZE;
-        let kernel_pages = k_reserved / PAGE_SIZE;
-        for i in kernel_start_page..(kernel_start_page + kernel_pages) {
-            if i < self.total_pages {
-                self.mark_used_no_list(i);
+        // Calculate PageFrame array size and location
+        // Place it right after kernel reserved region
+        let frames_size = total_pages * core::mem::size_of::<PageFrame>();
+        let frames_pages = (frames_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let frames_start_page = kernel_end_page;
+        let frames_end_page = frames_start_page + frames_pages;
+
+        // Physical address of PageFrame array
+        let frames_phys = DRAM_BASE + frames_start_page * PAGE_SIZE;
+        self.frames = mmu::phys_to_virt(frames_phys as u64) as *mut PageFrame;
+
+        // First page available for allocation
+        self.first_free_page = frames_end_page;
+
+        // Initialize all frames
+        for i in 0..total_pages {
+            let frame = self.frame_mut(i);
+            frame.next_free = FREE_LIST_END;
+            frame.ref_count = 0;
+
+            if i < 16 {
+                // Reserved: U-Boot, DTB, etc.
+                frame.state = PageState::Reserved;
+            } else if i >= kernel_start_page && i < kernel_end_page {
+                // Reserved: Kernel
+                frame.state = PageState::Reserved;
+            } else if i >= frames_start_page && i < frames_end_page {
+                // Reserved: PageFrame array itself
+                frame.state = PageState::Reserved;
+            } else {
+                frame.state = PageState::Free;
             }
         }
 
-        // Mark first few pages as used (safety buffer for U-Boot, DTB, etc.)
-        for i in 0..16 {
-            self.mark_used_no_list(i);
-        }
+        // Count free pages and build free list
+        self.free_pages = 0;
+        self.free_list_head = FREE_LIST_END;
 
-        // Build free list from all free pages
-        // Walk bitmap and add free pages to list
-        for page_idx in 0..self.total_pages {
-            if self.is_free(page_idx) {
-                let phys_addr = DRAM_START + page_idx * PAGE_SIZE;
-                self.push_free_list(phys_addr);
+        // Build free list in reverse order (lower addresses at head)
+        for i in (self.first_free_page..total_pages).rev() {
+            if self.frame(i).state == PageState::Free {
+                self.push_free_list(i);
+                self.free_pages += 1;
             }
         }
+
+        self.initialized = true;
+
+        let free_mb = self.free_pages * PAGE_SIZE / (1024 * 1024);
+        let total_mb = total_pages * PAGE_SIZE / (1024 * 1024);
+        let meta_mb = frames_pages * PAGE_SIZE / (1024 * 1024);
+        logln!("[PMM] {} pages total ({} MB), {} free ({} MB)",
+               total_pages, total_mb, self.free_pages, free_mb);
+        logln!("[PMM] Metadata: {} pages ({} MB) at 0x{:x}",
+               frames_pages, meta_mb, frames_phys);
     }
 
     /// Push a page onto the free list (O(1))
     #[inline]
-    fn push_free_list(&mut self, phys_addr: usize) {
-        // Validate address before pushing
-        if phys_addr < DRAM_START || phys_addr >= DRAM_END {
-            logln!("[PMM] ERROR: push_free_list invalid addr=0x{:x}", phys_addr);
-            return;
-        }
-        if phys_addr & (PAGE_SIZE - 1) != 0 {
-            logln!("[PMM] ERROR: push_free_list unaligned addr=0x{:x}", phys_addr);
-            return;
-        }
-
-        // Store current head in the page's first 8 bytes
-        // Access via kernel virtual address (TTBR1 mapping)
-        let virt_addr = mmu::phys_to_virt(phys_addr as u64);
-        let ptr = virt_addr as *mut usize;
-        let old_head = self.free_list_head;
-        unsafe {
-            core::ptr::write_volatile(ptr, old_head);
-            // Data synchronization barrier to ensure write completes
-            core::arch::asm!("dsb sy");
-            // Verify write
-            let readback = core::ptr::read_volatile(ptr);
-            if readback != old_head {
-                logln!("[PMM] WRITE FAILED: wrote 0x{:x} to 0x{:x}, read back 0x{:x}",
-                       old_head, phys_addr, readback);
-            }
-        }
-        self.free_list_head = phys_addr;
+    fn push_free_list(&mut self, page_idx: usize) {
+        debug_assert!(page_idx < self.num_frames);
+        self.frame_mut(page_idx).next_free = self.free_list_head;
+        self.free_list_head = page_idx as u32;
     }
 
     /// Pop a page from the free list (O(1))
     #[inline]
     fn pop_free_list(&mut self) -> Option<usize> {
-        if self.free_list_head == 0 {
+        if self.free_list_head == FREE_LIST_END {
             return None;
         }
-        let phys_addr = self.free_list_head;
 
-        // Validate free_list_head is in DRAM range before dereferencing
-        if phys_addr < DRAM_START || phys_addr >= DRAM_END {
-            logln!("[PMM] CORRUPTION: free_list_head=0x{:x} outside DRAM!", phys_addr);
-            panic!("PMM free list corrupted");
-        }
-        // Check page alignment
-        if phys_addr & (PAGE_SIZE - 1) != 0 {
-            logln!("[PMM] CORRUPTION: free_list_head=0x{:x} not page-aligned!", phys_addr);
-            panic!("PMM free list corrupted");
-        }
+        let page_idx = self.free_list_head as usize;
+        debug_assert!(page_idx < self.num_frames);
 
-        // Read next pointer from the page via kernel virtual address (TTBR1 mapping)
-        let virt_addr = mmu::phys_to_virt(phys_addr as u64);
-        let ptr = virt_addr as *const usize;
-        unsafe {
-            self.free_list_head = core::ptr::read_volatile(ptr);
-        }
+        self.free_list_head = self.frame(page_idx).next_free;
+        self.frame_mut(page_idx).next_free = FREE_LIST_END;
 
-        // Validate new head (if non-zero)
-        if self.free_list_head != 0 {
-            if self.free_list_head < DRAM_START || self.free_list_head >= DRAM_END {
-                logln!("[PMM] CORRUPTION detected after pop: new head=0x{:x} from page 0x{:x}",
-                       self.free_list_head, phys_addr);
-                panic!("PMM free list corrupted");
-            }
-        }
-
-        Some(phys_addr)
+        Some(page_idx)
     }
 
-    /// Allocate a single page, returns physical address or None (O(1) amortized)
+    /// Allocate a single page (O(1))
     pub fn alloc_page(&mut self) -> Option<usize> {
-        // Pop from free list, skipping stale entries (pages allocated via alloc_pages)
-        loop {
-            let phys_addr = self.pop_free_list()?;
-            let page_idx = (phys_addr - DRAM_START) / PAGE_SIZE;
+        let page_idx = self.pop_free_list()?;
 
-            // Check if page is actually free (not stale entry from contiguous alloc)
-            if self.is_free(page_idx) {
-                self.mark_used_no_list(page_idx);
-                // Debug: log when specific page is allocated
-                if phys_addr == 0x4006c000 {
-                    logln!("[PMM] Allocating page 0x4006c000!");
-                }
-                return Some(phys_addr);
-            }
-            // Stale entry - continue to next
-        }
+        self.frame_mut(page_idx).state = PageState::Used;
+        self.frame_mut(page_idx).ref_count = 1;
+        self.free_pages -= 1;
+
+        Some(DRAM_BASE + page_idx * PAGE_SIZE)
     }
 
-    /// Rebuild the free list from scratch using the bitmap
-    /// This removes any stale entries that might have corrupted pointers
-    fn rebuild_free_list(&mut self) {
-        self.free_list_head = 0;
-        // Walk bitmap and rebuild free list
-        // We iterate in reverse so lower addresses end up at the head
-        // (better for locality when allocating)
-        for page_idx in (0..self.total_pages).rev() {
-            if self.is_free(page_idx) {
-                let phys_addr = DRAM_START + page_idx * PAGE_SIZE;
-                // Store current head in the page's first 8 bytes
-                let virt_addr = mmu::phys_to_virt(phys_addr as u64);
-                let ptr = virt_addr as *mut usize;
-                unsafe {
-                    core::ptr::write_volatile(ptr, self.free_list_head);
-                }
-                self.free_list_head = phys_addr;
-            }
-        }
-    }
-
-    /// Allocate contiguous pages, returns starting physical address or None
-    /// Note: O(n) for contiguous allocation, but this is rare (DMA buffers only)
+    /// Allocate contiguous pages (O(n) scan)
     pub fn alloc_pages(&mut self, count: usize) -> Option<usize> {
         if count == 0 {
             return None;
@@ -232,53 +286,100 @@ impl PhysicalMemoryManager {
             return self.alloc_page();
         }
 
-        // Find contiguous free pages using bitmap (linear search)
-        let mut start_page = 0;
+        // Scan for contiguous free pages
+        let mut start_page = self.first_free_page;
         let mut consecutive = 0;
+        let mut max_consecutive = 0;
+        let mut scanned = 0;
 
-        for page_idx in 0..self.total_pages {
-            if self.is_free(page_idx) {
+        for page_idx in self.first_free_page..self.num_frames {
+            scanned += 1;
+            if self.frame(page_idx).state == PageState::Free {
                 if consecutive == 0 {
                     start_page = page_idx;
                 }
                 consecutive += 1;
+                if consecutive > max_consecutive {
+                    max_consecutive = consecutive;
+                }
                 if consecutive == count {
-                    // Found enough contiguous pages, mark them used in bitmap
+                    // Found enough! Remove from free list and mark as used
+                    self.remove_range_from_free_list(start_page, count);
+
                     for i in start_page..(start_page + count) {
-                        self.mark_used_no_list(i);
+                        self.frame_mut(i).state = PageState::Used;
+                        self.frame_mut(i).ref_count = 1;
                     }
-                    let phys_addr = DRAM_START + start_page * PAGE_SIZE;
+                    self.free_pages -= count;
 
-                    // CRITICAL: Rebuild free list to remove stale entries
-                    // Without this, stale entries pointing to now-used pages will have
-                    // their "next pointer" corrupted when the page is written to (e.g., ELF code)
-                    self.rebuild_free_list();
-
-                    return Some(phys_addr);
+                    return Some(DRAM_BASE + start_page * PAGE_SIZE);
                 }
             } else {
                 consecutive = 0;
             }
         }
+
+        // Debug: log failure for large allocations
+        if count >= 256 {
+            logln!("[PMM] alloc_pages({}) FAILED: scanned={}, max_consecutive={}, free={}, first_free={}",
+                   count, scanned, max_consecutive, self.free_pages, self.first_free_page);
+        }
         None
+    }
+
+    /// Remove a range of pages from the free list
+    fn remove_range_from_free_list(&mut self, start: usize, count: usize) {
+        let end = start + count;
+
+        // Handle head of list
+        while self.free_list_head != FREE_LIST_END {
+            let head = self.free_list_head as usize;
+            if head >= start && head < end {
+                self.free_list_head = self.frame(head).next_free;
+                self.frame_mut(head).next_free = FREE_LIST_END;
+            } else {
+                break;
+            }
+        }
+
+        // Walk the rest
+        if self.free_list_head != FREE_LIST_END {
+            let mut prev = self.free_list_head as usize;
+            while self.frame(prev).next_free != FREE_LIST_END {
+                let curr = self.frame(prev).next_free as usize;
+                if curr >= start && curr < end {
+                    self.frame_mut(prev).next_free = self.frame(curr).next_free;
+                    self.frame_mut(curr).next_free = FREE_LIST_END;
+                } else {
+                    prev = curr;
+                }
+            }
+        }
     }
 
     /// Free a single page (O(1))
     pub fn free_page(&mut self, phys_addr: usize) {
-        if phys_addr < DRAM_START || phys_addr >= DRAM_END {
-            return; // Invalid address
+        if phys_addr < DRAM_BASE || phys_addr >= DRAM_END {
+            return;
         }
-        let page_idx = (phys_addr - DRAM_START) / PAGE_SIZE;
-        // Only free if currently allocated (avoid double-free)
-        if !self.is_free(page_idx) {
-            // Debug: log when specific page is freed
-            if phys_addr == 0x4006c000 {
-                logln!("[PMM] Freeing page 0x4006c000!");
+        if phys_addr & (PAGE_SIZE - 1) != 0 {
+            return;
+        }
+
+        let page_idx = (phys_addr - DRAM_BASE) / PAGE_SIZE;
+        if page_idx >= self.num_frames {
+            return;
+        }
+
+        if self.frame(page_idx).state == PageState::Used {
+            let new_ref = self.frame(page_idx).ref_count.saturating_sub(1);
+            self.frame_mut(page_idx).ref_count = new_ref;
+
+            if new_ref == 0 {
+                self.frame_mut(page_idx).state = PageState::Free;
+                self.push_free_list(page_idx);
+                self.free_pages += 1;
             }
-            self.mark_free_no_list(page_idx);
-            self.push_free_list(phys_addr);
-        } else if phys_addr == 0x4006c000 {
-            logln!("[PMM] DOUBLE-FREE attempt on 0x4006c000 (already free)");
         }
     }
 
@@ -296,7 +397,7 @@ impl PhysicalMemoryManager {
 
     /// Get total page count
     pub fn total_count(&self) -> usize {
-        self.total_pages
+        self.num_frames
     }
 
     /// Get free memory in bytes
@@ -304,51 +405,45 @@ impl PhysicalMemoryManager {
         self.free_pages * PAGE_SIZE
     }
 
-    #[inline]
-    fn is_free(&self, page_idx: usize) -> bool {
-        let byte_idx = page_idx / 8;
-        let bit = page_idx % 8;
-        (self.bitmap[byte_idx] & (1 << bit)) == 0
-    }
-
-    /// Mark page as used in bitmap only (doesn't touch free list)
-    #[inline]
-    fn mark_used_no_list(&mut self, page_idx: usize) {
-        let byte_idx = page_idx / 8;
-        let bit = page_idx % 8;
-        if self.is_free(page_idx) {
-            self.bitmap[byte_idx] |= 1 << bit;
-            self.free_pages -= 1;
+    /// Increment reference count for a page
+    #[allow(dead_code)]
+    pub fn inc_ref(&mut self, phys_addr: usize) -> bool {
+        if phys_addr < DRAM_BASE || phys_addr >= DRAM_END {
+            return false;
+        }
+        let page_idx = (phys_addr - DRAM_BASE) / PAGE_SIZE;
+        if page_idx >= self.num_frames {
+            return false;
+        }
+        if self.frame(page_idx).state == PageState::Used {
+            let frame = self.frame_mut(page_idx);
+            frame.ref_count = frame.ref_count.saturating_add(1);
+            true
+        } else {
+            false
         }
     }
 
-    /// Mark page as free in bitmap only (doesn't touch free list)
-    #[inline]
-    fn mark_free_no_list(&mut self, page_idx: usize) {
-        let byte_idx = page_idx / 8;
-        let bit = page_idx % 8;
-        if !self.is_free(page_idx) {
-            self.bitmap[byte_idx] &= !(1 << bit);
-            self.free_pages += 1;
+    /// Get reference count for a page
+    #[allow(dead_code)]
+    pub fn ref_count(&self, phys_addr: usize) -> u8 {
+        if phys_addr < DRAM_BASE || phys_addr >= DRAM_END {
+            return 0;
         }
+        let page_idx = (phys_addr - DRAM_BASE) / PAGE_SIZE;
+        if page_idx >= self.num_frames {
+            return 0;
+        }
+        self.frame(page_idx).ref_count
     }
 }
 
-/// Global PMM instance protected by SpinLock
-///
-/// The SpinLock provides:
-/// - IRQ-safe access (disables interrupts while held)
-/// - SMP-safe access (atomic spinlock for multi-core)
+// ============================================================================
+// Global PMM Instance
+// ============================================================================
+
+/// Global PMM protected by SpinLock
 static PMM: SpinLock<PhysicalMemoryManager> = SpinLock::new(PhysicalMemoryManager::new());
-
-/// Execute a closure with exclusive access to the PMM.
-/// The SpinLock automatically handles IRQ disable/enable.
-#[inline]
-#[allow(dead_code)]
-pub fn with_pmm<R, F: FnOnce(&mut PhysicalMemoryManager) -> R>(f: F) -> R {
-    let mut guard = PMM.lock();
-    f(&mut *guard)
-}
 
 /// Initialize the physical memory manager
 pub fn init() {
@@ -356,7 +451,7 @@ pub fn init() {
     guard.init();
 }
 
-/// Allocate a page
+/// Allocate a single page
 pub fn alloc_page() -> Option<usize> {
     let mut guard = PMM.lock();
     guard.alloc_page()
@@ -368,7 +463,7 @@ pub fn alloc_pages(count: usize) -> Option<usize> {
     guard.alloc_pages(count)
 }
 
-/// Free a page
+/// Free a single page
 pub fn free_page(addr: usize) {
     let mut guard = PMM.lock();
     guard.free_page(addr);
@@ -380,13 +475,12 @@ pub fn free_pages(addr: usize, count: usize) {
     guard.free_pages(addr, count);
 }
 
-/// Allocate contiguous physical pages (alias for alloc_pages)
-/// For shared memory / DMA buffers that need physical contiguity
+/// Allocate contiguous pages (alias for DMA)
 pub fn alloc_contiguous(count: usize) -> Option<usize> {
     alloc_pages(count)
 }
 
-/// Free contiguous physical pages (alias for free_pages)
+/// Free contiguous pages (alias)
 pub fn free_contiguous(addr: usize, count: usize) {
     free_pages(addr, count)
 }
@@ -412,31 +506,36 @@ pub fn print_info() {
     logln!("  Free:   {} pages ({} MB)", guard.free_count(), free_mb);
 }
 
-/// Test the allocator
-#[allow(dead_code)] // Test infrastructure
-pub fn test() {
-    logln!("  Testing allocation...");
+/// Execute a closure with exclusive PMM access
+#[inline]
+#[allow(dead_code)]
+pub fn with_pmm<R, F: FnOnce(&mut PhysicalMemoryManager) -> R>(f: F) -> R {
+    let mut guard = PMM.lock();
+    f(&mut *guard)
+}
 
-    // Allocate a page
+/// Test the allocator
+#[allow(dead_code)]
+pub fn test() {
+    logln!("  Testing PMM...");
+
     if let Some(addr) = alloc_page() {
         logln!("    Allocated page at 0x{:08x}", addr);
-
-        // Write test pattern
-        unsafe {
-            let ptr = addr as *mut u64;
-            core::ptr::write_volatile(ptr, 0xDEADBEEF_CAFEBABE);
-            let val = core::ptr::read_volatile(ptr);
-            if val == 0xDEADBEEF_CAFEBABE {
-                logln!("    Write/read test: OK");
-            } else {
-                logln!("    Write/read test: FAILED");
-            }
-        }
-
-        // Free it
         free_page(addr);
         logln!("    Freed page");
     } else {
-        logln!("    Allocation failed!");
+        logln!("    [!!] Allocation failed");
+        return;
     }
+
+    if let Some(addr) = alloc_pages(4) {
+        logln!("    Allocated 4 pages at 0x{:08x}", addr);
+        free_pages(addr, 4);
+        logln!("    Freed 4 pages");
+    } else {
+        logln!("    [!!] Contiguous allocation failed");
+        return;
+    }
+
+    logln!("    [OK] PMM tests passed");
 }

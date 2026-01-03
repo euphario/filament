@@ -33,6 +33,7 @@
 #![allow(dead_code)]  // Infrastructure for future use
 
 use crate::arch::aarch64::mmu::{self, flags, PAGE_SIZE};
+use crate::arch::aarch64::mmio::cache_clean_range;
 use super::task;
 
 /// Maximum valid user space address (48-bit, upper half is kernel)
@@ -615,6 +616,13 @@ pub fn copy_to_user(user_ptr: u64, kernel_buf: &[u8]) -> Result<usize, UAccessEr
             let dst = kernel_va as *mut u8;
             core::ptr::copy_nonoverlapping(src, dst, chunk_size);
         }
+
+        // CRITICAL: Clean cache to ensure data is visible to non-cacheable mappings
+        // User DMA buffers are mapped with NORMAL_NC (non-cacheable), but we write
+        // through the kernel's cached identity mapping. Without this cache clean,
+        // user reads from non-cacheable mapping would see stale zeros.
+        cache_clean_range(kernel_va, chunk_size);
+
         copied += chunk_size;
     }
 

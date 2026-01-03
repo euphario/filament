@@ -690,8 +690,67 @@ self.write(RST, val | rst_bits);   // Set - leaves at 0x30
 
 ---
 
+## Fixes Applied (2024-12-23)
+
+### 4. SWDEF_MODE Write Before driver_own() (CRITICAL)
+
+**Problem**: DMA index never advanced after writing cpu_idx (doorbell). The WiFi chip wasn't processing DMA descriptors at all.
+
+**Root Cause**: Missing `MT_SWDEF_MODE = MT_SWDEF_NORMAL_MODE` write before calling `driver_own()`. The Linux driver does this to "force firmware operation mode into normal state, which should be set before firmware download stage."
+
+**Fix**: Added write to SWDEF_MODE register (BAR offset 0x8143c) before driver_own() in `mcu.rs`:
+
+```rust
+// Step 0b: Force firmware operation mode to normal
+// Linux: mt76_wr(dev, MT_SWDEF_MODE, MT_SWDEF_NORMAL_MODE);
+self.dev.write32_raw(swdef::MODE, swdef::NORMAL_MODE);  // 0x8143c <- 0
+```
+
+**Register Details**:
+- Physical address: 0x0040143c
+- WF_MCU_SYSRAM base (0x00400000) maps to BAR offset 0x80000
+- SWDEF_BASE = 0x00401400 → BAR offset 0x81400
+- SWDEF_MODE = SWDEF_BASE + 0x3c → BAR offset 0x8143c
+- Normal mode value: 0
+
+### 5. wfsys_reset() Call Before Initialization
+
+**Problem**: WiFi hardware may not be in a clean state after PCIe enumeration.
+
+**Root Cause**: Linux calls `mt7996_wfsys_reset()` at probe time (before DMA init) to reset the wireless subsystem to a known state.
+
+**Fix**: Added call to `wfsys_reset()` at the beginning of `mcu.reset()` in `mcu.rs`:
+
+```rust
+// Step 0a: Wireless subsystem reset
+// Linux does this at probe time before DMA init
+trace!(MCU, "performing wfsys_reset...");
+self.wfdma.wfsys_reset();
+```
+
+This pulses the WF_SUBSYS_RST register (0x70028600 via CBTOP remap):
+1. Set bit 0 (assert reset)
+2. Wait 20ms
+3. Clear bit 0 (deassert reset)
+4. Wait 20ms
+
+---
+
+## Current Initialization Sequence (mcu.reset())
+
+```
+1. wfsys_reset()           - Reset WiFi subsystem to known state
+2. SWDEF_MODE = 0          - Force firmware to normal operation mode
+3. driver_own()            - Claim ownership from firmware
+4. Check FW_STATE          - Should be FW_DOWNLOAD (1)
+5. wfdma.init()            - Configure DMA rings and enable
+6. Load firmware via DMA   - ROM patch, WM, WA
+```
+
+---
+
 ## Remaining Items to Verify
 
-1. **RX thresholds** - Linux sets PAUSE_RX_Q_* thresholds
+1. **RX thresholds** - Linux sets PAUSE_RX_Q_* thresholds (now added)
 2. **Interrupt masking** - verify doesn't block DMA
 3. **Command TXD format** - verify header fields match Linux

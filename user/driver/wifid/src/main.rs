@@ -14,6 +14,7 @@
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]  // WiFi driver state machine reserved for future use
 
 mod driver;
 mod drivers;
@@ -45,16 +46,40 @@ fn main() {
     ];
 
     let mut wifi_count = 0;
+    let mut used_ports: [Option<u8>; 8] = [None; 8];  // Track ports we touched
+    let mut used_port_count = 0usize;
 
     for (vendor_id, vendor_name) in vendors {
         print!("Scanning {} devices... ", vendor_name);
         let devices = client.find_devices(vendor_id, 0xFFFF);
         println!("found {}", devices.len());
 
+        // Collect all device infos into a fixed-size array for probe_with_peers
+        let mut all_devices: [pcie::PcieDeviceInfo; 16] = [Default::default(); 16];
+        let mut device_count = 0;
         for info in devices.iter() {
-            // Try to find a driver for this device
-            if let Some(mut driver) = AnyWifiDriver::probe(info) {
+            if device_count < 16 {
+                all_devices[device_count] = *info;
+                device_count += 1;
+            }
+        }
+
+        for info in devices.iter() {
+            // Debug: print device info BEFORE probing
+            println!("  [{:02x}:{:02x}.{}] {:04x}:{:04x} BAR0=0x{:x}/{}KB cmd=0x{:04x}",
+                info.bus, info.device, info.function,
+                info.vendor_id, info.device_id,
+                info.bar0_addr, info.bar0_size / 1024,
+                info.command);
+
+            // Try to find a driver for this device (passing all devices so it can find peers like HIF2)
+            if let Some(mut driver) = AnyWifiDriver::probe_with_peers(info, &all_devices[..device_count]) {
                 wifi_count += 1;
+                // Track this port for cleanup
+                if used_port_count < 8 {
+                    used_ports[used_port_count] = Some(info.port);
+                    used_port_count += 1;
+                }
                 let dev_info = driver.device_info();
 
                 println!();

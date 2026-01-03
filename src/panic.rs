@@ -1,7 +1,7 @@
 //! Panic handler for bare-metal kernel
 
 use core::panic::PanicInfo;
-use crate::println;
+use crate::println_direct;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -13,11 +13,12 @@ fn panic(info: &PanicInfo) -> ! {
         crate::platform::mt7988::uart::flush_buffer();
     }
 
-    println!();
-    println!("=== KERNEL PANIC ===");
+    // Use direct UART output for panic - we need immediate visibility
+    println_direct!();
+    println_direct!("=== KERNEL PANIC ===");
 
     if let Some(location) = info.location() {
-        println!(
+        println_direct!(
             "  at {}:{}:{}",
             location.file(),
             location.line(),
@@ -26,12 +27,12 @@ fn panic(info: &PanicInfo) -> ! {
     }
 
     if let Some(message) = info.message().as_str() {
-        println!("  message: {}", message);
+        println_direct!("  message: {}", message);
     }
 
-    println!("====================");
-    println!();
-    println!("System halted.");
+    println_direct!("====================");
+    println_direct!();
+    println_direct!("System halted.");
 
     // Halt the CPU
     loop {

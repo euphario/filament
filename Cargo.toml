@@ -6,8 +6,9 @@ authors = ["Your Name"]
 description = "Bare-metal kernel for Banana Pi BPI-R4 (MT7988A)"
 
 [features]
-default = ["embed-initrd"]
+default = ["embed-initrd", "embed-dtb"]
 embed-initrd = []  # Embed user/initrd.tar in kernel binary
+embed-dtb = []     # Embed bpi-r4.dtb in kernel binary
 selftest = []      # Run self-tests during boot (slows boot, useful for dev)
 
 [dependencies]

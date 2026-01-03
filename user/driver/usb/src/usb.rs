@@ -208,6 +208,12 @@ impl EndpointContext {
     pub fn set_interval(&mut self, interval: u32) {
         self.dw0 = (self.dw0 & !(0xFF << 16)) | ((interval & 0xFF) << 16);
     }
+
+    /// Set Max ESIT Payload Low (bits 16-31 of dw4)
+    /// For SS periodic endpoints: Max Packet Size * (Max Burst Size + 1)
+    pub fn set_max_esit_payload_lo(&mut self, payload: u32) {
+        self.dw4 = (self.dw4 & 0xFFFF) | ((payload & 0xFFFF) << 16);
+    }
 }
 
 // Endpoint types

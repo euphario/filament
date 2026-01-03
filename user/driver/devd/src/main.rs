@@ -22,9 +22,15 @@
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]  // Device manager state machine reserved for future use
 
 use userlib::println;
 use userlib::syscall::{self, PciDeviceInfo, Event, event_type, event_flags};
+use userlib::ipc::protocols::devd::{
+    DevdRequest, DevdResponse, Node, NodeList, PropertyList, EventType,
+    MAX_PATH, MAX_NODES,
+};
+use userlib::ipc::Message;
 
 // =============================================================================
 // Constants
@@ -40,6 +46,7 @@ const QUIET_PERIOD_MS: u64 = 60_000;
 
 // PCI class codes
 const PCI_CLASS_USB: u32 = 0x0C0300;
+const PCI_CLASS_NVME: u32 = 0x010802;
 
 // Bus control message types (must match kernel bus.rs)
 const MSG_STATE_SNAPSHOT: u8 = 0;
@@ -55,6 +62,10 @@ const HW_MSG_READ: u8 = 2;
 const HW_MSG_CLOSE: u8 = 3;
 const HW_MSG_RESPONSE: u8 = 128;
 
+// Device tree constants
+const MAX_TREE_NODES: usize = 64;
+const MAX_SUBSCRIPTIONS: usize = 16;
+
 // =============================================================================
 // Bus Types and State
 // =============================================================================
@@ -65,6 +76,7 @@ const HW_MSG_RESPONSE: u8 = 128;
 pub enum BusType {
     PCIe = 0,
     Usb = 1,
+    Platform = 2,
 }
 
 /// Bus state as reported by kernel
@@ -88,6 +100,8 @@ pub struct BusConnection {
     pub kernel_state: KernelBusState,
     /// Are we connected?
     pub connected: bool,
+    /// Controller base address (MMIO)
+    pub base_addr: u32,
 }
 
 impl BusConnection {
@@ -98,9 +112,22 @@ impl BusConnection {
             channel: 0,
             kernel_state: KernelBusState::Safe,
             connected: false,
+            base_addr: 0,
         }
     }
 }
+
+// MT7988A bus controller addresses
+const PCIE_MAC_BASES: [u32; 4] = [
+    0x1130_0000,  // PCIe0
+    0x1131_0000,  // PCIe1
+    0x1128_0000,  // PCIe2
+    0x1129_0000,  // PCIe3
+];
+const USB_MAC_BASES: [u32; 2] = [
+    0x1119_0000,  // SSUSB0 (M.2 slot)
+    0x1120_0000,  // SSUSB1 (USB-A ports)
+];
 
 // =============================================================================
 // Device State Machine
@@ -375,25 +402,387 @@ pub struct MatchRule {
 // =============================================================================
 
 static MATCH_RULES: &[MatchRule] = &[
+    // Platform devices
     MatchRule {
-        bus: Some(BusType::PCIe),
+        bus: Some(BusType::Platform),
         class: Some(DeviceClass::Serial),
         pci_class: None,
         driver: "shell",
     },
-    MatchRule {
-        bus: Some(BusType::Usb),
-        class: Some(DeviceClass::UsbController),
-        pci_class: None,
-        driver: "usbd",
-    },
+    // DISABLED for wifid2 testing
+    // MatchRule {
+    //     bus: Some(BusType::Usb),
+    //     class: Some(DeviceClass::UsbController),
+    //     pci_class: None,
+    //     driver: "usbd",
+    // },
+    // MatchRule {
+    //     bus: Some(BusType::PCIe),
+    //     class: None,
+    //     pci_class: Some(PCI_CLASS_USB),
+    //     driver: "usbd",
+    // },
     MatchRule {
         bus: Some(BusType::PCIe),
         class: None,
-        pci_class: Some(PCI_CLASS_USB),
-        driver: "usbd",
+        pci_class: Some(PCI_CLASS_NVME),
+        driver: "nvmed",
     },
 ];
+
+// =============================================================================
+// Device Tree (Path-based Resource Registry)
+// =============================================================================
+
+/// A subscription to device tree changes
+#[derive(Clone, Copy)]
+struct Subscription {
+    /// Pattern to match (glob-style)
+    pattern: [u8; MAX_PATH],
+    pattern_len: u8,
+    /// Channel to notify when matching node changes
+    channel: u32,
+    /// Active flag
+    active: bool,
+}
+
+impl Subscription {
+    const fn empty() -> Self {
+        Self {
+            pattern: [0; MAX_PATH],
+            pattern_len: 0,
+            channel: 0,
+            active: false,
+        }
+    }
+
+    fn pattern_str(&self) -> &str {
+        core::str::from_utf8(&self.pattern[..self.pattern_len as usize]).unwrap_or("")
+    }
+}
+
+/// The device tree - stores nodes with paths and properties
+struct DeviceTree {
+    nodes: [Node; MAX_TREE_NODES],
+    node_count: usize,
+    subscriptions: [Subscription; MAX_SUBSCRIPTIONS],
+    sub_count: usize,
+}
+
+impl DeviceTree {
+    const fn new() -> Self {
+        const EMPTY_NODE: Node = Node::empty();
+        const EMPTY_SUB: Subscription = Subscription::empty();
+        Self {
+            nodes: [EMPTY_NODE; MAX_TREE_NODES],
+            node_count: 0,
+            subscriptions: [EMPTY_SUB; MAX_SUBSCRIPTIONS],
+            sub_count: 0,
+        }
+    }
+
+    /// Register a new node (or update if exists)
+    fn register(&mut self, path: &str, props: PropertyList) -> Result<(), i32> {
+        // Check if node already exists
+        for i in 0..self.node_count {
+            if self.nodes[i].path_str() == path {
+                // Update existing node
+                self.nodes[i].properties = props;
+                self.notify_subscribers(path, EventType::Updated);
+                return Ok(());
+            }
+        }
+
+        // Add new node
+        if self.node_count >= MAX_TREE_NODES {
+            return Err(-12); // ENOMEM
+        }
+
+        let mut node = Node::new(path);
+        node.properties = props;
+        self.nodes[self.node_count] = node;
+        self.node_count += 1;
+
+        self.notify_subscribers(path, EventType::Created);
+        Ok(())
+    }
+
+    /// Update an existing node's properties
+    fn update(&mut self, path: &str, props: PropertyList) -> Result<(), i32> {
+        for i in 0..self.node_count {
+            if self.nodes[i].path_str() == path {
+                self.nodes[i].properties = props;
+                self.notify_subscribers(path, EventType::Updated);
+                return Ok(());
+            }
+        }
+        Err(-2) // ENOENT
+    }
+
+    /// Remove a node
+    fn remove(&mut self, path: &str) -> Result<(), i32> {
+        for i in 0..self.node_count {
+            if self.nodes[i].path_str() == path {
+                // Notify before removal
+                self.notify_subscribers(path, EventType::Removed);
+
+                // Shift remaining nodes down
+                for j in i..self.node_count - 1 {
+                    self.nodes[j] = self.nodes[j + 1].clone();
+                }
+                self.node_count -= 1;
+                return Ok(());
+            }
+        }
+        Err(-2) // ENOENT
+    }
+
+    /// Query nodes matching a glob pattern
+    fn query(&self, pattern: &str) -> NodeList {
+        let mut result = NodeList::new();
+        for i in 0..self.node_count {
+            let path = self.nodes[i].path_str();
+            if glob_match(pattern, path) && (result.count as usize) < MAX_NODES {
+                result.push(self.nodes[i].clone());
+            }
+        }
+        result
+    }
+
+    /// Add a subscription
+    fn subscribe(&mut self, pattern: &str, channel: u32) -> Result<(), i32> {
+        // Check for existing subscription from same channel
+        for i in 0..self.sub_count {
+            if self.subscriptions[i].active
+                && self.subscriptions[i].channel == channel
+                && self.subscriptions[i].pattern_str() == pattern
+            {
+                return Ok(()); // Already subscribed
+            }
+        }
+
+        // Find empty slot or add new
+        let slot = self.subscriptions[..self.sub_count]
+            .iter()
+            .position(|s| !s.active)
+            .unwrap_or(self.sub_count);
+
+        if slot >= MAX_SUBSCRIPTIONS {
+            return Err(-12); // ENOMEM
+        }
+
+        let len = pattern.len().min(MAX_PATH);
+        self.subscriptions[slot].pattern[..len].copy_from_slice(&pattern.as_bytes()[..len]);
+        self.subscriptions[slot].pattern_len = len as u8;
+        self.subscriptions[slot].channel = channel;
+        self.subscriptions[slot].active = true;
+
+        if slot >= self.sub_count {
+            self.sub_count = slot + 1;
+        }
+
+        Ok(())
+    }
+
+    /// Remove a subscription
+    fn unsubscribe(&mut self, pattern: &str, channel: u32) {
+        for i in 0..self.sub_count {
+            if self.subscriptions[i].active
+                && self.subscriptions[i].channel == channel
+                && self.subscriptions[i].pattern_str() == pattern
+            {
+                self.subscriptions[i].active = false;
+                return;
+            }
+        }
+    }
+
+    /// Notify subscribers about a change
+    fn notify_subscribers(&self, path: &str, event_type: EventType) {
+        for i in 0..self.sub_count {
+            if !self.subscriptions[i].active {
+                continue;
+            }
+
+            if glob_match(self.subscriptions[i].pattern_str(), path) {
+                // Find the node to send
+                let node = self.nodes[..self.node_count]
+                    .iter()
+                    .find(|n| n.path_str() == path)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        // For Removed events, node may be gone - create minimal node
+                        Node::new(path)
+                    });
+
+                let response = DevdResponse::Event { event_type, node };
+                let mut buf = [0u8; 576];
+                if let Ok(len) = response.serialize(&mut buf) {
+                    let _ = syscall::send(self.subscriptions[i].channel, &buf[..len]);
+                }
+            }
+        }
+    }
+
+    /// Get node by path
+    fn get(&self, path: &str) -> Option<&Node> {
+        self.nodes[..self.node_count]
+            .iter()
+            .find(|n| n.path_str() == path)
+    }
+
+    /// Format device tree for hw:tree command
+    fn format_tree(&self, buf: &mut [u8]) -> usize {
+        let mut pos = 0;
+        pos += write_str(&mut buf[pos..], "# Device Tree\r\n");
+        pos += write_str(&mut buf[pos..], "# path {properties...}\r\n");
+
+        for i in 0..self.node_count {
+            let node = &self.nodes[i];
+            pos += write_str(&mut buf[pos..], node.path_str());
+            pos += write_str(&mut buf[pos..], " {");
+
+            let mut first = true;
+            for prop in node.properties.iter() {
+                if !first {
+                    pos += write_str(&mut buf[pos..], ", ");
+                }
+                first = false;
+                pos += write_str(&mut buf[pos..], prop.key_str());
+                pos += write_str(&mut buf[pos..], ": \"");
+                pos += write_str(&mut buf[pos..], prop.value_str());
+                pos += write_str(&mut buf[pos..], "\"");
+            }
+
+            pos += write_str(&mut buf[pos..], "}\r\n");
+        }
+
+        pos
+    }
+
+    /// Append device tree nodes in hw list format (for combining with DeviceManager output)
+    /// Format: path,bus,class,vendor:device,state
+    fn append_to_list(&self, buf: &mut [u8], start_pos: usize) -> usize {
+        let mut pos = start_pos;
+
+        for i in 0..self.node_count {
+            let node = &self.nodes[i];
+
+            // Path
+            pos += write_str(&mut buf[pos..], node.path_str());
+            pos += write_str(&mut buf[pos..], ",");
+
+            // Bus (from properties or "unknown")
+            let bus = node.properties.get("bus").unwrap_or("unknown");
+            pos += write_str(&mut buf[pos..], bus);
+            pos += write_str(&mut buf[pos..], ",");
+
+            // Class (from properties or "other")
+            let class = node.properties.get("class").unwrap_or("other");
+            pos += write_str(&mut buf[pos..], class);
+            pos += write_str(&mut buf[pos..], ",");
+
+            // Vendor:Device
+            let vendor = node.properties.get("vendor").unwrap_or("0000");
+            let device = node.properties.get("device").unwrap_or("0000");
+            pos += write_str(&mut buf[pos..], vendor);
+            pos += write_str(&mut buf[pos..], ":");
+            pos += write_str(&mut buf[pos..], device);
+            pos += write_str(&mut buf[pos..], ",");
+
+            // State
+            let state = node.properties.get("state").unwrap_or("unknown");
+            pos += write_str(&mut buf[pos..], state);
+            pos += write_str(&mut buf[pos..], "\r\n");
+        }
+
+        pos
+    }
+}
+
+/// Simple glob pattern matching
+/// Supports: * (any chars), ? (single char), ** (any path segments)
+fn glob_match(pattern: &str, path: &str) -> bool {
+    glob_match_impl(pattern.as_bytes(), path.as_bytes())
+}
+
+fn glob_match_impl(pattern: &[u8], text: &[u8]) -> bool {
+    let mut pi = 0;
+    let mut ti = 0;
+    let mut star_pi = usize::MAX;
+    let mut star_ti = 0;
+
+    while ti < text.len() {
+        if pi < pattern.len() {
+            // Handle ** (match any path segments)
+            if pi + 1 < pattern.len() && pattern[pi] == b'*' && pattern[pi + 1] == b'*' {
+                // ** can match anything including '/'
+                star_pi = pi;
+                star_ti = ti;
+                pi += 2;
+                // Skip optional trailing /
+                if pi < pattern.len() && pattern[pi] == b'/' {
+                    pi += 1;
+                }
+                continue;
+            }
+
+            // Handle * (match any chars except /)
+            if pattern[pi] == b'*' {
+                star_pi = pi;
+                star_ti = ti;
+                pi += 1;
+                continue;
+            }
+
+            // Handle ? (match single char except /)
+            if pattern[pi] == b'?' && text[ti] != b'/' {
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+
+            // Exact match
+            if pattern[pi] == text[ti] {
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+        }
+
+        // No match - try backtracking to last * or **
+        if star_pi != usize::MAX {
+            // For *, don't match /
+            if pattern[star_pi] == b'*' && star_pi + 1 < pattern.len() && pattern[star_pi + 1] == b'*' {
+                // ** can match anything
+                star_ti += 1;
+                ti = star_ti;
+                pi = star_pi + 2;
+                if pi < pattern.len() && pattern[pi] == b'/' {
+                    pi += 1;
+                }
+            } else {
+                // * cannot match /
+                if text[star_ti] == b'/' {
+                    return false;
+                }
+                star_ti += 1;
+                ti = star_ti;
+                pi = star_pi + 1;
+            }
+            continue;
+        }
+
+        return false;
+    }
+
+    // Skip trailing *s
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
+}
 
 // =============================================================================
 // Device Manager
@@ -425,7 +814,7 @@ impl DeviceManager {
         }
     }
 
-    /// Connect to a kernel bus control port
+    /// Connect to a kernel bus control port and register the bus as a device
     fn connect_bus(&mut self, bus_type: BusType, index: u8) -> bool {
         if self.bus_count >= MAX_BUSES {
             println!("[devd] Bus table full!");
@@ -434,10 +823,12 @@ impl DeviceManager {
 
         // Build port name
         let name: &[u8] = match bus_type {
+            BusType::Platform => b"/kernel/bus/platform",
             BusType::PCIe => match index {
                 0 => b"/kernel/bus/pcie0",
                 1 => b"/kernel/bus/pcie1",
                 2 => b"/kernel/bus/pcie2",
+                3 => b"/kernel/bus/pcie3",
                 _ => return false,
             },
             BusType::Usb => match index {
@@ -459,29 +850,41 @@ impl DeviceManager {
         self.buses[slot].bus_index = index;
         self.buses[slot].channel = channel as u32;
         self.buses[slot].connected = true;
+        // Set controller base address
+        self.buses[slot].base_addr = match bus_type {
+            BusType::Platform => 0,  // No MMIO base for pseudo-bus
+            BusType::PCIe => PCIE_MAC_BASES.get(index as usize).copied().unwrap_or(0),
+            BusType::Usb => USB_MAC_BASES.get(index as usize).copied().unwrap_or(0),
+        };
         self.bus_count += 1;
 
-        println!("[devd] Connected to {:?}{} (channel {})",
-                 bus_type, index, channel);
+        println!("[devd] Connected to {:?}{} @ 0x{:08x} (channel {})",
+                 bus_type, index, self.buses[slot].base_addr, channel);
 
         // Wait for StateSnapshot from kernel
         let mut buf = [0u8; 64];
         let len = syscall::receive(channel as u32, &mut buf);
-        if len > 0 && buf[0] == MSG_STATE_SNAPSHOT {
-            let kernel_state = match buf[3] {
+        let kernel_state = if len > 0 && buf[0] == MSG_STATE_SNAPSHOT {
+            match buf[3] {
                 0 => KernelBusState::Safe,
                 1 => KernelBusState::Claimed,
                 2 => KernelBusState::Resetting,
                 _ => KernelBusState::Safe,
-            };
-            self.buses[slot].kernel_state = kernel_state;
-            println!("[devd]   Kernel state: {:?}", kernel_state);
-        }
+            }
+        } else {
+            KernelBusState::Safe
+        };
+        self.buses[slot].kernel_state = kernel_state;
+        println!("[devd]   Kernel state: {:?}", kernel_state);
+
+        // Note: Buses are NOT added as devices - they're shown separately in hw list
+        // from the buses array. Only enumerated devices go in the devices array.
 
         true
     }
 
-    /// Add a discovered device
+    /// Add a device
+    /// If device.state is already set (not Discovered), preserve it
     fn add_device(&mut self, mut device: Device) -> Option<u16> {
         if self.device_count >= MAX_DEVICES {
             println!("[devd] Device table full!");
@@ -490,7 +893,8 @@ impl DeviceManager {
 
         device.id = self.next_device_id;
         self.next_device_id += 1;
-        device.state = DeviceState::Discovered;
+        // Only set to Discovered if not already set to something else
+        // (allows platform devices like uart0 to be pre-bound)
 
         let slot = self.device_count;
         self.devices[slot] = device;
@@ -597,8 +1001,15 @@ impl DeviceManager {
         // Update device state
         if let Some(device) = self.find_device(device_id) {
             device.driver_id = Some(slot);
-            let deadline = syscall::gettime() as u64 + BIND_TIMEOUT_NS;
-            device.transition(DeviceState::Binding { deadline });
+
+            // Platform devices don't need binding handshake - mark as Bound immediately
+            // Other buses use Binding state with timeout for driver to confirm
+            if device.bus_type == BusType::Platform {
+                device.transition(DeviceState::Bound);
+            } else {
+                let deadline = syscall::gettime() as u64 + BIND_TIMEOUT_NS;
+                device.transition(DeviceState::Binding { deadline });
+            }
             println!("[devd] Spawned {} (PID {}) for device {}",
                      binary, pid, device.path_str());
         }
@@ -775,6 +1186,45 @@ impl DeviceManager {
         pos += write_str(&mut buf[pos..], "# Hardware Devices\r\n");
         pos += write_str(&mut buf[pos..], "# path,bus,class,vendor:device,state\r\n");
 
+        // List all buses first (from buses array, not as matchable devices)
+        for i in 0..self.bus_count {
+            let bus = &self.buses[i];
+            if !bus.connected {
+                continue;
+            }
+            // Format: /bus/pcie0,pcie,bus,-,state or /bus/platform,platform,bus,-,state
+            pos += write_str(&mut buf[pos..], "/bus/");
+            let bus_name = match bus.bus_type {
+                BusType::PCIe => "pcie",
+                BusType::Usb => "usb",
+                BusType::Platform => "platform",
+            };
+            pos += write_str(&mut buf[pos..], bus_name);
+            // Only add index for numbered buses (not platform)
+            if bus.bus_type != BusType::Platform {
+                pos += write_num(&mut buf[pos..], bus.bus_index as usize);
+            }
+            pos += write_str(&mut buf[pos..], ",");
+            pos += write_str(&mut buf[pos..], bus_name);
+            pos += write_str(&mut buf[pos..], ",bus,");
+            // Show controller address (or - for platform pseudo-bus)
+            if bus.base_addr != 0 {
+                pos += write_hex16(&mut buf[pos..], (bus.base_addr >> 16) as u16);
+                pos += write_str(&mut buf[pos..], ":");
+                pos += write_hex16(&mut buf[pos..], (bus.base_addr & 0xFFFF) as u16);
+            } else {
+                pos += write_str(&mut buf[pos..], "-");
+            }
+            pos += write_str(&mut buf[pos..], ",");
+            // Show kernel state for bus
+            pos += write_str(&mut buf[pos..], match bus.kernel_state {
+                KernelBusState::Safe => "safe",
+                KernelBusState::Claimed => "claimed",
+                KernelBusState::Resetting => "resetting",
+            });
+            pos += write_str(&mut buf[pos..], "\r\n");
+        }
+
         // List all devices
         for i in 0..self.device_count {
             let dev = &self.devices[i];
@@ -784,6 +1234,7 @@ impl DeviceManager {
             pos += write_str(&mut buf[pos..], match dev.bus_type {
                 BusType::PCIe => "pcie",
                 BusType::Usb => "usb",
+                BusType::Platform => "platform",
             });
             pos += write_str(&mut buf[pos..], ",");
             pos += write_str(&mut buf[pos..], match dev.class {
@@ -816,16 +1267,17 @@ impl DeviceManager {
         for i in 0..self.bus_count {
             let bus = &self.buses[i];
             // Format: name,type,state,connected
-            pos += write_str(&mut buf[pos..], match bus.bus_type {
+            let bus_name = match bus.bus_type {
                 BusType::PCIe => "pcie",
                 BusType::Usb => "usb",
-            });
-            pos += write_num(&mut buf[pos..], bus.bus_index as usize);
+                BusType::Platform => "platform",
+            };
+            pos += write_str(&mut buf[pos..], bus_name);
+            if bus.bus_type != BusType::Platform {
+                pos += write_num(&mut buf[pos..], bus.bus_index as usize);
+            }
             pos += write_str(&mut buf[pos..], ",");
-            pos += write_str(&mut buf[pos..], match bus.bus_type {
-                BusType::PCIe => "pcie",
-                BusType::Usb => "usb",
-            });
+            pos += write_str(&mut buf[pos..], bus_name);
             pos += write_str(&mut buf[pos..], ",");
             pos += write_str(&mut buf[pos..], match bus.kernel_state {
                 KernelBusState::Safe => "safe",
@@ -850,11 +1302,15 @@ impl DeviceManager {
                 pos += write_str(&mut buf[pos..], "path=");
                 pos += write_str(&mut buf[pos..], dev.path_str());
                 pos += write_str(&mut buf[pos..], "\r\nbus=");
-                pos += write_str(&mut buf[pos..], match dev.bus_type {
+                let bus_name = match dev.bus_type {
                     BusType::PCIe => "pcie",
                     BusType::Usb => "usb",
-                });
-                pos += write_num(&mut buf[pos..], dev.bus_index as usize);
+                    BusType::Platform => "platform",
+                };
+                pos += write_str(&mut buf[pos..], bus_name);
+                if dev.bus_type != BusType::Platform {
+                    pos += write_num(&mut buf[pos..], dev.bus_index as usize);
+                }
                 pos += write_str(&mut buf[pos..], "\r\nclass=");
                 pos += write_str(&mut buf[pos..], match dev.class {
                     DeviceClass::UsbController => "usb-controller",
@@ -956,30 +1412,44 @@ fn write_hex16(buf: &mut [u8], val: u16) -> usize {
 // Bus Scanning
 // =============================================================================
 
-fn scan_platform(mgr: &mut DeviceManager) {
-    println!("[devd] Scanning platform devices...");
+// MT7988A platform device addresses
+const UART0_BASE: u32 = 0x1100_2000;  // UART0 MMIO base
+const I2C0_BASE: u32 = 0x1100_7000;   // I2C0 (for GPIO expander)
 
-    // UART0 - always present, triggers shell
+fn scan_platform(mgr: &mut DeviceManager) {
+    println!("[devd] Scanning platform bus...");
+
+    // UART0 - always present on platform bus
     let mut uart = Device::empty();
     uart.set_path("/platform/uart0");
-    uart.bus_type = BusType::PCIe;  // Use PCIe bus 0 for platform
+    uart.bus_type = BusType::Platform;
     uart.bus_index = 0;
     uart.class = DeviceClass::Serial;
+    // Use MMIO base as "vendor:device" identifier
+    uart.vendor_id = (UART0_BASE >> 16) as u16;
+    uart.device_id = (UART0_BASE & 0xFFFF) as u16;
+    // Leave as Discovered - match_and_spawn will match and spawn shell
 
     if let Some(id) = mgr.add_device(uart) {
-        println!("[devd]   Found: /platform/uart0 (id={})", id);
+        println!("[devd]   Found: /platform/uart0 @ 0x{:08x} (id={})", UART0_BASE, id);
     }
 
-    // SSUSB1 - USB-A ports
-    let mut usb1 = Device::empty();
-    usb1.set_path("/platform/ssusb1");
-    usb1.bus_type = BusType::Usb;
-    usb1.bus_index = 1;
-    usb1.class = DeviceClass::UsbController;
+    // GPIO - I2C-attached PCA9555 via I2C0
+    let mut gpio = Device::empty();
+    gpio.set_path("/platform/gpio");
+    gpio.bus_type = BusType::Platform;
+    gpio.bus_index = 0;
+    gpio.class = DeviceClass::Other;
+    // I2C address 0x27 on I2C0
+    gpio.vendor_id = (I2C0_BASE >> 16) as u16;
+    gpio.device_id = 0x0027;  // I2C address
 
-    if let Some(id) = mgr.add_device(usb1) {
-        println!("[devd]   Found: /platform/ssusb1 (id={})", id);
+    if let Some(id) = mgr.add_device(gpio) {
+        println!("[devd]   Found: /platform/gpio @ I2C0:0x27 (id={})", id);
     }
+
+    // Note: USB controllers (ssusb0, ssusb1) are buses, not devices
+    // They're listed under /bus/usb0, /bus/usb1
 }
 
 fn scan_pcie(mgr: &mut DeviceManager) {
@@ -1090,6 +1560,64 @@ fn match_and_spawn(mgr: &mut DeviceManager) {
 }
 
 // =============================================================================
+// DevdProtocol Request Handler
+// =============================================================================
+
+fn handle_devd_request(tree: &mut DeviceTree, req: &DevdRequest, client_ch: u32) -> DevdResponse {
+    match req {
+        DevdRequest::Register { path, path_len, properties } => {
+            let path_str = core::str::from_utf8(&path[..*path_len as usize]).unwrap_or("");
+            println!("[devd] Register: {}", path_str);
+            match tree.register(path_str, properties.clone()) {
+                Ok(()) => DevdResponse::Ok,
+                Err(e) => DevdResponse::Error(e),
+            }
+        }
+
+        DevdRequest::Update { path, path_len, properties } => {
+            let path_str = core::str::from_utf8(&path[..*path_len as usize]).unwrap_or("");
+            println!("[devd] Update: {}", path_str);
+            match tree.update(path_str, properties.clone()) {
+                Ok(()) => DevdResponse::Ok,
+                Err(e) => DevdResponse::Error(e),
+            }
+        }
+
+        DevdRequest::Query { pattern, pattern_len } => {
+            let pattern_str = core::str::from_utf8(&pattern[..*pattern_len as usize]).unwrap_or("");
+            println!("[devd] Query: {}", pattern_str);
+            let nodes = tree.query(pattern_str);
+            DevdResponse::Nodes(nodes)
+        }
+
+        DevdRequest::Subscribe { pattern, pattern_len } => {
+            let pattern_str = core::str::from_utf8(&pattern[..*pattern_len as usize]).unwrap_or("");
+            println!("[devd] Subscribe: {} (ch={})", pattern_str, client_ch);
+            match tree.subscribe(pattern_str, client_ch) {
+                Ok(()) => DevdResponse::Ok,
+                Err(e) => DevdResponse::Error(e),
+            }
+        }
+
+        DevdRequest::Unsubscribe { pattern, pattern_len } => {
+            let pattern_str = core::str::from_utf8(&pattern[..*pattern_len as usize]).unwrap_or("");
+            println!("[devd] Unsubscribe: {} (ch={})", pattern_str, client_ch);
+            tree.unsubscribe(pattern_str, client_ch);
+            DevdResponse::Ok
+        }
+
+        DevdRequest::Remove { path, path_len } => {
+            let path_str = core::str::from_utf8(&path[..*path_len as usize]).unwrap_or("");
+            println!("[devd] Remove: {}", path_str);
+            match tree.remove(path_str) {
+                Ok(()) => DevdResponse::Ok,
+                Err(e) => DevdResponse::Error(e),
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Main Loop
 // =============================================================================
 
@@ -1103,22 +1631,27 @@ fn main() -> ! {
     println!();
 
     let mut mgr = DeviceManager::new();
+    let mut tree = DeviceTree::new();
 
     // Phase 1: Connect to kernel bus control ports
     println!("[devd] Connecting to bus control ports...");
 
-    // Connect to USB buses (these are what we have working)
+    // Connect to platform bus (uart, gpio, i2c, spi, etc.)
+    mgr.connect_bus(BusType::Platform, 0);
+
+    // Connect to USB buses
     mgr.connect_bus(BusType::Usb, 0);
     mgr.connect_bus(BusType::Usb, 1);
 
-    // Connect to PCIe buses
+    // Connect to PCIe buses (4 ports on BPI-R4)
     mgr.connect_bus(BusType::PCIe, 0);
     mgr.connect_bus(BusType::PCIe, 1);
     mgr.connect_bus(BusType::PCIe, 2);
+    mgr.connect_bus(BusType::PCIe, 3);
 
     // Phase 2: Scan buses for devices
     println!();
-    scan_platform(&mut mgr);
+    scan_platform(&mut mgr);  // Enumerates uart0, gpio, etc. on platform bus
     scan_pcie(&mut mgr);
 
     // Phase 3: Match and spawn drivers
@@ -1150,10 +1683,22 @@ fn main() -> ! {
         }
     }
 
+    // Phase 4b: Register "devd" port for protocol requests
+    println!("[devd] Registering devd port...");
+    let devd_port = syscall::port_register(b"devd");
+    let mut devd_port_valid = false;
+    if devd_port < 0 {
+        println!("[devd] Failed to register devd port: {}", devd_port);
+    } else {
+        println!("[devd] Registered devd port ({})", devd_port);
+        devd_port_valid = true;
+    }
+
     println!();
     println!("[devd] Supervision started ({} buses, {} devices, {} drivers)",
              mgr.bus_count, mgr.device_count, mgr.driver_count);
     println!("[devd] Hardware discovery via hw:list, hw:bus, hw:device/<path>");
+    println!("[devd] Protocol queries via devd port");
     println!();
 
     // Phase 5: Subscribe to events (CRITICAL - failure means system unusable)
@@ -1200,6 +1745,16 @@ fn main() -> ! {
         }
     }
 
+    // Subscribe to IpcReady for devd protocol port
+    if devd_port_valid {
+        let result = syscall::event_subscribe(event_type::IPC_READY, devd_port as u64);
+        if result != 0 {
+            println!("[devd] FATAL: Failed to subscribe to IpcReady for devd port (error {})", result);
+            panic!("[devd] FATAL: devd port subscription failed");
+        }
+        println!("[devd]   IpcReady(devd:{}): OK", devd_port);
+    }
+
     println!();
 
     // Phase 6: Main supervision loop (event-driven)
@@ -1244,6 +1799,8 @@ fn main() -> ! {
             et if et == event_type::IPC_READY => {
                 // IPC message available on a channel
                 let channel = event.data as u32;
+                println!("[devd] IpcReady: channel={} (hw={}, devd={})",
+                         channel, hw_channel, devd_port);
 
                 if hw_channel_valid && channel == hw_channel {
                     // hw: scheme request
@@ -1256,13 +1813,46 @@ fn main() -> ! {
 
                         println!("[devd] hw: request path='{}' server_ch={}", path, server_ch);
 
-                        let mut response = [0u8; 1024];
-                        let data_len = mgr.handle_hw_request(path, &mut response);
+                        // Handle hw: scheme requests
+                        let mut response = [0u8; 2048];
+                        let data_len = if path == "tree" {
+                            // Show device tree only
+                            tree.format_tree(&mut response)
+                        } else if path == "list" || path.is_empty() {
+                            // Combine DeviceManager devices and DeviceTree nodes
+                            let mgr_len = mgr.format_device_list(&mut response);
+                            tree.append_to_list(&mut response, mgr_len)
+                        } else {
+                            mgr.handle_hw_request(path, &mut response)
+                        };
 
                         let result = syscall::send(server_ch, &response[..data_len]);
                         if result < 0 {
                             println!("[devd] hw: send failed: {}", result);
                         }
+                    }
+                } else if devd_port_valid && channel == devd_port as u32 {
+                    // DevdProtocol request - accept connection
+                    let client_ch = syscall::port_accept(devd_port as u32);
+                    if client_ch > 0 {
+                        // Receive the request
+                        let mut buf = [0u8; 576];
+                        let len = syscall::receive(client_ch as u32, &mut buf);
+                        if len > 0 {
+                            // Deserialize and handle the request
+                            let response = match DevdRequest::deserialize(&buf[..len as usize]) {
+                                Ok((req, _)) => handle_devd_request(&mut tree, &req, client_ch as u32),
+                                Err(_) => DevdResponse::Error(-22), // EINVAL
+                            };
+
+                            // Serialize and send response
+                            let mut resp_buf = [0u8; 576];
+                            if let Ok(resp_len) = response.serialize(&mut resp_buf) {
+                                let _ = syscall::send(client_ch as u32, &resp_buf[..resp_len]);
+                            }
+                        }
+                        // Close the connection channel
+                        syscall::channel_close(client_ch as u32);
                     }
                 } else {
                     // Check if it's a bus control channel

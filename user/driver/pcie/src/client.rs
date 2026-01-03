@@ -34,6 +34,8 @@ pub struct PcieDeviceInfo {
     pub bar0_addr: u64,
     /// BAR0 size in bytes
     pub bar0_size: u32,
+    /// PCI command register (for verifying bus master enabled)
+    pub command: u16,
 }
 
 /// PCIe client for querying devices from pcied
@@ -79,7 +81,7 @@ impl PcieClient {
                 let mut offset = 1;
 
                 for _ in 0..count {
-                    if offset + 24 > len as usize {
+                    if offset + 25 > len as usize {
                         break;
                     }
 
@@ -100,10 +102,11 @@ impl PcieClient {
                         bar0_size: u32::from_le_bytes([
                             buf[offset + 19], buf[offset + 20], buf[offset + 21], buf[offset + 22],
                         ]),
+                        command: u16::from_le_bytes([buf[offset + 23], buf[offset + 24]]),
                     };
 
                     devices.push(info);
-                    offset += 23;
+                    offset += 25;
                 }
 
                 return devices;
@@ -118,6 +121,32 @@ impl PcieClient {
     pub fn find_mt7996_devices(&self) -> DeviceList {
         // Query for MediaTek vendor, any device
         self.find_devices(0x14C3, 0xFFFF)
+    }
+
+    /// Reset a PCIe port (for driver cleanup before exit)
+    ///
+    /// This asserts PERST# to reset the endpoint device on the specified port,
+    /// returning it to power-on state for the next driver.
+    pub fn reset_port(&self, port: u8) -> bool {
+        let mut buf = [0u8; 16];
+
+        // Build request: cmd(1) + port(1)
+        buf[0] = 0x02; // RESET_PORT command
+        buf[1] = port;
+
+        // Send request
+        syscall::send(self.channel, &buf[..2]);
+
+        // Wait for response
+        for _ in 0..100 {
+            let len = syscall::receive(self.channel, &mut buf);
+            if len > 0 {
+                return buf[0] == 1;
+            }
+            syscall::yield_now();
+        }
+
+        false
     }
 }
 

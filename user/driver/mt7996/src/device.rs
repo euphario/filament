@@ -1,6 +1,14 @@
 //! MT7996 Device Access
 //!
 //! Handles BAR mapping and register I/O for the MT7996 WiFi chipset.
+//!
+//! ## Dual PCIe Interface (HIF1/HIF2)
+//!
+//! MT7996 uses two PCIe devices for tri-band operation:
+//! - HIF1 (primary): Device ID 0x7990 - handles bands 0 and 1
+//! - HIF2 (secondary): Device ID 0x7991 - handles band 2
+//!
+//! Both interfaces must be initialized for proper operation.
 
 use pcie::{PcieConfigSpace, PcieBdf, PcieDevice, PcieDeviceInfo};
 use pcie::regs::cfg;
@@ -21,7 +29,7 @@ pub enum Mt7996Error {
 
 /// MT7996 device handle
 pub struct Mt7996Device {
-    /// Mapped BAR0 region
+    /// Mapped BAR0 region (primary/HIF1)
     bar0: pcie::MmioRegion,
     /// BAR0 size
     bar0_size: u64,
@@ -29,6 +37,14 @@ pub struct Mt7996Device {
     variant: ChipVariant,
     /// BDF address
     bdf: PcieBdf,
+    /// PCI command register (for verifying bus master)
+    command: u16,
+    /// HIF2 BAR0 region (secondary interface, optional)
+    hif2_bar0: Option<pcie::MmioRegion>,
+    /// HIF2 BAR0 size
+    hif2_bar0_size: u64,
+    /// HIF2 PCI command register (for verifying bus master on HIF2)
+    hif2_command: u16,
 }
 
 impl Mt7996Device {
@@ -90,6 +106,10 @@ impl Mt7996Device {
             bar0_size,
             variant,
             bdf,
+            command: 0, // Not available via this path
+            hif2_bar0: None,
+            hif2_bar0_size: 0,
+            hif2_command: 0,
         };
 
         // Verify device responds by reading a known register
@@ -105,7 +125,16 @@ impl Mt7996Device {
     /// Initialize the MT7996 device from IPC-provided device info
     ///
     /// Uses pre-discovered BAR0 info from pcied instead of reading config space.
+    /// Optional HIF2 device info can be provided for dual-interface operation.
     pub fn init_from_info(info: &PcieDeviceInfo) -> Result<Self, Mt7996Error> {
+        Self::init_with_hif2(info, None)
+    }
+
+    /// Initialize the MT7996 device with optional HIF2 interface
+    ///
+    /// For proper MT7996 operation, both HIF1 (primary) and HIF2 (secondary)
+    /// interfaces should be initialized.
+    pub fn init_with_hif2(info: &PcieDeviceInfo, hif2_info: Option<&PcieDeviceInfo>) -> Result<Self, Mt7996Error> {
         let bdf = PcieBdf::new(info.bus, info.device, info.function);
         let variant = ChipVariant::from_device_id(info.device_id);
 
@@ -114,15 +143,32 @@ impl Mt7996Device {
             return Err(Mt7996Error::InvalidBar);
         }
 
-        // Map BAR0
+        // Map BAR0 (primary/HIF1)
         let bar0 = pcie::MmioRegion::open(info.bar0_addr, info.bar0_size as u64)
             .ok_or(Mt7996Error::BarMapFailed)?;
+
+        // Map HIF2 BAR if provided
+        let (hif2_bar0, hif2_bar0_size, hif2_command) = if let Some(hif2) = hif2_info {
+            if hif2.bar0_addr != 0 && hif2.bar0_size != 0 {
+                let hif2_region = pcie::MmioRegion::open(hif2.bar0_addr, hif2.bar0_size as u64)
+                    .ok_or(Mt7996Error::BarMapFailed)?;
+                (Some(hif2_region), hif2.bar0_size as u64, hif2.command)
+            } else {
+                (None, 0, 0)
+            }
+        } else {
+            (None, 0, 0)
+        };
 
         let device = Self {
             bar0,
             bar0_size: info.bar0_size as u64,
             variant,
             bdf,
+            command: info.command,
+            hif2_bar0,
+            hif2_bar0_size,
+            hif2_command,
         };
 
         // Verify device responds by reading a known register
@@ -250,6 +296,11 @@ impl Mt7996Device {
         self.bar0.virt_base()
     }
 
+    /// Get PCI command register value
+    pub fn command(&self) -> u16 {
+        self.command
+    }
+
     /// Read hardware revision
     pub fn hw_rev(&self) -> u32 {
         self.read32(regs::MT_HW_REV)
@@ -258,5 +309,74 @@ impl Mt7996Device {
     /// Read chip ID
     pub fn chip_id(&self) -> u32 {
         self.read32(regs::MT_HW_CHIPID)
+    }
+
+    /// Check if HIF2 is available
+    pub fn has_hif2(&self) -> bool {
+        self.hif2_bar0.is_some()
+    }
+
+    /// Get HIF2 BAR0 virtual address (for debugging)
+    pub fn hif2_bar0_virt(&self) -> Option<u64> {
+        self.hif2_bar0.as_ref().map(|r| r.virt_base())
+    }
+
+    /// Get HIF2 BAR0 size
+    pub fn hif2_bar0_size(&self) -> u64 {
+        self.hif2_bar0_size
+    }
+
+    /// Read 32-bit value from HIF2 at raw offset
+    #[inline]
+    pub fn hif2_read32_raw(&self, offset: u32) -> Option<u32> {
+        self.hif2_bar0.as_ref().map(|bar| {
+            if (offset as u64) < self.hif2_bar0_size {
+                bar.read32(offset as usize)
+            } else {
+                0xFFFF_FFFF
+            }
+        })
+    }
+
+    /// Write 32-bit value to HIF2 at raw offset
+    #[inline]
+    pub fn hif2_write32_raw(&self, offset: u32, value: u32) {
+        if let Some(ref bar) = self.hif2_bar0 {
+            if (offset as u64) < self.hif2_bar0_size {
+                bar.write32(offset as usize, value);
+            }
+        }
+    }
+
+    /// Get HIF2 PCI command register value
+    pub fn hif2_command(&self) -> u16 {
+        self.hif2_command
+    }
+
+    /// Read 32-bit value from HIF2 via HIF1's BAR + offset
+    ///
+    /// This is how Linux accesses HIF2 registers: through HIF1's BAR with
+    /// a 0x4000 offset added. This may behave differently than accessing
+    /// HIF2 via its own BAR.
+    #[inline]
+    pub fn hif2_via_hif1_read32(&self, offset: u32) -> u32 {
+        let hif2_offset = offset + regs::MT_HIF1_OFS;
+        if (hif2_offset as u64) < self.bar0_size {
+            self.bar0.read32(hif2_offset as usize)
+        } else {
+            0xFFFF_FFFF
+        }
+    }
+
+    /// Write 32-bit value to HIF2 via HIF1's BAR + offset
+    ///
+    /// This is how Linux accesses HIF2 registers: through HIF1's BAR with
+    /// a 0x4000 offset added.
+    #[inline]
+    pub fn hif2_via_hif1_write32(&self, offset: u32, value: u32) {
+        let hif2_offset = offset + regs::MT_HIF1_OFS;
+        if (hif2_offset as u64) < self.bar0_size {
+            self.bar0.write32(hif2_offset as usize, value);
+        }
     }
 }

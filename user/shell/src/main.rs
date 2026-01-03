@@ -4,6 +4,7 @@
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]  // Shell commands reserved for future use
 
 use userlib::{println, print, syscall, Stdin};
 
@@ -203,7 +204,91 @@ fn execute_command(cmd: &[u8]) {
         cmd_log(&cmd[4..]);
     } else if cmd_eq(cmd, b"reset") || cmd_eq(cmd, b"reboot") {
         cmd_reset();
+    } else if cmd_eq(cmd, b"hw") || cmd_eq(cmd, b"hw list") {
+        cmd_hw("list");
+    } else if cmd_eq(cmd, b"hw bus") {
+        cmd_hw("bus");
+    } else if cmd_eq(cmd, b"hw tree") {
+        cmd_hw("tree");
+    } else if cmd_starts_with(cmd, b"hw ") {
+        // hw <path> - query specific path
+        if let Ok(path) = core::str::from_utf8(&cmd[3..]) {
+            cmd_hw(path.trim());
+        }
     } else {
+        // Try to run as a binary from bin/ directory
+        try_run_binary(cmd);
+    }
+}
+
+/// Try to run an unknown command as a binary from bin/
+fn try_run_binary(cmd: &[u8]) {
+    // Extract command name (first word)
+    let cmd_name = if let Some(pos) = cmd.iter().position(|&c| c == b' ') {
+        &cmd[..pos]
+    } else {
+        cmd
+    };
+
+    // Convert to str
+    let name = match core::str::from_utf8(trim(cmd_name)) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Invalid command");
+            return;
+        }
+    };
+
+    if name.is_empty() {
+        return;
+    }
+
+    // Build path: "bin/<name>"
+    let mut path_buf = [0u8; 64];
+    let prefix = b"bin/";
+    let name_bytes = name.as_bytes();
+
+    if prefix.len() + name_bytes.len() >= path_buf.len() {
+        println!("Command name too long");
+        return;
+    }
+
+    path_buf[..prefix.len()].copy_from_slice(prefix);
+    path_buf[prefix.len()..prefix.len() + name_bytes.len()].copy_from_slice(name_bytes);
+    let path_len = prefix.len() + name_bytes.len();
+
+    let path = match core::str::from_utf8(&path_buf[..path_len]) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Invalid path");
+            return;
+        }
+    };
+
+    // Try to execute
+    let result = syscall::exec(path);
+
+    if result >= 0 {
+        let pid = result as u32;
+        // Wait for child to complete
+        loop {
+            let wait_result = syscall::wait(pid as i32);
+            if wait_result >= 0 {
+                let exit_code = (wait_result & 0xFFFFFFFF) as i32;
+                if exit_code != 0 {
+                    println!("Process {} exited with code {}", pid, exit_code);
+                }
+                break;
+            } else if wait_result == -11 {
+                // EAGAIN - child still running, retry
+                continue;
+            } else {
+                println!("Wait failed: {}", wait_result);
+                break;
+            }
+        }
+    } else {
+        // exec failed - command not found
         print!("Unknown command: ");
         print_bytes(cmd);
         println!();
@@ -227,6 +312,10 @@ fn cmd_help() {
     println!("  wifi          - Run WiFi driver (MT7996)");
     println!("  fan           - Start PWM fan driver");
     println!("  fan <0-100>   - Set fan speed (percent)");
+    println!("  hw            - List hardware devices");
+    println!("  hw bus        - List bus controllers");
+    println!("  hw tree       - Show device tree (registered nodes)");
+    println!("  hw <path>     - Query device info (e.g., hw /platform/uart0)");
     println!("  yield         - Yield CPU to other processes");
     println!("  panic         - Trigger a panic (test)");
     println!("  ps            - Show running processes");
@@ -419,12 +508,39 @@ fn cmd_ps() {
     let mut buf: [syscall::ProcessInfo; 16] = [syscall::ProcessInfo::empty(); 16];
     let count = syscall::ps_info(&mut buf);
 
-    println!("PID   PPID  STATE      NAME");
-    println!("----  ----  ---------  ---------------");
+    println!("PID   PPID  STATE      HB     AGE    NAME");
+    println!("----  ----  ---------  -----  -----  ---------------");
 
     for i in 0..count {
         let info = &buf[i];
-        print!("{:4}  {:4}  {:9}  ", info.pid, info.parent_pid, info.state_str());
+        // Format heartbeat age
+        let age_str: [u8; 5] = if info.heartbeat_age_ms == 0 {
+            *b"    -"
+        } else if info.heartbeat_age_ms < 1000 {
+            let ms = info.heartbeat_age_ms;
+            [
+                b' ',
+                if ms >= 100 { b'0' + ((ms / 100) % 10) as u8 } else { b' ' },
+                if ms >= 10 { b'0' + ((ms / 10) % 10) as u8 } else { b' ' },
+                b'0' + (ms % 10) as u8,
+                b'm',
+            ]
+        } else {
+            let s = info.heartbeat_age_ms / 1000;
+            [
+                if s >= 1000 { b'0' + ((s / 1000) % 10) as u8 } else { b' ' },
+                if s >= 100 { b'0' + ((s / 100) % 10) as u8 } else { b' ' },
+                if s >= 10 { b'0' + ((s / 10) % 10) as u8 } else { b' ' },
+                b'0' + (s % 10) as u8,
+                b's',
+            ]
+        };
+        print!("{:4}  {:4}  {:9}  {:5}  ",
+               info.pid, info.parent_pid, info.state_str(), info.heartbeat_str());
+        for c in age_str.iter() {
+            print!("{}", *c as char);
+        }
+        print!("  ");
         print_bytes(&info.name);
         println!();
     }
@@ -618,5 +734,50 @@ fn cmd_reset() {
     let result = syscall::reset();
     if result < 0 {
         println!("Reset failed: error {}", result);
+    }
+}
+
+/// Query devd's hw: scheme
+fn cmd_hw(path: &str) {
+    // Build the scheme URL
+    let mut url_buf = [0u8; 64];
+    let prefix = b"hw:";
+    url_buf[..prefix.len()].copy_from_slice(prefix);
+    let path_bytes = path.as_bytes();
+    let url_len = prefix.len() + path_bytes.len().min(url_buf.len() - prefix.len());
+    url_buf[prefix.len()..url_len].copy_from_slice(&path_bytes[..url_len - prefix.len()]);
+
+    let url = core::str::from_utf8(&url_buf[..url_len]).unwrap_or("hw:list");
+
+    // Open the scheme
+    let fd = syscall::scheme_open(url, 0);
+    if fd < 0 {
+        println!("Failed to open {}: error {}", url, fd);
+        return;
+    }
+
+    // Read the response (retry on EAGAIN/-11 as we may need to wait for devd)
+    let mut buf = [0u8; 1024];
+    let mut len: isize = -11;
+    let mut retries = 0;
+    while len == -11 && retries < 100 {
+        len = syscall::read(fd as u32, &mut buf);
+        if len == -11 {
+            syscall::yield_now();
+            retries += 1;
+        }
+    }
+    syscall::close(fd as u32);
+
+    if len < 0 {
+        println!("Failed to read from {}: error {}", url, len);
+        return;
+    }
+
+    // Print the response
+    if len > 0 {
+        if let Ok(s) = core::str::from_utf8(&buf[..len as usize]) {
+            print!("{}", s);
+        }
     }
 }

@@ -18,10 +18,13 @@
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]  // Many functions reserved for future use or debugging
 
 mod device;
+mod bot_state;
 
 use device::{is_msc_bbb, is_hub_class};
+pub use bot_state::{BotStateMachine, DeviceState, TransferPhase, RecoveryState, RecoveryAction, CswStatus, TransportResult};
 use userlib::{println, print, syscall};
 use userlib::syscall::O_NONBLOCK;
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
@@ -60,7 +63,7 @@ use usb::{
     get_hub_descriptor_setup, get_port_status_setup,
     set_port_feature_setup, clear_port_feature_setup,
     // Cache ops (ARM64 cache maintenance for DMA) - kept for potential future use
-    flush_cache_line, flush_buffer, invalidate_buffer, dsb,
+    flush_cache_line, flush_buffer, invalidate_buffer, invalidate_cache_line, dsb,
     // Register bit constants
     ERDP_EHB, USBSTS_EINT, USBSTS_PCD,
 };
@@ -72,6 +75,42 @@ use usb::phy::{PhyDriver, Mt7988aTphy};
 use usb::xhci::Controller as XhciController;
 
 // Module definitions now imported from usb crate
+
+// =============================================================================
+// USB Timing Constants (from Linux kernel drivers/usb/core/hub.c)
+// =============================================================================
+
+mod usb_timing {
+    // Hub debounce - connection must be stable before enumeration
+    pub const HUB_DEBOUNCE_TIMEOUT: u32 = 2000;  // Max time to wait for stable connection
+    pub const HUB_DEBOUNCE_STEP: u32 = 25;       // Poll interval during debounce
+    pub const HUB_DEBOUNCE_STABLE: u32 = 100;    // Must be stable for this long
+
+    // Reset timing
+    pub const HUB_SHORT_RESET_TIME: u32 = 10;    // Minimum reset signal time
+    pub const HUB_BH_RESET_TIME: u32 = 50;       // Warm reset (USB3)
+    pub const HUB_LONG_RESET_TIME: u32 = 200;    // Extended reset for problematic devices
+    pub const HUB_RESET_TIMEOUT: u32 = 800;      // Max wait for reset completion
+
+    // Enumeration retries
+    pub const PORT_RESET_TRIES: u32 = 5;
+    pub const SET_ADDRESS_TRIES: u32 = 2;
+    pub const GET_DESCRIPTOR_TRIES: u32 = 2;
+    pub const GET_CONFIG_TRIES: u32 = 2;
+
+    // Status/control timeouts
+    pub const USB_STS_TIMEOUT: u32 = 1000;       // Port status fetch timeout
+    pub const USB_CTRL_TIMEOUT: u32 = 5000;      // Control transfer timeout
+
+    // Interrupt endpoint
+    pub const HUB_IRQ_RETRY_DELAY: u32 = 1000;   // Retry delay on submission failure
+    pub const HUB_IRQ_MAX_ERRORS: u32 = 10;      // Reset hub after this many errors
+
+    // Post-operation delays
+    pub const POST_RESET_DELAY: u32 = 10;        // After reset completion
+    pub const POST_ADDRESS_DELAY: u32 = 2;       // After SET_ADDRESS (USB spec: 2ms)
+    pub const POST_CONFIG_DELAY: u32 = 10;       // After SET_CONFIGURATION
+}
 
 // =============================================================================
 // USB Driver
@@ -128,6 +167,9 @@ pub struct HubDeviceInfo {
     pub device_ctx: *mut DeviceContext,
     // Pending transfer flag
     pub transfer_pending: bool,
+    // Error tracking for robustness (Linux-style)
+    pub irq_errors: u32,        // Consecutive interrupt errors
+    pub irq_retry_pending: bool, // Need to retry interrupt submission
 }
 
 /// Mass Storage Class device info for block operations
@@ -165,6 +207,12 @@ pub struct MscDeviceInfo {
     pub ep0_ring_phys: u64,
     pub ep0_enqueue: usize,
     pub ep0_cycle: bool,  // Cycle bit for EP0 ring wrapping
+    // Port info for recovery
+    pub root_port: u8,         // Root port number (0-indexed)
+    pub hub_slot: Option<u32>, // Hub slot if behind a hub, None if direct
+    pub hub_port: u8,          // Hub port number if behind a hub
+    // BOT state machine for transfer and recovery management
+    pub state_machine: BotStateMachine,
 }
 
 impl UsbDriver {
@@ -372,6 +420,15 @@ impl UsbDriver {
         }
         print!(" [9]");
 
+        // Debug: Show initial event ring state and ERDP
+        if let Some(ref event_ring) = self.event_ring {
+            let (idx, cycle, ctrl) = event_ring.debug_state();
+            let erdp_hw = self.rt_read64(xhci_rt::IR0 + xhci_ir::ERDP);
+            let erdp_expected = event_ring.erdp();
+            println!("[evtring init] idx={} cycle={} ctrl=0x{:08x} ERDP_hw=0x{:x} ERDP_sw=0x{:x}",
+                     idx, cycle, ctrl, erdp_hw, erdp_expected);
+        }
+
         // Power on ports and wait for connection
         self.xhci.power_on_all_ports();
         print!(" [10]");
@@ -416,7 +473,40 @@ impl UsbDriver {
         let eint = (usbsts & USBSTS_EINT) != 0;
         let pcd = (usbsts & USBSTS_PCD) != 0;
 
+        // Auto-resync: check for cycle bit mismatch before reading
+        let mut erdp_update: Option<u64> = None;
         if let Some(ref mut event_ring) = self.event_ring {
+            let (idx, expected_cycle, ctrl) = event_ring.debug_state();
+            let actual_cycle = (ctrl & 1) != 0;
+
+            // If there's a mismatch and TRB is not empty, fix it
+            if expected_cycle != actual_cycle && ctrl != 0 {
+                // Scan for sync point
+                let ring_size = 64usize;
+                for offset in 0..ring_size {
+                    let check_idx = (idx + offset) % ring_size;
+                    unsafe {
+                        let ptr = event_ring.trbs.add(check_idx);
+                        invalidate_cache_line(ptr as u64);
+                        dsb();
+                        let trb = core::ptr::read_volatile(ptr);
+                        let c = (trb.control & 1) != 0;
+                        if c == expected_cycle {
+                            event_ring.dequeue = check_idx;
+                            erdp_update = Some(event_ring.erdp());
+                            break;
+                        }
+                    }
+                }
+                // If no sync point found, flip cycle
+                if erdp_update.is_none() {
+                    event_ring.cycle = !event_ring.cycle;
+                    event_ring.dequeue = 0;
+                    erdp_update = Some(event_ring.erdp());
+                }
+            }
+
+            // Now read events
             while event_count < 16 {
                 if let Some(trb) = event_ring.dequeue() {
                     events[event_count] = Some(trb);
@@ -428,9 +518,39 @@ impl UsbDriver {
             }
         }
 
+        // Update ERDP if we did a resync
+        if let Some(erdp) = erdp_update {
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
+        }
+
         if event_count == 0 {
             // Clear sticky EINT and PCD bits if no actual events found
             if eint || pcd {
+                // Debug: EINT/PCD set but no events - cycle bit mismatch?
+                if let Some(ref event_ring) = self.event_ring {
+                    let (idx, expected_cycle, ctrl) = event_ring.debug_state();
+                    let actual_cycle = (ctrl & 1) != 0;
+                    let erdp_hw = self.rt_read64(xhci_rt::IR0 + xhci_ir::ERDP);
+                    let erdp_sw = event_ring.erdp();
+                    println!("[usbd] EINT={} PCD={} no events! idx={} expect={} actual={} ctrl=0x{:08x}",
+                        eint, pcd, idx, expected_cycle, actual_cycle, ctrl);
+                    println!("       ERDP_hw=0x{:x} ERDP_sw=0x{:x}", erdp_hw, erdp_sw);
+
+                    // Scan ring to find where events actually are
+                    println!("       Ring scan:");
+                    for scan_idx in 0..8 {
+                        let check_idx = (idx + scan_idx) % 64;
+                        unsafe {
+                            let ptr = event_ring.trbs.add(check_idx);
+                            invalidate_cache_line(ptr as u64);
+                            dsb();
+                            let trb = core::ptr::read_volatile(ptr);
+                            let c = (trb.control & 1) != 0;
+                            let t = (trb.control >> 10) & 0x3F;
+                            println!("         [{}] cycle={} type={}", check_idx, c, t);
+                        }
+                    }
+                }
                 self.op_write32(xhci_op::USBSTS, USBSTS_EINT | USBSTS_PCD);
             }
             return 0;
@@ -462,17 +582,39 @@ impl UsbDriver {
 
                         if is_hub_int {
                             if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET {
+                                // Success - reset error counter
+                                if let Some(ref mut hub) = self.hub_device {
+                                    hub.irq_errors = 0;
+                                }
                                 // Handle the hub status change
                                 let status_bitmap = self.handle_hub_status_transfer(transfer_len);
                                 if status_bitmap != 0 {
                                     self.process_hub_port_changes(status_bitmap);
                                 } else {
                                     // No changes - re-queue the transfer
-                                    self.queue_hub_status_transfer();
+                                    self.requeue_hub_interrupt();
                                 }
                             } else {
-                                println!("[usbd] Hub interrupt error: cc={}", cc);
-                                self.queue_hub_status_transfer();
+                                // Error - increment counter and check for hub reset
+                                let should_reset = if let Some(ref mut hub) = self.hub_device {
+                                    hub.irq_errors += 1;
+                                    println!("[usbd] Hub interrupt error: cc={} (error {}/{})",
+                                             cc, hub.irq_errors, usb_timing::HUB_IRQ_MAX_ERRORS);
+                                    hub.irq_errors >= usb_timing::HUB_IRQ_MAX_ERRORS
+                                } else {
+                                    false
+                                };
+
+                                if should_reset {
+                                    println!("[usbd] Too many hub errors, resetting interrupt endpoint");
+                                    // Reset error counter and perform full endpoint reset
+                                    if let Some(ref mut hub) = self.hub_device {
+                                        hub.irq_errors = 0;
+                                    }
+                                    self.reset_hub_interrupt_endpoint();
+                                } else {
+                                    self.requeue_hub_interrupt();
+                                }
                             }
                         }
                     }
@@ -492,22 +634,70 @@ impl UsbDriver {
     /// Resync event ring state before daemon loop
     /// This drains any pending events and ensures ERDP is properly synchronized with hardware
     fn resync_event_ring(&mut self) {
-        // Drain any remaining events (up to 256 to avoid infinite loop)
+        // First try to drain any remaining events
         let mut drained = 0;
-        let mut last_erdp = 0u64;
+        let mut erdp_to_write: Option<u64> = None;
+
         if let Some(ref mut event_ring) = self.event_ring {
+            // Check if we have a cycle bit mismatch
+            let (idx, expected_cycle, ctrl) = event_ring.debug_state();
+            let actual_cycle = (ctrl & 1) != 0;
+
+            if expected_cycle != actual_cycle && ctrl != 0 {
+                // Cycle bit mismatch detected! Hard reset the event ring.
+                println!("[usbd] Event ring desync detected at idx={}, resetting...", idx);
+
+                // Scan to find where hardware's cycle actually is
+                let ring_size = 64usize;
+                let mut found_sync_point = false;
+
+                for offset in 0..ring_size {
+                    let check_idx = (idx + offset) % ring_size;
+                    unsafe {
+                        let ptr = event_ring.trbs.add(check_idx);
+                        invalidate_cache_line(ptr as u64);
+                        dsb();
+                        let trb = core::ptr::read_volatile(ptr);
+                        let c = (trb.control & 1) != 0;
+
+                        // Found a TRB matching our expected cycle?
+                        if c == expected_cycle {
+                            println!("[usbd] Found sync point at idx={}", check_idx);
+                            event_ring.dequeue = check_idx;
+                            found_sync_point = true;
+                            erdp_to_write = Some(event_ring.erdp());
+                            break;
+                        }
+                    }
+                }
+
+                if !found_sync_point {
+                    // All TRBs have wrong cycle - flip our cycle to match hardware
+                    println!("[usbd] No sync point found, flipping cycle");
+                    event_ring.cycle = !event_ring.cycle;
+                    event_ring.dequeue = 0;
+                    erdp_to_write = Some(event_ring.erdp());
+                }
+            }
+
+            // Now try to drain any events we can read
             for _ in 0..256 {
                 if let Some(_evt) = event_ring.dequeue() {
                     drained += 1;
-                    last_erdp = event_ring.erdp();
+                    erdp_to_write = Some(event_ring.erdp());
                 } else {
                     break;
                 }
             }
         }
 
+        // Update ERDP after releasing the borrow
+        if let Some(erdp) = erdp_to_write {
+            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
+        }
+
         if drained > 0 {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, last_erdp | ERDP_EHB);
+            println!("[usbd] Drained {} stale events during resync", drained);
         }
 
         // Clear sticky USBSTS bits (W1C)
@@ -1104,7 +1294,7 @@ impl UsbDriver {
         &mut self,
         slot_id: u32,
         ep0_ring_virt: *mut Trb,
-        ep0_ring_phys: u64,
+        _ep0_ring_phys: u64,
         ep0_enqueue: &mut usize,
         ep0_cycle: &mut bool,
         request_type: u8,
@@ -1457,7 +1647,10 @@ impl UsbDriver {
             input.endpoints[ep_idx].set_max_burst_size(0);
             input.endpoints[ep_idx].set_cerr(3);
             input.endpoints[ep_idx].set_tr_dequeue_ptr(int_ring_phys, true);
-            input.endpoints[ep_idx].set_average_trb_length(1);
+            input.endpoints[ep_idx].set_average_trb_length(2);  // Match max packet size
+            // For SS periodic endpoints, Max ESIT Payload = Max Packet Size * (Max Burst Size + 1)
+            // Max Burst Size = 0, so Max ESIT Payload = Max Packet Size = 2
+            input.endpoints[ep_idx].set_max_esit_payload_lo(int_max_packet as u32);
             // Interval: for SS, value is 2^(interval-1) * 125us
             // For hub status, we can use a reasonable polling interval
             input.endpoints[ep_idx].set_interval(int_interval as u32);
@@ -1509,6 +1702,30 @@ impl UsbDriver {
 
         println!("    Hub interrupt endpoint configured (DCI={})", int_in_dci);
 
+        // Debug: Read back COMPLETE endpoint context to verify state
+        unsafe {
+            invalidate_buffer(device_ctx_virt as u64, core::mem::size_of::<DeviceContext>());
+            let dev_ctx = &*(device_ctx_virt as *const DeviceContext);
+            let ep_idx = (int_in_dci - 1) as usize;
+            let ep_ctx = &dev_ctx.endpoints[ep_idx];
+            let ep_state = ep_ctx.dw0 & 0x7;
+            let interval = (ep_ctx.dw0 >> 16) & 0xFF;
+            let mult = (ep_ctx.dw0 >> 8) & 0x3;
+            let cerr = (ep_ctx.dw1 >> 1) & 0x3;
+            let ep_type = (ep_ctx.dw1 >> 3) & 0x7;
+            let max_burst = (ep_ctx.dw1 >> 8) & 0xFF;
+            let max_packet = (ep_ctx.dw1 >> 16) & 0xFFFF;
+            let dcs = (ep_ctx.dw2 & 1) != 0;
+            let dequeue_lo = ep_ctx.dw2 & !0xF;
+            let dequeue_hi = ep_ctx.dw3;
+            let dequeue = ((dequeue_hi as u64) << 32) | (dequeue_lo as u64);
+            let avg_trb_len = ep_ctx.dw4 & 0xFFFF;
+            let max_esit = (ep_ctx.dw4 >> 16) & 0xFFFF;
+            println!("    EP{} ctx: state={} type={} interval={} mult={}", int_in_dci, ep_state, ep_type, interval, mult);
+            println!("           cerr={} burst={} maxpkt={} avgtrb={} esit={}", cerr, max_burst, max_packet, avg_trb_len, max_esit);
+            println!("           DCS={} deq=0x{:x}", dcs, dequeue);
+        }
+
         // Store hub device info
         // Note: ep0_cycle is true because we haven't wrapped the ring yet during enumeration
         self.hub_device = Some(HubDeviceInfo {
@@ -1528,6 +1745,8 @@ impl UsbDriver {
             ep0_cycle: true,  // Cycle starts at 1, toggled when ring wraps
             device_ctx: device_ctx_virt,
             transfer_pending: false,
+            irq_errors: 0,
+            irq_retry_pending: false,
         });
 
         true
@@ -1539,18 +1758,21 @@ impl UsbDriver {
         let (slot_id, int_in_dci) = {
             let hub = match self.hub_device.as_mut() {
                 Some(h) => h,
-                None => return false,
+                None => {
+                    println!("[hub-int] No hub device");
+                    return false;
+                }
             };
 
             if hub.transfer_pending {
+                println!("[hub-int] Transfer already pending");
                 return true;  // Already have a transfer queued
             }
 
             // Build Normal TRB for interrupt transfer
-            // Status bitmap is 1 byte for hubs with <= 7 ports
-            let transfer_len = ((hub.num_ports as usize + 8) / 8).max(1);
-            let enqueue_idx = hub.int_in_enqueue;
-            let cycle = hub.int_in_cycle;
+            // Use max packet size (2) to match endpoint descriptor
+            // This might help xHCI schedule the transfer correctly
+            let transfer_len = 2usize;  // max_packet from endpoint descriptor
 
             unsafe {
                 let ring = hub.int_in_ring;
@@ -1586,9 +1808,91 @@ impl UsbDriver {
         true
     }
 
+    /// Reset hub interrupt endpoint after too many errors (Linux-style)
+    /// This performs xHCI endpoint reset, reinitializes the transfer ring, and requeues
+    fn reset_hub_interrupt_endpoint(&mut self) {
+        // Extract hub info first to avoid borrow issues
+        let (slot_id, int_in_dci, ring, ring_phys) = match self.hub_device.as_ref() {
+            Some(h) => (h.slot_id, h.int_in_dci, h.int_in_ring, h.int_in_ring_phys),
+            None => return,
+        };
+
+        println!("[hub] Resetting interrupt endpoint (slot={}, dci={})", slot_id, int_in_dci);
+
+        // Step 1: Reset endpoint via xHCI command
+        let reset_trb = usb::enumeration::build_reset_endpoint_trb(slot_id, int_in_dci, false);
+        if let Some(ref mut cmd_ring) = self.cmd_ring {
+            cmd_ring.enqueue(&reset_trb);
+        }
+        self.ring_doorbell(0, 0);
+        if !self.wait_command_complete(100) {
+            println!("[hub] Reset endpoint command failed");
+        }
+
+        // Step 2: Reinitialize the interrupt ring
+        unsafe {
+            // Clear all TRBs
+            for i in 0..16 {
+                let trb = &mut *ring.add(i);
+                trb.param = 0;
+                trb.status = 0;
+                trb.control = 0;
+            }
+            // Setup Link TRB at index 15
+            let link = &mut *ring.add(15);
+            link.param = ring_phys;
+            link.set_type(trb_type::LINK);
+            link.control |= trb_ctrl::TC;  // Toggle Cycle
+            flush_buffer(ring as u64, 16 * core::mem::size_of::<Trb>());
+        }
+
+        // Reset ring state
+        if let Some(ref mut hub) = self.hub_device {
+            hub.int_in_enqueue = 0;
+            hub.int_in_cycle = true;
+            hub.transfer_pending = false;
+        }
+
+        // Step 3: Set TR Dequeue Pointer (DCS=1 to match cycle)
+        let set_deq = usb::enumeration::build_set_tr_dequeue_trb(slot_id, int_in_dci, ring_phys, true);
+        if let Some(ref mut cmd_ring) = self.cmd_ring {
+            cmd_ring.enqueue(&set_deq);
+        }
+        self.ring_doorbell(0, 0);
+        if !self.wait_command_complete(100) {
+            println!("[hub] Set TR Dequeue command failed");
+        }
+
+        println!("[hub] Interrupt endpoint reset complete");
+
+        // Step 4: Re-queue the interrupt transfer
+        self.requeue_hub_interrupt();
+    }
+
+    /// Requeue hub interrupt with retry logic (Linux-style)
+    /// If queue fails, sets retry flag for main loop to handle
+    fn requeue_hub_interrupt(&mut self) {
+        if !self.queue_hub_status_transfer() {
+            // Failed to queue - set retry flag (will be retried in main loop)
+            if let Some(ref mut hub) = self.hub_device {
+                if !hub.irq_retry_pending {
+                    println!("[hub] Interrupt queue failed, will retry");
+                    hub.irq_retry_pending = true;
+                }
+            }
+        } else {
+            // Successfully queued - clear retry flag
+            if let Some(ref mut hub) = self.hub_device {
+                hub.irq_retry_pending = false;
+            }
+        }
+    }
+
     /// Handle hub status change interrupt transfer completion
     /// Returns bitmask of ports with status changes
     fn handle_hub_status_transfer(&mut self, transfer_len: u32) -> u8 {
+        println!("[hub-int] Transfer complete, len={}", transfer_len);
+
         let hub = match self.hub_device.as_mut() {
             Some(h) => h,
             None => return 0,
@@ -1606,6 +1910,7 @@ impl UsbDriver {
         // Read status bitmap - bit N indicates port N has a change
         // Bit 0 = hub status change, bits 1-N = port 1-N changes
         let status = unsafe { *hub.status_buf };
+        println!("[hub-int] Status bitmap: 0x{:02x}", status);
 
         status
     }
@@ -1728,6 +2033,63 @@ impl UsbDriver {
             Some((cc, _)) if cc == trb_cc::SUCCESS => true,
             _ => false
         }
+    }
+
+    /// Debounce a hub port connection (Linux-style)
+    /// Returns true if connection is stable, false if unstable/disconnected
+    fn debounce_hub_port(
+        &mut self,
+        hub_slot: u32,
+        ep0_ring_virt: *mut Trb,
+        ep0_ring_phys: u64,
+        ep0_enqueue: &mut usize,
+        ep0_cycle: &mut bool,
+        port: u16,
+        buf_virt: u64,
+        buf_phys: u64,
+    ) -> bool {
+        use usb_timing::*;
+
+        let mut stable_time: u32 = 0;
+        let mut total_time: u32 = 0;
+        let mut last_connected = false;
+        let mut first = true;
+
+        while total_time < HUB_DEBOUNCE_TIMEOUT {
+            let connected = if let Some(ps) = self.hub_get_port_status(
+                hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle,
+                port, buf_virt, buf_phys
+            ) {
+                (ps.status & hub::PS_CONNECTION) != 0
+            } else {
+                false
+            };
+
+            if first {
+                last_connected = connected;
+                first = false;
+            }
+
+            if connected == last_connected {
+                stable_time += HUB_DEBOUNCE_STEP;
+                if stable_time >= HUB_DEBOUNCE_STABLE {
+                    if connected {
+                        println!("    Port {}: connection stable after {}ms", port, total_time);
+                    }
+                    return connected;
+                }
+            } else {
+                // State changed - reset stability counter
+                stable_time = 0;
+                last_connected = connected;
+            }
+
+            delay_ms(HUB_DEBOUNCE_STEP);
+            total_time += HUB_DEBOUNCE_STEP;
+        }
+
+        println!("    Port {}: connection unstable (timeout after {}ms)", port, total_time);
+        false
     }
 
     /// Enumerate devices connected through a hub
@@ -1934,30 +2296,53 @@ impl UsbDriver {
                     self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_PORT_CONNECTION);
                 }
 
-                // If device connected, reset and enumerate
+                // If device connected, debounce then reset and enumerate
                 if (ps.status & hub::PS_CONNECTION) != 0 {
-                    println!("      -> Device connected, resetting...");
-                    if self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::PORT_RESET) {
-                        // Poll for reset completion (max 100ms with backoff)
-                        let mut reset_done = false;
-                        for attempt in 0..20 {  // 20 attempts * 5ms = 100ms max
+                    println!("      -> Device detected, debouncing...");
+
+                    // Debounce: ensure connection is stable before proceeding
+                    if !self.debounce_hub_port(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt_u64, buf_phys) {
+                        println!("      -> Connection unstable, skipping port");
+                        continue;
+                    }
+
+                    // Reset with retry logic (Linux: PORT_RESET_TRIES = 5)
+                    let mut enumerated = false;
+                    for reset_try in 0..usb_timing::PORT_RESET_TRIES {
+                        if reset_try > 0 {
+                            println!("      -> Reset retry {}/{}", reset_try + 1, usb_timing::PORT_RESET_TRIES);
+                        }
+
+                        if !self.hub_set_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::PORT_RESET) {
+                            delay_ms(100);
+                            continue;
+                        }
+
+                        // Poll for reset completion (800ms timeout per Linux HUB_RESET_TIMEOUT)
+                        let max_attempts = usb_timing::HUB_RESET_TIMEOUT / 10;
+                        for attempt in 0..max_attempts {
                             if let Some(ps2) = self.hub_get_port_status(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, buf_virt_u64, buf_phys) {
                                 if (ps2.change & hub::PS_C_RESET) != 0 {
                                     self.hub_clear_port_feature(hub_slot, ep0_ring_virt, ep0_ring_phys, ep0_enqueue, ep0_cycle, port, hub::C_PORT_RESET);
                                     if (ps2.status & hub::PS_ENABLE) != 0 {
-                                        println!("      -> Port enabled after {} attempts, enumerating device", attempt + 1);
-                                        delay_ms(50);  // Brief stabilization before enumeration
+                                        println!("      -> Port enabled after {}ms, enumerating", attempt * 10);
+                                        delay_ms(usb_timing::POST_RESET_DELAY);
                                         self.enumerate_hub_device(hub_slot, hub_port, port as u32);
-                                        reset_done = true;
+                                        enumerated = true;
                                     }
                                     break;
                                 }
                             }
-                            delay_ms(5);
+                            delay_ms(10);
                         }
-                        if !reset_done {
-                            println!("      -> Port reset timed out or not enabled");
+
+                        if enumerated {
+                            break;
                         }
+                    }
+
+                    if !enumerated {
+                        println!("      -> Port reset failed after {} tries", usb_timing::PORT_RESET_TRIES);
                     }
                 }
             }
@@ -2192,79 +2577,82 @@ impl UsbDriver {
             dsb();
         }
 
-        // Wait 200ms before addressing - device needs time after reset
-        for _ in 0..200 {
-            delay(1000);
-        }
+        // Address Device with retry logic (Linux: SET_ADDRESS_TRIES = 2)
+        let mut addr_ok = false;
+        for addr_try in 0..usb_timing::SET_ADDRESS_TRIES {
+            if addr_try > 0 {
+                println!("[hub] Port {}: Address retry {}/{}", hub_port, addr_try + 1, usb_timing::SET_ADDRESS_TRIES);
+                delay_ms(100);  // Wait before retry
+            }
 
-        // Address Device command
-        {
-            let cmd_ring = match self.cmd_ring.as_mut() {
-                Some(r) => r,
-                None => {
-                    syscall::munmap(ctx_virt as u64, 4096);
-                    return;
-                }
-            };
-            let mut trb = Trb::new();
-            trb.param = input_ctx_phys;
-            trb.set_type(trb_type::ADDRESS_DEVICE);
-            trb.control |= (slot_id & 0xFF) << 24;
-            cmd_ring.enqueue(&trb);
-            self.ring_doorbell(0, 0);
-        }
+            // Wait before addressing - device needs time after reset
+            delay_ms(usb_timing::HUB_LONG_RESET_TIME);  // 200ms
 
-        for _ in 0..100 {
-            delay(1000);
-        }
-
-        // Poll for Address Device completion
-        let mut addr_result: Option<u32> = None;
-        let mut erdp_to_update: Option<u64> = None;
-
-        if let Some(ref mut event_ring) = self.event_ring {
-            for _ in 0..50 {
-                if let Some(evt) = event_ring.dequeue() {
-                    erdp_to_update = Some(event_ring.erdp());
-                    if evt.get_type() == trb_type::COMMAND_COMPLETION {
-                        let cc = (evt.status >> 24) & 0xFF;
-                        addr_result = Some(cc);
-                        break;
+            // Address Device command
+            {
+                let cmd_ring = match self.cmd_ring.as_mut() {
+                    Some(r) => r,
+                    None => {
+                        syscall::munmap(ctx_virt as u64, 4096);
+                        return;
                     }
+                };
+                let mut trb = Trb::new();
+                trb.param = input_ctx_phys;
+                trb.set_type(trb_type::ADDRESS_DEVICE);
+                trb.control |= (slot_id & 0xFF) << 24;
+                cmd_ring.enqueue(&trb);
+                self.ring_doorbell(0, 0);
+            }
+
+            delay_ms(100);  // Wait for command processing
+
+            // Poll for Address Device completion
+            let mut addr_result: Option<u32> = None;
+            let mut erdp_to_update: Option<u64> = None;
+
+            if let Some(ref mut event_ring) = self.event_ring {
+                for _ in 0..50 {
+                    if let Some(evt) = event_ring.dequeue() {
+                        erdp_to_update = Some(event_ring.erdp());
+                        if evt.get_type() == trb_type::COMMAND_COMPLETION {
+                            let cc = (evt.status >> 24) & 0xFF;
+                            addr_result = Some(cc);
+                            break;
+                        }
+                    }
+                    delay(1000);
                 }
-                delay(1000);
+            }
+
+            if let Some(erdp) = erdp_to_update {
+                self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
+            }
+
+            match addr_result {
+                Some(cc) if cc == trb_cc::SUCCESS => {
+                    addr_ok = true;
+                    break;
+                }
+                Some(cc) => {
+                    println!("[hub] Port {}: Address failed (cc={})", hub_port, cc);
+                }
+                None => {
+                    println!("[hub] Port {}: Address timeout", hub_port);
+                }
             }
         }
-
-        if let Some(erdp) = erdp_to_update {
-            self.rt_write64(xhci_rt::IR0 + xhci_ir::ERDP, erdp | ERDP_EHB);
-        }
-
-        let addr_ok = match addr_result {
-            Some(cc) if cc == trb_cc::SUCCESS => {
-                true
-            }
-            Some(cc) => {
-                println!("[hub] Port {}: Address failed (cc={})", hub_port, cc);
-                false
-            }
-            None => {
-                println!("[hub] Port {}: Address timeout", hub_port);
-                false
-            }
-        };
 
         if !addr_ok {
+            println!("[hub] Port {}: Address failed after {} tries", hub_port, usb_timing::SET_ADDRESS_TRIES);
             syscall::munmap(ctx_virt as u64, 4096);
             return;
         }
 
-        // Wait for device ready
-        for _ in 0..100 {
-            delay(1000);
-        }
+        // Wait for device ready (USB spec: 2ms after SET_ADDRESS)
+        delay_ms(usb_timing::POST_ADDRESS_DELAY.max(10));
 
-        // Get Device Descriptor
+        // Get Device Descriptor with retry (Linux: GET_DESCRIPTOR_TRIES = 2)
         let mut desc_phys: u64 = 0;
         let desc_virt = syscall::mmap_dma(4096, &mut desc_phys);
         if desc_virt < 0 {
@@ -2276,39 +2664,53 @@ impl UsbDriver {
         let mut dev_ep0_enqueue = 0usize;
         let mut dev_ep0_cycle = true;  // Cycle starts at 1 for new ring
 
-        match self.control_transfer(
-            slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue, &mut dev_ep0_cycle,
-            0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_DEVICE << 8) as u16,
-            0, desc_phys, 18
-        ) {
-            Some((cc, _len)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
-                let desc_ptr = desc_virt as *const u8;
-                let device_class = unsafe { *desc_ptr.add(4) };  // offset 4 = bDeviceClass
-                let vendor_id = unsafe {
-                    let p = desc_ptr.add(8) as *const u16;
-                    core::ptr::read_unaligned(p)
-                };
-                let product_id = unsafe {
-                    let p = desc_ptr.add(10) as *const u16;
-                    core::ptr::read_unaligned(p)
-                };
-                if device_class == msc::CLASS || device_class == 0 {
-                    // Class 0 means class is defined at interface level (common for MSC)
-                    println!("[hub] Port {}: Mass Storage (VID={:04x} PID={:04x})", hub_port, vendor_id, product_id);
-                    self.configure_mass_storage(
-                        slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue, &mut dev_ep0_cycle,
-                        desc_virt as *mut u8, desc_phys, device_ctx_virt
-                    );
-                } else {
-                    println!("[hub] Port {}: Device class {} (VID={:04x} PID={:04x})", hub_port, device_class, vendor_id, product_id);
+        let mut desc_ok = false;
+        for desc_try in 0..usb_timing::GET_DESCRIPTOR_TRIES {
+            if desc_try > 0 {
+                println!("[hub] Port {}: Descriptor retry {}/{}", hub_port, desc_try + 1, usb_timing::GET_DESCRIPTOR_TRIES);
+                delay_ms(50);  // Brief delay before retry
+            }
+
+            match self.control_transfer(
+                slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue, &mut dev_ep0_cycle,
+                0x80, usb_req::GET_DESCRIPTOR, (usb_req::DESC_DEVICE << 8) as u16,
+                0, desc_phys, 18
+            ) {
+                Some((cc, _len)) if cc == trb_cc::SUCCESS || cc == trb_cc::SHORT_PACKET => {
+                    let desc_ptr = desc_virt as *const u8;
+                    let device_class = unsafe { *desc_ptr.add(4) };  // offset 4 = bDeviceClass
+                    let vendor_id = unsafe {
+                        let p = desc_ptr.add(8) as *const u16;
+                        core::ptr::read_unaligned(p)
+                    };
+                    let product_id = unsafe {
+                        let p = desc_ptr.add(10) as *const u16;
+                        core::ptr::read_unaligned(p)
+                    };
+                    if device_class == msc::CLASS || device_class == 0 {
+                        // Class 0 means class is defined at interface level (common for MSC)
+                        println!("[hub] Port {}: Mass Storage (VID={:04x} PID={:04x})", hub_port, vendor_id, product_id);
+                        self.configure_mass_storage(
+                            slot_id, ep0_ring_virt, ep0_ring_phys, &mut dev_ep0_enqueue, &mut dev_ep0_cycle,
+                            desc_virt as *mut u8, desc_phys, device_ctx_virt
+                        );
+                    } else {
+                        println!("[hub] Port {}: Device class {} (VID={:04x} PID={:04x})", hub_port, device_class, vendor_id, product_id);
+                    }
+                    desc_ok = true;
+                    break;
+                }
+                Some((cc, _)) => {
+                    println!("[hub] Port {}: Descriptor failed (cc={})", hub_port, cc);
+                }
+                None => {
+                    println!("[hub] Port {}: Descriptor timeout", hub_port);
                 }
             }
-            Some((cc, _)) => {
-                println!("[hub] Port {}: Descriptor failed (cc={})", hub_port, cc);
-            }
-            None => {
-                println!("[hub] Port {}: Descriptor timeout", hub_port);
-            }
+        }
+
+        if !desc_ok {
+            println!("[hub] Port {}: Descriptor failed after {} tries", hub_port, usb_timing::GET_DESCRIPTOR_TRIES);
         }
 
         // Free temporary descriptor buffer
@@ -3046,6 +3448,255 @@ impl UsbDriver {
         (result, csw)
     }
 
+    /// Execute a complete BOT command using the state machine for tracking and recovery.
+    /// This is the preferred method for production use as it provides proper error
+    /// handling based on USB BOT spec section 5.3.
+    ///
+    /// Returns TransportResult indicating the overall command status.
+    fn bot_command(
+        &mut self,
+        ctx: &mut BulkContext,
+        sm: &mut BotStateMachine,
+        cmd: &[u8],
+        is_data_in: bool,
+        data_length: u32,
+        target_phys: Option<u64>,  // For DMA reads, None for internal buffer
+    ) -> TransportResult {
+        // Check if device is ready
+        if !sm.is_ready() {
+            println!("[BOT] Device not ready: {}", sm);
+            return TransportResult::Error;
+        }
+
+        // Get tag and start command
+        let tag = sm.next_tag();
+        ctx.tag = tag;
+        sm.start_command();
+
+        // Build CBW
+        let cbw = Cbw::new(tag, data_length, is_data_in, 0, cmd);
+
+        // === CBW Phase ===
+        if !self.send_cbw(ctx, &cbw) {
+            let action = sm.cbw_stalled();
+            return self.handle_recovery_action(ctx, sm, action);
+        }
+
+        // Transition to data or CSW phase
+        let has_data_in = is_data_in && data_length > 0;
+        let has_data_out = !is_data_in && data_length > 0;
+        sm.cbw_sent(has_data_in, has_data_out);
+
+        // === Data Phase ===
+        if has_data_in {
+            let (result, _bytes) = if let Some(phys) = target_phys {
+                self.receive_bulk_in_dma(ctx, phys, data_length as usize)
+            } else {
+                self.receive_bulk_in_irq(ctx, DATA_OFFSET, data_length as usize)
+            };
+
+            match result {
+                TransferResult::Success | TransferResult::ShortPacket => {
+                    sm.data_complete();
+                }
+                TransferResult::Error(cc) if cc == trb_cc::STALL => {
+                    let action = sm.data_stalled(true);
+                    if let RecoveryAction::ClearHalt { is_bulk_in } = action {
+                        if self.clear_endpoint_halt(ctx, is_bulk_in) {
+                            sm.halt_cleared();
+                        } else {
+                            return self.handle_recovery_action(ctx, sm, RecoveryAction::BotReset);
+                        }
+                    }
+                }
+                _ => {
+                    let action = sm.transfer_error();
+                    return self.handle_recovery_action(ctx, sm, action);
+                }
+            }
+        } else if has_data_out {
+            // Data OUT phase not implemented with state machine yet
+            // For now, fall through to CSW
+            sm.data_complete();
+        }
+
+        // === CSW Phase ===
+        self.receive_csw_with_sm(ctx, sm, tag)
+    }
+
+    /// Receive CSW with state machine tracking
+    fn receive_csw_with_sm(
+        &mut self,
+        ctx: &mut BulkContext,
+        sm: &mut BotStateMachine,
+        expected_tag: u32,
+    ) -> TransportResult {
+        let max_retries = 3;
+
+        for _retry in 0..max_retries {
+            let (result, _bytes) = self.receive_bulk_in_irq(ctx, CSW_OFFSET, 13);
+
+            match result {
+                TransferResult::Success | TransferResult::ShortPacket => {
+                    // Read and validate CSW
+                    unsafe {
+                        let csw_ptr = ctx.data_buf.add(CSW_OFFSET) as *const Csw;
+                        ctx.invalidate_buffer(csw_ptr as u64, 13);
+                        let csw = core::ptr::read_volatile(csw_ptr);
+
+                        let sig = csw.signature;
+                        let tag = csw.tag;
+                        let status = csw.status;
+
+                        // Validate signature
+                        if sig != msc::CSW_SIGNATURE {
+                            println!("[BOT] CSW bad signature: 0x{:08x}", sig);
+                            let action = sm.csw_invalid();
+                            match action {
+                                RecoveryAction::RetryCSW => continue,
+                                _ => return self.handle_recovery_action(ctx, sm, action),
+                            }
+                        }
+
+                        // Validate tag
+                        if tag != expected_tag {
+                            println!("[BOT] CSW tag mismatch: {} != {}", tag, expected_tag);
+                            let action = sm.csw_invalid();
+                            match action {
+                                RecoveryAction::RetryCSW => continue,
+                                _ => return self.handle_recovery_action(ctx, sm, action),
+                            }
+                        }
+
+                        // Process CSW status
+                        return sm.csw_received(CswStatus::from(status));
+                    }
+                }
+                TransferResult::Error(cc) if cc == trb_cc::STALL => {
+                    // CSW stalled - clear halt and retry
+                    let action = sm.csw_stalled();
+                    if let RecoveryAction::ClearHalt { is_bulk_in } = action {
+                        if self.clear_endpoint_halt(ctx, is_bulk_in) {
+                            sm.halt_cleared();
+                            continue;
+                        }
+                    }
+                    return self.handle_recovery_action(ctx, sm, RecoveryAction::BotReset);
+                }
+                _ => {
+                    let action = sm.transfer_error();
+                    return self.handle_recovery_action(ctx, sm, action);
+                }
+            }
+        }
+
+        // Too many retries
+        self.handle_recovery_action(ctx, sm, RecoveryAction::BotReset)
+    }
+
+    /// Handle recovery action from state machine
+    fn handle_recovery_action(
+        &mut self,
+        ctx: &mut BulkContext,
+        sm: &mut BotStateMachine,
+        action: RecoveryAction,
+    ) -> TransportResult {
+        println!("[BOT] Recovery action: {}", action);
+
+        match action {
+            RecoveryAction::None => TransportResult::Good,
+            RecoveryAction::Retry | RecoveryAction::RetryCSW => {
+                // Caller should retry
+                TransportResult::Error
+            }
+            RecoveryAction::ClearHalt { is_bulk_in } => {
+                if self.clear_endpoint_halt(ctx, is_bulk_in) {
+                    sm.halt_cleared();
+                    TransportResult::Error // Caller should retry
+                } else {
+                    self.handle_recovery_action(ctx, sm, RecoveryAction::BotReset)
+                }
+            }
+            RecoveryAction::BotReset => {
+                println!("[BOT] Performing BOT class reset...");
+                let success = self.bot_class_reset(ctx);
+                let next_action = sm.bot_reset_complete(success);
+                if next_action == RecoveryAction::None {
+                    TransportResult::Error // Reset succeeded, but command failed
+                } else {
+                    self.handle_recovery_action(ctx, sm, next_action)
+                }
+            }
+            RecoveryAction::PortReset => {
+                println!("[BOT] Port reset required - device unrecoverable");
+                sm.on_disconnect();
+                TransportResult::Error
+            }
+            RecoveryAction::ReEnumerate => {
+                println!("[BOT] Re-enumeration required after port reset");
+                TransportResult::Error
+            }
+            RecoveryAction::GiveUp => {
+                println!("[BOT] Device unrecoverable - giving up");
+                sm.on_disconnect();
+                TransportResult::Error
+            }
+        }
+    }
+
+    /// Clear endpoint halt (CLEAR_FEATURE ENDPOINT_HALT)
+    fn clear_endpoint_halt(&mut self, ctx: &mut BulkContext, is_bulk_in: bool) -> bool {
+        let ep_addr = if is_bulk_in { ctx.bulk_in_addr } else { ctx.bulk_out_addr };
+        println!("[BOT] Clearing HALT on endpoint 0x{:02x}", ep_addr);
+
+        let result = self.control_transfer(
+            ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue, &mut ctx.ep0_cycle,
+            0x02, 1, 0, ep_addr as u16, 0, 0
+        );
+
+        match result {
+            Some((cc, _)) if cc == trb_cc::SUCCESS => {
+                println!("[BOT] Clear HALT OK");
+                true
+            }
+            _ => {
+                println!("[BOT] Clear HALT failed");
+                false
+            }
+        }
+    }
+
+    /// BOT class reset (class-specific mass storage reset)
+    fn bot_class_reset(&mut self, ctx: &mut BulkContext) -> bool {
+        println!("[BOT] Sending class reset to interface {}...", ctx.interface_num);
+
+        let result = self.control_transfer(
+            ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue, &mut ctx.ep0_cycle,
+            0x21, 0xFF, 0, ctx.interface_num as u16, 0, 0
+        );
+
+        let reset_ok = match result {
+            Some((cc, _)) if cc == trb_cc::SUCCESS => {
+                println!("[BOT] Class reset OK");
+                true
+            }
+            _ => {
+                println!("[BOT] Class reset failed");
+                false
+            }
+        };
+
+        if reset_ok {
+            delay_ms(10);
+            // Clear both endpoints
+            let out_ok = self.clear_endpoint_halt(ctx, false);
+            let in_ok = self.clear_endpoint_halt(ctx, true);
+            out_ok && in_ok
+        } else {
+            false
+        }
+    }
+
     /// SCSI WRITE(10) command - write sectors to device
     fn scsi_write_10(&mut self, ctx: &mut BulkContext, lba: u32, data: &[u8]) -> bool {
         let count = (data.len() / 512) as u16;
@@ -3340,6 +3991,16 @@ impl UsbDriver {
                     ep0_ring_phys: ctx.ep0_ring_phys,
                     ep0_enqueue: ctx.ep0_enqueue,
                     ep0_cycle: ctx.ep0_cycle,
+                    // Port info for recovery - filled later if needed
+                    root_port: 0,
+                    hub_slot: None,
+                    hub_port: 0,
+                    // Initialize state machine as ready
+                    state_machine: {
+                        let mut sm = BotStateMachine::new();
+                        sm.on_enumerated();
+                        sm
+                    },
                 });
                 println!("    Block device ready: {} blocks x {} bytes", block_count, block_size);
 
@@ -3359,7 +4020,7 @@ impl UsbDriver {
     }
 
     /// Run direct USB performance test (uses internal buffer)
-    fn run_performance_test(&mut self, ctx: &mut BulkContext, block_count: u64) {
+    fn run_performance_test(&mut self, ctx: &mut BulkContext, _block_count: u64) {
         println!("\n=== USB Performance Test ===");
         println!("  Ring state: OUT idx={} cycle={}, IN idx={} cycle={}",
             ctx.out_enqueue, ctx.out_cycle as u8, ctx.in_enqueue, ctx.in_cycle as u8);
@@ -3636,7 +4297,8 @@ impl UsbDriver {
     /// 2. CLEAR_FEATURE(ENDPOINT_HALT) for both bulk endpoints
     /// 3. xHCI Reset Endpoint commands
     /// 4. Set TR Dequeue Pointer commands
-    fn recover_endpoints(&mut self, ctx: &mut BulkContext) {
+    /// Returns true if recovery succeeded, false if device needs port reset
+    fn recover_endpoints(&mut self, ctx: &mut BulkContext) -> bool {
         println!("  [Recovery] Starting USB BOT recovery...");
 
         // Drain any pending events first
@@ -3673,10 +4335,16 @@ impl UsbDriver {
             ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue, &mut ctx.ep0_cycle,
             0x02, 1, 0, ctx.bulk_out_addr as u16, 0, 0
         );
-        match result {
-            Some((cc, _)) if cc == trb_cc::SUCCESS => println!("  [Recovery] Clear HALT OUT OK"),
-            _ => println!("  [Recovery] Clear HALT OUT failed"),
-        }
+        let clear_out_ok = match result {
+            Some((cc, _)) if cc == trb_cc::SUCCESS => {
+                println!("  [Recovery] Clear HALT OUT OK");
+                true
+            }
+            _ => {
+                println!("  [Recovery] Clear HALT OUT failed");
+                false
+            }
+        };
 
         // Step 3: CLEAR_FEATURE(ENDPOINT_HALT) for bulk IN
         println!("  [Recovery] Clearing HALT on bulk IN endpoint 0x{:02x}...", ctx.bulk_in_addr);
@@ -3684,9 +4352,23 @@ impl UsbDriver {
             ctx.slot_id, ctx.ep0_ring, ctx.ep0_ring_phys, &mut ctx.ep0_enqueue, &mut ctx.ep0_cycle,
             0x02, 1, 0, ctx.bulk_in_addr as u16, 0, 0
         );
-        match result {
-            Some((cc, _)) if cc == trb_cc::SUCCESS => println!("  [Recovery] Clear HALT IN OK"),
-            _ => println!("  [Recovery] Clear HALT IN failed"),
+        let clear_in_ok = match result {
+            Some((cc, _)) if cc == trb_cc::SUCCESS => {
+                println!("  [Recovery] Clear HALT IN OK");
+                true
+            }
+            _ => {
+                println!("  [Recovery] Clear HALT IN failed");
+                false
+            }
+        };
+
+        // If both Clear HALT failed, device needs port reset - don't waste time with xHCI recovery
+        if !clear_out_ok && !clear_in_ok {
+            println!("  [Recovery] CRITICAL: Both Clear HALT failed!");
+            println!("  [Recovery] Device requires port reset - please unplug and replug");
+            println!("  [Recovery] Complete (FAILED)");
+            return false;
         }
 
         // Step 4: xHCI Reset bulk OUT endpoint
@@ -3779,11 +4461,16 @@ impl UsbDriver {
             }
             delay_ms(100);
         }
-        if !ready {
-            println!("  [Recovery] Device NOT ready after 10 attempts!");
-        }
 
-        println!("  [Recovery] Complete");
+        if ready {
+            println!("  [Recovery] Complete (OK)");
+            true
+        } else {
+            println!("  [Recovery] Device NOT ready after 10 attempts!");
+            println!("  [Recovery] Device may require port reset - please unplug and replug");
+            println!("  [Recovery] Complete (FAILED)");
+            false
+        }
     }
 
     /// Quick TEST_UNIT_READY for recovery (no debug output)
@@ -4543,12 +5230,38 @@ fn main() {
         }
     }
 
-    // Wait up to 5 seconds for USB device enumeration
+    // Resync event ring after enumeration - fix any cycle bit desync
+    driver.resync_event_ring();
+
+    // Re-queue hub interrupt transfer (may have been lost in stale events)
+    if let Some(ref mut hub) = driver.hub_device {
+        // Reset transfer_pending since the old transfer was lost in stale events
+        hub.transfer_pending = false;
+    }
+    if driver.hub_device.is_some() {
+        driver.queue_hub_status_transfer();
+        println!("[usbd] Re-queued hub interrupt transfer after resync");
+    }
+
+    // Wait for USB device enumeration (no timeout - keep monitoring)
+    println!("[usbd] Monitoring for USB devices...");
     let mut wait_count = 0;
-    while driver.msc_device.is_none() && wait_count < 50 {
+    while driver.msc_device.is_none() {
         wait_count += 1;
-        if wait_count % 10 == 1 {
-            println!("[usbd] Waiting for MSC device... ({}/50)", wait_count);
+        if wait_count % 50 == 1 {
+            println!("[usbd] Still waiting for MSC device... ({}s)", wait_count / 10);
+        }
+
+        // Every 1 second, poll hub port status via control transfers
+        if wait_count % 10 == 0 {
+            // Check if we need to retry hub interrupt submission
+            if let Some(ref hub) = driver.hub_device {
+                if hub.irq_retry_pending {
+                    println!("[usbd] Retrying hub interrupt submission...");
+                    driver.requeue_hub_interrupt();
+                }
+            }
+            driver.poll_hub_ports_quick();
         }
 
         delay_ms(100);
@@ -4560,13 +5273,7 @@ fn main() {
         }
     }
 
-    if driver.msc_device.is_none() {
-        println!("No USB mass storage device found after 5 seconds");
-        if irq_fd >= 0 {
-            syscall::close(irq_fd as u32);
-        }
-        syscall::exit(1);
-    }
+    println!("[usbd] MSC device detected after {}ms", wait_count * 100);
 
     // Now that MSC is ready, register the "usb" port
     // Clients (fatfs) will have been blocking on port_connect() until now
@@ -4611,91 +5318,79 @@ fn main() {
         }
     }
 
-    // Daemonize
-    println!("[usbd] About to daemonize, num_clients={}", num_clients);
-    let result = syscall::daemonize();
-    println!("[usbd] daemonize returned {}", result);
-    if result == 0 {
-        println!("USB daemon running (ring buffer mode)");
-        // Resync event ring before daemon loop - drain any pending events and update ERDP
-        println!("[usbd] Resyncing event ring...");
-        driver.resync_event_ring();
-        println!("[usbd] Event ring resynced, entering daemon loop");
+    // Enter daemon loop directly (devd supervises us, no need to daemonize)
+    println!("USB daemon running (ring buffer mode)");
 
-        // clients array already initialized above (may have connections from init phase)
-        let mut heartbeat_counter = 0u32;
-        println!("[usbd] About to enter main loop");
+    // Resync event ring before daemon loop - drain any pending events and update ERDP
+    driver.resync_event_ring();
 
-        let mut first_iteration = true;
-        loop {
-            heartbeat_counter += 1;
-            if first_iteration {
-                println!("[usbd] First loop iteration");
-                first_iteration = false;
-            }
+    let mut heartbeat_counter = 0u32;
 
-            // Reset heartbeat counter and print heartbeat every ~100s
-            if heartbeat_counter >= 10000 {
-                println!("[usbd] heartbeat");
-                heartbeat_counter = 0;
-            }
+    loop {
+        heartbeat_counter += 1;
 
-            // Poll xHCI events every iteration for responsive hotplug
-            let ports_to_enum = driver.poll_events();
-            if ports_to_enum != 0 {
-                driver.enumerate_pending_ports(ports_to_enum);
-            }
-
-            // Poll hub ports every ~1 second (100 iterations) for hotplug detection
-            if heartbeat_counter % 100 == 0 && heartbeat_counter > 0 {
-                driver.poll_hub_ports_quick();
-            }
-
-
-            // Accept new client connections
-            let accept_result = syscall::port_accept(usb_port);
-            if accept_result > 0 && num_clients < MAX_CLIENTS {
-                println!("[usbd] port_accept returned {} - accepting client", accept_result);
-                let client_channel = accept_result as u32;
-
-                // Create BlockServer and complete handshake
-                let mut client = BlockServer::new(client_channel);
-                println!("[usbd] calling try_handshake on ch {}", client_channel);
-                if client.try_handshake() {
-                    println!("[usbd] handshake succeeded");
-                    // Add to clients array
-                    for i in 0..MAX_CLIENTS {
-                        if clients[i].is_none() {
-                            clients[i] = Some(client);
-                            num_clients += 1;
-                            break;
-                        }
-                    }
-                } else {
-                    println!("[usbd] handshake failed");
-                }
-            }
-
-            // Process ring requests from all ready clients
-            for i in 0..MAX_CLIENTS {
-                if let Some(ref mut client) = clients[i] {
-                    if client.is_ready() {
-                        client.process_requests(&mut driver);
-                    }
-                }
-            }
-
-            // Use a short delay instead of yield for testing
-            delay_ms(10);
+        // Reset heartbeat counter and print heartbeat every ~100s
+        if heartbeat_counter >= 10000 {
+            println!("[usbd] heartbeat");
+            heartbeat_counter = 0;
         }
-    } else {
-        println!("  Daemonize failed: {}", result);
+
+        // Poll xHCI events every iteration for responsive hotplug
+        let ports_to_enum = driver.poll_events();
+        if ports_to_enum != 0 {
+            driver.enumerate_pending_ports(ports_to_enum);
+        }
+
+        // Poll hub ports every ~1 second (100 iterations) for hotplug detection
+        if heartbeat_counter % 100 == 0 && heartbeat_counter > 0 {
+            // Check if we need to retry hub interrupt submission
+            if let Some(ref hub) = driver.hub_device {
+                if hub.irq_retry_pending {
+                    println!("[usbd] Retrying hub interrupt submission...");
+                    driver.requeue_hub_interrupt();
+                }
+            }
+            driver.poll_hub_ports_quick();
+
+            // Debug: print port status every second to check for hot-plug
+            let raw = driver.xhci.read_portsc(1);  // Port 2 (0-indexed)
+            let usbsts = driver.op_read32(xhci_op::USBSTS);
+            println!("[usbd] P2=0x{:x} USBSTS=0x{:x}", raw, usbsts);
+        }
+
+        // Accept new client connections
+        let accept_result = syscall::port_accept(usb_port);
+        if accept_result > 0 && num_clients < MAX_CLIENTS {
+            let client_channel = accept_result as u32;
+
+            // Create BlockServer and complete handshake
+            let mut client = BlockServer::new(client_channel);
+            if client.try_handshake() {
+                // Add to clients array
+                for i in 0..MAX_CLIENTS {
+                    if clients[i].is_none() {
+                        clients[i] = Some(client);
+                        num_clients += 1;
+                        println!("[usbd] Client connected (total: {})", num_clients);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Process ring requests from all ready clients
+        for i in 0..MAX_CLIENTS {
+            if let Some(ref mut client) = clients[i] {
+                if client.is_ready() {
+                    client.process_requests(&mut driver);
+                }
+            }
+        }
+
+        // Use a short delay instead of yield for testing
+        delay_ms(10);
     }
 
-    // Only reached if daemonize failed
-    if irq_fd >= 0 {
-        syscall::close(irq_fd as u32);
-    }
-
-    syscall::exit(0);
+    // Note: loop is infinite, this is unreachable
+    // If we ever need graceful shutdown, add signal handling
 }

@@ -412,6 +412,7 @@ fn sys_exit(code: i32) -> i64 {
         super::scheme::process_cleanup(pid);
         super::pci::release_all_devices(pid);
         super::port::process_cleanup(pid);
+        super::ipc::process_cleanup(pid);
 
         // Close all file descriptors (releases scheme handles, channels, etc.)
         if let Some(ref mut task) = sched.tasks[current_slot] {
@@ -1837,6 +1838,7 @@ fn sys_kill(pid: u32) -> i64 {
         super::scheme::process_cleanup(pid);
         super::pci::release_all_devices(pid);
         super::port::process_cleanup(pid);
+        super::ipc::process_cleanup(pid);
 
         // Close all file descriptors and mark as terminated
         if let Some(ref mut task) = sched.tasks[slot] {
@@ -2306,6 +2308,11 @@ fn sys_pci_bar_map(bdf: u32, bar: u8, size_out_ptr: u64) -> i64 {
 /// Returns: first IRQ number or -errno
 fn sys_pci_msi_alloc(bdf: u32, count: u8) -> i64 {
     use super::pci::{self, PciBdf};
+
+    // Require IRQ_CLAIM capability for MSI allocation
+    if let Err(e) = require_capability(Capabilities::IRQ_CLAIM) {
+        return e;
+    }
 
     let bdf = PciBdf::from_u32(bdf);
     let pid = current_pid();

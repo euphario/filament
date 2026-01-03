@@ -2,6 +2,8 @@
 //!
 //! Parses FAT12/16/32 boot sectors and provides filesystem navigation.
 
+#![allow(dead_code)]  // FAT types and helpers reserved for future use
+
 /// FAT filesystem type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FatType {

@@ -80,12 +80,18 @@ impl Firmware {
     ///
     /// Allocates DMA memory and reads the entire file into it.
     pub fn load(path: &str) -> Result<Self, FirmwareError> {
+        use userlib::{println, print};
+
+        println!("[FW] Loading: {}", path);
+
         // Open the firmware file
         let fd = syscall::open_str(path, syscall::O_RDONLY);
         if fd < 0 {
+            println!("[FW] open failed: {}", fd);
             return Err(FirmwareError::FileNotFound);
         }
         let fd = fd as u32;
+        println!("[FW] fd={}", fd);
 
         // Get file size by seeking to end
         let size = syscall::lseek(fd, 0, syscall::SEEK_END);
@@ -94,6 +100,7 @@ impl Firmware {
             return Err(FirmwareError::ReadFailed);
         }
         let size = size as usize;
+        println!("[FW] size={}", size);
 
         if size > MAX_FIRMWARE_SIZE {
             syscall::close(fd);
@@ -114,10 +121,12 @@ impl Firmware {
             return Err(FirmwareError::DmaAllocFailed);
         }
         let vaddr = vaddr as u64;
+        println!("[FW] DMA vaddr=0x{:x} paddr=0x{:x}", vaddr, paddr);
 
         // Read firmware into DMA buffer
         let buf = unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u8, size) };
         let mut total_read = 0usize;
+        let mut chunk_count = 0u32;
 
         while total_read < size {
             let remaining = size - total_read;
@@ -125,15 +134,27 @@ impl Firmware {
 
             let n = syscall::read(fd, &mut buf[total_read..total_read + chunk_size]);
             if n < 0 {
+                println!("[FW] read error: {} at offset {}", n, total_read);
                 syscall::close(fd);
                 syscall::munmap(vaddr, size);
                 return Err(FirmwareError::ReadFailed);
             }
             if n == 0 {
+                println!("[FW] unexpected EOF at offset {}", total_read);
                 break; // EOF
             }
             total_read += n as usize;
+            chunk_count += 1;
         }
+
+        println!("[FW] read {} bytes in {} chunks", total_read, chunk_count);
+
+        // Show first 16 bytes immediately after read
+        println!("[FW] First 16 bytes after read:");
+        for i in 0..16 {
+            print!("{:02x} ", buf[i]);
+        }
+        println!();
 
         syscall::close(fd);
 

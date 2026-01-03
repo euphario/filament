@@ -321,24 +321,55 @@ pub fn send_direct(channel_id: u32, data: &[u8]) -> i32 {
     syscall3(SYS_SEND_DIRECT, channel_id as u64, data.as_ptr() as u64, data.len() as u64) as i32
 }
 
-/// Receive data from a channel
+/// Receive data from a channel (blocking)
+///
+/// Blocks until a message is available or the channel is closed.
+/// Returns: message length on success, negative error on failure
+///
+/// ## Behavior
+/// - Retries on WouldBlock (-11) which indicates spurious wakeup
+/// - Returns immediately on success (len > 0)
+/// - Returns immediately on Close message (len = 0)
+/// - Returns immediately on real errors (len < 0, not -11)
 pub fn receive(channel_id: u32, buf: &mut [u8]) -> isize {
+    loop {
+        let result = receive_nonblock(channel_id, buf);
+        if result == -11 {
+            // WouldBlock - no message yet, yield and retry
+            yield_now();
+            continue;
+        }
+        return result;
+    }
+}
+
+/// Receive data from a channel (non-blocking)
+///
+/// Returns immediately with the result.
+/// Returns: message length on success, -11 (WouldBlock) if no message, negative error otherwise
+pub fn receive_nonblock(channel_id: u32, buf: &mut [u8]) -> isize {
     syscall3(SYS_RECEIVE, channel_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as isize
 }
 
 /// Receive data from a channel with timeout
-/// timeout_ms: 0 = non-blocking (return immediately if no message)
-/// Returns: message length on success, -110 (ETIMEDOUT) on timeout, negative error otherwise
+///
+/// - timeout_ms = 0: Non-blocking (returns immediately if no message)
+/// - timeout_ms > 0: Blocks until message, error, or timeout
+///
+/// Returns: message length on success, -11 (WouldBlock) if non-blocking and no message,
+///          -110 (ETIMEDOUT) on timeout, negative error otherwise
 pub fn receive_timeout(channel_id: u32, buf: &mut [u8], timeout_ms: u32) -> isize {
+    // Non-blocking case: just check once
+    if timeout_ms == 0 {
+        return receive_nonblock(channel_id, buf);
+    }
+
+    // Blocking with timeout: retry on WouldBlock until timeout
     loop {
         let result = syscall4(SYS_RECEIVE_TIMEOUT, channel_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_ms as u64) as isize;
         if result == -11 {
-            // EAGAIN/WouldBlock
-            // For non-blocking calls (timeout=0), return immediately - no message available
-            // For blocking calls, retry (spurious wakeup from sender notification)
-            if timeout_ms == 0 {
-                return result;
-            }
+            // WouldBlock - spurious wakeup, retry
+            // Note: kernel handles actual timeout tracking
             continue;
         }
         return result;
@@ -552,9 +583,19 @@ pub fn event_post(target_pid: u32, event_type: u32, data: u64) -> i32 {
 pub struct ProcessInfo {
     pub pid: u32,
     pub parent_pid: u32,
-    pub state: u8,      // 0=Ready, 1=Running, 2=Blocked, 3=Terminated
-    pub _pad: [u8; 3],  // Alignment padding
+    pub state: u8,           // 0=Ready, 1=Running, 2=Blocked, 3=Terminated
+    pub heartbeat_status: u8, // 0=never, 1=alive (<1s), 2=stale (1-5s), 3=dead (>5s)
+    pub _pad: [u8; 2],       // Alignment padding
+    pub heartbeat_age_ms: u32, // Milliseconds since last heartbeat (0 if never)
     pub name: [u8; 16],
+}
+
+/// Heartbeat status values
+pub mod heartbeat_status {
+    pub const NEVER: u8 = 0;   // Never sent heartbeat
+    pub const ALIVE: u8 = 1;   // Last heartbeat < 1 second ago
+    pub const STALE: u8 = 2;   // Last heartbeat 1-5 seconds ago
+    pub const DEAD: u8 = 3;    // Last heartbeat > 5 seconds ago
 }
 
 impl ProcessInfo {
@@ -563,7 +604,9 @@ impl ProcessInfo {
             pid: 0,
             parent_pid: 0,
             state: 0,
-            _pad: [0; 3],
+            heartbeat_status: 0,
+            _pad: [0; 2],
+            heartbeat_age_ms: 0,
             name: [0; 16],
         }
     }
@@ -579,9 +622,20 @@ impl ProcessInfo {
         match self.state {
             0 => "Ready",
             1 => "Running",
-            2 => "Blocked",
+            2 => "Waiting",
             3 => "Zombie",
             _ => "???",
+        }
+    }
+
+    /// Get heartbeat status as string
+    pub fn heartbeat_str(&self) -> &'static str {
+        match self.heartbeat_status {
+            heartbeat_status::NEVER => "-",
+            heartbeat_status::ALIVE => "OK",
+            heartbeat_status::STALE => "STALE",
+            heartbeat_status::DEAD => "DEAD",
+            _ => "?",
         }
     }
 }
@@ -700,6 +754,8 @@ pub const SYS_PCI_BAR_MAP: u64 = 53;
 pub const SYS_PCI_MSI_ALLOC: u64 = 54;
 pub const SYS_PCI_CLAIM: u64 = 55;
 pub const SYS_SIGNAL_ALLOW: u64 = 56;
+pub const SYS_TIMER_SET: u64 = 57;
+pub const SYS_HEARTBEAT: u64 = 58;
 
 /// PCI Bus/Device/Function address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -892,4 +948,24 @@ pub fn pci_claim(bdf: PciBdf) -> i32 {
 /// Returns 0 on success, negative error code on failure.
 pub fn signal_allow(sender_pid: u32) -> i32 {
     syscall1(SYS_SIGNAL_ALLOW, sender_pid as u64) as i32
+}
+
+/// Set a one-shot timer that delivers a Timer event after duration_ns nanoseconds.
+///
+/// The task must be subscribed to Timer events (event_type::TIMER) to receive them.
+/// Pass 0 to cancel a pending timer.
+///
+/// Returns 0 on success, negative error code on failure.
+pub fn timer_set(duration_ns: u64) -> i32 {
+    syscall1(SYS_TIMER_SET, duration_ns) as i32
+}
+
+/// Send a heartbeat to indicate this process is alive.
+///
+/// Privileged processes should call this periodically (e.g., every 500ms).
+/// The kernel tracks the last heartbeat time, which is visible in ps output.
+///
+/// Returns 0 on success, negative error code on failure.
+pub fn heartbeat() -> i32 {
+    syscall0(SYS_HEARTBEAT) as i32
 }

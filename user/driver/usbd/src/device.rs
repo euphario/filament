@@ -3,6 +3,8 @@
 //! Abstraction layer for USB device classes. Each device class (MSC, Hub, etc.)
 //! implements this trait, allowing usbd to work with any supported device type.
 
+#![allow(dead_code)]  // Types reserved for future use
+
 /// USB device class error
 #[derive(Debug, Clone, Copy)]
 pub enum DeviceError {

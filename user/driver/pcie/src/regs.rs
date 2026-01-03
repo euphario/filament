@@ -160,6 +160,51 @@ pub mod command {
     pub const INT_DISABLE: u16 = 1 << 10;
 }
 
+/// PCI Capability IDs
+pub mod cap_id {
+    /// Power Management
+    pub const PM: u8 = 0x01;
+    /// AGP
+    pub const AGP: u8 = 0x02;
+    /// MSI
+    pub const MSI: u8 = 0x05;
+    /// PCI Express
+    pub const PCIE: u8 = 0x10;
+    /// MSI-X
+    pub const MSIX: u8 = 0x11;
+}
+
+/// PCIe Express Capability offsets (from capability base)
+pub mod pcie_cap {
+    /// Capability ID and Next pointer (8-bit each)
+    pub const CAP_ID: u16 = 0x00;
+    pub const CAP_NEXT: u16 = 0x01;
+    /// PCIe Capabilities Register (16-bit)
+    pub const PCIE_CAP: u16 = 0x02;
+    /// Device Capabilities (32-bit)
+    pub const DEV_CAP: u16 = 0x04;
+    /// Device Control (16-bit)
+    pub const DEV_CTL: u16 = 0x08;
+    /// Device Status (16-bit)
+    pub const DEV_STA: u16 = 0x0A;
+    /// Link Capabilities (32-bit)
+    pub const LINK_CAP: u16 = 0x0C;
+    /// Link Control (16-bit)
+    pub const LINK_CTL: u16 = 0x10;
+    /// Link Status (16-bit)
+    pub const LINK_STA: u16 = 0x12;
+}
+
+/// Link Control register bits
+pub mod link_ctl {
+    /// ASPM L0s Enable
+    pub const ASPM_L0S: u16 = 1 << 0;
+    /// ASPM L1 Enable
+    pub const ASPM_L1: u16 = 1 << 1;
+    /// Both ASPM states
+    pub const ASPM_MASK: u16 = ASPM_L0S | ASPM_L1;
+}
+
 /// Header type values
 pub mod header_type {
     /// Multi-function device bit

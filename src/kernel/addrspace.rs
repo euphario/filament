@@ -141,7 +141,8 @@ pub struct AddressSpace {
     /// ASID for this address space (1-255, 0 = none allocated)
     asid: u16,
     /// Physical addresses of allocated page tables (for cleanup)
-    page_tables: [u64; 16],  // L0 + L1 + some L2/L3
+    /// 64 tables supports ~128MB of heap (each L3 covers 2MB)
+    page_tables: [u64; 64],
     num_tables: usize,
 }
 
@@ -201,7 +202,7 @@ impl AddressSpace {
             ttbr0: l0_phys as u64,
             asid,
             page_tables: {
-                let mut tables = [0u64; 16];
+                let mut tables = [0u64; 64];
                 tables[0] = l0_phys as u64;
                 tables[1] = l1_phys as u64;
                 tables
@@ -275,7 +276,7 @@ impl AddressSpace {
 
             if entry == 0 {
                 // Allocate new table
-                if self.num_tables >= 16 {
+                if self.num_tables >= 64 {
                     return None; // Out of tracking space
                 }
                 let new_table = pmm::alloc_page()? as u64;

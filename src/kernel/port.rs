@@ -277,6 +277,28 @@ impl PortRegistry {
             table.create_pair(client_pid, port.owner)
         }).ok_or(PortError::NoChannels)?;
 
+        // For kernel bus ports, directly call the bus controller
+        // (kernel has no accept loop, so we handle it synchronously)
+        if name.starts_with("/kernel/bus/") {
+            // Extract bus type and index from name
+            let suffix = &name["/kernel/bus/".len()..];
+            // Pass server_ch (kernel's endpoint) - send() puts msg in peer's (client's) queue
+            let result = super::bus::handle_port_connect(suffix, server_ch, client_pid);
+            if let Err(e) = result {
+                // Close the channels on failure
+                ipc::with_channel_table(|table| {
+                    table.close(client_ch);
+                    table.close(server_ch);
+                });
+                return Err(match e {
+                    super::bus::BusError::AlreadyClaimed => PortError::PermissionDenied,
+                    super::bus::BusError::Busy => PortError::WouldBlock,
+                    _ => PortError::InvalidMessage,
+                });
+            }
+            return Ok(client_ch);
+        }
+
         // Send connection notification to the service via its listen channel
         // The service will receive the server_ch endpoint
         let mut connect_msg = Message::new();
@@ -287,6 +309,7 @@ impl PortRegistry {
 
         // Send connect message and get blocked receiver if any
         let listen_channel = port.listen_channel;
+        let owner_pid = port.owner;
         let blocked_pid = ipc::with_channel_table(|table| {
             if let Some(ep_slot) = table.endpoints.iter().position(|e| e.id == listen_channel) {
                 let peer_id = table.endpoints[ep_slot].peer;
@@ -299,6 +322,25 @@ impl PortRegistry {
             }
             None
         });
+
+        // Push IpcReady event to server's event queue (for event-driven processes)
+        if owner_pid != 0 {
+            let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+            unsafe {
+                let sched = super::task::scheduler();
+                if let Some(slot) = sched.slot_by_pid(owner_pid) {
+                    if let Some(ref mut task) = sched.tasks[slot] {
+                        let event = super::event::Event::ipc_ready(listen_channel, client_pid);
+                        if task.event_queue.is_subscribed(&event) {
+                            task.event_queue.push(event);
+                            if task.state == super::task::TaskState::Blocked {
+                                task.state = super::task::TaskState::Ready;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Wake blocked accepter outside lock
         if let Some(pid) = blocked_pid {

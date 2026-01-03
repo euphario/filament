@@ -1,13 +1,17 @@
 //! FAT Filesystem Driver
 //!
-//! Userspace FAT12/16/32 filesystem driver that reads from USB mass storage
-//! via ring buffers to usbd.
+//! Userspace FAT12/16/32 filesystem driver that reads from block storage
+//! (NVMe or USB mass storage) via ring buffers.
+//!
+//! Uses type-safe IPC via `Server<FsProtocol>`.
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]  // FAT parsing utilities reserved for future use
 
 use userlib::{println, print, syscall};
-use userlib::firmware::{FirmwareRequest, FirmwareReply, FATFS_PORT, error as fw_error};
+use userlib::ipc::{Server, Connection, IpcError};
+use userlib::ipc::protocols::{FsProtocol, FsRequest, FsResponse, fs_error};
 
 mod fat;
 
@@ -20,14 +24,17 @@ use usb::BlockClient;
 fn main() {
     println!("[fatfs] FAT filesystem driver starting...");
 
-    // Connect to usbd via "usb" port using ring buffer protocol
-    println!("[fatfs] Connecting to usbd...");
-    let mut block = match BlockClient::connect(b"usb") {
-        Some(b) => b,
-        None => {
-            println!("[fatfs] ERROR: Failed to connect to usbd");
-            syscall::exit(1);
-        }
+    // Try NVMe first (faster), then fall back to USB
+    println!("[fatfs] Connecting to block device...");
+    let mut block = if let Some(b) = BlockClient::connect(b"nvme") {
+        println!("[fatfs] Connected to NVMe");
+        b
+    } else if let Some(b) = BlockClient::connect(b"usb") {
+        println!("[fatfs] Connected to USB");
+        b
+    } else {
+        println!("[fatfs] ERROR: No block device available (tried nvme, usb)");
+        syscall::exit(1);
     };
     println!("[fatfs] Connected via ring buffer (data buffer: {} bytes)", block.buffer_size());
 
@@ -237,173 +244,172 @@ fn main() {
     // Skip performance test for faster startup, go straight to service mode
     // read_performance_test(&mut block, block_count);
 
-    // Register as firmware service
+    // Register as filesystem service
     println!();
-    println!("[fatfs] Registering as firmware service...");
-    let listen_channel = syscall::port_register(FATFS_PORT);
-    if listen_channel < 0 {
-        println!("[fatfs] ERROR: Failed to register port: {}", listen_channel);
-        syscall::exit(1);
-    }
-    let listen_channel = listen_channel as u32;
-    println!("[fatfs] Listening on port 'fatfs' (channel {})", listen_channel);
-
-    // Daemonize - detach from parent so shell can continue
-    let result = syscall::daemonize();
-    if result != 0 {
-        println!("[fatfs] WARNING: daemonize failed: {}", result);
-    }
-
-    // Service loop
-    firmware_service_loop(&fs, &mut block, listen_channel);
-}
-
-/// Receive with retry on EAGAIN
-/// When a blocked receive is woken (e.g., by close notification), it returns
-/// EAGAIN (-11) and needs to retry to get the actual message.
-fn receive_with_retry(channel: u32, buf: &mut [u8]) -> isize {
-    loop {
-        let n = syscall::receive(channel, buf);
-        if n == -11 {
-            // EAGAIN - woken from blocking, yield and retry
-            syscall::yield_now();
-            continue;
+    println!("[fatfs] Registering filesystem service...");
+    let server = match Server::<FsProtocol>::register() {
+        Ok(s) => {
+            println!("[fatfs] Registered 'fatfs' port");
+            s
         }
-        return n;
-    }
+        Err(IpcError::ResourceBusy) => {
+            println!("[fatfs] ERROR: fatfs driver already running");
+            syscall::exit(1);
+        }
+        Err(e) => {
+            println!("[fatfs] ERROR: Failed to register fatfs port: {:?}", e);
+            syscall::exit(1);
+        }
+    };
+
+    // Service loop (devd supervises us, no need to daemonize)
+    filesystem_service_loop(&fs, &mut block, &server);
 }
 
-/// Handle firmware requests from clients
-fn firmware_service_loop(fs: &FatFilesystem, block: &mut BlockClient, listen_channel: u32) {
-    let mut request_buf = [0u8; core::mem::size_of::<FirmwareRequest>()];
+/// Handle filesystem requests from clients
+fn filesystem_service_loop(fs: &FatFilesystem, block: &mut BlockClient, server: &Server<FsProtocol>) {
     let my_pid = syscall::getpid();
-
     println!("[fatfs] Service loop started (my_pid={})", my_pid);
 
     loop {
         // Accept a connection
-        let client_channel = syscall::port_accept(listen_channel);
-        if client_channel < 0 {
-            // No connection pending, yield and retry
-            syscall::yield_now();
-            continue;
-        }
-        let client_channel = client_channel as u32;
-        println!("[fatfs] Accepted connection (channel={})", client_channel);
+        let mut conn: Connection<FsProtocol> = match server.accept() {
+            Ok(c) => c,
+            Err(_) => {
+                syscall::yield_now();
+                continue;
+            }
+        };
+        println!("[fatfs] Accepted connection");
 
-        // First message is handshake - receive ping, send our PID
-        // Note: receive() returns -11 (EAGAIN) when woken from blocking,
-        // need to retry to get actual message
-        let mut ping_buf = [0u8; 4];
-        println!("[fatfs] Waiting for handshake ping...");
-        let n = receive_with_retry(client_channel, &mut ping_buf);
-        if n < 0 {
-            println!("[fatfs] Handshake receive failed: {}", n);
-            syscall::channel_close(client_channel);
-            continue;
-        }
-        println!("[fatfs] Received handshake ping ({} bytes)", n);
-
-        // Send our PID so client can shmem_allow us
-        let pid_bytes = my_pid.to_le_bytes();
-        let send_result = syscall::send(client_channel, &pid_bytes);
-        if send_result < 0 {
-            println!("[fatfs] Handshake send PID failed: {}", send_result);
-            syscall::channel_close(client_channel);
-            continue;
-        }
-        println!("[fatfs] Sent PID response");
-
-        // Now receive actual firmware request
-        let n = receive_with_retry(client_channel, &mut request_buf);
-        if n < 0 {
-            // Negative but not EAGAIN means real error (e.g., channel closed)
-            syscall::channel_close(client_channel);
-            continue;
-        }
-        if n == 0 {
-            // 0-byte message = channel close notification, client disconnected
-            // This is normal when client just probes availability
-            syscall::channel_close(client_channel);
-            continue;
-        }
-
-        let request = match FirmwareRequest::from_bytes(&request_buf[..n as usize]) {
-            Some(r) => r,
-            None => {
-                println!("[fatfs] Invalid request (size={})", n);
-                let reply = FirmwareReply::error(fw_error::READ_ERROR);
-                syscall::send(client_channel, reply.as_bytes());
-                syscall::channel_close(client_channel);
+        // Perform PID handshake (receive client PID, send our PID)
+        let client_pid = match conn.handshake_pid() {
+            Ok(pid) => {
+                println!("[fatfs] Handshake complete, client_pid={}", pid);
+                pid
+            }
+            Err(e) => {
+                println!("[fatfs] Handshake failed: {:?}", e);
                 continue;
             }
         };
 
-        let filename = request.filename_str();
-        let filename_str = core::str::from_utf8(filename).unwrap_or("???");
-        println!("[fatfs] Request: {} (shmem={}, max={})",
-            filename_str, request.shmem_id, request.max_size);
+        // Handle requests on this connection until disconnect
+        loop {
+            match conn.receive() {
+                Ok(request) => {
+                    let response = handle_fs_request(fs, block, &request, client_pid);
+                    if conn.send(&response).is_err() {
+                        break; // Client disconnected
+                    }
+                }
+                Err(IpcError::ChannelClosed) => break,
+                Err(IpcError::WouldBlock) => {
+                    syscall::yield_now();
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+        // Connection dropped here, channel closed automatically
+    }
+}
 
-        // Allow the requester to access the shmem (they created it, we need to map it)
-        // Actually, the requester owns it, we need them to allow US
-        // The protocol should have requester call shmem_allow(shmem_id, fatfs_pid)
-        // For now, try to map it directly
+/// Handle a single filesystem request
+fn handle_fs_request(
+    fs: &FatFilesystem,
+    block: &mut BlockClient,
+    request: &FsRequest,
+    _client_pid: u32,
+) -> FsResponse {
+    match request {
+        FsRequest::ReadToShmem { path, path_len, shmem_id, max_size, requester_pid: _ } => {
+            let filename = &path[..*path_len as usize];
+            let filename_str = core::str::from_utf8(filename).unwrap_or("???");
+            println!("[fatfs] ReadToShmem: {} (shmem={}, max={})", filename_str, shmem_id, max_size);
 
-        // Map the shared memory
-        let mut vaddr: u64 = 0;
-        let mut paddr: u64 = 0;
-        let map_result = syscall::shmem_map(request.shmem_id, &mut vaddr, &mut paddr);
-        if map_result < 0 {
-            println!("[fatfs] Failed to map shmem {}: {}", request.shmem_id, map_result);
-            let reply = FirmwareReply::error(fw_error::NO_MEMORY);
-            syscall::send(client_channel, reply.as_bytes());
-            syscall::channel_close(client_channel);
-            continue;
+            // Map the shared memory
+            let mut vaddr: u64 = 0;
+            let mut paddr: u64 = 0;
+            let map_result = syscall::shmem_map(*shmem_id, &mut vaddr, &mut paddr);
+            println!("[fatfs] shmem_map({}) -> result={}, vaddr=0x{:x}, paddr=0x{:x}",
+                shmem_id, map_result, vaddr, paddr);
+
+            if map_result < 0 {
+                println!("[fatfs] Failed to map shmem {}: {}", shmem_id, map_result);
+                return FsResponse::Error(fs_error::IO);
+            }
+
+            // Validate addresses before use
+            if vaddr == 0 || vaddr > 0x7FFFFFFFFFFF {
+                println!("[fatfs] ERROR: Invalid vaddr 0x{:x} from shmem_map", vaddr);
+                syscall::shmem_unmap(*shmem_id);
+                return FsResponse::Error(fs_error::IO);
+            }
+
+            // Find the file
+            let file = match find_file(fs, block, filename) {
+                Some(f) => f,
+                None => {
+                    println!("[fatfs] File not found: {}", filename_str);
+                    syscall::shmem_unmap(*shmem_id);
+                    return FsResponse::Error(fs_error::NOT_FOUND);
+                }
+            };
+
+            // Check size
+            if file.size > *max_size {
+                println!("[fatfs] File too large: {} > {}", file.size, max_size);
+                syscall::shmem_unmap(*shmem_id);
+                return FsResponse::Error(fs_error::NO_SPACE);
+            }
+
+            // Read file into shared memory
+            let buffer = unsafe {
+                core::slice::from_raw_parts_mut(vaddr as *mut u8, *max_size as usize)
+            };
+
+            let bytes_read = match read_file(fs, block, &file, buffer) {
+                Some(n) => n,
+                None => {
+                    println!("[fatfs] Read error");
+                    syscall::shmem_unmap(*shmem_id);
+                    return FsResponse::Error(fs_error::IO);
+                }
+            };
+
+            println!("[fatfs] Loaded {} bytes", bytes_read);
+
+            // Unmap shared memory - we're done with it
+            syscall::shmem_unmap(*shmem_id);
+
+            FsResponse::ShmemRead { bytes: bytes_read as u64 }
         }
 
-        // Find the file
-        let file = match find_file(fs, block, filename) {
-            Some(f) => f,
-            None => {
-                println!("[fatfs] File not found: {}", filename_str);
-                let reply = FirmwareReply::error(fw_error::NOT_FOUND);
-                syscall::send(client_channel, reply.as_bytes());
-                syscall::channel_close(client_channel);
-                continue;
-            }
-        };
+        FsRequest::Stat { path, path_len } => {
+            let filename = &path[..*path_len as usize];
+            let filename_str = core::str::from_utf8(filename).unwrap_or("???");
+            println!("[fatfs] Stat: {}", filename_str);
 
-        // Check size
-        if file.size > request.max_size {
-            println!("[fatfs] File too large: {} > {}", file.size, request.max_size);
-            let reply = FirmwareReply::error(fw_error::TOO_LARGE);
-            syscall::send(client_channel, reply.as_bytes());
-            syscall::channel_close(client_channel);
-            continue;
+            match find_file(fs, block, filename) {
+                Some(file) => {
+                    use userlib::ipc::protocols::FileStat;
+                    FsResponse::Stat(FileStat {
+                        file_type: 0, // Regular file
+                        size: file.size as u64,
+                        created: 0,
+                        modified: 0,
+                    })
+                }
+                None => FsResponse::Error(fs_error::NOT_FOUND),
+            }
         }
 
-        // Read file into shared memory
-        let buffer = unsafe {
-            core::slice::from_raw_parts_mut(vaddr as *mut u8, request.max_size as usize)
-        };
-
-        let bytes_read = match read_file(fs, block, &file, buffer) {
-            Some(n) => n,
-            None => {
-                println!("[fatfs] Read error");
-                let reply = FirmwareReply::error(fw_error::READ_ERROR);
-                syscall::send(client_channel, reply.as_bytes());
-                syscall::channel_close(client_channel);
-                continue;
-            }
-        };
-
-        println!("[fatfs] Loaded {} bytes", bytes_read);
-
-        // Send success reply
-        let reply = FirmwareReply::success(bytes_read);
-        syscall::send(client_channel, reply.as_bytes());
-        syscall::channel_close(client_channel);
+        // Other operations not yet implemented
+        _ => {
+            println!("[fatfs] Unsupported operation");
+            FsResponse::Error(fs_error::INVALID)
+        }
     }
 }
 
@@ -491,7 +497,7 @@ fn read_performance_test(block: &mut BlockClient, _block_count: u64) {
             block.wait_completions(1, 5000);
 
             // Collect all available completions
-            while let Some((tag, bytes)) = block.collect_completion() {
+            while let Some((_tag, bytes)) = block.collect_completion() {
                 if bytes > 0 {
                     success += 1;
                 }
@@ -862,7 +868,7 @@ fn read_file(
         return Some(0);
     }
 
-    let bytes_per_cluster = fs.bytes_per_cluster() as usize;
+    let _bytes_per_cluster = fs.bytes_per_cluster() as usize;
     let sectors_per_cluster = fs.sectors_per_cluster_u32();
     let mut bytes_read = 0usize;
     let mut current_cluster = file.start_cluster;
@@ -881,8 +887,25 @@ fn read_file(
             }
 
             let sector = cluster_start + sector_offset;
-            if block.read_sector(sector as u64).is_none() {
-                println!("[fatfs] Read error at sector {}", sector);
+
+            // Retry logic for transient USB errors
+            let mut read_ok = false;
+            for retry in 0..5 {
+                if block.read_sector(sector as u64).is_some() {
+                    read_ok = true;
+                    break;
+                }
+                if retry < 4 {
+                    println!("[fatfs] Read error at sector {}, retry {}/5", sector, retry + 1);
+                    // Brief delay before retry
+                    for _ in 0..100 {
+                        syscall::yield_now();
+                    }
+                }
+            }
+
+            if !read_ok {
+                println!("[fatfs] Read failed at sector {} after 5 retries", sector);
                 return None;
             }
 
@@ -895,10 +918,23 @@ fn read_file(
         // Get next cluster from FAT
         let (fat_sector, offset) = fs.fat_sector_for_cluster(current_cluster);
 
-        // Cache FAT sector reads
+        // Cache FAT sector reads (with retry logic)
         if cached_fat_sector != Some(fat_sector) {
-            if block.read_sector(fat_sector as u64).is_none() {
-                println!("[fatfs] FAT read error at sector {}", fat_sector);
+            let mut fat_read_ok = false;
+            for retry in 0..5 {
+                if block.read_sector(fat_sector as u64).is_some() {
+                    fat_read_ok = true;
+                    break;
+                }
+                if retry < 4 {
+                    println!("[fatfs] FAT read error at sector {}, retry {}/5", fat_sector, retry + 1);
+                    for _ in 0..100 {
+                        syscall::yield_now();
+                    }
+                }
+            }
+            if !fat_read_ok {
+                println!("[fatfs] FAT read failed at sector {} after 5 retries", fat_sector);
                 return None;
             }
             fat_sector_buf.copy_from_slice(&block.data()[..512]);

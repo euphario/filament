@@ -1706,13 +1706,37 @@ fn open_user_scheme(
     // Send to daemon's main channel
     logln!("  scheme_open: sending to daemon_channel={} (path='{}', server_ch={})",
            daemon_channel, path, server_ch);
-    let blocked_pid = ipc::with_channel_table(|table| {
-        table.send(daemon_channel, msg)
-    }).map_err(|e| {
+    let (blocked_pid, peer_owner, peer_channel) = ipc::with_channel_table(|table| {
+        let peer_owner = table.get_peer_owner(daemon_channel);
+        let peer_channel = table.get_peer_id(daemon_channel);
+        let blocked = table.send(daemon_channel, msg)?;
+        Ok((blocked, peer_owner, peer_channel))
+    }).map_err(|e: ipc::IpcError| {
         logln!("  scheme_open: send failed: {:?}", e);
         e.to_errno()
     })?;
     logln!("  scheme_open: sent, blocked_pid={:?}", blocked_pid);
+
+    // Push IpcReady event to daemon's event queue (for event-driven processes)
+    if let (Some(peer_pid), Some(peer_ch)) = (peer_owner, peer_channel) {
+        if peer_pid != 0 {
+            let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+            unsafe {
+                let sched = super::task::scheduler();
+                if let Some(slot) = sched.slot_by_pid(peer_pid) {
+                    if let Some(ref mut task) = sched.tasks[slot] {
+                        let event = super::event::Event::ipc_ready(peer_ch, caller_pid);
+                        if task.event_queue.is_subscribed(&event) {
+                            task.event_queue.push(event);
+                            if task.state == super::task::TaskState::Blocked {
+                                task.state = super::task::TaskState::Ready;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Wake blocked receiver outside lock
     if let Some(pid) = blocked_pid {

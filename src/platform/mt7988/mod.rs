@@ -35,8 +35,12 @@ pub use crate::arch::aarch64::mmu::KERNEL_VIRT_BASE;
 /// DRAM base address
 pub const DRAM_BASE: usize = 0x4000_0000;
 
-/// DRAM size (assumes 2GB - adjust for actual board)
-pub const DRAM_SIZE: usize = 0x8000_0000;
+/// DRAM size (4GB for BPI-R4)
+/// Note: Adjust this for different board variants
+pub const DRAM_SIZE: usize = 0x1_0000_0000;  // 4GB
+
+/// End of usable DRAM
+pub const DRAM_END: usize = DRAM_BASE + DRAM_SIZE;
 
 /// Default initrd load address (set by U-Boot)
 pub const INITRD_ADDR: usize = 0x4800_0000;

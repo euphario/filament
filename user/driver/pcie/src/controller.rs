@@ -34,6 +34,8 @@ pub struct PcieDevice {
     pub bar0_addr: u64,
     /// BAR0 size in bytes (0 if not present)
     pub bar0_size: u32,
+    /// PCI command register value (after bus master enable)
+    pub command: u16,
 }
 
 /// PCIe host controller
@@ -211,6 +213,37 @@ impl PcieController {
         self.config.desc
     }
 
+    /// Reset the link by asserting PERST# (fundamental reset to endpoint)
+    ///
+    /// This puts the endpoint device back into its power-on state.
+    /// Used when a driver exits to reset the device for the next user.
+    ///
+    /// Returns true if link came back up, false on timeout.
+    pub fn reset_link(&mut self) -> bool {
+        // Assert PERST# only (keep MAC/PHY/BRG running)
+        let rst = self.mac.read32(regs::PCIE_RST_CTRL_REG);
+        self.mac.write32(regs::PCIE_RST_CTRL_REG, rst | rst_ctrl::PCIE_PE_RSTB);
+
+        // PCIe spec requires PERST# asserted for at least 100ms
+        delay_ms(100);
+
+        // De-assert PERST#
+        self.mac.write32(regs::PCIE_RST_CTRL_REG, rst & !rst_ctrl::PCIE_PE_RSTB);
+
+        // Wait for link to come back up (up to 500ms)
+        for _ in 0..50 {
+            delay_ms(10);
+            let status = self.mac.read32(regs::PCIE_LINK_STATUS_REG);
+            if (status & link_status::PCIE_PORT_LINKUP) != 0 {
+                self.link_up = true;
+                return true;
+            }
+        }
+
+        self.link_up = false;
+        false
+    }
+
     /// Get config space accessor (uses MAC region for TLP-based access)
     pub fn config_space(&self) -> PcieConfigSpace<'_> {
         PcieConfigSpace::new(&self.mac)
@@ -244,7 +277,8 @@ impl PcieController {
     /// Allocate and program BAR0 for a device
     ///
     /// Returns (addr, size) where addr is the allocated physical address.
-    fn allocate_bar0(&mut self, mac: *const MmioRegion, bdf: PcieBdf) -> (u64, u32) {
+    /// Allocate BAR0 and enable bus master. Returns (addr, size, command).
+    fn allocate_bar0(&mut self, mac: *const MmioRegion, bdf: PcieBdf) -> (u64, u32, u16) {
         use crate::regs::cfg as pci_cfg;
         use crate::regs::command;
 
@@ -256,7 +290,7 @@ impl PcieController {
 
         // Check if memory BAR (bit 0 = 0)
         if (bar0_orig & 0x1) != 0 {
-            return (0, 0); // I/O BAR, skip
+            return (0, 0, 0); // I/O BAR, skip
         }
 
         // Check if 64-bit (bits 2:1 = 10)
@@ -269,14 +303,14 @@ impl PcieController {
         if size_mask == 0 {
             // Restore and return - BAR not implemented
             cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
-            return (0, 0);
+            return (0, 0, 0);
         }
 
         // Calculate size (lowest set bit) - use checked arithmetic
         let size = (!size_mask).wrapping_add(1) & size_mask;
         if size == 0 {
             cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
-            return (0, 0);
+            return (0, 0, 0);
         }
 
         // Align next_mem_addr to BAR size (use checked arithmetic)
@@ -285,7 +319,7 @@ impl PcieController {
             Some(addr) => addr & !(size64 - 1),
             None => {
                 cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
-                return (0, 0); // Overflow
+                return (0, 0, 0); // Overflow
             }
         };
 
@@ -294,20 +328,20 @@ impl PcieController {
             Some(addr) => addr,
             None => {
                 cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
-                return (0, 0); // Overflow
+                return (0, 0, 0); // Overflow
             }
         };
         let mem_end = match self.config.mem_base.checked_add(self.config.mem_size) {
             Some(end) => end,
             None => {
                 cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
-                return (0, 0); // Config overflow
+                return (0, 0, 0); // Config overflow
             }
         };
         if end_addr > mem_end {
             // Out of memory window space
             cfg.write32(bdf, pci_cfg::BAR0, bar0_orig);
-            return (0, 0);
+            return (0, 0, 0);
         }
 
         // Program BAR0 with allocated address
@@ -316,14 +350,18 @@ impl PcieController {
             cfg.write32(bdf, pci_cfg::BAR0 + 4, (aligned_addr >> 32) as u32);
         }
 
-        // Enable memory space access
+        // Enable memory space access and bus master
         let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
-        cfg.write32(bdf, pci_cfg::COMMAND, (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+        let new_cmd = cmd | command::MEM_SPACE | command::BUS_MASTER;
+        cfg.write32(bdf, pci_cfg::COMMAND, new_cmd as u32);
+
+        // Read back to verify
+        let cmd_readback = cfg.read16(bdf, pci_cfg::COMMAND);
 
         // Update allocation pointer
         self.next_mem_addr = end_addr;
 
-        (aligned_addr, size)
+        (aligned_addr, size, cmd_readback)
     }
 
     /// Scan a device (check all functions if multi-function)
@@ -339,11 +377,16 @@ impl PcieController {
             let is_bridge = (header_type & 0x7F) == 0x01;
 
             // Allocate and program BAR0 for non-bridge devices
-            let (bar0_addr, bar0_size) = if !is_bridge {
+            let (bar0_addr, bar0_size, command) = if !is_bridge {
                 self.allocate_bar0(mac, bdf)
             } else {
-                (0, 0)
+                (0, 0, 0)
             };
+
+            // Disable ASPM for all devices (including bridges/root ports)
+            // Both link partners must have ASPM disabled for proper operation
+            // Critical for WiFi devices like MT7996 - Linux disables on BOTH device AND parent bridge
+            cfg.disable_aspm(bdf);
 
             devices.push(PcieDevice {
                 bdf,
@@ -352,6 +395,7 @@ impl PcieController {
                 is_bridge,
                 bar0_addr,
                 bar0_size,
+                command,
             });
 
             // If bridge, configure and scan secondary bus
@@ -376,11 +420,13 @@ impl PcieController {
                     if let Some(id) = cfg.read_device_id(bdf) {
                         let ht = cfg.read_header_type(bdf);
                         let func_is_bridge = (ht & 0x7F) == 0x01;
-                        let (bar0_addr, bar0_size) = if !func_is_bridge {
+                        let (bar0_addr, bar0_size, command) = if !func_is_bridge {
                             self.allocate_bar0(mac, bdf)
                         } else {
-                            (0, 0)
+                            (0, 0, 0)
                         };
+                        // Disable ASPM for all devices (including bridge functions)
+                        cfg.disable_aspm(bdf);
                         devices.push(PcieDevice {
                             bdf,
                             id,
@@ -388,6 +434,7 @@ impl PcieController {
                             is_bridge: func_is_bridge,
                             bar0_addr,
                             bar0_size,
+                            command,
                         });
                     }
                 }

@@ -265,6 +265,8 @@ pub enum BusType {
     PCIe = 0,
     /// USB host controller (xHCI)
     Usb = 1,
+    /// Platform pseudo-bus (uart, gpio, i2c, spi, etc.)
+    Platform = 2,
 }
 
 impl BusType {
@@ -272,6 +274,7 @@ impl BusType {
         match self {
             BusType::PCIe => "pcie",
             BusType::Usb => "usb",
+            BusType::Platform => "platform",
         }
     }
 }
@@ -646,6 +649,9 @@ impl BusController {
         match self.bus_type {
             BusType::PCIe => self.pcie_disable_all_bus_mastering(),
             BusType::Usb => self.usb_disable_all_dma(),
+            BusType::Platform => {
+                // Platform devices don't have bus mastering
+            }
         }
 
         // Then update our tracking
@@ -783,6 +789,12 @@ impl BusController {
             }
             BusType::Usb => {
                 self.usb_reset_sequence();
+            }
+            BusType::Platform => {
+                // Platform bus is a pseudo-bus - no hardware to reset
+                // Devices like uart, gpio are always available
+                self.hardware_verified = true;
+                logln!("    [OK] Platform bus: no hardware reset needed");
             }
         }
     }
@@ -1320,6 +1332,7 @@ impl BusController {
         let hw_result = match self.bus_type {
             BusType::PCIe => self.pcie_set_bus_mastering(device_id, true),
             BusType::Usb => self.usb_set_dma_allowed(device_id, true),
+            BusType::Platform => Ok(()), // Platform devices don't have bus mastering
         };
 
         if let Err(e) = hw_result {
@@ -1350,6 +1363,7 @@ impl BusController {
             let hw_result = match self.bus_type {
                 BusType::PCIe => self.pcie_set_bus_mastering(device_id, false),
                 BusType::Usb => self.usb_set_dma_allowed(device_id, false),
+                BusType::Platform => Ok(()), // Platform devices don't have bus mastering
             };
 
             if let Err(e) = hw_result {
@@ -1739,6 +1753,20 @@ pub fn init(kernel_pid: Pid) {
             }
         }
 
+        // Platform pseudo-bus - for uart, gpio, i2c, spi, etc.
+        if let Some(bus) = registry.add(BusType::Platform, 0) {
+            logln!("  Initializing {}...", bus.port_name_str());
+
+            // Platform bus is always verified (no hardware reset needed)
+            bus.perform_hardware_reset();
+
+            if let Err(e) = bus.register_port(kernel_pid) {
+                logln!("    [!!] Failed to register {}: {:?}", bus.port_name_str(), e);
+            }
+
+            crate::kernel::log::flush();
+        }
+
         logln!("");
         logln!("  Bus controller summary:");
         registry.print_info();
@@ -1756,7 +1784,7 @@ pub fn process_cleanup(pid: Pid) {
 
 /// Handle port_connect for kernel bus ports
 /// Called synchronously from port::connect() for /kernel/bus/* ports
-/// suffix is the part after "/kernel/bus/" e.g. "usb0", "pcie1"
+/// suffix is the part after "/kernel/bus/" e.g. "usb0", "pcie1", "platform"
 pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: Pid) -> Result<(), BusError> {
     // Parse bus type and index from suffix
     let (bus_type, index) = if suffix.starts_with("usb") {
@@ -1765,6 +1793,8 @@ pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: 
     } else if suffix.starts_with("pcie") {
         let idx = suffix[4..].parse::<u8>().map_err(|_| BusError::NotFound)?;
         (BusType::PCIe, idx)
+    } else if suffix == "platform" {
+        (BusType::Platform, 0)
     } else {
         return Err(BusError::NotFound);
     };

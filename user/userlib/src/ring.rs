@@ -183,6 +183,7 @@ pub struct Ring<S, C> {
     /// Physical address (for DMA)
     phys: u64,
     /// Total size of the region
+    #[allow(dead_code)]
     size: usize,
     /// Are we the owner (creator)?
     is_owner: bool,

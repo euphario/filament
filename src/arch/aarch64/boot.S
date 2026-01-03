@@ -14,10 +14,35 @@
  *   x27 = preserved (callee-saved)
  */
 
+/*
+ * Debug UART output macro - outputs a single character
+ * Uses x10, x11 as scratch (must save/restore if needed)
+ * UART0 base = 0x11000000 physical, 0xFFFF000011000000 virtual (TTBR1)
+ * THR = offset 0, LSR = offset 0x14
+ *
+ * After MMU is enabled, we use TTBR1 virtual address so this works
+ * regardless of what TTBR0 is pointing to.
+ */
+.macro debug_uart_char char
+    // Load UART base via TTBR1: 0xFFFF_0000_1100_0000
+    movz    x10, #0x1100, lsl #16   // 0x11000000
+    movk    x10, #0xFFFF, lsl #48   // Add TTBR1 prefix
+1:  ldr     w11, [x10, #0x14]       // Read LSR
+    tbz     w11, #5, 1b             // Wait for THRE (bit 5)
+    mov     w11, #\char
+    str     w11, [x10, #0]          // Write to THR
+.endm
+
 .section .text.boot
 .global _start
 
 _start:
+    /*
+     * U-Boot passes DTB address in x0. Save it before we clobber x0.
+     * Use x20 (callee-saved) to preserve across function calls.
+     */
+    mov     x20, x0
+
     /*
      * Disable interrupts (DAIF = Debug, Async, IRQ, FIQ)
      */
@@ -304,6 +329,10 @@ post_mmu_entry:
     adrp    x3, BOOT_TTBR1
     str     x1, [x3, :lo12:BOOT_TTBR1]
 
+    /* Store DTB pointer (from x20, saved at _start) */
+    adrp    x3, BOOT_DTB_ADDR
+    str     x20, [x3, :lo12:BOOT_DTB_ADDR]
+
     /*
      * Jump to Rust entry point.
      * Rust code now runs with MMU enabled, all symbols valid.
@@ -450,6 +479,9 @@ exception_handler:
     stp     x29, x30, [sp, #-16]!
     stp     x0, x1, [sp, #-16]!
 
+    /* Debug: exception entry (UART via TTBR1) */
+    debug_uart_char 'E'
+
     mrs     x0, esr_el1
     mrs     x1, elr_el1
     mrs     x2, far_el1
@@ -461,6 +493,7 @@ exception_handler:
 
 /*
  * IRQ handler - check if from user mode and handle accordingly
+ * NOTE: Cannot use UART debug here - TTBR0 may be user space (0x11000000 not mapped)
  */
 irq_handler:
     /* Check if IRQ came from EL0 (user mode) by examining SPSR_EL1.M[3:0] */
@@ -691,7 +724,7 @@ svc_handler:
     ldr     x7, [x9, #64]           // syscall number (was x8)
     bl      syscall_handler_rust
 
-    /* Save syscall return value temporarily */
+    /* Save syscall return value temporarily (x19 is callee-saved) */
     mov     x19, x0
 
     /* Check if syscall already switched tasks */
@@ -699,7 +732,17 @@ svc_handler:
     ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
     cbnz    x10, .Lsvc_already_switched
 
-    /* Syscall didn't switch - check if reschedule is needed (e.g., task blocked on IPC) */
+    /* Syscall didn't switch - store return value to trap frame BEFORE
+     * calling do_resched_if_needed. This is critical: if do_resched switches
+     * to another task, we need the return value saved now, because x9 will
+     * be reloaded to point to the new task's trap frame after the switch.
+     * Note: x9 may have been clobbered by syscall_handler_rust (caller-saved),
+     * so we must reload CURRENT_TRAP_FRAME here. */
+    adrp    x9, CURRENT_TRAP_FRAME
+    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    str     x19, [x9, #0]
+
+    /* Now check if reschedule is needed (e.g., timer preemption) */
     bl      do_resched_if_needed
 
 .Lsvc_already_switched:
@@ -708,13 +751,8 @@ svc_handler:
     adrp    x9, CURRENT_TRAP_FRAME
     ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
 
-    /* Check if we switched tasks - only store return value if same task */
-    adrp    x10, SYSCALL_SWITCHED_TASK
-    ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
-    cbnz    x10, .Lsvc_skip_retval
-
-    /* Same task: store syscall return value */
-    str     x19, [x9, #0]
+    /* Note: return value was already stored above if syscall didn't switch.
+     * If syscall DID switch, the new task's trap frame already has its x0. */
 
 .Lsvc_skip_retval:
     /* Switch TTBR0 to current task's user address space for eret.
@@ -805,3 +843,8 @@ BOOT_TTBR0:
 .global BOOT_TTBR1
 BOOT_TTBR1:
     .quad 0                     // Physical address of boot TTBR1 L0 table
+
+.balign 8
+.global BOOT_DTB_ADDR
+BOOT_DTB_ADDR:
+    .quad 0                     // DTB address passed from U-Boot in x0

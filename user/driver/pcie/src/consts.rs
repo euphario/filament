@@ -19,17 +19,31 @@ pub mod vendor {
 
 /// Well-known PCIe device IDs
 pub mod device {
-    // MediaTek WiFi devices
-    /// MediaTek MT7996 WiFi 7 (main)
-    pub const MT7996: u16 = 0x7996;
-    /// MediaTek MT7996 WiFi 7 endpoint A
-    pub const MT7990: u16 = 0x7990;
-    /// MediaTek MT7996 WiFi 7 endpoint B
-    pub const MT7991: u16 = 0x7991;
+    // MediaTek WiFi devices (per Linux mt76/mt7996/mt7996.h)
+    // Device IDs from https://github.com/openwrt/mt76/blob/master/mt7996/mt7996.h
+
+    /// MediaTek MT7996 WiFi 7 (primary - use for firmware loading)
+    pub const MT7996: u16 = 0x7990;
+    /// MediaTek MT7996 WiFi 7 HIF2 (secondary - do NOT load firmware directly)
+    pub const MT7996_HIF2: u16 = 0x7991;
+    /// MediaTek MT7992 WiFi 7 (primary)
+    pub const MT7992: u16 = 0x7992;
+    /// MediaTek MT7992 WiFi 7 HIF2 (secondary)
+    pub const MT7992_HIF2: u16 = 0x799a;
+    /// MediaTek MT7990 WiFi 7 (primary)
+    pub const MT7990: u16 = 0x7993;
+    /// MediaTek MT7990 WiFi 7 HIF2 (secondary)
+    pub const MT7990_HIF2: u16 = 0x799b;
     /// MediaTek MT7915 WiFi 6
     pub const MT7915: u16 = 0x7915;
     /// MediaTek MT7988 PCIe Root Complex
     pub const MT7988_RC: u16 = 0x7988;
+
+    /// Check if a device ID is a secondary/HIF2 device
+    /// HIF2 devices should not have firmware loaded directly
+    pub const fn is_hif2(device_id: u16) -> bool {
+        matches!(device_id, MT7996_HIF2 | MT7992_HIF2 | MT7990_HIF2)
+    }
 }
 
 /// PCIe class codes (base class, upper 8 bits of 24-bit class code)

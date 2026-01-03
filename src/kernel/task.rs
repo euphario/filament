@@ -168,7 +168,8 @@ pub const GUARD_PAGE_SIZE: usize = 4096;
 pub const MAX_TASKS: usize = 16;
 
 /// Maximum number of heap mappings per task
-pub const MAX_HEAP_MAPPINGS: usize = 32;
+/// WiFi driver needs ~20 rings × 2 mappings each = 40+
+pub const MAX_HEAP_MAPPINGS: usize = 64;
 
 /// User heap region start (after code/stack regions)
 pub const USER_HEAP_START: u64 = 0x5000_0000;
@@ -1036,10 +1037,16 @@ impl Scheduler {
     }
 
     /// Generate a PID for a given slot
-    /// PID format: bits[7:0] = slot + 1 (1-16), bits[31:8] = generation
+    /// PID format: bits[7:0] = slot + 1 (1-16), bits[31:8] = generation (24 bits)
+    ///
+    /// The generation is masked to 24 bits to prevent overflow when shifted.
+    /// After 2^24 task creations in a slot, generation wraps to 0, which is
+    /// acceptable since the probability of a stale reference surviving that
+    /// long is negligible.
     fn make_pid(&self, slot: usize) -> TaskId {
         let slot_bits = (slot + 1) as u32;  // +1 to avoid PID 0
-        let gen_bits = self.generations[slot] << 8;
+        let gen = self.generations[slot] & 0xFF_FFFF;  // Mask to 24 bits
+        let gen_bits = gen << 8;
         slot_bits | gen_bits
     }
 

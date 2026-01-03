@@ -34,6 +34,7 @@
 //! - `board` - Board configuration trait and implementations
 
 #![no_std]
+#![allow(dead_code)]  // USB constants and helpers for future use
 
 // =============================================================================
 // Modular Architecture

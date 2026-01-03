@@ -14,6 +14,8 @@
 //! and firmware loading infrastructure.
 
 #![no_std]
+#![allow(dead_code)]  // Driver functions reserved for future use
+#![allow(unused_unsafe)]  // Some unsafe blocks are for future-proofing
 
 pub mod regs;
 pub mod device;

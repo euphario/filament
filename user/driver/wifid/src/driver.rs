@@ -3,6 +3,8 @@
 //! Abstraction layer for WiFi device drivers. Each chip family implements
 //! this trait, allowing wifid to work with any supported hardware.
 
+#![allow(dead_code)]  // Driver state machine variants reserved for future use
+
 use pcie::PcieDeviceInfo;
 
 /// WiFi driver initialization error
@@ -79,10 +81,23 @@ pub enum AnyWifiDriver {
 impl AnyWifiDriver {
     /// Try to find a driver for the given device
     pub fn probe(info: &PcieDeviceInfo) -> Option<Self> {
+        Self::probe_with_peers(info, &[])
+    }
+
+    /// Try to find a driver, with access to all devices for finding peers (like HIF2)
+    pub fn probe_with_peers(info: &PcieDeviceInfo, all_devices: &[PcieDeviceInfo]) -> Option<Self> {
         use super::drivers::mt7996::Mt7996Driver;
 
         if Mt7996Driver::supports(info) {
-            if let Ok(driver) = Mt7996Driver::probe(info) {
+            // For MT7996, try to find the HIF2 peer device
+            let hif2_id = Mt7996Driver::hif2_device_id(info.device_id);
+            let hif2_info = hif2_id.and_then(|id| {
+                all_devices.iter().find(|d| {
+                    d.vendor_id == info.vendor_id && d.device_id == id
+                })
+            });
+
+            if let Ok(driver) = Mt7996Driver::probe_with_hif2(info, hif2_info) {
                 return Some(AnyWifiDriver::Mt7996(driver));
             }
         }

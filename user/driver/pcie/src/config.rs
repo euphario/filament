@@ -156,6 +156,96 @@ impl<'a> PcieConfigSpace<'a> {
         self.mac.write32(offset, value);
     }
 
+    /// Write 16-bit value to config space
+    pub fn write16(&self, bdf: PcieBdf, reg: u16, value: u16) {
+        // For 16-bit writes, we need to read-modify-write
+        // to avoid clobbering adjacent 16-bit register
+        let aligned_reg = reg & !0x3;
+        self.setup_tlp(bdf, aligned_reg, 4);
+        let offset = PCIE_CFG_OFFSET_ADDR + (aligned_reg as usize);
+
+        let val32 = self.mac.read32(offset);
+        let shift = ((reg & 0x2) as u32) * 8;
+        let mask = !(0xFFFFu32 << shift);
+        let new_val = (val32 & mask) | ((value as u32) << shift);
+
+        self.setup_tlp(bdf, aligned_reg, 4);
+        self.mac.write32(offset, new_val);
+    }
+
+    /// Find a PCI capability by ID
+    /// Returns the capability's base offset in config space, or None if not found
+    pub fn find_capability(&self, bdf: PcieBdf, cap_id: u8) -> Option<u16> {
+        use crate::regs::cfg;
+
+        // Check if device has capabilities (status register bit 4)
+        let status = self.read16(bdf, cfg::STATUS);
+        if (status & (1 << 4)) == 0 {
+            return None;  // No capabilities
+        }
+
+        // Get capabilities pointer
+        let mut cap_ptr = self.read8(bdf, cfg::CAP_PTR) & !0x3;  // Must be dword aligned
+        if cap_ptr == 0 {
+            return None;
+        }
+
+        // Walk capability list (max 48 to avoid infinite loops)
+        for _ in 0..48 {
+            if cap_ptr == 0 || cap_ptr == 0xFF {
+                break;
+            }
+
+            let id = self.read8(bdf, cap_ptr as u16);
+            if id == cap_id {
+                return Some(cap_ptr as u16);
+            }
+
+            // Next pointer is at offset +1
+            cap_ptr = self.read8(bdf, cap_ptr as u16 + 1);
+        }
+
+        None
+    }
+
+    /// Find PCIe Express Capability
+    pub fn find_pcie_capability(&self, bdf: PcieBdf) -> Option<u16> {
+        use crate::regs::cap_id;
+        self.find_capability(bdf, cap_id::PCIE)
+    }
+
+    /// Disable ASPM (Active State Power Management) on a device
+    ///
+    /// This is critical for WiFi devices like MT7996 which may not work
+    /// correctly with power management enabled.
+    ///
+    /// Returns true if ASPM was disabled, false if PCIe capability not found
+    pub fn disable_aspm(&self, bdf: PcieBdf) -> bool {
+        use crate::regs::{pcie_cap, link_ctl};
+
+        let pcie_cap_base = match self.find_pcie_capability(bdf) {
+            Some(base) => base,
+            None => return false,
+        };
+
+        // Read Link Control register
+        let link_ctl_reg = pcie_cap_base + pcie_cap::LINK_CTL;
+        let link_ctl_val = self.read16(bdf, link_ctl_reg);
+
+        // Check if ASPM is enabled
+        if (link_ctl_val & link_ctl::ASPM_MASK) != 0 {
+            // Clear ASPM bits
+            let new_val = link_ctl_val & !link_ctl::ASPM_MASK;
+            self.write16(bdf, link_ctl_reg, new_val);
+
+            // Verify
+            let verify = self.read16(bdf, link_ctl_reg);
+            return (verify & link_ctl::ASPM_MASK) == 0;
+        }
+
+        true  // ASPM already disabled
+    }
+
     /// Check if a device exists at the given BDF
     pub fn device_exists(&self, bdf: PcieBdf) -> bool {
         let vendor = self.read16(bdf, cfg::VENDOR_ID);

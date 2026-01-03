@@ -103,7 +103,9 @@ impl MmioRegion {
     pub fn write32(&self, offset: usize, value: u32) {
         debug_assert!(offset + 3 < self.size as usize);
         unsafe {
-            core::ptr::write_volatile((self.base + offset as u64) as *mut u32, value)
+            core::ptr::write_volatile((self.base + offset as u64) as *mut u32, value);
+            // dsb sy ensures write completes before any subsequent operation
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
     }
 

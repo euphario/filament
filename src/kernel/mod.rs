@@ -12,6 +12,7 @@
 //! Code in this module should be architecture and platform independent.
 
 pub mod task;
+pub mod sched;
 pub mod process;
 pub mod syscall;
 pub mod ipc;
@@ -31,3 +32,4 @@ pub mod percpu;
 pub mod pci;
 pub mod bus;
 pub mod security_log;
+pub mod fdt;

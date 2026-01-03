@@ -25,14 +25,33 @@ echo "  Mode: $BUILD_TYPE"
 echo "========================================"
 echo
 
+# Step 0: Compile device tree
+echo "Step 0: Compiling device tree..."
+if command -v dtc >/dev/null 2>&1; then
+    dtc -I dts -O dtb -o bpi-r4.dtb bpi-r4.dts 2>/dev/null || {
+        echo "  Warning: dtc failed, skipping DTB"
+    }
+    if [ -f bpi-r4.dtb ]; then
+        DTB_SIZE=$(ls -lh bpi-r4.dtb | awk '{print $5}')
+        echo "  Created: bpi-r4.dtb ($DTB_SIZE)"
+    fi
+else
+    echo "  Warning: dtc not found, skipping DTB compilation"
+    echo "  Install with: brew install dtc (macOS) or apt install device-tree-compiler (Linux)"
+fi
+echo
+
 # Step 1: Build user programs
 echo "Step 1: Building user programs..."
 (cd user && ./build.sh)
 echo
 
 # Step 2: Create initrd
+# Use --with-firmware to embed firmware (adds ~3MB)
+# Without it, firmware loads from USB via fatfs
 echo "Step 2: Creating initrd..."
-(cd user && ./mkinitrd.sh)
+INITRD_OPTS="${INITRD_OPTS:-}"
+(cd user && ./mkinitrd.sh $INITRD_OPTS)
 echo
 
 # Step 3: Build kernel
@@ -53,10 +72,16 @@ echo "========================================"
 echo "  Build Complete!"
 echo "========================================"
 echo
-echo "  kernel.bin: $KERNEL_SIZE"
+echo "  kernel.bin: $KERNEL_SIZE (includes embedded DTB)"
+if [ -f bpi-r4.dtb ]; then
+    DTB_SIZE=$(ls -lh bpi-r4.dtb | awk '{print $5}')
+    echo "  bpi-r4.dtb: $DTB_SIZE (standalone copy)"
+fi
 echo
 echo "To load via U-Boot:"
 echo "  1. loady 0x46000000"
 echo "  2. (send kernel.bin via xmodem)"
 echo "  3. go 0x46000000"
+echo
+echo "DTB is embedded in kernel.bin - no separate loading needed."
 echo

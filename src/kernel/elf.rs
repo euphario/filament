@@ -455,13 +455,20 @@ pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::Task
                 }
             }
             // Second pass: add child and set capabilities
+            let mut found_parent = false;
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut parent_task) = task_opt {
                     if parent_task.id == parent_id {
-                        parent_task.add_child(task_id);
+                        let added = parent_task.add_child(task_id);
+                        logln!("    add_child({}): parent {} now has {} children, added={}",
+                               task_id, parent_id, parent_task.num_children, added);
+                        found_parent = true;
                         break;
                     }
                 }
+            }
+            if !found_parent {
+                logln!("    WARNING: parent {} not found for child {}", parent_id, task_id);
             }
             // Apply inherited capabilities to the child
             if let Some(caps) = parent_caps {

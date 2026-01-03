@@ -10,6 +10,9 @@
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]        // Kernel functions reserved for SMP, drivers, etc.
+#![allow(unused_unsafe)]    // Some unsafe blocks are for future-proofing
+#![allow(unused_must_use)]  // Some Results intentionally ignored
 
 // Architecture support (AArch64)
 mod arch {
@@ -28,6 +31,7 @@ mod hal;
 mod kernel;
 
 // Remaining top-level modules (to be organized later)
+mod dtb;
 mod initrd;
 mod log;
 mod panic;
@@ -93,6 +97,10 @@ pub extern "C" fn kmain() -> ! {
     } else if el == 2 {
         println!("[!!] Still at EL2 - drop failed");
     }
+
+    // Parse and dump device tree from U-Boot
+    kernel::fdt::init();
+    kernel::log::flush();
 
     println!();
     println!("Initializing GIC...");

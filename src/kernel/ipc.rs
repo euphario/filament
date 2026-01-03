@@ -143,8 +143,13 @@ impl Message {
     }
 
     /// Get payload as slice
+    ///
+    /// Returns the valid portion of the payload buffer. The length is clamped
+    /// to MAX_INLINE_PAYLOAD to prevent out-of-bounds access if payload_len
+    /// is corrupted.
     pub fn payload_slice(&self) -> &[u8] {
-        &self.payload[..self.header.payload_len as usize]
+        let len = core::cmp::min(self.header.payload_len as usize, MAX_INLINE_PAYLOAD);
+        &self.payload[..len]
     }
 }
 
@@ -267,6 +272,8 @@ pub struct ChannelEndpoint {
     pub queue: MessageQueue,
     /// Process waiting to receive on this channel
     pub blocked_receiver: Option<Pid>,
+    /// Set when peer has closed (even if Close message couldn't be delivered)
+    pub peer_closed: bool,
 }
 
 impl ChannelEndpoint {
@@ -278,6 +285,7 @@ impl ChannelEndpoint {
             state: ChannelState::Free,
             queue: MessageQueue::new(),
             blocked_receiver: None,
+            peer_closed: false,
         }
     }
 
@@ -289,6 +297,7 @@ impl ChannelEndpoint {
         self.state = ChannelState::Free;
         self.queue = MessageQueue::new();
         self.blocked_receiver = None;
+        self.peer_closed = false;
     }
 }
 
@@ -379,7 +388,11 @@ impl ChannelTable {
                     // Get blocked receiver before pushing message
                     blocked_pid = self.endpoints[peer_slot].blocked_receiver;
 
-                    // Send close notification to peer's queue
+                    // Mark peer as having a closed peer (ensures notification even if queue is full)
+                    self.endpoints[peer_slot].peer_closed = true;
+
+                    // Try to send close notification to peer's queue
+                    // (may fail if queue is full, but peer_closed flag ensures detection)
                     let close_msg = Message {
                         header: MessageHeader {
                             msg_type: MessageType::Close,
@@ -438,7 +451,19 @@ impl ChannelTable {
     pub fn receive(&mut self, channel_id: ChannelId) -> Result<Message, IpcError> {
         let slot = self.find_by_id(channel_id).ok_or(IpcError::InvalidChannel)?;
 
-        self.endpoints[slot].queue.pop().ok_or(IpcError::WouldBlock)
+        // Try to pop a message from the queue
+        if let Some(msg) = self.endpoints[slot].queue.pop() {
+            return Ok(msg);
+        }
+
+        // Queue is empty - check if peer has closed
+        // This handles the case where the Close message couldn't be delivered
+        // due to a full queue
+        if self.endpoints[slot].peer_closed {
+            return Err(IpcError::PeerClosed);
+        }
+
+        Err(IpcError::WouldBlock)
     }
 
     /// Register a process as blocked waiting for a message
@@ -670,7 +695,9 @@ fn sys_send_internal(channel_id: ChannelId, caller: Pid, data: &[u8], direct: bo
     }
 
     // Wake blocked process outside the channel lock to avoid deadlock
+    // Use IrqGuard for scheduler access to prevent race with interrupt handlers
     if let Some(pid) = blocked_pid {
+        let _guard = crate::arch::aarch64::sync::IrqGuard::new();
         unsafe {
             super::process::process_table().wake(pid);
             let sched = super::task::scheduler();
@@ -832,6 +859,28 @@ pub fn sys_queue_status(channel_id: ChannelId, caller: Pid) -> Result<QueueStatu
         table.peer_queue_status(channel_id)
             .ok_or(IpcError::NoPeer)
     })
+}
+
+/// Clean up all channels owned by a process (called on process exit)
+/// This handles channels that weren't stored in the FD table (e.g., from port_connect)
+pub fn process_cleanup(pid: Pid) {
+    with_channel_table(|table| {
+        // Collect channel IDs to close (avoid borrow issues)
+        let mut to_close: [ChannelId; MAX_CHANNELS] = [0; MAX_CHANNELS];
+        let mut count = 0;
+
+        for ep in table.endpoints.iter() {
+            if ep.state != ChannelState::Free && ep.owner == pid {
+                to_close[count] = ep.id;
+                count += 1;
+            }
+        }
+
+        // Close each channel
+        for i in 0..count {
+            let _ = table.close(to_close[i]);
+        }
+    });
 }
 
 // ============================================================================

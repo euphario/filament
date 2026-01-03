@@ -17,6 +17,11 @@ pub const MT_TOP_CFG: u32 = 0x70020000;
 /// WFDMA0 base
 pub const MT_WFDMA0_BASE: u32 = 0xd4000;
 
+/// HIF2 offset when accessed via HIF1's BAR
+/// Linux uses: MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) = 0xd8000 - 0xd4000 = 0x4000
+/// This allows accessing HIF2 registers as HIF1_BAR + HIF1_OFS + register_offset
+pub const MT_HIF1_OFS: u32 = 0x4000;
+
 /// WFDMA0 busy status
 pub const MT_WFDMA0_BUSY_ENA: u32 = MT_WFDMA0_BASE + 0x13c;
 
