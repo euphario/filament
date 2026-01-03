@@ -742,37 +742,29 @@ impl BusController {
     }
 
     /// Handle a new connection to the bus control port
-    /// First connection (devd) becomes supervisor - bus stays Safe
-    /// Second connection (driver) claims the bus if supervisor present
+    /// Only supervisor (devd) should connect - drivers are authorized via SetDriver
     pub fn handle_connect(&mut self, client_channel: ChannelId, client_pid: Pid) -> Result<(), BusError> {
         match self.state {
             BusState::Safe => {
-                if self.owner_pid.is_none() {
-                    // First connection is supervisor (devd) - bus stays Safe
-                    self.owner_channel = Some(client_channel);
-                    self.owner_pid = Some(client_pid);
-                    logln!("  Bus {}: supervisor PID {} connected",
-                           self.port_name_str(), client_pid);
-                } else if self.driver_pid.is_none() {
-                    // Second connection is driver claiming the bus
-                    // Only allowed if supervisor is connected
-                    self.driver_pid = Some(client_pid);
-                    self.transition_to(BusState::Claimed, StateChangeReason::DriverClaimed);
-                    logln!("  Bus {}: driver PID {} claimed (supervisor {:?})",
+                if self.owner_pid.is_some() {
+                    // Only one supervisor allowed - drivers use SetDriver, not connect
+                    logln!("  Bus {}: rejecting connect from PID {} (supervisor {:?} already connected)",
                            self.port_name_str(), client_pid, self.owner_pid);
-                } else {
-                    // Already has supervisor and driver - reject
-                    logln!("  Bus {}: rejecting connect from PID {} (already has driver {:?})",
-                           self.port_name_str(), client_pid, self.driver_pid);
                     return Err(BusError::AlreadyClaimed);
                 }
 
-                // Send StateSnapshot to new connection
+                // First connection is supervisor (devd) - bus stays Safe
+                self.owner_channel = Some(client_channel);
+                self.owner_pid = Some(client_pid);
+                logln!("  Bus {}: supervisor PID {} connected",
+                       self.port_name_str(), client_pid);
+
+                // Send StateSnapshot to supervisor
                 self.send_state_snapshot(client_channel)?;
                 Ok(())
             }
             BusState::Claimed => {
-                // Already claimed - reject (driver should use handoff)
+                // Already claimed - reject
                 Err(BusError::AlreadyClaimed)
             }
             BusState::Resetting => {
