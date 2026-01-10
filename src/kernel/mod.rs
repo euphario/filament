@@ -21,6 +21,7 @@ pub mod port;
 pub mod event;
 pub mod fd;
 pub mod shmem;
+pub mod dma_pool;
 pub mod elf;
 pub mod pmm;
 pub mod addrspace;

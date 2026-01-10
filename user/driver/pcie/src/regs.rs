@@ -56,6 +56,19 @@ pub mod link_status {
     pub const WIDTH_SHIFT: u32 = 20;
 }
 
+/// PCIE_SETTING_REG - Mode and capability settings (from pcie-mediatek-gen3.c)
+pub const PCIE_SETTING_REG: usize = 0x80;
+
+/// PCIE_SETTING_REG bits
+pub mod pcie_setting {
+    /// Root Complex mode enable (CRITICAL for inbound DMA to work!)
+    pub const RC_MODE: u32 = 1 << 0;
+    /// Link width setting mask
+    pub const LINK_WIDTH_MASK: u32 = 0xF << 8;
+    /// Gen support mask
+    pub const GEN_SUPPORT_MASK: u32 = 0x7 << 12;
+}
+
 /// MISC control register (from pcie-mediatek-gen3.c)
 pub const PCIE_MISC_CTRL_REG: usize = 0x348;
 
@@ -205,6 +218,39 @@ pub mod link_ctl {
     pub const ASPM_MASK: u16 = ASPM_L0S | ASPM_L1;
 }
 
+/// Device Capabilities register bits (offset 0x04 from PCIe cap)
+pub mod dev_cap {
+    /// Max Payload Size Supported (bits 2:0)
+    /// 000=128B, 001=256B, 010=512B, 011=1KB, 100=2KB, 101=4KB
+    pub const MPS_MASK: u32 = 0x7;
+}
+
+/// Device Control register bits (offset 0x08 from PCIe cap)
+pub mod dev_ctl {
+    /// Relaxed Ordering Enable (bit 4)
+    pub const RELAX_ORDER_EN: u16 = 1 << 4;
+    /// Max Payload Size (bits 7:5)
+    pub const MPS_SHIFT: u16 = 5;
+    pub const MPS_MASK: u16 = 0x7 << 5;
+    /// Extended Tag Enable (bit 8)
+    pub const EXT_TAG_EN: u16 = 1 << 8;
+    /// No Snoop Enable (bit 11)
+    pub const NO_SNOOP_EN: u16 = 1 << 11;
+    /// Max Read Request Size (bits 14:12)
+    /// 000=128B, 001=256B, 010=512B, 011=1KB, 100=2KB, 101=4KB
+    pub const MRRS_SHIFT: u16 = 12;
+    pub const MRRS_MASK: u16 = 0x7 << 12;
+
+    /// MRRS value for 512 bytes (default per spec)
+    pub const MRRS_512: u16 = 2 << 12;
+    /// MRRS value for 4KB (maximum)
+    pub const MRRS_4K: u16 = 5 << 12;
+    /// MPS value for 128 bytes (safe default)
+    pub const MPS_128: u16 = 0 << 5;
+    /// MPS value for 256 bytes
+    pub const MPS_256: u16 = 1 << 5;
+}
+
 /// Header type values
 pub mod header_type {
     /// Multi-function device bit
@@ -220,7 +266,20 @@ pub mod header_type {
 }
 
 /// Address Translation Unit (ATU) registers
-/// Programs outbound CPU-to-PCIe address translation
+///
+/// The MediaTek PCIe Gen3 controller uses ATU tables for address translation:
+///
+/// **Outbound (CPU → PCIe):** Programs how CPU addresses map to PCIe bus addresses
+/// when the CPU accesses device BARs. Configured at offset 0x800.
+///
+/// **Inbound (PCIe → CPU):** On MT7988A, inbound DMA uses identity mapping by default.
+/// The AXI interconnect passes PCIe memory transactions directly to DRAM without
+/// explicit translation table configuration. This means:
+/// - PCIe bus address 0x40000000 → CPU physical address 0x40000000 (DRAM base)
+/// - No explicit inbound ATU configuration required
+///
+/// For platforms that require explicit inbound windows, additional registers would
+/// be needed (typically separate inbound ATU tables or iATU registers).
 pub const PCIE_TRANS_TABLE_BASE_REG: usize = 0x800;
 
 /// ATU register offsets within each translation table entry
@@ -236,13 +295,35 @@ pub mod atu {
     /// Spacing between translation table entries
     pub const TLB_SET_OFFSET: usize = 0x20;
 
-    /// Maximum number of translation tables
+    /// Maximum number of translation tables (outbound)
     pub const MAX_TRANS_TABLES: usize = 8;
 
     /// ATU type bits (in source address LSB register)
     pub const TYPE_MEM: u32 = 0x0;  // Memory type
     pub const TYPE_IO: u32 = 0x1;   // I/O type
 
+    /// ATU enable bit
+    pub const ATR_EN: u32 = 1 << 0;
+
     /// Minimum ATU window size (4KB)
     pub const MIN_SIZE: u64 = 0x1000;
+
+    /// Calculate ATU size encoding for a given window size
+    /// Formula from Linux: (((size - 1) << 1) & 0x7E) | ATR_EN
+    #[inline]
+    pub const fn size_encoding(size: u64) -> u32 {
+        if size == 0 {
+            return 0;
+        }
+        let leading = size.leading_zeros();
+        if leading >= 63 {
+            return ATR_EN; // Minimum size
+        }
+        let size_log2 = 63 - leading; // fls(size) - 1
+        if size_log2 >= 1 {
+            (((size_log2 - 1) << 1) & 0x7E) as u32 | ATR_EN
+        } else {
+            ATR_EN
+        }
+    }
 }

@@ -501,7 +501,10 @@ unsafe fn unmap_from_all_processes(phys_addr: u64, size: usize) {
     }
 }
 
-/// Map physical memory into a process's address space
+/// Map physical memory into a process's address space for DMA
+/// Uses non-cacheable device memory attributes (nGnRnE) because shmem
+/// is primarily used for DMA rings where CPU cache coherency with
+/// PCIe/USB devices is critical.
 fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
     unsafe {
         let sched = super::task::scheduler();
@@ -510,9 +513,9 @@ fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
         for task_opt in sched.tasks.iter_mut() {
             if let Some(ref mut task) = task_opt {
                 if task.id == pid {
-                    // Use the task's address space to allocate a virtual address
-                    // and create the mapping
-                    return task.mmap_phys(phys_addr, size)
+                    // Use mmap_shmem_dma: non-cacheable for DMA coherency,
+                    // but BorrowedShmem kind so pages are managed by shmem subsystem
+                    return task.mmap_shmem_dma(phys_addr, size)
                         .ok_or(-12i64); // ENOMEM
                 }
             }

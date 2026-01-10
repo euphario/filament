@@ -145,8 +145,8 @@ fn class_name(class_code: u32) -> &'static str {
     }
 }
 
-/// Register all devices with devd
-fn register_with_devd(registry: &DeviceRegistry) {
+/// Register all devices with devd and claim the buses we manage
+fn register_with_devd(registry: &DeviceRegistry, active_ports: u8) {
     print!("Registering with devd... ");
 
     let mut devd = match DevdClient::connect() {
@@ -157,6 +157,30 @@ fn register_with_devd(registry: &DeviceRegistry) {
         }
     };
 
+    // First, claim ALL PCIe buses (pcied manages all 4 ports)
+    println!("OK");
+    println!("Claiming PCIe buses...");
+    let mut buses_claimed = 0usize;
+    for port in 0..4u8 {
+        // Format bus path: /bus/pcie{port}
+        let mut bus_path = [0u8; 12];
+        bus_path[..9].copy_from_slice(b"/bus/pcie");
+        bus_path[9] = b'0' + port;
+        let path = core::str::from_utf8(&bus_path[..10]).unwrap_or("");
+
+        match devd.claim_bus(path) {
+            Ok(()) => {
+                println!("  {} -> active", path);
+                buses_claimed += 1;
+            }
+            Err(e) => {
+                println!("  {} FAILED: {:?}", path, e);
+            }
+        }
+    }
+
+    // Then register all discovered devices
+    println!("Registering {} devices with devd...", registry.count);
     let mut registered = 0usize;
 
     for i in 0..registry.count {
@@ -218,14 +242,20 @@ fn register_with_devd(registry: &DeviceRegistry) {
             .add("vendor", vendor_str)
             .add("device", device_str)
             .add("class", class_name(dev.class_code))
-            .add("state", "bound");
+            .add("state", "discovered");
 
-        if devd.register(path, props).is_ok() {
-            registered += 1;
+        match devd.register(path, props) {
+            Ok(()) => {
+                println!("  {} -> registered", path);
+                registered += 1;
+            }
+            Err(e) => {
+                println!("  {} FAILED: {:?}", path, e);
+            }
         }
     }
 
-    println!("OK ({} devices)", registered);
+    println!("Done: {} buses claimed, {} devices registered", buses_claimed, registered);
 }
 
 #[unsafe(no_mangle)]
@@ -298,6 +328,7 @@ fn main() {
     // Step 4: Initialize each available port and enumerate devices
     // devd has authorized us via SetDriver - we trust our spawn context
     let mut any_device_found = false;
+    let mut active_ports: u8 = 0;  // Bitmask of ports we successfully enumerated
 
     for port in 0..board.soc().port_count() {
         // Skip ports not in kernel's bus list
@@ -324,6 +355,9 @@ fn main() {
                     let width = controller.link_width();
                     println!("Link up! (Gen{} x{})", speed, width);
 
+                    // Mark this port as active (we're managing it)
+                    active_ports |= 1 << port;
+
                     // Enumerate devices on this port
                     let devices = controller.enumerate();
 
@@ -335,7 +369,7 @@ fn main() {
                             any_device_found = true;
                             print_device(dev);
 
-                            // Add to registry
+                            // Add to registry (pcied is source of truth for PCI devices)
                             registry.add(StoredDevice {
                                 port,
                                 bus: dev.bdf.bus,
@@ -361,14 +395,17 @@ fn main() {
         println!();
     }
 
+    println!("=== PCIe enumeration complete ===");
     if any_device_found {
-        println!("=== PCIe enumeration complete ===");
-        println!("Registered {} device(s)", registry.count);
-
-        // Register all devices with devd
-        register_with_devd(&registry);
+        println!("Discovered {} device(s)", registry.count);
     } else {
         println!("No PCIe devices detected");
+    }
+
+    // Register buses and devices with devd
+    // (always register buses even if no devices found)
+    if active_ports != 0 {
+        register_with_devd(&registry, active_ports);
     }
 
     // Step 4: Register port and serve queries
@@ -440,6 +477,35 @@ fn main() {
                                     }
                                     Err(e) => {
                                         println!("[pcied] Port {} reset failed: {:?}", port, e);
+                                        PcieResponse::ResetResult(false)
+                                    }
+                                }
+                            } else {
+                                PcieResponse::ResetResult(false)
+                            }
+                        }
+                        PcieRequest::EnableBusMaster { port, bus, device, function } => {
+                            let board = pcie_init.board();
+                            if let Some(port_config) = board.soc().port_config(port) {
+                                match PcieController::init(port_config, |_| {}, |_| {}) {
+                                    Ok(controller) => {
+                                        // Enable BME on the requested device
+                                        let success = controller.enable_bus_master(bus, device, function);
+                                        if success {
+                                            println!("[pcied] Enabled BME on port {} {:02x}:{:02x}.{}",
+                                                     port, bus, device, function);
+                                            // If device is not on bus 0, also enable BME on parent bridge
+                                            if bus > 0 {
+                                                // Parent bridge is at bus 0, device 0, function 0
+                                                if controller.enable_bus_master(0, 0, 0) {
+                                                    println!("[pcied] Enabled BME on parent bridge 00:00.0");
+                                                }
+                                            }
+                                        }
+                                        PcieResponse::ResetResult(success)
+                                    }
+                                    Err(e) => {
+                                        println!("[pcied] EnableBusMaster failed: {:?}", e);
                                         PcieResponse::ResetResult(false)
                                     }
                                 }

@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "mt7996"
+version = "0.1.0"
+dependencies = [
+ "pcie",
+ "userlib",
+]
+
+[[package]]
 name = "pcie"
 version = "0.1.0"
 dependencies = [
@@ -17,6 +25,7 @@ version = "0.1.0"
 name = "wifid3"
 version = "0.1.0"
 dependencies = [
+ "mt7996",
  "pcie",
  "userlib",
 ]

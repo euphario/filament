@@ -785,6 +785,20 @@ impl Task {
         ).map(|r| r.virt_addr)
     }
 
+    /// Map shared memory for DMA (Normal Non-Cacheable, for PCIe/USB DMA buffers)
+    /// Uses NORMAL_NC attributes (not Device!) for proper DMA coherency.
+    /// Device memory (nGnRnE) has strict access semantics that may not work for DMA data.
+    /// Returns virtual address on success
+    #[inline]
+    pub fn mmap_shmem_dma(&mut self, phys_addr: u64, size: usize) -> Option<u64> {
+        self.map_region(
+            size,
+            MapSource::Fixed(phys_addr),
+            MapFlags::dma(),  // Normal Non-Cacheable for DMA buffers (NOT Device!)
+            MappingKind::BorrowedShmem,  // Pages owned by shmem, not freed here
+        ).map(|r| r.virt_addr)
+    }
+
     /// Map device memory (MMIO/PCI BARs) into user address space
     /// Uses non-cacheable device memory attributes (nGnRnE)
     /// Returns virtual address on success

@@ -49,6 +49,251 @@
 
 ---
 
+## Microkernel Device Architecture
+
+### Principles
+
+The kernel is **minimal** - it provides raw capabilities but does NOT track devices.
+Device management lives in userspace with **devd as the single source of truth**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              KERNEL (minimal)                           │
+│                                                                         │
+│  Syscalls provided:                                                     │
+│  • bus_list()           - Expose buses from DTB (pcie0, usb0, etc.)    │
+│  • mmap_device(pa, sz)  - Map physical addr as device MMIO (cap check) │
+│  • shmem_create()       - DMA-capable shared memory                    │
+│  • irq_claim()          - Claim interrupt (cap check)                  │
+│                                                                         │
+│  NOT in kernel:                                                         │
+│  • No device registry                                                   │
+│  • No PCI/USB/etc specific logic                                        │
+│  • No driver management                                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    ▼                               ▼
+┌───────────────────────────────┐   ┌───────────────────────────────────┐
+│  devd (device supervisor)     │   │  Bus Drivers (pcied, usbd)        │
+│                               │   │                                   │
+│  • Single source of truth     │◄──│  • Enumerate devices on bus       │
+│  • Receives enumeration       │   │  • Report discoveries to devd     │
+│  • Controls driver access     │   │  • Answer queries from drivers    │
+│  • Supervises driver lifecycle│   │  • Handle bus-level operations    │
+│  • Manages restarts/recovery  │   │                                   │
+└───────────────────────────────┘   └───────────────────────────────────┘
+                                                    │
+                                                    ▼
+                                    ┌───────────────────────────────────┐
+                                    │  Device Drivers (wifid, nvmed)    │
+                                    │                                   │
+                                    │  • Query bus driver for device    │
+                                    │  • Get BAR/endpoint info via IPC  │
+                                    │  • Call mmap_device() directly    │
+                                    │  • Report status to devd          │
+                                    └───────────────────────────────────┘
+```
+
+### Data Flow Example: WiFi Driver
+
+```
+1. Kernel boots, reads DTB → knows about pcie0, pcie1, usb0, usb1, etc.
+
+2. devd starts, spawns pcied for PCIe buses
+
+3. pcied:
+   • Initializes PCIe MAC, brings up links
+   • Enumerates: finds MT7996 at BAR0=0x30200000, size=2MB
+   • Registers devices with devd (via IPC)
+   • Listens for FindDevice queries
+
+4. wifid2 starts:
+   • Connects to pcied
+   • Calls FindDevice(vendor=0x14c3, device=0x7990)
+   • Gets: {bar0_addr: 0x30200000, bar0_size: 2MB, ...}
+
+5. wifid2 maps device memory:
+   • Calls syscall::mmap_device(0x30200000, 2MB)
+   • Kernel checks MMIO capability, maps with device attributes
+   • Returns virtual address 0x50000000
+
+6. wifid2 accesses registers:
+   • Writes to 0x50000000 + offset → hardware access
+```
+
+### Syscall: mmap_device
+
+```rust
+/// Map device MMIO into process address space
+/// Generic - kernel doesn't know what device this is
+///
+/// phys_addr: Physical address of device memory (BAR, MMIO region)
+/// size: Size in bytes to map (max 16MB)
+/// Returns: Virtual address on success, negative error on failure
+///
+/// Requires: MMIO capability
+/// Memory attributes: Device-nGnRnE (non-cacheable, non-gathering)
+pub fn mmap_device(phys_addr: u64, size: u64) -> Result<u64, i32>
+```
+
+### Bus Driver Responsibilities
+
+| Component | Responsibility |
+|-----------|---------------|
+| **Kernel** | Expose bus list from DTB, provide mmap_device syscall |
+| **devd** | Supervise bus drivers, maintain device database |
+| **pcied** | Enumerate PCIe, configure BARs, answer FindDevice |
+| **usbd** | Enumerate USB, configure endpoints, answer FindDevice |
+| **Driver** | Query bus driver for device info, mmap and use device |
+
+### Drivers Needing Updates
+
+| Driver | Status | Required Changes |
+|--------|--------|------------------|
+| wifid2 | ✅ Updated | Uses mmap_device with BAR from pcied |
+| nvmed | ❌ Needs rewrite | Currently uses pci_bar_map, should use mmap_device |
+| usbd | ❌ Needs rewrite | Should report devices to devd, answer queries |
+| wifid | ❌ Legacy | Uses old mt7996 library, superseded by wifid2 |
+
+### Why This Design?
+
+1. **Kernel stays minimal** - No device-specific code, just raw capabilities
+2. **Single source of truth** - devd knows all devices, controls access
+3. **Bus drivers are experts** - pcied knows PCI, usbd knows USB
+4. **Drivers are independent** - Only need IPC to bus driver + mmap syscall
+5. **Easy to add buses** - New bus = new userspace driver, no kernel changes
+6. **Supervision works** - devd can restart crashed drivers, reset buses
+
+### Syscalls to Deprecate
+
+With the clean architecture, these PCI-specific syscalls should be removed:
+
+| Syscall | Replacement |
+|---------|-------------|
+| `pci_bar_map` | `mmap_device` (generic) + get BAR from pcied |
+| `pci_enumerate` | Query pcied via IPC |
+| `pci_claim` | devd controls access, not kernel |
+| `pci_config_read/write` | pcied does this internally via MMIO |
+
+The kernel should only provide:
+- `bus_list` - DTB buses
+- `mmap_device` - generic MMIO mapping
+- `shmem_create` - DMA memory
+- `irq_claim` - interrupt handling
+
+---
+
+## Bus & Device State Machine
+
+### Overview
+
+Buses and devices follow explicit state machines tracked by devd.
+This enables proper supervision, restart recovery, and status reporting.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           STATE FLOW                                     │
+│                                                                         │
+│  BUS STATES:                                                            │
+│  ┌──────┐  pcied/usbd   ┌────────┐  reset     ┌───────────┐            │
+│  │ Safe │ ────claims────▶│ Active │ ──────────▶│ Resetting │            │
+│  └──────┘               └────────┘            └─────┬─────┘            │
+│     ▲                        ▲                      │                   │
+│     │                        └──────────────────────┘                   │
+│     │                              reset complete                       │
+│     └─────────────────────────────────────────────────                  │
+│                    bus driver exits/crashes                             │
+│                                                                         │
+│  DEVICE STATES:                                                         │
+│  ┌────────────┐  driver    ┌───────┐                                   │
+│  │ Discovered │ ──claims──▶│ Bound │                                   │
+│  └────────────┘            └───────┘                                   │
+│        ▲                       │                                        │
+│        └───────────────────────┘                                        │
+│              driver exits/crashes                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Bus States
+
+| State | Meaning | Transitions |
+|-------|---------|-------------|
+| `Safe` | No driver assigned, bus idle | → Active (bus driver claims) |
+| `Active` | Bus driver (pcied/usbd) is managing | → Resetting (reset requested) |
+| `Resetting` | Bus hardware being reset | → Active (reset complete) |
+
+### Device States
+
+| State | Meaning | Transitions |
+|-------|---------|-------------|
+| `Discovered` | Found by bus driver, no device driver | → Bound (driver claims) |
+| `Bound` | Device driver is actively using | → Discovered (driver exits) |
+
+### Initialization Sequence
+
+```
+1. Kernel boots
+   └── DTB parsed → buses exposed via bus_list()
+
+2. devd starts
+   ├── Queries bus_list() → sees pcie0, pcie1, usb0, usb1
+   ├── Connects to each bus → state = "safe"
+   ├── Registers devd port (BEFORE spawning drivers!)
+   └── Spawns bus drivers (pcied, usbd)
+
+3. pcied starts
+   ├── Connects to devd
+   ├── Claims buses: /bus/pcie0, /bus/pcie1 → state = "active"
+   ├── Initializes PCIe MAC, brings up links
+   ├── Enumerates devices → registers as "discovered"
+   │   └── /bus/pcie0/01:00.0 (MT7996) → state = "discovered"
+   └── Starts IPC server for FindDevice queries
+
+4. wifid2 starts
+   ├── Connects to pcied → FindDevice(vendor=0x14c3)
+   ├── Gets BAR info for MT7996
+   ├── Connects to devd
+   ├── Claims device: /bus/pcie0/01:00.0 → state = "bound"
+   └── Maps MMIO via mmap_device(), operates hardware
+```
+
+### DevdProtocol Messages
+
+| Request | Purpose | Example |
+|---------|---------|---------|
+| `ClaimBus` | Bus driver takes ownership | pcied claims `/bus/pcie0` |
+| `ClaimDevice` | Device driver takes ownership | wifid2 claims `/bus/pcie0/01:00.0` |
+| `Register` | Bus driver reports discovered device | pcied registers MT7996 |
+| `Update` | Modify device properties | Change state, add driver name |
+| `Query` | Search for devices | Find all network devices |
+
+### Example: hw list Output
+
+```
+# After pcied and wifid2 have started:
+
+> hw list
+# path,bus,class,vendor:device,state
+/bus/pcie0,pcie,bus,1130:0000,active          ← pcied managing
+/bus/pcie1,pcie,bus,1131:0000,active          ← pcied managing
+/bus/usb0,usb,bus,1119:0000,safe              ← no driver yet
+/bus/pcie0/00:00.0,pcie,bridge,14c3:7988,discovered
+/bus/pcie0/01:00.0,pcie,network,14c3:7990,bound    ← wifid2 using
+/bus/pcie1/01:00.0,pcie,network,14c3:7991,bound    ← wifid2 using
+```
+
+### Implementation Files
+
+| File | Role |
+|------|------|
+| `user/driver/devd/src/main.rs` | State machine, ClaimBus/ClaimDevice handlers |
+| `user/userlib/src/ipc/protocols/devd.rs` | DevdRequest::ClaimBus, ClaimDevice |
+| `user/driver/pcied/src/main.rs` | Claims buses, registers devices as "discovered" |
+| `user/driver/wifid2/src/main.rs` | Claims devices before using |
+
+---
+
 ## Quick Reference
 
 ### Build Commands
@@ -57,10 +302,34 @@
 # Full build (kernel + userspace + initrd)
 ./build.sh
 
+# Build with MT7996 firmware embedded in initrd (for WiFi testing)
+./build.sh --with-firmware
+
+# Build with self-tests enabled
+./build.sh --test
+
 # Output files:
-# - kernel.bin     : Kernel binary for Xmodem transfer (616KB)
+# - kernel.bin     : Kernel binary for Xmodem transfer (~1.1MB without firmware)
 # - initrd.img     : Initial ramdisk with userspace programs
 ```
+
+### WiFi Testing
+
+When testing WiFi drivers (wifid, wifid2, wifid3), firmware must be available.
+Two options:
+
+1. **Embedded firmware** (recommended for testing):
+   ```bash
+   ./build.sh --with-firmware
+   ```
+   Firmware files are embedded in initrd.img and available at boot.
+   Results in larger kernel (~3MB more).
+
+2. **USB firmware** (default):
+   ```bash
+   ./build.sh
+   ```
+   Firmware loaded from USB drive via fatfs at runtime.
 
 ### Loading via U-Boot
 
@@ -102,11 +371,45 @@ bpi-r4-kernel/
 │       ├── usb/            # USB library (xHCI, protocols)
 │       │   └── ARCHITECTURE.md  # Ring buffer documentation
 │       ├── usbd/           # USB daemon (host controller driver)
+│       ├── wifid3/         # MT7996 WiFi driver (latest, line-by-line Linux port)
 │       └── fatfs/          # FAT filesystem driver
+├── linux/                  # Linux kernel source (for reference/debugging)
+│   ├── drivers/net/wireless/mediatek/mt76/  # MT76 driver source
+│   │   ├── dma.c           # Core DMA implementation (with debug printks)
+│   │   ├── mt7996/         # MT7996-specific code
+│   │   │   ├── dma.c       # MT7996 DMA init (with debug printks)
+│   │   │   ├── mcu.c       # MCU/firmware loading (with debug printks)
+│   │   │   └── regs.h      # Register definitions
+│   │   └── dma.h           # DMA descriptor structures
+│   ├── build-bpir4.sh      # Build script for Linux kernel
+│   ├── build-docker.sh     # Docker-based build (for macOS)
+│   └── Dockerfile          # Ubuntu 22.04 build environment
 ├── build.sh                # Main build script
 ├── mkinitrd.sh             # Creates initrd.tar
-└── kernel8.img             # Output kernel binary
+└── kernel.bin              # Output kernel binary
 ```
+
+### Linux Source Code
+
+**IMPORTANT**: We have multiple Linux source directories:
+
+| Directory | Source | Purpose |
+|-----------|--------|---------|
+| `linux/` | Local kernel 6.12 | Debug printks, older code |
+| `linux-upstream/` | `git clone --depth 1 https://github.com/torvalds/linux.git` | Latest upstream kernel |
+| `mt76/` | `git clone https://github.com/openwrt/mt76.git` | Latest mt76 driver (often ahead of kernel) |
+
+**Always use `mt76/` or `linux-upstream/` for reference** - the local `linux/` has older mt7996 code
+that's missing features like `GLO_CFG_EXT_EN`, `PAUSE_RX_Q` thresholds, and PCIe link speed detection.
+
+The OpenWrt mt76 repository is typically the most current for WiFi driver development.
+
+Key files for MT7996:
+- `mt76/mt7996/dma.c` - DMA initialization (upstream has more features)
+- `mt76/mt7996/mcu.c` - MCU/firmware loading
+- `mt76/mt7996/init.c` - Hardware initialization
+- `mt76/mt7996/pci.c` - PCIe probe sequence
+- `mt76/mt7996/regs.h` - Register definitions
 
 ## Key Architecture Concepts
 

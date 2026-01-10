@@ -87,23 +87,21 @@ impl PcieController {
         let misc = mac.read32(regs::PCIE_MISC_CTRL_REG);
         mac.write32(regs::PCIE_MISC_CTRL_REG, misc | misc_ctrl::DISABLE_DVFSRC_VLT_REQ);
 
-        debug("rst+");
-        // Step 1: Assert all reset signals
-        mac.write32(regs::PCIE_RST_CTRL_REG, rst_ctrl::ALL);
-        let rst_after = mac.read32(regs::PCIE_RST_CTRL_REG);
-        debug_status(rst_after);
+        // Set Root Complex mode - CRITICAL for inbound DMA to work!
+        // Linux: mtk_pcie_startup_port_v2() sets PCIE_RC_MODE in PCIE_SETTING_REG
+        // Without this, the controller may not properly route inbound (device->host) transactions
+        let setting = mac.read32(regs::PCIE_SETTING_REG);
+        mac.write32(regs::PCIE_SETTING_REG, setting | regs::pcie_setting::RC_MODE);
 
-        // Step 2: Wait 100ms for power/clock stabilization (TPVPERL per PCIe spec)
-        delay_ms(100);
+        // EXPERIMENT: Skip reset to preserve U-Boot's PCIe configuration
+        // U-Boot already initialized PCIe and DMA might work with its setup.
+        // The full reset sequence might be breaking inbound DMA configuration.
+        debug("rst-SKIP");
+        let rst_current = mac.read32(regs::PCIE_RST_CTRL_REG);
+        debug_status(rst_current);
 
-        debug("rst-");
-        // Step 3: De-assert all resets at once
-        mac.write32(regs::PCIE_RST_CTRL_REG, 0);
-        let rst_final = mac.read32(regs::PCIE_RST_CTRL_REG);
-        debug_status(rst_final);
-
-        // Wait for device to come out of reset and PHY to stabilize
-        delay_ms(200);
+        // Only wait briefly for any register writes to settle
+        delay_ms(10);
 
         debug("link");
         // Step 4: Read status registers for debug
@@ -144,32 +142,31 @@ impl PcieController {
     ///
     /// Programs the translation table to map CPU addresses to PCIe bus addresses.
     /// Uses 1:1 mapping for simplicity (CPU addr == PCIe addr).
+    ///
+    /// # Outbound vs Inbound
+    ///
+    /// This configures **outbound** translation (CPU → PCIe device BARs).
+    ///
+    /// **Inbound** translation (PCIe device DMA → CPU memory) on MT7988A uses
+    /// identity mapping by default - the AXI interconnect passes PCIe memory
+    /// transactions directly to DRAM without explicit ATU configuration.
+    /// If your platform requires explicit inbound windows, see `setup_inbound_atu`.
     fn setup_atu(mac: &MmioRegion, cpu_addr: u64, pci_addr: u64, size: u64) {
-        // Validate size - must be non-zero and power of 2 for ATU
+        // Validate size - must be non-zero for ATU
         if size == 0 {
-            return; // Cannot program ATU with zero size
+            return;
         }
 
-        // Calculate size encoding per Linux pcie-mediatek-gen3.c:
-        // #define PCIE_ATR_SIZE(size) (((((size) - 1) << 1) & GENMASK(6, 1)) | PCIE_ATR_EN)
-        // Where size = fls(bytes) - 1, and PCIE_ATR_EN = bit 0 (enable)
-        // This goes in the SOURCE ADDRESS LSB register, not a separate param register!
-        let leading = size.leading_zeros();
-        if leading >= 63 {
-            return; // Size too small (< 2 bytes)
+        // Calculate size encoding using helper
+        let atr_size = atu::size_encoding(size);
+        if atr_size == 0 {
+            return; // Size too small
         }
-        let size_log2 = 63 - leading;  // fls(size) - 1
-        // Ensure size_log2 >= 1 to avoid underflow
-        let atr_size = if size_log2 >= 1 {
-            (((size_log2 - 1) << 1) & 0x7E) | 0x01  // Shifted + enable bit
-        } else {
-            0x01  // Minimum size, just enable bit
-        };
 
         // Use translation table 0 for memory
         let table_base = regs::PCIE_TRANS_TABLE_BASE_REG;
 
-        // Write source (CPU) address LSB with size/enable (Linux: cpu_addr | PCIE_ATR_SIZE(...))
+        // Write source (CPU) address LSB with size/enable
         mac.write32(table_base, (cpu_addr as u32) | atr_size);
 
         // Write source (CPU) address MSB
@@ -181,9 +178,41 @@ impl PcieController {
         // Write translation (PCIe) address MSB
         mac.write32(table_base + atu::TRSL_ADDR_MSB_OFFSET, (pci_addr >> 32) as u32);
 
-        // Param register (0x10) - may contain additional translation parameters
-        // For now, write 0 (memory type, no special params)
+        // Param register (0x10) - memory type, no special params
         mac.write32(table_base + atu::TRSL_PARAM_OFFSET, 0);
+    }
+
+    /// Setup inbound ATU for device DMA to host memory (if needed)
+    ///
+    /// On MT7988A, inbound DMA uses identity mapping by default through the AXI
+    /// interconnect, so this function is a no-op. The kernel's `mmap_dma` syscall
+    /// returns DMA addresses via the platform's `phys_to_dma()` translation.
+    ///
+    /// For platforms that require explicit inbound windows (e.g., those with
+    /// PCIe-to-AXI bridges that need configuration), this function would program
+    /// the inbound translation tables.
+    ///
+    /// # Arguments
+    /// * `_pci_addr` - PCIe bus address that devices will use for DMA
+    /// * `_cpu_addr` - CPU physical address where DMA should land
+    /// * `_size` - Size of the inbound window
+    #[allow(dead_code)]
+    fn setup_inbound_atu(&self, _pci_addr: u64, _cpu_addr: u64, _size: u64) {
+        // MT7988A: No explicit inbound ATU configuration needed.
+        // The AXI interconnect provides identity-mapped access to DRAM.
+        //
+        // For platforms needing explicit inbound windows, you would:
+        // 1. Find the inbound ATU register base (may be different from outbound)
+        // 2. Program: PCIe addr → CPU physical addr translation
+        // 3. Enable the window with appropriate size encoding
+        //
+        // Example for a hypothetical platform:
+        // let table_base = INBOUND_ATU_BASE + table_index * atu::TLB_SET_OFFSET;
+        // self.mac.write32(table_base, (pci_addr as u32) | atu::size_encoding(size));
+        // self.mac.write32(table_base + atu::SRC_ADDR_MSB_OFFSET, (pci_addr >> 32) as u32);
+        // self.mac.write32(table_base + atu::TRSL_ADDR_LSB_OFFSET, cpu_addr as u32);
+        // self.mac.write32(table_base + atu::TRSL_ADDR_MSB_OFFSET, (cpu_addr >> 32) as u32);
+        // self.mac.write32(table_base + atu::TRSL_PARAM_OFFSET, INBOUND_MEM_TYPE);
     }
 
     /// Check if link is up
@@ -377,16 +406,28 @@ impl PcieController {
             let is_bridge = (header_type & 0x7F) == 0x01;
 
             // Allocate and program BAR0 for non-bridge devices
+            // For bridges, just enable BME so DMA can flow through
             let (bar0_addr, bar0_size, command) = if !is_bridge {
                 self.allocate_bar0(mac, bdf)
             } else {
-                (0, 0, 0)
+                // Enable BME on bridge so downstream devices can DMA
+                use crate::regs::cfg as pci_cfg;
+                use crate::regs::command;
+                let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
+                cfg.write32(bdf, pci_cfg::COMMAND,
+                    (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+                let readback = cfg.read16(bdf, pci_cfg::COMMAND);
+                (0, 0, readback)
             };
 
             // Disable ASPM for all devices (including bridges/root ports)
             // Both link partners must have ASPM disabled for proper operation
             // Critical for WiFi devices like MT7996 - Linux disables on BOTH device AND parent bridge
             cfg.disable_aspm(bdf);
+
+            // Configure Device Control (MRRS, MPS, Extended Tag, etc.)
+            // Critical for DMA to work - Linux does this automatically for all PCIe devices
+            cfg.configure_device_control(bdf);
 
             devices.push(PcieDevice {
                 bdf,
@@ -423,10 +464,19 @@ impl PcieController {
                         let (bar0_addr, bar0_size, command) = if !func_is_bridge {
                             self.allocate_bar0(mac, bdf)
                         } else {
-                            (0, 0, 0)
+                            // Enable BME on bridge so downstream devices can DMA
+                            use crate::regs::cfg as pci_cfg;
+                            use crate::regs::command;
+                            let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
+                            cfg.write32(bdf, pci_cfg::COMMAND,
+                                (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+                            let readback = cfg.read16(bdf, pci_cfg::COMMAND);
+                            (0, 0, readback)
                         };
                         // Disable ASPM for all devices (including bridge functions)
                         cfg.disable_aspm(bdf);
+                        // Configure Device Control (MRRS, MPS, Extended Tag, etc.)
+                        cfg.configure_device_control(bdf);
                         devices.push(PcieDevice {
                             bdf,
                             id,
@@ -474,6 +524,32 @@ impl PcieController {
         let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
         cfg.write32(bdf, pci_cfg::COMMAND,
             (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+    }
+
+    /// Enable Bus Master on a specific device
+    ///
+    /// This is called by drivers that need DMA capability.
+    /// Returns true on success.
+    pub fn enable_bus_master(&self, bus: u8, device: u8, function: u8) -> bool {
+        use crate::regs::cfg as pci_cfg;
+        use crate::regs::command;
+
+        let cfg = PcieConfigSpace::new(&self.mac);
+        let bdf = PcieBdf::new(bus, device, function);
+
+        // Check if device exists
+        if cfg.read_device_id(bdf).is_none() {
+            return false;
+        }
+
+        // Enable memory space and bus master
+        let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
+        cfg.write32(bdf, pci_cfg::COMMAND,
+            (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+
+        // Verify it was written
+        let readback = cfg.read16(bdf, pci_cfg::COMMAND);
+        (readback & command::BUS_MASTER) != 0
     }
 }
 

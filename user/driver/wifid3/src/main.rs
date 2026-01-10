@@ -34,6 +34,39 @@ fn dma_wmb() {
     }
 }
 
+/// Full data synchronization barrier (for after cache flush)
+#[inline(always)]
+fn dsb_sy() {
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Flush a single cache line to memory (DC CVAC = Data Cache Clean by VA to Coherency)
+/// This writes back dirty cache data to RAM so DMA devices can see it
+#[inline(always)]
+fn flush_cache_line(addr: u64) {
+    unsafe {
+        core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack, preserves_flags));
+    }
+}
+
+/// Flush a buffer to memory (for CPU writes that DMA device will read)
+/// Must be called BEFORE kicking DMA, after writing descriptors/data
+fn flush_buffer(virt_addr: u64, size: usize) {
+    const CACHE_LINE: usize = 64;
+    let start = virt_addr & !(CACHE_LINE as u64 - 1);
+    let end = (virt_addr + size as u64 + CACHE_LINE as u64 - 1) & !(CACHE_LINE as u64 - 1);
+
+    let mut a = start;
+    while a < end {
+        flush_cache_line(a);
+        a += CACHE_LINE as u64;
+    }
+    // DSB ensures cache maintenance complete before continuing
+    dsb_sy();
+}
+
 // ============================================================================
 // DMA Address Translation
 // ============================================================================
@@ -1074,6 +1107,11 @@ impl Mt7996Dev {
             }
         }
 
+        // CRITICAL: Flush descriptor cache to RAM so DMA device can see them!
+        // On ARM64, CPU writes go to cache first. Without flush, device reads stale RAM.
+        let desc_bytes = fill_count * core::mem::size_of::<Mt76Desc>();
+        flush_buffer(q.desc_virt, desc_bytes);
+
         // Ensure writes are visible to DMA (use proper DSB barrier for PCIe)
         dma_wmb();
 
@@ -1097,7 +1135,10 @@ impl Mt7996Dev {
 
         const MIN_RING_SIZE: u32 = 64;
         const DESC_SIZE: usize = 16;
-        const RING_BYTES: usize = MIN_RING_SIZE as usize * DESC_SIZE;
+        // CRITICAL: Linux uses dmam_alloc_coherent() which returns 4KB-aligned memory
+        // for each queue. WFDMA hardware may require this alignment!
+        // We must use 4KB increments between queues, not just RING_BYTES.
+        const RING_BYTES: usize = 4096; // 4KB alignment per queue (was 64*16=1024)
 
         // dma.c:611 - mt7996_dma_config() was called in constructor
 
@@ -1158,7 +1199,7 @@ impl Mt7996Dev {
             desc_phys + offset as u64,
             desc_virt + offset as u64,
         );
-        offset += MT7996_TX_FWDL_RING_SIZE as usize * DESC_SIZE;
+        offset += RING_BYTES; // 4KB aligned like other queues
         println!("  TX FWDL queue @ 0x{:08x}", tx_ring_base + MT7996_TXQ_FWDL * MT_RING_SIZE);
 
         // dma.c:659-665 - event from WM (MCU RX queue)
@@ -1703,6 +1744,11 @@ impl Mt7996Dev {
             core::ptr::write_volatile(&mut (*desc).ctrl, ctrl_val);
         }
 
+        // CRITICAL: Flush TX buffer and descriptor to RAM so DMA device can see them!
+        // Without this, data sits in CPU cache and device reads stale RAM.
+        flush_buffer(buf as u64, total_len);
+        flush_buffer(desc as u64, core::mem::size_of::<Mt76Desc>());
+
         // Debug: print desc state (show both phys and dma for debugging)
         println!("    TX[{}]: buf_phys=0x{:08x} buf_dma=0x{:08x} len={} cmd=0x{:02x}",
                  idx, buf_phys as u32, buf_dma as u32, total_len, cmd);
@@ -1822,6 +1868,11 @@ impl Mt7996Dev {
             // Write ctrl LAST - triggers hardware
             core::ptr::write_volatile(&mut (*desc).ctrl, ctrl_val);
         }
+
+        // CRITICAL: Flush TX buffer and descriptor to RAM so DMA device can see them!
+        // Without this, data sits in CPU cache and device reads stale RAM.
+        flush_buffer(buf as u64, total_len);
+        flush_buffer(desc as u64, core::mem::size_of::<Mt76Desc>());
 
         // Detailed diagnostic for first chunk only
         if is_first {
@@ -2279,16 +2330,23 @@ fn main() {
     // Linux mmio.c __mt7996_reg_addr(): if (addr < 0x100000) return addr;
     // So we don't need to map HIF2's BAR separately for register access.
 
-    // Step 4: Allocate DMA descriptor memory
-    println!("\n=== Allocating DMA Memory ===");
+    // Step 4: Allocate DMA descriptor memory from LOW MEMORY pool
+    // MT7996 WFDMA appears to have issues with higher memory addresses (0x46xxxxxx)
+    // OpenWRT uses addresses around 0x40xxxxxx - we now use a dedicated DMA pool there
+    println!("\n=== Allocating DMA Memory (from low memory pool) ===");
 
     const DESC_MEM_SIZE: usize = 64 * 1024; // 64KB for all queues
     let mut desc_virt: u64 = 0;
     let mut desc_phys: u64 = 0;
-    let result = syscall::shmem_create(DESC_MEM_SIZE, &mut desc_virt, &mut desc_phys);
+    let result = syscall::dma_pool_create(DESC_MEM_SIZE, &mut desc_virt, &mut desc_phys);
     if result < 0 {
-        println!("ERROR: shmem_create failed: {}", result);
-        syscall::exit(1);
+        println!("ERROR: dma_pool_create failed: {} (falling back to shmem)", result);
+        // Fallback to regular shmem if DMA pool fails
+        let result = syscall::shmem_create(DESC_MEM_SIZE, &mut desc_virt, &mut desc_phys);
+        if result < 0 {
+            println!("ERROR: shmem_create also failed: {}", result);
+            syscall::exit(1);
+        }
     }
     println!("  Descriptor pool: virt=0x{:x} phys=0x{:x} size={}", desc_virt, desc_phys, DESC_MEM_SIZE);
 
@@ -2302,10 +2360,15 @@ fn main() {
     const RX_BUF_POOL_SIZE: usize = 6 * 64 * 2048;  // 768KB for all RX queues
     let mut rx_buf_virt: u64 = 0;
     let mut rx_buf_phys: u64 = 0;
-    let result = syscall::shmem_create(RX_BUF_POOL_SIZE, &mut rx_buf_virt, &mut rx_buf_phys);
+    let result = syscall::dma_pool_create(RX_BUF_POOL_SIZE, &mut rx_buf_virt, &mut rx_buf_phys);
     if result < 0 {
-        println!("ERROR: shmem_create for RX buffers failed: {}", result);
-        syscall::exit(1);
+        println!("ERROR: dma_pool_create for RX buffers failed: {} (falling back to shmem)", result);
+        // Fallback to regular shmem
+        let result = syscall::shmem_create(RX_BUF_POOL_SIZE, &mut rx_buf_virt, &mut rx_buf_phys);
+        if result < 0 {
+            println!("ERROR: shmem_create for RX buffers also failed: {}", result);
+            syscall::exit(1);
+        }
     }
     println!("  RX buffer pool: virt=0x{:x} phys=0x{:x} size={}", rx_buf_virt, rx_buf_phys, RX_BUF_POOL_SIZE);
 
@@ -2435,6 +2498,20 @@ fn main() {
     dev.mt7996_dma_init(desc_phys, desc_virt, DESC_MEM_SIZE, rx_buf_phys, rx_buf_virt, RX_BUF_POOL_SIZE);
     dump_int_src(&dev, "after_dma_init");
 
+    // === Register dump for OpenWRT comparison ===
+    println!("\n=== Register Dump (compare with OpenWRT) ===");
+    println!("GLO_CFG_EXT0 = 0x{:08x}  (OpenWRT: 0x28c444df)", dev.mt76_rr(0xd42b0));
+    println!("GLO_CFG_EXT1 = 0x{:08x}  (OpenWRT: 0x9c800404)", dev.mt76_rr(0xd42b4));
+    println!("BUSY_ENA     = 0x{:08x}  (OpenWRT: 0x0000001f)", dev.mt76_rr(0xd413c));
+    println!("HIF_MISC     = 0x{:08x}  (OpenWRT: 0x001c2000)", dev.mt76_rr(0xd7044));
+    println!("HOST_CONFIG  = 0x{:08x}  (OpenWRT: 0x00407d01)", dev.mt76_rr(0xd7030));
+    println!("AXI_R2A_CTRL = 0x{:08x}  (OpenWRT: 0xffff0c14)", dev.mt76_rr(0xd7500));
+    println!("PCIE_RECOG   = 0x{:08x}  (OpenWRT: 0x00000001)", dev.mt76_rr(0xd7090));
+    println!("FWDL BASE    = 0x{:08x}  (OpenWRT: 0x40181000)", dev.mt76_rr(0xd4400));
+    println!("FWDL CPU_IDX = 0x{:08x}", dev.mt76_rr(0xd4408));
+    println!("FWDL DMA_IDX = 0x{:08x}", dev.mt76_rr(0xd440c));
+    println!("HIF2 BUSY_EN = 0x{:08x}  (OpenWRT: 0x0000001f)", dev.mt76_rr(0xd813c));
+
     // ========================================================================
     // PHASE 3: mcu_init() from mcu.c - happens AFTER dma_init!
     // Per DeepWiki citations [4][5]: SWDEF_MODE then driver_own
@@ -2528,22 +2605,25 @@ fn main() {
     // ========================================================================
     println!("\n8. Firmware Loading (mcu_init -> mt7996_load_firmware)...");
 
-    // Allocate buffer memory for MCU TX commands (4KB per descriptor)
+    // Allocate buffer memory for MCU TX commands (4KB per descriptor) from DMA pool
     const TX_BUF_SIZE: usize = MT7996_TX_FWDL_RING_SIZE as usize * MCU_FW_DL_BUF_SIZE;
     let mut tx_buf_virt: u64 = 0;
     let mut tx_buf_phys: u64 = 0;
-    let tx_buf_id = syscall::shmem_create(TX_BUF_SIZE, &mut tx_buf_virt, &mut tx_buf_phys);
-    if tx_buf_id < 0 {
-        println!("ERROR: Failed to allocate TX buffer: {}", tx_buf_id);
-        syscall::exit(1);
+    let tx_buf_result = syscall::dma_pool_create(TX_BUF_SIZE, &mut tx_buf_virt, &mut tx_buf_phys);
+    if tx_buf_result < 0 {
+        println!("WARNING: dma_pool_create for TX buffer failed: {}, using shmem", tx_buf_result);
+        let tx_buf_id = syscall::shmem_create(TX_BUF_SIZE, &mut tx_buf_virt, &mut tx_buf_phys);
+        if tx_buf_id < 0 {
+            println!("ERROR: Failed to allocate TX buffer: {}", tx_buf_id);
+            syscall::exit(1);
+        }
     }
     println!("TX buffer: virt=0x{:x} phys=0x{:x}", tx_buf_virt, tx_buf_phys);
 
     // Create TxRing for FWDL queue
-    // FWDL descriptors are at offset: (3 rings * 64 desc * 16 bytes) = 3072 bytes
-    // Actually need to calculate based on our queue setup...
-    // From mt7996_dma_init: BAND0(64) + MCU_WM(64) + MCU_WA(64) = 192 descriptors * 16 = 3072
-    const FWDL_DESC_OFFSET: usize = 3 * 64 * 16;
+    // FWDL is the 4th queue (index 3), each queue is 4KB aligned
+    // From mt7996_dma_init: BAND0, MCU_WM, MCU_WA, then FWDL
+    const FWDL_DESC_OFFSET: usize = 3 * 4096;  // 3 * 4KB = 12KB offset
     let fwdl_desc_virt = desc_virt + FWDL_DESC_OFFSET as u64;
     let fwdl_desc_phys = desc_phys + FWDL_DESC_OFFSET as u64;
 
@@ -2633,8 +2713,8 @@ fn main() {
     let final_fw_state = dev.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
     println!("FW_STATE: {} (7=running)", final_fw_state);
 
-    // Cleanup
-    syscall::shmem_destroy(tx_buf_id as u32);
+    // Note: DMA pool memory is not freed - it's a bump allocator for driver lifetime
+    // The pool will be reused if the driver is restarted
 
     println!("\n=== wifid3 complete ===");
 }

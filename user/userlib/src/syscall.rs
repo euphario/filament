@@ -250,10 +250,24 @@ pub fn mmap(addr: u64, size: usize, prot: u32) -> i64 {
     syscall3(SYS_MMAP, addr, size as u64, prot as u64)
 }
 
-/// Allocate DMA-capable memory, returns (virtual_addr, physical_addr)
-/// The physical address is written to the provided pointer
-pub fn mmap_dma(size: usize, phys_out: &mut u64) -> i64 {
-    syscall2(SYS_MMAP_DMA, size as u64, phys_out as *mut u64 as u64)
+/// Allocate DMA-capable memory for device I/O
+///
+/// Returns virtual address on success (negative on error).
+/// The DMA address (for programming into device descriptors) is written to `dma_out`.
+///
+/// The DMA address is what PCIe/bus-mastering devices should use to access this memory.
+/// On platforms with identity-mapped PCIe, this equals the CPU physical address.
+/// On platforms with an offset, the kernel applies the appropriate translation.
+///
+/// # Arguments
+/// * `size` - Size in bytes to allocate (will be rounded up to page size)
+/// * `dma_out` - Pointer to receive the DMA address for device programming
+///
+/// # Returns
+/// * Positive: Virtual address of allocated memory
+/// * Negative: Error code
+pub fn mmap_dma(size: usize, dma_out: &mut u64) -> i64 {
+    syscall2(SYS_MMAP_DMA, size as u64, dma_out as *mut u64 as u64)
 }
 
 /// Unmap memory
@@ -757,6 +771,8 @@ pub const SYS_SIGNAL_ALLOW: u64 = 56;
 pub const SYS_TIMER_SET: u64 = 57;
 pub const SYS_HEARTBEAT: u64 = 58;
 pub const SYS_BUS_LIST: u64 = 59;
+pub const SYS_MMAP_DEVICE: u64 = 60;
+pub const SYS_DMA_POOL_CREATE: u64 = 61;
 
 /// PCI Bus/Device/Function address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -939,6 +955,36 @@ pub fn pci_msi_alloc(bdf: PciBdf, count: u8) -> Result<u32, i32> {
 /// Returns: 0 or negative error
 pub fn pci_claim(bdf: PciBdf) -> i32 {
     syscall1(SYS_PCI_CLAIM, bdf.to_u32() as u64) as i32
+}
+
+/// Map device MMIO into process address space
+/// Generic syscall for drivers to map physical device memory
+/// phys_addr: physical address of device MMIO (e.g., PCIe BAR)
+/// size: size in bytes to map
+/// Returns: virtual address on success, negative error on failure
+pub fn mmap_device(phys_addr: u64, size: u64) -> Result<u64, i32> {
+    let ret = syscall2(SYS_MMAP_DEVICE, phys_addr, size);
+    if ret < 0 {
+        Err(ret as i32)
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+/// Allocate from DMA pool (low memory for PCIe devices)
+///
+/// Some PCIe devices (like MT7996 WiFi) may have issues accessing higher memory
+/// addresses. This allocates from a pre-reserved pool of low memory (0x40100000).
+///
+/// Returns 0 on success, negative error on failure.
+/// vaddr and paddr are populated with the virtual and physical addresses.
+pub fn dma_pool_create(size: usize, vaddr: &mut u64, paddr: &mut u64) -> i64 {
+    syscall3(
+        SYS_DMA_POOL_CREATE,
+        size as u64,
+        vaddr as *mut u64 as u64,
+        paddr as *mut u64 as u64,
+    )
 }
 
 /// Allow a specific PID to send signals to this process.

@@ -246,6 +246,57 @@ impl<'a> PcieConfigSpace<'a> {
         true  // ASPM already disabled
     }
 
+    /// Configure Device Control register (MRRS, MPS, Extended Tag, etc.)
+    ///
+    /// This is critical for DMA to work properly. Linux does this automatically
+    /// for all PCIe devices during enumeration.
+    ///
+    /// Returns true if configured successfully, false if PCIe capability not found
+    pub fn configure_device_control(&self, bdf: PcieBdf) -> bool {
+        use crate::regs::{pcie_cap, dev_cap, dev_ctl};
+
+        let pcie_cap_base = match self.find_pcie_capability(bdf) {
+            Some(base) => base,
+            None => return false,
+        };
+
+        // Read Device Capabilities to get max supported MPS
+        let dev_cap_reg = pcie_cap_base + pcie_cap::DEV_CAP;
+        let dev_cap_val = self.read32(bdf, dev_cap_reg);
+        let max_mps = (dev_cap_val & dev_cap::MPS_MASK) as u16;
+
+        // Read current Device Control
+        let dev_ctl_reg = pcie_cap_base + pcie_cap::DEV_CTL;
+        let dev_ctl_val = self.read16(bdf, dev_ctl_reg);
+
+        // Configure:
+        // - MPS: Use 128B (safe default, works with all devices)
+        // - MRRS: Use 512B (spec default, allows reasonable DMA performance)
+        // - Extended Tag: Enable if supported (allows more outstanding transactions)
+        // - Relaxed Ordering: Enable (improves performance)
+        // - No Snoop: Enable (allows device to bypass cache for DMA)
+        let mut new_val = dev_ctl_val;
+
+        // Clear and set MPS (use min of 128B for safety, or device max if lower)
+        new_val &= !dev_ctl::MPS_MASK;
+        let mps_to_set = if max_mps < 1 { max_mps << 5 } else { dev_ctl::MPS_128 };
+        new_val |= mps_to_set;
+
+        // Clear and set MRRS to 512B (spec default)
+        new_val &= !dev_ctl::MRRS_MASK;
+        new_val |= dev_ctl::MRRS_512;
+
+        // Enable Extended Tag, Relaxed Ordering, No Snoop
+        new_val |= dev_ctl::EXT_TAG_EN | dev_ctl::RELAX_ORDER_EN | dev_ctl::NO_SNOOP_EN;
+
+        // Write new value
+        self.write16(bdf, dev_ctl_reg, new_val);
+
+        // Verify
+        let verify = self.read16(bdf, dev_ctl_reg);
+        verify == new_val
+    }
+
     /// Check if a device exists at the given BDF
     pub fn device_exists(&self, bdf: PcieBdf) -> bool {
         let vendor = self.read16(bdf, cfg::VENDOR_ID);
