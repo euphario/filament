@@ -1,0 +1,13 @@
+[package]
+name = "wifid3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+userlib = { path = "../../userlib" }
+pcie = { path = "../pcie" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

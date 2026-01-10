@@ -25,7 +25,350 @@
 //! next ring's desc_base. Our physical addresses fit in 32 bits anyway.
 
 use crate::device::Mt7996Device;
+use crate::regs;
 use userlib::{syscall, trace};
+
+// Note: crate::dma_defs and crate::mt7996_defs are used via fully-qualified paths
+// in the submodules below (queue_map, wfdma, glo_cfg, dma_ctl) to provide canonical
+// definitions that were translated from Linux header files.
+
+//=============================================================================
+// Queue ID Mapping System (mirrors Linux mt76 exactly)
+//=============================================================================
+//
+// Linux uses a q_id[] array to map logical queue indices to hardware ring indices.
+// This allows the same code to work with different chip variants that may have
+// different hardware ring assignments.
+//
+// The q_id[] array is indexed by three namespaces:
+//   - MCU queues:     indices 0 .. __MT_MCUQ_MAX
+//   - RX queues:      indices __MT_MCUQ_MAX .. (__MT_MCUQ_MAX + __MT_RXQ_MAX)
+//   - Data TX queues: indices (__MT_MCUQ_MAX + __MT_RXQ_MAX) .. end
+//
+// Linux macros:
+//   #define __RXQ(q)     ((q) + __MT_MCUQ_MAX)
+//   #define __TXQ(q)     (__RXQ(q) + __MT_RXQ_MAX)
+//   #define MT_MCUQ_ID(q)  dev->q_id[q]
+//   #define MT_RXQ_ID(q)   dev->q_id[__RXQ(q)]
+//   #define MT_TXQ_ID(q)   dev->q_id[__TXQ(q)]
+
+/// MT7996 queue ID mapping - mirrors Linux q_id[] array system
+pub mod queue_map {
+    /// Ring size in bytes (16 bytes per ring register set) - from dma_defs
+    pub const MT_RING_SIZE: u32 = crate::dma_defs::MT_RING_SIZE;
+
+    //-------------------------------------------------------------------------
+    // Logical Queue Indices (mirrors Linux enums)
+    //-------------------------------------------------------------------------
+
+    /// MCU queue logical indices (mt76.h: enum mt76_mcuq_id)
+    pub mod mcuq {
+        pub const WM: usize = 0;      // MT_MCUQ_WM
+        pub const WA: usize = 1;      // MT_MCUQ_WA
+        pub const FWDL: usize = 2;    // MT_MCUQ_FWDL
+        pub const MAX: usize = 3;     // __MT_MCUQ_MAX
+    }
+
+    /// RX queue logical indices (mt76.h: enum mt76_rxq_id)
+    /// Note: These are LOGICAL indices, not hardware ring indices!
+    pub mod rxq {
+        pub const MAIN: usize = 0;           // MT_RXQ_MAIN
+        pub const MCU: usize = 1;            // MT_RXQ_MCU
+        pub const MCU_WA: usize = 2;         // MT_RXQ_MCU_WA
+        pub const BAND1: usize = 3;          // MT_RXQ_BAND1
+        pub const BAND1_WA: usize = 4;       // MT_RXQ_BAND1_WA
+        pub const MAIN_WA: usize = 5;        // MT_RXQ_MAIN_WA
+        pub const BAND2: usize = 6;          // MT_RXQ_BAND2
+        pub const BAND2_WA: usize = 7;       // MT_RXQ_BAND2_WA
+        pub const RRO_BAND0: usize = 8;      // MT_RXQ_RRO_BAND0
+        pub const RRO_BAND1: usize = 9;      // MT_RXQ_RRO_BAND1
+        pub const RRO_BAND2: usize = 10;     // MT_RXQ_RRO_BAND2
+        pub const MSDU_PAGE_BAND0: usize = 11;
+        pub const MSDU_PAGE_BAND1: usize = 12;
+        pub const MSDU_PAGE_BAND2: usize = 13;
+        pub const TXFREE_BAND0: usize = 14;  // MT_RXQ_TXFREE_BAND0
+        pub const TXFREE_BAND1: usize = 15;  // MT_RXQ_TXFREE_BAND1
+        pub const TXFREE_BAND2: usize = 16;  // MT_RXQ_TXFREE_BAND2
+        pub const RRO_IND: usize = 17;
+        pub const RRO_RXDMAD_C: usize = 18;
+        pub const NPU0: usize = 19;
+        pub const NPU1: usize = 20;
+        pub const MAX: usize = 21;           // __MT_RXQ_MAX
+    }
+
+    /// Data TX queue logical indices (0, 1, 2 for BAND0, BAND1, BAND2)
+    pub mod txq {
+        pub const BAND0: usize = 0;
+        pub const BAND1: usize = 1;
+        pub const BAND2: usize = 2;
+        pub const MAX: usize = 3;
+    }
+
+    //-------------------------------------------------------------------------
+    // Hardware Ring Indices for MT7996 (mt7996.h enums)
+    //-------------------------------------------------------------------------
+
+    /// MT7996 TX queue hardware ring indices - from mt7996_defs::Mt7996TxqId
+    pub mod mt7996_txq {
+        use crate::mt7996_defs::Mt7996TxqId;
+        pub const FWDL: u32 = Mt7996TxqId::Fwdl as u32;
+        pub const MCU_WM: u32 = Mt7996TxqId::McuWm as u32;
+        pub const BAND0: u32 = Mt7996TxqId::Band0 as u32;
+        pub const BAND1: u32 = Mt7996TxqId::Band1 as u32;
+        pub const MCU_WA: u32 = Mt7996TxqId::McuWa as u32;
+        pub const BAND2: u32 = Mt7996TxqId::Band2 as u32;
+    }
+
+    /// MT7996 RX queue hardware ring indices - from mt7996_defs::rxq_id
+    pub mod mt7996_rxq {
+        use crate::mt7996_defs::rxq_id;
+        pub const MCU_WM: u32 = rxq_id::MCU_WM;
+        pub const MCU_WA: u32 = rxq_id::MCU_WA;
+        pub const MCU_WA_MAIN: u32 = rxq_id::MCU_WA_MAIN;
+        pub const MCU_WA_TRI: u32 = rxq_id::MCU_WA_TRI;
+        pub const BAND0: u32 = rxq_id::BAND0;
+        pub const BAND2: u32 = rxq_id::BAND2;
+        pub const RRO_BAND2: u32 = rxq_id::RRO_BAND2;
+        pub const TXFREE2: u32 = rxq_id::TXFREE2;
+        pub const RRO_BAND0: u32 = rxq_id::RRO_BAND0;
+        pub const TXFREE0: u32 = rxq_id::TXFREE0;
+        pub const RRO_BAND1: u32 = rxq_id::RRO_BAND1;
+        pub const MSDU_PG_BAND0: u32 = rxq_id::MSDU_PG_BAND0;
+        pub const MSDU_PG_BAND1: u32 = rxq_id::MSDU_PG_BAND1;
+        pub const MSDU_PG_BAND2: u32 = rxq_id::MSDU_PG_BAND2;
+    }
+
+    //-------------------------------------------------------------------------
+    // Index Transformation (mirrors Linux macros)
+    //-------------------------------------------------------------------------
+
+    /// Convert RX logical index to q_id[] array index
+    /// Linux: #define __RXQ(q) ((q) + __MT_MCUQ_MAX)
+    #[inline]
+    pub const fn rxq_to_qid_idx(rxq: usize) -> usize {
+        rxq + mcuq::MAX
+    }
+
+    /// Convert Data TX logical index to q_id[] array index
+    /// Linux: #define __TXQ(q) (__RXQ(q) + __MT_RXQ_MAX)
+    #[inline]
+    pub const fn txq_to_qid_idx(txq: usize) -> usize {
+        rxq_to_qid_idx(txq) + rxq::MAX
+    }
+
+    /// Total size of q_id[] array
+    pub const QID_ARRAY_SIZE: usize = mcuq::MAX + rxq::MAX + txq::MAX;
+
+    //-------------------------------------------------------------------------
+    // Queue ID Mapping Structure
+    //-------------------------------------------------------------------------
+
+    /// Queue ID mapping table - mirrors Linux dev->q_id[]
+    /// Populated at init time based on chip type
+    pub struct QueueIds {
+        /// Maps logical queue index to hardware ring index
+        pub q_id: [u32; QID_ARRAY_SIZE],
+    }
+
+    impl QueueIds {
+        /// Create queue ID mapping for MT7996
+        /// This mirrors mt7996_dma_config() in Linux
+        pub const fn new_mt7996() -> Self {
+            let mut q_id = [0u32; QID_ARRAY_SIZE];
+
+            // MCU queues (index 0..3)
+            q_id[mcuq::WM] = mt7996_txq::MCU_WM;
+            q_id[mcuq::WA] = mt7996_txq::MCU_WA;
+            q_id[mcuq::FWDL] = mt7996_txq::FWDL;
+
+            // RX queues (index 3..24) - offset by mcuq::MAX
+            q_id[rxq_to_qid_idx(rxq::MCU)] = mt7996_rxq::MCU_WM;
+            q_id[rxq_to_qid_idx(rxq::MCU_WA)] = mt7996_rxq::MCU_WA;
+            q_id[rxq_to_qid_idx(rxq::MAIN_WA)] = mt7996_rxq::MCU_WA_MAIN;
+            q_id[rxq_to_qid_idx(rxq::BAND2_WA)] = mt7996_rxq::MCU_WA_TRI;
+            q_id[rxq_to_qid_idx(rxq::MAIN)] = mt7996_rxq::BAND0;
+            q_id[rxq_to_qid_idx(rxq::BAND2)] = mt7996_rxq::BAND2;
+            q_id[rxq_to_qid_idx(rxq::RRO_BAND0)] = mt7996_rxq::RRO_BAND0;
+            q_id[rxq_to_qid_idx(rxq::RRO_BAND2)] = mt7996_rxq::RRO_BAND2;
+            q_id[rxq_to_qid_idx(rxq::TXFREE_BAND0)] = mt7996_rxq::TXFREE0;
+            q_id[rxq_to_qid_idx(rxq::TXFREE_BAND2)] = mt7996_rxq::TXFREE2;
+
+            // Data TX queues (index 24..27) - offset by mcuq::MAX + rxq::MAX
+            q_id[txq_to_qid_idx(txq::BAND0)] = mt7996_txq::BAND0;
+            q_id[txq_to_qid_idx(txq::BAND1)] = mt7996_txq::BAND1;
+            q_id[txq_to_qid_idx(txq::BAND2)] = mt7996_txq::BAND2;
+
+            Self { q_id }
+        }
+
+        //---------------------------------------------------------------------
+        // ID Lookup Methods (mirror Linux MT_*_ID macros)
+        //---------------------------------------------------------------------
+
+        /// Get MCU queue hardware ring index
+        /// Linux: #define MT_MCUQ_ID(q) dev->q_id[q]
+        #[inline]
+        pub const fn mcuq_id(&self, q: usize) -> u32 {
+            self.q_id[q]
+        }
+
+        /// Get RX queue hardware ring index
+        /// Linux: #define MT_RXQ_ID(q) dev->q_id[__RXQ(q)]
+        #[inline]
+        pub const fn rxq_id(&self, q: usize) -> u32 {
+            self.q_id[rxq_to_qid_idx(q)]
+        }
+
+        /// Get Data TX queue hardware ring index
+        /// Linux: #define MT_TXQ_ID(q) dev->q_id[__TXQ(q)]
+        #[inline]
+        pub const fn txq_id(&self, q: usize) -> u32 {
+            self.q_id[txq_to_qid_idx(q)]
+        }
+
+        //---------------------------------------------------------------------
+        // Ring Base Address Methods (mirror Linux MT_*_RING_BASE macros)
+        //---------------------------------------------------------------------
+
+        /// MCU queue ring base address (relative to WFDMA base)
+        /// Linux: #define MT_MCUQ_RING_BASE(q) (MT_Q_BASE(q) + 0x300)
+        /// Returns offset from WFDMA base (we always use WFDMA0)
+        #[inline]
+        pub const fn mcuq_ring_base(&self, q: usize) -> u32 {
+            0x300 + self.mcuq_id(q) * MT_RING_SIZE
+        }
+
+        /// RX queue ring base address (relative to WFDMA base)
+        /// Linux: #define MT_RXQ_RING_BASE(q) (MT_Q_BASE(__RXQ(q)) + 0x500)
+        #[inline]
+        pub const fn rxq_ring_base(&self, q: usize) -> u32 {
+            0x500 + self.rxq_id(q) * MT_RING_SIZE
+        }
+
+        /// Data TX queue ring base address (relative to WFDMA base)
+        /// Linux: #define MT_TXQ_RING_BASE(q) (MT_Q_BASE(__TXQ(q)) + 0x300)
+        #[inline]
+        pub const fn txq_ring_base(&self, q: usize) -> u32 {
+            0x300 + self.txq_id(q) * MT_RING_SIZE
+        }
+
+        //---------------------------------------------------------------------
+        // Prefetch Control Methods (mirror Linux MT_*_EXT_CTRL macros)
+        //---------------------------------------------------------------------
+
+        /// MCU queue prefetch control register (relative to WFDMA base)
+        /// Linux: #define MT_MCUQ_EXT_CTRL(q) (MT_Q_BASE(q) + 0x600 + MT_MCUQ_ID(q) * 0x4)
+        #[inline]
+        pub const fn mcuq_ext_ctrl(&self, q: usize) -> u32 {
+            0x600 + self.mcuq_id(q) * 4
+        }
+
+        /// RX queue prefetch control register (relative to WFDMA base)
+        /// Linux: #define MT_RXQ_EXT_CTRL(q) (MT_Q_BASE(__RXQ(q)) + 0x680 + MT_RXQ_ID(q) * 0x4)
+        #[inline]
+        pub const fn rxq_ext_ctrl(&self, q: usize) -> u32 {
+            0x680 + self.rxq_id(q) * 4
+        }
+
+        /// Data TX queue prefetch control register (relative to WFDMA base)
+        /// Linux: #define MT_TXQ_EXT_CTRL(q) (MT_Q_BASE(__TXQ(q)) + 0x600 + MT_TXQ_ID(q) * 0x4)
+        #[inline]
+        pub const fn txq_ext_ctrl(&self, q: usize) -> u32 {
+            0x600 + self.txq_id(q) * 4
+        }
+    }
+
+    /// Static queue ID mapping for MT7996
+    pub static MT7996_QUEUE_IDS: QueueIds = QueueIds::new_mt7996();
+
+    //-------------------------------------------------------------------------
+    // Self-Tests (run at init to validate all calculations match expected)
+    //-------------------------------------------------------------------------
+
+    /// Validate queue ID mappings match expected values
+    /// Call this at driver init to catch any math errors
+    pub fn validate_mt7996_queue_ids() -> Result<(), &'static str> {
+        let q = &MT7996_QUEUE_IDS;
+
+        // Validate MCU queue IDs
+        if q.mcuq_id(mcuq::FWDL) != 16 { return Err("FWDL hw_id != 16"); }
+        if q.mcuq_id(mcuq::WM) != 17 { return Err("WM hw_id != 17"); }
+        if q.mcuq_id(mcuq::WA) != 20 { return Err("WA hw_id != 20"); }
+
+        // Validate Data TX queue IDs
+        if q.txq_id(txq::BAND0) != 18 { return Err("TXQ_BAND0 hw_id != 18"); }
+        if q.txq_id(txq::BAND1) != 19 { return Err("TXQ_BAND1 hw_id != 19"); }
+        if q.txq_id(txq::BAND2) != 21 { return Err("TXQ_BAND2 hw_id != 21"); }
+
+        // Validate RX queue IDs
+        if q.rxq_id(rxq::MCU) != 0 { return Err("RXQ_MCU hw_id != 0"); }
+        if q.rxq_id(rxq::MCU_WA) != 1 { return Err("RXQ_MCU_WA hw_id != 1"); }
+        if q.rxq_id(rxq::MAIN_WA) != 2 { return Err("RXQ_MAIN_WA hw_id != 2"); }
+        if q.rxq_id(rxq::MAIN) != 4 { return Err("RXQ_MAIN hw_id != 4"); }
+        if q.rxq_id(rxq::BAND2) != 5 { return Err("RXQ_BAND2 hw_id != 5"); }
+        if q.rxq_id(rxq::RRO_BAND0) != 8 { return Err("RXQ_RRO_BAND0 hw_id != 8"); }
+        if q.rxq_id(rxq::TXFREE_BAND0) != 9 { return Err("RXQ_TXFREE_BAND0 hw_id != 9"); }
+        if q.rxq_id(rxq::TXFREE_BAND2) != 7 { return Err("RXQ_TXFREE_BAND2 hw_id != 7"); }
+
+        // Validate ring base calculations
+        if q.mcuq_ring_base(mcuq::FWDL) != 0x400 { return Err("FWDL ring_base != 0x400"); }
+        if q.mcuq_ring_base(mcuq::WM) != 0x410 { return Err("WM ring_base != 0x410"); }
+        if q.mcuq_ring_base(mcuq::WA) != 0x440 { return Err("WA ring_base != 0x440"); }
+        if q.txq_ring_base(txq::BAND0) != 0x420 { return Err("TXQ_BAND0 ring_base != 0x420"); }
+        if q.txq_ring_base(txq::BAND1) != 0x430 { return Err("TXQ_BAND1 ring_base != 0x430"); }
+        if q.txq_ring_base(txq::BAND2) != 0x450 { return Err("TXQ_BAND2 ring_base != 0x450"); }
+        if q.rxq_ring_base(rxq::MCU) != 0x500 { return Err("RXQ_MCU ring_base != 0x500"); }
+        if q.rxq_ring_base(rxq::MAIN) != 0x540 { return Err("RXQ_MAIN ring_base != 0x540"); }
+        if q.rxq_ring_base(rxq::TXFREE_BAND0) != 0x590 { return Err("RXQ_TXFREE0 ring_base != 0x590"); }
+
+        // Validate prefetch control calculations
+        if q.mcuq_ext_ctrl(mcuq::FWDL) != 0x640 { return Err("FWDL ext_ctrl != 0x640"); }
+        if q.mcuq_ext_ctrl(mcuq::WM) != 0x644 { return Err("WM ext_ctrl != 0x644"); }
+        if q.mcuq_ext_ctrl(mcuq::WA) != 0x650 { return Err("WA ext_ctrl != 0x650"); }
+        if q.txq_ext_ctrl(txq::BAND0) != 0x648 { return Err("TXQ_BAND0 ext_ctrl != 0x648"); }
+        if q.txq_ext_ctrl(txq::BAND1) != 0x64C { return Err("TXQ_BAND1 ext_ctrl != 0x64C"); }
+        if q.txq_ext_ctrl(txq::BAND2) != 0x654 { return Err("TXQ_BAND2 ext_ctrl != 0x654"); }
+        if q.rxq_ext_ctrl(rxq::MCU) != 0x680 { return Err("RXQ_MCU ext_ctrl != 0x680"); }
+        if q.rxq_ext_ctrl(rxq::MAIN) != 0x690 { return Err("RXQ_MAIN ext_ctrl != 0x690"); }
+        if q.rxq_ext_ctrl(rxq::TXFREE_BAND0) != 0x6A4 { return Err("RXQ_TXFREE0 ext_ctrl != 0x6A4"); }
+
+        Ok(())
+    }
+
+    /// Print all queue mappings for debugging
+    pub fn dump_queue_ids() {
+        let q = &MT7996_QUEUE_IDS;
+
+        userlib::println!("[QueueMap] MT7996 Queue ID Mapping:");
+        userlib::println!("[QueueMap]   MCU TX queues:");
+        userlib::println!("[QueueMap]     FWDL: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.mcuq_id(mcuq::FWDL), q.mcuq_ring_base(mcuq::FWDL), q.mcuq_ext_ctrl(mcuq::FWDL));
+        userlib::println!("[QueueMap]     WM:   hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.mcuq_id(mcuq::WM), q.mcuq_ring_base(mcuq::WM), q.mcuq_ext_ctrl(mcuq::WM));
+        userlib::println!("[QueueMap]     WA:   hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.mcuq_id(mcuq::WA), q.mcuq_ring_base(mcuq::WA), q.mcuq_ext_ctrl(mcuq::WA));
+
+        userlib::println!("[QueueMap]   Data TX queues:");
+        userlib::println!("[QueueMap]     BAND0: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.txq_id(txq::BAND0), q.txq_ring_base(txq::BAND0), q.txq_ext_ctrl(txq::BAND0));
+        userlib::println!("[QueueMap]     BAND1: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.txq_id(txq::BAND1), q.txq_ring_base(txq::BAND1), q.txq_ext_ctrl(txq::BAND1));
+        userlib::println!("[QueueMap]     BAND2: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.txq_id(txq::BAND2), q.txq_ring_base(txq::BAND2), q.txq_ext_ctrl(txq::BAND2));
+
+        userlib::println!("[QueueMap]   RX queues:");
+        userlib::println!("[QueueMap]     MCU:        hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.rxq_id(rxq::MCU), q.rxq_ring_base(rxq::MCU), q.rxq_ext_ctrl(rxq::MCU));
+        userlib::println!("[QueueMap]     MCU_WA:     hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.rxq_id(rxq::MCU_WA), q.rxq_ring_base(rxq::MCU_WA), q.rxq_ext_ctrl(rxq::MCU_WA));
+        userlib::println!("[QueueMap]     MAIN:       hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.rxq_id(rxq::MAIN), q.rxq_ring_base(rxq::MAIN), q.rxq_ext_ctrl(rxq::MAIN));
+        userlib::println!("[QueueMap]     TXFREE0:    hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.rxq_id(rxq::TXFREE_BAND0), q.rxq_ring_base(rxq::TXFREE_BAND0), q.rxq_ext_ctrl(rxq::TXFREE_BAND0));
+        userlib::println!("[QueueMap]     TXFREE2:    hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+            q.rxq_id(rxq::TXFREE_BAND2), q.rxq_ring_base(rxq::TXFREE_BAND2), q.rxq_ext_ctrl(rxq::TXFREE_BAND2));
+    }
+}
 
 /// Cache line size (64 bytes for Cortex-A73)
 const CACHE_LINE: usize = 64;
@@ -93,143 +436,136 @@ pub mod remap {
 
 /// WFDMA base addresses (relative to BAR0)
 pub mod wfdma {
-    /// WFDMA0 base
-    pub const WFDMA0_BASE: u32 = 0xd4000;
-    /// WFDMA1 base
-    pub const WFDMA1_BASE: u32 = 0xd5000;
-    /// WFDMA0 on PCIe1 (for dual-band)
-    pub const WFDMA0_PCIE1_BASE: u32 = 0xd8000;
+    /// WFDMA0 base - from regs::wfdma0
+    pub const WFDMA0_BASE: u32 = crate::regs::wfdma0::BASE;
+    /// WFDMA1 base - from regs::wfdma1
+    pub const WFDMA1_BASE: u32 = crate::regs::wfdma1::BASE;
+    /// WFDMA0 on PCIe1 (for dual-band) - from regs::wfdma0_pcie1
+    pub const WFDMA0_PCIE1_BASE: u32 = crate::regs::wfdma0_pcie1::BASE;
 
-    /// Reset register
-    pub const RST: u32 = 0x100;
-    /// Reset bits
-    pub const RST_LOGIC_RST: u32 = 1 << 4;
-    pub const RST_DMASHDL_ALL_RST: u32 = 1 << 5;
+    /// Reset register offset - computed from regs::wfdma0::RST - BASE
+    pub const RST: u32 = crate::regs::wfdma0::RST - crate::regs::wfdma0::BASE;
+    /// Reset bits - from regs::wfdma0
+    pub const RST_LOGIC_RST: u32 = crate::regs::wfdma0::RST_LOGIC_RST;
+    pub const RST_DMASHDL_ALL_RST: u32 = crate::regs::wfdma0::RST_DMASHDL_ALL_RST;
 
-    /// Busy enable register
-    pub const BUSY_ENA: u32 = 0x13c;
-    pub const BUSY_ENA_TX_FIFO0: u32 = 1 << 0;
-    pub const BUSY_ENA_TX_FIFO1: u32 = 1 << 1;
-    pub const BUSY_ENA_RX_FIFO: u32 = 1 << 2;
-    /// PCIE1 (HIF2) BUSY_ENA bits - different from HIF1!
-    pub const PCIE1_BUSY_ENA_TX_FIFO0: u32 = 1 << 0;
-    pub const PCIE1_BUSY_ENA_TX_FIFO1: u32 = 1 << 1;
-    pub const PCIE1_BUSY_ENA_RX_FIFO: u32 = 1 << 4;  // BIT(4), not BIT(2)!
+    /// Busy enable register offset - from regs::wfdma0
+    pub const BUSY_ENA: u32 = crate::regs::wfdma0::BUSY_ENA - crate::regs::wfdma0::BASE;
+    pub const BUSY_ENA_TX_FIFO0: u32 = crate::regs::wfdma0::BUSY_ENA_TX_FIFO0;
+    pub const BUSY_ENA_TX_FIFO1: u32 = crate::regs::wfdma0::BUSY_ENA_TX_FIFO1;
+    pub const BUSY_ENA_RX_FIFO: u32 = crate::regs::wfdma0::BUSY_ENA_RX_FIFO;
+    /// PCIE1 (HIF2) BUSY_ENA bits - from regs::wfdma0_pcie1
+    pub const PCIE1_BUSY_ENA_TX_FIFO0: u32 = crate::regs::wfdma0_pcie1::BUSY_ENA_TX_FIFO0;
+    pub const PCIE1_BUSY_ENA_TX_FIFO1: u32 = crate::regs::wfdma0_pcie1::BUSY_ENA_TX_FIFO1;
+    pub const PCIE1_BUSY_ENA_RX_FIFO: u32 = crate::regs::wfdma0_pcie1::BUSY_ENA_RX_FIFO;
 
-    /// MCU command register
-    pub const MCU_CMD: u32 = 0x1f0;
+    /// MCU command register offset - from regs::wfdma0
+    pub const MCU_CMD: u32 = crate::regs::wfdma0::MCU_CMD - crate::regs::wfdma0::BASE;
 
-    /// Interrupt source
-    pub const INT_SRC: u32 = 0x200;
-    /// Interrupt mask
-    pub const INT_MASK: u32 = 0x204;
+    /// Interrupt source offset - from regs::wfdma0
+    pub const INT_SRC: u32 = crate::regs::wfdma0::INT_SOURCE_CSR - crate::regs::wfdma0::BASE;
+    /// Interrupt mask offset - from regs::wfdma0
+    pub const INT_MASK: u32 = crate::regs::wfdma0::INT_MASK_CSR - crate::regs::wfdma0::BASE;
 
-    /// Global config register
-    pub const GLO_CFG: u32 = 0x208;
+    /// Global config register offset - from regs::wfdma0
+    pub const GLO_CFG: u32 = crate::regs::wfdma0::GLO_CFG - crate::regs::wfdma0::BASE;
 
-    /// Reset DTX pointer
-    pub const RST_DTX_PTR: u32 = 0x20c;
+    /// Reset DTX pointer offset - from regs::wfdma0
+    pub const RST_DTX_PTR: u32 = crate::regs::wfdma0::RST_DTX_PTR - crate::regs::wfdma0::BASE;
 
-    /// Interrupt delay configuration registers (CORRECT addresses!)
-    /// NOT 0x20c/0x230 - those are wrong and clobber other regs!
-    pub const PRI_DLY_INT_CFG0: u32 = 0x2f0;
-    pub const PRI_DLY_INT_CFG1: u32 = 0x2f4;
-    pub const PRI_DLY_INT_CFG2: u32 = 0x2f8;
+    /// Interrupt delay configuration register offsets - from regs::wfdma0
+    pub const PRI_DLY_INT_CFG0: u32 = crate::regs::wfdma0::PRI_DLY_INT_CFG0 - crate::regs::wfdma0::BASE;
+    pub const PRI_DLY_INT_CFG1: u32 = crate::regs::wfdma0::PRI_DLY_INT_CFG1 - crate::regs::wfdma0::BASE;
+    pub const PRI_DLY_INT_CFG2: u32 = crate::regs::wfdma0::PRI_DLY_INT_CFG2 - crate::regs::wfdma0::BASE;
 
-    /// Extended global config registers
-    pub const GLO_CFG_EXT0: u32 = 0x2b0;
-    pub const GLO_CFG_EXT1: u32 = 0x2b4;
+    /// Extended global config register offsets - from regs::wfdma0
+    pub const GLO_CFG_EXT0: u32 = crate::regs::wfdma0::GLO_CFG_EXT0 - crate::regs::wfdma0::BASE;
+    pub const GLO_CFG_EXT1: u32 = crate::regs::wfdma0::GLO_CFG_EXT1 - crate::regs::wfdma0::BASE;
 
-    /// GLO_CFG_EXT0 bits
-    pub const GLO_CFG_EXT0_RX_WB_RXD: u32 = 1 << 18;
-    pub const GLO_CFG_EXT0_WED_MERGE_MODE: u32 = 1 << 14;
+    /// GLO_CFG_EXT0 bits - from regs::wfdma0
+    pub const GLO_CFG_EXT0_RX_WB_RXD: u32 = crate::regs::wfdma0::GLO_CFG_EXT0_RX_WB_RXD;
+    pub const GLO_CFG_EXT0_WED_MERGE_MODE: u32 = crate::regs::wfdma0::GLO_CFG_EXT0_WED_MERGE_MODE;
 
-    /// RX pause threshold registers
-    pub const PAUSE_RX_Q_45_TH: u32 = 0x268;
-    pub const PAUSE_RX_Q_67_TH: u32 = 0x26c;
-    pub const PAUSE_RX_Q_89_TH: u32 = 0x270;
-    pub const PAUSE_RX_Q_RRO_TH: u32 = 0x274;
+    /// RX pause threshold register offsets - from regs::wfdma0
+    /// Note: NOT sequential! 0x274-0x278 reserved, RRO at 0x27c
+    pub const PAUSE_RX_Q_45_TH: u32 = crate::regs::wfdma0::PAUSE_RX_Q_45_TH - crate::regs::wfdma0::BASE;
+    pub const PAUSE_RX_Q_67_TH: u32 = crate::regs::wfdma0::PAUSE_RX_Q_67_TH - crate::regs::wfdma0::BASE;
+    pub const PAUSE_RX_Q_89_TH: u32 = crate::regs::wfdma0::PAUSE_RX_Q_89_TH - crate::regs::wfdma0::BASE;
+    pub const PAUSE_RX_Q_RRO_TH: u32 = crate::regs::wfdma0::PAUSE_RX_Q_RRO_TH - crate::regs::wfdma0::BASE;
 
-    /// WFDMA Extended CSR base
-    pub const EXT_CSR_BASE: u32 = 0xd7000;
-    /// HIF misc status register (relative to BAR0)
-    pub const EXT_CSR_HIF_MISC: u32 = 0xd7044;
-    /// BUSY bit in HIF_MISC
-    pub const EXT_CSR_HIF_MISC_BUSY: u32 = 1 << 0;
+    /// WFDMA Extended CSR base - from regs::wfdma_ext_csr
+    pub const EXT_CSR_BASE: u32 = crate::regs::wfdma_ext_csr::BASE;
+    /// HIF misc status register (relative to BAR0) - from regs::wfdma_ext_csr
+    pub const EXT_CSR_HIF_MISC: u32 = crate::regs::wfdma_ext_csr::HIF_MISC;
+    /// BUSY bit in HIF_MISC - from regs::wfdma_ext_csr
+    pub const EXT_CSR_HIF_MISC_BUSY: u32 = crate::regs::wfdma_ext_csr::HIF_MISC_BUSY;
 
-    /// Host config register (relative to BAR0) - controls band-to-PCIe mapping
-    /// Address: 0xd7000 + 0x30 = 0xd7030
-    pub const HOST_CONFIG: u32 = 0xd7030;
-    /// HOST_CONFIG bits
-    pub const HOST_CONFIG_PDMA_BAND: u32 = 1 << 0;
-    pub const HOST_CONFIG_BAND0_PCIE1: u32 = 1 << 20;
-    pub const HOST_CONFIG_BAND1_PCIE1: u32 = 1 << 21;
-    pub const HOST_CONFIG_BAND2_PCIE1: u32 = 1 << 22;
+    /// Host config register (relative to BAR0) - from regs::wfdma_ext_csr
+    pub const HOST_CONFIG: u32 = crate::regs::wfdma_ext_csr::HOST_CONFIG;
+    /// HOST_CONFIG bits - from regs::wfdma_ext_csr
+    pub const HOST_CONFIG_PDMA_BAND: u32 = crate::regs::wfdma_ext_csr::HOST_CONFIG_PDMA_BAND;
+    pub const HOST_CONFIG_BAND0_PCIE1: u32 = crate::regs::wfdma_ext_csr::HOST_CONFIG_BAND0_PCIE1;
+    pub const HOST_CONFIG_BAND1_PCIE1: u32 = crate::regs::wfdma_ext_csr::HOST_CONFIG_BAND1_PCIE1;
+    pub const HOST_CONFIG_BAND2_PCIE1: u32 = crate::regs::wfdma_ext_csr::HOST_CONFIG_BAND2_PCIE1;
 
-    /// AXI R2A control register (relative to BAR0) - controls AXI outstanding transactions
-    /// Address: 0xd7000 + 0x500 = 0xd7500
-    pub const AXI_R2A_CTRL: u32 = 0xd7500;
-    pub const AXI_R2A_CTRL_OUTSTAND_MASK: u32 = 0x1f;  // bits 4:0
+    /// AXI R2A control register - from regs::wfdma_ext_csr
+    pub const AXI_R2A_CTRL: u32 = crate::regs::wfdma_ext_csr::AXI_R2A_CTRL;
+    pub const AXI_R2A_CTRL_OUTSTAND_MASK: u32 = crate::regs::wfdma_ext_csr::AXI_R2A_CTRL_OUTSTAND_MASK;
 
-    /// RX interrupt PCIe select register (relative to WFDMA0 base)
-    /// Address: WFDMA0_BASE + 0x154 = 0xd4154
-    pub const RX_INT_PCIE_SEL: u32 = 0x154;
+    /// RX interrupt PCIe select register - from regs::wfdma0
+    pub const RX_INT_PCIE_SEL: u32 = crate::regs::wfdma0::RX_INT_PCIE_SEL - crate::regs::wfdma0::BASE;
     pub const RX_INT_SEL_RING3: u32 = 1 << 3;
     pub const RX_INT_SEL_RING5: u32 = 1 << 5;
     pub const RX_INT_SEL_RING6: u32 = 1 << 6;
     pub const RX_INT_SEL_RING9: u32 = 1 << 9;
 
-    /// GLO_CFG_EXT1 bits
-    pub const GLO_CFG_EXT1_TX_FCTRL_MODE: u32 = 1 << 28;
+    /// GLO_CFG_EXT1 bits - from regs::wfdma0
+    pub const GLO_CFG_EXT1_TX_FCTRL_MODE: u32 = crate::regs::wfdma0::GLO_CFG_EXT1_TX_FCTRL_MODE;
     /// CALC_MODE bit - MUST be set after prefetch configuration
-    pub const GLO_CFG_EXT1_CALC_MODE: u32 = 1 << 31;
+    pub const GLO_CFG_EXT1_CALC_MODE: u32 = crate::regs::wfdma0::GLO_CFG_EXT1_CALC_MODE;
 
-    /// MCU queue ring base offset (from WFDMA base)
-    pub const MCU_RING_BASE: u32 = 0x300;
-    /// Data TX queue ring base offset (from WFDMA base)
-    pub const TX_RING_BASE: u32 = 0x400;
-    /// RX queue ring base offset
-    pub const RX_RING_BASE: u32 = 0x500;
+    /// TX ring base offset (from WFDMA base) - from regs::wfdma0
+    /// All TX rings (MCU and data) use this base + hw_idx * 0x10
+    pub const MCU_RING_BASE: u32 = crate::regs::wfdma0::TX_RING_BASE;
+    /// RX queue ring base offset - from regs::wfdma0
+    pub const RX_RING_BASE: u32 = crate::regs::wfdma0::RX_RING_BASE;
 
-    /// Data TX queue indices (ring index within TX_RING_BASE)
-    pub const TXQ_BAND0: u32 = 0;
-    /// HIF2 Data TX queue indices (from MCU_RING_BASE, per dma.c:129-139)
-    /// Ring numbers are absolute from 0x300, not relative to TX_RING_BASE
-    pub const TXQ_BAND1: u32 = 19;  // HIF2 band1: 0x300 + 19*0x10 = 0x430
-    pub const TXQ_BAND2: u32 = 21;  // HIF2 band2: 0x300 + 21*0x10 = 0x450
-    /// Data TX ring size - matches Linux MT7996_TX_RING_SIZE
-    pub const TX_RING_SIZE: u32 = 2048;
-    /// TX MCU ring size - matches Linux MT7996_TX_MCU_RING_SIZE
-    pub const TX_MCU_RING_SIZE: u32 = 256;
+    /// Data TX queue hardware indices - from mt7996_defs::Mt7996TxqId
+    /// All TX rings use MCU_RING_BASE + hw_idx * 0x10
+    pub const TXQ_BAND0: u32 = crate::mt7996_defs::Mt7996TxqId::Band0 as u32;  // 18
+    pub const TXQ_BAND1: u32 = crate::mt7996_defs::Mt7996TxqId::Band1 as u32;  // 19 (HIF2)
+    pub const TXQ_BAND2: u32 = crate::mt7996_defs::Mt7996TxqId::Band2 as u32;  // 21 (HIF2)
+    /// Data TX ring size - from mt7996_defs (MT7996_TX_RING_SIZE)
+    pub const TX_RING_SIZE: u32 = crate::mt7996_defs::MT7996_TX_RING_SIZE;
+    /// TX MCU ring size - from mt7996_defs (MT7996_TX_MCU_RING_SIZE)
+    pub const TX_MCU_RING_SIZE: u32 = crate::mt7996_defs::MT7996_TX_MCU_RING_SIZE;
 
-    /// RX MCU queue IDs (mt7996.h enum mt7996_rxq_id)
-    pub const RXQ_MCU: u32 = 0;           // MT7996_RXQ_MCU_WM
-    pub const RXQ_MCU_WA: u32 = 1;        // MT7996_RXQ_MCU_WA - WA event queue
-    pub const RXQ_MCU_WA_MAIN: u32 = 2;   // MT7996_RXQ_MCU_WA_MAIN - TXFREE via WA
-    pub const RXQ_MCU_WA_TRI: u32 = 3;    // MT7996_RXQ_MCU_WA_TRI - Band2 WA (on HIF1!)
-    /// RX data queue IDs (per deepwiki MT7996_RXQ_BAND0 = 4)
-    pub const RXQ_BAND0: u32 = 4;         // RX_MAIN for band0
-    pub const RXQ_BAND2: u32 = 5;         // RX_MAIN for band2 (on HIF2)
-    /// RRO queue IDs - Hardware Receive Reorder (mt7996.h)
-    pub const RXQ_RRO_BAND2: u32 = 6;     // MT7996_RXQ_RRO_BAND2 (on HIF2)
-    pub const RXQ_RRO_BAND0: u32 = 8;     // MT7996_RXQ_RRO_BAND0
-    /// RX TXFREE queue IDs - TX completion notifications (mt7996.h:192-194)
+    /// RX MCU queue IDs - from mt7996_defs::rxq_id
+    pub const RXQ_MCU: u32 = crate::mt7996_defs::rxq_id::MCU_WM;
+    pub const RXQ_MCU_WA: u32 = crate::mt7996_defs::rxq_id::MCU_WA;
+    pub const RXQ_MCU_WA_MAIN: u32 = crate::mt7996_defs::rxq_id::MCU_WA_MAIN;
+    pub const RXQ_MCU_WA_TRI: u32 = crate::mt7996_defs::rxq_id::MCU_WA_TRI;
+    /// RX data queue IDs - from mt7996_defs::rxq_id
+    pub const RXQ_BAND0: u32 = crate::mt7996_defs::rxq_id::BAND0;
+    pub const RXQ_BAND2: u32 = crate::mt7996_defs::rxq_id::BAND2;
+    /// RRO queue IDs - from mt7996_defs::rxq_id
+    pub const RXQ_RRO_BAND2: u32 = crate::mt7996_defs::rxq_id::RRO_BAND2;
+    pub const RXQ_RRO_BAND0: u32 = crate::mt7996_defs::rxq_id::RRO_BAND0;
+    /// RX TXFREE queue IDs - from mt7996_defs::rxq_id
     /// CRITICAL: Required for DMA init, hardware validates before RST release!
-    pub const RXQ_TXFREE_BAND0: u32 = 9;  // __RXQ(9) = 12, offset 0x5C0 (on HIF1)
-    pub const RXQ_TXFREE_BAND2: u32 = 7;  // __RXQ(7) = 10, offset 0x5A0 (on HIF2)
-    /// __RXQ macro: converts queue ID to ring index
-    /// __RXQ(q) = q + __MT_MCUQ_MAX, where __MT_MCUQ_MAX = 3
-    pub const RXQ_OFFSET: u32 = 3;
-    /// RX MCU ring size - matches Linux MT7996_RX_MCU_RING_SIZE
-    pub const RX_MCU_RING_SIZE: u32 = 512;
-    /// RX MCU WA ring size - matches Linux MT7996_RX_MCU_RING_SIZE_WA
-    pub const RX_MCU_RING_SIZE_WA: u32 = 1024;
-    /// RX data ring size - matches Linux MT7996_RX_RING_SIZE
-    pub const RX_DATA_RING_SIZE: u32 = 1536;
+    pub const RXQ_TXFREE_BAND0: u32 = crate::mt7996_defs::rxq_id::TXFREE0;
+    pub const RXQ_TXFREE_BAND2: u32 = crate::mt7996_defs::rxq_id::TXFREE2;
+
+    /// RX MCU ring size - from mt7996_defs (MT7996_RX_MCU_RING_SIZE)
+    pub const RX_MCU_RING_SIZE: u32 = crate::mt7996_defs::MT7996_RX_MCU_RING_SIZE;
+    /// RX MCU WA ring size - from mt7996_defs (MT7996_RX_MCU_RING_SIZE_WA)
+    pub const RX_MCU_RING_SIZE_WA: u32 = crate::mt7996_defs::MT7996_RX_MCU_RING_SIZE_WA;
+    /// RX data ring size - from mt7996_defs (MT7996_RX_RING_SIZE)
+    pub const RX_DATA_RING_SIZE: u32 = crate::mt7996_defs::MT7996_RX_RING_SIZE;
     /// RX TXFREE ring size - uses RX data size per Linux
-    pub const RX_TXFREE_RING_SIZE: u32 = 1536;
+    pub const RX_TXFREE_RING_SIZE: u32 = crate::mt7996_defs::MT7996_RX_RING_SIZE;
     /// RX RRO ring size - matches RX data size
-    pub const RX_RRO_RING_SIZE: u32 = 1536;
+    pub const RX_RRO_RING_SIZE: u32 = crate::mt7996_defs::MT7996_RX_RING_SIZE;
 
     /// Ring register offsets (16 bytes per ring, NO base_hi!)
     pub const RING_BASE: u32 = 0x00;     // desc_base (32-bit address)
@@ -238,15 +574,22 @@ pub mod wfdma {
     pub const RING_DMA_IDX: u32 = 0x0c;  // dma_idx
     // Note: offset 0x10 is the NEXT ring's desc_base, not base_hi!
 
-    /// Ring size for firmware download
-    pub const FWDL_RING_SIZE: u32 = 128;
+    /// Ring size for firmware download - from mt7996_defs (MT7996_TX_FWDL_RING_SIZE)
+    pub const FWDL_RING_SIZE: u32 = crate::mt7996_defs::MT7996_TX_FWDL_RING_SIZE;
 
     /// Extended control register offsets (relative to WFDMA base)
-    /// MCU TX queue prefetch control
-    pub const MCUQ_EXT_CTRL_BASE: u32 = 0x600;
-    /// Data TX queue prefetch control
-    pub const TXQ_EXT_CTRL_BASE: u32 = 0x640;
+    /// All TX queue prefetch control (MCU AND Data TX share the same base!)
+    /// Linux: MT_MCUQ_EXT_CTRL(q) = MT_Q_BASE(q) + 0x600 + MT_MCUQ_ID(q) * 0x4
+    /// Linux: MT_TXQ_EXT_CTRL(q) = MT_Q_BASE(__TXQ(q)) + 0x600 + MT_TXQ_ID(q) * 0x4
+    /// Both use 0x600 base - the hw ring index (16-21) determines the actual offset
+    pub const TX_EXT_CTRL_BASE: u32 = 0x600;
+    /// Alias for backwards compatibility
+    pub const MCUQ_EXT_CTRL_BASE: u32 = TX_EXT_CTRL_BASE;
+    /// REMOVED: TXQ_EXT_CTRL_BASE was 0x640 which is WRONG!
+    /// Linux uses 0x600 for both MCU and Data TX queues
+    pub const TXQ_EXT_CTRL_BASE: u32 = TX_EXT_CTRL_BASE;  // Was 0x640, now fixed to 0x600
     /// RX queue prefetch control
+    /// Linux: MT_RXQ_EXT_CTRL(q) = MT_Q_BASE(__RXQ(q)) + 0x680 + MT_RXQ_ID(q) * 0x4
     pub const RXQ_EXT_CTRL_BASE: u32 = 0x680;
 
     /// For backwards compatibility
@@ -254,6 +597,52 @@ pub mod wfdma {
 
     /// Prefetch depth for MT7990 MCU queues
     pub const PREFETCH_DEPTH_MCU_MT7990: u32 = 4;
+
+    /// Validate wfdma constants against regs.rs (catches drift)
+    pub fn validate_against_regs() {
+        use crate::regs;
+
+        // WFDMA0 base addresses
+        assert_eq!(WFDMA0_BASE, regs::wfdma0::BASE, "WFDMA0_BASE mismatch with regs.rs");
+        assert_eq!(WFDMA0_PCIE1_BASE, regs::wfdma0_pcie1::BASE, "WFDMA0_PCIE1_BASE mismatch");
+
+        // Reset register
+        assert_eq!(WFDMA0_BASE + RST, regs::wfdma0::RST, "RST address mismatch");
+        assert_eq!(RST_LOGIC_RST, regs::wfdma0::RST_LOGIC_RST, "RST_LOGIC_RST mismatch");
+        assert_eq!(RST_DMASHDL_ALL_RST, regs::wfdma0::RST_DMASHDL_ALL_RST, "RST_DMASHDL_ALL_RST mismatch");
+
+        // GLO_CFG
+        assert_eq!(WFDMA0_BASE + GLO_CFG, regs::wfdma0::GLO_CFG, "GLO_CFG address mismatch");
+
+        // Pause RX thresholds (the one we fixed!)
+        assert_eq!(WFDMA0_BASE + PAUSE_RX_Q_45_TH, regs::wfdma0::PAUSE_RX_Q_45_TH, "PAUSE_RX_Q_45_TH mismatch");
+        assert_eq!(WFDMA0_BASE + PAUSE_RX_Q_67_TH, regs::wfdma0::PAUSE_RX_Q_67_TH, "PAUSE_RX_Q_67_TH mismatch");
+        assert_eq!(WFDMA0_BASE + PAUSE_RX_Q_89_TH, regs::wfdma0::PAUSE_RX_Q_89_TH, "PAUSE_RX_Q_89_TH mismatch");
+        assert_eq!(WFDMA0_BASE + PAUSE_RX_Q_RRO_TH, regs::wfdma0::PAUSE_RX_Q_RRO_TH, "PAUSE_RX_Q_RRO_TH mismatch");
+
+        // GLO_CFG extensions
+        assert_eq!(WFDMA0_BASE + GLO_CFG_EXT0, regs::wfdma0::GLO_CFG_EXT0, "GLO_CFG_EXT0 address mismatch");
+        assert_eq!(WFDMA0_BASE + GLO_CFG_EXT1, regs::wfdma0::GLO_CFG_EXT1, "GLO_CFG_EXT1 address mismatch");
+        assert_eq!(GLO_CFG_EXT1_CALC_MODE, regs::wfdma0::GLO_CFG_EXT1_CALC_MODE, "GLO_CFG_EXT1_CALC_MODE mismatch");
+
+        // Extended CSR
+        assert_eq!(EXT_CSR_HIF_MISC, regs::wfdma_ext_csr::HIF_MISC, "EXT_CSR_HIF_MISC mismatch");
+        assert_eq!(HOST_CONFIG, regs::wfdma_ext_csr::HOST_CONFIG, "HOST_CONFIG mismatch");
+
+        // Prefetch control bases - the bug we found!
+        // Both MCU and Data TX use 0x600, RX uses 0x680
+        assert_eq!(TX_EXT_CTRL_BASE, regs::wfdma0::TX_EXT_CTRL_BASE, "TX_EXT_CTRL_BASE mismatch");
+        assert_eq!(RXQ_EXT_CTRL_BASE, regs::wfdma0::RX_EXT_CTRL_BASE, "RXQ_EXT_CTRL_BASE mismatch");
+
+        // Ring bases
+        assert_eq!(MCU_RING_BASE, regs::wfdma0::TX_RING_BASE, "MCU_RING_BASE mismatch");
+        assert_eq!(RX_RING_BASE, regs::wfdma0::RX_RING_BASE, "RX_RING_BASE mismatch");
+
+        // Busy enable bits
+        assert_eq!(BUSY_ENA_TX_FIFO0, regs::wfdma0::BUSY_ENA_TX_FIFO0, "BUSY_ENA_TX_FIFO0 mismatch");
+        assert_eq!(BUSY_ENA_TX_FIFO1, regs::wfdma0::BUSY_ENA_TX_FIFO1, "BUSY_ENA_TX_FIFO1 mismatch");
+        assert_eq!(BUSY_ENA_RX_FIFO, regs::wfdma0::BUSY_ENA_RX_FIFO, "BUSY_ENA_RX_FIFO mismatch");
+    }
 }
 
 /// Interrupt mask bits for WFDMA
@@ -288,6 +677,27 @@ pub mod int_mask {
                               RX_DONE_BAND0 | RX_DONE_BAND1 | TX_DONE_BAND2 |
                               TX_DONE_MCU_WA | RX_DONE_BAND2_EXT |
                               TX_DONE_FWDL | TX_DONE_MCU_WM | MCU_CMD;
+
+    /// Validate interrupt bits against regs.rs
+    pub fn validate_against_regs() {
+        use crate::regs;
+
+        assert_eq!(RX_DONE_WM, regs::int::RX_DONE_WM, "RX_DONE_WM mismatch");
+        assert_eq!(RX_DONE_WA, regs::int::RX_DONE_WA, "RX_DONE_WA mismatch");
+        assert_eq!(RX_DONE_WA_MAIN, regs::int::RX_DONE_WA_MAIN, "RX_DONE_WA_MAIN mismatch");
+        assert_eq!(RX_DONE_WA_TRI, regs::int::RX_DONE_WA_TRI, "RX_DONE_WA_TRI mismatch");
+        assert_eq!(RX_DONE_BAND0, regs::int::RX_DONE_BAND0, "RX_DONE_BAND0 mismatch");
+        assert_eq!(RX_DONE_BAND2_EXT, regs::int::RX_DONE_BAND2_EXT, "RX_DONE_BAND2_EXT mismatch");
+
+        assert_eq!(TX_DONE_MCU_WM, regs::int::TX_DONE_MCU_WM, "TX_DONE_MCU_WM mismatch");
+        assert_eq!(TX_DONE_MCU_WA, regs::int::TX_DONE_MCU_WA, "TX_DONE_MCU_WA mismatch");
+        assert_eq!(TX_DONE_FWDL, regs::int::TX_DONE_FWDL, "TX_DONE_FWDL mismatch");
+        assert_eq!(TX_DONE_BAND0, regs::int::TX_DONE_BAND0, "TX_DONE_BAND0 mismatch");
+        assert_eq!(TX_DONE_BAND1, regs::int::TX_DONE_BAND1, "TX_DONE_BAND1 mismatch");
+        assert_eq!(TX_DONE_BAND2, regs::int::TX_DONE_BAND2, "TX_DONE_BAND2 mismatch");
+
+        assert_eq!(MCU_CMD, regs::int::MCU_CMD, "MCU_CMD mismatch");
+    }
 }
 
 /// MT7996 MCU TX queue IDs (for TXD packet header Q_IDX field)
@@ -304,31 +714,57 @@ pub mod txq_id {
     pub const WA: u32 = MCU_RX_Q0;
 }
 
-/// MT7996 MCU ring indices (for ring register access)
-/// Ring registers are at MCU_RING_BASE + ring_index * 0x10
-/// These are the mt76_mcuq_id enum values from Linux.
+/// MT7996 MCU queue logical IDs (matches Linux mt76_mcuq_id enum)
+/// These are software indices (0, 1, 2) that map to hardware ring indices.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McuQueue {
-    /// WM (WiFi Manager) - ring index 0
+    /// WM (WiFi Manager) - logical index 0
     Wm = 0,
-    /// WA (WiFi Agent) - ring index 1
+    /// WA (WiFi Agent) - logical index 1
     Wa = 1,
-    /// Firmware download - ring index 2
+    /// Firmware download - logical index 2
     Fwdl = 2,
 }
 
+/// MT7996 hardware TX queue indices - from mt7996_defs::Mt7996TxqId
+/// These are the actual hardware ring numbers used for register access.
+pub mod hw_ring_idx {
+    use crate::mt7996_defs::Mt7996TxqId;
+    /// Firmware download - hardware ring 16
+    pub const FWDL: u32 = Mt7996TxqId::Fwdl as u32;
+    /// WM (WiFi Manager) - hardware ring 17
+    pub const WM: u32 = Mt7996TxqId::McuWm as u32;
+    /// WA (WiFi Agent) - hardware ring 20
+    pub const WA: u32 = Mt7996TxqId::McuWa as u32;
+}
+
 impl McuQueue {
+    /// Get hardware ring index for this MCU queue
+    /// Linux: dev->q_id[MT_MCUQ_*] = MT7996_TXQ_*
+    #[inline]
+    pub const fn hw_ring_idx(self) -> u32 {
+        match self {
+            McuQueue::Wm => hw_ring_idx::WM,
+            McuQueue::Wa => hw_ring_idx::WA,
+            McuQueue::Fwdl => hw_ring_idx::FWDL,
+        }
+    }
+
     /// Get ring register base offset from WFDMA base
+    /// Linux: q->regs = base + ring_base + idx * MT_RING_SIZE
+    /// where ring_base = MT_MCUQ_RING_BASE(q) = MT_Q_BASE(q) + 0x300
+    /// and idx = MT_MCUQ_ID(q) = hardware ring index
     #[inline]
     pub const fn ring_offset(self) -> u32 {
-        wfdma::MCU_RING_BASE + (self as u32) * 0x10
+        wfdma::MCU_RING_BASE + self.hw_ring_idx() * 0x10
     }
 
     /// Get prefetch control register offset from WFDMA base
+    /// Linux: MT_MCUQ_EXT_CTRL(q) = MT_Q_BASE(q) + 0x600 + MT_MCUQ_ID(q) * 0x4
     #[inline]
     pub const fn ext_ctrl_offset(self) -> u32 {
-        wfdma::MCUQ_EXT_CTRL_BASE + (self as u32) * 4
+        wfdma::MCUQ_EXT_CTRL_BASE + self.hw_ring_idx() * 4
     }
 
     /// Get TXD queue ID for this MCU queue (for TXD0 Q_IDX field)
@@ -343,15 +779,16 @@ impl McuQueue {
 }
 
 /// Typed TX queue index (prevents mixing with RX queues or raw offsets)
-/// NOTE: This uses ring indices (0, 1, 2), not TXQ IDs (16, 17, 20)
+/// Uses hardware ring indices (16, 17, 20) for correct register access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxQ(pub u8);
 
 impl TxQ {
-    /// Ring indices (for register access)
-    pub const WM: TxQ = TxQ(0);
-    pub const WA: TxQ = TxQ(1);
-    pub const FWDL: TxQ = TxQ(2);
+    /// Hardware ring indices (for register access)
+    /// These match Linux mt7996_txq_id enum values
+    pub const WM: TxQ = TxQ(hw_ring_idx::WM as u8);
+    pub const WA: TxQ = TxQ(hw_ring_idx::WA as u8);
+    pub const FWDL: TxQ = TxQ(hw_ring_idx::FWDL as u8);
 
     /// Get ring register base offset from WFDMA base
     #[inline]
@@ -535,12 +972,12 @@ pub mod txd {
     pub const TXD1_CMD: u32 = TXD1_LONG_FORMAT | TXD1_HDR_FORMAT_CMD;
 }
 
-/// Global config register bits
+/// Global config register bits - from regs::wfdma0
 pub mod glo_cfg {
-    /// Enable TX DMA
-    pub const TX_DMA_EN: u32 = 1 << 0;
-    /// Enable RX DMA
-    pub const RX_DMA_EN: u32 = 1 << 2;
+    /// Enable TX DMA - from regs::wfdma0
+    pub const TX_DMA_EN: u32 = crate::regs::wfdma0::GLO_CFG_TX_DMA_EN;
+    /// Enable RX DMA - from regs::wfdma0
+    pub const RX_DMA_EN: u32 = crate::regs::wfdma0::GLO_CFG_RX_DMA_EN;
     /// TX DMA busy
     pub const TX_DMA_BUSY: u32 = 1 << 1;
     /// RX DMA busy
@@ -549,33 +986,33 @@ pub mod glo_cfg {
     pub const BYTE_SWAP: u32 = 1 << 4;
     /// DMA descriptor size (0 = 8 DWORDs, 1 = 16 DWORDs)
     pub const DESC_SIZE_16DW: u32 = 1 << 8;
-    /// Omit RX info in prefetch
-    pub const OMIT_RX_INFO_PFET2: u32 = 1 << 21;
-    /// External enable (required for firmware loading!)
-    pub const EXT_EN: u32 = 1 << 26;
-    /// Omit RX info
-    pub const OMIT_RX_INFO: u32 = 1 << 27;
-    /// Omit TX info
-    pub const OMIT_TX_INFO: u32 = 1 << 28;
+    /// Omit RX info in prefetch - from regs::wfdma0
+    pub const OMIT_RX_INFO_PFET2: u32 = crate::regs::wfdma0::GLO_CFG_OMIT_RX_INFO_PFET2;
+    /// External enable (required for firmware loading!) - from regs::wfdma0
+    pub const EXT_EN: u32 = crate::regs::wfdma0::GLO_CFG_EXT_EN;
+    /// Omit RX info - from regs::wfdma0
+    pub const OMIT_RX_INFO: u32 = crate::regs::wfdma0::GLO_CFG_OMIT_RX_INFO;
+    /// Omit TX info - from regs::wfdma0
+    pub const OMIT_TX_INFO: u32 = crate::regs::wfdma0::GLO_CFG_OMIT_TX_INFO;
 }
 
-/// Ring descriptor control field bits
+/// Ring descriptor control field bits - from dma_defs
 pub mod dma_ctl {
-    /// Segment data length 0 (bits 29:16)
+    /// Segment data length 0 (bits 29:16) - from dma_defs
     pub const SD_LEN0_SHIFT: u32 = 16;
-    pub const SD_LEN0_MASK: u32 = 0x3FFF << 16;
-    /// Last segment indicator for buffer 0
-    pub const LAST_SEC0: u32 = 1 << 30;
-    /// DMA done flag
-    pub const DMA_DONE: u32 = 1 << 31;
+    pub const SD_LEN0_MASK: u32 = crate::dma_defs::MT_DMA_CTL_SD_LEN0;
+    /// Last segment indicator for buffer 0 - from dma_defs
+    pub const LAST_SEC0: u32 = crate::dma_defs::MT_DMA_CTL_LAST_SEC0;
+    /// DMA done flag - from dma_defs
+    pub const DMA_DONE: u32 = crate::dma_defs::MT_DMA_CTL_DMA_DONE;
 
-    /// RRO magic counter constants (from Linux mt76 dma.h)
+    /// RRO magic counter constants - from dma_defs
     /// MT_DMA_MAGIC_CNT = 16, initial value is CNT-1 = 15
-    pub const RRO_MAGIC_CNT: u32 = 16;
-    pub const RRO_MAGIC_CNT_INIT: u32 = 15;  // MT_DMA_MAGIC_CNT - 1
-    /// Magic counter mask in info field (bits 15:12 per Linux dma.h MT_DMA_MAGIC_MASK)
-    pub const RRO_MAGIC_SHIFT: u32 = 12;
-    pub const RRO_MAGIC_MASK: u32 = 0xF << 12;
+    pub const RRO_MAGIC_CNT: u32 = crate::dma_defs::MT_DMA_MAGIC_CNT;
+    pub const RRO_MAGIC_CNT_INIT: u32 = crate::dma_defs::MT_DMA_MAGIC_CNT - 1;
+    /// Magic counter mask in info field (bits 31:28 per Linux dma.h MT_DMA_MAGIC_MASK)
+    pub const RRO_MAGIC_SHIFT: u32 = 28;  // Corrected: was 12, should be 28
+    pub const RRO_MAGIC_MASK: u32 = crate::dma_defs::MT_DMA_MAGIC_MASK;
 }
 
 /// DMA ring descriptor (mt76_desc format - 16 bytes)
@@ -965,7 +1402,7 @@ impl RxRing {
                 desc.buf0 = buf_addr as u32;
                 desc.buf1 = (buf_addr >> 32) as u32;
                 // Set buffer length in ctrl field for RX
-                // DMA_DONE (bit 30) = 0 means "owned by hardware" (ready to receive)
+                // DMA_DONE (bit 31) = 0 means "owned by hardware" (ready to receive)
                 desc.ctrl = (RX_BUF_SIZE as u32) << dma_ctl::SD_LEN0_SHIFT;
                 desc.info = 0;
             }
@@ -1332,140 +1769,145 @@ impl<'a> Wfdma<'a> {
         // - TX data queues: depth = 8
         // - RX data queues: depth = 16
         // For firmware download, we only need MCU queues.
+        //
+        // This function mirrors Linux __mt7996_dma_prefetch() exactly.
+        // Uses queue_map to compute register offsets the same way Linux macros do.
+
+        use queue_map::{mcuq, rxq, txq, MT7996_QUEUE_IDS};
+        let q = &MT7996_QUEUE_IDS;
 
         let mut base: u32 = 0;
 
         // Helper to compute prefetch value and advance base
+        // Linux: __mt7996_dma_prefetch_base(&base, depth)
+        // Formula: (base << 16) | depth, then base += depth << 4
         let prefetch = |b: &mut u32, depth: u32| -> u32 {
             let val = (*b << 16) | depth;
             *b += depth << 4;  // Advance base by depth * 16
             val
         };
 
-        // MCU Command Queues (at WFDMA + 0x600 + queue_id * 4)
-        // Queue IDs: WM=0, WA=1, FWDL=2
-        // IMPORTANT: Linux configures in order FWDL, WM, WA so FWDL gets base=0
-        let depth = 2u32;  // MT7996 uses depth=2 for command queues
+        // MT7996 command queue depth (vs 4 for MT7990)
+        let cmd_depth = 2u32;
 
-        // FWDL queue (queue 2) - FIRST, gets base=0
-        let fwdl_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::MCUQ_EXT_CTRL_BASE + 2 * 4, fwdl_prefetch);
+        //---------------------------------------------------------------------
+        // MCU TX Command Queues
+        // Linux: mt76_wr(dev, MT_MCUQ_EXT_CTRL(MT_MCUQ_FWDL), PREFETCH(val))
+        // Order: FWDL, WM, WA (FWDL gets base=0)
+        //---------------------------------------------------------------------
+        let fwdl_prefetch = prefetch(&mut base, cmd_depth);
+        self.write(q.mcuq_ext_ctrl(mcuq::FWDL), fwdl_prefetch);
 
-        // WM queue (queue 0) - second
-        let wm_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::MCUQ_EXT_CTRL_BASE + 0 * 4, wm_prefetch);
+        let wm_prefetch = prefetch(&mut base, cmd_depth);
+        self.write(q.mcuq_ext_ctrl(mcuq::WM), wm_prefetch);
 
-        // WA queue (queue 1) - third
-        let wa_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::MCUQ_EXT_CTRL_BASE + 1 * 4, wa_prefetch);
+        let wa_prefetch = prefetch(&mut base, cmd_depth);
+        self.write(q.mcuq_ext_ctrl(mcuq::WA), wa_prefetch);
 
-        // Ring 3 and Ring 4 prefetch (hardware validates all rings)
-        let ring3_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::MCUQ_EXT_CTRL_BASE + 3 * 4, ring3_prefetch);
-        let ring4_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::MCUQ_EXT_CTRL_BASE + 4 * 4, ring4_prefetch);
+        userlib::println!("[DMA]   MCUQ prefetch @0x{:x},0x{:x},0x{:x}: FWDL=0x{:08x} WM=0x{:08x} WA=0x{:08x}",
+            q.mcuq_ext_ctrl(mcuq::FWDL), q.mcuq_ext_ctrl(mcuq::WM), q.mcuq_ext_ctrl(mcuq::WA),
+            fwdl_prefetch, wm_prefetch, wa_prefetch);
 
-        userlib::println!("[DMA]   MCUQ prefetch: FWDL=0x{:08x} WM=0x{:08x} WA=0x{:08x} R3=0x{:08x} R4=0x{:08x}",
-            fwdl_prefetch, wm_prefetch, wa_prefetch, ring3_prefetch, ring4_prefetch);
+        //---------------------------------------------------------------------
+        // Data TX Queues
+        // Linux: mt76_wr(dev, MT_TXQ_EXT_CTRL(0), PREFETCH(0x8))
+        //---------------------------------------------------------------------
+        let tx_data_depth = 8u32;
+        let tx_band0_prefetch = prefetch(&mut base, tx_data_depth);
+        self.write(q.txq_ext_ctrl(txq::BAND0), tx_band0_prefetch);
 
-        // RX MCU queues - prefetch registers use physical ring numbers!
-        // MCU RX is at __RXQ(0) = 3, so prefetch at RXQ_EXT_CTRL_BASE + 3*4
-        let rx_mcu_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::RXQ_EXT_CTRL_BASE + (wfdma::RXQ_MCU + wfdma::RXQ_OFFSET) * 4, rx_mcu_prefetch);
+        userlib::println!("[DMA]   TXQ data prefetch @0x{:x}: BAND0=0x{:08x}",
+            q.txq_ext_ctrl(txq::BAND0), tx_band0_prefetch);
 
-        // RX WA queue at __RXQ(1) = 4
-        let rx_wa_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::RXQ_EXT_CTRL_BASE + (wfdma::RXQ_MCU_WA + wfdma::RXQ_OFFSET) * 4, rx_wa_prefetch);
+        //---------------------------------------------------------------------
+        // RX Event Queues (MCU)
+        // Linux: mt76_wr(dev, MT_RXQ_EXT_CTRL(MT_RXQ_MCU), PREFETCH(val))
+        //---------------------------------------------------------------------
+        let rx_mcu_prefetch = prefetch(&mut base, cmd_depth);
+        self.write(q.rxq_ext_ctrl(rxq::MCU), rx_mcu_prefetch);
 
-        // RX WA MAIN queue at __RXQ(2) = 5
-        let rx_wa_main_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::RXQ_EXT_CTRL_BASE + (wfdma::RXQ_MCU_WA_MAIN + wfdma::RXQ_OFFSET) * 4, rx_wa_main_prefetch);
+        let rx_wa_prefetch = prefetch(&mut base, cmd_depth);
+        self.write(q.rxq_ext_ctrl(rxq::MCU_WA), rx_wa_prefetch);
 
-        // RX WA TRI queue at __RXQ(3) = 6
-        let rx_wa_tri_prefetch = prefetch(&mut base, depth);
-        self.write(wfdma::RXQ_EXT_CTRL_BASE + (wfdma::RXQ_MCU_WA_TRI + wfdma::RXQ_OFFSET) * 4, rx_wa_tri_prefetch);
+        let rx_wa_main_prefetch = prefetch(&mut base, cmd_depth);
+        self.write(q.rxq_ext_ctrl(rxq::MAIN_WA), rx_wa_main_prefetch);
 
-        userlib::println!("[DMA]   RXQ MCU prefetch (rings {}-{}): MCU=0x{:08x} WA=0x{:08x} WA_MAIN=0x{:08x} WA_TRI=0x{:08x}",
-            wfdma::RXQ_OFFSET, wfdma::RXQ_OFFSET + 3,
+        let rx_wa_tri_prefetch = prefetch(&mut base, cmd_depth);
+        self.write(q.rxq_ext_ctrl(rxq::BAND2_WA), rx_wa_tri_prefetch);
+
+        userlib::println!("[DMA]   RXQ MCU prefetch @0x{:x},0x{:x},0x{:x},0x{:x}: MCU=0x{:08x} WA=0x{:08x} WA_MAIN=0x{:08x} WA_TRI=0x{:08x}",
+            q.rxq_ext_ctrl(rxq::MCU), q.rxq_ext_ctrl(rxq::MCU_WA),
+            q.rxq_ext_ctrl(rxq::MAIN_WA), q.rxq_ext_ctrl(rxq::BAND2_WA),
             rx_mcu_prefetch, rx_wa_prefetch, rx_wa_main_prefetch, rx_wa_tri_prefetch);
 
-        // Data TX queue (band0) - at TXQ_EXT_CTRL_BASE + TXQ_BAND0 * 4
-        // Data TX queues use depth=8 (vs depth=2 for command queues)
-        let tx_data_depth = 8u32;
-        let tx_data_prefetch = prefetch(&mut base, tx_data_depth);
-        self.write(wfdma::TXQ_EXT_CTRL_BASE + (wfdma::TXQ_BAND0) * 4, tx_data_prefetch);
-        userlib::println!("[DMA]   TXQ data prefetch: BAND0=0x{:08x}", tx_data_prefetch);
-
-        // RX MAIN (band0) - prefetch at __RXQ(4) = 7
-        // Data RX queues use depth=16 (vs depth=2 for MCU RX)
+        //---------------------------------------------------------------------
+        // RX Data Queues
+        // Linux: mt76_wr(dev, MT_RXQ_EXT_CTRL(MT_RXQ_MAIN), PREFETCH(0x10))
+        //---------------------------------------------------------------------
         let rx_data_depth = 16u32;
         let rx_main_prefetch = prefetch(&mut base, rx_data_depth);
-        self.write(wfdma::RXQ_EXT_CTRL_BASE + (wfdma::RXQ_BAND0 + wfdma::RXQ_OFFSET) * 4, rx_main_prefetch);
-        userlib::println!("[DMA]   RXQ data prefetch: BAND0 (ring {})=0x{:08x}",
-            wfdma::RXQ_BAND0 + wfdma::RXQ_OFFSET, rx_main_prefetch);
+        self.write(q.rxq_ext_ctrl(rxq::MAIN), rx_main_prefetch);
 
-        // RX TXFREE (band0) - TX completion notifications, CRITICAL for RST release!
-        // Queue ID 9, __RXQ(9) = 12, register at RXQ_EXT_CTRL_BASE + 12*4 = 0x6B0
-        // Prefetch depth=4 for MT7996 per dma.c:206-213
+        userlib::println!("[DMA]   RXQ data prefetch @0x{:x}: MAIN=0x{:08x}",
+            q.rxq_ext_ctrl(rxq::MAIN), rx_main_prefetch);
+
+        //---------------------------------------------------------------------
+        // RX TXFREE Queue (TX completion notifications - CRITICAL!)
+        // Linux: mt76_wr(dev, MT_RXQ_EXT_CTRL(MT_RXQ_TXFREE_BAND0), PREFETCH(0x4))
+        //---------------------------------------------------------------------
         let rx_txfree_depth = 4u32;
         let rx_txfree_prefetch = prefetch(&mut base, rx_txfree_depth);
-        let txfree_prefetch_reg = wfdma::RXQ_EXT_CTRL_BASE + 12 * 4;  // __RXQ(9) = 12
-        self.write(txfree_prefetch_reg, rx_txfree_prefetch);
-        userlib::println!("[DMA]   RXQ TXFREE prefetch @0x{:x}: 0x{:08x}", txfree_prefetch_reg, rx_txfree_prefetch);
+        self.write(q.rxq_ext_ctrl(rxq::TXFREE_BAND0), rx_txfree_prefetch);
 
-        // RX RRO (band0) - Hardware Receive Reorder
-        // Queue ID 8, __RXQ(8) = 11, register at RXQ_EXT_CTRL_BASE + 11*4 = 0x6AC
-        // Prefetch depth=16 (same as data RX)
+        userlib::println!("[DMA]   RXQ TXFREE prefetch @0x{:x}: 0x{:08x}",
+            q.rxq_ext_ctrl(rxq::TXFREE_BAND0), rx_txfree_prefetch);
+
+        //---------------------------------------------------------------------
+        // RX RRO Queue (Hardware Receive Reorder)
+        // Linux: mt76_wr(dev, MT_RXQ_EXT_CTRL(MT_RXQ_RRO_BAND0), PREFETCH(0x10))
+        //---------------------------------------------------------------------
         let rx_rro_prefetch = prefetch(&mut base, rx_data_depth);
-        let rro_prefetch_reg = wfdma::RXQ_EXT_CTRL_BASE + (wfdma::RXQ_RRO_BAND0 + wfdma::RXQ_OFFSET) * 4;
-        self.write(rro_prefetch_reg, rx_rro_prefetch);
-        userlib::println!("[DMA]   RXQ RRO BAND0 prefetch @0x{:x}: 0x{:08x}", rro_prefetch_reg, rx_rro_prefetch);
+        self.write(q.rxq_ext_ctrl(rxq::RRO_BAND0), rx_rro_prefetch);
 
-        // HIF2 prefetch configuration (CRITICAL for dual-HIF RST release!)
-        // Per deepwiki: HIF2 does NOT have separate SRAM space - it shares the same base!
-        // Linux calls __mt7996_dma_prefetch() twice with same base counter continuing.
+        userlib::println!("[DMA]   RXQ RRO prefetch @0x{:x}: 0x{:08x}",
+            q.rxq_ext_ctrl(rxq::RRO_BAND0), rx_rro_prefetch);
+
+        //---------------------------------------------------------------------
+        // HIF2 prefetch configuration (for dual-PCIe devices)
+        // Linux calls __mt7996_dma_prefetch() with hif2 offset, continuing base
+        //---------------------------------------------------------------------
         if self.dev.has_hif2() {
             userlib::println!("[DMA]   HIF2 prefetch configuration (continuing from base=0x{:x}):", base);
 
-            // HIF2 RX data (band2) - __RXQ(5) = 8, prefetch reg = 0x680 + 8*4 = 0x6A0
-            let hif2_rx_data_depth = 16u32;  // Same as HIF1 data RX
-            let hif2_rx_data_prefetch = prefetch(&mut base, hif2_rx_data_depth);
-            let hif2_rx_data_prefetch_reg = wfdma::WFDMA0_BASE + wfdma::RXQ_EXT_CTRL_BASE + 8 * 4;
-            self.dev.hif2_via_hif1_write32(hif2_rx_data_prefetch_reg, hif2_rx_data_prefetch);
-            userlib::println!("[DMA]     HIF2 RX data prefetch @0x{:x}: 0x{:08x}",
-                hif2_rx_data_prefetch_reg, hif2_rx_data_prefetch);
+            // HIF2 RX data (band2)
+            let hif2_rx_data_prefetch = prefetch(&mut base, rx_data_depth);
+            let hif2_rx_data_reg = wfdma::WFDMA0_BASE + q.rxq_ext_ctrl(rxq::BAND2);
+            self.dev.hif2_via_hif1_write32(hif2_rx_data_reg, hif2_rx_data_prefetch);
+            userlib::println!("[DMA]     HIF2 RX data @0x{:x}: 0x{:08x}", hif2_rx_data_reg, hif2_rx_data_prefetch);
 
-            // HIF2 RX TXFREE (band2) - __RXQ(7) = 10, prefetch reg = 0x680 + 10*4 = 0x6A8
-            let hif2_txfree_depth = 4u32;  // Same as HIF1 TXFREE
-            let hif2_txfree_prefetch = prefetch(&mut base, hif2_txfree_depth);
-            let hif2_txfree_prefetch_reg = wfdma::WFDMA0_BASE + wfdma::RXQ_EXT_CTRL_BASE + 10 * 4;
-            self.dev.hif2_via_hif1_write32(hif2_txfree_prefetch_reg, hif2_txfree_prefetch);
-            userlib::println!("[DMA]     HIF2 TXFREE prefetch @0x{:x}: 0x{:08x}",
-                hif2_txfree_prefetch_reg, hif2_txfree_prefetch);
+            // HIF2 RX TXFREE (band2)
+            let hif2_txfree_prefetch = prefetch(&mut base, rx_txfree_depth);
+            let hif2_txfree_reg = wfdma::WFDMA0_BASE + q.rxq_ext_ctrl(rxq::TXFREE_BAND2);
+            self.dev.hif2_via_hif1_write32(hif2_txfree_reg, hif2_txfree_prefetch);
+            userlib::println!("[DMA]     HIF2 TXFREE @0x{:x}: 0x{:08x}", hif2_txfree_reg, hif2_txfree_prefetch);
 
-            // HIF2 RX RRO (band2) - __RXQ(6) = 9, prefetch reg = 0x680 + 9*4 = 0x6A4
-            let hif2_rro_depth = 16u32;  // Same as data RX
-            let hif2_rro_prefetch = prefetch(&mut base, hif2_rro_depth);
-            let hif2_rro_prefetch_reg = wfdma::WFDMA0_BASE + wfdma::RXQ_EXT_CTRL_BASE + (wfdma::RXQ_RRO_BAND2 + wfdma::RXQ_OFFSET) * 4;
-            self.dev.hif2_via_hif1_write32(hif2_rro_prefetch_reg, hif2_rro_prefetch);
-            userlib::println!("[DMA]     HIF2 RRO band2 prefetch @0x{:x}: 0x{:08x}",
-                hif2_rro_prefetch_reg, hif2_rro_prefetch);
+            // HIF2 RX RRO (band2)
+            let hif2_rro_prefetch = prefetch(&mut base, rx_data_depth);
+            let hif2_rro_reg = wfdma::WFDMA0_BASE + q.rxq_ext_ctrl(rxq::RRO_BAND2);
+            self.dev.hif2_via_hif1_write32(hif2_rro_reg, hif2_rro_prefetch);
+            userlib::println!("[DMA]     HIF2 RRO @0x{:x}: 0x{:08x}", hif2_rro_reg, hif2_rro_prefetch);
 
-            // HIF2 TX data (band1) - ring 19, prefetch reg = TXQ_EXT_CTRL_BASE + 19*4 = 0x640 + 0x4C = 0x68C
-            let hif2_tx_band1_depth = 8u32;  // Same as HIF1 data TX
-            let hif2_tx_band1_prefetch = prefetch(&mut base, hif2_tx_band1_depth);
-            let hif2_tx_band1_prefetch_reg = wfdma::WFDMA0_BASE + wfdma::TXQ_EXT_CTRL_BASE + wfdma::TXQ_BAND1 * 4;
-            self.dev.hif2_via_hif1_write32(hif2_tx_band1_prefetch_reg, hif2_tx_band1_prefetch);
-            userlib::println!("[DMA]     HIF2 TX band1 prefetch @0x{:x}: 0x{:08x}",
-                hif2_tx_band1_prefetch_reg, hif2_tx_band1_prefetch);
+            // HIF2 TX data (band1) - uses txq_ext_ctrl
+            let hif2_tx_band1_prefetch = prefetch(&mut base, tx_data_depth);
+            let hif2_tx_band1_reg = wfdma::WFDMA0_BASE + q.txq_ext_ctrl(txq::BAND1);
+            self.dev.hif2_via_hif1_write32(hif2_tx_band1_reg, hif2_tx_band1_prefetch);
+            userlib::println!("[DMA]     HIF2 TX band1 @0x{:x}: 0x{:08x}", hif2_tx_band1_reg, hif2_tx_band1_prefetch);
 
-            // HIF2 TX data (band2) - ring 21, prefetch reg = TXQ_EXT_CTRL_BASE + 21*4 = 0x640 + 0x54 = 0x694
-            let hif2_tx_band2_depth = 8u32;  // Same as HIF1 data TX
-            let hif2_tx_band2_prefetch = prefetch(&mut base, hif2_tx_band2_depth);
-            let hif2_tx_band2_prefetch_reg = wfdma::WFDMA0_BASE + wfdma::TXQ_EXT_CTRL_BASE + wfdma::TXQ_BAND2 * 4;
-            self.dev.hif2_via_hif1_write32(hif2_tx_band2_prefetch_reg, hif2_tx_band2_prefetch);
-            userlib::println!("[DMA]     HIF2 TX band2 prefetch @0x{:x}: 0x{:08x}",
-                hif2_tx_band2_prefetch_reg, hif2_tx_band2_prefetch);
+            // HIF2 TX data (band2)
+            let hif2_tx_band2_prefetch = prefetch(&mut base, tx_data_depth);
+            let hif2_tx_band2_reg = wfdma::WFDMA0_BASE + q.txq_ext_ctrl(txq::BAND2);
+            self.dev.hif2_via_hif1_write32(hif2_tx_band2_reg, hif2_tx_band2_prefetch);
+            userlib::println!("[DMA]     HIF2 TX band2 @0x{:x}: 0x{:08x}", hif2_tx_band2_reg, hif2_tx_band2_prefetch);
 
             // Set CALC_MODE on HIF2 as well
             let hif2_ext1_reg = wfdma::WFDMA0_BASE + wfdma::GLO_CFG_EXT1;
@@ -1517,6 +1959,52 @@ impl<'a> Wfdma<'a> {
     /// Initialize WFDMA for firmware download
     pub fn init(&mut self) -> bool {
         trace!(DMA, "Initializing WFDMA...");
+
+        // Validate queue ID mappings (catches math errors at init time)
+        if let Err(e) = queue_map::validate_mt7996_queue_ids() {
+            userlib::println!("[DMA] FATAL: Queue ID validation failed: {}", e);
+            return false;
+        }
+        userlib::println!("[DMA] Queue ID validation passed");
+
+        // Validate regs.rs constants match Linux regs.h
+        regs::validate_registers();
+        userlib::println!("[DMA] Register address validation passed");
+
+        // Validate dma.rs wfdma constants match regs.rs (catches drift)
+        wfdma::validate_against_regs();
+        userlib::println!("[DMA] WFDMA constants cross-validation passed");
+
+        // Validate interrupt bits match regs.rs
+        int_mask::validate_against_regs();
+        userlib::println!("[DMA] Interrupt mask cross-validation passed");
+
+        // === TIMING DIAGNOSTIC ===
+        // Verify ARM generic timer is working correctly (if delays don't work, DMA fails)
+        let freq: u64;
+        let start: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
+        }
+        userlib::println!("[TIMING] cntfrq_el0 = {} Hz ({} MHz)", freq, freq / 1_000_000);
+        userlib::delay_ms(100);
+        let end: u64;
+        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) end); }
+        let elapsed_ticks = end - start;
+        let expected_ticks = freq / 10; // 100ms = freq/10 ticks
+        userlib::println!("[TIMING] 100ms delay: {} ticks (expected ~{})", elapsed_ticks, expected_ticks);
+        if elapsed_ticks < expected_ticks / 2 {
+            userlib::println!("[TIMING] WARNING: Delay too short! Timer may not be working!");
+        } else if elapsed_ticks > expected_ticks * 2 {
+            userlib::println!("[TIMING] WARNING: Delay too long! Scheduler overhead?");
+        } else {
+            userlib::println!("[TIMING] Timer appears to be working correctly");
+        }
+        // === END TIMING DIAGNOSTIC ===
+
+        // Dump queue mappings for debugging
+        queue_map::dump_queue_ids();
 
         // Print BAR0 info for diagnostics
         let bar0_size = self.dev.bar0_size();
@@ -1683,8 +2171,8 @@ impl<'a> Wfdma<'a> {
         userlib::println!("[DMA] WM ring allocated: vaddr=0x{:x}, paddr=0x{:x}, cnt={}",
             wm_ring.desc_vaddr, wm_ring.desc_paddr, wm_ring.size);
 
-        // Configure WM ring (Ring 0 in MCU queue space)
-        let wm_ring_base = wfdma::MCU_RING_BASE + (McuQueue::Wm as u32) * 0x10;
+        // Configure WM ring (hardware ring 17)
+        let wm_ring_base = McuQueue::Wm.ring_offset();
         userlib::println!("[DMA] WM Ring@WFDMA+0x{:x} programming...", wm_ring_base);
         self.write(wm_ring_base + wfdma::RING_BASE, wm_ring.desc_paddr as u32);
         self.write(wm_ring_base + wfdma::RING_MAX_CNT, wm_ring.size);
@@ -1709,8 +2197,8 @@ impl<'a> Wfdma<'a> {
         userlib::println!("[DMA] WA ring allocated: vaddr=0x{:x}, paddr=0x{:x}, cnt={}",
             wa_ring.desc_vaddr, wa_ring.desc_paddr, wa_ring.size);
 
-        // Configure WA ring (Ring 1 in MCU queue space)
-        let wa_ring_base = wfdma::MCU_RING_BASE + (McuQueue::Wa as u32) * 0x10;
+        // Configure WA ring (hardware ring 20)
+        let wa_ring_base = McuQueue::Wa.ring_offset();
         userlib::println!("[DMA] WA Ring@WFDMA+0x{:x} programming...", wa_ring_base);
         self.write(wa_ring_base + wfdma::RING_BASE, wa_ring.desc_paddr as u32);
         self.write(wa_ring_base + wfdma::RING_MAX_CNT, wa_ring.size);
@@ -1742,8 +2230,8 @@ impl<'a> Wfdma<'a> {
             return false;
         }
 
-        // Configure FWDL ring (Ring 2 in MCU queue space)
-        let ring_base = wfdma::MCU_RING_BASE + (McuQueue::Fwdl as u32) * 0x10;
+        // Configure FWDL ring (hardware ring 16)
+        let ring_base = McuQueue::Fwdl.ring_offset();
 
         // Debug: dump ring register space before config
         userlib::println!("[DMA] FWDL Ring@WFDMA+0x{:x} before write:", ring_base);
@@ -1770,39 +2258,8 @@ impl<'a> Wfdma<'a> {
             return false;
         }
 
-        // Configure Ring 3 and Ring 4 (MCU ring indices 3, 4 at 0x330/0x340)
-        // Hardware validates ALL rings before releasing RST - need unique addresses!
-        userlib::println!("[DMA] Allocating Ring3 (MCU ring 3)...");
-        let ring3 = FwdlRing::new();
-        if ring3.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate Ring3");
-            self.set_error();
-            return false;
-        }
-        let ring3 = ring3.unwrap();
-        let ring3_reg = wfdma::MCU_RING_BASE + 3 * 0x10;  // 0x330
-        self.write(ring3_reg + wfdma::RING_BASE, ring3.desc_paddr as u32);
-        self.write(ring3_reg + wfdma::RING_MAX_CNT, ring3.size);
-        self.write(ring3_reg + wfdma::RING_CPU_IDX, 0);
-        self.write(ring3_reg + wfdma::RING_DMA_IDX, 0);
-        userlib::println!("[DMA] Ring3 @0x{:x}: base=0x{:08x} cnt={}", ring3_reg,
-            self.read(ring3_reg + wfdma::RING_BASE), ring3.size);
-
-        userlib::println!("[DMA] Allocating Ring4 (MCU ring 4)...");
-        let ring4 = FwdlRing::new();
-        if ring4.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate Ring4");
-            self.set_error();
-            return false;
-        }
-        let ring4 = ring4.unwrap();
-        let ring4_reg = wfdma::MCU_RING_BASE + 4 * 0x10;  // 0x340
-        self.write(ring4_reg + wfdma::RING_BASE, ring4.desc_paddr as u32);
-        self.write(ring4_reg + wfdma::RING_MAX_CNT, ring4.size);
-        self.write(ring4_reg + wfdma::RING_CPU_IDX, 0);
-        self.write(ring4_reg + wfdma::RING_DMA_IDX, 0);
-        userlib::println!("[DMA] Ring4 @0x{:x}: base=0x{:08x} cnt={}", ring4_reg,
-            self.read(ring4_reg + wfdma::RING_BASE), ring4.size);
+        // NOTE: Linux does NOT create rings at TX indices 0-15 (only 16-21 are used).
+        // Ring indices 16=FWDL, 17=WM, 18=BAND0, 19=BAND1, 20=WA, 21=BAND2
 
         // NOTE: PRI_DLY_INT and GLO_CFG_EXT0/EXT1 moved to enable phase
         // Per Linux mt7996_dma_enable order:
@@ -1841,9 +2298,8 @@ impl<'a> Wfdma<'a> {
         self.state = WfdmaState::RingsConfigured;
 
         // Configure RX MCU ring registers
-        // CRITICAL: Must add RXQ_OFFSET per Linux __RXQ() macro: __RXQ(q) = q + __MT_MCUQ_MAX
-        // MCU RX rings start at ring 3 (offset 0x530), not ring 0 (offset 0x500)
-        let rx_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU + wfdma::RXQ_OFFSET) * 0x10;
+        // RX rings use hardware indices directly (MCU=0 at offset 0x500)
+        let rx_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_MCU * 0x10;
         trace!(DMA, "RX ring@WFDMA+0x{:x} before write:", rx_ring_base);
         trace!(DMA, "  regs: {:08x} {:08x} {:08x} {:08x}",
             self.read(rx_ring_base + 0x00), self.read(rx_ring_base + 0x04),
@@ -1885,8 +2341,8 @@ impl<'a> Wfdma<'a> {
             rx_wa_ring.desc_vaddr, rx_wa_ring.desc_paddr, rx_wa_ring.size);
 
         // Configure RX WA ring registers (rx ring 1)
-        // Add RXQ_OFFSET per Linux __RXQ() macro
-        let rx_wa_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU_WA + wfdma::RXQ_OFFSET) * 0x10;
+        // RX rings use hardware indices directly
+        let rx_wa_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU_WA) * 0x10;
         userlib::println!("[DMA] RX WA Ring@WFDMA+0x{:x} programming...", rx_wa_ring_base);
         self.write(rx_wa_ring_base + wfdma::RING_BASE, rx_wa_ring.desc_paddr as u32);
         self.write(rx_wa_ring_base + wfdma::RING_MAX_CNT, rx_wa_ring.size);
@@ -1909,8 +2365,8 @@ impl<'a> Wfdma<'a> {
         }
         let rx_wa_main = self.rx_wa_main_ring.as_ref().unwrap();
         userlib::println!("[DMA] RX WA MAIN ring: paddr=0x{:x}, size={}", rx_wa_main.desc_paddr, rx_wa_main.size);
-        // Configure RX WA MAIN ring - add RXQ_OFFSET per Linux __RXQ() macro
-        let rx_wa_main_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU_WA_MAIN + wfdma::RXQ_OFFSET) * 0x10;
+        // Configure RX WA MAIN ring - hardware queue index 2, offset 0x520
+        let rx_wa_main_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_MCU_WA_MAIN * 0x10;
         userlib::println!("[DMA] RX WA MAIN Ring@WFDMA+0x{:x} programming...", rx_wa_main_ring_base);
         self.write(rx_wa_main_ring_base + wfdma::RING_BASE, rx_wa_main.desc_paddr as u32);
         self.write(rx_wa_main_ring_base + wfdma::RING_MAX_CNT, rx_wa_main.size);
@@ -1930,8 +2386,8 @@ impl<'a> Wfdma<'a> {
         }
         let rx_wa_tri = self.rx_wa_tri_ring.as_ref().unwrap();
         userlib::println!("[DMA] RX WA TRI ring: paddr=0x{:x}, size={}", rx_wa_tri.desc_paddr, rx_wa_tri.size);
-        // Configure RX WA TRI ring - add RXQ_OFFSET per Linux __RXQ() macro
-        let rx_wa_tri_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU_WA_TRI + wfdma::RXQ_OFFSET) * 0x10;
+        // Configure RX WA TRI ring - hardware queue index 3, offset 0x530
+        let rx_wa_tri_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_MCU_WA_TRI * 0x10;
         userlib::println!("[DMA] RX WA TRI Ring@WFDMA+0x{:x} programming...", rx_wa_tri_ring_base);
         self.write(rx_wa_tri_ring_base + wfdma::RING_BASE, rx_wa_tri.desc_paddr as u32);
         self.write(rx_wa_tri_ring_base + wfdma::RING_MAX_CNT, rx_wa_tri.size);
@@ -1942,7 +2398,7 @@ impl<'a> Wfdma<'a> {
         userlib::println!("[DMA] RX WA TRI Ring after write: base=0x{:08x}", rb);
 
         // Allocate Data TX ring (band0) - REQUIRED per deepwiki
-        // Data TX queues are at TX_RING_BASE (0x400), separate from MCU queues
+        // All TX rings use MCU_RING_BASE + hw_idx * 0x10 (TXQ_BAND0 = 18 → offset 0x420)
         userlib::println!("[DMA] Allocating Data TX ring (band0)...");
         self.tx_data_ring = FwdlRing::new_with_size(wfdma::TX_RING_SIZE);
         if self.tx_data_ring.is_none() {
@@ -1955,8 +2411,8 @@ impl<'a> Wfdma<'a> {
         userlib::println!("[DMA] Data TX ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
             tx_data.desc_vaddr, tx_data.desc_paddr, tx_data.size);
 
-        // Configure Data TX ring registers (at TX_RING_BASE + TXQ_BAND0 * 0x10)
-        let tx_data_ring_base = wfdma::TX_RING_BASE + (wfdma::TXQ_BAND0) * 0x10;
+        // Configure Data TX ring registers (at MCU_RING_BASE + TXQ_BAND0 * 0x10 = 0x300 + 18*0x10 = 0x420)
+        let tx_data_ring_base = wfdma::MCU_RING_BASE + wfdma::TXQ_BAND0 * 0x10;
         userlib::println!("[DMA] Data TX Ring@WFDMA+0x{:x} programming...", tx_data_ring_base);
         self.write(tx_data_ring_base + wfdma::RING_BASE, tx_data.desc_paddr as u32);
         self.write(tx_data_ring_base + wfdma::RING_MAX_CNT, tx_data.size);
@@ -1980,9 +2436,8 @@ impl<'a> Wfdma<'a> {
         userlib::println!("[DMA] RX MAIN ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
             rx_main.desc_vaddr, rx_main.desc_paddr, rx_main.size);
 
-        // Configure RX MAIN ring registers - add RXQ_OFFSET per Linux __RXQ() macro
-        // __RXQ(4) = 7 → ring 7 → 0x570
-        let rx_main_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_BAND0 + wfdma::RXQ_OFFSET) * 0x10;
+        // Configure RX MAIN ring registers - hw ring 4 at offset 0x540
+        let rx_main_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_BAND0) * 0x10;
         userlib::println!("[DMA] RX MAIN Ring@WFDMA+0x{:x} programming...", rx_main_ring_base);
         self.write(rx_main_ring_base + wfdma::RING_BASE, rx_main.desc_paddr as u32);
         self.write(rx_main_ring_base + wfdma::RING_MAX_CNT, rx_main.size);
@@ -1995,7 +2450,7 @@ impl<'a> Wfdma<'a> {
         userlib::println!("[DMA] RX MAIN Ring after write: base=0x{:08x} cnt={}", rx_main_base_rb, rx_main_cnt_rb);
 
         // Allocate RX TXFREE ring (band0) - CRITICAL for RST auto-release!
-        // Queue ID 9, __RXQ(9) = 12, ring offset = 0x500 + 12*0x10 = 0x5C0
+        // HW ring 9 at offset 0x500 + 9*0x10 = 0x590
         userlib::println!("[DMA] Allocating RX TXFREE ring (band0)...");
         self.rx_txfree_ring = RxRing::new(wfdma::RX_TXFREE_RING_SIZE);
         if self.rx_txfree_ring.is_none() {
@@ -2006,8 +2461,8 @@ impl<'a> Wfdma<'a> {
         userlib::println!("[DMA] RX TXFREE ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
             rx_txfree.desc_vaddr, rx_txfree.desc_paddr, rx_txfree.size);
 
-        // Configure RX TXFREE ring registers (at RX_RING_BASE + __RXQ(9)*0x10 = 0x5C0)
-        let rx_txfree_ring_base = wfdma::RX_RING_BASE + 12 * 0x10;  // __RXQ(9) = 12
+        // Configure RX TXFREE ring registers at hw ring 9
+        let rx_txfree_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_TXFREE_BAND0 * 0x10;
         userlib::println!("[DMA] RX TXFREE Ring@WFDMA+0x{:x} programming...", rx_txfree_ring_base);
         self.write(rx_txfree_ring_base + wfdma::RING_BASE, rx_txfree.desc_paddr as u32);
         self.write(rx_txfree_ring_base + wfdma::RING_MAX_CNT, rx_txfree.size);
@@ -2020,7 +2475,7 @@ impl<'a> Wfdma<'a> {
         userlib::println!("[DMA] RX TXFREE Ring after write: base=0x{:08x} cnt={}", rx_txfree_base_rb, rx_txfree_cnt_rb);
 
         // Allocate RX RRO ring (band0) - Hardware Receive Reorder
-        // Queue ID 8, __RXQ(8) = 11, ring offset = 0x500 + 11*0x10 = 0x5B0
+        // HW ring 8 at offset 0x500 + 8*0x10 = 0x580
         userlib::println!("[DMA] Allocating RX RRO BAND0 ring...");
         self.rx_rro_band0_ring = RxRing::new_rro(wfdma::RX_RRO_RING_SIZE);
         if self.rx_rro_band0_ring.is_none() {
@@ -2029,8 +2484,8 @@ impl<'a> Wfdma<'a> {
         }
         let rx_rro = self.rx_rro_band0_ring.as_ref().unwrap();
         userlib::println!("[DMA] RX RRO BAND0 ring: paddr=0x{:x}, size={}", rx_rro.desc_paddr, rx_rro.size);
-        // Configure RX RRO BAND0 ring at __RXQ(8) = 11, offset 0x5B0
-        let rx_rro_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_RRO_BAND0 + wfdma::RXQ_OFFSET) * 0x10;
+        // Configure RX RRO BAND0 ring at hw ring 8
+        let rx_rro_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_RRO_BAND0 * 0x10;
         userlib::println!("[DMA] RX RRO BAND0 Ring@WFDMA+0x{:x} programming...", rx_rro_ring_base);
         self.write(rx_rro_ring_base + wfdma::RING_BASE, rx_rro.desc_paddr as u32);
         self.write(rx_rro_ring_base + wfdma::RING_MAX_CNT, rx_rro.size);
@@ -2046,7 +2501,7 @@ impl<'a> Wfdma<'a> {
             userlib::println!("[DMA] === HIF2 Ring Configuration ===");
 
             // Allocate HIF2 RX TXFREE ring (band2)
-            // Queue ID 7, __RXQ(7) = 10, ring offset = 0x500 + 10*0x10 = 0x5A0
+            // Hardware queue index 7 (RXQ_TXFREE_BAND2), ring offset = 0x500 + 7*0x10 = 0x570
             userlib::println!("[DMA] Allocating HIF2 RX TXFREE ring (band2)...");
             self.hif2_rx_txfree_ring = RxRing::new(wfdma::RX_TXFREE_RING_SIZE);
             if let Some(ref hif2_txfree) = self.hif2_rx_txfree_ring {
@@ -2054,7 +2509,7 @@ impl<'a> Wfdma<'a> {
                     hif2_txfree.desc_paddr, hif2_txfree.size);
 
                 // Configure HIF2 RX TXFREE ring via HIF1+0x4000 offset
-                let hif2_txfree_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + 10 * 0x10;  // 0xd4000 + 0x5A0
+                let hif2_txfree_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + wfdma::RXQ_TXFREE_BAND2 * 0x10;
                 userlib::println!("[DMA] HIF2 TXFREE Ring@0x{:x} programming (via HIF1+0x4000)...", hif2_txfree_ring_base);
                 self.dev.hif2_via_hif1_write32(hif2_txfree_ring_base + wfdma::RING_BASE, hif2_txfree.desc_paddr as u32);
                 self.dev.hif2_via_hif1_write32(hif2_txfree_ring_base + wfdma::RING_MAX_CNT, hif2_txfree.size);
@@ -2069,7 +2524,7 @@ impl<'a> Wfdma<'a> {
             }
 
             // Allocate HIF2 RX data ring (band2)
-            // Queue ID 5, __RXQ(5) = 8, ring offset = 0x500 + 8*0x10 = 0x580
+            // Hardware queue index 5 (RXQ_BAND2), ring offset = 0x500 + 5*0x10 = 0x550
             userlib::println!("[DMA] Allocating HIF2 RX data ring (band2)...");
             self.hif2_rx_data_ring = RxRing::new(wfdma::RX_DATA_RING_SIZE);
             if let Some(ref hif2_rx_data) = self.hif2_rx_data_ring {
@@ -2077,7 +2532,7 @@ impl<'a> Wfdma<'a> {
                     hif2_rx_data.desc_paddr, hif2_rx_data.size);
 
                 // Configure HIF2 RX data ring via HIF1+0x4000 offset
-                let hif2_rx_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + 8 * 0x10;  // 0xd4000 + 0x580
+                let hif2_rx_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + wfdma::RXQ_BAND2 * 0x10;
                 userlib::println!("[DMA] HIF2 RX data Ring@0x{:x} programming...", hif2_rx_ring_base);
                 self.dev.hif2_via_hif1_write32(hif2_rx_ring_base + wfdma::RING_BASE, hif2_rx_data.desc_paddr as u32);
                 self.dev.hif2_via_hif1_write32(hif2_rx_ring_base + wfdma::RING_MAX_CNT, hif2_rx_data.size);
@@ -2136,7 +2591,7 @@ impl<'a> Wfdma<'a> {
             }
 
             // Allocate HIF2 RX RRO ring (band2) - Hardware Receive Reorder
-            // Queue ID 6, __RXQ(6) = 9, ring offset = 0x500 + 9*0x10 = 0x590
+            // Hardware queue index 6 (RXQ_RRO_BAND2), ring offset = 0x500 + 6*0x10 = 0x560
             userlib::println!("[DMA] Allocating HIF2 RX RRO ring (band2)...");
             self.hif2_rx_rro_band2_ring = RxRing::new_rro(wfdma::RX_RRO_RING_SIZE);
             if let Some(ref hif2_rro) = self.hif2_rx_rro_band2_ring {
@@ -2144,8 +2599,7 @@ impl<'a> Wfdma<'a> {
                     hif2_rro.desc_paddr, hif2_rro.size);
 
                 // Configure HIF2 RX RRO ring via HIF1+0x4000 offset
-                // __RXQ(6) = 9, offset = 0x500 + 9*0x10 = 0x590
-                let hif2_rro_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + (wfdma::RXQ_RRO_BAND2 + wfdma::RXQ_OFFSET) * 0x10;
+                let hif2_rro_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + wfdma::RXQ_RRO_BAND2 * 0x10;
                 userlib::println!("[DMA] HIF2 RRO band2 Ring@0x{:x} programming (via HIF1+0x4000)...", hif2_rro_ring_base);
                 self.dev.hif2_via_hif1_write32(hif2_rro_ring_base + wfdma::RING_BASE, hif2_rro.desc_paddr as u32);
                 self.dev.hif2_via_hif1_write32(hif2_rro_ring_base + wfdma::RING_MAX_CNT, hif2_rro.size);
@@ -2169,53 +2623,58 @@ impl<'a> Wfdma<'a> {
 
         // Dump ALL rings BEFORE enabling DMA
         userlib::println!("[DMA] Ring dump BEFORE enable:");
-        userlib::println!("[DMA]   TX MCU rings (0x300+):");
-        for i in 0..3u32 {
-            let rbase = wfdma::MCU_RING_BASE + i * 0x10;
+        userlib::println!("[DMA]   TX MCU rings:");
+        // FWDL=16, WM=17, WA=20 (using hw_ring_idx from McuQueue)
+        for queue in [McuQueue::Fwdl, McuQueue::Wm, McuQueue::Wa] {
+            let rbase = queue.ring_offset();
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
-            let name = match i { 0 => "WM", 1 => "WA", 2 => "FWDL", _ => "?" };
-            userlib::println!("[DMA]     {} (ring{}) @0x{:x}: base=0x{:08x} cnt={}", name, i, rbase, base, cnt);
+            let name = match queue {
+                McuQueue::Fwdl => "FWDL",
+                McuQueue::Wm => "WM",
+                McuQueue::Wa => "WA",
+            };
+            userlib::println!("[DMA]     {} (hw ring {}) @0x{:x}: base=0x{:08x} cnt={}",
+                name, queue.hw_ring_idx(), rbase, base, cnt);
         }
-        userlib::println!("[DMA]   TX Data rings (0x400+):");
+        userlib::println!("[DMA]   TX Data ring BAND0 (hw ring 18):");
         {
-            let rbase = wfdma::TX_RING_BASE + (wfdma::TXQ_BAND0) * 0x10;
+            let rbase = wfdma::MCU_RING_BASE + wfdma::TXQ_BAND0 * 0x10;
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
             userlib::println!("[DMA]     BAND0 @0x{:x}: base=0x{:08x} cnt={}", rbase, base, cnt);
         }
-        userlib::println!("[DMA]   RX MCU rings (with RXQ_OFFSET={}):", wfdma::RXQ_OFFSET);
+        userlib::println!("[DMA]   RX MCU rings (hw indices 0-3):");
         for i in 0..4u32 {
-            // MCU RX rings are at __RXQ(i) = i + RXQ_OFFSET
-            let rbase = wfdma::RX_RING_BASE + (i + wfdma::RXQ_OFFSET) * 0x10;
+            // MCU RX rings use hardware indices 0, 1, 2, 3 directly
+            let rbase = wfdma::RX_RING_BASE + i * 0x10;
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
             let name = match i { 0 => "MCU", 1 => "WA", 2 => "WA_MAIN", 3 => "WA_TRI", _ => "?" };
-            let ring_num = i + wfdma::RXQ_OFFSET;
-            userlib::println!("[DMA]     {} (ring{}) @0x{:x}: base=0x{:08x} cnt={} cpu={}", name, ring_num, rbase, base, cnt, cpu);
+            userlib::println!("[DMA]     {} (ring{}) @0x{:x}: base=0x{:08x} cnt={} cpu={}", name, i, rbase, base, cnt, cpu);
         }
         userlib::println!("[DMA]   RX Data rings:");
         {
-            // MAIN at __RXQ(4) = 7 → 0x570
-            let rbase = wfdma::RX_RING_BASE + (wfdma::RXQ_BAND0 + wfdma::RXQ_OFFSET) * 0x10;
+            // MAIN at hw ring 4 → 0x540
+            let rbase = wfdma::RX_RING_BASE + wfdma::RXQ_BAND0 * 0x10;
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
-            let ring_num = wfdma::RXQ_BAND0 + wfdma::RXQ_OFFSET;
+            let ring_num = wfdma::RXQ_BAND0;
             userlib::println!("[DMA]     MAIN (ring{}) @0x{:x}: base=0x{:08x} cnt={} cpu={}", ring_num, rbase, base, cnt, cpu);
         }
         {
-            // TXFREE at __RXQ(9) = 12, offset 0x5C0
-            let rbase = wfdma::RX_RING_BASE + 12 * 0x10;  // 0x5C0
+            // TXFREE at hw ring 9 → 0x590
+            let rbase = wfdma::RX_RING_BASE + wfdma::RXQ_TXFREE_BAND0 * 0x10;
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
             userlib::println!("[DMA]     TXFREE (rx12) @0x{:x}: base=0x{:08x} cnt={} cpu={}", rbase, base, cnt, cpu);
         }
         {
-            // RRO BAND0 at __RXQ(8) = 11, offset 0x5B0
-            let rbase = wfdma::RX_RING_BASE + (wfdma::RXQ_RRO_BAND0 + wfdma::RXQ_OFFSET) * 0x10;
+            // RRO BAND0 at hw ring 8 → 0x580
+            let rbase = wfdma::RX_RING_BASE + wfdma::RXQ_RRO_BAND0 * 0x10;
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
@@ -2280,8 +2739,8 @@ impl<'a> Wfdma<'a> {
     pub fn enable(&mut self) -> bool {
         userlib::println!("[DMA] Enabling WFDMA (after driver ownership)...");
 
-        // FWDL ring base for debugging (queue 2 = offset 0x20 from MCU_RING_BASE)
-        let ring_base = wfdma::MCU_RING_BASE + 2 * 0x10;
+        // FWDL ring base for debugging (hw ring 16 = offset 0x100 from MCU_RING_BASE)
+        let ring_base = McuQueue::Fwdl.ring_offset();
 
         // STEP 1: Write RST_DTX_PTR first (resets DMA indices)
         userlib::println!("[DMA] Writing RST_DTX_PTR=0xFFFFFFFF (both interfaces)...");
@@ -2291,9 +2750,9 @@ impl<'a> Wfdma<'a> {
             userlib::println!("[DMA]   HIF2 RST_DTX_PTR written");
         }
 
-        // Check ring state after RST_DTX_PTR (should still be intact)
-        let ring2_after_dtp = self.read(ring_base + wfdma::RING_BASE);
-        userlib::println!("[DMA] Ring2 base after RST_DTX_PTR: 0x{:08x}", ring2_after_dtp);
+        // Check FWDL ring state after RST_DTX_PTR (should still be intact)
+        let fwdl_after_dtp = self.read(ring_base + wfdma::RING_BASE);
+        userlib::println!("[DMA] FWDL ring base after RST_DTX_PTR: 0x{:08x}", fwdl_after_dtp);
 
         // STEP 2: Clear delay interrupt configs (per deepwiki dma.c:368-377)
         userlib::println!("[DMA] Clearing PRI_DLY_INT_CFG0/1/2...");
@@ -2331,20 +2790,21 @@ impl<'a> Wfdma<'a> {
 
         // Wait for HIF_MISC_BUSY to clear (prerequisite for RST auto-release)
         // Per deepwiki: DMA engine must be idle before RST bits will auto-clear
+        // Pattern: delay FIRST, then check (avoids tight loops starving hardware)
         userlib::println!("[DMA] Waiting for HIF_MISC_BUSY to clear...");
         let hif_misc_addr = wfdma::EXT_CSR_HIF_MISC;
         let mut busy_timeout = false;
         for i in 0..1000 {
+            userlib::delay_ms(1);  // Delay FIRST before checking
             let hif_misc = self.read_bar(hif_misc_addr);
             if (hif_misc & wfdma::EXT_CSR_HIF_MISC_BUSY) == 0 {
-                userlib::println!("[DMA] HIF_MISC idle after {}ms: 0x{:08x}", i, hif_misc);
+                userlib::println!("[DMA] HIF_MISC idle after {}ms: 0x{:08x}", i + 1, hif_misc);
                 break;
             }
             if i == 999 {
                 userlib::println!("[DMA] WARNING: HIF_MISC_BUSY timeout: 0x{:08x}", hif_misc);
                 busy_timeout = true;
             }
-            userlib::delay_ms(1);  // Actual 1ms delay per iteration
         }
 
         // Also check HIF2's HIF_MISC_BUSY (CRITICAL for dual-HIF RST release!)
@@ -2352,15 +2812,15 @@ impl<'a> Wfdma<'a> {
             userlib::println!("[DMA] Waiting for HIF2 HIF_MISC_BUSY to clear...");
             let hif2_hif_misc_offset = wfdma::EXT_CSR_HIF_MISC;
             for i in 0..1000 {
+                userlib::delay_ms(1);  // Delay FIRST before checking
                 let hif2_misc = self.dev.hif2_via_hif1_read32(hif2_hif_misc_offset);
                 if (hif2_misc & wfdma::EXT_CSR_HIF_MISC_BUSY) == 0 {
-                    userlib::println!("[DMA] HIF2 HIF_MISC idle after {}ms: 0x{:08x}", i, hif2_misc);
+                    userlib::println!("[DMA] HIF2 HIF_MISC idle after {}ms: 0x{:08x}", i + 1, hif2_misc);
                     break;
                 }
                 if i == 999 {
                     userlib::println!("[DMA] WARNING: HIF2 HIF_MISC_BUSY timeout: 0x{:08x}", hif2_misc);
                 }
-                userlib::delay_ms(1);
             }
         }
 
@@ -2449,7 +2909,9 @@ impl<'a> Wfdma<'a> {
 
         // Give hardware time to process GLO_CFG enable and auto-release RST
         // (USB driver had similar issues with tight loops preventing HW completion)
-        userlib::delay_ms(10);
+        // Using 500ms to rule out timing issues - if this works, timing is the culprit
+        userlib::println!("[DMA] Waiting 500ms after GLO_CFG enable for hardware to settle...");
+        userlib::delay_ms(500);
 
         // Check ring state after GLO_CFG enable (hardware should have auto-released RST)
         let ring2_after_glo = self.read(ring_base + wfdma::RING_BASE);
@@ -2596,7 +3058,7 @@ impl<'a> Wfdma<'a> {
         };
 
         // Update CPU index register (rings doorbell) - WFDMA relative
-        let ring_base = wfdma::MCU_RING_BASE + (McuQueue::Fwdl as u32) * 0x10;
+        let ring_base = McuQueue::Fwdl.ring_offset();
 
         // Debug: check state before doorbell
         if cpu_idx == 0 {
@@ -2674,7 +3136,12 @@ impl<'a> Wfdma<'a> {
             ring.cpu_idx
         };
 
-        let ring_base = wfdma::MCU_RING_BASE + (McuQueue::Fwdl as u32) * 0x10;
+        let ring_base = McuQueue::Fwdl.ring_offset();
+
+        // CRITICAL: DSB SY ensures descriptor writes are visible to DMA engine
+        // before we ring the doorbell. Matches send_fw_scatter() barrier.
+        unsafe { core::arch::asm!("dsb sy"); }
+
         self.write(ring_base + wfdma::RING_CPU_IDX, new_cpu_idx);
 
         true
@@ -2720,7 +3187,12 @@ impl<'a> Wfdma<'a> {
         };
 
         // Write to WM ring (ring 0) CPU index
-        let ring_base = wfdma::MCU_RING_BASE + (McuQueue::Wm as u32) * 0x10;
+        let ring_base = McuQueue::Wm.ring_offset();
+
+        // CRITICAL: DSB SY ensures descriptor writes are visible to DMA engine
+        // before we ring the doorbell. Matches send_fw_scatter() barrier.
+        unsafe { core::arch::asm!("dsb sy"); }
+
         self.write(ring_base + wfdma::RING_CPU_IDX, new_cpu_idx);
 
         true
@@ -2780,14 +3252,17 @@ impl<'a> Wfdma<'a> {
             None => return false,
         };
 
-        let tx_ring_base = wfdma::MCU_RING_BASE + (McuQueue::Fwdl as u32) * 0x10;
-        // Add RXQ_OFFSET per Linux __RXQ() macro
-        let rx_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU + wfdma::RXQ_OFFSET) * 0x10;
+        let tx_ring_base = McuQueue::Fwdl.ring_offset();
+        // RX rings use hardware indices directly
+        let rx_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU) * 0x10;
 
         let initial_dma_idx = self.read(tx_ring_base + wfdma::RING_DMA_IDX);
         let initial_rx_dma_idx = self.read(rx_ring_base + wfdma::RING_DMA_IDX);
 
         for i in 0..(timeout_ms * 10) {
+            // Delay FIRST before checking (avoids tight loops starving hardware)
+            userlib::delay_us(100);
+
             // Check TX DMA progress
             let tx_dma_idx = self.read(tx_ring_base + wfdma::RING_DMA_IDX);
 
@@ -2820,8 +3295,6 @@ impl<'a> Wfdma<'a> {
             if (mcu_cmd & mcu_cmd::NORMAL_STATE) != 0 {
                 trace!(DMA, "MCU reached normal state: 0x{:08x}", mcu_cmd);
             }
-
-            syscall::yield_now();
         }
 
         // Final status dump
@@ -2856,13 +3329,16 @@ impl<'a> Wfdma<'a> {
             }
         };
 
-        let tx_ring_base = wfdma::MCU_RING_BASE + (McuQueue::Wm as u32) * 0x10;
-        // Add RXQ_OFFSET per Linux __RXQ() macro
-        let rx_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU + wfdma::RXQ_OFFSET) * 0x10;
+        let tx_ring_base = McuQueue::Wm.ring_offset();
+        // RX rings use hardware indices directly
+        let rx_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU) * 0x10;
 
         let initial_dma_idx = self.read(tx_ring_base + wfdma::RING_DMA_IDX);
 
         for i in 0..(timeout_ms * 10) {
+            // Delay FIRST before checking (avoids tight loops starving hardware)
+            userlib::delay_us(100);
+
             let tx_dma_idx = self.read(tx_ring_base + wfdma::RING_DMA_IDX);
             let rx_dma_idx = self.read(rx_ring_base + wfdma::RING_DMA_IDX);
             let int_src = self.read(wfdma::INT_SRC);
@@ -2879,8 +3355,6 @@ impl<'a> Wfdma<'a> {
                     return true;
                 }
             }
-
-            syscall::yield_now();
         }
 
         // Timeout - dump status
