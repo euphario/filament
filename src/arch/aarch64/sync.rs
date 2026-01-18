@@ -233,9 +233,10 @@ pub fn get_sctlr_span() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{kdebug, kinfo};
 
     pub fn test() {
-        crate::logln!("  Testing sync primitives...");
+        kdebug!("sync", "test_start");
 
         // Test IrqGuard - only I bit should be affected
         let before: u64;
@@ -267,6 +268,6 @@ mod tests {
         assert!(flags.check_and_clear_resched());
         assert!(!flags.need_resched());
 
-        crate::logln!("    [OK] Sync primitives working");
+        kinfo!("sync", "test_ok");
     }
 }

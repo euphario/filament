@@ -6,38 +6,65 @@
 #![no_main]
 #![allow(dead_code)]  // Shell commands reserved for future use
 
-use userlib::{println, print, syscall, Stdin};
+mod builtins;
+mod color;
+mod completion;
+mod console;
+mod output;
+mod readline;
 
-/// Maximum command line length
-const MAX_LINE: usize = 128;
+use userlib::{println, print, syscall};
 
 /// Maximum background jobs to track
 const MAX_BG_JOBS: usize = 16;
 
 /// Static line buffer (in .bss) to avoid stack allocation issues
-static mut LINE_BUF: [u8; MAX_LINE] = [0u8; MAX_LINE];
+static mut LINE_BUF: [u8; readline::MAX_LINE] = [0u8; readline::MAX_LINE];
+
+/// Command history
+static mut HISTORY: readline::History = readline::History::new();
 
 /// Background job PIDs (0 = empty slot)
 static mut BG_PIDS: [u32; MAX_BG_JOBS] = [0; MAX_BG_JOBS];
 
 #[unsafe(no_mangle)]
 fn main() {
-    let _ = syscall::write(syscall::STDOUT, b"BPI-R4 Shell v0.1\r\n");
-    let _ = syscall::write(syscall::STDOUT, b"Type 'help' for commands\r\n\r\n");
+    // Initialize console connection (falls back to direct UART if consoled not available)
+    let connected = console::init();
 
-    let stdin = Stdin;
+    // Colored welcome banner
+    color::set(color::BOLD);
+    color::set(color::CYAN);
+    console::write(b"BPI-R4 Shell");
+    color::reset();
+    console::write(b" v0.3\r\n");
+    color::set(color::DIM);
+    if connected {
+        console::write(b"Connected to consoled\r\n");
+    }
+    console::write(b"Type 'help' for commands\r\n\r\n");
+    color::reset();
 
     loop {
-        let _ = syscall::write(syscall::STDOUT, b"> ");
+        // Colored prompt
+        color::set(color::BOLD);
+        color::set(color::GREEN);
+        console::write(b"> ");
+        color::reset();
 
-        // Read a line using static buffer
-        let buf_slice = unsafe {
-            core::slice::from_raw_parts_mut(
-                core::ptr::addr_of_mut!(LINE_BUF) as *mut u8,
-                MAX_LINE
+        // Read a line using readline with history
+        let (buf_slice, history) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(
+                    core::ptr::addr_of_mut!(LINE_BUF) as *mut u8,
+                    readline::MAX_LINE
+                ),
+                &mut *core::ptr::addr_of_mut!(HISTORY)
             )
         };
-        let len = read_line(&stdin, buf_slice);
+
+        let mut editor = readline::LineEditor::new(buf_slice, history);
+        let len = editor.read();
 
         if len == 0 {
             continue;
@@ -56,7 +83,7 @@ fn main() {
 /// Print a decimal number
 fn print_dec(val: usize) {
     if val == 0 {
-        let _ = syscall::write(syscall::STDOUT, b"0");
+        console::write(b"0");
         return;
     }
     let mut buf = [0u8; 10];
@@ -67,59 +94,11 @@ fn print_dec(val: usize) {
         buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    let _ = syscall::write(syscall::STDOUT, &buf[i..]);
-}
-
-/// Read a line with echo and basic line editing
-fn read_line(stdin: &Stdin, buf: &mut [u8]) -> usize {
-    let mut pos: usize = 0;
-
-    while pos < buf.len() - 1 {
-        if let Some(ch) = stdin.read_byte() {
-            match ch {
-                // Enter - end of line
-                b'\r' | b'\n' => {
-                    let _ = syscall::write(syscall::STDOUT, b"\r\n");
-                    break;
-                }
-                // Backspace
-                0x7F | 0x08 => {
-                    if pos > 0 {
-                        pos -= 1;
-                        let _ = syscall::write(syscall::STDOUT, b"\x08 \x08");
-                    }
-                }
-                // Ctrl+C - cancel line
-                0x03 => {
-                    let _ = syscall::write(syscall::STDOUT, b"^C\r\n");
-                    return 0;
-                }
-                // Ctrl+D - EOF (exit if empty line)
-                0x04 => {
-                    if pos == 0 {
-                        let _ = syscall::write(syscall::STDOUT, b"\r\n");
-                        syscall::exit(0);
-                    }
-                }
-                // Printable characters
-                0x20..=0x7E => {
-                    buf[pos] = ch;
-                    pos += 1;
-                    // Echo character
-                    let _ = syscall::write(syscall::STDOUT, &[ch]);
-                }
-                _ => {
-                    // Ignore other control characters
-                }
-            }
-        }
-    }
-
-    pos
+    console::write(&buf[i..]);
 }
 
 /// Trim whitespace from a byte slice
-fn trim(input: &[u8]) -> &[u8] {
+pub fn trim(input: &[u8]) -> &[u8] {
     let start = input.iter().position(|&c| c != b' ' && c != b'\t' && c != b'\r' && c != b'\n');
     let end = input.iter().rposition(|&c| c != b' ' && c != b'\t' && c != b'\r' && c != b'\n');
 
@@ -180,7 +159,9 @@ fn execute_command(cmd: &[u8]) {
     } else if cmd_eq(cmd, b"usb") {
         cmd_run_program("bin/usbd");
     } else if cmd_eq(cmd, b"gpio") {
-        cmd_run_program("bin/gpio");
+        builtins::gpio::run(b"");
+    } else if cmd_starts_with(cmd, b"gpio ") {
+        builtins::gpio::run(&cmd[5..]);
     } else if cmd_eq(cmd, b"fatfs") {
         cmd_run_program("bin/fatfs");
     } else if cmd_eq(cmd, b"pcied") {
@@ -193,7 +174,7 @@ fn execute_command(cmd: &[u8]) {
     } else if cmd_starts_with(cmd, b"fan ") {
         cmd_fan(&cmd[4..]);
     } else if cmd_eq(cmd, b"ps") {
-        cmd_ps();
+        builtins::ps::run(b"").print();
     } else if cmd_starts_with(cmd, b"kill ") {
         cmd_kill(&cmd[5..]);
     } else if cmd_starts_with(cmd, b"bg ") {
@@ -202,19 +183,24 @@ fn execute_command(cmd: &[u8]) {
         cmd_jobs();
     } else if cmd_starts_with(cmd, b"log ") {
         cmd_log(&cmd[4..]);
+    } else if cmd_eq(cmd, b"logs") {
+        cmd_logs(b"");
+    } else if cmd_starts_with(cmd, b"logs ") {
+        cmd_logs(&cmd[5..]);
     } else if cmd_eq(cmd, b"reset") || cmd_eq(cmd, b"reboot") {
         cmd_reset();
-    } else if cmd_eq(cmd, b"hw") || cmd_eq(cmd, b"hw list") {
-        cmd_hw("list");
-    } else if cmd_eq(cmd, b"hw bus") {
-        cmd_hw("bus");
-    } else if cmd_eq(cmd, b"hw tree") {
-        cmd_hw("tree");
+    } else if cmd_eq(cmd, b"hw") {
+        builtins::hw::run(b"");
     } else if cmd_starts_with(cmd, b"hw ") {
-        // hw <path> - query specific path
-        if let Ok(path) = core::str::from_utf8(&cmd[3..]) {
-            cmd_hw(path.trim());
-        }
+        builtins::hw::run(&cmd[3..]);
+    } else if cmd_eq(cmd, b"resize") {
+        cmd_resize();
+    } else if cmd_eq(cmd, b"ls") {
+        builtins::ls::run(b"").print();
+    } else if cmd_starts_with(cmd, b"ls ") {
+        builtins::ls::run(&cmd[3..]).print();
+    } else if cmd_starts_with(cmd, b"cat ") {
+        cmd_cat(&cmd[4..]);
     } else {
         // Try to run as a binary from bin/ directory
         try_run_binary(cmd);
@@ -222,6 +208,9 @@ fn execute_command(cmd: &[u8]) {
 }
 
 /// Try to run an unknown command as a binary from bin/
+/// Uses a two-phase approach:
+/// 1. Fast path: Try kernel ramfs exec (embedded binaries)
+/// 2. Fallback: Load from filesystem via exec_mem (external binaries)
 fn try_run_binary(cmd: &[u8]) {
     // Extract command name (first word)
     let cmd_name = if let Some(pos) = cmd.iter().position(|&c| c == b' ') {
@@ -265,72 +254,162 @@ fn try_run_binary(cmd: &[u8]) {
         }
     };
 
-    // Try to execute
+    // Phase 1: Try kernel ramfs exec (fast path for embedded binaries)
     let result = syscall::exec(path);
 
     if result >= 0 {
-        let pid = result as u32;
-        // Wait for child to complete
-        loop {
-            let wait_result = syscall::wait(pid as i32);
-            if wait_result >= 0 {
-                let exit_code = (wait_result & 0xFFFFFFFF) as i32;
-                if exit_code != 0 {
-                    println!("Process {} exited with code {}", pid, exit_code);
-                }
-                break;
-            } else if wait_result == -11 {
-                // EAGAIN - child still running, retry
-                continue;
-            } else {
-                println!("Wait failed: {}", wait_result);
-                break;
-            }
+        wait_for_child(result as u32);
+        return;
+    }
+
+    // Phase 2: If NOT_FOUND, try loading from filesystem via exec_mem
+    // This allows running binaries from USB, network, etc.
+    if result == -2 {  // ENOENT - Not found in kernel ramfs
+        if let Some(pid) = try_exec_from_filesystem(&path_buf[..path_len], name) {
+            wait_for_child(pid);
+            return;
         }
+    }
+
+    // Both paths failed - command not found
+    color::set(color::RED);
+    print!("Unknown command: ");
+    print_bytes(cmd);
+    color::reset();
+    println!();
+    color::set(color::DIM);
+    println!("Type 'help' for available commands");
+    color::reset();
+}
+
+/// Wait for a child process to complete
+fn wait_for_child(pid: u32) {
+    loop {
+        let wait_result = syscall::wait(pid as i32);
+        if wait_result >= 0 {
+            let exit_code = (wait_result & 0xFFFFFFFF) as i32;
+            if exit_code != 0 {
+                println!("Process {} exited with code {}", pid, exit_code);
+            }
+            break;
+        } else if wait_result == -11 {
+            // EAGAIN - child still running, retry
+            continue;
+        } else {
+            println!("Wait failed: {}", wait_result);
+            break;
+        }
+    }
+}
+
+/// Try to load and execute a binary from filesystem (fallback path)
+/// Returns Some(pid) on success, None on failure
+fn try_exec_from_filesystem(path: &[u8], name: &str) -> Option<u32> {
+    // Try to open the file via kernel ramfs (for now)
+    // Future: Could use vfsd ReadToShmem for external filesystems
+    let fd = syscall::open(path, 0);  // O_RDONLY
+    if fd < 0 {
+        return None;
+    }
+    let fd = fd as u32;
+
+    // Get file size by reading to end (simple approach)
+    // Note: For large files, we'd want stat() or vfsd's ReadToShmem
+    const MAX_ELF_SIZE: usize = 512 * 1024;  // 512KB max for shell-launched binaries
+    let elf_addr = syscall::mmap(0, MAX_ELF_SIZE, syscall::PROT_READ | syscall::PROT_WRITE);
+    if elf_addr < 0 {
+        syscall::close(fd);
+        return None;
+    }
+
+    // Read entire ELF into buffer
+    let elf_buf = unsafe { core::slice::from_raw_parts_mut(elf_addr as *mut u8, MAX_ELF_SIZE) };
+    let mut total_read = 0usize;
+
+    loop {
+        let remaining = &mut elf_buf[total_read..];
+        if remaining.is_empty() {
+            break;
+        }
+
+        let chunk_size = remaining.len().min(4096);
+        let n = syscall::read(fd, &mut remaining[..chunk_size]);
+        if n <= 0 {
+            break;
+        }
+        total_read += n as usize;
+    }
+
+    syscall::close(fd);
+
+    // Validate minimum ELF size
+    if total_read < 64 {
+        syscall::munmap(elf_addr as u64, MAX_ELF_SIZE);
+        return None;
+    }
+
+    // Execute via exec_mem
+    let result = syscall::exec_mem(&elf_buf[..total_read], Some(name));
+
+    // Free the buffer
+    syscall::munmap(elf_addr as u64, MAX_ELF_SIZE);
+
+    if result >= 0 {
+        Some(result as u32)
     } else {
-        // exec failed - command not found
-        print!("Unknown command: ");
-        print_bytes(cmd);
-        println!();
-        println!("Type 'help' for available commands");
+        None
     }
 }
 
 fn cmd_help() {
+    color::set(color::BOLD);
+    color::set(color::CYAN);
     println!("Available commands:");
-    println!("  help, ?       - Show this help");
-    println!("  exit, quit    - Exit the shell");
-    println!("  pid           - Show current process ID");
-    println!("  uptime        - Show system uptime (ticks)");
-    println!("  mem           - Test memory allocation");
-    println!("  echo <msg>    - Echo a message");
-    println!("  spawn <id>    - Spawn process by ELF ID");
-    println!("  usb           - Run USB userspace driver");
-    println!("  gpio          - Run GPIO control utility");
-    println!("  fatfs         - Run FAT filesystem driver");
-    println!("  pcied         - Start PCIe daemon (background)");
-    println!("  wifi          - Run WiFi driver (MT7996)");
-    println!("  fan           - Start PWM fan driver");
-    println!("  fan <0-100>   - Set fan speed (percent)");
-    println!("  hw            - List hardware devices");
-    println!("  hw bus        - List bus controllers");
-    println!("  hw tree       - Show device tree (registered nodes)");
-    println!("  hw <path>     - Query device info (e.g., hw /platform/uart0)");
-    println!("  yield         - Yield CPU to other processes");
-    println!("  panic         - Trigger a panic (test)");
-    println!("  ps            - Show running processes");
-    println!("  kill <pid>    - Terminate a process");
-    println!("  bg <path>     - Run program in background");
-    println!("  jobs          - Show background jobs");
-    println!("  log <level>   - Set log level (error/warn/info/debug/trace)");
-    println!("  reset, reboot - Reset the system");
+    color::reset();
+    help_line("help, ?", "Show this help");
+    help_line("exit, quit", "Exit the shell");
+    help_line("pid", "Show current process ID");
+    help_line("uptime", "Show system uptime");
+    help_line("mem", "Test memory allocation");
+    help_line("echo <msg>", "Echo a message");
+    help_line("ls [path]", "List directory (default: /bin)");
+    help_line("cat <path>", "Display file contents");
+    help_line("spawn <id>", "Spawn process by ELF ID");
+    help_line("usb", "Run USB userspace driver");
+    help_line("gpio [cmd]", "GPIO control (try 'gpio help')");
+    help_line("fatfs", "Run FAT filesystem driver");
+    help_line("pcied", "Start PCIe daemon");
+    help_line("wifi", "Run WiFi driver (MT7996)");
+    help_line("fan [0-100]", "Fan control / set speed");
+    help_line("hw [path]", "Hardware info (list/bus/tree/<path>)");
+    help_line("yield", "Yield CPU to other processes");
+    help_line("ps", "Show running processes");
+    help_line("kill <pid>", "Terminate a process");
+    help_line("bg <path>", "Run program in background");
+    help_line("jobs", "Show background jobs");
+    help_line("log <level>", "Set log level (error/warn/info/debug/trace)");
+    help_line("logs [on|off|n]", "Control console log region");
+    help_line("resize", "Detect/display terminal size");
+    help_line("reset", "Reset the system");
+}
+
+/// Print a help line with colored command
+fn help_line(cmd: &str, desc: &str) {
+    print!("  ");
+    color::set(color::YELLOW);
+    print!("{:14}", cmd);
+    color::reset();
+    color::set(color::DIM);
+    print!(" - ");
+    color::reset();
+    println!("{}", desc);
 }
 
 fn cmd_pid() {
     let pid = syscall::getpid();
-    let _ = syscall::write(syscall::STDOUT, b"PID: ");
+    console::write(b"PID: ");
     print_dec(pid as usize);
-    let _ = syscall::write(syscall::STDOUT, b"\r\n");
+    console::write(b"\r\n");
 }
 
 fn cmd_uptime() {
@@ -343,16 +422,16 @@ fn cmd_uptime() {
     let seconds = cycles / 24_000_000;
     let millis = (cycles % 24_000_000) / 24_000;
 
-    let _ = syscall::write(syscall::STDOUT, b"Uptime: ");
+    console::write(b"Uptime: ");
     print_dec(seconds as usize);
-    let _ = syscall::write(syscall::STDOUT, b".");
+    console::write(b".");
     // Print millis with leading zeros (3 digits)
-    if millis < 100 { let _ = syscall::write(syscall::STDOUT, b"0"); }
-    if millis < 10 { let _ = syscall::write(syscall::STDOUT, b"0"); }
+    if millis < 100 { console::write(b"0"); }
+    if millis < 10 { console::write(b"0"); }
     print_dec(millis as usize);
-    let _ = syscall::write(syscall::STDOUT, b"s (");
+    console::write(b"s (");
     print_dec(cycles as usize);
-    let _ = syscall::write(syscall::STDOUT, b" cycles)\r\n");
+    console::write(b" cycles)\r\n");
 }
 
 fn cmd_mem() {
@@ -432,7 +511,7 @@ fn cmd_spawn(arg: &[u8]) {
 
 /// Print a byte slice to stdout
 fn print_bytes(bytes: &[u8]) {
-    let _ = syscall::write(syscall::STDOUT, bytes);
+    console::write(bytes);
 }
 
 /// Run a program from ramfs by path
@@ -486,7 +565,7 @@ fn cmd_run_program_bg(path: &str) {
 }
 
 /// Parse decimal number from byte slice
-fn parse_decimal(input: &[u8]) -> Option<u32> {
+pub fn parse_decimal(input: &[u8]) -> Option<u32> {
     let trimmed = trim(input);
     if trimmed.is_empty() {
         return None;
@@ -503,48 +582,6 @@ fn parse_decimal(input: &[u8]) -> Option<u32> {
     Some(value)
 }
 
-/// Show process list
-fn cmd_ps() {
-    let mut buf: [syscall::ProcessInfo; 16] = [syscall::ProcessInfo::empty(); 16];
-    let count = syscall::ps_info(&mut buf);
-
-    println!("PID   PPID  STATE      HB     AGE    NAME");
-    println!("----  ----  ---------  -----  -----  ---------------");
-
-    for i in 0..count {
-        let info = &buf[i];
-        // Format heartbeat age
-        let age_str: [u8; 5] = if info.heartbeat_age_ms == 0 {
-            *b"    -"
-        } else if info.heartbeat_age_ms < 1000 {
-            let ms = info.heartbeat_age_ms;
-            [
-                b' ',
-                if ms >= 100 { b'0' + ((ms / 100) % 10) as u8 } else { b' ' },
-                if ms >= 10 { b'0' + ((ms / 10) % 10) as u8 } else { b' ' },
-                b'0' + (ms % 10) as u8,
-                b'm',
-            ]
-        } else {
-            let s = info.heartbeat_age_ms / 1000;
-            [
-                if s >= 1000 { b'0' + ((s / 1000) % 10) as u8 } else { b' ' },
-                if s >= 100 { b'0' + ((s / 100) % 10) as u8 } else { b' ' },
-                if s >= 10 { b'0' + ((s / 10) % 10) as u8 } else { b' ' },
-                b'0' + (s % 10) as u8,
-                b's',
-            ]
-        };
-        print!("{:4}  {:4}  {:9}  {:5}  ",
-               info.pid, info.parent_pid, info.state_str(), info.heartbeat_str());
-        for c in age_str.iter() {
-            print!("{}", *c as char);
-        }
-        print!("  ");
-        print_bytes(&info.name);
-        println!();
-    }
-}
 
 /// Kill a process by PID
 fn cmd_kill(arg: &[u8]) {
@@ -728,6 +765,62 @@ fn cmd_log(arg: &[u8]) {
     }
 }
 
+/// Control console log region split
+fn cmd_logs(arg: &[u8]) {
+    let arg = trim(arg);
+
+    // Check if connected to consoled
+    if !console::console().is_connected() {
+        println!("Not connected to consoled (using direct UART)");
+        return;
+    }
+
+    if arg.is_empty() {
+        // Toggle log split
+        let current = console::console().log_split;
+        console::console_mut().set_log_split(!current);
+        if !current {
+            println!("Log split enabled");
+        } else {
+            println!("Log split disabled (full screen for shell)");
+        }
+    } else if cmd_eq(arg, b"on") {
+        console::console_mut().set_log_split(true);
+        println!("Log split enabled");
+    } else if cmd_eq(arg, b"off") {
+        console::console_mut().set_log_split(false);
+        println!("Log split disabled");
+    } else if cmd_eq(arg, b"disconnect") {
+        // Disconnect from logd completely (stops receiving logs)
+        console::console().set_logd_connected(false);
+        println!("Disconnected from logd (no new logs will appear)");
+    } else if cmd_eq(arg, b"connect") || cmd_eq(arg, b"reconnect") {
+        // Reconnect to logd
+        console::console().set_logd_connected(true);
+        println!("Reconnecting to logd...");
+    } else if let Some(n) = parse_decimal(arg) {
+        // Set number of log lines
+        if n > 255 {
+            println!("Log lines must be 0-255 (0 = auto)");
+            return;
+        }
+        console::console().set_log_lines(n as u8);
+        if n == 0 {
+            println!("Log lines set to auto");
+        } else {
+            println!("Log lines set to {}", n);
+        }
+    } else {
+        println!("Usage: logs [on|off|disconnect|connect|<lines>]");
+        println!("  logs            - Toggle log split");
+        println!("  logs on         - Enable log region");
+        println!("  logs off        - Disable log region (full screen for shell)");
+        println!("  logs disconnect - Disconnect from logd (stop receiving logs)");
+        println!("  logs connect    - Reconnect to logd");
+        println!("  logs <n>        - Set log region to n lines (0 = auto)");
+    }
+}
+
 /// Reset the system
 fn cmd_reset() {
     println!("Resetting system...");
@@ -737,47 +830,68 @@ fn cmd_reset() {
     }
 }
 
-/// Query devd's hw: scheme
-fn cmd_hw(path: &str) {
-    // Build the scheme URL
-    let mut url_buf = [0u8; 64];
-    let prefix = b"hw:";
-    url_buf[..prefix.len()].copy_from_slice(prefix);
-    let path_bytes = path.as_bytes();
-    let url_len = prefix.len() + path_bytes.len().min(url_buf.len() - prefix.len());
-    url_buf[prefix.len()..url_len].copy_from_slice(&path_bytes[..url_len - prefix.len()]);
+/// Query and display terminal size
+fn cmd_resize() {
+    let con = console::console_mut();
 
-    let url = core::str::from_utf8(&url_buf[..url_len]).unwrap_or("hw:list");
-
-    // Open the scheme
-    let fd = syscall::scheme_open(url, 0);
-    if fd < 0 {
-        println!("Failed to open {}: error {}", url, fd);
+    if !con.is_connected() {
+        println!("Not connected to consoled (using direct UART)");
+        println!("Current: {}x{}", con.cols, con.rows);
         return;
     }
 
-    // Read the response (retry on EAGAIN/-11 as we may need to wait for devd)
-    let mut buf = [0u8; 1024];
-    let mut len: isize = -11;
-    let mut retries = 0;
-    while len == -11 && retries < 100 {
-        len = syscall::read(fd as u32, &mut buf);
-        if len == -11 {
-            syscall::yield_now();
-            retries += 1;
+    // Query consoled for current size (triggers re-detection)
+    match con.query_size() {
+        Some((cols, rows)) => {
+            println!("Terminal size: {}x{}", cols, rows);
         }
-    }
-    syscall::close(fd as u32);
-
-    if len < 0 {
-        println!("Failed to read from {}: error {}", url, len);
-        return;
-    }
-
-    // Print the response
-    if len > 0 {
-        if let Ok(s) = core::str::from_utf8(&buf[..len as usize]) {
-            print!("{}", s);
+        None => {
+            println!("Failed to query terminal size");
+            println!("Current: {}x{}", con.cols, con.rows);
         }
     }
 }
+
+/// Display file contents
+/// Note: Uses kernel ramfs directly for simplicity and performance.
+/// For external filesystems (USB, network), this would need to use vfsd's
+/// ReadToShmem protocol with shared memory buffers.
+fn cmd_cat(path_arg: &[u8]) {
+    let path = trim(path_arg);
+
+    if path.is_empty() {
+        println!("Usage: cat <path>");
+        return;
+    }
+
+    // Convert path to str
+    let path_str = match core::str::from_utf8(path) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Invalid path");
+            return;
+        }
+    };
+
+    // Open the file via kernel ramfs
+    let fd = syscall::open(path, 0);  // O_RDONLY
+    if fd < 0 {
+        println!("cat: {}: not found", path_str);
+        return;
+    }
+    let fd = fd as u32;
+
+    // Read and print contents
+    let mut buf = [0u8; 512];
+    loop {
+        let n = syscall::read(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        console::write(&buf[..n as usize]);
+    }
+
+    syscall::close(fd);
+    println!();  // Ensure newline at end
+}
+

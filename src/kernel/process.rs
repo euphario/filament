@@ -12,7 +12,7 @@
 
 use super::addrspace::AddressSpace;
 use super::pmm;
-use crate::logln;
+use crate::print_direct;
 use crate::arch::aarch64::mmu;
 
 /// Process ID type
@@ -385,21 +385,21 @@ impl ProcessTable {
 
     /// Print process table
     pub fn print_info(&self) {
-        logln!("  Process table ({} max):", MAX_PROCESSES);
+        print_direct!("  Process table ({} max):\n", MAX_PROCESSES);
         for proc in self.processes.iter().flatten() {
             let state_str = match proc.state {
                 ProcessState::Creating => "creating",
                 ProcessState::Ready => "ready",
                 ProcessState::Running => "RUNNING",
-                ProcessState::Blocked => "blocked",
+                ProcessState::Blocked => "waiting",
                 ProcessState::Zombie => "zombie",
                 ProcessState::Free => "free",
             };
             let marker = if Some(proc.pid) == self.current_pid { ">" } else { " " };
-            logln!("    {} [{}] {} ({})", marker, proc.pid, proc.name_str(), state_str);
+            print_direct!("    {} [{}] {} ({})\n", marker, proc.pid, proc.name_str(), state_str);
         }
         if self.processes.iter().flatten().count() == 0 {
-            logln!("    (no processes)");
+            print_direct!("    (no processes)\n");
         }
     }
 }
@@ -447,21 +447,21 @@ const HELLO_USER_PROGRAM: &[u8] = &[
 
 /// Test process creation
 pub fn test() {
-    logln!("  Testing process creation...");
+    print_direct!("  Testing process creation...\n");
 
     unsafe {
         let ptable = process_table();
 
         // Create a test process
         if let Some(pid) = ptable.create(0, "test_proc") {
-            logln!("    Created process with PID {}", pid);
+            print_direct!("    Created process with PID {}\n", pid);
 
             if let Some(proc) = ptable.get_mut(pid) {
                 // Allocate user stack (4KB)
                 if let Some(stack_top) = proc.alloc_user_stack(4096) {
-                    logln!("    Allocated user stack at 0x{:016x}", stack_top);
+                    print_direct!("    Allocated user stack at 0x{:016x}\n", stack_top);
                 } else {
-                    logln!("    [!!] Failed to allocate user stack");
+                    print_direct!("    [!!] Failed to allocate user stack\n");
                 }
 
                 // Mark as ready
@@ -473,12 +473,12 @@ pub fn test() {
             // Clean up - terminate and reap
             ptable.terminate(pid, 0);
             ptable.reap(pid);
-            logln!("    Process terminated and reaped");
+            print_direct!("    Process terminated and reaped\n");
 
         } else {
-            logln!("    [!!] Failed to create process");
+            print_direct!("    [!!] Failed to create process\n");
         }
     }
 
-    logln!("    [OK] Process structure test passed");
+    print_direct!("    [OK] Process structure test passed\n");
 }

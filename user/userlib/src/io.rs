@@ -4,12 +4,35 @@
 
 use crate::syscall::{read, write, STDIN, STDOUT, STDERR};
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag to enable/disable stdout output
+/// Disabled by daemons to avoid corrupting consoled's display
+static STDOUT_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Disable stdout output (print!/println! become no-ops)
+pub fn disable_stdout() {
+    STDOUT_ENABLED.store(false, Ordering::Release);
+}
+
+/// Enable stdout output
+pub fn enable_stdout() {
+    STDOUT_ENABLED.store(true, Ordering::Release);
+}
+
+/// Check if stdout is enabled
+pub fn stdout_enabled() -> bool {
+    STDOUT_ENABLED.load(Ordering::Acquire)
+}
 
 /// Standard output writer
 pub struct Stdout;
 
 impl Write for Stdout {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        if !STDOUT_ENABLED.load(Ordering::Acquire) {
+            return Ok(()); // Silently discard
+        }
         let bytes = s.as_bytes();
         let mut written = 0;
         while written < bytes.len() {
@@ -94,13 +117,17 @@ macro_rules! print {
 #[macro_export]
 macro_rules! println {
     () => {{
-        let _ = $crate::syscall::write($crate::syscall::STDOUT, b"\r\n");
+        if $crate::io::stdout_enabled() {
+            let _ = $crate::syscall::write($crate::syscall::STDOUT, b"\r\n");
+        }
     }};
     ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        // writeln! adds \n, we need to also add \r for serial terminals
-        let _ = write!(&mut $crate::io::Stdout, $($arg)*);
-        let _ = $crate::syscall::write($crate::syscall::STDOUT, b"\r\n");
+        if $crate::io::stdout_enabled() {
+            use core::fmt::Write;
+            // writeln! adds \n, we need to also add \r for serial terminals
+            let _ = write!(&mut $crate::io::Stdout, $($arg)*);
+            let _ = $crate::syscall::write($crate::syscall::STDOUT, b"\r\n");
+        }
     }};
 }
 

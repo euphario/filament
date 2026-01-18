@@ -412,7 +412,7 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                         }
                     }
                 }
-                Err(ipc::IpcError::WouldBlock) => {
+                Err(ipc::ChannelError::WouldBlock) => {
                     if entry.flags.nonblocking {
                         -11 // EAGAIN
                     } else {
@@ -423,8 +423,8 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                         -11 // EAGAIN - caller should block and retry
                     }
                 }
-                Err(ipc::IpcError::PeerClosed) => 0, // EOF
-                Err(ipc::IpcError::InvalidChannel) => -9, // EBADF
+                Err(ipc::ChannelError::PeerClosed) => 0, // EOF
+                Err(ipc::ChannelError::InvalidChannel) => -9, // EBADF
                 Err(_) => -5, // EIO
             }
         }
@@ -511,7 +511,7 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
 
             match ipc::sys_send(channel_id, caller_pid, chunk) {
                 Ok(()) => chunk.len() as isize,
-                Err(ipc::IpcError::QueueFull) => {
+                Err(ipc::ChannelError::QueueFull) => {
                     if entry.flags.nonblocking {
                         -11 // EAGAIN
                     } else {
@@ -520,9 +520,9 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
                         -11
                     }
                 }
-                Err(ipc::IpcError::PeerClosed) => -32, // EPIPE
-                Err(ipc::IpcError::InvalidChannel) => -9, // EBADF
-                Err(ipc::IpcError::PermissionDenied) => -13, // EACCES
+                Err(ipc::ChannelError::PeerClosed) => -32, // EPIPE
+                Err(ipc::ChannelError::InvalidChannel) => -9, // EBADF
+                Err(ipc::ChannelError::PermissionDenied) => -13, // EACCES
                 Err(_) => -5, // EIO
             }
         }

@@ -195,10 +195,16 @@ pub struct Connection<P: Protocol> {
 impl<P: Protocol> Connection<P> {
     /// Create from channel
     fn new(channel: Channel) -> Self {
+        // Query the client PID via syscall
+        let client_pid = {
+            let pid = crate::syscall::channel_get_peer(channel.id());
+            if pid > 0 { Some(pid as u32) } else { None }
+        };
+
         Self {
             channel,
             state: ConnectionState::Active,
-            client_pid: None,
+            client_pid,
             _protocol: core::marker::PhantomData,
         }
     }
@@ -213,9 +219,28 @@ impl<P: Protocol> Connection<P> {
         self.state == ConnectionState::Active && self.channel.is_connected()
     }
 
-    /// Get client PID (if known from handshake)
+    /// Get client PID
+    /// Returns the PID of the process on the other end of this channel.
+    /// Used for security checks in protocol handlers.
     pub fn client_pid(&self) -> Option<u32> {
         self.client_pid
+    }
+
+    /// Get client's capabilities
+    /// Returns the capability bits of the client process.
+    /// Use crate::syscall::caps::has() to check specific capabilities.
+    pub fn client_capabilities(&self) -> Option<u64> {
+        self.client_pid.map(|pid| {
+            let caps = crate::syscall::get_capabilities(pid);
+            if caps >= 0 { caps as u64 } else { 0 }
+        })
+    }
+
+    /// Check if client has a specific capability
+    pub fn client_has_capability(&self, cap: u64) -> bool {
+        self.client_capabilities()
+            .map(|caps| crate::syscall::caps::has(caps, cap))
+            .unwrap_or(false)
     }
 
     /// Get channel ID

@@ -1,13 +1,14 @@
 [package]
 name = "wifid"
 version = "0.1.0"
-edition = "2024"
-
-[[bin]]
-name = "wifid"
-path = "src/main.rs"
+edition = "2021"
 
 [dependencies]
 userlib = { path = "../../userlib" }
 pcie = { path = "../pcie" }
 mt7996 = { path = "../mt7996" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

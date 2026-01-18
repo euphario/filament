@@ -15,7 +15,7 @@
 
 use super::fd::{FdEntry, FdFlags, FdType};
 use crate::arch::aarch64::tlb;
-use crate::logln;
+use crate::{kinfo, print_direct};
 
 /// Maximum number of registered schemes
 pub const MAX_SCHEMES: usize = 32;
@@ -1704,18 +1704,12 @@ fn open_user_scheme(
     };
 
     // Send to daemon's main channel
-    logln!("  scheme_open: sending to daemon_channel={} (path='{}', server_ch={})",
-           daemon_channel, path, server_ch);
     let (blocked_pid, peer_owner, peer_channel) = ipc::with_channel_table(|table| {
         let peer_owner = table.get_peer_owner(daemon_channel);
         let peer_channel = table.get_peer_id(daemon_channel);
         let blocked = table.send(daemon_channel, msg)?;
         Ok((blocked, peer_owner, peer_channel))
-    }).map_err(|e: ipc::IpcError| {
-        logln!("  scheme_open: send failed: {:?}", e);
-        e.to_errno()
-    })?;
-    logln!("  scheme_open: sent, blocked_pid={:?}", blocked_pid);
+    }).map_err(|e: ipc::ChannelError| e.to_errno())?;
 
     // Push IpcReady event to daemon's event queue (for event-driven processes)
     if let (Some(peer_pid), Some(peer_ch)) = (peer_owner, peer_channel) {
@@ -1784,28 +1778,28 @@ pub fn init() {
         reg.register_kernel("i2c");      // ID 7
         reg.register_kernel("pcie");     // ID 8
     }
-    logln!("  Registered kernel schemes: memory, time, irq, null, zero, console, mmio, i2c, pcie");
+    kinfo!("scheme", "init_ok"; schemes = "memory,time,irq,null,zero,console,mmio,i2c,pcie");
 }
 
 /// Test scheme system
 pub fn test() {
-    logln!("  Testing scheme system...");
+    print_direct!("  Testing scheme system...\n");
 
     // Test URL parsing
     let url = b"memory:info";
     if let Some((scheme, path)) = parse_url(url) {
-        logln!("    Parsed 'memory:info' -> scheme='{}', path='{}'", scheme, path);
+        print_direct!("    Parsed 'memory:info' -> scheme='{}', path='{}'\n", scheme, path);
     }
 
     // Test memory scheme
     if let Some(scheme) = get_kernel_scheme("memory") {
-        logln!("    Found memory scheme");
+        print_direct!("    Found memory scheme\n");
         if let Ok(handle) = scheme.open(b"info", 0) {
-            logln!("    Opened memory:info, handle={}", handle.handle);
+            print_direct!("    Opened memory:info, handle={}\n", handle.handle);
             let mut buf = [0u8; 64];
             if let Ok(n) = scheme.read(&handle, &mut buf) {
                 let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
-                logln!("    Read {} bytes: {}", n, s.trim());
+                print_direct!("    Read {} bytes: {}\n", n, s.trim());
             }
         }
     }
@@ -1816,18 +1810,18 @@ pub fn test() {
             let mut buf = [0u8; 8];
             if let Ok(_) = scheme.read(&handle, &mut buf) {
                 let ns = u64::from_le_bytes(buf);
-                logln!("    time:now = {} ns", ns);
+                print_direct!("    time:now = {} ns\n", ns);
             }
         }
     }
 
     // List registered schemes
-    logln!("    Registered schemes:");
+    print_direct!("    Registered schemes:\n");
     unsafe {
         for entry in registry().list() {
-            logln!("      {}: ({:?})", entry.name_str(), entry.scheme_type);
+            print_direct!("      {}: ({:?})\n", entry.name_str(), entry.scheme_type);
         }
     }
 
-    logln!("    [OK] Scheme system test passed");
+    print_direct!("    [OK] Scheme system test passed\n");
 }

@@ -19,7 +19,7 @@ use crate::arch::aarch64::mmu::{self, flags, attr};
 use crate::arch::aarch64::tlb;
 use super::pmm;
 use super::lock::SpinLock;
-use crate::logln;
+use crate::print_direct;
 
 // ============================================================================
 // ASID Allocator
@@ -484,32 +484,32 @@ impl Drop for AddressSpace {
 
 /// Test the address space manager
 pub fn test() {
-    logln!("  Testing address space creation...");
+    print_direct!("  Testing address space creation...\n");
 
     if let Some(mut addr_space) = AddressSpace::new() {
-        logln!("    Created address space, TTBR0: 0x{:016x}", addr_space.ttbr0);
+        print_direct!("    Created address space, TTBR0: 0x{:016x}\n", addr_space.ttbr0);
 
         // Allocate a physical page for user code
         if let Some(user_page) = pmm::alloc_page() {
-            logln!("    Allocated user page at 0x{:08x}", user_page);
+            print_direct!("    Allocated user page at 0x{:08x}\n", user_page);
 
             // Map it into the address space at a user address
             let user_virt = 0x4000_0000u64;  // 1GB mark
             if addr_space.map_page(user_virt, user_page as u64, true, true) {
-                logln!("    Mapped 0x{:08x} -> 0x{:016x}", user_page, user_virt);
-                logln!("    [OK] Address space test passed");
+                print_direct!("    Mapped 0x{:08x} -> 0x{:016x}\n", user_page, user_virt);
+                print_direct!("    [OK] Address space test passed\n");
             } else {
-                logln!("    [!!] Failed to map page");
+                print_direct!("    [!!] Failed to map page\n");
             }
 
             pmm::free_page(user_page);
         } else {
-            logln!("    [!!] Failed to allocate user page");
+            print_direct!("    [!!] Failed to allocate user page\n");
         }
 
         // addr_space will be dropped here, freeing page tables
-        logln!("    Address space cleaned up");
+        print_direct!("    Address space cleaned up\n");
     } else {
-        logln!("    [!!] Failed to create address space");
+        print_direct!("    [!!] Failed to create address space\n");
     }
 }

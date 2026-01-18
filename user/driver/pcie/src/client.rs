@@ -180,6 +180,73 @@ impl PcieClient {
 
         false
     }
+
+    /// Read PCIe Device Status register
+    ///
+    /// Returns the Device Status register value (16-bit), or None on error.
+    /// Key bits for DMA debugging:
+    /// - Bit 0: Correctable Error Detected
+    /// - Bit 1: Non-Fatal Error Detected
+    /// - Bit 2: Fatal Error Detected
+    /// - Bit 3: Unsupported Request Detected (indicates bad DMA address!)
+    /// - Bit 5: Transactions Pending
+    pub fn read_device_status(&self, port: u8, bus: u8, device: u8, function: u8) -> Option<u16> {
+        let mut buf = [0u8; 16];
+
+        // Build request: cmd(1) + port(1) + bus(1) + device(1) + function(1)
+        buf[0] = 0x04; // READ_DEVICE_STATUS command
+        buf[1] = port;
+        buf[2] = bus;
+        buf[3] = device;
+        buf[4] = function;
+
+        // Send request
+        syscall::send(self.channel, &buf[..5]);
+
+        // Wait for response
+        for _ in 0..100 {
+            let len = syscall::receive(self.channel, &mut buf);
+            if len >= 3 {
+                if buf[0] == 0xFE {
+                    // DeviceStatus marker (from pcie.rs protocol): status in bytes 1-2
+                    return Some(u16::from_le_bytes([buf[1], buf[2]]));
+                }
+                return None; // Error
+            }
+            syscall::yield_now();
+        }
+
+        None
+    }
+
+    /// Clear PCIe Device Status error bits
+    ///
+    /// Clears all error bits (Correctable, Non-Fatal, Fatal, Unsupported Request).
+    /// Returns true on success.
+    pub fn clear_device_status(&self, port: u8, bus: u8, device: u8, function: u8) -> bool {
+        let mut buf = [0u8; 16];
+
+        // Build request: cmd(1) + port(1) + bus(1) + device(1) + function(1)
+        buf[0] = 0x05; // CLEAR_DEVICE_STATUS command
+        buf[1] = port;
+        buf[2] = bus;
+        buf[3] = device;
+        buf[4] = function;
+
+        // Send request
+        syscall::send(self.channel, &buf[..5]);
+
+        // Wait for response
+        for _ in 0..100 {
+            let len = syscall::receive(self.channel, &mut buf);
+            if len > 0 {
+                return buf[0] == 1;
+            }
+            syscall::yield_now();
+        }
+
+        false
+    }
 }
 
 impl Drop for PcieClient {

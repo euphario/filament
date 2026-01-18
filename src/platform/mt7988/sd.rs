@@ -4,7 +4,7 @@
 //! Supports basic block read/write operations.
 
 use crate::arch::aarch64::mmio::MmioRegion;
-use crate::logln;
+use crate::{kdebug, kinfo, kwarn, klog};
 
 /// Block size (always 512 for SD/eMMC)
 pub const BLOCK_SIZE: usize = 512;
@@ -203,7 +203,7 @@ impl SdDriver {
 
     /// Initialize the SD controller and card
     pub fn init(&mut self) -> Result<(), &'static str> {
-        logln!("    Initializing SD/MMC controller...");
+        kdebug!("sd", "init_start");
 
         // Reset controller
         let cfg = self.mmio.read32(regs::MSDC_CFG);
@@ -220,7 +220,7 @@ impl SdDriver {
         // Check card presence
         let ps = self.mmio.read32(regs::MSDC_PS);
         if ps & regs::MSDC_PS_CDSTS != 0 {
-            logln!("    No card detected");
+            kwarn!("sd", "no_card");
             return Err("No card");
         }
 
@@ -228,9 +228,18 @@ impl SdDriver {
         self.init_card()?;
 
         self.initialized = true;
-        logln!("    [OK] SD card initialized");
-        logln!("    Type: {:?}", self.card_type);
-        logln!("    Capacity: {} MB", self.capacity * BLOCK_SIZE as u64 / (1024 * 1024));
+
+        // Convert card type to numeric for logging
+        let card_type_num = match self.card_type {
+            CardType::Unknown => 0u64,
+            CardType::SdV1 => 1,
+            CardType::SdV2 => 2,
+            CardType::SdHC => 3,
+            CardType::Mmc => 4,
+            CardType::Emmc => 5,
+        };
+        let capacity_mb = self.capacity * BLOCK_SIZE as u64 / (1024 * 1024);
+        kinfo!("sd", "init_ok"; card_type = card_type_num, capacity_mb = capacity_mb);
 
         Ok(())
     }
@@ -487,16 +496,14 @@ pub fn init_emmc() -> Result<(), &'static str> {
 
 /// Test SD/eMMC
 pub fn test() {
-    logln!("  Testing SD/eMMC...");
+    kdebug!("sd", "test_start");
 
     // Just check if we can read registers without crashing
     let msdc0 = MmioRegion::new(regs::MSDC0_BASE);
     let msdc1 = MmioRegion::new(regs::MSDC1_BASE);
     let cfg0 = msdc0.read32(regs::MSDC_CFG);
     let cfg1 = msdc1.read32(regs::MSDC_CFG);
-    logln!("    MSDC0 CFG: 0x{:08x}", cfg0);
-    logln!("    MSDC1 CFG: 0x{:08x}", cfg1);
+    kdebug!("sd", "reg_read"; msdc0_cfg = klog::hex32(cfg0), msdc1_cfg = klog::hex32(cfg1));
 
-    logln!("    Note: Full SD test requires card insertion");
-    logln!("    [OK] SD/eMMC registers accessible");
+    kinfo!("sd", "test_ok");
 }

@@ -7,7 +7,7 @@
 
 use super::addrspace::AddressSpace;
 use super::pmm;
-use crate::logln;
+use crate::{kinfo, print_direct};
 use crate::arch::aarch64::mmu;
 use super::task;
 
@@ -111,6 +111,25 @@ pub enum ElfError {
     OutOfMemory,
     /// Invalid segment
     InvalidSegment,
+    /// Binary signature verification failed (future: crypto check)
+    SignatureInvalid,
+}
+
+impl ElfError {
+    /// Convert to errno-style error code
+    pub fn to_errno(self) -> i32 {
+        match self {
+            ElfError::BadMagic => -8,         // ENOEXEC
+            ElfError::Not64Bit => -8,         // ENOEXEC
+            ElfError::NotLittleEndian => -8,  // ENOEXEC
+            ElfError::NotExecutable => -8,    // ENOEXEC
+            ElfError::WrongArch => -8,        // ENOEXEC
+            ElfError::TooSmall => -8,         // ENOEXEC
+            ElfError::OutOfMemory => -12,     // ENOMEM
+            ElfError::InvalidSegment => -8,   // ENOEXEC
+            ElfError::SignatureInvalid => -1, // EPERM
+        }
+    }
 }
 
 /// Parsed ELF information
@@ -121,6 +140,36 @@ pub struct ElfInfo {
     pub base: u64,
     /// Number of segments loaded
     pub segments_loaded: usize,
+}
+
+// ============================================================================
+// Binary Signature Verification (stub for future crypto implementation)
+// ============================================================================
+
+/// Verify that a binary is authorized to receive the requested capabilities.
+///
+/// STUB: Currently always returns Ok. Future implementation will:
+/// - Check binary hash against known-good list, OR
+/// - Verify Ed25519 signature in .sig ELF section, OR
+/// - Validate signed capability manifest
+///
+/// # Arguments
+/// * `_data` - Raw ELF binary bytes (for hashing/signature extraction)
+/// * `_name` - Binary name (for manifest lookup)
+/// * `_requested_caps` - Capabilities being granted (to verify against manifest)
+///
+/// # Returns
+/// * `Ok(())` - Binary is authorized
+/// * `Err(SignatureInvalid)` - Binary failed verification
+#[allow(unused_variables)]
+pub fn verify_binary_signature(
+    _data: &[u8],
+    _name: &str,
+    _requested_caps: Option<super::caps::Capabilities>,
+) -> Result<(), ElfError> {
+    // TODO: Implement actual signature verification
+    // For now, trust all binaries (implicit trust via initrd embedding)
+    Ok(())
 }
 
 /// Validate ELF header
@@ -319,16 +368,16 @@ pub fn print_header_info(header: &Elf64Header) {
     let e_phoff = { header.e_phoff };
     let e_phnum = { header.e_phnum };
 
-    logln!("  ELF Header:");
-    logln!("    Type:    {}", match e_type {
+    print_direct!("  ELF Header:\n");
+    print_direct!("    Type:    {}\n", match e_type {
         ET_EXEC => "Executable",
         ET_DYN => "Shared/PIE",
         _ => "Unknown",
     });
-    logln!("    Machine: {}", if e_machine == EM_AARCH64 { "AArch64" } else { "Unknown" });
-    logln!("    Entry:   0x{:016x}", e_entry);
-    logln!("    PHoff:   0x{:x}", e_phoff);
-    logln!("    PHnum:   {}", e_phnum);
+    print_direct!("    Machine: {}\n", if e_machine == EM_AARCH64 { "AArch64" } else { "Unknown" });
+    print_direct!("    Entry:   0x{:016x}\n", e_entry);
+    print_direct!("    PHoff:   0x{:x}\n", e_phoff);
+    print_direct!("    PHnum:   {}\n", e_phnum);
 }
 
 /// Print program header info
@@ -355,7 +404,7 @@ pub fn print_phdr_info(phdr: &Elf64ProgramHeader) {
     if (p_flags & PF_W) != 0 { flags_str[1] = b'W'; }
     if (p_flags & PF_X) != 0 { flags_str[2] = b'X'; }
 
-    logln!("    {:8} 0x{:08x} 0x{:08x} {} {}",
+    print_direct!("    {:8} 0x{:08x} 0x{:08x} {} {}\n",
         type_str,
         p_vaddr,
         p_memsz,
@@ -371,8 +420,8 @@ pub fn print_phdr_info(phdr: &Elf64ProgramHeader) {
 /// Default user stack virtual address (grows down from here)
 pub const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
 
-/// User stack size (64KB)
-pub const USER_STACK_SIZE: usize = 64 * 1024;
+/// User stack size (256KB - devd and other daemons need larger stacks)
+pub const USER_STACK_SIZE: usize = 256 * 1024;
 
 /// Guard page size (4KB) - unmapped page below stack to catch overflow
 pub const USER_GUARD_PAGE_SIZE: usize = 4096;
@@ -387,6 +436,32 @@ pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), 
 /// Sets up parent-child relationship
 /// Returns (task_id, task_slot) on success
 pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::TaskId) -> Result<(task::TaskId, usize), ElfError> {
+    spawn_from_elf_internal(data, name, parent_id, None)
+}
+
+/// Spawn a new process from an ELF binary with explicit capability grant
+/// explicit_caps: If Some, use these capabilities (intersected with parent's)
+///                If None, inherit all parent capabilities (legacy behavior)
+pub fn spawn_from_elf_with_caps(
+    data: &[u8],
+    name: &str,
+    parent_id: task::TaskId,
+    requested_caps: super::caps::Capabilities
+) -> Result<(task::TaskId, usize), ElfError> {
+    spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))
+}
+
+/// Internal spawn implementation
+fn spawn_from_elf_internal(
+    data: &[u8],
+    name: &str,
+    parent_id: task::TaskId,
+    explicit_caps: Option<super::caps::Capabilities>
+) -> Result<(task::TaskId, usize), ElfError> {
+    // Verify binary signature/authorization before spawning
+    // (stub: always passes, future: crypto verification)
+    verify_binary_signature(data, name, explicit_caps)?;
+
     // Create a new user task
     let (task_id, slot) = unsafe {
         task::scheduler().add_user_task(name).ok_or(ElfError::OutOfMemory)?
@@ -435,13 +510,11 @@ pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::Task
     };
     task.set_user_entry(elf_info.entry, USER_STACK_TOP);
 
-    // Set up parent-child relationship and inherit capabilities
-    // TODO: Implement exec_with_caps syscall for explicit capability grants per-process
-    //       instead of blanket inheritance (security improvement)
+    // Set up parent-child relationship and handle capabilities
     if parent_id != 0 {
         task.set_parent(parent_id);
 
-        // Add child to parent's children list and inherit capabilities
+        // Add child to parent's children list and compute capabilities
         unsafe {
             let sched = task::scheduler();
             // First pass: find parent's capabilities
@@ -454,31 +527,34 @@ pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::Task
                     }
                 }
             }
-            // Second pass: add child and set capabilities
-            let mut found_parent = false;
+            // Second pass: add child to parent's children list
             for task_opt in sched.tasks.iter_mut() {
                 if let Some(ref mut parent_task) = task_opt {
                     if parent_task.id == parent_id {
-                        let added = parent_task.add_child(task_id);
-                        logln!("    add_child({}): parent {} now has {} children, added={}",
-                               task_id, parent_id, parent_task.num_children, added);
-                        found_parent = true;
+                        let _ = parent_task.add_child(task_id);
                         break;
                     }
                 }
             }
-            if !found_parent {
-                logln!("    WARNING: parent {} not found for child {}", parent_id, task_id);
-            }
-            // Apply inherited capabilities to the child
-            if let Some(caps) = parent_caps {
+            // Compute and apply child capabilities
+            if let Some(p_caps) = parent_caps {
                 let child_task = sched.task_mut(slot).expect("just created");
-                child_task.set_capabilities(caps);
+                let final_caps = match explicit_caps {
+                    Some(requested) => {
+                        // Explicit grant: use child_capabilities() for proper filtering
+                        super::caps::child_capabilities(p_caps, requested)
+                    }
+                    None => {
+                        // Legacy: inherit all parent capabilities
+                        p_caps
+                    }
+                };
+                child_task.set_capabilities(final_caps);
             }
         }
     }
 
-    logln!("    Spawned '{}' (PID {}) entry=0x{:x} parent={}", name, task_id, elf_info.entry, parent_id);
+    kinfo!("elf", "spawn_ok"; name = name, pid = task_id as u64, entry = crate::klog::hex64(elf_info.entry), parent = parent_id as u64);
 
     Ok((task_id, slot))
 }
@@ -504,6 +580,21 @@ pub fn get_elf_by_id(id: u32) -> Option<&'static [u8]> {
 /// Searches /bin/<name> and /<name>
 pub fn spawn_from_path(path: &str) -> Result<(task::TaskId, usize), ElfError> {
     spawn_from_path_with_parent(path, 0)
+}
+
+/// Spawn from path with explicit capability grant (uses find_executable)
+pub fn spawn_from_path_with_caps_find(
+    path: &str,
+    parent_id: task::TaskId,
+    requested_caps: super::caps::Capabilities
+) -> Result<(task::TaskId, usize), ElfError> {
+    // Try to find the file in ramfs
+    let data = find_executable(path).ok_or(ElfError::NotExecutable)?;
+
+    // Extract name from path for the process name
+    let name = path.rsplit('/').next().unwrap_or(path);
+
+    spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))
 }
 
 /// Spawn a process from a file path with a parent
@@ -713,45 +804,45 @@ pub fn get_test_elf2() -> &'static [u8] {
 
 /// Test ELF loading
 pub fn test() {
-    logln!("  Testing ELF loader...");
+    print_direct!("  Testing ELF loader...\n");
 
     // Validate the test ELF
     match validate_header(TEST_ELF) {
         Ok(header) => {
-            logln!("    Test ELF validated");
+            print_direct!("    Test ELF validated\n");
             print_header_info(header);
 
             match get_program_headers(TEST_ELF, header) {
                 Ok(phdrs) => {
-                    logln!("    Program headers:");
+                    print_direct!("    Program headers:\n");
                     for phdr in phdrs {
                         print_phdr_info(phdr);
                     }
                 }
-                Err(e) => logln!("    [!!] Failed to get phdrs: {:?}", e),
+                Err(e) => print_direct!("    [!!] Failed to get phdrs: {:?}\n", e),
             }
         }
         Err(e) => {
-            logln!("    [!!] ELF validation failed: {:?}", e);
+            print_direct!("    [!!] ELF validation failed: {:?}\n", e);
             return;
         }
     }
 
     // Try loading into a new address space
-    logln!("    Loading ELF into address space...");
+    print_direct!("    Loading ELF into address space...\n");
     if let Some(mut addr_space) = AddressSpace::new() {
         match load_elf(TEST_ELF, &mut addr_space) {
             Ok(info) => {
-                logln!("    Loaded {} segments", info.segments_loaded);
-                logln!("    Entry point: 0x{:016x}", info.entry);
-                logln!("    Base address: 0x{:016x}", info.base);
-                logln!("    [OK] ELF loaded successfully");
+                print_direct!("    Loaded {} segments\n", info.segments_loaded);
+                print_direct!("    Entry point: 0x{:016x}\n", info.entry);
+                print_direct!("    Base address: 0x{:016x}\n", info.base);
+                print_direct!("    [OK] ELF loaded successfully\n");
             }
-            Err(e) => logln!("    [!!] Load failed: {:?}", e),
+            Err(e) => print_direct!("    [!!] Load failed: {:?}\n", e),
         }
     } else {
-        logln!("    [!!] Failed to create address space");
+        print_direct!("    [!!] Failed to create address space\n");
     }
 
-    logln!("    [OK] ELF loader test passed");
+    print_direct!("    [OK] ELF loader test passed\n");
 }

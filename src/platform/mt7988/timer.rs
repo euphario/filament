@@ -3,7 +3,7 @@
 //! Uses the EL1 Physical Timer (CNTP_*) which generates the timer PPI.
 //! Implements the HAL Timer trait for portability.
 
-use crate::logln;
+use crate::kdebug;
 use crate::hal::Timer as TimerTrait;
 use super::{gic, irq};
 
@@ -75,6 +75,13 @@ impl Timer {
 
         if (ctl & ctl::ISTATUS) != 0 {
             self.tick_count += 1;
+
+            // Update per-CPU tick counts for CPU usage tracking
+            let cpu_data = crate::kernel::percpu::cpu_local();
+            cpu_data.tick();
+            if cpu_data.is_idle() {
+                cpu_data.idle_tick();
+            }
 
             // Kick the watchdog to prevent system reset
             super::wdt::kick();
@@ -274,7 +281,7 @@ pub fn counter() -> u64 {
 /// Print timer info
 pub fn print_info() {
     let freq = frequency();
-    logln!("  Frequency: {} Hz ({} MHz)", freq, freq / 1_000_000);
+    kdebug!("timer", "info"; freq_hz = freq, freq_mhz = freq / 1_000_000);
 }
 
 /// Get a mutable reference to the timer as a Timer trait object

@@ -15,8 +15,8 @@
 #![no_main]
 #![allow(dead_code)]  // Constants/registers for future use
 
-use userlib::{println, syscall};
-use userlib::syscall::{Event, event_type, event_flags};
+use userlib::{syscall, uinfo, uwarn, uerror, EventFilter, kevent_subscribe, kevent_timer, kevent_wait};
+use userlib::syscall::{Event, event_type};
 use userlib::ipc::{Server, Connection, IpcError, DevdClient};
 use userlib::ipc::protocols::{GpioProtocol, GpioRequest, GpioResponse};
 use userlib::ipc::protocols::devd::PropertyList;
@@ -97,19 +97,17 @@ impl GpioExpander {
         // Open PCA9545 multiplexer on I2C2 @ 0x70
         let mux_fd = syscall::scheme_open("i2c:2/70", 2);
         if mux_fd < 0 {
-            println!("  Failed to open I2C mux: {}", mux_fd);
+            uerror!("gpio", "i2c_open_failed"; device = "pca9545", err = mux_fd as i64);
             return None;
         }
-        println!("  PCA9545 mux opened (fd={})", mux_fd);
 
         // Open PCA9555 expander on I2C2 @ 0x20
         let gpio_fd = syscall::scheme_open("i2c:2/20", 2);
         if gpio_fd < 0 {
-            println!("  Failed to open I2C GPIO: {}", gpio_fd);
+            uerror!("gpio", "i2c_open_failed"; device = "pca9555", err = gpio_fd as i64);
             syscall::close(mux_fd as u32);
             return None;
         }
-        println!("  PCA9555 GPIO opened (fd={})", gpio_fd);
 
         Some(Self {
             i2c_mux_fd: mux_fd,
@@ -124,7 +122,7 @@ impl GpioExpander {
         let data = [MUX_CHANNEL_3];
         let result = syscall::write(self.i2c_mux_fd as u32, &data);
         if result < 0 {
-            println!("  Mux select failed: {}", result);
+            uerror!("gpio", "mux_select_failed"; err = result as i64);
             return false;
         }
         true
@@ -154,48 +152,38 @@ impl GpioExpander {
     }
 
     fn init(&mut self) -> bool {
-        println!("  Initializing PCA9555...");
-
         if !self.select_mux_channel() {
-            println!("    Failed to select mux channel");
+            uerror!("gpio", "init_failed"; reason = "mux_select");
             return false;
         }
-        println!("    Mux channel 3 selected");
 
         if let Some(out0) = self.read_reg(pca9555::OUTPUT_PORT0) {
             self.output_state[0] = out0;
-            println!("    Output port 0: 0x{:02x}", out0);
         } else {
-            println!("    Failed to read output port 0");
+            uerror!("gpio", "init_failed"; reason = "read_output0");
             return false;
         }
 
         if let Some(out1) = self.read_reg(pca9555::OUTPUT_PORT1) {
             self.output_state[1] = out1;
-            println!("    Output port 1: 0x{:02x}", out1);
         }
 
         if let Some(cfg0) = self.read_reg(pca9555::CONFIG_PORT0) {
             self.config_state[0] = cfg0;
-            println!("    Config port 0: 0x{:02x}", cfg0);
         }
 
         if let Some(cfg1) = self.read_reg(pca9555::CONFIG_PORT1) {
             self.config_state[1] = cfg1;
-            println!("    Config port 1: 0x{:02x}", cfg1);
         }
 
         // Read initial input state
         if let Some(in0) = self.read_reg(pca9555::INPUT_PORT0) {
             self.input_state[0] = in0;
-            println!("    Input port 0: 0x{:02x}", in0);
         }
         if let Some(in1) = self.read_reg(pca9555::INPUT_PORT1) {
             self.input_state[1] = in1;
-            println!("    Input port 1: 0x{:02x}", in1);
         }
 
-        println!("    PCA9555 initialized");
         true
     }
 
@@ -329,8 +317,8 @@ impl GpioExpander {
                 .add("val", if value { "1" } else { "0" })
                 .add("name", PIN_NAMES[pin as usize]);
 
-            if let Err(e) = devd.register(path, props) {
-                println!("  Failed to register {} with devd: {:?}", path, e);
+            if devd.register(path, props).is_err() {
+                uerror!("gpio", "devd_register_failed"; pin = pin as u64);
             }
         }
     }
@@ -367,118 +355,85 @@ impl GpioExpander {
 
 #[unsafe(no_mangle)]
 fn main() {
-    println!("========================================");
-    println!("  GPIO Expander Driver (PCA9555)");
-    println!("  BPI-R4 I2C GPIO Expander");
-    println!("========================================");
-    println!();
+    uinfo!("gpio", "init_start");
 
     // Create and initialize GPIO expander
-    println!("=== I2C Initialization ===");
     let mut gpio = match GpioExpander::new() {
         Some(g) => g,
         None => {
-            println!("ERROR: Failed to open I2C devices");
+            uerror!("gpio", "init_failed"; reason = "i2c_open");
             syscall::exit(1);
         }
     };
 
-    println!();
-    println!("=== PCA9555 Initialization ===");
     if !gpio.init() {
-        println!("ERROR: Failed to initialize PCA9555");
+        uerror!("gpio", "init_failed"; reason = "pca9555_init");
         syscall::exit(1);
     }
 
     // Enable USB VBUS by default (pin 11)
-    println!();
-    println!("=== Enabling USB Power ===");
     if gpio.set_output(GPIO_USB_VBUS, true) {
-        println!("  USB VBUS enabled (pin {})", GPIO_USB_VBUS);
+        uinfo!("gpio", "gpio_ready"; pin = GPIO_USB_VBUS as u64);
     } else {
-        println!("  WARNING: Failed to enable USB VBUS");
+        uwarn!("gpio", "usb_vbus_failed");
     }
 
     // Register GPIO server
-    println!();
     let server = match Server::<GpioProtocol>::register() {
-        Ok(s) => {
-            println!("  Registered 'gpio' port");
-            s
-        }
+        Ok(s) => s,
         Err(IpcError::ResourceBusy) => {
-            println!("ERROR: GPIO driver already running");
+            uerror!("gpio", "init_failed"; reason = "port_busy");
             syscall::exit(1);
         }
-        Err(e) => {
-            println!("ERROR: Failed to register GPIO port: {:?}", e);
+        Err(_) => {
+            uerror!("gpio", "init_failed"; reason = "port_register");
             syscall::exit(1);
         }
     };
 
     // Connect to devd and register pins
-    println!();
-    println!("=== Registering with devd ===");
     let mut devd_client: Option<DevdClient> = match DevdClient::connect() {
         Ok(mut client) => {
-            println!("  Connected to devd");
             gpio.register_with_devd(&mut client);
-            println!("  Registered {} GPIO pins", 16);
             Some(client)
         }
-        Err(e) => {
-            println!("  WARNING: Failed to connect to devd: {:?}", e);
-            println!("  GPIO pins will not be visible in device tree");
+        Err(_) => {
+            uwarn!("gpio", "devd_connect_failed");
             None
         }
     };
 
-    // Subscribe to events
-    println!();
-    println!("=== Setting up event handling ===");
-
-    // Subscribe to IPC events for GPIO port
+    // Subscribe to IPC events for GPIO port (kevent API)
     let gpio_channel = server.listen_channel();
-    let result = syscall::event_subscribe(event_type::IPC_READY, gpio_channel as u64);
-    if result != 0 {
-        println!("ERROR: Failed to subscribe to IPC events: {}", result);
+    if kevent_subscribe(EventFilter::Ipc(gpio_channel)).is_err() {
+        uerror!("gpio", "event_subscribe_failed"; event = "ipc");
         syscall::exit(1);
     }
-    println!("  IpcReady(gpio:{}): OK", gpio_channel);
 
-    // Subscribe to timer events for polling
-    let result = syscall::event_subscribe(event_type::TIMER, 0);
-    if result != 0 {
-        println!("ERROR: Failed to subscribe to Timer events: {}", result);
+    // Subscribe to timer events for polling (kevent API)
+    if kevent_subscribe(EventFilter::Timer(0)).is_err() {
+        uerror!("gpio", "event_subscribe_failed"; event = "timer");
         syscall::exit(1);
     }
-    println!("  Timer: OK");
 
-    // Set initial polling timer
-    syscall::timer_set(POLL_INTERVAL_NS);
+    // Set recurring polling timer (kevent_timer: id=1, interval, initial)
+    let _ = kevent_timer(1, POLL_INTERVAL_NS, POLL_INTERVAL_NS);
 
-    println!();
-    println!("========================================");
-    println!("  GPIO driver ready (polling every 100ms)");
-    println!("========================================");
+    uinfo!("gpio", "ready");
 
-    // Event-driven main loop
-    let mut event = Event::empty();
+    // Event-driven main loop (kevent batch receive)
+    let mut events = [Event::empty(); 4];
 
     loop {
-        let result = syscall::event_wait(&mut event, event_flags::BLOCKING);
+        let count = match kevent_wait(&mut events, u64::MAX) {
+            Ok(n) => n,
+            Err(_) => {
+                syscall::yield_now();
+                continue;
+            }
+        };
 
-        if result == -11 {
-            // EAGAIN - yield and retry
-            syscall::yield_now();
-            continue;
-        }
-
-        if result <= 0 {
-            syscall::yield_now();
-            continue;
-        }
-
+        for event in &events[..count] {
         match event.event_type {
             et if et == event_type::IPC_READY => {
                 let channel = event.data as u32;
@@ -502,17 +457,13 @@ fn main() {
             }
 
             et if et == event_type::TIMER => {
-                // Poll for input changes
-                let changed = gpio.poll_changes(&mut devd_client);
-                if changed > 0 {
-                    println!("[gpio] {} input pin(s) changed", changed);
-                }
-
-                // Re-arm timer for next poll
-                syscall::timer_set(POLL_INTERVAL_NS);
+                // Poll for input changes (no logging for normal polling)
+                // Timer auto-rearms due to recurring kevent_timer
+                gpio.poll_changes(&mut devd_client);
             }
 
             _ => {}
+        }
         }
     }
 }

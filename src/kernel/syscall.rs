@@ -14,7 +14,8 @@
 //!
 //! SECURITY: All user pointers are validated before access using the uaccess module.
 
-use crate::logln;
+use crate::{kwarn, kdebug, kinfo, print_direct};
+use crate::span;
 #[allow(unused_imports)]  // Used for phys_to_dma method on dyn Platform
 use crate::hal::Platform;
 use super::uaccess::{self, UAccessError};
@@ -120,18 +121,12 @@ pub enum SyscallNumber {
     ReceiveTimeout = 46,
     /// Unmap shared memory region from this process
     ShmemUnmap = 47,
-    /// Enumerate PCI devices
-    PciEnumerate = 50,
     /// Read PCI config space
     PciConfigRead = 51,
     /// Write PCI config space
     PciConfigWrite = 52,
-    /// Map PCI BAR into process address space
-    PciBarMap = 53,
     /// Allocate MSI vector(s) for a device
     PciMsiAlloc = 54,
-    /// Claim ownership of a PCI device
-    PciClaim = 55,
     /// Allow a PID to send signals to this process
     SignalAllow = 56,
     /// Set a timer - delivers Timer event after duration_ns nanoseconds
@@ -142,8 +137,32 @@ pub enum SyscallNumber {
     BusList = 59,
     /// Map device MMIO into process address space (generic, no device tracking)
     MmapDevice = 60,
-    /// Allocate from DMA pool (low memory for PCIe devices)
+    /// Allocate from DMA pool (low memory for PCIe devices, < 4GB)
     DmaPoolCreate = 61,
+    /// Allocate from high DMA pool (36-bit addresses, > 4GB)
+    DmaPoolCreateHigh = 62,
+    /// List ramfs entries (for vfsd directory listing)
+    RamfsList = 63,
+    /// Execute ELF from memory buffer (for loading from vfsd/fatfs)
+    ExecMem = 64,
+    /// Read formatted kernel log record (for consoled)
+    KlogRead = 65,
+    /// Get capabilities of a process (for security checks in protocol handlers)
+    GetCapabilities = 66,
+    /// Get peer PID of a channel (for identifying caller in protocol handlers)
+    ChannelGetPeer = 67,
+    /// Get CPU statistics (tick counts, idle ticks, CPU count)
+    CpuStats = 68,
+    /// Subscribe to events (kevent-style: unified filter)
+    KeventSubscribe = 70,
+    /// Unsubscribe from events (kevent-style)
+    KeventUnsubscribe = 71,
+    /// Set/modify timer (kevent-style: multiple timers, recurring support)
+    KeventTimer = 72,
+    /// Wait for events (kevent-style: batch receive)
+    KeventWait = 73,
+    /// Execute with explicit capability grant (for privilege separation)
+    ExecWithCaps = 74,
     /// Invalid syscall
     Invalid = 0xFFFF,
 }
@@ -199,18 +218,27 @@ impl From<u64> for SyscallNumber {
             45 => SyscallNumber::SendDirect,
             46 => SyscallNumber::ReceiveTimeout,
             47 => SyscallNumber::ShmemUnmap,
-            50 => SyscallNumber::PciEnumerate,
             51 => SyscallNumber::PciConfigRead,
             52 => SyscallNumber::PciConfigWrite,
-            53 => SyscallNumber::PciBarMap,
             54 => SyscallNumber::PciMsiAlloc,
-            55 => SyscallNumber::PciClaim,
             56 => SyscallNumber::SignalAllow,
             57 => SyscallNumber::TimerSet,
             58 => SyscallNumber::Heartbeat,
             59 => SyscallNumber::BusList,
             60 => SyscallNumber::MmapDevice,
             61 => SyscallNumber::DmaPoolCreate,
+            62 => SyscallNumber::DmaPoolCreateHigh,
+            63 => SyscallNumber::RamfsList,
+            64 => SyscallNumber::ExecMem,
+            65 => SyscallNumber::KlogRead,
+            66 => SyscallNumber::GetCapabilities,
+            67 => SyscallNumber::ChannelGetPeer,
+            68 => SyscallNumber::CpuStats,
+            70 => SyscallNumber::KeventSubscribe,
+            71 => SyscallNumber::KeventUnsubscribe,
+            72 => SyscallNumber::KeventTimer,
+            73 => SyscallNumber::KeventWait,
+            74 => SyscallNumber::ExecWithCaps,
             _ => SyscallNumber::Invalid,
         }
     }
@@ -254,6 +282,13 @@ pub enum SyscallError {
     NotImplemented = -38,
 }
 
+impl SyscallError {
+    /// Convert to errno-style error code
+    pub fn to_errno(self) -> i32 {
+        self as i32
+    }
+}
+
 /// Syscall arguments structure
 #[repr(C)]
 pub struct SyscallArgs {
@@ -268,15 +303,33 @@ pub struct SyscallArgs {
 
 /// Convert UAccessError to syscall error code
 fn uaccess_to_errno(e: UAccessError) -> i64 {
-    e.to_errno()
+    e.to_errno() as i64
 }
 
 /// Handle a syscall
 /// Returns the result to be placed in x0
 pub fn handle(args: &SyscallArgs) -> i64 {
     let syscall = SyscallNumber::from(args.num);
+    let pid = current_pid();
 
-    match syscall {
+    // Get syscall name for tracing (only for non-trivial syscalls)
+    let syscall_name = syscall_name(syscall);
+
+    // Skip tracing for very high-frequency syscalls to reduce overhead
+    let should_trace = !matches!(syscall,
+        SyscallNumber::Yield |
+        SyscallNumber::GetTime |
+        SyscallNumber::DebugWrite
+    );
+
+    // Create span for traceable syscalls
+    let _span = if should_trace {
+        Some(span!("syscall", syscall_name; pid = pid as u64, num = args.num))
+    } else {
+        None
+    };
+
+    let result = match syscall {
         SyscallNumber::Exit => sys_exit(args.arg0 as i32),
         SyscallNumber::DebugWrite => sys_debug_write(args.arg0, args.arg1 as usize),
         SyscallNumber::Yield => sys_yield(),
@@ -339,30 +392,120 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::ShmemNotify => sys_shmem_notify(args.arg0 as u32),
         SyscallNumber::ShmemDestroy => sys_shmem_destroy(args.arg0 as u32),
         SyscallNumber::ShmemUnmap => sys_shmem_unmap(args.arg0 as u32),
-        SyscallNumber::PciEnumerate => sys_pci_enumerate(args.arg0, args.arg1 as usize),
         SyscallNumber::PciConfigRead => {
             sys_pci_config_read(args.arg0 as u32, args.arg1 as u16, args.arg2 as u8)
         }
         SyscallNumber::PciConfigWrite => {
             sys_pci_config_write(args.arg0 as u32, args.arg1 as u16, args.arg2 as u8, args.arg3 as u32)
         }
-        SyscallNumber::PciBarMap => {
-            sys_pci_bar_map(args.arg0 as u32, args.arg1 as u8, args.arg2)
-        }
         SyscallNumber::PciMsiAlloc => {
             sys_pci_msi_alloc(args.arg0 as u32, args.arg1 as u8)
         }
-        SyscallNumber::PciClaim => sys_pci_claim(args.arg0 as u32),
         SyscallNumber::SignalAllow => sys_signal_allow(args.arg0 as u32),
         SyscallNumber::TimerSet => sys_timer_set(args.arg0),
         SyscallNumber::Heartbeat => sys_heartbeat(),
         SyscallNumber::BusList => sys_bus_list(args.arg0, args.arg1),
         SyscallNumber::MmapDevice => sys_mmap_device(args.arg0, args.arg1),
         SyscallNumber::DmaPoolCreate => sys_dma_pool_create(args.arg0 as usize, args.arg1, args.arg2),
+        SyscallNumber::DmaPoolCreateHigh => sys_dma_pool_create_high(args.arg0 as usize, args.arg1, args.arg2),
+        SyscallNumber::RamfsList => sys_ramfs_list(args.arg0, args.arg1 as usize),
+        SyscallNumber::ExecMem => sys_exec_mem(args.arg0, args.arg1 as usize, args.arg2, args.arg3 as usize),
+        SyscallNumber::KlogRead => sys_klog_read(args.arg0, args.arg1 as usize),
+        SyscallNumber::GetCapabilities => sys_get_capabilities(args.arg0 as u32),
+        SyscallNumber::ChannelGetPeer => sys_channel_get_peer(args.arg0 as u32),
+        SyscallNumber::CpuStats => sys_cpu_stats(args.arg0, args.arg1 as usize),
+        SyscallNumber::KeventSubscribe => sys_kevent_subscribe(args.arg0 as u32, args.arg1 as u32),
+        SyscallNumber::KeventUnsubscribe => sys_kevent_unsubscribe(args.arg0 as u32, args.arg1 as u32),
+        SyscallNumber::KeventTimer => sys_kevent_timer(args.arg0 as u32, args.arg1, args.arg2),
+        SyscallNumber::KeventWait => sys_kevent_wait(args.arg0, args.arg1 as u32, args.arg2),
+        SyscallNumber::ExecWithCaps => sys_exec_with_caps(args.arg0, args.arg1 as usize, args.arg2),
         SyscallNumber::Invalid => {
-            logln!("[SYSCALL] Invalid syscall number: {}", args.num);
+            kwarn!("syscall", "invalid"; num = args.num, pid = pid as u64);
             SyscallError::NotImplemented as i64
         }
+    };
+
+    // Log failed syscalls at debug level (helps with debugging)
+    if should_trace && result < 0 {
+        kdebug!("syscall", "failed"; name = syscall_name, result = result, pid = pid as u64);
+    }
+
+    result
+}
+
+/// Get syscall name as static str for tracing
+fn syscall_name(syscall: SyscallNumber) -> &'static str {
+    match syscall {
+        SyscallNumber::Exit => "exit",
+        SyscallNumber::DebugWrite => "debug_write",
+        SyscallNumber::Yield => "yield",
+        SyscallNumber::GetPid => "getpid",
+        SyscallNumber::Mmap => "mmap",
+        SyscallNumber::Munmap => "munmap",
+        SyscallNumber::Send => "send",
+        SyscallNumber::Receive => "receive",
+        SyscallNumber::Spawn => "spawn",
+        SyscallNumber::Wait => "wait",
+        SyscallNumber::GetTime => "gettime",
+        SyscallNumber::ChannelCreate => "channel_create",
+        SyscallNumber::ChannelClose => "channel_close",
+        SyscallNumber::ChannelTransfer => "channel_transfer",
+        SyscallNumber::PortRegister => "port_register",
+        SyscallNumber::PortUnregister => "port_unregister",
+        SyscallNumber::PortConnect => "port_connect",
+        SyscallNumber::PortAccept => "port_accept",
+        SyscallNumber::Open => "open",
+        SyscallNumber::Close => "close",
+        SyscallNumber::Read => "read",
+        SyscallNumber::Write => "write",
+        SyscallNumber::Dup => "dup",
+        SyscallNumber::Dup2 => "dup2",
+        SyscallNumber::EventSubscribe => "event_subscribe",
+        SyscallNumber::EventUnsubscribe => "event_unsubscribe",
+        SyscallNumber::EventWait => "event_wait",
+        SyscallNumber::EventPost => "event_post",
+        SyscallNumber::SchemeOpen => "scheme_open",
+        SyscallNumber::SchemeRegister => "scheme_register",
+        SyscallNumber::SchemeUnregister => "scheme_unregister",
+        SyscallNumber::Exec => "exec",
+        SyscallNumber::Daemonize => "daemonize",
+        SyscallNumber::Kill => "kill",
+        SyscallNumber::PsInfo => "ps_info",
+        SyscallNumber::SetLogLevel => "set_log_level",
+        SyscallNumber::MmapDma => "mmap_dma",
+        SyscallNumber::Reset => "reset",
+        SyscallNumber::Lseek => "lseek",
+        SyscallNumber::ShmemCreate => "shmem_create",
+        SyscallNumber::ShmemMap => "shmem_map",
+        SyscallNumber::ShmemAllow => "shmem_allow",
+        SyscallNumber::ShmemWait => "shmem_wait",
+        SyscallNumber::ShmemNotify => "shmem_notify",
+        SyscallNumber::ShmemDestroy => "shmem_destroy",
+        SyscallNumber::SendDirect => "send_direct",
+        SyscallNumber::ReceiveTimeout => "receive_timeout",
+        SyscallNumber::ShmemUnmap => "shmem_unmap",
+        SyscallNumber::PciConfigRead => "pci_config_read",
+        SyscallNumber::PciConfigWrite => "pci_config_write",
+        SyscallNumber::PciMsiAlloc => "pci_msi_alloc",
+        SyscallNumber::SignalAllow => "signal_allow",
+        SyscallNumber::TimerSet => "timer_set",
+        SyscallNumber::Heartbeat => "heartbeat",
+        SyscallNumber::BusList => "bus_list",
+        SyscallNumber::MmapDevice => "mmap_device",
+        SyscallNumber::DmaPoolCreate => "dma_pool_create",
+        SyscallNumber::DmaPoolCreateHigh => "dma_pool_create_high",
+        SyscallNumber::RamfsList => "ramfs_list",
+        SyscallNumber::ExecMem => "exec_mem",
+        SyscallNumber::KlogRead => "klog_read",
+        SyscallNumber::GetCapabilities => "get_capabilities",
+        SyscallNumber::ChannelGetPeer => "channel_get_peer",
+        SyscallNumber::CpuStats => "cpu_stats",
+        SyscallNumber::KeventSubscribe => "kevent_subscribe",
+        SyscallNumber::KeventUnsubscribe => "kevent_unsubscribe",
+        SyscallNumber::KeventTimer => "kevent_timer",
+        SyscallNumber::KeventWait => "kevent_wait",
+        SyscallNumber::ExecWithCaps => "exec_with_caps",
+        SyscallNumber::Invalid => "invalid",
     }
 }
 
@@ -388,7 +531,7 @@ fn require_capability(cap: Capabilities) -> Result<(), i64> {
                 task.id,
                 "", // cap name logged separately
             );
-            logln!("[SECURITY]   capability={:?}", cap);
+            kwarn!("security", "cap_denied"; pid = task.id as u64, cap = core::any::type_name_of_val(&cap));
         }
     }
     Err(SyscallError::PermissionDenied as i64)
@@ -401,10 +544,9 @@ fn sys_exit(code: i32) -> i64 {
         crate::platform::mt7988::uart::flush_buffer();
     }
 
-    logln!();
-    logln!("========================================");
-    logln!("  Process exited with code: {}", code);
-    logln!("========================================");
+    print_direct!("\n========================================\n");
+    print_direct!("  Process exited with code: {}\n", code);
+    print_direct!("========================================\n");
 
     unsafe {
         let sched = super::task::scheduler();
@@ -412,8 +554,6 @@ fn sys_exit(code: i32) -> i64 {
 
         // Get current task's info before terminating
         let (pid, parent_id) = if let Some(ref task) = sched.tasks[current_slot] {
-            logln!("[sys_exit] task pid={} parent={} name={:?}",
-                   task.id, task.parent_id, task.name_str());
             (task.id, task.parent_id)
         } else {
             (0, 0)
@@ -463,7 +603,7 @@ fn sys_exit(code: i32) -> i64 {
         }
 
         // Debug: show task states before scheduling
-        logln!("  Task states at exit (current_slot={}):", super::task::current_slot());
+        print_direct!("  Task states at exit (current_slot={}):\n", super::task::current_slot());
         for (i, task_opt) in sched.tasks.iter().enumerate() {
             if let Some(ref task) = task_opt {
                 let state_str = match task.state {
@@ -472,7 +612,7 @@ fn sys_exit(code: i32) -> i64 {
                     super::task::TaskState::Blocked => "Waiting",
                     super::task::TaskState::Terminated => "Terminated",
                 };
-                logln!("    [{}] {} - {}", i, task.name_str(), state_str);
+                print_direct!("    [{}] {} - {}\n", i, task.name_str(), state_str);
             }
         }
 
@@ -489,19 +629,11 @@ fn sys_exit(code: i32) -> i64 {
             // overwrite the new task's x0 with our return value
             super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
 
-            // Debug: show the trap frame and TTBR0 we're switching to
-            if let Some(ref task) = sched.tasks[next_slot] {
-                let ttbr0 = task.address_space.as_ref().map(|a| a.get_ttbr0()).unwrap_or(0);
-                logln!("  Switching to task {} '{}' elr=0x{:x} sp=0x{:x} spsr=0x{:x} x0=0x{:x} ttbr0=0x{:x}",
-                       next_slot, task.name_str(),
-                       task.trap_frame.elr_el1, task.trap_frame.sp_el0,
-                       task.trap_frame.spsr_el1, task.trap_frame.x0, ttbr0);
-            }
             // Return - svc_handler will load new task's state and eret
             0
         } else {
             // No more tasks - halt
-            logln!("  No more processes - halting.");
+            kinfo!("sys_exit", "halt_no_tasks");
             loop {
                 core::arch::asm!("wfi");
             }
@@ -860,7 +992,7 @@ fn sys_receive(channel_id: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             // Return actual message length (so caller knows if truncated)
             msg.header.payload_len as i64
         }
-        Err(super::ipc::IpcError::WouldBlock) => {
+        Err(super::ipc::ChannelError::WouldBlock) => {
             // Task is already registered as blocked receiver by sys_receive_blocking
             // Just mark task as blocked and trigger reschedule
             unsafe {
@@ -928,7 +1060,7 @@ fn sys_receive_timeout(channel_id: u32, buf_ptr: u64, buf_len: usize, timeout_ms
             // Return actual message length (so caller knows if truncated)
             msg.header.payload_len as i64
         }
-        Err(super::ipc::IpcError::WouldBlock) => {
+        Err(super::ipc::ChannelError::WouldBlock) => {
             // Task is already registered as blocked receiver by sys_receive_blocking
             // Now set up the timeout and block
             unsafe {
@@ -1181,7 +1313,7 @@ fn sys_read(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                     Err(e) => uaccess_to_errno(e),
                 }
             }
-            Err(super::ipc::IpcError::WouldBlock) => {
+            Err(super::ipc::ChannelError::WouldBlock) => {
                 // Block the task
                 unsafe {
                     let sched = super::task::scheduler();
@@ -1194,7 +1326,7 @@ fn sys_read(fd: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                 }
                 SyscallError::WouldBlock as i64
             }
-            Err(super::ipc::IpcError::PeerClosed) => 0, // EOF
+            Err(super::ipc::ChannelError::PeerClosed) => 0, // EOF
             Err(_) => -5, // EIO
         }
     } else {
@@ -1544,7 +1676,6 @@ fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
 
     // Get current PID as parent
     let parent_id = current_pid();
-    logln!("[sys_exec] {} called by pid {}", path, parent_id);
 
     // Try to spawn from ramfs path
     match super::elf::spawn_from_path_with_parent(path, parent_id) {
@@ -1552,6 +1683,122 @@ fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
         Err(super::elf::ElfError::NotExecutable) => SyscallError::NotFound as i64,
         Err(_) => SyscallError::OutOfMemory as i64,
     }
+}
+
+/// Execute a program with explicit capability grant (privilege separation)
+/// Args: path_ptr, path_len, capabilities (bitmask)
+/// Returns: child PID on success, negative error on failure
+/// SECURITY: Child capabilities are intersected with parent's - can't escalate
+fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u64) -> i64 {
+    // Require SPAWN capability
+    if let Err(e) = require_capability(super::caps::Capabilities::SPAWN) {
+        return e;
+    }
+
+    // Require GRANT capability to delegate capabilities to children
+    if let Err(e) = require_capability(super::caps::Capabilities::GRANT) {
+        return e;
+    }
+
+    // Validate path length
+    if path_len == 0 || path_len > 127 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Copy path from user space
+    let mut path_buf = [0u8; 128];
+    match uaccess::copy_from_user(&mut path_buf[..path_len], path_ptr) {
+        Ok(_) => {}
+        Err(e) => return uaccess_to_errno(e),
+    }
+
+    // Parse path from kernel buffer
+    let path = match core::str::from_utf8(&path_buf[..path_len]) {
+        Ok(s) => s,
+        Err(_) => return SyscallError::InvalidArgument as i64,
+    };
+
+    // Get current PID as parent
+    let parent_id = current_pid();
+
+    // Convert capabilities bitmask
+    let requested_caps = super::caps::Capabilities::from_bits(capabilities);
+
+    // Try to spawn from ramfs path with explicit capabilities
+    match super::elf::spawn_from_path_with_caps_find(path, parent_id, requested_caps) {
+        Ok((child_id, _slot)) => child_id as i64,
+        Err(super::elf::ElfError::NotExecutable) => SyscallError::NotFound as i64,
+        Err(_) => SyscallError::OutOfMemory as i64,
+    }
+}
+
+/// Execute ELF binary from a memory buffer
+/// Args:
+///   elf_ptr: Pointer to ELF data in userspace
+///   elf_len: Size of ELF data in bytes
+///   name_ptr: Pointer to process name (or 0 for default)
+///   name_len: Length of process name
+/// Returns: PID of new process on success, negative error on failure
+/// SECURITY: Reads ELF data via page table translation
+fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len: usize) -> i64 {
+    // Validate ELF size (reasonable bounds: at least an ELF header, at most 16MB)
+    if elf_len < 64 || elf_len > 16 * 1024 * 1024 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Validate and read ELF data from userspace
+    // We need to copy to kernel memory since the ELF loader works with slices
+    if let Err(e) = uaccess::validate_user_read(elf_ptr, elf_len) {
+        return uaccess_to_errno(e);
+    }
+
+    // Allocate kernel buffer for ELF data
+    // Use the PMM for larger allocations
+    let num_pages = (elf_len + 4095) / 4096;
+    let elf_phys = match super::pmm::alloc_pages(num_pages) {
+        Some(addr) => addr,
+        None => return SyscallError::OutOfMemory as i64,
+    };
+
+    // Get kernel virtual address for the allocation
+    let elf_virt = crate::arch::aarch64::mmu::phys_to_virt(elf_phys as u64) as *mut u8;
+
+    // Copy ELF data from userspace to kernel buffer
+    let elf_slice = unsafe { core::slice::from_raw_parts_mut(elf_virt, elf_len) };
+    if let Err(e) = uaccess::copy_from_user(elf_slice, elf_ptr) {
+        super::pmm::free_pages(elf_phys, num_pages);
+        return uaccess_to_errno(e);
+    }
+
+    // Parse process name
+    let mut name_buf = [0u8; 32];
+    let name = if name_ptr != 0 && name_len > 0 {
+        let actual_len = name_len.min(31);
+        if let Err(e) = uaccess::copy_from_user(&mut name_buf[..actual_len], name_ptr) {
+            super::pmm::free_pages(elf_phys, num_pages);
+            return uaccess_to_errno(e);
+        }
+        core::str::from_utf8(&name_buf[..actual_len]).unwrap_or("exec_mem")
+    } else {
+        "exec_mem"
+    };
+
+    // Get current PID as parent
+    let parent_id = current_pid();
+
+    // Spawn from the ELF data
+    let result = match super::elf::spawn_from_elf_with_parent(elf_slice, name, parent_id) {
+        Ok((child_id, _slot)) => child_id as i64,
+        Err(super::elf::ElfError::BadMagic) => SyscallError::InvalidArgument as i64,
+        Err(super::elf::ElfError::NotExecutable) => SyscallError::InvalidArgument as i64,
+        Err(super::elf::ElfError::WrongArch) => SyscallError::InvalidArgument as i64,
+        Err(_) => SyscallError::OutOfMemory as i64,
+    };
+
+    // Free the kernel buffer (ELF data has been copied to process address space)
+    super::pmm::free_pages(elf_phys, num_pages);
+
+    result
 }
 
 /// Wait flags
@@ -1564,7 +1811,6 @@ pub const WNOHANG: u32 = 1;  // Don't block if no child has exited
 /// SECURITY: Writes to user status pointer via page table translation
 fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
     let caller_pid = current_pid();
-    logln!("[sys_wait] ENTER: caller_pid={} wait_for={} flags={}", caller_pid, pid, flags);
 
     // Validate status pointer if provided
     if status_ptr != 0 {
@@ -1585,11 +1831,8 @@ fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
 
         // Check if caller has any children
         if !caller_task.has_children() {
-            logln!("[sys_wait] pid {} (slot {}) has no children", caller_pid, caller_slot);
             return SyscallError::NoChild as i64;
         }
-        logln!("[sys_wait] pid {} has {} children, looking for terminated...",
-               caller_pid, caller_task.num_children);
 
         // Look for terminated children - first pass: find terminated child info
         let mut found_child: Option<(usize, u32, i32)> = None; // (slot, pid, exit_code)
@@ -1600,15 +1843,6 @@ fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
                 if task.parent_id != caller_pid {
                     continue;
                 }
-
-                // This is a child - log its state
-                let state_str = match task.state {
-                    super::task::TaskState::Ready => "Ready",
-                    super::task::TaskState::Running => "Running",
-                    super::task::TaskState::Blocked => "Waiting",
-                    super::task::TaskState::Terminated => "Terminated",
-                };
-                logln!("[sys_wait]   child slot={} pid={} state={}", slot, task.id, state_str);
 
                 // Check if waiting for specific PID or any child
                 if pid > 0 && task.id != pid as u32 {
@@ -1625,7 +1859,6 @@ fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
 
         // Second pass: reap the child if found (outside of iterator)
         if let Some((child_slot, child_pid, exit_code)) = found_child {
-            logln!("[sys_wait] FOUND: reaping child pid={} slot={} exit_code={}", child_pid, child_slot, exit_code);
             // Write exit status to user space if pointer provided
             if status_ptr != 0 {
                 if let Err(e) = uaccess::put_user::<i32>(status_ptr, exit_code) {
@@ -1810,7 +2043,7 @@ fn sys_kill(pid: u32) -> i64 {
 
     // SECURITY: Never allow killing init (PID 1) - system would become unstable
     if pid == 1 {
-        logln!("[SYSCALL] Refusing to kill init (PID 1)");
+        kwarn!("security", "kill_init_denied"; caller = current_pid() as u64);
         return SyscallError::PermissionDenied as i64;
     }
 
@@ -1850,8 +2083,7 @@ fn sys_kill(pid: u32) -> i64 {
         let has_cap_kill = require_capability(Capabilities::KILL).is_ok();
 
         if !is_suicide && !is_child && !has_cap_kill {
-            logln!("[SYSCALL] Kill denied: PID {} cannot kill PID {} (not owner/child)",
-                   caller_pid, pid);
+            kwarn!("security", "kill_denied"; caller = caller_pid as u64, target = pid as u64);
             return SyscallError::PermissionDenied as i64;
         }
 
@@ -2005,6 +2237,94 @@ fn sys_set_log_level(level: u8) -> i64 {
     }
 }
 
+/// Read one formatted kernel log record into userspace buffer
+/// Args: buf (pointer to buffer), len (buffer size)
+/// Returns: number of bytes written, 0 if no logs available, negative on error
+fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
+    // Validate buffer
+    if buf_len == 0 || buf_len > 1024 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Allocate temporary buffer for formatted output
+    let mut text_buf = [0u8; 1024];
+    let mut record_buf = [0u8; crate::klog::MAX_RECORD_SIZE];
+
+    // Read one record from kernel log ring
+    let record_len = unsafe {
+        let ring = &mut *core::ptr::addr_of_mut!(crate::klog::LOG_RING);
+        ring.read(&mut record_buf)
+    };
+
+    let Some(len) = record_len else {
+        // No logs available
+        return 0;
+    };
+
+    // Format the record
+    let text_len = crate::klog::format_record(&record_buf[..len], &mut text_buf);
+    if text_len == 0 {
+        return 0;
+    }
+
+    // Copy to userspace (truncate if buffer too small)
+    let copy_len = text_len.min(buf_len);
+    match uaccess::copy_to_user(buf_ptr, &text_buf[..copy_len]) {
+        Ok(n) => n as i64,
+        Err(_) => SyscallError::BadAddress as i64,
+    }
+}
+
+/// Get capabilities of a process
+/// Args: pid (0 = current process)
+/// Returns: capability bits as i64 on success, negative error on failure
+///
+/// This allows protocol handlers to verify caller permissions before
+/// executing privileged operations. Any process can query any other
+/// process's capabilities (they are not secret).
+fn sys_get_capabilities(pid: u32) -> i64 {
+    let target_pid = if pid == 0 { current_pid() } else { pid };
+
+    unsafe {
+        let sched = super::task::scheduler();
+
+        // Find the task by PID
+        for slot in 0..super::task::MAX_TASKS {
+            if let Some(ref task) = sched.tasks[slot] {
+                if task.id == target_pid {
+                    return task.capabilities.bits() as i64;
+                }
+            }
+        }
+    }
+
+    // Process not found
+    SyscallError::NoProcess as i64
+}
+
+/// Get peer PID of a channel
+/// Args: channel_id
+/// Returns: peer PID on success, negative error on failure
+///
+/// This allows protocol handlers to identify who is sending requests.
+/// Combined with get_capabilities(), servers can verify caller permissions.
+fn sys_channel_get_peer(channel_id: u32) -> i64 {
+    let caller = current_pid();
+
+    super::ipc::with_channel_table(|table| {
+        // Verify caller owns this channel
+        if table.get_owner(channel_id) != Some(caller) {
+            return SyscallError::PermissionDenied as i64;
+        }
+
+        // Get peer owner
+        match table.get_peer_owner(channel_id) {
+            Some(peer_pid) => peer_pid as i64,
+            None => SyscallError::NotFound as i64,
+        }
+    })
+}
+
 /// Reset/reboot the system using MT7988A watchdog
 fn sys_reset() -> i64 {
     // Only processes with ALL capabilities can reset the system
@@ -2012,10 +2332,9 @@ fn sys_reset() -> i64 {
         return e;
     }
 
-    logln!();
-    logln!("========================================");
-    logln!("  System Reset Requested");
-    logln!("========================================");
+    print_direct!("\n========================================\n");
+    print_direct!("  System Reset Requested\n");
+    print_direct!("========================================\n");
 
     // MT7988A TOPRGU (Top Reset Generation Unit) registers
     use crate::arch::aarch64::mmio::MmioRegion;
@@ -2048,7 +2367,7 @@ fn sys_reset() -> i64 {
     crate::arch::aarch64::mmio::dsb();
 
     // Should not reach here, but loop just in case
-    logln!("Reset triggered, waiting...");
+    kinfo!("sys_reset", "triggered");
     loop {
         unsafe { core::arch::asm!("wfi"); }
     }
@@ -2057,76 +2376,6 @@ fn sys_reset() -> i64 {
 // ============================================================================
 // PCI Syscalls
 // ============================================================================
-
-/// PCI device info structure for enumerate syscall
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct PciDeviceInfo {
-    /// BDF as u32 (port:8 | bus:8 | device:5 | function:3)
-    pub bdf: u32,
-    /// Vendor ID
-    pub vendor_id: u16,
-    /// Device ID
-    pub device_id: u16,
-    /// Class code (24-bit)
-    pub class_code: u32,
-    /// Revision
-    pub revision: u8,
-    /// Has MSI capability
-    pub has_msi: u8,
-    /// Has MSI-X capability
-    pub has_msix: u8,
-    /// Padding
-    pub _pad: u8,
-    /// BAR0 physical address
-    pub bar0_addr: u64,
-    /// BAR0 size
-    pub bar0_size: u64,
-}
-
-/// Enumerate PCI devices
-/// buf_ptr: pointer to array of PciDeviceInfo
-/// buf_len: number of entries in array
-/// Returns: number of devices written (or -errno)
-fn sys_pci_enumerate(buf_ptr: u64, buf_len: usize) -> i64 {
-    use super::pci;
-
-    // Validate buffer
-    let entry_size = core::mem::size_of::<PciDeviceInfo>();
-    let total_size = buf_len.saturating_mul(entry_size);
-
-    if uaccess::validate_user_write(buf_ptr, total_size).is_err() {
-        return SyscallError::BadAddress as i64;
-    }
-
-    let mut count = 0usize;
-    for dev in pci::devices() {
-        if count >= buf_len {
-            break;
-        }
-
-        let info = PciDeviceInfo {
-            bdf: dev.bdf.to_u32(),
-            vendor_id: dev.vendor_id,
-            device_id: dev.device_id,
-            class_code: dev.class_code,
-            revision: dev.revision,
-            has_msi: if dev.has_msi() { 1 } else { 0 },
-            has_msix: if dev.has_msix() { 1 } else { 0 },
-            _pad: 0,
-            bar0_addr: dev.bar0_addr,
-            bar0_size: dev.bar0_size,
-        };
-
-        let dest = buf_ptr + (count * entry_size) as u64;
-        unsafe {
-            core::ptr::write(dest as *mut PciDeviceInfo, info);
-        }
-        count += 1;
-    }
-
-    count as i64
-}
 
 /// Read PCI config space
 /// bdf: device address (port:8 | bus:8 | device:5 | function:3)
@@ -2259,73 +2508,6 @@ fn sys_pci_config_write(bdf: u32, offset: u16, size: u8, value: u32) -> i64 {
     }
 }
 
-/// Map PCI BAR into process address space
-/// bdf: device address
-/// bar: BAR number (0-5)
-/// size_out_ptr: pointer to write actual size
-/// Returns: virtual address or -errno
-fn sys_pci_bar_map(bdf: u32, bar: u8, size_out_ptr: u64) -> i64 {
-    use super::pci::{self, PciBdf};
-
-    // Require MMIO capability for device memory mapping
-    if let Err(e) = require_capability(Capabilities::MMIO) {
-        return e;
-    }
-
-    if bar > 5 {
-        return SyscallError::InvalidArgument as i64;
-    }
-
-    let bdf = PciBdf::from_u32(bdf);
-    let pid = current_pid();
-
-    // Check device exists and caller owns it
-    let dev = match pci::find_by_bdf(bdf) {
-        Some(d) => d,
-        None => return SyscallError::NotFound as i64,
-    };
-
-    if dev.owner_pid != pid {
-        return SyscallError::PermissionDenied as i64;
-    }
-
-    // Get BAR info
-    let (phys_addr, size) = match pci::bar_info(bdf, bar) {
-        Ok(info) => info,
-        Err(_) => return SyscallError::InvalidArgument as i64,
-    };
-
-    if size == 0 {
-        return SyscallError::InvalidArgument as i64;
-    }
-
-    // Map into process address space with device memory attributes (nGnRnE)
-    // PCI BARs are MMIO and must use non-cacheable device memory
-    unsafe {
-        let sched = super::task::scheduler();
-        for task_opt in sched.tasks.iter_mut() {
-            if let Some(ref mut task) = task_opt {
-                if task.id == pid {
-                    match task.mmap_device(phys_addr, size as usize) {
-                        Some(vaddr) => {
-                            // Write size to output pointer if valid
-                            if size_out_ptr != 0 {
-                                if uaccess::validate_user_write(size_out_ptr, 8).is_ok() {
-                                    core::ptr::write(size_out_ptr as *mut u64, size);
-                                }
-                            }
-                            return vaddr as i64;
-                        }
-                        None => return SyscallError::OutOfMemory as i64,
-                    }
-                }
-            }
-        }
-    }
-
-    SyscallError::NoProcess as i64
-}
-
 /// Allocate MSI vector(s) for a device
 /// bdf: device address
 /// count: number of vectors requested (power of 2)
@@ -2360,29 +2542,6 @@ fn sys_pci_msi_alloc(bdf: u32, count: u8) -> i64 {
     match pci::msi_alloc(bdf, count) {
         Ok(irq) => irq as i64,
         Err(pci::PciError::NoMsiVectors) => SyscallError::OutOfMemory as i64,
-        Err(_) => SyscallError::IoError as i64,
-    }
-}
-
-/// Claim ownership of a PCI device
-/// bdf: device address
-/// Returns: 0 or -errno
-fn sys_pci_claim(bdf: u32) -> i64 {
-    // Check RAW_DEVICE capability for PCI access
-    if let Err(e) = require_capability(Capabilities::RAW_DEVICE) {
-        return e;
-    }
-
-    use super::pci::{self, PciBdf};
-
-    let bdf = PciBdf::from_u32(bdf);
-    let pid = current_pid();
-
-    // Find and claim device via the pci module's claim function
-    match pci::claim_device(bdf, pid) {
-        Ok(()) => 0,
-        Err(pci::PciError::NotFound) => SyscallError::NotFound as i64,
-        Err(pci::PciError::PermissionDenied) => SyscallError::PermissionDenied as i64,
         Err(_) => SyscallError::IoError as i64,
     }
 }
@@ -2481,6 +2640,58 @@ fn sys_dma_pool_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
     0 // Success
 }
 
+/// Allocate from high DMA pool (36-bit addresses, > 4GB)
+///
+/// Same interface as sys_dma_pool_create but allocates from high memory
+/// for devices that use 36-bit DMA addressing (like MT7996 TX buffers).
+fn sys_dma_pool_create_high(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
+    if let Err(e) = require_capability(Capabilities::DMA) {
+        return e;
+    }
+
+    if size == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    if vaddr_ptr != 0 {
+        if let Err(e) = uaccess::validate_user_write(vaddr_ptr, core::mem::size_of::<u64>()) {
+            return uaccess_to_errno(e);
+        }
+    }
+    if paddr_ptr != 0 {
+        if let Err(e) = uaccess::validate_user_write(paddr_ptr, core::mem::size_of::<u64>()) {
+            return uaccess_to_errno(e);
+        }
+    }
+
+    let caller_pid = current_pid();
+
+    // Allocate from HIGH DMA pool (36-bit addresses)
+    let phys_addr = match super::dma_pool::alloc_high(size) {
+        Ok(addr) => addr,
+        Err(_) => return SyscallError::OutOfMemory as i64,
+    };
+
+    // Map into process address space
+    let virt_addr = match super::dma_pool::map_into_process_high(caller_pid, phys_addr, size) {
+        Ok(addr) => addr,
+        Err(_) => return SyscallError::OutOfMemory as i64,
+    };
+
+    if vaddr_ptr != 0 {
+        if let Err(e) = uaccess::put_user::<u64>(vaddr_ptr, virt_addr) {
+            return uaccess_to_errno(e);
+        }
+    }
+    if paddr_ptr != 0 {
+        if let Err(e) = uaccess::put_user::<u64>(paddr_ptr, phys_addr) {
+            return uaccess_to_errno(e);
+        }
+    }
+
+    0
+}
+
 /// Allow a specific PID to send signals to this process.
 ///
 /// By default (empty allowlist), all processes can send signals. Once at least
@@ -2505,13 +2716,17 @@ fn sys_signal_allow(sender_pid: u32) -> i64 {
 /// Set a timer - delivers Timer event after duration_ns nanoseconds
 /// Args: duration_ns (0 to cancel)
 /// Returns: 0 on success, negative error
+///
+/// LEGACY API - uses timer slot 0 for backwards compatibility.
+/// New code should use kevent_timer() for multiple timers and recurring support.
 fn sys_timer_set(duration_ns: u64) -> i64 {
     unsafe {
         let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
             if duration_ns == 0 {
-                // Cancel timer
-                task.timer_deadline = 0;
+                // Cancel timer 0
+                task.timers[0].deadline = 0;
+                task.timers[0].interval = 0;
                 return 0;
             }
 
@@ -2522,12 +2737,237 @@ fn sys_timer_set(duration_ns: u64) -> i64 {
             // Use the timer's tick_count (same counter that check_timeouts receives)
             let current_tick = crate::platform::mt7988::timer::ticks();
 
-            // Set deadline (minimum 1 tick in future)
-            task.timer_deadline = current_tick.saturating_add(duration_ticks.max(1));
+            // Set timer 0 as one-shot (backwards compatible)
+            task.timers[0].id = 0;
+            task.timers[0].interval = 0;  // One-shot
+            task.timers[0].deadline = current_tick.saturating_add(duration_ticks.max(1));
             return 0;
         }
     }
     SyscallError::NoProcess as i64
+}
+
+/// Set or modify a timer with kevent-style API
+/// Args: id (1-7 for user timers, 0 reserved), interval_ns, initial_ns
+/// Returns: 0 on success, negative error
+///
+/// - id=0 with interval_ns=0 and initial_ns=0: cancel all timers
+/// - id=1-7: set timer with given parameters
+/// - interval_ns=0: one-shot timer (fires once, then deactivates)
+/// - interval_ns>0: recurring timer (re-arms after each fire)
+/// - initial_ns: time until first fire (0 = use interval for periodic timers)
+fn sys_kevent_timer(id: u32, interval_ns: u64, initial_ns: u64) -> i64 {
+    // Validate timer ID (1-7 for user, 0 special)
+    if id >= super::task::MAX_TIMERS_PER_TASK as u32 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            // Special case: id=0 with both values 0 = cancel all
+            if id == 0 && interval_ns == 0 && initial_ns == 0 {
+                for timer in task.timers.iter_mut() {
+                    timer.deadline = 0;
+                    timer.interval = 0;
+                }
+                return 0;
+            }
+
+            // For id=0, treat it as legacy timer (one-shot only)
+            // New API uses id 1-7
+
+            // Convert nanoseconds to ticks (100 Hz = 10ms per tick)
+            let interval_ticks = interval_ns / 10_000_000;
+            let initial_ticks = if initial_ns > 0 {
+                initial_ns / 10_000_000
+            } else if interval_ticks > 0 {
+                interval_ticks  // Periodic with no initial = use interval
+            } else {
+                return SyscallError::InvalidArgument as i64; // One-shot needs initial_ns
+            };
+
+            let current_tick = crate::platform::mt7988::timer::ticks();
+
+            task.timers[id as usize].id = id;
+            task.timers[id as usize].interval = interval_ticks;
+            task.timers[id as usize].deadline = current_tick.saturating_add(initial_ticks.max(1));
+            return 0;
+        }
+    }
+    SyscallError::NoProcess as i64
+}
+
+/// Subscribe to events using kevent-style unified filter
+/// Args: filter_type (1=Ipc, 2=Timer, 3=Irq, etc.), filter_value (channel_id, timer_id, etc.)
+/// Returns: 0 on success, negative error
+///
+/// This wraps the existing event subscription system with a cleaner API.
+/// Internally converts EventFilter to EventType for the subscription.
+fn sys_kevent_subscribe(filter_type: u32, filter_value: u32) -> i64 {
+    use super::event::EventFilter;
+
+    // Validate and convert filter
+    let filter = match EventFilter::from_type_and_value(filter_type, filter_value) {
+        Some(f) => f,
+        None => return SyscallError::InvalidArgument as i64,
+    };
+
+    // Check capabilities for privileged event types
+    let pid = current_pid();
+    if filter_type == 3 {  // IRQ
+        if let Err(e) = require_capability(Capabilities::IRQ_CLAIM) {
+            super::security_log::log_capability_denied(pid, "IRQ_CLAIM", "kevent_subscribe");
+            return e;
+        }
+    }
+
+    // Subscribe using the event type and filter value
+    let ev_type = filter.to_event_type();
+    let filter_val = filter.filter_value();
+
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            match task.event_queue.subscribe(ev_type, filter_val) {
+                Ok(()) => return 0,
+                Err(e) => return e,
+            }
+        }
+    }
+    SyscallError::NoProcess as i64
+}
+
+/// Unsubscribe from events using kevent-style unified filter
+/// Args: filter_type, filter_value
+/// Returns: 0 on success, negative error
+fn sys_kevent_unsubscribe(filter_type: u32, filter_value: u32) -> i64 {
+    use super::event::EventFilter;
+
+    let filter = match EventFilter::from_type_and_value(filter_type, filter_value) {
+        Some(f) => f,
+        None => return SyscallError::InvalidArgument as i64,
+    };
+
+    let ev_type = filter.to_event_type();
+    let filter_val = filter.filter_value();
+
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[sched.current] {
+            if task.event_queue.unsubscribe(ev_type, filter_val) {
+                return 0;
+            }
+        }
+    }
+    SyscallError::NotFound as i64
+}
+
+/// Wait for events with batch receive (kevent-style)
+/// Args: events_ptr (pointer to Event array), max_events, timeout_ns
+/// Returns: number of events received, or negative error
+///
+/// timeout_ns semantics:
+/// - 0: poll (return immediately with whatever events are available)
+/// - u64::MAX: block forever until at least one event
+/// - other: block up to timeout_ns nanoseconds
+///
+/// This drains up to max_events from the queue in one call, reducing
+/// context switch overhead compared to single-event sys_event_wait.
+fn sys_kevent_wait(events_ptr: u64, max_events: u32, timeout_ns: u64) -> i64 {
+    if max_events == 0 {
+        return 0;  // Nothing to do
+    }
+
+    // Limit max_events to prevent excessive copying
+    let max = core::cmp::min(max_events as usize, 32);
+
+    // Validate user buffer for writing
+    let event_size = core::mem::size_of::<super::event::Event>();
+    let buf_size = max * event_size;
+    if let Err(e) = uaccess::validate_user_write(events_ptr, buf_size) {
+        return uaccess_to_errno(e);
+    }
+
+    let caller_slot = super::task::current_slot();
+
+    // First try: drain available events
+    let mut count = 0usize;
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[caller_slot] {
+            while count < max {
+                if let Some(event) = task.event_queue.pop() {
+                    // Write event to user buffer
+                    let offset = count * event_size;
+                    let event_bytes = core::slice::from_raw_parts(
+                        &event as *const super::event::Event as *const u8,
+                        event_size
+                    );
+                    if let Err(_) = uaccess::copy_to_user(events_ptr + offset as u64, event_bytes) {
+                        if count > 0 {
+                            return count as i64;  // Return what we have
+                        }
+                        return SyscallError::BadAddress as i64;
+                    }
+                    count += 1;
+                } else {
+                    break;  // No more events
+                }
+            }
+        } else {
+            return SyscallError::NoProcess as i64;
+        }
+    }
+
+    // If we got events, return immediately
+    if count > 0 {
+        return count as i64;
+    }
+
+    // No events available - check timeout
+    if timeout_ns == 0 {
+        // Poll mode - return 0 (no events)
+        return 0;
+    }
+
+    // Block waiting for events
+    unsafe {
+        let sched = super::task::scheduler();
+        if let Some(ref mut task) = sched.tasks[caller_slot] {
+            task.state = super::task::TaskState::Blocked;
+            task.wait_reason = Some(super::task::WaitReason::Event);
+
+            // Set wake_at if timeout is not "forever"
+            if timeout_ns != u64::MAX {
+                // Convert timeout_ns to ticks (100 Hz = 10ms per tick)
+                let timeout_ticks = timeout_ns / 10_000_000;
+                let current_tick = crate::platform::mt7988::timer::ticks();
+                task.wake_at = current_tick.saturating_add(timeout_ticks.max(1));
+            }
+
+            // Pre-store return value (0 = timeout with no events)
+            // If woken by event, we'll re-drain and update x0
+            task.trap_frame.x0 = 0;
+        }
+
+        // Switch to another task
+        if let Some(next_slot) = sched.schedule() {
+            if next_slot != caller_slot {
+                super::task::set_current_slot(next_slot);
+                sched.current = next_slot;
+                if let Some(ref mut next) = sched.tasks[next_slot] {
+                    next.state = super::task::TaskState::Running;
+                }
+                super::task::update_current_task_globals();
+                super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    // When we return here after being woken, svc_handler will eret with x0 from trap_frame
+    // The wake path should have set x0 appropriately
+    0
 }
 
 /// Send heartbeat - updates last_heartbeat timestamp for monitoring
@@ -2612,31 +3052,31 @@ pub extern "C" fn syscall_handler_rust(
 /// Test syscall handling
 #[allow(dead_code)] // Test infrastructure
 pub fn test() {
-    logln!("  Testing syscall infrastructure...");
+    print_direct!("  Testing syscall infrastructure...\n");
 
     // Test debug write - uses kernel addresses during boot, so skip validation test
     let msg = "Hello from syscall!\n";
     // Note: This works during kernel init because we're using kernel pointers
     // In real user mode, user pointers would be validated
     let result = sys_debug_write(msg.as_ptr() as u64, msg.len());
-    logln!("    debug_write returned: {}", result);
+    print_direct!("    debug_write returned: {}\n", result);
 
     // Test getpid
     let pid = sys_getpid();
-    logln!("    getpid returned: {}", pid);
+    print_direct!("    getpid returned: {}\n", pid);
 
     // Test gettime
     let time = sys_gettime();
-    logln!("    gettime returned: {} ns", time);
+    print_direct!("    gettime returned: {} ns\n", time);
 
     // Test user address validation
-    logln!("    Testing address validation...");
+    print_direct!("    Testing address validation...\n");
     assert!(uaccess::is_user_address(0x4000_0000));
     assert!(!uaccess::is_user_address(0xFFFF_0000_0000_0000));
     assert!(!uaccess::is_user_address(0)); // Null pointer
-    logln!("    Address validation: OK");
+    print_direct!("    Address validation: OK\n");
 
-    logln!("    [OK] Syscall infrastructure ready");
+    print_direct!("    [OK] Syscall infrastructure ready\n");
 }
 
 // =============================================================================
@@ -2790,4 +3230,150 @@ fn sys_shmem_unmap(shmem_id: u32) -> i64 {
         Ok(()) => 0,
         Err(e) => e,
     }
+}
+
+/// Ramfs directory entry for userspace (fixed size for easy iteration)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RamfsListEntry {
+    /// Filename (null-terminated, max 100 bytes)
+    pub name: [u8; 100],
+    /// File size in bytes
+    pub size: u64,
+    /// File type: 0 = regular, 1 = directory
+    pub file_type: u8,
+    /// Padding for alignment
+    pub _pad: [u8; 7],
+}
+
+impl RamfsListEntry {
+    const SIZE: usize = 116; // 100 + 8 + 1 + 7 = 116 bytes
+}
+
+/// List ramfs entries
+/// Args: buf_ptr (output buffer), buf_len (buffer size in bytes)
+/// Returns: number of entries written on success, negative error on failure
+///
+/// Each entry is 116 bytes (RamfsListEntry):
+/// - name[100]: null-terminated filename
+/// - size[8]: u64 file size
+/// - file_type[1]: 0=regular, 1=directory
+/// - _pad[7]: padding
+fn sys_ramfs_list(buf_ptr: u64, buf_len: usize) -> i64 {
+    // Calculate how many entries we can fit
+    let max_entries = buf_len / RamfsListEntry::SIZE;
+    if max_entries == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Validate user pointer for writing
+    if let Err(e) = uaccess::validate_user_write(buf_ptr, buf_len) {
+        return uaccess_to_errno(e);
+    }
+
+    // Get ramfs entries
+    let ramfs = crate::ramfs::ramfs();
+    let count = ramfs.len().min(max_entries);
+
+    // Write entries to user buffer
+    for i in 0..count {
+        if let Some(entry) = ramfs.get(i) {
+            let mut list_entry = RamfsListEntry {
+                name: [0u8; 100],
+                size: entry.size as u64,
+                file_type: if entry.is_dir() { 1 } else { 0 },
+                _pad: [0u8; 7],
+            };
+
+            // Copy filename
+            let name_len = entry.name.iter().position(|&c| c == 0).unwrap_or(100).min(100);
+            list_entry.name[..name_len].copy_from_slice(&entry.name[..name_len]);
+
+            // Convert to bytes and copy to userspace
+            let entry_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &list_entry as *const RamfsListEntry as *const u8,
+                    RamfsListEntry::SIZE,
+                )
+            };
+
+            let offset = i * RamfsListEntry::SIZE;
+            if let Err(e) = uaccess::copy_to_user(buf_ptr + offset as u64, entry_bytes) {
+                return uaccess_to_errno(e);
+            }
+        }
+    }
+
+    count as i64
+}
+
+/// CPU statistics entry for userspace
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CpuStatsEntry {
+    /// CPU ID (0-based)
+    pub cpu_id: u32,
+    /// Reserved/padding
+    pub _pad: u32,
+    /// Total tick count since boot
+    pub tick_count: u64,
+    /// Ticks spent in idle (WFI)
+    pub idle_ticks: u64,
+}
+
+impl CpuStatsEntry {
+    const SIZE: usize = 24; // 4 + 4 + 8 + 8 = 24 bytes
+}
+
+/// Get CPU statistics
+/// Args: buf_ptr (output buffer for CpuStatsEntry array), buf_len (buffer size in bytes)
+/// Returns: number of CPUs on success, negative error on failure
+///
+/// Each entry is 24 bytes (CpuStatsEntry):
+/// - cpu_id[4]: u32 CPU ID
+/// - _pad[4]: padding
+/// - tick_count[8]: u64 total ticks
+/// - idle_ticks[8]: u64 idle ticks
+///
+/// Usage calculation: busy% = 100 * (1 - idle_ticks / tick_count)
+fn sys_cpu_stats(buf_ptr: u64, buf_len: usize) -> i64 {
+    use super::percpu::{MAX_CPUS, cpu_local};
+
+    // Calculate how many entries we can fit
+    let max_entries = buf_len / CpuStatsEntry::SIZE;
+    if max_entries == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Validate user pointer for writing
+    if let Err(e) = uaccess::validate_user_write(buf_ptr, buf_len) {
+        return uaccess_to_errno(e);
+    }
+
+    // For now, only report one CPU (single-core implementation)
+    // In SMP, we'd iterate over all online CPUs
+    let num_cpus = 1.min(max_entries).min(MAX_CPUS);
+
+    // Get current CPU's stats
+    let cpu_data = cpu_local();
+    let entry = CpuStatsEntry {
+        cpu_id: cpu_data.cpu_id,
+        _pad: 0,
+        tick_count: cpu_data.ticks(),
+        idle_ticks: cpu_data.get_idle_ticks(),
+    };
+
+    // Convert to bytes and copy to userspace
+    let entry_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &entry as *const CpuStatsEntry as *const u8,
+            CpuStatsEntry::SIZE,
+        )
+    };
+
+    if let Err(e) = uaccess::copy_to_user(buf_ptr, entry_bytes) {
+        return uaccess_to_errno(e);
+    }
+
+    num_cpus as i64
 }

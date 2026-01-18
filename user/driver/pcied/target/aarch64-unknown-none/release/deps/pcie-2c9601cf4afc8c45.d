@@ -1,0 +1,16 @@
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcied/target/aarch64-unknown-none/release/deps/pcie-2c9601cf4afc8c45.d: /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/lib.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/soc/mod.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/soc/mt7988a.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/board/mod.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/board/bpi_r4.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/consts.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/regs.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/config.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/controller.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/client.rs
+
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcied/target/aarch64-unknown-none/release/deps/libpcie-2c9601cf4afc8c45.rlib: /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/lib.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/soc/mod.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/soc/mt7988a.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/board/mod.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/board/bpi_r4.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/consts.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/regs.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/config.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/controller.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/client.rs
+
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcied/target/aarch64-unknown-none/release/deps/libpcie-2c9601cf4afc8c45.rmeta: /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/lib.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/soc/mod.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/soc/mt7988a.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/board/mod.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/board/bpi_r4.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/consts.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/regs.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/config.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/controller.rs /Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/client.rs
+
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/lib.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/soc/mod.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/soc/mt7988a.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/board/mod.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/board/bpi_r4.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/consts.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/regs.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/config.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/controller.rs:
+/Users/t.heloin/git/banana/bpi-r4-kernel/user/driver/pcie/src/client.rs:

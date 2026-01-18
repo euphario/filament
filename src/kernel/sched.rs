@@ -30,7 +30,7 @@
 //! - `yield_current()`: Voluntarily give up CPU (does NOT change Blocked state)
 //! - `run_idle()`: Idle loop - only called when no tasks are runnable
 
-use crate::logln;
+use crate::{kwarn, kerror, kinfo};
 use super::task::{self, TaskState, WaitReason, Priority, current_slot, set_current_slot};
 use super::task::{update_current_task_globals, SYSCALL_SWITCHED_TASK};
 use core::sync::atomic::Ordering;
@@ -98,7 +98,7 @@ pub fn reschedule() -> bool {
 
         // No ready tasks at all - this shouldn't happen if idle task exists
         // But handle gracefully by staying on current
-        logln!("[SCHED] WARNING: no ready tasks!");
+        kwarn!("sched", "no_ready_tasks");
         false
     }
 }
@@ -136,7 +136,7 @@ pub fn block_current(reason: WaitReason) {
         if let Some(ref mut task) = sched.tasks[slot] {
             // Don't block the idle task!
             if slot == IDLE_SLOT {
-                logln!("[SCHED] ERROR: attempt to block idle task!");
+                kerror!("sched", "block_idle_attempt");
                 return;
             }
 
@@ -158,7 +158,7 @@ pub fn block_current_timeout(reason: WaitReason, deadline_tick: u64) {
 
         if let Some(ref mut task) = sched.tasks[slot] {
             if slot == IDLE_SLOT {
-                logln!("[SCHED] ERROR: attempt to block idle task!");
+                kerror!("sched", "block_idle_attempt");
                 return;
             }
 
@@ -229,8 +229,6 @@ pub fn is_current_blocked() -> bool {
 /// # Safety
 /// Only the idle task (slot 0) should call this.
 pub fn run_idle() -> ! {
-    logln!("[IDLE] Entering idle loop");
-
     loop {
         // Check if there's a ready task before WFI
         let has_ready = unsafe {
@@ -284,13 +282,12 @@ pub fn init_idle_task() -> bool {
         // for context switching (it never blocks or switches normally)
 
         if sched.tasks[IDLE_SLOT].is_some() {
-            logln!("[SCHED] Idle task already exists");
             return true;
         }
 
         // For now, we'll create a minimal placeholder
         // The real idle loop runs in the boot context
-        logln!("[SCHED] Idle task initialized (slot 0)");
+        kinfo!("sched", "idle_init"; slot = IDLE_SLOT as u64);
         true
     }
 }
@@ -325,13 +322,15 @@ pub fn timer_tick(current_tick: u64) {
 
 /// Print scheduler state for debugging.
 pub fn dump_state() {
+    use crate::print_direct;
+
     unsafe {
         let sched = task::scheduler();
 
-        logln!("[SCHED] Task states:");
+        print_direct!("[SCHED] Task states:\n");
         for (i, slot) in sched.tasks.iter().enumerate() {
             if let Some(ref task) = slot {
-                logln!("  slot {}: pid={} state={:?} prio={:?} name={}",
+                print_direct!("  slot {}: pid={} state={:?} prio={:?} name={}\n",
                        i, task.id, task.state, task.priority,
                        core::str::from_utf8(&task.name).unwrap_or("?"));
             }

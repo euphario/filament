@@ -32,28 +32,87 @@ pub mod ltssm {
     pub const STATE_MASK: u32 = 0x1F << 24;
     pub const STATE_SHIFT: u32 = 24;
 
-    // LTSSM states
+    // LTSSM states (from pcie-mediatek-gen3.c)
     pub const DETECT_QUIET: u32 = 0x00;
     pub const DETECT_ACTIVE: u32 = 0x01;
     pub const POLLING_ACTIVE: u32 = 0x02;
+    pub const POLLING_COMPLIANCE: u32 = 0x03;
+    pub const POLLING_CONFIG: u32 = 0x04;
+    pub const CONFIG_LINKWIDTH_START: u32 = 0x05;
+    pub const CONFIG_LINKWIDTH_ACCEPT: u32 = 0x06;
+    pub const CONFIG_LANENUM_WAIT: u32 = 0x07;
+    pub const CONFIG_LANENUM_ACCEPT: u32 = 0x08;
+    pub const CONFIG_COMPLETE: u32 = 0x09;
+    pub const CONFIG_IDLE: u32 = 0x0A;
+    pub const RECOVERY_RCVRLOCK: u32 = 0x0B;
+    pub const RECOVERY_EQUALIZATION: u32 = 0x0C;
+    pub const RECOVERY_SPEED: u32 = 0x0D;
+    pub const RECOVERY_RCVRCONFIG: u32 = 0x0E;
+    pub const RECOVERY_IDLE: u32 = 0x0F;
     pub const L0: u32 = 0x10;  // Link up and operational
+    pub const L0S: u32 = 0x11;
+    pub const L1_ENTRY: u32 = 0x12;
+    pub const L1_IDLE: u32 = 0x13;
+    pub const L2_IDLE: u32 = 0x14;
+    pub const L2_TRANSMIT_WAKE: u32 = 0x15;
+    pub const DISABLED: u32 = 0x16;
+
+    /// Get LTSSM state from register value
+    #[inline]
+    pub const fn get_state(val: u32) -> u32 {
+        (val & STATE_MASK) >> STATE_SHIFT
+    }
+
+    /// Get state name
+    pub fn state_name(state: u32) -> &'static str {
+        match state {
+            0x00 => "detect.quiet",
+            0x01 => "detect.active",
+            0x02 => "polling.active",
+            0x03 => "polling.compliance",
+            0x04 => "polling.config",
+            0x05 => "config.linkwidth.start",
+            0x06 => "config.linkwidth.accept",
+            0x07 => "config.lanenum.wait",
+            0x08 => "config.lanenum.accept",
+            0x09 => "config.complete",
+            0x0A => "config.idle",
+            0x0B => "recovery.rcvrlock",
+            0x0C => "recovery.equalization",
+            0x0D => "recovery.speed",
+            0x0E => "recovery.rcvrconfig",
+            0x0F => "recovery.idle",
+            0x10 => "L0",
+            0x11 => "L0s",
+            0x12 => "L1.entry",
+            0x13 => "L1.idle",
+            0x14 => "L2.idle",
+            0x15 => "L2.transmit.wake",
+            0x16 => "disabled",
+            _ => "unknown",
+        }
+    }
+
+    /// Decode full LTSSM register (for debugging)
+    /// Returns (state_name, other_bits_description)
+    pub fn decode(val: u32) -> (&'static str, u32) {
+        let state = get_state(val);
+        let other_bits = val & !STATE_MASK;
+        (state_name(state), other_bits)
+    }
 }
 
 /// Link status register offset
 pub const PCIE_LINK_STATUS_REG: usize = 0x154;
 
-/// Link status bits
+/// Link status bits (MAC register 0x154)
+///
+/// Note: This register only has LINKUP bit. Speed/width are in the
+/// PCIe capability Link Status register at config space offset 0x92
+/// (accessed via MAC + 0x1092).
 pub mod link_status {
     /// Link training complete, link is up (bit 8)
     pub const PCIE_PORT_LINKUP: u32 = 1 << 8;
-
-    /// Link speed mask (bits 19:16)
-    pub const SPEED_MASK: u32 = 0xF << 16;
-    pub const SPEED_SHIFT: u32 = 16;
-
-    /// Link width mask (bits 25:20)
-    pub const WIDTH_MASK: u32 = 0x3F << 20;
-    pub const WIDTH_SHIFT: u32 = 20;
 }
 
 /// PCIE_SETTING_REG - Mode and capability settings (from pcie-mediatek-gen3.c)
@@ -65,8 +124,28 @@ pub mod pcie_setting {
     pub const RC_MODE: u32 = 1 << 0;
     /// Link width setting mask
     pub const LINK_WIDTH_MASK: u32 = 0xF << 8;
-    /// Gen support mask
+    /// Gen support mask (bits 14:12)
+    /// For Gen3: set bits 0-1 = 0x3, for Gen2: set bit 0 = 0x1
     pub const GEN_SUPPORT_MASK: u32 = 0x7 << 12;
+    /// Gen2 support (bit 12)
+    pub const GEN2_SUPPORT: u32 = 0x1 << 12;
+    /// Gen3 support (bits 12-13)
+    pub const GEN3_SUPPORT: u32 = 0x3 << 12;
+}
+
+/// Link Control 2 / Status 2 register (in config space at 0x1000 + 0xb0)
+pub const PCIE_CONF_LINK2_CTL_STS: usize = 0x10b0;
+
+/// Link Control 2 bits
+pub mod link_ctl2 {
+    /// Target link speed mask (bits 3:0)
+    pub const TARGET_SPEED_MASK: u32 = 0xF;
+    /// Gen1 (2.5 GT/s)
+    pub const GEN1: u32 = 1;
+    /// Gen2 (5 GT/s)
+    pub const GEN2: u32 = 2;
+    /// Gen3 (8 GT/s)
+    pub const GEN3: u32 = 3;
 }
 
 /// MISC control register (from pcie-mediatek-gen3.c)
@@ -206,6 +285,10 @@ pub mod pcie_cap {
     pub const LINK_CTL: u16 = 0x10;
     /// Link Status (16-bit)
     pub const LINK_STA: u16 = 0x12;
+    /// Link Control 2 (16-bit)
+    pub const LINK_CTL2: u16 = 0x30;
+    /// Link Status 2 (16-bit)
+    pub const LINK_STA2: u16 = 0x32;
 }
 
 /// Link Control register bits
@@ -223,6 +306,25 @@ pub mod dev_cap {
     /// Max Payload Size Supported (bits 2:0)
     /// 000=128B, 001=256B, 010=512B, 011=1KB, 100=2KB, 101=4KB
     pub const MPS_MASK: u32 = 0x7;
+}
+
+/// Device Status register bits (offset 0x0A from PCIe cap)
+pub mod dev_sta {
+    /// Correctable Error Detected (bit 0)
+    pub const CED: u16 = 1 << 0;
+    /// Non-Fatal Error Detected (bit 1)
+    pub const NFED: u16 = 1 << 1;
+    /// Fatal Error Detected (bit 2)
+    pub const FED: u16 = 1 << 2;
+    /// Unsupported Request Detected (bit 3) - indicates bad DMA address or unsupported TLP
+    pub const URD: u16 = 1 << 3;
+    /// AUX Power Detected (bit 4)
+    pub const APD: u16 = 1 << 4;
+    /// Transactions Pending (bit 5)
+    pub const TP: u16 = 1 << 5;
+
+    /// All error bits (W1C - Write 1 to Clear)
+    pub const ALL_ERRORS: u16 = CED | NFED | FED | URD;
 }
 
 /// Device Control register bits (offset 0x08 from PCIe cap)
@@ -326,4 +428,50 @@ pub mod atu {
             ATR_EN
         }
     }
+}
+
+// ============================================================================
+// MSI (Message Signaled Interrupts) Registers
+// From Linux pcie-mediatek-gen3.c
+// ============================================================================
+
+/// Interrupt enable register offset
+pub const PCIE_INT_ENABLE_REG: usize = 0x180;
+
+/// Interrupt status register offset
+pub const PCIE_INT_STATUS_REG: usize = 0x184;
+
+/// MSI set enable register offset
+pub const PCIE_MSI_SET_ENABLE_REG: usize = 0x190;
+
+/// MSI set base register (set 0)
+pub const PCIE_MSI_SET_BASE_REG: usize = 0xc00;
+
+/// MSI set high address base
+pub const PCIE_MSI_SET_ADDR_HI_BASE: usize = 0xc80;
+
+/// MSI register constants
+pub mod msi {
+    /// Number of MSI sets (from Linux PCIE_MSI_SET_NUM)
+    pub const SET_NUM: usize = 8;
+
+    /// Offset between MSI sets (16 bytes per set)
+    pub const SET_OFFSET: usize = 0x10;
+
+    /// Status offset within MSI set
+    pub const SET_STATUS_OFFSET: usize = 0x04;
+
+    /// Enable offset within MSI set
+    pub const SET_ENABLE_OFFSET: usize = 0x08;
+
+    /// High address offset between sets
+    pub const ADDR_HI_OFFSET: usize = 0x04;
+
+    /// MSI enable bits in INT_ENABLE register (bits 15:8)
+    /// Linux: PCIE_MSI_ENABLE = GENMASK(PCIE_MSI_SET_NUM + 8 - 1, 8)
+    pub const INT_ENABLE_BITS: u32 = 0xFF << 8;
+
+    /// MSI set enable bits in MSI_SET_ENABLE register (bits 7:0)
+    /// Linux: PCIE_MSI_SET_ENABLE = GENMASK(PCIE_MSI_SET_NUM - 1, 0)
+    pub const SET_ENABLE_BITS: u32 = 0xFF;
 }

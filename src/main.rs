@@ -33,14 +33,17 @@ mod kernel;
 // Remaining top-level modules (to be organized later)
 mod dtb;
 mod initrd;
-mod log;
+mod klog;      // Unified logging framework
+mod ktrace;    // Unified tracing framework (spans, call depth)
+mod log;       // Legacy logging (used by platform drivers, to migrate later)
+mod serialize; // Shared serialization for klog/ktrace
 mod panic;
 mod ramfs;
 
 // Convenient aliases - use full paths to avoid ambiguity
 use arch::aarch64::{mmu, sync, smp};
 use platform::mt7988::{gic, uart, timer, wdt};
-use kernel::{task, scheme, shmem, elf, pmm, pci, bus};
+use kernel::{task, scheme, shmem, dma_pool, elf, pmm, pci, bus};
 
 // Alias for platform constants (platform::mt7988::INITRD_ADDR, etc.)
 use platform::mt7988 as plat;
@@ -49,279 +52,246 @@ use kernel::percpu;
 /// Kernel entry point - called from boot.S after dropping to EL1
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
-    // Initialize UART first (needed for printing)
+    // =========================================================================
+    // Phase 1: Early init (no logging yet)
+    // =========================================================================
     uart::init();
 
-    // Initialize per-CPU infrastructure early (sets TPIDR_EL1)
-    percpu::init_boot_cpu();
+    // Reset terminal state first - ensures clean display on remote terminal
+    // ESC c = Full Reset (RIS) - clears screen, resets all modes
+    print_direct!("\x1bc");
 
-    // Verify PAN (Privileged Access Never) is enabled for security
-    // This prevents kernel from accidentally accessing user memory directly
+    percpu::init_boot_cpu();
     sync::verify_pan_enabled();
 
-    // Initialize logging (after UART so we can print)
-    log::init();
+    // Initialize logging/tracing infrastructure
+    log::init();       // Legacy (for platform drivers not yet migrated)
+    klog::init();      // Structured logging
+    ktrace::init();    // Span-based tracing
 
-    // Print banner (flush immediately - timer not running yet)
-    println!();
-    println!("========================================");
-    println!("  BPI-R4 Bare-Metal Kernel");
-    println!("  MediaTek MT7988A (Cortex-A73)");
-    println!("========================================");
-    println!();
-    println!("Hello World from BPI-R4!");
-    println!();
-    kernel::log::flush();
+    // Boot banner (direct UART - useful for early debug)
+    print_direct!("\r\n========================================\r\n");
+    print_direct!("  BPI-R4 Bare-Metal Kernel\r\n");
+    print_direct!("  MediaTek MT7988A (Cortex-A73)\r\n");
+    print_direct!("========================================\r\n\r\n");
+
+    // =========================================================================
+    // Phase 2: Kernel initialization (with logging and tracing)
+    // =========================================================================
+
+    // Start boot trace span
+    let _boot_span = span!("kernel", "boot");
 
     // Read CPU info
-    let midr: u64;
-    let current_el: u64;
-    let vbar: u64;
-
-    unsafe {
+    let (midr, current_el, vbar) = unsafe {
+        let midr: u64;
+        let el: u64;
+        let vbar: u64;
         core::arch::asm!("mrs {}, midr_el1", out(reg) midr);
-        core::arch::asm!("mrs {}, currentel", out(reg) current_el);
+        core::arch::asm!("mrs {}, currentel", out(reg) el);
         core::arch::asm!("mrs {}, vbar_el1", out(reg) vbar);
+        (midr, (el >> 2) & 0x3, vbar)
+    };
+
+    kinfo!("kernel", "cpu_info"; midr = klog::hex64(midr), el = current_el, vbar = klog::hex64(vbar));
+
+    if current_el != 1 {
+        kerror!("kernel", "el_check_failed"; expected = 1u64, actual = current_el);
     }
 
-    let el = (current_el >> 2) & 0x3;
-
-    println!("CPU Info:");
-    println!("  MIDR_EL1:   0x{:016x}", midr);
-    println!("  CurrentEL:  EL{}", el);
-    println!("  VBAR_EL1:   0x{:016x}", vbar);
-    println!();
-
-    if el == 1 {
-        println!("[OK] Successfully dropped from EL2 to EL1!");
-    } else if el == 2 {
-        println!("[!!] Still at EL2 - drop failed");
+    // Device tree parsing
+    {
+        let _span = span!("fdt", "init");
+        kernel::fdt::init();
     }
 
-    // Parse and dump device tree from U-Boot
-    kernel::fdt::init();
-    kernel::log::flush();
+    // GIC (interrupt controller)
+    {
+        let _span = span!("gic", "init");
+        gic::init();
+        let (product, variant, num_irqs) = gic::info();
+        kinfo!("gic", "init_ok"; product = klog::hex32(product as u32), variant = variant, irqs = num_irqs);
 
-    println!();
-    println!("Initializing GIC...");
-    gic::init();
+        uart::enable_rx_interrupt();
+        kinfo!("gic", "uart_irq_enabled"; irq = plat::irq::UART0);
+    }
 
-    let (product, variant, num_irqs) = gic::info();
-    println!("[OK] GIC initialized");
-    println!("  Product:  0x{:02x}", product);
-    println!("  Variant:  0x{:x}", variant);
-    println!("  IRQ lines: {}", num_irqs);
-
-    // Enable UART RX interrupt for blocking reads
-    uart::enable_rx_interrupt();
-    println!("  UART RX IRQ enabled (IRQ {})", plat::irq::UART0);
-    kernel::log::flush();
-
-    // MMU was already initialized by boot.S before Rust code runs.
-    // The kernel is linked at TTBR1 virtual address (0xFFFF_0000_4600_0000).
-    println!();
-    println!("MMU status (initialized by boot.S):");
-    println!("  Address space layout:");
-    println!("    TTBR0 (user):   0x0000_xxxx -> identity mapped");
-    println!("    TTBR1 (kernel): 0xFFFF_xxxx -> physical memory");
-    println!("  L1 blocks (1GB each):");
-    println!("    [0] 0x00000000: Device (UART, GIC)");
-    println!("    [1] 0x40000000: Normal (DRAM)");
-    println!("    [2] 0x80000000: Normal (DRAM)");
-    println!("    [3] 0xC0000000: Normal (DRAM)");
+    // MMU info (already initialized by boot.S)
+    kinfo!("mmu", "status"; ttbr0 = "user", ttbr1 = "kernel");
     mmu::print_info();
 
-    // Initialize physical memory manager
-    println!();
-    println!("Initializing physical memory manager...");
-    pmm::init();
-    println!("[OK] PMM initialized");
-    pmm::print_info();
+    // Physical memory manager
+    {
+        let _span = span!("pmm", "init");
+        pmm::init();
+        // Note: pmm::init() logs init_ok with details
+    }
 
-    // Initialize shared memory subsystem
-    shmem::init();
+    // DMA pools
+    {
+        let _span = span!("dma", "init");
+        dma_pool::init();
+        dma_pool::init_high();
+        kinfo!("dma", "pools_ready");
+    }
 
-    // Initialize scheme system (needed for userspace drivers)
-    println!();
-    println!("Initializing scheme system...");
-    scheme::init();
+    // Shared memory
+    {
+        let _span = span!("shmem", "init");
+        shmem::init();
+        // Note: shmem::init() logs init_ok with details
+    }
 
-    // Initialize PCI subsystem
-    println!();
-    println!("Initializing PCI subsystem...");
-    pci::init();
+    // Scheme system
+    {
+        let _span = span!("scheme", "init");
+        scheme::init();
+        // Note: scheme::init() logs init_ok with details
+    }
 
-    // Initialize bus controllers with state machines
-    // This creates control ports for each bus (/kernel/bus/pcie0, /kernel/bus/usb0, etc.)
-    // Buses start in SAFE state - devd will connect to claim them
-    println!();
-    println!("Initializing bus controllers...");
-    kernel::log::flush();
-    bus::init(0);  // Kernel PID = 0
-    kernel::log::flush();
+    // PCI subsystem
+    {
+        let _span = span!("pci", "init");
+        pci::init();
+        kinfo!("pci", "init_ok");
+    }
 
-    // Initialize watchdog timer (but don't enable yet)
-    println!();
-    println!("Initializing watchdog...");
-    wdt::init();
-    println!("[OK] Watchdog initialized (disabled)");
+    // Bus controllers
+    {
+        let _span = span!("bus", "init");
+        bus::init(0);  // Kernel PID = 0
+        kinfo!("bus", "init_ok");
+    }
 
-    // Initialize timer
-    println!();
-    println!("Initializing timer...");
-    timer::init();
-    println!("[OK] Timer initialized");
-    timer::print_info();
+    // Watchdog
+    {
+        let _span = span!("wdt", "init");
+        wdt::init();
+        kinfo!("wdt", "init_ok"; enabled = false);
+    }
 
-    // Initialize SMP (but don't start secondary CPUs yet)
-    println!();
-    println!("Initializing SMP...");
-    smp::init();
+    // Timer
+    {
+        let _span = span!("timer", "init");
+        timer::init();
+        kinfo!("timer", "init_ok");
+        timer::print_info();
+    }
+
+    // SMP
+    {
+        let _span = span!("smp", "init");
+        smp::init();
+        kinfo!("smp", "init_ok");
+    }
+
+    // Flush logs before self-tests
+    klog::flush();
+    ktrace::flush();
 
     // =========================================================================
     // Self-tests (only when compiled with --features selftest)
     // =========================================================================
     #[cfg(feature = "selftest")]
     {
-        println!();
-        println!("========================================");
-        println!("  Running Self-Tests");
-        println!("========================================");
+        let _span = span!("kernel", "selftest");
+        kinfo!("kernel", "selftest_start");
 
-        println!();
-        println!("Testing PMM...");
+        kernel::lock::test();  // Test locks early - other modules depend on them
         pmm::test();
-
-        println!();
-        println!("Testing address space manager...");
-        addrspace::test();
-
-        println!();
-        println!("Testing task structures...");
+        kernel::dma_pool::test();  // Test DMA pool after PMM
+        kernel::shmem::test();  // Test shmem after PMM
+        kernel::addrspace::test();
         task::test();
-
-        println!();
-        println!("Testing syscall infrastructure...");
-        syscall::test();
-
-        println!();
-        println!("Testing process management...");
-        process::test();
-
-        println!();
-        println!("Testing IPC...");
-        ipc::test();
-
-        println!();
-        println!("Testing port registry...");
-        port::test();
-
-        println!();
-        println!("Testing event system...");
-        event::test();
-
-        println!();
-        println!("Testing scheme system...");
+        kernel::syscall::test();
+        kernel::process::test();
+        kernel::ipc::test();
+        kernel::port::test();
+        kernel::event::test();
         scheme::test();
-
-        println!();
-        println!("Testing ELF loader...");
         elf::test();
-
-        println!();
-        println!("Testing SMP...");
         smp::test();
+        plat::eth::test();
+        plat::sd::test();
 
-        println!();
-        println!("Testing Ethernet (register access)...");
-        eth::test();
-
-        println!();
-        println!("Testing SD/eMMC (register access)...");
-        sd::test();
-
-        println!();
-        println!("========================================");
-        println!("  Self-Tests Complete");
-        println!("========================================");
+        kinfo!("kernel", "selftest_complete");
     }
 
     #[cfg(not(feature = "selftest"))]
     {
-        println!();
-        println!("  (self-tests skipped, use --features selftest to enable)");
+        kdebug!("kernel", "selftest_skipped");
     }
 
-    // Note: USB is now handled by userspace driver (bin/usbtest)
-    // The userspace driver uses MMIO and IRQ schemes to access hardware
+    // =========================================================================
+    // Phase 3: Ramfs and userspace init
+    // =========================================================================
 
-    // Initialize ramfs (initrd)
-    // The initrd address/size would typically be passed by U-Boot
-    // For now, check if an initrd was loaded at a known address
-    println!();
-    println!("========================================");
-    println!("  Initializing ramfs");
-    println!("========================================");
-    init_ramfs();
+    // Initialize ramfs
+    {
+        let _span = span!("ramfs", "init");
+        init_ramfs();
+    }
 
-    // Enable IRQs before entering user mode
-    println!();
-    println!("Enabling interrupts...");
+    // Enable interrupts
     unsafe {
-        core::arch::asm!("msr daifclr, #2"); // Clear I bit to enable IRQs
+        core::arch::asm!("msr daifclr, #2");
     }
-    println!("[OK] Interrupts enabled");
+    kinfo!("kernel", "irq_enabled");
 
-    // Spawn devd (device supervisor / init)
-    println!();
-    println!("========================================");
-    println!("  Spawning devd (PID 1)");
-    println!("========================================");
-
-    // Spawn device supervisor from ramfs - it will spawn shell and drivers
-    let slot1 = match elf::spawn_from_path("bin/devd") {
-        Ok((_task_id, slot)) => {
-            println!("  Process 'devd' spawned at slot {}", slot);
-            // Give devd ALL capabilities (it's init/PID 1)
-            unsafe {
-                if let Some(ref mut task) = task::scheduler().tasks[slot] {
-                    task.set_capabilities(kernel::caps::Capabilities::ALL);
+    // Spawn devd (init process)
+    let slot1 = {
+        let _span = span!("elf", "spawn"; path = "bin/devd");
+        match elf::spawn_from_path("bin/devd") {
+            Ok((_task_id, slot)) => {
+                kinfo!("kernel", "devd_spawned"; slot = slot);
+                // Give devd ALL capabilities (it's init/PID 1)
+                unsafe {
+                    if let Some(ref mut task) = task::scheduler().tasks[slot] {
+                        task.set_capabilities(kernel::caps::Capabilities::ALL);
+                    }
                 }
+                Some(slot)
             }
-            Some(slot)
-        }
-        Err(e) => {
-            println!("  [!!] Failed to spawn devd: {:?}", e);
-            None
+            Err(e) => {
+                let err_str = match e {
+                    elf::ElfError::BadMagic => "bad_magic",
+                    elf::ElfError::Not64Bit => "not_64bit",
+                    elf::ElfError::NotLittleEndian => "not_le",
+                    elf::ElfError::NotExecutable => "not_exec",
+                    elf::ElfError::WrongArch => "wrong_arch",
+                    elf::ElfError::TooSmall => "too_small",
+                    elf::ElfError::OutOfMemory => "oom",
+                    elf::ElfError::InvalidSegment => "invalid_seg",
+                    elf::ElfError::SignatureInvalid => "sig_invalid",
+                };
+                kerror!("kernel", "devd_spawn_failed"; err = err_str);
+                None
+            }
         }
     };
 
-    // Note: mmap test can be added here once we have a proper test binary
-    // For now, mmap/munmap syscalls are implemented and ready for use
+    // =========================================================================
+    // Phase 4: Start scheduler
+    // =========================================================================
 
-    // Run the first process
     if let Some(slot) = slot1 {
-        println!();
-        println!("  Starting scheduler with process at slot {}...", slot);
-
-        // Debug: print VBAR_EL1 to verify it's the kernel VA
-        let vbar: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, vbar_el1", out(reg) vbar);
-        }
-        println!("  VBAR_EL1:  0x{:016x}", vbar);
+        kinfo!("kernel", "scheduler_start"; slot = slot);
 
         // Start timer for preemption (10ms time slice)
         timer::start(10);
-        println!("  Timer started: 10ms time slice");
-        println!();
+        kinfo!("timer", "preemption_started"; slice_ms = 10u64);
+
+        // Flush all logs before entering userspace
+        klog::flush();
+        ktrace::flush();
 
         // Enter user mode - scheduler will switch between processes
+        // (boot span will be auto-closed when we context switch)
         unsafe {
             task::scheduler().run_user_task(slot);
         }
     } else {
-        println!("  No processes to run - halting.");
+        kerror!("kernel", "no_init_process");
         loop {
             unsafe { core::arch::asm!("wfi"); }
         }
@@ -356,12 +326,17 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
             sync::cpu_flags().set_need_resched();
         }
     } else if irq == plat::irq::UART0 {
-        // UART RX interrupt - wake any blocked reader
+        // UART RX interrupt - data available on console
         if uart::handle_rx_irq() {
             // Disable UART RX interrupt to prevent re-triggering
-            // (will be re-enabled when shell reads the data)
+            // (will be re-enabled when process reads the data)
             uart::disable_rx_interrupt();
 
+            // Broadcast FdReadable event to all subscribers of STDIN (fd 0)
+            // This allows event-driven console I/O without blocking syscalls
+            kernel::event::broadcast_event(kernel::event::Event::fd_readable(0));
+
+            // Also wake any process blocked in legacy blocking read syscall
             let blocked_pid = uart::get_blocked_pid();
             if blocked_pid != 0 {
                 unsafe {
@@ -410,12 +385,13 @@ pub extern "C" fn irq_exit_resched() {
     // 2. Log any unhandled IRQs from interrupt context (deferred logging)
     let (unhandled_count, last_irq) = sync::cpu_flags().get_unhandled_stats();
     if unhandled_count > 0 {
-        logln!("[IRQ] {} unhandled interrupt(s), last: {}", unhandled_count, last_irq);
+        kwarn!("irq", "unhandled"; count = unhandled_count as u64, last = last_irq as u64);
         sync::cpu_flags().clear_unhandled_stats();
     }
 
-    // 3. Flush deferred log buffer before returning to user
-    kernel::log::flush();
+    // 3. Flush log buffers before returning to user
+    klog::flush();
+    kernel::log::flush();  // Legacy (for platform drivers)
 }
 
 /// Print a hex value directly to UART (no allocations, no logging)
@@ -433,7 +409,218 @@ fn print_str_uart(s: &str) {
     }
 }
 
-/// Exception handler called from assembly
+/// Exception from user mode - terminate task and switch to next
+/// Called from assembly when a userspace task faults (page fault, illegal instruction, etc.)
+#[no_mangle]
+pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
+    // Flush any buffered UART output first
+    while uart::has_buffered_output() {
+        uart::flush_buffer();
+    }
+
+    // Get current task info
+    let (pid, parent_id, task_name) = unsafe {
+        let sched = kernel::task::scheduler();
+        let slot = kernel::task::current_slot();
+        if let Some(ref task) = sched.tasks[slot] {
+            let mut name = [0u8; 16];
+            let name_len = task.name.len().min(16);
+            name[..name_len].copy_from_slice(&task.name[..name_len]);
+            (task.id, task.parent_id, name)
+        } else {
+            (0, 0, [0u8; 16])
+        }
+    };
+
+    // Decode exception class
+    let ec = (esr >> 26) & 0x3f;
+    let exception_name = match ec {
+        0b000000 => "Unknown",
+        0b100000 => "Instruction Abort",
+        0b100100 => "Data Abort",
+        0b100010 => "PC Alignment",
+        0b100110 => "SP Alignment",
+        0b111100 => "BRK (breakpoint)",
+        _ => "Exception",
+    };
+
+    // Print crash info
+    print_str_uart("\r\n=== USER FAULT ===\r\n");
+    print_str_uart("  PID: ");
+    print_hex_uart(pid as u64);
+    print_str_uart(" (");
+    for &c in &task_name {
+        if c == 0 { break; }
+        uart::putc(c as char);
+    }
+    print_str_uart(")\r\n  ");
+    print_str_uart(exception_name);
+    print_str_uart(" at PC=0x");
+    print_hex_uart(elr);
+    print_str_uart(" FAR=0x");
+    print_hex_uart(far);
+    print_str_uart("\r\n");
+
+    // Special handling for PID 1 (devd/init)
+    if pid == 1 {
+        print_str_uart("  CRITICAL: init (devd) crashed!\r\n");
+        print_str_uart("  Attempting recovery...\r\n");
+
+        // Step 1: Kill all other tasks
+        print_str_uart("  Killing all tasks...\r\n");
+        unsafe {
+            let sched = kernel::task::scheduler();
+            for task_opt in sched.tasks.iter_mut() {
+                if let Some(ref mut task) = task_opt {
+                    if task.id != 0 {  // Don't kill kernel (PID 0 if it exists)
+                        // Cleanup resources
+                        kernel::bus::process_cleanup(task.id);
+                        kernel::shmem::process_cleanup(task.id);
+                        kernel::scheme::process_cleanup(task.id);
+                        kernel::pci::release_all_devices(task.id);
+                        kernel::port::process_cleanup(task.id);
+                        kernel::ipc::process_cleanup(task.id);
+                        task.fd_table.close_all(task.id);
+                        task.state = kernel::task::TaskState::Terminated;
+                    }
+                }
+            }
+        }
+
+        // Step 2: Reset all buses to safe state
+        print_str_uart("  Resetting all buses...\r\n");
+        kernel::bus::reset_all_buses();
+
+        // Step 3: Respawn devd
+        print_str_uart("  Respawning devd...\r\n");
+        match elf::spawn_from_path("devd") {
+            Ok((new_pid, slot)) => {
+                print_str_uart("  devd restarted as PID ");
+                print_hex_uart(new_pid as u64);
+                print_str_uart("\r\n");
+
+                // Give devd ALL capabilities
+                unsafe {
+                    if let Some(ref mut task) = kernel::task::scheduler().tasks[slot] {
+                        task.set_capabilities(kernel::caps::Capabilities::ALL);
+                    }
+                }
+
+                // Schedule devd
+                unsafe {
+                    let sched = kernel::task::scheduler();
+                    kernel::task::set_current_slot(slot);
+                    sched.current = slot;
+                    if let Some(ref mut task) = sched.tasks[slot] {
+                        task.state = kernel::task::TaskState::Running;
+                    }
+                    kernel::task::update_current_task_globals();
+                }
+
+                print_str_uart("  Recovery complete, continuing.\r\n");
+                return;  // Return to assembly, will eret to new devd
+            }
+            Err(e) => {
+                print_str_uart("  FATAL: Failed to respawn devd: ");
+                let err_str = match e {
+                    elf::ElfError::BadMagic => "bad_magic",
+                    elf::ElfError::Not64Bit => "not_64bit",
+                    elf::ElfError::NotLittleEndian => "not_le",
+                    elf::ElfError::NotExecutable => "not_exec",
+                    elf::ElfError::WrongArch => "wrong_arch",
+                    elf::ElfError::TooSmall => "too_small",
+                    elf::ElfError::OutOfMemory => "oom",
+                    elf::ElfError::InvalidSegment => "invalid_seg",
+                    elf::ElfError::SignatureInvalid => "sig_invalid",
+                };
+                print_str_uart(err_str);
+                print_str_uart("\r\n  System halted.\r\n");
+                loop {
+                    unsafe { core::arch::asm!("wfe"); }
+                }
+            }
+        }
+    }
+
+    // Exit code: negative signal number (like Unix)
+    // -11 = SIGSEGV for memory faults, -4 = SIGILL for illegal instruction
+    let exit_code = match ec {
+        0b100000 | 0b100100 => -11i32,  // SIGSEGV
+        0b100010 | 0b100110 => -7i32,   // SIGBUS
+        _ => -6i32,                      // SIGABRT
+    };
+
+    unsafe {
+        let sched = kernel::task::scheduler();
+        let current_slot = kernel::task::current_slot();
+
+        // Clean up process resources (same as sys_exit)
+        kernel::bus::process_cleanup(pid);
+        kernel::shmem::process_cleanup(pid);
+        kernel::scheme::process_cleanup(pid);
+        kernel::pci::release_all_devices(pid);
+        kernel::port::process_cleanup(pid);
+        kernel::ipc::process_cleanup(pid);
+
+        // Close all file descriptors
+        if let Some(ref mut task) = sched.tasks[current_slot] {
+            task.fd_table.close_all(pid);
+        }
+
+        // Kill all children of this task
+        for task_opt in sched.tasks.iter_mut() {
+            if let Some(ref mut task) = task_opt {
+                if task.parent_id == pid && task.state != kernel::task::TaskState::Terminated {
+                    // Mark child as terminated
+                    task.exit_code = -9;  // SIGKILL
+                    task.state = kernel::task::TaskState::Terminated;
+                }
+            }
+        }
+
+        // Set exit code and mark as terminated
+        if let Some(ref mut task) = sched.tasks[current_slot] {
+            task.exit_code = exit_code;
+            task.state = kernel::task::TaskState::Terminated;
+        }
+
+        // Notify parent
+        if parent_id != 0 {
+            for task_opt in sched.tasks.iter_mut() {
+                if let Some(ref mut task) = task_opt {
+                    if task.id == parent_id {
+                        let event = kernel::event::Event::child_exit(pid, exit_code);
+                        task.event_queue.push(event);
+                        if task.state == kernel::task::TaskState::Blocked {
+                            task.state = kernel::task::TaskState::Ready;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        print_str_uart("  Task terminated, switching to next...\r\n");
+
+        // Schedule next task
+        if let Some(next_slot) = sched.schedule() {
+            kernel::task::set_current_slot(next_slot);
+            sched.current = next_slot;
+            if let Some(ref mut task) = sched.tasks[next_slot] {
+                task.state = kernel::task::TaskState::Running;
+            }
+            kernel::task::update_current_task_globals();
+            // Return to assembly which will eret to next task
+        } else {
+            print_str_uart("  No more tasks - halting.\r\n");
+            loop {
+                core::arch::asm!("wfe");
+            }
+        }
+    }
+}
+
+/// Exception handler called from assembly (kernel mode - fatal)
 #[no_mangle]
 pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
     // Flush any buffered UART output first so we don't lose pre-crash messages
@@ -496,9 +683,8 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
 fn init_ramfs() {
     // First, try embedded initrd (compiled into kernel)
     if let Some((addr, size)) = initrd::get_embedded_initrd() {
-        println!("  Found embedded initrd at 0x{:08x} ({} bytes)", addr, size);
         let count = ramfs::init(addr, size);
-        println!("  Loaded {} files from embedded initrd", count);
+        kinfo!("ramfs", "loaded"; source = "embedded", addr = klog::hex64(addr as u64), files = count);
         ramfs::list();
         return;
     }
@@ -513,9 +699,9 @@ fn init_ramfs() {
 
     if magic_check {
         let count = ramfs::init(plat::INITRD_ADDR, plat::INITRD_MAX_SIZE);
-        println!("  Loaded {} files from external initrd at 0x{:08x}", count, plat::INITRD_ADDR);
+        kinfo!("ramfs", "loaded"; source = "external", addr = klog::hex64(plat::INITRD_ADDR as u64), files = count);
         ramfs::list();
     } else {
-        println!("  No initrd found (build with: cd user && ./mkinitrd.sh)");
+        kwarn!("ramfs", "not_found"; hint = "build with mkinitrd.sh");
     }
 }

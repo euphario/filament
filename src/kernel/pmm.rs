@@ -37,7 +37,7 @@
 //! All operations are protected by a SpinLock with IRQ-save semantics.
 //! Safe to call from both process and interrupt context.
 
-use crate::logln;
+use crate::{kinfo, kwarn, kdebug, print_direct, klog};
 use crate::arch::aarch64::mmu;
 use crate::platform::mt7988::{DRAM_BASE, DRAM_END};
 use super::lock::SpinLock;
@@ -236,10 +236,15 @@ impl PhysicalMemoryManager {
         let free_mb = self.free_pages * PAGE_SIZE / (1024 * 1024);
         let total_mb = total_pages * PAGE_SIZE / (1024 * 1024);
         let meta_mb = frames_pages * PAGE_SIZE / (1024 * 1024);
-        logln!("[PMM] {} pages total ({} MB), {} free ({} MB)",
-               total_pages, total_mb, self.free_pages, free_mb);
-        logln!("[PMM] Metadata: {} pages ({} MB) at 0x{:x}",
-               frames_pages, meta_mb, frames_phys);
+        kinfo!("pmm", "init_ok";
+            total_pages = total_pages as u64,
+            total_mb = total_mb as u64,
+            free_pages = self.free_pages as u64,
+            free_mb = free_mb as u64,
+            meta_pages = frames_pages as u64,
+            meta_mb = meta_mb as u64,
+            meta_phys = klog::hex64(frames_phys as u64)
+        );
     }
 
     /// Push a page onto the free list (O(1))
@@ -321,8 +326,13 @@ impl PhysicalMemoryManager {
 
         // Debug: log failure for large allocations
         if count >= 256 {
-            logln!("[PMM] alloc_pages({}) FAILED: scanned={}, max_consecutive={}, free={}, first_free={}",
-                   count, scanned, max_consecutive, self.free_pages, self.first_free_page);
+            kwarn!("pmm", "alloc_failed";
+                requested = count as u64,
+                scanned = scanned as u64,
+                max_consecutive = max_consecutive as u64,
+                free = self.free_pages as u64,
+                first_free = self.first_free_page as u64
+            );
         }
         None
     }
@@ -502,8 +512,8 @@ pub fn print_info() {
     let guard = PMM.lock();
     let free_mb = guard.free_memory() / (1024 * 1024);
     let total_mb = (guard.total_count() * PAGE_SIZE) / (1024 * 1024);
-    logln!("  Total:  {} pages ({} MB)", guard.total_count(), total_mb);
-    logln!("  Free:   {} pages ({} MB)", guard.free_count(), free_mb);
+    print_direct!("  Total:  {} pages ({} MB)\n", guard.total_count(), total_mb);
+    print_direct!("  Free:   {} pages ({} MB)\n", guard.free_count(), free_mb);
 }
 
 /// Execute a closure with exclusive PMM access
@@ -517,25 +527,25 @@ pub fn with_pmm<R, F: FnOnce(&mut PhysicalMemoryManager) -> R>(f: F) -> R {
 /// Test the allocator
 #[allow(dead_code)]
 pub fn test() {
-    logln!("  Testing PMM...");
+    kdebug!("pmm", "test_start");
 
     if let Some(addr) = alloc_page() {
-        logln!("    Allocated page at 0x{:08x}", addr);
+        kdebug!("pmm", "alloc_page_ok"; addr = klog::hex64(addr as u64));
         free_page(addr);
-        logln!("    Freed page");
+        kdebug!("pmm", "free_page_ok");
     } else {
-        logln!("    [!!] Allocation failed");
+        kwarn!("pmm", "test_alloc_failed");
         return;
     }
 
     if let Some(addr) = alloc_pages(4) {
-        logln!("    Allocated 4 pages at 0x{:08x}", addr);
+        kdebug!("pmm", "alloc_pages_ok"; addr = klog::hex64(addr as u64), count = 4);
         free_pages(addr, 4);
-        logln!("    Freed 4 pages");
+        kdebug!("pmm", "free_pages_ok");
     } else {
-        logln!("    [!!] Contiguous allocation failed");
+        kwarn!("pmm", "test_contiguous_failed");
         return;
     }
 
-    logln!("    [OK] PMM tests passed");
+    kinfo!("pmm", "test_ok");
 }

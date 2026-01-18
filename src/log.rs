@@ -125,8 +125,9 @@ pub fn _log(level: LogLevel, module: &str, args: core::fmt::Arguments) {
 }
 
 /// Log macro - use the convenience macros below instead
+/// DEPRECATED: Use klog! from klog.rs instead
 #[macro_export]
-macro_rules! klog {
+macro_rules! _legacy_klog {
     ($level:expr, $($arg:tt)*) => {{
         if $crate::log::is_enabled($level) {
             $crate::log::_log($level, module_path!(), format_args!($($arg)*));
@@ -135,41 +136,46 @@ macro_rules! klog {
 }
 
 /// Log an error message
+/// DEPRECATED: Use kerror! from klog.rs instead
 #[macro_export]
 macro_rules! log_error {
     ($($arg:tt)*) => {
-        $crate::klog!($crate::log::LogLevel::Error, $($arg)*)
+        $crate::_legacy_klog!($crate::log::LogLevel::Error, $($arg)*)
     };
 }
 
 /// Log a warning message
+/// DEPRECATED: Use kwarn! from klog.rs instead
 #[macro_export]
 macro_rules! log_warn {
     ($($arg:tt)*) => {
-        $crate::klog!($crate::log::LogLevel::Warn, $($arg)*)
+        $crate::_legacy_klog!($crate::log::LogLevel::Warn, $($arg)*)
     };
 }
 
 /// Log an info message
+/// DEPRECATED: Use kinfo! from klog.rs instead
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {
-        $crate::klog!($crate::log::LogLevel::Info, $($arg)*)
+        $crate::_legacy_klog!($crate::log::LogLevel::Info, $($arg)*)
     };
 }
 
 /// Log a debug message
+/// DEPRECATED: Use kdebug! from klog.rs instead
 #[macro_export]
 macro_rules! log_debug {
     ($($arg:tt)*) => {
-        $crate::klog!($crate::log::LogLevel::Debug, $($arg)*)
+        $crate::_legacy_klog!($crate::log::LogLevel::Debug, $($arg)*)
     };
 }
 
 /// Log a trace message
+/// DEPRECATED: Use ktrace! from klog.rs instead
 #[macro_export]
 macro_rules! log_trace {
     ($($arg:tt)*) => {
-        $crate::klog!($crate::log::LogLevel::Trace, $($arg)*)
+        $crate::_legacy_klog!($crate::log::LogLevel::Trace, $($arg)*)
     };
 }

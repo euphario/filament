@@ -5,6 +5,7 @@
 
 use crate::arch::aarch64::mmio::MmioRegion;
 use crate::hal::InterruptController;
+use crate::{kdebug, klog};
 use super::{GICD_BASE, GICR_BASE, irq};
 
 /// GICD Register offsets
@@ -395,12 +396,12 @@ pub fn eoi(irq: u32) {
 }
 
 /// Debug: dump GIC state for an IRQ
-pub fn debug_irq(irq: u32) {
+pub fn debug_irq(irq_num: u32) {
     let gic = unsafe { &*core::ptr::addr_of!(GIC) };
 
-    if irq >= 32 {
-        let reg_idx = (irq / 32) as usize;
-        let bit_pos = irq % 32;
+    if irq_num >= 32 {
+        let reg_idx = (irq_num / 32) as usize;
+        let bit_pos = irq_num % 32;
 
         // Read ISENABLER (is enabled?)
         let isenabler = gic.gicd_read(gicd::ISENABLER + reg_idx * 4);
@@ -415,19 +416,22 @@ pub fn debug_irq(irq: u32) {
         let group = (igroupr >> bit_pos) & 1;
 
         // Read IROUTER
-        let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
+        let irouter_offset = gicd::IROUTER + ((irq_num - 32) as usize) * 8;
         let irouter_lo = gic.gicd_read(irouter_offset);
         let irouter_hi = gic.gicd_read(irouter_offset + 4);
 
-        crate::logln!("[GIC] IRQ {} state:", irq);
-        crate::logln!("  Enabled: {}", enabled);
-        crate::logln!("  Pending: {}", pending);
-        crate::logln!("  Group:   {} (1=NS)", group);
-        crate::logln!("  IROUTER: 0x{:08x}_{:08x}", irouter_hi, irouter_lo);
-
         // Read GICD_CTLR
         let ctlr = gic.gicd_read(gicd::CTLR);
-        crate::logln!("  GICD_CTLR: 0x{:08x}", ctlr);
+
+        kdebug!("gic", "irq_state";
+            irq = irq_num as u64,
+            enabled = enabled as u64,
+            pending = pending as u64,
+            group = group as u64,
+            irouter_hi = klog::hex32(irouter_hi),
+            irouter_lo = klog::hex32(irouter_lo),
+            ctlr = klog::hex32(ctlr)
+        );
     }
 }
 

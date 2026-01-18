@@ -23,7 +23,7 @@
 use super::pmm;
 use super::process::Pid;
 use super::lock::SpinLock;
-use crate::logln;
+use crate::{kinfo, kwarn};
 
 /// Maximum number of shared memory regions
 const MAX_SHMEM_REGIONS: usize = 32;
@@ -167,7 +167,7 @@ pub fn init() {
     }
     guard.next_id = 1;
     drop(guard);
-    logln!("[shmem] Initialized ({} max regions)", MAX_SHMEM_REGIONS);
+    kinfo!("shmem", "init_ok"; max_regions = MAX_SHMEM_REGIONS as u64);
 }
 
 /// Create a new shared memory region
@@ -444,8 +444,7 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
                     // ref_count of 1 means only the owner has it mapped (safe to destroy)
                     // ref_count > 1 means other processes still have active mappings
                     if region.ref_count > 1 {
-                        logln!("[shmem] Refusing to destroy region {} - ref_count={} (other processes still mapped)",
-                               shmem_id, region.ref_count);
+                        kwarn!("shmem", "destroy_refused_busy"; id = shmem_id as u64, ref_count = region.ref_count as u64);
                         return Err(-16); // EBUSY - resource busy
                     }
 
@@ -574,4 +573,94 @@ pub fn process_cleanup(pid: Pid) {
 
         pmm::free_contiguous(phys_addr as usize, num_pages);
     }
+}
+
+// ============================================================================
+// Self-tests
+// ============================================================================
+
+#[cfg(feature = "selftest")]
+pub fn test() {
+    use crate::{kdebug, kinfo};
+
+    kdebug!("shmem", "test_start");
+
+    // Test 1: Shmem manager is initialized
+    {
+        let guard = SHMEM.lock();
+        // Check that table has expected capacity
+        assert!(guard.table.len() > 0, "Shmem table should have capacity");
+        drop(guard);
+        kdebug!("shmem", "init_ok");
+    }
+
+    // Test 2: Create small shmem region
+    // Note: create(owner_pid, size) returns (id, phys_addr, virt_addr)
+    {
+        let result = create(0, 4096); // 1 page, owner PID 0
+        assert!(result.is_ok(), "create(0, 4096) should succeed");
+        let (id, phys, _virt) = result.unwrap();
+        assert!(id > 0, "Shmem ID should be positive");
+        assert!(phys >= 0x4000_0000, "Physical address should be in DRAM");
+        assert_eq!(phys % 4096, 0, "Physical address should be page-aligned");
+
+        // Verify the region exists in table
+        let guard = SHMEM.lock();
+        let found = guard.table.iter().any(|slot| {
+            if let Some(ref r) = slot {
+                r.id == id
+            } else {
+                false
+            }
+        });
+        assert!(found, "Created region should be in table");
+        drop(guard);
+
+        kdebug!("shmem", "create_ok"; id = id as u64, phys = crate::klog::hex64(phys));
+    }
+
+    // Test 3: Zero-size creation fails
+    {
+        let result = create(0, 0);
+        assert!(result.is_err(), "Zero-size create should fail");
+        kdebug!("shmem", "zero_create_rejected");
+    }
+
+    // Test 4: Region lookup works
+    {
+        let result = create(0, 8192); // 2 pages
+        assert!(result.is_ok(), "create should succeed");
+        let (id, phys, _virt) = result.unwrap();
+
+        // Look it up
+        let guard = SHMEM.lock();
+        let found = guard.table.iter().find_map(|slot| {
+            if let Some(ref r) = slot {
+                if r.id == id {
+                    Some((r.phys_addr, r.size))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        drop(guard);
+
+        assert!(found.is_some(), "Should find created region");
+        let (found_phys, found_size) = found.unwrap();
+        assert_eq!(found_phys, phys, "Physical address should match");
+        assert_eq!(found_size, 8192, "Size should match");
+        kdebug!("shmem", "lookup_ok"; id = id as u64);
+    }
+
+    // Test 5: ID generation is unique
+    {
+        let r1 = create(0, 4096).unwrap();
+        let r2 = create(0, 4096).unwrap();
+        assert_ne!(r1.0, r2.0, "IDs should be unique");
+        kdebug!("shmem", "unique_ids_ok"; id1 = r1.0 as u64, id2 = r2.0 as u64);
+    }
+
+    kinfo!("shmem", "test_ok");
 }

@@ -445,7 +445,7 @@ lower_el_aarch64_sync:
     lsr     x9, x9, #26         // Extract EC (exception class)
     cmp     x9, #0x15           // EC 0x15 = SVC from AArch64
     b.eq    svc_handler
-    b       exception_handler   // Not SVC, use generic handler
+    b       exception_from_user // User fault - terminate task and continue
 .balign 0x80
 lower_el_aarch64_irq:
     b       irq_handler
@@ -479,9 +479,6 @@ exception_handler:
     stp     x29, x30, [sp, #-16]!
     stp     x0, x1, [sp, #-16]!
 
-    /* Debug: exception entry (UART via TTBR1) */
-    debug_uart_char 'E'
-
     mrs     x0, esr_el1
     mrs     x1, elr_el1
     mrs     x2, far_el1
@@ -490,6 +487,101 @@ exception_handler:
     ldp     x0, x1, [sp], #16
     ldp     x29, x30, [sp], #16
     b       hang
+
+/*
+ * Exception from user mode - terminate faulting task and switch to next
+ * Similar to irq_from_user but for sync exceptions (page faults, etc.)
+ */
+exception_from_user:
+    /* Save x9-x12 to kernel stack */
+    stp     x9, x10, [sp, #-16]!
+    stp     x11, x12, [sp, #-16]!
+
+    /* Get pointer to current task's trap frame */
+    adrp    x9, CURRENT_TRAP_FRAME
+    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+
+    /* Save all general purpose registers to trap frame */
+    stp     x0, x1, [x9, #0]
+    stp     x2, x3, [x9, #16]
+    stp     x4, x5, [x9, #32]
+    stp     x6, x7, [x9, #48]
+    str     x8, [x9, #64]
+    /* Get original x9-x12 from stack */
+    ldp     x10, x11, [sp], #16
+    str     x11, [x9, #96]          // x12
+    str     x10, [x9, #88]          // x11
+    ldp     x10, x11, [sp], #16
+    stp     x10, x11, [x9, #72]     // x9, x10
+    str     x13, [x9, #104]
+    stp     x14, x15, [x9, #112]
+    stp     x16, x17, [x9, #128]
+    stp     x18, x19, [x9, #144]
+    stp     x20, x21, [x9, #160]
+    stp     x22, x23, [x9, #176]
+    stp     x24, x25, [x9, #192]
+    stp     x26, x27, [x9, #208]
+    stp     x28, x29, [x9, #224]
+    str     x30, [x9, #240]
+
+    /* Save special registers */
+    mrs     x10, sp_el0
+    mrs     x11, elr_el1
+    mrs     x12, spsr_el1
+    str     x10, [x9, #248]         // sp_el0
+    str     x11, [x9, #256]         // elr_el1
+    str     x12, [x9, #264]         // spsr_el1
+
+    /* Get exception info for Rust handler */
+    mrs     x0, esr_el1             // Exception Syndrome Register
+    mrs     x1, elr_el1             // Exception Link Register (faulting PC)
+    mrs     x2, far_el1             // Fault Address Register
+    bl      exception_from_user_rust
+
+    /* Rust handler terminates the task and schedules next.
+     * Reload CURRENT_TRAP_FRAME (now points to next task). */
+    adrp    x9, CURRENT_TRAP_FRAME
+    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+
+    /* Switch TTBR0 to current task's user address space */
+    adrp    x10, CURRENT_TTBR0
+    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    msr     ttbr0_el1, x10
+    isb
+    tlbi    vmalle1
+    dsb     ish
+    isb
+
+    /* Restore special registers from trap frame */
+    ldr     x10, [x9, #248]
+    ldr     x11, [x9, #256]
+    ldr     x12, [x9, #264]
+    msr     sp_el0, x10
+    msr     elr_el1, x11
+    msr     spsr_el1, x12
+
+    /* Restore all general purpose registers */
+    ldp     x0, x1, [x9, #0]
+    ldp     x2, x3, [x9, #16]
+    ldp     x4, x5, [x9, #32]
+    ldp     x6, x7, [x9, #48]
+    ldr     x8, [x9, #64]
+    ldr     x10, [x9, #80]
+    ldr     x11, [x9, #88]
+    ldp     x12, x13, [x9, #96]
+    ldp     x14, x15, [x9, #112]
+    ldp     x16, x17, [x9, #128]
+    ldp     x18, x19, [x9, #144]
+    ldp     x20, x21, [x9, #160]
+    ldp     x22, x23, [x9, #176]
+    ldp     x24, x25, [x9, #192]
+    ldp     x26, x27, [x9, #208]
+    ldp     x28, x29, [x9, #224]
+    ldr     x30, [x9, #240]
+    ldr     x9, [x9, #72]
+
+    /* Return to next task */
+    eret
 
 /*
  * IRQ handler - check if from user mode and handle accordingly

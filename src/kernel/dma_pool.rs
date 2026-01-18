@@ -20,19 +20,32 @@
 //! Userspace drivers call `shmem_create_dma()` syscall to allocate from
 //! this pool instead of regular shmem.
 
-use crate::logln;
+use crate::{kinfo, kerror, klog};
 use crate::arch::aarch64::mmu;
 use super::lock::SpinLock;
 use super::process::Pid;
 
 /// DMA pool base address (1MB into DRAM, avoiding any U-Boot stuff at start)
+/// NOTE: Descriptor rings MUST be below 4GB (DESC_BASE is 32-bit register)
 pub const DMA_POOL_BASE: u64 = 0x4010_0000;
 
-/// DMA pool size (2MB - enough for MT7996 descriptors + buffers)
-pub const DMA_POOL_SIZE: usize = 2 * 1024 * 1024;
+/// DMA pool size (4MB - enough for MT7996 descriptor rings + TX buffers)
+pub const DMA_POOL_SIZE: usize = 4 * 1024 * 1024;
 
 /// DMA pool end address
 pub const DMA_POOL_END: u64 = DMA_POOL_BASE + DMA_POOL_SIZE as u64;
+
+/// High DMA pool base address (above 4GB, for 36-bit buffer addresses)
+/// This is ~3GB into DRAM (0x40000000 + 0xC0000000 = 0x100000000)
+/// Linux uses addresses like 0x1020c7490 for TX buffers
+pub const DMA_POOL_HIGH_BASE: u64 = 0x1_0010_0000;
+
+/// High DMA pool size (16MB for TX/RX buffers)
+/// MT7996 needs: descriptors(256KB) + RX(13MB) + FWDL_TX(512KB) + MCU_TX(1MB) ≈ 15MB
+pub const DMA_POOL_HIGH_SIZE: usize = 16 * 1024 * 1024;
+
+/// High DMA pool end address
+pub const DMA_POOL_HIGH_END: u64 = DMA_POOL_HIGH_BASE + DMA_POOL_HIGH_SIZE as u64;
 
 /// Page size for alignment
 const PAGE_SIZE: usize = 4096;
@@ -54,8 +67,11 @@ impl DmaPool {
     }
 }
 
-/// Global DMA pool (protected by spinlock)
+/// Global DMA pool (protected by spinlock) - for descriptors (< 4GB)
 static DMA_POOL: SpinLock<DmaPool> = SpinLock::new(DmaPool::new());
+
+/// Global high DMA pool (protected by spinlock) - for buffers (> 4GB, 36-bit)
+static DMA_POOL_HIGH: SpinLock<DmaPool> = SpinLock::new(DmaPool::new());
 
 /// Initialize the DMA pool
 ///
@@ -70,14 +86,14 @@ pub fn init() {
     let mut pool = DMA_POOL.lock();
 
     if pool.initialized {
-        logln!("[DMA Pool] Already initialized");
         return;
     }
 
-    logln!("[DMA Pool] Reserving low memory for PCIe DMA");
-    logln!("  Base: 0x{:08x}", DMA_POOL_BASE);
-    logln!("  Size: {} KB", DMA_POOL_SIZE / 1024);
-    logln!("  End:  0x{:08x}", DMA_POOL_END);
+    kinfo!("dma_pool", "init_start";
+        base = klog::hex64(DMA_POOL_BASE),
+        size_kb = (DMA_POOL_SIZE / 1024) as u64,
+        end = klog::hex64(DMA_POOL_END)
+    );
 
     // The kernel's boot.S sets up identity mapping for all DRAM,
     // so we can access the pool directly at its physical address.
@@ -89,8 +105,88 @@ pub fn init() {
         core::ptr::write_bytes(pool_virt as *mut u8, 0, DMA_POOL_SIZE);
     }
 
+    // CRITICAL: Flush the cache to RAM!
+    // The kernel maps DRAM as cacheable, but userspace DMA mappings use
+    // non-cacheable (NORMAL_NC). Without this flush, the zeros sit in
+    // kernel cache and could overwrite userspace descriptor writes when
+    // cache lines are evicted later.
+    const CACHE_LINE: u64 = 64;
+    let end = pool_virt + DMA_POOL_SIZE as u64;
+    let mut addr = pool_virt;
+    while addr < end {
+        unsafe {
+            // DC CIVAC: Clean and Invalidate by VA to Point of Coherency
+            // This writes dirty data to RAM and invalidates the cache line,
+            // so future kernel accesses will re-read from RAM.
+            core::arch::asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += CACHE_LINE;
+    }
+    // DSB ensures all cache maintenance operations complete
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+
     pool.initialized = true;
-    logln!("[DMA Pool] Initialized successfully");
+    kinfo!("dma_pool", "init_ok");
+}
+
+/// Initialize the high DMA pool (for 36-bit buffer addresses)
+///
+/// Called during kernel boot after init().
+/// NOTE: We don't zero this memory from kernel space because the boot page tables
+/// only cover lower memory. The memory will be zeroed when mapped into userspace.
+pub fn init_high() {
+    let mut pool = DMA_POOL_HIGH.lock();
+
+    if pool.initialized {
+        return;
+    }
+
+    kinfo!("dma_pool", "init_high_start";
+        base = klog::hex64(DMA_POOL_HIGH_BASE),
+        size_kb = (DMA_POOL_HIGH_SIZE / 1024) as u64,
+        end = klog::hex64(DMA_POOL_HIGH_END)
+    );
+
+    pool.initialized = true;
+    kinfo!("dma_pool", "init_high_ok");
+}
+
+/// Allocate memory from high DMA pool (36-bit addresses)
+///
+/// Returns physical_address on success, or error code on failure.
+/// Memory is page-aligned and zeroed.
+pub fn alloc_high(size: usize) -> Result<u64, i64> {
+    if size == 0 {
+        return Err(-1);
+    }
+
+    let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    let mut pool = DMA_POOL_HIGH.lock();
+
+    if !pool.initialized {
+        kerror!("dma_pool", "alloc_high_not_init");
+        return Err(-2);
+    }
+
+    if pool.next_offset + aligned_size > DMA_POOL_HIGH_SIZE {
+        kerror!("dma_pool", "alloc_high_oom"; requested = aligned_size as u64, available = (DMA_POOL_HIGH_SIZE - pool.next_offset) as u64);
+        return Err(-3);
+    }
+
+    let phys_addr = DMA_POOL_HIGH_BASE + pool.next_offset as u64;
+    pool.next_offset += aligned_size;
+
+    kinfo!("dma_pool", "alloc_high_ok";
+        size = aligned_size as u64,
+        addr = klog::hex64(phys_addr),
+        usage = pool.next_offset as u64,
+        total = DMA_POOL_HIGH_SIZE as u64
+    );
+
+    Ok(phys_addr)
 }
 
 /// Allocate memory from DMA pool
@@ -108,22 +204,25 @@ pub fn alloc(size: usize) -> Result<u64, i64> {
     let mut pool = DMA_POOL.lock();
 
     if !pool.initialized {
-        logln!("[DMA Pool] ERROR: Pool not initialized");
+        kerror!("dma_pool", "alloc_not_init");
         return Err(-2); // ENODEV
     }
 
     // Check if we have enough space
     if pool.next_offset + aligned_size > DMA_POOL_SIZE {
-        logln!("[DMA Pool] ERROR: Out of memory (requested={}, available={})",
-               aligned_size, DMA_POOL_SIZE - pool.next_offset);
+        kerror!("dma_pool", "alloc_oom"; requested = aligned_size as u64, available = (DMA_POOL_SIZE - pool.next_offset) as u64);
         return Err(-3); // ENOMEM
     }
 
     let phys_addr = DMA_POOL_BASE + pool.next_offset as u64;
     pool.next_offset += aligned_size;
 
-    logln!("[DMA Pool] Allocated {} bytes at 0x{:08x} (pool usage: {}/{})",
-           aligned_size, phys_addr, pool.next_offset, DMA_POOL_SIZE);
+    kinfo!("dma_pool", "alloc_ok";
+        size = aligned_size as u64,
+        addr = klog::hex64(phys_addr),
+        usage = pool.next_offset as u64,
+        total = DMA_POOL_SIZE as u64
+    );
 
     Ok(phys_addr)
 }
@@ -135,7 +234,7 @@ pub fn alloc(size: usize) -> Result<u64, i64> {
 pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
     // Verify address is within pool
     if phys_addr < DMA_POOL_BASE || phys_addr + size as u64 > DMA_POOL_END {
-        logln!("[DMA Pool] ERROR: Address 0x{:x} not in pool", phys_addr);
+        kerror!("dma_pool", "map_addr_invalid"; addr = klog::hex64(phys_addr));
         return Err(-1);
     }
 
@@ -158,8 +257,125 @@ pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i6
     Err(-3) // ESRCH - no such process
 }
 
+/// Map high DMA pool memory into a process's address space (36-bit addresses)
+/// Uses special mapping that doesn't try to access memory from kernel space
+pub fn map_into_process_high(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
+    // Verify address is within high pool
+    if phys_addr < DMA_POOL_HIGH_BASE || phys_addr + size as u64 > DMA_POOL_HIGH_END {
+        kerror!("dma_pool", "map_high_addr_invalid"; addr = klog::hex64(phys_addr));
+        return Err(-1);
+    }
+
+    unsafe {
+        let sched = super::task::scheduler();
+
+        for task_opt in sched.tasks.iter_mut() {
+            if let Some(ref mut task) = task_opt {
+                if task.id == pid {
+                    // Use dma_high mapping - no kernel-side zeroing/flush
+                    return task.mmap_shmem_dma_high(phys_addr, size)
+                        .ok_or(-12i64);
+                }
+            }
+        }
+    }
+    Err(-3)
+}
+
 /// Get pool statistics
 pub fn stats() -> (usize, usize) {
     let pool = DMA_POOL.lock();
     (pool.next_offset, DMA_POOL_SIZE)
+}
+
+/// Get high pool statistics
+pub fn stats_high() -> (usize, usize) {
+    let pool = DMA_POOL_HIGH.lock();
+    (pool.next_offset, DMA_POOL_HIGH_SIZE)
+}
+
+// ============================================================================
+// Self-tests
+// ============================================================================
+
+#[cfg(feature = "selftest")]
+pub fn test() {
+    use crate::{kdebug, kinfo};
+
+    kdebug!("dma_pool", "test_start");
+
+    // Test 1: Pool constants are valid
+    {
+        assert!(DMA_POOL_BASE >= 0x4000_0000, "DMA_POOL_BASE should be in DRAM");
+        assert!(DMA_POOL_BASE < 0x1_0000_0000, "DMA_POOL_BASE must be < 4GB for 32-bit DESC_BASE");
+        assert!(DMA_POOL_SIZE > 0, "DMA_POOL_SIZE must be positive");
+        assert_eq!(DMA_POOL_SIZE % PAGE_SIZE, 0, "DMA_POOL_SIZE must be page-aligned");
+        assert!(DMA_POOL_END == DMA_POOL_BASE + DMA_POOL_SIZE as u64, "DMA_POOL_END calculation");
+        kdebug!("dma_pool", "constants_ok");
+    }
+
+    // Test 2: High pool constants are valid
+    {
+        assert!(DMA_POOL_HIGH_BASE >= 0x1_0000_0000, "DMA_POOL_HIGH_BASE should be > 4GB");
+        assert!(DMA_POOL_HIGH_SIZE > 0, "DMA_POOL_HIGH_SIZE must be positive");
+        assert_eq!(DMA_POOL_HIGH_SIZE % PAGE_SIZE, 0, "DMA_POOL_HIGH_SIZE must be page-aligned");
+        kdebug!("dma_pool", "high_constants_ok");
+    }
+
+    // Test 3: Pool initialized
+    {
+        let pool = DMA_POOL.lock();
+        assert!(pool.initialized, "DMA pool should be initialized");
+        drop(pool);
+        kdebug!("dma_pool", "init_ok");
+    }
+
+    // Test 4: Allocation returns valid address
+    {
+        let (used_before, _) = stats();
+        let result = alloc(PAGE_SIZE);
+        assert!(result.is_ok(), "alloc should succeed");
+        let addr = result.unwrap();
+        assert!(addr >= DMA_POOL_BASE, "Allocated address below pool base");
+        assert!(addr < DMA_POOL_END, "Allocated address above pool end");
+        assert_eq!(addr % PAGE_SIZE as u64, 0, "Allocated address not page-aligned");
+
+        let (used_after, _) = stats();
+        assert_eq!(used_after, used_before + PAGE_SIZE, "Pool usage should increase by PAGE_SIZE");
+        kdebug!("dma_pool", "alloc_ok"; addr = crate::klog::hex64(addr));
+    }
+
+    // Test 5: Zero-size allocation fails
+    {
+        let result = alloc(0);
+        assert!(result.is_err(), "Zero-size alloc should fail");
+        kdebug!("dma_pool", "zero_alloc_rejected");
+    }
+
+    // Test 6: High pool allocation
+    {
+        let pool = DMA_POOL_HIGH.lock();
+        if pool.initialized {
+            drop(pool);
+            let result = alloc_high(PAGE_SIZE);
+            assert!(result.is_ok(), "alloc_high should succeed");
+            let addr = result.unwrap();
+            assert!(addr >= DMA_POOL_HIGH_BASE, "High alloc below base");
+            assert!(addr < DMA_POOL_HIGH_END, "High alloc above end");
+            kdebug!("dma_pool", "alloc_high_ok"; addr = crate::klog::hex64(addr));
+        } else {
+            drop(pool);
+            kdebug!("dma_pool", "high_pool_not_init_skipped");
+        }
+    }
+
+    // Test 7: Stats function works
+    {
+        let (used, total) = stats();
+        assert!(used <= total, "Used should not exceed total");
+        assert_eq!(total, DMA_POOL_SIZE, "Total should match DMA_POOL_SIZE");
+        kdebug!("dma_pool", "stats_ok"; used = used as u64, total = total as u64);
+    }
+
+    kinfo!("dma_pool", "test_ok");
 }

@@ -26,7 +26,7 @@
 //! ```
 
 use super::super::error::{IpcError, IpcResult};
-use super::super::protocol::{Protocol, Message};
+use super::super::protocol::{Protocol, Message, Writer, Reader};
 
 /// Maximum devices in a response
 pub const MAX_DEVICES: usize = 8;
@@ -83,63 +83,175 @@ pub enum PcieRequest {
     ResetPort {
         port: u8,
     },
+    /// Enable Bus Master on a device and its parent bridge
+    /// Required before DMA operations. Also enables BME on the parent bridge
+    /// to allow DMA traffic through.
+    EnableBusMaster {
+        port: u8,
+        bus: u8,
+        device: u8,
+        function: u8,
+    },
+    /// Read PCIe Device Status register
+    /// Returns status bits for error detection (UR, Fatal, Non-Fatal, Correctable)
+    ReadDeviceStatus {
+        port: u8,
+        bus: u8,
+        device: u8,
+        function: u8,
+    },
+    /// Clear PCIe Device Status error bits (W1C)
+    ClearDeviceStatus {
+        port: u8,
+        bus: u8,
+        device: u8,
+        function: u8,
+    },
+    /// Read a register from device BAR0 (for debugging)
+    /// offset: Offset from BAR0 base address
+    ReadRegister {
+        port: u8,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u32,
+    },
+    /// Write a register to device BAR0 (for debugging)
+    /// offset: Offset from BAR0 base address
+    /// value: 32-bit value to write
+    WriteRegister {
+        port: u8,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u32,
+        value: u32,
+    },
 }
 
 /// Command codes (must match pcied)
 const CMD_FIND_DEVICE: u8 = 0x01;
 const CMD_RESET_PORT: u8 = 0x02;
+const CMD_ENABLE_BUS_MASTER: u8 = 0x03;
+const CMD_READ_DEVICE_STATUS: u8 = 0x04;
+const CMD_CLEAR_DEVICE_STATUS: u8 = 0x05;
+const CMD_READ_REGISTER: u8 = 0x06;
+const CMD_WRITE_REGISTER: u8 = 0x07;
 
 impl Message for PcieRequest {
     fn serialize(&self, buf: &mut [u8]) -> IpcResult<usize> {
+        let mut w = Writer::new(buf);
         match self {
             PcieRequest::FindDevice { vendor_id, device_id } => {
-                if buf.len() < 5 {
-                    return Err(IpcError::MessageTooLarge);
-                }
-                buf[0] = CMD_FIND_DEVICE;
-                buf[1..3].copy_from_slice(&vendor_id.to_le_bytes());
-                buf[3..5].copy_from_slice(&device_id.to_le_bytes());
-                Ok(5)
+                w.write_u8(CMD_FIND_DEVICE)?;
+                w.write_u16(*vendor_id)?;
+                w.write_u16(*device_id)?;
             }
             PcieRequest::ResetPort { port } => {
-                if buf.len() < 2 {
-                    return Err(IpcError::MessageTooLarge);
-                }
-                buf[0] = CMD_RESET_PORT;
-                buf[1] = *port;
-                Ok(2)
+                w.write_u8(CMD_RESET_PORT)?;
+                w.write_u8(*port)?;
+            }
+            PcieRequest::EnableBusMaster { port, bus, device, function } => {
+                w.write_u8(CMD_ENABLE_BUS_MASTER)?;
+                w.write_u8(*port)?;
+                w.write_u8(*bus)?;
+                w.write_u8(*device)?;
+                w.write_u8(*function)?;
+            }
+            PcieRequest::ReadDeviceStatus { port, bus, device, function } => {
+                w.write_u8(CMD_READ_DEVICE_STATUS)?;
+                w.write_u8(*port)?;
+                w.write_u8(*bus)?;
+                w.write_u8(*device)?;
+                w.write_u8(*function)?;
+            }
+            PcieRequest::ClearDeviceStatus { port, bus, device, function } => {
+                w.write_u8(CMD_CLEAR_DEVICE_STATUS)?;
+                w.write_u8(*port)?;
+                w.write_u8(*bus)?;
+                w.write_u8(*device)?;
+                w.write_u8(*function)?;
+            }
+            PcieRequest::ReadRegister { port, bus, device, function, offset } => {
+                w.write_u8(CMD_READ_REGISTER)?;
+                w.write_u8(*port)?;
+                w.write_u8(*bus)?;
+                w.write_u8(*device)?;
+                w.write_u8(*function)?;
+                w.write_u32(*offset)?;
+            }
+            PcieRequest::WriteRegister { port, bus, device, function, offset, value } => {
+                w.write_u8(CMD_WRITE_REGISTER)?;
+                w.write_u8(*port)?;
+                w.write_u8(*bus)?;
+                w.write_u8(*device)?;
+                w.write_u8(*function)?;
+                w.write_u32(*offset)?;
+                w.write_u32(*value)?;
             }
         }
+        Ok(w.finish())
     }
 
     fn deserialize(buf: &[u8]) -> IpcResult<(Self, usize)> {
-        if buf.is_empty() {
-            return Err(IpcError::Truncated);
-        }
+        let mut r = Reader::new(buf);
+        let cmd = r.read_u8()?;
 
-        match buf[0] {
-            CMD_FIND_DEVICE => {
-                if buf.len() < 5 {
-                    return Err(IpcError::Truncated);
-                }
-                let vendor_id = u16::from_le_bytes([buf[1], buf[2]]);
-                let device_id = u16::from_le_bytes([buf[3], buf[4]]);
-                Ok((PcieRequest::FindDevice { vendor_id, device_id }, 5))
-            }
-            CMD_RESET_PORT => {
-                if buf.len() < 2 {
-                    return Err(IpcError::Truncated);
-                }
-                Ok((PcieRequest::ResetPort { port: buf[1] }, 2))
-            }
-            _ => Err(IpcError::UnexpectedMessage),
-        }
+        let msg = match cmd {
+            CMD_FIND_DEVICE => PcieRequest::FindDevice {
+                vendor_id: r.read_u16()?,
+                device_id: r.read_u16()?,
+            },
+            CMD_RESET_PORT => PcieRequest::ResetPort {
+                port: r.read_u8()?,
+            },
+            CMD_ENABLE_BUS_MASTER => PcieRequest::EnableBusMaster {
+                port: r.read_u8()?,
+                bus: r.read_u8()?,
+                device: r.read_u8()?,
+                function: r.read_u8()?,
+            },
+            CMD_READ_DEVICE_STATUS => PcieRequest::ReadDeviceStatus {
+                port: r.read_u8()?,
+                bus: r.read_u8()?,
+                device: r.read_u8()?,
+                function: r.read_u8()?,
+            },
+            CMD_CLEAR_DEVICE_STATUS => PcieRequest::ClearDeviceStatus {
+                port: r.read_u8()?,
+                bus: r.read_u8()?,
+                device: r.read_u8()?,
+                function: r.read_u8()?,
+            },
+            CMD_READ_REGISTER => PcieRequest::ReadRegister {
+                port: r.read_u8()?,
+                bus: r.read_u8()?,
+                device: r.read_u8()?,
+                function: r.read_u8()?,
+                offset: r.read_u32()?,
+            },
+            CMD_WRITE_REGISTER => PcieRequest::WriteRegister {
+                port: r.read_u8()?,
+                bus: r.read_u8()?,
+                device: r.read_u8()?,
+                function: r.read_u8()?,
+                offset: r.read_u32()?,
+                value: r.read_u32()?,
+            },
+            _ => return Err(IpcError::UnexpectedMessage),
+        };
+        Ok((msg, r.position()))
     }
 
     fn serialized_size(&self) -> usize {
         match self {
             PcieRequest::FindDevice { .. } => 5,
             PcieRequest::ResetPort { .. } => 2,
+            PcieRequest::EnableBusMaster { .. } => 5,
+            PcieRequest::ReadDeviceStatus { .. } => 5,
+            PcieRequest::ClearDeviceStatus { .. } => 5,
+            PcieRequest::ReadRegister { .. } => 9,
+            PcieRequest::WriteRegister { .. } => 13,
         }
     }
 }
@@ -151,6 +263,15 @@ pub enum PcieResponse {
     Devices(DeviceList),
     /// Reset result (success/failure)
     ResetResult(bool),
+    /// Device Status register value (16-bit)
+    /// Bit 0: Correctable Error Detected
+    /// Bit 1: Non-Fatal Error Detected
+    /// Bit 2: Fatal Error Detected
+    /// Bit 3: Unsupported Request Detected (indicates bad DMA address!)
+    /// Bit 5: Transactions Pending
+    DeviceStatus(u16),
+    /// Register value (32-bit) from ReadRegister request
+    RegisterValue(u32),
     /// Error response
     Error(i32),
 }
@@ -192,6 +313,22 @@ impl Message for PcieResponse {
                 buf[0] = if *success { 1 } else { 0 };
                 Ok(1)
             }
+            PcieResponse::DeviceStatus(status) => {
+                if buf.len() < 3 {
+                    return Err(IpcError::MessageTooLarge);
+                }
+                buf[0] = 0xFE; // DeviceStatus marker (distinct from error 0xFF)
+                buf[1..3].copy_from_slice(&status.to_le_bytes());
+                Ok(3)
+            }
+            PcieResponse::RegisterValue(value) => {
+                if buf.len() < 5 {
+                    return Err(IpcError::MessageTooLarge);
+                }
+                buf[0] = 0xFD; // RegisterValue marker
+                buf[1..5].copy_from_slice(&value.to_le_bytes());
+                Ok(5)
+            }
             PcieResponse::Error(code) => {
                 if buf.len() < 5 {
                     return Err(IpcError::MessageTooLarge);
@@ -215,6 +352,24 @@ impl Message for PcieResponse {
             }
             let code = i32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
             return Ok((PcieResponse::Error(code), 5));
+        }
+
+        // Check for DeviceStatus marker
+        if buf[0] == 0xFE {
+            if buf.len() < 3 {
+                return Err(IpcError::Truncated);
+            }
+            let status = u16::from_le_bytes([buf[1], buf[2]]);
+            return Ok((PcieResponse::DeviceStatus(status), 3));
+        }
+
+        // Check for RegisterValue marker
+        if buf[0] == 0xFD {
+            if buf.len() < 5 {
+                return Err(IpcError::Truncated);
+            }
+            let value = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+            return Ok((PcieResponse::RegisterValue(value), 5));
         }
 
         // If count is 0 or 1 and buffer is exactly 1 byte, it's a reset result
@@ -265,6 +420,8 @@ impl Message for PcieResponse {
         match self {
             PcieResponse::Devices(list) => 1 + list.len() * PcieDeviceInfo::SERIALIZED_SIZE,
             PcieResponse::ResetResult(_) => 1,
+            PcieResponse::DeviceStatus(_) => 3,
+            PcieResponse::RegisterValue(_) => 5,
             PcieResponse::Error(_) => 5,
         }
     }
@@ -357,6 +514,86 @@ impl PcieClient {
     /// Reset a PCIe port
     pub fn reset_port(&mut self, port: u8) -> IpcResult<bool> {
         let request = PcieRequest::ResetPort { port };
+        let response = self.inner.request(&request)?;
+
+        match response {
+            PcieResponse::ResetResult(success) => Ok(success),
+            PcieResponse::Error(code) => Err(IpcError::ServerError(code)),
+            _ => Err(IpcError::UnexpectedMessage),
+        }
+    }
+
+    /// Enable Bus Master on a device and its parent bridge
+    ///
+    /// This must be called before DMA operations. It enables BME on:
+    /// 1. The specified device
+    /// 2. The parent bridge (if any) to allow DMA traffic through the PCIe hierarchy
+    pub fn enable_bus_master(&mut self, port: u8, bus: u8, device: u8, function: u8) -> IpcResult<bool> {
+        let request = PcieRequest::EnableBusMaster { port, bus, device, function };
+        let response = self.inner.request(&request)?;
+
+        match response {
+            PcieResponse::ResetResult(success) => Ok(success), // Reusing same response type
+            PcieResponse::Error(code) => Err(IpcError::ServerError(code)),
+            _ => Err(IpcError::UnexpectedMessage),
+        }
+    }
+
+    /// Read PCIe Device Status register
+    ///
+    /// Returns the Device Status register value (16-bit).
+    /// Key bits for DMA debugging:
+    /// - Bit 0: Correctable Error Detected
+    /// - Bit 1: Non-Fatal Error Detected
+    /// - Bit 2: Fatal Error Detected
+    /// - Bit 3: Unsupported Request Detected (indicates bad DMA address!)
+    /// - Bit 5: Transactions Pending
+    pub fn read_device_status(&mut self, port: u8, bus: u8, device: u8, function: u8) -> IpcResult<u16> {
+        let request = PcieRequest::ReadDeviceStatus { port, bus, device, function };
+        let response = self.inner.request(&request)?;
+
+        match response {
+            PcieResponse::DeviceStatus(status) => Ok(status),
+            PcieResponse::Error(code) => Err(IpcError::ServerError(code)),
+            _ => Err(IpcError::UnexpectedMessage),
+        }
+    }
+
+    /// Clear PCIe Device Status error bits
+    ///
+    /// Clears all error bits (Correctable, Non-Fatal, Fatal, Unsupported Request).
+    pub fn clear_device_status(&mut self, port: u8, bus: u8, device: u8, function: u8) -> IpcResult<bool> {
+        let request = PcieRequest::ClearDeviceStatus { port, bus, device, function };
+        let response = self.inner.request(&request)?;
+
+        match response {
+            PcieResponse::ResetResult(success) => Ok(success),
+            PcieResponse::Error(code) => Err(IpcError::ServerError(code)),
+            _ => Err(IpcError::UnexpectedMessage),
+        }
+    }
+
+    /// Read a 32-bit register from device BAR0
+    ///
+    /// offset: Offset from BAR0 base address (must be 4-byte aligned)
+    /// Returns the 32-bit register value
+    pub fn read_register(&mut self, port: u8, bus: u8, device: u8, function: u8, offset: u32) -> IpcResult<u32> {
+        let request = PcieRequest::ReadRegister { port, bus, device, function, offset };
+        let response = self.inner.request(&request)?;
+
+        match response {
+            PcieResponse::RegisterValue(value) => Ok(value),
+            PcieResponse::Error(code) => Err(IpcError::ServerError(code)),
+            _ => Err(IpcError::UnexpectedMessage),
+        }
+    }
+
+    /// Write a 32-bit register to device BAR0
+    ///
+    /// offset: Offset from BAR0 base address (must be 4-byte aligned)
+    /// value: 32-bit value to write
+    pub fn write_register(&mut self, port: u8, bus: u8, device: u8, function: u8, offset: u32, value: u32) -> IpcResult<bool> {
+        let request = PcieRequest::WriteRegister { port, bus, device, function, offset, value };
         let response = self.inner.request(&request)?;
 
         match response {

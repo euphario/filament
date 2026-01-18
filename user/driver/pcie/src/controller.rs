@@ -54,6 +54,27 @@ pub struct PcieController {
 }
 
 impl PcieController {
+    /// Open an existing (already initialized) PCIe port for operations
+    ///
+    /// This does NOT perform reset or re-initialization - just maps the MAC
+    /// registers for access. Use this for operations on an already-active port.
+    pub fn open_existing(config: PciePortConfig) -> Result<Self, PcieError> {
+        // Map MAC MMIO region
+        let mac = MmioRegion::open(config.mac_base, config.mac_size)
+            .ok_or(PcieError::MacMmioFailed)?;
+
+        // Check if link is up (port should already be initialized)
+        let link_status = mac.read32(regs::PCIE_LINK_STATUS_REG);
+        let link_up = (link_status & link_status::PCIE_PORT_LINKUP) != 0;
+
+        Ok(Self {
+            mac,
+            config,
+            link_up,
+            next_mem_addr: config.mem_base,
+        })
+    }
+
     /// Initialize a PCIe port with the given configuration
     ///
     /// Performs the full initialization sequence:
@@ -87,21 +108,31 @@ impl PcieController {
         let misc = mac.read32(regs::PCIE_MISC_CTRL_REG);
         mac.write32(regs::PCIE_MISC_CTRL_REG, misc | misc_ctrl::DISABLE_DVFSRC_VLT_REQ);
 
-        // Set Root Complex mode - CRITICAL for inbound DMA to work!
+        // Set Root Complex mode
         // Linux: mtk_pcie_startup_port_v2() sets PCIE_RC_MODE in PCIE_SETTING_REG
-        // Without this, the controller may not properly route inbound (device->host) transactions
+        // Without RC_MODE, the controller may not properly route inbound (device->host) transactions
+        // NOTE: We don't force link speed - let hardware auto-negotiate like Linux does
+        // (Linux only sets GEN_SUPPORT if max-link-speed is specified in device tree, which MT7988 doesn't have)
         let setting = mac.read32(regs::PCIE_SETTING_REG);
         mac.write32(regs::PCIE_SETTING_REG, setting | regs::pcie_setting::RC_MODE);
 
-        // EXPERIMENT: Skip reset to preserve U-Boot's PCIe configuration
-        // U-Boot already initialized PCIe and DMA might work with its setup.
-        // The full reset sequence might be breaking inbound DMA configuration.
-        debug("rst-SKIP");
-        let rst_current = mac.read32(regs::PCIE_RST_CTRL_REG);
-        debug_status(rst_current);
+        // Reset sequence - MUST match Linux exactly (single-stage release)
+        // Linux: mtk_pcie_startup_port() lines 474-493
+        debug("rst");
 
-        // Only wait briefly for any register writes to settle
-        delay_ms(10);
+        // Assert all resets (read-modify-write like Linux)
+        let mut rst = mac.read32(regs::PCIE_RST_CTRL_REG);
+        rst |= rst_ctrl::ALL;
+        mac.write32(regs::PCIE_RST_CTRL_REG, rst);
+        debug_status(mac.read32(regs::PCIE_RST_CTRL_REG));
+
+        // Wait 100ms per PCIe CEM spec (TPVPERL) for power and clock to stabilize
+        delay_ms(100);
+
+        // De-assert ALL resets at once (critical: Linux does this in one write)
+        rst &= !rst_ctrl::ALL;
+        mac.write32(regs::PCIE_RST_CTRL_REG, rst);
+        debug_status(mac.read32(regs::PCIE_RST_CTRL_REG));
 
         debug("link");
         // Step 4: Read status registers for debug
@@ -112,10 +143,23 @@ impl PcieController {
 
         let link_up = Self::wait_for_link(&mac, 500);
 
+        // Debug: show final link status after training
+        if link_up {
+            let final_ltssm = mac.read32(regs::PCIE_LTSSM_STATUS_REG);
+            let final_link = mac.read32(regs::PCIE_LINK_STATUS_REG);
+            debug_status(final_ltssm);
+            debug_status(final_link);
+        }
+
         debug("atu");
         // Setup ATU for memory transactions (1:1 mapping)
         // CPU address 0x30200000 -> PCIe bus address 0x30200000
         Self::setup_atu(&mac, config.mem_base, config.mem_base, config.mem_size);
+
+        debug("msi");
+        // Enable MSI on root complex
+        // Required for devices that use MSI for internal state machine transitions
+        Self::enable_msi(&mac, config.mac_base);
 
         debug("done");
         Ok(Self {
@@ -215,21 +259,180 @@ impl PcieController {
         // self.mac.write32(table_base + atu::TRSL_PARAM_OFFSET, INBOUND_MEM_TYPE);
     }
 
+    /// Enable MSI (Message Signaled Interrupts) on the root complex
+    ///
+    /// EXACT copy of Linux mtk_pcie_enable_msi() in pcie-mediatek-gen3.c:377-404
+    ///
+    /// # Arguments
+    /// * `mac_phys_base` - Physical base address of the PCIe MAC (e.g., 0x11300000)
+    fn enable_msi(mac: &MmioRegion, mac_phys_base: u64) {
+        use regs::{msi, PCIE_MSI_SET_BASE_REG, PCIE_MSI_SET_ADDR_HI_BASE,
+                   PCIE_MSI_SET_ENABLE_REG, PCIE_INT_ENABLE_REG};
+
+        // Linux: for (i = 0; i < PCIE_MSI_SET_NUM; i++) {
+        for i in 0..msi::SET_NUM {
+            // Linux: msi_set->msg_addr = pcie->reg_base + PCIE_MSI_SET_BASE_REG + i * PCIE_MSI_SET_OFFSET;
+            let msg_addr = mac_phys_base + PCIE_MSI_SET_BASE_REG as u64 + (i * msi::SET_OFFSET) as u64;
+
+            // Linux: writel_relaxed(lower_32_bits(msi_set->msg_addr), msi_set->base);
+            let set_base = PCIE_MSI_SET_BASE_REG + i * msi::SET_OFFSET;
+            mac.write32(set_base, msg_addr as u32);
+
+            // Linux: writel_relaxed(upper_32_bits(msi_set->msg_addr),
+            //                       pcie->base + PCIE_MSI_SET_ADDR_HI_BASE + i * PCIE_MSI_SET_ADDR_HI_OFFSET);
+            let addr_hi_reg = PCIE_MSI_SET_ADDR_HI_BASE + i * msi::ADDR_HI_OFFSET;
+            mac.write32(addr_hi_reg, (msg_addr >> 32) as u32);
+        }
+
+        // Linux: val = readl_relaxed(pcie->base + PCIE_MSI_SET_ENABLE_REG);
+        //        val |= PCIE_MSI_SET_ENABLE;
+        //        writel_relaxed(val, pcie->base + PCIE_MSI_SET_ENABLE_REG);
+        let val = mac.read32(PCIE_MSI_SET_ENABLE_REG);
+        mac.write32(PCIE_MSI_SET_ENABLE_REG, val | msi::SET_ENABLE_BITS);
+
+        // Linux: val = readl_relaxed(pcie->base + PCIE_INT_ENABLE_REG);
+        //        val |= PCIE_MSI_ENABLE;
+        //        writel_relaxed(val, pcie->base + PCIE_INT_ENABLE_REG);
+        let val = mac.read32(PCIE_INT_ENABLE_REG);
+        mac.write32(PCIE_INT_ENABLE_REG, val | msi::INT_ENABLE_BITS);
+    }
+
     /// Check if link is up
     pub fn is_link_up(&self) -> bool {
         self.link_up
     }
 
     /// Get link speed (Gen1/2/3)
+    ///
+    /// Reads from PCIe capability Link Status register in Root Port config space.
+    /// PCIe cap is at 0x1080 (since Link Control 2 @ 0x10b0 = cap + 0x30).
+    /// Link Control is at cap + 0x10 = 0x1090, Link Status is at cap + 0x12 = 0x1092.
+    /// We read 32-bit aligned at 0x1090 and extract upper 16 bits for Link Status.
     pub fn link_speed(&self) -> u8 {
-        let status = self.mac.read32(regs::PCIE_LINK_STATUS_REG);
-        ((status & link_status::SPEED_MASK) >> link_status::SPEED_SHIFT) as u8
+        // Read 32-bit at aligned address 0x1090 (Link Control + Link Status)
+        // Link Status is in upper 16 bits
+        const PCIE_CAP_LINK_CTL_STA: usize = 0x1090;
+        let val = self.mac.read32(PCIE_CAP_LINK_CTL_STA);
+        // Link Status is upper 16 bits, speed is bits 3:0 of Link Status
+        let link_status = (val >> 16) as u16;
+        (link_status & 0xF) as u8
     }
 
     /// Get link width (x1, x2, etc.)
+    ///
+    /// Reads from PCIe capability Link Status register in Root Port config space.
     pub fn link_width(&self) -> u8 {
-        let status = self.mac.read32(regs::PCIE_LINK_STATUS_REG);
-        ((status & link_status::WIDTH_MASK) >> link_status::WIDTH_SHIFT) as u8
+        // Read 32-bit at aligned address 0x1090 (Link Control + Link Status)
+        // Link Status is in upper 16 bits
+        const PCIE_CAP_LINK_CTL_STA: usize = 0x1090;
+        let val = self.mac.read32(PCIE_CAP_LINK_CTL_STA);
+        // Link Status is upper 16 bits, width is bits 9:4 of Link Status
+        let link_status = (val >> 16) as u16;
+        ((link_status >> 4) & 0x3F) as u8
+    }
+
+    /// Get raw LTSSM register value for debugging
+    ///
+    /// Use `regs::ltssm::decode()` to interpret the value.
+    pub fn ltssm_raw(&self) -> u32 {
+        self.mac.read32(regs::PCIE_LTSSM_STATUS_REG)
+    }
+
+    /// Dump all SoC PCIe controller registers for debugging
+    ///
+    /// This prints all the important registers from the MediaTek PCIe MAC
+    /// for comparison with OpenWRT/Linux.
+    pub fn dump_soc_registers(&self) {
+        use userlib::println;
+
+        // Register addresses from pcie-mediatek-gen3.c
+        const PCIE_BASE_CFG_REG: usize = 0x14;
+        const PCIE_SETTING_REG: usize = 0x80;
+        const PCIE_PCI_IDS_1: usize = 0x9c;
+        const PCIE_EQ_PRESET_01_REG: usize = 0x100;
+        const PCIE_CFGNUM_REG: usize = 0x140;
+        const PCIE_RST_CTRL_REG: usize = 0x148;
+        const PCIE_LTSSM_STATUS_REG: usize = 0x150;
+        const PCIE_LINK_STATUS_REG: usize = 0x154;
+        const PCIE_INT_ENABLE_REG: usize = 0x180;
+        const PCIE_INT_STATUS_REG: usize = 0x184;
+        const PCIE_MSI_SET_ENABLE_REG: usize = 0x190;
+        const PCIE_ICMD_PM_REG: usize = 0x198;
+        const PCIE_PIPE4_PIE8_REG: usize = 0x338;
+        const PCIE_MISC_CTRL_REG: usize = 0x348;
+        const PCIE_TRANS_TABLE_BASE: usize = 0x800;
+        const PCIE_MSI_SET_BASE_REG: usize = 0xc00;
+        const PCIE_RESOURCE_CTRL_REG: usize = 0xd2c;
+        const PCIE_CONF_LINK2_CTL_STS: usize = 0x10b0;
+
+        println!("=== SoC PCIe MAC Registers (base 0x{:08x}) ===",
+                 self.config.mac_base);
+
+        println!("  BASE_CFG (0x14):     0x{:08x}", self.mac.read32(PCIE_BASE_CFG_REG));
+        println!("  SETTING (0x80):      0x{:08x}", self.mac.read32(PCIE_SETTING_REG));
+        println!("  PCI_IDS_1 (0x9c):    0x{:08x}", self.mac.read32(PCIE_PCI_IDS_1));
+        println!("  EQ_PRESET (0x100):   0x{:08x}", self.mac.read32(PCIE_EQ_PRESET_01_REG));
+        println!("  CFGNUM (0x140):      0x{:08x}", self.mac.read32(PCIE_CFGNUM_REG));
+        println!("  RST_CTRL (0x148):    0x{:08x}", self.mac.read32(PCIE_RST_CTRL_REG));
+        println!("  LTSSM (0x150):       0x{:08x}", self.mac.read32(PCIE_LTSSM_STATUS_REG));
+        println!("  LINK_STATUS (0x154): 0x{:08x}", self.mac.read32(PCIE_LINK_STATUS_REG));
+        println!("  INT_ENABLE (0x180):  0x{:08x}", self.mac.read32(PCIE_INT_ENABLE_REG));
+        println!("  INT_STATUS (0x184):  0x{:08x}", self.mac.read32(PCIE_INT_STATUS_REG));
+        println!("  MSI_SET_EN (0x190):  0x{:08x}", self.mac.read32(PCIE_MSI_SET_ENABLE_REG));
+        println!("  ICMD_PM (0x198):     0x{:08x}", self.mac.read32(PCIE_ICMD_PM_REG));
+        println!("  PIPE4_PIE8 (0x338):  0x{:08x}", self.mac.read32(PCIE_PIPE4_PIE8_REG));
+        println!("  MISC_CTRL (0x348):   0x{:08x}", self.mac.read32(PCIE_MISC_CTRL_REG));
+        println!("  RSRC_CTRL (0xd2c):   0x{:08x}", self.mac.read32(PCIE_RESOURCE_CTRL_REG));
+        println!("  LINK2_CTL (0x10b0):  0x{:08x}", self.mac.read32(PCIE_CONF_LINK2_CTL_STS));
+
+        // ATU table entry 0 (5 registers per entry)
+        println!("  ATU[0] (0x800-0x810):");
+        println!("    SRC_LSB:   0x{:08x}", self.mac.read32(PCIE_TRANS_TABLE_BASE));
+        println!("    SRC_MSB:   0x{:08x}", self.mac.read32(PCIE_TRANS_TABLE_BASE + 0x4));
+        println!("    TRSL_LSB:  0x{:08x}", self.mac.read32(PCIE_TRANS_TABLE_BASE + 0x8));
+        println!("    TRSL_MSB:  0x{:08x}", self.mac.read32(PCIE_TRANS_TABLE_BASE + 0xc));
+        println!("    PARAM:     0x{:08x}", self.mac.read32(PCIE_TRANS_TABLE_BASE + 0x10));
+
+        // MSI set 0 (3 registers per set)
+        println!("  MSI[0] (0xc00-0xc08):");
+        println!("    BASE:      0x{:08x}", self.mac.read32(PCIE_MSI_SET_BASE_REG));
+        println!("    STATUS:    0x{:08x}", self.mac.read32(PCIE_MSI_SET_BASE_REG + 0x4));
+        println!("    ENABLE:    0x{:08x}", self.mac.read32(PCIE_MSI_SET_BASE_REG + 0x8));
+
+        // Decode LTSSM bits for debugging
+        let ltssm = self.mac.read32(PCIE_LTSSM_STATUS_REG);
+        let state = (ltssm >> 24) & 0x1F;
+        let bit11 = (ltssm >> 11) & 1;
+        println!("  LTSSM decode: state={}, bit11={} (OpenWRT has bit11=1)",
+                 state, bit11);
+
+        // Decode SETTING bits
+        let setting = self.mac.read32(PCIE_SETTING_REG);
+        let rc_mode = setting & 1;
+        let link_width = (setting >> 8) & 0xF;
+        let gen_support = (setting >> 12) & 0x7;
+        println!("  SETTING decode: RC_MODE={}, LINK_WIDTH={}, GEN_SUPPORT={}",
+                 rc_mode, link_width, gen_support);
+
+        // Root Port config space (at offset 0x1000 from MAC base)
+        // This is the RC's own config space, not device config space
+        const RC_CFG_BASE: usize = 0x1000;
+        println!("=== Root Port Config Space ===");
+        println!("  VID/DID (0x00):      0x{:08x}", self.mac.read32(RC_CFG_BASE + 0x00));
+        println!("  CMD/STS (0x04):      0x{:08x}", self.mac.read32(RC_CFG_BASE + 0x04));
+        println!("  CLASS (0x08):        0x{:08x}", self.mac.read32(RC_CFG_BASE + 0x08));
+        println!("  HDR/BIST (0x0c):     0x{:08x}", self.mac.read32(RC_CFG_BASE + 0x0c));
+
+        // PCIe capability is typically at offset 0x80 in config space
+        // For MediaTek it's at 0x1080 from MAC base
+        const RC_PCIE_CAP: usize = 0x1080;
+        println!("  PCIe Cap (0x80):");
+        println!("    CAP_ID (0x80):     0x{:08x}", self.mac.read32(RC_PCIE_CAP + 0x00));
+        println!("    DEV_CAP (0x84):    0x{:08x}", self.mac.read32(RC_PCIE_CAP + 0x04));
+        println!("    DEV_CTL (0x88):    0x{:08x}", self.mac.read32(RC_PCIE_CAP + 0x08));
+        println!("    LINK_CAP (0x8c):   0x{:08x}", self.mac.read32(RC_PCIE_CAP + 0x0c));
+        println!("    LINK_CTL (0x90):   0x{:08x}", self.mac.read32(RC_PCIE_CAP + 0x10));
+        println!("    LINK_CTL2 (0xb0):  0x{:08x}", self.mac.read32(RC_PCIE_CAP + 0x30));
     }
 
     /// Get port configuration
@@ -379,9 +582,10 @@ impl PcieController {
             cfg.write32(bdf, pci_cfg::BAR0 + 4, (aligned_addr >> 32) as u32);
         }
 
-        // Enable memory space access and bus master
+        // Enable memory space access, bus master, and disable INTx
+        // OpenWRT sets Command = 0x0406: MEM_SPACE | BUS_MASTER | INT_DISABLE
         let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
-        let new_cmd = cmd | command::MEM_SPACE | command::BUS_MASTER;
+        let new_cmd = cmd | command::MEM_SPACE | command::BUS_MASTER | command::INT_DISABLE;
         cfg.write32(bdf, pci_cfg::COMMAND, new_cmd as u32);
 
         // Read back to verify
@@ -411,23 +615,25 @@ impl PcieController {
                 self.allocate_bar0(mac, bdf)
             } else {
                 // Enable BME on bridge so downstream devices can DMA
+                // OpenWRT sets Command = 0x0406: MEM_SPACE | BUS_MASTER | INT_DISABLE
+                // Use TLP access - direct MMIO to RC config space (0x1004) is read-only
                 use crate::regs::cfg as pci_cfg;
                 use crate::regs::command;
                 let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
-                cfg.write32(bdf, pci_cfg::COMMAND,
-                    (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+                let new_cmd = cmd | command::MEM_SPACE | command::BUS_MASTER | command::INT_DISABLE;
+                cfg.write16(bdf, pci_cfg::COMMAND, new_cmd);
                 let readback = cfg.read16(bdf, pci_cfg::COMMAND);
                 (0, 0, readback)
             };
 
-            // Disable ASPM for all devices (including bridges/root ports)
-            // Both link partners must have ASPM disabled for proper operation
-            // Critical for WiFi devices like MT7996 - Linux disables on BOTH device AND parent bridge
+            // Configure all PCIe registers to match OpenWRT exactly
+            // Use TLP-based config access for all devices (including root port)
+            // Direct MMIO to RC config space is read-only
             cfg.disable_aspm(bdf);
-
-            // Configure Device Control (MRRS, MPS, Extended Tag, etc.)
-            // Critical for DMA to work - Linux does this automatically for all PCIe devices
             cfg.configure_device_control(bdf);
+            cfg.configure_link_control2(bdf, is_bridge);
+
+            // PCIe capability register configuration already done by configure_* methods
 
             devices.push(PcieDevice {
                 bdf,
@@ -464,19 +670,19 @@ impl PcieController {
                         let (bar0_addr, bar0_size, command) = if !func_is_bridge {
                             self.allocate_bar0(mac, bdf)
                         } else {
-                            // Enable BME on bridge so downstream devices can DMA
+                            // Enable BME on bridge using TLP access
                             use crate::regs::cfg as pci_cfg;
                             use crate::regs::command;
                             let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
-                            cfg.write32(bdf, pci_cfg::COMMAND,
-                                (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+                            let new_cmd = cmd | command::MEM_SPACE | command::BUS_MASTER | command::INT_DISABLE;
+                            cfg.write16(bdf, pci_cfg::COMMAND, new_cmd);
                             let readback = cfg.read16(bdf, pci_cfg::COMMAND);
                             (0, 0, readback)
                         };
-                        // Disable ASPM for all devices (including bridge functions)
+                        // Configure all PCIe registers to match OpenWRT
                         cfg.disable_aspm(bdf);
-                        // Configure Device Control (MRRS, MPS, Extended Tag, etc.)
                         cfg.configure_device_control(bdf);
+                        cfg.configure_link_control2(bdf, func_is_bridge);
                         devices.push(PcieDevice {
                             bdf,
                             id,
@@ -520,10 +726,11 @@ impl PcieController {
         // Disable prefetchable memory window (set base > limit)
         cfg.write32(bdf, pci_cfg::PREF_MEMORY_BASE, 0xFFF0_0000);
 
-        // Enable memory space and bus master
+        // Enable memory space, bus master, and disable INTx
+        // OpenWRT sets Command = 0x0406: MEM_SPACE | BUS_MASTER | INT_DISABLE
         let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
         cfg.write32(bdf, pci_cfg::COMMAND,
-            (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+            (cmd | command::MEM_SPACE | command::BUS_MASTER | command::INT_DISABLE) as u32);
     }
 
     /// Enable Bus Master on a specific device
@@ -542,14 +749,39 @@ impl PcieController {
             return false;
         }
 
-        // Enable memory space and bus master
+        // Enable memory space, bus master, and disable INTx
+        // OpenWRT sets Command = 0x0406: MEM_SPACE | BUS_MASTER | INT_DISABLE
         let cmd = cfg.read16(bdf, pci_cfg::COMMAND);
         cfg.write32(bdf, pci_cfg::COMMAND,
-            (cmd | command::MEM_SPACE | command::BUS_MASTER) as u32);
+            (cmd | command::MEM_SPACE | command::BUS_MASTER | command::INT_DISABLE) as u32);
 
         // Verify it was written
         let readback = cfg.read16(bdf, pci_cfg::COMMAND);
         (readback & command::BUS_MASTER) != 0
+    }
+
+    /// Read PCIe Device Status register
+    ///
+    /// Returns the Device Status value (16-bit), or None if device not found.
+    /// Key bits:
+    /// - Bit 0: Correctable Error Detected
+    /// - Bit 1: Non-Fatal Error Detected
+    /// - Bit 2: Fatal Error Detected
+    /// - Bit 3: Unsupported Request Detected (indicates bad DMA address!)
+    /// - Bit 5: Transactions Pending
+    pub fn read_device_status(&self, bus: u8, device: u8, function: u8) -> Option<u16> {
+        let cfg = PcieConfigSpace::new(&self.mac);
+        let bdf = PcieBdf::new(bus, device, function);
+        cfg.read_device_status(bdf)
+    }
+
+    /// Clear PCIe Device Status error bits (W1C - Write 1 to Clear)
+    ///
+    /// Returns true on success.
+    pub fn clear_device_status(&self, bus: u8, device: u8, function: u8) -> bool {
+        let cfg = PcieConfigSpace::new(&self.mac);
+        let bdf = PcieBdf::new(bus, device, function);
+        cfg.clear_device_status_errors(bdf)
     }
 }
 

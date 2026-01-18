@@ -10,7 +10,7 @@ use super::event::EventQueue;
 use super::fd::FdTable;
 use super::pmm;
 use crate::arch::aarch64::{mmu, tlb};
-use crate::logln;
+use crate::{kinfo, print_direct, klog};
 
 /// Task states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +270,18 @@ impl MapFlags {
         }
     }
 
+    /// High DMA memory mapping (for 36-bit addresses above 4GB)
+    /// No kernel-side zeroing or cache flush since kernel doesn't have mapping
+    pub const fn dma_high() -> Self {
+        Self {
+            writable: true,
+            executable: false,
+            zero: false,      // Can't zero - kernel has no mapping for high memory
+            flush_cache: false, // Can't flush - kernel has no mapping
+            device: false,
+        }
+    }
+
     /// Shared memory mapping (no allocation, no zeroing)
     pub const fn shared() -> Self {
         Self {
@@ -318,6 +330,35 @@ pub const MAX_CHILDREN: usize = 16;
 /// Used for receiver opt-in rate limiting
 pub const MAX_SIGNAL_SENDERS: usize = 8;
 
+/// Maximum number of timers per task (BSD kqueue style)
+pub const MAX_TIMERS_PER_TASK: usize = 8;
+
+/// Timer descriptor for unified event system
+/// Supports multiple independent timers per task, including recurring.
+#[derive(Clone, Copy)]
+pub struct TimerDesc {
+    /// Timer ID (1-8 for user timers, 0 reserved for legacy timer_set)
+    pub id: u32,
+    /// Interval in ticks (0 = one-shot, >0 = recurring)
+    pub interval: u64,
+    /// Next deadline tick (0 = inactive)
+    pub deadline: u64,
+}
+
+impl TimerDesc {
+    pub const fn empty() -> Self {
+        Self {
+            id: 0,
+            interval: 0,
+            deadline: 0,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.deadline != 0
+    }
+}
+
 /// Task Control Block
 pub struct Task {
     /// Unique task ID
@@ -362,9 +403,9 @@ pub struct Task {
     pub wait_reason: Option<WaitReason>,
     /// Timer tick count at which to wake this task (0 = no timeout)
     pub wake_at: u64,
-    /// Timer tick count at which to deliver Timer event (0 = no timer)
-    /// Set via timer_set syscall, delivers EventType::Timer when reached
-    pub timer_deadline: u64,
+    /// Multiple timers per task (BSD kqueue style)
+    /// Each timer can be one-shot or recurring with interval
+    pub timers: [TimerDesc; MAX_TIMERS_PER_TASK],
     /// Last heartbeat tick count (0 = never sent heartbeat)
     /// Privileged processes should send heartbeats periodically
     pub last_heartbeat: u64,
@@ -426,7 +467,7 @@ impl Task {
             exit_code: 0,
             wait_reason: None,
             wake_at: 0,
-            timer_deadline: 0,
+            timers: [TimerDesc::empty(); MAX_TIMERS_PER_TASK],
             last_heartbeat: 0,
             capabilities: super::caps::Capabilities::ALL,  // Kernel tasks get all capabilities
             signal_allowlist: [0; MAX_SIGNAL_SENDERS],
@@ -484,7 +525,7 @@ impl Task {
             exit_code: 0,
             wait_reason: None,
             wake_at: 0,
-            timer_deadline: 0,
+            timers: [TimerDesc::empty(); MAX_TIMERS_PER_TASK],
             last_heartbeat: 0,
             capabilities: super::caps::Capabilities::DRIVER_DEFAULT,  // User tasks default to driver caps
             signal_allowlist: [0; MAX_SIGNAL_SENDERS],
@@ -796,6 +837,19 @@ impl Task {
             MapSource::Fixed(phys_addr),
             MapFlags::dma(),  // Normal Non-Cacheable for DMA buffers (NOT Device!)
             MappingKind::BorrowedShmem,  // Pages owned by shmem, not freed here
+        ).map(|r| r.virt_addr)
+    }
+
+    /// Map high DMA memory (36-bit addresses above 4GB)
+    /// Uses non-cacheable attributes but skips kernel-side zeroing/flush
+    /// Returns virtual address on success
+    #[inline]
+    pub fn mmap_shmem_dma_high(&mut self, phys_addr: u64, size: usize) -> Option<u64> {
+        self.map_region(
+            size,
+            MapSource::Fixed(phys_addr),
+            MapFlags::dma_high(),  // No kernel-side access for high memory
+            MappingKind::BorrowedShmem,
         ).map(|r| r.virt_addr)
     }
 
@@ -1132,19 +1186,32 @@ impl Scheduler {
                     }
                 }
 
-                // Check timer_deadline - deliver Timer event if reached
-                // This works for both Blocked and Ready tasks
-                if task.timer_deadline != 0 && current_tick >= task.timer_deadline {
-                    // Deliver Timer event to task's event queue
-                    let timer_event = super::event::Event::timer(task.timer_deadline);
-                    task.event_queue.push(timer_event);
-                    task.timer_deadline = 0;  // Clear (one-shot timer)
+                // Check all timers for this task (BSD kqueue style)
+                // Multiple timers can fire per tick, each generates a separate event
+                let mut should_wake = false;
+                for timer in task.timers.iter_mut() {
+                    if timer.is_active() && current_tick >= timer.deadline {
+                        // Timer fired - deliver event with timer ID
+                        let timer_event = super::event::Event::timer_with_id(timer.id, timer.deadline);
+                        task.event_queue.push(timer_event);
 
-                    // Wake task if blocked
-                    if task.state == TaskState::Blocked {
-                        task.state = TaskState::Ready;
-                        woken += 1;
+                        if timer.interval > 0 {
+                            // Recurring timer - reset deadline
+                            // Avoid drift by adding interval to previous deadline
+                            timer.deadline += timer.interval;
+                        } else {
+                            // One-shot timer - clear it
+                            timer.deadline = 0;
+                        }
+
+                        should_wake = true;
                     }
+                }
+
+                // Wake task if any timer fired and task was blocked
+                if should_wake && task.state == TaskState::Blocked {
+                    task.state = TaskState::Ready;
+                    woken += 1;
                 }
             }
         }
@@ -1247,10 +1314,11 @@ impl Scheduler {
                 CURRENT_TRAP_FRAME.store(trap_frame, Ordering::Release);
                 CURRENT_TTBR0.store(ttbr0, Ordering::Release);
 
-                logln!("  Entering user mode:");
-                logln!("    Entry:  0x{:016x}", task.trap_frame.elr_el1);
-                logln!("    Stack:  0x{:016x}", task.trap_frame.sp_el0);
-                logln!("    TTBR0:  0x{:016x}", ttbr0);
+                kinfo!("task", "enter_user";
+                    entry = klog::hex64(task.trap_frame.elr_el1),
+                    stack = klog::hex64(task.trap_frame.sp_el0),
+                    ttbr0 = klog::hex64(ttbr0)
+                );
 
                 // Flush log buffer before entering userspace
                 super::log::flush();
@@ -1490,7 +1558,7 @@ impl Scheduler {
 
     /// Print scheduler state
     pub fn print_info(&self) {
-        logln!("  Tasks:");
+        print_direct!("  Tasks:\n");
         for (i, slot) in self.tasks.iter().enumerate() {
             if let Some(ref task) = slot {
                 let state_str = match task.state {
@@ -1500,7 +1568,7 @@ impl Scheduler {
                     TaskState::Terminated => "terminated",
                 };
                 let marker = if i == self.current { ">" } else { " " };
-                logln!("    {} [{}] {} ({})", marker, task.id, task.name_str(), state_str);
+                print_direct!("    {} [{}] {} ({})\n", marker, task.id, task.name_str(), state_str);
             }
         }
     }
@@ -1684,8 +1752,14 @@ pub unsafe extern "C" fn do_resched_if_needed() {
             // We must enable IRQs here or WFI will wait forever.
             core::arch::asm!("msr daifclr, #2");  // Clear I bit = enable IRQs
 
+            // Mark CPU as idle for usage tracking (set before WFI)
+            crate::kernel::percpu::cpu_local().set_idle();
+
             // Wait for interrupt - timer tick or device IRQ will wake a task
             core::arch::asm!("wfi");
+
+            // CPU woke up - no longer idle
+            crate::kernel::percpu::cpu_local().clear_idle();
 
             // Disable IRQs to check scheduler state
             let _guard2 = crate::arch::aarch64::sync::IrqGuard::new();
@@ -1718,9 +1792,9 @@ pub unsafe extern "C" fn do_resched_if_needed() {
 
 /// Test context switching
 pub fn test() {
-    logln!("  Context switch test:");
-    logln!("    TrapFrame size: {} bytes", core::mem::size_of::<TrapFrame>());
-    logln!("    CpuContext size: {} bytes", core::mem::size_of::<CpuContext>());
-    logln!("    Task size: {} bytes", core::mem::size_of::<Task>());
-    logln!("    [OK] Structures initialized");
+    print_direct!("  Context switch test:\n");
+    print_direct!("    TrapFrame size: {} bytes\n", core::mem::size_of::<TrapFrame>());
+    print_direct!("    CpuContext size: {} bytes\n", core::mem::size_of::<CpuContext>());
+    print_direct!("    Task size: {} bytes\n", core::mem::size_of::<Task>());
+    print_direct!("    [OK] Structures initialized\n");
 }

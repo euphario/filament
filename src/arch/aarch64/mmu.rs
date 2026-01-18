@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]  // Many items are infrastructure for future use
 
-use crate::logln;
+use crate::{kdebug, klog};
 
 /// Page size (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -213,7 +213,5 @@ pub fn is_enabled() -> bool {
 
 /// Print MMU info
 pub fn print_info() {
-    logln!("  TTBR0_EL1: 0x{:016x} (user/identity)", ttbr0());
-    logln!("  TTBR1_EL1: 0x{:016x} (kernel)", ttbr1());
-    logln!("  MMU:       {}", if is_enabled() { "enabled" } else { "disabled" });
+    kdebug!("mmu", "info"; ttbr0 = klog::hex64(ttbr0()), ttbr1 = klog::hex64(ttbr1()), enabled = is_enabled());
 }

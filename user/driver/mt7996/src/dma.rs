@@ -1175,10 +1175,23 @@ impl FwdlRing {
             return None;
         }
 
-        // Zero the descriptor ring
+        // Initialize descriptor ring with DMA_DONE=1 (matches Linux mt76_dma_queue_reset)
+        // Linux: for (i = 0; i < q->ndesc; i++) q->desc[i].ctrl = cpu_to_le32(MT_DMA_CTL_DMA_DONE);
+        // DMA_DONE=1 means "SW owns this descriptor / descriptor is complete"
+        // DMA_DONE=0 means "HW owns / in progress"
+        // We must start with SW ownership (DMA_DONE=1) so device knows ring is empty
         unsafe {
-            core::ptr::write_bytes(desc_vaddr as *mut u8, 0, desc_size);
+            let descs = desc_vaddr as *mut TxDesc;
+            for i in 0..size as usize {
+                // Zero the descriptor first
+                core::ptr::write_bytes(descs.add(i), 0, 1);
+                // Then set ctrl = DMA_DONE (bit 31)
+                (*descs.add(i)).ctrl = crate::dma_defs::MT_DMA_CTL_DMA_DONE;
+            }
         }
+
+        // Flush TX descriptors to RAM so device can see DMA_DONE state
+        flush_buffer(desc_vaddr as u64, desc_size);
 
         // Allocate DMA memory for command buffer
         let mut cmd_paddr: u64 = 0;

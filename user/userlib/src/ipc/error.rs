@@ -3,6 +3,7 @@
 //! Comprehensive error handling for IPC operations.
 
 use core::fmt;
+use crate::error::SysError;
 
 /// Result type for IPC operations
 pub type IpcResult<T> = Result<T, IpcError>;
@@ -163,6 +164,26 @@ impl fmt::Display for IpcError {
             IpcError::PermissionDenied => write!(f, "permission denied"),
             IpcError::Internal => write!(f, "internal error"),
             IpcError::Unknown(e) => write!(f, "unknown error: {}", e),
+        }
+    }
+}
+
+impl From<SysError> for IpcError {
+    fn from(e: SysError) -> Self {
+        match e {
+            SysError::NotFound => IpcError::PortNotFound,
+            SysError::BadFd => IpcError::InvalidChannel,
+            SysError::WouldBlock => IpcError::WouldBlock,
+            SysError::OutOfMemory => IpcError::OutOfMemory,
+            SysError::PermissionDenied | SysError::AccessDenied => IpcError::PermissionDenied,
+            SysError::Busy => IpcError::ResourceBusy,
+            SysError::InvalidArgument => IpcError::InvalidRequest,
+            SysError::TooManyFiles => IpcError::TooManyChannels,
+            SysError::MessageTooLarge => IpcError::MessageTooLarge,
+            SysError::ConnectionReset => IpcError::ChannelClosed,
+            SysError::Timeout => IpcError::Timeout,
+            SysError::ConnectionRefused => IpcError::ConnectionRefused,
+            _ => IpcError::Unknown(e.to_errno()),
         }
     }
 }

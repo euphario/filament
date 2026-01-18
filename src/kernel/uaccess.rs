@@ -65,7 +65,7 @@ pub enum UAccessError {
 
 impl UAccessError {
     /// Convert to errno-style error code
-    pub fn to_errno(self) -> i64 {
+    pub fn to_errno(self) -> i32 {
         match self {
             UAccessError::NullPointer => -14,      // EFAULT
             UAccessError::KernelAddress => -14,    // EFAULT

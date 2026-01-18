@@ -23,7 +23,7 @@
 
 #![allow(dead_code)]  // Some message types and methods are for future use
 
-use crate::logln;
+use crate::print_direct;
 use super::lock::SpinLock;
 use super::process::Pid;
 
@@ -424,22 +424,22 @@ impl ChannelTable {
 
     /// Send a message to a channel
     /// Returns Ok(()) or Err with blocked PID to wake
-    pub fn send(&mut self, channel_id: ChannelId, msg: Message) -> Result<Option<Pid>, IpcError> {
-        let slot = self.find_by_id(channel_id).ok_or(IpcError::InvalidChannel)?;
+    pub fn send(&mut self, channel_id: ChannelId, msg: Message) -> Result<Option<Pid>, ChannelError> {
+        let slot = self.find_by_id(channel_id).ok_or(ChannelError::InvalidChannel)?;
         let peer_id = self.endpoints[slot].peer;
 
         if peer_id == 0 {
-            return Err(IpcError::NoPeer);
+            return Err(ChannelError::NoPeer);
         }
 
-        let peer_slot = self.find_by_id(peer_id).ok_or(IpcError::PeerClosed)?;
+        let peer_slot = self.find_by_id(peer_id).ok_or(ChannelError::PeerClosed)?;
 
         if self.endpoints[peer_slot].state == ChannelState::Closed {
-            return Err(IpcError::PeerClosed);
+            return Err(ChannelError::PeerClosed);
         }
 
         if self.endpoints[peer_slot].queue.is_full() {
-            return Err(IpcError::QueueFull);
+            return Err(ChannelError::QueueFull);
         }
 
         self.endpoints[peer_slot].queue.push(msg);
@@ -450,8 +450,8 @@ impl ChannelTable {
     }
 
     /// Receive a message from a channel (non-blocking)
-    pub fn receive(&mut self, channel_id: ChannelId) -> Result<Message, IpcError> {
-        let slot = self.find_by_id(channel_id).ok_or(IpcError::InvalidChannel)?;
+    pub fn receive(&mut self, channel_id: ChannelId) -> Result<Message, ChannelError> {
+        let slot = self.find_by_id(channel_id).ok_or(ChannelError::InvalidChannel)?;
 
         // Try to pop a message from the queue
         if let Some(msg) = self.endpoints[slot].queue.pop() {
@@ -462,15 +462,15 @@ impl ChannelTable {
         // This handles the case where the Close message couldn't be delivered
         // due to a full queue
         if self.endpoints[slot].peer_closed {
-            return Err(IpcError::PeerClosed);
+            return Err(ChannelError::PeerClosed);
         }
 
-        Err(IpcError::WouldBlock)
+        Err(ChannelError::WouldBlock)
     }
 
     /// Register a process as blocked waiting for a message
-    pub fn block_receiver(&mut self, channel_id: ChannelId, pid: Pid) -> Result<(), IpcError> {
-        let slot = self.find_by_id(channel_id).ok_or(IpcError::InvalidChannel)?;
+    pub fn block_receiver(&mut self, channel_id: ChannelId, pid: Pid) -> Result<(), ChannelError> {
+        let slot = self.find_by_id(channel_id).ok_or(ChannelError::InvalidChannel)?;
         self.endpoints[slot].blocked_receiver = Some(pid);
         Ok(())
     }
@@ -539,9 +539,13 @@ impl ChannelTable {
     }
 }
 
-/// IPC error codes
+/// Kernel channel error codes (internal use only)
+///
+/// Note: This is distinct from userspace ChannelError in userlib/src/ipc/error.rs.
+/// This enum is for kernel-internal channel operations; userspace ChannelError
+/// is for high-level IPC protocol errors used by drivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IpcError {
+pub enum ChannelError {
     /// Invalid channel ID
     InvalidChannel,
     /// Channel has no peer
@@ -558,16 +562,16 @@ pub enum IpcError {
     InvalidMessage,
 }
 
-impl IpcError {
+impl ChannelError {
     pub fn to_errno(self) -> i32 {
         match self {
-            IpcError::InvalidChannel => -1,
-            IpcError::NoPeer => -2,
-            IpcError::PeerClosed => -3,
-            IpcError::QueueFull => -4,
-            IpcError::WouldBlock => -11,  // EAGAIN
-            IpcError::PermissionDenied => -13,  // EACCES
-            IpcError::InvalidMessage => -22,  // EINVAL
+            ChannelError::InvalidChannel => -9,   // EBADF
+            ChannelError::NoPeer => -104,         // ECONNRESET
+            ChannelError::PeerClosed => -104,     // ECONNRESET
+            ChannelError::QueueFull => -11,       // EAGAIN
+            ChannelError::WouldBlock => -11,      // EAGAIN
+            ChannelError::PermissionDenied => -13, // EACCES
+            ChannelError::InvalidMessage => -22,  // EINVAL
         }
     }
 }
@@ -607,24 +611,24 @@ pub fn with_channel_table<R, F: FnOnce(&mut ChannelTable) -> R>(f: F) -> R {
 
 /// Create a channel pair
 /// Returns channel IDs in (arg0_out, arg1_out) or error
-pub fn sys_channel_create(owner: Pid) -> Result<(ChannelId, ChannelId), IpcError> {
+pub fn sys_channel_create(owner: Pid) -> Result<(ChannelId, ChannelId), ChannelError> {
     with_channel_table(|table| {
         table.create_pair(owner, owner)
-            .ok_or(IpcError::InvalidChannel)
+            .ok_or(ChannelError::InvalidChannel)
     })
 }
 
 /// Close a channel
-pub fn sys_channel_close(channel_id: ChannelId, caller: Pid) -> Result<(), IpcError> {
+pub fn sys_channel_close(channel_id: ChannelId, caller: Pid) -> Result<(), ChannelError> {
     // Hold lock only for the channel operation, release before waking
     let blocked_pid = with_channel_table(|table| {
         // Verify ownership atomically with close
         if table.get_owner(channel_id) != Some(caller) {
-            return Err(IpcError::PermissionDenied);
+            return Err(ChannelError::PermissionDenied);
         }
         match table.close(channel_id) {
             Ok(blocked) => Ok(blocked),
-            Err(()) => Err(IpcError::InvalidChannel),
+            Err(()) => Err(ChannelError::InvalidChannel),
         }
     })?;
 
@@ -639,19 +643,19 @@ pub fn sys_channel_close(channel_id: ChannelId, caller: Pid) -> Result<(), IpcEr
 }
 
 /// Send a message (non-blocking)
-pub fn sys_send(channel_id: ChannelId, caller: Pid, data: &[u8]) -> Result<(), IpcError> {
+pub fn sys_send(channel_id: ChannelId, caller: Pid, data: &[u8]) -> Result<(), ChannelError> {
     sys_send_internal(channel_id, caller, data, false)
 }
 
 /// Send a message with direct switch to receiver (fast-path IPC)
 /// If receiver is blocked waiting, directly switch to it.
 /// Returns when switched back (receiver yielded/blocked/preempted).
-pub fn sys_send_direct(channel_id: ChannelId, caller: Pid, data: &[u8]) -> Result<(), IpcError> {
+pub fn sys_send_direct(channel_id: ChannelId, caller: Pid, data: &[u8]) -> Result<(), ChannelError> {
     sys_send_internal(channel_id, caller, data, true)
 }
 
 /// Internal send implementation
-fn sys_send_internal(channel_id: ChannelId, caller: Pid, data: &[u8], direct: bool) -> Result<(), IpcError> {
+fn sys_send_internal(channel_id: ChannelId, caller: Pid, data: &[u8], direct: bool) -> Result<(), ChannelError> {
     // Build message outside lock (data copy)
     let msg = Message::data(caller, data);
 
@@ -660,7 +664,7 @@ fn sys_send_internal(channel_id: ChannelId, caller: Pid, data: &[u8], direct: bo
     let (blocked_pid, peer_owner, peer_channel) = with_channel_table(|table| {
         // Verify ownership atomically with send
         if table.get_owner(channel_id) != Some(caller) {
-            return Err(IpcError::PermissionDenied);
+            return Err(ChannelError::PermissionDenied);
         }
         let peer_owner = table.get_peer_owner(channel_id);
         let peer_channel = table.get_peer_id(channel_id);
@@ -716,11 +720,11 @@ fn sys_send_internal(channel_id: ChannelId, caller: Pid, data: &[u8], direct: bo
 }
 
 /// Receive a message (non-blocking)
-pub fn sys_receive(channel_id: ChannelId, caller: Pid) -> Result<Message, IpcError> {
+pub fn sys_receive(channel_id: ChannelId, caller: Pid) -> Result<Message, ChannelError> {
     with_channel_table(|table| {
         // Verify ownership atomically with receive
         if table.get_owner(channel_id) != Some(caller) {
-            return Err(IpcError::PermissionDenied);
+            return Err(ChannelError::PermissionDenied);
         }
         table.receive(channel_id)
     })
@@ -729,21 +733,21 @@ pub fn sys_receive(channel_id: ChannelId, caller: Pid) -> Result<Message, IpcErr
 /// Try to receive, blocking if no message available
 /// Returns WouldBlock if called from non-blocking context
 /// The actual blocking is handled by the syscall layer
-pub fn sys_receive_blocking(channel_id: ChannelId, caller: Pid) -> Result<Message, IpcError> {
+pub fn sys_receive_blocking(channel_id: ChannelId, caller: Pid) -> Result<Message, ChannelError> {
     // First try: receive with ownership check
     let result = with_channel_table(|table| {
         // Verify ownership atomically with receive attempt
         if table.get_owner(channel_id) != Some(caller) {
-            return Err(IpcError::PermissionDenied);
+            return Err(ChannelError::PermissionDenied);
         }
 
         // Try to receive
         match table.receive(channel_id) {
             Ok(msg) => Ok(Ok(msg)),
-            Err(IpcError::WouldBlock) => {
+            Err(ChannelError::WouldBlock) => {
                 // No message - register as blocked receiver (while still holding lock)
                 table.block_receiver(channel_id, caller)?;
-                Ok(Err(IpcError::WouldBlock))
+                Ok(Err(ChannelError::WouldBlock))
             }
             Err(e) => Err(e),
         }
@@ -751,14 +755,14 @@ pub fn sys_receive_blocking(channel_id: ChannelId, caller: Pid) -> Result<Messag
 
     match result {
         Ok(msg) => Ok(msg),
-        Err(IpcError::WouldBlock) => {
+        Err(ChannelError::WouldBlock) => {
             // Mark process as blocked (outside channel lock)
             unsafe {
                 if let Some(proc) = super::process::process_table().get_mut(caller) {
                     proc.block_on_receive(channel_id);
                 }
             }
-            Err(IpcError::WouldBlock)
+            Err(ChannelError::WouldBlock)
         }
         Err(e) => Err(e),
     }
@@ -771,14 +775,14 @@ pub fn sys_receive_blocking(channel_id: ChannelId, caller: Pid) -> Result<Messag
 /// Note: For true fast-path performance, the scheduler would need to
 /// directly switch to the callee and back. This version uses the
 /// standard blocking mechanism.
-pub fn sys_call(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) -> Result<Message, IpcError> {
+pub fn sys_call(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) -> Result<Message, ChannelError> {
     // Build message outside lock
     let msg = Message::request(caller, msg_id, data);
 
     // Send request and register for blocking (atomically)
     let blocked_pid = with_channel_table(|table| {
         if table.get_owner(channel_id) != Some(caller) {
-            return Err(IpcError::PermissionDenied);
+            return Err(ChannelError::PermissionDenied);
         }
 
         // Send the request message
@@ -805,19 +809,19 @@ pub fn sys_call(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) ->
         }
     }
 
-    Err(IpcError::WouldBlock) // Syscall layer will handle retry after wakeup
+    Err(ChannelError::WouldBlock) // Syscall layer will handle retry after wakeup
 }
 
 /// Reply to a request on a channel
 /// Used by servers responding to sys_call requests.
-pub fn sys_reply(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) -> Result<(), IpcError> {
+pub fn sys_reply(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) -> Result<(), ChannelError> {
     // Build message outside lock
     let msg = Message::reply(caller, msg_id, data);
 
     // Send reply (atomically with ownership check)
     let blocked_pid = with_channel_table(|table| {
         if table.get_owner(channel_id) != Some(caller) {
-            return Err(IpcError::PermissionDenied);
+            return Err(ChannelError::PermissionDenied);
         }
         table.send(channel_id, msg)
     })?;
@@ -833,12 +837,12 @@ pub fn sys_reply(channel_id: ChannelId, caller: Pid, msg_id: u32, data: &[u8]) -
 }
 
 /// Transfer a channel endpoint to another process
-pub fn sys_channel_transfer(channel_id: ChannelId, from: Pid, to: Pid) -> Result<(), IpcError> {
+pub fn sys_channel_transfer(channel_id: ChannelId, from: Pid, to: Pid) -> Result<(), ChannelError> {
     with_channel_table(|table| {
-        let slot = table.find_by_id(channel_id).ok_or(IpcError::InvalidChannel)?;
+        let slot = table.find_by_id(channel_id).ok_or(ChannelError::InvalidChannel)?;
 
         if table.endpoints[slot].owner != from {
-            return Err(IpcError::PermissionDenied);
+            return Err(ChannelError::PermissionDenied);
         }
 
         table.endpoints[slot].owner = to;
@@ -850,16 +854,16 @@ pub fn sys_channel_transfer(channel_id: ChannelId, from: Pid, to: Pid) -> Result
 ///
 /// Returns the status of the peer's queue (i.e., what we would be sending to).
 /// This allows senders to implement backpressure by checking before sending.
-pub fn sys_queue_status(channel_id: ChannelId, caller: Pid) -> Result<QueueStatus, IpcError> {
+pub fn sys_queue_status(channel_id: ChannelId, caller: Pid) -> Result<QueueStatus, ChannelError> {
     with_channel_table(|table| {
         // Verify ownership
         if table.get_owner(channel_id) != Some(caller) {
-            return Err(IpcError::PermissionDenied);
+            return Err(ChannelError::PermissionDenied);
         }
 
         // Return peer's queue status (what we'd be sending to)
         table.peer_queue_status(channel_id)
-            .ok_or(IpcError::NoPeer)
+            .ok_or(ChannelError::NoPeer)
     })
 }
 
@@ -891,7 +895,7 @@ pub fn process_cleanup(pid: Pid) {
 
 /// Test IPC functionality
 pub fn test() {
-    logln!("  Testing IPC...");
+    print_direct!("  Testing IPC...\n");
 
     // Create a channel pair
     let channels = with_channel_table(|table| {
@@ -900,11 +904,11 @@ pub fn test() {
 
     let (ch_a, ch_b) = match channels {
         Some((a, b)) => {
-            logln!("    Created channel pair: {} <-> {}", a, b);
+            print_direct!("    Created channel pair: {} <-> {}\n", a, b);
             (a, b)
         }
         None => {
-            logln!("    [!!] Failed to create channel pair");
+            print_direct!("    [!!] Failed to create channel pair\n");
             return;
         }
     };
@@ -914,25 +918,25 @@ pub fn test() {
     let msg = Message::data(1, test_data);
 
     match with_channel_table(|table| table.send(ch_a, msg)) {
-        Ok(_) => logln!("    Sent message on channel {}", ch_a),
-        Err(e) => logln!("    [!!] Send failed: {:?}", e),
+        Ok(_) => print_direct!("    Sent message on channel {}\n", ch_a),
+        Err(e) => print_direct!("    [!!] Send failed: {:?}\n", e),
     }
 
     // Check queue length
     let queue_len = with_channel_table(|table| table.queue_len(ch_b));
-    logln!("    Channel {} queue length: {}", ch_b, queue_len);
+    print_direct!("    Channel {} queue length: {}\n", ch_b, queue_len);
 
     // Receive on B
     match with_channel_table(|table| table.receive(ch_b)) {
         Ok(recv_msg) => {
             let payload = recv_msg.payload_slice();
-            logln!("    Received {} bytes from PID {}",
+            print_direct!("    Received {} bytes from PID {}\n",
                 payload.len(), recv_msg.header.sender);
             if payload == test_data {
-                logln!("    Message content verified!");
+                print_direct!("    Message content verified!\n");
             }
         }
-        Err(e) => logln!("    [!!] Receive failed: {:?}", e),
+        Err(e) => print_direct!("    [!!] Receive failed: {:?}\n", e),
     }
 
     // Test request/reply pattern
@@ -940,7 +944,7 @@ pub fn test() {
     let _ = with_channel_table(|table| table.send(ch_a, req_msg));
 
     if let Ok(req) = with_channel_table(|table| table.receive(ch_b)) {
-        logln!("    Received request with msg_id={}", req.header.msg_id);
+        print_direct!("    Received request with msg_id={}\n", req.header.msg_id);
 
         // Send reply
         let reply_msg = Message::reply(2, req.header.msg_id, b"pong");
@@ -949,17 +953,17 @@ pub fn test() {
         if let Ok(reply) = with_channel_table(|table| table.receive(ch_a)) {
             if reply.header.msg_type == MessageType::Reply &&
                reply.header.msg_id == 42 {
-                logln!("    Request/reply pattern works!");
+                print_direct!("    Request/reply pattern works!\n");
             }
         }
     }
 
     // Test blocking receive (on empty queue)
-    logln!("    Testing blocking receive...");
+    print_direct!("    Testing blocking receive...\n");
     match sys_receive_blocking(ch_a, 1) {
-        Ok(_) => logln!("    [!!] Should have blocked"),
-        Err(IpcError::WouldBlock) => {
-            logln!("    Correctly returned WouldBlock");
+        Ok(_) => print_direct!("    [!!] Should have blocked\n"),
+        Err(ChannelError::WouldBlock) => {
+            print_direct!("    Correctly returned WouldBlock\n");
             // Check that receiver was registered
             let blocked = with_channel_table(|table| {
                 table.endpoints.iter()
@@ -967,31 +971,31 @@ pub fn test() {
                     .and_then(|e| e.blocked_receiver)
             });
             if blocked == Some(1) {
-                logln!("    Blocked receiver registered: PID 1");
+                print_direct!("    Blocked receiver registered: PID 1\n");
             }
         }
-        Err(e) => logln!("    [!!] Unexpected error: {:?}", e),
+        Err(e) => print_direct!("    [!!] Unexpected error: {:?}\n", e),
     }
 
     // Send message which should wake the blocked receiver
     let wake_msg = Message::data(2, b"wake up!");
     match with_channel_table(|table| table.send(ch_b, wake_msg)) {
         Ok(maybe_pid) => {
-            logln!("    Sent wake message, blocked PID: {:?}", maybe_pid);
+            print_direct!("    Sent wake message, blocked PID: {:?}\n", maybe_pid);
         }
-        Err(e) => logln!("    [!!] Send failed: {:?}", e),
+        Err(e) => print_direct!("    [!!] Send failed: {:?}\n", e),
     }
 
     // Test backpressure API
     if let Some(status) = with_channel_table(|table| table.peer_queue_status(ch_a)) {
-        logln!("    Queue status: {}/{} (full={}, empty={})",
+        print_direct!("    Queue status: {}/{} (full={}, empty={})\n",
             status.count, status.capacity, status.full, status.empty);
     }
 
     // Close channels
     let _ = with_channel_table(|table| table.close(ch_a));
     let _ = with_channel_table(|table| table.close(ch_b));
-    logln!("    Channels closed");
+    print_direct!("    Channels closed\n");
 
-    logln!("    [OK] IPC test passed");
+    print_direct!("    [OK] IPC test passed\n");
 }

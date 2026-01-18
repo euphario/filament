@@ -78,6 +78,23 @@ impl Platform for Mt7988Platform {
     fn virt_to_phys(&self, virt: usize) -> usize {
         mmu::virt_to_phys(virt as u64) as usize
     }
+
+    fn phys_to_dma(&self, phys: u64) -> u64 {
+        // MT7988A PCIe uses identity mapping for inbound DMA
+        // (no dma-ranges offset in device tree, confirmed by Linux driver)
+        //
+        // DRAM at CPU physical 0x40000000 is accessed at PCIe bus address 0x40000000
+        //
+        // If this changes (e.g., for a different MT7988 board configuration),
+        // update this translation accordingly:
+        //   phys - DRAM_BASE as u64 + PCIE_INBOUND_BASE
+        phys
+    }
+
+    fn dma_to_phys(&self, dma: u64) -> u64 {
+        // Identity mapping: DMA address == CPU physical address
+        dma
+    }
 }
 
 /// Global platform instance

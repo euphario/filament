@@ -11,7 +11,7 @@
 
 use super::ipc::{self, ChannelId, Message, MessageType};
 use super::process::Pid;
-use crate::logln;
+use crate::{kinfo, print_direct};
 
 /// Maximum port name length
 pub const MAX_PORT_NAME: usize = 32;
@@ -393,17 +393,17 @@ impl PortRegistry {
 
     /// Print registry info
     pub fn print_info(&self) {
-        logln!("  Registered ports:");
+        print_direct!("  Registered ports:\n");
         let mut count = 0;
         for port in self.ports.iter() {
             if port.state == PortState::Open {
-                logln!("    {} (owner: PID {}, pending: {})",
+                print_direct!("    {} (owner: PID {}, pending: {})\n",
                     port.name_str(), port.owner, port.pending_count());
                 count += 1;
             }
         }
         if count == 0 {
-            logln!("    (none)");
+            print_direct!("    (none)\n");
         }
     }
 }
@@ -486,7 +486,7 @@ pub fn process_cleanup(pid: Pid) {
 
                 let name_len = name_buf.iter().position(|&c| c == 0).unwrap_or(MAX_PORT_NAME);
                 if let Ok(name) = core::str::from_utf8(&name_buf[..name_len]) {
-                    logln!("  Port cleanup: unregistering '{}' (owned by PID {})", name, pid);
+                    kinfo!("port", "cleanup"; name = name, pid = pid as u64);
                     // Remove from hash table
                     registry.hash_remove(name);
                 }
@@ -591,7 +591,7 @@ pub fn sys_port_connect_buf(name: &[u8], caller: Pid) -> Result<ChannelId, PortE
 
 /// Test port registry
 pub fn test() {
-    logln!("  Testing port registry...");
+    print_direct!("  Testing port registry...\n");
 
     unsafe {
         let registry = port_registry();
@@ -599,10 +599,10 @@ pub fn test() {
         // Register a test port
         match registry.register("uart:", 1) {
             Ok(listen_ch) => {
-                logln!("    Registered 'uart:' port, listen channel: {}", listen_ch);
+                print_direct!("    Registered 'uart:' port, listen channel: {}\n", listen_ch);
             }
             Err(e) => {
-                logln!("    [!!] Failed to register port: {:?}", e);
+                print_direct!("    [!!] Failed to register port: {:?}\n", e);
                 return;
             }
         }
@@ -610,10 +610,10 @@ pub fn test() {
         // Register another port
         match registry.register("echo:", 1) {
             Ok(listen_ch) => {
-                logln!("    Registered 'echo:' port, listen channel: {}", listen_ch);
+                print_direct!("    Registered 'echo:' port, listen channel: {}\n", listen_ch);
             }
             Err(e) => {
-                logln!("    [!!] Failed to register port: {:?}", e);
+                print_direct!("    [!!] Failed to register port: {:?}\n", e);
             }
         }
 
@@ -623,27 +623,27 @@ pub fn test() {
         // Try to connect to uart:
         match registry.connect("uart:", 2) {
             Ok(client_ch) => {
-                logln!("    PID 2 connected to 'uart:', got channel: {}", client_ch);
+                print_direct!("    PID 2 connected to 'uart:', got channel: {}\n", client_ch);
 
                 // The service (PID 1) should now have a Connect message
                 // Let's simulate accepting it
                 let Some(uart_port) = registry.ports.iter()
                     .find(|p| p.name_str() == "uart:") else {
-                    logln!("    [!!] Failed to find uart: port in registry");
+                    print_direct!("    [!!] Failed to find uart: port in registry\n");
                     return;
                 };
                 let listen_ch = uart_port.listen_channel;
 
                 match registry.accept(listen_ch, 1) {
                     Ok(server_ch) => {
-                        logln!("    Service accepted connection, got channel: {}", server_ch);
+                        print_direct!("    Service accepted connection, got channel: {}\n", server_ch);
 
                         // Now client_ch and server_ch form a connected pair
                         // Let's test sending a message
                         let test_msg = b"Hello service!";
                         match ipc::sys_send(client_ch, 2, test_msg) {
-                            Ok(()) => logln!("    Client sent message"),
-                            Err(e) => logln!("    [!!] Client send failed: {:?}", e),
+                            Ok(()) => print_direct!("    Client sent message\n"),
+                            Err(e) => print_direct!("    [!!] Client send failed: {:?}\n", e),
                         }
 
                         // Service receives
@@ -651,25 +651,25 @@ pub fn test() {
                             Ok(msg) => {
                                 let payload = msg.payload_slice();
                                 if payload == test_msg {
-                                    logln!("    Service received correct message!");
+                                    print_direct!("    Service received correct message!\n");
                                 }
                             }
-                            Err(e) => logln!("    [!!] Service receive failed: {:?}", e),
+                            Err(e) => print_direct!("    [!!] Service receive failed: {:?}\n", e),
                         }
                     }
-                    Err(e) => logln!("    [!!] Accept failed: {:?}", e),
+                    Err(e) => print_direct!("    [!!] Accept failed: {:?}\n", e),
                 }
             }
             Err(e) => {
-                logln!("    [!!] Connect failed: {:?}", e);
+                print_direct!("    [!!] Connect failed: {:?}\n", e);
             }
         }
 
         // Unregister ports
         let _ = registry.unregister("uart:", 1);
         let _ = registry.unregister("echo:", 1);
-        logln!("    Ports unregistered");
+        print_direct!("    Ports unregistered\n");
     }
 
-    logln!("    [OK] Port registry test passed");
+    print_direct!("    [OK] Port registry test passed\n");
 }

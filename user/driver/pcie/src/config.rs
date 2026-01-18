@@ -214,12 +214,15 @@ impl<'a> PcieConfigSpace<'a> {
         self.find_capability(bdf, cap_id::PCIE)
     }
 
-    /// Disable ASPM (Active State Power Management) on a device
+    /// Disable ASPM and set Common Clock Configuration
     ///
     /// This is critical for WiFi devices like MT7996 which may not work
     /// correctly with power management enabled.
     ///
-    /// Returns true if ASPM was disabled, false if PCIe capability not found
+    /// Also sets Common Clock Configuration (bit 6) which is required when
+    /// RC and endpoint share the same reference clock (standard on most boards).
+    ///
+    /// Returns true if configured, false if PCIe capability not found
     pub fn disable_aspm(&self, bdf: PcieBdf) -> bool {
         use crate::regs::{pcie_cap, link_ctl};
 
@@ -232,18 +235,16 @@ impl<'a> PcieConfigSpace<'a> {
         let link_ctl_reg = pcie_cap_base + pcie_cap::LINK_CTL;
         let link_ctl_val = self.read16(bdf, link_ctl_reg);
 
-        // Check if ASPM is enabled
-        if (link_ctl_val & link_ctl::ASPM_MASK) != 0 {
-            // Clear ASPM bits
-            let new_val = link_ctl_val & !link_ctl::ASPM_MASK;
-            self.write16(bdf, link_ctl_reg, new_val);
+        // Clear ASPM bits and set Common Clock Configuration (bit 6)
+        // OpenWRT sets 0x0040 which is just Common Clock, no ASPM
+        const COMMON_CLOCK_CONFIG: u16 = 1 << 6;
+        let new_val = (link_ctl_val & !link_ctl::ASPM_MASK) | COMMON_CLOCK_CONFIG;
 
-            // Verify
-            let verify = self.read16(bdf, link_ctl_reg);
-            return (verify & link_ctl::ASPM_MASK) == 0;
+        if new_val != link_ctl_val {
+            self.write16(bdf, link_ctl_reg, new_val);
         }
 
-        true  // ASPM already disabled
+        true
     }
 
     /// Configure Device Control register (MRRS, MPS, Extended Tag, etc.)
@@ -251,50 +252,108 @@ impl<'a> PcieConfigSpace<'a> {
     /// This is critical for DMA to work properly. Linux does this automatically
     /// for all PCIe devices during enumeration.
     ///
+    /// Matches OpenWRT's configuration: 0x193f
+    /// - Error reporting enabled (bits 3:0)
+    /// - MPS 256B (bits 7:5 = 001)
+    /// - MRRS 256B (bits 14:12 = 001)
+    /// - Extended Tag, Relaxed Ordering, No Snoop enabled
+    ///
     /// Returns true if configured successfully, false if PCIe capability not found
     pub fn configure_device_control(&self, bdf: PcieBdf) -> bool {
-        use crate::regs::{pcie_cap, dev_cap, dev_ctl};
+        use crate::regs::{pcie_cap, dev_ctl};
 
         let pcie_cap_base = match self.find_pcie_capability(bdf) {
             Some(base) => base,
             None => return false,
         };
 
-        // Read Device Capabilities to get max supported MPS
-        let dev_cap_reg = pcie_cap_base + pcie_cap::DEV_CAP;
-        let dev_cap_val = self.read32(bdf, dev_cap_reg);
-        let max_mps = (dev_cap_val & dev_cap::MPS_MASK) as u16;
-
         // Read current Device Control
         let dev_ctl_reg = pcie_cap_base + pcie_cap::DEV_CTL;
-        let dev_ctl_val = self.read16(bdf, dev_ctl_reg);
 
-        // Configure:
-        // - MPS: Use 128B (safe default, works with all devices)
-        // - MRRS: Use 512B (spec default, allows reasonable DMA performance)
-        // - Extended Tag: Enable if supported (allows more outstanding transactions)
-        // - Relaxed Ordering: Enable (improves performance)
-        // - No Snoop: Enable (allows device to bypass cache for DMA)
-        let mut new_val = dev_ctl_val;
+        // Configure to match OpenWRT (0x193f):
+        // - Bits 3:0 = 0xF: Error reporting (CE, NFE, FE, URE) enabled
+        // - Bit 4 = 1: Relaxed Ordering Enable
+        // - Bits 7:5 = 001: MPS 256B
+        // - Bit 8 = 1: Extended Tag Enable
+        // - Bit 11 = 1: No Snoop Enable
+        // - Bits 14:12 = 001: MRRS 256B
+        const ERROR_REPORTING: u16 = 0x000F;  // CE, NFE, FE, URE reporting
+        const MPS_256: u16 = 1 << 5;
+        const MRRS_256: u16 = 1 << 12;
 
-        // Clear and set MPS (use min of 128B for safety, or device max if lower)
-        new_val &= !dev_ctl::MPS_MASK;
-        let mps_to_set = if max_mps < 1 { max_mps << 5 } else { dev_ctl::MPS_128 };
-        new_val |= mps_to_set;
+        let new_val = ERROR_REPORTING
+            | dev_ctl::RELAX_ORDER_EN
+            | MPS_256
+            | dev_ctl::EXT_TAG_EN
+            | dev_ctl::NO_SNOOP_EN
+            | MRRS_256;
 
-        // Clear and set MRRS to 512B (spec default)
-        new_val &= !dev_ctl::MRRS_MASK;
-        new_val |= dev_ctl::MRRS_512;
-
-        // Enable Extended Tag, Relaxed Ordering, No Snoop
-        new_val |= dev_ctl::EXT_TAG_EN | dev_ctl::RELAX_ORDER_EN | dev_ctl::NO_SNOOP_EN;
-
-        // Write new value
+        // Write new value (0x193f)
         self.write16(bdf, dev_ctl_reg, new_val);
 
         // Verify
         let verify = self.read16(bdf, dev_ctl_reg);
         verify == new_val
+    }
+
+    /// Read PCIe Device Status register
+    ///
+    /// Returns the Device Status value, or None if PCIe capability not found.
+    /// Key bits:
+    /// - Bit 0: Correctable Error Detected
+    /// - Bit 1: Non-Fatal Error Detected
+    /// - Bit 2: Fatal Error Detected
+    /// - Bit 3: Unsupported Request Detected (indicates bad DMA address!)
+    /// - Bit 5: Transactions Pending
+    pub fn read_device_status(&self, bdf: PcieBdf) -> Option<u16> {
+        use crate::regs::pcie_cap;
+
+        let pcie_cap_base = self.find_pcie_capability(bdf)?;
+        let dev_sta_reg = pcie_cap_base + pcie_cap::DEV_STA;
+        Some(self.read16(bdf, dev_sta_reg))
+    }
+
+    /// Clear PCIe Device Status error bits (W1C - Write 1 to Clear)
+    ///
+    /// Clears all error bits in Device Status register.
+    pub fn clear_device_status_errors(&self, bdf: PcieBdf) -> bool {
+        use crate::regs::{pcie_cap, dev_sta};
+
+        let pcie_cap_base = match self.find_pcie_capability(bdf) {
+            Some(base) => base,
+            None => return false,
+        };
+
+        let dev_sta_reg = pcie_cap_base + pcie_cap::DEV_STA;
+        // W1C: Write 1 to clear error bits
+        self.write16(bdf, dev_sta_reg, dev_sta::ALL_ERRORS);
+        true
+    }
+
+    /// Configure Link Control 2 to match OpenWRT
+    ///
+    /// OpenWRT values:
+    /// - Root port (00:00.0): 0x0043 (Target Gen3 + Hardware Autonomous Speed Disable)
+    /// - Endpoint (01:00.0): 0x0003 (Target Gen3)
+    ///
+    /// The `is_root_port` parameter determines which value to use.
+    pub fn configure_link_control2(&self, bdf: PcieBdf, is_root_port: bool) -> bool {
+        use crate::regs::pcie_cap;
+
+        let pcie_cap_base = match self.find_pcie_capability(bdf) {
+            Some(base) => base,
+            None => return false,
+        };
+
+        let link_ctl2_reg = pcie_cap_base + pcie_cap::LINK_CTL2;
+
+        // OpenWRT values:
+        // Root port: 0x0043 = Target Gen3 (bits 3:0 = 3) + HW Autonomous Speed Disable (bit 6)
+        // Endpoint:  0x0003 = Target Gen3 (bits 3:0 = 3)
+        let new_val: u16 = if is_root_port { 0x0043 } else { 0x0003 };
+
+        self.write16(bdf, link_ctl2_reg, new_val);
+        true
     }
 
     /// Check if a device exists at the given BDF

@@ -135,6 +135,8 @@ const CMD_QUERY: u8 = 3;
 const CMD_SUBSCRIBE: u8 = 4;
 const CMD_UNSUBSCRIBE: u8 = 5;
 const CMD_REMOVE: u8 = 6;
+const CMD_CLAIM_BUS: u8 = 7;
+const CMD_CLAIM_DEVICE: u8 = 8;
 
 // Response codes
 const RESP_OK: u8 = 0;
@@ -371,6 +373,23 @@ pub enum DevdRequest {
         path: [u8; MAX_PATH],
         path_len: u8,
     },
+
+    /// Claim a bus (bus driver reports it's now managing the bus)
+    /// e.g., pcied claims "/bus/pcie0" → state becomes "active"
+    ClaimBus {
+        path: [u8; MAX_PATH],
+        path_len: u8,
+    },
+
+    /// Claim a device (device driver reports it's now using the device)
+    /// e.g., wifid2 claims "/bus/pcie0/01:00.0" → state becomes "bound"
+    ClaimDevice {
+        path: [u8; MAX_PATH],
+        path_len: u8,
+        /// Name of the claiming driver (for debugging/display)
+        driver: [u8; 16],
+        driver_len: u8,
+    },
 }
 
 impl DevdRequest {
@@ -428,6 +447,35 @@ impl DevdRequest {
         DevdRequest::Remove {
             path: path_buf,
             path_len: len as u8,
+        }
+    }
+
+    /// Helper to create a ClaimBus request
+    pub fn claim_bus(path: &str) -> Self {
+        let mut path_buf = [0u8; MAX_PATH];
+        let len = path.len().min(MAX_PATH);
+        path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+        DevdRequest::ClaimBus {
+            path: path_buf,
+            path_len: len as u8,
+        }
+    }
+
+    /// Helper to create a ClaimDevice request
+    pub fn claim_device(path: &str, driver_name: &str) -> Self {
+        let mut path_buf = [0u8; MAX_PATH];
+        let path_len = path.len().min(MAX_PATH);
+        path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+
+        let mut driver_buf = [0u8; 16];
+        let driver_len = driver_name.len().min(16);
+        driver_buf[..driver_len].copy_from_slice(&driver_name.as_bytes()[..driver_len]);
+
+        DevdRequest::ClaimDevice {
+            path: path_buf,
+            path_len: path_len as u8,
+            driver: driver_buf,
+            driver_len: driver_len as u8,
         }
     }
 }
@@ -552,6 +600,30 @@ impl Message for DevdRequest {
                 buf[2..2 + MAX_PATH].copy_from_slice(path);
                 Ok(2 + MAX_PATH)
             }
+
+            DevdRequest::ClaimBus { path, path_len } => {
+                if buf.len() < 2 + MAX_PATH {
+                    return Err(IpcError::MessageTooLarge);
+                }
+                buf[0] = CMD_CLAIM_BUS;
+                buf[1] = *path_len;
+                buf[2..2 + MAX_PATH].copy_from_slice(path);
+                Ok(2 + MAX_PATH)
+            }
+
+            DevdRequest::ClaimDevice { path, path_len, driver, driver_len } => {
+                // cmd(1) + path_len(1) + path(64) + driver_len(1) + driver(16)
+                let total = 1 + 1 + MAX_PATH + 1 + 16;
+                if buf.len() < total {
+                    return Err(IpcError::MessageTooLarge);
+                }
+                buf[0] = CMD_CLAIM_DEVICE;
+                buf[1] = *path_len;
+                buf[2..2 + MAX_PATH].copy_from_slice(path);
+                buf[2 + MAX_PATH] = *driver_len;
+                buf[3 + MAX_PATH..3 + MAX_PATH + 16].copy_from_slice(driver);
+                Ok(total)
+            }
         }
     }
 
@@ -623,6 +695,30 @@ impl Message for DevdRequest {
                 Ok((DevdRequest::Remove { path, path_len }, 2 + MAX_PATH))
             }
 
+            CMD_CLAIM_BUS => {
+                if buf.len() < 2 + MAX_PATH {
+                    return Err(IpcError::Truncated);
+                }
+                let path_len = buf[1];
+                let mut path = [0u8; MAX_PATH];
+                path.copy_from_slice(&buf[2..2 + MAX_PATH]);
+                Ok((DevdRequest::ClaimBus { path, path_len }, 2 + MAX_PATH))
+            }
+
+            CMD_CLAIM_DEVICE => {
+                let total = 1 + 1 + MAX_PATH + 1 + 16;
+                if buf.len() < total {
+                    return Err(IpcError::Truncated);
+                }
+                let path_len = buf[1];
+                let mut path = [0u8; MAX_PATH];
+                path.copy_from_slice(&buf[2..2 + MAX_PATH]);
+                let driver_len = buf[2 + MAX_PATH];
+                let mut driver = [0u8; 16];
+                driver.copy_from_slice(&buf[3 + MAX_PATH..3 + MAX_PATH + 16]);
+                Ok((DevdRequest::ClaimDevice { path, path_len, driver, driver_len }, total))
+            }
+
             _ => Err(IpcError::UnexpectedMessage),
         }
     }
@@ -636,7 +732,9 @@ impl Message for DevdRequest {
             DevdRequest::Query { .. } |
             DevdRequest::Subscribe { .. } |
             DevdRequest::Unsubscribe { .. } |
-            DevdRequest::Remove { .. } => 2 + MAX_PATH,
+            DevdRequest::Remove { .. } |
+            DevdRequest::ClaimBus { .. } => 2 + MAX_PATH,
+            DevdRequest::ClaimDevice { .. } => 2 + MAX_PATH + 1 + 16,
         }
     }
 }
@@ -908,6 +1006,28 @@ impl DevdClient {
     /// Remove a node
     pub fn remove(&mut self, path: &str) -> IpcResult<()> {
         let request = DevdRequest::remove(path);
+        let response = self.inner.request(&request)?;
+        match response {
+            DevdResponse::Ok => Ok(()),
+            DevdResponse::Error(e) => Err(IpcError::ServerError(e)),
+            _ => Err(IpcError::UnexpectedMessage),
+        }
+    }
+
+    /// Claim a bus (marks it as active, managed by calling driver)
+    pub fn claim_bus(&mut self, path: &str) -> IpcResult<()> {
+        let request = DevdRequest::claim_bus(path);
+        let response = self.inner.request(&request)?;
+        match response {
+            DevdResponse::Ok => Ok(()),
+            DevdResponse::Error(e) => Err(IpcError::ServerError(e)),
+            _ => Err(IpcError::UnexpectedMessage),
+        }
+    }
+
+    /// Claim a device (marks it as bound to the calling driver)
+    pub fn claim_device(&mut self, path: &str, driver_name: &str) -> IpcResult<()> {
+        let request = DevdRequest::claim_device(path, driver_name);
         let response = self.inner.request(&request)?;
         match response {
             DevdResponse::Ok => Ok(()),

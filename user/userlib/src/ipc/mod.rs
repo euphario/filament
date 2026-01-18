@@ -151,7 +151,7 @@ pub mod protocols;
 
 pub use error::{IpcError, IpcResult};
 pub use channel::{Channel, create_pair};
-pub use protocol::{Protocol, Message, Serialize, Deserialize, Empty, ReprCMessage};
+pub use protocol::{Protocol, Message, Serialize, Deserialize, Empty, ReprCMessage, Writer, Reader};
 pub use client::{Client, ClientBuilder, ClientState};
 pub use server::{Server, Connection, ServerState, ConnectionState};
 

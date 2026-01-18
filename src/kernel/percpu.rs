@@ -59,6 +59,9 @@ pub struct CpuData {
     /// Idle time counter (ticks spent in idle)
     pub idle_ticks: AtomicU64,
 
+    /// Flag: CPU is currently in idle (WFI)
+    pub in_idle: AtomicU32,
+
     /// Last syscall number (for debugging)
     pub last_syscall: AtomicU32,
 
@@ -77,6 +80,7 @@ impl CpuData {
             need_resched: AtomicU32::new(0),
             tick_count: AtomicU64::new(0),
             idle_ticks: AtomicU64::new(0),
+            in_idle: AtomicU32::new(0),
             last_syscall: AtomicU32::new(0),
             kernel_stack_top: AtomicU64::new(0),
         }
@@ -134,6 +138,30 @@ impl CpuData {
     #[inline]
     pub fn idle_tick(&self) {
         self.idle_ticks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get idle tick count
+    #[inline]
+    pub fn get_idle_ticks(&self) -> u64 {
+        self.idle_ticks.load(Ordering::Relaxed)
+    }
+
+    /// Mark CPU as entering idle (before WFI)
+    #[inline]
+    pub fn set_idle(&self) {
+        self.in_idle.store(1, Ordering::Release);
+    }
+
+    /// Mark CPU as exiting idle (after WFI, found work)
+    #[inline]
+    pub fn clear_idle(&self) {
+        self.in_idle.store(0, Ordering::Release);
+    }
+
+    /// Check if CPU is currently idle
+    #[inline]
+    pub fn is_idle(&self) -> bool {
+        self.in_idle.load(Ordering::Acquire) != 0
     }
 }
 

@@ -452,3 +452,137 @@ impl<'a, T> Drop for RwLockWriteGuard<'a, T> {
         restore_irqs(self.irqs_were_enabled);
     }
 }
+
+// ============================================================================
+// Self-tests
+// ============================================================================
+
+#[cfg(feature = "selftest")]
+pub fn test() {
+    use crate::{kdebug, kinfo};
+
+    kdebug!("lock", "test_start");
+
+    // Test 1: Basic SpinLock acquire/release
+    {
+        static TEST_LOCK: SpinLock<u32> = SpinLock::new(42);
+
+        let guard = TEST_LOCK.lock();
+        assert_eq!(*guard, 42, "SpinLock initial value wrong");
+        assert!(TEST_LOCK.is_locked(), "Lock should be held");
+        drop(guard);
+        assert!(!TEST_LOCK.is_locked(), "Lock should be released");
+        kdebug!("lock", "spinlock_basic_ok");
+    }
+
+    // Test 2: SpinLock mutation
+    {
+        static COUNTER: SpinLock<u32> = SpinLock::new(0);
+
+        {
+            let mut guard = COUNTER.lock();
+            *guard += 1;
+        }
+        {
+            let mut guard = COUNTER.lock();
+            *guard += 1;
+        }
+        {
+            let guard = COUNTER.lock();
+            assert_eq!(*guard, 2, "Counter should be 2");
+        }
+        kdebug!("lock", "spinlock_mutation_ok");
+    }
+
+    // Test 3: try_lock succeeds when unlocked
+    {
+        static TRY_LOCK: SpinLock<u32> = SpinLock::new(100);
+
+        let result = TRY_LOCK.try_lock();
+        assert!(result.is_some(), "try_lock should succeed when unlocked");
+        drop(result);
+        kdebug!("lock", "try_lock_success_ok");
+    }
+
+    // Test 4: IRQ state preservation
+    // This tests that IRQs are properly saved/restored
+    {
+        static IRQ_TEST: SpinLock<u32> = SpinLock::new(0);
+
+        // Get IRQ state before
+        let daif_before: u64;
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif_before); }
+        let irqs_enabled_before = (daif_before & (1 << 7)) == 0;
+
+        {
+            let _guard = IRQ_TEST.lock();
+            // IRQs should be disabled while holding lock
+            let daif_during: u64;
+            unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif_during); }
+            assert!((daif_during & (1 << 7)) != 0, "IRQs should be disabled during lock");
+        }
+
+        // IRQ state should be restored
+        let daif_after: u64;
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif_after); }
+        let irqs_enabled_after = (daif_after & (1 << 7)) == 0;
+        assert_eq!(irqs_enabled_before, irqs_enabled_after, "IRQ state not restored");
+        kdebug!("lock", "irq_preserve_ok");
+    }
+
+    // Test 5: RwLock read access
+    {
+        static RW_TEST: RwLock<u32> = RwLock::new(123);
+
+        let guard = RW_TEST.read();
+        assert_eq!(*guard, 123, "RwLock read value wrong");
+        drop(guard);
+        kdebug!("lock", "rwlock_read_ok");
+    }
+
+    // Test 6: RwLock write access
+    {
+        static RW_WRITE: RwLock<u32> = RwLock::new(0);
+
+        {
+            let mut guard = RW_WRITE.write();
+            *guard = 456;
+        }
+        {
+            let guard = RW_WRITE.read();
+            assert_eq!(*guard, 456, "RwLock write value not persisted");
+        }
+        kdebug!("lock", "rwlock_write_ok");
+    }
+
+    // Test 7: Multiple readers allowed
+    {
+        static MULTI_READ: RwLock<u32> = RwLock::new(789);
+
+        let r1 = MULTI_READ.read();
+        // Note: We can't easily test simultaneous readers on single-core,
+        // but we verify the state tracking works
+        assert_eq!(MULTI_READ.state.load(Ordering::Relaxed), 1, "Should have 1 reader");
+        drop(r1);
+        assert_eq!(MULTI_READ.state.load(Ordering::Relaxed), 0, "Should have 0 readers");
+        kdebug!("lock", "rwlock_multi_ok");
+    }
+
+    // Test 8: Lock depth tracking (debug builds only)
+    #[cfg(debug_assertions)]
+    {
+        static DEPTH_TEST: SpinLock<u32> = SpinLock::new(0);
+
+        let depth_before = current_lock_depth();
+        {
+            let _g = DEPTH_TEST.lock();
+            let depth_during = current_lock_depth();
+            assert_eq!(depth_during, depth_before + 1, "Lock depth should increment");
+        }
+        let depth_after = current_lock_depth();
+        assert_eq!(depth_after, depth_before, "Lock depth should return to original");
+        kdebug!("lock", "depth_tracking_ok");
+    }
+
+    kinfo!("lock", "test_ok");
+}

@@ -168,6 +168,23 @@ pub trait Platform {
 
     /// Convert kernel virtual address to physical address
     fn virt_to_phys(&self, virt: usize) -> usize;
+
+    /// Convert CPU physical address to DMA address for PCIe/bus devices
+    ///
+    /// On platforms with identity-mapped PCIe inbound windows, this returns
+    /// the physical address unchanged. On platforms with an offset (e.g., PCIe
+    /// inbound window at 0x0 mapping to DRAM at 0x40000000), this applies the
+    /// necessary translation.
+    ///
+    /// Drivers should use this when programming DMA descriptors with buffer
+    /// addresses that will be used by bus-mastering devices.
+    fn phys_to_dma(&self, phys: u64) -> u64;
+
+    /// Convert DMA address back to CPU physical address
+    ///
+    /// Inverse of `phys_to_dma`. Used when reading addresses from device
+    /// descriptors that need to be accessed by the CPU.
+    fn dma_to_phys(&self, dma: u64) -> u64;
 }
 
 /// IRQ handler type

@@ -6,7 +6,8 @@
 #![no_std]
 #![no_main]
 
-use userlib::{println, print, syscall};
+use userlib::{uinfo, uerror, syscall};
+use userlib::ulog;
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 use pcie::{PcieClient, PcieDeviceInfo};
 
@@ -351,7 +352,7 @@ impl BlockServer {
 
         // Grant client access
         if !ring.allow(client_pid) {
-            println!("[nvme] Failed to allow client access to ring");
+            uerror!("nvmed", "client_ring_failed"; op = "allow", err = "grant_denied", next = "drop");
             return None;
         }
 
@@ -423,28 +424,24 @@ const MAX_CLIENTS: usize = 4;
 
 #[unsafe(no_mangle)]
 fn main() {
-    println!("=== NVMe Driver ===");
-    println!();
+    uinfo!("nvmed", "init_start");
 
     // Step 1: Query pcied for NVMe device
-    print!("Querying pcied for NVMe device... ");
     let client = match PcieClient::connect() {
         Some(c) => c,
         None => {
-            println!("FAILED to connect to pcied");
+            uerror!("nvmed", "init_failed"; op = "pcie_connect", err = "no_pcied", next = "exit");
             syscall::exit(1);
         }
     };
 
     let devices = client.find_devices(0xFFFF, 0xFFFF);
-    println!("found {} devices", devices.len());
 
     let mut nvme_dev: Option<PcieDeviceInfo> = None;
     for info in devices.iter() {
         let class = info.class_code >> 8;
         if class == 0x0108 {
-            println!("  Found NVMe: {:04x}:{:04x} BAR0=0x{:x}",
-                info.vendor_id, info.device_id, info.bar0_addr);
+            uinfo!("nvmed", "device_found"; vendor = info.vendor_id as u64, device = info.device_id as u64, bar0 = ulog::hex64(info.bar0_addr));
             nvme_dev = Some(*info);
             break;
         }
@@ -453,39 +450,28 @@ fn main() {
     let info = match nvme_dev {
         Some(i) => i,
         None => {
-            println!("No NVMe device found!");
+            uerror!("nvmed", "init_failed"; op = "device_scan", err = "no_nvme", next = "exit");
             syscall::exit(1);
         }
     };
 
-    // Step 2: Map BAR0
-    print!("Mapping BAR0... ");
-    let bdf = syscall::PciBdf {
-        port: info.port,
-        bus: info.bus,
-        device: info.device,
-        function: info.function,
-    };
-
-    let (bar0_virt, bar0_size) = match syscall::pci_bar_map(bdf, 0) {
+    // Step 2: Map BAR0 using mmap_device
+    let bar0_virt = match syscall::mmap_device(info.bar0_addr, info.bar0_size as u64) {
         Ok(v) => v,
         Err(e) => {
-            println!("FAILED: {}", e);
+            uerror!("nvmed", "init_failed"; op = "bar0_map", err = e, next = "exit");
             syscall::exit(1);
         }
     };
-    println!("OK (virt=0x{:x} size={}KB)", bar0_virt, bar0_size / 1024);
 
     // Step 3: Allocate queue memory
-    print!("Allocating queue memory... ");
     let mut queue_mem_phys: u64 = 0;
     let queue_mem_virt = syscall::mmap_dma(QUEUE_MEM_SIZE, &mut queue_mem_phys);
     if queue_mem_virt < 0 {
-        println!("FAILED: {}", queue_mem_virt);
+        uerror!("nvmed", "init_failed"; op = "dma_alloc", err = queue_mem_virt as u64, next = "exit");
         syscall::exit(1);
     }
     let queue_mem_virt = queue_mem_virt as u64;
-    println!("OK (phys=0x{:x})", queue_mem_phys);
 
     unsafe { core::ptr::write_bytes(queue_mem_virt as *mut u8, 0, QUEUE_MEM_SIZE); }
     flush_buffer(queue_mem_virt, QUEUE_MEM_SIZE);
@@ -507,37 +493,33 @@ fn main() {
     };
 
     // Step 4: Read capabilities and initialize
-    print!("Reading capabilities... ");
     let cap = ctrl.read64(regs::CAP);
-    let mqes = (cap & cap::MQES_MASK) as u32 + 1;
+    let _mqes = (cap & cap::MQES_MASK) as u32 + 1;
     let dstrd = ((cap & cap::DSTRD_MASK) >> cap::DSTRD_SHIFT) as u32;
     ctrl.doorbell_stride = 4 << dstrd;
-    let vs = ctrl.read32(regs::VS);
-    println!("MQES={} VS={}.{}.{}", mqes, (vs >> 16) & 0xFF, (vs >> 8) & 0xFF, vs & 0xFF);
+    let _vs = ctrl.read32(regs::VS);
 
-    print!("Disabling controller... ");
+    // Disable controller
     ctrl.write32(regs::CC, 0);
     for _ in 0..1000 {
         if (ctrl.read32(regs::CSTS) & csts::RDY) == 0 { break; }
         syscall::yield_now();
     }
-    println!("OK");
 
-    print!("Configuring Admin queues... ");
+    // Configure Admin queues
     let aqa = ((ADMIN_QUEUE_SIZE as u32 - 1) << 16) | (ADMIN_QUEUE_SIZE as u32 - 1);
     ctrl.write32(regs::AQA, aqa);
     ctrl.write64(regs::ASQ, queue_mem_phys);
     ctrl.write64(regs::ACQ, queue_mem_phys + 4096);
-    println!("OK");
 
-    print!("Enabling controller... ");
+    // Enable controller
     let cc = cc::EN | cc::CSS_NVM | cc::AMS_RR | (6 << cc::IOSQES_SHIFT) | (4 << cc::IOCQES_SHIFT);
     ctrl.write32(regs::CC, cc);
     for _ in 0..1000 {
         let csts = ctrl.read32(regs::CSTS);
-        if (csts & csts::RDY) != 0 { println!("OK"); break; }
+        if (csts & csts::RDY) != 0 { break; }
         if (csts & csts::CFS) != 0 {
-            println!("FAILED: Controller Fatal Status!");
+            uerror!("nvmed", "init_failed"; op = "ctrl_enable", err = "cfs", next = "exit");
             syscall::exit(1);
         }
         syscall::yield_now();
@@ -547,30 +529,26 @@ fn main() {
     let mut id_buf_phys: u64 = 0;
     let id_buf_virt = syscall::mmap_dma(4096, &mut id_buf_phys);
     if id_buf_virt < 0 {
-        println!("FAILED to allocate identify buffer");
+        uerror!("nvmed", "init_failed"; op = "id_buf_alloc", err = id_buf_virt as u64, next = "exit");
         syscall::exit(1);
     }
     let id_buf_virt = id_buf_virt as u64;
 
-    print!("Identifying controller... ");
+    // Identify controller
     invalidate_buffer(id_buf_virt, 4096);
     match ctrl.identify_controller(id_buf_phys) {
         Ok(_) => {
             invalidate_buffer(id_buf_virt, 4096);
             let id_ctrl = unsafe { &*(id_buf_virt as *const IdentifyController) };
-            let sn = core::str::from_utf8(&id_ctrl.sn).unwrap_or("?").trim();
-            let mn = core::str::from_utf8(&id_ctrl.mn).unwrap_or("?").trim();
-            println!("OK");
-            println!("  Model: {}", mn);
-            println!("  Serial: {}", sn);
+            uinfo!("nvmed", "controller_id"; vendor = id_ctrl.vid as u64);
         }
         Err(e) => {
-            println!("FAILED: status=0x{:x}", e);
+            uerror!("nvmed", "init_failed"; op = "identify_ctrl", err = e as u64, next = "exit");
             syscall::exit(1);
         }
     }
 
-    print!("Identifying namespace 1... ");
+    // Identify namespace 1
     invalidate_buffer(id_buf_virt, 4096);
     match ctrl.identify_namespace(1, id_buf_phys) {
         Ok(_) => {
@@ -580,44 +558,41 @@ fn main() {
             let lbaf = id_ns.lbaf0;
             let lba_ds = (lbaf >> 16) & 0xFF;
             ctrl.block_size = 1 << lba_ds;
-            let size_gb = (ctrl.ns_size * ctrl.block_size as u64) / (1024 * 1024 * 1024);
-            println!("OK");
-            println!("  Size: {} blocks ({} GB)", ctrl.ns_size, size_gb);
-            println!("  Block size: {} bytes", ctrl.block_size);
         }
         Err(e) => {
-            println!("FAILED: status=0x{:x}", e);
+            uerror!("nvmed", "init_failed"; op = "identify_ns", err = e as u64, next = "exit");
             syscall::exit(1);
         }
     }
 
-    print!("Creating I/O CQ... ");
+    // Create I/O queues
     match ctrl.create_iocq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 12288) {
-        Ok(_) => println!("OK"),
-        Err(e) => { println!("FAILED: status=0x{:x}", e); syscall::exit(1); }
+        Ok(_) => {}
+        Err(e) => {
+            uerror!("nvmed", "init_failed"; op = "create_iocq", err = e as u64, next = "exit");
+            syscall::exit(1);
+        }
     }
 
-    print!("Creating I/O SQ... ");
     match ctrl.create_iosq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 8192, 1) {
-        Ok(_) => println!("OK"),
-        Err(e) => { println!("FAILED: status=0x{:x}", e); syscall::exit(1); }
+        Ok(_) => {}
+        Err(e) => {
+            uerror!("nvmed", "init_failed"; op = "create_iosq", err = e as u64, next = "exit");
+            syscall::exit(1);
+        }
     }
 
-    println!();
-    println!("NVMe initialization complete!");
-    println!();
+    uinfo!("nvmed", "controller_ready"; namespaces = 1u64, blocks = ctrl.ns_size, block_size = ctrl.block_size as u64);
 
     // Register as block device
-    println!("Registering as 'nvme' block device...");
     let port = syscall::port_register(b"nvme");
     if port < 0 {
-        println!("FAILED to create port: {}", port);
+        uerror!("nvmed", "init_failed"; op = "port_register", err = port as u64, next = "exit");
         syscall::exit(1);
     }
     let port = port as u32;
 
-    println!("Ready! Waiting for block clients...");
-    println!();
+    uinfo!("nvmed", "ready");
 
     // Client management
     let mut clients: [Option<BlockServer>; MAX_CLIENTS] = [None, None, None, None];
@@ -627,7 +602,7 @@ fn main() {
         let new_channel = syscall::port_accept(port);
         if new_channel >= 0 {
             if let Some(server) = BlockServer::try_handshake(new_channel as u32) {
-                println!("[nvme] Client {} connected", server.client_pid);
+                uinfo!("nvmed", "client_connected"; pid = server.client_pid as u64);
                 // Find empty slot
                 for slot in clients.iter_mut() {
                     if slot.is_none() {

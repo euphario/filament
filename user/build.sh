@@ -6,13 +6,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Create output directory
+# Create output directory (clean first to remove stale binaries)
+rm -rf bin
 mkdir -p bin
 
 # List of programs to build (name:path pairs, path defaults to name if not specified)
 # Note: usbd replaces usbtest as the main USB daemon
 # Note: msc removed - MSC/SCSI handled directly in usbd for performance
-PROGRAMS="devd:driver/devd shell gpio:driver/gpio usbd:driver/usbd fatfs:driver/fatfs pcied:driver/pcied wifid:driver/wifid wifid2:driver/wifid2 pwm:driver/pwm nvmed:driver/nvmed"
+PROGRAMS="devd:driver/devd logd:driver/logd shell gpio:driver/gpio usbd:driver/usbd fatfs:driver/fatfs pcied:driver/pcied vfsd:driver/vfsd consoled:driver/consoled wifid:driver/wifid pwm:driver/pwm nvmed:driver/nvmed pciepoke:driver/pciepoke"
 
 # Build each program
 for entry in $PROGRAMS; do

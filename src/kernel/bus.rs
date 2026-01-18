@@ -49,7 +49,7 @@ use super::ipc::{self, ChannelId, Message, MessageType};
 use super::port::{self, PortError};
 use super::process::Pid;
 use crate::arch::aarch64::mmio::{MmioRegion, delay_ms, delay_us, dsb};
-use crate::logln;
+use crate::{kinfo, kerror, print_direct, klog};
 
 /// Get current uptime in milliseconds
 fn uptime_ms() -> u64 {
@@ -74,6 +74,37 @@ pub const MAX_DEVICES_PER_BUS: usize = 32;
 
 /// Bus control port name prefix
 pub const BUS_PORT_PREFIX: &str = "/kernel/bus/";
+
+// =============================================================================
+// Bus Capability Flags (reported in StateSnapshot)
+// =============================================================================
+
+/// Bus capability flags - reported to devd so it knows what features are available
+pub mod bus_caps {
+    // PCIe capabilities
+    /// PCIe: Bus mastering (DMA) supported
+    pub const PCIE_BUS_MASTER: u8 = 1 << 0;
+    /// PCIe: MSI interrupts supported
+    pub const PCIE_MSI: u8 = 1 << 1;
+    /// PCIe: MSI-X interrupts supported
+    pub const PCIE_MSIX: u8 = 1 << 2;
+    /// PCIe: Link is up and trained
+    pub const PCIE_LINK_UP: u8 = 1 << 3;
+
+    // USB capabilities
+    /// USB: USB 2.0 (EHCI/high-speed) supported
+    pub const USB_2_0: u8 = 1 << 0;
+    /// USB: USB 3.0 (xHCI/super-speed) supported
+    pub const USB_3_0: u8 = 1 << 1;
+    /// USB: Controller is running (not halted)
+    pub const USB_RUNNING: u8 = 1 << 2;
+
+    // Platform capabilities
+    /// Platform: MMIO regions available
+    pub const PLATFORM_MMIO: u8 = 1 << 0;
+    /// Platform: IRQs available
+    pub const PLATFORM_IRQ: u8 = 1 << 1;
+}
 
 // =============================================================================
 // MT7988A Hardware Addresses
@@ -491,6 +522,21 @@ pub enum StateChangeReason {
     DriverExited = 7,
 }
 
+impl StateChangeReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StateChangeReason::Connected => "connected",
+            StateChangeReason::Disconnected => "disconnected",
+            StateChangeReason::OwnerCrashed => "owner_crashed",
+            StateChangeReason::ResetRequested => "reset_requested",
+            StateChangeReason::ResetComplete => "reset_complete",
+            StateChangeReason::Handoff => "handoff",
+            StateChangeReason::DriverClaimed => "driver_claimed",
+            StateChangeReason::DriverExited => "driver_exited",
+        }
+    }
+}
+
 // =============================================================================
 // Bus Controller
 // =============================================================================
@@ -649,11 +695,82 @@ impl BusController {
         info
     }
 
+    /// Query hardware capabilities for this bus
+    /// Returns a bitmask of bus_caps flags appropriate for the bus type
+    pub fn query_capabilities(&self) -> u8 {
+        match self.bus_type {
+            BusType::PCIe => self.query_pcie_capabilities(),
+            BusType::Usb => self.query_usb_capabilities(),
+            BusType::Platform => self.query_platform_capabilities(),
+        }
+    }
+
+    /// Query PCIe-specific capabilities by reading hardware registers
+    fn query_pcie_capabilities(&self) -> u8 {
+        let mut caps = 0u8;
+
+        // All MT7988 PCIe ports support bus mastering and MSI
+        caps |= bus_caps::PCIE_BUS_MASTER;
+        caps |= bus_caps::PCIE_MSI;
+
+        // Check if link is up by reading LTSSM state
+        if (self.bus_index as usize) < pcie_hw::MAC_BASES.len() {
+            let mac_base = pcie_hw::MAC_BASES[self.bus_index as usize];
+            let mmio = MmioRegion::new(mac_base);
+
+            // Read K_CNT_APPL register (offset 0x104C) for LTSSM state
+            // LTSSM state is in bits [28:24], L0 = 0x10
+            let k_cnt_appl = mmio.read32(0x104C);
+            let ltssm_state = (k_cnt_appl >> 24) & 0x1F;
+
+            // L0 (normal operation) or L0s (low power L0) means link is up
+            if ltssm_state == 0x10 || ltssm_state == 0x11 {
+                caps |= bus_caps::PCIE_LINK_UP;
+            }
+        }
+
+        caps
+    }
+
+    /// Query USB-specific capabilities by reading xHCI registers
+    fn query_usb_capabilities(&self) -> u8 {
+        let mut caps = 0u8;
+
+        // All MT7988 USB controllers are xHCI (USB 3.0) with USB 2.0 support
+        caps |= bus_caps::USB_2_0;
+        caps |= bus_caps::USB_3_0;
+
+        // Check if controller is running (not halted)
+        if (self.bus_index as usize) < usb_hw::MAC_BASES.len() {
+            let mac_base = usb_hw::MAC_BASES[self.bus_index as usize];
+            let mmio = MmioRegion::new(mac_base);
+
+            // Read CAPLENGTH to find operational registers offset
+            let caplength = mmio.read32(usb_hw::CAPLENGTH) & 0xFF;
+            let op_base = caplength as usize;
+
+            // Read USBSTS - check HCH (Host Controller Halted) bit
+            let usbsts = mmio.read32(op_base + usb_hw::USBSTS);
+            if (usbsts & usb_hw::STS_HCH) == 0 {
+                // Not halted = running
+                caps |= bus_caps::USB_RUNNING;
+            }
+        }
+
+        caps
+    }
+
+    /// Query platform bus capabilities (pseudo-bus, always has MMIO/IRQ)
+    fn query_platform_capabilities(&self) -> u8 {
+        // Platform bus always supports MMIO and IRQ access
+        bus_caps::PLATFORM_MMIO | bus_caps::PLATFORM_IRQ
+    }
+
     /// Register the bus control port
     /// Called during kernel init
     pub fn register_port(&mut self, kernel_pid: Pid) -> Result<(), PortError> {
         let name = self.port_name_str();
-        logln!("  Registering bus control port: {}", name);
+        kinfo!("bus", "register_port"; name = name);
 
         let listen_ch = port::with_port_registry(|registry| {
             registry.register(name, kernel_pid)
@@ -691,8 +808,11 @@ impl BusController {
             return;
         }
 
-        logln!("  Bus {}: {:?} -> {:?} (reason: {:?})",
-               self.port_name_str(), old_state, new_state, reason);
+        kinfo!("bus", "state_change";
+            name = self.port_name_str(),
+            from = old_state.as_str(),
+            to = new_state.as_str(),
+            reason = reason.as_str());
 
         self.state = new_state;
         self.state_entered_at = uptime_ms();
@@ -723,8 +843,6 @@ impl BusController {
 
     /// Disable bus mastering for all devices (hardware + tracking)
     fn disable_all_bus_mastering(&mut self) {
-        logln!("  Bus {}: disabling ALL bus mastering", self.port_name_str());
-
         // First, disable at hardware level
         match self.bus_type {
             BusType::PCIe => self.pcie_disable_all_bus_mastering(),
@@ -748,16 +866,13 @@ impl BusController {
             BusState::Safe => {
                 if self.owner_pid.is_some() {
                     // Only one supervisor allowed - drivers use SetDriver, not connect
-                    logln!("  Bus {}: rejecting connect from PID {} (supervisor {:?} already connected)",
-                           self.port_name_str(), client_pid, self.owner_pid);
                     return Err(BusError::AlreadyClaimed);
                 }
 
                 // First connection is supervisor (devd) - bus stays Safe
                 self.owner_channel = Some(client_channel);
                 self.owner_pid = Some(client_pid);
-                logln!("  Bus {}: supervisor PID {} connected",
-                       self.port_name_str(), client_pid);
+                kinfo!("bus", "supervisor_connected"; name = self.port_name_str(), pid = client_pid as u64);
 
                 // Send StateSnapshot to supervisor
                 self.send_state_snapshot(client_channel)?;
@@ -793,8 +908,7 @@ impl BusController {
     /// Called when the driver_pid process exits. Resets the bus and notifies
     /// the supervisor (devd) via owner_channel so it can restart the driver.
     pub fn handle_driver_exit(&mut self, driver_pid: Pid) {
-        logln!("  Bus {}: driver PID {} exited, resetting bus",
-               self.port_name_str(), driver_pid);
+        kinfo!("bus", "driver_exit"; name = self.port_name_str(), pid = driver_pid as u64);
 
         // Clear driver_pid
         self.driver_pid = None;
@@ -809,11 +923,9 @@ impl BusController {
         // Notify supervisor (devd) via owner_channel that bus is Safe
         // This wakes devd so it can restart the driver
         if let Some(channel) = self.owner_channel {
-            logln!("  Bus {}: notifying supervisor on channel {}",
-                   self.port_name_str(), channel);
             if let Err(e) = self.send_state_snapshot(channel) {
-                logln!("  Bus {}: failed to notify supervisor: {:?}",
-                       self.port_name_str(), e);
+                kerror!("bus", "notify_failed"; name = self.port_name_str());
+                let _ = e;  // error logged
             }
         }
     }
@@ -825,8 +937,7 @@ impl BusController {
         }
 
         // Atomic transfer - NO state change, NO reset
-        logln!("  Bus {}: handoff from PID {:?} to PID {}",
-               self.port_name_str(), self.owner_pid, new_pid);
+        kinfo!("bus", "handoff"; name = self.port_name_str(), new_pid = new_pid as u64);
 
         self.owner_channel = Some(new_channel);
         self.owner_pid = Some(new_pid);
@@ -845,7 +956,7 @@ impl BusController {
             bus_index: self.bus_index,
             state: self.state as u8,
             device_count: self.device_count as u8,
-            capabilities: 0, // TODO: Fill in actual capabilities
+            capabilities: self.query_capabilities(),
             _reserved: [0; 2],
             since_boot_ms: uptime_ms(),
         };
@@ -866,21 +977,10 @@ impl BusController {
 
     /// Perform hardware reset sequence
     fn perform_hardware_reset(&mut self) {
-        logln!("  Bus {}: performing hardware reset...", self.port_name_str());
-
         match self.bus_type {
-            BusType::PCIe => {
-                self.pcie_reset_sequence();
-            }
-            BusType::Usb => {
-                self.usb_reset_sequence();
-            }
-            BusType::Platform => {
-                // Platform bus is a pseudo-bus - no hardware to reset
-                // Devices like uart, gpio are always available
-                self.hardware_verified = true;
-                logln!("    [OK] Platform bus: no hardware reset needed");
-            }
+            BusType::PCIe => self.pcie_reset_sequence(),
+            BusType::Usb => self.usb_reset_sequence(),
+            BusType::Platform => self.hardware_verified = true, // No hardware to reset
         }
     }
 
@@ -893,14 +993,6 @@ impl BusController {
     fn pcie_enable_clocks(&self, index: usize) {
         let infracfg = MmioRegion::new(pcie_hw::INFRACFG_AO_BASE);
 
-        logln!("    Enabling PCIe{} clocks via INFRACFG...", index);
-
-        // Read current clock gate status
-        let infra0_sta_before = infracfg.read32(pcie_hw::INFRA0_CG_STA);
-        let infra3_sta_before = infracfg.read32(pcie_hw::INFRA3_CG_STA);
-        logln!("      INFRA0_CG_STA before: 0x{:08x}", infra0_sta_before);
-        logln!("      INFRA3_CG_STA before: 0x{:08x}", infra3_sta_before);
-
         // Get clock bits for this port
         let peri_26m_bit = pcie_hw::INFRA0_PCIE_PERI_26M[index];
         let gfmux_bit = pcie_hw::INFRA3_PCIE_GFMUX_TL[index];
@@ -908,11 +1000,9 @@ impl BusController {
         let clk_133m_bit = pcie_hw::INFRA3_PCIE_133M[index];
 
         // Enable clocks by writing to CLEAR registers (clear gate = enable clock)
-        // INFRA0: PCIE_PERI_26M
         infracfg.write32(pcie_hw::INFRA0_CG_CLR, peri_26m_bit);
         dsb();
 
-        // INFRA3: GFMUX_TL, PIPE, 133M
         let infra3_bits = gfmux_bit | pipe_bit | clk_133m_bit;
         infracfg.write32(pcie_hw::INFRA3_CG_CLR, infra3_bits);
         dsb();
@@ -920,35 +1010,10 @@ impl BusController {
         // Small delay for clocks to stabilize
         delay_us(100);
 
-        // Verify clocks are enabled (bits should be 0 = ungated)
-        let infra0_sta_after = infracfg.read32(pcie_hw::INFRA0_CG_STA);
-        let infra3_sta_after = infracfg.read32(pcie_hw::INFRA3_CG_STA);
-        logln!("      INFRA0_CG_STA after: 0x{:08x}", infra0_sta_after);
-        logln!("      INFRA3_CG_STA after: 0x{:08x}", infra3_sta_after);
-
-        // Check if clocks are now enabled (gate bits should be 0)
-        let peri_26m_enabled = (infra0_sta_after & peri_26m_bit) == 0;
-        let gfmux_enabled = (infra3_sta_after & gfmux_bit) == 0;
-        let pipe_enabled = (infra3_sta_after & pipe_bit) == 0;
-        let clk_133m_enabled = (infra3_sta_after & clk_133m_bit) == 0;
-
-        logln!("      PERI_26M: {}, GFMUX: {}, PIPE: {}, 133M: {}",
-               if peri_26m_enabled { "ON" } else { "off" },
-               if gfmux_enabled { "ON" } else { "off" },
-               if pipe_enabled { "ON" } else { "off" },
-               if clk_133m_enabled { "ON" } else { "off" });
-
         // Deassert PEXTP_MAC_SWRST (write 1 to CLR register to deassert)
-        // This is required for RST_CTRL register to be writable
-        let rst0_sta_before = infracfg.read32(pcie_hw::RST0_STA);
-        logln!("      RST0_STA before: 0x{:08x}", rst0_sta_before);
-
         infracfg.write32(pcie_hw::RST0_CLR, pcie_hw::PEXTP_MAC_SWRST);
         dsb();
         delay_us(10);
-
-        let rst0_sta_after = infracfg.read32(pcie_hw::RST0_STA);
-        logln!("      RST0_STA after: 0x{:08x} (PEXTP_MAC deasserted)", rst0_sta_after);
     }
 
     /// Disable PCIe clocks and assert INFRACFG reset for a port
@@ -959,8 +1024,6 @@ impl BusController {
     /// 2. Disable clocks
     fn pcie_disable_clocks(&self, index: usize) {
         let infracfg = MmioRegion::new(pcie_hw::INFRACFG_AO_BASE);
-
-        logln!("    Disabling PCIe{} clocks...", index);
 
         // Assert PEXTP_MAC_SWRST (write 1 to SET register to assert)
         infracfg.write32(pcie_hw::RST0_SET, pcie_hw::PEXTP_MAC_SWRST);
@@ -976,8 +1039,6 @@ impl BusController {
         infracfg.write32(pcie_hw::INFRA0_CG_SET, peri_26m_bit);
         infracfg.write32(pcie_hw::INFRA3_CG_SET, gfmux_bit | pipe_bit | clk_133m_bit);
         dsb();
-
-        logln!("      Reset asserted, clocks gated");
     }
 
     /// PCIe hardware reset sequence
@@ -1000,13 +1061,12 @@ impl BusController {
     fn pcie_reset_sequence(&mut self) {
         let index = self.bus_index as usize;
         if index >= pcie_hw::MAC_BASES.len() {
-            logln!("    [!!] Invalid PCIe index {}", index);
+            kerror!("bus", "pcie_invalid_index"; index = index as u64);
             self.hardware_verified = false;
             return;
         }
 
         let mac_base = pcie_hw::MAC_BASES[index];
-        logln!("    PCIe{}: MAC base 0x{:08x}", index, mac_base);
 
         // Step 1: Enable clocks and deassert INFRACFG reset
         self.pcie_enable_clocks(index);
@@ -1016,33 +1076,18 @@ impl BusController {
 
         // Step 2: Verify MAC is accessible
         let test_read = mac.read32(0x00);
-        logln!("    MAC[0x00]: 0x{:08x}", test_read);
         if test_read == 0 || test_read == 0xFFFFFFFF {
-            logln!("    [!!] PCIe{}: MAC not accessible", index);
+            kerror!("bus", "pcie_mac_not_accessible"; index = index as u64, mac = klog::hex32(mac_base as u32));
             self.pcie_disable_clocks(index);
             self.hardware_verified = false;
             return;
         }
 
-        // Step 3: Read current state for diagnostics
-        let rst_ctrl = mac.read32(pcie_hw::RST_CTRL_REG);
-        let ltssm = mac.read32(pcie_hw::LTSSM_STATUS_REG);
-        let link_status = mac.read32(pcie_hw::LINK_STATUS_REG);
-        let link_up = (link_status & pcie_hw::LINK_UP) != 0;
-
-        logln!("    RST_CTRL: 0x{:08x}", rst_ctrl);
-        logln!("    LTSSM: 0x{:08x}, Link: 0x{:08x}, up={}", ltssm, link_status, link_up);
-
-        // Note: We intentionally skip RST_CTRL manipulation on MT7988
-        // because it doesn't work (writes have no effect).
-        // The INFRACFG PEXTP_MAC_SWRST provides the reset control we need.
-
-        // MAC is accessible and we verified state - mark as verified
+        // MAC is accessible - mark as verified
         self.hardware_verified = true;
-        logln!("    [OK] PCIe{}: MAC accessible, INFRACFG reset working", index);
+        kinfo!("bus", "pcie_verified"; port = index as u64, mac = klog::hex32(mac_base as u32));
 
-        // Step 4: Assert INFRACFG reset and disable clocks (safe state)
-        // This puts the MAC in reset - no DMA possible
+        // Step 3: Assert INFRACFG reset and disable clocks (safe state)
         self.pcie_disable_clocks(index);
     }
 
@@ -1052,26 +1097,10 @@ impl BusController {
 
         // Check reset control is deasserted
         let rst_ctrl = mac.read32(pcie_hw::RST_CTRL_REG);
-        logln!("    RST_CTRL after: 0x{:08x}", rst_ctrl);
         if rst_ctrl != pcie_hw::RST_ALL {
-            logln!("    [!!] Reset bits not properly deasserted");
+            kerror!("bus", "pcie_rst_not_deasserted"; index = index as u64);
             return false;
         }
-
-        // Check LTSSM state
-        let ltssm = mac.read32(pcie_hw::LTSSM_STATUS_REG);
-        let ltssm_state = ltssm & pcie_hw::LTSSM_STATE_MASK;
-        logln!("    LTSSM: 0x{:08x} (state: 0x{:02x})", ltssm, ltssm_state >> 24);
-
-        // Check link status
-        let link_status = mac.read32(pcie_hw::LINK_STATUS_REG);
-        let link_up = (link_status & pcie_hw::LINK_UP) != 0;
-        logln!("    Link status: 0x{:08x} (up: {})", link_status, link_up);
-
-        // A device may or may not be present
-        // We verify the controller is in a valid state, not necessarily that a device is connected
-        // LTSSM in Detect.Quiet (0x00) or Detect.Active (0x01) is expected when no device
-        // LTSSM in L0 (0x10) when device is present and link trained
 
         true  // Controller is in a valid state
     }
@@ -1090,7 +1119,7 @@ impl BusController {
     fn usb_reset_sequence(&mut self) {
         let index = self.bus_index as usize;
         if index >= usb_hw::MAC_BASES.len() {
-            logln!("    [!!] Invalid USB index {}", index);
+            kerror!("bus", "usb_invalid_index"; index = index as u64);
             self.hardware_verified = false;
             return;
         }
@@ -1099,159 +1128,110 @@ impl BusController {
         let ippc_base = mac_base + usb_hw::IPPC_OFFSET;
         let ippc = MmioRegion::new(ippc_base);
 
-        logln!("    USB{}: MAC=0x{:08x} IPPC=0x{:08x}", index, mac_base, ippc_base);
-
-        // Step 1: Reset the whole SSUSB IP
-        // CRITICAL: This stops xHCI DMA. We must wait for in-flight DMA to complete
-        // before freeing any DMA buffers (shmem), otherwise freed pages get corrupted.
-        logln!("    Step 1: IP software reset...");
+        // Step 1: Reset the whole SSUSB IP (quiesces DMA)
         let ctrl0 = ippc.read32(usb_hw::IP_PW_CTRL0);
-        logln!("      CTRL0 before: 0x{:08x}", ctrl0);
         ippc.write32(usb_hw::IP_PW_CTRL0, ctrl0 | usb_hw::CTRL0_IP_SW_RST);
         dsb();
-        delay_us(10);  // Hold reset active
+        delay_us(10);
         ippc.write32(usb_hw::IP_PW_CTRL0, ctrl0 & !usb_hw::CTRL0_IP_SW_RST);
         dsb();
-        delay_ms(1);  // Wait for in-flight DMA to complete (1ms safety margin)
-        logln!("      IP reset complete, DMA quiesced");
+        delay_ms(1);  // Wait for in-flight DMA to complete
 
-        // Step 2: Power down device IP (we only want host mode)
-        logln!("    Step 2: Power down device IP...");
+        // Step 2: Power down device IP (host mode only)
         let ctrl2 = ippc.read32(usb_hw::IP_PW_CTRL2);
         ippc.write32(usb_hw::IP_PW_CTRL2, ctrl2 | usb_hw::CTRL2_IP_DEV_PDN);
         dsb();
 
         // Step 3: Power on host IP
-        logln!("    Step 3: Power on host IP...");
         let ctrl1 = ippc.read32(usb_hw::IP_PW_CTRL1);
-        logln!("      CTRL1 before: 0x{:08x}", ctrl1);
         ippc.write32(usb_hw::IP_PW_CTRL1, ctrl1 & !usb_hw::CTRL1_IP_HOST_PDN);
         dsb();
 
-        // Step 4: Read port configuration from IP_XHCI_CAP
+        // Step 4: Enable ports
         let xhci_cap = ippc.read32(usb_hw::IP_XHCI_CAP);
         let u3_port_num = ((xhci_cap >> 8) & 0xF) as usize;
         let u2_port_num = ((xhci_cap >> 0) & 0xF) as usize;
-        logln!("    Step 4: Port config: {} U3 ports, {} U2 ports", u3_port_num, u2_port_num);
 
-        // Step 5: Enable U3 ports
         for i in 0..u3_port_num.min(4) {
             let offset = usb_hw::U3_CTRL_P0 + (i * 8);
             let ctrl = ippc.read32(offset);
-            let new_ctrl = (ctrl & !(usb_hw::PORT_PDN | usb_hw::PORT_DIS)) | usb_hw::PORT_HOST_SEL;
-            ippc.write32(offset, new_ctrl);
-            logln!("      U3P{}: 0x{:08x} -> 0x{:08x}", i, ctrl, new_ctrl);
+            ippc.write32(offset, (ctrl & !(usb_hw::PORT_PDN | usb_hw::PORT_DIS)) | usb_hw::PORT_HOST_SEL);
         }
-
-        // Step 6: Enable U2 ports
         for i in 0..u2_port_num.min(5) {
             let offset = usb_hw::U2_CTRL_P0 + (i * 8);
             let ctrl = ippc.read32(offset);
-            let new_ctrl = (ctrl & !(usb_hw::PORT_PDN | usb_hw::PORT_DIS)) | usb_hw::PORT_HOST_SEL;
-            ippc.write32(offset, new_ctrl);
-            logln!("      U2P{}: 0x{:08x} -> 0x{:08x}", i, ctrl, new_ctrl);
+            ippc.write32(offset, (ctrl & !(usb_hw::PORT_PDN | usb_hw::PORT_DIS)) | usb_hw::PORT_HOST_SEL);
         }
         dsb();
 
-        // Step 7: Wait for clocks to stabilize
-        // These bits use "bar" notation: 1 = reset deasserted (good), 0 = reset asserted (bad)
-        logln!("    Step 5: Waiting for clock stability...");
+        // Step 5: Wait for clocks to stabilize
         let stable_mask = usb_hw::STS1_SYSPLL_STABLE | usb_hw::STS1_REF_RST |
                           usb_hw::STS1_SYS125_RST | usb_hw::STS1_XHCI_RST;
         let mut stable = false;
-        for _ in 0..200 {  // 200ms timeout
+        for _ in 0..200 {
             delay_ms(1);
-            let sts1 = ippc.read32(usb_hw::IP_PW_STS1);
-            // All bits should be SET when stable (bar signals: 1 = deasserted/stable)
-            if (sts1 & stable_mask) == stable_mask {
+            if (ippc.read32(usb_hw::IP_PW_STS1) & stable_mask) == stable_mask {
                 stable = true;
-                logln!("      STS1: 0x{:08x} - clocks stable", sts1);
                 break;
             }
         }
         if !stable {
-            let sts1 = ippc.read32(usb_hw::IP_PW_STS1);
-            logln!("      [!!] Clock stability timeout, STS1=0x{:08x}", sts1);
-            // Continue anyway - some bits may not be set on all hardware
+            kerror!("bus", "usb_clk_timeout"; sts1 = klog::hex32(ippc.read32(usb_hw::IP_PW_STS1)));
         }
 
-        // Step 8: Now we can access xHCI registers
-        // Read CAPLENGTH to find operational registers
+        // Step 6: Access xHCI registers
         let mac = MmioRegion::new(mac_base);
         let caplength = (mac.read32(usb_hw::CAPLENGTH) & 0xFF) as usize;
-        logln!("    Step 6: xHCI CAPLENGTH=0x{:02x}", caplength);
-
         if caplength == 0 || caplength > 0x40 {
-            logln!("      [!!] Invalid CAPLENGTH, xHCI not accessible");
+            kerror!("bus", "usb_invalid_caplength"; caplength = caplength as u64);
             self.hardware_verified = false;
             return;
         }
 
+        // Step 7: Wait for Controller Not Ready to clear
         let op = MmioRegion::new(mac_base + caplength);
-
-        // Wait for Controller Not Ready to clear
         let mut ready = false;
         for _ in 0..100 {
             delay_ms(1);
-            let sts = op.read32(usb_hw::USBSTS);
-            if (sts & usb_hw::STS_CNR) == 0 {
+            if (op.read32(usb_hw::USBSTS) & usb_hw::STS_CNR) == 0 {
                 ready = true;
                 break;
             }
         }
         if !ready {
-            let sts = op.read32(usb_hw::USBSTS);
-            logln!("      [!!] Controller not ready, USBSTS=0x{:08x}", sts);
+            kerror!("bus", "usb_not_ready"; usbsts = klog::hex32(op.read32(usb_hw::USBSTS)));
             self.hardware_verified = false;
             return;
         }
-        logln!("      Controller ready");
 
-        // Verify final state
-        let verified = self.usb_verify_state(index);
-        self.hardware_verified = verified;
-
-        if verified {
-            logln!("    [OK] USB{}: hardware reset complete, state verified", index);
+        // Verify and power down to safe state
+        self.hardware_verified = self.usb_verify_state(index);
+        if self.hardware_verified {
+            kinfo!("bus", "usb_verified"; port = index as u64, u3 = u3_port_num as u64, u2 = u2_port_num as u64);
         } else {
-            logln!("    [!!] USB{}: reset complete but state NOT verified", index);
+            kerror!("bus", "usb_verify_failed"; index = index as u64);
         }
-
-        // Step 9: Power down to put in safe state
-        // The controller is now in a known-good state.
-        // devd can re-power when it wants to use the controller.
         self.usb_power_down(index);
     }
 
     /// Power down USB controller to put in safe state
-    ///
-    /// This powers down the host IP and all ports, leaving the controller
-    /// in a known safe state where no DMA can occur.
+    /// Powers down host IP and all ports - no DMA can occur.
     fn usb_power_down(&self, index: usize) {
         let mac_base = usb_hw::MAC_BASES[index];
         let ippc = MmioRegion::new(mac_base + usb_hw::IPPC_OFFSET);
 
-        logln!("    Powering down USB{} for safe state...", index);
-
-        // Read port config
         let xhci_cap = ippc.read32(usb_hw::IP_XHCI_CAP);
         let u3_port_num = ((xhci_cap >> 8) & 0xF) as usize;
         let u2_port_num = ((xhci_cap >> 0) & 0xF) as usize;
 
-        // Power down U3 ports
+        // Power down all ports
         for i in 0..u3_port_num.min(4) {
             let offset = usb_hw::U3_CTRL_P0 + (i * 8);
-            let ctrl = ippc.read32(offset);
-            let new_ctrl = ctrl | usb_hw::PORT_PDN;
-            ippc.write32(offset, new_ctrl);
+            ippc.write32(offset, ippc.read32(offset) | usb_hw::PORT_PDN);
         }
-
-        // Power down U2 ports
         for i in 0..u2_port_num.min(5) {
             let offset = usb_hw::U2_CTRL_P0 + (i * 8);
-            let ctrl = ippc.read32(offset);
-            let new_ctrl = ctrl | usb_hw::PORT_PDN;
-            ippc.write32(offset, new_ctrl);
+            ippc.write32(offset, ippc.read32(offset) | usb_hw::PORT_PDN);
         }
         dsb();
 
@@ -1259,8 +1239,6 @@ impl BusController {
         let ctrl1 = ippc.read32(usb_hw::IP_PW_CTRL1);
         ippc.write32(usb_hw::IP_PW_CTRL1, ctrl1 | usb_hw::CTRL1_IP_HOST_PDN);
         dsb();
-
-        logln!("      Host IP powered down");
     }
 
     /// Verify USB controller is in expected state after power-on
@@ -1269,43 +1247,31 @@ impl BusController {
         let mac = MmioRegion::new(mac_base);
         let ippc = MmioRegion::new(mac_base + usb_hw::IPPC_OFFSET);
 
-        // Read capability length
         let caplength = (mac.read32(usb_hw::CAPLENGTH) & 0xFF) as usize;
         if caplength == 0 || caplength > 0x40 {
-            logln!("      [!!] Invalid CAPLENGTH=0x{:02x}", caplength);
+            kerror!("bus", "usb_invalid_caplength"; caplength = caplength as u64);
             return false;
         }
 
         let op = MmioRegion::new(mac_base + caplength);
         let usbsts = op.read32(usb_hw::USBSTS);
 
-        logln!("      USBSTS: 0x{:08x} CNR={} HCE={}",
-               usbsts,
-               if (usbsts & usb_hw::STS_CNR) != 0 { 1 } else { 0 },
-               if (usbsts & usb_hw::STS_HCE) != 0 { 1 } else { 0 });
-
-        // After power-on, controller should be:
-        // - CNR=0 (ready)
-        // - HCE=0 (no error)
+        // After power-on: CNR=0 (ready), HCE=0 (no error)
         if (usbsts & usb_hw::STS_CNR) != 0 {
-            logln!("      [!!] Controller not ready (CNR=1)");
+            kerror!("bus", "usb_cnr_set"; index = index as u64);
             return false;
         }
         if (usbsts & usb_hw::STS_HCE) != 0 {
-            logln!("      [!!] Host controller error (HCE=1)");
+            kerror!("bus", "usb_hce_set"; index = index as u64);
             return false;
         }
-
-        // Check IPPC power status
-        let pw_sts1 = ippc.read32(usb_hw::IP_PW_STS1);
 
         // Verify IP is not in sleep mode
-        if (pw_sts1 & usb_hw::STS1_IP_SLEEP_STS) != 0 {
-            logln!("      [!!] IP is in sleep mode");
+        if (ippc.read32(usb_hw::IP_PW_STS1) & usb_hw::STS1_IP_SLEEP_STS) != 0 {
+            kerror!("bus", "usb_sleep_mode"; index = index as u64);
             return false;
         }
 
-        logln!("      Verification passed");
         true
     }
 
@@ -1349,8 +1315,7 @@ impl BusController {
                     return Err(BusError::Busy);
                 }
 
-                logln!("  Bus {}: reset requested (current state: {:?})",
-                       self.port_name_str(), self.state);
+                kinfo!("bus", "reset_requested"; name = self.port_name_str());
 
                 // Transition to Resetting state
                 self.transition_to(BusState::Resetting, StateChangeReason::ResetRequested);
@@ -1377,8 +1342,7 @@ impl BusController {
                     msg.payload[1], msg.payload[2], msg.payload[3], msg.payload[4]
                 ]);
 
-                logln!("  Bus {}: driver PID set to {} (supervisor PID {:?})",
-                       self.port_name_str(), driver_pid, self.owner_pid);
+                kinfo!("bus", "driver_set"; name = self.port_name_str(), driver_pid = driver_pid as u64);
 
                 self.driver_pid = Some(driver_pid);
 
@@ -1421,16 +1385,12 @@ impl BusController {
         };
 
         if let Err(e) = hw_result {
-            logln!("  Bus {}: FAILED to enable bus mastering for device {:04x}: {:?}",
-                   self.port_name_str(), device_id, e);
+            kerror!("bus", "bm_enable_failed"; name = self.port_name_str(), device = device_id as u64);
             return Err(e);
         }
 
         self.devices[slot].enabled = true;
         self.bus_master_enabled = true;
-
-        logln!("  Bus {}: enabled bus mastering for device {:04x}",
-               self.port_name_str(), device_id);
 
         Ok(())
     }
@@ -1452,15 +1412,12 @@ impl BusController {
             };
 
             if let Err(e) = hw_result {
-                logln!("  Bus {}: FAILED to disable bus mastering for device {:04x}: {:?}",
-                       self.port_name_str(), device_id, e);
+                kerror!("bus", "bm_disable_failed"; name = self.port_name_str(), device = device_id as u64);
+                let _ = e;  // error logged
                 // Continue anyway - we must disable in our tracking
             }
 
             self.devices[slot].enabled = false;
-
-            logln!("  Bus {}: disabled bus mastering for device {:04x}",
-                   self.port_name_str(), device_id);
         }
 
         // Update global flag
@@ -1497,8 +1454,6 @@ impl BusController {
         // For now, we only support the root port itself (bus 0, devfn 0)
         // and immediate children (bus 1, any devfn)
         if bus_num > 1 {
-            logln!("    PCIe{}: device {:04x} not on root or secondary bus, skipping",
-                   index, device_id);
             // We allow this - driver can manage downstream devices
             return Ok(());
         }
@@ -1527,14 +1482,10 @@ impl BusController {
             // Verify
             let verify = cfg.read16(cmd_offset);
             if (verify & pcie_hw::CMD_BUS_MASTER != 0) != enable {
-                logln!("    PCIe{}: bus mastering {} FAILED (cmd=0x{:04x})",
-                       index, if enable { "enable" } else { "disable" }, verify);
+                kerror!("bus", "pcie_bm_verify_failed"; index = index as u64, cmd = verify as u64);
                 return Err(BusError::HardwareError);
             }
         }
-
-        logln!("    PCIe{}: device {:04x} bus mastering {} (cmd 0x{:04x} -> 0x{:04x})",
-               index, device_id, if enable { "enabled" } else { "disabled" }, current, new_cmd);
 
         Ok(())
     }
@@ -1551,8 +1502,6 @@ impl BusController {
 
         // Disable on first device behind root port (bus 1, device 0)
         let _ = self.pcie_set_bus_mastering(0x0100, false);
-
-        logln!("    PCIe{}: disabled bus mastering on all known devices", index);
     }
 
     // =========================================================================
@@ -1583,9 +1532,6 @@ impl BusController {
             // If allowing, driver will set Run/Stop when ready
         }
 
-        logln!("    USB{}: device {:04x} DMA {}",
-               index, device_id, if allow { "allowed" } else { "revoked" });
-
         Ok(())
     }
 
@@ -1606,7 +1552,6 @@ impl BusController {
         // Check if already halted
         let usbsts = op.read32(usb_hw::USBSTS);
         if (usbsts & usb_hw::STS_HCH) != 0 {
-            logln!("    USB{}: already halted", index);
             return Ok(());
         }
 
@@ -1620,12 +1565,11 @@ impl BusController {
             delay_ms(1);
             let sts = op.read32(usb_hw::USBSTS);
             if (sts & usb_hw::STS_HCH) != 0 {
-                logln!("    USB{}: force halted", index);
                 return Ok(());
             }
         }
 
-        logln!("    USB{}: force halt FAILED", index);
+        kerror!("bus", "usb_force_halt_failed"; index = index as u64);
         Err(BusError::HardwareError)
     }
 
@@ -1702,25 +1646,12 @@ impl BusRegistry {
             // Check if this is the supervisor (devd)
             // If so, trigger full disconnect
             else if bus.owner_pid == Some(pid) {
-                logln!("  Bus {}: owner PID {} exited, triggering disconnect",
-                       bus.port_name_str(), pid);
+                kinfo!("bus", "owner_exit"; name = bus.port_name_str(), pid = pid as u64);
                 bus.handle_disconnect(StateChangeReason::OwnerCrashed);
             }
         }
     }
 
-    /// Print registry info
-    pub fn print_info(&self) {
-        logln!("  Bus controllers:");
-        for bus in self.buses[..self.bus_count].iter() {
-            logln!("    {} state={:?} owner={:?} driver={:?} verified={}",
-                   bus.port_name_str(),
-                   bus.state,
-                   bus.owner_pid,
-                   bus.driver_pid,
-                   bus.hardware_verified);
-        }
-    }
 }
 
 // =============================================================================
@@ -1792,72 +1723,35 @@ pub fn with_bus_registry<R, F: FnOnce(&mut BusRegistry) -> R>(f: F) -> R {
 /// 3. Verifies hardware is in expected state
 /// 4. Registers control ports for devd to connect
 pub fn init(kernel_pid: Pid) {
-    logln!("Initializing bus controllers...");
-
     with_bus_registry(|registry| {
         // PCIe ports - MT7988A has 4 PCIe ports
-        // All 4 are present in DTB, pcie3 hosts M.2 NVMe slot
         for i in 0..4u8 {
             if let Some(bus) = registry.add(BusType::PCIe, i) {
-                logln!("  Initializing {}...", bus.port_name_str());
-
-                // Perform initial hardware reset and verify
                 bus.perform_hardware_reset();
-
                 if !bus.hardware_verified {
-                    logln!("    [!!] {} hardware verification failed", bus.port_name_str());
+                    kerror!("bus", "hw_verify_failed"; name = bus.port_name_str());
                 }
-
-                if let Err(e) = bus.register_port(kernel_pid) {
-                    logln!("    [!!] Failed to register {}: {:?}", bus.port_name_str(), e);
-                }
-
-                // Flush after each bus (timer not running yet during early boot)
-                crate::kernel::log::flush();
+                let _ = bus.register_port(kernel_pid);
             }
         }
 
         // USB controllers - MT7988A has 2 SSUSB controllers
         for i in 0..2u8 {
             if let Some(bus) = registry.add(BusType::Usb, i) {
-                logln!("  Initializing {}...", bus.port_name_str());
-
-                // Perform initial hardware reset and verify
                 bus.perform_hardware_reset();
-
                 if !bus.hardware_verified {
-                    logln!("    [!!] {} hardware verification failed", bus.port_name_str());
+                    kerror!("bus", "hw_verify_failed"; name = bus.port_name_str());
                 }
-
-                if let Err(e) = bus.register_port(kernel_pid) {
-                    logln!("    [!!] Failed to register {}: {:?}", bus.port_name_str(), e);
-                }
-
-                // Flush after each bus (timer not running yet during early boot)
-                crate::kernel::log::flush();
+                let _ = bus.register_port(kernel_pid);
             }
         }
 
-        // Platform pseudo-bus - for uart, gpio, i2c, spi, etc.
+        // Platform pseudo-bus
         if let Some(bus) = registry.add(BusType::Platform, 0) {
-            logln!("  Initializing {}...", bus.port_name_str());
-
-            // Platform bus is always verified (no hardware reset needed)
             bus.perform_hardware_reset();
-
-            if let Err(e) = bus.register_port(kernel_pid) {
-                logln!("    [!!] Failed to register {}: {:?}", bus.port_name_str(), e);
-            }
-
-            crate::kernel::log::flush();
+            let _ = bus.register_port(kernel_pid);
         }
-
-        logln!("");
-        logln!("  Bus controller summary:");
-        registry.print_info();
     });
-
-    logln!("  Bus controllers initialized");
 }
 
 /// Handle process cleanup (called when a process exits)
@@ -1865,6 +1759,31 @@ pub fn process_cleanup(pid: Pid) {
     with_bus_registry(|registry| {
         registry.process_cleanup(pid);
     });
+}
+
+/// Reset all buses to Safe state (for devd restart)
+/// This is called when devd crashes and needs to be restarted.
+/// All hardware is reset and put in safe state so devd can claim buses again.
+pub fn reset_all_buses() {
+    kinfo!("bus", "reset_all_start");
+    with_bus_registry(|registry| {
+        for bus in registry.iter_mut() {
+            // Clear ownership
+            bus.owner_channel = None;
+            bus.owner_pid = None;
+            bus.driver_pid = None;
+
+            // Perform hardware reset sequence
+            bus.perform_hardware_reset();
+
+            // Transition to Safe state
+            bus.state = BusState::Safe;
+            bus.state_entered_at = uptime_ms();
+
+            kinfo!("bus", "reset_ok"; name = bus.port_name_str());
+        }
+    });
+    kinfo!("bus", "reset_all_complete");
 }
 
 /// Handle port_connect for kernel bus ports
@@ -1911,7 +1830,6 @@ pub fn process_bus_message(client_channel: ChannelId, data: &[u8]) {
     });
 
     let Some(server_ch) = server_channel else {
-        logln!("  process_bus_message: no peer for channel {}", client_channel);
         return;
     };
 
@@ -1926,12 +1844,12 @@ pub fn process_bus_message(client_channel: ChannelId, data: &[u8]) {
 
                 // Process the message
                 if let Err(e) = bus.handle_message(&msg) {
-                    logln!("  Bus {}: message error: {:?}", bus.port_name_str(), e);
+                    kerror!("bus", "message_error"; name = bus.port_name_str());
+                    let _ = e;  // error logged
                 }
                 return;
             }
         }
-        logln!("  process_bus_message: no bus owns channel {}", server_ch);
     });
 }
 
@@ -1958,7 +1876,7 @@ pub fn get_bus_count() -> usize {
 
 /// Test bus controller state machine
 pub fn test() {
-    logln!("  Testing bus controller...");
+    print_direct!("  Testing bus controller...\n");
 
     let mut bus = BusController::new();
     bus.init(BusType::PCIe, 0);
@@ -1979,5 +1897,5 @@ pub fn test() {
     assert!(bus.state == BusState::Safe);
     assert!(bus.check_invariants());
 
-    logln!("    [OK] Bus controller test passed");
+    print_direct!("    [OK] Bus controller test passed\n");
 }

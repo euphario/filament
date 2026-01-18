@@ -3,8 +3,9 @@
 # Creates kernel.bin ready for loading via U-Boot xmodem
 #
 # Usage:
-#   ./build.sh           # Normal build (no self-tests)
-#   ./build.sh --test    # Build with self-tests enabled
+#   ./build.sh                    # Normal build, firmware via USB
+#   ./build.sh --test             # Build with self-tests enabled
+#   ./build.sh --with-firmware    # Embed MT7996 firmware in initrd (~3MB larger)
 
 set -e
 
@@ -14,14 +15,26 @@ cd "$SCRIPT_DIR"
 # Parse arguments
 FEATURES=""
 BUILD_TYPE="Production"
-if [ "$1" = "--test" ] || [ "$1" = "-t" ]; then
-    FEATURES="--features selftest"
-    BUILD_TYPE="Development (with self-tests)"
-fi
+INITRD_OPTS=""
+FIRMWARE_MODE="USB (fatfs)"
+
+for arg in "$@"; do
+    case "$arg" in
+        --test|-t)
+            FEATURES="--features selftest"
+            BUILD_TYPE="Development (with self-tests)"
+            ;;
+        --with-firmware)
+            INITRD_OPTS="--with-firmware"
+            FIRMWARE_MODE="Embedded"
+            ;;
+    esac
+done
 
 echo "========================================"
 echo "  BPI-R4 Kernel Build"
 echo "  Mode: $BUILD_TYPE"
+echo "  Firmware: $FIRMWARE_MODE"
 echo "========================================"
 echo
 
@@ -47,10 +60,7 @@ echo "Step 1: Building user programs..."
 echo
 
 # Step 2: Create initrd
-# Use --with-firmware to embed firmware (adds ~3MB)
-# Without it, firmware loads from USB via fatfs
 echo "Step 2: Creating initrd..."
-INITRD_OPTS="${INITRD_OPTS:-}"
 (cd user && ./mkinitrd.sh $INITRD_OPTS)
 echo
 
@@ -78,10 +88,18 @@ if [ -f bpi-r4.dtb ]; then
     echo "  bpi-r4.dtb: $DTB_SIZE (standalone copy)"
 fi
 echo
-echo "To load via U-Boot:"
+echo "To load via U-Boot (Xmodem - slow but reliable):"
 echo "  1. loady 0x46000000"
 echo "  2. (send kernel.bin via xmodem)"
 echo "  3. go 0x46000000"
+echo
+echo "To load via U-Boot (USB - fast):"
+echo "  1. Copy kernel.bin to USB drive (FAT32)"
+echo "  2. Insert USB drive into BPI-R4"
+echo "  3. Run these commands:"
+echo "     usb start"
+echo "     fatload usb 0:1 0x46000000 kernel.bin"
+echo "     go 0x46000000"
 echo
 echo "DTB is embedded in kernel.bin - no separate loading needed."
 echo

@@ -3,7 +3,10 @@
 //! Parses the device tree blob passed from U-Boot to discover hardware.
 //! FDT format: https://devicetree-specification.readthedocs.io/
 
-use crate::{print, println};
+// For device tree dump (visual/structured output), we use direct UART output
+// For status/error messages, we use structured klog
+
+use crate::{kinfo, kwarn, kerror, kdebug, print_direct};
 
 /// FDT magic number (big-endian)
 const FDT_MAGIC: u32 = 0xd00dfeed;
@@ -61,7 +64,7 @@ impl Fdt {
         let magic = be32(header.magic);
 
         if magic != FDT_MAGIC {
-            println!("[fdt] Bad magic: 0x{:08x} (expected 0x{:08x})", magic, FDT_MAGIC);
+            kerror!("fdt", "bad_magic"; got = crate::klog::hex32(magic), expected = crate::klog::hex32(FDT_MAGIC));
             return None;
         }
 
@@ -70,9 +73,7 @@ impl Fdt {
         let off_dt_strings = be32(header.off_dt_strings);
         let version = be32(header.version);
 
-        println!("[fdt] Embedded device tree");
-        println!("[fdt]   Version: {}", version);
-        println!("[fdt]   Total size: {} bytes", totalsize);
+        kinfo!("fdt", "parsed"; source = "embedded", version = version, size = totalsize);
 
         let struct_base = unsafe { base.add(off_dt_struct as usize) };
         let strings_base = unsafe { base.add(off_dt_strings as usize) };
@@ -89,7 +90,7 @@ impl Fdt {
     /// Returns None if magic doesn't match or address is invalid
     pub fn parse(phys_addr: u64) -> Option<Self> {
         if phys_addr == 0 || phys_addr < 0x40000000 {
-            println!("[fdt] Invalid DTB address: 0x{:x}", phys_addr);
+            kwarn!("fdt", "invalid_addr"; addr = crate::klog::hex64(phys_addr));
             return None;
         }
 
@@ -102,7 +103,7 @@ impl Fdt {
         let magic = be32(header.magic);
 
         if magic != FDT_MAGIC {
-            println!("[fdt] Bad magic: 0x{:08x} (expected 0x{:08x})", magic, FDT_MAGIC);
+            kerror!("fdt", "bad_magic"; got = crate::klog::hex32(magic), expected = crate::klog::hex32(FDT_MAGIC));
             return None;
         }
 
@@ -111,9 +112,7 @@ impl Fdt {
         let off_dt_strings = be32(header.off_dt_strings);
         let version = be32(header.version);
 
-        println!("[fdt] Found device tree at 0x{:x}", phys_addr);
-        println!("[fdt]   Version: {}", version);
-        println!("[fdt]   Total size: {} bytes", totalsize);
+        kinfo!("fdt", "parsed"; source = "memory", addr = crate::klog::hex64(phys_addr), version = version, size = totalsize);
 
         let struct_base = unsafe { base.add(off_dt_struct as usize) };
         let strings_base = unsafe { base.add(off_dt_strings as usize) };
@@ -143,12 +142,12 @@ impl Fdt {
         be32(unsafe { *ptr })
     }
 
-    /// Dump the entire device tree
+    /// Dump the entire device tree (visual output to UART)
     pub fn dump(&self) {
-        println!();
-        println!("========================================");
-        println!("  Device Tree Dump");
-        println!("========================================");
+        // Device tree dump uses direct UART output (visual diagnostic)
+        print_direct!("\r\n========================================\r\n");
+        print_direct!("  Device Tree Dump\r\n");
+        print_direct!("========================================\r\n");
 
         let mut offset: usize = 0;
         let mut depth: usize = 0;
@@ -170,12 +169,12 @@ impl Fdt {
 
                     // Print with indentation
                     for _ in 0..depth {
-                        print!("  ");
+                        print_direct!("  ");
                     }
                     if name.is_empty() {
-                        println!("/");
+                        print_direct!("/\r\n");
                     } else {
-                        println!("{}/", name);
+                        print_direct!("{}/\r\n", name);
                     }
 
                     // Align to next 4-byte boundary
@@ -199,41 +198,41 @@ impl Fdt {
 
                     // Print property with indentation
                     for _ in 0..depth {
-                        print!("  ");
+                        print_direct!("  ");
                     }
 
                     if len == 0 {
-                        println!("  {} (empty)", prop_name);
+                        print_direct!("  {} (empty)\r\n", prop_name);
                     } else if len == 4 {
                         // Likely a u32
                         let val = self.read_u32(offset);
-                        println!("  {} = <0x{:x}>", prop_name, val);
+                        print_direct!("  {} = <0x{:x}>\r\n", prop_name, val);
                     } else if len == 8 {
                         // Likely a u64 (reg or ranges)
                         let hi = self.read_u32(offset);
                         let lo = self.read_u32(offset + 4);
-                        println!("  {} = <0x{:x} 0x{:x}>", prop_name, hi, lo);
+                        print_direct!("  {} = <0x{:x} 0x{:x}>\r\n", prop_name, hi, lo);
                     } else if self.is_printable_string(offset, len) {
                         // String property
                         let val_ptr = unsafe { self.struct_base.add(offset) };
                         let val_slice = unsafe { core::slice::from_raw_parts(val_ptr, len.saturating_sub(1)) };
                         let val = core::str::from_utf8(val_slice).unwrap_or("<invalid>");
-                        println!("  {} = \"{}\"", prop_name, val);
+                        print_direct!("  {} = \"{}\"\r\n", prop_name, val);
                     } else {
                         // Binary data - show first few bytes
-                        print!("  {} = [", prop_name);
+                        print_direct!("  {} = [", prop_name);
                         let show = len.min(16);
                         for i in 0..show {
                             let b = unsafe { *self.struct_base.add(offset + i) };
-                            print!("{:02x}", b);
+                            print_direct!("{:02x}", b);
                             if i < show - 1 {
-                                print!(" ");
+                                print_direct!(" ");
                             }
                         }
                         if len > 16 {
-                            print!("...");
+                            print_direct!("...");
                         }
-                        println!("] ({} bytes)", len);
+                        print_direct!("] ({} bytes)\r\n", len);
                     }
 
                     // Align to next 4-byte boundary
@@ -245,20 +244,19 @@ impl Fdt {
                 }
 
                 FDT_END => {
-                    println!();
-                    println!("[fdt] End of device tree");
+                    kdebug!("fdt", "dump_complete");
                     break;
                 }
 
                 _ => {
-                    println!("[fdt] Unknown token 0x{:x} at offset {}", token, offset - 4);
+                    kwarn!("fdt", "unknown_token"; token = crate::klog::hex32(token), offset = offset as u64 - 4);
                     break;
                 }
             }
 
             // Safety check
             if offset > self.totalsize as usize {
-                println!("[fdt] Walked past end of DTB!");
+                kerror!("fdt", "walk_overflow");
                 break;
             }
         }
@@ -310,8 +308,7 @@ fn find_dtb() -> Option<u64> {
             let header = unsafe { &*(virt as *const FdtHeader) };
             let totalsize = be32(header.totalsize);
             if totalsize > 0x100 && totalsize < 0x100000 {
-                println!("[fdt] Found DTB at known address 0x{:08x} (size: {} bytes)",
-                         addr, totalsize);
+                kinfo!("fdt", "found_known"; addr = crate::klog::hex64(addr), size = totalsize);
                 return Some(addr);
             }
         }
@@ -319,11 +316,10 @@ fn find_dtb() -> Option<u64> {
 
     // Full scan
     let mut addr = DTB_SCAN_START;
-    let mut found_count = 0;
+    let mut found_count = 0u32;
     let mut first_found: Option<u64> = None;
 
-    println!("[fdt] Scanning 0x{:x}-0x{:x} for DTB magic...",
-             DTB_SCAN_START, DTB_SCAN_END);
+    kdebug!("fdt", "scan_start"; from = crate::klog::hex64(DTB_SCAN_START), to = crate::klog::hex64(DTB_SCAN_END));
 
     while addr < DTB_SCAN_END {
         // Skip our kernel region (0x46000000-0x47000000)
@@ -342,7 +338,7 @@ fn find_dtb() -> Option<u64> {
             let totalsize = be32(header.totalsize);
 
             if totalsize > 0x100 && totalsize < 0x100000 {
-                println!("[fdt] Found DTB at 0x{:08x} (size: {} bytes)", addr, totalsize);
+                kdebug!("fdt", "found_scan"; addr = crate::klog::hex64(addr), size = totalsize);
                 found_count += 1;
                 if first_found.is_none() {
                     first_found = Some(addr);
@@ -353,37 +349,34 @@ fn find_dtb() -> Option<u64> {
         addr += DTB_SCAN_STEP;
     }
 
-    println!("[fdt] Scan complete: found {} DTB(s)", found_count);
+    kdebug!("fdt", "scan_complete"; count = found_count);
     first_found
 }
 
-/// Initialize and dump the device tree
+/// Initialize the device tree (parse only, no dump)
 pub fn init() {
     // First check for embedded DTB (compiled into kernel)
     if let Some(dtb_data) = crate::dtb::get_embedded_dtb() {
-        println!("[fdt] Using embedded DTB ({} bytes)", dtb_data.len());
-        if let Some(fdt) = Fdt::parse_from_ptr(dtb_data.as_ptr()) {
-            fdt.dump();
+        kinfo!("fdt", "using_embedded"; size = dtb_data.len());
+        if Fdt::parse_from_ptr(dtb_data.as_ptr()).is_some() {
             return;
         }
     }
 
     // Try address from U-Boot (only valid with booti, not go)
     let boot_dtb = get_dtb_address();
-    println!("[fdt] DTB address from boot: 0x{:x}", boot_dtb);
-    if let Some(fdt) = Fdt::parse(boot_dtb) {
-        fdt.dump();
+    kdebug!("fdt", "boot_addr"; addr = crate::klog::hex64(boot_dtb));
+    if Fdt::parse(boot_dtb).is_some() {
         return;
     }
 
     // Fallback: scan known locations for DTB magic
-    println!("[fdt] Scanning for DTB at known addresses...");
+    kdebug!("fdt", "scanning");
     if let Some(addr) = find_dtb() {
-        if let Some(fdt) = Fdt::parse(addr) {
-            fdt.dump();
+        if Fdt::parse(addr).is_some() {
             return;
         }
     }
 
-    println!("[fdt] No device tree found");
+    kwarn!("fdt", "not_found");
 }

@@ -6,7 +6,7 @@
 #![allow(dead_code)]  // SMP infrastructure for future multi-core support
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
-use crate::logln;
+use crate::{kinfo, kwarn, kdebug};
 
 /// Maximum number of CPUs supported
 pub const MAX_CPUS: usize = 4;
@@ -204,13 +204,13 @@ pub fn cpu_affinity_info(cpu: u32) -> i32 {
 /// Initialize SMP - called from primary CPU
 pub fn init() {
     let cpu = cpu_id();
-    logln!("  Primary CPU: {}", cpu);
+    kdebug!("smp", "init"; primary_cpu = cpu as u64);
 
     // Check PSCI version
     if let Some((major, minor)) = psci_version() {
-        logln!("  PSCI version: {}.{}", major, minor);
+        kinfo!("smp", "psci_version"; major = major as u64, minor = minor as u64);
     } else {
-        logln!("  PSCI not available (may be in EL1 without EL2/EL3)");
+        kwarn!("smp", "psci_unavailable");
     }
 
     // Initialize primary CPU's per-CPU data
@@ -218,17 +218,17 @@ pub fn init() {
         if let Some(pcpu) = get_cpu_mut(cpu) {
             pcpu.stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
             pcpu.set_state(CpuState::Online);
-            logln!("  CPU {} online", cpu);
+            kinfo!("smp", "cpu_online"; cpu = cpu as u64);
         } else {
-            logln!("  [!!] CPU {} init failed - invalid CPU ID", cpu);
+            kwarn!("smp", "cpu_init_failed"; cpu = cpu as u64);
         }
     }
 }
 
 /// Secondary CPU entry point (called from assembly)
 #[no_mangle]
-pub extern "C" fn secondary_cpu_entry(cpu_id: u64) {
-    let cpu = cpu_id as u32;
+pub extern "C" fn secondary_cpu_entry(cpu_id_arg: u64) {
+    let cpu = cpu_id_arg as u32;
 
     // Mark CPU as online
     unsafe {
@@ -247,7 +247,7 @@ pub extern "C" fn secondary_cpu_entry(cpu_id: u64) {
         core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) ctl);
     }
 
-    logln!("  CPU {} online", cpu);
+    kinfo!("smp", "cpu_online"; cpu = cpu as u64);
 
     // Enter idle loop - scheduler will assign tasks
     loop {
@@ -269,7 +269,7 @@ pub extern "C" fn secondary_cpu_entry(cpu_id: u64) {
 /// Start secondary CPUs
 pub fn start_secondary_cpus() {
     let primary = cpu_id();
-    logln!("  Starting secondary CPUs from CPU {}...", primary);
+    kdebug!("smp", "starting_secondary"; primary = primary as u64);
 
     // Get the physical address of secondary_start from boot.S
     extern "C" {
@@ -289,7 +289,7 @@ pub fn start_secondary_cpus() {
                 pcpu.set_state(CpuState::Starting);
                 true
             } else {
-                logln!("    [!!] CPU {} has invalid ID, skipping", cpu);
+                kwarn!("smp", "invalid_cpu_id"; cpu = cpu as u64);
                 false
             }
         };
@@ -303,20 +303,20 @@ pub fn start_secondary_cpus() {
         // Try to wake CPU via PSCI
         match cpu_on(cpu, entry, cpu as u64) {
             Ok(()) => {
-                logln!("    CPU {} start requested", cpu);
+                kdebug!("smp", "cpu_start_requested"; cpu = cpu as u64);
             }
             Err(psci::ALREADY_ON) => {
-                logln!("    CPU {} already on", cpu);
+                kdebug!("smp", "cpu_already_on"; cpu = cpu as u64);
             }
             Err(psci::NOT_SUPPORTED) => {
                 // PSCI not available, try sending event
-                logln!("    CPU {} PSCI not supported, sending SEV", cpu);
+                kdebug!("smp", "psci_not_supported_sev"; cpu = cpu as u64);
                 unsafe {
                     core::arch::asm!("sev");
                 }
             }
             Err(e) => {
-                logln!("    CPU {} start failed: {}", cpu, e);
+                kwarn!("smp", "cpu_start_failed"; cpu = cpu as u64, err = e as i64);
             }
         }
     }
@@ -327,15 +327,15 @@ pub fn start_secondary_cpus() {
     }
 
     // Report status
-    let mut online = 0;
+    let mut online_count = 0u32;
     for cpu in 0..MAX_CPUS as u32 {
         if let Some(pcpu) = get_cpu(cpu) {
             if pcpu.get_state() == CpuState::Online {
-                online += 1;
+                online_count += 1;
             }
         }
     }
-    logln!("  {} CPUs online", online);
+    kinfo!("smp", "cpus_online"; count = online_count as u64);
 }
 
 /// Get number of online CPUs
@@ -414,10 +414,10 @@ impl Drop for SpinLockGuard<'_> {
 
 /// Test SMP functionality
 pub fn test() {
-    logln!("  Testing SMP...");
+    kdebug!("smp", "test_start");
 
     let cpu = cpu_id();
-    logln!("    Current CPU: {}", cpu);
+    kdebug!("smp", "current_cpu"; cpu = cpu as u64);
 
     // Test spinlock
     static TEST_LOCK: SpinLock = SpinLock::new();
@@ -427,10 +427,12 @@ pub fn test() {
         let _guard = SpinLockGuard::new(&TEST_LOCK);
         TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     }
-    logln!("    Spinlock test: counter = {}", TEST_COUNTER.load(Ordering::Relaxed));
+    let counter = TEST_COUNTER.load(Ordering::Relaxed);
+    kdebug!("smp", "spinlock_test"; counter = counter as u64);
 
     // Show online CPUs
-    logln!("    Online CPUs: {}", online_cpus());
+    let online = online_cpus();
+    kdebug!("smp", "online_cpus"; count = online as u64);
 
-    logln!("    [OK] SMP test passed");
+    kinfo!("smp", "test_ok");
 }

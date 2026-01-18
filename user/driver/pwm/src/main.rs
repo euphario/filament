@@ -12,7 +12,7 @@
 #![no_main]
 #![allow(dead_code)]  // PWM constants for different channels
 
-use userlib::{println, syscall, MmioRegion};
+use userlib::{syscall, MmioRegion, uinfo, uwarn, uerror};
 
 // =============================================================================
 // MT7988 PWM Controller
@@ -101,30 +101,12 @@ impl PwmDriver {
     /// However, the bootloader (U-Boot) may have already configured this,
     /// and the pinctrl might need additional setup in other iocfg regions.
     fn configure_pinmux(&mut self) -> bool {
-        println!("  Configuring GPIO62 for PWM6...");
-
-        // Try multiple GPIO mode register offsets based on different interpretations
-        // of the PIN_FIELD macro parameters
-
         // Standard 8-pins-per-register layout: offset = 0x300 + (pin/8)*4
         // Pin 62: register 7 at offset 0x31C, bits [27:24]
         let mode_offset_v1 = GPIO_MODE_BASE + (62 / 8) * 4;  // 0x31C
 
-        // Alternative with 0x10 stride per register group
-        // This would be 0x300 + (pin/8)*0x10 for some interpretations
-        let mode_offset_v2 = GPIO_MODE_BASE + (62 / 8) * 0x10;  // 0x370
-
-        // Read both to see which one has meaningful data
+        // Read current value
         let mode_v1 = self.pinctrl.read32(mode_offset_v1);
-        let mode_v2 = self.pinctrl.read32(mode_offset_v2);
-
-        println!("    GPIO mode reg 0x{:03x}: 0x{:08x}", mode_offset_v1, mode_v1);
-        println!("    GPIO mode reg 0x{:03x}: 0x{:08x}", mode_offset_v2, mode_v2);
-
-        // Also check IOCFG regions which might control higher GPIOs
-        // iocfg_rb at 0x11d20000 might control GPIO62
-        // (Can't map this without another MmioRegion, so just note it)
-        println!("    Note: GPIO62 might be controlled by iocfg_rb at 0x11d20000");
 
         // Try writing to the standard offset
         let bit_shift = (62 % 8) * 4;  // 24
@@ -135,48 +117,40 @@ impl PwmDriver {
 
         // Verify
         let verify = self.pinctrl.read32(mode_offset_v1);
-        println!("    GPIO mode reg after: 0x{:08x}", verify);
 
         if verify == new_mode && verify != mode_v1 {
-            println!("    GPIO62 configured for PWM6");
+            uinfo!("pwm", "pinmux_configured"; gpio = 62u64);
             true
         } else {
-            println!("    WARNING: GPIO mode register unchanged");
-            println!("    Bootloader may have pre-configured, or different region needed");
-            // Continue anyway - PWM might still work
+            uwarn!("pwm", "pinmux_unchanged"; gpio = 62u64);
+            // Continue anyway - PWM might still work (bootloader may have pre-configured)
             true
         }
     }
 
     /// Initialize PWM6 for fan control
     fn init_pwm(&mut self) -> bool {
-        println!("  Initializing PWM6...");
-
         let ch_off = self.channel_offset(FAN_PWM_CHANNEL);
 
         // Enable PWM6 in global enable register
         let en = self.pwm.read32(PWM_EN);
         self.pwm.write32(PWM_EN, en | (1 << FAN_PWM_CHANNEL));
-        println!("    PWM enable: 0x{:08x} -> 0x{:08x}", en, self.pwm.read32(PWM_EN));
 
         // Configure PWMCON: old mode, clock divider = 0 (no division)
         // Old mode uses PWMDWIDTH/PWMTHRES for period/duty
         let pwmcon = pwmcon::OLD_MODE | 0;  // divider = 0
         self.pwm.write32(ch_off + pwm_reg::PWMCON, pwmcon);
-        println!("    PWMCON: 0x{:08x}", self.pwm.read32(ch_off + pwm_reg::PWMCON));
 
         // Set period (max 13 bits = 8191)
         // Use 4096 for easy percentage calculation
         self.period = 4096;
         self.pwm.write32(ch_off + pwm_reg::PWMDWIDTH, self.period);
-        println!("    PWMDWIDTH (period): {}", self.pwm.read32(ch_off + pwm_reg::PWMDWIDTH));
 
         // Set initial duty to 0 (fan off)
         self.duty = 0;
         self.pwm.write32(ch_off + pwm_reg::PWMTHRES, 0);
-        println!("    PWMTHRES (duty): {}", self.pwm.read32(ch_off + pwm_reg::PWMTHRES));
 
-        println!("    PWM6 initialized");
+        uinfo!("pwm", "channel_ready"; channel = FAN_PWM_CHANNEL as u64);
         true
     }
 
@@ -215,47 +189,33 @@ const PWM_CMD_GET_FAN: u8 = 2;    // Get fan speed: [2] -> [percent]
 
 #[unsafe(no_mangle)]
 fn main() {
-    println!("========================================");
-    println!("  PWM Fan Driver");
-    println!("  MT7988 PWM6 on GPIO62");
-    println!("========================================");
-    println!();
+    uinfo!("pwm", "init_start");
 
     // Register the "pwm" port
     let port_result = syscall::port_register(b"pwm");
     if port_result < 0 {
         if port_result == -17 {  // EEXIST
-            println!("ERROR: PWM driver already running");
+            uerror!("pwm", "port_exists");
         } else {
-            println!("ERROR: Failed to register PWM port: {}", port_result);
+            uerror!("pwm", "port_register_failed"; err = port_result as i64);
         }
         syscall::exit(1);
     }
     let listen_channel = port_result as u32;
-    println!("  Registered 'pwm' port (channel {})", listen_channel);
 
     // Open MMIO regions
-    println!();
-    println!("=== Opening MMIO Regions ===");
-
     let pwm_mmio = match MmioRegion::open(PWM_BASE, PWM_SIZE) {
-        Some(m) => {
-            println!("  PWM controller: 0x{:08x}", m.virt_base());
-            m
-        }
+        Some(m) => m,
         None => {
-            println!("ERROR: Failed to map PWM controller");
+            uerror!("pwm", "mmio_map_failed"; region = "pwm");
             syscall::exit(1);
         }
     };
 
     let pinctrl_mmio = match MmioRegion::open(PINCTRL_BASE, PINCTRL_SIZE) {
-        Some(m) => {
-            println!("  Pinctrl: 0x{:08x}", m.virt_base());
-            m
-        }
+        Some(m) => m,
         None => {
-            println!("ERROR: Failed to map pinctrl");
+            uerror!("pwm", "mmio_map_failed"; region = "pinctrl");
             syscall::exit(1);
         }
     };
@@ -264,36 +224,20 @@ fn main() {
     let mut pwm = PwmDriver::new(pwm_mmio, pinctrl_mmio);
 
     // Configure pinmux
-    println!();
-    println!("=== Configuring Pinmux ===");
     if !pwm.configure_pinmux() {
-        println!("WARNING: Pinmux configuration failed, continuing anyway");
+        uwarn!("pwm", "pinmux_failed");
     }
 
     // Initialize PWM
-    println!();
-    println!("=== Initializing PWM ===");
     if !pwm.init_pwm() {
-        println!("ERROR: PWM initialization failed");
+        uerror!("pwm", "init_failed");
         syscall::exit(1);
     }
 
-    // Set initial fan speed to 100% to test
-    println!();
-    println!("=== Setting Initial Fan Speed ===");
+    // Set initial fan speed to 100%
     pwm.set_fan_speed(100);
-    println!("  Fan speed set to 100% (for testing)");
 
-    // Read back PWM registers to verify
-    let ch_off = pwm.channel_offset(FAN_PWM_CHANNEL);
-    println!("  PWM6 PWMCON: 0x{:08x}", pwm.pwm.read32(ch_off + pwm_reg::PWMCON));
-    println!("  PWM6 PWMDWIDTH: {}", pwm.pwm.read32(ch_off + pwm_reg::PWMDWIDTH));
-    println!("  PWM6 PWMTHRES: {}", pwm.pwm.read32(ch_off + pwm_reg::PWMTHRES));
-
-    println!();
-    println!("========================================");
-    println!("  PWM Fan driver initialized!");
-    println!("========================================");
+    uinfo!("pwm", "init_complete"; channel = listen_channel as u64);
 
     // Main loop - handle IPC requests (devd supervises us, no need to daemonize)
     let mut msg_buf = [0u8; 16];

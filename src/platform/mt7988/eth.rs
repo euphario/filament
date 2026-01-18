@@ -6,7 +6,7 @@
 //! This is a minimal driver for basic packet TX/RX.
 
 use crate::arch::aarch64::mmio::{MmioRegion, dsb};
-use crate::logln;
+use crate::{kdebug, kinfo, klog};
 
 /// Ethernet frame constants
 pub const ETH_FRAME_MIN: usize = 64;
@@ -193,7 +193,7 @@ impl EthDriver {
 
     /// Initialize the ethernet controller
     pub fn init(&mut self) -> Result<(), &'static str> {
-        logln!("    Initializing MT7988 Ethernet...");
+        kdebug!("eth", "init_start");
 
         // Reset frame engine
         self.fe.write32(regs::FE_RST_GL, 0x1);
@@ -214,10 +214,12 @@ impl EthDriver {
         self.enable_dma();
 
         self.initialized = true;
-        logln!("    [OK] Ethernet initialized");
-        logln!("    MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.mac_addr.0[0], self.mac_addr.0[1], self.mac_addr.0[2],
-            self.mac_addr.0[3], self.mac_addr.0[4], self.mac_addr.0[5]);
+
+        // Format MAC address as hex values
+        let mac = &self.mac_addr.0;
+        let mac_hi = ((mac[0] as u32) << 16) | ((mac[1] as u32) << 8) | (mac[2] as u32);
+        let mac_lo = ((mac[3] as u32) << 16) | ((mac[4] as u32) << 8) | (mac[5] as u32);
+        kinfo!("eth", "init_ok"; mac_hi = klog::hex32(mac_hi), mac_lo = klog::hex32(mac_lo));
 
         Ok(())
     }
@@ -414,14 +416,13 @@ pub fn link_status() -> bool {
 
 /// Test ethernet (basic init check)
 pub fn test() {
-    logln!("  Testing ethernet...");
+    kdebug!("eth", "test_start");
 
     // Just check if we can read registers without crashing
     // Real testing requires network connectivity
     let fe = MmioRegion::new(regs::FE_BASE);
     let fe_cfg = fe.read32(regs::FE_GLO_CFG);
-    logln!("    FE_GLO_CFG: 0x{:08x}", fe_cfg);
+    kdebug!("eth", "reg_read"; fe_glo_cfg = klog::hex32(fe_cfg));
 
-    logln!("    Note: Full ethernet test requires network connection");
-    logln!("    [OK] Ethernet registers accessible");
+    kinfo!("eth", "test_ok");
 }

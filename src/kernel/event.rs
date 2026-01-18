@@ -5,7 +5,7 @@
 //! Provides async notification mechanism for processes.
 //! Similar to Redox's event system - processes can wait on multiple events.
 
-use crate::logln;
+use crate::{kwarn, print_direct};
 
 // ============================================================================
 // Debug Assertions
@@ -40,7 +40,7 @@ pub const MAX_CRITICAL_EVENTS: usize = 8;
 /// Formula: MAX_BUSES * 2 + 8 provides headroom for multiple subscribers
 pub const MAX_SUBSCRIPTIONS_PER_TYPE: usize = super::bus::MAX_BUSES * 2 + 8;
 
-/// Event types
+/// Event types (legacy, used internally)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum EventType {
@@ -60,6 +60,79 @@ pub enum EventType {
     FdWritable = 6,
     /// Signal received
     Signal = 7,
+    /// Kernel log available (for logd)
+    KlogReady = 8,
+}
+
+/// Unified event filter - what to wait for (BSD kqueue-inspired)
+///
+/// Used for kevent_subscribe() and kevent_wait() APIs.
+/// The u32 parameter is a filter-specific identifier (channel_id, timer_id, etc.)
+/// A value of 0 typically means "any" (any timer, any child, any signal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventFilter {
+    /// IPC channel has message (channel_id)
+    Ipc(u32),
+    /// Timer expired (timer_id, 0 = any timer)
+    Timer(u32),
+    /// IRQ occurred (irq_num)
+    Irq(u32),
+    /// Child process exited (pid, 0 = any child)
+    ChildExit(u32),
+    /// File descriptor readable (fd)
+    Read(u32),
+    /// File descriptor writable (fd)
+    Write(u32),
+    /// Signal received (signal_num, 0 = any)
+    Signal(u32),
+    /// Kernel log available
+    KlogReady,
+}
+
+impl EventFilter {
+    /// Convert to EventType for internal matching
+    pub fn to_event_type(&self) -> EventType {
+        match self {
+            EventFilter::Ipc(_) => EventType::IpcReady,
+            EventFilter::Timer(_) => EventType::Timer,
+            EventFilter::Irq(_) => EventType::Irq,
+            EventFilter::ChildExit(_) => EventType::ChildExit,
+            EventFilter::Read(_) => EventType::FdReadable,
+            EventFilter::Write(_) => EventType::FdWritable,
+            EventFilter::Signal(_) => EventType::Signal,
+            EventFilter::KlogReady => EventType::KlogReady,
+        }
+    }
+
+    /// Get the filter value (id/fd/etc.)
+    pub fn filter_value(&self) -> u64 {
+        match self {
+            EventFilter::Ipc(id) => *id as u64,
+            EventFilter::Timer(id) => *id as u64,
+            EventFilter::Irq(num) => *num as u64,
+            EventFilter::ChildExit(pid) => *pid as u64,
+            EventFilter::Read(fd) => *fd as u64,
+            EventFilter::Write(fd) => *fd as u64,
+            EventFilter::Signal(num) => *num as u64,
+            EventFilter::KlogReady => 0,
+        }
+    }
+
+    /// Create from type and value (for syscall deserialization)
+    /// type: 1=Ipc, 2=Timer, 3=Irq, 4=ChildExit, 5=Read, 6=Write, 7=Signal, 8=KlogReady
+    pub fn from_type_and_value(filter_type: u32, filter_value: u32) -> Option<Self> {
+        match filter_type {
+            1 => Some(EventFilter::Ipc(filter_value)),
+            2 => Some(EventFilter::Timer(filter_value)),
+            3 => Some(EventFilter::Irq(filter_value)),
+            4 => Some(EventFilter::ChildExit(filter_value)),
+            5 => Some(EventFilter::Read(filter_value)),
+            6 => Some(EventFilter::Write(filter_value)),
+            7 => Some(EventFilter::Signal(filter_value)),
+            8 => Some(EventFilter::KlogReady),
+            _ => None,
+        }
+    }
 }
 
 /// An event that can be delivered to a process
@@ -99,11 +172,23 @@ impl Event {
         }
     }
 
-    pub fn timer(timer_id: u64) -> Self {
+    /// Create a timer event (legacy: data = deadline)
+    pub fn timer(deadline: u64) -> Self {
         Self {
             event_type: EventType::Timer,
-            data: timer_id,
+            data: deadline,
             flags: 0,
+            source_pid: 0,
+        }
+    }
+
+    /// Create a timer event with explicit ID (kevent style)
+    /// data = timer_id (1-8), flags stores low 32 bits of deadline
+    pub fn timer_with_id(timer_id: u32, deadline: u64) -> Self {
+        Self {
+            event_type: EventType::Timer,
+            data: timer_id as u64,
+            flags: deadline as u32,  // Low 32 bits of deadline for debugging
             source_pid: 0,
         }
     }
@@ -132,6 +217,24 @@ impl Event {
             data: signal_num as u64,
             flags: 0,
             source_pid: sender_pid,
+        }
+    }
+
+    pub fn klog_ready() -> Self {
+        Self {
+            event_type: EventType::KlogReady,
+            data: 0,
+            flags: 0,
+            source_pid: 0,
+        }
+    }
+
+    pub fn fd_readable(fd: u64) -> Self {
+        Self {
+            event_type: EventType::FdReadable,
+            data: fd,
+            flags: 0,
+            source_pid: 0,
         }
     }
 }
@@ -267,7 +370,7 @@ impl EventQueue {
     fn push_critical(&mut self, event: Event) -> bool {
         if self.critical_count >= MAX_CRITICAL_EVENTS {
             // Critical queue full - this is a serious condition
-            logln!("[EVENT] WARNING: critical queue full, event may be lost: {:?}", event.event_type);
+            kwarn!("event", "critical_queue_full"; event_type = event.event_type as u64);
             return false;
         }
         self.critical_events[self.critical_write_idx] = event;
@@ -367,6 +470,36 @@ pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
     false
 }
 
+/// Broadcast an event to all subscribed tasks
+///
+/// Used for system-wide events like KlogReady where multiple processes
+/// may want to receive the notification.
+///
+/// Returns the number of tasks that received the event.
+pub fn broadcast_event(event: Event) -> usize {
+    // Can be called from IRQ context or with IRQs disabled
+    let mut delivered = 0;
+
+    unsafe {
+        let sched = super::task::scheduler();
+        for slot in 0..super::task::MAX_TASKS {
+            if let Some(ref mut task) = sched.tasks[slot] {
+                // Check if task is subscribed to this event type
+                if task.event_queue.is_subscribed(&event) {
+                    if task.event_queue.push(event) {
+                        // Wake task if blocked
+                        if task.state == super::task::TaskState::Blocked {
+                            task.state = super::task::TaskState::Ready;
+                        }
+                        delivered += 1;
+                    }
+                }
+            }
+        }
+    }
+    delivered
+}
+
 // ============================================================================
 // Syscall implementations
 // ============================================================================
@@ -382,7 +515,7 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
             // IRQ events require IRQ_CLAIM capability
             if event_type == 3 {
                 if !task.has_capability(super::caps::Capabilities::IRQ_CLAIM) {
-                    logln!("[SECURITY] IRQ subscribe denied: pid={} lacks IRQ_CLAIM capability", pid);
+                    super::security_log::log_capability_denied(pid, "IRQ_CLAIM", "event_subscribe");
                     return -13; // EACCES
                 }
             }
@@ -397,6 +530,7 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
         5 => EventType::FdReadable,
         6 => EventType::FdWritable,
         7 => EventType::Signal,
+        8 => EventType::KlogReady,
         _ => return -1,
     };
 
@@ -422,6 +556,7 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
         5 => EventType::FdReadable,
         6 => EventType::FdWritable,
         7 => EventType::Signal,
+        8 => EventType::KlogReady,
         _ => return -1,
     };
 
@@ -507,18 +642,18 @@ pub fn sys_event_post(target_pid: u32, event_type: u32, data: u64, caller_pid: u
 
 /// Test the event system
 pub fn test() {
-    logln!("  Testing event system...");
+    print_direct!("  Testing event system...\n");
 
     let mut queue = EventQueue::new();
 
     // Test subscription
     assert!(queue.subscribe(EventType::IpcReady, 0).is_ok());
-    logln!("    Subscribed to IpcReady events");
+    print_direct!("    Subscribed to IpcReady events\n");
 
     // Test event push/pop
     let event = Event::ipc_ready(1, 2);
     assert!(queue.push(event));
-    logln!("    Pushed IpcReady event");
+    print_direct!("    Pushed IpcReady event\n");
 
     assert!(queue.has_events());
     assert_eq!(queue.len(), 1);
@@ -528,8 +663,8 @@ pub fn test() {
     let e = popped.unwrap();
     assert_eq!(e.event_type, EventType::IpcReady);
     assert_eq!(e.data, 1);
-    logln!("    Popped event: type={:?}, data={}", e.event_type, e.data);
+    print_direct!("    Popped event: type={:?}, data={}\n", e.event_type, e.data);
 
     assert!(!queue.has_events());
-    logln!("    [OK] Event system test passed");
+    print_direct!("    [OK] Event system test passed\n");
 }

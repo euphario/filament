@@ -35,11 +35,11 @@
 //!
 //! ## Syscalls
 //!
-//! - `pci_enumerate()` - List all PCI devices
 //! - `pci_config_read(bdf, offset, size)` - Read config space
 //! - `pci_config_write(bdf, offset, size, value)` - Write config space
-//! - `pci_bar_map(bdf, bar)` - Map BAR into process address space
 //! - `pci_msi_alloc(bdf, count)` - Allocate MSI vectors
+//!
+//! Note: Device enumeration and BAR mapping are handled by pcied via IPC.
 
 #![allow(dead_code)]
 
@@ -52,7 +52,7 @@ pub use host::{PciHost, PciHostOps};
 pub use device::{PciDevice, PciDeviceRegistry, PciBdf};
 pub use msi::MsiAllocator;
 
-use crate::logln;
+use crate::{kinfo, print_direct};
 
 /// Maximum number of PCI devices we track
 pub const MAX_PCI_DEVICES: usize = 64;
@@ -83,6 +83,24 @@ pub enum PciError {
     AlreadyMapped,
     /// Host controller not initialized
     NotInitialized,
+}
+
+impl PciError {
+    /// Convert to errno-style error code
+    pub fn to_errno(self) -> i32 {
+        match self {
+            PciError::NotFound => -2,          // ENOENT
+            PciError::PermissionDenied => -1,  // EPERM
+            PciError::InvalidBdf => -22,       // EINVAL
+            PciError::InvalidBar => -22,       // EINVAL
+            PciError::BarNotMemory => -22,     // EINVAL
+            PciError::NoMsiVectors => -12,     // ENOMEM
+            PciError::MsiNotSupported => -95,  // EOPNOTSUPP
+            PciError::OutOfMemory => -12,      // ENOMEM
+            PciError::AlreadyMapped => -16,    // EBUSY
+            PciError::NotInitialized => -6,    // ENXIO
+        }
+    }
 }
 
 /// Result type for PCI operations
@@ -312,7 +330,7 @@ pub fn init() {
     unsafe {
         PCI_SUBSYSTEM = Some(PciSubsystem::new());
     }
-    logln!("[pci] Subsystem initialized");
+    kinfo!("pci", "init_ok");
 }
 
 /// Get subsystem reference
@@ -330,7 +348,7 @@ pub fn register_mt7988a_host(host: Mt7988aPciHost) {
     let port_count = host.port_count;
     if let Some(pci) = subsystem_mut() {
         pci.register_host(PciHostImpl::Mt7988a(host));
-        logln!("[pci] MT7988A host registered ({} ports)", port_count);
+        kinfo!("pci", "host_registered"; ports = port_count as u64);
     }
 }
 
@@ -441,9 +459,9 @@ pub fn devices() -> impl Iterator<Item = &'static PciDevice> {
 
 /// Print all registered devices
 pub fn list_devices() {
-    logln!("[pci] Registered devices:");
+    print_direct!("[pci] Registered devices:\n");
     for dev in devices() {
-        logln!("  {:02x}:{:02x}.{} [{:04x}:{:04x}] {}",
+        print_direct!("  {:02x}:{:02x}.{} [{:04x}:{:04x}] {}\n",
             dev.bdf.bus, dev.bdf.device, dev.bdf.function,
             dev.vendor_id, dev.device_id,
             dev.class_name());
