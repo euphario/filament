@@ -83,6 +83,104 @@ impl UartBuffer {
 static UART_BUFFER: SpinLock<UartBuffer> = SpinLock::new(UartBuffer::new());
 
 // ============================================================================
+// RX Ring Buffer for Input (IRQ-driven)
+// ============================================================================
+
+/// UART RX buffer size (256 bytes - smaller than TX since input is slower)
+const UART_RX_BUFFER_SIZE: usize = 256;
+
+/// High water mark - deassert RTS when buffer reaches this level (75%)
+const RX_HIGH_WATER: usize = UART_RX_BUFFER_SIZE * 3 / 4;
+
+/// Low water mark - assert RTS when buffer drops below this level (25%)
+const RX_LOW_WATER: usize = UART_RX_BUFFER_SIZE / 4;
+
+/// Ring buffer for UART RX (input)
+struct RxBuffer {
+    buffer: [u8; UART_RX_BUFFER_SIZE],
+    write_pos: AtomicUsize,
+    read_pos: AtomicUsize,
+}
+
+impl RxBuffer {
+    const fn new() -> Self {
+        Self {
+            buffer: [0; UART_RX_BUFFER_SIZE],
+            write_pos: AtomicUsize::new(0),
+            read_pos: AtomicUsize::new(0),
+        }
+    }
+
+    /// Push a byte into the RX buffer (called from IRQ handler)
+    #[inline]
+    fn push(&mut self, byte: u8) -> bool {
+        let write = self.write_pos.load(Ordering::Relaxed);
+        let read = self.read_pos.load(Ordering::Acquire);
+        let next_write = (write + 1) % UART_RX_BUFFER_SIZE;
+
+        if next_write == read {
+            return false; // Buffer full
+        }
+
+        self.buffer[write] = byte;
+        self.write_pos.store(next_write, Ordering::Release);
+        true
+    }
+
+    /// Pop a byte from the RX buffer (called from read syscall)
+    #[inline]
+    fn pop(&mut self) -> Option<u8> {
+        let write = self.write_pos.load(Ordering::Acquire);
+        let read = self.read_pos.load(Ordering::Relaxed);
+
+        if read == write {
+            return None;
+        }
+
+        let byte = self.buffer[read];
+        self.read_pos.store((read + 1) % UART_RX_BUFFER_SIZE, Ordering::Release);
+        Some(byte)
+    }
+
+    /// Check if buffer has data
+    #[inline]
+    fn has_data(&self) -> bool {
+        self.write_pos.load(Ordering::Acquire) != self.read_pos.load(Ordering::Acquire)
+    }
+
+    /// Get number of bytes in buffer
+    #[inline]
+    fn len(&self) -> usize {
+        let write = self.write_pos.load(Ordering::Acquire);
+        let read = self.read_pos.load(Ordering::Acquire);
+        if write >= read {
+            write - read
+        } else {
+            UART_RX_BUFFER_SIZE - read + write
+        }
+    }
+
+    /// Check if buffer is above high water mark
+    #[inline]
+    fn above_high_water(&self) -> bool {
+        self.len() >= RX_HIGH_WATER
+    }
+
+    /// Check if buffer is below low water mark
+    #[inline]
+    fn below_low_water(&self) -> bool {
+        self.len() <= RX_LOW_WATER
+    }
+}
+
+/// Global UART RX buffer (SMP-safe)
+static RX_BUFFER: SpinLock<RxBuffer> = SpinLock::new(RxBuffer::new());
+
+/// RTS state - true means RTS is asserted (sender can send)
+static RTS_ASSERTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+// ============================================================================
 // UART Hardware Driver
 // ============================================================================
 
@@ -116,6 +214,14 @@ mod lsr {
 mod ier {
     /// Enable Received Data Available Interrupt
     pub const ERBFI: u32 = 1 << 0;
+}
+
+/// Modem Control Register bits
+mod mcr {
+    /// Data Terminal Ready
+    pub const DTR: u32 = 1 << 0;
+    /// Request To Send - deassert (0) to signal sender to stop
+    pub const RTS: u32 = 1 << 1;
 }
 
 /// UART driver instance
@@ -200,6 +306,18 @@ impl Uart {
             self.putc(byte);
         }
     }
+
+    /// Assert RTS (allow sender to transmit)
+    pub fn assert_rts(&self) {
+        let mcr = self.regs.read32(regs::MCR);
+        self.regs.write32(regs::MCR, mcr | mcr::RTS);
+    }
+
+    /// Deassert RTS (signal sender to stop - flow control)
+    pub fn deassert_rts(&self) {
+        let mcr = self.regs.read32(regs::MCR);
+        self.regs.write32(regs::MCR, mcr & !mcr::RTS);
+    }
 }
 
 /// Implement Write trait for formatted printing
@@ -272,6 +390,17 @@ pub fn print(s: &str) {
     UART.lock().puts(s);
 }
 
+/// Write raw bytes to console (atomic - holds lock for entire write)
+pub fn write_bytes(bytes: &[u8]) {
+    let uart = UART.lock();
+    for &byte in bytes {
+        if byte == 0 {
+            break;
+        }
+        uart.putc(byte);
+    }
+}
+
 /// Print a single character
 pub fn putc(c: char) {
     UART.lock().putc(c as u8);
@@ -287,32 +416,8 @@ pub fn getc() -> char {
     UART.lock().getc() as char
 }
 
-/// Print formatted output to the console (BUFFERED - unified with logln!)
-/// Output goes to LOG_BUFFER and is flushed by timer tick or explicit flush.
-/// Use print_direct! for panic handler or early boot where timer isn't running.
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        #[allow(unused_unsafe)]
-        unsafe {
-            let _ = write!(&mut *core::ptr::addr_of_mut!($crate::kernel::log::LOG_BUFFER), $($arg)*);
-        }
-    }};
-}
-
-/// Print formatted output with newline (BUFFERED - unified with logln!)
-#[macro_export]
-macro_rules! println {
-    () => ($crate::print!("\n"));
-    ($($arg:tt)*) => {{
-        $crate::print!($($arg)*);
-        $crate::print!("\n");
-    }};
-}
-
 /// Print directly to UART (BLOCKING - bypasses buffer)
-/// Use only for panic handler, early boot, or debugging where immediate output is critical.
+/// Use only for panic handler or kernel exceptions.
 #[macro_export]
 macro_rules! print_direct {
     ($($arg:tt)*) => {{
@@ -479,16 +584,79 @@ pub fn get_blocked_pid() -> u32 {
     CONSOLE_BLOCKED_PID.load(Ordering::Acquire)
 }
 
-/// Handle UART RX interrupt - returns true if it was handled
+/// Handle UART RX interrupt - reads all available data into ring buffer
+/// Returns true if data was received
 pub fn handle_rx_irq() -> bool {
     let uart = UART.lock();
-    // Check if data is available
-    if (uart.regs.read32(regs::LSR) & lsr::DR) != 0 {
-        // Data available - clear interrupt by reading (but don't consume)
-        // The blocked process will read the actual data
-        return true;
+    let mut rx_buf = RX_BUFFER.lock();
+    let mut received = false;
+
+    // Read all available characters into the ring buffer
+    while (uart.regs.read32(regs::LSR) & lsr::DR) != 0 {
+        let byte = uart.regs.read32(regs::THR) as u8;
+        if !rx_buf.push(byte) {
+            // Buffer full - drop character (shouldn't happen with flow control)
+            break;
+        }
+        received = true;
     }
-    false
+
+    // Manage RTS flow control
+    // TODO: Abstract flow control into a platform trait for hardware auto-RTS support
+    if rx_buf.above_high_water() && RTS_ASSERTED.load(Ordering::Relaxed) {
+        // Buffer getting full - tell sender to stop
+        uart.deassert_rts();
+        RTS_ASSERTED.store(false, Ordering::Release);
+    }
+
+    received
+}
+
+/// Read a byte from the RX ring buffer (non-blocking)
+/// Returns Some(byte) if data available, None otherwise
+pub fn rx_buffer_read() -> Option<u8> {
+    let mut rx_buf = RX_BUFFER.lock();
+    let byte = rx_buf.pop();
+
+    // Manage RTS flow control - re-enable if buffer drained
+    if byte.is_some() && rx_buf.below_low_water() && !RTS_ASSERTED.load(Ordering::Relaxed) {
+        // Buffer has space - allow sender to resume
+        let uart = UART.lock();
+        uart.assert_rts();
+        RTS_ASSERTED.store(true, Ordering::Release);
+    }
+
+    byte
+}
+
+/// Read multiple bytes from the RX ring buffer into a slice
+/// Returns number of bytes read
+pub fn rx_buffer_read_bytes(buf: &mut [u8]) -> usize {
+    let mut rx_buf = RX_BUFFER.lock();
+    let mut count = 0;
+
+    for slot in buf.iter_mut() {
+        if let Some(byte) = rx_buf.pop() {
+            *slot = byte;
+            count += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Manage RTS flow control after batch read
+    if count > 0 && rx_buf.below_low_water() && !RTS_ASSERTED.load(Ordering::Relaxed) {
+        let uart = UART.lock();
+        uart.assert_rts();
+        RTS_ASSERTED.store(true, Ordering::Release);
+    }
+
+    count
+}
+
+/// Check if RX buffer has data available
+pub fn rx_buffer_has_data() -> bool {
+    RX_BUFFER.lock().has_data()
 }
 
 // ============================================================================

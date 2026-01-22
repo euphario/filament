@@ -15,8 +15,12 @@
 #![no_main]
 #![allow(dead_code)]  // Constants/registers for future use
 
-use userlib::{syscall, uinfo, uwarn, uerror, EventFilter, kevent_subscribe, kevent_timer, kevent_wait};
-use userlib::syscall::{Event, event_type};
+use userlib::{syscall, uinfo, uwarn, uerror};
+use userlib::syscall::{
+    Handle, WaitFilter, WaitRequest, WaitResult,
+    handle_timer_create, handle_timer_set, handle_wait,
+    handle_wrap_channel, handle_close,
+};
 use userlib::ipc::{Server, Connection, IpcError, DevdClient};
 use userlib::ipc::protocols::{GpioProtocol, GpioRequest, GpioResponse};
 use userlib::ipc::protocols::devd::PropertyList;
@@ -403,29 +407,43 @@ fn main() {
         }
     };
 
-    // Subscribe to IPC events for GPIO port (kevent API)
+    // Create timer handle for polling (Handle API)
+    let timer_handle = match handle_timer_create() {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("gpio", "timer_create_failed");
+            syscall::exit(1);
+        }
+    };
+
+    // Arm timer as recurring (fires every POLL_INTERVAL_NS)
+    if handle_timer_set(timer_handle, POLL_INTERVAL_NS, POLL_INTERVAL_NS).is_err() {
+        uerror!("gpio", "timer_set_failed");
+        syscall::exit(1);
+    }
+
+    // Wrap the listen channel as a handle (Handle API)
     let gpio_channel = server.listen_channel();
-    if kevent_subscribe(EventFilter::Ipc(gpio_channel)).is_err() {
-        uerror!("gpio", "event_subscribe_failed"; event = "ipc");
-        syscall::exit(1);
-    }
-
-    // Subscribe to timer events for polling (kevent API)
-    if kevent_subscribe(EventFilter::Timer(0)).is_err() {
-        uerror!("gpio", "event_subscribe_failed"; event = "timer");
-        syscall::exit(1);
-    }
-
-    // Set recurring polling timer (kevent_timer: id=1, interval, initial)
-    let _ = kevent_timer(1, POLL_INTERVAL_NS, POLL_INTERVAL_NS);
+    let channel_handle = match handle_wrap_channel(gpio_channel) {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("gpio", "channel_wrap_failed");
+            syscall::exit(1);
+        }
+    };
 
     uinfo!("gpio", "ready");
 
-    // Event-driven main loop (kevent batch receive)
-    let mut events = [Event::empty(); 4];
+    // Event-driven main loop (Handle API)
+    let requests = [
+        WaitRequest::new(timer_handle, WaitFilter::Timer),
+        WaitRequest::new(channel_handle, WaitFilter::Readable),
+    ];
+    let mut results = [WaitResult::empty(); 2];
 
     loop {
-        let count = match kevent_wait(&mut events, u64::MAX) {
+        // Wait for timer or IPC (blocking)
+        let count = match handle_wait(&requests, &mut results, u64::MAX) {
             Ok(n) => n,
             Err(_) => {
                 syscall::yield_now();
@@ -433,37 +451,30 @@ fn main() {
             }
         };
 
-        for event in &events[..count] {
-        match event.event_type {
-            et if et == event_type::IPC_READY => {
-                let channel = event.data as u32;
-                if channel == gpio_channel {
-                    // Accept connection on GPIO port
-                    let mut conn: Connection<GpioProtocol> = match server.accept() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-
-                    // Handle request
-                    match conn.receive() {
-                        Ok(request) => {
-                            let response = gpio.handle_request(&request, &mut devd_client);
-                            let _ = conn.send(&response);
-                        }
-                        Err(_) => {}
-                    }
-                    // Connection dropped here
-                }
-            }
-
-            et if et == event_type::TIMER => {
-                // Poll for input changes (no logging for normal polling)
-                // Timer auto-rearms due to recurring kevent_timer
+        for result in &results[..count] {
+            if result.handle.raw() == timer_handle.raw() {
+                // Timer fired - poll for input changes
                 gpio.poll_changes(&mut devd_client);
-            }
 
-            _ => {}
-        }
+                // Rearm timer for next interval
+                let _ = handle_timer_set(timer_handle, POLL_INTERVAL_NS, POLL_INTERVAL_NS);
+            } else if result.handle.raw() == channel_handle.raw() {
+                // IPC ready - accept connection and handle request
+                let mut conn: Connection<GpioProtocol> = match server.accept() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                // Handle request
+                match conn.receive() {
+                    Ok(request) => {
+                        let response = gpio.handle_request(&request, &mut devd_client);
+                        let _ = conn.send(&response);
+                    }
+                    Err(_) => {}
+                }
+                // Connection dropped here
+            }
         }
     }
 }

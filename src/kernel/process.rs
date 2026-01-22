@@ -19,6 +19,17 @@ use crate::arch::aarch64::mmu;
 pub type Pid = u32;
 
 /// Process states
+///
+/// State machine:
+/// ```text
+///   Creating ──────► Ready ◄────────► Running
+///                      │                 │
+///                      │                 │
+///                      ▼                 ▼
+///                   Blocked ──────────► Zombie ──────► Free
+///                      │                   ▲
+///                      └───────────────────┘
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ProcessState {
@@ -34,6 +45,51 @@ pub enum ProcessState {
     Zombie = 4,
     /// Process slot is free
     Free = 255,
+}
+
+impl ProcessState {
+    /// Check if transition to new state is valid
+    pub fn can_transition_to(&self, new: &ProcessState) -> bool {
+        match (self, new) {
+            // Creating → Ready (after load complete)
+            (ProcessState::Creating, ProcessState::Ready) => true,
+
+            // Ready ↔ Running (scheduling)
+            (ProcessState::Ready, ProcessState::Running) => true,
+            (ProcessState::Running, ProcessState::Ready) => true,
+
+            // Running → Blocked (waiting for I/O, IPC, etc.)
+            (ProcessState::Running, ProcessState::Blocked) => true,
+            // Blocked → Ready (event arrived)
+            (ProcessState::Blocked, ProcessState::Ready) => true,
+
+            // Any active state → Zombie (exit/kill)
+            (ProcessState::Running, ProcessState::Zombie) => true,
+            (ProcessState::Ready, ProcessState::Zombie) => true,
+            (ProcessState::Blocked, ProcessState::Zombie) => true,
+
+            // Zombie → Free (reaped by parent)
+            (ProcessState::Zombie, ProcessState::Free) => true,
+
+            // Free → Creating (slot reused)
+            (ProcessState::Free, ProcessState::Creating) => true,
+
+            // All other transitions are invalid
+            _ => false,
+        }
+    }
+
+    /// Get state name for logging
+    pub fn name(&self) -> &'static str {
+        match self {
+            ProcessState::Creating => "Creating",
+            ProcessState::Ready => "Ready",
+            ProcessState::Running => "Running",
+            ProcessState::Blocked => "Blocked",
+            ProcessState::Zombie => "Zombie",
+            ProcessState::Free => "Free",
+        }
+    }
 }
 
 /// What a blocked process is waiting for

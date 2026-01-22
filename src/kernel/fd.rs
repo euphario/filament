@@ -272,113 +272,87 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
     match entry.fd_type {
         FdType::None => -9, // EBADF
         FdType::ConsoleIn => {
-            // Read from UART
+            // Read from UART RX ring buffer
+            // Data is collected by IRQ handler into the buffer
             if buf.is_empty() {
                 return 0;
             }
 
             if entry.flags.nonblocking {
-                // Non-blocking: return immediately
-                match uart::try_getc() {
+                // Non-blocking: return immediately from buffer
+                match uart::rx_buffer_read() {
                     Some(c) => {
-                        buf[0] = c as u8;
+                        buf[0] = c;
                         1
                     }
                     None => -11, // EAGAIN
                 }
             } else {
-                // Blocking read: if no data, actually block waiting for UART IRQ
-                match uart::try_getc() {
-                    Some(c) => {
-                        buf[0] = c as u8;
-                        let mut count = 1;
-                        // Read more if available (non-blocking for subsequent chars)
-                        while count < buf.len() {
-                            match uart::try_getc() {
-                                Some(c) => {
-                                    buf[count] = c as u8;
-                                    count += 1;
-                                }
-                                None => break,
-                            }
-                        }
-                        // Re-enable UART RX interrupt for next read
-                        uart::reenable_rx_interrupt();
-                        count as isize
-                    }
-                    None => {
-                        // No data available - try to block waiting for UART RX interrupt
-                        unsafe {
-                            let sched = super::task::scheduler();
-                            let my_slot = super::task::current_slot();
-                            let current_pid = sched.tasks[my_slot]
-                                .as_ref().map(|t| t.id).unwrap_or(0);
+                // Blocking read: read from buffer, block if empty
+                // Read as many bytes as available in buffer (up to buf size)
+                let count = uart::rx_buffer_read_bytes(buf);
+                if count > 0 {
+                    count as isize
+                } else {
+                    // No data in buffer - block waiting for UART RX interrupt
+                    unsafe {
+                        let sched = super::task::scheduler();
+                        let my_slot = super::task::current_slot();
+                        let current_pid = sched.tasks[my_slot]
+                            .as_ref().map(|t| t.id).unwrap_or(0);
 
-                            // Check if there's another task to switch to FIRST
-                            // (schedule() checks for Ready tasks excluding Blocked ones)
-                            let has_other_task = sched.tasks.iter().enumerate().any(|(slot, t)| {
-                                slot != my_slot &&
-                                t.as_ref().map(|task| task.state == super::task::TaskState::Ready).unwrap_or(false)
-                            });
+                        // Check if there's another task to switch to FIRST
+                        let has_other_task = sched.tasks.iter().enumerate().any(|(slot, t)| {
+                            slot != my_slot &&
+                            t.as_ref().map(|task| task.state == super::task::TaskState::Ready).unwrap_or(false)
+                        });
 
-                            if has_other_task {
-                                // There's another task - we can safely block
-                                // First, clear any stale registration from ourselves
-                                // (can happen if we were woken by something other than UART RX)
-                                if uart::get_blocked_pid() == current_pid {
-                                    uart::clear_blocked();
-                                }
-
-                                if uart::block_for_input(current_pid) {
-                                    // CRITICAL: Ensure RX interrupt is enabled before blocking!
-                                    // It may have been disabled by IRQ handler while we were in a syscall.
-                                    uart::reenable_rx_interrupt();
-
-                                    // Block the task
-                                    if let Some(ref mut current) = sched.tasks[my_slot] {
-                                        current.state = super::task::TaskState::Blocked;
-                                        // Pre-store EAGAIN - will be retried when woken
-                                        current.trap_frame.x0 = (-11i64) as u64;
-                                    }
-
-                                    // Switch to another task
-                                    if let Some(next_slot) = sched.schedule() {
-                                        // Update both per-CPU slot and legacy field
-                                        super::task::set_current_slot(next_slot);
-                                        sched.current = next_slot;
-                                        if let Some(ref mut next) = sched.tasks[next_slot] {
-                                            next.state = super::task::TaskState::Running;
-                                        }
-                                        super::task::update_current_task_globals();
-                                        super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
-                                    }
-                                }
-                            } else {
-                                // No other task - can't block, use WFI to wait for IRQ
-                                // Flush any buffered output first (so user sees prompt)
-                                while uart::has_buffered_output() {
-                                    uart::flush_buffer();
-                                }
-                                // Register for wakeup but stay Ready (not Blocked)
-                                uart::block_for_input(current_pid);
-                                // WFI until any interrupt arrives (UART or timer)
-                                // CRITICAL: Enable IRQs before WFI, otherwise interrupts can't fire!
-                                core::arch::asm!("msr daifclr, #2");  // Enable IRQs
-                                core::arch::asm!("wfi");
-                                core::arch::asm!("msr daifset, #2");  // Disable IRQs again
-                                // Clear the registration since we're returning to retry
+                        if has_other_task {
+                            // There's another task - we can safely block
+                            if uart::get_blocked_pid() == current_pid {
                                 uart::clear_blocked();
                             }
+
+                            if uart::block_for_input(current_pid) {
+                                // Block the task (sleeping, waiting for UART input event)
+                                if let Some(ref mut current) = sched.tasks[my_slot] {
+                                    current.state = super::task::TaskState::Sleeping {
+                                        reason: super::task::SleepReason::EventLoop,
+                                    };
+                                    current.trap_frame.x0 = (-11i64) as u64;
+                                }
+
+                                // Switch to another task
+                                if let Some(next_slot) = sched.schedule() {
+                                    super::task::set_current_slot(next_slot);
+                                    sched.current = next_slot;
+                                    if let Some(ref mut next) = sched.tasks[next_slot] {
+                                        next.state = super::task::TaskState::Running;
+                                    }
+                                    super::task::update_current_task_globals();
+                                    super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+                                }
+                            }
+                        } else {
+                            // No other task - use WFI to wait for IRQ
+                            while uart::has_buffered_output() {
+                                uart::flush_buffer();
+                            }
+                            uart::block_for_input(current_pid);
+                            core::arch::asm!("msr daifclr, #2");  // Enable IRQs
+                            core::arch::asm!("wfi");
+                            core::arch::asm!("msr daifset, #2");  // Disable IRQs
+                            uart::clear_blocked();
                         }
-                        -11 // EAGAIN - caller retries after being woken
                     }
+                    -11 // EAGAIN - caller retries after being woken
                 }
             }
         }
         FdType::ConsoleOut => -9, // EBADF - Can't read from output
         FdType::Null => 0,        // EOF
         FdType::Channel(channel_id) => {
-            // Read from IPC channel
+            // Read from IPC channel using ipc
             match ipc::sys_receive(channel_id, caller_pid) {
                 Ok(msg) => {
                     // Only process data-like messages for read()
@@ -412,19 +386,18 @@ pub fn fd_read(entry: &FdEntry, buf: &mut [u8], caller_pid: Pid) -> isize {
                         }
                     }
                 }
-                Err(ipc::ChannelError::WouldBlock) => {
+                Err(ipc::IpcError::WouldBlock) => {
                     if entry.flags.nonblocking {
                         -11 // EAGAIN
                     } else {
-                        // Register for blocking - syscall layer handles actual blocking
-                        ipc::with_channel_table(|table| {
-                            let _ = table.block_receiver(channel_id, caller_pid);
-                        });
+                        // Subscribe for wake notification via ipc subscriber system
+                        ipc::channel_register_waker(channel_id, caller_pid);
                         -11 // EAGAIN - caller should block and retry
                     }
                 }
-                Err(ipc::ChannelError::PeerClosed) => 0, // EOF
-                Err(ipc::ChannelError::InvalidChannel) => -9, // EBADF
+                Err(ipc::IpcError::PeerClosed) => 0, // EOF
+                Err(ipc::IpcError::Closed) => 0, // EOF
+                Err(ipc::IpcError::InvalidChannel { .. }) => -9, // EBADF
                 Err(_) => -5, // EIO
             }
         }
@@ -500,7 +473,7 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
         }
         FdType::Null => buf.len() as isize, // Discard
         FdType::Channel(channel_id) => {
-            // Write to IPC channel
+            // Write to IPC channel using ipc
             // Split data into chunks if needed (max payload is MAX_INLINE_PAYLOAD)
             let max_payload = ipc::MAX_INLINE_PAYLOAD;
             let chunk = if buf.len() > max_payload {
@@ -511,7 +484,7 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
 
             match ipc::sys_send(channel_id, caller_pid, chunk) {
                 Ok(()) => chunk.len() as isize,
-                Err(ipc::ChannelError::QueueFull) => {
+                Err(ipc::IpcError::QueueFull) => {
                     if entry.flags.nonblocking {
                         -11 // EAGAIN
                     } else {
@@ -520,9 +493,10 @@ pub fn fd_write(entry: &FdEntry, buf: &[u8], caller_pid: Pid) -> isize {
                         -11
                     }
                 }
-                Err(ipc::ChannelError::PeerClosed) => -32, // EPIPE
-                Err(ipc::ChannelError::InvalidChannel) => -9, // EBADF
-                Err(ipc::ChannelError::PermissionDenied) => -13, // EACCES
+                Err(ipc::IpcError::PeerClosed) => -32, // EPIPE
+                Err(ipc::IpcError::Closed) => -32, // EPIPE
+                Err(ipc::IpcError::InvalidChannel { .. }) => -9, // EBADF
+                Err(ipc::IpcError::NotOwner { .. }) => -13, // EACCES
                 Err(_) => -5, // EIO
             }
         }

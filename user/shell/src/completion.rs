@@ -1,13 +1,7 @@
 //! Tab Completion
 //!
-//! Provides path and command completion using vfsd and builtin commands.
-
-use userlib::syscall;
-use userlib::ipc::Message;
-use userlib::ipc::protocols::{
-    FsRequest, FsResponse,
-    filesystem::MAX_DIR_ENTRIES,
-};
+//! Provides command completion using builtin commands.
+//! Path completion is disabled until vfsd is available.
 
 /// Maximum completions to show
 const MAX_COMPLETIONS: usize = 16;
@@ -17,7 +11,7 @@ const BUILTINS: &[&[u8]] = &[
     b"help", b"exit", b"quit", b"pid", b"uptime", b"mem", b"echo",
     b"spawn", b"yield", b"panic", b"usb", b"gpio", b"fatfs", b"pcied",
     b"wifi", b"fan", b"ps", b"kill", b"bg", b"jobs", b"log", b"reset",
-    b"reboot", b"hw", b"ls", b"cat",
+    b"reboot", b"hw", b"ls", b"cat", b"devd", b"handle", b"resize",
 ];
 
 /// Completion result
@@ -94,160 +88,23 @@ impl Completions {
 }
 
 /// Complete a path prefix
-/// Returns completions for the given partial path
-pub fn complete_path(partial: &[u8]) -> Completions {
-    let mut result = Completions::empty();
-
-    // Find the last '/' to split into directory and prefix
-    let (dir_path, prefix) = if let Some(slash_pos) = partial.iter().rposition(|&c| c == b'/') {
-        (&partial[..slash_pos + 1], &partial[slash_pos + 1..])
-    } else {
-        // No slash - assume current directory or bin/
-        (b"/bin/" as &[u8], partial)
-    };
-
-    // Connect to vfsd
-    let ch = syscall::port_connect(b"vfs");
-    if ch < 0 {
-        return result;
-    }
-    let ch = ch as u32;
-
-    // Request directory listing
-    let request = FsRequest::read_dir(dir_path, 0);
-
-    let mut req_buf = [0u8; 512];
-    let req_len = match request.serialize(&mut req_buf) {
-        Ok(len) => len,
-        Err(_) => {
-            syscall::channel_close(ch);
-            return result;
-        }
-    };
-
-    if syscall::send(ch, &req_buf[..req_len]) < 0 {
-        syscall::channel_close(ch);
-        return result;
-    }
-
-    let mut resp_buf = [0u8; 2048];
-    let received = syscall::receive(ch, &mut resp_buf);
-    syscall::channel_close(ch);
-
-    if received <= 0 {
-        return result;
-    }
-
-    let response = match FsResponse::deserialize(&resp_buf[..received as usize]) {
-        Ok((resp, _)) => resp,
-        Err(_) => return result,
-    };
-
-    // Find matching entries
-    if let FsResponse::DirEntries { entries, count, .. } = response {
-        for i in 0..(count as usize).min(MAX_DIR_ENTRIES) {
-            let entry = &entries[i];
-            let name = &entry.name[..entry.name_len as usize];
-
-            // Check if name starts with prefix
-            if prefix.is_empty() || (name.len() >= prefix.len() && &name[..prefix.len()] == prefix) {
-                result.add_match(name);
-            }
-        }
-    }
-
-    result.compute_common();
-    result
+/// Returns empty completions (vfsd not available)
+pub fn complete_path(_partial: &[u8]) -> Completions {
+    // Path completion disabled - vfsd not available
+    Completions::empty()
 }
 
-/// Complete a command (searches builtins + /bin)
+/// Complete a command (searches builtins only)
 pub fn complete_command(partial: &[u8]) -> Completions {
     let mut result = Completions::empty();
 
-    // First, check builtins
+    // Check builtins
     for &builtin in BUILTINS {
         if partial.is_empty() || (builtin.len() >= partial.len() && &builtin[..partial.len()] == partial) {
             result.add_match(builtin);
         }
     }
 
-    // Then check /bin/ via vfsd
-    let bin_completions = complete_path_in_dir(b"/bin/", partial);
-    for i in 0..bin_completions.count {
-        if let Some(m) = bin_completions.get_match(i) {
-            // Avoid duplicates (builtin might have same name as binary)
-            let mut is_dup = false;
-            for j in 0..result.count {
-                if let Some(existing) = result.get_match(j) {
-                    if existing == m {
-                        is_dup = true;
-                        break;
-                    }
-                }
-            }
-            if !is_dup {
-                result.add_match(m);
-            }
-        }
-    }
-
     result.compute_common();
-    result
-}
-
-/// Complete a path within a specific directory
-fn complete_path_in_dir(dir: &[u8], prefix: &[u8]) -> Completions {
-    let mut result = Completions::empty();
-
-    // Connect to vfsd
-    let ch = syscall::port_connect(b"vfs");
-    if ch < 0 {
-        return result;
-    }
-    let ch = ch as u32;
-
-    // Request directory listing
-    let request = FsRequest::read_dir(dir, 0);
-
-    let mut req_buf = [0u8; 512];
-    let req_len = match request.serialize(&mut req_buf) {
-        Ok(len) => len,
-        Err(_) => {
-            syscall::channel_close(ch);
-            return result;
-        }
-    };
-
-    if syscall::send(ch, &req_buf[..req_len]) < 0 {
-        syscall::channel_close(ch);
-        return result;
-    }
-
-    let mut resp_buf = [0u8; 2048];
-    let received = syscall::receive(ch, &mut resp_buf);
-    syscall::channel_close(ch);
-
-    if received <= 0 {
-        return result;
-    }
-
-    let response = match FsResponse::deserialize(&resp_buf[..received as usize]) {
-        Ok((resp, _)) => resp,
-        Err(_) => return result,
-    };
-
-    // Find matching entries
-    if let FsResponse::DirEntries { entries, count, .. } = response {
-        for i in 0..(count as usize).min(MAX_DIR_ENTRIES) {
-            let entry = &entries[i];
-            let name = &entry.name[..entry.name_len as usize];
-
-            // Check if name starts with prefix
-            if prefix.is_empty() || (name.len() >= prefix.len() && &name[..prefix.len()] == prefix) {
-                result.add_match(name);
-            }
-        }
-    }
-
     result
 }

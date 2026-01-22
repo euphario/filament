@@ -86,9 +86,9 @@ impl Timer {
             // Kick the watchdog to prevent system reset
             super::wdt::kick();
 
-            // Flush kernel log buffer (logln! output)
-            // Use try_flush to avoid deadlock if syscall is holding UART lock
-            crate::kernel::log::try_flush();
+
+            // Drain klog ring directly to UART
+            crate::klog::try_drain(8);
 
             // Flush UART output buffer (userspace console output)
             // Use try_flush to avoid deadlock if syscall is holding UART lock
@@ -99,10 +99,23 @@ impl Timer {
                 crate::kernel::task::scheduler().check_timeouts(self.tick_count);
             }
 
+            // Run liveness checks (pings blocked tasks periodically)
+            crate::kernel::sched::timer_tick(self.tick_count);
+
             // Reap terminated tasks (orphan processes that exited)
             // Safe to do here since we're not running on the terminated task's stack
             unsafe {
-                crate::kernel::task::scheduler().reap_terminated();
+                crate::kernel::task::scheduler().reap_terminated(self.tick_count);
+            }
+
+            // Continue bus initialization (one bus per tick until all Safe)
+            // This runs in parallel with devd - devd gets notified as each bus becomes Safe
+            crate::kernel::bus::continue_init();
+
+            // Check if liveness system killed devd - trigger recovery
+            // (Done here to avoid recursive scheduler access from within liveness check)
+            if crate::DEVD_LIVENESS_KILLED.swap(false, core::sync::atomic::Ordering::SeqCst) {
+                crate::recover_devd();
             }
 
             // Reload timer for next time slice
@@ -209,13 +222,12 @@ impl TimerTrait for Timer {
             self.tick_count += 1;
 
             super::wdt::kick();
-            // Use try_flush to avoid deadlock if syscall is holding UART lock
-            crate::kernel::log::try_flush();
+            crate::klog::try_drain(8);
             super::uart::try_flush_buffer();
 
             unsafe {
                 crate::kernel::task::scheduler().check_timeouts(self.tick_count);
-                crate::kernel::task::scheduler().reap_terminated();
+                crate::kernel::task::scheduler().reap_terminated(self.tick_count);
             }
 
             let ticks = (self.frequency * self.time_slice_ms) / 1000;

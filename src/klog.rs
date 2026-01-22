@@ -599,15 +599,18 @@ pub fn format_record(record: &[u8], out: &mut [u8]) -> usize {
         out[out_pos] = b' ';
         out_pos += 1;
 
-        // Key in dim
-        out[out_pos..out_pos + 4].copy_from_slice(b"\x1b[2m");
-        out_pos += 4;
-        out[out_pos..out_pos + key_len].copy_from_slice(key);
-        out_pos += key_len;
-        out[out_pos] = b'=';
-        out_pos += 1;
-        out[out_pos..out_pos + RESET.len()].copy_from_slice(RESET);
-        out_pos += RESET.len();
+        // Empty key = raw output (no "key=" prefix), used by userspace logs
+        if key_len > 0 {
+            // Key in dim
+            out[out_pos..out_pos + 4].copy_from_slice(b"\x1b[2m");
+            out_pos += 4;
+            out[out_pos..out_pos + key_len].copy_from_slice(key);
+            out_pos += key_len;
+            out[out_pos] = b'=';
+            out_pos += 1;
+            out[out_pos..out_pos + RESET.len()].copy_from_slice(RESET);
+            out_pos += RESET.len();
+        }
 
         // Value
         out_pos += format_value(vtype, &record[pos..], &mut out[out_pos..], &mut pos);
@@ -787,7 +790,7 @@ fn write_hex64(out: &mut [u8], val: u64) -> usize {
 // Drain (called from timer interrupt or explicit flush)
 // ============================================================================
 
-/// Drain one record from the ring buffer and output to UART
+/// Drain one record from the ring buffer and output directly to UART
 /// Returns true if a record was drained
 pub fn drain_one() -> bool {
     let mut record_buf = [0u8; MAX_RECORD_SIZE];
@@ -805,17 +808,16 @@ pub fn drain_one() -> bool {
 
     let text_len = format_record(&record_buf[..len], &mut text_buf);
     if text_len > 0 {
-        // Write to UART buffer
-        crate::platform::mt7988::uart::write_buffered(&text_buf[..text_len]);
+        // Write directly to UART
+        crate::platform::mt7988::uart::write_bytes(&text_buf[..text_len]);
     }
 
     true
 }
 
-/// Flush all pending records
+/// Flush all pending records to UART
 pub fn flush() {
     while drain_one() {}
-    crate::platform::mt7988::uart::flush_buffer();
 }
 
 /// Try to drain records (non-blocking, for timer interrupt)
@@ -844,6 +846,79 @@ pub fn dropped() -> u64 {
         let ring = &*core::ptr::addr_of!(LOG_RING);
         ring.dropped()
     }
+}
+
+// ============================================================================
+// User Message Logging (for syscall::klog)
+// ============================================================================
+
+/// Log a userspace message via syscall
+/// Parses [subsys] prefix if present, otherwise uses "user" as subsystem
+/// First word becomes event, rest becomes key=value pairs (output directly)
+pub fn log_user_message(level: Level, msg: &[u8]) {
+    if !is_enabled(level) {
+        return;
+    }
+
+    // Trim trailing newline/CR
+    let mut end = msg.len();
+    while end > 0 && (msg[end - 1] == b'\n' || msg[end - 1] == b'\r') {
+        end -= 1;
+    }
+    let msg = &msg[..end];
+
+    if msg.is_empty() {
+        return;
+    }
+
+    // Try to parse [subsys] prefix
+    let (subsys, text) = if msg.first() == Some(&b'[') {
+        if let Some(bracket_end) = msg.iter().position(|&b| b == b']') {
+            let subsys = &msg[1..bracket_end];
+            let rest_start = if msg.len() > bracket_end + 1 && msg[bracket_end + 1] == b' ' {
+                bracket_end + 2
+            } else {
+                bracket_end + 1
+            };
+            (subsys, &msg[rest_start..])
+        } else {
+            (b"user".as_slice(), msg)
+        }
+    } else {
+        (b"user".as_slice(), msg)
+    };
+
+    // Extract first word as event, rest as raw kv text
+    let (event, rest) = if let Some(space_pos) = text.iter().position(|&b| b == b' ') {
+        (&text[..space_pos], &text[space_pos + 1..])
+    } else {
+        (text, &[][..])
+    };
+
+    // Build the log record
+    let mut builder = RecordBuilder::new();
+    builder.header(level);
+
+    // Subsystem (convert bytes to string, truncate if invalid UTF-8)
+    let subsys_str = core::str::from_utf8(subsys).unwrap_or("user");
+    builder.subsys(subsys_str);
+
+    // Event = first word of message
+    let event_str = core::str::from_utf8(event).unwrap_or("msg");
+    builder.event(event_str);
+
+    // No context, remaining text as raw (special type 6 = raw string, no key prefix)
+    builder.ctx_count(0);
+    if rest.is_empty() {
+        builder.kv_count(0);
+    } else {
+        builder.kv_count(1);
+        // Use empty key "" to signal raw output (formatter will skip "key=")
+        let rest_str = core::str::from_utf8(rest).unwrap_or("");
+        builder.kv("", rest_str);
+    }
+
+    builder.finish();
 }
 
 // ============================================================================

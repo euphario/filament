@@ -65,9 +65,8 @@ pub extern "C" fn kmain() -> ! {
     sync::verify_pan_enabled();
 
     // Initialize logging/tracing infrastructure
-    log::init();       // Legacy (for platform drivers not yet migrated)
-    klog::init();      // Structured logging
-    ktrace::init();    // Span-based tracing
+    klog::init();      // Structured logging (LOG_RING → UART)
+    ktrace::init();    // Span-based tracing (TRACE_RING)
 
     // Boot banner (direct UART - useful for early debug)
     print_direct!("\r\n========================================\r\n");
@@ -205,8 +204,8 @@ pub extern "C" fn kmain() -> ! {
         task::test();
         kernel::syscall::test();
         kernel::process::test();
-        kernel::ipc::test();
-        kernel::port::test();
+        // IPC tests via ipc module
+        // kernel::ipc::test(); // TODO: Add ipc unit tests
         kernel::event::test();
         scheme::test();
         elf::test();
@@ -232,22 +231,42 @@ pub extern "C" fn kmain() -> ! {
         init_ramfs();
     }
 
+    // Flush logs after ramfs init (before timer starts)
+    klog::flush();
+
     // Enable interrupts
     unsafe {
         core::arch::asm!("msr daifclr, #2");
     }
     kinfo!("kernel", "irq_enabled");
+    klog::flush();  // DEBUG: flush after irq enable
 
-    // Spawn devd (init process)
+    // =========================================================================
+    // Phase 4: Start scheduler
+    // =========================================================================
+
+    // Start timer for preemption (10ms time slice)
+    timer::start(10);
+    kinfo!("timer", "preemption_started"; slice_ms = 10u64);
+    klog::flush();  // DEBUG: flush after timer start
+    kinfo!("kernel", "scheduler_ready");
+    klog::flush();  // DEBUG: flush after scheduler ready
+
+    // Spawn devd (init process) - after scheduler is ready
+    kinfo!("kernel", "spawning_devd");
+    klog::flush();
     let slot1 = {
         let _span = span!("elf", "spawn"; path = "bin/devd");
         match elf::spawn_from_path("bin/devd") {
             Ok((_task_id, slot)) => {
                 kinfo!("kernel", "devd_spawned"; slot = slot);
-                // Give devd ALL capabilities (it's init/PID 1)
+                klog::flush();
+                // Give devd ALL capabilities, high priority, and mark as init process
                 unsafe {
                     if let Some(ref mut task) = task::scheduler().tasks[slot] {
                         task.set_capabilities(kernel::caps::Capabilities::ALL);
+                        task.set_priority(task::Priority::High);  // devd is critical
+                        task.is_init = true;  // Mark as init for heartbeat watchdog
                     }
                 }
                 Some(slot)
@@ -270,18 +289,9 @@ pub extern "C" fn kmain() -> ! {
         }
     };
 
-    // =========================================================================
-    // Phase 4: Start scheduler
-    // =========================================================================
-
     if let Some(slot) = slot1 {
-        kinfo!("kernel", "scheduler_start"; slot = slot);
-
-        // Start timer for preemption (10ms time slice)
-        timer::start(10);
-        kinfo!("timer", "preemption_started"; slice_ms = 10u64);
-
         // Flush all logs before entering userspace
+        kinfo!("kernel", "entering_userspace"; slot = slot);
         klog::flush();
         ktrace::flush();
 
@@ -327,13 +337,9 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
         }
     } else if irq == plat::irq::UART0 {
         // UART RX interrupt - data available on console
+        // IRQ handler drains FIFO into ring buffer, so IRQ won't re-trigger
         if uart::handle_rx_irq() {
-            // Disable UART RX interrupt to prevent re-triggering
-            // (will be re-enabled when process reads the data)
-            uart::disable_rx_interrupt();
-
             // Broadcast FdReadable event to all subscribers of STDIN (fd 0)
-            // This allows event-driven console I/O without blocking syscalls
             kernel::event::broadcast_event(kernel::event::Event::fd_readable(0));
 
             // Also wake any process blocked in legacy blocking read syscall
@@ -389,9 +395,8 @@ pub extern "C" fn irq_exit_resched() {
         sync::cpu_flags().clear_unhandled_stats();
     }
 
-    // 3. Flush log buffers before returning to user
+    // 3. Flush log buffer before returning to user
     klog::flush();
-    kernel::log::flush();  // Legacy (for platform drivers)
 }
 
 /// Print a hex value directly to UART (no allocations, no logging)
@@ -466,43 +471,63 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_str_uart("  CRITICAL: init (devd) crashed!\r\n");
         print_str_uart("  Attempting recovery...\r\n");
 
-        // Step 1: Kill all other tasks
+        // Step 1: Kill all tasks and free slots immediately
+        // (Safe because we're on exception stack, not any task's stack)
         print_str_uart("  Killing all tasks...\r\n");
         unsafe {
             let sched = kernel::task::scheduler();
-            for task_opt in sched.tasks.iter_mut() {
-                if let Some(ref mut task) = task_opt {
-                    if task.id != 0 {  // Don't kill kernel (PID 0 if it exists)
+            for slot_idx in 0..kernel::task::MAX_TASKS {
+                if let Some(ref task) = sched.tasks[slot_idx] {
+                    let pid = task.id;
+                    print_str_uart("  slot[");
+                    print_hex_uart(slot_idx as u64);
+                    print_str_uart("] pid=");
+                    print_hex_uart(pid as u64);
+                    print_str_uart(" '");
+                    for c in task.name.iter().take_while(|&&c| c != 0) {
+                        uart::putc(*c as char);
+                    }
+                    print_str_uart("'\r\n");
+
+                    if pid != 0 {  // Don't kill kernel (PID 0 if it exists)
                         // Cleanup resources
-                        kernel::bus::process_cleanup(task.id);
-                        kernel::shmem::process_cleanup(task.id);
-                        kernel::scheme::process_cleanup(task.id);
-                        kernel::pci::release_all_devices(task.id);
-                        kernel::port::process_cleanup(task.id);
-                        kernel::ipc::process_cleanup(task.id);
-                        task.fd_table.close_all(task.id);
-                        task.state = kernel::task::TaskState::Terminated;
+                        kernel::bus::process_cleanup(pid);
+                        kernel::shmem::process_cleanup(pid);
+                        kernel::scheme::process_cleanup(pid);
+                        kernel::pci::release_all_devices(pid);
+                        let port_wake = kernel::ipc::port_cleanup_task(pid);
+                        kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
+                        let ipc_wake = kernel::ipc::process_cleanup(pid);
+                        kernel::ipc::waker::wake(&ipc_wake, kernel::ipc::WakeReason::Closed);
+
+                        // Close FDs before freeing slot
+                        if let Some(ref mut task) = sched.tasks[slot_idx] {
+                            task.fd_table.close_all(pid);
+                        }
+
+                        // Free slot immediately (bump generation to invalidate stale PIDs)
+                        sched.bump_generation(slot_idx);
+                        sched.tasks[slot_idx] = None;
                     }
                 }
             }
         }
 
-        // Step 2: Reset all buses to safe state
-        print_str_uart("  Resetting all buses...\r\n");
-        kernel::bus::reset_all_buses();
-
-        // Step 3: Respawn devd
+        // Step 2: Respawn devd
+        // (Buses already reset to Safe by process_cleanup above)
         print_str_uart("  Respawning devd...\r\n");
-        match elf::spawn_from_path("devd") {
+        match elf::spawn_from_path("bin/devd") {
             Ok((new_pid, slot)) => {
                 print_str_uart("  devd restarted as PID ");
                 print_hex_uart(new_pid as u64);
                 print_str_uart("\r\n");
 
-                // Give devd ALL capabilities
+                // Give devd ALL capabilities, high priority, and mark as init
                 unsafe {
                     if let Some(ref mut task) = kernel::task::scheduler().tasks[slot] {
                         task.set_capabilities(kernel::caps::Capabilities::ALL);
+                        task.set_priority(kernel::task::Priority::High);  // devd is critical
+                        task.is_init = true;  // Mark as init for heartbeat watchdog
                     }
                 }
 
@@ -554,34 +579,26 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         let sched = kernel::task::scheduler();
         let current_slot = kernel::task::current_slot();
 
-        // Clean up process resources (same as sys_exit)
-        kernel::bus::process_cleanup(pid);
-        kernel::shmem::process_cleanup(pid);
-        kernel::scheme::process_cleanup(pid);
-        kernel::pci::release_all_devices(pid);
-        kernel::port::process_cleanup(pid);
-        kernel::ipc::process_cleanup(pid);
-
-        // Close all file descriptors
-        if let Some(ref mut task) = sched.tasks[current_slot] {
-            task.fd_table.close_all(pid);
-        }
+        // NOTE: Resource cleanup is deferred to reap_terminated() to avoid double-cleanup.
+        // Just mark the task as Terminated here; reap_terminated() will handle:
+        // - bus cleanup (stops DMA)
+        // - shmem, scheme, pci, port, ipc cleanup
+        // - closing file descriptors
+        // - freeing task slot
 
         // Kill all children of this task
         for task_opt in sched.tasks.iter_mut() {
             if let Some(ref mut task) = task_opt {
-                if task.parent_id == pid && task.state != kernel::task::TaskState::Terminated {
+                if task.parent_id == pid && !task.state.is_terminated() {
                     // Mark child as terminated
-                    task.exit_code = -9;  // SIGKILL
-                    task.state = kernel::task::TaskState::Terminated;
+                    task.state = kernel::task::TaskState::Exiting { code: -9 };  // SIGKILL
                 }
             }
         }
 
         // Set exit code and mark as terminated
         if let Some(ref mut task) = sched.tasks[current_slot] {
-            task.exit_code = exit_code;
-            task.state = kernel::task::TaskState::Terminated;
+            task.state = kernel::task::TaskState::Exiting { code: exit_code };
         }
 
         // Notify parent
@@ -591,7 +608,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                     if task.id == parent_id {
                         let event = kernel::event::Event::child_exit(pid, exit_code);
                         task.event_queue.push(event);
-                        if task.state == kernel::task::TaskState::Blocked {
+                        if task.state.is_blocked() {
                             task.state = kernel::task::TaskState::Ready;
                         }
                         break;
@@ -676,6 +693,123 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
 
     loop {
         unsafe { core::arch::asm!("wfe"); }
+    }
+}
+
+/// Static flag to prevent re-entry during devd recovery
+static DEVD_RECOVERY_IN_PROGRESS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Flag set by liveness checker when devd is killed (checked by timer tick)
+#[no_mangle]
+pub static DEVD_LIVENESS_KILLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Recover from devd failure (liveness timeout or other critical failure)
+/// This kills all processes, resets buses, and respawns devd
+#[no_mangle]
+pub extern "C" fn recover_devd() {
+    use core::sync::atomic::Ordering;
+
+    // Prevent re-entry
+    if DEVD_RECOVERY_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    print_str_uart("\r\n=== DEVD LIVENESS TIMEOUT ===\r\n");
+    print_str_uart("  devd failed to respond to liveness probe\r\n");
+    print_str_uart("  Attempting recovery...\r\n");
+
+    // Step 1: Kill all tasks and free slots immediately
+    // (Safe because we're on exception/interrupt stack, not any task's stack)
+    print_str_uart("  Killing all tasks...\r\n");
+    unsafe {
+        let sched = kernel::task::scheduler();
+        for slot_idx in 0..kernel::task::MAX_TASKS {
+            if let Some(ref task) = sched.tasks[slot_idx] {
+                let pid = task.id;
+                if pid != 0 {  // Don't kill kernel (PID 0 if it exists)
+                    // Cleanup resources
+                    kernel::bus::process_cleanup(pid);
+                    kernel::shmem::process_cleanup(pid);
+                    kernel::scheme::process_cleanup(pid);
+                    kernel::pci::release_all_devices(pid);
+                    let port_wake = kernel::ipc::port_cleanup_task(pid);
+                    kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
+                    let ipc_wake = kernel::ipc::process_cleanup(pid);
+                    kernel::ipc::waker::wake(&ipc_wake, kernel::ipc::WakeReason::Closed);
+
+                    // Close FDs before freeing slot
+                    if let Some(ref mut task) = sched.tasks[slot_idx] {
+                        task.fd_table.close_all(pid);
+                    }
+
+                    // Free slot immediately (bump generation to invalidate stale PIDs)
+                    sched.bump_generation(slot_idx);
+                    sched.tasks[slot_idx] = None;
+                }
+            }
+        }
+    }
+
+    // Step 2: Respawn devd
+    // (Buses already reset to Safe by process_cleanup above)
+    print_str_uart("  Respawning devd...\r\n");
+    match elf::spawn_from_path("bin/devd") {
+        Ok((new_pid, slot)) => {
+            print_str_uart("  devd restarted as PID ");
+            print_hex_uart(new_pid as u64);
+            print_str_uart("\r\n");
+
+            // Give devd ALL capabilities, high priority, and mark as init
+            unsafe {
+                if let Some(ref mut task) = kernel::task::scheduler().tasks[slot] {
+                    task.set_capabilities(kernel::caps::Capabilities::ALL);
+                    task.set_priority(kernel::task::Priority::High);  // devd is critical
+                    task.is_init = true;  // Mark as init for heartbeat watchdog
+                }
+            }
+
+            // Schedule devd
+            unsafe {
+                let sched = kernel::task::scheduler();
+                kernel::task::set_current_slot(slot);
+                sched.current = slot;
+                if let Some(ref mut task) = sched.tasks[slot] {
+                    task.state = kernel::task::TaskState::Running;
+                }
+                kernel::task::update_current_task_globals();
+            }
+
+            print_str_uart("  Recovery complete.\r\n");
+            DEVD_RECOVERY_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+        Err(e) => {
+            print_str_uart("  FATAL: Failed to respawn devd: ");
+            let err_str = match e {
+                elf::ElfError::BadMagic => "bad_magic",
+                elf::ElfError::Not64Bit => "not_64bit",
+                elf::ElfError::NotLittleEndian => "not_le",
+                elf::ElfError::NotExecutable => "not_exec",
+                elf::ElfError::WrongArch => "wrong_arch",
+                elf::ElfError::TooSmall => "too_small",
+                elf::ElfError::OutOfMemory => "oom",
+                elf::ElfError::InvalidSegment => "invalid_seg",
+                elf::ElfError::SignatureInvalid => "sig_invalid",
+            };
+            print_str_uart(err_str);
+            print_str_uart("\r\n");
+
+            // Try hardware reboot
+            print_str_uart("  Attempting system reboot...\r\n");
+            kernel::syscall::hardware_reset();
+
+            // If reset fails, halt
+            print_str_uart("  System halted.\r\n");
+            loop {
+                unsafe { core::arch::asm!("wfe"); }
+            }
+        }
     }
 }
 

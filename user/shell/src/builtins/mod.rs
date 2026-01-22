@@ -6,7 +6,9 @@
 //! To disable a builtin, simply comment out its `pub mod` line and the
 //! corresponding match arm in main.rs.
 
+pub mod devd;
 pub mod gpio;
+pub mod handle;
 pub mod hw;
 pub mod ls;
 pub mod ps;

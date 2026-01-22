@@ -1,0 +1,14 @@
+[package]
+name = "abi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "abi"
+path = "src/lib.rs"
+
+[dependencies]
+# No dependencies - pure data types only
+
+[features]
+default = []

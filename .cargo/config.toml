@@ -7,3 +7,6 @@ rustflags = ["-C", "link-arg=-Tsrc/linker.ld"]
 [unstable]
 build-std = ["core"]
 build-std-features = ["compiler-builtins-mem"]
+
+# For running unit tests on host, use ./test.sh
+# (temporarily disables this config to use native target)

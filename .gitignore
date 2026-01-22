@@ -24,3 +24,11 @@ user/usbtest/target/
 .DS_Store
 Thumbs.db
 linux
+
+# Build artifacts in subdirectories
+user/driver/devd/target/
+user/userlib/target/
+
+# Debug logs
+*.log
+!docs/**/*.log

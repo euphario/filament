@@ -127,6 +127,13 @@ impl ByteRing {
         header.tail = AtomicU32::new(0);
 
         // Memory barrier to ensure header is visible
+        // Use DSB SY to ensure all writes complete to memory (not just cache)
+        // This is critical for non-cacheable shared memory
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         core::sync::atomic::fence(Ordering::Release);
 
         Ok(Self {
@@ -147,6 +154,12 @@ impl ByteRing {
             return Err(ByteRingError::ShmemMapFailed);
         }
         let base = vaddr;
+
+        // DSB + ISB to ensure we see the latest memory state
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+        }
 
         // Memory barrier before reading header
         core::sync::atomic::fence(Ordering::Acquire);
@@ -344,3 +357,179 @@ impl ByteRing {
 // - Producer calls futex_wake(&header.head) after write
 // - Consumer calls futex_wait(&header.head, last_head) to sleep until data
 // This eliminates the need for IPC doorbell messages
+
+/// Default timeout for ring operations (10 seconds)
+/// After this, we report a stall but continue trying
+pub const RING_STALL_TIMEOUT_MS: u64 = 10_000;
+
+impl ByteRing {
+    /// Write all bytes to the ring, waiting if necessary (with stall detection)
+    ///
+    /// This will block until all data is written, but reports stalls if
+    /// the consumer isn't draining the ring fast enough.
+    ///
+    /// Returns the number of bytes written (always == data.len() unless error)
+    ///
+    /// NOTE: Prefer using non-blocking write() with mux/doorbell pattern.
+    /// TODO: Replace with futex-based notification.
+    pub fn write_all(&self, data: &[u8]) -> usize {
+        debug_assert!(self.is_producer);
+
+        let mut offset = 0;
+        let start = syscall::gettime();
+        let mut last_progress = start;
+        let mut stall_count = 0u32;
+
+        while offset < data.len() {
+            let written = self.write(&data[offset..]);
+            if written > 0 {
+                offset += written;
+                last_progress = syscall::gettime();
+            } else {
+                // Ring full - check for stall
+                let now = syscall::gettime();
+                let stall_ms = (now - last_progress) / 1_000_000;
+
+                if stall_ms > RING_STALL_TIMEOUT_MS {
+                    stall_count += 1;
+                    let total_ms = (now - start) / 1_000_000;
+                    report_ring_stall("write", self.shmem_id, total_ms as u32, stall_count);
+                    last_progress = now; // Reset stall timer
+                }
+
+                // Sleep 1ms and retry (TODO: use futex)
+                crate::mmio::delay_ms(1);
+            }
+        }
+        offset
+    }
+
+    /// Read bytes from the ring, waiting if necessary (with stall detection)
+    ///
+    /// Blocks until at least one byte is available, with stall detection
+    /// if no data arrives within the timeout period.
+    ///
+    /// Returns number of bytes read (0 only on sustained timeout)
+    ///
+    /// NOTE: Prefer using non-blocking read() with mux/doorbell pattern.
+    /// TODO: Replace with futex-based notification.
+    pub fn read_wait(&self, buf: &mut [u8]) -> usize {
+        debug_assert!(!self.is_producer);
+
+        let start = syscall::gettime();
+        let mut stall_count = 0u32;
+
+        loop {
+            let n = self.read(buf);
+            if n > 0 {
+                return n;
+            }
+
+            // No data - check for stall
+            let now = syscall::gettime();
+            let wait_ms = (now - start) / 1_000_000;
+
+            if wait_ms > RING_STALL_TIMEOUT_MS * (stall_count as u64 + 1) {
+                stall_count += 1;
+                report_ring_stall("read", self.shmem_id, wait_ms as u32, stall_count);
+            }
+
+            // Sleep 1ms and retry (TODO: use futex)
+            crate::mmio::delay_ms(1);
+        }
+    }
+
+    /// Read bytes with deadline (0 = poll, MAX = forever)
+    ///
+    /// Returns number of bytes read, or 0 if deadline exceeded with no data
+    ///
+    /// NOTE: Prefer using non-blocking read() with mux/doorbell pattern.
+    /// TODO: Replace with futex-based notification.
+    pub fn read_deadline(&self, buf: &mut [u8], deadline: u64) -> usize {
+        debug_assert!(!self.is_producer);
+
+        let start = syscall::gettime();
+        let mut stall_count = 0u32;
+
+        loop {
+            let n = self.read(buf);
+            if n > 0 {
+                return n;
+            }
+
+            // Check deadline
+            let now = syscall::gettime();
+            if deadline != u64::MAX && now >= deadline {
+                return 0; // Deadline exceeded
+            }
+
+            // Check for stall (only if waiting long)
+            let wait_ms = (now - start) / 1_000_000;
+            if wait_ms > RING_STALL_TIMEOUT_MS * (stall_count as u64 + 1) {
+                stall_count += 1;
+                report_ring_stall("read", self.shmem_id, wait_ms as u32, stall_count);
+            }
+
+            // Sleep 1ms and retry (TODO: use futex)
+            crate::mmio::delay_ms(1);
+        }
+    }
+}
+
+/// Report a ring stall condition
+fn report_ring_stall(op: &str, shmem_id: u32, elapsed_ms: u32, count: u32) {
+    // Write to debug output: "RING_STALL op shmem=X wait=Yms #Z\n"
+    let mut msg = [0u8; 64];
+    let mut pos = 0;
+
+    let prefix = b"RING_STALL ";
+    msg[pos..pos + prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+
+    let op_bytes = op.as_bytes();
+    let op_len = op_bytes.len().min(8);
+    msg[pos..pos + op_len].copy_from_slice(&op_bytes[..op_len]);
+    pos += op_len;
+
+    msg[pos..pos + 7].copy_from_slice(b" shmem=");
+    pos += 7;
+    pos += write_u32_dec(&mut msg[pos..], shmem_id);
+
+    msg[pos..pos + 6].copy_from_slice(b" wait=");
+    pos += 6;
+    pos += write_u32_dec(&mut msg[pos..], elapsed_ms);
+
+    msg[pos..pos + 4].copy_from_slice(b"ms #");
+    pos += 4;
+    pos += write_u32_dec(&mut msg[pos..], count);
+
+    msg[pos] = b'\n';
+    pos += 1;
+
+    let _ = syscall::write(1, &msg[..pos]);
+}
+
+/// Write u32 as decimal to buffer
+fn write_u32_dec(buf: &mut [u8], mut val: u32) -> usize {
+    if val == 0 {
+        if !buf.is_empty() {
+            buf[0] = b'0';
+            return 1;
+        }
+        return 0;
+    }
+
+    let mut tmp = [0u8; 10];
+    let mut len = 0;
+    while val > 0 && len < 10 {
+        tmp[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
+    }
+
+    let copy_len = len.min(buf.len());
+    for i in 0..copy_len {
+        buf[i] = tmp[len - 1 - i];
+    }
+    copy_len
+}

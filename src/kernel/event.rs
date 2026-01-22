@@ -62,6 +62,8 @@ pub enum EventType {
     Signal = 7,
     /// Kernel log available (for logd)
     KlogReady = 8,
+    /// Shared memory region is being destroyed (owner died)
+    ShmemInvalid = 9,
 }
 
 /// Unified event filter - what to wait for (BSD kqueue-inspired)
@@ -87,6 +89,8 @@ pub enum EventFilter {
     Signal(u32),
     /// Kernel log available
     KlogReady,
+    /// Shared memory region is being destroyed (shmem_id)
+    ShmemInvalid(u32),
 }
 
 impl EventFilter {
@@ -101,6 +105,7 @@ impl EventFilter {
             EventFilter::Write(_) => EventType::FdWritable,
             EventFilter::Signal(_) => EventType::Signal,
             EventFilter::KlogReady => EventType::KlogReady,
+            EventFilter::ShmemInvalid(_) => EventType::ShmemInvalid,
         }
     }
 
@@ -115,6 +120,7 @@ impl EventFilter {
             EventFilter::Write(fd) => *fd as u64,
             EventFilter::Signal(num) => *num as u64,
             EventFilter::KlogReady => 0,
+            EventFilter::ShmemInvalid(id) => *id as u64,
         }
     }
 
@@ -130,6 +136,7 @@ impl EventFilter {
             6 => Some(EventFilter::Write(filter_value)),
             7 => Some(EventFilter::Signal(filter_value)),
             8 => Some(EventFilter::KlogReady),
+            9 => Some(EventFilter::ShmemInvalid(filter_value)),
             _ => None,
         }
     }
@@ -229,6 +236,17 @@ impl Event {
         }
     }
 
+    /// Shared memory region is being destroyed (owner died)
+    /// data = shmem_id, source_pid = owner_pid who is dying
+    pub fn shmem_invalid(shmem_id: u32, owner_pid: u32) -> Self {
+        Self {
+            event_type: EventType::ShmemInvalid,
+            data: shmem_id as u64,
+            flags: 0,
+            source_pid: owner_pid,
+        }
+    }
+
     pub fn fd_readable(fd: u64) -> Self {
         Self {
             event_type: EventType::FdReadable,
@@ -239,6 +257,29 @@ impl Event {
     }
 }
 
+/// Subscription state - explicit enum instead of bool
+///
+/// This makes the state machine clearer than a simple `active: bool`:
+/// - Empty: Slot available for new subscription
+/// - Active: Listening for events
+///
+/// Future extensions could add:
+/// - OneShot: Auto-unsubscribe after first event
+/// - Paused: Temporarily disabled
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionState {
+    /// Slot not in use
+    Empty,
+    /// Subscription is active, listening for events
+    Active,
+}
+
+impl Default for SubscriptionState {
+    fn default() -> Self {
+        SubscriptionState::Empty
+    }
+}
+
 /// Event subscription - what events a process wants to receive
 #[derive(Debug, Clone, Copy)]
 pub struct EventSubscription {
@@ -246,8 +287,8 @@ pub struct EventSubscription {
     pub event_type: EventType,
     /// Filter data (e.g., specific channel ID, IRQ number)
     pub filter: u64,
-    /// Whether this subscription is active
-    pub active: bool,
+    /// Subscription state
+    pub state: SubscriptionState,
 }
 
 impl EventSubscription {
@@ -255,8 +296,14 @@ impl EventSubscription {
         Self {
             event_type: EventType::None,
             filter: 0,
-            active: false,
+            state: SubscriptionState::Empty,
         }
+    }
+
+    /// Check if this subscription is active
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, SubscriptionState::Active)
     }
 }
 
@@ -279,8 +326,8 @@ pub struct EventQueue {
     critical_read_idx: usize,
     critical_write_idx: usize,
 
-    /// Subscriptions
-    subscriptions: [EventSubscription; MAX_EVENTS],
+    /// Subscriptions (public for liveness checker)
+    pub subscriptions: [EventSubscription; MAX_EVENTS],
 }
 
 impl EventQueue {
@@ -309,7 +356,7 @@ impl EventQueue {
     pub fn subscribe(&mut self, event_type: EventType, filter: u64) -> Result<(), i64> {
         // Count existing subscriptions for this type to prevent exhaustion
         let type_count = self.subscriptions.iter()
-            .filter(|s| s.active && s.event_type == event_type)
+            .filter(|s| s.is_active() && s.event_type == event_type)
             .count();
 
         if type_count >= MAX_SUBSCRIPTIONS_PER_TYPE {
@@ -318,10 +365,10 @@ impl EventQueue {
 
         // Find a free slot
         for sub in self.subscriptions.iter_mut() {
-            if !sub.active {
+            if sub.state == SubscriptionState::Empty {
                 sub.event_type = event_type;
                 sub.filter = filter;
-                sub.active = true;
+                sub.state = SubscriptionState::Active;
                 return Ok(());
             }
         }
@@ -336,8 +383,8 @@ impl EventQueue {
     /// Unsubscribe from an event type
     pub fn unsubscribe(&mut self, event_type: EventType, filter: u64) -> bool {
         for sub in self.subscriptions.iter_mut() {
-            if sub.active && sub.event_type == event_type && sub.filter == filter {
-                sub.active = false;
+            if sub.is_active() && sub.event_type == event_type && sub.filter == filter {
+                sub.state = SubscriptionState::Empty;
                 return true;
             }
         }
@@ -347,7 +394,7 @@ impl EventQueue {
     /// Check if subscribed to this event
     pub fn is_subscribed(&self, event: &Event) -> bool {
         for sub in &self.subscriptions {
-            if sub.active && sub.event_type == event.event_type {
+            if sub.is_active() && sub.event_type == event.event_type {
                 // Filter check: 0 means any, otherwise must match
                 if sub.filter == 0 || sub.filter == event.data {
                     return true;
@@ -433,6 +480,105 @@ impl EventQueue {
             None
         }
     }
+
+    /// Check for a pending ChildExit event matching a specific child PID
+    ///
+    /// child_pid: PID to look for (0 = any child)
+    /// Returns Some((child_pid, exit_code)) if found, None otherwise.
+    /// Does NOT consume the event - caller must call pop_child_exit() to consume.
+    pub fn peek_child_exit(&self, child_pid: u32) -> Option<(u32, i32)> {
+        if self.critical_count == 0 {
+            return None;
+        }
+
+        // Scan the critical queue for matching ChildExit events
+        let mut idx = self.critical_read_idx;
+        for _ in 0..self.critical_count {
+            let event = &self.critical_events[idx];
+            if event.event_type == EventType::ChildExit {
+                let exit_pid = event.data as u32;
+                let exit_code = event.flags as i32;
+
+                // Match if watching this specific child or any child
+                if child_pid == 0 || child_pid == exit_pid {
+                    return Some((exit_pid, exit_code));
+                }
+            }
+            idx = (idx + 1) % MAX_CRITICAL_EVENTS;
+        }
+        None
+    }
+
+    /// Pop (consume) a pending ChildExit event matching a specific child PID
+    ///
+    /// child_pid: PID to look for (0 = any child)
+    /// Returns Some((child_pid, exit_code)) if found and consumed, None otherwise.
+    pub fn pop_child_exit(&mut self, child_pid: u32) -> Option<(u32, i32)> {
+        if self.critical_count == 0 {
+            return None;
+        }
+
+        // Scan the critical queue for matching ChildExit events
+        let mut idx = self.critical_read_idx;
+        for i in 0..self.critical_count {
+            let event = &self.critical_events[idx];
+            if event.event_type == EventType::ChildExit {
+                let exit_pid = event.data as u32;
+                let exit_code = event.flags as i32;
+
+                // Match if watching this specific child or any child
+                if child_pid == 0 || child_pid == exit_pid {
+                    // Remove this event by shifting subsequent events
+                    // This is O(n) but critical queue is small (4 elements)
+                    let mut src = idx;
+                    for _ in i..self.critical_count - 1 {
+                        let next = (src + 1) % MAX_CRITICAL_EVENTS;
+                        self.critical_events[src] = self.critical_events[next];
+                        src = next;
+                    }
+                    self.critical_count -= 1;
+                    // Adjust write index
+                    if self.critical_count == 0 {
+                        self.critical_write_idx = self.critical_read_idx;
+                    } else {
+                        self.critical_write_idx = (self.critical_read_idx + self.critical_count) % MAX_CRITICAL_EVENTS;
+                    }
+                    return Some((exit_pid, exit_code));
+                }
+            }
+            idx = (idx + 1) % MAX_CRITICAL_EVENTS;
+        }
+        None
+    }
+
+    /// Check for a pending ShmemInvalid event matching a specific shmem ID
+    ///
+    /// shmem_id: ID to look for (0 = any shmem)
+    /// Returns Some((shmem_id, owner_pid)) if found, None otherwise.
+    /// Does NOT consume the event - caller must call pop_next() to consume.
+    pub fn peek_shmem_invalid(&self, shmem_id: u32) -> Option<(u32, u32)> {
+        // ShmemInvalid events go to the normal queue, not critical queue
+        if self.count == 0 {
+            return None;
+        }
+
+        // Scan the normal queue for matching ShmemInvalid events
+        let mut idx = self.read_idx;
+        for _ in 0..self.count {
+            let event = &self.events[idx];
+            if event.event_type == EventType::ShmemInvalid {
+                let found_id = event.data as u32;
+                let owner_pid = event.source_pid;
+
+                // Match if watching this specific shmem or any shmem
+                if shmem_id == 0 || shmem_id == found_id {
+                    return Some((found_id, owner_pid));
+                }
+            }
+            idx = (idx + 1) % MAX_EVENTS;
+        }
+        None
+    }
 }
 
 // NOTE: Global EventSystem removed - all events now go directly to per-task queues.
@@ -457,10 +603,8 @@ pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
                 // Check if task is subscribed to this event type
                 if task.event_queue.is_subscribed(&event) {
                     if task.event_queue.push(event) {
-                        // Wake task if blocked
-                        if task.state == super::task::TaskState::Blocked {
-                            task.state = super::task::TaskState::Ready;
-                        }
+                        // Wake task if blocked (using unified wake function)
+                        sched.wake_task(slot);
                         return true;
                     }
                 }
@@ -488,8 +632,10 @@ pub fn broadcast_event(event: Event) -> usize {
                 if task.event_queue.is_subscribed(&event) {
                     if task.event_queue.push(event) {
                         // Wake task if blocked
-                        if task.state == super::task::TaskState::Blocked {
+                        if task.state.is_blocked() {
                             task.state = super::task::TaskState::Ready;
+                            // Reset liveness - task received event
+                            task.liveness_state = super::liveness::LivenessState::Normal;
                         }
                         delivered += 1;
                     }
@@ -592,8 +738,10 @@ pub fn sys_event_wait_internal(flags: u32) -> Option<Event> {
                 return None;
             }
 
-            // Would block - mark task as waiting
-            task.state = super::task::TaskState::Blocked;
+            // Would block - mark task as sleeping on event loop
+            task.state = super::task::TaskState::Sleeping {
+                reason: super::task::SleepReason::EventLoop,
+            };
         }
     }
     None

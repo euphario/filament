@@ -3,9 +3,11 @@
 # Creates kernel.bin ready for loading via U-Boot xmodem
 #
 # Usage:
-#   ./build.sh                    # Normal build, firmware via USB
+#   ./build.sh                    # Normal build (incremental)
 #   ./build.sh --test             # Build with self-tests enabled
 #   ./build.sh --with-firmware    # Embed MT7996 firmware in initrd (~3MB larger)
+#   ./build.sh --skip-user        # Skip userspace build (kernel only)
+#   ./build.sh --only devd shell  # Build only specific userspace programs
 
 set -e
 
@@ -17,16 +19,35 @@ FEATURES=""
 BUILD_TYPE="Production"
 INITRD_OPTS=""
 FIRMWARE_MODE="USB (fatfs)"
+SKIP_USER=false
+USER_PROGRAMS=""
 
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --test|-t)
             FEATURES="--features selftest"
             BUILD_TYPE="Development (with self-tests)"
+            shift
             ;;
         --with-firmware)
             INITRD_OPTS="--with-firmware"
             FIRMWARE_MODE="Embedded"
+            shift
+            ;;
+        --skip-user)
+            SKIP_USER=true
+            shift
+            ;;
+        --only)
+            shift
+            # Collect remaining args as program names
+            while [ $# -gt 0 ] && [[ ! "$1" =~ ^-- ]]; do
+                USER_PROGRAMS="$USER_PROGRAMS $1"
+                shift
+            done
+            ;;
+        *)
+            shift
             ;;
     esac
 done
@@ -38,9 +59,11 @@ echo "  Firmware: $FIRMWARE_MODE"
 echo "========================================"
 echo
 
-# Step 0: Compile device tree
-echo "Step 0: Compiling device tree..."
-if command -v dtc >/dev/null 2>&1; then
+# Step 0: Compile device tree (skip if unchanged)
+if [ -f bpi-r4.dtb ] && [ bpi-r4.dtb -nt bpi-r4.dts ]; then
+    echo "Step 0: Device tree (unchanged)"
+elif command -v dtc >/dev/null 2>&1; then
+    echo "Step 0: Compiling device tree..."
     dtc -I dts -O dtb -o bpi-r4.dtb bpi-r4.dts 2>/dev/null || {
         echo "  Warning: dtc failed, skipping DTB"
     }
@@ -49,14 +72,20 @@ if command -v dtc >/dev/null 2>&1; then
         echo "  Created: bpi-r4.dtb ($DTB_SIZE)"
     fi
 else
-    echo "  Warning: dtc not found, skipping DTB compilation"
-    echo "  Install with: brew install dtc (macOS) or apt install device-tree-compiler (Linux)"
+    echo "Step 0: Warning: dtc not found, skipping DTB"
 fi
 echo
 
 # Step 1: Build user programs
-echo "Step 1: Building user programs..."
-(cd user && ./build.sh)
+if [ "$SKIP_USER" = true ]; then
+    echo "Step 1: Skipping user programs (--skip-user)"
+elif [ -n "$USER_PROGRAMS" ]; then
+    echo "Step 1: Building user programs:$USER_PROGRAMS"
+    (cd user && ./build.sh $USER_PROGRAMS)
+else
+    echo "Step 1: Building user programs (incremental)..."
+    (cd user && ./build.sh)
+fi
 echo
 
 # Step 2: Create initrd

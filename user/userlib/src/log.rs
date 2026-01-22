@@ -120,7 +120,7 @@ pub fn flush() {
         }
 
         // Write chunk to stdout via syscall
-        crate::syscall::write(crate::syscall::STDOUT, &chunk[..n]);
+        let _ = crate::syscall::write(crate::syscall::Handle::STDOUT, &chunk[..n]);
     }
 }
 

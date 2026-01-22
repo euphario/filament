@@ -7,6 +7,11 @@
 #![no_main]
 
 use userlib::{uinfo, uerror, syscall};
+use userlib::syscall::{
+    Handle, WaitFilter, WaitRequest, WaitResult,
+    handle_timer_create, handle_timer_set, handle_wait,
+    handle_wrap_channel,
+};
 use userlib::ulog;
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 use pcie::{PcieClient, PcieDeviceInfo};
@@ -590,35 +595,80 @@ fn main() {
         uerror!("nvmed", "init_failed"; op = "port_register", err = port as u64, next = "exit");
         syscall::exit(1);
     }
-    let port = port as u32;
+    let port_id = port as u32;
+
+    // Create timer handle for polling (Handle API)
+    // 1ms polling interval for ring buffer requests
+    const POLL_INTERVAL_NS: u64 = 1_000_000; // 1ms
+    let timer_handle = match handle_timer_create() {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("nvmed", "init_failed"; op = "timer_create", err = 0u64, next = "exit");
+            syscall::exit(1);
+        }
+    };
+
+    // Set timer as recurring
+    if handle_timer_set(timer_handle, POLL_INTERVAL_NS, POLL_INTERVAL_NS).is_err() {
+        uerror!("nvmed", "init_failed"; op = "timer_set", err = 0u64, next = "exit");
+        syscall::exit(1);
+    }
+
+    // Wrap the listen channel as a handle (Handle API)
+    let port_handle = match handle_wrap_channel(port_id) {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("nvmed", "init_failed"; op = "port_wrap", err = 0u64, next = "exit");
+            syscall::exit(1);
+        }
+    };
 
     uinfo!("nvmed", "ready");
 
     // Client management
     let mut clients: [Option<BlockServer>; MAX_CLIENTS] = [None, None, None, None];
 
+    // Event-driven main loop (Handle API)
+    let requests = [
+        WaitRequest::new(timer_handle, WaitFilter::Timer),
+        WaitRequest::new(port_handle, WaitFilter::Readable),
+    ];
+    let mut results = [WaitResult::empty(); 2];
+
     loop {
-        // Accept new connections
-        let new_channel = syscall::port_accept(port);
-        if new_channel >= 0 {
-            if let Some(server) = BlockServer::try_handshake(new_channel as u32) {
-                uinfo!("nvmed", "client_connected"; pid = server.client_pid as u64);
-                // Find empty slot
-                for slot in clients.iter_mut() {
-                    if slot.is_none() {
-                        *slot = Some(server);
-                        break;
+        // Wait for timer or client connection (blocking)
+        let count = match handle_wait(&requests, &mut results, u64::MAX) {
+            Ok(n) => n,
+            Err(_) => {
+                syscall::yield_now();
+                continue;
+            }
+        };
+
+        // Process each ready handle
+        for result in &results[..count] {
+            if result.handle.raw() == timer_handle.raw() {
+                // Timer fired - process ring buffer requests from all clients
+                for client in clients.iter_mut().flatten() {
+                    client.process_requests(&mut ctrl);
+                }
+            } else if result.handle.raw() == port_handle.raw() {
+                // New client connection ready
+                let new_channel = syscall::port_accept(port_id);
+                if new_channel >= 0 {
+                    if let Some(server) = BlockServer::try_handshake(new_channel as u32) {
+                        uinfo!("nvmed", "client_connected"; pid = server.client_pid as u64);
+                        // Find empty slot
+                        for slot in clients.iter_mut() {
+                            if slot.is_none() {
+                                *slot = Some(server);
+                                break;
+                            }
+                        }
                     }
+                    syscall::close(new_channel as u32);
                 }
             }
-            syscall::close(new_channel as u32);
         }
-
-        // Process requests from all connected clients
-        for client in clients.iter_mut().flatten() {
-            client.process_requests(&mut ctrl);
-        }
-
-        syscall::yield_now();
     }
 }

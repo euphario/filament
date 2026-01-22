@@ -28,6 +28,11 @@ pub use bot_state::{BotStateMachine, DeviceState, TransferPhase, RecoveryState, 
 use userlib::{println, syscall};
 use userlib::{uinfo, uwarn, uerror};
 use userlib::syscall::O_NONBLOCK;
+use userlib::syscall::{
+    Handle, WaitFilter, WaitRequest, WaitResult,
+    handle_timer_create, handle_timer_set, handle_wait,
+    handle_wrap_channel,
+};
 use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
 
 // Import from the usb driver library
@@ -4912,6 +4917,32 @@ fn main() {
     let usb_port = port_result as u32;
     uinfo!("usbd", "port_registered");
 
+    // Create timer handle for polling (Handle API)
+    // 10ms polling interval for xHCI events
+    const POLL_INTERVAL_NS: u64 = 10_000_000; // 10ms
+    let timer_handle = match handle_timer_create() {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("usbd", "timer_create_failed");
+            syscall::exit(1);
+        }
+    };
+
+    // Set timer as recurring
+    if handle_timer_set(timer_handle, POLL_INTERVAL_NS, POLL_INTERVAL_NS).is_err() {
+        uerror!("usbd", "timer_set_failed");
+        syscall::exit(1);
+    }
+
+    // Wrap the listen channel as a handle (Handle API)
+    let port_handle = match handle_wrap_channel(usb_port) {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("usbd", "port_wrap_failed");
+            syscall::exit(1);
+        }
+    };
+
     // Initialize client tracking
     const MAX_CLIENTS: usize = 4;
     let mut clients: [Option<BlockServer>; MAX_CLIENTS] = [None, None, None, None];
@@ -4945,62 +4976,81 @@ fn main() {
 
     let mut heartbeat_counter = 0u32;
 
+    // Event-driven main loop (Handle API)
+    let requests = [
+        WaitRequest::new(timer_handle, WaitFilter::Timer),
+        WaitRequest::new(port_handle, WaitFilter::Readable),
+    ];
+    let mut results = [WaitResult::empty(); 2];
+
     loop {
-        heartbeat_counter += 1;
-
-        // Reset heartbeat counter every ~100s (heartbeat logging disabled)
-        if heartbeat_counter >= 10000 {
-            heartbeat_counter = 0;
-        }
-
-        // Poll xHCI events every iteration for responsive hotplug
-        let ports_to_enum = driver.poll_events();
-        if ports_to_enum != 0 {
-            driver.enumerate_pending_ports(ports_to_enum);
-        }
-
-        // Poll hub ports every ~1 second (100 iterations) for hotplug detection
-        if heartbeat_counter % 100 == 0 && heartbeat_counter > 0 {
-            // Check if we need to retry hub interrupt submission
-            if let Some(ref hub) = driver.hub_device {
-                if hub.irq_retry_pending {
-                    driver.requeue_hub_interrupt();
-                }
+        // Wait for timer or client connection (blocking)
+        let count = match handle_wait(&requests, &mut results, u64::MAX) {
+            Ok(n) => n,
+            Err(_) => {
+                syscall::yield_now();
+                continue;
             }
-            driver.poll_hub_ports_quick();
-        }
+        };
 
-        // Accept new client connections
-        let accept_result = syscall::port_accept(usb_port);
-        if accept_result > 0 && num_clients < MAX_CLIENTS {
-            let client_channel = accept_result as u32;
+        // Process each ready handle
+        for result in &results[..count] {
+            if result.handle.raw() == timer_handle.raw() {
+                // Timer fired - poll xHCI events
+                heartbeat_counter += 1;
 
-            // Create BlockServer and complete handshake
-            let mut client = BlockServer::new(client_channel);
-            if client.try_handshake() {
-                // Add to clients array
+                // Reset heartbeat counter every ~100s
+                if heartbeat_counter >= 10000 {
+                    heartbeat_counter = 0;
+                }
+
+                // Poll xHCI events every timer tick for responsive hotplug
+                let ports_to_enum = driver.poll_events();
+                if ports_to_enum != 0 {
+                    driver.enumerate_pending_ports(ports_to_enum);
+                }
+
+                // Poll hub ports every ~1 second (100 iterations) for hotplug detection
+                if heartbeat_counter % 100 == 0 && heartbeat_counter > 0 {
+                    // Check if we need to retry hub interrupt submission
+                    if let Some(ref hub) = driver.hub_device {
+                        if hub.irq_retry_pending {
+                            driver.requeue_hub_interrupt();
+                        }
+                    }
+                    driver.poll_hub_ports_quick();
+                }
+
+                // Process ring requests from all ready clients
                 for i in 0..MAX_CLIENTS {
-                    if clients[i].is_none() {
-                        clients[i] = Some(client);
-                        num_clients += 1;
-                        uinfo!("usbd", "client_connected"; count = num_clients as u64);
-                        break;
+                    if let Some(ref mut client) = clients[i] {
+                        if client.is_ready() {
+                            client.process_requests(&mut driver);
+                        }
+                    }
+                }
+            } else if result.handle.raw() == port_handle.raw() {
+                // New client connection ready
+                let accept_result = syscall::port_accept(usb_port);
+                if accept_result > 0 && num_clients < MAX_CLIENTS {
+                    let client_channel = accept_result as u32;
+
+                    // Create BlockServer and complete handshake
+                    let mut client = BlockServer::new(client_channel);
+                    if client.try_handshake() {
+                        // Add to clients array
+                        for i in 0..MAX_CLIENTS {
+                            if clients[i].is_none() {
+                                clients[i] = Some(client);
+                                num_clients += 1;
+                                uinfo!("usbd", "client_connected"; count = num_clients as u64);
+                                break;
+                            }
+                        }
                     }
                 }
             }
         }
-
-        // Process ring requests from all ready clients
-        for i in 0..MAX_CLIENTS {
-            if let Some(ref mut client) = clients[i] {
-                if client.is_ready() {
-                    client.process_requests(&mut driver);
-                }
-            }
-        }
-
-        // Use a short delay instead of yield for testing
-        delay_ms(10);
     }
 
     // Note: loop is infinite, this is unreachable

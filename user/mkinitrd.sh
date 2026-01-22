@@ -101,9 +101,10 @@ echo ""
 
 # Also create a binary blob that can be embedded or loaded
 # Add padding to align to 4KB for easier loading
-PADDED_SIZE=$(( (($(stat -f%z "$OUTPUT") + 4095) / 4096) * 4096 ))
-dd if=/dev/zero bs=1 count=$PADDED_SIZE of="${OUTPUT%.tar}.img" 2>/dev/null
-dd if="$OUTPUT" of="${OUTPUT%.tar}.img" conv=notrunc 2>/dev/null
+cp "$OUTPUT" "${OUTPUT%.tar}.img"
+CURRENT_SIZE=$(stat -f%z "${OUTPUT%.tar}.img" 2>/dev/null || stat -c%s "${OUTPUT%.tar}.img")
+PADDED_SIZE=$(( ((CURRENT_SIZE + 4095) / 4096) * 4096 ))
+truncate -s "$PADDED_SIZE" "${OUTPUT%.tar}.img"
 echo "Created: ${OUTPUT%.tar}.img ($(ls -lh "${OUTPUT%.tar}.img" | awk '{print $5}'), 4KB aligned)"
 
 # Cleanup staging

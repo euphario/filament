@@ -5,6 +5,18 @@ edition = "2021"
 authors = ["Your Name"]
 description = "Bare-metal kernel for Banana Pi BPI-R4 (MT7988A)"
 
+[lib]
+name = "bpi_r4_kernel"
+path = "src/lib.rs"
+# Enable tests for pure-logic modules only
+test = true
+
+[[bin]]
+name = "bpi-r4-kernel"
+path = "src/main.rs"
+# Binary is no_std, no test harness
+test = false
+
 [features]
 default = ["embed-initrd", "embed-dtb"]
 embed-initrd = []  # Embed user/initrd.tar in kernel binary
@@ -12,6 +24,7 @@ embed-dtb = []     # Embed bpi-r4.dtb in kernel binary
 selftest = []      # Run self-tests during boot (slows boot, useful for dev)
 
 [dependencies]
+abi = { path = "user/abi" }
 
 [profile.dev]
 panic = "abort"

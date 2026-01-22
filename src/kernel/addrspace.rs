@@ -3,6 +3,23 @@
 //! Manages per-process virtual address spaces using the PMM for page table allocation.
 //! Each process gets its own page tables loaded into TTBR0 during context switch.
 //!
+//! ## Memory Layout (User Space via TTBR0)
+//!
+//! ```text
+//! 0x0000_0000_0000_0000 - 0x0000_0000_3FFF_FFFF : Reserved/device (1GB)
+//! 0x0000_0000_4000_0000 - 0x0000_0000_7FFF_FFFF : Code + data (1GB)
+//! 0x0000_0000_8000_0000 - 0x0000_0000_BFFF_FFFF : Available (1GB)
+//! 0x0000_0000_C000_0000 - 0x0000_0000_FFFF_FFFF : Available (1GB)
+//! ```
+//!
+//! ## Page Table Structure (4KB granule, 48-bit VA)
+//!
+//! ```text
+//! L0 (512 entries x 512GB each) -> L1 (512 entries x 1GB each)
+//!                                       -> L2 (512 entries x 2MB each)
+//!                                              -> L3 (512 entries x 4KB pages)
+//! ```
+//!
 //! ASID (Address Space ID) support:
 //! - Each address space gets a unique 8-bit ASID (256 values, 0 reserved)
 //! - ASID is encoded in TTBR0 bits [63:48] for hardware tagging
@@ -123,15 +140,36 @@ fn phys_to_virt(phys: u64) -> *mut u64 {
     mmu::phys_to_virt(phys) as *mut u64
 }
 
-/// Maximum number of L1 entries we support for user space
-/// Entry 0 (0x00000000-0x3FFFFFFF) is typically reserved/device
-/// Entry 1+ (0x40000000+) can be used for user programs
+// ============================================================================
+// Virtual Address Space Layout Constants
+// ============================================================================
+//
+// These constants define the userspace memory layout for AArch64 with 4KB
+// pages and 48-bit virtual addresses. The layout is:
+//
+//   L1 Index 0: 0x00000000-0x3FFFFFFF (1GB) - Reserved for kernel/device
+//   L1 Index 1: 0x40000000-0x7FFFFFFF (1GB) - Code + initial data
+//   L1 Index 2: 0x80000000-0xBFFFFFFF (1GB) - Heap growth
+//   L1 Index 3: 0xC0000000-0xFFFFFFFF (1GB) - Stack + mmap
+//
+// This provides 4GB of user virtual address space, which is sufficient
+// for embedded systems while keeping page table overhead minimal.
+// ============================================================================
+
+/// Maximum number of L1 (1GB) entries for user address space.
+/// Value 4 = 4GB total user VA space (indices 0-3).
+/// L1 index 0 is reserved (device memory region), so usable space is 3GB.
 const MAX_USER_L1_ENTRIES: usize = 4;
 
-/// User space start address (after device memory region)
+/// User space start address.
+/// 0x4000_0000 = 1GB = L1 index 1. This skips the first 1GB which
+/// contains device MMIO mappings in the kernel's address space.
+/// User code/data starts here.
 pub const USER_SPACE_START: u64 = 0x0000_0000_4000_0000;
 
-/// User space end address
+/// User space end address (exclusive).
+/// 0x1_0000_0000 = 4GB. This is the upper limit of the 4 L1 entries.
+/// Addresses at or above this are invalid for user processes.
 pub const USER_SPACE_END: u64 = 0x0000_0001_0000_0000;
 
 /// Represents a process's virtual address space
@@ -140,8 +178,14 @@ pub struct AddressSpace {
     pub ttbr0: u64,
     /// ASID for this address space (1-255, 0 = none allocated)
     asid: u16,
-    /// Physical addresses of allocated page tables (for cleanup)
-    /// 64 tables supports ~128MB of heap (each L3 covers 2MB)
+    /// Physical addresses of allocated page tables (for cleanup).
+    ///
+    /// Array size 64 = L0(1) + L1(1) + L2(up to 4) + L3(up to 58).
+    /// Each L3 table covers 2MB (512 x 4KB pages), so 58 L3 tables
+    /// support up to 116MB of fine-grained mapped memory.
+    ///
+    /// This is sufficient for typical embedded processes. Processes
+    /// needing more memory would use 2MB block mappings at L2 level.
     page_tables: [u64; 64],
     num_tables: usize,
 }
@@ -221,10 +265,12 @@ impl AddressSpace {
         writable: bool,
         executable: bool,
     ) -> bool {
-        // For now, only support 1GB block mappings at L1 level
-        // This is a simplification - full implementation would use L2/L3 for fine-grained mapping
-
-        if size != 0x40000000 {
+        // For now, only support 1GB block mappings at L1 level.
+        // This is a simplification - full implementation would use L2/L3 for fine-grained mapping.
+        //
+        // 0x4000_0000 = 1GB = 2^30 bytes = size of one L1 block entry.
+        // L1 block entries map 1GB of contiguous physical memory to 1GB of virtual memory.
+        if size != 0x4000_0000 {
             // Only 1GB blocks supported for now
             return false;
         }
@@ -264,7 +310,16 @@ impl AddressSpace {
     // Page Mapping - Core Implementation
     // ========================================================================
 
-    /// Mask to extract physical address from page table entry
+    /// Mask to extract physical address from a page table entry.
+    ///
+    /// AArch64 page table entry format (4KB granule):
+    ///   Bits [47:12] = Physical address (36 bits, 4KB aligned)
+    ///   Bits [11:0]  = Flags (VALID, TABLE/BLOCK, AP, SH, etc.)
+    ///
+    /// This mask (0x0000_FFFF_FFFF_F000) extracts bits [47:12]:
+    ///   - Upper 16 bits cleared (bits [63:48] are ASID/reserved)
+    ///   - Lower 12 bits cleared (flags)
+    ///   - Result is 4KB-aligned physical address
     const PHYS_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
     /// Internal helper: Get or allocate a next-level table
@@ -330,15 +385,41 @@ impl AddressSpace {
             None => return false,
         };
 
+        // DEBUG: Verify L2 entry actually points to L3
+        // Check addresses in 0x5000_0000-0x5FFF_FFFF range (heap region at 1.25-1.5GB)
+        // This is a common area for heap allocations and has had issues with page table setup
+        if (virt_addr >> 28) == 5 {
+            unsafe {
+                let l2_ptr = phys_to_virt(l2_phys);
+                let l2_entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
+                let l2_points_to = l2_entry & 0x0000_FFFF_FFFF_F000;
+                if l2_points_to != l3_phys {
+                    crate::kwarn!("addrspace", "l2_mismatch";
+                        va = virt_addr,
+                        l2_entry = l2_entry,
+                        l2_points_to = l2_points_to,
+                        expected_l3 = l3_phys);
+                }
+            }
+        }
+
         // Build page entry flags
         let ap = if writable { flags::AP_RW_ALL } else { flags::AP_RO_ALL };
         let xn = if executable && memory_attr == attr::NORMAL { 0 } else { flags::UXN };
 
         unsafe {
             let l3_ptr = phys_to_virt(l3_phys);
-            core::ptr::write_volatile(
-                l3_ptr.add(l3_index),
-                phys_addr
+
+            // DEBUG: Check if there's already a mapping here
+            let old_pte = core::ptr::read_volatile(l3_ptr.add(l3_index));
+            if old_pte != 0 {
+                crate::kwarn!("addrspace", "overwriting_pte";
+                    va = virt_addr,
+                    old_pte = old_pte,
+                    old_pa = old_pte & 0x0000_FFFF_FFFF_F000);
+            }
+
+            let pte = phys_addr
                     | flags::VALID
                     | flags::PAGE
                     | flags::AF
@@ -346,8 +427,37 @@ impl AddressSpace {
                     | memory_attr
                     | ap
                     | xn
-                    | flags::PXN
+                    | flags::PXN;
+
+            core::ptr::write_volatile(l3_ptr.add(l3_index), pte);
+
+            // Clean cache line containing the PTE to ensure page table walker sees it
+            let pte_addr = l3_ptr.add(l3_index) as u64;
+            core::arch::asm!(
+                "dc cvac, {pte}",   // Clean data cache by VA to PoC
+                "dsb ish",          // Ensure clean completes
+                pte = in(reg) pte_addr,
+                options(nostack, preserves_flags)
             );
+
+            // CRITICAL: Invalidate TLB entry for this virtual address
+            core::arch::asm!(
+                "tlbi vaae1is, {va}",
+                "dsb ish",
+                "isb",
+                va = in(reg) virt_addr >> 12,
+                options(nostack, preserves_flags)
+            );
+
+            // Verify PTE was written correctly
+            let pte_readback = core::ptr::read_volatile(l3_ptr.add(l3_index));
+            let pte_phys = pte_readback & 0x0000_FFFF_FFFF_F000;
+            if pte_phys != (phys_addr & 0x0000_FFFF_FFFF_F000) {
+                crate::kwarn!("addrspace", "pte_mismatch";
+                    va = virt_addr,
+                    expected_pa = phys_addr,
+                    pte_pa = pte_phys);
+            }
         }
 
         true
@@ -376,7 +486,7 @@ impl AddressSpace {
         self.map_page_internal(virt_addr, phys_addr, writable, false, attr::DEVICE)
     }
 
-    /// Map a 4KB DMA page (normal non-cacheable, for DMA coherency)
+    /// Map a 4KB DMA page (using non-cacheable memory for coherency)
     #[inline]
     pub fn map_dma_page(
         &mut self,
@@ -449,7 +559,8 @@ impl AddressSpace {
 
     /// Activate this address space (switch TTBR0)
     pub unsafe fn activate(&self) {
-        mmu::switch_user_space(self.ttbr0);
+        // IMPORTANT: Must include ASID in TTBR0 for proper TLB isolation
+        mmu::switch_user_space(self.get_ttbr0());
     }
 
     /// Get the TTBR0 value for this address space (includes ASID in bits [63:48])
@@ -493,8 +604,8 @@ pub fn test() {
         if let Some(user_page) = pmm::alloc_page() {
             print_direct!("    Allocated user page at 0x{:08x}\n", user_page);
 
-            // Map it into the address space at a user address
-            let user_virt = 0x4000_0000u64;  // 1GB mark
+            // Map it into the address space at USER_SPACE_START (1GB mark)
+            let user_virt = USER_SPACE_START;
             if addr_space.map_page(user_virt, user_page as u64, true, true) {
                 print_direct!("    Mapped 0x{:08x} -> 0x{:016x}\n", user_page, user_virt);
                 print_direct!("    [OK] Address space test passed\n");

@@ -13,6 +13,10 @@
 #![allow(dead_code)]  // PWM constants for different channels
 
 use userlib::{syscall, MmioRegion, uinfo, uwarn, uerror};
+use userlib::syscall::{
+    Handle, WaitFilter, WaitRequest, WaitResult,
+    handle_wait, handle_wrap_channel,
+};
 
 // =============================================================================
 // MT7988 PWM Controller
@@ -237,15 +241,39 @@ fn main() {
     // Set initial fan speed to 100%
     pwm.set_fan_speed(100);
 
+    // Wrap the listen channel as a handle (Handle API)
+    let channel_handle = match handle_wrap_channel(listen_channel) {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("pwm", "channel_wrap_failed");
+            syscall::exit(1);
+        }
+    };
+
     uinfo!("pwm", "init_complete"; channel = listen_channel as u64);
 
-    // Main loop - handle IPC requests (devd supervises us, no need to daemonize)
+    // Event-driven main loop (Handle API)
+    let requests = [WaitRequest::new(channel_handle, WaitFilter::Readable)];
+    let mut results = [WaitResult::empty(); 1];
     let mut msg_buf = [0u8; 16];
+
     loop {
-        // Accept connection
+        // Wait for connection (blocking)
+        let count = match handle_wait(&requests, &mut results, u64::MAX) {
+            Ok(n) => n,
+            Err(_) => {
+                syscall::yield_now();
+                continue;
+            }
+        };
+
+        if count == 0 {
+            continue;
+        }
+
+        // Accept connection (non-blocking since we know it's ready)
         let client = syscall::port_accept(listen_channel);
         if client < 0 {
-            syscall::yield_now();
             continue;
         }
         let client_ch = client as u32;

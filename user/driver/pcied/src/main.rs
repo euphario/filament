@@ -11,6 +11,10 @@
 #![allow(unreachable_code)]  // Exit points for clarity
 
 use userlib::syscall;
+use userlib::syscall::{
+    Handle, WaitFilter, WaitRequest, WaitResult,
+    handle_wait, handle_wrap_channel,
+};
 use userlib::{uinfo, uerror};
 use userlib::ipc::{Server, Connection, IpcError};
 use userlib::ipc::protocols::{
@@ -368,17 +372,43 @@ fn main() {
         }
     };
 
+    // Notify devd that pcied is ready (pcie: port registered)
+    userlib::ipc::notify_service_ready("pcie:");
+
+    // Wrap the listen channel as a handle (Handle API)
+    let listen_channel = server.listen_channel();
+    let channel_handle = match handle_wrap_channel(listen_channel) {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("pcied", "channel_wrap_failed");
+            syscall::exit(1);
+        }
+    };
+
     uinfo!("pcied", "ready"; devices = registry.count);
 
-    // Main loop: handle queries (devd supervises us, no need to daemonize)
+    // Event-driven main loop (Handle API)
+    let requests = [WaitRequest::new(channel_handle, WaitFilter::Readable)];
+    let mut results = [WaitResult::empty(); 1];
+
     loop {
-        // Accept connection
-        let mut conn: Connection<PcieProtocol> = match server.accept() {
-            Ok(c) => c,
+        // Wait for connection (blocking)
+        let count = match handle_wait(&requests, &mut results, u64::MAX) {
+            Ok(n) => n,
             Err(_) => {
                 syscall::yield_now();
                 continue;
             }
+        };
+
+        if count == 0 {
+            continue;
+        }
+
+        // Accept connection (non-blocking since we know it's ready)
+        let mut conn: Connection<PcieProtocol> = match server.try_accept() {
+            Ok(c) => c,
+            Err(_) => continue,
         };
 
         // Track ports this client queried (for auto-reset on disconnect)

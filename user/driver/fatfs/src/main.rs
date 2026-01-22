@@ -10,6 +10,10 @@
 #![allow(dead_code)]  // FAT parsing utilities reserved for future use
 
 use userlib::syscall;
+use userlib::syscall::{
+    Handle, WaitFilter, WaitRequest, WaitResult,
+    handle_wait, handle_wrap_channel,
+};
 use userlib::{uinfo, uwarn, uerror};
 use userlib::ipc::{Server, Connection, IpcError};
 use userlib::ipc::protocols::{FsProtocol, FsRequest, FsResponse, fs_error};
@@ -175,14 +179,38 @@ fn filesystem_service_loop(fs: &FatFilesystem, block: &mut BlockClient, server: 
     let my_pid = syscall::getpid();
     uinfo!("fatfs", "service_running"; pid = my_pid as u64);
 
+    // Wrap the listen channel as a handle (Handle API)
+    let listen_channel = server.listen_channel();
+    let channel_handle = match handle_wrap_channel(listen_channel) {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("fatfs", "channel_wrap_failed");
+            syscall::exit(1);
+        }
+    };
+
+    // Event-driven main loop (Handle API)
+    let requests = [WaitRequest::new(channel_handle, WaitFilter::Readable)];
+    let mut results = [WaitResult::empty(); 1];
+
     loop {
-        // Accept a connection
-        let mut conn: Connection<FsProtocol> = match server.accept() {
-            Ok(c) => c,
+        // Wait for connection (blocking)
+        let count = match handle_wait(&requests, &mut results, u64::MAX) {
+            Ok(n) => n,
             Err(_) => {
                 syscall::yield_now();
                 continue;
             }
+        };
+
+        if count == 0 {
+            continue;
+        }
+
+        // Accept connection (non-blocking since we know it's ready)
+        let mut conn: Connection<FsProtocol> = match server.try_accept() {
+            Ok(c) => c,
+            Err(_) => continue,
         };
 
         // Perform PID handshake (receive client PID, send our PID)

@@ -13,25 +13,33 @@
 //! 2. **State machine**: Task states follow strict transitions:
 //!    - Ready → Running (only via reschedule)
 //!    - Running → Ready (via yield or preemption)
-//!    - Running → Blocked (via block_current)
-//!    - Blocked → Ready (only via wake - never by the blocked task itself!)
+//!    - Running → Sleeping (via sleep_current) - event loop, no deadline
+//!    - Running → Waiting (via wait_current) - specific request, has deadline
+//!    - Sleeping/Waiting → Ready (only via wake or deadline expiry)
 //!    - Running → Terminated (via exit)
 //!
-//! 3. **Separation of concerns**:
+//! 3. **Sleeping vs Waiting**:
+//!    - Sleeping: Event-loop idle (devd waiting for events) - no deadline
+//!    - Waiting: Request pending (IPC call, waitpid) - has deadline
+//!    - Tickless: only scans Waiting for next wake time
+//!    - Liveness: only probes Sleeping; Waiting uses deadline enforcement
+//!
+//! 4. **Separation of concerns**:
 //!    - syscall.rs: User-facing syscall entry points (sys_yield, sys_exit, etc.)
-//!    - sched.rs: Kernel-internal scheduling (reschedule, wake, block, etc.)
+//!    - sched.rs: Kernel-internal scheduling (reschedule, wake, sleep, wait, etc.)
 //!    - task.rs: Task structures and per-task operations
 //!
 //! ## Key Functions
 //!
 //! - `reschedule()`: Pick next task and switch to it (called from timer, syscalls)
-//! - `wake(pid)`: Wake a blocked task (called when event arrives)
-//! - `block_current(reason)`: Block current task (called when waiting for event)
-//! - `yield_current()`: Voluntarily give up CPU (does NOT change Blocked state)
+//! - `wake(pid)`: Wake a sleeping/waiting task (called when event arrives)
+//! - `sleep_current(reason)`: Sleep current task (event loop, no deadline)
+//! - `wait_current(reason, deadline)`: Wait current task (request, has deadline)
+//! - `yield_current()`: Voluntarily give up CPU
 //! - `run_idle()`: Idle loop - only called when no tasks are runnable
 
 use crate::{kwarn, kerror, kinfo};
-use super::task::{self, TaskState, WaitReason, Priority, current_slot, set_current_slot};
+use super::task::{self, TaskState, SleepReason, WaitReason, Priority, current_slot, set_current_slot};
 use super::task::{update_current_task_globals, SYSCALL_SWITCHED_TASK};
 use core::sync::atomic::Ordering;
 
@@ -122,11 +130,17 @@ pub fn wake(pid: u32) -> bool {
 /// Block the current task with a reason.
 ///
 /// The task will stay Blocked until explicitly woken via `wake()` or timeout.
-/// After calling this, the caller should trigger a reschedule.
+/// Put current task to sleep (event loop waiting for any event).
+///
+/// Use this for processes that are idle in their event loop,
+/// waiting for any incoming event. No timeout - they sleep until woken.
 ///
 /// # Important
 /// Does NOT reschedule - caller must do that after setting up wait condition.
-pub fn block_current(reason: WaitReason) {
+///
+/// # Returns
+/// true if state transition succeeded, false if invalid (e.g., blocking idle task)
+pub fn sleep_current(reason: task::SleepReason) -> bool {
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
 
     unsafe {
@@ -137,19 +151,31 @@ pub fn block_current(reason: WaitReason) {
             // Don't block the idle task!
             if slot == IDLE_SLOT {
                 kerror!("sched", "block_idle_attempt");
-                return;
+                return false;
             }
 
-            task.state = TaskState::Blocked;
-            task.wait_reason = Some(reason);
+            // Use state machine for validated transition
+            if task.state.sleep(reason).is_err() {
+                kerror!("sched", "invalid_sleep_transition"; from = task.state.name());
+                return false;
+            }
+            return true;
         }
     }
+    false
 }
 
-/// Block current task with a timeout.
+/// Put current task into waiting state (specific request with deadline).
 ///
-/// Like `block_current`, but also sets a wake deadline.
-pub fn block_current_timeout(reason: WaitReason, deadline_tick: u64) {
+/// Use this for request-response patterns where we expect a reply
+/// within a specific time. If deadline passes, liveness checks can act.
+///
+/// # Important
+/// Does NOT reschedule - caller must do that after setting up wait condition.
+///
+/// # Returns
+/// true if state transition succeeded, false if invalid (e.g., blocking idle task)
+pub fn wait_current(reason: task::WaitReason, deadline: u64) -> bool {
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
 
     unsafe {
@@ -159,14 +185,20 @@ pub fn block_current_timeout(reason: WaitReason, deadline_tick: u64) {
         if let Some(ref mut task) = sched.tasks[slot] {
             if slot == IDLE_SLOT {
                 kerror!("sched", "block_idle_attempt");
-                return;
+                return false;
             }
 
-            task.state = TaskState::Blocked;
-            task.wait_reason = Some(reason);
-            task.wake_at = deadline_tick;
+            // Use state machine for validated transition
+            if task.state.wait(reason, deadline).is_err() {
+                kerror!("sched", "invalid_wait_transition"; from = task.state.name());
+                return false;
+            }
+            // Notify scheduler of deadline for tickless optimization
+            sched.note_deadline(deadline);
+            return true;
         }
     }
+    false
 }
 
 /// Yield the current task's CPU voluntarily.
@@ -208,7 +240,7 @@ pub fn is_current_blocked() -> bool {
         let slot = current_slot();
 
         if let Some(ref task) = sched.tasks[slot] {
-            return task.state == TaskState::Blocked;
+            return task.state.is_blocked();
         }
     }
     false
@@ -300,14 +332,30 @@ pub fn init_idle_task() -> bool {
 ///
 /// This:
 /// 1. Calls check_timeouts to wake tasks whose timers expired
-/// 2. Sets the need_resched flag if any task was woken
-/// 3. Actual reschedule happens at exception return (do_resched_if_needed)
+/// 2. Periodically checks liveness of waiting tasks
+/// 3. Sets the need_resched flag if any task was woken
+/// 4. Actual reschedule happens at exception return (do_resched_if_needed)
 pub fn timer_tick(current_tick: u64) {
     // IRQs are already disabled in interrupt context
+
+    // Debug: confirm timer_tick is called
+    if current_tick % 1000 == 0 {
+        crate::kdebug!("sched", "timer_tick"; t = current_tick);
+    }
 
     unsafe {
         let sched = task::scheduler();
         let woken = sched.check_timeouts(current_tick);
+
+        // Periodically check liveness of waiting tasks
+        // Only run every LIVENESS_CHECK_INTERVAL ticks to reduce overhead
+        if current_tick % super::liveness::LIVENESS_CHECK_INTERVAL == 0 {
+            let actions = super::liveness::check_liveness(current_tick);
+            if actions > 0 {
+                // Liveness check took action - need to reschedule
+                crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+            }
+        }
 
         if woken > 0 {
             // A task was woken - signal that we need to reschedule
@@ -322,17 +370,13 @@ pub fn timer_tick(current_tick: u64) {
 
 /// Print scheduler state for debugging.
 pub fn dump_state() {
-    use crate::print_direct;
-
     unsafe {
         let sched = task::scheduler();
 
-        print_direct!("[SCHED] Task states:\n");
+        crate::kdebug!("sched", "dump_start");
         for (i, slot) in sched.tasks.iter().enumerate() {
             if let Some(ref task) = slot {
-                print_direct!("  slot {}: pid={} state={:?} prio={:?} name={}\n",
-                       i, task.id, task.state, task.priority,
-                       core::str::from_utf8(&task.name).unwrap_or("?"));
+                crate::kdebug!("sched", "task"; slot = i as u64, pid = task.id as u64, name = task.name_str());
             }
         }
     }

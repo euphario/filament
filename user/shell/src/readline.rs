@@ -138,11 +138,17 @@ impl<'a> LineEditor<'a> {
     }
 
     /// Read a line with editing support
-    /// Returns the length of the line, or 0 if cancelled
+    /// Returns the length of the line, or 0 if cancelled/disconnected
     pub fn read(&mut self) -> usize {
         while self.len < self.buf.len() - 1 {
-            if let Some(ch) = console::read_byte() {
-                match ch {
+            let ch = match console::read_byte() {
+                Some(c) => c,
+                None => {
+                    // Connection lost - return empty line
+                    return 0;
+                }
+            };
+            match ch {
                     // Enter - end of line
                     b'\r' | b'\n' => {
                         write_str("\r\n");
@@ -216,7 +222,6 @@ impl<'a> LineEditor<'a> {
                         // Ignore other control characters
                     }
                 }
-            }
         }
 
         self.len

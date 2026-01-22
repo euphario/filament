@@ -609,9 +609,12 @@ pub fn spawn_from_path_with_parent(path: &str, parent_id: task::TaskId) -> Resul
 }
 
 /// Find an executable in ramfs
-/// Searches: exact path, /bin/<name>, /<name>
+/// Searches: exact path, bin/<name>, ./bin/<name>
 fn find_executable(path: &str) -> Option<&'static [u8]> {
     use crate::ramfs;
+
+    // Extract just the filename (strip any leading path like /bin/)
+    let name = path.rsplit('/').next().unwrap_or(path);
 
     // Try exact path first
     if let Some(entry) = ramfs::find(path) {
@@ -620,15 +623,15 @@ fn find_executable(path: &str) -> Option<&'static [u8]> {
         }
     }
 
-    // Try with bin/ prefix
-    if !path.starts_with("bin/") && !path.starts_with("/bin/") {
+    // Try bin/<name> (without leading /)
+    {
         let mut bin_path = [0u8; 128];
         let prefix = b"bin/";
-        let path_bytes = path.as_bytes();
-        if prefix.len() + path_bytes.len() < bin_path.len() {
+        let name_bytes = name.as_bytes();
+        if prefix.len() + name_bytes.len() < bin_path.len() {
             bin_path[..prefix.len()].copy_from_slice(prefix);
-            bin_path[prefix.len()..prefix.len() + path_bytes.len()].copy_from_slice(path_bytes);
-            let full_path = core::str::from_utf8(&bin_path[..prefix.len() + path_bytes.len()]).ok()?;
+            bin_path[prefix.len()..prefix.len() + name_bytes.len()].copy_from_slice(name_bytes);
+            let full_path = core::str::from_utf8(&bin_path[..prefix.len() + name_bytes.len()]).ok()?;
             if let Some(entry) = ramfs::find(full_path) {
                 if entry.is_file() {
                     return Some(entry.data_slice());
@@ -638,14 +641,14 @@ fn find_executable(path: &str) -> Option<&'static [u8]> {
     }
 
     // Try ./bin/<name> (tar format often uses ./)
-    if !path.starts_with("./") {
+    {
         let mut dot_path = [0u8; 128];
         let prefix = b"./bin/";
-        let path_bytes = path.as_bytes();
-        if prefix.len() + path_bytes.len() < dot_path.len() {
+        let name_bytes = name.as_bytes();
+        if prefix.len() + name_bytes.len() < dot_path.len() {
             dot_path[..prefix.len()].copy_from_slice(prefix);
-            dot_path[prefix.len()..prefix.len() + path_bytes.len()].copy_from_slice(path_bytes);
-            let full_path = core::str::from_utf8(&dot_path[..prefix.len() + path_bytes.len()]).ok()?;
+            dot_path[prefix.len()..prefix.len() + name_bytes.len()].copy_from_slice(name_bytes);
+            let full_path = core::str::from_utf8(&dot_path[..prefix.len() + name_bytes.len()]).ok()?;
             if let Some(entry) = ramfs::find(full_path) {
                 if entry.is_file() {
                     return Some(entry.data_slice());

@@ -5,7 +5,7 @@
 //! can convert from SysError via `From` trait.
 
 use core::fmt;
-use crate::serialize::{Serialize, ValueType};
+use abi::errno;
 
 /// Result type for syscall operations
 pub type SysResult<T> = Result<T, SysError>;
@@ -72,65 +72,65 @@ pub enum SysError {
 
 impl SysError {
     /// Create from raw errno value (negative)
-    pub fn from_errno(errno: i32) -> Self {
-        match errno {
-            -1 => SysError::PermissionDenied,
-            -2 => SysError::NotFound,
-            -3 => SysError::NoProcess,
-            -4 => SysError::Interrupted,
-            -5 => SysError::IoError,
-            -6 => SysError::NoDevice,
-            -8 => SysError::ExecFormat,
-            -9 => SysError::BadFd,
-            -10 => SysError::NoChild,
-            -11 => SysError::WouldBlock,
-            -12 => SysError::OutOfMemory,
-            -13 => SysError::AccessDenied,
-            -14 => SysError::BadAddress,
-            -16 => SysError::Busy,
-            -17 => SysError::AlreadyExists,
-            -19 => SysError::NotSupported,
-            -22 => SysError::InvalidArgument,
-            -23 => SysError::TooManyFiles,
-            -28 => SysError::NoSpace,
-            -38 => SysError::NotImplemented,
-            -90 => SysError::MessageTooLarge,
-            -95 => SysError::OperationNotSupported,
-            -104 => SysError::ConnectionReset,
-            -110 => SysError::Timeout,
-            -111 => SysError::ConnectionRefused,
-            e => SysError::Unknown(e),
+    pub fn from_errno(e: i32) -> Self {
+        match e {
+            errno::EPERM => SysError::PermissionDenied,
+            errno::ENOENT => SysError::NotFound,
+            errno::ESRCH => SysError::NoProcess,
+            errno::EINTR => SysError::Interrupted,
+            errno::EIO => SysError::IoError,
+            errno::ENXIO => SysError::NoDevice,
+            errno::ENOEXEC => SysError::ExecFormat,
+            errno::EBADF => SysError::BadFd,
+            errno::ECHILD => SysError::NoChild,
+            errno::EAGAIN => SysError::WouldBlock,
+            errno::ENOMEM => SysError::OutOfMemory,
+            errno::EACCES => SysError::AccessDenied,
+            errno::EFAULT => SysError::BadAddress,
+            errno::EBUSY => SysError::Busy,
+            errno::EEXIST => SysError::AlreadyExists,
+            errno::ENODEV => SysError::NotSupported,
+            errno::EINVAL => SysError::InvalidArgument,
+            errno::ENFILE => SysError::TooManyFiles,
+            errno::ENOSPC => SysError::NoSpace,
+            errno::ENOSYS => SysError::NotImplemented,
+            errno::EMSGSIZE => SysError::MessageTooLarge,
+            errno::EOPNOTSUPP => SysError::OperationNotSupported,
+            errno::ECONNRESET => SysError::ConnectionReset,
+            errno::ETIMEDOUT => SysError::Timeout,
+            errno::ECONNREFUSED => SysError::ConnectionRefused,
+            _ => SysError::Unknown(e),
         }
     }
 
     /// Convert to raw errno value (negative)
     pub fn to_errno(self) -> i32 {
         match self {
-            SysError::PermissionDenied => -1,
-            SysError::NotFound => -2,
-            SysError::NoProcess => -3,
-            SysError::Interrupted => -4,
-            SysError::IoError => -5,
-            SysError::NoDevice => -6,
-            SysError::ExecFormat => -8,
-            SysError::BadFd => -9,
-            SysError::NoChild => -10,
-            SysError::WouldBlock => -11,
-            SysError::OutOfMemory => -12,
-            SysError::AccessDenied => -13,
-            SysError::BadAddress => -14,
-            SysError::Busy => -16,
-            SysError::AlreadyExists => -17,
-            SysError::NotSupported => -19,
-            SysError::InvalidArgument => -22,
-            SysError::TooManyFiles => -23,
-            SysError::NoSpace => -28,
-            SysError::NotImplemented => -38,
-            SysError::MessageTooLarge => -90,
-            SysError::OperationNotSupported => -95,
-            SysError::ConnectionReset => -104,
-            SysError::Timeout => -110,
-            SysError::ConnectionRefused => -111,
+            SysError::PermissionDenied => errno::EPERM,
+            SysError::NotFound => errno::ENOENT,
+            SysError::NoProcess => errno::ESRCH,
+            SysError::Interrupted => errno::EINTR,
+            SysError::IoError => errno::EIO,
+            SysError::NoDevice => errno::ENXIO,
+            SysError::ExecFormat => errno::ENOEXEC,
+            SysError::BadFd => errno::EBADF,
+            SysError::NoChild => errno::ECHILD,
+            SysError::WouldBlock => errno::EAGAIN,
+            SysError::OutOfMemory => errno::ENOMEM,
+            SysError::AccessDenied => errno::EACCES,
+            SysError::BadAddress => errno::EFAULT,
+            SysError::Busy => errno::EBUSY,
+            SysError::AlreadyExists => errno::EEXIST,
+            SysError::NotSupported => errno::ENODEV,
+            SysError::InvalidArgument => errno::EINVAL,
+            SysError::TooManyFiles => errno::ENFILE,
+            SysError::NoSpace => errno::ENOSPC,
+            SysError::NotImplemented => errno::ENOSYS,
+            SysError::MessageTooLarge => errno::EMSGSIZE,
+            SysError::OperationNotSupported => errno::EOPNOTSUPP,
+            SysError::ConnectionReset => errno::ECONNRESET,
+            SysError::Timeout => errno::ETIMEDOUT,
+            SysError::ConnectionRefused => errno::ECONNREFUSED,
             SysError::Unknown(e) => e,
         }
     }
@@ -207,26 +207,3 @@ pub fn check_errno_i32(result: i32) -> SysResult<u32> {
     }
 }
 
-// Implement Serialize for structured logging (ulog)
-impl Serialize for SysError {
-    fn type_marker(&self) -> u8 {
-        ValueType::Str as u8
-    }
-
-    fn serialized_size(&self) -> usize {
-        // 2 bytes length prefix + string bytes
-        2 + self.as_str().len()
-    }
-
-    fn serialize(&self, buf: &mut [u8]) -> usize {
-        let s = self.as_str();
-        let len = s.len();
-        if buf.len() < 2 + len {
-            return 0;
-        }
-        buf[0] = (len & 0xFF) as u8;
-        buf[1] = ((len >> 8) & 0xFF) as u8;
-        buf[2..2 + len].copy_from_slice(s.as_bytes());
-        2 + len
-    }
-}

@@ -13,7 +13,29 @@ mod console;
 mod output;
 mod readline;
 
-use userlib::{println, print, syscall};
+// Shell-local print macros that route through console (consoled channel when connected)
+// This avoids the output interleaving that happens when using userlib::print! directly
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!(&mut $crate::console::ConsoleWriter, $($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! println {
+    () => {{
+        $crate::console::write(b"\r\n");
+    }};
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!(&mut $crate::console::ConsoleWriter, $($arg)*);
+        $crate::console::write(b"\r\n");
+    }};
+}
+
+use userlib::syscall;
 
 /// Maximum background jobs to track
 const MAX_BG_JOBS: usize = 16;
@@ -26,6 +48,9 @@ static mut HISTORY: readline::History = readline::History::new();
 
 /// Background job PIDs (0 = empty slot)
 static mut BG_PIDS: [u32; MAX_BG_JOBS] = [0; MAX_BG_JOBS];
+
+/// Retry counter for console connection
+static mut CONSOLE_RETRY: u8 = 0;
 
 #[unsafe(no_mangle)]
 fn main() {
@@ -41,11 +66,25 @@ fn main() {
     color::set(color::DIM);
     if connected {
         console::write(b"Connected to consoled\r\n");
+    } else {
+        console::write(b"Direct UART mode (consoled not ready)\r\n");
     }
     console::write(b"Type 'help' for commands\r\n\r\n");
     color::reset();
 
     loop {
+        // Try to connect to consoled if not connected yet (lazy connection)
+        if !console::console().is_connected() {
+            let retry = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE_RETRY) };
+            *retry = retry.wrapping_add(1);
+            // Retry every 10 prompts
+            if *retry % 10 == 0 {
+                if console::console_mut().connect() {
+                    console::write(b"\r\n[Connected to consoled]\r\n");
+                }
+            }
+        }
+
         // Colored prompt
         color::set(color::BOLD);
         color::set(color::GREEN);
@@ -151,9 +190,6 @@ fn execute_command(cmd: &[u8]) {
         println!();
     } else if cmd_starts_with(cmd, b"spawn ") {
         cmd_spawn(&cmd[6..]);
-    } else if cmd_eq(cmd, b"yield") {
-        syscall::yield_now();
-        println!("Yielded CPU");
     } else if cmd_eq(cmd, b"panic") {
         panic!("User requested panic");
     } else if cmd_eq(cmd, b"usb") {
@@ -193,6 +229,14 @@ fn execute_command(cmd: &[u8]) {
         builtins::hw::run(b"");
     } else if cmd_starts_with(cmd, b"hw ") {
         builtins::hw::run(&cmd[3..]);
+    } else if cmd_eq(cmd, b"devd") {
+        builtins::devd::run(b"");
+    } else if cmd_starts_with(cmd, b"devd ") {
+        builtins::devd::run(&cmd[5..]);
+    } else if cmd_eq(cmd, b"handle") {
+        builtins::handle::run(b"", &mut output::ShellOutput::new());
+    } else if cmd_starts_with(cmd, b"handle ") {
+        builtins::handle::run(&cmd[7..], &mut output::ShellOutput::new());
     } else if cmd_eq(cmd, b"resize") {
         cmd_resize();
     } else if cmd_eq(cmd, b"ls") {
@@ -262,14 +306,8 @@ fn try_run_binary(cmd: &[u8]) {
         return;
     }
 
-    // Phase 2: If NOT_FOUND, try loading from filesystem via exec_mem
-    // This allows running binaries from USB, network, etc.
-    if result == -2 {  // ENOENT - Not found in kernel ramfs
-        if let Some(pid) = try_exec_from_filesystem(&path_buf[..path_len], name) {
-            wait_for_child(pid);
-            return;
-        }
-    }
+    // Note: Future support for loading binaries from external filesystems (USB, network)
+    // would go here via vfsd's ReadToShmem protocol
 
     // Both paths failed - command not found
     color::set(color::RED);
@@ -302,64 +340,8 @@ fn wait_for_child(pid: u32) {
     }
 }
 
-/// Try to load and execute a binary from filesystem (fallback path)
-/// Returns Some(pid) on success, None on failure
-fn try_exec_from_filesystem(path: &[u8], name: &str) -> Option<u32> {
-    // Try to open the file via kernel ramfs (for now)
-    // Future: Could use vfsd ReadToShmem for external filesystems
-    let fd = syscall::open(path, 0);  // O_RDONLY
-    if fd < 0 {
-        return None;
-    }
-    let fd = fd as u32;
-
-    // Get file size by reading to end (simple approach)
-    // Note: For large files, we'd want stat() or vfsd's ReadToShmem
-    const MAX_ELF_SIZE: usize = 512 * 1024;  // 512KB max for shell-launched binaries
-    let elf_addr = syscall::mmap(0, MAX_ELF_SIZE, syscall::PROT_READ | syscall::PROT_WRITE);
-    if elf_addr < 0 {
-        syscall::close(fd);
-        return None;
-    }
-
-    // Read entire ELF into buffer
-    let elf_buf = unsafe { core::slice::from_raw_parts_mut(elf_addr as *mut u8, MAX_ELF_SIZE) };
-    let mut total_read = 0usize;
-
-    loop {
-        let remaining = &mut elf_buf[total_read..];
-        if remaining.is_empty() {
-            break;
-        }
-
-        let chunk_size = remaining.len().min(4096);
-        let n = syscall::read(fd, &mut remaining[..chunk_size]);
-        if n <= 0 {
-            break;
-        }
-        total_read += n as usize;
-    }
-
-    syscall::close(fd);
-
-    // Validate minimum ELF size
-    if total_read < 64 {
-        syscall::munmap(elf_addr as u64, MAX_ELF_SIZE);
-        return None;
-    }
-
-    // Execute via exec_mem
-    let result = syscall::exec_mem(&elf_buf[..total_read], Some(name));
-
-    // Free the buffer
-    syscall::munmap(elf_addr as u64, MAX_ELF_SIZE);
-
-    if result >= 0 {
-        Some(result as u32)
-    } else {
-        None
-    }
-}
+// Note: Loading binaries from external filesystems (USB, network) will require
+// vfsd's ReadToShmem protocol. The kernel exec() already handles ramfs directly.
 
 fn cmd_help() {
     color::set(color::BOLD);
@@ -382,6 +364,8 @@ fn cmd_help() {
     help_line("wifi", "Run WiFi driver (MT7996)");
     help_line("fan [0-100]", "Fan control / set speed");
     help_line("hw [path]", "Hardware info (list/bus/tree/<path>)");
+    help_line("handle", "Test handle API (timer/channel/poll)");
+    help_line("devd spawn", "Spawn driver via devd (with caps)");
     help_line("yield", "Yield CPU to other processes");
     help_line("ps", "Show running processes");
     help_line("kill <pid>", "Terminate a process");
@@ -474,21 +458,22 @@ fn cmd_echo(msg: &[u8]) {
 }
 
 fn cmd_spawn(arg: &[u8]) {
-    // Parse ELF ID (simple decimal parser)
-    let mut id: u32 = 0;
-    for &ch in arg {
-        if ch >= b'0' && ch <= b'9' {
-            id = id * 10 + (ch - b'0') as u32;
-        } else if ch == b' ' || ch == b'\t' {
-            continue;
-        } else {
-            println!("Invalid ELF ID");
+    // Parse path from argument
+    let path = match core::str::from_utf8(trim(arg)) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Invalid path");
             return;
         }
+    };
+
+    if path.is_empty() {
+        println!("Usage: spawn <path>");
+        return;
     }
 
-    println!("Spawning ELF ID {}...", id);
-    let result = syscall::spawn(id);
+    println!("Spawning {}...", path);
+    let result = syscall::exec(path);
 
     if result >= 0 {
         let pid = result as u32;
@@ -496,14 +481,7 @@ fn cmd_spawn(arg: &[u8]) {
 
         // Wait for it
         println!("Waiting for process to exit...");
-        let wait_result = syscall::wait(pid as i32);
-
-        if wait_result >= 0 {
-            let exit_code = (wait_result & 0xFFFFFFFF) as i32;
-            println!("Process exited with code {}", exit_code);
-        } else {
-            println!("wait failed: {}", wait_result);
-        }
+        wait_for_child(pid);
     } else {
         println!("spawn failed: {}", result);
     }
@@ -666,8 +644,8 @@ fn cmd_jobs() {
                     still_exists = true;
                     found = true;
 
-                    // If terminated, clean up the slot
-                    if buf[j].state == 3 {  // Terminated
+                    // If terminated (Exiting/Dying/Dead), clean up the slot
+                    if buf[j].state >= 4 {  // 4=Exiting, 5=Dying, 6=Dead
                         BG_PIDS[i] = 0;
                     }
                     break;
@@ -688,13 +666,15 @@ fn cmd_jobs() {
 
 /// Set fan speed via PWM driver IPC
 fn cmd_fan(arg: &[u8]) {
+    use userlib::ipc::Channel;
+
     let arg = trim(arg);
 
     // Parse percentage (0-100)
     let mut percent: u32 = 0;
-    for &ch in arg {
-        if ch >= b'0' && ch <= b'9' {
-            percent = percent * 10 + (ch - b'0') as u32;
+    for &c in arg {
+        if c >= b'0' && c <= b'9' {
+            percent = percent * 10 + (c - b'0') as u32;
         } else {
             println!("Invalid fan speed. Use: fan <0-100>");
             return;
@@ -707,33 +687,33 @@ fn cmd_fan(arg: &[u8]) {
     }
 
     // Connect to PWM driver
-    let ch = syscall::port_connect(b"pwm");
-    if ch < 0 {
-        println!("Failed to connect to PWM driver (not running?)");
-        println!("Start it with: fan");
-        return;
-    }
-    let ch = ch as u32;
+    let mut channel = match Channel::connect(b"pwm:") {
+        Ok(ch) => ch,
+        Err(_) => {
+            println!("Failed to connect to PWM driver (not running?)");
+            println!("Start it with: fan");
+            return;
+        }
+    };
 
     // Send set fan speed command: [1, percent]
     let cmd = [1u8, percent as u8];
-    let sent = syscall::send(ch, &cmd);
-    if sent < 0 {
+    if channel.send(&cmd).is_err() {
         println!("Failed to send command");
-        syscall::channel_close(ch);
         return;
     }
 
     // Receive response
     let mut resp = [0u8; 1];
-    let received = syscall::receive(ch, &mut resp);
-    syscall::channel_close(ch);
-
-    if received > 0 {
-        println!("Fan speed set to {}%", resp[0]);
-    } else {
-        println!("No response from PWM driver");
+    match channel.recv(&mut resp) {
+        Ok(n) if n > 0 => {
+            println!("Fan speed set to {}%", resp[0]);
+        }
+        _ => {
+            println!("No response from PWM driver");
+        }
     }
+    // Channel is dropped automatically
 }
 
 /// Set kernel log level
@@ -853,9 +833,7 @@ fn cmd_resize() {
 }
 
 /// Display file contents
-/// Note: Uses kernel ramfs directly for simplicity and performance.
-/// For external filesystems (USB, network), this would need to use vfsd's
-/// ReadToShmem protocol with shared memory buffers.
+/// Note: Currently not implemented. Would need vfsd's ReadToShmem protocol.
 fn cmd_cat(path_arg: &[u8]) {
     let path = trim(path_arg);
 
@@ -864,34 +842,9 @@ fn cmd_cat(path_arg: &[u8]) {
         return;
     }
 
-    // Convert path to str
-    let path_str = match core::str::from_utf8(path) {
-        Ok(s) => s,
-        Err(_) => {
-            println!("Invalid path");
-            return;
-        }
-    };
-
-    // Open the file via kernel ramfs
-    let fd = syscall::open(path, 0);  // O_RDONLY
-    if fd < 0 {
-        println!("cat: {}: not found", path_str);
-        return;
-    }
-    let fd = fd as u32;
-
-    // Read and print contents
-    let mut buf = [0u8; 512];
-    loop {
-        let n = syscall::read(fd, &mut buf);
-        if n <= 0 {
-            break;
-        }
-        console::write(&buf[..n as usize]);
-    }
-
-    syscall::close(fd);
-    println!();  // Ensure newline at end
+    // File reading requires vfsd's ReadToShmem protocol (not yet implemented)
+    // For now, show files via 'ls' and run binaries directly
+    println!("cat: file reading not implemented");
+    println!("Hint: Use 'ls' to list files, run binaries by name");
 }
 

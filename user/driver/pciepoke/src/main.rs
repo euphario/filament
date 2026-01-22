@@ -251,19 +251,19 @@ fn read_line(stdin: &Stdin, buf: &mut [u8]) -> usize {
             match ch {
                 // Enter - end of line
                 b'\r' | b'\n' => {
-                    let _ = syscall::write(syscall::STDOUT, b"\r\n");
+                    let _ = syscall::write(syscall::Handle::STDOUT, b"\r\n");
                     break;
                 }
                 // Backspace
                 0x7F | 0x08 => {
                     if pos > 0 {
                         pos -= 1;
-                        let _ = syscall::write(syscall::STDOUT, b"\x08 \x08");
+                        let _ = syscall::write(syscall::Handle::STDOUT, b"\x08 \x08");
                     }
                 }
                 // Ctrl+C - cancel line
                 0x03 => {
-                    let _ = syscall::write(syscall::STDOUT, b"^C\r\n");
+                    let _ = syscall::write(syscall::Handle::STDOUT, b"^C\r\n");
                     return 0;
                 }
                 // Printable characters
@@ -271,7 +271,7 @@ fn read_line(stdin: &Stdin, buf: &mut [u8]) -> usize {
                     buf[pos] = ch;
                     pos += 1;
                     // Echo character
-                    let _ = syscall::write(syscall::STDOUT, &[ch]);
+                    let _ = syscall::write(syscall::Handle::STDOUT, &[ch]);
                 }
                 // Ignore other control characters
                 _ => {}

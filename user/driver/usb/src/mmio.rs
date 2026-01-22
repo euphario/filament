@@ -65,11 +65,11 @@ pub fn print_hex32(val: u32) {
         buf[i] = hex[(n & 0xF) as usize];
         n >>= 4;
     }
-    let _ = syscall::write(syscall::STDOUT, &buf);
+    let _ = syscall::write(syscall::Handle::STDOUT, &buf);
 }
 
 pub fn print_hex8(val: u8) {
     let hex = b"0123456789abcdef";
     let buf = [hex[(val >> 4) as usize], hex[(val & 0xF) as usize]];
-    let _ = syscall::write(syscall::STDOUT, &buf);
+    let _ = syscall::write(syscall::Handle::STDOUT, &buf);
 }

@@ -200,56 +200,31 @@ fn format_hex(buf: &mut [u8], val: u64) -> usize {
     digits
 }
 
-/// Delay for approximately `ms` milliseconds using the ARM timer
+/// Delay for approximately `ms` milliseconds
 ///
-/// This yields to the scheduler between timer checks, allowing other tasks to run.
+/// Uses light oneshot sleep syscall - task sleeps, scheduler can idle CPU.
 pub fn delay_ms(ms: u32) {
-    let freq: u64;
-    let start: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
+    if ms == 0 {
+        return;
     }
-    let ticks_needed = (freq / 1000) * ms as u64;
-    let end = start + ticks_needed;
-    loop {
-        let now: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now); }
-        if now >= end {
-            break;
-        }
-        // Yield to scheduler instead of busy-spinning
-        syscall::yield_now();
-    }
+    syscall::sleep_ms(ms);
 }
 
-/// Delay for approximately `us` microseconds using the ARM timer
+/// Delay for approximately `us` microseconds
 ///
-/// For very short delays (<100us), this uses spin_loop() to avoid scheduler overhead.
-/// For longer delays, yields to the scheduler between checks.
+/// < 100us: spin (hardware precision, syscall overhead not worth it)
+/// >= 100us: sleep syscall (scheduler can idle CPU)
 pub fn delay_us(us: u32) {
-    let freq: u64;
-    let start: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
+    if us == 0 {
+        return;
     }
-    let ticks_needed = (freq / 1_000_000) * us as u64;
-    let end = start + ticks_needed;
-
-    // For very short delays, spin to avoid scheduler overhead
-    // For longer delays, yield to allow other tasks to run
-    let use_yield = us >= 100;
-
-    loop {
-        let now: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now); }
-        if now >= end {
-            break;
-        }
-        if use_yield {
-            syscall::yield_now();
-        } else {
+    if us >= 100 {
+        syscall::sleep_us(us);
+    } else {
+        // Short delay - spin for precision
+        let start = syscall::gettime();
+        let end = start + (us as u64) * 1_000;
+        while syscall::gettime() < end {
             core::hint::spin_loop();
         }
     }
@@ -260,35 +235,27 @@ pub fn delay_us(us: u32) {
 /// Calls `condition()` repeatedly until it returns `true` or `timeout_ms` expires.
 /// Returns `true` if condition was met, `false` on timeout.
 ///
+/// Sleeps 1ms between polls to avoid busy-waiting.
 /// The `label` is used for debug output on timeout.
 pub fn poll_until<F>(label: &str, timeout_ms: u32, mut condition: F) -> bool
 where
     F: FnMut() -> bool,
 {
-    let freq: u64;
-    let start: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
-    }
-    let ticks_needed = (freq / 1000) * timeout_ms as u64;
-    let end = start + ticks_needed;
+    let start = syscall::gettime();
+    let deadline = start + (timeout_ms as u64) * 1_000_000;
 
     loop {
         if condition() {
             return true;
         }
 
-        let now: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now); }
-        if now >= end {
-            // Timeout - could log here if we had a trace! macro
+        if syscall::gettime() >= deadline {
             crate::println!("poll_until '{}' timeout after {}ms", label, timeout_ms);
             return false;
         }
 
-        // Yield to scheduler between polls
-        syscall::yield_now();
+        // Sleep 1ms between polls
+        syscall::sleep_ms(1);
     }
 }
 

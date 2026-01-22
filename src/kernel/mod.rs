@@ -15,9 +15,9 @@ pub mod task;
 pub mod sched;
 pub mod process;
 pub mod syscall;
-pub mod ipc;
+pub mod memory;  // User memory mapping types
+pub mod ipc;    // IPC system (channels, ports, waker)
 pub mod scheme;
-pub mod port;
 pub mod event;
 pub mod fd;
 pub mod shmem;
@@ -34,3 +34,7 @@ pub mod pci;
 pub mod bus;
 pub mod security_log;
 pub mod fdt;
+pub mod liveness;
+pub mod handle;
+pub mod hw_poll;
+pub mod object;

@@ -418,28 +418,29 @@ impl IrqRegistration {
 /// Maximum IRQ registrations
 pub const MAX_IRQ_REGISTRATIONS: usize = 32;
 
-/// Global IRQ registration table
-static mut IRQ_REGISTRATIONS: [IrqRegistration; MAX_IRQ_REGISTRATIONS] =
-    [IrqRegistration::empty(); MAX_IRQ_REGISTRATIONS];
+/// Global IRQ registration table (protected by SpinLock)
+static IRQ_TABLE: super::lock::SpinLock<[IrqRegistration; MAX_IRQ_REGISTRATIONS]> =
+    super::lock::SpinLock::new([IrqRegistration::empty(); MAX_IRQ_REGISTRATIONS]);
 
-/// Get IRQ registration table (unsafe, requires synchronization)
-pub unsafe fn irq_table() -> &'static mut [IrqRegistration; MAX_IRQ_REGISTRATIONS] {
-    &mut *core::ptr::addr_of_mut!(IRQ_REGISTRATIONS)
+/// Execute a closure with exclusive access to the IRQ table
+/// Automatically disables interrupts for the duration.
+#[inline]
+pub fn with_irq_table<R, F: FnOnce(&mut [IrqRegistration; MAX_IRQ_REGISTRATIONS]) -> R>(f: F) -> R {
+    let mut table = IRQ_TABLE.lock();
+    f(&mut *table)
 }
 
 /// Register a process for an IRQ
 pub fn irq_register(irq_num: u32, pid: u32) -> bool {
-    unsafe {
-        let table = irq_table();
-
-        // Check if already registered
+    with_irq_table(|table| {
+        // Check if already registered (atomic with registration)
         for reg in table.iter() {
             if !reg.is_empty() && reg.irq_num == irq_num {
                 return false; // IRQ already taken
             }
         }
 
-        // Find empty slot
+        // Find empty slot and register atomically
         for reg in table.iter_mut() {
             if reg.is_empty() {
                 reg.irq_num = irq_num;
@@ -457,14 +458,12 @@ pub fn irq_register(irq_num: u32, pid: u32) -> bool {
             }
         }
         false
-    }
+    })
 }
 
 /// Unregister a process from an IRQ
 pub fn irq_unregister(irq_num: u32, pid: u32) -> bool {
-    unsafe {
-        let table = irq_table();
-
+    with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
                 // Disable the IRQ in the GIC
@@ -475,14 +474,12 @@ pub fn irq_unregister(irq_num: u32, pid: u32) -> bool {
             }
         }
         false
-    }
+    })
 }
 
 /// Clean up all IRQ registrations for a process (called on process exit)
 pub fn process_cleanup(pid: u32) {
-    unsafe {
-        let table = irq_table();
-
+    with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.owner_pid == pid {
                 // Disable the IRQ in the GIC
@@ -490,7 +487,7 @@ pub fn process_cleanup(pid: u32) {
                 *reg = IrqRegistration::empty();
             }
         }
-    }
+    })
 }
 
 /// Called from IRQ handler when an interrupt fires
@@ -500,49 +497,40 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
     // Userspace will unmask by reading from the irq: scheme
     crate::platform::mt7988::gic::disable_irq(irq_num);
 
-    unsafe {
-        let table = irq_table();
-
+    // First, update IRQ table state and collect wake info
+    // Keep lock scope minimal to avoid deadlock with scheduler
+    let (wake_blocked, owner_pid) = with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num {
                 reg.pending = true;
                 reg.pending_count += 1;
 
-                // Wake up blocked process if any
-                let wake_pid = if reg.blocked_pid != 0 {
+                if reg.blocked_pid != 0 {
                     let pid = reg.blocked_pid;
                     reg.blocked_pid = 0;
-
-                    // Find task by PID (not slot index - they may differ!)
-                    let sched = super::task::scheduler();
-                    let mut found_slot = None;
-                    for (slot, task_opt) in sched.tasks.iter().enumerate() {
-                        if let Some(ref task) = task_opt {
-                            if task.id == pid {
-                                found_slot = Some(slot);
-                                break;
-                            }
-                        }
-                    }
-
-                    if let Some(slot) = found_slot {
-                        if let Some(ref mut task) = sched.tasks[slot] {
-                            if matches!(task.state, super::task::TaskState::Blocked) {
-                                task.state = super::task::TaskState::Ready;
-                            }
-                        }
-                    }
-                    Some(pid)
+                    return (Some(pid), reg.owner_pid);
                 } else {
-                    // Send event to the process (fallback for non-blocking mode)
-                    let event = super::event::Event::irq(irq_num);
-                    super::event::deliver_event_to_task(reg.owner_pid, event);
-                    Some(reg.owner_pid)
-                };
-
-                return wake_pid;
+                    return (None, reg.owner_pid);
+                }
             }
         }
+        (None, 0)
+    });
+
+    // Now handle waking outside the IRQ table lock
+    if let Some(pid) = wake_blocked {
+        // Wake blocked process using unified wake function
+        unsafe {
+            let sched = super::task::scheduler();
+            sched.wake_by_pid(pid);
+        }
+        Some(pid)
+    } else if owner_pid != 0 {
+        // Send event to the process (fallback for non-blocking mode)
+        let event = super::event::Event::irq(irq_num);
+        super::event::deliver_event_to_task(owner_pid, event);
+        Some(owner_pid)
+    } else {
         None
     }
 }
@@ -550,9 +538,7 @@ pub fn irq_notify(irq_num: u32) -> Option<u32> {
 /// Check if an IRQ is pending for a process
 /// If pending, clears the flag and re-enables the IRQ at the GIC
 pub fn irq_check_pending(irq_num: u32, pid: u32) -> Option<u32> {
-    unsafe {
-        let table = irq_table();
-
+    with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
                 if reg.pending {
@@ -570,7 +556,7 @@ pub fn irq_check_pending(irq_num: u32, pid: u32) -> Option<u32> {
             }
         }
         None
-    }
+    })
 }
 
 /// Block waiting for an IRQ (called from syscall context)
@@ -581,30 +567,33 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
         return Ok(count);
     }
 
-    // Not pending - set up for blocking
-    unsafe {
-        let table = irq_table();
-        let mut found = false;
-
+    // Not pending - set up for blocking (minimal lock scope)
+    let found = with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
                 reg.blocked_pid = pid;
-                found = true;
-                break;
+                return true;
             }
         }
+        false
+    });
 
-        if !found {
-            return Err(-22); // EINVAL - not registered for this IRQ
-        }
+    if !found {
+        return Err(-22); // EINVAL - not registered for this IRQ
+    }
 
-        // Mark current task as Blocked and switch to another task
+    // Now handle blocking outside the IRQ table lock
+    unsafe {
+
+        // Mark current task as Sleeping and switch to another task
         let sched = super::task::scheduler();
         let caller_slot = super::task::current_slot();
 
-        // Mark current as Blocked to exclude it from scheduling
+        // Mark current as Sleeping to exclude it from scheduling (waiting for IRQ)
         if let Some(ref mut task) = sched.tasks[caller_slot] {
-            task.state = super::task::TaskState::Blocked;
+            task.state = super::task::TaskState::Sleeping {
+                reason: super::task::SleepReason::EventLoop,
+            };
         }
 
         // Find next ready task
@@ -634,7 +623,20 @@ pub fn irq_wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
         }
 
         // Spin-wait with interrupts enabled until IRQ fires
+        // IMPORTANT: Add timeout to prevent infinite hang if IRQ never arrives
+        const IRQ_WAIT_TIMEOUT_MS: u64 = 5000; // 5 second timeout
+        let start = crate::platform::mt7988::timer::counter();
+        let freq = crate::platform::mt7988::timer::frequency();
+        let deadline = start + (IRQ_WAIT_TIMEOUT_MS * freq / 1000);
+
         loop {
+            // Check timeout first
+            let now = crate::platform::mt7988::timer::counter();
+            if now >= deadline {
+                crate::kwarn!("scheme", "irq_wait_timeout"; irq = irq_num as u64, pid = pid as u64);
+                return Err(-110); // ETIMEDOUT
+            }
+
             core::arch::asm!("msr daifclr, #2"); // Unmask IRQs
             core::arch::asm!("wfi");
 
@@ -1662,7 +1664,7 @@ fn open_user_scheme(
     path: &str,
     flags: u32,
 ) -> Result<(FdEntry, SchemeHandle), i32> {
-    use super::ipc::{self, Message, MessageType};
+    use super::ipc::{self, Message, MessageHeader, MessageType, MAX_INLINE_PAYLOAD, waker, WakeReason};
 
     let daemon_channel = entry.channel_id;
     let daemon_pid = entry.owner_pid;
@@ -1677,23 +1679,22 @@ fn open_user_scheme(
     };
 
     // Create a channel pair for this connection
-    let (client_ch, server_ch) = ipc::with_channel_table(|table| {
-        table.create_pair(caller_pid, daemon_pid)
-    }).ok_or(-12)?; // ENOMEM
+    let (client_ch, server_ch) = ipc::create_channel_pair(caller_pid, daemon_pid)
+        .map_err(|_| -12i32)?; // ENOMEM
 
     // Build open request message
     // Format: server_ch (4 bytes) + flags (4 bytes) + path (remaining bytes)
     // The server_ch is included so the daemon knows where to send responses
-    let mut payload = [0u8; ipc::MAX_INLINE_PAYLOAD];
+    let mut payload = [0u8; MAX_INLINE_PAYLOAD];
     payload[0..4].copy_from_slice(&server_ch.to_le_bytes());
     payload[4..8].copy_from_slice(&flags.to_le_bytes());
     let path_bytes = path.as_bytes();
-    let path_len = core::cmp::min(path_bytes.len(), ipc::MAX_INLINE_PAYLOAD - 8);
+    let path_len = core::cmp::min(path_bytes.len(), MAX_INLINE_PAYLOAD - 8);
     payload[8..8 + path_len].copy_from_slice(&path_bytes[..path_len]);
 
     // Create connect message
     let msg = Message {
-        header: super::ipc::MessageHeader {
+        header: MessageHeader {
             msg_type: MessageType::Connect,
             sender: caller_pid,
             msg_id: server_ch, // Also in payload for easier access
@@ -1703,13 +1704,16 @@ fn open_user_scheme(
         payload,
     };
 
-    // Send to daemon's main channel
-    let (blocked_pid, peer_owner, peer_channel) = ipc::with_channel_table(|table| {
-        let peer_owner = table.get_peer_owner(daemon_channel);
-        let peer_channel = table.get_peer_id(daemon_channel);
-        let blocked = table.send(daemon_channel, msg)?;
-        Ok((blocked, peer_owner, peer_channel))
-    }).map_err(|e: ipc::ChannelError| e.to_errno())?;
+    // Get peer info before sending
+    let peer_owner = ipc::get_peer_owner_unchecked(daemon_channel);
+    let peer_channel = ipc::get_peer_id(daemon_channel);
+
+    // Send to daemon's main channel (use unchecked send since caller may not own channel)
+    let wake_list = ipc::send_unchecked(daemon_channel, msg)
+        .map_err(|e| e.to_errno() as i32)?;
+
+    // Wake subscribers from the send
+    waker::wake(&wake_list, WakeReason::Readable);
 
     // Push IpcReady event to daemon's event queue (for event-driven processes)
     if let (Some(peer_pid), Some(peer_ch)) = (peer_owner, peer_channel) {
@@ -1722,21 +1726,12 @@ fn open_user_scheme(
                         let event = super::event::Event::ipc_ready(peer_ch, caller_pid);
                         if task.event_queue.is_subscribed(&event) {
                             task.event_queue.push(event);
-                            if task.state == super::task::TaskState::Blocked {
-                                task.state = super::task::TaskState::Ready;
-                            }
+                            // Wake task using unified wake function
+                            sched.wake_task(slot);
                         }
                     }
                 }
             }
-        }
-    }
-
-    // Wake blocked receiver outside lock
-    if let Some(pid) = blocked_pid {
-        unsafe {
-            super::process::process_table().wake(pid);
-            super::task::scheduler().wake_by_pid(pid);
         }
     }
 

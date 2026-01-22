@@ -1,0 +1,1208 @@
+//! The Five Syscalls
+//!
+//! Everything goes through these five entry points.
+
+use super::{Object, ObjectType, Handle, ConsoleType, Pollable};
+use super::types::Error;
+use crate::kernel::task;
+use crate::kernel::uaccess;
+use crate::platform::mt7988::uart;
+use crate::kernel::ipc;
+use crate::kernel::ipc::waker;
+
+// ============================================================================
+// open - Create a new handle
+// ============================================================================
+
+/// Open a new object
+///
+/// type_id: ObjectType discriminant
+/// params_ptr: Type-specific parameters
+/// params_len: Length of params
+///
+/// Returns: handle (positive) or error (negative)
+pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
+    let Some(obj_type) = ObjectType::from_u32(type_id) else {
+        return Error::InvalidArg.to_errno();
+    };
+
+    // Dispatch to type-specific open
+    match obj_type {
+        ObjectType::Channel => open_channel(params_ptr, params_len),
+        ObjectType::Timer => open_timer(params_ptr, params_len),
+        ObjectType::Process => open_process(params_ptr, params_len),
+        ObjectType::Port => open_port(params_ptr, params_len),
+        ObjectType::Shmem => open_shmem(params_ptr, params_len),
+        ObjectType::DmaPool => open_dma_pool(params_ptr, params_len),
+        ObjectType::Mmio => open_mmio(params_ptr, params_len),
+        ObjectType::Stdin => open_console(super::ConsoleType::Stdin),
+        ObjectType::Stdout => open_console(super::ConsoleType::Stdout),
+        ObjectType::Stderr => open_console(super::ConsoleType::Stderr),
+        ObjectType::Klog => open_klog(params_ptr, params_len),
+        ObjectType::Mux => open_mux(params_ptr, params_len),
+        ObjectType::PciBus => open_pci_bus(params_ptr, params_len),
+    }
+}
+
+// ============================================================================
+// read - Read from handle
+// ============================================================================
+
+/// Read from a handle
+///
+/// For channels: receive message
+/// For timer: wait until tick, return timestamp
+/// For process: wait until exit, return exit code
+/// For port: accept connection, return new handle
+/// For mux: wait for event, return (handle, event_type)
+///
+/// Returns: bytes read (positive) or error (negative)
+pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
+    let handle = Handle::from_raw(handle_raw);
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        // Check handle validity and get type
+        let (obj_type, task_id) = {
+            let Some(entry) = task.object_table.get(handle) else {
+                return Error::BadHandle.to_errno();
+            };
+            if !entry.object_type.is_readable() {
+                return Error::NotSupported.to_errno();
+            }
+            (entry.object_type, task.id)
+        };
+
+        // Handle Mux specially - needs access to multiple handles
+        if obj_type == ObjectType::Mux {
+            return read_mux_impl(task, handle, buf_ptr, buf_len);
+        }
+
+        // For other types, get mutable ref and dispatch
+        let Some(entry) = task.object_table.get_mut(handle) else {
+            return Error::BadHandle.to_errno();
+        };
+
+        // Dispatch to type-specific read
+        match &mut entry.object {
+            Object::Channel(ch) => read_channel(ch, buf_ptr, buf_len),
+            Object::Timer(t) => read_timer(t, buf_ptr, buf_len, task_id),
+            Object::Process(p) => read_process(p, buf_ptr, buf_len, task_id),
+            Object::Port(p) => read_port(p, buf_ptr, buf_len, task_id),
+            Object::Shmem(s) => read_shmem(s, buf_ptr, buf_len),
+            Object::Console(c) => read_console(c, buf_ptr, buf_len, task_id),
+            Object::Klog(k) => read_klog(k, buf_ptr, buf_len),
+            Object::Mux(_) => unreachable!(), // Handled above
+            _ => Error::NotSupported.to_errno(),
+        }
+    }
+}
+
+// ============================================================================
+// sys_write - Write to handle
+// ============================================================================
+
+/// Write to a handle
+///
+/// For channels: send message
+/// For timer: set deadline (buf = u64 nanoseconds)
+/// For mux: add/remove watch
+///
+/// Returns: bytes written (positive) or error (negative)
+pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
+    let handle = Handle::from_raw(handle_raw);
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let Some(entry) = task.object_table.get_mut(handle) else {
+            return Error::BadHandle.to_errno();
+        };
+
+        if !entry.object_type.is_writable() {
+            return Error::NotSupported.to_errno();
+        }
+
+        // Dispatch to type-specific write
+        match &mut entry.object {
+            Object::Channel(ch) => write_channel(ch, buf_ptr, buf_len),
+            Object::Timer(t) => write_timer(t, buf_ptr, buf_len),
+            Object::Shmem(s) => write_shmem(s, buf_ptr, buf_len),
+            Object::Console(c) => write_console(c, buf_ptr, buf_len),
+            Object::Mux(m) => write_mux(m, buf_ptr, buf_len),
+            _ => Error::NotSupported.to_errno(),
+        }
+    }
+}
+
+// ============================================================================
+// sys_map - Map handle to memory
+// ============================================================================
+
+/// Map a memory handle into address space
+///
+/// Only valid for: Shmem, DmaPool, Mmio
+///
+/// Returns: virtual address (positive) or error (negative)
+pub fn map(handle_raw: u32, flags: u32) -> i64 {
+    let handle = Handle::from_raw(handle_raw);
+    let _ = flags; // For future use (read-only, etc.)
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let Some(entry) = task.object_table.get_mut(handle) else {
+            return Error::BadHandle.to_errno();
+        };
+
+        if !entry.object_type.is_mappable() {
+            return Error::NotSupported.to_errno();
+        }
+
+        // Dispatch to type-specific map
+        match &mut entry.object {
+            Object::Shmem(s) => map_shmem(s, task.id),
+            Object::DmaPool(d) => map_dma_pool(d, task.id),
+            Object::Mmio(m) => map_mmio(m, task.id),
+            _ => Error::NotSupported.to_errno(),
+        }
+    }
+}
+
+// ============================================================================
+// sys_close - Close a handle
+// ============================================================================
+
+/// Close a handle
+///
+/// Returns: 0 on success, negative error
+pub fn close(handle_raw: u32) -> i64 {
+    let handle = Handle::from_raw(handle_raw);
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let Some(object) = task.object_table.close(handle) else {
+            return Error::BadHandle.to_errno();
+        };
+
+        // Type-specific cleanup and resource counter updates
+        match object {
+            Object::Channel(ch) => {
+                close_channel(ch, task.id);
+                task.remove_channel();
+            }
+            Object::Port(p) => {
+                close_port(p, task.id);
+                task.remove_port();
+            }
+            Object::Shmem(s) => {
+                close_shmem(s, task.id);
+                task.remove_shmem();
+            }
+            Object::DmaPool(d) => close_dma_pool(d, task.id),
+            Object::Mmio(m) => close_mmio(m, task.id),
+            _ => {} // No cleanup needed
+        }
+
+        0
+    }
+}
+
+// ============================================================================
+// Type-specific implementations (stubs for now)
+// ============================================================================
+
+fn open_channel(params_ptr: u64, params_len: usize) -> i64 {
+    // Two modes:
+    // 1. params_len == 0: Create channel pair
+    // 2. params_len > 0: Connect to named port
+    //
+    // For channel pair: Returns both handles packed: (handle_a << 32) | handle_b
+    // For port connect: Returns single channel handle
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let pid = task.id;
+
+        // Check if this is a port connect (params contains port name)
+        if params_len > 0 && params_len <= 32 {
+            // Per-process limit check (1 channel for connect)
+            if !task.can_create_channel() {
+                return Error::NoSpace.to_errno();
+            }
+            // Copy port name from user
+            let mut name_buf = [0u8; 32];
+            if uaccess::copy_from_user(&mut name_buf[..params_len], params_ptr).is_err() {
+                return Error::BadAddress.to_errno();
+            }
+
+            // Try to connect to the port
+            match ipc::port_connect(&name_buf[..params_len], pid) {
+                Ok((client_channel, wake_list)) => {
+                    // Wake the server that's waiting for connections
+                    waker::wake(&wake_list, ipc::WakeReason::Accepted);
+
+                    // Create ChannelObject for the client channel
+                    let ch_obj = Object::Channel(super::ChannelObject::new(client_channel));
+
+                    match task.object_table.alloc(ObjectType::Channel, ch_obj) {
+                        Some(handle) => {
+                            task.add_channel();  // Track resource usage
+                            return handle.raw() as i64;
+                        }
+                        None => {
+                            let _ = ipc::close_channel(client_channel, pid);
+                            return Error::NoSpace.to_errno();
+                        }
+                    }
+                }
+                Err(ipc::IpcError::PortNotFound) => return Error::NotFound.to_errno(),
+                Err(e) => return e.to_errno(),
+            }
+        }
+
+        // Per-process limit check (need space for 2 channels in pair)
+        if task.channel_count + 2 > task::MAX_CHANNELS_PER_TASK {
+            return Error::NoSpace.to_errno();
+        }
+
+        // Create channel pair (no params)
+        let (ch_a, ch_b) = match ipc::create_channel_pair(pid, pid) {
+            Ok(pair) => pair,
+            Err(e) => return e.to_errno(),
+        };
+
+        // Create ChannelObject for channel A
+        let obj_a = Object::Channel(super::ChannelObject::new(ch_a));
+
+        let Some(handle_a) = task.object_table.alloc(ObjectType::Channel, obj_a) else {
+            let _ = ipc::close_channel(ch_a, pid);
+            let _ = ipc::close_channel(ch_b, pid);
+            return Error::NoSpace.to_errno();
+        };
+
+        // Create ChannelObject for channel B
+        let obj_b = Object::Channel(super::ChannelObject::new(ch_b));
+
+        let Some(handle_b) = task.object_table.alloc(ObjectType::Channel, obj_b) else {
+            let _ = task.object_table.close(handle_a);
+            let _ = ipc::close_channel(ch_a, pid);
+            let _ = ipc::close_channel(ch_b, pid);
+            return Error::NoSpace.to_errno();
+        };
+
+        // Track resource usage (both channels created successfully)
+        task.add_channel();
+        task.add_channel();
+
+        // Pack both handles into return value
+        ((handle_a.raw() as i64) << 32) | (handle_b.raw() as i64)
+    }
+}
+
+fn open_timer(_params_ptr: u64, _params_len: usize) -> i64 {
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        // Create timer object
+        let timer_obj = Object::Timer(super::TimerObject::new());
+
+        // Allocate handle
+        match task.object_table.alloc(ObjectType::Timer, timer_obj) {
+            Some(handle) => handle.raw() as i64,
+            None => Error::NoSpace.to_errno(),
+        }
+    }
+}
+
+fn open_process(params_ptr: u64, params_len: usize) -> i64 {
+    // Params: u32 PID to watch (4 bytes)
+    if params_len != 4 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    // Copy PID from user
+    let mut pid_bytes = [0u8; 4];
+    if uaccess::copy_from_user(&mut pid_bytes, params_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+    let target_pid = u32::from_le_bytes(pid_bytes);
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        // First, check target task state (before borrowing caller's task)
+        let exit_code = if let Some(target_slot) = sched.slot_by_pid(target_pid) {
+            if let Some(ref target) = sched.tasks[target_slot] {
+                target.state.exit_code()
+            } else {
+                Some(-1) // Slot exists but task is None
+            }
+        } else {
+            // Task not found - may have already exited and been reaped
+            Some(-1)
+        };
+
+        // Now borrow caller's task to allocate handle
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        // Create ProcessObject
+        let proc_obj = Object::Process(super::ProcessObject {
+            pid: target_pid,
+            exit_code,
+            subscriber: None,
+        });
+
+        // Allocate handle
+        match task.object_table.alloc(ObjectType::Process, proc_obj) {
+            Some(handle) => handle.raw() as i64,
+            None => Error::NoSpace.to_errno(),
+        }
+    }
+}
+
+fn open_port(params_ptr: u64, params_len: usize) -> i64 {
+    // params contains the port name
+    if params_len == 0 || params_len > 32 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    // Copy port name from user
+    let mut name_buf = [0u8; 32];
+    if uaccess::copy_from_user(&mut name_buf[..params_len], params_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let pid = task.id;
+
+        // Per-process port limit check
+        if !task.can_create_port() {
+            return Error::NoSpace.to_errno();
+        }
+
+        // Register port with ipc backend
+        let (port_id, _listen_channel) = match ipc::port_register(&name_buf[..params_len], pid) {
+            Ok(result) => result,
+            Err(e) => return e.to_errno(),
+        };
+
+        // Create PortObject using new constructor
+        let port_obj = super::PortObject::new(port_id, &name_buf[..params_len]);
+        let obj = Object::Port(port_obj);
+
+        match task.object_table.alloc(ObjectType::Port, obj) {
+            Some(h) => {
+                task.add_port();  // Track resource usage
+                h.raw() as i64
+            }
+            None => {
+                // Cleanup: unregister the port
+                let _ = ipc::port_unregister(port_id, pid);
+                Error::NoSpace.to_errno()
+            }
+        }
+    }
+}
+
+fn open_shmem(_params_ptr: u64, _params_len: usize) -> i64 {
+    // TODO: Create shmem region
+    Error::NotSupported.to_errno()
+}
+
+fn open_dma_pool(_params_ptr: u64, _params_len: usize) -> i64 {
+    // TODO: Allocate DMA pool
+    Error::NotSupported.to_errno()
+}
+
+fn open_mmio(_params_ptr: u64, _params_len: usize) -> i64 {
+    // TODO: Request MMIO region
+    Error::NotSupported.to_errno()
+}
+
+fn open_console(console_type: super::ConsoleType) -> i64 {
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let obj = Object::Console(super::ConsoleObject {
+            console_type,
+            subscriber: None,
+        });
+
+        let obj_type = match console_type {
+            super::ConsoleType::Stdin => ObjectType::Stdin,
+            super::ConsoleType::Stdout => ObjectType::Stdout,
+            super::ConsoleType::Stderr => ObjectType::Stderr,
+        };
+
+        match task.object_table.alloc(obj_type, obj) {
+            Some(h) => h.raw() as i64,
+            None => Error::NoSpace.to_errno(),
+        }
+    }
+}
+
+fn open_klog(_params_ptr: u64, _params_len: usize) -> i64 {
+    // TODO: Create klog handle
+    Error::NotSupported.to_errno()
+}
+
+fn open_mux(_params_ptr: u64, _params_len: usize) -> i64 {
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(ref mut task) = sched.tasks[slot] else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let obj = Object::Mux(super::MuxObject::default());
+
+        match task.object_table.alloc(ObjectType::Mux, obj) {
+            Some(h) => h.raw() as i64,
+            None => Error::NoSpace.to_errno(),
+        }
+    }
+}
+
+fn open_pci_bus(_params_ptr: u64, _params_len: usize) -> i64 {
+    // TODO: Create PCI bus handle
+    Error::NotSupported.to_errno()
+}
+
+// Read implementations
+fn read_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    use super::ChannelState;
+
+    // Check state first
+    match ch.state {
+        ChannelState::Closed => return Error::PeerClosed.to_errno(),
+        ChannelState::HalfClosed | ChannelState::Open => {}
+    }
+
+    let channel_id = ch.channel_id;
+    if channel_id == 0 {
+        return Error::PeerClosed.to_errno();
+    }
+
+    let pid = unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+        match sched.tasks[slot] {
+            Some(ref t) => t.id,
+            None => return Error::BadHandle.to_errno(),
+        }
+    };
+
+    // Receive message from ipc
+    match ipc::receive(channel_id, pid) {
+        Ok(msg) => {
+            let payload = msg.payload_slice();
+            let copy_len = core::cmp::min(payload.len(), buf_len);
+
+            // Copy to user buffer
+            if uaccess::copy_to_user(buf_ptr, &payload[..copy_len]).is_err() {
+                return Error::BadAddress.to_errno();
+            }
+
+            copy_len as i64
+        }
+        Err(ipc::IpcError::WouldBlock) => Error::WouldBlock.to_errno(),
+        Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
+            // Transition to HalfClosed if peer closed
+            if ch.state == ChannelState::Open {
+                ch.state = ChannelState::HalfClosed;
+            }
+            Error::PeerClosed.to_errno()
+        }
+        Err(_) => Error::BadHandle.to_errno(),
+    }
+}
+
+fn read_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    use super::TimerState;
+    use crate::platform::mt7988::timer;
+
+    let current_tick = timer::ticks();
+
+    match t.state {
+        TimerState::Disarmed => {
+            // Timer not armed - return error
+            Error::InvalidArg.to_errno()
+        }
+        TimerState::Armed => {
+            if current_tick >= t.deadline {
+                // Timer has fired
+                t.state = TimerState::Fired;
+
+                // Write timestamp to buffer if provided
+                if buf_ptr != 0 && buf_len >= 8 {
+                    let ts_bytes = current_tick.to_le_bytes();
+                    if uaccess::copy_to_user(buf_ptr, &ts_bytes).is_err() {
+                        return Error::BadAddress.to_errno();
+                    }
+                }
+
+                // Handle recurring timer
+                if t.interval > 0 {
+                    t.deadline = current_tick + t.interval;
+                    t.state = TimerState::Armed;
+                }
+
+                8 // Return bytes written
+            } else {
+                // Not yet fired - register waker and return WouldBlock
+                t.subscriber = Some(ipc::traits::Subscriber {
+                    task_id,
+                    generation: task::Scheduler::generation_from_pid(task_id),
+                });
+                Error::WouldBlock.to_errno()
+            }
+        }
+        TimerState::Fired => {
+            // Already fired - return timestamp
+            if buf_ptr != 0 && buf_len >= 8 {
+                let ts_bytes = t.deadline.to_le_bytes();
+                if uaccess::copy_to_user(buf_ptr, &ts_bytes).is_err() {
+                    return Error::BadAddress.to_errno();
+                }
+            }
+            t.state = TimerState::Disarmed;
+            8
+        }
+    }
+}
+
+fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    use crate::kernel::ipc::traits::Subscriber;
+
+    // Check if we already have the exit code cached
+    if let Some(code) = p.exit_code {
+        // Return the exit code
+        if buf_ptr != 0 && buf_len >= 4 {
+            let code_bytes = code.to_le_bytes();
+            if uaccess::copy_to_user(buf_ptr, &code_bytes).is_err() {
+                return Error::BadAddress.to_errno();
+            }
+        }
+        return 4; // Return 4 bytes written
+    }
+
+    // Lazy check: see if target task has exited since we last checked
+    let exit_code = unsafe {
+        let sched = task::scheduler();
+        if let Some(target_slot) = sched.slot_by_pid(p.pid) {
+            if let Some(ref target) = sched.tasks[target_slot] {
+                target.state.exit_code()
+            } else {
+                Some(-1) // Slot exists but task is None (shouldn't happen)
+            }
+        } else {
+            // Task not found - PID no longer valid, task was reaped
+            Some(-1)
+        }
+    };
+
+    if let Some(code) = exit_code {
+        // Target has exited - cache and return
+        p.exit_code = Some(code);
+        if buf_ptr != 0 && buf_len >= 4 {
+            let code_bytes = code.to_le_bytes();
+            if uaccess::copy_to_user(buf_ptr, &code_bytes).is_err() {
+                return Error::BadAddress.to_errno();
+            }
+        }
+        return 4;
+    }
+
+    // Target still running - register subscriber and return WouldBlock
+    p.subscriber = Some(Subscriber {
+        task_id,
+        generation: task::Scheduler::generation_from_pid(task_id),
+    });
+    Error::WouldBlock.to_errno()
+}
+
+fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    use super::PortState;
+
+    // Check state first
+    if p.state != PortState::Listening {
+        return Error::PeerClosed.to_errno();
+    }
+
+    let port_id = p.port_id;
+
+    // Accept connection from ipc
+    match ipc::port_accept(port_id, task_id) {
+        Ok((server_channel, client_pid)) => {
+            // Create a new ChannelObject for the accepted connection
+            let ch_obj = Object::Channel(super::ChannelObject::new(server_channel));
+
+            unsafe {
+                let sched = task::scheduler();
+                let slot = task::current_slot();
+
+                let Some(ref mut task) = sched.tasks[slot] else {
+                    return Error::BadHandle.to_errno();
+                };
+
+                // Need at least 4 bytes for handle
+                if buf_ptr == 0 || buf_len < 4 {
+                    let _ = ipc::close_channel(server_channel, task_id);
+                    return Error::InvalidArg.to_errno();
+                }
+
+                match task.object_table.alloc(ObjectType::Channel, ch_obj) {
+                    Some(handle) => {
+                        // Write handle (always)
+                        let handle_bytes = handle.raw().to_le_bytes();
+                        if uaccess::copy_to_user(buf_ptr, &handle_bytes).is_err() {
+                            return Error::BadAddress.to_errno();
+                        }
+
+                        // Write client_pid if space available
+                        if buf_len >= 8 {
+                            let pid_bytes = client_pid.to_le_bytes();
+                            if uaccess::copy_to_user(buf_ptr + 4, &pid_bytes).is_err() {
+                                return Error::BadAddress.to_errno();
+                            }
+                            return 8;
+                        }
+                        4 // Wrote 4 bytes (handle only)
+                    }
+                    None => {
+                        // Close the channel we couldn't wrap
+                        let _ = ipc::close_channel(server_channel, task_id);
+                        Error::NoSpace.to_errno()
+                    }
+                }
+            }
+        }
+        Err(ipc::IpcError::NoPending) => Error::WouldBlock.to_errno(),
+        Err(ipc::IpcError::Closed) => Error::PeerClosed.to_errno(),
+        Err(_) => Error::BadHandle.to_errno(),
+    }
+}
+
+fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    let _ = (s, buf_ptr, buf_len);
+    Error::NotSupported.to_errno()
+}
+
+fn read_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    use super::Pollable;
+    use crate::kernel::ipc::traits::Subscriber;
+
+    // Only stdin is readable
+    match c.console_type {
+        ConsoleType::Stdin => {
+            if buf_len == 0 {
+                return 0;
+            }
+            // Read from UART RX buffer (non-blocking for now)
+            let mut kernel_buf = [0u8; 256];
+            let max_read = core::cmp::min(buf_len, 256);
+            let mut bytes_read = 0;
+
+            for i in 0..max_read {
+                if let Some(byte) = uart::rx_buffer_read() {
+                    kernel_buf[i] = byte;
+                    bytes_read += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if bytes_read == 0 {
+                // Register for wake when input arrives (fixes audit #13)
+                let sub = Subscriber {
+                    task_id,
+                    generation: task::Scheduler::generation_from_pid(task_id),
+                };
+                c.subscribe(sub);
+                return Error::WouldBlock.to_errno();
+            }
+
+            // Copy to user
+            if uaccess::copy_to_user(buf_ptr, &kernel_buf[..bytes_read]).is_err() {
+                return Error::BadAddress.to_errno();
+            }
+
+            bytes_read as i64
+        }
+        ConsoleType::Stdout | ConsoleType::Stderr => Error::NotSupported.to_errno(),
+    }
+}
+
+fn read_klog(k: &mut super::KlogObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    let _ = (k, buf_ptr, buf_len);
+    Error::NotSupported.to_errno()
+}
+
+fn read_mux(_m: &mut super::MuxObject, _buf_ptr: u64, _buf_len: usize, _task_id: u32) -> i64 {
+    // This shouldn't be called - Mux is handled specially in read()
+    Error::NotSupported.to_errno()
+}
+
+/// Mux read - blocks until events are ready
+///
+/// State machine:
+/// 1. Subscribe to watched handles
+/// 2. Poll for ready events
+/// 3. If ready → copy to user, return count
+/// 4. If not ready:
+///    - No timers → Sleeping (liveness monitors, no deadline)
+///    - Has timers → Waiting (deadline from earliest timer)
+/// 5. When woken → syscall re-executes from start
+///
+/// Userspace never sees WouldBlock.
+fn read_mux_impl(task: &mut crate::kernel::task::Task, mux_handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
+    use super::types::filter;
+    use crate::kernel::ipc::traits::Subscriber;
+
+    let task_id = task.id;
+    let subscriber = Subscriber {
+        task_id,
+        generation: task::Scheduler::generation_from_pid(task_id),
+    };
+
+    // Collect watch list and channel IDs
+    let watches: [(Option<super::MuxWatch>, u32); 16] = {
+        let Some(mux_entry) = task.object_table.get(mux_handle) else {
+            return Error::BadHandle.to_errno();
+        };
+        let Object::Mux(ref mux) = mux_entry.object else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let mut w = [(None, 0u32); 16];
+        for i in 0..16 {
+            if let Some(watch) = mux.watches[i] {
+                let watched_handle = Handle::from_raw(watch.handle);
+                let channel_id = if let Some(entry) = task.object_table.get(watched_handle) {
+                    if let Object::Channel(ch) = &entry.object { ch.channel_id } else { 0 }
+                } else { 0 };
+                w[i] = (Some(watch), channel_id);
+            }
+        }
+        w
+    };
+
+    // Subscribe BEFORE polling (avoid race)
+    if let Some(mux_entry) = task.object_table.get_mut(mux_handle) {
+        if let Object::Mux(ref mut mux) = mux_entry.object {
+            mux.subscriber = Some(subscriber);
+        }
+    }
+
+    // Compute earliest timer deadline for tickless wake
+    let mut earliest_deadline: u64 = u64::MAX;
+
+    for watch_opt in &watches {
+        let Some(watch) = watch_opt.0 else { continue };
+        let channel_id = watch_opt.1;
+        let watched_handle = Handle::from_raw(watch.handle);
+
+        if let Some(entry) = task.object_table.get_mut(watched_handle) {
+            match &mut entry.object {
+                Object::Channel(_) => {
+                    if channel_id != 0 {
+                        let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
+                    }
+                }
+                Object::Port(p) => { p.subscriber = Some(subscriber); }
+                Object::Timer(t) => {
+                    t.subscriber = Some(subscriber);
+                    if t.deadline > 0 && t.deadline < earliest_deadline {
+                        earliest_deadline = t.deadline;
+                    }
+                }
+                Object::Console(c) => {
+                    c.subscriber = Some(subscriber);
+                    if matches!(c.console_type, ConsoleType::Stdin) {
+                        uart::block_for_input(task_id);
+                    }
+                }
+                Object::Process(p) => { p.subscriber = Some(subscriber); }
+                _ => {}
+            }
+        }
+    }
+
+    // Poll for ready events
+    let mut events = [super::MuxEvent::empty(); 16];
+    let mut event_count = 0usize;
+    let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
+
+    for watch_opt in &watches {
+        if event_count >= max_events { break; }
+        let Some(watch) = watch_opt.0 else { continue };
+        let channel_id = watch_opt.1;
+        let watched_handle = Handle::from_raw(watch.handle);
+
+        let Some(entry) = task.object_table.get(watched_handle) else { continue };
+
+        let ready = match &entry.object {
+            Object::Channel(_) => {
+                if (watch.filter & filter::READABLE) != 0 {
+                    channel_id != 0 && ipc::channel_has_messages(channel_id)
+                } else if (watch.filter & filter::CLOSED) != 0 {
+                    channel_id == 0
+                } else {
+                    false
+                }
+            }
+            Object::Port(p) => {
+                (watch.filter & filter::READABLE) != 0 && ipc::port_has_pending(p.port_id)
+            }
+            Object::Timer(t) => {
+                if (watch.filter & filter::READABLE) != 0 {
+                    let now = crate::platform::mt7988::timer::ticks();
+                    t.deadline > 0 && now >= t.deadline
+                } else {
+                    false
+                }
+            }
+            Object::Console(c) => {
+                match c.console_type {
+                    ConsoleType::Stdin => (watch.filter & filter::READABLE) != 0 && uart::rx_buffer_has_data(),
+                    ConsoleType::Stdout | ConsoleType::Stderr => (watch.filter & filter::WRITABLE) != 0,
+                }
+            }
+            Object::Process(p) => {
+                (watch.filter & filter::READABLE) != 0 && p.poll(filter::READABLE).is_ready()
+            }
+            _ => false,
+        };
+
+        if ready {
+            events[event_count] = super::MuxEvent {
+                handle: abi::Handle::from_raw(watch.handle),
+                event: watch.filter,
+                _pad: [0; 3],
+            };
+            event_count += 1;
+        }
+    }
+
+    // Events ready → return to userspace
+    if event_count > 0 {
+        let bytes = event_count * core::mem::size_of::<super::MuxEvent>();
+        let event_bytes = unsafe {
+            core::slice::from_raw_parts(events.as_ptr() as *const u8, bytes)
+        };
+        if uaccess::copy_to_user(buf_ptr, event_bytes).is_err() {
+            return Error::BadAddress.to_errno();
+        }
+        return event_count as i64;
+    }
+
+    // No events → transition to blocked state via state machine
+    // - Sleeping (no deadline): event loop waiting, liveness monitors
+    // - Waiting (has deadline): timer in mux, deadline-based wake
+    if earliest_deadline == u64::MAX {
+        // No timer → Sleeping (liveness will monitor)
+        if task.state.sleep(crate::kernel::task::SleepReason::EventLoop).is_err() {
+            // State transition failed (task not Running?)
+            return Error::InvalidArg.to_errno();
+        }
+    } else {
+        // Has timer → Waiting with deadline
+        if task.state.wait(crate::kernel::task::WaitReason::TimedEvent, earliest_deadline).is_err() {
+            // State transition failed
+            return Error::InvalidArg.to_errno();
+        }
+        // Notify scheduler of deadline for tickless optimization
+        unsafe {
+            let sched = task::scheduler();
+            sched.note_deadline(earliest_deadline);
+        }
+    }
+
+    // Store syscall args in trap frame so syscall re-executes on wake
+    // (trap frame already has the args from original call)
+
+    // Reschedule to another task
+    crate::kernel::sched::reschedule();
+
+    // This return value is stored but task won't return to userspace yet
+    // When woken, PC will re-execute the syscall instruction
+    0
+}
+
+// Write implementations
+fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    use super::ChannelState;
+
+    // Check state - can only write to Open channel
+    if ch.state != ChannelState::Open {
+        return Error::PeerClosed.to_errno();
+    }
+
+    let channel_id = ch.channel_id;
+    if channel_id == 0 {
+        return Error::PeerClosed.to_errno();
+    }
+
+    // Limit message size
+    if buf_len > ipc::MAX_INLINE_PAYLOAD {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let pid = unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+        match sched.tasks[slot] {
+            Some(ref t) => t.id,
+            None => return Error::BadHandle.to_errno(),
+        }
+    };
+
+    // Copy from user buffer
+    let mut kernel_buf = [0u8; 256];
+    let copy_len = core::cmp::min(buf_len, kernel_buf.len());
+    if uaccess::copy_from_user(&mut kernel_buf[..copy_len], buf_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    // Create message and send via ipc
+    let msg = ipc::Message::data(pid, &kernel_buf[..copy_len]);
+
+    match ipc::send(channel_id, msg, pid) {
+        Ok(wake_list) => {
+            // Wake any subscribers waiting for readable events
+            waker::wake(&wake_list, ipc::WakeReason::Readable);
+            copy_len as i64
+        }
+        Err(ipc::IpcError::QueueFull) => Error::WouldBlock.to_errno(),
+        Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
+            ch.state = ChannelState::HalfClosed;
+            Error::PeerClosed.to_errno()
+        }
+        Err(_) => Error::BadHandle.to_errno(),
+    }
+}
+
+fn write_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    use super::TimerState;
+    use crate::platform::mt7988::timer;
+
+    // Format: [deadline_ns: u64] or [deadline_ns: u64, interval_ns: u64]
+    if buf_len < 8 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let mut buf = [0u8; 16];
+    let copy_len = buf_len.min(16);
+    if uaccess::copy_from_user(&mut buf[..copy_len], buf_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    let deadline_ns = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+
+    if deadline_ns == 0 {
+        // Disarm timer
+        t.state = TimerState::Disarmed;
+        t.deadline = 0;
+        t.interval = 0;
+        return 0;
+    }
+
+    // Convert nanoseconds to ticks (timer runs at 13MHz = 13 ticks per microsecond)
+    // 1 tick = 1/13,000,000 seconds = ~77ns
+    let ticks_per_ns = 13; // Approximately 13 ticks per 1000ns
+    let deadline_ticks = deadline_ns * ticks_per_ns / 1000;
+
+    let current_tick = timer::ticks();
+    t.deadline = current_tick + deadline_ticks;
+    t.state = TimerState::Armed;
+
+    // Check for interval (recurring timer)
+    if buf_len >= 16 {
+        let interval_ns = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+        if interval_ns > 0 {
+            t.interval = interval_ns * ticks_per_ns / 1000;
+        } else {
+            t.interval = 0;
+        }
+    } else {
+        t.interval = 0;
+    }
+
+    0
+}
+
+fn write_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    let _ = (s, buf_ptr, buf_len);
+    Error::NotSupported.to_errno()
+}
+
+fn write_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    // Only stdout and stderr are writable
+    match c.console_type {
+        ConsoleType::Stdout | ConsoleType::Stderr => {
+            if buf_len == 0 {
+                return 0;
+            }
+            // Limit buffer size
+            if buf_len > 4096 {
+                return Error::InvalidArg.to_errno();
+            }
+            // Copy from user
+            let mut kernel_buf = [0u8; 4096];
+            if uaccess::copy_from_user(&mut kernel_buf[..buf_len], buf_ptr).is_err() {
+                return Error::BadAddress.to_errno();
+            }
+            // Write to UART and flush
+            uart::write_buffered(&kernel_buf[..buf_len]);
+            uart::flush_buffer();
+            buf_len as i64
+        }
+        ConsoleType::Stdin => Error::NotSupported.to_errno(),
+    }
+}
+
+fn write_mux(m: &mut super::MuxObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    // Format: [op:1][filter:1][pad:2][handle:4]
+    // op: 0=Add, 1=Remove
+    // filter: 0=Readable, 1=Writable, 2=Closed
+    if buf_len < 8 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let mut buf = [0u8; 8];
+    if uaccess::copy_from_user(&mut buf, buf_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    let op = buf[0];
+    let filter = buf[1];
+    let handle = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+    match op {
+        0 => {
+            // Add watch
+            for slot in &mut m.watches {
+                if slot.is_none() {
+                    *slot = Some(super::MuxWatch { handle, filter });
+                    return 0;
+                }
+            }
+            Error::NoSpace.to_errno()
+        }
+        1 => {
+            // Remove watch
+            for slot in &mut m.watches {
+                if let Some(w) = slot {
+                    if w.handle == handle {
+                        *slot = None;
+                        return 0;
+                    }
+                }
+            }
+            Error::NotFound.to_errno()
+        }
+        _ => Error::InvalidArg.to_errno(),
+    }
+}
+
+// Map implementations
+fn map_shmem(s: &mut super::ShmemObject, task_id: u32) -> i64 {
+    let _ = (s, task_id);
+    Error::NotSupported.to_errno()
+}
+
+fn map_dma_pool(d: &mut super::DmaPoolObject, task_id: u32) -> i64 {
+    let _ = (d, task_id);
+    Error::NotSupported.to_errno()
+}
+
+fn map_mmio(m: &mut super::MmioObject, task_id: u32) -> i64 {
+    let _ = (m, task_id);
+    Error::NotSupported.to_errno()
+}
+
+// Close implementations
+fn close_channel(ch: super::ChannelObject, owner: u32) {
+    // Only close if not already closed
+    if ch.state != super::ChannelState::Closed && ch.channel_id != 0 {
+        if let Ok(wake_list) = ipc::close_channel(ch.channel_id, owner) {
+            // Wake any subscribers waiting on this channel
+            waker::wake(&wake_list, ipc::WakeReason::Closed);
+        }
+    }
+}
+
+fn close_port(p: super::PortObject, owner: u32) {
+    // Only close if listening
+    if p.state == super::PortState::Listening && p.port_id != 0 {
+        if let Ok(wake_list) = ipc::port_unregister(p.port_id, owner) {
+            // Wake any subscribers
+            waker::wake(&wake_list, ipc::WakeReason::Closed);
+        }
+    }
+}
+
+fn close_shmem(s: super::ShmemObject, owner: u32) {
+    let _ = (s, owner);
+    // TODO: Unmap, release
+}
+
+fn close_dma_pool(d: super::DmaPoolObject, owner: u32) {
+    let _ = (d, owner);
+    // TODO: Unmap, release
+}
+
+fn close_mmio(m: super::MmioObject, owner: u32) {
+    let _ = (m, owner);
+    // TODO: Unmap, release
+}

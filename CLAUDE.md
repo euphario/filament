@@ -11,6 +11,72 @@ A reliability-focused microkernel for the Banana Pi BPI-R4 (MT7988A SoC).
 | [docs/architecture/](docs/architecture/) | System architecture |
 | [docs/decisions/ADR.md](docs/decisions/ADR.md) | Architecture decisions |
 
+## The Laws
+
+These are inviolable. No exceptions. No "just this once."
+
+### 1. State Machine is the Law of the Land
+
+Every component with lifecycle has an **explicit state enum**:
+```rust
+pub enum ChannelState { Open, HalfClosed, Closed }
+pub enum PortState { Listening, Closed }
+pub enum TimerState { Armed, Disarmed }
+```
+
+- **Single source of truth** - ONE state field, not `is_closed + peer_gone + blocked`
+- **Explicit transitions** - State changes only via defined methods with validation
+- **No implicit state** - No deriving state from multiple booleans
+
+### 2. Traits and Modules for Testability
+
+```rust
+pub trait Pollable {
+    fn poll(&self, filter: u8) -> PollResult;
+    fn subscribe(&mut self, sub: Subscriber);
+    fn unsubscribe(&mut self);
+}
+```
+
+- **Trait-based contracts** - Define behavior, not implementation
+- **Pure functions where possible** - Inputs in, outputs out, no hidden state
+- **Separate syscall glue from core logic** - Core logic is testable without scheduler
+
+### 3. Unified 5-Syscall Interface
+
+Everything is an object. Everything uses the same 5 syscalls:
+
+| Syscall | Number | Purpose |
+|---------|--------|---------|
+| `open` | 100 | Open/create any object (channel, port, timer, shmem, etc.) |
+| `read` | 101 | Read from object (recv message, accept connection, poll mux) |
+| `write` | 102 | Write to object (send message, arm timer, add to mux) |
+| `map` | 103 | Map object to memory (shmem, DMA pool, MMIO) |
+| `close` | 104 | Close object |
+
+- **IPC is a channel** - Same semantics as file open/read/write/close
+- **No special syscalls** - Everything goes through the unified interface
+- **Object types via open flags** - `open(ObjectType::Channel, flags, arg)`
+
+### 4. No Tech Debt
+
+- **Complete migrations only** - No half-finished rewrites
+- **Deprecate completely** - Old code returns ENOSYS, then gets deleted
+- **No backward compatibility shims** - Clean breaks, not cruft accumulation
+
+### 5. Subscriber-Based Waking
+
+```rust
+pub struct Subscriber { task_id: u32, generation: u32 }
+pub enum WakeReason { Readable, Writable, Closed, Accepted, Timeout }
+```
+
+- **Single wake mechanism** - Tasks subscribe to events, get woken
+- **Generation prevents stale wakes** - Detect task slot reuse
+- **Wake outside locks** - Collect subscribers under lock, wake after release
+
+---
+
 ## Key Principles (Summary)
 
 See [docs/PRINCIPLES.md](docs/PRINCIPLES.md) for complete design philosophy.
@@ -195,19 +261,60 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 
 ## Current Work
 
+### Unified Syscall Migration (IN PROGRESS)
+- **Kernel object system complete** (`src/kernel/object/`)
+  - Pollable trait with explicit state machines
+  - open/read/write/map/close implemented
+  - Channel, Port, Timer, Mux objects working
+- **Userlib ipc2 module complete** (`user/userlib/src/ipc2.rs`)
+  - High-level types: Channel, Port, Timer, Mux, Console, Process
+  - Old ipc module marked deprecated
+- **Legacy syscalls kept working for boot**
+  - Old IPC, Handle, Scheme syscalls work but marked LEGACY
+  - System boots and runs with existing userspace
+
+### Next Steps
+1. Migrate Service framework (`userlib/src/service.rs`) to ipc2
+2. Update devd to use ipc2 directly or updated Service
+3. Update consoled to use ipc2
+4. Update shell to use ipc2
+5. Remove legacy syscalls after all userspace migrated
+
 ### MT7996 WiFi Driver
 - Prefetch configuration fixed to match Linux exactly
 - Cache coherency fix applied (kernel DMA pool flush)
 - Awaiting hardware test with new serial adapter
 
-### Next Steps
-- Test MT7996 firmware loading on hardware
-- Signed binary manifests for capability verification (infrastructure in place)
-- Process accounting and resource limits
-
 ---
 
 ## Changelog (Recent)
+
+### 2026-01-20 (Session 1)
+- **Unified 5-syscall interface** - Complete rewrite of kernel API
+  - `src/kernel/object/mod.rs` - Object system with Pollable trait
+  - `src/kernel/object/syscall.rs` - open/read/write/map/close handlers
+  - Explicit state machines: ChannelState, PortState, TimerState
+  - Connected to ipc2 backend for channel/port operations
+  - MuxObject for multiplexed waiting (like epoll/kqueue)
+- **Documented "The Laws"** in CLAUDE.md
+  - State machine is law
+  - Traits for testability
+  - Unified syscall interface
+  - No tech debt policy
+  - Subscriber-based waking
+- **New userlib ipc2 module** (`user/userlib/src/ipc2.rs`)
+  - `Channel` - Bidirectional IPC with explicit state machine
+  - `Port` - Named service endpoint with Listening/Closed states
+  - `Timer` - Deadline-based timer with Armed/Disarmed/Fired states
+  - `Mux` - Event multiplexer (like epoll/kqueue)
+  - `Console` - Standard I/O wrapper
+  - `Process` - Child process handle for exit watching
+  - `Message` - Message buffer helper
+- **Legacy syscalls marked but kept working** - For boot compatibility
+  - Old IPC syscalls (6-17) marked LEGACY, still work
+  - Handle syscalls (80+) marked LEGACY, still work
+  - Scheme syscalls (28-30) marked LEGACY, still work
+  - Migration path: Service framework -> devd/consoled/shell -> remove legacy
 
 ### 2026-01-17 (Session 3)
 - **Capability-based security system**

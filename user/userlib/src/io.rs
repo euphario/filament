@@ -2,7 +2,7 @@
 //!
 //! Provides Stdout, Stdin, Stderr types and print!/println! macros.
 
-use crate::syscall::{read, write, STDIN, STDOUT, STDERR};
+use crate::syscall::{Handle, read, write};
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,11 +36,10 @@ impl Write for Stdout {
         let bytes = s.as_bytes();
         let mut written = 0;
         while written < bytes.len() {
-            let n = write(STDOUT, &bytes[written..]);
-            if n < 0 {
-                return Err(fmt::Error);
+            match write(Handle::STDOUT, &bytes[written..]) {
+                Ok(n) => written += n,
+                Err(_) => return Err(fmt::Error),
             }
-            written += n as usize;
         }
         Ok(())
     }
@@ -54,11 +53,10 @@ impl Write for Stderr {
         let bytes = s.as_bytes();
         let mut written = 0;
         while written < bytes.len() {
-            let n = write(STDERR, &bytes[written..]);
-            if n < 0 {
-                return Err(fmt::Error);
+            match write(Handle::STDERR, &bytes[written..]) {
+                Ok(n) => written += n,
+                Err(_) => return Err(fmt::Error),
             }
-            written += n as usize;
         }
         Ok(())
     }
@@ -71,17 +69,18 @@ impl Stdin {
     /// Read a single byte (blocking)
     pub fn read_byte(&self) -> Option<u8> {
         let mut buf = [0u8; 1];
-        let n = read(STDIN, &mut buf);
-        if n > 0 {
-            Some(buf[0])
-        } else {
-            None
+        match read(Handle::STDIN, &mut buf) {
+            Ok(n) if n > 0 => Some(buf[0]),
+            _ => None,
         }
     }
 
     /// Read into a buffer (blocking for first byte)
     pub fn read(&self, buf: &mut [u8]) -> isize {
-        read(STDIN, buf)
+        match read(Handle::STDIN, buf) {
+            Ok(n) => n as isize,
+            Err(_) => -1,
+        }
     }
 
     /// Read a line into a buffer (until newline or buffer full)
@@ -90,14 +89,15 @@ impl Stdin {
         let mut pos = 0;
         while pos < buf.len() {
             let mut byte = [0u8; 1];
-            let n = read(STDIN, &mut byte);
-            if n <= 0 {
-                break;
-            }
-            buf[pos] = byte[0];
-            pos += 1;
-            if byte[0] == b'\n' || byte[0] == b'\r' {
-                break;
+            match read(Handle::STDIN, &mut byte) {
+                Ok(n) if n > 0 => {
+                    buf[pos] = byte[0];
+                    pos += 1;
+                    if byte[0] == b'\n' || byte[0] == b'\r' {
+                        break;
+                    }
+                }
+                _ => break,
             }
         }
         pos
@@ -118,7 +118,7 @@ macro_rules! print {
 macro_rules! println {
     () => {{
         if $crate::io::stdout_enabled() {
-            let _ = $crate::syscall::write($crate::syscall::STDOUT, b"\r\n");
+            let _ = $crate::syscall::write($crate::syscall::Handle::STDOUT, b"\r\n");
         }
     }};
     ($($arg:tt)*) => {{
@@ -126,7 +126,7 @@ macro_rules! println {
             use core::fmt::Write;
             // writeln! adds \n, we need to also add \r for serial terminals
             let _ = write!(&mut $crate::io::Stdout, $($arg)*);
-            let _ = $crate::syscall::write($crate::syscall::STDOUT, b"\r\n");
+            let _ = $crate::syscall::write($crate::syscall::Handle::STDOUT, b"\r\n");
         }
     }};
 }
@@ -144,7 +144,7 @@ macro_rules! eprint {
 #[macro_export]
 macro_rules! eprintln {
     () => {{
-        let _ = $crate::syscall::write($crate::syscall::STDERR, b"\n");
+        let _ = $crate::syscall::write($crate::syscall::Handle::STDERR, b"\n");
     }};
     ($($arg:tt)*) => {{
         use core::fmt::Write;

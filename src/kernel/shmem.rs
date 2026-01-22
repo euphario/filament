@@ -37,6 +37,47 @@ const MAX_WAITERS: usize = 8;
 /// Invalid/no PID marker
 const NO_PID: Pid = 0;
 
+/// State of a shared memory region
+///
+/// State machine:
+/// ```text
+/// ┌────────┐    owner exit    ┌────────┐   finalize   ┌─────────┐
+/// │ Active │ ─────────────> │ Dying  │ ──────────> │ (freed) │
+/// └────────┘                 └────────┘             └─────────┘
+///                               │
+///                               │ all mappers unmap early
+///                               ▼
+///                          (can be freed)
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegionState {
+    /// Region is active and can be used for mapping and notifications
+    Active,
+    /// Owner is dying - ShmemInvalid events sent, waiting for mappers to release.
+    /// New mappings are NOT allowed in this state.
+    Dying,
+}
+
+impl RegionState {
+    /// Check if transition to new state is valid
+    pub fn can_transition_to(&self, new: &RegionState) -> bool {
+        match (self, new) {
+            // Active → Dying (owner starts exit sequence)
+            (RegionState::Active, RegionState::Dying) => true,
+            // All other transitions are invalid (including Dying → Active)
+            _ => false,
+        }
+    }
+
+    /// Get state name for logging
+    pub fn name(&self) -> &'static str {
+        match self {
+            RegionState::Active => "Active",
+            RegionState::Dying => "Dying",
+        }
+    }
+}
+
 /// Shared memory region descriptor
 #[derive(Clone, Copy)]
 pub struct SharedMem {
@@ -54,6 +95,8 @@ pub struct SharedMem {
     pub waiters: [Pid; MAX_WAITERS],
     /// Reference count (number of mappings)
     pub ref_count: u32,
+    /// Region state (Active or Dying)
+    pub state: RegionState,
 }
 
 impl SharedMem {
@@ -67,6 +110,7 @@ impl SharedMem {
             allowed_pids: [NO_PID; MAX_ALLOWED_PIDS],
             waiters: [NO_PID; MAX_WAITERS],
             ref_count: 0,
+            state: RegionState::Active,
         }
     }
 
@@ -170,6 +214,20 @@ pub fn init() {
     kinfo!("shmem", "init_ok"; max_regions = MAX_SHMEM_REGIONS as u64);
 }
 
+/// Get a copy of a shared memory region by ID
+/// Returns None if the region doesn't exist
+pub fn get_region(shmem_id: u32) -> Option<SharedMem> {
+    let guard = SHMEM.lock();
+    for slot in guard.table.iter() {
+        if let Some(region) = slot {
+            if region.id == shmem_id {
+                return Some(*region);
+            }
+        }
+    }
+    None
+}
+
 /// Create a new shared memory region
 /// Returns (shmem_id, vaddr, paddr) or error
 pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
@@ -259,8 +317,23 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
         for slot in guard.table.iter_mut() {
             if let Some(ref mut region) = slot {
                 if region.id == shmem_id {
+                    // Reject mapping if region is dying (owner exiting)
+                    if region.state == RegionState::Dying {
+                        kwarn!("shmem", "map_dying";
+                            caller = pid as u64,
+                            shmem = shmem_id as u64);
+                        return Err(-11); // EAGAIN - resource temporarily unavailable
+                    }
+
                     // Check if allowed
                     if !region.is_allowed(pid) {
+                        // DEBUG: Log the access denial with details
+                        kwarn!("shmem", "map_denied";
+                            caller = pid as u64,
+                            shmem = shmem_id as u64,
+                            owner = region.owner_pid as u64,
+                            allowed0 = region.allowed_pids[0] as u64,
+                            allowed1 = region.allowed_pids[1] as u64);
                         return Err(-13); // EACCES
                     }
                     region.ref_count += 1;
@@ -268,6 +341,9 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
                     break;
                 }
             }
+        }
+        if found.is_none() {
+            kwarn!("shmem", "map_not_found"; caller = pid as u64, shmem = shmem_id as u64);
         }
         found.ok_or(-2i64)? // ENOENT
     };
@@ -310,8 +386,16 @@ pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
     for slot in guard.table.iter_mut() {
         if let Some(ref mut region) = slot {
             if region.id == shmem_id {
+                // Reject if region is dying
+                if region.state == RegionState::Dying {
+                    return Err(-11); // EAGAIN - resource temporarily unavailable
+                }
+
                 // Only owner can grant access
                 if region.owner_pid != owner_pid {
+                    kwarn!("shmem", "allow_denied_not_owner";
+                        caller = owner_pid as u64,
+                        actual_owner = region.owner_pid as u64);
                     return Err(-1); // EPERM
                 }
 
@@ -358,23 +442,42 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
     // shmem lock released here before touching scheduler
 
     // Mark task as blocked - syscall layer will handle scheduling
-    unsafe {
+    // Calculate deadline first, then set state, then notify scheduler
+    let deadline_to_notify: Option<u64> = unsafe {
         let sched = super::task::scheduler();
         if let Some(ref mut task) = sched.tasks[sched.current] {
-            task.state = super::task::TaskState::Blocked;
-            task.wait_reason = Some(super::task::WaitReason::ShmemNotify(shmem_id));
-
             // Set wake timeout if specified
-            if timeout_ms > 0 {
+            let timeout = if timeout_ms > 0 {
                 // Timer runs at 100 Hz (10ms per tick), so timeout_ms / 10 = ticks
                 // Add 1 to round up and avoid 0-tick timeouts
                 let timeout_ticks = (timeout_ms as u64 + 9) / 10;
                 let current_tick = crate::platform::mt7988::timer::ticks();
                 // Use saturating_add to prevent overflow (would cause immediate wake)
-                task.wake_at = current_tick.saturating_add(timeout_ticks);
+                Some(current_tick.saturating_add(timeout_ticks))
             } else {
-                task.wake_at = 0; // No timeout
-            }
+                None // No timeout
+            };
+
+            // Set state based on whether we have a timeout
+            task.state = match timeout {
+                Some(deadline) => super::task::TaskState::Waiting {
+                    reason: super::task::WaitReason::ShmemNotify { shmem_id },
+                    deadline,
+                },
+                None => super::task::TaskState::Sleeping {
+                    reason: super::task::SleepReason::EventLoop,
+                },
+            };
+            timeout
+        } else {
+            None
+        }
+    };
+
+    // Notify scheduler of deadline for tickless optimization (outside task borrow)
+    if let Some(deadline) = deadline_to_notify {
+        unsafe {
+            super::task::scheduler().note_deadline(deadline);
         }
     }
 
@@ -523,39 +626,77 @@ fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
     Err(-3) // ESRCH - no such process
 }
 
-/// Called when a process exits - clean up any shared memory it owns or has mapped
-pub fn process_cleanup(pid: Pid) {
-    // Collect regions owned by this process (need to unmap outside lock)
-    let mut owned_regions: [(u64, usize, usize); MAX_SHMEM_REGIONS] = [(0, 0, 0); MAX_SHMEM_REGIONS];
-    let mut owned_count = 0;
+/// Phase 1: Begin cleanup - mark regions as Dying and notify mappers
+/// This gives servers a chance to release their mappings gracefully.
+/// Call finalize_cleanup() later to actually free the memory.
+pub fn begin_cleanup(pid: Pid) {
+    // Collect regions owned by this process and pids to notify
+    let mut to_notify: [(u32, Pid); MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS] = [(0, 0); MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS];
+    let mut notify_count = 0;
 
-    // First pass: update ref counts and collect owned regions
     {
         let mut guard = SHMEM.lock();
-        for (i, slot) in guard.table.iter_mut().enumerate() {
+        for slot in guard.table.iter_mut() {
             if let Some(ref mut region) = slot {
-                // Remove from waiters if present
+                // Remove dying pid from waiters
                 region.remove_waiter(pid);
 
-                // If this process had it mapped (is in allowed list), decrement ref_count
-                // This handles non-owner processes that had mapped the shmem
+                // If this process had it mapped (non-owner), decrement ref_count
                 if region.is_allowed(pid) && region.owner_pid != pid {
                     if region.ref_count > 0 {
                         region.ref_count -= 1;
                     }
                 }
 
-                // If owner, mark for destruction
-                if region.owner_pid == pid {
+                // If owner, mark as Dying and collect mappers to notify
+                if region.owner_pid == pid && region.state == RegionState::Active {
+                    region.state = RegionState::Dying;
+                    let shmem_id = region.id;
+
+                    // Collect all allowed pids (excluding owner) to notify
+                    for &allowed_pid in &region.allowed_pids {
+                        if allowed_pid != NO_PID && allowed_pid != pid {
+                            if notify_count < to_notify.len() {
+                                to_notify[notify_count] = (shmem_id, allowed_pid);
+                                notify_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // shmem lock released before touching scheduler/events
+
+    // Send ShmemInvalid events to all mappers (outside lock)
+    for i in 0..notify_count {
+        let (shmem_id, mapper_pid) = to_notify[i];
+        let event = super::event::Event::shmem_invalid(shmem_id, pid);
+        let _ = super::event::deliver_event_to_task(mapper_pid, event);
+    }
+}
+
+/// Phase 2: Finalize cleanup - force unmap and free memory
+/// Called after servers had a chance to release their mappings.
+pub fn finalize_cleanup(pid: Pid) {
+    // Collect Dying regions owned by this process
+    let mut owned_regions: [(u64, usize, usize); MAX_SHMEM_REGIONS] = [(0, 0, 0); MAX_SHMEM_REGIONS];
+    let mut owned_count = 0;
+
+    {
+        let mut guard = SHMEM.lock();
+        for (i, slot) in guard.table.iter_mut().enumerate() {
+            if let Some(ref region) = slot {
+                // Collect Dying regions owned by this pid
+                if region.owner_pid == pid && region.state == RegionState::Dying {
                     owned_regions[owned_count] = (region.phys_addr, region.size, i);
                     owned_count += 1;
                 }
             }
         }
     }
-    // shmem lock released before touching scheduler
 
-    // Second pass: destroy owned regions (unmap from other processes)
+    // Destroy owned regions (unmap from other processes)
     for i in 0..owned_count {
         let (phys_addr, size, slot_idx) = owned_regions[i];
         let num_pages = size / 4096;
@@ -573,6 +714,13 @@ pub fn process_cleanup(pid: Pid) {
 
         pmm::free_contiguous(phys_addr as usize, num_pages);
     }
+}
+
+/// Legacy single-phase cleanup (for backwards compatibility)
+/// Calls both phases immediately - use begin_cleanup + finalize_cleanup for graceful cleanup
+pub fn process_cleanup(pid: Pid) {
+    begin_cleanup(pid);
+    finalize_cleanup(pid);
 }
 
 // ============================================================================

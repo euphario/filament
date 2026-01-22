@@ -12,8 +12,36 @@
 //! table.print();
 //! ```
 
-use userlib::{print, println};
+// Use shell's own print!/println! macros which route through console
+use crate::{print, println};
 use crate::color;
+
+/// Trait for simple output (used by handle tests and other builtins that need raw byte output)
+pub trait Output {
+    fn write(&mut self, data: &[u8]);
+}
+
+/// Simple shell output that writes to stdout
+pub struct ShellOutput;
+
+impl ShellOutput {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Output for ShellOutput {
+    fn write(&mut self, data: &[u8]) {
+        if let Ok(s) = core::str::from_utf8(data) {
+            print!("{}", s);
+        } else {
+            // Print byte-by-byte if not valid UTF-8
+            for &b in data {
+                print!("{}", b as char);
+            }
+        }
+    }
+}
 
 /// Maximum columns per table
 pub const MAX_COLS: usize = 8;
@@ -322,6 +350,7 @@ impl Table {
     }
 
     /// Print the table with headers and formatting
+    /// Uses line buffering to reduce channel message count
     pub fn print(&self) {
         // Compute final widths including all rows
         let mut widths = self.widths;
@@ -334,59 +363,58 @@ impl Table {
             }
         }
 
+        // Line buffer for batching output
+        let mut line = LineBuf::new();
+
         // Print header (bold cyan)
-        color::set(color::BOLD);
-        color::set(color::CYAN);
+        line.push_str("\x1b[1m\x1b[36m"); // BOLD + CYAN
         for i in 0..self.col_count {
             if i > 0 {
-                print!("  ");
+                line.push_str("  ");
             }
             let hdr = self.headers[i];
             let w = widths[i];
             if self.aligns[i] == Align::Right {
-                for _ in 0..(w.saturating_sub(hdr.len())) {
-                    print!(" ");
-                }
-                print!("{}", hdr);
+                line.pad(w.saturating_sub(hdr.len()));
+                line.push_str(hdr);
             } else {
-                print!("{}", hdr);
-                for _ in 0..(w.saturating_sub(hdr.len())) {
-                    print!(" ");
-                }
+                line.push_str(hdr);
+                line.pad(w.saturating_sub(hdr.len()));
             }
         }
-        color::reset();
-        println!();
+        line.push_str("\x1b[0m\r\n"); // RESET + newline
+        line.flush();
 
         // Print separator (dim)
-        color::set(color::DIM);
+        line.push_str("\x1b[2m"); // DIM
         for i in 0..self.col_count {
             if i > 0 {
-                print!("  ");
+                line.push_str("  ");
             }
-            for _ in 0..widths[i] {
-                print!("-");
-            }
+            line.dashes(widths[i]);
         }
-        color::reset();
-        println!();
+        line.push_str("\x1b[0m\r\n"); // RESET + newline
+        line.flush();
 
         // Print rows
         for r in 0..self.row_count {
             let row = &self.rows[r];
             for i in 0..self.col_count {
                 if i > 0 {
-                    print!("  ");
+                    line.push_str("  ");
                 }
                 let cell = &row.cells[i];
                 let w = widths[i];
                 if self.aligns[i] == Align::Right {
-                    cell.print_right(w);
+                    line.pad(w.saturating_sub(cell.display_width()));
+                    line.push_value(cell);
                 } else {
-                    cell.print_left(w);
+                    line.push_value(cell);
+                    line.pad(w.saturating_sub(cell.display_width()));
                 }
             }
-            println!();
+            line.push_str("\r\n");
+            line.flush();
         }
     }
 
@@ -495,6 +523,123 @@ impl CommandResult {
                 color::reset();
             }
             CommandResult::None => {}
+        }
+    }
+}
+
+// =============================================================================
+// Line Buffer - batches output to reduce channel message count
+// =============================================================================
+
+/// Line buffer for batching output into single sends
+struct LineBuf {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl LineBuf {
+    fn new() -> Self {
+        Self { buf: [0u8; 256], len: 0 }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        for &b in s.as_bytes() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+
+    fn push_byte(&mut self, b: u8) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+    }
+
+    fn pad(&mut self, n: usize) {
+        for _ in 0..n {
+            self.push_byte(b' ');
+        }
+    }
+
+    fn dashes(&mut self, n: usize) {
+        for _ in 0..n {
+            self.push_byte(b'-');
+        }
+    }
+
+    fn push_value(&mut self, val: &Value) {
+        match val {
+            Value::Empty => {}
+            Value::Bool(b) => self.push_str(if *b { "true" } else { "false" }),
+            Value::Int(n) => self.push_int(*n),
+            Value::Uint(n) => self.push_uint(*n),
+            Value::Hex32(n) => {
+                self.push_str("0x");
+                self.push_hex32(*n);
+            }
+            Value::Hex64(n) => {
+                self.push_str("0x");
+                self.push_hex64(*n);
+            }
+            Value::StaticStr(s) => self.push_str(s),
+            Value::Str { buf, len } => {
+                let bytes = &buf[..*len as usize];
+                for &b in bytes {
+                    self.push_byte(b);
+                }
+            }
+        }
+    }
+
+    fn push_int(&mut self, n: i64) {
+        if n < 0 {
+            self.push_byte(b'-');
+            self.push_uint((-n) as u64);
+        } else {
+            self.push_uint(n as u64);
+        }
+    }
+
+    fn push_uint(&mut self, n: u64) {
+        if n == 0 {
+            self.push_byte(b'0');
+            return;
+        }
+        let mut tmp = [0u8; 20];
+        let mut i = 0;
+        let mut val = n;
+        while val > 0 {
+            tmp[i] = b'0' + (val % 10) as u8;
+            val /= 10;
+            i += 1;
+        }
+        while i > 0 {
+            i -= 1;
+            self.push_byte(tmp[i]);
+        }
+    }
+
+    fn push_hex32(&mut self, n: u32) {
+        for i in (0..8).rev() {
+            let nibble = ((n >> (i * 4)) & 0xF) as u8;
+            self.push_byte(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+    }
+
+    fn push_hex64(&mut self, n: u64) {
+        for i in (0..16).rev() {
+            let nibble = ((n >> (i * 4)) & 0xF) as u8;
+            self.push_byte(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.len > 0 {
+            crate::console::write(&self.buf[..self.len]);
+            self.len = 0;
         }
     }
 }

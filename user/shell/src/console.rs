@@ -1,44 +1,16 @@
-//! Console I/O via consoled protocol
+//! Console I/O via consoled
 //!
-//! Provides input/output through the console daemon (consoled) which manages
-//! terminal regions for logs and shell interaction.
+//! All shell I/O goes through consoled channel - no direct UART access.
+//! Shell must connect to consoled before producing any output.
 //!
-//! ## Output Architecture
-//!
-//! Shell output uses a ring buffer for efficiency:
-//! ```text
-//! ┌─────────┐  write()   ┌──────────┐  Doorbell  ┌──────────┐
-//! │  Shell  │ ──────────▶│ ByteRing │ ──────────▶│ consoled │
-//! └─────────┘            └──────────┘  (IPC)     └──────────┘
-//! ```
-//!
-//! - Shell creates ByteRing and sends shmem_id to consoled via SetupOutputRing
-//! - Shell writes data directly to ring (no IPC per-write)
-//! - Shell sends Doorbell message to wake consoled when data available
-//! - consoled reads from ring and writes to display
+//! Uses the unified 5-syscall interface (open, read, write, map, close).
 
-use userlib::ipc::protocols::{
-    ConsoleClient, ConsoleRequest, ConsoleResponse, InputState,
-    MAX_INPUT_SIZE,
-};
-use userlib::ipc::Message;
-use userlib::{syscall, ByteRing};
+use userlib::ipc::Channel;
 
 /// Console I/O state
 pub struct Console {
-    client: Option<ConsoleClient>,
-    /// Output ring buffer (shell writes, consoled reads)
-    output_ring: Option<ByteRing>,
-    /// Input ring buffer (consoled writes, shell reads)
-    input_ring: Option<ByteRing>,
-    /// IPC channel for doorbell (separate from client for non-blocking sends)
-    doorbell_channel: Option<u32>,
-    /// Input buffer for data received from consoled (legacy or ring overflow)
-    input_buf: [u8; MAX_INPUT_SIZE],
-    input_len: usize,
-    input_pos: usize,
-    /// Fallback mode - use direct UART if consoled not available
-    fallback: bool,
+    /// Channel to consoled (if connected)
+    channel: Option<Channel>,
     /// Terminal dimensions
     pub cols: u16,
     pub rows: u16,
@@ -46,217 +18,120 @@ pub struct Console {
     pub log_split: bool,
 }
 
-/// Size of output ring buffer (4KB should be plenty for terminal output)
-const OUTPUT_RING_SIZE: usize = 4096;
-
 impl Console {
     /// Create new console I/O (does not connect yet)
     pub const fn new() -> Self {
         Self {
-            client: None,
-            output_ring: None,
-            input_ring: None,
-            doorbell_channel: None,
-            input_buf: [0u8; MAX_INPUT_SIZE],
-            input_len: 0,
-            input_pos: 0,
-            fallback: true,
+            channel: None,
             cols: 80,
             rows: 24,
-            log_split: true,
+            log_split: false,
         }
     }
 
     /// Connect to consoled
     /// Returns true if connected, false if falling back to direct UART
     pub fn connect(&mut self) -> bool {
-        match ConsoleClient::connect() {
-            Ok(client) => {
-                // Send ready and get initial config
-                match client.ready() {
-                    Ok(ConsoleResponse::Ready { cols, rows, log_split }) => {
-                        self.cols = cols;
-                        self.rows = rows;
-                        self.log_split = log_split;
+        match Channel::connect(b"console:") {
+            Ok(mut channel) => {
+                // Query terminal size (query-response protocol)
+                if channel.send(b"GETSIZE\n").is_ok() {
+                    // Wait for SIZE response using event-driven blocking
+                    use userlib::ipc::{Mux, MuxFilter};
 
-                        // Create output ring buffer
-                        if let Ok(ring) = ByteRing::create(OUTPUT_RING_SIZE) {
-                            // Open a second channel for doorbell messages
-                            // (ConsoleClient blocks on receive, we need non-blocking doorbell)
-                            let doorbell_ch = syscall::port_connect(b"console");
-                            if doorbell_ch >= 0 {
-                                let ch = doorbell_ch as u32;
+                    if let Ok(mux) = Mux::new() {
+                        // Add channel to mux, wait for readable
+                        if mux.add(channel.handle(), MuxFilter::Readable).is_ok() {
+                            // Block until channel is readable
+                            let _ = mux.wait();
 
-                                // Allow consoled to map our ring
-                                // Get consoled's PID via channel peer lookup
-                                let peer_pid = syscall::channel_get_peer(ch);
-                                if peer_pid > 0 {
-                                    let _ = ring.allow(peer_pid as u32);
-                                }
-
-                                // Send SetupOutputRing to tell consoled about the ring
-                                let setup = ConsoleRequest::SetupOutputRing {
-                                    shmem_id: ring.shmem_id(),
-                                };
-                                let mut buf = [0u8; 16];
-                                if let Ok(len) = setup.serialize(&mut buf) {
-                                    let _ = syscall::send(ch, &buf[..len]);
-                                    // Wait for acknowledgment
-                                    let mut resp = [0u8; 8];
-                                    let _ = syscall::receive(ch, &mut resp);
-                                }
-
-                                self.output_ring = Some(ring);
-                                self.doorbell_channel = Some(ch);
+                            // Now read the response
+                            let mut buf = [0u8; 32];
+                            if let Ok(n) = channel.recv(&mut buf) {
+                                self.parse_size_msg(&buf[..n]);
                             }
                         }
-
-                        self.client = Some(client);
-                        self.fallback = false;
-                        true
-                    }
-                    _ => {
-                        // Didn't get proper ready response, fall back
-                        self.fallback = true;
-                        false
                     }
                 }
+
+                self.channel = Some(channel);
+                true
             }
             Err(_) => {
                 // Can't connect to consoled, use direct UART
-                self.fallback = true;
                 false
             }
         }
     }
 
+    /// Parse "SIZE cols rows\n" message
+    fn parse_size_msg(&mut self, data: &[u8]) {
+        if data.len() < 5 || &data[..5] != b"SIZE " {
+            return;
+        }
+
+        let rest = &data[5..];
+
+        // Find space between cols and rows
+        let mut cols: u16 = 0;
+        let mut rows: u16 = 0;
+        let mut i = 0;
+
+        // Parse cols
+        while i < rest.len() && rest[i] >= b'0' && rest[i] <= b'9' {
+            cols = cols.saturating_mul(10).saturating_add((rest[i] - b'0') as u16);
+            i += 1;
+        }
+
+        // Skip space
+        if i < rest.len() && rest[i] == b' ' {
+            i += 1;
+        }
+
+        // Parse rows
+        while i < rest.len() && rest[i] >= b'0' && rest[i] <= b'9' {
+            rows = rows.saturating_mul(10).saturating_add((rest[i] - b'0') as u16);
+            i += 1;
+        }
+
+        if cols >= 10 && cols <= 500 && rows >= 10 && rows <= 500 {
+            self.cols = cols;
+            self.rows = rows;
+        }
+    }
+
     /// Check if connected to consoled
     pub fn is_connected(&self) -> bool {
-        !self.fallback && self.client.is_some()
+        self.channel.is_some()
     }
 
     /// Read a single byte (blocking)
-    /// Compatible with Stdin interface for readline
+    /// All input comes from consoled channel - no direct UART access
     pub fn read_byte(&mut self) -> Option<u8> {
-        // Return from buffer if we have data
-        if self.input_pos < self.input_len {
-            let b = self.input_buf[self.input_pos];
-            self.input_pos += 1;
-            return Some(b);
-        }
+        let channel = self.channel.as_mut()?;
 
-        // Try to read from input ring first
-        if let Some(ring) = &self.input_ring {
-            let n = ring.read(&mut self.input_buf);
-            if n > 0 {
-                self.input_len = n;
-                self.input_pos = 1;
-                return Some(self.input_buf[0]);
-            }
-        }
-
-        // Need more data
-        if self.fallback {
-            // Direct UART read
-            let mut buf = [0u8; 1];
-            let n = syscall::read(syscall::STDIN, &mut buf);
-            if n > 0 {
-                Some(buf[0])
-            } else {
+        let mut buf = [0u8; 1];
+        // Kernel blocks internally until data available
+        match channel.recv(&mut buf) {
+            Ok(n) if n > 0 => Some(buf[0]),
+            Ok(_) => None, // EOF
+            Err(_) => {
+                // Connection lost
+                self.channel = None;
                 None
             }
-        } else if let Some(client) = &self.client {
-            // Receive from consoled
-            loop {
-                match client.receive() {
-                    Ok(ConsoleResponse::Input { data, len }) => {
-                        // Legacy IPC input (fallback when ring not available)
-                        let len = len as usize;
-                        if len > 0 {
-                            // Buffer the input
-                            let copy_len = len.min(MAX_INPUT_SIZE);
-                            self.input_buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                            self.input_len = copy_len;
-                            self.input_pos = 1;
-                            return Some(self.input_buf[0]);
-                        }
-                    }
-                    Ok(ConsoleResponse::SetupInputRing { shmem_id }) => {
-                        // consoled created an input ring - map it
-                        if let Ok(ring) = ByteRing::map(shmem_id) {
-                            self.input_ring = Some(ring);
-                        }
-                        // Continue waiting for input
-                    }
-                    Ok(ConsoleResponse::Doorbell) => {
-                        // consoled notified us that input is available in ring
-                        if let Some(ring) = &self.input_ring {
-                            let n = ring.read(&mut self.input_buf);
-                            if n > 0 {
-                                self.input_len = n;
-                                self.input_pos = 1;
-                                return Some(self.input_buf[0]);
-                            }
-                        }
-                        // Continue if nothing read (spurious doorbell)
-                    }
-                    Ok(ConsoleResponse::Resize { cols, rows }) => {
-                        self.cols = cols;
-                        self.rows = rows;
-                        // Continue waiting for input
-                    }
-                    Ok(_) => {
-                        // Other responses, continue
-                    }
-                    Err(_) => {
-                        // Error - fall back to direct UART
-                        return None;
-                    }
-                }
-            }
-        } else {
-            None
         }
     }
 
     /// Write bytes to console
+    /// All output goes through consoled channel - no direct UART access
     pub fn write(&self, data: &[u8]) {
-        if self.fallback {
-            let _ = syscall::write(syscall::STDOUT, data);
-        } else if let Some(ring) = &self.output_ring {
-            // Write to ring buffer
-            let mut offset = 0;
-            while offset < data.len() {
-                let written = ring.write(&data[offset..]);
-                if written == 0 {
-                    // Ring full - send doorbell and wait a bit for consoled to drain
-                    self.send_doorbell();
-                    syscall::yield_now();
-                } else {
-                    offset += written;
-                }
-            }
-            // Send doorbell to notify consoled
-            self.send_doorbell();
-        } else if let Some(client) = &self.client {
-            // Fallback to legacy IPC write (no ring available)
-            let _ = client.write(data);
+        if let Some(channel) = &self.channel {
+            // Write to consoled channel only
+            let _ = channel.send(data);
         }
-    }
-
-    /// Send doorbell to wake consoled
-    fn send_doorbell(&self) {
-        if let Some(ch) = self.doorbell_channel {
-            let doorbell = ConsoleRequest::Doorbell;
-            let mut buf = [0u8; 4];
-            if let Ok(len) = doorbell.serialize(&mut buf) {
-                // Non-blocking send - don't wait for response
-                let _ = syscall::send(ch, &buf[..len]);
-                // Drain any pending responses to avoid filling channel buffer
-                let mut resp = [0u8; 8];
-                let _ = syscall::receive_nonblock(ch, &mut resp);
-            }
-        }
+        // If not connected, output is silently dropped
+        // Shell must connect to consoled before producing output
     }
 
     /// Write a string to console
@@ -264,59 +139,47 @@ impl Console {
         self.write(s.as_bytes());
     }
 
-    /// Set input state (for dynamic region management)
-    pub fn set_input_state(&self, state: InputState) {
-        if let Some(client) = &self.client {
-            let _ = client.set_input_state(state);
-        }
-    }
-
-    /// Toggle log split
-    pub fn set_log_split(&mut self, enabled: bool) {
-        self.log_split = enabled;
-        if let Some(client) = &self.client {
-            let _ = client.set_log_split(enabled);
-        }
-    }
-
-    /// Set log lines
-    pub fn set_log_lines(&self, lines: u8) {
-        if let Some(client) = &self.client {
-            let _ = client.set_log_lines(lines);
-        }
-    }
-
-    /// Connect/disconnect from logd
-    pub fn set_logd_connected(&self, connected: bool) {
-        if let Some(client) = &self.client {
-            let _ = client.set_logd_connected(connected);
-        }
-    }
-
-    /// Query terminal size from consoled (triggers re-detection)
+    /// Query terminal size from consoled
     /// Returns (cols, rows) on success
     pub fn query_size(&mut self) -> Option<(u16, u16)> {
-        if let Some(client) = &self.client {
-            match client.query_size() {
-                Ok((cols, rows)) => {
-                    self.cols = cols;
-                    self.rows = rows;
-                    Some((cols, rows))
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        }
+        // For now, just return cached size
+        // In the future, could send a query message to consoled
+        Some((self.cols, self.rows))
+    }
+
+    /// Set log split (placeholder - no protocol for this yet)
+    pub fn set_log_split(&mut self, enabled: bool) {
+        self.log_split = enabled;
+        // Future: send config message to consoled
+    }
+
+    /// Set log lines (placeholder)
+    pub fn set_log_lines(&self, _lines: u8) {
+        // Future: send config message to consoled
+    }
+
+    /// Connect/disconnect from logd (placeholder)
+    pub fn set_logd_connected(&self, _connected: bool) {
+        // Future: send config message to consoled
     }
 }
 
 /// Global console instance
 static mut CONSOLE: Console = Console::new();
 
-/// Initialize and connect to console
+/// Initialize and connect to console (with retry)
 pub fn init() -> bool {
-    unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).connect() }
+    // Retry a few times - consoled might not be ready yet
+    for _ in 0..10 {
+        if unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).connect() } {
+            return true;
+        }
+        // Small delay before retry
+        for _ in 0..100000 {
+            core::hint::spin_loop();
+        }
+    }
+    false
 }
 
 /// Get reference to global console
@@ -344,7 +207,13 @@ pub fn read_byte() -> Option<u8> {
     console_mut().read_byte()
 }
 
-/// Set input state (convenience function)
-pub fn set_input_state(state: InputState) {
-    console().set_input_state(state);
+/// Writer for core::fmt::Write trait
+/// Used by the shell's print!/println! macros
+pub struct ConsoleWriter;
+
+impl core::fmt::Write for ConsoleWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        write(s.as_bytes());
+        Ok(())
+    }
 }

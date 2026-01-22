@@ -6,7 +6,7 @@ use crate::println_direct;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Flush any pending log messages before panic output
-    crate::kernel::log::flush();
+    crate::klog::flush();
 
     // Flush UART output buffer (userspace writes)
     while crate::platform::mt7988::uart::has_buffered_output() {

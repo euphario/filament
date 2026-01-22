@@ -13,6 +13,8 @@ use userlib::{
         self, port_register, port_accept, receive, send,
         open, read, close,
         ramfs_list, RamfsEntry,
+        Handle, WaitFilter, WaitRequest, WaitResult,
+        handle_wait, handle_wrap_channel,
     },
     ipc::{
         Message,  // Import Message trait for serialize/deserialize
@@ -282,14 +284,38 @@ fn main() {
     }
     let port_id = result as u32;
 
+    // Wrap the listen channel as a handle (Handle API)
+    let channel_handle = match handle_wrap_channel(port_id) {
+        Ok(h) => h,
+        Err(_) => {
+            uerror!("vfsd", "channel_wrap_failed");
+            return;
+        }
+    };
+
     uinfo!("vfsd", "ready"; port = "vfs", entries = ramfs_count() as u64);
 
-    // Main loop: accept connections and handle requests
+    // Event-driven main loop (Handle API)
+    let requests = [WaitRequest::new(channel_handle, WaitFilter::Readable)];
+    let mut results = [WaitResult::empty(); 1];
+
     loop {
-        // Accept a connection
+        // Wait for connection (blocking)
+        let count = match handle_wait(&requests, &mut results, u64::MAX) {
+            Ok(n) => n,
+            Err(_) => {
+                syscall::yield_now();
+                continue;
+            }
+        };
+
+        if count == 0 {
+            continue;
+        }
+
+        // Accept a connection (non-blocking since we know it's ready)
         let result = port_accept(port_id);
         if result < 0 {
-            syscall::yield_now();
             continue;
         }
         let channel_id = result as u32;
