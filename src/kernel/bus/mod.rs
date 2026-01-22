@@ -225,7 +225,9 @@ static mut BUS_REGISTRY: BusRegistry = BusRegistry::new();
 /// Get the global bus registry
 /// # Safety
 /// Must ensure proper synchronization
-pub unsafe fn bus_registry() -> &'static mut BusRegistry {
+///
+/// NOTE: Prefer `with_bus_registry()` for safe access with automatic IRQ guard.
+pub(crate) unsafe fn bus_registry() -> &'static mut BusRegistry {
     &mut *core::ptr::addr_of_mut!(BUS_REGISTRY)
 }
 

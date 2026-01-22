@@ -188,3 +188,98 @@ pub fn child_capabilities(parent_caps: Capabilities, requested: Capabilities) ->
 
     allowed
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_capabilities_none() {
+        assert_eq!(Capabilities::NONE.bits(), 0);
+    }
+
+    #[test]
+    fn test_capabilities_all() {
+        assert_eq!(Capabilities::ALL.bits(), u64::MAX);
+    }
+
+    #[test]
+    fn test_capabilities_has() {
+        let caps = Capabilities::IPC.union(Capabilities::MEMORY);
+        assert!(caps.has(Capabilities::IPC));
+        assert!(caps.has(Capabilities::MEMORY));
+        assert!(!caps.has(Capabilities::SPAWN));
+    }
+
+    #[test]
+    fn test_capabilities_union() {
+        let a = Capabilities::IPC;
+        let b = Capabilities::MEMORY;
+        let c = a.union(b);
+        assert!(c.has(Capabilities::IPC));
+        assert!(c.has(Capabilities::MEMORY));
+    }
+
+    #[test]
+    fn test_capabilities_intersect() {
+        let a = Capabilities::IPC.union(Capabilities::MEMORY);
+        let b = Capabilities::MEMORY.union(Capabilities::SPAWN);
+        let c = a.intersect(b);
+        assert!(!c.has(Capabilities::IPC));
+        assert!(c.has(Capabilities::MEMORY));
+        assert!(!c.has(Capabilities::SPAWN));
+    }
+
+    #[test]
+    fn test_capabilities_user_default() {
+        let caps = Capabilities::USER_DEFAULT;
+        assert!(caps.has(Capabilities::IPC));
+        assert!(caps.has(Capabilities::MEMORY));
+        assert!(caps.has(Capabilities::SPAWN));
+        assert!(!caps.has(Capabilities::MMIO));
+    }
+
+    #[test]
+    fn test_capabilities_driver_default() {
+        let caps = Capabilities::DRIVER_DEFAULT;
+        assert!(caps.has(Capabilities::MMIO));
+        assert!(caps.has(Capabilities::DMA));
+        assert!(caps.has(Capabilities::IRQ_CLAIM));
+    }
+
+    #[test]
+    fn test_child_capabilities_with_grant() {
+        let parent = Capabilities::ALL;
+        let requested = Capabilities::IPC.union(Capabilities::MEMORY);
+        let child = child_capabilities(parent, requested);
+        assert!(child.has(Capabilities::IPC));
+        assert!(child.has(Capabilities::MEMORY));
+        assert!(!child.has(Capabilities::MMIO)); // Not requested
+    }
+
+    #[test]
+    fn test_child_capabilities_without_grant() {
+        let parent = Capabilities::IPC.union(Capabilities::MEMORY).union(Capabilities::SPAWN);
+        let requested = Capabilities::ALL;
+        let child = child_capabilities(parent, requested);
+        // Without GRANT, child gets USER_DEFAULT intersection
+        assert!(child.has(Capabilities::IPC));
+        assert!(child.has(Capabilities::MEMORY));
+    }
+
+    #[test]
+    fn test_check_capability_success() {
+        let caps = Capabilities::IPC.union(Capabilities::MEMORY);
+        assert!(check_capability(caps, Capabilities::IPC).is_ok());
+    }
+
+    #[test]
+    fn test_check_capability_failure() {
+        let caps = Capabilities::IPC;
+        assert!(check_capability(caps, Capabilities::MMIO).is_err());
+    }
+}

@@ -466,7 +466,7 @@ static mut PROCESS_TABLE: ProcessTable = ProcessTable::new();
 /// Get the global process table
 /// # Safety
 /// Must ensure proper synchronization
-pub unsafe fn process_table() -> &'static mut ProcessTable {
+pub(crate) unsafe fn process_table() -> &'static mut ProcessTable {
     &mut *core::ptr::addr_of_mut!(PROCESS_TABLE)
 }
 

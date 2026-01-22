@@ -28,7 +28,7 @@ pub(super) fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
 
     unsafe {
         let sched = super::super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task_mut() {
             match task.mmap(size, writable, executable) {
                 Some(virt_addr) => virt_addr as i64,
                 None => SyscallError::OutOfMemory as i64,
@@ -68,7 +68,7 @@ pub(super) fn sys_mmap_dma(size: usize, dma_ptr: u64) -> i64 {
 
     unsafe {
         let sched = super::super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task_mut() {
             match task.mmap_dma(size) {
                 Some((virt_addr, phys_addr)) => {
                     // Convert physical address to DMA address using platform HAL
@@ -108,7 +108,7 @@ pub(super) fn sys_munmap(addr: u64, size: usize) -> i64 {
 
     unsafe {
         let sched = super::super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task_mut() {
             if task.munmap(addr, size) {
                 SyscallError::Success as i64
             } else {
@@ -138,17 +138,12 @@ pub(super) fn sys_mmap_device(phys_addr: u64, size: u64) -> i64 {
     }
 
     // Map into calling process's address space
-    let pid = current_pid();
     unsafe {
         let sched = super::super::task::scheduler();
-        for task_opt in sched.tasks.iter_mut() {
-            if let Some(ref mut task) = task_opt {
-                if task.id == pid {
-                    match task.mmap_device(phys_addr, size as usize) {
-                        Some(vaddr) => return vaddr as i64,
-                        None => return SyscallError::OutOfMemory as i64,
-                    }
-                }
+        if let Some(task) = sched.current_task_mut() {
+            match task.mmap_device(phys_addr, size as usize) {
+                Some(vaddr) => return vaddr as i64,
+                None => return SyscallError::OutOfMemory as i64,
             }
         }
     }

@@ -1,33 +1,92 @@
-//! IPC2 - Rewritten Inter-Process Communication
+//! Inter-Process Communication (IPC)
 //!
-//! This module provides a clean, state-machine-driven IPC system with:
-//! - Explicit state machines for channels and ports
-//! - Single, unified wake mechanism via subscribers
-//! - Trait-based contracts (Waitable, Closable)
-//! - Comprehensive unit tests
+//! Kernel-internal message passing system with channels and ports.
 //!
-//! # Module Structure
+//! # Overview
+//!
+//! This module provides the low-level IPC primitives used by the kernel.
+//! It is NOT directly exposed to userspace - syscalls go through the
+//! [`object`](super::object) module which wraps these primitives.
+//!
+//! # Architecture
 //!
 //! ```text
-//! ipc/
-//! ├── mod.rs      - This file: re-exports, global table access
-//! ├── types.rs    - Message, MessageHeader, constants
-//! ├── queue.rs    - MessageQueue with ring buffer
-//! ├── channel.rs  - Channel state machine
-//! ├── table.rs    - ChannelTable (allocation, lookup)
-//! ├── port.rs     - Port state machine + registry
-//! ├── waker.rs    - Unified wake mechanism
-//! ├── traits.rs   - Waitable, Closable, Subscriber
-//! └── error.rs    - Typed errors
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                      Channel Table                              │
+//! │  - Global table of all channels (MAX_CHANNELS slots)           │
+//! │  - Each channel has peer, state, message queue, subscribers    │
+//! └────────────────────────────────────────┬────────────────────────┘
+//!                                          │
+//!          ┌───────────────────────────────┼───────────────────────┐
+//!          │                               │                       │
+//!          ▼                               ▼                       ▼
+//!    ┌──────────┐                   ┌──────────┐            ┌──────────┐
+//!    │ Channel  │ ◀────paired────▶ │ Channel  │            │  Port    │
+//!    │  ch_id=1 │                   │  ch_id=2 │            │ "devd:"  │
+//!    │ owner=10 │                   │ owner=20 │            │ owner=1  │
+//!    └──────────┘                   └──────────┘            └──────────┘
+//! ```
+//!
+//! # Public API
+//!
+//! ## Types (re-exported)
+//! - [`Message`] - Message buffer with header and payload
+//! - [`MessageHeader`] - Message type and metadata
+//! - [`ChannelId`] - Channel identifier (u32)
+//! - [`IpcError`] - Error type for IPC operations
+//! - [`Subscriber`] - Task subscription for wake notifications
+//! - [`WakeReason`] - Why a subscriber is being woken
+//!
+//! ## Channel Operations
+//! - [`create_channel_pair()`] - Create a connected channel pair
+//! - [`send()`] - Send message on a channel
+//! - [`receive()`] - Receive message from a channel
+//! - [`close_channel()`] - Close a channel (notifies peer)
+//! - [`subscribe()`] - Register for wake notifications
+//!
+//! ## Port Operations
+//! - [`port_register()`] - Register a named port
+//! - [`port_connect()`] - Connect to a named port (creates channel pair)
+//! - [`port_accept()`] - Accept pending connection on a port
+//! - [`port_unregister()`] - Unregister a port
+//!
+//! ## Query Operations
+//! - [`channel_has_messages()`] - Check if channel has pending messages
+//! - [`channel_is_closed()`] - Check if channel or peer is closed
+//! - [`port_has_pending()`] - Check if port has pending connections
+//!
+//! # Usage Example
+//!
+//! ```ignore
+//! // Create channel pair between two tasks
+//! let (ch_a, ch_b) = ipc::create_channel_pair(pid_a, pid_b)?;
+//!
+//! // Send a message
+//! let msg = Message::new(MessageType::Data, b"hello");
+//! let wake_list = ipc::send(ch_a, msg, pid_a)?;
+//! waker::wake(&wake_list, WakeReason::Readable);
+//!
+//! // Receive on the other end
+//! let received = ipc::receive(ch_b, pid_b)?;
 //! ```
 //!
 //! # Design Principles
 //!
-//! 1. **Single source of truth**: Each object has ONE state enum
-//! 2. **Explicit transitions**: State changes only via defined methods
-//! 3. **Subscriber-based waking**: Tasks subscribe to events, get woken
-//! 4. **No implicit state**: No `blocked_receiver` + `peer_closed` + `state` mess
-//! 5. **Testable**: Core logic separated from syscall glue
+//! 1. **State machines** - Channels and ports have explicit states with valid transitions
+//! 2. **Subscriber-based waking** - Tasks subscribe to events, collected in WakeList
+//! 3. **Wake outside locks** - Collect subscribers under lock, wake after release
+//! 4. **IRQ-safe** - All operations use spinlocks, safe from interrupt context
+//!
+//! # Module Structure
+//!
+//! - [`types`] - Message, MessageHeader, constants
+//! - [`queue`] - MessageQueue ring buffer
+//! - [`channel`] - Channel state machine
+//! - [`table`] - ChannelTable (internal, allocation/lookup)
+//! - [`port`] - Port state machine and registry
+//! - [`waker`] - Wake mechanism (WakeList, wake())
+//! - [`traits`] - Subscriber, WakeReason, Waitable, Closable
+//! - [`error`] - IpcError enum
 
 pub mod types;
 pub mod queue;
@@ -41,15 +100,14 @@ pub mod port;
 #[cfg(test)]
 mod tests;
 
-// Re-export commonly used types
-pub use types::{Message, MessageHeader, MessageType, ChannelId, MAX_INLINE_PAYLOAD, MAX_QUEUE_SIZE, MAX_PORT_NAME};
-pub use queue::MessageQueue;
+// Re-export types used by other kernel modules
+pub use types::{Message, MessageHeader, MessageType, ChannelId, MAX_INLINE_PAYLOAD};
 pub use error::IpcError;
-pub use traits::{Subscriber, WakeReason, Waitable, Closable, CloseAction};
-pub use waker::SubscriberSet;
-pub use channel::{Channel, ChannelState};
-pub use table::ChannelTable;
-pub use port::{Port, PortState, PortRegistry, PendingConnection};
+pub use traits::{Subscriber, WakeReason, Waitable, Closable};
+
+// Internal imports (not re-exported)
+use table::ChannelTable;
+use port::PortRegistry;
 
 use super::lock::SpinLock;
 
@@ -60,15 +118,8 @@ static CHANNEL_TABLE: SpinLock<ChannelTable> = SpinLock::new(ChannelTable::new()
 static PORT_REGISTRY: SpinLock<PortRegistry> = SpinLock::new(PortRegistry::new());
 
 /// Access the global channel table (IRQ-safe)
-///
-/// # Example
-/// ```ignore
-/// let subs = with_channel_table(|table| {
-///     table.send(channel_id, msg, caller_pid)
-/// })?;
-/// waker::wake(&subs, WakeReason::Readable);
-/// ```
-pub fn with_channel_table<F, R>(f: F) -> R
+/// Internal only - use the typed API functions below
+fn with_channel_table<F, R>(f: F) -> R
 where
     F: FnOnce(&mut ChannelTable) -> R,
 {
@@ -77,7 +128,8 @@ where
 }
 
 /// Access the global port registry (IRQ-safe)
-pub fn with_port_registry<F, R>(f: F) -> R
+/// Internal only - use the typed API functions below
+fn with_port_registry<F, R>(f: F) -> R
 where
     F: FnOnce(&mut PortRegistry) -> R,
 {
@@ -86,12 +138,8 @@ where
 }
 
 /// Access both tables atomically (for operations that span both)
-///
-/// This is needed for operations like port_connect which:
-/// 1. Looks up port in registry
-/// 2. Creates channel pair in channel table
-/// 3. Adds pending connection to port
-pub fn with_both_tables<F, R>(f: F) -> R
+/// Internal only - use port_connect() instead
+fn with_both_tables<F, R>(f: F) -> R
 where
     F: FnOnce(&mut ChannelTable, &mut PortRegistry) -> R,
 {
@@ -102,42 +150,100 @@ where
 }
 
 // ============================================================================
-// Convenience functions for common operations
+// Channel API - Message passing between tasks
 // ============================================================================
 
-/// Create a channel pair between two tasks
+/// Create a bidirectional channel pair between two tasks.
+///
+/// Returns `(channel_a, channel_b)` where messages sent on `channel_a`
+/// are received on `channel_b` and vice versa.
+///
+/// # Arguments
+/// * `owner_a` - PID of task that will own channel_a
+/// * `owner_b` - PID of task that will own channel_b (can be same as owner_a)
+///
+/// # Errors
+/// - `IpcError::NoSlots` - No free channel slots available
 pub fn create_channel_pair(owner_a: u32, owner_b: u32) -> Result<(ChannelId, ChannelId), IpcError> {
     with_channel_table(|table| table.create_pair(owner_a, owner_b))
 }
 
-/// Send a message on a channel
-/// Returns subscribers to wake (caller must wake outside lock)
+/// Send a message on a channel.
+///
+/// Returns a list of subscribers to wake. **Caller must wake them after
+/// releasing the lock** using `waker::wake(&wake_list, WakeReason::Readable)`.
+///
+/// # Arguments
+/// * `channel_id` - Channel to send on
+/// * `msg` - Message to send
+/// * `caller` - PID of sending task (must be owner)
+///
+/// # Errors
+/// - `IpcError::NotFound` - Channel doesn't exist
+/// - `IpcError::NotOwner` - Caller doesn't own this channel
+/// - `IpcError::PeerClosed` - Peer channel is closed
+/// - `IpcError::QueueFull` - Message queue is full
 pub fn send(channel_id: ChannelId, msg: Message, caller: u32) -> Result<waker::WakeList, IpcError> {
     with_channel_table(|table| table.send(channel_id, msg, caller))
 }
 
-/// Receive a message from a channel
+/// Receive a message from a channel.
+///
+/// Blocks conceptually (caller should check/subscribe before calling).
+///
+/// # Arguments
+/// * `channel_id` - Channel to receive from
+/// * `caller` - PID of receiving task (must be owner)
+///
+/// # Errors
+/// - `IpcError::NotFound` - Channel doesn't exist
+/// - `IpcError::NotOwner` - Caller doesn't own this channel
+/// - `IpcError::WouldBlock` - No messages available
+/// - `IpcError::PeerClosed` - Peer closed and queue empty
 pub fn receive(channel_id: ChannelId, caller: u32) -> Result<Message, IpcError> {
     with_channel_table(|table| table.receive(channel_id, caller))
 }
 
-/// Close a channel
-/// Returns subscribers to wake
+/// Close a channel.
+///
+/// Notifies peer that this end is closed. Returns subscribers to wake.
+///
+/// # Arguments
+/// * `channel_id` - Channel to close
+/// * `caller` - PID of calling task (must be owner)
+///
+/// # Errors
+/// - `IpcError::NotFound` - Channel doesn't exist
+/// - `IpcError::NotOwner` - Caller doesn't own this channel
 pub fn close_channel(channel_id: ChannelId, caller: u32) -> Result<waker::WakeList, IpcError> {
     with_channel_table(|table| table.close(channel_id, caller))
 }
 
-/// Subscribe to events on a channel
+/// Subscribe to events on a channel.
+///
+/// When the requested event occurs, the subscriber's task will be woken.
+///
+/// # Arguments
+/// * `channel_id` - Channel to subscribe to
+/// * `caller` - PID of subscribing task (must be owner)
+/// * `sub` - Subscriber info (task_id + generation for stale detection)
+/// * `filter` - Which events to subscribe to (Readable, Writable, Closed)
 pub fn subscribe(channel_id: ChannelId, caller: u32, sub: Subscriber, filter: WakeReason) -> Result<(), IpcError> {
     with_channel_table(|table| table.subscribe(channel_id, caller, sub, filter))
 }
 
-/// Unsubscribe from events on a channel
+/// Unsubscribe from events on a channel.
 pub fn unsubscribe(channel_id: ChannelId, caller: u32, sub: Subscriber) -> Result<(), IpcError> {
     with_channel_table(|table| table.unsubscribe(channel_id, caller, sub))
 }
 
-/// Check if channel is ready for an operation
+/// Check if channel is ready for an operation (non-blocking poll).
+///
+/// # Arguments
+/// * `filter` - What to check: `Readable` (has messages), `Writable` (queue not full)
+///
+/// # Returns
+/// `Ok(true)` if ready, `Ok(false)` if not ready
 pub fn poll(channel_id: ChannelId, caller: u32, filter: WakeReason) -> Result<bool, IpcError> {
     with_channel_table(|table| table.poll(channel_id, caller, filter))
 }

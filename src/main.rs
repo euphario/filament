@@ -43,7 +43,7 @@ mod ramfs;
 // Convenient aliases - use full paths to avoid ambiguity
 use arch::aarch64::{mmu, sync, smp};
 use platform::mt7988::{gic, uart, timer, wdt};
-use kernel::{task, scheme, shmem, dma_pool, elf, pmm, pci, bus};
+use kernel::{task, irq, shmem, dma_pool, elf, pmm, pci, bus};
 
 // Alias for platform constants (platform::mt7988::INITRD_ADDR, etc.)
 use platform::mt7988 as plat;
@@ -141,13 +141,6 @@ pub extern "C" fn kmain() -> ! {
         // Note: shmem::init() logs init_ok with details
     }
 
-    // Scheme system
-    {
-        let _span = span!("scheme", "init");
-        scheme::init();
-        // Note: scheme::init() logs init_ok with details
-    }
-
     // PCI subsystem
     {
         let _span = span!("pci", "init");
@@ -207,7 +200,6 @@ pub extern "C" fn kmain() -> ! {
         // IPC tests via ipc module
         // kernel::ipc::test(); // TODO: Add ipc unit tests
         kernel::event::test();
-        scheme::test();
         elf::test();
         smp::test();
         plat::eth::test();
@@ -263,7 +255,7 @@ pub extern "C" fn kmain() -> ! {
                 klog::flush();
                 // Give devd ALL capabilities, high priority, and mark as init process
                 unsafe {
-                    if let Some(ref mut task) = task::scheduler().tasks[slot] {
+                    if let Some(task) = task::scheduler().task_mut(slot) {
                         task.set_capabilities(kernel::caps::Capabilities::ALL);
                         task.set_priority(task::Priority::High);  // devd is critical
                         task.is_init = true;  // Mark as init for heartbeat watchdog
@@ -356,7 +348,7 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
         }
     } else {
         // Check if this IRQ is registered by a userspace driver
-        if let Some(owner_pid) = scheme::irq_notify(irq) {
+        if let Some(owner_pid) = irq::notify(irq) {
             // Wake the owner process if blocked - O(1) lookup via pid_to_slot map
             unsafe {
                 let _guard = sync::IrqGuard::new(); // Ensure atomicity
@@ -427,7 +419,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
     let (pid, parent_id, task_name) = unsafe {
         let sched = kernel::task::scheduler();
         let slot = kernel::task::current_slot();
-        if let Some(ref task) = sched.tasks[slot] {
+        if let Some(task) = sched.task(slot) {
             let mut name = [0u8; 16];
             let name_len = task.name.len().min(16);
             name[..name_len].copy_from_slice(&task.name[..name_len]);
@@ -477,7 +469,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         unsafe {
             let sched = kernel::task::scheduler();
             for slot_idx in 0..kernel::task::MAX_TASKS {
-                if let Some(ref task) = sched.tasks[slot_idx] {
+                if let Some(task) = sched.task(slot_idx) {
                     let pid = task.id;
                     print_str_uart("  slot[");
                     print_hex_uart(slot_idx as u64);
@@ -493,21 +485,16 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                         // Cleanup resources
                         kernel::bus::process_cleanup(pid);
                         kernel::shmem::process_cleanup(pid);
-                        kernel::scheme::process_cleanup(pid);
+                        kernel::irq::process_cleanup(pid);
                         kernel::pci::release_all_devices(pid);
                         let port_wake = kernel::ipc::port_cleanup_task(pid);
                         kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
                         let ipc_wake = kernel::ipc::process_cleanup(pid);
                         kernel::ipc::waker::wake(&ipc_wake, kernel::ipc::WakeReason::Closed);
 
-                        // Close FDs before freeing slot
-                        if let Some(ref mut task) = sched.tasks[slot_idx] {
-                            task.fd_table.close_all(pid);
-                        }
-
                         // Free slot immediately (bump generation to invalidate stale PIDs)
                         sched.bump_generation(slot_idx);
-                        sched.tasks[slot_idx] = None;
+                        sched.clear_slot(slot_idx);
                     }
                 }
             }
@@ -524,7 +511,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
 
                 // Give devd ALL capabilities, high priority, and mark as init
                 unsafe {
-                    if let Some(ref mut task) = kernel::task::scheduler().tasks[slot] {
+                    if let Some(task) = kernel::task::scheduler().task_mut(slot) {
                         task.set_capabilities(kernel::caps::Capabilities::ALL);
                         task.set_priority(kernel::task::Priority::High);  // devd is critical
                         task.is_init = true;  // Mark as init for heartbeat watchdog
@@ -535,9 +522,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 unsafe {
                     let sched = kernel::task::scheduler();
                     kernel::task::set_current_slot(slot);
-                    sched.current = slot;
-                    if let Some(ref mut task) = sched.tasks[slot] {
-                        task.state = kernel::task::TaskState::Running;
+                    if let Some(task) = sched.task_mut(slot) {
+                        let _ = task.set_running();
                     }
                     kernel::task::update_current_task_globals();
                 }
@@ -587,31 +573,28 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         // - freeing task slot
 
         // Kill all children of this task
-        for task_opt in sched.tasks.iter_mut() {
-            if let Some(ref mut task) = task_opt {
-                if task.parent_id == pid && !task.state.is_terminated() {
+        for (_slot, task_opt) in sched.iter_tasks_mut() {
+            if let Some(task) = task_opt {
+                if task.parent_id == pid && !task.is_terminated() {
                     // Mark child as terminated
-                    task.state = kernel::task::TaskState::Exiting { code: -9 };  // SIGKILL
+                    let _ = task.set_exiting(-9);  // SIGKILL
                 }
             }
         }
 
         // Set exit code and mark as terminated
-        if let Some(ref mut task) = sched.tasks[current_slot] {
-            task.state = kernel::task::TaskState::Exiting { code: exit_code };
+        if let Some(task) = sched.task_mut(current_slot) {
+            let _ = task.set_exiting(exit_code);
         }
 
         // Notify parent
         if parent_id != 0 {
-            for task_opt in sched.tasks.iter_mut() {
-                if let Some(ref mut task) = task_opt {
-                    if task.id == parent_id {
-                        let event = kernel::event::Event::child_exit(pid, exit_code);
-                        task.event_queue.push(event);
-                        if task.state.is_blocked() {
-                            task.state = kernel::task::TaskState::Ready;
-                        }
-                        break;
+            if let Some(parent_slot) = sched.slot_by_pid(parent_id) {
+                if let Some(parent) = sched.task_mut(parent_slot) {
+                    let event = kernel::event::Event::child_exit(pid, exit_code);
+                    parent.event_queue.push(event);
+                    if parent.is_blocked() {
+                        let _ = parent.wake();
                     }
                 }
             }
@@ -622,9 +605,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         // Schedule next task
         if let Some(next_slot) = sched.schedule() {
             kernel::task::set_current_slot(next_slot);
-            sched.current = next_slot;
-            if let Some(ref mut task) = sched.tasks[next_slot] {
-                task.state = kernel::task::TaskState::Running;
+            if let Some(task) = sched.task_mut(next_slot) {
+                let _ = task.set_running();
             }
             kernel::task::update_current_task_globals();
             // Return to assembly which will eret to next task
@@ -726,27 +708,22 @@ pub extern "C" fn recover_devd() {
     unsafe {
         let sched = kernel::task::scheduler();
         for slot_idx in 0..kernel::task::MAX_TASKS {
-            if let Some(ref task) = sched.tasks[slot_idx] {
+            if let Some(task) = sched.task(slot_idx) {
                 let pid = task.id;
                 if pid != 0 {  // Don't kill kernel (PID 0 if it exists)
                     // Cleanup resources
                     kernel::bus::process_cleanup(pid);
                     kernel::shmem::process_cleanup(pid);
-                    kernel::scheme::process_cleanup(pid);
+                    kernel::irq::process_cleanup(pid);
                     kernel::pci::release_all_devices(pid);
                     let port_wake = kernel::ipc::port_cleanup_task(pid);
                     kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
                     let ipc_wake = kernel::ipc::process_cleanup(pid);
                     kernel::ipc::waker::wake(&ipc_wake, kernel::ipc::WakeReason::Closed);
 
-                    // Close FDs before freeing slot
-                    if let Some(ref mut task) = sched.tasks[slot_idx] {
-                        task.fd_table.close_all(pid);
-                    }
-
                     // Free slot immediately (bump generation to invalidate stale PIDs)
                     sched.bump_generation(slot_idx);
-                    sched.tasks[slot_idx] = None;
+                    sched.clear_slot(slot_idx);
                 }
             }
         }
@@ -763,7 +740,7 @@ pub extern "C" fn recover_devd() {
 
             // Give devd ALL capabilities, high priority, and mark as init
             unsafe {
-                if let Some(ref mut task) = kernel::task::scheduler().tasks[slot] {
+                if let Some(task) = kernel::task::scheduler().task_mut(slot) {
                     task.set_capabilities(kernel::caps::Capabilities::ALL);
                     task.set_priority(kernel::task::Priority::High);  // devd is critical
                     task.is_init = true;  // Mark as init for heartbeat watchdog
@@ -774,9 +751,8 @@ pub extern "C" fn recover_devd() {
             unsafe {
                 let sched = kernel::task::scheduler();
                 kernel::task::set_current_slot(slot);
-                sched.current = slot;
-                if let Some(ref mut task) = sched.tasks[slot] {
-                    task.state = kernel::task::TaskState::Running;
+                if let Some(task) = sched.task_mut(slot) {
+                    let _ = task.set_running();
                 }
                 kernel::task::update_current_task_globals();
             }
@@ -800,15 +776,9 @@ pub extern "C" fn recover_devd() {
             print_str_uart(err_str);
             print_str_uart("\r\n");
 
-            // Try hardware reboot
+            // Hardware reboot (never returns)
             print_str_uart("  Attempting system reboot...\r\n");
             kernel::syscall::hardware_reset();
-
-            // If reset fails, halt
-            print_str_uart("  System halted.\r\n");
-            loop {
-                unsafe { core::arch::asm!("wfe"); }
-            }
         }
     }
 }

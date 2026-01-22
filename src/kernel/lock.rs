@@ -586,3 +586,101 @@ pub fn test() {
 
     kinfo!("lock", "test_ok");
 }
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spinlock_new() {
+        let lock: SpinLock<u32> = SpinLock::new(42);
+        assert_eq!(*lock.lock(), 42);
+    }
+
+    #[test]
+    fn test_spinlock_lock_unlock() {
+        let lock = SpinLock::new(0u32);
+        {
+            let mut guard = lock.lock();
+            *guard = 100;
+        }
+        assert_eq!(*lock.lock(), 100);
+    }
+
+    #[test]
+    fn test_spinlock_try_lock() {
+        let lock = SpinLock::new(0u32);
+
+        let guard = lock.try_lock();
+        assert!(guard.is_some());
+        drop(guard);
+    }
+
+    #[test]
+    fn test_spinlock_multiple_access() {
+        let lock = SpinLock::new(0u32);
+
+        {
+            let mut g = lock.lock();
+            *g += 1;
+        }
+        {
+            let mut g = lock.lock();
+            *g += 1;
+        }
+        assert_eq!(*lock.lock(), 2);
+    }
+
+    #[test]
+    fn test_rwlock_new() {
+        let lock: RwLock<u32> = RwLock::new(123);
+        assert_eq!(*lock.read(), 123);
+    }
+
+    #[test]
+    fn test_rwlock_read() {
+        let lock = RwLock::new(456u32);
+        let guard = lock.read();
+        assert_eq!(*guard, 456);
+    }
+
+    #[test]
+    fn test_rwlock_write() {
+        let lock = RwLock::new(0u32);
+        {
+            let mut guard = lock.write();
+            *guard = 789;
+        }
+        assert_eq!(*lock.read(), 789);
+    }
+
+    #[test]
+    fn test_rwlock_try_read() {
+        let lock = RwLock::new(100u32);
+        let guard = lock.try_read();
+        assert!(guard.is_some());
+    }
+
+    #[test]
+    fn test_rwlock_try_write() {
+        let lock = RwLock::new(200u32);
+        let guard = lock.try_write();
+        assert!(guard.is_some());
+    }
+
+    #[test]
+    fn test_spinlock_const_new() {
+        static LOCK: SpinLock<u32> = SpinLock::new(999);
+        assert_eq!(*LOCK.lock(), 999);
+    }
+
+    #[test]
+    fn test_rwlock_const_new() {
+        static LOCK: RwLock<u32> = RwLock::new(888);
+        assert_eq!(*LOCK.read(), 888);
+    }
+}

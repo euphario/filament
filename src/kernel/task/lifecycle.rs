@@ -72,10 +72,10 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), Lif
     let parent_id = {
         let task = sched.tasks[slot].as_mut().ok_or(LifecycleError::NotFound)?;
 
-        // Transition state
-        if let Err(_e) = task.state.exit(code) {
+        // Transition state via state machine
+        if let Err(_e) = task.set_exiting(code) {
             // Already terminated? That's ok, just return
-            if task.state.is_terminated() {
+            if task.is_terminated() {
                 return Ok(());
             }
             return Err(LifecycleError::InvalidState);
@@ -153,8 +153,8 @@ pub fn kill(
     {
         let task = sched.tasks[slot].as_mut().ok_or(LifecycleError::NotFound)?;
 
-        if let Err(_e) = task.state.exit(-9) {
-            if task.state.is_terminated() {
+        if let Err(_e) = task.set_exiting(-9) {
+            if task.is_terminated() {
                 return Ok(());
             }
             return Err(LifecycleError::InvalidState);
@@ -230,7 +230,7 @@ pub fn wait_child(
             }
 
             // Check if terminated
-            if let Some(code) = task.state.exit_code() {
+            if let Some(code) = task.state().exit_code() {
                 found = Some((slot, task.id, code));
                 break;
             }
@@ -279,12 +279,12 @@ pub fn wake(sched: &mut Scheduler, task_id: TaskId) -> bool {
     };
 
     // Only wake if blocked
-    if !task.state.is_blocked() {
+    if !task.is_blocked() {
         return false;
     }
 
-    // Transition to Ready
-    if task.state.wake().is_err() {
+    // Transition to Ready via state machine
+    if task.wake().is_err() {
         return false;
     }
 
@@ -305,7 +305,7 @@ pub fn wake(sched: &mut Scheduler, task_id: TaskId) -> bool {
 pub fn sleep_current(sched: &mut Scheduler, slot: usize, reason: SleepReason) -> Result<(), LifecycleError> {
     let task = sched.tasks[slot].as_mut().ok_or(LifecycleError::NotFound)?;
 
-    task.state.sleep(reason).map_err(|_| LifecycleError::InvalidState)
+    task.set_sleeping(reason).map_err(|_| LifecycleError::InvalidState)
 }
 
 /// Wait until deadline (with timeout)
@@ -329,7 +329,7 @@ pub fn wait_until(
 ) -> Result<(), LifecycleError> {
     let task = sched.tasks[slot].as_mut().ok_or(LifecycleError::NotFound)?;
 
-    task.state.wait(reason, deadline).map_err(|_| LifecycleError::InvalidState)
+    task.set_waiting(reason, deadline).map_err(|_| LifecycleError::InvalidState)
 }
 
 // ============================================================================
@@ -339,7 +339,7 @@ pub fn wait_until(
 /// Notify parent that a child has exited
 ///
 /// This handles both:
-/// 1. ChildExitObject handle notifications (for handle-based waiting)
+/// 1. ProcessObject handle notifications (for unified syscall waiting)
 /// 2. Direct wake of blocked parent (for sys_wait compatibility)
 fn notify_parent_of_exit(sched: &mut Scheduler, parent_id: TaskId, child_pid: TaskId, code: i32) {
     let parent_slot = match sched.slot_by_pid(parent_id) {
@@ -349,18 +349,18 @@ fn notify_parent_of_exit(sched: &mut Scheduler, parent_id: TaskId, child_pid: Ta
 
     let mut should_wake_parent = false;
 
-    // Notify via ChildExitObject handles and check if parent is blocked
-    if let Some(ref mut parent) = sched.tasks[parent_slot] {
-        // Notify via handle system
-        let wake_list = crate::kernel::handle::child_exit::notify_child_exit_to_task(
-            parent, child_pid, code,
+    // Notify via ProcessObject handles in object_table and check if parent is blocked
+    if let Some(parent) = sched.task_mut(parent_slot) {
+        // Notify via unified object system
+        let wake_list = crate::kernel::object::notify_child_exit(
+            &mut parent.object_table, child_pid, code,
         );
 
         // Wake handle subscribers
         waker::wake(&wake_list, WakeReason::ChildExit);
 
         // Also check if parent is directly blocked (sys_wait)
-        if parent.state.is_blocked() {
+        if parent.is_blocked() {
             should_wake_parent = true;
         }
     }
@@ -368,7 +368,7 @@ fn notify_parent_of_exit(sched: &mut Scheduler, parent_id: TaskId, child_pid: Ta
     // Direct wake of parent if blocked (outside borrow)
     if should_wake_parent {
         if let Some(ref mut parent) = sched.tasks[parent_slot] {
-            let _ = parent.state.wake();
+            let _ = parent.wake();
             parent.liveness_state = crate::kernel::liveness::LivenessState::Normal;
         }
     }

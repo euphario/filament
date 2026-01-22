@@ -393,4 +393,142 @@ mod tests {
         assert!(state.exit(-9).is_ok());
         assert_eq!(state.exit_code(), Some(-9));
     }
+
+    #[test]
+    fn test_wait_with_deadline() {
+        let mut state = TaskState::Running;
+        assert!(state.wait(WaitReason::Timer, 12345).is_ok());
+
+        if let TaskState::Waiting { deadline, reason } = state {
+            assert_eq!(deadline, 12345);
+            assert_eq!(reason, WaitReason::Timer);
+        } else {
+            panic!("Expected Waiting state");
+        }
+    }
+
+    #[test]
+    fn test_wait_reasons() {
+        let mut state = TaskState::Running;
+
+        // IpcCall
+        assert!(state.wait(WaitReason::IpcCall, 100).is_ok());
+        assert!(state.wake().is_ok());
+
+        // Child
+        assert!(state.schedule().is_ok());
+        assert!(state.wait(WaitReason::Child, 200).is_ok());
+        assert!(state.wake().is_ok());
+
+        // ShmemNotify
+        assert!(state.schedule().is_ok());
+        assert!(state.wait(WaitReason::ShmemNotify, 300).is_ok());
+        assert!(state.wake().is_ok());
+    }
+
+    #[test]
+    fn test_sleep_reasons() {
+        let mut state = TaskState::Running;
+
+        // EventLoop
+        assert!(state.sleep(SleepReason::EventLoop).is_ok());
+        assert!(state.wake().is_ok());
+
+        // Ipc
+        assert!(state.schedule().is_ok());
+        assert!(state.sleep(SleepReason::Ipc).is_ok());
+        assert!(state.wake().is_ok());
+    }
+
+    #[test]
+    fn test_is_runnable() {
+        let state = TaskState::Ready;
+        assert!(state.is_runnable());
+
+        let state = TaskState::Running;
+        assert!(state.is_runnable());
+
+        let state = TaskState::Sleeping { reason: SleepReason::EventLoop };
+        assert!(!state.is_runnable());
+
+        let state = TaskState::Dead;
+        assert!(!state.is_runnable());
+    }
+
+    #[test]
+    fn test_is_blocked() {
+        let state = TaskState::Sleeping { reason: SleepReason::Ipc };
+        assert!(state.is_blocked());
+
+        let state = TaskState::Waiting { reason: WaitReason::Timer, deadline: 100 };
+        assert!(state.is_blocked());
+
+        let state = TaskState::Running;
+        assert!(!state.is_blocked());
+    }
+
+    #[test]
+    fn test_is_terminated() {
+        let state = TaskState::Exiting { code: 0 };
+        assert!(state.is_terminated());
+
+        let state = TaskState::Dying { code: -1, until: 0 };
+        assert!(state.is_terminated());
+
+        let state = TaskState::Dead;
+        assert!(state.is_terminated());
+
+        let state = TaskState::Running;
+        assert!(!state.is_terminated());
+    }
+
+    #[test]
+    fn test_exit_code_extraction() {
+        let state = TaskState::Exiting { code: 42 };
+        assert_eq!(state.exit_code(), Some(42));
+
+        let state = TaskState::Dying { code: -15, until: 0 };
+        assert_eq!(state.exit_code(), Some(-15));
+
+        let state = TaskState::Dead;
+        assert_eq!(state.exit_code(), None);
+
+        let state = TaskState::Running;
+        assert_eq!(state.exit_code(), None);
+    }
+
+    #[test]
+    fn test_yield_cpu() {
+        let mut state = TaskState::Running;
+        assert!(state.yield_cpu().is_ok());
+        assert_eq!(state, TaskState::Ready);
+    }
+
+    #[test]
+    fn test_cannot_yield_from_blocked() {
+        let mut state = TaskState::Sleeping { reason: SleepReason::EventLoop };
+        assert!(state.yield_cpu().is_err());
+    }
+
+    #[test]
+    fn test_finalize_returns_code() {
+        let mut state = TaskState::Dying { code: 99, until: 1000 };
+        let result = state.finalize();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(state, TaskState::Dead);
+    }
+
+    #[test]
+    fn test_double_exit_fails() {
+        let mut state = TaskState::Exiting { code: 1 };
+        assert!(state.exit(2).is_err());
+    }
+
+    #[test]
+    fn test_wake_from_waiting() {
+        let mut state = TaskState::Waiting { reason: WaitReason::Timer, deadline: 100 };
+        assert!(state.wake().is_ok());
+        assert_eq!(state, TaskState::Ready);
+    }
 }

@@ -241,7 +241,7 @@ fn current_pid() -> u32 {
 fn require_capability(cap: Capabilities) -> Result<(), i64> {
     unsafe {
         let sched = super::task::scheduler();
-        if let Some(ref task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task() {
             if task.has_capability(cap) {
                 return Ok(());
             }
@@ -430,7 +430,7 @@ pub extern "C" fn syscall_handler_rust(
     unsafe {
         let slot = super::task::current_slot();
         let sched = super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[slot] {
+        if let Some(task) = sched.task_mut(slot) {
             task.last_activity_tick = crate::platform::mt7988::timer::ticks();
 
             // Reset liveness state if we're in PingSent with channel=0 (implicit pong)
@@ -440,8 +440,8 @@ pub extern "C" fn syscall_handler_rust(
             }
 
             // Debug: log if devd (slot 0) enters a syscall in unexpected state
-            if slot == 0 && !matches!(task.state, super::task::TaskState::Running) {
-                crate::print_direct!("[SDBG] devd syscall entry state={:?} num={}\n", task.state, num);
+            if slot == 0 && !matches!(*task.state(), super::task::TaskState::Running) {
+                crate::print_direct!("[SDBG] devd syscall entry state={:?} num={}\n", task.state(), num);
             }
         }
     }

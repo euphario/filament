@@ -1,45 +1,74 @@
 //! Scheduler - Internal Kernel Scheduling Mechanisms
 //!
-//! This module provides internal scheduler functions for the kernel.
-//! These are NOT syscall entry points - they are kernel-internal mechanisms.
+//! This module provides the kernel-internal scheduling functions. These are
+//! **not** syscall entry points - they are called by syscall handlers and
+//! interrupt handlers to manage task execution.
 //!
-//! ## Design Principles
+//! # Architecture
 //!
-//! 1. **Idle task**: Slot 0 is reserved for the idle task, which:
-//!    - Has lowest priority (Priority::Idle)
-//!    - Is always Ready (never blocks)
-//!    - Runs WFI loop when no other tasks are runnable
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────────┐
+//! │  Timer Interrupt / Syscall / Exception                           │
+//! └──────────────────────────────┬───────────────────────────────────┘
+//!                                │
+//!                                ▼
+//!          ┌─────────────────────────────────────────┐
+//!          │           sched::reschedule()           │
+//!          │  1. Mark current task Ready             │
+//!          │  2. Pick highest-priority Ready task    │
+//!          │  3. Context switch to new task          │
+//!          └─────────────────────────────────────────┘
+//!                                │
+//!            ┌───────────────────┼───────────────────┐
+//!            ▼                   ▼                   ▼
+//!       ┌─────────┐        ┌─────────┐        ┌─────────┐
+//!       │ Task A  │        │ Task B  │        │  Idle   │
+//!       │ Ready   │        │ Running │        │ slot 0  │
+//!       └─────────┘        └─────────┘        └─────────┘
+//! ```
 //!
-//! 2. **State machine**: Task states follow strict transitions:
-//!    - Ready → Running (only via reschedule)
-//!    - Running → Ready (via yield or preemption)
-//!    - Running → Sleeping (via sleep_current) - event loop, no deadline
-//!    - Running → Waiting (via wait_current) - specific request, has deadline
-//!    - Sleeping/Waiting → Ready (only via wake or deadline expiry)
-//!    - Running → Terminated (via exit)
+//! # Public API
 //!
-//! 3. **Sleeping vs Waiting**:
-//!    - Sleeping: Event-loop idle (devd waiting for events) - no deadline
-//!    - Waiting: Request pending (IPC call, waitpid) - has deadline
-//!    - Tickless: only scans Waiting for next wake time
-//!    - Liveness: only probes Sleeping; Waiting uses deadline enforcement
+//! | Function | Purpose |
+//! |----------|---------|
+//! | [`reschedule()`] | Pick next task and context switch |
+//! | [`wake(pid)`] | Wake a sleeping/waiting task by PID |
+//! | [`sleep_current(reason)`] | Sleep current task (event loop) |
+//! | [`wait_current(reason, deadline)`] | Wait with timeout |
+//! | [`yield_current()`] | Voluntarily give up CPU |
 //!
-//! 4. **Separation of concerns**:
-//!    - syscall.rs: User-facing syscall entry points (sys_yield, sys_exit, etc.)
-//!    - sched.rs: Kernel-internal scheduling (reschedule, wake, sleep, wait, etc.)
-//!    - task.rs: Task structures and per-task operations
+//! # Task States
 //!
-//! ## Key Functions
+//! This module enforces the task state machine:
 //!
-//! - `reschedule()`: Pick next task and switch to it (called from timer, syscalls)
-//! - `wake(pid)`: Wake a sleeping/waiting task (called when event arrives)
-//! - `sleep_current(reason)`: Sleep current task (event loop, no deadline)
-//! - `wait_current(reason, deadline)`: Wait current task (request, has deadline)
-//! - `yield_current()`: Voluntarily give up CPU
-//! - `run_idle()`: Idle loop - only called when no tasks are runnable
+//! - **Ready** → Running (via `reschedule`)
+//! - **Running** → Ready (via `yield_current` or preemption)
+//! - **Running** → Sleeping (via `sleep_current`) - no deadline
+//! - **Running** → Waiting (via `wait_current`) - has deadline
+//! - **Sleeping/Waiting** → Ready (via `wake` or timeout)
+//!
+//! # Sleeping vs Waiting
+//!
+//! Two distinct blocked states for different use cases:
+//!
+//! | State | Use Case | Deadline | Example |
+//! |-------|----------|----------|---------|
+//! | Sleeping | Event loop idle | None | devd waiting for events |
+//! | Waiting | Specific request | Yes | IPC receive with timeout |
+//!
+//! This distinction enables:
+//! - **Tickless**: Only scan Waiting tasks for next wake time
+//! - **Liveness**: Only probe Sleeping tasks; Waiting has deadline enforcement
+//!
+//! # Design Principles
+//!
+//! 1. **Idle task**: Slot 0 is always the idle task (never blocks, lowest priority)
+//! 2. **State machine**: All transitions validated by [`task::state`] module
+//! 3. **Separation**: syscall.rs → sched.rs → task.rs (layered responsibility)
+//! 4. **IRQ-safe**: All operations use spinlocks, safe from interrupt context
 
 use crate::{kwarn, kerror, kinfo};
-use super::task::{self, TaskState, SleepReason, WaitReason, Priority, current_slot, set_current_slot};
+use super::task::{self, TaskState, Priority, current_slot, set_current_slot};
 use super::task::{update_current_task_globals, SYSCALL_SWITCHED_TASK};
 use core::sync::atomic::Ordering;
 
@@ -74,9 +103,9 @@ pub fn reschedule() -> bool {
 
         // Mark current task as Ready if it was Running
         // (Unless it's Blocked or Terminated, which should stay as-is)
-        if let Some(ref mut current) = sched.tasks[caller_slot] {
-            if current.state == TaskState::Running {
-                current.state = TaskState::Ready;
+        if let Some(current) = sched.task_mut(caller_slot) {
+            if *current.state() == TaskState::Running {
+                let _ = current.set_ready();
             }
         }
 
@@ -85,10 +114,9 @@ pub fn reschedule() -> bool {
             if next_slot != caller_slot {
                 // Switch to different task
                 set_current_slot(next_slot);
-                sched.current = next_slot;
 
-                if let Some(ref mut next) = sched.tasks[next_slot] {
-                    next.state = TaskState::Running;
+                if let Some(next) = sched.task_mut(next_slot) {
+                    let _ = next.set_running();
                 }
 
                 update_current_task_globals();
@@ -97,8 +125,8 @@ pub fn reschedule() -> bool {
                 return true;
             } else {
                 // Same task continues
-                if let Some(ref mut current) = sched.tasks[caller_slot] {
-                    current.state = TaskState::Running;
+                if let Some(current) = sched.task_mut(caller_slot) {
+                    let _ = current.set_running();
                 }
                 return false;
             }
@@ -147,7 +175,7 @@ pub fn sleep_current(reason: task::SleepReason) -> bool {
         let sched = task::scheduler();
         let slot = current_slot();
 
-        if let Some(ref mut task) = sched.tasks[slot] {
+        if let Some(task) = sched.task_mut(slot) {
             // Don't block the idle task!
             if slot == IDLE_SLOT {
                 kerror!("sched", "block_idle_attempt");
@@ -155,8 +183,8 @@ pub fn sleep_current(reason: task::SleepReason) -> bool {
             }
 
             // Use state machine for validated transition
-            if task.state.sleep(reason).is_err() {
-                kerror!("sched", "invalid_sleep_transition"; from = task.state.name());
+            if task.set_sleeping(reason).is_err() {
+                kerror!("sched", "invalid_sleep_transition"; from = task.state().name());
                 return false;
             }
             return true;
@@ -182,15 +210,15 @@ pub fn wait_current(reason: task::WaitReason, deadline: u64) -> bool {
         let sched = task::scheduler();
         let slot = current_slot();
 
-        if let Some(ref mut task) = sched.tasks[slot] {
+        if let Some(task) = sched.task_mut(slot) {
             if slot == IDLE_SLOT {
                 kerror!("sched", "block_idle_attempt");
                 return false;
             }
 
             // Use state machine for validated transition
-            if task.state.wait(reason, deadline).is_err() {
-                kerror!("sched", "invalid_wait_transition"; from = task.state.name());
+            if task.set_waiting(reason, deadline).is_err() {
+                kerror!("sched", "invalid_wait_transition"; from = task.state().name());
                 return false;
             }
             // Notify scheduler of deadline for tickless optimization
@@ -218,10 +246,10 @@ pub fn yield_current() -> bool {
         let sched = task::scheduler();
         let slot = current_slot();
 
-        if let Some(ref mut task) = sched.tasks[slot] {
+        if let Some(task) = sched.task_mut(slot) {
             // Only change Running → Ready, don't touch Blocked!
-            if task.state == TaskState::Running {
-                task.state = TaskState::Ready;
+            if *task.state() == TaskState::Running {
+                let _ = task.set_ready();
             }
             // If task is Blocked, it stays Blocked - this is intentional!
         }
@@ -239,8 +267,8 @@ pub fn is_current_blocked() -> bool {
         let sched = task::scheduler();
         let slot = current_slot();
 
-        if let Some(ref task) = sched.tasks[slot] {
-            return task.state.is_blocked();
+        if let Some(task) = sched.task(slot) {
+            return task.is_blocked();
         }
     }
     false
@@ -265,14 +293,7 @@ pub fn run_idle() -> ! {
         // Check if there's a ready task before WFI
         let has_ready = unsafe {
             let sched = task::scheduler();
-            sched.tasks.iter().enumerate().any(|(i, slot)| {
-                if i == IDLE_SLOT { return false; }  // Skip idle itself
-                if let Some(ref task) = slot {
-                    task.state == TaskState::Ready
-                } else {
-                    false
-                }
-            })
+            sched.has_ready_task_besides(IDLE_SLOT)
         };
 
         if has_ready {
@@ -313,7 +334,7 @@ pub fn init_idle_task() -> bool {
         // We don't use new_kernel because idle doesn't need a real stack
         // for context switching (it never blocks or switches normally)
 
-        if sched.tasks[IDLE_SLOT].is_some() {
+        if sched.slot_occupied(IDLE_SLOT) {
             return true;
         }
 
@@ -374,8 +395,8 @@ pub fn dump_state() {
         let sched = task::scheduler();
 
         crate::kdebug!("sched", "dump_start");
-        for (i, slot) in sched.tasks.iter().enumerate() {
-            if let Some(ref task) = slot {
+        for (i, task_opt) in sched.iter_tasks() {
+            if let Some(task) = task_opt {
                 crate::kdebug!("sched", "task"; slot = i as u64, pid = task.id as u64, name = task.name_str());
             }
         }

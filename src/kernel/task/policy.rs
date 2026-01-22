@@ -115,7 +115,7 @@ impl SchedulingPolicy for PriorityRoundRobin {
             }
 
             if let Some(ref task) = tasks[slot] {
-                if task.state == TaskState::Ready {
+                if *task.state() == TaskState::Ready {
                     // Lower priority value = higher priority
                     if best_slot.is_none() || task.priority < best_priority {
                         best_slot = Some(slot);
@@ -137,14 +137,14 @@ impl SchedulingPolicy for PriorityRoundRobin {
 
         // Check if current task is still runnable (it might be Running, not Ready)
         if let Some(ref task) = tasks[current_slot] {
-            if task.state == TaskState::Running || task.state == TaskState::Ready {
+            if task.is_runnable() {
                 return Some(current_slot);
             }
         }
 
         // Fall back to idle task if nothing else
         if let Some(ref task) = tasks[self.idle_slot] {
-            if task.state == TaskState::Ready || task.state == TaskState::Running {
+            if task.is_runnable() {
                 return Some(self.idle_slot);
             }
         }

@@ -120,7 +120,7 @@ pub(super) fn sys_shmem_wait(shmem_id: u32, timeout_ms: u32) -> i64 {
             // When woken by notify, task will resume and see 0
             unsafe {
                 let sched = task::scheduler();
-                if let Some(ref mut task) = sched.tasks[sched.current] {
+                if let Some(task) = sched.current_task_mut() {
                     task.trap_frame.x0 = 0;
                 }
             }

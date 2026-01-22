@@ -1,35 +1,98 @@
 //! Unified Object System
 //!
-//! Everything is a handle. Five syscalls:
-//! - open(type, params) → handle
-//! - read(handle, buf) → bytes
-//! - write(handle, buf) → bytes
-//! - map(handle) → vaddr
-//! - close(handle)
+//! The kernel's unified interface for all resources. Everything is accessed
+//! through handles using just 5 syscalls.
 //!
-//! # Design Principles
+//! # Syscall Interface
 //!
-//! 1. **Trait-based contracts**: All pollable objects implement `Pollable`
-//! 2. **State machines**: Objects have explicit states with valid transitions
-//! 3. **Functional style**: Minimize mutation, prefer pure functions
-//! 4. **Testability**: Traits allow mocking and unit testing
+//! | Syscall | Number | Purpose |
+//! |---------|--------|---------|
+//! | `open`  | 100 | Create or open an object → handle |
+//! | `read`  | 101 | Read from object (recv, accept, poll) |
+//! | `write` | 102 | Write to object (send, arm timer, add watch) |
+//! | `map`   | 103 | Map object to memory address |
+//! | `close` | 104 | Close handle, release resources |
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────┐
+//! │                    Userspace                                    │
+//! │    open(Channel, ...)  read(h)  write(h, msg)  close(h)        │
+//! └────────────────────────────────┬───────────────────────────────┘
+//!                                  │ syscall
+//! ┌────────────────────────────────▼───────────────────────────────┐
+//! │                    object/syscall.rs                           │
+//! │    sys_open()  sys_read()  sys_write()  sys_map()  sys_close() │
+//! └────────────────────────────────┬───────────────────────────────┘
+//!                                  │
+//! ┌────────────────────────────────▼───────────────────────────────┐
+//! │                    Object enum + HandleTable                    │
+//! │  Channel │ Timer │ Port │ Process │ Shmem │ Mux │ Console │... │
+//! └────────────────────────────────────────────────────────────────┘
+//! ```
 //!
 //! # Object Types
 //!
 //! | Type | open() | read() | write() | map() |
 //! |------|--------|--------|---------|-------|
-//! | Channel | create pair | recv msg | send msg | ✗ |
-//! | Timer | create | wait for tick | set deadline | ✗ |
-//! | Process | spawn binary | wait for exit → code | kill? | ✗ |
-//! | Port | register name | accept → new handle | ✗ | ✗ |
-//! | Shmem | create region | notify signal | signal peer | ✓ |
-//! | DmaPool | allocate | ✗ | ✗ | ✓ |
-//! | Mmio | request region | ✗ | ✗ | ✓ |
-//! | Console | get stdin/out | read input | write output | ✗ |
-//! | Klog | create | read log lines | ✗ | ✗ |
-//! | Mux | create | wait → (handle, event) | add/remove watch | ✗ |
+//! | **Channel** | create pair | recv msg | send msg | - |
+//! | **Timer** | create | wait for tick | set deadline | - |
+//! | **Process** | spawn binary | wait for exit | kill | - |
+//! | **Port** | register name | accept connection | - | - |
+//! | **Shmem** | create region | - | - | ✓ |
+//! | **DmaPool** | allocate | - | - | ✓ |
+//! | **Mmio** | request region | - | - | ✓ |
+//! | **Console** | get stdin/out | read input | write output | - |
+//! | **Klog** | create | read log lines | - | - |
+//! | **Mux** | create | wait for events | add/remove watch | - |
+//!
+//! # Public API
+//!
+//! ## Types
+//! - [`Object`] - Enum of all kernel object types
+//! - [`ObjectType`] - Type discriminator (from abi crate)
+//! - [`Handle`] / [`HandleTable`] - Per-task handle allocation
+//! - [`Pollable`] - Trait for objects that support polling
+//! - [`PollResult`] - Result of polling (ready flags + data)
+//!
+//! ## Object State Machines
+//! - [`ChannelState`] - Open → HalfClosed → Closed
+//! - [`PortState`] - Listening → Closed
+//! - [`TimerState`] - Disarmed → Armed → Fired
+//!
+//! ## Syscall Handlers (in [`syscall`] submodule)
+//! - `sys_open()` - Create objects
+//! - `sys_read()` - Read/receive/accept/poll
+//! - `sys_write()` - Write/send/arm/configure
+//! - `sys_map()` - Map to memory
+//! - `sys_close()` - Close and cleanup
+//!
+//! # Design Principles
+//!
+//! 1. **Trait-based contracts** - All pollable objects implement [`Pollable`]
+//! 2. **State machines** - Objects have explicit states with validated transitions
+//! 3. **Encapsulation** - Object fields are private, accessed via methods
+//! 4. **Testability** - Traits allow mocking for unit tests
+//!
+//! # Example
+//!
+//! ```ignore
+//! // Userspace creates a timer
+//! let h = syscall::open(ObjectType::Timer, &[])?;
+//!
+//! // Arm the timer (1 second from now)
+//! let deadline = syscall::gettime() + 1_000_000_000;
+//! syscall::write(h, &deadline.to_le_bytes())?;
+//!
+//! // Wait for timer
+//! let mut buf = [0u8; 8];
+//! syscall::read(h, &mut buf)?;  // Blocks until timer fires
+//!
+//! // Cleanup
+//! syscall::close(h)?;
+//! ```
 
-use crate::kernel::ipc::waker::SubscriberSet;
 use crate::kernel::ipc::traits::Subscriber;
 use crate::kernel::task::TaskId;
 
@@ -169,14 +232,26 @@ impl ChannelState {
 /// IPC channel - bidirectional message passing
 pub struct ChannelObject {
     /// Channel ID in ipc backend (our end)
-    pub channel_id: u32,
+    channel_id: u32,
     /// Current state
-    pub state: ChannelState,
+    state: ChannelState,
     /// Subscriber for wake
-    pub subscriber: Option<Subscriber>,
+    subscriber: Option<Subscriber>,
 }
 
 impl ChannelObject {
+    /// Get the channel ID
+    pub fn channel_id(&self) -> u32 { self.channel_id }
+    /// Get the current state
+    pub fn state(&self) -> ChannelState { self.state }
+    /// Check if channel has a subscriber
+    pub fn has_subscriber(&self) -> bool { self.subscriber.is_some() }
+    /// Get subscriber (for waking)
+    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+}
+
+impl ChannelObject {
+    /// Create a new channel object
     pub fn new(channel_id: u32) -> Self {
         Self {
             channel_id,
@@ -193,6 +268,11 @@ impl ChannelObject {
         } else {
             false
         }
+    }
+
+    /// Set subscriber (internal use)
+    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
+        self.subscriber = sub;
     }
 }
 
@@ -224,13 +304,13 @@ impl Pollable for ChannelObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.subscriber = Some(subscriber);
+        self.set_subscriber(Some(subscriber));
         // Also register with ipc backend
         let _ = crate::kernel::ipc::subscribe(self.channel_id, subscriber.task_id, subscriber, crate::kernel::ipc::WakeReason::Readable);
     }
 
     fn unsubscribe(&mut self) {
-        self.subscriber = None;
+        self.set_subscriber(None);
     }
 }
 
@@ -252,13 +332,13 @@ pub enum TimerState {
 /// Timer - write to set, read to wait
 pub struct TimerObject {
     /// Current state
-    pub state: TimerState,
+    state: TimerState,
     /// Deadline tick (0 = disarmed)
-    pub deadline: u64,
+    deadline: u64,
     /// Interval for recurring (0 = one-shot)
-    pub interval: u64,
+    interval: u64,
     /// Subscriber to wake
-    pub subscriber: Option<Subscriber>,
+    subscriber: Option<Subscriber>,
 }
 
 impl TimerObject {
@@ -270,6 +350,15 @@ impl TimerObject {
             subscriber: None,
         }
     }
+
+    /// Get the current state
+    pub fn state(&self) -> TimerState { self.state }
+    /// Get the deadline tick
+    pub fn deadline(&self) -> u64 { self.deadline }
+    /// Get the interval
+    pub fn interval(&self) -> u64 { self.interval }
+    /// Get subscriber (for waking)
+    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
 
     /// Arm the timer with deadline and optional interval
     pub fn arm(&mut self, deadline: u64, interval: u64) {
@@ -283,6 +372,21 @@ impl TimerObject {
         self.deadline = 0;
         self.interval = 0;
         self.state = TimerState::Disarmed;
+    }
+
+    /// Set deadline directly (for syscall handler)
+    pub(crate) fn set_deadline(&mut self, deadline: u64) {
+        self.deadline = deadline;
+    }
+
+    /// Set interval directly (for syscall handler)
+    pub(crate) fn set_interval(&mut self, interval: u64) {
+        self.interval = interval;
+    }
+
+    /// Set state directly (for syscall handler)
+    pub(crate) fn set_state(&mut self, state: TimerState) {
+        self.state = state;
     }
 
     /// Check and update state based on current tick
@@ -308,6 +412,11 @@ impl TimerObject {
             }
         }
     }
+
+    /// Set subscriber (internal use)
+    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
+        self.subscriber = sub;
+    }
 }
 
 impl Pollable for TimerObject {
@@ -317,21 +426,21 @@ impl Pollable for TimerObject {
         }
 
         let current_tick = crate::platform::mt7988::timer::ticks();
-        if self.state == TimerState::Armed && current_tick >= self.deadline {
+        if self.state() == TimerState::Armed && current_tick >= self.deadline() {
             PollResult { ready: poll::READABLE, data: current_tick }
-        } else if self.state == TimerState::Fired {
-            PollResult { ready: poll::READABLE, data: self.deadline }
+        } else if self.state() == TimerState::Fired {
+            PollResult { ready: poll::READABLE, data: self.deadline() }
         } else {
             PollResult::NONE
         }
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.subscriber = Some(subscriber);
+        self.set_subscriber(Some(subscriber));
     }
 
     fn unsubscribe(&mut self) {
-        self.subscriber = None;
+        self.set_subscriber(None);
     }
 }
 
@@ -342,14 +451,40 @@ impl Pollable for TimerObject {
 /// Child process handle
 pub struct ProcessObject {
     /// Child PID
-    pub pid: TaskId,
+    pid: TaskId,
     /// Exit code (Some when exited)
-    pub exit_code: Option<i32>,
+    exit_code: Option<i32>,
     /// Subscriber to wake on exit
-    pub subscriber: Option<Subscriber>,
+    subscriber: Option<Subscriber>,
 }
 
 impl ProcessObject {
+    /// Create a new process object
+    pub fn new(pid: TaskId) -> Self {
+        Self {
+            pid,
+            exit_code: None,
+            subscriber: None,
+        }
+    }
+
+    /// Get the process ID
+    pub fn pid(&self) -> TaskId { self.pid }
+    /// Get the exit code (if exited)
+    pub fn exit_code(&self) -> Option<i32> { self.exit_code }
+    /// Get subscriber (for waking)
+    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+
+    /// Set exit code (internal use)
+    pub(crate) fn set_exit_code(&mut self, code: Option<i32>) {
+        self.exit_code = code;
+    }
+
+    /// Set subscriber (internal use)
+    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
+        self.subscriber = sub;
+    }
+
     /// Lazy check if target process has exited
     /// Updates exit_code cache if target has exited
     pub fn check_exit(&mut self) {
@@ -361,8 +496,8 @@ impl ProcessObject {
         let code = unsafe {
             let sched = task::scheduler();
             if let Some(target_slot) = sched.slot_by_pid(self.pid) {
-                if let Some(ref target) = sched.tasks[target_slot] {
-                    target.state.exit_code()
+                if let Some(target) = sched.task(target_slot) {
+                    target.state().exit_code()
                 } else {
                     Some(-1)
                 }
@@ -382,7 +517,7 @@ impl Pollable for ProcessObject {
         }
 
         // Check cached exit code first
-        if self.exit_code.is_some() {
+        if self.exit_code().is_some() {
             return PollResult::readable();
         }
 
@@ -391,9 +526,9 @@ impl Pollable for ProcessObject {
         use crate::kernel::task;
         let has_exited = unsafe {
             let sched = task::scheduler();
-            if let Some(target_slot) = sched.slot_by_pid(self.pid) {
-                if let Some(ref target) = sched.tasks[target_slot] {
-                    target.state.exit_code().is_some()
+            if let Some(target_slot) = sched.slot_by_pid(self.pid()) {
+                if let Some(target) = sched.task(target_slot) {
+                    target.state().exit_code().is_some()
                 } else {
                     true // No task in slot
                 }
@@ -410,12 +545,48 @@ impl Pollable for ProcessObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.subscriber = Some(subscriber);
+        self.set_subscriber(Some(subscriber));
     }
 
     fn unsubscribe(&mut self) {
-        self.subscriber = None;
+        self.set_subscriber(None);
     }
+}
+
+// ============================================================================
+// Child Exit Notification
+// ============================================================================
+
+/// Notify all ProcessObject handles in a task's object_table about a child exit.
+///
+/// Called by task lifecycle code when a child process exits.
+/// Iterates the parent's object_table looking for ProcessObject handles
+/// watching the exited child and updates their exit code.
+///
+/// Returns a list of subscribers to wake.
+pub fn notify_child_exit(
+    object_table: &mut HandleTable,
+    child_pid: TaskId,
+    exit_code: i32,
+) -> crate::kernel::ipc::waker::WakeList {
+    let mut wake_list = crate::kernel::ipc::waker::WakeList::new();
+
+    for entry in object_table.entries_mut() {
+        if let Object::Process(ref mut proc_obj) = entry.object {
+            // Check if this ProcessObject is watching the exited child
+            if proc_obj.pid() == child_pid {
+                // Update the cached exit code
+                proc_obj.set_exit_code(Some(exit_code));
+
+                // Add subscriber to wake list (if any)
+                if let Some(sub) = proc_obj.subscriber() {
+                    wake_list.push(sub);
+                }
+            }
+        }
+    }
+
+    wake_list
 }
 
 // ============================================================================
@@ -434,14 +605,14 @@ pub enum PortState {
 /// Named port for accepting connections
 pub struct PortObject {
     /// Port ID in ipc backend
-    pub port_id: u32,
+    port_id: u32,
     /// Port state
-    pub state: PortState,
+    state: PortState,
     /// Port name
-    pub name: [u8; 32],
-    pub name_len: u8,
+    name: [u8; 32],
+    name_len: u8,
     /// Subscriber to wake on connection
-    pub subscriber: Option<Subscriber>,
+    subscriber: Option<Subscriber>,
 }
 
 impl PortObject {
@@ -457,16 +628,35 @@ impl PortObject {
         obj.name[..len].copy_from_slice(&name[..len]);
         obj
     }
+
+    /// Get the port ID
+    pub fn port_id(&self) -> u32 { self.port_id }
+    /// Get the current state
+    pub fn state(&self) -> PortState { self.state }
+    /// Get the port name
+    pub fn name(&self) -> &[u8] { &self.name[..self.name_len as usize] }
+    /// Get subscriber (for waking)
+    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+
+    /// Set state (internal use)
+    pub(crate) fn set_state(&mut self, state: PortState) {
+        self.state = state;
+    }
+
+    /// Set subscriber (internal use)
+    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
+        self.subscriber = sub;
+    }
 }
 
 impl Pollable for PortObject {
     fn poll(&self, filter: u8) -> PollResult {
-        match self.state {
+        match self.state() {
             PortState::Closed => PollResult::closed(),
             PortState::Listening => {
                 if (filter & poll::READABLE) != 0 {
                     // Check ipc for pending connections
-                    if crate::kernel::ipc::port_has_pending(self.port_id) {
+                    if crate::kernel::ipc::port_has_pending(self.port_id()) {
                         PollResult::readable()
                     } else {
                         PollResult::NONE
@@ -479,11 +669,11 @@ impl Pollable for PortObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.subscriber = Some(subscriber);
+        self.set_subscriber(Some(subscriber));
     }
 
     fn unsubscribe(&mut self) {
-        self.subscriber = None;
+        self.set_subscriber(None);
     }
 }
 
@@ -493,34 +683,69 @@ impl Pollable for PortObject {
 
 /// Shared memory region
 pub struct ShmemObject {
+    /// Region ID in shmem table (for cleanup and notifications)
+    shmem_id: u32,
     /// Physical address
-    pub paddr: u64,
+    paddr: u64,
     /// Size in bytes
-    pub size: usize,
+    size: usize,
     /// Mapped virtual address (per-task, 0 = not mapped)
-    pub vaddr: u64,
+    vaddr: u64,
     /// Peer notification (for signaling)
-    pub peer_subscriber: Option<Subscriber>,
+    peer_subscriber: Option<Subscriber>,
+}
+
+impl ShmemObject {
+    pub fn new(shmem_id: u32, paddr: u64, size: usize, vaddr: u64) -> Self {
+        Self { shmem_id, paddr, size, vaddr, peer_subscriber: None }
+    }
+    pub fn shmem_id(&self) -> u32 { self.shmem_id }
+    pub fn paddr(&self) -> u64 { self.paddr }
+    pub fn size(&self) -> usize { self.size }
+    pub fn vaddr(&self) -> u64 { self.vaddr }
+    pub fn peer_subscriber(&self) -> Option<Subscriber> { self.peer_subscriber }
+    pub(crate) fn set_vaddr(&mut self, vaddr: u64) { self.vaddr = vaddr; }
+    pub(crate) fn set_peer_subscriber(&mut self, sub: Option<Subscriber>) { self.peer_subscriber = sub; }
 }
 
 /// DMA pool
 pub struct DmaPoolObject {
     /// Physical address
-    pub paddr: u64,
+    paddr: u64,
     /// Size in bytes
-    pub size: usize,
+    size: usize,
     /// Mapped virtual address
-    pub vaddr: u64,
+    vaddr: u64,
+}
+
+impl DmaPoolObject {
+    pub fn new(paddr: u64, size: usize, vaddr: u64) -> Self {
+        Self { paddr, size, vaddr }
+    }
+    pub fn paddr(&self) -> u64 { self.paddr }
+    pub fn size(&self) -> usize { self.size }
+    pub fn vaddr(&self) -> u64 { self.vaddr }
+    pub(crate) fn set_vaddr(&mut self, vaddr: u64) { self.vaddr = vaddr; }
 }
 
 /// MMIO region
 pub struct MmioObject {
     /// Physical address
-    pub paddr: u64,
+    paddr: u64,
     /// Size in bytes
-    pub size: usize,
+    size: usize,
     /// Mapped virtual address
-    pub vaddr: u64,
+    vaddr: u64,
+}
+
+impl MmioObject {
+    pub fn new(paddr: u64, size: usize, vaddr: u64) -> Self {
+        Self { paddr, size, vaddr }
+    }
+    pub fn paddr(&self) -> u64 { self.paddr }
+    pub fn size(&self) -> usize { self.size }
+    pub fn vaddr(&self) -> u64 { self.vaddr }
+    pub(crate) fn set_vaddr(&mut self, vaddr: u64) { self.vaddr = vaddr; }
 }
 
 // ============================================================================
@@ -535,8 +760,8 @@ pub enum ConsoleType {
 }
 
 pub struct ConsoleObject {
-    pub console_type: ConsoleType,
-    pub subscriber: Option<Subscriber>,
+    console_type: ConsoleType,
+    subscriber: Option<Subscriber>,
 }
 
 impl ConsoleObject {
@@ -546,13 +771,16 @@ impl ConsoleObject {
             subscriber: None,
         }
     }
+    pub fn console_type(&self) -> ConsoleType { self.console_type }
+    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) { self.subscriber = sub; }
 }
 
 impl Pollable for ConsoleObject {
     fn poll(&self, filter: u8) -> PollResult {
         use crate::platform::mt7988::uart;
 
-        match self.console_type {
+        match self.console_type() {
             ConsoleType::Stdin => {
                 if (filter & poll::READABLE) != 0 && uart::rx_buffer_has_data() {
                     PollResult::readable()
@@ -572,16 +800,18 @@ impl Pollable for ConsoleObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.subscriber = Some(subscriber);
+        let is_stdin = self.console_type() == ConsoleType::Stdin;
+        self.set_subscriber(Some(subscriber));
         // For stdin, register with UART for input notification
-        if self.console_type == ConsoleType::Stdin {
+        if is_stdin {
             crate::platform::mt7988::uart::block_for_input(subscriber.task_id);
         }
     }
 
     fn unsubscribe(&mut self) {
-        self.subscriber = None;
-        if self.console_type == ConsoleType::Stdin {
+        let is_stdin = self.console_type() == ConsoleType::Stdin;
+        self.set_subscriber(None);
+        if is_stdin {
             crate::platform::mt7988::uart::clear_blocked();
         }
     }
@@ -593,8 +823,18 @@ impl Pollable for ConsoleObject {
 
 pub struct KlogObject {
     /// Read position in kernel log buffer
-    pub read_pos: usize,
-    pub subscriber: Option<Subscriber>,
+    read_pos: usize,
+    subscriber: Option<Subscriber>,
+}
+
+impl KlogObject {
+    pub fn new() -> Self {
+        Self { read_pos: 0, subscriber: None }
+    }
+    pub fn read_pos(&self) -> usize { self.read_pos }
+    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+    pub(crate) fn set_read_pos(&mut self, pos: usize) { self.read_pos = pos; }
+    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) { self.subscriber = sub; }
 }
 
 // ============================================================================
@@ -604,18 +844,37 @@ pub struct KlogObject {
 /// Watch entry for multiplexer
 #[derive(Clone, Copy)]
 pub struct MuxWatch {
-    pub handle: u32,
-    pub filter: u8,  // READABLE, WRITABLE, CLOSED, etc.
+    handle: u32,
+    filter: u8,  // READABLE, WRITABLE, CLOSED, etc.
 }
 
-// Re-export MuxEvent and MuxFilter from abi crate - single source of truth
-pub use abi::{MuxEvent, MuxFilter};
+impl MuxWatch {
+    pub fn new(handle: u32, filter: u8) -> Self {
+        Self { handle, filter }
+    }
+    pub fn handle(&self) -> u32 { self.handle }
+    pub fn filter(&self) -> u8 { self.filter }
+    pub(crate) fn set_filter(&mut self, filter: u8) { self.filter = filter; }
+}
+
+// Re-export MuxEvent from abi crate - single source of truth
+pub use abi::MuxEvent;
 
 pub struct MuxObject {
     /// Watched handles
-    pub watches: [Option<MuxWatch>; 16],
+    watches: [Option<MuxWatch>; 16],
     /// Subscriber to wake
-    pub subscriber: Option<Subscriber>,
+    subscriber: Option<Subscriber>,
+}
+
+impl MuxObject {
+    pub fn new() -> Self {
+        Self { watches: [None; 16], subscriber: None }
+    }
+    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+    pub fn watches(&self) -> &[Option<MuxWatch>; 16] { &self.watches }
+    pub fn watches_mut(&mut self) -> &mut [Option<MuxWatch>; 16] { &mut self.watches }
+    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) { self.subscriber = sub; }
 }
 
 // ============================================================================
@@ -624,7 +883,14 @@ pub struct MuxObject {
 
 pub struct PciBusObject {
     /// BDF filter (0 = all devices)
-    pub bdf_filter: u32,
+    bdf_filter: u32,
+}
+
+impl PciBusObject {
+    pub fn new(bdf_filter: u32) -> Self {
+        Self { bdf_filter }
+    }
+    pub fn bdf_filter(&self) -> u32 { self.bdf_filter }
 }
 
 // ============================================================================
@@ -734,5 +1000,181 @@ impl Default for ConsoleObject {
             console_type: ConsoleType::Stdin,
             subscriber: None,
         }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Timer tests
+    #[test]
+    fn test_timer_new() {
+        let timer = TimerObject::new();
+        assert_eq!(timer.state(), &TimerState::Disarmed);
+        assert_eq!(timer.deadline(), 0);
+        assert_eq!(timer.interval(), 0);
+    }
+
+    #[test]
+    fn test_timer_arm() {
+        let mut timer = TimerObject::new();
+        timer.arm(1000, 0);
+        assert_eq!(timer.state(), &TimerState::Armed);
+        assert_eq!(timer.deadline(), 1000);
+    }
+
+    #[test]
+    fn test_timer_arm_recurring() {
+        let mut timer = TimerObject::new();
+        timer.arm(1000, 100);
+        assert_eq!(timer.interval(), 100);
+    }
+
+    #[test]
+    fn test_timer_disarm() {
+        let mut timer = TimerObject::new();
+        timer.arm(1000, 0);
+        timer.disarm();
+        assert_eq!(timer.state(), &TimerState::Disarmed);
+    }
+
+    #[test]
+    fn test_timer_fire() {
+        let mut timer = TimerObject::new();
+        timer.arm(1000, 0);
+        timer.fire();
+        assert_eq!(timer.state(), &TimerState::Fired);
+    }
+
+    #[test]
+    fn test_timer_is_armed() {
+        let timer = TimerObject::new();
+        assert!(!timer.is_armed());
+
+        let mut timer = TimerObject::new();
+        timer.arm(1000, 0);
+        assert!(timer.is_armed());
+    }
+
+    // Channel state tests
+    #[test]
+    fn test_channel_state_open() {
+        assert!(ChannelState::Open.is_open());
+        assert!(!ChannelState::Closed.is_open());
+    }
+
+    #[test]
+    fn test_channel_state_closed() {
+        assert!(ChannelState::Closed.is_closed());
+        assert!(!ChannelState::Open.is_closed());
+    }
+
+    // Port state tests
+    #[test]
+    fn test_port_state_listening() {
+        assert!(PortState::Listening.is_listening());
+        assert!(!PortState::Closed.is_listening());
+    }
+
+    // ProcessObject tests
+    #[test]
+    fn test_process_object_new() {
+        let proc = ProcessObject::new(42);
+        assert_eq!(proc.pid(), 42);
+        assert!(proc.exit_code().is_none());
+    }
+
+    #[test]
+    fn test_process_object_set_exit_code() {
+        let mut proc = ProcessObject::new(42);
+        proc.set_exit_code(Some(0));
+        assert_eq!(proc.exit_code(), Some(0));
+    }
+
+    // ShmemObject tests
+    #[test]
+    fn test_shmem_object_new() {
+        let shmem = ShmemObject::new(1, 0x8000_0000, 4096, 0x1000_0000);
+        assert_eq!(shmem.shmem_id(), 1);
+        assert_eq!(shmem.paddr(), 0x8000_0000);
+        assert_eq!(shmem.size(), 4096);
+        assert_eq!(shmem.vaddr(), 0x1000_0000);
+    }
+
+    // DmaPoolObject tests
+    #[test]
+    fn test_dma_pool_object_new() {
+        let dma = DmaPoolObject::new(0x4000_0000, 4096, 0x2000_0000);
+        assert_eq!(dma.paddr(), 0x4000_0000);
+        assert_eq!(dma.size(), 4096);
+        assert_eq!(dma.vaddr(), 0x2000_0000);
+    }
+
+    // MmioObject tests
+    #[test]
+    fn test_mmio_object_new() {
+        let mmio = MmioObject::new(0x1000_0000, 0x1000, 0x3000_0000);
+        assert_eq!(mmio.paddr(), 0x1000_0000);
+        assert_eq!(mmio.size(), 0x1000);
+        assert_eq!(mmio.vaddr(), 0x3000_0000);
+    }
+
+    // KlogObject tests
+    #[test]
+    fn test_klog_object_new() {
+        let klog = KlogObject::new();
+        assert_eq!(klog.read_pos(), 0);
+    }
+
+    #[test]
+    fn test_klog_object_set_read_pos() {
+        let mut klog = KlogObject::new();
+        klog.set_read_pos(100);
+        assert_eq!(klog.read_pos(), 100);
+    }
+
+    // PciBusObject tests
+    #[test]
+    fn test_pci_bus_object_new() {
+        let pci = PciBusObject::new(0);
+        assert_eq!(pci.bdf_filter(), 0);
+
+        let pci = PciBusObject::new(0x0100); // Bus 1
+        assert_eq!(pci.bdf_filter(), 0x0100);
+    }
+
+    // ObjectType tests
+    #[test]
+    fn test_object_type_from_u32() {
+        assert_eq!(ObjectType::from_u32(1), Some(ObjectType::Channel));
+        assert_eq!(ObjectType::from_u32(2), Some(ObjectType::Timer));
+        assert_eq!(ObjectType::from_u32(99), None);
+    }
+
+    // MuxObject tests
+    #[test]
+    fn test_mux_object_default() {
+        let mux = MuxObject::default();
+        assert!(mux.subscriber().is_none());
+    }
+
+    // Subscriber tests
+    #[test]
+    fn test_subscriber_new() {
+        let sub = Subscriber::new(123, 5);
+        assert_eq!(sub.task_id, 123);
+        assert_eq!(sub.generation, 5);
+    }
+
+    // ConsoleType tests
+    #[test]
+    fn test_console_type() {
+        let console = ConsoleObject { console_type: ConsoleType::Stdout, subscriber: None };
+        assert_eq!(console.console_type, ConsoleType::Stdout);
     }
 }

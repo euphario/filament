@@ -37,7 +37,7 @@
 //! - Add waiting channel and liveness status to ps output
 
 use super::ipc::{Message, MessageHeader, MessageType, MAX_INLINE_PAYLOAD, waker, WakeReason};
-use super::task::{TaskState, SleepReason, WaitReason};
+use super::task::SleepReason;
 
 /// How often to check liveness (in ticks, ~100 ticks/sec)
 pub const LIVENESS_CHECK_INTERVAL: u64 = 100; // Every ~1 second
@@ -196,10 +196,10 @@ pub fn check_liveness(current_tick: u64) -> usize {
         let mut waiting_count = 0u64;
 
         // Log all blocked tasks and their wait state
-        for slot in 0..super::task::MAX_TASKS {
-            if let Some(ref task) = sched.tasks[slot] {
-                if task.state.is_blocked() {
-                    if task.state.is_sleeping() {
+        for (slot, task_opt) in sched.iter_tasks() {
+            if let Some(task) = task_opt {
+                if task.is_blocked() {
+                    if task.state().is_sleeping() {
                         sleeping_count += 1;
                     } else {
                         waiting_count += 1;
@@ -211,7 +211,8 @@ pub fn check_liveness(current_tick: u64) -> usize {
                         LivenessState::ClosePending { .. } => 2,
                     };
                     // 0=unknown, 1=sleeping, 2=waiting
-                    let wait_type = if task.state.is_sleeping() { 1 } else { 2 };
+                    let wait_type = if task.state().is_sleeping() { 1 } else { 2 };
+                    let _ = slot; // suppress unused variable warning
                     crate::kdebug!("live", "task"; pid = task.id as u64, wait = wait_type as u64, idle = idle_ticks, state = live_state as u64);
                 }
             }
@@ -222,28 +223,28 @@ pub fn check_liveness(current_tick: u64) -> usize {
             crate::kinfo!("liveness", "check"; tick = current_tick, sleeping = sleeping_count, waiting = waiting_count);
         }
 
-        for slot in 0..super::task::MAX_TASKS {
-            if let Some(ref mut task) = sched.tasks[slot] {
+        for (_slot, task_opt) in sched.iter_tasks_mut() {
+            if let Some(task) = task_opt {
                 // Reset liveness state for non-blocked tasks
-                if !task.state.is_blocked() {
+                if !task.is_blocked() {
                     task.liveness_state.reset(task.id);
                     continue;
                 }
 
                 // WAITING tasks have deadlines - no probing needed
                 // Scheduler's check_timeouts handles deadline enforcement
-                if task.state.is_waiting() {
+                if task.state().is_waiting() {
                     // Just reset liveness - deadline is the enforcement
                     task.liveness_state.reset(task.id);
                     continue;
                 }
 
                 // Only probe SLEEPING tasks (event loop processes)
-                if !task.state.is_sleeping() {
+                if !task.state().is_sleeping() {
                     continue;
                 }
 
-                let sleep_reason = task.state.sleep_reason();
+                let sleep_reason = task.state().sleep_reason();
 
                 match task.liveness_state {
                     LivenessState::Normal => {
@@ -254,7 +255,7 @@ pub fn check_liveness(current_tick: u64) -> usize {
                             // Just wake the task - its next syscall proves it's alive
                             if matches!(sleep_reason, Some(SleepReason::EventLoop)) {
                                 // Wake the task - it will return 0 from handle_wait
-                                task.state = TaskState::Ready;
+                                let _ = task.wake();
                                 let new_state = LivenessState::PingSent {
                                     channel: 0, // No channel - implicit pong via syscall
                                     sent_at: current_tick,
@@ -320,7 +321,7 @@ pub fn check_liveness(current_tick: u64) -> usize {
                             crate::kerror!("live", "kill"; pid = pid as u64, init = is_init);
 
                             // Mark for termination (actual kill happens in scheduler)
-                            task.state = TaskState::Exiting { code: -9 }; // SIGKILL equivalent
+                            let _ = task.set_exiting(-9); // SIGKILL equivalent
                             // Reset liveness state (transition logging handled by reset())
                             task.liveness_state.reset(pid);
                             actions += 1;
@@ -348,11 +349,11 @@ pub fn check_liveness(current_tick: u64) -> usize {
         // Process collected notifications - notify parent tasks of child exits
         for i in 0..notify_count {
             if let Some(ref notif) = notifications[i] {
-                // Find parent task and notify via ChildExitObject handles
+                // Find parent task and notify via ProcessObject handles in object_table
                 if let Some(parent_slot) = sched.slot_by_pid(notif.parent_id) {
-                    if let Some(ref mut parent_task) = sched.tasks[parent_slot] {
-                        let wake_list = super::handle::child_exit::notify_child_exit_to_task(
-                            parent_task,
+                    if let Some(parent_task) = sched.task_mut(parent_slot) {
+                        let wake_list = super::object::notify_child_exit(
+                            &mut parent_task.object_table,
                             notif.child_pid,
                             notif.exit_code,
                         );

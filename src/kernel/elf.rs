@@ -519,8 +519,8 @@ fn spawn_from_elf_internal(
             let sched = task::scheduler();
             // First pass: find parent's capabilities
             let mut parent_caps = None;
-            for task_opt in sched.tasks.iter() {
-                if let Some(ref parent_task) = task_opt {
+            for (_slot, task_opt) in sched.iter_tasks() {
+                if let Some(parent_task) = task_opt {
                     if parent_task.id == parent_id {
                         parent_caps = Some(parent_task.capabilities);
                         break;
@@ -528,8 +528,8 @@ fn spawn_from_elf_internal(
                 }
             }
             // Second pass: add child to parent's children list
-            for task_opt in sched.tasks.iter_mut() {
-                if let Some(ref mut parent_task) = task_opt {
+            for (_slot, task_opt) in sched.iter_tasks_mut() {
+                if let Some(parent_task) = task_opt {
                     if parent_task.id == parent_id {
                         let _ = parent_task.add_child(task_id);
                         break;
@@ -538,7 +538,11 @@ fn spawn_from_elf_internal(
             }
             // Compute and apply child capabilities
             if let Some(p_caps) = parent_caps {
-                let child_task = sched.task_mut(slot).expect("just created");
+                // Note: slot was just allocated, so task_mut should always succeed
+                let Some(child_task) = sched.task_mut(slot) else {
+                    // Should never happen - task was just created
+                    return Err(ElfError::OutOfMemory);
+                };
                 let final_caps = match explicit_caps {
                     Some(requested) => {
                         // Explicit grant: use child_capabilities() for proper filtering

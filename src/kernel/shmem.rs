@@ -445,7 +445,7 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
     // Calculate deadline first, then set state, then notify scheduler
     let deadline_to_notify: Option<u64> = unsafe {
         let sched = super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task_mut() {
             // Set wake timeout if specified
             let timeout = if timeout_ms > 0 {
                 // Timer runs at 100 Hz (10ms per tick), so timeout_ms / 10 = ticks
@@ -458,15 +458,17 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
                 None // No timeout
             };
 
-            // Set state based on whether we have a timeout
-            task.state = match timeout {
-                Some(deadline) => super::task::TaskState::Waiting {
-                    reason: super::task::WaitReason::ShmemNotify { shmem_id },
-                    deadline,
-                },
-                None => super::task::TaskState::Sleeping {
-                    reason: super::task::SleepReason::EventLoop,
-                },
+            // Set state based on whether we have a timeout (via state machine)
+            match timeout {
+                Some(deadline) => {
+                    let _ = task.set_waiting(
+                        super::task::WaitReason::ShmemNotify { shmem_id },
+                        deadline,
+                    );
+                }
+                None => {
+                    let _ = task.set_sleeping(super::task::SleepReason::EventLoop);
+                }
             };
             timeout
         } else {
@@ -582,8 +584,8 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
 unsafe fn unmap_from_all_processes(phys_addr: u64, size: usize) {
     let sched = super::task::scheduler();
 
-    for task_opt in sched.tasks.iter_mut() {
-        if let Some(ref mut task) = task_opt {
+    for (_slot, task_opt) in sched.iter_tasks_mut() {
+        if let Some(task) = task_opt {
             // Search task's heap mappings for this physical address
             // First find the virtual address, then unmap (avoids borrow issues)
             let mut virt_to_unmap = None;
@@ -612,14 +614,12 @@ fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
         let sched = super::task::scheduler();
 
         // Find the task
-        for task_opt in sched.tasks.iter_mut() {
-            if let Some(ref mut task) = task_opt {
-                if task.id == pid {
-                    // Use mmap_shmem_dma: non-cacheable for DMA coherency,
-                    // but BorrowedShmem kind so pages are managed by shmem subsystem
-                    return task.mmap_shmem_dma(phys_addr, size)
-                        .ok_or(-12i64); // ENOMEM
-                }
+        if let Some(slot) = sched.slot_by_pid(pid) {
+            if let Some(task) = sched.task_mut(slot) {
+                // Use mmap_shmem_dma: non-cacheable for DMA coherency,
+                // but BorrowedShmem kind so pages are managed by shmem subsystem
+                return task.mmap_shmem_dma(phys_addr, size)
+                    .ok_or(-12i64); // ENOMEM
             }
         }
     }

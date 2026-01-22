@@ -599,7 +599,7 @@ pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
         let sched = super::task::scheduler();
         // Use generation-aware PID lookup to prevent TOCTOU
         if let Some(slot) = sched.slot_by_pid(target_pid) {
-            if let Some(ref mut task) = sched.tasks[slot] {
+            if let Some(task) = sched.task_mut(slot) {
                 // Check if task is subscribed to this event type
                 if task.event_queue.is_subscribed(&event) {
                     if task.event_queue.push(event) {
@@ -626,14 +626,14 @@ pub fn broadcast_event(event: Event) -> usize {
 
     unsafe {
         let sched = super::task::scheduler();
-        for slot in 0..super::task::MAX_TASKS {
-            if let Some(ref mut task) = sched.tasks[slot] {
+        for (_slot, task_opt) in sched.iter_tasks_mut() {
+            if let Some(task) = task_opt {
                 // Check if task is subscribed to this event type
                 if task.event_queue.is_subscribed(&event) {
                     if task.event_queue.push(event) {
                         // Wake task if blocked
-                        if task.state.is_blocked() {
-                            task.state = super::task::TaskState::Ready;
+                        if task.is_blocked() {
+                            let _ = task.wake();
                             // Reset liveness - task received event
                             task.liveness_state = super::liveness::LivenessState::Normal;
                         }
@@ -657,7 +657,7 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
     // First, check capabilities for privileged event types
     unsafe {
         let sched = super::task::scheduler();
-        if let Some(ref task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task() {
             // IRQ events require IRQ_CLAIM capability
             if event_type == 3 {
                 if !task.has_capability(super::caps::Capabilities::IRQ_CLAIM) {
@@ -682,7 +682,7 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
 
     unsafe {
         let sched = super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task_mut() {
             match task.event_queue.subscribe(ev_type, filter) {
                 Ok(()) => return 0,
                 Err(e) => return e,
@@ -708,7 +708,7 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
 
     unsafe {
         let sched = super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task_mut() {
             if task.event_queue.unsubscribe(ev_type, filter) {
                 return 0;
             }
@@ -726,7 +726,7 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
 pub fn sys_event_wait_internal(flags: u32) -> Option<Event> {
     unsafe {
         let sched = super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task_mut() {
             // Check task's event queue directly (no global system)
             if let Some(event) = task.event_queue.pop() {
                 return Some(event);
@@ -739,9 +739,7 @@ pub fn sys_event_wait_internal(flags: u32) -> Option<Event> {
             }
 
             // Would block - mark task as sleeping on event loop
-            task.state = super::task::TaskState::Sleeping {
-                reason: super::task::SleepReason::EventLoop,
-            };
+            let _ = task.set_sleeping(super::task::SleepReason::EventLoop);
         }
     }
     None
@@ -766,7 +764,7 @@ pub fn sys_event_post(target_pid: u32, event_type: u32, data: u64, caller_pid: u
     unsafe {
         let sched = super::task::scheduler();
         if let Some(slot) = sched.slot_by_pid(target_pid) {
-            if let Some(ref task) = sched.tasks[slot] {
+            if let Some(task) = sched.task(slot) {
                 if !task.can_receive_signal_from(caller_pid) {
                     super::security_log::log_signal_blocked(target_pid, caller_pid);
                     return -13; // EACCES - sender not in allowlist

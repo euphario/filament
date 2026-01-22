@@ -242,15 +242,13 @@ pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i6
         let sched = super::task::scheduler();
 
         // Find the task and map the memory
-        for task_opt in sched.tasks.iter_mut() {
-            if let Some(ref mut task) = task_opt {
-                if task.id == pid {
-                    // Use mmap_shmem_dma: device memory attributes for DMA coherency
-                    // BorrowedShmem kind means pages won't be freed when unmapped
-                    // (they're owned by the DMA pool)
-                    return task.mmap_shmem_dma(phys_addr, size)
-                        .ok_or(-12i64); // ENOMEM
-                }
+        if let Some(slot) = sched.slot_by_pid(pid) {
+            if let Some(task) = sched.task_mut(slot) {
+                // Use mmap_shmem_dma: device memory attributes for DMA coherency
+                // BorrowedShmem kind means pages won't be freed when unmapped
+                // (they're owned by the DMA pool)
+                return task.mmap_shmem_dma(phys_addr, size)
+                    .ok_or(-12i64); // ENOMEM
             }
         }
     }
@@ -269,13 +267,11 @@ pub fn map_into_process_high(pid: Pid, phys_addr: u64, size: usize) -> Result<u6
     unsafe {
         let sched = super::task::scheduler();
 
-        for task_opt in sched.tasks.iter_mut() {
-            if let Some(ref mut task) = task_opt {
-                if task.id == pid {
-                    // Use dma_high mapping - no kernel-side zeroing/flush
-                    return task.mmap_shmem_dma_high(phys_addr, size)
-                        .ok_or(-12i64);
-                }
+        if let Some(slot) = sched.slot_by_pid(pid) {
+            if let Some(task) = sched.task_mut(slot) {
+                // Use dma_high mapping - no kernel-side zeroing/flush
+                return task.mmap_shmem_dma_high(phys_addr, size)
+                    .ok_or(-12i64);
             }
         }
     }

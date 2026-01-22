@@ -34,7 +34,7 @@ fn require_capability(cap: Capabilities) -> Result<(), i64> {
 
     unsafe {
         let sched = super::super::task::scheduler();
-        if let Some(ref task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task() {
             if task.has_capability(cap) {
                 return Ok(());
             }
@@ -68,7 +68,7 @@ pub(super) fn sys_yield() -> i64 {
     // Pre-store return value in caller's trap frame
     unsafe {
         let sched = super::super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[caller_slot] {
+        if let Some(task) = sched.task_mut(caller_slot) {
             task.trap_frame.x0 = 0;
         }
     }
@@ -111,9 +111,8 @@ pub(super) fn sys_yield() -> i64 {
             // Check if the ORIGINAL caller has been woken (Blocked -> Ready)
             let still_blocked = unsafe {
                 let sched = super::super::task::scheduler();
-                sched.tasks[caller_slot]
-                    .as_ref()
-                    .map(|t| t.state.is_blocked())
+                sched.task(caller_slot)
+                    .map(|t| t.is_blocked())
                     .unwrap_or(false)
             };
             if !still_blocked {
@@ -132,9 +131,9 @@ pub(super) fn sys_yield() -> i64 {
     // Ensure we're marked Running before returning to userspace
     unsafe {
         let sched = super::super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[caller_slot] {
-            if task.state == super::super::task::TaskState::Ready {
-                task.state = super::super::task::TaskState::Running;
+        if let Some(task) = sched.task_mut(caller_slot) {
+            if *task.state() == super::super::task::TaskState::Ready {
+                let _ = task.set_running();
             }
         }
     }
@@ -352,7 +351,7 @@ pub(super) fn sys_reset() -> i64 {
 pub(super) fn sys_signal_allow(sender_pid: u32) -> i64 {
     unsafe {
         let sched = super::super::task::scheduler();
-        if let Some(ref mut task) = sched.tasks[sched.current] {
+        if let Some(task) = sched.current_task_mut() {
             if task.allow_signals_from(sender_pid) {
                 return 0;
             } else {

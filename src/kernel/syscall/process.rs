@@ -49,8 +49,7 @@ pub(super) fn sys_exit(code: i32) -> i64 {
         let current_slot = super::super::task::current_slot();
 
         // Get current task's PID
-        let pid = sched.tasks[current_slot]
-            .as_ref()
+        let pid = sched.task(current_slot)
             .map(|t| t.id)
             .unwrap_or(0);
 
@@ -62,9 +61,9 @@ pub(super) fn sys_exit(code: i32) -> i64 {
 
         // Debug: show task states before scheduling
         print_direct!("  Task states at exit (current_slot={}):\n", current_slot);
-        for (i, task_opt) in sched.tasks.iter().enumerate() {
-            if let Some(ref task) = task_opt {
-                print_direct!("    [{}] {} - {}\n", i, task.name_str(), task.state.name());
+        for (i, task_opt) in sched.iter_tasks() {
+            if let Some(task) = task_opt {
+                print_direct!("    [{}] {} - {}\n", i, task.name_str(), task.state().name());
             }
         }
 
@@ -72,9 +71,8 @@ pub(super) fn sys_exit(code: i32) -> i64 {
         if let Some(next_slot) = sched.schedule() {
             kinfo!("sys_exit", "scheduled"; next = next_slot);
             super::super::task::set_current_slot(next_slot);
-            sched.current = next_slot;
-            if let Some(ref mut task) = sched.tasks[next_slot] {
-                task.state = super::super::task::TaskState::Running;
+            if let Some(task) = sched.task_mut(next_slot) {
+                let _ = task.set_running();
             }
             super::super::task::update_current_task_globals();
             super::super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
@@ -333,7 +331,7 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
                 }
 
                 // Pre-store return value in caller's trap frame
-                if let Some(ref mut parent) = sched.tasks[caller_slot] {
+                if let Some(parent) = sched.task_mut(caller_slot) {
                     parent.trap_frame.x0 = SyscallError::WouldBlock as i64 as u64;
                 }
 
@@ -356,30 +354,27 @@ pub(super) fn sys_daemonize() -> i64 {
     unsafe {
         let sched = super::super::task::scheduler();
 
-        // Find the calling task
-        let mut parent_id = 0u32;
-        for task_opt in sched.tasks.iter_mut() {
-            if let Some(ref mut task) = task_opt {
-                if task.id == caller_pid {
-                    // Save parent ID and clear it
-                    parent_id = task.parent_id;
-                    task.parent_id = 0;
-                    break;
-                }
+        // Find the calling task and get parent ID
+        let parent_id = if let Some(slot) = sched.slot_by_pid(caller_pid) {
+            if let Some(task) = sched.task_mut(slot) {
+                let pid = task.parent_id;
+                task.parent_id = 0;
+                pid
+            } else {
+                0
             }
-        }
+        } else {
+            0
+        };
 
         // Remove from parent's children list and wake parent if blocked
         if parent_id != 0 {
-            for (slot, task_opt) in sched.tasks.iter_mut().enumerate() {
-                if let Some(ref mut task) = task_opt {
-                    if task.id == parent_id {
-                        task.remove_child(caller_pid);
-                        // Wake up parent if it's blocked using unified wake function
-                        sched.wake_task(slot);
-                        break;
-                    }
+            if let Some(parent_slot) = sched.slot_by_pid(parent_id) {
+                if let Some(parent) = sched.task_mut(parent_slot) {
+                    parent.remove_child(caller_pid);
                 }
+                // Wake up parent if it's blocked using unified wake function
+                sched.wake_task(parent_slot);
             }
         }
     }
@@ -430,9 +425,8 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
         if pid == caller_pid {
             if let Some(next_slot) = sched.schedule() {
                 super::super::task::set_current_slot(next_slot);
-                sched.current = next_slot;
-                if let Some(ref mut next) = sched.tasks[next_slot] {
-                    next.state = super::super::task::TaskState::Running;
+                if let Some(next) = sched.task_mut(next_slot) {
+                    let _ = next.set_running();
                 }
                 super::super::task::update_current_task_globals();
                 super::super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
@@ -462,12 +456,12 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
     unsafe {
         let sched = super::super::task::scheduler();
 
-        for task_opt in sched.tasks.iter() {
+        for (_slot, task_opt) in sched.iter_tasks() {
             if count >= max_entries {
                 break;
             }
 
-            if let Some(ref task) = task_opt {
+            if let Some(task) = task_opt {
                 // Calculate activity age and liveness status
                 let current_tick = crate::platform::mt7988::timer::ticks();
 
@@ -489,7 +483,7 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
                 let info = ProcessInfo {
                     pid: task.id,
                     ppid: task.parent_id,
-                    state: task.state.state_code(),
+                    state: task.state().state_code(),
                     liveness_status: live_status,
                     _pad: [0; 2],
                     activity_age_ms,
@@ -529,11 +523,9 @@ pub(super) fn sys_get_capabilities(pid: u32) -> i64 {
         let sched = super::super::task::scheduler();
 
         // Find the task by PID
-        for slot in 0..super::super::task::MAX_TASKS {
-            if let Some(ref task) = sched.tasks[slot] {
-                if task.id == target_pid {
-                    return task.capabilities.bits() as i64;
-                }
+        if let Some(slot) = sched.slot_by_pid(target_pid) {
+            if let Some(task) = sched.task(slot) {
+                return task.capabilities.bits() as i64;
             }
         }
     }

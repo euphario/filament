@@ -236,7 +236,7 @@ fn verify_mapping(addr: u64, len: usize, needs_write: bool) -> Result<(), UAcces
     // Get current task's TTBR0 (page table root) through address_space
     let ttbr0 = unsafe {
         let sched = task::scheduler();
-        match &sched.tasks[sched.current] {
+        match sched.current_task() {
             Some(task) => {
                 match &task.address_space {
                     Some(addr_space) => addr_space.ttbr0,
@@ -524,7 +524,7 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
 fn get_current_ttbr0() -> Result<u64, UAccessError> {
     unsafe {
         let sched = task::scheduler();
-        match &sched.tasks[sched.current] {
+        match sched.current_task() {
             Some(task) => {
                 match &task.address_space {
                     Some(addr_space) => Ok(addr_space.ttbr0),
