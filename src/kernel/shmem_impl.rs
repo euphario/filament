@@ -570,4 +570,246 @@ mod tests {
         // id2 should still exist
         assert!(backend.all_regions().iter().find(|r| r.id == id2).is_some());
     }
+
+    // ========================================================================
+    // Additional Lifecycle Tests
+    // ========================================================================
+
+    #[test]
+    fn test_shmem_full_lifecycle() {
+        let backend = MockShmemBackend::new();
+
+        // 1. Create region
+        let (id, phys, size) = backend.create(1, 4096).unwrap();
+        assert!(id > 0);
+        assert!(phys > 0);
+        assert_eq!(size, 4096);
+
+        // 2. Allow another process
+        {
+            let mut regions = backend.regions.borrow_mut();
+            regions[0].allowed.push(2);
+        }
+
+        // 3. Second process maps
+        let result = backend.map(id, 2);
+        assert!(result.is_ok());
+        let (mapped_phys, mapped_size) = result.unwrap();
+        assert_eq!(mapped_phys, phys);
+        assert_eq!(mapped_size, size);
+
+        // 4. Verify mapping count
+        assert_eq!(backend.mapping_tracker().mapping_count(id), 2);
+
+        // 5. Second process unmaps
+        assert!(backend.unmap(id, 2).is_ok());
+        assert_eq!(backend.mapping_tracker().mapping_count(id), 1);
+
+        // 6. Owner destroys
+        assert!(backend.destroy(id, 1).is_ok());
+
+        // 7. Region is gone
+        assert!(backend.all_regions().is_empty());
+    }
+
+    #[test]
+    fn test_only_owner_can_destroy() {
+        let backend = MockShmemBackend::new();
+
+        // Create region as pid 1
+        let (id, _, _) = backend.create(1, 4096).unwrap();
+
+        // Pid 2 tries to destroy - should fail
+        let result = backend.destroy(id, 2);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ShmemError::NotOwner);
+
+        // Owner can destroy
+        assert!(backend.destroy(id, 1).is_ok());
+    }
+
+    #[test]
+    fn test_dying_state_blocks_mapping() {
+        let backend = MockShmemBackend::new();
+
+        // Create region
+        let (id, _, _) = backend.create(1, 4096).unwrap();
+
+        // Allow pid 2
+        {
+            let mut regions = backend.regions.borrow_mut();
+            regions[0].allowed.push(2);
+        }
+
+        // Set to dying state
+        {
+            let mut regions = backend.regions.borrow_mut();
+            regions[0].state = TraitShmemState::Dying;
+        }
+
+        // Pid 2 tries to map - should fail because dying
+        let result = backend.map(id, 2);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ShmemError::Dying);
+    }
+
+    #[test]
+    fn test_map_without_permission() {
+        let backend = MockShmemBackend::new();
+
+        // Create region as pid 1
+        let (id, _, _) = backend.create(1, 4096).unwrap();
+
+        // Pid 2 NOT allowed, tries to map
+        let result = backend.map(id, 2);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ShmemError::NotAllowed);
+    }
+
+    #[test]
+    fn test_map_nonexistent_region() {
+        let backend = MockShmemBackend::new();
+
+        // Try to map nonexistent region
+        let result = backend.map(999, 1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ShmemError::NotFound);
+    }
+
+    #[test]
+    fn test_destroy_nonexistent_region() {
+        let backend = MockShmemBackend::new();
+
+        // Try to destroy nonexistent region
+        let result = backend.destroy(999, 1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ShmemError::NotFound);
+    }
+
+    #[test]
+    fn test_multiple_regions_same_owner() {
+        let backend = MockShmemBackend::new();
+
+        // Create multiple regions as same owner
+        let (id1, _, _) = backend.create(1, 4096).unwrap();
+        let (id2, _, _) = backend.create(1, 8192).unwrap();
+        let (id3, _, _) = backend.create(1, 16384).unwrap();
+
+        // All should be different
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+
+        // All should exist
+        assert_eq!(backend.all_regions().len(), 3);
+
+        // Cleanup removes all for this owner
+        backend.cleanup_process(1);
+        assert!(backend.all_regions().is_empty());
+    }
+
+    #[test]
+    fn test_mapping_tracker_remove_all_for_region() {
+        let tracker = MockMappingTracker::new();
+
+        // Add mappings for region 1
+        tracker.add_mapping(1, 100).unwrap();
+        tracker.add_mapping(1, 101).unwrap();
+        tracker.add_mapping(1, 102).unwrap();
+
+        // Add mapping for region 2
+        tracker.add_mapping(2, 100).unwrap();
+
+        // Remove all for region 1
+        tracker.remove_all_for_region(1);
+
+        // Region 1 mappings gone
+        assert!(!tracker.has_mapping(1, 100));
+        assert!(!tracker.has_mapping(1, 101));
+        assert!(!tracker.has_mapping(1, 102));
+
+        // Region 2 mapping still there
+        assert!(tracker.has_mapping(2, 100));
+    }
+
+    #[test]
+    fn test_mapping_tracker_remove_all_for_pid() {
+        let tracker = MockMappingTracker::new();
+
+        // Pid 100 maps multiple regions
+        tracker.add_mapping(1, 100).unwrap();
+        tracker.add_mapping(2, 100).unwrap();
+        tracker.add_mapping(3, 100).unwrap();
+
+        // Pid 101 maps one region
+        tracker.add_mapping(1, 101).unwrap();
+
+        // Remove all for pid 100
+        tracker.remove_all_for_pid(100);
+
+        // Pid 100 mappings gone
+        assert!(!tracker.has_mapping(1, 100));
+        assert!(!tracker.has_mapping(2, 100));
+        assert!(!tracker.has_mapping(3, 100));
+
+        // Pid 101 mapping still there
+        assert!(tracker.has_mapping(1, 101));
+    }
+
+    #[test]
+    fn test_mapping_count() {
+        let tracker = MockMappingTracker::new();
+
+        // Initially zero
+        assert_eq!(tracker.mapping_count(1), 0);
+
+        // Add mappings
+        tracker.add_mapping(1, 100).unwrap();
+        assert_eq!(tracker.mapping_count(1), 1);
+
+        tracker.add_mapping(1, 101).unwrap();
+        assert_eq!(tracker.mapping_count(1), 2);
+
+        tracker.add_mapping(1, 102).unwrap();
+        assert_eq!(tracker.mapping_count(1), 3);
+
+        // Remove one
+        tracker.remove_mapping(1, 101).unwrap();
+        assert_eq!(tracker.mapping_count(1), 2);
+    }
+
+    #[test]
+    fn test_get_mapped_pids() {
+        let tracker = MockMappingTracker::new();
+
+        // Add mappings
+        tracker.add_mapping(1, 100).unwrap();
+        tracker.add_mapping(1, 101).unwrap();
+        tracker.add_mapping(1, 102).unwrap();
+
+        let pids = tracker.get_mapped_pids(1);
+
+        // First 3 elements should be our pids (order may vary)
+        let expected: Vec<Pid> = vec![100, 101, 102];
+        for pid in expected {
+            assert!(pids.contains(&pid), "Missing pid {}", pid);
+        }
+    }
+
+    #[test]
+    fn test_size_alignment() {
+        let backend = MockShmemBackend::new();
+
+        // Create with non-aligned size
+        let (_, _, size) = backend.create(1, 100).unwrap();
+
+        // Should be page-aligned (4096)
+        assert_eq!(size, 4096);
+
+        // Create with slightly over one page
+        let (_, _, size) = backend.create(1, 4097).unwrap();
+
+        // Should be 2 pages
+        assert_eq!(size, 8192);
+    }
 }

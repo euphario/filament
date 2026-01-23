@@ -41,6 +41,7 @@ pub mod waker;
 pub mod sched;
 pub mod process;
 pub mod addrspace;
+pub mod task;
 
 // Re-exports for convenient access - will be used once migration completes
 #[allow(unused_imports)]
@@ -58,3 +59,5 @@ pub use sched::{SchedulerBackend, TaskStateInfo, SchedError};
 pub use process::{ProcessBackend, ProcessStateInfo, ProcessInfo, ProcessError};
 #[allow(unused_imports)]
 pub use addrspace::{AddressSpaceBackend, Asid, VirtAddr, PhysAddr, PageFlags, MemoryType, AddrSpaceError};
+#[allow(unused_imports)]
+pub use task::{TaskOperations, TaskId, ResourceCounts, Capabilities, TaskError};

@@ -13,6 +13,7 @@
 pub mod traits; // Trait boundaries for swappable subsystems
 pub mod waker_impl; // Waker trait implementation
 pub mod task;
+pub mod task_impl; // TaskOperations trait implementation
 pub mod sched;
 pub mod sched_impl; // SchedulerBackend trait implementation
 pub mod process;
