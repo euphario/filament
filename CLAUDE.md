@@ -261,17 +261,23 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 
 ## Current Work
 
-### Unified Syscall Migration (IN PROGRESS)
-- **Kernel object system complete** (`src/kernel/object/`)
-  - Pollable trait with explicit state machines
-  - open/read/write/map/close implemented
-  - Channel, Port, Timer, Mux objects working
-- **Userlib ipc2 module complete** (`user/userlib/src/ipc2.rs`)
-  - High-level types: Channel, Port, Timer, Mux, Console, Process
-  - Old ipc module marked deprecated
-- **Legacy syscalls kept working for boot**
-  - Old IPC, Handle, Scheme syscalls work but marked LEGACY
-  - System boots and runs with existing userspace
+### Trait-Based Syscall Layer (COMPLETE)
+- **Syscalls now go through trait boundaries** - Pure microkernel design
+  - All scheduler access via `task::with_scheduler(|sched| { ... })`
+  - No more `unsafe { task::scheduler() }` in syscall handlers
+  - Traits define behavior, implementations wrap kernel internals
+- **Trait hierarchy**
+  - `SyscallContext` - Entry point, provides access to subsystems
+  - `ObjectOps` - Unified 5-syscall interface (open/read/write/map/close)
+  - `MemoryOps` - Memory management (mmap/munmap)
+  - `ProcessOps` - Process lifecycle (exit/kill/spawn)
+  - `UserAccess` - Safe user memory access
+- **Implementation files**
+  - `src/kernel/syscall_ctx_impl.rs` - KernelSyscallContext
+  - `src/kernel/object_ops_impl.rs` - KernelObjectOps
+  - `src/kernel/memory_ops_impl.rs` - KernelMemoryOps
+  - `src/kernel/process_ops_impl.rs` - KernelProcessOps
+  - `src/kernel/user_access_impl.rs` - KernelUserAccess
 
 ### Next Steps
 1. Migrate Service framework (`userlib/src/service.rs`) to ipc2
@@ -288,6 +294,29 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 ---
 
 ## Changelog (Recent)
+
+### 2026-01-22
+- **Trait-based syscall layer refactoring** - Pure microkernel design
+  - All syscall handlers now use trait boundaries
+  - Replaced `unsafe { task::scheduler() }` with `task::with_scheduler(|sched| { ... })`
+  - Syscalls are thin dispatchers: validate args, call trait method, return result
+- **New trait files** (`src/kernel/traits/`)
+  - `syscall_ctx.rs` - SyscallContext entry point trait
+  - `object_ops.rs` - ObjectOps for unified 5-syscall interface
+  - `memory_ops.rs` - MemoryOps for mmap/munmap
+  - `process_ops.rs` - ProcessOps for exit/kill/spawn
+  - `user_access.rs` - UserAccess for safe user memory access
+- **New implementation files**
+  - `syscall_ctx_impl.rs` - KernelSyscallContext
+  - `object_ops_impl.rs` - KernelObjectOps
+  - `memory_ops_impl.rs` - KernelMemoryOps
+  - `process_ops_impl.rs` - KernelProcessOps
+  - `user_access_impl.rs` - KernelUserAccess
+- **Unsafe block reduction**
+  - `object/syscall.rs`: 30 unsafe blocks -> 3 (inherent: slice conversions)
+  - `syscall/memory.rs`: 4 unsafe blocks -> 0
+  - `syscall/misc.rs`: Inherent unsafe only (asm, raw statics)
+  - `syscall/process.rs`: Inherent unsafe only (update_current_task_globals, asm)
 
 ### 2026-01-20 (Session 1)
 - **Unified 5-syscall interface** - Complete rewrite of kernel API

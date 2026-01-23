@@ -2,23 +2,21 @@
 //!
 //! Everything goes through these five entry points.
 //!
-//! # Safety
+//! # Architecture
 //!
-//! This module contains many `unsafe` blocks that access the global scheduler.
-//! These are safe because:
+//! This module implements the unified 5-syscall interface that is the heart
+//! of the microkernel. All scheduler access goes through `task::with_scheduler`
+//! which provides safe access to the scheduler with proper locking.
 //!
-//! 1. **Syscall context**: All functions are called from syscall entry points
-//!    where interrupts are disabled (via IrqGuard in the syscall handler).
+//! # The 5 Syscalls
 //!
-//! 2. **Single-threaded**: Each CPU handles one syscall at a time, and the
-//!    scheduler's task table uses slot indexing that doesn't require locking
-//!    for single-CPU access.
-//!
-//! 3. **Current task**: `current_slot()` returns the per-CPU running task,
-//!    which is guaranteed to be valid during syscall execution.
-//!
-//! 4. **Memory safety**: User pointers are validated via `uaccess` module
-//!    before any read/write operations.
+//! | Syscall | Purpose |
+//! |---------|---------|
+//! | open | Create object, return handle |
+//! | read | Read from object |
+//! | write | Write to object |
+//! | map | Map object to memory |
+//! | close | Release handle |
 
 use super::{Object, ObjectType, Handle, ConsoleType, Pollable};
 use super::types::Error;
@@ -82,13 +80,7 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
 pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
     let handle = Handle::from_raw(handle_raw);
 
-    // SAFETY: Called from syscall context with interrupts disabled.
-    // Scheduler access is safe because:
-    // 1. We're in syscall context (single-threaded per-CPU)
-    // 2. IRQs are disabled during syscall handling
-    // 3. current_slot() returns the caller's task slot
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -132,7 +124,7 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::BusList(b) => read_bus_list(b, buf_ptr, buf_len),
             _ => Error::NotSupported.to_errno(),
         }
-    }
+    })
 }
 
 // ============================================================================
@@ -149,8 +141,7 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
     let handle = Handle::from_raw(handle_raw);
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -177,7 +168,7 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::PciDevice(d) => write_pci_device(d, buf_ptr, buf_len, task_id),
             _ => Error::NotSupported.to_errno(),
         }
-    }
+    })
 }
 
 // ============================================================================
@@ -193,8 +184,7 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
     let handle = Handle::from_raw(handle_raw);
     let _ = flags; // For future use (read-only, etc.)
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -216,7 +206,7 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
             Object::Mmio(m) => map_mmio(m, task.id),
             _ => Error::NotSupported.to_errno(),
         }
-    }
+    })
 }
 
 // ============================================================================
@@ -229,8 +219,7 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
 pub fn close(handle_raw: u32) -> i64 {
     let handle = Handle::from_raw(handle_raw);
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -261,7 +250,7 @@ pub fn close(handle_raw: u32) -> i64 {
         }
 
         0
-    }
+    })
 }
 
 // ============================================================================
@@ -276,8 +265,7 @@ fn open_channel(params_ptr: u64, params_len: usize) -> i64 {
     // For channel pair: Returns both handles packed: (handle_a << 32) | handle_b
     // For port connect: Returns single channel handle
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -359,12 +347,11 @@ fn open_channel(params_ptr: u64, params_len: usize) -> i64 {
 
         // Pack both handles into return value
         ((handle_a.raw() as i64) << 32) | (handle_b.raw() as i64)
-    }
+    })
 }
 
 fn open_timer(_params_ptr: u64, _params_len: usize) -> i64 {
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -379,7 +366,7 @@ fn open_timer(_params_ptr: u64, _params_len: usize) -> i64 {
             Some(handle) => handle.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 fn open_process(params_ptr: u64, params_len: usize) -> i64 {
@@ -395,8 +382,7 @@ fn open_process(params_ptr: u64, params_len: usize) -> i64 {
     }
     let target_pid = u32::from_le_bytes(pid_bytes);
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         // First, check target task state (before borrowing caller's task)
@@ -428,7 +414,7 @@ fn open_process(params_ptr: u64, params_len: usize) -> i64 {
             Some(handle) => handle.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 fn open_port(params_ptr: u64, params_len: usize) -> i64 {
@@ -443,8 +429,7 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
         return Error::BadAddress.to_errno();
     }
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -479,7 +464,7 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
                 Error::NoSpace.to_errno()
             }
         }
-    }
+    })
 }
 
 fn open_shmem(params_ptr: u64, params_len: usize) -> i64 {
@@ -505,8 +490,7 @@ fn open_shmem_create(params_ptr: u64) -> i64 {
         return Error::InvalidArg.to_errno();
     }
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -533,7 +517,7 @@ fn open_shmem_create(params_ptr: u64) -> i64 {
             }
             Err(e) => e, // shmem::create returns errno directly
         }
-    }
+    })
 }
 
 fn open_shmem_existing(params_ptr: u64) -> i64 {
@@ -544,8 +528,7 @@ fn open_shmem_existing(params_ptr: u64) -> i64 {
     }
     let shmem_id = u32::from_le_bytes(id_bytes);
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -575,7 +558,7 @@ fn open_shmem_existing(params_ptr: u64) -> i64 {
             }
             Err(e) => e,
         }
-    }
+    })
 }
 
 fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
@@ -604,8 +587,7 @@ fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
         return Error::InvalidArg.to_errno();
     }
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -652,7 +634,7 @@ fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
                 Error::NoSpace.to_errno()
             }
         }
-    }
+    })
 }
 
 fn open_mmio(params_ptr: u64, params_len: usize) -> i64 {
@@ -680,8 +662,7 @@ fn open_mmio(params_ptr: u64, params_len: usize) -> i64 {
         return Error::InvalidArg.to_errno();
     }
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -705,12 +686,11 @@ fn open_mmio(params_ptr: u64, params_len: usize) -> i64 {
                 Error::NoSpace.to_errno()
             }
         }
-    }
+    })
 }
 
 fn open_console(console_type: super::ConsoleType) -> i64 {
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -732,13 +712,12 @@ fn open_console(console_type: super::ConsoleType) -> i64 {
             Some(h) => h.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 fn open_klog(_params_ptr: u64, _params_len: usize) -> i64 {
     // No params needed - creates a kernel log reader handle
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -753,12 +732,11 @@ fn open_klog(_params_ptr: u64, _params_len: usize) -> i64 {
             Some(handle) => handle.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 fn open_mux(_params_ptr: u64, _params_len: usize) -> i64 {
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -771,7 +749,7 @@ fn open_mux(_params_ptr: u64, _params_len: usize) -> i64 {
             Some(h) => h.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 fn open_pci_bus(params_ptr: u64, params_len: usize) -> i64 {
@@ -789,8 +767,7 @@ fn open_pci_bus(params_ptr: u64, params_len: usize) -> i64 {
         return Error::InvalidArg.to_errno();
     };
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -805,7 +782,7 @@ fn open_pci_bus(params_ptr: u64, params_len: usize) -> i64 {
             Some(handle) => handle.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
@@ -834,8 +811,7 @@ fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
         return Error::NotFound.to_errno();
     }
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -848,7 +824,7 @@ fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
             Some(handle) => handle.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
@@ -880,9 +856,10 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
         None => return Error::NotFound.to_errno(),
     };
 
-    let pid = unsafe {
-        task::scheduler().current_task().map(|t| t.id).unwrap_or(0)
-    };
+    // Get current pid via safe scheduler access
+    let pid = task::with_scheduler(|sched| {
+        sched.current_task().map(|t| t.id).unwrap_or(0)
+    });
 
     if dev.owner() != pid {
         return Error::PermDenied.to_errno();
@@ -900,8 +877,7 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
         Err(_) => return Error::Io.to_errno(),
     };
 
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -914,12 +890,11 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
             Some(handle) => handle.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 fn open_bus_list(_params_ptr: u64, _params_len: usize) -> i64 {
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         let slot = task::current_slot();
 
         let Some(task) = sched.task_mut(slot) else {
@@ -932,7 +907,7 @@ fn open_bus_list(_params_ptr: u64, _params_len: usize) -> i64 {
             Some(handle) => handle.raw() as i64,
             None => Error::NoSpace.to_errno(),
         }
-    }
+    })
 }
 
 // Read implementations
@@ -947,13 +922,15 @@ fn read_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> 
         return Error::PeerClosed.to_errno();
     }
 
-    let pid = unsafe {
-        let sched = task::scheduler();
+    let pid = task::with_scheduler(|sched| {
         match sched.current_task() {
             Some(t) => t.id,
-            None => return Error::BadHandle.to_errno(),
+            None => 0,
         }
-    };
+    });
+    if pid == 0 {
+        return Error::BadHandle.to_errno();
+    }
 
     // Receive message from ipc
     match ipc::receive(channel_id, pid) {
@@ -1048,8 +1025,7 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
     }
 
     // Lazy check: see if target task has exited since we last checked
-    let exit_code = unsafe {
-        let sched = task::scheduler();
+    let exit_code = task::with_scheduler(|sched| {
         if let Some(target_slot) = sched.slot_by_pid(p.pid) {
             if let Some(target) = sched.task(target_slot) {
                 target.state().exit_code()
@@ -1060,7 +1036,7 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
             // Task not found - PID no longer valid, task was reaped
             Some(-1)
         }
-    };
+    });
 
     if let Some(code) = exit_code {
         // Target has exited - cache and return
@@ -1096,8 +1072,7 @@ fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u
             // Create a new ChannelObject for the accepted connection
             let ch_obj = Object::Channel(super::ChannelObject::new(server_channel));
 
-            unsafe {
-                let sched = task::scheduler();
+            task::with_scheduler(|sched| {
                 let slot = task::current_slot();
 
                 let Some(task) = sched.task_mut(slot) else {
@@ -1134,7 +1109,7 @@ fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u
                         Error::NoSpace.to_errno()
                     }
                 }
-            }
+            })
         }
         Err(ipc::IpcError::NoPending) => Error::WouldBlock.to_errno(),
         Err(ipc::IpcError::Closed) => Error::PeerClosed.to_errno(),
@@ -1159,12 +1134,11 @@ fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id:
         Ok(()) => 0,
         Err(-11) => {
             // EAGAIN = blocked, pre-store success return value
-            unsafe {
-                let sched = task::scheduler();
+            task::with_scheduler(|sched| {
                 if let Some(task) = sched.current_task_mut() {
                     task.trap_frame.x0 = 0;
                 }
-            }
+            });
             Error::WouldBlock.to_errno()
         }
         Err(e) => e,
@@ -1562,10 +1536,9 @@ fn read_mux_impl(task: &mut crate::kernel::task::Task, mux_handle: Handle, buf_p
             return Error::InvalidArg.to_errno();
         }
         // Notify scheduler of deadline for tickless optimization
-        unsafe {
-            let sched = task::scheduler();
+        task::with_scheduler(|sched| {
             sched.note_deadline(earliest_deadline);
-        }
+        });
     }
 
     // Store syscall args in trap frame so syscall re-executes on wake
@@ -1596,13 +1569,15 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
         return Error::InvalidArg.to_errno();
     }
 
-    let pid = unsafe {
-        let sched = task::scheduler();
+    let pid = task::with_scheduler(|sched| {
         match sched.current_task() {
             Some(t) => t.id,
-            None => return Error::BadHandle.to_errno(),
+            None => 0,
         }
-    };
+    });
+    if pid == 0 {
+        return Error::BadHandle.to_errno();
+    }
 
     // Copy from user buffer
     let mut kernel_buf = [0u8; 256];

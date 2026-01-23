@@ -35,6 +35,7 @@
 //! }
 //! ```
 
+// Existing subsystem traits
 pub mod ipc;
 pub mod memory;
 pub mod waker;
@@ -43,7 +44,14 @@ pub mod process;
 pub mod addrspace;
 pub mod task;
 
-// Re-exports for convenient access - will be used once migration completes
+// New syscall-facing traits (microkernel interface)
+pub mod syscall_ctx;
+pub mod object_ops;
+pub mod memory_ops;
+pub mod process_ops;
+pub mod user_access;
+
+// Re-exports for convenient access - existing traits
 #[allow(unused_imports)]
 pub use ipc::{
     IpcChannel, IpcPort, IpcBackend, IpcError as TraitIpcError,
@@ -61,3 +69,15 @@ pub use process::{ProcessBackend, ProcessStateInfo, ProcessInfo, ProcessError};
 pub use addrspace::{AddressSpaceBackend, Asid, VirtAddr, PhysAddr, PageFlags, MemoryType, AddrSpaceError};
 #[allow(unused_imports)]
 pub use task::{TaskOperations, TaskId, ResourceCounts, Capabilities, TaskError};
+
+// Re-exports for new syscall-facing traits
+#[allow(unused_imports)]
+pub use syscall_ctx::{SyscallContext, SyscallError};
+#[allow(unused_imports)]
+pub use object_ops::{ObjectOps, ObjectType, ObjectError, Handle, ReadResult, MapResult};
+#[allow(unused_imports)]
+pub use memory_ops::{MemoryOps, MemoryError};
+#[allow(unused_imports)]
+pub use process_ops::{ProcessOps, ProcessError as ProcOpsError};
+#[allow(unused_imports)]
+pub use user_access::{UserAccess, UserAccessExt, UAccessError};

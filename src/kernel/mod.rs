@@ -43,3 +43,10 @@ pub mod liveness;
 pub mod hw_poll;
 pub mod object;
 pub mod irq;
+
+// New syscall-facing trait implementations
+pub mod syscall_ctx_impl;
+pub mod object_ops_impl;
+pub mod memory_ops_impl;
+pub mod process_ops_impl;
+pub mod user_access_impl;

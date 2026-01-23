@@ -20,8 +20,10 @@
 use crate::{kwarn, kinfo, print_direct};
 use super::super::uaccess;
 use super::super::caps::Capabilities;
-use super::super::task::lifecycle;
-use super::{SyscallError, current_pid, require_capability, uaccess_to_errno};
+use super::super::task::{self, lifecycle};
+use super::super::syscall_ctx_impl::create_syscall_context;
+use super::super::traits::syscall_ctx::SyscallContext;
+use super::{SyscallError, uaccess_to_errno};
 
 /// Wait flags
 pub const WNOHANG: u32 = 1;  // Don't block if no child has exited
@@ -35,6 +37,8 @@ pub use abi::liveness_status;
 /// Delegates to lifecycle::exit() for state transition and parent notification,
 /// then handles scheduling.
 pub(super) fn sys_exit(code: i32) -> i64 {
+    let ctx = create_syscall_context();
+
     // Flush UART buffer so pending output from this process appears first
     while crate::platform::mt7988::uart::has_buffered_output() {
         crate::platform::mt7988::uart::flush_buffer();
@@ -44,14 +48,16 @@ pub(super) fn sys_exit(code: i32) -> i64 {
     print_direct!("  Process exited with code: {}\n", code);
     print_direct!("========================================\n");
 
-    unsafe {
-        let sched = super::super::task::scheduler();
-        let current_slot = super::super::task::current_slot();
+    let pid = match ctx.current_task_id() {
+        Some(id) => id,
+        None => {
+            kinfo!("sys_exit", "no_current_task");
+            return SyscallError::NoProcess as i64;
+        }
+    };
 
-        // Get current task's PID
-        let pid = sched.task(current_slot)
-            .map(|t| t.id)
-            .unwrap_or(0);
+    task::with_scheduler(|sched| {
+        let current_slot = task::current_slot();
 
         // Delegate state transition and parent notification to lifecycle module
         // NOTE: Resource cleanup is deferred to reap_terminated() for two-phase cleanup.
@@ -70,21 +76,21 @@ pub(super) fn sys_exit(code: i32) -> i64 {
         // Schedule next task
         if let Some(next_slot) = sched.schedule() {
             kinfo!("sys_exit", "scheduled"; next = next_slot);
-            super::super::task::set_current_slot(next_slot);
+            task::set_current_slot(next_slot);
             if let Some(task) = sched.task_mut(next_slot) {
                 let _ = task.set_running();
             }
-            super::super::task::update_current_task_globals();
-            super::super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+            unsafe { task::update_current_task_globals(); }
+            task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
             0
         } else {
             // No more tasks - halt
             kinfo!("sys_exit", "halt_no_tasks");
             loop {
-                core::arch::asm!("wfi");
+                unsafe { core::arch::asm!("wfi"); }
             }
         }
-    }
+    })
 }
 
 /// Spawn a new process from a built-in ELF binary
@@ -92,9 +98,11 @@ pub(super) fn sys_exit(code: i32) -> i64 {
 /// Returns: child PID on success, negative error on failure
 /// SECURITY: Copies user name buffer via page table translation
 pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
+    let ctx = create_syscall_context();
+
     // Check SPAWN capability
-    if let Err(e) = require_capability(Capabilities::SPAWN) {
-        return e;
+    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
+        return SyscallError::PermissionDenied as i64;
     }
 
     // Validate name length
@@ -119,7 +127,10 @@ pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
     let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("child");
 
     // Get current PID as parent
-    let parent_id = current_pid();
+    let parent_id = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::NoProcess as i64,
+    };
 
     // Spawn the child process
     match super::super::elf::spawn_from_elf_with_parent(elf_data, name, parent_id) {
@@ -133,6 +144,8 @@ pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
 /// Returns: child PID on success, negative error on failure
 /// SECURITY: Copies user path buffer via page table translation
 pub(super) fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
+    let ctx = create_syscall_context();
+
     // Validate path length
     if path_len == 0 || path_len > 127 {
         return SyscallError::InvalidArgument as i64;
@@ -152,7 +165,10 @@ pub(super) fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
     };
 
     // Get current PID as parent
-    let parent_id = current_pid();
+    let parent_id = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::NoProcess as i64,
+    };
 
     // Try to spawn from ramfs path
     match super::super::elf::spawn_from_path_with_parent(path, parent_id) {
@@ -167,14 +183,16 @@ pub(super) fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
 /// Returns: child PID on success, negative error on failure
 /// SECURITY: Child capabilities are intersected with parent's - can't escalate
 pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u64) -> i64 {
+    let ctx = create_syscall_context();
+
     // Require SPAWN capability
-    if let Err(e) = require_capability(super::super::caps::Capabilities::SPAWN) {
-        return e;
+    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
+        return SyscallError::PermissionDenied as i64;
     }
 
     // Require GRANT capability to delegate capabilities to children
-    if let Err(e) = require_capability(super::super::caps::Capabilities::GRANT) {
-        return e;
+    if let Err(_) = ctx.require_capability(Capabilities::GRANT.bits()) {
+        return SyscallError::PermissionDenied as i64;
     }
 
     // Validate path length
@@ -196,10 +214,13 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
     };
 
     // Get current PID as parent
-    let parent_id = current_pid();
+    let parent_id = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::NoProcess as i64,
+    };
 
     // Convert capabilities bitmask
-    let requested_caps = super::super::caps::Capabilities::from_bits(capabilities);
+    let requested_caps = Capabilities::from_bits(capabilities);
 
     // Try to spawn from ramfs path with explicit capabilities
     match super::super::elf::spawn_from_path_with_caps_find(path, parent_id, requested_caps) {
@@ -218,6 +239,8 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
 /// Returns: PID of new process on success, negative error on failure
 /// SECURITY: Reads ELF data via page table translation
 pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len: usize) -> i64 {
+    let ctx = create_syscall_context();
+
     // Validate ELF size (reasonable bounds: at least an ELF header, at most 16MB)
     if elf_len < 64 || elf_len > 16 * 1024 * 1024 {
         return SyscallError::InvalidArgument as i64;
@@ -261,7 +284,13 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
     };
 
     // Get current PID as parent
-    let parent_id = current_pid();
+    let parent_id = match ctx.current_task_id() {
+        Some(id) => id,
+        None => {
+            super::super::pmm::free_pages(elf_phys, num_pages);
+            return SyscallError::NoProcess as i64;
+        }
+    };
 
     // Spawn from the ELF data
     let result = match super::super::elf::spawn_from_elf_with_parent(elf_slice, name, parent_id) {
@@ -288,7 +317,11 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
 /// Returns: PID of exited child on success, 0 if WNOHANG and no child exited, negative error
 /// SECURITY: Writes to user status pointer via page table translation
 pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
-    let caller_pid = current_pid();
+    let ctx = create_syscall_context();
+    let caller_pid = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::NoProcess as i64,
+    };
     let no_hang = (flags & WNOHANG) != 0;
 
     // Validate status pointer if provided
@@ -298,9 +331,8 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
         }
     }
 
-    unsafe {
-        let sched = super::super::task::scheduler();
-        let caller_slot = super::super::task::current_slot();
+    task::with_scheduler(|sched| {
+        let caller_slot = task::current_slot();
 
         // Delegate to lifecycle module for child lookup and reaping
         match lifecycle::wait_child(sched, caller_pid, pid, no_hang) {
@@ -325,7 +357,7 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
                 if let Err(_e) = lifecycle::sleep_current(
                     sched,
                     caller_slot,
-                    super::super::task::SleepReason::EventLoop,
+                    task::SleepReason::EventLoop,
                 ) {
                     return SyscallError::InvalidArgument as i64;
                 }
@@ -344,16 +376,18 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
             lifecycle::WaitResult::NoChildren => SyscallError::NoChild as i64,
             lifecycle::WaitResult::NotChild => SyscallError::InvalidArgument as i64,
         }
-    }
+    })
 }
 
 /// Daemonize - detach from parent and become a daemon
 pub(super) fn sys_daemonize() -> i64 {
-    let caller_pid = current_pid();
+    let ctx = create_syscall_context();
+    let caller_pid = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::NoProcess as i64,
+    };
 
-    unsafe {
-        let sched = super::super::task::scheduler();
-
+    task::with_scheduler(|sched| {
         // Find the calling task and get parent ID
         let parent_id = if let Some(slot) = sched.slot_by_pid(caller_pid) {
             if let Some(task) = sched.task_mut(slot) {
@@ -377,7 +411,7 @@ pub(super) fn sys_daemonize() -> i64 {
                 sched.wake_task(parent_slot);
             }
         }
-    }
+    });
 
     0  // Success
 }
@@ -393,21 +427,25 @@ pub(super) fn sys_daemonize() -> i64 {
 /// - Processes in caller's signal allowlist
 /// - Processes with CAP_KILL capability can kill any process except init (PID 1)
 pub(super) fn sys_kill(pid: u32) -> i64 {
+    let ctx = create_syscall_context();
+
     if pid == 0 {
         return SyscallError::InvalidArgument as i64;
     }
 
     // SECURITY: Never allow killing init (PID 1) - system would become unstable
     if pid == 1 {
-        kwarn!("security", "kill_init_denied"; caller = current_pid() as u64);
+        let caller = ctx.current_task_id().unwrap_or(0);
+        kwarn!("security", "kill_init_denied"; caller = caller as u64);
         return SyscallError::PermissionDenied as i64;
     }
 
-    let caller_pid = current_pid();
+    let caller_pid = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::NoProcess as i64,
+    };
 
-    unsafe {
-        let sched = super::super::task::scheduler();
-
+    task::with_scheduler(|sched| {
         // Delegate to lifecycle module for permission check, state transition, and notification
         // NOTE: Resource cleanup is deferred to reap_terminated() for two-phase cleanup.
         match lifecycle::kill(sched, pid, caller_pid) {
@@ -424,22 +462,24 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
         // If killing current task, schedule next
         if pid == caller_pid {
             if let Some(next_slot) = sched.schedule() {
-                super::super::task::set_current_slot(next_slot);
+                task::set_current_slot(next_slot);
                 if let Some(next) = sched.task_mut(next_slot) {
                     let _ = next.set_running();
                 }
-                super::super::task::update_current_task_globals();
-                super::super::task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+                unsafe { task::update_current_task_globals(); }
+                task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
             }
         }
-    }
 
-    0  // Success
+        0  // Success
+    })
 }
 
 /// Get process info list
 /// Args: buf_ptr (pointer to ProcessInfo array), max_entries
 /// Returns: number of entries written
+///
+/// NOTE: This is a temporary syscall - pure microkernel will move this to init service.
 pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
     if max_entries == 0 {
         return 0;
@@ -451,10 +491,8 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
         return uaccess_to_errno(e);
     }
 
-    let mut count = 0usize;
-
-    unsafe {
-        let sched = super::super::task::scheduler();
+    task::with_scheduler(|sched| {
+        let mut count = 0usize;
 
         for (_slot, task_opt) in sched.iter_tasks() {
             if count >= max_entries {
@@ -492,10 +530,12 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
 
                 // Write to user buffer
                 let offset = (count * entry_size) as u64;
-                let info_bytes = core::slice::from_raw_parts(
-                    &info as *const ProcessInfo as *const u8,
-                    entry_size
-                );
+                let info_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &info as *const ProcessInfo as *const u8,
+                        entry_size
+                    )
+                };
 
                 if let Err(_) = uaccess::copy_to_user(buf_ptr + offset, info_bytes) {
                     break;
@@ -504,9 +544,9 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
                 count += 1;
             }
         }
-    }
 
-    count as i64
+        count as i64
+    })
 }
 
 /// Get capabilities of a process
@@ -517,19 +557,25 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
 /// executing privileged operations. Any process can query any other
 /// process's capabilities (they are not secret).
 pub(super) fn sys_get_capabilities(pid: u32) -> i64 {
-    let target_pid = if pid == 0 { current_pid() } else { pid };
+    let ctx = create_syscall_context();
+    let target_pid = if pid == 0 {
+        match ctx.current_task_id() {
+            Some(id) => id,
+            None => return SyscallError::NoProcess as i64,
+        }
+    } else {
+        pid
+    };
 
-    unsafe {
-        let sched = super::super::task::scheduler();
-
+    task::with_scheduler(|sched| {
         // Find the task by PID
         if let Some(slot) = sched.slot_by_pid(target_pid) {
             if let Some(task) = sched.task(slot) {
                 return task.capabilities.bits() as i64;
             }
         }
-    }
 
-    // Process not found
-    SyscallError::NoProcess as i64
+        // Process not found
+        SyscallError::NoProcess as i64
+    })
 }

@@ -41,7 +41,7 @@ pub enum SyscallNumber {
     // Core process/memory (0-10)
     Exit = 0,
     DebugWrite = 1,
-    Yield = 2,
+    // Yield = 2 - REMOVED: IPC blocking makes yield redundant in microkernel
     GetPid = 3,
     Mmap = 4,
     Munmap = 5,
@@ -60,7 +60,7 @@ pub enum SyscallNumber {
     Reset = 37,
     // 38-47: legacy shmem (removed) - use unified open/read/write/close
     // 51-54: legacy PCI config (removed) - use unified open/read/write
-    SignalAllow = 56,
+    // SignalAllow = 56 - REMOVED: replaced by capability-based permissions
     // 57-59: legacy timer/heartbeat/bus_list (removed)
     MmapDevice = 60,
     DmaPoolCreate = 61,
@@ -70,10 +70,10 @@ pub enum SyscallNumber {
     KlogRead = 65,
     GetCapabilities = 66,
     // 67: legacy ChannelGetPeer (removed)
-    CpuStats = 68,
+    // CpuStats = 68 - REMOVED: statistics belong in userspace service
     // 70-75: legacy kevent/device_list (removed) - use unified open/read
     ExecWithCaps = 74,
-    Klog = 76,
+    // Klog = 76 - REMOVED: logging goes through logd via IPC
 
     // 80-96: legacy handle system (removed) - use 100-104
 
@@ -94,7 +94,7 @@ impl From<u64> for SyscallNumber {
             // Core process/memory
             0 => SyscallNumber::Exit,
             1 => SyscallNumber::DebugWrite,
-            2 => SyscallNumber::Yield,
+            // 2 => Yield - REMOVED (microkernel: use IPC blocking)
             3 => SyscallNumber::GetPid,
             4 => SyscallNumber::Mmap,
             5 => SyscallNumber::Munmap,
@@ -111,7 +111,7 @@ impl From<u64> for SyscallNumber {
             37 => SyscallNumber::Reset,
             // 39-47: legacy shmem -> Invalid (use unified interface)
             // 51-54: legacy PCI -> Invalid (use unified interface)
-            56 => SyscallNumber::SignalAllow,
+            // 56 => SignalAllow - REMOVED (use capabilities)
             // 59: legacy BusList -> Invalid (use unified interface)
             60 => SyscallNumber::MmapDevice,
             61 => SyscallNumber::DmaPoolCreate,
@@ -120,10 +120,10 @@ impl From<u64> for SyscallNumber {
             64 => SyscallNumber::ExecMem,
             65 => SyscallNumber::KlogRead,
             66 => SyscallNumber::GetCapabilities,
-            68 => SyscallNumber::CpuStats,
+            // 68 => CpuStats - REMOVED (use service)
             74 => SyscallNumber::ExecWithCaps,
             // 75: legacy DeviceList -> Invalid (use unified interface)
-            76 => SyscallNumber::Klog,
+            // 76 => Klog - REMOVED (use logd via IPC)
             // Unified interface (100-104)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -245,10 +245,8 @@ pub fn handle(args: &SyscallArgs) -> i64 {
 
     // Skip tracing for very high-frequency syscalls to reduce overhead
     let should_trace = !matches!(syscall,
-        SyscallNumber::Yield |
         SyscallNumber::GetTime |
-        SyscallNumber::DebugWrite |
-        SyscallNumber::Klog
+        SyscallNumber::DebugWrite
     );
 
     // Create span for traceable syscalls
@@ -273,17 +271,17 @@ pub fn handle(args: &SyscallArgs) -> i64 {
 
         // Misc syscalls (misc.rs)
         SyscallNumber::DebugWrite => misc::sys_debug_write(args.arg0, args.arg1 as usize),
-        SyscallNumber::Yield => misc::sys_yield(),
+        // Yield removed - microkernel: IPC blocking makes yield redundant
         SyscallNumber::GetPid => misc::sys_getpid(),
         SyscallNumber::GetTime => misc::sys_gettime(),
         SyscallNumber::Sleep => misc::sys_sleep(args.arg0),
         SyscallNumber::SetLogLevel => misc::sys_set_log_level(args.arg0 as u8),
         SyscallNumber::KlogRead => misc::sys_klog_read(args.arg0, args.arg1 as usize),
         SyscallNumber::Reset => misc::sys_reset(),
-        SyscallNumber::SignalAllow => misc::sys_signal_allow(args.arg0 as u32),
-        SyscallNumber::CpuStats => misc::sys_cpu_stats(args.arg0, args.arg1 as usize),
+        // SignalAllow removed - use capability-based permissions
+        // CpuStats removed - use userspace service
         SyscallNumber::RamfsList => misc::sys_ramfs_list(args.arg0, args.arg1 as usize),
-        SyscallNumber::Klog => misc::sys_klog(args.arg0 as u8, args.arg1, args.arg2 as usize),
+        // Klog removed - use logd via IPC
 
         // Memory management (memory.rs)
         SyscallNumber::Mmap => memory::sys_mmap(args.arg0, args.arg1 as usize, args.arg2 as u32),
@@ -323,7 +321,6 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         // Core process/memory
         SyscallNumber::Exit => "exit",
         SyscallNumber::DebugWrite => "debug_write",
-        SyscallNumber::Yield => "yield",
         SyscallNumber::GetPid => "getpid",
         SyscallNumber::Mmap => "mmap",
         SyscallNumber::Munmap => "munmap",
@@ -339,7 +336,6 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::MmapDma => "mmap_dma",
         SyscallNumber::Reset => "reset",
         // Misc
-        SyscallNumber::SignalAllow => "signal_allow",
         SyscallNumber::MmapDevice => "mmap_device",
         SyscallNumber::DmaPoolCreate => "dma_pool_create",
         SyscallNumber::DmaPoolCreateHigh => "dma_pool_create_high",
@@ -347,9 +343,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::ExecMem => "exec_mem",
         SyscallNumber::KlogRead => "klog_read",
         SyscallNumber::GetCapabilities => "get_capabilities",
-        SyscallNumber::CpuStats => "cpu_stats",
         SyscallNumber::ExecWithCaps => "exec_with_caps",
-        SyscallNumber::Klog => "klog",
         // Unified interface (100-104)
         SyscallNumber::Open => "open",
         SyscallNumber::Read => "read",

@@ -1,145 +1,35 @@
 //! Miscellaneous Syscall Handlers
 //!
-//! This module contains various utility syscalls that don't fit into
-//! other categories:
+//! This module contains utility syscalls that don't fit into other categories:
 //!
-//! - Process control: `sys_yield`, `sys_getpid`, `sys_signal_allow`
-//! - Logging: `sys_debug_write`, `sys_klog`, `sys_klog_read`, `sys_set_log_level`
-//! - Time: `sys_gettime`
-//! - System: `sys_reset`, `sys_cpu_stats`, `sys_ramfs_list`
+//! - Process info: `sys_getpid`
+//! - Logging: `sys_debug_write`, `sys_klog_read`, `sys_set_log_level`
+//! - Time: `sys_gettime`, `sys_sleep`
+//! - System: `sys_reset`, `sys_ramfs_list`
+//!
+//! ## Removed Syscalls (Microkernel Design)
+//!
+//! The following syscalls were removed in favor of microkernel principles:
+//!
+//! - `sys_yield` - IPC blocking makes yield redundant
+//! - `sys_klog` - Logging goes through logd service via IPC
+//! - `sys_cpu_stats` - Statistics belong in userspace services
+//! - `sys_signal_allow` - Permission model uses capabilities
 
 use crate::print_direct;
-use super::super::uaccess::{self, UAccessError};
+use super::super::uaccess;
 use super::super::caps::Capabilities;
+use super::super::syscall_ctx_impl::create_syscall_context;
+use super::super::traits::syscall_ctx::SyscallContext;
 
 /// Syscall error codes (re-exported from parent for convenience)
 use super::SyscallError;
 
-/// Convert UAccessError to syscall error code
-fn uaccess_to_errno(e: UAccessError) -> i64 {
-    e.to_errno() as i64
-}
+// Use shared helpers from parent module
+use super::uaccess_to_errno;
 
-/// Get current process ID from scheduler
-fn current_pid() -> u32 {
-    unsafe {
-        super::super::task::scheduler().current_task_id().unwrap_or(1)
-    }
-}
-
-/// Check if current task has the required capability
-/// Returns Ok(()) if the capability is present, or an error code if not
-fn require_capability(cap: Capabilities) -> Result<(), i64> {
-    use crate::kwarn;
-
-    unsafe {
-        let sched = super::super::task::scheduler();
-        if let Some(task) = sched.current_task() {
-            if task.has_capability(cap) {
-                return Ok(());
-            }
-            // Log via security infrastructure
-            super::super::security_log::log_security_event(
-                super::super::security_log::SecurityEvent::CapabilityDenied,
-                task.id,
-                "", // cap name logged separately
-            );
-            kwarn!("security", "cap_denied"; pid = task.id as u64, cap = core::any::type_name_of_val(&cap));
-        }
-    }
-    Err(SyscallError::PermissionDenied as i64)
-}
-
-/// Yield CPU to another process.
-///
-/// SYSCALL ENTRY POINT - wraps internal sched::yield_current().
-///
-/// Key behavior:
-/// - If current task is Running, it becomes Ready and we reschedule
-/// - If current task is Blocked (waiting for event), it STAYS Blocked!
-///   This is critical - a blocked task calling yield should not become Ready.
-/// - If no other task is ready AND current is Blocked, we WFI until woken
-///
-/// This ensures proper event-driven behavior where blocked tasks only run
-/// when their event arrives.
-pub(super) fn sys_yield() -> i64 {
-    let caller_slot = super::super::task::current_slot();
-
-    // Pre-store return value in caller's trap frame
-    unsafe {
-        let sched = super::super::task::scheduler();
-        if let Some(task) = sched.task_mut(caller_slot) {
-            task.trap_frame.x0 = 0;
-        }
-    }
-
-    // Check if current task is blocked BEFORE yielding
-    let is_blocked = super::super::sched::is_current_blocked();
-
-    // Try to yield (this respects Blocked state - won't change it to Ready)
-    let switched = super::super::sched::yield_current();
-
-    if switched {
-        // We switched to another task
-        return 0;
-    }
-
-    // We're still the current task (no other ready task found)
-    // If we're Blocked, we MUST wait for an interrupt to wake us
-    // If we're Ready, just return (busy-wait caller will retry)
-
-    if is_blocked {
-        // Blocked task with no other ready tasks - must WFI until woken
-        // WFI loop until we're woken OR another task becomes ready
-        loop {
-            // Enable IRQs, WFI, disable IRQs
-            unsafe {
-                core::arch::asm!("msr daifclr, #2");  // Enable IRQs
-                core::arch::asm!("wfi");
-                core::arch::asm!("msr daifset, #2");  // Disable IRQs
-            }
-
-            // CRITICAL: Try to reschedule after WFI!
-            // The timer might have woken a DIFFERENT task (e.g., devd's timer fired).
-            // If another task became Ready and we switched to it, return immediately
-            // so svc_handler can perform the actual context switch.
-            if super::super::sched::reschedule() {
-                // We've set up a switch to another task - return now to execute it
-                return 0;
-            }
-
-            // Check if the ORIGINAL caller has been woken (Blocked -> Ready)
-            let still_blocked = unsafe {
-                let sched = super::super::task::scheduler();
-                sched.task(caller_slot)
-                    .map(|t| t.is_blocked())
-                    .unwrap_or(false)
-            };
-            if !still_blocked {
-                break;
-            }
-        }
-    } else {
-        // Not blocked, just no other tasks - do one WFI for power saving
-        unsafe {
-            core::arch::asm!("msr daifclr, #2");  // Enable IRQs
-            core::arch::asm!("wfi");
-            core::arch::asm!("msr daifset, #2");  // Disable IRQs
-        }
-    }
-
-    // Ensure we're marked Running before returning to userspace
-    unsafe {
-        let sched = super::super::task::scheduler();
-        if let Some(task) = sched.task_mut(caller_slot) {
-            if *task.state() == super::super::task::TaskState::Ready {
-                let _ = task.set_running();
-            }
-        }
-    }
-
-    0
-}
+// sys_yield REMOVED - Microkernel design: IPC blocking makes yield redundant.
+// A task with nothing to do blocks on its IPC endpoint waiting for work.
 
 /// Write to debug console - DIRECT UART OUTPUT
 /// SECURITY: Copies user buffer via page table translation
@@ -170,40 +60,13 @@ pub(super) fn sys_debug_write(buf_ptr: u64, len: usize) -> i64 {
     len as i64
 }
 
-/// Write structured log message
-/// level: 0=Error, 1=Warn, 2=Info, 3=Debug, 4=Trace
-/// Parses [subsys] prefix from message for structured output
-pub(super) fn sys_klog(level: u8, buf_ptr: u64, len: usize) -> i64 {
-    // Validate level
-    let log_level = match crate::klog::Level::from_u8(level) {
-        Some(l) => l,
-        None => return SyscallError::InvalidArgument as i64,
-    };
-
-    // Validate length
-    if len == 0 {
-        return 0;
-    }
-    if len > 4096 {
-        return SyscallError::InvalidArgument as i64;
-    }
-
-    // Copy from user space
-    let mut kernel_buf = [0u8; 4096];
-    match uaccess::copy_from_user(&mut kernel_buf[..len], buf_ptr) {
-        Ok(_) => {}
-        Err(e) => return uaccess_to_errno(e),
-    }
-
-    // Log via structured klog system
-    crate::klog::log_user_message(log_level, &kernel_buf[..len]);
-
-    len as i64
-}
+// sys_klog REMOVED - Microkernel design: logging goes through logd via IPC.
+// Userspace processes send log messages to logd service, not to kernel directly.
 
 /// Get current process ID
 pub(super) fn sys_getpid() -> i64 {
-    current_pid() as i64
+    let ctx = create_syscall_context();
+    ctx.current_task_id().unwrap_or(0) as i64
 }
 
 /// Get system time in nanoseconds
@@ -330,8 +193,9 @@ pub fn hardware_reset() -> ! {
 /// Reset/reboot the system syscall
 pub(super) fn sys_reset() -> i64 {
     // Only processes with ALL capabilities can reset the system
-    if let Err(e) = require_capability(Capabilities::ALL) {
-        return e;
+    let ctx = create_syscall_context();
+    if let Err(_) = ctx.require_capability(Capabilities::ALL.bits()) {
+        return SyscallError::PermissionDenied as i64;
     }
 
     print_direct!("\n========================================\n");
@@ -341,97 +205,11 @@ pub(super) fn sys_reset() -> i64 {
     hardware_reset();
 }
 
-/// Allow a specific PID to send signals to this process.
-///
-/// By default (empty allowlist), all processes can send signals. Once at least
-/// one PID is added to the allowlist, only those PIDs (plus the parent) can send.
-///
-/// Args: sender_pid - PID to allow signals from
-/// Returns: 0 on success, negative error
-pub(super) fn sys_signal_allow(sender_pid: u32) -> i64 {
-    unsafe {
-        let sched = super::super::task::scheduler();
-        if let Some(task) = sched.current_task_mut() {
-            if task.allow_signals_from(sender_pid) {
-                return 0;
-            } else {
-                return SyscallError::OutOfMemory as i64; // Allowlist full (-12)
-            }
-        }
-    }
-    SyscallError::NoProcess as i64
-}
+// sys_signal_allow REMOVED - Microkernel design: permission model uses capabilities.
+// Signal permissions are controlled via the capability system, not explicit allowlists.
 
-/// CPU statistics entry for userspace
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CpuStatsEntry {
-    /// CPU ID (0-based)
-    pub cpu_id: u32,
-    /// Reserved/padding
-    pub _pad: u32,
-    /// Total tick count since boot
-    pub tick_count: u64,
-    /// Ticks spent in idle (WFI)
-    pub idle_ticks: u64,
-}
-
-impl CpuStatsEntry {
-    const SIZE: usize = 24; // 4 + 4 + 8 + 8 = 24 bytes
-}
-
-/// Get CPU statistics
-/// Args: buf_ptr (output buffer for CpuStatsEntry array), buf_len (buffer size in bytes)
-/// Returns: number of CPUs on success, negative error on failure
-///
-/// Each entry is 24 bytes (CpuStatsEntry):
-/// - cpu_id[4]: u32 CPU ID
-/// - _pad[4]: padding
-/// - tick_count[8]: u64 total ticks
-/// - idle_ticks[8]: u64 idle ticks
-///
-/// Usage calculation: busy% = 100 * (1 - idle_ticks / tick_count)
-pub(super) fn sys_cpu_stats(buf_ptr: u64, buf_len: usize) -> i64 {
-    use super::super::percpu::{MAX_CPUS, cpu_local};
-
-    // Calculate how many entries we can fit
-    let max_entries = buf_len / CpuStatsEntry::SIZE;
-    if max_entries == 0 {
-        return SyscallError::InvalidArgument as i64;
-    }
-
-    // Validate user pointer for writing
-    if let Err(e) = uaccess::validate_user_write(buf_ptr, buf_len) {
-        return uaccess_to_errno(e);
-    }
-
-    // For now, only report one CPU (single-core implementation)
-    // In SMP, we'd iterate over all online CPUs
-    let num_cpus = 1.min(max_entries).min(MAX_CPUS);
-
-    // Get current CPU's stats
-    let cpu_data = cpu_local();
-    let entry = CpuStatsEntry {
-        cpu_id: cpu_data.cpu_id,
-        _pad: 0,
-        tick_count: cpu_data.ticks(),
-        idle_ticks: cpu_data.get_idle_ticks(),
-    };
-
-    // Convert to bytes and copy to userspace
-    let entry_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &entry as *const CpuStatsEntry as *const u8,
-            CpuStatsEntry::SIZE,
-        )
-    };
-
-    if let Err(e) = uaccess::copy_to_user(buf_ptr, entry_bytes) {
-        return uaccess_to_errno(e);
-    }
-
-    num_cpus as i64
-}
+// CpuStatsEntry and sys_cpu_stats REMOVED - Microkernel design: statistics belong in userspace.
+// A userspace service can track CPU usage via scheduler callbacks or performance counters.
 
 /// Ramfs list entry for userspace
 #[repr(C)]

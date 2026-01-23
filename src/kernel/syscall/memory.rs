@@ -7,12 +7,19 @@
 //! - `sys_mmap_device` - Map device MMIO into process address space
 //! - `sys_dma_pool_create` - Allocate from DMA pool (low memory for PCIe devices)
 //! - `sys_dma_pool_create_high` - Allocate from high DMA pool (36-bit addresses)
+//!
+//! # Trait-based Architecture
+//!
+//! Core memory operations (mmap/munmap) use the MemoryOps trait for clean separation.
+//! DMA/device mapping still uses direct implementation for now (will migrate to ObjectOps).
 
 #[allow(unused_imports)]  // Used for phys_to_dma method on dyn Platform
 use crate::hal::Platform;
 use super::super::uaccess;
 use super::super::caps::Capabilities;
-use super::{SyscallError, current_pid, require_capability, uaccess_to_errno};
+use super::super::syscall_ctx_impl::create_syscall_context;
+use super::super::traits::syscall_ctx::SyscallContext;
+use super::{SyscallError, uaccess_to_errno};
 
 /// Map memory pages into user address space
 /// Args: addr (hint, ignored for now), size, prot
@@ -26,16 +33,16 @@ pub(super) fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
     let writable = (prot & 0x2) != 0;  // PROT_WRITE
     let executable = (prot & 0x4) != 0; // PROT_EXEC
 
-    unsafe {
-        let sched = super::super::task::scheduler();
-        if let Some(task) = sched.current_task_mut() {
-            match task.mmap(size, writable, executable) {
-                Some(virt_addr) => virt_addr as i64,
-                None => SyscallError::OutOfMemory as i64,
-            }
-        } else {
-            SyscallError::InvalidArgument as i64
-        }
+    // Use trait-based context
+    let ctx = create_syscall_context();
+    let task_id = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::InvalidArgument as i64,
+    };
+
+    match ctx.memory().mmap(task_id, size, writable, executable) {
+        Ok(vaddr) => vaddr as i64,
+        Err(_) => SyscallError::OutOfMemory as i64,
     }
 }
 
@@ -49,10 +56,13 @@ pub(super) fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
 /// the appropriate translation is applied.
 ///
 /// SECURITY: Writes to user pointer via page table translation
+///
+/// NOTE: Legacy syscall - pure microkernel uses open(DmaPool) + map() instead.
 pub(super) fn sys_mmap_dma(size: usize, dma_ptr: u64) -> i64 {
     // Check DMA capability
-    if let Err(e) = require_capability(Capabilities::DMA) {
-        return e;
+    let ctx = create_syscall_context();
+    if let Err(_) = ctx.require_capability(Capabilities::DMA.bits()) {
+        return SyscallError::PermissionDenied as i64;
     }
 
     if size == 0 {
@@ -66,31 +76,31 @@ pub(super) fn sys_mmap_dma(size: usize, dma_ptr: u64) -> i64 {
         }
     }
 
-    unsafe {
-        let sched = super::super::task::scheduler();
-        if let Some(task) = sched.current_task_mut() {
-            match task.mmap_dma(size) {
-                Some((virt_addr, phys_addr)) => {
-                    // Convert physical address to DMA address using platform HAL
-                    let platform = crate::platform::mt7988::platform::platform();
-                    let dma_addr = platform.phys_to_dma(phys_addr);
+    super::super::task::with_scheduler(|sched| {
+        let task = match sched.current_task_mut() {
+            Some(t) => t,
+            None => return SyscallError::InvalidArgument as i64,
+        };
 
-                    // Write DMA address to user pointer
-                    if dma_ptr != 0 {
-                        if let Err(e) = uaccess::put_user::<u64>(dma_ptr, dma_addr) {
-                            // Unmap the allocation since we couldn't return the dma addr
-                            task.munmap(virt_addr, size);
-                            return uaccess_to_errno(e);
-                        }
+        match task.mmap_dma(size) {
+            Some((virt_addr, phys_addr)) => {
+                // Convert physical address to DMA address using platform HAL
+                let platform = crate::platform::mt7988::platform::platform();
+                let dma_addr = platform.phys_to_dma(phys_addr);
+
+                // Write DMA address to user pointer
+                if dma_ptr != 0 {
+                    if let Err(e) = uaccess::put_user::<u64>(dma_ptr, dma_addr) {
+                        // Unmap the allocation since we couldn't return the dma addr
+                        task.munmap(virt_addr, size);
+                        return uaccess_to_errno(e);
                     }
-                    virt_addr as i64
                 }
-                None => SyscallError::OutOfMemory as i64,
+                virt_addr as i64
             }
-        } else {
-            SyscallError::InvalidArgument as i64
+            None => SyscallError::OutOfMemory as i64,
         }
-    }
+    })
 }
 
 /// Unmap memory pages from user address space
@@ -106,17 +116,16 @@ pub(super) fn sys_munmap(addr: u64, size: usize) -> i64 {
         return SyscallError::BadAddress as i64;
     }
 
-    unsafe {
-        let sched = super::super::task::scheduler();
-        if let Some(task) = sched.current_task_mut() {
-            if task.munmap(addr, size) {
-                SyscallError::Success as i64
-            } else {
-                SyscallError::InvalidArgument as i64
-            }
-        } else {
-            SyscallError::InvalidArgument as i64
-        }
+    // Use trait-based context
+    let ctx = create_syscall_context();
+    let task_id = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::InvalidArgument as i64,
+    };
+
+    match ctx.memory().munmap(task_id, addr, size) {
+        Ok(()) => SyscallError::Success as i64,
+        Err(_) => SyscallError::InvalidArgument as i64,
     }
 }
 
@@ -125,10 +134,13 @@ pub(super) fn sys_munmap(addr: u64, size: usize) -> i64 {
 /// phys_addr: physical address of device MMIO region
 /// size: size in bytes to map
 /// Returns: virtual address on success, negative error on failure
+///
+/// NOTE: Legacy syscall - pure microkernel uses open(Mmio) + map() instead.
 pub(super) fn sys_mmap_device(phys_addr: u64, size: u64) -> i64 {
     // Require MMIO capability for device memory mapping
-    if let Err(e) = require_capability(Capabilities::MMIO) {
-        return e;
+    let ctx = create_syscall_context();
+    if let Err(_) = ctx.require_capability(Capabilities::MMIO.bits()) {
+        return SyscallError::PermissionDenied as i64;
     }
 
     // Validate size
@@ -138,17 +150,17 @@ pub(super) fn sys_mmap_device(phys_addr: u64, size: u64) -> i64 {
     }
 
     // Map into calling process's address space
-    unsafe {
-        let sched = super::super::task::scheduler();
-        if let Some(task) = sched.current_task_mut() {
-            match task.mmap_device(phys_addr, size as usize) {
-                Some(vaddr) => return vaddr as i64,
-                None => return SyscallError::OutOfMemory as i64,
+    super::super::task::with_scheduler(|sched| {
+        match sched.current_task_mut() {
+            Some(task) => {
+                match task.mmap_device(phys_addr, size as usize) {
+                    Some(vaddr) => vaddr as i64,
+                    None => SyscallError::OutOfMemory as i64,
+                }
             }
+            None => SyscallError::NoProcess as i64,
         }
-    }
-
-    SyscallError::NoProcess as i64
+    })
 }
 
 /// Allocate from DMA pool (low memory for PCIe devices)
@@ -158,10 +170,13 @@ pub(super) fn sys_mmap_device(phys_addr: u64, size: u64) -> i64 {
 /// This allocates from a pre-reserved pool of low memory (0x40100000-0x40300000)
 /// that some PCIe devices require for DMA operations. Use this instead of
 /// shmem_create when the device can't access higher memory addresses.
+///
+/// NOTE: Legacy syscall - pure microkernel uses open(DmaPool) + map() instead.
 pub(super) fn sys_dma_pool_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
     // Require DMA capability
-    if let Err(e) = require_capability(Capabilities::DMA) {
-        return e;
+    let ctx = create_syscall_context();
+    if let Err(_) = ctx.require_capability(Capabilities::DMA.bits()) {
+        return SyscallError::PermissionDenied as i64;
     }
 
     if size == 0 {
@@ -180,7 +195,10 @@ pub(super) fn sys_dma_pool_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -
         }
     }
 
-    let caller_pid = current_pid();
+    let caller_pid = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::NoProcess as i64,
+    };
 
     // Allocate from DMA pool
     let phys_addr = match super::super::dma_pool::alloc(size) {
@@ -213,9 +231,12 @@ pub(super) fn sys_dma_pool_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -
 ///
 /// Same interface as sys_dma_pool_create but allocates from high memory
 /// for devices that use 36-bit DMA addressing (like MT7996 TX buffers).
+///
+/// NOTE: Legacy syscall - pure microkernel uses open(DmaPool, HIGH) + map() instead.
 pub(super) fn sys_dma_pool_create_high(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
-    if let Err(e) = require_capability(Capabilities::DMA) {
-        return e;
+    let ctx = create_syscall_context();
+    if let Err(_) = ctx.require_capability(Capabilities::DMA.bits()) {
+        return SyscallError::PermissionDenied as i64;
     }
 
     if size == 0 {
@@ -233,7 +254,10 @@ pub(super) fn sys_dma_pool_create_high(size: usize, vaddr_ptr: u64, paddr_ptr: u
         }
     }
 
-    let caller_pid = current_pid();
+    let caller_pid = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return SyscallError::NoProcess as i64,
+    };
 
     // Allocate from HIGH DMA pool (36-bit addresses)
     let phys_addr = match super::super::dma_pool::alloc_high(size) {
