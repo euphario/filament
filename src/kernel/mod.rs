@@ -41,8 +41,11 @@ pub mod security_log;
 pub mod fdt;
 pub mod liveness;
 pub mod hw_poll;
+pub mod tickless;
 pub mod object;
 pub mod irq;
+pub mod object_service;
+pub mod blocking;
 
 // New syscall-facing trait implementations
 pub mod syscall_ctx_impl;

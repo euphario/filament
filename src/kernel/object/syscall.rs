@@ -22,7 +22,7 @@ use super::{Object, ObjectType, Handle, ConsoleType, Pollable};
 use super::types::Error;
 use crate::kernel::task;
 use crate::kernel::uaccess;
-use crate::platform::mt7988::uart;
+use crate::platform::current::uart;
 use crate::kernel::ipc;
 use crate::kernel::ipc::waker;
 use crate::kernel::shmem;
@@ -265,108 +265,60 @@ fn open_channel(params_ptr: u64, params_len: usize) -> i64 {
     // For channel pair: Returns both handles packed: (handle_a << 32) | handle_b
     // For port connect: Returns single channel handle
 
-    task::with_scheduler(|sched| {
+    use crate::kernel::object_service::object_service;
+
+    // Get current task ID
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let pid = task.id;
-
-        // Check if this is a port connect (params contains port name)
-        if params_len > 0 && params_len <= 32 {
-            // Per-process limit check (1 channel for connect)
-            if !task.can_create_channel() {
-                return Error::NoSpace.to_errno();
-            }
-            // Copy port name from user
-            let mut name_buf = [0u8; 32];
-            if uaccess::copy_from_user(&mut name_buf[..params_len], params_ptr).is_err() {
-                return Error::BadAddress.to_errno();
-            }
-
-            // Try to connect to the port
-            match ipc::port_connect(&name_buf[..params_len], pid) {
-                Ok((client_channel, wake_list)) => {
-                    // Wake the server that's waiting for connections
-                    waker::wake(&wake_list, ipc::WakeReason::Accepted);
-
-                    // Create ChannelObject for the client channel
-                    let ch_obj = Object::Channel(super::ChannelObject::new(client_channel));
-
-                    match task.object_table.alloc(ObjectType::Channel, ch_obj) {
-                        Some(handle) => {
-                            task.add_channel();  // Track resource usage
-                            return handle.raw() as i64;
-                        }
-                        None => {
-                            let _ = ipc::close_channel(client_channel, pid);
-                            return Error::NoSpace.to_errno();
-                        }
-                    }
-                }
-                Err(ipc::IpcError::PortNotFound) => return Error::NotFound.to_errno(),
-                Err(e) => return e.to_errno(),
-            }
+    // Check if this is a port connect (params contains port name)
+    if params_len > 0 && params_len <= 32 {
+        // Copy port name from user
+        let mut name_buf = [0u8; 32];
+        if uaccess::copy_from_user(&mut name_buf[..params_len], params_ptr).is_err() {
+            return Error::BadAddress.to_errno();
         }
 
-        // Per-process limit check (need space for 2 channels in pair)
-        if task.channel_count + 2 > task::MAX_CHANNELS_PER_TASK {
-            return Error::NoSpace.to_errno();
+        // Delegate to ObjectService
+        match object_service().open_channel_connect(task_id, &name_buf[..params_len]) {
+            Ok(handle) => handle.raw() as i64,
+            Err(e) => e.to_errno(),
         }
-
-        // Create channel pair (no params)
-        let (ch_a, ch_b) = match ipc::create_channel_pair(pid, pid) {
-            Ok(pair) => pair,
-            Err(e) => return e.to_errno(),
-        };
-
-        // Create ChannelObject for channel A
-        let obj_a = Object::Channel(super::ChannelObject::new(ch_a));
-
-        let Some(handle_a) = task.object_table.alloc(ObjectType::Channel, obj_a) else {
-            let _ = ipc::close_channel(ch_a, pid);
-            let _ = ipc::close_channel(ch_b, pid);
-            return Error::NoSpace.to_errno();
-        };
-
-        // Create ChannelObject for channel B
-        let obj_b = Object::Channel(super::ChannelObject::new(ch_b));
-
-        let Some(handle_b) = task.object_table.alloc(ObjectType::Channel, obj_b) else {
-            let _ = task.object_table.close(handle_a);
-            let _ = ipc::close_channel(ch_a, pid);
-            let _ = ipc::close_channel(ch_b, pid);
-            return Error::NoSpace.to_errno();
-        };
-
-        // Track resource usage (both channels created successfully)
-        task.add_channel();
-        task.add_channel();
-
-        // Pack both handles into return value
-        ((handle_a.raw() as i64) << 32) | (handle_b.raw() as i64)
-    })
+    } else {
+        // Create channel pair
+        match object_service().open_channel_pair(task_id) {
+            Ok((handle_a, handle_b)) => {
+                // Pack both handles into return value
+                ((handle_a.raw() as i64) << 32) | (handle_b.raw() as i64)
+            }
+            Err(e) => e.to_errno(),
+        }
+    }
 }
 
 fn open_timer(_params_ptr: u64, _params_len: usize) -> i64 {
-    task::with_scheduler(|sched| {
+    // Get current task ID
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        // Create timer object
-        let timer_obj = Object::Timer(super::TimerObject::new());
-
-        // Allocate handle
-        match task.object_table.alloc(ObjectType::Timer, timer_obj) {
-            Some(handle) => handle.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_timer(task_id) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_process(params_ptr: u64, params_len: usize) -> i64 {
@@ -382,39 +334,21 @@ fn open_process(params_ptr: u64, params_len: usize) -> i64 {
     }
     let target_pid = u32::from_le_bytes(pid_bytes);
 
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        // First, check target task state (before borrowing caller's task)
-        let exit_code = if let Some(target_slot) = sched.slot_by_pid(target_pid) {
-            if let Some(target) = sched.task(target_slot) {
-                target.state().exit_code()
-            } else {
-                Some(-1) // Slot exists but task is None
-            }
-        } else {
-            // Task not found - may have already exited and been reaped
-            Some(-1)
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        // Now borrow caller's task to allocate handle
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
-
-        // Create ProcessObject
-        let proc_obj = Object::Process(super::ProcessObject {
-            pid: target_pid,
-            exit_code,
-            subscriber: None,
-        });
-
-        // Allocate handle
-        match task.object_table.alloc(ObjectType::Process, proc_obj) {
-            Some(handle) => handle.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_process(task_id, target_pid) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_port(params_ptr: u64, params_len: usize) -> i64 {
@@ -429,42 +363,22 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
         return Error::BadAddress.to_errno();
     }
 
-    task::with_scheduler(|sched| {
+    // Get current task ID
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let pid = task.id;
-
-        // Per-process port limit check
-        if !task.can_create_port() {
-            return Error::NoSpace.to_errno();
-        }
-
-        // Register port with ipc backend
-        let (port_id, _listen_channel) = match ipc::port_register(&name_buf[..params_len], pid) {
-            Ok(result) => result,
-            Err(e) => return e.to_errno(),
-        };
-
-        // Create PortObject using new constructor
-        let port_obj = super::PortObject::new(port_id, &name_buf[..params_len]);
-        let obj = Object::Port(port_obj);
-
-        match task.object_table.alloc(ObjectType::Port, obj) {
-            Some(h) => {
-                task.add_port();  // Track resource usage
-                h.raw() as i64
-            }
-            None => {
-                // Cleanup: unregister the port
-                let _ = ipc::port_unregister(port_id, pid);
-                Error::NoSpace.to_errno()
-            }
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_port(task_id, &name_buf[..params_len]) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_shmem(params_ptr: u64, params_len: usize) -> i64 {
@@ -486,38 +400,21 @@ fn open_shmem_create(params_ptr: u64) -> i64 {
     }
     let size = u64::from_le_bytes(size_bytes) as usize;
 
-    if size == 0 {
-        return Error::InvalidArg.to_errno();
-    }
-
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let pid = task.id;
-
-        // Create shmem region
-        match shmem::create(pid, size) {
-            Ok((shmem_id, vaddr, paddr)) => {
-                // Create ShmemObject
-                let obj = Object::Shmem(super::ShmemObject::new(shmem_id, paddr, size, vaddr));
-
-                // Allocate handle
-                match task.object_table.alloc(ObjectType::Shmem, obj) {
-                    Some(handle) => handle.raw() as i64,
-                    None => {
-                        // Cleanup: destroy the shmem region
-                        let _ = shmem::destroy(shmem_id, pid);
-                        Error::NoSpace.to_errno()
-                    }
-                }
-            }
-            Err(e) => e, // shmem::create returns errno directly
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_shmem_create(task_id, size) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_shmem_existing(params_ptr: u64) -> i64 {
@@ -528,42 +425,24 @@ fn open_shmem_existing(params_ptr: u64) -> i64 {
     }
     let shmem_id = u32::from_le_bytes(id_bytes);
 
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let pid = task.id;
-
-        // Map existing shmem region
-        match shmem::map(pid, shmem_id) {
-            Ok((vaddr, paddr)) => {
-                // Get size from shmem module
-                let size = shmem::get_size(shmem_id).unwrap_or(0);
-
-                // Create ShmemObject
-                let obj = Object::Shmem(super::ShmemObject::new(shmem_id, paddr, size, vaddr));
-
-                // Allocate handle
-                match task.object_table.alloc(ObjectType::Shmem, obj) {
-                    Some(handle) => handle.raw() as i64,
-                    None => {
-                        // Cleanup: unmap
-                        let _ = shmem::unmap(pid, shmem_id);
-                        Error::NoSpace.to_errno()
-                    }
-                }
-            }
-            Err(e) => e,
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_shmem_existing(task_id, shmem_id) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
-    use crate::kernel::dma_pool;
-
     // Params: u64 size, u32 flags (16 bytes)
     // flags bit 0: 1 = high memory pool, 0 = low memory pool
     if params_len != 16 {
@@ -583,58 +462,21 @@ fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
     let flags = u32::from_le_bytes([params[8], params[9], params[10], params[11]]);
     let use_high = (flags & 1) != 0;
 
-    if size == 0 {
-        return Error::InvalidArg.to_errno();
-    }
-
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let pid = task.id;
-
-        // Allocate from appropriate pool
-        let paddr = if use_high {
-            match dma_pool::alloc_high(size) {
-                Ok(addr) => addr,
-                Err(e) => return e,
-            }
-        } else {
-            match dma_pool::alloc(size) {
-                Ok(addr) => addr,
-                Err(e) => return e,
-            }
-        };
-
-        // Map into process
-        let vaddr = if use_high {
-            match dma_pool::map_into_process_high(pid, paddr, size) {
-                Ok(addr) => addr,
-                Err(e) => return e,
-            }
-        } else {
-            match dma_pool::map_into_process(pid, paddr, size) {
-                Ok(addr) => addr,
-                Err(e) => return e,
-            }
-        };
-
-        // Create DmaPoolObject
-        let obj = Object::DmaPool(super::DmaPoolObject::new(paddr, size, vaddr));
-
-        // Allocate handle
-        match task.object_table.alloc(ObjectType::DmaPool, obj) {
-            Some(handle) => handle.raw() as i64,
-            None => {
-                // Note: DMA pool doesn't have a free function, memory is leaked
-                // This is acceptable for now - DMA allocations are typically long-lived
-                Error::NoSpace.to_errno()
-            }
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_dma_pool(task_id, size, use_high) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_mmio(params_ptr: u64, params_len: usize) -> i64 {
@@ -658,98 +500,76 @@ fn open_mmio(params_ptr: u64, params_len: usize) -> i64 {
         params[12], params[13], params[14], params[15],
     ]) as usize;
 
-    if size == 0 {
-        return Error::InvalidArg.to_errno();
-    }
-
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        // Map MMIO into process
-        let vaddr = match task.mmap_device(phys_addr, size) {
-            Some(addr) => addr,
-            None => return Error::NoSpace.to_errno(),
-        };
-
-        // Create MmioObject
-        let obj = Object::Mmio(super::MmioObject::new(phys_addr, size, vaddr));
-
-        // Allocate handle
-        match task.object_table.alloc(ObjectType::Mmio, obj) {
-            Some(handle) => handle.raw() as i64,
-            None => {
-                // MMIO mappings stay until process exits (no unmap function)
-                Error::NoSpace.to_errno()
-            }
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_mmio(task_id, phys_addr, size) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_console(console_type: super::ConsoleType) -> i64 {
-    task::with_scheduler(|sched| {
+    // Get current task ID
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let obj = Object::Console(super::ConsoleObject {
-            console_type,
-            subscriber: None,
-        });
-
-        let obj_type = match console_type {
-            super::ConsoleType::Stdin => ObjectType::Stdin,
-            super::ConsoleType::Stdout => ObjectType::Stdout,
-            super::ConsoleType::Stderr => ObjectType::Stderr,
-        };
-
-        match task.object_table.alloc(obj_type, obj) {
-            Some(h) => h.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_console(task_id, console_type) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_klog(_params_ptr: u64, _params_len: usize) -> i64 {
-    // No params needed - creates a kernel log reader handle
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        // Create KlogObject
-        let obj = Object::Klog(super::KlogObject::new());
-
-        // Allocate handle
-        match task.object_table.alloc(ObjectType::Klog, obj) {
-            Some(handle) => handle.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_klog(task_id) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_mux(_params_ptr: u64, _params_len: usize) -> i64 {
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let obj = Object::Mux(super::MuxObject::default());
-
-        match task.object_table.alloc(ObjectType::Mux, obj) {
-            Some(h) => h.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_mux(task_id) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_pci_bus(params_ptr: u64, params_len: usize) -> i64 {
@@ -767,22 +587,21 @@ fn open_pci_bus(params_ptr: u64, params_len: usize) -> i64 {
         return Error::InvalidArg.to_errno();
     };
 
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        // Create PciBusObject
-        let obj = Object::PciBus(super::PciBusObject::new(bdf_filter));
-
-        // Allocate handle
-        match task.object_table.alloc(ObjectType::PciBus, obj) {
-            Some(handle) => handle.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_pci_bus(task_id, bdf_filter) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
@@ -811,20 +630,21 @@ fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
         return Error::NotFound.to_errno();
     }
 
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let obj = Object::PciDevice(super::PciDeviceObject::new(bdf));
-
-        match task.object_table.alloc(ObjectType::PciDevice, obj) {
-            Some(handle) => handle.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_pci_device(task_id, bdf) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
@@ -857,11 +677,11 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
     };
 
     // Get current pid via safe scheduler access
-    let pid = task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         sched.current_task().map(|t| t.id).unwrap_or(0)
     });
 
-    if dev.owner() != pid {
+    if dev.owner() != task_id {
         return Error::PermDenied.to_errno();
     }
 
@@ -877,37 +697,30 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
         Err(_) => return Error::Io.to_errno(),
     };
 
-    task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
-
-        let obj = Object::Msi(super::MsiObject::new(bdf, first_irq, count));
-
-        match task.object_table.alloc(ObjectType::Msi, obj) {
-            Some(handle) => handle.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_msi(task_id, bdf, first_irq, count) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 fn open_bus_list(_params_ptr: u64, _params_len: usize) -> i64 {
-    task::with_scheduler(|sched| {
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let obj = Object::BusList(super::BusListObject::new());
-
-        match task.object_table.alloc(ObjectType::BusList, obj) {
-            Some(handle) => handle.raw() as i64,
-            None => Error::NoSpace.to_errno(),
-        }
-    })
+    // Delegate to ObjectService
+    use crate::kernel::object_service::object_service;
+    match object_service().open_bus_list(task_id) {
+        Ok(handle) => handle.raw() as i64,
+        Err(e) => e.to_errno(),
+    }
 }
 
 // Read implementations
@@ -956,7 +769,7 @@ fn read_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> 
 
 fn read_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
     use super::TimerState;
-    use crate::platform::mt7988::timer;
+    use crate::platform::current::timer;
 
     let current_tick = timer::ticks();
 
@@ -1064,7 +877,7 @@ fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u
         return Error::PeerClosed.to_errno();
     }
 
-    let port_id = p.port_id;
+    let port_id = p.port_id();
 
     // Accept connection from ipc
     match ipc::port_accept(port_id, task_id) {
@@ -1480,7 +1293,7 @@ fn read_mux_impl(task: &mut crate::kernel::task::Task, mux_handle: Handle, buf_p
             }
             Object::Timer(t) => {
                 if (watch.filter & filter::READABLE) != 0 {
-                    let now = crate::platform::mt7988::timer::ticks();
+                    let now = crate::platform::current::timer::ticks();
                     t.deadline > 0 && now >= t.deadline
                 } else {
                     false
@@ -1605,7 +1418,7 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
 }
 
 fn write_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    use crate::platform::mt7988::timer;
+    use crate::platform::current::timer;
 
     // Format: [deadline_ns: u64] or [deadline_ns: u64, interval_ns: u64]
     if buf_len < 8 {
