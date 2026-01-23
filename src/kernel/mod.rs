@@ -16,6 +16,7 @@ pub mod task;
 pub mod sched;
 pub mod sched_impl; // SchedulerBackend trait implementation
 pub mod process;
+pub mod process_impl; // ProcessBackend trait implementation
 pub mod syscall;
 pub mod memory;  // User memory mapping types
 pub(crate) mod ipc;    // IPC system - internal, use object/ for public API
