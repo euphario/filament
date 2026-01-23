@@ -118,7 +118,7 @@ impl SchedulerBackend for KernelSchedulerBackend {
     }
 
     fn current_tick(&self) -> u64 {
-        crate::platform::mt7988::timer::ticks()
+        crate::platform::current::timer::ticks()
     }
 
     fn note_deadline(&self, deadline: u64) {

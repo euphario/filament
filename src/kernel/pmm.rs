@@ -39,11 +39,11 @@
 
 use crate::{kinfo, kwarn, kdebug, print_direct, klog};
 use crate::arch::aarch64::mmu;
-use crate::platform::mt7988::{DRAM_BASE, DRAM_END};
+use crate::platform::current::{DRAM_BASE, DRAM_END};
 use super::lock::SpinLock;
 
 /// Page size (4KB) - re-exported for other modules
-pub const PAGE_SIZE: usize = crate::platform::mt7988::PAGE_SIZE;
+pub const PAGE_SIZE: usize = crate::platform::current::PAGE_SIZE;
 
 /// Sentinel value for end of free list
 const FREE_LIST_END: u32 = u32::MAX;

@@ -20,6 +20,7 @@ pub mod sd;
 pub mod i2c;
 pub mod wdt;
 pub mod platform;
+pub mod bus;
 
 // =============================================================================
 // Platform Constants

@@ -54,7 +54,7 @@ pub(super) fn sys_debug_write(buf_ptr: u64, len: usize) -> i64 {
 
     // Write DIRECTLY to UART, bypassing all buffering
     for &byte in &kernel_buf[..len] {
-        crate::platform::mt7988::uart::putc(byte as char);
+        crate::platform::current::uart::putc(byte as char);
     }
 
     len as i64
@@ -71,8 +71,8 @@ pub(super) fn sys_getpid() -> i64 {
 
 /// Get system time in nanoseconds
 pub(super) fn sys_gettime() -> i64 {
-    let counter = crate::platform::mt7988::timer::counter();
-    let freq = crate::platform::mt7988::timer::frequency();
+    let counter = crate::platform::current::timer::counter();
+    let freq = crate::platform::current::timer::frequency();
     // Convert counter to nanoseconds
     if freq > 0 {
         ((counter as u128 * 1_000_000_000) / freq as u128) as i64
@@ -90,7 +90,7 @@ pub(super) fn sys_sleep(deadline_ns: u64) -> i64 {
     use crate::kernel::{sched, task::WaitReason};
 
     // Convert ns deadline to timer ticks
-    let freq = crate::platform::mt7988::timer::frequency();
+    let freq = crate::platform::current::timer::frequency();
     let deadline_ticks = if freq > 0 {
         ((deadline_ns as u128 * freq as u128) / 1_000_000_000) as u64
     } else {
@@ -98,7 +98,7 @@ pub(super) fn sys_sleep(deadline_ns: u64) -> i64 {
     };
 
     // Check if deadline already passed
-    let now = crate::platform::mt7988::timer::counter();
+    let now = crate::platform::current::timer::counter();
     if now >= deadline_ticks {
         return 0; // Already past deadline, return immediately
     }
@@ -164,27 +164,106 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
     }
 }
 
-/// Perform hardware reset using MT7988A watchdog
+/// Write a log message to kernel log buffer
+/// Args: level (0=Error, 1=Warn, 2=Info, 3=Debug, 4=Trace), buf (message), len (length)
+/// This is a compatibility shim - userspace should migrate to Klog object
+pub(super) fn sys_klog(level: u8, buf_ptr: u64, buf_len: usize) -> i64 {
+    // Validate level
+    let level = match crate::klog::Level::from_u8(level) {
+        Some(l) => l,
+        None => return SyscallError::InvalidArgument as i64,
+    };
+
+    // Validate buffer size
+    if buf_len == 0 || buf_len > 256 {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Copy message from userspace
+    let mut msg_buf = [0u8; 256];
+    match uaccess::copy_from_user(&mut msg_buf[..buf_len], buf_ptr) {
+        Ok(_) => {}
+        Err(_) => return SyscallError::BadAddress as i64,
+    }
+
+    // Build a log record
+    // Format: subsys="user", event=<message>
+    let msg = &msg_buf[..buf_len];
+
+    // Use RecordBuilder to write to log ring
+    let mut builder = crate::klog::RecordBuilder::new();
+    builder.header(level);
+    builder.subsys("user");
+
+    // Parse the message to extract event name if possible
+    // Format expected: "[name] message..." or just "message"
+    let (event, _rest) = if msg.starts_with(b"[") {
+        // Try to extract name from [name] prefix
+        if let Some(end) = msg.iter().position(|&c| c == b']') {
+            let name = core::str::from_utf8(&msg[1..end]).unwrap_or("msg");
+            (name, &msg[end + 1..])
+        } else {
+            ("msg", msg)
+        }
+    } else {
+        ("msg", msg)
+    };
+
+    builder.event(event);
+    builder.ctx_count(0);
+
+    // Add the full message as a key-value pair
+    if let Ok(text) = core::str::from_utf8(msg) {
+        builder.kv_count(1);
+        builder.kv("text", text);
+    } else {
+        builder.kv_count(0);
+    }
+
+    builder.finish();
+
+    buf_len as i64
+}
+
+/// Perform hardware reset
 /// This is public so it can be called from devd watchdog recovery
 pub fn hardware_reset() -> ! {
-    use crate::arch::aarch64::mmio::MmioRegion;
-    use crate::arch::aarch64::mmu;
-    use crate::platform::mt7988 as platform;
+    #[cfg(feature = "platform-mt7988a")]
+    {
+        use crate::arch::aarch64::mmio::MmioRegion;
+        use crate::arch::aarch64::mmu;
+        use crate::platform::mt7988 as platform;
 
-    let wdt = MmioRegion::new(mmu::phys_to_virt(platform::TOPRGU_BASE as u64) as usize);
+        let wdt = MmioRegion::new(mmu::phys_to_virt(platform::TOPRGU_BASE as u64) as usize);
 
-    const WDT_MODE: usize = 0x00;
-    const WDT_SWRST: usize = 0x14;
-    const WDT_MODE_KEY: u32 = 0x2200_0000;
-    const WDT_MODE_EXTEN: u32 = 1 << 2;
-    const WDT_MODE_EN: u32 = 1 << 0;
-    const WDT_SWRST_KEY: u32 = 0x1209;
+        const WDT_MODE: usize = 0x00;
+        const WDT_SWRST: usize = 0x14;
+        const WDT_MODE_KEY: u32 = 0x2200_0000;
+        const WDT_MODE_EXTEN: u32 = 1 << 2;
+        const WDT_MODE_EN: u32 = 1 << 0;
+        const WDT_SWRST_KEY: u32 = 0x1209;
 
-    wdt.write32(WDT_MODE, WDT_MODE_KEY | WDT_MODE_EXTEN | WDT_MODE_EN);
-    crate::arch::aarch64::mmio::dsb();
-    wdt.write32(WDT_SWRST, WDT_SWRST_KEY);
-    crate::arch::aarch64::mmio::dsb();
+        wdt.write32(WDT_MODE, WDT_MODE_KEY | WDT_MODE_EXTEN | WDT_MODE_EN);
+        crate::arch::aarch64::mmio::dsb();
+        wdt.write32(WDT_SWRST, WDT_SWRST_KEY);
+        crate::arch::aarch64::mmio::dsb();
+    }
 
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        // QEMU virt: Use PSCI SYSTEM_RESET (0x84000009)
+        const PSCI_SYSTEM_RESET: u64 = 0x84000009;
+        unsafe {
+            core::arch::asm!(
+                "hvc #0",
+                in("x0") PSCI_SYSTEM_RESET,
+                options(noreturn)
+            );
+        }
+    }
+
+    // Fallback: halt (unreachable on platforms with reset implemented)
+    #[allow(unreachable_code)]
     loop {
         unsafe { core::arch::asm!("wfi"); }
     }

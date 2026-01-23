@@ -432,7 +432,7 @@ pub fn drain_one() -> bool {
 
     let text_len = format_event(&event_buf[..len], &mut text_buf);
     if text_len > 0 {
-        crate::platform::mt7988::uart::write_buffered(&text_buf[..text_len]);
+        crate::platform::current::uart::write_buffered(&text_buf[..text_len]);
     }
 
     true
@@ -441,7 +441,7 @@ pub fn drain_one() -> bool {
 /// Flush all pending trace events
 pub fn flush() {
     while drain_one() {}
-    crate::platform::mt7988::uart::flush_buffer();
+    crate::platform::current::uart::flush_buffer();
 }
 
 /// Check if there are pending events

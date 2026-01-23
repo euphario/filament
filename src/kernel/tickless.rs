@@ -14,7 +14,7 @@
 //! - Liveness checks (periodic probing of blocked tasks)
 //! - Watchdog (must kick periodically)
 
-use super::task::{scheduler, TaskState, MAX_TASKS};
+use super::task::scheduler;
 use super::liveness::LIVENESS_CHECK_INTERVAL;
 
 /// Maximum time to sleep (in ticks) - ensures watchdog doesn't expire
@@ -27,43 +27,24 @@ const MIN_SLEEP_TICKS: u64 = 1;
 /// Calculate the next timer deadline
 /// Returns the tick count when the timer should fire next
 pub fn next_deadline(current_tick: u64) -> u64 {
-    let mut soonest = current_tick + MAX_SLEEP_TICKS;
+    // Get the scheduler's tracked next deadline
+    let sched_deadline = unsafe {
+        scheduler().get_next_deadline()
+    };
 
-    unsafe {
-        let sched = scheduler();
-
-        for slot in 0..MAX_TASKS {
-            if let Some(ref task) = sched.tasks[slot] {
-                // Check Waiting state deadline (request-response with deadline)
-                if let TaskState::Waiting { deadline, .. } = task.state {
-                    if deadline < soonest {
-                        soonest = deadline;
-                    }
-                }
-
-                // Check Dying state deadline (cleanup deadline)
-                if let TaskState::Dying { until, .. } = task.state {
-                    if until < soonest {
-                        soonest = until;
-                    }
-                }
-
-                // Check all task timers
-                for timer in &task.timers {
-                    if timer.is_active() && timer.deadline < soonest {
-                        soonest = timer.deadline;
-                    }
-                }
-            }
-        }
-    }
+    // Use scheduler's deadline if it's valid and sooner
+    let soonest = if sched_deadline > current_tick && sched_deadline < current_tick + MAX_SLEEP_TICKS {
+        sched_deadline
+    } else {
+        current_tick + MAX_SLEEP_TICKS
+    };
 
     // Ensure we don't return a deadline in the past
     if soonest <= current_tick {
-        soonest = current_tick + MIN_SLEEP_TICKS;
+        current_tick + MIN_SLEEP_TICKS
+    } else {
+        soonest
     }
-
-    soonest
 }
 
 /// Calculate how many ticks until the next deadline
@@ -103,12 +84,28 @@ pub fn reprogram_timer(current_tick: u64) {
 
 /// Platform-specific: set the timer to fire after `ticks` timer ticks
 fn set_next_timer(ticks: u64) {
-    // This would call into platform/mt7988/timer.rs
-    // to reprogram CNTP_TVAL with the calculated value
-    //
-    // For now, this is a stub - the actual implementation
-    // would replace the fixed reload in handle_irq
-    let _ = ticks;
+    // Convert scheduler ticks (10ms each) to timer ticks
+    let freq = crate::platform::current::timer::frequency();
+    // Each scheduler tick is 10ms, so multiply by 10 and convert to timer ticks
+    let timer_ticks = (ticks * freq * 10) / 1000;
+
+    // Clamp to reasonable bounds
+    let timer_ticks = timer_ticks.max(freq / 100).min(freq * 10); // 10ms to 10s
+
+    // Program the timer
+    unsafe {
+        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) timer_ticks);
+        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64); // Enable
+        core::arch::asm!("isb");
+    }
+
+    // Track stats
+    unsafe {
+        STATS.tickless_entries += 1;
+        if ticks > STATS.longest_sleep {
+            STATS.longest_sleep = ticks;
+        }
+    }
 }
 
 // =============================================================================

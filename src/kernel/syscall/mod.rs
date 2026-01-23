@@ -73,16 +73,17 @@ pub enum SyscallNumber {
     // CpuStats = 68 - REMOVED: statistics belong in userspace service
     // 70-75: legacy kevent/device_list (removed) - use unified open/read
     ExecWithCaps = 74,
-    // Klog = 76 - REMOVED: logging goes through logd via IPC
+    Klog = 76,  // Compatibility shim - writes to klog ring buffer
 
     // 80-96: legacy handle system (removed) - use 100-104
 
-    // Unified interface (100-104) - THE 5 SYSCALLS
+    // Unified interface (100-105) - THE 6 SYSCALLS
     Open = 100,
     Read = 101,
     Write = 102,
     Map = 103,
     Close = 104,
+    UnifiedExit = 105,  // Exit via unified interface (same as Exit=0)
 
     /// Invalid/unknown syscall
     Invalid = 0xFFFF,
@@ -123,13 +124,14 @@ impl From<u64> for SyscallNumber {
             // 68 => CpuStats - REMOVED (use service)
             74 => SyscallNumber::ExecWithCaps,
             // 75: legacy DeviceList -> Invalid (use unified interface)
-            // 76 => Klog - REMOVED (use logd via IPC)
-            // Unified interface (100-104)
+            76 => SyscallNumber::Klog,
+            // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
             102 => SyscallNumber::Write,
             103 => SyscallNumber::Map,
             104 => SyscallNumber::Close,
+            105 => SyscallNumber::UnifiedExit,
             // All other numbers (legacy IPC, FD, handle, event) -> Invalid
             _ => SyscallNumber::Invalid,
         }
@@ -277,11 +279,11 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Sleep => misc::sys_sleep(args.arg0),
         SyscallNumber::SetLogLevel => misc::sys_set_log_level(args.arg0 as u8),
         SyscallNumber::KlogRead => misc::sys_klog_read(args.arg0, args.arg1 as usize),
+        SyscallNumber::Klog => misc::sys_klog(args.arg0 as u8, args.arg1, args.arg2 as usize),
         SyscallNumber::Reset => misc::sys_reset(),
         // SignalAllow removed - use capability-based permissions
         // CpuStats removed - use userspace service
         SyscallNumber::RamfsList => misc::sys_ramfs_list(args.arg0, args.arg1 as usize),
-        // Klog removed - use logd via IPC
 
         // Memory management (memory.rs)
         SyscallNumber::Mmap => memory::sys_mmap(args.arg0, args.arg1 as usize, args.arg2 as u32),
@@ -293,12 +295,13 @@ pub fn handle(args: &SyscallArgs) -> i64 {
 
         // Legacy shmem (39-47) and PCI (51-54, 59, 75) removed - use unified interface (100-104)
 
-        // Unified interface (100-104) - THE 5 SYSCALLS
+        // Unified interface (100-105) - THE 6 SYSCALLS
         SyscallNumber::Open => super::object::syscall::open(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::Read => super::object::syscall::read(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::Write => super::object::syscall::write(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::Map => super::object::syscall::map(args.arg0 as u32, args.arg1 as u32),
         SyscallNumber::Close => super::object::syscall::close(args.arg0 as u32),
+        SyscallNumber::UnifiedExit => process::sys_exit(args.arg0 as i32),
 
         // Invalid or legacy syscall numbers -> ENOSYS
         SyscallNumber::Invalid => {
@@ -342,14 +345,16 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::RamfsList => "ramfs_list",
         SyscallNumber::ExecMem => "exec_mem",
         SyscallNumber::KlogRead => "klog_read",
+        SyscallNumber::Klog => "klog",
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::ExecWithCaps => "exec_with_caps",
-        // Unified interface (100-104)
+        // Unified interface (100-105)
         SyscallNumber::Open => "open",
         SyscallNumber::Read => "read",
         SyscallNumber::Write => "write",
         SyscallNumber::Map => "map",
         SyscallNumber::Close => "close",
+        SyscallNumber::UnifiedExit => "exit",
         SyscallNumber::Invalid => "invalid",
     }
 }
@@ -371,7 +376,7 @@ pub extern "C" fn syscall_handler_rust(
         let slot = super::task::current_slot();
         let sched = super::task::scheduler();
         if let Some(task) = sched.task_mut(slot) {
-            task.last_activity_tick = crate::platform::mt7988::timer::ticks();
+            task.last_activity_tick = crate::platform::current::timer::ticks();
 
             // Reset liveness state if we're in PingSent with channel=0 (implicit pong)
             // The syscall itself IS the pong - proves the task is alive and responsive

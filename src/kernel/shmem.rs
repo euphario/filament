@@ -741,7 +741,7 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
                 // Timer runs at 100 Hz (10ms per tick), so timeout_ms / 10 = ticks
                 // Add 1 to round up and avoid 0-tick timeouts
                 let timeout_ticks = (timeout_ms as u64 + 9) / 10;
-                let current_tick = crate::platform::mt7988::timer::ticks();
+                let current_tick = crate::platform::current::timer::ticks();
                 // Use saturating_add to prevent overflow (would cause immediate wake)
                 Some(current_tick.saturating_add(timeout_ticks))
             } else {

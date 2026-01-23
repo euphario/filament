@@ -274,8 +274,8 @@ pub fn with_bus_registry<R, F: FnOnce(&mut BusRegistry) -> R>(f: F) -> R {
 
 /// Get current uptime in milliseconds
 fn uptime_ms() -> u64 {
-    let counter = crate::platform::mt7988::timer::counter();
-    let freq = crate::platform::mt7988::timer::frequency();
+    let counter = crate::platform::current::timer::counter();
+    let freq = crate::platform::current::timer::frequency();
     if freq > 0 {
         (counter * 1000) / freq
     } else {
@@ -294,37 +294,8 @@ fn uptime_ms() -> u64 {
 /// Hardware reset is deferred - call complete_init() after devd can run,
 /// or let buses reset async. devd handles any state and waits for Safe.
 pub fn init(kernel_pid: Pid) {
-    with_bus_registry(|registry| {
-        // PCIe ports - MT7988A has 4 PCIe ports
-        for i in 0..4u8 {
-            if let Some(bus) = registry.add(BusType::PCIe, i) {
-                // Start in Resetting - hardware reset happens in complete_init()
-                // Initial state set via set_initial_state() since bus is brand new
-                bus.set_initial_state(BusState::Resetting);
-                let _ = bus.register_port(kernel_pid);
-                kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Resetting");
-            }
-        }
-
-        // USB controllers - MT7988A has 2 SSUSB controllers
-        for i in 0..2u8 {
-            if let Some(bus) = registry.add(BusType::Usb, i) {
-                // Start in Resetting - hardware reset happens in complete_init()
-                // Initial state set via set_initial_state() since bus is brand new
-                bus.set_initial_state(BusState::Resetting);
-                let _ = bus.register_port(kernel_pid);
-                kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Resetting");
-            }
-        }
-
-        // Platform pseudo-bus (no hardware reset needed, starts Safe)
-        if let Some(bus) = registry.add(BusType::Platform, 0) {
-            // Initial state set via set_initial_state() since bus is brand new
-            bus.set_initial_state(BusState::Safe);
-            let _ = bus.register_port(kernel_pid);
-            kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Safe");
-        }
-    });
+    // Call platform-specific bus registration
+    crate::platform::current::bus::register_buses(kernel_pid);
 }
 
 /// Continue bus initialization work (called from timer interrupt)

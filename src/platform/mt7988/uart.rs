@@ -419,6 +419,7 @@ pub fn getc() -> char {
 /// Print directly to UART (BLOCKING - bypasses buffer)
 /// Use only for panic handler or kernel exceptions.
 #[macro_export]
+#[cfg(feature = "platform-mt7988a")]
 macro_rules! print_direct {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
@@ -428,6 +429,7 @@ macro_rules! print_direct {
 
 /// Print directly to UART with newline (BLOCKING - bypasses buffer)
 #[macro_export]
+#[cfg(feature = "platform-mt7988a")]
 macro_rules! println_direct {
     () => ($crate::print_direct!("\n"));
     ($($arg:tt)*) => {{

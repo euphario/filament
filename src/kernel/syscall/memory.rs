@@ -85,7 +85,7 @@ pub(super) fn sys_mmap_dma(size: usize, dma_ptr: u64) -> i64 {
         match task.mmap_dma(size) {
             Some((virt_addr, phys_addr)) => {
                 // Convert physical address to DMA address using platform HAL
-                let platform = crate::platform::mt7988::platform::platform();
+                let platform = crate::platform::current::platform::platform();
                 let dma_addr = platform.phys_to_dma(phys_addr);
 
                 // Write DMA address to user pointer

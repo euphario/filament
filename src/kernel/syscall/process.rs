@@ -40,8 +40,8 @@ pub(super) fn sys_exit(code: i32) -> i64 {
     let ctx = create_syscall_context();
 
     // Flush UART buffer so pending output from this process appears first
-    while crate::platform::mt7988::uart::has_buffered_output() {
-        crate::platform::mt7988::uart::flush_buffer();
+    while crate::platform::current::uart::has_buffered_output() {
+        crate::platform::current::uart::flush_buffer();
     }
 
     print_direct!("\n========================================\n");
@@ -501,7 +501,7 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
 
             if let Some(task) = task_opt {
                 // Calculate activity age and liveness status
-                let current_tick = crate::platform::mt7988::timer::ticks();
+                let current_tick = crate::platform::current::timer::ticks();
 
                 // Age since last syscall activity (10ms per tick)
                 let activity_age_ms = if task.last_activity_tick == 0 {

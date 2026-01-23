@@ -206,11 +206,15 @@ pub fn init() {
     let cpu = cpu_id();
     kdebug!("smp", "init"; primary_cpu = cpu as u64);
 
-    // Check PSCI version
-    if let Some((major, minor)) = psci_version() {
-        kinfo!("smp", "psci_version"; major = major as u64, minor = minor as u64);
-    } else {
-        kwarn!("smp", "psci_unavailable");
+    // Check PSCI version - skip on QEMU virt when using device loader
+    // SMC without EL3 firmware causes exceptions
+    #[cfg(not(feature = "platform-qemu-virt"))]
+    {
+        if let Some((major, minor)) = psci_version() {
+            kinfo!("smp", "psci_version"; major = major as u64, minor = minor as u64);
+        } else {
+            kwarn!("smp", "psci_unavailable");
+        }
     }
 
     // Initialize primary CPU's per-CPU data

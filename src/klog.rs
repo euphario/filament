@@ -809,7 +809,7 @@ pub fn drain_one() -> bool {
     let text_len = format_record(&record_buf[..len], &mut text_buf);
     if text_len > 0 {
         // Write directly to UART
-        crate::platform::mt7988::uart::write_bytes(&text_buf[..text_len]);
+        crate::platform::current::uart::write_bytes(&text_buf[..text_len]);
     }
 
     true

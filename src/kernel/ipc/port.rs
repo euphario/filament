@@ -452,7 +452,7 @@ impl PortRegistry {
         let (client_ch, server_ch) = channel_table.create_pair(client, server_owner)?;
 
         // Add pending connection
-        let now = crate::platform::mt7988::timer::ticks();
+        let now = crate::platform::current::timer::ticks();
         let conn = PendingConnection::new(client, client_ch, server_ch, now);
         let wake_list = port.add_pending(conn)?;
 

@@ -19,10 +19,8 @@ mod arch {
     pub mod aarch64;
 }
 
-// Platform support (MT7988A)
-mod platform {
-    pub mod mt7988;
-}
+// Platform support - conditional compilation
+mod platform;
 
 // Hardware Abstraction Layer
 mod hal;
@@ -42,12 +40,15 @@ mod ramfs;
 
 // Convenient aliases - use full paths to avoid ambiguity
 use arch::aarch64::{mmu, sync, smp};
-use platform::mt7988::{gic, uart, timer, wdt};
 use kernel::{task, irq, shmem, dma_pool, elf, pmm, pci, bus};
-
-// Alias for platform constants (platform::mt7988::INITRD_ADDR, etc.)
-use platform::mt7988 as plat;
 use kernel::percpu;
+
+// Platform-specific imports - use platform::current for portability
+use platform::current::{gic, uart, timer};
+use platform::current as plat;
+
+#[cfg(feature = "platform-mt7988a")]
+use platform::mt7988::wdt;
 
 /// Kernel entry point - called from boot.S after dropping to EL1
 #[no_mangle]
@@ -70,9 +71,19 @@ pub extern "C" fn kmain() -> ! {
 
     // Boot banner (direct UART - useful for early debug)
     print_direct!("\r\n========================================\r\n");
+    #[cfg(feature = "platform-mt7988a")]
     print_direct!("  BPI-R4 Bare-Metal Kernel\r\n");
+    #[cfg(feature = "platform-mt7988a")]
     print_direct!("  MediaTek MT7988A (Cortex-A73)\r\n");
+    #[cfg(feature = "platform-qemu-virt")]
+    print_direct!("  Bare-Metal Kernel (QEMU virt)\r\n");
+    #[cfg(feature = "platform-qemu-virt")]
+    print_direct!("  ARM Cortex-A72\r\n");
     print_direct!("========================================\r\n\r\n");
+
+    // =========================================================================
+    // Phase 2: Kernel initialization (with logging and tracing)
+    // =========================================================================
 
     // =========================================================================
     // Phase 2: Kernel initialization (with logging and tracing)
@@ -155,7 +166,8 @@ pub extern "C" fn kmain() -> ! {
         kinfo!("bus", "init_ok");
     }
 
-    // Watchdog
+    // Watchdog (MT7988A only)
+    #[cfg(feature = "platform-mt7988a")]
     {
         let _span = span!("wdt", "init");
         wdt::init();
@@ -202,8 +214,13 @@ pub extern "C" fn kmain() -> ! {
         kernel::event::test();
         elf::test();
         smp::test();
-        plat::eth::test();
-        plat::sd::test();
+
+        // Platform-specific tests (MT7988A only)
+        #[cfg(feature = "platform-mt7988a")]
+        {
+            plat::eth::test();
+            plat::sd::test();
+        }
 
         kinfo!("kernel", "selftest_complete");
     }

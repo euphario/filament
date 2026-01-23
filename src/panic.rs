@@ -9,8 +9,8 @@ fn panic(info: &PanicInfo) -> ! {
     crate::klog::flush();
 
     // Flush UART output buffer (userspace writes)
-    while crate::platform::mt7988::uart::has_buffered_output() {
-        crate::platform::mt7988::uart::flush_buffer();
+    while crate::platform::current::uart::has_buffered_output() {
+        crate::platform::current::uart::flush_buffer();
     }
 
     // Use direct UART output for panic - we need immediate visibility

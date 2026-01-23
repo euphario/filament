@@ -67,8 +67,8 @@ pub fn register(irq_num: u32, pid: u32) -> bool {
                 reg.pending_count = 0;
 
                 // Enable the IRQ in the GIC
-                crate::platform::mt7988::gic::enable_irq(irq_num);
-                crate::platform::mt7988::gic::debug_irq(irq_num);
+                crate::platform::current::gic::enable_irq(irq_num);
+                crate::platform::current::gic::debug_irq(irq_num);
 
                 return true;
             }
@@ -82,7 +82,7 @@ pub fn unregister(irq_num: u32, pid: u32) -> bool {
     with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
-                crate::platform::mt7988::gic::disable_irq(irq_num);
+                crate::platform::current::gic::disable_irq(irq_num);
                 *reg = IrqRegistration::empty();
                 return true;
             }
@@ -96,7 +96,7 @@ pub fn process_cleanup(pid: u32) {
     with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.owner_pid == pid {
-                crate::platform::mt7988::gic::disable_irq(reg.irq_num);
+                crate::platform::current::gic::disable_irq(reg.irq_num);
                 *reg = IrqRegistration::empty();
             }
         }
@@ -107,7 +107,7 @@ pub fn process_cleanup(pid: u32) {
 /// Returns the PID to wake up, if any
 pub fn notify(irq_num: u32) -> Option<u32> {
     // Mask the IRQ immediately to prevent interrupt storm
-    crate::platform::mt7988::gic::disable_irq(irq_num);
+    crate::platform::current::gic::disable_irq(irq_num);
 
     // Update IRQ table state and collect wake info
     let (wake_blocked, owner_pid) = with_irq_table(|table| {
@@ -155,7 +155,7 @@ pub fn check_pending(irq_num: u32, pid: u32) -> Option<u32> {
                     let count = reg.pending_count;
                     reg.pending = false;
                     reg.pending_count = 0;
-                    crate::platform::mt7988::gic::enable_irq(irq_num);
+                    crate::platform::current::gic::enable_irq(irq_num);
                     return Some(count);
                 }
                 return None;

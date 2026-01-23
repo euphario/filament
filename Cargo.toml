@@ -18,10 +18,14 @@ path = "src/main.rs"
 test = false
 
 [features]
-default = ["embed-initrd", "embed-dtb"]
+default = ["embed-initrd", "embed-dtb", "platform-mt7988a"]
 embed-initrd = []  # Embed user/initrd.tar in kernel binary
 embed-dtb = []     # Embed bpi-r4.dtb in kernel binary
 selftest = []      # Run self-tests during boot (slows boot, useful for dev)
+
+# Platform selection (exactly one must be enabled)
+platform-mt7988a = []    # BPI-R4 hardware (MediaTek MT7988A)
+platform-qemu-virt = []  # QEMU virt machine for testing
 
 [dependencies]
 abi = { path = "user/abi" }

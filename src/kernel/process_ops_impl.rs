@@ -33,8 +33,8 @@ impl KernelProcessOps {
 impl ProcessOps for KernelProcessOps {
     fn exit(&self, task_id: TaskId, code: i32) -> ! {
         // Flush UART buffer so pending output from this process appears first
-        while crate::platform::mt7988::uart::has_buffered_output() {
-            crate::platform::mt7988::uart::flush_buffer();
+        while crate::platform::current::uart::has_buffered_output() {
+            crate::platform::current::uart::flush_buffer();
         }
 
         print_direct!("\n========================================\n");
