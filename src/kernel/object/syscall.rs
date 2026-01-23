@@ -78,33 +78,46 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
 ///
 /// Returns: bytes read (positive) or error (negative)
 pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
+    use crate::kernel::object_service::object_service;
+
     let handle = Handle::from_raw(handle_raw);
 
-    task::with_scheduler(|sched| {
+    // Get current task ID
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
+    // Use ObjectService's tables for dispatch
+    let result = object_service().with_table_mut(task_id, |table| {
         // Check handle validity and get type
-        let (obj_type, task_id) = {
-            let Some(entry) = task.object_table.get(handle) else {
-                return Error::BadHandle.to_errno();
-            };
-            if !entry.object_type.is_readable() {
-                return Error::NotSupported.to_errno();
-            }
-            (entry.object_type, task.id)
+        let Some(entry) = table.get(handle) else {
+            return Err(Error::BadHandle);
         };
-
-        // Handle Mux specially - needs access to multiple handles
-        if obj_type == ObjectType::Mux {
-            return read_mux_impl(task, handle, buf_ptr, buf_len);
+        if !entry.object_type.is_readable() {
+            return Err(Error::NotSupported);
         }
+        Ok(entry.object_type)
+    });
 
-        // For other types, get mutable ref and dispatch
-        let Some(entry) = task.object_table.get_mut(handle) else {
+    let obj_type = match result {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return e.to_errno(),
+        Err(_) => return Error::BadHandle.to_errno(),
+    };
+
+    // Handle Mux specially - needs access to multiple handles
+    if obj_type == ObjectType::Mux {
+        return read_mux_via_service(task_id, handle, buf_ptr, buf_len);
+    }
+
+    // For other types, get mutable ref and dispatch
+    let result = object_service().with_table_mut(task_id, |table| {
+        let Some(entry) = table.get_mut(handle) else {
             return Error::BadHandle.to_errno();
         };
 
@@ -124,7 +137,12 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::BusList(b) => read_bus_list(b, buf_ptr, buf_len),
             _ => Error::NotSupported.to_errno(),
         }
-    })
+    });
+
+    match result {
+        Ok(errno) => errno,
+        Err(_) => Error::BadHandle.to_errno(),
+    }
 }
 
 // ============================================================================
@@ -139,24 +157,29 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 ///
 /// Returns: bytes written (positive) or error (negative)
 pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
+    use crate::kernel::object_service::object_service;
+
     let handle = Handle::from_raw(handle_raw);
 
-    task::with_scheduler(|sched| {
+    // Get current task ID
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let Some(entry) = task.object_table.get_mut(handle) else {
+    // Use ObjectService's tables for dispatch
+    let result = object_service().with_table_mut(task_id, |table| {
+        let Some(entry) = table.get_mut(handle) else {
             return Error::BadHandle.to_errno();
         };
 
         if !entry.object_type.is_writable() {
             return Error::NotSupported.to_errno();
         }
-
-        let task_id = task.id;
 
         // Dispatch to type-specific write
         match &mut entry.object {
@@ -168,7 +191,12 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::PciDevice(d) => write_pci_device(d, buf_ptr, buf_len, task_id),
             _ => Error::NotSupported.to_errno(),
         }
-    })
+    });
+
+    match result {
+        Ok(errno) => errno,
+        Err(_) => Error::BadHandle.to_errno(),
+    }
 }
 
 // ============================================================================
@@ -181,17 +209,24 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 ///
 /// Returns: virtual address (positive) or error (negative)
 pub fn map(handle_raw: u32, flags: u32) -> i64 {
+    use crate::kernel::object_service::object_service;
+
     let handle = Handle::from_raw(handle_raw);
     let _ = flags; // For future use (read-only, etc.)
 
-    task::with_scheduler(|sched| {
+    // Get current task ID
+    let task_id = task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    });
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    let Some(task_id) = task_id else {
+        return Error::BadHandle.to_errno();
+    };
 
-        let Some(entry) = task.object_table.get_mut(handle) else {
+    // Use ObjectService's tables for dispatch
+    let result = object_service().with_table_mut(task_id, |table| {
+        let Some(entry) = table.get_mut(handle) else {
             return Error::BadHandle.to_errno();
         };
 
@@ -201,12 +236,17 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
 
         // Dispatch to type-specific map
         match &mut entry.object {
-            Object::Shmem(s) => map_shmem(s, task.id),
-            Object::DmaPool(d) => map_dma_pool(d, task.id),
-            Object::Mmio(m) => map_mmio(m, task.id),
+            Object::Shmem(s) => map_shmem(s, task_id),
+            Object::DmaPool(d) => map_dma_pool(d, task_id),
+            Object::Mmio(m) => map_mmio(m, task_id),
             _ => Error::NotSupported.to_errno(),
         }
-    })
+    });
+
+    match result {
+        Ok(errno) => errno,
+        Err(_) => Error::BadHandle.to_errno(),
+    }
 }
 
 // ============================================================================
@@ -217,40 +257,56 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
 ///
 /// Returns: 0 on success, negative error
 pub fn close(handle_raw: u32) -> i64 {
+    use crate::kernel::object_service::object_service;
+
     let handle = Handle::from_raw(handle_raw);
 
-    task::with_scheduler(|sched| {
+    // Get current task ID and slot
+    let (task_id, slot) = match task::with_scheduler(|sched| {
         let slot = task::current_slot();
+        sched.task(slot).map(|t| (t.id, slot))
+    }) {
+        Some((id, slot)) => (id, slot),
+        None => return Error::BadHandle.to_errno(),
+    };
 
-        let Some(task) = sched.task_mut(slot) else {
-            return Error::BadHandle.to_errno();
-        };
+    // Close handle via ObjectService
+    let object = match object_service().close_handle(task_id, handle) {
+        Ok(obj) => obj,
+        Err(_) => return Error::BadHandle.to_errno(),
+    };
 
-        let Some(object) = task.object_table.close(handle) else {
-            return Error::BadHandle.to_errno();
-        };
+    // Extract info needed for cleanup before scheduler lock
+    let (is_channel, is_port, is_shmem) = match &object {
+        Object::Channel(_) => (true, false, false),
+        Object::Port(_) => (false, true, false),
+        Object::Shmem(_) => (false, false, true),
+        _ => (false, false, false),
+    };
 
-        // Type-specific cleanup and resource counter updates
-        match object {
-            Object::Channel(ch) => {
-                close_channel(ch, task.id);
-                task.remove_channel();
-            }
-            Object::Port(p) => {
-                close_port(p, task.id);
-                task.remove_port();
-            }
-            Object::Shmem(s) => {
-                close_shmem(s, task.id);
-                task.remove_shmem();
-            }
-            Object::DmaPool(d) => close_dma_pool(d, task.id),
-            Object::Mmio(m) => close_mmio(m, task.id),
-            _ => {} // No cleanup needed
-        }
+    // Type-specific cleanup (outside scheduler lock)
+    match object {
+        Object::Channel(ch) => close_channel(ch, task_id),
+        Object::Port(p) => close_port(p, task_id),
+        Object::Shmem(s) => close_shmem(s, task_id),
+        Object::DmaPool(d) => close_dma_pool(d, task_id),
+        Object::Mmio(m) => close_mmio(m, task_id),
+        _ => {} // No cleanup needed
+    }
 
-        0
-    })
+    // Update resource counters via scheduler
+    if is_channel || is_port || is_shmem {
+        task::with_scheduler(|sched| {
+            let Some(task) = sched.task_mut(slot) else {
+                return; // Task gone, counters don't matter
+            };
+            if is_channel { task.remove_channel(); }
+            if is_port { task.remove_port(); }
+            if is_shmem { task.remove_shmem(); }
+        });
+    }
+
+    0
 }
 
 // ============================================================================
@@ -1180,7 +1236,210 @@ fn read_bus_list(b: &mut super::BusListObject, buf_ptr: u64, buf_len: usize) -> 
     to_copy as i64
 }
 
-/// Mux read - blocks until events are ready
+/// Mux read via ObjectService - blocks until events are ready
+///
+/// Uses ObjectService's tables instead of task.object_table.
+fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
+    use super::types::filter;
+    use crate::kernel::ipc::traits::Subscriber;
+    use crate::kernel::object_service::object_service;
+
+    let slot = task::current_slot();
+    let subscriber = Subscriber {
+        task_id,
+        generation: task::Scheduler::generation_from_pid(task_id),
+    };
+
+    // Phase 1: Collect watch list and channel IDs from ObjectService tables
+    let watches: [(Option<super::MuxWatch>, u32); 16] = {
+        let result = object_service().with_table(task_id, |table| {
+            let Some(mux_entry) = table.get(mux_handle) else {
+                return Err(Error::BadHandle);
+            };
+            let Object::Mux(ref mux) = mux_entry.object else {
+                return Err(Error::BadHandle);
+            };
+
+            let mut w = [(None, 0u32); 16];
+            for i in 0..16 {
+                if let Some(watch) = mux.watches[i] {
+                    let watched_handle = Handle::from_raw(watch.handle);
+                    let channel_id = if let Some(entry) = table.get(watched_handle) {
+                        if let Object::Channel(ch) = &entry.object { ch.channel_id() } else { 0 }
+                    } else { 0 };
+                    w[i] = (Some(watch), channel_id);
+                }
+            }
+            Ok(w)
+        });
+
+        match result {
+            Ok(Ok(w)) => w,
+            Ok(Err(e)) => return e.to_errno(),
+            Err(_) => return Error::BadHandle.to_errno(),
+        }
+    };
+
+    // Phase 2: Subscribe BEFORE polling (avoid race) - needs mutable access
+    let subscribe_result = object_service().with_table_mut(task_id, |table| {
+        if let Some(mux_entry) = table.get_mut(mux_handle) {
+            if let Object::Mux(ref mut mux) = mux_entry.object {
+                mux.subscriber = Some(subscriber);
+            }
+        }
+
+        // Compute earliest timer deadline for tickless wake
+        let mut earliest_deadline: u64 = u64::MAX;
+
+        for watch_opt in &watches {
+            let Some(watch) = watch_opt.0 else { continue };
+            let channel_id = watch_opt.1;
+            let watched_handle = Handle::from_raw(watch.handle);
+
+            if let Some(entry) = table.get_mut(watched_handle) {
+                match &mut entry.object {
+                    Object::Channel(_) => {
+                        if channel_id != 0 {
+                            let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
+                        }
+                    }
+                    Object::Port(p) => { p.subscriber = Some(subscriber); }
+                    Object::Timer(t) => {
+                        t.subscriber = Some(subscriber);
+                        if t.deadline > 0 && t.deadline < earliest_deadline {
+                            earliest_deadline = t.deadline;
+                        }
+                    }
+                    Object::Console(c) => {
+                        c.subscriber = Some(subscriber);
+                        if matches!(c.console_type, ConsoleType::Stdin) {
+                            uart::block_for_input(task_id);
+                        }
+                    }
+                    Object::Process(p) => { p.subscriber = Some(subscriber); }
+                    _ => {}
+                }
+            }
+        }
+        earliest_deadline
+    });
+
+    let earliest_deadline = match subscribe_result {
+        Ok(d) => d,
+        Err(_) => return Error::BadHandle.to_errno(),
+    };
+
+    // Phase 3: Poll for ready events
+    let poll_result = object_service().with_table(task_id, |table| {
+        let mut events = [super::MuxEvent::empty(); 16];
+        let mut event_count = 0usize;
+        let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
+
+        for watch_opt in &watches {
+            if event_count >= max_events { break; }
+            let Some(watch) = watch_opt.0 else { continue };
+            let channel_id = watch_opt.1;
+            let watched_handle = Handle::from_raw(watch.handle);
+
+            let Some(entry) = table.get(watched_handle) else { continue };
+
+            let ready = match &entry.object {
+                Object::Channel(_) => {
+                    if (watch.filter & filter::READABLE) != 0 {
+                        channel_id != 0 && ipc::channel_has_messages(channel_id)
+                    } else if (watch.filter & filter::CLOSED) != 0 {
+                        channel_id == 0
+                    } else {
+                        false
+                    }
+                }
+                Object::Port(p) => {
+                    (watch.filter & filter::READABLE) != 0 && ipc::port_has_pending(p.port_id())
+                }
+                Object::Timer(t) => {
+                    if (watch.filter & filter::READABLE) != 0 {
+                        let now = crate::platform::current::timer::ticks();
+                        t.deadline > 0 && now >= t.deadline
+                    } else {
+                        false
+                    }
+                }
+                Object::Console(c) => {
+                    match c.console_type {
+                        ConsoleType::Stdin => (watch.filter & filter::READABLE) != 0 && uart::rx_buffer_has_data(),
+                        ConsoleType::Stdout | ConsoleType::Stderr => (watch.filter & filter::WRITABLE) != 0,
+                    }
+                }
+                Object::Process(p) => {
+                    (watch.filter & filter::READABLE) != 0 && p.poll(filter::READABLE).is_ready()
+                }
+                _ => false,
+            };
+
+            if ready {
+                events[event_count] = super::MuxEvent {
+                    handle: abi::Handle::from_raw(watch.handle),
+                    event: watch.filter,
+                    _pad: [0; 3],
+                };
+                event_count += 1;
+            }
+        }
+
+        (events, event_count)
+    });
+
+    let (events, event_count) = match poll_result {
+        Ok((e, c)) => (e, c),
+        Err(_) => return Error::BadHandle.to_errno(),
+    };
+
+    // Phase 4: Events ready → return to userspace
+    if event_count > 0 {
+        let bytes = event_count * core::mem::size_of::<super::MuxEvent>();
+        let event_bytes = unsafe {
+            core::slice::from_raw_parts(events.as_ptr() as *const u8, bytes)
+        };
+        if uaccess::copy_to_user(buf_ptr, event_bytes).is_err() {
+            return Error::BadAddress.to_errno();
+        }
+        return event_count as i64;
+    }
+
+    // Phase 5: No events → transition to blocked state via scheduler
+    // Note: Tables lock is NOT held here
+    let transition_ok = task::with_scheduler(|sched| {
+        let Some(task) = sched.task_mut(slot) else {
+            return false;
+        };
+
+        if earliest_deadline == u64::MAX {
+            // No timer → Sleeping (liveness will monitor)
+            task.set_sleeping(crate::kernel::task::SleepReason::EventLoop).is_ok()
+        } else {
+            // Has timer → Waiting with deadline
+            if task.set_waiting(crate::kernel::task::WaitReason::TimedEvent, earliest_deadline).is_ok() {
+                sched.note_deadline(earliest_deadline);
+                true
+            } else {
+                false
+            }
+        }
+    });
+
+    if !transition_ok {
+        return Error::InvalidArg.to_errno();
+    }
+
+    // Reschedule to another task
+    crate::kernel::sched::reschedule();
+
+    // This return value is stored but task won't return to userspace yet
+    // When woken, PC will re-execute the syscall instruction
+    0
+}
+
+/// Mux read - blocks until events are ready (legacy - uses task.object_table)
 ///
 /// State machine:
 /// 1. Subscribe to watched handles
@@ -1192,6 +1451,7 @@ fn read_bus_list(b: &mut super::BusListObject, buf_ptr: u64, buf_len: usize) -> 
 /// 5. When woken → syscall re-executes from start
 ///
 /// Userspace never sees WouldBlock.
+#[allow(dead_code)]
 fn read_mux_impl(task: &mut crate::kernel::task::Task, mux_handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
     use super::types::filter;
     use crate::kernel::ipc::traits::Subscriber;
