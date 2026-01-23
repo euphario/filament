@@ -347,23 +347,18 @@ fn notify_parent_of_exit(sched: &mut Scheduler, parent_id: TaskId, child_pid: Ta
         None => return,
     };
 
-    let mut should_wake_parent = false;
+    // Check if parent is blocked
+    let should_wake_parent = sched.task(parent_slot)
+        .map(|p| p.is_blocked())
+        .unwrap_or(false);
 
-    // Notify via ProcessObject handles in object_table and check if parent is blocked
-    if let Some(parent) = sched.task_mut(parent_slot) {
-        // Notify via unified object system
-        let wake_list = crate::kernel::object::notify_child_exit(
-            &mut parent.object_table, child_pid, code,
-        );
+    // Notify via ObjectService (acquires ObjectService.tables lock, not scheduler)
+    let wake_list = crate::kernel::object_service::object_service().notify_child_exit(
+        parent_id, child_pid, code,
+    );
 
-        // Wake handle subscribers
-        waker::wake(&wake_list, WakeReason::ChildExit);
-
-        // Also check if parent is directly blocked (sys_wait)
-        if parent.is_blocked() {
-            should_wake_parent = true;
-        }
-    }
+    // Wake handle subscribers
+    waker::wake(&wake_list, WakeReason::ChildExit);
 
     // Direct wake of parent if blocked (outside borrow)
     if should_wake_parent {

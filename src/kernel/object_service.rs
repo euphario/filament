@@ -1186,6 +1186,49 @@ impl ObjectService {
 
         table.alloc(ObjectType::BusList, obj).ok_or(ObjError::OutOfHandles)
     }
+
+    // ========================================================================
+    // Child Exit Notification
+    // ========================================================================
+
+    /// Notify a parent task's ProcessObject handles about a child exit
+    ///
+    /// This method can be called outside the scheduler lock.
+    /// Returns a wake list for the caller to process.
+    pub fn notify_child_exit(
+        &self,
+        parent_id: TaskId,
+        child_pid: TaskId,
+        exit_code: i32,
+    ) -> crate::kernel::ipc::waker::WakeList {
+        use crate::kernel::object::Object;
+
+        let slot = match slot_from_task_id(parent_id) {
+            Some(s) => s,
+            None => return crate::kernel::ipc::waker::WakeList::new(),
+        };
+
+        let mut tables = self.tables.lock();
+        let table = match tables[slot].as_mut() {
+            Some(t) => t,
+            None => return crate::kernel::ipc::waker::WakeList::new(),
+        };
+
+        // Iterate and update ProcessObjects watching this child
+        let mut wake_list = crate::kernel::ipc::waker::WakeList::new();
+        for entry in table.entries_mut() {
+            if let Object::Process(ref mut proc_obj) = entry.object {
+                if proc_obj.pid() == child_pid {
+                    proc_obj.set_exit_code(Some(exit_code));
+                    if let Some(sub) = proc_obj.subscriber() {
+                        wake_list.push(sub);
+                    }
+                }
+            }
+        }
+
+        wake_list
+    }
 }
 
 // ============================================================================

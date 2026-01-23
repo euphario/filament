@@ -346,22 +346,17 @@ pub fn check_liveness(current_tick: u64) -> usize {
             }
         }
 
-        // Process collected notifications - notify parent tasks of child exits
-        for i in 0..notify_count {
-            if let Some(ref notif) = notifications[i] {
-                // Find parent task and notify via ProcessObject handles in object_table
-                if let Some(parent_slot) = sched.slot_by_pid(notif.parent_id) {
-                    if let Some(parent_task) = sched.task_mut(parent_slot) {
-                        let wake_list = super::object::notify_child_exit(
-                            &mut parent_task.object_table,
-                            notif.child_pid,
-                            notif.exit_code,
-                        );
-                        // Wake subscribers outside the task loop
-                        waker::wake(&wake_list, WakeReason::ChildExit);
-                    }
-                }
-            }
+    } // End of unsafe scheduler block
+
+    // Process collected notifications via ObjectService (outside scheduler lock)
+    for i in 0..notify_count {
+        if let Some(ref notif) = notifications[i] {
+            let wake_list = super::object_service::object_service().notify_child_exit(
+                notif.parent_id,
+                notif.child_pid,
+                notif.exit_code,
+            );
+            waker::wake(&wake_list, WakeReason::ChildExit);
         }
     }
 
