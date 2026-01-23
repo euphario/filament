@@ -474,7 +474,7 @@ impl Pollable for TimerObject {
             return PollResult::NONE;
         }
 
-        let current_tick = crate::platform::mt7988::timer::ticks();
+        let current_tick = crate::platform::current::timer::ticks();
         if self.state() == TimerState::Armed && current_tick >= self.deadline() {
             PollResult { ready: poll::READABLE, data: current_tick }
         } else if self.state() == TimerState::Fired {
@@ -600,42 +600,6 @@ impl Pollable for ProcessObject {
     fn unsubscribe(&mut self) {
         self.set_subscriber(None);
     }
-}
-
-// ============================================================================
-// Child Exit Notification
-// ============================================================================
-
-/// Notify all ProcessObject handles in a task's object_table about a child exit.
-///
-/// Called by task lifecycle code when a child process exits.
-/// Iterates the parent's object_table looking for ProcessObject handles
-/// watching the exited child and updates their exit code.
-///
-/// Returns a list of subscribers to wake.
-pub fn notify_child_exit(
-    object_table: &mut HandleTable,
-    child_pid: TaskId,
-    exit_code: i32,
-) -> crate::kernel::ipc::waker::WakeList {
-    let mut wake_list = crate::kernel::ipc::waker::WakeList::new();
-
-    for entry in object_table.entries_mut() {
-        if let Object::Process(ref mut proc_obj) = entry.object {
-            // Check if this ProcessObject is watching the exited child
-            if proc_obj.pid() == child_pid {
-                // Update the cached exit code
-                proc_obj.set_exit_code(Some(exit_code));
-
-                // Add subscriber to wake list (if any)
-                if let Some(sub) = proc_obj.subscriber() {
-                    wake_list.push(sub);
-                }
-            }
-        }
-    }
-
-    wake_list
 }
 
 // ============================================================================
@@ -829,7 +793,7 @@ impl ConsoleObject {
 
 impl Pollable for ConsoleObject {
     fn poll(&self, filter: u8) -> PollResult {
-        use crate::platform::mt7988::uart;
+        use crate::platform::current::uart;
 
         match self.console_type() {
             ConsoleType::Stdin => {
@@ -855,7 +819,7 @@ impl Pollable for ConsoleObject {
         self.set_subscriber(Some(subscriber));
         // For stdin, register with UART for input notification
         if is_stdin {
-            crate::platform::mt7988::uart::block_for_input(subscriber.task_id);
+            crate::platform::current::uart::block_for_input(subscriber.task_id);
         }
     }
 
@@ -863,7 +827,7 @@ impl Pollable for ConsoleObject {
         let is_stdin = self.console_type() == ConsoleType::Stdin;
         self.set_subscriber(None);
         if is_stdin {
-            crate::platform::mt7988::uart::clear_blocked();
+            crate::platform::current::uart::clear_blocked();
         }
     }
 }

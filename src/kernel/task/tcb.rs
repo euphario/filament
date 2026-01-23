@@ -227,8 +227,7 @@ pub struct Task {
     pub(crate) heap_mappings: [HeapMapping; MAX_HEAP_MAPPINGS],
     /// Next heap address for bump allocation
     pub(crate) heap_next: u64,
-    /// Object table (unified 5-syscall system)
-    pub(crate) object_table: crate::kernel::object::HandleTable,
+    // NOTE: object_table removed - now owned by ObjectService
     /// Per-process resource counters
     pub(crate) channel_count: u16,
     pub(crate) port_count: u16,
@@ -289,7 +288,6 @@ impl Task {
             name: task_name,
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
-            object_table: crate::kernel::object::HandleTable::new(),
             channel_count: 0,
             port_count: 0,
             shmem_count: 0,
@@ -345,7 +343,6 @@ impl Task {
             name: task_name,
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
-            object_table: crate::kernel::object::HandleTable::new_with_stdio(),
             channel_count: 0,
             port_count: 0,
             shmem_count: 0,
