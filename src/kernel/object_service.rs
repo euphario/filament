@@ -201,22 +201,16 @@ impl ObjectService {
     // ========================================================================
 
     /// Allocate a new handle in a task's object table
-    ///
-    /// MIGRATION NOTE: During Phase 3, this uses task.object_table for storage
-    /// to maintain backward compatibility. Phase 4 will switch to ObjectService's
-    /// own tables and remove task.object_table.
     pub fn alloc_handle(
         &self,
         task_id: TaskId,
         object_type: ObjectType,
         object: Object,
     ) -> Result<Handle, ObjError> {
-        // MIGRATION: Use task.object_table for storage during Phase 3
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            task.object_table.alloc(object_type, object).ok_or(ObjError::OutOfHandles)
-        })
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        table.alloc(object_type, object).ok_or(ObjError::OutOfHandles)
     }
 
     /// Get a handle entry (immutable)
@@ -313,55 +307,51 @@ impl ObjectService {
         use crate::kernel::ipc::traits::Subscriber;
         use crate::kernel::object::{Object, Pollable};
 
-        // MIGRATION: Access task.object_table directly during Phase 3
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let entry = task.object_table.get_mut(handle).ok_or(ObjError::BadHandle)?;
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let entry = table.get_mut(handle).ok_or(ObjError::BadHandle)?;
 
-            let Object::Console(ref mut c) = entry.object else {
-                return Err(ObjError::TypeMismatch);
-            };
+        let Object::Console(ref mut c) = entry.object else {
+            return Err(ObjError::TypeMismatch);
+        };
 
-            // Only stdin is readable
-            if !matches!(c.console_type(), ConsoleType::Stdin) {
-                return Err(ObjError::NotSupported);
-            }
+        // Only stdin is readable
+        if !matches!(c.console_type(), ConsoleType::Stdin) {
+            return Err(ObjError::NotSupported);
+        }
 
-            if buf.is_empty() {
-                return Ok(ReadAttempt::Success(0));
-            }
+        if buf.is_empty() {
+            return Ok(ReadAttempt::Success(0));
+        }
 
-            // Read from UART RX buffer
-            let mut bytes_read = 0;
-            for byte in buf.iter_mut() {
-                if let Some(b) = uart::rx_buffer_read() {
-                    *byte = b;
-                    bytes_read += 1;
-                } else {
-                    break;
-                }
-            }
-
-            if bytes_read > 0 {
-                Ok(ReadAttempt::Success(bytes_read))
+        // Read from UART RX buffer
+        let mut bytes_read = 0;
+        for byte in buf.iter_mut() {
+            if let Some(b) = uart::rx_buffer_read() {
+                *byte = b;
+                bytes_read += 1;
             } else {
-                // Register for wake when input arrives (IRQ-based)
-                let sub = Subscriber {
-                    task_id,
-                    generation: crate::kernel::task::Scheduler::generation_from_pid(task_id),
-                };
-                c.subscribe(sub);
-                Ok(ReadAttempt::NeedBlock)
+                break;
             }
-        })
+        }
+
+        if bytes_read > 0 {
+            Ok(ReadAttempt::Success(bytes_read))
+        } else {
+            // Register for wake when input arrives (IRQ-based)
+            let sub = Subscriber {
+                task_id,
+                generation: crate::kernel::task::Scheduler::generation_from_pid(task_id),
+            };
+            c.subscribe(sub);
+            Ok(ReadAttempt::NeedBlock)
+        }
     }
 
     /// Write to console (stdout/stderr only)
     ///
     /// Always completes immediately (UART is buffered).
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn write_console(
         &self,
         task_id: TaskId,
@@ -371,29 +361,27 @@ impl ObjectService {
         use crate::platform::current::uart;
         use crate::kernel::object::Object;
 
-        // MIGRATION: Access task.object_table directly during Phase 3
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task(slot).ok_or(ObjError::TaskNotFound)?;
-            let entry = task.object_table.get(handle).ok_or(ObjError::BadHandle)?;
+        let tables = self.tables.lock();
+        let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+        let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
 
-            let Object::Console(ref c) = entry.object else {
-                return Err(ObjError::TypeMismatch);
-            };
+        let Object::Console(ref c) = entry.object else {
+            return Err(ObjError::TypeMismatch);
+        };
 
-            // Only stdout/stderr are writable
-            match c.console_type() {
-                ConsoleType::Stdout | ConsoleType::Stderr => {
-                    if buf.is_empty() {
-                        return Ok(0);
-                    }
-                    uart::write_buffered(buf);
-                    uart::flush_buffer();
-                    Ok(buf.len())
+        // Only stdout/stderr are writable
+        match c.console_type() {
+            ConsoleType::Stdout | ConsoleType::Stderr => {
+                if buf.is_empty() {
+                    return Ok(0);
                 }
-                ConsoleType::Stdin => Err(ObjError::NotSupported),
+                uart::write_buffered(buf);
+                uart::flush_buffer();
+                Ok(buf.len())
             }
-        })
+            ConsoleType::Stdin => Err(ObjError::NotSupported),
+        }
     }
 
     // ========================================================================
@@ -416,8 +404,6 @@ impl ObjectService {
     /// - Success(8) with timestamp if timer fired
     /// - NeedBlock if timer not yet fired (caller should block)
     /// - Error if timer not armed
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn read_timer(
         &self,
         task_id: TaskId,
@@ -429,67 +415,64 @@ impl ObjectService {
         use crate::kernel::object::{Object, TimerState};
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let entry = task.object_table.get_mut(handle).ok_or(ObjError::BadHandle)?;
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let entry = table.get_mut(handle).ok_or(ObjError::BadHandle)?;
 
-            let Object::Timer(ref mut t) = entry.object else {
-                return Err(ObjError::TypeMismatch);
-            };
+        let Object::Timer(ref mut t) = entry.object else {
+            return Err(ObjError::TypeMismatch);
+        };
 
-            let current_tick = timer::ticks();
+        let current_tick = timer::ticks();
 
-            match t.state() {
-                TimerState::Disarmed => {
-                    Err(ObjError::InvalidArg)
-                }
-                TimerState::Armed => {
-                    if current_tick >= t.deadline() {
-                        // Timer has fired
-                        let _ = t.fire();
+        match t.state() {
+            TimerState::Disarmed => {
+                Err(ObjError::InvalidArg)
+            }
+            TimerState::Armed => {
+                if current_tick >= t.deadline() {
+                    // Timer has fired
+                    let _ = t.fire();
 
-                        // Write timestamp to buffer if provided
-                        if buf.len() >= 8 {
-                            let ts_bytes = current_tick.to_le_bytes();
-                            buf[..8].copy_from_slice(&ts_bytes);
-                        }
-
-                        // Handle recurring timer
-                        if t.interval() > 0 {
-                            let new_deadline = current_tick + t.interval();
-                            t.arm(new_deadline, t.interval());
-                        }
-
-                        Ok(ReadAttempt::Success(8))
-                    } else {
-                        // Not yet fired - register for wake (IRQ-based via scheduler)
-                        t.set_subscriber(Some(Subscriber {
-                            task_id,
-                            generation: crate::kernel::task::Scheduler::generation_from_pid(task_id),
-                        }));
-                        Ok(ReadAttempt::NeedBlock)
-                    }
-                }
-                TimerState::Fired => {
-                    // Already fired - return timestamp
+                    // Write timestamp to buffer if provided
                     if buf.len() >= 8 {
-                        let ts_bytes = t.deadline().to_le_bytes();
+                        let ts_bytes = current_tick.to_le_bytes();
                         buf[..8].copy_from_slice(&ts_bytes);
                     }
-                    // Consume the fired state
-                    t.disarm();
+
+                    // Handle recurring timer
+                    if t.interval() > 0 {
+                        let new_deadline = current_tick + t.interval();
+                        t.arm(new_deadline, t.interval());
+                    }
+
                     Ok(ReadAttempt::Success(8))
+                } else {
+                    // Not yet fired - register for wake (IRQ-based via scheduler)
+                    t.set_subscriber(Some(Subscriber {
+                        task_id,
+                        generation: crate::kernel::task::Scheduler::generation_from_pid(task_id),
+                    }));
+                    Ok(ReadAttempt::NeedBlock)
                 }
             }
-        })
+            TimerState::Fired => {
+                // Already fired - return timestamp
+                if buf.len() >= 8 {
+                    let ts_bytes = t.deadline().to_le_bytes();
+                    buf[..8].copy_from_slice(&ts_bytes);
+                }
+                // Consume the fired state
+                t.disarm();
+                Ok(ReadAttempt::Success(8))
+            }
+        }
     }
 
     /// Write to timer (arm/disarm)
     ///
     /// Format: [deadline_ns: u64] or [deadline_ns: u64, interval_ns: u64]
     /// deadline_ns=0 disarms the timer.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn write_timer(
         &self,
         task_id: TaskId,
@@ -508,9 +491,9 @@ impl ObjectService {
         ]);
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let entry = task.object_table.get_mut(handle).ok_or(ObjError::BadHandle)?;
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let entry = table.get_mut(handle).ok_or(ObjError::BadHandle)?;
 
             let Object::Timer(ref mut t) = entry.object else {
                 return Err(ObjError::TypeMismatch);
@@ -543,9 +526,8 @@ impl ObjectService {
                 0
             };
 
-            t.arm(deadline, interval);
-            Ok(0)
-        })
+        t.arm(deadline, interval);
+        Ok(0)
     }
 
     // ========================================================================
