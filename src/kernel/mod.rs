@@ -11,6 +11,7 @@
 //! Code in this module should be architecture and platform independent.
 
 pub mod traits; // Trait boundaries for swappable subsystems
+pub mod waker_impl; // Waker trait implementation
 pub mod task;
 pub mod sched;
 pub mod process;

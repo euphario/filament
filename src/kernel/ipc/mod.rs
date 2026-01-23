@@ -96,6 +96,7 @@ pub mod waker;
 pub mod channel;
 pub mod table;
 pub mod port;
+pub mod backend;
 
 #[cfg(test)]
 mod tests;
@@ -104,6 +105,7 @@ mod tests;
 pub use types::{Message, MessageHeader, MessageType, ChannelId, MAX_INLINE_PAYLOAD};
 pub use error::IpcError;
 pub use traits::{Subscriber, WakeReason, Waitable, Closable};
+pub use backend::{ipc_backend, KernelIpcBackend};
 
 // Internal imports (not re-exported)
 use table::ChannelTable;

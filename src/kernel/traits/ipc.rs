@@ -26,7 +26,7 @@
 //! }
 //! ```
 
-use super::waker::{Subscriber, WakeReason, WakeList};
+pub use super::waker::{Subscriber, WakeReason, WakeList};
 
 /// Channel identifier
 pub type ChannelId = u32;
@@ -304,7 +304,20 @@ pub trait IpcPort: Send + Sync {
 ///
 /// This is the main entry point for IPC operations.
 /// The kernel holds a single instance implementing this trait.
+///
+/// # Design Note
+///
+/// All operations go through this trait directly rather than returning
+/// references to individual channel/port objects. This allows the
+/// implementation to use internal locking without lifetime issues.
+///
+/// The `IpcChannel` and `IpcPort` traits above are documentation of the
+/// expected behavior, not interfaces that need to be implemented directly.
 pub trait IpcBackend: Send + Sync {
+    // ========================================================================
+    // Channel Pair Creation
+    // ========================================================================
+
     /// Create a channel pair
     ///
     /// Returns (channel_a, channel_b) where messages sent on A
@@ -315,10 +328,9 @@ pub trait IpcBackend: Send + Sync {
         owner_b: TaskId,
     ) -> Result<(ChannelId, ChannelId), IpcError>;
 
-    /// Get a channel by ID
-    ///
-    /// Returns None if channel doesn't exist or caller isn't owner.
-    fn get_channel(&self, id: ChannelId, caller: TaskId) -> Option<&dyn IpcChannel>;
+    // ========================================================================
+    // Port Operations
+    // ========================================================================
 
     /// Register a new port
     ///
@@ -338,16 +350,26 @@ pub trait IpcBackend: Send + Sync {
         client: TaskId,
     ) -> Result<(ChannelId, WakeList), IpcError>;
 
-    /// Get a port by ID
-    fn get_port(&self, id: PortId, caller: TaskId) -> Option<&dyn IpcPort>;
+    /// Accept connection on port
+    fn accept_port(
+        &self,
+        port_id: PortId,
+        owner: TaskId,
+    ) -> Result<(ChannelId, TaskId), IpcError>;
 
-    /// Clean up all IPC resources for a task
-    fn cleanup_task(&self, task_id: TaskId) -> WakeList;
+    /// Close port
+    fn close_port(
+        &self,
+        port_id: PortId,
+        owner: TaskId,
+    ) -> Result<WakeList, IpcError>;
 
-    /// Remove a task from all subscriber lists
-    fn remove_subscriber(&self, task_id: TaskId);
+    /// Get port state (no ownership check)
+    fn port_state(&self, port_id: PortId) -> Option<PortState>;
 
-    // === Direct operations (for syscall layer) ===
+    // ========================================================================
+    // Channel Operations
+    // ========================================================================
 
     /// Send on channel with ownership check
     fn send(
@@ -388,20 +410,6 @@ pub trait IpcBackend: Send + Sync {
         filter: WakeReason,
     ) -> Result<bool, IpcError>;
 
-    /// Accept connection on port
-    fn accept_port(
-        &self,
-        port_id: PortId,
-        owner: TaskId,
-    ) -> Result<(ChannelId, TaskId), IpcError>;
-
-    /// Close port
-    fn close_port(
-        &self,
-        port_id: PortId,
-        owner: TaskId,
-    ) -> Result<WakeList, IpcError>;
-
     /// Check if channel has messages (no ownership check)
     fn channel_has_messages(&self, channel_id: ChannelId) -> bool;
 
@@ -411,7 +419,14 @@ pub trait IpcBackend: Send + Sync {
     /// Get channel state (no ownership check)
     fn channel_state(&self, channel_id: ChannelId) -> Option<ChannelState>;
 
-    /// Get port state (no ownership check)
-    fn port_state(&self, port_id: PortId) -> Option<PortState>;
+    // ========================================================================
+    // Cleanup
+    // ========================================================================
+
+    /// Clean up all IPC resources for a task
+    fn cleanup_task(&self, task_id: TaskId) -> WakeList;
+
+    /// Remove a task from all subscriber lists
+    fn remove_subscriber(&self, task_id: TaskId);
 }
 

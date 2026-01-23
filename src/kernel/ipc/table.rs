@@ -202,6 +202,12 @@ impl ChannelTable {
         self.channels[slot].as_mut()
     }
 
+    /// Get channel reference without ownership check (for state queries)
+    pub fn get_unchecked(&self, id: ChannelId) -> Option<&Channel> {
+        let slot = self.find_slot(id)?;
+        self.channels[slot].as_ref()
+    }
+
     /// Send a message on a channel
     ///
     /// Returns subscribers to wake.
