@@ -537,8 +537,6 @@ impl ObjectService {
     /// Open (register) a named port for listening
     ///
     /// Returns handle on success.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_port(&self, task_id: TaskId, name: &[u8]) -> Result<Handle, ObjError> {
         use crate::kernel::ipc;
         use crate::kernel::object::{Object, PortObject};
@@ -549,42 +547,54 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
+        // Check limit via scheduler (separate from object table access)
+        let can_create = crate::kernel::task::with_scheduler(|sched| {
+            sched.task(slot).map(|t| t.can_create_port()).unwrap_or(false)
+        });
+        if !can_create {
+            return Err(ObjError::OutOfHandles);
+        }
 
-            // Per-process limit check
-            if !task.can_create_port() {
+        // Register port with IPC backend (no lock held)
+        let (port_id, _listen_channel) = ipc::port_register(name, task_id)
+            .map_err(|e| match e {
+                ipc::IpcError::PortExists { .. } => ObjError::AlreadyExists,
+                _ => ObjError::OutOfMemory,
+            })?;
+
+        // Allocate handle in ObjectService tables
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or_else(|| {
+            let _ = ipc::port_unregister(port_id, task_id);
+            ObjError::TaskNotFound
+        })?;
+
+        let obj = Object::Port(PortObject::new(port_id, name));
+        let handle = match table.alloc(ObjectType::Port, obj) {
+            Some(h) => h,
+            None => {
+                let _ = ipc::port_unregister(port_id, task_id);
                 return Err(ObjError::OutOfHandles);
             }
+        };
 
-            // Register port with IPC backend
-            let (port_id, _listen_channel) = ipc::port_register(name, task_id)
-                .map_err(|e| match e {
-                    ipc::IpcError::PortExists { .. } => ObjError::AlreadyExists,
-                    _ => ObjError::OutOfMemory,
-                })?;
+        // Drop tables lock before scheduler access
+        drop(tables);
 
-            // Create and allocate handle
-            let obj = Object::Port(PortObject::new(port_id, name));
-            let handle = match task.object_table.alloc(ObjectType::Port, obj) {
-                Some(h) => h,
-                None => {
-                    let _ = ipc::port_unregister(port_id, task_id);
-                    return Err(ObjError::OutOfHandles);
-                }
-            };
+        // Update limit counter via scheduler
+        crate::kernel::task::with_scheduler(|sched| {
+            if let Some(task) = sched.task_mut(slot) {
+                task.add_port();
+            }
+        });
 
-            task.add_port();
-            Ok(handle)
-        })
+        Ok(handle)
     }
 
     /// Read from port (accept connection)
     ///
     /// Returns (channel_handle, client_pid) on success.
     /// Returns NeedBlock if no pending connections.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn read_port(
         &self,
         task_id: TaskId,
@@ -595,9 +605,11 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let entry = task.object_table.get(handle).ok_or(ObjError::BadHandle)?;
+        // Get port_id from object table
+        let port_id = {
+            let tables = self.tables.lock();
+            let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+            let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
 
             let Object::Port(ref p) = entry.object else {
                 return Err(ObjError::TypeMismatch);
@@ -607,30 +619,41 @@ impl ObjectService {
                 return Ok((ReadAttempt::Closed, None));
             }
 
-            let port_id = p.port_id();
+            p.port_id()
+        };
 
-            // Accept connection from IPC backend
-            match ipc::port_accept(port_id, task_id) {
-                Ok((server_channel, client_pid)) => {
-                    // Create Channel handle for accepted connection
-                    let ch_obj = Object::Channel(ChannelObject::new(server_channel));
+        // Accept connection from IPC backend (no lock held)
+        match ipc::port_accept(port_id, task_id) {
+            Ok((server_channel, client_pid)) => {
+                // Allocate channel handle in ObjectService tables
+                let mut tables = self.tables.lock();
+                let table = tables[slot].as_mut().ok_or_else(|| {
+                    let _ = ipc::close_channel(server_channel, task_id);
+                    ObjError::TaskNotFound
+                })?;
 
-                    match task.object_table.alloc(ObjectType::Channel, ch_obj) {
-                        Some(ch_handle) => {
-                            task.add_channel();
-                            Ok((ReadAttempt::Success(8), Some((ch_handle, client_pid))))
-                        }
-                        None => {
-                            let _ = ipc::close_channel(server_channel, task_id);
-                            Err(ObjError::OutOfHandles)
-                        }
+                let ch_obj = Object::Channel(ChannelObject::new(server_channel));
+                match table.alloc(ObjectType::Channel, ch_obj) {
+                    Some(ch_handle) => {
+                        drop(tables);
+                        // Update limit counter via scheduler
+                        crate::kernel::task::with_scheduler(|sched| {
+                            if let Some(task) = sched.task_mut(slot) {
+                                task.add_channel();
+                            }
+                        });
+                        Ok((ReadAttempt::Success(8), Some((ch_handle, client_pid))))
+                    }
+                    None => {
+                        let _ = ipc::close_channel(server_channel, task_id);
+                        Err(ObjError::OutOfHandles)
                     }
                 }
-                Err(ipc::IpcError::NoPending) => Ok((ReadAttempt::NeedBlock, None)),
-                Err(ipc::IpcError::Closed) => Ok((ReadAttempt::Closed, None)),
-                Err(_) => Err(ObjError::BadHandle),
             }
-        })
+            Err(ipc::IpcError::NoPending) => Ok((ReadAttempt::NeedBlock, None)),
+            Err(ipc::IpcError::Closed) => Ok((ReadAttempt::Closed, None)),
+            Err(_) => Err(ObjError::BadHandle),
+        }
     }
 
     // ========================================================================
@@ -640,60 +663,69 @@ impl ObjectService {
     /// Create a channel pair
     ///
     /// Returns (handle_a, handle_b) on success.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_channel_pair(&self, task_id: TaskId) -> Result<(Handle, Handle), ObjError> {
         use crate::kernel::ipc;
         use crate::kernel::object::{Object, ChannelObject};
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
+        // Per-process limit check via scheduler
+        let channel_count = crate::kernel::task::with_scheduler(|sched| {
+            sched.task(slot).map(|t| t.channel_count).unwrap_or(u16::MAX)
+        });
+        if channel_count + 2 > crate::kernel::task::MAX_CHANNELS_PER_TASK {
+            return Err(ObjError::OutOfHandles);
+        }
 
-            // Per-process limit check
-            if task.channel_count + 2 > crate::kernel::task::MAX_CHANNELS_PER_TASK {
+        // Create channel pair via IPC backend (no lock held)
+        let (ch_a, ch_b) = ipc::create_channel_pair(task_id, task_id)
+            .map_err(|_| ObjError::OutOfMemory)?;
+
+        // Allocate handles in ObjectService tables
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or_else(|| {
+            let _ = ipc::close_channel(ch_a, task_id);
+            let _ = ipc::close_channel(ch_b, task_id);
+            ObjError::TaskNotFound
+        })?;
+
+        // Create and allocate handle A
+        let obj_a = Object::Channel(ChannelObject::new(ch_a));
+        let handle_a = table.alloc(ObjectType::Channel, obj_a)
+            .ok_or_else(|| {
+                let _ = ipc::close_channel(ch_a, task_id);
+                let _ = ipc::close_channel(ch_b, task_id);
+                ObjError::OutOfHandles
+            })?;
+
+        // Create and allocate handle B
+        let obj_b = Object::Channel(ChannelObject::new(ch_b));
+        let handle_b = match table.alloc(ObjectType::Channel, obj_b) {
+            Some(h) => h,
+            None => {
+                let _ = table.close(handle_a);
+                let _ = ipc::close_channel(ch_a, task_id);
+                let _ = ipc::close_channel(ch_b, task_id);
                 return Err(ObjError::OutOfHandles);
             }
+        };
 
-            // Create channel pair via IPC backend
-            let (ch_a, ch_b) = ipc::create_channel_pair(task_id, task_id)
-                .map_err(|_| ObjError::OutOfMemory)?;
+        drop(tables);
 
-            // Create and allocate handle A
-            let obj_a = Object::Channel(ChannelObject::new(ch_a));
-            let handle_a = task.object_table.alloc(ObjectType::Channel, obj_a)
-                .ok_or_else(|| {
-                    let _ = ipc::close_channel(ch_a, task_id);
-                    let _ = ipc::close_channel(ch_b, task_id);
-                    ObjError::OutOfHandles
-                })?;
+        // Track resource usage via scheduler
+        crate::kernel::task::with_scheduler(|sched| {
+            if let Some(task) = sched.task_mut(slot) {
+                task.add_channel();
+                task.add_channel();
+            }
+        });
 
-            // Create and allocate handle B
-            let obj_b = Object::Channel(ChannelObject::new(ch_b));
-            let handle_b = match task.object_table.alloc(ObjectType::Channel, obj_b) {
-                Some(h) => h,
-                None => {
-                    let _ = task.object_table.close(handle_a);
-                    let _ = ipc::close_channel(ch_a, task_id);
-                    let _ = ipc::close_channel(ch_b, task_id);
-                    return Err(ObjError::OutOfHandles);
-                }
-            };
-
-            // Track resource usage
-            task.add_channel();
-            task.add_channel();
-
-            Ok((handle_a, handle_b))
-        })
+        Ok((handle_a, handle_b))
     }
 
     /// Connect to a named port
     ///
     /// Returns channel handle on success.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_channel_connect(
         &self,
         task_id: TaskId,
@@ -704,42 +736,53 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
+        // Per-process limit check via scheduler
+        let can_create = crate::kernel::task::with_scheduler(|sched| {
+            sched.task(slot).map(|t| t.can_create_channel()).unwrap_or(false)
+        });
+        if !can_create {
+            return Err(ObjError::OutOfHandles);
+        }
 
-            // Per-process limit check
-            if !task.can_create_channel() {
+        // Connect to port via IPC backend (no lock held)
+        let (client_channel, wake_list) = ipc::port_connect(port_name, task_id)
+            .map_err(|e| match e {
+                ipc::IpcError::PortNotFound => ObjError::BadHandle,
+                _ => ObjError::InvalidArg,
+            })?;
+
+        // Wake the server waiting for connections
+        waker::wake(&wake_list, ipc::WakeReason::Accepted);
+
+        // Allocate handle in ObjectService tables
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or_else(|| {
+            let _ = ipc::close_channel(client_channel, task_id);
+            ObjError::TaskNotFound
+        })?;
+
+        let obj = Object::Channel(ChannelObject::new(client_channel));
+        let handle = match table.alloc(ObjectType::Channel, obj) {
+            Some(h) => h,
+            None => {
+                let _ = ipc::close_channel(client_channel, task_id);
                 return Err(ObjError::OutOfHandles);
             }
+        };
 
-            // Connect to port via IPC backend
-            let (client_channel, wake_list) = ipc::port_connect(port_name, task_id)
-                .map_err(|e| match e {
-                    ipc::IpcError::PortNotFound => ObjError::BadHandle,
-                    _ => ObjError::InvalidArg,
-                })?;
+        drop(tables);
 
-            // Wake the server waiting for connections
-            waker::wake(&wake_list, ipc::WakeReason::Accepted);
+        // Track resource usage via scheduler
+        crate::kernel::task::with_scheduler(|sched| {
+            if let Some(task) = sched.task_mut(slot) {
+                task.add_channel();
+            }
+        });
 
-            // Create and allocate handle
-            let obj = Object::Channel(ChannelObject::new(client_channel));
-            let handle = match task.object_table.alloc(ObjectType::Channel, obj) {
-                Some(h) => h,
-                None => {
-                    let _ = ipc::close_channel(client_channel, task_id);
-                    return Err(ObjError::OutOfHandles);
-                }
-            };
-
-            task.add_channel();
-            Ok(handle)
-        })
+        Ok(handle)
     }
 
     /// Read from channel (receive message)
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn read_channel(
         &self,
         task_id: TaskId,
@@ -751,9 +794,11 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let entry = task.object_table.get_mut(handle).ok_or(ObjError::BadHandle)?;
+        // Get channel info from object table
+        let channel_id = {
+            let tables = self.tables.lock();
+            let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+            let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
 
             let Object::Channel(ref ch) = entry.object else {
                 return Err(ObjError::TypeMismatch);
@@ -769,26 +814,27 @@ impl ObjectService {
                 return Ok(ReadAttempt::Closed);
             }
 
-            // Receive from IPC backend
-            match ipc::receive(channel_id, task_id) {
-                Ok(msg) => {
-                    let payload = msg.payload_slice();
-                    let copy_len = core::cmp::min(payload.len(), buf.len());
-                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                    Ok(ReadAttempt::Success(copy_len))
-                }
-                Err(ipc::IpcError::WouldBlock) => Ok(ReadAttempt::NeedBlock),
-                Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
-                    Ok(ReadAttempt::Closed)
-                }
-                Err(_) => Err(ObjError::BadHandle),
+            channel_id
+        };
+        // tables lock dropped here
+
+        // Receive from IPC backend (outside lock)
+        match ipc::receive(channel_id, task_id) {
+            Ok(msg) => {
+                let payload = msg.payload_slice();
+                let copy_len = core::cmp::min(payload.len(), buf.len());
+                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                Ok(ReadAttempt::Success(copy_len))
             }
-        })
+            Err(ipc::IpcError::WouldBlock) => Ok(ReadAttempt::NeedBlock),
+            Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
+                Ok(ReadAttempt::Closed)
+            }
+            Err(_) => Err(ObjError::BadHandle),
+        }
     }
 
     /// Write to channel (send message)
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn write_channel(
         &self,
         task_id: TaskId,
@@ -804,9 +850,11 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let entry = task.object_table.get_mut(handle).ok_or(ObjError::BadHandle)?;
+        // Get channel info from object table
+        let channel_id = {
+            let tables = self.tables.lock();
+            let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+            let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
 
             let Object::Channel(ref ch) = entry.object else {
                 return Err(ObjError::TypeMismatch);
@@ -822,65 +870,61 @@ impl ObjectService {
                 return Err(ObjError::Closed);
             }
 
-            // Create and send message
-            let msg = ipc::Message::data(task_id, buf);
+            channel_id
+        };
+        // tables lock dropped here
 
-            match ipc::send(channel_id, msg, task_id) {
-                Ok(wake_list) => {
-                    waker::wake(&wake_list, ipc::WakeReason::Readable);
-                    Ok(buf.len())
-                }
-                Err(ipc::IpcError::QueueFull) => Err(ObjError::WouldBlock),
-                Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
-                    Err(ObjError::Closed)
-                }
-                Err(_) => Err(ObjError::BadHandle),
+        // Create and send message (outside lock)
+        let msg = ipc::Message::data(task_id, buf);
+
+        match ipc::send(channel_id, msg, task_id) {
+            Ok(wake_list) => {
+                waker::wake(&wake_list, ipc::WakeReason::Readable);
+                Ok(buf.len())
             }
-        })
+            Err(ipc::IpcError::QueueFull) => Err(ObjError::WouldBlock),
+            Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
+                Err(ObjError::Closed)
+            }
+            Err(_) => Err(ObjError::BadHandle),
+        }
     }
 
     // ========================================================================
-    // Mux Operations (Phase 3)
+    // Mux Operations
     // ========================================================================
 
     /// Create a new Mux
     ///
     /// Returns a handle to the mux on success.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_mux(&self, task_id: TaskId) -> Result<Handle, ObjError> {
         use crate::kernel::object::{Object, MuxObject};
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let obj = Object::Mux(MuxObject::new());
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let obj = Object::Mux(MuxObject::new());
 
-            task.object_table
-                .alloc(ObjectType::Mux, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        table.alloc(ObjectType::Mux, obj).ok_or(ObjError::OutOfHandles)
     }
 
     // ========================================================================
-    // Process Operations (Phase 3)
+    // Process Operations
     // ========================================================================
 
     /// Create a Process object to watch another process
     ///
     /// The target_pid is the PID to watch. Returns a handle that can be
     /// read to wait for the target process to exit.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_process(&self, task_id: TaskId, target_pid: TaskId) -> Result<Handle, ObjError> {
         use crate::kernel::object::{Object, ProcessObject};
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            // First, check target task state (before borrowing caller's task)
-            let exit_code = if let Some(target_slot) = sched.slot_by_pid(target_pid) {
+        // First, check target task state via scheduler
+        let exit_code = crate::kernel::task::with_scheduler(|sched| {
+            if let Some(target_slot) = sched.slot_by_pid(target_pid) {
                 if let Some(target) = sched.task(target_slot) {
                     target.state().exit_code()
                 } else {
@@ -889,34 +933,30 @@ impl ObjectService {
             } else {
                 // Task not found - may have already exited and been reaped
                 Some(-1)
-            };
-
-            // Now borrow caller's task to allocate handle
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-
-            // Create ProcessObject
-            let mut proc_obj = ProcessObject::new(target_pid);
-            if let Some(code) = exit_code {
-                proc_obj.set_exit_code(Some(code));
             }
-            let obj = Object::Process(proc_obj);
+        });
+        // scheduler lock dropped here
 
-            // Allocate handle
-            task.object_table
-                .alloc(ObjectType::Process, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        // Create ProcessObject
+        let mut proc_obj = ProcessObject::new(target_pid);
+        if let Some(code) = exit_code {
+            proc_obj.set_exit_code(Some(code));
+        }
+        let obj = Object::Process(proc_obj);
+
+        // Allocate handle in object table
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        table.alloc(ObjectType::Process, obj).ok_or(ObjError::OutOfHandles)
     }
 
     // ========================================================================
-    // Shmem Operations (Phase 3)
+    // Shmem Operations
     // ========================================================================
 
     /// Create a new shared memory region
     ///
     /// Returns a handle to the shmem on success.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_shmem_create(&self, task_id: TaskId, size: usize) -> Result<Handle, ObjError> {
         use crate::kernel::object::{Object, ShmemObject};
         use crate::kernel::shmem;
@@ -927,69 +967,70 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
+        // Create shmem region (outside lock)
+        let (shmem_id, vaddr, paddr) = shmem::create(task_id, size)
+            .map_err(ObjError::from_errno)?;
 
-            // Create shmem region
-            match shmem::create(task_id, size) {
-                Ok((shmem_id, vaddr, paddr)) => {
-                    let obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, size, vaddr));
+        // Allocate handle in object table
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or_else(|| {
+            let _ = shmem::destroy(shmem_id, task_id);
+            ObjError::TaskNotFound
+        })?;
 
-                    match task.object_table.alloc(ObjectType::Shmem, obj) {
-                        Some(handle) => Ok(handle),
-                        None => {
-                            let _ = shmem::destroy(shmem_id, task_id);
-                            Err(ObjError::OutOfHandles)
-                        }
-                    }
-                }
-                Err(e) => Err(ObjError::from_errno(e)),
+        let obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, size, vaddr));
+
+        match table.alloc(ObjectType::Shmem, obj) {
+            Some(handle) => Ok(handle),
+            None => {
+                let _ = shmem::destroy(shmem_id, task_id);
+                Err(ObjError::OutOfHandles)
             }
-        })
+        }
     }
 
     /// Open an existing shared memory region
     ///
     /// Returns a handle to the shmem on success.
+    /// Open an existing shared memory region
     ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
+    /// Returns a handle to the shmem on success.
     pub fn open_shmem_existing(&self, task_id: TaskId, shmem_id: u32) -> Result<Handle, ObjError> {
         use crate::kernel::object::{Object, ShmemObject};
         use crate::kernel::shmem;
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
+        // Map existing shmem region (outside lock)
+        let (vaddr, paddr) = shmem::map(task_id, shmem_id)
+            .map_err(ObjError::from_errno)?;
+        let size = shmem::get_size(shmem_id).unwrap_or(0);
 
-            // Map existing shmem region
-            match shmem::map(task_id, shmem_id) {
-                Ok((vaddr, paddr)) => {
-                    let size = shmem::get_size(shmem_id).unwrap_or(0);
-                    let obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, size, vaddr));
+        // Allocate handle in object table
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or_else(|| {
+            let _ = shmem::unmap(task_id, shmem_id);
+            ObjError::TaskNotFound
+        })?;
 
-                    match task.object_table.alloc(ObjectType::Shmem, obj) {
-                        Some(handle) => Ok(handle),
-                        None => {
-                            let _ = shmem::unmap(task_id, shmem_id);
-                            Err(ObjError::OutOfHandles)
-                        }
-                    }
-                }
-                Err(e) => Err(ObjError::from_errno(e)),
+        let obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, size, vaddr));
+
+        match table.alloc(ObjectType::Shmem, obj) {
+            Some(handle) => Ok(handle),
+            None => {
+                let _ = shmem::unmap(task_id, shmem_id);
+                Err(ObjError::OutOfHandles)
             }
-        })
+        }
     }
 
     // ========================================================================
-    // DmaPool Operations (Phase 3)
+    // DmaPool Operations
     // ========================================================================
 
     /// Allocate DMA-capable memory
     ///
     /// Returns a handle to the DMA pool on success.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_dma_pool(
         &self,
         task_id: TaskId,
@@ -1005,42 +1046,37 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
+        // Allocate from appropriate pool (outside lock)
+        let paddr = if use_high {
+            dma_pool::alloc_high(size).map_err(ObjError::from_errno)?
+        } else {
+            dma_pool::alloc(size).map_err(ObjError::from_errno)?
+        };
 
-            // Allocate from appropriate pool
-            let paddr = if use_high {
-                dma_pool::alloc_high(size).map_err(ObjError::from_errno)?
-            } else {
-                dma_pool::alloc(size).map_err(ObjError::from_errno)?
-            };
+        // Map into process (outside lock)
+        let vaddr = if use_high {
+            dma_pool::map_into_process_high(task_id, paddr, size)
+                .map_err(ObjError::from_errno)?
+        } else {
+            dma_pool::map_into_process(task_id, paddr, size)
+                .map_err(ObjError::from_errno)?
+        };
 
-            // Map into process
-            let vaddr = if use_high {
-                dma_pool::map_into_process_high(task_id, paddr, size)
-                    .map_err(ObjError::from_errno)?
-            } else {
-                dma_pool::map_into_process(task_id, paddr, size)
-                    .map_err(ObjError::from_errno)?
-            };
+        // Allocate handle in object table
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let obj = Object::DmaPool(DmaPoolObject::new(paddr, size, vaddr));
 
-            let obj = Object::DmaPool(DmaPoolObject::new(paddr, size, vaddr));
-
-            task.object_table
-                .alloc(ObjectType::DmaPool, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        table.alloc(ObjectType::DmaPool, obj).ok_or(ObjError::OutOfHandles)
     }
 
     // ========================================================================
-    // MMIO Operations (Phase 3)
+    // MMIO Operations
     // ========================================================================
 
     /// Map MMIO region
     ///
     /// Returns a handle to the MMIO mapping on success.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_mmio(
         &self,
         task_id: TaskId,
@@ -1055,87 +1091,71 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
+        // Map MMIO into process via scheduler
+        let vaddr = crate::kernel::task::with_scheduler(|sched| {
             let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
+            task.mmap_device(phys_addr, size).ok_or(ObjError::OutOfMemory)
+        })?;
+        // scheduler lock dropped here
 
-            // Map MMIO into process
-            let vaddr = task.mmap_device(phys_addr, size).ok_or(ObjError::OutOfMemory)?;
+        // Allocate handle in object table
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let obj = Object::Mmio(MmioObject::new(phys_addr, size, vaddr));
 
-            let obj = Object::Mmio(MmioObject::new(phys_addr, size, vaddr));
-
-            task.object_table
-                .alloc(ObjectType::Mmio, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        table.alloc(ObjectType::Mmio, obj).ok_or(ObjError::OutOfHandles)
     }
 
     // ========================================================================
-    // Klog Operations (Phase 3)
+    // Klog Operations
     // ========================================================================
 
     /// Create a kernel log reader
     ///
     /// Returns a handle to the klog reader on success.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_klog(&self, task_id: TaskId) -> Result<Handle, ObjError> {
         use crate::kernel::object::{Object, KlogObject};
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let obj = Object::Klog(KlogObject::new());
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let obj = Object::Klog(KlogObject::new());
 
-            task.object_table
-                .alloc(ObjectType::Klog, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        table.alloc(ObjectType::Klog, obj).ok_or(ObjError::OutOfHandles)
     }
 
     // ========================================================================
-    // PCI Bus Operations (Phase 3)
+    // PCI Bus Operations
     // ========================================================================
 
     /// Create a PCI bus handle for device enumeration
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_pci_bus(&self, task_id: TaskId, bdf_filter: u32) -> Result<Handle, ObjError> {
         use crate::kernel::object::{Object, PciBusObject};
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let obj = Object::PciBus(PciBusObject::new(bdf_filter));
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let obj = Object::PciBus(PciBusObject::new(bdf_filter));
 
-            task.object_table
-                .alloc(ObjectType::PciBus, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        table.alloc(ObjectType::PciBus, obj).ok_or(ObjError::OutOfHandles)
     }
 
     /// Create a PCI device handle for config access
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_pci_device(&self, task_id: TaskId, bdf: u32) -> Result<Handle, ObjError> {
         use crate::kernel::object::{Object, PciDeviceObject};
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let obj = Object::PciDevice(PciDeviceObject::new(bdf));
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let obj = Object::PciDevice(PciDeviceObject::new(bdf));
 
-            task.object_table
-                .alloc(ObjectType::PciDevice, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        table.alloc(ObjectType::PciDevice, obj).ok_or(ObjError::OutOfHandles)
     }
 
     /// Allocate MSI vectors for a PCI device
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_msi(
         &self,
         task_id: TaskId,
@@ -1147,32 +1167,24 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let obj = Object::Msi(MsiObject::new(bdf, first_irq, count));
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let obj = Object::Msi(MsiObject::new(bdf, first_irq, count));
 
-            task.object_table
-                .alloc(ObjectType::Msi, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        table.alloc(ObjectType::Msi, obj).ok_or(ObjError::OutOfHandles)
     }
 
     /// Create a bus list handle
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn open_bus_list(&self, task_id: TaskId) -> Result<Handle, ObjError> {
         use crate::kernel::object::{Object, BusListObject};
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
-        crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            let obj = Object::BusList(BusListObject::new());
+        let mut tables = self.tables.lock();
+        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let obj = Object::BusList(BusListObject::new());
 
-            task.object_table
-                .alloc(ObjectType::BusList, obj)
-                .ok_or(ObjError::OutOfHandles)
-        })
+        table.alloc(ObjectType::BusList, obj).ok_or(ObjError::OutOfHandles)
     }
 }
 
