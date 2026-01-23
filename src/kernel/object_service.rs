@@ -1188,6 +1188,53 @@ impl ObjectService {
     }
 
     // ========================================================================
+    // Timer Checking (for scheduler tick)
+    // ========================================================================
+
+    /// Check TimerObjects for a task and collect fired subscribers
+    ///
+    /// Called during scheduler tick to find TimerObjects that have fired.
+    /// Returns subscribers that should be woken.
+    pub fn check_timers_for_task(
+        &self,
+        task_id: TaskId,
+        current_tick: u64,
+        max_subscribers: usize,
+    ) -> (crate::kernel::ipc::waker::WakeList, usize) {
+        use crate::kernel::object::Object;
+
+        let slot = match slot_from_task_id(task_id) {
+            Some(s) => s,
+            None => return (crate::kernel::ipc::waker::WakeList::new(), 0),
+        };
+
+        let mut tables = self.tables.lock();
+        let table = match tables[slot].as_mut() {
+            Some(t) => t,
+            None => return (crate::kernel::ipc::waker::WakeList::new(), 0),
+        };
+
+        let mut wake_list = crate::kernel::ipc::waker::WakeList::new();
+        let mut count = 0;
+
+        for entry in table.entries_mut() {
+            if count >= max_subscribers {
+                break;
+            }
+            if let Object::Timer(ref mut t) = entry.object {
+                if t.check(current_tick) {
+                    if let Some(sub) = t.subscriber() {
+                        wake_list.push(sub);
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        (wake_list, count)
+    }
+
+    // ========================================================================
     // Child Exit Notification
     // ========================================================================
 

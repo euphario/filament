@@ -395,28 +395,36 @@ impl Scheduler {
                     woken += 1;
                 }
 
-                // Also check TimerObjects in object_table (for Mux subscribers)
-                for entry in task.object_table.entries_mut() {
-                    if let crate::kernel::object::Object::Timer(ref mut t) = entry.object {
-                        // Check if timer has fired and has a subscriber
-                        if t.check(current_tick) {
-                            if let Some(subscriber) = t.subscriber() {
-                                // Collect subscriber to wake
-                                timer_subscribers[timer_sub_count] = subscriber;
-                                timer_sub_count += 1;
-                                if timer_sub_count >= timer_subscribers.len() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                // Collect task ID for TimerObject checking via ObjectService
+                if timer_sub_count < timer_subscribers.len() {
+                    // Store task_id in the subscriber array (repurposed temporarily)
+                    timer_subscribers[timer_sub_count] = Subscriber { task_id: task.id, generation: 0 };
+                    timer_sub_count += 1;
                 }
             }
         }
 
-        // Wake all collected TimerObject subscribers (outside scheduler lock ideally)
+        // Check TimerObjects via ObjectService (outside task iteration)
+        // Collect all subscribers to wake
+        let mut all_subscribers: [Subscriber; 32] = [Subscriber { task_id: 0, generation: 0 }; 32];
+        let mut all_sub_count = 0;
+
         for i in 0..timer_sub_count {
-            let subscriber = timer_subscribers[i];
+            let task_id = timer_subscribers[i].task_id;
+            let (wake_list, _) = super::object_service::object_service()
+                .check_timers_for_task(task_id, current_tick, 8);
+
+            for sub in wake_list.iter() {
+                if all_sub_count < all_subscribers.len() {
+                    all_subscribers[all_sub_count] = sub;
+                    all_sub_count += 1;
+                }
+            }
+        }
+
+        // Wake all collected TimerObject subscribers
+        for i in 0..all_sub_count {
+            let subscriber = all_subscribers[i];
             // Find and wake the subscriber's task
             if let Some(slot) = self.slot_by_pid(subscriber.task_id) {
                 if let Some(ref mut task) = self.tasks[slot] {
@@ -451,6 +459,8 @@ impl Scheduler {
 
         self.tasks[slot] = Task::new_kernel(id, entry, name);
         if self.tasks[slot].is_some() {
+            // Create parallel object table in ObjectService (Phase 1: not used yet)
+            super::object_service::object_service().create_task_table(id, false);
             Some(id)
         } else {
             None
@@ -466,6 +476,8 @@ impl Scheduler {
 
         self.tasks[slot] = Task::new_user(id, name);
         if self.tasks[slot].is_some() {
+            // Create parallel object table in ObjectService (Phase 1: not used yet)
+            super::object_service::object_service().create_task_table(id, true);
             Some((id, slot))
         } else {
             None
@@ -696,6 +708,9 @@ impl Scheduler {
                     let port_wake_list = super::ipc::port_cleanup_task(pid);
                     super::ipc::waker::wake(&port_wake_list, super::ipc::WakeReason::Closed);
 
+                    // Remove object table from ObjectService (Phase 1: parallel structure)
+                    super::object_service::object_service().remove_task_table(pid);
+
                     // Bump generation so any stale PIDs for this slot become invalid
                     self.bump_generation(slot_idx);
                     // Drop the task (frees kernel stack and heap mappings)
@@ -755,6 +770,11 @@ impl Scheduler {
                 false
             }
         })
+    }
+
+    /// Get the next deadline (for tickless timer reprogramming)
+    pub fn get_next_deadline(&self) -> u64 {
+        self.next_deadline
     }
 
     /// Select the next task to run using the current scheduling policy
@@ -1021,7 +1041,7 @@ pub unsafe fn update_current_task_globals() {
 
     // Defensive check: validate current slot is in bounds
     if sched.current >= MAX_TASKS {
-        crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: current slot out of bounds!\r\n");
+        crate::platform::current::uart::print("[PANIC] update_current_task_globals: current slot out of bounds!\r\n");
         loop { core::arch::asm!("wfe"); }
     }
 
@@ -1031,7 +1051,7 @@ pub unsafe fn update_current_task_globals() {
 
         // Defensive check: trap frame should be in kernel space (0xFFFF...)
         if trap_addr < 0xFFFF_0000_0000_0000 {
-            crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: trap_frame not in kernel space!\r\n");
+            crate::platform::current::uart::print("[PANIC] update_current_task_globals: trap_frame not in kernel space!\r\n");
             loop { core::arch::asm!("wfe"); }
         }
 
@@ -1045,14 +1065,14 @@ pub unsafe fn update_current_task_globals() {
             // Defensive check: physical address should be valid DRAM (>= 0x40000000)
             // and properly aligned (4KB page table)
             if ttbr0_phys < 0x4000_0000 || ttbr0_phys >= 0x1_0000_0000 || (ttbr0_phys & 0xFFF) != 0 {
-                crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: invalid TTBR0=0x");
+                crate::platform::current::uart::print("[PANIC] update_current_task_globals: invalid TTBR0=0x");
                 // Print hex value
                 for i in (0..16).rev() {
                     let nibble = ((ttbr0 >> (i * 4)) & 0xf) as u8;
                     let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-                    crate::platform::mt7988::uart::putc(c as char);
+                    crate::platform::current::uart::putc(c as char);
                 }
-                crate::platform::mt7988::uart::print("\r\n");
+                crate::platform::current::uart::print("\r\n");
                 loop { core::arch::asm!("wfe"); }
             }
 
@@ -1060,7 +1080,7 @@ pub unsafe fn update_current_task_globals() {
         }
     } else {
         // No task at current slot - this is also a bug
-        crate::platform::mt7988::uart::print("[PANIC] update_current_task_globals: no task at current slot!\r\n");
+        crate::platform::current::uart::print("[PANIC] update_current_task_globals: no task at current slot!\r\n");
         loop { core::arch::asm!("wfe"); }
     }
 }
