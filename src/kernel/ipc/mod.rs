@@ -105,7 +105,8 @@ mod tests;
 pub use types::{Message, MessageHeader, MessageType, ChannelId, MAX_INLINE_PAYLOAD};
 pub use error::IpcError;
 pub use traits::{Subscriber, WakeReason, Waitable, Closable};
-pub use backend::{ipc_backend, KernelIpcBackend};
+// Note: KernelIpcBackend exists in backend.rs for trait-based testing
+// but is not re-exported since ObjectService handles operations directly
 
 // Internal imports (not re-exported)
 use table::ChannelTable;

@@ -58,13 +58,47 @@ Everything is an object. Everything uses the same 5 syscalls:
 - **No special syscalls** - Everything goes through the unified interface
 - **Object types via open flags** - `open(ObjectType::Channel, flags, arg)`
 
-### 4. No Tech Debt
+### 4. ObjectService Owns All Tables
+
+**Critical architecture**: Object tables are NOT in Task struct. ObjectService owns them.
+
+```rust
+pub struct ObjectService {
+    tables: SpinLock<[Option<ObjectTable>; MAX_TASKS]>,
+}
+
+impl ObjectService {
+    pub fn with_table<F, R>(&self, task_id: TaskId, f: F) -> Result<R>
+    pub fn with_table_mut<F, R>(&self, task_id: TaskId, f: F) -> Result<R>
+}
+```
+
+**Lock ordering** (always this order):
+1. Scheduler lock (via `task::with_scheduler()`)
+2. ObjectService tables lock (via `object_service().tables.lock()`)
+
+**Pattern for syscall dispatch**:
+```rust
+// Get task ID from scheduler
+let task_id = task::with_scheduler(|sched| sched.task(slot).map(|t| t.id));
+
+// Access object table via ObjectService
+object_service().with_table_mut(task_id, |table| {
+    // Operate on table...
+})?;
+```
+
+**Key files**:
+- `src/kernel/object_service.rs` - ObjectService with tables
+- `src/kernel/object/syscall.rs` - Syscall dispatch using ObjectService
+
+### 5. No Tech Debt
 
 - **Complete migrations only** - No half-finished rewrites
 - **Deprecate completely** - Old code returns ENOSYS, then gets deleted
 - **No backward compatibility shims** - Clean breaks, not cruft accumulation
 
-### 5. Subscriber-Based Waking
+### 6. Subscriber-Based Waking
 
 ```rust
 pub struct Subscriber { task_id: u32, generation: u32 }
@@ -261,6 +295,16 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 
 ## Current Work
 
+### ObjectService Tables Migration (COMPLETE)
+- **Object tables moved to ObjectService** - Not in Task struct anymore
+  - `src/kernel/object_service.rs` owns all per-task object tables
+  - Scheduler lock and tables lock are separate (proper lock ordering)
+  - Task struct no longer has `object_table` field
+- **All syscall dispatch uses ObjectService**
+  - `object/syscall.rs` - read/write/map/close use `object_service().with_table[_mut]()`
+  - Child exit notifications via `object_service().notify_child_exit()`
+  - Timer checking via `object_service().check_timers_for_task()`
+
 ### Trait-Based Syscall Layer (COMPLETE)
 - **Syscalls now go through trait boundaries** - Pure microkernel design
   - All scheduler access via `task::with_scheduler(|sched| { ... })`
@@ -272,12 +316,6 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
   - `MemoryOps` - Memory management (mmap/munmap)
   - `ProcessOps` - Process lifecycle (exit/kill/spawn)
   - `UserAccess` - Safe user memory access
-- **Implementation files**
-  - `src/kernel/syscall_ctx_impl.rs` - KernelSyscallContext
-  - `src/kernel/object_ops_impl.rs` - KernelObjectOps
-  - `src/kernel/memory_ops_impl.rs` - KernelMemoryOps
-  - `src/kernel/process_ops_impl.rs` - KernelProcessOps
-  - `src/kernel/user_access_impl.rs` - KernelUserAccess
 
 ### Next Steps
 1. Migrate Service framework (`userlib/src/service.rs`) to ipc2
@@ -294,6 +332,17 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 ---
 
 ## Changelog (Recent)
+
+### 2026-01-23
+- **ObjectService tables migration complete** - Phase 4-6 of syscall rebuild
+  - Object tables moved from Task struct to ObjectService
+  - `src/kernel/object_service.rs` owns `BTreeMap<TaskId, ObjectTable>` with its own lock
+  - All syscall dispatch (read/write/map/close) now uses `object_service().with_table[_mut]()`
+  - Child exit notifications migrated to `object_service().notify_child_exit()`
+  - Timer checking migrated to `object_service().check_timers_for_task()`
+  - `object_table` field removed from Task struct
+- **Lock ordering established**: scheduler lock first, then ObjectService tables lock
+- **Cleanup**: Removed dead `read_mux_impl`, unused IPC backend re-exports
 
 ### 2026-01-22
 - **Trait-based syscall layer refactoring** - Pure microkernel design
