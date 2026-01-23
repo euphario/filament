@@ -204,8 +204,12 @@ impl<T> SpinLock<T> {
     ///
     /// The caller must ensure exclusive access to the data.
     /// This is only safe during initialization before the lock is used.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(crate)` to limit unsafe access to kernel internals only.
     #[inline]
-    pub unsafe fn get_unchecked(&self) -> &T {
+    pub(crate) unsafe fn get_unchecked(&self) -> &T {
         &*self.data.get()
     }
 
@@ -215,8 +219,12 @@ impl<T> SpinLock<T> {
     ///
     /// The caller must ensure exclusive access to the data.
     /// This is only safe during initialization before the lock is used.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(crate)` to limit unsafe access to kernel internals only.
     #[inline]
-    pub unsafe fn get_unchecked_mut(&self) -> &mut T {
+    pub(crate) unsafe fn get_unchecked_mut(&self) -> &mut T {
         &mut *self.data.get()
     }
 }

@@ -104,6 +104,36 @@ impl BusState {
             BusState::Resetting => Some(10_000), // 10 seconds max for reset
         }
     }
+
+    /// Valid state transitions
+    pub fn can_transition_to(&self, new: BusState) -> bool {
+        match (*self, new) {
+            // Safe -> Claimed (devd sets driver)
+            (BusState::Safe, BusState::Claimed) => true,
+            // Safe -> Resetting (explicit reset request)
+            (BusState::Safe, BusState::Resetting) => true,
+            // Claimed -> Resetting (driver crashed or reset requested)
+            (BusState::Claimed, BusState::Resetting) => true,
+            // Resetting -> Safe (reset complete)
+            (BusState::Resetting, BusState::Safe) => true,
+            _ => false,
+        }
+    }
+
+    /// Get human-readable state name
+    pub fn name(&self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl super::ipc::traits::StateMachine for BusState {
+    fn can_transition_to(&self, new: &Self) -> bool {
+        BusState::can_transition_to(self, *new)
+    }
+
+    fn name(&self) -> &'static str {
+        BusState::name(self)
+    }
 }
 
 // =============================================================================
@@ -269,8 +299,8 @@ pub fn init(kernel_pid: Pid) {
         for i in 0..4u8 {
             if let Some(bus) = registry.add(BusType::PCIe, i) {
                 // Start in Resetting - hardware reset happens in complete_init()
-                bus.state = BusState::Resetting;
-                bus.state_entered_at = uptime_ms();
+                // Initial state set via set_initial_state() since bus is brand new
+                bus.set_initial_state(BusState::Resetting);
                 let _ = bus.register_port(kernel_pid);
                 kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Resetting");
             }
@@ -280,8 +310,8 @@ pub fn init(kernel_pid: Pid) {
         for i in 0..2u8 {
             if let Some(bus) = registry.add(BusType::Usb, i) {
                 // Start in Resetting - hardware reset happens in complete_init()
-                bus.state = BusState::Resetting;
-                bus.state_entered_at = uptime_ms();
+                // Initial state set via set_initial_state() since bus is brand new
+                bus.set_initial_state(BusState::Resetting);
                 let _ = bus.register_port(kernel_pid);
                 kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Resetting");
             }
@@ -289,8 +319,8 @@ pub fn init(kernel_pid: Pid) {
 
         // Platform pseudo-bus (no hardware reset needed, starts Safe)
         if let Some(bus) = registry.add(BusType::Platform, 0) {
-            bus.state = BusState::Safe;
-            bus.state_entered_at = uptime_ms();
+            // Initial state set via set_initial_state() since bus is brand new
+            bus.set_initial_state(BusState::Safe);
             let _ = bus.register_port(kernel_pid);
             kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Safe");
         }
@@ -304,7 +334,7 @@ pub fn continue_init() -> bool {
     with_bus_registry(|registry| {
         // Find first bus still in Resetting state
         for bus in registry.iter_mut() {
-            if bus.state == BusState::Resetting {
+            if bus.state() == BusState::Resetting {
                 // Do hardware reset for this bus
                 bus.perform_hardware_reset();
                 if !bus.hardware_verified {
@@ -325,7 +355,7 @@ pub fn continue_init() -> bool {
 /// Check if all buses have completed initialization
 pub fn init_complete() -> bool {
     with_bus_registry(|registry| {
-        registry.iter().all(|bus| bus.state != BusState::Resetting)
+        registry.iter().all(|bus| bus.state() != BusState::Resetting)
     })
 }
 
@@ -351,9 +381,8 @@ pub fn reset_all_buses() {
             // Perform hardware reset sequence
             bus.perform_hardware_reset();
 
-            // Transition to Safe state
-            bus.state = BusState::Safe;
-            bus.state_entered_at = uptime_ms();
+            // Transition to Safe state using proper transition method
+            bus.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
 
             kinfo!("bus", "reset_ok"; name = bus.port_name_str());
         }
@@ -512,19 +541,19 @@ pub fn test() {
     bus.init(BusType::PCIe, 0);
 
     // Initial state should be SAFE
-    assert!(bus.state == BusState::Safe);
+    assert!(bus.state() == BusState::Safe);
     assert!(bus.check_invariants());
 
     // Simulate connect
     bus.owner_channel = Some(100);
     bus.owner_pid = Some(1);
     bus.transition_to(BusState::Claimed, StateChangeReason::Connected);
-    assert!(bus.state == BusState::Claimed);
+    assert!(bus.state() == BusState::Claimed);
     assert!(bus.check_invariants());
 
     // Simulate disconnect
     bus.handle_disconnect(StateChangeReason::Disconnected);
-    assert!(bus.state == BusState::Safe);
+    assert!(bus.state() == BusState::Safe);
     assert!(bus.check_invariants());
 
     print_direct!("    [OK] Bus controller test passed\n");

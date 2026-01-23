@@ -15,7 +15,7 @@ pub mod sched;
 pub mod process;
 pub mod syscall;
 pub mod memory;  // User memory mapping types
-pub mod ipc;    // IPC system (channels, ports, waker)
+pub(crate) mod ipc;    // IPC system - internal, use object/ for public API
 pub mod event;
 pub mod shmem;
 pub mod dma_pool;

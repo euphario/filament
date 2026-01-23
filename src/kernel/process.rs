@@ -144,8 +144,8 @@ pub struct Process {
     pub pid: Pid,
     /// Parent process ID
     pub parent_pid: Pid,
-    /// Current state
-    pub state: ProcessState,
+    /// Current state - private, use state() and transition methods
+    state: ProcessState,
     /// Why the process is blocked (if state == Blocked)
     pub block_reason: BlockReason,
     /// Virtual address space
@@ -168,6 +168,9 @@ const KERNEL_STACK_SIZE: usize = 8 * 1024;
 const MAX_PROCESSES: usize = 64;
 
 impl Process {
+    /// Get current state
+    pub fn state(&self) -> ProcessState { self.state }
+
     /// Create a new process
     pub fn new(pid: Pid, parent_pid: Pid, name: &str) -> Option<Self> {
         // Allocate kernel stack
@@ -294,11 +297,22 @@ impl Process {
         self.state = ProcessState::Ready;
     }
 
+    /// Terminate the process (any -> Zombie)
+    pub fn terminate(&mut self, exit_code: i32) {
+        self.state = ProcessState::Zombie;
+        self.exit_code = exit_code;
+    }
+
+    /// Mark as running
+    pub fn make_running(&mut self) {
+        self.state = ProcessState::Running;
+    }
+
     /// Start running the process (switch to user mode)
     /// # Safety
     /// Must be called with interrupts properly configured
     pub unsafe fn run(&mut self) -> ! {
-        self.state = ProcessState::Running;
+        self.make_running();
 
         // Switch to process's address space
         if let Some(ref addr_space) = self.address_space {
@@ -395,8 +409,7 @@ impl ProcessTable {
     /// Terminate a process
     pub fn terminate(&mut self, pid: Pid, exit_code: i32) {
         if let Some(proc) = self.get_mut(pid) {
-            proc.state = ProcessState::Zombie;
-            proc.exit_code = exit_code;
+            proc.terminate(exit_code);
         }
     }
 

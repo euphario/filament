@@ -47,6 +47,40 @@ impl BusMasteringState {
     pub fn is_enabled(&self) -> bool {
         matches!(self, BusMasteringState::Enabled)
     }
+
+    /// Valid state transitions
+    pub fn can_transition_to(&self, new: BusMasteringState) -> bool {
+        match (*self, new) {
+            // Can always disable
+            (_, BusMasteringState::Disabled) => true,
+            // Can enable from Disabled
+            (BusMasteringState::Disabled, BusMasteringState::Enabled) => true,
+            // Can suspend from any state (for crash handling)
+            (_, BusMasteringState::Suspended) => true,
+            // Can resume from Suspended to Enabled
+            (BusMasteringState::Suspended, BusMasteringState::Enabled) => true,
+            _ => false,
+        }
+    }
+
+    /// Get human-readable state name
+    pub fn name(&self) -> &'static str {
+        match self {
+            BusMasteringState::Disabled => "disabled",
+            BusMasteringState::Enabled => "enabled",
+            BusMasteringState::Suspended => "suspended",
+        }
+    }
+}
+
+impl crate::kernel::ipc::traits::StateMachine for BusMasteringState {
+    fn can_transition_to(&self, new: &Self) -> bool {
+        BusMasteringState::can_transition_to(self, *new)
+    }
+
+    fn name(&self) -> &'static str {
+        BusMasteringState::name(self)
+    }
 }
 
 /// Per-device bus mastering state
@@ -54,15 +88,21 @@ impl BusMasteringState {
 pub struct DeviceBusMasterState {
     /// Device identifier (BDF for PCIe, slot for USB)
     pub device_id: u16,
-    /// Bus mastering state
-    pub state: BusMasteringState,
+    /// Bus mastering state - private, use state() and transition methods
+    state: BusMasteringState,
     /// IOMMU mapping count
     pub iommu_mappings: u16,
 }
 
 impl DeviceBusMasterState {
+    /// Get current state
+    pub fn state(&self) -> BusMasteringState { self.state }
+}
+
+impl DeviceBusMasterState {
     /// Reset device state completely (for cleanup)
     pub fn reset(&mut self) {
+        // Direct assignment acceptable here - reset() is the canonical way to return to initial state
         self.state = BusMasteringState::Disabled;
         self.iommu_mappings = 0;
     }
@@ -70,6 +110,27 @@ impl DeviceBusMasterState {
     /// Check if bus mastering is enabled
     pub fn is_enabled(&self) -> bool {
         self.state.is_enabled()
+    }
+
+    /// Enable bus mastering (Disabled -> Enabled)
+    /// Returns true if transition succeeded
+    pub fn enable(&mut self) -> bool {
+        if self.state.can_transition_to(BusMasteringState::Enabled) {
+            self.state = BusMasteringState::Enabled;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Disable bus mastering (any -> Disabled)
+    pub fn disable(&mut self) {
+        self.state = BusMasteringState::Disabled;
+    }
+
+    /// Suspend bus mastering (any -> Suspended)
+    pub fn suspend(&mut self) {
+        self.state = BusMasteringState::Suspended;
     }
 }
 
@@ -81,8 +142,8 @@ pub struct BusController {
     /// Bus index (e.g., pcie0, pcie1, usb0, usb1)
     pub bus_index: u8,
 
-    /// Current state
-    pub state: BusState,
+    /// Current state - private, use state() and transition methods
+    state: BusState,
 
     /// When we entered current state (for watchdog)
     pub state_entered_at: u64,
@@ -117,6 +178,9 @@ pub struct BusController {
 }
 
 impl BusController {
+    /// Get current state
+    pub fn state(&self) -> BusState { self.state }
+
     pub const fn new() -> Self {
         Self {
             bus_type: BusType::PCIe,
@@ -144,8 +208,8 @@ impl BusController {
     pub fn init(&mut self, bus_type: BusType, index: u8) {
         self.bus_type = bus_type;
         self.bus_index = index;
-        self.state = BusState::Safe;
-        self.state_entered_at = uptime_ms();
+        // Use set_initial_state for constructor-like initialization
+        self.set_initial_state(BusState::Safe);
 
         // Build port name: "/kernel/bus/pcie0" or "/kernel/bus/usb0"
         let prefix = BUS_PORT_PREFIX.as_bytes();
@@ -175,6 +239,14 @@ impl BusController {
     /// Get port name as string
     pub fn port_name_str(&self) -> &str {
         core::str::from_utf8(&self.port_name[..self.port_name_len]).unwrap_or("???")
+    }
+
+    /// Set initial state during construction (before bus is active)
+    /// This is the only place where direct state assignment is acceptable
+    /// because the bus is brand new and has no previous state.
+    pub fn set_initial_state(&mut self, state: BusState) {
+        self.state = state;
+        self.state_entered_at = uptime_ms();
     }
 
     /// Convert to BusInfo for syscall
@@ -702,7 +774,8 @@ impl BusController {
             return Err(e);
         }
 
-        self.devices[slot].state = BusMasteringState::Enabled;
+        // Use transition method
+        let _ = self.devices[slot].enable();
         self.bus_master_enabled = true;
 
         Ok(())
@@ -727,7 +800,8 @@ impl BusController {
                 // Continue anyway - we must disable in our tracking
             }
 
-            self.devices[slot].state = BusMasteringState::Disabled;
+            // Use transition method
+            self.devices[slot].disable();
         }
 
         // Update global flag

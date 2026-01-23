@@ -3,7 +3,7 @@
 //! Everything is an object. Everything uses: open, read, write, map, close.
 
 use crate::error::{SysError, SysResult};
-use crate::syscall::{Handle, ObjectType, open, read, write, close, channel_pair};
+use crate::syscall::{Handle, ObjectType, open, read, write, map, close, channel_pair};
 
 // Re-export handle type
 pub type ObjHandle = Handle;
@@ -406,5 +406,180 @@ impl EventLoop {
     /// Get underlying mux handle (for advanced use)
     pub fn mux_handle(&self) -> ObjHandle {
         self.mux.handle()
+    }
+}
+
+// ============================================================================
+// Shmem - Shared memory
+// ============================================================================
+
+/// Shared memory region
+pub struct Shmem {
+    handle: ObjHandle,
+    shmem_id: u32,
+    vaddr: u64,
+    size: usize,
+}
+
+impl Shmem {
+    /// Create a new shared memory region of the given size
+    pub fn create(size: usize) -> SysResult<Self> {
+        let handle = open(ObjectType::Shmem, &(size as u64).to_le_bytes())?;
+        // After open, handle has vaddr. Use map() to get the address
+        let vaddr = map(handle, 0)?;
+        Ok(Self {
+            handle,
+            shmem_id: handle.0, // Use handle as ID for now
+            vaddr,
+            size,
+        })
+    }
+
+    /// Open an existing shared memory region by ID
+    pub fn open_existing(shmem_id: u32) -> SysResult<Self> {
+        let handle = open(ObjectType::Shmem, &shmem_id.to_le_bytes())?;
+        let vaddr = map(handle, 0)?;
+        // Size is not known for existing regions, could query from kernel
+        Ok(Self {
+            handle,
+            shmem_id,
+            vaddr,
+            size: 0, // Unknown
+        })
+    }
+
+    pub fn handle(&self) -> ObjHandle { self.handle }
+    pub fn shmem_id(&self) -> u32 { self.shmem_id }
+    pub fn vaddr(&self) -> u64 { self.vaddr }
+    pub fn size(&self) -> usize { self.size }
+
+    /// Get a pointer to the shared memory
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.vaddr as *mut u8
+    }
+
+    /// Grant access to another process
+    pub fn allow(&self, peer_pid: u32) -> SysResult<()> {
+        let mut buf = [0u8; 5];
+        buf[0] = 0; // ALLOW command
+        buf[1..5].copy_from_slice(&peer_pid.to_le_bytes());
+        write(self.handle, &buf)?;
+        Ok(())
+    }
+
+    /// Wait for notification (blocking)
+    pub fn wait(&self, timeout_ms: u32) -> SysResult<()> {
+        read(self.handle, &mut timeout_ms.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Notify waiters
+    pub fn notify(&self) -> SysResult<u32> {
+        let mut buf = [0u8; 1];
+        buf[0] = 1; // NOTIFY command
+        let woken = write(self.handle, &buf)?;
+        Ok(woken as u32)
+    }
+}
+
+impl Drop for Shmem {
+    fn drop(&mut self) {
+        let _ = close(self.handle);
+    }
+}
+
+// ============================================================================
+// PciDevice - PCI configuration access
+// ============================================================================
+
+/// PCI device handle for configuration space access
+pub struct PciDevice {
+    handle: ObjHandle,
+    bdf: u32,
+}
+
+impl PciDevice {
+    /// Open a PCI device by BDF (bus/device/function)
+    pub fn open(bdf: u32) -> SysResult<Self> {
+        let handle = open(ObjectType::PciDevice, &bdf.to_le_bytes())?;
+        Ok(Self { handle, bdf })
+    }
+
+    pub fn handle(&self) -> ObjHandle { self.handle }
+    pub fn bdf(&self) -> u32 { self.bdf }
+
+    /// Read from PCI configuration space
+    pub fn config_read(&self, offset: u16, size: u8) -> SysResult<u32> {
+        let mut params = [0u8; 3];
+        params[0..2].copy_from_slice(&offset.to_le_bytes());
+        params[2] = size;
+        let value = read(self.handle, &mut params)?;
+        Ok(value as u32)
+    }
+
+    /// Write to PCI configuration space
+    pub fn config_write(&self, offset: u16, size: u8, value: u32) -> SysResult<()> {
+        let mut params = [0u8; 7];
+        params[0..2].copy_from_slice(&offset.to_le_bytes());
+        params[2] = size;
+        params[3..7].copy_from_slice(&value.to_le_bytes());
+        write(self.handle, &params)?;
+        Ok(())
+    }
+}
+
+impl Drop for PciDevice {
+    fn drop(&mut self) {
+        let _ = close(self.handle);
+    }
+}
+
+// ============================================================================
+// Msi - MSI vector allocation
+// ============================================================================
+
+/// MSI info returned from kernel
+pub struct MsiInfo {
+    pub first_irq: u32,
+    pub count: u8,
+    pub bdf: u32,
+}
+
+/// MSI vector allocation
+pub struct Msi {
+    handle: ObjHandle,
+    info: MsiInfo,
+}
+
+impl Msi {
+    /// Allocate MSI vectors for a device
+    pub fn allocate(bdf: u32, count: u8) -> SysResult<Self> {
+        let mut params = [0u8; 5];
+        params[0..4].copy_from_slice(&bdf.to_le_bytes());
+        params[4] = count;
+        let handle = open(ObjectType::Msi, &params)?;
+
+        // Read MSI info
+        let mut buf = [0u8; 9];
+        read(handle, &mut buf)?;
+        let first_irq = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let count = buf[4];
+        let bdf = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+
+        Ok(Self {
+            handle,
+            info: MsiInfo { first_irq, count, bdf },
+        })
+    }
+
+    pub fn handle(&self) -> ObjHandle { self.handle }
+    pub fn info(&self) -> &MsiInfo { &self.info }
+    pub fn first_irq(&self) -> u32 { self.info.first_irq }
+    pub fn count(&self) -> u8 { self.info.count }
+}
+
+impl Drop for Msi {
+    fn drop(&mut self) {
+        let _ = close(self.handle);
     }
 }

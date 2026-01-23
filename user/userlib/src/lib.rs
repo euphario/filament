@@ -13,7 +13,7 @@ pub use error::{SysError, SysResult};
 pub use syscall::{LogLevel, Handle, ObjHandle, ObjectType};
 pub use syscall::{exit, exec, klog};
 pub use syscall::{open, read, write, map, close, channel_pair};
-pub use ipc::{Channel, Port, Timer, Mux, MuxFilter, MuxEvent, Process, Message, ObjHandle as IpcHandle, EventLoop};
+pub use ipc::{Channel, Port, Timer, Mux, MuxFilter, MuxEvent, Process, Message, ObjHandle as IpcHandle, EventLoop, Shmem, PciDevice, Msi, MsiInfo};
 
 // Entry point - called by _start
 unsafe extern "Rust" {

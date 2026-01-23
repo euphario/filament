@@ -57,11 +57,11 @@ impl PciBdf {
 /// A discovered PCI device
 #[derive(Debug, Clone, Copy)]
 pub struct PciDevice {
-    /// Bus/Device/Function address
+    /// Bus/Device/Function address (immutable after creation)
     pub bdf: PciBdf,
-    /// Vendor ID
+    /// Vendor ID (immutable after creation)
     pub vendor_id: u16,
-    /// Device ID
+    /// Device ID (immutable after creation)
     pub device_id: u16,
     /// Class code (24-bit: class << 16 | subclass << 8 | prog_if)
     pub class_code: u32,
@@ -80,7 +80,8 @@ pub struct PciDevice {
     /// MSI-X capability offset (0 if not supported)
     pub msix_cap: u8,
     /// Owning process ID (0 = unclaimed)
-    pub owner_pid: u32,
+    /// Private to enforce access control - use owner() and set_owner()
+    owner_pid: u32,
 }
 
 impl PciDevice {
@@ -154,6 +155,21 @@ impl PciDevice {
     /// Check if device supports MSI-X
     pub const fn has_msix(&self) -> bool {
         self.msix_cap != 0
+    }
+
+    /// Get the owning process ID (0 = unclaimed)
+    pub const fn owner(&self) -> u32 {
+        self.owner_pid
+    }
+
+    /// Check if device is claimed by a process
+    pub const fn is_claimed(&self) -> bool {
+        self.owner_pid != 0
+    }
+
+    /// Set the owner (kernel-internal, use claim/release methods on registry)
+    pub(crate) fn set_owner(&mut self, pid: u32) {
+        self.owner_pid = pid;
     }
 }
 
@@ -260,20 +276,21 @@ impl PciDeviceRegistry {
     /// Claim a device for a process
     pub fn claim(&mut self, bdf: PciBdf, pid: u32) -> PciResult<()> {
         let dev = self.get_mut(bdf).ok_or(PciError::NotFound)?;
-        if dev.owner_pid != 0 && dev.owner_pid != pid {
+        let current_owner = dev.owner();
+        if current_owner != 0 && current_owner != pid {
             return Err(PciError::PermissionDenied);
         }
-        dev.owner_pid = pid;
+        dev.set_owner(pid);
         Ok(())
     }
 
     /// Release a device
     pub fn release(&mut self, bdf: PciBdf, pid: u32) -> PciResult<()> {
         let dev = self.get_mut(bdf).ok_or(PciError::NotFound)?;
-        if dev.owner_pid != pid {
+        if dev.owner() != pid {
             return Err(PciError::PermissionDenied);
         }
-        dev.owner_pid = 0;
+        dev.set_owner(0);
         Ok(())
     }
 
@@ -282,9 +299,9 @@ impl PciDeviceRegistry {
     pub fn release_all(&mut self, pid: u32) -> [Option<PciBdf>; MAX_PCI_DEVICES] {
         let mut released = [None; MAX_PCI_DEVICES];
         for i in 0..self.count {
-            if self.devices[i].owner_pid == pid {
+            if self.devices[i].owner() == pid {
                 released[i] = Some(self.devices[i].bdf);
-                self.devices[i].owner_pid = 0;
+                self.devices[i].set_owner(0);
             }
         }
         released

@@ -16,14 +16,13 @@
 
 // Submodules organized by functionality
 // All IPC goes through the unified 5-syscall interface (100-104)
+// Legacy shmem.rs and pci.rs removed - use unified interface
 mod memory;
 mod misc;
-mod pci;
 
 // Re-export hardware_reset for use from main.rs
 pub use misc::hardware_reset;
 mod process;
-mod shmem;
 
 use crate::{kwarn, kdebug};
 use crate::span;
@@ -59,25 +58,10 @@ pub enum SyscallNumber {
     SetLogLevel = 35,
     MmapDma = 36,
     Reset = 37,
-    // 38: legacy lseek (removed)
-
-    // Shared memory (39-47)
-    ShmemCreate = 39,
-    ShmemMap = 40,
-    ShmemAllow = 41,
-    ShmemWait = 42,
-    ShmemNotify = 43,
-    ShmemDestroy = 44,
-    // 45-46: legacy IPC (removed)
-    ShmemUnmap = 47,
-
-    // PCI/Bus (51-76)
-    PciConfigRead = 51,
-    PciConfigWrite = 52,
-    PciMsiAlloc = 54,
+    // 38-47: legacy shmem (removed) - use unified open/read/write/close
+    // 51-54: legacy PCI config (removed) - use unified open/read/write
     SignalAllow = 56,
-    // 57-58: legacy timer/heartbeat (removed)
-    BusList = 59,
+    // 57-59: legacy timer/heartbeat/bus_list (removed)
     MmapDevice = 60,
     DmaPoolCreate = 61,
     DmaPoolCreateHigh = 62,
@@ -87,9 +71,8 @@ pub enum SyscallNumber {
     GetCapabilities = 66,
     // 67: legacy ChannelGetPeer (removed)
     CpuStats = 68,
-    // 70-73: legacy kevent (removed)
+    // 70-75: legacy kevent/device_list (removed) - use unified open/read
     ExecWithCaps = 74,
-    DeviceList = 75,
     Klog = 76,
 
     // 80-96: legacy handle system (removed) - use 100-104
@@ -126,20 +109,10 @@ impl From<u64> for SyscallNumber {
             35 => SyscallNumber::SetLogLevel,
             36 => SyscallNumber::MmapDma,
             37 => SyscallNumber::Reset,
-            // Shared memory
-            39 => SyscallNumber::ShmemCreate,
-            40 => SyscallNumber::ShmemMap,
-            41 => SyscallNumber::ShmemAllow,
-            42 => SyscallNumber::ShmemWait,
-            43 => SyscallNumber::ShmemNotify,
-            44 => SyscallNumber::ShmemDestroy,
-            47 => SyscallNumber::ShmemUnmap,
-            // PCI/Bus
-            51 => SyscallNumber::PciConfigRead,
-            52 => SyscallNumber::PciConfigWrite,
-            54 => SyscallNumber::PciMsiAlloc,
+            // 39-47: legacy shmem -> Invalid (use unified interface)
+            // 51-54: legacy PCI -> Invalid (use unified interface)
             56 => SyscallNumber::SignalAllow,
-            59 => SyscallNumber::BusList,
+            // 59: legacy BusList -> Invalid (use unified interface)
             60 => SyscallNumber::MmapDevice,
             61 => SyscallNumber::DmaPoolCreate,
             62 => SyscallNumber::DmaPoolCreateHigh,
@@ -149,7 +122,7 @@ impl From<u64> for SyscallNumber {
             66 => SyscallNumber::GetCapabilities,
             68 => SyscallNumber::CpuStats,
             74 => SyscallNumber::ExecWithCaps,
-            75 => SyscallNumber::DeviceList,
+            // 75: legacy DeviceList -> Invalid (use unified interface)
             76 => SyscallNumber::Klog,
             // Unified interface (100-104)
             100 => SyscallNumber::Open,
@@ -238,7 +211,7 @@ fn current_pid() -> u32 {
 
 /// Check if current task has the required capability
 /// Returns Ok(()) if the capability is present, or an error code if not
-fn require_capability(cap: Capabilities) -> Result<(), i64> {
+pub(crate) fn require_capability(cap: Capabilities) -> Result<(), i64> {
     unsafe {
         let sched = super::task::scheduler();
         if let Some(task) = sched.current_task() {
@@ -320,21 +293,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::DmaPoolCreate => memory::sys_dma_pool_create(args.arg0 as usize, args.arg1, args.arg2),
         SyscallNumber::DmaPoolCreateHigh => memory::sys_dma_pool_create_high(args.arg0 as usize, args.arg1, args.arg2),
 
-        // Shared memory (shmem.rs)
-        SyscallNumber::ShmemCreate => shmem::sys_shmem_create(args.arg0 as usize, args.arg1, args.arg2),
-        SyscallNumber::ShmemMap => shmem::sys_shmem_map(args.arg0 as u32, args.arg1, args.arg2),
-        SyscallNumber::ShmemAllow => shmem::sys_shmem_allow(args.arg0 as u32, args.arg1 as u32),
-        SyscallNumber::ShmemWait => shmem::sys_shmem_wait(args.arg0 as u32, args.arg1 as u32),
-        SyscallNumber::ShmemNotify => shmem::sys_shmem_notify(args.arg0 as u32),
-        SyscallNumber::ShmemDestroy => shmem::sys_shmem_destroy(args.arg0 as u32),
-        SyscallNumber::ShmemUnmap => shmem::sys_shmem_unmap(args.arg0 as u32),
-
-        // PCI and bus (pci.rs)
-        SyscallNumber::PciConfigRead => pci::sys_pci_config_read(args.arg0 as u32, args.arg1 as u16, args.arg2 as u8),
-        SyscallNumber::PciConfigWrite => pci::sys_pci_config_write(args.arg0 as u32, args.arg1 as u16, args.arg2 as u8, args.arg3 as u32),
-        SyscallNumber::PciMsiAlloc => pci::sys_pci_msi_alloc(args.arg0 as u32, args.arg1 as u8),
-        SyscallNumber::BusList => pci::sys_bus_list(args.arg0, args.arg1),
-        SyscallNumber::DeviceList => pci::sys_device_list(args.arg0, args.arg1),
+        // Legacy shmem (39-47) and PCI (51-54, 59, 75) removed - use unified interface (100-104)
 
         // Unified interface (100-104) - THE 5 SYSCALLS
         SyscallNumber::Open => super::object::syscall::open(args.arg0 as u32, args.arg1, args.arg2 as usize),
@@ -379,20 +338,8 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::SetLogLevel => "set_log_level",
         SyscallNumber::MmapDma => "mmap_dma",
         SyscallNumber::Reset => "reset",
-        // Shared memory
-        SyscallNumber::ShmemCreate => "shmem_create",
-        SyscallNumber::ShmemMap => "shmem_map",
-        SyscallNumber::ShmemAllow => "shmem_allow",
-        SyscallNumber::ShmemWait => "shmem_wait",
-        SyscallNumber::ShmemNotify => "shmem_notify",
-        SyscallNumber::ShmemDestroy => "shmem_destroy",
-        SyscallNumber::ShmemUnmap => "shmem_unmap",
-        // PCI/Bus
-        SyscallNumber::PciConfigRead => "pci_config_read",
-        SyscallNumber::PciConfigWrite => "pci_config_write",
-        SyscallNumber::PciMsiAlloc => "pci_msi_alloc",
+        // Misc
         SyscallNumber::SignalAllow => "signal_allow",
-        SyscallNumber::BusList => "bus_list",
         SyscallNumber::MmapDevice => "mmap_device",
         SyscallNumber::DmaPoolCreate => "dma_pool_create",
         SyscallNumber::DmaPoolCreateHigh => "dma_pool_create_high",
@@ -402,7 +349,6 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::CpuStats => "cpu_stats",
         SyscallNumber::ExecWithCaps => "exec_with_caps",
-        SyscallNumber::DeviceList => "device_list",
         SyscallNumber::Klog => "klog",
         // Unified interface (100-104)
         SyscallNumber::Open => "open",

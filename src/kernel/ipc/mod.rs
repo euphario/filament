@@ -383,6 +383,22 @@ pub fn port_has_pending(port_id: u32) -> bool {
     })
 }
 
+/// Check if a port exists and is listening
+pub fn port_is_listening(port_id: u32) -> bool {
+    with_port_registry(|reg| {
+        if let Some(port) = reg.get(port_id) {
+            port.state().is_listening()
+        } else {
+            false
+        }
+    })
+}
+
+/// Check if a port exists
+pub fn port_exists(port_id: u32) -> bool {
+    with_port_registry(|reg| reg.get(port_id).is_some())
+}
+
 /// Register a waker for a channel (handle system compatibility)
 pub fn channel_register_waker(channel_id: ChannelId, task_id: u32) {
     let _ = with_channel_table(|table| table.register_waker(channel_id, task_id));

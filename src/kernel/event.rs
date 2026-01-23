@@ -274,6 +274,45 @@ pub enum SubscriptionState {
     Active,
 }
 
+impl SubscriptionState {
+    /// Valid state transitions
+    pub fn can_transition_to(&self, new: SubscriptionState) -> bool {
+        match (*self, new) {
+            (SubscriptionState::Empty, SubscriptionState::Active) => true,
+            (SubscriptionState::Active, SubscriptionState::Empty) => true,
+            _ => false,
+        }
+    }
+
+    /// Check if this is an empty slot
+    pub fn is_empty(&self) -> bool {
+        matches!(self, SubscriptionState::Empty)
+    }
+
+    /// Check if this is an active subscription
+    pub fn is_active(&self) -> bool {
+        matches!(self, SubscriptionState::Active)
+    }
+
+    /// Get human-readable state name
+    pub fn name(&self) -> &'static str {
+        match self {
+            SubscriptionState::Empty => "empty",
+            SubscriptionState::Active => "active",
+        }
+    }
+}
+
+impl super::ipc::traits::StateMachine for SubscriptionState {
+    fn can_transition_to(&self, new: &Self) -> bool {
+        SubscriptionState::can_transition_to(self, *new)
+    }
+
+    fn name(&self) -> &'static str {
+        SubscriptionState::name(self)
+    }
+}
+
 impl Default for SubscriptionState {
     fn default() -> Self {
         SubscriptionState::Empty
@@ -287,8 +326,15 @@ pub struct EventSubscription {
     pub event_type: EventType,
     /// Filter data (e.g., specific channel ID, IRQ number)
     pub filter: u64,
-    /// Subscription state
-    pub state: SubscriptionState,
+    /// Subscription state - private, use state() and transition methods
+    state: SubscriptionState,
+}
+
+impl EventSubscription {
+    /// Get current state
+    pub fn state(&self) -> SubscriptionState {
+        self.state
+    }
 }
 
 impl EventSubscription {
@@ -303,7 +349,31 @@ impl EventSubscription {
     /// Check if this subscription is active
     #[inline]
     pub fn is_active(&self) -> bool {
-        matches!(self.state, SubscriptionState::Active)
+        self.state.is_active()
+    }
+
+    /// Activate this subscription (Empty -> Active)
+    /// Returns true if transition succeeded
+    pub fn activate(&mut self, event_type: EventType, filter: u64) -> bool {
+        if self.state.can_transition_to(SubscriptionState::Active) {
+            self.event_type = event_type;
+            self.filter = filter;
+            self.state = SubscriptionState::Active;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Deactivate this subscription (Active -> Empty)
+    /// Returns true if transition succeeded
+    pub fn deactivate(&mut self) -> bool {
+        if self.state.can_transition_to(SubscriptionState::Empty) {
+            self.state = SubscriptionState::Empty;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -363,13 +433,12 @@ impl EventQueue {
             return Err(-28); // ENOSPC - too many subscriptions of this type
         }
 
-        // Find a free slot
+        // Find a free slot and activate using transition method
         for sub in self.subscriptions.iter_mut() {
-            if sub.state == SubscriptionState::Empty {
-                sub.event_type = event_type;
-                sub.filter = filter;
-                sub.state = SubscriptionState::Active;
-                return Ok(());
+            if sub.state.is_empty() {
+                if sub.activate(event_type, filter) {
+                    return Ok(());
+                }
             }
         }
         Err(-12) // ENOMEM - no free subscription slots
@@ -384,8 +453,8 @@ impl EventQueue {
     pub fn unsubscribe(&mut self, event_type: EventType, filter: u64) -> bool {
         for sub in self.subscriptions.iter_mut() {
             if sub.is_active() && sub.event_type == event_type && sub.filter == filter {
-                sub.state = SubscriptionState::Empty;
-                return true;
+                // Use transition method to deactivate
+                return sub.deactivate();
             }
         }
         false

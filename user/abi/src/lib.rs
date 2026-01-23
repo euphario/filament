@@ -105,8 +105,14 @@ pub enum ObjectType {
     Klog = 10,
     /// Event multiplexer
     Mux = 11,
-    /// PCIe bus access
+    /// PCIe bus access (device enumeration)
     PciBus = 12,
+    /// PCI device handle (for config read/write)
+    PciDevice = 13,
+    /// MSI vector allocation
+    Msi = 14,
+    /// Bus enumeration
+    BusList = 15,
 }
 
 impl ObjectType {
@@ -125,6 +131,9 @@ impl ObjectType {
             10 => Some(ObjectType::Klog),
             11 => Some(ObjectType::Mux),
             12 => Some(ObjectType::PciBus),
+            13 => Some(ObjectType::PciDevice),
+            14 => Some(ObjectType::Msi),
+            15 => Some(ObjectType::BusList),
             _ => None,
         }
     }
@@ -141,7 +150,7 @@ impl ObjectType {
 
     /// Does this type support write()?
     pub fn is_writable(&self) -> bool {
-        !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process)
+        !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process | ObjectType::BusList | ObjectType::Msi)
     }
 }
 

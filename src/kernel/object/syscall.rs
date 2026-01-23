@@ -60,6 +60,9 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         ObjectType::Klog => open_klog(params_ptr, params_len),
         ObjectType::Mux => open_mux(params_ptr, params_len),
         ObjectType::PciBus => open_pci_bus(params_ptr, params_len),
+        ObjectType::PciDevice => open_pci_device(params_ptr, params_len),
+        ObjectType::Msi => open_msi(params_ptr, params_len),
+        ObjectType::BusList => open_bus_list(params_ptr, params_len),
     }
 }
 
@@ -119,10 +122,14 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::Timer(t) => read_timer(t, buf_ptr, buf_len, task_id),
             Object::Process(p) => read_process(p, buf_ptr, buf_len, task_id),
             Object::Port(p) => read_port(p, buf_ptr, buf_len, task_id),
-            Object::Shmem(s) => read_shmem(s, buf_ptr, buf_len),
+            Object::Shmem(s) => read_shmem(s, buf_ptr, buf_len, task_id),
             Object::Console(c) => read_console(c, buf_ptr, buf_len, task_id),
             Object::Klog(k) => read_klog(k, buf_ptr, buf_len),
             Object::Mux(_) => unreachable!(), // Handled above
+            Object::PciBus(p) => read_pci_bus(p, buf_ptr, buf_len),
+            Object::PciDevice(d) => read_pci_device(d, buf_ptr, buf_len, task_id),
+            Object::Msi(m) => read_msi(m, buf_ptr, buf_len),
+            Object::BusList(b) => read_bus_list(b, buf_ptr, buf_len),
             _ => Error::NotSupported.to_errno(),
         }
     }
@@ -158,13 +165,16 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             return Error::NotSupported.to_errno();
         }
 
+        let task_id = task.id;
+
         // Dispatch to type-specific write
         match &mut entry.object {
             Object::Channel(ch) => write_channel(ch, buf_ptr, buf_len),
             Object::Timer(t) => write_timer(t, buf_ptr, buf_len),
-            Object::Shmem(s) => write_shmem(s, buf_ptr, buf_len),
+            Object::Shmem(s) => write_shmem(s, buf_ptr, buf_len, task_id),
             Object::Console(c) => write_console(c, buf_ptr, buf_len),
             Object::Mux(m) => write_mux(m, buf_ptr, buf_len),
+            Object::PciDevice(d) => write_pci_device(d, buf_ptr, buf_len, task_id),
             _ => Error::NotSupported.to_errno(),
         }
     }
@@ -473,11 +483,17 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
 }
 
 fn open_shmem(params_ptr: u64, params_len: usize) -> i64 {
-    // Params: u64 size (8 bytes)
-    if params_len != 8 {
-        return Error::InvalidArg.to_errno();
+    // Params format depends on length:
+    // - 8 bytes: Create new (size:u64)
+    // - 4 bytes: Open existing (shmem_id:u32)
+    match params_len {
+        8 => open_shmem_create(params_ptr),
+        4 => open_shmem_existing(params_ptr),
+        _ => Error::InvalidArg.to_errno(),
     }
+}
 
+fn open_shmem_create(params_ptr: u64) -> i64 {
     // Copy size from user
     let mut size_bytes = [0u8; 8];
     if uaccess::copy_from_user(&mut size_bytes, params_ptr).is_err() {
@@ -516,6 +532,48 @@ fn open_shmem(params_ptr: u64, params_len: usize) -> i64 {
                 }
             }
             Err(e) => e, // shmem::create returns errno directly
+        }
+    }
+}
+
+fn open_shmem_existing(params_ptr: u64) -> i64 {
+    // Copy shmem_id from user
+    let mut id_bytes = [0u8; 4];
+    if uaccess::copy_from_user(&mut id_bytes, params_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+    let shmem_id = u32::from_le_bytes(id_bytes);
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(task) = sched.task_mut(slot) else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let pid = task.id;
+
+        // Map existing shmem region
+        match shmem::map(pid, shmem_id) {
+            Ok((vaddr, paddr)) => {
+                // Get size from shmem module
+                let size = shmem::get_size(shmem_id).unwrap_or(0);
+
+                // Create ShmemObject
+                let obj = Object::Shmem(super::ShmemObject::new(shmem_id, paddr, size, vaddr));
+
+                // Allocate handle
+                match task.object_table.alloc(ObjectType::Shmem, obj) {
+                    Some(handle) => handle.raw() as i64,
+                    None => {
+                        // Cleanup: unmap
+                        let _ = shmem::unmap(pid, shmem_id);
+                        Error::NoSpace.to_errno()
+                    }
+                }
+            }
+            Err(e) => e,
         }
     }
 }
@@ -750,17 +808,141 @@ fn open_pci_bus(params_ptr: u64, params_len: usize) -> i64 {
     }
 }
 
-// Read implementations
-fn read_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    use super::ChannelState;
+fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
+    use crate::kernel::caps::Capabilities;
+    use crate::kernel::pci::{self, PciBdf};
 
-    // Check state first
-    match ch.state {
-        ChannelState::Closed => return Error::PeerClosed.to_errno(),
-        ChannelState::HalfClosed | ChannelState::Open => {}
+    // Params: u32 bdf (4 bytes)
+    if params_len != 4 {
+        return Error::InvalidArg.to_errno();
     }
 
-    let channel_id = ch.channel_id;
+    // Require RAW_DEVICE capability
+    if let Err(e) = super::super::syscall::require_capability(Capabilities::RAW_DEVICE) {
+        return e;
+    }
+
+    let mut bdf_bytes = [0u8; 4];
+    if uaccess::copy_from_user(&mut bdf_bytes, params_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+    let bdf = u32::from_le_bytes(bdf_bytes);
+
+    // Check device exists
+    let bdf_typed = PciBdf::from_u32(bdf);
+    if pci::find_by_bdf(bdf_typed).is_none() {
+        return Error::NotFound.to_errno();
+    }
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(task) = sched.task_mut(slot) else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let obj = Object::PciDevice(super::PciDeviceObject::new(bdf));
+
+        match task.object_table.alloc(ObjectType::PciDevice, obj) {
+            Some(handle) => handle.raw() as i64,
+            None => Error::NoSpace.to_errno(),
+        }
+    }
+}
+
+fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
+    use crate::kernel::caps::Capabilities;
+    use crate::kernel::pci::{self, PciBdf};
+
+    // Params: u32 bdf (4 bytes) + u8 count (1 byte) = 5 bytes
+    if params_len != 5 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    // Require IRQ_CLAIM capability
+    if let Err(e) = super::super::syscall::require_capability(Capabilities::IRQ_CLAIM) {
+        return e;
+    }
+
+    let mut params = [0u8; 5];
+    if uaccess::copy_from_user(&mut params, params_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+    let bdf = u32::from_le_bytes([params[0], params[1], params[2], params[3]]);
+    let count = params[4];
+
+    let bdf_typed = PciBdf::from_u32(bdf);
+
+    // Check device exists and caller owns it
+    let dev = match pci::find_by_bdf(bdf_typed) {
+        Some(d) => d,
+        None => return Error::NotFound.to_errno(),
+    };
+
+    let pid = unsafe {
+        task::scheduler().current_task().map(|t| t.id).unwrap_or(0)
+    };
+
+    if dev.owner() != pid {
+        return Error::PermDenied.to_errno();
+    }
+
+    // Check device supports MSI
+    if !dev.has_msi() && !dev.has_msix() {
+        return Error::NotSupported.to_errno();
+    }
+
+    // Allocate vectors
+    let first_irq = match pci::msi_alloc(bdf_typed, count) {
+        Ok(irq) => irq,
+        Err(pci::PciError::NoMsiVectors) => return Error::NoSpace.to_errno(),
+        Err(_) => return Error::Io.to_errno(),
+    };
+
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(task) = sched.task_mut(slot) else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let obj = Object::Msi(super::MsiObject::new(bdf, first_irq, count));
+
+        match task.object_table.alloc(ObjectType::Msi, obj) {
+            Some(handle) => handle.raw() as i64,
+            None => Error::NoSpace.to_errno(),
+        }
+    }
+}
+
+fn open_bus_list(_params_ptr: u64, _params_len: usize) -> i64 {
+    unsafe {
+        let sched = task::scheduler();
+        let slot = task::current_slot();
+
+        let Some(task) = sched.task_mut(slot) else {
+            return Error::BadHandle.to_errno();
+        };
+
+        let obj = Object::BusList(super::BusListObject::new());
+
+        match task.object_table.alloc(ObjectType::BusList, obj) {
+            Some(handle) => handle.raw() as i64,
+            None => Error::NoSpace.to_errno(),
+        }
+    }
+}
+
+// Read implementations
+fn read_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    // Check state first (queries ipc backend)
+    if ch.is_closed() && !ipc::channel_has_messages(ch.channel_id()) {
+        return Error::PeerClosed.to_errno();
+    }
+
+    let channel_id = ch.channel_id();
     if channel_id == 0 {
         return Error::PeerClosed.to_errno();
     }
@@ -788,10 +970,7 @@ fn read_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> 
         }
         Err(ipc::IpcError::WouldBlock) => Error::WouldBlock.to_errno(),
         Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
-            // Transition to HalfClosed if peer closed
-            if ch.state == ChannelState::Open {
-                ch.state = ChannelState::HalfClosed;
-            }
+            // Backend already knows about peer close
             Error::PeerClosed.to_errno()
         }
         Err(_) => Error::BadHandle.to_errno(),
@@ -804,15 +983,15 @@ fn read_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize, task_id:
 
     let current_tick = timer::ticks();
 
-    match t.state {
+    match t.state() {
         TimerState::Disarmed => {
             // Timer not armed - return error
             Error::InvalidArg.to_errno()
         }
         TimerState::Armed => {
-            if current_tick >= t.deadline {
-                // Timer has fired
-                t.state = TimerState::Fired;
+            if current_tick >= t.deadline() {
+                // Timer has fired - use transition method
+                let _ = t.fire();
 
                 // Write timestamp to buffer if provided
                 if buf_ptr != 0 && buf_len >= 8 {
@@ -822,31 +1001,32 @@ fn read_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize, task_id:
                     }
                 }
 
-                // Handle recurring timer
-                if t.interval > 0 {
-                    t.deadline = current_tick + t.interval;
-                    t.state = TimerState::Armed;
+                // Handle recurring timer - re-arm with new deadline
+                if t.interval() > 0 {
+                    let new_deadline = current_tick + t.interval();
+                    t.arm(new_deadline, t.interval());
                 }
 
                 8 // Return bytes written
             } else {
                 // Not yet fired - register waker and return WouldBlock
-                t.subscriber = Some(ipc::traits::Subscriber {
+                t.set_subscriber(Some(ipc::traits::Subscriber {
                     task_id,
                     generation: task::Scheduler::generation_from_pid(task_id),
-                });
+                }));
                 Error::WouldBlock.to_errno()
             }
         }
         TimerState::Fired => {
             // Already fired - return timestamp
             if buf_ptr != 0 && buf_len >= 8 {
-                let ts_bytes = t.deadline.to_le_bytes();
+                let ts_bytes = t.deadline().to_le_bytes();
                 if uaccess::copy_to_user(buf_ptr, &ts_bytes).is_err() {
                     return Error::BadAddress.to_errno();
                 }
             }
-            t.state = TimerState::Disarmed;
+            // Consume the fired state
+            t.disarm();
             8
         }
     }
@@ -903,10 +1083,8 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
 }
 
 fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
-    use super::PortState;
-
     // Check state first
-    if p.state != PortState::Listening {
+    if !p.is_listening() {
         return Error::PeerClosed.to_errno();
     }
 
@@ -964,9 +1142,33 @@ fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u
     }
 }
 
-fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    let _ = (s, buf_ptr, buf_len);
-    Error::NotSupported.to_errno()
+fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    // Read = WAIT operation
+    // Params: optional timeout_ms (u32) in buffer, default 0 = infinite
+    let timeout_ms = if buf_len >= 4 {
+        let mut timeout_bytes = [0u8; 4];
+        if uaccess::copy_from_user(&mut timeout_bytes, buf_ptr).is_err() {
+            return Error::BadAddress.to_errno();
+        }
+        u32::from_le_bytes(timeout_bytes)
+    } else {
+        0 // Infinite wait
+    };
+
+    match shmem::wait(task_id, s.shmem_id(), timeout_ms) {
+        Ok(()) => 0,
+        Err(-11) => {
+            // EAGAIN = blocked, pre-store success return value
+            unsafe {
+                let sched = task::scheduler();
+                if let Some(task) = sched.current_task_mut() {
+                    task.trap_frame.x0 = 0;
+                }
+            }
+            Error::WouldBlock.to_errno()
+        }
+        Err(e) => e,
+    }
 }
 
 fn read_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
@@ -1024,6 +1226,173 @@ fn read_mux(_m: &mut super::MuxObject, _buf_ptr: u64, _buf_len: usize, _task_id:
     Error::NotSupported.to_errno()
 }
 
+fn read_pci_bus(p: &mut super::PciBusObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    use crate::kernel::bus::{DeviceInfo, get_device_list, get_device_count};
+
+    if buf_ptr == 0 {
+        // Just return count
+        return get_device_count() as i64;
+    }
+
+    let max = buf_len / core::mem::size_of::<DeviceInfo>();
+    if max == 0 {
+        return 0;
+    }
+
+    // Create temporary buffer (max 16 devices)
+    let mut temp = [DeviceInfo::empty(); 16];
+    let count = get_device_list(&mut temp[..max.min(16)]);
+
+    // Filter by BDF if needed
+    let bdf_filter = p.bdf_filter();
+    let filtered_count = if bdf_filter == 0 {
+        count
+    } else {
+        // Filter devices by BDF prefix
+        let mut j = 0;
+        for i in 0..count {
+            // TODO: implement BDF filtering
+            temp[j] = temp[i];
+            j += 1;
+        }
+        j
+    };
+
+    // Copy to userspace
+    let copy_size = filtered_count * core::mem::size_of::<DeviceInfo>();
+    let src_bytes = unsafe {
+        core::slice::from_raw_parts(temp.as_ptr() as *const u8, copy_size)
+    };
+    if uaccess::copy_to_user(buf_ptr, src_bytes).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    filtered_count as i64
+}
+
+fn read_pci_device(d: &mut super::PciDeviceObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    use crate::kernel::pci::{self, PciBdf};
+
+    // Params: offset:u16 (2 bytes) + size:u8 (1 byte) = 3 bytes
+    if buf_len < 3 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let mut params = [0u8; 3];
+    if uaccess::copy_from_user(&mut params, buf_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+    let offset = u16::from_le_bytes([params[0], params[1]]);
+    let size = params[2];
+
+    // Validate offset and size
+    const PCI_CONFIG_MAX: u16 = 4096;
+    if offset >= PCI_CONFIG_MAX || (size != 1 && size != 2 && size != 4) {
+        return Error::InvalidArg.to_errno();
+    }
+    if (offset as u32) + (size as u32) > PCI_CONFIG_MAX as u32 {
+        return Error::InvalidArg.to_errno();
+    }
+    // Check alignment
+    if (size == 2 && (offset & 1) != 0) || (size == 4 && (offset & 3) != 0) {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let bdf = PciBdf::from_u32(d.bdf());
+
+    // Check device exists and caller has access
+    let dev = match pci::find_by_bdf(bdf) {
+        Some(d) => d,
+        None => return Error::NotFound.to_errno(),
+    };
+
+    // Check ownership (0 = unclaimed, anyone can read)
+    let owner = dev.owner();
+    if owner != 0 && owner != task_id {
+        return Error::PermDenied.to_errno();
+    }
+
+    match pci::config_read32(bdf, offset & !0x3) {
+        Ok(val32) => {
+            // Extract the requested portion
+            match size {
+                1 => {
+                    let shift = (offset & 3) * 8;
+                    ((val32 >> shift) & 0xFF) as i64
+                }
+                2 => {
+                    let shift = (offset & 2) * 8;
+                    ((val32 >> shift) & 0xFFFF) as i64
+                }
+                4 => val32 as i64,
+                _ => Error::InvalidArg.to_errno(),
+            }
+        }
+        Err(_) => Error::Io.to_errno(),
+    }
+}
+
+fn read_msi(m: &mut super::MsiObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    // Return MSI info: first_irq:u32 + count:u8 + bdf:u32 = 9 bytes
+    if buf_len < 9 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let mut out = [0u8; 9];
+    out[0..4].copy_from_slice(&m.first_irq().to_le_bytes());
+    out[4] = m.count();
+    out[5..9].copy_from_slice(&m.bdf().to_le_bytes());
+
+    if uaccess::copy_to_user(buf_ptr, &out).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    9
+}
+
+fn read_bus_list(b: &mut super::BusListObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    use crate::kernel::bus::{BusInfo, get_bus_list, get_bus_count};
+
+    if buf_ptr == 0 {
+        // Just return count
+        return get_bus_count() as i64;
+    }
+
+    let max = buf_len / core::mem::size_of::<BusInfo>();
+    if max == 0 {
+        return 0;
+    }
+
+    // Create temporary buffer (max 16 buses)
+    let mut temp = [BusInfo::empty(); 16];
+    let count = get_bus_list(&mut temp[..max.min(16)]);
+
+    // Skip already-read entries
+    let cursor = b.cursor() as usize;
+    if cursor >= count {
+        return 0; // No more entries
+    }
+
+    let remaining = count - cursor;
+    let to_copy = remaining.min(max.min(16 - cursor));
+
+    // Copy to userspace
+    let copy_size = to_copy * core::mem::size_of::<BusInfo>();
+    let src_bytes = unsafe {
+        core::slice::from_raw_parts(temp[cursor..].as_ptr() as *const u8, copy_size)
+    };
+    if uaccess::copy_to_user(buf_ptr, src_bytes).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    // Advance cursor
+    for _ in 0..to_copy {
+        b.advance();
+    }
+
+    to_copy as i64
+}
+
 /// Mux read - blocks until events are ready
 ///
 /// State machine:
@@ -1060,7 +1429,7 @@ fn read_mux_impl(task: &mut crate::kernel::task::Task, mux_handle: Handle, buf_p
             if let Some(watch) = mux.watches[i] {
                 let watched_handle = Handle::from_raw(watch.handle);
                 let channel_id = if let Some(entry) = task.object_table.get(watched_handle) {
-                    if let Object::Channel(ch) = &entry.object { ch.channel_id } else { 0 }
+                    if let Object::Channel(ch) = &entry.object { ch.channel_id() } else { 0 }
                 } else { 0 };
                 w[i] = (Some(watch), channel_id);
             }
@@ -1212,14 +1581,12 @@ fn read_mux_impl(task: &mut crate::kernel::task::Task, mux_handle: Handle, buf_p
 
 // Write implementations
 fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    use super::ChannelState;
-
-    // Check state - can only write to Open channel
-    if ch.state != ChannelState::Open {
+    // Check state - can only write to Open channel (queries ipc backend)
+    if !ch.is_open() {
         return Error::PeerClosed.to_errno();
     }
 
-    let channel_id = ch.channel_id;
+    let channel_id = ch.channel_id();
     if channel_id == 0 {
         return Error::PeerClosed.to_errno();
     }
@@ -1255,7 +1622,7 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
         }
         Err(ipc::IpcError::QueueFull) => Error::WouldBlock.to_errno(),
         Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
-            ch.state = ChannelState::HalfClosed;
+            // Backend already knows about peer close
             Error::PeerClosed.to_errno()
         }
         Err(_) => Error::BadHandle.to_errno(),
@@ -1263,7 +1630,6 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
 }
 
 fn write_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    use super::TimerState;
     use crate::platform::mt7988::timer;
 
     // Format: [deadline_ns: u64] or [deadline_ns: u64, interval_ns: u64]
@@ -1280,10 +1646,8 @@ fn write_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize) -> i64 
     let deadline_ns = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
 
     if deadline_ns == 0 {
-        // Disarm timer
-        t.state = TimerState::Disarmed;
-        t.deadline = 0;
-        t.interval = 0;
+        // Disarm timer using transition method
+        t.disarm();
         return 0;
     }
 
@@ -1293,27 +1657,65 @@ fn write_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize) -> i64 
     let deadline_ticks = deadline_ns * ticks_per_ns / 1000;
 
     let current_tick = timer::ticks();
-    t.deadline = current_tick + deadline_ticks;
-    t.state = TimerState::Armed;
+    let deadline = current_tick + deadline_ticks;
 
     // Check for interval (recurring timer)
-    if buf_len >= 16 {
+    let interval = if buf_len >= 16 {
         let interval_ns = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
         if interval_ns > 0 {
-            t.interval = interval_ns * ticks_per_ns / 1000;
+            interval_ns * ticks_per_ns / 1000
         } else {
-            t.interval = 0;
+            0
         }
     } else {
-        t.interval = 0;
-    }
+        0
+    };
+
+    // Arm timer using transition method
+    t.arm(deadline, interval);
 
     0
 }
 
-fn write_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    let _ = (s, buf_ptr, buf_len);
-    Error::NotSupported.to_errno()
+fn write_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    // Write commands:
+    // - cmd=0 + peer_pid:u32 = ALLOW (grant access to peer)
+    // - cmd=1 = NOTIFY (wake waiters)
+    if buf_len < 1 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let mut cmd_byte = [0u8; 1];
+    if uaccess::copy_from_user(&mut cmd_byte, buf_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    match cmd_byte[0] {
+        0 => {
+            // ALLOW: need peer_pid
+            if buf_len < 5 {
+                return Error::InvalidArg.to_errno();
+            }
+            let mut pid_bytes = [0u8; 4];
+            if uaccess::copy_from_user(&mut pid_bytes, buf_ptr + 1).is_err() {
+                return Error::BadAddress.to_errno();
+            }
+            let peer_pid = u32::from_le_bytes(pid_bytes);
+
+            match shmem::allow(task_id, s.shmem_id(), peer_pid) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        1 => {
+            // NOTIFY: wake waiters
+            match shmem::notify(task_id, s.shmem_id()) {
+                Ok(woken) => woken as i64,
+                Err(e) => e,
+            }
+        }
+        _ => Error::InvalidArg.to_errno(),
+    }
 }
 
 fn write_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize) -> i64 {
@@ -1385,10 +1787,90 @@ fn write_mux(m: &mut super::MuxObject, buf_ptr: u64, buf_len: usize) -> i64 {
     }
 }
 
+fn write_pci_device(d: &mut super::PciDeviceObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    use crate::kernel::pci::{self, PciBdf};
+
+    // Params: offset:u16 (2) + size:u8 (1) + value:u32 (4) = 7 bytes
+    if buf_len < 7 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let mut params = [0u8; 7];
+    if uaccess::copy_from_user(&mut params, buf_ptr).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+    let offset = u16::from_le_bytes([params[0], params[1]]);
+    let size = params[2];
+    let value = u32::from_le_bytes([params[3], params[4], params[5], params[6]]);
+
+    // Validate offset and size
+    const PCI_CONFIG_MAX: u16 = 4096;
+    if offset >= PCI_CONFIG_MAX || (size != 1 && size != 2 && size != 4) {
+        return Error::InvalidArg.to_errno();
+    }
+    if (offset as u32) + (size as u32) > PCI_CONFIG_MAX as u32 {
+        return Error::InvalidArg.to_errno();
+    }
+    // Check alignment
+    if (size == 2 && (offset & 1) != 0) || (size == 4 && (offset & 3) != 0) {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let bdf = PciBdf::from_u32(d.bdf());
+
+    // Check device exists and caller owns it
+    let dev = match pci::find_by_bdf(bdf) {
+        Some(d) => d,
+        None => return Error::NotFound.to_errno(),
+    };
+
+    if dev.owner() != task_id {
+        return Error::PermDenied.to_errno();
+    }
+
+    // For partial writes, do read-modify-write
+    let aligned_offset = offset & !0x3;
+
+    let result = if size == 4 {
+        pci::config_write32(bdf, aligned_offset, value)
+    } else {
+        // Read current value
+        let current = match pci::config_read32(bdf, aligned_offset) {
+            Ok(v) => v,
+            Err(_) => return Error::Io.to_errno(),
+        };
+
+        let (mask, shift) = match size {
+            1 => (0xFFu32, ((offset & 3) * 8) as u32),
+            2 => (0xFFFFu32, ((offset & 2) * 8) as u32),
+            _ => return Error::InvalidArg.to_errno(),
+        };
+
+        let new_val = (current & !(mask << shift)) | ((value & mask) << shift);
+        pci::config_write32(bdf, aligned_offset, new_val)
+    };
+
+    match result {
+        Ok(()) => 0,
+        Err(_) => Error::Io.to_errno(),
+    }
+}
+
 // Map implementations
 fn map_shmem(s: &mut super::ShmemObject, task_id: u32) -> i64 {
-    let _ = (s, task_id);
-    Error::NotSupported.to_errno()
+    // If already mapped, return the existing vaddr
+    if s.vaddr() != 0 {
+        return s.vaddr() as i64;
+    }
+
+    // Map the region (shouldn't normally happen since open() already maps)
+    match shmem::map(task_id, s.shmem_id()) {
+        Ok((vaddr, _paddr)) => {
+            s.set_vaddr(vaddr);
+            vaddr as i64
+        }
+        Err(e) => e,
+    }
 }
 
 fn map_dma_pool(d: &mut super::DmaPoolObject, task_id: u32) -> i64 {
@@ -1403,9 +1885,9 @@ fn map_mmio(m: &mut super::MmioObject, task_id: u32) -> i64 {
 
 // Close implementations
 fn close_channel(ch: super::ChannelObject, owner: u32) {
-    // Only close if not already closed
-    if ch.state != super::ChannelState::Closed && ch.channel_id != 0 {
-        if let Ok(wake_list) = ipc::close_channel(ch.channel_id, owner) {
+    // Only close if not already closed (queries ipc backend)
+    if !ch.is_closed() && ch.channel_id() != 0 {
+        if let Ok(wake_list) = ipc::close_channel(ch.channel_id(), owner) {
             // Wake any subscribers waiting on this channel
             waker::wake(&wake_list, ipc::WakeReason::Closed);
         }
@@ -1414,8 +1896,8 @@ fn close_channel(ch: super::ChannelObject, owner: u32) {
 
 fn close_port(p: super::PortObject, owner: u32) {
     // Only close if listening
-    if p.state == super::PortState::Listening && p.port_id != 0 {
-        if let Ok(wake_list) = ipc::port_unregister(p.port_id, owner) {
+    if p.is_listening() && p.port_id() != 0 {
+        if let Ok(wake_list) = ipc::port_unregister(p.port_id(), owner) {
             // Wake any subscribers
             waker::wake(&wake_list, ipc::WakeReason::Closed);
         }

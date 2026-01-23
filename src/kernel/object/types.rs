@@ -29,6 +29,8 @@ pub enum Error {
     Exists = errno::EEXIST,
     /// Bad address
     BadAddress = errno::EFAULT,
+    /// I/O error
+    Io = errno::EIO,
 }
 
 impl Error {

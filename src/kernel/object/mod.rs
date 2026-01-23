@@ -57,8 +57,8 @@
 //! - [`PollResult`] - Result of polling (ready flags + data)
 //!
 //! ## Object State Machines
-//! - [`ChannelState`] - Open → HalfClosed → Closed
-//! - [`PortState`] - Listening → Closed
+//! - Channel state is queried from `ipc::channel` backend
+//! - Port state is queried from `ipc::port` backend
 //! - [`TimerState`] - Disarmed → Armed → Fired
 //!
 //! ## Syscall Handlers (in [`syscall`] submodule)
@@ -198,43 +198,34 @@ pub enum Object {
     /// Multiplexer
     Mux(MuxObject),
 
-    /// PCIe bus
+    /// PCIe bus (device enumeration)
     PciBus(PciBusObject),
+
+    /// PCI device (config access)
+    PciDevice(PciDeviceObject),
+
+    /// MSI vectors
+    Msi(MsiObject),
+
+    /// Bus list
+    BusList(BusListObject),
 }
 
 // ============================================================================
 // Channel Object
 // ============================================================================
 
-/// Channel state - explicit state machine
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChannelState {
-    /// Channel is open and connected
-    Open,
-    /// Peer has closed, but messages may remain in queue
-    HalfClosed,
-    /// Fully closed
-    Closed,
-}
-
-impl ChannelState {
-    /// Valid state transitions
-    pub fn can_transition_to(&self, new: ChannelState) -> bool {
-        match (*self, new) {
-            (ChannelState::Open, ChannelState::HalfClosed) => true,
-            (ChannelState::Open, ChannelState::Closed) => true,
-            (ChannelState::HalfClosed, ChannelState::Closed) => true,
-            _ => false,
-        }
-    }
-}
+// ChannelState is defined in ipc/channel.rs - we query ipc backend for state
+// instead of caching it locally. This ensures single source of truth.
 
 /// IPC channel - bidirectional message passing
+///
+/// This is a thin wrapper around an ipc channel_id. State is not cached
+/// locally - we query the ipc backend when needed. This ensures the
+/// ipc::channel::ChannelState is the single source of truth.
 pub struct ChannelObject {
     /// Channel ID in ipc backend (our end)
     channel_id: u32,
-    /// Current state
-    state: ChannelState,
     /// Subscriber for wake
     subscriber: Option<Subscriber>,
 }
@@ -242,10 +233,22 @@ pub struct ChannelObject {
 impl ChannelObject {
     /// Get the channel ID
     pub fn channel_id(&self) -> u32 { self.channel_id }
-    /// Get the current state
-    pub fn state(&self) -> ChannelState { self.state }
+
+    /// Check if channel is open (queries ipc backend)
+    pub fn is_open(&self) -> bool {
+        crate::kernel::ipc::channel_exists(self.channel_id)
+            && !crate::kernel::ipc::channel_is_closed(self.channel_id)
+    }
+
+    /// Check if channel is closed (queries ipc backend)
+    pub fn is_closed(&self) -> bool {
+        !crate::kernel::ipc::channel_exists(self.channel_id)
+            || crate::kernel::ipc::channel_is_closed(self.channel_id)
+    }
+
     /// Check if channel has a subscriber
     pub fn has_subscriber(&self) -> bool { self.subscriber.is_some() }
+
     /// Get subscriber (for waking)
     pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
 }
@@ -255,18 +258,7 @@ impl ChannelObject {
     pub fn new(channel_id: u32) -> Self {
         Self {
             channel_id,
-            state: ChannelState::Open,
             subscriber: None,
-        }
-    }
-
-    /// Transition to new state (validates transition)
-    pub fn transition(&mut self, new_state: ChannelState) -> bool {
-        if self.state.can_transition_to(new_state) {
-            self.state = new_state;
-            true
-        } else {
-            false
         }
     }
 
@@ -280,26 +272,31 @@ impl Pollable for ChannelObject {
     fn poll(&self, filter: u8) -> PollResult {
         use crate::kernel::ipc;
 
-        match self.state {
-            ChannelState::Closed => PollResult::closed(),
-            ChannelState::HalfClosed => {
-                // Can still read remaining messages
-                if (filter & poll::READABLE) != 0 && ipc::channel_has_messages(self.channel_id) {
-                    PollResult::readable()
-                } else {
-                    PollResult::closed()
-                }
+        // Query ipc backend for state (single source of truth)
+        if !ipc::channel_exists(self.channel_id) {
+            return PollResult::closed();
+        }
+
+        let is_closed = ipc::channel_is_closed(self.channel_id);
+        let has_messages = ipc::channel_has_messages(self.channel_id);
+
+        if is_closed {
+            // Peer closed - can still read remaining messages
+            if (filter & poll::READABLE) != 0 && has_messages {
+                PollResult::readable()
+            } else {
+                PollResult::closed()
             }
-            ChannelState::Open => {
-                let mut ready = 0u8;
-                if (filter & poll::READABLE) != 0 && ipc::channel_has_messages(self.channel_id) {
-                    ready |= poll::READABLE;
-                }
-                if (filter & poll::WRITABLE) != 0 && !ipc::channel_queue_full(self.channel_id) {
-                    ready |= poll::WRITABLE;
-                }
-                PollResult { ready, data: 0 }
+        } else {
+            // Channel open
+            let mut ready = 0u8;
+            if (filter & poll::READABLE) != 0 && has_messages {
+                ready |= poll::READABLE;
             }
+            if (filter & poll::WRITABLE) != 0 && !ipc::channel_queue_full(self.channel_id) {
+                ready |= poll::WRITABLE;
+            }
+            PollResult { ready, data: 0 }
         }
     }
 
@@ -327,6 +324,46 @@ pub enum TimerState {
     Armed,
     /// Timer fired (deadline passed)
     Fired,
+}
+
+impl TimerState {
+    /// Valid state transitions for timer
+    pub fn can_transition_to(&self, new: TimerState) -> bool {
+        match (*self, new) {
+            // Can always disarm
+            (_, TimerState::Disarmed) => true,
+            // Can arm from disarmed or fired (re-arm)
+            (TimerState::Disarmed, TimerState::Armed) => true,
+            (TimerState::Fired, TimerState::Armed) => true,
+            // Can fire only from armed
+            (TimerState::Armed, TimerState::Fired) => true,
+            _ => false,
+        }
+    }
+
+    /// Check if timer is armed
+    pub fn is_armed(&self) -> bool {
+        matches!(self, TimerState::Armed)
+    }
+
+    /// Get human-readable state name
+    pub fn name(&self) -> &'static str {
+        match self {
+            TimerState::Disarmed => "disarmed",
+            TimerState::Armed => "armed",
+            TimerState::Fired => "fired",
+        }
+    }
+}
+
+impl crate::kernel::ipc::traits::StateMachine for TimerState {
+    fn can_transition_to(&self, new: &Self) -> bool {
+        TimerState::can_transition_to(self, *new)
+    }
+
+    fn name(&self) -> &'static str {
+        TimerState::name(self)
+    }
 }
 
 /// Timer - write to set, read to wait
@@ -360,33 +397,45 @@ impl TimerObject {
     /// Get subscriber (for waking)
     pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
 
+    /// Check if timer is armed
+    pub fn is_armed(&self) -> bool {
+        self.state.is_armed()
+    }
+
     /// Arm the timer with deadline and optional interval
+    /// Always succeeds (can arm from any state)
     pub fn arm(&mut self, deadline: u64, interval: u64) {
         self.deadline = deadline;
         self.interval = interval;
         self.state = TimerState::Armed;
     }
 
-    /// Disarm the timer
+    /// Fire the timer (only valid from Armed state)
+    /// Returns true if transition succeeded
+    pub fn fire(&mut self) -> bool {
+        if self.state == TimerState::Armed {
+            self.state = TimerState::Fired;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Disarm the timer (always succeeds)
     pub fn disarm(&mut self) {
         self.deadline = 0;
         self.interval = 0;
         self.state = TimerState::Disarmed;
     }
 
-    /// Set deadline directly (for syscall handler)
+    /// Set deadline directly (for syscall handler - used with arm())
     pub(crate) fn set_deadline(&mut self, deadline: u64) {
         self.deadline = deadline;
     }
 
-    /// Set interval directly (for syscall handler)
+    /// Set interval directly (for syscall handler - used with arm())
     pub(crate) fn set_interval(&mut self, interval: u64) {
         self.interval = interval;
-    }
-
-    /// Set state directly (for syscall handler)
-    pub(crate) fn set_state(&mut self, state: TimerState) {
-        self.state = state;
     }
 
     /// Check and update state based on current tick
@@ -593,21 +642,17 @@ pub fn notify_child_exit(
 // Port Object
 // ============================================================================
 
-/// Port state
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PortState {
-    /// Port is listening for connections
-    Listening,
-    /// Port is closed
-    Closed,
-}
+// PortState is defined in ipc/port.rs - we query ipc backend for state
+// instead of caching it locally. This ensures single source of truth.
 
 /// Named port for accepting connections
+///
+/// This is a thin wrapper around an ipc port_id. State is not cached
+/// locally - we query the ipc backend when needed. This ensures the
+/// ipc::port::PortState is the single source of truth.
 pub struct PortObject {
     /// Port ID in ipc backend
     port_id: u32,
-    /// Port state
-    state: PortState,
     /// Port name
     name: [u8; 32],
     name_len: u8,
@@ -619,7 +664,6 @@ impl PortObject {
     pub fn new(port_id: u32, name: &[u8]) -> Self {
         let mut obj = Self {
             port_id,
-            state: PortState::Listening,
             name: [0u8; 32],
             name_len: name.len().min(32) as u8,
             subscriber: None,
@@ -631,17 +675,23 @@ impl PortObject {
 
     /// Get the port ID
     pub fn port_id(&self) -> u32 { self.port_id }
-    /// Get the current state
-    pub fn state(&self) -> PortState { self.state }
+
+    /// Check if port is listening (queries ipc backend)
+    pub fn is_listening(&self) -> bool {
+        crate::kernel::ipc::port_is_listening(self.port_id)
+    }
+
+    /// Check if port is closed (queries ipc backend)
+    pub fn is_closed(&self) -> bool {
+        !crate::kernel::ipc::port_exists(self.port_id)
+            || !crate::kernel::ipc::port_is_listening(self.port_id)
+    }
+
     /// Get the port name
     pub fn name(&self) -> &[u8] { &self.name[..self.name_len as usize] }
+
     /// Get subscriber (for waking)
     pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
-
-    /// Set state (internal use)
-    pub(crate) fn set_state(&mut self, state: PortState) {
-        self.state = state;
-    }
 
     /// Set subscriber (internal use)
     pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
@@ -651,20 +701,21 @@ impl PortObject {
 
 impl Pollable for PortObject {
     fn poll(&self, filter: u8) -> PollResult {
-        match self.state() {
-            PortState::Closed => PollResult::closed(),
-            PortState::Listening => {
-                if (filter & poll::READABLE) != 0 {
-                    // Check ipc for pending connections
-                    if crate::kernel::ipc::port_has_pending(self.port_id()) {
-                        PollResult::readable()
-                    } else {
-                        PollResult::NONE
-                    }
-                } else {
-                    PollResult::NONE
-                }
+        // Query ipc backend for state (single source of truth)
+        if self.is_closed() {
+            return PollResult::closed();
+        }
+
+        // Port is listening
+        if (filter & poll::READABLE) != 0 {
+            // Check ipc for pending connections
+            if crate::kernel::ipc::port_has_pending(self.port_id()) {
+                PollResult::readable()
+            } else {
+                PollResult::NONE
             }
+        } else {
+            PollResult::NONE
         }
     }
 
@@ -894,6 +945,64 @@ impl PciBusObject {
 }
 
 // ============================================================================
+// PCI Device Object (for config read/write)
+// ============================================================================
+
+/// PCI device handle for configuration space access
+pub struct PciDeviceObject {
+    /// Device BDF (bus/device/function)
+    bdf: u32,
+}
+
+impl PciDeviceObject {
+    pub fn new(bdf: u32) -> Self {
+        Self { bdf }
+    }
+    pub fn bdf(&self) -> u32 { self.bdf }
+}
+
+// ============================================================================
+// MSI Object
+// ============================================================================
+
+/// MSI vector allocation result
+pub struct MsiObject {
+    /// Device BDF this MSI belongs to
+    bdf: u32,
+    /// First IRQ number
+    first_irq: u32,
+    /// Number of vectors allocated
+    count: u8,
+}
+
+impl MsiObject {
+    pub fn new(bdf: u32, first_irq: u32, count: u8) -> Self {
+        Self { bdf, first_irq, count }
+    }
+    pub fn bdf(&self) -> u32 { self.bdf }
+    pub fn first_irq(&self) -> u32 { self.first_irq }
+    pub fn count(&self) -> u8 { self.count }
+}
+
+// ============================================================================
+// Bus List Object
+// ============================================================================
+
+/// Bus enumeration iterator
+pub struct BusListObject {
+    /// Current cursor position
+    cursor: u32,
+}
+
+impl BusListObject {
+    pub fn new() -> Self {
+        Self { cursor: 0 }
+    }
+    pub fn cursor(&self) -> u32 { self.cursor }
+    pub fn advance(&mut self) { self.cursor += 1; }
+}
+
+// ============================================================================
 // Message Queue (for channels)
 // ============================================================================
 
@@ -961,7 +1070,6 @@ impl Default for ChannelObject {
     fn default() -> Self {
         Self {
             channel_id: 0,
-            state: ChannelState::Closed,
             subscriber: None,
         }
     }
@@ -986,7 +1094,6 @@ impl Default for PortObject {
     fn default() -> Self {
         Self {
             port_id: 0,
-            state: PortState::Closed,
             name: [0u8; 32],
             name_len: 0,
             subscriber: None,
@@ -1015,7 +1122,7 @@ mod tests {
     #[test]
     fn test_timer_new() {
         let timer = TimerObject::new();
-        assert_eq!(timer.state(), &TimerState::Disarmed);
+        assert_eq!(timer.state(), TimerState::Disarmed);
         assert_eq!(timer.deadline(), 0);
         assert_eq!(timer.interval(), 0);
     }
@@ -1024,7 +1131,7 @@ mod tests {
     fn test_timer_arm() {
         let mut timer = TimerObject::new();
         timer.arm(1000, 0);
-        assert_eq!(timer.state(), &TimerState::Armed);
+        assert_eq!(timer.state(), TimerState::Armed);
         assert_eq!(timer.deadline(), 1000);
     }
 
@@ -1040,15 +1147,23 @@ mod tests {
         let mut timer = TimerObject::new();
         timer.arm(1000, 0);
         timer.disarm();
-        assert_eq!(timer.state(), &TimerState::Disarmed);
+        assert_eq!(timer.state(), TimerState::Disarmed);
     }
 
     #[test]
     fn test_timer_fire() {
         let mut timer = TimerObject::new();
         timer.arm(1000, 0);
-        timer.fire();
-        assert_eq!(timer.state(), &TimerState::Fired);
+        assert!(timer.fire());
+        assert_eq!(timer.state(), TimerState::Fired);
+    }
+
+    #[test]
+    fn test_timer_fire_invalid() {
+        let mut timer = TimerObject::new();
+        // Can't fire from Disarmed
+        assert!(!timer.fire());
+        assert_eq!(timer.state(), TimerState::Disarmed);
     }
 
     #[test]
@@ -1061,25 +1176,25 @@ mod tests {
         assert!(timer.is_armed());
     }
 
-    // Channel state tests
     #[test]
-    fn test_channel_state_open() {
-        assert!(ChannelState::Open.is_open());
-        assert!(!ChannelState::Closed.is_open());
+    fn test_timer_state_transitions() {
+        // Test valid transitions
+        assert!(TimerState::Disarmed.can_transition_to(TimerState::Armed));
+        assert!(TimerState::Armed.can_transition_to(TimerState::Fired));
+        assert!(TimerState::Fired.can_transition_to(TimerState::Armed)); // re-arm
+        assert!(TimerState::Armed.can_transition_to(TimerState::Disarmed));
+        assert!(TimerState::Fired.can_transition_to(TimerState::Disarmed));
+
+        // Test invalid transitions
+        assert!(!TimerState::Disarmed.can_transition_to(TimerState::Fired));
+        assert!(!TimerState::Fired.can_transition_to(TimerState::Fired));
     }
 
-    #[test]
-    fn test_channel_state_closed() {
-        assert!(ChannelState::Closed.is_closed());
-        assert!(!ChannelState::Open.is_closed());
-    }
+    // Channel state is now queried from ipc backend - no local enum to test
+    // ChannelObject.is_open() and is_closed() query ipc::channel_exists/is_closed
 
-    // Port state tests
-    #[test]
-    fn test_port_state_listening() {
-        assert!(PortState::Listening.is_listening());
-        assert!(!PortState::Closed.is_listening());
-    }
+    // Port state is now queried from ipc backend - no local enum to test
+    // PortObject.is_listening() and is_closed() query ipc::port_exists/is_listening
 
     // ProcessObject tests
     #[test]

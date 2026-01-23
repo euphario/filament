@@ -72,9 +72,19 @@ impl RegionState {
     /// Get state name for logging
     pub fn name(&self) -> &'static str {
         match self {
-            RegionState::Active => "Active",
-            RegionState::Dying => "Dying",
+            RegionState::Active => "active",
+            RegionState::Dying => "dying",
         }
+    }
+}
+
+impl super::ipc::traits::StateMachine for RegionState {
+    fn can_transition_to(&self, new: &Self) -> bool {
+        RegionState::can_transition_to(self, new)
+    }
+
+    fn name(&self) -> &'static str {
+        RegionState::name(self)
     }
 }
 
@@ -95,8 +105,15 @@ pub struct SharedMem {
     pub waiters: [Pid; MAX_WAITERS],
     /// Reference count (number of mappings)
     pub ref_count: u32,
-    /// Region state (Active or Dying)
-    pub state: RegionState,
+    /// Region state (Active or Dying) - private, use state() and transition methods
+    state: RegionState,
+}
+
+impl SharedMem {
+    /// Get current state
+    pub fn state(&self) -> RegionState {
+        self.state
+    }
 }
 
 impl SharedMem {
@@ -172,6 +189,17 @@ impl SharedMem {
         self.waiters = [NO_PID; MAX_WAITERS];
         waiters
     }
+
+    /// Transition to Dying state (owner is exiting)
+    /// Returns true if transition succeeded
+    pub fn begin_dying(&mut self) -> bool {
+        if self.state.can_transition_to(&RegionState::Dying) {
+            self.state = RegionState::Dying;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Shared memory subsystem state (protected by SpinLock for SMP safety)
@@ -226,6 +254,11 @@ pub fn get_region(shmem_id: u32) -> Option<SharedMem> {
         }
     }
     None
+}
+
+/// Get size of a shared memory region
+pub fn get_size(shmem_id: u32) -> Option<usize> {
+    get_region(shmem_id).map(|r| r.size)
 }
 
 /// Create a new shared memory region
@@ -318,7 +351,7 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
             if let Some(ref mut region) = slot {
                 if region.id == shmem_id {
                     // Reject mapping if region is dying (owner exiting)
-                    if region.state == RegionState::Dying {
+                    if region.state() == RegionState::Dying {
                         kwarn!("shmem", "map_dying";
                             caller = pid as u64,
                             shmem = shmem_id as u64);
@@ -387,7 +420,7 @@ pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
         if let Some(ref mut region) = slot {
             if region.id == shmem_id {
                 // Reject if region is dying
-                if region.state == RegionState::Dying {
+                if region.state() == RegionState::Dying {
                     return Err(-11); // EAGAIN - resource temporarily unavailable
                 }
 
@@ -649,8 +682,9 @@ pub fn begin_cleanup(pid: Pid) {
                 }
 
                 // If owner, mark as Dying and collect mappers to notify
-                if region.owner_pid == pid && region.state == RegionState::Active {
-                    region.state = RegionState::Dying;
+                if region.owner_pid == pid && region.state() == RegionState::Active {
+                    // Use transition method to mark as dying
+                    let _ = region.begin_dying();
                     let shmem_id = region.id;
 
                     // Collect all allowed pids (excluding owner) to notify
@@ -688,7 +722,7 @@ pub fn finalize_cleanup(pid: Pid) {
         for (i, slot) in guard.table.iter_mut().enumerate() {
             if let Some(ref region) = slot {
                 // Collect Dying regions owned by this pid
-                if region.owner_pid == pid && region.state == RegionState::Dying {
+                if region.owner_pid == pid && region.state() == RegionState::Dying {
                     owned_regions[owned_count] = (region.phys_addr, region.size, i);
                     owned_count += 1;
                 }
