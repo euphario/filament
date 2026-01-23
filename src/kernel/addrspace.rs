@@ -134,6 +134,26 @@ fn free_asid(asid: u16) {
     guard.free(asid);
 }
 
+// ============================================================================
+// External API for Trait Implementation
+// ============================================================================
+
+/// Allocate an ASID (external API for trait boundary)
+pub fn alloc_asid_external() -> Option<u16> {
+    alloc_asid()
+}
+
+/// Free an ASID (external API for trait boundary)
+pub fn free_asid_external(asid: u16) {
+    free_asid(asid);
+}
+
+/// Get count of allocated ASIDs (external API for trait boundary)
+pub fn asid_count_external() -> usize {
+    let guard = ASID_ALLOCATOR.lock();
+    guard.count() as usize
+}
+
 /// Convert a physical address to a kernel virtual address for access via TTBR1
 #[inline(always)]
 fn phys_to_virt(phys: u64) -> *mut u64 {

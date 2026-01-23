@@ -28,6 +28,7 @@ pub mod elf;
 pub mod pmm;
 pub mod pmm_impl; // PhysicalAllocator trait implementation
 pub mod addrspace;
+pub mod addrspace_impl; // AddressSpaceBackend trait implementation
 pub mod uaccess;
 pub mod log;
 pub mod caps;
