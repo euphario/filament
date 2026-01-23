@@ -1053,6 +1053,72 @@ pub fn process_cleanup(pid: Pid) {
 }
 
 // ============================================================================
+// Trait Boundary Helpers
+// ============================================================================
+//
+// These functions provide a stable interface for the trait implementations
+// in shmem_impl.rs. They delegate to the internal MappingTable.
+
+/// Add a mapping for (region_id, pid) - for trait boundary
+pub fn mapping_add(region_id: u32, pid: Pid) -> Result<(), i64> {
+    let mut guard = SHMEM.lock();
+    guard.mappings.add_mapping(region_id, pid)
+}
+
+/// Remove a mapping for (region_id, pid) - for trait boundary
+pub fn mapping_remove(region_id: u32, pid: Pid) -> Result<(), i64> {
+    let mut guard = SHMEM.lock();
+    guard.mappings.remove_mapping(region_id, pid)
+}
+
+/// Check if pid has region mapped - for trait boundary
+pub fn mapping_has(region_id: u32, pid: Pid) -> bool {
+    let guard = SHMEM.lock();
+    guard.mappings.has_mapping(region_id, pid)
+}
+
+/// Get count of mappings for a region - for trait boundary
+pub fn mapping_count(region_id: u32) -> usize {
+    let guard = SHMEM.lock();
+    guard.mappings.mapping_count(region_id)
+}
+
+/// Get all PIDs that have a region mapped - for trait boundary
+pub fn mapping_get_pids(region_id: u32) -> [Pid; MAX_ALLOWED_PIDS] {
+    let guard = SHMEM.lock();
+    guard.mappings.get_mapped_pids(region_id)
+}
+
+/// Remove all mappings for a pid - for trait boundary
+pub fn mapping_remove_all_for_pid(pid: Pid) {
+    let mut guard = SHMEM.lock();
+    guard.mappings.remove_all_for_pid(pid);
+}
+
+/// Remove all mappings for a region - for trait boundary
+pub fn mapping_remove_all_for_region(region_id: u32) {
+    let mut guard = SHMEM.lock();
+    guard.mappings.remove_all_for_region(region_id);
+}
+
+/// Transition a region to Dying state - for trait boundary
+pub fn begin_region_dying(region_id: u32) -> Result<(), i64> {
+    let mut guard = SHMEM.lock();
+    for slot in guard.table.iter_mut() {
+        if let Some(ref mut region) = slot {
+            if region.id == region_id {
+                if region.begin_dying() {
+                    return Ok(());
+                } else {
+                    return Err(-22); // EINVAL - invalid state transition
+                }
+            }
+        }
+    }
+    Err(-2) // ENOENT
+}
+
+// ============================================================================
 // Self-tests
 // ============================================================================
 

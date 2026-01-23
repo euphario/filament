@@ -14,15 +14,18 @@ pub mod traits; // Trait boundaries for swappable subsystems
 pub mod waker_impl; // Waker trait implementation
 pub mod task;
 pub mod sched;
+pub mod sched_impl; // SchedulerBackend trait implementation
 pub mod process;
 pub mod syscall;
 pub mod memory;  // User memory mapping types
 pub(crate) mod ipc;    // IPC system - internal, use object/ for public API
 pub mod event;
 pub mod shmem;
+pub mod shmem_impl; // ShmemBackend trait implementation
 pub mod dma_pool;
 pub mod elf;
 pub mod pmm;
+pub mod pmm_impl; // PhysicalAllocator trait implementation
 pub mod addrspace;
 pub mod uaccess;
 pub mod log;

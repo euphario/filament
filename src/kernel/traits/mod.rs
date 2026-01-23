@@ -38,6 +38,7 @@
 pub mod ipc;
 pub mod memory;
 pub mod waker;
+pub mod sched;
 
 // Re-exports for convenient access - will be used once migration completes
 #[allow(unused_imports)]
@@ -49,3 +50,5 @@ pub use ipc::{
 pub use memory::{PhysicalAllocator, SharedMemory, ShmemError, MappingTracker};
 #[allow(unused_imports)]
 pub use waker::{Waker, WakeReason, Subscriber};
+#[allow(unused_imports)]
+pub use sched::{SchedulerBackend, TaskStateInfo, SchedError};
