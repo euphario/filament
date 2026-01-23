@@ -1,6 +1,4 @@
 //! Shared Memory Subsystem
-
-#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Provides DMA-capable shared memory regions that can be mapped into
 //! multiple processes. Used as a building block for high-performance
@@ -11,19 +9,29 @@
 //! The kernel manages shared memory regions and access control.
 //! Ring buffer structure and protocol are handled in userspace.
 //!
-//! ## Syscalls
+//! ## Key Fix: Mapping Tracking
 //!
-//! - `shmem_create(size, &vaddr, &paddr)` - Create new region
-//! - `shmem_map(id, &vaddr, &paddr)` - Map existing region
-//! - `shmem_allow(id, peer_pid)` - Grant access to peer
-//! - `shmem_wait(id, timeout_ms)` - Wait for notification
-//! - `shmem_notify(id)` - Wake all waiters
-//! - `shmem_destroy(id)` - Destroy region
+//! Instead of using a simple ref_count that can be manipulated, we now
+//! track actual (region_id, pid) pairs in a MappingTable. This prevents:
+//! - Double-free (unmap called twice)
+//! - Ref-count underflow (malicious repeated unmap)
+//! - Use-after-free (destroy while others have mappings)
+//!
+//! ## Syscalls (via unified interface)
+//!
+//! - `open(Shmem, [size])` - Create new region
+//! - `open(Shmem, [flags=1, id])` - Map existing region
+//! - `write(handle, [cmd=0, pid])` - Allow peer (ALLOW command)
+//! - `write(handle, [cmd=1])` - Notify waiters (NOTIFY command)
+//! - `read(handle, [timeout])` - Wait for notification
+//! - `close(handle)` - Unmap/destroy region
+
+#![allow(dead_code)]  // Infrastructure for future use
 
 use super::pmm;
 use super::process::Pid;
 use super::lock::SpinLock;
-use crate::{kinfo, kwarn};
+use crate::{kinfo, kwarn, kerror};
 
 /// Maximum number of shared memory regions
 const MAX_SHMEM_REGIONS: usize = 32;
@@ -34,8 +42,14 @@ const MAX_ALLOWED_PIDS: usize = 8;
 /// Maximum waiters per region
 const MAX_WAITERS: usize = 8;
 
+/// Maximum total mappings tracked globally (prevents unbounded growth)
+const MAX_TOTAL_MAPPINGS: usize = MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS;
+
 /// Invalid/no PID marker
 const NO_PID: Pid = 0;
+
+/// Page size constant
+const PAGE_SIZE: usize = 4096;
 
 /// State of a shared memory region
 ///
@@ -202,9 +216,160 @@ impl SharedMem {
     }
 }
 
+// ============================================================================
+// Mapping Table - Tracks actual (region_id, pid) pairs
+// ============================================================================
+
+/// A single mapping entry tracking which pid has which region mapped
+#[derive(Clone, Copy)]
+struct MappingEntry {
+    region_id: u32,
+    pid: Pid,
+}
+
+impl MappingEntry {
+    const fn empty() -> Self {
+        Self { region_id: 0, pid: NO_PID }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pid == NO_PID
+    }
+}
+
+/// Mapping table that tracks actual mappings to prevent double-free
+///
+/// This solves the ref_count underflow vulnerability:
+/// - add_mapping() fails if pid already has this region mapped
+/// - remove_mapping() fails if pid doesn't have this region mapped
+struct MappingTable {
+    entries: [MappingEntry; MAX_TOTAL_MAPPINGS],
+    count: usize,
+}
+
+impl MappingTable {
+    const fn new() -> Self {
+        Self {
+            entries: [MappingEntry::empty(); MAX_TOTAL_MAPPINGS],
+            count: 0,
+        }
+    }
+
+    /// Add a mapping for (region_id, pid)
+    ///
+    /// Returns Ok(()) on success, Err(-EEXIST) if already mapped, Err(-ENOMEM) if full
+    fn add_mapping(&mut self, region_id: u32, pid: Pid) -> Result<(), i64> {
+        // Check if already mapped (prevents double-map)
+        for entry in &self.entries[..self.count] {
+            if entry.region_id == region_id && entry.pid == pid {
+                return Err(-17); // EEXIST - already mapped
+            }
+        }
+
+        // Find empty slot
+        if self.count < MAX_TOTAL_MAPPINGS {
+            self.entries[self.count] = MappingEntry { region_id, pid };
+            self.count += 1;
+            Ok(())
+        } else {
+            Err(-12) // ENOMEM - no slots
+        }
+    }
+
+    /// Remove a mapping for (region_id, pid)
+    ///
+    /// Returns Ok(()) on success, Err(-EINVAL) if not mapped
+    fn remove_mapping(&mut self, region_id: u32, pid: Pid) -> Result<(), i64> {
+        for i in 0..self.count {
+            if self.entries[i].region_id == region_id && self.entries[i].pid == pid {
+                // Swap with last and decrement count
+                if i < self.count - 1 {
+                    self.entries[i] = self.entries[self.count - 1];
+                }
+                self.entries[self.count - 1] = MappingEntry::empty();
+                self.count -= 1;
+                return Ok(());
+            }
+        }
+        Err(-22) // EINVAL - not mapped (prevents double-free)
+    }
+
+    /// Check if pid has region mapped
+    fn has_mapping(&self, region_id: u32, pid: Pid) -> bool {
+        for entry in &self.entries[..self.count] {
+            if entry.region_id == region_id && entry.pid == pid {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get count of mappings for a region
+    fn mapping_count(&self, region_id: u32) -> usize {
+        let mut count = 0;
+        for entry in &self.entries[..self.count] {
+            if entry.region_id == region_id {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Remove all mappings for a pid (process cleanup)
+    fn remove_all_for_pid(&mut self, pid: Pid) {
+        let mut i = 0;
+        while i < self.count {
+            if self.entries[i].pid == pid {
+                if i < self.count - 1 {
+                    self.entries[i] = self.entries[self.count - 1];
+                }
+                self.entries[self.count - 1] = MappingEntry::empty();
+                self.count -= 1;
+                // Don't increment i - check the swapped entry
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Remove all mappings for a region (region destruction)
+    fn remove_all_for_region(&mut self, region_id: u32) {
+        let mut i = 0;
+        while i < self.count {
+            if self.entries[i].region_id == region_id {
+                if i < self.count - 1 {
+                    self.entries[i] = self.entries[self.count - 1];
+                }
+                self.entries[self.count - 1] = MappingEntry::empty();
+                self.count -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Get all PIDs that have a region mapped
+    fn get_mapped_pids(&self, region_id: u32) -> [Pid; MAX_ALLOWED_PIDS] {
+        let mut pids = [NO_PID; MAX_ALLOWED_PIDS];
+        let mut idx = 0;
+        for entry in &self.entries[..self.count] {
+            if entry.region_id == region_id && idx < MAX_ALLOWED_PIDS {
+                pids[idx] = entry.pid;
+                idx += 1;
+            }
+        }
+        pids
+    }
+}
+
+// ============================================================================
+// Shmem State
+// ============================================================================
+
 /// Shared memory subsystem state (protected by SpinLock for SMP safety)
 struct ShmemState {
     table: [Option<SharedMem>; MAX_SHMEM_REGIONS],
+    mappings: MappingTable,
     next_id: u32,
 }
 
@@ -214,6 +379,7 @@ impl ShmemState {
         const NONE: Option<SharedMem> = None;
         Self {
             table: [NONE; MAX_SHMEM_REGIONS],
+            mappings: MappingTable::new(),
             next_id: 1,
         }
     }
@@ -268,13 +434,23 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
         return Err(-22); // EINVAL
     }
 
-    // Round up to page size
-    let page_size = 4096usize;
-    let aligned_size = (size + page_size - 1) & !(page_size - 1);
-    let num_pages = aligned_size / page_size;
+    // OVERFLOW CHECK: Align size to page boundary safely
+    let aligned_size = size.checked_add(PAGE_SIZE - 1)
+        .map(|s| s & !(PAGE_SIZE - 1))
+        .ok_or_else(|| {
+            kerror!("shmem", "size_overflow"; size = size as u64);
+            -22i64 // EINVAL - size overflow
+        })?;
 
-    // CRITICAL: Find free slot BEFORE allocating physical memory
-    // This prevents memory leak if no slots are available
+    // OVERFLOW CHECK: Calculate number of pages
+    let num_pages = aligned_size / PAGE_SIZE;
+    if num_pages == 0 || num_pages > 1024 {
+        // Sanity limit: max 4MB per region
+        return Err(-22); // EINVAL
+    }
+
+    // CRITICAL: Find free slot and add mapping BEFORE allocating physical memory
+    // This prevents memory leak if no slots or mappings available
     let (slot_idx, shmem_id) = {
         let mut guard = SHMEM.lock();
         let mut found = None;
@@ -286,22 +462,35 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
         }
         let idx = found.ok_or(-12i64)?; // ENOMEM (no slots)
         let id = guard.next_id;
-        guard.next_id += 1;
+
+        // Pre-register owner's mapping in tracking table
+        guard.mappings.add_mapping(id, owner_pid)?;
+
+        guard.next_id = guard.next_id.wrapping_add(1);
+        if guard.next_id == 0 { guard.next_id = 1; } // Skip 0
         (idx, id)
     };
 
     // Now allocate contiguous physical pages for DMA
-    // If this fails, we haven't modified any state yet
-    let phys_addr = pmm::alloc_contiguous(num_pages)
-        .ok_or(-12i64)?; // ENOMEM
+    // If this fails, remove the pre-registered mapping
+    let phys_addr = match pmm::alloc_contiguous(num_pages) {
+        Some(addr) => addr,
+        None => {
+            // Rollback: remove the mapping we added
+            let mut guard = SHMEM.lock();
+            let _ = guard.mappings.remove_mapping(shmem_id, owner_pid);
+            return Err(-12); // ENOMEM
+        }
+    };
 
     // Create the region descriptor
+    // Note: ref_count is now derived from mapping table, not stored here
     let mut region = SharedMem::new();
     region.id = shmem_id;
     region.owner_pid = owner_pid;
     region.phys_addr = phys_addr as u64;
     region.size = aligned_size;
-    region.ref_count = 1; // Owner's mapping
+    region.ref_count = 1; // For compatibility - real tracking is in MappingTable
 
     // Map into owner's address space (clean up phys pages on failure)
     let vaddr = match map_into_process(owner_pid, phys_addr as u64, aligned_size) {
@@ -346,60 +535,125 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
 pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
     let (phys_addr, size) = {
         let mut guard = SHMEM.lock();
-        let mut found = None;
-        for slot in guard.table.iter_mut() {
-            if let Some(ref mut region) = slot {
-                if region.id == shmem_id {
-                    // Reject mapping if region is dying (owner exiting)
-                    if region.state() == RegionState::Dying {
-                        kwarn!("shmem", "map_dying";
-                            caller = pid as u64,
-                            shmem = shmem_id as u64);
-                        return Err(-11); // EAGAIN - resource temporarily unavailable
-                    }
 
-                    // Check if allowed
-                    if !region.is_allowed(pid) {
-                        // DEBUG: Log the access denial with details
-                        kwarn!("shmem", "map_denied";
-                            caller = pid as u64,
-                            shmem = shmem_id as u64,
-                            owner = region.owner_pid as u64,
-                            allowed0 = region.allowed_pids[0] as u64,
-                            allowed1 = region.allowed_pids[1] as u64);
-                        return Err(-13); // EACCES
-                    }
-                    region.ref_count += 1;
-                    found = Some((region.phys_addr, region.size));
+        // SECURITY FIX: Check for double-map FIRST via MappingTable
+        // This prevents double-map attacks
+        if guard.mappings.has_mapping(shmem_id, pid) {
+            kwarn!("shmem", "map_already_mapped";
+                caller = pid as u64,
+                shmem = shmem_id as u64);
+            return Err(-17); // EEXIST - already mapped
+        }
+
+        // Find the region and validate
+        let mut found_info: Option<(u64, usize, bool, Pid, [Pid; MAX_ALLOWED_PIDS])> = None;
+        for slot in guard.table.iter() {
+            if let Some(ref region) = slot {
+                if region.id == shmem_id {
+                    found_info = Some((
+                        region.phys_addr,
+                        region.size,
+                        region.state() == RegionState::Dying,
+                        region.owner_pid,
+                        region.allowed_pids,
+                    ));
                     break;
                 }
             }
         }
-        if found.is_none() {
-            kwarn!("shmem", "map_not_found"; caller = pid as u64, shmem = shmem_id as u64);
+
+        let (phys, sz, is_dying, owner, allowed) = match found_info {
+            Some(info) => info,
+            None => {
+                kwarn!("shmem", "map_not_found"; caller = pid as u64, shmem = shmem_id as u64);
+                return Err(-2); // ENOENT
+            }
+        };
+
+        // Reject mapping if region is dying (owner exiting)
+        if is_dying {
+            kwarn!("shmem", "map_dying";
+                caller = pid as u64,
+                shmem = shmem_id as u64);
+            return Err(-11); // EAGAIN - resource temporarily unavailable
         }
-        found.ok_or(-2i64)? // ENOENT
+
+        // Check if allowed
+        let is_allowed = pid == owner || allowed.iter().any(|&p| p == pid);
+        if !is_allowed {
+            kwarn!("shmem", "map_denied";
+                caller = pid as u64,
+                shmem = shmem_id as u64,
+                owner = owner as u64,
+                allowed0 = allowed[0] as u64,
+                allowed1 = allowed[1] as u64);
+            return Err(-13); // EACCES
+        }
+
+        // Add to tracking table (will fail if full)
+        guard.mappings.add_mapping(shmem_id, pid)?;
+
+        // Update ref_count for backward compatibility
+        for slot in guard.table.iter_mut() {
+            if let Some(ref mut region) = slot {
+                if region.id == shmem_id {
+                    region.ref_count += 1;
+                    break;
+                }
+            }
+        }
+
+        (phys, sz)
     };
 
     // Map into process's address space
-    let vaddr = map_into_process(pid, phys_addr, size)?;
+    let vaddr = match map_into_process(pid, phys_addr, size) {
+        Ok(addr) => addr,
+        Err(e) => {
+            // Rollback: remove the mapping we added
+            let mut guard = SHMEM.lock();
+            let _ = guard.mappings.remove_mapping(shmem_id, pid);
+            // Also decrement ref_count
+            for slot in guard.table.iter_mut() {
+                if let Some(ref mut region) = slot {
+                    if region.id == shmem_id && region.ref_count > 0 {
+                        region.ref_count -= 1;
+                        break;
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
 
     Ok((vaddr, phys_addr))
 }
 
-/// Unmap shared memory from a process (decrements ref_count)
+/// Unmap shared memory from a process
 /// Called when a process unmaps shmem or exits
+///
+/// SECURITY FIX: Uses MappingTable to track actual mappings.
+/// Prevents double-free via ref_count underflow.
 pub fn unmap(pid: Pid, shmem_id: u32) -> Result<(), i64> {
     let mut guard = SHMEM.lock();
+
+    // SECURITY FIX: First verify the mapping actually exists in our tracking table
+    // This prevents double-free attacks where unmap is called repeatedly
+    guard.mappings.remove_mapping(shmem_id, pid)?;
+
     for slot in guard.table.iter_mut() {
         if let Some(ref mut region) = slot {
             if region.id == shmem_id {
-                // Check if this process has it mapped (must be allowed)
+                // Check if this process has access (defense in depth)
                 if !region.is_allowed(pid) {
+                    // This shouldn't happen since we verified mapping above
+                    // but re-add the mapping to maintain consistency
+                    let _ = guard.mappings.add_mapping(shmem_id, pid);
                     return Err(-13); // EACCES
                 }
 
-                // Decrement ref_count (but never below 0)
+                // Update ref_count for backward compatibility
+                // Real authority is the MappingTable which we already updated
                 if region.ref_count > 0 {
                     region.ref_count -= 1;
                 }
@@ -410,6 +664,9 @@ pub fn unmap(pid: Pid, shmem_id: u32) -> Result<(), i64> {
             }
         }
     }
+
+    // Region not found - re-add the mapping we removed to maintain consistency
+    let _ = guard.mappings.add_mapping(shmem_id, pid);
     Err(-2) // ENOENT
 }
 
@@ -562,13 +819,14 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
 
 /// Destroy a shared memory region (only owner can do this)
 ///
-/// SECURITY: Refuses to destroy if ref_count > 1 (other processes still have it mapped).
+/// SECURITY: Refuses to destroy if other processes still have active mappings.
+/// Uses MappingTable for authoritative count (not ref_count which can be manipulated).
 /// This prevents use-after-free where destroying shared memory while another process
 /// is actively using it would cause memory corruption.
 pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
     // Extract info and validate under shmem lock
     let (phys_addr, size, slot_idx) = {
-        let guard = SHMEM.lock();
+        let mut guard = SHMEM.lock();
         let mut found = None;
         for (i, slot) in guard.table.iter().enumerate() {
             if let Some(ref region) = slot {
@@ -578,11 +836,16 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
                         return Err(-1); // EPERM
                     }
 
-                    // SECURITY: Refuse to destroy if other processes still have it mapped
-                    // ref_count of 1 means only the owner has it mapped (safe to destroy)
-                    // ref_count > 1 means other processes still have active mappings
-                    if region.ref_count > 1 {
-                        kwarn!("shmem", "destroy_refused_busy"; id = shmem_id as u64, ref_count = region.ref_count as u64);
+                    // SECURITY FIX: Use MappingTable for authoritative count
+                    // This prevents manipulation of ref_count to bypass the check
+                    let active_mappings = guard.mappings.mapping_count(shmem_id);
+
+                    // mapping_count of 1 means only the owner has it mapped (safe to destroy)
+                    // mapping_count > 1 means other processes still have active mappings
+                    if active_mappings > 1 {
+                        kwarn!("shmem", "destroy_refused_busy";
+                            id = shmem_id as u64,
+                            mappings = active_mappings as u64);
                         return Err(-16); // EBUSY - resource busy
                     }
 
@@ -591,6 +854,12 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
                 }
             }
         }
+
+        // If we found the region, remove owner's mapping from table
+        if found.is_some() {
+            let _ = guard.mappings.remove_mapping(shmem_id, owner_pid);
+        }
+
         found.ok_or(-2i64)? // ENOENT
     };
     // shmem lock released here before touching scheduler
@@ -604,6 +873,8 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
     {
         let mut guard = SHMEM.lock();
         guard.table[slot_idx] = None;
+        // Also clean up any remaining mappings for this region (defense in depth)
+        guard.mappings.remove_all_for_region(shmem_id);
     }
 
     let num_pages = size / 4096;
@@ -667,35 +938,57 @@ pub fn begin_cleanup(pid: Pid) {
     let mut to_notify: [(u32, Pid); MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS] = [(0, 0); MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS];
     let mut notify_count = 0;
 
+    // Collect shmem IDs owned by this pid first (to get mappers from table)
+    let mut owned_ids: [u32; MAX_SHMEM_REGIONS] = [0; MAX_SHMEM_REGIONS];
+    let mut owned_count = 0;
+
     {
         let mut guard = SHMEM.lock();
+
+        // First pass: collect owned region IDs and get their mapped PIDs
+        for slot in guard.table.iter() {
+            if let Some(ref region) = slot {
+                if region.owner_pid == pid && region.state() == RegionState::Active {
+                    let shmem_id = region.id;
+                    if owned_count < MAX_SHMEM_REGIONS {
+                        owned_ids[owned_count] = shmem_id;
+                        owned_count += 1;
+                    }
+
+                    // Get actual mapped PIDs from MappingTable
+                    let mapped_pids = guard.mappings.get_mapped_pids(shmem_id);
+                    for mapper_pid in mapped_pids {
+                        if mapper_pid != NO_PID && mapper_pid != pid {
+                            if notify_count < to_notify.len() {
+                                to_notify[notify_count] = (shmem_id, mapper_pid);
+                                notify_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // SECURITY FIX: Remove all mappings for this pid from the tracking table
+        // This happens regardless of whether they're owner or just mapper
+        guard.mappings.remove_all_for_pid(pid);
+
+        // Second pass: mark regions as dying and update ref_counts
         for slot in guard.table.iter_mut() {
             if let Some(ref mut region) = slot {
                 // Remove dying pid from waiters
                 region.remove_waiter(pid);
 
-                // If this process had it mapped (non-owner), decrement ref_count
+                // If this process had it mapped (non-owner), decrement ref_count for compat
                 if region.is_allowed(pid) && region.owner_pid != pid {
                     if region.ref_count > 0 {
                         region.ref_count -= 1;
                     }
                 }
 
-                // If owner, mark as Dying and collect mappers to notify
+                // If owner, mark as Dying
                 if region.owner_pid == pid && region.state() == RegionState::Active {
-                    // Use transition method to mark as dying
                     let _ = region.begin_dying();
-                    let shmem_id = region.id;
-
-                    // Collect all allowed pids (excluding owner) to notify
-                    for &allowed_pid in &region.allowed_pids {
-                        if allowed_pid != NO_PID && allowed_pid != pid {
-                            if notify_count < to_notify.len() {
-                                to_notify[notify_count] = (shmem_id, allowed_pid);
-                                notify_count += 1;
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -714,16 +1007,16 @@ pub fn begin_cleanup(pid: Pid) {
 /// Called after servers had a chance to release their mappings.
 pub fn finalize_cleanup(pid: Pid) {
     // Collect Dying regions owned by this process
-    let mut owned_regions: [(u64, usize, usize); MAX_SHMEM_REGIONS] = [(0, 0, 0); MAX_SHMEM_REGIONS];
+    let mut owned_regions: [(u64, usize, usize, u32); MAX_SHMEM_REGIONS] = [(0, 0, 0, 0); MAX_SHMEM_REGIONS];
     let mut owned_count = 0;
 
     {
-        let mut guard = SHMEM.lock();
-        for (i, slot) in guard.table.iter_mut().enumerate() {
+        let guard = SHMEM.lock();
+        for (i, slot) in guard.table.iter().enumerate() {
             if let Some(ref region) = slot {
                 // Collect Dying regions owned by this pid
                 if region.owner_pid == pid && region.state() == RegionState::Dying {
-                    owned_regions[owned_count] = (region.phys_addr, region.size, i);
+                    owned_regions[owned_count] = (region.phys_addr, region.size, i, region.id);
                     owned_count += 1;
                 }
             }
@@ -732,7 +1025,7 @@ pub fn finalize_cleanup(pid: Pid) {
 
     // Destroy owned regions (unmap from other processes)
     for i in 0..owned_count {
-        let (phys_addr, size, slot_idx) = owned_regions[i];
+        let (phys_addr, size, slot_idx, shmem_id) = owned_regions[i];
         let num_pages = size / 4096;
 
         // CRITICAL: Unmap from ALL other processes before freeing
@@ -740,10 +1033,12 @@ pub fn finalize_cleanup(pid: Pid) {
             unmap_from_all_processes(phys_addr, size);
         }
 
-        // Clear the slot
+        // Clear the slot and clean up all mappings for this region
         {
             let mut guard = SHMEM.lock();
             guard.table[slot_idx] = None;
+            // SECURITY FIX: Remove all mapping entries for this region
+            guard.mappings.remove_all_for_region(shmem_id);
         }
 
         pmm::free_contiguous(phys_addr as usize, num_pages);

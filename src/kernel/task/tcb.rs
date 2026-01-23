@@ -599,7 +599,8 @@ impl Task {
         flags: MapFlags,
         kind: MappingKind,
     ) -> Option<MapResult> {
-        let num_pages = (size + 4095) / 4096;
+        // OVERFLOW CHECK: Calculate number of pages safely
+        let num_pages = size.checked_add(4095)? / 4096;
         if num_pages == 0 {
             return None;
         }
@@ -607,8 +608,11 @@ impl Task {
         let slot = self.heap_mappings.iter().position(|m| m.is_empty())?;
 
         let virt_addr = self.heap_next;
-        let mapping_size = (num_pages * 4096) as u64;
-        if virt_addr + mapping_size > USER_HEAP_END {
+        // OVERFLOW CHECK: Calculate mapping size safely
+        let mapping_size = num_pages.checked_mul(4096)? as u64;
+        // OVERFLOW CHECK: Check end address safely
+        let end_addr = virt_addr.checked_add(mapping_size)?;
+        if end_addr > USER_HEAP_END {
             return None;
         }
 
@@ -762,7 +766,11 @@ impl Task {
     }
 
     pub fn munmap(&mut self, addr: u64, size: usize) -> bool {
-        let num_pages = (size + 4095) / 4096;
+        // OVERFLOW CHECK: Calculate number of pages safely
+        let num_pages = match size.checked_add(4095) {
+            Some(s) => s / 4096,
+            None => return false, // Size overflow
+        };
         if num_pages == 0 {
             return false;
         }
@@ -817,6 +825,11 @@ core::arch::global_asm!(r#"
 .global context_switch_asm
 .type context_switch_asm, @function
 context_switch_asm:
+    // MEMORY BARRIER: Ensure all stores from outgoing context are visible
+    // to other CPUs before we switch. Critical for SMP correctness.
+    dsb     sy
+
+    // Save callee-saved registers for current task
     stp     x19, x20, [x0, #0]
     stp     x21, x22, [x0, #16]
     stp     x23, x24, [x0, #32]
@@ -826,6 +839,7 @@ context_switch_asm:
     mov     x9, sp
     str     x9, [x0, #96]
 
+    // Restore callee-saved registers for next task
     ldp     x19, x20, [x1, #0]
     ldp     x21, x22, [x1, #16]
     ldp     x23, x24, [x1, #32]
@@ -834,6 +848,11 @@ context_switch_asm:
     ldp     x29, x30, [x1, #80]
     ldr     x9, [x1, #96]
     mov     sp, x9
+
+    // MEMORY BARRIER: Ensure all loads complete before returning
+    // to the new context. Prevents stale reads in SMP.
+    dsb     sy
+    isb
 
     ret
 

@@ -240,7 +240,8 @@ impl Process {
 
     /// Allocate user stack in process address space
     pub fn alloc_user_stack(&mut self, size: usize) -> Option<u64> {
-        let pages = (size + 4095) / 4096;
+        // OVERFLOW CHECK: Calculate pages safely
+        let pages = size.checked_add(4095)? / 4096;
         let phys = pmm::alloc_pages(pages)? as u64;
 
         // Map at a high user address
@@ -265,7 +266,8 @@ impl Process {
     /// Load a simple program into the process address space
     /// Returns the entry point
     pub fn load_program(&mut self, code: &[u8], load_addr: u64) -> Option<u64> {
-        let pages = (code.len() + 4095) / 4096;
+        // OVERFLOW CHECK: Calculate pages safely
+        let pages = code.len().checked_add(4095)? / 4096;
         let phys = pmm::alloc_pages(pages)? as u64;
 
         // Copy program to physical memory (use TTBR1 virtual address)
@@ -337,7 +339,9 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         // Free kernel stack
-        let pages = (self.kernel_stack_size + 4095) / 4096;
+        // Note: kernel_stack_size is set during Process::new() with known-safe values
+        // Use saturating_add for defense in depth (won't overflow, just cap at max)
+        let pages = self.kernel_stack_size.saturating_add(4095) / 4096;
         pmm::free_pages(self.kernel_stack as usize, pages);
         // address_space is automatically dropped
     }

@@ -410,13 +410,18 @@ pub fn channel_unregister_waker(channel_id: ChannelId, task_id: u32) {
 }
 
 /// Register a waker for port Accepted events (when channel is a listen channel)
-pub fn port_register_waker_for_channel(channel_id: ChannelId, task_id: u32) {
+///
+/// Returns true on success, false if port not found or subscriber set full.
+pub fn port_register_waker_for_channel(channel_id: ChannelId, task_id: u32) -> bool {
     with_port_registry(|reg| {
         if let Some(port) = reg.get_by_listen_channel_mut(channel_id) {
             let sub = traits::Subscriber { task_id, generation: 0 };
-            port.subscribe(sub, traits::WakeReason::Accepted);
+            // SECURITY FIX: Don't silently drop - return error if full
+            port.subscribe(sub, traits::WakeReason::Accepted).is_ok()
+        } else {
+            false
         }
-    });
+    })
 }
 
 /// Unregister a waker for port events

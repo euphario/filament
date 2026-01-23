@@ -87,6 +87,9 @@ pub enum IpcError {
     /// No space for new ports
     NoPortSpace,
 
+    /// Subscriber set is full (cannot add more subscribers)
+    SubscribersFull,
+
     // ========================================================================
     // Handle Errors
     // ========================================================================
@@ -152,6 +155,7 @@ impl IpcError {
             IpcError::NoChannelSpace => -28,
             IpcError::NoPortSpace => -28,
             IpcError::PendingFull => -28,
+            IpcError::SubscribersFull => -28,
 
             // ENOTSUP (95) - Operation not supported
             IpcError::NotSupported => -95,
@@ -182,6 +186,7 @@ impl IpcError {
             IpcError::PendingFull => "pending full",
             IpcError::NoChannelSpace => "no channel space",
             IpcError::NoPortSpace => "no port space",
+            IpcError::SubscribersFull => "subscribers full",
             IpcError::StaleHandle { .. } => "stale handle",
             IpcError::InvalidHandle => "invalid handle",
             IpcError::NotSupported => "not supported",
@@ -238,6 +243,7 @@ impl core::fmt::Display for IpcError {
             IpcError::PendingFull => write!(f, "too many pending connections"),
             IpcError::NoChannelSpace => write!(f, "no space for new channels"),
             IpcError::NoPortSpace => write!(f, "no space for new ports"),
+            IpcError::SubscribersFull => write!(f, "subscriber set is full"),
             IpcError::StaleHandle { expected, got } => {
                 write!(f, "stale handle: expected gen {}, got {}", expected, got)
             }

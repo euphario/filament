@@ -162,7 +162,13 @@ pub fn alloc_high(size: usize) -> Result<u64, i64> {
         return Err(-1);
     }
 
-    let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // OVERFLOW CHECK: Align size safely
+    let aligned_size = size.checked_add(PAGE_SIZE - 1)
+        .map(|s| s & !(PAGE_SIZE - 1))
+        .ok_or_else(|| {
+            kerror!("dma_pool", "alloc_high_size_overflow"; size = size as u64);
+            -22i64 // EINVAL - size overflow
+        })?;
 
     let mut pool = DMA_POOL_HIGH.lock();
 
@@ -171,13 +177,19 @@ pub fn alloc_high(size: usize) -> Result<u64, i64> {
         return Err(-2);
     }
 
-    if pool.next_offset + aligned_size > DMA_POOL_HIGH_SIZE {
+    // OVERFLOW CHECK: Verify addition doesn't overflow
+    let new_offset = pool.next_offset.checked_add(aligned_size).ok_or_else(|| {
+        kerror!("dma_pool", "alloc_high_offset_overflow");
+        -22i64 // EINVAL
+    })?;
+
+    if new_offset > DMA_POOL_HIGH_SIZE {
         kerror!("dma_pool", "alloc_high_oom"; requested = aligned_size as u64, available = (DMA_POOL_HIGH_SIZE - pool.next_offset) as u64);
         return Err(-3);
     }
 
     let phys_addr = DMA_POOL_HIGH_BASE + pool.next_offset as u64;
-    pool.next_offset += aligned_size;
+    pool.next_offset = new_offset;
 
     kinfo!("dma_pool", "alloc_high_ok";
         size = aligned_size as u64,
@@ -198,8 +210,13 @@ pub fn alloc(size: usize) -> Result<u64, i64> {
         return Err(-1); // EINVAL
     }
 
-    // Round up to page size
-    let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // OVERFLOW CHECK: Round up to page size safely
+    let aligned_size = size.checked_add(PAGE_SIZE - 1)
+        .map(|s| s & !(PAGE_SIZE - 1))
+        .ok_or_else(|| {
+            kerror!("dma_pool", "alloc_size_overflow"; size = size as u64);
+            -22i64 // EINVAL - size overflow
+        })?;
 
     let mut pool = DMA_POOL.lock();
 
@@ -208,14 +225,20 @@ pub fn alloc(size: usize) -> Result<u64, i64> {
         return Err(-2); // ENODEV
     }
 
+    // OVERFLOW CHECK: Verify addition doesn't overflow
+    let new_offset = pool.next_offset.checked_add(aligned_size).ok_or_else(|| {
+        kerror!("dma_pool", "alloc_offset_overflow");
+        -22i64 // EINVAL
+    })?;
+
     // Check if we have enough space
-    if pool.next_offset + aligned_size > DMA_POOL_SIZE {
+    if new_offset > DMA_POOL_SIZE {
         kerror!("dma_pool", "alloc_oom"; requested = aligned_size as u64, available = (DMA_POOL_SIZE - pool.next_offset) as u64);
         return Err(-3); // ENOMEM
     }
 
     let phys_addr = DMA_POOL_BASE + pool.next_offset as u64;
-    pool.next_offset += aligned_size;
+    pool.next_offset = new_offset;
 
     kinfo!("dma_pool", "alloc_ok";
         size = aligned_size as u64,
@@ -232,8 +255,14 @@ pub fn alloc(size: usize) -> Result<u64, i64> {
 /// The physical memory is already allocated from the pool.
 /// This creates a virtual mapping in the process using device memory attributes.
 pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
+    // OVERFLOW CHECK: Verify address bounds safely
+    let end_addr = phys_addr.checked_add(size as u64).ok_or_else(|| {
+        kerror!("dma_pool", "map_addr_overflow"; addr = klog::hex64(phys_addr), size = size as u64);
+        -22i64 // EINVAL
+    })?;
+
     // Verify address is within pool
-    if phys_addr < DMA_POOL_BASE || phys_addr + size as u64 > DMA_POOL_END {
+    if phys_addr < DMA_POOL_BASE || end_addr > DMA_POOL_END {
         kerror!("dma_pool", "map_addr_invalid"; addr = klog::hex64(phys_addr));
         return Err(-1);
     }
@@ -258,8 +287,14 @@ pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i6
 /// Map high DMA pool memory into a process's address space (36-bit addresses)
 /// Uses special mapping that doesn't try to access memory from kernel space
 pub fn map_into_process_high(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
+    // OVERFLOW CHECK: Verify address bounds safely
+    let end_addr = phys_addr.checked_add(size as u64).ok_or_else(|| {
+        kerror!("dma_pool", "map_high_addr_overflow"; addr = klog::hex64(phys_addr), size = size as u64);
+        -22i64 // EINVAL
+    })?;
+
     // Verify address is within high pool
-    if phys_addr < DMA_POOL_HIGH_BASE || phys_addr + size as u64 > DMA_POOL_HIGH_END {
+    if phys_addr < DMA_POOL_HIGH_BASE || end_addr > DMA_POOL_HIGH_END {
         kerror!("dma_pool", "map_high_addr_invalid"; addr = klog::hex64(phys_addr));
         return Err(-1);
     }

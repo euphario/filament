@@ -524,6 +524,8 @@ impl PortRegistry {
     }
 
     /// Subscribe to port events
+    ///
+    /// Returns error if subscriber set is full (never silently drops).
     pub fn subscribe(&mut self, port_id: PortId, caller: TaskId, sub: Subscriber, filter: WakeReason) -> Result<(), IpcError> {
         let slot = self.find_by_id(port_id).ok_or(IpcError::InvalidPort { id: port_id })?;
 
@@ -533,8 +535,8 @@ impl PortRegistry {
             return Err(IpcError::port_not_owner(port_id, port.owner(), caller));
         }
 
-        port.subscribe(sub, filter);
-        Ok(())
+        // SECURITY FIX: Propagate error if subscriber set is full
+        port.subscribe(sub, filter).map_err(|()| IpcError::SubscribersFull)
     }
 
     /// Unregister port by channel ID (for cleanup)

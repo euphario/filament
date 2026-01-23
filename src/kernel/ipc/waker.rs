@@ -28,7 +28,6 @@
 
 use super::traits::{Subscriber, WakeReason};
 use crate::kernel::task;
-use crate::arch::aarch64::sync::IrqGuard;
 
 /// Maximum subscribers per object
 pub const MAX_SUBSCRIBERS: usize = 8;
@@ -244,20 +243,22 @@ pub fn wake(list: &WakeList, _reason: WakeReason) {
 }
 
 /// Wake a single subscriber
+///
+/// SERIALIZATION: Uses with_scheduler() which provides both:
+/// 1. IRQ disabling on this CPU
+/// 2. Proper serialization for SMP safety
 fn wake_one(sub: &Subscriber) {
-    let _guard = IrqGuard::new();
-
-    unsafe {
-        let sched = task::scheduler();
+    task::with_scheduler(|sched| {
         // Use unified wake function that handles IPC return values,
         // liveness state reset, and state validation
         sched.wake_by_pid(sub.task_id);
-    }
+    });
 }
 
 /// Wake a task by PID directly (for compatibility)
 ///
 /// Prefer using WakeList when possible.
+/// SERIALIZATION: Uses with_scheduler internally for SMP safety.
 pub fn wake_pid(pid: u32) {
     wake_one(&Subscriber::simple(pid));
 }

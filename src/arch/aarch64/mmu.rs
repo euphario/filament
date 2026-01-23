@@ -175,6 +175,9 @@ pub fn boot_ttbr1() -> u64 {
 /// The page table must be valid and properly set up
 pub unsafe fn switch_user_space(ttbr0_with_asid: u64) {
     core::arch::asm!(
+        // MEMORY BARRIER: Ensure all prior stores are visible before
+        // switching address spaces. Critical for SMP correctness.
+        "dsb sy",
         "msr ttbr0_el1, {0}",
         "isb",
         // No TLB flush - entries are ASID-tagged
