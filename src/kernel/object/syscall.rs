@@ -928,9 +928,16 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
 }
 
 fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    use crate::kernel::object_service::object_service;
+
     // Check state first
     if !p.is_listening() {
         return Error::PeerClosed.to_errno();
+    }
+
+    // Need at least 4 bytes for handle
+    if buf_ptr == 0 || buf_len < 4 {
+        return Error::InvalidArg.to_errno();
     }
 
     let port_id = p.port_id();
@@ -938,47 +945,36 @@ fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u
     // Accept connection from ipc
     match ipc::port_accept(port_id, task_id) {
         Ok((server_channel, client_pid)) => {
-            // Create a new ChannelObject for the accepted connection
+            // Create a new ChannelObject for the accepted connection via ObjectService
             let ch_obj = Object::Channel(super::ChannelObject::new(server_channel));
 
-            task::with_scheduler(|sched| {
-                let slot = task::current_slot();
-
-                let Some(task) = sched.task_mut(slot) else {
-                    return Error::BadHandle.to_errno();
-                };
-
-                // Need at least 4 bytes for handle
-                if buf_ptr == 0 || buf_len < 4 {
+            // Allocate handle via ObjectService (uses ObjectService.tables)
+            let handle = match object_service().with_table_mut(task_id, |table| {
+                table.alloc(ObjectType::Channel, ch_obj)
+            }) {
+                Ok(Some(h)) => h,
+                Ok(None) | Err(_) => {
+                    // Close the channel we couldn't wrap
                     let _ = ipc::close_channel(server_channel, task_id);
-                    return Error::InvalidArg.to_errno();
+                    return Error::NoSpace.to_errno();
                 }
+            };
 
-                match task.object_table.alloc(ObjectType::Channel, ch_obj) {
-                    Some(handle) => {
-                        // Write handle (always)
-                        let handle_bytes = handle.raw().to_le_bytes();
-                        if uaccess::copy_to_user(buf_ptr, &handle_bytes).is_err() {
-                            return Error::BadAddress.to_errno();
-                        }
+            // Write handle
+            let handle_bytes = handle.raw().to_le_bytes();
+            if uaccess::copy_to_user(buf_ptr, &handle_bytes).is_err() {
+                return Error::BadAddress.to_errno();
+            }
 
-                        // Write client_pid if space available
-                        if buf_len >= 8 {
-                            let pid_bytes = client_pid.to_le_bytes();
-                            if uaccess::copy_to_user(buf_ptr + 4, &pid_bytes).is_err() {
-                                return Error::BadAddress.to_errno();
-                            }
-                            return 8;
-                        }
-                        4 // Wrote 4 bytes (handle only)
-                    }
-                    None => {
-                        // Close the channel we couldn't wrap
-                        let _ = ipc::close_channel(server_channel, task_id);
-                        Error::NoSpace.to_errno()
-                    }
+            // Write client_pid if space available
+            if buf_len >= 8 {
+                let pid_bytes = client_pid.to_le_bytes();
+                if uaccess::copy_to_user(buf_ptr + 4, &pid_bytes).is_err() {
+                    return Error::BadAddress.to_errno();
                 }
-            })
+                return 8;
+            }
+            4 // Wrote 4 bytes (handle only)
         }
         Err(ipc::IpcError::NoPending) => Error::WouldBlock.to_errno(),
         Err(ipc::IpcError::Closed) => Error::PeerClosed.to_errno(),
