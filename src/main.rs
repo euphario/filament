@@ -810,6 +810,25 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 kernel::idle::idle_entry();
             }
 
+            // Check if the next task has saved kernel context (was blocked in kernel mode).
+            // If so, we can't eret to it - eret goes to userspace, but the task needs to
+            // resume its kernel execution. Fall through to idle which will properly
+            // context_switch to it.
+            let needs_context_switch = sched.task(next_slot)
+                .map(|t| t.context_saved)
+                .unwrap_or(false);
+
+            if needs_context_switch {
+                print_str_uart("  Next task needs context_switch, entering idle...\r\n");
+                kernel::task::set_current_slot(0);
+                if let Some(task) = sched.task_mut(0) {
+                    let _ = task.set_running();
+                }
+                // Enter idle loop - when the timer fires, normal scheduling will
+                // properly context_switch to the blocked task
+                kernel::idle::idle_entry();
+            }
+
             // Switch address space BEFORE changing current slot
             if let Some(next) = sched.task(next_slot) {
                 if let Some(ref addr_space) = next.address_space {
