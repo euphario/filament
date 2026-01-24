@@ -250,20 +250,21 @@ impl Consoled {
                 }
             };
 
-            // Dispatch based on which handle is ready
-            if event.handle == self.stdin_handle {
-                self.handle_stdin();
-            } else if let Some(port) = &self.port {
+            // Check for new connection on port
+            if let Some(port) = &self.port {
                 if event.handle == port.handle() {
                     self.handle_port();
                 }
             }
 
-            // Also check for shell if connected
-            if let Some(shell) = &self.shell {
-                if event.handle == shell.handle() {
-                    self.handle_shell();
-                }
+            // Always poll ALL sources after any event to avoid missing data.
+            // mux.wait() returns one event, but multiple handles may be ready.
+            // Process stdin (UART input -> shell)
+            self.handle_stdin();
+
+            // Process shell output (shell -> UART)
+            if self.shell.is_some() {
+                self.handle_shell();
             }
         }
     }
