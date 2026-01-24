@@ -863,7 +863,8 @@ fn read_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize, task_id:
     use super::TimerState;
     use crate::platform::current::timer;
 
-    let current_tick = timer::ticks();
+    // Use hardware counter - deadline is in counter units (set via deadline_ns)
+    let current_counter = timer::counter();
 
     match t.state() {
         TimerState::Disarmed => {
@@ -871,13 +872,13 @@ fn read_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize, task_id:
             Error::InvalidArg.to_errno()
         }
         TimerState::Armed => {
-            if current_tick >= t.deadline() {
+            if current_counter >= t.deadline() {
                 // Timer has fired - use transition method
                 let _ = t.fire();
 
                 // Write timestamp to buffer if provided
                 if buf_ptr != 0 && buf_len >= 8 {
-                    let ts_bytes = current_tick.to_le_bytes();
+                    let ts_bytes = current_counter.to_le_bytes();
                     if uaccess::copy_to_user(buf_ptr, &ts_bytes).is_err() {
                         return Error::BadAddress.to_errno();
                     }
@@ -885,7 +886,7 @@ fn read_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize, task_id:
 
                 // Handle recurring timer - re-arm with new deadline
                 if t.interval() > 0 {
-                    let new_deadline = current_tick + t.interval();
+                    let new_deadline = current_counter + t.interval();
                     t.arm(new_deadline, t.interval());
                 }
 
