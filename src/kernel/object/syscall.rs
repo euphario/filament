@@ -1616,6 +1616,18 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 if *task.state() == task::TaskState::Ready {
                     let _ = task.set_running();
                 }
+
+                // Reset liveness state - this proves the task is alive.
+                // Liveness uses implicit pong for EventLoop sleep: waking the task
+                // and waiting for a syscall. But since we're in a blocking syscall
+                // loop, we never make a NEW syscall - we just continue looping.
+                // Reset liveness here to prove we're responsive.
+                let current_counter = crate::platform::current::timer::counter();
+                task.last_activity_tick = current_counter;
+                if let crate::kernel::liveness::LivenessState::PingSent { channel: 0, .. } = task.liveness_state {
+                    task.liveness_state = crate::kernel::liveness::LivenessState::Normal;
+                }
+
                 task.state().name()
             } else {
                 "none"
