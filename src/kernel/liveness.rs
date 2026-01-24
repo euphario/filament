@@ -59,6 +59,14 @@ fn counter_to_ns(counter: u64) -> u64 {
     ((counter as u128 * 1_000_000_000) / freq as u128) as u64
 }
 
+/// Convert hardware counter value to milliseconds (for logging)
+fn counter_to_ms(counter: u64) -> u64 {
+    let freq = crate::platform::current::timer::frequency();
+    if freq == 0 { return 0; }
+    // counter * 1000 / freq
+    ((counter as u128 * 1000) / freq as u128) as u64
+}
+
 /// Special message type for liveness ping (kernel-internal)
 pub const MSG_TYPE_PING: u32 = 0xFFFE;
 /// Special message type for liveness pong (kernel-internal)
@@ -141,14 +149,14 @@ impl LivenessState {
                     crate::kdebug!("liveness", "ping_sent";
                         pid = pid as u64,
                         channel = *channel as u64,
-                        tick = *sent_at
+                        ms = counter_to_ms(*sent_at)
                     );
                 }
                 LivenessState::ClosePending { channel, closed_at } => {
                     crate::kinfo!("liveness", "close_pending";
                         pid = pid as u64,
                         channel = *channel as u64,
-                        tick = *closed_at
+                        ms = counter_to_ms(*closed_at)
                     );
                 }
             }
@@ -212,7 +220,7 @@ pub fn check_liveness(current_tick: u64) -> usize {
                     } else {
                         waiting_count += 1;
                     }
-                    let idle_ticks = current_tick.saturating_sub(task.last_activity_tick);
+                    let idle_ms = counter_to_ms(current_tick.saturating_sub(task.last_activity_tick));
                     let live_state = match task.liveness_state {
                         LivenessState::Normal => 0,
                         LivenessState::PingSent { .. } => 1,
@@ -221,14 +229,14 @@ pub fn check_liveness(current_tick: u64) -> usize {
                     // 0=unknown, 1=sleeping, 2=waiting
                     let wait_type = if task.state().is_sleeping() { 1 } else { 2 };
                     let _ = slot; // suppress unused variable warning
-                    crate::kdebug!("live", "task"; pid = task.id as u64, wait = wait_type as u64, idle = idle_ticks, state = live_state as u64);
+                    crate::kdebug!("live", "task"; pid = task.id as u64, wait = wait_type as u64, idle_ms = idle_ms, state = live_state as u64);
                 }
             }
         }
 
         // Log every ~30 seconds to confirm liveness checker is running
         if current_tick % (30 * 100) == 0 {
-            crate::kinfo!("liveness", "check"; tick = current_tick, sleeping = sleeping_count, waiting = waiting_count);
+            crate::kinfo!("liveness", "check"; ms = counter_to_ms(current_tick), sleeping = sleeping_count, waiting = waiting_count);
         }
 
         for (_slot, task_opt) in sched.iter_tasks_mut() {
