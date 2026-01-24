@@ -128,7 +128,7 @@ pub extern "C" fn kmain() -> ! {
         kinfo!("gic", "init_ok"; product = klog::hex32(product as u32), variant = variant, irqs = num_irqs);
 
         uart::enable_rx_interrupt();
-        kinfo!("gic", "uart_irq_enabled"; irq = plat::irq::UART0);
+        gic::enable_irq(plat::irq::UART0);
     }
 
     // Debug: check slots after GIC init
@@ -539,6 +539,117 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
     print_str_uart(" FAR=0x");
     print_hex_uart(far);
     print_str_uart("\r\n");
+
+    // Debug: Print TTBR0 and user sp for crash diagnosis
+    print_str_uart("  TTBR0=0x");
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack)); }
+    print_hex_uart(ttbr0);
+    print_str_uart(" SP_EL0=0x");
+    let sp_el0: u64;
+    unsafe { core::arch::asm!("mrs {0}, sp_el0", out(reg) sp_el0, options(nomem, nostack)); }
+    print_hex_uart(sp_el0);
+    print_str_uart("\r\n");
+
+    // Debug: Walk page tables to see what's mapped for FAR
+    print_str_uart("  Page table walk for FAR:\r\n");
+    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let l0_idx = ((far >> 39) & 0x1FF) as usize;
+    let l1_idx = ((far >> 30) & 0x1FF) as usize;
+    let l2_idx = ((far >> 21) & 0x1FF) as usize;
+    let l3_idx = ((far >> 12) & 0x1FF) as usize;
+    print_str_uart("    L0_phys=0x");
+    print_hex_uart(l0_phys);
+    print_str_uart(" indices=");
+    print_hex_uart(l0_idx as u64);
+    print_str_uart(",");
+    print_hex_uart(l1_idx as u64);
+    print_str_uart(",");
+    print_hex_uart(l2_idx as u64);
+    print_str_uart(",");
+    print_hex_uart(l3_idx as u64);
+    print_str_uart("\r\n");
+
+    // Read L0 entry
+    let l0_virt = crate::arch::aarch64::mmu::phys_to_virt(l0_phys);
+    let l0_entry = unsafe { core::ptr::read_volatile((l0_virt as *const u64).add(l0_idx)) };
+    print_str_uart("    L0[");
+    print_hex_uart(l0_idx as u64);
+    print_str_uart("]=0x");
+    print_hex_uart(l0_entry);
+    if (l0_entry & 0x3) == 0x3 { print_str_uart(" (TABLE)"); }
+    else if (l0_entry & 0x1) == 0 { print_str_uart(" (INVALID!)"); }
+    print_str_uart("\r\n");
+
+    if (l0_entry & 0x3) == 0x3 {
+        let l1_phys = l0_entry & 0x0000_FFFF_FFFF_F000;
+        let l1_virt = crate::arch::aarch64::mmu::phys_to_virt(l1_phys);
+        let l1_entry = unsafe { core::ptr::read_volatile((l1_virt as *const u64).add(l1_idx)) };
+        print_str_uart("    L1[");
+        print_hex_uart(l1_idx as u64);
+        print_str_uart("]=0x");
+        print_hex_uart(l1_entry);
+        if (l1_entry & 0x3) == 0x3 { print_str_uart(" (TABLE)"); }
+        else if (l1_entry & 0x3) == 0x1 { print_str_uart(" (BLOCK)"); }
+        else if (l1_entry & 0x1) == 0 { print_str_uart(" (INVALID!)"); }
+        print_str_uart("\r\n");
+
+        if (l1_entry & 0x3) == 0x3 {
+            let l2_phys = l1_entry & 0x0000_FFFF_FFFF_F000;
+            let l2_virt = crate::arch::aarch64::mmu::phys_to_virt(l2_phys);
+            let l2_entry = unsafe { core::ptr::read_volatile((l2_virt as *const u64).add(l2_idx)) };
+            print_str_uart("    L2[");
+            print_hex_uart(l2_idx as u64);
+            print_str_uart("]=0x");
+            print_hex_uart(l2_entry);
+            if (l2_entry & 0x3) == 0x3 { print_str_uart(" (TABLE)"); }
+            else if (l2_entry & 0x3) == 0x1 { print_str_uart(" (BLOCK)"); }
+            else if (l2_entry & 0x1) == 0 { print_str_uart(" (INVALID!)"); }
+            print_str_uart("\r\n");
+
+            if (l2_entry & 0x3) == 0x3 {
+                let l3_phys = l2_entry & 0x0000_FFFF_FFFF_F000;
+                let l3_virt = crate::arch::aarch64::mmu::phys_to_virt(l3_phys);
+
+                // DEBUG: Read L3 entry BEFORE cache invalidate
+                let l3_entry_cached = unsafe { core::ptr::read_volatile((l3_virt as *const u64).add(l3_idx)) };
+                print_str_uart("    L3[");
+                print_hex_uart(l3_idx as u64);
+                print_str_uart("] cached=0x");
+                print_hex_uart(l3_entry_cached);
+
+                // Invalidate cache line to see true memory value
+                let pte_addr = unsafe { (l3_virt as *const u64).add(l3_idx) } as u64;
+                unsafe {
+                    core::arch::asm!(
+                        "dc ivac, {addr}",  // Invalidate data cache by VA to PoC
+                        "dsb ish",
+                        addr = in(reg) pte_addr,
+                        options(nostack, preserves_flags)
+                    );
+                }
+
+                // Re-read AFTER cache invalidate
+                let l3_entry = unsafe { core::ptr::read_volatile((l3_virt as *const u64).add(l3_idx)) };
+                print_str_uart(" after_invalidate=0x");
+                print_hex_uart(l3_entry);
+                if (l3_entry & 0x3) == 0x3 { print_str_uart(" (PAGE)"); }
+                else if (l3_entry & 0x1) == 0 { print_str_uart(" (INVALID!)"); }
+                print_str_uart("\r\n");
+            }
+        }
+    }
+
+    // Debug: Print expected stack range
+    print_str_uart("  Expected stack: 0x7FFC0000-0x80000000 (256KB)\r\n");
+    if sp_el0 < 0x7FFC0000 || sp_el0 > 0x80000000 {
+        print_str_uart("  WARNING: SP_EL0 outside expected stack range!\r\n");
+    }
+    if far < 0x7FFC0000 || far > 0x80000000 {
+        print_str_uart("  WARNING: FAR outside expected stack range!\r\n");
+    } else {
+        print_str_uart("  FAR is within stack range - page table issue?\r\n");
+    }
 
     // Special handling for init process (devd)
     if is_init {

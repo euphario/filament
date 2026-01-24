@@ -1487,8 +1487,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
 
         // Phase 4: Events ready → return to userspace
         if event_count > 0 {
-            // Debug: log the event being returned
-            crate::kinfo!("mux", "return_event"; task_id = task_id, count = event_count, handle = events[0].handle.0);
+            // Clear stdin blocked registration so next poll can re-register
+            uart::clear_blocked_if_pid(task_id);
 
             let bytes = event_count * core::mem::size_of::<super::MuxEvent>();
             let event_bytes = unsafe {

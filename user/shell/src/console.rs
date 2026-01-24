@@ -7,6 +7,9 @@
 
 use userlib::ipc::Channel;
 
+/// Receive buffer size - holds one complete message from consoled
+const RX_BUFFER_SIZE: usize = 64;
+
 /// Console I/O state
 pub struct Console {
     /// Channel to consoled (if connected)
@@ -16,6 +19,12 @@ pub struct Console {
     pub rows: u16,
     /// Log split enabled
     pub log_split: bool,
+    /// Receive buffer for partial message handling
+    rx_buf: [u8; RX_BUFFER_SIZE],
+    /// Read position in rx_buf
+    rx_read: usize,
+    /// Write position in rx_buf (amount of data available)
+    rx_write: usize,
 }
 
 impl Console {
@@ -26,6 +35,9 @@ impl Console {
             cols: 80,
             rows: 24,
             log_split: false,
+            rx_buf: [0u8; RX_BUFFER_SIZE],
+            rx_read: 0,
+            rx_write: 0,
         }
     }
 
@@ -107,18 +119,35 @@ impl Console {
 
     /// Read a single byte (blocking)
     /// All input comes from consoled channel - no direct UART access
+    /// Uses internal buffer to handle message-oriented IPC where kernel
+    /// delivers complete messages that may contain multiple bytes.
     pub fn read_byte(&mut self) -> Option<u8> {
         use userlib::ipc::{Mux, MuxFilter};
         use userlib::error::SysError;
 
-        let channel = self.channel.as_mut()?;
+        // First, check if we have buffered data
+        if self.rx_read < self.rx_write {
+            let byte = self.rx_buf[self.rx_read];
+            self.rx_read += 1;
+            return Some(byte);
+        }
 
-        let mut buf = [0u8; 1];
+        // Buffer empty - need to receive more data
+        let channel = self.channel.as_mut()?;
 
         // Loop until we get data - kernel returns WouldBlock if nothing queued
         loop {
-            match channel.recv(&mut buf) {
-                Ok(n) if n > 0 => return Some(buf[0]),
+            // Reset buffer positions before receiving
+            self.rx_read = 0;
+            self.rx_write = 0;
+
+            match channel.recv(&mut self.rx_buf) {
+                Ok(n) if n > 0 => {
+                    // Got data - return first byte, keep rest in buffer
+                    self.rx_write = n;
+                    self.rx_read = 1;
+                    return Some(self.rx_buf[0]);
+                }
                 Ok(_) => return None, // EOF
                 Err(SysError::WouldBlock) => {
                     // No data yet - wait for channel to be readable using Mux

@@ -201,6 +201,12 @@ pub fn init() {
     // 8N1, enable FIFO
     uart_write(UARTLCR_H, LCR_WLEN_8 | LCR_FEN);
 
+    // Configure FIFO interrupt levels:
+    // RX FIFO: 1/8 full (2 bytes) - trigger interrupt on first few chars
+    // TX FIFO: 1/8 full (default)
+    // UARTIFLS bits [5:3] = RXIFLSEL, 0b000 = 1/8 full
+    uart_write(UARTIFLS, 0);
+
     // Enable UART, TX, and RX
     uart_write(UARTCR, CR_UARTEN | CR_TXE | CR_RXE);
 
@@ -297,7 +303,9 @@ pub fn flush() {
 /// Enable RX interrupt
 pub fn enable_rx_interrupt() {
     let imsc = uart_read(UARTIMSC);
-    uart_write(UARTIMSC, imsc | (1 << 4)); // RXIM
+    // Enable RXIM (bit 4) and RTIM (bit 6 - receive timeout)
+    // RTIM fires when data sits in FIFO for 32 bit periods without more data
+    uart_write(UARTIMSC, imsc | (1 << 4) | (1 << 6));
 }
 
 /// Handle UART RX interrupt - reads all available data into ring buffer
@@ -306,16 +314,17 @@ pub fn handle_rx_irq() -> bool {
     let mis = uart_read(UARTMIS);
     let mut received = false;
 
-    // RX interrupt
-    if (mis & (1 << 4)) != 0 {
+    // RX interrupt (RXIM bit 4) or receive timeout (RTIM bit 6)
+    if (mis & ((1 << 4) | (1 << 6))) != 0 {
         let mut rx = RX_BUFFER.lock();
         while (uart_read(UARTFR) & FR_RXFE) == 0 {
             let data = uart_read(UARTDR);
-            let _ = rx.push((data & 0xFF) as u8);
+            let byte = (data & 0xFF) as u8;
+            let _ = rx.push(byte);
             received = true;
         }
-        // Clear interrupt
-        uart_write(UARTICR, 1 << 4);
+        // Clear both RXIC and RTIC interrupts
+        uart_write(UARTICR, (1 << 4) | (1 << 6));
     }
 
     received
@@ -333,6 +342,15 @@ pub fn block_for_input(pid: u32) -> bool {
 /// Clear the blocked process (called when woken or process exits)
 pub fn clear_blocked() {
     CONSOLE_BLOCKED_PID.store(0, Ordering::Release);
+}
+
+/// Clear blocked PID only if it matches the given PID
+/// Used when a task returns from mux.wait() to allow re-registration
+pub fn clear_blocked_if_pid(pid: u32) {
+    let _ = CONSOLE_BLOCKED_PID.compare_exchange(
+        pid, 0,
+        Ordering::SeqCst, Ordering::SeqCst
+    );
 }
 
 /// Get the PID waiting for console input (0 if none)

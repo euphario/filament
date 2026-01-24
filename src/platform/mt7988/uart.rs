@@ -581,6 +581,15 @@ pub fn clear_blocked() {
     CONSOLE_BLOCKED_PID.store(0, Ordering::Release);
 }
 
+/// Clear blocked PID only if it matches the given PID
+/// Used when a task returns from mux.wait() to allow re-registration
+pub fn clear_blocked_if_pid(pid: u32) {
+    let _ = CONSOLE_BLOCKED_PID.compare_exchange(
+        pid, 0,
+        Ordering::SeqCst, Ordering::SeqCst
+    );
+}
+
 /// Get the PID waiting for console input (0 if none)
 pub fn get_blocked_pid() -> u32 {
     CONSOLE_BLOCKED_PID.load(Ordering::Acquire)
