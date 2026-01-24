@@ -738,12 +738,9 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
         if let Some(task) = sched.current_task_mut() {
             // Set wake timeout if specified
             let timeout = if timeout_ms > 0 {
-                // Timer runs at 100 Hz (10ms per tick), so timeout_ms / 10 = ticks
-                // Add 1 to round up and avoid 0-tick timeouts
-                let timeout_ticks = (timeout_ms as u64 + 9) / 10;
-                let current_tick = crate::platform::current::timer::ticks();
-                // Use saturating_add to prevent overflow (would cause immediate wake)
-                Some(current_tick.saturating_add(timeout_ticks))
+                // Use unified clock API - convert ms to ns, then to hardware counter deadline
+                let timeout_ns = timeout_ms as u64 * 1_000_000;
+                Some(crate::platform::current::timer::deadline_ns(timeout_ns))
             } else {
                 None // No timeout
             };
