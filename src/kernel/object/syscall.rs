@@ -127,6 +127,11 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         return read_mux_via_service(task_id, handle, buf_ptr, buf_len);
     }
 
+    // Handle Port specially - needs to allocate a new handle (can't nest locks)
+    if obj_type == ObjectType::Port {
+        return read_port_via_service(task_id, handle, buf_ptr, buf_len);
+    }
+
     // For other types, get mutable ref and dispatch
     let result = object_service().with_table_mut(task_id, |table| {
         let Some(entry) = table.get_mut(handle) else {
@@ -138,7 +143,7 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::Channel(ch) => read_channel(ch, buf_ptr, buf_len),
             Object::Timer(t) => read_timer(t, buf_ptr, buf_len, task_id),
             Object::Process(p) => read_process(p, buf_ptr, buf_len, task_id),
-            Object::Port(p) => read_port(p, buf_ptr, buf_len, task_id),
+            Object::Port(_) => unreachable!(), // Handled above
             Object::Shmem(s) => read_shmem(s, buf_ptr, buf_len, task_id),
             Object::Console(c) => read_console(c, buf_ptr, buf_len, task_id),
             Object::Klog(k) => read_klog(k, buf_ptr, buf_len),
@@ -964,59 +969,86 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
     Error::WouldBlock.to_errno()
 }
 
-fn read_port(p: &mut super::PortObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+/// Read from port via service - accepts connection and allocates channel handle
+///
+/// Must be called OUTSIDE any with_table_mut closure to avoid deadlock,
+/// since allocating the channel handle requires taking the tables lock.
+fn read_port_via_service(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
     use crate::kernel::object_service::object_service;
-
-    // Check state first
-    if !p.is_listening() {
-        return Error::PeerClosed.to_errno();
-    }
 
     // Need at least 4 bytes for handle
     if buf_ptr == 0 || buf_len < 4 {
         return Error::InvalidArg.to_errno();
     }
 
-    let port_id = p.port_id();
-
-    // Accept connection from ipc
-    match ipc::port_accept(port_id, task_id) {
-        Ok((server_channel, client_pid)) => {
-            // Create a new ChannelObject for the accepted connection via ObjectService
-            let ch_obj = Object::Channel(super::ChannelObject::new(server_channel));
-
-            // Allocate handle via ObjectService (uses ObjectService.tables)
-            let handle = match object_service().with_table_mut(task_id, |table| {
-                table.alloc(ObjectType::Channel, ch_obj)
-            }) {
-                Ok(Some(h)) => h,
-                Ok(None) | Err(_) => {
-                    // Close the channel we couldn't wrap
-                    let _ = ipc::close_channel(server_channel, task_id);
-                    return Error::NoSpace.to_errno();
-                }
+    // Phase 1: Get port_id and check state (quick lock)
+    let port_id = {
+        let result = object_service().with_table(task_id, |table| {
+            let Some(entry) = table.get(handle) else {
+                return Err(Error::BadHandle);
             };
-
-            // Write handle
-            let handle_bytes = handle.raw().to_le_bytes();
-            if uaccess::copy_to_user(buf_ptr, &handle_bytes).is_err() {
-                return Error::BadAddress.to_errno();
-            }
-
-            // Write client_pid if space available
-            if buf_len >= 8 {
-                let pid_bytes = client_pid.to_le_bytes();
-                if uaccess::copy_to_user(buf_ptr + 4, &pid_bytes).is_err() {
-                    return Error::BadAddress.to_errno();
+            match &entry.object {
+                Object::Port(p) => {
+                    if !p.is_listening() {
+                        return Err(Error::PeerClosed);
+                    }
+                    Ok(p.port_id())
                 }
-                return 8;
+                _ => Err(Error::BadHandle),
             }
-            4 // Wrote 4 bytes (handle only)
+        });
+        match result {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) => return e.to_errno(),
+            Err(_) => return Error::BadHandle.to_errno(),
         }
-        Err(ipc::IpcError::NoPending) => Error::WouldBlock.to_errno(),
-        Err(ipc::IpcError::Closed) => Error::PeerClosed.to_errno(),
-        Err(_) => Error::BadHandle.to_errno(),
+    };
+
+    crate::kinfo!("port", "read_port_accept"; port_id = port_id, task_id = task_id);
+
+    // Phase 2: Accept connection (no ObjectService lock held)
+    let (server_channel, client_pid) = match ipc::port_accept(port_id, task_id) {
+        Ok(result) => result,
+        Err(ipc::IpcError::NoPending) => return Error::WouldBlock.to_errno(),
+        Err(ipc::IpcError::Closed) => return Error::PeerClosed.to_errno(),
+        Err(_) => return Error::BadHandle.to_errno(),
+    };
+
+    // Phase 3: Allocate channel handle (takes lock again - safe, not nested)
+    let ch_obj = Object::Channel(super::ChannelObject::new(server_channel));
+    let new_handle = match object_service().with_table_mut(task_id, |table| {
+        table.alloc(ObjectType::Channel, ch_obj)
+    }) {
+        Ok(Some(h)) => h,
+        Ok(None) | Err(_) => {
+            // Close the channel we couldn't wrap
+            let _ = ipc::close_channel(server_channel, task_id);
+            return Error::NoSpace.to_errno();
+        }
+    };
+
+    // Phase 4: Write results to user
+    let handle_bytes = new_handle.raw().to_le_bytes();
+    if uaccess::copy_to_user(buf_ptr, &handle_bytes).is_err() {
+        return Error::BadAddress.to_errno();
     }
+
+    if buf_len >= 8 {
+        let pid_bytes = client_pid.to_le_bytes();
+        if uaccess::copy_to_user(buf_ptr + 4, &pid_bytes).is_err() {
+            return Error::BadAddress.to_errno();
+        }
+        return 8;
+    }
+    4 // Wrote 4 bytes (handle only)
+}
+
+// Legacy read_port - kept for reference but not used (replaced by read_port_via_service)
+#[allow(dead_code)]
+fn read_port(_p: &mut super::PortObject, _buf_ptr: u64, _buf_len: usize, _task_id: u32) -> i64 {
+    // This function is no longer used - Port reads go through read_port_via_service
+    // to avoid nested lock issues when allocating the channel handle.
+    Error::NotSupported.to_errno()
 }
 
 fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {

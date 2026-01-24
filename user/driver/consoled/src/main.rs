@@ -233,6 +233,10 @@ impl Consoled {
     pub fn run(&mut self) -> ! {
         clog!("running");
 
+        // Log handles for debugging
+        clog!("stdin={} port={}", self.stdin_handle.0,
+              self.port.as_ref().map(|p| p.handle().0).unwrap_or(0));
+
         loop {
             let mux = self.mux.as_ref().expect("consoled: mux not initialized");
             let wait_result = mux.wait();
@@ -255,7 +259,7 @@ impl Consoled {
                 }
             }
 
-            // Check if shell channel is ready
+            // Also check for shell if connected
             if let Some(shell) = &self.shell {
                 if event.handle == shell.handle() {
                     self.handle_shell();
@@ -329,19 +333,15 @@ impl Consoled {
         if let Some(port) = &self.port {
             match port.accept() {
                 Ok(channel) => {
-                    clog!("shell connected handle={}", channel.handle().0);
+                    clog!("shell connected");
 
                     // Drain any stale UART input before shell starts
                     let mut buf = [0u8; 64];
-                    let mut drained = 0usize;
                     loop {
                         match syscall::read(self.stdin_handle, &mut buf) {
-                            Ok(n) if n > 0 => drained += n,
+                            Ok(n) if n > 0 => {}
                             _ => break,
                         }
-                    }
-                    if drained > 0 {
-                        clog!("drained {} bytes on shell connect", drained);
                     }
 
                     // Add shell channel to mux

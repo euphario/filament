@@ -230,8 +230,14 @@ impl Mux {
                 core::mem::size_of::<MuxEvent>(),
             )
         };
-        read(self.handle, buf)?;
-        Ok(event)
+        // Loop until we get a valid event (kernel should always return 1+ if no error)
+        loop {
+            let n = read(self.handle, buf)?;
+            if n > 0 {
+                return Ok(event);
+            }
+            // Kernel returned 0 events - retry (this shouldn't normally happen)
+        }
     }
 }
 

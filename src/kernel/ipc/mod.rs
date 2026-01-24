@@ -279,8 +279,8 @@ pub fn port_register(name: &[u8], owner: u32) -> Result<(u32, ChannelId), IpcErr
 }
 
 /// Connect to a port
-/// Returns (client_channel, subscribers_to_wake)
-pub fn port_connect(name: &[u8], client: u32) -> Result<(ChannelId, waker::WakeList), IpcError> {
+/// Returns (client_channel, subscribers_to_wake, port_owner_id)
+pub fn port_connect(name: &[u8], client: u32) -> Result<(ChannelId, waker::WakeList, u32), IpcError> {
     with_both_tables(|chan_table, port_reg| {
         port_reg.connect(name, client, chan_table)
     })

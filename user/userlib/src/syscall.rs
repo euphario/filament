@@ -226,6 +226,11 @@ pub fn klog(level: LogLevel, msg: &[u8]) {
     let _ = syscall3(sys::KLOG, level as u64, msg.as_ptr() as u64, msg.len() as u64);
 }
 
+/// Raw debug write to UART (bypasses klog buffer)
+pub fn debug_write(msg: &[u8]) {
+    let _ = syscall2(sys::DEBUG_WRITE, msg.as_ptr() as u64, msg.len() as u64);
+}
+
 // ============================================================================
 // Debug / Admin (consider moving to services)
 // ============================================================================
