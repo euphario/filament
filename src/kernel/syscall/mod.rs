@@ -385,7 +385,7 @@ pub extern "C" fn syscall_handler_rust(
         let slot = super::task::current_slot();
         let sched = super::task::scheduler();
         if let Some(task) = sched.task_mut(slot) {
-            task.last_activity_tick = crate::platform::current::timer::ticks();
+            task.last_activity_tick = crate::platform::current::timer::counter();
 
             // Reset liveness state if we're in PingSent with channel=0 (implicit pong)
             // The syscall itself IS the pong - proves the task is alive and responsive

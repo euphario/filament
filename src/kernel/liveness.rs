@@ -20,10 +20,10 @@
 //! ## Probe Mechanism (for Sleeping)
 //!
 //! For sleeping tasks:
-//! - After PING_INTERVAL_TICKS of idle, probe the task
+//! - After PING_INTERVAL_NS of idle, probe the task
 //! - For EventLoop sleep: wake the task (implicit pong via next syscall)
 //! - For IPC sleep: send MSG_TYPE_PING message to channel
-//! - If no response after PING_TIMEOUT_TICKS → escalate
+//! - If no response after PING_TIMEOUT_NS → escalate
 //!
 //! ## Timeouts
 //!
@@ -39,17 +39,25 @@
 use super::ipc::{Message, MessageHeader, MessageType, MAX_INLINE_PAYLOAD, waker, WakeReason};
 use super::task::SleepReason;
 
-/// How often to check liveness (in ticks, ~100 ticks/sec)
+/// How often to check liveness (in timer IRQs, ~100/sec)
 pub const LIVENESS_CHECK_INTERVAL: u64 = 100; // Every ~1 second
 
-/// How long a process can be idle-waiting before we ping it (30 seconds)
-pub const PING_INTERVAL_TICKS: u64 = 30 * 100;
+/// How long a process can be idle-waiting before we ping it (in nanoseconds)
+pub const PING_INTERVAL_NS: u64 = 30 * 1_000_000_000; // 30 seconds
 
-/// How long to wait for pong response (10 seconds)
-pub const PING_TIMEOUT_TICKS: u64 = 10 * 100;
+/// How long to wait for pong response (in nanoseconds)
+pub const PING_TIMEOUT_NS: u64 = 10 * 1_000_000_000; // 10 seconds
 
-/// How long after closing channel before killing (10 seconds)
-pub const KILL_TIMEOUT_TICKS: u64 = 10 * 100;
+/// How long after closing channel before killing (in nanoseconds)
+pub const KILL_TIMEOUT_NS: u64 = 10 * 1_000_000_000; // 10 seconds
+
+/// Convert hardware counter value to nanoseconds
+fn counter_to_ns(counter: u64) -> u64 {
+    let freq = crate::platform::current::timer::frequency();
+    if freq == 0 { return 0; }
+    // counter * 1_000_000_000 / freq, avoiding overflow
+    ((counter as u128 * 1_000_000_000) / freq as u128) as u64
+}
 
 /// Special message type for liveness ping (kernel-internal)
 pub const MSG_TYPE_PING: u32 = 0xFFFE;
@@ -246,11 +254,15 @@ pub fn check_liveness(current_tick: u64) -> usize {
 
                 let sleep_reason = task.state().sleep_reason();
 
+                // Convert counter values to nanoseconds for comparison
+                let current_ns = counter_to_ns(current_tick);
+
                 match task.liveness_state {
                     LivenessState::Normal => {
                         // Check if task has been sleeping too long
                         let wait_started = task.last_activity_tick;
-                        if wait_started > 0 && current_tick > wait_started + PING_INTERVAL_TICKS {
+                        let wait_started_ns = counter_to_ns(wait_started);
+                        if wait_started > 0 && current_ns > wait_started_ns + PING_INTERVAL_NS {
                             // For EventLoop sleep (handle_wait), use implicit pong:
                             // Just wake the task - its next syscall proves it's alive
                             if matches!(sleep_reason, Some(SleepReason::EventLoop)) {
@@ -286,7 +298,8 @@ pub fn check_liveness(current_tick: u64) -> usize {
 
                     LivenessState::PingSent { channel, sent_at } => {
                         // Check if ping timed out
-                        if current_tick > sent_at + PING_TIMEOUT_TICKS {
+                        let sent_at_ns = counter_to_ns(sent_at);
+                        if current_ns > sent_at_ns + PING_TIMEOUT_NS {
                             if channel == 0 {
                                 // Implicit pong case (handle_wait) - no channel to close
                                 // Task was woken but didn't call any syscall - skip to kill
@@ -314,7 +327,8 @@ pub fn check_liveness(current_tick: u64) -> usize {
                     LivenessState::ClosePending { channel: _, closed_at } => {
                         // Check if task recovered (should have woken up from channel close)
                         // If still blocked after timeout, kill it
-                        if current_tick > closed_at + KILL_TIMEOUT_TICKS {
+                        let closed_at_ns = counter_to_ns(closed_at);
+                        if current_ns > closed_at_ns + KILL_TIMEOUT_NS {
                             // Task didn't recover - kill it
                             let pid = task.id;
                             let is_init = task.is_init;
