@@ -435,8 +435,8 @@ impl PortRegistry {
     /// Connect to a port by name
     ///
     /// Creates a channel pair and adds a pending connection.
-    /// Returns (client_channel, wake_list).
-    pub fn connect(&mut self, name: &[u8], client: TaskId, channel_table: &mut ChannelTable) -> Result<(ChannelId, WakeList), IpcError> {
+    /// Returns (client_channel, wake_list, port_owner).
+    pub fn connect(&mut self, name: &[u8], client: TaskId, channel_table: &mut ChannelTable) -> Result<(ChannelId, WakeList, TaskId), IpcError> {
         // Find port
         let slot = self.find_by_name(name).ok_or(IpcError::PortNotFound)?;
 
@@ -456,7 +456,7 @@ impl PortRegistry {
         let conn = PendingConnection::new(client, client_ch, server_ch, now);
         let wake_list = port.add_pending(conn)?;
 
-        Ok((client_ch, wake_list))
+        Ok((client_ch, wake_list, server_owner))
     }
 
     /// Accept a pending connection on a port

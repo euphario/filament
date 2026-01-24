@@ -551,6 +551,7 @@ impl ObjectService {
         let can_create = crate::kernel::task::with_scheduler(|sched| {
             sched.task(slot).map(|t| t.can_create_port()).unwrap_or(false)
         });
+
         if !can_create {
             return Err(ObjError::OutOfHandles);
         }
@@ -564,6 +565,7 @@ impl ObjectService {
 
         // Allocate handle in ObjectService tables
         let mut tables = self.tables.lock();
+
         let table = tables[slot].as_mut().ok_or_else(|| {
             let _ = ipc::port_unregister(port_id, task_id);
             ObjError::TaskNotFound
@@ -745,14 +747,42 @@ impl ObjectService {
         }
 
         // Connect to port via IPC backend (no lock held)
-        let (client_channel, wake_list) = ipc::port_connect(port_name, task_id)
+        let (client_channel, wake_list, port_owner) = ipc::port_connect(port_name, task_id)
             .map_err(|e| match e {
                 ipc::IpcError::PortNotFound => ObjError::BadHandle,
                 _ => ObjError::InvalidArg,
             })?;
 
-        // Wake the server waiting for connections
+        // Wake the server waiting for connections (IPC backend subscribers)
         waker::wake(&wake_list, ipc::WakeReason::Accepted);
+
+        // Also wake PortObject subscriber if the port owner is watching via Mux
+        // (The PortObject.subscriber is set by read_mux_via_service)
+        let port_subscriber = if let Some(owner_slot) = slot_from_task_id(port_owner) {
+            let tables = self.tables.lock();
+            let mut found_sub = None;
+            if let Some(Some(owner_table)) = tables.get(owner_slot) {
+                // Find the PortObject for this port name and get its subscriber
+                for (_handle, entry) in owner_table.iter() {
+                    if let Object::Port(ref port_obj) = entry.object {
+                        if port_obj.name_matches(port_name) {
+                            found_sub = port_obj.subscriber();
+                            break;
+                        }
+                    }
+                }
+            }
+            found_sub
+        } else {
+            None
+        };
+        // Wake outside the lock
+        if let Some(sub) = port_subscriber {
+            crate::kinfo!("objsvc", "port_wake"; port_owner = port_owner, sub_task = sub.task_id);
+            waker::wake_pid(sub.task_id);
+        } else {
+            crate::kwarn!("objsvc", "port_no_sub"; port_owner = port_owner);
+        }
 
         // Allocate handle in ObjectService tables
         let mut tables = self.tables.lock();

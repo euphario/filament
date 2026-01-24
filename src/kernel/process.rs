@@ -161,8 +161,9 @@ pub struct Process {
     pub name: [u8; 32],
 }
 
-/// Kernel stack size per process (8KB)
-const KERNEL_STACK_SIZE: usize = 8 * 1024;
+/// Kernel stack size per process (64KB)
+/// Must be large enough for syscall handlers that create large local variables
+const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 /// Maximum number of processes
 const MAX_PROCESSES: usize = 64;

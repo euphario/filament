@@ -67,7 +67,7 @@
 //! 3. **Separation**: syscall.rs → sched.rs → task.rs (layered responsibility)
 //! 4. **IRQ-safe**: All operations use spinlocks, safe from interrupt context
 
-use crate::{kwarn, kerror, kinfo, kdebug};
+use crate::{kerror, kdebug};
 use super::task::{self, TaskState, Priority, current_slot, set_current_slot};
 use super::task::{update_current_task_globals, SYSCALL_SWITCHED_TASK};
 use core::sync::atomic::Ordering;
@@ -359,6 +359,7 @@ unsafe fn switch_to_task(
     // Current task is runnable (Running/Ready) and target doesn't need context restore.
     // This is the preemption case - simple variable-based switch.
     // The actual switch happens at eret using trap frames.
+
     set_current_slot(to_slot);
 
     if let Some(next) = sched.task_mut(to_slot) {

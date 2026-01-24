@@ -132,8 +132,10 @@ impl CpuContext {
 /// Task ID type
 pub type TaskId = u32;
 
-/// Stack size for kernel tasks (16KB)
-pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
+/// Stack size for kernel tasks (64KB)
+/// Needs to be large enough for functions that create large local variables
+/// (e.g., MessageQueue is ~4800 bytes, Channel is ~5000 bytes)
+pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 /// Guard page size (4KB) - placed at bottom of kernel stack
 pub const GUARD_PAGE_SIZE: usize = 4096;
