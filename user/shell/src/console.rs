@@ -43,12 +43,12 @@ impl Console {
                         // Add channel to mux, wait for readable
                         if mux.add(channel.handle(), MuxFilter::Readable).is_ok() {
                             // Block until channel is readable
-                            let _ = mux.wait();
-
-                            // Now read the response
-                            let mut buf = [0u8; 32];
-                            if let Ok(n) = channel.recv(&mut buf) {
-                                self.parse_size_msg(&buf[..n]);
+                            if mux.wait().is_ok() {
+                                // Now read the response
+                                let mut buf = [0u8; 32];
+                                if let Ok(n) = channel.recv(&mut buf) {
+                                    self.parse_size_msg(&buf[..n]);
+                                }
                             }
                         }
                     }
@@ -58,7 +58,7 @@ impl Console {
                 true
             }
             Err(_) => {
-                // Can't connect to consoled, use direct UART
+                // Can't connect to consoled
                 false
             }
         }
@@ -108,17 +108,32 @@ impl Console {
     /// Read a single byte (blocking)
     /// All input comes from consoled channel - no direct UART access
     pub fn read_byte(&mut self) -> Option<u8> {
+        use userlib::ipc::{Mux, MuxFilter};
+        use userlib::error::SysError;
+
         let channel = self.channel.as_mut()?;
 
         let mut buf = [0u8; 1];
-        // Kernel blocks internally until data available
-        match channel.recv(&mut buf) {
-            Ok(n) if n > 0 => Some(buf[0]),
-            Ok(_) => None, // EOF
-            Err(_) => {
-                // Connection lost
-                self.channel = None;
-                None
+
+        // Loop until we get data - kernel returns WouldBlock if nothing queued
+        loop {
+            match channel.recv(&mut buf) {
+                Ok(n) if n > 0 => return Some(buf[0]),
+                Ok(_) => return None, // EOF
+                Err(SysError::WouldBlock) => {
+                    // No data yet - wait for channel to be readable using Mux
+                    if let Ok(mux) = Mux::new() {
+                        if mux.add(channel.handle(), MuxFilter::Readable).is_ok() {
+                            let _ = mux.wait(); // Block until readable
+                        }
+                    }
+                    // Loop back and try recv again
+                }
+                Err(_) => {
+                    // Connection lost (not WouldBlock)
+                    self.channel = None;
+                    return None;
+                }
             }
         }
     }
@@ -127,8 +142,17 @@ impl Console {
     /// All output goes through consoled channel - no direct UART access
     pub fn write(&self, data: &[u8]) {
         if let Some(channel) = &self.channel {
-            // Write to consoled channel only
-            let _ = channel.send(data);
+            // Write to consoled channel only - retry if queue full
+            loop {
+                match channel.send(data) {
+                    Ok(()) => break,
+                    Err(userlib::error::SysError::WouldBlock) => {
+                        // Queue full - yield and retry
+                        userlib::syscall::sleep_us(100);
+                    }
+                    Err(_) => break, // Other error, give up
+                }
+            }
         }
         // If not connected, output is silently dropped
         // Shell must connect to consoled before producing output
