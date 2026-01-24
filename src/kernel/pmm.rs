@@ -39,7 +39,7 @@
 
 use crate::{kinfo, kwarn, kdebug, print_direct, klog};
 use crate::arch::aarch64::mmu;
-use crate::platform::current::{DRAM_BASE, DRAM_END};
+use crate::platform::current::{DRAM_BASE, DRAM_END, KERNEL_PHYS_BASE};
 use super::lock::SpinLock;
 
 /// Page size (4KB) - re-exported for other modules
@@ -47,9 +47,6 @@ pub const PAGE_SIZE: usize = crate::platform::current::PAGE_SIZE;
 
 /// Sentinel value for end of free list
 const FREE_LIST_END: u32 = u32::MAX;
-
-/// Kernel physical load address (must match linker script)
-const KERNEL_PHYS_BASE: usize = 0x46000000;
 
 // Linker symbols for kernel boundaries
 extern "C" {
@@ -236,6 +233,10 @@ impl PhysicalMemoryManager {
         let free_mb = self.free_pages * PAGE_SIZE / (1024 * 1024);
         let total_mb = total_pages * PAGE_SIZE / (1024 * 1024);
         let meta_mb = frames_pages * PAGE_SIZE / (1024 * 1024);
+
+        // Debug: direct UART output
+        print_direct!("PMM: {} free pages, {} MB free\r\n", self.free_pages, free_mb);
+
         kinfo!("pmm", "init_ok";
             total_pages = total_pages as u64,
             total_mb = total_mb as u64,
@@ -274,7 +275,6 @@ impl PhysicalMemoryManager {
     /// Allocate a single page (O(1))
     pub fn alloc_page(&mut self) -> Option<usize> {
         let page_idx = self.pop_free_list()?;
-
         self.frame_mut(page_idx).state = PageState::Used;
         self.frame_mut(page_idx).ref_count = 1;
         self.free_pages -= 1;

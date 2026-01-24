@@ -130,7 +130,7 @@ impl LivenessState {
                     crate::kinfo!("liveness", "state_reset"; pid = pid as u64, from = from_code as u64);
                 }
                 LivenessState::PingSent { channel, sent_at } => {
-                    crate::kinfo!("liveness", "ping_sent";
+                    crate::kdebug!("liveness", "ping_sent";
                         pid = pid as u64,
                         channel = *channel as u64,
                         tick = *sent_at

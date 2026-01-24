@@ -43,8 +43,12 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         return Error::InvalidArg.to_errno();
     };
 
+    // DEBUG: Check L3 canary before open dispatch
+    let l3_canary_va = crate::arch::aarch64::mmu::phys_to_virt(0x4033fff8);
+    let canary_before = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
+
     // Dispatch to type-specific open
-    match obj_type {
+    let result = match obj_type {
         ObjectType::Channel => open_channel(params_ptr, params_len),
         ObjectType::Timer => open_timer(params_ptr, params_len),
         ObjectType::Process => open_process(params_ptr, params_len),
@@ -61,7 +65,15 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         ObjectType::PciDevice => open_pci_device(params_ptr, params_len),
         ObjectType::Msi => open_msi(params_ptr, params_len),
         ObjectType::BusList => open_bus_list(params_ptr, params_len),
+    };
+
+    // DEBUG: Check L3 canary after open dispatch
+    let canary_after = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
+    if canary_before != 0 && canary_after == 0 {
+        crate::print_direct!("[CORRUPT] L3[511] corrupted by open type={:?}\r\n", obj_type);
     }
+
+    result
 }
 
 // ============================================================================
@@ -408,6 +420,10 @@ fn open_process(params_ptr: u64, params_len: usize) -> i64 {
 }
 
 fn open_port(params_ptr: u64, params_len: usize) -> i64 {
+    // DEBUG: Canary check
+    let l3_canary_va = crate::arch::aarch64::mmu::phys_to_virt(0x4033fff8);
+    let canary0 = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
+
     // params contains the port name
     if params_len == 0 || params_len > 32 {
         return Error::InvalidArg.to_errno();
@@ -417,6 +433,12 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
     let mut name_buf = [0u8; 32];
     if uaccess::copy_from_user(&mut name_buf[..params_len], params_ptr).is_err() {
         return Error::BadAddress.to_errno();
+    }
+
+    // DEBUG: Canary check after copy_from_user
+    let canary1 = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
+    if canary0 != 0 && canary1 == 0 {
+        crate::print_direct!("[CORRUPT] L3[511] corrupted by open_port copy_from_user\r\n");
     }
 
     // Get current task ID
@@ -429,12 +451,26 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
         return Error::BadHandle.to_errno();
     };
 
+    // DEBUG: Canary check after with_scheduler
+    let canary2 = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
+    if canary1 != 0 && canary2 == 0 {
+        crate::print_direct!("[CORRUPT] L3[511] corrupted by open_port with_scheduler\r\n");
+    }
+
     // Delegate to ObjectService
     use crate::kernel::object_service::object_service;
-    match object_service().open_port(task_id, &name_buf[..params_len]) {
+    let result = match object_service().open_port(task_id, &name_buf[..params_len]) {
         Ok(handle) => handle.raw() as i64,
         Err(e) => e.to_errno(),
+    };
+
+    // DEBUG: Canary check after object_service
+    let canary3 = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
+    if canary2 != 0 && canary3 == 0 {
+        crate::print_direct!("[CORRUPT] L3[511] corrupted by open_port object_service\r\n");
     }
+
+    result
 }
 
 fn open_shmem(params_ptr: u64, params_len: usize) -> i64 {
@@ -1235,6 +1271,7 @@ fn read_bus_list(b: &mut super::BusListObject, buf_ptr: u64, buf_len: usize) -> 
 /// Mux read via ObjectService - blocks until events are ready
 ///
 /// Uses ObjectService's tables instead of task.object_table.
+/// Loops until events are ready, sleeping between attempts.
 fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
     use super::types::filter;
     use crate::kernel::ipc::traits::Subscriber;
@@ -1246,193 +1283,345 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         generation: task::Scheduler::generation_from_pid(task_id),
     };
 
-    // Phase 1: Collect watch list and channel IDs from ObjectService tables
-    let watches: [(Option<super::MuxWatch>, u32); 16] = {
-        let result = object_service().with_table(task_id, |table| {
-            let Some(mux_entry) = table.get(mux_handle) else {
-                return Err(Error::BadHandle);
-            };
-            let Object::Mux(ref mux) = mux_entry.object else {
-                return Err(Error::BadHandle);
-            };
+    // Main loop - keep trying until we have events
+    loop {
+        crate::kdebug!("mux", "poll_start"; task_id = task_id);
 
-            let mut w = [(None, 0u32); 16];
-            for i in 0..16 {
-                if let Some(watch) = mux.watches[i] {
-                    let watched_handle = Handle::from_raw(watch.handle);
-                    let channel_id = if let Some(entry) = table.get(watched_handle) {
-                        if let Object::Channel(ch) = &entry.object { ch.channel_id() } else { 0 }
-                    } else { 0 };
-                    w[i] = (Some(watch), channel_id);
+        // Phase 1: Collect watch list and channel IDs from ObjectService tables
+        let watches: [(Option<super::MuxWatch>, u32); 16] = {
+            let result = object_service().with_table(task_id, |table| {
+                let Some(mux_entry) = table.get(mux_handle) else {
+                    return Err(Error::BadHandle);
+                };
+                let Object::Mux(ref mux) = mux_entry.object else {
+                    return Err(Error::BadHandle);
+                };
+
+                let mut w = [(None, 0u32); 16];
+                for i in 0..16 {
+                    if let Some(watch) = mux.watches[i] {
+                        let watched_handle = Handle::from_raw(watch.handle);
+                        let channel_id = if let Some(entry) = table.get(watched_handle) {
+                            if let Object::Channel(ch) = &entry.object { ch.channel_id() } else { 0 }
+                        } else { 0 };
+                        w[i] = (Some(watch), channel_id);
+                    }
+                }
+                Ok(w)
+            });
+
+            match result {
+                Ok(Ok(w)) => w,
+                Ok(Err(e)) => return e.to_errno(),
+                Err(_) => return Error::BadHandle.to_errno(),
+            }
+        };
+
+        // Phase 2+3: Subscribe AND poll in single lock to avoid race
+        //
+        // CRITICAL: Subscribe and poll must happen atomically. If we subscribe,
+        // release the lock, then poll separately, an event can arrive between
+        // subscribe and poll. The waker will find our subscriber but we're not
+        // blocked yet, so the wake fails. Then we poll, find nothing, and block
+        // - but we already missed the wake.
+        //
+        // By doing both in a single locked section, either:
+        // - The event arrives BEFORE we subscribe → poll will see it
+        // - The event arrives AFTER we poll → we'll be blocked and wake succeeds
+        let subscribe_and_poll_result = object_service().with_table_mut(task_id, |table| {
+            // Subscribe to mux itself
+            if let Some(mux_entry) = table.get_mut(mux_handle) {
+                if let Object::Mux(ref mut mux) = mux_entry.object {
+                    mux.subscriber = Some(subscriber);
                 }
             }
-            Ok(w)
-        });
 
-        match result {
-            Ok(Ok(w)) => w,
-            Ok(Err(e)) => return e.to_errno(),
-            Err(_) => return Error::BadHandle.to_errno(),
-        }
-    };
+            // Compute earliest timer deadline for tickless wake
+            let mut earliest_deadline: u64 = u64::MAX;
 
-    // Phase 2: Subscribe BEFORE polling (avoid race) - needs mutable access
-    let subscribe_result = object_service().with_table_mut(task_id, |table| {
-        if let Some(mux_entry) = table.get_mut(mux_handle) {
-            if let Object::Mux(ref mut mux) = mux_entry.object {
-                mux.subscriber = Some(subscriber);
+            // Subscribe to each watched object
+            for watch_opt in &watches {
+                let Some(watch) = watch_opt.0 else { continue };
+                let channel_id = watch_opt.1;
+                let watched_handle = Handle::from_raw(watch.handle);
+
+                if let Some(entry) = table.get_mut(watched_handle) {
+                    match &mut entry.object {
+                        Object::Channel(_) => {
+                            if channel_id != 0 {
+                                let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
+                            }
+                        }
+                        Object::Port(p) => { p.subscriber = Some(subscriber); }
+                        Object::Timer(t) => {
+                            t.subscriber = Some(subscriber);
+                            if t.deadline > 0 && t.deadline < earliest_deadline {
+                                earliest_deadline = t.deadline;
+                            }
+                        }
+                        Object::Console(c) => {
+                            c.subscriber = Some(subscriber);
+                            if matches!(c.console_type, ConsoleType::Stdin) {
+                                uart::block_for_input(task_id);
+                            }
+                        }
+                        Object::Process(p) => { p.subscriber = Some(subscriber); }
+                        _ => {}
+                    }
+                }
             }
-        }
 
-        // Compute earliest timer deadline for tickless wake
-        let mut earliest_deadline: u64 = u64::MAX;
+            // Now poll for ready events (still holding the lock)
+            // We use mutable access so we can transition timer state when fired
+            let mut events = [super::MuxEvent::empty(); 16];
+            let mut event_count = 0usize;
+            let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
+            let current_tick = crate::platform::current::timer::counter();
 
-        for watch_opt in &watches {
-            let Some(watch) = watch_opt.0 else { continue };
-            let channel_id = watch_opt.1;
-            let watched_handle = Handle::from_raw(watch.handle);
+            for watch_opt in &watches {
+                if event_count >= max_events { break; }
+                let Some(watch) = watch_opt.0 else { continue };
+                let channel_id = watch_opt.1;
+                let watched_handle = Handle::from_raw(watch.handle);
 
-            if let Some(entry) = table.get_mut(watched_handle) {
-                match &mut entry.object {
+                let Some(entry) = table.get_mut(watched_handle) else { continue };
+
+                let ready = match &mut entry.object {
                     Object::Channel(_) => {
-                        if channel_id != 0 {
-                            let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
+                        if (watch.filter & filter::READABLE) != 0 {
+                            channel_id != 0 && ipc::channel_has_messages(channel_id)
+                        } else if (watch.filter & filter::CLOSED) != 0 {
+                            channel_id == 0
+                        } else {
+                            false
                         }
                     }
-                    Object::Port(p) => { p.subscriber = Some(subscriber); }
+                    Object::Port(p) => {
+                        (watch.filter & filter::READABLE) != 0 && ipc::port_has_pending(p.port_id())
+                    }
                     Object::Timer(t) => {
-                        t.subscriber = Some(subscriber);
-                        if t.deadline > 0 && t.deadline < earliest_deadline {
-                            earliest_deadline = t.deadline;
+                        if (watch.filter & filter::READABLE) != 0 {
+                            // Use timer's check method to handle state transition
+                            // If timer is Armed and expired, it transitions to Fired
+                            // and we return ready. If already Fired, also ready.
+                            // If Disarmed or not expired, not ready.
+                            if t.state() == super::TimerState::Armed && crate::platform::current::timer::is_expired(t.deadline()) {
+                                // Transition to Fired and immediately consume for recurring
+                                // This ensures we don't report the same event twice
+                                t.fire();
+                                t.consume(current_tick);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
                         }
                     }
                     Object::Console(c) => {
-                        c.subscriber = Some(subscriber);
-                        if matches!(c.console_type, ConsoleType::Stdin) {
-                            uart::block_for_input(task_id);
+                        match c.console_type {
+                            ConsoleType::Stdin => (watch.filter & filter::READABLE) != 0 && uart::rx_buffer_has_data(),
+                            ConsoleType::Stdout | ConsoleType::Stderr => (watch.filter & filter::WRITABLE) != 0,
                         }
                     }
-                    Object::Process(p) => { p.subscriber = Some(subscriber); }
-                    _ => {}
+                    Object::Process(p) => {
+                        (watch.filter & filter::READABLE) != 0 && p.poll(filter::READABLE).is_ready()
+                    }
+                    _ => false,
+                };
+
+                if ready {
+                    events[event_count] = super::MuxEvent {
+                        handle: abi::Handle::from_raw(watch.handle),
+                        event: watch.filter,
+                        _pad: [0; 3],
+                    };
+                    event_count += 1;
                 }
             }
+
+            (earliest_deadline, events, event_count)
+        });
+
+        let (earliest_deadline, events, event_count) = match subscribe_and_poll_result {
+            Ok((d, e, c)) => (d, e, c),
+            Err(_) => return Error::BadHandle.to_errno(),
+        };
+
+        // Phase 4: Events ready → return to userspace
+        if event_count > 0 {
+            // Debug: log the event being returned
+            crate::kinfo!("mux", "return_event"; task_id = task_id, count = event_count, handle = events[0].handle.0);
+
+            let bytes = event_count * core::mem::size_of::<super::MuxEvent>();
+            let event_bytes = unsafe {
+                core::slice::from_raw_parts(events.as_ptr() as *const u8, bytes)
+            };
+            if uaccess::copy_to_user(buf_ptr, event_bytes).is_err() {
+                return Error::BadAddress.to_errno();
+            }
+            return event_count as i64;
         }
-        earliest_deadline
-    });
 
-    let earliest_deadline = match subscribe_result {
-        Ok(d) => d,
-        Err(_) => return Error::BadHandle.to_errno(),
-    };
-
-    // Phase 3: Poll for ready events
-    let poll_result = object_service().with_table(task_id, |table| {
-        let mut events = [super::MuxEvent::empty(); 16];
-        let mut event_count = 0usize;
-        let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
-
-        for watch_opt in &watches {
-            if event_count >= max_events { break; }
-            let Some(watch) = watch_opt.0 else { continue };
-            let channel_id = watch_opt.1;
-            let watched_handle = Handle::from_raw(watch.handle);
-
-            let Some(entry) = table.get(watched_handle) else { continue };
-
-            let ready = match &entry.object {
-                Object::Channel(_) => {
-                    if (watch.filter & filter::READABLE) != 0 {
-                        channel_id != 0 && ipc::channel_has_messages(channel_id)
-                    } else if (watch.filter & filter::CLOSED) != 0 {
-                        channel_id == 0
-                    } else {
-                        false
-                    }
-                }
-                Object::Port(p) => {
-                    (watch.filter & filter::READABLE) != 0 && ipc::port_has_pending(p.port_id())
-                }
-                Object::Timer(t) => {
-                    if (watch.filter & filter::READABLE) != 0 {
-                        let now = crate::platform::current::timer::ticks();
-                        t.deadline > 0 && now >= t.deadline
-                    } else {
-                        false
-                    }
-                }
-                Object::Console(c) => {
-                    match c.console_type {
-                        ConsoleType::Stdin => (watch.filter & filter::READABLE) != 0 && uart::rx_buffer_has_data(),
-                        ConsoleType::Stdout | ConsoleType::Stderr => (watch.filter & filter::WRITABLE) != 0,
-                    }
-                }
-                Object::Process(p) => {
-                    (watch.filter & filter::READABLE) != 0 && p.poll(filter::READABLE).is_ready()
-                }
-                _ => false,
+        // Phase 5: Transition to blocked state
+        //
+        // RACE CONDITION: Between releasing the tables lock (above) and transitioning
+        // to Sleeping, an event may arrive. The waker will call wake_task(), but since
+        // we're still Running, it returns false (wake ignored). We then block and miss
+        // the event.
+        //
+        // SOLUTION: After transitioning to Sleeping/Waiting, do one more poll. If events
+        // are ready, wake ourselves (proper state machine transition: Sleeping -> Ready -> Running)
+        // and return the events. This keeps all state changes going through the state machine.
+        let transition_ok = task::with_scheduler(|sched| {
+            let Some(task) = sched.task_mut(slot) else {
+                return false;
             };
 
-            if ready {
-                events[event_count] = super::MuxEvent {
-                    handle: abi::Handle::from_raw(watch.handle),
-                    event: watch.filter,
-                    _pad: [0; 3],
-                };
-                event_count += 1;
-            }
-        }
+            let state_name = task.state().name();
 
-        (events, event_count)
-    });
-
-    let (events, event_count) = match poll_result {
-        Ok((e, c)) => (e, c),
-        Err(_) => return Error::BadHandle.to_errno(),
-    };
-
-    // Phase 4: Events ready → return to userspace
-    if event_count > 0 {
-        let bytes = event_count * core::mem::size_of::<super::MuxEvent>();
-        let event_bytes = unsafe {
-            core::slice::from_raw_parts(events.as_ptr() as *const u8, bytes)
-        };
-        if uaccess::copy_to_user(buf_ptr, event_bytes).is_err() {
-            return Error::BadAddress.to_errno();
-        }
-        return event_count as i64;
-    }
-
-    // Phase 5: No events → transition to blocked state via scheduler
-    // Note: Tables lock is NOT held here
-    let transition_ok = task::with_scheduler(|sched| {
-        let Some(task) = sched.task_mut(slot) else {
-            return false;
-        };
-
-        if earliest_deadline == u64::MAX {
-            // No timer → Sleeping (liveness will monitor)
-            task.set_sleeping(crate::kernel::task::SleepReason::EventLoop).is_ok()
-        } else {
-            // Has timer → Waiting with deadline
-            if task.set_waiting(crate::kernel::task::WaitReason::TimedEvent, earliest_deadline).is_ok() {
-                sched.note_deadline(earliest_deadline);
-                true
+            if earliest_deadline == u64::MAX {
+                let result = task.set_sleeping(crate::kernel::task::SleepReason::EventLoop);
+                if result.is_err() {
+                    crate::kerror!("mux", "sleep_failed"; task_id = task_id, state = state_name);
+                }
+                result.is_ok()
             } else {
-                false
+                if task.set_waiting(crate::kernel::task::WaitReason::TimedEvent, earliest_deadline).is_ok() {
+                    sched.note_deadline(earliest_deadline);
+                    true
+                } else {
+                    crate::kerror!("mux", "wait_failed"; task_id = task_id, state = state_name);
+                    false
+                }
             }
+        });
+
+        if !transition_ok {
+            // State transition failed - shouldn't happen normally
+            crate::kerror!("mux", "transition_failed"; task_id = task_id);
+            return Error::InvalidArg.to_errno();
         }
-    });
 
-    if !transition_ok {
-        return Error::InvalidArg.to_errno();
+        // Now we're in Sleeping/Waiting state. Poll once more to catch events
+        // that arrived in the window between our poll and blocking.
+        let late_poll_found_events = {
+            let mut found = false;
+            let _ = object_service().with_table(task_id, |table| {
+                for watch_opt in &watches {
+                    let Some(watch) = watch_opt.0 else { continue };
+                    let channel_id = watch_opt.1;
+                    let watched_handle = Handle::from_raw(watch.handle);
+                    let Some(entry) = table.get(watched_handle) else { continue };
+
+                    let ready = match &entry.object {
+                        Object::Channel(_) => {
+                            if (watch.filter & filter::READABLE) != 0 {
+                                channel_id != 0 && ipc::channel_has_messages(channel_id)
+                            } else if (watch.filter & filter::CLOSED) != 0 {
+                                channel_id == 0
+                            } else {
+                                false
+                            }
+                        }
+                        Object::Port(p) => {
+                            (watch.filter & filter::READABLE) != 0 && ipc::port_has_pending(p.port_id())
+                        }
+                        Object::Timer(t) => {
+                            // Check timer state - only Armed timers that expired are ready
+                            // (We don't consume here - just checking if there's an event to return)
+                            if (watch.filter & filter::READABLE) != 0 {
+                                t.state() == super::TimerState::Armed &&
+                                    crate::platform::current::timer::is_expired(t.deadline())
+                            } else {
+                                false
+                            }
+                        }
+                        Object::Console(c) => {
+                            match c.console_type {
+                                ConsoleType::Stdin => (watch.filter & filter::READABLE) != 0 && uart::rx_buffer_has_data(),
+                                ConsoleType::Stdout | ConsoleType::Stderr => (watch.filter & filter::WRITABLE) != 0,
+                            }
+                        }
+                        Object::Process(p) => {
+                            (watch.filter & filter::READABLE) != 0 && p.poll(filter::READABLE).is_ready()
+                        }
+                        _ => false,
+                    };
+
+                    if ready {
+                        found = true;
+                        break;
+                    }
+                }
+                Ok::<(), Error>(())
+            });
+            found
+        };
+
+        // Check BOTH: late_poll found events OR task was woken (state changed)
+        //
+        // Race condition: A waker might wake us (Sleeping -> Ready) after we
+        // transitioned to Sleeping but the late_poll didn't see the event data.
+        // In that case, late_poll_found_events is false but task is now Ready.
+        // We must check the task state to catch this case.
+        //
+        // IMPORTANT: Only check for Ready state (was woken from Sleeping).
+        // If task is still Running (sleep transition failed), that's a different
+        // error path - don't treat that as "woken".
+        let (task_was_woken, current_state) = task::with_scheduler(|sched| {
+            sched.task(slot)
+                .map(|t| (*t.state() == task::TaskState::Ready, t.state().name()))
+                .unwrap_or((false, "none"))
+        });
+
+        if late_poll_found_events || task_was_woken {
+            // Events arrived OR we were woken by someone else.
+            // Transition to Running via proper state machine.
+            if late_poll_found_events {
+                crate::kinfo!("mux", "late_poll_wake"; task_id = task_id);
+            } else {
+                crate::kinfo!("mux", "external_wake"; task_id = task_id, state = current_state);
+            }
+
+            task::with_scheduler(|sched| {
+                if let Some(task) = sched.task_mut(slot) {
+                    // If Sleeping/Waiting -> wake to Ready
+                    // If already Ready -> this is a no-op (error discarded)
+                    let _ = task.wake();
+                    // Ready -> Running
+                    let _ = task.set_running();
+                }
+            });
+            // Loop back to poll and return the events
+            continue;
+        }
+
+        // No late events and still blocked - safe to reschedule.
+        //
+        // When reschedule() is called with a blocked task:
+        // - If another task is Ready, we do a kernel context switch to it
+        // - If no tasks are Ready, we enter idle loop (WFI)
+        // - Either way, when we return here, we've been woken and should poll again
+        crate::kernel::sched::reschedule();
+
+        // When we return here, we've been switched back to this task.
+        // The scheduler's context_switch mechanism ensures we resume here.
+        // Ensure we're Running (state machine: was Ready when scheduled back).
+        let post_state = task::with_scheduler(|sched| {
+            if let Some(task) = sched.task_mut(slot) {
+                // After being switched back, task should be Running (set by scheduler)
+                // or Ready (if just woken). Handle both cases.
+                if *task.state() == task::TaskState::Ready {
+                    let _ = task.set_running();
+                }
+                task.state().name()
+            } else {
+                "none"
+            }
+        });
+        crate::kdebug!("mux", "woke_up"; task_id = task_id, state = post_state);
     }
-
-    // Reschedule to another task
-    crate::kernel::sched::reschedule();
-
-    // This return value is stored but task won't return to userspace yet
-    // When woken, PC will re-execute the syscall instruction
-    0
 }
 
 // Write implementations
@@ -1509,19 +1698,16 @@ fn write_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize) -> i64 
         return 0;
     }
 
-    // Convert nanoseconds to ticks (timer runs at 13MHz = 13 ticks per microsecond)
-    // 1 tick = 1/13,000,000 seconds = ~77ns
-    let ticks_per_ns = 13; // Approximately 13 ticks per 1000ns
-    let deadline_ticks = deadline_ns * ticks_per_ns / 1000;
-
-    let current_tick = timer::ticks();
-    let deadline = current_tick + deadline_ticks;
+    // Use unified clock API to create deadline
+    let deadline = timer::deadline_ns(deadline_ns);
 
     // Check for interval (recurring timer)
-    let interval = if buf_len >= 16 {
+    let freq = timer::frequency();
+    let interval = if buf_len >= 16 && freq > 0 {
         let interval_ns = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
         if interval_ns > 0 {
-            interval_ns * ticks_per_ns / 1000
+            // Convert interval to counter ticks (same unit as deadline)
+            ((interval_ns as u128 * freq as u128) / 1_000_000_000) as u64
         } else {
             0
         }
@@ -1531,6 +1717,11 @@ fn write_timer(t: &mut super::TimerObject, buf_ptr: u64, buf_len: usize) -> i64 
 
     // Arm timer using transition method
     t.arm(deadline, interval);
+
+    // Notify scheduler about this deadline so it wakes us when timer fires
+    task::with_scheduler(|sched| {
+        sched.note_deadline(deadline);
+    });
 
     0
 }
