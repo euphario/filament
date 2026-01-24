@@ -1356,8 +1356,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                         Object::Port(p) => { p.subscriber = Some(subscriber); }
                         Object::Timer(t) => {
                             t.subscriber = Some(subscriber);
-                            if t.deadline > 0 && t.deadline < earliest_deadline {
-                                earliest_deadline = t.deadline;
+                            if t.deadline() > 0 && t.deadline() < earliest_deadline {
+                                earliest_deadline = t.deadline();
                             }
                         }
                         Object::Console(c) => {
@@ -1402,13 +1402,17 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     }
                     Object::Timer(t) => {
                         if (watch.filter & filter::READABLE) != 0 {
-                            // Use timer's check method to handle state transition
-                            // If timer is Armed and expired, it transitions to Fired
-                            // and we return ready. If already Fired, also ready.
-                            // If Disarmed or not expired, not ready.
-                            if t.state() == super::TimerState::Armed && crate::platform::current::timer::is_expired(t.deadline()) {
-                                // Transition to Fired and immediately consume for recurring
-                                // This ensures we don't report the same event twice
+                            // Check timer state:
+                            // - Armed + expired: transition to Fired and return ready
+                            // - Fired: already fired (by check_timeouts), consume and return ready
+                            // - Disarmed or Armed but not expired: not ready
+                            let state = t.state();
+                            if state == super::TimerState::Fired {
+                                // Already fired by check_timeouts - consume and return ready
+                                t.consume(current_tick);
+                                true
+                            } else if state == super::TimerState::Armed && crate::platform::current::timer::is_expired(t.deadline()) {
+                                // Fire now and consume
                                 t.fire();
                                 t.consume(current_tick);
                                 true
@@ -1529,11 +1533,13 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                             (watch.filter & filter::READABLE) != 0 && ipc::port_has_pending(p.port_id())
                         }
                         Object::Timer(t) => {
-                            // Check timer state - only Armed timers that expired are ready
+                            // Check timer state - Fired or (Armed + expired) means ready
                             // (We don't consume here - just checking if there's an event to return)
                             if (watch.filter & filter::READABLE) != 0 {
-                                t.state() == super::TimerState::Armed &&
-                                    crate::platform::current::timer::is_expired(t.deadline())
+                                let state = t.state();
+                                state == super::TimerState::Fired ||
+                                    (state == super::TimerState::Armed &&
+                                     crate::platform::current::timer::is_expired(t.deadline()))
                             } else {
                                 false
                             }

@@ -625,6 +625,7 @@ pub fn timer_tick(current_time: u64) {
         // For now, check every ~100 timer interrupts by using a simple counter
         static mut LIVENESS_COUNTER: u64 = 0;
         LIVENESS_COUNTER += 1;
+
         if LIVENESS_COUNTER % super::liveness::LIVENESS_CHECK_INTERVAL == 0 {
             let actions = super::liveness::check_liveness(current_time);
             if actions > 0 {
