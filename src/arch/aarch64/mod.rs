@@ -7,6 +7,7 @@
 //! - Synchronization primitives (barriers, IrqGuard)
 //! - SMP and per-CPU state
 //! - MMIO abstractions with proper barriers
+//! - HAL implementations (Cpu, ContextSwitch)
 
 use core::arch::global_asm;
 
@@ -15,10 +16,12 @@ pub mod tlb;
 pub mod sync;
 pub mod smp;
 pub mod mmio;
+pub mod hal;
 
 // Include the assembly startup code
 global_asm!(include_str!("boot.S"));
 
-// Re-exports available if needed:
+// Re-exports
+pub use hal::{Aarch64Cpu, Aarch64Context, Aarch64ContextSwitch, cpu};
 // pub use sync::IrqGuard;
 // pub use mmio::MmioRegion;

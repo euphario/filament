@@ -984,6 +984,43 @@ use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
 /// Global scheduler instance
 static mut SCHEDULER: Scheduler = Scheduler::new();
 
+/// Initialize scheduler (call once at boot)
+/// This explicitly resets all task slots to None to handle static initialization issues
+/// on some platforms (e.g., QEMU where .data section may not be properly initialized).
+///
+/// Also creates the idle task in slot 0 - this is an internal implementation detail.
+pub fn init_scheduler() {
+    let sched_addr = unsafe { core::ptr::addr_of!(SCHEDULER) as usize };
+    crate::print_direct!("init_scheduler: SCHEDULER at 0x{:x}\r\n", sched_addr);
+    crate::print_direct!("init_scheduler: clearing {} task slots...\r\n", MAX_TASKS);
+    unsafe {
+        for i in 0..MAX_TASKS {
+            SCHEDULER.tasks[i] = None;
+        }
+        SCHEDULER.current = 0;
+        SCHEDULER.next_deadline = u64::MAX;
+    }
+    // Verify it worked
+    let free = unsafe {
+        SCHEDULER.tasks.iter().filter(|t| t.is_none()).count()
+    };
+    crate::print_direct!("init_scheduler: {} free slots after clear\r\n", free);
+
+    // Create idle task in slot 0 - this is an internal scheduler detail
+    // The idle task runs when no other tasks are ready, doing WFI in a loop
+    // Uses static stack (no PMM allocation) since PMM isn't initialized yet
+    unsafe {
+        // Generate PID for slot 0 using the scheduler's PID generation
+        // Slot 0 = PID 1 (since slot_bits = slot + 1)
+        let idle_id = SCHEDULER.make_pid(0);
+
+        let idle_task = Task::new_idle(idle_id, crate::kernel::idle::idle_entry);
+        SCHEDULER.tasks[0] = Some(idle_task);
+
+        crate::print_direct!("init_scheduler: idle task created (pid={}, slot=0)\r\n", idle_id);
+    }
+}
+
 /// Early boot trap frame - used before any tasks are created
 /// This ensures exception handlers have a valid place to save state
 /// even if an exception occurs during very early boot.
@@ -1039,13 +1076,18 @@ pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
 pub unsafe fn update_current_task_globals() {
     let sched = scheduler();
 
+    // Use current_slot() which was just updated by set_current_slot()
+    // This avoids aliasing issues where sched.current might not be visible
+    // through a fresh scheduler() reference due to compiler optimizations
+    let slot = current_slot();
+
     // Defensive check: validate current slot is in bounds
-    if sched.current >= MAX_TASKS {
+    if slot >= MAX_TASKS {
         crate::platform::current::uart::print("[PANIC] update_current_task_globals: current slot out of bounds!\r\n");
         loop { core::arch::asm!("wfe"); }
     }
 
-    if let Some(ref mut task) = sched.tasks[sched.current] {
+    if let Some(ref mut task) = sched.tasks[slot] {
         let trap_ptr = &mut task.trap_frame as *mut TrapFrame;
         let trap_addr = trap_ptr as u64;
 
@@ -1103,92 +1145,24 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     // Check and clear the flag atomically (before taking lock)
     let need_resched = crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched();
 
-    // Do the reschedule with IRQs disabled for the critical section
-    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
-    let sched = scheduler();
-    let my_slot = current_slot();  // Use per-CPU slot for consistency with schedule()
-
-    // Check if current task is blocked - must switch away immediately
-    let current_blocked = if let Some(ref task) = sched.tasks[my_slot] {
-        task.is_blocked()
-    } else {
-        false
-    };
-
-    // Skip if no reason to reschedule
-    if !need_resched && !current_blocked {
-        return;
-    }
-
-    // Mark current as ready (it was running) - but only if it was Running
-    // (don't change Blocked tasks)
-    if let Some(ref mut current) = sched.tasks[my_slot] {
-        if *current.state() == TaskState::Running {
-            let _ = current.set_ready();
+    // Quick check if we need to do anything (without taking lock)
+    if !need_resched {
+        // Only check current_blocked if we have a reason to
+        let sched = scheduler();
+        let my_slot = current_slot();
+        let current_blocked = sched.tasks[my_slot]
+            .as_ref()
+            .map(|t| t.is_blocked())
+            .unwrap_or(false);
+        if !current_blocked {
+            return;
         }
     }
 
-    // Find next task
-    if let Some(next_slot) = sched.schedule() {
-        if next_slot != my_slot {
-            // Update both per-CPU slot and legacy field
-            set_current_slot(next_slot);
-            sched.current = next_slot;
-            if let Some(ref mut next_task) = sched.tasks[next_slot] {
-                let _ = next_task.set_running();
-            }
-            update_current_task_globals();
-            // Signal to assembly that we switched tasks
-            SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
-        } else {
-            // Same task selected - only mark as running if it was Ready
-            if let Some(ref mut current) = sched.tasks[my_slot] {
-                if *current.state() == TaskState::Ready {
-                    let _ = current.set_running();
-                }
-            }
-        }
-    } else if current_blocked {
-        // Current task is blocked but no other task is ready
-        // We MUST wait for an interrupt to wake something up
-        drop(_guard);
-
-        loop {
-            // CRITICAL: Explicitly enable IRQs before WFI!
-            // After syscall, hardware leaves IRQs disabled (PSTATE.I set).
-            // IrqGuard saw them disabled, so drop() didn't re-enable them.
-            // We must enable IRQs here or WFI will wait forever.
-            core::arch::asm!("msr daifclr, #2");  // Clear I bit = enable IRQs
-
-            // Mark CPU as idle for usage tracking (set before WFI)
-            crate::kernel::percpu::cpu_local().set_idle();
-
-            // Wait for interrupt - timer tick or device IRQ will wake a task
-            core::arch::asm!("wfi");
-
-            // CPU woke up - no longer idle
-            crate::kernel::percpu::cpu_local().clear_idle();
-
-            // Disable IRQs to check scheduler state
-            let _guard2 = crate::arch::aarch64::sync::IrqGuard::new();
-            let sched2 = scheduler();
-
-            if let Some(next_slot) = sched2.schedule() {
-                // Found a ready task - switch to it
-                // Update both per-CPU slot and legacy field
-                set_current_slot(next_slot);
-                sched2.current = next_slot;
-                if let Some(ref mut next_task) = sched2.tasks[next_slot] {
-                    let _ = next_task.set_running();
-                }
-                update_current_task_globals();
-                SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
-                // Note: _guard2 will be dropped here, re-enabling IRQs
-                return;
-            }
-            // No ready task yet, _guard2 drops here and we loop back to WFI
-        }
-    }
+    // Delegate to sched::reschedule() which properly handles:
+    // - Variable-based switching for user->user preemption
+    // - Context switching for kernel tasks and blocked tasks
+    crate::kernel::sched::reschedule();
 }
 
 // NOTE: yield_cpu() and yield_cpu_locked() have been removed.

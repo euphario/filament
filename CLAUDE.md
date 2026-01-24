@@ -126,18 +126,51 @@ See [docs/PRINCIPLES.md](docs/PRINCIPLES.md) for complete design philosophy.
 
 ## Build & Run
 
-### Build Commands
+### Build Commands (cargo xtask)
 
 ```bash
 # Full build (kernel + userspace + initrd)
-./build.sh
+./x build
 
-# Build with MT7996 firmware embedded
-./build.sh --with-firmware
+# Build for QEMU virt target
+./x build --platform qemu
 
 # Build with self-tests enabled
-./build.sh --test
+./x build --test
+
+# Build with MT7996 firmware embedded
+./x build --firmware
+
+# Build only specific user programs
+./x build --only devd shell
+
+# Run in QEMU
+./x qemu
+
+# Clean all build artifacts
+./x clean
 ```
+
+### Legacy Build Script
+
+The `./build.sh` script is deprecated but still works for compatibility.
+
+### Running on QEMU
+
+```bash
+# Build and run (recommended)
+./x qemu
+
+# Manual run
+./x build --platform qemu
+qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512M -nographic -kernel kernel.bin
+```
+
+QEMU differences from real hardware:
+- Loads kernel at 0x40080000 (vs 0x46000000 on MT7988A)
+- Uses PL011 UART at 0x09000000 (vs 16550 at 0x11000000)
+- Uses GICv3 (vs custom interrupt controller)
+- No PCIe or USB enumeration (stubs only)
 
 ### Load via U-Boot
 
@@ -149,10 +182,17 @@ See [docs/PRINCIPLES.md](docs/PRINCIPLES.md) for complete design philosophy.
 
 ### Hardware
 
+**Physical hardware:**
 - **Board**: Banana Pi BPI-R4
 - **SoC**: MediaTek MT7988A
 - **CPU**: ARM Cortex-A73 (AArch64)
 - **USB**: SSUSB0 (IRQ 205, M.2), SSUSB1 (IRQ 204, USB-A via VL822)
+
+**Emulation (QEMU virt):**
+- **Machine**: virt with GICv3
+- **CPU**: Cortex-A72 or max
+- **RAM**: 512M+ recommended
+- Useful for testing kernel/userspace without hardware
 
 ---
 
@@ -334,6 +374,59 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 ## Changelog (Recent)
 
 ### 2026-01-23
+- **Scheduler State Machine Fixes** - Critical context switching bugs fixed
+  - **Fixed `context_saved` flag bug** (`src/kernel/sched.rs`)
+    - Previously only set when `from_blocked`, causing yielding tasks to not have flag set
+    - Now always set when entering context_switch branch, regardless of blocking state
+    - Prevents bug where task's context was saved but flag wasn't set, causing next switch to skip restoration
+  - **Fixed crash recovery** (`src/main.rs`)
+    - Kill loop now starts from slot 1, preserving idle task in slot 0
+    - Changed init detection from `pid == 1` (matches idle) to `is_init` flag (matches devd)
+  - **Fixed exception handler idle handling** (`src/main.rs`)
+    - When next task after termination is idle (slot 0), enter `idle_entry()` directly
+    - Previously tried to eret to idle which failed (idle has no user trap frame)
+    - Prevents cascade failure where devd crash caused idle to fault at PC=0x0
+- **Scheduler HAL Redesign** - Proper idle task and context switching
+  - Created HAL traits for CPU operations (`src/hal/cpu.rs`, `src/hal/context.rs`)
+    - `Cpu` trait: idle (WFI), IRQ enable/disable, memory barriers, CPU ID
+    - `Context` trait: kernel context for context switching
+    - `ContextSwitch` trait: architecture-specific context switch
+  - AArch64 HAL implementation (`src/arch/aarch64/hal.rs`)
+    - `Aarch64Cpu`: WFI, DAIF manipulation for IRQs
+    - `Aarch64Context`: callee-saved registers (x19-x30, sp)
+    - `aarch64_context_switch`: assembly implementation
+  - **Real idle task** (`src/kernel/idle.rs`)
+    - Idle task is now a proper kernel task in slot 0
+    - Runs WFI loop, has valid kernel context for context switching
+    - Created before devd spawns (devd now in slot 1)
+  - **Fixed blocking syscall context switching**
+    - When task blocks, scheduler context switches to idle (slot 0)
+    - Idle task runs WFI with IRQs enabled
+    - Timer interrupt sets NEED_RESCHED flag
+    - `do_resched_if_needed()` switches from idle to ready task
+    - Blocked task's kernel context properly saved/restored
+  - **Fixes busy loop issue** - Tasks no longer wake ~63 times/second
+  - Design doc: `docs/architecture/SCHEDULER_REDESIGN.md`
+- **QEMU virt platform now working** - Full boot to userspace on QEMU
+  - Fixed linker script: QEMU loads kernel at 0x40080000, not 0x40000000
+  - `src/linker-qemu.ld` updated with correct KERNEL_PHYS_BASE
+  - Added L2 page tables (2MB blocks) for TTBR1 - more compatible than 1GB blocks
+  - Boot sequence: `B1SPEJMK` then kernel initialization
+  - Run with: `./x qemu` or manual: `qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512M -nographic -kernel kernel.bin`
+- **Boot code improvements** (`src/arch/aarch64/boot.S`)
+  - Platform-conditional UART debug macros (MT7988A 16550 vs QEMU PL011)
+  - Better exception handler with detailed ESR/ELR dump
+  - Cleaner debug checkpoint sequence
+- **Fixed Mux subscribe-poll race condition** - Critical IPC fix
+  - Merged Phase 2 (subscribe) and Phase 3 (poll) into single atomic lock section
+  - Previously: subscribe released lock, poll acquired separately - race window
+  - Now: subscribe and poll happen in one `with_table_mut()` call
+  - Fixes issue where port connection wake was lost if it arrived between subscribe and poll
+  - File: `src/kernel/object/syscall.rs` - `read_mux_via_service()`
+- **Unified Clock HAL** - Consistent time source across platforms
+  - Added `now_ns()`, `deadline_ns()`, `is_expired()` to HAL Timer trait
+  - All timer operations now use hardware counter in nanoseconds
+  - Platforms: `src/platform/qemu_virt/timer.rs`, `src/platform/mt7988/timer.rs`
 - **ObjectService tables migration complete** - Phase 4-6 of syscall rebuild
   - Object tables moved from Task struct to ObjectService
   - `src/kernel/object_service.rs` owns `BTreeMap<TaskId, ObjectTable>` with its own lock

@@ -250,6 +250,44 @@ pub struct Task {
     pub(crate) liveness_state: crate::kernel::liveness::LivenessState,
     /// Last activity tick (syscall made)
     pub(crate) last_activity_tick: u64,
+    /// True if this task was switched away via context_switch and needs context restored.
+    /// Set when task blocks and context_switch saves its context.
+    /// Cleared when context_switch restores its context.
+    pub(crate) context_saved: bool,
+}
+
+/// Trampoline for new user tasks.
+///
+/// When a new user task is first scheduled via context_switch, it ret's here.
+/// This function sets up the task globals and erets into userspace.
+///
+/// # Safety
+/// Must only be called via context_switch with proper scheduler state set up.
+fn user_task_trampoline() -> ! {
+    unsafe {
+        // Get current slot (was set by switch_to_task before context_switch)
+        let slot = crate::kernel::percpu::cpu_local().get_current_slot();
+
+        // Get scheduler (IRQs should still be disabled from switch_to_task)
+        let sched = super::scheduler();
+
+        if let Some(ref mut task) = sched.tasks[slot] {
+            if let Some(ref addr_space) = task.address_space {
+                let ttbr0 = addr_space.get_ttbr0();
+                let trap_frame = &mut task.trap_frame as *mut TrapFrame;
+
+                // Set globals for exception handler
+                super::CURRENT_TRAP_FRAME.store(trap_frame, core::sync::atomic::Ordering::Release);
+                super::CURRENT_TTBR0.store(ttbr0, core::sync::atomic::Ordering::Release);
+
+                // Enter userspace via eret
+                super::enter_usermode(trap_frame as *const TrapFrame, ttbr0);
+            }
+        }
+
+        // Should never reach here - enter_usermode doesn't return
+        panic!("user_task_trampoline: invalid task state");
+    }
 }
 
 impl Task {
@@ -301,16 +339,74 @@ impl Task {
             signal_allowlist_count: 0,
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
+            context_saved: true,  // Kernel task always uses CpuContext
         })
     }
 
+    /// Create the idle task with a static stack (no PMM allocation)
+    ///
+    /// This is special because:
+    /// 1. The idle task is created before PMM is initialized
+    /// 2. It uses a statically allocated stack from kernel/idle.rs
+    /// 3. There's only ever one idle task (in slot 0)
+    ///
+    /// # Safety
+    /// Must only be called once, during scheduler initialization.
+    pub unsafe fn new_idle(id: TaskId, entry: fn() -> !) -> Self {
+        // Use static stack from idle module
+        let stack_top = crate::kernel::idle::idle_stack_top();
+
+        let mut context = CpuContext::new();
+        context.sp = stack_top as u64;
+        context.pc = entry as u64;
+        context.x30 = entry as u64;
+
+        Self {
+            id,
+            state: TaskState::Ready,
+            priority: Priority::Low,  // Idle is lowest priority
+            context,
+            trap_frame: TrapFrame::new(),
+            kernel_stack: 0,  // Static stack, not from PMM
+            kernel_stack_size: 4096,  // IDLE_STACK size
+            guard_page: 0,  // No guard page for static stack
+            address_space: None,
+            is_user: false,
+            is_init: false,
+            name: *b"idle\0\0\0\0\0\0\0\0\0\0\0\0",
+            heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
+            heap_next: USER_HEAP_START,
+            channel_count: 0,
+            port_count: 0,
+            shmem_count: 0,
+            event_queue: EventQueue::new(),
+            parent_id: 0,
+            children: [0; MAX_CHILDREN],
+            num_children: 0,
+            timers: [TimerDesc::empty(); MAX_TIMERS_PER_TASK],
+            capabilities: crate::kernel::caps::Capabilities::NONE,  // No capabilities needed
+            signal_allowlist: [0; MAX_SIGNAL_SENDERS],
+            signal_allowlist_count: 0,
+            liveness_state: crate::kernel::liveness::LivenessState::Normal,
+            last_activity_tick: 0,
+            context_saved: true,  // Kernel task always uses CpuContext
+        }
+    }
+
     /// Create a new user task with its own address space
+    ///
+    /// The task's CpuContext is initialized to point to `user_task_trampoline`,
+    /// which will set up globals and eret to userspace when first scheduled.
     pub fn new_user(id: TaskId, name: &str) -> Option<Self> {
         let total_pages = (KERNEL_STACK_SIZE / 4096) + 1;
         let alloc_base = pmm::alloc_pages(total_pages)?;
 
         let guard_page = alloc_base;
         let stack_base = alloc_base + GUARD_PAGE_SIZE;
+        let stack_top = stack_base + KERNEL_STACK_SIZE;
+
+        // Convert to kernel virtual address (MMU is enabled)
+        let stack_top_virt = crate::arch::aarch64::mmu::phys_to_virt(stack_top as u64);
 
         let address_space = match AddressSpace::new() {
             Some(addr_space) => addr_space,
@@ -320,7 +416,13 @@ impl Task {
             }
         };
 
-        let context = CpuContext::new();
+        // Initialize CpuContext to point to the user task entry trampoline.
+        // When context_switched to, ret will jump to the trampoline which
+        // sets up globals and erets to userspace.
+        let mut context = CpuContext::new();
+        context.x30 = user_task_trampoline as u64;
+        context.sp = stack_top_virt;
+
         let trap_frame = TrapFrame::new();
 
         let mut task_name = [0u8; 16];
@@ -356,6 +458,7 @@ impl Task {
             signal_allowlist_count: 0,
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
+            context_saved: true,  // New tasks need context_switch to run their trampoline
         })
     }
 

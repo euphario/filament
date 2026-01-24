@@ -12,7 +12,7 @@
 //!          |
 //!          v
 //! +-------------------+
-//! |    HAL Traits     |  InterruptController, Timer, Platform
+//! |    HAL Traits     |  Cpu, ContextSwitch, Timer, InterruptController
 //! +-------------------+
 //!          |
 //!    +-----+-----+
@@ -27,6 +27,14 @@
 //!
 //! The kernel accesses hardware through the global `PLATFORM` reference,
 //! which provides access to interrupt controller and timer through traits.
+
+// HAL submodules
+pub mod cpu;
+pub mod context;
+
+// Re-export core traits
+pub use cpu::Cpu;
+pub use context::{Context, ContextSwitch};
 
 /// Interrupt controller abstraction
 ///
@@ -63,6 +71,16 @@ pub trait InterruptController {
 ///
 /// Provides a platform-agnostic interface for system timers.
 /// The timer is used for preemptive scheduling and timeouts.
+///
+/// # Unified Clock
+///
+/// All time-related operations in the kernel use nanoseconds as the canonical
+/// unit. Use `now_ns()` to get the current time and `deadline_ns()` to create
+/// deadlines. This ensures consistent behavior across all platforms regardless
+/// of their underlying hardware counter frequencies.
+///
+/// The raw `counter()` and `frequency()` methods are provided for platform
+/// internals but should NOT be used directly by kernel code.
 pub trait Timer {
     /// Initialize the timer hardware
     fn init(&mut self);
@@ -78,13 +96,63 @@ pub trait Timer {
     fn handle_irq(&mut self) -> bool;
 
     /// Get the current tick count (increments each timer interrupt)
+    /// This is a software counter, not the hardware counter.
     fn ticks(&self) -> u64;
 
-    /// Get the timer frequency in Hz
+    /// Get the timer frequency in Hz (hardware counter frequency)
+    /// Used internally for conversions. Kernel code should use `now_ns()`.
     fn frequency(&self) -> u64;
 
-    /// Get the raw counter value (for high-resolution timing)
+    /// Get the raw counter value
+    /// Used internally. Kernel code should use `now_ns()` instead.
     fn counter(&self) -> u64;
+
+    // =========================================================================
+    // Unified Clock API - Use these in kernel code
+    // =========================================================================
+
+    /// Get current time in nanoseconds
+    ///
+    /// This is the canonical time source for the kernel. All deadlines,
+    /// timeouts, and durations should use nanoseconds.
+    fn now_ns(&self) -> u64 {
+        let counter = self.counter();
+        let freq = self.frequency();
+        if freq == 0 {
+            return 0;
+        }
+        // Use 128-bit math to avoid overflow
+        // ns = counter * 1_000_000_000 / freq
+        ((counter as u128 * 1_000_000_000) / freq as u128) as u64
+    }
+
+    /// Create a deadline N nanoseconds from now
+    ///
+    /// Returns the counter value at which the deadline expires.
+    /// Use `is_expired()` to check if a deadline has passed.
+    fn deadline_ns(&self, duration_ns: u64) -> u64 {
+        let freq = self.frequency();
+        if freq == 0 {
+            return 0;
+        }
+        // Convert duration to counter ticks
+        let duration_ticks = ((duration_ns as u128 * freq as u128) / 1_000_000_000) as u64;
+        self.counter().saturating_add(duration_ticks)
+    }
+
+    /// Check if a deadline (counter value) has expired
+    fn is_expired(&self, deadline: u64) -> bool {
+        self.counter() >= deadline
+    }
+
+    /// Convert a counter deadline back to nanoseconds (for debugging)
+    fn deadline_to_ns(&self, deadline: u64) -> u64 {
+        let freq = self.frequency();
+        if freq == 0 {
+            return 0;
+        }
+        ((deadline as u128 * 1_000_000_000) / freq as u128) as u64
+    }
 }
 
 /// UART abstraction

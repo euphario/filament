@@ -15,16 +15,37 @@
  */
 
 /*
- * Debug UART output macro - outputs a single character
- * Uses x10, x11 as scratch (must save/restore if needed)
- * UART0 base = 0x11000000 physical, 0xFFFF000011000000 virtual (TTBR1)
- * THR = offset 0, LSR = offset 0x14
+ * Debug UART output macros for early boot (before MMU)
  *
- * After MMU is enabled, we use TTBR1 virtual address so this works
- * regardless of what TTBR0 is pointing to.
+ * MT7988A: 16550-compatible UART at 0x11000000
+ *   THR = offset 0, LSR = offset 0x14, THRE = bit 5
+ *
+ * QEMU virt: PL011 UART at 0x09000000
+ *   UARTDR = offset 0, UARTFR = offset 0x18, TXFF = bit 5
+ *
+ * After MMU is enabled, use TTBR1 virtual address prefix.
  */
-.macro debug_uart_char char
-    // Load UART base via TTBR1: 0xFFFF_0000_1100_0000
+
+/* MT7988A UART output (physical address, before MMU) */
+.macro debug_uart_char_mt7988_phys char
+    movz    x10, #0x1100, lsl #16   // 0x11000000
+1:  ldr     w11, [x10, #0x14]       // Read LSR
+    tbz     w11, #5, 1b             // Wait for THRE (bit 5)
+    mov     w11, #\char
+    str     w11, [x10, #0]          // Write to THR
+.endm
+
+/* QEMU PL011 output (physical address, before MMU) */
+.macro debug_uart_char_qemu_phys char
+    movz    x10, #0x0900, lsl #16   // 0x09000000
+1:  ldr     w11, [x10, #0x18]       // Read UARTFR
+    tbnz    w11, #5, 1b             // Wait while TXFF (bit 5) is set
+    mov     w11, #\char
+    str     w11, [x10, #0]          // Write to UARTDR
+.endm
+
+/* MT7988A UART output (virtual address, after MMU) */
+.macro debug_uart_char_mt7988 char
     movz    x10, #0x1100, lsl #16   // 0x11000000
     movk    x10, #0xFFFF, lsl #48   // Add TTBR1 prefix
 1:  ldr     w11, [x10, #0x14]       // Read LSR
@@ -33,10 +54,37 @@
     str     w11, [x10, #0]          // Write to THR
 .endm
 
+/* QEMU PL011 output (virtual address, after MMU) */
+.macro debug_uart_char_qemu char
+    movz    x10, #0x0900, lsl #16   // 0x09000000
+    movk    x10, #0xFFFF, lsl #48   // Add TTBR1 prefix
+1:  ldr     w11, [x10, #0x18]       // Read UARTFR
+    tbnz    w11, #5, 1b             // Wait while TXFF (bit 5) is set
+    mov     w11, #\char
+    str     w11, [x10, #0]          // Write to UARTDR
+.endm
+
+/* Output to both platforms (after MMU) - QEMU first, then MT7988A.
+ * On QEMU, the MT7988A address (0x11000000) is unmapped device memory
+ * which should just return 0/garbage on reads, not cause exceptions.
+ */
+.macro debug_uart_char char
+    debug_uart_char_qemu \char
+    debug_uart_char_mt7988 \char
+.endm
+
 .section .text.boot
 .global _start
 
 _start:
+    /*
+     * Early debug output - prints 'B' to UART before any setup.
+     * Output to both MT7988A and QEMU UARTs (one will work, one will be ignored).
+     * This confirms CPU is executing our code.
+     */
+    debug_uart_char_mt7988_phys 'B'
+    debug_uart_char_qemu_phys 'B'
+
     /*
      * U-Boot passes DTB address in x0. Save it before we clobber x0.
      * Use x20 (callee-saved) to preserve across function calls.
@@ -73,6 +121,10 @@ _start:
  * EL2 Setup - Configure hypervisor and drop to EL1
  */
 el2_setup:
+    /* Debug: '2' = at EL2, about to configure */
+    debug_uart_char_mt7988_phys '2'
+    debug_uart_char_qemu_phys '2'
+
     /*
      * Configure HCR_EL2 (Hypervisor Configuration Register)
      * RW (bit 31) = 1: EL1 is AArch64
@@ -119,11 +171,34 @@ el2_setup:
  * EL1 Entry Point
  *
  * At this point:
- * - Running at physical address ~0x46000000
- * - Symbols contain virtual addresses ~0xFFFF000046000000
+ * - Running at physical address ~0x46000000 (MT7988A) or ~0x40000000 (QEMU)
+ * - Symbols contain virtual addresses ~0xFFFF0000xxxxxxxx
  * - Must enable MMU before using any Rust code
  */
 el1_entry:
+    /* Debug: '1' = at EL1 */
+    debug_uart_char_mt7988_phys '1'
+    debug_uart_char_qemu_phys '1'
+
+    /* Disable debug exceptions that might interfere with execution.
+     * Clear MDSCR_EL1.SS (Software Step) and MDSCR_EL1.MDE (Monitor Debug Events) */
+    msr     mdscr_el1, xzr
+    isb
+
+    /* Disable all timer interrupts at the CPU level.
+     * CNTP_CTL_EL0: IMASK (bit 1) = 1 disables the interrupt
+     * CNTV_CTL_EL0: Same for virtual timer */
+    mov     x0, #2                  // IMASK = 1
+    msr     cntp_ctl_el0, x0        // Physical timer
+    msr     cntv_ctl_el0, x0        // Virtual timer
+    isb
+
+    /* Clear any pending interrupts by writing to ICC_PMR_EL1 with low priority.
+     * This masks interrupts at the GIC CPU interface level. */
+    mov     x0, #0                  // Priority 0 = mask all
+    msr     S3_0_C4_C6_0, x0        // ICC_PMR_EL1
+    isb
+
     /*
      * Compute virtual-to-physical offset.
      * adr gives us the runtime (physical) address
@@ -166,6 +241,10 @@ bss_loop:
     b       bss_loop
 
 bss_done:
+    /* Debug: 'S' = stack and BSS setup done */
+    debug_uart_char_mt7988_phys 'S'
+    debug_uart_char_qemu_phys 'S'
+
     /*
      * Set up page tables and enable MMU.
      * After this, we'll be running at virtual addresses.
@@ -215,27 +294,70 @@ bss_done:
     orr     x4, x3, #3              // Table descriptor: valid + table
     str     x4, [x2]
 
-    /* Initialize TTBR1 L1: map kernel virtual to physical
-     * 0xFFFF_0000_0000_0000 -> 0x0000_0000_0000_0000
-     * Same as identity map, just accessed via high addresses */
-    /* Block 0: Device memory with UXN|PXN */
-    mov     x4, #0x401              // Valid + AF + Device
-    movk    x4, #0x0060, lsl #48    // UXN (bit 54) + PXN (bit 53)
+    /* Initialize TTBR1 L1 with table descriptors pointing to L2.
+     * This uses 2MB blocks (L2) instead of 1GB blocks (L1) for better compatibility.
+     */
+    /* L1 entry 0 (0xFFFF000000000000-0xFFFF00003FFFFFFF) -> L2 table 0 */
+    ldr     x4, =boot_l2_ttbr1_0
+    add     x4, x4, x28             // Convert to physical
+    orr     x4, x4, #3              // Table descriptor
     str     x4, [x3, #0]
-    /* Block 1: Normal memory with UXN (kernel code) */
-    mov     x4, #0x40000000
-    add     x4, x4, #0x405          // Valid + AF + Normal
-    movk    x4, #0x0040, lsl #48    // UXN (bit 54)
+
+    /* L1 entry 1 (0xFFFF000040000000-0xFFFF00007FFFFFFF) -> L2 table 1 */
+    ldr     x4, =boot_l2_ttbr1_1
+    add     x4, x4, x28             // Convert to physical
+    orr     x4, x4, #3              // Table descriptor
     str     x4, [x3, #8]
-    /* Block 2-3: Normal memory with UXN */
-    mov     x4, #0x80000000
-    add     x4, x4, #0x405
-    movk    x4, #0x0040, lsl #48
-    str     x4, [x3, #16]
-    mov     x4, #0xC0000000
-    add     x4, x4, #0x405
-    movk    x4, #0x0040, lsl #48
-    str     x4, [x3, #24]
+
+    /* Initialize TTBR1 L2 table 0 (maps 0x00000000-0x3FFFFFFF)
+     * First 512MB = device memory (256 x 2MB blocks)
+     * Rest = normal memory
+     * For now, just map first few blocks as device */
+    ldr     x5, =boot_l2_ttbr1_0
+    add     x5, x5, x28             // Physical address of L2 table 0
+    mov     x6, #0                  // Physical address counter
+    mov     x7, #256                // 256 entries (512 entries per L2, we do first 256 as device)
+    /* Device memory entries (0x00000000-0x1FFFFFFF) */
+.Lttbr1_l2_0_device:
+    cbz     x7, .Lttbr1_l2_0_normal
+    mov     x4, x6
+    add     x4, x4, #0x401          // Valid + AF + Device (AttrIndx=0)
+    movk    x4, #0x0060, lsl #48    // UXN + PXN (no execute)
+    str     x4, [x5], #8
+    add     x6, x6, #0x200000       // Next 2MB block
+    sub     x7, x7, #1
+    b       .Lttbr1_l2_0_device
+.Lttbr1_l2_0_normal:
+    /* Remaining entries as normal memory (0x20000000-0x3FFFFFFF) */
+    mov     x7, #256
+.Lttbr1_l2_0_normal_loop:
+    cbz     x7, .Lttbr1_l2_1_setup
+    mov     x4, x6
+    add     x4, x4, #0x705          // Valid + AF + Normal + SH=Inner
+    movk    x4, #0x0040, lsl #48    // UXN only (EL1 can execute)
+    str     x4, [x5], #8
+    add     x6, x6, #0x200000       // Next 2MB block
+    sub     x7, x7, #1
+    b       .Lttbr1_l2_0_normal_loop
+
+.Lttbr1_l2_1_setup:
+    /* Initialize TTBR1 L2 table 1 (maps 0x40000000-0x7FFFFFFF)
+     * This is where kernel code lives - all normal memory */
+    ldr     x5, =boot_l2_ttbr1_1
+    add     x5, x5, x28             // Physical address of L2 table 1
+    mov     x6, #0x40000000         // Physical address counter
+    mov     x7, #512                // 512 entries
+.Lttbr1_l2_1_loop:
+    cbz     x7, .Lttbr1_l2_done
+    mov     x4, x6
+    add     x4, x4, #0x705          // Valid + AF + Normal + SH=Inner
+    movk    x4, #0x0040, lsl #48    // UXN only (EL1 can execute)
+    str     x4, [x5], #8
+    add     x6, x6, #0x200000       // Next 2MB block
+    sub     x7, x7, #1
+    b       .Lttbr1_l2_1_loop
+
+.Lttbr1_l2_done:
 
     /* Set MAIR_EL1: Memory Attribute Indirection Register
      * Attr0: Device-nGnRnE (0x00)
@@ -272,38 +394,80 @@ bss_done:
     dsb     ish
     isb
 
-    /* Enable MMU via SCTLR_EL1 */
-    mrs     x4, sctlr_el1
+    /* Debug: 'P' = page tables ready, about to enable MMU */
+    debug_uart_char_mt7988_phys 'P'
+    debug_uart_char_qemu_phys 'P'
+
+    /* Enable MMU via SCTLR_EL1
+     * Start from a known good state rather than ORing into unknown values.
+     * This is important for QEMU which starts at EL1 with different defaults.
+     */
+    mov     x4, xzr                 // Start with 0
     orr     x4, x4, #(1 << 0)       // M: Enable MMU
     orr     x4, x4, #(1 << 2)       // C: Enable data cache
     orr     x4, x4, #(1 << 12)      // I: Enable instruction cache
     mov     x5, #(1 << 26)
     orr     x4, x4, x5              // UCI: Allow cache maint from EL0
-    /* Enable PAN (Privileged Access Never) for security
-     * SPAN (bit 23) = 0 means PSTATE.PAN = 1 on exception entry
-     * This prevents kernel from accidentally accessing user memory */
-    mov     x5, #(1 << 23)
-    bic     x4, x4, x5              // Clear SPAN to enable PAN
+    mov     x5, #(1 << 29)
+    orr     x4, x4, x5              // LSMAOE: Load/Store Multiple Atomicity and Ordering Enable
+    mov     x5, #(1 << 28)
+    orr     x4, x4, x5              // nTLSMD: No Trap Load/Store Multiple to Device-nGRE/nGnRE/nGnRnE
+    /* Note: SPAN (bit 23) = 0 for PAN (Privileged Access Never) security */
     msr     sctlr_el1, x4
+    isb
+
+    /* Full cache and TLB maintenance after MMU enable.
+     * This ensures instruction fetches from new virtual addresses work correctly. */
+    tlbi    vmalle1                 // Invalidate all TLB entries for EL1
+    dsb     nsh                     // Wait for TLB invalidation
+    ic      iallu                   // Invalidate all instruction caches
+    dsb     nsh                     // Wait for icache invalidation
+    isb                             // Synchronize context
+
+    /* Debug: 'E' = MMU enabled, still at physical address */
+    debug_uart_char_mt7988_phys 'E'
+    debug_uart_char_qemu_phys 'E'
+
+    /* Ensure all interrupts/exceptions are masked at PSTATE level.
+     * This should already be set from _start but let's be explicit. */
+    msr     daifset, #0xf           // Mask D, A, I, F
+
+    /* Set up early exception handler using PHYSICAL address.
+     * This ensures exceptions work even if TTBR1 instruction fetch fails.
+     * The handler uses TTBR0 identity map for UART access anyway. */
+    adr     x5, early_exception_handler    // Physical address (PC-relative)
+    msr     vbar_el1, x5
     isb
 
     /*
      * MMU is now enabled. We're still running at physical address
      * via the TTBR0 identity mapping. Jump to TTBR1 virtual address.
+     *
+     * Use the linker symbol directly - this gives us the virtual address.
      */
-    ldr     x0, =post_mmu_entry     // Virtual address
+    ldr     x0, =post_mmu_entry     // x0 = virtual address (linker symbol)
+
+    /* Debug: print 'J' just before jump to virtual address */
+    debug_uart_char_mt7988_phys 'J'
+    debug_uart_char_qemu_phys 'J'
+
+    /* Branch to TTBR1 virtual address of post_mmu_entry */
     br      x0
 
 /*
  * Post-MMU entry point.
- * Now running at virtual address 0xFFFF_0000_46xx_xxxx.
+ * Now running at virtual address 0xFFFF_0000_xxxx_xxxx (TTBR1).
  * Stack already set (still valid via TTBR1).
  * Can use symbols directly without offset adjustment.
  */
 post_mmu_entry:
-    /* Re-set stack pointer to virtual address */
+    /* Now running at virtual address via TTBR1.
+     * Re-set stack pointer to virtual address. */
     ldr     x0, =__stack_top
     mov     sp, x0
+
+    /* Debug: 'M' = entered at MMU/virtual address */
+    debug_uart_char 'M'
 
     /*
      * Set up exception vectors using virtual address.
@@ -337,10 +501,173 @@ post_mmu_entry:
      * Jump to Rust entry point.
      * Rust code now runs with MMU enabled, all symbols valid.
      */
+    /* Debug: 'K' = about to call kmain */
+    debug_uart_char 'K'
     bl      kmain
 
 hang:
     wfe
+    b       hang
+
+/*
+ * Early exception handler for debugging MMU setup.
+ * Prints 'X' and exception info, then hangs.
+ * Must be aligned to 0x800 (2KB) for VBAR.
+ *
+ * Vector offsets from VBAR:
+ *   0x000 - Sync from curr EL with SP_EL0
+ *   0x080 - IRQ from curr EL with SP_EL0
+ *   0x100 - FIQ from curr EL with SP_EL0
+ *   0x180 - SError from curr EL with SP_EL0
+ *   0x200 - Sync from curr EL with SP_ELx
+ *   0x280 - IRQ from curr EL with SP_ELx
+ *   0x300 - FIQ from curr EL with SP_ELx
+ *   0x380 - SError from curr EL with SP_ELx
+ */
+.balign 0x800
+early_exception_handler:
+    /* Sync from curr EL with SP_EL0 - offset 0x000 */
+    debug_uart_char_mt7988_phys 'X'
+    debug_uart_char_qemu_phys 'X'
+    debug_uart_char_mt7988_phys '0'
+    debug_uart_char_qemu_phys '0'
+    b       early_exc_dump
+
+.balign 0x80
+early_exc_irq_sp0:
+    debug_uart_char_mt7988_phys 'X'
+    debug_uart_char_qemu_phys 'X'
+    debug_uart_char_mt7988_phys '1'
+    debug_uart_char_qemu_phys '1'
+    b       early_exc_dump
+
+.balign 0x80
+early_exc_fiq_sp0:
+    debug_uart_char_mt7988_phys 'X'
+    debug_uart_char_qemu_phys 'X'
+    debug_uart_char_mt7988_phys '2'
+    debug_uart_char_qemu_phys '2'
+    b       early_exc_dump
+
+.balign 0x80
+early_exc_serror_sp0:
+    debug_uart_char_mt7988_phys 'X'
+    debug_uart_char_qemu_phys 'X'
+    debug_uart_char_mt7988_phys '3'
+    debug_uart_char_qemu_phys '3'
+    b       early_exc_dump
+
+.balign 0x80
+early_exc_sync_spx:
+    /* Sync from curr EL with SP_ELx - offset 0x200 */
+    debug_uart_char_mt7988_phys 'X'
+    debug_uart_char_qemu_phys 'X'
+    debug_uart_char_mt7988_phys '4'
+    debug_uart_char_qemu_phys '4'
+    b       early_exc_dump
+
+.balign 0x80
+early_exc_irq_spx:
+    debug_uart_char_mt7988_phys 'X'
+    debug_uart_char_qemu_phys 'X'
+    debug_uart_char_mt7988_phys '5'
+    debug_uart_char_qemu_phys '5'
+    b       early_exc_dump
+
+.balign 0x80
+early_exc_fiq_spx:
+    debug_uart_char_mt7988_phys 'X'
+    debug_uart_char_qemu_phys 'X'
+    debug_uart_char_mt7988_phys '6'
+    debug_uart_char_qemu_phys '6'
+    b       early_exc_dump
+
+.balign 0x80
+early_exc_serror_spx:
+    debug_uart_char_mt7988_phys 'X'
+    debug_uart_char_qemu_phys 'X'
+    debug_uart_char_mt7988_phys '7'
+    debug_uart_char_qemu_phys '7'
+    b       early_exc_dump
+
+/* Common exception dump - print ESR EC as 2 hex digits and ELR */
+early_exc_dump:
+    /* Save ESR and ELR */
+    mrs     x19, esr_el1            // x19 = ESR
+    mrs     x20, elr_el1            // x20 = ELR
+
+    /* Print ' E=' */
+    movz    x10, #0x0900, lsl #16   // UART base
+    mov     w11, #' '
+    str     w11, [x10]
+    mov     w11, #'E'
+    str     w11, [x10]
+    mov     w11, #'='
+    str     w11, [x10]
+
+    /* Print EC (bits 31:26) as 2 hex digits */
+    lsr     x0, x19, #26            // EC in bits 5:0
+    and     x0, x0, #0x3f           // 6 bits
+
+    /* High nibble (bits 5:4) */
+    lsr     x1, x0, #4
+    and     x1, x1, #0xf
+    cmp     x1, #10
+    b.lt    1f
+    add     x1, x1, #('A' - 10)
+    b       2f
+1:  add     x1, x1, #'0'
+2:  str     w1, [x10]
+
+    /* Low nibble (bits 3:0) */
+    and     x1, x0, #0xf
+    cmp     x1, #10
+    b.lt    3f
+    add     x1, x1, #('A' - 10)
+    b       4f
+3:  add     x1, x1, #'0'
+4:  str     w1, [x10]
+
+    /* Print ' P=' for PC (ELR) */
+    mov     w11, #' '
+    str     w11, [x10]
+    mov     w11, #'P'
+    str     w11, [x10]
+    mov     w11, #'='
+    str     w11, [x10]
+
+    /* Print ELR high 32 bits (top 8 hex digits) */
+    mov     x21, #60                // Start at bit 60 (15 nibbles * 4 = 60, but we do 8 for high)
+    mov     x22, #8                 // 8 hex digits
+5:  cbz     x22, 6f
+    lsr     x1, x20, x21
+    and     x1, x1, #0xf
+    cmp     x1, #10
+    b.lt    51f
+    add     x1, x1, #('A' - 10)
+    b       52f
+51: add     x1, x1, #'0'
+52: str     w1, [x10]
+    sub     x21, x21, #4
+    sub     x22, x22, #1
+    b       5b
+6:
+    /* Print low 8 hex digits */
+    mov     x21, #28                // Start at bit 28
+    mov     x22, #8
+7:  cbz     x22, 8f
+    lsr     x1, x20, x21
+    and     x1, x1, #0xf
+    cmp     x1, #10
+    b.lt    71f
+    add     x1, x1, #('A' - 10)
+    b       72f
+71: add     x1, x1, #'0'
+72: str     w1, [x10]
+    sub     x21, x21, #4
+    sub     x22, x22, #1
+    b       7b
+8:
     b       hang
 
 /*
@@ -595,7 +922,15 @@ irq_handler:
     b       irq_from_user           // Came from EL0 (user)
 
 /*
- * IRQ from kernel mode - simple save/restore on kernel stack
+ * IRQ from kernel mode - save/restore on kernel stack
+ * Now supports reschedule (e.g., for preempting idle task when a task wakes)
+ *
+ * If do_resched_if_needed triggers a context switch:
+ * 1. context_switch saves callee-saved regs (x19-x30, sp) to current task's CpuContext
+ * 2. Loads next task's CpuContext and returns to that task
+ * 3. Later, when we're switched back, context_switch returns here
+ * 4. sp is restored, so our saved ELR/SPSR are still on the stack
+ * 5. We restore and eret back to where the kernel was interrupted
  */
 irq_from_kernel:
     /* Save all caller-saved registers */
@@ -616,9 +951,25 @@ irq_from_kernel:
     stp     x1, x2, [sp, #-16]!
     str     x0, [sp, #-8]!
 
-    /* Call Rust IRQ handler (no preemption for kernel IRQs) */
+    /* Save ELR and SPSR - these must survive a potential context switch.
+     * If we context_switch away and back, sp is restored so these stay valid. */
+    mrs     x10, elr_el1
+    mrs     x11, spsr_el1
+    stp     x10, x11, [sp, #-16]!
+
+    /* Call Rust IRQ handler */
     mov     x0, #0                  // from_user = false
     bl      irq_handler_rust
+
+    /* Check if reschedule is needed (e.g., timer woke a task).
+     * This may context_switch to another task. When we're switched back,
+     * we return here with sp restored, so ELR/SPSR are still on our stack. */
+    bl      do_resched_if_needed
+
+    /* Restore ELR and SPSR (saved before potential context switch) */
+    ldp     x10, x11, [sp], #16
+    msr     elr_el1, x10
+    msr     spsr_el1, x11
 
     /* Restore registers */
     ldr     x0, [sp], #8
@@ -923,6 +1274,16 @@ boot_l0_ttbr1:
 .global boot_l1_ttbr1
 boot_l1_ttbr1:
     .fill 512, 8, 0             // 512 entries, all zero initially
+
+.balign 4096
+.global boot_l2_ttbr1_0
+boot_l2_ttbr1_0:
+    .fill 512, 8, 0             // L2 table for TTBR1 entry 0 (0x00000000-0x3FFFFFFF)
+
+.balign 4096
+.global boot_l2_ttbr1_1
+boot_l2_ttbr1_1:
+    .fill 512, 8, 0             // L2 table for TTBR1 entry 1 (0x40000000-0x7FFFFFFF)
 
 /* Global variables for Rust MMU code */
 .section .data

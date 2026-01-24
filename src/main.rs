@@ -63,11 +63,16 @@ pub extern "C" fn kmain() -> ! {
     print_direct!("\x1bc");
 
     percpu::init_boot_cpu();
+    task::init_scheduler();  // Explicitly init scheduler for platforms with static init issues
     sync::verify_pan_enabled();
 
     // Initialize logging/tracing infrastructure
     klog::init();      // Structured logging (LOG_RING → UART)
     ktrace::init();    // Span-based tracing (TRACE_RING)
+
+    // Debug: check slots after klog/ktrace init
+    let klog_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
+    print_direct!("After klog/ktrace init: {} free slots\r\n", klog_slots);
 
     // Boot banner (direct UART - useful for early debug)
     print_direct!("\r\n========================================\r\n");
@@ -126,6 +131,10 @@ pub extern "C" fn kmain() -> ! {
         kinfo!("gic", "uart_irq_enabled"; irq = plat::irq::UART0);
     }
 
+    // Debug: check slots after GIC init
+    let gic_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
+    print_direct!("After GIC init: {} free slots\r\n", gic_slots);
+
     // MMU info (already initialized by boot.S)
     kinfo!("mmu", "status"; ttbr0 = "user", ttbr1 = "kernel");
     mmu::print_info();
@@ -137,6 +146,10 @@ pub extern "C" fn kmain() -> ! {
         // Note: pmm::init() logs init_ok with details
     }
 
+    // Debug: check slots after PMM init
+    let pmm_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
+    print_direct!("After PMM init: {} free slots\r\n", pmm_slots);
+
     // DMA pools
     {
         let _span = span!("dma", "init");
@@ -144,6 +157,10 @@ pub extern "C" fn kmain() -> ! {
         dma_pool::init_high();
         kinfo!("dma", "pools_ready");
     }
+
+    // Debug: check slots after DMA init
+    let dma_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
+    print_direct!("After DMA init: {} free slots\r\n", dma_slots);
 
     // Shared memory
     {
@@ -159,12 +176,20 @@ pub extern "C" fn kmain() -> ! {
         kinfo!("pci", "init_ok");
     }
 
+    // Debug: check slots after PCI init
+    let pci_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
+    print_direct!("After PCI init: {} free slots\r\n", pci_slots);
+
     // Bus controllers
     {
         let _span = span!("bus", "init");
         bus::init(0);  // Kernel PID = 0
         kinfo!("bus", "init_ok");
     }
+
+    // Debug: check slots after bus init
+    let bus_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
+    print_direct!("After bus init: {} free slots\r\n", bus_slots);
 
     // Watchdog (MT7988A only)
     #[cfg(feature = "platform-mt7988a")]
@@ -185,13 +210,27 @@ pub extern "C" fn kmain() -> ! {
     // SMP
     {
         let _span = span!("smp", "init");
+        let free_before = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
         smp::init();
+        let free_after = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
+        if free_before != free_after {
+            print_direct!("SMP: slots changed from {} to {}\r\n", free_before, free_after);
+        }
         kinfo!("smp", "init_ok");
     }
 
     // Flush logs before self-tests
     klog::flush();
     ktrace::flush();
+
+    // Debug: check slots after flush
+    let (sched_addr, slots_after_flush) = unsafe {
+        let sched = task::scheduler();
+        let addr = sched as *const _ as usize;
+        let free = sched.iter_tasks().filter(|(_, t)| t.is_none()).count();
+        (addr, free)
+    };
+    print_direct!("After flush: SCHEDULER at 0x{:x}, {} free slots\r\n", sched_addr, slots_after_flush);
 
     // =========================================================================
     // Self-tests (only when compiled with --features selftest)
@@ -258,12 +297,37 @@ pub extern "C" fn kmain() -> ! {
     timer::start(10);
     kinfo!("timer", "preemption_started"; slice_ms = 10u64);
     klog::flush();  // DEBUG: flush after timer start
+
+    // Note: idle task is created automatically by init_scheduler() in slot 0
     kinfo!("kernel", "scheduler_ready");
     klog::flush();  // DEBUG: flush after scheduler ready
 
     // Spawn devd (init process) - after scheduler is ready
     kinfo!("kernel", "spawning_devd");
     klog::flush();
+
+    // Debug: check scheduler state before spawning devd
+    let (occupied, empty) = unsafe {
+        let sched = task::scheduler();
+        let occupied = sched.iter_tasks().filter(|(_, t)| t.is_some()).count();
+        let empty = sched.iter_tasks().filter(|(_, t)| t.is_none()).count();
+        (occupied, empty)
+    };
+    print_direct!("Scheduler: {} occupied, {} empty slots\r\n", occupied, empty);
+    print_direct!("Task size: {} bytes, Option<Task> size: {} bytes\r\n",
+        core::mem::size_of::<task::Task>(),
+        core::mem::size_of::<Option<task::Task>>());
+
+    // Debug: check first slot's raw state
+    unsafe {
+        let sched = task::scheduler();
+        if let Some(task) = sched.task(0) {
+            print_direct!("Slot 0: is_some=true, id={}, parent={}, is_user={}\r\n",
+                task.id, task.parent_id, task.is_user);
+        } else {
+            print_direct!("Slot 0: is_none=true\r\n");
+        }
+    }
     let slot1 = {
         let _span = span!("elf", "spawn"; path = "bin/devd");
         match elf::spawn_from_path("bin/devd") {
@@ -404,8 +468,9 @@ pub extern "C" fn irq_exit_resched() {
         sync::cpu_flags().clear_unhandled_stats();
     }
 
-    // 3. Flush log buffer before returning to user
-    klog::flush();
+    // 3. Don't flush all logs here - let timer tick drain gradually
+    // Calling flush() here caused UART saturation feedback loop in QEMU
+    // where output took longer than timer interval, causing cascading delays
 }
 
 /// Print a hex value directly to UART (no allocations, no logging)
@@ -433,16 +498,16 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
     }
 
     // Get current task info
-    let (pid, parent_id, task_name) = unsafe {
+    let (pid, parent_id, task_name, is_init) = unsafe {
         let sched = kernel::task::scheduler();
         let slot = kernel::task::current_slot();
         if let Some(task) = sched.task(slot) {
             let mut name = [0u8; 16];
             let name_len = task.name.len().min(16);
             name[..name_len].copy_from_slice(&task.name[..name_len]);
-            (task.id, task.parent_id, name)
+            (task.id, task.parent_id, name, task.is_init)
         } else {
-            (0, 0, [0u8; 16])
+            (0, 0, [0u8; 16], false)
         }
     };
 
@@ -475,8 +540,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
     print_hex_uart(far);
     print_str_uart("\r\n");
 
-    // Special handling for PID 1 (devd/init)
-    if pid == 1 {
+    // Special handling for init process (devd)
+    if is_init {
         print_str_uart("  CRITICAL: init (devd) crashed!\r\n");
         print_str_uart("  Attempting recovery...\r\n");
 
@@ -485,7 +550,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_str_uart("  Killing all tasks...\r\n");
         unsafe {
             let sched = kernel::task::scheduler();
-            for slot_idx in 0..kernel::task::MAX_TASKS {
+            // Start from slot 1 - slot 0 is the idle task which must never be killed
+            for slot_idx in 1..kernel::task::MAX_TASKS {
                 if let Some(task) = sched.task(slot_idx) {
                     let pid = task.id;
                     print_str_uart("  slot[");
@@ -498,7 +564,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                     }
                     print_str_uart("'\r\n");
 
-                    if pid != 0 {  // Don't kill kernel (PID 0 if it exists)
+                    if slot_idx != 0 {  // Extra safety: skip idle (slot 0)
                         // Cleanup resources
                         kernel::bus::process_cleanup(pid);
                         kernel::shmem::process_cleanup(pid);
@@ -621,6 +687,25 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
 
         // Schedule next task
         if let Some(next_slot) = sched.schedule() {
+            // Idle task (slot 0) is a kernel task - can't eret to it
+            // Instead, enter the idle loop directly
+            if next_slot == 0 {
+                print_str_uart("  Next task is idle, entering idle loop...\r\n");
+                kernel::task::set_current_slot(0);
+                if let Some(task) = sched.task_mut(0) {
+                    let _ = task.set_running();
+                }
+                // Enter idle loop - this doesn't return
+                kernel::idle::idle_entry();
+            }
+
+            // Switch address space BEFORE changing current slot
+            if let Some(next) = sched.task(next_slot) {
+                if let Some(ref addr_space) = next.address_space {
+                    addr_space.activate();
+                }
+            }
+
             kernel::task::set_current_slot(next_slot);
             if let Some(task) = sched.task_mut(next_slot) {
                 let _ = task.set_running();
@@ -724,10 +809,11 @@ pub extern "C" fn recover_devd() {
     print_str_uart("  Killing all tasks...\r\n");
     unsafe {
         let sched = kernel::task::scheduler();
-        for slot_idx in 0..kernel::task::MAX_TASKS {
+        // Start from slot 1 - slot 0 is the idle task which must never be killed
+        for slot_idx in 1..kernel::task::MAX_TASKS {
             if let Some(task) = sched.task(slot_idx) {
                 let pid = task.id;
-                if pid != 0 {  // Don't kill kernel (PID 0 if it exists)
+                if slot_idx != 0 {  // Extra safety: skip idle (slot 0)
                     // Cleanup resources
                     kernel::bus::process_cleanup(pid);
                     kernel::shmem::process_cleanup(pid);

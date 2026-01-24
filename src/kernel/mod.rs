@@ -46,6 +46,7 @@ pub mod object;
 pub mod irq;
 pub mod object_service;
 pub mod blocking;
+pub mod idle;
 
 // New syscall-facing trait implementations
 pub mod syscall_ctx_impl;

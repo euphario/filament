@@ -242,6 +242,15 @@ pub fn handle(args: &SyscallArgs) -> i64 {
     let syscall = SyscallNumber::from(args.num);
     let pid = current_pid();
 
+    // DEBUG: Log all syscalls from devd (pid=1) to trace the loop
+    static mut DEVD_SYSCALL_COUNT: u32 = 0;
+    if pid == 1 {
+        let count = unsafe { DEVD_SYSCALL_COUNT += 1; DEVD_SYSCALL_COUNT };
+        if count > 100 && count < 110 {
+            crate::print_direct!("DEVD[{}]: syscall {} x0=0x{:x}\r\n", count, args.num, args.arg0);
+        }
+    }
+
     // Get syscall name for tracing (only for non-trivial syscalls)
     let syscall_name = syscall_name(syscall);
 
@@ -384,9 +393,10 @@ pub extern "C" fn syscall_handler_rust(
                 task.liveness_state = super::liveness::LivenessState::Normal;
             }
 
-            // Debug: log if devd (slot 0) enters a syscall in unexpected state
-            if slot == 0 && !matches!(*task.state(), super::task::TaskState::Running) {
-                crate::print_direct!("[SDBG] devd syscall entry state={:?} num={}\n", task.state(), num);
+            // Debug: log if ANY task enters a syscall in unexpected state
+            // (task should be Running when making syscalls)
+            if !matches!(*task.state(), super::task::TaskState::Running) {
+                crate::print_direct!("[SDBG] slot={} syscall entry state={:?} num={}\n", slot, task.state(), num);
             }
         }
     }
