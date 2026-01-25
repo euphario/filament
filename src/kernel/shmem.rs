@@ -733,8 +733,7 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
 
     // Mark task as blocked - syscall layer will handle scheduling
     // Calculate deadline first, then set state, then notify scheduler
-    let deadline_to_notify: Option<u64> = unsafe {
-        let mut sched = super::task::scheduler();
+    let deadline_to_notify: Option<u64> = super::task::with_scheduler(|sched| {
         if let Some(task) = sched.current_task_mut() {
             // Set wake timeout if specified
             let timeout = if timeout_ms > 0 {
@@ -761,13 +760,13 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
         } else {
             None
         }
-    };
+    });
 
     // Notify scheduler of deadline for tickless optimization (outside task borrow)
     if let Some(deadline) = deadline_to_notify {
-        unsafe {
-            super::task::scheduler().note_deadline(deadline);
-        }
+        super::task::with_scheduler(|sched| {
+            sched.note_deadline(deadline);
+        });
     }
 
     // Return "would block" - syscall exit path will reschedule
@@ -798,9 +797,8 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
     // shmem lock released here before touching scheduler
 
     // Wake all waiters using O(1) PID→slot lookup
-    let mut woken = 0u32;
-    unsafe {
-        let mut sched = super::task::scheduler();
+    let woken = super::task::with_scheduler(|sched| {
+        let mut woken = 0u32;
         for waiter_pid in waiters.iter() {
             if *waiter_pid == NO_PID {
                 continue;
@@ -809,7 +807,8 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
                 woken += 1;
             }
         }
-    }
+        woken
+    });
 
     Ok(woken)
 }
@@ -862,9 +861,7 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
     // shmem lock released here before touching scheduler
 
     // Safe to unmap - only owner has it mapped
-    unsafe {
-        unmap_from_all_processes(phys_addr, size);
-    }
+    unmap_from_all_processes(phys_addr, size);
 
     // Clear slot and free physical memory
     {
@@ -882,28 +879,28 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
 
 /// Unmap a physical address range from all processes
 /// Used when destroying shared memory to prevent use-after-free
-unsafe fn unmap_from_all_processes(phys_addr: u64, size: usize) {
-    let mut sched = super::task::scheduler();
+fn unmap_from_all_processes(phys_addr: u64, size: usize) {
+    super::task::with_scheduler(|sched| {
+        for (_slot, task_opt) in sched.iter_tasks_mut() {
+            if let Some(task) = task_opt {
+                // Search task's heap mappings for this physical address
+                // First find the virtual address, then unmap (avoids borrow issues)
+                let mut virt_to_unmap = None;
+                for mapping in task.heap_mappings.iter() {
+                    if !mapping.is_empty() && mapping.phys_addr == phys_addr {
+                        virt_to_unmap = Some(mapping.virt_addr);
+                        break; // Each task should only have one mapping to this phys
+                    }
+                }
 
-    for (_slot, task_opt) in sched.iter_tasks_mut() {
-        if let Some(task) = task_opt {
-            // Search task's heap mappings for this physical address
-            // First find the virtual address, then unmap (avoids borrow issues)
-            let mut virt_to_unmap = None;
-            for mapping in task.heap_mappings.iter() {
-                if !mapping.is_empty() && mapping.phys_addr == phys_addr {
-                    virt_to_unmap = Some(mapping.virt_addr);
-                    break; // Each task should only have one mapping to this phys
+                // Now unmap if we found a mapping
+                // Note: munmap() won't free pages because kind is BorrowedShmem
+                if let Some(virt_addr) = virt_to_unmap {
+                    task.munmap(virt_addr, size);
                 }
             }
-
-            // Now unmap if we found a mapping
-            // Note: munmap() won't free pages because kind is BorrowedShmem
-            if let Some(virt_addr) = virt_to_unmap {
-                task.munmap(virt_addr, size);
-            }
         }
-    }
+    });
 }
 
 /// Map physical memory into a process's address space for DMA
@@ -911,9 +908,7 @@ unsafe fn unmap_from_all_processes(phys_addr: u64, size: usize) {
 /// is primarily used for DMA rings where CPU cache coherency with
 /// PCIe/USB devices is critical.
 fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
-    unsafe {
-        let mut sched = super::task::scheduler();
-
+    super::task::with_scheduler(|sched| {
         // Find the task
         if let Some(slot) = sched.slot_by_pid(pid) {
             if let Some(task) = sched.task_mut(slot) {
@@ -923,8 +918,8 @@ fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
                     .ok_or(-12i64); // ENOMEM
             }
         }
-    }
-    Err(-3) // ESRCH - no such process
+        Err(-3) // ESRCH - no such process
+    })
 }
 
 /// Phase 1: Begin cleanup - mark regions as Dying and notify mappers
@@ -1026,9 +1021,7 @@ pub fn finalize_cleanup(pid: Pid) {
         let num_pages = size / 4096;
 
         // CRITICAL: Unmap from ALL other processes before freeing
-        unsafe {
-            unmap_from_all_processes(phys_addr, size);
-        }
+        unmap_from_all_processes(phys_addr, size);
 
         // Clear the slot and clean up all mappings for this region
         {

@@ -747,17 +747,20 @@ pub fn broadcast_event(event: Event) -> usize {
 /// Returns: 0 on success, negative error (-13 = EACCES for permission denied)
 pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
     // First, check capabilities for privileged event types
-    unsafe {
-        let sched = super::task::scheduler();
+    let cap_denied = super::task::with_scheduler(|sched| {
         if let Some(task) = sched.current_task() {
             // IRQ events require IRQ_CLAIM capability
             if event_type == 3 {
                 if !task.has_capability(super::caps::Capabilities::IRQ_CLAIM) {
                     super::security_log::log_capability_denied(pid, "IRQ_CLAIM", "event_subscribe");
-                    return -13; // EACCES
+                    return true;
                 }
             }
         }
+        false
+    });
+    if cap_denied {
+        return -13; // EACCES
     }
 
     let ev_type = match event_type {
@@ -772,16 +775,15 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
         _ => return -1,
     };
 
-    unsafe {
-        let mut sched = super::task::scheduler();
+    super::task::with_scheduler(|sched| {
         if let Some(task) = sched.current_task_mut() {
             match task.event_queue.subscribe(ev_type, filter) {
                 Ok(()) => return 0,
                 Err(e) => return e,
             }
         }
-    }
-    -1 // No current task
+        -1 // No current task
+    })
 }
 
 /// Unsubscribe from events
@@ -798,15 +800,14 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
         _ => return -1,
     };
 
-    unsafe {
-        let mut sched = super::task::scheduler();
+    super::task::with_scheduler(|sched| {
         if let Some(task) = sched.current_task_mut() {
             if task.event_queue.unsubscribe(ev_type, filter) {
                 return 0;
             }
         }
-    }
-    -1
+        -1
+    })
 }
 
 /// Wait for an event (blocking or non-blocking)
@@ -816,8 +817,7 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
 /// NOTE: This is the low-level implementation. The syscall handler in
 /// syscall.rs wraps this with proper uaccess for copying to userspace.
 pub fn sys_event_wait_internal(flags: u32) -> Option<Event> {
-    unsafe {
-        let mut sched = super::task::scheduler();
+    super::task::with_scheduler(|sched| {
         if let Some(task) = sched.current_task_mut() {
             // Check task's event queue directly (no global system)
             if let Some(event) = task.event_queue.pop() {
@@ -833,8 +833,8 @@ pub fn sys_event_wait_internal(flags: u32) -> Option<Event> {
             // Would block - mark task as sleeping on event loop
             let _ = task.set_sleeping(super::task::SleepReason::EventLoop);
         }
-    }
-    None
+        None
+    })
 }
 
 /// Post an event to another process
@@ -853,18 +853,20 @@ pub fn sys_event_post(target_pid: u32, event_type: u32, data: u64, caller_pid: u
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
 
     // Check signal allowlist before delivering
-    unsafe {
-        let sched = super::task::scheduler();
+    let check_result = super::task::with_scheduler(|sched| {
         if let Some(slot) = sched.slot_by_pid(target_pid) {
             if let Some(task) = sched.task(slot) {
                 if !task.can_receive_signal_from(caller_pid) {
                     super::security_log::log_signal_blocked(target_pid, caller_pid);
-                    return -13; // EACCES - sender not in allowlist
+                    return Err(-13i64); // EACCES - sender not in allowlist
                 }
+                return Ok(());
             }
-        } else {
-            return -3; // ESRCH - process not found
         }
+        Err(-3i64) // ESRCH - process not found
+    });
+    if let Err(e) = check_result {
+        return e;
     }
 
     let event = Event::signal(data as u32, caller_pid);

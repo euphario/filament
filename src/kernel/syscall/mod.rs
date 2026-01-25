@@ -206,16 +206,13 @@ fn uaccess_to_errno(e: UAccessError) -> i64 {
 
 /// Get current process ID from scheduler
 fn current_pid() -> u32 {
-    unsafe {
-        super::task::scheduler().current_task_id().unwrap_or(1)
-    }
+    super::task::with_scheduler(|sched| sched.current_task_id().unwrap_or(1))
 }
 
 /// Check if current task has the required capability
 /// Returns Ok(()) if the capability is present, or an error code if not
 pub(crate) fn require_capability(cap: Capabilities) -> Result<(), i64> {
-    unsafe {
-        let sched = super::task::scheduler();
+    super::task::with_scheduler(|sched| {
         if let Some(task) = sched.current_task() {
             if task.has_capability(cap) {
                 return Ok(());
@@ -228,8 +225,8 @@ pub(crate) fn require_capability(cap: Capabilities) -> Result<(), i64> {
             );
             kwarn!("security", "cap_denied"; pid = task.id as u64, cap = core::any::type_name_of_val(&cap));
         }
-    }
-    Err(SyscallError::PermissionDenied as i64)
+        Err(SyscallError::PermissionDenied as i64)
+    })
 }
 
 // ============================================================================
@@ -372,9 +369,8 @@ pub extern "C" fn syscall_handler_rust(
     arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, _unused: u64, num: u64
 ) -> i64 {
     // Storm protection: check if task is making too many syscalls
-    let storm_action = unsafe {
+    let storm_action = super::task::with_scheduler(|sched| {
         let slot = super::task::current_slot();
-        let mut sched = super::task::scheduler();
         if let Some(task) = sched.task_mut(slot) {
             // Use logical ticks computed from hardware counter (not IRQ-incremented)
             // This is more reliable since it doesn't depend on timer IRQ firing
@@ -393,7 +389,7 @@ pub extern "C" fn syscall_handler_rust(
         } else {
             super::storm::StormAction::Allow
         }
-    };
+    });
 
     // Handle storm action BEFORE processing syscall
     match storm_action {
@@ -404,10 +400,10 @@ pub extern "C" fn syscall_handler_rust(
             const THROTTLE_DURATION_NS: u64 = 1_000_000_000; // 1 second
             let deadline = crate::platform::current::timer::deadline_ns(THROTTLE_DURATION_NS);
 
-            let pid = unsafe {
-                super::task::scheduler().task(super::task::current_slot())
+            let pid = super::task::with_scheduler(|sched| {
+                sched.task(super::task::current_slot())
                     .map(|t| t.id).unwrap_or(0)
-            };
+            });
             crate::kwarn!("storm", "throttle_block";
                 pid = pid as u64,
                 syscall = num,
@@ -433,10 +429,10 @@ pub extern "C" fn syscall_handler_rust(
         }
         super::storm::StormAction::Evict => {
             // Task exceeded strike limit - evict it
-            let pid = unsafe {
-                super::task::scheduler().task(super::task::current_slot())
+            let pid = super::task::with_scheduler(|sched| {
+                sched.task(super::task::current_slot())
                     .map(|t| t.id).unwrap_or(0)
-            };
+            });
             crate::kerror!("storm", "evict"; pid = pid as u64, syscall = num);
             super::task::eviction::mark_for_eviction(
                 pid,

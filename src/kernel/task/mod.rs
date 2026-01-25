@@ -1033,8 +1033,14 @@ pub static SYSCALL_SWITCHED_TASK: AtomicU64 = AtomicU64::new(0);
 /// sched.wake_task(slot);
 /// // Guard dropped, lock released
 /// ```
+///
+/// # Warning
+///
+/// This function is `pub(crate)` to prevent external code from holding the
+/// lock across function calls, which can cause deadlocks. External code should
+/// use `with_scheduler()` or `try_with_scheduler()` instead.
 #[inline]
-pub fn scheduler() -> super::lock::SpinLockGuard<'static, Scheduler> {
+pub(crate) fn scheduler() -> super::lock::SpinLockGuard<'static, Scheduler> {
     SCHEDULER.lock()
 }
 
@@ -1042,8 +1048,13 @@ pub fn scheduler() -> super::lock::SpinLockGuard<'static, Scheduler> {
 ///
 /// Returns None if the scheduler lock is already held.
 /// Useful for preventing deadlock when logging inside scheduler operations.
+///
+/// # Warning
+///
+/// This function is `pub(crate)` to prevent external code from holding the
+/// lock across function calls. External code should use `try_with_scheduler()`.
 #[inline]
-pub fn try_scheduler() -> Option<super::lock::SpinLockGuard<'static, Scheduler>> {
+pub(crate) fn try_scheduler() -> Option<super::lock::SpinLockGuard<'static, Scheduler>> {
     SCHEDULER.try_lock()
 }
 
@@ -1058,10 +1069,39 @@ pub fn try_scheduler() -> Option<super::lock::SpinLockGuard<'static, Scheduler>>
 ///
 /// The SpinLock is acquired before calling the closure and released after.
 /// IRQs are disabled for the duration (SpinLock does this automatically).
+///
+/// # Deadlock Prevention
+///
+/// The closure-based API ensures the lock is always released when the closure
+/// returns. This prevents the common bug of holding the scheduler lock while
+/// calling into other subsystems (uaccess, IPC, etc.) that might also need it.
 #[inline]
 pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
     let mut guard = SCHEDULER.lock();
     f(&mut *guard)
+}
+
+/// Try to execute a closure with scheduler access, returning None if lock is held.
+///
+/// This is useful when:
+/// - Called from code that might already hold the scheduler lock
+/// - Called from IRQ context where blocking is not acceptable
+/// - Need to fall back to a lock-free alternative (e.g., deferred wake queue)
+///
+/// # Example
+/// ```
+/// if let Some(result) = try_with_scheduler(|sched| {
+///     sched.wake_by_pid(pid)
+/// }) {
+///     // Lock acquired, operation completed
+/// } else {
+///     // Lock was held, use fallback (e.g., request_wake)
+///     cpu_flags().request_wake(pid);
+/// }
+/// ```
+#[inline]
+pub fn try_with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> Option<R> {
+    SCHEDULER.try_lock().map(|mut guard| f(&mut *guard))
 }
 
 // ============================================================================

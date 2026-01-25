@@ -204,21 +204,17 @@ const LOG_INTERVAL_CALLS: u64 = 3;  // Every ~3 seconds for debugging
 ///
 /// Returns number of actions taken (pings sent, channels closed, tasks killed)
 pub fn check_liveness(current_tick: u64) -> usize {
-    let mut actions = 0;
-
     // Track call count for periodic logging (hardware counter is MHz, not suitable)
     let call_count = unsafe {
         LOG_CALL_COUNT += 1;
         LOG_CALL_COUNT
     };
 
-    // Collect child exit notifications during the loop
-    // Process them after to avoid borrowing issues
-    let mut notifications: [Option<PendingNotification>; 4] = [None, None, None, None];
-    let mut notify_count = 0;
-
-    unsafe {
-        let mut sched = super::task::scheduler();
+    // Execute liveness check with scheduler lock, returning actions and notifications
+    let (actions, notifications, notify_count) = super::task::with_scheduler(|sched| {
+        let mut actions = 0usize;
+        let mut notifications: [Option<PendingNotification>; 4] = [None, None, None, None];
+        let mut notify_count = 0usize;
 
         // Count blocked tasks for logging
         let mut sleeping_count = 0u64;
@@ -377,7 +373,8 @@ pub fn check_liveness(current_tick: u64) -> usize {
             }
         }
 
-    } // End of unsafe scheduler block
+        (actions, notifications, notify_count)
+    }); // Scheduler lock released here
 
     // Process collected notifications via ObjectService (outside scheduler lock)
     for i in 0..notify_count {
@@ -453,11 +450,10 @@ fn close_channel_for_liveness(channel_id: u32) {
 
 /// Wake a task by PID
 fn wake_task(pid: u32) {
-    unsafe {
-        let mut sched = super::task::scheduler();
+    super::task::with_scheduler(|sched| {
         // Use unified wake function
         sched.wake_by_pid(pid);
-    }
+    });
 }
 
 /// Called when a task makes a syscall - reset liveness tracking

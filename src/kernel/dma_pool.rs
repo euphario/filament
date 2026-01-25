@@ -266,9 +266,7 @@ pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i6
         return Err(-1);
     }
 
-    unsafe {
-        let mut sched = super::task::scheduler();
-
+    super::task::with_scheduler(|sched| {
         // Find the task and map the memory
         if let Some(slot) = sched.slot_by_pid(pid) {
             if let Some(task) = sched.task_mut(slot) {
@@ -279,8 +277,8 @@ pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i6
                     .ok_or(-12i64); // ENOMEM
             }
         }
-    }
-    Err(-3) // ESRCH - no such process
+        Err(-3) // ESRCH - no such process
+    })
 }
 
 /// Map high DMA pool memory into a process's address space (36-bit addresses)
@@ -298,9 +296,7 @@ pub fn map_into_process_high(pid: Pid, phys_addr: u64, size: usize) -> Result<u6
         return Err(-1);
     }
 
-    unsafe {
-        let mut sched = super::task::scheduler();
-
+    super::task::with_scheduler(|sched| {
         if let Some(slot) = sched.slot_by_pid(pid) {
             if let Some(task) = sched.task_mut(slot) {
                 // Use dma_high mapping - no kernel-side zeroing/flush
@@ -308,8 +304,8 @@ pub fn map_into_process_high(pid: Pid, phys_addr: u64, size: usize) -> Result<u6
                     .ok_or(-12i64);
             }
         }
-    }
-    Err(-3)
+        Err(-3)
+    })
 }
 
 /// Get pool statistics
