@@ -233,19 +233,10 @@ fn verify_mapping(addr: u64, len: usize, needs_write: bool) -> Result<(), UAcces
         return Ok(());
     }
 
-    // Get current task's TTBR0 (page table root) through address_space
-    let ttbr0 = unsafe {
-        let sched = task::scheduler();
-        match sched.current_task() {
-            Some(task) => {
-                match &task.address_space {
-                    Some(addr_space) => addr_space.ttbr0,
-                    None => return Err(UAccessError::NotMapped), // Kernel task, no user space
-                }
-            }
-            None => return Err(UAccessError::NotMapped),
-        }
-    };
+    // Get current task's TTBR0 from global atomic to avoid acquiring scheduler lock.
+    // This is critical because verify_mapping is called from copy_to_user/copy_from_user
+    // which may be called while the scheduler lock is already held (e.g., sys_ps_info).
+    let ttbr0 = get_current_ttbr0()?;
 
     // Check each page in the range
     let start_page = addr & !(PAGE_SIZE as u64 - 1);
