@@ -389,17 +389,14 @@ pub fn write_bytes(bytes: &[u8]) {
 pub fn flush_buffer() {
     let mut buf = UART_BUFFER.lock();
 
-    // Drain up to 64 bytes per flush call to limit time spent
-    for _ in 0..64 {
-        if let Some(byte) = buf.pop() {
-            // Wait for space
-            while (uart_read(UARTFR) & FR_TXFF) != 0 {
-                core::hint::spin_loop();
-            }
-            uart_write(UARTDR, byte as u32);
-        } else {
-            break;
+    // Drain all buffered data to UART
+    // QEMU's virtual UART is fast so no need to limit bytes per call
+    while let Some(byte) = buf.pop() {
+        // Wait for space in TX FIFO
+        while (uart_read(UARTFR) & FR_TXFF) != 0 {
+            core::hint::spin_loop();
         }
+        uart_write(UARTDR, byte as u32);
     }
 }
 

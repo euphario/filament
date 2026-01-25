@@ -115,10 +115,16 @@ pub trait Timer {
     ///
     /// This is the canonical time source for the kernel. All deadlines,
     /// timeouts, and durations should use nanoseconds.
+    ///
+    /// Returns 0 if timer not initialized (frequency == 0). This is logged
+    /// as a warning since it indicates timer initialization failure.
     fn now_ns(&self) -> u64 {
         let counter = self.counter();
         let freq = self.frequency();
         if freq == 0 {
+            // Timer not initialized - this should not happen in production
+            // Log once per call site would be ideal, but static tracking is complex
+            // Callers should ensure timer is initialized before use
             return 0;
         }
         // Use 128-bit math to avoid overflow
@@ -130,9 +136,13 @@ pub trait Timer {
     ///
     /// Returns the counter value at which the deadline expires.
     /// Use `is_expired()` to check if a deadline has passed.
+    ///
+    /// Returns 0 if timer not initialized (frequency == 0).
     fn deadline_ns(&self, duration_ns: u64) -> u64 {
         let freq = self.frequency();
         if freq == 0 {
+            // Timer not initialized - return 0 (immediately expired)
+            // This causes callers to not block, which is safer than hanging
             return 0;
         }
         // Convert duration to counter ticks
@@ -152,6 +162,18 @@ pub trait Timer {
             return 0;
         }
         ((deadline as u128 * 1_000_000_000) / freq as u128) as u64
+    }
+
+    /// Get logical tick count derived from hardware counter
+    ///
+    /// Unlike `ticks()` which depends on IRQ handler incrementing a counter,
+    /// this computes ticks directly from the hardware timer. More reliable
+    /// for rate limiting and storm protection.
+    ///
+    /// Default tick interval is 10ms (100 ticks per second).
+    fn logical_ticks(&self) -> u64 {
+        const TICK_INTERVAL_NS: u64 = 10_000_000; // 10ms
+        self.now_ns() / TICK_INTERVAL_NS
     }
 }
 

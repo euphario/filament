@@ -60,8 +60,8 @@ impl TaskStateInfo {
 pub enum SleepReason {
     /// Waiting in event loop
     EventLoop,
-    /// Waiting for IPC
-    Ipc,
+    /// Waiting for hardware IRQ
+    Irq,
     /// Waiting for child process
     ChildWait,
     /// Other/unspecified reason

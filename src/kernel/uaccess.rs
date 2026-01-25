@@ -500,6 +500,12 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
         let l3_table = mmu::phys_to_virt(l3_table_phys) as *const u64;
         let l3_entry = core::ptr::read_volatile(l3_table.add(l3_index));
 
+        // DEBUG: trace access to top stack page (L3[511] in L3 at 0x4033f000)
+        if l3_table_phys == 0x4033f000 && l3_index == 511 {
+            crate::print_direct!("[UACCESS] L3[511] at 0x4033f000 = 0x{:x} for VA 0x{:x}\r\n",
+                l3_entry, virt_addr);
+        }
+
         if (l3_entry & flags::VALID) == 0 {
             return Err(UAccessError::NotMapped);
         }
@@ -518,6 +524,11 @@ fn user_virt_to_phys(ttbr0: u64, virt_addr: u64) -> Result<u64, UAccessError> {
 
         Ok(page_base | page_offset)
     }
+}
+
+/// Debug helper: translate user VA to PA without error handling
+pub fn user_virt_to_phys_debug(ttbr0: u64, virt_addr: u64) -> u64 {
+    user_virt_to_phys(ttbr0, virt_addr).unwrap_or(0xDEAD_DEAD)
 }
 
 /// Get the current task's TTBR0 (user page table root)
@@ -569,6 +580,14 @@ pub fn copy_from_user(kernel_buf: &mut [u8], user_ptr: u64) -> Result<usize, UAc
 
         // Access physical memory via TTBR1 kernel mapping
         let kernel_va = mmu::phys_to_virt(phys_addr);
+
+        // CRITICAL: Invalidate cache before reading to ensure we see user's writes
+        // User writes go through TTBR0 (cacheable), kernel reads via TTBR1.
+        // Without invalidate, we might read stale zeros from RAM instead of
+        // user's cached data. This is needed because ARM caches are VIPT/PIPT
+        // but QEMU may not fully simulate cache coherency across mappings.
+        cache_clean_range(kernel_va, chunk_size);
+
         unsafe {
             let src = kernel_va as *const u8;
             let dst = kernel_buf.as_mut_ptr().add(copied);
@@ -611,6 +630,11 @@ pub fn copy_to_user(user_ptr: u64, kernel_buf: &[u8]) -> Result<usize, UAccessEr
 
         // Access physical memory via TTBR1 kernel mapping
         let kernel_va = mmu::phys_to_virt(phys_addr);
+
+        // DEBUG: Canary check - verify L3[511] at 0x4033f000 before write
+        let l3_canary_va = mmu::phys_to_virt(0x4033fff8); // L3[511] at 0x4033f000 + 511*8
+        let canary_before = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
+
         unsafe {
             let src = kernel_buf.as_ptr().add(copied);
             let dst = kernel_va as *mut u8;
@@ -622,6 +646,17 @@ pub fn copy_to_user(user_ptr: u64, kernel_buf: &[u8]) -> Result<usize, UAccessEr
         // through the kernel's cached identity mapping. Without this cache clean,
         // user reads from non-cacheable mapping would see stale zeros.
         cache_clean_range(kernel_va, chunk_size);
+
+        // DEBUG: Canary check - verify L3[511] at 0x4033f000 after write + cache_clean
+        let canary_after = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
+        if canary_before != 0 && canary_after == 0 {
+            crate::print_direct!("[CORRUPT] L3[511] at 0x4033f000 corrupted by copy_to_user!\r\n");
+            crate::print_direct!("  before=0x{:x} after=0x{:x}\r\n", canary_before, canary_after);
+            crate::print_direct!("  user_addr=0x{:x} phys_addr=0x{:x} kernel_va=0x{:x} chunk_size={}\r\n",
+                user_addr, phys_addr, kernel_va, chunk_size);
+            // Panic to get stack trace
+            panic!("L3 entry corruption detected");
+        }
 
         copied += chunk_size;
     }

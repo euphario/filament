@@ -71,14 +71,7 @@ pub(super) fn sys_getpid() -> i64 {
 
 /// Get system time in nanoseconds
 pub(super) fn sys_gettime() -> i64 {
-    let counter = crate::platform::current::timer::counter();
-    let freq = crate::platform::current::timer::frequency();
-    // Convert counter to nanoseconds
-    if freq > 0 {
-        ((counter as u128 * 1_000_000_000) / freq as u128) as i64
-    } else {
-        0
-    }
+    crate::platform::current::timer::now_ns() as i64
 }
 
 /// Sleep until deadline (nanoseconds since boot)
@@ -88,23 +81,19 @@ pub(super) fn sys_gettime() -> i64 {
 /// Uses state machine for validated transitions.
 pub(super) fn sys_sleep(deadline_ns: u64) -> i64 {
     use crate::kernel::{sched, task::WaitReason};
+    use crate::platform::current::timer;
 
-    // Convert ns deadline to timer ticks
-    let freq = crate::platform::current::timer::frequency();
-    let deadline_ticks = if freq > 0 {
-        ((deadline_ns as u128 * freq as u128) / 1_000_000_000) as u64
-    } else {
-        return SyscallError::InvalidArgument as i64;
-    };
+    // Create deadline using unified clock API
+    // Note: deadline_ns is duration from now, not absolute time
+    let deadline = timer::deadline_ns(deadline_ns);
 
-    // Check if deadline already passed
-    let now = crate::platform::current::timer::counter();
-    if now >= deadline_ticks {
-        return 0; // Already past deadline, return immediately
+    // Check if deadline already passed (shouldn't happen but be safe)
+    if timer::is_expired(deadline) {
+        return 0;
     }
 
     // Set task to Waiting state via state machine
-    if !sched::wait_current(WaitReason::Timer, deadline_ticks) {
+    if !sched::wait_current(WaitReason::Timer, deadline) {
         return SyscallError::InvalidArgument as i64;
     }
 
@@ -186,6 +175,11 @@ pub(super) fn sys_klog(level: u8, buf_ptr: u64, buf_len: usize) -> i64 {
         Err(_) => return SyscallError::BadAddress as i64,
     }
 
+    // Get caller PID for log message
+    let caller_pid = crate::kernel::task::with_scheduler(|sched| {
+        sched.current_task_id().unwrap_or(0)
+    });
+
     // Build a log record
     // Format: subsys="user", event=<message>
     let msg = &msg_buf[..buf_len];
@@ -212,12 +206,20 @@ pub(super) fn sys_klog(level: u8, buf_ptr: u64, buf_len: usize) -> i64 {
     builder.event(event);
     builder.ctx_count(0);
 
-    // Add the full message as a key-value pair
+    // Add the full message as a key-value pair, plus PID for debugging
     if let Ok(text) = core::str::from_utf8(msg) {
-        builder.kv_count(1);
+        // Check if message is effectively empty (only whitespace)
+        let trimmed = text.trim();
+        if trimmed.is_empty() && level == crate::klog::Level::Error {
+            // Log a warning about empty error message for debugging
+            crate::kwarn!("syscall", "empty_klog"; pid = caller_pid as u64, len = buf_len as u64);
+        }
+        builder.kv_count(2);
+        builder.kv("pid", caller_pid as u64);
         builder.kv("text", text);
     } else {
-        builder.kv_count(0);
+        builder.kv_count(1);
+        builder.kv("pid", caller_pid as u64);
     }
 
     builder.finish();

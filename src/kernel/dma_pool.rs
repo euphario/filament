@@ -22,27 +22,26 @@
 
 use crate::{kinfo, kerror, klog};
 use crate::arch::aarch64::mmu;
+use crate::platform::current;
 use super::lock::SpinLock;
 use super::process::Pid;
 
-/// DMA pool base address (1MB into DRAM, avoiding any U-Boot stuff at start)
+/// DMA pool base address (platform-specific)
 /// NOTE: Descriptor rings MUST be below 4GB (DESC_BASE is 32-bit register)
-pub const DMA_POOL_BASE: u64 = 0x4010_0000;
+/// NOTE: Must not overlap with kernel image
+pub const DMA_POOL_BASE: u64 = current::DMA_POOL_BASE;
 
-/// DMA pool size (4MB - enough for MT7996 descriptor rings + TX buffers)
-pub const DMA_POOL_SIZE: usize = 4 * 1024 * 1024;
+/// DMA pool size (platform-specific)
+pub const DMA_POOL_SIZE: usize = current::DMA_POOL_SIZE;
 
 /// DMA pool end address
 pub const DMA_POOL_END: u64 = DMA_POOL_BASE + DMA_POOL_SIZE as u64;
 
-/// High DMA pool base address (above 4GB, for 36-bit buffer addresses)
-/// This is ~3GB into DRAM (0x40000000 + 0xC0000000 = 0x100000000)
-/// Linux uses addresses like 0x1020c7490 for TX buffers
-pub const DMA_POOL_HIGH_BASE: u64 = 0x1_0010_0000;
+/// High DMA pool base address (platform-specific, for 36-bit buffer addresses)
+pub const DMA_POOL_HIGH_BASE: u64 = current::DMA_POOL_HIGH_BASE;
 
-/// High DMA pool size (16MB for TX/RX buffers)
-/// MT7996 needs: descriptors(256KB) + RX(13MB) + FWDL_TX(512KB) + MCU_TX(1MB) ≈ 15MB
-pub const DMA_POOL_HIGH_SIZE: usize = 16 * 1024 * 1024;
+/// High DMA pool size (platform-specific)
+pub const DMA_POOL_HIGH_SIZE: usize = current::DMA_POOL_HIGH_SIZE;
 
 /// High DMA pool end address
 pub const DMA_POOL_HIGH_END: u64 = DMA_POOL_HIGH_BASE + DMA_POOL_HIGH_SIZE as u64;

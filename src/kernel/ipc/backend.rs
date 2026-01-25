@@ -162,7 +162,7 @@ impl IpcBackend for KernelIpcBackend {
         client: TaskId,
     ) -> Result<(ChannelId, TraitWakeList), TraitIpcError> {
         super::port_connect(name, client)
-            .map(|(id, list)| (id, convert_wake_list(list)))
+            .map(|(id, list, _owner)| (id, convert_wake_list(list)))
             .map_err(convert_error)
     }
 

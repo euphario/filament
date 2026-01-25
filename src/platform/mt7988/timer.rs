@@ -94,13 +94,10 @@ impl Timer {
             // Use try_flush to avoid deadlock if syscall is holding UART lock
             super::uart::try_flush_buffer();
 
-            // Check for timed-out blocked tasks and wake them
-            unsafe {
-                crate::kernel::task::scheduler().check_timeouts(self.tick_count);
-            }
-
-            // Run liveness checks (pings blocked tasks periodically)
-            crate::kernel::sched::timer_tick(self.tick_count);
+            // Check timeouts using hardware counter (canonical time source)
+            // All deadlines in the system use counter units for consistency
+            let current_counter = Self::read_cntpct();
+            crate::kernel::sched::timer_tick(current_counter);
 
             // Reap terminated tasks (orphan processes that exited)
             // Safe to do here since we're not running on the terminated task's stack
@@ -225,8 +222,9 @@ impl TimerTrait for Timer {
             crate::klog::try_drain(8);
             super::uart::try_flush_buffer();
 
+            let current_counter = Self::read_cntpct();
             unsafe {
-                crate::kernel::task::scheduler().check_timeouts(self.tick_count);
+                crate::kernel::task::scheduler().check_timeouts(current_counter);
                 crate::kernel::task::scheduler().reap_terminated(self.tick_count);
             }
 
@@ -288,6 +286,31 @@ pub fn frequency() -> u64 {
 /// Get raw counter value
 pub fn counter() -> u64 {
     unsafe { (*core::ptr::addr_of!(TIMER)).counter() }
+}
+
+/// Get logical tick count (computed from hardware counter, not IRQ-incremented)
+/// More reliable for storm protection and rate limiting.
+pub fn logical_ticks() -> u64 {
+    unsafe { (*core::ptr::addr_of!(TIMER)).logical_ticks() }
+}
+
+// ============================================================================
+// Unified Clock API
+// ============================================================================
+
+/// Get current time in nanoseconds
+pub fn now_ns() -> u64 {
+    unsafe { (*core::ptr::addr_of!(TIMER)).now_ns() }
+}
+
+/// Create a deadline N nanoseconds from now
+pub fn deadline_ns(duration_ns: u64) -> u64 {
+    unsafe { (*core::ptr::addr_of!(TIMER)).deadline_ns(duration_ns) }
+}
+
+/// Check if a deadline has expired
+pub fn is_expired(deadline: u64) -> bool {
+    unsafe { (*core::ptr::addr_of!(TIMER)).is_expired(deadline) }
 }
 
 /// Print timer info

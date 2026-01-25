@@ -35,9 +35,10 @@ use userlib::error::{SysError, SysResult};
 macro_rules! dlog {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
+        const PREFIX: &[u8] = b"[devd] ";
         let mut buf = [0u8; 128];
-        let mut pos = 0;
-        for &b in b"[devd] " { if pos < buf.len() { buf[pos] = b; pos += 1; } }
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        let mut pos = PREFIX.len();
         struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
         impl core::fmt::Write for W<'_> {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -55,9 +56,10 @@ macro_rules! dlog {
 macro_rules! derror {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
+        const PREFIX: &[u8] = b"[devd] ";
         let mut buf = [0u8; 128];
-        let mut pos = 0;
-        for &b in b"[devd] " { if pos < buf.len() { buf[pos] = b; pos += 1; } }
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        let mut pos = PREFIX.len();
         struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
         impl core::fmt::Write for W<'_> {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -189,9 +191,9 @@ static SERVICE_DEFS: &[ServiceDef] = &[
     ServiceDef {
         binary: "shell",
         registers: &[],  // shell doesn't register any ports
-        dependencies: &[],  // soft dep on console: - shell has UART fallback
+        dependencies: &[Dependency::Requires(b"console:")],  // Wait for consoled
         auto_restart: true,
-        parent: None,  // independent - can start immediately
+        parent: None,
     },
     // Future services would be added here:
     // ServiceDef {
@@ -378,6 +380,7 @@ impl Devd {
         // Register our port
         let port = Port::register(b"devd:")?;
         dlog!("port devd: registered handle={}", port.handle().0);
+
         events.watch(port.handle())?;
 
         // Create maintenance timer
@@ -430,16 +433,22 @@ impl Devd {
             dlog!("service {} registered idx={}", def.binary, idx);
         }
 
+        dlog!("linking children to parents");
         // Link children to parents
         for i in 0..self.service_count {
+            dlog!("  link check i={}", i);
             if let Some(service) = &self.services[i] {
                 if let Some(parent_idx) = service.parent {
+                    dlog!("  service {} has parent {}", i, parent_idx);
                     if let Some(parent) = &mut self.services[parent_idx as usize] {
+                        dlog!("  adding child {} to parent {}", i, parent_idx);
                         parent.add_child(i as u8);
+                        dlog!("  child added");
                     }
                 }
             }
         }
+        dlog!("init_services done");
     }
 
     // =========================================================================
@@ -522,10 +531,14 @@ impl Devd {
     }
 
     fn check_pending_services(&mut self) {
+        dlog!("check_pending_services: count={}", self.service_count);
         let now = self.now_ms;
         for i in 0..self.service_count {
             if let Some(service) = &self.services[i] {
-                if service.state == ServiceState::Pending && self.deps_satisfied(service) {
+                let is_pending = service.state == ServiceState::Pending;
+                let deps_ok = self.deps_satisfied(service);
+                dlog!("  service[{}]: pending={} deps_ok={}", i, is_pending, deps_ok);
+                if is_pending && deps_ok {
                     let name = service.name();
                     dlog!("deps satisfied for {}", name);
                     // Borrow ends here, spawn needs &mut self
@@ -533,6 +546,7 @@ impl Devd {
                 }
             }
         }
+        dlog!("check_pending_services done");
     }
 
     // =========================================================================
@@ -923,7 +937,7 @@ impl Devd {
     // =========================================================================
 
     pub fn run(&mut self) -> ! {
-        dlog!("starting main loop");
+        derror!("RUN CALLED");
 
         // Initial time
         self.now_ms = syscall::gettime() / 1_000_000;

@@ -17,6 +17,11 @@ use super::super::process::Pid;
 pub const MAX_INLINE_PAYLOAD: usize = 576;
 
 /// Maximum messages in a queue
+/// NOTE: Reduced from 32 to 8 to prevent stack overflow.
+/// Each Message is 596 bytes, MessageQueue is MAX_QUEUE_SIZE * 596 bytes,
+/// and Channel contains MessageQueue. Creating channels on the stack during
+/// syscalls was causing stack overflow (19KB per channel, 38KB for pair).
+/// With MAX_QUEUE_SIZE=8: MessageQueue=~4.8KB, Channel=~5KB, pair=~10KB.
 pub const MAX_QUEUE_SIZE: usize = 8;
 
 /// Maximum number of channels

@@ -297,11 +297,13 @@ impl Consoled {
 
         // Drain all available data from shell (multiple messages may be queued)
         let mut buf = [0u8; 256];
+        let mut msg_count = 0u32;
         loop {
             let result = syscall::read(shell_handle, &mut buf);
 
             match result {
                 Ok(n) if n > 0 => {
+                    msg_count += 1;
                     // Check for GETSIZE query
                     if n >= 7 && &buf[..7] == b"GETSIZE" {
                         // Respond with SIZE message
@@ -315,13 +317,22 @@ impl Consoled {
                         let _ = syscall::write(Handle::STDOUT, &buf[..n]);
                     }
                 }
-                Ok(_) | Err(SysError::WouldBlock) => break, // No more data
+                Ok(_) | Err(SysError::WouldBlock) => {
+                    // Log if we drained multiple messages (indicates queue buildup)
+                    if msg_count > 4 {
+                        clog!("drained {} msgs", msg_count);
+                    }
+                    break;
+                }
                 Err(SysError::ConnectionReset) | Err(SysError::BadFd) => {
                     clog!("shell disconnected");
                     self.disconnect_shell();
                     break;
                 }
-                Err(_) => break, // Other errors
+                Err(e) => {
+                    cerror!("shell read error: {:?}", e);
+                    break;
+                }
             }
         }
     }
@@ -428,6 +439,8 @@ static mut CONSOLED: Consoled = Consoled::new();
 #[unsafe(no_mangle)]
 #[allow(static_mut_refs)]
 fn main() -> ! {
+    // Immediate debug - first thing in main
+    syscall::debug_write(b"CONSOLED MAIN ENTRY\n");
     cerror!("BOOT v2.0-unified");
 
     let consoled = unsafe { &mut CONSOLED };

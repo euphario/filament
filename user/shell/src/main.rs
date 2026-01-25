@@ -54,8 +54,16 @@ static mut CONSOLE_RETRY: u8 = 0;
 
 #[unsafe(no_mangle)]
 fn main() {
+    userlib::klog(userlib::syscall::LogLevel::Error, b"[shell] BOOT");
+
     // Initialize console connection (falls back to direct UART if consoled not available)
+    userlib::klog(userlib::syscall::LogLevel::Info, b"[shell] connecting to consoled");
     let connected = console::init();
+    if connected {
+        userlib::klog(userlib::syscall::LogLevel::Info, b"[shell] connected OK");
+    } else {
+        userlib::klog(userlib::syscall::LogLevel::Error, b"[shell] connect FAILED");
+    }
 
     // Colored welcome banner
     color::set(color::BOLD);

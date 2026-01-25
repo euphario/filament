@@ -371,18 +371,78 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
 pub extern "C" fn syscall_handler_rust(
     arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, _unused: u64, num: u64
 ) -> i64 {
-    // Update activity tick for liveness tracking (all syscalls count as activity)
-    unsafe {
+    // Storm protection: check if task is making too many syscalls
+    let storm_action = unsafe {
         let slot = super::task::current_slot();
         let sched = super::task::scheduler();
         if let Some(task) = sched.task_mut(slot) {
-            task.last_activity_tick = crate::platform::current::timer::counter();
+            // Use logical ticks computed from hardware counter (not IRQ-incremented)
+            // This is more reliable since it doesn't depend on timer IRQ firing
+            let current_tick = crate::platform::current::timer::logical_ticks();
+
+            // Record activity and check for syscall storm via encapsulated methods
+            task.record_activity(current_tick);
+            let config = super::storm::StormConfig::new();
+            let action = task.record_storm_syscall(current_tick, &config);
 
             // Reset liveness state if we're in PingSent with channel=0 (implicit pong)
             // The syscall itself IS the pong - proves the task is alive and responsive
-            if let super::liveness::LivenessState::PingSent { channel: 0, .. } = task.liveness_state {
-                task.liveness_state = super::liveness::LivenessState::Normal;
+            task.reset_liveness_if_implicit_pong();
+
+            action
+        } else {
+            super::storm::StormAction::Allow
+        }
+    };
+
+    // Handle storm action BEFORE processing syscall
+    match storm_action {
+        super::storm::StormAction::Allow => {}
+        super::storm::StormAction::Throttle => {
+            // BLOCK the task for 1 second - this is a real penalty, not just EAGAIN
+            // This prevents the task from burning CPU in a tight retry loop
+            const THROTTLE_DURATION_NS: u64 = 1_000_000_000; // 1 second
+            let deadline = crate::platform::current::timer::deadline_ns(THROTTLE_DURATION_NS);
+
+            let pid = unsafe {
+                super::task::scheduler().task(super::task::current_slot())
+                    .map(|t| t.id).unwrap_or(0)
+            };
+            crate::kwarn!("storm", "throttle_block";
+                pid = pid as u64,
+                syscall = num,
+                duration_s = 1
+            );
+
+            // Block the task with a deadline using the proper sched API
+            // This handles state transition and deadline tracking
+            if !crate::kernel::sched::wait_current(
+                super::task::state::WaitReason::Throttled,
+                deadline
+            ) {
+                // Failed to block (shouldn't happen for normal tasks)
+                // Fall back to just returning EAGAIN
+                return -11;
             }
+
+            // Trigger reschedule - another task will run while we're blocked
+            crate::kernel::sched::reschedule();
+
+            // When we wake up, return EAGAIN so userspace knows to retry
+            return -11; // EAGAIN
+        }
+        super::storm::StormAction::Evict => {
+            // Task exceeded strike limit - evict it
+            let pid = unsafe {
+                super::task::scheduler().task(super::task::current_slot())
+                    .map(|t| t.id).unwrap_or(0)
+            };
+            crate::kerror!("storm", "evict"; pid = pid as u64, syscall = num);
+            super::task::eviction::mark_for_eviction(
+                pid,
+                super::task::state::EvictionReason::ResourceExhaustion,
+            );
+            return -1; // Will be killed before returning to user
         }
     }
 
@@ -402,7 +462,7 @@ pub extern "C" fn syscall_handler_rust(
     // Don't call it here - would cause infinite WFI loop when task blocks
 
     // Safe point: flush deferred log buffer before returning to user
-    super::log::flush();
+    crate::klog::flush();
 
     result
 }

@@ -7,7 +7,7 @@
 
 use super::addrspace::AddressSpace;
 use super::pmm;
-use crate::{kinfo, print_direct};
+use crate::{kinfo, kwarn, print_direct};
 use crate::arch::aarch64::mmu;
 use super::task;
 
@@ -315,6 +315,10 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
         let executable = (flags & PF_X) != 0;
 
         // If executable, perform cache maintenance to ensure I-cache sees the code
+        // Note: I-cache can be ASID-tagged, so we need to either:
+        //   1. Use full I-cache invalidation (IC IALLUIS), or
+        //   2. Invalidate with the correct ASID context
+        // We use full invalidation for simplicity and correctness.
         if executable {
             unsafe {
                 let virt_base = mmu::phys_to_virt(phys_base as u64) as usize;
@@ -327,11 +331,9 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
                 }
                 // Data Synchronization Barrier
                 core::arch::asm!("dsb ish");
-                // Invalidate instruction cache
-                for addr in (virt_base..(virt_base + size)).step_by(64) {
-                    // IC IVAU: Invalidate instruction cache by VA to PoU
-                    core::arch::asm!("ic ivau, {}", in(reg) addr);
-                }
+                // Invalidate ALL instruction cache (handles ASID-tagged caches)
+                // IC IALLUIS: Invalidate all I-cache to PoU, Inner Shareable
+                core::arch::asm!("ic ialluis");
                 // Ensure I-cache invalidation completes
                 core::arch::asm!("dsb ish");
                 core::arch::asm!("isb");
@@ -346,6 +348,17 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
                 // Cleanup on failure
                 pmm::free_pages(phys_base, num_pages);
                 return Err(ElfError::OutOfMemory);
+            }
+        }
+
+        // Debug: dump first 4 bytes of executable segments (only in debug builds)
+        #[cfg(debug_assertions)]
+        if executable && segments_loaded == 0 {
+            unsafe {
+                let virt_base = mmu::phys_to_virt(phys_base as u64);
+                let ptr = (virt_base + offset_in_page as u64) as *const u32;
+                let first_inst = core::ptr::read_volatile(ptr);
+                crate::kdebug!("elf", "first_inst"; vaddr = crate::klog::hex64(vaddr), phys = crate::klog::hex64(phys_base as u64), inst = crate::klog::hex64(first_inst as u64));
             }
         }
 
@@ -477,6 +490,20 @@ fn spawn_from_elf_internal(
     // Load the ELF into the address space
     let elf_info = load_elf(data, addr_space)?;
 
+    // Debug: Dump PTEs for entry point (only in debug builds)
+    #[cfg(debug_assertions)]
+    {
+        let entry = elf_info.entry;
+        for offset in [0u64, 0x1000, 0x2000, 0x3000, 0x4000] {
+            let va = entry + offset;
+            if let Some((l1, l2, l3, phys)) = addr_space.dump_pte(va) {
+                kdebug!("elf", "pte_dump"; name = name, va = crate::klog::hex64(va),
+                    l1 = crate::klog::hex64(l1), l2 = crate::klog::hex64(l2),
+                    l3 = crate::klog::hex64(l3), phys = crate::klog::hex64(phys));
+            }
+        }
+    }
+
     // Allocate user stack
     let stack_pages = USER_STACK_SIZE / 4096;
     let stack_phys = pmm::alloc_pages(stack_pages).ok_or(ElfError::OutOfMemory)?;
@@ -536,7 +563,15 @@ fn spawn_from_elf_internal(
                     }
                 }
             }
-            // Compute and apply child capabilities
+            // Find parent priority first (before mutable borrow for child)
+            let parent_priority = sched.iter_tasks()
+                .find_map(|(_, task_opt)| {
+                    task_opt.as_ref()
+                        .filter(|t| t.id == parent_id)
+                        .map(|t| t.priority)
+                });
+
+            // Compute and apply child capabilities and priority
             if let Some(p_caps) = parent_caps {
                 // Note: slot was just allocated, so task_mut should always succeed
                 let Some(child_task) = sched.task_mut(slot) else {
@@ -554,6 +589,11 @@ fn spawn_from_elf_internal(
                     }
                 };
                 child_task.set_capabilities(final_caps);
+
+                // Inherit parent's priority (children of High priority tasks get High priority)
+                if let Some(prio) = parent_priority {
+                    child_task.set_priority(prio);
+                }
             }
         }
     }

@@ -1,0 +1,3 @@
+# xtask uses host toolchain via ./x wrapper script
+# The parent .cargo/config.toml targets aarch64-unknown-none
+# which doesn't have std, so we use stable toolchain via wrapper

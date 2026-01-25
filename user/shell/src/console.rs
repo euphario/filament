@@ -172,14 +172,32 @@ impl Console {
     pub fn write(&self, data: &[u8]) {
         if let Some(channel) = &self.channel {
             // Write to consoled channel only - retry if queue full
+            let mut retries = 0u32;
             loop {
                 match channel.send(data) {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        // Log if we had many retries (indicates backpressure)
+                        if retries > 10 {
+                            userlib::syscall::klog(
+                                userlib::syscall::LogLevel::Warn,
+                                b"[shell] write retries: high"
+                            );
+                        }
+                        break;
+                    }
                     Err(userlib::error::SysError::WouldBlock) => {
                         // Queue full - yield and retry
+                        retries += 1;
                         userlib::syscall::sleep_us(100);
                     }
-                    Err(_) => break, // Other error, give up
+                    Err(_) => {
+                        // Log unexpected errors
+                        userlib::syscall::klog(
+                            userlib::syscall::LogLevel::Error,
+                            b"[shell] write failed"
+                        );
+                        break;
+                    }
                 }
             }
         }

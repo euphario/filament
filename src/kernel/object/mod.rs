@@ -470,13 +470,14 @@ impl TimerObject {
 
 impl Pollable for TimerObject {
     fn poll(&self, filter: u8) -> PollResult {
+        use crate::platform::current::timer;
+
         if (filter & poll::READABLE) == 0 {
             return PollResult::NONE;
         }
 
-        let current_tick = crate::platform::current::timer::ticks();
-        if self.state() == TimerState::Armed && current_tick >= self.deadline() {
-            PollResult { ready: poll::READABLE, data: current_tick }
+        if self.state() == TimerState::Armed && timer::is_expired(self.deadline()) {
+            PollResult { ready: poll::READABLE, data: timer::counter() }
         } else if self.state() == TimerState::Fired {
             PollResult { ready: poll::READABLE, data: self.deadline() }
         } else {
@@ -653,6 +654,11 @@ impl PortObject {
 
     /// Get the port name
     pub fn name(&self) -> &[u8] { &self.name[..self.name_len as usize] }
+
+    /// Check if port name matches
+    pub fn name_matches(&self, other: &[u8]) -> bool {
+        self.name() == other
+    }
 
     /// Get subscriber (for waking)
     pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }

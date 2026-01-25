@@ -26,6 +26,25 @@ unsafe extern "Rust" {
 #[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        // Debug: write "_ST\n" to UART via syscall before anything else
+        // Store message on stack: "_ST\n" = 0x5f 0x53 0x54 0x0a
+        "sub sp, sp, #16",           // Allocate stack space
+        "mov x0, #0x5f",             // '_'
+        "strb w0, [sp]",
+        "mov x0, #0x53",             // 'S'
+        "strb w0, [sp, #1]",
+        "mov x0, #0x54",             // 'T'
+        "strb w0, [sp, #2]",
+        "mov x0, #0x0a",             // '\n'
+        "strb w0, [sp, #3]",
+        // Syscall: debug_write(buf=sp, len=4)
+        "mov x0, sp",                // buf pointer
+        "mov x1, #4",                // length
+        "mov x8, #1",                // DEBUG_WRITE syscall
+        "svc #0",
+        // Clean up stack
+        "add sp, sp, #16",
+        // Now call main
         "bl {main}",
         "mov x8, #0",
         "svc #0",

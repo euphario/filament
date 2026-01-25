@@ -36,6 +36,27 @@ pub const DRAM_SIZE: usize = 0x2000_0000;
 /// End of usable DRAM
 pub const DRAM_END: usize = DRAM_BASE + DRAM_SIZE;
 
+/// Kernel physical load address (where QEMU places the kernel - 512KB after DRAM base)
+/// Must match linker-qemu.ld KERNEL_PHYS_BASE
+pub const KERNEL_PHYS_BASE: usize = 0x4008_0000;
+
+// =============================================================================
+// DMA Pool (must not overlap with kernel)
+// =============================================================================
+
+/// DMA pool base address (16MB into DRAM, well after kernel image ends)
+/// Kernel loads at 0x40080000 and is ~1MB, so this gives plenty of margin
+pub const DMA_POOL_BASE: u64 = 0x4100_0000;
+
+/// DMA pool size (4MB for descriptor rings and TX buffers)
+pub const DMA_POOL_SIZE: usize = 4 * 1024 * 1024;
+
+/// High DMA pool base address (not used on QEMU, but define for compatibility)
+pub const DMA_POOL_HIGH_BASE: u64 = 0x5000_0000;
+
+/// High DMA pool size (16MB)
+pub const DMA_POOL_HIGH_SIZE: usize = 16 * 1024 * 1024;
+
 /// Initrd load address
 pub const INITRD_ADDR: usize = 0x4800_0000;
 

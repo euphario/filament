@@ -1,8 +1,13 @@
 #!/bin/bash
-# Build script for BPI-R4 kernel
-# Creates kernel.bin ready for loading via U-Boot xmodem
+# Build script for BPI-R4 kernel (DEPRECATED - use cargo xtask instead)
 #
-# Usage:
+# Preferred usage (cargo xtask):
+#   cargo xtask build              # Normal build
+#   cargo xtask build --test       # With self-tests
+#   cargo xtask build --firmware   # Embed firmware
+#   cargo xtask qemu               # Run in QEMU
+#
+# Legacy usage (this script):
 #   ./build.sh                    # Normal build (incremental)
 #   ./build.sh --test             # Build with self-tests enabled
 #   ./build.sh --with-firmware    # Embed MT7996 firmware in initrd (~3MB larger)

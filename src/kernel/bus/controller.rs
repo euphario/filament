@@ -21,13 +21,7 @@ pub const BUS_PORT_PREFIX: &str = "/kernel/bus/";
 
 /// Get current uptime in milliseconds
 fn uptime_ms() -> u64 {
-    let counter = crate::platform::current::timer::counter();
-    let freq = crate::platform::current::timer::frequency();
-    if freq > 0 {
-        (counter * 1000) / freq
-    } else {
-        0
-    }
+    crate::platform::current::timer::now_ns() / 1_000_000
 }
 
 /// Bus mastering state for a device

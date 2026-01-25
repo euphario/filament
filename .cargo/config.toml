@@ -8,5 +8,9 @@ rustflags = ["-C", "link-arg=-Tsrc/linker.ld"]
 build-std = ["core"]
 build-std-features = ["compiler-builtins-mem"]
 
+# NOTE: xtask cannot use cargo alias due to target override issues
+# Run directly: cd xtask && cargo run -- <command>
+# Or use the wrapper script: ./xtask <command>
+
 # For running unit tests on host, use ./test.sh
 # (temporarily disables this config to use native target)

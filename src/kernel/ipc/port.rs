@@ -429,6 +429,7 @@ impl PortRegistry {
         self.ports[slot] = Some(Port::new(port_id, name, owner, listen_ch));
         self.active_count += 1;
 
+        crate::kinfo!("port", "register"; port_id = port_id, owner = owner);
         Ok((port_id, listen_ch))
     }
 
@@ -466,6 +467,8 @@ impl PortRegistry {
         let slot = self.find_by_id(port_id).ok_or(IpcError::InvalidPort { id: port_id })?;
 
         let port = self.ports[slot].as_mut().ok_or(IpcError::InvalidPort { id: port_id })?;
+
+        crate::kinfo!("port", "accept"; port_id = port_id, caller = caller, owner = port.owner(), pending = port.state().pending_count());
 
         if port.owner() != caller {
             return Err(IpcError::port_not_owner(port_id, port.owner(), caller));

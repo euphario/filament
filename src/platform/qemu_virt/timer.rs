@@ -63,18 +63,15 @@ impl Timer {
                 cpu_data.idle_tick();
             }
 
-            // Drain klog
-            crate::klog::try_drain(8);
+            // Drain klog (limit to 2 records per tick to avoid UART saturation)
+            // At 115200 baud, UART can only output ~115 bytes per 10ms tick
+            // Each formatted log line is ~100-200 bytes with ANSI codes
+            crate::klog::try_drain(2);
 
-            // Flush UART
-            super::uart::flush();
-
-            // Check timeouts and reap terminated
-            unsafe {
-                crate::kernel::task::scheduler().check_timeouts(self.tick_count);
-            }
-
-            crate::kernel::sched::timer_tick(self.tick_count);
+            // Check timeouts using hardware counter (canonical time source)
+            // All deadlines in the system use counter units for consistency
+            let current_counter = Self::read_cntpct();
+            crate::kernel::sched::timer_tick(current_counter);
 
             unsafe {
                 crate::kernel::task::scheduler().reap_terminated(self.tick_count);
@@ -207,6 +204,31 @@ pub fn frequency() -> u64 {
 
 pub fn counter() -> u64 {
     unsafe { (*core::ptr::addr_of!(TIMER)).counter() }
+}
+
+/// Get logical tick count (computed from hardware counter, not IRQ-incremented)
+/// More reliable for storm protection and rate limiting.
+pub fn logical_ticks() -> u64 {
+    unsafe { (*core::ptr::addr_of!(TIMER)).logical_ticks() }
+}
+
+// ============================================================================
+// Unified Clock API
+// ============================================================================
+
+/// Get current time in nanoseconds
+pub fn now_ns() -> u64 {
+    unsafe { (*core::ptr::addr_of!(TIMER)).now_ns() }
+}
+
+/// Create a deadline N nanoseconds from now
+pub fn deadline_ns(duration_ns: u64) -> u64 {
+    unsafe { (*core::ptr::addr_of!(TIMER)).deadline_ns(duration_ns) }
+}
+
+/// Check if a deadline has expired
+pub fn is_expired(deadline: u64) -> bool {
+    unsafe { (*core::ptr::addr_of!(TIMER)).is_expired(deadline) }
 }
 
 pub fn as_timer() -> &'static mut dyn TimerTrait {

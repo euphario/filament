@@ -70,10 +70,6 @@ pub extern "C" fn kmain() -> ! {
     klog::init();      // Structured logging (LOG_RING → UART)
     ktrace::init();    // Span-based tracing (TRACE_RING)
 
-    // Debug: check slots after klog/ktrace init
-    let klog_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
-    print_direct!("After klog/ktrace init: {} free slots\r\n", klog_slots);
-
     // Boot banner (direct UART - useful for early debug)
     print_direct!("\r\n========================================\r\n");
     #[cfg(feature = "platform-mt7988a")]
@@ -131,10 +127,6 @@ pub extern "C" fn kmain() -> ! {
         gic::enable_irq(plat::irq::UART0);
     }
 
-    // Debug: check slots after GIC init
-    let gic_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
-    print_direct!("After GIC init: {} free slots\r\n", gic_slots);
-
     // MMU info (already initialized by boot.S)
     kinfo!("mmu", "status"; ttbr0 = "user", ttbr1 = "kernel");
     mmu::print_info();
@@ -146,10 +138,6 @@ pub extern "C" fn kmain() -> ! {
         // Note: pmm::init() logs init_ok with details
     }
 
-    // Debug: check slots after PMM init
-    let pmm_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
-    print_direct!("After PMM init: {} free slots\r\n", pmm_slots);
-
     // DMA pools
     {
         let _span = span!("dma", "init");
@@ -157,10 +145,6 @@ pub extern "C" fn kmain() -> ! {
         dma_pool::init_high();
         kinfo!("dma", "pools_ready");
     }
-
-    // Debug: check slots after DMA init
-    let dma_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
-    print_direct!("After DMA init: {} free slots\r\n", dma_slots);
 
     // Shared memory
     {
@@ -176,20 +160,12 @@ pub extern "C" fn kmain() -> ! {
         kinfo!("pci", "init_ok");
     }
 
-    // Debug: check slots after PCI init
-    let pci_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
-    print_direct!("After PCI init: {} free slots\r\n", pci_slots);
-
     // Bus controllers
     {
         let _span = span!("bus", "init");
         bus::init(0);  // Kernel PID = 0
         kinfo!("bus", "init_ok");
     }
-
-    // Debug: check slots after bus init
-    let bus_slots = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
-    print_direct!("After bus init: {} free slots\r\n", bus_slots);
 
     // Watchdog (MT7988A only)
     #[cfg(feature = "platform-mt7988a")]
@@ -210,27 +186,13 @@ pub extern "C" fn kmain() -> ! {
     // SMP
     {
         let _span = span!("smp", "init");
-        let free_before = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
         smp::init();
-        let free_after = unsafe { task::scheduler().iter_tasks().filter(|(_, t)| t.is_none()).count() };
-        if free_before != free_after {
-            print_direct!("SMP: slots changed from {} to {}\r\n", free_before, free_after);
-        }
         kinfo!("smp", "init_ok");
     }
 
     // Flush logs before self-tests
     klog::flush();
     ktrace::flush();
-
-    // Debug: check slots after flush
-    let (sched_addr, slots_after_flush) = unsafe {
-        let sched = task::scheduler();
-        let addr = sched as *const _ as usize;
-        let free = sched.iter_tasks().filter(|(_, t)| t.is_none()).count();
-        (addr, free)
-    };
-    print_direct!("After flush: SCHEDULER at 0x{:x}, {} free slots\r\n", sched_addr, slots_after_flush);
 
     // =========================================================================
     // Self-tests (only when compiled with --features selftest)
@@ -287,47 +249,21 @@ pub extern "C" fn kmain() -> ! {
         core::arch::asm!("msr daifclr, #2");
     }
     kinfo!("kernel", "irq_enabled");
-    klog::flush();  // DEBUG: flush after irq enable
 
     // =========================================================================
     // Phase 4: Start scheduler
     // =========================================================================
 
-    // Start timer for preemption (10ms time slice)
-    timer::start(10);
-    kinfo!("timer", "preemption_started"; slice_ms = 10u64);
-    klog::flush();  // DEBUG: flush after timer start
+    // NOTE: Timer preemption is started in run_user_task(), not here.
+    // Starting it here would allow timer IRQs to fire during boot and
+    // trigger a context switch BEFORE run_user_task is called, which
+    // corrupts the boot flow.
 
     // Note: idle task is created automatically by init_scheduler() in slot 0
     kinfo!("kernel", "scheduler_ready");
-    klog::flush();  // DEBUG: flush after scheduler ready
 
     // Spawn devd (init process) - after scheduler is ready
     kinfo!("kernel", "spawning_devd");
-    klog::flush();
-
-    // Debug: check scheduler state before spawning devd
-    let (occupied, empty) = unsafe {
-        let sched = task::scheduler();
-        let occupied = sched.iter_tasks().filter(|(_, t)| t.is_some()).count();
-        let empty = sched.iter_tasks().filter(|(_, t)| t.is_none()).count();
-        (occupied, empty)
-    };
-    print_direct!("Scheduler: {} occupied, {} empty slots\r\n", occupied, empty);
-    print_direct!("Task size: {} bytes, Option<Task> size: {} bytes\r\n",
-        core::mem::size_of::<task::Task>(),
-        core::mem::size_of::<Option<task::Task>>());
-
-    // Debug: check first slot's raw state
-    unsafe {
-        let sched = task::scheduler();
-        if let Some(task) = sched.task(0) {
-            print_direct!("Slot 0: is_some=true, id={}, parent={}, is_user={}\r\n",
-                task.id, task.parent_id, task.is_user);
-        } else {
-            print_direct!("Slot 0: is_none=true\r\n");
-        }
-    }
     let slot1 = {
         let _span = span!("elf", "spawn"; path = "bin/devd");
         match elf::spawn_from_path("bin/devd") {
@@ -461,14 +397,17 @@ pub extern "C" fn irq_exit_resched() {
         task::do_resched_if_needed();
     }
 
-    // 2. Log any unhandled IRQs from interrupt context (deferred logging)
+    // 2. Process any pending task evictions
+    task::eviction::process_pending_evictions();
+
+    // 3. Log any unhandled IRQs from interrupt context (deferred logging)
     let (unhandled_count, last_irq) = sync::cpu_flags().get_unhandled_stats();
     if unhandled_count > 0 {
         kwarn!("irq", "unhandled"; count = unhandled_count as u64, last = last_irq as u64);
         sync::cpu_flags().clear_unhandled_stats();
     }
 
-    // 3. Don't flush all logs here - let timer tick drain gradually
+    // 4. Don't flush all logs here - let timer tick drain gradually
     // Calling flush() here caused UART saturation feedback loop in QEMU
     // where output took longer than timer interval, causing cascading delays
 }
@@ -1021,8 +960,7 @@ fn init_ramfs() {
     // First, try embedded initrd (compiled into kernel)
     if let Some((addr, size)) = initrd::get_embedded_initrd() {
         let count = ramfs::init(addr, size);
-        kinfo!("ramfs", "loaded"; source = "embedded", addr = klog::hex64(addr as u64), files = count);
-        ramfs::list();
+        kinfo!("ramfs", "loaded"; source = "embedded", files = count);
         return;
     }
 
@@ -1036,8 +974,7 @@ fn init_ramfs() {
 
     if magic_check {
         let count = ramfs::init(plat::INITRD_ADDR, plat::INITRD_MAX_SIZE);
-        kinfo!("ramfs", "loaded"; source = "external", addr = klog::hex64(plat::INITRD_ADDR as u64), files = count);
-        ramfs::list();
+        kinfo!("ramfs", "loaded"; source = "external", files = count);
     } else {
         kwarn!("ramfs", "not_found"; hint = "build with mkinitrd.sh");
     }

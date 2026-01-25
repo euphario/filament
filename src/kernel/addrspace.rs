@@ -39,6 +39,10 @@ use super::lock::SpinLock;
 use crate::print_direct;
 
 // ============================================================================
+// DEBUG: L3 canary tracking for devd's stack
+// ============================================================================
+
+// ============================================================================
 // ASID Allocator
 // ============================================================================
 
@@ -469,15 +473,6 @@ impl AddressSpace {
                 options(nostack, preserves_flags)
             );
 
-            // Verify PTE was written correctly
-            let pte_readback = core::ptr::read_volatile(l3_ptr.add(l3_index));
-            let pte_phys = pte_readback & 0x0000_FFFF_FFFF_F000;
-            if pte_phys != (phys_addr & 0x0000_FFFF_FFFF_F000) {
-                crate::kwarn!("addrspace", "pte_mismatch";
-                    va = virt_addr,
-                    expected_pa = phys_addr,
-                    pte_pa = pte_phys);
-            }
         }
 
         true
@@ -593,6 +588,52 @@ impl AddressSpace {
     /// Get the ASID for this address space
     pub fn get_asid(&self) -> u16 {
         self.asid
+    }
+
+    /// Debug: Dump PTE for a given virtual address
+    /// Returns (l1_entry, l2_entry, l3_entry, phys_addr) or None if not mapped
+    pub fn dump_pte(&self, virt_addr: u64) -> Option<(u64, u64, u64, u64)> {
+        let l1_index = ((virt_addr >> 30) & 0x1FF) as usize;
+        let l2_index = ((virt_addr >> 21) & 0x1FF) as usize;
+        let l3_index = ((virt_addr >> 12) & 0x1FF) as usize;
+
+        unsafe {
+            // Check L1
+            let l1_ptr = phys_to_virt(self.page_tables[1]);
+            let l1_entry = core::ptr::read_volatile(l1_ptr.add(l1_index));
+            if (l1_entry & flags::VALID) == 0 {
+                return None;
+            }
+            if (l1_entry & flags::TABLE) == 0 {
+                // Block entry at L1 (1GB block)
+                let phys = l1_entry & Self::PHYS_ADDR_MASK;
+                return Some((l1_entry, 0, 0, phys));
+            }
+
+            // Get L2
+            let l2_phys = l1_entry & Self::PHYS_ADDR_MASK;
+            let l2_ptr = phys_to_virt(l2_phys);
+            let l2_entry = core::ptr::read_volatile(l2_ptr.add(l2_index));
+            if (l2_entry & flags::VALID) == 0 {
+                return None;
+            }
+            if (l2_entry & flags::TABLE) == 0 {
+                // Block entry at L2 (2MB block)
+                let phys = l2_entry & Self::PHYS_ADDR_MASK;
+                return Some((l1_entry, l2_entry, 0, phys));
+            }
+
+            // Get L3
+            let l3_phys = l2_entry & Self::PHYS_ADDR_MASK;
+            let l3_ptr = phys_to_virt(l3_phys);
+            let l3_entry = core::ptr::read_volatile(l3_ptr.add(l3_index));
+            if (l3_entry & flags::VALID) == 0 {
+                return None;
+            }
+
+            let phys = l3_entry & Self::PHYS_ADDR_MASK;
+            Some((l1_entry, l2_entry, l3_entry, phys))
+        }
     }
 }
 

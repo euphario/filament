@@ -188,7 +188,7 @@ pub fn wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
     }
 
     // Block the current task (use Ipc reason - blocking without timeout)
-    if !super::sched::sleep_current(super::task::SleepReason::Ipc) {
+    if !super::sched::sleep_current(super::task::SleepReason::Irq) {
         return Err(-11); // EAGAIN
     }
     super::sched::reschedule();
