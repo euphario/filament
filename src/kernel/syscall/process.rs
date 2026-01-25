@@ -148,6 +148,11 @@ pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
 pub(super) fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
     let ctx = create_syscall_context();
 
+    // Check SPAWN capability
+    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
+        return SyscallError::PermissionDenied as i64;
+    }
+
     // Validate path length
     if path_len == 0 || path_len > 127 {
         return SyscallError::InvalidArgument as i64;
@@ -242,6 +247,11 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
 /// SECURITY: Reads ELF data via page table translation
 pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len: usize) -> i64 {
     let ctx = create_syscall_context();
+
+    // Check SPAWN capability
+    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
+        return SyscallError::PermissionDenied as i64;
+    }
 
     // Validate ELF size (reasonable bounds: at least an ELF header, at most 16MB)
     if elf_len < 64 || elf_len > 16 * 1024 * 1024 {

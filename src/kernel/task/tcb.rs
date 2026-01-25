@@ -666,34 +666,19 @@ impl Task {
     /// Transition: Running → Sleeping (block for event, no deadline)
     #[inline]
     pub fn set_sleeping(&mut self, reason: super::state::SleepReason) -> Result<(), super::state::InvalidTransition> {
-        let from = self.state.name();
-        let result = self.state.sleep(reason);
-        if self.id == 2 {
-            crate::kinfo!("devd", "set_sleeping"; from = from, ok = result.is_ok());
-        }
-        result
+        self.state.sleep(reason)
     }
 
     /// Transition: Running → Waiting (block with deadline)
     #[inline]
     pub fn set_waiting(&mut self, reason: super::state::WaitReason, deadline: u64) -> Result<(), super::state::InvalidTransition> {
-        let from = self.state.name();
-        let result = self.state.wait(reason, deadline);
-        if self.id == 2 {
-            crate::kinfo!("devd", "set_waiting"; from = from, ok = result.is_ok(), deadline = deadline);
-        }
-        result
+        self.state.wait(reason, deadline)
     }
 
     /// Transition: Sleeping/Waiting → Ready (wake up)
     #[inline]
     pub fn wake(&mut self) -> Result<(), super::state::InvalidTransition> {
-        let from = self.state.name();
-        let result = self.state.wake();
-        if self.id == 2 {
-            crate::kinfo!("devd", "wake"; from = from, ok = result.is_ok());
-        }
-        result
+        self.state.wake()
     }
 
     /// Transition: Any runnable/blocked → Exiting
@@ -1020,6 +1005,16 @@ impl Task {
         self.heap_mappings[slot] = HeapMapping::empty();
 
         true
+    }
+
+    /// Clear all timers (helper for task exit/kill)
+    ///
+    /// Resets all timer slots to inactive state.
+    pub fn clear_timers(&mut self) {
+        for timer in self.timers.iter_mut() {
+            timer.deadline = 0;
+            timer.interval = 0;
+        }
     }
 }
 

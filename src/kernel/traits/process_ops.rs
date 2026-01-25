@@ -112,3 +112,56 @@ pub trait ProcessOps: Send + Sync {
         caps: Capabilities,
     ) -> Result<TaskId, ProcessError>;
 }
+
+// ============================================================================
+// Mock Implementation for Testing
+// ============================================================================
+
+/// Mock ProcessOps implementation for unit testing
+///
+/// Note: exit() cannot be easily mocked because it returns `!`.
+/// Tests should avoid calling exit() on the mock, or expect a panic.
+#[cfg(any(test, feature = "mock"))]
+pub struct MockProcessOps {
+    kill_result: Result<(), ProcessError>,
+    spawn_result: Result<TaskId, ProcessError>,
+}
+
+#[cfg(any(test, feature = "mock"))]
+impl MockProcessOps {
+    /// Create a new mock with default (success) results
+    pub const fn new() -> Self {
+        Self {
+            kill_result: Ok(()),
+            spawn_result: Ok(1), // Default spawned PID
+        }
+    }
+
+    /// Configure kill() result
+    pub const fn with_kill_result(mut self, result: Result<(), ProcessError>) -> Self {
+        self.kill_result = result;
+        self
+    }
+
+    /// Configure spawn() result
+    pub const fn with_spawn_result(mut self, result: Result<TaskId, ProcessError>) -> Self {
+        self.spawn_result = result;
+        self
+    }
+}
+
+#[cfg(any(test, feature = "mock"))]
+impl ProcessOps for MockProcessOps {
+    fn exit(&self, _task_id: TaskId, _code: i32) -> ! {
+        // Cannot return from exit - panic in mock
+        panic!("MockProcessOps::exit() called - tests should not call exit()")
+    }
+
+    fn kill(&self, _killer: TaskId, _target: TaskId) -> Result<(), ProcessError> {
+        self.kill_result
+    }
+
+    fn spawn(&self, _parent: TaskId, _elf_path: &str, _caps: Capabilities) -> Result<TaskId, ProcessError> {
+        self.spawn_result
+    }
+}

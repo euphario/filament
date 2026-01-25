@@ -1007,13 +1007,8 @@ fn read_port_via_service(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: us
     4 // Wrote 4 bytes (handle only)
 }
 
-// Legacy read_port - kept for reference but not used (replaced by read_port_via_service)
-#[allow(dead_code)]
-fn read_port(_p: &mut super::PortObject, _buf_ptr: u64, _buf_len: usize, _task_id: u32) -> i64 {
-    // This function is no longer used - Port reads go through read_port_via_service
-    // to avoid nested lock issues when allocating the channel handle.
-    Error::NotSupported.to_errno()
-}
+// Note: Port reads are handled via read_port_via_service() to avoid nested lock issues
+// when allocating the channel handle. See that function for the implementation.
 
 fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
     // Read = WAIT operation

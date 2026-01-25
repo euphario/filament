@@ -64,7 +64,7 @@ pub use waker::{Waker, WakeReason, Subscriber};
 #[allow(unused_imports)]
 pub use sched::{SchedulerBackend, TaskStateInfo, SchedError};
 #[allow(unused_imports)]
-pub use process::{ProcessBackend, ProcessStateInfo, ProcessInfo, ProcessError};
+pub use process::{ProcessBackend, ProcessStateInfo, ProcessInfo};
 #[allow(unused_imports)]
 pub use addrspace::{AddressSpaceBackend, Asid, VirtAddr, PhysAddr, PageFlags, MemoryType, AddrSpaceError};
 #[allow(unused_imports)]

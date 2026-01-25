@@ -250,3 +250,107 @@ pub trait ObjectOps: Send + Sync {
         sub: Subscriber,
     ) -> Result<(), ObjectError>;
 }
+
+// ============================================================================
+// Mock Implementation for Testing
+// ============================================================================
+
+/// Mock ObjectOps implementation for unit testing
+///
+/// This allows testing code that depends on ObjectOps without a real kernel.
+/// Configure behavior via the builder methods.
+///
+/// # Example
+/// ```ignore
+/// let mock = MockObjectOps::new()
+///     .with_create_result(Ok(42))
+///     .with_read_result(Ok(ReadResult { bytes_read: 10, peer_pid: None }));
+/// test_code_that_uses_object_ops(&mock);
+/// ```
+#[cfg(any(test, feature = "mock"))]
+pub struct MockObjectOps {
+    create_result: Result<Handle, ObjectError>,
+    read_result: Result<ReadResult, ObjectError>,
+    write_result: Result<usize, ObjectError>,
+    map_result: Result<MapResult, ObjectError>,
+    close_result: Result<(), ObjectError>,
+    subscribe_result: Result<(), ObjectError>,
+}
+
+#[cfg(any(test, feature = "mock"))]
+impl MockObjectOps {
+    /// Create a new mock with default (success) results
+    pub const fn new() -> Self {
+        Self {
+            create_result: Ok(1), // Default handle
+            read_result: Ok(ReadResult { bytes_read: 0, peer_pid: None }),
+            write_result: Ok(0),
+            map_result: Ok(MapResult { vaddr: 0, paddr: 0, size: 0 }),
+            close_result: Ok(()),
+            subscribe_result: Ok(()),
+        }
+    }
+
+    /// Configure create() result
+    pub const fn with_create_result(mut self, result: Result<Handle, ObjectError>) -> Self {
+        self.create_result = result;
+        self
+    }
+
+    /// Configure read() result
+    pub const fn with_read_result(mut self, result: Result<ReadResult, ObjectError>) -> Self {
+        self.read_result = result;
+        self
+    }
+
+    /// Configure write() result
+    pub const fn with_write_result(mut self, result: Result<usize, ObjectError>) -> Self {
+        self.write_result = result;
+        self
+    }
+
+    /// Configure map() result
+    pub const fn with_map_result(mut self, result: Result<MapResult, ObjectError>) -> Self {
+        self.map_result = result;
+        self
+    }
+
+    /// Configure close() result
+    pub const fn with_close_result(mut self, result: Result<(), ObjectError>) -> Self {
+        self.close_result = result;
+        self
+    }
+
+    /// Configure subscribe() result
+    pub const fn with_subscribe_result(mut self, result: Result<(), ObjectError>) -> Self {
+        self.subscribe_result = result;
+        self
+    }
+}
+
+#[cfg(any(test, feature = "mock"))]
+impl ObjectOps for MockObjectOps {
+    fn create(&self, _task_id: TaskId, _obj_type: ObjectType, _flags: u32, _arg: u64) -> Result<Handle, ObjectError> {
+        self.create_result
+    }
+
+    fn read(&self, _task_id: TaskId, _handle: Handle, _buf: &mut [u8], _flags: u32) -> Result<ReadResult, ObjectError> {
+        self.read_result
+    }
+
+    fn write(&self, _task_id: TaskId, _handle: Handle, _buf: &[u8], _flags: u32) -> Result<usize, ObjectError> {
+        self.write_result
+    }
+
+    fn map(&self, _task_id: TaskId, _handle: Handle) -> Result<MapResult, ObjectError> {
+        self.map_result
+    }
+
+    fn close(&self, _task_id: TaskId, _handle: Handle) -> Result<(), ObjectError> {
+        self.close_result
+    }
+
+    fn subscribe(&self, _task_id: TaskId, _handle: Handle, _sub: Subscriber) -> Result<(), ObjectError> {
+        self.subscribe_result
+    }
+}

@@ -543,7 +543,7 @@ impl ProcessObject {
         }
 
         use crate::kernel::task;
-        let code = unsafe {
+        let code = {
             let sched = task::scheduler();
             if let Some(target_slot) = sched.slot_by_pid(self.pid) {
                 if let Some(target) = sched.task(target_slot) {
@@ -574,7 +574,7 @@ impl Pollable for ProcessObject {
         // Lazy check - see if target has exited
         // Note: We can't mutate self here, so do a non-caching check
         use crate::kernel::task;
-        let has_exited = unsafe {
+        let has_exited = {
             let sched = task::scheduler();
             if let Some(target_slot) = sched.slot_by_pid(self.pid()) {
                 if let Some(target) = sched.task(target_slot) {

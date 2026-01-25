@@ -178,30 +178,5 @@ pub trait ProcessBackend: Send + Sync {
     fn wake(&self, pid: Pid) -> bool;
 }
 
-// ============================================================================
-// Error Types
-// ============================================================================
-
-/// Process errors for trait boundary
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessError {
-    /// Process not found
-    NotFound,
-    /// No free slots available
-    NoSlots,
-    /// Invalid state transition
-    InvalidTransition,
-    /// Operation not permitted
-    NotPermitted,
-}
-
-impl ProcessError {
-    pub fn to_errno(self) -> i64 {
-        match self {
-            ProcessError::NotFound => -3,         // ESRCH
-            ProcessError::NoSlots => -12,         // ENOMEM
-            ProcessError::InvalidTransition => -22, // EINVAL
-            ProcessError::NotPermitted => -1,     // EPERM
-        }
-    }
-}
+// Note: ProcessError is defined in traits/process_ops.rs for syscall layer.
+// This module defines ProcessBackend for process lifecycle operations.

@@ -233,6 +233,27 @@ impl Scheduler {
         }
     }
 
+    /// Wake parent task if it's sleeping (helper for cleanup code)
+    ///
+    /// This allows EventLoop to poll ProcessObjects and see child exits.
+    /// Called during task termination to notify parent.
+    fn wake_parent_if_sleeping(&mut self, slot_idx: usize) {
+        let parent_id = match self.tasks[slot_idx].as_ref() {
+            Some(task) => task.parent_id,
+            None => return,
+        };
+        if parent_id == 0 {
+            return;
+        }
+        if let Some(parent_slot) = self.slot_by_pid(parent_id) {
+            if let Some(ref mut parent) = self.tasks[parent_slot] {
+                if parent.state().is_sleeping() {
+                    crate::transition_or_log!(parent, wake);
+                }
+            }
+        }
+    }
+
     /// Recalculate next_deadline by scanning all active timers and waiting tasks
     /// Called after a deadline fires to find the next one
     pub fn recalculate_next_deadline(&mut self) {
@@ -690,19 +711,7 @@ impl Scheduler {
                     }
 
                     // Wake parent task if it's sleeping (for Process watch)
-                    // This allows EventLoop to poll ProcessObjects and see the exit
-                    if let Some(ref task) = self.tasks[slot_idx] {
-                        let parent_id = task.parent_id;
-                        if parent_id != 0 {
-                            if let Some(parent_slot) = self.slot_by_pid(parent_id) {
-                                if let Some(ref mut parent) = self.tasks[parent_slot] {
-                                    if parent.state().is_sleeping() {
-                                        crate::transition_or_log!(parent, wake);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.wake_parent_if_sleeping(slot_idx);
 
                     // Stop DMA first (critical for safety)
                     super::bus::process_cleanup(pid);
@@ -772,18 +781,7 @@ impl Scheduler {
                     );
 
                     // Wake parent task if it's sleeping (for Process watch)
-                    if let Some(ref task) = self.tasks[slot_idx] {
-                        let parent_id = task.parent_id;
-                        if parent_id != 0 {
-                            if let Some(parent_slot) = self.slot_by_pid(parent_id) {
-                                if let Some(ref mut parent) = self.tasks[parent_slot] {
-                                    if parent.state().is_sleeping() {
-                                        crate::transition_or_log!(parent, wake);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.wake_parent_if_sleeping(slot_idx);
 
                     // Stop DMA
                     super::bus::process_cleanup(pid);

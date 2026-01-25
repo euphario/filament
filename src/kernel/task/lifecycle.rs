@@ -82,10 +82,7 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), Lif
         }
 
         // Clear timers
-        for timer in task.timers.iter_mut() {
-            timer.deadline = 0;
-            timer.interval = 0;
-        }
+        task.clear_timers();
 
         // Clear is_init flag so new devd can be init
         task.is_init = false;
@@ -161,10 +158,7 @@ pub fn kill(
         }
 
         // Clear timers
-        for timer in task.timers.iter_mut() {
-            timer.deadline = 0;
-            timer.interval = 0;
-        }
+        task.clear_timers();
 
         task.is_init = false;
 
