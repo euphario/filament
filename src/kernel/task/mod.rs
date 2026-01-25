@@ -850,63 +850,51 @@ impl Scheduler {
         }
     }
 
-    /// Run a specific user task (enter user mode)
-    /// This never returns to the caller - it erets to user mode
+    /// Prepare a task for running and return data needed for usermode entry.
+    ///
+    /// This extracts the trap frame pointer and ttbr0, setting up globals.
+    /// The caller MUST release the scheduler lock before calling enter_usermode().
+    ///
+    /// # Returns
+    /// Some((trap_frame_ptr, ttbr0)) on success, None if task isn't valid.
+    ///
     /// # Safety
-    /// Task must be properly set up with valid trap frame and address space
-    pub unsafe fn run_user_task(&mut self, slot: usize) -> ! {
+    /// Task must be properly set up with valid trap frame and address space.
+    pub unsafe fn prepare_user_task(&mut self, slot: usize) -> Option<(*const TrapFrame, u64)> {
         // This should only be called ONCE at boot from kernel_main
         kinfo!("task", "run_user_task_entry"; slot = slot as u64);
 
         // Set current task slot for this CPU
         set_current_slot(slot);
 
-        if let Some(ref mut task) = self.tasks[slot] {
-            // Task must be Ready to enter Running state
-            // If task is in another state (Waiting, Sleeping, etc), we can't run it
-            if !crate::transition_or_evict!(task, set_running) {
-                // Transition failed - task was evicted
-                // This should NEVER happen at boot - devd should be Ready
-                kerror!("task", "run_user_task_failed"; slot = slot as u64, pid = task.id as u64, state = task.state().name());
+        let task = self.tasks[slot].as_mut()?;
 
-                // Reset to idle task before entering idle loop
-                set_current_slot(0);  // Idle is always slot 0
-                update_current_task_globals();
+        // Task must be Ready to enter Running state
+        if !crate::transition_or_evict!(task, set_running) {
+            // Transition failed - task was evicted
+            kerror!("task", "run_user_task_failed"; slot = slot as u64, pid = task.id as u64, state = task.state().name());
 
-                // Enter idle - will wait for IRQ to wake a task
-                crate::kernel::idle::idle_entry();
-            }
-
-            if let Some(ref addr_space) = task.address_space {
-                let ttbr0 = addr_space.get_ttbr0();
-                let trap_frame = &mut task.trap_frame as *mut TrapFrame;
-
-                // Set globals for exception handler (atomic for SMP safety)
-                CURRENT_TRAP_FRAME.store(trap_frame, Ordering::Release);
-                CURRENT_TTBR0.store(ttbr0, Ordering::Release);
-
-                kinfo!("task", "enter_user";
-                    entry = klog::hex64(task.trap_frame.elr_el1),
-                    stack = klog::hex64(task.trap_frame.sp_el0),
-                    ttbr0 = klog::hex64(ttbr0)
-                );
-
-                // Flush log buffer before entering userspace
-                crate::klog::flush();
-
-                // Start timer preemption just before entering userspace.
-                // We can't start this earlier in boot because timer IRQs
-                // would trigger rescheduling before run_user_task is called,
-                // corrupting the boot flow.
-                crate::plat::timer::start(10);
-                kinfo!("timer", "preemption_started"; slice_ms = 10u64);
-
-                enter_usermode(trap_frame as *const TrapFrame, ttbr0);
-            }
+            // Reset to idle task
+            set_current_slot(0);
+            update_current_task_globals();
+            return None;
         }
 
-        // Should never reach here
-        panic!("run_user_task: invalid task or no address space");
+        let addr_space = task.address_space.as_ref()?;
+        let ttbr0 = addr_space.get_ttbr0();
+        let trap_frame = &mut task.trap_frame as *mut TrapFrame;
+
+        // Set globals for exception handler (atomic for SMP safety)
+        CURRENT_TRAP_FRAME.store(trap_frame, Ordering::Release);
+        CURRENT_TTBR0.store(ttbr0, Ordering::Release);
+
+        kinfo!("task", "enter_user";
+            entry = klog::hex64(task.trap_frame.elr_el1),
+            stack = klog::hex64(task.trap_frame.sp_el0),
+            ttbr0 = klog::hex64(ttbr0)
+        );
+
+        Some((trap_frame as *const TrapFrame, ttbr0))
     }
 
     /// Get the next deadline (for tickless timer reprogramming)

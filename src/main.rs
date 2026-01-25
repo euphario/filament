@@ -306,8 +306,33 @@ pub extern "C" fn kmain() -> ! {
 
         // Enter user mode - scheduler will switch between processes
         // (boot span will be auto-closed when we context switch)
+        //
+        // CRITICAL: We must release the scheduler lock BEFORE entering usermode.
+        // Otherwise, the lock is never released (eret doesn't return) and all
+        // subsequent scheduler() calls will deadlock.
+        let (trap_frame, ttbr0) = unsafe {
+            let mut sched = task::scheduler();
+            match sched.prepare_user_task(slot) {
+                Some(data) => data,
+                None => {
+                    // Task preparation failed - enter idle instead
+                    drop(sched);
+                    kerror!("kernel", "task_prep_failed"; slot = slot);
+                    kernel::idle::idle_entry();
+                }
+            }
+            // sched guard is dropped here, releasing the lock
+        };
+
+        // Start timer preemption just before entering userspace.
+        // We can't start this earlier in boot because timer IRQs
+        // would trigger rescheduling before we're ready.
+        crate::platform::current::timer::start(10);
+        kinfo!("timer", "preemption_started"; slice_ms = 10u64);
+
+        // Enter usermode - this never returns
         unsafe {
-            task::scheduler().run_user_task(slot);
+            task::enter_usermode(trap_frame, ttbr0);
         }
     } else {
         kerror!("kernel", "no_init_process");
