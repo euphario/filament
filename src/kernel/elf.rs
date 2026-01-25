@@ -7,7 +7,7 @@
 
 use super::addrspace::AddressSpace;
 use super::pmm;
-use crate::{kinfo, kwarn, print_direct};
+use crate::{kinfo, print_direct};
 use crate::arch::aarch64::mmu;
 use super::task;
 
@@ -475,125 +475,136 @@ fn spawn_from_elf_internal(
     // (stub: always passes, future: crypto verification)
     verify_binary_signature(data, name, explicit_caps)?;
 
-    // Create a new user task
-    let (task_id, slot) = unsafe {
-        task::scheduler().add_user_task(name).ok_or(ElfError::OutOfMemory)?
-    };
-
-    // Get access to the task's address space
-    let task = unsafe {
-        task::scheduler().task_mut(slot).ok_or(ElfError::OutOfMemory)?
-    };
-
-    let addr_space = task.address_space_mut().ok_or(ElfError::OutOfMemory)?;
-
-    // Load the ELF into the address space
-    let elf_info = load_elf(data, addr_space)?;
-
-    // Debug: Dump PTEs for entry point (only in debug builds)
-    #[cfg(debug_assertions)]
-    {
-        let entry = elf_info.entry;
-        for offset in [0u64, 0x1000, 0x2000, 0x3000, 0x4000] {
-            let va = entry + offset;
-            if let Some((l1, l2, l3, phys)) = addr_space.dump_pte(va) {
-                kdebug!("elf", "pte_dump"; name = name, va = crate::klog::hex64(va),
-                    l1 = crate::klog::hex64(l1), l2 = crate::klog::hex64(l2),
-                    l3 = crate::klog::hex64(l3), phys = crate::klog::hex64(phys));
-            }
-        }
-    }
-
-    // Allocate user stack
+    // Allocate user stack BEFORE acquiring scheduler lock
+    // (pmm allocation doesn't need scheduler lock)
     let stack_pages = USER_STACK_SIZE / 4096;
     let stack_phys = pmm::alloc_pages(stack_pages).ok_or(ElfError::OutOfMemory)?;
 
-    // Map user stack with guard page below
-    // Layout (addresses grow up):
-    //   [guard page - NOT MAPPED - will fault on access]  <- catches stack overflow
-    //   [usable stack pages]
-    //   [USER_STACK_TOP - 1]  <- initial SP points here
-    //
-    // Guard page virtual address (not mapped - any access faults)
-    let guard_page_virt = USER_STACK_TOP - USER_STACK_SIZE as u64 - USER_GUARD_PAGE_SIZE as u64;
-    let stack_base_virt = guard_page_virt + USER_GUARD_PAGE_SIZE as u64;
+    // Hold scheduler lock for the entire task setup
+    let mut sched = task::scheduler();
 
-    // Only map the usable stack pages (guard page left unmapped)
-    for i in 0..stack_pages {
-        let page_virt = stack_base_virt + (i * 4096) as u64;
-        let page_phys = (stack_phys + i * 4096) as u64;
-        if !addr_space.map_page(page_virt, page_phys, true, false) {
+    // Create a new user task
+    let (task_id, slot) = unsafe {
+        sched.add_user_task(name).ok_or_else(|| {
             pmm::free_pages(stack_phys, stack_pages);
-            return Err(ElfError::OutOfMemory);
+            ElfError::OutOfMemory
+        })?
+    };
+
+    // Load ELF into the task's address space
+    let elf_info = {
+        let task = sched.task_mut(slot).ok_or_else(|| {
+            pmm::free_pages(stack_phys, stack_pages);
+            ElfError::OutOfMemory
+        })?;
+        let addr_space = task.address_space_mut().ok_or_else(|| {
+            pmm::free_pages(stack_phys, stack_pages);
+            ElfError::OutOfMemory
+        })?;
+
+        let info = load_elf(data, addr_space)?;
+
+        // Debug: Dump PTEs for entry point (only in debug builds)
+        #[cfg(debug_assertions)]
+        {
+            let entry = info.entry;
+            for offset in [0u64, 0x1000, 0x2000, 0x3000, 0x4000] {
+                let va = entry + offset;
+                if let Some((l1, l2, l3, phys)) = addr_space.dump_pte(va) {
+                    kdebug!("elf", "pte_dump"; name = name, va = crate::klog::hex64(va),
+                        l1 = crate::klog::hex64(l1), l2 = crate::klog::hex64(l2),
+                        l3 = crate::klog::hex64(l3), phys = crate::klog::hex64(phys));
+                }
+            }
+        }
+
+        // Map user stack with guard page below
+        // Layout (addresses grow up):
+        //   [guard page - NOT MAPPED - will fault on access]  <- catches stack overflow
+        //   [usable stack pages]
+        //   [USER_STACK_TOP - 1]  <- initial SP points here
+        //
+        // Guard page virtual address (not mapped - any access faults)
+        let guard_page_virt = USER_STACK_TOP - USER_STACK_SIZE as u64 - USER_GUARD_PAGE_SIZE as u64;
+        let stack_base_virt = guard_page_virt + USER_GUARD_PAGE_SIZE as u64;
+
+        // Only map the usable stack pages (guard page left unmapped)
+        for i in 0..stack_pages {
+            let page_virt = stack_base_virt + (i * 4096) as u64;
+            let page_phys = (stack_phys + i * 4096) as u64;
+            if !addr_space.map_page(page_virt, page_phys, true, false) {
+                pmm::free_pages(stack_phys, stack_pages);
+                return Err(ElfError::OutOfMemory);
+            }
+        }
+        // Note: guard_page_virt is intentionally NOT mapped
+        // Any stack overflow that reaches it will trigger a page fault
+
+        info
+    };
+
+    // Set up the trap frame with entry point and user stack
+    {
+        let task = sched.task_mut(slot).ok_or(ElfError::OutOfMemory)?;
+        task.set_user_entry(elf_info.entry, USER_STACK_TOP);
+
+        // Set parent if specified
+        if parent_id != 0 {
+            task.set_parent(parent_id);
         }
     }
 
-    // Note: guard_page_virt is intentionally NOT mapped
-    // Any stack overflow that reaches it will trigger a page fault
-
-    // Set up the trap frame with entry point and user stack
-    let task = unsafe {
-        task::scheduler().task_mut(slot).ok_or(ElfError::OutOfMemory)?
-    };
-    task.set_user_entry(elf_info.entry, USER_STACK_TOP);
-
     // Set up parent-child relationship and handle capabilities
     if parent_id != 0 {
-        task.set_parent(parent_id);
-
-        // Add child to parent's children list and compute capabilities
-        unsafe {
-            let sched = task::scheduler();
-            // First pass: find parent's capabilities
-            let mut parent_caps = None;
-            for (_slot, task_opt) in sched.iter_tasks() {
-                if let Some(parent_task) = task_opt {
-                    if parent_task.id == parent_id {
-                        parent_caps = Some(parent_task.capabilities);
-                        break;
-                    }
+        // First pass: find parent's capabilities
+        let mut parent_caps = None;
+        for (_slot, task_opt) in sched.iter_tasks() {
+            if let Some(parent_task) = task_opt {
+                if parent_task.id == parent_id {
+                    parent_caps = Some(parent_task.capabilities);
+                    break;
                 }
             }
-            // Second pass: add child to parent's children list
-            for (_slot, task_opt) in sched.iter_tasks_mut() {
-                if let Some(parent_task) = task_opt {
-                    if parent_task.id == parent_id {
-                        let _ = parent_task.add_child(task_id);
-                        break;
-                    }
+        }
+        // Second pass: add child to parent's children list
+        for (_slot, task_opt) in sched.iter_tasks_mut() {
+            if let Some(parent_task) = task_opt {
+                if parent_task.id == parent_id {
+                    let _ = parent_task.add_child(task_id);
+                    break;
                 }
             }
-            // Find parent priority first (before mutable borrow for child)
-            let parent_priority = sched.iter_tasks()
-                .find_map(|(_, task_opt)| {
-                    task_opt.as_ref()
-                        .filter(|t| t.id == parent_id)
-                        .map(|t| t.priority)
-                });
+        }
+        // Find parent priority first (before mutable borrow for child)
+        let parent_priority = sched.iter_tasks()
+            .find_map(|(_, task_opt)| {
+                task_opt.as_ref()
+                    .filter(|t| t.id == parent_id)
+                    .map(|t| t.priority)
+            });
 
-            // Compute and apply child capabilities and priority
-            if let Some(p_caps) = parent_caps {
-                // Note: slot was just allocated, so task_mut should always succeed
-                let Some(child_task) = sched.task_mut(slot) else {
-                    // Should never happen - task was just created
-                    return Err(ElfError::OutOfMemory);
-                };
-                let final_caps = match explicit_caps {
-                    Some(requested) => {
-                        // Explicit grant: use child_capabilities() for proper filtering
-                        super::caps::child_capabilities(p_caps, requested)
-                    }
-                    None => {
-                        // Legacy: inherit all parent capabilities
-                        p_caps
-                    }
-                };
-                child_task.set_capabilities(final_caps);
-
-                // Inherit parent's priority (children of High priority tasks get High priority)
-                if let Some(prio) = parent_priority {
-                    child_task.set_priority(prio);
+        // Compute and apply child capabilities and priority
+        if let Some(p_caps) = parent_caps {
+            // Note: slot was just allocated, so task_mut should always succeed
+            let Some(child_task) = sched.task_mut(slot) else {
+                // Should never happen - task was just created
+                return Err(ElfError::OutOfMemory);
+            };
+            let final_caps = match explicit_caps {
+                Some(requested) => {
+                    // Explicit grant: use child_capabilities() for proper filtering
+                    super::caps::child_capabilities(p_caps, requested)
                 }
+                None => {
+                    // Legacy: inherit all parent capabilities
+                    p_caps
+                }
+            };
+            child_task.set_capabilities(final_caps);
+
+            // Inherit parent's priority (children of High priority tasks get High priority)
+            if let Some(prio) = parent_priority {
+                child_task.set_priority(prio);
             }
         }
     }

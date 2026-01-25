@@ -936,28 +936,34 @@ impl Scheduler {
 }
 
 use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
+use super::lock::SpinLock;
 
-/// Global scheduler instance
+/// Global scheduler instance protected by SpinLock for SMP safety.
 ///
 /// # Synchronization
 ///
-/// Access is serialized via IrqGuard in `with_scheduler()`. This prevents:
-/// - Interrupt handler races (IRQs disabled while holding "lock")
-/// - Recursive access from same CPU
+/// Access is serialized via SpinLock which:
+/// 1. Disables IRQs on the current CPU (prevents interrupt handler races)
+/// 2. Uses atomic spinlock (prevents cross-CPU races on SMP)
 ///
-/// # SMP Limitation
+/// # Three-Phase Scheduling
 ///
-/// This design is NOT SMP-safe. For multi-core support, we would need one of:
-/// - Per-CPU run queues with local locks (common approach in Linux, xv6)
-/// - Lock release before context_switch, reacquire after
-/// - More complex lock ownership tracking
+/// The lock MUST NOT be held across context_switch(). This is achieved via
+/// three-phase scheduling in reschedule():
+/// 1. Phase 1: Acquire lock, make decision, extract SwitchDecision, RELEASE LOCK
+/// 2. Phase 2: Context switch with NO LOCK (only IRQs disabled)
+/// 3. Phase 3: Reacquire lock for finalization
 ///
-/// The challenge is that context_switch() suspends the current task mid-function,
-/// and any held lock would appear "owned" by that task even though another CPU
-/// might try to acquire it. See SCHEDULER_REDESIGN.md for future plans.
+/// # Public API
 ///
-/// For single-core (current BPI-R4 use), IrqGuard is sufficient.
-static mut SCHEDULER: Scheduler = Scheduler::new();
+/// Most code should use the public API functions which hide locking:
+/// - `with_task()` / `with_task_mut()` - access a task by slot
+/// - `reap_terminated()` - cleanup dead tasks
+/// - `check_timeouts()` - wake timed-out tasks
+/// - `current_task_id()` - get current task's PID
+///
+/// See docs/architecture/SCHEDULER_DESIGN_V2.md for details.
+static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 
 /// Initialize scheduler (call once at boot)
 /// This explicitly resets all task slots to None to handle static initialization issues
@@ -966,11 +972,12 @@ static mut SCHEDULER: Scheduler = Scheduler::new();
 /// Also creates the idle task in slot 0 - this is an internal implementation detail.
 pub fn init_scheduler() {
     // Clear all task slots (handles static init issues on some platforms)
-    unsafe {
+    {
+        let mut sched = SCHEDULER.lock();
         for i in 0..MAX_TASKS {
-            SCHEDULER.tasks[i] = None;
+            sched.tasks[i] = None;
         }
-        SCHEDULER.next_deadline = u64::MAX;
+        sched.next_deadline = u64::MAX;
     }
 
     // Initialize per-CPU current slot to idle (slot 0)
@@ -978,10 +985,12 @@ pub fn init_scheduler() {
 
     // Create idle task in slot 0 - runs WFI loop when no tasks ready
     // Uses static stack (no PMM allocation) since PMM isn't initialized yet
-    unsafe {
-        let idle_id = SCHEDULER.make_pid(0);
-        let idle_task = Task::new_idle(idle_id, crate::kernel::idle::idle_entry);
-        SCHEDULER.tasks[0] = Some(idle_task);
+    {
+        let mut sched = SCHEDULER.lock();
+        let idle_id = sched.make_pid(0);
+        // SAFETY: idle_entry is a valid function pointer, idle_stack_top() returns valid stack
+        let idle_task = unsafe { Task::new_idle(idle_id, crate::kernel::idle::idle_entry) };
+        sched.tasks[0] = Some(idle_task);
     }
 }
 
@@ -1009,40 +1018,119 @@ pub static CURRENT_TTBR0: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub static SYSCALL_SWITCHED_TASK: AtomicU64 = AtomicU64::new(0);
 
-/// Get the global scheduler
-/// # Safety
-/// Must ensure proper synchronization (interrupts disabled via IrqGuard)
+/// Get exclusive access to the scheduler.
 ///
-/// NOTE: Prefer `with_scheduler()` for safe access with automatic IRQ guard.
-/// This raw accessor is `pub(crate)` to limit exposure.
-pub(crate) unsafe fn scheduler() -> &'static mut Scheduler {
-    &mut *core::ptr::addr_of_mut!(SCHEDULER)
+/// Returns a guard that holds the SpinLock. The lock is released when
+/// the guard is dropped.
+///
+/// # Warning
+/// NEVER hold the guard across context_switch()! Use the three-phase
+/// pattern in reschedule() instead.
+///
+/// # Usage
+/// ```
+/// let mut sched = scheduler();
+/// sched.wake_task(slot);
+/// // Guard dropped, lock released
+/// ```
+#[inline]
+pub fn scheduler() -> super::lock::SpinLockGuard<'static, Scheduler> {
+    SCHEDULER.lock()
 }
 
 /// Execute a closure with exclusive access to the scheduler.
-/// Automatically disables interrupts for the duration.
 ///
-/// Use this instead of `unsafe { scheduler() }` for safe access:
+/// This is the preferred pattern for most operations:
 /// ```
 /// with_scheduler(|sched| {
-///     sched.wake(pid);
+///     sched.wake_task(slot);
 /// });
 /// ```
 ///
-/// # SMP Limitation
-/// This only provides single-core safety via IRQ disable. For multi-core,
-/// see the SMP discussion in the SCHEDULER static documentation above.
+/// The SpinLock is acquired before calling the closure and released after.
+/// IRQs are disabled for the duration (SpinLock does this automatically).
 #[inline]
 pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
-    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
-    unsafe { f(scheduler()) }
+    let mut guard = SCHEDULER.lock();
+    f(&mut *guard)
+}
+
+// ============================================================================
+// Public API - Locking Hidden Inside
+// ============================================================================
+
+/// Access a task by slot (read-only).
+///
+/// Acquires scheduler lock, calls closure with task reference, releases lock.
+/// Returns None if slot is empty.
+#[inline]
+pub fn with_task<R, F: FnOnce(&Task) -> R>(slot: usize, f: F) -> Option<R> {
+    let sched = SCHEDULER.lock();
+    sched.tasks[slot].as_ref().map(f)
+}
+
+/// Access a task by slot (mutable).
+///
+/// Acquires scheduler lock, calls closure with task reference, releases lock.
+/// Returns None if slot is empty.
+#[inline]
+pub fn with_task_mut<R, F: FnOnce(&mut Task) -> R>(slot: usize, f: F) -> Option<R> {
+    let mut sched = SCHEDULER.lock();
+    sched.tasks[slot].as_mut().map(f)
+}
+
+/// Get the current task's PID.
+#[inline]
+pub fn current_task_id() -> Option<TaskId> {
+    let sched = SCHEDULER.lock();
+    sched.tasks[current_slot()].as_ref().map(|t| t.id)
+}
+
+/// Remove terminated tasks and free resources.
+///
+/// Called from timer interrupt to clean up dead tasks.
+#[inline]
+pub fn reap_terminated(current_tick: u64) {
+    let mut sched = SCHEDULER.lock();
+    sched.reap_terminated(current_tick);
+}
+
+/// Check for timed-out tasks and wake them.
+///
+/// Returns the number of tasks woken.
+#[inline]
+pub fn check_timeouts(current_time: u64) -> usize {
+    let mut sched = SCHEDULER.lock();
+    sched.check_timeouts(current_time)
+}
+
+/// Record a deadline for the next wake time.
+#[inline]
+pub fn note_deadline(deadline: u64) {
+    let mut sched = SCHEDULER.lock();
+    sched.note_deadline(deadline);
+}
+
+/// Spawn a new user task.
+///
+/// Returns (pid, slot) on success, None if no free slots.
+#[inline]
+pub fn spawn_user_task(name: &str) -> Option<(TaskId, usize)> {
+    let mut sched = SCHEDULER.lock();
+    sched.add_user_task(name)
 }
 
 /// Update the current task globals after scheduling decision
+///
 /// # Safety
-/// Must be called with valid current task
+/// Must be called with valid current task.
+///
+/// # Note
+/// This function acquires the scheduler lock. It should NOT be called
+/// while already holding the lock. For three-phase reschedule, extract
+/// the needed data (trap_frame ptr, ttbr0) upfront in Phase 1.
 pub unsafe fn update_current_task_globals() {
-    let sched = scheduler();
+    let mut sched = SCHEDULER.lock();
     let slot = current_slot();
 
     // Defensive check: validate current slot is in bounds

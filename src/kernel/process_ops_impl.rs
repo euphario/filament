@@ -42,10 +42,10 @@ impl ProcessOps for KernelProcessOps {
         print_direct!("========================================\n");
 
         unsafe {
-            let sched = task::scheduler();
+            let mut sched = task::scheduler();
 
             // Delegate state transition and parent notification to lifecycle module
-            if let Err(e) = lifecycle::exit(sched, task_id, code) {
+            if let Err(e) = lifecycle::exit(&mut *sched, task_id, code) {
                 kinfo!("process_ops", "exit_lifecycle_error"; pid = task_id as u64, err = e as i64);
             }
 
@@ -83,10 +83,10 @@ impl ProcessOps for KernelProcessOps {
         }
 
         unsafe {
-            let sched = task::scheduler();
+            let mut sched = task::scheduler();
 
             // Delegate to lifecycle module for permission check, state transition, notification
-            match lifecycle::kill(sched, target, killer) {
+            match lifecycle::kill(&mut *sched, target, killer) {
                 Ok(()) => {
                     // If killing self, need to reschedule
                     if target == killer {

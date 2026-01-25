@@ -12,7 +12,7 @@
 //! fn wake_one(sub: &Subscriber) {
 //!     let _guard = IrqGuard::new();  // Only disables interrupts!
 //!     unsafe {
-//!         let sched = task::scheduler();
+//!         let mut sched = task::scheduler();
 //!         sched.wake_by_pid(sub.task_id);  // Race: another CPU can modify!
 //!     }
 //! }

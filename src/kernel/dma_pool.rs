@@ -267,7 +267,7 @@ pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i6
     }
 
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
 
         // Find the task and map the memory
         if let Some(slot) = sched.slot_by_pid(pid) {
@@ -299,7 +299,7 @@ pub fn map_into_process_high(pid: Pid, phys_addr: u64, size: usize) -> Result<u6
     }
 
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
 
         if let Some(slot) = sched.slot_by_pid(pid) {
             if let Some(task) = sched.task_mut(slot) {

@@ -734,7 +734,7 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
     // Mark task as blocked - syscall layer will handle scheduling
     // Calculate deadline first, then set state, then notify scheduler
     let deadline_to_notify: Option<u64> = unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         if let Some(task) = sched.current_task_mut() {
             // Set wake timeout if specified
             let timeout = if timeout_ms > 0 {
@@ -800,7 +800,7 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
     // Wake all waiters using O(1) PID→slot lookup
     let mut woken = 0u32;
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         for waiter_pid in waiters.iter() {
             if *waiter_pid == NO_PID {
                 continue;
@@ -883,7 +883,7 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
 /// Unmap a physical address range from all processes
 /// Used when destroying shared memory to prevent use-after-free
 unsafe fn unmap_from_all_processes(phys_addr: u64, size: usize) {
-    let sched = super::task::scheduler();
+    let mut sched = super::task::scheduler();
 
     for (_slot, task_opt) in sched.iter_tasks_mut() {
         if let Some(task) = task_opt {
@@ -912,7 +912,7 @@ unsafe fn unmap_from_all_processes(phys_addr: u64, size: usize) {
 /// PCIe/USB devices is critical.
 fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
 
         // Find the task
         if let Some(slot) = sched.slot_by_pid(pid) {

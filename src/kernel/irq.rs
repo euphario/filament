@@ -131,7 +131,7 @@ pub fn notify(irq_num: u32) -> Option<u32> {
     // Wake process outside the IRQ table lock
     if let Some(pid) = wake_blocked {
         unsafe {
-            let sched = super::task::scheduler();
+            let mut sched = super::task::scheduler();
             sched.wake_by_pid(pid);
         }
         Some(pid)

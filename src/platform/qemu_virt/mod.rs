@@ -17,12 +17,6 @@ pub mod timer;
 pub mod platform;
 pub mod bus;
 
-// Re-export platform function for convenience
-pub use platform::platform;
-
-// Re-export KERNEL_VIRT_BASE from arch layer
-pub use crate::arch::aarch64::mmu::KERNEL_VIRT_BASE;
-
 // =============================================================================
 // Memory Map (QEMU virt machine)
 // =============================================================================

@@ -82,7 +82,9 @@ pub static mut IDLE_STACK: IdleStack = IdleStack::new();
 /// # Safety
 /// Must only be called during scheduler initialization
 pub unsafe fn idle_stack_top() -> *mut u8 {
-    IDLE_STACK.top()
+    // Use addr_of_mut! to avoid creating a reference to mutable static
+    let stack_ptr = core::ptr::addr_of_mut!(IDLE_STACK);
+    (*stack_ptr).data.as_mut_ptr().add(4096)
 }
 
 #[cfg(test)]

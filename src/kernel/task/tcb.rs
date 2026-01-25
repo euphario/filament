@@ -273,7 +273,7 @@ fn user_task_trampoline() -> ! {
         let slot = crate::kernel::percpu::cpu_local().get_current_slot();
 
         // Get scheduler (IRQs should still be disabled from switch_to_task)
-        let sched = super::scheduler();
+        let mut sched = super::scheduler();
 
         if let Some(ref mut task) = sched.tasks[slot] {
             // Debug: log which task is entering userspace with full trap frame details
@@ -438,7 +438,7 @@ impl Task {
         // When context_switched to, ret will jump to the trampoline which
         // sets up globals and erets to userspace.
         let mut context = CpuContext::new();
-        context.x30 = user_task_trampoline as u64;
+        context.x30 = user_task_trampoline as *const () as u64;
         context.sp = stack_top_virt;
 
         let trap_frame = TrapFrame::new();

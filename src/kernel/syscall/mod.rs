@@ -374,7 +374,7 @@ pub extern "C" fn syscall_handler_rust(
     // Storm protection: check if task is making too many syscalls
     let storm_action = unsafe {
         let slot = super::task::current_slot();
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         if let Some(task) = sched.task_mut(slot) {
             // Use logical ticks computed from hardware counter (not IRQ-incremented)
             // This is more reliable since it doesn't depend on timer IRQ firing

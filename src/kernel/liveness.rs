@@ -218,7 +218,7 @@ pub fn check_liveness(current_tick: u64) -> usize {
     let mut notify_count = 0;
 
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
 
         // Count blocked tasks for logging
         let mut sleeping_count = 0u64;
@@ -454,7 +454,7 @@ fn close_channel_for_liveness(channel_id: u32) {
 /// Wake a task by PID
 fn wake_task(pid: u32) {
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         // Use unified wake function
         sched.wake_by_pid(pid);
     }

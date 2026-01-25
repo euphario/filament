@@ -666,7 +666,7 @@ pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
 
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         // Use generation-aware PID lookup to prevent TOCTOU
         if let Some(slot) = sched.slot_by_pid(target_pid) {
             if let Some(task) = sched.task_mut(slot) {
@@ -695,7 +695,7 @@ pub fn broadcast_event(event: Event) -> usize {
     let mut delivered = 0;
 
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         for (_slot, task_opt) in sched.iter_tasks_mut() {
             if let Some(task) = task_opt {
                 // Check if task is subscribed to this event type
@@ -751,7 +751,7 @@ pub fn sys_event_subscribe(event_type: u32, filter: u64, pid: u32) -> i64 {
     };
 
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         if let Some(task) = sched.current_task_mut() {
             match task.event_queue.subscribe(ev_type, filter) {
                 Ok(()) => return 0,
@@ -777,7 +777,7 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
     };
 
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         if let Some(task) = sched.current_task_mut() {
             if task.event_queue.unsubscribe(ev_type, filter) {
                 return 0;
@@ -795,7 +795,7 @@ pub fn sys_event_unsubscribe(event_type: u32, filter: u64, _pid: u32) -> i64 {
 /// syscall.rs wraps this with proper uaccess for copying to userspace.
 pub fn sys_event_wait_internal(flags: u32) -> Option<Event> {
     unsafe {
-        let sched = super::task::scheduler();
+        let mut sched = super::task::scheduler();
         if let Some(task) = sched.current_task_mut() {
             // Check task's event queue directly (no global system)
             if let Some(event) = task.event_queue.pop() {

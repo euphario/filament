@@ -355,7 +355,7 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
             let blocked_pid = uart::get_blocked_pid();
             if blocked_pid != 0 {
                 unsafe {
-                    let sched = task::scheduler();
+                    let mut sched = task::scheduler();
                     if sched.wake_by_pid(blocked_pid) {
                         uart::clear_blocked();
                         sync::cpu_flags().set_need_resched();
@@ -369,7 +369,7 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
             // Wake the owner process if blocked - O(1) lookup via pid_to_slot map
             unsafe {
                 let _guard = sync::IrqGuard::new(); // Ensure atomicity
-                let sched = task::scheduler();
+                let mut sched = task::scheduler();
                 if sched.wake_by_pid(owner_pid) {
                     // Task was woken, set need_resched so we switch to it
                     sync::cpu_flags().set_need_resched();
@@ -599,7 +599,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         // (Safe because we're on exception stack, not any task's stack)
         print_str_uart("  Killing all tasks...\r\n");
         unsafe {
-            let sched = kernel::task::scheduler();
+            let mut sched = kernel::task::scheduler();
             // Start from slot 1 - slot 0 is the idle task which must never be killed
             for slot_idx in 1..kernel::task::MAX_TASKS {
                 if let Some(task) = sched.task(slot_idx) {
@@ -653,7 +653,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
 
                 // Schedule devd
                 unsafe {
-                    let sched = kernel::task::scheduler();
+                    let mut sched = kernel::task::scheduler();
                     kernel::task::set_current_slot(slot);
                     if let Some(task) = sched.task_mut(slot) {
                         let _ = task.set_running();
@@ -695,7 +695,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
     };
 
     unsafe {
-        let sched = kernel::task::scheduler();
+        let mut sched = kernel::task::scheduler();
         let current_slot = kernel::task::current_slot();
 
         // NOTE: Resource cleanup is deferred to reap_terminated() to avoid double-cleanup.
@@ -877,7 +877,7 @@ pub extern "C" fn recover_devd() {
     // (Safe because we're on exception/interrupt stack, not any task's stack)
     print_str_uart("  Killing all tasks...\r\n");
     unsafe {
-        let sched = kernel::task::scheduler();
+        let mut sched = kernel::task::scheduler();
         // Start from slot 1 - slot 0 is the idle task which must never be killed
         for slot_idx in 1..kernel::task::MAX_TASKS {
             if let Some(task) = sched.task(slot_idx) {
@@ -921,7 +921,7 @@ pub extern "C" fn recover_devd() {
 
             // Schedule devd
             unsafe {
-                let sched = kernel::task::scheduler();
+                let mut sched = kernel::task::scheduler();
                 kernel::task::set_current_slot(slot);
                 if let Some(task) = sched.task_mut(slot) {
                     let _ = task.set_running();
