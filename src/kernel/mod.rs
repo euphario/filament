@@ -16,6 +16,7 @@ pub mod task;
 pub mod task_impl; // TaskOperations trait implementation
 pub mod sched;
 pub mod sched_impl; // SchedulerBackend trait implementation
+pub mod storm;  // Syscall storm protection
 pub mod process;
 pub mod process_impl; // ProcessBackend trait implementation
 pub mod syscall;
@@ -31,7 +32,6 @@ pub mod pmm_impl; // PhysicalAllocator trait implementation
 pub mod addrspace;
 pub mod addrspace_impl; // AddressSpaceBackend trait implementation
 pub mod uaccess;
-pub mod log;
 pub mod caps;
 pub mod lock;
 pub mod percpu;
@@ -41,11 +41,9 @@ pub mod security_log;
 pub mod fdt;
 pub mod liveness;
 pub mod hw_poll;
-pub mod tickless;
 pub mod object;
 pub mod irq;
 pub mod object_service;
-pub mod blocking;
 pub mod idle;
 
 // New syscall-facing trait implementations

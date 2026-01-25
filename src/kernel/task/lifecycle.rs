@@ -363,7 +363,7 @@ fn notify_parent_of_exit(sched: &mut Scheduler, parent_id: TaskId, child_pid: Ta
     // Direct wake of parent if blocked (outside borrow)
     if should_wake_parent {
         if let Some(ref mut parent) = sched.tasks[parent_slot] {
-            let _ = parent.wake();
+            crate::transition_or_log!(parent, wake);
             parent.liveness_state = crate::kernel::liveness::LivenessState::Normal;
         }
     }

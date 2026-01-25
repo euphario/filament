@@ -138,6 +138,10 @@ impl SchedulingPolicy for PriorityRoundRobin {
         // Check if current task is still runnable (it might be Running, not Ready)
         if let Some(ref task) = tasks[current_slot] {
             if task.is_runnable() {
+                // Log if pid=2 (devd) is being returned as current
+                if task.id == 2 {
+                    crate::kdebug!("sched", "select_current"; slot = current_slot, pid = 2, state = task.state().name());
+                }
                 return Some(current_slot);
             }
         }
@@ -145,10 +149,12 @@ impl SchedulingPolicy for PriorityRoundRobin {
         // Fall back to idle task if nothing else
         if let Some(ref task) = tasks[self.idle_slot] {
             if task.is_runnable() {
+                crate::kdebug!("sched", "select_idle"; from = current_slot);
                 return Some(self.idle_slot);
             }
         }
 
+        crate::kerror!("sched", "select_none"; from = current_slot);
         None
     }
 

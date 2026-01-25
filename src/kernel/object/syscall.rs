@@ -43,12 +43,8 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         return Error::InvalidArg.to_errno();
     };
 
-    // DEBUG: Check L3 canary before open dispatch
-    let l3_canary_va = crate::arch::aarch64::mmu::phys_to_virt(0x4033fff8);
-    let canary_before = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
-
     // Dispatch to type-specific open
-    let result = match obj_type {
+    match obj_type {
         ObjectType::Channel => open_channel(params_ptr, params_len),
         ObjectType::Timer => open_timer(params_ptr, params_len),
         ObjectType::Process => open_process(params_ptr, params_len),
@@ -65,15 +61,7 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         ObjectType::PciDevice => open_pci_device(params_ptr, params_len),
         ObjectType::Msi => open_msi(params_ptr, params_len),
         ObjectType::BusList => open_bus_list(params_ptr, params_len),
-    };
-
-    // DEBUG: Check L3 canary after open dispatch
-    let canary_after = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
-    if canary_before != 0 && canary_after == 0 {
-        crate::print_direct!("[CORRUPT] L3[511] corrupted by open type={:?}\r\n", obj_type);
     }
-
-    result
 }
 
 // ============================================================================
@@ -425,10 +413,6 @@ fn open_process(params_ptr: u64, params_len: usize) -> i64 {
 }
 
 fn open_port(params_ptr: u64, params_len: usize) -> i64 {
-    // DEBUG: Canary check
-    let l3_canary_va = crate::arch::aarch64::mmu::phys_to_virt(0x4033fff8);
-    let canary0 = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
-
     // params contains the port name
     if params_len == 0 || params_len > 32 {
         return Error::InvalidArg.to_errno();
@@ -438,12 +422,6 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
     let mut name_buf = [0u8; 32];
     if uaccess::copy_from_user(&mut name_buf[..params_len], params_ptr).is_err() {
         return Error::BadAddress.to_errno();
-    }
-
-    // DEBUG: Canary check after copy_from_user
-    let canary1 = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
-    if canary0 != 0 && canary1 == 0 {
-        crate::print_direct!("[CORRUPT] L3[511] corrupted by open_port copy_from_user\r\n");
     }
 
     // Get current task ID
@@ -456,26 +434,12 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
         return Error::BadHandle.to_errno();
     };
 
-    // DEBUG: Canary check after with_scheduler
-    let canary2 = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
-    if canary1 != 0 && canary2 == 0 {
-        crate::print_direct!("[CORRUPT] L3[511] corrupted by open_port with_scheduler\r\n");
-    }
-
     // Delegate to ObjectService
     use crate::kernel::object_service::object_service;
-    let result = match object_service().open_port(task_id, &name_buf[..params_len]) {
+    match object_service().open_port(task_id, &name_buf[..params_len]) {
         Ok(handle) => handle.raw() as i64,
         Err(e) => e.to_errno(),
-    };
-
-    // DEBUG: Canary check after object_service
-    let canary3 = unsafe { core::ptr::read_volatile(l3_canary_va as *const u64) };
-    if canary2 != 0 && canary3 == 0 {
-        crate::print_direct!("[CORRUPT] L3[511] corrupted by open_port object_service\r\n");
     }
-
-    result
 }
 
 fn open_shmem(params_ptr: u64, params_len: usize) -> i64 {
@@ -1070,7 +1034,7 @@ fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id:
             // EAGAIN = blocked, pre-store success return value
             task::with_scheduler(|sched| {
                 if let Some(task) = sched.current_task_mut() {
-                    task.trap_frame.x0 = 0;
+                    task.set_deferred_return(0);
                 }
             });
             Error::WouldBlock.to_errno()
@@ -1382,7 +1346,9 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     match &mut entry.object {
                         Object::Channel(_) => {
                             if channel_id != 0 {
-                                let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
+                                if let Err(_e) = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable) {
+                                    crate::kdebug!("mux", "subscribe_fail"; channel = channel_id as u64);
+                                }
                             }
                         }
                         Object::Port(p) => { p.subscriber = Some(subscriber); }
@@ -1515,6 +1481,15 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 return false;
             };
 
+            // If task was preempted (Ready state), transition back to Running first.
+            // This can happen if a timer interrupt preempted us between the poll and here.
+            if *task.state() == task::TaskState::Ready {
+                if task.set_running().is_err() {
+                    crate::kerror!("mux", "set_running_failed"; task_id = task_id);
+                    return false;
+                }
+            }
+
             let state_name = task.state().name();
 
             if earliest_deadline == u64::MAX {
@@ -1626,10 +1601,10 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             task::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
                     // If Sleeping/Waiting -> wake to Ready
-                    // If already Ready -> this is a no-op (error discarded)
-                    let _ = task.wake();
+                    // If already Ready -> this is a no-op (logged by macro)
+                    crate::transition_or_log!(task, wake);
                     // Ready -> Running
-                    let _ = task.set_running();
+                    crate::transition_or_evict!(task, set_running);
                 }
             });
             // Loop back to poll and return the events
@@ -1652,7 +1627,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 // After being switched back, task should be Running (set by scheduler)
                 // or Ready (if just woken). Handle both cases.
                 if *task.state() == task::TaskState::Ready {
-                    let _ = task.set_running();
+                    crate::transition_or_evict!(task, set_running);
                 }
 
                 // Reset liveness state - this proves the task is alive.
@@ -1660,11 +1635,9 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 // and waiting for a syscall. But since we're in a blocking syscall
                 // loop, we never make a NEW syscall - we just continue looping.
                 // Reset liveness here to prove we're responsive.
-                let current_counter = crate::platform::current::timer::counter();
-                task.last_activity_tick = current_counter;
-                if let crate::kernel::liveness::LivenessState::PingSent { channel: 0, .. } = task.liveness_state {
-                    task.liveness_state = crate::kernel::liveness::LivenessState::Normal;
-                }
+                let current_tick = crate::platform::current::timer::logical_ticks();
+                task.record_activity(current_tick);
+                task.reset_liveness_if_implicit_pong();
 
                 task.state().name()
             } else {

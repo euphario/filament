@@ -103,9 +103,10 @@ pub mod state;
 pub mod lifecycle;
 pub mod policy;
 pub mod tcb;
+pub mod eviction;
 
 // Re-export core types from state module
-pub use state::{TaskState, SleepReason, WaitReason};
+pub use state::{TaskState, SleepReason, WaitReason, EvictionReason};
 
 // Re-export scheduling policy trait and implementations
 pub use policy::{SchedulingPolicy, PriorityRoundRobin};
@@ -117,7 +118,56 @@ pub use tcb::{
     enter_usermode, context_switch,
 };
 
-use crate::{kinfo, print_direct, klog};
+use crate::{kinfo, kerror, print_direct, klog};
+
+// ============================================================================
+// Error Handling Macros for State Transitions
+// ============================================================================
+
+/// State transition that evicts task on failure (critical transitions).
+///
+/// Use this for transitions that MUST succeed for correct operation.
+/// If the transition fails, the task is marked for eviction and will be
+/// cleaned up at the next safe point.
+///
+/// Returns `true` if transition succeeded, `false` if task was marked for eviction.
+#[macro_export]
+macro_rules! transition_or_evict {
+    ($task:expr, $method:ident $(, $arg:expr)*) => {{
+        match $task.$method($($arg),*) {
+            Ok(_) => true,
+            Err(e) => {
+                $crate::kerror!("state", "transition_fail";
+                    pid = $task.id as u64,
+                    from = e.from,
+                    to = e.to
+                );
+                $crate::kernel::task::eviction::mark_for_eviction(
+                    $task.id,
+                    $crate::kernel::task::EvictionReason::InvalidStateTransition,
+                );
+                false
+            }
+        }
+    }};
+}
+
+/// State transition that logs but continues (idempotent operations).
+///
+/// Use this for transitions that may reasonably fail without indicating
+/// corruption (e.g., waking a task that's already Ready).
+#[macro_export]
+macro_rules! transition_or_log {
+    ($task:expr, $method:ident $(, $arg:expr)*) => {{
+        if let Err(e) = $task.$method($($arg),*) {
+            $crate::kdebug!("state", "transition_skip";
+                pid = $task.id as u64,
+                from = e.from,
+                to = e.to
+            );
+        }
+    }};
+}
 
 /// Maximum number of tasks
 pub const MAX_TASKS: usize = 16;
@@ -126,8 +176,7 @@ pub const MAX_TASKS: usize = 16;
 ///
 /// The scheduler manages all tasks and their state. For SMP safety:
 /// - Task array modifications are protected by IrqGuard (single-core) or SpinLock (SMP)
-/// - Current task index is stored per-CPU via percpu module
-/// - The `current` field is deprecated - use `current_slot()` function instead
+/// - Current task index is stored per-CPU via percpu module (use `current_slot()`)
 ///
 /// # Scheduling Policy
 ///
@@ -140,9 +189,6 @@ pub const MAX_TASKS: usize = 16;
 pub struct Scheduler {
     /// All tasks (shared across CPUs) - access via task()/task_mut() only
     tasks: [Option<Task>; MAX_TASKS],
-    /// Currently running task index - DEPRECATED, use current_slot()
-    /// Kept for backwards compatibility during migration
-    current: usize,
     /// Generation counter per slot - increments when slot is reused
     /// PID = (slot + 1) | (generation << 8)
     /// This ensures stale PIDs from terminated tasks don't match new tasks
@@ -172,7 +218,6 @@ impl Scheduler {
         const NONE: Option<Task> = None;
         Self {
             tasks: [NONE; MAX_TASKS],
-            current: 0,
             generations: [0; MAX_TASKS],
             next_deadline: u64::MAX,
             policy: PriorityRoundRobin::new(),
@@ -279,7 +324,6 @@ impl Scheduler {
     /// eventually call this function to ensure:
     /// 1. State transition is valid (blocked → ready)
     /// 2. Liveness state is reset to Normal
-    /// 3. IPC return value is set correctly if needed
     ///
     /// Returns true if task was actually woken (was blocked).
     pub fn wake_task(&mut self, slot: usize) -> bool {
@@ -289,23 +333,8 @@ impl Scheduler {
                 return false;
             }
 
-            // Check if task was blocked on IPC
-            let is_ipc = match task.state() {
-                TaskState::Sleeping { reason: SleepReason::Ipc } => true,
-                TaskState::Waiting { reason: WaitReason::IpcCall, .. } => true,
-                _ => false,
-            };
-
-            // If task was blocked on IPC, set x0 to EAGAIN (-11)
-            // so it retries the receive and gets the message.
-            // This is needed because receive_timeout pre-sets x0 to
-            // ETIMEDOUT (-110) before blocking.
-            if is_ipc {
-                task.trap_frame.x0 = (-11i64) as u64; // EAGAIN
-            }
-
             // Transition to Ready via state machine
-            let _ = task.wake();
+            crate::transition_or_log!(task, wake);
 
             // Reset liveness state - task responded/became active
             task.liveness_state = super::liveness::LivenessState::Normal;
@@ -358,7 +387,8 @@ impl Scheduler {
                     if current_tick >= deadline {
                         // Deadline expired - wake the task
                         // Note: Don't reset liveness state for timeout - task didn't respond
-                        let _ = task.wake();
+                        crate::kdebug!("sched", "deadline_wake"; pid = task.id as u64);
+                        crate::transition_or_log!(task, wake);
                         woken += 1;
                         need_recalculate = true;
                     }
@@ -371,12 +401,18 @@ impl Scheduler {
                     if timer.is_active() && current_tick >= timer.deadline {
                         // Timer fired - deliver event with timer ID
                         let timer_event = super::event::Event::timer_with_id(timer.id, timer.deadline);
-                        let _pushed = task.event_queue.push(timer_event);
+                        if !task.event_queue.push(timer_event) {
+                            // Queue full - log for diagnostics (timer still fires, event lost)
+                            crate::kwarn!("timer", "event_dropped";
+                                pid = task.id as u64,
+                                timer_id = timer.id as u64
+                            );
+                        }
 
                         if timer.interval > 0 {
                             // Recurring timer - reset deadline
-                            // Avoid drift by adding interval to previous deadline
-                            timer.deadline += timer.interval;
+                            // Use saturating_add to prevent overflow on very long uptime
+                            timer.deadline = timer.deadline.saturating_add(timer.interval);
                         } else {
                             // One-shot timer - clear it
                             timer.deadline = 0;
@@ -389,7 +425,7 @@ impl Scheduler {
 
                 // Wake task if any timer fired and task was blocked
                 if should_wake && task.is_blocked() {
-                    let _ = task.wake();
+                    crate::transition_or_log!(task, wake);
                     // Reset liveness - timer event means task is active
                     task.liveness_state = super::liveness::LivenessState::Normal;
                     woken += 1;
@@ -430,7 +466,7 @@ impl Scheduler {
                 if let Some(ref mut task) = self.tasks[slot] {
                     // Wake if task is blocked (generation 0 = always valid, skip check)
                     if task.is_blocked() {
-                        let _ = task.wake();
+                        crate::transition_or_log!(task, wake);
                         // Reset liveness - timer event means task is active
                         task.liveness_state.reset(task.id);
                         woken += 1;
@@ -476,10 +512,11 @@ impl Scheduler {
 
         self.tasks[slot] = Task::new_user(id, name);
         if self.tasks[slot].is_some() {
-            // Create parallel object table in ObjectService (Phase 1: not used yet)
+            // Create parallel object table in ObjectService
             super::object_service::object_service().create_task_table(id, true);
             Some((id, slot))
         } else {
+            crate::kerror!("task", "add_user_fail"; slot = slot as u64, pid = id as u64);
             None
         }
     }
@@ -539,28 +576,6 @@ impl Scheduler {
         self.tasks[current_slot()].as_ref().map(|t| t.id)
     }
 
-    /// Check if any task besides `exclude_slot` is ready to run.
-    ///
-    /// Used by blocking operations to decide whether to yield or spin.
-    /// Returns `true` if there's useful work to switch to.
-    pub fn has_ready_task_besides(&self, exclude_slot: usize) -> bool {
-        self.tasks.iter().enumerate().any(|(i, slot)| {
-            if i == exclude_slot { return false; }
-            if let Some(ref task) = slot {
-                *task.state() == TaskState::Ready
-            } else {
-                false
-            }
-        })
-    }
-
-    /// Check if a slot is occupied by a task.
-    ///
-    /// Note: Task may be in any state including Dead/Dying.
-    pub fn slot_occupied(&self, slot: usize) -> bool {
-        self.tasks.get(slot).map(|t| t.is_some()).unwrap_or(false)
-    }
-
     /// Iterate over all task slots with their indices.
     ///
     /// Yields `(slot_index, Option<&Task>)` for each slot.
@@ -604,7 +619,7 @@ impl Scheduler {
     pub fn terminate_current(&mut self, exit_code: i32) {
         let slot = current_slot();
         if let Some(ref mut task) = self.tasks[slot] {
-            let _ = task.set_exiting(exit_code);
+            crate::transition_or_evict!(task, set_exiting, exit_code);
             // Clear timers so they don't fire for terminated task
             for timer in task.timers.iter_mut() {
                 timer.deadline = 0;
@@ -621,7 +636,21 @@ impl Scheduler {
     /// - Dying: Grace period (~100ms) for servers to react, then Phase 2
     /// - Dead: Task slot can be reused
     pub fn reap_terminated(&mut self, current_tick: u64) {
+        // CRITICAL: Cleanup must be atomic - no preemption during dying cycle.
+        // This is typically called from IRQ context (IRQs already disabled),
+        // but we take IrqGuard defensively to guarantee atomicity.
+        let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+
+        // CRITICAL: Never reap the current task - it's still executing!
+        // If it needs to die, let it reach a safe point first (syscall return, reschedule).
+        let current = current_slot();
+
         for slot_idx in 0..MAX_TASKS {
+            // Skip current task - can't reap while still running
+            if slot_idx == current {
+                continue;
+            }
+
             let state = self.tasks[slot_idx]
                 .as_ref()
                 .map(|t| (*t.state(), t.id))
@@ -668,7 +697,7 @@ impl Scheduler {
                             if let Some(parent_slot) = self.slot_by_pid(parent_id) {
                                 if let Some(ref mut parent) = self.tasks[parent_slot] {
                                     if parent.state().is_sleeping() {
-                                        let _ = parent.wake();
+                                        crate::transition_or_log!(parent, wake);
                                     }
                                 }
                             }
@@ -691,7 +720,7 @@ impl Scheduler {
                     // Transition to Dying with grace period deadline
                     let grace_until = current_tick + CLEANUP_GRACE_TICKS as u64;
                     if let Some(ref mut task) = self.tasks[slot_idx] {
-                        let _ = task.set_dying(grace_until);
+                        crate::transition_or_evict!(task, set_dying, grace_until);
                     }
                 }
                 (TaskState::Dying { code: _, until }, pid) if current_tick >= until => {
@@ -711,6 +740,20 @@ impl Scheduler {
                     // Remove object table from ObjectService (Phase 1: parallel structure)
                     super::object_service::object_service().remove_task_table(pid);
 
+                    // SAFETY: Clear CURRENT_TRAP_FRAME if it points to this task.
+                    // This shouldn't happen (we skip current task), but prevents use-after-free.
+                    if let Some(ref task) = self.tasks[slot_idx] {
+                        let task_trap_ptr = &task.trap_frame as *const TrapFrame;
+                        let current_ptr = CURRENT_TRAP_FRAME.load(Ordering::Acquire);
+                        if current_ptr == task_trap_ptr as *mut TrapFrame {
+                            crate::kwarn!("task", "clearing_stale_trap_frame"; slot = slot_idx as u64, pid = pid as u64);
+                            CURRENT_TRAP_FRAME.store(
+                                unsafe { core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAME) },
+                                Ordering::Release
+                            );
+                        }
+                    }
+
                     // Bump generation so any stale PIDs for this slot become invalid
                     self.bump_generation(slot_idx);
                     // Drop the task (frees kernel stack and heap mappings)
@@ -718,6 +761,77 @@ impl Scheduler {
                 }
                 (TaskState::Dying { .. }, _) => {
                     // Still in grace period - let servers process notifications
+                }
+                (TaskState::Evicting { reason }, pid) => {
+                    // ============================================================
+                    // Evicted task: Immediate cleanup, no grace period
+                    // ============================================================
+                    kerror!("evict", "reaping";
+                        pid = pid as u64,
+                        reason = reason as u8 as u64
+                    );
+
+                    // Wake parent task if it's sleeping (for Process watch)
+                    if let Some(ref task) = self.tasks[slot_idx] {
+                        let parent_id = task.parent_id;
+                        if parent_id != 0 {
+                            if let Some(parent_slot) = self.slot_by_pid(parent_id) {
+                                if let Some(ref mut parent) = self.tasks[parent_slot] {
+                                    if parent.state().is_sleeping() {
+                                        crate::transition_or_log!(parent, wake);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Stop DMA
+                    super::bus::process_cleanup(pid);
+
+                    // Remove from subscriber lists
+                    super::ipc::remove_subscriber_from_all(pid);
+
+                    // Notify IPC peers
+                    let ipc_wake_list = super::ipc::process_cleanup(pid);
+                    super::ipc::waker::wake(&ipc_wake_list, super::ipc::WakeReason::Closed);
+
+                    // Finalize shmem immediately (no grace period)
+                    super::shmem::begin_cleanup(pid);
+                    super::shmem::finalize_cleanup(pid);
+
+                    // Clean up remaining subsystems
+                    super::irq::process_cleanup(pid);
+                    super::pci::release_all_devices(pid);
+
+                    // Clean up ports
+                    let port_wake_list = super::ipc::port_cleanup_task(pid);
+                    super::ipc::waker::wake(&port_wake_list, super::ipc::WakeReason::Closed);
+
+                    // Remove object table
+                    super::object_service::object_service().remove_task_table(pid);
+
+                    // Transition to Dead via state machine
+                    if let Some(ref mut task) = self.tasks[slot_idx] {
+                        let _ = task.finalize(); // Evicting → Dead
+                    }
+
+                    // SAFETY: Clear CURRENT_TRAP_FRAME if it points to this task.
+                    // This shouldn't happen (we skip current task), but prevents use-after-free.
+                    if let Some(ref task) = self.tasks[slot_idx] {
+                        let task_trap_ptr = &task.trap_frame as *const TrapFrame;
+                        let current_ptr = CURRENT_TRAP_FRAME.load(Ordering::Acquire);
+                        if current_ptr == task_trap_ptr as *mut TrapFrame {
+                            crate::kwarn!("task", "clearing_stale_trap_frame"; slot = slot_idx as u64, pid = pid as u64);
+                            CURRENT_TRAP_FRAME.store(
+                                unsafe { core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAME) },
+                                Ordering::Release
+                            );
+                        }
+                    }
+
+                    // Bump generation and remove task
+                    self.bump_generation(slot_idx);
+                    self.tasks[slot_idx] = None;
                 }
                 _ => {}
             }
@@ -729,12 +843,27 @@ impl Scheduler {
     /// # Safety
     /// Task must be properly set up with valid trap frame and address space
     pub unsafe fn run_user_task(&mut self, slot: usize) -> ! {
-        // Update both per-CPU and legacy field
+        // This should only be called ONCE at boot from kernel_main
+        kinfo!("task", "run_user_task_entry"; slot = slot as u64);
+
+        // Set current task slot for this CPU
         set_current_slot(slot);
-        self.current = slot;
 
         if let Some(ref mut task) = self.tasks[slot] {
-            let _ = task.set_running();
+            // Task must be Ready to enter Running state
+            // If task is in another state (Waiting, Sleeping, etc), we can't run it
+            if !crate::transition_or_evict!(task, set_running) {
+                // Transition failed - task was evicted
+                // This should NEVER happen at boot - devd should be Ready
+                kerror!("task", "run_user_task_failed"; slot = slot as u64, pid = task.id as u64, state = task.state().name());
+
+                // Reset to idle task before entering idle loop
+                set_current_slot(0);  // Idle is always slot 0
+                update_current_task_globals();
+
+                // Enter idle - will wait for IRQ to wake a task
+                crate::kernel::idle::idle_entry();
+            }
 
             if let Some(ref addr_space) = task.address_space {
                 let ttbr0 = addr_space.get_ttbr0();
@@ -751,7 +880,14 @@ impl Scheduler {
                 );
 
                 // Flush log buffer before entering userspace
-                super::log::flush();
+                crate::klog::flush();
+
+                // Start timer preemption just before entering userspace.
+                // We can't start this earlier in boot because timer IRQs
+                // would trigger rescheduling before run_user_task is called,
+                // corrupting the boot flow.
+                crate::plat::timer::start(10);
+                kinfo!("timer", "preemption_started"; slice_ms = 10u64);
 
                 enter_usermode(trap_frame as *const TrapFrame, ttbr0);
             }
@@ -759,17 +895,6 @@ impl Scheduler {
 
         // Should never reach here
         panic!("run_user_task: invalid task or no address space");
-    }
-
-    /// Check if there are any runnable tasks
-    pub fn has_runnable_tasks(&self) -> bool {
-        self.tasks.iter().any(|slot| {
-            if let Some(ref task) = slot {
-                task.is_runnable()
-            } else {
-                false
-            }
-        })
     }
 
     /// Get the next deadline (for tickless timer reprogramming)
@@ -787,179 +912,9 @@ impl Scheduler {
         self.policy.select_next(my_slot, &self.tasks)
     }
 
-    /// Perform a context switch to the next ready task
-    /// # Safety
-    /// Must be called with interrupts disabled
-    pub unsafe fn switch_to_next(&mut self) {
-        let my_slot = current_slot();  // Use per-CPU current slot
-
-        if let Some(next_idx) = self.schedule() {
-            if next_idx != my_slot {
-                let caller_slot = my_slot;  // Save our slot before switching
-
-                // Mark current as ready (if still running)
-                if let Some(ref mut current) = self.tasks[caller_slot] {
-                    if *current.state() == TaskState::Running {
-                        let _ = current.set_ready();
-                    }
-                }
-
-                // Get pointers to current and next contexts
-                let current_ctx = if let Some(ref mut t) = self.tasks[caller_slot] {
-                    &mut t.context as *mut CpuContext
-                } else {
-                    return;
-                };
-
-                let next_ctx = if let Some(ref t) = self.tasks[next_idx] {
-                    &t.context as *const CpuContext
-                } else {
-                    return;
-                };
-
-                // Switch address space if next task has one
-                if let Some(ref task) = self.tasks[next_idx] {
-                    if let Some(ref addr_space) = task.address_space {
-                        addr_space.activate();
-                    }
-                }
-
-                // Update current index (both per-CPU and legacy field)
-                set_current_slot(next_idx);
-                self.current = next_idx;
-
-                // Mark next as running
-                if let Some(ref mut t) = self.tasks[next_idx] {
-                    let _ = t.set_running();
-                }
-
-                // CRITICAL: Update globals BEFORE context_switch so the target task
-                // uses the correct trap frame when returning to user mode.
-                update_current_task_globals();
-                SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
-
-                // Actually switch
-                context_switch(current_ctx, next_ctx);
-
-                // We return here when switched back to this task.
-                // Restore our slot (was saved on stack before switch).
-                set_current_slot(caller_slot);
-                self.current = caller_slot;
-
-                // Mark ourselves as Running again
-                if let Some(ref mut t) = self.tasks[caller_slot] {
-                    let _ = t.set_running();
-                }
-                // Restore our address space and globals
-                if let Some(ref task) = self.tasks[caller_slot] {
-                    if let Some(ref addr_space) = task.address_space {
-                        addr_space.activate();
-                    }
-                }
-                update_current_task_globals();
-            }
-        }
-    }
-
-    /// Direct switch to a specific task by PID (for IPC fast-path)
-    /// Returns true if switch happened, false if target not found/not ready
-    ///
-    /// This bypasses normal scheduling for synchronous IPC - the sender
-    /// directly donates its timeslice to the receiver.
-    ///
-    /// # Safety
-    /// Must be called with interrupts disabled
-    pub unsafe fn direct_switch_to(&mut self, target_pid: TaskId) -> bool {
-        let my_slot = current_slot();  // Use per-CPU current slot
-
-        // Find target slot
-        let target_slot = match self.slot_by_pid(target_pid) {
-            Some(slot) => slot,
-            None => return false,
-        };
-
-        // Don't switch to self
-        if target_slot == my_slot {
-            return false;
-        }
-
-        // Verify target is ready (or we just woke it)
-        if let Some(ref task) = self.tasks[target_slot] {
-            if !task.is_runnable() {
-                return false;
-            }
-        } else {
-            return false;
-        }
-
-        let caller_slot = my_slot;  // Save our slot before switching
-
-        // Mark current as ready (donating timeslice)
-        if let Some(ref mut current) = self.tasks[caller_slot] {
-            if *current.state() == TaskState::Running {
-                let _ = current.set_ready();
-            }
-        }
-
-        // Get context pointers
-        let current_ctx = if let Some(ref mut t) = self.tasks[caller_slot] {
-            &mut t.context as *mut CpuContext
-        } else {
-            return false;
-        };
-
-        let next_ctx = if let Some(ref t) = self.tasks[target_slot] {
-            &t.context as *const CpuContext
-        } else {
-            return false;
-        };
-
-        // Switch address space
-        if let Some(ref task) = self.tasks[target_slot] {
-            if let Some(ref addr_space) = task.address_space {
-                addr_space.activate();
-            }
-        }
-
-        // Update current (both per-CPU and legacy field) and mark target as running
-        set_current_slot(target_slot);
-        self.current = target_slot;
-        if let Some(ref mut t) = self.tasks[target_slot] {
-            let _ = t.set_running();
-        }
-
-        // CRITICAL: Update globals BEFORE context_switch so the target task
-        // uses the correct trap frame when returning to user mode.
-        // The target task will reload CURRENT_TRAP_FRAME from the global
-        // in svc_handler/irq_from_user before eret.
-        update_current_task_globals();
-        SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
-
-        // Perform the switch
-        context_switch(current_ctx, next_ctx);
-
-        // Returned here when switched back to this task.
-        // Restore our slot (was saved on stack before switch).
-        set_current_slot(caller_slot);
-        self.current = caller_slot;
-
-        // Mark ourselves as Running again
-        if let Some(ref mut t) = self.tasks[caller_slot] {
-            let _ = t.set_running();
-        }
-        // Restore our address space and globals
-        if let Some(ref task) = self.tasks[caller_slot] {
-            if let Some(ref addr_space) = task.address_space {
-                addr_space.activate();
-            }
-        }
-        update_current_task_globals();
-
-        true
-    }
-
     /// Print scheduler state
     pub fn print_info(&self) {
+        let current = current_slot();
         print_direct!("  Tasks:\n");
         for (i, slot) in self.tasks.iter().enumerate() {
             if let Some(ref task) = slot {
@@ -970,9 +925,10 @@ impl Scheduler {
                     TaskState::Waiting { .. } => "waiting",
                     TaskState::Exiting { .. } => "exiting",
                     TaskState::Dying { .. } => "dying",
+                    TaskState::Evicting { .. } => "evicting",
                     TaskState::Dead => "dead",
                 };
-                let marker = if i == self.current { ">" } else { " " };
+                let marker = if i == current { ">" } else { " " };
                 print_direct!("    {} [{}] {} ({})\n", marker, task.id, task.name_str(), state_str);
             }
         }
@@ -982,6 +938,25 @@ impl Scheduler {
 use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
 
 /// Global scheduler instance
+///
+/// # Synchronization
+///
+/// Access is serialized via IrqGuard in `with_scheduler()`. This prevents:
+/// - Interrupt handler races (IRQs disabled while holding "lock")
+/// - Recursive access from same CPU
+///
+/// # SMP Limitation
+///
+/// This design is NOT SMP-safe. For multi-core support, we would need one of:
+/// - Per-CPU run queues with local locks (common approach in Linux, xv6)
+/// - Lock release before context_switch, reacquire after
+/// - More complex lock ownership tracking
+///
+/// The challenge is that context_switch() suspends the current task mid-function,
+/// and any held lock would appear "owned" by that task even though another CPU
+/// might try to acquire it. See SCHEDULER_REDESIGN.md for future plans.
+///
+/// For single-core (current BPI-R4 use), IrqGuard is sufficient.
 static mut SCHEDULER: Scheduler = Scheduler::new();
 
 /// Initialize scheduler (call once at boot)
@@ -990,34 +965,23 @@ static mut SCHEDULER: Scheduler = Scheduler::new();
 ///
 /// Also creates the idle task in slot 0 - this is an internal implementation detail.
 pub fn init_scheduler() {
-    let sched_addr = unsafe { core::ptr::addr_of!(SCHEDULER) as usize };
-    crate::print_direct!("init_scheduler: SCHEDULER at 0x{:x}\r\n", sched_addr);
-    crate::print_direct!("init_scheduler: clearing {} task slots...\r\n", MAX_TASKS);
+    // Clear all task slots (handles static init issues on some platforms)
     unsafe {
         for i in 0..MAX_TASKS {
             SCHEDULER.tasks[i] = None;
         }
-        SCHEDULER.current = 0;
         SCHEDULER.next_deadline = u64::MAX;
     }
-    // Verify it worked
-    let free = unsafe {
-        SCHEDULER.tasks.iter().filter(|t| t.is_none()).count()
-    };
-    crate::print_direct!("init_scheduler: {} free slots after clear\r\n", free);
 
-    // Create idle task in slot 0 - this is an internal scheduler detail
-    // The idle task runs when no other tasks are ready, doing WFI in a loop
+    // Initialize per-CPU current slot to idle (slot 0)
+    set_current_slot(0);
+
+    // Create idle task in slot 0 - runs WFI loop when no tasks ready
     // Uses static stack (no PMM allocation) since PMM isn't initialized yet
     unsafe {
-        // Generate PID for slot 0 using the scheduler's PID generation
-        // Slot 0 = PID 1 (since slot_bits = slot + 1)
         let idle_id = SCHEDULER.make_pid(0);
-
         let idle_task = Task::new_idle(idle_id, crate::kernel::idle::idle_entry);
         SCHEDULER.tasks[0] = Some(idle_task);
-
-        crate::print_direct!("init_scheduler: idle task created (pid={}, slot=0)\r\n", idle_id);
     }
 }
 
@@ -1047,7 +1011,7 @@ pub static SYSCALL_SWITCHED_TASK: AtomicU64 = AtomicU64::new(0);
 
 /// Get the global scheduler
 /// # Safety
-/// Must ensure proper synchronization (interrupts disabled)
+/// Must ensure proper synchronization (interrupts disabled via IrqGuard)
 ///
 /// NOTE: Prefer `with_scheduler()` for safe access with automatic IRQ guard.
 /// This raw accessor is `pub(crate)` to limit exposure.
@@ -1064,6 +1028,10 @@ pub(crate) unsafe fn scheduler() -> &'static mut Scheduler {
 ///     sched.wake(pid);
 /// });
 /// ```
+///
+/// # SMP Limitation
+/// This only provides single-core safety via IRQ disable. For multi-core,
+/// see the SMP discussion in the SCHEDULER static documentation above.
 #[inline]
 pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
@@ -1075,10 +1043,6 @@ pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
 /// Must be called with valid current task
 pub unsafe fn update_current_task_globals() {
     let sched = scheduler();
-
-    // Use current_slot() which was just updated by set_current_slot()
-    // This avoids aliasing issues where sched.current might not be visible
-    // through a fresh scheduler() reference due to compiler optimizations
     let slot = current_slot();
 
     // Defensive check: validate current slot is in bounds
@@ -1120,6 +1084,7 @@ pub unsafe fn update_current_task_globals() {
 
             CURRENT_TTBR0.store(ttbr0, Ordering::Release);
         }
+        // Note: Kernel tasks (no address_space) keep existing TTBR0
     } else {
         // No task at current slot - this is also a bug
         crate::platform::current::uart::print("[PANIC] update_current_task_globals: no task at current slot!\r\n");
@@ -1145,18 +1110,22 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     // Check and clear the flag atomically (before taking lock)
     let need_resched = crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched();
 
-    // Quick check if we need to do anything (without taking lock)
-    if !need_resched {
-        // Only check current_blocked if we have a reason to
-        let sched = scheduler();
-        let my_slot = current_slot();
-        let current_blocked = sched.tasks[my_slot]
-            .as_ref()
-            .map(|t| t.is_blocked())
-            .unwrap_or(false);
-        if !current_blocked {
-            return;
-        }
+    // Check if we need to reschedule (must hold IrqGuard for SMP safety)
+    let should_resched = if need_resched {
+        true
+    } else {
+        // Check if current task is blocked - requires lock for safe access
+        with_scheduler(|sched| {
+            let my_slot = current_slot();
+            sched.tasks[my_slot]
+                .as_ref()
+                .map(|t| t.is_blocked())
+                .unwrap_or(false)
+        })
+    };
+
+    if !should_resched {
+        return;
     }
 
     // Delegate to sched::reschedule() which properly handles:

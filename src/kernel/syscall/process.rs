@@ -30,7 +30,6 @@ pub const WNOHANG: u32 = 1;  // Don't block if no child has exited
 
 // Re-export ProcessInfo from abi crate (single source of truth)
 pub use abi::ProcessInfo;
-pub use abi::liveness_status;
 
 /// Exit current process
 ///
@@ -76,9 +75,12 @@ pub(super) fn sys_exit(code: i32) -> i64 {
         // Schedule next task
         if let Some(next_slot) = sched.schedule() {
             kinfo!("sys_exit", "scheduled"; next = next_slot);
+
+            // Update scheduler state - actual TTBR0 switch happens in assembly
+            // at exception return (assembly loads CURRENT_TTBR0 and switches)
             task::set_current_slot(next_slot);
             if let Some(task) = sched.task_mut(next_slot) {
-                let _ = task.set_running();
+                crate::transition_or_evict!(task, set_running);
             }
             unsafe { task::update_current_task_globals(); }
             task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
@@ -364,7 +366,7 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
 
                 // Pre-store return value in caller's trap frame
                 if let Some(parent) = sched.task_mut(caller_slot) {
-                    parent.trap_frame.x0 = SyscallError::WouldBlock as i64 as u64;
+                    parent.set_deferred_return(SyscallError::WouldBlock as i64);
                 }
 
                 // Reschedule to another task
@@ -388,12 +390,10 @@ pub(super) fn sys_daemonize() -> i64 {
     };
 
     task::with_scheduler(|sched| {
-        // Find the calling task and get parent ID
+        // Find the calling task and detach from parent
         let parent_id = if let Some(slot) = sched.slot_by_pid(caller_pid) {
             if let Some(task) = sched.task_mut(slot) {
-                let pid = task.parent_id;
-                task.parent_id = 0;
-                pid
+                task.detach_from_parent()
             } else {
                 0
             }
@@ -464,7 +464,7 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
             if let Some(next_slot) = sched.schedule() {
                 task::set_current_slot(next_slot);
                 if let Some(next) = sched.task_mut(next_slot) {
-                    let _ = next.set_running();
+                    crate::transition_or_evict!(next, set_running);
                 }
                 unsafe { task::update_current_task_globals(); }
                 task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
@@ -500,31 +500,16 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
             }
 
             if let Some(task) = task_opt {
-                // Calculate activity age and liveness status
+                // Calculate activity age and liveness status via encapsulated accessors
                 let current_tick = crate::platform::current::timer::ticks();
-
-                // Age since last syscall activity (10ms per tick)
-                let activity_age_ms = if task.last_activity_tick == 0 {
-                    0u32
-                } else {
-                    let age_ticks = current_tick.saturating_sub(task.last_activity_tick);
-                    (age_ticks * 10) as u32
-                };
-
-                // Liveness status from kernel ping/pong system
-                let live_status = match task.liveness_state {
-                    super::super::liveness::LivenessState::Normal => liveness_status::NORMAL,
-                    super::super::liveness::LivenessState::PingSent { .. } => liveness_status::PING_SENT,
-                    super::super::liveness::LivenessState::ClosePending { .. } => liveness_status::CLOSE_PENDING,
-                };
 
                 let info = ProcessInfo {
                     pid: task.id,
                     ppid: task.parent_id,
                     state: task.state().state_code(),
-                    liveness_status: live_status,
+                    liveness_status: task.get_liveness_status_code(),
                     _pad: [0; 2],
-                    activity_age_ms,
+                    activity_age_ms: task.get_activity_age_ms(current_tick),
                     name: task.name,
                 };
 
@@ -571,7 +556,7 @@ pub(super) fn sys_get_capabilities(pid: u32) -> i64 {
         // Find the task by PID
         if let Some(slot) = sched.slot_by_pid(target_pid) {
             if let Some(task) = sched.task(slot) {
-                return task.capabilities.bits() as i64;
+                return task.get_capabilities_bits() as i64;
             }
         }
 

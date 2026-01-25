@@ -52,9 +52,12 @@ impl ProcessOps for KernelProcessOps {
             // Schedule next task
             if let Some(next_slot) = sched.schedule() {
                 kinfo!("process_ops", "exit_scheduled"; next = next_slot);
+
+                // Update scheduler state - actual TTBR0 switch happens in assembly
+                // at exception return (assembly loads CURRENT_TTBR0 and switches)
                 task::set_current_slot(next_slot);
                 if let Some(task) = sched.task_mut(next_slot) {
-                    let _ = task.set_running();
+                    crate::transition_or_evict!(task, set_running);
                 }
                 task::update_current_task_globals();
                 task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
@@ -88,9 +91,11 @@ impl ProcessOps for KernelProcessOps {
                     // If killing self, need to reschedule
                     if target == killer {
                         if let Some(next_slot) = sched.schedule() {
+                            // Update scheduler state - actual TTBR0 switch happens in assembly
+                            // at exception return (assembly loads CURRENT_TTBR0 and switches)
                             task::set_current_slot(next_slot);
                             if let Some(next) = sched.task_mut(next_slot) {
-                                let _ = next.set_running();
+                                crate::transition_or_evict!(next, set_running);
                             }
                             task::update_current_task_globals();
                             task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);

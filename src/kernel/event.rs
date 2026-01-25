@@ -662,7 +662,8 @@ impl EventQueue {
 /// Returns true if the event was delivered (task exists and subscribed),
 /// false otherwise.
 pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
-    assert_irqs_disabled();
+    // Ensure IRQs are disabled for scheduler access (not just debug assert)
+    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
 
     unsafe {
         let sched = super::task::scheduler();
@@ -702,7 +703,7 @@ pub fn broadcast_event(event: Event) -> usize {
                     if task.event_queue.push(event) {
                         // Wake task if blocked
                         if task.is_blocked() {
-                            let _ = task.wake();
+                            crate::transition_or_log!(task, wake);
                             // Reset liveness - task received event
                             task.liveness_state = super::liveness::LivenessState::Normal;
                         }

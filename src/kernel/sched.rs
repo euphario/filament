@@ -79,93 +79,6 @@ pub const PRIORITY_IDLE: Priority = Priority::Low;  // We'll use slot 0 check in
 pub const IDLE_SLOT: usize = 0;
 
 // ============================================================================
-// Idle State Machine
-// ============================================================================
-//
-// When no task is Ready, the scheduler enters idle mode:
-//
-//     ┌─────────────────────────────────────────────────────────┐
-//     │                  reschedule()                           │
-//     └──────────────────────┬──────────────────────────────────┘
-//                            │
-//              ┌─────────────┴─────────────┐
-//              │ schedule() returns None   │
-//              │ (no Ready tasks)          │
-//              └─────────────┬─────────────┘
-//                            │
-//                            ▼
-//     ┌──────────────────────────────────────────────────────────┐
-//     │              compute_idle_deadline()                     │
-//     │  Scan all Waiting tasks for earliest deadline            │
-//     └──────────────────────┬───────────────────────────────────┘
-//                            │
-//          ┌─────────────────┴─────────────────┐
-//          │                                   │
-//          ▼                                   ▼
-//   ┌──────────────┐                   ┌──────────────┐
-//   │ Has deadline │                   │ No deadline  │
-//   │ (Waiting)    │                   │ (Sleeping)   │
-//   └──────┬───────┘                   └──────┬───────┘
-//          │                                   │
-//          ▼                                   ▼
-//   ┌──────────────┐                   ┌──────────────┐
-//   │ Set timer    │                   │ Disable      │
-//   │ for deadline │                   │ timer        │
-//   └──────┬───────┘                   └──────┬───────┘
-//          │                                   │
-//          └─────────────┬─────────────────────┘
-//                        │
-//                        ▼
-//               ┌────────────────┐
-//               │      WFI       │◄────────┐
-//               │ (wait for IRQ) │         │
-//               └───────┬────────┘         │
-//                       │                  │
-//                       ▼                  │
-//              ┌────────────────┐          │
-//              │ IRQ fires      │          │
-//              │ (timer/UART/..)│          │
-//              └───────┬────────┘          │
-//                      │                   │
-//                      ▼                   │
-//             ┌─────────────────┐          │
-//             │ Check timeouts  │          │
-//             │ Wake expired    │          │
-//             └───────┬─────────┘          │
-//                     │                    │
-//        ┌────────────┴────────────┐       │
-//        │                         │       │
-//        ▼                         ▼       │
-// ┌─────────────┐          ┌─────────────┐ │
-// │ Has Ready   │          │ No Ready    │─┘
-// │ task        │          │ yet         │
-// └──────┬──────┘          └─────────────┘
-//        │
-//        ▼
-// ┌─────────────────┐
-// │ Switch to task  │
-// │ Exit idle       │
-// └─────────────────┘
-
-/// Reason for entering idle state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdleReason {
-    /// All tasks are blocked (normal operation)
-    AllBlocked,
-    /// Current task blocked, staying in idle until woken
-    CurrentBlocked,
-}
-
-/// Result of computing idle deadline
-#[derive(Debug, Clone, Copy)]
-pub enum IdleDeadline {
-    /// No deadline - wait indefinitely for external interrupt
-    Infinite,
-    /// Wake at specific tick (earliest Waiting task deadline)
-    At(u64),
-}
-
-// ============================================================================
 // Core Scheduling Operations
 // ============================================================================
 
@@ -214,12 +127,15 @@ pub fn reschedule() -> bool {
         // (Unless it's Blocked or Terminated, which should stay as-is)
         if let Some(current) = sched.task_mut(caller_slot) {
             if *current.state() == TaskState::Running {
-                let _ = current.set_ready();
+                crate::transition_or_evict!(current, set_ready);
             }
         }
 
         // Find next task to run
         if let Some(next_slot) = sched.schedule() {
+            if caller_slot == 1 && next_slot != 1 {
+                crate::kinfo!("sched", "reschedule_switch"; from = caller_slot, to = next_slot);
+            }
             return switch_to_task(sched, caller_slot, next_slot);
         }
 
@@ -228,6 +144,10 @@ pub fn reschedule() -> bool {
             .map(|t| t.is_blocked())
             .unwrap_or(false);
 
+        if caller_slot == 1 {
+            crate::kinfo!("sched", "reschedule_no_switch"; from = caller_slot, blocked = current_blocked);
+        }
+
         if !current_blocked {
             // Current task is not blocked (e.g., yield from Ready task)
             // Safe to return - task will continue
@@ -235,8 +155,8 @@ pub fn reschedule() -> bool {
         }
 
         // Current task is blocked and nothing is ready
-        // Enter the idle state machine
-        enter_idle(sched, IdleReason::CurrentBlocked)
+        // Switch to idle task
+        enter_idle(sched)
     }
 }
 
@@ -256,9 +176,12 @@ unsafe fn switch_to_task(
     to_slot: usize,
 ) -> bool {
     if to_slot == from_slot {
-        // Same task continues
-        if let Some(current) = sched.task_mut(from_slot) {
-            let _ = current.set_running();
+        // Same task continues - but it was set to Ready by reschedule(),
+        // so we need to set it back to Running before returning.
+        if let Some(t) = sched.task_mut(to_slot) {
+            if *t.state() == task::TaskState::Ready {
+                crate::transition_or_evict!(t, set_running);
+            }
         }
         return false;
     }
@@ -320,7 +243,10 @@ unsafe fn switch_to_task(
         // (it's about to be restored, so it won't need context_switch next time
         // unless it blocks again)
         if let Some(next) = sched.task_mut(to_slot) {
-            let _ = next.set_running();
+            if next.id == 2 {
+                crate::kinfo!("sched", "switch_to_devd"; from = from_slot, state = next.state().name());
+            }
+            crate::transition_or_evict!(next, set_running);
             next.context_saved = false;
         }
 
@@ -337,8 +263,28 @@ unsafe fn switch_to_task(
         set_current_slot(from_slot);
 
         // Mark ourselves as Running again and clear our context_saved flag
+        // BUT: check current state first - if we died while switched out,
+        // or if we were already Running, don't force a transition.
         if let Some(t) = sched.task_mut(from_slot) {
-            let _ = t.set_running();
+            match t.state() {
+                task::TaskState::Ready => {
+                    // Normal case: was Ready (yielded/preempted), now Running
+                    crate::transition_or_evict!(t, set_running);
+                }
+                task::TaskState::Running => {
+                    // Already Running - no transition needed (context_switch doesn't change state)
+                }
+                task::TaskState::Dying { .. } | task::TaskState::Dead |
+                task::TaskState::Exiting { .. } | task::TaskState::Evicting { .. } => {
+                    // Task died while we were switched out - don't try to run it
+                    // Just return, let the scheduler handle cleanup
+                    return false;
+                }
+                _ => {
+                    // Blocked state - shouldn't happen, but try to recover
+                    crate::kwarn!("sched", "resume_blocked"; slot = from_slot as u64);
+                }
+            }
             t.context_saved = false;  // We've been restored
         }
 
@@ -363,7 +309,7 @@ unsafe fn switch_to_task(
     set_current_slot(to_slot);
 
     if let Some(next) = sched.task_mut(to_slot) {
-        let _ = next.set_running();
+        crate::transition_or_evict!(next, set_running);
     }
 
     update_current_task_globals();
@@ -384,8 +330,8 @@ unsafe fn switch_to_task(
 ///
 /// # Returns
 /// true when we switch to idle (or another task if one became ready)
-unsafe fn enter_idle(sched: &mut task::Scheduler, reason: IdleReason) -> bool {
-    kdebug!("sched", "enter_idle"; reason = reason as u64);
+unsafe fn enter_idle(sched: &mut task::Scheduler) -> bool {
+    kdebug!("sched", "enter_idle");
 
     // First, check if any deadlines have passed (timeout wakeups)
     let current_time = crate::platform::current::timer::counter();
@@ -411,42 +357,6 @@ unsafe fn enter_idle(sched: &mut task::Scheduler, reason: IdleReason) -> bool {
 
     kdebug!("sched", "switch_to_idle");
     switch_to_task(sched, current_slot(), IDLE_SLOT)
-}
-
-/// Compute the earliest deadline from all Waiting tasks and ObjectService timers.
-///
-/// This scans all tasks and finds the minimum deadline among:
-/// 1. Tasks in Waiting state (have deadline in task state)
-/// 2. Scheduler's next_deadline (from ObjectService timers via note_deadline())
-///
-/// # Returns
-/// - `IdleDeadline::At(tick)` - earliest deadline tick
-/// - `IdleDeadline::Infinite` - no deadlines pending
-fn compute_idle_deadline(sched: &task::Scheduler) -> IdleDeadline {
-    let mut earliest: u64 = u64::MAX;
-
-    // Check task Waiting state deadlines
-    for (_slot, task_opt) in sched.iter_tasks() {
-        if let Some(task) = task_opt {
-            if let Some(deadline) = task.state().deadline() {
-                if deadline < earliest {
-                    earliest = deadline;
-                }
-            }
-        }
-    }
-
-    // Also check scheduler's next_deadline (ObjectService timers)
-    let sched_deadline = sched.get_next_deadline();
-    if sched_deadline < earliest {
-        earliest = sched_deadline;
-    }
-
-    if earliest == u64::MAX {
-        IdleDeadline::Infinite
-    } else {
-        IdleDeadline::At(earliest)
-    }
 }
 
 /// Wake a blocked task by PID.
@@ -531,6 +441,7 @@ pub fn wait_current(reason: task::WaitReason, deadline: u64) -> bool {
                 kerror!("sched", "invalid_wait_transition"; from = task.state().name());
                 return false;
             }
+            kdebug!("sched", "blocked"; pid = task.id as u64, deadline = deadline);
             // Notify scheduler of deadline for tickless optimization
             sched.note_deadline(deadline);
             return true;
@@ -559,7 +470,7 @@ pub fn yield_current() -> bool {
         if let Some(task) = sched.task_mut(slot) {
             // Only change Running → Ready, don't touch Blocked!
             if *task.state() == TaskState::Running {
-                let _ = task.set_ready();
+                crate::transition_or_evict!(task, set_ready);
             }
             // If task is Blocked, it stays Blocked - this is intentional!
         }
@@ -567,21 +478,6 @@ pub fn yield_current() -> bool {
 
     // Now reschedule
     reschedule()
-}
-
-/// Check if current task is blocked.
-pub fn is_current_blocked() -> bool {
-    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
-
-    unsafe {
-        let sched = task::scheduler();
-        let slot = current_slot();
-
-        if let Some(task) = sched.task(slot) {
-            return task.is_blocked();
-        }
-    }
-    false
 }
 
 // ============================================================================
@@ -637,24 +533,6 @@ pub fn timer_tick(current_time: u64) {
         if woken > 0 {
             // A task was woken - signal that we need to reschedule
             crate::arch::aarch64::sync::cpu_flags().set_need_resched();
-        }
-    }
-}
-
-// ============================================================================
-// Debugging
-// ============================================================================
-
-/// Print scheduler state for debugging.
-pub fn dump_state() {
-    unsafe {
-        let sched = task::scheduler();
-
-        crate::kdebug!("sched", "dump_start");
-        for (i, task_opt) in sched.iter_tasks() {
-            if let Some(task) = task_opt {
-                crate::kdebug!("sched", "task"; slot = i as u64, pid = task.id as u64, name = task.name_str());
-            }
         }
     }
 }

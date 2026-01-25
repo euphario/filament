@@ -40,7 +40,8 @@ use super::ipc::{Message, MessageHeader, MessageType, MAX_INLINE_PAYLOAD, waker,
 use super::task::SleepReason;
 
 /// How often to check liveness (in timer IRQs, ~100/sec)
-pub const LIVENESS_CHECK_INTERVAL: u64 = 100; // Every ~1 second
+/// Note: Timer tick rate varies. Using high value to reduce spam.
+pub const LIVENESS_CHECK_INTERVAL: u64 = 10000; // Every ~100 seconds
 
 /// How long a process can be idle-waiting before we ping it (in nanoseconds)
 pub const PING_INTERVAL_NS: u64 = 30 * 1_000_000_000; // 30 seconds
@@ -192,12 +193,24 @@ struct PendingNotification {
     exit_code: i32,
 }
 
+/// Counter for periodic logging (not the hardware counter, which is MHz)
+static mut LOG_CALL_COUNT: u64 = 0;
+
+/// Log every N check_liveness calls (~30 seconds at 1 call/second)
+const LOG_INTERVAL_CALLS: u64 = 3;  // Every ~3 seconds for debugging
+
 /// Check liveness of all waiting tasks
 /// Called periodically from timer tick (not every tick, use counter)
 ///
 /// Returns number of actions taken (pings sent, channels closed, tasks killed)
 pub fn check_liveness(current_tick: u64) -> usize {
     let mut actions = 0;
+
+    // Track call count for periodic logging (hardware counter is MHz, not suitable)
+    let call_count = unsafe {
+        LOG_CALL_COUNT += 1;
+        LOG_CALL_COUNT
+    };
 
     // Collect child exit notifications during the loop
     // Process them after to avoid borrowing issues
@@ -211,8 +224,8 @@ pub fn check_liveness(current_tick: u64) -> usize {
         let mut sleeping_count = 0u64;
         let mut waiting_count = 0u64;
 
-        // Log all blocked tasks and their wait state
-        for (slot, task_opt) in sched.iter_tasks() {
+        // Log all tasks and their states
+        for (_slot, task_opt) in sched.iter_tasks() {
             if let Some(task) = task_opt {
                 if task.is_blocked() {
                     if task.state().is_sleeping() {
@@ -220,23 +233,19 @@ pub fn check_liveness(current_tick: u64) -> usize {
                     } else {
                         waiting_count += 1;
                     }
-                    let idle_ms = counter_to_ms(current_tick.saturating_sub(task.last_activity_tick));
-                    let live_state = match task.liveness_state {
-                        LivenessState::Normal => 0,
-                        LivenessState::PingSent { .. } => 1,
-                        LivenessState::ClosePending { .. } => 2,
-                    };
-                    // 0=unknown, 1=sleeping, 2=waiting
-                    let wait_type = if task.state().is_sleeping() { 1 } else { 2 };
-                    let _ = slot; // suppress unused variable warning
-                    crate::kdebug!("live", "task"; pid = task.id as u64, wait = wait_type as u64, idle_ms = idle_ms, state = live_state as u64);
                 }
             }
         }
 
-        // Log every ~30 seconds to confirm liveness checker is running
-        if current_tick % (30 * 100) == 0 {
-            crate::kinfo!("liveness", "check"; ms = counter_to_ms(current_tick), sleeping = sleeping_count, waiting = waiting_count);
+        // Log every call with all task states
+        if call_count % LOG_INTERVAL_CALLS == 0 {
+            crate::kinfo!("liveness", "check"; calls = call_count, sleeping = sleeping_count, waiting = waiting_count);
+            // Dump all task states (we only have ~3 tasks)
+            for (slot, task_opt) in sched.iter_tasks() {
+                if let Some(task) = task_opt {
+                    crate::kinfo!("liveness", "task"; slot = slot as u64, pid = task.id as u64, state = task.state().name());
+                }
+            }
         }
 
         for (_slot, task_opt) in sched.iter_tasks_mut() {
@@ -275,7 +284,7 @@ pub fn check_liveness(current_tick: u64) -> usize {
                             // Just wake the task - its next syscall proves it's alive
                             if matches!(sleep_reason, Some(SleepReason::EventLoop)) {
                                 // Wake the task - it will return 0 from handle_wait
-                                let _ = task.wake();
+                                crate::transition_or_log!(task, wake);
                                 let new_state = LivenessState::PingSent {
                                     channel: 0, // No channel - implicit pong via syscall
                                     sent_at: current_tick,
@@ -283,8 +292,8 @@ pub fn check_liveness(current_tick: u64) -> usize {
                                 let _ = task.liveness_state.transition_to(new_state, task.id);
                                 actions += 1;
                                 crate::kdebug!("live", "wake"; pid = task.id as u64);
-                            } else if matches!(sleep_reason, Some(SleepReason::Ipc)) {
-                                // For IPC sleep (channel recv), send ping message
+                            } else if matches!(sleep_reason, Some(SleepReason::Irq)) {
+                                // For IRQ sleep, send ping message via channel if available
                                 if let Some(channel) = find_wait_channel(task) {
                                     if send_ping(channel, task.id) {
                                         let new_state = LivenessState::PingSent {
@@ -343,7 +352,7 @@ pub fn check_liveness(current_tick: u64) -> usize {
                             crate::kerror!("live", "kill"; pid = pid as u64, init = is_init);
 
                             // Mark for termination (actual kill happens in scheduler)
-                            let _ = task.set_exiting(-9); // SIGKILL equivalent
+                            crate::transition_or_evict!(task, set_exiting, -9); // SIGKILL equivalent
                             // Reset liveness state (transition logging handled by reset())
                             task.liveness_state.reset(pid);
                             actions += 1;

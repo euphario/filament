@@ -252,6 +252,8 @@ pub struct Task {
     pub(crate) liveness_state: crate::kernel::liveness::LivenessState,
     /// Last activity tick (syscall made)
     pub(crate) last_activity_tick: u64,
+    /// Storm protection state (syscall/wake rate limiting)
+    pub(crate) storm: crate::kernel::storm::StormState,
     /// True if this task was switched away via context_switch and needs context restored.
     /// Set when task blocks and context_switch saves its context.
     /// Cleared when context_switch restores its context.
@@ -274,9 +276,21 @@ fn user_task_trampoline() -> ! {
         let sched = super::scheduler();
 
         if let Some(ref mut task) = sched.tasks[slot] {
+            // Debug: log which task is entering userspace with full trap frame details
+            let pid = task.id;
+            let entry = task.trap_frame.elr_el1;
+            let sp = task.trap_frame.sp_el0;
+            let spsr = task.trap_frame.spsr_el1;
+
             if let Some(ref addr_space) = task.address_space {
                 let ttbr0 = addr_space.get_ttbr0();
                 let trap_frame = &mut task.trap_frame as *mut TrapFrame;
+
+                crate::kinfo!("task", "enter_user"; pid = pid as u64,
+                    elr = crate::klog::hex64(entry),
+                    sp = crate::klog::hex64(sp),
+                    spsr = crate::klog::hex64(spsr),
+                    ttbr0 = crate::klog::hex64(ttbr0));
 
                 // Set globals for exception handler
                 super::CURRENT_TRAP_FRAME.store(trap_frame, core::sync::atomic::Ordering::Release);
@@ -341,6 +355,7 @@ impl Task {
             signal_allowlist_count: 0,
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
+            storm: crate::kernel::storm::StormState::new(),
             context_saved: true,  // Kernel task always uses CpuContext
         })
     }
@@ -391,6 +406,7 @@ impl Task {
             signal_allowlist_count: 0,
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
+            storm: crate::kernel::storm::StormState::new(),
             context_saved: true,  // Kernel task always uses CpuContext
         }
     }
@@ -460,6 +476,7 @@ impl Task {
             signal_allowlist_count: 0,
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
+            storm: crate::kernel::storm::StormState::new(),
             context_saved: true,  // New tasks need context_switch to run their trampoline
         })
     }
@@ -649,19 +666,34 @@ impl Task {
     /// Transition: Running → Sleeping (block for event, no deadline)
     #[inline]
     pub fn set_sleeping(&mut self, reason: super::state::SleepReason) -> Result<(), super::state::InvalidTransition> {
-        self.state.sleep(reason)
+        let from = self.state.name();
+        let result = self.state.sleep(reason);
+        if self.id == 2 {
+            crate::kinfo!("devd", "set_sleeping"; from = from, ok = result.is_ok());
+        }
+        result
     }
 
     /// Transition: Running → Waiting (block with deadline)
     #[inline]
     pub fn set_waiting(&mut self, reason: super::state::WaitReason, deadline: u64) -> Result<(), super::state::InvalidTransition> {
-        self.state.wait(reason, deadline)
+        let from = self.state.name();
+        let result = self.state.wait(reason, deadline);
+        if self.id == 2 {
+            crate::kinfo!("devd", "set_waiting"; from = from, ok = result.is_ok(), deadline = deadline);
+        }
+        result
     }
 
     /// Transition: Sleeping/Waiting → Ready (wake up)
     #[inline]
     pub fn wake(&mut self) -> Result<(), super::state::InvalidTransition> {
-        self.state.wake()
+        let from = self.state.name();
+        let result = self.state.wake();
+        if self.id == 2 {
+            crate::kinfo!("devd", "wake"; from = from, ok = result.is_ok());
+        }
+        result
     }
 
     /// Transition: Any runnable/blocked → Exiting
@@ -682,11 +714,96 @@ impl Task {
         self.state.finalize()
     }
 
+    /// Transition: Any non-terminal → Evicting (kernel-initiated forced termination)
+    #[inline]
+    pub fn evict(&mut self, reason: super::state::EvictionReason) -> Result<(), super::state::InvalidTransition> {
+        self.state.evict(reason)
+    }
+
+    /// Transition: Exiting/Dying/Evicting → Dead (cleanup complete)
+    #[inline]
+    pub fn finalize(&mut self) -> Result<i32, super::state::InvalidTransition> {
+        self.state.finalize()
+    }
+
     /// Force state to Ready (for task slot reuse after Dead)
     /// This bypasses the state machine - only use for slot reinitialization
     #[inline]
     pub(crate) fn reset_state_for_reuse(&mut self) {
         self.state = TaskState::Ready;
+    }
+
+    // ========================================================================
+    // Syscall-Facing Encapsulation API
+    // ========================================================================
+    // These methods hide internal field access from syscall handlers.
+    // Syscalls should use these instead of accessing fields directly.
+
+    /// Record syscall activity for liveness tracking
+    /// Called at syscall entry to prove task is responsive
+    #[inline]
+    pub fn record_activity(&mut self, tick: u64) {
+        self.last_activity_tick = tick;
+    }
+
+    /// Reset liveness state if task is in implicit pong state
+    /// A syscall itself proves the task is alive - no explicit pong needed
+    #[inline]
+    pub fn reset_liveness_if_implicit_pong(&mut self) {
+        if let crate::kernel::liveness::LivenessState::PingSent { channel: 0, .. } = self.liveness_state {
+            self.liveness_state = crate::kernel::liveness::LivenessState::Normal;
+        }
+    }
+
+    /// Record a syscall for storm protection and return action to take
+    #[inline]
+    pub fn record_storm_syscall(&mut self, tick: u64, config: &crate::kernel::storm::StormConfig) -> crate::kernel::storm::StormAction {
+        self.storm.record_syscall(tick, config)
+    }
+
+    /// Set deferred return value for syscall (written to trap_frame.x0)
+    /// Used when syscall return value needs to be set after blocking
+    #[inline]
+    pub fn set_deferred_return(&mut self, value: i64) {
+        self.trap_frame.x0 = value as u64;
+    }
+
+    /// Detach task from its parent, returning the old parent ID
+    /// Used by daemonize to orphan a process
+    #[inline]
+    pub fn detach_from_parent(&mut self) -> TaskId {
+        let old_parent = self.parent_id;
+        self.parent_id = 0;
+        old_parent
+    }
+
+    /// Get capabilities as raw bits for syscall return
+    #[inline]
+    pub fn get_capabilities_bits(&self) -> u64 {
+        self.capabilities.bits()
+    }
+
+    /// Get activity age in milliseconds since last syscall
+    /// Returns 0 if no activity recorded yet
+    #[inline]
+    pub fn get_activity_age_ms(&self, current_tick: u64) -> u32 {
+        if self.last_activity_tick == 0 {
+            0
+        } else {
+            let age_ticks = current_tick.saturating_sub(self.last_activity_tick);
+            (age_ticks * 10) as u32  // 10ms per tick
+        }
+    }
+
+    /// Get liveness status code for ABI
+    #[inline]
+    pub fn get_liveness_status_code(&self) -> u8 {
+        use abi::liveness_status;
+        match self.liveness_state {
+            crate::kernel::liveness::LivenessState::Normal => liveness_status::NORMAL,
+            crate::kernel::liveness::LivenessState::PingSent { .. } => liveness_status::PING_SENT,
+            crate::kernel::liveness::LivenessState::ClosePending { .. } => liveness_status::CLOSE_PENDING,
+        }
     }
 
     // ========================================================================
@@ -980,6 +1097,10 @@ enter_usermode_asm:
     msr     ttbr0_el1, x9
     isb
     tlbi    vmalle1
+    dsb     sy
+    isb
+    // CRITICAL: Invalidate I-cache - different processes use same VA with different PA
+    ic      ialluis         // Invalidate all I-caches in inner shareable domain
     dsb     sy
     isb
 

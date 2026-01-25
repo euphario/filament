@@ -32,6 +32,7 @@ fn convert_state(state: &TaskState) -> TaskStateInfo {
         TaskState::Waiting { deadline, .. } => TaskStateInfo::Waiting { deadline: *deadline },
         TaskState::Exiting { .. } |
         TaskState::Dying { .. } |
+        TaskState::Evicting { .. } |
         TaskState::Dead => TaskStateInfo::Terminated,
     }
 }
@@ -40,7 +41,7 @@ fn convert_state(state: &TaskState) -> TaskStateInfo {
 fn convert_sleep_reason(reason: SleepReason) -> InternalSleepReason {
     match reason {
         SleepReason::EventLoop => InternalSleepReason::EventLoop,
-        SleepReason::Ipc => InternalSleepReason::Ipc,
+        SleepReason::Irq => InternalSleepReason::Irq,
         // ChildWait is a WaitReason in the kernel (has deadline), not SleepReason
         SleepReason::ChildWait => InternalSleepReason::EventLoop,
         SleepReason::Other => InternalSleepReason::EventLoop,

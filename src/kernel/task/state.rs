@@ -46,8 +46,8 @@
 pub enum SleepReason {
     /// Waiting in event loop (kevent_wait, mux read)
     EventLoop,
-    /// Blocking IPC receive (no timeout)
-    Ipc,
+    /// Waiting for hardware IRQ (no timeout)
+    Irq,
 }
 
 /// Why a task is waiting (request-response style, has deadline)
@@ -63,6 +63,23 @@ pub enum WaitReason {
     TimedEvent,
     /// Waiting for timer expiry
     Timer,
+    /// Throttled due to syscall storm - blocked until deadline
+    Throttled,
+}
+
+/// Why a task is being forcibly evicted
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionReason {
+    /// Invalid state transition attempted (state machine violation)
+    InvalidStateTransition,
+    /// Internal state corruption detected
+    StateCorruption,
+    /// Syscall handler panicked or detected corruption
+    SyscallPanic,
+    /// Task failed liveness check (unresponsive too long)
+    LivenessTimeout,
+    /// Task exhausted a kernel resource (handles, memory, etc.)
+    ResourceExhaustion,
 }
 
 /// Task lifecycle state
@@ -90,6 +107,10 @@ pub enum TaskState {
 
     /// Task in grace period for Phase 2 cleanup (resource release)
     Dying { code: i32, until: u64 },
+
+    /// Task being forcibly evicted due to state corruption or violation
+    /// Kernel-initiated termination - goes directly to Dead (no grace period)
+    Evicting { reason: EvictionReason },
 
     /// Task fully cleaned up, slot can be reused
     Dead,
@@ -131,8 +152,13 @@ impl TaskState {
     pub fn is_terminated(&self) -> bool {
         matches!(
             self,
-            TaskState::Exiting { .. } | TaskState::Dying { .. } | TaskState::Dead
+            TaskState::Exiting { .. } | TaskState::Dying { .. } | TaskState::Evicting { .. } | TaskState::Dead
         )
+    }
+
+    /// Task is being evicted (kernel-initiated forced termination)
+    pub fn is_evicting(&self) -> bool {
+        matches!(self, TaskState::Evicting { .. })
     }
 
     /// Get deadline if this state has one
@@ -168,6 +194,14 @@ impl TaskState {
         }
     }
 
+    /// Get eviction reason if evicting
+    pub fn eviction_reason(&self) -> Option<EvictionReason> {
+        match self {
+            TaskState::Evicting { reason } => Some(*reason),
+            _ => None,
+        }
+    }
+
     /// State name for debugging/logging
     pub fn name(&self) -> &'static str {
         match self {
@@ -177,11 +211,12 @@ impl TaskState {
             TaskState::Waiting { .. } => "Waiting",
             TaskState::Exiting { .. } => "Exiting",
             TaskState::Dying { .. } => "Dying",
+            TaskState::Evicting { .. } => "Evicting",
             TaskState::Dead => "Dead",
         }
     }
 
-    /// Numeric code for ProcessInfo (userspace compatibility)
+    /// Numeric code for ProcessInfo
     pub fn state_code(&self) -> u8 {
         match self {
             TaskState::Ready => 0,
@@ -191,6 +226,7 @@ impl TaskState {
             TaskState::Exiting { .. } => 4,
             TaskState::Dying { .. } => 5,
             TaskState::Dead => 6,
+            TaskState::Evicting { .. } => 7,
         }
     }
 
@@ -233,8 +269,16 @@ impl TaskState {
             (Dying { .. }, Dead) => true,
 
             // Dead goes to Ready (slot reused for new task)
-            // This is a special case - slot reuse, not same task
             (Dead, Ready) => true,
+
+            // Evicting: kernel-initiated forced termination
+            // Any non-terminal state can be evicted
+            (Ready, Evicting { .. }) => true,
+            (Running, Evicting { .. }) => true,
+            (Sleeping { .. }, Evicting { .. }) => true,
+            (Waiting { .. }, Evicting { .. }) => true,
+            // Evicting goes directly to Dead (no grace period)
+            (Evicting { .. }, Dead) => true,
 
             // All other transitions are invalid
             _ => false,
@@ -321,18 +365,28 @@ impl TaskState {
         }
     }
 
-    /// Exiting/Dying → Dead (cleanup complete)
+    /// Exiting/Dying/Evicting → Dead (cleanup complete)
     pub fn finalize(&mut self) -> Result<i32, InvalidTransition> {
         match *self {
             TaskState::Exiting { code } | TaskState::Dying { code, .. } => {
                 *self = TaskState::Dead;
                 Ok(code)
             }
+            TaskState::Evicting { .. } => {
+                // Evicted tasks get exit code -1 (abnormal termination)
+                *self = TaskState::Dead;
+                Ok(-1)
+            }
             _ => Err(InvalidTransition {
                 from: self.name(),
                 to: "Dead",
             }),
         }
+    }
+
+    /// Any non-terminal → Evicting (kernel-initiated forced termination)
+    pub fn evict(&mut self, reason: EvictionReason) -> Result<(), InvalidTransition> {
+        self.transition(TaskState::Evicting { reason }).map(|_| ())
     }
 }
 
@@ -387,7 +441,7 @@ mod tests {
     #[test]
     fn test_kill_while_blocked() {
         let mut state = TaskState::Running;
-        state.sleep(SleepReason::Ipc).unwrap();
+        state.sleep(SleepReason::Irq).unwrap();
 
         // Can kill a sleeping task
         assert!(state.exit(-9).is_ok());
@@ -436,7 +490,7 @@ mod tests {
 
         // Ipc
         assert!(state.schedule().is_ok());
-        assert!(state.sleep(SleepReason::Ipc).is_ok());
+        assert!(state.sleep(SleepReason::Irq).is_ok());
         assert!(state.wake().is_ok());
     }
 
@@ -457,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_is_blocked() {
-        let state = TaskState::Sleeping { reason: SleepReason::Ipc };
+        let state = TaskState::Sleeping { reason: SleepReason::Irq };
         assert!(state.is_blocked());
 
         let state = TaskState::Waiting { reason: WaitReason::Timer, deadline: 100 };
@@ -530,5 +584,58 @@ mod tests {
         let mut state = TaskState::Waiting { reason: WaitReason::Timer, deadline: 100 };
         assert!(state.wake().is_ok());
         assert_eq!(state, TaskState::Ready);
+    }
+
+    #[test]
+    fn test_evict_from_running() {
+        let mut state = TaskState::Running;
+        assert!(state.evict(EvictionReason::InvalidStateTransition).is_ok());
+        assert!(state.is_evicting());
+        assert!(state.is_terminated());
+        assert_eq!(state.eviction_reason(), Some(EvictionReason::InvalidStateTransition));
+    }
+
+    #[test]
+    fn test_evict_from_sleeping() {
+        let mut state = TaskState::Sleeping { reason: SleepReason::EventLoop };
+        assert!(state.evict(EvictionReason::LivenessTimeout).is_ok());
+        assert!(state.is_evicting());
+    }
+
+    #[test]
+    fn test_evict_from_waiting() {
+        let mut state = TaskState::Waiting { reason: WaitReason::Timer, deadline: 100 };
+        assert!(state.evict(EvictionReason::ResourceExhaustion).is_ok());
+        assert!(state.is_evicting());
+    }
+
+    #[test]
+    fn test_evict_from_ready() {
+        let mut state = TaskState::Ready;
+        assert!(state.evict(EvictionReason::StateCorruption).is_ok());
+        assert!(state.is_evicting());
+    }
+
+    #[test]
+    fn test_cannot_evict_dead() {
+        let mut state = TaskState::Dead;
+        assert!(state.evict(EvictionReason::InvalidStateTransition).is_err());
+    }
+
+    #[test]
+    fn test_evicting_to_dead() {
+        let mut state = TaskState::Evicting { reason: EvictionReason::SyscallPanic };
+        let result = state.finalize();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), -1);
+        assert_eq!(state, TaskState::Dead);
+    }
+
+    #[test]
+    fn test_evicting_is_terminated() {
+        let state = TaskState::Evicting { reason: EvictionReason::LivenessTimeout };
+        assert!(state.is_terminated());
+        assert!(!state.is_runnable());
+        assert!(!state.is_blocked());
     }
 }
