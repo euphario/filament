@@ -1529,27 +1529,27 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         //
         // Race condition: A waker might wake us (Sleeping -> Ready) after we
         // transitioned to Sleeping but the late_poll didn't see the event data.
-        // In that case, late_poll_found_events is false but task is now Ready.
+        // In that case, late_poll_found_events is false but task is no longer blocked.
         // We must check the task state to catch this case.
         //
-        // IMPORTANT: Only check for Ready state (was woken from Sleeping).
-        // If task is still Running (sleep transition failed), that's a different
-        // error path - don't treat that as "woken".
-        let (task_was_woken, current_state) = task::with_scheduler(|sched| {
+        // We check !is_blocked() rather than == Ready because there's another race:
+        // 1. We set Sleeping
+        // 2. Shell sends message, wakes us (Sleeping -> Ready)
+        // 3. Scheduler preempts, switches to us (Ready -> Running)
+        // 4. We check state - it's Running, not Ready!
+        // If we only checked == Ready, we'd miss this and go back to sleep.
+        //
+        // Note: We only reach here if set_sleeping/set_waiting succeeded (transition_ok),
+        // so being unblocked means we were woken, not that the transition failed.
+        let task_was_woken = task::with_scheduler(|sched| {
             sched.task(slot)
-                .map(|t| (*t.state() == task::TaskState::Ready, t.state().name()))
-                .unwrap_or((false, "none"))
+                .map(|t| !t.is_blocked())
+                .unwrap_or(false)
         });
 
         if late_poll_found_events || task_was_woken {
             // Events arrived OR we were woken by someone else.
             // Transition to Running via proper state machine.
-            if late_poll_found_events {
-                crate::kinfo!("mux", "late_poll_wake"; task_id = task_id);
-            } else {
-                crate::kinfo!("mux", "external_wake"; task_id = task_id, state = current_state);
-            }
-
             task::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
                     // If Sleeping/Waiting -> wake to Ready
