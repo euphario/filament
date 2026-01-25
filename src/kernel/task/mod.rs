@@ -1234,6 +1234,12 @@ pub unsafe fn update_current_task_globals() {
 /// Must be called from kernel context (not IRQ context).
 #[no_mangle]
 pub unsafe extern "C" fn do_resched_if_needed() {
+    // First, process any pending wake requests from IRQ context.
+    // This is critical because IRQ handlers can't acquire the scheduler lock
+    // directly (to avoid deadlock), so they queue wakes via request_wake().
+    // We must process these before checking need_resched.
+    process_pending_wakes();
+
     // Check and clear the flag atomically (before taking lock)
     let need_resched = crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched();
 
