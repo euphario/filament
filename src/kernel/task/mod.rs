@@ -1068,6 +1068,36 @@ pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
 // Public API - Locking Hidden Inside
 // ============================================================================
 
+/// Process any pending wake requests queued by IRQ handlers.
+///
+/// Must be called from a safe point where the scheduler lock is NOT held.
+/// This is typically called from `irq_exit_resched()` after the interrupt
+/// handler returns but before returning to the interrupted code.
+///
+/// IRQ handlers use `cpu_flags().request_wake(pid)` to queue wakes because
+/// they cannot safely acquire the scheduler lock (it may be held by the
+/// interrupted code, causing deadlock). This function processes those
+/// queued requests at a point where it's safe to acquire the lock.
+pub fn process_pending_wakes() {
+    let pending = crate::arch::aarch64::sync::cpu_flags().drain_pending_wakes();
+    let mut any_woken = false;
+
+    for pid in pending {
+        if pid != 0 {
+            with_scheduler(|sched| {
+                if sched.wake_by_pid(pid) {
+                    any_woken = true;
+                }
+            });
+        }
+    }
+
+    // Ensure need_resched is set if we woke anyone
+    if any_woken {
+        crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+    }
+}
+
 /// Access a task by slot (read-only).
 ///
 /// Acquires scheduler lock, calls closure with task reference, releases lock.

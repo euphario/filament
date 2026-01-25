@@ -661,22 +661,34 @@ impl EventQueue {
 ///
 /// Returns true if the event was delivered (task exists and subscribed),
 /// false otherwise.
+///
+/// # Deadlock Prevention
+///
+/// Uses try_scheduler() to prevent deadlock if called from IRQ context
+/// while the scheduler lock is already held. If the lock can't be acquired,
+/// queues a deferred wake request instead.
 pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
-    // Ensure IRQs are disabled for scheduler access (not just debug assert)
+    // Ensure IRQs are disabled for scheduler access
     let _guard = crate::arch::aarch64::sync::IrqGuard::new();
 
-    unsafe {
-        let mut sched = super::task::scheduler();
-        // Use generation-aware PID lookup to prevent TOCTOU
-        if let Some(slot) = sched.slot_by_pid(target_pid) {
-            if let Some(task) = sched.task_mut(slot) {
-                // Check if task is subscribed to this event type
-                if task.event_queue.is_subscribed(&event) {
-                    if task.event_queue.push(event) {
-                        // Wake task if blocked (using unified wake function)
-                        sched.wake_task(slot);
-                        return true;
-                    }
+    // Use try_scheduler to prevent deadlock if called from IRQ context
+    let Some(mut sched) = super::task::try_scheduler() else {
+        // Lock held - queue deferred wake and return.
+        // The event won't be delivered this time, but task will wake
+        // and can poll for events.
+        crate::arch::aarch64::sync::cpu_flags().request_wake(target_pid);
+        return false;
+    };
+
+    // Use generation-aware PID lookup to prevent TOCTOU
+    if let Some(slot) = sched.slot_by_pid(target_pid) {
+        if let Some(task) = sched.task_mut(slot) {
+            // Check if task is subscribed to this event type
+            if task.event_queue.is_subscribed(&event) {
+                if task.event_queue.push(event) {
+                    // Wake task if blocked (using unified wake function)
+                    sched.wake_task(slot);
+                    return true;
                 }
             }
         }

@@ -74,6 +74,10 @@ pub struct CpuFlags {
     unhandled_irqs: AtomicU32,
     /// Last unhandled IRQ number
     last_unhandled_irq: AtomicU32,
+    /// Lock-free wake queue for IRQ context.
+    /// PIDs to wake (0 = empty slot). Used when IRQ handler needs to
+    /// wake a task but scheduler lock may be held.
+    pending_wakes: [AtomicU32; 4],
 }
 
 impl CpuFlags {
@@ -83,6 +87,12 @@ impl CpuFlags {
             timer_ticks: AtomicU32::new(0),
             unhandled_irqs: AtomicU32::new(0),
             last_unhandled_irq: AtomicU32::new(0),
+            pending_wakes: [
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+            ],
         }
     }
 
@@ -136,6 +146,59 @@ impl CpuFlags {
     #[inline]
     pub fn clear_unhandled_stats(&self) {
         self.unhandled_irqs.store(0, Ordering::Relaxed);
+    }
+
+    // ========================================================================
+    // Deferred Wake Queue - for IRQ context
+    // ========================================================================
+
+    /// Request a task wake from IRQ context (lock-free).
+    ///
+    /// Use this when an IRQ handler needs to wake a task but can't acquire
+    /// the scheduler lock (which may be held by the interrupted code).
+    ///
+    /// Returns true if queued successfully, false if queue is full.
+    /// Automatically sets need_resched flag so the wake will be processed.
+    #[inline]
+    pub fn request_wake(&self, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        for slot in &self.pending_wakes {
+            // Try to claim empty slot (0 -> pid)
+            if slot
+                .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.set_need_resched();
+                return true;
+            }
+        }
+        // Queue full - still set need_resched so scheduler runs
+        self.set_need_resched();
+        false
+    }
+
+    /// Drain all pending wake requests (called from safe point).
+    ///
+    /// Returns array of PIDs that need to be woken (0 = empty slot).
+    /// The caller should acquire the scheduler lock and call wake_by_pid()
+    /// for each non-zero PID.
+    #[inline]
+    pub fn drain_pending_wakes(&self) -> [u32; 4] {
+        let mut result = [0u32; 4];
+        for (i, slot) in self.pending_wakes.iter().enumerate() {
+            result[i] = slot.swap(0, Ordering::AcqRel);
+        }
+        result
+    }
+
+    /// Check if any wakes are pending (without draining).
+    #[inline]
+    pub fn has_pending_wakes(&self) -> bool {
+        self.pending_wakes
+            .iter()
+            .any(|s| s.load(Ordering::Relaxed) != 0)
     }
 }
 

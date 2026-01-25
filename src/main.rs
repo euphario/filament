@@ -376,30 +376,19 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
             // Broadcast FdReadable event to all subscribers of STDIN (fd 0)
             kernel::event::broadcast_event(kernel::event::Event::fd_readable(0));
 
-            // Also wake any process blocked in legacy blocking read syscall
+            // Also wake any process blocked in legacy blocking read syscall.
+            // Use deferred wake to avoid deadlock if scheduler lock is held.
             let blocked_pid = uart::get_blocked_pid();
             if blocked_pid != 0 {
-                unsafe {
-                    let mut sched = task::scheduler();
-                    if sched.wake_by_pid(blocked_pid) {
-                        uart::clear_blocked();
-                        sync::cpu_flags().set_need_resched();
-                    }
-                }
+                sync::cpu_flags().request_wake(blocked_pid);
+                uart::clear_blocked();
             }
         }
     } else {
         // Check if this IRQ is registered by a userspace driver
         if let Some(owner_pid) = irq::notify(irq) {
-            // Wake the owner process if blocked - O(1) lookup via pid_to_slot map
-            unsafe {
-                let _guard = sync::IrqGuard::new(); // Ensure atomicity
-                let mut sched = task::scheduler();
-                if sched.wake_by_pid(owner_pid) {
-                    // Task was woken, set need_resched so we switch to it
-                    sync::cpu_flags().set_need_resched();
-                }
-            }
+            // Wake the owner process - use deferred wake to avoid deadlock
+            sync::cpu_flags().request_wake(owner_pid);
         } else {
             // Record unhandled IRQ (don't print in IRQ context!)
             sync::cpu_flags().record_unhandled_irq(irq);
@@ -412,17 +401,23 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
 
 /// Called from assembly after IRQ handler, at the safe point before eret.
 /// This is where deferred work happens:
-/// 1. Reschedule if timer set the flag
-/// 2. Log any deferred messages (e.g., unhandled IRQs)
-/// 3. Flush log buffer before returning to user
+/// 1. Process pending wake requests from IRQ context
+/// 2. Reschedule if timer set the flag
+/// 3. Log any deferred messages (e.g., unhandled IRQs)
+/// 4. Flush log buffer before returning to user
 #[no_mangle]
 pub extern "C" fn irq_exit_resched() {
-    // 1. Handle deferred reschedule
+    // 1. Process pending wake requests from IRQ context.
+    // IRQ handlers use cpu_flags().request_wake(pid) instead of directly
+    // acquiring the scheduler lock (which may be held by interrupted code).
+    task::process_pending_wakes();
+
+    // 2. Handle deferred reschedule
     unsafe {
         task::do_resched_if_needed();
     }
 
-    // 2. Process any pending task evictions
+    // 3. Process any pending task evictions
     task::eviction::process_pending_evictions();
 
     // 3. Log any unhandled IRQs from interrupt context (deferred logging)
