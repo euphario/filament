@@ -645,11 +645,9 @@ impl ObjectService {
         };
         // Wake outside the lock
         if let Some(sub) = port_subscriber {
-            crate::kinfo!("objsvc", "port_wake"; port_owner = port_owner, sub_task = sub.task_id);
             waker::wake_pid(sub.task_id);
-        } else {
-            crate::kwarn!("objsvc", "port_no_sub"; port_owner = port_owner);
         }
+        // Note: no subscriber is normal if port not yet added to mux
 
         // Allocate handle in ObjectService tables
         let mut tables = self.tables.lock();

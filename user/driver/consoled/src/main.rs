@@ -198,7 +198,6 @@ impl Consoled {
 
         // Open stdin handle for use with Mux
         self.stdin_handle = syscall::open(ObjectType::Stdin, &[])?;
-        clog!("stdin handle={}", self.stdin_handle.0);
 
         // Drain any stale input that accumulated before we were ready
         let mut buf = [0u8; 64];
@@ -215,14 +214,12 @@ impl Consoled {
 
         // Create event multiplexer
         let mux = Mux::new()?;
-        clog!("mux handle={}", mux.handle().0);
 
         // Add stdin to mux (readable)
         mux.add(self.stdin_handle, MuxFilter::Readable)?;
 
         // Register console port (limit: 1 shell connection)
         let port = Port::with_limit(b"console:", 1)?;
-        clog!("port handle={}", port.handle().0);
 
         // Add port to mux (readable = accept pending)
         mux.add(port.handle(), MuxFilter::Readable)?;
@@ -330,10 +327,6 @@ impl Consoled {
                     }
                 }
                 Ok(_) | Err(SysError::WouldBlock) => {
-                    // Log if we drained multiple messages (indicates queue buildup)
-                    if msg_count > 4 {
-                        clog!("drained {} msgs", msg_count);
-                    }
                     break;
                 }
                 Err(SysError::ConnectionReset) | Err(SysError::BadFd) => {
@@ -456,8 +449,6 @@ static mut CONSOLED: Consoled = Consoled::new();
 #[unsafe(no_mangle)]
 #[allow(static_mut_refs)]
 fn main() -> ! {
-    // Immediate debug - first thing in main
-    syscall::debug_write(b"CONSOLED MAIN ENTRY\n");
     cerror!("BOOT v2.0-unified");
 
     let consoled = unsafe { &mut CONSOLED };

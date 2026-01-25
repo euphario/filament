@@ -929,8 +929,6 @@ fn read_port_via_service(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: us
         }
     };
 
-    crate::kinfo!("port", "read_port_accept"; port_id = port_id, task_id = task_id);
-
     // Phase 2: Accept connection (no ObjectService lock held)
     let (server_channel, client_pid) = match ipc::port_accept(port_id, task_id) {
         Ok(result) => result,

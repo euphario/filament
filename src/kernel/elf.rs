@@ -7,7 +7,7 @@
 
 use super::addrspace::AddressSpace;
 use super::pmm;
-use crate::{kinfo, print_direct};
+use crate::{kdebug, print_direct};
 use crate::arch::aarch64::mmu;
 use super::task;
 
@@ -613,7 +613,7 @@ fn spawn_from_elf_internal(
     // (kinfo! -> broadcast_event -> scheduler() would deadlock)
     drop(sched);
 
-    kinfo!("elf", "spawn_ok"; name = name, pid = task_id as u64, entry = crate::klog::hex64(elf_info.entry), parent = parent_id as u64);
+    kdebug!("elf", "spawn_ok"; name = name, pid = task_id as u64, entry = crate::klog::hex64(elf_info.entry), parent = parent_id as u64);
 
     Ok((task_id, slot))
 }

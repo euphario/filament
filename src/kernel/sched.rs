@@ -126,10 +126,6 @@ pub fn reschedule() -> bool {
             }
         };
 
-        if caller_slot == 1 && next_slot != 1 {
-            crate::kinfo!("sched", "reschedule_switch"; from = caller_slot, to = next_slot);
-        }
-
         // Check if we need full context switch
         let from_blocked = sched.task(caller_slot)
             .map(|t| t.is_blocked()).unwrap_or(false);
