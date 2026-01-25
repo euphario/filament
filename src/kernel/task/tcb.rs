@@ -268,41 +268,50 @@ pub struct Task {
 /// # Safety
 /// Must only be called via context_switch with proper scheduler state set up.
 fn user_task_trampoline() -> ! {
-    unsafe {
-        // Get current slot (was set by switch_to_task before context_switch)
-        let slot = crate::kernel::percpu::cpu_local().get_current_slot();
+    // Get current slot (was set by switch_to_task before context_switch)
+    let slot = crate::kernel::percpu::cpu_local().get_current_slot();
 
-        // Get scheduler (IRQs should still be disabled from switch_to_task)
+    // CRITICAL: Extract data while holding lock, then RELEASE LOCK before enter_usermode.
+    // If we call enter_usermode while holding the lock, it never returns (eret),
+    // so the lock would never be released, causing deadlock on next scheduler() call.
+    let (trap_frame, ttbr0) = {
         let mut sched = super::scheduler();
 
-        if let Some(ref mut task) = sched.tasks[slot] {
-            // Debug: log which task is entering userspace with full trap frame details
-            let pid = task.id;
-            let entry = task.trap_frame.elr_el1;
-            let sp = task.trap_frame.sp_el0;
-            let spsr = task.trap_frame.spsr_el1;
+        let task = match sched.tasks[slot].as_mut() {
+            Some(t) => t,
+            None => panic!("user_task_trampoline: no task in slot {}", slot),
+        };
 
-            if let Some(ref addr_space) = task.address_space {
-                let ttbr0 = addr_space.get_ttbr0();
-                let trap_frame = &mut task.trap_frame as *mut TrapFrame;
+        let addr_space = match task.address_space.as_ref() {
+            Some(a) => a,
+            None => panic!("user_task_trampoline: no address space for task {}", task.id),
+        };
 
-                crate::kinfo!("task", "enter_user"; pid = pid as u64,
-                    elr = crate::klog::hex64(entry),
-                    sp = crate::klog::hex64(sp),
-                    spsr = crate::klog::hex64(spsr),
-                    ttbr0 = crate::klog::hex64(ttbr0));
+        // Extract data needed for usermode entry
+        let pid = task.id;
+        let entry = task.trap_frame.elr_el1;
+        let sp = task.trap_frame.sp_el0;
+        let spsr = task.trap_frame.spsr_el1;
+        let ttbr0 = addr_space.get_ttbr0();
+        let trap_frame = &mut task.trap_frame as *mut TrapFrame;
 
-                // Set globals for exception handler
-                super::CURRENT_TRAP_FRAME.store(trap_frame, core::sync::atomic::Ordering::Release);
-                super::CURRENT_TTBR0.store(ttbr0, core::sync::atomic::Ordering::Release);
+        crate::kinfo!("task", "enter_user"; pid = pid as u64,
+            elr = crate::klog::hex64(entry),
+            sp = crate::klog::hex64(sp),
+            spsr = crate::klog::hex64(spsr),
+            ttbr0 = crate::klog::hex64(ttbr0));
 
-                // Enter userspace via eret
-                super::enter_usermode(trap_frame as *const TrapFrame, ttbr0);
-            }
-        }
+        // Set globals for exception handler
+        super::CURRENT_TRAP_FRAME.store(trap_frame, core::sync::atomic::Ordering::Release);
+        super::CURRENT_TTBR0.store(ttbr0, core::sync::atomic::Ordering::Release);
 
-        // Should never reach here - enter_usermode doesn't return
-        panic!("user_task_trampoline: invalid task state");
+        (trap_frame as *const TrapFrame, ttbr0)
+        // sched guard dropped here - lock released
+    };
+
+    // Enter userspace via eret (this never returns)
+    unsafe {
+        super::enter_usermode(trap_frame, ttbr0);
     }
 }
 
