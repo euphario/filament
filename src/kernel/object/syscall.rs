@@ -1300,9 +1300,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     match &mut entry.object {
                         Object::Channel(_) => {
                             if channel_id != 0 {
-                                if let Err(_e) = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable) {
-                                    crate::kdebug!("mux", "subscribe_fail"; channel = channel_id as u64);
-                                }
+                                let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
                             }
                         }
                         Object::Port(p) => { p.set_subscriber(Some(subscriber)); }
