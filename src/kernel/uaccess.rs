@@ -532,18 +532,17 @@ pub fn user_virt_to_phys_debug(ttbr0: u64, virt_addr: u64) -> u64 {
 }
 
 /// Get the current task's TTBR0 (user page table root)
+///
+/// Reads from global CURRENT_TTBR0 instead of acquiring the scheduler lock.
+/// This avoids deadlock when called from code that already holds the lock
+/// (e.g., sys_ps_info which holds the lock while calling copy_to_user).
 fn get_current_ttbr0() -> Result<u64, UAccessError> {
-    unsafe {
-        let sched = task::scheduler();
-        match sched.current_task() {
-            Some(task) => {
-                match &task.address_space {
-                    Some(addr_space) => Ok(addr_space.ttbr0),
-                    None => Err(UAccessError::NotMapped), // Kernel task, no user space
-                }
-            }
-            None => Err(UAccessError::NotMapped),
-        }
+    let ttbr0 = task::CURRENT_TTBR0.load(core::sync::atomic::Ordering::Acquire);
+    if ttbr0 == 0 {
+        // Kernel task or not initialized - no user address space
+        Err(UAccessError::NotMapped)
+    } else {
+        Ok(ttbr0)
     }
 }
 
