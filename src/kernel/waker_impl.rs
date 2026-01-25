@@ -27,7 +27,9 @@ impl Waker for KernelWaker {
     fn wake(&self, sub: &Subscriber, _reason: WakeReason) {
         // Use with_scheduler for proper SMP serialization
         task::with_scheduler(|sched| {
-            // TODO: Check generation to prevent stale wakes
+            // Generation check is handled by wake_by_pid -> slot_by_pid:
+            // slot_by_pid compares task.id == pid which includes the generation
+            // bits, so stale PIDs will fail the lookup and won't wake anything.
             sched.wake_by_pid(sub.task_id);
         });
     }

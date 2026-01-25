@@ -77,7 +77,7 @@ impl ObjError {
             ObjError::OutOfMemory => -12,   // ENOMEM
             ObjError::OutOfHandles => -24,  // EMFILE
             ObjError::InvalidArg => -22,    // EINVAL
-            ObjError::PermissionDenied => -13, // EACCES
+            ObjError::PermissionDenied => -1,  // EPERM
             ObjError::TaskNotFound => -3,   // ESRCH
             ObjError::AlreadyExists => -17, // EEXIST
         }

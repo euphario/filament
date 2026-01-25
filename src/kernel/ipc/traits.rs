@@ -124,10 +124,11 @@ impl Subscriber {
         Self { task_id, generation }
     }
 
-    /// Create a subscriber for a task (generation 0 = always valid)
+    /// Create a subscriber for a task (generation 0 bypasses stale PID detection)
     ///
     /// Use this when you don't have access to task generation,
-    /// but be aware it may cause spurious wakes.
+    /// but be aware it may cause spurious wakes to reused PIDs.
+    /// Prefer using Subscriber::new() with proper generation when possible.
     pub const fn simple(task_id: TaskId) -> Self {
         Self { task_id, generation: 0 }
     }

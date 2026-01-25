@@ -98,7 +98,9 @@ impl Subscriber {
         Self { task_id, generation }
     }
 
-    /// Create simple subscriber (generation 0 = always valid)
+    /// Create simple subscriber (generation 0 bypasses stale PID detection)
+    ///
+    /// Prefer using Subscriber::new() with proper generation when possible.
     pub const fn simple(task_id: TaskId) -> Self {
         Self { task_id, generation: 0 }
     }

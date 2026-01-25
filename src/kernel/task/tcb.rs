@@ -254,10 +254,10 @@ pub struct Task {
     pub(crate) last_activity_tick: u64,
     /// Storm protection state (syscall/wake rate limiting)
     pub(crate) storm: crate::kernel::storm::StormState,
-    /// True if this task was switched away via context_switch and needs context restored.
+    /// True if this task needs its kernel context restored via context_switch.
     /// Set when task blocks and context_switch saves its context.
     /// Cleared when context_switch restores its context.
-    pub(crate) context_saved: bool,
+    pub(crate) needs_context_restore: bool,
 }
 
 /// Trampoline for new user tasks.
@@ -356,7 +356,7 @@ impl Task {
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
-            context_saved: true,  // Kernel task always uses CpuContext
+            needs_context_restore: true,  // Kernel task always uses CpuContext
         })
     }
 
@@ -407,7 +407,7 @@ impl Task {
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
-            context_saved: true,  // Kernel task always uses CpuContext
+            needs_context_restore: true,  // Kernel task always uses CpuContext
         }
     }
 
@@ -477,7 +477,7 @@ impl Task {
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
-            context_saved: true,  // New tasks need context_switch to run their trampoline
+            needs_context_restore: true,  // New tasks need context_switch to run their trampoline
         })
     }
 

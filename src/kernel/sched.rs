@@ -134,7 +134,7 @@ pub fn reschedule() -> bool {
         let from_blocked = sched.task(caller_slot)
             .map(|t| t.is_blocked()).unwrap_or(false);
         let to_needs_context = sched.task(next_slot)
-            .map(|t| t.context_saved).unwrap_or(false);
+            .map(|t| t.needs_context_restore).unwrap_or(false);
 
         if !from_blocked && !to_needs_context {
             // Simple preemption case - no context_switch needed
@@ -161,7 +161,7 @@ pub fn reschedule() -> bool {
         // Need full context switch - extract everything we need
         let from_ctx = match sched.task_mut(caller_slot) {
             Some(t) => {
-                t.context_saved = true;
+                t.needs_context_restore = true;
                 &mut t.context as *mut task::CpuContext
             }
             None => return false,
@@ -171,7 +171,7 @@ pub fn reschedule() -> bool {
             Some(t) => {
                 // Prepare target state while holding lock
                 crate::transition_or_evict!(t, set_running);
-                t.context_saved = false;
+                t.needs_context_restore = false;
 
                 let ctx = &t.context as *const task::CpuContext;
                 let trap = &mut t.trap_frame as *mut TrapFrame;
@@ -254,7 +254,7 @@ pub fn reschedule() -> bool {
                     kwarn!("sched", "resume_unexpected"; slot = decision.from_slot as u64);
                 }
             }
-            t.context_saved = false;
+            t.needs_context_restore = false;
 
             // Update trap frame pointer
             let trap_ptr = &mut t.trap_frame as *mut TrapFrame;

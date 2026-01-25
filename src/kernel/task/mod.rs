@@ -455,8 +455,13 @@ impl Scheduler {
                 // Collect task ID for TimerObject checking via ObjectService
                 if timer_sub_count < timer_subscribers.len() {
                     // Store task_id in the subscriber array (repurposed temporarily)
-                    timer_subscribers[timer_sub_count] = Subscriber { task_id: task.id, generation: 0 };
+                    timer_subscribers[timer_sub_count] = Subscriber {
+                        task_id: task.id,
+                        generation: Scheduler::generation_from_pid(task.id),
+                    };
                     timer_sub_count += 1;
+                } else {
+                    crate::kwarn!("timer", "subscriber_overflow"; dropped = 1);
                 }
             }
         }
@@ -475,6 +480,8 @@ impl Scheduler {
                 if all_sub_count < all_subscribers.len() {
                     all_subscribers[all_sub_count] = sub;
                     all_sub_count += 1;
+                } else {
+                    crate::kwarn!("timer", "wake_list_overflow"; dropped = 1);
                 }
             }
         }
@@ -485,7 +492,7 @@ impl Scheduler {
             // Find and wake the subscriber's task
             if let Some(slot) = self.slot_by_pid(subscriber.task_id) {
                 if let Some(ref mut task) = self.tasks[slot] {
-                    // Wake if task is blocked (generation 0 = always valid, skip check)
+                    // Wake if task is blocked
                     if task.is_blocked() {
                         crate::transition_or_log!(task, wake);
                         // Reset liveness - timer event means task is active
@@ -651,6 +658,25 @@ impl Scheduler {
         }
     }
 
+    /// Perform IPC cleanup for a terminating task.
+    ///
+    /// This handles:
+    /// - Stopping DMA (critical for safety)
+    /// - Removing from subscriber lists (prevents stale wakes)
+    /// - Notifying IPC peers (sends Close messages, wakes blocked receivers)
+    ///
+    /// Returns the wake list for IPC peers.
+    fn do_ipc_cleanup(pid: TaskId) -> super::ipc::waker::WakeList {
+        // Stop DMA first (critical for safety)
+        super::bus::process_cleanup(pid);
+
+        // Remove dying task from ALL subscriber lists (prevent stale wakes)
+        super::ipc::remove_subscriber_from_all(pid);
+
+        // Notify IPC peers (sends Close messages, wakes blocked receivers)
+        super::ipc::process_cleanup(pid)
+    }
+
     /// Remove terminated tasks and free resources
     /// Uses two-phase cleanup to give servers a chance to release shared resources gracefully:
     /// - Exiting: Phase 1 - Send notifications (IPC Close, ShmemInvalid events), transition to Dying
@@ -713,14 +739,8 @@ impl Scheduler {
                     // Wake parent task if it's sleeping (for Process watch)
                     self.wake_parent_if_sleeping(slot_idx);
 
-                    // Stop DMA first (critical for safety)
-                    super::bus::process_cleanup(pid);
-
-                    // Remove dying task from ALL subscriber lists (prevent stale wakes)
-                    super::ipc::remove_subscriber_from_all(pid);
-
-                    // Notify IPC peers (sends Close messages, wakes blocked receivers)
-                    let ipc_wake_list = super::ipc::process_cleanup(pid);
+                    // Perform IPC cleanup (DMA stop, subscriber removal, peer notification)
+                    let ipc_wake_list = Self::do_ipc_cleanup(pid);
                     super::ipc::waker::wake(&ipc_wake_list, super::ipc::WakeReason::Closed);
 
                     // Notify shmem mappers (marks regions as Dying, sends ShmemInvalid events)
@@ -783,14 +803,8 @@ impl Scheduler {
                     // Wake parent task if it's sleeping (for Process watch)
                     self.wake_parent_if_sleeping(slot_idx);
 
-                    // Stop DMA
-                    super::bus::process_cleanup(pid);
-
-                    // Remove from subscriber lists
-                    super::ipc::remove_subscriber_from_all(pid);
-
-                    // Notify IPC peers
-                    let ipc_wake_list = super::ipc::process_cleanup(pid);
+                    // Perform IPC cleanup (DMA stop, subscriber removal, peer notification)
+                    let ipc_wake_list = Self::do_ipc_cleanup(pid);
                     super::ipc::waker::wake(&ipc_wake_list, super::ipc::WakeReason::Closed);
 
                     // Finalize shmem immediately (no grace period)

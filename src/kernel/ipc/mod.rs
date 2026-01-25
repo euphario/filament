@@ -403,8 +403,10 @@ pub fn port_exists(port_id: u32) -> bool {
 }
 
 /// Register a waker for a channel (handle system compatibility)
-pub fn channel_register_waker(channel_id: ChannelId, task_id: u32) {
-    let _ = with_channel_table(|table| table.register_waker(channel_id, task_id));
+///
+/// Returns true on success, false if channel not found or subscriber set full.
+pub fn channel_register_waker(channel_id: ChannelId, task_id: u32) -> bool {
+    with_channel_table(|table| table.register_waker(channel_id, task_id).is_ok())
 }
 
 /// Unregister a waker for a channel

@@ -237,8 +237,10 @@ impl Channel {
             // If half-closed and queue now empty, transition to Closed
             if let ChannelState::HalfClosed { .. } = &self.state {
                 if self.queue.is_empty() {
+                    // SAFETY: HalfClosed -> Closed is always valid when queue drains
                     self.state = ChannelState::Closed;
                 } else {
+                    // SAFETY: HalfClosed can always update messages_remaining (same state variant)
                     self.state = ChannelState::HalfClosed {
                         messages_remaining: self.queue.len() as u8,
                     };
@@ -263,8 +265,10 @@ impl Channel {
             ChannelState::Open { .. } => {
                 let remaining = self.queue.len() as u8;
                 if remaining > 0 {
+                    // SAFETY: Open -> HalfClosed is always valid per state machine
                     self.state = ChannelState::HalfClosed { messages_remaining: remaining };
                 } else {
+                    // SAFETY: Open -> Closed is valid when no pending messages
                     self.state = ChannelState::Closed;
                 }
                 // Wake all subscribers with Closed reason
@@ -279,6 +283,7 @@ impl Channel {
     /// Returns subscribers to wake.
     pub fn do_close(&mut self) -> WakeList {
         let subs = self.subscribers.drain();
+        // SAFETY: Any state -> Closed is always valid (terminal state)
         self.state = ChannelState::Closed;
         subs
     }

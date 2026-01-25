@@ -149,6 +149,36 @@ pub trait Pollable {
     fn unsubscribe(&mut self);
 }
 
+// ============================================================================
+// HasSubscriber Trait - Reduces boilerplate for subscriber management
+// ============================================================================
+
+/// Internal trait for objects that have a subscriber field.
+///
+/// This trait reduces boilerplate across the 7 object types that use
+/// the subscriber pattern (Channel, Timer, Process, Port, Console, Klog, Mux).
+///
+/// # Design Note
+/// This trait is pub(crate) because subscriber management is an internal
+/// concern - external code uses the Pollable trait's subscribe/unsubscribe.
+pub(crate) trait HasSubscriber {
+    /// Get mutable reference to the subscriber field
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber>;
+
+    /// Get the current subscriber (provided)
+    fn get_subscriber(&self) -> Option<Subscriber>;
+
+    /// Check if a subscriber is registered (provided)
+    fn has_subscriber(&self) -> bool {
+        self.get_subscriber().is_some()
+    }
+
+    /// Set or clear the subscriber (provided)
+    fn set_subscriber(&mut self, sub: Option<Subscriber>) {
+        *self.subscriber_mut() = sub;
+    }
+}
+
 pub mod types;
 pub mod handle;
 pub mod syscall;
@@ -231,6 +261,14 @@ pub struct ChannelObject {
 }
 
 impl ChannelObject {
+    /// Create a new channel object
+    pub fn new(channel_id: u32) -> Self {
+        Self {
+            channel_id,
+            subscriber: None,
+        }
+    }
+
     /// Get the channel ID
     pub fn channel_id(&self) -> u32 { self.channel_id }
 
@@ -246,25 +284,17 @@ impl ChannelObject {
             || crate::kernel::ipc::channel_is_closed(self.channel_id)
     }
 
-    /// Check if channel has a subscriber
-    pub fn has_subscriber(&self) -> bool { self.subscriber.is_some() }
-
-    /// Get subscriber (for waking)
-    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+    /// Get subscriber (for waking) - delegates to trait
+    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
 }
 
-impl ChannelObject {
-    /// Create a new channel object
-    pub fn new(channel_id: u32) -> Self {
-        Self {
-            channel_id,
-            subscriber: None,
-        }
+impl HasSubscriber for ChannelObject {
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
+        &mut self.subscriber
     }
 
-    /// Set subscriber (internal use)
-    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
-        self.subscriber = sub;
+    fn get_subscriber(&self) -> Option<Subscriber> {
+        self.subscriber
     }
 }
 
@@ -394,8 +424,8 @@ impl TimerObject {
     pub fn deadline(&self) -> u64 { self.deadline }
     /// Get the interval
     pub fn interval(&self) -> u64 { self.interval }
-    /// Get subscriber (for waking)
-    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+    /// Get subscriber (for waking) - delegates to trait
+    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
 
     /// Check if timer is armed
     pub fn is_armed(&self) -> bool {
@@ -461,10 +491,15 @@ impl TimerObject {
             }
         }
     }
+}
 
-    /// Set subscriber (internal use)
-    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
-        self.subscriber = sub;
+impl HasSubscriber for TimerObject {
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
+        &mut self.subscriber
+    }
+
+    fn get_subscriber(&self) -> Option<Subscriber> {
+        self.subscriber
     }
 }
 
@@ -522,17 +557,12 @@ impl ProcessObject {
     pub fn pid(&self) -> TaskId { self.pid }
     /// Get the exit code (if exited)
     pub fn exit_code(&self) -> Option<i32> { self.exit_code }
-    /// Get subscriber (for waking)
-    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+    /// Get subscriber (for waking) - delegates to trait
+    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
 
     /// Set exit code (internal use)
     pub(crate) fn set_exit_code(&mut self, code: Option<i32>) {
         self.exit_code = code;
-    }
-
-    /// Set subscriber (internal use)
-    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
-        self.subscriber = sub;
     }
 
     /// Lazy check if target process has exited
@@ -543,8 +573,7 @@ impl ProcessObject {
         }
 
         use crate::kernel::task;
-        let code = {
-            let sched = task::scheduler();
+        let code = task::with_scheduler(|sched| {
             if let Some(target_slot) = sched.slot_by_pid(self.pid) {
                 if let Some(target) = sched.task(target_slot) {
                     target.state().exit_code()
@@ -555,8 +584,18 @@ impl ProcessObject {
                 // Task not found - was reaped
                 Some(-1)
             }
-        };
+        });
         self.exit_code = code;
+    }
+}
+
+impl HasSubscriber for ProcessObject {
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
+        &mut self.subscriber
+    }
+
+    fn get_subscriber(&self) -> Option<Subscriber> {
+        self.subscriber
     }
 }
 
@@ -574,8 +613,7 @@ impl Pollable for ProcessObject {
         // Lazy check - see if target has exited
         // Note: We can't mutate self here, so do a non-caching check
         use crate::kernel::task;
-        let has_exited = {
-            let sched = task::scheduler();
+        let has_exited = task::with_scheduler(|sched| {
             if let Some(target_slot) = sched.slot_by_pid(self.pid()) {
                 if let Some(target) = sched.task(target_slot) {
                     target.state().exit_code().is_some()
@@ -585,7 +623,7 @@ impl Pollable for ProcessObject {
             } else {
                 true // Slot not found - task was reaped
             }
-        };
+        });
 
         if has_exited {
             PollResult::readable()
@@ -660,12 +698,17 @@ impl PortObject {
         self.name() == other
     }
 
-    /// Get subscriber (for waking)
-    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+    /// Get subscriber (for waking) - delegates to trait
+    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+}
 
-    /// Set subscriber (internal use)
-    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) {
-        self.subscriber = sub;
+impl HasSubscriber for PortObject {
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
+        &mut self.subscriber
+    }
+
+    fn get_subscriber(&self) -> Option<Subscriber> {
+        self.subscriber
     }
 }
 
@@ -793,8 +836,18 @@ impl ConsoleObject {
         }
     }
     pub fn console_type(&self) -> ConsoleType { self.console_type }
-    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
-    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) { self.subscriber = sub; }
+    /// Get subscriber (for waking) - delegates to trait
+    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+}
+
+impl HasSubscriber for ConsoleObject {
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
+        &mut self.subscriber
+    }
+
+    fn get_subscriber(&self) -> Option<Subscriber> {
+        self.subscriber
+    }
 }
 
 impl Pollable for ConsoleObject {
@@ -853,14 +906,49 @@ impl KlogObject {
         Self { read_pos: 0, subscriber: None }
     }
     pub fn read_pos(&self) -> usize { self.read_pos }
-    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
+    /// Get subscriber (for waking) - delegates to trait
+    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
     pub(crate) fn set_read_pos(&mut self, pos: usize) { self.read_pos = pos; }
-    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) { self.subscriber = sub; }
+}
+
+impl HasSubscriber for KlogObject {
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
+        &mut self.subscriber
+    }
+
+    fn get_subscriber(&self) -> Option<Subscriber> {
+        self.subscriber
+    }
+}
+
+impl Pollable for KlogObject {
+    fn poll(&self, filter: u8) -> PollResult {
+        if (filter & poll::READABLE) == 0 {
+            return PollResult::NONE;
+        }
+        // Check if there's unread log data
+        // For now, always report readable (log buffer always has data)
+        PollResult::readable()
+    }
+
+    fn subscribe(&mut self, subscriber: Subscriber) {
+        self.set_subscriber(Some(subscriber));
+    }
+
+    fn unsubscribe(&mut self) {
+        self.set_subscriber(None);
+    }
 }
 
 // ============================================================================
 // Mux Object (multiplexer)
 // ============================================================================
+
+/// Maximum watches per Mux object
+pub const MAX_MUX_WATCHES: usize = 16;
+
+/// Maximum events returned per mux poll
+pub const MAX_MUX_EVENTS: usize = 16;
 
 /// Watch entry for multiplexer
 #[derive(Clone, Copy)]
@@ -883,19 +971,29 @@ pub use abi::MuxEvent;
 
 pub struct MuxObject {
     /// Watched handles
-    watches: [Option<MuxWatch>; 16],
+    watches: [Option<MuxWatch>; MAX_MUX_WATCHES],
     /// Subscriber to wake
     subscriber: Option<Subscriber>,
 }
 
 impl MuxObject {
     pub fn new() -> Self {
-        Self { watches: [None; 16], subscriber: None }
+        Self { watches: [None; MAX_MUX_WATCHES], subscriber: None }
     }
-    pub fn subscriber(&self) -> Option<Subscriber> { self.subscriber }
-    pub fn watches(&self) -> &[Option<MuxWatch>; 16] { &self.watches }
-    pub fn watches_mut(&mut self) -> &mut [Option<MuxWatch>; 16] { &mut self.watches }
-    pub(crate) fn set_subscriber(&mut self, sub: Option<Subscriber>) { self.subscriber = sub; }
+    /// Get subscriber (for waking) - delegates to trait
+    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    pub fn watches(&self) -> &[Option<MuxWatch>; MAX_MUX_WATCHES] { &self.watches }
+    pub fn watches_mut(&mut self) -> &mut [Option<MuxWatch>; MAX_MUX_WATCHES] { &mut self.watches }
+}
+
+impl HasSubscriber for MuxObject {
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
+        &mut self.subscriber
+    }
+
+    fn get_subscriber(&self) -> Option<Subscriber> {
+        self.subscriber
+    }
 }
 
 // ============================================================================
@@ -987,10 +1085,10 @@ pub struct Message {
 }
 
 pub struct MessageQueue {
-    pub messages: [Option<Message>; MAX_QUEUE_DEPTH],
-    pub head: u8,
-    pub tail: u8,
-    pub count: u8,
+    messages: [Option<Message>; MAX_QUEUE_DEPTH],
+    head: u8,
+    tail: u8,
+    count: u8,
 }
 
 impl MessageQueue {
@@ -1021,6 +1119,10 @@ impl MessageQueue {
         self.head = (self.head + 1) % MAX_QUEUE_DEPTH as u8;
         self.count -= 1;
         msg
+    }
+
+    pub fn len(&self) -> usize {
+        self.count as usize
     }
 
     pub fn is_empty(&self) -> bool {

@@ -266,8 +266,7 @@ impl ChannelTable {
     /// Subscribe to events on a channel
     pub fn subscribe(&mut self, id: ChannelId, caller: TaskId, sub: Subscriber, filter: WakeReason) -> Result<(), IpcError> {
         let channel = self.get_mut(id, caller)?;
-        channel.subscribe(sub, filter);
-        Ok(())
+        channel.subscribe(sub, filter).map_err(|_| IpcError::SubscribersFull)
     }
 
     /// Unsubscribe from events on a channel
@@ -361,8 +360,8 @@ impl ChannelTable {
         let channel = self.channels[slot].as_mut()
             .ok_or(IpcError::InvalidChannel { id })?;
 
-        channel.subscribe(Subscriber::simple(task_id), WakeReason::Readable);
-        Ok(())
+        channel.subscribe(Subscriber::simple(task_id), WakeReason::Readable)
+            .map_err(|_| IpcError::SubscribersFull)
     }
 
     /// Unregister a waker for a channel

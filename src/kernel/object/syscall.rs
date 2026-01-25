@@ -18,7 +18,7 @@
 //! | map | Map object to memory |
 //! | close | Release handle |
 
-use super::{Object, ObjectType, Handle, ConsoleType, Pollable};
+use super::{Object, ObjectType, Handle, ConsoleType, Pollable, HasSubscriber};
 use super::types::Error;
 use crate::kernel::task;
 use crate::kernel::uaccess;
@@ -26,6 +26,18 @@ use crate::platform::current::uart;
 use crate::kernel::ipc;
 use crate::kernel::ipc::waker;
 use crate::kernel::shmem;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Get current task's ID. Returns None if no task in current slot.
+fn get_current_task_id() -> Option<u32> {
+    task::with_scheduler(|sched| {
+        let slot = task::current_slot();
+        sched.task(slot).map(|t| t.id)
+    })
+}
 
 // ============================================================================
 // open - Create a new handle
@@ -83,10 +95,7 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
     let handle = Handle::from_raw(handle_raw);
 
     // Get current task ID
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -167,10 +176,7 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
     let handle = Handle::from_raw(handle_raw);
 
     // Get current task ID
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -220,10 +226,7 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
     let _ = flags; // For future use (read-only, etc.)
 
     // Get current task ID
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -329,10 +332,7 @@ fn open_channel(params_ptr: u64, params_len: usize) -> i64 {
     use crate::kernel::object_service::object_service;
 
     // Get current task ID
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -365,10 +365,7 @@ fn open_channel(params_ptr: u64, params_len: usize) -> i64 {
 
 fn open_timer(_params_ptr: u64, _params_len: usize) -> i64 {
     // Get current task ID
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -395,10 +392,7 @@ fn open_process(params_ptr: u64, params_len: usize) -> i64 {
     }
     let target_pid = u32::from_le_bytes(pid_bytes);
 
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -425,10 +419,7 @@ fn open_port(params_ptr: u64, params_len: usize) -> i64 {
     }
 
     // Get current task ID
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -461,10 +452,7 @@ fn open_shmem_create(params_ptr: u64) -> i64 {
     }
     let size = u64::from_le_bytes(size_bytes) as usize;
 
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -486,10 +474,7 @@ fn open_shmem_existing(params_ptr: u64) -> i64 {
     }
     let shmem_id = u32::from_le_bytes(id_bytes);
 
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -523,10 +508,7 @@ fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
     let flags = u32::from_le_bytes([params[8], params[9], params[10], params[11]]);
     let use_high = (flags & 1) != 0;
 
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -561,10 +543,7 @@ fn open_mmio(params_ptr: u64, params_len: usize) -> i64 {
         params[12], params[13], params[14], params[15],
     ]) as usize;
 
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -580,10 +559,7 @@ fn open_mmio(params_ptr: u64, params_len: usize) -> i64 {
 
 fn open_console(console_type: super::ConsoleType) -> i64 {
     // Get current task ID
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -598,10 +574,7 @@ fn open_console(console_type: super::ConsoleType) -> i64 {
 }
 
 fn open_klog(_params_ptr: u64, _params_len: usize) -> i64 {
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -616,10 +589,7 @@ fn open_klog(_params_ptr: u64, _params_len: usize) -> i64 {
 }
 
 fn open_mux(_params_ptr: u64, _params_len: usize) -> i64 {
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -648,10 +618,7 @@ fn open_pci_bus(params_ptr: u64, params_len: usize) -> i64 {
         return Error::InvalidArg.to_errno();
     };
 
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -691,10 +658,7 @@ fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
         return Error::NotFound.to_errno();
     }
 
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -767,10 +731,7 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
 }
 
 fn open_bus_list(_params_ptr: u64, _params_len: usize) -> i64 {
-    let task_id = task::with_scheduler(|sched| {
-        let slot = task::current_slot();
-        sched.task(slot).map(|t| t.id)
-    });
+    let task_id = get_current_task_id();
 
     let Some(task_id) = task_id else {
         return Error::BadHandle.to_errno();
@@ -1111,18 +1072,18 @@ fn read_pci_bus(p: &mut super::PciBusObject, buf_ptr: u64, buf_len: usize) -> i6
     let count = get_device_list(&mut temp[..max.min(16)]);
 
     // Filter by BDF if needed
+    // NOTE: BDF filtering requires DeviceInfo to have a BDF field or
+    // a separate PCIe-specific enumeration API. Currently, all devices
+    // pass through regardless of filter. This is acceptable since:
+    // - bdf_filter=0 is the common case (enumerate all)
+    // - Userspace can filter results itself if needed
     let bdf_filter = p.bdf_filter();
     let filtered_count = if bdf_filter == 0 {
         count
     } else {
-        // Filter devices by BDF prefix
-        let mut j = 0;
-        for i in 0..count {
-            // TODO: implement BDF filtering
-            temp[j] = temp[i];
-            j += 1;
-        }
-        j
+        // BDF filtering not implemented - would need DeviceInfo.bdf field
+        // For now, just copy all devices and let userspace filter
+        count
     };
 
     // Copy to userspace
@@ -1280,7 +1241,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         crate::kdebug!("mux", "poll_start"; task_id = task_id);
 
         // Phase 1: Collect watch list and channel IDs from ObjectService tables
-        let watches: [(Option<super::MuxWatch>, u32); 16] = {
+        let watches: [(Option<super::MuxWatch>, u32); super::MAX_MUX_WATCHES] = {
             let result = object_service().with_table(task_id, |table| {
                 let Some(mux_entry) = table.get(mux_handle) else {
                     return Err(Error::BadHandle);
@@ -1289,8 +1250,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     return Err(Error::BadHandle);
                 };
 
-                let mut w = [(None, 0u32); 16];
-                for i in 0..16 {
+                let mut w = [(None, 0u32); super::MAX_MUX_WATCHES];
+                for i in 0..super::MAX_MUX_WATCHES {
                     if let Some(watch) = mux.watches[i] {
                         let watched_handle = Handle::from_raw(watch.handle);
                         let channel_id = if let Some(entry) = table.get(watched_handle) {
@@ -1324,7 +1285,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             // Subscribe to mux itself
             if let Some(mux_entry) = table.get_mut(mux_handle) {
                 if let Object::Mux(ref mut mux) = mux_entry.object {
-                    mux.subscriber = Some(subscriber);
+                    mux.set_subscriber(Some(subscriber));
                 }
             }
 
@@ -1346,20 +1307,20 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                                 }
                             }
                         }
-                        Object::Port(p) => { p.subscriber = Some(subscriber); }
+                        Object::Port(p) => { p.set_subscriber(Some(subscriber)); }
                         Object::Timer(t) => {
-                            t.subscriber = Some(subscriber);
+                            t.set_subscriber(Some(subscriber));
                             if t.deadline() > 0 && t.deadline() < earliest_deadline {
                                 earliest_deadline = t.deadline();
                             }
                         }
                         Object::Console(c) => {
-                            c.subscriber = Some(subscriber);
-                            if matches!(c.console_type, ConsoleType::Stdin) {
+                            c.set_subscriber(Some(subscriber));
+                            if matches!(c.console_type(), ConsoleType::Stdin) {
                                 uart::block_for_input(task_id);
                             }
                         }
-                        Object::Process(p) => { p.subscriber = Some(subscriber); }
+                        Object::Process(p) => { p.set_subscriber(Some(subscriber)); }
                         _ => {}
                     }
                 }
@@ -1367,7 +1328,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
 
             // Now poll for ready events (still holding the lock)
             // We use mutable access so we can transition timer state when fired
-            let mut events = [super::MuxEvent::empty(); 16];
+            let mut events = [super::MuxEvent::empty(); super::MAX_MUX_EVENTS];
             let mut event_count = 0usize;
             let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
             let current_tick = crate::platform::current::timer::counter();

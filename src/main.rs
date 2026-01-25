@@ -754,7 +754,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
             // resume its kernel execution. Fall through to idle which will properly
             // context_switch to it.
             let needs_context_switch = sched.task(next_slot)
-                .map(|t| t.context_saved)
+                .map(|t| t.needs_context_restore)
                 .unwrap_or(false);
 
             if needs_context_switch {
