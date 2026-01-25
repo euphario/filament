@@ -168,6 +168,8 @@ pub struct Consoled {
     stdin_handle: ObjHandle,
     cols: u16,
     rows: u16,
+    /// Channel to devd (announces we're ready)
+    devd_channel: Option<Channel>,
 }
 
 impl Consoled {
@@ -180,6 +182,7 @@ impl Consoled {
             stdin_handle: Handle::INVALID,
             cols: 80,
             rows: 24,
+            devd_channel: None,
         }
     }
 
@@ -226,6 +229,15 @@ impl Consoled {
 
         self.port = Some(port);
         self.mux = Some(mux);
+
+        // Announce ready to devd
+        if let Ok(devd_channel) = Channel::connect(b"devd:") {
+            clog!("connected to devd");
+            // Keep the channel open - devd uses it to know we're alive
+            self.devd_channel = Some(devd_channel);
+        } else {
+            clog!("devd connect failed (not fatal)");
+        }
 
         Ok(())
     }

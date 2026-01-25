@@ -141,6 +141,15 @@ impl Port {
     ///
     /// Returns WouldBlock if connection limit is reached.
     pub fn accept(&mut self) -> SysResult<Channel> {
+        let (channel, _pid) = self.accept_with_pid()?;
+        Ok(channel)
+    }
+
+    /// Accept a connection and return the client's PID
+    ///
+    /// Returns (Channel, client_pid) on success.
+    /// Returns WouldBlock if connection limit is reached.
+    pub fn accept_with_pid(&mut self) -> SysResult<(Channel, u32)> {
         if self.state == PortState::Closed {
             return Err(SysError::BadFd);
         }
@@ -150,17 +159,21 @@ impl Port {
             return Err(SysError::WouldBlock);
         }
 
-        // Kernel returns [handle: u32] (4 bytes) or [handle: u32, client_pid: u32] (8 bytes)
+        // Kernel returns [handle: u32, client_pid: u32] (8 bytes)
         let mut buf = [0u8; 8];
         let n = read(self.handle, &mut buf)?;
         if n >= 4 {
             let handle = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-            // buf[4..8] contains client_pid if n >= 8
+            let client_pid = if n >= 8 {
+                u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])
+            } else {
+                0 // Unknown PID
+            };
             self.active_connections = self.active_connections.saturating_add(1);
-            Ok(Channel {
+            Ok((Channel {
                 handle: Handle(handle),
                 state: ChannelState::Open,
-            })
+            }, client_pid))
         } else {
             Err(SysError::InvalidArgument)
         }
