@@ -217,8 +217,8 @@ impl Consoled {
         // Add stdin to mux (readable)
         mux.add(self.stdin_handle, MuxFilter::Readable)?;
 
-        // Register console port
-        let port = Port::register(b"console:")?;
+        // Register console port (limit: 1 shell connection)
+        let port = Port::with_limit(b"console:", 1)?;
         clog!("port handle={}", port.handle().0);
 
         // Add port to mux (readable = accept pending)
@@ -342,7 +342,7 @@ impl Consoled {
             return; // Already have a shell
         }
 
-        if let Some(port) = &self.port {
+        if let Some(port) = &mut self.port {
             match port.accept() {
                 Ok(channel) => {
                     clog!("shell connected");
@@ -380,6 +380,11 @@ impl Consoled {
                 let _ = mux.remove(shell.handle());
             }
             // shell is dropped here, closing the handle
+
+            // Notify port that connection is closed (allows new connections)
+            if let Some(port) = &mut self.port {
+                port.connection_closed();
+            }
         }
         self.state = ConsoleState::WaitingForShell;
     }

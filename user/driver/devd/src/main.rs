@@ -85,6 +85,10 @@ const MAX_PORT_NAME: usize = 32;
 const MAX_RESTARTS: u8 = 3;
 const INITIAL_BACKOFF_MS: u32 = 1000;
 const MAX_BACKOFF_MS: u32 = 30000;
+/// Time before Failed services are retried (5 minutes)
+const FAILED_RETRY_MS: u64 = 5 * 60 * 1000;
+/// Time Ready before restart count resets (1 minute)
+const STABLE_READY_MS: u64 = 60 * 1000;
 
 // =============================================================================
 // Service State Machine
@@ -94,11 +98,12 @@ const MAX_BACKOFF_MS: u32 = 30000;
 ///
 /// State transitions:
 ///   Pending ──[deps satisfied]──► Starting
-///   Starting ──[connected to devd:]──► Ready
+///   Starting ──[grace period elapsed]──► Ready
 ///   Ready ──[exit(0)]──► Stopped
 ///   Ready ──[exit(!=0)]──► Crashed
-///   Crashed ──[restart, restarts < MAX]──► Starting
+///   Crashed ──[backoff elapsed, restarts < MAX]──► Starting
 ///   Crashed ──[restarts >= MAX]──► Failed
+///   Failed ──[FAILED_RETRY_MS elapsed, auto_restart]──► Pending (recovery)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceState {
     /// Waiting for dependencies to be satisfied
@@ -273,6 +278,8 @@ pub struct Service {
     backoff_ms: u32,
     /// Last state change timestamp
     last_change: u64,
+    /// Total restarts (for monitoring, not reset)
+    total_restarts: u32,
 }
 
 impl Service {
@@ -288,6 +295,7 @@ impl Service {
             parent: None,
             backoff_ms: INITIAL_BACKOFF_MS,
             last_change: 0,
+            total_restarts: 0,
         }
     }
 
@@ -375,19 +383,15 @@ impl Devd {
     pub fn init(&mut self) -> SysResult<()> {
         // Create event loop
         let mut events = EventLoop::new()?;
-        dlog!("event_loop created");
 
         // Register our port
         let port = Port::register(b"devd:")?;
-        dlog!("port devd: registered handle={}", port.handle().0);
-
         events.watch(port.handle())?;
 
-        // Create maintenance timer
+        // Create maintenance timer (1 second interval)
         let mut timer = Timer::new()?;
-        timer.set(1_000_000_000)?; // 1 second
+        timer.set(1_000_000_000)?;
         events.watch(timer.handle())?;
-        dlog!("timer armed");
 
         self.port = Some(port);
         self.timer = Some(timer);
@@ -406,7 +410,7 @@ impl Devd {
         // Create service entries for all defined services
         for (i, def) in SERVICE_DEFS.iter().enumerate() {
             if self.service_count >= MAX_SERVICES {
-                derror!("too many services");
+                derror!("too many services limit={}", MAX_SERVICES);
                 break;
             }
 
@@ -426,29 +430,20 @@ impl Devd {
                 }
             }
 
-            let idx = self.service_count;
-            self.services[idx] = Some(service);
+            self.services[self.service_count] = Some(service);
             self.service_count += 1;
-
-            dlog!("service {} registered idx={}", def.binary, idx);
         }
 
-        dlog!("linking children to parents");
         // Link children to parents
         for i in 0..self.service_count {
-            dlog!("  link check i={}", i);
             if let Some(service) = &self.services[i] {
                 if let Some(parent_idx) = service.parent {
-                    dlog!("  service {} has parent {}", i, parent_idx);
                     if let Some(parent) = &mut self.services[parent_idx as usize] {
-                        dlog!("  adding child {} to parent {}", i, parent_idx);
                         parent.add_child(i as u8);
-                        dlog!("  child added");
                     }
                 }
             }
         }
-        dlog!("init_services done");
     }
 
     // =========================================================================
@@ -531,22 +526,15 @@ impl Devd {
     }
 
     fn check_pending_services(&mut self) {
-        dlog!("check_pending_services: count={}", self.service_count);
         let now = self.now_ms;
         for i in 0..self.service_count {
             if let Some(service) = &self.services[i] {
-                let is_pending = service.state == ServiceState::Pending;
-                let deps_ok = self.deps_satisfied(service);
-                dlog!("  service[{}]: pending={} deps_ok={}", i, is_pending, deps_ok);
-                if is_pending && deps_ok {
-                    let name = service.name();
-                    dlog!("deps satisfied for {}", name);
+                if service.state == ServiceState::Pending && self.deps_satisfied(service) {
                     // Borrow ends here, spawn needs &mut self
                     self.spawn_service(i, now);
                 }
             }
         }
-        dlog!("check_pending_services done");
     }
 
     // =========================================================================
@@ -554,6 +542,11 @@ impl Devd {
     // =========================================================================
 
     fn spawn_service(&mut self, idx: usize, now: u64) {
+        // Bounds check
+        if idx >= MAX_SERVICES {
+            return;
+        }
+
         // Get binary name and spawn
         let binary = {
             let service = match &self.services[idx] {
@@ -627,6 +620,11 @@ impl Devd {
     // =========================================================================
 
     fn handle_service_exit(&mut self, idx: usize, code: i32) {
+        // Bounds check
+        if idx >= MAX_SERVICES {
+            return;
+        }
+
         let now = self.now_ms;
 
         // First pass: collect info and update service state
@@ -658,11 +656,11 @@ impl Devd {
             };
 
             if code == 0 {
-                dlog!("{} exited cleanly", name);
                 service.transition(ServiceState::Stopped { code: 0 }, now);
                 (name, port_names, false, auto_restart)
             } else {
-                derror!("{} crashed code={}", name, code);
+                // Track total restarts for monitoring
+                service.total_restarts = service.total_restarts.saturating_add(1);
 
                 let restarts = match service.state {
                     ServiceState::Crashed { restarts, .. } => restarts + 1,
@@ -671,12 +669,11 @@ impl Devd {
 
                 if restarts >= MAX_RESTARTS || !auto_restart {
                     service.transition(ServiceState::Failed { code }, now);
-                    derror!("{} failed permanently", name);
+                    derror!("{} failed code={} restarts={}", name, code, service.total_restarts);
                     (name, port_names, false, auto_restart)
                 } else {
                     service.transition(ServiceState::Crashed { code, restarts }, now);
                     service.backoff_ms = (service.backoff_ms * 2).min(MAX_BACKOFF_MS);
-                    dlog!("{} will restart in {}ms", name, service.backoff_ms);
                     (name, port_names, true, auto_restart)
                 }
             }
@@ -694,6 +691,11 @@ impl Devd {
     }
 
     fn handle_service_ready(&mut self, idx: usize) {
+        // Bounds check
+        if idx >= MAX_SERVICES {
+            return;
+        }
+
         let now = self.now_ms;
 
         // First pass: update service state and collect port names
@@ -729,6 +731,11 @@ impl Devd {
     // =========================================================================
 
     fn prune_children(&mut self, parent_idx: usize) {
+        // Bounds check
+        if parent_idx >= MAX_SERVICES {
+            return;
+        }
+
         // Collect children to kill (can't borrow mutably while iterating)
         let mut to_kill = [None; MAX_CHILDREN_PER_SERVICE];
         let mut kill_count = 0;
@@ -755,6 +762,11 @@ impl Devd {
     }
 
     fn kill_service(&mut self, idx: usize) {
+        // Bounds check
+        if idx >= MAX_SERVICES {
+            return;
+        }
+
         let now = self.now_ms;
 
         // First pass: check state, collect info, kill process, cleanup watcher
@@ -850,10 +862,9 @@ impl Devd {
 
         for i in 0..self.service_count {
             if let Some(service) = &self.services[i] {
-                if let ServiceState::Crashed { restarts, .. } = service.state {
+                if let ServiceState::Crashed { .. } = service.state {
                     let elapsed = now.saturating_sub(service.last_change);
                     if elapsed >= service.backoff_ms as u64 {
-                        dlog!("{} restarting (attempt {})", service.name(), restarts + 1);
                         to_restart[restart_count] = Some(i);
                         restart_count += 1;
                     }
@@ -864,6 +875,56 @@ impl Devd {
         // Now spawn (borrows are released)
         for idx in to_restart.iter().flatten() {
             self.spawn_service(*idx, now);
+        }
+    }
+
+    /// Check Failed services for retry after FAILED_RETRY_MS
+    fn check_failed_services(&mut self) {
+        let now = self.now_ms;
+
+        // Collect indices of services that should be retried
+        let mut to_retry = [None; MAX_SERVICES];
+        let mut retry_count = 0;
+
+        for i in 0..self.service_count {
+            if let Some(service) = &self.services[i] {
+                if let ServiceState::Failed { .. } = service.state {
+                    if service.def().auto_restart {
+                        let elapsed = now.saturating_sub(service.last_change);
+                        if elapsed >= FAILED_RETRY_MS {
+                            to_retry[retry_count] = Some(i);
+                            retry_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Transition to Pending and reset backoff
+        for idx in to_retry.iter().flatten() {
+            if let Some(service) = &mut self.services[*idx] {
+                let name = service.name();
+                service.backoff_ms = INITIAL_BACKOFF_MS;
+                service.transition(ServiceState::Pending, now);
+                dlog!("{} retry after failed (total_restarts={})", name, service.total_restarts);
+            }
+        }
+    }
+
+    /// Reset restart count for services that have been Ready for STABLE_READY_MS
+    fn check_stable_services(&mut self) {
+        let now = self.now_ms;
+
+        for i in 0..self.service_count {
+            if let Some(service) = &mut self.services[i] {
+                if service.state == ServiceState::Ready {
+                    let elapsed = now.saturating_sub(service.last_change);
+                    if elapsed >= STABLE_READY_MS && service.backoff_ms != INITIAL_BACKOFF_MS {
+                        // Service has been stable - reset backoff
+                        service.backoff_ms = INITIAL_BACKOFF_MS;
+                    }
+                }
+            }
         }
     }
 
@@ -884,22 +945,27 @@ impl Devd {
         // Check for Starting services that should be Ready
         self.check_starting_services();
 
-        // Check for services needing restart
+        // Check for services needing restart (Crashed -> Starting)
         self.check_restarts();
 
-        // Check for pending services
+        // Check for Failed services that should be retried (Failed -> Pending)
+        self.check_failed_services();
+
+        // Reset backoff for stable Ready services
+        self.check_stable_services();
+
+        // Check for pending services (Pending -> Starting)
         self.check_pending_services();
     }
 
     fn handle_port_event(&mut self) {
-        let port = match &self.port {
+        let port = match &mut self.port {
             Some(p) => p,
             None => return,
         };
 
         match port.accept() {
             Ok(channel) => {
-                dlog!("client connected");
                 // TODO: Handle client messages (service queries, etc.)
                 // For now, check if it's a service announcing ready
                 drop(channel);
@@ -908,27 +974,33 @@ impl Devd {
                 // Spurious wake, ignore
             }
             Err(e) => {
-                derror!("accept failed err={:?}", e);
+                derror!("devd: accept failed err={:?}", e);
             }
         }
     }
 
     fn handle_process_exit(&mut self, handle: ObjHandle) {
         // Find which service this watcher belongs to
+        let mut found_idx = None;
         for i in 0..self.service_count {
             if let Some(service) = &self.services[i] {
                 if let Some(watcher) = &service.watcher {
                     if watcher.handle() == handle {
-                        // Get exit code
-                        let code = {
-                            let s = self.services[i].as_mut().unwrap();
-                            s.watcher.as_mut().map(|w| w.wait().unwrap_or(-1)).unwrap_or(-1)
-                        };
-                        self.handle_service_exit(i, code);
-                        return;
+                        found_idx = Some(i);
+                        break;
                     }
                 }
             }
+        }
+
+        // Get exit code and handle exit (separate borrow)
+        if let Some(idx) = found_idx {
+            let code = self.services[idx]
+                .as_mut()
+                .and_then(|s| s.watcher.as_mut())
+                .map(|w| w.wait().unwrap_or(-1))
+                .unwrap_or(-1);
+            self.handle_service_exit(idx, code);
         }
     }
 
@@ -937,8 +1009,6 @@ impl Devd {
     // =========================================================================
 
     pub fn run(&mut self) -> ! {
-        derror!("RUN CALLED");
-
         // Initial time
         self.now_ms = syscall::gettime() / 1_000_000;
 
@@ -987,18 +1057,17 @@ static mut DEVD: Devd = Devd::new();
 #[unsafe(no_mangle)]
 #[allow(static_mut_refs)]  // Required for no_std global state
 fn main() -> ! {
-    derror!("BOOT v7.0-services");
     userlib::io::disable_stdout();
 
     let devd = unsafe { &mut DEVD };
 
     // Initialize
     if let Err(e) = devd.init() {
-        derror!("init failed err={:?}", e);
+        derror!("devd: init failed err={:?}", e);
         syscall::exit(1);
     }
 
-    derror!("init complete");
+    dlog!("devd: started services={}", devd.service_count);
 
     // Run main loop
     devd.run()

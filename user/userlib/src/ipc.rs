@@ -92,29 +92,71 @@ pub enum PortState {
 pub struct Port {
     handle: ObjHandle,
     state: PortState,
+    /// Maximum active connections (0 = unlimited)
+    max_connections: u8,
+    /// Current active connection count
+    active_connections: u8,
 }
 
 impl Port {
-    /// Register a named port
+    /// Register a named port with unlimited connections
     pub fn register(name: &[u8]) -> SysResult<Self> {
         let handle = open(ObjectType::Port, name)?;
-        Ok(Self { handle, state: PortState::Listening })
+        Ok(Self {
+            handle,
+            state: PortState::Listening,
+            max_connections: 0,
+            active_connections: 0,
+        })
+    }
+
+    /// Register a named port with a connection limit
+    ///
+    /// When active connections reach the limit, `accept()` returns WouldBlock.
+    /// Caller must call `connection_closed()` when a channel closes to decrement
+    /// the counter and allow new connections.
+    pub fn with_limit(name: &[u8], max_connections: u8) -> SysResult<Self> {
+        let handle = open(ObjectType::Port, name)?;
+        Ok(Self {
+            handle,
+            state: PortState::Listening,
+            max_connections,
+            active_connections: 0,
+        })
     }
 
     pub fn handle(&self) -> ObjHandle { self.handle }
     pub fn state(&self) -> PortState { self.state }
+    pub fn active_connections(&self) -> u8 { self.active_connections }
+
+    /// Notify that a connection was closed
+    ///
+    /// Must be called when a channel accepted from this port is closed,
+    /// to allow new connections when a limit is set.
+    pub fn connection_closed(&mut self) {
+        self.active_connections = self.active_connections.saturating_sub(1);
+    }
 
     /// Accept a connection (blocking)
-    pub fn accept(&self) -> SysResult<Channel> {
+    ///
+    /// Returns WouldBlock if connection limit is reached.
+    pub fn accept(&mut self) -> SysResult<Channel> {
         if self.state == PortState::Closed {
             return Err(SysError::BadFd);
         }
+
+        // Check connection limit
+        if self.max_connections > 0 && self.active_connections >= self.max_connections {
+            return Err(SysError::WouldBlock);
+        }
+
         // Kernel returns [handle: u32] (4 bytes) or [handle: u32, client_pid: u32] (8 bytes)
         let mut buf = [0u8; 8];
         let n = read(self.handle, &mut buf)?;
         if n >= 4 {
             let handle = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
             // buf[4..8] contains client_pid if n >= 8
+            self.active_connections = self.active_connections.saturating_add(1);
             Ok(Channel {
                 handle: Handle(handle),
                 state: ChannelState::Open,
