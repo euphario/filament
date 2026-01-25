@@ -609,6 +609,10 @@ fn spawn_from_elf_internal(
         }
     }
 
+    // Drop scheduler lock BEFORE logging to avoid deadlock
+    // (kinfo! -> broadcast_event -> scheduler() would deadlock)
+    drop(sched);
+
     kinfo!("elf", "spawn_ok"; name = name, pid = task_id as u64, entry = crate::klog::hex64(elf_info.entry), parent = parent_id as u64);
 
     Ok((task_id, slot))
