@@ -1050,6 +1050,15 @@ pub fn scheduler() -> super::lock::SpinLockGuard<'static, Scheduler> {
     SCHEDULER.lock()
 }
 
+/// Try to get exclusive access to the scheduler without blocking.
+///
+/// Returns None if the scheduler lock is already held.
+/// Useful for preventing deadlock when logging inside scheduler operations.
+#[inline]
+pub fn try_scheduler() -> Option<super::lock::SpinLockGuard<'static, Scheduler>> {
+    SCHEDULER.try_lock()
+}
+
 /// Execute a closure with exclusive access to the scheduler.
 ///
 /// This is the preferred pattern for most operations:

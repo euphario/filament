@@ -690,25 +690,35 @@ pub fn deliver_event_to_task(target_pid: u32, event: Event) -> bool {
 /// may want to receive the notification.
 ///
 /// Returns the number of tasks that received the event.
+///
+/// # Deadlock Prevention
+///
+/// Uses try_lock() instead of lock() because this function is called from
+/// LOG_RING.write() during logging. If the scheduler lock is already held
+/// (e.g., during spawn or other scheduler operations that log), we skip
+/// the broadcast rather than deadlock. The log is still written; tasks
+/// just won't be immediately woken (they'll see it on their next poll).
 pub fn broadcast_event(event: Event) -> usize {
-    // Can be called from IRQ context or with IRQs disabled
-    let mut delivered = 0;
+    // Use try_lock to prevent deadlock when logging inside scheduler lock
+    let Some(mut sched) = super::task::try_scheduler() else {
+        // Scheduler lock held - skip broadcast to prevent deadlock
+        // Event is still logged, just not broadcast to waiting tasks
+        return 0;
+    };
 
-    unsafe {
-        let mut sched = super::task::scheduler();
-        for (_slot, task_opt) in sched.iter_tasks_mut() {
-            if let Some(task) = task_opt {
-                // Check if task is subscribed to this event type
-                if task.event_queue.is_subscribed(&event) {
-                    if task.event_queue.push(event) {
-                        // Wake task if blocked
-                        if task.is_blocked() {
-                            crate::transition_or_log!(task, wake);
-                            // Reset liveness - task received event
-                            task.liveness_state = super::liveness::LivenessState::Normal;
-                        }
-                        delivered += 1;
+    let mut delivered = 0;
+    for (_slot, task_opt) in sched.iter_tasks_mut() {
+        if let Some(task) = task_opt {
+            // Check if task is subscribed to this event type
+            if task.event_queue.is_subscribed(&event) {
+                if task.event_queue.push(event) {
+                    // Wake task if blocked
+                    if task.is_blocked() {
+                        crate::transition_or_log!(task, wake);
+                        // Reset liveness - task received event
+                        task.liveness_state = super::liveness::LivenessState::Normal;
                     }
+                    delivered += 1;
                 }
             }
         }
