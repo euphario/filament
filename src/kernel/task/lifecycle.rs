@@ -117,7 +117,7 @@ pub fn kill(
     let slot = sched.slot_by_pid(task_id).ok_or(LifecycleError::NotFound)?;
 
     // Check permission
-    let (parent_id, allowed) = {
+    let (parent_id, allowed, was_init) = {
         let task = sched.tasks[slot].as_ref().ok_or(LifecycleError::NotFound)?;
 
         // Check allowlist
@@ -139,7 +139,7 @@ pub fn kill(
         };
 
         let allowed = is_self || is_parent || in_allowlist || has_cap_kill;
-        (task.parent_id, allowed)
+        (task.parent_id, allowed, task.is_init)
     };
 
     if !allowed {
@@ -168,6 +168,12 @@ pub fn kill(
     // Notify parent
     if parent_id != 0 && parent_id != killer_id {
         notify_parent_of_exit(sched, parent_id, task_id, -9);
+    }
+
+    // If this was the init process (devd), trigger recovery
+    if was_init {
+        kinfo!("lifecycle", "init_killed"; pid = task_id, triggering = "recovery");
+        crate::DEVD_LIVENESS_KILLED.store(true, core::sync::atomic::Ordering::SeqCst);
     }
 
     Ok(())

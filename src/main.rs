@@ -673,8 +673,14 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                     kernel::task::set_current_slot(slot);
                     if let Some(task) = sched.task_mut(slot) {
                         let _ = task.set_running();
+                        // Update globals directly (can't call update_current_task_globals
+                        // here because we already hold the scheduler lock)
+                        let trap_ptr = &mut task.trap_frame as *mut kernel::task::TrapFrame;
+                        kernel::task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                        if let Some(ref addr_space) = task.address_space {
+                            kernel::task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                        }
                     }
-                    kernel::task::update_current_task_globals();
                 }
 
                 print_str_uart("  Recovery complete, continuing.\r\n");
@@ -736,7 +742,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
             let _ = task.set_exiting(exit_code);
         }
 
-        // Notify parent
+        // Notify parent via event queue (legacy path)
         if parent_id != 0 {
             if let Some(parent_slot) = sched.slot_by_pid(parent_id) {
                 if let Some(parent) = sched.task_mut(parent_slot) {
@@ -748,6 +754,21 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 }
             }
         }
+
+        // Release scheduler lock before ObjectService notification
+        drop(sched);
+
+        // Notify parent via ObjectService (for Process watcher handles used by devd)
+        if parent_id != 0 {
+            use kernel::ipc::{waker, traits::WakeReason};
+            let wake_list = kernel::object_service::object_service().notify_child_exit(
+                parent_id, pid, exit_code,
+            );
+            waker::wake(&wake_list, WakeReason::ChildExit);
+        }
+
+        // Reacquire scheduler lock for task switching
+        let mut sched = kernel::task::scheduler();
 
         print_str_uart("  Task terminated, switching to next...\r\n");
 
@@ -794,8 +815,14 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
             kernel::task::set_current_slot(next_slot);
             if let Some(task) = sched.task_mut(next_slot) {
                 let _ = task.set_running();
+                // Update globals directly (can't call update_current_task_globals
+                // here because we already hold the scheduler lock)
+                let trap_ptr = &mut task.trap_frame as *mut kernel::task::TrapFrame;
+                kernel::task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                if let Some(ref addr_space) = task.address_space {
+                    kernel::task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                }
             }
-            kernel::task::update_current_task_globals();
             // Return to assembly which will eret to next task
         } else {
             print_str_uart("  No more tasks - halting.\r\n");
@@ -877,6 +904,15 @@ pub static DEVD_LIVENESS_KILLED: core::sync::atomic::AtomicBool =
 /// Recover from devd failure (liveness timeout or other critical failure)
 /// This kills all processes, resets buses, and respawns devd
 #[no_mangle]
+/// Recover from devd failure by resetting system state and respawning devd.
+///
+/// This follows the same pattern as initial boot:
+/// 1. Kill all tasks (except idle)
+/// 2. Reset buses to Safe state
+/// 3. Spawn devd in Ready state
+/// 4. Request reschedule - scheduler will pick up devd naturally
+///
+/// We don't enter devd directly - we let the normal scheduler handle it.
 pub extern "C" fn recover_devd() {
     use core::sync::atomic::Ordering;
 
@@ -885,12 +921,10 @@ pub extern "C" fn recover_devd() {
         return;
     }
 
-    print_str_uart("\r\n=== DEVD LIVENESS TIMEOUT ===\r\n");
-    print_str_uart("  devd failed to respond to liveness probe\r\n");
+    print_str_uart("\r\n=== DEVD RECOVERY ===\r\n");
     print_str_uart("  Attempting recovery...\r\n");
 
     // Step 1: Kill all tasks and free slots immediately
-    // (Safe because we're on exception/interrupt stack, not any task's stack)
     print_str_uart("  Killing all tasks...\r\n");
     unsafe {
         let mut sched = kernel::task::scheduler();
@@ -898,54 +932,54 @@ pub extern "C" fn recover_devd() {
         for slot_idx in 1..kernel::task::MAX_TASKS {
             if let Some(task) = sched.task(slot_idx) {
                 let pid = task.id;
-                if slot_idx != 0 {  // Extra safety: skip idle (slot 0)
-                    // Cleanup resources
-                    kernel::bus::process_cleanup(pid);
-                    kernel::shmem::process_cleanup(pid);
-                    kernel::irq::process_cleanup(pid);
-                    kernel::pci::release_all_devices(pid);
-                    let port_wake = kernel::ipc::port_cleanup_task(pid);
-                    kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
-                    let ipc_wake = kernel::ipc::process_cleanup(pid);
-                    kernel::ipc::waker::wake(&ipc_wake, kernel::ipc::WakeReason::Closed);
+                // Cleanup resources
+                kernel::bus::process_cleanup(pid);
+                kernel::shmem::process_cleanup(pid);
+                kernel::irq::process_cleanup(pid);
+                kernel::pci::release_all_devices(pid);
+                let port_wake = kernel::ipc::port_cleanup_task(pid);
+                kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
+                let ipc_wake = kernel::ipc::process_cleanup(pid);
+                kernel::ipc::waker::wake(&ipc_wake, kernel::ipc::WakeReason::Closed);
 
-                    // Free slot immediately (bump generation to invalidate stale PIDs)
-                    sched.bump_generation(slot_idx);
-                    sched.clear_slot(slot_idx);
-                }
+                // Clean up ObjectService tables
+                kernel::object_service::object_service().remove_task_table(pid);
+
+                // Free slot (bump generation to invalidate stale PIDs)
+                sched.bump_generation(slot_idx);
+                sched.clear_slot(slot_idx);
             }
         }
     }
 
-    // Step 2: Respawn devd
-    // (Buses already reset to Safe by process_cleanup above)
+    // Step 2: Reset all buses to Safe state
+    print_str_uart("  Resetting buses to Safe...\r\n");
+    kernel::bus::reset_all_buses();
+
+    // Step 3: Respawn devd - same as boot
     print_str_uart("  Respawning devd...\r\n");
     match elf::spawn_from_path("bin/devd") {
         Ok((new_pid, slot)) => {
-            print_str_uart("  devd restarted as PID ");
+            print_str_uart("  devd spawned as PID ");
             print_hex_uart(new_pid as u64);
+            print_str_uart(" slot ");
+            print_hex_uart(slot as u64);
             print_str_uart("\r\n");
 
-            // Give devd ALL capabilities, high priority, and mark as init
+            // Configure devd (same as boot)
             unsafe {
                 if let Some(task) = kernel::task::scheduler().task_mut(slot) {
                     task.set_capabilities(kernel::caps::Capabilities::ALL);
-                    task.set_priority(kernel::task::Priority::High);  // devd is critical
-                    task.is_init = true;  // Mark as init for heartbeat watchdog
+                    task.set_priority(kernel::task::Priority::High);
+                    task.is_init = true;
                 }
             }
 
-            // Schedule devd
-            unsafe {
-                let mut sched = kernel::task::scheduler();
-                kernel::task::set_current_slot(slot);
-                if let Some(task) = sched.task_mut(slot) {
-                    let _ = task.set_running();
-                }
-                kernel::task::update_current_task_globals();
-            }
+            // Step 4: Request reschedule - scheduler will pick up devd
+            // The task is in Ready state, scheduler will switch to it
+            crate::arch::aarch64::sync::cpu_flags().set_need_resched();
 
-            print_str_uart("  Recovery complete.\r\n");
+            print_str_uart("  Recovery complete, scheduler will pick up devd.\r\n");
             DEVD_RECOVERY_IN_PROGRESS.store(false, Ordering::SeqCst);
         }
         Err(e) => {

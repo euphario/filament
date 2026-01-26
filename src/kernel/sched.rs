@@ -150,14 +150,22 @@ pub fn reschedule() -> bool {
                     CURRENT_TTBR0.store(addr_space.get_ttbr0(), Ordering::Release);
                 }
             }
-            SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
+            // Only set flag for user tasks (not idle) - this tells IRQ handler
+            // to use user return path instead of kernel return path
+            if next_slot != IDLE_SLOT {
+                SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
+            }
             return true;
         }
 
         // Need full context switch - extract everything we need
         let from_ctx = match sched.task_mut(caller_slot) {
             Some(t) => {
-                t.needs_context_restore = true;
+                // Only mark for restore if task is alive
+                // Terminated tasks (Evicting, Exiting, Dying, Dead) should never be restored
+                if !t.is_terminated() {
+                    t.needs_context_restore = true;
+                }
                 &mut t.context as *mut task::CpuContext
             }
             None => return false,
@@ -180,6 +188,16 @@ pub fn reschedule() -> bool {
 
         // Update per-CPU slot before releasing lock
         set_current_slot(next_slot);
+
+        // Debug: Log context values before context switch
+        let from_x30 = unsafe { (*from_ctx).x30 };
+        let to_x30 = unsafe { (*to_ctx).x30 };
+        kdebug!("sched", "context_switch_prep";
+            from_slot = caller_slot as u64,
+            to_slot = next_slot as u64,
+            from_x30 = from_x30,
+            to_x30 = to_x30
+        );
 
         Some(SwitchDecision {
             from_slot: caller_slot,
@@ -219,7 +237,35 @@ pub fn reschedule() -> bool {
 
     // Update globals
     CURRENT_TRAP_FRAME.store(decision.to_trap_frame, Ordering::Release);
-    SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
+    // Only set flag for user tasks (not idle) - this tells IRQ handler
+    // to use user return path instead of kernel return path
+    if decision.to_slot != IDLE_SLOT {
+        SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
+    }
+
+    // SAFETY CHECK: Verify target context has valid x30 (return address)
+    // A context with x30=0 would cause an instruction abort at address 0
+    let to_x30 = unsafe { (*decision.to_ctx).x30 };
+    if to_x30 == 0 {
+        kerror!("sched", "switch_to_null_x30";
+            from_slot = decision.from_slot as u64,
+            to_slot = decision.to_slot as u64,
+            to_sp = unsafe { (*decision.to_ctx).sp }
+        );
+        // Don't switch to a task with null return address - this would crash
+        // Instead, mark it for eviction and return without switching
+        {
+            let mut sched = task::scheduler();
+            if let Some(task) = sched.task_mut(decision.to_slot) {
+                crate::kerror!("sched", "evicting_corrupt_task";
+                    slot = decision.to_slot as u64,
+                    pid = task.id as u64
+                );
+                let _ = task.evict(task::EvictionReason::StateCorruption);
+            }
+        }
+        return false;
+    }
 
     // Do context switch - returns when switched BACK to us
     unsafe {
@@ -231,6 +277,13 @@ pub fn reschedule() -> bool {
     // ========================================================================
     // We've been switched back to from_slot
     drop(_irq_guard);
+
+    // CRITICAL: Clear SYSCALL_SWITCHED_TASK because we're returning to our
+    // original context (from_slot), not a new task. The flag was set when we
+    // originally switched away, but now we're coming BACK. If we don't clear it,
+    // irq_from_kernel would incorrectly use irq_kernel_to_user path which would
+    // ERET to from_slot's trap_frame (which could be idle with ELR=0).
+    SYSCALL_SWITCHED_TASK.store(0, Ordering::Release);
 
     {
         let mut sched = task::scheduler();
@@ -273,11 +326,20 @@ pub fn reschedule() -> bool {
 
 /// Wake a blocked task by PID.
 ///
+/// Uses try_scheduler() to avoid deadlock when called from contexts that
+/// already hold the scheduler lock (e.g., cleanup paths, reap_terminated).
+/// If the lock is held, defers the wake via request_wake().
+///
 /// # Returns
-/// true if task was woken, false if not found or not blocked.
+/// true if task was woken (or wake was deferred), false if task not found.
 pub fn wake(pid: u32) -> bool {
-    let mut sched = task::scheduler();
-    sched.wake_by_pid(pid)
+    if let Some(mut sched) = task::try_scheduler() {
+        sched.wake_by_pid(pid)
+    } else {
+        // Lock held - defer the wake
+        crate::arch::aarch64::sync::cpu_flags().request_wake(pid);
+        true // Wake will be processed by process_pending_wakes
+    }
 }
 
 /// Put current task to sleep (event loop waiting for any event).
@@ -358,5 +420,18 @@ pub fn timer_tick(current_time: u64) {
 
     if woken > 0 {
         crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+    }
+
+    // Drop scheduler lock before liveness check (it takes its own lock)
+    drop(sched);
+
+    // Periodic liveness check (every LIVENESS_CHECK_INTERVAL ticks)
+    static mut LIVENESS_TICK_COUNTER: u64 = 0;
+    unsafe {
+        LIVENESS_TICK_COUNTER += 1;
+        if LIVENESS_TICK_COUNTER >= super::liveness::LIVENESS_CHECK_INTERVAL {
+            LIVENESS_TICK_COUNTER = 0;
+            let _ = super::liveness::check_liveness(current_time);
+        }
     }
 }

@@ -961,12 +961,25 @@ irq_from_kernel:
     mov     x0, #0                  // from_user = false
     bl      irq_handler_rust
 
+    /* Clear SYSCALL_SWITCHED_TASK before calling do_resched_if_needed
+     * so we can detect if it switched to a user task */
+    adrp    x10, SYSCALL_SWITCHED_TASK
+    str     xzr, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+
     /* Check if reschedule is needed (e.g., timer woke a task).
      * This may context_switch to another task. When we're switched back,
-     * we return here with sp restored, so ELR/SPSR are still on our stack. */
+     * we return here with sp restored, so ELR/SPSR are still on our stack.
+     * If it switches to a user task, it sets SYSCALL_SWITCHED_TASK = 1. */
     bl      do_resched_if_needed
 
-    /* Restore ELR and SPSR (saved before potential context switch) */
+    /* Check if we switched to a user task.
+     * If so, we need to use the user return path to restore from trap frame
+     * and switch TTBR0. This handles devd recovery when IRQ came from idle. */
+    adrp    x10, SYSCALL_SWITCHED_TASK
+    ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    cbnz    x10, irq_kernel_to_user     // If switched, use user return path
+
+    /* Returning to kernel (idle task) - restore from stack */
     ldp     x10, x11, [sp], #16
     msr     elr_el1, x10
     msr     spsr_el1, x11
@@ -990,6 +1003,61 @@ irq_from_kernel:
     ldp     x29, x30, [sp], #16
 
     /* Return from exception */
+    eret
+
+/*
+ * IRQ from kernel switching to user task
+ * This happens when recovery spawned devd while idle was running.
+ * Pop saved state from kernel stack (discard) and use user return path.
+ */
+irq_kernel_to_user:
+    /* Discard saved ELR/SPSR from kernel stack */
+    add     sp, sp, #16
+    /* Discard saved registers from kernel stack */
+    add     sp, sp, #(8 + 15*16)        // x0 + x1-x30 pairs
+
+    /* Now use the user return path - restore from CURRENT_TRAP_FRAME */
+    adrp    x9, CURRENT_TRAP_FRAME
+    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+
+    /* Switch TTBR0 to user task's address space */
+    adrp    x10, CURRENT_TTBR0
+    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    msr     ttbr0_el1, x10
+    isb
+    tlbi    vmalle1
+    dsb     ish
+    isb
+
+    /* Restore special registers from trap frame */
+    ldr     x10, [x9, #248]             // sp_el0
+    ldr     x11, [x9, #256]             // elr_el1
+    ldr     x12, [x9, #264]             // spsr_el1
+    msr     sp_el0, x10
+    msr     elr_el1, x11
+    msr     spsr_el1, x12
+
+    /* Restore all general purpose registers from trap frame */
+    ldp     x0, x1, [x9, #0]
+    ldp     x2, x3, [x9, #16]
+    ldp     x4, x5, [x9, #32]
+    ldp     x6, x7, [x9, #48]
+    ldr     x8, [x9, #64]
+    ldr     x10, [x9, #80]
+    ldr     x11, [x9, #88]
+    ldp     x12, x13, [x9, #96]
+    ldp     x14, x15, [x9, #112]
+    ldp     x16, x17, [x9, #128]
+    ldp     x18, x19, [x9, #144]
+    ldp     x20, x21, [x9, #160]
+    ldp     x22, x23, [x9, #176]
+    ldp     x24, x25, [x9, #192]
+    ldp     x26, x27, [x9, #208]
+    ldp     x28, x29, [x9, #224]
+    ldr     x30, [x9, #240]
+    ldr     x9, [x9, #72]
+
+    /* Return to user mode */
     eret
 
 /*

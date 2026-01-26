@@ -199,6 +199,14 @@ pub struct ServiceDef {
 
 /// Service definitions - the "service tree"
 static SERVICE_DEFS: &[ServiceDef] = &[
+    // TODO: Add logd once updated to new IPC APIs
+    // ServiceDef {
+    //     binary: "logd",
+    //     registers: &[b"logd:"],
+    //     dependencies: &[],
+    //     auto_restart: true,
+    //     parent: None,
+    // },
     ServiceDef {
         binary: "consoled",
         registers: &[b"console:"],
@@ -400,19 +408,24 @@ impl Devd {
     // =========================================================================
 
     pub fn init(&mut self) -> SysResult<()> {
+        syscall::klog(LogLevel::Info, b"[devd] init: creating EventLoop");
         // Create event loop
         let mut events = EventLoop::new()?;
 
+        syscall::klog(LogLevel::Info, b"[devd] init: registering port devd:");
         // Register our port (services connect here to announce ready)
         let port = Port::register(b"devd:")?;
+        syscall::klog(LogLevel::Info, b"[devd] init: watching port");
         events.watch(port.handle())?;
 
         self.port = Some(port);
         self.events = Some(events);
 
+        syscall::klog(LogLevel::Info, b"[devd] init: registering in internal registry");
         // Register devd's own port in the registry
         self.register_port(b"devd:", 0xFF)?; // 0xFF = devd itself
 
+        syscall::klog(LogLevel::Info, b"[devd] init: initializing services");
         // Initialize services from definitions
         self.init_services();
 
@@ -494,7 +507,6 @@ impl Devd {
         Err(SysError::NoSpace)
     }
 
-    #[allow(dead_code)]  // Infrastructure for future use
     fn unregister_port(&mut self, name: &[u8]) {
         for slot in &mut self.ports {
             if let Some(p) = slot {
@@ -539,11 +551,13 @@ impl Devd {
     }
 
     fn check_pending_services(&mut self) {
+        syscall::klog(LogLevel::Info, b"[devd] check_pending_services");
         let now = Self::now_ms();
         for i in 0..self.service_count {
             if let Some(service) = &self.services[i] {
                 if service.state == ServiceState::Pending && self.deps_satisfied(service) {
                     // Borrow ends here, spawn needs &mut self
+                    dlog!("spawning service idx={}", i);
                     self.spawn_service(i, now);
                 }
             }
@@ -626,6 +640,10 @@ impl Devd {
             let _ = self.register_port(port_name, idx as u8);
             self.set_port_availability(port_name, false);
         }
+
+        // For services that don't register ports, mark Ready immediately
+        // (they won't connect to devd:, so we'd never see them otherwise)
+        self.mark_portless_services_ready();
     }
 
     // =========================================================================
@@ -707,9 +725,10 @@ impl Devd {
             }
         };
 
-        // Second pass: mark ports unavailable (service borrow is dropped)
+        // Second pass: unregister ports (service borrow is dropped)
+        // Ports are re-registered when service restarts via spawn_service
         for port_name in port_names.iter().flatten() {
-            self.set_port_availability(port_name, false);
+            self.unregister_port(port_name);
         }
 
         // Third pass: prune children if needed
@@ -790,38 +809,90 @@ impl Devd {
     }
 
     // =========================================================================
-    // Branch Pruning (kill children on parent crash)
+    // Branch Pruning (kill dependents on service crash)
     // =========================================================================
 
-    fn prune_children(&mut self, parent_idx: usize) {
+    /// Kill all services that depend on the given service's ports.
+    /// This handles BOTH hierarchical children AND dependency-based dependents.
+    fn prune_dependents(&mut self, provider_idx: usize) {
         // Bounds check
-        if parent_idx >= MAX_SERVICES {
+        if provider_idx >= MAX_SERVICES {
             return;
         }
 
-        // Collect children to kill (can't borrow mutably while iterating)
-        let mut to_kill = [None; MAX_CHILDREN_PER_SERVICE];
-        let mut kill_count = 0;
+        // Collect port names that this service provides
+        let mut provider_ports: [Option<&'static [u8]>; MAX_PORTS_PER_SERVICE] = [None; MAX_PORTS_PER_SERVICE];
+        let mut port_count = 0;
 
-        if let Some(parent) = &self.services[parent_idx] {
-            for i in 0..parent.child_count as usize {
-                if let Some(child_idx) = parent.children[i] {
-                    to_kill[kill_count] = Some(child_idx);
-                    kill_count += 1;
+        if let Some(provider) = &self.services[provider_idx] {
+            for &port_name in provider.def().registers {
+                if port_count < MAX_PORTS_PER_SERVICE {
+                    provider_ports[port_count] = Some(port_name);
+                    port_count += 1;
                 }
             }
         }
 
-        // Kill children recursively (depth-first, leaves first)
-        for i in 0..kill_count {
-            if let Some(child_idx) = to_kill[i] {
-                // Recurse first (kill grandchildren)
-                self.prune_children(child_idx as usize);
+        // Find all services that depend on any of these ports
+        let mut to_kill = [None; MAX_SERVICES];
+        let mut kill_count = 0;
 
-                // Then kill this child
-                self.kill_service(child_idx as usize);
+        for i in 0..self.service_count {
+            if i == provider_idx {
+                continue; // Don't kill the provider itself
+            }
+
+            let depends = if let Some(service) = &self.services[i] {
+                // Skip services that aren't running
+                if !service.state.is_running() {
+                    false
+                } else {
+                    // Check if this service depends on any of the provider's ports
+                    service.def().dependencies.iter().any(|dep| {
+                        let dep_port = dep.port_name();
+                        provider_ports.iter().flatten().any(|&p| p == dep_port)
+                    })
+                }
+            } else {
+                false
+            };
+
+            if depends && kill_count < MAX_SERVICES {
+                to_kill[kill_count] = Some(i);
+                kill_count += 1;
             }
         }
+
+        // Also collect hierarchical children
+        if let Some(parent) = &self.services[provider_idx] {
+            for i in 0..parent.child_count as usize {
+                if let Some(child_idx) = parent.children[i] {
+                    // Check if already in to_kill
+                    let already_listed = to_kill[..kill_count].iter()
+                        .any(|&x| x == Some(child_idx as usize));
+                    if !already_listed && kill_count < MAX_SERVICES {
+                        to_kill[kill_count] = Some(child_idx as usize);
+                        kill_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Kill dependents recursively (depth-first, leaves first)
+        for i in 0..kill_count {
+            if let Some(dep_idx) = to_kill[i] {
+                // Recurse first (kill services that depend on this dependent)
+                self.prune_dependents(dep_idx);
+
+                // Then kill this dependent
+                self.kill_service(dep_idx);
+            }
+        }
+    }
+
+    /// Legacy alias for backward compatibility
+    fn prune_children(&mut self, parent_idx: usize) {
+        self.prune_dependents(parent_idx);
     }
 
     fn kill_service(&mut self, idx: usize) {
@@ -874,9 +945,9 @@ impl Devd {
             arr
         };
 
-        // Second pass: mark ports unavailable
+        // Second pass: unregister ports (will be re-registered on restart)
         for port_name in port_names.iter().flatten() {
-            self.set_port_availability(port_name, false);
+            self.unregister_port(port_name);
         }
     }
 
@@ -924,6 +995,25 @@ impl Devd {
             }
             Err(e) => {
                 derror!("devd: accept failed err={:?}", e);
+            }
+        }
+    }
+
+    /// Mark services as Ready that don't register ports but are running.
+    /// Called after spawning to handle services like shell that don't connect to devd.
+    fn mark_portless_services_ready(&mut self) {
+        let now = Self::now_ms();
+
+        for i in 0..self.service_count {
+            if let Some(service) = &mut self.services[i] {
+                // Service is Starting, has no ports to register, and has been running
+                if service.state == ServiceState::Starting
+                    && service.def().registers.is_empty()
+                    && service.pid != 0
+                {
+                    service.transition(ServiceState::Ready, now);
+                    service.backoff_ms = INITIAL_BACKOFF_MS;
+                }
             }
         }
     }
@@ -1062,16 +1152,22 @@ static mut DEVD: Devd = Devd::new();
 fn main() -> ! {
     userlib::io::disable_stdout();
 
+    // Early debug: confirm devd is starting
+    syscall::klog(LogLevel::Info, b"[devd] main() entry");
+
     let devd = unsafe { &mut DEVD };
 
     // Initialize
+    syscall::klog(LogLevel::Info, b"[devd] calling init()");
     if let Err(e) = devd.init() {
         derror!("devd: init failed err={:?}", e);
         syscall::exit(1);
     }
+    syscall::klog(LogLevel::Info, b"[devd] init() complete");
 
     dlog!("devd: started services={}", devd.service_count);
 
     // Run main loop
+    syscall::klog(LogLevel::Info, b"[devd] entering run()");
     devd.run()
 }

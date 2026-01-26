@@ -56,11 +56,21 @@ impl ProcessOps for KernelProcessOps {
                 // Update scheduler state - actual TTBR0 switch happens in assembly
                 // at exception return (assembly loads CURRENT_TTBR0 and switches)
                 task::set_current_slot(next_slot);
-                if let Some(task) = sched.task_mut(next_slot) {
-                    crate::transition_or_evict!(task, set_running);
+                if let Some(next) = sched.task_mut(next_slot) {
+                    crate::transition_or_evict!(next, set_running);
+                    // Update globals directly (can't call update_current_task_globals
+                    // here because we already hold the scheduler lock)
+                    let trap_ptr = &mut next.trap_frame as *mut task::TrapFrame;
+                    task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                    if let Some(ref addr_space) = next.address_space {
+                        task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                    }
                 }
-                task::update_current_task_globals();
-                task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+                // Only set flag for user tasks (not idle) - this tells IRQ handler
+                // to use user return path instead of kernel return path
+                if next_slot != crate::kernel::sched::IDLE_SLOT {
+                    task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+                }
 
                 // Return to the new task
                 // This is a diverging function, so we need to jump to context switch
@@ -96,9 +106,19 @@ impl ProcessOps for KernelProcessOps {
                             task::set_current_slot(next_slot);
                             if let Some(next) = sched.task_mut(next_slot) {
                                 crate::transition_or_evict!(next, set_running);
+                                // Update globals directly (can't call update_current_task_globals
+                                // here because we already hold the scheduler lock)
+                                let trap_ptr = &mut next.trap_frame as *mut task::TrapFrame;
+                                task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                                if let Some(ref addr_space) = next.address_space {
+                                    task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                                }
                             }
-                            task::update_current_task_globals();
-                            task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+                            // Only set flag for user tasks (not idle) - this tells IRQ handler
+                            // to use user return path instead of kernel return path
+                            if next_slot != crate::kernel::sched::IDLE_SLOT {
+                                task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+                            }
                         }
                     }
                     Ok(())

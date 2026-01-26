@@ -79,11 +79,21 @@ pub(super) fn sys_exit(code: i32) -> i64 {
             // Update scheduler state - actual TTBR0 switch happens in assembly
             // at exception return (assembly loads CURRENT_TTBR0 and switches)
             task::set_current_slot(next_slot);
-            if let Some(task) = sched.task_mut(next_slot) {
-                crate::transition_or_evict!(task, set_running);
+            if let Some(next) = sched.task_mut(next_slot) {
+                crate::transition_or_evict!(next, set_running);
+                // Update globals directly (can't call update_current_task_globals
+                // here because we already hold the scheduler lock)
+                let trap_ptr = &mut next.trap_frame as *mut task::TrapFrame;
+                task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                if let Some(ref addr_space) = next.address_space {
+                    task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                }
             }
-            unsafe { task::update_current_task_globals(); }
-            task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+            // Only set flag for user tasks (not idle) - this tells IRQ handler
+            // to use user return path instead of kernel return path
+            if next_slot != crate::kernel::sched::IDLE_SLOT {
+                task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+            }
             0
         } else {
             // No more tasks - halt
@@ -443,12 +453,17 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
         return SyscallError::InvalidArgument as i64;
     }
 
-    // SECURITY: Never allow killing init (PID 1) - system would become unstable
+    // SECURITY: Never allow killing idle (slot 0, pid 1)
     if pid == 1 {
         let caller = ctx.current_task_id().unwrap_or(0);
-        kwarn!("security", "kill_init_denied"; caller = caller as u64);
+        kwarn!("security", "kill_idle_denied"; caller = caller as u64);
         return SyscallError::PermissionDenied as i64;
     }
+
+    // NOTE: Killing devd (is_init=true) is allowed for testing - recovery will be triggered.
+    // The lifecycle::kill() function sets DEVD_LIVENESS_KILLED flag which causes
+    // the timer handler to respawn devd and kill all other tasks.
+    // TODO: For production, consider requiring CAP_KILL capability for killing init.
 
     let caller_pid = match ctx.current_task_id() {
         Some(id) => id,
@@ -469,17 +484,22 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
             Err(lifecycle::LifecycleError::NoChildren) => return SyscallError::InvalidArgument as i64,
         }
 
-        // If killing current task, schedule next
-        if pid == caller_pid {
-            if let Some(next_slot) = sched.schedule() {
-                task::set_current_slot(next_slot);
-                if let Some(next) = sched.task_mut(next_slot) {
-                    crate::transition_or_evict!(next, set_running);
-                }
-                unsafe { task::update_current_task_globals(); }
-                task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
-            }
-        }
+        // If killing current task, the reschedule will be handled by do_resched_if_needed
+        // after this syscall returns. The current task is now in Exiting state, which
+        // will cause should_resched = true (is_terminated check in do_resched_if_needed).
+        //
+        // IMPORTANT: We must NOT do manual task switching here because:
+        // 1. The target task might need needs_context_restore (was context-switched out)
+        // 2. Proper context_switch requires releasing the scheduler lock first
+        // 3. do_resched_if_needed and reschedule() handle this correctly
+        //
+        // The flow after self-kill:
+        // 1. sys_kill returns 0
+        // 2. svc_handler sees SYSCALL_SWITCHED_TASK = 0 (we didn't set it)
+        // 3. svc_handler stores return value to current trap frame (dying task's)
+        // 4. svc_handler calls do_resched_if_needed
+        // 5. do_resched_if_needed sees current task is terminated -> should_resched = true
+        // 6. reschedule() properly handles context switch to next task
 
         0  // Success
     })
@@ -504,7 +524,12 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
     task::with_scheduler(|sched| {
         let mut count = 0usize;
 
-        for (_slot, task_opt) in sched.iter_tasks() {
+        for (slot, task_opt) in sched.iter_tasks() {
+            // Skip idle task (slot 0) - it's an internal kernel task
+            if slot == 0 {
+                continue;
+            }
+
             if count >= max_entries {
                 break;
             }
