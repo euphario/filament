@@ -52,9 +52,9 @@ enum Commands {
 
     /// Run in QEMU
     Qemu {
-        /// Build before running (default: true)
-        #[arg(long, default_value = "true")]
-        build: bool,
+        /// Skip build before running
+        #[arg(long)]
+        no_build: bool,
 
         /// Enable GDB server
         #[arg(short, long)]
@@ -79,8 +79,8 @@ fn main() -> Result<()> {
         Commands::Build { test, firmware, skip_user, only, platform } => {
             cmd_build(&project_root, test, firmware, skip_user, only, &platform)?;
         }
-        Commands::Qemu { build, gdb, test } => {
-            cmd_qemu(&project_root, build, gdb, test)?;
+        Commands::Qemu { no_build, gdb, test } => {
+            cmd_qemu(&project_root, !no_build, gdb, test)?;
         }
         Commands::Clean => {
             cmd_clean(&project_root)?;
@@ -474,8 +474,13 @@ fn build_kernel(root: &Path, test: bool, platform_feature: &str) -> Result<()> {
         platform_feature.to_string()
     };
 
-    // Also include embed-initrd and embed-dtb
-    let full_features = format!("{},embed-initrd,embed-dtb", features);
+    // Include embed-initrd always, embed-dtb only for real hardware
+    // (QEMU doesn't need embedded DTB - it constructs its own)
+    let full_features = if platform_feature == "platform-qemu-virt" {
+        format!("{},embed-initrd", features)
+    } else {
+        format!("{},embed-initrd,embed-dtb", features)
+    };
 
     // Use nightly toolchain with build-std
     // Clear CARGO_BUILD_TARGET to use target from .cargo/config.toml
@@ -543,30 +548,65 @@ fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool) -> Result<()> {
         bail!("kernel.bin not found - run './x build --platform qemu' first");
     }
 
+    // Create disk images for emulated devices if they don't exist
+    let usb_disk = "/tmp/bpi-r4-usb.img";
+    let nvme_disk = "/tmp/bpi-r4-nvme.img";
+
+    if !Path::new(usb_disk).exists() {
+        println!("Creating USB disk image: {}", usb_disk);
+        Command::new("qemu-img")
+            .args(["create", "-f", "raw", usb_disk, "64M"])
+            .status()
+            .context("Failed to create USB disk image")?;
+    }
+
+    if !Path::new(nvme_disk).exists() {
+        println!("Creating NVMe disk image: {}", nvme_disk);
+        Command::new("qemu-img")
+            .args(["create", "-f", "raw", nvme_disk, "128M"])
+            .status()
+            .context("Failed to create NVMe disk image")?;
+    }
+
     // Use virt machine with GICv3 (our kernel uses GICv3 system registers)
-    let mut args = vec![
+    // Include: xHCI USB with hub/MSC/HID, NVMe, virtio-net
+    let kernel_str = kernel_path.to_string_lossy().to_string();
+    let usb_drive_str = format!("id=usbdisk,file={},format=raw,if=none", usb_disk);
+    let nvme_drive_str = format!("id=nvme0,file={},format=raw,if=none", nvme_disk);
+    let args = vec![
         "-M", "virt,gic-version=3",
         "-cpu", "cortex-a72",
         "-m", "512M",
         "-nographic",
-        "-kernel",
+        "-kernel", &kernel_str,
+        // USB xHCI controller with devices
+        "-device", "qemu-xhci,id=xhci",
+        "-device", "usb-hub,bus=xhci.0,port=1",
+        "-device", "usb-storage,bus=xhci.0,port=2,drive=usbdisk",
+        "-drive", &usb_drive_str,
+        "-device", "usb-kbd,bus=xhci.0,port=3",
+        "-device", "usb-mouse,bus=xhci.0,port=4",
+        // NVMe controller
+        "-device", "nvme,drive=nvme0,serial=BPIR4NVME",
+        "-drive", &nvme_drive_str,
+        // Network (virtio - simpler than emulating real NIC)
+        "-device", "virtio-net-pci,netdev=net0",
+        "-netdev", "user,id=net0",
     ];
 
-    let kernel_str = kernel_path.to_string_lossy();
-    args.push(&kernel_str);
-
     if gdb {
-        args.push("-s");
-        args.push("-S");
         println!("GDB server listening on :1234");
         println!("Connect with: gdb -ex 'target remote :1234'");
     }
 
-    let status = Command::new("qemu-system-aarch64")
-        .args(&args)
-        .current_dir(root)
-        .status()
-        .context("Failed to run QEMU")?;
+    let mut cmd = Command::new("qemu-system-aarch64");
+    cmd.args(&args).current_dir(root);
+
+    if gdb {
+        cmd.args(["-s", "-S"]);
+    }
+
+    let status = cmd.status().context("Failed to run QEMU")?;
 
     if !status.success() {
         println!("QEMU exited with error");
