@@ -1,16 +1,24 @@
-//! USB/xHCI Hardware Constants and Operations for MT7988A
+//! USB/xHCI Hardware Constants and Operations
 //!
-//! This module contains MT7988A-specific USB hardware addresses,
-//! IPPC registers, xHCI operations, and power management.
+//! This module contains USB hardware addresses, IPPC registers,
+//! xHCI operations, and power management. Base addresses come from
+//! the platform configuration (selected at boot based on DTB).
 
 use crate::arch::aarch64::mmio::{MmioRegion, delay_ms, delay_us, dsb};
 use super::hw_poll::poll_until;
+use super::config::bus_config;
 
-/// xHCI base addresses (MAC base) for MT7988A (2 controllers)
-pub const MAC_BASES: [usize; 2] = [
-    0x1119_0000,  // SSUSB0 (M.2 slot)
-    0x1120_0000,  // SSUSB1 (USB-A ports via VL822)
-];
+/// Get USB MAC base address for a controller (from platform config)
+#[inline]
+fn mac_base(index: usize) -> Option<usize> {
+    bus_config().usb_base(index)
+}
+
+/// Get number of USB controllers (from platform config)
+#[inline]
+pub fn controller_count() -> usize {
+    bus_config().usb_controller_count()
+}
 
 /// IPPC (IP Port Control) offset from MAC base
 pub const IPPC_OFFSET: usize = 0x3E00;
@@ -81,13 +89,11 @@ pub const STS_HCE: u32 = 1 << 12;   // Host Controller Error
 /// Returns (hardware_verified, u3_port_count, u2_port_count)
 pub fn reset_sequence(bus_index: u8) -> (bool, usize, usize) {
     let index = bus_index as usize;
-    if index >= MAC_BASES.len() {
+    let Some(base) = mac_base(index) else {
         crate::kerror!("bus", "usb_invalid_index"; index = index as u64);
         return (false, 0, 0);
-    }
-
-    let mac_base = MAC_BASES[index];
-    let ippc_base = mac_base + IPPC_OFFSET;
+    };
+    let ippc_base = base + IPPC_OFFSET;
     let ippc = MmioRegion::new(ippc_base);
 
     // Step 1: Reset the whole SSUSB IP (quiesces DMA)
@@ -137,7 +143,7 @@ pub fn reset_sequence(bus_index: u8) -> (bool, usize, usize) {
     }
 
     // Step 6: Access xHCI registers
-    let mac = MmioRegion::new(mac_base);
+    let mac = MmioRegion::new(base);
     let caplength = (mac.read32(CAPLENGTH) & 0xFF) as usize;
     if caplength == 0 || caplength > 0x40 {
         crate::kerror!("bus", "usb_invalid_caplength"; caplength = caplength as u64);
@@ -145,7 +151,7 @@ pub fn reset_sequence(bus_index: u8) -> (bool, usize, usize) {
     }
 
     // Step 7: Wait for Controller Not Ready to clear (100ms timeout)
-    let op = MmioRegion::new(mac_base + caplength);
+    let op = MmioRegion::new(base + caplength);
     let ready = poll_until(100, 1, || {
         (op.read32(USBSTS) & STS_CNR) == 0
     });
@@ -161,9 +167,11 @@ pub fn reset_sequence(bus_index: u8) -> (bool, usize, usize) {
 
 /// Verify USB controller is in expected state after power-on
 pub fn verify_state(index: usize) -> bool {
-    let mac_base = MAC_BASES[index];
-    let mac = MmioRegion::new(mac_base);
-    let ippc = MmioRegion::new(mac_base + IPPC_OFFSET);
+    let Some(base) = mac_base(index) else {
+        return false;
+    };
+    let mac = MmioRegion::new(base);
+    let ippc = MmioRegion::new(base + IPPC_OFFSET);
 
     let caplength = (mac.read32(CAPLENGTH) & 0xFF) as usize;
     if caplength == 0 || caplength > 0x40 {
@@ -171,7 +179,7 @@ pub fn verify_state(index: usize) -> bool {
         return false;
     }
 
-    let op = MmioRegion::new(mac_base + caplength);
+    let op = MmioRegion::new(base + caplength);
     let usbsts = op.read32(USBSTS);
 
     // After power-on: CNR=0 (ready), HCE=0 (no error)
@@ -197,12 +205,10 @@ pub fn verify_state(index: usize) -> bool {
 /// Powers down host IP and all ports - no DMA can occur.
 pub fn power_down(bus_index: u8) {
     let index = bus_index as usize;
-    if index >= MAC_BASES.len() {
+    let Some(base) = mac_base(index) else {
         return;
-    }
-
-    let mac_base = MAC_BASES[index];
-    let ippc = MmioRegion::new(mac_base + IPPC_OFFSET);
+    };
+    let ippc = MmioRegion::new(base + IPPC_OFFSET);
 
     let xhci_cap = ippc.read32(IP_XHCI_CAP);
     let u3_port_num = ((xhci_cap >> 8) & 0xF) as usize;
@@ -228,16 +234,14 @@ pub fn power_down(bus_index: u8) {
 /// Force halt the USB controller (emergency stop)
 pub fn force_halt(bus_index: u8) -> Result<(), super::BusError> {
     let index = bus_index as usize;
-    if index >= MAC_BASES.len() {
+    let Some(base) = mac_base(index) else {
         return Err(super::BusError::NotFound);
-    }
-
-    let mac_base = MAC_BASES[index];
-    let mac = MmioRegion::new(mac_base);
+    };
+    let mac = MmioRegion::new(base);
 
     // Read capability length
     let caplength = (mac.read32(CAPLENGTH) & 0xFF) as usize;
-    let op = MmioRegion::new(mac_base + caplength);
+    let op = MmioRegion::new(base + caplength);
 
     // Check if already halted
     let usbsts = op.read32(USBSTS);
@@ -270,7 +274,7 @@ pub fn force_halt(bus_index: u8) -> Result<(), super::BusError> {
 /// Instead, we track permission and can forcibly halt if needed
 pub fn set_dma_allowed(bus_index: u8, device_id: u16, allow: bool) -> Result<(), super::BusError> {
     let index = bus_index as usize;
-    if index >= MAC_BASES.len() {
+    if mac_base(index).is_none() {
         return Err(super::BusError::NotFound);
     }
 
@@ -295,14 +299,13 @@ pub fn query_capabilities(bus_index: u8) -> u8 {
     use super::bus_caps;
     let mut caps = 0u8;
 
-    // All MT7988 USB controllers are xHCI (USB 3.0) with USB 2.0 support
+    // All USB controllers are xHCI (USB 3.0) with USB 2.0 support
     caps |= bus_caps::USB_2_0;
     caps |= bus_caps::USB_3_0;
 
     // Check if controller is running (not halted)
-    if (bus_index as usize) < MAC_BASES.len() {
-        let mac_base = MAC_BASES[bus_index as usize];
-        let mmio = MmioRegion::new(mac_base);
+    if let Some(base) = mac_base(bus_index as usize) {
+        let mmio = MmioRegion::new(base);
 
         // Read CAPLENGTH to find operational registers offset
         let caplength = mmio.read32(CAPLENGTH) & 0xFF;

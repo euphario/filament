@@ -1,16 +1,38 @@
 //! QEMU virt Bus Configuration
 //!
-//! QEMU virt machine has no PCIe or USB hardware.
-//! Only registers the Platform pseudo-bus for software devices.
+//! Registers buses based on platform config. QEMU virt typically has
+//! no PCIe or USB hardware (uses virtio instead).
 
-use crate::kernel::bus::{BusType, BusState, with_bus_registry};
+use crate::kernel::bus::{BusType, BusState, with_bus_registry, bus_config};
 use crate::kernel::process::Pid;
 use crate::kinfo;
 
-/// Register buses for QEMU virt platform
+/// Register buses for this platform
 pub fn register_buses(kernel_pid: Pid) {
+    let config = bus_config();
+
     with_bus_registry(|registry| {
-        // Platform pseudo-bus only - no hardware buses on QEMU virt
+        // PCIe ports - count from platform config (typically 0 for QEMU)
+        let pcie_count = config.pcie_port_count();
+        for i in 0..pcie_count {
+            if let Some(bus) = registry.add(BusType::PCIe, i as u8) {
+                bus.set_initial_state(BusState::Resetting);
+                let _ = bus.register_port(kernel_pid);
+                kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Resetting");
+            }
+        }
+
+        // USB controllers - count from platform config (typically 0 for QEMU)
+        let usb_count = config.usb_controller_count();
+        for i in 0..usb_count {
+            if let Some(bus) = registry.add(BusType::Usb, i as u8) {
+                bus.set_initial_state(BusState::Resetting);
+                let _ = bus.register_port(kernel_pid);
+                kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Resetting");
+            }
+        }
+
+        // Platform pseudo-bus (always present)
         if let Some(bus) = registry.add(BusType::Platform, 0) {
             bus.set_initial_state(BusState::Safe);
             let _ = bus.register_port(kernel_pid);

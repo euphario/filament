@@ -1,20 +1,21 @@
 //! MT7988A Bus Configuration
 //!
-//! Registers the buses available on the MT7988A SoC:
-//! - 4 PCIe ports (pcie0-pcie3)
-//! - 2 USB/xHCI controllers (usb0-usb1)
-//! - 1 Platform pseudo-bus
+//! Registers the buses available on the MT7988A SoC.
+//! Bus counts come from the platform config (selected at boot from DTB).
 
-use crate::kernel::bus::{BusType, BusState, with_bus_registry};
+use crate::kernel::bus::{BusType, BusState, with_bus_registry, bus_config};
 use crate::kernel::process::Pid;
 use crate::kinfo;
 
-/// Register all buses for MT7988A platform
+/// Register all buses for this platform
 pub fn register_buses(kernel_pid: Pid) {
+    let config = bus_config();
+
     with_bus_registry(|registry| {
-        // PCIe ports - MT7988A has 4 PCIe ports
-        for i in 0..4u8 {
-            if let Some(bus) = registry.add(BusType::PCIe, i) {
+        // PCIe ports - count from platform config
+        let pcie_count = config.pcie_port_count();
+        for i in 0..pcie_count {
+            if let Some(bus) = registry.add(BusType::PCIe, i as u8) {
                 // Start in Resetting - hardware reset happens in complete_init()
                 bus.set_initial_state(BusState::Resetting);
                 let _ = bus.register_port(kernel_pid);
@@ -22,9 +23,10 @@ pub fn register_buses(kernel_pid: Pid) {
             }
         }
 
-        // USB controllers - MT7988A has 2 SSUSB controllers
-        for i in 0..2u8 {
-            if let Some(bus) = registry.add(BusType::Usb, i) {
+        // USB controllers - count from platform config
+        let usb_count = config.usb_controller_count();
+        for i in 0..usb_count {
+            if let Some(bus) = registry.add(BusType::Usb, i as u8) {
                 // Start in Resetting - hardware reset happens in complete_init()
                 bus.set_initial_state(BusState::Resetting);
                 let _ = bus.register_port(kernel_pid);

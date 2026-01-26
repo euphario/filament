@@ -245,20 +245,13 @@ impl BusController {
 
     /// Convert to BusInfo for syscall
     pub fn to_info(&self) -> BusInfo {
+        let config = super::config::bus_config();
         let base_addr = match self.bus_type {
             BusType::PCIe => {
-                if (self.bus_index as usize) < hw_pcie::MAC_BASES.len() {
-                    hw_pcie::MAC_BASES[self.bus_index as usize] as u32
-                } else {
-                    0
-                }
+                config.pcie_base(self.bus_index as usize).unwrap_or(0) as u32
             }
             BusType::Usb => {
-                if (self.bus_index as usize) < hw_usb::MAC_BASES.len() {
-                    hw_usb::MAC_BASES[self.bus_index as usize] as u32
-                } else {
-                    0
-                }
+                config.usb_base(self.bus_index as usize).unwrap_or(0) as u32
             }
             BusType::Platform => 0, // Platform devices have individual addresses
         };
@@ -285,17 +278,18 @@ impl BusController {
     /// Convert to DeviceInfo for unified device list
     /// Uses chipset:instance naming (e.g., "mt7988-pcie:0", "xhci:0")
     pub fn to_device_info(&self) -> DeviceInfo {
+        let config = super::config::bus_config();
         let (base_addr, size) = match self.bus_type {
             BusType::PCIe => {
-                if (self.bus_index as usize) < hw_pcie::MAC_BASES.len() {
-                    (hw_pcie::MAC_BASES[self.bus_index as usize] as u64, 0x10000)
+                if let Some(base) = config.pcie_base(self.bus_index as usize) {
+                    (base as u64, 0x10000)
                 } else {
                     (0, 0)
                 }
             }
             BusType::Usb => {
-                if (self.bus_index as usize) < hw_usb::MAC_BASES.len() {
-                    (hw_usb::MAC_BASES[self.bus_index as usize] as u64, 0x10000)
+                if let Some(base) = config.usb_base(self.bus_index as usize) {
+                    (base as u64, 0x10000)
                 } else {
                     (0, 0)
                 }
@@ -611,13 +605,12 @@ impl BusController {
         use crate::klog;
 
         let index = self.bus_index as usize;
-        if index >= hw_pcie::MAC_BASES.len() {
+        let config = super::config::bus_config();
+        let Some(mac_base) = config.pcie_base(index) else {
             kerror!("bus", "pcie_invalid_index"; index = index as u64);
             self.hardware_verified = false;
             return;
-        }
-
-        let mac_base = hw_pcie::MAC_BASES[index];
+        };
 
         // Step 1: Enable clocks and deassert INFRACFG reset
         hw_pcie::enable_clocks(index);

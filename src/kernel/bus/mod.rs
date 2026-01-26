@@ -48,8 +48,13 @@
 mod types;
 mod protocol;
 mod controller;
+mod config;
 mod hw_pcie;
 mod hw_usb;
+
+// Re-export platform config API
+#[allow(unused_imports)]
+pub use config::{BusConfig, bus_config, select_platform_from_fdt, use_default_platform, is_platform_selected};
 
 // Re-export for use by hw modules
 use super::hw_poll;

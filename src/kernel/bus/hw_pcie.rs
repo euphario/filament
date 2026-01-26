@@ -1,20 +1,29 @@
-//! PCIe Hardware Constants and Operations for MT7988A
+//! PCIe Hardware Constants and Operations
 //!
-//! This module contains MT7988A-specific PCIe MAC base addresses,
-//! clock gate registers, reset control, and hardware operations.
+//! This module contains PCIe MAC operations including clock gate control,
+//! reset control, and bus mastering. Base addresses come from the platform
+//! configuration (selected at boot based on DTB).
 
 use crate::arch::aarch64::mmio::{MmioRegion, delay_us, dsb};
+use super::config::bus_config;
 
-/// PCIe port MAC base addresses for MT7988A (4 ports)
-pub const MAC_BASES: [usize; 4] = [
-    0x1130_0000,  // PCIe0
-    0x1131_0000,  // PCIe1
-    0x1128_0000,  // PCIe2
-    0x1129_0000,  // PCIe3
-];
+/// Get PCIe MAC base address for a port (from platform config)
+#[inline]
+fn mac_base(index: usize) -> Option<usize> {
+    bus_config().pcie_base(index)
+}
 
-/// INFRACFG_AO base (clock/reset controller)
-pub const INFRACFG_AO_BASE: usize = 0x1000_1000;
+/// Get number of PCIe ports (from platform config)
+#[inline]
+pub fn port_count() -> usize {
+    bus_config().pcie_port_count()
+}
+
+/// Get INFRACFG_AO base address (from platform config)
+#[inline]
+fn infracfg_base() -> usize {
+    bus_config().infracfg_base
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Clock Gate Registers (MediaTek set/clear model)
@@ -128,7 +137,11 @@ pub const CMD_BUS_MASTER: u16 = 1 << 2;
 /// 1. Enable clocks: PCIE_PERI_26M, GFMUX_TL, PIPE, 133M
 /// 2. Deassert PEXTP_MAC_SWRST (required for RST_CTRL to be writable)
 pub fn enable_clocks(index: usize) {
-    let infracfg = MmioRegion::new(INFRACFG_AO_BASE);
+    let base = infracfg_base();
+    if base == 0 {
+        return;  // No INFRACFG on this platform
+    }
+    let infracfg = MmioRegion::new(base);
 
     // Get clock bits for this port
     let peri_26m_bit = INFRA0_PCIE_PERI_26M[index];
@@ -160,7 +173,11 @@ pub fn enable_clocks(index: usize) {
 /// 1. Assert PEXTP_MAC_SWRST (put MAC in reset)
 /// 2. Disable clocks
 pub fn disable_clocks(index: usize) {
-    let infracfg = MmioRegion::new(INFRACFG_AO_BASE);
+    let base = infracfg_base();
+    if base == 0 {
+        return;  // No INFRACFG on this platform
+    }
+    let infracfg = MmioRegion::new(base);
 
     // Assert PEXTP_MAC_SWRST (write 1 to SET register to assert)
     infracfg.write32(RST0_SET, PEXTP_MAC_SWRST);
@@ -184,12 +201,10 @@ pub fn disable_clocks(index: usize) {
 /// For root port devices, this is typically 0x0000
 pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<(), super::BusError> {
     let index = bus_index as usize;
-    if index >= MAC_BASES.len() {
+    let Some(base) = mac_base(index) else {
         return Err(super::BusError::NotFound);
-    }
-
-    let mac_base = MAC_BASES[index];
-    let cfg_base = mac_base + CFG_OFFSET;
+    };
+    let cfg_base = base + CFG_OFFSET;
     let cfg = MmioRegion::new(cfg_base);
 
     // Extract BDF from device_id
@@ -206,7 +221,7 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<
 
     // Configure TLP header for config access
     // MediaTek uses CFGNUM register at MAC+0x140
-    let cfgnum = MmioRegion::new(mac_base);
+    let cfgnum = MmioRegion::new(base);
     let cfgnum_val = ((bus_num as u32) << 8) | (devfn as u32) | (0xF << 16); // BE=0xF
     cfgnum.write32(0x140, cfgnum_val);
     dsb();
@@ -239,7 +254,7 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<
 /// Disable bus mastering for ALL devices on a PCIe port
 pub fn disable_all_bus_mastering(bus_index: u8) {
     let index = bus_index as usize;
-    if index >= MAC_BASES.len() {
+    if mac_base(index).is_none() {
         return;
     }
 
@@ -252,7 +267,10 @@ pub fn disable_all_bus_mastering(bus_index: u8) {
 
 /// Verify PCIe link is in expected state after reset
 pub fn verify_link(index: usize) -> bool {
-    let mac = MmioRegion::new(MAC_BASES[index]);
+    let Some(base) = mac_base(index) else {
+        return false;
+    };
+    let mac = MmioRegion::new(base);
 
     // Check reset control is deasserted
     let rst_ctrl = mac.read32(RST_CTRL_REG);
@@ -269,14 +287,13 @@ pub fn query_capabilities(bus_index: u8) -> u8 {
     use super::bus_caps;
     let mut caps = 0u8;
 
-    // All MT7988 PCIe ports support bus mastering and MSI
+    // All PCIe ports support bus mastering and MSI
     caps |= bus_caps::PCIE_BUS_MASTER;
     caps |= bus_caps::PCIE_MSI;
 
     // Check if link is up by reading LTSSM state
-    if (bus_index as usize) < MAC_BASES.len() {
-        let mac_base = MAC_BASES[bus_index as usize];
-        let mmio = MmioRegion::new(mac_base);
+    if let Some(base) = mac_base(bus_index as usize) {
+        let mmio = MmioRegion::new(base);
 
         // Read K_CNT_APPL register (offset 0x104C) for LTSSM state
         // LTSSM state is in bits [28:24], L0 = 0x10
