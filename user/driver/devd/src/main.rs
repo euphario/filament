@@ -27,6 +27,7 @@ mod service;
 mod ports;
 mod process;
 mod deps;
+mod devices;
 
 use userlib::syscall::{self, LogLevel};
 use userlib::ipc::{Port, Timer, Channel, EventLoop, ObjHandle};
@@ -40,6 +41,7 @@ use service::{
 use ports::{PortRegistry, Ports};
 use process::{ProcessManager, SyscallProcessManager};
 use deps::{DependencyResolver, Dependencies};
+use devices::{DeviceStore, DeviceRegistry};
 
 // =============================================================================
 // Logging
@@ -104,6 +106,8 @@ pub struct Devd {
     process_mgr: SyscallProcessManager,
     /// Dependency resolver
     deps: Dependencies,
+    /// Device registry (for hierarchical queries)
+    devices: DeviceRegistry,
 }
 
 impl Devd {
@@ -115,6 +119,7 @@ impl Devd {
             ports: Ports::new(),
             process_mgr: SyscallProcessManager::new(),
             deps: Dependencies::new(),
+            devices: DeviceRegistry::new(),
         }
     }
 
@@ -473,6 +478,12 @@ impl Devd {
         // Unregister ports
         for port_name in port_names.iter().flatten() {
             self.ports.unregister(port_name);
+        }
+
+        // Remove devices registered by this service
+        let removed = self.devices.remove_by_owner(idx as u8);
+        if removed > 0 {
+            dlog!("removed {} devices from service idx={}", removed, idx);
         }
     }
 
