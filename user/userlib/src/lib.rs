@@ -9,6 +9,7 @@ pub mod syscall;
 pub mod ipc;
 pub mod io;
 pub mod console_ring;
+pub mod query;
 
 pub use error::{SysError, SysResult};
 pub use syscall::{LogLevel, Handle, ObjHandle, ObjectType};
