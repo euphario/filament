@@ -11,6 +11,7 @@ pub mod gpio;
 pub mod handle;
 pub mod hw;
 pub mod ls;
+pub mod lsdev;
 pub mod ps;
 
 // Future builtins:

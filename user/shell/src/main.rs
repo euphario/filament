@@ -10,6 +10,7 @@ mod builtins;
 mod color;
 mod completion;
 mod console;
+mod input_box;
 mod output;
 mod readline;
 
@@ -85,7 +86,7 @@ fn main() {
             }
         }
 
-        // Colored prompt
+        // Draw prompt
         color::set(color::BOLD);
         color::set(color::GREEN);
         console::write(b"> ");
@@ -243,6 +244,14 @@ fn execute_command(cmd: &[u8]) {
         builtins::ls::run(b"").print();
     } else if cmd_starts_with(cmd, b"ls ") {
         builtins::ls::run(&cmd[3..]).print();
+    } else if cmd_eq(cmd, b"lsdev") {
+        builtins::lsdev::cmd_lsdev(b"");
+    } else if cmd_starts_with(cmd, b"lsdev ") {
+        builtins::lsdev::cmd_lsdev(&cmd[6..]);
+    } else if cmd_starts_with(cmd, b"devinfo ") {
+        builtins::lsdev::cmd_devinfo(&cmd[8..]);
+    } else if cmd_starts_with(cmd, b"devquery ") {
+        builtins::lsdev::cmd_devquery(&cmd[9..]);
     } else if cmd_starts_with(cmd, b"cat ") {
         cmd_cat(&cmd[4..]);
     } else {
@@ -366,6 +375,9 @@ fn cmd_help() {
     help_line("hw [path]", "Hardware info (list/bus/tree/<path>)");
     help_line("handle", "Test handle API (timer/channel/poll)");
     help_line("devd spawn", "Spawn driver via devd (with caps)");
+    help_line("lsdev [class]", "List registered devices");
+    help_line("devinfo <id>", "Get device info by ID");
+    help_line("devquery <id>", "Query driver (blockinfo/partition)");
     help_line("yield", "Yield CPU to other processes");
     help_line("ps", "Show running processes");
     help_line("kill <pid>", "Terminate a process");
@@ -784,7 +796,7 @@ fn cmd_logs(arg: &[u8]) {
             println!("Log lines must be 0-255 (0 = auto)");
             return;
         }
-        console::console().set_log_lines(n as u8);
+        console::console_mut().set_log_lines(n as u8);
         if n == 0 {
             println!("Log lines set to auto");
         } else {
