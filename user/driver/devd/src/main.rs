@@ -28,13 +28,14 @@ mod ports;
 mod process;
 mod deps;
 mod devices;
+mod query;
 
 use userlib::syscall::{self, LogLevel};
-use userlib::ipc::{Port, Timer, Channel, EventLoop, ObjHandle};
+use userlib::ipc::{Port, Timer, EventLoop, ObjHandle};
 use userlib::error::{SysError, SysResult};
 
 use service::{
-    Service, ServiceState, ServiceManager, ServiceRegistry,
+    ServiceState, ServiceManager, ServiceRegistry,
     MAX_SERVICES, MAX_PORTS_PER_SERVICE, MAX_RESTARTS,
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
 };
@@ -42,6 +43,7 @@ use ports::{PortRegistry, Ports};
 use process::{ProcessManager, SyscallProcessManager};
 use deps::{DependencyResolver, Dependencies};
 use devices::{DeviceStore, DeviceRegistry};
+use query::{QueryHandler, MSG_BUFFER_SIZE};
 
 // =============================================================================
 // Logging
@@ -96,6 +98,8 @@ macro_rules! derror {
 pub struct Devd {
     /// Our port for services to announce ready
     port: Option<Port>,
+    /// Query port for device queries
+    query_port: Option<Port>,
     /// Event loop
     events: Option<EventLoop>,
     /// Service registry
@@ -108,18 +112,22 @@ pub struct Devd {
     deps: Dependencies,
     /// Device registry (for hierarchical queries)
     devices: DeviceRegistry,
+    /// Query handler for client connections
+    query_handler: QueryHandler,
 }
 
 impl Devd {
     pub const fn new() -> Self {
         Self {
             port: None,
+            query_port: None,
             events: None,
             services: ServiceRegistry::new(),
             ports: Ports::new(),
             process_mgr: SyscallProcessManager::new(),
             deps: Dependencies::new(),
             devices: DeviceRegistry::new(),
+            query_handler: QueryHandler::new(),
         }
     }
 
@@ -144,11 +152,18 @@ impl Devd {
         syscall::klog(LogLevel::Info, b"[devd] init: watching port");
         events.watch(port.handle())?;
 
+        syscall::klog(LogLevel::Info, b"[devd] init: registering query port devd-query:");
+        let query_port = Port::register(b"devd-query:")?;
+        syscall::klog(LogLevel::Info, b"[devd] init: watching query port");
+        events.watch(query_port.handle())?;
+
         self.port = Some(port);
+        self.query_port = Some(query_port);
         self.events = Some(events);
 
         syscall::klog(LogLevel::Info, b"[devd] init: registering in internal registry");
         self.ports.register(b"devd:", 0xFF)?; // 0xFF = devd itself
+        self.ports.register(b"devd-query:", 0xFF)?;
 
         syscall::klog(LogLevel::Info, b"[devd] init: initializing services");
         self.services.init_from_defs();
@@ -600,6 +615,149 @@ impl Devd {
     }
 
     // =========================================================================
+    // Query Event Handling
+    // =========================================================================
+
+    fn handle_query_port_event(&mut self) {
+        let query_port = match &mut self.query_port {
+            Some(p) => p,
+            None => return,
+        };
+
+        match query_port.accept_with_pid() {
+            Ok((channel, client_pid)) => {
+                // Check if this is a known service (driver)
+                let service_idx = self.services.find_by_pid(client_pid)
+                    .filter(|&i| {
+                        self.services.get(i)
+                            .map(|s| s.state == ServiceState::Ready)
+                            .unwrap_or(false)
+                    })
+                    .map(|i| i as u8);
+
+                // Add to event loop
+                if let Some(events) = &mut self.events {
+                    let _ = events.watch(channel.handle());
+                }
+
+                // Add to query handler
+                match self.query_handler.add_client(channel, service_idx) {
+                    Some(slot) => {
+                        let client_type = if service_idx.is_some() { "driver" } else { "client" };
+                        dlog!("query: {} connected (slot={}, pid={})", client_type, slot, client_pid);
+                    }
+                    None => {
+                        derror!("query: too many clients, rejecting pid={}", client_pid);
+                    }
+                }
+            }
+            Err(SysError::WouldBlock) => {}
+            Err(e) => {
+                derror!("query: accept failed err={:?}", e);
+            }
+        }
+    }
+
+    fn handle_query_client_event(&mut self, handle: ObjHandle) {
+        let slot = match self.query_handler.find_by_handle(handle) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Read message from client
+        let mut recv_buf = [0u8; MSG_BUFFER_SIZE];
+        let mut response_buf = [0u8; MSG_BUFFER_SIZE];
+
+        let client = match self.query_handler.get_mut(slot) {
+            Some(c) => c,
+            None => return,
+        };
+
+        match client.channel.recv(&mut recv_buf) {
+            Ok(len) if len > 0 => {
+                // Process the message
+                let response_len = self.query_handler.handle_message(
+                    slot,
+                    &recv_buf[..len],
+                    &mut self.devices,
+                    &self.services,
+                    &mut response_buf,
+                );
+
+                // Send response if there is one
+                if let Some(resp_len) = response_len {
+                    if let Some(client) = self.query_handler.get_mut(slot) {
+                        let _ = client.channel.send(&response_buf[..resp_len]);
+                    }
+                } else {
+                    // QUERY_DRIVER needs special handling - forward to driver
+                    self.handle_query_driver_forward(slot, &recv_buf[..len]);
+                }
+            }
+            Ok(_) => {
+                // Empty read or EOF - client disconnected
+                self.remove_query_client(slot);
+            }
+            Err(SysError::WouldBlock) => {}
+            Err(e) => {
+                derror!("query: recv failed slot={} err={:?}", slot, e);
+                self.remove_query_client(slot);
+            }
+        }
+    }
+
+    fn handle_query_driver_forward(&mut self, _client_slot: usize, buf: &[u8]) {
+        use userlib::query::{ErrorResponse, QueryHeader, error};
+
+        // Parse the driver query
+        let parsed = self.query_handler.parse_driver_query(buf, &self.devices);
+
+        let (seq_id, driver_idx, _query_type, _payload) = match parsed {
+            Some(p) => p,
+            None => {
+                // Send error response
+                if let Some(header) = QueryHeader::from_bytes(buf) {
+                    let resp = ErrorResponse::new(header.seq_id, error::NOT_FOUND);
+                    if let Some(client) = self.query_handler.get_mut(_client_slot) {
+                        let _ = client.channel.send(&resp.to_bytes());
+                    }
+                }
+                return;
+            }
+        };
+
+        // Find driver's channel
+        let driver_channel = self.services.get(driver_idx as usize)
+            .and_then(|s| s.channel.as_ref());
+
+        match driver_channel {
+            Some(_ch) => {
+                // TODO: Forward query to driver and wait for response
+                // For now, return NOT_SUPPORTED since we haven't integrated driver-side handling
+                let resp = ErrorResponse::new(seq_id, error::NOT_SUPPORTED);
+                if let Some(client) = self.query_handler.get_mut(_client_slot) {
+                    let _ = client.channel.send(&resp.to_bytes());
+                }
+            }
+            None => {
+                let resp = ErrorResponse::new(seq_id, error::NO_DRIVER);
+                if let Some(client) = self.query_handler.get_mut(_client_slot) {
+                    let _ = client.channel.send(&resp.to_bytes());
+                }
+            }
+        }
+    }
+
+    fn remove_query_client(&mut self, slot: usize) {
+        if let Some(channel) = self.query_handler.remove_client(slot) {
+            if let Some(events) = &mut self.events {
+                let _ = events.unwatch(channel.handle());
+            }
+            dlog!("query: client disconnected slot={}", slot);
+        }
+    }
+
+    // =========================================================================
     // Main Loop
     // =========================================================================
 
@@ -613,12 +771,26 @@ impl Devd {
 
             match wait_result {
                 Ok(handle) => {
-                    // Port event?
+                    // Service port event?
                     if let Some(port) = &self.port {
                         if handle == port.handle() {
                             self.handle_port_event();
                             continue;
                         }
+                    }
+
+                    // Query port event?
+                    if let Some(query_port) = &self.query_port {
+                        if handle == query_port.handle() {
+                            self.handle_query_port_event();
+                            continue;
+                        }
+                    }
+
+                    // Query client message?
+                    if self.query_handler.find_by_handle(handle).is_some() {
+                        self.handle_query_client_event(handle);
+                        continue;
                     }
 
                     // Service restart timer?
