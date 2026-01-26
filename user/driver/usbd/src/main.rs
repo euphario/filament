@@ -28,6 +28,10 @@ pub use bot_state::{BotStateMachine, DeviceState, TransferPhase, RecoveryState, 
 use userlib::{println, syscall};
 use userlib::{uinfo, uwarn, uerror};
 use userlib::syscall::O_NONBLOCK;
+use userlib::query::{
+    QueryHeader, DeviceRegister, DeviceInfoResponse, ErrorResponse,
+    msg, class, state, error,
+};
 use userlib::syscall::{
     Handle, WaitFilter, WaitRequest, WaitResult,
     handle_timer_create, handle_timer_set, handle_wait,
@@ -208,6 +212,11 @@ pub struct MscDeviceInfo {
     pub bulk_out_addr: u8,
     // Interface number (for BOT Reset)
     pub interface_num: u8,
+    // USB device identifiers (for devd registration)
+    pub vendor_id: u16,
+    pub product_id: u16,
+    // Device ID assigned by devd (0 = not registered)
+    pub devd_device_id: u32,
     // EP0 ring for control transfers (for USB recovery)
     pub ep0_ring: *mut Trb,
     pub ep0_ring_phys: u64,
@@ -3743,6 +3752,10 @@ impl UsbDriver {
                     bulk_in_addr: ctx.bulk_in_addr,
                     bulk_out_addr: ctx.bulk_out_addr,
                     interface_num: ctx.interface_num,
+                    // USB device identifiers (populated later if needed)
+                    vendor_id: 0,
+                    product_id: 0,
+                    devd_device_id: 0,
                     ep0_ring: ctx.ep0_ring,
                     ep0_ring_phys: ctx.ep0_ring_phys,
                     ep0_enqueue: ctx.ep0_enqueue,
@@ -4589,6 +4602,124 @@ fn request_vbus_enable() -> bool {
 }
 
 // =============================================================================
+// Device Registration with devd
+// =============================================================================
+
+/// Register MSC device with devd for hierarchical query support
+/// Returns the device ID assigned by devd, or 0 on failure
+fn register_device_with_devd(
+    vendor_id: u16,
+    product_id: u16,
+    block_size: u32,
+    block_count: u64,
+) -> u32 {
+    // Connect to devd-query port
+    let channel = syscall::port_connect(b"devd-query:");
+    if channel < 0 {
+        uwarn!("usbd", "devd_connect_failed"; err = channel as i64);
+        return 0;
+    }
+    let ch = channel as u32;
+
+    // Build REGISTER_DEVICE message
+    let mut msg_buf = [0u8; 128];
+    let reg = DeviceRegister::new(
+        1, // seq_id
+        class::MASS_STORAGE,
+        0, // subclass
+        vendor_id,
+        product_id,
+    );
+
+    // Path for the device (e.g., "/usb/msc0")
+    let path = b"/usb/msc0";
+    let name = b"USB Mass Storage";
+
+    let msg_len = match reg.write_to(&mut msg_buf, path, name) {
+        Some(len) => len,
+        None => {
+            syscall::channel_close(ch);
+            return 0;
+        }
+    };
+
+    // Send registration request
+    if syscall::send(ch, &msg_buf[..msg_len]) < 0 {
+        syscall::channel_close(ch);
+        return 0;
+    }
+
+    // Receive response
+    let mut response = [0u8; 64];
+    let recv_len = syscall::receive(ch, &mut response);
+    syscall::channel_close(ch);
+
+    if recv_len <= 0 {
+        return 0;
+    }
+
+    // Parse response
+    let header = match QueryHeader::from_bytes(&response) {
+        Some(h) => h,
+        None => return 0,
+    };
+
+    if header.msg_type == msg::DEVICE_INFO {
+        // Success - extract device_id from DeviceInfoResponse
+        if response.len() >= DeviceInfoResponse::FIXED_SIZE {
+            let device_id = u32::from_le_bytes([
+                response[8], response[9], response[10], response[11],
+            ]);
+            uinfo!("usbd", "devd_registered"; device_id = device_id as u64);
+            return device_id;
+        }
+    } else if header.msg_type == msg::ERROR {
+        if let Some(err_resp) = ErrorResponse::from_bytes(&response) {
+            uwarn!("usbd", "devd_register_error"; code = err_resp.error_code as i64);
+        }
+    }
+
+    0
+}
+
+/// Update device state with devd
+fn update_device_state_with_devd(device_id: u32, new_state: u8) -> bool {
+    let channel = syscall::port_connect(b"devd-query:");
+    if channel < 0 {
+        return false;
+    }
+    let ch = channel as u32;
+
+    // Build UPDATE_STATE message (header + device_id + state)
+    let mut msg_buf = [0u8; 16];
+    let header = QueryHeader::new(msg::UPDATE_STATE, 1);
+    msg_buf[0..8].copy_from_slice(&header.to_bytes());
+    msg_buf[8..12].copy_from_slice(&device_id.to_le_bytes());
+    msg_buf[12] = new_state;
+
+    if syscall::send(ch, &msg_buf[..13]) < 0 {
+        syscall::channel_close(ch);
+        return false;
+    }
+
+    // Wait for response
+    let mut response = [0u8; 16];
+    let recv_len = syscall::receive(ch, &mut response);
+    syscall::channel_close(ch);
+
+    if recv_len <= 0 {
+        return false;
+    }
+
+    // Check for success (error code 0)
+    if let Some(err_resp) = ErrorResponse::from_bytes(&response) {
+        err_resp.error_code == error::OK
+    } else {
+        false
+    }
+}
+
+// =============================================================================
 // Block Device Server (Ring Buffer)
 // =============================================================================
 
@@ -4897,6 +5028,21 @@ fn main() {
         let ports_to_enum = driver.poll_events();
         if ports_to_enum != 0 {
             driver.enumerate_pending_ports(ports_to_enum);
+        }
+    }
+
+    // Register MSC device with devd for hierarchical query support
+    if let Some(ref mut msc) = driver.msc_device {
+        let device_id = register_device_with_devd(
+            msc.vendor_id,
+            msc.product_id,
+            msc.block_size,
+            msc.block_count,
+        );
+        if device_id != 0 {
+            msc.devd_device_id = device_id;
+            // Update state to OPERATIONAL
+            update_device_state_with_devd(device_id, state::OPERATIONAL);
         }
     }
 
