@@ -483,12 +483,13 @@ pub struct Shmem {
 impl Shmem {
     /// Create a new shared memory region of the given size
     pub fn create(size: usize) -> SysResult<Self> {
-        let handle = open(ObjectType::Shmem, &(size as u64).to_le_bytes())?;
-        // After open, handle has vaddr. Use map() to get the address
+        // Use special shmem open that returns both handle and shmem_id
+        let (handle, shmem_id) = crate::syscall::open_shmem_create(size)?;
+        // After open, use map() to get the address
         let vaddr = map(handle, 0)?;
         Ok(Self {
             handle,
-            shmem_id: handle.0, // Use handle as ID for now
+            shmem_id,
             vaddr,
             size,
         })
@@ -638,6 +639,170 @@ impl Msi {
 }
 
 impl Drop for Msi {
+    fn drop(&mut self) {
+        let _ = close(self.handle);
+    }
+}
+
+// ============================================================================
+// PipeRing - High-performance IPC with typed messages
+// ============================================================================
+
+/// High-performance ring buffer IPC
+///
+/// Memory layout:
+/// ```text
+/// [RingHeader (64 bytes)][TX Ring][RX Ring]
+/// ```
+///
+/// # Usage
+///
+/// ```ignore
+/// // Create a ring with preset configuration
+/// let ring = PipeRing::create(abi::ring_presets::CONSOLE_TX, abi::ring_presets::CONSOLE_RX)?;
+///
+/// // Map to access shared memory
+/// let addr = ring.map()?;
+///
+/// // Get header for atomic operations
+/// let header = ring.header();
+/// ```
+pub struct PipeRing {
+    handle: ObjHandle,
+    vaddr: u64,
+    tx_config: u16,
+    rx_config: u16,
+}
+
+impl PipeRing {
+    /// Create a new pipe ring
+    ///
+    /// # Arguments
+    /// * `tx_config` - TX ring configuration (use `abi::ring_presets::*`)
+    /// * `rx_config` - RX ring configuration
+    pub fn create(tx_config: u16, rx_config: u16) -> SysResult<Self> {
+        let params = abi::RingParams { tx: tx_config, rx: rx_config };
+        let params_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &params as *const abi::RingParams as *const u8,
+                core::mem::size_of::<abi::RingParams>()
+            )
+        };
+        let handle = open(ObjectType::Ring, params_bytes)?;
+        Ok(Self {
+            handle,
+            vaddr: 0,
+            tx_config,
+            rx_config,
+        })
+    }
+
+    /// Create with preset for console output (large TX, small RX)
+    pub fn console_out() -> SysResult<Self> {
+        Self::create(abi::ring_presets::CONSOLE_TX, abi::ring_presets::CONSOLE_RX)
+    }
+
+    /// Create with balanced configuration
+    pub fn balanced() -> SysResult<Self> {
+        Self::create(abi::ring_presets::BALANCED, abi::ring_presets::BALANCED)
+    }
+
+    /// Create with bulk configuration (large buffers)
+    pub fn bulk() -> SysResult<Self> {
+        Self::create(abi::ring_presets::BULK, abi::ring_presets::BULK)
+    }
+
+    pub fn handle(&self) -> ObjHandle { self.handle }
+    pub fn is_mapped(&self) -> bool { self.vaddr != 0 }
+    pub fn vaddr(&self) -> u64 { self.vaddr }
+
+    /// Map the ring into address space
+    pub fn map_ring(&mut self) -> SysResult<u64> {
+        if self.vaddr != 0 {
+            return Ok(self.vaddr);
+        }
+        let addr = map(self.handle, 0)?;  // flags = 0 for default mapping
+        self.vaddr = addr;
+        Ok(addr)
+    }
+
+    /// Get the ring header (must be mapped first)
+    ///
+    /// # Safety
+    /// Caller must ensure the ring is mapped before calling this.
+    pub fn header(&self) -> Option<&abi::RingHeader> {
+        if self.vaddr == 0 {
+            return None;
+        }
+        Some(unsafe { &*(self.vaddr as *const abi::RingHeader) })
+    }
+
+    /// Get mutable reference to ring header
+    ///
+    /// # Safety
+    /// Caller must ensure the ring is mapped before calling this.
+    pub fn header_mut(&mut self) -> Option<&mut abi::RingHeader> {
+        if self.vaddr == 0 {
+            return None;
+        }
+        Some(unsafe { &mut *(self.vaddr as *mut abi::RingHeader) })
+    }
+
+    /// Get TX ring size in bytes
+    pub fn tx_ring_size(&self) -> usize {
+        abi::ring_config::ring_size(self.tx_config)
+    }
+
+    /// Get RX ring size in bytes
+    pub fn rx_ring_size(&self) -> usize {
+        abi::ring_config::ring_size(self.rx_config)
+    }
+
+    /// Get TX slot size in bytes
+    pub fn tx_slot_size(&self) -> usize {
+        abi::ring_config::slot_size(self.tx_config)
+    }
+
+    /// Get RX slot size in bytes
+    pub fn rx_slot_size(&self) -> usize {
+        abi::ring_config::slot_size(self.rx_config)
+    }
+
+    /// Get pointer to TX ring buffer (must be mapped first)
+    pub fn tx_ring_ptr(&self) -> Option<*mut u8> {
+        if self.vaddr == 0 {
+            return None;
+        }
+        Some(unsafe { (self.vaddr as *mut u8).add(64) })
+    }
+
+    /// Get pointer to RX ring buffer (must be mapped first)
+    pub fn rx_ring_ptr(&self) -> Option<*mut u8> {
+        if self.vaddr == 0 {
+            return None;
+        }
+        Some(unsafe { (self.vaddr as *mut u8).add(64 + self.tx_ring_size()) })
+    }
+
+    /// Notify peer that data is available
+    ///
+    /// Call this after writing to the TX ring to wake the peer.
+    pub fn notify(&self) -> SysResult<()> {
+        write(self.handle, &[])?;
+        Ok(())
+    }
+
+    /// Wait for data to be available
+    ///
+    /// Blocks until peer notifies or ring is closed.
+    pub fn wait(&self) -> SysResult<()> {
+        let mut buf = [0u8; 0];
+        read(self.handle, &mut buf)?;
+        Ok(())
+    }
+}
+
+impl Drop for PipeRing {
     fn drop(&mut self) {
         let _ = close(self.handle);
     }

@@ -1,79 +1,181 @@
-//! Console I/O via consoled
+//! Console I/O via ring buffer
 //!
-//! All shell I/O goes through consoled channel - no direct UART access.
-//! Shell must connect to consoled before producing any output.
+//! High-performance I/O using ConsoleRing shared memory.
+//! Shell connects to consoled port, receives shmem_id, maps the ring.
 //!
-//! Uses the unified 5-syscall interface (open, read, write, map, close).
+//! ## Protocol
+//!
+//! 1. Connect to "console:" port (Channel)
+//! 2. Receive "RING" + shmem_id + cols + rows message
+//! 3. Map the shmem as ConsoleRing
+//! 4. Use TX ring for output, RX ring for input
 
-use userlib::ipc::Channel;
-
-/// Receive buffer size - holds one complete message from consoled
-const RX_BUFFER_SIZE: usize = 64;
+use userlib::ipc::{Channel, Mux, MuxFilter};
+use userlib::console_ring::ConsoleRing;
 
 /// Console I/O state
 pub struct Console {
-    /// Channel to consoled (if connected)
-    channel: Option<Channel>,
+    /// Ring buffer for I/O (primary path once connected)
+    ring: Option<ConsoleRing>,
+    /// Channel used during handshake (kept alive to maintain connection)
+    handshake_channel: Option<Channel>,
     /// Terminal dimensions
     pub cols: u16,
     pub rows: u16,
     /// Log split enabled
     pub log_split: bool,
-    /// Receive buffer for partial message handling
-    rx_buf: [u8; RX_BUFFER_SIZE],
-    /// Read position in rx_buf
-    rx_read: usize,
-    /// Write position in rx_buf (amount of data available)
-    rx_write: usize,
 }
 
 impl Console {
     /// Create new console I/O (does not connect yet)
     pub const fn new() -> Self {
         Self {
-            channel: None,
+            ring: None,
+            handshake_channel: None,
             cols: 80,
             rows: 24,
             log_split: false,
-            rx_buf: [0u8; RX_BUFFER_SIZE],
-            rx_read: 0,
-            rx_write: 0,
         }
     }
 
     /// Connect to consoled
     /// Returns true if connected, false if falling back to direct UART
     pub fn connect(&mut self) -> bool {
-        match Channel::connect(b"console:") {
-            Ok(mut channel) => {
-                // Query terminal size (query-response protocol)
-                if channel.send(b"GETSIZE\n").is_ok() {
-                    // Wait for SIZE response using event-driven blocking
-                    use userlib::ipc::{Mux, MuxFilter};
+        // Connect to consoled port
+        let mut channel = match Channel::connect(b"console:") {
+            Ok(ch) => ch,
+            Err(_) => return false,
+        };
 
-                    if let Ok(mux) = Mux::new() {
-                        // Add channel to mux, wait for readable
-                        if mux.add(channel.handle(), MuxFilter::Readable).is_ok() {
-                            // Block until channel is readable
-                            if mux.wait().is_ok() {
-                                // Now read the response
-                                let mut buf = [0u8; 32];
-                                if let Ok(n) = channel.recv(&mut buf) {
-                                    self.parse_size_msg(&buf[..n]);
-                                }
-                            }
-                        }
-                    }
+        // Wait for RING message using mux
+        let mux = match Mux::new() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        if mux.add(channel.handle(), MuxFilter::Readable).is_err() {
+            return false;
+        }
+
+        // Block until channel is readable
+        if mux.wait().is_err() {
+            return false;
+        }
+
+        // Read the RING message
+        let mut buf = [0u8; 16];
+        let n = match channel.recv(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+
+        // Parse: "RING" + shmem_id (4 bytes) + cols (2 bytes) + rows (2 bytes)
+        if n < 12 || &buf[..4] != b"RING" {
+            return false;
+        }
+
+        let shmem_id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let cols = u16::from_le_bytes([buf[8], buf[9]]);
+        let rows = u16::from_le_bytes([buf[10], buf[11]]);
+
+        // Map the ring
+        let ring = match ConsoleRing::map(shmem_id) {
+            Some(r) => r,
+            None => return false,
+        };
+
+        self.ring = Some(ring);
+        self.handshake_channel = Some(channel);
+        self.cols = cols;
+        self.rows = rows;
+
+        true
+    }
+
+    /// Check if connected to consoled
+    pub fn is_connected(&self) -> bool {
+        self.ring.is_some()
+    }
+
+    /// Read a single byte (blocking)
+    /// Uses RX ring (consoled -> shell)
+    pub fn read_byte(&mut self) -> Option<u8> {
+        let ring = self.ring.as_ref()?;
+
+        // First check if data is available
+        loop {
+            let available = ring.rx_available();
+            if available > 0 {
+                let mut byte = [0u8; 1];
+                let n = ring.rx_read(&mut byte);
+                if n > 0 {
+                    return Some(byte[0]);
                 }
-
-                self.channel = Some(channel);
-                true
             }
-            Err(_) => {
-                // Can't connect to consoled
-                false
+
+            // No data - wait indefinitely for notification
+            // The shmem pending_for mechanism ensures we don't miss notifications
+            ring.wait(0);
+        }
+    }
+
+    /// Write bytes to console
+    /// Uses TX ring (shell -> consoled)
+    pub fn write(&self, data: &[u8]) {
+        let ring = match &self.ring {
+            Some(r) => r,
+            None => return, // Not connected, drop output
+        };
+
+        let mut offset = 0;
+        while offset < data.len() {
+            let written = ring.tx_write(&data[offset..]);
+
+            if written > 0 {
+                offset += written;
+                // Notify consoled that data is available
+                ring.notify();
+            } else {
+                // TX ring full - wait a bit for consoled to drain
+                if !ring.wait(1) {
+                    userlib::syscall::sleep_us(1_000); // 1ms backoff
+                }
             }
         }
+    }
+
+    /// Write a string to console
+    pub fn write_str(&self, s: &str) {
+        self.write(s.as_bytes());
+    }
+
+    /// Query terminal size from consoled
+    /// Returns (cols, rows) on success
+    pub fn query_size(&mut self) -> Option<(u16, u16)> {
+        let ring = self.ring.as_ref()?;
+
+        // Send GETSIZE query via TX ring
+        ring.tx_write(b"GETSIZE\n");
+        ring.notify();
+
+        // Wait for SIZE response in RX ring
+        for _ in 0..100 {
+            if ring.rx_available() >= 5 {
+                let mut buf = [0u8; 32];
+                let n = ring.rx_read(&mut buf);
+                if n >= 5 && &buf[..5] == b"SIZE " {
+                    self.parse_size_msg(&buf[..n]);
+                    return Some((self.cols, self.rows));
+                }
+            }
+            // If wait fails, use sleep_us backoff to prevent storm
+            if !ring.wait(10) {
+                userlib::syscall::sleep_us(10_000); // 10ms backoff
+            }
+        }
+
+        // Timeout - return cached size
+        Some((self.cols, self.rows))
     }
 
     /// Parse "SIZE cols rows\n" message
@@ -112,112 +214,6 @@ impl Console {
         }
     }
 
-    /// Check if connected to consoled
-    pub fn is_connected(&self) -> bool {
-        self.channel.is_some()
-    }
-
-    /// Read a single byte (blocking)
-    /// All input comes from consoled channel - no direct UART access
-    /// Uses internal buffer to handle message-oriented IPC where kernel
-    /// delivers complete messages that may contain multiple bytes.
-    pub fn read_byte(&mut self) -> Option<u8> {
-        use userlib::ipc::{Mux, MuxFilter};
-        use userlib::error::SysError;
-
-        // First, check if we have buffered data
-        if self.rx_read < self.rx_write {
-            let byte = self.rx_buf[self.rx_read];
-            self.rx_read += 1;
-            return Some(byte);
-        }
-
-        // Buffer empty - need to receive more data
-        let channel = self.channel.as_mut()?;
-
-        // Loop until we get data - kernel returns WouldBlock if nothing queued
-        loop {
-            // Reset buffer positions before receiving
-            self.rx_read = 0;
-            self.rx_write = 0;
-
-            match channel.recv(&mut self.rx_buf) {
-                Ok(n) if n > 0 => {
-                    // Got data - return first byte, keep rest in buffer
-                    self.rx_write = n;
-                    self.rx_read = 1;
-                    return Some(self.rx_buf[0]);
-                }
-                Ok(_) => return None, // EOF
-                Err(SysError::WouldBlock) => {
-                    // No data yet - wait for channel to be readable using Mux
-                    if let Ok(mux) = Mux::new() {
-                        if mux.add(channel.handle(), MuxFilter::Readable).is_ok() {
-                            let _ = mux.wait(); // Block until readable
-                        }
-                    }
-                    // Loop back and try recv again
-                }
-                Err(_) => {
-                    // Connection lost (not WouldBlock)
-                    self.channel = None;
-                    return None;
-                }
-            }
-        }
-    }
-
-    /// Write bytes to console
-    /// All output goes through consoled channel - no direct UART access
-    pub fn write(&self, data: &[u8]) {
-        if let Some(channel) = &self.channel {
-            // Write to consoled channel only - retry if queue full
-            let mut retries = 0u32;
-            loop {
-                match channel.send(data) {
-                    Ok(()) => {
-                        // Log if we had many retries (indicates backpressure)
-                        if retries > 10 {
-                            userlib::syscall::klog(
-                                userlib::syscall::LogLevel::Warn,
-                                b"[shell] write retries: high"
-                            );
-                        }
-                        break;
-                    }
-                    Err(userlib::error::SysError::WouldBlock) => {
-                        // Queue full - yield and retry
-                        retries += 1;
-                        userlib::syscall::sleep_us(100);
-                    }
-                    Err(_) => {
-                        // Log unexpected errors
-                        userlib::syscall::klog(
-                            userlib::syscall::LogLevel::Error,
-                            b"[shell] write failed"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-        // If not connected, output is silently dropped
-        // Shell must connect to consoled before producing output
-    }
-
-    /// Write a string to console
-    pub fn write_str(&self, s: &str) {
-        self.write(s.as_bytes());
-    }
-
-    /// Query terminal size from consoled
-    /// Returns (cols, rows) on success
-    pub fn query_size(&mut self) -> Option<(u16, u16)> {
-        // For now, just return cached size
-        // In the future, could send a query message to consoled
-        Some((self.cols, self.rows))
-    }
-
     /// Set log split (placeholder - no protocol for this yet)
     pub fn set_log_split(&mut self, enabled: bool) {
         self.log_split = enabled;
@@ -246,9 +242,7 @@ pub fn init() -> bool {
             return true;
         }
         // Small delay before retry
-        for _ in 0..100000 {
-            core::hint::spin_loop();
-        }
+        userlib::syscall::sleep_us(100_000); // 100ms
     }
     false
 }

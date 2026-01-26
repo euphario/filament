@@ -118,7 +118,7 @@ pub use tcb::{
     enter_usermode, context_switch,
 };
 
-use crate::{kinfo, kerror, print_direct, klog};
+use crate::{kerror, print_direct};
 
 // ============================================================================
 // Error Handling Macros for State Transitions
@@ -408,7 +408,6 @@ impl Scheduler {
                     if current_tick >= deadline {
                         // Deadline expired - wake the task
                         // Note: Don't reset liveness state for timeout - task didn't respond
-                        crate::kdebug!("sched", "deadline_wake"; pid = task.id as u64);
                         crate::transition_or_log!(task, wake);
                         woken += 1;
                         need_recalculate = true;
@@ -861,9 +860,6 @@ impl Scheduler {
     /// # Safety
     /// Task must be properly set up with valid trap frame and address space.
     pub unsafe fn prepare_user_task(&mut self, slot: usize) -> Option<(*const TrapFrame, u64)> {
-        // This should only be called ONCE at boot from kernel_main
-        kinfo!("task", "run_user_task_entry"; slot = slot as u64);
-
         // Set current task slot for this CPU
         set_current_slot(slot);
 
@@ -887,12 +883,6 @@ impl Scheduler {
         // Set globals for exception handler (atomic for SMP safety)
         CURRENT_TRAP_FRAME.store(trap_frame, Ordering::Release);
         CURRENT_TTBR0.store(ttbr0, Ordering::Release);
-
-        kinfo!("task", "enter_user";
-            entry = klog::hex64(task.trap_frame.elr_el1),
-            stack = klog::hex64(task.trap_frame.sp_el0),
-            ttbr0 = klog::hex64(ttbr0)
-        );
 
         Some((trap_frame as *const TrapFrame, ttbr0))
     }
@@ -1284,21 +1274,26 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     let need_resched = crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched();
 
     // Check if we need to reschedule (must hold IrqGuard for SMP safety)
-    let should_resched = if need_resched {
-        true
+    let (should_resched, blocked_pid) = if need_resched {
+        (true, 0)
     } else {
         // Check if current task is blocked - requires lock for safe access
         with_scheduler(|sched| {
             let my_slot = current_slot();
-            sched.tasks[my_slot]
-                .as_ref()
-                .map(|t| t.is_blocked())
-                .unwrap_or(false)
+            match sched.tasks[my_slot].as_ref() {
+                Some(t) if t.is_blocked() => (true, t.id),
+                _ => (false, 0),
+            }
         })
     };
 
     if !should_resched {
         return;
+    }
+
+    // Debug: log when we're about to reschedule due to blocked task
+    if blocked_pid != 0 {
+        crate::kdebug!("resched", "blocked_resched"; pid = blocked_pid as u64);
     }
 
     // Delegate to sched::reschedule() which properly handles:

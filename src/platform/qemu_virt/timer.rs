@@ -73,8 +73,10 @@ impl Timer {
             let current_counter = Self::read_cntpct();
             crate::kernel::sched::timer_tick(current_counter);
 
-            unsafe {
-                crate::kernel::task::scheduler().reap_terminated(self.tick_count);
+            // Reap terminated tasks - use try_scheduler to avoid deadlock
+            // if scheduler lock is held by interrupted syscall
+            if let Some(mut sched) = crate::kernel::task::try_scheduler() {
+                sched.reap_terminated(self.tick_count);
             }
 
             // Continue bus init (no-op for QEMU without PCIe)

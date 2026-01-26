@@ -99,10 +99,10 @@ impl Timer {
             let current_counter = Self::read_cntpct();
             crate::kernel::sched::timer_tick(current_counter);
 
-            // Reap terminated tasks (orphan processes that exited)
-            // Safe to do here since we're not running on the terminated task's stack
-            unsafe {
-                crate::kernel::task::scheduler().reap_terminated(self.tick_count);
+            // Reap terminated tasks - use try_scheduler to avoid deadlock
+            // if scheduler lock is held by interrupted syscall
+            if let Some(mut sched) = crate::kernel::task::try_scheduler() {
+                sched.reap_terminated(self.tick_count);
             }
 
             // Continue bus initialization (one bus per tick until all Safe)
@@ -222,10 +222,15 @@ impl TimerTrait for Timer {
             crate::klog::try_drain(8);
             super::uart::try_flush_buffer();
 
+            // Use try_scheduler to avoid deadlock if scheduler lock is held
+            // by interrupted syscall
             let current_counter = Self::read_cntpct();
-            unsafe {
-                crate::kernel::task::scheduler().check_timeouts(current_counter);
-                crate::kernel::task::scheduler().reap_terminated(self.tick_count);
+            if let Some(mut sched) = crate::kernel::task::try_scheduler() {
+                sched.check_timeouts(current_counter);
+                sched.reap_terminated(self.tick_count);
+            } else {
+                // Lock held - skip this tick, set need_resched to retry later
+                crate::arch::aarch64::sync::cpu_flags().set_need_resched();
             }
 
             let ticks = (self.frequency * self.time_slice_ms) / 1000;

@@ -81,6 +81,7 @@ impl ObjectOps for KernelObjectOps {
             ObjectType::PciDevice => 13,
             ObjectType::Msi => 14,
             ObjectType::BusList => 15,
+            ObjectType::Ring => 16,
         };
 
         // Call the existing open syscall

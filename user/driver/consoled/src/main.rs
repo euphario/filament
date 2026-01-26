@@ -1,20 +1,22 @@
 //! Console Daemon (consoled)
 //!
-//! Simple console multiplexer - forwards UART input to shell, shell output to UART.
-//! Uses the unified 5-syscall interface (open, read, write, map, close).
+//! High-performance console multiplexer using ring buffer IPC.
+//! Forwards UART input to shell, shell output to UART.
 //!
 //! ## Design
 //!
-//! Minimal design - no split screen, just a pipe between UART and shell.
-//! Shell connects to "console:" port, then bidirectional forwarding begins.
+//! Uses ConsoleRing for lock-free bidirectional I/O with shell:
+//! - TX ring: shell output -> consoled -> UART (large buffer for burst writes)
+//! - RX ring: UART input -> consoled -> shell (small buffer)
 //!
-//! Uses Mux for event-driven waiting - properly sleeps until events arrive.
+//! Shell connects to "console:" port, receives shmem_id, maps the ring.
 
 #![no_std]
 #![no_main]
 
 use userlib::syscall::{self, LogLevel, Handle, ObjectType};
 use userlib::ipc::{Port, Channel, Mux, MuxFilter, ObjHandle};
+use userlib::console_ring::ConsoleRing;
 use userlib::error::{SysError, SysResult};
 
 // =============================================================================
@@ -156,16 +158,20 @@ mod ansi {
 pub enum ConsoleState {
     /// Waiting for shell to connect
     WaitingForShell,
-    /// Shell connected, forwarding I/O
+    /// Shell connected, forwarding I/O via ring
     Connected,
 }
 
 pub struct Consoled {
     state: ConsoleState,
     port: Option<Port>,
-    shell: Option<Channel>,
+    /// Ring buffer for shell I/O (replaces Channel)
+    shell_ring: Option<ConsoleRing>,
+    /// Channel used during handshake (to send shmem_id)
+    handshake_channel: Option<Channel>,
     mux: Option<Mux>,
     stdin_handle: ObjHandle,
+    shmem_handle: ObjHandle,
     cols: u16,
     rows: u16,
     /// Channel to devd (announces we're ready)
@@ -177,9 +183,11 @@ impl Consoled {
         Self {
             state: ConsoleState::WaitingForShell,
             port: None,
-            shell: None,
+            shell_ring: None,
+            handshake_channel: None,
             mux: None,
             stdin_handle: Handle::INVALID,
+            shmem_handle: Handle::INVALID,
             cols: 80,
             rows: 24,
             devd_channel: None,
@@ -187,29 +195,20 @@ impl Consoled {
     }
 
     pub fn init(&mut self) -> SysResult<()> {
-        // Probe terminal size once at startup
-        if let Some((cols, rows)) = ansi::query_screen_size() {
-            clog!("screen {}x{}", cols, rows);
-            self.cols = cols;
-            self.rows = rows;
-        } else {
-            clog!("screen default 80x24");
-        }
+        // Skip terminal size detection at boot - causes blank output due to ANSI
+        // escape sequences interleaving with kernel logs. Shell can query via
+        // GETSIZE if needed. Defaults: 80x24
 
         // Open stdin handle for use with Mux
         self.stdin_handle = syscall::open(ObjectType::Stdin, &[])?;
 
         // Drain any stale input that accumulated before we were ready
         let mut buf = [0u8; 64];
-        let mut drained = 0usize;
         loop {
             match syscall::read(self.stdin_handle, &mut buf) {
-                Ok(n) if n > 0 => drained += n,
+                Ok(n) if n > 0 => {}
                 _ => break,
             }
-        }
-        if drained > 0 {
-            clog!("drained {} stale bytes", drained);
         }
 
         // Create event multiplexer
@@ -229,128 +228,165 @@ impl Consoled {
 
         // Announce ready to devd
         if let Ok(devd_channel) = Channel::connect(b"devd:") {
-            clog!("connected to devd");
             // Keep the channel open - devd uses it to know we're alive
             self.devd_channel = Some(devd_channel);
-        } else {
-            clog!("devd connect failed (not fatal)");
         }
 
         Ok(())
     }
 
     pub fn run(&mut self) -> ! {
-        clog!("running");
-
-        // Log handles for debugging
-        clog!("stdin={} port={}", self.stdin_handle.0,
-              self.port.as_ref().map(|p| p.handle().0).unwrap_or(0));
-
         loop {
-            let mux = self.mux.as_ref().expect("consoled: mux not initialized");
-            let wait_result = mux.wait();
+            // If connected via ring, use polling loop
+            if self.shell_ring.is_some() {
+                self.run_ring_loop();
+            } else {
+                // Not connected - wait for connection on port
+                let mux = self.mux.as_ref().expect("consoled: mux not initialized");
+                let wait_result = mux.wait();
 
-            // Wait for event (kernel blocks internally)
-            let event = match wait_result {
-                Ok(e) => e,
-                Err(e) => {
-                    cerror!("mux wait error: {:?}", e);
-                    continue;
-                }
-            };
+                // Wait for event (kernel blocks internally)
+                let event = match wait_result {
+                    Ok(e) => e,
+                    Err(e) => {
+                        cerror!("mux wait error: {:?}", e);
+                        continue;
+                    }
+                };
 
-            // Check for new connection on port
-            if let Some(port) = &self.port {
-                if event.handle == port.handle() {
-                    self.handle_port();
-                }
-            }
-
-            // Always poll ALL sources after any event to avoid missing data.
-            // mux.wait() returns one event, but multiple handles may be ready.
-            // Process stdin (UART input -> shell)
-            self.handle_stdin();
-
-            // Process shell output (shell -> UART)
-            if self.shell.is_some() {
-                self.handle_shell();
-            }
-        }
-    }
-
-    fn handle_stdin(&mut self) {
-        // Read from UART (via stdin handle)
-        let mut buf = [0u8; 64];
-        match syscall::read(self.stdin_handle, &mut buf) {
-            Ok(n) if n > 0 => {
-                // Forward to shell if connected
-                if let Some(shell) = &self.shell {
-                    if shell.send(&buf[..n]).is_err() {
-                        cerror!("shell send failed, disconnecting");
-                        self.disconnect_shell();
+                // Check for new connection on port
+                if let Some(port) = &self.port {
+                    if event.handle == port.handle() {
+                        self.handle_port();
                     }
                 }
             }
-            Ok(_) => {} // No data
-            Err(SysError::WouldBlock) => {} // Expected
-            Err(_) => {} // Ignore other errors
         }
     }
 
-    fn handle_shell(&mut self) {
-        // Check if shell is still connected
-        let shell_handle = match &self.shell {
-            Some(s) => s.handle(),
-            None => return,
+    /// Main loop when shell is connected via ring
+    ///
+    /// Strategy:
+    /// - Wait on BOTH stdin (UART input) AND shmem (shell TX notifications)
+    /// - This ensures we wake immediately when user types, not just when shell outputs
+    fn run_ring_loop(&mut self) {
+        let mut tx_buf = [0u8; 512];  // Buffer for reading from TX ring
+        let mut rx_buf = [0u8; 64];   // Buffer for reading from UART
+
+        // Create a new mux for ring mode that includes both stdin and shmem
+        let ring_mux = match Mux::new() {
+            Ok(m) => m,
+            Err(e) => {
+                cerror!("failed to create ring mux: {:?}", e);
+                return;
+            }
         };
 
-        // Drain all available data from shell (multiple messages may be queued)
-        let mut buf = [0u8; 256];
-        let mut msg_count = 0u32;
-        loop {
-            let result = syscall::read(shell_handle, &mut buf);
+        // Add stdin to mux (wake when UART has input)
+        if let Err(e) = ring_mux.add(self.stdin_handle, MuxFilter::Readable) {
+            cerror!("failed to add stdin to ring mux: {:?}", e);
+            return;
+        }
 
-            match result {
-                Ok(n) if n > 0 => {
-                    msg_count += 1;
-                    // Check for GETSIZE query
-                    if n >= 7 && &buf[..7] == b"GETSIZE" {
-                        // Respond with SIZE message
-                        let mut msg = [0u8; 32];
-                        let len = format_size_msg(&mut msg, self.cols, self.rows);
-                        if let Some(shell) = &self.shell {
-                            let _ = shell.send(&msg[..len]);
-                        }
-                    } else {
-                        // Forward to UART
-                        let _ = syscall::write(Handle::STDOUT, &buf[..n]);
+        // Add shmem handle to mux (wake when shell notifies)
+        if let Some(ring) = &self.shell_ring {
+            if let Err(e) = ring_mux.add(ring.handle(), MuxFilter::Readable) {
+                cerror!("failed to add shmem to ring mux: {:?}", e);
+                return;
+            }
+        }
+
+        loop {
+            let ring = match &self.shell_ring {
+                Some(r) => r,
+                None => return, // Disconnected
+            };
+
+            // Process TX ring (shell output -> UART)
+            // Drain all available data
+            loop {
+                let tx_avail = ring.tx_available();
+                if tx_avail == 0 {
+                    break;
+                }
+                let to_read = tx_avail.min(tx_buf.len());
+                let n = ring.tx_read(&mut tx_buf[..to_read]);
+                if n == 0 {
+                    break;
+                }
+                // Check for GETSIZE query
+                if n >= 7 && &tx_buf[..7] == b"GETSIZE" {
+                    // Do actual terminal size detection
+                    if let Some((cols, rows)) = ansi::query_screen_size() {
+                        self.cols = cols;
+                        self.rows = rows;
                     }
+                    let mut msg = [0u8; 32];
+                    let len = format_size_msg(&mut msg, self.cols, self.rows);
+                    ring.rx_write(&msg[..len]);
+                    ring.notify();
+                } else {
+                    // Forward to UART
+                    let _ = syscall::write(Handle::STDOUT, &tx_buf[..n]);
                 }
-                Ok(_) | Err(SysError::WouldBlock) => {
-                    break;
+            }
+
+            // Check stdin for user input (UART -> RX ring)
+            match syscall::read(self.stdin_handle, &mut rx_buf) {
+                Ok(n) if n > 0 => {
+                    let written = ring.rx_write(&rx_buf[..n]);
+                    if written > 0 {
+                        ring.notify();
+                    }
+                    // Continue immediately to process any response
+                    continue;
                 }
-                Err(SysError::ConnectionReset) | Err(SysError::BadFd) => {
-                    clog!("shell disconnected");
-                    self.disconnect_shell();
-                    break;
-                }
-                Err(e) => {
-                    cerror!("shell read error: {:?}", e);
-                    break;
-                }
+                _ => {}
+            }
+
+            // Wait for EITHER stdin OR shmem to become readable
+            // This ensures we wake immediately when user types
+            if ring_mux.wait().is_err() {
+                syscall::sleep_us(50_000); // 50ms backoff if wait fails
             }
         }
     }
 
     fn handle_port(&mut self) {
-        if self.shell.is_some() {
+        if self.shell_ring.is_some() {
             return; // Already have a shell
         }
 
         if let Some(port) = &mut self.port {
-            match port.accept() {
-                Ok(channel) => {
-                    clog!("shell connected");
+            match port.accept_with_pid() {
+                Ok((channel, client_pid)) => {
+                    // Create ring for shell communication
+                    let ring = match ConsoleRing::create() {
+                        Some(r) => r,
+                        None => {
+                            cerror!("failed to create ring");
+                            return;
+                        }
+                    };
+
+                    // Allow shell to map the ring using its actual PID
+                    ring.allow(client_pid);
+
+                    // Send shmem_id to shell via channel
+                    let shmem_id = ring.shmem_id();
+                    let mut msg = [0u8; 16];
+                    msg[..4].copy_from_slice(b"RING");
+                    msg[4..8].copy_from_slice(&shmem_id.to_le_bytes());
+                    // Also send terminal size
+                    msg[8..10].copy_from_slice(&self.cols.to_le_bytes());
+                    msg[10..12].copy_from_slice(&self.rows.to_le_bytes());
+
+                    if channel.send(&msg[..12]).is_err() {
+                        cerror!("failed to send ring info");
+                        return;
+                    }
+
+                    clog!("shell pid={} connected", client_pid);
 
                     // Drain any stale UART input before shell starts
                     let mut buf = [0u8; 64];
@@ -361,14 +397,10 @@ impl Consoled {
                         }
                     }
 
-                    // Add shell channel to mux
-                    if let Some(mux) = &self.mux {
-                        let _ = mux.add(channel.handle(), MuxFilter::Readable);
-                    }
-
-                    self.shell = Some(channel);
+                    // Store ring and handshake channel
+                    self.shell_ring = Some(ring);
+                    self.handshake_channel = Some(channel);
                     self.state = ConsoleState::Connected;
-                    // Shell will send GETSIZE to request terminal size
                 }
                 Err(SysError::WouldBlock) => {} // No pending connections
                 Err(e) => {
@@ -379,19 +411,15 @@ impl Consoled {
     }
 
     fn disconnect_shell(&mut self) {
-        if let Some(shell) = self.shell.take() {
-            // Remove shell from mux
-            if let Some(mux) = &self.mux {
-                let _ = mux.remove(shell.handle());
-            }
-            // shell is dropped here, closing the handle
+        self.shell_ring = None;
+        self.handshake_channel = None;
 
-            // Notify port that connection is closed (allows new connections)
-            if let Some(port) = &mut self.port {
-                port.connection_closed();
-            }
+        // Notify port that connection is closed (allows new connections)
+        if let Some(port) = &mut self.port {
+            port.connection_closed();
         }
         self.state = ConsoleState::WaitingForShell;
+        clog!("shell disconnected");
     }
 }
 
@@ -449,8 +477,6 @@ static mut CONSOLED: Consoled = Consoled::new();
 #[unsafe(no_mangle)]
 #[allow(static_mut_refs)]
 fn main() -> ! {
-    cerror!("BOOT v2.0-unified");
-
     let consoled = unsafe { &mut CONSOLED };
 
     if let Err(e) = consoled.init() {
@@ -458,6 +484,5 @@ fn main() -> ! {
         syscall::exit(1);
     }
 
-    cerror!("init complete");
     consoled.run()
 }

@@ -288,18 +288,8 @@ fn user_task_trampoline() -> ! {
         };
 
         // Extract data needed for usermode entry
-        let pid = task.id;
-        let entry = task.trap_frame.elr_el1;
-        let sp = task.trap_frame.sp_el0;
-        let spsr = task.trap_frame.spsr_el1;
         let ttbr0 = addr_space.get_ttbr0();
         let trap_frame = &mut task.trap_frame as *mut TrapFrame;
-
-        crate::kinfo!("task", "enter_user"; pid = pid as u64,
-            elr = crate::klog::hex64(entry),
-            sp = crate::klog::hex64(sp),
-            spsr = crate::klog::hex64(spsr),
-            ttbr0 = crate::klog::hex64(ttbr0));
 
         // Set globals for exception handler
         super::CURRENT_TRAP_FRAME.store(trap_frame, core::sync::atomic::Ordering::Release);

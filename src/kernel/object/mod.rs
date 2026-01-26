@@ -239,6 +239,9 @@ pub enum Object {
 
     /// Bus list
     BusList(BusListObject),
+
+    /// Ring buffer IPC (high-performance)
+    Ring(RingObject),
 }
 
 // ============================================================================
@@ -757,11 +760,15 @@ pub struct ShmemObject {
     vaddr: u64,
     /// Peer notification (for signaling)
     peer_subscriber: Option<Subscriber>,
+    /// Subscriber for mux integration (woken when notified)
+    mux_subscriber: Option<Subscriber>,
+    /// Notified flag - set by notify(), cleared by read/poll
+    notified: bool,
 }
 
 impl ShmemObject {
     pub fn new(shmem_id: u32, paddr: u64, size: usize, vaddr: u64) -> Self {
-        Self { shmem_id, paddr, size, vaddr, peer_subscriber: None }
+        Self { shmem_id, paddr, size, vaddr, peer_subscriber: None, mux_subscriber: None, notified: false }
     }
     pub fn shmem_id(&self) -> u32 { self.shmem_id }
     pub fn paddr(&self) -> u64 { self.paddr }
@@ -770,6 +777,12 @@ impl ShmemObject {
     pub fn peer_subscriber(&self) -> Option<Subscriber> { self.peer_subscriber }
     pub(crate) fn set_vaddr(&mut self, vaddr: u64) { self.vaddr = vaddr; }
     pub(crate) fn set_peer_subscriber(&mut self, sub: Option<Subscriber>) { self.peer_subscriber = sub; }
+
+    // Mux integration
+    pub fn mux_subscriber(&self) -> Option<Subscriber> { self.mux_subscriber }
+    pub fn set_mux_subscriber(&mut self, sub: Option<Subscriber>) { self.mux_subscriber = sub; }
+    pub fn is_notified(&self) -> bool { self.notified }
+    pub fn set_notified(&mut self, notified: bool) { self.notified = notified; }
 }
 
 /// DMA pool
@@ -1068,6 +1081,158 @@ impl BusListObject {
     }
     pub fn cursor(&self) -> u32 { self.cursor }
     pub fn advance(&mut self) { self.cursor += 1; }
+}
+
+// ============================================================================
+// Ring Object (high-performance IPC)
+// ============================================================================
+
+/// Ring buffer IPC - high-performance typed message passing
+///
+/// Memory layout:
+/// ```text
+/// ┌───────────────────────────────────────────────────────────────┐
+/// │ RingHeader (64 bytes, cache-line aligned)                     │
+/// │   tx_head, tx_tail, rx_head, rx_tail, configs, flags          │
+/// ├───────────────────────────────────────────────────────────────┤
+/// │ TX Ring Buffer (configurable size, e.g., 64KB)                │
+/// │   Producer writes here, consumer reads                        │
+/// ├───────────────────────────────────────────────────────────────┤
+/// │ RX Ring Buffer (configurable size, e.g., 4KB)                 │
+/// │   Consumer writes here, producer reads (for acks/flow ctrl)   │
+/// └───────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// # Design
+///
+/// The ring operates in shared memory with lock-free head/tail pointers.
+/// - Producer atomically updates tx_tail after writing
+/// - Consumer atomically updates tx_head after reading
+/// - Notifications are batched (wake only on empty→non-empty transition)
+///
+/// # Syscall behavior
+///
+/// - `open(Ring, flags, arg)` - Create ring, arg points to RingParams
+/// - `map(handle)` - Map shared memory into task's address space
+/// - `read(handle, buf)` - Wait for data available (returns immediately if data present)
+/// - `write(handle, buf)` - Notify peer that data was written (for wakeup)
+/// - `close(handle)` - Unmap and cleanup
+pub struct RingObject {
+    /// Physical address of shared memory region
+    paddr: u64,
+    /// Total size (header + tx ring + rx ring)
+    size: usize,
+    /// Mapped virtual address (0 = not mapped)
+    vaddr: u64,
+    /// TX ring configuration
+    tx_config: u16,
+    /// RX ring configuration
+    rx_config: u16,
+    /// Peer task ID (for waking)
+    peer_pid: Option<u32>,
+    /// Subscriber for wake notifications
+    subscriber: Option<Subscriber>,
+    /// Is this the "creator" side (owns the physical memory)?
+    is_creator: bool,
+}
+
+impl RingObject {
+    /// Create a new ring object (creator side - owns memory)
+    pub fn new_creator(paddr: u64, size: usize, tx_config: u16, rx_config: u16) -> Self {
+        Self {
+            paddr,
+            size,
+            vaddr: 0,
+            tx_config,
+            rx_config,
+            peer_pid: None,
+            subscriber: None,
+            is_creator: true,
+        }
+    }
+
+    /// Create a ring object from existing shared memory (peer side)
+    pub fn new_peer(paddr: u64, size: usize, tx_config: u16, rx_config: u16) -> Self {
+        Self {
+            paddr,
+            size,
+            vaddr: 0,
+            tx_config,
+            rx_config,
+            peer_pid: None,
+            subscriber: None,
+            is_creator: false,
+        }
+    }
+
+    pub fn paddr(&self) -> u64 { self.paddr }
+    pub fn size(&self) -> usize { self.size }
+    pub fn vaddr(&self) -> u64 { self.vaddr }
+    pub fn tx_config(&self) -> u16 { self.tx_config }
+    pub fn rx_config(&self) -> u16 { self.rx_config }
+    pub fn peer_pid(&self) -> Option<u32> { self.peer_pid }
+    pub fn is_creator(&self) -> bool { self.is_creator }
+    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+
+    pub(crate) fn set_vaddr(&mut self, vaddr: u64) { self.vaddr = vaddr; }
+    pub(crate) fn set_peer_pid(&mut self, pid: Option<u32>) { self.peer_pid = pid; }
+
+    /// Calculate TX ring offset from base
+    pub fn tx_ring_offset(&self) -> usize {
+        64 // After RingHeader
+    }
+
+    /// Calculate RX ring offset from base
+    pub fn rx_ring_offset(&self) -> usize {
+        64 + abi::ring_config::ring_size(self.tx_config)
+    }
+
+    /// Calculate TX ring size
+    pub fn tx_ring_size(&self) -> usize {
+        abi::ring_config::ring_size(self.tx_config)
+    }
+
+    /// Calculate RX ring size
+    pub fn rx_ring_size(&self) -> usize {
+        abi::ring_config::ring_size(self.rx_config)
+    }
+}
+
+impl HasSubscriber for RingObject {
+    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
+        &mut self.subscriber
+    }
+
+    fn get_subscriber(&self) -> Option<Subscriber> {
+        self.subscriber
+    }
+}
+
+impl Pollable for RingObject {
+    fn poll(&self, filter: u8) -> PollResult {
+        // Ring is always readable/writable if mapped (userspace manages head/tail)
+        // We just check if mapped and return ready
+        if self.vaddr == 0 {
+            return PollResult::NONE;
+        }
+
+        let mut ready = 0u8;
+        if (filter & poll::READABLE) != 0 {
+            ready |= poll::READABLE;
+        }
+        if (filter & poll::WRITABLE) != 0 {
+            ready |= poll::WRITABLE;
+        }
+        PollResult { ready, data: 0 }
+    }
+
+    fn subscribe(&mut self, subscriber: Subscriber) {
+        self.set_subscriber(Some(subscriber));
+    }
+
+    fn unsubscribe(&mut self) {
+        self.set_subscriber(None);
+    }
 }
 
 // ============================================================================

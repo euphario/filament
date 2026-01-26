@@ -113,6 +113,8 @@ pub enum ObjectType {
     Msi = 14,
     /// Bus enumeration
     BusList = 15,
+    /// Ring buffer IPC (high-performance typed messages)
+    Ring = 16,
 }
 
 impl ObjectType {
@@ -134,13 +136,14 @@ impl ObjectType {
             13 => Some(ObjectType::PciDevice),
             14 => Some(ObjectType::Msi),
             15 => Some(ObjectType::BusList),
+            16 => Some(ObjectType::Ring),
             _ => None,
         }
     }
 
     /// Can this type be memory-mapped?
     pub fn is_mappable(&self) -> bool {
-        matches!(self, ObjectType::Shmem | ObjectType::DmaPool | ObjectType::Mmio)
+        matches!(self, ObjectType::Shmem | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Ring)
     }
 
     /// Does this type support read()?
@@ -486,4 +489,332 @@ pub struct MuxAddWatch {
     pub filter: u8,
     pub _pad: [u8; 2],
     pub handle: u32,
+}
+
+// ============================================================================
+// Ring IPC (High-Performance Typed Message Passing)
+// ============================================================================
+
+/// Ring configuration - 16 bits encoding size parameters
+///
+/// Bits 0-3:  Ring size shift  (actual = 1 << (12 + n)) = 4KB to 512KB
+/// Bits 4-7:  Slot size shift  (actual = 1 << (5 + n))  = 32B to 4KB
+/// Bits 8-15: Reserved/flags
+pub type RingConfig = u16;
+
+/// Ring configuration helpers
+pub mod ring_config {
+    use super::RingConfig;
+
+    /// Extract ring size in bytes from config
+    #[inline]
+    pub const fn ring_size(cfg: RingConfig) -> usize {
+        1 << (12 + (cfg & 0x0F) as usize)
+    }
+
+    /// Extract slot size in bytes from config
+    #[inline]
+    pub const fn slot_size(cfg: RingConfig) -> usize {
+        1 << (5 + ((cfg >> 4) & 0x0F) as usize)
+    }
+
+    /// Calculate number of slots in ring
+    #[inline]
+    pub const fn slot_count(cfg: RingConfig) -> usize {
+        ring_size(cfg) / slot_size(cfg)
+    }
+
+    /// Create config from ring shift and slot shift
+    #[inline]
+    pub const fn make(ring_shift: u8, slot_shift: u8) -> RingConfig {
+        (ring_shift as u16) | ((slot_shift as u16) << 4)
+    }
+}
+
+/// Preset ring configurations
+pub mod ring_presets {
+    use super::RingConfig;
+    use super::ring_config::make;
+
+    /// Console TX: 64KB ring, 256B slots (256 slots) - shell output bursts
+    pub const CONSOLE_TX: RingConfig = make(4, 3);
+
+    /// Console RX: 4KB ring, 64B slots (64 slots) - keyboard input
+    pub const CONSOLE_RX: RingConfig = make(0, 1);
+
+    /// Balanced: 16KB ring, 128B slots (128 slots) - general IPC
+    pub const BALANCED: RingConfig = make(2, 2);
+
+    /// Bulk: 256KB ring, 512B slots (512 slots) - large transfers
+    pub const BULK: RingConfig = make(6, 4);
+
+    /// Tiny: 4KB ring, 32B slots (128 slots) - minimal footprint
+    pub const TINY: RingConfig = make(0, 0);
+}
+
+/// Parameters for opening a Ring object
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RingParams {
+    /// TX ring config (producer → consumer direction)
+    pub tx: RingConfig,
+    /// RX ring config (consumer → producer direction)
+    pub rx: RingConfig,
+}
+
+impl RingParams {
+    /// Console preset: asymmetric (large TX, small RX)
+    pub const CONSOLE: Self = Self {
+        tx: ring_presets::CONSOLE_TX,
+        rx: ring_presets::CONSOLE_RX,
+    };
+
+    /// Balanced preset: symmetric
+    pub const BALANCED: Self = Self {
+        tx: ring_presets::BALANCED,
+        rx: ring_presets::BALANCED,
+    };
+}
+
+/// Ring header in shared memory (cache-line aligned)
+///
+/// Layout in shared memory:
+/// ```text
+/// [RingHeader][TX Ring buffer][RX Ring buffer]
+/// ```
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct RingHeader {
+    /// TX ring: producer head (written by producer)
+    pub tx_head: core::sync::atomic::AtomicU32,
+    /// TX ring: consumer tail (written by consumer)
+    pub tx_tail: core::sync::atomic::AtomicU32,
+    /// RX ring: producer head (written by consumer, who is RX producer)
+    pub rx_head: core::sync::atomic::AtomicU32,
+    /// RX ring: consumer tail (written by producer, who is RX consumer)
+    pub rx_tail: core::sync::atomic::AtomicU32,
+    /// TX ring config (immutable after creation)
+    pub tx_config: RingConfig,
+    /// RX ring config (immutable after creation)
+    pub rx_config: RingConfig,
+    /// Flags for signaling
+    pub flags: core::sync::atomic::AtomicU32,
+    /// Reserved for future use
+    pub _reserved: [u8; 40],
+}
+
+/// Ring flags for wake signaling
+pub mod ring_flags {
+    /// Producer wants wake when space available
+    pub const TX_WAIT: u32 = 1 << 0;
+    /// Consumer wants wake when data available
+    pub const RX_WAIT: u32 = 1 << 1;
+}
+
+// ============================================================================
+// Pipe Messages (Typed Data for Ring IPC)
+// ============================================================================
+
+/// Maximum filename length in pipe messages
+pub const PIPE_NAME_MAX: usize = 64;
+
+/// Entry kind for directory entries
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    File = 0,
+    Directory = 1,
+    Symlink = 2,
+    Device = 3,
+    Unknown = 255,
+}
+
+/// Directory entry - used by ls, find, etc.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DirEntry {
+    pub name: [u8; PIPE_NAME_MAX],
+    pub size: u64,
+    pub kind: EntryKind,
+    pub permissions: u16,
+    pub _pad: [u8; 5],
+}
+
+impl DirEntry {
+    pub const fn empty() -> Self {
+        Self {
+            name: [0; PIPE_NAME_MAX],
+            size: 0,
+            kind: EntryKind::Unknown,
+            permissions: 0,
+            _pad: [0; 5],
+        }
+    }
+
+    pub fn name_str(&self) -> &str {
+        let len = self.name.iter().position(|&b| b == 0).unwrap_or(PIPE_NAME_MAX);
+        core::str::from_utf8(&self.name[..len]).unwrap_or("")
+    }
+}
+
+/// Process info for ps output
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PipeProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub state: u8,
+    pub _pad: [u8; 3],
+    pub name: [u8; 32],
+}
+
+impl PipeProcessInfo {
+    pub const fn empty() -> Self {
+        Self {
+            pid: 0,
+            ppid: 0,
+            state: 0,
+            _pad: [0; 3],
+            name: [0; 32],
+        }
+    }
+}
+
+/// Maximum text chunk size
+pub const PIPE_TEXT_MAX: usize = 192;
+
+/// Raw text chunk - fallback for unstructured data
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TextChunk {
+    pub len: u16,
+    pub _pad: [u8; 2],
+    pub data: [u8; PIPE_TEXT_MAX],
+}
+
+impl TextChunk {
+    pub const fn empty() -> Self {
+        Self {
+            len: 0,
+            _pad: [0; 2],
+            data: [0; PIPE_TEXT_MAX],
+        }
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Self {
+        let mut chunk = Self::empty();
+        let len = data.len().min(PIPE_TEXT_MAX);
+        chunk.data[..len].copy_from_slice(&data[..len]);
+        chunk.len = len as u16;
+        chunk
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data[..self.len as usize]
+    }
+}
+
+/// Table column descriptor
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TableColumn {
+    pub name: [u8; 16],
+    pub width: u8,
+    pub align: u8,  // 0=left, 1=right, 2=center
+    pub _pad: [u8; 2],
+}
+
+impl TableColumn {
+    pub const fn empty() -> Self {
+        Self {
+            name: [0; 16],
+            width: 0,
+            align: 0,
+            _pad: [0; 2],
+        }
+    }
+}
+
+/// Table start marker with column definitions
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TableStart {
+    pub column_count: u8,
+    pub _pad: [u8; 3],
+    pub columns: [TableColumn; 8],
+}
+
+impl TableStart {
+    pub const fn empty() -> Self {
+        Self {
+            column_count: 0,
+            _pad: [0; 3],
+            columns: [TableColumn::empty(); 8],
+        }
+    }
+}
+
+/// Error message
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PipeError {
+    pub code: i32,
+    pub msg_len: u16,
+    pub _pad: [u8; 2],
+    pub msg: [u8; 64],
+}
+
+impl PipeError {
+    pub const fn empty() -> Self {
+        Self {
+            code: 0,
+            msg_len: 0,
+            _pad: [0; 2],
+            msg: [0; 64],
+        }
+    }
+}
+
+/// Pipe message type tag
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeMessageType {
+    /// Raw text (fallback)
+    Text = 1,
+    /// Directory entry
+    DirEntry = 2,
+    /// Process info
+    ProcessInfo = 3,
+    /// Table start marker
+    TableStart = 4,
+    /// Table end marker
+    TableEnd = 5,
+    /// Error message
+    Error = 6,
+    /// End of stream
+    Eof = 7,
+}
+
+/// Maximum pipe message size (fits in 256B slot with header)
+pub const PIPE_MESSAGE_MAX: usize = 248;
+
+/// Pipe message header (8 bytes)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PipeMessageHeader {
+    pub msg_type: u8,
+    pub flags: u8,
+    pub len: u16,        // payload length
+    pub sequence: u32,   // for ordering/debug
+}
+
+impl PipeMessageHeader {
+    pub const fn new(msg_type: PipeMessageType, len: u16) -> Self {
+        Self {
+            msg_type: msg_type as u8,
+            flags: 0,
+            len,
+            sequence: 0,
+        }
+    }
 }

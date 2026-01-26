@@ -56,6 +56,8 @@ pub enum ObjectType {
     Msi = 14,
     /// Bus enumeration
     BusList = 15,
+    /// Ring buffer IPC (high-performance typed messages)
+    Ring = 16,
 }
 
 impl ObjectType {
@@ -77,6 +79,7 @@ impl ObjectType {
             13 => Some(ObjectType::PciDevice),
             14 => Some(ObjectType::Msi),
             15 => Some(ObjectType::BusList),
+            16 => Some(ObjectType::Ring),
             _ => None,
         }
     }

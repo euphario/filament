@@ -1,8 +1,7 @@
 //! Object Service - Central Owner of Object Tables
 //!
-//! This module implements the ObjectService which owns all per-task object tables.
-//! This is the key architectural change: object tables are NOT in the Task struct,
-//! they're owned by ObjectService with its own lock.
+//! Implements the ObjectService which owns all per-task object tables using
+//! per-task locks for deadlock-free concurrent access.
 //!
 //! # Architecture
 //!
@@ -15,8 +14,9 @@
 //!                                 │
 //! ┌───────────────────────────────▼────────────────────────────────┐
 //! │                    ObjectService                               │
-//! │    SpinLock<[Option<HandleTable>; MAX_TASKS]>                  │
-//! │    - Owns all object tables (indexed by slot, not task_id)    │
+//! │    [SpinLock<Option<HandleTable>>; MAX_TASKS]                  │
+//! │    - One lock per task slot (eliminates global lock deadlocks) │
+//! │    - TableGuard proves lock is held (type-safe)                │
 //! │    - Blocking read() implementation                            │
 //! │    - Wakes tasks when events occur                             │
 //! └────────────────────────────────────────────────────────────────┘
@@ -24,12 +24,12 @@
 //!
 //! # Key Design
 //!
-//! - **ObjectService owns object tables** - Not in Task struct
-//! - **Own lock** - Not nested inside scheduler lock
-//! - **Blocking read()** - Loop: try_read → subscribe → block → retry
-//! - **Mux for multiplexing** - The only way to wait on multiple handles
+//! - **Per-task locks** - Each task slot has its own SpinLock
+//! - **TableGuard** - Type-safe proof of lock ownership
+//! - **Lock ordering** - `lock_table_ordered()` prevents ABBA deadlocks
+//! - **Continuation pattern** - Operations release lock before waking
 
-use crate::kernel::lock::SpinLock;
+use crate::kernel::lock::{SpinLock, SpinLockGuard};
 use crate::kernel::task::{TaskId, MAX_TASKS};
 use crate::kernel::object::{HandleTable, Handle, Object, ObjectType, ConsoleType};
 use crate::kernel::object::handle::HandleEntry;
@@ -116,13 +116,60 @@ pub enum ReadAttempt {
 }
 
 // ============================================================================
+// TableGuard - Lock Token
+// ============================================================================
+
+/// Guard/token proving a task's table lock is held.
+///
+/// Dropping this guard releases the lock. The guard provides access to the
+/// table and records which slot is locked for ordering verification.
+pub struct TableGuard<'a> {
+    /// The actual spinlock guard
+    guard: SpinLockGuard<'a, Option<HandleTable>>,
+    /// Which slot this guards (for ordering checks)
+    slot: usize,
+}
+
+impl<'a> TableGuard<'a> {
+    /// Get immutable reference to the table
+    pub fn table(&self) -> Result<&HandleTable, ObjError> {
+        self.guard.as_ref().ok_or(ObjError::TaskNotFound)
+    }
+
+    /// Get mutable reference to the table
+    pub fn table_mut(&mut self) -> Result<&mut HandleTable, ObjError> {
+        self.guard.as_mut().ok_or(ObjError::TaskNotFound)
+    }
+
+    /// Get the slot index this guard protects
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// Check if this guard holds a valid table
+    pub fn has_table(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    /// Take the table out of the guard (for remove_task_table)
+    pub fn take(&mut self) -> Option<HandleTable> {
+        self.guard.take()
+    }
+
+    /// Put a table into the guard (for create_task_table)
+    pub fn put(&mut self, table: HandleTable) {
+        *self.guard = Some(table);
+    }
+}
+
+// ============================================================================
 // ObjectService
 // ============================================================================
 
 /// Extract slot index from TaskId
 ///
 /// PID format: bits[7:0] = slot + 1 (1-16), bits[31:8] = generation
-/// Returns None if invalid (slot 0 is reserved)
+/// Returns None if invalid (slot 0 is reserved for idle)
 fn slot_from_task_id(task_id: TaskId) -> Option<usize> {
     let slot_bits = (task_id & 0xFF) as usize;
     if slot_bits == 0 || slot_bits > MAX_TASKS {
@@ -131,24 +178,76 @@ fn slot_from_task_id(task_id: TaskId) -> Option<usize> {
     Some(slot_bits - 1)
 }
 
-/// Central service that owns all object tables
+/// Central service that owns all object tables.
 ///
-/// This is the single source of truth for object state. Tasks don't have
-/// object tables - ObjectService does.
-///
-/// Uses a fixed-size array indexed by slot (extracted from task_id).
-/// This avoids heap allocation in a no_std kernel.
+/// Uses per-task locks for deadlock-free concurrent access.
+/// Each task slot has its own SpinLock, eliminating the class of
+/// same-lock re-acquisition deadlocks.
 pub struct ObjectService {
-    /// Per-slot object tables (indexed by slot, not task_id)
-    tables: SpinLock<[Option<HandleTable>; MAX_TASKS]>,
+    /// Per-slot object tables with individual locks
+    tables: [SpinLock<Option<HandleTable>>; MAX_TASKS],
 }
 
 impl ObjectService {
-    /// Create a new ObjectService
+    /// Create a new ObjectService with per-task locks
     pub const fn new() -> Self {
-        const NONE: Option<HandleTable> = None;
+        const LOCKED_NONE: SpinLock<Option<HandleTable>> = SpinLock::new(None);
         Self {
-            tables: SpinLock::new([NONE; MAX_TASKS]),
+            tables: [LOCKED_NONE; MAX_TASKS],
+        }
+    }
+
+    // ========================================================================
+    // Lock Acquisition
+    // ========================================================================
+
+    /// Acquire lock on a single task's table.
+    ///
+    /// Returns a TableGuard that proves the lock is held.
+    pub fn lock_table(&self, task_id: TaskId) -> Result<TableGuard<'_>, ObjError> {
+        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        let guard = self.tables[slot].lock();
+        Ok(TableGuard { guard, slot })
+    }
+
+    /// Lock a table by slot index directly (internal use)
+    fn lock_slot(&self, slot: usize) -> Result<TableGuard<'_>, ObjError> {
+        if slot >= MAX_TASKS {
+            return Err(ObjError::TaskNotFound);
+        }
+        let guard = self.tables[slot].lock();
+        Ok(TableGuard { guard, slot })
+    }
+
+    /// Acquire lock on a second table, enforcing slot ordering.
+    ///
+    /// The new slot must be strictly greater than the held slot.
+    /// This prevents ABBA deadlocks when multiple tables need to be locked.
+    ///
+    /// # Errors
+    /// Returns `ObjError::InvalidArg` if trying to lock a lower or equal slot.
+    pub fn lock_table_ordered(
+        &self,
+        held: &TableGuard<'_>,
+        task_id: TaskId,
+    ) -> Result<TableGuard<'_>, ObjError> {
+        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        if slot <= held.slot {
+            // Lock order violation - would cause ABBA deadlock
+            return Err(ObjError::InvalidArg);
+        }
+        let guard = self.tables[slot].lock();
+        Ok(TableGuard { guard, slot })
+    }
+
+    /// Try to lock a table without blocking.
+    ///
+    /// Returns Ok(None) if lock is already held by another CPU.
+    pub fn try_lock_table(&self, task_id: TaskId) -> Result<Option<TableGuard<'_>>, ObjError> {
+        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        match self.tables[slot].try_lock() {
+            Some(guard) => Ok(Some(TableGuard { guard, slot })),
+            None => Ok(None),
         }
     }
 
@@ -161,43 +260,73 @@ impl ObjectService {
     /// Called when a task is created. Creates an empty HandleTable
     /// (or one with stdin/stdout/stderr for user tasks).
     pub fn create_task_table(&self, task_id: TaskId, is_user: bool) {
-        let slot = match slot_from_task_id(task_id) {
-            Some(s) => s,
-            None => return, // Invalid task_id
-        };
-
-        let table = if is_user {
-            HandleTable::new_with_stdio()
-        } else {
-            HandleTable::new()
-        };
-
-        let mut tables = self.tables.lock();
-        tables[slot] = Some(table);
+        if let Ok(mut guard) = self.lock_table(task_id) {
+            let table = if is_user {
+                HandleTable::new_with_stdio()
+            } else {
+                HandleTable::new()
+            };
+            guard.put(table);
+        }
     }
 
     /// Remove object table for an exiting task
     ///
     /// Called when a task exits. Closes all handles and removes the table.
-    /// Returns the list of objects that were closed (for cleanup).
     pub fn remove_task_table(&self, task_id: TaskId) -> Option<HandleTable> {
-        let slot = slot_from_task_id(task_id)?;
-        let mut tables = self.tables.lock();
-        tables[slot].take()
+        self.lock_table(task_id).ok()?.take()
     }
 
     /// Check if a task has an object table
     pub fn task_exists(&self, task_id: TaskId) -> bool {
-        let slot = match slot_from_task_id(task_id) {
-            Some(s) => s,
-            None => return false,
-        };
-        let tables = self.tables.lock();
-        tables[slot].is_some()
+        self.lock_table(task_id)
+            .map(|g| g.has_table())
+            .unwrap_or(false)
     }
 
     // ========================================================================
-    // Handle Operations (Phase 1 - just wrappers, no blocking yet)
+    // Handle Operations (with guards)
+    // ========================================================================
+
+    /// Allocate handle in a locked table
+    pub fn alloc_handle_with(
+        guard: &mut TableGuard<'_>,
+        object_type: ObjectType,
+        object: Object,
+    ) -> Result<Handle, ObjError> {
+        let table = guard.table_mut()?;
+        table.alloc(object_type, object).ok_or(ObjError::OutOfHandles)
+    }
+
+    /// Close handle in a locked table
+    pub fn close_handle_with(
+        guard: &mut TableGuard<'_>,
+        handle: Handle,
+    ) -> Result<Object, ObjError> {
+        let table = guard.table_mut()?;
+        table.close(handle).ok_or(ObjError::BadHandle)
+    }
+
+    /// Get entry from a locked table
+    pub fn get_entry_with<'b>(
+        guard: &'b TableGuard<'b>,
+        handle: Handle,
+    ) -> Result<&'b HandleEntry, ObjError> {
+        let table = guard.table()?;
+        table.get(handle).ok_or(ObjError::BadHandle)
+    }
+
+    /// Get mutable entry from a locked table
+    pub fn get_entry_mut_with<'b>(
+        guard: &'b mut TableGuard<'b>,
+        handle: Handle,
+    ) -> Result<&'b mut HandleEntry, ObjError> {
+        let table = guard.table_mut()?;
+        table.get_mut(handle).ok_or(ObjError::BadHandle)
+    }
+
+    // ========================================================================
+    // Convenience Methods (lock + operate + unlock)
     // ========================================================================
 
     /// Allocate a new handle in a task's object table
@@ -207,10 +336,8 @@ impl ObjectService {
         object_type: ObjectType,
         object: Object,
     ) -> Result<Handle, ObjError> {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
-        table.alloc(object_type, object).ok_or(ObjError::OutOfHandles)
+        let mut guard = self.lock_table(task_id)?;
+        Self::alloc_handle_with(&mut guard, object_type, object)
     }
 
     /// Get a handle entry (immutable)
@@ -218,9 +345,8 @@ impl ObjectService {
     where
         F: FnOnce(&HandleEntry) -> R,
     {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        let tables = self.tables.lock();
-        let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+        let guard = self.lock_table(task_id)?;
+        let table = guard.table()?;
         let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
         Ok(f(entry))
     }
@@ -230,19 +356,16 @@ impl ObjectService {
     where
         F: FnOnce(&mut HandleEntry) -> R,
     {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let entry = table.get_mut(handle).ok_or(ObjError::BadHandle)?;
         Ok(f(entry))
     }
 
     /// Close a handle
     pub fn close_handle(&self, task_id: TaskId, handle: Handle) -> Result<Object, ObjError> {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
-        table.close(handle).ok_or(ObjError::BadHandle)
+        let mut guard = self.lock_table(task_id)?;
+        Self::close_handle_with(&mut guard, handle)
     }
 
     /// Access the full table for a task (for complex operations like Mux polling)
@@ -250,9 +373,8 @@ impl ObjectService {
     where
         F: FnOnce(&HandleTable) -> R,
     {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        let tables = self.tables.lock();
-        let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+        let guard = self.lock_table(task_id)?;
+        let table = guard.table()?;
         Ok(f(table))
     }
 
@@ -261,25 +383,18 @@ impl ObjectService {
     where
         F: FnOnce(&mut HandleTable) -> R,
     {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         Ok(f(table))
     }
 
     // ========================================================================
-    // Object Operations (Phase 3 - will implement blocking read/write)
-    // ========================================================================
-
-    // ========================================================================
-    // Console Operations (Phase 3 - First migration)
+    // Console Operations
     // ========================================================================
 
     /// Open a console handle (stdin/stdout/stderr)
-    ///
-    /// Returns handle on success, error on failure.
     pub fn open_console(&self, task_id: TaskId, console_type: ConsoleType) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, ConsoleObject};
+        use crate::kernel::object::ConsoleObject;
 
         let obj = Object::Console(ConsoleObject::new(console_type));
         let obj_type = match console_type {
@@ -292,11 +407,6 @@ impl ObjectService {
     }
 
     /// Read from console (stdin only)
-    ///
-    /// Non-blocking: returns data if available, WouldBlock otherwise.
-    /// The caller (syscall layer) handles blocking.
-    ///
-    /// MIGRATION NOTE: Uses task.object_table for storage during Phase 3.
     pub fn read_console(
         &self,
         task_id: TaskId,
@@ -305,11 +415,10 @@ impl ObjectService {
     ) -> Result<ReadAttempt, ObjError> {
         use crate::platform::current::uart;
         use crate::kernel::ipc::traits::Subscriber;
-        use crate::kernel::object::{Object, Pollable};
+        use crate::kernel::object::{Pollable};
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let entry = table.get_mut(handle).ok_or(ObjError::BadHandle)?;
 
         let Object::Console(ref mut c) = entry.object else {
@@ -350,8 +459,6 @@ impl ObjectService {
     }
 
     /// Write to console (stdout/stderr only)
-    ///
-    /// Always completes immediately (UART is buffered).
     pub fn write_console(
         &self,
         task_id: TaskId,
@@ -359,54 +466,55 @@ impl ObjectService {
         buf: &[u8],
     ) -> Result<usize, ObjError> {
         use crate::platform::current::uart;
-        use crate::kernel::object::Object;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-        let tables = self.tables.lock();
-        let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
-        let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
+        // Validate handle and console type under lock
+        let is_writable = {
+            let guard = self.lock_table(task_id)?;
+            let table = guard.table()?;
+            let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
 
-        let Object::Console(ref c) = entry.object else {
-            return Err(ObjError::TypeMismatch);
+            let Object::Console(ref c) = entry.object else {
+                return Err(ObjError::TypeMismatch);
+            };
+
+            matches!(c.console_type(), ConsoleType::Stdout | ConsoleType::Stderr)
         };
+        // guard dropped here
 
-        // Only stdout/stderr are writable
-        match c.console_type() {
-            ConsoleType::Stdout | ConsoleType::Stderr => {
-                if buf.is_empty() {
-                    return Ok(0);
-                }
-                uart::write_buffered(buf);
-                uart::flush_buffer();
-                Ok(buf.len())
-            }
-            ConsoleType::Stdin => Err(ObjError::NotSupported),
+        if !is_writable {
+            return Err(ObjError::NotSupported);
         }
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Write outside lock (UART doesn't need ObjectService lock)
+        uart::write_buffered(buf);
+        uart::flush_buffer();
+        Ok(buf.len())
     }
 
     // ========================================================================
-    // Timer Operations (Phase 3)
+    // Timer Operations
     // ========================================================================
 
     /// Open a timer handle
-    ///
-    /// Returns handle on success, error on failure.
     pub fn open_timer(&self, task_id: TaskId) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, TimerObject};
+        use crate::kernel::object::TimerObject;
 
         let obj = Object::Timer(TimerObject::new());
         self.alloc_handle(task_id, ObjectType::Timer, obj)
     }
+
     // ========================================================================
-    // Port Operations (Phase 3)
+    // Port Operations
     // ========================================================================
 
     /// Open (register) a named port for listening
-    ///
-    /// Returns handle on success.
     pub fn open_port(&self, task_id: TaskId, name: &[u8]) -> Result<Handle, ObjError> {
         use crate::kernel::ipc;
-        use crate::kernel::object::{Object, PortObject};
+        use crate::kernel::object::PortObject;
 
         if name.is_empty() || name.len() > 32 {
             return Err(ObjError::InvalidArg);
@@ -430,13 +538,15 @@ impl ObjectService {
                 _ => ObjError::OutOfMemory,
             })?;
 
-        // Allocate handle in ObjectService tables
-        let mut tables = self.tables.lock();
-
-        let table = tables[slot].as_mut().ok_or_else(|| {
-            let _ = ipc::port_unregister(port_id, task_id);
-            ObjError::TaskNotFound
-        })?;
+        // Allocate handle in object table
+        let mut guard = self.lock_table(task_id)?;
+        let table = match guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = ipc::port_unregister(port_id, task_id);
+                return Err(ObjError::TaskNotFound);
+            }
+        };
 
         let obj = Object::Port(PortObject::new(port_id, name));
         let handle = match table.alloc(ObjectType::Port, obj) {
@@ -447,8 +557,8 @@ impl ObjectService {
             }
         };
 
-        // Drop tables lock before scheduler access
-        drop(tables);
+        // Drop table lock before scheduler access
+        drop(guard);
 
         // Update limit counter via scheduler
         crate::kernel::task::with_scheduler(|sched| {
@@ -461,23 +571,20 @@ impl ObjectService {
     }
 
     /// Read from port (accept connection)
-    ///
-    /// Returns (channel_handle, client_pid) on success.
-    /// Returns NeedBlock if no pending connections.
     pub fn read_port(
         &self,
         task_id: TaskId,
         handle: Handle,
     ) -> Result<(ReadAttempt, Option<(Handle, TaskId)>), ObjError> {
         use crate::kernel::ipc;
-        use crate::kernel::object::{Object, ChannelObject};
+        use crate::kernel::object::ChannelObject;
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
         // Get port_id from object table
         let port_id = {
-            let tables = self.tables.lock();
-            let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+            let guard = self.lock_table(task_id)?;
+            let table = guard.table()?;
             let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
 
             let Object::Port(ref p) = entry.object else {
@@ -490,21 +597,25 @@ impl ObjectService {
 
             p.port_id()
         };
+        // guard dropped here
 
         // Accept connection from IPC backend (no lock held)
         match ipc::port_accept(port_id, task_id) {
             Ok((server_channel, client_pid)) => {
-                // Allocate channel handle in ObjectService tables
-                let mut tables = self.tables.lock();
-                let table = tables[slot].as_mut().ok_or_else(|| {
-                    let _ = ipc::close_channel(server_channel, task_id);
-                    ObjError::TaskNotFound
-                })?;
+                // Allocate channel handle
+                let mut guard = self.lock_table(task_id)?;
+                let table = match guard.table_mut() {
+                    Ok(t) => t,
+                    Err(_) => {
+                        let _ = ipc::close_channel(server_channel, task_id);
+                        return Err(ObjError::TaskNotFound);
+                    }
+                };
 
                 let ch_obj = Object::Channel(ChannelObject::new(server_channel));
                 match table.alloc(ObjectType::Channel, ch_obj) {
                     Some(ch_handle) => {
-                        drop(tables);
+                        drop(guard);
                         // Update limit counter via scheduler
                         crate::kernel::task::with_scheduler(|sched| {
                             if let Some(task) = sched.task_mut(slot) {
@@ -526,15 +637,13 @@ impl ObjectService {
     }
 
     // ========================================================================
-    // Channel Operations (Phase 3)
+    // Channel Operations
     // ========================================================================
 
     /// Create a channel pair
-    ///
-    /// Returns (handle_a, handle_b) on success.
     pub fn open_channel_pair(&self, task_id: TaskId) -> Result<(Handle, Handle), ObjError> {
         use crate::kernel::ipc;
-        use crate::kernel::object::{Object, ChannelObject};
+        use crate::kernel::object::ChannelObject;
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
@@ -550,22 +659,27 @@ impl ObjectService {
         let (ch_a, ch_b) = ipc::create_channel_pair(task_id, task_id)
             .map_err(|_| ObjError::OutOfMemory)?;
 
-        // Allocate handles in ObjectService tables
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or_else(|| {
-            let _ = ipc::close_channel(ch_a, task_id);
-            let _ = ipc::close_channel(ch_b, task_id);
-            ObjError::TaskNotFound
-        })?;
+        // Allocate handles
+        let mut guard = self.lock_table(task_id)?;
+        let table = match guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = ipc::close_channel(ch_a, task_id);
+                let _ = ipc::close_channel(ch_b, task_id);
+                return Err(ObjError::TaskNotFound);
+            }
+        };
 
         // Create and allocate handle A
         let obj_a = Object::Channel(ChannelObject::new(ch_a));
-        let handle_a = table.alloc(ObjectType::Channel, obj_a)
-            .ok_or_else(|| {
+        let handle_a = match table.alloc(ObjectType::Channel, obj_a) {
+            Some(h) => h,
+            None => {
                 let _ = ipc::close_channel(ch_a, task_id);
                 let _ = ipc::close_channel(ch_b, task_id);
-                ObjError::OutOfHandles
-            })?;
+                return Err(ObjError::OutOfHandles);
+            }
+        };
 
         // Create and allocate handle B
         let obj_b = Object::Channel(ChannelObject::new(ch_b));
@@ -579,7 +693,7 @@ impl ObjectService {
             }
         };
 
-        drop(tables);
+        drop(guard);
 
         // Track resource usage via scheduler
         crate::kernel::task::with_scheduler(|sched| {
@@ -592,16 +706,14 @@ impl ObjectService {
         Ok((handle_a, handle_b))
     }
 
-    /// Connect to a named port
-    ///
-    /// Returns channel handle on success.
+    /// Connect to a named port (accesses two tables safely with per-task locks)
     pub fn open_channel_connect(
         &self,
         task_id: TaskId,
         port_name: &[u8],
     ) -> Result<Handle, ObjError> {
         use crate::kernel::ipc::{self, waker};
-        use crate::kernel::object::{Object, ChannelObject};
+        use crate::kernel::object::ChannelObject;
 
         let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
@@ -623,38 +735,43 @@ impl ObjectService {
         // Wake the server waiting for connections (IPC backend subscribers)
         waker::wake(&wake_list, ipc::WakeReason::Accepted);
 
-        // Also wake PortObject subscriber if the port owner is watching via Mux
-        // (The PortObject.subscriber is set by read_mux_via_service)
-        let port_subscriber = if let Some(owner_slot) = slot_from_task_id(port_owner) {
-            let tables = self.tables.lock();
-            let mut found_sub = None;
-            if let Some(Some(owner_table)) = tables.get(owner_slot) {
-                // Find the PortObject for this port name and get its subscriber
-                for (_handle, entry) in owner_table.iter() {
-                    if let Object::Port(ref port_obj) = entry.object {
-                        if port_obj.name_matches(port_name) {
-                            found_sub = port_obj.subscriber();
-                            break;
+        // Get port subscriber from owner's table (if owner != caller)
+        let owner_slot = slot_from_task_id(port_owner);
+        let port_subscriber = match owner_slot {
+            Some(os) if os != slot => {
+                // Different task - lock owner's table
+                let owner_guard = self.lock_slot(os)?;
+                let mut found_sub = None;
+                if let Ok(table) = owner_guard.table() {
+                    for (_h, entry) in table.iter() {
+                        if let Object::Port(ref p) = entry.object {
+                            if p.name_matches(port_name) {
+                                found_sub = p.subscriber();
+                                break;
+                            }
                         }
                     }
                 }
+                found_sub
+                // owner_guard dropped here
             }
-            found_sub
-        } else {
-            None
+            _ => None, // Same task or invalid - skip
         };
-        // Wake outside the lock
+
+        // Wake subscriber (no locks held)
         if let Some(sub) = port_subscriber {
             waker::wake_pid(sub.task_id);
         }
-        // Note: no subscriber is normal if port not yet added to mux
 
-        // Allocate handle in ObjectService tables
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or_else(|| {
-            let _ = ipc::close_channel(client_channel, task_id);
-            ObjError::TaskNotFound
-        })?;
+        // Allocate handle in caller's table
+        let mut caller_guard = self.lock_table(task_id)?;
+        let table = match caller_guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = ipc::close_channel(client_channel, task_id);
+                return Err(ObjError::TaskNotFound);
+            }
+        };
 
         let obj = Object::Channel(ChannelObject::new(client_channel));
         let handle = match table.alloc(ObjectType::Channel, obj) {
@@ -665,7 +782,7 @@ impl ObjectService {
             }
         };
 
-        drop(tables);
+        drop(caller_guard);
 
         // Track resource usage via scheduler
         crate::kernel::task::with_scheduler(|sched| {
@@ -685,14 +802,11 @@ impl ObjectService {
         buf: &mut [u8],
     ) -> Result<ReadAttempt, ObjError> {
         use crate::kernel::ipc;
-        use crate::kernel::object::Object;
-
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
         // Get channel info from object table
         let channel_id = {
-            let tables = self.tables.lock();
-            let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+            let guard = self.lock_table(task_id)?;
+            let table = guard.table()?;
             let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
 
             let Object::Channel(ref ch) = entry.object else {
@@ -711,7 +825,7 @@ impl ObjectService {
 
             channel_id
         };
-        // tables lock dropped here
+        // guard dropped here
 
         // Receive from IPC backend (outside lock)
         match ipc::receive(channel_id, task_id) {
@@ -737,18 +851,15 @@ impl ObjectService {
         buf: &[u8],
     ) -> Result<usize, ObjError> {
         use crate::kernel::ipc::{self, waker};
-        use crate::kernel::object::Object;
 
         if buf.len() > ipc::MAX_INLINE_PAYLOAD {
             return Err(ObjError::InvalidArg);
         }
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-
         // Get channel info from object table
         let channel_id = {
-            let tables = self.tables.lock();
-            let table = tables[slot].as_ref().ok_or(ObjError::TaskNotFound)?;
+            let guard = self.lock_table(task_id)?;
+            let table = guard.table()?;
             let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
 
             let Object::Channel(ref ch) = entry.object else {
@@ -767,7 +878,7 @@ impl ObjectService {
 
             channel_id
         };
-        // tables lock dropped here
+        // guard dropped here
 
         // Create and send message (outside lock)
         let msg = ipc::Message::data(task_id, buf);
@@ -790,15 +901,11 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a new Mux
-    ///
-    /// Returns a handle to the mux on success.
     pub fn open_mux(&self, task_id: TaskId) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, MuxObject};
+        use crate::kernel::object::MuxObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let obj = Object::Mux(MuxObject::new());
 
         table.alloc(ObjectType::Mux, obj).ok_or(ObjError::OutOfHandles)
@@ -809,13 +916,8 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a Process object to watch another process
-    ///
-    /// The target_pid is the PID to watch. Returns a handle that can be
-    /// read to wait for the target process to exit.
     pub fn open_process(&self, task_id: TaskId, target_pid: TaskId) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, ProcessObject};
-
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        use crate::kernel::object::ProcessObject;
 
         // First, check target task state via scheduler
         let exit_code = crate::kernel::task::with_scheduler(|sched| {
@@ -840,8 +942,8 @@ impl ObjectService {
         let obj = Object::Process(proc_obj);
 
         // Allocate handle in object table
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         table.alloc(ObjectType::Process, obj).ok_or(ObjError::OutOfHandles)
     }
 
@@ -850,33 +952,32 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a new shared memory region
-    ///
-    /// Returns a handle to the shmem on success.
-    pub fn open_shmem_create(&self, task_id: TaskId, size: usize) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, ShmemObject};
+    pub fn open_shmem_create(&self, task_id: TaskId, size: usize) -> Result<(Handle, u32), ObjError> {
+        use crate::kernel::object::ShmemObject;
         use crate::kernel::shmem;
 
         if size == 0 {
             return Err(ObjError::InvalidArg);
         }
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-
         // Create shmem region (outside lock)
         let (shmem_id, vaddr, paddr) = shmem::create(task_id, size)
             .map_err(ObjError::from_errno)?;
 
         // Allocate handle in object table
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or_else(|| {
-            let _ = shmem::destroy(shmem_id, task_id);
-            ObjError::TaskNotFound
-        })?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = match guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = shmem::destroy(shmem_id, task_id);
+                return Err(ObjError::TaskNotFound);
+            }
+        };
 
         let obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, size, vaddr));
 
         match table.alloc(ObjectType::Shmem, obj) {
-            Some(handle) => Ok(handle),
+            Some(handle) => Ok((handle, shmem_id)),
             None => {
                 let _ = shmem::destroy(shmem_id, task_id);
                 Err(ObjError::OutOfHandles)
@@ -885,16 +986,9 @@ impl ObjectService {
     }
 
     /// Open an existing shared memory region
-    ///
-    /// Returns a handle to the shmem on success.
-    /// Open an existing shared memory region
-    ///
-    /// Returns a handle to the shmem on success.
     pub fn open_shmem_existing(&self, task_id: TaskId, shmem_id: u32) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, ShmemObject};
+        use crate::kernel::object::ShmemObject;
         use crate::kernel::shmem;
-
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
         // Map existing shmem region (outside lock)
         let (vaddr, paddr) = shmem::map(task_id, shmem_id)
@@ -902,11 +996,14 @@ impl ObjectService {
         let size = shmem::get_size(shmem_id).unwrap_or(0);
 
         // Allocate handle in object table
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or_else(|| {
-            let _ = shmem::unmap(task_id, shmem_id);
-            ObjError::TaskNotFound
-        })?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = match guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = shmem::unmap(task_id, shmem_id);
+                return Err(ObjError::TaskNotFound);
+            }
+        };
 
         let obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, size, vaddr));
 
@@ -924,8 +1021,6 @@ impl ObjectService {
     // ========================================================================
 
     /// Allocate DMA-capable memory
-    ///
-    /// Returns a handle to the DMA pool on success.
     pub fn open_dma_pool(
         &self,
         task_id: TaskId,
@@ -933,13 +1028,11 @@ impl ObjectService {
         use_high: bool,
     ) -> Result<Handle, ObjError> {
         use crate::kernel::dma_pool;
-        use crate::kernel::object::{Object, DmaPoolObject};
+        use crate::kernel::object::DmaPoolObject;
 
         if size == 0 {
             return Err(ObjError::InvalidArg);
         }
-
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
 
         // Allocate from appropriate pool (outside lock)
         let paddr = if use_high {
@@ -958,8 +1051,8 @@ impl ObjectService {
         };
 
         // Allocate handle in object table
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let obj = Object::DmaPool(DmaPoolObject::new(paddr, size, vaddr));
 
         table.alloc(ObjectType::DmaPool, obj).ok_or(ObjError::OutOfHandles)
@@ -970,15 +1063,13 @@ impl ObjectService {
     // ========================================================================
 
     /// Map MMIO region
-    ///
-    /// Returns a handle to the MMIO mapping on success.
     pub fn open_mmio(
         &self,
         task_id: TaskId,
         phys_addr: u64,
         size: usize,
     ) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, MmioObject};
+        use crate::kernel::object::MmioObject;
 
         if size == 0 {
             return Err(ObjError::InvalidArg);
@@ -994,11 +1085,44 @@ impl ObjectService {
         // scheduler lock dropped here
 
         // Allocate handle in object table
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let obj = Object::Mmio(MmioObject::new(phys_addr, size, vaddr));
 
         table.alloc(ObjectType::Mmio, obj).ok_or(ObjError::OutOfHandles)
+    }
+
+    // ========================================================================
+    // Ring Operations (high-performance IPC)
+    // ========================================================================
+
+    /// Create a new Ring IPC object
+    pub fn open_ring(
+        &self,
+        task_id: TaskId,
+        ring: crate::kernel::object::RingObject,
+        shmem_id: u32,
+    ) -> Result<Handle, ObjError> {
+        // Allocate handle in object table
+        let mut guard = self.lock_table(task_id)?;
+        let table = match guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => {
+                // Clean up shmem on failure
+                let _ = crate::kernel::shmem::destroy(shmem_id, task_id);
+                return Err(ObjError::TaskNotFound);
+            }
+        };
+
+        let obj = Object::Ring(ring);
+
+        match table.alloc(ObjectType::Ring, obj) {
+            Some(handle) => Ok(handle),
+            None => {
+                let _ = crate::kernel::shmem::destroy(shmem_id, task_id);
+                Err(ObjError::OutOfHandles)
+            }
+        }
     }
 
     // ========================================================================
@@ -1006,15 +1130,11 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a kernel log reader
-    ///
-    /// Returns a handle to the klog reader on success.
     pub fn open_klog(&self, task_id: TaskId) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, KlogObject};
+        use crate::kernel::object::KlogObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let obj = Object::Klog(KlogObject::new());
 
         table.alloc(ObjectType::Klog, obj).ok_or(ObjError::OutOfHandles)
@@ -1026,12 +1146,10 @@ impl ObjectService {
 
     /// Create a PCI bus handle for device enumeration
     pub fn open_pci_bus(&self, task_id: TaskId, bdf_filter: u32) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, PciBusObject};
+        use crate::kernel::object::PciBusObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let obj = Object::PciBus(PciBusObject::new(bdf_filter));
 
         table.alloc(ObjectType::PciBus, obj).ok_or(ObjError::OutOfHandles)
@@ -1039,12 +1157,10 @@ impl ObjectService {
 
     /// Create a PCI device handle for config access
     pub fn open_pci_device(&self, task_id: TaskId, bdf: u32) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, PciDeviceObject};
+        use crate::kernel::object::PciDeviceObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let obj = Object::PciDevice(PciDeviceObject::new(bdf));
 
         table.alloc(ObjectType::PciDevice, obj).ok_or(ObjError::OutOfHandles)
@@ -1058,12 +1174,10 @@ impl ObjectService {
         first_irq: u32,
         count: u8,
     ) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, MsiObject};
+        use crate::kernel::object::MsiObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let obj = Object::Msi(MsiObject::new(bdf, first_irq, count));
 
         table.alloc(ObjectType::Msi, obj).ok_or(ObjError::OutOfHandles)
@@ -1071,12 +1185,10 @@ impl ObjectService {
 
     /// Create a bus list handle
     pub fn open_bus_list(&self, task_id: TaskId) -> Result<Handle, ObjError> {
-        use crate::kernel::object::{Object, BusListObject};
+        use crate::kernel::object::BusListObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
-
-        let mut tables = self.tables.lock();
-        let table = tables[slot].as_mut().ok_or(ObjError::TaskNotFound)?;
+        let mut guard = self.lock_table(task_id)?;
+        let table = guard.table_mut()?;
         let obj = Object::BusList(BusListObject::new());
 
         table.alloc(ObjectType::BusList, obj).ok_or(ObjError::OutOfHandles)
@@ -1087,26 +1199,25 @@ impl ObjectService {
     // ========================================================================
 
     /// Check TimerObjects for a task and collect fired subscribers
-    ///
-    /// Called during scheduler tick to find TimerObjects that have fired.
-    /// Returns subscribers that should be woken.
     pub fn check_timers_for_task(
         &self,
         task_id: TaskId,
         current_tick: u64,
         max_subscribers: usize,
     ) -> (crate::kernel::ipc::waker::WakeList, usize) {
-        use crate::kernel::object::Object;
-
         let slot = match slot_from_task_id(task_id) {
             Some(s) => s,
             None => return (crate::kernel::ipc::waker::WakeList::new(), 0),
         };
 
-        let mut tables = self.tables.lock();
-        let table = match tables[slot].as_mut() {
-            Some(t) => t,
-            None => return (crate::kernel::ipc::waker::WakeList::new(), 0),
+        let mut guard = match self.lock_slot(slot) {
+            Ok(g) => g,
+            Err(_) => return (crate::kernel::ipc::waker::WakeList::new(), 0),
+        };
+
+        let table = match guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => return (crate::kernel::ipc::waker::WakeList::new(), 0),
         };
 
         let mut wake_list = crate::kernel::ipc::waker::WakeList::new();
@@ -1134,26 +1245,25 @@ impl ObjectService {
     // ========================================================================
 
     /// Notify a parent task's ProcessObject handles about a child exit
-    ///
-    /// This method can be called outside the scheduler lock.
-    /// Returns a wake list for the caller to process.
     pub fn notify_child_exit(
         &self,
         parent_id: TaskId,
         child_pid: TaskId,
         exit_code: i32,
     ) -> crate::kernel::ipc::waker::WakeList {
-        use crate::kernel::object::Object;
-
         let slot = match slot_from_task_id(parent_id) {
             Some(s) => s,
             None => return crate::kernel::ipc::waker::WakeList::new(),
         };
 
-        let mut tables = self.tables.lock();
-        let table = match tables[slot].as_mut() {
-            Some(t) => t,
-            None => return crate::kernel::ipc::waker::WakeList::new(),
+        let mut guard = match self.lock_slot(slot) {
+            Ok(g) => g,
+            Err(_) => return crate::kernel::ipc::waker::WakeList::new(),
+        };
+
+        let table = match guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => return crate::kernel::ipc::waker::WakeList::new(),
         };
 
         // Iterate and update ProcessObjects watching this child
@@ -1178,26 +1288,9 @@ impl ObjectService {
 // ============================================================================
 
 /// Global ObjectService instance
-///
-/// This is the single source of truth for all object tables.
-/// All syscalls go through this service.
 static OBJECT_SERVICE: ObjectService = ObjectService::new();
 
 /// Get a reference to the global ObjectService
 pub fn object_service() -> &'static ObjectService {
     &OBJECT_SERVICE
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-// Note: Tests disabled for no_std kernel. Test ObjectService logic via
-// integration tests or QEMU-based testing.
-//
-// The key behaviors to verify:
-// - create_task_table() creates tables indexed by slot (extracted from task_id)
-// - remove_task_table() removes and returns the table
-// - alloc_handle() allocates in the correct task's table
-// - close_handle() closes handles correctly
-// - User tasks get stdin/stdout/stderr pre-allocated

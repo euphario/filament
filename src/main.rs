@@ -179,15 +179,12 @@ pub extern "C" fn kmain() -> ! {
     {
         let _span = span!("timer", "init");
         timer::init();
-        kinfo!("timer", "init_ok");
-        timer::print_info();
     }
 
     // SMP
     {
         let _span = span!("smp", "init");
         smp::init();
-        kinfo!("smp", "init_ok");
     }
 
     // Flush logs before self-tests
@@ -328,7 +325,6 @@ pub extern "C" fn kmain() -> ! {
         // We can't start this earlier in boot because timer IRQs
         // would trigger rescheduling before we're ready.
         crate::platform::current::timer::start(10);
-        kinfo!("timer", "preemption_started"; slice_ms = 10u64);
 
         // Enter usermode - this never returns
         unsafe {

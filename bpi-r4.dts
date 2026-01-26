@@ -1,189 +1,28 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
-// Simplified device tree for BPI-R4 bare-metal kernel
-// Based on Linux kernel mt7988a-bananapi-bpi-r4.dtsi
-
 /dts-v1/;
 
 / {
-	compatible = "bananapi,bpi-r4", "mediatek,mt7988a";
-	model = "Banana Pi BPI-R4";
-	#address-cells = <2>;
-	#size-cells = <2>;
+    compatible = "bpi,bpi-r4", "mediatek,mt7988a";
+    model = "Banana Pi BPI-R4";
+    #address-cells = <2>;
+    #size-cells = <2>;
 
-	aliases {
-		serial0 = &uart0;
-	};
+    chosen {
+        bootargs = "";
+    };
 
-	chosen {
-		stdout-path = "serial0:115200n8";
-	};
+    memory@40000000 {
+        device_type = "memory";
+        reg = <0x0 0x40000000 0x0 0x80000000>; /* 2GB */
+    };
 
-	cpus {
-		#address-cells = <1>;
-		#size-cells = <0>;
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
 
-		cpu0: cpu@0 {
-			compatible = "arm,cortex-a73";
-			device_type = "cpu";
-			reg = <0x0>;
-			enable-method = "psci";
-		};
-
-		cpu1: cpu@1 {
-			compatible = "arm,cortex-a73";
-			device_type = "cpu";
-			reg = <0x1>;
-			enable-method = "psci";
-		};
-
-		cpu2: cpu@2 {
-			compatible = "arm,cortex-a73";
-			device_type = "cpu";
-			reg = <0x2>;
-			enable-method = "psci";
-		};
-
-		cpu3: cpu@3 {
-			compatible = "arm,cortex-a73";
-			device_type = "cpu";
-			reg = <0x3>;
-			enable-method = "psci";
-		};
-	};
-
-	memory@40000000 {
-		device_type = "memory";
-		reg = <0x0 0x40000000 0x1 0x00000000>;  /* 4GB */
-	};
-
-	soc {
-		compatible = "simple-bus";
-		#address-cells = <2>;
-		#size-cells = <2>;
-		ranges;
-
-		/* GIC-600 Interrupt Controller */
-		gic: interrupt-controller@c000000 {
-			compatible = "arm,gic-v3";
-			reg = <0x0 0x0c000000 0x0 0x40000>,   /* GICD */
-			      <0x0 0x0c080000 0x0 0x200000>;  /* GICR */
-			interrupt-controller;
-			#interrupt-cells = <3>;
-		};
-
-		/* Watchdog */
-		watchdog@1001c000 {
-			compatible = "mediatek,mt7988-wdt", "mediatek,mt6589-wdt";
-			reg = <0x0 0x1001c000 0x0 0x1000>;
-		};
-
-		/* UART0 - Console */
-		uart0: serial@11002000 {
-			compatible = "mediatek,mt6577-uart";
-			reg = <0x0 0x11002000 0x0 0x1000>;
-			interrupts = <0 92 4>;  /* SPI 92, level */
-			clock-frequency = <26000000>;
-			status = "okay";
-		};
-
-		/* I2C0 - GPIO expander PCA9555 at 0x27 */
-		i2c0: i2c@11007000 {
-			compatible = "mediatek,mt7988-i2c", "mediatek,mt6577-i2c";
-			reg = <0x0 0x11007000 0x0 0x1000>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-			status = "okay";
-		};
-
-		/* PWM */
-		pwm: pwm@10048000 {
-			compatible = "mediatek,mt7988-pwm";
-			reg = <0x0 0x10048000 0x0 0x1000>;
-			#pwm-cells = <2>;
-			status = "okay";
-		};
-
-		/* USB0 - SSUSB0 (M.2 Key-B slot) */
-		usb0: usb@11190000 {
-			compatible = "mediatek,mt7988-xhci", "generic-xhci";
-			reg = <0x0 0x11190000 0x0 0x10000>;
-			interrupts = <0 173 4>;  /* SPI 173 */
-			status = "okay";
-		};
-
-		/* USB1 - SSUSB1 (USB-A ports via VL822 hub) */
-		usb1: usb@11200000 {
-			compatible = "mediatek,mt7988-xhci", "generic-xhci";
-			reg = <0x0 0x11200000 0x0 0x10000>;
-			interrupts = <0 172 4>;  /* SPI 172 */
-			status = "okay";
-		};
-
-		/* PCIe2 - M.2 Key-M slot (NVMe) */
-		pcie2: pcie@11280000 {
-			compatible = "mediatek,mt7988-pcie";
-			reg = <0x0 0x11280000 0x0 0x10000>;
-			device_type = "pci";
-			bus-range = <0x00 0xff>;
-			#address-cells = <3>;
-			#size-cells = <2>;
-			status = "okay";
-		};
-
-		/* PCIe3 - M.2 Key-E slot (WiFi MT7996) */
-		pcie3: pcie@11290000 {
-			compatible = "mediatek,mt7988-pcie";
-			reg = <0x0 0x11290000 0x0 0x10000>;
-			device_type = "pci";
-			bus-range = <0x00 0xff>;
-			#address-cells = <3>;
-			#size-cells = <2>;
-			status = "okay";
-		};
-
-		/* PCIe0 */
-		pcie0: pcie@11300000 {
-			compatible = "mediatek,mt7988-pcie";
-			reg = <0x0 0x11300000 0x0 0x10000>;
-			device_type = "pci";
-			bus-range = <0x00 0xff>;
-			#address-cells = <3>;
-			#size-cells = <2>;
-			status = "okay";
-		};
-
-		/* PCIe1 */
-		pcie1: pcie@11310000 {
-			compatible = "mediatek,mt7988-pcie";
-			reg = <0x0 0x11310000 0x0 0x10000>;
-			device_type = "pci";
-			bus-range = <0x00 0xff>;
-			#address-cells = <3>;
-			#size-cells = <2>;
-			status = "okay";
-		};
-
-		/* GPIO/Pinctrl */
-		pio: pinctrl@1001f000 {
-			compatible = "mediatek,mt7988-pinctrl";
-			reg = <0x0 0x1001f000 0x0 0x1000>;
-			gpio-controller;
-			#gpio-cells = <2>;
-		};
-	};
-
-	/* LEDs */
-	leds {
-		compatible = "gpio-leds";
-
-		led_green: green {
-			gpios = <&pio 79 0>;  /* GPIO_ACTIVE_HIGH */
-			default-state = "on";
-		};
-
-		led_blue: blue {
-			gpios = <&pio 63 0>;
-			default-state = "off";
-		};
-	};
+        cpu@0 {
+            device_type = "cpu";
+            compatible = "arm,cortex-a73";
+            reg = <0x0>;
+        };
+    };
 };

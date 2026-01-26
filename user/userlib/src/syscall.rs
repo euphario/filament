@@ -274,6 +274,24 @@ pub fn open(obj_type: ObjectType, params: &[u8]) -> SysResult<Handle> {
     }
 }
 
+/// Open a new shmem region and return (handle, shmem_id)
+/// The kernel returns shmem_id in upper 32 bits, handle in lower 32 bits
+pub fn open_shmem_create(size: usize) -> SysResult<(Handle, u32)> {
+    let ret = syscall3(
+        sys::OPEN,
+        ObjectType::Shmem as u64,
+        (&(size as u64).to_le_bytes()).as_ptr() as u64,
+        8, // size is u64 = 8 bytes
+    );
+    if ret < 0 {
+        Err(SysError::from_errno(ret as i32))
+    } else {
+        let handle = Handle((ret & 0xFFFF_FFFF) as u32);
+        let shmem_id = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+        Ok((handle, shmem_id))
+    }
+}
+
 /// Read from a handle
 pub fn read(handle: Handle, buf: &mut [u8]) -> SysResult<usize> {
     let ret = syscall3(

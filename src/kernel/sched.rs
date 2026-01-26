@@ -343,9 +343,17 @@ pub fn yield_current() {
 
 /// Handle timer tick - check timeouts and set reschedule flag if needed.
 ///
-/// Called from timer interrupt handler.
+/// Called from timer interrupt handler. Uses try_scheduler() to avoid
+/// deadlock if the scheduler lock is held by interrupted code.
 pub fn timer_tick(current_time: u64) {
-    let mut sched = task::scheduler();
+    // Use try_scheduler to avoid deadlock if syscall holds the lock
+    let Some(mut sched) = task::try_scheduler() else {
+        // Lock held - skip this tick, timeouts will be checked next tick
+        // Still set need_resched so we retry after the syscall completes
+        crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+        return;
+    };
+
     let woken = sched.check_timeouts(current_time);
 
     if woken > 0 {

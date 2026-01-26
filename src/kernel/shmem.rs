@@ -121,6 +121,10 @@ pub struct SharedMem {
     pub ref_count: u32,
     /// Region state (Active or Dying) - private, use state() and transition methods
     state: RegionState,
+    /// Per-PID pending notifications - PIDs that missed a notify() while not waiting.
+    /// When notify() is called with no waiters, all OTHER allowed PIDs get marked pending.
+    /// When wait() is called, if caller has pending flag, return immediately.
+    pending_for: [Pid; MAX_ALLOWED_PIDS],
 }
 
 impl SharedMem {
@@ -142,6 +146,7 @@ impl SharedMem {
             waiters: [NO_PID; MAX_WAITERS],
             ref_count: 0,
             state: RegionState::Active,
+            pending_for: [NO_PID; MAX_ALLOWED_PIDS],
         }
     }
 
@@ -704,8 +709,12 @@ pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
 /// The syscall layer handles actual blocking and rescheduling.
 /// If timeout_ms > 0, the wait will automatically complete after the timeout.
 /// timeout_ms = 0 means wait indefinitely.
+///
+/// Race condition fix: If notify() was called while no one was waiting,
+/// a pending flag is set. This function checks that flag first and returns
+/// immediately if set (clearing the flag). This prevents missing notifications.
 pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
-    // Add to waiters list under shmem lock
+    // Check for pending notification and add to waiters list under shmem lock
     {
         let mut guard = SHMEM.lock();
         let mut found = false;
@@ -715,6 +724,15 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
                     // Check access
                     if !region.is_allowed(pid) {
                         return Err(-13); // EACCES
+                    }
+
+                    // Check if notification is pending for THIS pid (race condition fix)
+                    // If notify() was called before we subscribed, return immediately
+                    for slot in &mut region.pending_for {
+                        if *slot == pid {
+                            *slot = NO_PID; // Clear the pending flag for this pid
+                            return Ok(()); // Data is ready, don't block
+                        }
                     }
 
                     if !region.add_waiter(pid) {
@@ -733,8 +751,11 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
 
     // Mark task as blocked - syscall layer will handle scheduling
     // Calculate deadline first, then set state, then notify scheduler
-    let deadline_to_notify: Option<u64> = super::task::with_scheduler(|sched| {
+    let (deadline_to_notify, transition_ok) = super::task::with_scheduler(|sched| {
         if let Some(task) = sched.current_task_mut() {
+            let pid = task.id;
+            let state_name = task.state().name();
+
             // Set wake timeout if specified
             let timeout = if timeout_ms > 0 {
                 // Use unified clock API - convert ms to ns, then to hardware counter deadline
@@ -745,22 +766,57 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
             };
 
             // Set state based on whether we have a timeout (via state machine)
-            match timeout {
+            let ok = match timeout {
                 Some(deadline) => {
-                    let _ = task.set_waiting(
+                    match task.set_waiting(
                         super::task::WaitReason::ShmemNotify { shmem_id },
                         deadline,
-                    );
+                    ) {
+                        Ok(()) => true,
+                        Err(_) => {
+                            crate::kerror!("shmem", "wait_transition_failed";
+                                pid = pid as u64,
+                                from_state = state_name,
+                                shmem_id = shmem_id as u64
+                            );
+                            false
+                        }
+                    }
                 }
                 None => {
-                    let _ = task.set_sleeping(super::task::SleepReason::EventLoop);
+                    match task.set_sleeping(super::task::SleepReason::EventLoop) {
+                        Ok(()) => true,
+                        Err(_) => {
+                            crate::kerror!("shmem", "sleep_transition_failed";
+                                pid = pid as u64,
+                                from_state = state_name,
+                                shmem_id = shmem_id as u64
+                            );
+                            false
+                        }
+                    }
                 }
             };
-            timeout
+            (timeout, ok)
         } else {
-            None
+            (None, false)
         }
     });
+
+    // If transition failed, remove from waiters and return error immediately
+    if !transition_ok {
+        // Remove from waiters since we can't block
+        let mut guard = SHMEM.lock();
+        for slot in guard.table.iter_mut() {
+            if let Some(ref mut region) = slot {
+                if region.id == shmem_id {
+                    region.remove_waiter(pid);
+                    break;
+                }
+            }
+        }
+        return Err(-11); // EAGAIN - caller should retry
+    }
 
     // Notify scheduler of deadline for tickless optimization (outside task borrow)
     if let Some(deadline) = deadline_to_notify {
@@ -775,11 +831,15 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
 
 /// Notify all waiters on shared memory
 /// Uses O(1) wake via PID→slot map
+///
+/// Race condition fix: If no waiters are present, sets notify_pending flag
+/// so that the next wait() call returns immediately without blocking.
 pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
     // Drain waiters under shmem lock
-    let waiters = {
+    let (waiters, had_waiters) = {
         let mut guard = SHMEM.lock();
         let mut found_waiters = None;
+        let mut had_any_waiters = false;
         for slot in guard.table.iter_mut() {
             if let Some(ref mut region) = slot {
                 if region.id == shmem_id {
@@ -787,14 +847,61 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
                     if !region.is_allowed(pid) {
                         return Err(-13); // EACCES
                     }
-                    found_waiters = Some(region.drain_waiters());
+                    let drained = region.drain_waiters();
+                    // Check if there were any actual waiters
+                    had_any_waiters = drained.iter().any(|&p| p != NO_PID);
+
+                    // If no waiters, mark all OTHER allowed PIDs as pending (race condition fix)
+                    // This way when they call wait(), they'll get the notification.
+                    // We exclude the caller since they're the one notifying.
+                    if !had_any_waiters {
+                        // Mark owner as pending (if not the caller)
+                        if region.owner_pid != NO_PID && region.owner_pid != pid {
+                            // Find empty slot in pending_for
+                            for slot in &mut region.pending_for {
+                                if *slot == NO_PID {
+                                    *slot = region.owner_pid;
+                                    break;
+                                } else if *slot == region.owner_pid {
+                                    break; // Already pending
+                                }
+                            }
+                        }
+                        // Mark allowed pids as pending (if not the caller)
+                        for &allowed_pid in &region.allowed_pids {
+                            if allowed_pid != NO_PID && allowed_pid != pid {
+                                // Find empty slot in pending_for (or check if already there)
+                                let mut already_pending = false;
+                                for slot in region.pending_for.iter() {
+                                    if *slot == allowed_pid {
+                                        already_pending = true;
+                                        break;
+                                    }
+                                }
+                                if !already_pending {
+                                    for slot in &mut region.pending_for {
+                                        if *slot == NO_PID {
+                                            *slot = allowed_pid;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    found_waiters = Some(drained);
                     break;
                 }
             }
         }
-        found_waiters.ok_or(-2i64)? // ENOENT
+        (found_waiters.ok_or(-2i64)?, had_any_waiters) // ENOENT
     };
     // shmem lock released here before touching scheduler
+
+    // If there were no waiters, we set the pending flag and return 0
+    if !had_waiters {
+        return Ok(0);
+    }
 
     // Wake all waiters using O(1) PID→slot lookup
     let woken = super::task::with_scheduler(|sched| {
