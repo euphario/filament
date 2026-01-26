@@ -10,23 +10,36 @@
 //! - Prune service branch on crash, then restart
 //! - Supervise with exponential backoff
 //!
-//! ## Service Tree Example
-//! ```text
-//! devd (PID 1, registers "devd:")
-//!  ├─ consoled (requires: devd:, registers: console:)
-//!  │   └─ shell (requires: console:)
-//!  ├─ pcied (requires: devd:, registers: pcie:)
-//!  │   └─ wifid (requires: pcie:, depends_on: console:)
-//!  └─ usbd (requires: devd:, registers: usb:)
-//!      └─ fatfs (requires: usb:, registers: fat:)
-//! ```
+//! ## Architecture
+//!
+//! devd uses a modular, trait-based design:
+//! - `service.rs` - Service state machine (ServiceManager trait)
+//! - `ports.rs` - Port registry (PortRegistry trait)
+//! - `process.rs` - Process management (ProcessManager trait)
+//! - `deps.rs` - Dependency resolution (DependencyResolver trait)
+//!
+//! Each module is testable independently via trait mocking.
 
 #![no_std]
 #![no_main]
 
+mod service;
+mod ports;
+mod process;
+mod deps;
+
 use userlib::syscall::{self, LogLevel};
-use userlib::ipc::{Port, Timer, Process, Channel, ObjHandle, EventLoop};
+use userlib::ipc::{Port, Timer, Channel, EventLoop, ObjHandle};
 use userlib::error::{SysError, SysResult};
+
+use service::{
+    Service, ServiceState, ServiceManager, ServiceRegistry,
+    MAX_SERVICES, MAX_PORTS_PER_SERVICE, MAX_RESTARTS,
+    INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
+};
+use ports::{PortRegistry, Ports};
+use process::{ProcessManager, SyscallProcessManager};
+use deps::{DependencyResolver, Dependencies};
 
 // =============================================================================
 // Logging
@@ -75,298 +88,7 @@ macro_rules! derror {
 }
 
 // =============================================================================
-// Constants
-// =============================================================================
-
-const MAX_SERVICES: usize = 16;
-const MAX_PORTS_PER_SERVICE: usize = 4;
-const MAX_CHILDREN_PER_SERVICE: usize = 8;
-const MAX_PORT_NAME: usize = 32;
-const MAX_RESTARTS: u8 = 3;
-const INITIAL_BACKOFF_MS: u32 = 1000;
-const MAX_BACKOFF_MS: u32 = 30000;
-/// Time before Failed services are retried (5 minutes)
-const FAILED_RETRY_MS: u64 = 5 * 60 * 1000;
-
-// =============================================================================
-// Service State Machine (Event-Driven)
-// =============================================================================
-
-/// Service lifecycle state
-///
-/// All transitions are event-driven, no polling:
-///
-///   Pending ──[deps satisfied]──► Starting
-///       Event: Another service becomes Ready
-///
-///   Starting ──[service connects to devd:]──► Ready
-///       Event: Port accept on devd: port
-///
-///   Ready ──[exit(0)]──► Stopped
-///       Event: Process watcher fires
-///
-///   Ready ──[exit(!=0)]──► Crashed (sets restart timer)
-///       Event: Process watcher fires
-///
-///   Crashed ──[restart timer fires, restarts < MAX]──► Starting
-///       Event: Per-service Timer fires
-///
-///   Crashed ──[restarts >= MAX]──► Failed (sets recovery timer)
-///       Immediate transition, no event needed
-///
-///   Failed ──[recovery timer fires]──► Pending
-///       Event: Per-service Timer fires (5 minute delay)
-///
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServiceState {
-    /// Waiting for dependencies to be satisfied
-    Pending,
-    /// Spawned, waiting for service to connect to devd:
-    Starting,
-    /// Service is ready (connected to devd:)
-    Ready,
-    /// Service exited cleanly
-    Stopped { code: i32 },
-    /// Service crashed, pending restart
-    Crashed { code: i32, restarts: u8 },
-    /// Service failed permanently (max restarts)
-    Failed { code: i32 },
-}
-
-impl ServiceState {
-    pub fn is_running(&self) -> bool {
-        matches!(self, ServiceState::Starting { .. } | ServiceState::Ready)
-    }
-
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, ServiceState::Stopped { .. } | ServiceState::Failed { .. })
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ServiceState::Pending => "pending",
-            ServiceState::Starting { .. } => "starting",
-            ServiceState::Ready => "ready",
-            ServiceState::Stopped { .. } => "stopped",
-            ServiceState::Crashed { .. } => "crashed",
-            ServiceState::Failed { .. } => "failed",
-        }
-    }
-}
-
-// =============================================================================
-// Dependency Types
-// =============================================================================
-
-/// Dependency specification
-#[derive(Clone, Copy, Debug)]
-pub enum Dependency {
-    /// Hard dependency - service won't start until this port exists
-    Requires(&'static [u8]),
-    /// Soft dependency - service starts anyway, handles missing gracefully
-    DependsOn(&'static [u8]),
-}
-
-impl Dependency {
-    pub fn port_name(&self) -> &'static [u8] {
-        match self {
-            Dependency::Requires(name) | Dependency::DependsOn(name) => name,
-        }
-    }
-
-    pub fn is_required(&self) -> bool {
-        matches!(self, Dependency::Requires(_))
-    }
-}
-
-// =============================================================================
-// Service Definition (static config)
-// =============================================================================
-
-/// Static service definition (compiled-in)
-pub struct ServiceDef {
-    /// Binary name in initrd
-    pub binary: &'static str,
-    /// Ports this service will register
-    pub registers: &'static [&'static [u8]],
-    /// Dependencies
-    pub dependencies: &'static [Dependency],
-    /// Auto-restart on crash?
-    pub auto_restart: bool,
-    /// Parent service (None = direct child of devd)
-    pub parent: Option<&'static str>,
-}
-
-/// Service definitions - the "service tree"
-static SERVICE_DEFS: &[ServiceDef] = &[
-    // TODO: Add logd once updated to new IPC APIs
-    // ServiceDef {
-    //     binary: "logd",
-    //     registers: &[b"logd:"],
-    //     dependencies: &[],
-    //     auto_restart: true,
-    //     parent: None,
-    // },
-    ServiceDef {
-        binary: "consoled",
-        registers: &[b"console:"],
-        dependencies: &[],  // devd: is implicit
-        auto_restart: true,
-        parent: None,
-    },
-    ServiceDef {
-        binary: "shell",
-        registers: &[],  // shell doesn't register any ports
-        dependencies: &[Dependency::Requires(b"console:")],  // Wait for consoled
-        auto_restart: true,
-        parent: None,
-    },
-    // Future services would be added here:
-    // ServiceDef {
-    //     binary: "pcied",
-    //     registers: &[b"pcie:"],
-    //     dependencies: &[],
-    //     auto_restart: true,
-    //     parent: None,
-    // },
-    // ServiceDef {
-    //     binary: "wifid",
-    //     registers: &[b"wifi:"],
-    //     dependencies: &[Dependency::Requires(b"pcie:")],
-    //     auto_restart: true,
-    //     parent: Some("pcied"),
-    // },
-];
-
-// =============================================================================
-// Port Registration
-// =============================================================================
-
-/// A registered port
-#[derive(Clone, Copy)]
-pub struct RegisteredPort {
-    /// Port name (e.g., "console:")
-    name: [u8; MAX_PORT_NAME],
-    name_len: u8,
-    /// Service index that owns this port
-    owner: u8,
-    /// Is the port currently available?
-    available: bool,
-}
-
-impl RegisteredPort {
-    pub const fn empty() -> Self {
-        Self {
-            name: [0; MAX_PORT_NAME],
-            name_len: 0,
-            owner: 0,
-            available: false,
-        }
-    }
-
-    pub fn name(&self) -> &[u8] {
-        &self.name[..self.name_len as usize]
-    }
-
-    pub fn matches(&self, name: &[u8]) -> bool {
-        self.name_len as usize == name.len() &&
-            &self.name[..self.name_len as usize] == name
-    }
-}
-
-// =============================================================================
-// Service Instance (runtime state)
-// =============================================================================
-
-/// A running or tracked service instance
-pub struct Service {
-    /// Index into SERVICE_DEFS
-    def_index: u8,
-    /// Current state
-    state: ServiceState,
-    /// Process ID (0 if not running)
-    pid: u32,
-    /// Process watcher handle
-    watcher: Option<Process>,
-    /// Channel from this service (for ready announcement)
-    channel: Option<Channel>,
-    /// Indices of child services
-    children: [Option<u8>; MAX_CHILDREN_PER_SERVICE],
-    child_count: u8,
-    /// Parent service index (None = devd)
-    parent: Option<u8>,
-    /// Restart backoff in ms
-    backoff_ms: u32,
-    /// Last state change timestamp
-    last_change: u64,
-    /// Total restarts (for monitoring, not reset)
-    total_restarts: u32,
-    /// Restart timer (set when Crashed or Failed, fires when ready to retry)
-    restart_timer: Option<Timer>,
-}
-
-impl Service {
-    pub const fn empty() -> Self {
-        Self {
-            def_index: 0,
-            state: ServiceState::Pending,
-            pid: 0,
-            watcher: None,
-            channel: None,
-            children: [None; MAX_CHILDREN_PER_SERVICE],
-            child_count: 0,
-            parent: None,
-            backoff_ms: INITIAL_BACKOFF_MS,
-            last_change: 0,
-            total_restarts: 0,
-            restart_timer: None,
-        }
-    }
-
-    pub fn def(&self) -> &'static ServiceDef {
-        &SERVICE_DEFS[self.def_index as usize]
-    }
-
-    pub fn name(&self) -> &'static str {
-        self.def().binary
-    }
-
-    /// Add a child service index
-    pub fn add_child(&mut self, child_idx: u8) -> bool {
-        if self.child_count as usize >= MAX_CHILDREN_PER_SERVICE {
-            return false;
-        }
-        self.children[self.child_count as usize] = Some(child_idx);
-        self.child_count += 1;
-        true
-    }
-
-    /// Remove a child service index
-    pub fn remove_child(&mut self, child_idx: u8) {
-        for i in 0..self.child_count as usize {
-            if self.children[i] == Some(child_idx) {
-                // Shift remaining
-                for j in i..self.child_count as usize - 1 {
-                    self.children[j] = self.children[j + 1];
-                }
-                self.children[self.child_count as usize - 1] = None;
-                self.child_count -= 1;
-                return;
-            }
-        }
-    }
-
-    /// Transition to a new state
-    pub fn transition(&mut self, new_state: ServiceState, now: u64) {
-        let old = self.state;
-        self.state = new_state;
-        self.last_change = now;
-        dlog!("service {} state: {:?} -> {:?}", self.name(), old, new_state);
-    }
-}
-
-// =============================================================================
-// Service Registry (devd core)
+// Devd - Service Supervisor
 // =============================================================================
 
 pub struct Devd {
@@ -374,12 +96,14 @@ pub struct Devd {
     port: Option<Port>,
     /// Event loop
     events: Option<EventLoop>,
-    /// All tracked services
-    services: [Option<Service>; MAX_SERVICES],
-    service_count: usize,
-    /// All registered ports (for routing)
-    ports: [Option<RegisteredPort>; MAX_SERVICES * MAX_PORTS_PER_SERVICE],
-    port_count: usize,
+    /// Service registry
+    services: ServiceRegistry,
+    /// Port registry
+    ports: Ports,
+    /// Process manager
+    process_mgr: SyscallProcessManager,
+    /// Dependency resolver
+    deps: Dependencies,
 }
 
 impl Devd {
@@ -387,10 +111,10 @@ impl Devd {
         Self {
             port: None,
             events: None,
-            services: [const { None }; MAX_SERVICES],
-            service_count: 0,
-            ports: [const { None }; MAX_SERVICES * MAX_PORTS_PER_SERVICE],
-            port_count: 0,
+            services: ServiceRegistry::new(),
+            ports: Ports::new(),
+            process_mgr: SyscallProcessManager::new(),
+            deps: Dependencies::new(),
         }
     }
 
@@ -398,7 +122,6 @@ impl Devd {
     // Helpers
     // =========================================================================
 
-    /// Get current time in milliseconds
     fn now_ms() -> u64 {
         syscall::gettime() / 1_000_000
     }
@@ -409,11 +132,9 @@ impl Devd {
 
     pub fn init(&mut self) -> SysResult<()> {
         syscall::klog(LogLevel::Info, b"[devd] init: creating EventLoop");
-        // Create event loop
         let mut events = EventLoop::new()?;
 
         syscall::klog(LogLevel::Info, b"[devd] init: registering port devd:");
-        // Register our port (services connect here to announce ready)
         let port = Port::register(b"devd:")?;
         syscall::klog(LogLevel::Info, b"[devd] init: watching port");
         events.watch(port.handle())?;
@@ -422,145 +143,41 @@ impl Devd {
         self.events = Some(events);
 
         syscall::klog(LogLevel::Info, b"[devd] init: registering in internal registry");
-        // Register devd's own port in the registry
-        self.register_port(b"devd:", 0xFF)?; // 0xFF = devd itself
+        self.ports.register(b"devd:", 0xFF)?; // 0xFF = devd itself
 
         syscall::klog(LogLevel::Info, b"[devd] init: initializing services");
-        // Initialize services from definitions
-        self.init_services();
+        self.services.init_from_defs();
 
         Ok(())
-    }
-
-    fn init_services(&mut self) {
-        // Create service entries for all defined services
-        for (i, def) in SERVICE_DEFS.iter().enumerate() {
-            if self.service_count >= MAX_SERVICES {
-                derror!("too many services limit={}", MAX_SERVICES);
-                break;
-            }
-
-            let mut service = Service::empty();
-            service.def_index = i as u8;
-            service.state = ServiceState::Pending;
-
-            // Find parent index
-            if let Some(parent_name) = def.parent {
-                for (j, s) in self.services.iter().enumerate() {
-                    if let Some(s) = s {
-                        if s.name() == parent_name {
-                            service.parent = Some(j as u8);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            self.services[self.service_count] = Some(service);
-            self.service_count += 1;
-        }
-
-        // Link children to parents
-        for i in 0..self.service_count {
-            if let Some(service) = &self.services[i] {
-                if let Some(parent_idx) = service.parent {
-                    if let Some(parent) = &mut self.services[parent_idx as usize] {
-                        parent.add_child(i as u8);
-                    }
-                }
-            }
-        }
-    }
-
-    // =========================================================================
-    // Port Registry
-    // =========================================================================
-
-    fn register_port(&mut self, name: &[u8], owner: u8) -> SysResult<()> {
-        if name.len() > MAX_PORT_NAME {
-            return Err(SysError::InvalidArgument);
-        }
-
-        // Check for duplicate
-        for p in self.ports.iter().flatten() {
-            if p.matches(name) {
-                derror!("port {:?} already registered", core::str::from_utf8(name));
-                return Err(SysError::AlreadyExists);
-            }
-        }
-
-        // Find empty slot
-        for slot in &mut self.ports {
-            if slot.is_none() {
-                let mut port = RegisteredPort::empty();
-                port.name[..name.len()].copy_from_slice(name);
-                port.name_len = name.len() as u8;
-                port.owner = owner;
-                port.available = true;
-                *slot = Some(port);
-                self.port_count += 1;
-                dlog!("port {:?} registered owner={}", core::str::from_utf8(name), owner);
-                return Ok(());
-            }
-        }
-
-        Err(SysError::NoSpace)
-    }
-
-    fn unregister_port(&mut self, name: &[u8]) {
-        for slot in &mut self.ports {
-            if let Some(p) = slot {
-                if p.matches(name) {
-                    dlog!("port {:?} unregistered", core::str::from_utf8(name));
-                    *slot = None;
-                    self.port_count -= 1;
-                    return;
-                }
-            }
-        }
-    }
-
-    fn port_available(&self, name: &[u8]) -> bool {
-        self.ports.iter()
-            .flatten()
-            .any(|p| p.matches(name) && p.available)
-    }
-
-    fn set_port_availability(&mut self, name: &[u8], available: bool) {
-        for slot in &mut self.ports {
-            if let Some(p) = slot {
-                if p.matches(name) {
-                    p.available = available;
-                    return;
-                }
-            }
-        }
     }
 
     // =========================================================================
     // Dependency Resolution
     // =========================================================================
 
-    fn deps_satisfied(&self, service: &Service) -> bool {
-        for dep in service.def().dependencies {
-            if dep.is_required() && !self.port_available(dep.port_name()) {
-                return false;
-            }
-        }
-        true
-    }
-
     fn check_pending_services(&mut self) {
         syscall::klog(LogLevel::Info, b"[devd] check_pending_services");
         let now = Self::now_ms();
-        for i in 0..self.service_count {
-            if let Some(service) = &self.services[i] {
-                if service.state == ServiceState::Pending && self.deps_satisfied(service) {
-                    // Borrow ends here, spawn needs &mut self
-                    dlog!("spawning service idx={}", i);
-                    self.spawn_service(i, now);
+
+        // Collect indices of services to spawn
+        let mut to_spawn = [None; MAX_SERVICES];
+        let mut spawn_count = 0;
+
+        self.services.for_each(|i, service| {
+            if service.state == ServiceState::Pending
+                && self.deps.satisfied(service, &self.ports)
+            {
+                if spawn_count < MAX_SERVICES {
+                    to_spawn[spawn_count] = Some(i);
+                    spawn_count += 1;
                 }
             }
+        });
+
+        // Spawn collected services
+        for idx in to_spawn.iter().flatten().copied() {
+            dlog!("spawning service idx={}", idx);
+            self.spawn_service(idx, now);
         }
     }
 
@@ -569,80 +186,64 @@ impl Devd {
     // =========================================================================
 
     fn spawn_service(&mut self, idx: usize, now: u64) {
-        // Bounds check
         if idx >= MAX_SERVICES {
             return;
         }
 
-        // Get binary name and spawn
-        let binary = {
-            let service = match &self.services[idx] {
-                Some(s) => s,
-                None => return,
-            };
-            service.def().binary
+        // Get binary name
+        let binary = match self.services.get(idx) {
+            Some(s) => s.def().binary,
+            None => return,
         };
 
         // Spawn the process
-        let pid = syscall::exec(binary);
-        if pid < 0 {
-            derror!("spawn {} failed err={}", binary, pid);
-            if let Some(s) = &mut self.services[idx] {
-                s.transition(ServiceState::Failed { code: pid as i32 }, now);
-            }
-            return;
-        }
-        let pid = pid as u32;
-
-        // Watch the process
-        let watcher = match Process::watch(pid) {
-            Ok(w) => w,
+        let (pid, watcher) = match self.process_mgr.spawn(binary) {
+            Ok(result) => result,
             Err(e) => {
-                derror!("watch {} failed err={:?}", binary, e);
-                if let Some(s) = &mut self.services[idx] {
-                    s.transition(ServiceState::Failed { code: -1 }, now);
-                }
+                derror!("spawn {} failed err={:?}", binary, e);
+                self.services.transition(idx, ServiceState::Failed { code: -1 }, now);
                 return;
             }
         };
 
-        // Add to event loop
+        // Add watcher to event loop
         if let Some(events) = &mut self.events {
             let _ = events.watch(watcher.handle());
         }
 
-        // Collect port names before taking mutable borrow
+        // Collect port names before mutable borrow
         let port_names: [Option<&'static [u8]>; MAX_PORTS_PER_SERVICE] = {
-            let service = match &self.services[idx] {
-                Some(s) => s,
-                None => return,
-            };
-            let mut arr = [None; MAX_PORTS_PER_SERVICE];
-            for (i, &pn) in service.def().registers.iter().enumerate() {
-                if i < MAX_PORTS_PER_SERVICE {
-                    arr[i] = Some(pn);
+            match self.services.get(idx) {
+                Some(s) => {
+                    let mut arr = [None; MAX_PORTS_PER_SERVICE];
+                    for (i, &pn) in s.def().registers.iter().enumerate() {
+                        if i < MAX_PORTS_PER_SERVICE {
+                            arr[i] = Some(pn);
+                        }
+                    }
+                    arr
                 }
+                None => return,
             }
-            arr
         };
 
         // Update service state
-        if let Some(service) = &mut self.services[idx] {
+        if let Some(service) = self.services.get_mut(idx) {
             service.pid = pid;
             service.watcher = Some(watcher);
-            service.transition(ServiceState::Starting, now);
+            service.state = ServiceState::Starting;
+            service.last_change = now;
         }
 
         dlog!("spawned {} pid={}", binary, pid);
 
-        // Pre-register ports this service will provide
+        // Pre-register ports this service will provide (not available yet)
         for port_name in port_names.iter().flatten() {
-            let _ = self.register_port(port_name, idx as u8);
-            self.set_port_availability(port_name, false);
+            let _ = self.ports.register(port_name, idx as u8);
+            self.ports.set_availability(port_name, false);
         }
 
         // For services that don't register ports, mark Ready immediately
-        // (they won't connect to devd:, so we'd never see them otherwise)
         self.mark_portless_services_ready();
     }
 
@@ -651,7 +252,6 @@ impl Devd {
     // =========================================================================
 
     fn handle_service_exit(&mut self, idx: usize, code: i32) {
-        // Bounds check
         if idx >= MAX_SERVICES {
             return;
         }
@@ -668,7 +268,7 @@ impl Devd {
 
         // First pass: collect info and update service state
         let (port_names, should_prune, action) = {
-            let service = match &mut self.services[idx] {
+            let service = match self.services.get_mut(idx) {
                 Some(s) => s,
                 None => return,
             };
@@ -690,22 +290,19 @@ impl Devd {
                 }
             }
 
-            // Collect port names to mark unavailable
-            let port_names: [Option<&'static [u8]>; MAX_PORTS_PER_SERVICE] = {
-                let mut arr = [None; MAX_PORTS_PER_SERVICE];
-                for (i, &pn) in service.def().registers.iter().enumerate() {
-                    if i < MAX_PORTS_PER_SERVICE {
-                        arr[i] = Some(pn);
-                    }
+            // Collect port names
+            let mut port_arr = [None; MAX_PORTS_PER_SERVICE];
+            for (i, &pn) in service.def().registers.iter().enumerate() {
+                if i < MAX_PORTS_PER_SERVICE {
+                    port_arr[i] = Some(pn);
                 }
-                arr
-            };
+            }
 
             if code == 0 {
-                service.transition(ServiceState::Stopped { code: 0 }, now);
-                (port_names, false, ExitAction::Stopped)
+                service.state = ServiceState::Stopped { code: 0 };
+                service.last_change = now;
+                (port_arr, false, ExitAction::Stopped)
             } else {
-                // Track total restarts for monitoring
                 service.total_restarts = service.total_restarts.saturating_add(1);
 
                 let restarts = match service.state {
@@ -714,75 +311,71 @@ impl Devd {
                 };
 
                 if restarts >= MAX_RESTARTS || !auto_restart {
-                    service.transition(ServiceState::Failed { code }, now);
+                    service.state = ServiceState::Failed { code };
+                    service.last_change = now;
                     derror!("{} failed code={} restarts={}", name, code, service.total_restarts);
-                    (port_names, false, if auto_restart { ExitAction::Failed } else { ExitAction::Stopped })
+                    (port_arr, false, if auto_restart { ExitAction::Failed } else { ExitAction::Stopped })
                 } else {
-                    service.transition(ServiceState::Crashed { code, restarts }, now);
+                    service.state = ServiceState::Crashed { code, restarts };
+                    service.last_change = now;
                     service.backoff_ms = (service.backoff_ms * 2).min(MAX_BACKOFF_MS);
-                    (port_names, true, ExitAction::Crashed { backoff_ms: service.backoff_ms })
+                    (port_arr, true, ExitAction::Crashed { backoff_ms: service.backoff_ms })
                 }
             }
         };
 
-        // Second pass: unregister ports (service borrow is dropped)
-        // Ports are re-registered when service restarts via spawn_service
+        // Unregister ports
         for port_name in port_names.iter().flatten() {
-            self.unregister_port(port_name);
+            self.ports.unregister(port_name);
         }
 
-        // Third pass: prune children if needed
+        // Prune children if needed
         if should_prune {
-            self.prune_children(idx);
+            self.prune_dependents(idx);
         }
 
-        // Fourth pass: create restart timer if needed
+        // Create restart timer if needed
         match action {
             ExitAction::Crashed { backoff_ms } => {
-                // Create timer for restart after backoff
                 if let Ok(mut timer) = Timer::new() {
                     let deadline_ns = (backoff_ms as u64) * 1_000_000;
                     if timer.set(deadline_ns).is_ok() {
                         if let Some(events) = &mut self.events {
                             let _ = events.watch(timer.handle());
                         }
-                        if let Some(service) = &mut self.services[idx] {
+                        if let Some(service) = self.services.get_mut(idx) {
                             service.restart_timer = Some(timer);
                         }
                     }
                 }
             }
             ExitAction::Failed => {
-                // Create timer for recovery retry after FAILED_RETRY_MS
                 if let Ok(mut timer) = Timer::new() {
                     let deadline_ns = FAILED_RETRY_MS * 1_000_000;
                     if timer.set(deadline_ns).is_ok() {
                         if let Some(events) = &mut self.events {
                             let _ = events.watch(timer.handle());
                         }
-                        if let Some(service) = &mut self.services[idx] {
+                        if let Some(service) = self.services.get_mut(idx) {
                             service.restart_timer = Some(timer);
                         }
                     }
                 }
             }
-            ExitAction::Stopped => {
-                // Clean exit, no restart timer
-            }
+            ExitAction::Stopped => {}
         }
     }
 
     fn handle_service_ready(&mut self, idx: usize) {
-        // Bounds check
         if idx >= MAX_SERVICES {
             return;
         }
 
         let now = Self::now_ms();
 
-        // First pass: update service state and collect port names
+        // Update service state and collect port names
         let port_names: [Option<&'static [u8]>; MAX_PORTS_PER_SERVICE] = {
-            let service = match &mut self.services[idx] {
+            let service = match self.services.get_mut(idx) {
                 Some(s) => s,
                 None => return,
             };
@@ -794,118 +387,50 @@ impl Devd {
                 }
             }
 
-            service.transition(ServiceState::Ready, now);
+            dlog!("service {} state: {:?} -> Ready", service.name(), service.state);
+            service.state = ServiceState::Ready;
+            service.last_change = now;
             service.backoff_ms = INITIAL_BACKOFF_MS;
             arr
         };
 
-        // Second pass: mark ports available
+        // Mark ports available
         for port_name in port_names.iter().flatten() {
-            self.set_port_availability(port_name, true);
+            self.ports.set_availability(port_name, true);
         }
 
-        // Third pass: check pending services
+        // Check pending services
         self.check_pending_services();
     }
 
     // =========================================================================
-    // Branch Pruning (kill dependents on service crash)
+    // Branch Pruning
     // =========================================================================
 
-    /// Kill all services that depend on the given service's ports.
-    /// This handles BOTH hierarchical children AND dependency-based dependents.
     fn prune_dependents(&mut self, provider_idx: usize) {
-        // Bounds check
         if provider_idx >= MAX_SERVICES {
             return;
         }
 
-        // Collect port names that this service provides
-        let mut provider_ports: [Option<&'static [u8]>; MAX_PORTS_PER_SERVICE] = [None; MAX_PORTS_PER_SERVICE];
-        let mut port_count = 0;
+        let dependents = self.deps.find_dependents(provider_idx, &self.services);
 
-        if let Some(provider) = &self.services[provider_idx] {
-            for &port_name in provider.def().registers {
-                if port_count < MAX_PORTS_PER_SERVICE {
-                    provider_ports[port_count] = Some(port_name);
-                    port_count += 1;
-                }
-            }
+        // Kill dependents recursively (depth-first)
+        for dep_idx in dependents.iter() {
+            self.prune_dependents(dep_idx);
+            self.kill_service(dep_idx);
         }
-
-        // Find all services that depend on any of these ports
-        let mut to_kill = [None; MAX_SERVICES];
-        let mut kill_count = 0;
-
-        for i in 0..self.service_count {
-            if i == provider_idx {
-                continue; // Don't kill the provider itself
-            }
-
-            let depends = if let Some(service) = &self.services[i] {
-                // Skip services that aren't running
-                if !service.state.is_running() {
-                    false
-                } else {
-                    // Check if this service depends on any of the provider's ports
-                    service.def().dependencies.iter().any(|dep| {
-                        let dep_port = dep.port_name();
-                        provider_ports.iter().flatten().any(|&p| p == dep_port)
-                    })
-                }
-            } else {
-                false
-            };
-
-            if depends && kill_count < MAX_SERVICES {
-                to_kill[kill_count] = Some(i);
-                kill_count += 1;
-            }
-        }
-
-        // Also collect hierarchical children
-        if let Some(parent) = &self.services[provider_idx] {
-            for i in 0..parent.child_count as usize {
-                if let Some(child_idx) = parent.children[i] {
-                    // Check if already in to_kill
-                    let already_listed = to_kill[..kill_count].iter()
-                        .any(|&x| x == Some(child_idx as usize));
-                    if !already_listed && kill_count < MAX_SERVICES {
-                        to_kill[kill_count] = Some(child_idx as usize);
-                        kill_count += 1;
-                    }
-                }
-            }
-        }
-
-        // Kill dependents recursively (depth-first, leaves first)
-        for i in 0..kill_count {
-            if let Some(dep_idx) = to_kill[i] {
-                // Recurse first (kill services that depend on this dependent)
-                self.prune_dependents(dep_idx);
-
-                // Then kill this dependent
-                self.kill_service(dep_idx);
-            }
-        }
-    }
-
-    /// Legacy alias for backward compatibility
-    fn prune_children(&mut self, parent_idx: usize) {
-        self.prune_dependents(parent_idx);
     }
 
     fn kill_service(&mut self, idx: usize) {
-        // Bounds check
         if idx >= MAX_SERVICES {
             return;
         }
 
         let now = Self::now_ms();
 
-        // First pass: check state, collect info, kill process, cleanup watcher
-        let port_names: [Option<&'static [u8]>; MAX_PORTS_PER_SERVICE] = {
-            let service = match &mut self.services[idx] {
+        // Get service info
+        let (pid, port_names) = {
+            let service = match self.services.get_mut(idx) {
                 Some(s) => s,
                 None => return,
             };
@@ -918,11 +443,6 @@ impl Devd {
             let pid = service.pid;
 
             dlog!("killing {} pid={} (branch prune)", name, pid);
-
-            // Kill the process
-            if pid != 0 {
-                let _ = syscall::kill(pid);
-            }
 
             // Clean up watcher
             if let Some(watcher) = service.watcher.take() {
@@ -939,15 +459,20 @@ impl Devd {
                 }
             }
 
-            // Set to pending
             service.pid = 0;
-            service.transition(ServiceState::Pending, now);
-            arr
+            service.state = ServiceState::Pending;
+            service.last_change = now;
+            (pid, arr)
         };
 
-        // Second pass: unregister ports (will be re-registered on restart)
+        // Kill the process
+        if pid != 0 {
+            let _ = self.process_mgr.kill(pid);
+        }
+
+        // Unregister ports
         for port_name in port_names.iter().flatten() {
-            self.unregister_port(port_name);
+            self.ports.unregister(port_name);
         }
     }
 
@@ -964,78 +489,56 @@ impl Devd {
         match port.accept_with_pid() {
             Ok((channel, client_pid)) => {
                 // Find which service connected by PID
-                let mut service_idx = None;
-                for i in 0..self.service_count {
-                    if let Some(service) = &self.services[i] {
-                        if service.pid == client_pid && service.state == ServiceState::Starting {
-                            service_idx = Some(i);
-                            break;
-                        }
-                    }
-                }
+                let service_idx = self.services.find_by_pid(client_pid)
+                    .filter(|&i| {
+                        self.services.get(i)
+                            .map(|s| s.state == ServiceState::Starting)
+                            .unwrap_or(false)
+                    });
 
                 if let Some(idx) = service_idx {
-                    // Store channel and add to event loop for future messages
+                    // Store channel and add to event loop
                     if let Some(events) = &mut self.events {
                         let _ = events.watch(channel.handle());
                     }
-                    if let Some(service) = &mut self.services[idx] {
+                    if let Some(service) = self.services.get_mut(idx) {
                         service.channel = Some(channel);
                     }
                     // Mark service as Ready
                     self.handle_service_ready(idx);
                 } else {
-                    // Unknown connection - just keep the channel for now
-                    // Could be a client query, future enhancement
+                    // Unknown connection - drop for now
                     drop(channel);
                 }
             }
-            Err(SysError::WouldBlock) => {
-                // Spurious wake, ignore
-            }
+            Err(SysError::WouldBlock) => {}
             Err(e) => {
                 derror!("devd: accept failed err={:?}", e);
             }
         }
     }
 
-    /// Mark services as Ready that don't register ports but are running.
-    /// Called after spawning to handle services like shell that don't connect to devd.
     fn mark_portless_services_ready(&mut self) {
         let now = Self::now_ms();
 
-        for i in 0..self.service_count {
-            if let Some(service) = &mut self.services[i] {
-                // Service is Starting, has no ports to register, and has been running
-                if service.state == ServiceState::Starting
-                    && service.def().registers.is_empty()
-                    && service.pid != 0
-                {
-                    service.transition(ServiceState::Ready, now);
-                    service.backoff_ms = INITIAL_BACKOFF_MS;
-                }
+        self.services.for_each_mut(|_i, service| {
+            if service.state == ServiceState::Starting
+                && service.def().registers.is_empty()
+                && service.pid != 0
+            {
+                dlog!("service {} state: Starting -> Ready (portless)", service.name());
+                service.state = ServiceState::Ready;
+                service.last_change = now;
+                service.backoff_ms = INITIAL_BACKOFF_MS;
             }
-        }
+        });
     }
 
     fn handle_process_exit(&mut self, handle: ObjHandle) {
-        // Find which service this watcher belongs to
-        let mut found_idx = None;
-        for i in 0..self.service_count {
-            if let Some(service) = &self.services[i] {
-                if let Some(watcher) = &service.watcher {
-                    if watcher.handle() == handle {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
-            }
-        }
+        let found_idx = self.services.find_by_watcher(handle);
 
-        // Get exit code and handle exit (separate borrow)
         if let Some(idx) = found_idx {
-            let code = self.services[idx]
-                .as_mut()
+            let code = self.services.get_mut(idx)
                 .and_then(|s| s.watcher.as_mut())
                 .map(|w| w.wait().unwrap_or(-1))
                 .unwrap_or(-1);
@@ -1043,7 +546,6 @@ impl Devd {
         }
     }
 
-    /// Handle a service's restart timer firing
     fn handle_restart_timer(&mut self, idx: usize) {
         if idx >= MAX_SERVICES {
             return;
@@ -1051,9 +553,9 @@ impl Devd {
 
         let now = Self::now_ms();
 
-        // Collect info and clear timer
+        // Clear timer and determine action
         let should_spawn = {
-            let service = match &mut self.services[idx] {
+            let service = match self.services.get_mut(idx) {
                 Some(s) => s,
                 None => return,
             };
@@ -1063,21 +565,17 @@ impl Devd {
                 if let Some(events) = &mut self.events {
                     let _ = events.unwatch(timer.handle());
                 }
-                // timer is dropped here
             }
 
             match service.state {
-                ServiceState::Crashed { .. } => {
-                    // Restart the service
-                    true
-                }
+                ServiceState::Crashed { .. } => true,
                 ServiceState::Failed { .. } => {
-                    // Recovery: transition to Pending
                     let name = service.name();
                     service.backoff_ms = INITIAL_BACKOFF_MS;
-                    service.transition(ServiceState::Pending, now);
+                    service.state = ServiceState::Pending;
+                    service.last_change = now;
                     dlog!("{} retry after failed (total_restarts={})", name, service.total_restarts);
-                    false // check_pending_services will spawn if deps satisfied
+                    false
                 }
                 _ => false,
             }
@@ -1086,7 +584,6 @@ impl Devd {
         if should_spawn {
             self.spawn_service(idx, now);
         } else {
-            // Check if pending services can now start
             self.check_pending_services();
         }
     }
@@ -1105,7 +602,7 @@ impl Devd {
 
             match wait_result {
                 Ok(handle) => {
-                    // Port event (service connecting)?
+                    // Port event?
                     if let Some(port) = &self.port {
                         if handle == port.handle() {
                             self.handle_port_event();
@@ -1114,18 +611,7 @@ impl Devd {
                     }
 
                     // Service restart timer?
-                    let mut timer_idx = None;
-                    for i in 0..self.service_count {
-                        if let Some(service) = &self.services[i] {
-                            if let Some(timer) = &service.restart_timer {
-                                if timer.handle() == handle {
-                                    timer_idx = Some(i);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(idx) = timer_idx {
+                    if let Some(idx) = self.services.find_by_timer(handle) {
                         self.handle_restart_timer(idx);
                         continue;
                     }
@@ -1148,16 +634,14 @@ impl Devd {
 static mut DEVD: Devd = Devd::new();
 
 #[unsafe(no_mangle)]
-#[allow(static_mut_refs)]  // Required for no_std global state
+#[allow(static_mut_refs)]
 fn main() -> ! {
     userlib::io::disable_stdout();
 
-    // Early debug: confirm devd is starting
     syscall::klog(LogLevel::Info, b"[devd] main() entry");
 
     let devd = unsafe { &mut DEVD };
 
-    // Initialize
     syscall::klog(LogLevel::Info, b"[devd] calling init()");
     if let Err(e) = devd.init() {
         derror!("devd: init failed err={:?}", e);
@@ -1165,9 +649,8 @@ fn main() -> ! {
     }
     syscall::klog(LogLevel::Info, b"[devd] init() complete");
 
-    dlog!("devd: started services={}", devd.service_count);
+    dlog!("devd: started services={}", devd.services.count());
 
-    // Run main loop
     syscall::klog(LogLevel::Info, b"[devd] entering run()");
     devd.run()
 }
