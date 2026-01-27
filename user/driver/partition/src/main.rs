@@ -31,12 +31,7 @@
 #![no_main]
 
 use userlib::syscall::{self, LogLevel};
-use userlib::ipc::Channel;
-use userlib::query::{
-    QueryHeader, PortRegister, PortRegisterResponse,
-    ListDevices, DeviceListResponse,
-    msg, port_type, class, error,
-};
+use userlib::devd::{DevdClient, PortType, DriverState, SpawnHandler, SpawnFilter, run_driver_loop};
 use userlib::error::SysError;
 
 // =============================================================================
@@ -173,10 +168,8 @@ impl Mbr {
 // =============================================================================
 
 struct PartitionDriver {
-    /// Connection to devd-query:
-    devd_channel: Option<Channel>,
-    /// Sequence ID for messages
-    next_seq: u32,
+    /// Connection to devd
+    devd_client: Option<DevdClient>,
     /// Discovered partitions
     partitions: [Option<PartitionInfo>; 16],
     partition_count: usize,
@@ -201,8 +194,7 @@ struct PartitionInfo {
 impl PartitionDriver {
     const fn new() -> Self {
         Self {
-            devd_channel: None,
-            next_seq: 1,
+            devd_client: None,
             partitions: [const { None }; 16],
             partition_count: 0,
         }
@@ -212,17 +204,11 @@ impl PartitionDriver {
         plog!("connecting to devd-query:");
 
         // Connect to devd
-        let channel = Channel::connect(b"devd-query:")?;
-        self.devd_channel = Some(channel);
+        let client = DevdClient::connect()?;
+        self.devd_client = Some(client);
 
         plog!("connected to devd");
         Ok(())
-    }
-
-    fn next_seq(&mut self) -> u32 {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        seq
     }
 
     /// Discover block devices and scan their partitions
@@ -230,7 +216,17 @@ impl PartitionDriver {
         plog!("discovering block devices");
 
         // Query devd for mass storage devices
-        let devices = self.list_block_devices()?;
+        // Retry a few times in case driver is still registering
+        let mut devices = 0;
+        for retry in 0..10 {
+            devices = self.list_block_devices()?;
+            if devices > 0 {
+                break;
+            }
+            if retry < 9 {
+                syscall::sleep_ms(50);
+            }
+        }
 
         plog!("found {} block device(s)", devices);
 
@@ -254,32 +250,10 @@ impl PartitionDriver {
         Ok(())
     }
 
-    /// List block devices via devd-query
+    /// List block devices via devd
     fn list_block_devices(&mut self) -> Result<usize, SysError> {
-        // Get seq first, then channel (avoid double mutable borrow)
-        let seq = self.next_seq();
-
-        let channel = self.devd_channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
-        // Send LIST_DEVICES request
-        let req = ListDevices::new(seq, Some(class::MASS_STORAGE));
-        let _ = channel.send(&req.to_bytes())?;
-
-        // Read response
-        let mut buf = [0u8; 512];
-        let len = channel.recv(&mut buf)?;
-
-        if len < DeviceListResponse::HEADER_SIZE {
-            return Ok(0);
-        }
-
-        let header = QueryHeader::from_bytes(&buf).ok_or(SysError::IoError)?;
-        if header.msg_type == msg::ERROR {
-            return Ok(0);
-        }
-
-        let resp = DeviceListResponse::from_bytes(&buf).ok_or(SysError::IoError)?;
-        Ok(resp.count as usize)
+        let client = self.devd_client.as_mut().ok_or(SysError::ConnectionRefused)?;
+        client.list_devices(Some(userlib::devd::DeviceClass::MassStorage))
     }
 
     /// Register example partitions (for demonstration)
@@ -287,6 +261,8 @@ impl PartitionDriver {
     /// In a real implementation, this would read the MBR from the disk.
     /// For now, we just register placeholder partitions.
     fn register_example_partitions(&mut self, disk_name: &[u8]) -> Result<(), SysError> {
+        let client = self.devd_client.as_mut().ok_or(SysError::ConnectionRefused)?;
+
         // Create partition names
         let part_names: [&[u8]; 2] = [b"part0:", b"part1:"];
 
@@ -295,14 +271,8 @@ impl PartitionDriver {
                 core::str::from_utf8(part_name).unwrap_or("?"),
                 core::str::from_utf8(disk_name).unwrap_or("?"));
 
-            // Register with devd
-            let result = self.register_port(
-                part_name,
-                Some(disk_name),
-                port_type::PARTITION,
-            );
-
-            match result {
+            // Register partition port with devd
+            match client.register_port(part_name, PortType::Partition, Some(disk_name)) {
                 Ok(()) => {
                     plog!("registered {}", core::str::from_utf8(part_name).unwrap_or("?"));
 
@@ -332,54 +302,6 @@ impl PartitionDriver {
         Ok(())
     }
 
-    /// Register a port with devd
-    fn register_port(
-        &mut self,
-        name: &[u8],
-        parent: Option<&[u8]>,
-        ptype: u8,
-    ) -> Result<(), SysError> {
-        // Get seq first (avoid double mutable borrow)
-        let seq = self.next_seq();
-
-        let channel = self.devd_channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
-        // Build REGISTER_PORT message
-        let reg = PortRegister::new(seq, ptype);
-
-        let mut buf = [0u8; 128];
-        let len = reg.write_to(&mut buf, name, parent, 0)
-            .ok_or(SysError::InvalidArgument)?;
-
-        // Send request
-        channel.send(&buf[..len])?;
-
-        // Read response
-        let mut resp_buf = [0u8; 64];
-        let resp_len = channel.recv(&mut resp_buf)?;
-
-        if resp_len < PortRegisterResponse::SIZE {
-            return Err(SysError::IoError);
-        }
-
-        // Check result
-        let header = QueryHeader::from_bytes(&resp_buf).ok_or(SysError::IoError)?;
-        if header.msg_type == msg::ERROR {
-            return Err(SysError::PermissionDenied);
-        }
-
-        // Parse result code
-        let result = i32::from_le_bytes([
-            resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
-        ]);
-
-        if result != error::OK {
-            return Err(SysError::InvalidArgument);
-        }
-
-        Ok(())
-    }
-
     /// Main event loop
     fn run(&mut self) -> ! {
         plog!("partition driver running");
@@ -391,10 +313,61 @@ impl PartitionDriver {
 
         plog!("registered {} partition(s)", self.partition_count);
 
-        // For now, just sleep forever
-        // In a real implementation, we'd handle I/O forwarding here
-        loop {
-            syscall::sleep_ms(10000);
+        // Take the devd client for the service loop
+        if let Some(mut client) = self.devd_client.take() {
+            // Report ready state
+            let _ = client.report_state(DriverState::Ready);
+            plog!("reported ready state, entering service loop");
+
+            // Use the generic driver service loop
+            run_driver_loop(client, PartitionSpawnHandler, 100);
+        } else {
+            perror!("no devd client, exiting");
+            syscall::exit(1);
+        }
+    }
+}
+
+/// Spawn handler for partition driver
+///
+/// Spawns fatfs (or other filesystem drivers) for partitions.
+struct PartitionSpawnHandler;
+
+impl SpawnHandler for PartitionSpawnHandler {
+    fn handle_spawn(&mut self, binary: &str, filter: &SpawnFilter) -> (u8, [u32; 16]) {
+        plog!("received SPAWN_CHILD: binary={}", binary);
+
+        // Log filter info
+        match filter.mode {
+            0 => plog!("  filter: EXACT pattern={}",
+                core::str::from_utf8(filter.pattern_bytes()).unwrap_or("?")),
+            1 => plog!("  filter: BY_TYPE port_type={}", filter.port_type),
+            2 => plog!("  filter: CHILDREN_OF parent={}",
+                core::str::from_utf8(filter.pattern_bytes()).unwrap_or("?")),
+            3 => plog!("  filter: ALL"),
+            _ => plog!("  filter: unknown"),
+        }
+
+        // Spawn the child
+        let mut pids = [0u32; 16];
+        let pid = syscall::exec(binary);
+        if pid > 0 {
+            plog!("  spawned child PID={}", pid);
+            pids[0] = pid as u32;
+            (1, pids)
+        } else {
+            perror!("  failed to spawn: error={}", -pid);
+            (0, pids)
+        }
+    }
+
+    fn handle_stop(&mut self, pid: u32) {
+        plog!("received STOP_CHILD: PID={}", pid);
+        let result = syscall::kill(pid);
+        if result == 0 {
+            plog!("  child killed successfully");
+        } else {
+            perror!("  kill failed: error={}", -result);
         }
     }
 }

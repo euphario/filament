@@ -1,11 +1,10 @@
 [package]
 name = "fatfs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 userlib = { path = "../../userlib" }
-usb = { path = "../usb" }
 
 [profile.release]
 opt-level = "z"

@@ -367,6 +367,32 @@ impl ServiceRegistry {
     pub fn find_empty_slot(&self) -> Option<usize> {
         (0..MAX_SERVICES).find(|&i| self.services[i].is_none())
     }
+
+    /// Ensure count includes a specific slot index (for dynamic services)
+    pub fn ensure_count_includes(&mut self, slot_idx: usize) {
+        if slot_idx >= self.count {
+            self.count = slot_idx + 1;
+        }
+    }
+
+    /// Create a dynamic service slot for a spawned child
+    ///
+    /// Returns the slot index if successful, None if no slots available.
+    pub fn create_dynamic_service(&mut self, pid: u32, now: u64) -> Option<usize> {
+        let slot_idx = self.find_empty_slot()?;
+
+        // Create a new service in the slot
+        let mut service = Service::empty();
+        service.pid = pid;
+        service.state = ServiceState::Ready;  // Children are ready immediately
+        service.last_change = now;
+        service.def_index = 0xFF;  // No static definition
+
+        self.services[slot_idx] = Some(service);
+        self.ensure_count_includes(slot_idx);
+
+        Some(slot_idx)
+    }
 }
 
 impl ServiceManager for ServiceRegistry {

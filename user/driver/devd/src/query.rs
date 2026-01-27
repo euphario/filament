@@ -7,7 +7,7 @@ use userlib::ipc::Channel;
 use userlib::query::{
     QueryHeader, DeviceRegister, ListDevices, GetDeviceInfo, DriverQuery,
     DeviceListResponse, DeviceInfoResponse, DeviceEntry, ErrorResponse,
-    PortRegister, PortRegisterResponse,
+    PortRegister, PortRegisterResponse, SpawnChild, SpawnAck,
     msg, error, port_type,
 };
 
@@ -36,6 +36,8 @@ pub struct QueryClient {
     pub is_driver: bool,
     /// Service index if this is a driver (-1 for regular clients)
     pub service_idx: i8,
+    /// Client PID (for later identification)
+    pub pid: u32,
 }
 
 // =============================================================================
@@ -59,7 +61,7 @@ impl QueryHandler {
     }
 
     /// Add a new client connection
-    pub fn add_client(&mut self, channel: Channel, service_idx: Option<u8>) -> Option<usize> {
+    pub fn add_client(&mut self, channel: Channel, service_idx: Option<u8>, pid: u32) -> Option<usize> {
         // Find empty slot
         let slot = (0..MAX_QUERY_CLIENTS).find(|&i| self.clients[i].is_none())?;
 
@@ -67,6 +69,7 @@ impl QueryHandler {
             channel,
             is_driver: service_idx.is_some(),
             service_idx: service_idx.map(|i| i as i8).unwrap_or(-1),
+            pid,
         });
         self.client_count += 1;
 
@@ -105,6 +108,31 @@ impl QueryHandler {
     /// Get mutable client reference
     pub fn get_mut(&mut self, slot: usize) -> Option<&mut QueryClient> {
         self.clients.get_mut(slot).and_then(|c| c.as_mut())
+    }
+
+    /// Get service index for a client (if it's a driver)
+    pub fn get_service_idx(&self, slot: usize) -> Option<u8> {
+        self.clients.get(slot)
+            .and_then(|c| c.as_ref())
+            .filter(|c| c.is_driver && c.service_idx >= 0)
+            .map(|c| c.service_idx as u8)
+    }
+
+    /// Upgrade a client to driver status by PID
+    ///
+    /// This handles the race condition where a child process connects to
+    /// devd-query before its parent sends SPAWN_ACK. When we receive the
+    /// SPAWN_ACK, we need to upgrade that client to driver status.
+    pub fn upgrade_client_to_driver(&mut self, pid: u32, service_idx: u8) {
+        for client in &mut self.clients {
+            if let Some(c) = client {
+                if c.pid == pid && !c.is_driver {
+                    c.is_driver = true;
+                    c.service_idx = service_idx as i8;
+                    return;
+                }
+            }
+        }
     }
 
     /// Process an incoming message from a client
@@ -410,6 +438,67 @@ pub struct PortRegisterInfo<'a> {
     pub parent: Option<&'a [u8]>,
     pub shmem_id: u32,
     pub owner_idx: u8,
+}
+
+// =============================================================================
+// Spawn Command Support
+// =============================================================================
+
+/// Sequence ID counter for spawn commands
+static mut SPAWN_SEQ_ID: u32 = 1;
+
+impl QueryHandler {
+    /// Find query client by service index
+    pub fn find_by_service_idx(&self, service_idx: u8) -> Option<usize> {
+        (0..MAX_QUERY_CLIENTS).find(|&i| {
+            self.clients[i]
+                .as_ref()
+                .map(|c| c.service_idx == service_idx as i8)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Send a SPAWN_CHILD command to a driver
+    ///
+    /// Returns the sequence ID used (for tracking acknowledgement)
+    pub fn send_spawn_child(
+        &mut self,
+        service_idx: u8,
+        binary: &[u8],
+        trigger_port: &[u8],
+    ) -> Option<u32> {
+        let slot = self.find_by_service_idx(service_idx)?;
+        let client = self.clients[slot].as_mut()?;
+
+        if !client.is_driver {
+            return None;
+        }
+
+        // Get next sequence ID
+        let seq_id = unsafe {
+            let id = SPAWN_SEQ_ID;
+            SPAWN_SEQ_ID = SPAWN_SEQ_ID.wrapping_add(1);
+            id
+        };
+
+        let cmd = SpawnChild::new(seq_id);
+        let mut buf = [0u8; 256];
+        let len = cmd.write_to(&mut buf, binary, trigger_port)?;
+
+        match client.channel.send(&buf[..len]) {
+            Ok(_) => Some(seq_id),
+            Err(_) => None,
+        }
+    }
+
+    /// Parse a SPAWN_ACK response from a driver
+    /// Returns: (seq_id, result, match_count, spawn_count, child_pids)
+    pub fn parse_spawn_ack(buf: &[u8]) -> Option<(u32, i32, u8, u8, [u32; 16])> {
+        let ack = SpawnAck::from_bytes(buf)?;
+        let pids = SpawnAck::parse_pids(buf, ack.spawn_count as usize)
+            .unwrap_or([0u32; 16]);
+        Some((ack.header.seq_id, ack.result, ack.match_count, ack.spawn_count, pids))
+    }
 }
 
 // =============================================================================

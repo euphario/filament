@@ -91,6 +91,8 @@ pub mod msg {
     pub const REGISTER_PORT: u16 = 0x0103;
     /// Unregister a port
     pub const UNREGISTER_PORT: u16 = 0x0104;
+    /// Driver state change notification (driver → devd)
+    pub const STATE_CHANGE: u16 = 0x0105;
 
     // Query messages (client → devd → driver)
     /// List all registered devices
@@ -99,6 +101,14 @@ pub mod msg {
     pub const GET_DEVICE_INFO: u16 = 0x0201;
     /// Pass-through query to driver
     pub const QUERY_DRIVER: u16 = 0x0202;
+
+    // Commands (devd → driver)
+    /// Tell driver to spawn a child process
+    pub const SPAWN_CHILD: u16 = 0x0400;
+    /// Tell driver to stop a child process
+    pub const STOP_CHILD: u16 = 0x0401;
+    /// Acknowledgement of spawn/stop command
+    pub const SPAWN_ACK: u16 = 0x0402;
 
     // Response messages
     /// Response containing device list
@@ -418,6 +428,464 @@ impl PortRegisterResponse {
         buf[0..8].copy_from_slice(&self.header.to_bytes());
         buf[8..12].copy_from_slice(&self.result.to_le_bytes());
         buf
+    }
+}
+
+// =============================================================================
+// State Change Messages (driver → devd)
+// =============================================================================
+
+/// Driver state constants
+pub mod driver_state {
+    /// Driver is initializing
+    pub const INITIALIZING: u8 = 0;
+    /// Driver is ready to receive commands
+    pub const READY: u8 = 1;
+    /// Driver encountered an error
+    pub const ERROR: u8 = 2;
+    /// Driver is stopping
+    pub const STOPPING: u8 = 3;
+}
+
+/// State change notification (driver → devd)
+///
+/// Sent when a driver's state changes. devd uses this to track
+/// driver lifecycle and trigger policy decisions.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct StateChange {
+    pub header: QueryHeader,
+    /// New state (see `driver_state` module)
+    pub new_state: u8,
+    pub _pad: [u8; 3],
+}
+
+impl StateChange {
+    pub const SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, new_state: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::STATE_CHANGE, seq_id),
+            new_state,
+            _pad: [0; 3],
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = self.new_state;
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            new_state: buf[8],
+            _pad: [0; 3],
+        })
+    }
+}
+
+// =============================================================================
+// Spawn Command Messages (devd → driver)
+// =============================================================================
+
+// =============================================================================
+// Filter Types for Queries and Commands
+// =============================================================================
+
+/// Filter match mode
+pub mod filter_mode {
+    /// Exact name match (e.g., "part0:")
+    pub const EXACT: u8 = 0;
+    /// Match by port type (e.g., all Partition ports)
+    pub const BY_TYPE: u8 = 1;
+    /// Match all children of a port (e.g., "disk0:.*")
+    pub const CHILDREN_OF: u8 = 2;
+    /// Match all (broadcast)
+    pub const ALL: u8 = 3;
+}
+
+/// Filter for targeting ports/devices
+///
+/// Used in spawn commands and queries to select targets.
+/// Same mechanism handles directed (1 match) and fan-out (N matches).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortFilter {
+    /// Filter mode (see `filter_mode` module)
+    pub mode: u8,
+    /// Port type filter (for BY_TYPE mode)
+    pub port_type: u8,
+    /// Device class filter (0 = any)
+    pub class_filter: u16,
+    /// Length of name/pattern string
+    pub pattern_len: u8,
+    pub _pad: [u8; 3],
+    // Followed by: pattern bytes (for EXACT or CHILDREN_OF modes)
+}
+
+impl PortFilter {
+    pub const FIXED_SIZE: usize = 8;
+
+    /// Create an exact name match filter
+    pub fn exact(name: &[u8]) -> (Self, &[u8]) {
+        (Self {
+            mode: filter_mode::EXACT,
+            port_type: 0,
+            class_filter: 0,
+            pattern_len: name.len() as u8,
+            _pad: [0; 3],
+        }, name)
+    }
+
+    /// Create a port type filter
+    pub fn by_type(port_type: u8) -> Self {
+        Self {
+            mode: filter_mode::BY_TYPE,
+            port_type,
+            class_filter: 0,
+            pattern_len: 0,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Create a children-of filter
+    pub fn children_of(parent: &[u8]) -> (Self, &[u8]) {
+        (Self {
+            mode: filter_mode::CHILDREN_OF,
+            port_type: 0,
+            class_filter: 0,
+            pattern_len: parent.len() as u8,
+            _pad: [0; 3],
+        }, parent)
+    }
+
+    /// Create a broadcast filter (all)
+    pub fn all() -> Self {
+        Self {
+            mode: filter_mode::ALL,
+            port_type: 0,
+            class_filter: 0,
+            pattern_len: 0,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Write filter to buffer, returns bytes written
+    pub fn write_to(&self, buf: &mut [u8], pattern: &[u8]) -> Option<usize> {
+        let total = Self::FIXED_SIZE + pattern.len();
+        if buf.len() < total {
+            return None;
+        }
+        buf[0] = self.mode;
+        buf[1] = self.port_type;
+        buf[2..4].copy_from_slice(&self.class_filter.to_le_bytes());
+        buf[4] = pattern.len() as u8;
+        buf[5..8].copy_from_slice(&[0, 0, 0]);
+        buf[Self::FIXED_SIZE..total].copy_from_slice(pattern);
+        Some(total)
+    }
+
+    /// Parse filter from buffer
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let pattern_len = buf[4] as usize;
+        let total = Self::FIXED_SIZE + pattern_len;
+        if buf.len() < total {
+            return None;
+        }
+        let pattern = &buf[Self::FIXED_SIZE..total];
+        Some((Self {
+            mode: buf[0],
+            port_type: buf[1],
+            class_filter: u16::from_le_bytes([buf[2], buf[3]]),
+            pattern_len: pattern_len as u8,
+            _pad: [0; 3],
+        }, pattern))
+    }
+}
+
+// =============================================================================
+// Spawn Child Command
+// =============================================================================
+
+/// Spawn child command (devd → driver)
+///
+/// Tells a driver to spawn child process(es) for ports matching a filter.
+/// The driver spawns children with its own restricted capabilities.
+///
+/// Examples:
+/// - Filter "part0:" (exact) → spawn 1 child for that port
+/// - Filter "*.Partition" (by_type) → spawn N children for all partition ports
+///
+/// Variable-length: header + fixed fields + binary_name + filter
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnChild {
+    pub header: QueryHeader,
+    /// Length of binary name
+    pub binary_len: u8,
+    /// Length of filter (PortFilter + pattern)
+    pub filter_len: u8,
+    pub _pad: [u8; 2],
+    // Followed by: binary name bytes, then PortFilter + pattern
+}
+
+impl SpawnChild {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SPAWN_CHILD, seq_id),
+            binary_len: 0,
+            filter_len: 0,
+            _pad: [0; 2],
+        }
+    }
+
+    /// Serialize to buffer with exact port name filter
+    pub fn write_exact(
+        &self,
+        buf: &mut [u8],
+        binary: &[u8],
+        port_name: &[u8],
+    ) -> Option<usize> {
+        let (filter, pattern) = PortFilter::exact(port_name);
+        self.write_to_internal(buf, binary, &filter, pattern)
+    }
+
+    /// Serialize to buffer with type filter
+    pub fn write_by_type(
+        &self,
+        buf: &mut [u8],
+        binary: &[u8],
+        port_type: u8,
+    ) -> Option<usize> {
+        let filter = PortFilter::by_type(port_type);
+        self.write_to_internal(buf, binary, &filter, &[])
+    }
+
+    /// Serialize to buffer with custom filter
+    pub fn write_to_internal(
+        &self,
+        buf: &mut [u8],
+        binary: &[u8],
+        filter: &PortFilter,
+        pattern: &[u8],
+    ) -> Option<usize> {
+        let filter_total = PortFilter::FIXED_SIZE + pattern.len();
+        let total_len = Self::FIXED_SIZE + binary.len() + filter_total;
+        if buf.len() < total_len || binary.len() > 255 || filter_total > 255 {
+            return None;
+        }
+
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = binary.len() as u8;
+        buf[9] = filter_total as u8;
+        buf[10] = 0;
+        buf[11] = 0;
+
+        let binary_start = Self::FIXED_SIZE;
+        buf[binary_start..binary_start + binary.len()].copy_from_slice(binary);
+
+        let filter_start = binary_start + binary.len();
+        filter.write_to(&mut buf[filter_start..], pattern)?;
+
+        Some(total_len)
+    }
+
+    /// Legacy: Serialize with port name (backwards compat, uses exact filter)
+    pub fn write_to(&self, buf: &mut [u8], binary: &[u8], trigger_port: &[u8]) -> Option<usize> {
+        self.write_exact(buf, binary, trigger_port)
+    }
+
+    /// Parse from buffer
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8], &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+
+        let header = QueryHeader::from_bytes(buf)?;
+        let binary_len = buf[8] as usize;
+        let filter_len = buf[9] as usize;
+
+        let total_len = Self::FIXED_SIZE + binary_len + filter_len;
+        if buf.len() < total_len {
+            return None;
+        }
+
+        let binary_start = Self::FIXED_SIZE;
+        let binary = &buf[binary_start..binary_start + binary_len];
+        let filter_start = binary_start + binary_len;
+        let filter_bytes = &buf[filter_start..filter_start + filter_len];
+
+        Some((
+            Self {
+                header,
+                binary_len: binary_len as u8,
+                filter_len: filter_len as u8,
+                _pad: [0; 2],
+            },
+            binary,
+            filter_bytes,
+        ))
+    }
+
+    /// Parse the filter from raw filter bytes
+    pub fn parse_filter(filter_bytes: &[u8]) -> Option<(PortFilter, &[u8])> {
+        PortFilter::from_bytes(filter_bytes)
+    }
+}
+
+/// Spawn acknowledgement (driver → devd)
+///
+/// Sent by driver after processing SPAWN_CHILD command.
+/// Reports how many children were spawned (filter can match N ports).
+///
+/// Variable-length: header + fixed fields + child PIDs array
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnAck {
+    pub header: QueryHeader,
+    /// 0 = success, negative = error code
+    pub result: i32,
+    /// Number of children spawned
+    pub spawn_count: u8,
+    /// Number of filter matches (may be > spawn_count if some failed)
+    pub match_count: u8,
+    pub _pad: [u8; 2],
+    // Followed by: spawn_count * u32 (child PIDs)
+}
+
+impl SpawnAck {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8;
+    pub const MAX_CHILDREN: usize = 16;
+
+    /// Create a single-spawn ack (backwards compat)
+    pub fn new(seq_id: u32, result: i32, child_pid: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SPAWN_ACK, seq_id),
+            result,
+            spawn_count: if child_pid != 0 { 1 } else { 0 },
+            match_count: 1,
+            _pad: [0; 2],
+        }
+    }
+
+    /// Create a multi-spawn ack
+    pub fn new_multi(seq_id: u32, result: i32, match_count: u8, spawn_count: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SPAWN_ACK, seq_id),
+            result,
+            spawn_count,
+            match_count,
+            _pad: [0; 2],
+        }
+    }
+
+    /// Write to buffer with child PIDs
+    pub fn write_to(&self, buf: &mut [u8], child_pids: &[u32]) -> Option<usize> {
+        let total = Self::FIXED_SIZE + child_pids.len() * 4;
+        if buf.len() < total || child_pids.len() > Self::MAX_CHILDREN {
+            return None;
+        }
+
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
+        buf[12] = child_pids.len() as u8;
+        buf[13] = self.match_count;
+        buf[14..16].copy_from_slice(&[0, 0]);
+
+        for (i, &pid) in child_pids.iter().enumerate() {
+            let offset = Self::FIXED_SIZE + i * 4;
+            buf[offset..offset + 4].copy_from_slice(&pid.to_le_bytes());
+        }
+
+        Some(total)
+    }
+
+    /// Legacy: to_bytes for single spawn (backwards compat)
+    pub fn to_bytes(&self) -> [u8; 20] {
+        let mut buf = [0u8; 20];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
+        buf[12] = self.spawn_count;
+        buf[13] = self.match_count;
+        buf[14..16].copy_from_slice(&[0, 0]);
+        // No PIDs in legacy format
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            result: i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            spawn_count: buf[12],
+            match_count: buf[13],
+            _pad: [0; 2],
+        })
+    }
+
+    /// Parse child PIDs from buffer (after from_bytes)
+    pub fn parse_pids(buf: &[u8], count: usize) -> Option<[u32; Self::MAX_CHILDREN]> {
+        if buf.len() < Self::FIXED_SIZE + count * 4 {
+            return None;
+        }
+        let mut pids = [0u32; Self::MAX_CHILDREN];
+        for i in 0..count.min(Self::MAX_CHILDREN) {
+            let offset = Self::FIXED_SIZE + i * 4;
+            pids[i] = u32::from_le_bytes([
+                buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]
+            ]);
+        }
+        Some(pids)
+    }
+}
+
+/// Stop child command (devd → driver)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct StopChild {
+    pub header: QueryHeader,
+    /// PID of child to stop
+    pub child_pid: u32,
+}
+
+impl StopChild {
+    pub const SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, child_pid: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::STOP_CHILD, seq_id),
+            child_pid,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.child_pid.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            child_pid: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        })
     }
 }
 

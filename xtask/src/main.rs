@@ -239,6 +239,7 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
         ("consoled", "driver/consoled"),
         ("shell", "shell"),
         ("partition", "driver/partition"),
+        ("fatfs", "driver/fatfs"),
     ];
 
     // Platform-specific programs

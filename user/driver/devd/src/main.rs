@@ -32,7 +32,7 @@ mod query;
 mod rules;
 
 use userlib::syscall::{self, LogLevel};
-use userlib::ipc::{Port, Timer, EventLoop, ObjHandle};
+use userlib::ipc::{Port, Timer, EventLoop, ObjHandle, Channel};
 use userlib::error::{SysError, SysResult};
 
 use service::{
@@ -46,6 +46,70 @@ use deps::{DependencyResolver, Dependencies};
 use devices::{DeviceStore, DeviceRegistry};
 use query::{QueryHandler, MSG_BUFFER_SIZE};
 use rules::{RulesEngine, StaticRules};
+
+// =============================================================================
+// Admin Client Handling (shell text commands)
+// =============================================================================
+
+/// Maximum number of admin clients (shell connections)
+const MAX_ADMIN_CLIENTS: usize = 4;
+
+/// Admin client connection (for text commands from shell)
+struct AdminClient {
+    channel: Channel,
+}
+
+/// Admin client registry
+struct AdminClients {
+    clients: [Option<AdminClient>; MAX_ADMIN_CLIENTS],
+}
+
+/// Trim whitespace and newlines from a byte slice
+fn trim_bytes(b: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = b.len();
+    while start < end && (b[start] == b' ' || b[start] == b'\n' || b[start] == b'\r' || b[start] == b'\t') {
+        start += 1;
+    }
+    while end > start && (b[end - 1] == b' ' || b[end - 1] == b'\n' || b[end - 1] == b'\r' || b[end - 1] == b'\t') {
+        end -= 1;
+    }
+    &b[start..end]
+}
+
+impl AdminClients {
+    const fn new() -> Self {
+        Self {
+            clients: [const { None }; MAX_ADMIN_CLIENTS],
+        }
+    }
+
+    fn add(&mut self, channel: Channel) -> Option<usize> {
+        let slot = (0..MAX_ADMIN_CLIENTS).find(|&i| self.clients[i].is_none())?;
+        self.clients[slot] = Some(AdminClient { channel });
+        Some(slot)
+    }
+
+    fn remove(&mut self, slot: usize) -> Option<Channel> {
+        if slot >= MAX_ADMIN_CLIENTS {
+            return None;
+        }
+        self.clients[slot].take().map(|c| c.channel)
+    }
+
+    fn find_by_handle(&self, handle: ObjHandle) -> Option<usize> {
+        (0..MAX_ADMIN_CLIENTS).find(|&i| {
+            self.clients[i]
+                .as_ref()
+                .map(|c| c.channel.handle() == handle)
+                .unwrap_or(false)
+        })
+    }
+
+    fn get_mut(&mut self, slot: usize) -> Option<&mut AdminClient> {
+        self.clients.get_mut(slot).and_then(|c| c.as_mut())
+    }
+}
 
 // =============================================================================
 // Logging
@@ -97,6 +161,39 @@ macro_rules! derror {
 // Devd - Service Supervisor
 // =============================================================================
 
+/// Maximum number of recently spawned dynamic PIDs to track
+const MAX_RECENT_DYNAMIC_PIDS: usize = 8;
+
+/// Maximum number of pending spawn commands per driver
+const MAX_PENDING_SPAWNS_PER_DRIVER: usize = 4;
+
+/// Maximum number of drivers that can have pending spawns
+const MAX_DRIVERS_WITH_PENDING: usize = 8;
+
+/// A pending spawn command waiting for driver to report Ready
+#[derive(Clone, Copy)]
+struct PendingSpawn {
+    /// Service index of the driver that should spawn
+    driver_idx: u8,
+    /// Binary name to spawn (index into static strings)
+    binary: &'static str,
+    /// Trigger port name
+    port_name: [u8; 32],
+    /// Length of port name
+    port_name_len: u8,
+}
+
+impl PendingSpawn {
+    const fn empty() -> Self {
+        Self {
+            driver_idx: 0xFF,
+            binary: "",
+            port_name: [0u8; 32],
+            port_name_len: 0,
+        }
+    }
+}
+
 pub struct Devd {
     /// Our port for services to announce ready
     port: Option<Port>,
@@ -118,6 +215,14 @@ pub struct Devd {
     query_handler: QueryHandler,
     /// Rules engine for auto-spawning drivers
     rules: StaticRules,
+    /// Admin clients (shell text commands)
+    admin_clients: AdminClients,
+    /// Recently spawned dynamic PIDs (workaround for spawn-before-slot-setup race)
+    /// Maps PID -> service_idx for dynamic drivers that haven't connected yet
+    recent_dynamic_pids: [(u32, u8); MAX_RECENT_DYNAMIC_PIDS],
+    /// Pending spawn commands waiting for drivers to report Ready
+    /// Keyed by driver service index
+    pending_spawns: [PendingSpawn; MAX_DRIVERS_WITH_PENDING * MAX_PENDING_SPAWNS_PER_DRIVER],
 }
 
 impl Devd {
@@ -133,6 +238,9 @@ impl Devd {
             devices: DeviceRegistry::new(),
             query_handler: QueryHandler::new(),
             rules: StaticRules::new(),
+            admin_clients: AdminClients::new(),
+            recent_dynamic_pids: [(0, 0); MAX_RECENT_DYNAMIC_PIDS],
+            pending_spawns: [const { PendingSpawn::empty() }; MAX_DRIVERS_WITH_PENDING * MAX_PENDING_SPAWNS_PER_DRIVER],
         }
     }
 
@@ -292,7 +400,7 @@ impl Devd {
         }
 
         // First pass: collect info and update service state
-        let (port_names, should_prune, action) = {
+        let (port_names, should_prune, action, old_pid) = {
             let service = match self.services.get_mut(idx) {
                 Some(s) => s,
                 None => return,
@@ -300,6 +408,10 @@ impl Devd {
 
             let name = service.name();
             let auto_restart = service.def().auto_restart;
+            let old_pid = service.pid;
+
+            // Clear PID - the process has exited
+            service.pid = 0;
 
             // Remove watcher from event loop
             if let Some(watcher) = service.watcher.take() {
@@ -326,7 +438,7 @@ impl Devd {
             if code == 0 {
                 service.state = ServiceState::Stopped { code: 0 };
                 service.last_change = now;
-                (port_arr, false, ExitAction::Stopped)
+                (port_arr, false, ExitAction::Stopped, old_pid)
             } else {
                 service.total_restarts = service.total_restarts.saturating_add(1);
 
@@ -339,15 +451,20 @@ impl Devd {
                     service.state = ServiceState::Failed { code };
                     service.last_change = now;
                     derror!("{} failed code={} restarts={}", name, code, service.total_restarts);
-                    (port_arr, false, if auto_restart { ExitAction::Failed } else { ExitAction::Stopped })
+                    (port_arr, false, if auto_restart { ExitAction::Failed } else { ExitAction::Stopped }, old_pid)
                 } else {
                     service.state = ServiceState::Crashed { code, restarts };
                     service.last_change = now;
                     service.backoff_ms = (service.backoff_ms * 2).min(MAX_BACKOFF_MS);
-                    (port_arr, true, ExitAction::Crashed { backoff_ms: service.backoff_ms })
+                    (port_arr, true, ExitAction::Crashed { backoff_ms: service.backoff_ms }, old_pid)
                 }
             }
         };
+
+        // Clean up recent_dynamic_pids tracking for this PID
+        if old_pid != 0 {
+            self.remove_recent_dynamic_pid(old_pid);
+        }
 
         // Unregister ports
         for port_name in port_names.iter().flatten() {
@@ -493,6 +610,8 @@ impl Devd {
         // Kill the process
         if pid != 0 {
             let _ = self.process_mgr.kill(pid);
+            // Clean up recent_dynamic_pids tracking for this PID
+            self.remove_recent_dynamic_pid(pid);
         }
 
         // Unregister ports
@@ -538,8 +657,18 @@ impl Devd {
                     // Mark service as Ready
                     self.handle_service_ready(idx);
                 } else {
-                    // Unknown connection - drop for now
-                    drop(channel);
+                    // Unknown connection - treat as admin client (shell)
+                    if let Some(events) = &mut self.events {
+                        let _ = events.watch(channel.handle());
+                    }
+                    match self.admin_clients.add(channel) {
+                        Some(slot) => {
+                            dlog!("admin client connected slot={} pid={}", slot, client_pid);
+                        }
+                        None => {
+                            dlog!("admin client rejected (full) pid={}", client_pid);
+                        }
+                    }
                 }
             }
             Err(SysError::WouldBlock) => {}
@@ -563,6 +692,182 @@ impl Devd {
                 service.backoff_ms = INITIAL_BACKOFF_MS;
             }
         });
+    }
+
+    // =========================================================================
+    // Admin Client Handling (shell text commands)
+    // =========================================================================
+
+    fn handle_admin_client_event(&mut self, handle: ObjHandle) {
+        let slot = match self.admin_clients.find_by_handle(handle) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut buf = [0u8; 128];
+        let len = {
+            let client = match self.admin_clients.get_mut(slot) {
+                Some(c) => c,
+                None => return,
+            };
+            match client.channel.recv(&mut buf) {
+                Ok(n) if n > 0 => n,
+                Ok(_) => {
+                    // EOF - client disconnected
+                    self.remove_admin_client(slot);
+                    return;
+                }
+                Err(SysError::WouldBlock) => return,
+                Err(_) => {
+                    self.remove_admin_client(slot);
+                    return;
+                }
+            }
+        };
+
+        // Parse and handle text command
+        let response = self.handle_admin_command(&buf[..len]);
+
+        // Send response
+        if let Some(client) = self.admin_clients.get_mut(slot) {
+            let _ = client.channel.send(response);
+        }
+    }
+
+    fn handle_admin_command(&mut self, cmd: &[u8]) -> &'static [u8] {
+        // Trim whitespace and newline
+        let cmd = trim_bytes(cmd);
+
+        if cmd.starts_with(b"START ") {
+            let name = trim_bytes(&cmd[6..]);
+            self.admin_start_service(name)
+        } else if cmd.starts_with(b"STOP ") {
+            let name = trim_bytes(&cmd[5..]);
+            self.admin_stop_service(name)
+        } else if cmd.starts_with(b"RESTART ") {
+            let name = trim_bytes(&cmd[8..]);
+            self.admin_restart_service(name)
+        } else if cmd == b"LIST" {
+            self.admin_list_services()
+        } else if cmd.starts_with(b"SPAWN ") {
+            let args = trim_bytes(&cmd[6..]);
+            self.admin_spawn_driver(args)
+        } else {
+            b"ERR unknown command\n"
+        }
+    }
+
+    fn admin_start_service(&mut self, name: &[u8]) -> &'static [u8] {
+        let name_str = match core::str::from_utf8(name) {
+            Ok(s) => s,
+            Err(_) => return b"ERR invalid name\n",
+        };
+
+        // Find service by name
+        let idx = match self.services.find_by_name(name_str) {
+            Some(i) => i,
+            None => return b"ERR service not found\n",
+        };
+
+        // Check if already running
+        if let Some(service) = self.services.get(idx) {
+            if service.state.is_running() {
+                return b"ERR already running\n";
+            }
+        }
+
+        // Spawn it
+        let now = Self::now_ms();
+        self.spawn_service(idx, now);
+
+        b"OK\n"
+    }
+
+    fn admin_stop_service(&mut self, name: &[u8]) -> &'static [u8] {
+        let name_str = match core::str::from_utf8(name) {
+            Ok(s) => s,
+            Err(_) => return b"ERR invalid name\n",
+        };
+
+        let idx = match self.services.find_by_name(name_str) {
+            Some(i) => i,
+            None => return b"ERR service not found\n",
+        };
+
+        // Check if running
+        if let Some(service) = self.services.get(idx) {
+            if !service.state.is_running() {
+                return b"ERR not running\n";
+            }
+        }
+
+        self.kill_service(idx);
+        b"OK\n"
+    }
+
+    fn admin_restart_service(&mut self, name: &[u8]) -> &'static [u8] {
+        let name_str = match core::str::from_utf8(name) {
+            Ok(s) => s,
+            Err(_) => return b"ERR invalid name\n",
+        };
+
+        let idx = match self.services.find_by_name(name_str) {
+            Some(i) => i,
+            None => return b"ERR service not found\n",
+        };
+
+        // Kill if running
+        if let Some(service) = self.services.get(idx) {
+            if service.state.is_running() {
+                self.kill_service(idx);
+            }
+        }
+
+        // Reset state to Pending so it can be spawned
+        let now = Self::now_ms();
+        if let Some(service) = self.services.get_mut(idx) {
+            service.state = ServiceState::Pending;
+            service.last_change = now;
+        }
+
+        // Spawn it
+        self.spawn_service(idx, now);
+        b"OK\n"
+    }
+
+    fn admin_list_services(&self) -> &'static [u8] {
+        // For now, just return OK
+        // A proper implementation would build a list string, but that requires allocation
+        // The shell can use devd-query for detailed listing
+        b"OK\n"
+    }
+
+    fn admin_spawn_driver(&mut self, args: &[u8]) -> &'static [u8] {
+        // Parse: <binary> <port>
+        let args_str = match core::str::from_utf8(args) {
+            Ok(s) => s,
+            Err(_) => return b"ERR invalid args\n",
+        };
+
+        let mut parts = args_str.split_whitespace();
+        let binary = match parts.next() {
+            Some(b) => b,
+            None => return b"ERR missing binary\n",
+        };
+        let port = parts.next().map(|p| p.as_bytes());
+
+        // Spawn the driver dynamically
+        self.spawn_dynamic_driver(binary, port.unwrap_or(b""));
+        b"OK\n"
+    }
+
+    fn remove_admin_client(&mut self, slot: usize) {
+        if let Some(channel) = self.admin_clients.remove(slot) {
+            if let Some(events) = &mut self.events {
+                let _ = events.unwatch(channel.handle());
+            }
+            dlog!("admin client disconnected slot={}", slot);
+        }
     }
 
     fn handle_process_exit(&mut self, handle: ObjHandle) {
@@ -632,7 +937,8 @@ impl Devd {
         match query_port.accept_with_pid() {
             Ok((channel, client_pid)) => {
                 // Check if this is a known service (driver)
-                let service_idx = self.services.find_by_pid(client_pid)
+                // First try the normal service registry lookup
+                let mut service_idx = self.services.find_by_pid(client_pid)
                     .filter(|&i| {
                         self.services.get(i)
                             .map(|s| s.state == ServiceState::Ready)
@@ -640,16 +946,31 @@ impl Devd {
                     })
                     .map(|i| i as u8);
 
+                // If not found, check recent_dynamic_pids for race condition workaround
+                // This handles the case where the child connects before the parent
+                // finishes setting up the service slot
+                if service_idx.is_none() {
+                    if let Some(idx) = self.find_recent_dynamic_pid(client_pid) {
+                        // Trust the recent_dynamic_pids entry - it was added immediately
+                        // after spawn, before the child could have connected
+                        service_idx = Some(idx);
+                        // Don't remove yet - keep tracking until slot is fully set up
+                        // The entry will be cleaned up on next lookup or service exit
+                        dlog!("query: found pid={} in recent_dynamic_pids idx={}", client_pid, idx);
+                    }
+                }
+
                 // Add to event loop
                 if let Some(events) = &mut self.events {
                     let _ = events.watch(channel.handle());
                 }
 
                 // Add to query handler
-                match self.query_handler.add_client(channel, service_idx) {
+                match self.query_handler.add_client(channel, service_idx, client_pid) {
                     Some(slot) => {
                         let client_type = if service_idx.is_some() { "driver" } else { "client" };
-                        dlog!("query: {} connected (slot={}, pid={})", client_type, slot, client_pid);
+                        dlog!("query: {} connected (slot={}, pid={}, svc_idx={:?})",
+                            client_type, slot, client_pid, service_idx);
                     }
                     None => {
                         derror!("query: too many clients, rejecting pid={}", client_pid);
@@ -691,6 +1012,14 @@ impl Devd {
                         // Handle port registration specially
                         self.handle_port_register_msg(slot, &recv_buf[..len]);
                     }
+                    Some(msg::STATE_CHANGE) => {
+                        // Handle driver state change
+                        self.handle_state_change_msg(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::SPAWN_ACK) => {
+                        // Handle spawn acknowledgement from driver
+                        self.handle_spawn_ack_msg(slot, &recv_buf[..len]);
+                    }
                     Some(msg::QUERY_DRIVER) => {
                         // Forward to driver
                         self.handle_query_driver_forward(slot, &recv_buf[..len]);
@@ -718,6 +1047,10 @@ impl Devd {
                 self.remove_query_client(slot);
             }
             Err(SysError::WouldBlock) => {}
+            Err(SysError::PeerClosed) => {
+                // Expected - client disconnected after query completed
+                self.remove_query_client(slot);
+            }
             Err(e) => {
                 derror!("query: recv failed slot={} err={:?}", slot, e);
                 self.remove_query_client(slot);
@@ -760,6 +1093,155 @@ impl Devd {
             Err(_) => error::INVALID_REQUEST,
         };
         self.query_handler.send_port_register_response(slot, info.seq_id, result_code);
+    }
+
+    fn handle_state_change_msg(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{StateChange, driver_state};
+
+        // Parse the state change message
+        let state_msg = match StateChange::from_bytes(buf) {
+            Some(s) => s,
+            None => {
+                derror!("invalid STATE_CHANGE message from slot={}", slot);
+                return;
+            }
+        };
+
+        // Get the driver's service index from the query client
+        let driver_idx = match self.query_handler.get_service_idx(slot) {
+            Some(idx) => idx,
+            None => {
+                dlog!("STATE_CHANGE from non-driver slot={}", slot);
+                return;
+            }
+        };
+
+        dlog!("driver {} state_change: {}", driver_idx, state_msg.new_state);
+
+        // When driver reports Ready, send any pending spawn commands
+        if state_msg.new_state == driver_state::READY {
+            self.flush_pending_spawns(driver_idx);
+        }
+    }
+
+    /// Queue a spawn command for later delivery when driver reports Ready
+    fn queue_pending_spawn(&mut self, driver_idx: u8, binary: &'static str, port_name: &[u8]) {
+        // Find an empty slot
+        for spawn in &mut self.pending_spawns {
+            if spawn.driver_idx == 0xFF {
+                spawn.driver_idx = driver_idx;
+                spawn.binary = binary;
+                let len = port_name.len().min(32);
+                spawn.port_name[..len].copy_from_slice(&port_name[..len]);
+                spawn.port_name_len = len as u8;
+                dlog!("queued spawn {} for driver {} (port trigger)", binary, driver_idx);
+                return;
+            }
+        }
+        derror!("pending spawn queue full for driver {}", driver_idx);
+    }
+
+    /// Send all pending spawn commands for a driver
+    fn flush_pending_spawns(&mut self, driver_idx: u8) {
+        // Collect pending spawns for this driver
+        let mut to_send: [(Option<&'static str>, [u8; 32], u8); MAX_PENDING_SPAWNS_PER_DRIVER] =
+            [(None, [0u8; 32], 0); MAX_PENDING_SPAWNS_PER_DRIVER];
+        let mut count = 0;
+
+        for spawn in &mut self.pending_spawns {
+            if spawn.driver_idx == driver_idx {
+                if count < MAX_PENDING_SPAWNS_PER_DRIVER {
+                    to_send[count] = (Some(spawn.binary), spawn.port_name, spawn.port_name_len);
+                    count += 1;
+                }
+                // Clear the slot
+                *spawn = PendingSpawn::empty();
+            }
+        }
+
+        if count == 0 {
+            return;
+        }
+
+        dlog!("flushing {} pending spawns for driver {}", count, driver_idx);
+
+        // Send the commands
+        for i in 0..count {
+            if let (Some(binary), port_name, port_len) = to_send[i] {
+                let port = &port_name[..port_len as usize];
+                match self.query_handler.send_spawn_child(driver_idx, binary.as_bytes(), port) {
+                    Some(seq_id) => {
+                        dlog!("sent queued SPAWN_CHILD seq={} binary={}", seq_id, binary);
+                    }
+                    None => {
+                        // Driver still not connected - fall back to direct spawn
+                        dlog!("driver {} still not connected, spawning {} directly", driver_idx, binary);
+                        self.spawn_dynamic_driver(binary, port);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle SPAWN_ACK message from a driver
+    ///
+    /// When a driver spawns children and sends SPAWN_ACK, we need to:
+    /// 1. Create service slots for the children so they can be recognized
+    /// 2. Add them to recent_dynamic_pids for the lookup race window
+    fn handle_spawn_ack_msg(&mut self, slot: usize, buf: &[u8]) {
+        use crate::query::QueryHandler;
+
+        // Parse the SPAWN_ACK message
+        let (seq_id, result, match_count, spawn_count, pids) = match QueryHandler::parse_spawn_ack(buf) {
+            Some(p) => p,
+            None => {
+                derror!("invalid SPAWN_ACK message from slot={}", slot);
+                return;
+            }
+        };
+
+        // Get the parent driver's service index
+        let parent_idx = match self.query_handler.get_service_idx(slot) {
+            Some(idx) => idx,
+            None => {
+                dlog!("SPAWN_ACK from non-driver slot={}", slot);
+                return;
+            }
+        };
+
+        dlog!("SPAWN_ACK from driver {}: seq={} result={} match={} spawn={}",
+            parent_idx, seq_id, result, match_count, spawn_count);
+
+        if spawn_count == 0 || result < 0 {
+            return;
+        }
+
+        // Create service slots for each spawned child
+        let now = Self::now_ms();
+        for i in 0..spawn_count as usize {
+            let child_pid = pids[i];
+            if child_pid == 0 {
+                continue;
+            }
+
+            // Create a new service slot for this child
+            let slot_idx = match self.services.create_dynamic_service(child_pid, now) {
+                Some(idx) => idx,
+                None => {
+                    derror!("no service slot for child pid={}", child_pid);
+                    continue;
+                }
+            };
+
+            // Add to recent_dynamic_pids (for race condition handling)
+            self.add_recent_dynamic_pid(child_pid, slot_idx as u8);
+
+            // Upgrade any already-connected client with this PID to driver status
+            // This handles the race where child connects before SPAWN_ACK arrives
+            self.query_handler.upgrade_client_to_driver(child_pid, slot_idx as u8);
+
+            dlog!("child pid={} registered in slot {} (parent={})", child_pid, slot_idx, parent_idx);
+        }
     }
 
     fn handle_query_driver_forward(&mut self, _client_slot: usize, buf: &[u8]) {
@@ -846,7 +1328,7 @@ impl Devd {
         }
 
         // Check rules for auto-spawning
-        self.check_rules_for_port(port_name, port_type, parent_type);
+        self.check_rules_for_port(port_name, port_type, parent_type, owner_idx);
 
         Ok(())
     }
@@ -857,23 +1339,28 @@ impl Devd {
         port_name: &[u8],
         port_type: PortType,
         parent_type: Option<PortType>,
+        owner_idx: u8,
     ) {
         let rule = match self.rules.find_matching_rule(port_type, parent_type) {
             Some(r) => r,
             None => return,
         };
 
-        dlog!("rule matched: spawning {} for port", rule.driver_binary);
+        dlog!("rule matched: {} should spawn {} for port", owner_idx, rule.driver_binary);
 
-        // Spawn the driver
-        // For now, we use a dynamic service slot
-        // In the future, this could use a more sophisticated approach
-        self.spawn_dynamic_driver(rule.driver_binary, port_name);
+        // Queue the spawn command - it will be sent when the driver reports Ready
+        // This avoids the race condition where SPAWN_CHILD arrives while the driver
+        // is still in register_port() waiting for the REGISTER_PORT response
+        self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
     }
 
     /// Spawn a driver dynamically (not from SERVICE_DEFS)
     fn spawn_dynamic_driver(&mut self, binary: &str, trigger_port: &[u8]) {
         let now = Self::now_ms();
+
+        // Find empty service slot BEFORE spawning so we can track immediately
+        let slot_idx = self.services.find_empty_slot();
+        let idx = slot_idx.unwrap_or(0xFF); // 0xFF = invalid/no slot
 
         // Spawn the process
         let (pid, watcher) = match self.process_mgr.spawn(binary) {
@@ -884,27 +1371,75 @@ impl Devd {
             }
         };
 
-        // Add watcher to event loop
-        if let Some(events) = &mut self.events {
-            let _ = events.watch(watcher.handle());
+        // IMMEDIATELY add to recent_dynamic_pids - this MUST happen before anything
+        // else because the spawned child may already be running and connecting!
+        // The child process starts immediately when spawn returns.
+        if idx != 0xFF {
+            self.add_recent_dynamic_pid(pid, idx as u8);
         }
 
-        // Find empty service slot for dynamic driver
-        let slot = self.services.find_empty_slot();
-        if let Some(idx) = slot {
-            // Use the slot for tracking this dynamic driver
+        // Now set up the service slot
+        if let Some(idx) = slot_idx {
             if let Some(service) = self.services.get_mut(idx) {
                 service.pid = pid;
                 service.watcher = Some(watcher);
-                service.state = service::ServiceState::Starting;
+                service.state = service::ServiceState::Ready;
                 service.last_change = now;
             }
+
+            // Add watcher to event loop
+            if let Some(events) = &mut self.events {
+                if let Some(service) = self.services.get(idx) {
+                    if let Some(w) = &service.watcher {
+                        let _ = events.watch(w.handle());
+                    }
+                }
+            }
+        } else {
+            // No slot available
+            if let Some(events) = &mut self.events {
+                let _ = events.watch(watcher.handle());
+            }
+            derror!("no service slot for dynamic driver pid={}", pid);
         }
 
         if let Ok(port_str) = core::str::from_utf8(trigger_port) {
-            dlog!("spawned {} pid={} for trigger={}", binary, pid, port_str);
+            dlog!("spawned {} pid={} slot={:?} for trigger={}", binary, pid, slot_idx, port_str);
         } else {
-            dlog!("spawned {} pid={}", binary, pid);
+            dlog!("spawned {} pid={} slot={:?}", binary, pid, slot_idx);
+        }
+    }
+
+    /// Add a recently spawned dynamic PID to the tracking array
+    fn add_recent_dynamic_pid(&mut self, pid: u32, service_idx: u8) {
+        // Find an empty slot or the oldest entry
+        for entry in &mut self.recent_dynamic_pids {
+            if entry.0 == 0 {
+                *entry = (pid, service_idx);
+                return;
+            }
+        }
+        // All slots full - overwrite the first one (oldest)
+        self.recent_dynamic_pids[0] = (pid, service_idx);
+    }
+
+    /// Look up a recently spawned dynamic PID
+    fn find_recent_dynamic_pid(&self, pid: u32) -> Option<u8> {
+        for &(p, idx) in &self.recent_dynamic_pids {
+            if p == pid {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Remove a PID from the recent dynamic PIDs tracking
+    fn remove_recent_dynamic_pid(&mut self, pid: u32) {
+        for entry in &mut self.recent_dynamic_pids {
+            if entry.0 == pid {
+                *entry = (0, 0);
+                return;
+            }
         }
     }
 
@@ -941,6 +1476,12 @@ impl Devd {
                     // Query client message?
                     if self.query_handler.find_by_handle(handle).is_some() {
                         self.handle_query_client_event(handle);
+                        continue;
+                    }
+
+                    // Admin client (shell) message?
+                    if self.admin_clients.find_by_handle(handle).is_some() {
+                        self.handle_admin_client_event(handle);
                         continue;
                     }
 

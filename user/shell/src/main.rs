@@ -353,52 +353,76 @@ fn wait_for_child(pid: u32) {
 // vfsd's ReadToShmem protocol. The kernel exec() already handles ramfs directly.
 
 fn cmd_help() {
-    color::set(color::BOLD);
-    color::set(color::CYAN);
-    println!("Available commands:");
-    color::reset();
-    help_line("help, ?", "Show this help");
-    help_line("exit, quit", "Exit the shell");
-    help_line("pid", "Show current process ID");
-    help_line("uptime", "Show system uptime");
-    help_line("mem", "Test memory allocation");
-    help_line("echo <msg>", "Echo a message");
-    help_line("ls [path]", "List directory (default: /bin)");
-    help_line("cat <path>", "Display file contents");
-    help_line("spawn <id>", "Spawn process by ELF ID");
-    help_line("usb", "Run USB userspace driver");
-    help_line("gpio [cmd]", "GPIO control (try 'gpio help')");
-    help_line("fatfs", "Run FAT filesystem driver");
-    help_line("pcied", "Start PCIe daemon");
-    help_line("wifi", "Run WiFi driver (MT7996)");
-    help_line("fan [0-100]", "Fan control / set speed");
-    help_line("hw [path]", "Hardware info (list/bus/tree/<path>)");
-    help_line("handle", "Test handle API (timer/channel/poll)");
-    help_line("devd spawn", "Spawn driver via devd (with caps)");
-    help_line("lsdev [class]", "List registered devices");
-    help_line("devinfo <id>", "Get device info by ID");
-    help_line("devquery <id>", "Query driver (blockinfo/partition)");
-    help_line("yield", "Yield CPU to other processes");
-    help_line("ps", "Show running processes");
-    help_line("kill <pid>", "Terminate a process");
-    help_line("bg <path>", "Run program in background");
-    help_line("jobs", "Show background jobs");
-    help_line("log <level>", "Set log level (error/warn/info/debug/trace)");
-    help_line("logs [on|off|n]", "Control console log region");
-    help_line("resize", "Detect/display terminal size");
-    help_line("reset", "Reset the system");
-}
+    // Build help text in a single buffer to avoid syscall storm
+    // Each line is: "  \e[33m{cmd:14}\e[0m\e[2m - \e[0m{desc}\n"
+    let mut buf = [0u8; 2048];
+    let mut pos = 0;
 
-/// Print a help line with colored command
-fn help_line(cmd: &str, desc: &str) {
-    print!("  ");
-    color::set(color::YELLOW);
-    print!("{:14}", cmd);
-    color::reset();
-    color::set(color::DIM);
-    print!(" - ");
-    color::reset();
-    println!("{}", desc);
+    // Helper to append bytes
+    let mut append = |s: &[u8]| {
+        let len = s.len().min(buf.len() - pos);
+        buf[pos..pos + len].copy_from_slice(&s[..len]);
+        pos += len;
+    };
+
+    // Header
+    append(color::BOLD);
+    append(color::CYAN);
+    append(b"Available commands:\n");
+    append(color::RESET);
+
+    // Commands - inline help_line logic
+    let commands: &[(&str, &str)] = &[
+        ("help, ?", "Show this help"),
+        ("exit, quit", "Exit the shell"),
+        ("pid", "Show current process ID"),
+        ("uptime", "Show system uptime"),
+        ("mem", "Test memory allocation"),
+        ("echo <msg>", "Echo a message"),
+        ("ls [path]", "List directory (default: /bin)"),
+        ("cat <path>", "Display file contents"),
+        ("spawn <id>", "Spawn process by ELF ID"),
+        ("usb", "Run USB userspace driver"),
+        ("gpio [cmd]", "GPIO control (try 'gpio help')"),
+        ("fatfs", "Run FAT filesystem driver"),
+        ("pcied", "Start PCIe daemon"),
+        ("wifi", "Run WiFi driver (MT7996)"),
+        ("fan [0-100]", "Fan control / set speed"),
+        ("hw [path]", "Hardware info (list/bus/tree/<path>)"),
+        ("handle", "Test handle API (timer/channel/poll)"),
+        ("devd spawn", "Spawn driver via devd (with caps)"),
+        ("lsdev [class]", "List registered devices"),
+        ("devinfo <id>", "Get device info by ID"),
+        ("devquery <id>", "Query driver (blockinfo/partition)"),
+        ("yield", "Yield CPU to other processes"),
+        ("ps", "Show running processes"),
+        ("kill <pid>", "Terminate a process"),
+        ("bg <path>", "Run program in background"),
+        ("jobs", "Show background jobs"),
+        ("log <level>", "Set log level (error/warn/info/debug/trace)"),
+        ("logs [on|off|n]", "Control console log region"),
+        ("resize", "Detect/display terminal size"),
+        ("reset", "Reset the system"),
+    ];
+
+    for (cmd, desc) in commands {
+        append(b"  ");
+        append(color::YELLOW);
+        // Pad command to 14 chars
+        append(cmd.as_bytes());
+        for _ in cmd.len()..14 {
+            append(b" ");
+        }
+        append(color::RESET);
+        append(color::DIM);
+        append(b" - ");
+        append(color::RESET);
+        append(desc.as_bytes());
+        append(b"\n");
+    }
+
+    // Single write syscall
+    console::write(&buf[..pos]);
 }
 
 fn cmd_pid() {

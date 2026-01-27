@@ -14,6 +14,7 @@ pub mod mmio;
 pub mod filter_chain;
 pub mod ring;
 pub mod data_port;
+pub mod devd;
 
 pub use error::{SysError, SysResult};
 pub use syscall::{LogLevel, Handle, ObjHandle, ObjectType};
@@ -23,6 +24,11 @@ pub use ipc::{Channel, Port, Timer, Mux, MuxFilter, MuxEvent, Process, Message, 
 pub use mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interval};
 pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_status, side_msg, side_status};
 pub use data_port::{DataPort, DataPortConfig, PortRole, Layer, ConnectedLayer, GeometryInfo};
+pub use devd::{
+    DevdClient, PortType, DeviceClass, DeviceInfo, ClientState, DriverState,
+    DevdCommand, SpawnFilter, SpawnResult, SpawnHandler, DefaultSpawnHandler,
+    register_block_device, register_partition, run_driver_loop,
+};
 
 // Entry point - called by _start
 unsafe extern "Rust" {
