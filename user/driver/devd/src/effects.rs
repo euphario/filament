@@ -96,9 +96,9 @@ impl EffectExecutor for SyscallExecutor {
 
         // Determine capabilities based on binary name
         let caps = match binary {
-            "pcied" | "usbd" => syscall::caps::BUS_DRIVER,
-            "wifid" | "nvmed" => syscall::caps::DEVICE_DRIVER,
-            "fatfs" | "vfsd" => syscall::caps::FS_DRIVER,
+            "pcied" | "usbd" | "xhcid" => syscall::caps::BUS_DRIVER,
+            "wifid" | "nvmed" | "partd" => syscall::caps::DEVICE_DRIVER,
+            "fatfsd" | "vfsd" => syscall::caps::FS_DRIVER,
             "gpio" | "pwm" => syscall::caps::GPIO_DRIVER,
             "consoled" | "logd" => syscall::caps::SERVICE_DRIVER,
             _ => syscall::caps::USER_DEFAULT,

@@ -358,8 +358,9 @@ impl QueryHandler {
                 // Get driver port name
                 let driver_port: &[u8] = services
                     .get(dev.owner_service_idx as usize)
-                    .and_then(|s: &Service| s.def().registers.first())
-                    .copied()
+                    .and_then(|s: &Service| s.def())
+                    .and_then(|d| d.registers.first())
+                    .map(|pd| pd.name)
                     .unwrap_or(b"");
 
                 let resp = DeviceInfoResponse::new(req.header.seq_id, entry);

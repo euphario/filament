@@ -36,7 +36,7 @@ use userlib::ipc::{Port, Timer, EventLoop, ObjHandle, Channel};
 use userlib::error::{SysError, SysResult};
 
 use service::{
-    ServiceState, ServiceManager, ServiceRegistry,
+    ServiceState, ServiceManager, ServiceRegistry, PortDef,
     MAX_SERVICES, MAX_PORTS_PER_SERVICE, MAX_RESTARTS,
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
 };
@@ -211,6 +211,10 @@ struct InflightSpawn {
     port_name: [u8; 32],
     /// Length of port name
     port_name_len: u8,
+    /// Binary name that was spawned
+    binary_name: [u8; 16],
+    /// Length of binary name
+    binary_name_len: u8,
 }
 
 impl InflightSpawn {
@@ -220,6 +224,8 @@ impl InflightSpawn {
             port_type: 0,
             port_name: [0u8; 32],
             port_name_len: 0,
+            binary_name: [0u8; 16],
+            binary_name_len: 0,
         }
     }
 }
@@ -335,8 +341,8 @@ impl Devd {
         self.events = Some(events);
 
         syscall::klog(LogLevel::Info, b"[devd] init: registering in internal registry");
-        self.ports.register(b"devd:", 0xFF)?; // 0xFF = devd itself
-        self.ports.register(b"devd-query:", 0xFF)?;
+        self.ports.register_typed(b"devd:", 0xFF, PortType::Service)?; // 0xFF = devd itself
+        self.ports.register_typed(b"devd-query:", 0xFF, PortType::Service)?;
 
         syscall::klog(LogLevel::Info, b"[devd] init: initializing services");
         self.services.init_from_defs();
@@ -384,8 +390,8 @@ impl Devd {
         }
 
         // Get binary name
-        let binary = match self.services.get(idx) {
-            Some(s) => s.def().binary,
+        let binary = match self.services.get(idx).and_then(|s| s.def()) {
+            Some(d) => d.binary,
             None => return,
         };
 
@@ -404,14 +410,14 @@ impl Devd {
             let _ = events.watch(watcher.handle());
         }
 
-        // Collect port names before mutable borrow
-        let port_names: [Option<&'static [u8]>; MAX_PORTS_PER_SERVICE] = {
-            match self.services.get(idx) {
-                Some(s) => {
+        // Collect port definitions before mutable borrow
+        let port_defs: [Option<PortDef>; MAX_PORTS_PER_SERVICE] = {
+            match self.services.get(idx).and_then(|s| s.def()) {
+                Some(def) => {
                     let mut arr = [None; MAX_PORTS_PER_SERVICE];
-                    for (i, &pn) in s.def().registers.iter().enumerate() {
+                    for (i, pd) in def.registers.iter().enumerate() {
                         if i < MAX_PORTS_PER_SERVICE {
-                            arr[i] = Some(pn);
+                            arr[i] = Some(*pd);
                         }
                     }
                     arr
@@ -431,9 +437,9 @@ impl Devd {
         dlog!("spawned {} pid={}", binary, pid);
 
         // Pre-register ports this service will provide (not available yet)
-        for port_name in port_names.iter().flatten() {
-            let _ = self.ports.register(port_name, idx as u8);
-            self.ports.set_availability(port_name, false);
+        for pd in port_defs.iter().flatten() {
+            let _ = self.ports.register_typed(pd.name, idx as u8, PortType::from_u8(pd.port_type));
+            self.ports.set_availability(pd.name, false);
         }
 
         // For services that don't register ports, mark Ready immediately
@@ -466,8 +472,13 @@ impl Devd {
                 None => return,
             };
 
-            let name = service.name();
-            let auto_restart = service.def().auto_restart;
+            // Copy name to local buffer (name() borrows dynamic_name)
+            let mut name_buf = [0u8; 16];
+            let name_str = service.name();
+            let name_len = name_str.len().min(16);
+            name_buf[..name_len].copy_from_slice(&name_str.as_bytes()[..name_len]);
+
+            let auto_restart = service.def().map(|d| d.auto_restart).unwrap_or(false);
             let old_pid = service.pid;
 
             // Clear PID - the process has exited
@@ -489,9 +500,11 @@ impl Devd {
 
             // Collect port names
             let mut port_arr = [None; MAX_PORTS_PER_SERVICE];
-            for (i, &pn) in service.def().registers.iter().enumerate() {
-                if i < MAX_PORTS_PER_SERVICE {
-                    port_arr[i] = Some(pn);
+            if let Some(def) = service.def() {
+                for (i, pd) in def.registers.iter().enumerate() {
+                    if i < MAX_PORTS_PER_SERVICE {
+                        port_arr[i] = Some(pd.name);
+                    }
                 }
             }
 
@@ -510,6 +523,7 @@ impl Devd {
                 if restarts >= MAX_RESTARTS || !auto_restart {
                     service.state = ServiceState::Failed { code };
                     service.last_change = now;
+                    let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("?");
                     derror!("{} failed code={} restarts={}", name, code, service.total_restarts);
                     (port_arr, false, if auto_restart { ExitAction::Failed } else { ExitAction::Stopped }, old_pid)
                 } else {
@@ -583,9 +597,11 @@ impl Devd {
             };
 
             let mut arr = [None; MAX_PORTS_PER_SERVICE];
-            for (i, &pn) in service.def().registers.iter().enumerate() {
-                if i < MAX_PORTS_PER_SERVICE {
-                    arr[i] = Some(pn);
+            if let Some(def) = service.def() {
+                for (i, pd) in def.registers.iter().enumerate() {
+                    if i < MAX_PORTS_PER_SERVICE {
+                        arr[i] = Some(pd.name);
+                    }
                 }
             }
 
@@ -655,9 +671,11 @@ impl Devd {
 
             // Collect port names
             let mut arr = [None; MAX_PORTS_PER_SERVICE];
-            for (i, &pn) in service.def().registers.iter().enumerate() {
-                if i < MAX_PORTS_PER_SERVICE {
-                    arr[i] = Some(pn);
+            if let Some(def) = service.def() {
+                for (i, pd) in def.registers.iter().enumerate() {
+                    if i < MAX_PORTS_PER_SERVICE {
+                        arr[i] = Some(pd.name);
+                    }
                 }
             }
 
@@ -742,8 +760,9 @@ impl Devd {
         let now = Self::now_ms();
 
         self.services.for_each_mut(|_i, service| {
+            let registers_empty = service.def().map(|d| d.registers.is_empty()).unwrap_or(true);
             if service.state == ServiceState::Starting
-                && service.def().registers.is_empty()
+                && registers_empty
                 && service.pid != 0
             {
                 dlog!("service {} state: Starting -> Ready (portless)", service.name());
@@ -966,10 +985,17 @@ impl Devd {
             match service.state {
                 ServiceState::Crashed { .. } => true,
                 ServiceState::Failed { .. } => {
-                    let name = service.name();
+                    // Copy name to local buffer before modifying service
+                    let mut name_buf = [0u8; 16];
+                    let name_str = service.name();
+                    let name_len = name_str.len().min(16);
+                    name_buf[..name_len].copy_from_slice(&name_str.as_bytes()[..name_len]);
+
                     service.backoff_ms = INITIAL_BACKOFF_MS;
                     service.state = ServiceState::Pending;
                     service.last_change = now;
+
+                    let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("?");
                     dlog!("{} retry after failed (total_restarts={})", name, service.total_restarts);
                     false
                 }
@@ -1112,6 +1138,14 @@ impl Devd {
                     Some(msg::UPDATE_PORT_SHMEM_ID) => {
                         // Handle update shmem_id for existing port
                         self.handle_update_port_shmem_id(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::LIST_PORTS) => {
+                        // Handle port list query
+                        self.handle_list_ports(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::LIST_SERVICES) => {
+                        // Handle service list query
+                        self.handle_list_services(slot, &recv_buf[..len]);
                     }
                     _ => {
                         // Process normally
@@ -1349,6 +1383,159 @@ impl Devd {
         }
     }
 
+    /// Handle LIST_PORTS message - returns all registered ports
+    fn handle_list_ports(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{QueryHeader, PortsListResponse, PortEntry, port_flags};
+
+        let header = match QueryHeader::from_bytes(buf) {
+            Some(h) => h,
+            None => {
+                derror!("invalid LIST_PORTS message from slot={}", slot);
+                return;
+            }
+        };
+
+        let seq_id = header.seq_id;
+
+        // Count ports and build entries
+        let mut entries = [[0u8; PortEntry::SIZE]; 32];
+        let mut count = 0usize;
+
+        self.ports.for_each(|port| {
+            if count >= 32 {
+                return;
+            }
+
+            // Get owner PID
+            let owner_pid = if port.owner() == 0xFF {
+                0 // devd itself
+            } else {
+                self.services.get(port.owner() as usize)
+                    .map(|s| s.pid)
+                    .unwrap_or(0)
+            };
+
+            // Build flags
+            let mut flags = 0u8;
+            if port.has_dataport() {
+                flags |= port_flags::HAS_DATAPORT;
+            }
+            if port.is_available() {
+                flags |= port_flags::AVAILABLE;
+            }
+
+            // Build entry
+            let mut name = [0u8; 20];
+            let name_bytes = port.name();
+            let name_len = name_bytes.len().min(20);
+            name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+
+            let entry = PortEntry {
+                name,
+                port_type: port.port_type() as u8,
+                flags,
+                owner_idx: port.owner(),
+                parent_idx: port.parent_idx().unwrap_or(0xFF),
+                shmem_id: port.shmem_id(),
+                owner_pid,
+            };
+
+            entries[count] = entry.to_bytes();
+            count += 1;
+        });
+
+        // Build response
+        let resp_header = PortsListResponse::new(seq_id, count as u16);
+
+        // Send response: header + entries
+        let mut resp_buf = [0u8; 12 + 32 * 32]; // header + 32 entries max
+        let header_bytes = resp_header.header_to_bytes();
+        resp_buf[..PortsListResponse::HEADER_SIZE].copy_from_slice(&header_bytes);
+
+        let mut offset = PortsListResponse::HEADER_SIZE;
+        for i in 0..count {
+            resp_buf[offset..offset + PortEntry::SIZE].copy_from_slice(&entries[i]);
+            offset += PortEntry::SIZE;
+        }
+
+        if let Some(client) = self.query_handler.get_mut(slot) {
+            let _ = client.channel.send(&resp_buf[..offset]);
+        }
+    }
+
+    /// Handle LIST_SERVICES message - returns all services
+    fn handle_list_services(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{QueryHeader, ServicesListResponse, ServiceEntry, service_state};
+
+        let header = match QueryHeader::from_bytes(buf) {
+            Some(h) => h,
+            None => {
+                derror!("invalid LIST_SERVICES message from slot={}", slot);
+                return;
+            }
+        };
+
+        let seq_id = header.seq_id;
+
+        // Build service entries
+        let mut entries = [[0u8; ServiceEntry::SIZE]; 16];
+        let mut count = 0usize;
+
+        self.services.for_each(|idx, service| {
+            if count >= 16 {
+                return;
+            }
+
+            // Build entry
+            let mut name = [0u8; 16];
+            let name_str = service.name().as_bytes();
+            let name_len = name_str.len().min(16);
+            name[..name_len].copy_from_slice(&name_str[..name_len]);
+
+            // Map state to constant
+            let state = match service.state {
+                ServiceState::Pending => service_state::PENDING,
+                ServiceState::Starting => service_state::STARTING,
+                ServiceState::Ready => service_state::READY,
+                ServiceState::Stopped { .. } => service_state::STOPPED,
+                ServiceState::Crashed { .. } => service_state::CRASHED,
+                ServiceState::Failed { .. } => service_state::FAILED,
+            };
+
+            let entry = ServiceEntry {
+                name,
+                pid: service.pid,
+                state,
+                index: idx as u8,
+                parent_idx: service.parent.unwrap_or(0xFF),
+                child_count: service.child_count,
+                total_restarts: service.total_restarts,
+                last_change: service.last_change as u32,
+            };
+
+            entries[count] = entry.to_bytes();
+            count += 1;
+        });
+
+        // Build response
+        let resp_header = ServicesListResponse::new(seq_id, count as u16);
+
+        // Send response: header + entries
+        let mut resp_buf = [0u8; 12 + 16 * 32]; // header + 16 entries max
+        let header_bytes = resp_header.header_to_bytes();
+        resp_buf[..ServicesListResponse::HEADER_SIZE].copy_from_slice(&header_bytes);
+
+        let mut offset = ServicesListResponse::HEADER_SIZE;
+        for i in 0..count {
+            resp_buf[offset..offset + ServiceEntry::SIZE].copy_from_slice(&entries[i]);
+            offset += ServiceEntry::SIZE;
+        }
+
+        if let Some(client) = self.query_handler.get_mut(slot) {
+            let _ = client.channel.send(&resp_buf[..offset]);
+        }
+    }
+
     /// Queue a spawn command for later delivery when driver reports Ready
     fn queue_pending_spawn(&mut self, driver_idx: u8, binary: &'static str, port_name: &[u8]) {
         // Find an empty slot
@@ -1398,9 +1585,8 @@ impl Devd {
                     Some(seq_id) => {
                         dlog!("sent queued SPAWN_CHILD seq={} binary={}", seq_id, binary);
                         // Track inflight spawn so we can store context when ACK arrives
-                        // Use port_type 0 for now (we'd need to look up the port type)
                         let port_type = self.ports.get_port_type(port).unwrap_or(0);
-                        self.track_inflight_spawn(seq_id, port_type, port);
+                        self.track_inflight_spawn(seq_id, port_type, port, binary);
                     }
                     None => {
                         // Driver still not connected - fall back to direct spawn
@@ -1441,12 +1627,17 @@ impl Devd {
         dlog!("SPAWN_ACK from driver {}: seq={} result={} match={} spawn={}",
             parent_idx, seq_id, result, match_count, spawn_count);
 
-        // Consume the inflight spawn to get port context
-        let port_ctx = self.consume_inflight_spawn(seq_id);
+        // Consume the inflight spawn to get port context and binary name
+        let spawn_ctx = self.consume_inflight_spawn(seq_id);
 
         if spawn_count == 0 || result < 0 {
             return;
         }
+
+        // Extract binary name from spawn context
+        let binary_name: &[u8] = spawn_ctx.as_ref()
+            .map(|(_, _, _, bin, bin_len)| &bin[..*bin_len as usize])
+            .unwrap_or(b"???");
 
         // Create service slots for each spawned child
         let now = Self::now_ms();
@@ -1456,8 +1647,8 @@ impl Devd {
                 continue;
             }
 
-            // Create a new service slot for this child
-            let slot_idx = match self.services.create_dynamic_service(child_pid, now) {
+            // Create a new service slot for this child with its binary name
+            let slot_idx = match self.services.create_dynamic_service(child_pid, binary_name, now) {
                 Some(idx) => idx,
                 None => {
                     derror!("no service slot for child pid={}", child_pid);
@@ -1469,7 +1660,7 @@ impl Devd {
             self.add_recent_dynamic_pid(child_pid, slot_idx as u8);
 
             // Store spawn context (port that triggered spawn) for GET_SPAWN_CONTEXT
-            if let Some((port_type, port_name, port_name_len)) = port_ctx {
+            if let Some((port_type, port_name, port_name_len, _, _)) = spawn_ctx {
                 self.store_spawn_context(child_pid, port_type, &port_name[..port_name_len as usize]);
                 dlog!("stored spawn context for pid={}: port={}", child_pid,
                     core::str::from_utf8(&port_name[..port_name_len as usize]).unwrap_or("?"));
@@ -1693,8 +1884,8 @@ impl Devd {
     // Spawn Context Tracking
     // =========================================================================
 
-    /// Track an in-flight spawn command (seq_id -> port info)
-    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8]) {
+    /// Track an in-flight spawn command (seq_id -> port info + binary name)
+    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8], binary: &str) {
         // Find empty slot
         for entry in &mut self.inflight_spawns {
             if entry.seq_id == 0 {
@@ -1703,17 +1894,21 @@ impl Devd {
                 let len = port_name.len().min(32);
                 entry.port_name[..len].copy_from_slice(&port_name[..len]);
                 entry.port_name_len = len as u8;
+                let bin_len = binary.len().min(16);
+                entry.binary_name[..bin_len].copy_from_slice(&binary.as_bytes()[..bin_len]);
+                entry.binary_name_len = bin_len as u8;
                 return;
             }
         }
         // No slot available - oldest will be overwritten implicitly when it's used
     }
 
-    /// Consume an in-flight spawn by seq_id, returning the port info
-    fn consume_inflight_spawn(&mut self, seq_id: u32) -> Option<(u8, [u8; 32], u8)> {
+    /// Consume an in-flight spawn by seq_id, returning (port_type, port_name, port_len, binary_name, binary_len)
+    fn consume_inflight_spawn(&mut self, seq_id: u32) -> Option<(u8, [u8; 32], u8, [u8; 16], u8)> {
         for entry in &mut self.inflight_spawns {
             if entry.seq_id == seq_id {
-                let result = (entry.port_type, entry.port_name, entry.port_name_len);
+                let result = (entry.port_type, entry.port_name, entry.port_name_len,
+                              entry.binary_name, entry.binary_name_len);
                 *entry = InflightSpawn::empty();
                 return Some(result);
             }

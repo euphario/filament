@@ -87,9 +87,11 @@ impl Dependencies {
 
 impl DependencyResolver for Dependencies {
     fn satisfied(&self, service: &Service, ports: &Ports) -> bool {
-        for dep in service.def().dependencies {
-            if dep.is_required() && !ports.available(dep.port_name()) {
-                return false;
+        if let Some(def) = service.def() {
+            for dep in def.dependencies {
+                if dep.is_required() && !ports.available(dep.port_name()) {
+                    return false;
+                }
             }
         }
         true
@@ -105,10 +107,10 @@ impl DependencyResolver for Dependencies {
         // Get ports that the provider registers
         let provider_ports: [Option<&'static [u8]>; 4] = {
             let mut ports = [None; 4];
-            if let Some(provider) = services.get(provider_idx) {
-                for (i, &port_name) in provider.def().registers.iter().enumerate() {
+            if let Some(def) = services.get(provider_idx).and_then(|s| s.def()) {
+                for (i, pd) in def.registers.iter().enumerate() {
                     if i < 4 {
-                        ports[i] = Some(port_name);
+                        ports[i] = Some(pd.name);
                     }
                 }
             }
@@ -139,10 +141,12 @@ impl DependencyResolver for Dependencies {
             }
 
             // Check if depends on provider's ports
-            let depends_on_ports = service.def().dependencies.iter().any(|dep| {
-                let dep_port = dep.port_name();
-                provider_ports.iter().flatten().any(|&p| p == dep_port)
-            });
+            let depends_on_ports = service.def()
+                .map(|d| d.dependencies.iter().any(|dep| {
+                    let dep_port = dep.port_name();
+                    provider_ports.iter().flatten().any(|&p| p == dep_port)
+                }))
+                .unwrap_or(false);
 
             // Check if is a child of provider
             let is_child = children.iter().flatten().any(|&c| c as usize == i);

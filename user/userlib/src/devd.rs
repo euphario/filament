@@ -50,7 +50,9 @@ use crate::query::{
     ListDevices, DeviceListResponse, StateChange, SpawnChild, SpawnAck,
     PortFilter, filter_mode, GetSpawnContext, SpawnContextResponse,
     QueryPort, PortInfoResponse, port_flags, UpdatePortShmemId,
-    msg, port_type, error, class, driver_state,
+    ListPorts, PortsListResponse, PortEntry,
+    ListServices, ServicesListResponse, ServiceEntry,
+    msg, port_type, error, class, driver_state, service_state,
 };
 
 // =============================================================================
@@ -799,6 +801,135 @@ impl DevdClient {
         } else {
             Ok(None)
         }
+    }
+
+    // =========================================================================
+    // Introspection (client → devd)
+    // =========================================================================
+
+    /// List all registered ports
+    ///
+    /// Returns a list of PortEntry structures describing all ports
+    /// currently registered with devd.
+    pub fn list_ports(&mut self) -> Result<([PortEntry; 32], usize), SysError> {
+        use crate::query::{ListPorts, PortsListResponse, PortEntry};
+
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = ListPorts::new(seq_id);
+        channel.send(&req.to_bytes())?;
+
+        // Buffer for response: header + up to 32 entries
+        let mut resp_buf = [0u8; 12 + 32 * PortEntry::SIZE];
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut resp_buf) {
+                Ok(len) if len >= PortsListResponse::HEADER_SIZE => {
+                    let header = QueryHeader::from_bytes(&resp_buf)
+                        .ok_or(SysError::IoError)?;
+
+                    if header.msg_type == msg::PORTS_LIST {
+                        let resp = PortsListResponse::from_bytes(&resp_buf)
+                            .ok_or(SysError::IoError)?;
+
+                        let count = (resp.count as usize).min(32);
+                        let mut entries = [PortEntry {
+                            name: [0u8; 20],
+                            port_type: 0,
+                            flags: 0,
+                            owner_idx: 0,
+                            parent_idx: 0xFF,
+                            shmem_id: 0,
+                            owner_pid: 0,
+                        }; 32];
+
+                        let data_start = PortsListResponse::HEADER_SIZE;
+                        for i in 0..count {
+                            let offset = data_start + i * PortEntry::SIZE;
+                            if offset + PortEntry::SIZE <= len {
+                                if let Some(entry) = PortEntry::from_bytes(&resp_buf[offset..]) {
+                                    entries[i] = entry;
+                                }
+                            }
+                        }
+
+                        return Ok((entries, count));
+                    } else if header.msg_type == msg::ERROR {
+                        return Err(SysError::NotFound);
+                    }
+                }
+                Ok(_) => return Err(SysError::IoError),
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SysError::Timeout)
+    }
+
+    /// List all services
+    ///
+    /// Returns a list of ServiceEntry structures describing all services
+    /// tracked by devd.
+    pub fn list_services(&mut self) -> Result<([ServiceEntry; 16], usize), SysError> {
+        use crate::query::{ListServices, ServicesListResponse, ServiceEntry};
+
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = ListServices::new(seq_id);
+        channel.send(&req.to_bytes())?;
+
+        // Buffer for response: header + up to 16 entries
+        let mut resp_buf = [0u8; 12 + 16 * ServiceEntry::SIZE];
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut resp_buf) {
+                Ok(len) if len >= ServicesListResponse::HEADER_SIZE => {
+                    let header = QueryHeader::from_bytes(&resp_buf)
+                        .ok_or(SysError::IoError)?;
+
+                    if header.msg_type == msg::SERVICES_LIST {
+                        let resp = ServicesListResponse::from_bytes(&resp_buf)
+                            .ok_or(SysError::IoError)?;
+
+                        let count = (resp.count as usize).min(16);
+                        let mut entries = [ServiceEntry {
+                            name: [0u8; 16],
+                            pid: 0,
+                            state: 0,
+                            index: 0,
+                            parent_idx: 0xFF,
+                            child_count: 0,
+                            total_restarts: 0,
+                            last_change: 0,
+                        }; 16];
+
+                        let data_start = ServicesListResponse::HEADER_SIZE;
+                        for i in 0..count {
+                            let offset = data_start + i * ServiceEntry::SIZE;
+                            if offset + ServiceEntry::SIZE <= len {
+                                if let Some(entry) = ServiceEntry::from_bytes(&resp_buf[offset..]) {
+                                    entries[i] = entry;
+                                }
+                            }
+                        }
+
+                        return Ok((entries, count));
+                    } else if header.msg_type == msg::ERROR {
+                        return Err(SysError::NotFound);
+                    }
+                }
+                Ok(_) => return Err(SysError::IoError),
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SysError::Timeout)
     }
 
     /// Disconnect from devd

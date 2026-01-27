@@ -7,15 +7,7 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
-name = "qemu-usbd"
-version = "0.1.0"
-dependencies = [
- "usb",
- "userlib",
-]
-
-[[package]]
-name = "usb"
+name = "partd"
 version = "0.1.0"
 dependencies = [
  "userlib",

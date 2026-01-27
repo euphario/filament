@@ -7,7 +7,7 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
-name = "fatfs"
+name = "usb"
 version = "0.1.0"
 dependencies = [
  "userlib",
@@ -18,4 +18,12 @@ name = "userlib"
 version = "0.1.0"
 dependencies = [
  "abi",
+]
+
+[[package]]
+name = "xhcid"
+version = "0.1.0"
+dependencies = [
+ "usb",
+ "userlib",
 ]

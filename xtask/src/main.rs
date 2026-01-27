@@ -254,15 +254,15 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
         ("devd", "driver/devd"),
         ("consoled", "driver/consoled"),
         ("shell", "shell"),
-        ("partition", "driver/partition"),
-        ("fatfs", "driver/fatfs"),
+        ("partd", "driver/partd"),
+        ("fatfsd", "driver/fatfsd"),
         ("vfsd", "driver/vfsd"),
     ];
 
     // Platform-specific programs
     if platform == "qemu" || platform == "qemu-virt" {
         all_programs.push(("pcied", "driver/pcied"));
-        all_programs.push(("qemu-usbd", "driver/qemu-usbd"));
+        all_programs.push(("xhcid", "driver/xhcid"));
     }
 
     let programs: Vec<_> = if only.is_empty() {

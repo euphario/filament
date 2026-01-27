@@ -28,6 +28,7 @@ use userlib::vfs::{
     DirEntries, DirEntry, FileData, FileInfo, Result as VfsResult,
     FsRegister,
 };
+use userlib::devd::{DevdClient, DriverState};
 use userlib::error::SysError;
 use userlib::sync::SingleThreadCell;
 
@@ -224,6 +225,19 @@ impl Vfsd {
         // Store port properly (no more mem::forget leak!)
         self.port = Some(port);
         self.mux = Some(mux);
+
+        // Connect to devd and report ready state
+        match DevdClient::connect() {
+            Ok(mut client) => {
+                let _ = client.report_state(DriverState::Ready);
+                vlog!("connected to devd");
+            }
+            Err(e) => {
+                // Non-fatal - vfsd can still work without devd connection
+                vlog!("devd connect failed: {:?} (continuing anyway)", e);
+            }
+        }
+
         vlog!("ready");
         Ok(())
     }

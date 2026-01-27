@@ -7,11 +7,11 @@
 //! ## Example Flow
 //!
 //! 1. usbd registers `disk0:` with type Block
-//! 2. Rules engine matches Block → partition driver
-//! 3. devd spawns partition driver with `disk0:` as trigger
-//! 4. partition registers `part0:`, `part1:` with type Partition, parent=disk0:
-//! 5. Rules engine matches Partition → fatfs driver
-//! 6. devd spawns fatfs for each partition
+//! 2. Rules engine matches Block → partd driver
+//! 3. devd spawns partd driver with `disk0:` as trigger
+//! 4. partd registers `part0:`, `part1:` with type Partition, parent=disk0:
+//! 5. Rules engine matches Partition → fatfsd driver
+//! 6. devd spawns fatfsd for each partd
 
 use crate::ports::PortType;
 
@@ -62,19 +62,19 @@ impl Rule {
 ///
 /// Order matters - first matching rule wins.
 pub static RULES: &[Rule] = &[
-    // When a Block device appears, spawn partition scanner
+    // When a Block device appears, spawn partd scanner
     Rule {
         match_parent_type: None,
         match_port_type: Some(PortType::Block),
-        driver_binary: "partition",
+        driver_binary: "partd",
         pass_port_name: true,
     },
-    // When a Partition appears with a Block parent, spawn fatfs
-    // (fatfs will probe and only attach if it recognizes the filesystem)
+    // When a Partition appears with a Block parent, spawn fatfsd
+    // (fatfsd will probe and only attach if it recognizes the filesystem)
     Rule {
         match_parent_type: Some(PortType::Block),
         match_port_type: Some(PortType::Partition),
-        driver_binary: "fatfs",
+        driver_binary: "fatfsd",
         pass_port_name: true,
     },
 ];
@@ -141,7 +141,7 @@ mod tests {
         let rule = Rule {
             match_parent_type: None,
             match_port_type: Some(PortType::Block),
-            driver_binary: "partition",
+            driver_binary: "partd",
             pass_port_name: true,
         };
 
@@ -155,7 +155,7 @@ mod tests {
         let rule = Rule {
             match_parent_type: Some(PortType::Block),
             match_port_type: Some(PortType::Partition),
-            driver_binary: "fatfs",
+            driver_binary: "fatfsd",
             pass_port_name: true,
         };
 
@@ -169,15 +169,15 @@ mod tests {
     fn test_static_rules_find() {
         let engine = StaticRules::new();
 
-        // Block device should match partition rule
+        // Block device should match partd rule
         let rule = engine.find_matching_rule(PortType::Block, None);
         assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver_binary, "partition");
+        assert_eq!(rule.unwrap().driver_binary, "partd");
 
-        // Partition with Block parent should match fatfs rule
+        // Partition with Block parent should match fatfsd rule
         let rule = engine.find_matching_rule(PortType::Partition, Some(PortType::Block));
         assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver_binary, "fatfs");
+        assert_eq!(rule.unwrap().driver_binary, "fatfsd");
 
         // Console should not match any rule
         let rule = engine.find_matching_rule(PortType::Console, None);

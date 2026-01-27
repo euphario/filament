@@ -107,6 +107,10 @@ pub mod msg {
     pub const GET_DEVICE_INFO: u16 = 0x0201;
     /// Pass-through query to driver
     pub const QUERY_DRIVER: u16 = 0x0202;
+    /// List all registered ports (for introspection)
+    pub const LIST_PORTS: u16 = 0x0203;
+    /// List all services (for introspection)
+    pub const LIST_SERVICES: u16 = 0x0204;
 
     // Commands (devd → driver)
     /// Tell driver to spawn a child process
@@ -127,6 +131,10 @@ pub mod msg {
     pub const SPAWN_CONTEXT: u16 = 0x0303;
     /// Response containing port info (including shmem_id)
     pub const PORT_INFO: u16 = 0x0304;
+    /// Response containing list of ports
+    pub const PORTS_LIST: u16 = 0x0305;
+    /// Response containing list of services
+    pub const SERVICES_LIST: u16 = 0x0306;
     /// Error response
     pub const ERROR: u16 = 0x03FF;
 }
@@ -1653,6 +1661,287 @@ impl PartitionEntry {
             _pad: [0; 2],
             start_lba: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
             size_sectors: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        })
+    }
+}
+
+// =============================================================================
+// Introspection Messages
+// =============================================================================
+
+/// List ports request (client → devd)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ListPorts {
+    pub header: QueryHeader,
+}
+
+impl ListPorts {
+    pub const SIZE: usize = QueryHeader::SIZE;
+
+    pub fn new(seq_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::LIST_PORTS, seq_id),
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        self.header.to_bytes()
+    }
+}
+
+/// List services request (client → devd)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ListServices {
+    pub header: QueryHeader,
+}
+
+impl ListServices {
+    pub const SIZE: usize = QueryHeader::SIZE;
+
+    pub fn new(seq_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::LIST_SERVICES, seq_id),
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        self.header.to_bytes()
+    }
+}
+
+/// Port entry in ports list response (32 bytes per entry)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortEntry {
+    /// Port name (null-padded)
+    pub name: [u8; 20],
+    /// Port type (see `port_type` module)
+    pub port_type: u8,
+    /// Port flags (see `port_flags` module)
+    pub flags: u8,
+    /// Owner service index (0xFF = devd itself)
+    pub owner_idx: u8,
+    /// Parent port index (0xFF = no parent / root)
+    pub parent_idx: u8,
+    /// DataPort shared memory ID (0 if no DataPort)
+    pub shmem_id: u32,
+    /// Owner process PID
+    pub owner_pid: u32,
+}
+
+impl PortEntry {
+    pub const SIZE: usize = 32;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..20].copy_from_slice(&self.name);
+        buf[20] = self.port_type;
+        buf[21] = self.flags;
+        buf[22] = self.owner_idx;
+        buf[23] = self.parent_idx;
+        buf[24..28].copy_from_slice(&self.shmem_id.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.owner_pid.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let mut name = [0u8; 20];
+        name.copy_from_slice(&buf[0..20]);
+        Some(Self {
+            name,
+            port_type: buf[20],
+            flags: buf[21],
+            owner_idx: buf[22],
+            parent_idx: buf[23],
+            shmem_id: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+            owner_pid: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
+        })
+    }
+
+    /// Get port name as slice (up to null terminator)
+    pub fn name_str(&self) -> &[u8] {
+        let len = self.name.iter().position(|&b| b == 0).unwrap_or(20);
+        &self.name[..len]
+    }
+}
+
+/// Service state constants for introspection
+pub mod service_state {
+    /// Waiting for dependencies to be satisfied
+    pub const PENDING: u8 = 0;
+    /// Spawned, waiting for service to connect
+    pub const STARTING: u8 = 1;
+    /// Service is ready
+    pub const READY: u8 = 2;
+    /// Service exited cleanly
+    pub const STOPPED: u8 = 3;
+    /// Service crashed, pending restart
+    pub const CRASHED: u8 = 4;
+    /// Service failed permanently
+    pub const FAILED: u8 = 5;
+}
+
+/// Service entry in services list response (32 bytes per entry)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ServiceEntry {
+    /// Service binary name (null-padded)
+    pub name: [u8; 16],
+    /// Process ID (0 if not running)
+    pub pid: u32,
+    /// Service state (see `service_state` module)
+    pub state: u8,
+    /// Service index
+    pub index: u8,
+    /// Parent service index (0xFF = devd)
+    pub parent_idx: u8,
+    /// Number of children
+    pub child_count: u8,
+    /// Total restart count
+    pub total_restarts: u32,
+    /// Last state change timestamp (ms since boot)
+    pub last_change: u32,
+}
+
+impl ServiceEntry {
+    pub const SIZE: usize = 32;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..16].copy_from_slice(&self.name);
+        buf[16..20].copy_from_slice(&self.pid.to_le_bytes());
+        buf[20] = self.state;
+        buf[21] = self.index;
+        buf[22] = self.parent_idx;
+        buf[23] = self.child_count;
+        buf[24..28].copy_from_slice(&self.total_restarts.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.last_change.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let mut name = [0u8; 16];
+        name.copy_from_slice(&buf[0..16]);
+        Some(Self {
+            name,
+            pid: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            state: buf[20],
+            index: buf[21],
+            parent_idx: buf[22],
+            child_count: buf[23],
+            total_restarts: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+            last_change: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
+        })
+    }
+
+    /// Get service name as slice (up to null terminator)
+    pub fn name_str(&self) -> &[u8] {
+        let len = self.name.iter().position(|&b| b == 0).unwrap_or(16);
+        &self.name[..len]
+    }
+
+    /// Get state as string
+    pub fn state_str(&self) -> &'static str {
+        match self.state {
+            service_state::PENDING => "pending",
+            service_state::STARTING => "starting",
+            service_state::READY => "ready",
+            service_state::STOPPED => "stopped",
+            service_state::CRASHED => "crashed",
+            service_state::FAILED => "failed",
+            _ => "unknown",
+        }
+    }
+}
+
+/// Ports list response header (devd → client)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortsListResponse {
+    pub header: QueryHeader,
+    /// Number of port entries following
+    pub count: u16,
+    pub _pad: u16,
+    // Followed by: count * PortEntry
+}
+
+impl PortsListResponse {
+    pub const HEADER_SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, count: u16) -> Self {
+        Self {
+            header: QueryHeader::new(msg::PORTS_LIST, seq_id),
+            count,
+            _pad: 0,
+        }
+    }
+
+    pub fn header_to_bytes(&self) -> [u8; Self::HEADER_SIZE] {
+        let mut buf = [0u8; Self::HEADER_SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..10].copy_from_slice(&self.count.to_le_bytes());
+        buf[10..12].copy_from_slice(&[0, 0]);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::HEADER_SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            count: u16::from_le_bytes([buf[8], buf[9]]),
+            _pad: 0,
+        })
+    }
+}
+
+/// Services list response header (devd → client)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ServicesListResponse {
+    pub header: QueryHeader,
+    /// Number of service entries following
+    pub count: u16,
+    pub _pad: u16,
+    // Followed by: count * ServiceEntry
+}
+
+impl ServicesListResponse {
+    pub const HEADER_SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, count: u16) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SERVICES_LIST, seq_id),
+            count,
+            _pad: 0,
+        }
+    }
+
+    pub fn header_to_bytes(&self) -> [u8; Self::HEADER_SIZE] {
+        let mut buf = [0u8; Self::HEADER_SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..10].copy_from_slice(&self.count.to_le_bytes());
+        buf[10..12].copy_from_slice(&[0, 0]);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::HEADER_SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            count: u16::from_le_bytes([buf[8], buf[9]]),
+            _pad: 0,
         })
     }
 }

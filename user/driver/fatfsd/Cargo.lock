@@ -7,7 +7,7 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
-name = "partition"
+name = "fatfsd"
 version = "0.1.0"
 dependencies = [
  "userlib",

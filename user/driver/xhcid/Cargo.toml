@@ -1,8 +1,8 @@
 [package]
-name = "qemu-usbd"
+name = "xhcid"
 version = "0.1.0"
 edition = "2021"
-description = "USB driver for QEMU virt (standard xHCI via PCI)"
+description = "xHCI USB host controller driver"
 
 [dependencies]
 userlib = { path = "../../userlib" }

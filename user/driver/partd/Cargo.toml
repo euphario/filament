@@ -1,7 +1,8 @@
 [package]
-name = "fatfs"
+name = "partd"
 version = "0.1.0"
 edition = "2024"
+description = "Partition table driver"
 
 [dependencies]
 userlib = { path = "../../userlib" }
@@ -9,5 +10,4 @@ userlib = { path = "../../userlib" }
 [profile.release]
 opt-level = "z"
 lto = true
-codegen-units = 1
 panic = "abort"

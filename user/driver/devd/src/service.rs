@@ -113,12 +113,25 @@ impl Dependency {
 // Service Definition (static config)
 // =============================================================================
 
+/// Port definition with name and type
+#[derive(Clone, Copy, Debug)]
+pub struct PortDef {
+    pub name: &'static [u8],
+    pub port_type: u8,
+}
+
+impl PortDef {
+    pub const fn new(name: &'static [u8], port_type: u8) -> Self {
+        Self { name, port_type }
+    }
+}
+
 /// Static service definition (compiled-in)
 pub struct ServiceDef {
     /// Binary name in initrd
     pub binary: &'static str,
-    /// Ports this service will register
-    pub registers: &'static [&'static [u8]],
+    /// Ports this service will register (with types)
+    pub registers: &'static [PortDef],
     /// Dependencies
     pub dependencies: &'static [Dependency],
     /// Auto-restart on crash?
@@ -127,18 +140,25 @@ pub struct ServiceDef {
     pub parent: Option<&'static str>,
 }
 
+// Port type constants for SERVICE_DEFS
+mod pt {
+    pub const CONSOLE: u8 = 6;
+    pub const SERVICE: u8 = 7;
+    pub const FILESYSTEM: u8 = 3;
+}
+
 /// Service definitions - the "service tree"
 pub static SERVICE_DEFS: &[ServiceDef] = &[
     ServiceDef {
         binary: "consoled",
-        registers: &[b"console:"],
+        registers: &[PortDef::new(b"console:", pt::CONSOLE)],
         dependencies: &[],  // devd: is implicit
         auto_restart: true,
         parent: None,
     },
     ServiceDef {
         binary: "vfsd",
-        registers: &[b"vfs:"],
+        registers: &[PortDef::new(b"vfs:", pt::FILESYSTEM)],
         dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
         auto_restart: true,
         parent: None,
@@ -154,16 +174,16 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
     // TODO: Make this conditional on platform detection (QEMU has ECAM, MT7988 has different)
     ServiceDef {
         binary: "pcied",
-        registers: &[b"pcie:"],  // PCI bus port
+        registers: &[PortDef::new(b"pcie:", pt::SERVICE)],  // PCI bus port
         dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
         auto_restart: false,
         parent: None,
     },
-    // QEMU USB driver - only works on QEMU virt platform
-    // TODO: Make this conditional on platform detection
+    // xHCI USB host controller driver
+    // TODO: Make this conditional on platform detection (QEMU has xHCI via PCI)
     ServiceDef {
-        binary: "qemu-usbd",
-        registers: &[],  // USB driver - doesn't register ports yet
+        binary: "xhcid",
+        registers: &[],  // Registers disk0: dynamically
         dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
         auto_restart: false,  // Don't restart on failure during testing
         parent: None,
@@ -176,7 +196,7 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
 
 /// A running or tracked service instance
 pub struct Service {
-    /// Index into SERVICE_DEFS
+    /// Index into SERVICE_DEFS (0xFF = dynamic service)
     pub def_index: u8,
     /// Current state
     pub state: ServiceState,
@@ -200,6 +220,8 @@ pub struct Service {
     pub total_restarts: u32,
     /// Restart timer (set when Crashed or Failed)
     pub restart_timer: Option<Timer>,
+    /// Name for dynamic services (when def_index == 0xFF)
+    pub dynamic_name: [u8; 16],
 }
 
 impl Service {
@@ -217,15 +239,41 @@ impl Service {
             last_change: 0,
             total_restarts: 0,
             restart_timer: None,
+            dynamic_name: [0; 16],
         }
     }
 
-    pub fn def(&self) -> &'static ServiceDef {
-        &SERVICE_DEFS[self.def_index as usize]
+    pub fn def(&self) -> Option<&'static ServiceDef> {
+        if (self.def_index as usize) < SERVICE_DEFS.len() {
+            Some(&SERVICE_DEFS[self.def_index as usize])
+        } else {
+            None
+        }
     }
 
-    pub fn name(&self) -> &'static str {
-        self.def().binary
+    /// Get service name (static or dynamic)
+    pub fn name(&self) -> &str {
+        if let Some(def) = self.def() {
+            def.binary
+        } else {
+            // Dynamic service - use stored name
+            let len = self.dynamic_name.iter().position(|&b| b == 0).unwrap_or(16);
+            core::str::from_utf8(&self.dynamic_name[..len]).unwrap_or("???")
+        }
+    }
+
+    /// Set dynamic name (for dynamic services)
+    pub fn set_dynamic_name(&mut self, name: &[u8]) {
+        let len = name.len().min(16);
+        self.dynamic_name[..len].copy_from_slice(&name[..len]);
+        if len < 16 {
+            self.dynamic_name[len..].fill(0);
+        }
+    }
+
+    /// Check if this is a dynamic service (no static definition)
+    pub fn is_dynamic(&self) -> bool {
+        self.def_index == 0xFF
     }
 
     /// Add a child service index
@@ -332,7 +380,7 @@ impl ServiceRegistry {
         // First pass: find parent indices
         for i in 0..self.count {
             if let Some(service) = &self.services[i] {
-                if let Some(parent_name) = service.def().parent {
+                if let Some(parent_name) = service.def().and_then(|d| d.parent) {
                     // Find parent index
                     let parent_idx = (0..self.count).find(|&j| {
                         self.services[j]
@@ -394,7 +442,7 @@ impl ServiceRegistry {
     /// Create a dynamic service slot for a spawned child
     ///
     /// Returns the slot index if successful, None if no slots available.
-    pub fn create_dynamic_service(&mut self, pid: u32, now: u64) -> Option<usize> {
+    pub fn create_dynamic_service(&mut self, pid: u32, name: &[u8], now: u64) -> Option<usize> {
         let slot_idx = self.find_empty_slot()?;
 
         // Create a new service in the slot
@@ -403,6 +451,7 @@ impl ServiceRegistry {
         service.state = ServiceState::Ready;  // Children are ready immediately
         service.last_change = now;
         service.def_index = 0xFF;  // No static definition
+        service.set_dynamic_name(name);
 
         self.services[slot_idx] = Some(service);
         self.ensure_count_includes(slot_idx);

@@ -250,6 +250,10 @@ fn execute_command(cmd: &[u8]) {
         builtins::devd::run(b"");
     } else if cmd_starts_with(cmd, b"devd ") {
         builtins::devd::run(&cmd[5..]);
+    } else if cmd_eq(cmd, b"drivers") {
+        builtins::drivers::run(b"").print();
+    } else if cmd_starts_with(cmd, b"drivers ") {
+        builtins::drivers::run(&cmd[8..]).print();
     } else if cmd_eq(cmd, b"handle") {
         builtins::handle::run(b"", &mut output::ShellOutput::new());
     } else if cmd_starts_with(cmd, b"handle ") {
@@ -424,6 +428,7 @@ fn cmd_help() {
         ("hw [path]", "Hardware info (list/bus/tree/<path>)"),
         ("handle", "Test handle API (timer/channel/poll)"),
         ("devd spawn", "Spawn driver via devd (with caps)"),
+        ("drivers", "Show driver/port tree (services, ports, shmem)"),
         ("lsdev [class]", "List registered devices"),
         ("devinfo <id>", "Get device info by ID"),
         ("devquery <id>", "Query driver (blockinfo/partition)"),
