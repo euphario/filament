@@ -136,7 +136,8 @@ impl FatfsDriver {
                 return Err(e);
             }
 
-            // Wait for response
+            // Wait for response (block until readable)
+            let _ = userlib::ipc::wait_one(channel.handle());
             let mut resp_buf = [0u8; 32];
             match channel.recv(&mut resp_buf) {
                 Ok(n) if n >= 8 => {
