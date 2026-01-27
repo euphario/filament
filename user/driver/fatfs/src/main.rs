@@ -23,7 +23,9 @@ use userlib::ipc::{Channel, Mux, MuxFilter};
 use userlib::devd::{DevdClient, DriverState};
 use userlib::vfs::{
     FsRegister, VfsHeader, fs_type, msg, error,
-    ListDir, DirEntries, DirEntry, file_type,
+    ListDir, ReadFile, MakeDir, Remove, WriteFile,
+    DirEntries, DirEntry, FileData, file_type,
+    Result as VfsResult,
 };
 use userlib::error::SysError;
 use userlib::sync::SingleThreadCell;
@@ -232,6 +234,10 @@ impl FatfsDriver {
 
         match header.msg_type {
             msg::FS_LIST => self.handle_fs_list(header.seq_id, &buf[..len]),
+            msg::FS_READ => self.handle_fs_read(header.seq_id, &buf[..len]),
+            msg::FS_WRITE => self.handle_fs_write(header.seq_id, &buf[..len]),
+            msg::FS_MKDIR => self.handle_fs_mkdir(header.seq_id, &buf[..len]),
+            msg::FS_REMOVE => self.handle_fs_remove(header.seq_id, &buf[..len]),
             msg::RESULT => {
                 // Ignore RESULT messages (response to our FS_REGISTER)
             }
@@ -279,6 +285,97 @@ impl FatfsDriver {
         }
 
         let _ = channel.send(&resp_buf[..offset]);
+    }
+
+    fn handle_fs_read(&mut self, seq_id: u32, buf: &[u8]) {
+        let channel = match self.vfs_channel.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let (_req, path) = match ReadFile::from_bytes(buf) {
+            Some(r) => r,
+            None => return,
+        };
+
+        flog!("FS_READ: {:?}", core::str::from_utf8(path));
+
+        // Return stub file content based on filename
+        // TODO: Actually read from FAT filesystem
+        let content: &[u8] = if path == b"/README.TXT" || path == b"README.TXT" {
+            b"Welcome to BPI-R4 FAT filesystem!\n\nThis is a stub implementation.\nReal FAT reading coming soon.\n"
+        } else if path == b"/CONFIG.SYS" || path == b"CONFIG.SYS" {
+            b"DEVICE=STUB.SYS\nBUFFERS=16\n"
+        } else {
+            // File not found - send error result
+            let resp = userlib::vfs::Result::new(seq_id, error::NOT_FOUND);
+            let _ = channel.send(&resp.to_bytes());
+            return;
+        };
+
+        // Build FILE_DATA response
+        let mut resp_buf = [0u8; 4096 + 64];
+        let resp = FileData::new(seq_id, content.len() as u32, true);
+        if let Some(len) = resp.write_to(&mut resp_buf, content) {
+            let _ = channel.send(&resp_buf[..len]);
+        }
+    }
+
+    fn handle_fs_write(&mut self, seq_id: u32, buf: &[u8]) {
+        let channel = match self.vfs_channel.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let (_req, path, data) = match WriteFile::from_bytes(buf) {
+            Some(r) => r,
+            None => return,
+        };
+
+        flog!("FS_WRITE: {:?} ({} bytes)", core::str::from_utf8(path), data.len());
+
+        // Stub: pretend write succeeded
+        // TODO: Actually write to FAT filesystem
+        let resp = VfsResult::new(seq_id, error::OK);
+        let _ = channel.send(&resp.to_bytes());
+    }
+
+    fn handle_fs_mkdir(&mut self, seq_id: u32, buf: &[u8]) {
+        let channel = match self.vfs_channel.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let (_req, path) = match MakeDir::from_bytes(buf) {
+            Some(r) => r,
+            None => return,
+        };
+
+        flog!("FS_MKDIR: {:?}", core::str::from_utf8(path));
+
+        // Stub: pretend mkdir succeeded
+        // TODO: Actually create directory in FAT filesystem
+        let resp = VfsResult::new(seq_id, error::OK);
+        let _ = channel.send(&resp.to_bytes());
+    }
+
+    fn handle_fs_remove(&mut self, seq_id: u32, buf: &[u8]) {
+        let channel = match self.vfs_channel.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let (_req, path) = match Remove::from_bytes(buf) {
+            Some(r) => r,
+            None => return,
+        };
+
+        flog!("FS_REMOVE: {:?}", core::str::from_utf8(path));
+
+        // Stub: pretend remove succeeded
+        // TODO: Actually remove from FAT filesystem
+        let resp = VfsResult::new(seq_id, error::OK);
+        let _ = channel.send(&resp.to_bytes());
     }
 }
 

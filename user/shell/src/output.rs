@@ -492,6 +492,54 @@ fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// Maximum size for raw byte output (cat, etc.)
+pub const MAX_BYTE_BUFFER: usize = 4096;
+
+/// Fixed-size buffer for raw file content
+pub struct ByteBuffer {
+    data: [u8; MAX_BYTE_BUFFER],
+    len: usize,
+}
+
+impl ByteBuffer {
+    /// Create a new empty buffer
+    pub const fn new() -> Self {
+        Self {
+            data: [0u8; MAX_BYTE_BUFFER],
+            len: 0,
+        }
+    }
+
+    /// Push bytes into buffer, returns number of bytes actually pushed
+    pub fn push(&mut self, data: &[u8]) -> usize {
+        let available = MAX_BYTE_BUFFER - self.len;
+        let to_copy = data.len().min(available);
+        self.data[self.len..self.len + to_copy].copy_from_slice(&data[..to_copy]);
+        self.len += to_copy;
+        to_copy
+    }
+
+    /// Get the buffer contents as a slice
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    /// Get the length
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Clear the buffer
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
 /// Result of a command - either a table or an error message
 pub enum CommandResult {
     /// Structured table output
@@ -500,6 +548,8 @@ pub enum CommandResult {
     Ok(&'static str),
     /// Error message
     Error(&'static str),
+    /// Raw byte output (for cat, etc.)
+    Bytes(ByteBuffer),
     /// Nothing to display (command handled its own output)
     None,
 }
@@ -522,6 +572,27 @@ impl CommandResult {
                 color::set(color::RED);
                 println!("{}", msg);
                 color::reset();
+            }
+            CommandResult::Bytes(buf) => {
+                // Print raw bytes, handling non-UTF8 gracefully
+                let data = buf.as_slice();
+                if let Ok(s) = core::str::from_utf8(data) {
+                    print!("{}", s);
+                } else {
+                    // Print byte-by-byte for binary data
+                    for &b in data {
+                        if b.is_ascii_graphic() || b == b' ' || b == b'\n' || b == b'\r' || b == b'\t' {
+                            crate::console::write(&[b]);
+                        } else {
+                            // Non-printable: show as dot
+                            crate::console::write(b".");
+                        }
+                    }
+                }
+                // Ensure newline at end if content doesn't end with one
+                if !data.is_empty() && data[data.len() - 1] != b'\n' {
+                    println!();
+                }
             }
             CommandResult::None => {}
         }

@@ -412,6 +412,194 @@ impl Stat {
     }
 }
 
+/// Make directory request
+#[repr(C)]
+pub struct MakeDir {
+    pub header: VfsHeader,
+    pub path_len: u16,
+    pub _pad: u16,
+    // Followed by: path bytes
+}
+
+impl MakeDir {
+    pub const HEADER_SIZE: usize = VfsHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32) -> Self {
+        Self {
+            header: VfsHeader::new(msg::MAKE_DIR, seq_id),
+            path_len: 0,
+            _pad: 0,
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], path: &[u8]) -> Option<usize> {
+        let total = Self::HEADER_SIZE + path.len();
+        if buf.len() < total {
+            return None;
+        }
+        buf[0..VfsHeader::SIZE].copy_from_slice(&self.header.to_bytes());
+        buf[VfsHeader::SIZE..VfsHeader::SIZE + 2].copy_from_slice(&(path.len() as u16).to_le_bytes());
+        buf[VfsHeader::SIZE + 2..VfsHeader::SIZE + 4].copy_from_slice(&[0, 0]);
+        buf[Self::HEADER_SIZE..total].copy_from_slice(path);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::HEADER_SIZE {
+            return None;
+        }
+        let header = VfsHeader::from_bytes(buf)?;
+        let path_len = u16::from_le_bytes([buf[VfsHeader::SIZE], buf[VfsHeader::SIZE + 1]]) as usize;
+        if buf.len() < Self::HEADER_SIZE + path_len {
+            return None;
+        }
+        let path = &buf[Self::HEADER_SIZE..Self::HEADER_SIZE + path_len];
+        Some((Self { header, path_len: path_len as u16, _pad: 0 }, path))
+    }
+}
+
+/// Remove file/directory request
+#[repr(C)]
+pub struct Remove {
+    pub header: VfsHeader,
+    pub path_len: u16,
+    pub flags: u8,      // REMOVE_FILE, REMOVE_DIR, REMOVE_RECURSIVE
+    pub _pad: u8,
+    // Followed by: path bytes
+}
+
+pub mod remove_flags {
+    pub const FILE: u8 = 0x01;      // Remove file
+    pub const DIR: u8 = 0x02;       // Remove empty directory
+    pub const RECURSIVE: u8 = 0x04; // Remove directory recursively
+}
+
+impl Remove {
+    pub const HEADER_SIZE: usize = VfsHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, flags: u8) -> Self {
+        Self {
+            header: VfsHeader::new(msg::REMOVE, seq_id),
+            path_len: 0,
+            flags,
+            _pad: 0,
+        }
+    }
+
+    pub fn file(seq_id: u32) -> Self {
+        Self::new(seq_id, remove_flags::FILE)
+    }
+
+    pub fn dir(seq_id: u32) -> Self {
+        Self::new(seq_id, remove_flags::DIR)
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], path: &[u8]) -> Option<usize> {
+        let total = Self::HEADER_SIZE + path.len();
+        if buf.len() < total {
+            return None;
+        }
+        buf[0..VfsHeader::SIZE].copy_from_slice(&self.header.to_bytes());
+        buf[VfsHeader::SIZE] = (path.len() & 0xFF) as u8;
+        buf[VfsHeader::SIZE + 1] = ((path.len() >> 8) & 0xFF) as u8;
+        buf[VfsHeader::SIZE + 2] = self.flags;
+        buf[VfsHeader::SIZE + 3] = 0;
+        buf[Self::HEADER_SIZE..total].copy_from_slice(path);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::HEADER_SIZE {
+            return None;
+        }
+        let header = VfsHeader::from_bytes(buf)?;
+        let path_len = u16::from_le_bytes([buf[VfsHeader::SIZE], buf[VfsHeader::SIZE + 1]]) as usize;
+        let flags = buf[VfsHeader::SIZE + 2];
+        if buf.len() < Self::HEADER_SIZE + path_len {
+            return None;
+        }
+        let path = &buf[Self::HEADER_SIZE..Self::HEADER_SIZE + path_len];
+        Some((Self { header, path_len: path_len as u16, flags, _pad: 0 }, path))
+    }
+}
+
+/// Write file request
+#[repr(C)]
+pub struct WriteFile {
+    pub header: VfsHeader,
+    pub path_len: u16,
+    pub flags: u8,      // CREATE, TRUNCATE, APPEND
+    pub _pad: u8,
+    pub offset: u64,
+    pub data_len: u32,
+    pub _pad2: u32,
+    // Followed by: path bytes, then data bytes
+}
+
+pub mod write_flags {
+    pub const CREATE: u8 = 0x01;    // Create if doesn't exist
+    pub const TRUNCATE: u8 = 0x02;  // Truncate existing file
+    pub const APPEND: u8 = 0x04;    // Append to file (ignore offset)
+}
+
+impl WriteFile {
+    pub const HEADER_SIZE: usize = VfsHeader::SIZE + 20;
+
+    pub fn new(seq_id: u32, offset: u64, flags: u8) -> Self {
+        Self {
+            header: VfsHeader::new(msg::WRITE_FILE, seq_id),
+            path_len: 0,
+            flags,
+            _pad: 0,
+            offset,
+            data_len: 0,
+            _pad2: 0,
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], path: &[u8], data: &[u8]) -> Option<usize> {
+        let total = Self::HEADER_SIZE + path.len() + data.len();
+        if buf.len() < total {
+            return None;
+        }
+        buf[0..VfsHeader::SIZE].copy_from_slice(&self.header.to_bytes());
+        buf[VfsHeader::SIZE..VfsHeader::SIZE + 2].copy_from_slice(&(path.len() as u16).to_le_bytes());
+        buf[VfsHeader::SIZE + 2] = self.flags;
+        buf[VfsHeader::SIZE + 3] = 0;
+        buf[VfsHeader::SIZE + 4..VfsHeader::SIZE + 12].copy_from_slice(&self.offset.to_le_bytes());
+        buf[VfsHeader::SIZE + 12..VfsHeader::SIZE + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        buf[VfsHeader::SIZE + 16..VfsHeader::SIZE + 20].copy_from_slice(&[0, 0, 0, 0]);
+        buf[Self::HEADER_SIZE..Self::HEADER_SIZE + path.len()].copy_from_slice(path);
+        buf[Self::HEADER_SIZE + path.len()..total].copy_from_slice(data);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8], &[u8])> {
+        if buf.len() < Self::HEADER_SIZE {
+            return None;
+        }
+        let header = VfsHeader::from_bytes(buf)?;
+        let path_len = u16::from_le_bytes([buf[VfsHeader::SIZE], buf[VfsHeader::SIZE + 1]]) as usize;
+        let flags = buf[VfsHeader::SIZE + 2];
+        let offset = u64::from_le_bytes([
+            buf[VfsHeader::SIZE + 4], buf[VfsHeader::SIZE + 5],
+            buf[VfsHeader::SIZE + 6], buf[VfsHeader::SIZE + 7],
+            buf[VfsHeader::SIZE + 8], buf[VfsHeader::SIZE + 9],
+            buf[VfsHeader::SIZE + 10], buf[VfsHeader::SIZE + 11],
+        ]);
+        let data_len = u32::from_le_bytes([
+            buf[VfsHeader::SIZE + 12], buf[VfsHeader::SIZE + 13],
+            buf[VfsHeader::SIZE + 14], buf[VfsHeader::SIZE + 15],
+        ]) as usize;
+        if buf.len() < Self::HEADER_SIZE + path_len + data_len {
+            return None;
+        }
+        let path = &buf[Self::HEADER_SIZE..Self::HEADER_SIZE + path_len];
+        let data = &buf[Self::HEADER_SIZE + path_len..Self::HEADER_SIZE + path_len + data_len];
+        Some((Self { header, path_len: path_len as u16, flags, _pad: 0, offset, data_len: data_len as u32, _pad2: 0 }, path, data))
+    }
+}
+
 // =============================================================================
 // vfsd → shell Responses
 // =============================================================================

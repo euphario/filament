@@ -3,12 +3,15 @@
 //! List directory contents.
 //!
 //! Usage:
-//!   ls              - List /bin directory
+//!   ls              - List current directory
+//!   ls /            - List root (shows /bin, /mnt)
+//!   ls /bin         - List embedded binaries
 //!   ls /mnt         - List mounted filesystems
 //!   ls /mnt/fat0    - List FAT filesystem root
 
 use crate::println;
 use crate::output::{Table, Row, Align, CommandResult};
+use crate::cwd::MAX_PATH;
 use userlib::ipc::Channel;
 use userlib::vfs::{ListDir, DirEntries, DirEntry, VfsHeader, msg, file_type};
 
@@ -27,21 +30,52 @@ const KNOWN_BINARIES: &[&str] = &[
 pub fn run(args: &[u8]) -> CommandResult {
     let path = crate::trim(args);
 
-    // Default to /bin if no path given
-    let path = if path.is_empty() { b"/bin" as &[u8] } else { path };
+    // Use cwd if no path given
+    let resolved_path: &[u8] = if path.is_empty() {
+        crate::get_cwd().as_bytes()
+    } else if path[0] != b'/' {
+        // Relative path - resolve against cwd
+        // For now, just prepend cwd (proper resolution in cwd.rs)
+        static mut RESOLVED: [u8; MAX_PATH] = [0u8; MAX_PATH];
+        let resolved = unsafe { &mut *core::ptr::addr_of_mut!(RESOLVED) };
+        match crate::get_cwd().resolve(path, resolved) {
+            Some(p) => p,
+            None => {
+                println!("ls: invalid path");
+                return CommandResult::None;
+            }
+        }
+    } else {
+        path
+    };
 
-    // Check if this is a VFS path
-    if path.starts_with(b"/mnt") {
-        return ls_vfs(path);
+    // Route based on path
+    if resolved_path == b"/" {
+        return ls_root();
     }
 
-    // Built-in /bin listing
-    if path == b"/bin" || path == b"bin" || path == b"." {
+    if resolved_path == b"/bin" || resolved_path.starts_with(b"/bin/") {
         return ls_bin();
     }
 
-    println!("ls: unknown path, try /bin or /mnt");
+    if resolved_path == b"/mnt" || resolved_path.starts_with(b"/mnt") {
+        return ls_vfs(resolved_path);
+    }
+
+    println!("ls: path not found");
     CommandResult::None
+}
+
+/// List root directory (virtual)
+fn ls_root() -> CommandResult {
+    let mut table = Table::new(&["TYPE", "NAME"])
+        .align(0, Align::Left);
+
+    // Root contains /bin and /mnt
+    table.add_row(Row::empty().str("dir").str("bin"));
+    table.add_row(Row::empty().str("dir").str("mnt"));
+
+    CommandResult::Table(table)
 }
 
 /// List /bin directory (hardcoded)

@@ -24,7 +24,7 @@ use userlib::syscall::{self, LogLevel, Handle};
 use userlib::ipc::{Port, Mux, MuxFilter};
 use userlib::vfs::{
     VfsHeader, msg, error, file_type,
-    ListDir, ReadFile, CopyFile, Stat,
+    ListDir, ReadFile, CopyFile, Stat, MakeDir, Remove, WriteFile,
     DirEntries, DirEntry, FileData, FileInfo, Result as VfsResult,
     FsRegister,
 };
@@ -336,8 +336,11 @@ impl Vfsd {
             // Shell commands
             msg::LIST_DIR => self.handle_list_dir(slot, header.seq_id, &msg_buf[..len]),
             msg::READ_FILE => self.handle_read_file(slot, header.seq_id, &msg_buf[..len]),
+            msg::WRITE_FILE => self.handle_write_file(slot, header.seq_id, &msg_buf[..len]),
             msg::STAT => self.handle_stat(slot, header.seq_id, &msg_buf[..len]),
             msg::COPY_FILE => self.handle_copy_file(slot, header.seq_id, &msg_buf[..len]),
+            msg::MAKE_DIR => self.handle_make_dir(slot, header.seq_id, &msg_buf[..len]),
+            msg::REMOVE => self.handle_remove(slot, header.seq_id, &msg_buf[..len]),
 
             _ => {
                 vlog!("unknown message type: {}", header.msg_type);
@@ -488,7 +491,7 @@ impl Vfsd {
     }
 
     fn handle_read_file(&mut self, client_slot: usize, seq_id: u32, buf: &[u8]) {
-        let (_req, path) = match ReadFile::from_bytes(buf) {
+        let (req, path) = match ReadFile::from_bytes(buf) {
             Some(r) => r,
             None => {
                 self.send_result(client_slot, seq_id, error::INVALID_PATH);
@@ -505,15 +508,53 @@ impl Vfsd {
             }
         };
 
-        // TODO: Forward to fatfs and stream data back
-        // For now, return empty file
-        let resp = FileData::new(seq_id, 0, true);
-        let mut resp_buf = [0u8; 64];
-        if let Some(len) = resp.write_to(&mut resp_buf, &[]) {
-            self.send_to_client(client_slot, &resp_buf[..len]);
+        // Get relative path within mount
+        let mount = &self.mounts[mount_idx];
+        let rel_path = mount.relative_path(path);
+        let fs_handle = mount.handle;
+
+        if !fs_handle.is_valid() {
+            self.send_result(client_slot, seq_id, error::IO_ERROR);
+            return;
         }
 
-        let _ = mount_idx;
+        // Build FS_READ request to forward to fatfs
+        let fs_req = ReadFile {
+            header: VfsHeader::new(msg::FS_READ, seq_id),
+            path_len: rel_path.len() as u16,
+            _pad: 0,
+            offset: req.offset,
+            len: req.len,
+            _pad2: 0,
+        };
+        let mut req_buf = [0u8; 256];
+        if let Some(len) = fs_req.write_to(&mut req_buf, rel_path) {
+            // Send to fatfs
+            if syscall::write(fs_handle, &req_buf[..len]).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
+            // Wait for response from fatfs
+            if userlib::ipc::wait_one(fs_handle).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
+            // Use transfer buffer for larger responses
+            let mut resp_buf = [0u8; 4096 + 64];
+            match syscall::read(fs_handle, &mut resp_buf) {
+                Ok(n) if n > 0 => {
+                    // Forward response to client
+                    self.send_to_client(client_slot, &resp_buf[..n]);
+                }
+                _ => {
+                    self.send_result(client_slot, seq_id, error::IO_ERROR);
+                }
+            }
+        } else {
+            self.send_result(client_slot, seq_id, error::INVALID_PATH);
+        }
     }
 
     fn handle_stat(&mut self, client_slot: usize, seq_id: u32, buf: &[u8]) {
@@ -576,6 +617,191 @@ impl Vfsd {
             core::str::from_utf8(dst_path));
 
         self.send_result(client_slot, seq_id, error::IO_ERROR);
+    }
+
+    fn handle_make_dir(&mut self, client_slot: usize, seq_id: u32, buf: &[u8]) {
+        let (_req, path) = match MakeDir::from_bytes(buf) {
+            Some(r) => r,
+            None => {
+                self.send_result(client_slot, seq_id, error::INVALID_PATH);
+                return;
+            }
+        };
+
+        // Find mount for this path
+        let mount_idx = match self.find_mount(path) {
+            Some(idx) => idx,
+            None => {
+                self.send_result(client_slot, seq_id, error::NOT_MOUNTED);
+                return;
+            }
+        };
+
+        // Get relative path and forward to fatfs
+        let mount = &self.mounts[mount_idx];
+        let rel_path = mount.relative_path(path);
+        let fs_handle = mount.handle;
+
+        if !fs_handle.is_valid() {
+            self.send_result(client_slot, seq_id, error::IO_ERROR);
+            return;
+        }
+
+        // Build FS_MKDIR request
+        let fs_req = MakeDir {
+            header: VfsHeader::new(msg::FS_MKDIR, seq_id),
+            path_len: rel_path.len() as u16,
+            _pad: 0,
+        };
+        let mut req_buf = [0u8; 256];
+        if let Some(len) = fs_req.write_to(&mut req_buf, rel_path) {
+            if syscall::write(fs_handle, &req_buf[..len]).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
+            if userlib::ipc::wait_one(fs_handle).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
+            let mut resp_buf = [0u8; 32];
+            match syscall::read(fs_handle, &mut resp_buf) {
+                Ok(n) if n > 0 => {
+                    self.send_to_client(client_slot, &resp_buf[..n]);
+                }
+                _ => {
+                    self.send_result(client_slot, seq_id, error::IO_ERROR);
+                }
+            }
+        } else {
+            self.send_result(client_slot, seq_id, error::INVALID_PATH);
+        }
+    }
+
+    fn handle_remove(&mut self, client_slot: usize, seq_id: u32, buf: &[u8]) {
+        let (req, path) = match Remove::from_bytes(buf) {
+            Some(r) => r,
+            None => {
+                self.send_result(client_slot, seq_id, error::INVALID_PATH);
+                return;
+            }
+        };
+
+        // Find mount for this path
+        let mount_idx = match self.find_mount(path) {
+            Some(idx) => idx,
+            None => {
+                self.send_result(client_slot, seq_id, error::NOT_MOUNTED);
+                return;
+            }
+        };
+
+        // Get relative path and forward to fatfs
+        let mount = &self.mounts[mount_idx];
+        let rel_path = mount.relative_path(path);
+        let fs_handle = mount.handle;
+
+        if !fs_handle.is_valid() {
+            self.send_result(client_slot, seq_id, error::IO_ERROR);
+            return;
+        }
+
+        // Build FS_REMOVE request
+        let fs_req = Remove {
+            header: VfsHeader::new(msg::FS_REMOVE, seq_id),
+            path_len: rel_path.len() as u16,
+            flags: req.flags,
+            _pad: 0,
+        };
+        let mut req_buf = [0u8; 256];
+        if let Some(len) = fs_req.write_to(&mut req_buf, rel_path) {
+            if syscall::write(fs_handle, &req_buf[..len]).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
+            if userlib::ipc::wait_one(fs_handle).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
+            let mut resp_buf = [0u8; 32];
+            match syscall::read(fs_handle, &mut resp_buf) {
+                Ok(n) if n > 0 => {
+                    self.send_to_client(client_slot, &resp_buf[..n]);
+                }
+                _ => {
+                    self.send_result(client_slot, seq_id, error::IO_ERROR);
+                }
+            }
+        } else {
+            self.send_result(client_slot, seq_id, error::INVALID_PATH);
+        }
+    }
+
+    fn handle_write_file(&mut self, client_slot: usize, seq_id: u32, buf: &[u8]) {
+        let (req, path, data) = match WriteFile::from_bytes(buf) {
+            Some(r) => r,
+            None => {
+                self.send_result(client_slot, seq_id, error::INVALID_PATH);
+                return;
+            }
+        };
+
+        // Find mount for this path
+        let mount_idx = match self.find_mount(path) {
+            Some(idx) => idx,
+            None => {
+                self.send_result(client_slot, seq_id, error::NOT_MOUNTED);
+                return;
+            }
+        };
+
+        // Get relative path and forward to fatfs
+        let mount = &self.mounts[mount_idx];
+        let rel_path = mount.relative_path(path);
+        let fs_handle = mount.handle;
+
+        if !fs_handle.is_valid() {
+            self.send_result(client_slot, seq_id, error::IO_ERROR);
+            return;
+        }
+
+        // Build FS_WRITE request
+        let fs_req = WriteFile {
+            header: VfsHeader::new(msg::FS_WRITE, seq_id),
+            path_len: rel_path.len() as u16,
+            flags: req.flags,
+            _pad: 0,
+            offset: req.offset,
+            data_len: data.len() as u32,
+            _pad2: 0,
+        };
+        let mut req_buf = [0u8; 4096 + 256];
+        if let Some(len) = fs_req.write_to(&mut req_buf, rel_path, data) {
+            if syscall::write(fs_handle, &req_buf[..len]).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
+            if userlib::ipc::wait_one(fs_handle).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
+            let mut resp_buf = [0u8; 32];
+            match syscall::read(fs_handle, &mut resp_buf) {
+                Ok(n) if n > 0 => {
+                    self.send_to_client(client_slot, &resp_buf[..n]);
+                }
+                _ => {
+                    self.send_result(client_slot, seq_id, error::IO_ERROR);
+                }
+            }
+        } else {
+            self.send_result(client_slot, seq_id, error::INVALID_PATH);
+        }
     }
 
     fn find_mount(&self, path: &[u8]) -> Option<usize> {

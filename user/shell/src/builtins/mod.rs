@@ -6,14 +6,16 @@
 //! To disable a builtin, simply comment out its `pub mod` line and the
 //! corresponding match arm in main.rs.
 
+pub mod cat;
+pub mod cp;
 pub mod devd;
 pub mod gpio;
 pub mod handle;
 pub mod hw;
 pub mod ls;
 pub mod lsdev;
+pub mod mkdir;
+pub mod mv;
 pub mod ps;
-
-// Future builtins:
-// pub mod fan;
-// pub mod jobs;
+pub mod rm;
+pub mod rmdir;

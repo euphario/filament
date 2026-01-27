@@ -10,6 +10,7 @@ mod builtins;
 mod color;
 mod completion;
 mod console;
+mod cwd;
 mod input_box;
 mod output;
 mod readline;
@@ -53,6 +54,9 @@ static mut BG_PIDS: [u32; MAX_BG_JOBS] = [0; MAX_BG_JOBS];
 /// Retry counter for console connection
 static mut CONSOLE_RETRY: u8 = 0;
 
+/// Current working directory
+static mut CWD: cwd::WorkingDir = cwd::WorkingDir::new();
+
 #[unsafe(no_mangle)]
 fn main() {
     // Initialize console connection (falls back to direct UART if consoled not available)
@@ -86,10 +90,16 @@ fn main() {
             }
         }
 
-        // Draw prompt
+        // Draw prompt with cwd
         color::set(color::BOLD);
+        color::set(color::BLUE);
+        let cwd_str = unsafe {
+            let cwd = &*core::ptr::addr_of!(CWD);
+            cwd.as_bytes()
+        };
+        console::write(cwd_str);
         color::set(color::GREEN);
-        console::write(b"> ");
+        console::write(b" > ");
         color::reset();
 
         // Read a line using readline with history
@@ -179,6 +189,12 @@ fn execute_command(cmd: &[u8]) {
     } else if cmd_eq(cmd, b"exit") || cmd_eq(cmd, b"quit") || cmd_eq(cmd, b"q") {
         println!("Goodbye!");
         syscall::exit(0);
+    } else if cmd_eq(cmd, b"pwd") {
+        cmd_pwd();
+    } else if cmd_eq(cmd, b"cd") {
+        cmd_cd(b"");
+    } else if cmd_starts_with(cmd, b"cd ") {
+        cmd_cd(&cmd[3..]);
     } else if cmd_eq(cmd, b"pid") {
         cmd_pid();
     } else if cmd_eq(cmd, b"uptime") {
@@ -254,6 +270,16 @@ fn execute_command(cmd: &[u8]) {
         builtins::lsdev::cmd_devquery(&cmd[9..]);
     } else if cmd_starts_with(cmd, b"cat ") {
         cmd_cat(&cmd[4..]);
+    } else if cmd_starts_with(cmd, b"mkdir ") {
+        builtins::mkdir::run(&cmd[6..]).print();
+    } else if cmd_starts_with(cmd, b"rmdir ") {
+        builtins::rmdir::run(&cmd[6..]).print();
+    } else if cmd_starts_with(cmd, b"rm ") {
+        builtins::rm::run(&cmd[3..]).print();
+    } else if cmd_starts_with(cmd, b"cp ") {
+        builtins::cp::run(&cmd[3..]).print();
+    } else if cmd_starts_with(cmd, b"mv ") {
+        builtins::mv::run(&cmd[3..]).print();
     } else {
         // Try to run as a binary from bin/ directory
         try_run_binary(cmd);
@@ -375,12 +401,19 @@ fn cmd_help() {
     let commands: &[(&str, &str)] = &[
         ("help, ?", "Show this help"),
         ("exit, quit", "Exit the shell"),
+        ("pwd", "Print working directory"),
+        ("cd [path]", "Change directory"),
         ("pid", "Show current process ID"),
         ("uptime", "Show system uptime"),
         ("mem", "Test memory allocation"),
         ("echo <msg>", "Echo a message"),
-        ("ls [path]", "List directory (default: /bin)"),
+        ("ls [path]", "List directory (default: cwd)"),
         ("cat <path>", "Display file contents"),
+        ("mkdir <path>", "Create directory"),
+        ("rmdir <path>", "Remove empty directory"),
+        ("rm <path>", "Remove file"),
+        ("cp <src> <dst>", "Copy file"),
+        ("mv <src> <dst>", "Move/rename file"),
         ("spawn <id>", "Spawn process by ELF ID"),
         ("usb", "Run USB userspace driver"),
         ("gpio [cmd]", "GPIO control (try 'gpio help')"),
@@ -869,7 +902,6 @@ fn cmd_resize() {
 }
 
 /// Display file contents
-/// Note: Currently not implemented. Would need vfsd's ReadToShmem protocol.
 fn cmd_cat(path_arg: &[u8]) {
     let path = trim(path_arg);
 
@@ -878,9 +910,53 @@ fn cmd_cat(path_arg: &[u8]) {
         return;
     }
 
-    // File reading requires vfsd's ReadToShmem protocol (not yet implemented)
-    // For now, show files via 'ls' and run binaries directly
-    println!("cat: file reading not implemented");
-    println!("Hint: Use 'ls' to list files, run binaries by name");
+    // Resolve path relative to cwd
+    let mut resolved = [0u8; cwd::MAX_PATH];
+    let full_path = unsafe {
+        let cwd = &*core::ptr::addr_of!(CWD);
+        cwd.resolve(path, &mut resolved)
+    };
+
+    let full_path = match full_path {
+        Some(p) => p,
+        None => {
+            println!("cat: invalid path");
+            return;
+        }
+    };
+
+    // Use the cat builtin
+    builtins::cat::run(full_path).print();
+}
+
+/// Print working directory
+fn cmd_pwd() {
+    let path = unsafe {
+        let cwd = &*core::ptr::addr_of!(CWD);
+        cwd.as_str()
+    };
+    match path {
+        Some(p) => println!("{}", p),
+        None => println!("/"),
+    }
+}
+
+/// Change directory
+fn cmd_cd(path_arg: &[u8]) {
+    let path = trim(path_arg);
+
+    let success = unsafe {
+        let cwd = &mut *core::ptr::addr_of_mut!(CWD);
+        cwd.cd(path)
+    };
+
+    if !success {
+        println!("cd: invalid path");
+    }
+}
+
+/// Get current working directory (for use by builtins)
+pub fn get_cwd() -> &'static cwd::WorkingDir {
+    unsafe { &*core::ptr::addr_of!(CWD) }
 }
 
