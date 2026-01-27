@@ -147,8 +147,9 @@ impl ObjectType {
     }
 
     /// Does this type support read()?
+    /// DmaPool: read returns paddr + size (16 bytes)
     pub fn is_readable(&self) -> bool {
-        !matches!(self, ObjectType::Stdout | ObjectType::Stderr | ObjectType::DmaPool | ObjectType::Mmio)
+        !matches!(self, ObjectType::Stdout | ObjectType::Stderr | ObjectType::Mmio)
     }
 
     /// Does this type support write()?

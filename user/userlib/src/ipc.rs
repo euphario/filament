@@ -472,11 +472,12 @@ impl EventLoop {
 // Shmem - Shared memory
 // ============================================================================
 
-/// Shared memory region
+/// Shared memory region with DMA support
 pub struct Shmem {
     handle: ObjHandle,
     shmem_id: u32,
     vaddr: u64,
+    paddr: u64,
     size: usize,
 }
 
@@ -487,10 +488,18 @@ impl Shmem {
         let (handle, shmem_id) = crate::syscall::open_shmem_create(size)?;
         // After open, use map() to get the address
         let vaddr = map(handle, 0)?;
+        // Query physical address via read (16-byte buffer returns paddr+size)
+        let mut info = [0u8; 16];
+        read(handle, &mut info)?;
+        let paddr = u64::from_le_bytes([
+            info[0], info[1], info[2], info[3],
+            info[4], info[5], info[6], info[7],
+        ]);
         Ok(Self {
             handle,
             shmem_id,
             vaddr,
+            paddr,
             size,
         })
     }
@@ -499,18 +508,30 @@ impl Shmem {
     pub fn open_existing(shmem_id: u32) -> SysResult<Self> {
         let handle = open(ObjectType::Shmem, &shmem_id.to_le_bytes())?;
         let vaddr = map(handle, 0)?;
-        // Size is not known for existing regions, could query from kernel
+        // Query physical address and size via read (16-byte buffer)
+        let mut info = [0u8; 16];
+        read(handle, &mut info)?;
+        let paddr = u64::from_le_bytes([
+            info[0], info[1], info[2], info[3],
+            info[4], info[5], info[6], info[7],
+        ]);
+        let size = u64::from_le_bytes([
+            info[8], info[9], info[10], info[11],
+            info[12], info[13], info[14], info[15],
+        ]) as usize;
         Ok(Self {
             handle,
             shmem_id,
             vaddr,
-            size: 0, // Unknown
+            paddr,
+            size,
         })
     }
 
     pub fn handle(&self) -> ObjHandle { self.handle }
     pub fn shmem_id(&self) -> u32 { self.shmem_id }
     pub fn vaddr(&self) -> u64 { self.vaddr }
+    pub fn paddr(&self) -> u64 { self.paddr }
     pub fn size(&self) -> usize { self.size }
 
     /// Get a pointer to the shared memory
@@ -529,7 +550,9 @@ impl Shmem {
 
     /// Wait for notification (blocking)
     pub fn wait(&self, timeout_ms: u32) -> SysResult<()> {
-        read(self.handle, &mut timeout_ms.to_le_bytes())?;
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&timeout_ms.to_le_bytes());
+        read(self.handle, &mut buf)?;
         Ok(())
     }
 

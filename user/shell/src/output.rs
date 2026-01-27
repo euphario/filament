@@ -47,10 +47,11 @@ impl Output for ShellOutput {
 pub const MAX_COLS: usize = 8;
 
 /// Maximum rows per table (for static allocation)
-pub const MAX_ROWS: usize = 64;
+/// Note: Keep this small - Table lives on stack! 16 rows * ~400 bytes/row = ~6KB
+pub const MAX_ROWS: usize = 16;
 
 /// Maximum string length in a cell
-pub const MAX_CELL_STR: usize = 32;
+pub const MAX_CELL_STR: usize = 24;
 
 /// Cell value types
 #[derive(Clone, Copy)]

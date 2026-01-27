@@ -40,11 +40,11 @@ use super::ipc::{Message, MessageHeader, MessageType, MAX_INLINE_PAYLOAD, waker,
 use super::task::SleepReason;
 
 /// How often to check liveness (in timer IRQs, ~100/sec)
-/// Note: Timer tick rate varies. Using high value to reduce spam.
-pub const LIVENESS_CHECK_INTERVAL: u64 = 10000; // Every ~100 seconds
+/// Check every ~1 second for quicker detection
+pub const LIVENESS_CHECK_INTERVAL: u64 = 100; // Every ~1 second
 
 /// How long a process can be idle-waiting before we ping it (in nanoseconds)
-pub const PING_INTERVAL_NS: u64 = 30 * 1_000_000_000; // 30 seconds
+pub const PING_INTERVAL_NS: u64 = 10 * 1_000_000_000; // 10 seconds
 
 /// How long to wait for pong response (in nanoseconds)
 pub const PING_TIMEOUT_NS: u64 = 10 * 1_000_000_000; // 10 seconds
@@ -196,8 +196,8 @@ struct PendingNotification {
 /// Counter for periodic logging (not the hardware counter, which is MHz)
 static mut LOG_CALL_COUNT: u64 = 0;
 
-/// Log every N check_liveness calls (~30 seconds at 1 call/second)
-const LOG_INTERVAL_CALLS: u64 = 3;  // Every ~3 seconds for debugging
+/// Log every N check_liveness calls
+const LOG_INTERVAL_CALLS: u64 = 5;  // Every ~5 seconds (with 1 call/second)
 
 /// Check liveness of all waiting tasks
 /// Called periodically from timer tick (not every tick, use counter)

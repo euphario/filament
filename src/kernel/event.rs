@@ -64,6 +64,8 @@ pub enum EventType {
     KlogReady = 8,
     /// Shared memory region is being destroyed (owner died)
     ShmemInvalid = 9,
+    /// Shared memory mapper left (mapper died) - notifies owner
+    ShmemMapperLeft = 10,
 }
 
 /// Unified event filter - what to wait for (BSD kqueue-inspired)
@@ -244,6 +246,17 @@ impl Event {
             data: shmem_id as u64,
             flags: 0,
             source_pid: owner_pid,
+        }
+    }
+
+    /// Shared memory mapper left (mapper died) - notifies owner
+    /// data = shmem_id, source_pid = mapper_pid who died
+    pub fn shmem_mapper_left(shmem_id: u32, mapper_pid: u32) -> Self {
+        Self {
+            event_type: EventType::ShmemMapperLeft,
+            data: shmem_id as u64,
+            flags: 0,
+            source_pid: mapper_pid,
         }
     }
 

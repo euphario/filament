@@ -244,21 +244,26 @@ pub fn wake(list: &WakeList, _reason: WakeReason) {
 
 /// Wake a single subscriber
 ///
-/// SERIALIZATION: Uses with_scheduler() which provides both:
-/// 1. IRQ disabling on this CPU
-/// 2. Proper serialization for SMP safety
+/// SERIALIZATION: Uses try_scheduler() to avoid deadlock when called from
+/// contexts that already hold the scheduler lock (e.g., reap_terminated).
+/// If lock is held, defers wake via request_wake.
 fn wake_one(sub: &Subscriber) {
-    task::with_scheduler(|sched| {
+    // Use try_scheduler to avoid deadlock if called from reap_terminated
+    if let Some(mut sched) = task::try_scheduler() {
         // Use unified wake function that handles IPC return values,
         // liveness state reset, and state validation
         sched.wake_by_pid(sub.task_id);
-    });
+    } else {
+        // Lock held - defer the wake
+        crate::arch::aarch64::sync::cpu_flags().request_wake(sub.task_id);
+    }
 }
 
 /// Wake a task by PID directly (for compatibility)
 ///
 /// Prefer using WakeList when possible.
-/// SERIALIZATION: Uses with_scheduler internally for SMP safety.
+/// SERIALIZATION: Uses try_scheduler internally for SMP safety.
+/// If scheduler lock is held, defers wake.
 pub fn wake_pid(pid: u32) {
     wake_one(&Subscriber::simple(pid));
 }

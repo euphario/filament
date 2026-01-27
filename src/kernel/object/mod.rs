@@ -41,7 +41,7 @@
 //! | **Process** | spawn binary | wait for exit | kill | - |
 //! | **Port** | register name | accept connection | - | - |
 //! | **Shmem** | create region | - | - | ✓ |
-//! | **DmaPool** | allocate | - | - | ✓ |
+//! | **DmaPool** | allocate | get paddr/size | - | ✓ |
 //! | **Mmio** | request region | - | - | ✓ |
 //! | **Console** | get stdin/out | read input | write output | - |
 //! | **Klog** | create | read log lines | - | - |
@@ -1217,6 +1217,23 @@ impl Pollable for RingObject {
         }
 
         let mut ready = 0u8;
+
+        // Check CLOSED first - if peer died, report closed
+        if (filter & poll::CLOSED) != 0 {
+            if let Some(peer) = self.peer_pid {
+                // Check if peer task is still alive
+                // Use try_scheduler to avoid deadlock if called from context holding scheduler lock
+                let peer_alive = if let Some(sched) = crate::kernel::task::try_scheduler() {
+                    sched.slot_by_pid(peer).is_some()
+                } else {
+                    true // Assume alive if we can't check (lock held)
+                };
+                if !peer_alive {
+                    ready |= poll::CLOSED;
+                }
+            }
+        }
+
         if (filter & poll::READABLE) != 0 {
             ready |= poll::READABLE;
         }

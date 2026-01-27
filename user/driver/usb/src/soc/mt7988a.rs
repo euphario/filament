@@ -197,44 +197,25 @@ impl Mt7988aSoc {
     ///
     /// Returns true on success, false on failure.
     pub fn global_init() -> bool {
-        use crate::mmio::{delay, format_mmio_url};
-        use userlib::syscall;
+        use crate::mmio::delay;
 
-        // Format URL for INFRACFG_AO
-        let mut url_buf = [0u8; 32];
-        let url_len = format_mmio_url(&mut url_buf, addrs::INFRACFG_AO_BASE, addrs::INFRACFG_AO_SIZE);
-        let url = unsafe { core::str::from_utf8_unchecked(&url_buf[..url_len]) };
-
-        let fd = syscall::scheme_open(url, 2);
-        if fd < 0 {
-            return false;
-        }
-
-        let mut virt_buf = [0u8; 8];
-        if syscall::read(fd as u32, &mut virt_buf) < 8 {
-            syscall::close(fd as u32);
-            return false;
-        }
-        let base = u64::from_le_bytes(virt_buf);
-
-        let write_reg = |offset: usize, value: u32| {
-            unsafe {
-                let ptr = (base + offset as u64) as *mut u32;
-                core::ptr::write_volatile(ptr, value);
-            }
+        // Map INFRACFG_AO region using unified object interface
+        let mmio = match MmioRegion::open(addrs::INFRACFG_AO_BASE, addrs::INFRACFG_AO_SIZE) {
+            Some(m) => m,
+            None => return false,
         };
 
         // Deassert USB resets for both controllers
         let usb_rst_bits = addrs::RST1_SSUSB_TOP0 | addrs::RST1_SSUSB_TOP1;
-        write_reg(addrs::INFRA_RST1_CLR, usb_rst_bits);
+        mmio.write32(addrs::INFRA_RST1_CLR, usb_rst_bits);
         delay(1000);
 
         // Enable USB clocks for both controllers
         let usb_cg_bits = addrs::CG1_SSUSB0 | addrs::CG1_SSUSB1;
-        write_reg(addrs::INFRA_CG1_CLR, usb_cg_bits);
+        mmio.write32(addrs::INFRA_CG1_CLR, usb_cg_bits);
         delay(10000);
 
-        syscall::close(fd as u32);
+        // mmio dropped here, region unmapped
         true
     }
 

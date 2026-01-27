@@ -49,7 +49,6 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::marker::PhantomData;
-use crate::syscall;
 
 // ============================================================================
 // Cache management for shared memory coherency
@@ -176,17 +175,8 @@ impl RingHeader {
 
 /// Shared ring buffer
 pub struct Ring<S, C> {
-    /// Shared memory ID
-    shmem_id: u32,
-    /// Virtual address of the shared region
-    base: *mut u8,
-    /// Physical address (for DMA)
-    phys: u64,
-    /// Total size of the region
-    #[allow(dead_code)]
-    size: usize,
-    /// Are we the owner (creator)?
-    is_owner: bool,
+    /// Shared memory wrapper (handles lifecycle)
+    shmem: crate::ipc::Shmem,
     /// Phantom data for request/response types
     _marker: PhantomData<(S, C)>,
 }
@@ -219,14 +209,8 @@ impl<S: Copy, C: Copy> Ring<S, C> {
         let total_size = data_offset.checked_add(data_size)?;
 
         // Create shared memory region
-        let mut vaddr: u64 = 0;
-        let mut paddr: u64 = 0;
-        let shmem_id = syscall::shmem_create(total_size, &mut vaddr, &mut paddr);
-        if shmem_id < 0 {
-            return None;
-        }
-
-        let base = vaddr as *mut u8;
+        let shmem = crate::ipc::Shmem::create(total_size).ok()?;
+        let base = shmem.as_ptr();
 
         // Initialize header
         unsafe {
@@ -249,25 +233,15 @@ impl<S: Copy, C: Copy> Ring<S, C> {
         // No cache flush needed - shmem uses non-cacheable memory
 
         Some(Self {
-            shmem_id: shmem_id as u32,
-            base,
-            phys: paddr,
-            size: total_size,
-            is_owner: true,
+            shmem,
             _marker: PhantomData,
         })
     }
 
     /// Map an existing ring buffer
     pub fn map(shmem_id: u32) -> Option<Self> {
-        let mut vaddr: u64 = 0;
-        let mut paddr: u64 = 0;
-        let result = syscall::shmem_map(shmem_id, &mut vaddr, &mut paddr);
-        if result < 0 {
-            return None;
-        }
-
-        let base = vaddr as *mut u8;
+        let shmem = crate::ipc::Shmem::open_existing(shmem_id).ok()?;
+        let base = shmem.as_ptr();
 
         // No cache invalidation needed - shmem uses non-cacheable memory
 
@@ -278,18 +252,8 @@ impl<S: Copy, C: Copy> Ring<S, C> {
                 return None;
             }
 
-            // Calculate total size from header (with overflow check)
-            // These values come from shared memory and may be malicious
-            let data_offset = (*header).data_offset as usize;
-            let data_size = (*header).data_size as usize;
-            let total_size = data_offset.checked_add(data_size)?;
-
             Some(Self {
-                shmem_id,
-                base,
-                phys: paddr,
-                size: total_size,
-                is_owner: false,
+                shmem,
                 _marker: PhantomData,
             })
         }
@@ -297,13 +261,13 @@ impl<S: Copy, C: Copy> Ring<S, C> {
 
     /// Get the shared memory ID (to send to peer)
     pub fn shmem_id(&self) -> u32 {
-        self.shmem_id
+        self.shmem.shmem_id()
     }
 
     /// Get the physical address of the data buffer (for DMA)
     pub fn data_phys(&self) -> u64 {
         let header = self.header();
-        self.phys + header.data_offset as u64
+        self.shmem.paddr() + header.data_offset as u64
     }
 
     /// Get the data buffer size
@@ -313,42 +277,45 @@ impl<S: Copy, C: Copy> Ring<S, C> {
 
     /// Allow another process to map this ring
     pub fn allow(&self, peer_pid: u32) -> bool {
-        syscall::shmem_allow(self.shmem_id, peer_pid) >= 0
+        self.shmem.allow(peer_pid).is_ok()
     }
 
     /// Wait for notification
     pub fn wait(&self, timeout_ms: u32) -> bool {
-        syscall::shmem_wait(self.shmem_id, timeout_ms) >= 0
+        self.shmem.wait(timeout_ms).is_ok()
     }
 
     /// Notify waiters
     pub fn notify(&self) -> u32 {
-        let result = syscall::shmem_notify(self.shmem_id);
-        if result >= 0 { result as u32 } else { 0 }
+        self.shmem.notify().unwrap_or(0)
     }
 
     // === Private helpers ===
 
+    fn base(&self) -> *mut u8 {
+        self.shmem.as_ptr()
+    }
+
     fn header(&self) -> &RingHeader {
-        unsafe { &*(self.base as *const RingHeader) }
+        unsafe { &*(self.base() as *const RingHeader) }
     }
 
     fn sq_ptr(&self) -> *mut S {
-        unsafe { self.base.add(self.header().sq_offset as usize) as *mut S }
+        unsafe { self.base().add(self.header().sq_offset as usize) as *mut S }
     }
 
     fn cq_ptr(&self) -> *mut C {
-        unsafe { self.base.add(self.header().cq_offset as usize) as *mut C }
+        unsafe { self.base().add(self.header().cq_offset as usize) as *mut C }
     }
 
     /// Get pointer to data buffer
     pub fn data_ptr(&self) -> *mut u8 {
-        unsafe { self.base.add(self.header().data_offset as usize) }
+        unsafe { self.base().add(self.header().data_offset as usize) }
     }
 
     /// Get base address (for debugging)
     pub fn base_addr(&self) -> u64 {
-        self.base as u64
+        self.base() as u64
     }
 
     /// Get data offset from header (for debugging)
@@ -548,13 +515,7 @@ impl<S: Copy, C: Copy> Ring<S, C> {
     }
 }
 
-impl<S, C> Drop for Ring<S, C> {
-    fn drop(&mut self) {
-        if self.is_owner {
-            syscall::shmem_destroy(self.shmem_id);
-        }
-    }
-}
+// Ring uses Shmem which handles its own Drop
 
 // =============================================================================
 // Block Device Protocol
@@ -667,3 +628,648 @@ impl BlockResponse {
 
 /// Convenience type for block device rings
 pub type BlockRing = Ring<BlockRequest, BlockResponse>;
+
+// =============================================================================
+// Layered I/O Protocol (Composable Driver Stack)
+// =============================================================================
+//
+// These structures support the zero-copy layered driver model where:
+// - Each layer is a separate process
+// - Data flows through rings without copying
+// - Queries flow through sidechannel for metadata/control
+//
+// ```text
+// fatfs → partition → msc → usbd → [hardware]
+//    └──────────────────────────────────────┘
+//              same data pool
+// ```
+
+/// Layered I/O Submission Queue Entry (SQE) - 32 bytes
+///
+/// Requests flow down the stack (app → hardware).
+/// The actual data is in the shared pool at `data_offset`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct IoSqe {
+    /// Operation code (see `io_op` module)
+    pub opcode: u8,
+    /// Flags (see `io_sqe_flags` module)
+    pub flags: u8,
+    /// Priority (0 = normal, higher = more urgent)
+    pub priority: u16,
+    /// Request tag (for matching completions)
+    pub tag: u32,
+    /// Logical block address (for block ops)
+    pub lba: u64,
+    /// Offset into shared data pool (NOT the data itself)
+    pub data_offset: u32,
+    /// Data length in bytes
+    pub data_len: u32,
+    /// Layer-specific parameter (e.g., SCSI LUN, encryption key ID)
+    pub param: u64,
+}
+
+/// Layered I/O Completion Queue Entry (CQE) - 16 bytes
+///
+/// Completions flow up the stack (hardware → app).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct IoCqe {
+    /// Completion status (see `io_status` module)
+    pub status: u16,
+    /// Flags
+    pub flags: u16,
+    /// Original request tag
+    pub tag: u32,
+    /// Bytes transferred (may be less than requested)
+    pub transferred: u32,
+    /// Layer-specific result
+    pub result: u32,
+}
+
+/// Sidechannel Entry - 32 bytes
+///
+/// For queries and control messages that flow through the layer stack.
+/// Each layer can answer, pass down, or return EOL.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SideEntry {
+    /// Message type (see `side_msg` module)
+    pub msg_type: u16,
+    /// Flags
+    pub flags: u16,
+    /// Request tag (for matching responses)
+    pub tag: u16,
+    /// Status (see `side_status` module)
+    pub status: u16,
+    /// Payload (query-specific data)
+    pub payload: [u8; 24],
+}
+
+impl Default for SideEntry {
+    fn default() -> Self {
+        Self {
+            msg_type: 0,
+            flags: 0,
+            tag: 0,
+            status: 0,
+            payload: [0; 24],
+        }
+    }
+}
+
+/// Layered I/O operation codes
+pub mod io_op {
+    pub const NOP: u8 = 0;
+    pub const READ: u8 = 1;
+    pub const WRITE: u8 = 2;
+    pub const FLUSH: u8 = 3;
+    pub const DISCARD: u8 = 4;
+    pub const SYNC: u8 = 5;
+
+    // Layer-specific ranges (each layer gets 32 opcodes)
+    pub const SCSI_BASE: u8 = 0x20;
+    pub const CRYPTO_BASE: u8 = 0x40;
+    pub const NET_BASE: u8 = 0x60;
+    pub const FS_BASE: u8 = 0x80;
+}
+
+/// Layered I/O completion status codes
+pub mod io_status {
+    pub const OK: u16 = 0;
+    pub const IO_ERROR: u16 = 1;
+    pub const INVALID: u16 = 2;
+    pub const NOT_READY: u16 = 3;
+    pub const TIMEOUT: u16 = 4;
+    pub const CANCELLED: u16 = 5;
+    pub const NO_SPACE: u16 = 6;
+    pub const NOT_FOUND: u16 = 7;
+}
+
+/// Layered I/O SQE flags
+pub mod io_sqe_flags {
+    /// Drain: wait for all prior ops to complete first
+    pub const DRAIN: u8 = 1 << 0;
+    /// Link: if this fails, cancel subsequent linked entries
+    pub const LINK: u8 = 1 << 1;
+    /// Async: don't block waiting for hardware
+    pub const ASYNC: u8 = 1 << 2;
+}
+
+/// Sidechannel message types
+pub mod side_msg {
+    // Queries (request info) - 0x00xx
+    pub const QUERY_INFO: u16 = 0x0001;        // Get device/layer info
+    pub const QUERY_GEOMETRY: u16 = 0x0002;    // Get block geometry
+    pub const QUERY_PARTITION: u16 = 0x0003;   // Get partition table
+    pub const QUERY_CAPS: u16 = 0x0004;        // Get capabilities
+
+    // Control (change state) - 0x01xx
+    pub const CTRL_FLUSH: u16 = 0x0100;        // Flush caches
+    pub const CTRL_RESET: u16 = 0x0101;        // Reset layer
+    pub const CTRL_EJECT: u16 = 0x0102;        // Eject media
+
+    // Notifications (from lower to upper) - 0x02xx
+    pub const NOTIFY_MEDIA_CHANGE: u16 = 0x0200;
+    pub const NOTIFY_ERROR: u16 = 0x0201;
+}
+
+/// Sidechannel status codes
+pub mod side_status {
+    /// Query answered successfully
+    pub const OK: u16 = 0;
+    /// Not for me, forwarded downstream (layer should pass to next)
+    pub const PASS_DOWN: u16 = 1;
+    /// End of line - nobody could answer
+    pub const EOL: u16 = 2;
+    /// Error processing query
+    pub const ERROR: u16 = 3;
+}
+
+// =============================================================================
+// Layered Ring with Sidechannel
+// =============================================================================
+
+/// Extended ring header for layered I/O with sidechannel
+///
+/// Memory layout:
+/// ```text
+/// offset 0x000: LayeredRingHeader (64 bytes)
+/// offset 0x040: SQE array (ring_size * 32 bytes)
+/// offset 0x040 + sq_size: CQE array (ring_size * 16 bytes)
+/// offset after CQ: Sidechannel array (side_size * 32 bytes)
+/// offset pool_offset: Data buffer pool (pool_size bytes)
+/// ```
+#[repr(C, align(64))]
+pub struct LayeredRingHeader {
+    /// Magic number ("LRIO")
+    pub magic: u32,
+    /// Protocol version
+    pub version: u16,
+    /// Ring size (power of 2)
+    pub ring_size: u16,
+
+    // Submission queue pointers
+    /// SQ head - consumer (lower layer) advances
+    pub sq_head: AtomicU32,
+    /// SQ tail - producer (upper layer) advances
+    pub sq_tail: AtomicU32,
+
+    // Completion queue pointers
+    /// CQ head - consumer (upper layer) advances
+    pub cq_head: AtomicU32,
+    /// CQ tail - producer (lower layer) advances
+    pub cq_tail: AtomicU32,
+
+    // Sidechannel pointers
+    /// Side head - consumer advances
+    pub side_head: AtomicU32,
+    /// Side tail - producer advances
+    pub side_tail: AtomicU32,
+    /// Sidechannel size (may differ from ring_size)
+    pub side_size: u16,
+    /// Reserved
+    _pad0: u16,
+
+    /// Offset to data buffer pool
+    pub pool_offset: u32,
+    /// Size of data buffer pool
+    pub pool_size: u32,
+
+    /// Doorbell flags (for notification)
+    pub doorbell: AtomicU32,
+
+    /// Reserved
+    _reserved: [u32; 3],
+}
+
+/// Magic for layered ring ("LRIO")
+pub const LAYERED_RING_MAGIC: u32 = 0x4C52494F;
+/// Layered ring version
+pub const LAYERED_RING_VERSION: u16 = 1;
+
+impl LayeredRingHeader {
+    /// Offset to SQ array
+    pub const fn sq_offset() -> usize {
+        64
+    }
+
+    /// Offset to CQ array
+    pub fn cq_offset(&self) -> usize {
+        Self::sq_offset() + (self.ring_size as usize * core::mem::size_of::<IoSqe>())
+    }
+
+    /// Offset to sidechannel array
+    pub fn side_offset(&self) -> usize {
+        self.cq_offset() + (self.ring_size as usize * core::mem::size_of::<IoCqe>())
+    }
+
+    /// Total size for ring structures (before pool)
+    pub fn struct_size(&self) -> usize {
+        self.side_offset() + (self.side_size as usize * core::mem::size_of::<SideEntry>())
+    }
+
+    /// Mask for index wrapping
+    pub fn ring_mask(&self) -> u32 {
+        self.ring_size as u32 - 1
+    }
+
+    /// Mask for sidechannel index wrapping
+    pub fn side_mask(&self) -> u32 {
+        self.side_size as u32 - 1
+    }
+
+    /// Validate header
+    pub fn is_valid(&self) -> bool {
+        self.magic == LAYERED_RING_MAGIC
+            && self.version == LAYERED_RING_VERSION
+            && self.ring_size > 0
+            && (self.ring_size & (self.ring_size - 1)) == 0
+            && (self.side_size == 0 || (self.side_size & (self.side_size - 1)) == 0)
+    }
+}
+
+/// Layered I/O ring with sidechannel
+pub struct LayeredRing {
+    /// Shared memory wrapper
+    shmem: crate::ipc::Shmem,
+}
+
+unsafe impl Send for LayeredRing {}
+
+impl LayeredRing {
+    /// Create a new layered ring
+    ///
+    /// # Arguments
+    /// * `ring_size` - Number of SQ/CQ entries (power of 2)
+    /// * `side_size` - Number of sidechannel entries (power of 2, 0 to disable)
+    /// * `pool_size` - Size of data buffer pool in bytes
+    pub fn create(ring_size: u16, side_size: u16, pool_size: u32) -> Option<Self> {
+        // Validate
+        if ring_size == 0 || (ring_size & (ring_size - 1)) != 0 {
+            return None;
+        }
+        if side_size != 0 && (side_size & (side_size - 1)) != 0 {
+            return None;
+        }
+
+        // Calculate sizes
+        let header_size = 64;
+        let sq_size = ring_size as usize * core::mem::size_of::<IoSqe>();
+        let cq_size = ring_size as usize * core::mem::size_of::<IoCqe>();
+        let side_bytes = side_size as usize * core::mem::size_of::<SideEntry>();
+        let struct_size = header_size + sq_size + cq_size + side_bytes;
+        let total_size = struct_size + pool_size as usize;
+
+        // Allocate shared memory
+        let shmem = crate::ipc::Shmem::create(total_size).ok()?;
+        let base = shmem.as_ptr();
+
+        // Initialize header
+        unsafe {
+            let header = base as *mut LayeredRingHeader;
+            (*header).magic = LAYERED_RING_MAGIC;
+            (*header).version = LAYERED_RING_VERSION;
+            (*header).ring_size = ring_size;
+            (*header).sq_head = AtomicU32::new(0);
+            (*header).sq_tail = AtomicU32::new(0);
+            (*header).cq_head = AtomicU32::new(0);
+            (*header).cq_tail = AtomicU32::new(0);
+            (*header).side_head = AtomicU32::new(0);
+            (*header).side_tail = AtomicU32::new(0);
+            (*header).side_size = side_size;
+            (*header)._pad0 = 0;
+            (*header).pool_offset = struct_size as u32;
+            (*header).pool_size = pool_size;
+            (*header).doorbell = AtomicU32::new(0);
+            (*header)._reserved = [0; 3];
+        }
+
+        Some(Self { shmem })
+    }
+
+    /// Map an existing layered ring
+    pub fn map(shmem_id: u32) -> Option<Self> {
+        let shmem = crate::ipc::Shmem::open_existing(shmem_id).ok()?;
+
+        let base = shmem.as_ptr();
+
+        // Validate header
+        unsafe {
+            let header = base as *const LayeredRingHeader;
+            if !(*header).is_valid() {
+                return None;
+            }
+        }
+
+        Some(Self { shmem })
+    }
+
+    /// Get shared memory ID
+    pub fn shmem_id(&self) -> u32 {
+        self.shmem.shmem_id()
+    }
+
+    /// Allow another process to map this ring
+    pub fn allow(&self, peer_pid: u32) -> bool {
+        self.shmem.allow(peer_pid).is_ok()
+    }
+
+    /// Wait for notification
+    pub fn wait(&self, timeout_ms: u32) -> bool {
+        self.shmem.wait(timeout_ms).is_ok()
+    }
+
+    /// Notify waiters
+    pub fn notify(&self) {
+        let _ = self.shmem.notify();
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.shmem.as_ptr()
+    }
+
+    fn header(&self) -> &LayeredRingHeader {
+        unsafe { &*(self.base() as *const LayeredRingHeader) }
+    }
+
+    // === Submission Queue ===
+
+    /// Space available in SQ
+    pub fn sq_space(&self) -> u32 {
+        let h = self.header();
+        let head = h.sq_head.load(Ordering::Acquire);
+        let tail = h.sq_tail.load(Ordering::Relaxed);
+        h.ring_size as u32 - tail.wrapping_sub(head)
+    }
+
+    /// Submit a request
+    pub fn sq_submit(&self, sqe: &IoSqe) -> bool {
+        let h = self.header();
+        if self.sq_space() == 0 {
+            return false;
+        }
+
+        let tail = h.sq_tail.load(Ordering::Relaxed);
+        let idx = (tail & h.ring_mask()) as usize;
+
+        unsafe {
+            let sq = self.base().add(LayeredRingHeader::sq_offset()) as *mut IoSqe;
+            core::ptr::write_volatile(sq.add(idx), *sqe);
+        }
+
+        core::sync::atomic::fence(Ordering::Release);
+        h.sq_tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Pending SQ entries
+    pub fn sq_pending(&self) -> u32 {
+        let h = self.header();
+        let head = h.sq_head.load(Ordering::Relaxed);
+        let tail = h.sq_tail.load(Ordering::Acquire);
+        tail.wrapping_sub(head)
+    }
+
+    /// Consume next SQ entry
+    pub fn sq_consume(&self) -> Option<IoSqe> {
+        let h = self.header();
+        if self.sq_pending() == 0 {
+            return None;
+        }
+
+        let head = h.sq_head.load(Ordering::Relaxed);
+        let idx = (head & h.ring_mask()) as usize;
+
+        let sqe = unsafe {
+            let sq = self.base().add(LayeredRingHeader::sq_offset()) as *const IoSqe;
+            core::ptr::read_volatile(sq.add(idx))
+        };
+
+        core::sync::atomic::fence(Ordering::Acquire);
+        h.sq_head.store(head.wrapping_add(1), Ordering::Release);
+        Some(sqe)
+    }
+
+    // === Completion Queue ===
+
+    /// Post a completion
+    pub fn cq_complete(&self, cqe: &IoCqe) -> bool {
+        let h = self.header();
+        let tail = h.cq_tail.load(Ordering::Relaxed);
+        let idx = (tail & h.ring_mask()) as usize;
+
+        unsafe {
+            let cq = self.base().add(h.cq_offset()) as *mut IoCqe;
+            core::ptr::write_volatile(cq.add(idx), *cqe);
+        }
+
+        core::sync::atomic::fence(Ordering::Release);
+        h.cq_tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Pending CQ entries
+    pub fn cq_pending(&self) -> u32 {
+        let h = self.header();
+        let head = h.cq_head.load(Ordering::Relaxed);
+        let tail = h.cq_tail.load(Ordering::Acquire);
+        tail.wrapping_sub(head)
+    }
+
+    /// Consume next CQ entry
+    pub fn cq_consume(&self) -> Option<IoCqe> {
+        let h = self.header();
+        if self.cq_pending() == 0 {
+            return None;
+        }
+
+        let head = h.cq_head.load(Ordering::Relaxed);
+        let idx = (head & h.ring_mask()) as usize;
+
+        let cqe = unsafe {
+            let cq = self.base().add(h.cq_offset()) as *const IoCqe;
+            core::ptr::read_volatile(cq.add(idx))
+        };
+
+        core::sync::atomic::fence(Ordering::Acquire);
+        h.cq_head.store(head.wrapping_add(1), Ordering::Release);
+        Some(cqe)
+    }
+
+    // === Sidechannel ===
+
+    /// Is sidechannel enabled?
+    pub fn has_sidechannel(&self) -> bool {
+        self.header().side_size > 0
+    }
+
+    /// Space in sidechannel
+    pub fn side_space(&self) -> u32 {
+        let h = self.header();
+        if h.side_size == 0 {
+            return 0;
+        }
+        let head = h.side_head.load(Ordering::Acquire);
+        let tail = h.side_tail.load(Ordering::Relaxed);
+        h.side_size as u32 - tail.wrapping_sub(head)
+    }
+
+    /// Send sidechannel entry
+    pub fn side_send(&self, entry: &SideEntry) -> bool {
+        let h = self.header();
+        if h.side_size == 0 || self.side_space() == 0 {
+            return false;
+        }
+
+        let tail = h.side_tail.load(Ordering::Relaxed);
+        let idx = (tail & h.side_mask()) as usize;
+
+        unsafe {
+            let side = self.base().add(h.side_offset()) as *mut SideEntry;
+            core::ptr::write_volatile(side.add(idx), *entry);
+        }
+
+        core::sync::atomic::fence(Ordering::Release);
+        h.side_tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Pending sidechannel entries
+    pub fn side_pending(&self) -> u32 {
+        let h = self.header();
+        if h.side_size == 0 {
+            return 0;
+        }
+        let head = h.side_head.load(Ordering::Relaxed);
+        let tail = h.side_tail.load(Ordering::Acquire);
+        tail.wrapping_sub(head)
+    }
+
+    /// Receive sidechannel entry
+    pub fn side_recv(&self) -> Option<SideEntry> {
+        let h = self.header();
+        if h.side_size == 0 || self.side_pending() == 0 {
+            return None;
+        }
+
+        let head = h.side_head.load(Ordering::Relaxed);
+        let idx = (head & h.side_mask()) as usize;
+
+        let entry = unsafe {
+            let side = self.base().add(h.side_offset()) as *const SideEntry;
+            core::ptr::read_volatile(side.add(idx))
+        };
+
+        core::sync::atomic::fence(Ordering::Acquire);
+        h.side_head.store(head.wrapping_add(1), Ordering::Release);
+        Some(entry)
+    }
+
+    // === Data Pool ===
+
+    /// Get data pool base pointer
+    pub fn pool_ptr(&self) -> *mut u8 {
+        let h = self.header();
+        unsafe { self.base().add(h.pool_offset as usize) }
+    }
+
+    /// Get data pool size
+    pub fn pool_size(&self) -> u32 {
+        self.header().pool_size
+    }
+
+    /// Get data pool physical address (for DMA)
+    pub fn pool_phys(&self) -> u64 {
+        self.shmem.paddr() + self.header().pool_offset as u64
+    }
+
+    /// Get slice at offset in pool
+    pub fn pool_slice(&self, offset: u32, len: u32) -> Option<&[u8]> {
+        let h = self.header();
+        if offset + len > h.pool_size {
+            return None;
+        }
+        unsafe {
+            Some(core::slice::from_raw_parts(
+                self.pool_ptr().add(offset as usize),
+                len as usize,
+            ))
+        }
+    }
+
+    /// Get mutable slice at offset in pool
+    pub fn pool_slice_mut(&self, offset: u32, len: u32) -> Option<&mut [u8]> {
+        let h = self.header();
+        if offset + len > h.pool_size {
+            return None;
+        }
+        unsafe {
+            Some(core::slice::from_raw_parts_mut(
+                self.pool_ptr().add(offset as usize),
+                len as usize,
+            ))
+        }
+    }
+}
+
+// LayeredRing uses Shmem which handles its own Drop
+
+// =============================================================================
+// Pool Allocator (simple bump allocator)
+// =============================================================================
+
+/// Simple bump allocator for data pool
+///
+/// For production, use a proper free-list allocator.
+pub struct PoolAlloc {
+    base_offset: u32,
+    size: u32,
+    next: u32,
+}
+
+impl PoolAlloc {
+    /// Create allocator for a pool region
+    pub fn new(base_offset: u32, size: u32) -> Self {
+        Self {
+            base_offset,
+            size,
+            next: 0,
+        }
+    }
+
+    /// Allocate buffer, returns offset from pool base
+    pub fn alloc(&mut self, len: u32) -> Option<u32> {
+        // Align to 64 bytes
+        let aligned = (len + 63) & !63;
+        if self.next + aligned > self.size {
+            return None;
+        }
+        let offset = self.base_offset + self.next;
+        self.next += aligned;
+        Some(offset)
+    }
+
+    /// Reset (free all)
+    pub fn reset(&mut self) {
+        self.next = 0;
+    }
+
+    /// Remaining space
+    pub fn remaining(&self) -> u32 {
+        self.size - self.next
+    }
+}
+
+// =============================================================================
+// Helper: Calculate total shmem size needed
+// =============================================================================
+
+/// Calculate minimum shared memory size for a layered ring
+pub const fn layered_ring_size(ring_size: u16, side_size: u16, pool_size: u32) -> usize {
+    let header = 64;
+    let sq = ring_size as usize * 32; // IoSqe is 32 bytes
+    let cq = ring_size as usize * 16; // IoCqe is 16 bytes
+    let side = side_size as usize * 32; // SideEntry is 32 bytes
+    header + sq + cq + side + pool_size as usize
+}

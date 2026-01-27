@@ -7,7 +7,8 @@ use userlib::ipc::Channel;
 use userlib::query::{
     QueryHeader, DeviceRegister, ListDevices, GetDeviceInfo, DriverQuery,
     DeviceListResponse, DeviceInfoResponse, DeviceEntry, ErrorResponse,
-    msg, error,
+    PortRegister, PortRegisterResponse,
+    msg, error, port_type,
 };
 
 use crate::devices::{DeviceStore, DeviceRegistry, MAX_DEVICES};
@@ -136,6 +137,11 @@ impl QueryHandler {
             msg::QUERY_DRIVER => {
                 // Pass-through queries need special handling (async)
                 // Return None to indicate caller should handle forwarding
+                None
+            }
+            msg::REGISTER_PORT => {
+                // Port registration needs access to Devd's ports and rules
+                // Return None to indicate caller should handle this
                 None
             }
             _ => {
@@ -356,6 +362,54 @@ impl QueryHandler {
             payload,
         ))
     }
+
+    /// Parse a REGISTER_PORT message
+    /// Returns: (seq_id, port_type, name, parent, shmem_id, owner_idx)
+    pub fn parse_port_register<'a>(
+        &self,
+        slot: usize,
+        buf: &'a [u8],
+    ) -> Option<PortRegisterInfo<'a>> {
+        let (reg, name, parent) = PortRegister::from_bytes(buf)?;
+
+        // Only drivers can register ports
+        let client = self.clients[slot].as_ref()?;
+        if !client.is_driver {
+            return None;
+        }
+
+        Some(PortRegisterInfo {
+            seq_id: reg.header.seq_id,
+            port_type: reg.port_type,
+            name,
+            parent,
+            shmem_id: reg.shmem_id,
+            owner_idx: client.service_idx as u8,
+        })
+    }
+
+    /// Send a port registration response
+    pub fn send_port_register_response(
+        &mut self,
+        slot: usize,
+        seq_id: u32,
+        result: i32,
+    ) {
+        let resp = PortRegisterResponse::new(seq_id, result);
+        if let Some(client) = self.get_mut(slot) {
+            let _ = client.channel.send(&resp.to_bytes());
+        }
+    }
+}
+
+/// Parsed port registration info
+pub struct PortRegisterInfo<'a> {
+    pub seq_id: u32,
+    pub port_type: u8,
+    pub name: &'a [u8],
+    pub parent: Option<&'a [u8]>,
+    pub shmem_id: u32,
+    pub owner_idx: u8,
 }
 
 // =============================================================================

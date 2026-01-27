@@ -5,8 +5,9 @@
 //!
 //! # Thread Safety
 //!
-//! All wake operations go through `with_scheduler()` which holds the
-//! scheduler lock, ensuring proper serialization on SMP systems.
+//! Uses try_scheduler() to avoid deadlocks when called from contexts that
+//! already hold the scheduler lock (e.g., cleanup paths, reap_terminated).
+//! If the lock is held, defers the wake via request_wake().
 
 use crate::kernel::traits::waker::{Waker, Subscriber, WakeReason, WakeList};
 use crate::kernel::task;
@@ -25,13 +26,16 @@ impl KernelWaker {
 
 impl Waker for KernelWaker {
     fn wake(&self, sub: &Subscriber, _reason: WakeReason) {
-        // Use with_scheduler for proper SMP serialization
-        task::with_scheduler(|sched| {
+        // Use try_scheduler to avoid deadlock when called from cleanup paths
+        if let Some(mut sched) = task::try_scheduler() {
             // Generation check is handled by wake_by_pid -> slot_by_pid:
             // slot_by_pid compares task.id == pid which includes the generation
             // bits, so stale PIDs will fail the lookup and won't wake anything.
             sched.wake_by_pid(sub.task_id);
-        });
+        } else {
+            // Lock held - defer the wake
+            crate::arch::aarch64::sync::cpu_flags().request_wake(sub.task_id);
+        }
     }
 
     fn wake_all(&self, list: &WakeList, reason: WakeReason) {

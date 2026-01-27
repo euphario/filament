@@ -29,6 +29,7 @@ mod process;
 mod deps;
 mod devices;
 mod query;
+mod rules;
 
 use userlib::syscall::{self, LogLevel};
 use userlib::ipc::{Port, Timer, EventLoop, ObjHandle};
@@ -39,11 +40,12 @@ use service::{
     MAX_SERVICES, MAX_PORTS_PER_SERVICE, MAX_RESTARTS,
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
 };
-use ports::{PortRegistry, Ports};
+use ports::{PortRegistry, Ports, PortType};
 use process::{ProcessManager, SyscallProcessManager};
 use deps::{DependencyResolver, Dependencies};
 use devices::{DeviceStore, DeviceRegistry};
 use query::{QueryHandler, MSG_BUFFER_SIZE};
+use rules::{RulesEngine, StaticRules};
 
 // =============================================================================
 // Logging
@@ -114,6 +116,8 @@ pub struct Devd {
     devices: DeviceRegistry,
     /// Query handler for client connections
     query_handler: QueryHandler,
+    /// Rules engine for auto-spawning drivers
+    rules: StaticRules,
 }
 
 impl Devd {
@@ -128,6 +132,7 @@ impl Devd {
             deps: Dependencies::new(),
             devices: DeviceRegistry::new(),
             query_handler: QueryHandler::new(),
+            rules: StaticRules::new(),
         }
     }
 
@@ -659,6 +664,8 @@ impl Devd {
     }
 
     fn handle_query_client_event(&mut self, handle: ObjHandle) {
+        use userlib::query::{msg, QueryHeader};
+
         let slot = match self.query_handler.find_by_handle(handle) {
             Some(s) => s,
             None => return,
@@ -675,23 +682,35 @@ impl Devd {
 
         match client.channel.recv(&mut recv_buf) {
             Ok(len) if len > 0 => {
-                // Process the message
-                let response_len = self.query_handler.handle_message(
-                    slot,
-                    &recv_buf[..len],
-                    &mut self.devices,
-                    &self.services,
-                    &mut response_buf,
-                );
+                // Check message type for special handling
+                let msg_type = QueryHeader::from_bytes(&recv_buf[..len])
+                    .map(|h| h.msg_type);
 
-                // Send response if there is one
-                if let Some(resp_len) = response_len {
-                    if let Some(client) = self.query_handler.get_mut(slot) {
-                        let _ = client.channel.send(&response_buf[..resp_len]);
+                match msg_type {
+                    Some(msg::REGISTER_PORT) => {
+                        // Handle port registration specially
+                        self.handle_port_register_msg(slot, &recv_buf[..len]);
                     }
-                } else {
-                    // QUERY_DRIVER needs special handling - forward to driver
-                    self.handle_query_driver_forward(slot, &recv_buf[..len]);
+                    Some(msg::QUERY_DRIVER) => {
+                        // Forward to driver
+                        self.handle_query_driver_forward(slot, &recv_buf[..len]);
+                    }
+                    _ => {
+                        // Process normally
+                        let response_len = self.query_handler.handle_message(
+                            slot,
+                            &recv_buf[..len],
+                            &mut self.devices,
+                            &self.services,
+                            &mut response_buf,
+                        );
+
+                        if let Some(resp_len) = response_len {
+                            if let Some(client) = self.query_handler.get_mut(slot) {
+                                let _ = client.channel.send(&response_buf[..resp_len]);
+                            }
+                        }
+                    }
                 }
             }
             Ok(_) => {
@@ -704,6 +723,43 @@ impl Devd {
                 self.remove_query_client(slot);
             }
         }
+    }
+
+    fn handle_port_register_msg(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{error, port_type};
+
+        // Parse the registration message
+        let info = match self.query_handler.parse_port_register(slot, buf) {
+            Some(i) => i,
+            None => {
+                // Permission denied or invalid format
+                if let Some(header) = userlib::query::QueryHeader::from_bytes(buf) {
+                    self.query_handler.send_port_register_response(
+                        slot, header.seq_id, error::PERMISSION_DENIED
+                    );
+                }
+                return;
+            }
+        };
+
+        // Convert port_type u8 to PortType enum
+        let port_type_enum = PortType::from_u8(info.port_type);
+
+        // Register the port
+        let result = self.handle_port_registration(
+            info.name,
+            port_type_enum,
+            info.parent,
+            info.owner_idx,
+            info.shmem_id,
+        );
+
+        // Send response
+        let result_code = match result {
+            Ok(()) => error::OK,
+            Err(_) => error::INVALID_REQUEST,
+        };
+        self.query_handler.send_port_register_response(slot, info.seq_id, result_code);
     }
 
     fn handle_query_driver_forward(&mut self, _client_slot: usize, buf: &[u8]) {
@@ -754,6 +810,101 @@ impl Devd {
                 let _ = events.unwatch(channel.handle());
             }
             dlog!("query: client disconnected slot={}", slot);
+        }
+    }
+
+    // =========================================================================
+    // Dynamic Port Registration
+    // =========================================================================
+
+    /// Handle a port registration request from a driver
+    ///
+    /// Called when a driver sends REGISTER_PORT to devd-query:.
+    /// Registers the port with hierarchy info and checks rules for auto-spawning.
+    pub fn handle_port_registration(
+        &mut self,
+        port_name: &[u8],
+        port_type: PortType,
+        parent_name: Option<&[u8]>,
+        owner_idx: u8,
+        _shmem_id: u32,
+    ) -> Result<(), SysError> {
+        // Register the port
+        if let Some(parent) = parent_name {
+            self.ports.register_child(port_name, owner_idx, parent, port_type)?;
+        } else {
+            self.ports.register_typed(port_name, owner_idx, port_type)?;
+        }
+
+        // Get parent type for rule matching
+        let parent_type = parent_name.and_then(|p| self.ports.port_type(p));
+
+        // Log registration
+        if let Ok(name_str) = core::str::from_utf8(port_name) {
+            dlog!("port registered: {} type={:?} parent={:?}",
+                name_str, port_type, parent_type);
+        }
+
+        // Check rules for auto-spawning
+        self.check_rules_for_port(port_name, port_type, parent_type);
+
+        Ok(())
+    }
+
+    /// Check if any rules match a newly registered port
+    fn check_rules_for_port(
+        &mut self,
+        port_name: &[u8],
+        port_type: PortType,
+        parent_type: Option<PortType>,
+    ) {
+        let rule = match self.rules.find_matching_rule(port_type, parent_type) {
+            Some(r) => r,
+            None => return,
+        };
+
+        dlog!("rule matched: spawning {} for port", rule.driver_binary);
+
+        // Spawn the driver
+        // For now, we use a dynamic service slot
+        // In the future, this could use a more sophisticated approach
+        self.spawn_dynamic_driver(rule.driver_binary, port_name);
+    }
+
+    /// Spawn a driver dynamically (not from SERVICE_DEFS)
+    fn spawn_dynamic_driver(&mut self, binary: &str, trigger_port: &[u8]) {
+        let now = Self::now_ms();
+
+        // Spawn the process
+        let (pid, watcher) = match self.process_mgr.spawn(binary) {
+            Ok(result) => result,
+            Err(e) => {
+                derror!("dynamic spawn {} failed err={:?}", binary, e);
+                return;
+            }
+        };
+
+        // Add watcher to event loop
+        if let Some(events) = &mut self.events {
+            let _ = events.watch(watcher.handle());
+        }
+
+        // Find empty service slot for dynamic driver
+        let slot = self.services.find_empty_slot();
+        if let Some(idx) = slot {
+            // Use the slot for tracking this dynamic driver
+            if let Some(service) = self.services.get_mut(idx) {
+                service.pid = pid;
+                service.watcher = Some(watcher);
+                service.state = service::ServiceState::Starting;
+                service.last_change = now;
+            }
+        }
+
+        if let Ok(port_str) = core::str::from_utf8(trigger_port) {
+            dlog!("spawned {} pid={} for trigger={}", binary, pid, port_str);
+        } else {
+            dlog!("spawned {} pid={}", binary, pid);
         }
     }
 

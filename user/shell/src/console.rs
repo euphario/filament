@@ -24,6 +24,8 @@ pub struct Console {
     pub rows: u16,
     /// Log split enabled
     pub log_split: bool,
+    /// Number of log lines (top region)
+    pub log_lines: u16,
 }
 
 impl Console {
@@ -35,6 +37,7 @@ impl Console {
             cols: 80,
             rows: 24,
             log_split: false,
+            log_lines: 5,
         }
     }
 
@@ -114,8 +117,12 @@ impl Console {
             }
 
             // No data - wait indefinitely for notification
-            // The shmem pending_for mechanism ensures we don't miss notifications
-            ring.wait(0);
+            // If wait fails (returns false), sleep briefly to prevent busy-loop
+            // This handles cases where shmem is broken or consoled died
+            if !ring.wait(0) {
+                // Wait failed - sleep briefly to prevent syscall storm
+                userlib::syscall::sleep_us(100_000); // 100ms backoff
+            }
         }
     }
 
@@ -214,20 +221,75 @@ impl Console {
         }
     }
 
-    /// Set log split (placeholder - no protocol for this yet)
+    /// Set log split mode
     pub fn set_log_split(&mut self, enabled: bool) {
+        let ring = match &self.ring {
+            Some(r) => r,
+            None => return,
+        };
+
+        if enabled {
+            // Send SPLIT command with current log_lines setting
+            // For now use default 5 lines
+            ring.tx_write(b"SPLIT 5\n");
+        } else {
+            ring.tx_write(b"NOSPLIT\n");
+        }
+        ring.notify();
+
+        // Wait for OK response
+        for _ in 0..50 {
+            if ring.rx_available() >= 2 {
+                let mut buf = [0u8; 16];
+                let n = ring.rx_read(&mut buf);
+                if n >= 2 && &buf[..2] == b"OK" {
+                    self.log_split = enabled;
+                    return;
+                }
+            }
+            ring.wait(10);
+        }
+        // Timeout - assume it worked
         self.log_split = enabled;
-        // Future: send config message to consoled
     }
 
-    /// Set log lines (placeholder)
-    pub fn set_log_lines(&self, _lines: u8) {
-        // Future: send config message to consoled
+    /// Set number of log lines (only effective when split is enabled)
+    pub fn set_log_lines(&mut self, lines: u8) {
+        let ring = match &self.ring {
+            Some(r) => r,
+            None => return,
+        };
+
+        // Send SPLIT command with specified lines
+        let mut cmd = [0u8; 16];
+        cmd[..6].copy_from_slice(b"SPLIT ");
+        let mut pos = 6;
+        if lines >= 10 {
+            cmd[pos] = b'0' + (lines / 10);
+            pos += 1;
+        }
+        cmd[pos] = b'0' + (lines % 10);
+        pos += 1;
+        cmd[pos] = b'\n';
+        pos += 1;
+
+        ring.tx_write(&cmd[..pos]);
+        ring.notify();
+
+        // Wait for OK response
+        for _ in 0..50 {
+            if ring.rx_available() >= 2 {
+                let mut buf = [0u8; 16];
+                ring.rx_read(&mut buf);
+                break;
+            }
+            ring.wait(10);
+        }
     }
 
-    /// Connect/disconnect from logd (placeholder)
+    /// Connect/disconnect from logd (placeholder - logd integration not yet implemented)
     pub fn set_logd_connected(&self, _connected: bool) {
-        // Future: send config message to consoled
+        // Future: tell consoled to connect/disconnect from logd
     }
 }
 

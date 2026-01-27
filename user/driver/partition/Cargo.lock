@@ -7,17 +7,9 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
-name = "usb"
+name = "partition"
 version = "0.1.0"
 dependencies = [
- "userlib",
-]
-
-[[package]]
-name = "usbd"
-version = "0.1.0"
-dependencies = [
- "usb",
  "userlib",
 ]
 

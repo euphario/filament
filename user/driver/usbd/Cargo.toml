@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 userlib = { path = "../../userlib" }
-usb = { path = "../usb" }
+usb = { path = "../usb", features = ["mt7988a"] }
 
 [profile.release]
 opt-level = "s"       # Optimize for size

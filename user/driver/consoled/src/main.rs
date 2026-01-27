@@ -176,6 +176,12 @@ pub struct Consoled {
     rows: u16,
     /// Channel to devd (announces we're ready)
     devd_channel: Option<Channel>,
+    /// Split screen mode enabled
+    split_enabled: bool,
+    /// Number of lines for log region (top)
+    log_lines: u16,
+    /// Current cursor row in output region
+    output_row: u16,
 }
 
 impl Consoled {
@@ -191,6 +197,9 @@ impl Consoled {
             cols: 80,
             rows: 24,
             devd_channel: None,
+            split_enabled: false,
+            log_lines: 5,
+            output_row: 6,  // First row after log region
         }
     }
 
@@ -235,6 +244,183 @@ impl Consoled {
         Ok(())
     }
 
+    // =========================================================================
+    // Split Screen Management
+    // =========================================================================
+
+    /// Enable split screen mode
+    ///
+    /// Layout:
+    /// - Lines 1 to log_lines: Log region (fixed, doesn't scroll)
+    /// - Line log_lines+1: Top separator (dashes)
+    /// - Lines log_lines+2 to rows-2: Output region (scrolls)
+    /// - Line rows-1: Bottom separator (dashes)
+    /// - Line rows: Prompt line (in scroll region for readline compat)
+    fn enable_split(&mut self) {
+        if self.split_enabled {
+            return;
+        }
+        self.split_enabled = true;
+
+        let mut buf = [0u8; 700];
+        let mut pos = 0;
+
+        // Clear entire screen
+        buf[pos..pos+4].copy_from_slice(b"\x1b[2J");
+        pos += 4;
+
+        // Draw TOP separator at log_lines+1
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += Self::write_u16_to_buf(&mut buf[pos..], self.log_lines + 1);
+        buf[pos..pos+3].copy_from_slice(b";1H");
+        pos += 3;
+
+        let line_chars = (self.cols as usize).min(200);
+        for _ in 0..line_chars {
+            buf[pos] = b'-';
+            pos += 1;
+        }
+
+        // Draw BOTTOM separator at rows-1
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += Self::write_u16_to_buf(&mut buf[pos..], self.rows - 1);
+        buf[pos..pos+3].copy_from_slice(b";1H");
+        pos += 3;
+
+        for _ in 0..line_chars {
+            buf[pos] = b'-';
+            pos += 1;
+        }
+
+        // Set scroll region: output area + prompt line
+        // From log_lines+2 to rows (includes prompt for readline)
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += Self::write_u16_to_buf(&mut buf[pos..], self.log_lines + 2);
+        buf[pos] = b';';
+        pos += 1;
+        pos += Self::write_u16_to_buf(&mut buf[pos..], self.rows);
+        buf[pos] = b'r';
+        pos += 1;
+
+        // Move cursor to prompt line (bottom)
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += Self::write_u16_to_buf(&mut buf[pos..], self.rows);
+        buf[pos..pos+3].copy_from_slice(b";1H");
+        pos += 3;
+
+        self.write_uart(&buf[..pos]);
+    }
+
+    /// Write u16 to buffer, return bytes written
+    fn write_u16_to_buf(buf: &mut [u8], n: u16) -> usize {
+        if n == 0 {
+            buf[0] = b'0';
+            return 1;
+        }
+        let mut tmp = [0u8; 5];
+        let mut val = n;
+        let mut len = 0;
+        while val > 0 {
+            tmp[len] = b'0' + (val % 10) as u8;
+            val /= 10;
+            len += 1;
+        }
+        for i in 0..len {
+            buf[i] = tmp[len - 1 - i];
+        }
+        len
+    }
+
+    /// Disable split screen mode
+    fn disable_split(&mut self) {
+        if !self.split_enabled {
+            return;
+        }
+        self.split_enabled = false;
+
+        // Reset scroll region to full screen, clear, home cursor
+        self.write_uart(b"\x1b[r\x1b[2J\x1b[H");
+    }
+
+    /// Write to log region (top, scrolls independently)
+    fn write_log(&mut self, data: &[u8]) {
+        if !self.split_enabled {
+            return;
+        }
+
+        // Batch all output into single buffer to avoid storm detection
+        let mut buf = [0u8; 600];
+        let mut pos = 0;
+
+        // Save cursor: ESC[s
+        buf[pos..pos+3].copy_from_slice(b"\x1b[s");
+        pos += 3;
+
+        // Set scroll region to log area only: ESC[1;<log_lines>r
+        buf[pos..pos+4].copy_from_slice(b"\x1b[1;");
+        pos += 4;
+        pos += Self::write_u16_to_buf(&mut buf[pos..], self.log_lines);
+        buf[pos] = b'r';
+        pos += 1;
+
+        // Move to last line of log region: ESC[<log_lines>;1H
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += Self::write_u16_to_buf(&mut buf[pos..], self.log_lines);
+        buf[pos..pos+3].copy_from_slice(b";1H");
+        pos += 3;
+
+        // Copy log data (limited by buffer)
+        let data_len = data.len().min(500);
+        buf[pos..pos+data_len].copy_from_slice(&data[..data_len]);
+        pos += data_len;
+
+        // Reset scroll region to full screen: ESC[r
+        buf[pos..pos+3].copy_from_slice(b"\x1b[r");
+        pos += 3;
+
+        // Restore cursor: ESC[u
+        buf[pos..pos+3].copy_from_slice(b"\x1b[u");
+        pos += 3;
+
+        self.write_uart(&buf[..pos]);
+    }
+
+    /// Write to shell output region
+    ///
+    /// In split mode, the scroll region is set so normal writes go to the
+    /// shell area and scroll naturally within that region.
+    fn write_output(&mut self, data: &[u8]) {
+        // Just pass through - scroll region handles positioning
+        self.write_uart(data);
+    }
+
+    /// Move cursor to prompt line (bottom)
+    fn goto_prompt(&mut self) {
+        if !self.split_enabled {
+            return;
+        }
+        self.write_uart(b"\x1b[");
+        self.write_u16(self.rows);
+        self.write_uart(b";1H\x1b[K");  // Go to last row, clear line
+    }
+
+    /// Write a u16 as decimal to UART
+    fn write_u16(&self, n: u16) {
+        let mut buf = [0u8; 5];
+        let len = format_u16(&mut buf, n);
+        self.write_uart(&buf[..len]);
+    }
+
+    /// Write directly to UART
+    fn write_uart(&self, data: &[u8]) {
+        let _ = syscall::write(Handle::STDOUT, data);
+    }
+
     pub fn run(&mut self) -> ! {
         loop {
             // If connected via ring, use polling loop
@@ -258,6 +444,15 @@ impl Consoled {
                 if let Some(port) = &self.port {
                     if event.handle == port.handle() {
                         self.handle_port();
+                    }
+                }
+
+                // Drain stdin to prevent spinning when not connected
+                // (stdin data has nowhere to go without a shell)
+                if event.handle == self.stdin_handle {
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = syscall::read(self.stdin_handle, &mut buf) {
+                        if n == 0 { break; }
                     }
                 }
             }
@@ -296,58 +491,170 @@ impl Consoled {
             }
         }
 
+        // Add handshake channel to mux (wake when shell disconnects)
+        let channel_handle = if let Some(ch) = &self.handshake_channel {
+            let h = ch.handle();
+            // Use Readable filter - closed channels become readable with error
+            if let Err(e) = ring_mux.add(h, MuxFilter::Readable) {
+                cerror!("failed to add channel to ring mux: {:?}", e);
+                return;
+            }
+            Some(h)
+        } else {
+            None
+        };
+
         loop {
-            let ring = match &self.shell_ring {
-                Some(r) => r,
-                None => return, // Disconnected
-            };
+            // Check if still connected
+            if self.shell_ring.is_none() {
+                return;
+            }
 
             // Process TX ring (shell output -> UART)
-            // Drain all available data
-            loop {
+            // Read data first, then process (to avoid borrow conflicts)
+            let n = {
+                let ring = self.shell_ring.as_ref().unwrap();
                 let tx_avail = ring.tx_available();
                 if tx_avail == 0 {
-                    break;
+                    0
+                } else {
+                    let to_read = tx_avail.min(tx_buf.len());
+                    ring.tx_read(&mut tx_buf[..to_read])
                 }
-                let to_read = tx_avail.min(tx_buf.len());
-                let n = ring.tx_read(&mut tx_buf[..to_read]);
-                if n == 0 {
-                    break;
-                }
-                // Check for GETSIZE query
-                if n >= 7 && &tx_buf[..7] == b"GETSIZE" {
-                    // Do actual terminal size detection
-                    if let Some((cols, rows)) = ansi::query_screen_size() {
-                        self.cols = cols;
-                        self.rows = rows;
+            };
+
+            if n > 0 {
+                // Find command start (skip leading whitespace/newlines which may be echo)
+                let mut cmd_start = 0;
+                while cmd_start < n && (tx_buf[cmd_start] == b'\n' || tx_buf[cmd_start] == b'\r') {
+                    // Output the newline first (it's echo from shell)
+                    if self.split_enabled {
+                        self.write_output(&tx_buf[cmd_start..cmd_start+1]);
+                    } else {
+                        self.write_uart(&tx_buf[cmd_start..cmd_start+1]);
                     }
+                    cmd_start += 1;
+                }
+
+                // Process the remaining data
+                let cmd_buf = &tx_buf[cmd_start..n];
+                let cmd_len = n - cmd_start;
+
+                // Process the data we read (using cmd_buf which has leading newlines stripped)
+                if cmd_len >= 5 && &cmd_buf[..5] == b"SPLIT" {
+                    // Parse optional line count: "SPLIT 5\n" or just "SPLIT\n"
+                    if cmd_len > 6 && cmd_buf[5] == b' ' {
+                        let mut lines: u16 = 0;
+                        let mut i = 6;
+                        while i < cmd_len && cmd_buf[i] >= b'0' && cmd_buf[i] <= b'9' {
+                            lines = lines.saturating_mul(10).saturating_add((cmd_buf[i] - b'0') as u16);
+                            i += 1;
+                        }
+                        if lines >= 1 && lines <= 20 {
+                            self.log_lines = lines;
+                        }
+                    }
+                    self.enable_split();
+                    // Send OK response
+                    if let Some(ring) = &self.shell_ring {
+                        ring.rx_write(b"OK\n");
+                        ring.notify();
+                    }
+                } else if cmd_len >= 7 && &cmd_buf[..7] == b"NOSPLIT" {
+                    self.disable_split();
+                    if let Some(ring) = &self.shell_ring {
+                        ring.rx_write(b"OK\n");
+                        ring.notify();
+                    }
+                } else if cmd_len >= 7 && &cmd_buf[..7] == b"GETSIZE" {
+                    // Temporarily disable scroll region for size detection
+                    if self.split_enabled {
+                        self.write_uart(b"\x1b[r");  // Reset scroll region
+                    }
+
+                    match ansi::query_screen_size() {
+                        Some((cols, rows)) => {
+                            // Log detected size
+                            self.write_uart(b"\r\n[consoled] detected size: ");
+                            let mut nbuf = [0u8; 8];
+                            let nlen = Self::write_u16_to_buf(&mut nbuf, cols);
+                            self.write_uart(&nbuf[..nlen]);
+                            self.write_uart(b"x");
+                            let nlen = Self::write_u16_to_buf(&mut nbuf, rows);
+                            self.write_uart(&nbuf[..nlen]);
+                            self.write_uart(b"\r\n");
+
+                            self.cols = cols;
+                            self.rows = rows;
+                        }
+                        None => {
+                            self.write_uart(b"\r\n[consoled] size detection failed, using cached\r\n");
+                        }
+                    }
+
+                    // Re-enable scroll region if split mode
+                    if self.split_enabled {
+                        // Re-setup the split screen with new size
+                        self.split_enabled = false;
+                        self.enable_split();
+                    }
+
                     let mut msg = [0u8; 32];
                     let len = format_size_msg(&mut msg, self.cols, self.rows);
-                    ring.rx_write(&msg[..len]);
-                    ring.notify();
-                } else {
-                    // Forward to UART
-                    let _ = syscall::write(Handle::STDOUT, &tx_buf[..n]);
+                    if let Some(ring) = &self.shell_ring {
+                        ring.rx_write(&msg[..len]);
+                        ring.notify();
+                    }
+                } else if cmd_len > 0 {
+                    // Regular output (not a command)
+                    if self.split_enabled {
+                        self.write_output(cmd_buf);
+                    } else {
+                        self.write_uart(cmd_buf);
+                    }
                 }
+                continue; // Check for more data
             }
 
             // Check stdin for user input (UART -> RX ring)
             match syscall::read(self.stdin_handle, &mut rx_buf) {
                 Ok(n) if n > 0 => {
-                    let written = ring.rx_write(&rx_buf[..n]);
-                    if written > 0 {
-                        ring.notify();
+                    if let Some(ring) = &self.shell_ring {
+                        let written = ring.rx_write(&rx_buf[..n]);
+                        if written > 0 {
+                            ring.notify();
+                        }
                     }
-                    // Continue immediately to process any response
                     continue;
                 }
                 _ => {}
             }
 
-            // Wait for EITHER stdin OR shmem to become readable
-            // This ensures we wake immediately when user types
-            if ring_mux.wait().is_err() {
-                syscall::sleep_us(50_000); // 50ms backoff if wait fails
+            // Wait for EITHER stdin OR shmem OR channel to become readable
+            // This ensures we wake immediately when user types or shell disconnects
+            match ring_mux.wait() {
+                Ok(event) => {
+                    // Check if this is the handshake channel signaling closure
+                    if let Some(ch_handle) = channel_handle {
+                        if event.handle == ch_handle {
+                            // Channel fired - try to recv to check if it's closed
+                            if let Some(ch) = &mut self.handshake_channel {
+                                let mut probe = [0u8; 1];
+                                match ch.recv(&mut probe) {
+                                    Err(SysError::PeerClosed) | Err(SysError::ConnectionReset) => {
+                                        clog!("shell disconnected (channel closed)");
+                                        self.disconnect_shell();
+                                        return;
+                                    }
+                                    _ => {} // Got data or would block - shell still alive
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    syscall::sleep_us(50_000); // 50ms backoff if wait fails
+                }
             }
         }
     }

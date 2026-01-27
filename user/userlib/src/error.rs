@@ -60,6 +60,8 @@ pub enum SysError {
     MessageTooLarge,
     /// EOPNOTSUPP (95) - Operation not supported
     OperationNotSupported,
+    /// EPIPE (32) - Broken pipe / peer closed
+    PeerClosed,
     /// ECONNRESET (104) - Connection reset by peer
     ConnectionReset,
     /// ETIMEDOUT (110) - Connection timed out
@@ -96,6 +98,7 @@ impl SysError {
             errno::ENOSYS => SysError::NotImplemented,
             errno::EMSGSIZE => SysError::MessageTooLarge,
             errno::EOPNOTSUPP => SysError::OperationNotSupported,
+            errno::EPIPE => SysError::PeerClosed,
             errno::ECONNRESET => SysError::ConnectionReset,
             errno::ETIMEDOUT => SysError::Timeout,
             errno::ECONNREFUSED => SysError::ConnectionRefused,
@@ -128,6 +131,7 @@ impl SysError {
             SysError::NotImplemented => errno::ENOSYS,
             SysError::MessageTooLarge => errno::EMSGSIZE,
             SysError::OperationNotSupported => errno::EOPNOTSUPP,
+            SysError::PeerClosed => errno::EPIPE,
             SysError::ConnectionReset => errno::ECONNRESET,
             SysError::Timeout => errno::ETIMEDOUT,
             SysError::ConnectionRefused => errno::ECONNREFUSED,
@@ -168,6 +172,7 @@ impl SysError {
             SysError::NotImplemented => "not implemented",
             SysError::MessageTooLarge => "message too large",
             SysError::OperationNotSupported => "operation not supported",
+            SysError::PeerClosed => "peer closed",
             SysError::ConnectionReset => "connection reset",
             SysError::Timeout => "timeout",
             SysError::ConnectionRefused => "connection refused",

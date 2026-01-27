@@ -74,6 +74,11 @@ impl ConsoleRing {
             // Head/tail already 0 from zero-init
         }
 
+        // MEMORY BARRIER: Ensure header writes are visible to other processes
+        // before we send the shmem_id. Without this, shell might map the shmem
+        // and see uninitialized tx_config/rx_config (causing crash at FAR=0x10).
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+
         Some(Self {
             shmem,
             is_owner: true,
@@ -86,6 +91,10 @@ impl ConsoleRing {
     pub fn map(shmem_id: u32) -> Option<Self> {
         // Open existing shmem via unified interface
         let shmem = Shmem::open_existing(shmem_id).ok()?;
+
+        // MEMORY BARRIER: Ensure we see all writes from the creator (consoled)
+        // before reading the header. Pairs with Release fence in create_with_config.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
         // Read config from header
         let vaddr = shmem.vaddr();

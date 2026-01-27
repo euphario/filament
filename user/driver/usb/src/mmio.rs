@@ -4,8 +4,8 @@
 
 use userlib::syscall;
 
-// Re-export MmioRegion and delay_ms from userlib (consolidated implementation)
-pub use userlib::{MmioRegion, delay_ms};
+// Re-export from userlib (now uses unified object interface)
+pub use userlib::mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interval};
 
 /// Format MMIO URL: "mmio:ADDR/SIZE" in hex
 /// (kept for compatibility with existing code)

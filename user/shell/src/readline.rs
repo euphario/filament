@@ -1,6 +1,6 @@
 //! Readline - Line Editing with History
 //!
-//! Provides bash-like line editing:
+//! Provides bash-like line editing with Claude Code-style input box:
 //! - Left/Right arrows: move cursor
 //! - Home/End: move to start/end of line
 //! - Backspace: delete before cursor
@@ -15,6 +15,7 @@
 
 use userlib::syscall;
 use crate::console;
+use crate::input_box::InputBox;
 
 /// Maximum command line length
 pub const MAX_LINE: usize = 128;
@@ -122,6 +123,10 @@ pub struct LineEditor<'a> {
     /// Saved current line when browsing history
     saved_line: [u8; MAX_LINE],
     saved_len: usize,
+    /// Input box for rendering
+    input_box: InputBox,
+    /// Whether to use box mode (false = legacy mode)
+    use_box: bool,
 }
 
 impl<'a> LineEditor<'a> {
@@ -134,23 +139,61 @@ impl<'a> LineEditor<'a> {
             history,
             saved_line: [0u8; MAX_LINE],
             saved_len: 0,
+            input_box: InputBox::new(),
+            use_box: false, // Disabled - triggers storm detection due to many write syscalls
         }
+    }
+
+    /// Create editor with explicit box mode setting
+    pub fn with_box_mode(buf: &'a mut [u8], history: &'a mut History, use_box: bool) -> Self {
+        history.reset_browse();
+        Self {
+            buf,
+            len: 0,
+            cursor: 0,
+            history,
+            saved_line: [0u8; MAX_LINE],
+            saved_len: 0,
+            input_box: InputBox::new(),
+            use_box,
+        }
+    }
+
+    /// Set terminal dimensions for box rendering
+    pub fn set_dimensions(&mut self, cols: u16, rows: u16) {
+        self.input_box.init(cols, rows);
     }
 
     /// Read a line with editing support
     /// Returns the length of the line, or 0 if cancelled/disconnected
     pub fn read(&mut self) -> usize {
+        // Get terminal dimensions from console
+        let con = console::console();
+        self.input_box.init(con.cols, con.rows);
+
+        // Draw initial empty box
+        if self.use_box {
+            self.input_box.draw(&[], 0);
+        }
+
         while self.len < self.buf.len() - 1 {
             let ch = match console::read_byte() {
                 Some(c) => c,
                 None => {
-                    // Connection lost - return empty line
+                    // Connection lost - clean up and return
+                    if self.use_box {
+                        self.input_box.clear();
+                    }
                     return 0;
                 }
             };
             match ch {
                     // Enter - end of line
                     b'\r' | b'\n' => {
+                        if self.use_box {
+                            // Clear box first, then move cursor to output area
+                            self.input_box.clear();
+                        }
                         write_str("\r\n");
                         // Add to history
                         if self.len > 0 {
@@ -166,6 +209,9 @@ impl<'a> LineEditor<'a> {
 
                     // Ctrl+C - cancel line
                     0x03 => {
+                        if self.use_box {
+                            self.input_box.clear();
+                        }
                         write_str("^C\r\n");
                         return 0;
                     }
@@ -173,6 +219,9 @@ impl<'a> LineEditor<'a> {
                     // Ctrl+D - EOF (exit if empty line)
                     0x04 => {
                         if self.len == 0 {
+                            if self.use_box {
+                                self.input_box.clear();
+                            }
                             write_str("\r\n");
                             syscall::exit(0);
                         }
@@ -268,9 +317,6 @@ impl<'a> LineEditor<'a> {
             return;
         }
 
-        // Inserting at end vs middle requires different handling
-        let inserting_at_end = self.cursor == self.len;
-
         // Shift characters after cursor to the right
         if self.cursor < self.len {
             for i in (self.cursor..self.len).rev() {
@@ -282,12 +328,16 @@ impl<'a> LineEditor<'a> {
         self.len += 1;
         self.cursor += 1;
 
-        if inserting_at_end {
-            // Simple case: just echo the character
-            console::write(&[ch]);
+        if self.use_box {
+            self.input_box.update(&self.buf[..self.len], self.cursor);
         } else {
-            // Redraw from cursor to end (cursor is now past the inserted char)
-            self.redraw_from_cursor();
+            // Legacy mode
+            let inserting_at_end = self.cursor == self.len;
+            if inserting_at_end {
+                console::write(&[ch]);
+            } else {
+                self.redraw_from_cursor();
+            }
         }
     }
 
@@ -305,10 +355,14 @@ impl<'a> LineEditor<'a> {
         self.len -= 1;
         self.cursor -= 1;
 
-        // Move cursor back and redraw
-        write_str("\x08");  // Move back
-        self.redraw_from_cursor();
-        write_str(" \x08");  // Clear last char
+        if self.use_box {
+            self.input_box.update(&self.buf[..self.len], self.cursor);
+        } else {
+            // Legacy mode: Move cursor back and redraw
+            write_str("\x08");
+            self.redraw_from_cursor();
+            write_str(" \x08");
+        }
     }
 
     /// Delete character at cursor
@@ -323,39 +377,70 @@ impl<'a> LineEditor<'a> {
         }
 
         self.len -= 1;
-        self.redraw_from_cursor();
-        write_str(" \x08");  // Clear last char
+
+        if self.use_box {
+            self.input_box.update(&self.buf[..self.len], self.cursor);
+        } else {
+            self.redraw_from_cursor();
+            write_str(" \x08");
+        }
     }
 
     /// Move cursor left
     fn move_left(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            write_str("\x08");  // Move back
+            if self.use_box {
+                self.input_box.position_cursor(self.cursor);
+            } else {
+                write_str("\x08");
+            }
         }
     }
 
     /// Move cursor right
     fn move_right(&mut self) {
         if self.cursor < self.len {
-            console::write(&[self.buf[self.cursor]]);
             self.cursor += 1;
+            if self.use_box {
+                self.input_box.position_cursor(self.cursor);
+            } else {
+                console::write(&[self.buf[self.cursor - 1]]);
+            }
         }
     }
 
     /// Move cursor to start
     fn move_to_start(&mut self) {
-        while self.cursor > 0 {
-            self.cursor -= 1;
-            write_str("\x08");
+        if self.cursor == 0 {
+            return;
+        }
+
+        if self.use_box {
+            self.cursor = 0;
+            self.input_box.position_cursor(0);
+        } else {
+            while self.cursor > 0 {
+                self.cursor -= 1;
+                write_str("\x08");
+            }
         }
     }
 
     /// Move cursor to end
     fn move_to_end(&mut self) {
-        while self.cursor < self.len {
-            console::write(&[self.buf[self.cursor]]);
-            self.cursor += 1;
+        if self.cursor >= self.len {
+            return;
+        }
+
+        if self.use_box {
+            self.cursor = self.len;
+            self.input_box.position_cursor(self.cursor);
+        } else {
+            while self.cursor < self.len {
+                console::write(&[self.buf[self.cursor]]);
+                self.cursor += 1;
+            }
         }
     }
 
@@ -368,19 +453,29 @@ impl<'a> LineEditor<'a> {
         let chars_to_clear = self.len - self.cursor;
         self.len = self.cursor;
 
-        // Clear to end of line
-        for _ in 0..chars_to_clear {
-            write_str(" ");
-        }
-        for _ in 0..chars_to_clear {
-            write_str("\x08");
+        if self.use_box {
+            self.input_box.update(&self.buf[..self.len], self.cursor);
+        } else {
+            for _ in 0..chars_to_clear {
+                write_str(" ");
+            }
+            for _ in 0..chars_to_clear {
+                write_str("\x08");
+            }
         }
     }
 
     /// Delete entire line
     fn delete_line(&mut self) {
-        self.move_to_start();
-        self.delete_to_end();
+        self.len = 0;
+        self.cursor = 0;
+
+        if self.use_box {
+            self.input_box.update(&[], 0);
+        } else {
+            self.move_to_start();
+            self.delete_to_end();
+        }
     }
 
     /// Delete word before cursor
@@ -412,20 +507,23 @@ impl<'a> LineEditor<'a> {
         }
 
         self.len -= chars_deleted;
-
-        // Move cursor back
-        for _ in 0..chars_deleted {
-            write_str("\x08");
-        }
         self.cursor = start;
 
-        // Redraw and clear
-        self.redraw_from_cursor();
-        for _ in 0..chars_deleted {
-            write_str(" ");
-        }
-        for _ in 0..chars_deleted {
-            write_str("\x08");
+        if self.use_box {
+            self.input_box.update(&self.buf[..self.len], self.cursor);
+        } else {
+            // Move cursor back
+            for _ in 0..chars_deleted {
+                write_str("\x08");
+            }
+            // Redraw and clear
+            self.redraw_from_cursor();
+            for _ in 0..chars_deleted {
+                write_str(" ");
+            }
+            for _ in 0..chars_deleted {
+                write_str("\x08");
+            }
         }
     }
 
@@ -483,26 +581,30 @@ impl<'a> LineEditor<'a> {
 
     /// Replace current line with new content
     fn replace_line(&mut self, new: &[u8]) {
-        // Move to start
-        self.move_to_start();
-
-        // Clear current line
-        let old_len = self.len;
-        for _ in 0..old_len {
-            write_str(" ");
-        }
-        for _ in 0..old_len {
-            write_str("\x08");
-        }
-
         // Copy new content
         let new_len = new.len().min(self.buf.len() - 1);
         self.buf[..new_len].copy_from_slice(&new[..new_len]);
         self.len = new_len;
         self.cursor = new_len;
 
-        // Display new line
-        console::write(&self.buf[..self.len]);
+        if self.use_box {
+            self.input_box.update(&self.buf[..self.len], self.cursor);
+        } else {
+            // Legacy mode: Move to start
+            self.move_to_start();
+
+            // Clear current line
+            let old_len = self.len;
+            for _ in 0..old_len {
+                write_str(" ");
+            }
+            for _ in 0..old_len {
+                write_str("\x08");
+            }
+
+            // Display new line
+            console::write(&self.buf[..self.len]);
+        }
     }
 
     /// Redraw from cursor to end of line
@@ -566,6 +668,11 @@ impl<'a> LineEditor<'a> {
             }
         } else if completions.count > 1 {
             // Multiple matches with same prefix - show options
+            if self.use_box {
+                // Clear box temporarily to show completions
+                self.input_box.clear();
+            }
+
             write_str("\r\n");
 
             // Print all matches
@@ -579,16 +686,21 @@ impl<'a> LineEditor<'a> {
             }
             write_str("\r\n");
 
-            // Redraw prompt and line (with colors)
-            crate::color::set(crate::color::BOLD);
-            crate::color::set(crate::color::GREEN);
-            write_str("> ");
-            crate::color::reset();
-            console::write(&self.buf[..self.len]);
+            if self.use_box {
+                // Redraw box with current content
+                self.input_box.draw(&self.buf[..self.len], self.cursor);
+            } else {
+                // Legacy mode: Redraw prompt and line (with colors)
+                crate::color::set(crate::color::BOLD);
+                crate::color::set(crate::color::GREEN);
+                write_str("> ");
+                crate::color::reset();
+                console::write(&self.buf[..self.len]);
 
-            // Move cursor back to position
-            for _ in self.cursor..self.len {
-                write_str("\x08");
+                // Move cursor back to position
+                for _ in self.cursor..self.len {
+                    write_str("\x08");
+                }
             }
         }
     }

@@ -87,6 +87,10 @@ pub mod msg {
     pub const UNREGISTER_DEVICE: u16 = 0x0101;
     /// Update device state
     pub const UPDATE_STATE: u16 = 0x0102;
+    /// Register a port (with optional parent and type)
+    pub const REGISTER_PORT: u16 = 0x0103;
+    /// Unregister a port
+    pub const UNREGISTER_PORT: u16 = 0x0104;
 
     // Query messages (client → devd → driver)
     /// List all registered devices
@@ -258,6 +262,162 @@ impl DeviceRegister {
             path,
             name,
         ))
+    }
+}
+
+// =============================================================================
+// Port Registration Messages
+// =============================================================================
+
+/// Port type constants (matches devd/ports.rs PortType enum)
+pub mod port_type {
+    pub const UNKNOWN: u8 = 0;
+    pub const BLOCK: u8 = 1;
+    pub const PARTITION: u8 = 2;
+    pub const FILESYSTEM: u8 = 3;
+    pub const USB: u8 = 4;
+    pub const NETWORK: u8 = 5;
+    pub const CONSOLE: u8 = 6;
+    pub const SERVICE: u8 = 7;
+}
+
+/// Port registration message (driver → devd)
+///
+/// Used by drivers to dynamically register ports with hierarchy information.
+/// This enables the composable driver stack where each layer can spawn the next.
+///
+/// Variable-length: header + fixed fields + port_name + parent_name
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortRegister {
+    pub header: QueryHeader,
+    /// Port type (see `port_type` module)
+    pub port_type: u8,
+    /// Length of port name (follows fixed fields)
+    pub name_len: u8,
+    /// Length of parent name (follows port name, 0 = no parent)
+    pub parent_len: u8,
+    /// Reserved
+    pub _pad: u8,
+    /// Shared memory ID for DataPort (0 = no data port)
+    pub shmem_id: u32,
+    // Followed by: port name bytes, then parent name bytes
+}
+
+impl PortRegister {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8;
+
+    pub fn new(seq_id: u32, port_type: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::REGISTER_PORT, seq_id),
+            port_type,
+            name_len: 0,
+            parent_len: 0,
+            _pad: 0,
+            shmem_id: 0,
+        }
+    }
+
+    /// Serialize to buffer, returns total length written
+    pub fn write_to(
+        &self,
+        buf: &mut [u8],
+        name: &[u8],
+        parent: Option<&[u8]>,
+        shmem_id: u32,
+    ) -> Option<usize> {
+        let parent_bytes = parent.unwrap_or(&[]);
+        let total_len = Self::FIXED_SIZE + name.len() + parent_bytes.len();
+        if buf.len() < total_len || name.len() > 255 || parent_bytes.len() > 255 {
+            return None;
+        }
+
+        // Header
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+
+        // Fixed fields
+        buf[8] = self.port_type;
+        buf[9] = name.len() as u8;
+        buf[10] = parent_bytes.len() as u8;
+        buf[11] = 0;
+        buf[12..16].copy_from_slice(&shmem_id.to_le_bytes());
+
+        // Variable fields
+        let name_start = Self::FIXED_SIZE;
+        buf[name_start..name_start + name.len()].copy_from_slice(name);
+        if !parent_bytes.is_empty() {
+            let parent_start = name_start + name.len();
+            buf[parent_start..parent_start + parent_bytes.len()].copy_from_slice(parent_bytes);
+        }
+
+        Some(total_len)
+    }
+
+    /// Parse from buffer
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8], Option<&[u8]>)> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+
+        let header = QueryHeader::from_bytes(buf)?;
+        let port_type = buf[8];
+        let name_len = buf[9] as usize;
+        let parent_len = buf[10] as usize;
+        let shmem_id = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+
+        let total_len = Self::FIXED_SIZE + name_len + parent_len;
+        if buf.len() < total_len {
+            return None;
+        }
+
+        let name_start = Self::FIXED_SIZE;
+        let name = &buf[name_start..name_start + name_len];
+        let parent = if parent_len > 0 {
+            let parent_start = name_start + name_len;
+            Some(&buf[parent_start..parent_start + parent_len])
+        } else {
+            None
+        };
+
+        Some((
+            Self {
+                header,
+                port_type,
+                name_len: name_len as u8,
+                parent_len: parent_len as u8,
+                _pad: 0,
+                shmem_id,
+            },
+            name,
+            parent,
+        ))
+    }
+}
+
+/// Port registration response
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortRegisterResponse {
+    pub header: QueryHeader,
+    /// 0 = success, negative = error
+    pub result: i32,
+}
+
+impl PortRegisterResponse {
+    pub const SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, result: i32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::REGISTER_PORT, seq_id),
+            result,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
+        buf
     }
 }
 

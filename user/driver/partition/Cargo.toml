@@ -1,0 +1,12 @@
+[package]
+name = "partition"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+userlib = { path = "../../userlib" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"

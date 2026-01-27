@@ -18,8 +18,10 @@
 //! - **BPI-R4**: SSUSB1 -> VL822 hub -> 4x USB-A
 //! - **Other board**: Same SoC, different GPIO, different port layout
 
+#[cfg(feature = "mt7988a")]
 pub mod bpi_r4;
 
+#[cfg(feature = "mt7988a")]
 pub use bpi_r4::BpiR4;
 
 use crate::soc::SocUsb;

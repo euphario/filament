@@ -1,16 +1,16 @@
 //! MMIO helpers for memory-mapped I/O access
 //!
 //! Provides a safe-ish wrapper around memory-mapped I/O regions.
-//! Uses the kernel's mmio scheme for mapping physical addresses.
+//! Uses the unified object interface for mapping physical addresses.
 
-use crate::syscall;
+use crate::syscall::{self, Handle, ObjectType};
 
 /// MMIO region handle
 ///
 /// Represents a mapped memory-mapped I/O region. The region is unmapped
 /// when the handle is dropped.
 pub struct MmioRegion {
-    fd: i32,
+    handle: Handle,
     base: u64,
     size: u64,
 }
@@ -20,25 +20,18 @@ impl MmioRegion {
     ///
     /// Returns None if the mapping fails.
     pub fn open(phys_addr: u64, size: u64) -> Option<Self> {
-        let mut url_buf = [0u8; 64];
-        let url_len = format_mmio_url(&mut url_buf, phys_addr, size);
+        // Build params: u64 phys_addr, u64 size (16 bytes)
+        let mut params = [0u8; 16];
+        params[0..8].copy_from_slice(&phys_addr.to_le_bytes());
+        params[8..16].copy_from_slice(&size.to_le_bytes());
 
-        let url_str = core::str::from_utf8(&url_buf[..url_len]).ok()?;
-        let fd = syscall::scheme_open(url_str, 0);
-        if fd < 0 {
-            return None;
-        }
+        // Open MMIO object (kernel maps it during open)
+        let handle = syscall::open(ObjectType::Mmio, &params).ok()?;
 
-        // Read virtual address from kernel
-        let mut virt_buf = [0u8; 8];
-        let n = syscall::read(fd as u32, &mut virt_buf);
-        if n != 8 {
-            syscall::close(fd as u32);
-            return None;
-        }
+        // Get virtual address via map syscall
+        let base = syscall::map(handle, 0).ok()?;
 
-        let base = u64::from_le_bytes(virt_buf);
-        Some(Self { fd, base, size })
+        Some(Self { handle, base, size })
     }
 
     /// Get the virtual base address
@@ -151,9 +144,153 @@ impl MmioRegion {
 
 impl Drop for MmioRegion {
     fn drop(&mut self) {
-        if self.fd >= 0 {
-            syscall::close(self.fd as u32);
+        let _ = syscall::close(self.handle);
+    }
+}
+
+// =============================================================================
+// DMA Pool
+// =============================================================================
+
+/// DMA-capable memory pool
+///
+/// Allocates physically contiguous, non-cacheable memory suitable for DMA.
+/// Use this for USB rings, command buffers, etc.
+pub struct DmaPool {
+    handle: Handle,
+    vaddr: u64,
+    paddr: u64,
+    size: usize,
+}
+
+impl DmaPool {
+    /// Allocate a DMA pool of the given size
+    ///
+    /// Returns None if allocation fails.
+    /// The memory is physically contiguous and non-cacheable.
+    pub fn alloc(size: usize) -> Option<Self> {
+        // Build params: u64 size, u32 flags (16 bytes)
+        // flags bit 0: 1 = high memory pool, 0 = low memory pool
+        let mut params = [0u8; 16];
+        params[0..8].copy_from_slice(&(size as u64).to_le_bytes());
+        params[8..12].copy_from_slice(&0u32.to_le_bytes()); // low memory
+
+        // Open DMA pool object
+        let handle = syscall::open(ObjectType::DmaPool, &params).ok()?;
+
+        // Get virtual address via map syscall
+        let vaddr = match syscall::map(handle, 0) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = syscall::close(handle);
+                return None;
+            }
+        };
+
+        // Get physical address via read syscall (returns paddr + size)
+        let mut info = [0u8; 16];
+        if syscall::read(handle, &mut info).ok()? != 16 {
+            let _ = syscall::close(handle);
+            return None;
         }
+
+        let paddr = u64::from_le_bytes([
+            info[0], info[1], info[2], info[3],
+            info[4], info[5], info[6], info[7],
+        ]);
+
+        Some(Self { handle, vaddr, paddr, size })
+    }
+
+    /// Get the virtual base address
+    #[inline]
+    pub fn vaddr(&self) -> u64 {
+        self.vaddr
+    }
+
+    /// Get the physical base address (for DMA)
+    #[inline]
+    pub fn paddr(&self) -> u64 {
+        self.paddr
+    }
+
+    /// Get the allocation size
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Get a pointer to the memory
+    #[inline]
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.vaddr as *mut u8
+    }
+
+    /// Get a slice of the memory
+    ///
+    /// # Safety
+    /// Caller must ensure no concurrent DMA access to this region.
+    #[inline]
+    pub unsafe fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.vaddr as *const u8, self.size) }
+    }
+
+    /// Get a mutable slice of the memory
+    ///
+    /// # Safety
+    /// Caller must ensure no concurrent DMA access to this region.
+    #[inline]
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.vaddr as *mut u8, self.size) }
+    }
+
+    /// Zero the memory
+    pub fn zero(&mut self) {
+        unsafe {
+            core::ptr::write_bytes(self.vaddr as *mut u8, 0, self.size);
+        }
+    }
+
+    /// Read a u32 at offset
+    #[inline]
+    pub fn read32(&self, offset: usize) -> u32 {
+        debug_assert!(offset + 4 <= self.size);
+        unsafe {
+            core::ptr::read_volatile((self.vaddr + offset as u64) as *const u32)
+        }
+    }
+
+    /// Write a u32 at offset
+    #[inline]
+    pub fn write32(&self, offset: usize, value: u32) {
+        debug_assert!(offset + 4 <= self.size);
+        unsafe {
+            core::ptr::write_volatile((self.vaddr + offset as u64) as *mut u32, value);
+        }
+    }
+
+    /// Read a u64 at offset
+    #[inline]
+    pub fn read64(&self, offset: usize) -> u64 {
+        debug_assert!(offset + 8 <= self.size);
+        unsafe {
+            core::ptr::read_volatile((self.vaddr + offset as u64) as *const u64)
+        }
+    }
+
+    /// Write a u64 at offset
+    #[inline]
+    pub fn write64(&self, offset: usize, value: u64) {
+        debug_assert!(offset + 8 <= self.size);
+        unsafe {
+            core::ptr::write_volatile((self.vaddr + offset as u64) as *mut u64, value);
+        }
+    }
+}
+
+impl Drop for DmaPool {
+    fn drop(&mut self) {
+        let _ = syscall::close(self.handle);
     }
 }
 

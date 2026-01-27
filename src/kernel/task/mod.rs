@@ -870,9 +870,15 @@ impl Scheduler {
             // Transition failed - task was evicted
             kerror!("task", "run_user_task_failed"; slot = slot as u64, pid = task.id as u64, state = task.state().name());
 
-            // Reset to idle task
+            // Reset to idle task - update globals directly since we already hold the lock
             set_current_slot(0);
-            update_current_task_globals();
+            if let Some(ref mut idle) = self.tasks[0] {
+                let trap_ptr = &mut idle.trap_frame as *mut TrapFrame;
+                CURRENT_TRAP_FRAME.store(trap_ptr, Ordering::Release);
+                if let Some(ref addr_space) = idle.address_space {
+                    CURRENT_TTBR0.store(addr_space.get_ttbr0(), Ordering::Release);
+                }
+            }
             return None;
         }
 
@@ -1189,65 +1195,40 @@ pub fn spawn_user_task(name: &str) -> Option<(TaskId, usize)> {
     sched.add_user_task(name)
 }
 
-/// Update the current task globals after scheduling decision
-///
-/// # Safety
-/// Must be called with valid current task.
-///
-/// # Note
-/// This function acquires the scheduler lock. It should NOT be called
-/// while already holding the lock. For three-phase reschedule, extract
-/// the needed data (trap_frame ptr, ttbr0) upfront in Phase 1.
-pub unsafe fn update_current_task_globals() {
-    let mut sched = SCHEDULER.lock();
-    let slot = current_slot();
-
-    // Defensive check: validate current slot is in bounds
-    if slot >= MAX_TASKS {
-        crate::platform::current::uart::print("[PANIC] update_current_task_globals: current slot out of bounds!\r\n");
-        loop { core::arch::asm!("wfe"); }
-    }
-
-    if let Some(ref mut task) = sched.tasks[slot] {
-        let trap_ptr = &mut task.trap_frame as *mut TrapFrame;
-        let trap_addr = trap_ptr as u64;
-
-        // Defensive check: trap frame should be in kernel space (0xFFFF...)
-        if trap_addr < 0xFFFF_0000_0000_0000 {
-            crate::platform::current::uart::print("[PANIC] update_current_task_globals: trap_frame not in kernel space!\r\n");
-            loop { core::arch::asm!("wfe"); }
-        }
-
-        CURRENT_TRAP_FRAME.store(trap_ptr, Ordering::Release);
-
-        if let Some(ref addr_space) = task.address_space {
-            let ttbr0 = addr_space.get_ttbr0();
-            // Extract physical address (bits [47:0], mask out ASID in bits [63:48])
-            let ttbr0_phys = ttbr0 & 0x0000_FFFF_FFFF_FFFF;
-
-            // Defensive check: physical address should be valid DRAM (>= 0x40000000)
-            // and properly aligned (4KB page table)
-            if ttbr0_phys < 0x4000_0000 || ttbr0_phys >= 0x1_0000_0000 || (ttbr0_phys & 0xFFF) != 0 {
-                crate::platform::current::uart::print("[PANIC] update_current_task_globals: invalid TTBR0=0x");
-                // Print hex value
-                for i in (0..16).rev() {
-                    let nibble = ((ttbr0 >> (i * 4)) & 0xf) as u8;
-                    let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-                    crate::platform::current::uart::putc(c as char);
-                }
-                crate::platform::current::uart::print("\r\n");
-                loop { core::arch::asm!("wfe"); }
-            }
-
-            CURRENT_TTBR0.store(ttbr0, Ordering::Release);
-        }
-        // Note: Kernel tasks (no address_space) keep existing TTBR0
-    } else {
-        // No task at current slot - this is also a bug
-        crate::platform::current::uart::print("[PANIC] update_current_task_globals: no task at current slot!\r\n");
-        loop { core::arch::asm!("wfe"); }
-    }
-}
+// ============================================================================
+// Updating Task Globals - Pattern Documentation
+// ============================================================================
+//
+// When switching tasks, update CURRENT_TRAP_FRAME and CURRENT_TTBR0 while
+// STILL HOLDING the scheduler lock. Do NOT call a helper function that
+// re-acquires the lock (this causes deadlock since SpinLock is not reentrant).
+//
+// ## Correct Pattern
+//
+// ```rust
+// with_scheduler(|sched| {
+//     // ... scheduling decision ...
+//     task::set_current_slot(next_slot);
+//
+//     // Update globals while still holding lock:
+//     if let Some(next) = sched.task_mut(next_slot) {
+//         crate::transition_or_evict!(next, set_running);
+//         let trap_ptr = &mut next.trap_frame as *mut task::TrapFrame;
+//         task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+//         if let Some(ref addr_space) = next.address_space {
+//             task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+//         }
+//     }
+// });
+// ```
+//
+// ## Why Not a Helper Function?
+//
+// A helper function that acquires SCHEDULER.lock() internally will deadlock
+// if called from inside with_scheduler(). The closure-based API ensures the
+// lock is always released, but only if you don't call functions that
+// re-acquire it.
+// ============================================================================
 
 /// Check NEED_RESCHED flag and perform reschedule if needed.
 /// Called at safe points (syscall exit, exception return).
@@ -1270,6 +1251,12 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     // We must process these before checking need_resched.
     process_pending_wakes();
 
+    // Process any pending task evictions.
+    // This is critical for storm detection: when a task is marked for eviction
+    // during syscall handling, we must process it before returning to userspace.
+    // Otherwise the task keeps making syscalls and hitting storm detection again.
+    eviction::process_pending_evictions();
+
     // Check and clear the flag atomically (before taking lock)
     let need_resched = crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched();
 
@@ -1277,11 +1264,13 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     let (should_resched, blocked_pid) = if need_resched {
         (true, 0)
     } else {
-        // Check if current task is blocked - requires lock for safe access
+        // Check if current task is blocked or terminated - requires lock for safe access
         with_scheduler(|sched| {
             let my_slot = current_slot();
             match sched.tasks[my_slot].as_ref() {
                 Some(t) if t.is_blocked() => (true, t.id),
+                // Terminated tasks (including evicted) must yield CPU
+                Some(t) if t.is_terminated() => (true, t.id),
                 _ => (false, 0),
             }
         })

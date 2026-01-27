@@ -143,7 +143,15 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         auto_restart: true,
         parent: None,
     },
-    // Future services would be added here
+    // QEMU USB driver - only works on QEMU virt platform
+    // TODO: Make this conditional on platform detection
+    ServiceDef {
+        binary: "qemu-usbd",
+        registers: &[],  // USB driver - doesn't register ports yet
+        dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
+        auto_restart: false,  // Don't restart on failure during testing
+        parent: None,
+    },
 ];
 
 // =============================================================================
@@ -350,6 +358,14 @@ impl ServiceRegistry {
         self.services[idx] = Some(service);
         self.count += 1;
         Some(idx)
+    }
+
+    /// Find an empty service slot (for dynamic drivers)
+    ///
+    /// Unlike `add()` which only uses count, this searches for any None slot.
+    /// Used for dynamically spawned drivers that don't have static definitions.
+    pub fn find_empty_slot(&self) -> Option<usize> {
+        (0..MAX_SERVICES).find(|&i| self.services[i].is_none())
     }
 }
 

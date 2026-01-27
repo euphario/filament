@@ -365,6 +365,19 @@ impl MappingTable {
         }
         pids
     }
+
+    /// Get all region IDs that a PID has mapped (for mapper death notification)
+    fn get_regions_for_pid(&self, pid: Pid) -> [u32; MAX_SHMEM_REGIONS] {
+        let mut regions = [0u32; MAX_SHMEM_REGIONS];
+        let mut idx = 0;
+        for entry in &self.entries[..self.count] {
+            if entry.pid == pid && idx < MAX_SHMEM_REGIONS {
+                regions[idx] = entry.region_id;
+                idx += 1;
+            }
+        }
+        regions
+    }
 }
 
 // ============================================================================
@@ -986,28 +999,39 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
 
 /// Unmap a physical address range from all processes
 /// Used when destroying shared memory to prevent use-after-free
+///
+/// DEADLOCK FIX: Uses try_scheduler() because this may be called from
+/// reap_terminated() which already holds the scheduler lock. If lock is
+/// held, we're inside reap_terminated and can safely skip - the dying
+/// task's mappings will be cleaned up by task destruction anyway.
 fn unmap_from_all_processes(phys_addr: u64, size: usize) {
-    super::task::with_scheduler(|sched| {
-        for (_slot, task_opt) in sched.iter_tasks_mut() {
-            if let Some(task) = task_opt {
-                // Search task's heap mappings for this physical address
-                // First find the virtual address, then unmap (avoids borrow issues)
-                let mut virt_to_unmap = None;
-                for mapping in task.heap_mappings.iter() {
-                    if !mapping.is_empty() && mapping.phys_addr == phys_addr {
-                        virt_to_unmap = Some(mapping.virt_addr);
-                        break; // Each task should only have one mapping to this phys
-                    }
-                }
+    // Use try_scheduler to avoid deadlock when called from reap_terminated
+    let Some(mut sched) = super::task::try_scheduler() else {
+        // Lock held by caller (reap_terminated) - mappings will be cleaned up
+        // when tasks are destroyed. The physical memory won't be freed until
+        // after this function returns, so there's no use-after-free risk.
+        return;
+    };
 
-                // Now unmap if we found a mapping
-                // Note: munmap() won't free pages because kind is BorrowedShmem
-                if let Some(virt_addr) = virt_to_unmap {
-                    task.munmap(virt_addr, size);
+    for (_slot, task_opt) in sched.iter_tasks_mut() {
+        if let Some(task) = task_opt {
+            // Search task's heap mappings for this physical address
+            // First find the virtual address, then unmap (avoids borrow issues)
+            let mut virt_to_unmap = None;
+            for mapping in task.heap_mappings.iter() {
+                if !mapping.is_empty() && mapping.phys_addr == phys_addr {
+                    virt_to_unmap = Some(mapping.virt_addr);
+                    break; // Each task should only have one mapping to this phys
                 }
             }
+
+            // Now unmap if we found a mapping
+            // Note: munmap() won't free pages because kind is BorrowedShmem
+            if let Some(virt_addr) = virt_to_unmap {
+                task.munmap(virt_addr, size);
+            }
         }
-    });
+    }
 }
 
 /// Map physical memory into a process's address space for DMA
@@ -1029,13 +1053,21 @@ fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
     })
 }
 
-/// Phase 1: Begin cleanup - mark regions as Dying and notify mappers
+/// Phase 1: Begin cleanup - mark regions as Dying and notify mappers/owners
 /// This gives servers a chance to release their mappings gracefully.
 /// Call finalize_cleanup() later to actually free the memory.
+///
+/// Bidirectional notification:
+/// - If owner dies: notify all mappers (ShmemInvalid event)
+/// - If mapper dies: notify owner (MapperLeft event)
 pub fn begin_cleanup(pid: Pid) {
-    // Collect regions owned by this process and pids to notify
-    let mut to_notify: [(u32, Pid); MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS] = [(0, 0); MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS];
-    let mut notify_count = 0;
+    // Collect regions owned by this process and pids to notify (owner dying)
+    let mut to_notify_mappers: [(u32, Pid); MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS] = [(0, 0); MAX_SHMEM_REGIONS * MAX_ALLOWED_PIDS];
+    let mut mapper_notify_count = 0;
+
+    // Collect owners to notify when this pid (mapper) dies
+    let mut to_notify_owners: [(u32, Pid); MAX_SHMEM_REGIONS] = [(0, 0); MAX_SHMEM_REGIONS];
+    let mut owner_notify_count = 0;
 
     // Collect shmem IDs owned by this pid first (to get mappers from table)
     let mut owned_ids: [u32; MAX_SHMEM_REGIONS] = [0; MAX_SHMEM_REGIONS];
@@ -1043,6 +1075,9 @@ pub fn begin_cleanup(pid: Pid) {
 
     {
         let mut guard = SHMEM.lock();
+
+        // Get regions this pid has mapped (for notifying owners when mapper dies)
+        let mapped_regions = guard.mappings.get_regions_for_pid(pid);
 
         // First pass: collect owned region IDs and get their mapped PIDs
         for slot in guard.table.iter() {
@@ -1058,10 +1093,21 @@ pub fn begin_cleanup(pid: Pid) {
                     let mapped_pids = guard.mappings.get_mapped_pids(shmem_id);
                     for mapper_pid in mapped_pids {
                         if mapper_pid != NO_PID && mapper_pid != pid {
-                            if notify_count < to_notify.len() {
-                                to_notify[notify_count] = (shmem_id, mapper_pid);
-                                notify_count += 1;
+                            if mapper_notify_count < to_notify_mappers.len() {
+                                to_notify_mappers[mapper_notify_count] = (shmem_id, mapper_pid);
+                                mapper_notify_count += 1;
                             }
+                        }
+                    }
+                }
+
+                // Check if this pid is a mapper (not owner) of this region
+                // to notify the owner
+                for &region_id in &mapped_regions {
+                    if region_id != 0 && region_id == region.id && region.owner_pid != pid {
+                        if owner_notify_count < to_notify_owners.len() {
+                            to_notify_owners[owner_notify_count] = (region_id, region.owner_pid);
+                            owner_notify_count += 1;
                         }
                     }
                 }
@@ -1094,11 +1140,26 @@ pub fn begin_cleanup(pid: Pid) {
     }
     // shmem lock released before touching scheduler/events
 
-    // Send ShmemInvalid events to all mappers (outside lock)
-    for i in 0..notify_count {
-        let (shmem_id, mapper_pid) = to_notify[i];
+    // Send ShmemInvalid events to all mappers when owner dies
+    for i in 0..mapper_notify_count {
+        let (shmem_id, mapper_pid) = to_notify_mappers[i];
         let event = super::event::Event::shmem_invalid(shmem_id, pid);
         let _ = super::event::deliver_event_to_task(mapper_pid, event);
+    }
+
+    // Send MapperLeft events to owners when mapper dies (bidirectional notification)
+    for i in 0..owner_notify_count {
+        let (shmem_id, owner_pid) = to_notify_owners[i];
+        if owner_pid != NO_PID {
+            // Send event
+            let event = super::event::Event::shmem_mapper_left(shmem_id, pid);
+            let _ = super::event::deliver_event_to_task(owner_pid, event);
+
+            // Also mark the owner's ShmemObject as notified (for mux wakeup)
+            super::object::syscall::mark_shmem_notified_for_task(owner_pid, shmem_id);
+
+            kinfo!("shmem", "mapper_left_notify"; shmem_id = shmem_id as u64, mapper = pid as u64, owner = owner_pid as u64);
+        }
     }
 }
 

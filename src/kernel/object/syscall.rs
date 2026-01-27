@@ -26,7 +26,6 @@ use crate::platform::current::uart;
 use crate::kernel::ipc;
 use crate::kernel::ipc::waker;
 use crate::kernel::shmem;
-
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -151,6 +150,7 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::Msi(m) => read_msi(m, buf_ptr, buf_len),
             Object::BusList(b) => read_bus_list(b, buf_ptr, buf_len),
             Object::Ring(r) => read_ring(r, buf_ptr, buf_len, task_id),
+            Object::DmaPool(d) => read_dma_pool(d, buf_ptr, buf_len),
             _ => Error::NotSupported.to_errno(),
         }
     });
@@ -1003,8 +1003,19 @@ fn read_port_via_service(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: us
 // when allocating the channel handle. See that function for the implementation.
 
 fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
-    // Read = WAIT operation
-    // Params: optional timeout_ms (u32) in buffer, default 0 = infinite
+    // buf_len >= 16: Metadata query - returns paddr (u64) + size (u64)
+    // buf_len < 16: WAIT operation with optional timeout
+    if buf_len >= 16 {
+        let mut info = [0u8; 16];
+        info[0..8].copy_from_slice(&s.paddr().to_le_bytes());
+        info[8..16].copy_from_slice(&(s.size() as u64).to_le_bytes());
+        if uaccess::copy_to_user(buf_ptr, &info).is_err() {
+            return Error::BadAddress.to_errno();
+        }
+        return 16;
+    }
+
+    // WAIT operation - params: optional timeout_ms (u32), default 0 = infinite
     let timeout_ms = if buf_len >= 4 {
         let mut timeout_bytes = [0u8; 4];
         if uaccess::copy_from_user(&mut timeout_bytes, buf_ptr).is_err() {
@@ -1026,6 +1037,23 @@ fn read_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id:
         }
         Err(e) => e,
     }
+}
+
+fn read_dma_pool(d: &mut super::DmaPoolObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    // Read returns DMA pool info: physical address (u64) + size (u64) = 16 bytes
+    if buf_len < 16 {
+        return Error::InvalidArg.to_errno();
+    }
+
+    let mut info = [0u8; 16];
+    info[0..8].copy_from_slice(&d.paddr().to_le_bytes());
+    info[8..16].copy_from_slice(&(d.size() as u64).to_le_bytes());
+
+    if uaccess::copy_to_user(buf_ptr, &info).is_err() {
+        return Error::BadAddress.to_errno();
+    }
+
+    16 // Return bytes written
 }
 
 fn read_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
@@ -1371,10 +1399,17 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
 
                 let ready = match &mut entry.object {
                     Object::Channel(_) => {
-                        if (watch.filter & filter::READABLE) != 0 {
-                            channel_id != 0 && ipc::channel_has_messages(channel_id)
-                        } else if (watch.filter & filter::CLOSED) != 0 {
-                            channel_id == 0
+                        let is_closed = channel_id == 0
+                            || !ipc::channel_exists(channel_id)
+                            || ipc::channel_is_closed(channel_id);
+                        let has_messages = channel_id != 0 && ipc::channel_has_messages(channel_id);
+
+                        // Closed channels are "readable" - recv() will return PeerClosed error
+                        // which is important information the caller needs to handle.
+                        if (watch.filter & filter::CLOSED) != 0 && is_closed {
+                            true
+                        } else if (watch.filter & filter::READABLE) != 0 && (has_messages || is_closed) {
+                            true
                         } else {
                             false
                         }
@@ -1422,6 +1457,10 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                         } else {
                             false
                         }
+                    }
+                    Object::Ring(r) => {
+                        // Use Ring's Pollable impl which checks peer liveness for CLOSED
+                        r.poll(watch.filter).is_ready()
                     }
                     _ => false,
                 };
@@ -1521,10 +1560,16 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
 
                     let ready = match &entry.object {
                         Object::Channel(_) => {
-                            if (watch.filter & filter::READABLE) != 0 {
-                                channel_id != 0 && ipc::channel_has_messages(channel_id)
-                            } else if (watch.filter & filter::CLOSED) != 0 {
-                                channel_id == 0
+                            let is_closed = channel_id == 0
+                                || !ipc::channel_exists(channel_id)
+                                || ipc::channel_is_closed(channel_id);
+                            let has_messages = channel_id != 0 && ipc::channel_has_messages(channel_id);
+
+                            // Closed channels are "readable" - recv() will return PeerClosed error
+                            if (watch.filter & filter::CLOSED) != 0 && is_closed {
+                                true
+                            } else if (watch.filter & filter::READABLE) != 0 && (has_messages || is_closed) {
+                                true
                             } else {
                                 false
                             }
@@ -1552,6 +1597,10 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                         }
                         Object::Process(p) => {
                             (watch.filter & filter::READABLE) != 0 && p.poll(filter::READABLE).is_ready()
+                        }
+                        Object::Ring(r) => {
+                            // Use Ring's Pollable impl which checks peer liveness for CLOSED
+                            r.poll(watch.filter).is_ready()
                         }
                         _ => false,
                     };
@@ -1859,6 +1908,28 @@ fn notify_shmem_objects(shmem_id: u32, caller_pid: u32) {
     }
 }
 
+/// Mark a specific task's ShmemObject as notified
+/// Used by shmem cleanup to notify owner when a mapper dies
+///
+/// NOTE: Does NOT wake the task directly to avoid deadlock when called from
+/// reap_terminated (which holds scheduler lock). The task will be woken by
+/// event delivery or its next mux poll.
+pub fn mark_shmem_notified_for_task(task_pid: u32, shmem_id: u32) {
+    use crate::kernel::object_service::object_service;
+
+    let _ = object_service().with_table_mut(task_pid, |table| {
+        // Find ShmemObject with matching shmem_id
+        for (_handle, entry) in table.iter_mut() {
+            if let Object::Shmem(ref mut s) = entry.object {
+                if s.shmem_id() == shmem_id {
+                    s.set_notified(true);
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn write_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize) -> i64 {
     // Only stdout and stderr are writable
     match c.console_type {
@@ -2014,14 +2085,15 @@ fn map_shmem(s: &mut super::ShmemObject, task_id: u32) -> i64 {
     }
 }
 
-fn map_dma_pool(d: &mut super::DmaPoolObject, task_id: u32) -> i64 {
-    let _ = (d, task_id);
-    Error::NotSupported.to_errno()
+fn map_dma_pool(d: &mut super::DmaPoolObject, _task_id: u32) -> i64 {
+    // DMA pool is already mapped during open(), return the vaddr
+    // Use read() on the handle to get the physical address
+    d.vaddr() as i64
 }
 
-fn map_mmio(m: &mut super::MmioObject, task_id: u32) -> i64 {
-    let _ = (m, task_id);
-    Error::NotSupported.to_errno()
+fn map_mmio(m: &mut super::MmioObject, _task_id: u32) -> i64 {
+    // MMIO is already mapped during open(), just return the vaddr
+    m.vaddr() as i64
 }
 
 // Close implementations

@@ -194,17 +194,15 @@ pub fn gettime() -> u64 {
     syscall0(sys::GETTIME) as u64
 }
 
-/// Sleep until deadline (nanoseconds since boot)
-///
-/// Light oneshot timer - task sleeps until deadline.
-/// More efficient than Timer object for simple delays.
-pub fn sleep_until(deadline_ns: u64) {
-    syscall1(sys::SLEEP, deadline_ns);
-}
-
 /// Sleep for duration in nanoseconds
+///
+/// Light oneshot timer - task sleeps for the specified duration.
+/// More efficient than Timer object for simple delays.
+///
+/// Note: The kernel's SLEEP syscall expects a duration, not an absolute deadline.
+/// It internally computes deadline = now + duration.
 pub fn sleep_ns(ns: u64) {
-    sleep_until(gettime() + ns);
+    syscall1(sys::SLEEP, ns);
 }
 
 /// Sleep for duration in microseconds

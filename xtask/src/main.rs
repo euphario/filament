@@ -136,7 +136,7 @@ fn cmd_build(
 
     // Step 1: Build user programs
     if !skip_user {
-        build_user(root, &only)?;
+        build_user(root, &only, platform)?;
     } else {
         println!("Step 1: Skipping user programs (--skip-user)");
     }
@@ -230,18 +230,24 @@ fn build_dtb(root: &Path) -> Result<()> {
 }
 
 /// Build user programs
-fn build_user(root: &Path, only: &[String]) -> Result<()> {
+fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
     let user_dir = root.join("user");
 
-    // Programs to build: name:path pairs
-    let all_programs = [
+    // Core programs (built for all platforms)
+    let mut all_programs: Vec<(&str, &str)> = vec![
         ("devd", "driver/devd"),
         ("consoled", "driver/consoled"),
         ("shell", "shell"),
+        ("partition", "driver/partition"),
     ];
 
+    // Platform-specific programs
+    if platform == "qemu" || platform == "qemu-virt" {
+        all_programs.push(("qemu-usbd", "driver/qemu-usbd"));
+    }
+
     let programs: Vec<_> = if only.is_empty() {
-        all_programs.to_vec()
+        all_programs.clone()
     } else {
         all_programs
             .iter()

@@ -23,8 +23,10 @@
 //! - Standard xHCI operations (that's in `xhci` module)
 //! - Board-specific GPIO/power (that's in `board` module)
 
+#[cfg(feature = "mt7988a")]
 pub mod mt7988a;
 
+#[cfg(feature = "mt7988a")]
 pub use mt7988a::{Mt7988aSoc, ControllerId as Mt7988aControllerId};
 
 /// SoC wrapper initialization error
