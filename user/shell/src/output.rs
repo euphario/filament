@@ -534,6 +534,16 @@ impl ByteBuffer {
         self.len == 0
     }
 
+    /// Check if buffer is full
+    pub fn is_full(&self) -> bool {
+        self.len >= MAX_BYTE_BUFFER
+    }
+
+    /// Get buffer capacity
+    pub fn capacity(&self) -> usize {
+        MAX_BYTE_BUFFER
+    }
+
     /// Clear the buffer
     pub fn clear(&mut self) {
         self.len = 0;

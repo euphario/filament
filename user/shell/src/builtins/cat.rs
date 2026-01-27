@@ -8,6 +8,9 @@ use crate::output::{ByteBuffer, CommandResult};
 use userlib::vfs_client::VfsClient;
 use userlib::vfs::VfsError;
 
+/// Max bytes to read per chunk (IPC limit constraint)
+const CHUNK_SIZE: u32 = 512;
+
 /// Main entry point for cat builtin
 pub fn run(path: &[u8]) -> CommandResult {
     let path = crate::trim(path);
@@ -27,23 +30,33 @@ pub fn run(path: &[u8]) -> CommandResult {
         Err(_) => return CommandResult::Error("cat: cannot connect to vfsd"),
     };
 
-    // Read file
-    let mut resp_buf = [0u8; 4096 + 64];
-    match client.read_file(path, 0, 4096, &mut resp_buf) {
-        Ok(content) => {
-            let mut output = ByteBuffer::new();
-            output.push(content.data);
+    // Read file in chunks until eof
+    let mut output = ByteBuffer::new();
+    let mut offset: u64 = 0;
+    let mut resp_buf = [0u8; 1024]; // 512 data + headers
 
-            // Note truncation if file is larger
-            if !content.eof && content.data.len() >= 4096 {
-                println!("... (truncated, file larger than 4KB)");
+    loop {
+        match client.read_file(path, offset, CHUNK_SIZE, &mut resp_buf) {
+            Ok(content) => {
+                let added = output.push(content.data);
+                offset += added as u64;
+
+                // Stop if we hit eof or filled buffer
+                if content.eof || added < content.data.len() {
+                    break;
+                }
             }
-
-            CommandResult::Bytes(output)
+            Err(VfsError::NotFound) => return CommandResult::Error("cat: file not found"),
+            Err(VfsError::PermissionDenied) => return CommandResult::Error("cat: permission denied"),
+            Err(VfsError::NotDirectory) => return CommandResult::Error("cat: is a directory"),
+            Err(_) => return CommandResult::Error("cat: read failed"),
         }
-        Err(VfsError::NotFound) => CommandResult::Error("cat: file not found"),
-        Err(VfsError::PermissionDenied) => CommandResult::Error("cat: permission denied"),
-        Err(VfsError::NotDirectory) => CommandResult::Error("cat: is a directory"),
-        Err(_) => CommandResult::Error("cat: read failed"),
     }
+
+    // Note if output buffer filled up (file larger than ByteBuffer can hold)
+    if output.is_full() {
+        println!("... (truncated, file larger than {} bytes)", output.capacity());
+    }
+
+    CommandResult::Bytes(output)
 }

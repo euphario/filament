@@ -17,6 +17,8 @@ pub mod data_port;
 pub mod devd;
 pub mod vfs;
 pub mod vfs_client;
+pub mod blk;
+pub mod blk_client;
 pub mod sync;
 
 pub use error::{SysError, SysResult};

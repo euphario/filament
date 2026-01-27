@@ -26,12 +26,15 @@ mod xhci_bulk;
 mod block;
 mod partition;
 mod ring_proto;
+mod block_service;
 
 use userlib::syscall;
 use userlib::devd::{
     DevdClient, PortType, DeviceClass, DeviceInfo, DriverState,
     SpawnHandler, SpawnFilter, run_driver_loop,
 };
+use userlib::data_port::{DataPort, DataPortConfig};
+use userlib::ring::{IoSqe, IoCqe, io_op, io_status};
 use usb::{MmioRegion, DmaPool, XhciController, XhciCaps};
 use usb::soc::{GenericSoc, SocUsb};
 use usb::ring::{Ring, EventRing, ErstEntry};
@@ -311,6 +314,14 @@ struct QemuUsbDriver {
     devices: [Option<UsbDevice>; layout::MAX_DEVICES],
     /// Command tag counter (for MSC operations)
     cmd_tag: u32,
+    /// First FAT partition info (for block service)
+    partition_info: block_service::PartitionInfo,
+    /// Bulk OUT ring state (persists between calls)
+    bulk_out_enqueue: usize,
+    bulk_out_cycle: bool,
+    /// Bulk IN ring state (persists between calls)
+    bulk_in_enqueue: usize,
+    bulk_in_cycle: bool,
 }
 
 impl QemuUsbDriver {
@@ -328,6 +339,11 @@ impl QemuUsbDriver {
             xhci_size,
             devices: [None; layout::MAX_DEVICES],
             cmd_tag: 1,
+            partition_info: block_service::PartitionInfo::empty(),
+            bulk_out_enqueue: 0,
+            bulk_out_cycle: true,
+            bulk_in_enqueue: 0,
+            bulk_in_cycle: true,
         }
     }
 
@@ -588,6 +604,39 @@ impl QemuUsbDriver {
 
         log("[qemu-usbd] Command timeout");
         None
+    }
+
+    /// Stop an endpoint (required before Set TR Dequeue Pointer)
+    fn stop_endpoint(&mut self, slot_id: u8, dci: u8) -> bool {
+        // Stop Endpoint command: type 15
+        let trb = Trb {
+            param: 0,
+            status: 0,
+            control: ((slot_id as u32) << 24) | ((dci as u32) << 16) | (trb_type::STOP_ENDPOINT << 10) | 1,
+        };
+
+        match self.send_command(trb) {
+            Some(result) if result.completion_code == 1 => true,  // Success
+            Some(result) if result.completion_code == 15 => true, // Context State Error (already stopped)
+            _ => false,
+        }
+    }
+
+    /// Set the TR Dequeue Pointer for an endpoint
+    fn set_tr_dequeue_pointer(&mut self, slot_id: u8, dci: u8, ring_phys: u64, dcs: bool) -> bool {
+        // Set TR Dequeue Pointer command: type 16
+        // param = New TR Dequeue Pointer | DCS (bit 0)
+        let param = ring_phys | if dcs { 1 } else { 0 };
+        let trb = Trb {
+            param,
+            status: 0,
+            control: ((slot_id as u32) << 24) | ((dci as u32) << 16) | (trb_type::SET_TR_DEQUEUE << 10) | 1,
+        };
+
+        match self.send_command(trb) {
+            Some(result) if result.completion_code == 1 => true,  // Success
+            _ => false,
+        }
     }
 
     /// Enumerate a device on a port
@@ -1527,6 +1576,13 @@ impl QemuUsbDriver {
 
         log("[qemu-usbd] === Testing composable block stack ===");
 
+        // Configure bulk endpoints first (required before any bulk transfers)
+        if !self.configure_msc_endpoints(slot_id) {
+            log("[qemu-usbd] Failed to configure endpoints");
+            return;
+        }
+        log("[qemu-usbd] Bulk endpoints configured");
+
         let dev_idx = match (slot_id as usize).checked_sub(1) {
             Some(idx) if idx < layout::MAX_DEVICES => idx,
             _ => return,
@@ -1606,6 +1662,10 @@ impl QemuUsbDriver {
         log_val("[qemu-usbd] Block size: ", block_dev.block_size() as u64);
         log_val("[qemu-usbd] Block count: ", block_dev.block_count());
 
+        // Save RAW disk info for block service (disk0: exposes the full disk)
+        let raw_disk_block_count = block_dev.block_count();
+        let raw_disk_block_size = block_dev.block_size();
+
         // Layer 4: Parse partition table
         // The partition layer reads the MBR and exposes partitions as BlockDevices
         use crate::partition::{read_partition_table, partition_type_name, PartitionDevice, Mbr};
@@ -1644,6 +1704,8 @@ impl QemuUsbDriver {
         // Layer 5: Create a PartitionDevice for the first FAT partition
         // This wraps the raw disk and offsets all LBAs automatically
         // Filesystem sees LBA 0 = partition start, knows nothing about MBR
+        let mut partition_found = false;
+
         if let Some(fat_entry) = mbr.find_fat_partition() {
             log("[qemu-usbd] Found FAT partition, creating PartitionDevice...");
 
@@ -1679,6 +1741,7 @@ impl QemuUsbDriver {
                 // Check for FAT signature
                 if boot_sector[510] == 0x55 && boot_sector[511] == 0xAA {
                     log("[qemu-usbd]   FAT boot signature found");
+                    partition_found = true;
 
                     // Parse some FAT fields
                     let bytes_per_sector = u16::from_le_bytes([boot_sector[11], boot_sector[12]]);
@@ -1708,7 +1771,309 @@ impl QemuUsbDriver {
             log("[qemu-usbd] No FAT partition found");
         }
 
+        // Save RAW disk info for block service
+        // disk0: exposes the full raw disk (LBA 0 = MBR), not a partition
+        // partition driver will read MBR and create part0:, part1: ports
+        if partition_found {
+            self.partition_info = block_service::PartitionInfo {
+                start_lba: 0,  // Raw disk starts at LBA 0
+                block_count: raw_disk_block_count,  // Full disk size
+                block_size: raw_disk_block_size,
+                slot_id,
+                bulk_in_dci,
+                bulk_out_dci,
+            };
+            log("[qemu-usbd] Raw disk info saved for block service (disk0:)");
+        }
+
         log("[qemu-usbd] === Block stack test complete ===");
+
+        // Reset ring state so service loop starts fresh
+        self.reset_bulk_rings(slot_id, bulk_in_dci, bulk_out_dci);
+    }
+
+    /// Reset bulk transfer rings to initial state
+    /// Uses xHCI commands to reset both software and hardware state
+    fn reset_bulk_rings(&mut self, slot_id: u8, bulk_in_dci: u8, bulk_out_dci: u8) {
+        use usb::trb::{Trb, trb_type};
+        use usb::transfer::dsb;
+
+        let dma = match self.dma.as_ref() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let dev_idx = match (slot_id as usize).checked_sub(1) {
+            Some(idx) if idx < layout::MAX_DEVICES => idx,
+            _ => return,
+        };
+
+        let vbase = dma.vaddr();
+        let pbase = dma.paddr();
+
+        // Ring locations (same as test_block_stack)
+        let dev_offset = layout::DEVICE_CTX_BASE + dev_idx * layout::DEVICE_CTX_SIZE;
+        let bulk_out_ring_offset = layout::DEV_EP0_RING + 0x400;
+        let bulk_in_ring_offset = bulk_out_ring_offset + 0x400;
+
+        let out_ring_vaddr = (vbase + dev_offset as u64 + bulk_out_ring_offset as u64) as *mut Trb;
+        let out_ring_paddr = pbase + dev_offset as u64 + bulk_out_ring_offset as u64;
+        let in_ring_vaddr = (vbase + dev_offset as u64 + bulk_in_ring_offset as u64) as *mut Trb;
+        let in_ring_paddr = pbase + dev_offset as u64 + bulk_in_ring_offset as u64;
+
+        const RING_SIZE: usize = 64;
+
+        // Step 1: Stop both endpoints (required before Set TR Dequeue Pointer)
+        self.stop_endpoint(slot_id, bulk_out_dci);
+        self.stop_endpoint(slot_id, bulk_in_dci);
+
+        // Step 2: Clear OUT ring and set up link TRB
+        unsafe {
+            for i in 0..(RING_SIZE - 1) {
+                core::ptr::write_volatile(out_ring_vaddr.add(i), Trb { param: 0, status: 0, control: 0 });
+            }
+            // Link TRB at last slot - TC=1 (toggle cycle), cycle=1
+            let link_trb = Trb {
+                param: out_ring_paddr,
+                status: 0,
+                control: (trb_type::LINK << 10) | (1 << 1) | 1, // TC=1, cycle=1
+            };
+            core::ptr::write_volatile(out_ring_vaddr.add(RING_SIZE - 1), link_trb);
+        }
+
+        // Step 3: Clear IN ring and set up link TRB
+        unsafe {
+            for i in 0..(RING_SIZE - 1) {
+                core::ptr::write_volatile(in_ring_vaddr.add(i), Trb { param: 0, status: 0, control: 0 });
+            }
+            let link_trb = Trb {
+                param: in_ring_paddr,
+                status: 0,
+                control: (trb_type::LINK << 10) | (1 << 1) | 1, // TC=1, cycle=1
+            };
+            core::ptr::write_volatile(in_ring_vaddr.add(RING_SIZE - 1), link_trb);
+        }
+
+        dsb();
+
+        // Step 4: Set TR Dequeue Pointer to reset hardware state
+        // DCS=1 means cycle bit should be 1 for new TRBs
+        self.set_tr_dequeue_pointer(slot_id, bulk_out_dci, out_ring_paddr, true);
+        self.set_tr_dequeue_pointer(slot_id, bulk_in_dci, in_ring_paddr, true);
+
+        // Step 5: Reset software ring state
+        self.bulk_out_enqueue = 0;
+        self.bulk_out_cycle = true;
+        self.bulk_in_enqueue = 0;
+        self.bulk_in_cycle = true;
+
+        log("[qemu-usbd] Bulk rings reset (hardware + software)");
+    }
+
+    /// Read blocks using the block stack
+    /// Reads from RAW disk (disk0: exposes full disk, LBA 0 = MBR)
+    fn read_blocks_for_service(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), &'static str> {
+        use crate::block::{BlockDevice, ScsiBlockDevice, BotScsi};
+        use crate::xhci_bulk::XhciBulk;
+
+        // Copy disk info before borrowing self mutably
+        let slot_id;
+        let bulk_in_dci;
+        let bulk_out_dci;
+        let block_size;
+        {
+            let info = &self.partition_info;
+            if !info.is_valid() {
+                return Err("No disk configured");
+            }
+            slot_id = info.slot_id;
+            bulk_in_dci = info.bulk_in_dci;
+            bulk_out_dci = info.bulk_out_dci;
+            block_size = info.block_size;
+        }
+
+        // Reset rings before each call to ensure clean state
+        self.reset_bulk_rings(slot_id, bulk_in_dci, bulk_out_dci);
+
+        let dev_idx = match (slot_id as usize).checked_sub(1) {
+            Some(idx) if idx < layout::MAX_DEVICES => idx,
+            _ => return Err("Invalid slot_id"),
+        };
+
+        let dma = self.dma.as_ref().ok_or("No DMA")?;
+        let xhci = self.xhci.as_mut().ok_or("No xHCI")?;
+        let evt_ring = self.evt_ring.as_mut().ok_or("No evt_ring")?;
+
+        let vbase = dma.vaddr();
+        let pbase = dma.paddr();
+
+        // Device context and ring locations (same as test_block_stack)
+        let dev_offset = layout::DEVICE_CTX_BASE + dev_idx * layout::DEVICE_CTX_SIZE;
+        let bulk_out_ring_offset = layout::DEV_EP0_RING + 0x400;
+        let bulk_in_ring_offset = bulk_out_ring_offset + 0x400;
+        let data_buf_offset = bulk_in_ring_offset + 0x400;
+
+        let out_ring_vaddr = vbase + dev_offset as u64 + bulk_out_ring_offset as u64;
+        let out_ring_paddr = pbase + dev_offset as u64 + bulk_out_ring_offset as u64;
+        let in_ring_vaddr = vbase + dev_offset as u64 + bulk_in_ring_offset as u64;
+        let in_ring_paddr = pbase + dev_offset as u64 + bulk_in_ring_offset as u64;
+        let data_buf_vaddr = vbase + dev_offset as u64 + data_buf_offset as u64;
+        let data_buf_paddr = pbase + dev_offset as u64 + data_buf_offset as u64;
+        let data_buf_size = 4096;
+
+        // Build the stack
+        let bulk = XhciBulk::new(
+            xhci,
+            evt_ring,
+            slot_id,
+            bulk_in_dci,
+            bulk_out_dci,
+            out_ring_vaddr as *mut Trb,
+            out_ring_paddr,
+            in_ring_vaddr as *mut Trb,
+            in_ring_paddr,
+            data_buf_vaddr as *mut u8,
+            data_buf_paddr,
+            data_buf_size,
+        );
+
+        let scsi = BotScsi::new(bulk);
+        let mut raw_dev = ScsiBlockDevice::new(scsi).ok_or("Failed to create ScsiBlockDevice")?;
+
+        // Read the requested blocks from RAW disk (disk0: exposes full disk, not partition)
+        // Partition driver will read MBR at LBA 0 and create partition-specific ports
+        let read_len = count as usize * block_size as usize;
+        if buf.len() < read_len {
+            return Err("Buffer too small");
+        }
+
+        raw_dev.read_blocks(lba, &mut buf[..read_len])
+            .map_err(|_| "Read failed")
+    }
+
+    /// Read blocks to a shared memory pool for DataPort (TRUE ZERO-COPY)
+    ///
+    /// Data DMAs directly to consumer's pool. CBW/CSW use driver's scratch.
+    fn read_blocks_to_pool(
+        &mut self,
+        lba: u64,
+        count: u32,
+        _pool_vaddr: *mut u8,
+        pool_paddr: u64,
+        pool_offset: u32,
+        pool_len: u32,
+    ) -> Result<u32, &'static str> {
+        use crate::xhci_bulk::XhciBulk;
+
+        // Copy disk info before borrowing self mutably
+        let slot_id;
+        let bulk_in_dci;
+        let bulk_out_dci;
+        let block_size;
+        {
+            let info = &self.partition_info;
+            if !info.is_valid() {
+                return Err("No disk configured");
+            }
+            slot_id = info.slot_id;
+            bulk_in_dci = info.bulk_in_dci;
+            bulk_out_dci = info.bulk_out_dci;
+            block_size = info.block_size;
+        }
+
+        // Calculate read size
+        let read_len = count as usize * block_size as usize;
+        if pool_len < read_len as u32 {
+            return Err("Pool buffer too small");
+        }
+
+        // Reset rings before each call to ensure clean state
+        self.reset_bulk_rings(slot_id, bulk_in_dci, bulk_out_dci);
+
+        let dev_idx = match (slot_id as usize).checked_sub(1) {
+            Some(idx) if idx < layout::MAX_DEVICES => idx,
+            _ => return Err("Invalid slot_id"),
+        };
+
+        let dma = self.dma.as_ref().ok_or("No DMA")?;
+        let xhci = self.xhci.as_mut().ok_or("No xHCI")?;
+        let evt_ring = self.evt_ring.as_mut().ok_or("No evt_ring")?;
+
+        let vbase = dma.vaddr();
+        let pbase = dma.paddr();
+
+        // Device context and ring locations
+        let dev_offset = layout::DEVICE_CTX_BASE + dev_idx * layout::DEVICE_CTX_SIZE;
+        let bulk_out_ring_offset = layout::DEV_EP0_RING + 0x400;
+        let bulk_in_ring_offset = bulk_out_ring_offset + 0x400;
+
+        let out_ring_vaddr = vbase + dev_offset as u64 + bulk_out_ring_offset as u64;
+        let out_ring_paddr = pbase + dev_offset as u64 + bulk_out_ring_offset as u64;
+        let in_ring_vaddr = vbase + dev_offset as u64 + bulk_in_ring_offset as u64;
+        let in_ring_paddr = pbase + dev_offset as u64 + bulk_in_ring_offset as u64;
+
+        // Use SCRATCH area for CBW/CSW only (128 bytes is plenty)
+        let scratch_vaddr = vbase + layout::SCRATCH_OFFSET as u64;
+        let scratch_paddr = pbase + layout::SCRATCH_OFFSET as u64;
+        let scratch_size = 128; // Only need CBW (64) + CSW (64)
+
+        // Build XhciBulk with scratch buffer for CBW/CSW
+        let mut bulk = XhciBulk::new(
+            xhci,
+            evt_ring,
+            slot_id,
+            bulk_in_dci,
+            bulk_out_dci,
+            out_ring_vaddr as *mut Trb,
+            out_ring_paddr,
+            in_ring_vaddr as *mut Trb,
+            in_ring_paddr,
+            scratch_vaddr as *mut u8,
+            scratch_paddr,
+            scratch_size,
+        );
+
+        // Build CBW for READ(10)
+        let mut cbw = [0u8; 31];
+        const CBW_SIG: u32 = 0x43425355;
+        cbw[0..4].copy_from_slice(&CBW_SIG.to_le_bytes());
+        cbw[4..8].copy_from_slice(&1u32.to_le_bytes()); // tag
+        cbw[8..12].copy_from_slice(&(read_len as u32).to_le_bytes());
+        cbw[12] = 0x80; // direction: device-to-host
+        cbw[14] = 10;   // CDB length
+
+        // READ(10) CDB
+        let lba32 = lba as u32;
+        let blocks = count as u16;
+        cbw[15] = 0x28; // opcode
+        cbw[17] = (lba32 >> 24) as u8;
+        cbw[18] = (lba32 >> 16) as u8;
+        cbw[19] = (lba32 >> 8) as u8;
+        cbw[20] = lba32 as u8;
+        cbw[22] = (blocks >> 8) as u8;
+        cbw[23] = blocks as u8;
+
+        // CSW buffer
+        let mut csw = [0u8; 13];
+
+        // Data physical address in consumer's pool - DMA goes directly here!
+        let data_phys = pool_paddr + pool_offset as u64;
+
+        // Execute with zero-copy: data DMAs to consumer's pool, CBW/CSW use scratch
+        let transferred = bulk.bot_read_zero_copy(&cbw, data_phys, read_len as u32, &mut csw)
+            .map_err(|_| "BOT command failed")?;
+
+        // Check CSW status
+        const CSW_SIG: u32 = 0x53425355;
+        let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
+        if sig != CSW_SIG {
+            return Err("Invalid CSW signature");
+        }
+        if csw[12] != 0 {
+            return Err("CSW status indicates error");
+        }
+
+        Ok(transferred)
     }
 }
 
@@ -1829,13 +2194,15 @@ fn main() {
     // Detect MSC devices and configure them
     driver.detect_all_msc();
 
-    // Test any MSC devices found
+    // Test any MSC devices found using the composable block stack
+    // Note: Do NOT call test_msc() here - it uses old bulk_in/bulk_out functions
+    // that don't track ring enqueue pointer properly, which corrupts the ring state
+    // for subsequent test_block_stack() calls.
     for slot_idx in 0..8 {
         let slot_id = match &driver.devices[slot_idx] {
             Some(d) if d.is_msc => d.slot_id,
             _ => continue,
         };
-        driver.test_msc(slot_id);
         // Test the composable block stack
         driver.test_block_stack(slot_id);
     }
@@ -1871,18 +2238,264 @@ fn main() {
         }
     }
 
-    if disk_count > 0 {
+    if disk_count > 0 && driver.partition_info.is_valid() {
         log_val("[qemu-usbd] Registered block devices: ", disk_count as u64);
 
         // Report ready state on the SAME connection
         let _ = devd_client.report_state(DriverState::Ready);
         log("[qemu-usbd] Reported ready state");
-        log("[qemu-usbd] Entering service loop");
 
-        // Use the generic driver service loop pattern (event-driven, no polling)
-        run_driver_loop(devd_client, QemuUsbdSpawnHandler);
+        // Create DataPort for zero-copy block I/O (ring protocol)
+        let config = DataPortConfig {
+            ring_size: 64,
+            side_size: 8,
+            pool_size: 256 * 1024, // 256KB pool for data transfers
+        };
+
+        let data_port = match DataPort::create(config) {
+            Ok(p) => {
+                log("[qemu-usbd] Created DataPort for disk0:");
+                log_val("[qemu-usbd]   shmem_id: ", p.shmem_id() as u64);
+                log_val("[qemu-usbd]   pool_size: ", p.pool_size() as u64);
+                log_hex("[qemu-usbd]   pool_phys: ", p.pool_phys());
+                p
+            }
+            Err(e) => {
+                log("[qemu-usbd] Failed to create DataPort");
+                syscall::exit(1);
+            }
+        };
+
+        // Allow any process to connect (for partition driver)
+        // In production, we'd get the PID from devd
+        for pid in 1..32 {
+            data_port.allow(pid);
+        }
+
+        // Also create legacy IPC port for backward compatibility during transition
+        use userlib::ipc::{Port, Mux, MuxFilter};
+
+        let port = match Port::register(b"disk0:") {
+            Ok(p) => {
+                log("[qemu-usbd] Created disk0: IPC port (legacy)");
+                p
+            }
+            Err(_) => {
+                log("[qemu-usbd] Failed to create disk0: IPC port");
+                syscall::exit(1);
+            }
+        };
+
+        // Set up mux for event-driven I/O
+        let mux = match Mux::new() {
+            Ok(m) => m,
+            Err(_) => {
+                log("[qemu-usbd] Failed to create Mux");
+                syscall::exit(1);
+            }
+        };
+
+        // Add devd channel to mux
+        if let Some(devd_handle) = devd_client.handle() {
+            let _ = mux.add(devd_handle, MuxFilter::Readable);
+        }
+
+        // Add port to mux (for new connections)
+        let _ = mux.add(port.handle(), MuxFilter::Readable);
+
+        log("[qemu-usbd] Entering block service loop");
+
+        // Track connected block clients (for legacy IPC)
+        let mut client_handle: Option<syscall::Handle> = None;
+
+        // Spawn handler tracks children to prevent duplicates
+        let mut spawn_handler = QemuUsbdSpawnHandler::new();
+
+        // Block info for ring protocol responses
+        let block_size = driver.partition_info.block_size;
+        let block_count = driver.partition_info.block_count;
+
+        loop {
+            // === Process DataPort ring requests (zero-copy) ===
+            // Check for ring requests before blocking on mux
+            while let Some(sqe) = data_port.recv() {
+                log("[qemu-usbd] Ring request received");
+                match sqe.opcode {
+                    io_op::READ => {
+                        log_val("[qemu-usbd]   READ lba=", sqe.lba);
+                        log_val("[qemu-usbd]   data_offset=", sqe.data_offset as u64);
+                        log_val("[qemu-usbd]   data_len=", sqe.data_len as u64);
+
+                        // Calculate number of blocks
+                        let count = (sqe.data_len / block_size) as u32;
+                        if count == 0 {
+                            data_port.complete_error(sqe.tag, io_status::INVALID);
+                            data_port.notify();
+                            continue;
+                        }
+
+                        // Read directly to pool memory (zero-copy!)
+                        match driver.read_blocks_to_pool(
+                            sqe.lba,
+                            count,
+                            data_port.pool_slice_mut(0, data_port.pool_size()).unwrap().as_mut_ptr(),
+                            data_port.pool_phys(),
+                            sqe.data_offset,
+                            sqe.data_len,
+                        ) {
+                            Ok(transferred) => {
+                                log_val("[qemu-usbd]   transferred=", transferred as u64);
+                                data_port.complete_ok(sqe.tag, transferred);
+                            }
+                            Err(e) => {
+                                log("[qemu-usbd] Ring READ failed: ");
+                                log(e);
+                                data_port.complete_error(sqe.tag, io_status::IO_ERROR);
+                            }
+                        }
+                        data_port.notify();
+                    }
+                    io_op::WRITE => {
+                        data_port.complete_error(sqe.tag, io_status::INVALID);
+                        data_port.notify();
+                    }
+                    _ => {
+                        data_port.complete_error(sqe.tag, io_status::INVALID);
+                        data_port.notify();
+                    }
+                }
+            }
+
+            // === Process DataPort sidechannel queries ===
+            // Use poll_side_request() to only consume REQUEST entries
+            // This leaves RESPONSE entries for the consumer to read
+            while let Some(entry) = data_port.poll_side_request() {
+                log("[qemu-usbd] Sidechannel query received");
+                use userlib::ring::side_msg;
+                match entry.msg_type {
+                    side_msg::QUERY_GEOMETRY => {
+                        log("[qemu-usbd]   QUERY_GEOMETRY");
+                        let info = userlib::data_port::GeometryInfo {
+                            block_size,
+                            block_count,
+                            max_transfer: 64 * 1024,
+                        };
+                        data_port.respond_geometry(&entry, &info);
+                        data_port.notify();
+                    }
+                    _ => {
+                        let mut eol = entry;
+                        eol.status = userlib::ring::side_status::EOL;
+                        data_port.side_send(&eol);
+                        data_port.notify();
+                    }
+                }
+            }
+
+            // === Brief sleep to avoid busy-looping ===
+            // Note: data_port.wait() uses shmem.wait() which doesn't support
+            // timeout properly in kernel, so use short sleep instead
+            syscall::sleep_us(1000); // 1ms poll interval
+
+            // === Process legacy IPC (non-blocking check) ===
+            // Try to accept any pending IPC connection first
+            {
+                let mut buf = [0u8; 8];
+                if let Ok(n) = syscall::read(port.handle(), &mut buf) {
+                    if n >= 4 {
+                        let ch_handle = syscall::Handle(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+                        log("[qemu-usbd] New IPC client connected (legacy)");
+
+                        if let Some(old) = client_handle {
+                            let _ = mux.remove(old);
+                            let _ = syscall::close(old);
+                        }
+
+                        let _ = mux.add(ch_handle, MuxFilter::Readable);
+                        client_handle = Some(ch_handle);
+                    }
+                }
+            }
+
+            // Check for devd commands (MUST be before client check to always run)
+            if let Ok(Some(cmd)) = devd_client.poll_command() {
+                match cmd {
+                    userlib::devd::DevdCommand::SpawnChild { seq_id, binary, binary_len, filter } => {
+                        log("[qemu-usbd] Received SPAWN_CHILD command");
+                        let binary_str = match core::str::from_utf8(&binary[..binary_len]) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let (count, pids) = spawn_handler.handle_spawn(binary_str, &filter);
+                        let result = if count > 0 { 0i32 } else { -1i32 };
+                        let child_pid = pids[0];
+                        let _ = devd_client.ack_spawn(seq_id, result, child_pid);
+                    }
+                    userlib::devd::DevdCommand::StopChild { child_pid, .. } => {
+                        spawn_handler.handle_stop(child_pid);
+                    }
+                }
+            }
+
+            // Skip IPC client handling if no client connected
+            if client_handle.is_none() {
+                continue;
+            }
+
+            // Process IPC client request (if any)
+            let ch = client_handle.unwrap();
+            let mut req_buf = [0u8; 64];
+            let event = match syscall::read(ch, &mut req_buf) {
+                Ok(0) => {
+                    // Client disconnected
+                    let _ = mux.remove(ch);
+                    let _ = syscall::close(ch);
+                    client_handle = None;
+                    continue;
+                }
+                Ok(len) => Some(len),
+                Err(userlib::error::SysError::WouldBlock) => None,
+                Err(userlib::error::SysError::PeerClosed) => {
+                    let _ = mux.remove(ch);
+                    let _ = syscall::close(ch);
+                    client_handle = None;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+
+            if let Some(len) = event {
+                if let Some((msg_type, seq_id, read_req)) = block_service::parse_request(&req_buf, len) {
+                    match msg_type {
+                        userlib::blk::msg::BLK_INFO => {
+                            block_service::send_info_response(ch, seq_id, &driver.partition_info);
+                        }
+                        userlib::blk::msg::BLK_READ => {
+                            if let Some(req) = read_req {
+                                let count = req.count.min(1) as u32;
+                                let read_len = count as usize * block_size as usize;
+                                let mut data_buf = [0u8; 512];
+
+                                match driver.read_blocks_for_service(req.lba, count, &mut data_buf) {
+                                    Ok(()) => {
+                                        block_service::send_read_response(ch, seq_id, &data_buf[..read_len]);
+                                    }
+                                    Err(_) => {
+                                        block_service::send_error_response(ch, seq_id, userlib::blk::error::IO);
+                                    }
+                                }
+                            }
+                        }
+                        userlib::blk::msg::BLK_WRITE => {
+                            block_service::send_error_response(ch, seq_id, userlib::blk::error::IO);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     } else {
-        log("[qemu-usbd] No block devices registered, exiting");
+        log("[qemu-usbd] No block devices or partitions found, exiting");
         syscall::exit(0);
     }
 }
@@ -1890,13 +2503,32 @@ fn main() {
 /// Custom spawn handler for qemu-usbd
 ///
 /// Logs spawn commands and can be extended to track children.
-struct QemuUsbdSpawnHandler;
+struct QemuUsbdSpawnHandler {
+    /// Track spawned children to prevent duplicate spawns
+    spawned_partition: Option<u32>,
+}
+
+impl QemuUsbdSpawnHandler {
+    fn new() -> Self {
+        Self { spawned_partition: None }
+    }
+}
 
 impl SpawnHandler for QemuUsbdSpawnHandler {
     fn handle_spawn(&mut self, binary: &str, filter: &SpawnFilter) -> (u8, [u32; 16]) {
         log("[qemu-usbd] Received SPAWN_CHILD command");
         log("[qemu-usbd]   Binary: ");
         log(binary);
+
+        // Guard: if we've already spawned partition, return the existing PID
+        if binary == "partition" {
+            if let Some(existing_pid) = self.spawned_partition {
+                log("[qemu-usbd]   Already spawned partition, returning existing PID");
+                let mut pids = [0u32; 16];
+                pids[0] = existing_pid;
+                return (1, pids);
+            }
+        }
 
         // Log filter info
         match filter.mode {
@@ -1932,6 +2564,12 @@ impl SpawnHandler for QemuUsbdSpawnHandler {
         if pid > 0 {
             log_val("[qemu-usbd]   Spawned child PID: ", pid as u64);
             pids[0] = pid as u32;
+
+            // Track partition spawn
+            if binary == "partition" {
+                self.spawned_partition = Some(pid as u32);
+            }
+
             (1, pids)
         } else {
             log("[qemu-usbd]   Failed to spawn child");
@@ -1945,6 +2583,10 @@ impl SpawnHandler for QemuUsbdSpawnHandler {
         let result = syscall::kill(pid);
         if result == 0 {
             log("[qemu-usbd]   Child killed successfully");
+            // Clear tracking if we killed the partition
+            if self.spawned_partition == Some(pid) {
+                self.spawned_partition = None;
+            }
         } else {
             log_val("[qemu-usbd]   Kill failed, error: ", (-result) as u64);
         }

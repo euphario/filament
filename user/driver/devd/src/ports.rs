@@ -267,6 +267,12 @@ impl Ports {
     fn find_empty_slot(&self) -> Option<usize> {
         (0..MAX_PORTS).find(|&i| self.ports[i].is_none())
     }
+
+    /// Get the type of a registered port
+    pub fn get_port_type(&self, name: &[u8]) -> Option<u8> {
+        let slot = self.find_slot(name)?;
+        self.ports[slot].as_ref().map(|p| p.port_type as u8)
+    }
 }
 
 impl PortRegistry for Ports {

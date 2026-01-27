@@ -313,6 +313,8 @@ impl DataPort {
     ///
     /// Returns the response, or None on timeout.
     pub fn query(&mut self, msg_type: u16, payload: &[u8]) -> Option<SideEntry> {
+        use crate::ring::side_status;
+
         if !self.has_sidechannel() {
             return None;
         }
@@ -322,7 +324,7 @@ impl DataPort {
             msg_type,
             flags: 0,
             tag,
-            status: 0,
+            status: side_status::REQUEST, // Mark as request (not a response)
             payload: [0; 24],
         };
         let copy_len = payload.len().min(24);
@@ -336,18 +338,63 @@ impl DataPort {
         // Wait for response (simple blocking wait)
         // In production, integrate with event loop
         for _ in 0..100 {
-            if let Some(resp) = self.poll_side() {
+            // Use poll_side_response() which doesn't consume REQUEST entries
+            // This allows the provider to read our request while we wait
+            if let Some(resp) = self.poll_side_response() {
                 if resp.tag == tag {
                     return Some(resp);
                 }
             }
-            self.ring.wait(10);
+            // Use short sleep since ring.wait() doesn't support timeout properly
+            crate::syscall::sleep_us(1000);
         }
         None
     }
 
-    /// Poll for sidechannel entry
+    /// Poll for sidechannel entry (consumes any entry)
     pub fn poll_side(&self) -> Option<SideEntry> {
+        self.ring.side_recv()
+    }
+
+    /// Poll for sidechannel response (Consumer helper)
+    ///
+    /// Only consumes entries with status != REQUEST.
+    /// This allows the provider to consume REQUEST entries while
+    /// the consumer waits for RESPONSE entries.
+    pub fn poll_side_response(&self) -> Option<SideEntry> {
+        use crate::ring::side_status;
+
+        // Peek at the next entry without consuming
+        let entry = self.ring.side_peek()?;
+
+        // If it's a request (not a response), don't consume it
+        // Let the provider read it instead
+        if entry.status == side_status::REQUEST {
+            return None;
+        }
+
+        // It's a response - consume and return it
+        self.ring.side_recv()
+    }
+
+    /// Poll for sidechannel request (Provider helper)
+    ///
+    /// Only consumes entries with status == REQUEST.
+    /// This allows the consumer to receive responses while
+    /// provider only processes requests.
+    pub fn poll_side_request(&self) -> Option<SideEntry> {
+        use crate::ring::side_status;
+
+        // Peek at the next entry without consuming
+        let entry = self.ring.side_peek()?;
+
+        // If it's NOT a request, don't consume it
+        // It's a response for the consumer to read
+        if entry.status != side_status::REQUEST {
+            return None;
+        }
+
+        // It's a request - consume and return it
         self.ring.side_recv()
     }
 

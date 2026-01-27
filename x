@@ -10,6 +10,8 @@
 #   ./x build --platform qemu  # Build for QEMU
 #   ./x build --test       # Build with self-tests enabled
 #   ./x qemu               # Run in QEMU
+#   ./x qemu-usb           # Create USB disk image with FAT16 filesystem
+#   ./x qemu-usb --force   # Recreate USB disk image
 #   ./x clean              # Clean all build artifacts
 
 set -e

@@ -784,6 +784,9 @@ pub mod side_status {
     pub const EOL: u16 = 2;
     /// Error processing query
     pub const ERROR: u16 = 3;
+    /// Request (not yet answered) - used to distinguish requests from responses
+    /// in the shared sidechannel queue
+    pub const REQUEST: u16 = 0xFFFF;
 }
 
 // =============================================================================
@@ -1146,7 +1149,7 @@ impl LayeredRing {
         tail.wrapping_sub(head)
     }
 
-    /// Receive sidechannel entry
+    /// Receive sidechannel entry (consumes it)
     pub fn side_recv(&self) -> Option<SideEntry> {
         let h = self.header();
         if h.side_size == 0 || self.side_pending() == 0 {
@@ -1163,6 +1166,26 @@ impl LayeredRing {
 
         core::sync::atomic::fence(Ordering::Acquire);
         h.side_head.store(head.wrapping_add(1), Ordering::Release);
+        Some(entry)
+    }
+
+    /// Peek at next sidechannel entry without consuming
+    pub fn side_peek(&self) -> Option<SideEntry> {
+        let h = self.header();
+        if h.side_size == 0 || self.side_pending() == 0 {
+            return None;
+        }
+
+        let head = h.side_head.load(Ordering::Relaxed);
+        let idx = (head & h.side_mask()) as usize;
+
+        let entry = unsafe {
+            let side = self.base().add(h.side_offset()) as *const SideEntry;
+            core::ptr::read_volatile(side.add(idx))
+        };
+
+        core::sync::atomic::fence(Ordering::Acquire);
+        // Don't advance head - just peek
         Some(entry)
     }
 

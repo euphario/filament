@@ -7,6 +7,8 @@
 //!   cargo xtask build --skip-user  # Skip userspace build (kernel only)
 //!   cargo xtask build --only devd shell  # Build specific userspace programs
 //!   cargo xtask qemu               # Run in QEMU virt
+//!   cargo xtask qemu-usb           # Create USB disk image with FAT16
+//!   cargo xtask qemu-usb --force   # Recreate USB disk image
 //!   cargo xtask clean              # Clean all build artifacts
 
 use anyhow::{Context, Result, bail};
@@ -65,6 +67,17 @@ enum Commands {
         test: bool,
     },
 
+    /// Create/recreate QEMU USB disk image with FAT16 filesystem
+    QemuUsb {
+        /// Force recreate even if image exists
+        #[arg(short, long)]
+        force: bool,
+
+        /// Disk size in MB (default: 64)
+        #[arg(long, default_value = "64")]
+        size: u32,
+    },
+
     /// Clean all build artifacts
     Clean,
 }
@@ -81,6 +94,9 @@ fn main() -> Result<()> {
         }
         Commands::Qemu { no_build, gdb, test } => {
             cmd_qemu(&project_root, !no_build, gdb, test)?;
+        }
+        Commands::QemuUsb { force, size } => {
+            cmd_qemu_usb(force, size)?;
         }
         Commands::Clean => {
             cmd_clean(&project_root)?;
@@ -561,11 +577,8 @@ fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool) -> Result<()> {
     let nvme_disk = "/tmp/bpi-r4-nvme.img";
 
     if !Path::new(usb_disk).exists() {
-        println!("Creating USB disk image: {}", usb_disk);
-        Command::new("qemu-img")
-            .args(["create", "-f", "raw", usb_disk, "64M"])
-            .status()
-            .context("Failed to create USB disk image")?;
+        // Create USB disk with proper FAT16 filesystem
+        cmd_qemu_usb(false, 64)?;
     }
 
     if !Path::new(nvme_disk).exists() {
@@ -618,6 +631,176 @@ fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool) -> Result<()> {
 
     if !status.success() {
         println!("QEMU exited with error");
+    }
+
+    Ok(())
+}
+
+/// Create QEMU USB disk image with MBR + FAT16
+///
+/// Creates a raw disk image with:
+/// - MBR partition table
+/// - Single FAT16 partition starting at 1MB
+/// - Formatted FAT16 filesystem
+///
+/// Works on macOS and Linux without requiring root or external tools.
+fn cmd_qemu_usb(force: bool, size_mb: u32) -> Result<()> {
+    use std::io::{Write, Seek, SeekFrom};
+
+    let usb_disk = "/tmp/bpi-r4-usb.img";
+
+    if Path::new(usb_disk).exists() && !force {
+        println!("USB disk image already exists: {}", usb_disk);
+        println!("Use --force to recreate");
+        return Ok(());
+    }
+
+    println!("Creating USB disk image: {} ({}MB)", usb_disk, size_mb);
+
+    let total_sectors = size_mb as u64 * 1024 * 1024 / 512;
+    let partition_start_lba: u32 = 2048; // 1MB offset (standard alignment)
+    let partition_sectors = (total_sectors as u32) - partition_start_lba;
+
+    // Create the file
+    let mut file = fs::File::create(usb_disk)
+        .context("Failed to create USB disk image")?;
+
+    // Set file size
+    file.set_len(total_sectors * 512)
+        .context("Failed to set file size")?;
+
+    // Write MBR
+    let mut mbr = [0u8; 512];
+
+    // Boot code (just enough to print error if someone tries to boot)
+    // We'll leave it as zeros - the partition table is what matters
+
+    // Partition 1 entry at offset 0x1BE
+    let pe = &mut mbr[0x1BE..0x1CE];
+    pe[0] = 0x80; // Bootable flag
+    // CHS start (ignored, using LBA)
+    pe[1] = 0x20; // Head
+    pe[2] = 0x21; // Sector + Cylinder high bits
+    pe[3] = 0x00; // Cylinder low
+    pe[4] = 0x06; // Partition type: FAT16 (>32MB)
+    // CHS end (ignored, using LBA)
+    pe[5] = 0xFE; // Head
+    pe[6] = 0xFF; // Sector + Cylinder high bits
+    pe[7] = 0xFF; // Cylinder low
+    // LBA start (little-endian)
+    pe[8..12].copy_from_slice(&partition_start_lba.to_le_bytes());
+    // LBA size (little-endian)
+    pe[12..16].copy_from_slice(&partition_sectors.to_le_bytes());
+
+    // MBR signature
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+
+    file.write_all(&mbr).context("Failed to write MBR")?;
+
+    // Calculate FAT16 parameters
+    let bytes_per_sector: u16 = 512;
+    let sectors_per_cluster: u8 = 4; // 2KB clusters
+    let reserved_sectors: u16 = 1;
+    let num_fats: u8 = 2;
+    let root_entry_count: u16 = 512; // Standard for FAT16
+    let root_dir_sectors = ((root_entry_count as u32 * 32) + 511) / 512;
+
+    // Calculate FAT size
+    // FAT16: each entry is 2 bytes
+    let data_sectors = partition_sectors - reserved_sectors as u32 - root_dir_sectors;
+    let total_clusters = data_sectors / sectors_per_cluster as u32;
+    let fat_entries = total_clusters + 2; // +2 for reserved entries
+    let fat_sectors = ((fat_entries * 2) + 511) / 512;
+
+    // Write FAT16 Boot Sector (BPB)
+    let mut bpb = [0u8; 512];
+
+    // Jump instruction
+    bpb[0] = 0xEB;
+    bpb[1] = 0x3C;
+    bpb[2] = 0x90;
+
+    // OEM name
+    bpb[3..11].copy_from_slice(b"BPIR4USB");
+
+    // BPB
+    bpb[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
+    bpb[13] = sectors_per_cluster;
+    bpb[14..16].copy_from_slice(&reserved_sectors.to_le_bytes());
+    bpb[16] = num_fats;
+    bpb[17..19].copy_from_slice(&root_entry_count.to_le_bytes());
+    // Total sectors (16-bit) - use 0 if > 65535, put in 32-bit field
+    if partition_sectors <= 65535 {
+        bpb[19..21].copy_from_slice(&(partition_sectors as u16).to_le_bytes());
+    }
+    bpb[21] = 0xF8; // Media type (fixed disk)
+    bpb[22..24].copy_from_slice(&(fat_sectors as u16).to_le_bytes());
+    bpb[24..26].copy_from_slice(&63u16.to_le_bytes()); // Sectors per track
+    bpb[26..28].copy_from_slice(&255u16.to_le_bytes()); // Number of heads
+    bpb[28..32].copy_from_slice(&partition_start_lba.to_le_bytes()); // Hidden sectors
+    // Total sectors (32-bit) - only if 16-bit field is 0
+    if partition_sectors > 65535 {
+        bpb[32..36].copy_from_slice(&partition_sectors.to_le_bytes());
+    }
+
+    // Extended BPB (FAT16)
+    bpb[36] = 0x80; // Drive number
+    bpb[37] = 0x00; // Reserved
+    bpb[38] = 0x29; // Extended boot signature
+    bpb[39..43].copy_from_slice(&0x12345678u32.to_le_bytes()); // Volume serial
+    bpb[43..54].copy_from_slice(b"BPIR4-USB  "); // Volume label (11 bytes)
+    bpb[54..62].copy_from_slice(b"FAT16   "); // File system type (8 bytes)
+
+    // Boot signature
+    bpb[510] = 0x55;
+    bpb[511] = 0xAA;
+
+    // Seek to partition start and write BPB
+    file.seek(SeekFrom::Start(partition_start_lba as u64 * 512))
+        .context("Failed to seek to partition")?;
+    file.write_all(&bpb).context("Failed to write BPB")?;
+
+    // Write FAT1 (first FAT)
+    let mut fat = vec![0u8; fat_sectors as usize * 512];
+    // First two entries are reserved
+    fat[0] = 0xF8; // Media type
+    fat[1] = 0xFF;
+    fat[2] = 0xFF; // End of chain marker
+    fat[3] = 0xFF;
+
+    let fat1_offset = (partition_start_lba as u64 + reserved_sectors as u64) * 512;
+    file.seek(SeekFrom::Start(fat1_offset))
+        .context("Failed to seek to FAT1")?;
+    file.write_all(&fat).context("Failed to write FAT1")?;
+
+    // Write FAT2 (second FAT)
+    let fat2_offset = fat1_offset + (fat_sectors as u64 * 512);
+    file.seek(SeekFrom::Start(fat2_offset))
+        .context("Failed to seek to FAT2")?;
+    file.write_all(&fat).context("Failed to write FAT2")?;
+
+    // Root directory is already zeros (empty)
+
+    file.sync_all().context("Failed to sync file")?;
+
+    println!("  Partition: {} sectors ({:.1}MB) starting at LBA {}",
+             partition_sectors,
+             partition_sectors as f64 * 512.0 / 1024.0 / 1024.0,
+             partition_start_lba);
+    println!("  FAT16: {} bytes/sector, {} sectors/cluster, {} FAT sectors",
+             bytes_per_sector, sectors_per_cluster, fat_sectors);
+    println!("  Created: {}", usb_disk);
+
+    // Optionally copy some test files using mtools if available
+    if Command::new("mcopy").arg("--version").output().is_ok() {
+        println!("\nmtools detected. You can add files with:");
+        println!("  mcopy -i {}@@1M <file> ::", usb_disk);
+    } else {
+        println!("\nTo add files, install mtools:");
+        println!("  brew install mtools  # macOS");
+        println!("  apt install mtools   # Linux");
+        println!("Then: mcopy -i {}@@1M <file> ::", usb_disk);
     }
 
     Ok(())

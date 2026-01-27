@@ -170,6 +170,60 @@ const MAX_PENDING_SPAWNS_PER_DRIVER: usize = 4;
 /// Maximum number of drivers that can have pending spawns
 const MAX_DRIVERS_WITH_PENDING: usize = 8;
 
+/// Maximum spawn contexts to track (PID -> trigger port)
+const MAX_SPAWN_CONTEXTS: usize = 32;
+
+/// Maximum in-flight spawn commands to track
+const MAX_INFLIGHT_SPAWNS: usize = 8;
+
+/// Spawn context entry - maps child PID to trigger port
+#[derive(Clone, Copy)]
+struct SpawnContext {
+    /// Child process PID (0 = empty slot)
+    pid: u32,
+    /// Port type that triggered spawn
+    port_type: u8,
+    /// Trigger port name
+    port_name: [u8; 32],
+    /// Length of port name
+    port_name_len: u8,
+}
+
+impl SpawnContext {
+    const fn empty() -> Self {
+        Self {
+            pid: 0,
+            port_type: 0,
+            port_name: [0u8; 32],
+            port_name_len: 0,
+        }
+    }
+}
+
+/// In-flight spawn tracking - maps seq_id to port info for SPAWN_ACK
+#[derive(Clone, Copy)]
+struct InflightSpawn {
+    /// Sequence ID (0 = empty slot)
+    seq_id: u32,
+    /// Port type that triggered spawn
+    port_type: u8,
+    /// Trigger port name
+    port_name: [u8; 32],
+    /// Length of port name
+    port_name_len: u8,
+}
+
+impl InflightSpawn {
+    const fn empty() -> Self {
+        Self {
+            seq_id: 0,
+            port_type: 0,
+            port_name: [0u8; 32],
+            port_name_len: 0,
+        }
+    }
+}
+
 /// A pending spawn command waiting for driver to report Ready
 #[derive(Clone, Copy)]
 struct PendingSpawn {
@@ -223,6 +277,10 @@ pub struct Devd {
     /// Pending spawn commands waiting for drivers to report Ready
     /// Keyed by driver service index
     pending_spawns: [PendingSpawn; MAX_DRIVERS_WITH_PENDING * MAX_PENDING_SPAWNS_PER_DRIVER],
+    /// Spawn context: maps child PID to trigger port (for GET_SPAWN_CONTEXT)
+    spawn_contexts: [SpawnContext; MAX_SPAWN_CONTEXTS],
+    /// In-flight spawn commands: maps seq_id to port info
+    inflight_spawns: [InflightSpawn; MAX_INFLIGHT_SPAWNS],
 }
 
 impl Devd {
@@ -241,6 +299,8 @@ impl Devd {
             admin_clients: AdminClients::new(),
             recent_dynamic_pids: [(0, 0); MAX_RECENT_DYNAMIC_PIDS],
             pending_spawns: [const { PendingSpawn::empty() }; MAX_DRIVERS_WITH_PENDING * MAX_PENDING_SPAWNS_PER_DRIVER],
+            spawn_contexts: [const { SpawnContext::empty() }; MAX_SPAWN_CONTEXTS],
+            inflight_spawns: [const { InflightSpawn::empty() }; MAX_INFLIGHT_SPAWNS],
         }
     }
 
@@ -1024,6 +1084,10 @@ impl Devd {
                         // Forward to driver
                         self.handle_query_driver_forward(slot, &recv_buf[..len]);
                     }
+                    Some(msg::GET_SPAWN_CONTEXT) => {
+                        // Handle spawn context query from child
+                        self.handle_get_spawn_context(slot, &recv_buf[..len]);
+                    }
                     _ => {
                         // Process normally
                         let response_len = self.query_handler.handle_message(
@@ -1124,6 +1188,52 @@ impl Devd {
         }
     }
 
+    /// Handle GET_SPAWN_CONTEXT message from a child driver
+    ///
+    /// Returns the port name that triggered this driver's spawn.
+    fn handle_get_spawn_context(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{QueryHeader, SpawnContextResponse, error};
+
+        let header = match QueryHeader::from_bytes(buf) {
+            Some(h) => h,
+            None => {
+                derror!("invalid GET_SPAWN_CONTEXT message from slot={}", slot);
+                return;
+            }
+        };
+
+        // Get the client's PID
+        let client_pid = match self.query_handler.get(slot) {
+            Some(client) => client.pid,
+            None => {
+                derror!("GET_SPAWN_CONTEXT from unknown slot={}", slot);
+                return;
+            }
+        };
+
+        // Look up spawn context for this PID
+        let mut response_buf = [0u8; 128];
+        let resp_len = if let Some((port_type, port_name)) = self.get_spawn_context(client_pid) {
+            dlog!("GET_SPAWN_CONTEXT for pid={}: port={}", client_pid,
+                core::str::from_utf8(port_name).unwrap_or("?"));
+
+            let resp = SpawnContextResponse::new(header.seq_id, error::OK, port_type);
+            resp.write_to(&mut response_buf, port_name)
+                .unwrap_or(SpawnContextResponse::HEADER_SIZE)
+        } else {
+            dlog!("GET_SPAWN_CONTEXT for pid={}: no context", client_pid);
+            // No context available - return error
+            let resp = SpawnContextResponse::new(header.seq_id, error::NOT_FOUND, 0);
+            resp.write_to(&mut response_buf, &[])
+                .unwrap_or(SpawnContextResponse::HEADER_SIZE)
+        };
+
+        // Send response
+        if let Some(client) = self.query_handler.get_mut(slot) {
+            let _ = client.channel.send(&response_buf[..resp_len]);
+        }
+    }
+
     /// Queue a spawn command for later delivery when driver reports Ready
     fn queue_pending_spawn(&mut self, driver_idx: u8, binary: &'static str, port_name: &[u8]) {
         // Find an empty slot
@@ -1172,6 +1282,10 @@ impl Devd {
                 match self.query_handler.send_spawn_child(driver_idx, binary.as_bytes(), port) {
                     Some(seq_id) => {
                         dlog!("sent queued SPAWN_CHILD seq={} binary={}", seq_id, binary);
+                        // Track inflight spawn so we can store context when ACK arrives
+                        // Use port_type 0 for now (we'd need to look up the port type)
+                        let port_type = self.ports.get_port_type(port).unwrap_or(0);
+                        self.track_inflight_spawn(seq_id, port_type, port);
                     }
                     None => {
                         // Driver still not connected - fall back to direct spawn
@@ -1212,6 +1326,9 @@ impl Devd {
         dlog!("SPAWN_ACK from driver {}: seq={} result={} match={} spawn={}",
             parent_idx, seq_id, result, match_count, spawn_count);
 
+        // Consume the inflight spawn to get port context
+        let port_ctx = self.consume_inflight_spawn(seq_id);
+
         if spawn_count == 0 || result < 0 {
             return;
         }
@@ -1235,6 +1352,13 @@ impl Devd {
 
             // Add to recent_dynamic_pids (for race condition handling)
             self.add_recent_dynamic_pid(child_pid, slot_idx as u8);
+
+            // Store spawn context (port that triggered spawn) for GET_SPAWN_CONTEXT
+            if let Some((port_type, port_name, port_name_len)) = port_ctx {
+                self.store_spawn_context(child_pid, port_type, &port_name[..port_name_len as usize]);
+                dlog!("stored spawn context for pid={}: port={}", child_pid,
+                    core::str::from_utf8(&port_name[..port_name_len as usize]).unwrap_or("?"));
+            }
 
             // Upgrade any already-connected client with this PID to driver status
             // This handles the race where child connects before SPAWN_ACK arrives
@@ -1378,6 +1502,12 @@ impl Devd {
             self.add_recent_dynamic_pid(pid, idx as u8);
         }
 
+        // Store spawn context for GET_SPAWN_CONTEXT
+        if !trigger_port.is_empty() {
+            let port_type = self.ports.get_port_type(trigger_port).unwrap_or(0);
+            self.store_spawn_context(pid, port_type, trigger_port);
+        }
+
         // Now set up the service slot
         if let Some(idx) = slot_idx {
             if let Some(service) = self.services.get_mut(idx) {
@@ -1438,6 +1568,77 @@ impl Devd {
         for entry in &mut self.recent_dynamic_pids {
             if entry.0 == pid {
                 *entry = (0, 0);
+                return;
+            }
+        }
+    }
+
+    // =========================================================================
+    // Spawn Context Tracking
+    // =========================================================================
+
+    /// Track an in-flight spawn command (seq_id -> port info)
+    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8]) {
+        // Find empty slot
+        for entry in &mut self.inflight_spawns {
+            if entry.seq_id == 0 {
+                entry.seq_id = seq_id;
+                entry.port_type = port_type;
+                let len = port_name.len().min(32);
+                entry.port_name[..len].copy_from_slice(&port_name[..len]);
+                entry.port_name_len = len as u8;
+                return;
+            }
+        }
+        // No slot available - oldest will be overwritten implicitly when it's used
+    }
+
+    /// Consume an in-flight spawn by seq_id, returning the port info
+    fn consume_inflight_spawn(&mut self, seq_id: u32) -> Option<(u8, [u8; 32], u8)> {
+        for entry in &mut self.inflight_spawns {
+            if entry.seq_id == seq_id {
+                let result = (entry.port_type, entry.port_name, entry.port_name_len);
+                *entry = InflightSpawn::empty();
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Store spawn context for a child PID
+    fn store_spawn_context(&mut self, pid: u32, port_type: u8, port_name: &[u8]) {
+        // Find empty slot or oldest entry
+        let mut empty_slot = None;
+        for (i, entry) in self.spawn_contexts.iter_mut().enumerate() {
+            if entry.pid == 0 {
+                empty_slot = Some(i);
+                break;
+            }
+        }
+
+        let slot = empty_slot.unwrap_or(0); // Overwrite first slot if full
+        self.spawn_contexts[slot].pid = pid;
+        self.spawn_contexts[slot].port_type = port_type;
+        let len = port_name.len().min(32);
+        self.spawn_contexts[slot].port_name[..len].copy_from_slice(&port_name[..len]);
+        self.spawn_contexts[slot].port_name_len = len as u8;
+    }
+
+    /// Get spawn context for a PID
+    fn get_spawn_context(&self, pid: u32) -> Option<(u8, &[u8])> {
+        for entry in &self.spawn_contexts {
+            if entry.pid == pid {
+                return Some((entry.port_type, &entry.port_name[..entry.port_name_len as usize]));
+            }
+        }
+        None
+    }
+
+    /// Remove spawn context for a PID (when process exits)
+    fn remove_spawn_context(&mut self, pid: u32) {
+        for entry in &mut self.spawn_contexts {
+            if entry.pid == pid {
+                *entry = SpawnContext::empty();
                 return;
             }
         }

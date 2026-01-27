@@ -93,6 +93,8 @@ pub mod msg {
     pub const UNREGISTER_PORT: u16 = 0x0104;
     /// Driver state change notification (driver → devd)
     pub const STATE_CHANGE: u16 = 0x0105;
+    /// Get spawn context (child → devd) - returns the port that triggered this spawn
+    pub const GET_SPAWN_CONTEXT: u16 = 0x0106;
 
     // Query messages (client → devd → driver)
     /// List all registered devices
@@ -117,6 +119,8 @@ pub mod msg {
     pub const DEVICE_INFO: u16 = 0x0301;
     /// Response from driver query
     pub const QUERY_RESULT: u16 = 0x0302;
+    /// Response containing spawn context (port name that triggered spawn)
+    pub const SPAWN_CONTEXT: u16 = 0x0303;
     /// Error response
     pub const ERROR: u16 = 0x03FF;
 }
@@ -487,6 +491,104 @@ impl StateChange {
             new_state: buf[8],
             _pad: [0; 3],
         })
+    }
+}
+
+// =============================================================================
+// Spawn Context Messages (child → devd)
+// =============================================================================
+
+/// Get spawn context request (child → devd)
+///
+/// Sent by a newly spawned child to learn which port triggered its spawn.
+/// devd tracks this based on the caller's PID.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GetSpawnContext {
+    pub header: QueryHeader,
+}
+
+impl GetSpawnContext {
+    pub const SIZE: usize = QueryHeader::SIZE;
+
+    pub fn new(seq_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::GET_SPAWN_CONTEXT, seq_id),
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        self.header.to_bytes()
+    }
+}
+
+/// Spawn context response (devd → child)
+///
+/// Contains the port name that triggered this driver's spawn.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnContextResponse {
+    pub header: QueryHeader,
+    /// Result code (0 = success, negative = error)
+    pub result: i32,
+    /// Port type that triggered spawn
+    pub port_type: u8,
+    /// Length of port name
+    pub port_name_len: u8,
+    pub _pad: [u8; 2],
+    // Followed by: port_name bytes
+}
+
+impl SpawnContextResponse {
+    pub const HEADER_SIZE: usize = QueryHeader::SIZE + 8;
+    pub const MAX_PORT_NAME: usize = 64;
+
+    pub fn new(seq_id: u32, result: i32, port_type: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SPAWN_CONTEXT, seq_id),
+            result,
+            port_type,
+            port_name_len: 0,
+            _pad: [0; 2],
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], port_name: &[u8]) -> Option<usize> {
+        let total = Self::HEADER_SIZE + port_name.len();
+        if buf.len() < total {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
+        buf[12] = self.port_type;
+        buf[13] = port_name.len() as u8;
+        buf[14..16].copy_from_slice(&[0, 0]);
+        buf[16..16 + port_name.len()].copy_from_slice(port_name);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::HEADER_SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(buf)?;
+        let result = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let port_type = buf[12];
+        let port_name_len = buf[13] as usize;
+
+        if buf.len() < Self::HEADER_SIZE + port_name_len {
+            return None;
+        }
+
+        let resp = Self {
+            header,
+            result,
+            port_type,
+            port_name_len: port_name_len as u8,
+            _pad: [0; 2],
+        };
+        let port_name = &buf[Self::HEADER_SIZE..Self::HEADER_SIZE + port_name_len];
+        Some((resp, port_name))
     }
 }
 

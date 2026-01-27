@@ -48,7 +48,7 @@ use crate::syscall;
 use crate::query::{
     QueryHeader, PortRegister, PortRegisterResponse, DeviceRegister,
     ListDevices, DeviceListResponse, StateChange, SpawnChild, SpawnAck,
-    PortFilter, filter_mode,
+    PortFilter, filter_mode, GetSpawnContext, SpawnContextResponse,
     msg, port_type, error, class, driver_state,
 };
 
@@ -355,6 +355,63 @@ impl DevdClient {
 
         // State changes don't need a response - fire and forget
         Ok(())
+    }
+
+    // =========================================================================
+    // Spawn Context Query (child driver → devd)
+    // =========================================================================
+
+    /// Get spawn context - returns the port that triggered this driver's spawn
+    ///
+    /// Call this when your driver starts to learn which port to connect to.
+    /// devd tracks spawn context by PID and returns the trigger port name.
+    ///
+    /// Returns (port_name, port_type) if this driver was spawned by devd rules,
+    /// or None if no context available (e.g., manually started driver).
+    pub fn get_spawn_context(&mut self) -> Result<Option<([u8; 64], usize, PortType)>, SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = GetSpawnContext::new(seq_id);
+        channel.send(&req.to_bytes())?;
+
+        // Wait for response
+        let mut resp_buf = [0u8; 128];
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut resp_buf) {
+                Ok(resp_len) if resp_len >= SpawnContextResponse::HEADER_SIZE => {
+                    if let Some((resp, port_name)) = SpawnContextResponse::from_bytes(&resp_buf[..resp_len]) {
+                        if resp.header.msg_type == msg::SPAWN_CONTEXT {
+                            if resp.result == error::OK && resp.port_name_len > 0 {
+                                let mut name = [0u8; 64];
+                                let len = (resp.port_name_len as usize).min(64);
+                                name[..len].copy_from_slice(&port_name[..len]);
+                                let ptype = match resp.port_type {
+                                    port_type::BLOCK => PortType::Block,
+                                    port_type::PARTITION => PortType::Partition,
+                                    port_type::NETWORK => PortType::Network,
+                                    port_type::CONSOLE => PortType::Console,
+                                    port_type::USB => PortType::Usb,
+                                    port_type::FILESYSTEM => PortType::Filesystem,
+                                    _ => PortType::Service,
+                                };
+                                return Ok(Some((name, len, ptype)));
+                            }
+                            // No context available (result != OK or empty name)
+                            return Ok(None);
+                        }
+                    }
+                    return Err(SysError::IoError);
+                }
+                Ok(_) => return Err(SysError::IoError),
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SysError::Timeout)
     }
 
     // =========================================================================
