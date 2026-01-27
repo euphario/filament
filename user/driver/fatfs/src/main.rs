@@ -34,6 +34,8 @@ use userlib::ipc::{Channel, Mux, MuxFilter};
 use userlib::devd::{DevdClient, DriverState};
 use userlib::blk_client::BlockClient;
 use userlib::blk::BlkError;
+use userlib::data_port::DataPort;
+use userlib::ring::io_status;
 use userlib::vfs::{
     FsRegister, VfsHeader, fs_type, msg, error,
     ListDir, ReadFile, MakeDir, Remove, WriteFile,
@@ -133,6 +135,7 @@ impl FatBpb {
 }
 
 /// FAT filesystem state
+#[derive(Clone)]
 struct FatState {
     /// FAT type (FAT16 or FAT32)
     fat_type: FatType,
@@ -297,8 +300,12 @@ struct FatfsDriver {
     devd_client: Option<DevdClient>,
     /// Connection to vfsd
     vfs_channel: Option<Channel>,
-    /// Connection to block device
+    /// Connection to block device (legacy IPC)
     block_client: Option<BlockClient>,
+    /// Connection to block device (DataPort ring protocol - zero-copy)
+    data_port: Option<DataPort>,
+    /// Using DataPort (true) or legacy BlockClient (false)
+    use_data_port: bool,
     /// FAT filesystem state
     fat_state: Option<FatState>,
     /// Instance number (for mount point naming, derived from PID)
@@ -311,6 +318,8 @@ impl FatfsDriver {
             devd_client: None,
             vfs_channel: None,
             block_client: None,
+            data_port: None,
+            use_data_port: false,
             fat_state: None,
             instance: 0,
         }
@@ -336,8 +345,127 @@ impl FatfsDriver {
         Ok(())
     }
 
+    /// Try to connect to block device via DataPort (zero-copy path)
+    fn try_connect_dataport(&mut self) -> Result<(), SysError> {
+        // Partition driver's provider DataPort shmem_id
+        // TODO: Get this from devd or service discovery instead of hardcoding
+        const PARTITION_SHMEM_ID: u32 = 3;
+
+        flog!("trying DataPort connection shmem_id={}", PARTITION_SHMEM_ID);
+
+        let mut port = DataPort::connect(PARTITION_SHMEM_ID)?;
+
+        // Query geometry
+        match port.query_geometry() {
+            Some(info) => {
+                flog!("DataPort geometry: {} bytes/sector, {} sectors",
+                    info.block_size, info.block_count);
+            }
+            None => {
+                flog!("DataPort: geometry query failed, using defaults");
+            }
+        }
+
+        self.data_port = Some(port);
+        self.use_data_port = true;
+        Ok(())
+    }
+
+    /// Read blocks via DataPort (zero-copy path)
+    fn read_blocks_dataport(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), SysError> {
+        let port = self.data_port.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let len = (count * 512) as u32;
+        let offset = port.alloc(len).ok_or(SysError::OutOfMemory)?;
+
+        // Use partition index 0 in param field
+        let tag = {
+            let t = port.next_tag();
+            let sqe = userlib::ring::IoSqe {
+                opcode: userlib::ring::io_op::READ,
+                flags: 0,
+                priority: 0,
+                tag: t,
+                lba,
+                data_offset: offset,
+                data_len: len,
+                param: 0, // partition 0
+            };
+            if !port.submit(&sqe) {
+                return Err(SysError::IoError);
+            }
+            t
+        };
+
+        port.notify();
+
+        // Poll for completion
+        for _ in 0..1000 {
+            if let Some(cqe) = port.poll_cq() {
+                if cqe.tag == tag {
+                    if cqe.status == io_status::OK {
+                        if let Some(slice) = port.pool_slice(offset, len) {
+                            let copy_len = buf.len().min(len as usize);
+                            buf[..copy_len].copy_from_slice(&slice[..copy_len]);
+                            return Ok(());
+                        }
+                    }
+                    return Err(SysError::IoError);
+                }
+            }
+            userlib::syscall::sleep_us(1000);
+        }
+
+        ferror!("DataPort read timeout");
+        Err(SysError::Timeout)
+    }
+
+    /// Unified read method - uses DataPort or legacy IPC depending on connection type
+    fn read_sectors(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), SysError> {
+        if self.use_data_port {
+            self.read_blocks_dataport(lba, count, buf)
+        } else if let Some(block) = self.block_client.as_mut() {
+            block.read_blocks(lba, count, buf).map(|_| ()).map_err(|_| SysError::IoError)
+        } else {
+            Err(SysError::ConnectionRefused)
+        }
+    }
+
     fn connect_to_block_device(&mut self) -> Result<(), SysError> {
         flog!("connecting to block device");
+
+        // Try DataPort first (zero-copy path)
+        if self.try_connect_dataport().is_ok() {
+            flog!("connected via DataPort (zero-copy)");
+
+            // Read boot sector via DataPort
+            let mut boot_sector = [0u8; 512];
+            self.read_blocks_dataport(0, 1, &mut boot_sector)?;
+
+            // Parse BPB and set up FAT state
+            let bpb = match FatBpb::from_boot_sector(&boot_sector) {
+                Some(b) => b,
+                None => {
+                    ferror!("invalid boot sector");
+                    return Err(SysError::IoError);
+                }
+            };
+
+            flog!("BPB: {} bytes/sector, {} sectors/cluster", bpb.bytes_per_sector, bpb.sectors_per_cluster);
+
+            let fat_state = FatState::from_bpb(bpb);
+            flog!("FAT type: {:?}", fat_state.fat_type);
+
+            if fat_state.fat_type == FatType::Unknown {
+                ferror!("unsupported FAT type");
+                return Err(SysError::IoError);
+            }
+
+            self.fat_state = Some(fat_state);
+            return Ok(());
+        }
+
+        flog!("DataPort failed, trying legacy IPC");
 
         // First, try to get spawn context from devd (tells us which port triggered our spawn)
         let port_name: Option<([u8; 64], usize)> = if let Some(client) = self.devd_client.as_mut() {
@@ -642,12 +770,7 @@ impl FatfsDriver {
         let mut count = 0;
 
         let fat_state = match &self.fat_state {
-            Some(s) => s,
-            None => return entries,
-        };
-
-        let block = match &mut self.block_client {
-            Some(b) => b,
+            Some(s) => s.clone(),
             None => return entries,
         };
 
@@ -669,10 +792,11 @@ impl FatfsDriver {
         let mut sector_buf = [0u8; 4096];
         let mut total_read = 0usize;
 
-        // Read one sector at a time due to IPC size limit
+        // Read one sector at a time due to IPC size limit (for legacy path)
+        // DataPort can handle larger reads but we keep consistent behavior
         for i in 0..sectors_to_read {
             let offset = i as usize * 512;
-            if block.read_blocks(root_sector as u64 + i as u64, 1, &mut sector_buf[offset..offset + 512]).is_err() {
+            if self.read_sectors(root_sector as u64 + i as u64, 1, &mut sector_buf[offset..offset + 512]).is_err() {
                 if i == 0 {
                     ferror!("failed to read root directory sector {}", i);
                     return entries;
@@ -759,12 +883,7 @@ impl FatfsDriver {
     /// Returns (data buffer, actual length read)
     fn read_file(&mut self, path: &[u8], offset: u64, max_len: u32) -> Option<([u8; 4096], usize)> {
         let fat_state = match &self.fat_state {
-            Some(s) => s,
-            None => return None,
-        };
-
-        let block = match &mut self.block_client {
-            Some(b) => b,
+            Some(s) => s.clone(),
             None => return None,
         };
 
@@ -786,8 +905,15 @@ impl FatfsDriver {
         let mut sector_buf = [0u8; 4096];
         let read_len = (sectors_to_read as usize * 512).min(4096);
 
-        if block.read_blocks(root_sector as u64, sectors_to_read.min(8), &mut sector_buf).is_err() {
-            return None;
+        // Read directory one sector at a time for consistency
+        for i in 0..sectors_to_read.min(8) {
+            let buf_offset = i as usize * 512;
+            if self.read_sectors(root_sector as u64 + i as u64, 1, &mut sector_buf[buf_offset..buf_offset + 512]).is_err() {
+                if i == 0 {
+                    return None;
+                }
+                break;
+            }
         }
 
         // Find the file
@@ -834,8 +960,15 @@ impl FatfsDriver {
         let mut file_buf = [0u8; 4096];
         let read_sectors = (cluster_size / 512).min(8);
 
-        if block.read_blocks(cluster_sector as u64, read_sectors, &mut file_buf).is_err() {
-            return None;
+        // Read file data one sector at a time for consistency
+        for i in 0..read_sectors {
+            let buf_offset = i as usize * 512;
+            if self.read_sectors(cluster_sector as u64 + i as u64, 1, &mut file_buf[buf_offset..buf_offset + 512]).is_err() {
+                if i == 0 {
+                    return None;
+                }
+                break;
+            }
         }
 
         // Apply offset and length limits

@@ -125,6 +125,8 @@ pub struct SharedMem {
     /// When notify() is called with no waiters, all OTHER allowed PIDs get marked pending.
     /// When wait() is called, if caller has pending flag, return immediately.
     pending_for: [Pid; MAX_ALLOWED_PIDS],
+    /// Public access flag - when true, any process can map this region
+    pub is_public: bool,
 }
 
 impl SharedMem {
@@ -147,6 +149,7 @@ impl SharedMem {
             ref_count: 0,
             state: RegionState::Active,
             pending_for: [NO_PID; MAX_ALLOWED_PIDS],
+            is_public: false,
         }
     }
 
@@ -154,6 +157,10 @@ impl SharedMem {
     pub fn is_allowed(&self, pid: Pid) -> bool {
         // Owner always allowed
         if pid == self.owner_pid {
+            return true;
+        }
+        // Public regions allow everyone
+        if self.is_public {
             return true;
         }
         // Check allowed list
@@ -564,7 +571,7 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
         }
 
         // Find the region and validate
-        let mut found_info: Option<(u64, usize, bool, Pid, [Pid; MAX_ALLOWED_PIDS])> = None;
+        let mut found_info: Option<(u64, usize, bool, Pid, [Pid; MAX_ALLOWED_PIDS], bool)> = None;
         for slot in guard.table.iter() {
             if let Some(ref region) = slot {
                 if region.id == shmem_id {
@@ -574,13 +581,14 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
                         region.state() == RegionState::Dying,
                         region.owner_pid,
                         region.allowed_pids,
+                        region.is_public,
                     ));
                     break;
                 }
             }
         }
 
-        let (phys, sz, is_dying, owner, allowed) = match found_info {
+        let (phys, sz, is_dying, owner, allowed, is_public) = match found_info {
             Some(info) => info,
             None => {
                 kwarn!("shmem", "map_not_found"; caller = pid as u64, shmem = shmem_id as u64);
@@ -596,8 +604,8 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
             return Err(-11); // EAGAIN - resource temporarily unavailable
         }
 
-        // Check if allowed
-        let is_allowed = pid == owner || allowed.iter().any(|&p| p == pid);
+        // Check if allowed (owner, public, or in allowed list)
+        let is_allowed = pid == owner || is_public || allowed.iter().any(|&p| p == pid);
         if !is_allowed {
             kwarn!("shmem", "map_denied";
                 caller = pid as u64,
@@ -710,6 +718,31 @@ pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
                 if !region.allow_pid(peer_pid) {
                     return Err(-12); // ENOMEM (no space in allowed list)
                 }
+                return Ok(());
+            }
+        }
+    }
+    Err(-2) // ENOENT
+}
+
+/// Make a shared memory region public (accessible by any process)
+pub fn set_public(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
+    let mut guard = SHMEM.lock();
+    for slot in guard.table.iter_mut() {
+        if let Some(ref mut region) = slot {
+            if region.id == shmem_id {
+                // Reject if region is dying
+                if region.state() == RegionState::Dying {
+                    return Err(-11); // EAGAIN
+                }
+
+                // Only owner can make region public
+                if region.owner_pid != owner_pid {
+                    return Err(-1); // EPERM
+                }
+
+                region.is_public = true;
+                kinfo!("shmem", "set_public"; id = shmem_id as u64, owner = owner_pid as u64);
                 return Ok(());
             }
         }

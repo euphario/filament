@@ -249,8 +249,10 @@ struct PartitionDriver {
     devd_client: Option<DevdClient>,
     /// Connection to underlying block device (legacy IPC)
     block_client: Option<BlockClient>,
-    /// Connection to underlying block device (DataPort ring protocol)
-    data_port: Option<DataPort>,
+    /// Connection to underlying block device (DataPort ring protocol) - consumer side
+    consumer_port: Option<DataPort>,
+    /// DataPort provider for fatfs (zero-copy path)
+    provider_port: Option<DataPort>,
     /// Using DataPort (true) or legacy IPC (false)
     use_data_port: bool,
     /// Block size from underlying device
@@ -270,7 +272,8 @@ impl PartitionDriver {
         Self {
             devd_client: None,
             block_client: None,
-            data_port: None,
+            consumer_port: None,
+            provider_port: None,
             use_data_port: false,
             block_size: 512,
             total_blocks: 0,
@@ -315,7 +318,7 @@ impl PartitionDriver {
             }
         }
 
-        self.data_port = Some(port);
+        self.consumer_port = Some(port);
         self.use_data_port = true;
 
         plog!("connected via DataPort (ring protocol)");
@@ -380,7 +383,7 @@ impl PartitionDriver {
     /// Read a block using DataPort or legacy IPC
     fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SysError> {
         if self.use_data_port {
-            let port = self.data_port.as_mut().ok_or(SysError::ConnectionRefused)?;
+            let port = self.consumer_port.as_mut().ok_or(SysError::ConnectionRefused)?;
 
             // Allocate space in the pool
             let len = buf.len() as u32;
@@ -478,6 +481,241 @@ impl PartitionDriver {
 
         plog!("found {} partition(s)", self.partition_count);
         Ok(self.partition_count)
+    }
+
+    /// Create DataPort provider for zero-copy access from fatfs
+    fn create_provider_port(&mut self) -> Result<u32, SysError> {
+        use userlib::data_port::{DataPort, DataPortConfig};
+
+        let config = DataPortConfig {
+            ring_size: 64,
+            side_size: 8,
+            pool_size: 256 * 1024, // 256KB pool
+        };
+
+        let port = DataPort::create(config)?;
+        let shmem_id = port.shmem_id();
+
+        plog!("created provider DataPort shmem_id={}", shmem_id);
+
+        // Make public so any process can connect (fatfs will connect)
+        // In production, should restrict to specific PIDs
+        if !port.set_public() {
+            plog!("warning: failed to set provider DataPort as public");
+        }
+
+        self.provider_port = Some(port);
+        Ok(shmem_id)
+    }
+
+    /// Process ring requests from fatfs (zero-copy path)
+    fn process_ring_requests(&mut self) {
+        // Collect pending requests first to avoid borrow issues
+        let mut requests: [Option<userlib::ring::IoSqe>; 8] = [None; 8];
+        let mut req_count = 0;
+
+        if let Some(provider) = self.provider_port.as_ref() {
+            while req_count < 8 {
+                if let Some(sqe) = provider.recv() {
+                    requests[req_count] = Some(sqe);
+                    req_count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Process collected requests
+        for i in 0..req_count {
+            if let Some(sqe) = requests[i].take() {
+                match sqe.opcode {
+                    userlib::ring::io_op::READ => {
+                        self.handle_ring_read(&sqe);
+                    }
+                    _ => {
+                        // Unknown opcode - complete with error
+                        if let Some(p) = self.provider_port.as_ref() {
+                            p.complete_error(sqe.tag, userlib::ring::io_status::INVALID);
+                            p.notify();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process sidechannel queries (geometry, etc.)
+        let mut queries: [Option<userlib::ring::SideEntry>; 4] = [None; 4];
+        let mut query_count = 0;
+
+        if let Some(provider) = self.provider_port.as_ref() {
+            while query_count < 4 {
+                if let Some(entry) = provider.poll_side_request() {
+                    queries[query_count] = Some(entry);
+                    query_count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for i in 0..query_count {
+            if let Some(entry) = queries[i].take() {
+                use userlib::ring::side_msg;
+                match entry.msg_type {
+                    side_msg::QUERY_GEOMETRY => {
+                        // Return geometry for partition 0 (or use param for partition selection)
+                        let info = userlib::data_port::GeometryInfo {
+                            block_size: self.block_size,
+                            block_count: if self.partition_count > 0 {
+                                self.partitions[0].sector_count
+                            } else {
+                                0
+                            },
+                            max_transfer: 64 * 1024,
+                        };
+                        if let Some(p) = self.provider_port.as_ref() {
+                            p.respond_geometry(&entry, &info);
+                            p.notify();
+                        }
+                    }
+                    _ => {
+                        // Unknown query
+                        let mut eol = entry;
+                        eol.status = userlib::ring::side_status::EOL;
+                        if let Some(p) = self.provider_port.as_ref() {
+                            p.side_send(&eol);
+                            p.notify();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle a ring READ request from fatfs
+    fn handle_ring_read(&mut self, sqe: &userlib::ring::IoSqe) {
+        // param field contains partition index
+        let part_idx = sqe.param as usize;
+
+        if part_idx >= self.partition_count {
+            if let Some(p) = self.provider_port.as_ref() {
+                p.complete_error(sqe.tag, userlib::ring::io_status::INVALID);
+                p.notify();
+            }
+            return;
+        }
+
+        let part = &self.partitions[part_idx];
+
+        // Validate LBA
+        let sectors = (sqe.data_len / self.block_size) as u64;
+        if sqe.lba + sectors > part.sector_count {
+            if let Some(p) = self.provider_port.as_ref() {
+                p.complete_error(sqe.tag, userlib::ring::io_status::IO_ERROR);
+                p.notify();
+            }
+            return;
+        }
+
+        // Translate LBA
+        let disk_lba = part.start_lba + sqe.lba;
+
+        // Read from disk via consumer port (to qemu-usbd)
+        if !self.use_data_port {
+            // Legacy path - shouldn't happen but handle it
+            if let Some(p) = self.provider_port.as_ref() {
+                p.complete_error(sqe.tag, userlib::ring::io_status::IO_ERROR);
+                p.notify();
+            }
+            return;
+        }
+
+        let consumer = match self.consumer_port.as_mut() {
+            Some(c) => c,
+            None => {
+                if let Some(p) = self.provider_port.as_ref() {
+                    p.complete_error(sqe.tag, userlib::ring::io_status::IO_ERROR);
+                    p.notify();
+                }
+                return;
+            }
+        };
+
+        // Allocate in consumer's pool (qemu-usbd's pool)
+        let consumer_offset = match consumer.alloc(sqe.data_len) {
+            Some(o) => o,
+            None => {
+                if let Some(p) = self.provider_port.as_ref() {
+                    p.complete_error(sqe.tag, userlib::ring::io_status::IO_ERROR);
+                    p.notify();
+                }
+                return;
+            }
+        };
+
+        // Submit read to qemu-usbd
+        let consumer_tag = match consumer.submit_read(disk_lba, consumer_offset, sqe.data_len) {
+            Some(t) => t,
+            None => {
+                if let Some(p) = self.provider_port.as_ref() {
+                    p.complete_error(sqe.tag, userlib::ring::io_status::IO_ERROR);
+                    p.notify();
+                }
+                return;
+            }
+        };
+
+        consumer.notify();
+
+        // Poll for completion
+        let mut transferred = 0u32;
+        let mut success = false;
+
+        for _ in 0..1000 {
+            if let Some(cqe) = consumer.poll_cq() {
+                if cqe.tag == consumer_tag {
+                    if cqe.status == userlib::ring::io_status::OK {
+                        transferred = cqe.transferred;
+                        success = true;
+                    }
+                    break;
+                }
+            }
+            userlib::syscall::sleep_us(1000);
+        }
+
+        if !success {
+            if let Some(p) = self.provider_port.as_ref() {
+                p.complete_error(sqe.tag, userlib::ring::io_status::IO_ERROR);
+                p.notify();
+            }
+            return;
+        }
+
+        // Copy from consumer's pool to provider's pool
+        // This is the ONE copy in the zero-copy chain
+        let provider = match self.provider_port.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let consumer = self.consumer_port.as_ref().unwrap();
+
+        if let (Some(src), Some(dst)) = (
+            consumer.pool_slice(consumer_offset, transferred),
+            provider.pool_slice_mut(sqe.data_offset, transferred),
+        ) {
+            // Invalidate cache on source (DMA wrote there)
+            invalidate_buffer(src.as_ptr() as u64, transferred as usize);
+            // Copy
+            dst.copy_from_slice(src);
+            // Complete to fatfs
+            provider.complete_ok(sqe.tag, transferred);
+        } else {
+            provider.complete_error(sqe.tag, userlib::ring::io_status::IO_ERROR);
+        }
+
+        provider.notify();
     }
 
     /// Register partition ports with devd
@@ -740,6 +978,18 @@ impl PartitionDriver {
             perror!("failed to register partitions: {:?}", e);
         }
 
+        // Create provider DataPort for zero-copy access from fatfs
+        let provider_shmem_id = match self.create_provider_port() {
+            Ok(id) => {
+                plog!("provider DataPort ready, shmem_id={}", id);
+                Some(id)
+            }
+            Err(e) => {
+                perror!("failed to create provider DataPort: {:?}", e);
+                None
+            }
+        };
+
         // Report ready state
         if let Some(client) = self.devd_client.as_mut() {
             let _ = client.report_state(DriverState::Ready);
@@ -766,14 +1016,63 @@ impl PartitionDriver {
             }
         }
 
+        // Log provider shmem_id so fatfs knows how to connect
+        if let Some(id) = provider_shmem_id {
+            plog!("fatfs should connect to shmem_id={}", id);
+        }
+
         plog!("entering service loop");
 
-        // Service loop
+        // Service loop - poll-based for now
+        // TODO: Integrate ring notification with mux for proper event-driven operation
         loop {
+            // Process ring requests from fatfs (zero-copy path)
+            if self.provider_port.is_some() {
+                self.process_ring_requests();
+            }
+
+            // Brief sleep to avoid busy-loop
+            syscall::sleep_us(1000);
+
+            // Also check for devd commands via polling
+            if let Some(client) = &mut self.devd_client {
+                if let Ok(Some(cmd)) = client.poll_command() {
+                    match cmd {
+                        DevdCommand::SpawnChild { seq_id, binary, binary_len, .. } => {
+                            let binary_str = match core::str::from_utf8(&binary[..binary_len]) {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    let _ = client.ack_spawn(seq_id, -1, 0);
+                                    continue;
+                                }
+                            };
+                            plog!("spawning child: {}", binary_str);
+                            let pid = syscall::exec(binary_str);
+                            if pid > 0 {
+                                plog!("spawned child PID: {}", pid);
+                                let _ = client.ack_spawn(seq_id, 0, pid as u32);
+                            } else {
+                                perror!("failed to spawn {}: {}", binary_str, -pid);
+                                let _ = client.ack_spawn(seq_id, pid as i32, 0);
+                            }
+                        }
+                        DevdCommand::StopChild { child_pid, .. } => {
+                            plog!("stopping child PID: {}", child_pid);
+                            let _ = syscall::kill(child_pid);
+                        }
+                    }
+                }
+            }
+
+            // Skip mux-based legacy IPC when provider_port is active
+            // fatfs should use DataPort instead
+            if self.provider_port.is_some() {
+                continue;
+            }
+
             let event = match mux.wait() {
                 Ok(e) => e,
                 Err(_) => {
-                    syscall::sleep_ms(10);
                     continue;
                 }
             };

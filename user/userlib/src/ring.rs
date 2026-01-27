@@ -280,6 +280,11 @@ impl<S: Copy, C: Copy> Ring<S, C> {
         self.shmem.allow(peer_pid).is_ok()
     }
 
+    /// Make ring public (accessible by any process)
+    pub fn set_public(&self) -> bool {
+        self.shmem.set_public().is_ok()
+    }
+
     /// Wait for notification
     pub fn wait(&self, timeout_ms: u32) -> bool {
         self.shmem.wait(timeout_ms).is_ok()
@@ -976,6 +981,11 @@ impl LayeredRing {
     /// Allow another process to map this ring
     pub fn allow(&self, peer_pid: u32) -> bool {
         self.shmem.allow(peer_pid).is_ok()
+    }
+
+    /// Make ring public (accessible by any process)
+    pub fn set_public(&self) -> bool {
+        self.shmem.set_public().is_ok()
     }
 
     /// Wait for notification

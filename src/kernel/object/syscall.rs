@@ -1717,8 +1717,8 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
         return Error::BadHandle.to_errno();
     }
 
-    // Copy from user buffer
-    let mut kernel_buf = [0u8; 256];
+    // Copy from user buffer (use MAX_INLINE_PAYLOAD to support block transfers)
+    let mut kernel_buf = [0u8; ipc::MAX_INLINE_PAYLOAD];
     let copy_len = core::cmp::min(buf_len, kernel_buf.len());
     if uaccess::copy_from_user(&mut kernel_buf[..copy_len], buf_ptr).is_err() {
         return Error::BadAddress.to_errno();
@@ -1845,6 +1845,13 @@ fn write_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id
                     // Simplest: just return the result; caller checks if buf_len==1 && cmd==1
                     woken as i64
                 }
+                Err(e) => e,
+            }
+        }
+        2 => {
+            // SET_PUBLIC: make region accessible by any process
+            match shmem::set_public(task_id, s.shmem_id()) {
+                Ok(()) => 0,
                 Err(e) => e,
             }
         }

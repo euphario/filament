@@ -10,14 +10,6 @@ version = "0.1.0"
 name = "fatfs"
 version = "0.1.0"
 dependencies = [
- "usb",
- "userlib",
-]
-
-[[package]]
-name = "usb"
-version = "0.1.0"
-dependencies = [
  "userlib",
 ]
 

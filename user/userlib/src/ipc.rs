@@ -548,6 +548,14 @@ impl Shmem {
         Ok(())
     }
 
+    /// Make region public (accessible by any process)
+    pub fn set_public(&self) -> SysResult<()> {
+        let mut buf = [0u8; 1];
+        buf[0] = 2; // SET_PUBLIC command
+        write(self.handle, &buf)?;
+        Ok(())
+    }
+
     /// Wait for notification (blocking)
     pub fn wait(&self, timeout_ms: u32) -> SysResult<()> {
         let mut buf = [0u8; 4];

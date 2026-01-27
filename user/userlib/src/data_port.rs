@@ -148,6 +148,11 @@ impl DataPort {
         self.ring.allow(peer_pid)
     }
 
+    /// Make port public (accessible by any process)
+    pub fn set_public(&self) -> bool {
+        self.ring.set_public()
+    }
+
     /// Get the role of this port
     pub fn role(&self) -> PortRole {
         self.role
