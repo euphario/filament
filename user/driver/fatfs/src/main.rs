@@ -123,8 +123,8 @@ impl FatfsDriver {
             let _ = client.report_state(DriverState::Ready);
             flog!("reported ready, entering service loop");
 
-            // Use the generic driver service loop
-            run_driver_loop(client, FatfsSpawnHandler, 100);
+            // Use the generic driver service loop (event-driven, no polling)
+            run_driver_loop(client, FatfsSpawnHandler);
         } else {
             ferror!("no devd client");
             syscall::exit(1);

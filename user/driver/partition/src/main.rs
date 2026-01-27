@@ -319,8 +319,8 @@ impl PartitionDriver {
             let _ = client.report_state(DriverState::Ready);
             plog!("reported ready state, entering service loop");
 
-            // Use the generic driver service loop
-            run_driver_loop(client, PartitionSpawnHandler, 100);
+            // Use the generic driver service loop (event-driven, no polling)
+            run_driver_loop(client, PartitionSpawnHandler);
         } else {
             perror!("no devd client, exiting");
             syscall::exit(1);

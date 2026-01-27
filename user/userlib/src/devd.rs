@@ -812,28 +812,34 @@ pub trait SpawnHandler {
 ///
 /// let client = DevdClient::connect()?;
 /// client.report_state(DriverState::Ready)?;
-/// run_driver_loop(client, MyDriver::new(), 100);
+/// run_driver_loop(client, MyDriver::new());
 /// ```
 pub fn run_driver_loop<H: SpawnHandler>(
     mut client: DevdClient,
     mut handler: H,
-    poll_interval_ms: u32,
 ) -> ! {
-    loop {
-        match client.poll_command() {
-            Ok(Some(cmd)) => {
-                handle_command(&mut client, &mut handler, cmd);
-            }
-            Ok(None) => {
-                // No command pending
-            }
-            Err(_) => {
-                // Poll error - could reconnect here
-            }
+    // Get the channel handle for event-driven blocking
+    let handle = match client.handle() {
+        Some(h) => h,
+        None => {
+            // No channel - can't run event loop
+            loop { syscall::sleep_ms(1000); }
         }
+    };
 
-        if poll_interval_ms > 0 {
-            syscall::sleep_ms(poll_interval_ms);
+    loop {
+        // Block until channel is readable (Sleeping state, no deadline)
+        let _ = crate::ipc::wait_one(handle);
+
+        // Process all pending commands
+        loop {
+            match client.poll_command() {
+                Ok(Some(cmd)) => {
+                    handle_command(&mut client, &mut handler, cmd);
+                }
+                Ok(None) => break,  // No more commands
+                Err(_) => break,    // Error - exit inner loop
+            }
         }
     }
 }
