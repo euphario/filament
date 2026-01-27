@@ -113,8 +113,15 @@ fn ls_vfs(path: &[u8]) -> CommandResult {
 
     // Check for error response
     if header.msg_type == msg::RESULT {
-        let code = if resp_len >= 12 {
-            i32::from_le_bytes([resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]])
+        // Need VfsHeader::SIZE + 4 bytes to read the i32 result code
+        let min_result_size = VfsHeader::SIZE + 4;
+        let code = if resp_len >= min_result_size {
+            i32::from_le_bytes([
+                resp_buf[VfsHeader::SIZE],
+                resp_buf[VfsHeader::SIZE + 1],
+                resp_buf[VfsHeader::SIZE + 2],
+                resp_buf[VfsHeader::SIZE + 3],
+            ])
         } else {
             -1
         };

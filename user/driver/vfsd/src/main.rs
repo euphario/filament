@@ -29,51 +29,18 @@ use userlib::vfs::{
     FsRegister,
 };
 use userlib::error::SysError;
+use userlib::sync::SingleThreadCell;
 
 // =============================================================================
-// Logging
+// Logging - uses centralized macros from userlib
 // =============================================================================
 
 macro_rules! vlog {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[vfsd] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Info, &buf[..pos]);
-    }};
+    ($($arg:tt)*) => { userlib::klog_info!("vfsd", $($arg)*) };
 }
 
 macro_rules! verror {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[vfsd] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Error, &buf[..pos]);
-    }};
+    ($($arg:tt)*) => { userlib::klog_error!("vfsd", $($arg)*) };
 }
 
 // =============================================================================
@@ -83,6 +50,32 @@ macro_rules! verror {
 const MAX_MOUNTS: usize = 8;
 const MAX_CLIENTS: usize = 8;
 const TRANSFER_BUF_SIZE: usize = 65536; // 64KB transfer buffer
+
+// =============================================================================
+// State Enums
+// =============================================================================
+
+/// Client connection state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientState {
+    /// Slot is empty, available for reuse
+    Empty,
+    /// Client connected, channel active
+    Connected,
+    /// Client disconnected, pending cleanup
+    Disconnected,
+}
+
+/// Filesystem mount state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountState {
+    /// Slot is empty
+    Empty,
+    /// Filesystem registered, channel active
+    Mounted,
+    /// Unmount requested, pending cleanup
+    Unmounting,
+}
 
 // =============================================================================
 // Mount Entry
@@ -97,8 +90,8 @@ struct MountEntry {
     fs_type: u8,
     /// Handle to fatfs channel
     handle: Handle,
-    /// Is this mount active?
-    active: bool,
+    /// Mount state
+    state: MountState,
 }
 
 impl MountEntry {
@@ -108,8 +101,12 @@ impl MountEntry {
             path_len: 0,
             fs_type: 0,
             handle: Handle::INVALID,
-            active: false,
+            state: MountState::Empty,
         }
+    }
+
+    fn is_active(&self) -> bool {
+        self.state == MountState::Mounted
     }
 
     fn path_str(&self) -> &str {
@@ -117,7 +114,7 @@ impl MountEntry {
     }
 
     fn matches(&self, path: &[u8]) -> bool {
-        if !self.active || self.path_len == 0 {
+        if !self.is_active() || self.path_len == 0 {
             return false;
         }
         let mount_path = &self.path[..self.path_len as usize];
@@ -153,7 +150,7 @@ struct ClientEntry {
     handle: Handle,
     is_fs: bool,  // true = fatfs, false = shell/app
     mount_idx: u8, // if is_fs, which mount this serves
-    active: bool,
+    state: ClientState,
 }
 
 impl ClientEntry {
@@ -162,8 +159,12 @@ impl ClientEntry {
             handle: Handle::INVALID,
             is_fs: false,
             mount_idx: 0,
-            active: false,
+            state: ClientState::Empty,
         }
+    }
+
+    fn is_active(&self) -> bool {
+        self.state == ClientState::Connected
     }
 }
 
@@ -172,8 +173,8 @@ impl ClientEntry {
 // =============================================================================
 
 struct Vfsd {
-    /// Service port handle
-    port_handle: Handle,
+    /// Service port (stored to prevent resource leak)
+    port: Option<Port>,
     /// Event multiplexer
     mux: Option<Mux>,
     /// Mount table
@@ -191,7 +192,7 @@ struct Vfsd {
 impl Vfsd {
     const fn new() -> Self {
         Self {
-            port_handle: Handle::INVALID,
+            port: None,
             mux: None,
             mounts: [const { MountEntry::empty() }; MAX_MOUNTS],
             mount_count: 0,
@@ -202,6 +203,11 @@ impl Vfsd {
         }
     }
 
+    /// Get the port handle, if port is registered.
+    fn port_handle(&self) -> Handle {
+        self.port.as_ref().map(|p| p.handle()).unwrap_or(Handle::INVALID)
+    }
+
     fn init(&mut self) -> Result<(), SysError> {
         vlog!("initializing");
 
@@ -210,16 +216,13 @@ impl Vfsd {
 
         // Register vfs: port
         let port = Port::register(b"vfs:")?;
-        let port_handle = port.handle();
         vlog!("port registered: vfs:");
 
         // Add port to mux
-        mux.add(port_handle, MuxFilter::Readable)?;
+        mux.add(port.handle(), MuxFilter::Readable)?;
 
-        self.port_handle = port_handle;
-        // Port is consumed but handle is saved
-        core::mem::forget(port);
-
+        // Store port properly (no more mem::forget leak!)
+        self.port = Some(port);
         self.mux = Some(mux);
         vlog!("ready");
         Ok(())
@@ -237,7 +240,7 @@ impl Vfsd {
             };
 
             // Check if it's a new connection on the port
-            if event.handle == self.port_handle {
+            if event.handle == self.port_handle() {
                 self.handle_new_connection();
                 continue;
             }
@@ -251,7 +254,7 @@ impl Vfsd {
         // Accept the connection by reading from port handle
         // Kernel returns [handle: u32, client_pid: u32] (8 bytes)
         let mut buf = [0u8; 8];
-        let ch_handle = match syscall::read(self.port_handle, &mut buf) {
+        let ch_handle = match syscall::read(self.port_handle(), &mut buf) {
             Ok(n) if n >= 4 => {
                 let raw = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 Handle(raw)
@@ -262,7 +265,7 @@ impl Vfsd {
         vlog!("new connection");
 
         // Find empty client slot
-        let slot = match self.clients.iter().position(|c| !c.active) {
+        let slot = match self.clients.iter().position(|c| c.state == ClientState::Empty) {
             Some(s) => s,
             None => {
                 verror!("no client slots available");
@@ -274,7 +277,11 @@ impl Vfsd {
 
         // Add channel to mux
         if let Some(ref mux) = self.mux {
-            let _ = mux.add(ch_handle, MuxFilter::Readable);
+            if let Err(e) = mux.add(ch_handle, MuxFilter::Readable) {
+                verror!("mux.add failed for client slot {}: {:?}", slot, e);
+                let _ = syscall::close(ch_handle);
+                return;
+            }
         }
 
         // Store handle
@@ -282,13 +289,13 @@ impl Vfsd {
             handle: ch_handle,
             is_fs: false,
             mount_idx: 0,
-            active: true,
+            state: ClientState::Connected,
         };
     }
 
     fn handle_client_message(&mut self, handle: Handle) {
         // Find client by handle
-        let slot = match self.clients.iter().position(|c| c.active && c.handle == handle) {
+        let slot = match self.clients.iter().position(|c| c.is_active() && c.handle == handle) {
             Some(s) => s,
             None => return,
         };
@@ -348,7 +355,7 @@ impl Vfsd {
         };
 
         // Find empty mount slot
-        let mount_slot = match self.mounts.iter().position(|m| !m.active) {
+        let mount_slot = match self.mounts.iter().position(|m| m.state == MountState::Empty) {
             Some(s) => s,
             None => {
                 verror!("no mount slots available");
@@ -363,7 +370,7 @@ impl Vfsd {
         mount.path[..len].copy_from_slice(&mount_point[..len]);
         mount.path_len = len as u8;
         mount.fs_type = reg.fs_type;
-        mount.active = true;
+        mount.state = MountState::Mounted;
 
         // Take handle from client - fatfs channel becomes mount's channel
         mount.handle = self.clients[client_slot].handle;
@@ -453,7 +460,7 @@ impl Vfsd {
 
     fn list_mounts(&mut self, client_slot: usize, seq_id: u32) {
         // Count active mounts
-        let count = self.mounts.iter().filter(|m| m.active).count() as u16;
+        let count = self.mounts.iter().filter(|m| m.is_active()).count() as u16;
 
         let resp = DirEntries::new(seq_id, count, false);
         if resp.write_header(&mut self.send_buf).is_none() {
@@ -463,7 +470,7 @@ impl Vfsd {
         let mut offset = DirEntries::HEADER_SIZE;
 
         for mount in &self.mounts {
-            if !mount.active {
+            if !mount.is_active() {
                 continue;
             }
 
@@ -593,14 +600,14 @@ impl Vfsd {
 
     fn send_to_client(&self, client_slot: usize, data: &[u8]) {
         let client = &self.clients[client_slot];
-        if !client.active {
+        if !client.is_active() {
             return;
         }
 
         // If client is a filesystem, its channel is in the mount
         let handle = if client.is_fs {
             let mount_idx = client.mount_idx as usize;
-            if mount_idx < MAX_MOUNTS && self.mounts[mount_idx].active {
+            if mount_idx < MAX_MOUNTS && self.mounts[mount_idx].is_active() {
                 self.mounts[mount_idx].handle
             } else {
                 return;
@@ -614,7 +621,7 @@ impl Vfsd {
 
     fn remove_client(&mut self, slot: usize) {
         let client = &self.clients[slot];
-        if !client.active {
+        if !client.is_active() {
             return;
         }
 
@@ -623,9 +630,9 @@ impl Vfsd {
             let mount_idx = client.mount_idx as usize;
             if mount_idx < MAX_MOUNTS {
                 let mount = &mut self.mounts[mount_idx];
-                if mount.active {
+                if mount.is_active() {
                     vlog!("unmounted: {}", mount.path_str());
-                    mount.active = false;
+                    mount.state = MountState::Empty;
                     mount.handle = Handle::INVALID;
                     self.mount_count = self.mount_count.saturating_sub(1);
                 }
@@ -648,19 +655,22 @@ impl Vfsd {
 // Entry Point
 // =============================================================================
 
-static mut VFSD: Vfsd = Vfsd::new();
+static VFSD: SingleThreadCell<Vfsd> = SingleThreadCell::new();
 
 #[unsafe(no_mangle)]
 fn main() {
     syscall::klog(LogLevel::Info, b"[vfsd] starting");
 
-    // SAFETY: Single-threaded userspace driver
-    let vfsd = unsafe { &mut *core::ptr::addr_of_mut!(VFSD) };
+    VFSD.init(Vfsd::new());
 
-    if let Err(e) = vfsd.init() {
-        verror!("init failed: {:?}", e);
-        syscall::exit(1);
+    {
+        let mut vfsd = VFSD.borrow_mut();
+        if let Err(e) = vfsd.init() {
+            verror!("init failed: {:?}", e);
+            syscall::exit(1);
+        }
     }
 
-    vfsd.run()
+    // Run loop - borrow for entire lifetime
+    VFSD.borrow_mut().run()
 }

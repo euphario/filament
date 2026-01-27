@@ -26,51 +26,18 @@ use userlib::vfs::{
     ListDir, DirEntries, DirEntry, file_type,
 };
 use userlib::error::SysError;
+use userlib::sync::SingleThreadCell;
 
 // =============================================================================
-// Logging
+// Logging - uses centralized macros from userlib
 // =============================================================================
 
 macro_rules! flog {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[fatfs] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Info, &buf[..pos]);
-    }};
+    ($($arg:tt)*) => { userlib::klog_info!("fatfs", $($arg)*) };
 }
 
 macro_rules! ferror {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[fatfs] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Error, &buf[..pos]);
-    }};
+    ($($arg:tt)*) => { userlib::klog_error!("fatfs", $($arg)*) };
 }
 
 // =============================================================================
@@ -319,19 +286,22 @@ impl FatfsDriver {
 // Main
 // =============================================================================
 
-static mut DRIVER: FatfsDriver = FatfsDriver::new();
+static DRIVER: SingleThreadCell<FatfsDriver> = SingleThreadCell::new();
 
 #[unsafe(no_mangle)]
 fn main() {
     syscall::klog(LogLevel::Info, b"[fatfs] starting");
 
-    // SAFETY: Single-threaded userspace driver
-    let driver = unsafe { &mut *(&raw mut DRIVER) };
+    DRIVER.init(FatfsDriver::new());
 
-    if let Err(e) = driver.init() {
-        ferror!("init failed: {:?}", e);
-        syscall::exit(1);
+    {
+        let mut driver = DRIVER.borrow_mut();
+        if let Err(e) = driver.init() {
+            ferror!("init failed: {:?}", e);
+            syscall::exit(1);
+        }
     }
 
-    driver.run()
+    // Run loop - borrow for entire lifetime
+    DRIVER.borrow_mut().run()
 }

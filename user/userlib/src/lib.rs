@@ -16,6 +16,7 @@ pub mod ring;
 pub mod data_port;
 pub mod devd;
 pub mod vfs;
+pub mod sync;
 
 pub use error::{SysError, SysResult};
 pub use syscall::{LogLevel, Handle, ObjHandle, ObjectType};

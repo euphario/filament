@@ -151,3 +151,72 @@ macro_rules! eprintln {
         let _ = writeln!(&mut $crate::io::Stderr, $($arg)*);
     }};
 }
+
+// =============================================================================
+// Kernel Log Macros (for daemons/drivers)
+// =============================================================================
+
+/// Log to kernel log with a prefix (Info level)
+///
+/// # Example
+/// ```ignore
+/// klog_info!("vfsd", "initializing");
+/// klog_info!("vfsd", "mounted: {} (type={})", path, fs_type);
+/// ```
+#[macro_export]
+macro_rules! klog_info {
+    ($prefix:expr, $($arg:tt)*) => {{
+        use core::fmt::Write;
+        let mut buf = [0u8; 128];
+        let prefix_bytes = concat!("[", $prefix, "] ").as_bytes();
+        let prefix_len = prefix_bytes.len();
+        buf[..prefix_len].copy_from_slice(prefix_bytes);
+        let mut pos = prefix_len;
+        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
+        impl core::fmt::Write for W<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &byte in s.as_bytes() {
+                    if *self.p < self.b.len() {
+                        self.b[*self.p] = byte;
+                        *self.p += 1;
+                    }
+                }
+                Ok(())
+            }
+        }
+        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
+        $crate::syscall::klog($crate::syscall::LogLevel::Info, &buf[..pos]);
+    }};
+}
+
+/// Log to kernel log with a prefix (Error level)
+///
+/// # Example
+/// ```ignore
+/// klog_error!("vfsd", "init failed: {:?}", e);
+/// ```
+#[macro_export]
+macro_rules! klog_error {
+    ($prefix:expr, $($arg:tt)*) => {{
+        use core::fmt::Write;
+        let mut buf = [0u8; 128];
+        let prefix_bytes = concat!("[", $prefix, "] ").as_bytes();
+        let prefix_len = prefix_bytes.len();
+        buf[..prefix_len].copy_from_slice(prefix_bytes);
+        let mut pos = prefix_len;
+        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
+        impl core::fmt::Write for W<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &byte in s.as_bytes() {
+                    if *self.p < self.b.len() {
+                        self.b[*self.p] = byte;
+                        *self.p += 1;
+                    }
+                }
+                Ok(())
+            }
+        }
+        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
+        $crate::syscall::klog($crate::syscall::LogLevel::Error, &buf[..pos]);
+    }};
+}

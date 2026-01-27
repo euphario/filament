@@ -55,6 +55,79 @@ pub mod error {
     pub const NOT_EMPTY: i32 = -8;
     pub const NO_SPACE: i32 = -9;
     pub const NOT_MOUNTED: i32 = -10;
+    pub const INVALID_MESSAGE: i32 = -11;
+    pub const INTERNAL: i32 = -99;
+}
+
+/// VFS operation error enum
+///
+/// Provides type-safe error handling for VFS operations.
+/// Can be converted to/from the raw i32 error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsError {
+    Ok,
+    NotFound,
+    PermissionDenied,
+    IoError,
+    InvalidPath,
+    NotDirectory,
+    NotFile,
+    AlreadyExists,
+    NotEmpty,
+    NoSpace,
+    NotMounted,
+    InvalidMessage,
+    Internal,
+}
+
+impl VfsError {
+    /// Convert from raw i32 error code.
+    pub fn from_i32(code: i32) -> Self {
+        match code {
+            error::OK => VfsError::Ok,
+            error::NOT_FOUND => VfsError::NotFound,
+            error::PERMISSION_DENIED => VfsError::PermissionDenied,
+            error::IO_ERROR => VfsError::IoError,
+            error::INVALID_PATH => VfsError::InvalidPath,
+            error::NOT_DIRECTORY => VfsError::NotDirectory,
+            error::NOT_FILE => VfsError::NotFile,
+            error::ALREADY_EXISTS => VfsError::AlreadyExists,
+            error::NOT_EMPTY => VfsError::NotEmpty,
+            error::NO_SPACE => VfsError::NoSpace,
+            error::NOT_MOUNTED => VfsError::NotMounted,
+            error::INVALID_MESSAGE => VfsError::InvalidMessage,
+            _ => VfsError::Internal,
+        }
+    }
+
+    /// Convert to raw i32 error code.
+    pub fn to_i32(self) -> i32 {
+        match self {
+            VfsError::Ok => error::OK,
+            VfsError::NotFound => error::NOT_FOUND,
+            VfsError::PermissionDenied => error::PERMISSION_DENIED,
+            VfsError::IoError => error::IO_ERROR,
+            VfsError::InvalidPath => error::INVALID_PATH,
+            VfsError::NotDirectory => error::NOT_DIRECTORY,
+            VfsError::NotFile => error::NOT_FILE,
+            VfsError::AlreadyExists => error::ALREADY_EXISTS,
+            VfsError::NotEmpty => error::NOT_EMPTY,
+            VfsError::NoSpace => error::NO_SPACE,
+            VfsError::NotMounted => error::NOT_MOUNTED,
+            VfsError::InvalidMessage => error::INVALID_MESSAGE,
+            VfsError::Internal => error::INTERNAL,
+        }
+    }
+
+    /// Returns true if this represents success.
+    pub fn is_ok(self) -> bool {
+        matches!(self, VfsError::Ok)
+    }
+
+    /// Returns true if this represents an error.
+    pub fn is_err(self) -> bool {
+        !self.is_ok()
+    }
 }
 
 pub mod file_type {
@@ -75,12 +148,23 @@ pub mod open_mode {
 // Message Header
 // =============================================================================
 
+/// Current VFS protocol version.
+/// Version 0 = legacy/unversioned (flags field was u16, now split)
+/// Version 1 = current version with explicit version field
+pub const VFS_PROTOCOL_VERSION: u8 = 1;
+
 /// Common header for all VFS messages (8 bytes)
+///
+/// Layout: [msg_type: u16, version: u8, flags: u8, seq_id: u32]
+///
+/// The version field was previously part of a u16 flags field.
+/// Messages with version=0 should be treated as legacy/unversioned.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VfsHeader {
     pub msg_type: u16,
-    pub flags: u16,
+    pub version: u8,
+    pub flags: u8,
     pub seq_id: u32,
 }
 
@@ -88,7 +172,12 @@ impl VfsHeader {
     pub const SIZE: usize = 8;
 
     pub fn new(msg_type: u16, seq_id: u32) -> Self {
-        Self { msg_type, flags: 0, seq_id }
+        Self {
+            msg_type,
+            version: VFS_PROTOCOL_VERSION,
+            flags: 0,
+            seq_id,
+        }
     }
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
@@ -97,7 +186,8 @@ impl VfsHeader {
         }
         Some(Self {
             msg_type: u16::from_le_bytes([buf[0], buf[1]]),
-            flags: u16::from_le_bytes([buf[2], buf[3]]),
+            version: buf[2],
+            flags: buf[3],
             seq_id: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
         })
     }
@@ -105,7 +195,8 @@ impl VfsHeader {
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0..2].copy_from_slice(&self.msg_type.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.flags.to_le_bytes());
+        buf[2] = self.version;
+        buf[3] = self.flags;
         buf[4..8].copy_from_slice(&self.seq_id.to_le_bytes());
         buf
     }
