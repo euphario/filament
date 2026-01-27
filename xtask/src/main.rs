@@ -240,6 +240,7 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
         ("shell", "shell"),
         ("partition", "driver/partition"),
         ("fatfs", "driver/fatfs"),
+        ("vfsd", "driver/vfsd"),
     ];
 
     // Platform-specific programs

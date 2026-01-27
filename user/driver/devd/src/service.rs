@@ -137,6 +137,13 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         parent: None,
     },
     ServiceDef {
+        binary: "vfsd",
+        registers: &[b"vfs:"],
+        dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
+        auto_restart: true,
+        parent: None,
+    },
+    ServiceDef {
         binary: "shell",
         registers: &[],  // shell doesn't register any ports
         dependencies: &[Dependency::Requires(b"console:")],  // Wait for consoled
