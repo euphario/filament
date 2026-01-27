@@ -86,6 +86,12 @@ fn ls_vfs(path: &[u8]) -> CommandResult {
         return CommandResult::None;
     }
 
+    // Wait for response
+    if let Err(e) = userlib::ipc::wait_one(channel.handle()) {
+        println!("ls: wait failed: {:?}", e);
+        return CommandResult::None;
+    }
+
     // Receive response
     let mut resp_buf = [0u8; 512];
     let resp_len = match channel.recv(&mut resp_buf) {

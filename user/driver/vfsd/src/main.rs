@@ -430,6 +430,11 @@ impl Vfsd {
             }
 
             // Wait for response from fatfs
+            if userlib::ipc::wait_one(fs_handle).is_err() {
+                self.send_result(client_slot, seq_id, error::IO_ERROR);
+                return;
+            }
+
             let mut resp_buf = [0u8; 512];
             match syscall::read(fs_handle, &mut resp_buf) {
                 Ok(n) if n > 0 => {
