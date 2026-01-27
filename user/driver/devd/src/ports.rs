@@ -345,12 +345,23 @@ impl PortRegistry for Ports {
             None => NO_PARENT,
         };
 
-        // Check for duplicate
-        if self.find_slot(name).is_some() {
-            return Err(SysError::AlreadyExists);
+        // Check for existing port
+        if let Some(slot_idx) = self.find_slot(name) {
+            // Port exists - allow update if same owner (service re-registering with more info)
+            if let Some(port) = &mut self.ports[slot_idx] {
+                if port.owner != owner {
+                    return Err(SysError::AlreadyExists);
+                }
+                // Update with new info from the service
+                port.port_type = port_type;
+                port.parent_idx = parent_idx;
+                port.shmem_id = shmem_id;
+                port.available = true;
+                return Ok(());
+            }
         }
 
-        // Find empty slot
+        // Find empty slot for new port
         let slot_idx = self.find_empty_slot().ok_or(SysError::NoSpace)?;
 
         let mut port = RegisteredPort::empty();

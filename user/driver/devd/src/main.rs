@@ -997,7 +997,7 @@ impl Devd {
         match query_port.accept_with_pid() {
             Ok((channel, client_pid)) => {
                 // Check if this is a known service (driver)
-                // First try the normal service registry lookup
+                // First try the normal service registry lookup for Ready services
                 let mut service_idx = self.services.find_by_pid(client_pid)
                     .filter(|&i| {
                         self.services.get(i)
@@ -1005,6 +1005,23 @@ impl Devd {
                             .unwrap_or(false)
                     })
                     .map(|i| i as u8);
+
+                // Also check for Starting services - connecting to query port means
+                // the service is ready to communicate, so transition to Ready
+                if service_idx.is_none() {
+                    if let Some(idx) = self.services.find_by_pid(client_pid) {
+                        let is_starting = self.services.get(idx)
+                            .map(|s| s.state == ServiceState::Starting)
+                            .unwrap_or(false);
+                        if is_starting {
+                            // Transition to Ready and recognize as a driver
+                            self.handle_service_ready(idx);
+                            service_idx = Some(idx as u8);
+                            dlog!("query: service {} transitioned Starting -> Ready via query port",
+                                self.services.get(idx).map(|s| s.name()).unwrap_or("?"));
+                        }
+                    }
+                }
 
                 // If not found, check recent_dynamic_pids for race condition workaround
                 // This handles the case where the child connects before the parent
@@ -1162,7 +1179,12 @@ impl Devd {
         // Send response
         let result_code = match result {
             Ok(()) => error::OK,
-            Err(_) => error::INVALID_REQUEST,
+            Err(e) => {
+                if let Ok(name_str) = core::str::from_utf8(info.name) {
+                    derror!("port registration failed: {} err={:?} owner={}", name_str, e, info.owner_idx);
+                }
+                error::INVALID_REQUEST
+            }
         };
         self.query_handler.send_port_register_response(slot, info.seq_id, result_code);
     }

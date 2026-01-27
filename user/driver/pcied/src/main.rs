@@ -1,587 +1,568 @@
-//! PCIe Host Controller Daemon
+//! PCIe Bus Driver
 //!
-//! Initializes PCIe ports, enumerates connected devices, and provides
-//! a query service for other drivers to find PCIe devices.
+//! Enumerates PCIe devices via ECAM, enables bus mastering, maps BARs,
+//! and registers devices with devd for driver spawning.
 //!
-//! Uses type-safe IPC via `Server<PcieProtocol>`.
+//! Supports:
+//! - QEMU virt (ECAM at 0x4010000000)
+//! - MT7988A (via platform-specific MAC access)
 
 #![no_std]
 #![no_main]
-#![allow(dead_code)]  // IPC commands reserved for future use
-#![allow(unreachable_code)]  // Exit points for clarity
 
 use userlib::syscall;
-use userlib::syscall::{
-    Handle, WaitFilter, WaitRequest, WaitResult,
-    handle_wait, handle_wrap_channel,
-};
-use userlib::{uinfo, uerror};
-use userlib::ipc::{Server, Connection, IpcError};
-use userlib::ipc::protocols::{
-    PcieProtocol, PcieRequest, PcieResponse,
-    PcieDeviceInfo, DeviceList,
-    DevdClient, PropertyList,
-};
-use pcie::{
-    Board, BpiR4, PcieInit, SocPcie,
-    PcieController,
-};
+use userlib::syscall::LogLevel;
+use userlib::devd::{DevdClient, PortType};
+use userlib::error::SysError;
+use userlib::mmio::MmioRegion;
 
-/// Maximum devices we can track (internal registry)
-const MAX_DEVICES: usize = 32;
+// ============================================================================
+// Logging
+// ============================================================================
 
-/// Stored device info for queries
+macro_rules! plog {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        const PREFIX: &[u8] = b"[pcied] ";
+        let mut buf = [0u8; 256];
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        let mut pos = PREFIX.len();
+        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
+        impl core::fmt::Write for W<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &byte in s.as_bytes() {
+                    if *self.p < self.b.len() { self.b[*self.p] = byte; *self.p += 1; }
+                }
+                Ok(())
+            }
+        }
+        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
+        syscall::klog(LogLevel::Info, &buf[..pos]);
+    }};
+}
+
+// ============================================================================
+// Platform Detection
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    QemuVirt,
+    Mt7988a,
+    Unknown,
+}
+
+impl Platform {
+    fn detect() -> Self {
+        // For now, assume QEMU virt platform
+        // The full ECAM mapping will validate if the platform is correct
+        // by checking vendor IDs during enumeration
+        //
+        // TODO: Use FDT or other method to detect platform without
+        // requiring an extra MMIO mapping
+        Platform::QemuVirt
+    }
+
+    fn ecam_base(&self) -> Option<u64> {
+        match self {
+            Platform::QemuVirt => Some(QEMU_ECAM_BASE),
+            Platform::Mt7988a => None, // Uses MAC-based access
+            Platform::Unknown => None,
+        }
+    }
+}
+
+// ============================================================================
+// ECAM Constants
+// ============================================================================
+
+/// QEMU virt ECAM base address
+const QEMU_ECAM_BASE: u64 = 0x40_1000_0000;
+
+/// QEMU virt ECAM size (4MB - 4 buses * 1MB each)
+const QEMU_ECAM_SIZE: u64 = 0x40_0000;
+
+/// Maximum buses to scan
+const MAX_BUSES: u8 = 4;
+
+/// Maximum devices per bus
+const MAX_DEVICES: u8 = 32;
+
+/// Maximum functions per device
+const MAX_FUNCTIONS: u8 = 8;
+
+// ============================================================================
+// PCI Configuration Space
+// ============================================================================
+
+/// PCI config space register offsets
+mod pci_cfg {
+    pub const VENDOR_DEVICE: usize = 0x00;
+    pub const COMMAND_STATUS: usize = 0x04;
+    pub const CLASS_REV: usize = 0x08;
+    pub const HEADER_TYPE: usize = 0x0C;
+    pub const BAR0: usize = 0x10;
+}
+
+/// PCI command register bits
+mod pci_cmd {
+    pub const MEMORY_SPACE: u16 = 1 << 1;
+    pub const BUS_MASTER: u16 = 1 << 2;
+}
+
+/// PCI class codes
+mod pci_class {
+    pub const NETWORK: u8 = 0x02;
+    pub const SERIAL_BUS: u8 = 0x0C;
+}
+
+/// PCI subclass codes for serial bus
+mod pci_subclass {
+    pub const USB: u8 = 0x03;
+}
+
+/// PCI prog-if for USB
+mod pci_progif {
+    pub const XHCI: u8 = 0x30;
+}
+
+// ============================================================================
+// ECAM Access
+// ============================================================================
+
+/// ECAM-based PCI config space access
+struct EcamAccess {
+    mmio: MmioRegion,
+}
+
+impl EcamAccess {
+    /// Create ECAM accessor by mapping the config space region
+    fn new(ecam_phys: u64) -> Option<Self> {
+        let mmio = MmioRegion::open(ecam_phys, QEMU_ECAM_SIZE)?;
+        Some(Self { mmio })
+    }
+
+    /// Calculate config space offset for BDF
+    fn offset(&self, bus: u8, device: u8, function: u8, reg: usize) -> usize {
+        let bdf = ((bus as usize) << 20) | ((device as usize) << 15) | ((function as usize) << 12);
+        bdf + reg
+    }
+
+    /// Read 32-bit config register
+    fn read32(&self, bus: u8, device: u8, function: u8, reg: usize) -> u32 {
+        let offset = self.offset(bus, device, function, reg);
+        self.mmio.read32(offset)
+    }
+
+    /// Write 32-bit config register
+    fn write32(&self, bus: u8, device: u8, function: u8, reg: usize, val: u32) {
+        let offset = self.offset(bus, device, function, reg);
+        self.mmio.write32(offset, val);
+    }
+
+    /// Read 16-bit config register
+    fn read16(&self, bus: u8, device: u8, function: u8, reg: usize) -> u16 {
+        let offset = self.offset(bus, device, function, reg);
+        self.mmio.read16(offset)
+    }
+
+    /// Write 16-bit config register
+    fn write16(&self, bus: u8, device: u8, function: u8, reg: usize, val: u16) {
+        let offset = self.offset(bus, device, function, reg);
+        self.mmio.write16(offset, val);
+    }
+}
+
+// ============================================================================
+// Device Discovery
+// ============================================================================
+
+/// Discovered PCI device
 #[derive(Clone, Copy, Default)]
-struct StoredDevice {
-    port: u8,
+struct PciDevice {
     bus: u8,
     device: u8,
     function: u8,
     vendor_id: u16,
     device_id: u16,
-    class_code: u32,
-    bar0_addr: u64,
-    bar0_size: u32,
-    command: u16,
+    class: u8,
+    subclass: u8,
+    prog_if: u8,
+    bar0_phys: u64,
+    bar0_size: u64,
 }
 
-impl StoredDevice {
-    /// Convert to protocol device info
-    fn to_info(&self) -> PcieDeviceInfo {
-        PcieDeviceInfo {
-            port: self.port,
-            bus: self.bus,
-            device: self.device,
-            function: self.function,
-            vendor_id: self.vendor_id,
-            device_id: self.device_id,
-            class_code: self.class_code,
-            bar0_addr: self.bar0_addr,
-            bar0_size: self.bar0_size,
-            command: self.command,
+impl PciDevice {
+    /// Check if this is an xHCI controller
+    fn is_xhci(&self) -> bool {
+        self.class == pci_class::SERIAL_BUS
+            && self.subclass == pci_subclass::USB
+            && self.prog_if == pci_progif::XHCI
+    }
+
+    /// Check if this is a network controller
+    fn is_network(&self) -> bool {
+        self.class == pci_class::NETWORK
+    }
+
+    /// Get class name for devd registration
+    fn class_name(&self) -> &'static str {
+        match (self.class, self.subclass, self.prog_if) {
+            (0x0C, 0x03, 0x30) => "xhci",
+            (0x0C, 0x03, 0x20) => "ehci",
+            (0x0C, 0x03, _) => "usb",
+            (0x02, _, _) => "network",
+            (0x01, _, _) => "storage",
+            (0x03, _, _) => "display",
+            (0x06, _, _) => "bridge",
+            _ => "other",
+        }
+    }
+
+    /// Get port type for devd registration
+    fn port_type(&self) -> PortType {
+        match (self.class, self.subclass) {
+            (0x0C, 0x03) => PortType::Usb,      // USB controller
+            (0x02, _) => PortType::Network,     // Network controller
+            (0x01, _) => PortType::Block,       // Storage controller
+            _ => PortType::Service,             // Default
         }
     }
 }
 
 /// Device registry
 struct DeviceRegistry {
-    devices: [StoredDevice; MAX_DEVICES],
+    devices: [PciDevice; 32],
     count: usize,
 }
 
 impl DeviceRegistry {
     fn new() -> Self {
         Self {
-            devices: [StoredDevice::default(); MAX_DEVICES],
+            devices: [PciDevice::default(); 32],
             count: 0,
         }
     }
 
-    fn add(&mut self, dev: StoredDevice) {
-        if self.count < MAX_DEVICES {
+    fn add(&mut self, dev: PciDevice) -> bool {
+        if self.count < 32 {
             self.devices[self.count] = dev;
             self.count += 1;
+            true
+        } else {
+            false
         }
     }
 
-    fn find(&self, vendor: u16, device: u16) -> impl Iterator<Item = &StoredDevice> {
-        self.devices[..self.count].iter().filter(move |d| {
-            (vendor == 0xFFFF || d.vendor_id == vendor) &&
-            (device == 0xFFFF || d.device_id == device)
-        })
+    fn iter(&self) -> impl Iterator<Item = &PciDevice> {
+        self.devices[..self.count].iter()
     }
+}
 
-    /// Find a device by port/bus/device/function
-    fn find_by_bdf(&self, port: u8, bus: u8, device: u8, function: u8) -> Option<&StoredDevice> {
-        self.devices[..self.count].iter().find(|d| {
-            d.port == port && d.bus == bus && d.device == device && d.function == function
-        })
-    }
+// ============================================================================
+// Bus Enumeration
+// ============================================================================
 
-    /// Handle a FindDevice request, returning device list and ports queried
-    fn find_devices(&self, vendor: u16, device: u16) -> (DeviceList, [Option<u8>; 4]) {
-        let mut list = DeviceList::new();
-        let mut ports: [Option<u8>; 4] = [None; 4];
-        let mut port_count = 0usize;
+/// Enumerate PCI bus using ECAM
+fn enumerate_ecam(ecam: &EcamAccess, registry: &mut DeviceRegistry) {
+    for bus in 0..MAX_BUSES {
+        for device in 0..MAX_DEVICES {
+            // Check function 0 first
+            let vendor_device = ecam.read32(bus, device, 0, pci_cfg::VENDOR_DEVICE);
+            let vendor_id = (vendor_device & 0xFFFF) as u16;
 
-        for dev in self.find(vendor, device) {
-            list.push(dev.to_info());
+            if vendor_id == 0xFFFF || vendor_id == 0 {
+                continue; // No device
+            }
 
-            // Track port for auto-reset on client disconnect
-            let port_already_tracked = ports.iter()
-                .take(port_count)
-                .any(|p| *p == Some(dev.port));
-            if !port_already_tracked && port_count < 4 {
-                ports[port_count] = Some(dev.port);
-                port_count += 1;
+            // Check header type for multi-function
+            let header = ecam.read32(bus, device, 0, pci_cfg::HEADER_TYPE);
+            let header_type = ((header >> 16) & 0xFF) as u8;
+            let multi_function = (header_type & 0x80) != 0;
+
+            let max_func = if multi_function { MAX_FUNCTIONS } else { 1 };
+
+            for function in 0..max_func {
+                if function > 0 {
+                    let vd = ecam.read32(bus, device, function, pci_cfg::VENDOR_DEVICE);
+                    if (vd & 0xFFFF) as u16 == 0xFFFF {
+                        continue;
+                    }
+                }
+
+                if let Some(dev) = probe_device(ecam, bus, device, function) {
+                    registry.add(dev);
+                }
             }
         }
-
-        (list, ports)
     }
 }
 
-fn debug_print(_s: &str) {}
-fn debug_status(_val: u32) {}
+/// Probe a single device
+fn probe_device(ecam: &EcamAccess, bus: u8, device: u8, function: u8) -> Option<PciDevice> {
+    let vendor_device = ecam.read32(bus, device, function, pci_cfg::VENDOR_DEVICE);
+    let vendor_id = (vendor_device & 0xFFFF) as u16;
+    let device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
 
-/// Format a u16 as hex string
-fn hex_u16(val: u16, buf: &mut [u8; 4]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    buf[0] = HEX[((val >> 12) & 0xf) as usize];
-    buf[1] = HEX[((val >> 8) & 0xf) as usize];
-    buf[2] = HEX[((val >> 4) & 0xf) as usize];
-    buf[3] = HEX[(val & 0xf) as usize];
-}
-
-/// Map PCI class code to device class name (matches devd's DeviceClass)
-fn class_name(class_code: u32) -> &'static str {
-    // Use upper 16 bits (class + subclass)
-    let class = (class_code >> 8) & 0xFFFF;
-    match class {
-        0x0200 => "network",       // Network controller
-        0x0280 => "network",       // Network controller (other)
-        0x0100..=0x010F => "storage", // Mass storage
-        0x0C03 => "usb",           // USB controller
-        0x0300..=0x030F => "display", // Display controller
-        0x0400..=0x040F => "multimedia", // Multimedia
-        0x0600..=0x060F => "bridge", // Bridge device
-        0x0700 => "serial",        // Serial controller
-        0x0900 => "input",         // Input device
-        _ => "other",
+    if vendor_id == 0xFFFF || vendor_id == 0 {
+        return None;
     }
+
+    let class_rev = ecam.read32(bus, device, function, pci_cfg::CLASS_REV);
+    let prog_if = ((class_rev >> 8) & 0xFF) as u8;
+    let subclass = ((class_rev >> 16) & 0xFF) as u8;
+    let class = ((class_rev >> 24) & 0xFF) as u8;
+
+    let header = ecam.read32(bus, device, function, pci_cfg::HEADER_TYPE);
+    let header_type = ((header >> 16) & 0x7F) as u8;
+
+    // Skip bridges for now (header type 1)
+    if header_type != 0 {
+        return None;
+    }
+
+    // Probe BAR0
+    let (bar0_phys, bar0_size) = probe_bar(ecam, bus, device, function, pci_cfg::BAR0);
+
+    Some(PciDevice {
+        bus,
+        device,
+        function,
+        vendor_id,
+        device_id,
+        class,
+        subclass,
+        prog_if,
+        bar0_phys,
+        bar0_size,
+    })
 }
 
-/// Register all devices with devd and claim the buses we manage
-fn register_with_devd(registry: &DeviceRegistry, _active_ports: u8) {
-    let mut devd = match DevdClient::connect() {
-        Ok(d) => d,
-        Err(_) => {
-            uerror!("pcied", "devd_connect_failed");
-            return;
-        }
+/// Probe a BAR to get its address and size
+fn probe_bar(ecam: &EcamAccess, bus: u8, device: u8, function: u8, bar_reg: usize) -> (u64, u64) {
+    let original = ecam.read32(bus, device, function, bar_reg);
+
+    // Check if it's an I/O BAR (bit 0 set)
+    if (original & 1) != 0 {
+        return (0, 0); // Skip I/O BARs
+    }
+
+    // Check if it's a 64-bit BAR
+    let bar_type = (original >> 1) & 0x3;
+    let is_64bit = bar_type == 2;
+
+    // Write all 1s to get size
+    ecam.write32(bus, device, function, bar_reg, 0xFFFFFFFF);
+    let size_mask_low = ecam.read32(bus, device, function, bar_reg);
+
+    let size_mask_high = if is_64bit {
+        let orig_high = ecam.read32(bus, device, function, bar_reg + 4);
+        ecam.write32(bus, device, function, bar_reg + 4, 0xFFFFFFFF);
+        let mask_high = ecam.read32(bus, device, function, bar_reg + 4);
+        ecam.write32(bus, device, function, bar_reg + 4, orig_high);
+        mask_high
+    } else {
+        0xFFFFFFFF // For 32-bit BARs, treat high bits as all 1s
     };
 
-    // Claim all PCIe buses
-    let mut buses_claimed = 0usize;
-    for port in 0..4u8 {
-        let mut bus_path = [0u8; 12];
-        bus_path[..9].copy_from_slice(b"/bus/pcie");
-        bus_path[9] = b'0' + port;
-        let path = core::str::from_utf8(&bus_path[..10]).unwrap_or("");
+    ecam.write32(bus, device, function, bar_reg, original);
 
-        if devd.claim_bus(path).is_ok() {
-            buses_claimed += 1;
-        }
+    if size_mask_low == 0 || size_mask_low == 0xFFFFFFFF {
+        return (0, 0);
     }
 
-    // Register discovered devices
-    let mut registered = 0usize;
+    // Calculate size:
+    // 1. Combine low and high masks
+    // 2. Mask out type bits (low 4 bits)
+    // 3. Invert and add 1 to get size
+    let full_mask = ((size_mask_high as u64) << 32) | (size_mask_low as u64);
+    let size = !(full_mask & !0xF) + 1;
 
-    for i in 0..registry.count {
-        let dev = &registry.devices[i];
+    // Get address
+    let mut addr = (original & !0xF) as u64;
 
-        // Build path: /bus/pcie{port}/{bdf}
-        let mut path_buf = [0u8; 32];
-        let path = {
-            let port = dev.port;
-            let bus = dev.bus;
-            let device = dev.device;
-            let function = dev.function;
-
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let mut i = 0;
-
-            path_buf[i..i+9].copy_from_slice(b"/bus/pcie");
-            i += 9;
-            path_buf[i] = b'0' + port;
-            i += 1;
-            path_buf[i] = b'/';
-            i += 1;
-            path_buf[i] = HEX[(bus >> 4) as usize];
-            i += 1;
-            path_buf[i] = HEX[(bus & 0xf) as usize];
-            i += 1;
-            path_buf[i] = b':';
-            i += 1;
-            path_buf[i] = HEX[(device >> 4) as usize];
-            i += 1;
-            path_buf[i] = HEX[(device & 0xf) as usize];
-            i += 1;
-            path_buf[i] = b'.';
-            i += 1;
-            path_buf[i] = HEX[(function & 0xf) as usize];
-            i += 1;
-
-            core::str::from_utf8(&path_buf[..i]).unwrap_or("")
-        };
-
-        let mut vendor_buf = [0u8; 4];
-        let mut device_buf = [0u8; 4];
-
-        hex_u16(dev.vendor_id, &mut vendor_buf);
-        hex_u16(dev.device_id, &mut device_buf);
-
-        let vendor_str = core::str::from_utf8(&vendor_buf).unwrap_or("0000");
-        let device_str = core::str::from_utf8(&device_buf).unwrap_or("0000");
-
-        let props = PropertyList::new()
-            .add("bus", "pcie")
-            .add("vendor", vendor_str)
-            .add("device", device_str)
-            .add("class", class_name(dev.class_code))
-            .add("state", "discovered");
-
-        if devd.register(path, props).is_ok() {
-            registered += 1;
-        }
+    if is_64bit {
+        let high = ecam.read32(bus, device, function, bar_reg + 4);
+        addr |= (high as u64) << 32;
     }
 
-    uinfo!("pcied", "devd_registered"; buses = buses_claimed, devices = registered);
+    (addr, size)
 }
+
+// ============================================================================
+// Device Setup
+// ============================================================================
+
+/// Enable bus mastering for a device
+fn enable_bus_master(ecam: &EcamAccess, dev: &PciDevice) {
+    let cmd = ecam.read16(dev.bus, dev.device, dev.function, pci_cfg::COMMAND_STATUS);
+    if (cmd & pci_cmd::BUS_MASTER) == 0 {
+        ecam.write16(dev.bus, dev.device, dev.function, pci_cfg::COMMAND_STATUS,
+            cmd | pci_cmd::BUS_MASTER | pci_cmd::MEMORY_SPACE);
+    }
+}
+
+// ============================================================================
+// devd Registration
+// ============================================================================
+
+/// Register device with devd
+fn register_device(client: &mut DevdClient, dev: &PciDevice) -> Result<(), SysError> {
+    // Format port name: pci/{bb:dd.f}:{class}
+    // e.g., "pci/00:01.0:xhci"
+    let mut name_buf = [0u8; 32];
+    let class_name = dev.class_name();
+
+    // Build name manually
+    let mut i = 0;
+    for b in b"pci/" {
+        name_buf[i] = *b;
+        i += 1;
+    }
+
+    // BDF: bb:dd.f
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    name_buf[i] = HEX[(dev.bus >> 4) as usize]; i += 1;
+    name_buf[i] = HEX[(dev.bus & 0xf) as usize]; i += 1;
+    name_buf[i] = b':'; i += 1;
+    name_buf[i] = HEX[(dev.device >> 4) as usize]; i += 1;
+    name_buf[i] = HEX[(dev.device & 0xf) as usize]; i += 1;
+    name_buf[i] = b'.'; i += 1;
+    name_buf[i] = HEX[(dev.function & 0xf) as usize]; i += 1;
+    name_buf[i] = b':'; i += 1;
+
+    for b in class_name.as_bytes() {
+        name_buf[i] = *b;
+        i += 1;
+    }
+
+    let name = &name_buf[..i];
+
+    // Register with devd
+    client.register_port(name, dev.port_type(), None)?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Main
+// ============================================================================
 
 #[unsafe(no_mangle)]
 fn main() {
-    // Disable all stdout to not corrupt consoled's display
-    userlib::io::disable_stdout();
-    userlib::ulog::disable_stdout();
+    plog!("starting");
 
-    userlib::ulog::init();
-    uinfo!("pcied", "init_start");
+    // Detect platform
+    let platform = Platform::detect();
+    match platform {
+        Platform::QemuVirt => plog!("platform: QEMU virt"),
+        Platform::Mt7988a => plog!("platform: MT7988A"),
+        Platform::Unknown => {
+            plog!("unknown platform, exiting");
+            syscall::exit(1);
+        }
+    }
 
+    // Get ECAM base
+    let ecam_base = match platform.ecam_base() {
+        Some(base) => base,
+        None => {
+            plog!("no ECAM support for this platform");
+            syscall::exit(1);
+        }
+    };
+
+    plog!("ECAM base: {:#x}", ecam_base);
+
+    // Map ECAM config space
+    let ecam = match EcamAccess::new(ecam_base) {
+        Some(e) => e,
+        None => {
+            plog!("failed to map ECAM");
+            syscall::exit(1);
+        }
+    };
+
+    // Enumerate devices
     let mut registry = DeviceRegistry::new();
+    enumerate_ecam(&ecam, &mut registry);
 
-    // Initialize board
-    let board = match BpiR4::new() {
-        Ok(b) => b,
-        Err(_e) => {
-            uerror!("pcied", "board_init_failed");
-            syscall::exit(1);
-            return;
-        }
-    };
+    plog!("found {} devices", registry.count);
 
-    // Initialize PCIe subsystem
-    let mut pcie_init = PcieInit::new(board);
-    if let Err(_e) = pcie_init.init() {
-        uerror!("pcied", "pcie_init_failed");
-        syscall::exit(1);
-        return;
-    }
-    let board = pcie_init.board();
-
-    // Discover PCIe buses from kernel
-    let mut buses = [syscall::BusInfo::empty(); 16];
-    let bus_count = syscall::bus_list(&mut buses);
-    if bus_count < 0 {
-        uerror!("pcied", "bus_list_failed"; err = bus_count);
-        syscall::exit(1);
-        return;
+    // Log discovered devices
+    for dev in registry.iter() {
+        plog!("{:02x}:{:02x}.{} vendor={:#06x} device={:#06x} class={} BAR0={:#x} size={:#x}",
+            dev.bus, dev.device, dev.function,
+            dev.vendor_id, dev.device_id, dev.class_name(),
+            dev.bar0_phys, dev.bar0_size);
     }
 
-    // Find which PCIe ports are available
-    let mut available_ports = 0u8;
-    for i in 0..(bus_count as usize) {
-        let info = &buses[i];
-        if info.bus_type == syscall::bus_type::PCIE {
-            let port = info.bus_index;
-            if (port as usize) < 4 {
-                available_ports |= 1 << port;
-            }
-        }
-    }
-
-    if available_ports == 0 {
-        uerror!("pcied", "no_pcie_ports");
-        syscall::exit(1);
-        return;
-    }
-
-    // Step 4: Initialize each available port and enumerate devices
-    // devd has authorized us via SetDriver - we trust our spawn context
-    let mut any_device_found = false;
-    let mut active_ports: u8 = 0;  // Bitmask of ports we successfully enumerated
-
-    for port in 0..board.soc().port_count() {
-        // Skip ports not in kernel's bus list
-        if (available_ports & (1 << port)) == 0 {
-            continue;
-        }
-
-        let slot = match board.slot_info(port) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let port_config = match board.soc().port_config(port) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        match PcieController::init(port_config, debug_print, debug_status) {
-            Ok(mut controller) => {
-                if controller.is_link_up() {
-                    let speed = controller.link_speed();
-                    let width = controller.link_width();
-                    uinfo!("pcied", "link_up"; port = port, speed = speed, width = width);
-
-                    active_ports |= 1 << port;
-                    let devices = controller.enumerate();
-
-                    for dev in devices.iter() {
-                        any_device_found = true;
-                        uinfo!("pcied", "device_found";
-                            port = port,
-                            vendor = dev.id.vendor_id,
-                            device = dev.id.device_id
-                        );
-
-                        registry.add(StoredDevice {
-                            port,
-                            bus: dev.bdf.bus,
-                            device: dev.bdf.device,
-                            function: dev.bdf.function,
-                            vendor_id: dev.id.vendor_id,
-                            device_id: dev.id.device_id,
-                            class_code: dev.id.class_code,
-                            bar0_addr: dev.bar0_addr,
-                            bar0_size: dev.bar0_size,
-                            command: dev.command,
-                        });
-                    }
-                }
-            }
-            Err(_) => {}
-        }
-    }
-
-    // Register buses and devices with devd
-    if active_ports != 0 {
-        register_with_devd(&registry, active_ports);
-    }
-
-    // Register IPC port
-    let server = match Server::<PcieProtocol>::register() {
-        Ok(s) => s,
-        Err(IpcError::ResourceBusy) => {
-            uerror!("pcied", "already_running");
-            syscall::exit(1);
-        }
+    // Connect to devd
+    let mut devd_client = match DevdClient::connect() {
+        Ok(c) => c,
         Err(_) => {
-            uerror!("pcied", "port_register_failed");
+            plog!("failed to connect to devd");
             syscall::exit(1);
         }
     };
 
-    // Notify devd that pcied is ready (pcie: port registered)
-    userlib::ipc::notify_service_ready("pcie:");
+    plog!("connected to devd");
 
-    // Wrap the listen channel as a handle (Handle API)
-    let listen_channel = server.listen_channel();
-    let channel_handle = match handle_wrap_channel(listen_channel) {
-        Ok(h) => h,
-        Err(_) => {
-            uerror!("pcied", "channel_wrap_failed");
-            syscall::exit(1);
+    // Register our service port
+    if let Err(_) = devd_client.register_port(b"pcie:", PortType::Service, None) {
+        plog!("failed to register pcie: port");
+    }
+
+    // Enable bus mastering and register devices with devd
+    for dev in registry.iter() {
+        // Enable bus master for devices that need DMA
+        if dev.is_xhci() || dev.is_network() {
+            enable_bus_master(&ecam, dev);
+            plog!("enabled bus master for {:02x}:{:02x}.{}",
+                dev.bus, dev.device, dev.function);
         }
-    };
 
-    uinfo!("pcied", "ready"; devices = registry.count);
+        // Register with devd
+        if let Err(_) = register_device(&mut devd_client, dev) {
+            plog!("failed to register device with devd");
+        }
+    }
 
-    // Event-driven main loop (Handle API)
-    let requests = [WaitRequest::new(channel_handle, WaitFilter::Readable)];
-    let mut results = [WaitResult::empty(); 1];
+    // Report ready
+    if let Err(_) = devd_client.report_state(userlib::devd::DriverState::Ready) {
+        plog!("failed to report ready state");
+    }
 
+    plog!("ready, entering service loop");
+
+    // Service loop - handle spawn commands from devd
     loop {
-        // Wait for connection (blocking)
-        let count = match handle_wait(&requests, &mut results, u64::MAX) {
-            Ok(n) => n,
-            Err(_) => {
-                syscall::yield_now();
-                continue;
-            }
-        };
+        // Poll for devd commands
+        match devd_client.poll_command() {
+            Ok(Some(cmd)) => {
+                match cmd {
+                    userlib::devd::DevdCommand::SpawnChild { seq_id, binary, binary_len, .. } => {
+                        if let Ok(s) = core::str::from_utf8(&binary[..binary_len]) {
+                            plog!("received spawn command for: {}", s);
+                        }
 
-        if count == 0 {
-            continue;
-        }
-
-        // Accept connection (non-blocking since we know it's ready)
-        let mut conn: Connection<PcieProtocol> = match server.try_accept() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        // Track ports this client queried (for auto-reset on disconnect)
-        let mut client_ports: [Option<u8>; 4] = [None; 4];
-        let mut client_port_count = 0usize;
-
-        // Handle messages on this connection until disconnect
-        loop {
-            match conn.receive() {
-                Ok(request) => {
-                    let response = match request {
-                        PcieRequest::FindDevice { vendor_id, device_id } => {
-                            let (list, ports) = registry.find_devices(vendor_id, device_id);
-                            // Merge new ports into client's tracked ports
-                            for port_opt in ports.iter() {
-                                if let Some(port) = *port_opt {
-                                    let already_tracked = client_ports.iter()
-                                        .take(client_port_count)
-                                        .any(|p| *p == Some(port));
-                                    if !already_tracked && client_port_count < 4 {
-                                        client_ports[client_port_count] = Some(port);
-                                        client_port_count += 1;
-                                    }
-                                }
-                            }
-                            PcieResponse::Devices(list)
-                        }
-                        PcieRequest::ResetPort { port } => {
-                            // Security: ResetPort requires MMIO capability
-                            if !conn.client_has_capability(syscall::caps::MMIO) {
-                                uerror!("pcied", "reset_denied"; port = port,
-                                    client_pid = conn.client_pid().unwrap_or(0));
-                                PcieResponse::Error(-1) // Permission denied
-                            } else {
-                                let board = pcie_init.board();
-                                if let Some(port_config) = board.soc().port_config(port) {
-                                    match PcieController::init(port_config, |_| {}, |_| {}) {
-                                        Ok(mut controller) => {
-                                            let link_up = controller.reset_link();
-                                            uinfo!("pcied", "port_reset"; port = port, link_up = link_up);
-                                            PcieResponse::ResetResult(true)
-                                        }
-                                        Err(_) => PcieResponse::ResetResult(false)
-                                    }
-                                } else {
-                                    PcieResponse::ResetResult(false)
-                                }
-                            }
-                        }
-                        PcieRequest::EnableBusMaster { port, bus, device, function } => {
-                            // Security: EnableBusMaster requires DMA capability
-                            if !conn.client_has_capability(syscall::caps::DMA) {
-                                uerror!("pcied", "bme_denied"; port = port, bus = bus,
-                                    client_pid = conn.client_pid().unwrap_or(0));
-                                PcieResponse::Error(-1) // Permission denied
-                            } else {
-                                let board = pcie_init.board();
-                                if let Some(port_config) = board.soc().port_config(port) {
-                                    match PcieController::open_existing(port_config) {
-                                        Ok(controller) => {
-                                            let success = controller.enable_bus_master(bus, device, function);
-                                            if success && bus > 0 {
-                                                // Also enable BME on parent bridge
-                                                controller.enable_bus_master(0, 0, 0);
-                                            }
-                                            PcieResponse::ResetResult(success)
-                                        }
-                                        Err(_) => PcieResponse::ResetResult(false)
-                                    }
-                                } else {
-                                    PcieResponse::ResetResult(false)
-                                }
-                            }
-                        }
-                        PcieRequest::ReadDeviceStatus { port, bus, device, function } => {
-                            // Use open_existing() - do NOT re-init/reset the port!
-                            let board = pcie_init.board();
-                            if let Some(port_config) = board.soc().port_config(port) {
-                                match PcieController::open_existing(port_config) {
-                                    Ok(controller) => {
-                                        if let Some(status) = controller.read_device_status(bus, device, function) {
-                                            PcieResponse::DeviceStatus(status)
-                                        } else {
-                                            PcieResponse::Error(-1)
-                                        }
-                                    }
-                                    Err(_) => PcieResponse::Error(-1),
-                                }
-                            } else {
-                                PcieResponse::Error(-1)
-                            }
-                        }
-                        PcieRequest::ClearDeviceStatus { port, bus, device, function } => {
-                            // Security: ClearDeviceStatus requires MMIO capability
-                            if !conn.client_has_capability(syscall::caps::MMIO) {
-                                uerror!("pcied", "clear_status_denied"; port = port,
-                                    client_pid = conn.client_pid().unwrap_or(0));
-                                PcieResponse::Error(-1) // Permission denied
-                            } else {
-                                // Use open_existing() - do NOT re-init/reset the port!
-                                let board = pcie_init.board();
-                                if let Some(port_config) = board.soc().port_config(port) {
-                                    match PcieController::open_existing(port_config) {
-                                        Ok(controller) => {
-                                            let success = controller.clear_device_status(bus, device, function);
-                                            PcieResponse::ResetResult(success)
-                                        }
-                                        Err(_) => PcieResponse::ResetResult(false),
-                                    }
-                                } else {
-                                    PcieResponse::ResetResult(false)
-                                }
-                            }
-                        }
-                        PcieRequest::ReadRegister { port, bus, device, function, offset } => {
-                            if let Some(dev) = registry.find_by_bdf(port, bus, device, function) {
-                                if dev.bar0_size == 0 {
-                                    PcieResponse::Error(-2)
-                                } else if offset as u64 + 4 > dev.bar0_size as u64 {
-                                    PcieResponse::Error(-3)
-                                } else {
-                                    match syscall::mmap_device(dev.bar0_addr, dev.bar0_size as u64) {
-                                        Ok(vaddr) => {
-                                            let reg_ptr = (vaddr + offset as u64) as *const u32;
-                                            let value = unsafe { core::ptr::read_volatile(reg_ptr) };
-                                            PcieResponse::RegisterValue(value)
-                                        }
-                                        Err(_) => PcieResponse::Error(-4)
-                                    }
-                                }
-                            } else {
-                                PcieResponse::Error(-1)
-                            }
-                        }
-                        PcieRequest::WriteRegister { port, bus, device, function, offset, value } => {
-                            if let Some(dev) = registry.find_by_bdf(port, bus, device, function) {
-                                if dev.bar0_size == 0 || offset as u64 + 4 > dev.bar0_size as u64 {
-                                    PcieResponse::ResetResult(false)
-                                } else {
-                                    match syscall::mmap_device(dev.bar0_addr, dev.bar0_size as u64) {
-                                        Ok(vaddr) => {
-                                            let reg_ptr = (vaddr + offset as u64) as *mut u32;
-                                            unsafe { core::ptr::write_volatile(reg_ptr, value) };
-                                            PcieResponse::ResetResult(true)
-                                        }
-                                        Err(_) => PcieResponse::ResetResult(false)
-                                    }
-                                }
-                            } else {
-                                PcieResponse::ResetResult(false)
-                            }
-                        }
-                    };
-                    let _ = conn.send(&response);
-                }
-                Err(_) => {
-                    // Disconnect - auto-reset ports this client queried
-                    for port_opt in client_ports.iter().take(client_port_count) {
-                        if let Some(port) = *port_opt {
-                            let board = pcie_init.board();
-                            if let Some(port_config) = board.soc().port_config(port) {
-                                if let Ok(mut controller) = PcieController::init(port_config, |_| {}, |_| {}) {
-                                    let link_up = controller.reset_link();
-                                    uinfo!("pcied", "auto_reset"; port = port, link_up = link_up);
-                                }
-                            }
-                        }
+                        // TODO: Spawn child driver
+                        // For now, just ack with failure
+                        let _ = devd_client.ack_spawn(seq_id, -1, 0);
                     }
-                    break;
+                    userlib::devd::DevdCommand::StopChild { child_pid, .. } => {
+                        plog!("stop child: {}", child_pid);
+                    }
                 }
             }
+            Ok(None) => {
+                // No command, sleep briefly
+                syscall::sleep_ms(100);
+            }
+            Err(_) => {
+                // Error polling, sleep and retry
+                syscall::sleep_ms(100);
+            }
         }
-        // Connection dropped here, channel closed automatically
     }
 }
-

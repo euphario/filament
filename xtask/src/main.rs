@@ -261,6 +261,7 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
 
     // Platform-specific programs
     if platform == "qemu" || platform == "qemu-virt" {
+        all_programs.push(("pcied", "driver/pcied"));
         all_programs.push(("qemu-usbd", "driver/qemu-usbd"));
     }
 

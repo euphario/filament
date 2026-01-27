@@ -150,6 +150,15 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         auto_restart: true,
         parent: None,
     },
+    // PCIe bus driver - enumerates PCI devices and registers them with devd
+    // TODO: Make this conditional on platform detection (QEMU has ECAM, MT7988 has different)
+    ServiceDef {
+        binary: "pcied",
+        registers: &[b"pcie:"],  // PCI bus port
+        dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
+        auto_restart: false,
+        parent: None,
+    },
     // QEMU USB driver - only works on QEMU virt platform
     // TODO: Make this conditional on platform detection
     ServiceDef {

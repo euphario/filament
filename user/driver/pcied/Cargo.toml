@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 userlib = { path = "../../userlib" }
-pcie = { path = "../pcie" }
 
 [profile.release]
 opt-level = "s"       # Optimize for size
