@@ -363,15 +363,25 @@ impl PartitionDriver {
         self.disk_name[..len].copy_from_slice(&disk_name[..len]);
         self.disk_name_len = len;
 
-        // Try DataPort first (shmem_id 2 is qemu-usbd's DataPort)
-        // TODO: Query devd for shmem_id associated with port name
-        const DISK0_SHMEM_ID: u32 = 2;
-
-        if disk_name == b"disk0:" {
-            match self.connect_to_disk_dataport(DISK0_SHMEM_ID) {
-                Ok(()) => return Ok(()),
+        // Query devd for the disk's DataPort shmem_id
+        if let Some(client) = self.devd_client.as_mut() {
+            match client.query_port_shmem_id(disk_name) {
+                Ok(Some(shmem_id)) => {
+                    plog!("devd returned shmem_id={} for {}", shmem_id,
+                        core::str::from_utf8(disk_name).unwrap_or("?"));
+                    match self.connect_to_disk_dataport(shmem_id) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            plog!("DataPort connect failed ({:?}), trying IPC", e);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    plog!("disk {} has no DataPort, using IPC",
+                        core::str::from_utf8(disk_name).unwrap_or("?"));
+                }
                 Err(e) => {
-                    plog!("DataPort connect failed ({:?}), trying IPC", e);
+                    plog!("devd query failed ({:?}), trying IPC", e);
                 }
             }
         }
@@ -719,7 +729,7 @@ impl PartitionDriver {
     }
 
     /// Register partition ports with devd
-    fn register_partitions(&mut self) -> Result<(), SysError> {
+    fn register_partitions(&mut self, shmem_id: u32) -> Result<(), SysError> {
         let client = self.devd_client.as_mut().ok_or(SysError::ConnectionRefused)?;
         let disk_name = &self.disk_name[..self.disk_name_len];
 
@@ -731,11 +741,16 @@ impl PartitionDriver {
             name[5] = b':';
             let name_len = 6;
 
-            plog!("registering part{} with parent {}", i,
-                core::str::from_utf8(disk_name).unwrap_or("?"));
+            plog!("registering part{} with parent {} shmem_id={}", i,
+                core::str::from_utf8(disk_name).unwrap_or("?"), shmem_id);
 
-            // Register partition port with devd
-            match client.register_port(&name[..name_len], PortType::Partition, Some(disk_name)) {
+            // Register partition port with devd including DataPort shmem_id
+            match client.register_port_with_dataport(
+                &name[..name_len],
+                PortType::Partition,
+                shmem_id,
+                Some(disk_name),
+            ) {
                 Ok(()) => {
                     plog!("registered part{}", i);
                 }
@@ -973,12 +988,8 @@ impl PartitionDriver {
             syscall::exit(0);
         }
 
-        // Register partitions with devd
-        if let Err(e) = self.register_partitions() {
-            perror!("failed to register partitions: {:?}", e);
-        }
-
-        // Create provider DataPort for zero-copy access from fatfs
+        // Create provider DataPort BEFORE registering partitions
+        // so we can include the shmem_id in the registration
         let provider_shmem_id = match self.create_provider_port() {
             Ok(id) => {
                 plog!("provider DataPort ready, shmem_id={}", id);
@@ -989,6 +1000,11 @@ impl PartitionDriver {
                 None
             }
         };
+
+        // Register partitions with devd (include provider shmem_id)
+        if let Err(e) = self.register_partitions(provider_shmem_id.unwrap_or(0)) {
+            perror!("failed to register partitions: {:?}", e);
+        }
 
         // Report ready state
         if let Some(client) = self.devd_client.as_mut() {

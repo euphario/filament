@@ -95,6 +95,10 @@ pub mod msg {
     pub const STATE_CHANGE: u16 = 0x0105;
     /// Get spawn context (child → devd) - returns the port that triggered this spawn
     pub const GET_SPAWN_CONTEXT: u16 = 0x0106;
+    /// Query port info by name (returns shmem_id if DataPort-backed)
+    pub const QUERY_PORT: u16 = 0x0107;
+    /// Update shmem_id for an existing port
+    pub const UPDATE_PORT_SHMEM_ID: u16 = 0x0108;
 
     // Query messages (client → devd → driver)
     /// List all registered devices
@@ -121,6 +125,8 @@ pub mod msg {
     pub const QUERY_RESULT: u16 = 0x0302;
     /// Response containing spawn context (port name that triggered spawn)
     pub const SPAWN_CONTEXT: u16 = 0x0303;
+    /// Response containing port info (including shmem_id)
+    pub const PORT_INFO: u16 = 0x0304;
     /// Error response
     pub const ERROR: u16 = 0x03FF;
 }
@@ -589,6 +595,249 @@ impl SpawnContextResponse {
         };
         let port_name = &buf[Self::HEADER_SIZE..Self::HEADER_SIZE + port_name_len];
         Some((resp, port_name))
+    }
+}
+
+// =============================================================================
+// Port Query Messages (client → devd)
+// =============================================================================
+
+/// Query port information by name
+///
+/// Allows consumers to discover DataPort shmem_id for a named port.
+/// This replaces hardcoded shmem_id constants in drivers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QueryPort {
+    pub header: QueryHeader,
+    /// Length of port name
+    pub name_len: u8,
+    pub _pad: [u8; 3],
+    // Followed by: port name bytes
+}
+
+impl QueryPort {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::QUERY_PORT, seq_id),
+            name_len: 0,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Serialize to buffer, returns total length written
+    pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
+        let total_len = Self::FIXED_SIZE + name.len();
+        if buf.len() < total_len || name.len() > 255 {
+            return None;
+        }
+
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = name.len() as u8;
+        buf[9..12].copy_from_slice(&[0, 0, 0]);
+        buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
+
+        Some(total_len)
+    }
+
+    /// Parse from buffer
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+
+        let header = QueryHeader::from_bytes(buf)?;
+        let name_len = buf[8] as usize;
+
+        let total_len = Self::FIXED_SIZE + name_len;
+        if buf.len() < total_len {
+            return None;
+        }
+
+        let name = &buf[Self::FIXED_SIZE..total_len];
+
+        Some((
+            Self {
+                header,
+                name_len: name_len as u8,
+                _pad: [0; 3],
+            },
+            name,
+        ))
+    }
+}
+
+/// Update port shmem_id message
+///
+/// Allows drivers to set/update the DataPort shmem_id for an existing port.
+/// Used when the DataPort is created after initial port registration.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UpdatePortShmemId {
+    pub header: QueryHeader,
+    /// New shmem_id for the port
+    pub shmem_id: u32,
+    /// Length of port name
+    pub name_len: u8,
+    pub _pad: [u8; 3],
+    // Followed by: port name bytes
+}
+
+impl UpdatePortShmemId {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8;
+
+    pub fn new(seq_id: u32, shmem_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::UPDATE_PORT_SHMEM_ID, seq_id),
+            shmem_id,
+            name_len: 0,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Serialize to buffer, returns total length written
+    pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
+        let total_len = Self::FIXED_SIZE + name.len();
+        if buf.len() < total_len || name.len() > 255 {
+            return None;
+        }
+
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.shmem_id.to_le_bytes());
+        buf[12] = name.len() as u8;
+        buf[13..16].copy_from_slice(&[0, 0, 0]);
+        buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
+
+        Some(total_len)
+    }
+
+    /// Parse from buffer
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+
+        let header = QueryHeader::from_bytes(buf)?;
+        let shmem_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let name_len = buf[12] as usize;
+
+        let total_len = Self::FIXED_SIZE + name_len;
+        if buf.len() < total_len {
+            return None;
+        }
+
+        let name = &buf[Self::FIXED_SIZE..total_len];
+
+        Some((
+            Self {
+                header,
+                shmem_id,
+                name_len: name_len as u8,
+                _pad: [0; 3],
+            },
+            name,
+        ))
+    }
+}
+
+/// Port info flags
+pub mod port_flags {
+    /// Port has a DataPort backing (shmem_id is valid)
+    pub const HAS_DATAPORT: u8 = 0x01;
+    /// Port is available/ready
+    pub const AVAILABLE: u8 = 0x02;
+}
+
+/// Port info response (devd → client)
+///
+/// Contains port information including DataPort shmem_id if applicable.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortInfoResponse {
+    pub header: QueryHeader,
+    /// Result code (0 = success, negative = error)
+    pub result: i32,
+    /// Port type (see `port_type` module)
+    pub port_type: u8,
+    /// Flags (see `port_flags` module)
+    pub flags: u8,
+    pub _pad: u16,
+    /// DataPort shared memory ID (0 if no DataPort)
+    pub shmem_id: u32,
+    /// Owner process ID
+    pub owner_pid: u32,
+}
+
+impl PortInfoResponse {
+    pub const SIZE: usize = QueryHeader::SIZE + 16;
+
+    pub fn new(seq_id: u32, result: i32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::PORT_INFO, seq_id),
+            result,
+            port_type: 0,
+            flags: 0,
+            _pad: 0,
+            shmem_id: 0,
+            owner_pid: 0,
+        }
+    }
+
+    pub fn success(
+        seq_id: u32,
+        port_type: u8,
+        flags: u8,
+        shmem_id: u32,
+        owner_pid: u32,
+    ) -> Self {
+        Self {
+            header: QueryHeader::new(msg::PORT_INFO, seq_id),
+            result: error::OK,
+            port_type,
+            flags,
+            _pad: 0,
+            shmem_id,
+            owner_pid,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
+        buf[12] = self.port_type;
+        buf[13] = self.flags;
+        buf[14..16].copy_from_slice(&[0, 0]);
+        buf[16..20].copy_from_slice(&self.shmem_id.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.owner_pid.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            result: i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            port_type: buf[12],
+            flags: buf[13],
+            _pad: 0,
+            shmem_id: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            owner_pid: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+        })
+    }
+
+    /// Check if port has a DataPort
+    pub fn has_dataport(&self) -> bool {
+        self.flags & port_flags::HAS_DATAPORT != 0
+    }
+
+    /// Check if port is available
+    pub fn is_available(&self) -> bool {
+        self.flags & port_flags::AVAILABLE != 0
     }
 }
 

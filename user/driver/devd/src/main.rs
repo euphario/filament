@@ -1088,6 +1088,14 @@ impl Devd {
                         // Handle spawn context query from child
                         self.handle_get_spawn_context(slot, &recv_buf[..len]);
                     }
+                    Some(msg::QUERY_PORT) => {
+                        // Handle port info query
+                        self.handle_query_port(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::UPDATE_PORT_SHMEM_ID) => {
+                        // Handle update shmem_id for existing port
+                        self.handle_update_port_shmem_id(slot, &recv_buf[..len]);
+                    }
                     _ => {
                         // Process normally
                         let response_len = self.query_handler.handle_message(
@@ -1231,6 +1239,91 @@ impl Devd {
         // Send response
         if let Some(client) = self.query_handler.get_mut(slot) {
             let _ = client.channel.send(&response_buf[..resp_len]);
+        }
+    }
+
+    /// Handle QUERY_PORT message - returns port info including shmem_id
+    fn handle_query_port(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{QueryPort, PortInfoResponse, port_flags, error};
+
+        let (query, port_name) = match QueryPort::from_bytes(buf) {
+            Some(q) => q,
+            None => {
+                derror!("invalid QUERY_PORT message from slot={}", slot);
+                return;
+            }
+        };
+
+        let seq_id = query.header.seq_id;
+
+        // Look up the port
+        let resp = if let Some(port) = self.ports.get(port_name) {
+            // Get owner PID from service index
+            let owner_pid = self.services.get(port.owner() as usize)
+                .map(|s| s.pid)
+                .unwrap_or(0);
+
+            // Build flags
+            let mut flags = 0u8;
+            if port.has_dataport() {
+                flags |= port_flags::HAS_DATAPORT;
+            }
+            if port.is_available() {
+                flags |= port_flags::AVAILABLE;
+            }
+
+            PortInfoResponse::success(
+                seq_id,
+                port.port_type() as u8,
+                flags,
+                port.shmem_id(),
+                owner_pid,
+            )
+        } else {
+            PortInfoResponse::new(seq_id, error::NOT_FOUND)
+        };
+
+        // Send response
+        if let Some(client) = self.query_handler.get_mut(slot) {
+            let _ = client.channel.send(&resp.to_bytes());
+        }
+    }
+
+    /// Handle UPDATE_PORT_SHMEM_ID message - updates shmem_id for existing port
+    fn handle_update_port_shmem_id(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{UpdatePortShmemId, PortRegisterResponse, error};
+
+        let (update, port_name) = match UpdatePortShmemId::from_bytes(buf) {
+            Some(u) => u,
+            None => {
+                derror!("invalid UPDATE_PORT_SHMEM_ID message from slot={}", slot);
+                return;
+            }
+        };
+
+        let seq_id = update.header.seq_id;
+
+        // Update the port's shmem_id
+        let result = self.ports.set_shmem_id(port_name, update.shmem_id);
+
+        let result_code = match result {
+            Ok(()) => {
+                dlog!("port {:?} shmem_id updated to {}",
+                    core::str::from_utf8(port_name).unwrap_or("?"),
+                    update.shmem_id);
+                error::OK
+            }
+            Err(_) => {
+                derror!("failed to update shmem_id for port {:?}",
+                    core::str::from_utf8(port_name).unwrap_or("?"));
+                error::NOT_FOUND
+            }
+        };
+
+        // Send response (reuse PortRegisterResponse format)
+        let resp = PortRegisterResponse::new(seq_id, result_code);
+        if let Some(client) = self.query_handler.get_mut(slot) {
+            let _ = client.channel.send(&resp.to_bytes());
         }
     }
 
@@ -1433,22 +1526,23 @@ impl Devd {
         port_type: PortType,
         parent_name: Option<&[u8]>,
         owner_idx: u8,
-        _shmem_id: u32,
+        shmem_id: u32,
     ) -> Result<(), SysError> {
-        // Register the port
-        if let Some(parent) = parent_name {
-            self.ports.register_child(port_name, owner_idx, parent, port_type)?;
-        } else {
-            self.ports.register_typed(port_name, owner_idx, port_type)?;
-        }
+        // Register the port with DataPort info
+        self.ports.register_with_dataport(port_name, owner_idx, port_type, shmem_id, parent_name)?;
 
         // Get parent type for rule matching
         let parent_type = parent_name.and_then(|p| self.ports.port_type(p));
 
         // Log registration
         if let Ok(name_str) = core::str::from_utf8(port_name) {
-            dlog!("port registered: {} type={:?} parent={:?}",
-                name_str, port_type, parent_type);
+            if shmem_id != 0 {
+                dlog!("port registered: {} type={:?} shmem_id={} parent={:?}",
+                    name_str, port_type, shmem_id, parent_type);
+            } else {
+                dlog!("port registered: {} type={:?} parent={:?}",
+                    name_str, port_type, parent_type);
+            }
         }
 
         // Check rules for auto-spawning

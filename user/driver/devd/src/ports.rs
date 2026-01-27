@@ -72,6 +72,8 @@ pub struct RegisteredPort {
     port_type: PortType,
     /// Parent port index (0xFF = no parent / root)
     parent_idx: u8,
+    /// DataPort shared memory ID (0 = no DataPort)
+    shmem_id: u32,
 }
 
 /// No parent sentinel value
@@ -86,6 +88,7 @@ impl RegisteredPort {
             available: false,
             port_type: PortType::Unknown,
             parent_idx: NO_PARENT,
+            shmem_id: 0,
         }
     }
 
@@ -121,6 +124,18 @@ impl RegisteredPort {
     pub fn has_parent(&self) -> bool {
         self.parent_idx != NO_PARENT
     }
+
+    pub fn shmem_id(&self) -> u32 {
+        self.shmem_id
+    }
+
+    pub fn has_dataport(&self) -> bool {
+        self.shmem_id != 0
+    }
+
+    pub fn set_shmem_id(&mut self, shmem_id: u32) {
+        self.shmem_id = shmem_id;
+    }
 }
 
 // =============================================================================
@@ -148,6 +163,19 @@ pub trait PortRegistry {
         owner: u8,
         port_type: PortType,
     ) -> Result<(), SysError>;
+
+    /// Register a port with type and DataPort shmem_id
+    fn register_with_dataport(
+        &mut self,
+        name: &[u8],
+        owner: u8,
+        port_type: PortType,
+        shmem_id: u32,
+        parent: Option<&[u8]>,
+    ) -> Result<(), SysError>;
+
+    /// Update shmem_id for an existing port
+    fn set_shmem_id(&mut self, name: &[u8], shmem_id: u32) -> Result<(), SysError>;
 
     /// Unregister a port by name
     fn unregister(&mut self, name: &[u8]);
@@ -287,12 +315,35 @@ impl PortRegistry for Ports {
         parent: &[u8],
         port_type: PortType,
     ) -> Result<(), SysError> {
+        self.register_with_dataport(name, owner, port_type, 0, Some(parent))
+    }
+
+    fn register_typed(
+        &mut self,
+        name: &[u8],
+        owner: u8,
+        port_type: PortType,
+    ) -> Result<(), SysError> {
+        self.register_with_dataport(name, owner, port_type, 0, None)
+    }
+
+    fn register_with_dataport(
+        &mut self,
+        name: &[u8],
+        owner: u8,
+        port_type: PortType,
+        shmem_id: u32,
+        parent: Option<&[u8]>,
+    ) -> Result<(), SysError> {
         if name.len() > MAX_PORT_NAME {
             return Err(SysError::InvalidArgument);
         }
 
-        // Find parent
-        let parent_idx = self.find_slot(parent).ok_or(SysError::NotFound)? as u8;
+        // Find parent if specified
+        let parent_idx = match parent {
+            Some(p) => self.find_slot(p).ok_or(SysError::NotFound)? as u8,
+            None => NO_PARENT,
+        };
 
         // Check for duplicate
         if self.find_slot(name).is_some() {
@@ -309,6 +360,7 @@ impl PortRegistry for Ports {
         port.available = true;
         port.port_type = port_type;
         port.parent_idx = parent_idx;
+        port.shmem_id = shmem_id;
 
         self.ports[slot_idx] = Some(port);
         self.count += 1;
@@ -316,36 +368,14 @@ impl PortRegistry for Ports {
         Ok(())
     }
 
-    fn register_typed(
-        &mut self,
-        name: &[u8],
-        owner: u8,
-        port_type: PortType,
-    ) -> Result<(), SysError> {
-        if name.len() > MAX_PORT_NAME {
-            return Err(SysError::InvalidArgument);
+    fn set_shmem_id(&mut self, name: &[u8], shmem_id: u32) -> Result<(), SysError> {
+        if let Some(idx) = self.find_slot(name) {
+            if let Some(port) = &mut self.ports[idx] {
+                port.shmem_id = shmem_id;
+                return Ok(());
+            }
         }
-
-        // Check for duplicate
-        if self.find_slot(name).is_some() {
-            return Err(SysError::AlreadyExists);
-        }
-
-        // Find empty slot
-        let slot_idx = self.find_empty_slot().ok_or(SysError::NoSpace)?;
-
-        let mut port = RegisteredPort::empty();
-        port.name[..name.len()].copy_from_slice(name);
-        port.name_len = name.len() as u8;
-        port.owner = owner;
-        port.available = true;
-        port.port_type = port_type;
-        port.parent_idx = NO_PARENT;
-
-        self.ports[slot_idx] = Some(port);
-        self.count += 1;
-
-        Ok(())
+        Err(SysError::NotFound)
     }
 
     fn unregister(&mut self, name: &[u8]) {

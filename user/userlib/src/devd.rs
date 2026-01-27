@@ -49,6 +49,7 @@ use crate::query::{
     QueryHeader, PortRegister, PortRegisterResponse, DeviceRegister,
     ListDevices, DeviceListResponse, StateChange, SpawnChild, SpawnAck,
     PortFilter, filter_mode, GetSpawnContext, SpawnContextResponse,
+    QueryPort, PortInfoResponse, port_flags, UpdatePortShmemId,
     msg, port_type, error, class, driver_state,
 };
 
@@ -430,12 +431,29 @@ impl DevdClient {
         port_type: PortType,
         parent: Option<&[u8]>,
     ) -> Result<(), SysError> {
+        self.register_port_with_dataport(name, port_type, 0, parent)
+    }
+
+    /// Register a port with devd including DataPort shmem_id
+    ///
+    /// # Arguments
+    /// * `name` - Port name (e.g., b"disk0:")
+    /// * `port_type` - Type of port
+    /// * `shmem_id` - DataPort shared memory ID (0 = no DataPort)
+    /// * `parent` - Optional parent port name
+    pub fn register_port_with_dataport(
+        &mut self,
+        name: &[u8],
+        port_type: PortType,
+        shmem_id: u32,
+        parent: Option<&[u8]>,
+    ) -> Result<(), SysError> {
         let seq_id = self.next_seq();
         let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let reg = PortRegister::new(seq_id, port_type as u8);
         let mut buf = [0u8; 128];
-        let len = reg.write_to(&mut buf, name, parent, 0)
+        let len = reg.write_to(&mut buf, name, parent, shmem_id)
             .ok_or(SysError::InvalidArgument)?;
 
         channel.send(&buf[..len])?;
@@ -458,6 +476,56 @@ impl DevdClient {
                         return Err(SysError::PermissionDenied);
                     } else if header.msg_type == msg::ERROR {
                         return Err(SysError::PermissionDenied);
+                    }
+                }
+                Ok(_) => return Err(SysError::IoError),
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SysError::Timeout)
+    }
+
+    /// Update shmem_id for an existing port
+    ///
+    /// Use this when the DataPort is created after the initial port registration.
+    /// This updates the shmem_id so consumers can discover it via query_port.
+    pub fn update_port_shmem_id(
+        &mut self,
+        name: &[u8],
+        shmem_id: u32,
+    ) -> Result<(), SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let update = UpdatePortShmemId::new(seq_id, shmem_id);
+        let mut buf = [0u8; 64];
+        let len = update.write_to(&mut buf, name)
+            .ok_or(SysError::InvalidArgument)?;
+
+        channel.send(&buf[..len])?;
+
+        // Wait for response
+        let mut resp_buf = [0u8; 64];
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut resp_buf) {
+                Ok(resp_len) if resp_len >= PortRegisterResponse::SIZE => {
+                    let header = QueryHeader::from_bytes(&resp_buf)
+                        .ok_or(SysError::IoError)?;
+
+                    if header.msg_type == msg::REGISTER_PORT {
+                        let result = i32::from_le_bytes([
+                            resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
+                        ]);
+                        if result == error::OK {
+                            return Ok(());
+                        }
+                        return Err(SysError::NotFound);
+                    } else if header.msg_type == msg::ERROR {
+                        return Err(SysError::NotFound);
                     }
                 }
                 Ok(_) => return Err(SysError::IoError),
@@ -679,6 +747,58 @@ impl DevdClient {
             }
         }
         Err(SysError::Timeout)
+    }
+
+    /// Query port info by name
+    ///
+    /// Returns port info including DataPort shmem_id if applicable.
+    /// Use this to discover the shmem_id for a named port instead of
+    /// hardcoding shmem_id constants.
+    pub fn query_port(&mut self, port_name: &[u8]) -> Result<PortInfoResponse, SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = QueryPort::new(seq_id);
+        let mut buf = [0u8; 128];
+        let len = req.write_to(&mut buf, port_name)
+            .ok_or(SysError::InvalidArgument)?;
+        channel.send(&buf[..len])?;
+
+        let mut resp_buf = [0u8; 64];
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut resp_buf) {
+                Ok(resp_len) if resp_len >= PortInfoResponse::SIZE => {
+                    let resp = PortInfoResponse::from_bytes(&resp_buf)
+                        .ok_or(SysError::IoError)?;
+
+                    if resp.result == error::OK {
+                        return Ok(resp);
+                    } else {
+                        return Err(SysError::NotFound);
+                    }
+                }
+                Ok(_) => return Err(SysError::IoError),
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SysError::Timeout)
+    }
+
+    /// Query port and return its shmem_id
+    ///
+    /// Convenience method that queries port info and extracts the shmem_id.
+    /// Returns None if the port doesn't have a DataPort.
+    pub fn query_port_shmem_id(&mut self, port_name: &[u8]) -> Result<Option<u32>, SysError> {
+        let info = self.query_port(port_name)?;
+        if info.has_dataport() {
+            Ok(Some(info.shmem_id))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Disconnect from devd

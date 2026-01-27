@@ -2241,11 +2241,11 @@ fn main() {
     if disk_count > 0 && driver.partition_info.is_valid() {
         log_val("[qemu-usbd] Registered block devices: ", disk_count as u64);
 
-        // Report ready state on the SAME connection
-        let _ = devd_client.report_state(DriverState::Ready);
-        log("[qemu-usbd] Reported ready state");
-
         // Create DataPort for zero-copy block I/O (ring protocol)
+        // NOTE: Must create DataPort and update shmem_id BEFORE reporting ready,
+        // because report_state() triggers devd to send SPAWN_CHILD commands,
+        // and if we call update_port_shmem_id() after that, it would consume
+        // the SPAWN_CHILD message while waiting for its response.
         let config = DataPortConfig {
             ring_size: 64,
             side_size: 8,
@@ -2260,17 +2260,29 @@ fn main() {
                 log_hex("[qemu-usbd]   pool_phys: ", p.pool_phys());
                 p
             }
-            Err(e) => {
+            Err(_) => {
                 log("[qemu-usbd] Failed to create DataPort");
                 syscall::exit(1);
             }
         };
 
-        // Allow any process to connect (for partition driver)
-        // In production, we'd get the PID from devd
-        for pid in 1..32 {
-            data_port.allow(pid);
+        // Make DataPort public for any consumer
+        data_port.set_public();
+
+        // Update disk0: port's shmem_id with devd
+        // The port was already registered above; now we update its DataPort shmem_id
+        // so consumers can discover it via devd query
+        if let Err(_) = devd_client.update_port_shmem_id(
+            b"disk0:",
+            data_port.shmem_id(),
+        ) {
+            log("[qemu-usbd] Warning: failed to update disk0: shmem_id");
         }
+
+        // Report ready state AFTER setting up DataPort
+        // This triggers devd to send SPAWN_CHILD commands
+        let _ = devd_client.report_state(DriverState::Ready);
+        log("[qemu-usbd] Reported ready state");
 
         // Also create legacy IPC port for backward compatibility during transition
         use userlib::ipc::{Port, Mux, MuxFilter};

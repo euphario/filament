@@ -347,13 +347,45 @@ impl FatfsDriver {
 
     /// Try to connect to block device via DataPort (zero-copy path)
     fn try_connect_dataport(&mut self) -> Result<(), SysError> {
-        // Partition driver's provider DataPort shmem_id
-        // TODO: Get this from devd or service discovery instead of hardcoding
-        const PARTITION_SHMEM_ID: u32 = 3;
+        // Get spawn context to find which partition port we should connect to
+        let port_name: Option<([u8; 64], usize)> = if let Some(client) = self.devd_client.as_mut() {
+            match client.get_spawn_context() {
+                Ok(Some((name, len, _ptype))) => Some((name, len)),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
-        flog!("trying DataPort connection shmem_id={}", PARTITION_SHMEM_ID);
+        // Query devd for the port's DataPort shmem_id
+        let shmem_id = if let Some((name, len)) = port_name {
+            if let Some(client) = self.devd_client.as_mut() {
+                match client.query_port_shmem_id(&name[..len]) {
+                    Ok(Some(id)) => {
+                        flog!("devd returned shmem_id={} for {}",
+                            id, core::str::from_utf8(&name[..len]).unwrap_or("?"));
+                        id
+                    }
+                    Ok(None) => {
+                        flog!("port {} has no DataPort", core::str::from_utf8(&name[..len]).unwrap_or("?"));
+                        return Err(SysError::NotFound);
+                    }
+                    Err(e) => {
+                        flog!("devd query failed: {:?}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                return Err(SysError::ConnectionRefused);
+            }
+        } else {
+            flog!("no spawn context for DataPort discovery");
+            return Err(SysError::NotFound);
+        };
 
-        let mut port = DataPort::connect(PARTITION_SHMEM_ID)?;
+        flog!("trying DataPort connection shmem_id={}", shmem_id);
+
+        let mut port = DataPort::connect(shmem_id)?;
 
         // Query geometry
         match port.query_geometry() {
