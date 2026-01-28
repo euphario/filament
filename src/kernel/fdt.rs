@@ -71,7 +71,7 @@ impl Fdt {
         let totalsize = be32(header.totalsize);
         let off_dt_struct = be32(header.off_dt_struct);
         let off_dt_strings = be32(header.off_dt_strings);
-        let version = be32(header.version);
+        let _version = be32(header.version);
 
         // FDT parse logging moved to single message after global FDT is set
 
@@ -110,7 +110,7 @@ impl Fdt {
         let totalsize = be32(header.totalsize);
         let off_dt_struct = be32(header.off_dt_struct);
         let off_dt_strings = be32(header.off_dt_strings);
-        let version = be32(header.version);
+        let _version = be32(header.version);
 
         kinfo!("fdt", "parsed"; source = "memory", addr = crate::klog::hex64(phys_addr));
 
@@ -572,7 +572,8 @@ static mut GLOBAL_FDT: Option<Fdt> = None;
 
 /// Get the global FDT instance if available
 pub fn get() -> Option<&'static Fdt> {
-    unsafe { GLOBAL_FDT.as_ref() }
+    // Use addr_of! to avoid creating shared reference to mutable static (Rust 2024)
+    unsafe { (*core::ptr::addr_of!(GLOBAL_FDT)).as_ref() }
 }
 
 /// Store the global FDT instance

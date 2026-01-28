@@ -194,51 +194,16 @@ struct PendingNotification {
     exit_code: i32,
 }
 
-/// Counter for periodic logging (not the hardware counter, which is MHz)
-static mut LOG_CALL_COUNT: u64 = 0;
-
-/// Log every N check_liveness calls
-const LOG_INTERVAL_CALLS: u64 = 5;  // Every ~5 seconds (with 1 call/second)
-
 /// Check liveness of all waiting tasks
 /// Called periodically from timer tick (not every tick, use counter)
 ///
 /// Returns number of actions taken (pings sent, channels closed, tasks killed)
 pub fn check_liveness(current_tick: u64) -> usize {
-    // Track call count for periodic logging (hardware counter is MHz, not suitable)
-    let call_count = unsafe {
-        LOG_CALL_COUNT += 1;
-        LOG_CALL_COUNT
-    };
-
     // Execute liveness check with scheduler lock, returning actions and notifications
     let (actions, notifications, notify_count) = super::task::with_scheduler(|sched| {
         let mut actions = 0usize;
         let mut notifications: [Option<PendingNotification>; 4] = [None, None, None, None];
         let mut notify_count = 0usize;
-
-        // Count blocked tasks for logging
-        let mut sleeping_count = 0u64;
-        let mut waiting_count = 0u64;
-
-        // Log all tasks and their states
-        for (_slot, task_opt) in sched.iter_tasks() {
-            if let Some(task) = task_opt {
-                if task.is_blocked() {
-                    if task.state().is_sleeping() {
-                        sleeping_count += 1;
-                    } else {
-                        waiting_count += 1;
-                    }
-                }
-            }
-        }
-
-        // Periodic liveness logging disabled for production
-        // Uncomment for debugging stuck tasks:
-        // if call_count % LOG_INTERVAL_CALLS == 0 {
-        //     crate::kdebug!("liveness", "check"; calls = call_count, sleeping = sleeping_count, waiting = waiting_count);
-        // }
 
         for (_slot, task_opt) in sched.iter_tasks_mut() {
             if let Some(task) = task_opt {

@@ -231,8 +231,6 @@ impl PhysicalMemoryManager {
         self.initialized = true;
 
         let free_mb = self.free_pages * PAGE_SIZE / (1024 * 1024);
-        let total_mb = total_pages * PAGE_SIZE / (1024 * 1024);
-        let meta_mb = frames_pages * PAGE_SIZE / (1024 * 1024);
 
         // Debug: direct UART output
         print_direct!("PMM: {} free pages, {} MB free\r\n", self.free_pages, free_mb);

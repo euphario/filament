@@ -179,7 +179,8 @@ pub fn bus_config() -> &'static BusConfig {
 
 /// Check if platform has been selected
 pub fn is_platform_selected() -> bool {
-    unsafe { SELECTED_CONFIG.is_some() }
+    // Use addr_of! to avoid creating shared reference to mutable static (Rust 2024)
+    unsafe { (*core::ptr::addr_of!(SELECTED_CONFIG)).is_some() }
 }
 
 // =============================================================================
