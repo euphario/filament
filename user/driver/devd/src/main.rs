@@ -524,7 +524,7 @@ impl Devd {
     fn check_pending_services(&mut self) {
         let now = Self::now_ms();
 
-        // Collect indices of services to spawn
+        // Collect indices of services to spawn (dependencies satisfied)
         let mut to_spawn = [None; MAX_SERVICES];
         let mut spawn_count = 0;
 
@@ -539,9 +539,8 @@ impl Devd {
             }
         });
 
-        // Spawn collected services
+        // Spawn all services whose dependencies are satisfied
         for idx in to_spawn.iter().flatten().copied() {
-            dlog!("spawning service idx={}", idx);
             self.spawn_service(idx, now);
         }
     }

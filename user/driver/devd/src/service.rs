@@ -171,20 +171,18 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         parent: None,
     },
     // PCIe bus driver - enumerates PCI devices and registers them with devd
-    // TODO: Make this conditional on platform detection (QEMU has ECAM, MT7988 has different)
     ServiceDef {
         binary: "pcied",
         registers: &[PortDef::new(b"pcie:", pt::SERVICE)],  // PCI bus port
-        dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
+        dependencies: &[],  // No dependencies - spawns immediately
         auto_restart: false,
         parent: None,
     },
     // xHCI USB host controller driver
-    // TODO: Make this conditional on platform detection (QEMU has xHCI via PCI)
     ServiceDef {
         binary: "xhcid",
         registers: &[],  // Registers disk0: dynamically
-        dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
+        dependencies: &[],  // No dependencies - spawns immediately
         auto_restart: false,  // Don't restart on failure during testing
         parent: None,
     },
