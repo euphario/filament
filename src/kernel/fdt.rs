@@ -73,7 +73,7 @@ impl Fdt {
         let off_dt_strings = be32(header.off_dt_strings);
         let version = be32(header.version);
 
-        kinfo!("fdt", "parsed"; source = "embedded", version = version, size = totalsize);
+        // FDT parse logging moved to single message after global FDT is set
 
         let struct_base = unsafe { base.add(off_dt_struct as usize) };
         let strings_base = unsafe { base.add(off_dt_strings as usize) };
@@ -112,7 +112,7 @@ impl Fdt {
         let off_dt_strings = be32(header.off_dt_strings);
         let version = be32(header.version);
 
-        kinfo!("fdt", "parsed"; source = "memory", addr = crate::klog::hex64(phys_addr), version = version, size = totalsize);
+        kinfo!("fdt", "parsed"; source = "memory", addr = crate::klog::hex64(phys_addr));
 
         let struct_base = unsafe { base.add(off_dt_struct as usize) };
         let strings_base = unsafe { base.add(off_dt_strings as usize) };
@@ -522,7 +522,7 @@ fn find_dtb() -> Option<u64> {
             let header = unsafe { &*(virt as *const FdtHeader) };
             let totalsize = be32(header.totalsize);
             if totalsize > 0x100 && totalsize < 0x100000 {
-                kinfo!("fdt", "found_known"; addr = crate::klog::hex64(addr), size = totalsize);
+                // Found at known location, parsed log will follow
                 return Some(addr);
             }
         }
@@ -586,7 +586,7 @@ fn store_fdt(fdt: Fdt) {
 pub fn init() {
     // First check for embedded DTB (compiled into kernel)
     if let Some(dtb_data) = crate::dtb::get_embedded_dtb() {
-        kinfo!("fdt", "using_embedded"; size = dtb_data.len());
+        // Using embedded DTB
         if let Some(fdt) = Fdt::parse_from_ptr(dtb_data.as_ptr()) {
             store_fdt(fdt);
             select_platform();

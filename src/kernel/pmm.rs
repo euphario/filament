@@ -237,15 +237,7 @@ impl PhysicalMemoryManager {
         // Debug: direct UART output
         print_direct!("PMM: {} free pages, {} MB free\r\n", self.free_pages, free_mb);
 
-        kinfo!("pmm", "init_ok";
-            total_pages = total_pages as u64,
-            total_mb = total_mb as u64,
-            free_pages = self.free_pages as u64,
-            free_mb = free_mb as u64,
-            meta_pages = frames_pages as u64,
-            meta_mb = meta_mb as u64,
-            meta_phys = klog::hex64(frames_phys as u64)
-        );
+        kinfo!("pmm", "init_ok"; free_mb = free_mb as u64);
     }
 
     /// Push a page onto the free list (O(1))

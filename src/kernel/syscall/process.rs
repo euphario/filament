@@ -74,7 +74,7 @@ pub(super) fn sys_exit(code: i32) -> i64 {
 
         // Schedule next task
         if let Some(next_slot) = sched.schedule() {
-            kinfo!("sys_exit", "scheduled"; next = next_slot);
+            // Internal scheduling detail, don't log
 
             // Update scheduler state - actual TTBR0 switch happens in assembly
             // at exception return (assembly loads CURRENT_TTBR0 and switches)

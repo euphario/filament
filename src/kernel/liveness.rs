@@ -144,7 +144,7 @@ impl LivenessState {
         if from_code != to_code {
             match &new_state {
                 LivenessState::Normal => {
-                    crate::kinfo!("liveness", "state_reset"; pid = pid as u64, from = from_code as u64);
+                    // State reset is frequent (every syscall), don't log
                 }
                 LivenessState::PingSent { channel, sent_at } => {
                     crate::kdebug!("liveness", "ping_sent";
@@ -170,8 +170,9 @@ impl LivenessState {
     /// Force reset to Normal state (always valid, used for task activity)
     pub fn reset(&mut self, pid: u32) {
         if *self != LivenessState::Normal {
-            let from_code = self.code();
-            crate::kinfo!("liveness", "state_reset"; pid = pid as u64, from = from_code as u64);
+            // Only log reset from problematic states (PingSent, ClosePending)
+            // Skip logging for frequent resets
+            let _ = pid; // silence unused warning
             *self = LivenessState::Normal;
         }
     }
@@ -233,16 +234,11 @@ pub fn check_liveness(current_tick: u64) -> usize {
             }
         }
 
-        // Log every call with all task states
-        if call_count % LOG_INTERVAL_CALLS == 0 {
-            crate::kinfo!("liveness", "check"; calls = call_count, sleeping = sleeping_count, waiting = waiting_count);
-            // Dump all task states (we only have ~3 tasks)
-            for (slot, task_opt) in sched.iter_tasks() {
-                if let Some(task) = task_opt {
-                    crate::kinfo!("liveness", "task"; slot = slot as u64, pid = task.id as u64, state = task.state().name());
-                }
-            }
-        }
+        // Periodic liveness logging disabled for production
+        // Uncomment for debugging stuck tasks:
+        // if call_count % LOG_INTERVAL_CALLS == 0 {
+        //     crate::kdebug!("liveness", "check"; calls = call_count, sleeping = sleeping_count, waiting = waiting_count);
+        // }
 
         for (_slot, task_opt) in sched.iter_tasks_mut() {
             if let Some(task) = task_opt {

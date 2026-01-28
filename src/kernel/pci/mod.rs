@@ -330,7 +330,7 @@ pub fn init() {
     unsafe {
         PCI_SUBSYSTEM = Some(PciSubsystem::new());
     }
-    kinfo!("pci", "init_ok");
+    // Log in main.rs after init returns
 }
 
 /// Get subsystem reference

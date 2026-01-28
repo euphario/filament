@@ -88,11 +88,7 @@ pub fn init() {
         return;
     }
 
-    kinfo!("dma_pool", "init_start";
-        base = klog::hex64(DMA_POOL_BASE),
-        size_kb = (DMA_POOL_SIZE / 1024) as u64,
-        end = klog::hex64(DMA_POOL_END)
-    );
+    // Init logging moved to main.rs pools_ready for cleaner boot output
 
     // The kernel's boot.S sets up identity mapping for all DRAM,
     // so we can access the pool directly at its physical address.
@@ -127,7 +123,6 @@ pub fn init() {
     }
 
     pool.initialized = true;
-    kinfo!("dma_pool", "init_ok");
 }
 
 /// Initialize the high DMA pool (for 36-bit buffer addresses)
@@ -142,14 +137,7 @@ pub fn init_high() {
         return;
     }
 
-    kinfo!("dma_pool", "init_high_start";
-        base = klog::hex64(DMA_POOL_HIGH_BASE),
-        size_kb = (DMA_POOL_HIGH_SIZE / 1024) as u64,
-        end = klog::hex64(DMA_POOL_HIGH_END)
-    );
-
     pool.initialized = true;
-    kinfo!("dma_pool", "init_high_ok");
 }
 
 /// Allocate memory from high DMA pool (36-bit addresses)
