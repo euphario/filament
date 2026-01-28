@@ -257,6 +257,129 @@ impl PendingInfoQuery {
     }
 }
 
+// =============================================================================
+// Log Buffer
+// =============================================================================
+
+/// Maximum log entries to buffer
+const MAX_LOG_ENTRIES: usize = 64;
+/// Maximum length of a single log message
+const MAX_LOG_MSG_LEN: usize = 128;
+
+/// A single log entry
+#[derive(Clone, Copy)]
+struct LogEntry {
+    /// Service index that sent the log (0xFF = devd itself)
+    service_idx: u8,
+    /// Log level
+    level: u8,
+    /// Message length
+    len: u8,
+    /// Message text
+    msg: [u8; MAX_LOG_MSG_LEN],
+}
+
+impl LogEntry {
+    const fn empty() -> Self {
+        Self {
+            service_idx: 0xFF,
+            level: 0,
+            len: 0,
+            msg: [0u8; MAX_LOG_MSG_LEN],
+        }
+    }
+}
+
+/// Ring buffer for log entries
+struct LogBuffer {
+    entries: [LogEntry; MAX_LOG_ENTRIES],
+    /// Write position (next entry to write)
+    write_pos: usize,
+    /// Number of entries (max = MAX_LOG_ENTRIES)
+    count: usize,
+}
+
+impl LogBuffer {
+    const fn new() -> Self {
+        Self {
+            entries: [const { LogEntry::empty() }; MAX_LOG_ENTRIES],
+            write_pos: 0,
+            count: 0,
+        }
+    }
+
+    /// Add a log entry
+    fn push(&mut self, service_idx: u8, level: u8, msg: &[u8]) {
+        let len = msg.len().min(MAX_LOG_MSG_LEN);
+        let mut entry = LogEntry::empty();
+        entry.service_idx = service_idx;
+        entry.level = level;
+        entry.len = len as u8;
+        entry.msg[..len].copy_from_slice(&msg[..len]);
+
+        self.entries[self.write_pos] = entry;
+        self.write_pos = (self.write_pos + 1) % MAX_LOG_ENTRIES;
+        if self.count < MAX_LOG_ENTRIES {
+            self.count += 1;
+        }
+    }
+
+    /// Format recent entries into a buffer (oldest first for display)
+    fn format_recent(&self, max_count: usize, buf: &mut [u8]) -> usize {
+        let count = self.count.min(max_count);
+        if count == 0 {
+            return 0;
+        }
+
+        // Calculate starting position (oldest entry to show)
+        let start = if self.write_pos >= count {
+            self.write_pos - count
+        } else {
+            MAX_LOG_ENTRIES - (count - self.write_pos)
+        };
+
+        let mut pos = 0;
+        for i in 0..count {
+            let idx = (start + i) % MAX_LOG_ENTRIES;
+            let entry = &self.entries[idx];
+
+            if pos >= buf.len() {
+                break;
+            }
+
+            // Format: "[LEVEL] message\n"
+            let level_str = match entry.level {
+                0 => b"ERR ",
+                1 => b"WARN",
+                2 => b"INFO",
+                _ => b"DBG ",
+            };
+            let msg_len = entry.len as usize;
+
+            // Check space
+            let needed = 1 + level_str.len() + 2 + msg_len + 1; // [LEVEL] msg\n
+            if pos + needed > buf.len() {
+                break;
+            }
+
+            buf[pos] = b'[';
+            pos += 1;
+            buf[pos..pos + level_str.len()].copy_from_slice(level_str);
+            pos += level_str.len();
+            buf[pos] = b']';
+            pos += 1;
+            buf[pos] = b' ';
+            pos += 1;
+            buf[pos..pos + msg_len].copy_from_slice(&entry.msg[..msg_len]);
+            pos += msg_len;
+            buf[pos] = b'\n';
+            pos += 1;
+        }
+
+        pos
+    }
+}
+
 /// A pending spawn command waiting for driver to report Ready
 #[derive(Clone, Copy)]
 struct PendingSpawn {
@@ -318,6 +441,10 @@ pub struct Devd {
     pending_info_queries: [PendingInfoQuery; MAX_PENDING_INFO_QUERIES],
     /// Next sequence ID for forwarded queries
     next_forward_seq_id: u32,
+    /// Log ring buffer
+    log_buffer: LogBuffer,
+    /// Whether live logging is enabled (print to console as received)
+    live_logging: bool,
 }
 
 impl Devd {
@@ -340,6 +467,8 @@ impl Devd {
             inflight_spawns: [const { InflightSpawn::empty() }; MAX_INFLIGHT_SPAWNS],
             pending_info_queries: [const { PendingInfoQuery::empty() }; MAX_PENDING_INFO_QUERIES],
             next_forward_seq_id: 1,
+            log_buffer: LogBuffer::new(),
+            live_logging: false, // Off during boot, enable after all services ready
         }
     }
 
@@ -1188,6 +1317,18 @@ impl Devd {
                         // Response from driver - relay to original client
                         self.handle_service_info_result(slot, &recv_buf[..len]);
                     }
+                    Some(msg::LOG_MESSAGE) => {
+                        // Log message from driver
+                        self.handle_log_message(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::LOG_QUERY) => {
+                        // Query log history
+                        self.handle_log_query(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::LOG_CONTROL) => {
+                        // Control logging (on/off)
+                        self.handle_log_control(slot, &recv_buf[..len]);
+                    }
                     _ => {
                         // Process normally
                         let response_len = self.query_handler.handle_message(
@@ -1737,6 +1878,110 @@ impl Devd {
                 let resp = ErrorResponse::new(client_seq_id, error::DEVICE_ERROR);
                 let _ = client.channel.send(&resp.to_bytes());
             }
+        }
+    }
+
+    // =========================================================================
+    // Log Handling
+    // =========================================================================
+
+    /// Handle LOG_MESSAGE from a driver
+    fn handle_log_message(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::LogMessage;
+
+        let (msg, text) = match LogMessage::from_bytes(buf) {
+            Some(m) => m,
+            None => return,
+        };
+
+        // Get service index for this slot (-1 means not a driver)
+        let service_idx = self.query_handler.get(slot)
+            .map(|c| c.service_idx)
+            .unwrap_or(-1);
+
+        let service_idx_u8 = if service_idx >= 0 { service_idx as u8 } else { 0xFF };
+
+        // Buffer the message
+        self.log_buffer.push(service_idx_u8, msg.level, text);
+
+        // If live logging is enabled, print to console
+        if self.live_logging {
+            // Get service name for context
+            let service_name = if service_idx >= 0 {
+                self.services.get(service_idx as usize)
+                    .map(|s| s.name())
+                    .unwrap_or("???")
+            } else {
+                "???"
+            };
+
+            // Print with level prefix
+            let level_str = match msg.level {
+                0 => "ERR ",
+                1 => "WARN",
+                2 => "INFO",
+                _ => "DBG ",
+            };
+
+            if let Ok(text_str) = core::str::from_utf8(text) {
+                dlog!("[{}] {}: {}", level_str, service_name, text_str);
+            }
+        }
+    }
+
+    /// Handle LOG_QUERY - return buffered logs
+    fn handle_log_query(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{LogQuery, LogHistory};
+
+        let req = match LogQuery::from_bytes(buf) {
+            Some(r) => r,
+            None => return,
+        };
+
+        let max_count = if req.max_count == 0 { 20 } else { req.max_count as usize };
+
+        let mut text_buf = [0u8; 4000];
+        let text_len = self.log_buffer.format_recent(max_count, &mut text_buf);
+
+        let resp = LogHistory::new(
+            req.header.seq_id,
+            self.log_buffer.count.min(max_count) as u8,
+            self.live_logging,
+        );
+
+        let mut resp_buf = [0u8; 4100];
+        if let Some(len) = resp.write_to(&mut resp_buf, &text_buf[..text_len]) {
+            if let Some(client) = self.query_handler.get_mut(slot) {
+                let _ = client.channel.send(&resp_buf[..len]);
+            }
+        }
+    }
+
+    /// Handle LOG_CONTROL - enable/disable live logging
+    fn handle_log_control(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{LogControl, log_cmd, ErrorResponse, error};
+
+        let req = match LogControl::from_bytes(buf) {
+            Some(r) => r,
+            None => return,
+        };
+
+        match req.command {
+            log_cmd::ENABLE => {
+                self.live_logging = true;
+                dlog!("live logging enabled");
+            }
+            log_cmd::DISABLE => {
+                self.live_logging = false;
+                dlog!("live logging disabled");
+            }
+            _ => {}
+        }
+
+        // Send ack
+        let resp = ErrorResponse::new(req.header.seq_id, error::OK);
+        if let Some(client) = self.query_handler.get_mut(slot) {
+            let _ = client.channel.send(&resp.to_bytes());
         }
     }
 

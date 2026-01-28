@@ -1011,6 +1011,113 @@ impl DevdClient {
         Ok(())
     }
 
+    // =========================================================================
+    // Logging
+    // =========================================================================
+
+    /// Send a log message to devd for buffering
+    ///
+    /// Drivers should use this instead of klog() to reduce console spam.
+    /// devd buffers these messages and optionally displays them based on
+    /// the current logging mode.
+    pub fn log(&mut self, level: u8, message: &[u8]) -> Result<(), SysError> {
+        use crate::query::LogMessage;
+
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let msg = LogMessage::new(seq_id, level);
+        let mut buf = [0u8; 256];
+        let len = msg.write_to(&mut buf, message)
+            .ok_or(SysError::InvalidArgument)?;
+        channel.send(&buf[..len])?;
+
+        Ok(())
+    }
+
+    /// Query log history from devd
+    ///
+    /// Returns buffered log messages. Use from shell or diagnostics.
+    pub fn query_logs(&mut self, max_count: u8) -> Result<([u8; 4096], usize, bool), SysError> {
+        use crate::query::{LogQuery, LogHistory, msg as query_msg};
+
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = LogQuery::new(seq_id, max_count);
+        channel.send(&req.to_bytes())?;
+
+        // Wait for response with retries
+        let mut recv_buf = [0u8; 4200];
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut recv_buf) {
+                Ok(len) if len >= QueryHeader::SIZE => {
+                    let header = QueryHeader::from_bytes(&recv_buf)
+                        .ok_or(SysError::InvalidArgument)?;
+
+                    if header.msg_type == query_msg::LOG_HISTORY {
+                        let (resp, text) = LogHistory::from_bytes(&recv_buf[..len])
+                            .ok_or(SysError::InvalidArgument)?;
+
+                        let mut out = [0u8; 4096];
+                        let out_len = text.len().min(4096);
+                        out[..out_len].copy_from_slice(&text[..out_len]);
+
+                        return Ok((out, out_len, resp.live_enabled != 0));
+                    }
+                }
+                Ok(_) => {}
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(SysError::Timeout)
+    }
+
+    /// Control logging (enable/disable live output)
+    pub fn log_control(&mut self, enable: bool) -> Result<(), SysError> {
+        use crate::query::{LogControl, log_cmd, ErrorResponse, msg as query_msg, error};
+
+        let seq_id = self.next_seq();
+        let cmd = if enable { log_cmd::ENABLE } else { log_cmd::DISABLE };
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = LogControl::new(seq_id, cmd);
+        channel.send(&req.to_bytes())?;
+
+        // Wait for ack with retries
+        let mut recv_buf = [0u8; 64];
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut recv_buf) {
+                Ok(len) if len >= QueryHeader::SIZE => {
+                    let header = QueryHeader::from_bytes(&recv_buf)
+                        .ok_or(SysError::InvalidArgument)?;
+
+                    // Accept either ERROR (with OK code) or any other ack
+                    if header.msg_type == query_msg::ERROR {
+                        if let Some(err) = ErrorResponse::from_bytes(&recv_buf[..len]) {
+                            if err.error_code == error::OK {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // Any response is OK
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(SysError::Timeout)
+    }
+
     /// Disconnect from devd
     pub fn disconnect(&mut self) {
         self.channel = None;

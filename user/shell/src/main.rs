@@ -254,6 +254,10 @@ fn execute_command(cmd: &[u8]) {
         builtins::drivers::run(b"").print();
     } else if cmd_starts_with(cmd, b"drivers ") {
         builtins::drivers::run(&cmd[8..]).print();
+    } else if cmd_eq(cmd, b"dlog") {
+        builtins::logs::run(b"").print();
+    } else if cmd_starts_with(cmd, b"dlog ") {
+        builtins::logs::run(&cmd[5..]).print();
     } else if cmd_eq(cmd, b"handle") {
         builtins::handle::run(b"", &mut output::ShellOutput::new());
     } else if cmd_starts_with(cmd, b"handle ") {

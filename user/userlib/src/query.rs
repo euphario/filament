@@ -113,6 +113,14 @@ pub mod msg {
     pub const LIST_SERVICES: u16 = 0x0204;
     /// Query detailed info from a service by name
     pub const QUERY_SERVICE_INFO: u16 = 0x0205;
+    /// Query log history from devd
+    pub const LOG_QUERY: u16 = 0x0206;
+    /// Control logging (on/off)
+    pub const LOG_CONTROL: u16 = 0x0207;
+
+    // Log messages (driver → devd)
+    /// Driver sends log message to devd
+    pub const LOG_MESSAGE: u16 = 0x0500;
 
     // Commands (devd → driver)
     /// Tell driver to spawn a child process
@@ -139,6 +147,8 @@ pub mod msg {
     pub const SERVICES_LIST: u16 = 0x0306;
     /// Response containing service info text
     pub const SERVICE_INFO_RESULT: u16 = 0x0307;
+    /// Response containing log history
+    pub const LOG_HISTORY: u16 = 0x0308;
     /// Error response
     pub const ERROR: u16 = 0x03FF;
 }
@@ -2099,6 +2109,231 @@ impl ServiceInfoResult {
             },
             info,
         ))
+    }
+}
+
+// =============================================================================
+// Log Messages
+// =============================================================================
+
+/// Log level constants
+pub mod log_level {
+    pub const ERROR: u8 = 0;
+    pub const WARN: u8 = 1;
+    pub const INFO: u8 = 2;
+    pub const DEBUG: u8 = 3;
+}
+
+/// Log message (driver → devd)
+///
+/// Drivers send log messages to devd for buffering and optional display.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LogMessage {
+    pub header: QueryHeader,
+    /// Log level (see log_level module)
+    pub level: u8,
+    /// Length of message text
+    pub msg_len: u8,
+    pub _pad: [u8; 2],
+    // Followed by: message text (UTF-8)
+}
+
+impl LogMessage {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4;
+    pub const MAX_MSG_LEN: usize = 200;
+
+    pub fn new(seq_id: u32, level: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::LOG_MESSAGE, seq_id),
+            level,
+            msg_len: 0,
+            _pad: [0; 2],
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], message: &[u8]) -> Option<usize> {
+        let len = message.len().min(Self::MAX_MSG_LEN);
+        let total = Self::FIXED_SIZE + len;
+        if buf.len() < total {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = self.level;
+        buf[9] = len as u8;
+        buf[10..12].copy_from_slice(&[0, 0]);
+        buf[Self::FIXED_SIZE..Self::FIXED_SIZE + len].copy_from_slice(&message[..len]);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(buf)?;
+        let level = buf[8];
+        let msg_len = buf[9] as usize;
+        let total = Self::FIXED_SIZE + msg_len;
+        if buf.len() < total {
+            return None;
+        }
+        let message = &buf[Self::FIXED_SIZE..total];
+        Some((Self { header, level, msg_len: msg_len as u8, _pad: [0; 2] }, message))
+    }
+}
+
+/// Log query (shell → devd)
+///
+/// Request log history from devd.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LogQuery {
+    pub header: QueryHeader,
+    /// Maximum number of log entries to return
+    pub max_count: u8,
+    pub _pad: [u8; 3],
+}
+
+impl LogQuery {
+    pub const SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, max_count: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::LOG_QUERY, seq_id),
+            max_count,
+            _pad: [0; 3],
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = self.max_count;
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            max_count: buf[8],
+            _pad: [0; 3],
+        })
+    }
+}
+
+/// Log control commands
+pub mod log_cmd {
+    /// Enable live logging to console
+    pub const ENABLE: u8 = 1;
+    /// Disable live logging
+    pub const DISABLE: u8 = 2;
+}
+
+/// Log control (shell → devd)
+///
+/// Control logging behavior (enable/disable live output).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LogControl {
+    pub header: QueryHeader,
+    /// Command (see log_cmd module)
+    pub command: u8,
+    pub _pad: [u8; 3],
+}
+
+impl LogControl {
+    pub const SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, command: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::LOG_CONTROL, seq_id),
+            command,
+            _pad: [0; 3],
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = self.command;
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            command: buf[8],
+            _pad: [0; 3],
+        })
+    }
+}
+
+/// Log history response (devd → shell)
+///
+/// Contains buffered log messages.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LogHistory {
+    pub header: QueryHeader,
+    /// Result code (0 = success)
+    pub result: i32,
+    /// Number of log entries in response
+    pub count: u8,
+    /// Whether live logging is currently enabled
+    pub live_enabled: u8,
+    /// Total length of log text following header
+    pub text_len: u16,
+    // Followed by: log text (newline-separated entries)
+}
+
+impl LogHistory {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8;
+
+    pub fn new(seq_id: u32, count: u8, live_enabled: bool) -> Self {
+        Self {
+            header: QueryHeader::new(msg::LOG_HISTORY, seq_id),
+            result: 0,
+            count,
+            live_enabled: if live_enabled { 1 } else { 0 },
+            text_len: 0,
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], text: &[u8]) -> Option<usize> {
+        let total = Self::FIXED_SIZE + text.len();
+        if buf.len() < total {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
+        buf[12] = self.count;
+        buf[13] = self.live_enabled;
+        buf[14..16].copy_from_slice(&(text.len() as u16).to_le_bytes());
+        buf[Self::FIXED_SIZE..total].copy_from_slice(text);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(buf)?;
+        let result = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let count = buf[12];
+        let live_enabled = buf[13];
+        let text_len = u16::from_le_bytes([buf[14], buf[15]]) as usize;
+        let total = Self::FIXED_SIZE + text_len;
+        if buf.len() < total {
+            return None;
+        }
+        let text = &buf[Self::FIXED_SIZE..total];
+        Some((Self { header, result, count, live_enabled, text_len: text_len as u16 }, text))
     }
 }
 

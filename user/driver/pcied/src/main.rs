@@ -257,6 +257,46 @@ impl DeviceRegistry {
     fn iter(&self) -> impl Iterator<Item = &PciDevice> {
         self.devices[..self.count].iter()
     }
+
+    fn format_info(&self) -> [u8; 1024] {
+        use core::fmt::Write;
+        let mut buf = [0u8; 1024];
+        let mut pos = 0;
+
+        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
+        impl core::fmt::Write for W<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &byte in s.as_bytes() {
+                    if *self.p < self.b.len() { self.b[*self.p] = byte; *self.p += 1; }
+                }
+                Ok(())
+            }
+        }
+
+        let mut w = W { b: &mut buf, p: &mut pos };
+
+        let _ = writeln!(w, "PCIe Bus Driver (ECAM)");
+        let _ = writeln!(w, "  Platform: QEMU virt");
+        let _ = writeln!(w, "  ECAM Base: {:#x}", QEMU_ECAM_BASE);
+        let _ = writeln!(w, "");
+        let _ = writeln!(w, "Devices: {}", self.count);
+
+        for dev in self.iter() {
+            let _ = writeln!(w, "  {:02x}:{:02x}.{}: {} [{:04x}:{:04x}]",
+                dev.bus, dev.device, dev.function,
+                dev.class_name(), dev.vendor_id, dev.device_id);
+            if dev.bar0_phys != 0 {
+                let size_kb = dev.bar0_size / 1024;
+                if size_kb >= 1024 {
+                    let _ = writeln!(w, "    BAR0: {:#x} ({} MB)", dev.bar0_phys, size_kb / 1024);
+                } else {
+                    let _ = writeln!(w, "    BAR0: {:#x} ({} KB)", dev.bar0_phys, size_kb);
+                }
+            }
+        }
+
+        buf
+    }
 }
 
 // ============================================================================
@@ -448,6 +488,16 @@ fn register_device(client: &mut DevdClient, dev: &PciDevice) -> Result<(), SysEr
 // Main
 // ============================================================================
 
+static mut REGISTRY: DeviceRegistry = DeviceRegistry {
+    devices: [PciDevice {
+        bus: 0, device: 0, function: 0,
+        vendor_id: 0, device_id: 0,
+        class: 0, subclass: 0, prog_if: 0,
+        bar0_phys: 0, bar0_size: 0,
+    }; 32],
+    count: 0,
+};
+
 #[unsafe(no_mangle)]
 fn main() {
     plog!("starting");
@@ -484,17 +534,9 @@ fn main() {
     };
 
     // Enumerate devices
-    let mut registry = DeviceRegistry::new();
-    enumerate_ecam(&ecam, &mut registry);
-
-    plog!("found {} devices", registry.count);
-
-    // Log discovered devices
-    for dev in registry.iter() {
-        plog!("{:02x}:{:02x}.{} vendor={:#06x} device={:#06x} class={} BAR0={:#x} size={:#x}",
-            dev.bus, dev.device, dev.function,
-            dev.vendor_id, dev.device_id, dev.class_name(),
-            dev.bar0_phys, dev.bar0_size);
+    unsafe {
+        enumerate_ecam(&ecam, &mut REGISTRY);
+        plog!("found {} devices", REGISTRY.count);
     }
 
     // Connect to devd
@@ -514,17 +556,19 @@ fn main() {
     }
 
     // Enable bus mastering and register devices with devd
-    for dev in registry.iter() {
-        // Enable bus master for devices that need DMA
-        if dev.is_xhci() || dev.is_network() {
-            enable_bus_master(&ecam, dev);
-            plog!("enabled bus master for {:02x}:{:02x}.{}",
-                dev.bus, dev.device, dev.function);
-        }
+    unsafe {
+        for dev in REGISTRY.iter() {
+            // Enable bus master for devices that need DMA
+            if dev.is_xhci() || dev.is_network() {
+                enable_bus_master(&ecam, dev);
+                plog!("enabled bus master for {:02x}:{:02x}.{}",
+                    dev.bus, dev.device, dev.function);
+            }
 
-        // Register with devd
-        if let Err(_) = register_device(&mut devd_client, dev) {
-            plog!("failed to register device with devd");
+            // Register with devd
+            if let Err(_) = register_device(&mut devd_client, dev) {
+                plog!("failed to register device with devd");
+            }
         }
     }
 
@@ -554,7 +598,9 @@ fn main() {
                         plog!("stop child: {}", child_pid);
                     }
                     userlib::devd::DevdCommand::QueryInfo { seq_id } => {
-                        let _ = devd_client.respond_info(seq_id, b"PCIe Bus Driver\n  (No detailed info available)");
+                        let info = unsafe { REGISTRY.format_info() };
+                        let info_len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
+                        let _ = devd_client.respond_info(seq_id, &info[..info_len]);
                     }
                 }
             }
