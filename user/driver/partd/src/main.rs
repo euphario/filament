@@ -882,6 +882,66 @@ impl PartitionDriver {
         }
     }
 
+    /// Format info text for introspection queries
+    fn format_info(&self) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        let mut pos = 0;
+
+        // Helper to append string
+        let append = |buf: &mut [u8], pos: &mut usize, s: &[u8]| {
+            let len = s.len().min(buf.len() - *pos);
+            buf[*pos..*pos + len].copy_from_slice(&s[..len]);
+            *pos += len;
+        };
+
+        append(&mut buf, &mut pos, b"Partition Driver\n");
+
+        // Disk info
+        append(&mut buf, &mut pos, b"  Disk: ");
+        append(&mut buf, &mut pos, &self.disk_name[..self.disk_name_len]);
+        append(&mut buf, &mut pos, b" (");
+        let mut num_buf = [0u8; 16];
+        let num_len = format_u32(&mut num_buf, self.block_size);
+        append(&mut buf, &mut pos, &num_buf[..num_len]);
+        append(&mut buf, &mut pos, b" bytes/sector)\n\nPartitions: ");
+        let num_len = format_u32(&mut num_buf, self.partition_count as u32);
+        append(&mut buf, &mut pos, &num_buf[..num_len]);
+        append(&mut buf, &mut pos, b"\n");
+
+        // Each partition
+        for i in 0..self.partition_count {
+            let p = &self.partitions[i];
+            let type_name = match p.partition_type {
+                0x01 | 0x04 | 0x06 | 0x0E => b"FAT16" as &[u8],
+                0x0B | 0x0C => b"FAT32",
+                0x07 => b"NTFS",
+                0x82 => b"Linux swap",
+                0x83 => b"Linux",
+                0xEE => b"GPT",
+                _ => b"Unknown",
+            };
+            let size_mb = (p.sector_count * self.block_size as u64) / (1024 * 1024);
+
+            append(&mut buf, &mut pos, b"  part");
+            let num_len = format_u32(&mut num_buf, i as u32);
+            append(&mut buf, &mut pos, &num_buf[..num_len]);
+            append(&mut buf, &mut pos, b": ");
+            append(&mut buf, &mut pos, type_name);
+            append(&mut buf, &mut pos, b" (0x");
+            let num_len = format_hex(&mut num_buf, p.partition_type as u32, 2);
+            append(&mut buf, &mut pos, &num_buf[..num_len]);
+            append(&mut buf, &mut pos, b"), LBA ");
+            let num_len = format_u64(&mut num_buf, p.start_lba);
+            append(&mut buf, &mut pos, &num_buf[..num_len]);
+            append(&mut buf, &mut pos, b", ");
+            let num_len = format_u64(&mut num_buf, size_mb);
+            append(&mut buf, &mut pos, &num_buf[..num_len]);
+            append(&mut buf, &mut pos, b" MB\n");
+        }
+
+        buf
+    }
+
     /// Find partition by port handle
     fn find_partition_by_port(&self, handle: Handle) -> Option<usize> {
         for i in 0..self.partition_count {
@@ -1051,30 +1111,44 @@ impl PartitionDriver {
             syscall::sleep_us(1000);
 
             // Also check for devd commands via polling
-            if let Some(client) = &mut self.devd_client {
-                if let Ok(Some(cmd)) = client.poll_command() {
-                    match cmd {
-                        DevdCommand::SpawnChild { seq_id, binary, binary_len, .. } => {
-                            let binary_str = match core::str::from_utf8(&binary[..binary_len]) {
-                                Ok(s) => s,
-                                Err(_) => {
+            // First poll for command (requires mutable borrow)
+            let cmd = self.devd_client.as_mut().and_then(|c| c.poll_command().ok().flatten());
+            if let Some(cmd) = cmd {
+                match cmd {
+                    DevdCommand::SpawnChild { seq_id, binary, binary_len, .. } => {
+                        let binary_str = match core::str::from_utf8(&binary[..binary_len]) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                if let Some(client) = &mut self.devd_client {
                                     let _ = client.ack_spawn(seq_id, -1, 0);
-                                    continue;
                                 }
-                            };
-                            plog!("spawning child: {}", binary_str);
-                            let pid = syscall::exec(binary_str);
-                            if pid > 0 {
-                                plog!("spawned child PID: {}", pid);
+                                continue;
+                            }
+                        };
+                        plog!("spawning child: {}", binary_str);
+                        let pid = syscall::exec(binary_str);
+                        if pid > 0 {
+                            plog!("spawned child PID: {}", pid);
+                            if let Some(client) = &mut self.devd_client {
                                 let _ = client.ack_spawn(seq_id, 0, pid as u32);
-                            } else {
-                                perror!("failed to spawn {}: {}", binary_str, -pid);
+                            }
+                        } else {
+                            perror!("failed to spawn {}: {}", binary_str, -pid);
+                            if let Some(client) = &mut self.devd_client {
                                 let _ = client.ack_spawn(seq_id, pid as i32, 0);
                             }
                         }
-                        DevdCommand::StopChild { child_pid, .. } => {
-                            plog!("stopping child PID: {}", child_pid);
-                            let _ = syscall::kill(child_pid);
+                    }
+                    DevdCommand::StopChild { child_pid, .. } => {
+                        plog!("stopping child PID: {}", child_pid);
+                        let _ = syscall::kill(child_pid);
+                    }
+                    DevdCommand::QueryInfo { seq_id } => {
+                        // Format info before mutable borrow
+                        let info = self.format_info();
+                        let info_len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
+                        if let Some(client) = &mut self.devd_client {
+                            let _ = client.respond_info(seq_id, &info[..info_len]);
                         }
                     }
                 }
@@ -1136,33 +1210,48 @@ impl PartitionDriver {
             }
 
             // Devd message (spawn commands, etc.)
-            if let Some(client) = &mut self.devd_client {
-                if client.handle() == Some(event.handle) {
-                    if let Ok(Some(cmd)) = client.poll_command() {
-                        match cmd {
-                            DevdCommand::SpawnChild { seq_id, binary, binary_len, .. } => {
-                                // Spawn the child process
-                                let binary_str = match core::str::from_utf8(&binary[..binary_len]) {
-                                    Ok(s) => s,
-                                    Err(_) => {
+            let is_devd_event = self.devd_client.as_ref()
+                .map(|c| c.handle() == Some(event.handle))
+                .unwrap_or(false);
+            if is_devd_event {
+                let cmd = self.devd_client.as_mut().and_then(|c| c.poll_command().ok().flatten());
+                if let Some(cmd) = cmd {
+                    match cmd {
+                        DevdCommand::SpawnChild { seq_id, binary, binary_len, .. } => {
+                            // Spawn the child process
+                            let binary_str = match core::str::from_utf8(&binary[..binary_len]) {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    if let Some(client) = &mut self.devd_client {
                                         let _ = client.ack_spawn(seq_id, -1, 0);
-                                        continue;
                                     }
-                                };
+                                    continue;
+                                }
+                            };
 
-                                plog!("spawning child: {}", binary_str);
-                                let pid = syscall::exec(binary_str);
-                                if pid > 0 {
-                                    plog!("spawned child PID: {}", pid);
+                            plog!("spawning child: {}", binary_str);
+                            let pid = syscall::exec(binary_str);
+                            if pid > 0 {
+                                plog!("spawned child PID: {}", pid);
+                                if let Some(client) = &mut self.devd_client {
                                     let _ = client.ack_spawn(seq_id, 0, pid as u32);
-                                } else {
-                                    perror!("failed to spawn {}: {}", binary_str, -pid);
+                                }
+                            } else {
+                                perror!("failed to spawn {}: {}", binary_str, -pid);
+                                if let Some(client) = &mut self.devd_client {
                                     let _ = client.ack_spawn(seq_id, pid as i32, 0);
                                 }
                             }
-                            DevdCommand::StopChild { child_pid, .. } => {
-                                plog!("stopping child PID: {}", child_pid);
-                                let _ = syscall::kill(child_pid);
+                        }
+                        DevdCommand::StopChild { child_pid, .. } => {
+                            plog!("stopping child PID: {}", child_pid);
+                            let _ = syscall::kill(child_pid);
+                        }
+                        DevdCommand::QueryInfo { seq_id } => {
+                            let info = self.format_info();
+                            let info_len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
+                            if let Some(client) = &mut self.devd_client {
+                                let _ = client.respond_info(seq_id, &info[..info_len]);
                             }
                         }
                     }
@@ -1191,4 +1280,73 @@ fn main() {
     }
 
     driver.run()
+}
+
+// =============================================================================
+// Helper Functions for Formatting
+// =============================================================================
+
+fn format_u32(buf: &mut [u8], val: u32) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 {
+        len += 1;
+        n /= 10;
+    }
+    n = val;
+    for i in (0..len).rev() {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    len
+}
+
+fn format_u64(buf: &mut [u8], val: u64) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 {
+        len += 1;
+        n /= 10;
+    }
+    n = val;
+    for i in (0..len).rev() {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    len
+}
+
+fn format_hex(buf: &mut [u8], val: u32, min_digits: usize) -> usize {
+    const HEX_CHARS: &[u8] = b"0123456789ABCDEF";
+    if val == 0 {
+        for i in 0..min_digits {
+            buf[i] = b'0';
+        }
+        return min_digits;
+    }
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 {
+        len += 1;
+        n /= 16;
+    }
+    let actual_len = len.max(min_digits);
+    // Pad with zeros
+    for i in 0..(actual_len - len) {
+        buf[i] = b'0';
+    }
+    n = val;
+    for i in (actual_len - len..actual_len).rev() {
+        buf[i] = HEX_CHARS[(n % 16) as usize];
+        n /= 16;
+    }
+    actual_len
 }

@@ -230,6 +230,33 @@ impl InflightSpawn {
     }
 }
 
+/// Maximum pending info queries
+const MAX_PENDING_INFO_QUERIES: usize = 8;
+
+/// A pending service info query waiting for driver response
+#[derive(Clone, Copy)]
+struct PendingInfoQuery {
+    /// Sequence ID we used when forwarding (0 = empty slot)
+    forward_seq_id: u32,
+    /// Original client's sequence ID
+    client_seq_id: u32,
+    /// Client slot to relay response to
+    client_slot: u8,
+    /// Driver slot we forwarded to
+    driver_slot: u8,
+}
+
+impl PendingInfoQuery {
+    const fn empty() -> Self {
+        Self {
+            forward_seq_id: 0,
+            client_seq_id: 0,
+            client_slot: 0,
+            driver_slot: 0,
+        }
+    }
+}
+
 /// A pending spawn command waiting for driver to report Ready
 #[derive(Clone, Copy)]
 struct PendingSpawn {
@@ -287,6 +314,10 @@ pub struct Devd {
     spawn_contexts: [SpawnContext; MAX_SPAWN_CONTEXTS],
     /// In-flight spawn commands: maps seq_id to port info
     inflight_spawns: [InflightSpawn; MAX_INFLIGHT_SPAWNS],
+    /// Pending info queries: maps forwarded seq_id to client info
+    pending_info_queries: [PendingInfoQuery; MAX_PENDING_INFO_QUERIES],
+    /// Next sequence ID for forwarded queries
+    next_forward_seq_id: u32,
 }
 
 impl Devd {
@@ -307,6 +338,8 @@ impl Devd {
             pending_spawns: [const { PendingSpawn::empty() }; MAX_DRIVERS_WITH_PENDING * MAX_PENDING_SPAWNS_PER_DRIVER],
             spawn_contexts: [const { SpawnContext::empty() }; MAX_SPAWN_CONTEXTS],
             inflight_spawns: [const { InflightSpawn::empty() }; MAX_INFLIGHT_SPAWNS],
+            pending_info_queries: [const { PendingInfoQuery::empty() }; MAX_PENDING_INFO_QUERIES],
+            next_forward_seq_id: 1,
         }
     }
 
@@ -1147,6 +1180,14 @@ impl Devd {
                         // Handle service list query
                         self.handle_list_services(slot, &recv_buf[..len]);
                     }
+                    Some(msg::QUERY_SERVICE_INFO) => {
+                        // Forward service info query to driver
+                        self.handle_query_service_info(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::SERVICE_INFO_RESULT) => {
+                        // Response from driver - relay to original client
+                        self.handle_service_info_result(slot, &recv_buf[..len]);
+                    }
                     _ => {
                         // Process normally
                         let response_len = self.query_handler.handle_message(
@@ -1533,6 +1574,169 @@ impl Devd {
 
         if let Some(client) = self.query_handler.get_mut(slot) {
             let _ = client.channel.send(&resp_buf[..offset]);
+        }
+    }
+
+    /// Handle QUERY_SERVICE_INFO - forward to the named service's driver
+    fn handle_query_service_info(&mut self, client_slot: usize, buf: &[u8]) {
+        use userlib::query::{QueryHeader, QueryServiceInfo, ErrorResponse, error};
+
+        // Parse the request
+        let (req, name_bytes) = match QueryServiceInfo::from_bytes(buf) {
+            Some(r) => r,
+            None => {
+                derror!("invalid QUERY_SERVICE_INFO from slot={}", client_slot);
+                return;
+            }
+        };
+
+        let client_seq_id = req.header.seq_id;
+
+        // Get service name as string
+        let name_str = match core::str::from_utf8(name_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                if let Some(client) = self.query_handler.get_mut(client_slot) {
+                    let resp = ErrorResponse::new(client_seq_id, error::INVALID_REQUEST);
+                    let _ = client.channel.send(&resp.to_bytes());
+                }
+                return;
+            }
+        };
+
+        // Find the service by name
+        let service_idx = match self.services.find_by_name(name_str) {
+            Some(idx) => idx,
+            None => {
+                if let Some(client) = self.query_handler.get_mut(client_slot) {
+                    let resp = ErrorResponse::new(client_seq_id, error::NOT_FOUND);
+                    let _ = client.channel.send(&resp.to_bytes());
+                }
+                return;
+            }
+        };
+
+        // Find the driver's query client slot
+        let driver_slot = match self.query_handler.find_by_service_idx(service_idx as u8) {
+            Some(slot) => slot,
+            None => {
+                // Driver not connected to query port
+                if let Some(client) = self.query_handler.get_mut(client_slot) {
+                    let resp = ErrorResponse::new(client_seq_id, error::NO_DRIVER);
+                    let _ = client.channel.send(&resp.to_bytes());
+                }
+                return;
+            }
+        };
+
+        // Allocate a forward sequence ID
+        let forward_seq_id = self.next_forward_seq_id;
+        self.next_forward_seq_id = self.next_forward_seq_id.wrapping_add(1);
+        if self.next_forward_seq_id == 0 {
+            self.next_forward_seq_id = 1;
+        }
+
+        // Store pending query for response routing
+        let mut stored = false;
+        for pending in &mut self.pending_info_queries {
+            if pending.forward_seq_id == 0 {
+                *pending = PendingInfoQuery {
+                    forward_seq_id,
+                    client_seq_id,
+                    client_slot: client_slot as u8,
+                    driver_slot: driver_slot as u8,
+                };
+                stored = true;
+                break;
+            }
+        }
+
+        if !stored {
+            derror!("pending info query table full");
+            if let Some(client) = self.query_handler.get_mut(client_slot) {
+                let resp = ErrorResponse::new(client_seq_id, error::DEVICE_ERROR);
+                let _ = client.channel.send(&resp.to_bytes());
+            }
+            return;
+        }
+
+        // Forward the query to the driver with our forwarded seq_id
+        let forward_req = QueryServiceInfo::new(forward_seq_id);
+        let mut forward_buf = [0u8; 128];
+        if let Some(len) = forward_req.write_to(&mut forward_buf, name_bytes) {
+            if let Some(driver_client) = self.query_handler.get_mut(driver_slot) {
+                if let Err(e) = driver_client.channel.send(&forward_buf[..len]) {
+                    derror!("failed to forward QUERY_SERVICE_INFO: {:?}", e);
+                    // Clear the pending entry
+                    for pending in &mut self.pending_info_queries {
+                        if pending.forward_seq_id == forward_seq_id {
+                            *pending = PendingInfoQuery::empty();
+                            break;
+                        }
+                    }
+                    if let Some(client) = self.query_handler.get_mut(client_slot) {
+                        let resp = ErrorResponse::new(client_seq_id, error::NO_DRIVER);
+                        let _ = client.channel.send(&resp.to_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle SERVICE_INFO_RESULT - relay response to original client
+    fn handle_service_info_result(&mut self, driver_slot: usize, buf: &[u8]) {
+        use userlib::query::{QueryHeader, ServiceInfoResult, ErrorResponse, error};
+
+        // Parse the response
+        let header = match QueryHeader::from_bytes(buf) {
+            Some(h) => h,
+            None => {
+                derror!("invalid SERVICE_INFO_RESULT from slot={}", driver_slot);
+                return;
+            }
+        };
+
+        let forward_seq_id = header.seq_id;
+
+        // Find the pending query by forward_seq_id
+        let mut pending_info: Option<(u32, u8)> = None;
+        for pending in &mut self.pending_info_queries {
+            if pending.forward_seq_id == forward_seq_id && pending.driver_slot == driver_slot as u8 {
+                pending_info = Some((pending.client_seq_id, pending.client_slot));
+                *pending = PendingInfoQuery::empty();
+                break;
+            }
+        }
+
+        let (client_seq_id, client_slot) = match pending_info {
+            Some(info) => info,
+            None => {
+                derror!("no pending query for SERVICE_INFO_RESULT seq_id={}", forward_seq_id);
+                return;
+            }
+        };
+
+        // Parse the full response to rewrite the seq_id
+        if let Some((resp, info_bytes)) = ServiceInfoResult::from_bytes(buf) {
+            // Build response with original client's seq_id
+            let client_resp = if resp.result == error::OK {
+                ServiceInfoResult::success(client_seq_id, info_bytes.len() as u16)
+            } else {
+                ServiceInfoResult::new(client_seq_id, resp.result)
+            };
+
+            let mut resp_buf = [0u8; 1100];
+            if let Some(len) = client_resp.write_to(&mut resp_buf, info_bytes) {
+                if let Some(client) = self.query_handler.get_mut(client_slot as usize) {
+                    let _ = client.channel.send(&resp_buf[..len]);
+                }
+            }
+        } else {
+            // Couldn't parse - send error
+            if let Some(client) = self.query_handler.get_mut(client_slot as usize) {
+                let resp = ErrorResponse::new(client_seq_id, error::DEVICE_ERROR);
+                let _ = client.channel.send(&resp.to_bytes());
+            }
         }
     }
 

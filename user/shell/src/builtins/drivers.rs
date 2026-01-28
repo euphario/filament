@@ -6,6 +6,7 @@
 //!   drivers              - Show all services and ports as tree
 //!   drivers services     - Show services only (table)
 //!   drivers ports        - Show ports only (table)
+//!   drivers <name>       - Query detailed info from a specific service
 //!   drivers help         - Show help
 
 use core::fmt::Write;
@@ -28,8 +29,8 @@ pub fn run(args: &[u8]) -> CommandResult {
     } else if cmd_eq(args, b"ports") {
         cmd_ports()
     } else {
-        println!("Unknown drivers subcommand. Try 'drivers help'");
-        CommandResult::None
+        // Query specific service by name
+        cmd_info(args)
     }
 }
 
@@ -40,7 +41,48 @@ fn show_help() {
     println!("  drivers              Show driver/port tree");
     println!("  drivers services     Show services table");
     println!("  drivers ports        Show ports table");
+    println!("  drivers <name>       Query detailed info from a service");
     println!("  drivers help         Show this help");
+    println!();
+    println!("Examples:");
+    println!("  drivers xhcid        Query USB controller info");
+    println!("  drivers partd        Query partition driver info");
+}
+
+/// Query detailed info from a specific service
+fn cmd_info(service_name: &[u8]) -> CommandResult {
+    let mut client = match DevdClient::connect() {
+        Ok(c) => c,
+        Err(_) => return CommandResult::Error("failed to connect to devd"),
+    };
+
+    match client.query_service_info(service_name) {
+        Ok((info, len)) => {
+            // Print the info text
+            if let Ok(text) = core::str::from_utf8(&info[..len]) {
+                // Trim trailing nulls
+                let text = text.trim_end_matches('\0');
+                for line in text.lines() {
+                    println!("{}", line);
+                }
+            } else {
+                println!("(invalid UTF-8 response)");
+            }
+            CommandResult::None
+        }
+        Err(userlib::error::SysError::NotFound) => {
+            if let Ok(name) = core::str::from_utf8(service_name) {
+                println!("Service '{}' not found", name);
+            } else {
+                println!("Service not found");
+            }
+            CommandResult::None
+        }
+        Err(e) => {
+            println!("Query failed: {:?}", e);
+            CommandResult::None
+        }
+    }
 }
 
 /// Fixed-size string buffer for building output

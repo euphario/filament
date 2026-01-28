@@ -553,6 +553,9 @@ fn main() {
                     userlib::devd::DevdCommand::StopChild { child_pid, .. } => {
                         plog!("stop child: {}", child_pid);
                     }
+                    userlib::devd::DevdCommand::QueryInfo { seq_id } => {
+                        let _ = devd_client.respond_info(seq_id, b"PCIe Bus Driver\n  (No detailed info available)");
+                    }
                 }
             }
             Ok(None) => {

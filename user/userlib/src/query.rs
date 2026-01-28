@@ -111,6 +111,8 @@ pub mod msg {
     pub const LIST_PORTS: u16 = 0x0203;
     /// List all services (for introspection)
     pub const LIST_SERVICES: u16 = 0x0204;
+    /// Query detailed info from a service by name
+    pub const QUERY_SERVICE_INFO: u16 = 0x0205;
 
     // Commands (devd → driver)
     /// Tell driver to spawn a child process
@@ -135,6 +137,8 @@ pub mod msg {
     pub const PORTS_LIST: u16 = 0x0305;
     /// Response containing list of services
     pub const SERVICES_LIST: u16 = 0x0306;
+    /// Response containing service info text
+    pub const SERVICE_INFO_RESULT: u16 = 0x0307;
     /// Error response
     pub const ERROR: u16 = 0x03FF;
 }
@@ -1943,6 +1947,158 @@ impl ServicesListResponse {
             count: u16::from_le_bytes([buf[8], buf[9]]),
             _pad: 0,
         })
+    }
+}
+
+// =============================================================================
+// Service Info Query (shell → devd → driver)
+// =============================================================================
+
+/// Query service info by name (client → devd)
+///
+/// Requests detailed info from a service. devd forwards this to the driver,
+/// which responds with text describing its state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QueryServiceInfo {
+    pub header: QueryHeader,
+    /// Length of service name
+    pub name_len: u8,
+    pub _pad: [u8; 3],
+    // Followed by: service name bytes
+}
+
+impl QueryServiceInfo {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::QUERY_SERVICE_INFO, seq_id),
+            name_len: 0,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Serialize to buffer, returns total length written
+    pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
+        let total_len = Self::FIXED_SIZE + name.len();
+        if buf.len() < total_len || name.len() > 255 {
+            return None;
+        }
+
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = name.len() as u8;
+        buf[9..12].copy_from_slice(&[0, 0, 0]);
+        buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
+
+        Some(total_len)
+    }
+
+    /// Parse from buffer
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+
+        let header = QueryHeader::from_bytes(buf)?;
+        let name_len = buf[8] as usize;
+
+        let total_len = Self::FIXED_SIZE + name_len;
+        if buf.len() < total_len {
+            return None;
+        }
+
+        let name = &buf[Self::FIXED_SIZE..total_len];
+
+        Some((
+            Self {
+                header,
+                name_len: name_len as u8,
+                _pad: [0; 3],
+            },
+            name,
+        ))
+    }
+}
+
+/// Service info response (driver → devd → client)
+///
+/// Contains UTF-8 text describing the service's current state and configuration.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ServiceInfoResult {
+    pub header: QueryHeader,
+    /// Result code (0 = success, negative = error)
+    pub result: i32,
+    /// Length of info text
+    pub info_len: u16,
+    pub _pad: u16,
+    // Followed by: UTF-8 info text bytes
+}
+
+impl ServiceInfoResult {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8;
+
+    pub fn new(seq_id: u32, result: i32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SERVICE_INFO_RESULT, seq_id),
+            result,
+            info_len: 0,
+            _pad: 0,
+        }
+    }
+
+    pub fn success(seq_id: u32, info_len: u16) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SERVICE_INFO_RESULT, seq_id),
+            result: error::OK,
+            info_len,
+            _pad: 0,
+        }
+    }
+
+    /// Serialize to buffer with info text, returns total length written
+    pub fn write_to(&self, buf: &mut [u8], info: &[u8]) -> Option<usize> {
+        let total_len = Self::FIXED_SIZE + info.len();
+        if buf.len() < total_len {
+            return None;
+        }
+
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
+        buf[12..14].copy_from_slice(&(info.len() as u16).to_le_bytes());
+        buf[14..16].copy_from_slice(&[0, 0]);
+        buf[Self::FIXED_SIZE..total_len].copy_from_slice(info);
+
+        Some(total_len)
+    }
+
+    /// Parse from buffer
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+
+        let header = QueryHeader::from_bytes(buf)?;
+        let result = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let info_len = u16::from_le_bytes([buf[12], buf[13]]) as usize;
+
+        let total_len = Self::FIXED_SIZE + info_len;
+        if buf.len() < total_len {
+            return None;
+        }
+
+        let info = &buf[Self::FIXED_SIZE..total_len];
+
+        Some((
+            Self {
+                header,
+                result,
+                info_len: info_len as u16,
+                _pad: 0,
+            },
+            info,
+        ))
     }
 }
 

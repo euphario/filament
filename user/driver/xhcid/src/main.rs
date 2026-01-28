@@ -347,6 +347,96 @@ impl QemuUsbDriver {
         }
     }
 
+    /// Format info text for introspection queries
+    fn format_info(&self) -> [u8; 1024] {
+        let mut buf = [0u8; 1024];
+        let mut pos = 0;
+
+        let append = |buf: &mut [u8], pos: &mut usize, s: &[u8]| {
+            let len = s.len().min(buf.len() - *pos);
+            buf[*pos..*pos + len].copy_from_slice(&s[..len]);
+            *pos += len;
+        };
+
+        append(&mut buf, &mut pos, b"USB Host Controller (xHCI)\n");
+
+        // Controller info
+        if let Some(caps) = &self.caps {
+            append(&mut buf, &mut pos, b"  Max Slots: ");
+            let mut num_buf = [0u8; 16];
+            let num_len = format_u32(&mut num_buf, caps.max_slots as u32);
+            append(&mut buf, &mut pos, &num_buf[..num_len]);
+            append(&mut buf, &mut pos, b"\n  Max Ports: ");
+            let num_len = format_u32(&mut num_buf, caps.max_ports as u32);
+            append(&mut buf, &mut pos, &num_buf[..num_len]);
+            append(&mut buf, &mut pos, b"\n");
+        }
+
+        // Count active devices
+        let mut device_count = 0;
+        for dev in &self.devices {
+            if dev.is_some() {
+                device_count += 1;
+            }
+        }
+
+        append(&mut buf, &mut pos, b"\nDevices: ");
+        let mut num_buf = [0u8; 16];
+        let num_len = format_u32(&mut num_buf, device_count);
+        append(&mut buf, &mut pos, &num_buf[..num_len]);
+        append(&mut buf, &mut pos, b"\n");
+
+        // Device details
+        for (i, dev_opt) in self.devices.iter().enumerate() {
+            if let Some(dev) = dev_opt {
+                append(&mut buf, &mut pos, b"  Slot ");
+                let num_len = format_u32(&mut num_buf, dev.slot_id as u32);
+                append(&mut buf, &mut pos, &num_buf[..num_len]);
+                append(&mut buf, &mut pos, b": ");
+
+                if dev.is_msc {
+                    append(&mut buf, &mut pos, b"USB Mass Storage");
+                } else {
+                    append(&mut buf, &mut pos, b"USB Device");
+                }
+
+                append(&mut buf, &mut pos, b"\n    Port: ");
+                let num_len = format_u32(&mut num_buf, dev.port as u32);
+                append(&mut buf, &mut pos, &num_buf[..num_len]);
+
+                append(&mut buf, &mut pos, b", Speed: ");
+                let speed_name = match dev.speed {
+                    1 => b"Full-Speed" as &[u8],
+                    2 => b"Low-Speed",
+                    3 => b"High-Speed",
+                    4 => b"SuperSpeed",
+                    _ => b"Unknown",
+                };
+                append(&mut buf, &mut pos, speed_name);
+
+                append(&mut buf, &mut pos, b"\n    VID:PID: 0x");
+                let num_len = format_hex_16(&mut num_buf, dev.vendor_id);
+                append(&mut buf, &mut pos, &num_buf[..num_len]);
+                append(&mut buf, &mut pos, b":0x");
+                let num_len = format_hex_16(&mut num_buf, dev.product_id);
+                append(&mut buf, &mut pos, &num_buf[..num_len]);
+
+                if dev.is_msc {
+                    append(&mut buf, &mut pos, b"\n    Bulk IN DCI: ");
+                    let num_len = format_u32(&mut num_buf, dev.bulk_in_dci as u32);
+                    append(&mut buf, &mut pos, &num_buf[..num_len]);
+                    append(&mut buf, &mut pos, b", Bulk OUT DCI: ");
+                    let num_len = format_u32(&mut num_buf, dev.bulk_out_dci as u32);
+                    append(&mut buf, &mut pos, &num_buf[..num_len]);
+                }
+
+                append(&mut buf, &mut pos, b"\n");
+            }
+        }
+
+        buf
+    }
+
     /// Initialize the USB controller
     fn init(&mut self) -> Result<(), &'static str> {
         log("[qemu-usbd] Starting initialization");
@@ -2446,6 +2536,12 @@ fn main() {
                     userlib::devd::DevdCommand::StopChild { child_pid, .. } => {
                         spawn_handler.handle_stop(child_pid);
                     }
+                    userlib::devd::DevdCommand::QueryInfo { seq_id } => {
+                        let info = driver.format_info();
+                        // Trim trailing nulls from fixed buffer
+                        let info_len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
+                        let _ = devd_client.respond_info(seq_id, &info[..info_len]);
+                    }
                 }
             }
 
@@ -2639,4 +2735,36 @@ fn register_block_port_with_client(client: &mut DevdClient, disk_num: u8) -> boo
             false
         }
     }
+}
+
+// =============================================================================
+// Helper Functions for Formatting
+// =============================================================================
+
+fn format_u32(buf: &mut [u8], val: u32) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 {
+        len += 1;
+        n /= 10;
+    }
+    n = val;
+    for i in (0..len).rev() {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    len
+}
+
+fn format_hex_16(buf: &mut [u8], val: u16) -> usize {
+    const HEX_CHARS: &[u8] = b"0123456789ABCDEF";
+    buf[0] = HEX_CHARS[((val >> 12) & 0xF) as usize];
+    buf[1] = HEX_CHARS[((val >> 8) & 0xF) as usize];
+    buf[2] = HEX_CHARS[((val >> 4) & 0xF) as usize];
+    buf[3] = HEX_CHARS[(val & 0xF) as usize];
+    4
 }

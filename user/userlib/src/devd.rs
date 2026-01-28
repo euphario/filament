@@ -52,6 +52,7 @@ use crate::query::{
     QueryPort, PortInfoResponse, port_flags, UpdatePortShmemId,
     ListPorts, PortsListResponse, PortEntry,
     ListServices, ServicesListResponse, ServiceEntry,
+    QueryServiceInfo, ServiceInfoResult,
     msg, port_type, error, class, driver_state, service_state,
 };
 
@@ -224,6 +225,11 @@ pub enum DevdCommand {
         seq_id: u32,
         /// PID of child to stop
         child_pid: u32,
+    },
+    /// Query for service info (devd is asking driver for info text)
+    QueryInfo {
+        /// Sequence ID for response
+        seq_id: u32,
     },
 }
 
@@ -669,6 +675,12 @@ impl DevdClient {
                             child_pid,
                         }))
                     }
+                    msg::QUERY_SERVICE_INFO => {
+                        // devd is forwarding a service info query
+                        Ok(Some(DevdCommand::QueryInfo {
+                            seq_id: header.seq_id,
+                        }))
+                    }
                     _ => {
                         // Unknown message type - ignore
                         Ok(None)
@@ -932,6 +944,73 @@ impl DevdClient {
         Err(SysError::Timeout)
     }
 
+    /// Query detailed info from a service by name
+    ///
+    /// Sends a query to devd which forwards it to the named service.
+    /// The service responds with UTF-8 text describing its state.
+    /// Returns the info text and its length.
+    pub fn query_service_info(&mut self, service_name: &[u8]) -> Result<([u8; 1024], usize), SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = QueryServiceInfo::new(seq_id);
+        let mut buf = [0u8; 128];
+        let len = req.write_to(&mut buf, service_name)
+            .ok_or(SysError::InvalidArgument)?;
+        channel.send(&buf[..len])?;
+
+        // Wait for response (larger buffer for info text)
+        let mut resp_buf = [0u8; 1100];
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut resp_buf) {
+                Ok(resp_len) if resp_len >= ServiceInfoResult::FIXED_SIZE => {
+                    let header = QueryHeader::from_bytes(&resp_buf)
+                        .ok_or(SysError::IoError)?;
+
+                    if header.msg_type == msg::SERVICE_INFO_RESULT {
+                        if let Some((resp, info)) = ServiceInfoResult::from_bytes(&resp_buf[..resp_len]) {
+                            if resp.result == error::OK {
+                                let mut result = [0u8; 1024];
+                                let info_len = info.len().min(1024);
+                                result[..info_len].copy_from_slice(&info[..info_len]);
+                                return Ok((result, info_len));
+                            } else {
+                                return Err(SysError::NotFound);
+                            }
+                        }
+                        return Err(SysError::IoError);
+                    } else if header.msg_type == msg::ERROR {
+                        return Err(SysError::NotFound);
+                    }
+                }
+                Ok(_) => return Err(SysError::IoError),
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SysError::Timeout)
+    }
+
+    /// Respond to a service info query
+    ///
+    /// Drivers call this when they receive a QueryInfo command from devd.
+    /// The info text should be UTF-8 formatted text describing the driver's
+    /// current state and configuration.
+    pub fn respond_info(&mut self, seq_id: u32, info: &[u8]) -> Result<(), SysError> {
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let resp = ServiceInfoResult::success(seq_id, info.len() as u16);
+        let mut buf = [0u8; 1100];
+        let len = resp.write_to(&mut buf, info)
+            .ok_or(SysError::InvalidArgument)?;
+        channel.send(&buf[..len])?;
+
+        Ok(())
+    }
+
     /// Disconnect from devd
     pub fn disconnect(&mut self) {
         self.channel = None;
@@ -1087,6 +1166,15 @@ pub trait SpawnHandler {
     fn handle_stop(&mut self, pid: u32) {
         let _ = syscall::kill(pid);
     }
+
+    /// Get service info text for introspection queries
+    ///
+    /// Called when a QueryInfo command is received. Return UTF-8 text
+    /// describing the driver's current state and configuration.
+    /// The default implementation returns a placeholder message.
+    fn get_info(&self) -> &[u8] {
+        b"No info available"
+    }
 }
 
 /// Run the driver service loop
@@ -1174,6 +1262,11 @@ fn handle_command<H: SpawnHandler>(
         }
         DevdCommand::StopChild { child_pid, .. } => {
             handler.handle_stop(child_pid);
+        }
+        DevdCommand::QueryInfo { seq_id } => {
+            // Get info from handler and respond
+            let info = handler.get_info();
+            let _ = client.respond_info(seq_id, info);
         }
     }
 }
