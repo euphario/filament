@@ -50,11 +50,11 @@ use userlib::sync::SingleThreadCell;
 // =============================================================================
 
 macro_rules! flog {
-    ($($arg:tt)*) => { userlib::klog_info!("fatfs", $($arg)*) };
+    ($($arg:tt)*) => { userlib::klog_info!("fatfsd", $($arg)*) };
 }
 
 macro_rules! ferror {
-    ($($arg:tt)*) => { userlib::klog_error!("fatfs", $($arg)*) };
+    ($($arg:tt)*) => { userlib::klog_error!("fatfsd", $($arg)*) };
 }
 
 // =============================================================================
@@ -709,13 +709,101 @@ impl FatfsDriver {
                 continue;
             }
 
-            // Check if it's from devd (ignore for now)
+            // Check if it's from devd
             if Some(event.handle) == devd_handle {
-                if let Some(ref mut client) = self.devd_client {
-                    let _ = client.poll_command();
-                }
+                self.handle_devd_command();
             }
         }
+    }
+
+    fn handle_devd_command(&mut self) {
+        use userlib::devd::DevdCommand;
+
+        let cmd = match self.devd_client.as_mut().and_then(|c| c.poll_command().ok().flatten()) {
+            Some(c) => c,
+            None => return,
+        };
+
+        match cmd {
+            DevdCommand::QueryInfo { seq_id } => {
+                let info = self.format_info();
+                let info_len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
+                if let Some(client) = &mut self.devd_client {
+                    let _ = client.respond_info(seq_id, &info[..info_len]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn format_info(&self) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        let mut pos = 0;
+
+        let append = |buf: &mut [u8], pos: &mut usize, s: &[u8]| {
+            let len = s.len().min(buf.len() - *pos);
+            buf[*pos..*pos + len].copy_from_slice(&s[..len]);
+            *pos += len;
+        };
+
+        let append_u32 = |buf: &mut [u8], pos: &mut usize, val: u32| {
+            let mut num_buf = [0u8; 16];
+            let mut n = val;
+            if n == 0 {
+                buf[*pos] = b'0';
+                *pos += 1;
+                return;
+            }
+            let mut len = 0;
+            while n > 0 {
+                len += 1;
+                n /= 10;
+            }
+            n = val;
+            for i in (0..len).rev() {
+                num_buf[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+            let copy_len = len.min(buf.len() - *pos);
+            buf[*pos..*pos + copy_len].copy_from_slice(&num_buf[..copy_len]);
+            *pos += copy_len;
+        };
+
+        append(&mut buf, &mut pos, b"FAT Filesystem Driver\n");
+        append(&mut buf, &mut pos, b"  Mount: /mnt/fat");
+        append_u32(&mut buf, &mut pos, self.instance as u32);
+        append(&mut buf, &mut pos, b"\n");
+
+        if let Some(ref state) = self.fat_state {
+            append(&mut buf, &mut pos, b"  Type: ");
+            match state.fat_type {
+                FatType::Fat16 => append(&mut buf, &mut pos, b"FAT16"),
+                FatType::Fat32 => append(&mut buf, &mut pos, b"FAT32"),
+                FatType::Unknown => append(&mut buf, &mut pos, b"Unknown"),
+            }
+            append(&mut buf, &mut pos, b"\n");
+
+            append(&mut buf, &mut pos, b"  Bytes/sector: ");
+            append_u32(&mut buf, &mut pos, state.bpb.bytes_per_sector as u32);
+            append(&mut buf, &mut pos, b"\n");
+
+            append(&mut buf, &mut pos, b"  Sectors/cluster: ");
+            append_u32(&mut buf, &mut pos, state.bpb.sectors_per_cluster as u32);
+            append(&mut buf, &mut pos, b"\n");
+
+            let cluster_size = state.bpb.sectors_per_cluster as u32 * state.bpb.bytes_per_sector as u32;
+            append(&mut buf, &mut pos, b"  Cluster size: ");
+            append_u32(&mut buf, &mut pos, cluster_size);
+            append(&mut buf, &mut pos, b" bytes\n");
+
+            append(&mut buf, &mut pos, b"  Total sectors: ");
+            append_u32(&mut buf, &mut pos, state.bpb.total_sectors());
+            append(&mut buf, &mut pos, b"\n");
+        } else {
+            append(&mut buf, &mut pos, b"  (not mounted)\n");
+        }
+
+        buf
     }
 
     fn handle_vfs_message(&mut self) {
