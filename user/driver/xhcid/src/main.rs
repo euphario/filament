@@ -26,9 +26,34 @@ mod xhci_bulk;
 mod block;
 mod partition;
 mod ring_proto;
-mod block_service;
+// Block info for DataPort geometry responses + USB hardware parameters
+#[derive(Clone, Copy)]
+struct BlockInfo {
+    block_size: u32,
+    block_count: u64,
+    // USB hardware parameters for xHCI communication
+    slot_id: u8,
+    bulk_in_dci: u8,
+    bulk_out_dci: u8,
+}
+
+impl BlockInfo {
+    fn empty() -> Self {
+        Self {
+            block_size: 512,
+            block_count: 0,
+            slot_id: 0,
+            bulk_in_dci: 0,
+            bulk_out_dci: 0,
+        }
+    }
+    fn is_valid(&self) -> bool {
+        self.block_count > 0 && self.slot_id > 0
+    }
+}
 
 use userlib::syscall;
+use userlib::Channel;
 use userlib::devd::{
     DevdClient, PortType, DeviceClass, DeviceInfo, DriverState,
     SpawnHandler, SpawnFilter, run_driver_loop,
@@ -51,151 +76,72 @@ use usb::transfer::{SetupPacket, Direction, build_setup_trb, build_data_trb, bui
 use usb::msc::msc;
 
 // =============================================================================
-// PCI Configuration (QEMU virt ECAM)
+// PCI Device Discovery (via pcied spawn context)
 // =============================================================================
 
-/// PCI ECAM configuration for QEMU virt machine
-mod pci {
-    /// ECAM base address (from device tree: reg = <0x40 0x10000000 ...>)
-    pub const ECAM_BASE: u64 = 0x40_1000_0000;
-
-    /// ECAM region size (256MB for 256 buses)
-    pub const ECAM_SIZE: u64 = 0x1000_0000;
-
-    /// PCI 32-bit MMIO window base (from device tree ranges)
-    /// This is where we can assign device BARs
-    pub const MMIO_BASE: u64 = 0x1000_0000;
-
-    /// PCI 32-bit MMIO window end
-    pub const MMIO_END: u64 = 0x3eff_ffff;
-
-    /// PCI config space offsets
-    pub const CFG_VENDOR_ID: usize = 0x00;
-    pub const CFG_COMMAND: usize = 0x04;
-    pub const CFG_CLASS_CODE: usize = 0x08;
-    pub const CFG_BAR0: usize = 0x10;
-    pub const CFG_BAR1: usize = 0x14;
-
-    /// PCI command register bits
-    pub const CMD_MEMORY_SPACE: u16 = 0x0002;
-    pub const CMD_BUS_MASTER: u16 = 0x0004;
-
-    /// xHCI class code: 0x0C (Serial Bus) 0x03 (USB) 0x30 (xHCI)
-    pub const XHCI_CLASS: u32 = 0x0C0330;
-
-    /// Calculate ECAM address for a device
-    #[inline]
-    pub fn ecam_addr(bus: u8, device: u8, function: u8) -> u64 {
-        ECAM_BASE + ((bus as u64) << 20) | ((device as u64) << 15) | ((function as u64) << 12)
-    }
-}
-
-/// xHCI device discovered via PCI enumeration
+/// xHCI device info from pcied
 struct XhciPciDevice {
     pub bar0: u64,
     pub bar_size: usize,
 }
 
-/// Scan PCI bus for xHCI controller
-fn find_xhci_device() -> Option<XhciPciDevice> {
-    log("[qemu-usbd] Scanning PCI bus for xHCI...");
-
-    // Map ECAM region (just first 1MB for bus 0)
-    let ecam = MmioRegion::open(pci::ECAM_BASE, 0x10_0000)?;
-
-    // Scan bus 0, devices 0-31
-    for device in 0..32u8 {
-        let offset = ((device as usize) << 15) as usize;
-
-        // Read vendor ID
-        let vendor_id = ecam.read16(offset + pci::CFG_VENDOR_ID);
-        if vendor_id == 0xFFFF || vendor_id == 0x0000 {
-            continue; // No device
+/// Get xHCI device info via spawn context
+///
+/// Flow:
+/// 1. Get spawn context from devd (port name like "pci/00:02.0:xhci")
+/// 2. Connect to that port (pcied's device port)
+/// 3. Receive device info: bar0_phys(8) + bar0_size(4) = 12 bytes
+fn get_device_from_spawn_context(devd: &mut DevdClient) -> Option<XhciPciDevice> {
+    // Step 1: Get spawn context from devd
+    let (port_name, port_len) = match devd.get_spawn_context() {
+        Ok(Some((name, len, _ptype))) => (name, len),
+        Ok(None) => {
+            log("[xhcid] No spawn context");
+            return None;
         }
+        Err(_) => {
+            log("[xhcid] Spawn context error");
+            return None;
+        }
+    };
 
-        // Read class code (offset 0x08, bits 31:8 = class/subclass/prog-if)
-        let class_reg = ecam.read32(offset + pci::CFG_CLASS_CODE);
-        let class_code = (class_reg >> 8) & 0xFFFFFF;
+    // Step 2: Connect to pcied's device port
+    let mut pcie_channel = match Channel::connect(&port_name[..port_len]) {
+        Ok(ch) => ch,
+        Err(_) => {
+            log("[xhcid] Failed to connect to device port");
+            return None;
+        }
+    };
 
-        log_val("[qemu-usbd]   Device ", device as u64);
-        log_hex("[qemu-usbd]     Vendor: ", vendor_id as u64);
-        log_hex("[qemu-usbd]     Class:  ", class_code as u64);
+    // Step 3: Receive device info from pcied
+    // recv() blocks until data arrives or peer closes
+    // Protocol: bar0_phys(8) + bar0_size(4) = 12 bytes
+    let mut buf = [0u8; 12];
+    match pcie_channel.recv(&mut buf) {
+        Ok(len) if len >= 12 => {
+            let bar0 = u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3],
+                buf[4], buf[5], buf[6], buf[7],
+            ]);
+            let bar_size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
 
-        if class_code == pci::XHCI_CLASS {
-            log("[qemu-usbd]   Found xHCI controller!");
-
-            // BAR size detection: write all 1s, read back, complement + 1
-            // Must do this BEFORE checking if BAR is assigned
-            let original = ecam.read32(offset + pci::CFG_BAR0);
-            ecam.write32(offset + pci::CFG_BAR0, 0xFFFFFFFF);
-            let size_mask = ecam.read32(offset + pci::CFG_BAR0);
-            ecam.write32(offset + pci::CFG_BAR0, original); // Restore original
-
-            let bar_size = if size_mask == 0 || size_mask == 0xFFFFFFFF {
-                0x10000 // Default 64KB
-            } else {
-                let size = !(size_mask & !0xF) + 1;
-                size as usize
-            };
-
-            log_val("[qemu-usbd]     BAR size: ", bar_size as u64);
-
-            // Read BAR0 (memory-mapped, 64-bit capable)
-            let bar0_low = ecam.read32(offset + pci::CFG_BAR0);
-            let is_64bit = (bar0_low & 0x6) == 0x4;
-
-            let mut bar0 = if is_64bit {
-                let bar0_high = ecam.read32(offset + pci::CFG_BAR0 + 4);
-                ((bar0_high as u64) << 32) | ((bar0_low & !0xF) as u64)
-            } else {
-                (bar0_low & !0xF) as u64
-            };
-
-            log_hex("[qemu-usbd]     BAR0 current: ", bar0);
-
-            // If BAR0 is unassigned (0), assign it from MMIO window
-            if bar0 == 0 {
-                log("[qemu-usbd]     BAR0 not assigned, programming...");
-
-                // Use a simple fixed address from the MMIO window
-                // In a real driver, we'd track allocations to avoid conflicts
-                let assigned_addr: u64 = pci::MMIO_BASE;
-
-                // Align to BAR size (BAR size is always power of 2)
-                let aligned_addr = (assigned_addr + (bar_size as u64 - 1)) & !(bar_size as u64 - 1);
-
-                log_hex("[qemu-usbd]     Assigning BAR0 to: ", aligned_addr);
-
-                // Write BAR0 (low 32 bits)
-                ecam.write32(offset + pci::CFG_BAR0, aligned_addr as u32);
-
-                // If 64-bit BAR, write high 32 bits
-                if is_64bit {
-                    ecam.write32(offset + pci::CFG_BAR1, (aligned_addr >> 32) as u32);
-                }
-
-                // Verify the write
-                let verify_low = ecam.read32(offset + pci::CFG_BAR0);
-                log_hex("[qemu-usbd]     BAR0 verify: ", (verify_low & !0xF) as u64);
-
-                bar0 = aligned_addr;
+            if bar0 == 0 || bar_size == 0 {
+                log("[xhcid] Invalid BAR (zero)");
+                return None;
             }
 
-            log_hex("[qemu-usbd]     BAR0 final: ", bar0);
-
-            // Enable bus mastering and memory space
-            let cmd = ecam.read16(offset + pci::CFG_COMMAND);
-            log_hex("[qemu-usbd]     CMD before: ", cmd as u64);
-            ecam.write16(offset + pci::CFG_COMMAND, cmd | pci::CMD_MEMORY_SPACE | pci::CMD_BUS_MASTER);
-            let cmd_after = ecam.read16(offset + pci::CFG_COMMAND);
-            log_hex("[qemu-usbd]     CMD after: ", cmd_after as u64);
-
-            return Some(XhciPciDevice { bar0, bar_size });
+            Some(XhciPciDevice { bar0, bar_size })
+        }
+        Ok(_) => {
+            log("[xhcid] Short device info response");
+            None
+        }
+        Err(_) => {
+            log("[xhcid] Device info recv failed");
+            None
         }
     }
-
-    log("[qemu-usbd] No xHCI controller found!");
-    None
 }
 
 // =============================================================================
@@ -315,7 +261,7 @@ struct QemuUsbDriver {
     /// Command tag counter (for MSC operations)
     cmd_tag: u32,
     /// First FAT partition info (for block service)
-    partition_info: block_service::PartitionInfo,
+    partition_info: BlockInfo,
     /// Bulk OUT ring state (persists between calls)
     bulk_out_enqueue: usize,
     bulk_out_cycle: bool,
@@ -339,7 +285,7 @@ impl QemuUsbDriver {
             xhci_size,
             devices: [None; layout::MAX_DEVICES],
             cmd_tag: 1,
-            partition_info: block_service::PartitionInfo::empty(),
+            partition_info: BlockInfo::empty(),
             bulk_out_enqueue: 0,
             bulk_out_cycle: true,
             bulk_in_enqueue: 0,
@@ -1861,19 +1807,18 @@ impl QemuUsbDriver {
             log("[qemu-usbd] No FAT partition found");
         }
 
-        // Save RAW disk info for block service
+        // Save RAW disk info for DataPort geometry responses
         // disk0: exposes the full raw disk (LBA 0 = MBR), not a partition
         // partition driver will read MBR and create part0:, part1: ports
         if partition_found {
-            self.partition_info = block_service::PartitionInfo {
-                start_lba: 0,  // Raw disk starts at LBA 0
-                block_count: raw_disk_block_count,  // Full disk size
+            self.partition_info = BlockInfo {
+                block_count: raw_disk_block_count,
                 block_size: raw_disk_block_size,
                 slot_id,
                 bulk_in_dci,
                 bulk_out_dci,
             };
-            log("[qemu-usbd] Raw disk info saved for block service (disk0:)");
+            log("[qemu-usbd] Raw disk info saved for DataPort");
         }
 
         log("[qemu-usbd] === Block stack test complete ===");
@@ -2200,13 +2145,22 @@ fn log_always(msg: &str) {
 
 #[unsafe(no_mangle)]
 fn main() {
-    log("[qemu-usbd] QEMU USB driver starting");
+    log("[xhcid] USB driver starting");
 
-    // Discover xHCI controller via PCI enumeration
-    let pci_device = match find_xhci_device() {
+    // Connect to devd first to get spawn context
+    let mut devd_client = match DevdClient::connect() {
+        Ok(c) => c,
+        Err(_) => {
+            syscall::klog(syscall::LogLevel::Error, b"[xhcid] Failed to connect to devd");
+            syscall::exit(1);
+        }
+    };
+
+    // Get xHCI controller info from pcied via spawn context
+    let pci_device = match get_device_from_spawn_context(&mut devd_client) {
         Some(dev) => dev,
         None => {
-            syscall::klog(syscall::LogLevel::Error, b"[qemu-usbd] No xHCI controller found");
+            syscall::klog(syscall::LogLevel::Error, b"[xhcid] No xHCI controller found");
             syscall::exit(1);
         }
     };
@@ -2327,60 +2281,19 @@ fn main() {
         let _ = devd_client.report_state(DriverState::Ready);
         log_always("[xhcid] ready (1 disk)");
 
-        // Also create legacy IPC port for backward compatibility during transition
-        use userlib::ipc::{Port, Mux, MuxFilter};
-
-        let port = match Port::register(b"disk0:") {
-            Ok(p) => {
-                log("[qemu-usbd] Created disk0: IPC port (legacy)");
-                p
-            }
-            Err(_) => {
-                log("[qemu-usbd] Failed to create disk0: IPC port");
-                syscall::exit(1);
-            }
-        };
-
-        // Set up mux for event-driven I/O
-        let mux = match Mux::new() {
-            Ok(m) => m,
-            Err(_) => {
-                log("[qemu-usbd] Failed to create Mux");
-                syscall::exit(1);
-            }
-        };
-
-        // Add devd channel to mux
-        if let Some(devd_handle) = devd_client.handle() {
-            let _ = mux.add(devd_handle, MuxFilter::Readable);
-        }
-
-        // Add port to mux (for new connections)
-        let _ = mux.add(port.handle(), MuxFilter::Readable);
-
-        log("[qemu-usbd] Entering block service loop");
-
-        // Track connected block clients (for legacy IPC)
-        let mut client_handle: Option<syscall::Handle> = None;
-
         // Spawn handler tracks children to prevent duplicates
         let mut spawn_handler = QemuUsbdSpawnHandler::new();
 
-        // Block info for ring protocol responses
+        // Block info for DataPort geometry responses
         let block_size = driver.partition_info.block_size;
         let block_count = driver.partition_info.block_count;
 
+        // DataPort-only main loop
         loop {
             // === Process DataPort ring requests (zero-copy) ===
-            // Check for ring requests before blocking on mux
             while let Some(sqe) = data_port.recv() {
-                log("[qemu-usbd] Ring request received");
                 match sqe.opcode {
                     io_op::READ => {
-                        log_val("[qemu-usbd]   READ lba=", sqe.lba);
-                        log_val("[qemu-usbd]   data_offset=", sqe.data_offset as u64);
-                        log_val("[qemu-usbd]   data_len=", sqe.data_len as u64);
-
                         // Calculate number of blocks
                         let count = (sqe.data_len / block_size) as u32;
                         if count == 0 {
@@ -2399,12 +2312,9 @@ fn main() {
                             sqe.data_len,
                         ) {
                             Ok(transferred) => {
-                                log_val("[qemu-usbd]   transferred=", transferred as u64);
                                 data_port.complete_ok(sqe.tag, transferred);
                             }
-                            Err(e) => {
-                                log("[qemu-usbd] Ring READ failed: ");
-                                log(e);
+                            Err(_) => {
                                 data_port.complete_error(sqe.tag, io_status::IO_ERROR);
                             }
                         }
@@ -2422,14 +2332,10 @@ fn main() {
             }
 
             // === Process DataPort sidechannel queries ===
-            // Use poll_side_request() to only consume REQUEST entries
-            // This leaves RESPONSE entries for the consumer to read
             while let Some(entry) = data_port.poll_side_request() {
-                log("[qemu-usbd] Sidechannel query received");
                 use userlib::ring::side_msg;
                 match entry.msg_type {
                     side_msg::QUERY_GEOMETRY => {
-                        log("[qemu-usbd]   QUERY_GEOMETRY");
                         let info = userlib::data_port::GeometryInfo {
                             block_size,
                             block_count,
@@ -2447,36 +2353,10 @@ fn main() {
                 }
             }
 
-            // === Brief sleep to avoid busy-looping ===
-            // Note: data_port.wait() uses shmem.wait() which doesn't support
-            // timeout properly in kernel, so use short sleep instead
-            syscall::sleep_us(1000); // 1ms poll interval
-
-            // === Process legacy IPC (non-blocking check) ===
-            // Try to accept any pending IPC connection first
-            {
-                let mut buf = [0u8; 8];
-                if let Ok(n) = syscall::read(port.handle(), &mut buf) {
-                    if n >= 4 {
-                        let ch_handle = syscall::Handle(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
-                        log("[qemu-usbd] New IPC client connected (legacy)");
-
-                        if let Some(old) = client_handle {
-                            let _ = mux.remove(old);
-                            let _ = syscall::close(old);
-                        }
-
-                        let _ = mux.add(ch_handle, MuxFilter::Readable);
-                        client_handle = Some(ch_handle);
-                    }
-                }
-            }
-
-            // Check for devd commands (MUST be before client check to always run)
+            // === Check for devd commands ===
             if let Ok(Some(cmd)) = devd_client.poll_command() {
                 match cmd {
                     userlib::devd::DevdCommand::SpawnChild { seq_id, binary, binary_len, filter } => {
-                        log("[qemu-usbd] Received SPAWN_CHILD command");
                         let binary_str = match core::str::from_utf8(&binary[..binary_len]) {
                             Ok(s) => s,
                             Err(_) => continue,
@@ -2491,69 +2371,16 @@ fn main() {
                     }
                     userlib::devd::DevdCommand::QueryInfo { seq_id } => {
                         let info = driver.format_info();
-                        // Trim trailing nulls from fixed buffer
                         let info_len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
                         let _ = devd_client.respond_info(seq_id, &info[..info_len]);
                     }
+                    // Orchestration commands not handled by xhcid
+                    _ => {}
                 }
             }
 
-            // Skip IPC client handling if no client connected
-            if client_handle.is_none() {
-                continue;
-            }
-
-            // Process IPC client request (if any)
-            let ch = client_handle.unwrap();
-            let mut req_buf = [0u8; 64];
-            let event = match syscall::read(ch, &mut req_buf) {
-                Ok(0) => {
-                    // Client disconnected
-                    let _ = mux.remove(ch);
-                    let _ = syscall::close(ch);
-                    client_handle = None;
-                    continue;
-                }
-                Ok(len) => Some(len),
-                Err(userlib::error::SysError::WouldBlock) => None,
-                Err(userlib::error::SysError::PeerClosed) => {
-                    let _ = mux.remove(ch);
-                    let _ = syscall::close(ch);
-                    client_handle = None;
-                    continue;
-                }
-                Err(_) => continue,
-            };
-
-            if let Some(len) = event {
-                if let Some((msg_type, seq_id, read_req)) = block_service::parse_request(&req_buf, len) {
-                    match msg_type {
-                        userlib::blk::msg::BLK_INFO => {
-                            block_service::send_info_response(ch, seq_id, &driver.partition_info);
-                        }
-                        userlib::blk::msg::BLK_READ => {
-                            if let Some(req) = read_req {
-                                let count = req.count.min(1) as u32;
-                                let read_len = count as usize * block_size as usize;
-                                let mut data_buf = [0u8; 512];
-
-                                match driver.read_blocks_for_service(req.lba, count, &mut data_buf) {
-                                    Ok(()) => {
-                                        block_service::send_read_response(ch, seq_id, &data_buf[..read_len]);
-                                    }
-                                    Err(_) => {
-                                        block_service::send_error_response(ch, seq_id, userlib::blk::error::IO);
-                                    }
-                                }
-                            }
-                        }
-                        userlib::blk::msg::BLK_WRITE => {
-                            block_service::send_error_response(ch, seq_id, userlib::blk::error::IO);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            // Brief sleep to avoid busy-looping (1ms poll interval)
+            syscall::sleep_us(1000);
         }
     } else {
         log_always("[xhcid] ready (no block devices)");

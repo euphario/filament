@@ -55,17 +55,44 @@ impl Channel {
         Ok(())
     }
 
-    pub fn recv(&mut self, buf: &mut [u8]) -> SysResult<usize> {
+    /// Try to receive without blocking.
+    /// Returns Ok(Some(n)) if data received, Ok(None) if no data available.
+    /// Use this after Mux tells you the channel is ready.
+    pub fn try_recv(&mut self, buf: &mut [u8]) -> SysResult<Option<usize>> {
         if self.state == ChannelState::Closed {
             return Err(SysError::ConnectionReset);
         }
         match read(self.handle, buf) {
-            Ok(n) => Ok(n),
+            Ok(n) => Ok(Some(n)),
             Err(SysError::ConnectionReset) => {
                 self.state = ChannelState::HalfClosed;
                 Err(SysError::ConnectionReset)
             }
+            Err(SysError::WouldBlock) => Ok(None), // No data yet
             Err(e) => Err(e),
+        }
+    }
+
+    /// Blocking receive - waits until data arrives or peer closes.
+    /// This is the normal recv for simple request/response patterns.
+    pub fn recv(&mut self, buf: &mut [u8]) -> SysResult<usize> {
+        if self.state == ChannelState::Closed {
+            return Err(SysError::ConnectionReset);
+        }
+
+        loop {
+            match read(self.handle, buf) {
+                Ok(n) => return Ok(n),
+                Err(SysError::ConnectionReset) => {
+                    self.state = ChannelState::HalfClosed;
+                    return Err(SysError::ConnectionReset);
+                }
+                Err(SysError::WouldBlock) => {
+                    // Wait for channel to become readable, then retry
+                    wait_one(self.handle)?;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 }

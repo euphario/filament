@@ -129,6 +129,10 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         return read_port_via_service(task_id, handle, buf_ptr, buf_len);
     }
 
+    // NOTE: Channel read is non-blocking (returns WouldBlock if no data).
+    // Use Mux to wait for data, or call wait_one() then recv().
+    // A proper blocking recv API should be added via a separate syscall flag.
+
     // For other types, get mutable ref and dispatch
     let result = object_service().with_table_mut(task_id, |table| {
         let Some(entry) = table.get_mut(handle) else {
@@ -927,6 +931,123 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
     Error::WouldBlock.to_errno()
 }
 
+/// Read from channel with blocking - waits until data arrives or peer closes
+///
+/// This is the proper blocking recv() implementation. Instead of returning WouldBlock,
+/// it subscribes to the channel, blocks the task, and waits for data.
+fn read_channel_blocking(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
+    use crate::kernel::ipc::traits::Subscriber;
+    use crate::kernel::object_service::object_service;
+
+    let slot = task::current_slot();
+    let subscriber = Subscriber {
+        task_id,
+        generation: task::Scheduler::generation_from_pid(task_id),
+    };
+
+    // Main loop - keep trying until we have data or peer closes
+    loop {
+        // Phase 1: Get channel_id and check if closed
+        let channel_id = {
+            let result = object_service().with_table(task_id, |table| {
+                let Some(entry) = table.get(handle) else {
+                    return Err(Error::BadHandle);
+                };
+                let Object::Channel(ref ch) = entry.object else {
+                    return Err(Error::BadHandle);
+                };
+                Ok(ch.channel_id())
+            });
+
+            match result {
+                Ok(Ok(id)) => id,
+                Ok(Err(e)) => return e.to_errno(),
+                Err(_) => return Error::BadHandle.to_errno(),
+            }
+        };
+
+        if channel_id == 0 {
+            return Error::PeerClosed.to_errno();
+        }
+
+        // Phase 2: Subscribe to channel events (before checking for data)
+        let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
+
+        // Phase 3: Check if channel is closed or has data
+        let is_closed = ipc::channel_is_closed(channel_id);
+        let has_messages = ipc::channel_has_messages(channel_id);
+
+        if is_closed && !has_messages {
+            // Peer closed and no remaining messages
+            return Error::PeerClosed.to_errno();
+        }
+
+        if has_messages {
+            // Try to receive the message
+            match ipc::receive(channel_id, task_id) {
+                Ok(msg) => {
+                    let payload = msg.payload_slice();
+                    let copy_len = core::cmp::min(payload.len(), buf_len);
+
+                    if uaccess::copy_to_user(buf_ptr, &payload[..copy_len]).is_err() {
+                        return Error::BadAddress.to_errno();
+                    }
+
+                    return copy_len as i64;
+                }
+                Err(ipc::IpcError::WouldBlock) => {
+                    // Race: message was consumed by another thread, continue to block
+                }
+                Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
+                    return Error::PeerClosed.to_errno();
+                }
+                Err(_) => {
+                    return Error::BadHandle.to_errno();
+                }
+            }
+        }
+
+        // Phase 4: No data available - block the task
+        let transition_ok = task::with_scheduler(|sched| {
+            let Some(task) = sched.task_mut(slot) else {
+                return false;
+            };
+
+            match task.state() {
+                task::TaskState::Running => {
+                    // Normal case - block
+                }
+                task::TaskState::Ready => {
+                    // Preempted - set back to running first
+                    if task.set_running().is_err() {
+                        return false;
+                    }
+                }
+                task::TaskState::Sleeping { .. } | task::TaskState::Waiting { .. } => {
+                    // Already blocked
+                    return true;
+                }
+                _ => {
+                    return false;
+                }
+            }
+
+            task.set_sleeping(crate::kernel::task::SleepReason::ChannelRecv).is_ok()
+        });
+
+        if !transition_ok {
+            // Failed to block - return error
+            return Error::WouldBlock.to_errno();
+        }
+
+        // Phase 5: Context switch to another task
+        // When we're woken, we'll loop back and try to receive again
+        task::with_scheduler(|sched| {
+            sched.schedule();
+        });
+    }
+}
+
 /// Read from port via service - accepts connection and allocates channel handle
 ///
 /// Must be called OUTSIDE any with_table_mut closure to avoid deadlock,
@@ -1415,7 +1536,11 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                         }
                     }
                     Object::Port(p) => {
-                        (watch.filter & filter::READABLE) != 0 && ipc::port_has_pending(p.port_id())
+                        let port_id = p.port_id();
+                        let has_pending = ipc::port_has_pending(port_id);
+                        let filter_readable = (watch.filter & filter::READABLE) != 0;
+                        let ready = filter_readable && has_pending;
+                        ready
                     }
                     Object::Timer(t) => {
                         if (watch.filter & filter::READABLE) != 0 {
@@ -1513,21 +1638,36 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 return false;
             };
 
-            // If task was preempted (Ready state), transition back to Running first.
-            // This can happen if a timer interrupt preempted us between the poll and here.
-            if *task.state() == task::TaskState::Ready {
-                if task.set_running().is_err() {
-                    crate::kerror!("mux", "set_running_failed"; task_id = task_id);
+            // Handle various states at Phase 5:
+            // - Running: normal, proceed to block
+            // - Ready: preempted, set_running first
+            // - Sleeping/Waiting: already blocked, treat as success
+            match task.state() {
+                task::TaskState::Running => {
+                    // Normal case - proceed to block below
+                }
+                task::TaskState::Ready => {
+                    // Preempted between poll and here - set back to Running
+                    if task.set_running().is_err() {
+                        crate::kerror!("mux", "set_running_failed"; task_id = task_id);
+                        return false;
+                    }
+                }
+                task::TaskState::Sleeping { .. } | task::TaskState::Waiting { .. } => {
+                    // Already blocked - treat as success
+                    return true;
+                }
+                _ => {
+                    // Terminated or invalid state
+                    crate::kerror!("mux", "unexpected_state_phase5"; task_id = task_id, state = task.state().name());
                     return false;
                 }
             }
 
-            let state_name = task.state().name();
-
             if earliest_deadline == u64::MAX {
                 let result = task.set_sleeping(crate::kernel::task::SleepReason::EventLoop);
                 if result.is_err() {
-                    crate::kerror!("mux", "sleep_failed"; task_id = task_id, state = state_name);
+                    crate::kerror!("mux", "sleep_failed"; task_id = task_id, state = task.state().name());
                 }
                 result.is_ok()
             } else {
@@ -1535,7 +1675,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     sched.note_deadline(earliest_deadline);
                     true
                 } else {
-                    crate::kerror!("mux", "wait_failed"; task_id = task_id, state = state_name);
+                    crate::kerror!("mux", "wait_failed"; task_id = task_id, state = task.state().name());
                     false
                 }
             }
@@ -1642,11 +1782,17 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             // Transition to Running via proper state machine.
             task::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
+                    // If already Running, nothing to do
+                    if *task.state() == task::TaskState::Running {
+                        return;
+                    }
                     // If Sleeping/Waiting -> wake to Ready
                     // If already Ready -> this is a no-op (logged by macro)
                     crate::transition_or_log!(task, wake);
-                    // Ready -> Running
-                    crate::transition_or_evict!(task, set_running);
+                    // Ready -> Running (only if we're Ready now)
+                    if *task.state() == task::TaskState::Ready {
+                        crate::transition_or_evict!(task, set_running);
+                    }
                 }
             });
             // Loop back to poll and return the events

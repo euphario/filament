@@ -48,6 +48,10 @@ pub enum SleepReason {
     EventLoop,
     /// Waiting for hardware IRQ (no timeout)
     Irq,
+    /// Waiting for channel message (blocking recv)
+    ChannelRecv,
+    /// Waiting for port accept (blocking accept)
+    PortAccept,
 }
 
 /// Why a task is waiting (request-response style, has deadline)
