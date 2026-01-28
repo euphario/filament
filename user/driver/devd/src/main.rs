@@ -115,7 +115,19 @@ impl AdminClients {
 // Logging
 // =============================================================================
 
+/// Enable verbose debug logging (disable for production)
+const VERBOSE: bool = false;
+
+/// Verbose debug log (no-op when VERBOSE=false)
 macro_rules! dlog {
+    ($($arg:tt)*) => {{
+        // Disabled for reduced logging noise
+        // Enable VERBOSE constant to see debug output
+    }};
+}
+
+/// Important state change log (always shown)
+macro_rules! dlog_state {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
         const PREFIX: &[u8] = b"[devd] ";
@@ -485,28 +497,21 @@ impl Devd {
     // =========================================================================
 
     pub fn init(&mut self) -> SysResult<()> {
-        syscall::klog(LogLevel::Info, b"[devd] init: creating EventLoop");
         let mut events = EventLoop::new()?;
 
-        syscall::klog(LogLevel::Info, b"[devd] init: registering port devd:");
         let port = Port::register(b"devd:")?;
-        syscall::klog(LogLevel::Info, b"[devd] init: watching port");
         events.watch(port.handle())?;
 
-        syscall::klog(LogLevel::Info, b"[devd] init: registering query port devd-query:");
         let query_port = Port::register(b"devd-query:")?;
-        syscall::klog(LogLevel::Info, b"[devd] init: watching query port");
         events.watch(query_port.handle())?;
 
         self.port = Some(port);
         self.query_port = Some(query_port);
         self.events = Some(events);
 
-        syscall::klog(LogLevel::Info, b"[devd] init: registering in internal registry");
         self.ports.register_typed(b"devd:", 0xFF, PortType::Service)?; // 0xFF = devd itself
         self.ports.register_typed(b"devd-query:", 0xFF, PortType::Service)?;
 
-        syscall::klog(LogLevel::Info, b"[devd] init: initializing services");
         self.services.init_from_defs();
 
         Ok(())
@@ -517,7 +522,6 @@ impl Devd {
     // =========================================================================
 
     fn check_pending_services(&mut self) {
-        syscall::klog(LogLevel::Info, b"[devd] check_pending_services");
         let now = Self::now_ms();
 
         // Collect indices of services to spawn
@@ -596,7 +600,7 @@ impl Devd {
             service.last_change = now;
         }
 
-        dlog!("spawned {} pid={}", binary, pid);
+        dlog_state!("spawned {} pid={}", binary, pid);
 
         // Pre-register ports this service will provide (not available yet)
         for pd in port_defs.iter().flatten() {
@@ -767,7 +771,7 @@ impl Devd {
                 }
             }
 
-            dlog!("service {} state: {:?} -> Ready", service.name(), service.state);
+            dlog_state!("service {} state: {:?} -> Ready", service.name(), service.state);
             service.state = ServiceState::Ready;
             service.last_change = now;
             service.backoff_ms = INITIAL_BACKOFF_MS;
@@ -927,7 +931,7 @@ impl Devd {
                 && registers_empty
                 && service.pid != 0
             {
-                dlog!("service {} state: Starting -> Ready (portless)", service.name());
+                dlog_state!("service {} state: Starting -> Ready (portless)", service.name());
                 service.state = ServiceState::Ready;
                 service.last_change = now;
                 service.backoff_ms = INITIAL_BACKOFF_MS;
@@ -2474,19 +2478,13 @@ static mut DEVD: Devd = Devd::new();
 fn main() -> ! {
     userlib::io::disable_stdout();
 
-    syscall::klog(LogLevel::Info, b"[devd] main() entry");
-
     let devd = unsafe { &mut DEVD };
 
-    syscall::klog(LogLevel::Info, b"[devd] calling init()");
     if let Err(e) = devd.init() {
-        derror!("devd: init failed err={:?}", e);
+        derror!("init failed err={:?}", e);
         syscall::exit(1);
     }
-    syscall::klog(LogLevel::Info, b"[devd] init() complete");
 
-    dlog!("devd: started services={}", devd.services.count());
-
-    syscall::klog(LogLevel::Info, b"[devd] entering run()");
+    dlog_state!("started services={}", devd.services.count());
     devd.run()
 }

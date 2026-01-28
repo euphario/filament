@@ -36,8 +36,9 @@ use userlib::sync::SingleThreadCell;
 // Logging - uses centralized macros from userlib
 // =============================================================================
 
+/// Verbose logging (disabled for production)
 macro_rules! vlog {
-    ($($arg:tt)*) => { userlib::klog_info!("vfsd", $($arg)*) };
+    ($($arg:tt)*) => { /* disabled */ };
 }
 
 macro_rules! verror {
@@ -899,8 +900,6 @@ static VFSD: SingleThreadCell<Vfsd> = SingleThreadCell::new();
 
 #[unsafe(no_mangle)]
 fn main() {
-    syscall::klog(LogLevel::Info, b"[vfsd] starting");
-
     VFSD.init(Vfsd::new());
 
     {

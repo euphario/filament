@@ -206,7 +206,6 @@ impl<'a> XhciBulk<'a> {
 
 impl<'a> ByteTransport for XhciBulk<'a> {
     fn send(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        userlib::syscall::debug_write(b"[xhci_bulk] send start\n");
         let len = data.len().min(self.dma_size);
 
         // Copy to DMA buffer
@@ -230,12 +229,10 @@ impl<'a> ByteTransport for XhciBulk<'a> {
 
         // Wait for completion
         self.wait_completion()?;
-        userlib::syscall::debug_write(b"[xhci_bulk] send done\n");
         Ok(())
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-        userlib::syscall::debug_write(b"[xhci_bulk] recv start\n");
         let max_len = buf.len().min(self.dma_size);
 
         // Build Normal TRB for receive
@@ -261,7 +258,6 @@ impl<'a> ByteTransport for XhciBulk<'a> {
             core::ptr::copy_nonoverlapping(self.dma_buf, buf.as_mut_ptr(), transferred);
         }
 
-        userlib::syscall::debug_write(b"[xhci_bulk] recv done\n");
         Ok(transferred)
     }
 }

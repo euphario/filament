@@ -87,10 +87,16 @@ const MAX_CLIENTS: usize = 4;
 // Logging
 // =============================================================================
 
+/// Verbose logging (disabled for production)
 macro_rules! plog {
+    ($($arg:tt)*) => { /* disabled */ };
+}
+
+/// Always log (for ready message and errors)
+macro_rules! plog_always {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        const PREFIX: &[u8] = b"[partition] ";
+        const PREFIX: &[u8] = b"[partd] ";
         let mut buf = [0u8; 128];
         buf[..PREFIX.len()].copy_from_slice(PREFIX);
         let mut pos = PREFIX.len();
@@ -1071,6 +1077,8 @@ impl PartitionDriver {
             let _ = client.report_state(DriverState::Ready);
         }
 
+        plog_always!("ready ({} partitions)", self.partition_count);
+
         // Create mux for event loop
         let mux = match Mux::new() {
             Ok(m) => m,
@@ -1269,8 +1277,6 @@ static mut DRIVER: PartitionDriver = PartitionDriver::new();
 
 #[unsafe(no_mangle)]
 fn main() {
-    syscall::klog(LogLevel::Info, b"[partition] starting");
-
     // SAFETY: Single-threaded userspace driver, no concurrent access
     let driver = unsafe { &mut *(&raw mut DRIVER) };
 

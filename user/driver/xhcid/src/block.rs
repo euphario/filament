@@ -178,18 +178,12 @@ impl<T: ScsiTransport> ScsiBlockDevice<T> {
 
         for retry in 0..10 {
             match transport.execute(&tur_cdb, None, None) {
-                Ok(0) => {
-                    userlib::syscall::debug_write(b"[ScsiBlockDevice] TUR ok\n");
-                    break;
-                }
+                Ok(0) => break,
                 Ok(_status) => {
-                    // Device not ready, try again
-                    userlib::syscall::debug_write(b"[ScsiBlockDevice] TUR retry\n");
-                    // Small delay - spin wait
+                    // Device not ready, try again with small delay
                     for _ in 0..100_000 { core::hint::spin_loop(); }
                 }
                 Err(_) => {
-                    userlib::syscall::debug_write(b"[ScsiBlockDevice] TUR error\n");
                     if retry == 9 { return None; }
                 }
             }
@@ -201,22 +195,16 @@ impl<T: ScsiTransport> ScsiBlockDevice<T> {
 
         let status = match transport.execute(&cdb, Some(&mut cap_buf), None) {
             Ok(s) => s,
-            Err(_) => {
-                userlib::syscall::debug_write(b"[ScsiBlockDevice] execute failed\n");
-                return None;
-            }
+            Err(_) => return None,
         };
 
         if status != 0 {
-            userlib::syscall::debug_write(b"[ScsiBlockDevice] SCSI status != 0\n");
             return None;
         }
 
         // Internal: parse response (big-endian)
         let last_lba = u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]);
         let block_size = u32::from_be_bytes([cap_buf[4], cap_buf[5], cap_buf[6], cap_buf[7]]);
-
-        userlib::syscall::debug_write(b"[ScsiBlockDevice] READ_CAPACITY ok\n");
 
         Some(Self {
             transport,
@@ -253,7 +241,6 @@ impl<T: ScsiTransport> BlockDevice for ScsiBlockDevice<T> {
         // Validate - all internal logic hidden
         let blocks = buf.len() / self.block_size as usize;
         if blocks == 0 || lba + blocks as u64 > self.block_count {
-            userlib::syscall::debug_write(b"[ScsiBlockDevice] read_blocks: OutOfRange\n");
             return Err(BlockError::OutOfRange);
         }
 
@@ -261,18 +248,9 @@ impl<T: ScsiTransport> BlockDevice for ScsiBlockDevice<T> {
         let cdb = Self::build_read_cdb(lba as u32, blocks as u16);
 
         match self.transport.execute(&cdb, Some(buf), None) {
-            Ok(0) => {
-                userlib::syscall::debug_write(b"[ScsiBlockDevice] read_blocks: ok\n");
-                Ok(())
-            },
-            Ok(status) => {
-                userlib::syscall::debug_write(b"[ScsiBlockDevice] read_blocks: SCSI status != 0\n");
-                Err(BlockError::Io)
-            },
-            Err(_) => {
-                userlib::syscall::debug_write(b"[ScsiBlockDevice] read_blocks: transport error\n");
-                Err(BlockError::Io)
-            },
+            Ok(0) => Ok(()),
+            Ok(_) => Err(BlockError::Io),
+            Err(_) => Err(BlockError::Io),
         }
     }
 

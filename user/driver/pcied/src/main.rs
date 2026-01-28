@@ -500,29 +500,21 @@ static mut REGISTRY: DeviceRegistry = DeviceRegistry {
 
 #[unsafe(no_mangle)]
 fn main() {
-    plog!("starting");
-
     // Detect platform
     let platform = Platform::detect();
-    match platform {
-        Platform::QemuVirt => plog!("platform: QEMU virt"),
-        Platform::Mt7988a => plog!("platform: MT7988A"),
-        Platform::Unknown => {
-            plog!("unknown platform, exiting");
-            syscall::exit(1);
-        }
+    if platform == Platform::Unknown {
+        plog!("unknown platform");
+        syscall::exit(1);
     }
 
     // Get ECAM base
     let ecam_base = match platform.ecam_base() {
         Some(base) => base,
         None => {
-            plog!("no ECAM support for this platform");
+            plog!("no ECAM support");
             syscall::exit(1);
         }
     };
-
-    plog!("ECAM base: {:#x}", ecam_base);
 
     // Map ECAM config space
     let ecam = match EcamAccess::new(ecam_base) {
@@ -534,26 +526,22 @@ fn main() {
     };
 
     // Enumerate devices
-    unsafe {
+    let device_count = unsafe {
         enumerate_ecam(&ecam, &mut REGISTRY);
-        plog!("found {} devices", REGISTRY.count);
-    }
+        REGISTRY.count
+    };
 
     // Connect to devd
     let mut devd_client = match DevdClient::connect() {
         Ok(c) => c,
         Err(_) => {
-            plog!("failed to connect to devd");
+            plog!("devd connection failed");
             syscall::exit(1);
         }
     };
 
-    plog!("connected to devd");
-
     // Register our service port
-    if let Err(_) = devd_client.register_port(b"pcie:", PortType::Service, None) {
-        plog!("failed to register pcie: port");
-    }
+    let _ = devd_client.register_port(b"pcie:", PortType::Service, None);
 
     // Enable bus mastering and register devices with devd
     unsafe {
@@ -561,23 +549,22 @@ fn main() {
             // Enable bus master for devices that need DMA
             if dev.is_xhci() || dev.is_network() {
                 enable_bus_master(&ecam, dev);
-                plog!("enabled bus master for {:02x}:{:02x}.{}",
-                    dev.bus, dev.device, dev.function);
             }
 
             // Register with devd
-            if let Err(_) = register_device(&mut devd_client, dev) {
-                plog!("failed to register device with devd");
-            }
+            let _ = register_device(&mut devd_client, dev);
         }
     }
 
     // Report ready
-    if let Err(_) = devd_client.report_state(userlib::devd::DriverState::Ready) {
-        plog!("failed to report ready state");
-    }
+    let _ = devd_client.report_state(userlib::devd::DriverState::Ready);
 
-    plog!("ready, entering service loop");
+    let platform_name = match platform {
+        Platform::QemuVirt => "QEMU",
+        Platform::Mt7988a => "MT7988A",
+        Platform::Unknown => "?",
+    };
+    plog!("ready ({}, {} devices)", platform_name, device_count);
 
     // Service loop - handle spawn commands from devd
     loop {
@@ -585,17 +572,13 @@ fn main() {
         match devd_client.poll_command() {
             Ok(Some(cmd)) => {
                 match cmd {
-                    userlib::devd::DevdCommand::SpawnChild { seq_id, binary, binary_len, .. } => {
-                        if let Ok(s) = core::str::from_utf8(&binary[..binary_len]) {
-                            plog!("received spawn command for: {}", s);
-                        }
-
+                    userlib::devd::DevdCommand::SpawnChild { seq_id, .. } => {
                         // TODO: Spawn child driver
                         // For now, just ack with failure
                         let _ = devd_client.ack_spawn(seq_id, -1, 0);
                     }
-                    userlib::devd::DevdCommand::StopChild { child_pid, .. } => {
-                        plog!("stop child: {}", child_pid);
+                    userlib::devd::DevdCommand::StopChild { .. } => {
+                        // Child stop not implemented
                     }
                     userlib::devd::DevdCommand::QueryInfo { seq_id } => {
                         let info = unsafe { REGISTRY.format_info() };

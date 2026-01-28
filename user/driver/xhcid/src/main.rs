@@ -2171,74 +2171,27 @@ impl QemuUsbDriver {
 // Logging Helpers
 // =============================================================================
 
-fn log(msg: &str) {
+/// Enable verbose logging (disable for production)
+const VERBOSE: bool = false;
+
+#[inline]
+fn log(_msg: &str) {
+    // Verbose logging disabled - use log_always() for critical messages
+}
+
+#[inline]
+fn log_hex(_prefix: &str, _val: u64) {
+    // Verbose logging disabled
+}
+
+#[inline]
+fn log_val(_prefix: &str, _val: u64) {
+    // Verbose logging disabled
+}
+
+/// Log a message that should always appear (errors, ready status)
+fn log_always(msg: &str) {
     syscall::klog(syscall::LogLevel::Info, msg.as_bytes());
-}
-
-fn log_hex(prefix: &str, val: u64) {
-    let mut buf = [0u8; 80];
-    let prefix_bytes = prefix.as_bytes();
-    let prefix_len = prefix_bytes.len().min(60);
-    buf[..prefix_len].copy_from_slice(&prefix_bytes[..prefix_len]);
-
-    let hex = b"0123456789abcdef";
-    let mut pos = prefix_len;
-
-    // Add "0x" prefix
-    if pos + 2 < buf.len() {
-        buf[pos] = b'0';
-        buf[pos + 1] = b'x';
-        pos += 2;
-    }
-
-    // Add hex digits
-    let v = val;
-    let mut started = false;
-    for shift in (0..16).rev() {
-        let digit = ((v >> (shift * 4)) & 0xF) as usize;
-        if digit != 0 || started || shift == 0 {
-            if pos < buf.len() {
-                buf[pos] = hex[digit];
-                pos += 1;
-            }
-            started = true;
-        }
-    }
-
-    syscall::klog(syscall::LogLevel::Info, &buf[..pos]);
-}
-
-fn log_val(prefix: &str, val: u64) {
-    let mut buf = [0u8; 80];
-    let prefix_bytes = prefix.as_bytes();
-    let prefix_len = prefix_bytes.len().min(60);
-    buf[..prefix_len].copy_from_slice(&prefix_bytes[..prefix_len]);
-
-    // Convert to decimal
-    let mut pos = prefix_len;
-    if val == 0 {
-        if pos < buf.len() {
-            buf[pos] = b'0';
-            pos += 1;
-        }
-    } else {
-        let mut v = val;
-        let mut digits = [0u8; 20];
-        let mut n = 0;
-        while v > 0 {
-            digits[n] = b'0' + (v % 10) as u8;
-            v /= 10;
-            n += 1;
-        }
-        for i in (0..n).rev() {
-            if pos < buf.len() {
-                buf[pos] = digits[i];
-                pos += 1;
-            }
-        }
-    }
-
-    syscall::klog(syscall::LogLevel::Info, &buf[..pos]);
 }
 
 // =============================================================================
@@ -2372,7 +2325,7 @@ fn main() {
         // Report ready state AFTER setting up DataPort
         // This triggers devd to send SPAWN_CHILD commands
         let _ = devd_client.report_state(DriverState::Ready);
-        log("[qemu-usbd] Reported ready state");
+        log_always("[xhcid] ready (1 disk)");
 
         // Also create legacy IPC port for backward compatibility during transition
         use userlib::ipc::{Port, Mux, MuxFilter};
@@ -2603,7 +2556,7 @@ fn main() {
             }
         }
     } else {
-        log("[qemu-usbd] No block devices or partitions found, exiting");
+        log_always("[xhcid] ready (no block devices)");
         syscall::exit(0);
     }
 }
