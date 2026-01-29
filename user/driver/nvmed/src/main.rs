@@ -1,20 +1,75 @@
-//! NVMe Driver for BPI-R4
+//! NVMe Driver
 //!
 //! Provides block device access to NVMe SSDs connected via PCIe.
-//! Uses shared ring buffer protocol compatible with BlockClient.
+//! Uses the bus framework for lifecycle, devd communication, and DataPort
+//! management.
+//!
+//! ## Spawning
+//!
+//! nvmed is rule-spawned by devd when pcied registers a Storage port.
+//! pcied spawns nvmed (capability delegation), nvmed gets the trigger port
+//! name from its spawn context, connects to pcied's per-device port to
+//! receive BAR0 info, then initializes hardware.
 
 #![no_std]
 #![no_main]
 
-use userlib::{uinfo, uerror, syscall};
-use userlib::syscall::{
-    Handle, WaitFilter, WaitRequest, WaitResult,
-    handle_timer_create, handle_timer_set, handle_wait,
-    handle_wrap_channel,
+use userlib::syscall::{self, LogLevel};
+use userlib::mmio::{MmioRegion, DmaPool};
+use userlib::bus::{
+    BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
+    BlockTransport, BlockPortConfig, BlockGeometry, bus_msg,
 };
-use userlib::ulog;
-use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
-use pcie::{PcieClient, PcieDeviceInfo};
+use userlib::bus_runtime::driver_main;
+use userlib::ring::{io_op, io_status, side_msg};
+use userlib::devd::PortType;
+use userlib::ipc::Channel;
+
+// =============================================================================
+// Logging
+// =============================================================================
+
+macro_rules! nlog {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        const PREFIX: &[u8] = b"[nvmed] ";
+        let mut buf = [0u8; 128];
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        let mut pos = PREFIX.len();
+        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
+        impl core::fmt::Write for W<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &byte in s.as_bytes() {
+                    if *self.p < self.b.len() { self.b[*self.p] = byte; *self.p += 1; }
+                }
+                Ok(())
+            }
+        }
+        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
+        syscall::klog(LogLevel::Info, &buf[..pos]);
+    }};
+}
+
+macro_rules! nerror {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        const PREFIX: &[u8] = b"[nvmed] ";
+        let mut buf = [0u8; 128];
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        let mut pos = PREFIX.len();
+        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
+        impl core::fmt::Write for W<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &byte in s.as_bytes() {
+                    if *self.p < self.b.len() { self.b[*self.p] = byte; *self.p += 1; }
+                }
+                Ok(())
+            }
+        }
+        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
+        syscall::klog(LogLevel::Error, &buf[..pos]);
+    }};
+}
 
 // =============================================================================
 // NVMe Register Definitions (NVMe 1.4 spec)
@@ -107,7 +162,7 @@ struct CqEntry {
 }
 
 impl CqEntry {
-    fn phase(&self) -> bool { (self.dw3 & 1) != 0 }
+    fn phase(&self) -> bool { (self.dw3 & (1 << 16)) != 0 }
     fn status(&self) -> u16 { ((self.dw3 >> 17) & 0x7FFF) as u16 }
 }
 
@@ -143,7 +198,7 @@ const IO_QUEUE_SIZE: usize = 64;
 const QUEUE_MEM_SIZE: usize = 4096 * 4;
 
 // =============================================================================
-// NVMe Controller
+// NVMe Controller (hardware access only — no IPC)
 // =============================================================================
 
 struct NvmeController {
@@ -222,7 +277,7 @@ impl NvmeController {
                 if status != 0 { return Err(status); }
                 return Ok(result);
             }
-            syscall::yield_now();
+            syscall::sleep_us(100);
         }
         Err(0xFFFF)
     }
@@ -247,7 +302,7 @@ impl NvmeController {
                 if status != 0 { return Err(status); }
                 return Ok(result);
             }
-            syscall::yield_now();
+            syscall::sleep_us(100);
         }
         Err(0xFFFF)
     }
@@ -275,7 +330,7 @@ impl NvmeController {
         let mut cmd = SqEntry::new();
         cmd.set_opcode(admin_opcode::CREATE_CQ);
         cmd.prp1 = prp;
-        cmd.cdw10 = ((size - 1) as u32) | ((qid as u32) << 16);
+        cmd.cdw10 = (qid as u32) | (((size - 1) as u32) << 16);
         cmd.cdw11 = 1;
         self.admin_cmd(&cmd)?;
         Ok(())
@@ -285,7 +340,7 @@ impl NvmeController {
         let mut cmd = SqEntry::new();
         cmd.set_opcode(admin_opcode::CREATE_SQ);
         cmd.prp1 = prp;
-        cmd.cdw10 = ((size - 1) as u32) | ((qid as u32) << 16);
+        cmd.cdw10 = (qid as u32) | (((size - 1) as u32) << 16);
         cmd.cdw11 = 1 | ((cqid as u32) << 16);
         self.admin_cmd(&cmd)?;
         Ok(())
@@ -302,6 +357,65 @@ impl NvmeController {
         self.io_cmd(&cmd)?;
         Ok(count as u32 * self.block_size)
     }
+
+    fn format_info(&self) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        let mut pos = 0;
+
+        let mut write_str = |s: &str| {
+            let bytes = s.as_bytes();
+            let len = bytes.len().min(buf.len() - pos);
+            buf[pos..pos + len].copy_from_slice(&bytes[..len]);
+            pos += len;
+        };
+
+        write_str("NVMe Storage Controller (bus framework)\n");
+        write_str("  Block size: ");
+        write_str(itoa(self.block_size as u64, &mut [0u8; 20]));
+        write_str(" bytes\n");
+        write_str("  Namespace size: ");
+        write_str(itoa(self.ns_size, &mut [0u8; 20]));
+        write_str(" blocks\n");
+
+        let capacity_mb = (self.ns_size * self.block_size as u64) / (1024 * 1024);
+        write_str("  Capacity: ");
+        write_str(itoa(capacity_mb, &mut [0u8; 20]));
+        write_str(" MB\n");
+
+        write_str("\nQueues:\n");
+        write_str("  Admin SQ tail: ");
+        write_str(itoa(self.asq_tail as u64, &mut [0u8; 20]));
+        write_str(", CQ head: ");
+        write_str(itoa(self.acq_head as u64, &mut [0u8; 20]));
+        write_str("\n");
+        write_str("  I/O SQ tail: ");
+        write_str(itoa(self.iosq_tail as u64, &mut [0u8; 20]));
+        write_str(", CQ head: ");
+        write_str(itoa(self.iocq_head as u64, &mut [0u8; 20]));
+        write_str("\n");
+
+        write_str("\nProtocol: DataPort (zero-copy via bus framework)\n");
+
+        buf
+    }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+fn itoa(mut n: u64, buf: &mut [u8]) -> &str {
+    if n == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap();
+    }
+    let mut i = buf.len();
+    while n > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    core::str::from_utf8(&buf[i..]).unwrap()
 }
 
 #[inline]
@@ -309,180 +423,38 @@ fn dsb() {
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)); }
 }
 
-fn flush_buffer(addr: u64, size: usize) {
-    let start = addr & !63;
-    let end = (addr + size as u64 + 63) & !63;
-    let mut a = start;
-    while a < end {
-        unsafe { core::arch::asm!("dc cvac, {}", in(reg) a, options(nostack, preserves_flags)); }
-        a += 64;
-    }
-    dsb();
-}
-
-fn invalidate_buffer(addr: u64, size: usize) {
-    let start = addr & !63;
-    let end = (addr + size as u64 + 63) & !63;
-    let mut a = start;
-    while a < end {
-        unsafe { core::arch::asm!("dc ivac, {}", in(reg) a, options(nostack, preserves_flags)); }
-        a += 64;
-    }
-    dsb();
-}
 
 // =============================================================================
-// Block Server (ring buffer protocol)
+// NVMe Controller Initialization (one-time, during init)
 // =============================================================================
 
-struct BlockServer {
-    ring: BlockRing,
-    client_pid: u32,
-}
-
-impl BlockServer {
-    fn try_handshake(channel: u32) -> Option<Self> {
-        let mut buf = [0u8; 64];
-
-        // Receive client's PID
-        let recv_len = syscall::receive(channel, &mut buf);
-        if recv_len < 4 {
-            return None;
-        }
-
-        let client_pid = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-
-        // Create shared ring buffer (64 entries, 1MB data buffer)
-        let ring = BlockRing::create(64, 1024 * 1024)?;
-
-        // Grant client access
-        if !ring.allow(client_pid) {
-            uerror!("nvmed", "client_ring_failed"; op = "allow", err = "grant_denied", next = "drop");
-            return None;
-        }
-
-        // Send shmem_id to client
-        let shmem_id_bytes = ring.shmem_id().to_le_bytes();
-        buf[..4].copy_from_slice(&shmem_id_bytes);
-        syscall::send(channel, &buf[..4]);
-
-        Some(Self { ring, client_pid })
-    }
-
-    fn process_requests(&mut self, ctrl: &mut NvmeController) -> u32 {
-        let mut processed = 0u32;
-
-        while let Some(req) = self.ring.next_request() {
-            let resp = self.handle_request(ctrl, &req);
-            self.ring.complete(&resp);
-            processed += 1;
-        }
-
-        if processed > 0 {
-            self.ring.notify();
-        }
-
-        processed
-    }
-
-    fn handle_request(&mut self, ctrl: &mut NvmeController, req: &BlockRequest) -> BlockResponse {
-        match req.cmd {
-            BlockRequest::CMD_INFO => {
-                BlockResponse::info(req.tag, ctrl.block_size, ctrl.ns_size)
-            }
-            BlockRequest::CMD_READ => {
-                self.handle_read(ctrl, req)
-            }
-            _ => {
-                BlockResponse::error(req.tag, -38) // ENOSYS
-            }
-        }
-    }
-
-    fn handle_read(&mut self, ctrl: &mut NvmeController, req: &BlockRequest) -> BlockResponse {
-        if req.count == 0 {
-            return BlockResponse::error(req.tag, -22);
-        }
-
-        let bytes = (req.count as u64) * (ctrl.block_size as u64);
-        let buf_offset = req.buf_offset as usize;
-
-        if buf_offset + bytes as usize > self.ring.data_size() {
-            return BlockResponse::error(req.tag, -22);
-        }
-
-        // Read directly into shared ring buffer
-        let target_phys = self.ring.data_phys() + buf_offset as u64;
-
-        match ctrl.read_blocks(req.lba, req.count as u16, target_phys) {
-            Ok(bytes_read) => BlockResponse::ok(req.tag, bytes_read),
-            Err(_) => BlockResponse::error(req.tag, -5), // EIO
-        }
-    }
-}
-
-// =============================================================================
-// Main
-// =============================================================================
-
-const MAX_CLIENTS: usize = 4;
-
-#[unsafe(no_mangle)]
-fn main() {
-    uinfo!("nvmed", "init_start");
-
-    // Step 1: Query pcied for NVMe device
-    let client = match PcieClient::connect() {
-        Some(c) => c,
+/// Initialize NVMe hardware. Returns the controller or exits on failure.
+fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
+    // Map BAR0
+    let bar0 = match MmioRegion::open(bar0_addr, bar0_size) {
+        Some(m) => m,
         None => {
-            uerror!("nvmed", "init_failed"; op = "pcie_connect", err = "no_pcied", next = "exit");
+            nerror!("bar0 map failed");
             syscall::exit(1);
         }
     };
 
-    let devices = client.find_devices(0xFFFF, 0xFFFF);
-
-    let mut nvme_dev: Option<PcieDeviceInfo> = None;
-    for info in devices.iter() {
-        let class = info.class_code >> 8;
-        if class == 0x0108 {
-            uinfo!("nvmed", "device_found"; vendor = info.vendor_id as u64, device = info.device_id as u64, bar0 = ulog::hex64(info.bar0_addr));
-            nvme_dev = Some(*info);
-            break;
-        }
-    }
-
-    let info = match nvme_dev {
-        Some(i) => i,
+    // Allocate queue memory
+    let queue_pool = match DmaPool::alloc(QUEUE_MEM_SIZE) {
+        Some(p) => p,
         None => {
-            uerror!("nvmed", "init_failed"; op = "device_scan", err = "no_nvme", next = "exit");
+            nerror!("dma alloc failed");
             syscall::exit(1);
         }
     };
 
-    // Step 2: Map BAR0 using mmap_device
-    let bar0_virt = match syscall::mmap_device(info.bar0_addr, info.bar0_size as u64) {
-        Ok(v) => v,
-        Err(e) => {
-            uerror!("nvmed", "init_failed"; op = "bar0_map", err = e, next = "exit");
-            syscall::exit(1);
-        }
-    };
-
-    // Step 3: Allocate queue memory
-    let mut queue_mem_phys: u64 = 0;
-    let queue_mem_virt = syscall::mmap_dma(QUEUE_MEM_SIZE, &mut queue_mem_phys);
-    if queue_mem_virt < 0 {
-        uerror!("nvmed", "init_failed"; op = "dma_alloc", err = queue_mem_virt as u64, next = "exit");
-        syscall::exit(1);
-    }
-    let queue_mem_virt = queue_mem_virt as u64;
+    let queue_mem_virt = queue_pool.vaddr();
+    let queue_mem_phys = queue_pool.paddr();
 
     unsafe { core::ptr::write_bytes(queue_mem_virt as *mut u8, 0, QUEUE_MEM_SIZE); }
-    flush_buffer(queue_mem_virt, QUEUE_MEM_SIZE);
 
     let mut ctrl = NvmeController {
-        bar0: bar0_virt,
+        bar0: bar0.virt_base(),
         doorbell_stride: 4,
         queue_mem_phys,
         queue_mem_virt,
@@ -497,10 +469,9 @@ fn main() {
         block_size: 512,
     };
 
-    // Step 4: Read capabilities and initialize
-    let cap = ctrl.read64(regs::CAP);
-    let _mqes = (cap & cap::MQES_MASK) as u32 + 1;
-    let dstrd = ((cap & cap::DSTRD_MASK) >> cap::DSTRD_SHIFT) as u32;
+    // Read capabilities
+    let cap_val = ctrl.read64(regs::CAP);
+    let dstrd = ((cap_val & cap::DSTRD_MASK) >> cap::DSTRD_SHIFT) as u32;
     ctrl.doorbell_stride = 4 << dstrd;
     let _vs = ctrl.read32(regs::VS);
 
@@ -508,56 +479,60 @@ fn main() {
     ctrl.write32(regs::CC, 0);
     for _ in 0..1000 {
         if (ctrl.read32(regs::CSTS) & csts::RDY) == 0 { break; }
-        syscall::yield_now();
+        syscall::sleep_ms(1);
     }
 
-    // Configure Admin queues
+    // Configure admin queues
     let aqa = ((ADMIN_QUEUE_SIZE as u32 - 1) << 16) | (ADMIN_QUEUE_SIZE as u32 - 1);
     ctrl.write32(regs::AQA, aqa);
     ctrl.write64(regs::ASQ, queue_mem_phys);
     ctrl.write64(regs::ACQ, queue_mem_phys + 4096);
 
     // Enable controller
-    let cc = cc::EN | cc::CSS_NVM | cc::AMS_RR | (6 << cc::IOSQES_SHIFT) | (4 << cc::IOCQES_SHIFT);
-    ctrl.write32(regs::CC, cc);
+    let cc_val = cc::EN | cc::CSS_NVM | cc::AMS_RR
+        | (6 << cc::IOSQES_SHIFT) | (4 << cc::IOCQES_SHIFT);
+    ctrl.write32(regs::CC, cc_val);
+    let mut rdy = false;
     for _ in 0..1000 {
-        let csts = ctrl.read32(regs::CSTS);
-        if (csts & csts::RDY) != 0 { break; }
-        if (csts & csts::CFS) != 0 {
-            uerror!("nvmed", "init_failed"; op = "ctrl_enable", err = "cfs", next = "exit");
+        let csts_val = ctrl.read32(regs::CSTS);
+        if (csts_val & csts::RDY) != 0 { rdy = true; break; }
+        if (csts_val & csts::CFS) != 0 {
+            nerror!("controller fatal status");
             syscall::exit(1);
         }
-        syscall::yield_now();
+        syscall::sleep_ms(1);
     }
-
-    // Allocate identify buffer
-    let mut id_buf_phys: u64 = 0;
-    let id_buf_virt = syscall::mmap_dma(4096, &mut id_buf_phys);
-    if id_buf_virt < 0 {
-        uerror!("nvmed", "init_failed"; op = "id_buf_alloc", err = id_buf_virt as u64, next = "exit");
+    if !rdy {
+        nerror!("controller enable timeout");
         syscall::exit(1);
     }
-    let id_buf_virt = id_buf_virt as u64;
+
+    // Identify buffer
+    let id_pool = match DmaPool::alloc(4096) {
+        Some(p) => p,
+        None => {
+            nerror!("identify buffer alloc failed");
+            syscall::exit(1);
+        }
+    };
+    let id_buf_virt = id_pool.vaddr();
+    let id_buf_phys = id_pool.paddr();
 
     // Identify controller
-    invalidate_buffer(id_buf_virt, 4096);
     match ctrl.identify_controller(id_buf_phys) {
         Ok(_) => {
-            invalidate_buffer(id_buf_virt, 4096);
             let id_ctrl = unsafe { &*(id_buf_virt as *const IdentifyController) };
-            uinfo!("nvmed", "controller_id"; vendor = id_ctrl.vid as u64);
+            nlog!("controller vendor={:#x}", id_ctrl.vid);
         }
         Err(e) => {
-            uerror!("nvmed", "init_failed"; op = "identify_ctrl", err = e as u64, next = "exit");
+            nerror!("identify_ctrl err={}", e);
             syscall::exit(1);
         }
     }
 
     // Identify namespace 1
-    invalidate_buffer(id_buf_virt, 4096);
     match ctrl.identify_namespace(1, id_buf_phys) {
         Ok(_) => {
-            invalidate_buffer(id_buf_virt, 4096);
             let id_ns = unsafe { &*(id_buf_virt as *const IdentifyNamespace) };
             ctrl.ns_size = id_ns.nsze;
             let lbaf = id_ns.lbaf0;
@@ -565,110 +540,288 @@ fn main() {
             ctrl.block_size = 1 << lba_ds;
         }
         Err(e) => {
-            uerror!("nvmed", "init_failed"; op = "identify_ns", err = e as u64, next = "exit");
+            nerror!("identify_ns err={}", e);
             syscall::exit(1);
         }
     }
 
     // Create I/O queues
-    match ctrl.create_iocq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 12288) {
-        Ok(_) => {}
-        Err(e) => {
-            uerror!("nvmed", "init_failed"; op = "create_iocq", err = e as u64, next = "exit");
-            syscall::exit(1);
-        }
-    }
-
-    match ctrl.create_iosq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 8192, 1) {
-        Ok(_) => {}
-        Err(e) => {
-            uerror!("nvmed", "init_failed"; op = "create_iosq", err = e as u64, next = "exit");
-            syscall::exit(1);
-        }
-    }
-
-    uinfo!("nvmed", "controller_ready"; namespaces = 1u64, blocks = ctrl.ns_size, block_size = ctrl.block_size as u64);
-
-    // Register as block device
-    let port = syscall::port_register(b"nvme");
-    if port < 0 {
-        uerror!("nvmed", "init_failed"; op = "port_register", err = port as u64, next = "exit");
+    if let Err(e) = ctrl.create_iocq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 12288) {
+        nerror!("create_iocq err={}", e);
         syscall::exit(1);
     }
-    let port_id = port as u32;
-
-    // Create timer handle for polling (Handle API)
-    // 1ms polling interval for ring buffer requests
-    const POLL_INTERVAL_NS: u64 = 1_000_000; // 1ms
-    let timer_handle = match handle_timer_create() {
-        Ok(h) => h,
-        Err(_) => {
-            uerror!("nvmed", "init_failed"; op = "timer_create", err = 0u64, next = "exit");
-            syscall::exit(1);
-        }
-    };
-
-    // Set timer as recurring
-    if handle_timer_set(timer_handle, POLL_INTERVAL_NS, POLL_INTERVAL_NS).is_err() {
-        uerror!("nvmed", "init_failed"; op = "timer_set", err = 0u64, next = "exit");
+    if let Err(e) = ctrl.create_iosq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 8192, 1) {
+        nerror!("create_iosq err={}", e);
         syscall::exit(1);
     }
 
-    // Wrap the listen channel as a handle (Handle API)
-    let port_handle = match handle_wrap_channel(port_id) {
-        Ok(h) => h,
-        Err(_) => {
-            uerror!("nvmed", "init_failed"; op = "port_wrap", err = 0u64, next = "exit");
-            syscall::exit(1);
+    nlog!("controller_ready blocks={} bs={}", ctrl.ns_size, ctrl.block_size);
+    ctrl
+}
+
+// =============================================================================
+// NVMe Driver (Bus Framework)
+// =============================================================================
+
+struct NvmeDriver {
+    ctrl: Option<NvmeController>,
+    port_id: Option<PortId>,
+}
+
+impl NvmeDriver {
+    const fn new() -> Self {
+        Self {
+            ctrl: None,
+            port_id: None,
         }
-    };
+    }
 
-    uinfo!("nvmed", "ready");
-
-    // Client management
-    let mut clients: [Option<BlockServer>; MAX_CLIENTS] = [None, None, None, None];
-
-    // Event-driven main loop (Handle API)
-    let requests = [
-        WaitRequest::new(timer_handle, WaitFilter::Timer),
-        WaitRequest::new(port_handle, WaitFilter::Readable),
-    ];
-    let mut results = [WaitResult::empty(); 2];
-
-    loop {
-        // Wait for timer or client connection (blocking)
-        let count = match handle_wait(&requests, &mut results, u64::MAX) {
-            Ok(n) => n,
-            Err(_) => {
-                syscall::yield_now();
-                continue;
-            }
+    fn process_ring_requests(&mut self, ctx: &mut dyn BusCtx) {
+        let port_id = match self.port_id {
+            Some(id) => id,
+            None => return,
+        };
+        let ctrl = match &mut self.ctrl {
+            Some(c) => c,
+            None => return,
         };
 
-        // Process each ready handle
-        for result in &results[..count] {
-            if result.handle.raw() == timer_handle.raw() {
-                // Timer fired - process ring buffer requests from all clients
-                for client in clients.iter_mut().flatten() {
-                    client.process_requests(&mut ctrl);
+        // Collect pending SQ requests
+        let mut requests: [Option<userlib::ring::IoSqe>; 8] = [None; 8];
+        let mut req_count = 0;
+
+        if let Some(port) = ctx.block_port(port_id) {
+            while req_count < 8 {
+                if let Some(sqe) = port.recv_request() {
+                    requests[req_count] = Some(sqe);
+                    req_count += 1;
+                } else {
+                    break;
                 }
-            } else if result.handle.raw() == port_handle.raw() {
-                // New client connection ready
-                let new_channel = syscall::port_accept(port_id);
-                if new_channel >= 0 {
-                    if let Some(server) = BlockServer::try_handshake(new_channel as u32) {
-                        uinfo!("nvmed", "client_connected"; pid = server.client_pid as u64);
-                        // Find empty slot
-                        for slot in clients.iter_mut() {
-                            if slot.is_none() {
-                                *slot = Some(server);
-                                break;
+            }
+        }
+
+        // Process each request
+        for i in 0..req_count {
+            if let Some(sqe) = requests[i].take() {
+                match sqe.opcode {
+                    io_op::READ => {
+                        let count = (sqe.data_len / ctrl.block_size) as u16;
+                        if count == 0 {
+                            if let Some(port) = ctx.block_port(port_id) {
+                                port.complete_error(sqe.tag, io_status::INVALID);
+                                port.notify();
+                            }
+                            continue;
+                        }
+
+                        // Calculate physical address in pool
+                        let target_phys = if let Some(port) = ctx.block_port(port_id) {
+                            port.pool_phys() + sqe.data_offset as u64
+                        } else {
+                            continue;
+                        };
+
+                        // Read directly to pool memory (zero-copy DMA)
+                        match ctrl.read_blocks(sqe.lba, count, target_phys) {
+                            Ok(transferred) => {
+                                if let Some(port) = ctx.block_port(port_id) {
+                                    port.complete_ok(sqe.tag, transferred);
+                                    port.notify();
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(port) = ctx.block_port(port_id) {
+                                    port.complete_error(sqe.tag, io_status::IO_ERROR);
+                                    port.notify();
+                                }
                             }
                         }
                     }
-                    syscall::close(new_channel as u32);
+                    io_op::WRITE => {
+                        if let Some(port) = ctx.block_port(port_id) {
+                            port.complete_error(sqe.tag, io_status::INVALID);
+                            port.notify();
+                        }
+                    }
+                    _ => {
+                        if let Some(port) = ctx.block_port(port_id) {
+                            port.complete_error(sqe.tag, io_status::INVALID);
+                            port.notify();
+                        }
+                    }
                 }
             }
         }
+
+        // Process sidechannel queries (geometry, etc.)
+        let mut queries: [Option<userlib::ring::SideEntry>; 4] = [None; 4];
+        let mut query_count = 0;
+
+        if let Some(port) = ctx.block_port(port_id) {
+            while query_count < 4 {
+                if let Some(entry) = port.poll_side_request() {
+                    queries[query_count] = Some(entry);
+                    query_count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for i in 0..query_count {
+            if let Some(entry) = queries[i].take() {
+                match entry.msg_type {
+                    side_msg::QUERY_GEOMETRY => {
+                        let info = BlockGeometry {
+                            block_size: ctrl.block_size,
+                            block_count: ctrl.ns_size,
+                            max_transfer: 64 * 1024,
+                        };
+                        if let Some(port) = ctx.block_port(port_id) {
+                            port.respond_geometry(&entry, &info);
+                            port.notify();
+                        }
+                    }
+                    _ => {
+                        if let Some(port) = ctx.block_port(port_id) {
+                            port.notify();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Driver Trait Implementation
+// =============================================================================
+
+impl Driver for NvmeDriver {
+    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        nlog!("starting");
+
+        // Get spawn context — the port name that triggered our spawn
+        // (e.g., "pci/00:02.0:nvme" registered by pcied)
+        let spawn_ctx = ctx.spawn_context().map_err(|e| {
+            nerror!("no spawn context — must be rule-spawned ({:?})", e);
+            e
+        })?;
+
+        let mut port_name_buf = [0u8; 64];
+        let port_name_len = spawn_ctx.port_name().len();
+        port_name_buf[..port_name_len].copy_from_slice(spawn_ctx.port_name());
+        let port_name = &port_name_buf[..port_name_len];
+
+        // Connect to pcied's per-device port to receive BAR0 info
+        let mut channel = match Channel::connect(port_name) {
+            Ok(ch) => ch,
+            Err(_) => {
+                nerror!("failed to connect to parent port");
+                return Err(BusError::LinkDown);
+            }
+        };
+
+        // Read device info from pcied: [bar0_addr: u64, bar0_size: u32]
+        // Use blocking recv() — pcied sends info after accepting the connection,
+        // which may happen after we connect (different process scheduling).
+        let mut info_buf = [0u8; 12];
+        match channel.recv(&mut info_buf) {
+            Ok(12) => {}
+            Ok(n) => {
+                nerror!("device info wrong size: got {} expected 12", n);
+                return Err(BusError::Internal);
+            }
+            Err(e) => {
+                nerror!("failed to read device info from parent: {:?}", e);
+                return Err(BusError::Internal);
+            }
+        }
+
+        let bar0_addr = u64::from_le_bytes([
+            info_buf[0], info_buf[1], info_buf[2], info_buf[3],
+            info_buf[4], info_buf[5], info_buf[6], info_buf[7],
+        ]);
+        let bar0_size = u32::from_le_bytes([
+            info_buf[8], info_buf[9], info_buf[10], info_buf[11],
+        ]) as u64;
+
+        nlog!("device_found bar0={:#x} size={:#x}", bar0_addr, bar0_size);
+
+        // Initialize NVMe hardware
+        let ctrl = init_nvme_hardware(bar0_addr, bar0_size);
+
+        let block_size = ctrl.block_size;
+        let block_count = ctrl.ns_size;
+        self.ctrl = Some(ctrl);
+
+        // Create block DataPort via framework
+        let config = BlockPortConfig {
+            ring_size: 64,
+            side_size: 8,
+            pool_size: 256 * 1024,
+        };
+
+        let port_id = ctx.create_block_port(config)?;
+        if let Some(port) = ctx.block_port(port_id) {
+            port.set_public();
+        }
+        self.port_id = Some(port_id);
+
+        // Register block port with devd
+        let _ = ctx.register_port(b"nvme0:", PortType::Block, None);
+
+        nlog!("ready blocks={} bs={}", block_count, block_size);
+
+        Ok(())
+    }
+
+    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
+        match msg.msg_type {
+            bus_msg::QUERY_INFO => {
+                if let Some(ref ctrl) = self.ctrl {
+                    let info = ctrl.format_info();
+                    let len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
+                    let _ = ctx.respond_info(msg.seq_id, &info[..len]);
+                }
+                Disposition::Handled
+            }
+            _ => Disposition::Forward,
+        }
+    }
+
+    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
+        if self.port_id == Some(port) {
+            self.process_ring_requests(ctx);
+        }
+    }
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+static mut DRIVER: NvmeDriver = NvmeDriver::new();
+
+#[unsafe(no_mangle)]
+fn main() {
+    let driver = unsafe { &mut *(&raw mut DRIVER) };
+    driver_main(b"nvmed", NvmeDriverWrapper(driver));
+}
+
+struct NvmeDriverWrapper(&'static mut NvmeDriver);
+
+impl Driver for NvmeDriverWrapper {
+    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.init(ctx)
+    }
+
+    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
+        self.0.command(msg, ctx)
+    }
+
+    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
+        self.0.data_ready(port, ctx)
     }
 }
