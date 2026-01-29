@@ -657,12 +657,11 @@ impl<D: Driver> DriverRuntime<D> {
             };
 
             if tag == TAG_DEVD {
-                // Devd channel is readable — drain all pending commands
-                loop {
-                    match self.ctx.devd.poll_command() {
-                        Ok(Some(cmd)) => self.dispatch_devd_command(cmd),
-                        Ok(None) | Err(_) => break,
-                    }
+                // Devd channel is readable — process one command per wake
+                // (Mux fires again if more data is pending on the channel)
+                match self.ctx.devd.poll_command() {
+                    Ok(Some(cmd)) => self.dispatch_devd_command(cmd),
+                    Ok(None) | Err(_) => {}
                 }
             } else if tag >= TAG_KERNEL_BUS_BASE && tag < TAG_BLOCK_PORT_BASE {
                 // Kernel bus state notification
