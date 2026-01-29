@@ -138,6 +138,12 @@ pub struct ServiceDef {
     pub auto_restart: bool,
     /// Parent service (None = direct child of devd)
     pub parent: Option<&'static str>,
+    /// Port name for spawn context (empty = no context)
+    pub context_port: &'static [u8],
+    /// PortType of the context port
+    pub context_port_type: u8,
+    /// Capability bits (0 = inherit parent's caps unchanged)
+    pub caps: u64,
 }
 
 // Port type constants for SERVICE_DEFS
@@ -155,6 +161,9 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         dependencies: &[],  // devd: is implicit
         auto_restart: true,
         parent: None,
+        context_port: b"",
+        context_port_type: 0,
+        caps: 0,  // inherit parent's caps
     },
     ServiceDef {
         binary: "vfsd",
@@ -162,6 +171,9 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
         auto_restart: true,
         parent: None,
+        context_port: b"",
+        context_port_type: 0,
+        caps: 0,
     },
     ServiceDef {
         binary: "shell",
@@ -169,6 +181,9 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         dependencies: &[Dependency::Requires(b"console:")],  // Wait for consoled
         auto_restart: true,
         parent: None,
+        context_port: b"",
+        context_port_type: 0,
+        caps: 0,
     },
     // PCIe bus driver - enumerates PCI devices and registers them with devd
     ServiceDef {
@@ -177,15 +192,26 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         dependencies: &[],  // No dependencies - spawns immediately
         auto_restart: false,
         parent: None,
+        context_port: b"/kernel/bus/pcie0",
+        context_port_type: pt::SERVICE,
+        caps: userlib::devd::caps::DRIVER,
     },
-    // xHCI USB host controller driver
-    ServiceDef {
-        binary: "xhcid",
-        registers: &[],  // Registers disk0: dynamically
-        dependencies: &[],  // No dependencies - spawns immediately
-        auto_restart: false,  // Don't restart on failure during testing
-        parent: None,
-    },
+    // xHCI USB host controller driver - DISABLED (does its own ECAM, bypasses pcied)
+    // ServiceDef {
+    //     binary: "xhcid",
+    //     registers: &[],  // Registers disk0: dynamically
+    //     dependencies: &[],  // No dependencies - spawns immediately
+    //     auto_restart: false,  // Don't restart on failure during testing
+    //     parent: None,
+    // },
+    // NVMe storage controller driver — now rule-spawned (Storage → nvmed)
+    // ServiceDef {
+    //     binary: "nvmed",
+    //     registers: &[],
+    //     dependencies: &[Dependency::Requires(b"pcie:")],
+    //     auto_restart: false,
+    //     parent: None,
+    // },
 ];
 
 // =============================================================================

@@ -34,6 +34,11 @@ mod rules;
 use userlib::syscall::{self, LogLevel};
 use userlib::ipc::{Port, Timer, EventLoop, ObjHandle, Channel};
 use userlib::error::{SysError, SysResult};
+use userlib::query::{
+    AttachDisk, ReportPartitions, RegisterPartitionMsg, PartitionReadyMsg,
+    MountPartitionMsg, MountReadyMsg, PartitionInfoMsg,
+    QueryHeader, msg, fs_hint, part_scheme,
+};
 
 use service::{
     ServiceState, ServiceManager, ServiceRegistry, PortDef,
@@ -244,6 +249,180 @@ impl InflightSpawn {
 
 /// Maximum pending info queries
 const MAX_PENDING_INFO_QUERIES: usize = 8;
+
+// =============================================================================
+// Orchestration State Machines (for block device stack)
+// =============================================================================
+
+/// Maximum number of tracked disks
+const MAX_TRACKED_DISKS: usize = 8;
+
+/// Maximum number of tracked partitions per disk
+const MAX_PARTITIONS_PER_DISK: usize = 8;
+
+/// Disk lifecycle state machine
+///
+/// State transitions:
+///   Empty -> Discovered: Block port registered with shmem_id
+///   Discovered -> AttachSent: AttachDisk sent to partd
+///   AttachSent -> PartitionsReported: ReportPartitions received
+///   PartitionsReported -> Ready: All partitions processed
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiskState {
+    /// Slot is empty
+    Empty,
+    /// Disk discovered, tracking started
+    Discovered,
+    /// AttachDisk sent to partd, waiting for response
+    AttachSent { seq_id: u32 },
+    /// ReportPartitions received, processing partitions
+    PartitionsReported,
+    /// All partitions processed
+    Ready,
+}
+
+/// Partition lifecycle state machine
+///
+/// State transitions:
+///   Empty -> Discovered: Reported by partd in ReportPartitions
+///   Discovered -> Registering: RegisterPartition sent to partd
+///   Registering -> Ready: PartitionReady received
+///   Ready -> MountSent: MountPartition sent to filesystem driver
+///   MountSent -> Mounted: MountReady received
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PartitionState {
+    /// Slot is empty
+    Empty,
+    /// Partition discovered (from ReportPartitions)
+    Discovered,
+    /// RegisterPartition sent, waiting for PartitionReady
+    Registering { seq_id: u32 },
+    /// DataPort ready, can be mounted
+    Ready { shmem_id: u32 },
+    /// MountPartition sent, waiting for MountReady
+    MountSent { shmem_id: u32, seq_id: u32 },
+    /// Successfully mounted
+    Mounted { shmem_id: u32, mount_point: [u8; 64], mount_len: u8 },
+}
+
+/// Information about a tracked disk (from Block port registration)
+#[derive(Clone, Copy)]
+struct TrackedDisk {
+    /// Current state in lifecycle
+    state: DiskState,
+    /// shmem_id of the DataPort
+    shmem_id: u32,
+    /// Block size in bytes
+    block_size: u32,
+    /// Total block count
+    block_count: u64,
+    /// Port name (e.g., "disk0:")
+    port_name: [u8; 32],
+    /// Length of port name
+    port_name_len: u8,
+    /// Owner service index
+    owner_idx: u8,
+    /// Number of partitions discovered
+    partition_count: u8,
+    /// Partition scheme (0=MBR, 1=GPT)
+    scheme: u8,
+    /// Partition info (filled by REPORT_PARTITIONS)
+    partitions: [TrackedPartition; MAX_PARTITIONS_PER_DISK],
+}
+
+impl TrackedDisk {
+    const fn empty() -> Self {
+        Self {
+            state: DiskState::Empty,
+            shmem_id: 0,
+            block_size: 0,
+            block_count: 0,
+            port_name: [0u8; 32],
+            port_name_len: 0,
+            owner_idx: 0,
+            partition_count: 0,
+            scheme: 0,
+            partitions: [const { TrackedPartition::empty() }; MAX_PARTITIONS_PER_DISK],
+        }
+    }
+
+    /// Transition to a new state (validates transition is legal)
+    fn transition(&mut self, new_state: DiskState) -> bool {
+        let valid = match (&self.state, &new_state) {
+            (DiskState::Empty, DiskState::Discovered) => true,
+            (DiskState::Discovered, DiskState::AttachSent { .. }) => true,
+            (DiskState::AttachSent { .. }, DiskState::PartitionsReported) => true,
+            (DiskState::PartitionsReported, DiskState::Ready) => true,
+            _ => false,
+        };
+        if valid {
+            self.state = new_state;
+        }
+        valid
+    }
+}
+
+/// Information about a partition (from REPORT_PARTITIONS)
+#[derive(Clone, Copy)]
+struct TrackedPartition {
+    /// Current state in lifecycle
+    state: PartitionState,
+    /// Partition index (from disk's partition table)
+    index: u8,
+    /// MBR partition type
+    part_type: u8,
+    /// Is bootable?
+    bootable: bool,
+    /// Start LBA
+    start_lba: u64,
+    /// Size in sectors
+    size_sectors: u64,
+    /// Assigned port name (e.g., "part0:")
+    assigned_name: [u8; 32],
+    /// Length of assigned name
+    assigned_name_len: u8,
+}
+
+impl TrackedPartition {
+    const fn empty() -> Self {
+        Self {
+            state: PartitionState::Empty,
+            index: 0,
+            part_type: 0,
+            bootable: false,
+            start_lba: 0,
+            size_sectors: 0,
+            assigned_name: [0u8; 32],
+            assigned_name_len: 0,
+        }
+    }
+
+    /// Transition to a new state (validates transition is legal)
+    fn transition(&mut self, new_state: PartitionState) -> bool {
+        let valid = match (&self.state, &new_state) {
+            (PartitionState::Empty, PartitionState::Discovered) => true,
+            (PartitionState::Discovered, PartitionState::Registering { .. }) => true,
+            (PartitionState::Registering { .. }, PartitionState::Ready { .. }) => true,
+            (PartitionState::Ready { .. }, PartitionState::MountSent { .. }) => true,
+            (PartitionState::MountSent { .. }, PartitionState::Mounted { .. }) => true,
+            _ => false,
+        };
+        if valid {
+            self.state = new_state;
+        }
+        valid
+    }
+
+    /// Get shmem_id if partition is Ready or later
+    fn shmem_id(&self) -> Option<u32> {
+        match self.state {
+            PartitionState::Ready { shmem_id } => Some(shmem_id),
+            PartitionState::MountSent { shmem_id, .. } => Some(shmem_id),
+            PartitionState::Mounted { shmem_id, .. } => Some(shmem_id),
+            _ => None,
+        }
+    }
+}
 
 /// A pending service info query waiting for driver response
 #[derive(Clone, Copy)]
@@ -457,6 +636,19 @@ pub struct Devd {
     log_buffer: LogBuffer,
     /// Whether live logging is enabled (print to console as received)
     live_logging: bool,
+    // =========================================================================
+    // Orchestration State (state machines track pending operations)
+    // =========================================================================
+    /// Tracked disks - each disk has its own DiskState state machine
+    tracked_disks: [TrackedDisk; MAX_TRACKED_DISKS],
+    /// Next partition name counter (part0, part1, ...)
+    next_partition_num: u32,
+    /// Service index for partd (0xFF = not known yet)
+    partd_service_idx: u8,
+    /// Service index for fatfsd (0xFF = not known yet)
+    fatfsd_service_idx: u8,
+    /// Orchestration sequence ID counter
+    orch_seq_id: u32,
 }
 
 impl Devd {
@@ -481,6 +673,12 @@ impl Devd {
             next_forward_seq_id: 1,
             log_buffer: LogBuffer::new(),
             live_logging: false, // Off during boot, enable after all services ready
+            // Orchestration state (disk/partition state machines)
+            tracked_disks: [const { TrackedDisk::empty() }; MAX_TRACKED_DISKS],
+            next_partition_num: 0,
+            partd_service_idx: 0xFF,
+            fatfsd_service_idx: 0xFF,
+            orch_seq_id: 1,
         }
     }
 
@@ -504,6 +702,7 @@ impl Devd {
 
         let query_port = Port::register(b"devd-query:")?;
         events.watch(query_port.handle())?;
+        dlog_state!("query_port handle={}", query_port.handle().raw());
 
         self.port = Some(port);
         self.query_port = Some(query_port);
@@ -554,14 +753,14 @@ impl Devd {
             return;
         }
 
-        // Get binary name
-        let binary = match self.services.get(idx).and_then(|s| s.def()) {
-            Some(d) => d.binary,
+        // Get service definition
+        let (binary, context_port, context_port_type, caps) = match self.services.get(idx).and_then(|s| s.def()) {
+            Some(d) => (d.binary, d.context_port, d.context_port_type, d.caps),
             None => return,
         };
 
-        // Spawn the process
-        let (pid, watcher) = match self.process_mgr.spawn(binary) {
+        // Spawn the process (with caps if specified)
+        let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
             Ok(result) => result,
             Err(e) => {
                 derror!("spawn {} failed err={:?}", binary, e);
@@ -569,6 +768,11 @@ impl Devd {
                 return;
             }
         };
+
+        // Store spawn context so child can query GET_SPAWN_CONTEXT
+        if !context_port.is_empty() {
+            self.store_spawn_context(pid, context_port_type, context_port);
+        }
 
         // Add watcher to event loop
         if let Some(events) = &mut self.events {
@@ -1187,6 +1391,7 @@ impl Devd {
 
         match query_port.accept_with_pid() {
             Ok((channel, client_pid)) => {
+                dlog_state!("query accept: pid={}", client_pid);
                 // Check if this is a known service (driver)
                 // First try the normal service registry lookup for Ready services
                 let mut service_idx = self.services.find_by_pid(client_pid)
@@ -1197,18 +1402,19 @@ impl Devd {
                     })
                     .map(|i| i as u8);
 
-                // Also check for Starting services - connecting to query port means
-                // the service is ready to communicate, so transition to Ready
+                // Also check for Starting services - they can connect to register
+                // ports before reporting Ready. Don't auto-transition; wait for
+                // explicit STATE_CHANGE(Ready) from the driver.
                 if service_idx.is_none() {
                     if let Some(idx) = self.services.find_by_pid(client_pid) {
                         let is_starting = self.services.get(idx)
                             .map(|s| s.state == ServiceState::Starting)
                             .unwrap_or(false);
                         if is_starting {
-                            // Transition to Ready and recognize as a driver
-                            self.handle_service_ready(idx);
+                            // Recognize as driver but keep in Starting state
+                            // Driver must send STATE_CHANGE(Ready) when actually ready
                             service_idx = Some(idx as u8);
-                            dlog!("query: service {} transitioned Starting -> Ready via query port",
+                            dlog!("query: service {} connected (still Starting)",
                                 self.services.get(idx).map(|s| s.name()).unwrap_or("?"));
                         }
                     }
@@ -1224,7 +1430,6 @@ impl Devd {
                         service_idx = Some(idx);
                         // Don't remove yet - keep tracking until slot is fully set up
                         // The entry will be cleaned up on next lookup or service exit
-                        dlog!("query: found pid={} in recent_dynamic_pids idx={}", client_pid, idx);
                     }
                 }
 
@@ -1239,6 +1444,13 @@ impl Devd {
                         let client_type = if service_idx.is_some() { "driver" } else { "client" };
                         dlog!("query: {} connected (slot={}, pid={}, svc_idx={:?})",
                             client_type, slot, client_pid, service_idx);
+
+                        // Check if this is partd or fatfsd for orchestration
+                        if let Some(idx) = service_idx {
+                            dlog_state!("check_orchestration for svc={}", idx);
+                            self.check_orchestration_driver_connected(idx);
+                            dlog_state!("check_orchestration done");
+                        }
                     }
                     None => {
                         derror!("query: too many clients, rejecting pid={}", client_pid);
@@ -1331,6 +1543,16 @@ impl Devd {
                     Some(msg::LOG_CONTROL) => {
                         // Control logging (on/off)
                         self.handle_log_control(slot, &recv_buf[..len]);
+                    }
+                    // Orchestration messages from partd/fatfsd
+                    Some(msg::REPORT_PARTITIONS) => {
+                        self.handle_report_partitions(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::PARTITION_READY) => {
+                        self.handle_partition_ready(slot, &recv_buf[..len]);
+                    }
+                    Some(msg::MOUNT_READY) => {
+                        self.handle_mount_ready(slot, &recv_buf[..len]);
                     }
                     _ => {
                         // Process normally
@@ -1429,7 +1651,7 @@ impl Devd {
             }
         };
 
-        dlog!("driver {} state_change: {}", driver_idx, state_msg.new_state);
+        dlog_state!("driver {} state_change: {}", driver_idx, state_msg.new_state);
 
         // When driver reports Ready, send any pending spawn commands
         if state_msg.new_state == driver_state::READY {
@@ -1544,12 +1766,16 @@ impl Devd {
 
         let seq_id = update.header.seq_id;
 
+        // Get port info before updating (for orchestration check)
+        let port_type = self.ports.port_type(port_name);
+        let owner_idx = self.ports.find_owner(port_name);
+
         // Update the port's shmem_id
         let result = self.ports.set_shmem_id(port_name, update.shmem_id);
 
         let result_code = match result {
             Ok(()) => {
-                dlog!("port {:?} shmem_id updated to {}",
+                dlog_state!("port {:?} shmem_id updated to {}",
                     core::str::from_utf8(port_name).unwrap_or("?"),
                     update.shmem_id);
                 error::OK
@@ -1565,6 +1791,17 @@ impl Devd {
         let resp = PortRegisterResponse::new(seq_id, result_code);
         if let Some(client) = self.query_handler.get_mut(slot) {
             let _ = client.channel.send(&resp.to_bytes());
+        }
+
+        // Trigger block orchestration if this is a Block port getting a shmem_id
+        if result_code == error::OK
+            && update.shmem_id != 0
+            && port_type == Some(PortType::Block)
+        {
+            if let Some(owner) = owner_idx {
+                dlog_state!("triggering orchestration for Block port update");
+                self.trigger_block_orchestration(port_name, update.shmem_id, owner);
+            }
         }
     }
 
@@ -2027,7 +2264,7 @@ impl Devd {
             return;
         }
 
-        dlog!("flushing {} pending spawns for driver {}", count, driver_idx);
+        dlog_state!("flushing {} pending spawns for driver {}", count, driver_idx);
 
         // Send the commands
         for i in 0..count {
@@ -2035,7 +2272,7 @@ impl Devd {
                 let port = &port_name[..port_len as usize];
                 match self.query_handler.send_spawn_child(driver_idx, binary.as_bytes(), port) {
                     Some(seq_id) => {
-                        dlog!("sent queued SPAWN_CHILD seq={} binary={}", seq_id, binary);
+                        dlog_state!("→ sent queued SPAWN_CHILD seq={} binary={}", seq_id, binary);
                         // Track inflight spawn so we can store context when ACK arrives
                         let port_type = self.ports.get_port_type(port).unwrap_or(0);
                         self.track_inflight_spawn(seq_id, port_type, port, binary);
@@ -2076,7 +2313,7 @@ impl Devd {
             }
         };
 
-        dlog!("SPAWN_ACK from driver {}: seq={} result={} match={} spawn={}",
+        dlog_state!("SPAWN_ACK from driver {}: seq={} result={} match={} spawn={}",
             parent_idx, seq_id, result, match_count, spawn_count);
 
         // Consume the inflight spawn to get port context and binary name
@@ -2202,21 +2439,38 @@ impl Devd {
         // Log registration
         if let Ok(name_str) = core::str::from_utf8(port_name) {
             if shmem_id != 0 {
-                dlog!("port registered: {} type={:?} shmem_id={} parent={:?}",
-                    name_str, port_type, shmem_id, parent_type);
+                dlog_state!("port registered: {} type={:?} shmem_id={}", name_str, port_type, shmem_id);
             } else {
-                dlog!("port registered: {} type={:?} parent={:?}",
+                dlog_state!("port registered: {} type={:?} parent={:?}",
                     name_str, port_type, parent_type);
             }
         }
 
-        // Check rules for auto-spawning
-        self.check_rules_for_port(port_name, port_type, parent_type, owner_idx);
+        // For Block ports, always use orchestration path (rules disabled for Block)
+        // Orchestration will be triggered when shmem_id is set via UPDATE_PORT
+        if port_type == PortType::Block {
+            if shmem_id != 0 {
+                self.trigger_block_orchestration(port_name, shmem_id, owner_idx);
+            }
+            // else: wait for UPDATE_PORT with shmem_id
+        } else {
+            // Check rules for auto-spawning (legacy path for other port types)
+            self.check_rules_for_port(port_name, port_type, parent_type, owner_idx);
+        }
 
         Ok(())
     }
 
     /// Check if any rules match a newly registered port
+    ///
+    /// When a rule matches, we send SpawnChild to the port owner (parent driver)
+    /// instead of spawning directly. This ensures capabilities flow down properly:
+    /// - pcied spawns xhcid (USB capability from PCI)
+    /// - xhcid spawns usbd (USB device access)
+    /// - etc.
+    ///
+    /// IMPORTANT: SpawnChild is only sent after the owner has reported Ready.
+    /// This ensures the owner is in its event loop and can process commands.
     fn check_rules_for_port(
         &mut self,
         port_name: &[u8],
@@ -2229,24 +2483,764 @@ impl Devd {
             None => return,
         };
 
-        dlog!("rule matched: {} should spawn {} for port", owner_idx, rule.driver_binary);
+        let rule_caps = rule.caps;
 
-        // Queue the spawn command - it will be sent when the driver reports Ready
-        // This avoids the race condition where SPAWN_CHILD arrives while the driver
-        // is still in register_port() waiting for the REGISTER_PORT response
-        self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
+        dlog_state!("rule matched: {} for port type={:?}, owner_idx={}",
+            rule.driver_binary, port_type, owner_idx);
+
+        // Check if owner service is Ready
+        // Only send SpawnChild to drivers that are Ready (in their event loop)
+        let owner_ready = self.services.get(owner_idx as usize)
+            .map(|s| s.state == ServiceState::Ready)
+            .unwrap_or(false);
+
+        if !owner_ready {
+            // Owner not ready yet - queue for when they report Ready
+            dlog_state!("owner {} not Ready, queuing spawn {}", owner_idx, rule.driver_binary);
+            self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
+            return;
+        }
+
+        // Owner is Ready - try to send SpawnChild with caps from rule
+        match self.query_handler.send_spawn_child_with_caps(
+            owner_idx, rule.driver_binary.as_bytes(), port_name, rule_caps,
+        ) {
+            Some(seq_id) => {
+                dlog_state!("→ SpawnChild seq={} to owner={} binary={}",
+                    seq_id, owner_idx, rule.driver_binary);
+                // Track inflight spawn so we can store context when ACK arrives
+                self.track_inflight_spawn(seq_id, port_type as u8, port_name, rule.driver_binary);
+            }
+            None => {
+                // Owner Ready but channel not available? Queue anyway
+                dlog_state!("owner {} Ready but send failed, queuing spawn {}", owner_idx, rule.driver_binary);
+                self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Block Device Orchestration
+    // =========================================================================
+
+    /// Trigger orchestration for a new block device
+    ///
+    /// When a Block port with shmem_id is registered, we:
+    /// 1. Track the disk info
+    /// 2. Spawn partd if not running
+    /// 3. Send ATTACH_DISK to partd
+    fn trigger_block_orchestration(&mut self, port_name: &[u8], shmem_id: u32, owner_idx: u8) {
+        // Track this disk
+        let disk_slot = self.track_disk(port_name, shmem_id, owner_idx);
+        if disk_slot.is_none() {
+            derror!("no slot to track disk shmem_id={}", shmem_id);
+            return;
+        }
+        let disk_slot = disk_slot.unwrap();
+
+        dlog_state!("→ orchestration: disk tracked slot={} shmem_id={}", disk_slot, shmem_id);
+
+        // Ensure partd is running (this spawns partd if needed)
+        dlog_state!("→ calling ensure_partd_running");
+        self.ensure_partd_running();
+        dlog_state!("→ ensure_partd_running returned");
+
+        // Send ATTACH_DISK to partd
+        if self.partd_service_idx != 0xFF {
+            self.send_attach_disk(disk_slot);
+        } else {
+            dlog!("partd not ready yet, will send AttachDisk when connected");
+        }
+    }
+
+    /// Track a disk for orchestration
+    /// State transition: Empty -> Discovered
+    fn track_disk(&mut self, port_name: &[u8], shmem_id: u32, owner_idx: u8) -> Option<usize> {
+        // Find empty slot (state == Empty)
+        let slot = (0..MAX_TRACKED_DISKS).find(|&i| {
+            self.tracked_disks[i].state == DiskState::Empty
+        })?;
+
+        let disk = &mut self.tracked_disks[slot];
+
+        // Transition Empty -> Discovered
+        if !disk.transition(DiskState::Discovered) {
+            derror!("disk state transition failed: {:?} -> Discovered", disk.state);
+            return None;
+        }
+
+        disk.shmem_id = shmem_id;
+        disk.owner_idx = owner_idx;
+        let len = port_name.len().min(32);
+        disk.port_name[..len].copy_from_slice(&port_name[..len]);
+        disk.port_name_len = len as u8;
+        // block_size and block_count will be filled when we query the DataPort
+
+        Some(slot)
+    }
+
+    /// Find tracked disk by shmem_id (in any non-Empty state)
+    fn find_disk_by_shmem_id(&self, shmem_id: u32) -> Option<usize> {
+        (0..MAX_TRACKED_DISKS).find(|&i| {
+            self.tracked_disks[i].state != DiskState::Empty
+                && self.tracked_disks[i].shmem_id == shmem_id
+        })
+    }
+
+    /// Ensure partd is running, spawn if not
+    fn ensure_partd_running(&mut self) {
+        if self.partd_service_idx != 0xFF {
+            return; // Already running
+        }
+
+        // Check if partd is already in services (maybe spawned but not connected yet)
+        for i in 0..MAX_SERVICES {
+            if let Some(service) = self.services.get(i) {
+                if let Some(def) = service.def() {
+                    if def.binary == "partd" && service.state == ServiceState::Ready {
+                        self.partd_service_idx = i as u8;
+                        dlog!("found existing partd at slot {}", i);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Spawn partd dynamically
+        dlog_state!("spawning partd for orchestration");
+        self.spawn_dynamic_driver("partd", b"");
+        dlog_state!("spawn_dynamic_driver returned");
+    }
+
+    /// Ensure fatfsd is running, spawn if not
+    fn ensure_fatfsd_running(&mut self) {
+        if self.fatfsd_service_idx != 0xFF {
+            return; // Already running
+        }
+
+        // Check if fatfsd is already in services
+        for i in 0..MAX_SERVICES {
+            if let Some(service) = self.services.get(i) {
+                if let Some(def) = service.def() {
+                    if def.binary == "fatfsd" && service.state == ServiceState::Ready {
+                        self.fatfsd_service_idx = i as u8;
+                        dlog!("found existing fatfsd at slot {}", i);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Spawn fatfsd dynamically
+        dlog_state!("spawning fatfsd for orchestration");
+        self.spawn_dynamic_driver("fatfsd", b"");
+    }
+
+    /// Get next orchestration sequence ID
+    fn next_orch_seq_id(&mut self) -> u32 {
+        let id = self.orch_seq_id;
+        self.orch_seq_id = self.orch_seq_id.wrapping_add(1);
+        if self.orch_seq_id == 0 {
+            self.orch_seq_id = 1;
+        }
+        id
+    }
+
+    /// Send ATTACH_DISK to partd
+    /// State transition: Discovered -> AttachSent
+    fn send_attach_disk(&mut self, disk_slot: usize) {
+        let partd_idx = self.partd_service_idx;
+        if partd_idx == 0xFF {
+            derror!("cannot send AttachDisk: partd not connected");
+            return;
+        }
+
+        // Verify disk is in Discovered state
+        if self.tracked_disks[disk_slot].state != DiskState::Discovered {
+            derror!("cannot send AttachDisk: disk not in Discovered state, is {:?}",
+                self.tracked_disks[disk_slot].state);
+            return;
+        }
+
+        // Get disk info - copy to local before mutable borrow
+        let (shmem_id, port_name_buf, port_name_len) = {
+            let disk = &self.tracked_disks[disk_slot];
+            let mut name_buf = [0u8; 32];
+            let len = disk.port_name_len as usize;
+            name_buf[..len].copy_from_slice(&disk.port_name[..len]);
+            (disk.shmem_id, name_buf, len)
+        };
+        let port_name = &port_name_buf[..port_name_len];
+
+        // Build ATTACH_DISK message
+        // Note: block_size and block_count are 0 for now - partd will query DataPort
+        let seq_id = self.next_orch_seq_id();
+        let attach = AttachDisk::new(seq_id, shmem_id, 0, 0);
+        let mut buf = [0u8; 128];
+        let len = match attach.write_to(&mut buf, port_name) {
+            Some(l) => l,
+            None => {
+                derror!("failed to serialize AttachDisk");
+                return;
+            }
+        };
+
+        // Transition Discovered -> AttachSent (tracks seq_id in state)
+        if !self.tracked_disks[disk_slot].transition(DiskState::AttachSent { seq_id }) {
+            derror!("disk state transition failed: Discovered -> AttachSent");
+            return;
+        }
+
+        // Send to partd
+        let slot = self.query_handler.find_by_service_idx(partd_idx);
+        if let Some(slot) = slot {
+            if let Some(client) = self.query_handler.get_mut(slot) {
+                match client.channel.send(&buf[..len]) {
+                    Ok(_) => {
+                        if let Ok(name_str) = core::str::from_utf8(port_name) {
+                            dlog_state!("→ AttachDisk seq={} to partd: {} shmem_id={}",
+                                seq_id, name_str, shmem_id);
+                        }
+                    }
+                    Err(e) => {
+                        derror!("failed to send AttachDisk: {:?}", e);
+                    }
+                }
+            }
+        } else {
+            derror!("partd slot not found for idx={}", partd_idx);
+        }
+    }
+
+    /// Handle REPORT_PARTITIONS from partd
+    /// State transitions:
+    ///   Disk: AttachSent -> PartitionsReported
+    ///   Partitions: Empty -> Discovered
+    fn handle_report_partitions(&mut self, slot: usize, buf: &[u8]) {
+        dlog_state!("← ReportPartitions received slot={} len={}", slot, buf.len());
+        let report = match ReportPartitions::from_bytes(buf) {
+            Some(r) => r,
+            None => {
+                derror!("invalid REPORT_PARTITIONS message");
+                return;
+            }
+        };
+
+        // Find the disk this is for
+        let disk_slot = match self.find_disk_by_shmem_id(report.source_shmem_id) {
+            Some(s) => s,
+            None => {
+                derror!("REPORT_PARTITIONS for unknown disk shmem_id={}", report.source_shmem_id);
+                return;
+            }
+        };
+
+        // Verify disk is in AttachSent state
+        if !matches!(self.tracked_disks[disk_slot].state, DiskState::AttachSent { .. }) {
+            derror!("REPORT_PARTITIONS for disk not in AttachSent state: {:?}",
+                self.tracked_disks[disk_slot].state);
+            return;
+        }
+
+        // Transition disk: AttachSent -> PartitionsReported
+        if !self.tracked_disks[disk_slot].transition(DiskState::PartitionsReported) {
+            derror!("disk state transition failed: AttachSent -> PartitionsReported");
+            return;
+        }
+
+        let scheme_str = if report.scheme == part_scheme::GPT { "GPT" } else { "MBR" };
+        dlog_state!("← ReportPartitions: {} partitions ({})", report.count, scheme_str);
+
+        // Parse partition info from buffer (follows fixed header)
+        let partition_count = (report.count as usize).min(MAX_PARTITIONS_PER_DISK);
+
+        let part_data = &buf[ReportPartitions::FIXED_SIZE..];
+        for i in 0..partition_count {
+            let offset = i * PartitionInfoMsg::SIZE;
+            if offset + PartitionInfoMsg::SIZE > part_data.len() {
+                break;
+            }
+            let pdata = &part_data[offset..offset + PartitionInfoMsg::SIZE];
+            if let Some(pinfo) = PartitionInfoMsg::from_bytes(pdata) {
+                let part = &mut self.tracked_disks[disk_slot].partitions[i];
+
+                // Transition partition: Empty -> Discovered
+                if !part.transition(PartitionState::Discovered) {
+                    derror!("partition {} state transition failed: Empty -> Discovered", i);
+                    continue;
+                }
+
+                part.index = pinfo.index;
+                part.part_type = pinfo.part_type;
+                part.bootable = pinfo.bootable != 0;
+                part.start_lba = pinfo.start_lba;
+                part.size_sectors = pinfo.size_sectors;
+
+                // Log each partition
+                let fs_str = match fs_hint::from_mbr_type(pinfo.part_type) {
+                    fs_hint::FAT12 => "FAT12",
+                    fs_hint::FAT16 => "FAT16",
+                    fs_hint::FAT32 => "FAT32",
+                    fs_hint::EXT4 => "ext4",
+                    fs_hint::NTFS => "NTFS",
+                    fs_hint::SWAP => "swap",
+                    _ => "unknown",
+                };
+                dlog_state!("  [{}] {} start={} size={} boot={}",
+                    pinfo.index, fs_str, pinfo.start_lba, pinfo.size_sectors, part.bootable);
+            }
+        }
+
+        // Store partition count and scheme
+        self.tracked_disks[disk_slot].partition_count = partition_count as u8;
+        self.tracked_disks[disk_slot].scheme = report.scheme;
+
+        // Collect partitions to register (avoid borrow issues)
+        let mut to_register = [false; MAX_PARTITIONS_PER_DISK];
+        for i in 0..partition_count {
+            let part = &self.tracked_disks[disk_slot].partitions[i];
+            if part.state == PartitionState::Discovered {
+                let fs_type = fs_hint::from_mbr_type(part.part_type);
+                // Only register partitions with known filesystem types
+                if fs_type != fs_hint::UNKNOWN && fs_type != fs_hint::SWAP {
+                    to_register[i] = true;
+                }
+            }
+        }
+
+        // Now send REGISTER_PARTITION for each mountable partition
+        for i in 0..partition_count {
+            if to_register[i] {
+                self.send_register_partition(disk_slot, i, slot);
+            }
+        }
+    }
+
+    /// Send REGISTER_PARTITION to partd
+    /// State transition: Discovered -> Registering
+    fn send_register_partition(&mut self, disk_slot: usize, part_idx: usize, partd_slot: usize) {
+        // Verify partition is in Discovered state
+        if self.tracked_disks[disk_slot].partitions[part_idx].state != PartitionState::Discovered {
+            derror!("cannot register partition: not in Discovered state, is {:?}",
+                self.tracked_disks[disk_slot].partitions[part_idx].state);
+            return;
+        }
+
+        // Get partition index before mutable operations
+        let part_table_index = self.tracked_disks[disk_slot].partitions[part_idx].index;
+
+        // Assign partition name
+        let part_num = self.next_partition_num;
+        self.next_partition_num += 1;
+
+        // Create name like "part0:"
+        let mut name_buf = [0u8; 32];
+        let name_len = {
+            let mut pos = 0;
+            for b in b"part" {
+                name_buf[pos] = *b;
+                pos += 1;
+            }
+            // Write number
+            if part_num == 0 {
+                name_buf[pos] = b'0';
+                pos += 1;
+            } else {
+                let mut n = part_num;
+                let mut digits = [0u8; 10];
+                let mut d = 0;
+                while n > 0 {
+                    digits[d] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    d += 1;
+                }
+                for i in (0..d).rev() {
+                    name_buf[pos] = digits[i];
+                    pos += 1;
+                }
+            }
+            name_buf[pos] = b':';
+            pos += 1;
+            pos
+        };
+
+        // Build REGISTER_PARTITION message
+        let seq_id = self.next_orch_seq_id();
+        let reg = RegisterPartitionMsg::new(seq_id, part_table_index);
+        let mut buf = [0u8; 64];
+        let len = match reg.write_to(&mut buf, &name_buf[..name_len]) {
+            Some(l) => l,
+            None => {
+                derror!("failed to serialize RegisterPartition");
+                return;
+            }
+        };
+
+        // Store assigned name and transition to Registering state
+        {
+            let part = &mut self.tracked_disks[disk_slot].partitions[part_idx];
+            part.assigned_name[..name_len].copy_from_slice(&name_buf[..name_len]);
+            part.assigned_name_len = name_len as u8;
+
+            // Transition Discovered -> Registering (tracks seq_id in state)
+            if !part.transition(PartitionState::Registering { seq_id }) {
+                derror!("partition state transition failed: Discovered -> Registering");
+                return;
+            }
+        }
+
+        // Send to partd
+        if let Some(client) = self.query_handler.get_mut(partd_slot) {
+            match client.channel.send(&buf[..len]) {
+                Ok(_) => {
+                    if let Ok(name_str) = core::str::from_utf8(&name_buf[..name_len]) {
+                        dlog_state!("→ RegisterPartition[{}] as \"{}\"", part_table_index, name_str);
+                    }
+                }
+                Err(e) => {
+                    derror!("failed to send RegisterPartition: {:?}", e);
+                }
+            }
+        }
+    }
+
+    /// Handle PARTITION_READY from partd
+    /// State transition: Registering -> Ready
+    fn handle_partition_ready(&mut self, _slot: usize, buf: &[u8]) {
+        let (ready, name) = match PartitionReadyMsg::from_bytes(buf) {
+            Some(r) => r,
+            None => {
+                derror!("invalid PARTITION_READY message");
+                return;
+            }
+        };
+
+        // Find the partition by name (must be in Registering state)
+        let mut found = None;
+        'outer: for disk_idx in 0..MAX_TRACKED_DISKS {
+            let disk = &self.tracked_disks[disk_idx];
+            if disk.state == DiskState::Empty {
+                continue;
+            }
+            for part_idx in 0..(disk.partition_count as usize).min(MAX_PARTITIONS_PER_DISK) {
+                let part = &disk.partitions[part_idx];
+                // Must be in Registering state to receive Ready
+                if !matches!(part.state, PartitionState::Registering { .. }) {
+                    continue;
+                }
+                let assigned_name = &part.assigned_name[..part.assigned_name_len as usize];
+                if assigned_name == name {
+                    found = Some((disk_idx, part_idx));
+                    break 'outer;
+                }
+            }
+        }
+
+        let (disk_idx, part_idx) = match found {
+            Some(f) => f,
+            None => {
+                if let Ok(name_str) = core::str::from_utf8(name) {
+                    derror!("PARTITION_READY for unknown partition: {}", name_str);
+                }
+                return;
+            }
+        };
+
+        // Transition partition: Registering -> Ready
+        {
+            let part = &mut self.tracked_disks[disk_idx].partitions[part_idx];
+            if !part.transition(PartitionState::Ready { shmem_id: ready.shmem_id }) {
+                derror!("partition state transition failed: Registering -> Ready");
+                return;
+            }
+        }
+
+        if let Ok(name_str) = core::str::from_utf8(name) {
+            dlog_state!("← PartitionReady: {} shmem_id={}", name_str, ready.shmem_id);
+        }
+
+        // Register the partition port with devd
+        let disk = &self.tracked_disks[disk_idx];
+        let disk_name = &disk.port_name[..disk.port_name_len as usize];
+        let _ = self.ports.register_with_dataport(
+            name,
+            self.partd_service_idx,
+            PortType::Partition,
+            ready.shmem_id,
+            Some(disk_name),
+        );
+
+        // Now mount the partition with appropriate filesystem driver
+        let part = &self.tracked_disks[disk_idx].partitions[part_idx];
+        let fs_type = fs_hint::from_mbr_type(part.part_type);
+
+        if fs_type == fs_hint::FAT12 || fs_type == fs_hint::FAT16 || fs_type == fs_hint::FAT32 {
+            self.ensure_fatfsd_running();
+            if self.fatfsd_service_idx != 0xFF {
+                self.send_mount_partition(disk_idx, part_idx);
+            } else {
+                dlog!("fatfsd not ready yet, will mount when connected");
+            }
+        } else {
+            dlog!("no filesystem driver for type {}", part.part_type);
+        }
+    }
+
+    /// Send MOUNT_PARTITION to fatfsd
+    /// State transition: Ready -> MountSent
+    fn send_mount_partition(&mut self, disk_idx: usize, part_idx: usize) {
+        let fatfsd_idx = self.fatfsd_service_idx;
+        if fatfsd_idx == 0xFF {
+            derror!("cannot send MountPartition: fatfsd not connected");
+            return;
+        }
+
+        // Verify partition is in Ready state and get shmem_id
+        let part_shmem_id = match self.tracked_disks[disk_idx].partitions[part_idx].state {
+            PartitionState::Ready { shmem_id } => shmem_id,
+            ref other => {
+                derror!("cannot mount partition: not in Ready state, is {:?}", other);
+                return;
+            }
+        };
+
+        // Copy needed data before mutable borrow
+        let (part_type, size_sectors, block_size, source_name_buf, source_name_len, mount_buf, mount_len) = {
+            let disk = &self.tracked_disks[disk_idx];
+            let part = &disk.partitions[part_idx];
+
+            // Copy source name
+            let mut src_buf = [0u8; 32];
+            let src_len = part.assigned_name_len as usize;
+            src_buf[..src_len].copy_from_slice(&part.assigned_name[..src_len]);
+
+            // Create mount point like "/mnt/fat0"
+            let mut mnt_buf = [0u8; 64];
+            let mnt_len = {
+                let prefix = b"/mnt/fat";
+                let mut pos = 0;
+                for b in prefix {
+                    mnt_buf[pos] = *b;
+                    pos += 1;
+                }
+                // Use partition number from assigned name (part0: -> 0)
+                // Extract number from "partN:" format
+                let name = &part.assigned_name[..part.assigned_name_len as usize];
+                if name.len() > 5 && name.starts_with(b"part") {
+                    for &b in &name[4..] {
+                        if b == b':' {
+                            break;
+                        }
+                        mnt_buf[pos] = b;
+                        pos += 1;
+                    }
+                }
+                pos
+            };
+
+            (part.part_type, part.size_sectors, disk.block_size, src_buf, src_len, mnt_buf, mnt_len)
+        };
+
+        let source_name = &source_name_buf[..source_name_len];
+        let fs_type = fs_hint::from_mbr_type(part_type);
+
+        // Build MOUNT_PARTITION message
+        let seq_id = self.next_orch_seq_id();
+        let mount = MountPartitionMsg::new(
+            seq_id,
+            part_shmem_id,
+            fs_type,
+            block_size,
+            size_sectors,
+        );
+        let mut buf = [0u8; 128];
+        let len = match mount.write_to(&mut buf, source_name, &mount_buf[..mount_len]) {
+            Some(l) => l,
+            None => {
+                derror!("failed to serialize MountPartition");
+                return;
+            }
+        };
+
+        // Transition Ready -> MountSent
+        {
+            let part = &mut self.tracked_disks[disk_idx].partitions[part_idx];
+            if !part.transition(PartitionState::MountSent { shmem_id: part_shmem_id, seq_id }) {
+                derror!("partition state transition failed: Ready -> MountSent");
+                return;
+            }
+        }
+
+        // Send to fatfsd
+        let slot = self.query_handler.find_by_service_idx(fatfsd_idx);
+        if let Some(slot) = slot {
+            if let Some(client) = self.query_handler.get_mut(slot) {
+                match client.channel.send(&buf[..len]) {
+                    Ok(_) => {
+                        if let Ok(source_str) = core::str::from_utf8(source_name) {
+                            if let Ok(mount_str) = core::str::from_utf8(&mount_buf[..mount_len]) {
+                                dlog_state!("→ MountPartition {} -> {}", source_str, mount_str);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        derror!("failed to send MountPartition: {:?}", e);
+                    }
+                }
+            }
+        } else {
+            derror!("fatfsd slot not found for idx={}", fatfsd_idx);
+        }
+    }
+
+    /// Handle MOUNT_READY from fatfsd
+    /// State transition: MountSent -> Mounted
+    fn handle_mount_ready(&mut self, _slot: usize, buf: &[u8]) {
+        let (ready, mount_point) = match MountReadyMsg::from_bytes(buf) {
+            Some(r) => r,
+            None => {
+                derror!("invalid MOUNT_READY message");
+                return;
+            }
+        };
+
+        if let Ok(mount_str) = core::str::from_utf8(mount_point) {
+            dlog_state!("← MountReady: {} shmem_id={}", mount_str, ready.shmem_id);
+        }
+
+        // Register the mount point as a Filesystem port
+        let _ = self.ports.register_with_dataport(
+            mount_point,
+            self.fatfsd_service_idx,
+            PortType::Filesystem,
+            ready.shmem_id,
+            None, // No parent for VFS mount points
+        );
+
+        // Find the partition in MountSent state with matching shmem_id
+        for disk_idx in 0..MAX_TRACKED_DISKS {
+            let disk = &mut self.tracked_disks[disk_idx];
+            if disk.state == DiskState::Empty {
+                continue;
+            }
+            for part_idx in 0..(disk.partition_count as usize).min(MAX_PARTITIONS_PER_DISK) {
+                let part = &mut disk.partitions[part_idx];
+                // Check if in MountSent state with matching shmem_id
+                if let PartitionState::MountSent { shmem_id, .. } = part.state {
+                    if shmem_id == ready.shmem_id {
+                        // Transition MountSent -> Mounted
+                        let mut mount_buf = [0u8; 64];
+                        let mount_len = mount_point.len().min(64);
+                        mount_buf[..mount_len].copy_from_slice(&mount_point[..mount_len]);
+
+                        if !part.transition(PartitionState::Mounted {
+                            shmem_id,
+                            mount_point: mount_buf,
+                            mount_len: mount_len as u8,
+                        }) {
+                            derror!("partition state transition failed: MountSent -> Mounted");
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        derror!("MOUNT_READY for unknown partition shmem_id={}", ready.shmem_id);
+    }
+
+    /// Check if a newly connected driver is partd or fatfsd
+    fn check_orchestration_driver_connected(&mut self, service_idx: u8) {
+        // Look up the service to find its binary name
+        if let Some(service) = self.services.get(service_idx as usize) {
+            // Check dynamic name first (for dynamically spawned drivers)
+            let name = service.name();
+
+            if name == "partd" {
+                self.partd_connected(service_idx);
+            } else if name == "fatfsd" {
+                self.fatfsd_connected(service_idx);
+            }
+            // Also check def (for statically defined services)
+            else if let Some(def) = service.def() {
+                if def.binary == "partd" {
+                    self.partd_connected(service_idx);
+                } else if def.binary == "fatfsd" {
+                    self.fatfsd_connected(service_idx);
+                }
+            }
+        }
+    }
+
+    /// Called when partd connects to devd-query
+    /// Send AttachDisk for any disks still in Discovered state
+    fn partd_connected(&mut self, service_idx: u8) {
+        if self.partd_service_idx != 0xFF {
+            return; // Already connected
+        }
+        self.partd_service_idx = service_idx;
+        dlog_state!("partd connected as service {}", service_idx);
+
+        // Send AttachDisk for any disks in Discovered state
+        // (they haven't had AttachDisk sent yet)
+        for disk_slot in 0..MAX_TRACKED_DISKS {
+            if self.tracked_disks[disk_slot].state == DiskState::Discovered {
+                self.send_attach_disk(disk_slot);
+            }
+        }
+    }
+
+    /// Called when fatfsd connects to devd-query
+    /// Send MountPartition for any partitions in Ready state
+    fn fatfsd_connected(&mut self, service_idx: u8) {
+        if self.fatfsd_service_idx != 0xFF {
+            return; // Already connected
+        }
+        self.fatfsd_service_idx = service_idx;
+        dlog_state!("fatfsd connected as service {}", service_idx);
+
+        // Collect partitions to mount first, then send (to avoid borrow issues)
+        let mut to_mount = [(0usize, 0usize); MAX_TRACKED_DISKS * MAX_PARTITIONS_PER_DISK];
+        let mut mount_count = 0;
+
+        for disk_idx in 0..MAX_TRACKED_DISKS {
+            let disk = &self.tracked_disks[disk_idx];
+            if disk.state == DiskState::Empty {
+                continue;
+            }
+            for part_idx in 0..(disk.partition_count as usize).min(MAX_PARTITIONS_PER_DISK) {
+                let part = &disk.partitions[part_idx];
+                // Check for Ready state (meaning partition has DataPort but not mounted yet)
+                if let PartitionState::Ready { .. } = part.state {
+                    let fs_type = fs_hint::from_mbr_type(part.part_type);
+                    if fs_type == fs_hint::FAT12 || fs_type == fs_hint::FAT16 || fs_type == fs_hint::FAT32 {
+                        if mount_count < to_mount.len() {
+                            to_mount[mount_count] = (disk_idx, part_idx);
+                            mount_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now send MountPartition for each
+        for i in 0..mount_count {
+            let (disk_idx, part_idx) = to_mount[i];
+            self.send_mount_partition(disk_idx, part_idx);
+        }
     }
 
     /// Spawn a driver dynamically (not from SERVICE_DEFS)
     fn spawn_dynamic_driver(&mut self, binary: &str, trigger_port: &[u8]) {
+        self.spawn_dynamic_driver_with_caps(binary, trigger_port, 0);
+    }
+
+    /// Spawn a driver dynamically with explicit capabilities
+    fn spawn_dynamic_driver_with_caps(&mut self, binary: &str, trigger_port: &[u8], caps: u64) {
         let now = Self::now_ms();
 
-        // Find empty service slot BEFORE spawning so we can track immediately
-        let slot_idx = self.services.find_empty_slot();
-        let idx = slot_idx.unwrap_or(0xFF); // 0xFF = invalid/no slot
-
-        // Spawn the process
-        let (pid, watcher) = match self.process_mgr.spawn(binary) {
+        // Spawn the process first (with caps if specified)
+        let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
             Ok(result) => result,
             Err(e) => {
                 derror!("dynamic spawn {} failed err={:?}", binary, e);
@@ -2254,27 +3248,23 @@ impl Devd {
             }
         };
 
-        // IMMEDIATELY add to recent_dynamic_pids - this MUST happen before anything
-        // else because the spawned child may already be running and connecting!
-        // The child process starts immediately when spawn returns.
-        if idx != 0xFF {
-            self.add_recent_dynamic_pid(pid, idx as u8);
-        }
-
         // Store spawn context for GET_SPAWN_CONTEXT
         if !trigger_port.is_empty() {
             let port_type = self.ports.get_port_type(trigger_port).unwrap_or(0);
             self.store_spawn_context(pid, port_type, trigger_port);
         }
 
-        // Now set up the service slot
+        // Create service slot using create_dynamic_service (which actually creates the entry)
+        let slot_idx = self.services.create_dynamic_service(pid, binary.as_bytes(), now);
+
+        // Set up the service slot with watcher
         if let Some(idx) = slot_idx {
             if let Some(service) = self.services.get_mut(idx) {
-                service.pid = pid;
                 service.watcher = Some(watcher);
-                service.state = service::ServiceState::Ready;
-                service.last_change = now;
             }
+
+            // Add to recent_dynamic_pids for race condition handling
+            self.add_recent_dynamic_pid(pid, idx as u8);
 
             // Add watcher to event loop
             if let Some(events) = &mut self.events {
@@ -2297,6 +3287,7 @@ impl Devd {
         } else {
             dlog!("spawned {} pid={} slot={:?}", binary, pid, slot_idx);
         }
+
     }
 
     /// Add a recently spawned dynamic PID to the tracking array
@@ -2437,6 +3428,10 @@ impl Devd {
                         }
                     }
 
+                    // Debug: log unmatched handles
+                    let qp_handle = self.query_port.as_ref().map(|p| p.handle().raw()).unwrap_or(0);
+                    dlog!("mux: handle={} qp={}", handle.raw(), qp_handle);
+
                     // Query client message?
                     if self.query_handler.find_by_handle(handle).is_some() {
                         self.handle_query_client_event(handle);
@@ -2457,6 +3452,9 @@ impl Devd {
 
                     // Process exit (watcher)?
                     self.handle_process_exit(handle);
+                }
+                Err(SysError::WouldBlock) => {
+                    // No events pending - this is normal during polling, not an error
                 }
                 Err(e) => {
                     derror!("wait failed err={:?}", e);

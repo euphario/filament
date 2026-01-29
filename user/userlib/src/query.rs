@@ -99,6 +99,12 @@ pub mod msg {
     pub const QUERY_PORT: u16 = 0x0107;
     /// Update shmem_id for an existing port
     pub const UPDATE_PORT_SHMEM_ID: u16 = 0x0108;
+    /// Report discovered partitions (partd → devd)
+    pub const REPORT_PARTITIONS: u16 = 0x0109;
+    /// Partition ready notification (partd → devd)
+    pub const PARTITION_READY: u16 = 0x010A;
+    /// Mount ready notification (fatfsd → devd)
+    pub const MOUNT_READY: u16 = 0x010B;
 
     // Query messages (client → devd → driver)
     /// List all registered devices
@@ -129,6 +135,12 @@ pub mod msg {
     pub const STOP_CHILD: u16 = 0x0401;
     /// Acknowledgement of spawn/stop command
     pub const SPAWN_ACK: u16 = 0x0402;
+    /// Attach a disk to partd (devd → partd)
+    pub const ATTACH_DISK: u16 = 0x0410;
+    /// Register a partition with assigned name (devd → partd)
+    pub const REGISTER_PARTITION: u16 = 0x0411;
+    /// Mount a partition (devd → fatfsd)
+    pub const MOUNT_PARTITION: u16 = 0x0412;
 
     // Response messages
     /// Response containing device list
@@ -321,6 +333,40 @@ pub mod port_type {
     pub const NETWORK: u8 = 5;
     pub const CONSOLE: u8 = 6;
     pub const SERVICE: u8 = 7;
+    pub const STORAGE: u8 = 8;
+}
+
+/// Filesystem type hints for partition mounting
+pub mod fs_hint {
+    pub const UNKNOWN: u8 = 0;
+    pub const FAT12: u8 = 1;
+    pub const FAT16: u8 = 2;
+    pub const FAT32: u8 = 3;
+    pub const EXFAT: u8 = 4;
+    pub const EXT2: u8 = 5;
+    pub const EXT4: u8 = 6;
+    pub const NTFS: u8 = 7;
+    pub const SWAP: u8 = 8;
+
+    /// Convert MBR partition type to filesystem hint
+    pub fn from_mbr_type(mbr_type: u8) -> u8 {
+        match mbr_type {
+            0x01 => FAT12,
+            0x04 | 0x06 | 0x0E => FAT16,
+            0x0B | 0x0C => FAT32,
+            0x07 => NTFS,
+            0x82 => SWAP,
+            0x83 => EXT4,
+            _ => UNKNOWN,
+        }
+    }
+}
+
+/// Partition scheme types
+pub mod part_scheme {
+    pub const UNKNOWN: u8 = 0;
+    pub const MBR: u8 = 1;
+    pub const GPT: u8 = 2;
 }
 
 /// Port registration message (driver → devd)
@@ -1008,11 +1054,13 @@ pub struct SpawnChild {
     /// Length of filter (PortFilter + pattern)
     pub filter_len: u8,
     pub _pad: [u8; 2],
+    /// Capability bits for spawned child (0 = inherit parent's)
+    pub caps: u64,
     // Followed by: binary name bytes, then PortFilter + pattern
 }
 
 impl SpawnChild {
-    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4;
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4 + 8;
 
     pub fn new(seq_id: u32) -> Self {
         Self {
@@ -1020,6 +1068,17 @@ impl SpawnChild {
             binary_len: 0,
             filter_len: 0,
             _pad: [0; 2],
+            caps: 0,
+        }
+    }
+
+    pub fn with_caps(seq_id: u32, caps: u64) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SPAWN_CHILD, seq_id),
+            binary_len: 0,
+            filter_len: 0,
+            _pad: [0; 2],
+            caps,
         }
     }
 
@@ -1064,6 +1123,7 @@ impl SpawnChild {
         buf[9] = filter_total as u8;
         buf[10] = 0;
         buf[11] = 0;
+        buf[12..20].copy_from_slice(&self.caps.to_le_bytes());
 
         let binary_start = Self::FIXED_SIZE;
         buf[binary_start..binary_start + binary.len()].copy_from_slice(binary);
@@ -1099,12 +1159,22 @@ impl SpawnChild {
         let filter_start = binary_start + binary_len;
         let filter_bytes = &buf[filter_start..filter_start + filter_len];
 
+        let caps = if buf.len() >= 20 {
+            u64::from_le_bytes([
+                buf[12], buf[13], buf[14], buf[15],
+                buf[16], buf[17], buf[18], buf[19],
+            ])
+        } else {
+            0
+        };
+
         Some((
             Self {
                 header,
                 binary_len: binary_len as u8,
                 filter_len: filter_len as u8,
                 _pad: [0; 2],
+                caps,
             },
             binary,
             filter_bytes,
@@ -2334,6 +2404,522 @@ impl LogHistory {
         }
         let text = &buf[Self::FIXED_SIZE..total];
         Some((Self { header, result, count, live_enabled, text_len: text_len as u16 }, text))
+    }
+}
+
+// =============================================================================
+// Orchestration Messages
+// =============================================================================
+
+/// Rich partition information for ReportPartitions
+///
+/// Contains all partition metadata needed by devd to make policy decisions.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PartitionInfoMsg {
+    /// Partition index (0-based position in partition table)
+    pub index: u8,
+    /// MBR partition type (0x0B=FAT32, 0x83=Linux) or GPT type index
+    pub part_type: u8,
+    /// Bootable flag (1 = bootable, 0 = not)
+    pub bootable: u8,
+    /// Reserved padding
+    pub _pad: u8,
+    /// Start LBA (64-bit for GPT support)
+    pub start_lba: u64,
+    /// Size in sectors (64-bit for GPT support)
+    pub size_sectors: u64,
+    /// GPT partition GUID (zeros for MBR)
+    pub guid: [u8; 16],
+    /// GPT partition label (zeros for MBR, null-terminated UTF-8)
+    pub label: [u8; 36],
+}
+
+impl PartitionInfoMsg {
+    pub const SIZE: usize = 4 + 8 + 8 + 16 + 36; // 72 bytes
+
+    pub fn new() -> Self {
+        Self {
+            index: 0,
+            part_type: 0,
+            bootable: 0,
+            _pad: 0,
+            start_lba: 0,
+            size_sectors: 0,
+            guid: [0; 16],
+            label: [0; 36],
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0] = self.index;
+        buf[1] = self.part_type;
+        buf[2] = self.bootable;
+        buf[3] = self._pad;
+        buf[4..12].copy_from_slice(&self.start_lba.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.size_sectors.to_le_bytes());
+        buf[20..36].copy_from_slice(&self.guid);
+        buf[36..72].copy_from_slice(&self.label);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            index: buf[0],
+            part_type: buf[1],
+            bootable: buf[2],
+            _pad: buf[3],
+            start_lba: u64::from_le_bytes([
+                buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+            ]),
+            size_sectors: u64::from_le_bytes([
+                buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+            ]),
+            guid: {
+                let mut g = [0u8; 16];
+                g.copy_from_slice(&buf[20..36]);
+                g
+            },
+            label: {
+                let mut l = [0u8; 36];
+                l.copy_from_slice(&buf[36..72]);
+                l
+            },
+        })
+    }
+
+    /// Get label as string slice
+    pub fn label_str(&self) -> &str {
+        let len = self.label.iter().position(|&b| b == 0).unwrap_or(36);
+        core::str::from_utf8(&self.label[..len]).unwrap_or("")
+    }
+}
+
+/// Attach disk command (devd → partd)
+///
+/// Tells partd to connect to a block device and scan for partitions.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AttachDisk {
+    pub header: QueryHeader,
+    /// DataPort shared memory ID
+    pub shmem_id: u32,
+    /// Length of source port name
+    pub source_len: u8,
+    /// Reserved padding
+    pub _pad: [u8; 3],
+    /// Block size in bytes
+    pub block_size: u32,
+    /// Total number of blocks
+    pub block_count: u64,
+    // Followed by: source port name bytes (e.g., "disk0:")
+}
+
+impl AttachDisk {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4 + 4 + 4 + 8; // 28 bytes
+
+    pub fn new(seq_id: u32, shmem_id: u32, block_size: u32, block_count: u64) -> Self {
+        Self {
+            header: QueryHeader::new(msg::ATTACH_DISK, seq_id),
+            shmem_id,
+            source_len: 0,
+            _pad: [0; 3],
+            block_size,
+            block_count,
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], source: &[u8]) -> Option<usize> {
+        let total = Self::FIXED_SIZE + source.len();
+        if buf.len() < total || source.len() > 255 {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.shmem_id.to_le_bytes());
+        buf[12] = source.len() as u8;
+        buf[13..16].copy_from_slice(&[0; 3]);
+        buf[16..20].copy_from_slice(&self.block_size.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.block_count.to_le_bytes());
+        buf[28..total].copy_from_slice(source);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(buf)?;
+        let shmem_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let source_len = buf[12] as usize;
+        let block_size = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let block_count = u64::from_le_bytes([
+            buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
+        ]);
+        let total = Self::FIXED_SIZE + source_len;
+        if buf.len() < total {
+            return None;
+        }
+        let source = &buf[Self::FIXED_SIZE..total];
+        Some((
+            Self {
+                header,
+                shmem_id,
+                source_len: source_len as u8,
+                _pad: [0; 3],
+                block_size,
+                block_count,
+            },
+            source,
+        ))
+    }
+}
+
+/// Report partitions message (partd → devd)
+///
+/// partd sends this after scanning a disk's partition table.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReportPartitions {
+    pub header: QueryHeader,
+    /// Source disk's DataPort shmem_id
+    pub source_shmem_id: u32,
+    /// Number of partitions found
+    pub count: u8,
+    /// Partition scheme (see part_scheme module)
+    pub scheme: u8,
+    /// Reserved padding
+    pub _pad: [u8; 2],
+    // Followed by: count * PartitionInfoMsg entries
+}
+
+impl ReportPartitions {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8;
+
+    pub fn new(seq_id: u32, source_shmem_id: u32, count: u8, scheme: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::REPORT_PARTITIONS, seq_id),
+            source_shmem_id,
+            count,
+            scheme,
+            _pad: [0; 2],
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::FIXED_SIZE] {
+        let mut buf = [0u8; Self::FIXED_SIZE];
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.source_shmem_id.to_le_bytes());
+        buf[12] = self.count;
+        buf[13] = self.scheme;
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        Some(Self {
+            header: QueryHeader::from_bytes(buf)?,
+            source_shmem_id: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            count: buf[12],
+            scheme: buf[13],
+            _pad: [0; 2],
+        })
+    }
+}
+
+/// Register partition command (devd → partd)
+///
+/// devd tells partd to create a DataPort for a partition with an assigned name.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RegisterPartitionMsg {
+    pub header: QueryHeader,
+    /// Partition index from ReportPartitions
+    pub index: u8,
+    /// Length of assigned name
+    pub name_len: u8,
+    /// Reserved padding
+    pub _pad: [u8; 2],
+    // Followed by: assigned name bytes (e.g., "part0:")
+}
+
+impl RegisterPartitionMsg {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, index: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::REGISTER_PARTITION, seq_id),
+            index,
+            name_len: 0,
+            _pad: [0; 2],
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
+        let total = Self::FIXED_SIZE + name.len();
+        if buf.len() < total || name.len() > 255 {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = self.index;
+        buf[9] = name.len() as u8;
+        buf[10..12].copy_from_slice(&[0; 2]);
+        buf[12..total].copy_from_slice(name);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(buf)?;
+        let index = buf[8];
+        let name_len = buf[9] as usize;
+        let total = Self::FIXED_SIZE + name_len;
+        if buf.len() < total {
+            return None;
+        }
+        let name = &buf[Self::FIXED_SIZE..total];
+        Some((
+            Self {
+                header,
+                index,
+                name_len: name_len as u8,
+                _pad: [0; 2],
+            },
+            name,
+        ))
+    }
+}
+
+/// Partition ready notification (partd → devd)
+///
+/// partd confirms a partition DataPort is ready.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PartitionReadyMsg {
+    pub header: QueryHeader,
+    /// Length of partition name
+    pub name_len: u8,
+    /// Reserved padding
+    pub _pad: [u8; 3],
+    /// DataPort shared memory ID
+    pub shmem_id: u32,
+    // Followed by: partition name bytes
+}
+
+impl PartitionReadyMsg {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8;
+
+    pub fn new(seq_id: u32, shmem_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::PARTITION_READY, seq_id),
+            name_len: 0,
+            _pad: [0; 3],
+            shmem_id,
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
+        let total = Self::FIXED_SIZE + name.len();
+        if buf.len() < total || name.len() > 255 {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = name.len() as u8;
+        buf[9..12].copy_from_slice(&[0; 3]);
+        buf[12..16].copy_from_slice(&self.shmem_id.to_le_bytes());
+        buf[16..total].copy_from_slice(name);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(buf)?;
+        let name_len = buf[8] as usize;
+        let shmem_id = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let total = Self::FIXED_SIZE + name_len;
+        if buf.len() < total {
+            return None;
+        }
+        let name = &buf[Self::FIXED_SIZE..total];
+        Some((
+            Self {
+                header,
+                name_len: name_len as u8,
+                _pad: [0; 3],
+                shmem_id,
+            },
+            name,
+        ))
+    }
+}
+
+/// Mount partition command (devd → fatfsd)
+///
+/// devd tells fatfsd to mount a partition.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MountPartitionMsg {
+    pub header: QueryHeader,
+    /// Partition's DataPort shared memory ID
+    pub shmem_id: u32,
+    /// Length of source partition name
+    pub source_len: u8,
+    /// Length of mount point
+    pub mount_len: u8,
+    /// Filesystem hint (see fs_hint module)
+    pub fs_hint: u8,
+    /// Reserved padding
+    pub _pad: u8,
+    /// Block size in bytes
+    pub block_size: u32,
+    /// Total number of blocks
+    pub block_count: u64,
+    // Followed by: source name bytes, then mount point bytes
+}
+
+impl MountPartitionMsg {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4 + 4 + 4 + 8; // 28 bytes
+
+    pub fn new(seq_id: u32, shmem_id: u32, fs_hint: u8, block_size: u32, block_count: u64) -> Self {
+        Self {
+            header: QueryHeader::new(msg::MOUNT_PARTITION, seq_id),
+            shmem_id,
+            source_len: 0,
+            mount_len: 0,
+            fs_hint,
+            _pad: 0,
+            block_size,
+            block_count,
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], source: &[u8], mount_point: &[u8]) -> Option<usize> {
+        let total = Self::FIXED_SIZE + source.len() + mount_point.len();
+        if buf.len() < total || source.len() > 255 || mount_point.len() > 255 {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.shmem_id.to_le_bytes());
+        buf[12] = source.len() as u8;
+        buf[13] = mount_point.len() as u8;
+        buf[14] = self.fs_hint;
+        buf[15] = 0;
+        buf[16..20].copy_from_slice(&self.block_size.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.block_count.to_le_bytes());
+        let source_end = Self::FIXED_SIZE + source.len();
+        buf[28..source_end].copy_from_slice(source);
+        buf[source_end..total].copy_from_slice(mount_point);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8], &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(buf)?;
+        let shmem_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let source_len = buf[12] as usize;
+        let mount_len = buf[13] as usize;
+        let fs_hint = buf[14];
+        let block_size = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let block_count = u64::from_le_bytes([
+            buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
+        ]);
+        let total = Self::FIXED_SIZE + source_len + mount_len;
+        if buf.len() < total {
+            return None;
+        }
+        let source_end = Self::FIXED_SIZE + source_len;
+        let source = &buf[Self::FIXED_SIZE..source_end];
+        let mount_point = &buf[source_end..total];
+        Some((
+            Self {
+                header,
+                shmem_id,
+                source_len: source_len as u8,
+                mount_len: mount_len as u8,
+                fs_hint,
+                _pad: 0,
+                block_size,
+                block_count,
+            },
+            source,
+            mount_point,
+        ))
+    }
+}
+
+/// Mount ready notification (fatfsd → devd)
+///
+/// fatfsd confirms a filesystem is mounted.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MountReadyMsg {
+    pub header: QueryHeader,
+    /// Length of mount point
+    pub mount_len: u8,
+    /// Reserved padding
+    pub _pad: [u8; 3],
+    /// VFS DataPort shared memory ID (for file operations)
+    pub shmem_id: u32,
+    // Followed by: mount point bytes
+}
+
+impl MountReadyMsg {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8;
+
+    pub fn new(seq_id: u32, shmem_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::MOUNT_READY, seq_id),
+            mount_len: 0,
+            _pad: [0; 3],
+            shmem_id,
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8], mount_point: &[u8]) -> Option<usize> {
+        let total = Self::FIXED_SIZE + mount_point.len();
+        if buf.len() < total || mount_point.len() > 255 {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = mount_point.len() as u8;
+        buf[9..12].copy_from_slice(&[0; 3]);
+        buf[12..16].copy_from_slice(&self.shmem_id.to_le_bytes());
+        buf[16..total].copy_from_slice(mount_point);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(buf)?;
+        let mount_len = buf[8] as usize;
+        let shmem_id = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let total = Self::FIXED_SIZE + mount_len;
+        if buf.len() < total {
+            return None;
+        }
+        let mount_point = &buf[Self::FIXED_SIZE..total];
+        Some((
+            Self {
+                header,
+                mount_len: mount_len as u8,
+                _pad: [0; 3],
+                shmem_id,
+            },
+            mount_point,
+        ))
     }
 }
 

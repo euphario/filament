@@ -43,6 +43,23 @@
 //! ```
 
 use crate::error::SysError;
+
+// =============================================================================
+// Capability Presets (mirrors kernel caps.rs bits)
+// =============================================================================
+
+/// Capability bit presets for userspace driver spawning.
+///
+/// These match the kernel's `Capabilities` bitfield in `src/kernel/caps.rs`.
+/// Pass to `exec_with_caps()` or `ProcessManager::spawn_with_context()`.
+pub mod caps {
+    /// IPC | MEM | SPAWN | SCHEME | IRQ | MMIO | DMA | RAW_DEVICE
+    pub const DRIVER: u64 = 0x027F;
+    /// IPC | MEM | SPAWN
+    pub const SERVICE: u64 = 0x0007;
+    /// IPC | MEM | SPAWN
+    pub const USER: u64 = 0x0007;
+}
 use crate::ipc::{Channel, ObjHandle};
 use crate::syscall;
 use crate::query::{
@@ -53,7 +70,10 @@ use crate::query::{
     ListPorts, PortsListResponse, PortEntry,
     ListServices, ServicesListResponse, ServiceEntry,
     QueryServiceInfo, ServiceInfoResult,
+    AttachDisk, ReportPartitions, RegisterPartitionMsg, PartitionReadyMsg,
+    MountPartitionMsg, MountReadyMsg, PartitionInfoMsg,
     msg, port_type, error, class, driver_state, service_state,
+    fs_hint, part_scheme,
 };
 
 // =============================================================================
@@ -78,6 +98,8 @@ pub enum PortType {
     Filesystem = port_type::FILESYSTEM,
     /// Service port
     Service = port_type::SERVICE,
+    /// Mass storage controller (NVMe, AHCI, etc.)
+    Storage = port_type::STORAGE,
 }
 
 // =============================================================================
@@ -218,6 +240,8 @@ pub enum DevdCommand {
         binary_len: usize,
         /// Filter for selecting target ports
         filter: SpawnFilter,
+        /// Capability bits for spawned child (0 = inherit parent's)
+        caps: u64,
     },
     /// Stop a child driver process
     StopChild {
@@ -230,6 +254,49 @@ pub enum DevdCommand {
     QueryInfo {
         /// Sequence ID for response
         seq_id: u32,
+    },
+    /// Attach to a block device (devd → partd)
+    AttachDisk {
+        /// Sequence ID for response
+        seq_id: u32,
+        /// DataPort shared memory ID
+        shmem_id: u32,
+        /// Source port name (e.g., "disk0:")
+        source: [u8; 32],
+        source_len: usize,
+        /// Block size in bytes
+        block_size: u32,
+        /// Total number of blocks
+        block_count: u64,
+    },
+    /// Register a partition with assigned name (devd → partd)
+    RegisterPartition {
+        /// Sequence ID for response
+        seq_id: u32,
+        /// Partition index from ReportPartitions
+        index: u8,
+        /// Assigned partition name (e.g., "part0:")
+        name: [u8; 32],
+        name_len: usize,
+    },
+    /// Mount a partition (devd → fatfsd)
+    MountPartition {
+        /// Sequence ID for response
+        seq_id: u32,
+        /// Partition's DataPort shared memory ID
+        shmem_id: u32,
+        /// Source partition name (e.g., "part0:")
+        source: [u8; 32],
+        source_len: usize,
+        /// Mount point (e.g., "/mnt/fat0")
+        mount_point: [u8; 64],
+        mount_len: usize,
+        /// Filesystem hint
+        fs_hint: u8,
+        /// Block size in bytes
+        block_size: u32,
+        /// Total number of blocks
+        block_count: u64,
     },
 }
 
@@ -378,49 +445,63 @@ impl DevdClient {
     /// Returns (port_name, port_type) if this driver was spawned by devd rules,
     /// or None if no context available (e.g., manually started driver).
     pub fn get_spawn_context(&mut self) -> Result<Option<([u8; 64], usize, PortType)>, SysError> {
-        let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+        // Retry outer loop handles NOT_FOUND race condition
+        // When pcied spawns xhcid, xhcid might query spawn context before devd
+        // has processed the SPAWN_ACK that contains the PID -> context mapping
+        const SPAWN_ACK_RETRIES: usize = 10;
+        const SPAWN_ACK_DELAY_MS: u32 = 20;
 
-        let req = GetSpawnContext::new(seq_id);
-        channel.send(&req.to_bytes())?;
+        for retry in 0..SPAWN_ACK_RETRIES {
+            let seq_id = self.next_seq();
+            let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
-        // Wait for response
-        let mut resp_buf = [0u8; 128];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(resp_len) if resp_len >= SpawnContextResponse::HEADER_SIZE => {
-                    if let Some((resp, port_name)) = SpawnContextResponse::from_bytes(&resp_buf[..resp_len]) {
-                        if resp.header.msg_type == msg::SPAWN_CONTEXT {
-                            if resp.result == error::OK && resp.port_name_len > 0 {
-                                let mut name = [0u8; 64];
-                                let len = (resp.port_name_len as usize).min(64);
-                                name[..len].copy_from_slice(&port_name[..len]);
-                                let ptype = match resp.port_type {
-                                    port_type::BLOCK => PortType::Block,
-                                    port_type::PARTITION => PortType::Partition,
-                                    port_type::NETWORK => PortType::Network,
-                                    port_type::CONSOLE => PortType::Console,
-                                    port_type::USB => PortType::Usb,
-                                    port_type::FILESYSTEM => PortType::Filesystem,
-                                    _ => PortType::Service,
-                                };
-                                return Ok(Some((name, len, ptype)));
+            let req = GetSpawnContext::new(seq_id);
+            channel.send(&req.to_bytes())?;
+
+            // Wait for response
+            let mut resp_buf = [0u8; 128];
+            for _ in 0..Self::MAX_RETRIES {
+                match channel.recv(&mut resp_buf) {
+                    Ok(resp_len) if resp_len >= SpawnContextResponse::HEADER_SIZE => {
+                        if let Some((resp, port_name)) = SpawnContextResponse::from_bytes(&resp_buf[..resp_len]) {
+                            if resp.header.msg_type == msg::SPAWN_CONTEXT {
+                                if resp.result == error::OK && resp.port_name_len > 0 {
+                                    let mut name = [0u8; 64];
+                                    let len = (resp.port_name_len as usize).min(64);
+                                    name[..len].copy_from_slice(&port_name[..len]);
+                                    let ptype = match resp.port_type {
+                                        port_type::BLOCK => PortType::Block,
+                                        port_type::PARTITION => PortType::Partition,
+                                        port_type::NETWORK => PortType::Network,
+                                        port_type::CONSOLE => PortType::Console,
+                                        port_type::USB => PortType::Usb,
+                                        port_type::FILESYSTEM => PortType::Filesystem,
+                                        port_type::STORAGE => PortType::Storage,
+                                        _ => PortType::Service,
+                                    };
+                                    return Ok(Some((name, len, ptype)));
+                                }
+                                // NOT_FOUND - might be race with SPAWN_ACK, retry
+                                if resp.result == error::NOT_FOUND && retry < SPAWN_ACK_RETRIES - 1 {
+                                    syscall::sleep_ms(SPAWN_ACK_DELAY_MS);
+                                    break; // Retry outer loop
+                                }
+                                // No context after all retries (manually started driver)
+                                return Ok(None);
                             }
-                            // No context available (result != OK or empty name)
-                            return Ok(None);
                         }
+                        return Err(SysError::IoError);
                     }
-                    return Err(SysError::IoError);
+                    Ok(_) => return Err(SysError::IoError),
+                    Err(SysError::WouldBlock) => {
+                        syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Ok(_) => return Err(SysError::IoError),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
             }
         }
-        Err(SysError::Timeout)
+        Ok(None) // No context after all retries
     }
 
     // =========================================================================
@@ -628,7 +709,7 @@ impl DevdClient {
 
                 match header.msg_type {
                     msg::SPAWN_CHILD => {
-                        let (_, binary, filter_bytes) = SpawnChild::from_bytes(&buf[..len])
+                        let (spawn_hdr, binary, filter_bytes) = SpawnChild::from_bytes(&buf[..len])
                             .ok_or(SysError::IoError)?;
 
                         // Parse binary name
@@ -666,6 +747,7 @@ impl DevdClient {
                             binary: cmd_binary,
                             binary_len,
                             filter,
+                            caps: spawn_hdr.caps,
                         }))
                     }
                     msg::STOP_CHILD => {
@@ -679,6 +761,55 @@ impl DevdClient {
                         // devd is forwarding a service info query
                         Ok(Some(DevdCommand::QueryInfo {
                             seq_id: header.seq_id,
+                        }))
+                    }
+                    msg::ATTACH_DISK => {
+                        let (attach, source) = AttachDisk::from_bytes(&buf[..len])
+                            .ok_or(SysError::IoError)?;
+                        let mut source_buf = [0u8; 32];
+                        let source_len = source.len().min(32);
+                        source_buf[..source_len].copy_from_slice(&source[..source_len]);
+                        Ok(Some(DevdCommand::AttachDisk {
+                            seq_id: header.seq_id,
+                            shmem_id: attach.shmem_id,
+                            source: source_buf,
+                            source_len,
+                            block_size: attach.block_size,
+                            block_count: attach.block_count,
+                        }))
+                    }
+                    msg::REGISTER_PARTITION => {
+                        let (reg, name) = RegisterPartitionMsg::from_bytes(&buf[..len])
+                            .ok_or(SysError::IoError)?;
+                        let mut name_buf = [0u8; 32];
+                        let name_len = name.len().min(32);
+                        name_buf[..name_len].copy_from_slice(&name[..name_len]);
+                        Ok(Some(DevdCommand::RegisterPartition {
+                            seq_id: header.seq_id,
+                            index: reg.index,
+                            name: name_buf,
+                            name_len,
+                        }))
+                    }
+                    msg::MOUNT_PARTITION => {
+                        let (mount, source, mount_point) = MountPartitionMsg::from_bytes(&buf[..len])
+                            .ok_or(SysError::IoError)?;
+                        let mut source_buf = [0u8; 32];
+                        let source_len = source.len().min(32);
+                        source_buf[..source_len].copy_from_slice(&source[..source_len]);
+                        let mut mount_buf = [0u8; 64];
+                        let mount_len = mount_point.len().min(64);
+                        mount_buf[..mount_len].copy_from_slice(&mount_point[..mount_len]);
+                        Ok(Some(DevdCommand::MountPartition {
+                            seq_id: header.seq_id,
+                            shmem_id: mount.shmem_id,
+                            source: source_buf,
+                            source_len,
+                            mount_point: mount_buf,
+                            mount_len,
+                            fs_hint: mount.fs_hint,
+                            block_size: mount.block_size,
+                            block_count: mount.block_count,
                         }))
                     }
                     _ => {
@@ -720,6 +851,77 @@ impl DevdClient {
         let ack = SpawnAck::new_multi(seq_id, result, match_count, child_pids.len() as u8);
         let mut buf = [0u8; 128];
         let len = ack.write_to(&mut buf, child_pids).ok_or(SysError::IoError)?;
+        channel.send(&buf[..len])?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Orchestration Responses (driver → devd)
+    // =========================================================================
+
+    /// Report discovered partitions to devd (partd → devd)
+    ///
+    /// Call this after scanning a disk's partition table.
+    pub fn report_partitions(
+        &mut self,
+        source_shmem_id: u32,
+        scheme: u8,
+        partitions: &[PartitionInfoMsg],
+    ) -> Result<(), SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        // Build message: header + partition entries
+        let mut buf = [0u8; 1024];
+        let header = ReportPartitions::new(seq_id, source_shmem_id, partitions.len() as u8, scheme);
+        buf[..ReportPartitions::FIXED_SIZE].copy_from_slice(&header.to_bytes());
+
+        let mut offset = ReportPartitions::FIXED_SIZE;
+        for part in partitions {
+            let part_bytes = part.to_bytes();
+            if offset + part_bytes.len() > buf.len() {
+                return Err(SysError::InvalidArgument);
+            }
+            buf[offset..offset + part_bytes.len()].copy_from_slice(&part_bytes);
+            offset += part_bytes.len();
+        }
+
+        channel.send(&buf[..offset])?;
+        Ok(())
+    }
+
+    /// Notify devd that a partition DataPort is ready (partd → devd)
+    ///
+    /// Call this after creating a DataPort for a partition.
+    pub fn partition_ready(
+        &mut self,
+        name: &[u8],
+        shmem_id: u32,
+    ) -> Result<(), SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let msg = PartitionReadyMsg::new(seq_id, shmem_id);
+        let mut buf = [0u8; 64];
+        let len = msg.write_to(&mut buf, name).ok_or(SysError::IoError)?;
+        channel.send(&buf[..len])?;
+        Ok(())
+    }
+
+    /// Notify devd that a filesystem is mounted (fatfsd → devd)
+    ///
+    /// Call this after successfully mounting a filesystem.
+    pub fn mount_ready(
+        &mut self,
+        mount_point: &[u8],
+        shmem_id: u32,
+    ) -> Result<(), SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let msg = MountReadyMsg::new(seq_id, shmem_id);
+        let mut buf = [0u8; 128];
+        let len = msg.write_to(&mut buf, mount_point).ok_or(SysError::IoError)?;
         channel.send(&buf[..len])?;
         Ok(())
     }
@@ -1213,7 +1415,16 @@ impl DevdClient {
     /// }
     /// ```
     pub fn spawn_and_ack(&mut self, seq_id: u32, binary: &str) -> SpawnResult {
-        let pid = syscall::exec(binary);
+        self.spawn_and_ack_with_caps(seq_id, binary, 0)
+    }
+
+    /// Handle a spawn command by executing the binary with capabilities
+    pub fn spawn_and_ack_with_caps(&mut self, seq_id: u32, binary: &str, caps: u64) -> SpawnResult {
+        let pid = if caps != 0 {
+            syscall::exec_with_caps(binary, caps)
+        } else {
+            syscall::exec(binary)
+        };
         if pid > 0 {
             let _ = self.ack_spawn(seq_id, 0, pid as u32);
             SpawnResult::success(pid as u32)
@@ -1227,11 +1438,20 @@ impl DevdClient {
     ///
     /// Spawns multiple instances if count > 1 (e.g., for fan-out).
     pub fn spawn_multi_and_ack(&mut self, seq_id: u32, binary: &str, count: usize) -> (u8, [u32; 16]) {
+        self.spawn_multi_and_ack_with_caps(seq_id, binary, count, 0)
+    }
+
+    /// Handle a spawn command with multiple potential spawns and explicit caps
+    pub fn spawn_multi_and_ack_with_caps(&mut self, seq_id: u32, binary: &str, count: usize, caps: u64) -> (u8, [u32; 16]) {
         let mut pids = [0u32; 16];
         let mut spawned = 0u8;
 
         for i in 0..count.min(16) {
-            let pid = syscall::exec(binary);
+            let pid = if caps != 0 {
+                syscall::exec_with_caps(binary, caps)
+            } else {
+                syscall::exec(binary)
+            };
             if pid > 0 {
                 pids[i] = pid as u32;
                 spawned += 1;
@@ -1257,10 +1477,14 @@ pub trait SpawnHandler {
     /// 3. Return the PIDs of spawned children
     ///
     /// The default implementation spawns a single child unconditionally.
-    fn handle_spawn(&mut self, binary: &str, filter: &SpawnFilter) -> (u8, [u32; 16]) {
+    fn handle_spawn(&mut self, binary: &str, filter: &SpawnFilter, caps: u64) -> (u8, [u32; 16]) {
         let _ = filter; // Default ignores filter
         let mut pids = [0u32; 16];
-        let pid = syscall::exec(binary);
+        let pid = if caps != 0 {
+            syscall::exec_with_caps(binary, caps)
+        } else {
+            syscall::exec(binary)
+        };
         if pid > 0 {
             pids[0] = pid as u32;
             (1, pids)
@@ -1302,7 +1526,7 @@ pub trait SpawnHandler {
 /// ```rust
 /// struct MyDriver { children: Vec<u32> }
 /// impl SpawnHandler for MyDriver {
-///     fn handle_spawn(&mut self, binary: &str, _filter: &SpawnFilter) -> (u8, [u32; 16]) {
+///     fn handle_spawn(&mut self, binary: &str, _filter: &SpawnFilter, caps: u64) -> (u8, [u32; 16]) {
 ///         let pid = syscall::exec(binary);
 ///         if pid > 0 {
 ///             self.children.push(pid as u32);
@@ -1354,7 +1578,7 @@ fn handle_command<H: SpawnHandler>(
     cmd: DevdCommand,
 ) {
     match cmd {
-        DevdCommand::SpawnChild { seq_id, binary, binary_len, filter } => {
+        DevdCommand::SpawnChild { seq_id, binary, binary_len, filter, caps } => {
             let binary_name = match core::str::from_utf8(&binary[..binary_len]) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1363,7 +1587,7 @@ fn handle_command<H: SpawnHandler>(
                 }
             };
 
-            let (spawned, pids) = handler.handle_spawn(binary_name, &filter);
+            let (spawned, pids) = handler.handle_spawn(binary_name, &filter, caps);
             let result = if spawned > 0 { 0 } else { -1 };
             let _ = client.ack_spawn_multi(seq_id, result, spawned, &pids[..spawned as usize]);
         }
@@ -1375,6 +1599,10 @@ fn handle_command<H: SpawnHandler>(
             let info = handler.get_info();
             let _ = client.respond_info(seq_id, info);
         }
+        // Orchestration commands are handled directly by drivers in their main loop
+        DevdCommand::AttachDisk { .. } => {}
+        DevdCommand::RegisterPartition { .. } => {}
+        DevdCommand::MountPartition { .. } => {}
     }
 }
 

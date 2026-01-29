@@ -143,6 +143,11 @@ pub fn exec(path: &str) -> i64 {
     syscall2(sys::EXEC, path.as_ptr() as u64, path.len() as u64)
 }
 
+/// Execute a program from initrd with explicit capabilities
+pub fn exec_with_caps(path: &str, caps: u64) -> i64 {
+    syscall3(sys::EXEC_WITH_CAPS, path.as_ptr() as u64, path.len() as u64, caps)
+}
+
 /// Execute ELF from memory
 pub fn exec_mem(elf_data: &[u8], name: Option<&str>) -> i64 {
     let (name_ptr, name_len) = match name {
@@ -302,6 +307,16 @@ pub fn read(handle: Handle, buf: &mut [u8]) -> SysResult<usize> {
         Err(SysError::from_errno(ret as i32))
     } else {
         Ok(ret as usize)
+    }
+}
+
+/// Try to read from a handle without blocking.
+/// Returns Ok(Some(n)) if data was read, Ok(None) if nothing available (WouldBlock).
+pub fn try_read(handle: Handle, buf: &mut [u8]) -> SysResult<Option<usize>> {
+    match read(handle, buf) {
+        Ok(n) => Ok(Some(n)),
+        Err(SysError::WouldBlock) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

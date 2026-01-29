@@ -17,6 +17,12 @@ pub trait ProcessManager {
     /// Returns (pid, watcher) on success
     fn spawn(&mut self, binary: &str) -> Result<(u32, Process), SysError>;
 
+    /// Spawn a new process with explicit capabilities
+    ///
+    /// If `caps` is 0, inherits parent's capabilities unchanged (same as spawn).
+    /// If `caps` is non-zero, uses exec_with_caps to restrict the child.
+    fn spawn_with_caps(&mut self, binary: &str, caps: u64) -> Result<(u32, Process), SysError>;
+
     /// Kill a process by PID
     fn kill(&mut self, pid: u32) -> Result<(), SysError>;
 }
@@ -37,6 +43,21 @@ impl SyscallProcessManager {
 impl ProcessManager for SyscallProcessManager {
     fn spawn(&mut self, binary: &str) -> Result<(u32, Process), SysError> {
         let pid = syscall::exec(binary);
+        if pid < 0 {
+            return Err(SysError::from_errno(-pid as i32));
+        }
+        let pid = pid as u32;
+
+        let watcher = Process::watch(pid)?;
+        Ok((pid, watcher))
+    }
+
+    fn spawn_with_caps(&mut self, binary: &str, caps: u64) -> Result<(u32, Process), SysError> {
+        let pid = if caps != 0 {
+            syscall::exec_with_caps(binary, caps)
+        } else {
+            syscall::exec(binary)
+        };
         if pid < 0 {
             return Err(SysError::from_errno(-pid as i32));
         }
@@ -95,6 +116,10 @@ impl ProcessManager for MockProcessManager {
         // Can't create real Process in mock, so this would need adjustment
         // For now, return error to indicate mock limitation
         Err(SysError::Unsupported)
+    }
+
+    fn spawn_with_caps(&mut self, binary: &str, _caps: u64) -> Result<(u32, Process), SysError> {
+        self.spawn(binary)
     }
 
     fn kill(&mut self, pid: u32) -> Result<(), SysError> {

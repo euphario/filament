@@ -468,6 +468,19 @@ impl QueryHandler {
         binary: &[u8],
         trigger_port: &[u8],
     ) -> Option<u32> {
+        self.send_spawn_child_with_caps(service_idx, binary, trigger_port, 0)
+    }
+
+    /// Send a SPAWN_CHILD command to a driver with explicit capabilities
+    ///
+    /// Returns the sequence ID used (for tracking acknowledgement)
+    pub fn send_spawn_child_with_caps(
+        &mut self,
+        service_idx: u8,
+        binary: &[u8],
+        trigger_port: &[u8],
+        caps: u64,
+    ) -> Option<u32> {
         let slot = self.find_by_service_idx(service_idx)?;
         let client = self.clients[slot].as_mut()?;
 
@@ -482,7 +495,7 @@ impl QueryHandler {
             id
         };
 
-        let cmd = SpawnChild::new(seq_id);
+        let cmd = SpawnChild::with_caps(seq_id, caps);
         let mut buf = [0u8; 256];
         let len = cmd.write_to(&mut buf, binary, trigger_port)?;
 

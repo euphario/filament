@@ -2356,12 +2356,12 @@ fn main() {
             // === Check for devd commands ===
             if let Ok(Some(cmd)) = devd_client.poll_command() {
                 match cmd {
-                    userlib::devd::DevdCommand::SpawnChild { seq_id, binary, binary_len, filter } => {
+                    userlib::devd::DevdCommand::SpawnChild { seq_id, binary, binary_len, filter, caps } => {
                         let binary_str = match core::str::from_utf8(&binary[..binary_len]) {
                             Ok(s) => s,
                             Err(_) => continue,
                         };
-                        let (count, pids) = spawn_handler.handle_spawn(binary_str, &filter);
+                        let (count, pids) = spawn_handler.handle_spawn(binary_str, &filter, caps);
                         let result = if count > 0 { 0i32 } else { -1i32 };
                         let child_pid = pids[0];
                         let _ = devd_client.ack_spawn(seq_id, result, child_pid);
@@ -2403,7 +2403,7 @@ impl QemuUsbdSpawnHandler {
 }
 
 impl SpawnHandler for QemuUsbdSpawnHandler {
-    fn handle_spawn(&mut self, binary: &str, filter: &SpawnFilter) -> (u8, [u32; 16]) {
+    fn handle_spawn(&mut self, binary: &str, filter: &SpawnFilter, caps: u64) -> (u8, [u32; 16]) {
         log("[qemu-usbd] Received SPAWN_CHILD command");
         log("[qemu-usbd]   Binary: ");
         log(binary);
@@ -2446,9 +2446,13 @@ impl SpawnHandler for QemuUsbdSpawnHandler {
             }
         }
 
-        // Spawn the child process
+        // Spawn the child process (with caps if specified)
         let mut pids = [0u32; 16];
-        let pid = syscall::exec(binary);
+        let pid = if caps != 0 {
+            syscall::exec_with_caps(binary, caps)
+        } else {
+            syscall::exec(binary)
+        };
         if pid > 0 {
             log_val("[qemu-usbd]   Spawned child PID: ", pid as u64);
             pids[0] = pid as u32;

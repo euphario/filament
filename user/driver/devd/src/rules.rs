@@ -30,6 +30,8 @@ pub struct Rule {
     pub driver_binary: &'static str,
     /// Should the driver receive the port name as an argument?
     pub pass_port_name: bool,
+    /// Capability bits for spawned child (0 = inherit parent's caps)
+    pub caps: u64,
 }
 
 impl Rule {
@@ -62,12 +64,29 @@ impl Rule {
 ///
 /// Order matters - first matching rule wins.
 pub static RULES: &[Rule] = &[
+    // xhcid branch disabled — testing pcied → nvmed → partd → fatfsd path only
+    // Rule {
+    //     match_parent_type: None,
+    //     match_port_type: Some(PortType::Usb),
+    //     driver_binary: "xhcid",
+    //     pass_port_name: true,
+    //     caps: userlib::devd::caps::DRIVER,
+    // },
+    // When a Storage controller appears (NVMe, AHCI), spawn nvmed
+    Rule {
+        match_parent_type: None,
+        match_port_type: Some(PortType::Storage),
+        driver_binary: "nvmed",
+        pass_port_name: true,
+        caps: userlib::devd::caps::DRIVER,
+    },
     // When a Block device appears, spawn partd scanner
     Rule {
         match_parent_type: None,
         match_port_type: Some(PortType::Block),
         driver_binary: "partd",
         pass_port_name: true,
+        caps: userlib::devd::caps::DRIVER,
     },
     // When a Partition appears with a Block parent, spawn fatfsd
     // (fatfsd will probe and only attach if it recognizes the filesystem)
@@ -76,6 +95,7 @@ pub static RULES: &[Rule] = &[
         match_port_type: Some(PortType::Partition),
         driver_binary: "fatfsd",
         pass_port_name: true,
+        caps: userlib::devd::caps::DRIVER,
     },
 ];
 
@@ -143,6 +163,7 @@ mod tests {
             match_port_type: Some(PortType::Block),
             driver_binary: "partd",
             pass_port_name: true,
+            caps: 0,
         };
 
         assert!(rule.matches(PortType::Block, None));
@@ -157,6 +178,7 @@ mod tests {
             match_port_type: Some(PortType::Partition),
             driver_binary: "fatfsd",
             pass_port_name: true,
+            caps: 0,
         };
 
         assert!(rule.matches(PortType::Partition, Some(PortType::Block)));
