@@ -426,6 +426,20 @@ impl BusCtx for RuntimeCtx {
         self.kernel_buses.get(idx)?.as_ref().map(|e| &e.info)
     }
 
+    fn enable_bus_mastering(&mut self, bus_id: KernelBusId, device_bdf: u16) -> Result<(), BusError> {
+        let idx = bus_id.0 as usize;
+        let entry = self.kernel_buses.get_mut(idx)
+            .and_then(|e| e.as_mut())
+            .ok_or(BusError::InvalidMessage)?;
+
+        // Build EnableBusMastering message: [type(1), device_id(2)]
+        let mut msg = [0u8; 3];
+        msg[0] = 16; // EnableBusMastering
+        msg[1..3].copy_from_slice(&device_bdf.to_le_bytes());
+        entry.channel.send(&msg).map_err(|_| BusError::LinkDown)?;
+        Ok(())
+    }
+
     fn watch_handle(&mut self, handle: Handle, tag: u32) -> Result<(), BusError> {
         self.mux.add(handle, MuxFilter::Readable).map_err(|_| BusError::Internal)?;
         if !self.handles.add(handle, tag) {

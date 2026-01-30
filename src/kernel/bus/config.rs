@@ -25,6 +25,12 @@ pub struct BusConfig {
     /// True if PCIe uses ECAM (QEMU virt), false if MAC-based (MT7988)
     pub pcie_ecam_based: bool,
 
+    // PCIe MMIO window (for BAR allocation on ECAM platforms)
+    /// PCIe MMIO window base address (0 = firmware-assigned, no kernel allocation)
+    pub pcie_mmio_base: u64,
+    /// PCIe MMIO window end address (inclusive)
+    pub pcie_mmio_end: u64,
+
     // USB configuration
     /// USB/xHCI MAC base addresses
     pub usb_bases: &'static [usize],
@@ -55,6 +61,16 @@ impl BusConfig {
     pub fn is_pcie_ecam_based(&self) -> bool {
         self.pcie_ecam_based
     }
+
+    /// Get PCIe MMIO window (base, end) for BAR allocation
+    /// Returns None if no kernel BAR allocation (firmware-assigned)
+    pub fn pcie_mmio_window(&self) -> Option<(u64, u64)> {
+        if self.pcie_mmio_base != 0 && self.pcie_mmio_end > self.pcie_mmio_base {
+            Some((self.pcie_mmio_base, self.pcie_mmio_end))
+        } else {
+            None
+        }
+    }
 }
 
 // =============================================================================
@@ -75,6 +91,8 @@ static MT7988A_CONFIG: BusConfig = BusConfig {
     ],
     infracfg_base: 0x1000_1000,
     pcie_ecam_based: false,
+    pcie_mmio_base: 0,  // Firmware-assigned BARs on MT7988A
+    pcie_mmio_end: 0,
     usb_bases: &[
         0x1119_0000,  // SSUSB0 (M.2 slot)
         0x1120_0000,  // SSUSB1 (USB-A ports via VL822)
@@ -94,6 +112,8 @@ static MT7988A_LITE_CONFIG: BusConfig = BusConfig {
     ],
     infracfg_base: 0x1000_1000,
     pcie_ecam_based: false,
+    pcie_mmio_base: 0,
+    pcie_mmio_end: 0,
     usb_bases: &[
         0x1119_0000,  // SSUSB0
     ],
@@ -110,6 +130,8 @@ static QEMU_VIRT_CONFIG: BusConfig = BusConfig {
     ],
     infracfg_base: 0,
     pcie_ecam_based: true,
+    pcie_mmio_base: 0x1000_0000,   // QEMU virt PCI MMIO window
+    pcie_mmio_end: 0x3EFF_FFFF,
     usb_bases: &[],
 };
 

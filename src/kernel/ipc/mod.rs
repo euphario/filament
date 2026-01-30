@@ -307,6 +307,10 @@ fn connect_to_bus_port(name: &[u8], client: u32) -> Result<(ChannelId, waker::Wa
         port_reg.connect_and_accept(name, client, chan_table)
     })?;
 
+    // Mark client channel for kernel bus dispatch — writes on this channel
+    // are synchronously dispatched to the bus controller
+    set_kernel_dispatch(client_channel);
+
     // Call bus handler to send StateSnapshot
     match crate::kernel::bus::handle_port_connect(suffix_str, server_channel, client) {
         Ok(()) => {
@@ -499,6 +503,19 @@ pub fn close_unchecked(channel_id: ChannelId) -> Result<waker::WakeList, IpcErro
 /// Get peer channel ID
 pub fn get_peer_id(channel_id: ChannelId) -> Option<ChannelId> {
     with_channel_table(|table| table.get_peer_id(channel_id))
+}
+
+/// Mark a channel for kernel bus dispatch
+///
+/// Writes on this channel will be dispatched synchronously to the
+/// kernel bus controller instead of just being queued.
+pub fn set_kernel_dispatch(channel_id: ChannelId) {
+    with_channel_table(|table| table.set_kernel_dispatch(channel_id))
+}
+
+/// Check if a channel has kernel bus dispatch enabled
+pub fn is_kernel_dispatch(channel_id: ChannelId) -> bool {
+    with_channel_table(|table| table.is_kernel_dispatch(channel_id))
 }
 
 // ============================================================================

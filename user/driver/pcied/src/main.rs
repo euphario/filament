@@ -1,118 +1,39 @@
 //! PCIe Bus Driver
 //!
-//! Enumerates PCIe devices via ECAM and registers per-device ports with devd.
-//! Device info (BAR0 address/size) is embedded as metadata in the port
-//! registration, flowing to child drivers via spawn context.
+//! Reads PCI device list from the kernel's PCI registry and registers
+//! per-device ports with devd. The kernel handles all ECAM/MAC access,
+//! BAR probing, and BAR allocation. pcied is a thin policy layer.
 //!
 //! Architecture:
 //! 1. Connect to kernel's /kernel/bus/pcie0 to receive bus state
-//! 2. Wait for Safe state before proceeding
-//! 3. Enumerate PCI devices via ECAM
-//! 4. Register each device as a devd port with BAR0 metadata
-//! 5. devd rules match port types and spawn child drivers (nvmed, xhcid, etc.)
-//! 6. Child drivers read BAR0 info from spawn context metadata
-//!
-//! Supports:
-//! - QEMU virt (ECAM at 0x4010000000)
-//! - MT7988A (via platform-specific MAC access)
+//! 2. Wait for Safe state (kernel has already enumerated devices)
+//! 3. Read PCI device list from kernel via pci_enumerate()
+//! 4. Enable bus mastering for DMA-capable devices via kernel bus control
+//! 5. Register each device as a devd port with BAR0 metadata
+//! 6. devd rules match port types and spawn child drivers (nvmed, xhcid, etc.)
+//! 7. Child drivers read BAR0 info from spawn context metadata
 
 #![no_std]
 #![no_main]
 
-use userlib::syscall::{self, LogLevel};
+use userlib::syscall;
+use userlib::{uinfo, uerror};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId,
     KernelBusState, KernelBusChangeReason, bus_msg,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::devd::PortType;
-use userlib::mmio::MmioRegion;
 
 // ============================================================================
-// Logging
+// Logging — uses structured ulog macros from userlib
 // ============================================================================
 
-macro_rules! plog {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[pcied] ";
-        let mut buf = [0u8; 256];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &byte in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = byte; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Info, &buf[..pos]);
-    }};
-}
-
 // ============================================================================
-// Platform Detection
+// PCI Class Constants
 // ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Platform {
-    QemuVirt,
-    Mt7988a,
-    Unknown,
-}
-
-impl Platform {
-    fn detect() -> Self {
-        Platform::QemuVirt
-    }
-
-    fn ecam_base(&self) -> Option<u64> {
-        match self {
-            Platform::QemuVirt => Some(QEMU_ECAM_BASE),
-            Platform::Mt7988a => None,
-            Platform::Unknown => None,
-        }
-    }
-}
-
-// ============================================================================
-// ECAM Constants
-// ============================================================================
-
-const QEMU_ECAM_BASE: u64 = 0x40_1000_0000;
-const QEMU_ECAM_SIZE: u64 = 0x40_0000;
-
-const QEMU_PCI_MMIO_BASE: u64 = 0x1000_0000;
-const QEMU_PCI_MMIO_END: u64 = 0x3EFF_FFFF;
-
-static mut BAR_ALLOC_NEXT: u64 = QEMU_PCI_MMIO_BASE;
-
-const MAX_BUSES: u8 = 4;
-const MAX_DEVICES: u8 = 32;
-const MAX_FUNCTIONS: u8 = 8;
-
-// ============================================================================
-// PCI Configuration Space
-// ============================================================================
-
-mod pci_cfg {
-    pub const VENDOR_DEVICE: usize = 0x00;
-    pub const COMMAND_STATUS: usize = 0x04;
-    pub const CLASS_REV: usize = 0x08;
-    pub const HEADER_TYPE: usize = 0x0C;
-    pub const BAR0: usize = 0x10;
-}
-
-mod pci_cmd {
-    pub const MEMORY_SPACE: u16 = 0x0002;
-    pub const BUS_MASTER: u16 = 0x0004;
-}
 
 mod pci_class {
-    pub const BRIDGE: u8 = 0x06;
     pub const NETWORK: u8 = 0x02;
     pub const SERIAL_BUS: u8 = 0x0C;
     pub const MASS_STORAGE: u8 = 0x01;
@@ -128,267 +49,70 @@ mod pci_prog_if {
 }
 
 // ============================================================================
-// ECAM Access
-// ============================================================================
-
-struct EcamAccess {
-    mmio: MmioRegion,
-}
-
-impl EcamAccess {
-    fn new(ecam_phys: u64) -> Option<Self> {
-        let mmio = MmioRegion::open(ecam_phys, QEMU_ECAM_SIZE)?;
-        Some(Self { mmio })
-    }
-
-    fn config_offset(bus: u8, device: u8, function: u8, reg: usize) -> usize {
-        ((bus as usize) << 20) | ((device as usize) << 15) | ((function as usize) << 12) | reg
-    }
-
-    fn read32(&self, bus: u8, device: u8, function: u8, reg: usize) -> u32 {
-        self.mmio.read32(Self::config_offset(bus, device, function, reg))
-    }
-
-    fn write32(&self, bus: u8, device: u8, function: u8, reg: usize, val: u32) {
-        self.mmio.write32(Self::config_offset(bus, device, function, reg), val);
-    }
-
-    fn read16(&self, bus: u8, device: u8, function: u8, reg: usize) -> u16 {
-        self.mmio.read16(Self::config_offset(bus, device, function, reg))
-    }
-
-    fn write16(&self, bus: u8, device: u8, function: u8, reg: usize, val: u16) {
-        self.mmio.write16(Self::config_offset(bus, device, function, reg), val);
-    }
-}
-
-// ============================================================================
-// PCI Device
-// ============================================================================
-
-#[derive(Clone, Copy)]
-struct PciDevice {
-    bus: u8,
-    device: u8,
-    function: u8,
-    vendor_id: u16,
-    device_id: u16,
-    class: u8,
-    subclass: u8,
-    prog_if: u8,
-    bar0_phys: u64,
-    bar0_size: u64,
-}
-
-impl PciDevice {
-    fn is_xhci(&self) -> bool {
-        self.class == pci_class::SERIAL_BUS &&
-        self.subclass == pci_subclass::USB &&
-        self.prog_if == pci_prog_if::XHCI
-    }
-
-    fn is_network(&self) -> bool {
-        self.class == pci_class::NETWORK
-    }
-
-    fn class_name(&self) -> &'static str {
-        match (self.class, self.subclass, self.prog_if) {
-            (pci_class::SERIAL_BUS, pci_subclass::USB, pci_prog_if::XHCI) => "xhci",
-            (pci_class::NETWORK, _, _) => "network",
-            (pci_class::MASS_STORAGE, pci_subclass::NVME, _) => "nvme",
-            (pci_class::BRIDGE, _, _) => "bridge",
-            _ => "unknown",
-        }
-    }
-
-    fn is_nvme(&self) -> bool {
-        self.class == pci_class::MASS_STORAGE && self.subclass == pci_subclass::NVME
-    }
-
-    fn port_type(&self) -> PortType {
-        if self.is_xhci() {
-            PortType::Usb
-        } else if self.is_nvme() {
-            PortType::Storage
-        } else if self.is_network() {
-            PortType::Network
-        } else {
-            PortType::Service
-        }
-    }
-
-    fn format_port_name(&self, buf: &mut [u8; 32]) -> usize {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let class_name = self.class_name();
-
-        let mut i = 0;
-        for b in b"pci/" { buf[i] = *b; i += 1; }
-        buf[i] = HEX[(self.bus >> 4) as usize]; i += 1;
-        buf[i] = HEX[(self.bus & 0xf) as usize]; i += 1;
-        buf[i] = b':'; i += 1;
-        buf[i] = HEX[(self.device >> 4) as usize]; i += 1;
-        buf[i] = HEX[(self.device & 0xf) as usize]; i += 1;
-        buf[i] = b'.'; i += 1;
-        buf[i] = HEX[(self.function & 0xf) as usize]; i += 1;
-        buf[i] = b':'; i += 1;
-        for b in class_name.as_bytes() {
-            if i >= buf.len() { break; }
-            buf[i] = *b;
-            i += 1;
-        }
-        i
-    }
-
-    /// Build BAR0 metadata: [bar0_phys: u64 LE, bar0_size: u32 LE] = 12 bytes
-    fn bar0_metadata(&self) -> [u8; 12] {
-        let mut meta = [0u8; 12];
-        meta[0..8].copy_from_slice(&self.bar0_phys.to_le_bytes());
-        meta[8..12].copy_from_slice(&(self.bar0_size as u32).to_le_bytes());
-        meta
-    }
-}
-
-// ============================================================================
-// Device Registry
+// Device Classification (from PciEnumEntry)
 // ============================================================================
 
 const MAX_PCI_DEVICES: usize = 32;
 
-struct DeviceRegistry {
-    devices: [PciDevice; MAX_PCI_DEVICES],
-    count: usize,
-}
-
-impl DeviceRegistry {
-    fn add(&mut self, dev: PciDevice) {
-        if self.count < MAX_PCI_DEVICES {
-            self.devices[self.count] = dev;
-            self.count += 1;
-        }
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &PciDevice> {
-        self.devices[..self.count].iter()
+fn class_name(base_class: u8, subclass: u8, prog_if: u8) -> &'static str {
+    match (base_class, subclass, prog_if) {
+        (pci_class::SERIAL_BUS, pci_subclass::USB, pci_prog_if::XHCI) => "xhci",
+        (pci_class::NETWORK, _, _) => "network",
+        (pci_class::MASS_STORAGE, pci_subclass::NVME, _) => "nvme",
+        (0x06, _, _) => "bridge",
+        _ => "unknown",
     }
 }
 
-// ============================================================================
-// Enumeration
-// ============================================================================
-
-fn enumerate_ecam(ecam: &EcamAccess, registry: &mut DeviceRegistry) {
-    for bus in 0..MAX_BUSES {
-        for device in 0..MAX_DEVICES {
-            let vendor_device = ecam.read32(bus, device, 0, pci_cfg::VENDOR_DEVICE);
-            let vendor_id = (vendor_device & 0xFFFF) as u16;
-
-            if vendor_id == 0xFFFF || vendor_id == 0 { continue; }
-
-            let header = ecam.read32(bus, device, 0, pci_cfg::HEADER_TYPE);
-            let header_type = ((header >> 16) & 0xFF) as u8;
-            let multi_function = (header_type & 0x80) != 0;
-            let max_func = if multi_function { MAX_FUNCTIONS } else { 1 };
-
-            for function in 0..max_func {
-                if function > 0 {
-                    let vd = ecam.read32(bus, device, function, pci_cfg::VENDOR_DEVICE);
-                    if (vd & 0xFFFF) as u16 == 0xFFFF { continue; }
-                }
-                if let Some(dev) = probe_device(ecam, bus, device, function) {
-                    registry.add(dev);
-                }
-            }
-        }
+fn port_type(base_class: u8, subclass: u8, prog_if: u8) -> PortType {
+    match (base_class, subclass, prog_if) {
+        (pci_class::SERIAL_BUS, pci_subclass::USB, pci_prog_if::XHCI) => PortType::Usb,
+        (pci_class::MASS_STORAGE, pci_subclass::NVME, _) => PortType::Storage,
+        (pci_class::NETWORK, _, _) => PortType::Network,
+        _ => PortType::Service,
     }
 }
 
-fn probe_device(ecam: &EcamAccess, bus: u8, device: u8, function: u8) -> Option<PciDevice> {
-    let vendor_device = ecam.read32(bus, device, function, pci_cfg::VENDOR_DEVICE);
-    let vendor_id = (vendor_device & 0xFFFF) as u16;
-    let device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
-
-    if vendor_id == 0xFFFF || vendor_id == 0 { return None; }
-
-    let class_rev = ecam.read32(bus, device, function, pci_cfg::CLASS_REV);
-    let prog_if = ((class_rev >> 8) & 0xFF) as u8;
-    let subclass = ((class_rev >> 16) & 0xFF) as u8;
-    let class = ((class_rev >> 24) & 0xFF) as u8;
-
-    let header = ecam.read32(bus, device, function, pci_cfg::HEADER_TYPE);
-    let header_type = ((header >> 16) & 0x7F) as u8;
-    if header_type != 0 { return None; }
-
-    let (bar0_phys, bar0_size) = probe_bar(ecam, bus, device, function, pci_cfg::BAR0);
-
-    Some(PciDevice {
-        bus, device, function, vendor_id, device_id,
-        class, subclass, prog_if, bar0_phys, bar0_size,
-    })
+fn needs_bus_mastering(base_class: u8, subclass: u8, prog_if: u8) -> bool {
+    matches!(
+        (base_class, subclass, prog_if),
+        (pci_class::SERIAL_BUS, pci_subclass::USB, pci_prog_if::XHCI)
+        | (pci_class::MASS_STORAGE, pci_subclass::NVME, _)
+        | (pci_class::NETWORK, _, _)
+    )
 }
 
-fn probe_bar(ecam: &EcamAccess, bus: u8, device: u8, function: u8, bar_reg: usize) -> (u64, u64) {
-    let original = ecam.read32(bus, device, function, bar_reg);
-    if (original & 1) != 0 { return (0, 0); }
+fn format_port_name(entry: &syscall::PciEnumEntry, buf: &mut [u8; 32]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bus = entry.bus();
+    let device = entry.device();
+    let function = entry.function();
+    let cname = class_name(entry.base_class(), entry.subclass(), entry.prog_if());
 
-    let bar_type = (original >> 1) & 0x3;
-    let is_64bit = bar_type == 2;
-
-    ecam.write32(bus, device, function, bar_reg, 0xFFFFFFFF);
-    let size_mask_low = ecam.read32(bus, device, function, bar_reg);
-
-    let size_mask_high = if is_64bit {
-        let orig_high = ecam.read32(bus, device, function, bar_reg + 4);
-        ecam.write32(bus, device, function, bar_reg + 4, 0xFFFFFFFF);
-        let mask_high = ecam.read32(bus, device, function, bar_reg + 4);
-        ecam.write32(bus, device, function, bar_reg + 4, orig_high);
-        mask_high
-    } else {
-        0xFFFFFFFF
-    };
-
-    ecam.write32(bus, device, function, bar_reg, original);
-
-    if size_mask_low == 0 || size_mask_low == 0xFFFFFFFF { return (0, 0); }
-
-    let full_mask = ((size_mask_high as u64) << 32) | (size_mask_low as u64);
-    let size = !(full_mask & !0xF) + 1;
-
-    let mut addr = (original & !0xF) as u64;
-    if is_64bit {
-        let high = ecam.read32(bus, device, function, bar_reg + 4);
-        addr |= (high as u64) << 32;
+    let mut i = 0;
+    for b in b"pci/" { buf[i] = *b; i += 1; }
+    buf[i] = HEX[(bus >> 4) as usize]; i += 1;
+    buf[i] = HEX[(bus & 0xf) as usize]; i += 1;
+    buf[i] = b':'; i += 1;
+    buf[i] = HEX[(device >> 4) as usize]; i += 1;
+    buf[i] = HEX[(device & 0xf) as usize]; i += 1;
+    buf[i] = b'.'; i += 1;
+    buf[i] = HEX[(function & 0xf) as usize]; i += 1;
+    buf[i] = b':'; i += 1;
+    for b in cname.as_bytes() {
+        if i >= buf.len() { break; }
+        buf[i] = *b;
+        i += 1;
     }
-
-    if addr == 0 && size > 0 {
-        unsafe {
-            let align_mask = size - 1;
-            BAR_ALLOC_NEXT = (BAR_ALLOC_NEXT + align_mask) & !align_mask;
-            if BAR_ALLOC_NEXT + size <= QEMU_PCI_MMIO_END {
-                addr = BAR_ALLOC_NEXT;
-                BAR_ALLOC_NEXT += size;
-                let bar_value = (addr as u32) | (original & 0xF);
-                ecam.write32(bus, device, function, bar_reg, bar_value);
-                if is_64bit {
-                    ecam.write32(bus, device, function, bar_reg + 4, 0);
-                }
-                let cmd = ecam.read16(bus, device, function, pci_cfg::COMMAND_STATUS);
-                if (cmd & pci_cmd::MEMORY_SPACE) == 0 {
-                    ecam.write16(bus, device, function, pci_cfg::COMMAND_STATUS,
-                                 cmd | pci_cmd::MEMORY_SPACE);
-                }
-            }
-        }
-    }
-
-    (addr, size)
+    i
 }
 
-fn enable_bus_master(ecam: &EcamAccess, dev: &PciDevice) {
-    let cmd = ecam.read16(dev.bus, dev.device, dev.function, pci_cfg::COMMAND_STATUS);
-    if (cmd & pci_cmd::BUS_MASTER) == 0 {
-        ecam.write16(dev.bus, dev.device, dev.function, pci_cfg::COMMAND_STATUS,
-                     cmd | pci_cmd::BUS_MASTER);
-    }
+/// Build BAR0 metadata: [bar0_phys: u64 LE, bar0_size: u32 LE] = 12 bytes
+fn bar0_metadata(entry: &syscall::PciEnumEntry) -> [u8; 12] {
+    let mut meta = [0u8; 12];
+    meta[0..8].copy_from_slice(&entry.bar0_addr.to_le_bytes());
+    meta[8..12].copy_from_slice(&entry.bar0_size.to_le_bytes());
+    meta
 }
 
 // ============================================================================
@@ -396,24 +120,16 @@ fn enable_bus_master(ecam: &EcamAccess, dev: &PciDevice) {
 // ============================================================================
 
 struct PcieDriver {
-    platform: Platform,
-    registry: DeviceRegistry,
+    entries: [syscall::PciEnumEntry; MAX_PCI_DEVICES],
+    count: usize,
     kernel_bus: Option<KernelBusId>,
 }
 
 impl PcieDriver {
     const fn new() -> Self {
         Self {
-            platform: Platform::Unknown,
-            registry: DeviceRegistry {
-                devices: [PciDevice {
-                    bus: 0, device: 0, function: 0,
-                    vendor_id: 0, device_id: 0,
-                    class: 0, subclass: 0, prog_if: 0,
-                    bar0_phys: 0, bar0_size: 0,
-                }; MAX_PCI_DEVICES],
-                count: 0,
-            },
+            entries: [syscall::PciEnumEntry::empty(); MAX_PCI_DEVICES],
+            count: 0,
             kernel_bus: None,
         }
     }
@@ -435,15 +151,15 @@ impl PcieDriver {
         }
 
         let mut w = W { b: &mut buf, p: &mut pos };
-        let _ = writeln!(w, "PCIe Bus Driver (bus framework)");
-        let _ = writeln!(w, "  ECAM Base: {:#x}", QEMU_ECAM_BASE);
-        let _ = writeln!(w, "  Devices: {}", self.registry.count);
-        for dev in self.registry.iter() {
+        let _ = writeln!(w, "PCIe Bus Driver (kernel-enumerated)");
+        let _ = writeln!(w, "  Devices: {}", self.count);
+        for entry in &self.entries[..self.count] {
+            let cname = class_name(entry.base_class(), entry.subclass(), entry.prog_if());
             let _ = writeln!(w, "    {:02x}:{:02x}.{} {:04x}:{:04x} {} bar0={:#x}",
-                dev.bus, dev.device, dev.function,
-                dev.vendor_id, dev.device_id,
-                dev.class_name(),
-                dev.bar0_phys);
+                entry.bus(), entry.device(), entry.function(),
+                entry.vendor_id, entry.device_id,
+                cname,
+                entry.bar0_addr);
         }
 
         buf
@@ -459,15 +175,15 @@ impl Driver for PcieDriver {
         &mut self,
         _bus: KernelBusId,
         _old_state: KernelBusState,
-        new_state: KernelBusState,
-        reason: KernelBusChangeReason,
+        _new_state: KernelBusState,
+        _reason: KernelBusChangeReason,
         _ctx: &mut dyn BusCtx,
     ) {
-        plog!("bus state -> {:?} (reason: {:?})", new_state, reason);
+        uinfo!("pcied", "bus_state_change";);
     }
 
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        plog!("starting");
+        uinfo!("pcied", "starting";);
 
         // Get bus path from spawn context, falling back to default
         let mut bus_path_buf = [0u8; 64];
@@ -490,68 +206,58 @@ impl Driver for PcieDriver {
         // connect -> StateSnapshot -> wait Safe -> SetDriver -> Mux registration
         match ctx.claim_kernel_bus(bus_path) {
             Ok((bus_id, info)) => {
-                plog!("kernel bus claimed (type={}, caps={:#x})", info.bus_type, info.capabilities);
+                uinfo!("pcied", "bus_claimed"; bus_type = info.bus_type as u32, caps = userlib::ulog::hex32(info.capabilities as u32));
                 self.kernel_bus = Some(bus_id);
             }
             Err(_) => {
-                plog!("kernel bus not available (QEMU?)");
+                uerror!("pcied", "bus_unavailable";);
             }
         }
 
-        // Detect platform
-        self.platform = Platform::detect();
-        let ecam_base = match self.platform.ecam_base() {
-            Some(base) => base,
-            None => {
-                plog!("no ECAM support");
+        // Read PCI device list from kernel registry
+        match syscall::pci_enumerate(&mut self.entries) {
+            Ok(count) => {
+                self.count = count;
+                uinfo!("pcied", "pci_devices"; count = count as u32);
+            }
+            Err(e) => {
+                uerror!("pcied", "pci_enumerate_failed";);
                 return Err(BusError::Internal);
             }
-        };
+        }
 
-        // Map ECAM
-        let ecam = match EcamAccess::new(ecam_base) {
-            Some(e) => e,
-            None => {
-                plog!("failed to map ECAM");
-                return Err(BusError::ShmemError);
-            }
-        };
-
-        // Enumerate PCI devices
-        enumerate_ecam(&ecam, &mut self.registry);
-
-        // Enable bus mastering
-        for dev in self.registry.iter() {
-            if dev.is_xhci() || dev.is_network() || dev.is_nvme() {
-                enable_bus_master(&ecam, dev);
+        // Enable bus mastering for DMA-capable devices via kernel bus control
+        if let Some(bus_id) = self.kernel_bus {
+            for idx in 0..self.count {
+                let entry = &self.entries[idx];
+                if needs_bus_mastering(entry.base_class(), entry.subclass(), entry.prog_if()) {
+                    let device_bdf = (entry.bdf & 0xFFFF) as u16;
+                    if let Err(e) = ctx.enable_bus_mastering(bus_id, device_bdf) {
+                        uerror!("pcied", "bus_master_failed"; bdf = entry.bdf);
+                    }
+                }
             }
         }
 
         // Register per-device ports with devd including BAR0 metadata
-        // No Port objects needed — devd stores metadata and delivers it
-        // to child drivers via spawn context
-        for idx in 0..self.registry.count {
-            let dev = &self.registry.devices[idx];
+        for idx in 0..self.count {
+            let entry = &self.entries[idx];
             let mut name_buf = [0u8; 32];
-            let name_len = dev.format_port_name(&mut name_buf);
+            let name_len = format_port_name(entry, &mut name_buf);
             let name = &name_buf[..name_len];
 
             // BAR0 metadata: [bar0_phys: u64 LE, bar0_size: u32 LE]
-            let metadata = dev.bar0_metadata();
-            let _ = ctx.register_port_with_metadata(name, dev.port_type(), 0, None, &metadata);
+            let metadata = bar0_metadata(entry);
+            let pt = port_type(entry.base_class(), entry.subclass(), entry.prog_if());
+            let _ = ctx.register_port_with_metadata(name, pt, 0, None, &metadata);
 
-            plog!("registered {} bar0={:#x} size={:#x}",
-                core::str::from_utf8(name).unwrap_or("?"),
-                dev.bar0_phys, dev.bar0_size);
+            uinfo!("pcied", "port_registered";
+                name = core::str::from_utf8(name).unwrap_or("?"),
+                bar0 = userlib::ulog::hex64(entry.bar0_addr),
+                size = userlib::ulog::hex32(entry.bar0_size));
         }
 
-        let platform_name = match self.platform {
-            Platform::QemuVirt => "QEMU",
-            Platform::Mt7988a => "MT7988A",
-            Platform::Unknown => "?",
-        };
-        plog!("ready ({}, {} devices)", platform_name, self.registry.count);
-
+        uinfo!("pcied", "ready"; devices = self.count as u32);
         Ok(())
     }
 

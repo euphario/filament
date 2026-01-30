@@ -26,6 +26,9 @@ pub mod bus_runtime;
 pub mod bus_block;
 pub mod vfs_proto;
 pub mod vfs_client;
+pub mod serialize;
+#[macro_use]
+pub mod ulog;
 
 pub use error::{SysError, SysResult};
 pub use syscall::{LogLevel, Handle, ObjHandle, ObjectType};

@@ -80,6 +80,14 @@ pub static RULES: &[Rule] = &[
         pass_port_name: true,
         caps: userlib::devd::caps::DRIVER,
     },
+    // When a Network controller appears (virtio-net, etc.), spawn netd
+    Rule {
+        match_parent_type: None,
+        match_port_type: Some(PortType::Network),
+        driver_binary: "netd",
+        pass_port_name: true,
+        caps: userlib::devd::caps::DRIVER,
+    },
     // When a Block device appears, spawn partd scanner
     Rule {
         match_parent_type: None,

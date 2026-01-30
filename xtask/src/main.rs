@@ -262,6 +262,7 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
         all_programs.push(("pcied", "driver/pcied"));
         all_programs.push(("xhcid", "driver/xhcid"));
         all_programs.push(("nvmed", "driver/nvmed"));
+        all_programs.push(("netd", "driver/netd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
         all_programs.push(("vfsd", "driver/vfsd"));
     }

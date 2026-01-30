@@ -80,8 +80,8 @@ pub struct PciDevice {
     /// MSI-X capability offset (0 if not supported)
     pub msix_cap: u8,
     /// Owning process ID (0 = unclaimed)
-    /// Private to enforce access control - use owner() and set_owner()
-    owner_pid: u32,
+    /// Crate-private to enforce access control - use owner() and set_owner()
+    pub(crate) owner_pid: u32,
 }
 
 impl PciDevice {

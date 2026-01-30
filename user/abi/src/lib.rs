@@ -64,6 +64,7 @@ pub mod syscall {
     pub const EXEC_WITH_CAPS: u64 = 74;
     pub const DEVICE_LIST: u64 = 75;
     pub const KLOG: u64 = 76;
+    pub const KLOG_WRITE: u64 = 77;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;
@@ -798,6 +799,88 @@ pub enum PipeMessageType {
 
 /// Maximum pipe message size (fits in 256B slot with header)
 pub const PIPE_MESSAGE_MAX: usize = 248;
+
+// ============================================================================
+// PCI Enumeration (Kernel → Userspace)
+// ============================================================================
+
+/// PCI device entry returned by kernel enumeration
+///
+/// Used by read(PciBus) to return the list of discovered PCI devices.
+/// 28 bytes per entry, packed for efficient transfer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PciEnumEntry {
+    /// Packed BDF: bus(8) | device(5) | function(3) in low 16 bits
+    pub bdf: u32,
+    /// PCI vendor ID
+    pub vendor_id: u16,
+    /// PCI device ID
+    pub device_id: u16,
+    /// Packed class: class(8) | subclass(8) | prog_if(8) | revision(8)
+    pub class_code: u32,
+    /// First MMIO BAR physical address
+    pub bar0_addr: u64,
+    /// First MMIO BAR size in bytes
+    pub bar0_size: u32,
+    /// MSI capability offset (0 = not supported)
+    pub msi_cap: u8,
+    /// MSI-X capability offset (0 = not supported)
+    pub msix_cap: u8,
+    /// Reserved for future use
+    pub _reserved: [u8; 2],
+}
+
+impl PciEnumEntry {
+    pub const fn empty() -> Self {
+        Self {
+            bdf: 0,
+            vendor_id: 0,
+            device_id: 0,
+            class_code: 0,
+            bar0_addr: 0,
+            bar0_size: 0,
+            msi_cap: 0,
+            msix_cap: 0,
+            _reserved: [0; 2],
+        }
+    }
+
+    /// Extract bus number from packed BDF
+    pub const fn bus(&self) -> u8 {
+        ((self.bdf >> 8) & 0xFF) as u8
+    }
+
+    /// Extract device number from packed BDF
+    pub const fn device(&self) -> u8 {
+        ((self.bdf >> 3) & 0x1F) as u8
+    }
+
+    /// Extract function number from packed BDF
+    pub const fn function(&self) -> u8 {
+        (self.bdf & 0x07) as u8
+    }
+
+    /// Extract base class from class_code
+    pub const fn base_class(&self) -> u8 {
+        ((self.class_code >> 24) & 0xFF) as u8
+    }
+
+    /// Extract subclass from class_code
+    pub const fn subclass(&self) -> u8 {
+        ((self.class_code >> 16) & 0xFF) as u8
+    }
+
+    /// Extract prog_if from class_code
+    pub const fn prog_if(&self) -> u8 {
+        ((self.class_code >> 8) & 0xFF) as u8
+    }
+
+    /// Extract revision from class_code
+    pub const fn revision(&self) -> u8 {
+        (self.class_code & 0xFF) as u8
+    }
+}
 
 /// Pipe message header (8 bytes)
 #[repr(C)]

@@ -313,6 +313,12 @@ pub fn continue_init() -> bool {
                 // Transition to Safe (notifies connected devd if any)
                 bus.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
 
+                // If this is a PCIe bus, enumerate devices now that hardware is ready
+                if bus.bus_type == BusType::PCIe {
+                    let count = super::pci::enumerate();
+                    kinfo!("bus", "pci_enumerated"; devices = count as u64);
+                }
+
                 // Return true = more work might remain
                 return true;
             }

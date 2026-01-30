@@ -634,6 +634,12 @@ pub trait BusCtx {
     /// Get cached info for a claimed kernel bus.
     fn kernel_bus_info(&self, id: KernelBusId) -> Option<&KernelBusInfo>;
 
+    /// Enable bus mastering for a PCI device via kernel bus control.
+    ///
+    /// `bus_id`: The kernel bus returned by `claim_kernel_bus()`.
+    /// `device_bdf`: Packed BDF (bus<<8 | dev<<3 | func).
+    fn enable_bus_mastering(&mut self, bus_id: KernelBusId, device_bdf: u16) -> Result<(), BusError>;
+
     // === Identity ===
 
     /// This driver's name.

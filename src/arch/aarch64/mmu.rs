@@ -156,6 +156,44 @@ impl PageTable {
 extern "C" {
     pub static BOOT_TTBR0: u64;
     pub static BOOT_TTBR1: u64;
+    // L1 table for TTBR1 (512 entries, each covers 1GB)
+    static boot_l1_ttbr1: [u64; 512];
+}
+
+/// Map a 1GB-aligned physical region as device memory in the kernel address space.
+///
+/// Writes an L1 block descriptor into the kernel's TTBR1 page table so that
+/// `phys_base | KERNEL_VIRT_BASE` becomes accessible as device memory.
+///
+/// # Safety
+/// - `phys_base` must be 1GB-aligned
+/// - The L1 slot must not already be in use for a different mapping
+/// - Must be called after MMU is enabled
+pub fn map_kernel_device_1gb(phys_base: u64) {
+    assert!(phys_base & 0x3FFF_FFFF == 0, "phys_base must be 1GB-aligned");
+
+    let l1_index = ((phys_base >> 30) & 0x1FF) as usize;
+
+    // Build L1 block descriptor: device memory, no-execute, kernel-only
+    let descriptor = phys_base
+        | flags::VALID
+        | flags::AF
+        | attr::DEVICE
+        | (flags::UXN | flags::PXN);
+    // Note: no TABLE flag = block descriptor at L1 level
+
+    // Write to the L1 table (identity-mapped in kernel VA space)
+    let l1_virt = unsafe { &boot_l1_ttbr1 as *const _ as u64 } ;
+    let entry_ptr = (l1_virt + (l1_index as u64) * 8) as *mut u64;
+    unsafe {
+        core::ptr::write_volatile(entry_ptr, descriptor);
+        // Ensure the write is visible before any access through the new mapping
+        core::arch::asm!(
+            "dsb sy",
+            "isb",
+            options(nostack, nomem)
+        );
+    }
 }
 
 /// Get the boot TTBR0 physical address (identity mapping)

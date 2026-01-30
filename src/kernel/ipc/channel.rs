@@ -141,6 +141,11 @@ pub struct Channel {
 
     /// Subscribers waiting for events
     subscribers: SubscriberSet,
+
+    /// When true, writes on this channel are dispatched to the kernel bus
+    /// controller synchronously. Set for client channels connected to
+    /// /kernel/bus/* ports.
+    kernel_dispatch: bool,
 }
 
 impl Channel {
@@ -152,6 +157,7 @@ impl Channel {
             state: ChannelState::Open { peer_id, peer_owner },
             queue: MessageQueue::new(),
             subscribers: SubscriberSet::new(),
+            kernel_dispatch: false,
         }
     }
 
@@ -163,6 +169,7 @@ impl Channel {
             state: ChannelState::Closed,
             queue: MessageQueue::new(),
             subscribers: SubscriberSet::new(),
+            kernel_dispatch: false,
         }
     }
 
@@ -188,6 +195,16 @@ impl Channel {
     /// Get peer channel ID (if open)
     pub fn peer_id(&self) -> Option<ChannelId> {
         self.state.peer_id()
+    }
+
+    /// Check if writes on this channel dispatch to a kernel bus controller
+    pub fn is_kernel_dispatch(&self) -> bool {
+        self.kernel_dispatch
+    }
+
+    /// Mark this channel for kernel bus dispatch
+    pub fn set_kernel_dispatch(&mut self) {
+        self.kernel_dispatch = true;
     }
 
     /// Get message queue reference

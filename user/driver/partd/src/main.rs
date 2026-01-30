@@ -31,6 +31,7 @@
 #![no_main]
 
 use userlib::syscall::{self, LogLevel};
+use userlib::uerror;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, bus_msg,
@@ -46,33 +47,8 @@ use userlib::query::{PartitionInfoMsg, part_scheme};
 const MAX_PARTITIONS: usize = 4;
 
 // =============================================================================
-// Logging
+// Logging — uses structured ulog macros from userlib
 // =============================================================================
-
-macro_rules! plog {
-    ($($arg:tt)*) => { /* disabled */ };
-}
-
-macro_rules! perror {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[partd] ERROR: ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Error, &buf[..pos]);
-    }};
-}
 
 // =============================================================================
 // MBR Structures
@@ -101,21 +77,7 @@ impl MbrEntry {
     }
 }
 
-fn partition_type_name(ptype: u8) -> &'static str {
-    match ptype {
-        0x00 => "Empty",
-        0x01 => "FAT12",
-        0x04 | 0x06 | 0x0E => "FAT16",
-        0x05 | 0x0F => "Extended",
-        0x07 => "NTFS/exFAT",
-        0x0B | 0x0C => "FAT32",
-        0x82 => "Linux swap",
-        0x83 => "Linux",
-        0xEE => "GPT protective",
-        0xEF => "EFI System",
-        _ => "Unknown",
-    }
-}
+
 
 struct Mbr {
     entries: [MbrEntry; 4],
@@ -241,22 +203,19 @@ impl PartitionDriver {
     fn scan_partitions(&mut self, ctx: &mut dyn BusCtx) -> usize {
         let mut mbr_buf = [0u8; 512];
         if !self.read_block(0, &mut mbr_buf, ctx) {
-            perror!("failed to read MBR");
+            uerror!("partd", "mbr_read_failed";);
             return 0;
         }
 
         let mbr = Mbr::parse(&mbr_buf);
         if !mbr.valid {
-            perror!("invalid MBR (no 0x55AA signature)");
+            uerror!("partd", "mbr_invalid";);
             return 0;
         }
 
         self.partition_count = 0;
         for (i, entry) in mbr.entries.iter().enumerate() {
             if entry.is_valid() && self.partition_count < MAX_PARTITIONS {
-                plog!("  part{}: type={:#04x} ({}) start={} size={}",
-                    i, entry.partition_type, partition_type_name(entry.partition_type),
-                    entry.start_lba, entry.sector_count);
                 self.partitions[self.partition_count] = PartitionInfo {
                     index: i as u8,
                     partition_type: entry.partition_type,
@@ -627,12 +586,12 @@ impl Driver for PartitionDriver {
                                 part_scheme::MBR,
                                 &part_infos[..count],
                             ) {
-                                perror!("failed to report partitions");
+                                uerror!("partd", "report_failed";);
                             }
                         }
                     }
                     Err(e) => {
-                        perror!("connect to disk failed: {:?}", e);
+                        uerror!("partd", "disk_connect_failed";);
                     }
                 }
 
@@ -664,7 +623,7 @@ impl Driver for PartitionDriver {
                         }
                     }
                     Err(e) => {
-                        perror!("create partition DataPort failed: {:?}", e);
+                        uerror!("partd", "dataport_create_failed";);
                     }
                 }
 

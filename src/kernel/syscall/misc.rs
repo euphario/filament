@@ -227,6 +227,54 @@ pub(super) fn sys_klog(level: u8, buf_ptr: u64, buf_len: usize) -> i64 {
     buf_len as i64
 }
 
+/// Write a pre-built binary log record into the kernel log ring
+/// Args: buf_ptr (record bytes), buf_len (record length)
+///
+/// The record must be in the standard binary format (RecordHeader + fields).
+/// The kernel validates the header and writes it directly — no text conversion.
+/// This preserves structured key-value data from userspace ulog macros.
+pub(super) fn sys_klog_write(buf_ptr: u64, buf_len: usize) -> i64 {
+    // Validate size
+    if buf_len < crate::klog::RecordHeader::SIZE || buf_len > crate::klog::MAX_RECORD_SIZE {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Copy record from userspace
+    let mut record = [0u8; crate::klog::MAX_RECORD_SIZE];
+    match uaccess::copy_from_user(&mut record[..buf_len], buf_ptr) {
+        Ok(_) => {}
+        Err(_) => return SyscallError::BadAddress as i64,
+    }
+
+    // Validate: total_len in header must match buf_len
+    let total_len = u16::from_le_bytes([record[0], record[1]]) as usize;
+    if total_len != buf_len {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Validate: level must be known
+    let level = record[6];
+    if crate::klog::Level::from_u8(level).is_none() {
+        return SyscallError::InvalidArgument as i64;
+    }
+
+    // Re-stamp the timestamp from kernel's clock so all records use the
+    // same time base (userspace counter may drift or start from different epoch)
+    let ts = crate::klog::timestamp_ms();
+    record[2] = ts as u8;
+    record[3] = (ts >> 8) as u8;
+    record[4] = (ts >> 16) as u8;
+    record[5] = (ts >> 24) as u8;
+
+    // Write directly into kernel log ring — structure preserved
+    unsafe {
+        let ring = &mut *core::ptr::addr_of_mut!(crate::klog::LOG_RING);
+        ring.write(&record[..buf_len]);
+    }
+
+    buf_len as i64
+}
+
 /// Perform hardware reset
 /// This is public so it can be called from devd watchdog recovery
 pub fn hardware_reset() -> ! {

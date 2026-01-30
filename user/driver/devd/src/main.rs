@@ -31,7 +31,8 @@ mod devices;
 mod query;
 mod rules;
 
-use userlib::syscall::{self, LogLevel};
+use userlib::syscall;
+use userlib::{uinfo, uerror};
 use userlib::ipc::{Port, Timer, EventLoop, ObjHandle, Channel};
 use userlib::error::{SysError, SysResult};
 use userlib::query::{
@@ -120,59 +121,9 @@ impl AdminClients {
 // Logging
 // =============================================================================
 
-/// Enable verbose debug logging (disable for production)
-const VERBOSE: bool = false;
-
-/// Verbose debug log (no-op when VERBOSE=false)
-macro_rules! dlog {
-    ($($arg:tt)*) => {{
-        // Disabled for reduced logging noise
-        // Enable VERBOSE constant to see debug output
-    }};
-}
-
-/// Important state change log (always shown)
-macro_rules! dlog_state {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[devd] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Info, &buf[..pos]);
-    }};
-}
-
-macro_rules! derror {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[devd] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Error, &buf[..pos]);
-    }};
-}
+// All logging uses structured ulog macros from userlib:
+// - uinfo!("devd", "event_name"; key = val, ...)
+// - uerror!("devd", "error_name"; key = val, ...)
 
 // =============================================================================
 // Devd - Service Supervisor
@@ -683,6 +634,11 @@ impl Devd {
         syscall::gettime() / 1_000_000
     }
 
+    /// Get service name by index, for log messages
+    fn svc_name(&self, idx: u8) -> &str {
+        self.services.get(idx as usize).map(|s| s.name()).unwrap_or("?")
+    }
+
     // =========================================================================
     // Initialization
     // =========================================================================
@@ -695,7 +651,7 @@ impl Devd {
 
         let query_port = Port::register(b"devd-query:")?;
         events.watch(query_port.handle())?;
-        dlog_state!("query_port handle={}", query_port.handle().raw());
+        uinfo!("devd", "query_port_init"; handle = query_port.handle().raw());
 
         self.port = Some(port);
         self.query_port = Some(query_port);
@@ -756,7 +712,7 @@ impl Devd {
         let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
             Ok(result) => result,
             Err(e) => {
-                derror!("spawn {} failed err={:?}", binary, e);
+                uerror!("devd", "spawn_failed"; binary = binary);
                 self.services.transition(idx, ServiceState::Failed { code: -1 }, now);
                 return;
             }
@@ -806,7 +762,7 @@ impl Devd {
             service.last_change = now;
         }
 
-        dlog_state!("spawned {} pid={}", binary, pid);
+        uinfo!("devd", "svc_spawned"; binary = binary, pid = pid);
 
         // Pre-register ports this service will provide (not available yet)
         for pd in port_defs.iter().flatten() {
@@ -896,7 +852,7 @@ impl Devd {
                     service.state = ServiceState::Failed { code };
                     service.last_change = now;
                     let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("?");
-                    derror!("{} failed code={} restarts={}", name, code, service.total_restarts);
+                    uerror!("devd", "svc_failed"; name = name, code = code as i32, restarts = service.total_restarts as u32);
                     (port_arr, false, if auto_restart { ExitAction::Failed } else { ExitAction::Stopped }, old_pid)
                 } else {
                     service.state = ServiceState::Crashed { code, restarts };
@@ -977,7 +933,7 @@ impl Devd {
                 }
             }
 
-            dlog_state!("service {} state: {:?} -> Ready", service.name(), service.state);
+            uinfo!("devd", "svc_ready"; name = service.name());
             service.state = ServiceState::Ready;
             service.last_change = now;
             service.backoff_ms = INITIAL_BACKOFF_MS;
@@ -1029,10 +985,7 @@ impl Devd {
                 return;
             }
 
-            let name = service.name();
             let pid = service.pid;
-
-            dlog!("killing {} pid={} (branch prune)", name, pid);
 
             // Clean up watcher
             if let Some(watcher) = service.watcher.take() {
@@ -1070,10 +1023,7 @@ impl Devd {
         }
 
         // Remove devices registered by this service
-        let removed = self.devices.remove_by_owner(idx as u8);
-        if removed > 0 {
-            dlog!("removed {} devices from service idx={}", removed, idx);
-        }
+        let _removed = self.devices.remove_by_owner(idx as u8);
     }
 
     // =========================================================================
@@ -1111,19 +1061,12 @@ impl Devd {
                     if let Some(events) = &mut self.events {
                         let _ = events.watch(channel.handle());
                     }
-                    match self.admin_clients.add(channel) {
-                        Some(slot) => {
-                            dlog!("admin client connected slot={} pid={}", slot, client_pid);
-                        }
-                        None => {
-                            dlog!("admin client rejected (full) pid={}", client_pid);
-                        }
-                    }
+                    let _ = self.admin_clients.add(channel);
                 }
             }
             Err(SysError::WouldBlock) => {}
-            Err(e) => {
-                derror!("devd: accept failed err={:?}", e);
+            Err(_e) => {
+                uerror!("devd", "accept_failed";);
             }
         }
     }
@@ -1137,7 +1080,7 @@ impl Devd {
                 && registers_empty
                 && service.pid != 0
             {
-                dlog_state!("service {} state: Starting -> Ready (portless)", service.name());
+                uinfo!("devd", "svc_ready_portless"; name = service.name());
                 service.state = ServiceState::Ready;
                 service.last_change = now;
                 service.backoff_ms = INITIAL_BACKOFF_MS;
@@ -1317,7 +1260,6 @@ impl Devd {
             if let Some(events) = &mut self.events {
                 let _ = events.unwatch(channel.handle());
             }
-            dlog!("admin client disconnected slot={}", slot);
         }
     }
 
@@ -1367,8 +1309,6 @@ impl Devd {
                     service.state = ServiceState::Pending;
                     service.last_change = now;
 
-                    let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("?");
-                    dlog!("{} retry after failed (total_restarts={})", name, service.total_restarts);
                     false
                 }
                 _ => false,
@@ -1394,7 +1334,7 @@ impl Devd {
 
         match query_port.accept_with_pid() {
             Ok((channel, client_pid)) => {
-                dlog_state!("query accept: pid={}", client_pid);
+                uinfo!("devd", "query_accept"; pid = client_pid);
                 // Check if this is a known service (driver)
                 // First try the normal service registry lookup for Ready services
                 let mut service_idx = self.services.find_by_pid(client_pid)
@@ -1417,8 +1357,6 @@ impl Devd {
                             // Recognize as driver but keep in Starting state
                             // Driver must send STATE_CHANGE(Ready) when actually ready
                             service_idx = Some(idx as u8);
-                            dlog!("query: service {} connected (still Starting)",
-                                self.services.get(idx).map(|s| s.name()).unwrap_or("?"));
                         }
                     }
                 }
@@ -1443,26 +1381,20 @@ impl Devd {
 
                 // Add to query handler
                 match self.query_handler.add_client(channel, service_idx, client_pid) {
-                    Some(slot) => {
-                        let client_type = if service_idx.is_some() { "driver" } else { "client" };
-                        dlog!("query: {} connected (slot={}, pid={}, svc_idx={:?})",
-                            client_type, slot, client_pid, service_idx);
-
+                    Some(_slot) => {
                         // Check if this is partd for orchestration
                         if let Some(idx) = service_idx {
-                            dlog_state!("check_orchestration for svc={}", idx);
                             self.check_orchestration_driver_connected(idx);
-                            dlog_state!("check_orchestration done");
                         }
                     }
                     None => {
-                        derror!("query: too many clients, rejecting pid={}", client_pid);
+                        uerror!("devd", "query_full"; pid = client_pid);
                     }
                 }
             }
             Err(SysError::WouldBlock) => {}
-            Err(e) => {
-                derror!("query: accept failed err={:?}", e);
+            Err(_e) => {
+                uerror!("devd", "query_accept_failed";);
             }
         }
     }
@@ -1582,7 +1514,7 @@ impl Devd {
                 self.remove_query_client(slot);
             }
             Err(e) => {
-                derror!("query: recv failed slot={} err={:?}", slot, e);
+                uerror!("devd", "query_recv_failed"; slot = slot as u32);
                 self.remove_query_client(slot);
             }
         }
@@ -1621,9 +1553,9 @@ impl Devd {
         // Send response
         let result_code = match result {
             Ok(()) => error::OK,
-            Err(e) => {
+            Err(_e) => {
                 if let Ok(name_str) = core::str::from_utf8(info.name) {
-                    derror!("port registration failed: {} err={:?} owner={}", name_str, e, info.owner_idx);
+                    uerror!("devd", "port_register_failed"; name = name_str, owner = info.owner_idx as u32);
                 }
                 error::INVALID_REQUEST
             }
@@ -1638,7 +1570,7 @@ impl Devd {
         let state_msg = match StateChange::from_bytes(buf) {
             Some(s) => s,
             None => {
-                derror!("invalid STATE_CHANGE message from slot={}", slot);
+                uerror!("devd", "invalid_state_change"; slot = slot as u32);
                 return;
             }
         };
@@ -1647,12 +1579,11 @@ impl Devd {
         let driver_idx = match self.query_handler.get_service_idx(slot) {
             Some(idx) => idx,
             None => {
-                dlog!("STATE_CHANGE from non-driver slot={}", slot);
                 return;
             }
         };
 
-        dlog_state!("driver {} state_change: {}", driver_idx, state_msg.new_state);
+        uinfo!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
 
         // When driver reports Ready, send any pending spawn commands
         if state_msg.new_state == driver_state::READY {
@@ -1669,7 +1600,7 @@ impl Devd {
         let header = match QueryHeader::from_bytes(buf) {
             Some(h) => h,
             None => {
-                derror!("invalid GET_SPAWN_CONTEXT message from slot={}", slot);
+                uerror!("devd", "invalid_spawn_ctx_msg"; slot = slot as u32);
                 return;
             }
         };
@@ -1678,7 +1609,7 @@ impl Devd {
         let client_pid = match self.query_handler.get(slot) {
             Some(client) => client.pid,
             None => {
-                derror!("GET_SPAWN_CONTEXT from unknown slot={}", slot);
+                uerror!("devd", "unknown_spawn_ctx_slot"; slot = slot as u32);
                 return;
             }
         };
@@ -1686,14 +1617,10 @@ impl Devd {
         // Look up spawn context for this PID
         let mut response_buf = [0u8; 256];
         let resp_len = if let Some((port_type, port_name, metadata)) = self.get_spawn_context(client_pid) {
-            dlog!("GET_SPAWN_CONTEXT for pid={}: port={} meta_len={}", client_pid,
-                core::str::from_utf8(port_name).unwrap_or("?"), metadata.len());
-
             let resp = SpawnContextResponse::new(header.seq_id, error::OK, port_type);
             resp.write_to_with_metadata(&mut response_buf, port_name, metadata)
                 .unwrap_or(SpawnContextResponse::HEADER_SIZE)
         } else {
-            dlog!("GET_SPAWN_CONTEXT for pid={}: no context", client_pid);
             // No context available - return error
             let resp = SpawnContextResponse::new(header.seq_id, error::NOT_FOUND, 0);
             resp.write_to(&mut response_buf, &[])
@@ -1713,7 +1640,7 @@ impl Devd {
         let (query, port_name) = match QueryPort::from_bytes(buf) {
             Some(q) => q,
             None => {
-                derror!("invalid QUERY_PORT message from slot={}", slot);
+                uerror!("devd", "invalid_query_port"; slot = slot as u32);
                 return;
             }
         };
@@ -1760,7 +1687,7 @@ impl Devd {
         let (update, port_name) = match UpdatePortShmemId::from_bytes(buf) {
             Some(u) => u,
             None => {
-                derror!("invalid UPDATE_PORT_SHMEM_ID message from slot={}", slot);
+                uerror!("devd", "invalid_update_shmem"; slot = slot as u32);
                 return;
             }
         };
@@ -1776,14 +1703,11 @@ impl Devd {
 
         let result_code = match result {
             Ok(()) => {
-                dlog_state!("port {:?} shmem_id updated to {}",
-                    core::str::from_utf8(port_name).unwrap_or("?"),
-                    update.shmem_id);
+                uinfo!("devd", "port_shmem_update"; port = core::str::from_utf8(port_name).unwrap_or("?"), shmem_id = update.shmem_id);
                 error::OK
             }
             Err(_) => {
-                derror!("failed to update shmem_id for port {:?}",
-                    core::str::from_utf8(port_name).unwrap_or("?"));
+                uerror!("devd", "shmem_update_failed"; port = core::str::from_utf8(port_name).unwrap_or("?"));
                 error::NOT_FOUND
             }
         };
@@ -1800,7 +1724,7 @@ impl Devd {
             && port_type == Some(PortType::Block)
         {
             if let Some(owner) = owner_idx {
-                dlog_state!("triggering orchestration for Block port update");
+                uinfo!("devd", "block_orchestration_trigger";);
                 self.trigger_block_orchestration(port_name, update.shmem_id, owner);
             }
         }
@@ -1813,7 +1737,7 @@ impl Devd {
         let header = match QueryHeader::from_bytes(buf) {
             Some(h) => h,
             None => {
-                derror!("invalid LIST_PORTS message from slot={}", slot);
+                uerror!("devd", "invalid_list_ports"; slot = slot as u32);
                 return;
             }
         };
@@ -1893,7 +1817,7 @@ impl Devd {
         let header = match QueryHeader::from_bytes(buf) {
             Some(h) => h,
             None => {
-                derror!("invalid LIST_SERVICES message from slot={}", slot);
+                uerror!("devd", "invalid_list_services"; slot = slot as u32);
                 return;
             }
         };
@@ -1967,7 +1891,7 @@ impl Devd {
         let (req, name_bytes) = match QueryServiceInfo::from_bytes(buf) {
             Some(r) => r,
             None => {
-                derror!("invalid QUERY_SERVICE_INFO from slot={}", client_slot);
+                uerror!("devd", "invalid_query_svc_info"; slot = client_slot as u32);
                 return;
             }
         };
@@ -2034,7 +1958,7 @@ impl Devd {
         }
 
         if !stored {
-            derror!("pending info query table full");
+            uerror!("devd", "pending_query_full";);
             if let Some(client) = self.query_handler.get_mut(client_slot) {
                 let resp = ErrorResponse::new(client_seq_id, error::DEVICE_ERROR);
                 let _ = client.channel.send(&resp.to_bytes());
@@ -2047,8 +1971,8 @@ impl Devd {
         let mut forward_buf = [0u8; 128];
         if let Some(len) = forward_req.write_to(&mut forward_buf, name_bytes) {
             if let Some(driver_client) = self.query_handler.get_mut(driver_slot) {
-                if let Err(e) = driver_client.channel.send(&forward_buf[..len]) {
-                    derror!("failed to forward QUERY_SERVICE_INFO: {:?}", e);
+                if let Err(_e) = driver_client.channel.send(&forward_buf[..len]) {
+                    uerror!("devd", "query_forward_failed";);
                     // Clear the pending entry
                     for pending in &mut self.pending_info_queries {
                         if pending.forward_seq_id == forward_seq_id {
@@ -2073,7 +1997,7 @@ impl Devd {
         let header = match QueryHeader::from_bytes(buf) {
             Some(h) => h,
             None => {
-                derror!("invalid SERVICE_INFO_RESULT from slot={}", driver_slot);
+                uerror!("devd", "invalid_svc_info_result"; slot = driver_slot as u32);
                 return;
             }
         };
@@ -2093,7 +2017,7 @@ impl Devd {
         let (client_seq_id, client_slot) = match pending_info {
             Some(info) => info,
             None => {
-                derror!("no pending query for SERVICE_INFO_RESULT seq_id={}", forward_seq_id);
+                uerror!("devd", "no_pending_query"; seq = forward_seq_id);
                 return;
             }
         };
@@ -2145,29 +2069,6 @@ impl Devd {
         // Buffer the message
         self.log_buffer.push(service_idx_u8, msg.level, text);
 
-        // If live logging is enabled, print to console
-        if self.live_logging {
-            // Get service name for context
-            let service_name = if service_idx >= 0 {
-                self.services.get(service_idx as usize)
-                    .map(|s| s.name())
-                    .unwrap_or("???")
-            } else {
-                "???"
-            };
-
-            // Print with level prefix
-            let level_str = match msg.level {
-                0 => "ERR ",
-                1 => "WARN",
-                2 => "INFO",
-                _ => "DBG ",
-            };
-
-            if let Ok(text_str) = core::str::from_utf8(text) {
-                dlog!("[{}] {}: {}", level_str, service_name, text_str);
-            }
-        }
     }
 
     /// Handle LOG_QUERY - return buffered logs
@@ -2210,11 +2111,9 @@ impl Devd {
         match req.command {
             log_cmd::ENABLE => {
                 self.live_logging = true;
-                dlog!("live logging enabled");
             }
             log_cmd::DISABLE => {
                 self.live_logging = false;
-                dlog!("live logging disabled");
             }
             _ => {}
         }
@@ -2236,11 +2135,10 @@ impl Devd {
                 let len = port_name.len().min(32);
                 spawn.port_name[..len].copy_from_slice(&port_name[..len]);
                 spawn.port_name_len = len as u8;
-                dlog!("queued spawn {} for driver {} (port trigger)", binary, driver_idx);
                 return;
             }
         }
-        derror!("pending spawn queue full for driver {}", driver_idx);
+        uerror!("devd", "spawn_queue_full"; driver = self.svc_name(driver_idx));
     }
 
     /// Send all pending spawn commands for a driver
@@ -2265,7 +2163,7 @@ impl Devd {
             return;
         }
 
-        dlog_state!("flushing {} pending spawns for driver {}", count, driver_idx);
+        uinfo!("devd", "flush_pending_spawns"; count = count as u32, driver = self.svc_name(driver_idx as u8));
 
         // Send the commands
         for i in 0..count {
@@ -2273,14 +2171,13 @@ impl Devd {
                 let port = &port_name[..port_len as usize];
                 match self.query_handler.send_spawn_child(driver_idx, binary.as_bytes(), port) {
                     Some(seq_id) => {
-                        dlog_state!("→ sent queued SPAWN_CHILD seq={} binary={}", seq_id, binary);
+                        uinfo!("devd", "spawn_child_sent"; seq = seq_id, binary = binary);
                         // Track inflight spawn so we can store context when ACK arrives
                         let port_type = self.ports.get_port_type(port).unwrap_or(0);
                         self.track_inflight_spawn(seq_id, port_type, port, binary);
                     }
                     None => {
                         // Driver still not connected - fall back to direct spawn
-                        dlog!("driver {} still not connected, spawning {} directly", driver_idx, binary);
                         self.spawn_dynamic_driver(binary, port);
                     }
                 }
@@ -2300,7 +2197,7 @@ impl Devd {
         let (seq_id, result, match_count, spawn_count, pids) = match QueryHandler::parse_spawn_ack(buf) {
             Some(p) => p,
             None => {
-                derror!("invalid SPAWN_ACK message from slot={}", slot);
+                uerror!("devd", "invalid_spawn_ack"; slot = slot as u32);
                 return;
             }
         };
@@ -2309,13 +2206,11 @@ impl Devd {
         let parent_idx = match self.query_handler.get_service_idx(slot) {
             Some(idx) => idx,
             None => {
-                dlog!("SPAWN_ACK from non-driver slot={}", slot);
                 return;
             }
         };
 
-        dlog_state!("SPAWN_ACK from driver {}: seq={} result={} match={} spawn={}",
-            parent_idx, seq_id, result, match_count, spawn_count);
+        uinfo!("devd", "spawn_ack"; parent = self.svc_name(parent_idx as u8), seq = seq_id, result = result as i32, spawn = spawn_count as u32);
 
         // Consume the inflight spawn to get port context and binary name
         let spawn_ctx = self.consume_inflight_spawn(seq_id);
@@ -2341,7 +2236,7 @@ impl Devd {
             let slot_idx = match self.services.create_dynamic_service(child_pid, binary_name, now) {
                 Some(idx) => idx,
                 None => {
-                    derror!("no service slot for child pid={}", child_pid);
+                    uerror!("devd", "no_child_slot"; pid = child_pid);
                     continue;
                 }
             };
@@ -2364,15 +2259,12 @@ impl Devd {
                     })
                     .unwrap_or(([0u8; 64], 0));
                 self.store_spawn_context(child_pid, port_type, pname, &metadata.0[..metadata.1]);
-                dlog!("stored spawn context for pid={}: port={} meta_len={}", child_pid,
-                    core::str::from_utf8(pname).unwrap_or("?"), metadata.1);
             }
 
             // Upgrade any already-connected client with this PID to driver status
             // This handles the race where child connects before SPAWN_ACK arrives
             self.query_handler.upgrade_client_to_driver(child_pid, slot_idx as u8);
 
-            dlog!("child pid={} registered in slot {} (parent={})", child_pid, slot_idx, parent_idx);
         }
     }
 
@@ -2423,7 +2315,6 @@ impl Devd {
             if let Some(events) = &mut self.events {
                 let _ = events.unwatch(channel.handle());
             }
-            dlog!("query: client disconnected slot={}", slot);
         }
     }
 
@@ -2460,10 +2351,9 @@ impl Devd {
         // Log registration
         if let Ok(name_str) = core::str::from_utf8(port_name) {
             if shmem_id != 0 {
-                dlog_state!("port registered: {} type={:?} shmem_id={}", name_str, port_type, shmem_id);
+                uinfo!("devd", "port_registered"; name = name_str, shmem_id = shmem_id);
             } else {
-                dlog_state!("port registered: {} type={:?} parent={:?}",
-                    name_str, port_type, parent_type);
+                uinfo!("devd", "port_registered"; name = name_str);
             }
         }
 
@@ -2506,8 +2396,7 @@ impl Devd {
 
         let rule_caps = rule.caps;
 
-        dlog_state!("rule matched: {} for port type={:?}, owner_idx={}",
-            rule.driver_binary, port_type, owner_idx);
+        uinfo!("devd", "rule_matched"; binary = rule.driver_binary, owner = self.svc_name(owner_idx));
 
         // Check if owner service is Ready
         // Only send SpawnChild to drivers that are Ready (in their event loop)
@@ -2517,7 +2406,7 @@ impl Devd {
 
         if !owner_ready {
             // Owner not ready yet - queue for when they report Ready
-            dlog_state!("owner {} not Ready, queuing spawn {}", owner_idx, rule.driver_binary);
+            uinfo!("devd", "spawn_queued"; owner = self.svc_name(owner_idx), binary = rule.driver_binary);
             self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
             return;
         }
@@ -2527,14 +2416,13 @@ impl Devd {
             owner_idx, rule.driver_binary.as_bytes(), port_name, rule_caps,
         ) {
             Some(seq_id) => {
-                dlog_state!("→ SpawnChild seq={} to owner={} binary={}",
-                    seq_id, owner_idx, rule.driver_binary);
+                uinfo!("devd", "spawn_child_sent"; seq = seq_id, owner = self.svc_name(owner_idx), binary = rule.driver_binary);
                 // Track inflight spawn so we can store context when ACK arrives
                 self.track_inflight_spawn(seq_id, port_type as u8, port_name, rule.driver_binary);
             }
             None => {
                 // Owner Ready but channel not available? Queue anyway
-                dlog_state!("owner {} Ready but send failed, queuing spawn {}", owner_idx, rule.driver_binary);
+                uinfo!("devd", "spawn_queued_fallback"; owner = self.svc_name(owner_idx), binary = rule.driver_binary);
                 self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
             }
         }
@@ -2554,23 +2442,20 @@ impl Devd {
         // Track this disk
         let disk_slot = self.track_disk(port_name, shmem_id, owner_idx);
         if disk_slot.is_none() {
-            derror!("no slot to track disk shmem_id={}", shmem_id);
+            uerror!("devd", "disk_track_full"; shmem_id = shmem_id);
             return;
         }
         let disk_slot = disk_slot.unwrap();
 
-        dlog_state!("→ orchestration: disk tracked slot={} shmem_id={}", disk_slot, shmem_id);
+        uinfo!("devd", "disk_tracked"; slot = disk_slot as u32, shmem_id = shmem_id);
 
         // Ensure partd is running (this spawns partd if needed)
-        dlog_state!("→ calling ensure_partd_running");
         self.ensure_partd_running();
-        dlog_state!("→ ensure_partd_running returned");
 
         // Send ATTACH_DISK to partd
         if self.partd_service_idx != 0xFF {
             self.send_attach_disk(disk_slot);
         } else {
-            dlog!("partd not ready yet, will send AttachDisk when connected");
         }
     }
 
@@ -2586,7 +2471,7 @@ impl Devd {
 
         // Transition Empty -> Discovered
         if !disk.transition(DiskState::Discovered) {
-            derror!("disk state transition failed: {:?} -> Discovered", disk.state);
+            uerror!("devd", "disk_transition_failed"; target = "Discovered");
             return None;
         }
 
@@ -2620,7 +2505,6 @@ impl Devd {
                 if let Some(def) = service.def() {
                     if def.binary == "partd" && service.state == ServiceState::Ready {
                         self.partd_service_idx = i as u8;
-                        dlog!("found existing partd at slot {}", i);
                         return;
                     }
                 }
@@ -2628,9 +2512,8 @@ impl Devd {
         }
 
         // Spawn partd dynamically
-        dlog_state!("spawning partd for orchestration");
+        uinfo!("devd", "spawning_partd";);
         self.spawn_dynamic_driver("partd", b"");
-        dlog_state!("spawn_dynamic_driver returned");
     }
 
     /// Get next orchestration sequence ID
@@ -2648,14 +2531,13 @@ impl Devd {
     fn send_attach_disk(&mut self, disk_slot: usize) {
         let partd_idx = self.partd_service_idx;
         if partd_idx == 0xFF {
-            derror!("cannot send AttachDisk: partd not connected");
+            uerror!("devd", "attach_no_partd";);
             return;
         }
 
         // Verify disk is in Discovered state
         if self.tracked_disks[disk_slot].state != DiskState::Discovered {
-            derror!("cannot send AttachDisk: disk not in Discovered state, is {:?}",
-                self.tracked_disks[disk_slot].state);
+            uerror!("devd", "attach_wrong_state";);
             return;
         }
 
@@ -2677,14 +2559,14 @@ impl Devd {
         let len = match attach.write_to(&mut buf, port_name) {
             Some(l) => l,
             None => {
-                derror!("failed to serialize AttachDisk");
+                uerror!("devd", "attach_serialize_failed";);
                 return;
             }
         };
 
         // Transition Discovered -> AttachSent (tracks seq_id in state)
         if !self.tracked_disks[disk_slot].transition(DiskState::AttachSent { seq_id }) {
-            derror!("disk state transition failed: Discovered -> AttachSent");
+            uerror!("devd", "disk_transition_failed"; target = "AttachSent");
             return;
         }
 
@@ -2695,17 +2577,16 @@ impl Devd {
                 match client.channel.send(&buf[..len]) {
                     Ok(_) => {
                         if let Ok(name_str) = core::str::from_utf8(port_name) {
-                            dlog_state!("→ AttachDisk seq={} to partd: {} shmem_id={}",
-                                seq_id, name_str, shmem_id);
+                            uinfo!("devd", "attach_disk_sent"; seq = seq_id, port = name_str, shmem_id = shmem_id);
                         }
                     }
-                    Err(e) => {
-                        derror!("failed to send AttachDisk: {:?}", e);
+                    Err(_e) => {
+                        uerror!("devd", "attach_send_failed";);
                     }
                 }
             }
         } else {
-            derror!("partd slot not found for idx={}", partd_idx);
+            uerror!("devd", "partd_slot_missing"; idx = partd_idx as u32);
         }
     }
 
@@ -2714,11 +2595,11 @@ impl Devd {
     ///   Disk: AttachSent -> PartitionsReported
     ///   Partitions: Empty -> Discovered
     fn handle_report_partitions(&mut self, slot: usize, buf: &[u8]) {
-        dlog_state!("← ReportPartitions received slot={} len={}", slot, buf.len());
+        uinfo!("devd", "report_partitions"; slot = slot as u32, len = buf.len() as u32);
         let report = match ReportPartitions::from_bytes(buf) {
             Some(r) => r,
             None => {
-                derror!("invalid REPORT_PARTITIONS message");
+                uerror!("devd", "invalid_report_partitions";);
                 return;
             }
         };
@@ -2727,26 +2608,25 @@ impl Devd {
         let disk_slot = match self.find_disk_by_shmem_id(report.source_shmem_id) {
             Some(s) => s,
             None => {
-                derror!("REPORT_PARTITIONS for unknown disk shmem_id={}", report.source_shmem_id);
+                uerror!("devd", "unknown_disk"; shmem_id = report.source_shmem_id);
                 return;
             }
         };
 
         // Verify disk is in AttachSent state
         if !matches!(self.tracked_disks[disk_slot].state, DiskState::AttachSent { .. }) {
-            derror!("REPORT_PARTITIONS for disk not in AttachSent state: {:?}",
-                self.tracked_disks[disk_slot].state);
+            uerror!("devd", "report_wrong_state";);
             return;
         }
 
         // Transition disk: AttachSent -> PartitionsReported
         if !self.tracked_disks[disk_slot].transition(DiskState::PartitionsReported) {
-            derror!("disk state transition failed: AttachSent -> PartitionsReported");
+            uerror!("devd", "disk_transition_failed"; target = "PartitionsReported");
             return;
         }
 
         let scheme_str = if report.scheme == part_scheme::GPT { "GPT" } else { "MBR" };
-        dlog_state!("← ReportPartitions: {} partitions ({})", report.count, scheme_str);
+        uinfo!("devd", "partitions_found"; count = report.count as u32, scheme = scheme_str);
 
         // Parse partition info from buffer (follows fixed header)
         let partition_count = (report.count as usize).min(MAX_PARTITIONS_PER_DISK);
@@ -2763,7 +2643,7 @@ impl Devd {
 
                 // Transition partition: Empty -> Discovered
                 if !part.transition(PartitionState::Discovered) {
-                    derror!("partition {} state transition failed: Empty -> Discovered", i);
+                    uerror!("devd", "part_transition_failed"; idx = i as u32, target = "Discovered");
                     continue;
                 }
 
@@ -2783,8 +2663,7 @@ impl Devd {
                     fs_hint::SWAP => "swap",
                     _ => "unknown",
                 };
-                dlog_state!("  [{}] {} start={} size={} boot={}",
-                    pinfo.index, fs_str, pinfo.start_lba, pinfo.size_sectors, part.bootable);
+                uinfo!("devd", "partition_info"; idx = pinfo.index as u32, fs = fs_str, start = pinfo.start_lba as u64, size = pinfo.size_sectors as u64);
             }
         }
 
@@ -2818,8 +2697,7 @@ impl Devd {
     fn send_register_partition(&mut self, disk_slot: usize, part_idx: usize, partd_slot: usize) {
         // Verify partition is in Discovered state
         if self.tracked_disks[disk_slot].partitions[part_idx].state != PartitionState::Discovered {
-            derror!("cannot register partition: not in Discovered state, is {:?}",
-                self.tracked_disks[disk_slot].partitions[part_idx].state);
+            uerror!("devd", "part_register_wrong_state";);
             return;
         }
 
@@ -2868,7 +2746,7 @@ impl Devd {
         let len = match reg.write_to(&mut buf, &name_buf[..name_len]) {
             Some(l) => l,
             None => {
-                derror!("failed to serialize RegisterPartition");
+                uerror!("devd", "part_serialize_failed";);
                 return;
             }
         };
@@ -2881,7 +2759,7 @@ impl Devd {
 
             // Transition Discovered -> Registering (tracks seq_id in state)
             if !part.transition(PartitionState::Registering { seq_id }) {
-                derror!("partition state transition failed: Discovered -> Registering");
+                uerror!("devd", "part_transition_failed"; target = "Registering");
                 return;
             }
         }
@@ -2891,11 +2769,11 @@ impl Devd {
             match client.channel.send(&buf[..len]) {
                 Ok(_) => {
                     if let Ok(name_str) = core::str::from_utf8(&name_buf[..name_len]) {
-                        dlog_state!("→ RegisterPartition[{}] as \"{}\"", part_table_index, name_str);
+                        uinfo!("devd", "register_partition"; idx = part_table_index as u32, name = name_str);
                     }
                 }
-                Err(e) => {
-                    derror!("failed to send RegisterPartition: {:?}", e);
+                Err(_e) => {
+                    uerror!("devd", "part_register_send_failed";);
                 }
             }
         }
@@ -2907,7 +2785,7 @@ impl Devd {
         let (ready, name) = match PartitionReadyMsg::from_bytes(buf) {
             Some(r) => r,
             None => {
-                derror!("invalid PARTITION_READY message");
+                uerror!("devd", "invalid_partition_ready";);
                 return;
             }
         };
@@ -2937,7 +2815,7 @@ impl Devd {
             Some(f) => f,
             None => {
                 if let Ok(name_str) = core::str::from_utf8(name) {
-                    derror!("PARTITION_READY for unknown partition: {}", name_str);
+                    uerror!("devd", "unknown_partition"; name = name_str);
                 }
                 return;
             }
@@ -2947,13 +2825,13 @@ impl Devd {
         {
             let part = &mut self.tracked_disks[disk_idx].partitions[part_idx];
             if !part.transition(PartitionState::Ready { shmem_id: ready.shmem_id }) {
-                derror!("partition state transition failed: Registering -> Ready");
+                uerror!("devd", "part_transition_failed"; target = "Ready");
                 return;
             }
         }
 
         if let Ok(name_str) = core::str::from_utf8(name) {
-            dlog_state!("← PartitionReady: {} shmem_id={}", name_str, ready.shmem_id);
+            uinfo!("devd", "partition_ready"; name = name_str, shmem_id = ready.shmem_id);
         }
 
         // Register the partition port with devd
@@ -2997,7 +2875,7 @@ impl Devd {
             return; // Already connected
         }
         self.partd_service_idx = service_idx;
-        dlog_state!("partd connected as service {}", service_idx);
+        uinfo!("devd", "partd_connected"; svc = service_idx as u32);
 
         // Send AttachDisk for any disks in Discovered state
         // (they haven't had AttachDisk sent yet)
@@ -3021,7 +2899,7 @@ impl Devd {
         let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
             Ok(result) => result,
             Err(e) => {
-                derror!("dynamic spawn {} failed err={:?}", binary, e);
+                uerror!("devd", "dynamic_spawn_failed"; binary = binary);
                 return;
             }
         };
@@ -3067,13 +2945,7 @@ impl Devd {
             if let Some(events) = &mut self.events {
                 let _ = events.watch(watcher.handle());
             }
-            derror!("no service slot for dynamic driver pid={}", pid);
-        }
-
-        if let Ok(port_str) = core::str::from_utf8(trigger_port) {
-            dlog!("spawned {} pid={} slot={:?} for trigger={}", binary, pid, slot_idx, port_str);
-        } else {
-            dlog!("spawned {} pid={} slot={:?}", binary, pid, slot_idx);
+            uerror!("devd", "no_dynamic_slot"; pid = pid);
         }
 
     }
@@ -3223,10 +3095,6 @@ impl Devd {
                         }
                     }
 
-                    // Debug: log unmatched handles
-                    let qp_handle = self.query_port.as_ref().map(|p| p.handle().raw()).unwrap_or(0);
-                    dlog!("mux: handle={} qp={}", handle.raw(), qp_handle);
-
                     // Query client message?
                     if self.query_handler.find_by_handle(handle).is_some() {
                         self.handle_query_client_event(handle);
@@ -3252,7 +3120,7 @@ impl Devd {
                     // No events pending - this is normal during polling, not an error
                 }
                 Err(e) => {
-                    derror!("wait failed err={:?}", e);
+                    uerror!("devd", "wait_failed";);
                 }
             }
         }
@@ -3273,10 +3141,10 @@ fn main() -> ! {
     let devd = unsafe { &mut DEVD };
 
     if let Err(e) = devd.init() {
-        derror!("init failed err={:?}", e);
+        uerror!("devd", "init_failed";);
         syscall::exit(1);
     }
 
-    dlog_state!("started services={}", devd.services.count());
+    uinfo!("devd", "started"; services = devd.services.count() as u32);
     devd.run()
 }

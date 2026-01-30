@@ -697,10 +697,13 @@ fn write_hex64(out: &mut [u8], val: u64) -> usize {
 // Drain
 // ============================================================================
 
-/// Drain one record and write to stdout (if enabled)
+/// Drain one record from the local ring.
+///
+/// Sends the binary record to the kernel log ring via `klog_write`,
+/// preserving structured key-value data. The kernel handles formatting
+/// and UART output.
 pub fn drain_one() -> bool {
     let mut record_buf = [0u8; MAX_RECORD_SIZE];
-    let mut text_buf = [0u8; 1024];
 
     let record_len = unsafe {
         let ring = &mut *core::ptr::addr_of_mut!(LOG_RING);
@@ -711,13 +714,8 @@ pub fn drain_one() -> bool {
         return false;
     };
 
-    // Only write to stdout if enabled
-    if STDOUT_ENABLED.load(Ordering::Acquire) {
-        let text_len = format_record(&record_buf[..len], &mut text_buf);
-        if text_len > 0 {
-            let _ = crate::syscall::write(crate::syscall::Handle::STDOUT, &text_buf[..text_len]);
-        }
-    }
+    // Inject binary record into kernel log ring — structure preserved
+    crate::syscall::klog_write(&record_buf[..len]);
 
     true
 }

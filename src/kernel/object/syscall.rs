@@ -1233,47 +1233,71 @@ fn read_mux(_m: &mut super::MuxObject, _buf_ptr: u64, _buf_len: usize, _task_id:
 }
 
 fn read_pci_bus(p: &mut super::PciBusObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    use crate::kernel::bus::{DeviceInfo, get_device_list, get_device_count};
+    use crate::kernel::pci;
 
     if buf_ptr == 0 {
-        // Just return count
-        return get_device_count() as i64;
+        // Just return device count
+        return pci::device_count() as i64;
     }
 
-    let max = buf_len / core::mem::size_of::<DeviceInfo>();
+    let entry_size = core::mem::size_of::<abi::PciEnumEntry>();
+    let max = buf_len / entry_size;
     if max == 0 {
         return 0;
     }
 
-    // Create temporary buffer (max 16 devices)
-    let mut temp = [DeviceInfo::empty(); 16];
-    let count = get_device_list(&mut temp[..max.min(16)]);
-
-    // Filter by BDF if needed
-    // NOTE: BDF filtering requires DeviceInfo to have a BDF field or
-    // a separate PCIe-specific enumeration API. Currently, all devices
-    // pass through regardless of filter. This is acceptable since:
-    // - bdf_filter=0 is the common case (enumerate all)
-    // - Userspace can filter results itself if needed
     let bdf_filter = p.bdf_filter();
-    let filtered_count = if bdf_filter == 0 {
-        count
-    } else {
-        // BDF filtering not implemented - would need DeviceInfo.bdf field
-        // For now, just copy all devices and let userspace filter
-        count
-    };
 
-    // Copy to userspace
-    let copy_size = filtered_count * core::mem::size_of::<DeviceInfo>();
-    let src_bytes = unsafe {
-        core::slice::from_raw_parts(temp.as_ptr() as *const u8, copy_size)
-    };
-    if uaccess::copy_to_user(buf_ptr, src_bytes).is_err() {
-        return Error::BadAddress.to_errno();
-    }
+    // Fill PciEnumEntry array from kernel registry
+    let count = pci::with_devices(|registry| {
+        let mut written = 0usize;
+        for i in 0..registry.len() {
+            if written >= max {
+                break;
+            }
+            let Some(dev) = registry.get(i) else { continue };
 
-    filtered_count as i64
+            // Apply BDF filter if non-zero
+            if bdf_filter != 0 {
+                let packed_bdf = ((dev.bdf.bus as u32) << 8)
+                    | ((dev.bdf.device as u32) << 3)
+                    | (dev.bdf.function as u32);
+                if packed_bdf != bdf_filter {
+                    continue;
+                }
+            }
+
+            let entry = abi::PciEnumEntry {
+                bdf: ((dev.bdf.bus as u32) << 8)
+                    | ((dev.bdf.device as u32) << 3)
+                    | (dev.bdf.function as u32),
+                vendor_id: dev.vendor_id,
+                device_id: dev.device_id,
+                class_code: (dev.class_code << 8) | (dev.revision as u32),
+                bar0_addr: dev.bar0_addr,
+                bar0_size: dev.bar0_size as u32,
+                msi_cap: dev.msi_cap,
+                msix_cap: dev.msix_cap,
+                _reserved: [0; 2],
+            };
+
+            // Copy single entry to userspace
+            let src = unsafe {
+                core::slice::from_raw_parts(
+                    &entry as *const abi::PciEnumEntry as *const u8,
+                    entry_size,
+                )
+            };
+            let dst = buf_ptr + (written * entry_size) as u64;
+            if uaccess::copy_to_user(dst, src).is_err() {
+                return written;
+            }
+            written += 1;
+        }
+        written
+    });
+
+    count as i64
 }
 
 fn read_pci_device(d: &mut super::PciDeviceObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
@@ -1872,10 +1896,20 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
     // Create message and send via ipc
     let msg = ipc::Message::data(pid, &kernel_buf[..copy_len]);
 
+    // Check before send — avoids re-acquiring channel table lock after send
+    let is_bus_channel = ipc::is_kernel_dispatch(channel_id);
+
     match ipc::send(channel_id, msg, pid) {
         Ok(wake_list) => {
-            // Wake any subscribers waiting for readable events
             waker::wake(&wake_list, ipc::WakeReason::Readable);
+
+            // Kernel bus channels are dispatched synchronously — the bus
+            // controller processes the message here rather than reading
+            // from its channel queue.
+            if is_bus_channel {
+                crate::kernel::bus::process_bus_message(channel_id, &kernel_buf[..copy_len]);
+            }
+
             copy_len as i64
         }
         Err(ipc::IpcError::QueueFull) => Error::WouldBlock.to_errno(),

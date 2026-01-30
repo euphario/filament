@@ -74,6 +74,7 @@ pub enum SyscallNumber {
     // 70-75: legacy kevent/device_list (removed) - use unified open/read
     ExecWithCaps = 74,
     Klog = 76,  // Compatibility shim - writes to klog ring buffer
+    KlogWrite = 77,  // Inject binary log record into kernel ring
 
     // 80-96: legacy handle system (removed) - use 100-104
 
@@ -125,6 +126,7 @@ impl From<u64> for SyscallNumber {
             74 => SyscallNumber::ExecWithCaps,
             // 75: legacy DeviceList -> Invalid (use unified interface)
             76 => SyscallNumber::Klog,
+            77 => SyscallNumber::KlogWrite,
             // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -277,6 +279,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::SetLogLevel => misc::sys_set_log_level(args.arg0 as u8),
         SyscallNumber::KlogRead => misc::sys_klog_read(args.arg0, args.arg1 as usize),
         SyscallNumber::Klog => misc::sys_klog(args.arg0 as u8, args.arg1, args.arg2 as usize),
+        SyscallNumber::KlogWrite => misc::sys_klog_write(args.arg0, args.arg1 as usize),
         SyscallNumber::Reset => misc::sys_reset(),
         // SignalAllow removed - use capability-based permissions
         // CpuStats removed - use userspace service
@@ -343,6 +346,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::ExecMem => "exec_mem",
         SyscallNumber::KlogRead => "klog_read",
         SyscallNumber::Klog => "klog",
+        SyscallNumber::KlogWrite => "klog_write",
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::ExecWithCaps => "exec_with_caps",
         // Unified interface (100-105)

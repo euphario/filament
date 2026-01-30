@@ -32,6 +32,13 @@ pub fn register_buses(kernel_pid: Pid) {
             }
         }
 
+        // Register ECAM PCI host controller if this platform uses ECAM
+        if config.is_pcie_ecam_based() {
+            if let Some(base) = config.pcie_base(0) {
+                crate::kernel::pci::register_ecam_host(base);
+            }
+        }
+
         // Platform pseudo-bus (always present)
         if let Some(bus) = registry.add(BusType::Platform, 0) {
             bus.set_initial_state(BusState::Safe);

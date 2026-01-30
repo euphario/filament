@@ -376,6 +376,29 @@ impl ChannelTable {
     }
 
     // ========================================================================
+    // Kernel Dispatch
+    // ========================================================================
+
+    /// Mark a channel for kernel bus dispatch
+    pub fn set_kernel_dispatch(&mut self, id: ChannelId) {
+        if let Some(slot) = self.find_slot(id) {
+            if let Some(channel) = self.channels[slot].as_mut() {
+                channel.set_kernel_dispatch();
+            }
+        }
+    }
+
+    /// Check if a channel has kernel bus dispatch enabled
+    pub fn is_kernel_dispatch(&self, id: ChannelId) -> bool {
+        if let Some(slot) = self.find_slot(id) {
+            if let Some(channel) = self.channels[slot].as_ref() {
+                return channel.is_kernel_dispatch();
+            }
+        }
+        false
+    }
+
+    // ========================================================================
     // Liveness Support Functions
     // ========================================================================
 

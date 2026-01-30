@@ -39,7 +39,8 @@
 //! - `pci_config_write(bdf, offset, size, value)` - Write config space
 //! - `pci_msi_alloc(bdf, count)` - Allocate MSI vectors
 //!
-//! Note: Device enumeration and BAR mapping are handled by pcied via IPC.
+//! The kernel enumerates PCI devices at boot (BAR probing, address allocation)
+//! and populates the registry. pcied reads the device list via PciBus objects.
 
 #![allow(dead_code)]
 
@@ -109,6 +110,37 @@ pub type PciResult<T> = Result<T, PciError>;
 /// Global PCI subsystem state
 static mut PCI_SUBSYSTEM: Option<PciSubsystem> = None;
 
+/// Simple bump allocator for PCI BAR addresses
+struct BarAllocator {
+    next: u64,
+    end: u64,
+}
+
+impl BarAllocator {
+    const fn empty() -> Self {
+        Self { next: 0, end: 0 }
+    }
+
+    fn init(&mut self, base: u64, end: u64) {
+        self.next = base;
+        self.end = end;
+    }
+
+    /// Allocate aligned region of given size. Returns base address or None.
+    fn alloc(&mut self, size: u64) -> Option<u64> {
+        if size == 0 || self.next == 0 {
+            return None;
+        }
+        let align_mask = size - 1;
+        let aligned = (self.next + align_mask) & !align_mask;
+        if aligned + size > self.end + 1 {
+            return None;
+        }
+        self.next = aligned + size;
+        Some(aligned)
+    }
+}
+
 /// The PCI subsystem
 pub struct PciSubsystem {
     /// Device registry
@@ -117,11 +149,14 @@ pub struct PciSubsystem {
     msi: MsiAllocator,
     /// Host controller (trait object would need alloc, use enum instead)
     host: Option<PciHostImpl>,
+    /// BAR address allocator (for ECAM platforms where kernel assigns BARs)
+    bar_alloc: BarAllocator,
 }
 
 /// Concrete host implementations (avoid dyn trait)
 pub(crate) enum PciHostImpl {
     Mt7988a(Mt7988aPciHost),
+    Ecam(EcamPciHost),
 }
 
 impl PciSubsystem {
@@ -131,6 +166,7 @@ impl PciSubsystem {
             registry: PciDeviceRegistry::new(),
             msi: MsiAllocator::new(),
             host: None,
+            bar_alloc: BarAllocator::empty(),
         }
     }
 
@@ -143,6 +179,7 @@ impl PciSubsystem {
     fn host_ops(&self) -> Option<&dyn PciHostOps> {
         match &self.host {
             Some(PciHostImpl::Mt7988a(h)) => Some(h),
+            Some(PciHostImpl::Ecam(h)) => Some(h),
             None => None,
         }
     }
@@ -151,6 +188,7 @@ impl PciSubsystem {
     fn host_ops_mut(&mut self) -> Option<&mut dyn PciHostOps> {
         match &mut self.host {
             Some(PciHostImpl::Mt7988a(h)) => Some(h),
+            Some(PciHostImpl::Ecam(h)) => Some(h),
             None => None,
         }
     }
@@ -321,6 +359,115 @@ impl PciHostOps for Mt7988aPciHost {
     }
 }
 
+/// ECAM-based PCI host controller (QEMU virt, generic PCIe)
+///
+/// Uses memory-mapped ECAM (Enhanced Configuration Access Mechanism)
+/// for PCI configuration space access. The ECAM region is identity-mapped
+/// in the kernel's address space.
+pub struct EcamPciHost {
+    /// Virtual/physical base address of ECAM region (identity-mapped)
+    base: usize,
+}
+
+impl EcamPciHost {
+    /// Create new ECAM host with given base address
+    pub const fn new(base: usize) -> Self {
+        Self { base }
+    }
+
+    /// Calculate config space virtual address for a BDF + register
+    #[inline]
+    fn config_addr(&self, bdf: PciBdf, offset: u16) -> usize {
+        use crate::arch::aarch64::mmu;
+        let phys = self.base
+            + ((bdf.bus as usize) << 20)
+            + ((bdf.device as usize) << 15)
+            + ((bdf.function as usize) << 12)
+            + ((offset & 0xFFF) as usize);
+        if mmu::is_enabled() {
+            phys | (mmu::KERNEL_VIRT_BASE as usize)
+        } else {
+            phys
+        }
+    }
+}
+
+impl PciHostOps for EcamPciHost {
+    fn port_count(&self) -> usize {
+        1
+    }
+
+    fn link_up(&self, _port: usize) -> bool {
+        true // ECAM is always "up"
+    }
+
+    fn config_read32(&self, bdf: PciBdf, offset: u16) -> u32 {
+        let addr = self.config_addr(bdf, offset & !0x3);
+        unsafe { core::ptr::read_volatile(addr as *const u32) }
+    }
+
+    fn config_write32(&self, bdf: PciBdf, offset: u16, value: u32) {
+        let addr = self.config_addr(bdf, offset & !0x3);
+        unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
+    }
+
+    fn bar_info(&self, bdf: PciBdf, bar: u8) -> Option<(u64, u64)> {
+        if bar > 5 {
+            return None;
+        }
+
+        let bar_offset = 0x10 + (bar as u16) * 4;
+        let bar_val = self.config_read32(bdf, bar_offset);
+
+        // Skip I/O BARs
+        if (bar_val & 1) != 0 {
+            return None;
+        }
+
+        let is_64bit = ((bar_val >> 1) & 3) == 2;
+
+        // Get current address
+        let addr_lo = (bar_val & !0xF) as u64;
+        let addr = if is_64bit && bar < 5 {
+            let bar_hi = self.config_read32(bdf, bar_offset + 4);
+            addr_lo | ((bar_hi as u64) << 32)
+        } else {
+            addr_lo
+        };
+
+        // Probe size: write all-ones, read back, restore
+        self.config_write32(bdf, bar_offset, 0xFFFF_FFFF);
+        let size_mask = self.config_read32(bdf, bar_offset);
+        self.config_write32(bdf, bar_offset, bar_val); // Restore
+
+        // For 64-bit BARs, also probe the high word for size
+        let size64 = if is_64bit && bar < 5 {
+            let bar_hi_orig = self.config_read32(bdf, bar_offset + 4);
+            self.config_write32(bdf, bar_offset + 4, 0xFFFF_FFFF);
+            let size_hi = self.config_read32(bdf, bar_offset + 4);
+            self.config_write32(bdf, bar_offset + 4, bar_hi_orig); // Restore
+            Some(size_hi)
+        } else {
+            None
+        };
+
+        let size_bits = size_mask & !0xF;
+        if size_bits == 0 && size64.map_or(true, |h| h == 0) {
+            return Some((addr, 0));
+        }
+
+        // Compute size from mask bits (full 64-bit for 64-bit BARs)
+        let size = if let Some(hi) = size64 {
+            let full_mask = ((hi as u64) << 32) | (size_bits as u64);
+            (!full_mask).wrapping_add(1) & full_mask
+        } else {
+            let s = (!size_bits).wrapping_add(1) & size_bits;
+            s as u64
+        };
+        Some((addr, size))
+    }
+}
+
 // ============================================================================
 // Global API
 // ============================================================================
@@ -350,6 +497,244 @@ pub fn register_mt7988a_host(host: Mt7988aPciHost) {
         pci.register_host(PciHostImpl::Mt7988a(host));
         kinfo!("pci", "host_registered"; ports = port_count as u64);
     }
+}
+
+/// Register an ECAM-based host controller (QEMU virt)
+pub fn register_ecam_host(base: usize) {
+    // Map the ECAM region into kernel virtual address space.
+    // ECAM config space is at most 256MB (256 buses * 32 devices * 8 functions * 4KB).
+    // Map the containing 1GB block as device memory.
+    let gb_aligned = (base as u64) & !0x3FFF_FFFF;
+    crate::arch::aarch64::mmu::map_kernel_device_1gb(gb_aligned);
+    kinfo!("pci", "ecam_mapped"; phys = gb_aligned);
+
+    if let Some(pci) = subsystem_mut() {
+        pci.register_host(PciHostImpl::Ecam(EcamPciHost::new(base)));
+        kinfo!("pci", "ecam_registered"; base = base as u64);
+    }
+}
+
+/// Enumerate PCI devices and populate the registry.
+///
+/// Walks all buses/devices/functions, probes BARs, allocates addresses
+/// from the MMIO window if needed, walks capability list for MSI/MSI-X,
+/// and registers each device in the PciDeviceRegistry.
+///
+/// Returns the number of devices found.
+pub fn enumerate() -> usize {
+    use crate::kernel::bus::bus_config;
+
+    let pci = match subsystem_mut() {
+        Some(p) => p,
+        None => return 0,
+    };
+
+    let host = match &pci.host {
+        Some(h) => h,
+        None => return 0,
+    };
+
+    // Initialize BAR allocator from platform config
+    if let Some((base, end)) = bus_config().pcie_mmio_window() {
+        pci.bar_alloc.init(base, end);
+    }
+
+    let mut count = 0;
+
+    // Walk bus 0..4, device 0..32, function 0..8
+    for bus in 0..4u8 {
+        for device in 0..32u8 {
+            // Check function 0 first
+            let vendor_device = host_config_read32(host, PciBdf::new(bus, device, 0), 0x00);
+            let vendor_id = (vendor_device & 0xFFFF) as u16;
+            if vendor_id == 0xFFFF || vendor_id == 0 {
+                continue;
+            }
+
+            // Check if multi-function
+            let header_reg = host_config_read32(host, PciBdf::new(bus, device, 0), 0x0C);
+            let header_type = ((header_reg >> 16) & 0xFF) as u8;
+            let multi_function = (header_type & 0x80) != 0;
+            let max_func = if multi_function { 8u8 } else { 1 };
+
+            for function in 0..max_func {
+                let bdf = PciBdf::new(bus, device, function);
+
+                if function > 0 {
+                    let vd = host_config_read32(host, bdf, 0x00);
+                    if (vd & 0xFFFF) as u16 == 0xFFFF {
+                        continue;
+                    }
+                }
+
+                if let Some(dev) = enumerate_device(host, bdf, &mut pci.bar_alloc) {
+                    if pci.registry.register(dev).is_ok() {
+                        count += 1;
+                        kinfo!("pci", "device_found";
+                            bdf_bus = bdf.bus as u64,
+                            bdf_dev = bdf.device as u64,
+                            bdf_func = bdf.function as u64,
+                            vendor = dev.vendor_id as u64,
+                            device_id = dev.device_id as u64,
+                            bar0 = dev.bar0_addr);
+                    }
+                }
+            }
+        }
+    }
+
+    count
+}
+
+/// Helper: read config via host enum variant (avoids borrow issues with subsystem)
+fn host_config_read32(host: &PciHostImpl, bdf: PciBdf, offset: u16) -> u32 {
+    match host {
+        PciHostImpl::Mt7988a(h) => h.config_read32(bdf, offset),
+        PciHostImpl::Ecam(h) => h.config_read32(bdf, offset),
+    }
+}
+
+fn host_config_write32(host: &PciHostImpl, bdf: PciBdf, offset: u16, value: u32) {
+    match host {
+        PciHostImpl::Mt7988a(h) => h.config_write32(bdf, offset, value),
+        PciHostImpl::Ecam(h) => h.config_write32(bdf, offset, value),
+    }
+}
+
+fn host_bar_info(host: &PciHostImpl, bdf: PciBdf, bar: u8) -> Option<(u64, u64)> {
+    match host {
+        PciHostImpl::Mt7988a(h) => h.bar_info(bdf, bar),
+        PciHostImpl::Ecam(h) => h.bar_info(bdf, bar),
+    }
+}
+
+/// Enumerate a single device at the given BDF
+fn enumerate_device(host: &PciHostImpl, bdf: PciBdf, bar_alloc: &mut BarAllocator) -> Option<PciDevice> {
+    let vendor_device = host_config_read32(host, bdf, 0x00);
+    let vendor_id = (vendor_device & 0xFFFF) as u16;
+    let device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
+
+    if vendor_id == 0xFFFF || vendor_id == 0 {
+        return None;
+    }
+
+    let class_rev = host_config_read32(host, bdf, 0x08);
+    let revision = (class_rev & 0xFF) as u8;
+    let prog_if = ((class_rev >> 8) & 0xFF) as u8;
+    let subclass = ((class_rev >> 16) & 0xFF) as u8;
+    let base_class = ((class_rev >> 24) & 0xFF) as u8;
+    let class_code = ((base_class as u32) << 16) | ((subclass as u32) << 8) | (prog_if as u32);
+
+    let header_reg = host_config_read32(host, bdf, 0x0C);
+    let header_type = ((header_reg >> 16) & 0x7F) as u8;
+
+    // Skip bridges (type 1 headers)
+    if header_type != 0 {
+        return None;
+    }
+
+    // Find first MMIO BAR, probe size, allocate if needed
+    let mut bar0_addr = 0u64;
+    let mut bar0_size = 0u64;
+    let mut bar_idx = 0u8;
+    while bar_idx <= 5 {
+        let bar_offset = 0x10 + (bar_idx as u16) * 4;
+        let raw = host_config_read32(host, bdf, bar_offset);
+        let is_io = (raw & 1) != 0;
+        let is_64bit = !is_io && ((raw >> 1) & 0x3) == 2;
+
+        if !is_io {
+            if let Some((addr, size)) = host_bar_info(host, bdf, bar_idx) {
+                if size > 0 {
+                    let final_addr = if addr == 0 {
+                        // BAR unassigned — allocate from MMIO window
+                        if let Some(allocated) = bar_alloc.alloc(size) {
+                            let bar_value = (allocated as u32) | (raw & 0xF);
+                            host_config_write32(host, bdf, bar_offset, bar_value);
+                            if is_64bit {
+                                host_config_write32(host, bdf, bar_offset + 4, 0);
+                            }
+                            allocated
+                        } else {
+                            0
+                        }
+                    } else {
+                        addr
+                    };
+
+                    // Ensure MEMORY_SPACE is enabled in command register
+                    if final_addr != 0 {
+                        let cmd = host_config_read32(host, bdf, 0x04);
+                        if (cmd & 0x0002) == 0 {
+                            host_config_write32(host, bdf, 0x04, cmd | 0x0002);
+                        }
+                    }
+
+                    if final_addr != 0 {
+                        bar0_addr = final_addr;
+                        bar0_size = size;
+                        break;
+                    }
+                }
+            }
+        }
+
+        bar_idx += if is_64bit { 2 } else { 1 };
+    }
+
+    // Walk capability list for MSI (0x05) and MSI-X (0x11)
+    let mut msi_cap = 0u8;
+    let mut msix_cap = 0u8;
+    let status = (host_config_read32(host, bdf, 0x04) >> 16) as u16;
+    if (status & 0x10) != 0 {
+        // Capabilities list present
+        let mut cap_ptr = (host_config_read32(host, bdf, 0x34) & 0xFC) as u8;
+        for _ in 0..48 {
+            if cap_ptr == 0 {
+                break;
+            }
+            let cap_val = host_config_read32(host, bdf, cap_ptr as u16);
+            let cap_id = (cap_val & 0xFF) as u8;
+            match cap_id {
+                0x05 => msi_cap = cap_ptr,
+                0x11 => msix_cap = cap_ptr,
+                _ => {}
+            }
+            cap_ptr = ((cap_val >> 8) & 0xFC) as u8;
+        }
+    }
+
+    Some(PciDevice {
+        bdf,
+        vendor_id,
+        device_id,
+        class_code,
+        revision,
+        header_type,
+        is_bridge: false,
+        bar0_addr,
+        bar0_size,
+        msi_cap,
+        msix_cap,
+        owner_pid: 0,
+    })
+}
+
+/// Get the number of devices in the registry
+pub fn device_count() -> usize {
+    match subsystem() {
+        Some(pci) => pci.registry.len(),
+        None => 0,
+    }
+}
+
+/// Execute a closure with access to all devices in the registry
+pub fn with_devices<F, R>(f: F) -> R
+where
+    F: FnOnce(&PciDeviceRegistry) -> R,
+{
+    let pci = subsystem().expect("PCI subsystem not initialized");
+    f(&pci.registry)
 }
 
 /// Register a discovered device

@@ -7,6 +7,7 @@ use crate::state::driver::{Driver, DriverConfig, DriverState};
 use crate::state::{Effect, Effects, Event};
 use crate::effects::{SyscallExecutor, SpawnResult};
 use userlib::syscall;
+use userlib::uerror;
 
 /// Maximum number of managed drivers
 pub const MAX_DRIVERS: usize = 16;
@@ -100,7 +101,6 @@ impl DriverManager {
         let idx = self.count;
         self.drivers[idx] = Some(Driver::new_adopted(config, pid));
         self.count += 1;
-        crate::dlog!("driver_adopted binary={} pid={} idx={}", binary, pid, idx);
         Some(idx)
     }
 
@@ -182,10 +182,8 @@ impl DriverManager {
         let binary = driver.config.binary;
 
         // Log the exit
-        if code == 0 {
-            crate::dlog!("driver_exit_ok binary={} pid={}", binary, pid);
-        } else {
-            crate::derror!("driver_crashed binary={} pid={} code={}", binary, pid, code);
+        if code != 0 {
+            uerror!("devd", "driver_crashed"; binary = binary, pid = pid, code = code as i32);
         }
 
         // Handle ProcessExit event
@@ -200,18 +198,8 @@ impl DriverManager {
             let trans = driver.evaluate_crash(now);
 
             // Log recovery decision
-            match &trans.state {
-                DriverState::PendingRestart { restart_at } => {
-                    let delay_ms = restart_at.saturating_sub(now) / 1_000_000;
-                    crate::dlog!("driver_restart_pending binary={} delay_ms={}", binary, delay_ms);
-                }
-                DriverState::Failed => {
-                    crate::derror!("driver_failed binary={}", binary);
-                }
-                DriverState::Stopped => {
-                    crate::dlog!("driver_stopped_no_restart binary={}", binary);
-                }
-                _ => {}
+            if matches!(&trans.state, DriverState::Failed) {
+                uerror!("devd", "driver_failed"; binary = binary);
             }
 
             let effects = driver.apply(trans);
@@ -238,7 +226,6 @@ impl DriverManager {
         let binary = driver.config.binary;
 
         if let Some(trans) = driver.handle(Event::BindComplete { pid }, now) {
-            crate::dlog!("driver_bound binary={} pid={}", binary, pid);
             let effects = driver.apply(trans);
             self.execute_effects(effects, binary);
             return true;
@@ -392,11 +379,6 @@ impl DriverManager {
 
     /// Dump state for debugging
     pub fn dump_state(&self) {
-        for i in 0..self.count {
-            if let Some(ref driver) = self.drivers[i] {
-                crate::dlog!("driver_state idx={} binary={} state={} restarts={}",
-                    i, driver.config.binary, driver.state.name(), driver.restart_count);
-            }
-        }
+        // No-op: structured logging replaced text-based debug output
     }
 }

@@ -7,7 +7,7 @@ use core::arch::asm;
 use crate::error::{SysError, SysResult};
 
 // Re-export types from abi crate for convenience
-pub use abi::{ProcessInfo, ObjectType, Handle, LogLevel};
+pub use abi::{ProcessInfo, ObjectType, Handle, LogLevel, PciEnumEntry};
 pub use abi::{syscall as syscall_num, log_level, liveness_status, prot, errno};
 
 // Local aliases for syscall numbers (shorter names for internal use)
@@ -224,9 +224,17 @@ pub fn sleep_ms(ms: u32) {
 // Logging (kernel buffer)
 // ============================================================================
 
-/// Write structured log message to kernel
+/// Write formatted text log message to kernel (legacy — prefer klog_write)
 pub fn klog(level: LogLevel, msg: &[u8]) {
     let _ = syscall3(sys::KLOG, level as u64, msg.as_ptr() as u64, msg.len() as u64);
+}
+
+/// Write a binary log record into the kernel log ring.
+///
+/// The record must be in the standard binary format produced by
+/// `ulog::RecordBuilder`. Structure is preserved end-to-end.
+pub fn klog_write(record: &[u8]) -> i64 {
+    syscall2(sys::KLOG_WRITE, record.as_ptr() as u64, record.len() as u64)
 }
 
 /// Raw debug write to UART (bypasses klog buffer)
@@ -353,6 +361,29 @@ pub fn close(handle: Handle) -> SysResult<()> {
     } else {
         Ok(())
     }
+}
+
+// ============================================================================
+// PCI Enumeration
+// ============================================================================
+
+/// Query PCI devices from kernel registry.
+///
+/// Opens a PciBus handle, reads the device list, and closes the handle.
+/// Returns the number of devices written to `buf`.
+pub fn pci_enumerate(buf: &mut [abi::PciEnumEntry]) -> SysResult<usize> {
+    let handle = open(ObjectType::PciBus, &[])?;
+
+    // Read entries into the buffer (reinterpret as bytes)
+    let byte_buf = unsafe {
+        core::slice::from_raw_parts_mut(
+            buf.as_mut_ptr() as *mut u8,
+            buf.len() * core::mem::size_of::<abi::PciEnumEntry>(),
+        )
+    };
+    let result = read(handle, byte_buf);
+    let _ = close(handle);
+    result
 }
 
 // ============================================================================

@@ -200,8 +200,23 @@ pub fn disable_clocks(index: usize) {
 /// device_id format: (bus << 8) | (dev << 3) | func
 /// For root port devices, this is typically 0x0000
 pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<(), super::BusError> {
-    // ECAM-based platforms (QEMU): bus mastering is managed by hypervisor
+    // ECAM-based platforms (QEMU): set bus mastering via kernel PCI subsystem
     if bus_config().is_pcie_ecam_based() {
+        use crate::kernel::pci::{self, PciBdf};
+        let bdf = PciBdf::new(
+            (device_id >> 8) as u8,
+            ((device_id >> 3) & 0x1F) as u8,
+            (device_id & 0x07) as u8,
+        );
+        let cmd_status = pci::config_read32(bdf, 0x04).map_err(|_| super::BusError::HardwareError)?;
+        let cmd16 = cmd_status as u16;
+        let new_cmd = if enable { cmd16 | 0x4 } else { cmd16 & !0x4 };
+        if cmd16 != new_cmd {
+            // Preserve Status register (upper 16 bits) — Status bits are W1C,
+            // so writing 0 to them avoids accidentally clearing status.
+            let new_val = (cmd_status & 0xFFFF_0000) | (new_cmd as u32);
+            pci::config_write32(bdf, 0x04, new_val).map_err(|_| super::BusError::HardwareError)?;
+        }
         return Ok(());
     }
 
@@ -258,8 +273,19 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<
 
 /// Disable bus mastering for ALL devices on a PCIe port
 pub fn disable_all_bus_mastering(bus_index: u8) {
-    // ECAM-based platforms (QEMU): bus mastering is managed by hypervisor
+    // ECAM-based platforms (QEMU): disable via kernel PCI subsystem for all known devices
     if bus_config().is_pcie_ecam_based() {
+        use crate::kernel::pci;
+        pci::with_devices(|registry| {
+            for i in 0..registry.len() {
+                if let Some(dev) = registry.get(i) {
+                    let device_id = ((dev.bdf.bus as u16) << 8)
+                        | ((dev.bdf.device as u16) << 3)
+                        | (dev.bdf.function as u16);
+                    let _ = set_bus_mastering(bus_index, device_id, false);
+                }
+            }
+        });
         return;
     }
 
