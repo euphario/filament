@@ -158,6 +158,11 @@ impl DataPort {
         self.role
     }
 
+    /// Get the shmem handle for Mux registration
+    pub fn shmem_handle(&self) -> crate::syscall::Handle {
+        self.ring.shmem_handle()
+    }
+
     // =========================================================================
     // Pool Allocation (Consumer only)
     // =========================================================================

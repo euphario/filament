@@ -1,62 +1,60 @@
-//! Cat Builtin - Display File Contents
-//!
-//! Usage:
-//!   cat <path>      - Display file contents
+//! cat - Display file contents via VFS
 
 use crate::println;
-use crate::output::{ByteBuffer, CommandResult};
-use userlib::vfs_client::VfsClient;
-use userlib::vfs::VfsError;
+use crate::output::CommandResult;
+use userlib::vfs_proto::open_flags;
 
-/// Max bytes to read per chunk (IPC limit constraint)
-const CHUNK_SIZE: u32 = 512;
-
-/// Main entry point for cat builtin
-pub fn run(path: &[u8]) -> CommandResult {
-    let path = crate::trim(path);
+pub fn cmd_cat(args: &[u8]) -> CommandResult {
+    let path = crate::trim(args);
 
     if path.is_empty() {
-        return CommandResult::Error("usage: cat <path>");
+        println!("Usage: cat <path>");
+        return CommandResult::None;
     }
 
-    // Must be under /mnt for VFS access
-    if !path.starts_with(b"/mnt") {
-        return CommandResult::Error("cat: only /mnt paths supported");
-    }
-
-    // Connect to vfsd
-    let mut client = match VfsClient::connect() {
-        Ok(c) => c,
-        Err(_) => return CommandResult::Error("cat: cannot connect to vfsd"),
+    // Resolve path relative to cwd
+    let mut resolved_buf = [0u8; crate::cwd::MAX_PATH];
+    let path = match crate::get_cwd().resolve(path, &mut resolved_buf) {
+        Some(p) => p,
+        None => {
+            println!("cat: invalid path");
+            return CommandResult::None;
+        }
     };
 
-    // Read file in chunks until eof
-    let mut output = ByteBuffer::new();
+    let client = match crate::get_vfs_client() {
+        Some(c) => c,
+        None => {
+            println!("cat: vfsd not available");
+            return CommandResult::None;
+        }
+    };
+
+    let handle = match client.open(path, open_flags::RDONLY) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::builtins::ls::print_vfs_error(b"cat", path, e);
+            return CommandResult::None;
+        }
+    };
+
     let mut offset: u64 = 0;
-    let mut resp_buf = [0u8; 1024]; // 512 data + headers
+    let mut buf = [0u8; 4096];
 
     loop {
-        match client.read_file(path, offset, CHUNK_SIZE, &mut resp_buf) {
-            Ok(content) => {
-                let added = output.push(content.data);
-                offset += added as u64;
-
-                // Stop if we hit eof or filled buffer
-                if content.eof || added < content.data.len() {
-                    break;
-                }
+        match client.read(handle, offset, &mut buf) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                crate::console::write(&buf[..n]);
+                offset += n as u64;
             }
-            Err(VfsError::NotFound) => return CommandResult::Error("cat: file not found"),
-            Err(VfsError::PermissionDenied) => return CommandResult::Error("cat: permission denied"),
-            Err(VfsError::NotDirectory) => return CommandResult::Error("cat: is a directory"),
-            Err(_) => return CommandResult::Error("cat: read failed"),
+            Err(e) => {
+                crate::builtins::ls::print_vfs_error(b"cat", path, e);
+                break;
+            }
         }
     }
 
-    // Note if output buffer filled up (file larger than ByteBuffer can hold)
-    if output.is_full() {
-        println!("... (truncated, file larger than {} bytes)", output.capacity());
-    }
-
-    CommandResult::Bytes(output)
+    let _ = client.close(handle);
+    CommandResult::None
 }

@@ -36,7 +36,7 @@ use userlib::ipc::{Port, Timer, EventLoop, ObjHandle, Channel};
 use userlib::error::{SysError, SysResult};
 use userlib::query::{
     AttachDisk, ReportPartitions, RegisterPartitionMsg, PartitionReadyMsg,
-    MountPartitionMsg, MountReadyMsg, PartitionInfoMsg,
+    PartitionInfoMsg,
     QueryHeader, msg, fs_hint, part_scheme,
 };
 
@@ -204,6 +204,10 @@ struct SpawnContext {
     port_name: [u8; 32],
     /// Length of port name
     port_name_len: u8,
+    /// Opaque metadata from the port registration (e.g., BAR0 info)
+    metadata: [u8; 64],
+    /// Length of metadata
+    metadata_len: u8,
 }
 
 impl SpawnContext {
@@ -213,6 +217,8 @@ impl SpawnContext {
             port_type: 0,
             port_name: [0u8; 32],
             port_name_len: 0,
+            metadata: [0u8; 64],
+            metadata_len: 0,
         }
     }
 }
@@ -287,8 +293,6 @@ enum DiskState {
 ///   Empty -> Discovered: Reported by partd in ReportPartitions
 ///   Discovered -> Registering: RegisterPartition sent to partd
 ///   Registering -> Ready: PartitionReady received
-///   Ready -> MountSent: MountPartition sent to filesystem driver
-///   MountSent -> Mounted: MountReady received
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PartitionState {
     /// Slot is empty
@@ -297,12 +301,8 @@ enum PartitionState {
     Discovered,
     /// RegisterPartition sent, waiting for PartitionReady
     Registering { seq_id: u32 },
-    /// DataPort ready, can be mounted
+    /// DataPort ready
     Ready { shmem_id: u32 },
-    /// MountPartition sent, waiting for MountReady
-    MountSent { shmem_id: u32, seq_id: u32 },
-    /// Successfully mounted
-    Mounted { shmem_id: u32, mount_point: [u8; 64], mount_len: u8 },
 }
 
 /// Information about a tracked disk (from Block port registration)
@@ -403,8 +403,6 @@ impl TrackedPartition {
             (PartitionState::Empty, PartitionState::Discovered) => true,
             (PartitionState::Discovered, PartitionState::Registering { .. }) => true,
             (PartitionState::Registering { .. }, PartitionState::Ready { .. }) => true,
-            (PartitionState::Ready { .. }, PartitionState::MountSent { .. }) => true,
-            (PartitionState::MountSent { .. }, PartitionState::Mounted { .. }) => true,
             _ => false,
         };
         if valid {
@@ -417,8 +415,6 @@ impl TrackedPartition {
     fn shmem_id(&self) -> Option<u32> {
         match self.state {
             PartitionState::Ready { shmem_id } => Some(shmem_id),
-            PartitionState::MountSent { shmem_id, .. } => Some(shmem_id),
-            PartitionState::Mounted { shmem_id, .. } => Some(shmem_id),
             _ => None,
         }
     }
@@ -645,8 +641,6 @@ pub struct Devd {
     next_partition_num: u32,
     /// Service index for partd (0xFF = not known yet)
     partd_service_idx: u8,
-    /// Service index for fatfsd (0xFF = not known yet)
-    fatfsd_service_idx: u8,
     /// Orchestration sequence ID counter
     orch_seq_id: u32,
 }
@@ -677,7 +671,6 @@ impl Devd {
             tracked_disks: [const { TrackedDisk::empty() }; MAX_TRACKED_DISKS],
             next_partition_num: 0,
             partd_service_idx: 0xFF,
-            fatfsd_service_idx: 0xFF,
             orch_seq_id: 1,
         }
     }
@@ -770,8 +763,18 @@ impl Devd {
         };
 
         // Store spawn context so child can query GET_SPAWN_CONTEXT
+        // Include metadata from port registration (e.g., BAR0 info)
         if !context_port.is_empty() {
-            self.store_spawn_context(pid, context_port_type, context_port);
+            let metadata: ([u8; 64], usize) = self.ports.get(context_port)
+                .map(|p| {
+                    let m = p.metadata();
+                    let mut buf = [0u8; 64];
+                    let len = m.len().min(64);
+                    buf[..len].copy_from_slice(&m[..len]);
+                    (buf, len)
+                })
+                .unwrap_or(([0u8; 64], 0));
+            self.store_spawn_context(pid, context_port_type, context_port, &metadata.0[..metadata.1]);
         }
 
         // Add watcher to event loop
@@ -1445,7 +1448,7 @@ impl Devd {
                         dlog!("query: {} connected (slot={}, pid={}, svc_idx={:?})",
                             client_type, slot, client_pid, service_idx);
 
-                        // Check if this is partd or fatfsd for orchestration
+                        // Check if this is partd for orchestration
                         if let Some(idx) = service_idx {
                             dlog_state!("check_orchestration for svc={}", idx);
                             self.check_orchestration_driver_connected(idx);
@@ -1544,15 +1547,12 @@ impl Devd {
                         // Control logging (on/off)
                         self.handle_log_control(slot, &recv_buf[..len]);
                     }
-                    // Orchestration messages from partd/fatfsd
+                    // Orchestration messages from partd
                     Some(msg::REPORT_PARTITIONS) => {
                         self.handle_report_partitions(slot, &recv_buf[..len]);
                     }
                     Some(msg::PARTITION_READY) => {
                         self.handle_partition_ready(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::MOUNT_READY) => {
-                        self.handle_mount_ready(slot, &recv_buf[..len]);
                     }
                     _ => {
                         // Process normally
@@ -1608,13 +1608,14 @@ impl Devd {
         // Convert port_type u8 to PortType enum
         let port_type_enum = PortType::from_u8(info.port_type);
 
-        // Register the port
+        // Register the port (with metadata if provided)
         let result = self.handle_port_registration(
             info.name,
             port_type_enum,
             info.parent,
             info.owner_idx,
             info.shmem_id,
+            info.metadata,
         );
 
         // Send response
@@ -1683,13 +1684,13 @@ impl Devd {
         };
 
         // Look up spawn context for this PID
-        let mut response_buf = [0u8; 128];
-        let resp_len = if let Some((port_type, port_name)) = self.get_spawn_context(client_pid) {
-            dlog!("GET_SPAWN_CONTEXT for pid={}: port={}", client_pid,
-                core::str::from_utf8(port_name).unwrap_or("?"));
+        let mut response_buf = [0u8; 256];
+        let resp_len = if let Some((port_type, port_name, metadata)) = self.get_spawn_context(client_pid) {
+            dlog!("GET_SPAWN_CONTEXT for pid={}: port={} meta_len={}", client_pid,
+                core::str::from_utf8(port_name).unwrap_or("?"), metadata.len());
 
             let resp = SpawnContextResponse::new(header.seq_id, error::OK, port_type);
-            resp.write_to(&mut response_buf, port_name)
+            resp.write_to_with_metadata(&mut response_buf, port_name, metadata)
                 .unwrap_or(SpawnContextResponse::HEADER_SIZE)
         } else {
             dlog!("GET_SPAWN_CONTEXT for pid={}: no context", client_pid);
@@ -2349,10 +2350,22 @@ impl Devd {
             self.add_recent_dynamic_pid(child_pid, slot_idx as u8);
 
             // Store spawn context (port that triggered spawn) for GET_SPAWN_CONTEXT
+            // Include metadata from the port registration (e.g., BAR0 info)
             if let Some((port_type, port_name, port_name_len, _, _)) = spawn_ctx {
-                self.store_spawn_context(child_pid, port_type, &port_name[..port_name_len as usize]);
-                dlog!("stored spawn context for pid={}: port={}", child_pid,
-                    core::str::from_utf8(&port_name[..port_name_len as usize]).unwrap_or("?"));
+                let pname = &port_name[..port_name_len as usize];
+                // Look up metadata from the registered port
+                let metadata: ([u8; 64], usize) = self.ports.get(pname)
+                    .map(|p| {
+                        let m = p.metadata();
+                        let mut buf = [0u8; 64];
+                        let len = m.len().min(64);
+                        buf[..len].copy_from_slice(&m[..len]);
+                        (buf, len)
+                    })
+                    .unwrap_or(([0u8; 64], 0));
+                self.store_spawn_context(child_pid, port_type, pname, &metadata.0[..metadata.1]);
+                dlog!("stored spawn context for pid={}: port={} meta_len={}", child_pid,
+                    core::str::from_utf8(pname).unwrap_or("?"), metadata.1);
             }
 
             // Upgrade any already-connected client with this PID to driver status
@@ -2429,9 +2442,17 @@ impl Devd {
         parent_name: Option<&[u8]>,
         owner_idx: u8,
         shmem_id: u32,
+        metadata: &[u8],
     ) -> Result<(), SysError> {
         // Register the port with DataPort info
         self.ports.register_with_dataport(port_name, owner_idx, port_type, shmem_id, parent_name)?;
+
+        // Store metadata on the port if provided
+        if !metadata.is_empty() {
+            if let Some(port) = self.ports.get_mut(port_name) {
+                port.set_metadata(metadata);
+            }
+        }
 
         // Get parent type for rule matching
         let parent_type = parent_name.and_then(|p| self.ports.port_type(p));
@@ -2610,30 +2631,6 @@ impl Devd {
         dlog_state!("spawning partd for orchestration");
         self.spawn_dynamic_driver("partd", b"");
         dlog_state!("spawn_dynamic_driver returned");
-    }
-
-    /// Ensure fatfsd is running, spawn if not
-    fn ensure_fatfsd_running(&mut self) {
-        if self.fatfsd_service_idx != 0xFF {
-            return; // Already running
-        }
-
-        // Check if fatfsd is already in services
-        for i in 0..MAX_SERVICES {
-            if let Some(service) = self.services.get(i) {
-                if let Some(def) = service.def() {
-                    if def.binary == "fatfsd" && service.state == ServiceState::Ready {
-                        self.fatfsd_service_idx = i as u8;
-                        dlog!("found existing fatfsd at slot {}", i);
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Spawn fatfsd dynamically
-        dlog_state!("spawning fatfsd for orchestration");
-        self.spawn_dynamic_driver("fatfsd", b"");
     }
 
     /// Get next orchestration sequence ID
@@ -2970,186 +2967,11 @@ impl Devd {
             Some(disk_name),
         );
 
-        // Now mount the partition with appropriate filesystem driver
-        let part = &self.tracked_disks[disk_idx].partitions[part_idx];
-        let fs_type = fs_hint::from_mbr_type(part.part_type);
-
-        if fs_type == fs_hint::FAT12 || fs_type == fs_hint::FAT16 || fs_type == fs_hint::FAT32 {
-            self.ensure_fatfsd_running();
-            if self.fatfsd_service_idx != 0xFF {
-                self.send_mount_partition(disk_idx, part_idx);
-            } else {
-                dlog!("fatfsd not ready yet, will mount when connected");
-            }
-        } else {
-            dlog!("no filesystem driver for type {}", part.part_type);
-        }
+        // Check rules for this new partition port (triggers fatfsd spawn)
+        self.check_rules_for_port(name, PortType::Partition, Some(PortType::Block), self.partd_service_idx);
     }
 
-    /// Send MOUNT_PARTITION to fatfsd
-    /// State transition: Ready -> MountSent
-    fn send_mount_partition(&mut self, disk_idx: usize, part_idx: usize) {
-        let fatfsd_idx = self.fatfsd_service_idx;
-        if fatfsd_idx == 0xFF {
-            derror!("cannot send MountPartition: fatfsd not connected");
-            return;
-        }
-
-        // Verify partition is in Ready state and get shmem_id
-        let part_shmem_id = match self.tracked_disks[disk_idx].partitions[part_idx].state {
-            PartitionState::Ready { shmem_id } => shmem_id,
-            ref other => {
-                derror!("cannot mount partition: not in Ready state, is {:?}", other);
-                return;
-            }
-        };
-
-        // Copy needed data before mutable borrow
-        let (part_type, size_sectors, block_size, source_name_buf, source_name_len, mount_buf, mount_len) = {
-            let disk = &self.tracked_disks[disk_idx];
-            let part = &disk.partitions[part_idx];
-
-            // Copy source name
-            let mut src_buf = [0u8; 32];
-            let src_len = part.assigned_name_len as usize;
-            src_buf[..src_len].copy_from_slice(&part.assigned_name[..src_len]);
-
-            // Create mount point like "/mnt/fat0"
-            let mut mnt_buf = [0u8; 64];
-            let mnt_len = {
-                let prefix = b"/mnt/fat";
-                let mut pos = 0;
-                for b in prefix {
-                    mnt_buf[pos] = *b;
-                    pos += 1;
-                }
-                // Use partition number from assigned name (part0: -> 0)
-                // Extract number from "partN:" format
-                let name = &part.assigned_name[..part.assigned_name_len as usize];
-                if name.len() > 5 && name.starts_with(b"part") {
-                    for &b in &name[4..] {
-                        if b == b':' {
-                            break;
-                        }
-                        mnt_buf[pos] = b;
-                        pos += 1;
-                    }
-                }
-                pos
-            };
-
-            (part.part_type, part.size_sectors, disk.block_size, src_buf, src_len, mnt_buf, mnt_len)
-        };
-
-        let source_name = &source_name_buf[..source_name_len];
-        let fs_type = fs_hint::from_mbr_type(part_type);
-
-        // Build MOUNT_PARTITION message
-        let seq_id = self.next_orch_seq_id();
-        let mount = MountPartitionMsg::new(
-            seq_id,
-            part_shmem_id,
-            fs_type,
-            block_size,
-            size_sectors,
-        );
-        let mut buf = [0u8; 128];
-        let len = match mount.write_to(&mut buf, source_name, &mount_buf[..mount_len]) {
-            Some(l) => l,
-            None => {
-                derror!("failed to serialize MountPartition");
-                return;
-            }
-        };
-
-        // Transition Ready -> MountSent
-        {
-            let part = &mut self.tracked_disks[disk_idx].partitions[part_idx];
-            if !part.transition(PartitionState::MountSent { shmem_id: part_shmem_id, seq_id }) {
-                derror!("partition state transition failed: Ready -> MountSent");
-                return;
-            }
-        }
-
-        // Send to fatfsd
-        let slot = self.query_handler.find_by_service_idx(fatfsd_idx);
-        if let Some(slot) = slot {
-            if let Some(client) = self.query_handler.get_mut(slot) {
-                match client.channel.send(&buf[..len]) {
-                    Ok(_) => {
-                        if let Ok(source_str) = core::str::from_utf8(source_name) {
-                            if let Ok(mount_str) = core::str::from_utf8(&mount_buf[..mount_len]) {
-                                dlog_state!("→ MountPartition {} -> {}", source_str, mount_str);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        derror!("failed to send MountPartition: {:?}", e);
-                    }
-                }
-            }
-        } else {
-            derror!("fatfsd slot not found for idx={}", fatfsd_idx);
-        }
-    }
-
-    /// Handle MOUNT_READY from fatfsd
-    /// State transition: MountSent -> Mounted
-    fn handle_mount_ready(&mut self, _slot: usize, buf: &[u8]) {
-        let (ready, mount_point) = match MountReadyMsg::from_bytes(buf) {
-            Some(r) => r,
-            None => {
-                derror!("invalid MOUNT_READY message");
-                return;
-            }
-        };
-
-        if let Ok(mount_str) = core::str::from_utf8(mount_point) {
-            dlog_state!("← MountReady: {} shmem_id={}", mount_str, ready.shmem_id);
-        }
-
-        // Register the mount point as a Filesystem port
-        let _ = self.ports.register_with_dataport(
-            mount_point,
-            self.fatfsd_service_idx,
-            PortType::Filesystem,
-            ready.shmem_id,
-            None, // No parent for VFS mount points
-        );
-
-        // Find the partition in MountSent state with matching shmem_id
-        for disk_idx in 0..MAX_TRACKED_DISKS {
-            let disk = &mut self.tracked_disks[disk_idx];
-            if disk.state == DiskState::Empty {
-                continue;
-            }
-            for part_idx in 0..(disk.partition_count as usize).min(MAX_PARTITIONS_PER_DISK) {
-                let part = &mut disk.partitions[part_idx];
-                // Check if in MountSent state with matching shmem_id
-                if let PartitionState::MountSent { shmem_id, .. } = part.state {
-                    if shmem_id == ready.shmem_id {
-                        // Transition MountSent -> Mounted
-                        let mut mount_buf = [0u8; 64];
-                        let mount_len = mount_point.len().min(64);
-                        mount_buf[..mount_len].copy_from_slice(&mount_point[..mount_len]);
-
-                        if !part.transition(PartitionState::Mounted {
-                            shmem_id,
-                            mount_point: mount_buf,
-                            mount_len: mount_len as u8,
-                        }) {
-                            derror!("partition state transition failed: MountSent -> Mounted");
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-
-        derror!("MOUNT_READY for unknown partition shmem_id={}", ready.shmem_id);
-    }
-
-    /// Check if a newly connected driver is partd or fatfsd
+    /// Check if a newly connected driver is partd
     fn check_orchestration_driver_connected(&mut self, service_idx: u8) {
         // Look up the service to find its binary name
         if let Some(service) = self.services.get(service_idx as usize) {
@@ -3158,15 +2980,11 @@ impl Devd {
 
             if name == "partd" {
                 self.partd_connected(service_idx);
-            } else if name == "fatfsd" {
-                self.fatfsd_connected(service_idx);
             }
             // Also check def (for statically defined services)
             else if let Some(def) = service.def() {
                 if def.binary == "partd" {
                     self.partd_connected(service_idx);
-                } else if def.binary == "fatfsd" {
-                    self.fatfsd_connected(service_idx);
                 }
             }
         }
@@ -3190,46 +3008,6 @@ impl Devd {
         }
     }
 
-    /// Called when fatfsd connects to devd-query
-    /// Send MountPartition for any partitions in Ready state
-    fn fatfsd_connected(&mut self, service_idx: u8) {
-        if self.fatfsd_service_idx != 0xFF {
-            return; // Already connected
-        }
-        self.fatfsd_service_idx = service_idx;
-        dlog_state!("fatfsd connected as service {}", service_idx);
-
-        // Collect partitions to mount first, then send (to avoid borrow issues)
-        let mut to_mount = [(0usize, 0usize); MAX_TRACKED_DISKS * MAX_PARTITIONS_PER_DISK];
-        let mut mount_count = 0;
-
-        for disk_idx in 0..MAX_TRACKED_DISKS {
-            let disk = &self.tracked_disks[disk_idx];
-            if disk.state == DiskState::Empty {
-                continue;
-            }
-            for part_idx in 0..(disk.partition_count as usize).min(MAX_PARTITIONS_PER_DISK) {
-                let part = &disk.partitions[part_idx];
-                // Check for Ready state (meaning partition has DataPort but not mounted yet)
-                if let PartitionState::Ready { .. } = part.state {
-                    let fs_type = fs_hint::from_mbr_type(part.part_type);
-                    if fs_type == fs_hint::FAT12 || fs_type == fs_hint::FAT16 || fs_type == fs_hint::FAT32 {
-                        if mount_count < to_mount.len() {
-                            to_mount[mount_count] = (disk_idx, part_idx);
-                            mount_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Now send MountPartition for each
-        for i in 0..mount_count {
-            let (disk_idx, part_idx) = to_mount[i];
-            self.send_mount_partition(disk_idx, part_idx);
-        }
-    }
-
     /// Spawn a driver dynamically (not from SERVICE_DEFS)
     fn spawn_dynamic_driver(&mut self, binary: &str, trigger_port: &[u8]) {
         self.spawn_dynamic_driver_with_caps(binary, trigger_port, 0);
@@ -3249,9 +3027,19 @@ impl Devd {
         };
 
         // Store spawn context for GET_SPAWN_CONTEXT
+        // Include metadata from port registration (e.g., BAR0 info)
         if !trigger_port.is_empty() {
             let port_type = self.ports.get_port_type(trigger_port).unwrap_or(0);
-            self.store_spawn_context(pid, port_type, trigger_port);
+            let metadata: ([u8; 64], usize) = self.ports.get(trigger_port)
+                .map(|p| {
+                    let m = p.metadata();
+                    let mut buf = [0u8; 64];
+                    let len = m.len().min(64);
+                    buf[..len].copy_from_slice(&m[..len]);
+                    (buf, len)
+                })
+                .unwrap_or(([0u8; 64], 0));
+            self.store_spawn_context(pid, port_type, trigger_port, &metadata.0[..metadata.1]);
         }
 
         // Create service slot using create_dynamic_service (which actually creates the entry)
@@ -3359,8 +3147,8 @@ impl Devd {
         None
     }
 
-    /// Store spawn context for a child PID
-    fn store_spawn_context(&mut self, pid: u32, port_type: u8, port_name: &[u8]) {
+    /// Store spawn context for a child PID (with optional metadata from port registration)
+    fn store_spawn_context(&mut self, pid: u32, port_type: u8, port_name: &[u8], metadata: &[u8]) {
         // Find empty slot or oldest entry
         let mut empty_slot = None;
         for (i, entry) in self.spawn_contexts.iter_mut().enumerate() {
@@ -3376,13 +3164,20 @@ impl Devd {
         let len = port_name.len().min(32);
         self.spawn_contexts[slot].port_name[..len].copy_from_slice(&port_name[..len]);
         self.spawn_contexts[slot].port_name_len = len as u8;
+        let meta_len = metadata.len().min(64);
+        self.spawn_contexts[slot].metadata[..meta_len].copy_from_slice(&metadata[..meta_len]);
+        self.spawn_contexts[slot].metadata_len = meta_len as u8;
     }
 
     /// Get spawn context for a PID
-    fn get_spawn_context(&self, pid: u32) -> Option<(u8, &[u8])> {
+    fn get_spawn_context(&self, pid: u32) -> Option<(u8, &[u8], &[u8])> {
         for entry in &self.spawn_contexts {
             if entry.pid == pid {
-                return Some((entry.port_type, &entry.port_name[..entry.port_name_len as usize]));
+                return Some((
+                    entry.port_type,
+                    &entry.port_name[..entry.port_name_len as usize],
+                    &entry.metadata[..entry.metadata_len as usize],
+                ));
             }
         }
         None

@@ -1539,8 +1539,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                         let port_id = p.port_id();
                         let has_pending = ipc::port_has_pending(port_id);
                         let filter_readable = (watch.filter & filter::READABLE) != 0;
-                        let ready = filter_readable && has_pending;
-                        ready
+                        filter_readable && has_pending
                     }
                     Object::Timer(t) => {
                         if (watch.filter & filter::READABLE) != 0 {

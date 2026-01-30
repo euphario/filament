@@ -1,221 +1,133 @@
-//! Directory Listing Builtin
-//!
-//! List directory contents.
-//!
-//! Usage:
-//!   ls              - List current directory
-//!   ls /            - List root (shows /bin, /mnt)
-//!   ls /bin         - List embedded binaries
-//!   ls /mnt         - List mounted filesystems
-//!   ls /mnt/fat0    - List FAT filesystem root
+//! ls - List directory contents via VFS
 
 use crate::println;
-use crate::output::{Table, Row, Align, CommandResult};
-use crate::cwd::MAX_PATH;
-use userlib::ipc::Channel;
-use userlib::vfs::{ListDir, DirEntries, DirEntry, VfsHeader, msg, file_type};
+use crate::output::{CommandResult, Table, Row, Value, Align};
+use userlib::vfs_proto::{open_flags, file_type, VfsDirEntry};
 
-/// Known binaries in /bin (embedded in initrd)
-const KNOWN_BINARIES: &[&str] = &[
-    "shell",
-    "devd",
-    "consoled",
-    "vfsd",
-    "partition",
-    "fatfs",
-    "qemu-usbd",
-];
-
-/// Main entry point for ls builtin
-pub fn run(args: &[u8]) -> CommandResult {
+pub fn cmd_ls(args: &[u8]) -> CommandResult {
     let path = crate::trim(args);
 
-    // Use cwd if no path given
-    let resolved_path: &[u8] = if path.is_empty() {
-        crate::get_cwd().as_bytes()
-    } else if path[0] != b'/' {
-        // Relative path - resolve against cwd
-        // For now, just prepend cwd (proper resolution in cwd.rs)
-        static mut RESOLVED: [u8; MAX_PATH] = [0u8; MAX_PATH];
-        let resolved = unsafe { &mut *core::ptr::addr_of_mut!(RESOLVED) };
-        match crate::get_cwd().resolve(path, resolved) {
-            Some(p) => p,
-            None => {
-                println!("ls: invalid path");
-                return CommandResult::None;
+    // Resolve path relative to cwd
+    let mut resolved_buf = [0u8; crate::cwd::MAX_PATH];
+    let path = match crate::get_cwd().resolve(path, &mut resolved_buf) {
+        Some(p) => p,
+        None => return CommandResult::Error("invalid path"),
+    };
+
+    let client = match crate::get_vfs_client() {
+        Some(c) => c,
+        None => return CommandResult::Error("vfsd not available"),
+    };
+
+    let handle = match client.open(path, open_flags::DIR | open_flags::RDONLY) {
+        Ok(h) => h,
+        Err(e) => {
+            print_vfs_error(b"ls", path, e);
+            return CommandResult::None;
+        }
+    };
+
+    let mut entries = [VfsDirEntry::empty(); 32];
+    let result = match client.readdir(handle, &mut entries) {
+        Ok(count) => {
+            let mut table = Table::new(&["NAME", "TYPE", "SIZE"])
+                .align(2, Align::Right);
+
+            for i in 0..count {
+                let e = &entries[i];
+                let name = e.name_bytes();
+
+                let type_str = if e.file_type == file_type::DIR {
+                    "dir"
+                } else {
+                    "file"
+                };
+
+                let size_val = format_size(e.size);
+
+                table.add_row(
+                    Row::empty()
+                        .bytes(name)
+                        .str(type_str)
+                        .bytes(&size_val.0[..size_val.1])
+                );
             }
+
+            CommandResult::Table(table)
         }
+        Err(e) => {
+            print_vfs_error(b"ls", path, e);
+            CommandResult::None
+        }
+    };
+
+    let _ = client.close(handle);
+    result
+}
+
+/// Format size into a human-readable string, returns (buffer, length)
+fn format_size(size: u32) -> ([u8; 16], usize) {
+    let mut buf = [0u8; 16];
+    let len;
+    if size >= 1024 * 1024 {
+        let mb = size / (1024 * 1024);
+        let frac = (size % (1024 * 1024)) / (1024 * 100);
+        len = write_dec(&mut buf, mb);
+        buf[len] = b'.';
+        let len2 = write_dec(&mut buf[len + 1..], frac);
+        buf[len + 1 + len2] = b'M';
+        (buf, len + 1 + len2 + 1)
+    } else if size >= 1024 {
+        let kb = size / 1024;
+        let frac = (size % 1024) / 100;
+        len = write_dec(&mut buf, kb);
+        buf[len] = b'.';
+        let len2 = write_dec(&mut buf[len + 1..], frac);
+        buf[len + 1 + len2] = b'K';
+        (buf, len + 1 + len2 + 1)
     } else {
-        path
-    };
-
-    // Route based on path
-    if resolved_path == b"/" {
-        return ls_root();
+        len = write_dec(&mut buf, size);
+        buf[len] = b'B';
+        (buf, len + 1)
     }
-
-    if resolved_path == b"/bin" || resolved_path.starts_with(b"/bin/") {
-        return ls_bin();
-    }
-
-    if resolved_path == b"/mnt" || resolved_path.starts_with(b"/mnt") {
-        return ls_vfs(resolved_path);
-    }
-
-    println!("ls: path not found");
-    CommandResult::None
 }
 
-/// List root directory (virtual)
-fn ls_root() -> CommandResult {
-    let mut table = Table::new(&["TYPE", "NAME"])
-        .align(0, Align::Left);
-
-    // Root contains /bin and /mnt
-    table.add_row(Row::empty().str("dir").str("bin"));
-    table.add_row(Row::empty().str("dir").str("mnt"));
-
-    CommandResult::Table(table)
+fn write_dec(buf: &mut [u8], val: u32) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut n = val;
+    let mut digits = 0;
+    let mut tmp = [0u8; 10];
+    while n > 0 {
+        tmp[digits] = b'0' + (n % 10) as u8;
+        n /= 10;
+        digits += 1;
+    }
+    for i in 0..digits {
+        buf[i] = tmp[digits - 1 - i];
+    }
+    digits
 }
 
-/// List /bin directory (hardcoded)
-fn ls_bin() -> CommandResult {
-    let mut table = Table::new(&["TYPE", "NAME"])
-        .align(0, Align::Left);
-
-    for &name in KNOWN_BINARIES {
-        let row = Row::empty()
-            .str("file")
-            .str(name);
-        table.add_row(row);
-    }
-
-    CommandResult::Table(table)
-}
-
-/// List via VFS daemon
-fn ls_vfs(path: &[u8]) -> CommandResult {
-    // Connect to vfsd
-    let mut channel = match Channel::connect(b"vfs:") {
-        Ok(ch) => ch,
-        Err(e) => {
-            println!("ls: cannot connect to vfsd: {:?}", e);
-            return CommandResult::None;
-        }
+pub fn print_vfs_error(cmd: &[u8], path: &[u8], e: userlib::vfs_client::VfsError) {
+    use userlib::vfs_client::VfsError;
+    crate::console::write(cmd);
+    crate::console::write(b": ");
+    crate::console::write(path);
+    crate::console::write(b": ");
+    let msg = match e {
+        VfsError::NotFound => b"not found" as &[u8],
+        VfsError::NotDir => b"not a directory",
+        VfsError::IsDir => b"is a directory",
+        VfsError::Permission => b"permission denied",
+        VfsError::NoMount => b"no mount point",
+        VfsError::ReadOnly => b"read-only filesystem",
+        VfsError::Timeout => b"timeout",
+        VfsError::NotAvailable => b"vfsd not available",
+        _ => b"I/O error",
     };
-
-    // Send LIST_DIR request
-    let req = ListDir::new(1); // seq_id = 1
-    let mut buf = [0u8; 256];
-    let len = match req.write_to(&mut buf, path) {
-        Some(n) => n,
-        None => {
-            println!("ls: path too long");
-            return CommandResult::None;
-        }
-    };
-
-    if let Err(e) = channel.send(&buf[..len]) {
-        println!("ls: send failed: {:?}", e);
-        return CommandResult::None;
-    }
-
-    // Wait for response
-    if let Err(e) = userlib::ipc::wait_one(channel.handle()) {
-        println!("ls: wait failed: {:?}", e);
-        return CommandResult::None;
-    }
-
-    // Receive response
-    let mut resp_buf = [0u8; 512];
-    let resp_len = match channel.recv(&mut resp_buf) {
-        Ok(n) => n,
-        Err(e) => {
-            println!("ls: recv failed: {:?}", e);
-            return CommandResult::None;
-        }
-    };
-
-    // Parse response header
-    let header = match VfsHeader::from_bytes(&resp_buf[..resp_len]) {
-        Some(h) => h,
-        None => {
-            println!("ls: invalid response");
-            return CommandResult::None;
-        }
-    };
-
-    // Check for error response
-    if header.msg_type == msg::RESULT {
-        // Need VfsHeader::SIZE + 4 bytes to read the i32 result code
-        let min_result_size = VfsHeader::SIZE + 4;
-        let code = if resp_len >= min_result_size {
-            i32::from_le_bytes([
-                resp_buf[VfsHeader::SIZE],
-                resp_buf[VfsHeader::SIZE + 1],
-                resp_buf[VfsHeader::SIZE + 2],
-                resp_buf[VfsHeader::SIZE + 3],
-            ])
-        } else {
-            -1
-        };
-        println!("ls: error {}", code);
-        return CommandResult::None;
-    }
-
-    // Parse DIR_ENTRIES
-    if header.msg_type != msg::DIR_ENTRIES {
-        println!("ls: unexpected response type {}", header.msg_type);
-        return CommandResult::None;
-    }
-
-    let entries = match DirEntries::from_bytes(&resp_buf[..resp_len]) {
-        Some(e) => e,
-        None => {
-            println!("ls: invalid dir entries");
-            return CommandResult::None;
-        }
-    };
-
-    if entries.count == 0 {
-        println!("(empty directory)");
-        return CommandResult::None;
-    }
-
-    // Build table
-    let mut table = Table::new(&["TYPE", "SIZE", "NAME"])
-        .align(1, Align::Right);
-
-    // Parse each entry
-    let mut offset = DirEntries::HEADER_SIZE;
-    for _ in 0..entries.count {
-        if offset >= resp_len {
-            break;
-        }
-
-        let (entry, name) = match DirEntry::from_bytes(&resp_buf[offset..resp_len]) {
-            Some(e) => e,
-            None => break,
-        };
-
-        let type_str = match entry.file_type {
-            t if t == file_type::DIRECTORY => "dir",
-            t if t == file_type::FILE => "file",
-            t if t == file_type::SYMLINK => "link",
-            _ => "?",
-        };
-
-        // Copy name to avoid lifetime issues
-        let name_str = core::str::from_utf8(name).unwrap_or("?");
-
-        let row = Row::empty()
-            .str(type_str)
-            .uint(entry.size)
-            .string(name_str);  // Use string() instead of str() for non-static
-        table.add_row(row);
-
-        offset += entry.total_size();
-    }
-
-    CommandResult::Table(table)
+    crate::console::write(msg);
+    println!();
 }

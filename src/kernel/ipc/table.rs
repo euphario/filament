@@ -380,14 +380,26 @@ impl ChannelTable {
     // ========================================================================
 
     /// Send a message directly to a channel (bypass ownership check)
-    /// Used by liveness checker to send ping messages
+    /// Used by kernel components to send messages on kernel-owned channels.
+    /// Like regular send(), this delivers to the PEER channel.
     pub fn send_direct(&mut self, id: ChannelId, msg: Message) -> Result<WakeList, IpcError> {
         let slot = self.find_slot(id).ok_or(IpcError::InvalidChannel { id })?;
 
-        let channel = self.channels[slot].as_mut()
+        let channel = self.channels[slot].as_ref()
             .ok_or(IpcError::InvalidChannel { id })?;
 
-        channel.deliver(msg)
+        // Get peer ID from sender's channel state
+        let peer_id = match channel.state() {
+            ChannelState::Open { peer_id, .. } => *peer_id,
+            ChannelState::HalfClosed { .. } => return Err(IpcError::PeerClosed),
+            ChannelState::Closed => return Err(IpcError::Closed),
+        };
+
+        // Deliver to peer channel
+        let peer_channel = self.get_unchecked_mut(peer_id)
+            .ok_or(IpcError::PeerClosed)?;
+
+        peer_channel.deliver(msg)
     }
 
     /// Close a channel without ownership check (for liveness recovery)

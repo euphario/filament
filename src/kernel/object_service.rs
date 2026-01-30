@@ -755,7 +755,7 @@ impl ObjectService {
                 found_sub
                 // owner_guard dropped here
             }
-            _ => None, // Same task or invalid - skip
+            _ => None,
         };
 
         // Wake subscriber (no locks held)

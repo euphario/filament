@@ -1,7 +1,6 @@
 //! Tab Completion
 //!
 //! Provides command completion using builtin commands.
-//! Path completion is disabled until vfsd is available.
 
 /// Maximum completions to show
 const MAX_COMPLETIONS: usize = 16;
@@ -9,9 +8,10 @@ const MAX_COMPLETIONS: usize = 16;
 /// Builtin commands for completion
 const BUILTINS: &[&[u8]] = &[
     b"help", b"exit", b"quit", b"pid", b"uptime", b"mem", b"echo",
-    b"spawn", b"yield", b"panic", b"usb", b"gpio", b"fatfs", b"pcied",
+    b"spawn", b"yield", b"panic", b"usb", b"gpio", b"pcied",
     b"wifi", b"fan", b"ps", b"kill", b"bg", b"jobs", b"log", b"reset",
-    b"reboot", b"hw", b"ls", b"cat", b"devd", b"handle", b"resize",
+    b"reboot", b"hw", b"devd", b"handle", b"resize",
+    b"ls", b"cat", b"lsdev", b"devinfo", b"devquery", b"drivers", b"dlog",
 ];
 
 /// Completion result
@@ -85,13 +85,6 @@ impl Completions {
         self.common[..common_len].copy_from_slice(&first[..common_len]);
         self.common_len = common_len;
     }
-}
-
-/// Complete a path prefix
-/// Returns empty completions (vfsd not available)
-pub fn complete_path(_partial: &[u8]) -> Completions {
-    // Path completion disabled - vfsd not available
-    Completions::empty()
 }
 
 /// Complete a command (searches builtins only)

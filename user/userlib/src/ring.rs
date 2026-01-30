@@ -777,6 +777,9 @@ pub mod side_msg {
     // Notifications (from lower to upper) - 0x02xx
     pub const NOTIFY_MEDIA_CHANGE: u16 = 0x0200;
     pub const NOTIFY_ERROR: u16 = 0x0201;
+
+    // VFS registration (fatfsd → vfsd) - 0x03xx
+    pub const REGISTER_MOUNT: u16 = 0x0300;
 }
 
 /// Sidechannel status codes
@@ -996,6 +999,11 @@ impl LayeredRing {
     /// Notify waiters
     pub fn notify(&self) {
         let _ = self.shmem.notify();
+    }
+
+    /// Get the shmem handle for Mux registration
+    pub fn shmem_handle(&self) -> crate::syscall::Handle {
+        self.shmem.handle()
     }
 
     fn base(&self) -> *mut u8 {

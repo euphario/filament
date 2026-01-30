@@ -857,7 +857,10 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
     print_str_uart("\r\n  SP:  0x");
     print_hex_uart(sp_el0);
 
-    // Print current PID (from scheduler)
+    // Print current slot and PID
+    let slot = kernel::task::current_slot();
+    print_str_uart("\r\n  SLOT: ");
+    print_hex_uart(slot as u64);
     let pid = unsafe {
         kernel::task::scheduler().current_task_id().unwrap_or(0)
     };

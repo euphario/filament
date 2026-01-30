@@ -94,7 +94,7 @@ struct XhciPciDevice {
 fn get_device_from_spawn_context(devd: &mut DevdClient) -> Option<XhciPciDevice> {
     // Step 1: Get spawn context from devd
     let (port_name, port_len) = match devd.get_spawn_context() {
-        Ok(Some((name, len, _ptype))) => (name, len),
+        Ok(Some((name, len, _ptype, _meta, _meta_len))) => (name, len),
         Ok(None) => {
             log("[xhcid] No spawn context");
             return None;

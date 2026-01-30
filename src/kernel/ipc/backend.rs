@@ -64,6 +64,8 @@ fn convert_error(e: IpcError) -> TraitIpcError {
         IpcError::NotSupported => TraitIpcError::InvalidArg,
         IpcError::Timeout => TraitIpcError::WouldBlock,
         IpcError::Interrupted => TraitIpcError::WouldBlock,
+        IpcError::Busy => TraitIpcError::InvalidArg,
+        IpcError::Internal => TraitIpcError::InvalidArg,
     }
 }
 

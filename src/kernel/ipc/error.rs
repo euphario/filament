@@ -115,6 +115,12 @@ pub enum IpcError {
 
     /// Operation was interrupted
     Interrupted,
+
+    /// Resource is busy (e.g., bus already claimed)
+    Busy,
+
+    /// Internal error (catch-all)
+    Internal,
 }
 
 impl IpcError {
@@ -165,6 +171,12 @@ impl IpcError {
 
             // EINTR (4) - Interrupted system call
             IpcError::Interrupted => -4,
+
+            // EBUSY (16) - Device or resource busy
+            IpcError::Busy => -16,
+
+            // EIO (5) - I/O error
+            IpcError::Internal => -5,
         }
     }
 
@@ -192,6 +204,8 @@ impl IpcError {
             IpcError::NotSupported => "not supported",
             IpcError::Timeout => "timeout",
             IpcError::Interrupted => "interrupted",
+            IpcError::Busy => "busy",
+            IpcError::Internal => "internal error",
         }
     }
 
@@ -251,6 +265,8 @@ impl core::fmt::Display for IpcError {
             IpcError::NotSupported => write!(f, "operation not supported"),
             IpcError::Timeout => write!(f, "operation timed out"),
             IpcError::Interrupted => write!(f, "operation interrupted"),
+            IpcError::Busy => write!(f, "resource busy"),
+            IpcError::Internal => write!(f, "internal error"),
         }
     }
 }

@@ -7,7 +7,6 @@
 //! corresponding match arm in main.rs.
 
 pub mod cat;
-pub mod cp;
 pub mod devd;
 pub mod drivers;
 pub mod gpio;
@@ -16,8 +15,4 @@ pub mod hw;
 pub mod logs;
 pub mod ls;
 pub mod lsdev;
-pub mod mkdir;
-pub mod mv;
 pub mod ps;
-pub mod rm;
-pub mod rmdir;

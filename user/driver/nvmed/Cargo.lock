@@ -10,14 +10,6 @@ version = "0.1.0"
 name = "nvmed"
 version = "0.1.0"
 dependencies = [
- "pcie",
- "userlib",
-]
-
-[[package]]
-name = "pcie"
-version = "0.1.0"
-dependencies = [
  "userlib",
 ]
 

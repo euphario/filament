@@ -1,15 +1,16 @@
 //! PCIe Bus Driver
 //!
-//! Enumerates PCIe devices via ECAM, creates per-device ports, and spawns
-//! child drivers when requested by devd.
+//! Enumerates PCIe devices via ECAM and registers per-device ports with devd.
+//! Device info (BAR0 address/size) is embedded as metadata in the port
+//! registration, flowing to child drivers via spawn context.
 //!
 //! Architecture:
 //! 1. Connect to kernel's /kernel/bus/pcie0 to receive bus state
 //! 2. Wait for Safe state before proceeding
 //! 3. Enumerate PCI devices via ECAM
-//! 4. Create a kernel Port for each device (e.g., pci/00:02.0:xhci)
-//! 5. Register devices with devd
-//! 6. When devd sends SpawnChild, spawn driver and send device info to child
+//! 4. Register each device as a devd port with BAR0 metadata
+//! 5. devd rules match port types and spawn child drivers (nvmed, xhcid, etc.)
+//! 6. Child drivers read BAR0 info from spawn context metadata
 //!
 //! Supports:
 //! - QEMU virt (ECAM at 0x4010000000)
@@ -18,15 +19,14 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall::{self, Handle, LogLevel};
+use userlib::syscall::{self, LogLevel};
 use userlib::bus::{
-    BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId, KernelBusInfo,
+    BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId,
     KernelBusState, KernelBusChangeReason, bus_msg,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::devd::PortType;
 use userlib::mmio::MmioRegion;
-use userlib::ipc::{Port, ObjHandle};
 
 // ============================================================================
 // Logging
@@ -238,6 +238,14 @@ impl PciDevice {
         }
         i
     }
+
+    /// Build BAR0 metadata: [bar0_phys: u64 LE, bar0_size: u32 LE] = 12 bytes
+    fn bar0_metadata(&self) -> [u8; 12] {
+        let mut meta = [0u8; 12];
+        meta[0..8].copy_from_slice(&self.bar0_phys.to_le_bytes());
+        meta[8..12].copy_from_slice(&(self.bar0_size as u32).to_le_bytes());
+        meta
+    }
 }
 
 // ============================================================================
@@ -261,56 +269,6 @@ impl DeviceRegistry {
 
     fn iter(&self) -> impl Iterator<Item = &PciDevice> {
         self.devices[..self.count].iter()
-    }
-
-    fn get(&self, idx: usize) -> Option<&PciDevice> {
-        if idx < self.count { Some(&self.devices[idx]) } else { None }
-    }
-}
-
-// ============================================================================
-// Device Ports
-// ============================================================================
-
-/// Handle tags for device port events.
-/// Port accept: TAG_PORT_BASE + port_index
-/// Child channel: TAG_CHILD_BASE + port_index
-const TAG_PORT_BASE: u32 = 0x1000;
-const TAG_CHILD_BASE: u32 = 0x2000;
-
-struct DevicePort {
-    port: Port,
-    dev_idx: usize,
-    child: Option<ObjHandle>,
-    info_sent: bool,
-}
-
-const MAX_DEVICE_PORTS: usize = 16;
-
-struct DevicePorts {
-    ports: [Option<DevicePort>; MAX_DEVICE_PORTS],
-}
-
-impl DevicePorts {
-    const fn new() -> Self {
-        Self {
-            ports: [const { None }; MAX_DEVICE_PORTS],
-        }
-    }
-
-    fn add(&mut self, port: Port, dev_idx: usize) -> Option<usize> {
-        for (i, slot) in self.ports.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(DevicePort {
-                    port,
-                    dev_idx,
-                    child: None,
-                    info_sent: false,
-                });
-                return Some(i);
-            }
-        }
-        None
     }
 }
 
@@ -434,26 +392,13 @@ fn enable_bus_master(ecam: &EcamAccess, dev: &PciDevice) {
 }
 
 // ============================================================================
-// Device Info Protocol
-// ============================================================================
-
-fn send_device_info(handle: ObjHandle, dev: &PciDevice) -> bool {
-    let mut buf = [0u8; 12];
-    buf[0..8].copy_from_slice(&dev.bar0_phys.to_le_bytes());
-    buf[8..12].copy_from_slice(&(dev.bar0_size as u32).to_le_bytes());
-    syscall::write(handle, &buf).is_ok()
-}
-
-// ============================================================================
 // PCIe Driver (Bus Framework)
 // ============================================================================
 
 struct PcieDriver {
     platform: Platform,
     registry: DeviceRegistry,
-    device_ports: DevicePorts,
     kernel_bus: Option<KernelBusId>,
-    initialized: bool,
 }
 
 impl PcieDriver {
@@ -469,54 +414,7 @@ impl PcieDriver {
                 }; MAX_PCI_DEVICES],
                 count: 0,
             },
-            device_ports: DevicePorts::new(),
             kernel_bus: None,
-            initialized: false,
-        }
-    }
-
-    fn handle_port_accept(&mut self, port_idx: usize) {
-        let dp = match &mut self.device_ports.ports[port_idx] {
-            Some(dp) => dp,
-            None => return,
-        };
-
-        match dp.port.try_accept() {
-            Some(channel) => {
-                let handle = channel.handle();
-                dp.child = Some(handle);
-                dp.info_sent = false;
-
-                if let Some(dev) = self.registry.get(dp.dev_idx) {
-                    if send_device_info(handle, dev) {
-                        dp.info_sent = true;
-                    }
-                }
-
-                // Keep the channel handle alive — don't drop it
-                core::mem::forget(channel);
-            }
-            None => {}
-        }
-    }
-
-    fn handle_child_message(&mut self, port_idx: usize) {
-        let dp = match &mut self.device_ports.ports[port_idx] {
-            Some(dp) => dp,
-            None => return,
-        };
-
-        if let Some(handle) = dp.child {
-            let mut buf = [0u8; 64];
-            match syscall::try_read(handle, &mut buf) {
-                Ok(Some(0)) | Err(_) => {
-                    // Child disconnected
-                    let _ = syscall::close(handle);
-                    dp.child = None;
-                    dp.info_sent = false;
-                }
-                _ => {}
-            }
         }
     }
 
@@ -565,7 +463,7 @@ impl Driver for PcieDriver {
         reason: KernelBusChangeReason,
         _ctx: &mut dyn BusCtx,
     ) {
-        plog!("bus state → {:?} (reason: {:?})", new_state, reason);
+        plog!("bus state -> {:?} (reason: {:?})", new_state, reason);
     }
 
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
@@ -589,7 +487,7 @@ impl Driver for PcieDriver {
         let bus_path = &bus_path_buf[..bus_path_len];
 
         // Claim the kernel bus — handles the full protocol:
-        // connect → StateSnapshot → wait Safe → SetDriver → Mux registration
+        // connect -> StateSnapshot -> wait Safe -> SetDriver -> Mux registration
         match ctx.claim_kernel_bus(bus_path) {
             Ok((bus_id, info)) => {
                 plog!("kernel bus claimed (type={}, caps={:#x})", info.bus_type, info.capabilities);
@@ -629,26 +527,22 @@ impl Driver for PcieDriver {
             }
         }
 
-        // Create per-device ports and register with devd + Mux
+        // Register per-device ports with devd including BAR0 metadata
+        // No Port objects needed — devd stores metadata and delivers it
+        // to child drivers via spawn context
         for idx in 0..self.registry.count {
             let dev = &self.registry.devices[idx];
             let mut name_buf = [0u8; 32];
             let name_len = dev.format_port_name(&mut name_buf);
             let name = &name_buf[..name_len];
 
-            match Port::register(name) {
-                Ok(port) => {
-                    let port_handle = port.handle();
-                    if let Some(port_idx) = self.device_ports.add(port, idx) {
-                        // Watch port for incoming connections
-                        let _ = ctx.watch_handle(port_handle, TAG_PORT_BASE + port_idx as u32);
-                    }
-                    let _ = ctx.register_port(name, dev.port_type(), None);
-                }
-                Err(_) => {
-                    plog!("failed to create port for device {}", idx);
-                }
-            }
+            // BAR0 metadata: [bar0_phys: u64 LE, bar0_size: u32 LE]
+            let metadata = dev.bar0_metadata();
+            let _ = ctx.register_port_with_metadata(name, dev.port_type(), 0, None, &metadata);
+
+            plog!("registered {} bar0={:#x} size={:#x}",
+                core::str::from_utf8(name).unwrap_or("?"),
+                dev.bar0_phys, dev.bar0_size);
         }
 
         let platform_name = match self.platform {
@@ -658,7 +552,6 @@ impl Driver for PcieDriver {
         };
         plog!("ready ({}, {} devices)", platform_name, self.registry.count);
 
-        self.initialized = true;
         Ok(())
     }
 
@@ -671,27 +564,6 @@ impl Driver for PcieDriver {
                 Disposition::Handled
             }
             _ => Disposition::Forward,
-        }
-    }
-
-    fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
-        if !self.initialized { return; }
-
-        if tag >= TAG_CHILD_BASE {
-            // Child channel message
-            let port_idx = (tag - TAG_CHILD_BASE) as usize;
-            self.handle_child_message(port_idx);
-        } else if tag >= TAG_PORT_BASE {
-            // Port accept event
-            let port_idx = (tag - TAG_PORT_BASE) as usize;
-            self.handle_port_accept(port_idx);
-
-            // If a child was accepted, watch its channel too
-            if let Some(ref dp) = self.device_ports.ports[port_idx] {
-                if let Some(child_handle) = dp.child {
-                    let _ = ctx.watch_handle(child_handle, TAG_CHILD_BASE + port_idx as u32);
-                }
-            }
         }
     }
 }
@@ -728,9 +600,5 @@ impl Driver for PcieDriverWrapper {
         ctx: &mut dyn BusCtx,
     ) {
         self.0.bus_state_changed(bus, old_state, new_state, reason, ctx)
-    }
-
-    fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
-        self.0.handle_event(tag, handle, ctx)
     }
 }

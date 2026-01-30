@@ -200,6 +200,11 @@ pub fn disable_clocks(index: usize) {
 /// device_id format: (bus << 8) | (dev << 3) | func
 /// For root port devices, this is typically 0x0000
 pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<(), super::BusError> {
+    // ECAM-based platforms (QEMU): bus mastering is managed by hypervisor
+    if bus_config().is_pcie_ecam_based() {
+        return Ok(());
+    }
+
     let index = bus_index as usize;
     let Some(base) = mac_base(index) else {
         return Err(super::BusError::NotFound);
@@ -253,6 +258,11 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<
 
 /// Disable bus mastering for ALL devices on a PCIe port
 pub fn disable_all_bus_mastering(bus_index: u8) {
+    // ECAM-based platforms (QEMU): bus mastering is managed by hypervisor
+    if bus_config().is_pcie_ecam_based() {
+        return;
+    }
+
     let index = bus_index as usize;
     if mac_base(index).is_none() {
         return;
@@ -267,6 +277,11 @@ pub fn disable_all_bus_mastering(bus_index: u8) {
 
 /// Verify PCIe link is in expected state after reset
 pub fn verify_link(index: usize) -> bool {
+    // ECAM-based platforms (QEMU): always assume valid
+    if bus_config().is_pcie_ecam_based() {
+        return true;
+    }
+
     let Some(base) = mac_base(index) else {
         return false;
     };
@@ -291,7 +306,13 @@ pub fn query_capabilities(bus_index: u8) -> u8 {
     caps |= bus_caps::PCIE_BUS_MASTER;
     caps |= bus_caps::PCIE_MSI;
 
-    // Check if link is up by reading LTSSM state
+    // ECAM-based platforms (QEMU): can't read MAC registers, assume link up
+    if bus_config().is_pcie_ecam_based() {
+        caps |= bus_caps::PCIE_LINK_UP;
+        return caps;
+    }
+
+    // MAC-based platforms (MT7988): check if link is up by reading LTSSM state
     if let Some(base) = mac_base(bus_index as usize) {
         let mmio = MmioRegion::new(base);
 

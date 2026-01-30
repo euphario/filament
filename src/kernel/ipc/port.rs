@@ -474,6 +474,36 @@ impl PortRegistry {
         port.accept()
     }
 
+    /// Connect to a port and immediately accept (for kernel-owned ports)
+    ///
+    /// This is used for kernel bus ports where there's no userspace process
+    /// to accept connections. Returns (client_channel, server_channel, port_owner).
+    pub fn connect_and_accept(&mut self, name: &[u8], client: TaskId, channel_table: &mut ChannelTable) -> Result<(ChannelId, ChannelId, TaskId), IpcError> {
+        // Find port
+        let slot = self.find_by_name(name).ok_or(IpcError::PortNotFound)?;
+
+        let port = self.ports[slot].as_mut().ok_or(IpcError::PortNotFound)?;
+
+        if !port.state().is_listening() {
+            return Err(IpcError::Closed);
+        }
+
+        let server_owner = port.owner();
+
+        // Create channel pair: client <-> server
+        let (client_ch, server_ch) = channel_table.create_pair(client, server_owner)?;
+
+        // Add pending connection
+        let now = crate::platform::current::timer::ticks();
+        let conn = PendingConnection::new(client, client_ch, server_ch, now);
+        let _ = port.add_pending(conn)?;
+
+        // Immediately accept for kernel-owned ports
+        let (accepted_server_ch, _) = port.accept()?;
+
+        Ok((client_ch, accepted_server_ch, server_owner))
+    }
+
     /// Unregister a port
     ///
     /// Returns subscribers to wake.

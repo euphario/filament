@@ -229,6 +229,7 @@ impl DeviceStore for DeviceRegistry {
         self.count = self.count.saturating_sub(removed);
         removed
     }
+
 }
 
 // =============================================================================

@@ -281,9 +281,51 @@ pub fn port_register(name: &[u8], owner: u32) -> Result<(u32, ChannelId), IpcErr
 /// Connect to a port
 /// Returns (client_channel, subscribers_to_wake, port_owner_id)
 pub fn port_connect(name: &[u8], client: u32) -> Result<(ChannelId, waker::WakeList, u32), IpcError> {
+    // Check if this is a kernel bus port (/kernel/bus/*)
+    // These are special: auto-accept and call bus handler
+    const BUS_PREFIX: &[u8] = b"/kernel/bus/";
+    if name.starts_with(BUS_PREFIX) && name.len() > BUS_PREFIX.len() {
+        return connect_to_bus_port(name, client);
+    }
+
     with_both_tables(|chan_table, port_reg| {
         port_reg.connect(name, client, chan_table)
     })
+}
+
+/// Connect to a kernel bus port
+/// Bus ports are kernel-owned, so we auto-accept and call the bus handler
+fn connect_to_bus_port(name: &[u8], client: u32) -> Result<(ChannelId, waker::WakeList, u32), IpcError> {
+    const BUS_PREFIX: &[u8] = b"/kernel/bus/";
+
+    // Get suffix (e.g., "pcie0", "usb0")
+    let suffix = &name[BUS_PREFIX.len()..];
+    let suffix_str = core::str::from_utf8(suffix).map_err(|_| IpcError::PortNotFound)?;
+
+    // Connect and auto-accept (kernel port has no process to accept)
+    let (client_channel, server_channel, port_owner) = with_both_tables(|chan_table, port_reg| {
+        port_reg.connect_and_accept(name, client, chan_table)
+    })?;
+
+    // Call bus handler to send StateSnapshot
+    match crate::kernel::bus::handle_port_connect(suffix_str, server_channel, client) {
+        Ok(()) => {
+            // Success - bus handler sent StateSnapshot
+        }
+        Err(e) => {
+            // Bus handler failed - close channels and return error
+            crate::kerror!("ipc", "bus_connect_failed"; suffix = suffix_str);
+            let _ = close_channel(client_channel, client);
+            let _ = close_unchecked(server_channel);
+            return Err(match e {
+                crate::kernel::bus::BusError::NotFound => IpcError::PortNotFound,
+                crate::kernel::bus::BusError::AlreadyClaimed => IpcError::Busy,
+                _ => IpcError::Internal,
+            });
+        }
+    }
+
+    Ok((client_channel, waker::WakeList::new(), port_owner))
 }
 
 /// Accept a pending connection on a port

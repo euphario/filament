@@ -7,9 +7,9 @@
 //! ## Spawning
 //!
 //! nvmed is rule-spawned by devd when pcied registers a Storage port.
-//! pcied spawns nvmed (capability delegation), nvmed gets the trigger port
-//! name from its spawn context, connects to pcied's per-device port to
-//! receive BAR0 info, then initializes hardware.
+//! BAR0 address and size are delivered via spawn context metadata
+//! (set by pcied during port registration). nvmed maps BAR0, then
+//! initializes the NVMe controller hardware.
 
 #![no_std]
 #![no_main]
@@ -23,7 +23,6 @@ use userlib::bus::{
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{io_op, io_status, side_msg};
 use userlib::devd::PortType;
-use userlib::ipc::Channel;
 
 // =============================================================================
 // Logging
@@ -702,49 +701,27 @@ impl Driver for NvmeDriver {
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         nlog!("starting");
 
-        // Get spawn context — the port name that triggered our spawn
-        // (e.g., "pci/00:02.0:nvme" registered by pcied)
+        // Get spawn context — the port name and BAR0 metadata from pcied
+        // (e.g., "pci/00:02.0:nvme" registered by pcied with BAR0 info)
         let spawn_ctx = ctx.spawn_context().map_err(|e| {
             nerror!("no spawn context — must be rule-spawned ({:?})", e);
             e
         })?;
 
-        let mut port_name_buf = [0u8; 64];
-        let port_name_len = spawn_ctx.port_name().len();
-        port_name_buf[..port_name_len].copy_from_slice(spawn_ctx.port_name());
-        let port_name = &port_name_buf[..port_name_len];
-
-        // Connect to pcied's per-device port to receive BAR0 info
-        let mut channel = match Channel::connect(port_name) {
-            Ok(ch) => ch,
-            Err(_) => {
-                nerror!("failed to connect to parent port");
-                return Err(BusError::LinkDown);
-            }
-        };
-
-        // Read device info from pcied: [bar0_addr: u64, bar0_size: u32]
-        // Use blocking recv() — pcied sends info after accepting the connection,
-        // which may happen after we connect (different process scheduling).
-        let mut info_buf = [0u8; 12];
-        match channel.recv(&mut info_buf) {
-            Ok(12) => {}
-            Ok(n) => {
-                nerror!("device info wrong size: got {} expected 12", n);
-                return Err(BusError::Internal);
-            }
-            Err(e) => {
-                nerror!("failed to read device info from parent: {:?}", e);
-                return Err(BusError::Internal);
-            }
+        // Read BAR0 info from spawn context metadata
+        // pcied embeds [bar0_phys: u64 LE, bar0_size: u32 LE] = 12 bytes
+        let meta = spawn_ctx.metadata();
+        if meta.len() < 12 {
+            nerror!("spawn context metadata too short: {} bytes (need 12)", meta.len());
+            return Err(BusError::Internal);
         }
 
         let bar0_addr = u64::from_le_bytes([
-            info_buf[0], info_buf[1], info_buf[2], info_buf[3],
-            info_buf[4], info_buf[5], info_buf[6], info_buf[7],
+            meta[0], meta[1], meta[2], meta[3],
+            meta[4], meta[5], meta[6], meta[7],
         ]);
         let bar0_size = u32::from_le_bytes([
-            info_buf[8], info_buf[9], info_buf[10], info_buf[11],
+            meta[8], meta[9], meta[10], meta[11],
         ]) as u64;
 
         nlog!("device_found bar0={:#x} size={:#x}", bar0_addr, bar0_size);
@@ -769,8 +746,10 @@ impl Driver for NvmeDriver {
         }
         self.port_id = Some(port_id);
 
-        // Register block port with devd
-        let _ = ctx.register_port(b"nvme0:", PortType::Block, None);
+        // Register block port with devd including shmem_id
+        // Non-zero shmem_id triggers block orchestration (devd spawns partd)
+        let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
+        let _ = ctx.register_port(b"nvme0:", PortType::Block, shmem_id, None);
 
         nlog!("ready blocks={} bs={}", block_count, block_size);
 

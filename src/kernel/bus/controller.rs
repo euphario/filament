@@ -593,6 +593,10 @@ impl BusController {
 
     /// PCIe hardware reset sequence
     ///
+    /// Behavior depends on platform:
+    /// - ECAM-based (QEMU): Skip hardware reset, just mark as verified
+    /// - MAC-based (MT7988): Full reset via INFRACFG
+    ///
     /// MT7988 Note: The RST_CTRL register at offset 0x148 has unusual behavior
     /// on MT7988 - writes don't take effect. This is similar to EN7581 which
     /// skips RST_CTRL manipulation entirely in the Linux driver.
@@ -606,6 +610,16 @@ impl BusController {
 
         let index = self.bus_index as usize;
         let config = super::config::bus_config();
+
+        // ECAM-based platforms (QEMU virt): no hardware reset needed
+        // The hypervisor manages PCIe state, we just need to register the bus
+        if config.is_pcie_ecam_based() {
+            kinfo!("bus", "pcie_ecam_mode"; port = index as u64);
+            self.hardware_verified = true;
+            return;
+        }
+
+        // MAC-based platforms (MT7988): full hardware reset sequence
         let Some(mac_base) = config.pcie_base(index) else {
             kerror!("bus", "pcie_invalid_index"; index = index as u64);
             self.hardware_verified = false;

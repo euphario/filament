@@ -38,6 +38,7 @@ macro_rules! println {
 }
 
 use userlib::syscall;
+use userlib::vfs_client::VfsClient;
 
 /// Maximum background jobs to track
 const MAX_BG_JOBS: usize = 16;
@@ -56,6 +57,9 @@ static mut CONSOLE_RETRY: u8 = 0;
 
 /// Current working directory
 static mut CWD: cwd::WorkingDir = cwd::WorkingDir::new();
+
+/// Cached VFS client (discovered once, reused)
+static mut VFS_CLIENT: Option<VfsClient> = None;
 
 #[unsafe(no_mangle)]
 fn main() {
@@ -195,6 +199,12 @@ fn execute_command(cmd: &[u8]) {
         cmd_cd(b"");
     } else if cmd_starts_with(cmd, b"cd ") {
         cmd_cd(&cmd[3..]);
+    } else if cmd_eq(cmd, b"ls") {
+        builtins::ls::cmd_ls(b"").print();
+    } else if cmd_starts_with(cmd, b"ls ") {
+        builtins::ls::cmd_ls(&cmd[3..]).print();
+    } else if cmd_starts_with(cmd, b"cat ") {
+        builtins::cat::cmd_cat(&cmd[4..]);
     } else if cmd_eq(cmd, b"pid") {
         cmd_pid();
     } else if cmd_eq(cmd, b"uptime") {
@@ -264,10 +274,6 @@ fn execute_command(cmd: &[u8]) {
         builtins::handle::run(&cmd[7..], &mut output::ShellOutput::new());
     } else if cmd_eq(cmd, b"resize") {
         cmd_resize();
-    } else if cmd_eq(cmd, b"ls") {
-        builtins::ls::run(b"").print();
-    } else if cmd_starts_with(cmd, b"ls ") {
-        builtins::ls::run(&cmd[3..]).print();
     } else if cmd_eq(cmd, b"lsdev") {
         builtins::lsdev::cmd_lsdev(b"");
     } else if cmd_starts_with(cmd, b"lsdev ") {
@@ -276,18 +282,6 @@ fn execute_command(cmd: &[u8]) {
         builtins::lsdev::cmd_devinfo(&cmd[8..]);
     } else if cmd_starts_with(cmd, b"devquery ") {
         builtins::lsdev::cmd_devquery(&cmd[9..]);
-    } else if cmd_starts_with(cmd, b"cat ") {
-        cmd_cat(&cmd[4..]);
-    } else if cmd_starts_with(cmd, b"mkdir ") {
-        builtins::mkdir::run(&cmd[6..]).print();
-    } else if cmd_starts_with(cmd, b"rmdir ") {
-        builtins::rmdir::run(&cmd[6..]).print();
-    } else if cmd_starts_with(cmd, b"rm ") {
-        builtins::rm::run(&cmd[3..]).print();
-    } else if cmd_starts_with(cmd, b"cp ") {
-        builtins::cp::run(&cmd[3..]).print();
-    } else if cmd_starts_with(cmd, b"mv ") {
-        builtins::mv::run(&cmd[3..]).print();
     } else {
         // Try to run as a binary from bin/ directory
         try_run_binary(cmd);
@@ -910,34 +904,6 @@ fn cmd_resize() {
     }
 }
 
-/// Display file contents
-fn cmd_cat(path_arg: &[u8]) {
-    let path = trim(path_arg);
-
-    if path.is_empty() {
-        println!("Usage: cat <path>");
-        return;
-    }
-
-    // Resolve path relative to cwd
-    let mut resolved = [0u8; cwd::MAX_PATH];
-    let full_path = unsafe {
-        let cwd = &*core::ptr::addr_of!(CWD);
-        cwd.resolve(path, &mut resolved)
-    };
-
-    let full_path = match full_path {
-        Some(p) => p,
-        None => {
-            println!("cat: invalid path");
-            return;
-        }
-    };
-
-    // Use the cat builtin
-    builtins::cat::run(full_path).print();
-}
-
 /// Print working directory
 fn cmd_pwd() {
     let path = unsafe {
@@ -967,5 +933,16 @@ fn cmd_cd(path_arg: &[u8]) {
 /// Get current working directory (for use by builtins)
 pub fn get_cwd() -> &'static cwd::WorkingDir {
     unsafe { &*core::ptr::addr_of!(CWD) }
+}
+
+/// Get cached VFS client (discovers on first call, reuses afterward)
+pub fn get_vfs_client() -> Option<&'static mut VfsClient> {
+    unsafe {
+        let client = &mut *core::ptr::addr_of_mut!(VFS_CLIENT);
+        if client.is_none() {
+            *client = VfsClient::discover().ok();
+        }
+        client.as_mut()
+    }
 }
 

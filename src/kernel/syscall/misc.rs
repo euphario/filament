@@ -293,6 +293,13 @@ pub(super) fn sys_reset() -> i64 {
 // A userspace service can track CPU usage via scheduler callbacks or performance counters.
 
 /// Ramfs list entry for userspace
+///
+/// Layout (120 bytes with #[repr(C)] alignment):
+///   [0..100]   name (null-terminated)
+///   [100..104] implicit padding (u64 alignment)
+///   [104..112] size (u64)
+///   [112]      file_type (0=regular, 1=directory)
+///   [113..120] _pad
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RamfsListEntry {
@@ -306,16 +313,19 @@ pub struct RamfsListEntry {
     pub _pad: [u8; 7],
 }
 
+const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
+
 impl RamfsListEntry {
-    const SIZE: usize = 116; // 100 + 8 + 1 + 7 = 116 bytes
+    const SIZE: usize = core::mem::size_of::<Self>();
 }
 
 /// List ramfs entries
 /// Args: buf_ptr (output buffer), buf_len (buffer size in bytes)
 /// Returns: number of entries written on success, negative error on failure
 ///
-/// Each entry is 116 bytes (RamfsListEntry):
+/// Each entry is 120 bytes (#[repr(C)] RamfsListEntry):
 /// - name[100]: null-terminated filename
+/// - _align[4]: implicit padding for u64 alignment
 /// - size[8]: u64 file size
 /// - file_type[1]: 0=regular, 1=directory
 /// - _pad[7]: padding

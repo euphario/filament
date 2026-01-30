@@ -8,6 +8,7 @@
 //! - Query: vendor_id (2), device_id (2), class_mask (3)
 //! - Response: count, then for each device: port, bdf, ids, bar0_addr, bar0_size
 
+use userlib::ipc::Channel;
 use userlib::syscall;
 
 /// Maximum devices in a query response
@@ -40,17 +41,14 @@ pub struct PcieDeviceInfo {
 
 /// PCIe client for querying devices from pcied
 pub struct PcieClient {
-    channel: u32,
+    channel: Channel,
 }
 
 impl PcieClient {
     /// Connect to pcied
     pub fn connect() -> Option<Self> {
-        let channel = syscall::port_connect(b"pcie");
-        if channel < 0 {
-            return None;
-        }
-        Some(Self { channel: channel as u32 })
+        let channel = Channel::connect(b"pcie:").ok()?;
+        Some(Self { channel })
     }
 
     /// Find devices matching the given criteria
@@ -59,7 +57,7 @@ impl PcieClient {
     /// - device_id: 0xFFFF means any
     ///
     /// Returns list of matching devices.
-    pub fn find_devices(&self, vendor_id: u16, device_id: u16) -> DeviceList {
+    pub fn find_devices(&mut self, vendor_id: u16, device_id: u16) -> DeviceList {
         let mut buf = [0u8; 128];
 
         // Build query: cmd(1) + vendor(2) + device(2)
@@ -68,57 +66,58 @@ impl PcieClient {
         buf[3..5].copy_from_slice(&device_id.to_le_bytes());
 
         // Send query
-        syscall::send(self.channel, &buf[..5]);
+        let _ = self.channel.send(&buf[..5]);
 
         // Wait for response
         let mut devices = DeviceList::new();
 
         for _ in 0..100 {
-            let len = syscall::receive(self.channel, &mut buf);
-            if len > 0 {
-                // Parse response
-                let count = buf[0] as usize;
-                let mut offset = 1;
+            if let Ok(len) = self.channel.recv(&mut buf) {
+                if len > 0 {
+                    // Parse response
+                    let count = buf[0] as usize;
+                    let mut offset = 1;
 
-                for _ in 0..count {
-                    if offset + 25 > len as usize {
-                        break;
+                    for _ in 0..count {
+                        if offset + 25 > len {
+                            break;
+                        }
+
+                        let info = PcieDeviceInfo {
+                            port: buf[offset],
+                            bus: buf[offset + 1],
+                            device: buf[offset + 2],
+                            function: buf[offset + 3],
+                            vendor_id: u16::from_le_bytes([buf[offset + 4], buf[offset + 5]]),
+                            device_id: u16::from_le_bytes([buf[offset + 6], buf[offset + 7]]),
+                            class_code: u32::from_le_bytes([
+                                buf[offset + 8], buf[offset + 9], buf[offset + 10], 0
+                            ]),
+                            bar0_addr: u64::from_le_bytes([
+                                buf[offset + 11], buf[offset + 12], buf[offset + 13], buf[offset + 14],
+                                buf[offset + 15], buf[offset + 16], buf[offset + 17], buf[offset + 18],
+                            ]),
+                            bar0_size: u32::from_le_bytes([
+                                buf[offset + 19], buf[offset + 20], buf[offset + 21], buf[offset + 22],
+                            ]),
+                            command: u16::from_le_bytes([buf[offset + 23], buf[offset + 24]]),
+                        };
+
+                        devices.push(info);
+                        offset += 25;
                     }
 
-                    let info = PcieDeviceInfo {
-                        port: buf[offset],
-                        bus: buf[offset + 1],
-                        device: buf[offset + 2],
-                        function: buf[offset + 3],
-                        vendor_id: u16::from_le_bytes([buf[offset + 4], buf[offset + 5]]),
-                        device_id: u16::from_le_bytes([buf[offset + 6], buf[offset + 7]]),
-                        class_code: u32::from_le_bytes([
-                            buf[offset + 8], buf[offset + 9], buf[offset + 10], 0
-                        ]),
-                        bar0_addr: u64::from_le_bytes([
-                            buf[offset + 11], buf[offset + 12], buf[offset + 13], buf[offset + 14],
-                            buf[offset + 15], buf[offset + 16], buf[offset + 17], buf[offset + 18],
-                        ]),
-                        bar0_size: u32::from_le_bytes([
-                            buf[offset + 19], buf[offset + 20], buf[offset + 21], buf[offset + 22],
-                        ]),
-                        command: u16::from_le_bytes([buf[offset + 23], buf[offset + 24]]),
-                    };
-
-                    devices.push(info);
-                    offset += 25;
+                    return devices;
                 }
-
-                return devices;
             }
-            syscall::yield_now();
+            syscall::sleep_ms(1);
         }
 
         devices
     }
 
     /// Find all MediaTek WiFi devices (MT7996 family)
-    pub fn find_mt7996_devices(&self) -> DeviceList {
+    pub fn find_mt7996_devices(&mut self) -> DeviceList {
         // Query for MediaTek vendor, any device
         self.find_devices(0x14C3, 0xFFFF)
     }
@@ -127,7 +126,7 @@ impl PcieClient {
     ///
     /// This asserts PERST# to reset the endpoint device on the specified port,
     /// returning it to power-on state for the next driver.
-    pub fn reset_port(&self, port: u8) -> bool {
+    pub fn reset_port(&mut self, port: u8) -> bool {
         let mut buf = [0u8; 16];
 
         // Build request: cmd(1) + port(1)
@@ -135,15 +134,16 @@ impl PcieClient {
         buf[1] = port;
 
         // Send request
-        syscall::send(self.channel, &buf[..2]);
+        let _ = self.channel.send(&buf[..2]);
 
         // Wait for response
         for _ in 0..100 {
-            let len = syscall::receive(self.channel, &mut buf);
-            if len > 0 {
-                return buf[0] == 1;
+            if let Ok(len) = self.channel.recv(&mut buf) {
+                if len > 0 {
+                    return buf[0] == 1;
+                }
             }
-            syscall::yield_now();
+            syscall::sleep_ms(1);
         }
 
         false
@@ -156,7 +156,7 @@ impl PcieClient {
     /// 2. The parent bridge (if any) to allow DMA traffic through
     ///
     /// Returns true on success.
-    pub fn enable_bus_master(&self, port: u8, bus: u8, device: u8, function: u8) -> bool {
+    pub fn enable_bus_master(&mut self, port: u8, bus: u8, device: u8, function: u8) -> bool {
         let mut buf = [0u8; 16];
 
         // Build request: cmd(1) + port(1) + bus(1) + device(1) + function(1)
@@ -167,15 +167,16 @@ impl PcieClient {
         buf[4] = function;
 
         // Send request
-        syscall::send(self.channel, &buf[..5]);
+        let _ = self.channel.send(&buf[..5]);
 
         // Wait for response
         for _ in 0..100 {
-            let len = syscall::receive(self.channel, &mut buf);
-            if len > 0 {
-                return buf[0] == 1;
+            if let Ok(len) = self.channel.recv(&mut buf) {
+                if len > 0 {
+                    return buf[0] == 1;
+                }
             }
-            syscall::yield_now();
+            syscall::sleep_ms(1);
         }
 
         false
@@ -190,7 +191,7 @@ impl PcieClient {
     /// - Bit 2: Fatal Error Detected
     /// - Bit 3: Unsupported Request Detected (indicates bad DMA address!)
     /// - Bit 5: Transactions Pending
-    pub fn read_device_status(&self, port: u8, bus: u8, device: u8, function: u8) -> Option<u16> {
+    pub fn read_device_status(&mut self, port: u8, bus: u8, device: u8, function: u8) -> Option<u16> {
         let mut buf = [0u8; 16];
 
         // Build request: cmd(1) + port(1) + bus(1) + device(1) + function(1)
@@ -201,19 +202,20 @@ impl PcieClient {
         buf[4] = function;
 
         // Send request
-        syscall::send(self.channel, &buf[..5]);
+        let _ = self.channel.send(&buf[..5]);
 
         // Wait for response
         for _ in 0..100 {
-            let len = syscall::receive(self.channel, &mut buf);
-            if len >= 3 {
-                if buf[0] == 0xFE {
-                    // DeviceStatus marker (from pcie.rs protocol): status in bytes 1-2
-                    return Some(u16::from_le_bytes([buf[1], buf[2]]));
+            if let Ok(len) = self.channel.recv(&mut buf) {
+                if len >= 3 {
+                    if buf[0] == 0xFE {
+                        // DeviceStatus marker (from pcie.rs protocol): status in bytes 1-2
+                        return Some(u16::from_le_bytes([buf[1], buf[2]]));
+                    }
+                    return None; // Error
                 }
-                return None; // Error
             }
-            syscall::yield_now();
+            syscall::sleep_ms(1);
         }
 
         None
@@ -223,7 +225,7 @@ impl PcieClient {
     ///
     /// Clears all error bits (Correctable, Non-Fatal, Fatal, Unsupported Request).
     /// Returns true on success.
-    pub fn clear_device_status(&self, port: u8, bus: u8, device: u8, function: u8) -> bool {
+    pub fn clear_device_status(&mut self, port: u8, bus: u8, device: u8, function: u8) -> bool {
         let mut buf = [0u8; 16];
 
         // Build request: cmd(1) + port(1) + bus(1) + device(1) + function(1)
@@ -234,26 +236,23 @@ impl PcieClient {
         buf[4] = function;
 
         // Send request
-        syscall::send(self.channel, &buf[..5]);
+        let _ = self.channel.send(&buf[..5]);
 
         // Wait for response
         for _ in 0..100 {
-            let len = syscall::receive(self.channel, &mut buf);
-            if len > 0 {
-                return buf[0] == 1;
+            if let Ok(len) = self.channel.recv(&mut buf) {
+                if len > 0 {
+                    return buf[0] == 1;
+                }
             }
-            syscall::yield_now();
+            syscall::sleep_ms(1);
         }
 
         false
     }
 }
 
-impl Drop for PcieClient {
-    fn drop(&mut self) {
-        syscall::close(self.channel);
-    }
-}
+// Channel drops automatically, no need for explicit Drop impl
 
 /// List of device info (fixed-size, no heap)
 pub struct DeviceList {

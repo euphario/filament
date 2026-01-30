@@ -9,6 +9,7 @@ A reliability-focused microkernel for the Banana Pi BPI-R4 (MT7988A SoC).
 | [docs/PRINCIPLES.md](docs/PRINCIPLES.md) | **MUST READ** - Core design philosophy |
 | [docs/README.md](docs/README.md) | Documentation index |
 | [docs/architecture/](docs/architecture/) | System architecture |
+| [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) | Zero-copy ring-based driver I/O |
 | [docs/decisions/ADR.md](docs/decisions/ADR.md) | Architecture decisions |
 
 ## The Laws
@@ -109,6 +110,28 @@ pub enum WakeReason { Readable, Writable, Closed, Accepted, Timeout }
 - **Generation prevents stale wakes** - Detect task slot reuse
 - **Wake outside locks** - Collect subscribers under lock, wake after release
 
+### 7. Bus Framework Is The Only Way To Write Drivers
+
+All userspace drivers use the bus framework (`userlib/src/bus.rs`). No exceptions.
+
+```rust
+struct MyDriver { /* domain state */ }
+
+impl Driver for MyDriver {
+    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> { ... }
+    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition { ... }
+    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) { ... }
+}
+
+fn main() { driver_main(b"mydriver", MyDriver::new()); }
+```
+
+- **No hand-rolled event loops** - `driver_main()` owns the Mux and blocks on events
+- **No direct IPC** - Drivers never import Mux, Channel, Port, DevdClient, or CommandRing
+- **No raw syscalls for I/O** - All I/O goes through `BusCtx` and transport traits
+- **Extend the framework, don't bypass it** - If a driver needs something missing (new data transport, new callback, new BusCtx method), update `bus.rs`/`bus_runtime.rs` — never work around it with ad-hoc IPC
+- **Domain logic only** - A driver struct contains device state and hardware interaction, nothing else
+
 ---
 
 ## Key Principles (Summary)
@@ -121,6 +144,7 @@ See [docs/PRINCIPLES.md](docs/PRINCIPLES.md) for complete design philosophy.
 - **Minimal kernel** - Device management in userspace (devd)
 - **DMA memory non-cacheable** - No cache flushes in driver code
 - **Capability-based security** - Check permissions for privileged ops
+- **Bus framework for all drivers** - `driver_main()` + `Driver` trait, no exceptions
 
 ---
 
@@ -262,6 +286,27 @@ bpi-r4-kernel/
 
 See [docs/architecture/OVERVIEW.md](docs/architecture/OVERVIEW.md) for details.
 
+### Driver Stack (Zero-Copy I/O)
+
+Block device drivers use **shared memory rings** for bulk data, not IPC:
+
+```
+┌─────────┐     ┌───────────┐     ┌─────────┐     ┌──────┐
+│  fatfs  │ ←─→ │ partition │ ←─→ │  usbd   │ ←─→ │ xHCI │
+└─────────┘     └───────────┘     └─────────┘     └──────┘
+     ↑               ↑                 ↑
+     └───────────────┴─────────────────┘
+              Shared Memory Pool
+         (DMA writes, apps read - zero copy)
+```
+
+- **DataPort API**: Ring + Sidechannel + Pool in shared memory
+- **SQ/CQ carry offsets** into pool, not actual data
+- **Sidechannel**: Control plane for queries (devd → driver chain)
+- **IPC only for control**: Never for bulk data (576 byte limit)
+
+See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for details.
+
 ---
 
 ## Logging & Tracing
@@ -357,12 +402,28 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
   - `ProcessOps` - Process lifecycle (exit/kill/spawn)
   - `UserAccess` - Safe user memory access
 
+### Driver Stack Migration (IN PROGRESS)
+See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for architecture.
+
+Infrastructure complete (Phases 1-4):
+- `userlib/src/ring.rs` - Ring protocol with IoSqe/IoCqe/SideEntry
+- `userlib/src/data_port.rs` - DataPort API with Layer trait
+- `devd/src/ports.rs` - Port hierarchy with parent/child
+- `devd/src/rules.rs` - Auto-spawn rules for port events
+
+Driver conversion TODO (Phases 5-6):
+- [ ] Convert qemu-usbd to use DataPort
+- [ ] Convert partition to use DataPort
+- [ ] Convert fatfs to use DataPort
+- [ ] Remove IPC-based block protocol
+
 ### Next Steps
-1. Migrate Service framework (`userlib/src/service.rs`) to ipc2
-2. Update devd to use ipc2 directly or updated Service
-3. Update consoled to use ipc2
-4. Update shell to use ipc2
-5. Remove legacy syscalls after all userspace migrated
+1. Convert USB stack to DataPort ring protocol
+2. Migrate Service framework (`userlib/src/service.rs`) to ipc2
+3. Update devd to use ipc2 directly or updated Service
+4. Update consoled to use ipc2
+5. Update shell to use ipc2
+6. Remove legacy syscalls after all userspace migrated
 
 ### MT7996 WiFi Driver
 - Prefetch configuration fixed to match Linux exactly
@@ -372,6 +433,20 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 ---
 
 ## Changelog (Recent)
+
+### 2026-01-27
+- **Driver Stack Architecture Documentation**
+  - Created `docs/architecture/DRIVER_STACK.md` documenting zero-copy ring-based I/O
+  - DataPort = Ring + Sidechannel + Pool in shared memory
+  - SQ/CQ carry offsets, not data (avoids 576-byte IPC limit)
+  - Sidechannel for control plane queries (devd → driver chain)
+- **QEMU USB Disk Support**
+  - Added `./x qemu-usb` command to create FAT16 USB disk images
+  - Pure Rust MBR + FAT16 creation (no external tools on macOS)
+  - FAT16 partition at LBA 2048, auto-detected by partition driver
+- **Temporary IPC workaround** (to be replaced by DataPort)
+  - Limited block reads to 1 sector at a time to fit IPC payload
+  - Affected: fatfs, partition, qemu-usbd
 
 ### 2026-01-23
 - **Scheduler State Machine Fixes** - Critical context switching bugs fixed

@@ -474,14 +474,16 @@ impl BusCtx for RuntimeCtx {
             .map_err(|_| BusError::Internal)
     }
 
-    fn register_port(
+    fn register_port_with_metadata(
         &mut self,
         name: &[u8],
         port_type: crate::devd::PortType,
+        shmem_id: u32,
         parent: Option<&[u8]>,
+        metadata: &[u8],
     ) -> Result<(), BusError> {
         self.devd
-            .register_port(name, port_type, parent)
+            .register_port_full(name, port_type, shmem_id, parent, metadata)
             .map_err(|_| BusError::Internal)
     }
 
@@ -495,9 +497,9 @@ impl BusCtx for RuntimeCtx {
         // Query devd on first call, cache the result
         if matches!(self.spawn_ctx, SpawnCtxCache::NotQueried) {
             match self.devd.get_spawn_context() {
-                Ok(Some((name_buf, name_len, port_type))) => {
+                Ok(Some((name_buf, name_len, port_type, meta_buf, meta_len))) => {
                     self.spawn_ctx = SpawnCtxCache::Cached(
-                        SpawnContext::new(&name_buf, name_len, port_type),
+                        SpawnContext::new(&name_buf, name_len, port_type, &meta_buf[..meta_len]),
                     );
                 }
                 Ok(None) => {
@@ -514,6 +516,14 @@ impl BusCtx for RuntimeCtx {
             SpawnCtxCache::Cached(ctx) => Ok(ctx),
             SpawnCtxCache::NotSpawned => Err(BusError::NotFound),
             SpawnCtxCache::NotQueried => unreachable!(),
+        }
+    }
+
+    fn discover_port(&mut self, name: &[u8]) -> Result<u32, BusError> {
+        match self.devd.query_port_shmem_id(name) {
+            Ok(Some(shmem_id)) => Ok(shmem_id),
+            Ok(None) => Err(BusError::NotFound),
+            Err(_) => Err(BusError::LinkDown),
         }
     }
 }
@@ -558,30 +568,6 @@ fn devd_command_to_bus_msg(cmd: &DevdCommand) -> Option<BusMsg> {
         DevdCommand::QueryInfo { seq_id } => {
             let mut msg = BusMsg::new(bus_msg::QUERY_INFO);
             msg.seq_id = *seq_id;
-            Some(msg)
-        }
-        DevdCommand::MountPartition {
-            seq_id,
-            shmem_id,
-            source,
-            source_len,
-            mount_point,
-            mount_len,
-            fs_hint,
-            block_size,
-            block_count,
-        } => {
-            let mut msg = BusMsg::new(bus_msg::MOUNT_PARTITION);
-            msg.seq_id = *seq_id;
-            msg.write_u32(0, *shmem_id);
-            msg.write_u8(4, *fs_hint);
-            msg.write_u32(5, *block_size);
-            msg.write_u64(9, *block_count);
-            msg.write_u8(17, *source_len as u8);
-            msg.write_bytes(18, &source[..*source_len]);
-            let mount_offset = 18 + *source_len;
-            msg.write_u8(mount_offset, *mount_len as u8);
-            msg.write_bytes(mount_offset + 1, &mount_point[..*mount_len]);
             Some(msg)
         }
         DevdCommand::SpawnChild { .. } => None,

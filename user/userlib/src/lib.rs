@@ -15,11 +15,17 @@ pub mod filter_chain;
 pub mod ring;
 pub mod data_port;
 pub mod devd;
-pub mod vfs;
-pub mod vfs_client;
 pub mod blk;
 pub mod blk_client;
 pub mod sync;
+pub mod command_ring;
+pub mod driver_ring;
+pub mod bus;
+pub mod bus_transport;
+pub mod bus_runtime;
+pub mod bus_block;
+pub mod vfs_proto;
+pub mod vfs_client;
 
 pub use error::{SysError, SysResult};
 pub use syscall::{LogLevel, Handle, ObjHandle, ObjectType};
@@ -34,6 +40,32 @@ pub use devd::{
     DevdCommand, SpawnFilter, SpawnResult, SpawnHandler, DefaultSpawnHandler,
     register_block_device, register_partition, run_driver_loop,
 };
+pub use command_ring::{
+    // Traits for swappable IPC
+    CommandSender, CommandReceiver, Transport,
+    // Core ring types
+    CommandRing, Command, Response, CommandRingHeader, RingRole,
+    // Easy-to-use wrappers
+    Producer, Consumer, CommandBuilder, FireBuilder,
+    // Protocol types
+    RING_SIZE, ring_shmem_size,
+};
+pub use driver_ring::{
+    // Driver ring types
+    DriverRingProducer, DriverRingConsumer,
+    DriverCommand, DriverResponse,
+    // Protocol types
+    cmd_type as driver_cmd_type, resp_type as driver_resp_type,
+};
+pub use bus::{
+    BusMsg, BusMsgFlags, BusError, BusCtx, Driver, Disposition,
+    ChildId, PortId, BlockTransport, BlockPortConfig, BlockGeometry,
+    BlockCompletion, PortError, bus_msg as bus_msg_types,
+};
+pub use bus_block::ShmemBlockPort;
+pub use vfs_proto::{VfsDirEntry, VfsStat, fs_op, open_flags, file_type, vfs_error};
+pub use vfs_client::{VfsClient, VfsError};
+pub use bus_runtime::driver_main;
 
 // Entry point - called by _start
 unsafe extern "Rust" {

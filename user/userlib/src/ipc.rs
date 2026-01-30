@@ -172,6 +172,27 @@ impl Port {
         Ok(channel)
     }
 
+    /// Try to accept a connection without blocking.
+    /// Returns Some(channel) if a connection is pending, None if no connection available.
+    pub fn try_accept(&mut self) -> Option<Channel> {
+        if self.state == PortState::Closed { return None; }
+        if self.max_connections > 0 && self.active_connections >= self.max_connections {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        match read(self.handle, &mut buf) {
+            Ok(n) if n >= 4 => {
+                let handle = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                self.active_connections = self.active_connections.saturating_add(1);
+                Some(Channel {
+                    handle: Handle(handle),
+                    state: ChannelState::Open,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Accept a connection and return the client's PID
     ///
     /// Returns (Channel, client_pid) on success.

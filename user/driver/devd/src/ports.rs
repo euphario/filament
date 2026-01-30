@@ -37,6 +37,8 @@ pub enum PortType {
     Console = 6,
     /// Service port (devd:, logd:)
     Service = 7,
+    /// Mass storage controller (NVMe, AHCI, etc.)
+    Storage = 8,
 }
 
 impl PortType {
@@ -49,6 +51,7 @@ impl PortType {
             5 => PortType::Network,
             6 => PortType::Console,
             7 => PortType::Service,
+            8 => PortType::Storage,
             _ => PortType::Unknown,
         }
     }
@@ -74,6 +77,10 @@ pub struct RegisteredPort {
     parent_idx: u8,
     /// DataPort shared memory ID (0 = no DataPort)
     shmem_id: u32,
+    /// Opaque metadata (e.g., BAR0 info from pcied)
+    metadata: [u8; 64],
+    /// Length of metadata
+    metadata_len: u8,
 }
 
 /// No parent sentinel value
@@ -89,6 +96,8 @@ impl RegisteredPort {
             port_type: PortType::Unknown,
             parent_idx: NO_PARENT,
             shmem_id: 0,
+            metadata: [0; 64],
+            metadata_len: 0,
         }
     }
 
@@ -135,6 +144,16 @@ impl RegisteredPort {
 
     pub fn set_shmem_id(&mut self, shmem_id: u32) {
         self.shmem_id = shmem_id;
+    }
+
+    pub fn metadata(&self) -> &[u8] {
+        &self.metadata[..self.metadata_len as usize]
+    }
+
+    pub fn set_metadata(&mut self, data: &[u8]) {
+        let len = data.len().min(64);
+        self.metadata[..len].copy_from_slice(&data[..len]);
+        self.metadata_len = len as u8;
     }
 }
 
@@ -294,6 +313,11 @@ impl Ports {
 
     fn find_empty_slot(&self) -> Option<usize> {
         (0..MAX_PORTS).find(|&i| self.ports[i].is_none())
+    }
+
+    /// Get a mutable reference to a registered port by name
+    pub fn get_mut(&mut self, name: &[u8]) -> Option<&mut RegisteredPort> {
+        self.find_slot(name).and_then(|i| self.ports[i].as_mut())
     }
 
     /// Get the type of a registered port

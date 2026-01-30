@@ -131,7 +131,7 @@ fn cmd_build(
     platform: &str,
 ) -> Result<()> {
     let build_type = if test { "Development (self-tests)" } else { "Production" };
-    let firmware_mode = if firmware { "Embedded" } else { "USB (fatfs)" };
+    let firmware_mode = if firmware { "Embedded" } else { "USB" };
     let platform_feature = match platform {
         "qemu" | "qemu-virt" => "platform-qemu-virt",
         _ => "platform-mt7988a",
@@ -255,14 +255,15 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
         ("consoled", "driver/consoled"),
         ("shell", "shell"),
         ("partd", "driver/partd"),
-        ("fatfsd", "driver/fatfsd"),
-        ("vfsd", "driver/vfsd"),
     ];
 
     // Platform-specific programs
     if platform == "qemu" || platform == "qemu-virt" {
         all_programs.push(("pcied", "driver/pcied"));
         all_programs.push(("xhcid", "driver/xhcid"));
+        all_programs.push(("nvmed", "driver/nvmed"));
+        all_programs.push(("fatfsd", "driver/fatfsd"));
+        all_programs.push(("vfsd", "driver/vfsd"));
     }
 
     let programs: Vec<_> = if only.is_empty() {
@@ -449,7 +450,7 @@ fn create_initrd(root: &Path, include_firmware: bool) -> Result<()> {
             }
         }
     } else {
-        println!("  (firmware loaded from USB via fatfs)");
+        println!("  (firmware loaded from USB)");
     }
 
     // Create TAR archive
@@ -584,10 +585,7 @@ fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool) -> Result<()> {
 
     if !Path::new(nvme_disk).exists() {
         println!("Creating NVMe disk image: {}", nvme_disk);
-        Command::new("qemu-img")
-            .args(["create", "-f", "raw", nvme_disk, "128M"])
-            .status()
-            .context("Failed to create NVMe disk image")?;
+        create_nvme_disk(nvme_disk, 128)?;
     }
 
     // Use virt machine with GICv3 (our kernel uses GICv3 system registers)
@@ -793,10 +791,42 @@ fn cmd_qemu_usb(force: bool, size_mb: u32) -> Result<()> {
              bytes_per_sector, sectors_per_cluster, fat_sectors);
     println!("  Created: {}", usb_disk);
 
-    // Optionally copy some test files using mtools if available
-    if Command::new("mcopy").arg("--version").output().is_ok() {
-        println!("\nmtools detected. You can add files with:");
-        println!("  mcopy -i {}@@1M <file> ::", usb_disk);
+    // Add test files using mtools if available
+    let mtools_available = Command::new("mcopy").arg("--version").output().is_ok();
+    if mtools_available {
+        println!("  Adding test files...");
+
+        // Create hello.txt
+        let hello_content = "Hello from BPI-R4 kernel!\nThis is a test file for the FAT16 filesystem driver.\n";
+        let hello_tmp = "/tmp/bpi-r4-hello.txt";
+        fs::write(hello_tmp, hello_content).ok();
+
+        let img_spec = format!("{}@@1M", usb_disk);
+
+        // Copy hello.txt to root
+        let _ = Command::new("mcopy")
+            .args(["-i", &img_spec, hello_tmp, "::/hello.txt"])
+            .status();
+
+        // Create testdir
+        let _ = Command::new("mmd")
+            .args(["-i", &img_spec, "::/testdir"])
+            .status();
+
+        // Create nested.txt
+        let nested_content = "File inside directory\n";
+        let nested_tmp = "/tmp/bpi-r4-nested.txt";
+        fs::write(nested_tmp, nested_content).ok();
+
+        let _ = Command::new("mcopy")
+            .args(["-i", &img_spec, nested_tmp, "::/testdir/nested.txt"])
+            .status();
+
+        // Cleanup temp files
+        let _ = fs::remove_file(hello_tmp);
+        let _ = fs::remove_file(nested_tmp);
+
+        println!("  Added: hello.txt, testdir/nested.txt");
     } else {
         println!("\nTo add files, install mtools:");
         println!("  brew install mtools  # macOS");
@@ -804,6 +834,131 @@ fn cmd_qemu_usb(force: bool, size_mb: u32) -> Result<()> {
         println!("Then: mcopy -i {}@@1M <file> ::", usb_disk);
     }
 
+    Ok(())
+}
+
+/// Create NVMe disk image with MBR partition table and FAT16 filesystem
+///
+/// Creates a raw disk image with an MBR containing a single FAT16 partition.
+fn create_nvme_disk(path: &str, size_mb: u32) -> Result<()> {
+    use std::io::{Write, Seek, SeekFrom};
+
+    let total_sectors = size_mb as u64 * 1024 * 1024 / 512;
+    let partition_start_lba: u32 = 2048; // 1MB offset
+    let partition_sectors = (total_sectors as u32) - partition_start_lba;
+
+    let mut file = fs::File::create(path)
+        .context("Failed to create NVMe disk image")?;
+    file.set_len(total_sectors * 512)
+        .context("Failed to set file size")?;
+
+    // Write MBR with one partition
+    let mut mbr = [0u8; 512];
+
+    // Partition 1 entry at offset 0x1BE
+    let pe = &mut mbr[0x1BE..0x1CE];
+    pe[0] = 0x80; // Bootable
+    pe[1] = 0x20; pe[2] = 0x21; pe[3] = 0x00; // CHS start
+    pe[4] = 0x06; // Partition type: FAT16 (>32MB)
+    pe[5] = 0xFE; pe[6] = 0xFF; pe[7] = 0xFF; // CHS end
+    pe[8..12].copy_from_slice(&partition_start_lba.to_le_bytes());
+    pe[12..16].copy_from_slice(&partition_sectors.to_le_bytes());
+
+    // MBR signature
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+
+    file.write_all(&mbr).context("Failed to write MBR")?;
+
+    // FAT16 parameters
+    let bytes_per_sector: u16 = 512;
+    let sectors_per_cluster: u8 = 4; // 2KB clusters
+    let reserved_sectors: u16 = 1;
+    let num_fats: u8 = 2;
+    let root_entry_count: u16 = 512;
+    let root_dir_sectors = ((root_entry_count as u32 * 32) + 511) / 512;
+
+    let data_sectors = partition_sectors - reserved_sectors as u32 - root_dir_sectors;
+    let total_clusters = data_sectors / sectors_per_cluster as u32;
+    let fat_entries = total_clusters + 2;
+    let fat_sectors = ((fat_entries * 2) + 511) / 512;
+
+    // Write FAT16 Boot Sector (BPB)
+    let mut bpb = [0u8; 512];
+    bpb[0] = 0xEB; bpb[1] = 0x3C; bpb[2] = 0x90; // Jump
+    bpb[3..11].copy_from_slice(b"BPIR4NVM");
+    bpb[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
+    bpb[13] = sectors_per_cluster;
+    bpb[14..16].copy_from_slice(&reserved_sectors.to_le_bytes());
+    bpb[16] = num_fats;
+    bpb[17..19].copy_from_slice(&root_entry_count.to_le_bytes());
+    if partition_sectors <= 65535 {
+        bpb[19..21].copy_from_slice(&(partition_sectors as u16).to_le_bytes());
+    }
+    bpb[21] = 0xF8; // Media type
+    bpb[22..24].copy_from_slice(&(fat_sectors as u16).to_le_bytes());
+    bpb[24..26].copy_from_slice(&63u16.to_le_bytes());
+    bpb[26..28].copy_from_slice(&255u16.to_le_bytes());
+    bpb[28..32].copy_from_slice(&partition_start_lba.to_le_bytes());
+    if partition_sectors > 65535 {
+        bpb[32..36].copy_from_slice(&partition_sectors.to_le_bytes());
+    }
+    bpb[36] = 0x80; bpb[37] = 0x00; bpb[38] = 0x29;
+    bpb[39..43].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+    bpb[43..54].copy_from_slice(b"BPIR4-NVME ");
+    bpb[54..62].copy_from_slice(b"FAT16   ");
+    bpb[510] = 0x55; bpb[511] = 0xAA;
+
+    file.seek(SeekFrom::Start(partition_start_lba as u64 * 512))?;
+    file.write_all(&bpb)?;
+
+    // Write FAT1
+    let mut fat = vec![0u8; fat_sectors as usize * 512];
+    fat[0] = 0xF8; fat[1] = 0xFF;
+    fat[2] = 0xFF; fat[3] = 0xFF;
+
+    let fat1_offset = (partition_start_lba as u64 + reserved_sectors as u64) * 512;
+    file.seek(SeekFrom::Start(fat1_offset))?;
+    file.write_all(&fat)?;
+
+    // Write FAT2
+    let fat2_offset = fat1_offset + (fat_sectors as u64 * 512);
+    file.seek(SeekFrom::Start(fat2_offset))?;
+    file.write_all(&fat)?;
+
+    // Write a hello.txt file in the root directory
+    let root_dir_offset = fat2_offset + (fat_sectors as u64 * 512);
+
+    // Root directory entry for HELLO.TXT
+    let mut root_dir = [0u8; 512];
+    // 8.3 filename: "HELLO   TXT"
+    root_dir[0..8].copy_from_slice(b"HELLO   ");
+    root_dir[8..11].copy_from_slice(b"TXT");
+    root_dir[11] = 0x20; // Archive attribute
+    let file_content = b"Hello from BPI-R4 NVMe!\n";
+    let file_size = file_content.len() as u32;
+    let file_cluster: u16 = 2; // First data cluster
+    root_dir[26..28].copy_from_slice(&file_cluster.to_le_bytes());
+    root_dir[28..32].copy_from_slice(&file_size.to_le_bytes());
+
+    file.seek(SeekFrom::Start(root_dir_offset))?;
+    file.write_all(&root_dir)?;
+
+    // Mark cluster 2 as end-of-chain in FAT
+    fat[4] = 0xFF; fat[5] = 0xFF; // cluster 2 = EOF
+    file.seek(SeekFrom::Start(fat1_offset))?;
+    file.write_all(&fat)?;
+    file.seek(SeekFrom::Start(fat2_offset))?;
+    file.write_all(&fat)?;
+
+    // Write file content at cluster 2 (first data cluster)
+    let data_start = root_dir_offset + (root_dir_sectors as u64 * 512);
+    file.seek(SeekFrom::Start(data_start))?;
+    file.write_all(file_content)?;
+
+    file.sync_all()?;
+
+    println!("  Created: {} ({} MB, FAT16, 1 file)", path, size_mb);
     Ok(())
 }
 

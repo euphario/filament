@@ -645,7 +645,8 @@ impl<'a> LineEditor<'a> {
         let completions = if is_command {
             crate::completion::complete_command(word)
         } else {
-            crate::completion::complete_path(word)
+            // No path completion available
+            crate::completion::Completions::empty()
         };
 
         if completions.count == 0 {

@@ -355,6 +355,55 @@ pub fn close(handle: Handle) -> SysResult<()> {
     }
 }
 
+// ============================================================================
+// Ramfs
+// ============================================================================
+
+/// Ramfs directory entry — matches kernel's #[repr(C)] RamfsListEntry (120 bytes).
+///
+/// Layout:
+///   [0..100]   name (null-terminated)
+///   [100..104] implicit padding (u64 alignment)
+///   [104..112] size (u64)
+///   [112]      file_type (0=regular, 1=directory)
+///   [113..120] _pad
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RamfsListEntry {
+    pub name: [u8; 100],
+    pub size: u64,
+    pub file_type: u8,
+    pub _pad: [u8; 7],
+}
+
+const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
+
+impl RamfsListEntry {
+    pub const SIZE: usize = core::mem::size_of::<Self>();
+
+    pub const fn empty() -> Self {
+        Self { name: [0; 100], size: 0, file_type: 0, _pad: [0; 7] }
+    }
+
+    pub fn name_str(&self) -> &[u8] {
+        let len = self.name.iter().position(|&c| c == 0).unwrap_or(100);
+        &self.name[..len]
+    }
+}
+
+/// List ramfs entries. Returns number of entries on success, negative on error.
+pub fn ramfs_list(buf: &mut [RamfsListEntry]) -> i64 {
+    syscall2(
+        sys::RAMFS_LIST,
+        buf.as_mut_ptr() as u64,
+        (buf.len() * RamfsListEntry::SIZE) as u64,
+    )
+}
+
+// ============================================================================
+// Channels
+// ============================================================================
+
 /// Create a channel pair (returns two handles)
 pub fn channel_pair() -> SysResult<(Handle, Handle)> {
     let ret = syscall3(sys::OPEN, ObjectType::Channel as u64, 0, 0);

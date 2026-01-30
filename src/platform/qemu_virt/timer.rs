@@ -55,7 +55,6 @@ impl Timer {
 
         if (ctl_val & ctl::ISTATUS) != 0 {
             self.tick_count += 1;
-
             // Update per-CPU tick counts
             let cpu_data = crate::kernel::percpu::cpu_local();
             cpu_data.tick();

@@ -399,7 +399,7 @@ impl QueryHandler {
         slot: usize,
         buf: &'a [u8],
     ) -> Option<PortRegisterInfo<'a>> {
-        let (reg, name, parent) = PortRegister::from_bytes(buf)?;
+        let (reg, name, parent, metadata) = PortRegister::from_bytes(buf)?;
 
         // Only drivers can register ports
         let client = self.clients[slot].as_ref()?;
@@ -412,6 +412,7 @@ impl QueryHandler {
             port_type: reg.port_type,
             name,
             parent,
+            metadata,
             shmem_id: reg.shmem_id,
             owner_idx: client.service_idx as u8,
         })
@@ -437,6 +438,7 @@ pub struct PortRegisterInfo<'a> {
     pub port_type: u8,
     pub name: &'a [u8],
     pub parent: Option<&'a [u8]>,
+    pub metadata: &'a [u8],
     pub shmem_id: u32,
     pub owner_idx: u8,
 }

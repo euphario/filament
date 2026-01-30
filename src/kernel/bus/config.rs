@@ -18,10 +18,12 @@ pub struct BusConfig {
     pub name: &'static str,
 
     // PCIe configuration
-    /// PCIe MAC base addresses
+    /// PCIe MAC base addresses (for MT7988-style) or ECAM base (for QEMU)
     pub pcie_bases: &'static [usize],
-    /// INFRACFG_AO base address (for PCIe clocks/resets)
+    /// INFRACFG_AO base address (for PCIe clocks/resets), 0 = not available
     pub infracfg_base: usize,
+    /// True if PCIe uses ECAM (QEMU virt), false if MAC-based (MT7988)
+    pub pcie_ecam_based: bool,
 
     // USB configuration
     /// USB/xHCI MAC base addresses
@@ -48,6 +50,11 @@ impl BusConfig {
     pub fn usb_base(&self, index: usize) -> Option<usize> {
         self.usb_bases.get(index).copied()
     }
+
+    /// Check if PCIe is ECAM-based (QEMU) vs MAC-based (MT7988)
+    pub fn is_pcie_ecam_based(&self) -> bool {
+        self.pcie_ecam_based
+    }
 }
 
 // =============================================================================
@@ -55,7 +62,7 @@ impl BusConfig {
 // =============================================================================
 
 /// MT7988A (BPI-R4 standard)
-/// - 4 PCIe ports
+/// - 4 PCIe ports (MAC-based access)
 /// - 2 USB controllers
 static MT7988A_CONFIG: BusConfig = BusConfig {
     compatible: &["mediatek,mt7988a", "mediatek,mt7988", "bananapi,bpi-r4"],
@@ -67,6 +74,7 @@ static MT7988A_CONFIG: BusConfig = BusConfig {
         0x1129_0000,  // PCIe3
     ],
     infracfg_base: 0x1000_1000,
+    pcie_ecam_based: false,
     usb_bases: &[
         0x1119_0000,  // SSUSB0 (M.2 slot)
         0x1120_0000,  // SSUSB1 (USB-A ports via VL822)
@@ -74,7 +82,7 @@ static MT7988A_CONFIG: BusConfig = BusConfig {
 };
 
 /// MT7988A Lite variant (hypothetical)
-/// - 2 PCIe ports
+/// - 2 PCIe ports (MAC-based access)
 /// - 1 USB controller
 #[allow(dead_code)]
 static MT7988A_LITE_CONFIG: BusConfig = BusConfig {
@@ -85,19 +93,23 @@ static MT7988A_LITE_CONFIG: BusConfig = BusConfig {
         0x1131_0000,  // PCIe1
     ],
     infracfg_base: 0x1000_1000,
+    pcie_ecam_based: false,
     usb_bases: &[
         0x1119_0000,  // SSUSB0
     ],
 };
 
 /// QEMU virt machine
-/// - No PCIe (QEMU virt uses virtio)
-/// - No USB
+/// - 1 PCIe bus (ECAM-based at 0x4010000000)
+/// - No USB (uses virtio instead)
 static QEMU_VIRT_CONFIG: BusConfig = BusConfig {
     compatible: &["linux,dummy-virt", "arm,virt"],
     name: "QEMU-virt",
-    pcie_bases: &[],
+    pcie_bases: &[
+        0x40_1000_0000,  // ECAM base (config space)
+    ],
     infracfg_base: 0,
+    pcie_ecam_based: true,
     usb_bases: &[],
 };
 
@@ -198,12 +210,15 @@ mod tests {
         assert_eq!(config.usb_controller_count(), 2);
         assert_eq!(config.pcie_base(0), Some(0x1130_0000));
         assert_eq!(config.usb_base(1), Some(0x1120_0000));
+        assert!(!config.is_pcie_ecam_based());
     }
 
     #[test]
     fn test_qemu_config() {
         let config = &QEMU_VIRT_CONFIG;
-        assert_eq!(config.pcie_port_count(), 0);
+        assert_eq!(config.pcie_port_count(), 1);
         assert_eq!(config.usb_controller_count(), 0);
+        assert!(config.is_pcie_ecam_based());
+        assert_eq!(config.pcie_base(0), Some(0x40_1000_0000));
     }
 }

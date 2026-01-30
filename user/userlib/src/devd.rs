@@ -71,9 +71,9 @@ use crate::query::{
     ListServices, ServicesListResponse, ServiceEntry,
     QueryServiceInfo, ServiceInfoResult,
     AttachDisk, ReportPartitions, RegisterPartitionMsg, PartitionReadyMsg,
-    MountPartitionMsg, MountReadyMsg, PartitionInfoMsg,
+    PartitionInfoMsg,
     msg, port_type, error, class, driver_state, service_state,
-    fs_hint, part_scheme,
+    part_scheme,
 };
 
 // =============================================================================
@@ -279,25 +279,6 @@ pub enum DevdCommand {
         name: [u8; 32],
         name_len: usize,
     },
-    /// Mount a partition (devd → fatfsd)
-    MountPartition {
-        /// Sequence ID for response
-        seq_id: u32,
-        /// Partition's DataPort shared memory ID
-        shmem_id: u32,
-        /// Source partition name (e.g., "part0:")
-        source: [u8; 32],
-        source_len: usize,
-        /// Mount point (e.g., "/mnt/fat0")
-        mount_point: [u8; 64],
-        mount_len: usize,
-        /// Filesystem hint
-        fs_hint: u8,
-        /// Block size in bytes
-        block_size: u32,
-        /// Total number of blocks
-        block_count: u64,
-    },
 }
 
 impl DevdCommand {
@@ -444,7 +425,7 @@ impl DevdClient {
     ///
     /// Returns (port_name, port_type) if this driver was spawned by devd rules,
     /// or None if no context available (e.g., manually started driver).
-    pub fn get_spawn_context(&mut self) -> Result<Option<([u8; 64], usize, PortType)>, SysError> {
+    pub fn get_spawn_context(&mut self) -> Result<Option<([u8; 64], usize, PortType, [u8; 64], usize)>, SysError> {
         // Retry outer loop handles NOT_FOUND race condition
         // When pcied spawns xhcid, xhcid might query spawn context before devd
         // has processed the SPAWN_ACK that contains the PID -> context mapping
@@ -459,16 +440,19 @@ impl DevdClient {
             channel.send(&req.to_bytes())?;
 
             // Wait for response
-            let mut resp_buf = [0u8; 128];
+            let mut resp_buf = [0u8; 256];
             for _ in 0..Self::MAX_RETRIES {
                 match channel.recv(&mut resp_buf) {
                     Ok(resp_len) if resp_len >= SpawnContextResponse::HEADER_SIZE => {
-                        if let Some((resp, port_name)) = SpawnContextResponse::from_bytes(&resp_buf[..resp_len]) {
+                        if let Some((resp, port_name, metadata)) = SpawnContextResponse::from_bytes(&resp_buf[..resp_len]) {
                             if resp.header.msg_type == msg::SPAWN_CONTEXT {
                                 if resp.result == error::OK && resp.port_name_len > 0 {
                                     let mut name = [0u8; 64];
                                     let len = (resp.port_name_len as usize).min(64);
                                     name[..len].copy_from_slice(&port_name[..len]);
+                                    let mut meta = [0u8; 64];
+                                    let meta_len = (resp.metadata_len as usize).min(64);
+                                    meta[..meta_len].copy_from_slice(&metadata[..meta_len]);
                                     let ptype = match resp.port_type {
                                         port_type::BLOCK => PortType::Block,
                                         port_type::PARTITION => PortType::Partition,
@@ -479,7 +463,7 @@ impl DevdClient {
                                         port_type::STORAGE => PortType::Storage,
                                         _ => PortType::Service,
                                     };
-                                    return Ok(Some((name, len, ptype)));
+                                    return Ok(Some((name, len, ptype, meta, meta_len)));
                                 }
                                 // NOT_FOUND - might be race with SPAWN_ACK, retry
                                 if resp.result == error::NOT_FOUND && retry < SPAWN_ACK_RETRIES - 1 {
@@ -520,7 +504,7 @@ impl DevdClient {
         port_type: PortType,
         parent: Option<&[u8]>,
     ) -> Result<(), SysError> {
-        self.register_port_with_dataport(name, port_type, 0, parent)
+        self.register_port_full(name, port_type, 0, parent, &[])
     }
 
     /// Register a port with devd including DataPort shmem_id
@@ -537,12 +521,28 @@ impl DevdClient {
         shmem_id: u32,
         parent: Option<&[u8]>,
     ) -> Result<(), SysError> {
+        self.register_port_full(name, port_type, shmem_id, parent, &[])
+    }
+
+    /// Register a port with devd including DataPort shmem_id and metadata
+    ///
+    /// Metadata is opaque bytes stored with the port and passed to child
+    /// drivers via spawn context. Used e.g. to deliver BAR0 address info
+    /// from pcied to child drivers without requiring a separate IPC channel.
+    pub fn register_port_full(
+        &mut self,
+        name: &[u8],
+        port_type: PortType,
+        shmem_id: u32,
+        parent: Option<&[u8]>,
+        metadata: &[u8],
+    ) -> Result<(), SysError> {
         let seq_id = self.next_seq();
         let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let reg = PortRegister::new(seq_id, port_type as u8);
-        let mut buf = [0u8; 128];
-        let len = reg.write_to(&mut buf, name, parent, shmem_id)
+        let mut buf = [0u8; 256];
+        let len = reg.write_to_with_metadata(&mut buf, name, parent, shmem_id, metadata)
             .ok_or(SysError::InvalidArgument)?;
 
         channel.send(&buf[..len])?;
@@ -791,27 +791,6 @@ impl DevdClient {
                             name_len,
                         }))
                     }
-                    msg::MOUNT_PARTITION => {
-                        let (mount, source, mount_point) = MountPartitionMsg::from_bytes(&buf[..len])
-                            .ok_or(SysError::IoError)?;
-                        let mut source_buf = [0u8; 32];
-                        let source_len = source.len().min(32);
-                        source_buf[..source_len].copy_from_slice(&source[..source_len]);
-                        let mut mount_buf = [0u8; 64];
-                        let mount_len = mount_point.len().min(64);
-                        mount_buf[..mount_len].copy_from_slice(&mount_point[..mount_len]);
-                        Ok(Some(DevdCommand::MountPartition {
-                            seq_id: header.seq_id,
-                            shmem_id: mount.shmem_id,
-                            source: source_buf,
-                            source_len,
-                            mount_point: mount_buf,
-                            mount_len,
-                            fs_hint: mount.fs_hint,
-                            block_size: mount.block_size,
-                            block_count: mount.block_count,
-                        }))
-                    }
                     _ => {
                         // Unknown message type - ignore
                         Ok(None)
@@ -904,24 +883,6 @@ impl DevdClient {
         let msg = PartitionReadyMsg::new(seq_id, shmem_id);
         let mut buf = [0u8; 64];
         let len = msg.write_to(&mut buf, name).ok_or(SysError::IoError)?;
-        channel.send(&buf[..len])?;
-        Ok(())
-    }
-
-    /// Notify devd that a filesystem is mounted (fatfsd → devd)
-    ///
-    /// Call this after successfully mounting a filesystem.
-    pub fn mount_ready(
-        &mut self,
-        mount_point: &[u8],
-        shmem_id: u32,
-    ) -> Result<(), SysError> {
-        let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
-        let msg = MountReadyMsg::new(seq_id, shmem_id);
-        let mut buf = [0u8; 128];
-        let len = msg.write_to(&mut buf, mount_point).ok_or(SysError::IoError)?;
         channel.send(&buf[..len])?;
         Ok(())
     }
@@ -1602,7 +1563,6 @@ fn handle_command<H: SpawnHandler>(
         // Orchestration commands are handled directly by drivers in their main loop
         DevdCommand::AttachDisk { .. } => {}
         DevdCommand::RegisterPartition { .. } => {}
-        DevdCommand::MountPartition { .. } => {}
     }
 }
 
