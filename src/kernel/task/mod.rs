@@ -109,7 +109,7 @@ pub mod eviction;
 pub use state::{TaskState, SleepReason, WaitReason, EvictionReason};
 
 // Re-export scheduling policy trait and implementations
-pub use policy::{SchedulingPolicy, PriorityRoundRobin};
+pub use policy::{SchedulingPolicy, PerCpuQueues};
 
 // Re-export TCB types
 pub use tcb::{
@@ -169,8 +169,8 @@ macro_rules! transition_or_log {
     }};
 }
 
-/// Maximum number of tasks
-pub const MAX_TASKS: usize = 16;
+/// Maximum number of tasks (slots 0..MAX_CPUS reserved for idle)
+pub const MAX_TASKS: usize = 32;
 
 /// Scheduler state
 ///
@@ -181,7 +181,7 @@ pub const MAX_TASKS: usize = 16;
 /// # Scheduling Policy
 ///
 /// The scheduler uses a pluggable `SchedulingPolicy` trait for task selection.
-/// The default policy is `PriorityRoundRobin` - priority levels with round-robin
+/// The default policy is `PerCpuQueues` - priority levels with round-robin
 /// fairness within each level. Different policies can be swapped for:
 /// - SMP-aware scheduling with per-CPU queues
 /// - Real-time scheduling with deadline guarantees
@@ -198,7 +198,7 @@ pub struct Scheduler {
     /// This allows check_timeouts to early-return most ticks.
     next_deadline: u64,
     /// Scheduling policy for task selection
-    policy: PriorityRoundRobin,
+    policy: PerCpuQueues,
 }
 
 /// Get current CPU's running task slot index (SMP-safe)
@@ -220,7 +220,7 @@ impl Scheduler {
             tasks: [NONE; MAX_TASKS],
             generations: [0; MAX_TASKS],
             next_deadline: u64::MAX,
-            policy: PriorityRoundRobin::new(),
+            policy: PerCpuQueues::new(),
         }
     }
 
@@ -471,14 +471,16 @@ impl Scheduler {
 
     /// Add a kernel task to the scheduler
     pub fn add_kernel_task(&mut self, entry: fn() -> !, name: &str) -> Option<TaskId> {
-        // Find empty slot
-        let slot = self.tasks.iter().position(|t| t.is_none())?;
+        // Find empty slot (skip slots 0..MAX_CPUS reserved for per-CPU idle tasks)
+        let slot = self.tasks.iter().enumerate()
+            .position(|(i, t)| i >= super::percpu::MAX_CPUS && t.is_none())?;
 
         // Generate PID with current generation for this slot
         let id = self.make_pid(slot);
 
         self.tasks[slot] = Task::new_kernel(id, entry, name);
         if self.tasks[slot].is_some() {
+            self.policy.assign_task_round_robin(slot);
             // Create parallel object table in ObjectService (Phase 1: not used yet)
             super::object_service::object_service().create_task_table(id, false);
             Some(id)
@@ -489,13 +491,16 @@ impl Scheduler {
 
     /// Add a user task to the scheduler
     pub fn add_user_task(&mut self, name: &str) -> Option<(TaskId, usize)> {
-        let slot = self.tasks.iter().position(|t| t.is_none())?;
+        // Skip slots 0..MAX_CPUS reserved for per-CPU idle tasks
+        let slot = self.tasks.iter().enumerate()
+            .position(|(i, t)| i >= super::percpu::MAX_CPUS && t.is_none())?;
 
         // Generate PID with current generation for this slot
         let id = self.make_pid(slot);
 
         self.tasks[slot] = Task::new_user(id, name);
         if self.tasks[slot].is_some() {
+            self.policy.assign_task_round_robin(slot);
             // Create parallel object table in ObjectService
             super::object_service::object_service().create_task_table(id, true);
             Some((id, slot))
@@ -724,17 +729,19 @@ impl Scheduler {
                     // Remove object table from ObjectService (Phase 1: parallel structure)
                     super::object_service::object_service().remove_task_table(pid);
 
-                    // SAFETY: Clear CURRENT_TRAP_FRAME if it points to this task.
+                    // SAFETY: Clear per-CPU trap frame if it points to this task.
                     // This shouldn't happen (we skip current task), but prevents use-after-free.
                     if let Some(ref task) = self.tasks[slot_idx] {
                         let task_trap_ptr = &task.trap_frame as *const TrapFrame;
-                        let current_ptr = CURRENT_TRAP_FRAME.load(Ordering::Acquire);
+                        let current_ptr = super::percpu::get_trap_frame();
                         if current_ptr == task_trap_ptr as *mut TrapFrame {
                             crate::kwarn!("task", "clearing_stale_trap_frame"; slot = slot_idx as u64, pid = pid as u64);
-                            CURRENT_TRAP_FRAME.store(
-                                unsafe { core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAME) },
-                                Ordering::Release
-                            );
+                            let cpu = super::percpu::cpu_id() as usize;
+                            unsafe {
+                                super::percpu::set_trap_frame(
+                                    core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAMES[cpu])
+                                );
+                            }
                         }
                     }
 
@@ -786,17 +793,19 @@ impl Scheduler {
                         let _ = task.finalize(); // Evicting → Dead
                     }
 
-                    // SAFETY: Clear CURRENT_TRAP_FRAME if it points to this task.
+                    // SAFETY: Clear per-CPU trap frame if it points to this task.
                     // This shouldn't happen (we skip current task), but prevents use-after-free.
                     if let Some(ref task) = self.tasks[slot_idx] {
                         let task_trap_ptr = &task.trap_frame as *const TrapFrame;
-                        let current_ptr = CURRENT_TRAP_FRAME.load(Ordering::Acquire);
+                        let current_ptr = super::percpu::get_trap_frame();
                         if current_ptr == task_trap_ptr as *mut TrapFrame {
                             crate::kwarn!("task", "clearing_stale_trap_frame"; slot = slot_idx as u64, pid = pid as u64);
-                            CURRENT_TRAP_FRAME.store(
-                                unsafe { core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAME) },
-                                Ordering::Release
-                            );
+                            let cpu = super::percpu::cpu_id() as usize;
+                            unsafe {
+                                super::percpu::set_trap_frame(
+                                    core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAMES[cpu])
+                                );
+                            }
                         }
                     }
 
@@ -831,13 +840,13 @@ impl Scheduler {
             // Transition failed - task was evicted
             kerror!("task", "run_user_task_failed"; slot = slot as u64, pid = task.id as u64, state = task.state().name());
 
-            // Reset to idle task - update globals directly since we already hold the lock
+            // Reset to idle task - update per-CPU data directly since we already hold the lock
             set_current_slot(0);
             if let Some(ref mut idle) = self.tasks[0] {
                 let trap_ptr = &mut idle.trap_frame as *mut TrapFrame;
-                CURRENT_TRAP_FRAME.store(trap_ptr, Ordering::Release);
+                super::percpu::set_trap_frame(trap_ptr);
                 if let Some(ref addr_space) = idle.address_space {
-                    CURRENT_TTBR0.store(addr_space.get_ttbr0(), Ordering::Release);
+                    super::percpu::set_ttbr0(addr_space.get_ttbr0());
                 }
             }
             return None;
@@ -852,9 +861,9 @@ impl Scheduler {
             task.kernel_stack + task.kernel_stack_size as u64
         );
 
-        // Set globals for exception handler (atomic for SMP safety)
-        CURRENT_TRAP_FRAME.store(trap_frame, Ordering::Release);
-        CURRENT_TTBR0.store(ttbr0, Ordering::Release);
+        // Set per-CPU data for exception handler
+        super::percpu::set_trap_frame(trap_frame);
+        super::percpu::set_ttbr0(ttbr0);
 
         Some((trap_frame as *const TrapFrame, ttbr0, kstack_top))
     }
@@ -867,11 +876,21 @@ impl Scheduler {
     /// Select the next task to run using the current scheduling policy
     ///
     /// Delegates to `self.policy.select_next()` for the actual selection.
-    /// The default policy is `PriorityRoundRobin` - priority levels with
+    /// The default policy is `PerCpuQueues` - priority levels with
     /// round-robin fairness within each level.
     pub fn schedule(&mut self) -> Option<usize> {
         let my_slot = current_slot();
         self.policy.select_next(my_slot, &self.tasks)
+    }
+
+    /// Get which CPU a task slot is assigned to
+    pub fn task_cpu(&self, slot: usize) -> Option<u32> {
+        self.policy.task_cpu(slot)
+    }
+
+    /// Update the number of CPUs for round-robin task distribution.
+    pub fn set_num_cpus(&mut self, n: u32) {
+        self.policy.set_num_cpus(n as u8);
     }
 
     /// Print scheduler state
@@ -897,7 +916,6 @@ impl Scheduler {
     }
 }
 
-use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
 use super::lock::SpinLock;
 
 /// Global scheduler instance protected by SpinLock for SMP safety.
@@ -945,40 +963,57 @@ pub fn init_scheduler() {
     // Initialize per-CPU current slot to idle (slot 0)
     set_current_slot(0);
 
+    // Set early boot trap frame for this CPU (before any tasks exist)
+    let cpu = super::percpu::cpu_id() as usize;
+    unsafe {
+        let early_frame = core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAMES[cpu]);
+        super::percpu::set_trap_frame(early_frame);
+    }
+
     // Create idle task in slot 0 - runs WFI loop when no tasks ready
     // Uses static stack (no PMM allocation) since PMM isn't initialized yet
     {
         let mut sched = SCHEDULER.lock();
         let idle_id = sched.make_pid(0);
         // SAFETY: idle_entry is a valid function pointer, idle_stack_top() returns valid stack
-        let idle_task = unsafe { Task::new_idle(idle_id, crate::kernel::idle::idle_entry) };
+        let idle_task = unsafe { Task::new_idle(idle_id, crate::kernel::idle::idle_entry, 0) };
         sched.tasks[0] = Some(idle_task);
     }
 }
 
-/// Early boot trap frame - used before any tasks are created
-/// This ensures exception handlers have a valid place to save state
-/// even if an exception occurs during very early boot.
-static mut EARLY_BOOT_TRAP_FRAME: TrapFrame = TrapFrame::new();
+/// Initialize scheduler for a secondary CPU.
+///
+/// Creates an idle task in slot `cpu` for the given CPU.
+/// Must be called from the secondary CPU after percpu::init_secondary_cpu().
+pub fn init_secondary_scheduler(cpu: u32) {
+    // Set per-CPU current slot to this CPU's idle slot
+    set_current_slot(cpu as usize);
 
-/// Current task's trap frame pointer - used by exception handler
-/// Atomic to ensure safe access from multiple CPUs (SMP safety)
-/// Initialized to early boot trap frame to handle exceptions before tasks exist.
-#[no_mangle]
-pub static CURRENT_TRAP_FRAME: AtomicPtr<TrapFrame> = AtomicPtr::new(
-    unsafe { core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAME) }
-);
+    // Set early boot trap frame for this CPU
+    unsafe {
+        let early_frame = core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAMES[cpu as usize]);
+        super::percpu::set_trap_frame(early_frame);
+    }
 
-/// Current task's TTBR0 value - used by exception handler
-/// Atomic to ensure safe access from multiple CPUs (SMP safety)
-#[no_mangle]
-pub static CURRENT_TTBR0: AtomicU64 = AtomicU64::new(0);
+    // Create idle task in slot `cpu`
+    let mut sched = SCHEDULER.lock();
+    let idle_id = sched.make_pid(cpu as usize);
+    let idle_task = unsafe { Task::new_idle(idle_id, crate::kernel::idle::idle_entry, cpu) };
+    sched.tasks[cpu as usize] = Some(idle_task);
+}
 
-/// Flag: set to 1 when syscall switched tasks, 0 otherwise
-/// Assembly checks this to skip storing return value when switched
-/// Atomic to ensure safe access from multiple CPUs (SMP safety)
-#[no_mangle]
-pub static SYSCALL_SWITCHED_TASK: AtomicU64 = AtomicU64::new(0);
+// Per-CPU early boot trap frames - used before any tasks are created.
+// Each CPU gets its own early boot trap frame.
+static mut EARLY_BOOT_TRAP_FRAMES: [TrapFrame; super::percpu::MAX_CPUS] = [
+    TrapFrame::new(),
+    TrapFrame::new(),
+    TrapFrame::new(),
+    TrapFrame::new(),
+];
+
+// NOTE: CURRENT_TRAP_FRAME, CURRENT_TTBR0, and SYSCALL_SWITCHED_TASK have been
+// moved to per-CPU CpuData fields (accessed via percpu::set_trap_frame() etc.)
+// for SMP safety. See percpu.rs for the new API.
 
 /// Get exclusive access to the scheduler.
 ///

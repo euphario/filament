@@ -8,17 +8,8 @@
 //! - Each CPU has its own `CpuData` structure
 //! - TPIDR_EL1 register points to the current CPU's data
 //! - Access is via `cpu_local()` which reads TPIDR_EL1
-//!
-//! ## Current Implementation
-//!
-//! This is a single-core implementation that can be extended to SMP.
-//! For now, we have a single static CpuData and cpu_local() just returns it.
-//!
-//! ## Future SMP Extension
-//!
-//! 1. Allocate one CpuData per core during boot
-//! 2. Set TPIDR_EL1 to point to that core's CpuData
-//! 3. cpu_local() reads TPIDR_EL1 to find CpuData
+//! - Exception handlers (boot.S) access CpuData fields directly via
+//!   TPIDR_EL1 + offset, avoiding global statics that aren't SMP-safe
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -67,7 +58,30 @@ pub struct CpuData {
 
     /// Kernel stack for this CPU (used during boot/exceptions)
     pub kernel_stack_top: AtomicU64,
+
+    /// Current task's trap frame pointer - used by exception handler (boot.S)
+    /// Replaces the former global CURRENT_TRAP_FRAME for SMP safety.
+    pub trap_frame_ptr: AtomicU64,
+
+    /// Current task's TTBR0 value - used by exception handler (boot.S)
+    /// Replaces the former global CURRENT_TTBR0 for SMP safety.
+    pub ttbr0: AtomicU64,
+
+    /// Flag: set to 1 when syscall switched tasks, 0 otherwise
+    /// Assembly checks this to skip storing return value when switched.
+    /// Replaces the former global SYSCALL_SWITCHED_TASK for SMP safety.
+    pub syscall_switched: AtomicU64,
 }
+
+// Assembly offsets into CpuData (must match #[repr(C)] layout above)
+// Layout: cpu_id(u32:0) _pad(4) current_task(u64:8) current_slot(u32:16)
+//         irq_disable_count(u32:20) need_resched(u32:24) _pad(4)
+//         tick_count(u64:32) idle_ticks(u64:40) in_idle(u32:48)
+//         last_syscall(u32:52) kernel_stack_top(u64:56)
+//         trap_frame_ptr(u64:64) ttbr0(u64:72) syscall_switched(u64:80)
+pub const CPUDATA_OFFSET_TRAP_FRAME: usize = 64;
+pub const CPUDATA_OFFSET_TTBR0: usize = 72;
+pub const CPUDATA_OFFSET_SWITCHED: usize = 80;
 
 impl CpuData {
     /// Create a new CpuData for the given CPU ID.
@@ -83,6 +97,9 @@ impl CpuData {
             in_idle: AtomicU32::new(0),
             last_syscall: AtomicU32::new(0),
             kernel_stack_top: AtomicU64::new(0),
+            trap_frame_ptr: AtomicU64::new(0),
+            ttbr0: AtomicU64::new(0),
+            syscall_switched: AtomicU64::new(0),
         }
     }
 
@@ -163,6 +180,48 @@ impl CpuData {
     pub fn is_idle(&self) -> bool {
         self.in_idle.load(Ordering::Acquire) != 0
     }
+}
+
+// ============================================================================
+// Per-CPU Trap Frame / TTBR0 / Switched Accessors
+// ============================================================================
+// These replace the former global statics CURRENT_TRAP_FRAME, CURRENT_TTBR0,
+// and SYSCALL_SWITCHED_TASK for SMP safety.
+
+/// Set the current task's trap frame pointer (per-CPU)
+#[inline]
+pub fn set_trap_frame(ptr: *mut super::task::TrapFrame) {
+    cpu_local().trap_frame_ptr.store(ptr as u64, Ordering::Release);
+}
+
+/// Get the current task's trap frame pointer (per-CPU)
+#[inline]
+pub fn get_trap_frame() -> *mut super::task::TrapFrame {
+    cpu_local().trap_frame_ptr.load(Ordering::Acquire) as *mut _
+}
+
+/// Set the current task's TTBR0 value (per-CPU)
+#[inline]
+pub fn set_ttbr0(val: u64) {
+    cpu_local().ttbr0.store(val, Ordering::Release);
+}
+
+/// Get the current task's TTBR0 value (per-CPU)
+#[inline]
+pub fn get_ttbr0() -> u64 {
+    cpu_local().ttbr0.load(Ordering::Acquire)
+}
+
+/// Set the syscall-switched flag (per-CPU)
+#[inline]
+pub fn set_syscall_switched(val: u64) {
+    cpu_local().syscall_switched.store(val, Ordering::Release);
+}
+
+/// Get the syscall-switched flag (per-CPU)
+#[inline]
+pub fn get_syscall_switched() -> u64 {
+    cpu_local().syscall_switched.load(Ordering::Acquire)
 }
 
 // SAFETY: CpuData is designed for per-CPU access patterns
@@ -287,11 +346,9 @@ fn read_cpu_id() -> u32 {
 }
 
 /// Get the number of online CPUs.
-///
-/// Currently always returns 1 (single-core implementation).
 #[inline]
 pub fn num_online_cpus() -> u32 {
-    1
+    crate::arch::aarch64::smp::online_cpus()
 }
 
 /// Check if we're on the boot CPU.

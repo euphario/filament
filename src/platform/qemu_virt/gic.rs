@@ -322,6 +322,32 @@ pub fn as_interrupt_controller() -> &'static dyn InterruptController {
     unsafe { &*core::ptr::addr_of!(GIC) }
 }
 
+/// Send a Software Generated Interrupt (SGI) to a target CPU.
+///
+/// Uses GICv3 system register ICC_SGI1R_EL1 (S3_0_C12_C11_5).
+/// SGI IDs 0-15 are available. We use SGI 0 for reschedule IPI.
+///
+/// ICC_SGI1R_EL1 format:
+/// - Bits [3:0]: SGI ID (INTID)
+/// - Bits [15:0] of TargetList in Aff0 (bit N = target CPU with Aff0=N)
+/// - Bits [23:16]: Aff1
+/// - Bits [39:32]: Aff2
+/// - Bits [55:48]: Aff3
+/// - Bit [40]: IRM (0 = target list, 1 = all except self)
+pub fn send_sgi(target_cpu: u32, sgi_id: u32) {
+    // For QEMU virt, CPUs are in a single cluster (Aff1=Aff2=Aff3=0)
+    // Target list: bit N in [15:0] targets CPU with Aff0=N
+    let target_list = 1u64 << target_cpu;
+    let val = (sgi_id as u64 & 0xF) << 24 | target_list;
+    unsafe {
+        core::arch::asm!(
+            "msr S3_0_C12_C11_5, {}",
+            "isb",
+            in(reg) val,
+        );
+    }
+}
+
 /// Debug helper to print IRQ state (no-op for QEMU)
 pub fn debug_irq(_irq: u32) {
     // No-op for QEMU - minimal debug output

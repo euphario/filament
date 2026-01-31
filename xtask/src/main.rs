@@ -598,6 +598,7 @@ fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool) -> Result<()> {
     let args = vec![
         "-M", "virt,gic-version=3",
         "-cpu", "cortex-a72",
+        "-smp", "2",
         "-m", "512M",
         "-nographic",
         "-kernel", &kernel_str,

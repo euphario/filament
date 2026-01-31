@@ -464,3 +464,19 @@ pub fn init_cpu() {
 pub fn as_interrupt_controller() -> &'static dyn InterruptController {
     unsafe { &*core::ptr::addr_of!(GIC) }
 }
+
+/// Send a Software Generated Interrupt (SGI) to a target CPU.
+///
+/// Uses GICv3 system register ICC_SGI1R_EL1 (S3_0_C12_C11_5).
+/// SGI 0 is used for reschedule IPI.
+pub fn send_sgi(target_cpu: u32, sgi_id: u32) {
+    let target_list = 1u64 << target_cpu;
+    let val = (sgi_id as u64 & 0xF) << 24 | target_list;
+    unsafe {
+        core::arch::asm!(
+            "msr S3_0_C12_C11_5, {}",
+            "isb",
+            in(reg) val,
+        );
+    }
+}

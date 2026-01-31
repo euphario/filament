@@ -187,13 +187,14 @@ The `./build.sh` script is deprecated but still works for compatibility.
 
 # Manual run
 ./x build --platform qemu
-qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512M -nographic -kernel kernel.bin
+qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -smp 2 -m 512M -nographic -kernel kernel.bin
 ```
 
 QEMU differences from real hardware:
 - Loads kernel at 0x40080000 (vs 0x46000000 on MT7988A)
 - Uses PL011 UART at 0x09000000 (vs 16550 at 0x11000000)
 - Uses GICv3 (vs custom interrupt controller)
+- SMP: 2 CPUs via PSCI (vs 4x A73 on MT7988A)
 - No PCIe or USB enumeration (stubs only)
 
 ### Load via U-Boot
@@ -380,6 +381,27 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 
 ## Current Work
 
+### SMP Support (COMPLETE)
+- **2-core SMP on QEMU virt** with per-CPU scheduling
+  - Per-CPU data via TPIDR_EL1 (`src/kernel/percpu.rs`)
+  - Per-CPU trap frame, TTBR0, syscall_switched (no more global statics)
+  - Assembly exception handlers use `mrs xN, tpidr_el1` + offset loads
+  - TLB invalidation uses inner-shareable (`tlbi vmalle1is` + `dsb ish`)
+  - Per-CPU idle tasks (slot N = CPU N's idle task)
+  - Per-CPU idle stacks (`src/kernel/idle.rs`)
+  - `PerCpuQueues` scheduling policy with work stealing (`src/kernel/task/policy.rs`)
+  - SGI 0 (reschedule IPI) via GICv3 ICC_SGI1R_EL1
+  - Secondary CPU boot via PSCI CPU_ON
+  - QEMU runs with `-smp 2`
+- **Key files**:
+  - `src/kernel/percpu.rs` - CpuData with trap_frame_ptr, ttbr0, syscall_switched
+  - `src/kernel/sched.rs` - Three-phase scheduling with per-CPU idle, IPI on wake
+  - `src/kernel/task/policy.rs` - PerCpuQueues with u16 bitsets and work stealing
+  - `src/arch/aarch64/smp.rs` - secondary_cpu_entry with percpu init, GIC, idle
+  - `src/arch/aarch64/boot.S` - Per-CPU data loads via TPIDR_EL1
+  - `src/platform/qemu_virt/gic.rs` - send_sgi() for reschedule IPI
+- **Slot layout**: Slots 0..MAX_CPUS-1 reserved for per-CPU idle tasks, user tasks start at slot MAX_CPUS
+
 ### ObjectService Tables Migration (COMPLETE)
 - **Object tables moved to ObjectService** - Not in Task struct anymore
   - `src/kernel/object_service.rs` owns all per-task object tables
@@ -429,6 +451,16 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
 ## Changelog (Recent)
 
 ### 2026-01-31
+- **SMP (2-core, QEMU virt)**
+  - Per-CPU globals: CURRENT_TRAP_FRAME, CURRENT_TTBR0, SYSCALL_SWITCHED_TASK moved to CpuData fields
+  - Assembly exception handlers load per-CPU data via `mrs xN, tpidr_el1` + offset
+  - TLB invalidation upgraded to inner-shareable (`tlbi vmalle1is` + `dsb ish`)
+  - Per-CPU idle tasks: slot N = CPU N's idle, per-CPU idle stacks
+  - `PerCpuQueues` scheduling policy: u16 bitsets per CPU, work stealing
+  - SGI 0 reschedule IPI via GICv3 ICC_SGI1R_EL1
+  - Secondary CPU boot: `secondary_cpu_entry()` inits percpu, GIC, timer, idle task
+  - QEMU `-smp 2` for 2-core testing
+  - User tasks now start at slot MAX_CPUS (4) instead of slot 1
 - **Async Driver Stack (polling removal)**
   - Consumer block ports now registered with Mux in `bus_runtime.rs`
   - partd: async forwarding with fixed-size inflight table (`[Option<InflightRequest>; 16]`)

@@ -706,10 +706,68 @@ secondary_start:
     eret
 
 secondary_el1_entry:
-    /* x0 still has CPU ID */
+    /* x0 = CPU ID (preserved throughout MMU setup) */
 
-    /* Secondary CPUs start with MMU already enabled by primary.
-     * Load stack pointer from per-CPU stacks (virtual address) */
+    /* Enable FPU/SIMD before any code that might use FP */
+    mov     x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
+
+    /* Compute phys-virt offset (same technique as primary boot) */
+    adr     x28, _start             // x28 = physical address of _start
+    ldr     x1, =_start             // x1 = virtual address of _start
+    sub     x28, x28, x1            // x28 = phys - virt
+
+    /* Load page table physical addresses from globals set by primary */
+    ldr     x1, =BOOT_TTBR0
+    add     x1, x1, x28            // Physical address of BOOT_TTBR0 variable
+    ldr     x2, [x1]               // x2 = physical address of TTBR0 page table
+
+    ldr     x1, =BOOT_TTBR1
+    add     x1, x1, x28            // Physical address of BOOT_TTBR1 variable
+    ldr     x3, [x1]               // x3 = physical address of TTBR1 page table
+
+    /* Set MAIR_EL1 (same as primary) */
+    ldr     x1, =0x000000000044FF00
+    msr     mair_el1, x1
+
+    /* Set TCR_EL1 (same as primary) */
+    ldr     x1, =0x00000005B5103510
+    msr     tcr_el1, x1
+
+    /* Set TTBRs */
+    msr     ttbr0_el1, x2
+    msr     ttbr1_el1, x3
+
+    dsb     ish
+    isb
+    tlbi    vmalle1is
+    dsb     ish
+    isb
+
+    /* Enable MMU via SCTLR_EL1 (same value as primary) */
+    mov     x1, xzr
+    orr     x1, x1, #(1 << 0)       // M: Enable MMU
+    orr     x1, x1, #(1 << 2)       // C: Enable data cache
+    orr     x1, x1, #(1 << 12)      // I: Enable instruction cache
+    mov     x2, #(1 << 26)
+    orr     x1, x1, x2              // UCI
+    mov     x2, #(1 << 29)
+    orr     x1, x1, x2              // LSMAOE
+    mov     x2, #(1 << 28)
+    orr     x1, x1, x2              // nTLSMD
+    msr     sctlr_el1, x1
+    isb
+
+    /* MMU is now enabled. Still running at physical address via TTBR0 identity map.
+     * Jump to virtual address in TTBR1 space. */
+    ldr     x1, =secondary_virtual_entry
+    br      x1
+
+secondary_virtual_entry:
+    /* Now running in virtual address space. x0 = CPU ID (preserved). */
+
+    /* Set up stack from per-CPU stacks (virtual address) */
     ldr     x1, =CPU_STACKS
     mov     x2, #(16 * 1024)        // CPU_STACK_SIZE
     add     x3, x0, #1
@@ -719,6 +777,7 @@ secondary_el1_entry:
     /* Set up VBAR_EL1 to kernel's exception vectors (virtual address) */
     ldr     x1, =exception_vectors
     msr     vbar_el1, x1
+    isb
 
     /* Call Rust secondary CPU entry with CPU ID in x0 */
     bl      secondary_cpu_entry
@@ -727,6 +786,14 @@ secondary_el1_entry:
 secondary_hang:
     wfe
     b       secondary_hang
+
+/*
+ * Per-CPU data offsets (must match CpuData #[repr(C)] layout in percpu.rs)
+ * These are byte offsets from TPIDR_EL1 base.
+ */
+.equ CPUDATA_TRAP_FRAME,  64
+.equ CPUDATA_TTBR0,       72
+.equ CPUDATA_SWITCHED,    80
 
 /*
  * Exception Vector Table
@@ -824,9 +891,9 @@ exception_from_user:
     stp     x9, x10, [sp, #-16]!
     stp     x11, x12, [sp, #-16]!
 
-    /* Get pointer to current task's trap frame */
-    ldr     x9, =CURRENT_TRAP_FRAME
-    ldr     x9, [x9]
+    /* Get pointer to current task's trap frame (per-CPU via TPIDR_EL1) */
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
 
     /* Save all general purpose registers to trap frame */
     stp     x0, x1, [x9, #0]
@@ -866,20 +933,19 @@ exception_from_user:
     bl      exception_from_user_rust
 
     /* Rust handler terminates the task and schedules next.
-     * Reload CURRENT_TRAP_FRAME (now points to next task). */
-    ldr     x9, =CURRENT_TRAP_FRAME
-    ldr     x9, [x9]
+     * Reload trap frame from per-CPU data (now points to next task). */
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
 
     /* Switch TTBR0 to current task's user address space */
-    ldr     x10, =CURRENT_TTBR0
-    ldr     x10, [x10]
+    ldr     x10, [x10, #CPUDATA_TTBR0]
     cbnz    x10, 1f
     mov     x0, #1              // caller ID = exception_from_user
     b       ttbr0_zero_guard
 1:
     msr     ttbr0_el1, x10
     isb
-    tlbi    vmalle1
+    tlbi    vmalle1is
     dsb     ish
     isb
 
@@ -965,22 +1031,22 @@ irq_from_kernel:
     mov     x0, #0                  // from_user = false
     bl      irq_handler_rust
 
-    /* Clear SYSCALL_SWITCHED_TASK before calling do_resched_if_needed
+    /* Clear syscall_switched (per-CPU) before calling do_resched_if_needed
      * so we can detect if it switched to a user task */
-    ldr     x10, =SYSCALL_SWITCHED_TASK
-    str     xzr, [x10]
+    mrs     x10, tpidr_el1
+    str     xzr, [x10, #CPUDATA_SWITCHED]
 
     /* Check if reschedule is needed (e.g., timer woke a task).
      * This may context_switch to another task. When we're switched back,
      * we return here with sp restored, so ELR/SPSR are still on our stack.
-     * If it switches to a user task, it sets SYSCALL_SWITCHED_TASK = 1. */
+     * If it switches to a user task, it sets syscall_switched = 1. */
     bl      do_resched_if_needed
 
-    /* Check if we switched to a user task.
+    /* Check if we switched to a user task (per-CPU).
      * If so, we need to use the user return path to restore from trap frame
      * and switch TTBR0. This handles devd recovery when IRQ came from idle. */
-    ldr     x10, =SYSCALL_SWITCHED_TASK
-    ldr     x10, [x10]
+    mrs     x10, tpidr_el1
+    ldr     x10, [x10, #CPUDATA_SWITCHED]
     cbnz    x10, irq_kernel_to_user     // If switched, use user return path
 
     /* Returning to kernel (idle task) - restore from stack */
@@ -1020,20 +1086,19 @@ irq_kernel_to_user:
     /* Discard saved registers from kernel stack */
     add     sp, sp, #(8 + 15*16)        // x0 + x1-x30 pairs
 
-    /* Now use the user return path - restore from CURRENT_TRAP_FRAME */
-    ldr     x9, =CURRENT_TRAP_FRAME
-    ldr     x9, [x9]
+    /* Now use the user return path - restore from per-CPU trap frame */
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
 
     /* Switch TTBR0 to user task's address space */
-    ldr     x10, =CURRENT_TTBR0
-    ldr     x10, [x10]
+    ldr     x10, [x10, #CPUDATA_TTBR0]
     cbnz    x10, 1f
     mov     x0, #2              // caller ID = irq_kernel_to_user
     b       ttbr0_zero_guard
 1:
     msr     ttbr0_el1, x10
     isb
-    tlbi    vmalle1
+    tlbi    vmalle1is
     dsb     ish
     isb
 
@@ -1081,9 +1146,9 @@ irq_from_user:
     stp     x9, x10, [sp, #-16]!
     stp     x11, x12, [sp, #-16]!
 
-    /* Get pointer to current task's trap frame (already a virtual address) */
-    ldr     x9, =CURRENT_TRAP_FRAME
-    ldr     x9, [x9]
+    /* Get pointer to current task's trap frame from per-CPU data */
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
 
     /* Save all general purpose registers to trap frame */
     stp     x0, x1, [x9, #0]        // x0=0, x1=8
@@ -1120,33 +1185,33 @@ irq_from_user:
     mov     x0, #1                  // from_user = true
     bl      irq_handler_rust
 
-    /* Clear SYSCALL_SWITCHED_TASK before calling irq_exit_resched
+    /* Clear syscall_switched before calling irq_exit_resched
      * so we can detect if it actually switched tasks */
-    ldr     x10, =SYSCALL_SWITCHED_TASK
-    str     xzr, [x10]
+    mrs     x10, tpidr_el1
+    str     xzr, [x10, #CPUDATA_SWITCHED]
 
     /* Safe point: check NEED_RESCHED flag and do deferred scheduling.
      * This is where timer preemption actually happens - the IRQ handler
      * just sets the flag, this function does the actual task switch.
-     * If it switches tasks, it sets SYSCALL_SWITCHED_TASK = 1. */
+     * If it switches tasks, it sets per-CPU syscall_switched = 1. */
     bl      irq_exit_resched
 
     /* irq_exit_resched may have scheduled a different task */
-    /* Reload CURRENT_TRAP_FRAME (may have changed!) */
-    ldr     x9, =CURRENT_TRAP_FRAME
-    ldr     x9, [x9]
+    /* Reload trap frame from per-CPU data (may have changed!) */
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
 
     /* Switch TTBR0 to current task's user address space for eret.
      * Use TLBI to ensure no stale TLB entries. */
-    ldr     x10, =CURRENT_TTBR0
-    ldr     x10, [x10]
+    mrs     x10, tpidr_el1
+    ldr     x10, [x10, #CPUDATA_TTBR0]
     cbnz    x10, 1f
     mov     x0, #3              // caller ID = irq_from_user
     b       ttbr0_zero_guard
 1:
     msr     ttbr0_el1, x10
     isb
-    tlbi    vmalle1
+    tlbi    vmalle1is
     dsb     ish
     isb
 
@@ -1185,8 +1250,8 @@ irq_from_user:
 
 /*
  * SVC (Syscall) handler
- * Saves full user state to CURRENT_TRAP_FRAME, handles syscall,
- * then restores from CURRENT_TRAP_FRAME (which may be a different task after scheduling)
+ * Saves full user state to per-CPU trap frame, handles syscall,
+ * then restores from per-CPU trap frame (which may be a different task after scheduling)
  *
  * With kernel linked at TTBR1 virtual address, vtables contain virtual
  * addresses that work directly. No need to switch TTBR0 on entry.
@@ -1196,9 +1261,9 @@ svc_handler:
     stp     x9, x10, [sp, #-16]!
     stp     x11, x12, [sp, #-16]!
 
-    /* Get pointer to current task's trap frame (already a virtual address) */
-    ldr     x9, =CURRENT_TRAP_FRAME
-    ldr     x9, [x9]
+    /* Get pointer to current task's trap frame from per-CPU data */
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
 
     /* Save all general purpose registers to trap frame */
     /* TrapFrame layout: x0(0) x1(8) x2(16) ... x30(240), sp_el0(248), elr_el1(256), spsr_el1(264) */
@@ -1237,8 +1302,8 @@ svc_handler:
      * syscall_handler_rust(arg0, arg1, arg2, arg3, arg4, arg5, unused, num)
      */
     /* Clear switch flag before syscall */
-    ldr     x10, =SYSCALL_SWITCHED_TASK
-    str     xzr, [x10]
+    mrs     x10, tpidr_el1
+    str     xzr, [x10, #CPUDATA_SWITCHED]
 
     ldp     x0, x1, [x9, #0]        // arg0, arg1
     ldp     x2, x3, [x9, #16]       // arg2, arg3
@@ -1251,8 +1316,8 @@ svc_handler:
     mov     x19, x0
 
     /* Check if syscall already switched tasks */
-    ldr     x10, =SYSCALL_SWITCHED_TASK
-    ldr     x10, [x10]
+    mrs     x10, tpidr_el1
+    ldr     x10, [x10, #CPUDATA_SWITCHED]
     cbnz    x10, .Lsvc_already_switched
 
     /* Syscall didn't switch - store return value to trap frame BEFORE
@@ -1260,9 +1325,9 @@ svc_handler:
      * to another task, we need the return value saved now, because x9 will
      * be reloaded to point to the new task's trap frame after the switch.
      * Note: x9 may have been clobbered by syscall_handler_rust (caller-saved),
-     * so we must reload CURRENT_TRAP_FRAME here. */
-    ldr     x9, =CURRENT_TRAP_FRAME
-    ldr     x9, [x9]
+     * so we must reload trap frame from per-CPU data here. */
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
     str     x19, [x9, #0]
 
     /* Now check if reschedule is needed (e.g., timer preemption) */
@@ -1270,9 +1335,9 @@ svc_handler:
 
 .Lsvc_already_switched:
     /* syscall_handler_rust or do_resched_if_needed may have scheduled a different task */
-    /* Reload CURRENT_TRAP_FRAME (may have changed!) */
-    ldr     x9, =CURRENT_TRAP_FRAME
-    ldr     x9, [x9]
+    /* Reload trap frame from per-CPU data (may have changed!) */
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
 
     /* Note: return value was already stored above if syscall didn't switch.
      * If syscall DID switch, the new task's trap frame already has its x0. */
@@ -1280,15 +1345,15 @@ svc_handler:
 .Lsvc_skip_retval:
     /* Switch TTBR0 to current task's user address space for eret.
      * Use TLBI to ensure no stale TLB entries. */
-    ldr     x10, =CURRENT_TTBR0
-    ldr     x10, [x10]
+    mrs     x10, tpidr_el1
+    ldr     x10, [x10, #CPUDATA_TTBR0]
     cbnz    x10, 1f
     mov     x0, #4              // caller ID = svc_handler
     b       ttbr0_zero_guard
 1:
     msr     ttbr0_el1, x10
     isb
-    tlbi    vmalle1
+    tlbi    vmalle1is
     dsb     ish
     isb
 
@@ -1326,7 +1391,7 @@ svc_handler:
     eret
 
 /*
- * TTBR0 zero guard - called when CURRENT_TTBR0 is 0 before eret
+ * TTBR0 zero guard - called when per-CPU TTBR0 is 0 before eret
  * x0 = caller ID (1=exception, 2=irq_kernel_to_user, 3=irq_from_user, 4=svc)
  * x9 = trap frame pointer (for diagnostic)
  */

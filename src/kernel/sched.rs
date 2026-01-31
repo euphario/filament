@@ -32,12 +32,23 @@
 //! - **Sleeping/Waiting** → Ready (via `wake` or timeout)
 
 use crate::{kerror, kdebug, kwarn};
-use super::task::{self, TaskState, current_slot, set_current_slot};
-use super::task::{CURRENT_TRAP_FRAME, CURRENT_TTBR0, SYSCALL_SWITCHED_TASK, TrapFrame};
-use core::sync::atomic::Ordering;
+use super::task::{self, TaskState, current_slot, set_current_slot, TrapFrame};
+use super::percpu;
 
-/// Slot reserved for idle task
+/// Slot reserved for idle task on CPU 0 (backward compat)
 pub const IDLE_SLOT: usize = 0;
+
+/// Get the idle slot for a given CPU. Slot N = CPU N's idle task.
+#[inline]
+pub fn idle_slot_for_cpu(cpu: u32) -> usize {
+    cpu as usize
+}
+
+/// Check if a slot is an idle slot (any CPU's idle).
+#[inline]
+pub fn is_idle_slot(slot: usize) -> bool {
+    slot < percpu::MAX_CPUS
+}
 
 // ============================================================================
 // SMP-Safe Context Switch Data
@@ -121,8 +132,8 @@ pub fn reschedule() -> bool {
                     }
                     return false;
                 }
-                // Blocked and nothing ready - go to idle
-                IDLE_SLOT
+                // Blocked and nothing ready - go to this CPU's idle
+                idle_slot_for_cpu(percpu::cpu_id())
             }
         };
 
@@ -137,23 +148,23 @@ pub fn reschedule() -> bool {
             // Just update variables, actual switch at eret
             set_current_slot(next_slot);
 
-            // Extract and update globals while we have the lock
+            // Extract and update per-CPU data while we have the lock
             if let Some(next) = sched.task_mut(next_slot) {
                 crate::transition_or_evict!(next, set_running);
 
                 // Update trap frame pointer
                 let trap_ptr = &mut next.trap_frame as *mut TrapFrame;
-                CURRENT_TRAP_FRAME.store(trap_ptr, Ordering::Release);
+                percpu::set_trap_frame(trap_ptr);
 
                 // Update TTBR0
                 if let Some(ref addr_space) = next.address_space {
-                    CURRENT_TTBR0.store(addr_space.get_ttbr0(), Ordering::Release);
+                    percpu::set_ttbr0(addr_space.get_ttbr0());
                 }
             }
             // Only set flag for user tasks (not idle) - this tells IRQ handler
             // to use user return path instead of kernel return path
-            if next_slot != IDLE_SLOT {
-                SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
+            if !is_idle_slot(next_slot) {
+                percpu::set_syscall_switched(1);
             }
             return true;
         }
@@ -226,21 +237,21 @@ pub fn reschedule() -> bool {
             core::arch::asm!(
                 "msr ttbr0_el1, {0}",
                 "isb",
-                "tlbi vmalle1",
-                "dsb sy",
+                "tlbi vmalle1is",
+                "dsb ish",
                 "isb",
                 in(reg) decision.to_ttbr0,
             );
         }
-        CURRENT_TTBR0.store(decision.to_ttbr0, Ordering::Release);
+        percpu::set_ttbr0(decision.to_ttbr0);
     }
 
-    // Update globals
-    CURRENT_TRAP_FRAME.store(decision.to_trap_frame, Ordering::Release);
+    // Update per-CPU data
+    percpu::set_trap_frame(decision.to_trap_frame);
     // Only set flag for user tasks (not idle) - this tells IRQ handler
     // to use user return path instead of kernel return path
-    if decision.to_slot != IDLE_SLOT {
-        SYSCALL_SWITCHED_TASK.store(1, Ordering::Release);
+    if !is_idle_slot(decision.to_slot) {
+        percpu::set_syscall_switched(1);
     }
 
     // SAFETY CHECK: Verify target context has valid x30 (return address)
@@ -278,12 +289,12 @@ pub fn reschedule() -> bool {
     // We've been switched back to from_slot
     drop(_irq_guard);
 
-    // CRITICAL: Clear SYSCALL_SWITCHED_TASK because we're returning to our
+    // CRITICAL: Clear syscall_switched because we're returning to our
     // original context (from_slot), not a new task. The flag was set when we
     // originally switched away, but now we're coming BACK. If we don't clear it,
     // irq_from_kernel would incorrectly use irq_kernel_to_user path which would
     // ERET to from_slot's trap_frame (which could be idle with ELR=0).
-    SYSCALL_SWITCHED_TASK.store(0, Ordering::Release);
+    percpu::set_syscall_switched(0);
 
     {
         let mut sched = task::scheduler();
@@ -305,14 +316,14 @@ pub fn reschedule() -> bool {
             }
             t.needs_context_restore = false;
 
-            // Update trap frame pointer
+            // Update per-CPU trap frame pointer
             let trap_ptr = &mut t.trap_frame as *mut TrapFrame;
-            CURRENT_TRAP_FRAME.store(trap_ptr, Ordering::Release);
+            percpu::set_trap_frame(trap_ptr);
 
             // Restore address space
             if let Some(ref addr_space) = t.address_space {
                 unsafe { addr_space.activate(); }
-                CURRENT_TTBR0.store(addr_space.get_ttbr0(), Ordering::Release);
+                percpu::set_ttbr0(addr_space.get_ttbr0());
             }
         }
     } // Lock released
@@ -330,15 +341,36 @@ pub fn reschedule() -> bool {
 /// already hold the scheduler lock (e.g., cleanup paths, reap_terminated).
 /// If the lock is held, defers the wake via request_wake().
 ///
+/// After waking, sends a reschedule IPI to other CPUs so they can pick
+/// up the newly ready task.
+///
 /// # Returns
 /// true if task was woken (or wake was deferred), false if task not found.
 pub fn wake(pid: u32) -> bool {
     if let Some(mut sched) = task::try_scheduler() {
-        sched.wake_by_pid(pid)
+        let woken = sched.wake_by_pid(pid);
+        if woken {
+            // Send reschedule IPI to other CPUs
+            send_reschedule_ipi();
+        }
+        woken
     } else {
         // Lock held - defer the wake
         crate::arch::aarch64::sync::cpu_flags().request_wake(pid);
         true // Wake will be processed by process_pending_wakes
+    }
+}
+
+/// Send reschedule IPI (SGI 0) to all other online CPUs.
+///
+/// This causes the target CPUs to check for newly ready tasks.
+fn send_reschedule_ipi() {
+    let my_cpu = percpu::cpu_id();
+    let online = percpu::num_online_cpus();
+    for cpu in 0..online {
+        if cpu != my_cpu {
+            crate::platform::current::gic::send_sgi(cpu, 0);
+        }
     }
 }
 
@@ -352,7 +384,7 @@ pub fn sleep_current(reason: task::SleepReason) -> bool {
     let mut sched = task::scheduler();
     let slot = current_slot();
 
-    if slot == IDLE_SLOT {
+    if is_idle_slot(slot) {
         kerror!("sched", "block_idle_attempt");
         return false;
     }
@@ -377,7 +409,7 @@ pub fn wait_current(reason: task::WaitReason, deadline: u64) -> bool {
     let mut sched = task::scheduler();
     let slot = current_slot();
 
-    if slot == IDLE_SLOT {
+    if is_idle_slot(slot) {
         kerror!("sched", "block_idle_attempt");
         return false;
     }

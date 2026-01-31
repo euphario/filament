@@ -151,7 +151,24 @@ pub unsafe fn get_cpu_mut(id: u32) -> Option<&'static mut PerCpu> {
     }
 }
 
-/// Call PSCI function via SMC
+/// Call PSCI function via HVC (QEMU virt — no EL3 firmware).
+#[cfg(feature = "platform-qemu-virt")]
+#[inline]
+unsafe fn psci_call(func: u32, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    let ret: i64;
+    core::arch::asm!(
+        "hvc #0",
+        inout("x0") func as u64 => ret,
+        in("x1") arg0,
+        in("x2") arg1,
+        in("x3") arg2,
+        options(nomem, nostack)
+    );
+    ret
+}
+
+/// Call PSCI function via SMC (real hardware with EL3 firmware).
+#[cfg(not(feature = "platform-qemu-virt"))]
 #[inline]
 unsafe fn psci_call(func: u32, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     let ret: i64;
@@ -206,15 +223,11 @@ pub fn init() {
     let cpu = cpu_id();
     kdebug!("smp", "init"; primary_cpu = cpu as u64);
 
-    // Check PSCI version - skip on QEMU virt when using device loader
-    // SMC without EL3 firmware causes exceptions
-    #[cfg(not(feature = "platform-qemu-virt"))]
-    {
-        if let Some((major, minor)) = psci_version() {
-            kinfo!("smp", "psci_version"; major = major as u64, minor = minor as u64);
-        } else {
-            kwarn!("smp", "psci_unavailable");
-        }
+    // Check PSCI version
+    if let Some((major, minor)) = psci_version() {
+        kinfo!("smp", "psci_version"; major = major as u64, minor = minor as u64);
+    } else {
+        kwarn!("smp", "psci_unavailable");
     }
 
     // Initialize primary CPU's per-CPU data
@@ -230,44 +243,38 @@ pub fn init() {
 }
 
 /// Secondary CPU entry point (called from assembly)
+///
+/// Sets up per-CPU data, GIC, timer, creates idle task, then enters idle loop.
 #[no_mangle]
 pub extern "C" fn secondary_cpu_entry(cpu_id_arg: u64) {
     let cpu = cpu_id_arg as u32;
 
-    // Mark CPU as online
+    // 1. Initialize per-CPU data (sets TPIDR_EL1)
+    crate::kernel::percpu::init_secondary_cpu(cpu);
+
+    // 2. Mark CPU as online in SMP data
     unsafe {
         if let Some(pcpu) = get_cpu_mut(cpu) {
             pcpu.set_state(CpuState::Online);
         }
     }
 
-    // Initialize GIC CPU interface for this CPU
-    crate::gic::init_cpu();
+    // 3. Initialize GIC CPU interface for this CPU
+    crate::platform::current::gic::init_cpu();
 
-    // Enable timer for this CPU
-    unsafe {
-        // Enable physical timer interrupt
-        let ctl: u64 = 1; // ENABLE
-        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) ctl);
-    }
+    // 4. Create idle task for this CPU in the scheduler
+    crate::kernel::task::init_secondary_scheduler(cpu);
+
+    // 5. Set current slot to this CPU's idle task
+    crate::kernel::task::set_current_slot(cpu as usize);
+
+    // 6. Start timer for this CPU
+    crate::platform::current::timer::start(10);
 
     kinfo!("smp", "cpu_online"; cpu = cpu as u64);
 
-    // Enter idle loop - scheduler will assign tasks
-    loop {
-        unsafe {
-            core::arch::asm!("wfe");
-        }
-
-        // Check if we have work to do
-        let pcpu = this_cpu();
-        let task = pcpu.current_task.load(Ordering::Acquire);
-        if task != 0xFFFFFFFF {
-            // We have a task - run scheduler
-            // For now, just acknowledge and go back to idle
-            pcpu.idle.store(false, Ordering::Release);
-        }
-    }
+    // 7. Enter idle loop (never returns)
+    crate::kernel::idle::idle_entry();
 }
 
 /// Start secondary CPUs
@@ -276,10 +283,11 @@ pub fn start_secondary_cpus() {
     kdebug!("smp", "starting_secondary"; primary = primary as u64);
 
     // Get the physical address of secondary_start from boot.S
+    // PSCI CPU_ON requires a physical address — secondary CPU starts with MMU off
     extern "C" {
         fn secondary_start();
     }
-    let entry = secondary_start as *const () as u64;
+    let entry = crate::arch::aarch64::mmu::virt_to_phys(secondary_start as *const () as u64);
 
     for cpu in 0..MAX_CPUS as u32 {
         if cpu == primary {
@@ -340,6 +348,13 @@ pub fn start_secondary_cpus() {
         }
     }
     kinfo!("smp", "cpus_online"; count = online_count as u64);
+
+    // Update scheduler's round-robin to distribute across all online CPUs
+    if online_count > 1 {
+        crate::kernel::task::with_scheduler(|sched| {
+            sched.set_num_cpus(online_count);
+        });
+    }
 }
 
 /// Get number of online CPUs

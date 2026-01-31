@@ -262,9 +262,9 @@ fn user_task_trampoline() -> ! {
             task.kernel_stack + task.kernel_stack_size as u64
         );
 
-        // Set globals for exception handler
-        super::CURRENT_TRAP_FRAME.store(trap_frame, core::sync::atomic::Ordering::Release);
-        super::CURRENT_TTBR0.store(ttbr0, core::sync::atomic::Ordering::Release);
+        // Set per-CPU data for exception handler
+        crate::kernel::percpu::set_trap_frame(trap_frame);
+        crate::kernel::percpu::set_ttbr0(ttbr0);
 
         (trap_frame as *const TrapFrame, ttbr0, kstack_top)
         // sched guard dropped here - lock released
@@ -339,9 +339,9 @@ impl Task {
     ///
     /// # Safety
     /// Must only be called once, during scheduler initialization.
-    pub unsafe fn new_idle(id: TaskId, entry: fn() -> !) -> Self {
-        // Use static stack from idle module
-        let stack_top = crate::kernel::idle::idle_stack_top();
+    pub unsafe fn new_idle(id: TaskId, entry: fn() -> !, cpu: u32) -> Self {
+        // Use per-CPU static stack from idle module
+        let stack_top = crate::kernel::idle::idle_stack_top_for_cpu(cpu);
 
         let mut context = CpuContext::new();
         context.sp = stack_top as u64;
@@ -1054,12 +1054,12 @@ enter_usermode_asm:
 1:
     msr     ttbr0_el1, x9
     isb
-    tlbi    vmalle1
-    dsb     sy
+    tlbi    vmalle1is
+    dsb     ish
     isb
     // CRITICAL: Invalidate I-cache - different processes use same VA with different PA
     ic      ialluis         // Invalidate all I-caches in inner shareable domain
-    dsb     sy
+    dsb     ish
     isb
 
     // Set SP to task's kernel stack top BEFORE eret.

@@ -171,7 +171,8 @@ pub struct ProcessInfo {
     pub ppid: u32,
     pub state: u8,
     pub liveness_status: u8,
-    pub _pad: [u8; 2],
+    pub cpu: u8,
+    pub _pad: u8,
     pub activity_age_ms: u32,
     pub name: [u8; 16],
 }
@@ -183,7 +184,8 @@ impl ProcessInfo {
             ppid: 0,
             state: 0,
             liveness_status: 0,
-            _pad: [0; 2],
+            cpu: 0xFF,
+            _pad: 0,
             activity_age_ms: 0,
             name: [0; 16],
         }

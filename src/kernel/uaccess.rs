@@ -34,7 +34,6 @@
 
 use crate::arch::aarch64::mmu::{self, flags, PAGE_SIZE};
 use crate::arch::aarch64::mmio::cache_clean_range;
-use super::task;
 
 /// Maximum valid user space address (48-bit, upper half is kernel)
 pub const USER_SPACE_END: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -524,11 +523,11 @@ pub fn user_virt_to_phys_debug(ttbr0: u64, virt_addr: u64) -> u64 {
 
 /// Get the current task's TTBR0 (user page table root)
 ///
-/// Reads from global CURRENT_TTBR0 instead of acquiring the scheduler lock.
+/// Reads from per-CPU TTBR0 instead of acquiring the scheduler lock.
 /// This avoids deadlock when called from code that already holds the lock
 /// (e.g., sys_ps_info which holds the lock while calling copy_to_user).
 fn get_current_ttbr0() -> Result<u64, UAccessError> {
-    let ttbr0 = task::CURRENT_TTBR0.load(core::sync::atomic::Ordering::Acquire);
+    let ttbr0 = crate::kernel::percpu::get_ttbr0();
     if ttbr0 == 0 {
         // Kernel task or not initialized - no user address space
         Err(UAccessError::NotMapped)

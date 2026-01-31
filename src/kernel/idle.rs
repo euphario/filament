@@ -1,7 +1,6 @@
 //! Idle Task
 //!
-//! The idle task is a kernel task that runs when no other task is ready.
-//! It sits in slot 0 of the scheduler and is always runnable.
+//! Each CPU has its own idle task in a reserved scheduler slot (slot N = CPU N).
 //!
 //! # Design
 //!
@@ -9,6 +8,7 @@
 //! - **Lowest Priority**: Uses Priority::Low (or conceptual Priority::Idle)
 //! - **WFI Loop**: Enters low-power wait state until next interrupt
 //! - **Real Task**: Has proper kernel context for context switching
+//! - **Per-CPU**: Each CPU has its own idle task and stack
 //!
 //! # Why a Real Idle Task?
 //!
@@ -75,16 +75,29 @@ impl IdleStack {
     }
 }
 
-/// Global idle stack - statically allocated
-pub static mut IDLE_STACK: IdleStack = IdleStack::new();
+use super::percpu::MAX_CPUS;
 
-/// Get the idle stack top
+/// Per-CPU idle stacks - statically allocated
+static mut IDLE_STACKS: [IdleStack; MAX_CPUS] = [
+    IdleStack::new(),
+    IdleStack::new(),
+    IdleStack::new(),
+    IdleStack::new(),
+];
+
+/// Get the idle stack top for a given CPU
+/// # Safety
+/// Must only be called during scheduler initialization
+pub unsafe fn idle_stack_top_for_cpu(cpu: u32) -> *mut u8 {
+    let stacks_ptr = core::ptr::addr_of_mut!(IDLE_STACKS);
+    (*stacks_ptr)[cpu as usize].data.as_mut_ptr().add(4096)
+}
+
+/// Get the idle stack top for CPU 0 (backward compat)
 /// # Safety
 /// Must only be called during scheduler initialization
 pub unsafe fn idle_stack_top() -> *mut u8 {
-    // Use addr_of_mut! to avoid creating a reference to mutable static
-    let stack_ptr = core::ptr::addr_of_mut!(IDLE_STACK);
-    (*stack_ptr).data.as_mut_ptr().add(4096)
+    idle_stack_top_for_cpu(0)
 }
 
 #[cfg(test)]
@@ -94,7 +107,7 @@ mod tests {
     #[test]
     fn test_idle_stack_alignment() {
         unsafe {
-            let top = IDLE_STACK.top();
+            let top = idle_stack_top_for_cpu(0);
             assert_eq!(top as usize % 16, 0, "Stack must be 16-byte aligned");
         }
     }

@@ -8,19 +8,15 @@
 //! The `SchedulingPolicy` trait defines the interface for task selection.
 //! Implementations provide different scheduling strategies:
 //!
-//! - `PriorityRoundRobin` - Current default: priority levels with round-robin
-//! - Future: `PerCpuQueues` - SMP-aware with per-CPU run queues
-//! - Future: `RealtimePolicy` - Hard real-time guarantees
+//! - `PerCpuQueues` - Default: SMP-aware with per-CPU ready bitsets and work stealing
 //!
-//! # SMP Considerations
+//! # SMP Design
 //!
-//! For future SMP support, policies can:
-//! - Track per-CPU ready queues
-//! - Implement work stealing
-//! - Respect CPU affinity/pinning
-//! - Isolate high-performance tasks to dedicated CPUs
+//! Each task is assigned to a CPU. The scheduler first checks the local
+//! CPU's ready bitset, then steals from other CPUs if empty.
 
 use super::{Task, TaskState, Priority, MAX_TASKS};
+use crate::kernel::percpu;
 
 /// Scheduling policy trait
 ///
@@ -70,117 +66,232 @@ pub trait SchedulingPolicy {
     #[inline]
     fn on_task_exit(&mut self, _slot: usize) {}
 
+    /// Assign a task to a specific CPU
+    ///
+    /// Used for initial task placement. Default does nothing.
+    #[inline]
+    fn assign_task_to_cpu(&mut self, _slot: usize, _cpu: u32) {}
+
+    /// Assign a task to the next CPU via round-robin
+    ///
+    /// Called at spawn time to distribute tasks across CPUs.
+    /// Default does nothing.
+    #[inline]
+    fn assign_task_round_robin(&mut self, _slot: usize) {}
+
+    /// Get which CPU a task is assigned to
+    ///
+    /// Returns `None` if the task is unassigned. Default returns None.
+    #[inline]
+    fn task_cpu(&self, _slot: usize) -> Option<u32> { None }
+
     /// Get the name of this policy (for debugging/logging)
     fn name(&self) -> &'static str;
 }
 
 // ============================================================================
-// Priority Round-Robin Policy
+// Per-CPU Queues (SMP-aware)
 // ============================================================================
 
-/// Priority-based round-robin scheduling
+/// Unassigned CPU sentinel
+const UNASSIGNED: u8 = 0xFF;
+
+/// Per-CPU queue scheduling with work stealing
 ///
-/// This is the default scheduler policy:
-/// - Higher priority tasks (lower Priority value) always run first
-/// - Among same-priority tasks, uses round-robin for fairness
-/// - Scans task array starting from current+1 for round-robin behavior
+/// Each CPU has a ready bitset tracking which task slots are ready on it.
+/// Tasks are assigned to CPUs at spawn time (round-robin).
+/// When a CPU's queue is empty, it steals from other CPUs.
+///
+/// # Data Structures
+/// - `ready[cpu]`: u32 bitset — bit N set = task in slot N is ready on this CPU
+/// - `cpu_assign[slot]`: which CPU owns this task (0xFF = unassigned)
 ///
 /// # Complexity
-/// - `select_next`: O(n) where n = MAX_TASKS
-/// - Could be optimized with per-priority ready queues if needed
-pub struct PriorityRoundRobin {
-    /// Slot 0 is reserved for idle task - skip it in normal scheduling
-    idle_slot: usize,
+/// - `select_next` with local work: O(1) via `trailing_zeros`
+/// - `select_next` with stealing: O(MAX_CPUS) in worst case
+pub struct PerCpuQueues {
+    /// Per-CPU ready bitsets. Bit N = task slot N is ready on this CPU.
+    ready: [u32; percpu::MAX_CPUS],
+    /// Which CPU each task is assigned to (UNASSIGNED = not assigned)
+    cpu_assign: [u8; MAX_TASKS],
+    /// Round-robin counter for task placement
+    next_cpu: u8,
+    /// Number of CPUs to distribute across
+    num_cpus: u8,
 }
 
-impl PriorityRoundRobin {
+impl PerCpuQueues {
     pub const fn new() -> Self {
-        Self { idle_slot: 0 }
+        Self {
+            ready: [0; percpu::MAX_CPUS],
+            cpu_assign: [UNASSIGNED; MAX_TASKS],
+            next_cpu: 0,
+            num_cpus: 1,
+        }
     }
-}
 
-impl SchedulingPolicy for PriorityRoundRobin {
-    fn select_next(&mut self, current_slot: usize, tasks: &[Option<Task>; MAX_TASKS]) -> Option<usize> {
+    /// Update the number of CPUs for round-robin distribution.
+    /// Called after secondary CPUs come online.
+    pub fn set_num_cpus(&mut self, n: u8) {
+        if n > 0 && (n as usize) <= percpu::MAX_CPUS {
+            self.num_cpus = n;
+        }
+    }
+
+    /// Rebuild ready bitsets from task array state.
+    ///
+    /// Called from `select_next` to keep bitsets in sync with actual task state,
+    /// since not all state transitions go through the policy callbacks yet.
+    fn sync_ready(&mut self, tasks: &[Option<Task>; MAX_TASKS]) {
+        // Clear all bitsets
+        for r in self.ready.iter_mut() {
+            *r = 0;
+        }
+
+        for slot in percpu::MAX_CPUS..MAX_TASKS {
+            if let Some(ref task) = tasks[slot] {
+                // Auto-assign unassigned tasks round-robin
+                if self.cpu_assign[slot] == UNASSIGNED {
+                    self.cpu_assign[slot] = self.next_cpu;
+                    self.next_cpu = (self.next_cpu + 1) % self.num_cpus;
+                }
+
+                if *task.state() == TaskState::Ready {
+                    let cpu = self.cpu_assign[slot] as usize;
+                    if cpu < percpu::MAX_CPUS {
+                        self.ready[cpu] |= 1 << slot;
+                    }
+                }
+            } else {
+                // Slot empty — clear assignment
+                self.cpu_assign[slot] = UNASSIGNED;
+            }
+        }
+    }
+
+    /// Find highest-priority ready task from a bitset
+    fn best_from_bitset(&self, bitset: u32, tasks: &[Option<Task>; MAX_TASKS]) -> Option<usize> {
         let mut best_slot: Option<usize> = None;
         let mut best_priority = Priority::Low;
+        let mut bits = bitset;
 
-        // Scan from current+1 for round-robin fairness
-        let start = (current_slot + 1) % MAX_TASKS;
-        for i in 0..MAX_TASKS {
-            let slot = (start + i) % MAX_TASKS;
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as usize;
+            bits &= bits - 1; // Clear lowest set bit
 
-            // Skip idle slot in first pass (use it as fallback)
-            if slot == self.idle_slot {
-                continue;
-            }
-
-            if let Some(ref task) = tasks[slot] {
-                if *task.state() == TaskState::Ready {
-                    // Lower priority value = higher priority
-                    if best_slot.is_none() || task.priority < best_priority {
-                        best_slot = Some(slot);
-                        best_priority = task.priority;
-
-                        // Early exit for highest priority
-                        if best_priority == Priority::High {
-                            break;
+            if slot < MAX_TASKS {
+                if let Some(ref task) = tasks[slot] {
+                    if *task.state() == TaskState::Ready {
+                        if best_slot.is_none() || task.priority < best_priority {
+                            best_slot = Some(slot);
+                            best_priority = task.priority;
+                            if best_priority == Priority::High {
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
 
-        // If we found a ready task, return it
-        if best_slot.is_some() {
-            return best_slot;
-        }
-
-        // Check if current task is still runnable (it might be Running, not Ready)
-        if let Some(ref task) = tasks[current_slot] {
-            if task.is_runnable() {
-                // Log if pid=2 (devd) is being returned as current
-                if task.id == 2 {
-                    crate::kdebug!("sched", "select_current"; slot = current_slot, pid = 2, state = task.state().name());
-                }
-                return Some(current_slot);
-            }
-        }
-
-        // Fall back to idle task if nothing else
-        if let Some(ref task) = tasks[self.idle_slot] {
-            if task.is_runnable() {
-                crate::kdebug!("sched", "select_idle"; from = current_slot);
-                return Some(self.idle_slot);
-            }
-        }
-
-        crate::kerror!("sched", "select_none"; from = current_slot);
-        None
-    }
-
-    fn name(&self) -> &'static str {
-        "PriorityRoundRobin"
+        best_slot
     }
 }
 
-// ============================================================================
-// Future: Per-CPU Queues (SMP-aware)
-// ============================================================================
+impl SchedulingPolicy for PerCpuQueues {
+    fn select_next(&mut self, current_slot: usize, tasks: &[Option<Task>; MAX_TASKS]) -> Option<usize> {
+        let my_cpu = percpu::cpu_id() as usize;
+        let my_idle = my_cpu;
 
-// /// Per-CPU queue scheduling for SMP systems
-// ///
-// /// Each CPU has its own ready queue, reducing lock contention.
-// /// Work stealing allows idle CPUs to take tasks from busy ones.
-// ///
-// /// # Features (TODO)
-// /// - Per-CPU ready queues
-// /// - Work stealing with configurable threshold
-// /// - CPU affinity support
-// /// - High-performance (HP) task isolation
-// pub struct PerCpuQueues {
-//     // queues: [ReadyQueue; MAX_CPUS],
-//     // affinity: [CpuMask; MAX_TASKS],
-// }
+        // Rebuild bitsets from actual task state
+        self.sync_ready(tasks);
+
+        // 1. Check local CPU's ready queue
+        if let Some(slot) = self.best_from_bitset(self.ready[my_cpu], tasks) {
+            return Some(slot);
+        }
+
+        // 2. Check if current task is still runnable (not idle)
+        if current_slot >= percpu::MAX_CPUS {
+            if let Some(ref task) = tasks[current_slot] {
+                if task.is_runnable() {
+                    return Some(current_slot);
+                }
+            }
+        }
+
+        // 3. Work stealing — try other CPUs' queues (round-robin victim selection)
+        // Note: we run the task but don't reassign cpu_assign — the task returns
+        // to its home CPU on the next scheduling round via sync_ready().
+        for offset in 1..percpu::MAX_CPUS {
+            let victim = (my_cpu + offset) % percpu::MAX_CPUS;
+            if let Some(slot) = self.best_from_bitset(self.ready[victim], tasks) {
+                return Some(slot);
+            }
+        }
+
+        // 4. Fall back to this CPU's idle task
+        if let Some(ref task) = tasks[my_idle] {
+            if task.is_runnable() {
+                return Some(my_idle);
+            }
+        }
+
+        None
+    }
+
+    fn on_task_ready(&mut self, slot: usize, _priority: Priority) {
+        if slot < MAX_TASKS {
+            let cpu = self.cpu_assign[slot];
+            if cpu != UNASSIGNED && (cpu as usize) < percpu::MAX_CPUS {
+                self.ready[cpu as usize] |= 1 << slot;
+            }
+        }
+    }
+
+    fn on_task_blocked(&mut self, slot: usize) {
+        if slot < MAX_TASKS {
+            // Clear from all CPU bitsets
+            for r in self.ready.iter_mut() {
+                *r &= !(1 << slot);
+            }
+        }
+    }
+
+    fn on_task_exit(&mut self, slot: usize) {
+        if slot < MAX_TASKS {
+            for r in self.ready.iter_mut() {
+                *r &= !(1 << slot);
+            }
+            self.cpu_assign[slot] = UNASSIGNED;
+        }
+    }
+
+    fn assign_task_to_cpu(&mut self, slot: usize, cpu: u32) {
+        if slot < MAX_TASKS && (cpu as usize) < percpu::MAX_CPUS {
+            self.cpu_assign[slot] = cpu as u8;
+        }
+    }
+
+    fn assign_task_round_robin(&mut self, slot: usize) {
+        if slot < MAX_TASKS {
+            self.cpu_assign[slot] = self.next_cpu;
+            self.next_cpu = (self.next_cpu + 1) % self.num_cpus;
+        }
+    }
+
+    fn task_cpu(&self, slot: usize) -> Option<u32> {
+        if slot < MAX_TASKS && self.cpu_assign[slot] != UNASSIGNED {
+            Some(self.cpu_assign[slot] as u32)
+        } else {
+            None
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "PerCpuQueues"
+    }
+}
 
 // ============================================================================
 // Tests

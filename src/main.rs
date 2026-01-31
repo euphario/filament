@@ -316,6 +316,9 @@ pub extern "C" fn kmain() -> ! {
     };
 
     if let Some(slot) = slot1 {
+        // Start secondary CPUs now that scheduler is ready with idle tasks
+        smp::start_secondary_cpus();
+
         // Flush all logs before entering userspace
         kinfo!("kernel", "entering_userspace"; slot = slot);
         klog::flush();
@@ -376,6 +379,15 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
     // Check for spurious interrupt
     if irq >= plat::irq::SPURIOUS_THRESHOLD {
         return; // Spurious, ignore
+    }
+
+    // Handle SGI 0 (reschedule IPI from another CPU)
+    if irq < 16 {
+        // SGI - just set need_resched, EOI, and return
+        // The actual reschedule happens at IRQ exit via do_resched_if_needed
+        sync::cpu_flags().set_need_resched();
+        gic::eoi(irq);
+        return;
     }
 
     // Handle timer interrupt (PPI 30)
@@ -483,15 +495,15 @@ pub extern "C" fn ttbr0_zero_diagnostic(caller_id: u64) {
     print_hex_uart(hw_ttbr0);
     print_str_uart("\r\n");
 
-    // Read CURRENT_TTBR0 atomic
-    let atomic_val = kernel::task::CURRENT_TTBR0.load(core::sync::atomic::Ordering::SeqCst);
-    print_str_uart("  Atomic CURRENT_TTBR0: ");
+    // Read per-CPU TTBR0
+    let atomic_val = kernel::percpu::get_ttbr0();
+    print_str_uart("  Per-CPU TTBR0: ");
     print_hex_uart(atomic_val);
     print_str_uart("\r\n");
 
-    // Read CURRENT_TRAP_FRAME
-    let trap_ptr = kernel::task::CURRENT_TRAP_FRAME.load(core::sync::atomic::Ordering::SeqCst);
-    print_str_uart("  CURRENT_TRAP_FRAME: ");
+    // Read per-CPU TRAP_FRAME
+    let trap_ptr = kernel::percpu::get_trap_frame();
+    print_str_uart("  Per-CPU TRAP_FRAME: ");
     print_hex_uart(trap_ptr as u64);
     print_str_uart("\r\n");
 
@@ -501,9 +513,9 @@ pub extern "C" fn ttbr0_zero_diagnostic(caller_id: u64) {
     print_hex_uart(slot as u64);
     print_str_uart("\r\n");
 
-    // Read SYSCALL_SWITCHED_TASK
-    let switched = kernel::task::SYSCALL_SWITCHED_TASK.load(core::sync::atomic::Ordering::SeqCst);
-    print_str_uart("  SYSCALL_SWITCHED_TASK: ");
+    // Read per-CPU SYSCALL_SWITCHED
+    let switched = kernel::percpu::get_syscall_switched();
+    print_str_uart("  SYSCALL_SWITCHED: ");
     print_hex_uart(switched);
     print_str_uart("\r\n");
 
@@ -539,10 +551,10 @@ pub extern "C" fn ttbr0_zero_diagnostic(caller_id: u64) {
         print_str_uart("  Cannot acquire scheduler lock (held by another context)\r\n");
     }
 
-    // Read address of CURRENT_TTBR0 symbol itself for sanity check
-    let addr = &kernel::task::CURRENT_TTBR0 as *const _ as u64;
-    print_str_uart("  &CURRENT_TTBR0: ");
-    print_hex_uart(addr);
+    // Print CPU ID for SMP debugging
+    let cpu = kernel::percpu::cpu_id();
+    print_str_uart("  CPU ID: ");
+    print_hex_uart(cpu as u64);
     print_str_uart("\r\n");
 
     print_str_uart("=== HALTING ===\r\n");
@@ -724,8 +736,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_str_uart("  Killing all tasks...\r\n");
         unsafe {
             let mut sched = kernel::task::scheduler();
-            // Start from slot 1 - slot 0 is the idle task which must never be killed
-            for slot_idx in 1..kernel::task::MAX_TASKS {
+            // Skip idle slots (0..MAX_CPUS) - idle tasks must never be killed
+            for slot_idx in kernel::percpu::MAX_CPUS..kernel::task::MAX_TASKS {
                 if let Some(task) = sched.task(slot_idx) {
                     let pid = task.id;
                     print_str_uart("  slot[");
@@ -788,9 +800,9 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                         // Update globals directly (can't call update_current_task_globals
                         // here because we already hold the scheduler lock)
                         let trap_ptr = &mut task.trap_frame as *mut kernel::task::TrapFrame;
-                        kernel::task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                        kernel::percpu::set_trap_frame(trap_ptr);
                         if let Some(ref addr_space) = task.address_space {
-                            kernel::task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                            kernel::percpu::set_ttbr0(addr_space.get_ttbr0());
                         }
                     }
                 }
@@ -884,12 +896,13 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
 
         // Schedule next task
         if let Some(next_slot) = sched.schedule() {
-            // Idle task (slot 0) is a kernel task - can't eret to it
+            // Idle task is a kernel task - can't eret to it
             // Instead, enter the idle loop directly
-            if next_slot == 0 {
+            let my_idle = kernel::percpu::cpu_id() as usize;
+            if kernel::sched::is_idle_slot(next_slot) {
                 print_str_uart("  Next task is idle, entering idle loop...\r\n");
-                kernel::task::set_current_slot(0);
-                if let Some(task) = sched.task_mut(0) {
+                kernel::task::set_current_slot(my_idle);
+                if let Some(task) = sched.task_mut(my_idle) {
                     let _ = task.set_running();
                 }
                 // Drop scheduler lock before entering idle (idle_entry never
@@ -909,8 +922,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
 
             if needs_context_switch {
                 print_str_uart("  Next task needs context_switch, entering idle...\r\n");
-                kernel::task::set_current_slot(0);
-                if let Some(task) = sched.task_mut(0) {
+                kernel::task::set_current_slot(my_idle);
+                if let Some(task) = sched.task_mut(my_idle) {
                     let _ = task.set_running();
                 }
                 // Drop scheduler lock before entering idle (idle_entry never
@@ -929,12 +942,10 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
             kernel::task::set_current_slot(next_slot);
             if let Some(task) = sched.task_mut(next_slot) {
                 let _ = task.set_running();
-                // Update globals directly (can't call update_current_task_globals
-                // here because we already hold the scheduler lock)
                 let trap_ptr = &mut task.trap_frame as *mut kernel::task::TrapFrame;
-                kernel::task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                kernel::percpu::set_trap_frame(trap_ptr);
                 if let Some(ref addr_space) = task.address_space {
-                    kernel::task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                    kernel::percpu::set_ttbr0(addr_space.get_ttbr0());
                 }
             }
             // Return to assembly which will eret to next task

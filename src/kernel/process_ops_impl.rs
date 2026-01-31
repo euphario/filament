@@ -54,22 +54,22 @@ impl ProcessOps for KernelProcessOps {
                 kinfo!("process_ops", "exit_scheduled"; next = next_slot);
 
                 // Update scheduler state - actual TTBR0 switch happens in assembly
-                // at exception return (assembly loads CURRENT_TTBR0 and switches)
+                // at exception return (assembly loads per-CPU TTBR0 and switches)
                 task::set_current_slot(next_slot);
                 if let Some(next) = sched.task_mut(next_slot) {
                     crate::transition_or_evict!(next, set_running);
-                    // Update globals directly (can't call update_current_task_globals
+                    // Update per-CPU data directly (can't call update_current_task_globals
                     // here because we already hold the scheduler lock)
                     let trap_ptr = &mut next.trap_frame as *mut task::TrapFrame;
-                    task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                    crate::kernel::percpu::set_trap_frame(trap_ptr);
                     if let Some(ref addr_space) = next.address_space {
-                        task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                        crate::kernel::percpu::set_ttbr0(addr_space.get_ttbr0());
                     }
                 }
                 // Only set flag for user tasks (not idle) - this tells IRQ handler
                 // to use user return path instead of kernel return path
-                if next_slot != crate::kernel::sched::IDLE_SLOT {
-                    task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+                if !crate::kernel::sched::is_idle_slot(next_slot) {
+                    crate::kernel::percpu::set_syscall_switched(1);
                 }
 
                 // Return to the new task
@@ -102,22 +102,22 @@ impl ProcessOps for KernelProcessOps {
                     if target == killer {
                         if let Some(next_slot) = sched.schedule() {
                             // Update scheduler state - actual TTBR0 switch happens in assembly
-                            // at exception return (assembly loads CURRENT_TTBR0 and switches)
+                            // at exception return (assembly loads per-CPU TTBR0 and switches)
                             task::set_current_slot(next_slot);
                             if let Some(next) = sched.task_mut(next_slot) {
                                 crate::transition_or_evict!(next, set_running);
-                                // Update globals directly (can't call update_current_task_globals
+                                // Update per-CPU data directly (can't call update_current_task_globals
                                 // here because we already hold the scheduler lock)
                                 let trap_ptr = &mut next.trap_frame as *mut task::TrapFrame;
-                                task::CURRENT_TRAP_FRAME.store(trap_ptr, core::sync::atomic::Ordering::Release);
+                                crate::kernel::percpu::set_trap_frame(trap_ptr);
                                 if let Some(ref addr_space) = next.address_space {
-                                    task::CURRENT_TTBR0.store(addr_space.get_ttbr0(), core::sync::atomic::Ordering::Release);
+                                    crate::kernel::percpu::set_ttbr0(addr_space.get_ttbr0());
                                 }
                             }
                             // Only set flag for user tasks (not idle) - this tells IRQ handler
                             // to use user return path instead of kernel return path
-                            if next_slot != crate::kernel::sched::IDLE_SLOT {
-                                task::SYSCALL_SWITCHED_TASK.store(1, core::sync::atomic::Ordering::Release);
+                            if !crate::kernel::sched::is_idle_slot(next_slot) {
+                                crate::kernel::percpu::set_syscall_switched(1);
                             }
                         }
                     }
