@@ -377,8 +377,9 @@ fn send_ping(channel_id: u32, _target_pid: u32) -> bool {
 
     // Send directly to the channel (bypass ownership for kernel liveness probe)
     match super::ipc::send_direct(channel_id, ping) {
-        Ok(wake_list) => {
-            // Wake subscribers
+        Ok(peer) => {
+            let wake_list = super::object_service::object_service()
+                .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
             waker::wake(&wake_list, WakeReason::Readable);
             true
         }
@@ -390,12 +391,13 @@ fn send_ping(channel_id: u32, _target_pid: u32) -> bool {
 fn close_channel_for_liveness(channel_id: u32) {
     // Close channel without ownership check (kernel recovery action)
     match super::ipc::close_unchecked(channel_id) {
-        Ok(wake_list) => {
-            // Wake all subscribers
+        Ok(Some(peer)) => {
+            let wake_list = super::object_service::object_service()
+                .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
             waker::wake(&wake_list, WakeReason::Closed);
         }
-        Err(_) => {
-            // Channel may already be closed
+        Ok(None) | Err(_) => {
+            // Channel may already be closed or had no peer
         }
     }
 }
@@ -439,7 +441,9 @@ pub fn handle_ping_message(msg: &Message, receiver_channel: u32) -> bool {
         // Send pong back (to peer channel)
         if let Some(peer_id) = super::ipc::get_peer_id(receiver_channel) {
             // Send directly to peer
-            if let Ok(wake_list) = super::ipc::send_direct(peer_id, pong) {
+            if let Ok(peer) = super::ipc::send_direct(peer_id, pong) {
+                let wake_list = super::object_service::object_service()
+                    .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
                 waker::wake(&wake_list, WakeReason::Readable);
             }
         }

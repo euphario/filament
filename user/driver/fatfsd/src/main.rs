@@ -31,7 +31,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall::{self, LogLevel};
+use userlib::syscall;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
@@ -40,59 +40,10 @@ use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, SideEntry, io_status, side_msg, side_status};
 use userlib::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
 use userlib::devd::PortType;
+use userlib::{uinfo, uerror};
 
-// =============================================================================
-// Constants
-// =============================================================================
-
-const MAX_OPEN_FILES: usize = 8;
-const FAT_CACHE_ENTRIES: usize = 4096;
-
-// =============================================================================
-// Logging
-// =============================================================================
-
-macro_rules! flog {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[fatfsd] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Info, &buf[..pos]);
-    }};
-}
-
-macro_rules! ferror {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[fatfsd] ERROR: ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Error, &buf[..pos]);
-    }};
-}
+const FAT_CACHE_ENTRIES: usize = 8192;
+const MAX_OPEN_FILES: usize = 16;
 
 // =============================================================================
 // Open file tracking
@@ -201,8 +152,8 @@ impl FatfsDriver {
 
         port.notify();
 
-        // Poll for completion
-        for _ in 0..1000 {
+        // Wait for completion (kernel-backed wait, yields to scheduler)
+        for _ in 0..100 {
             if let Some(cqe) = port.poll_completion() {
                 if cqe.tag == tag {
                     if cqe.status == io_status::OK as u16 {
@@ -214,7 +165,7 @@ impl FatfsDriver {
                     return false;
                 }
             }
-            syscall::sleep_us(1000);
+            port.wait(10);
         }
         false
     }
@@ -230,7 +181,7 @@ impl FatfsDriver {
 
         // Check for valid jump instruction
         if sector[0] != 0xEB && sector[0] != 0xE9 {
-            ferror!("invalid BPB: bad jump byte {:#04x}", sector[0]);
+            uerror!("fatfsd", "invalid_bpb_jump"; byte = sector[0] as u32);
             return false;
         }
 
@@ -248,12 +199,12 @@ impl FatfsDriver {
 
         // Validate FAT16
         if self.bytes_per_sector == 0 || self.sectors_per_cluster == 0 || self.num_fats == 0 {
-            ferror!("invalid BPB: zero fields");
+            uerror!("fatfsd", "invalid_bpb_zero";);
             return false;
         }
 
         if self.fat_size_sectors == 0 {
-            ferror!("invalid BPB: FAT32 (fat_size_16=0)");
+            uerror!("fatfsd", "invalid_bpb_fat32";);
             return false;
         }
 
@@ -268,13 +219,15 @@ impl FatfsDriver {
         let data_sectors = self.total_sectors.saturating_sub(self.data_start_lba);
         let cluster_count = data_sectors / self.sectors_per_cluster as u32;
         if cluster_count < 4085 || cluster_count >= 65525 {
-            ferror!("not FAT16: {} clusters", cluster_count);
+            uerror!("fatfsd", "not_fat16"; clusters = cluster_count);
             return false;
         }
 
-        flog!("FAT16: {}B/sec, {} sec/clust, {} root entries, {} clusters",
-            self.bytes_per_sector, self.sectors_per_cluster,
-            self.root_entry_count, cluster_count);
+        uinfo!("fatfsd", "fat16_parsed";
+            bps = self.bytes_per_sector as u32,
+            spc = self.sectors_per_cluster as u32,
+            root_entries = self.root_entry_count as u32,
+            clusters = cluster_count);
 
         true
     }
@@ -295,7 +248,7 @@ impl FatfsDriver {
 
             let lba = self.fat_start_lba as u64 + sector_offset as u64;
             if !self.read_block(lba, &mut sector_buf[..self.bytes_per_sector as usize], ctx) {
-                ferror!("failed to read FAT sector {}", sector_offset);
+                uerror!("fatfsd", "fat_read_failed"; sector = sector_offset);
                 return false;
             }
 
@@ -312,7 +265,7 @@ impl FatfsDriver {
         }
 
         self.fat_cache_valid = true;
-        flog!("FAT cached: {} entries", cached);
+        uinfo!("fatfsd", "fat_cached"; entries = cached as u32);
         true
     }
 
@@ -907,18 +860,17 @@ impl FatfsDriver {
                 // Read BPB (sector 0)
                 let mut bpb_buf = [0u8; 512];
                 if !self.read_block(0, &mut bpb_buf, ctx) {
-                    ferror!("failed to read BPB");
+                    uerror!("fatfsd", "bpb_read_failed";);
                     return false;
                 }
 
                 if !self.parse_bpb(&bpb_buf) {
-                    ferror!("invalid FAT16 filesystem");
+                    uerror!("fatfsd", "invalid_fat16";);
                     return false;
                 }
-
                 // Cache FAT
                 if !self.cache_fat(ctx) {
-                    ferror!("failed to cache FAT");
+                    uerror!("fatfsd", "fat_cache_failed";);
                     return false;
                 }
 
@@ -936,11 +888,23 @@ impl FatfsDriver {
                             let vfs_shmem_id = port.shmem_id();
                             self.vfs_port = Some(port_id);
 
-                            // Mount at /mnt/nvme
+                            // Derive mount name from partition port name
+                            // e.g., "part0:" → "mnt/part0:"
                             let mut pname = [0u8; 32];
-                            let mount_name = b"mnt/nvme:";
-                            pname[..mount_name.len()].copy_from_slice(mount_name);
-                            let pname_len = mount_name.len();
+                            let pname_len = {
+                                let prefix = b"mnt/";
+                                let mut pos = prefix.len();
+                                pname[..pos].copy_from_slice(prefix);
+                                let copy_len = source_name.len().min(32 - pos);
+                                pname[pos..pos + copy_len].copy_from_slice(&source_name[..copy_len]);
+                                pos += copy_len;
+                                // Ensure name ends with ':'
+                                if pos > 0 && pname[pos - 1] != b':' && pos < 32 {
+                                    pname[pos] = b':';
+                                    pos += 1;
+                                }
+                                pos
+                            };
 
                             self.port_name[..pname_len].copy_from_slice(&pname[..pname_len]);
                             self.port_name_len = pname_len;
@@ -953,9 +917,7 @@ impl FatfsDriver {
                                 None,
                             );
 
-                            flog!("VFS port registered: {} shmem_id={}",
-                                core::str::from_utf8(&pname[..pname_len]).unwrap_or("?"),
-                                vfs_shmem_id);
+                            uinfo!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
 
                             // Register mount with vfsd via side-channel
                             self.register_mount_with_vfsd(vfs_shmem_id, &pname[..pname_len], ctx);
@@ -963,12 +925,12 @@ impl FatfsDriver {
                         }
                     }
                     Err(e) => {
-                        ferror!("create VFS DataPort failed: {:?}", e);
+                        uerror!("fatfsd", "vfs_port_create_failed";);
                     }
                 }
             }
             Err(e) => {
-                ferror!("connect to partition failed: {:?}", e);
+                uerror!("fatfsd", "partition_connect_failed";);
             }
         }
         false
@@ -984,7 +946,7 @@ impl FatfsDriver {
         let vfsd_shmem_id = match ctx.discover_port(b"vfs:") {
             Ok(id) => id,
             Err(e) => {
-                ferror!("discover vfs: failed: {:?}", e);
+                uerror!("fatfsd", "discover_vfs_failed";);
                 return;
             }
         };
@@ -993,7 +955,7 @@ impl FatfsDriver {
         let vfsd_port = match ctx.connect_block_port(vfsd_shmem_id) {
             Ok(id) => id,
             Err(e) => {
-                ferror!("connect to vfsd failed: {:?}", e);
+                uerror!("fatfsd", "vfsd_connect_failed";);
                 return;
             }
         };
@@ -1019,10 +981,9 @@ impl FatfsDriver {
         if let Some(port) = ctx.block_port(vfsd_port) {
             if port.side_send(&entry) {
                 port.notify();
-                flog!("REGISTER_MOUNT sent to vfsd: {} shmem={}",
-                    core::str::from_utf8(clean_name).unwrap_or("?"), vfs_shmem_id);
+                uinfo!("fatfsd", "mount_registered"; shmem_id = vfs_shmem_id);
             } else {
-                ferror!("side_send REGISTER_MOUNT failed");
+                uerror!("fatfsd", "mount_send_failed";);
             }
         }
     }
@@ -1060,24 +1021,29 @@ impl FatfsDriver {
 impl Driver for FatfsDriver {
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         // Use spawn context to discover which partition we were spawned for
-        if let Ok(spawn_ctx) = ctx.spawn_context() {
-            let port_name = spawn_ctx.port_name();
-            flog!("spawn context: {}", core::str::from_utf8(port_name).unwrap_or("?"));
+        match ctx.spawn_context() {
+            Ok(spawn_ctx) => {
+                let port_name = spawn_ctx.port_name();
 
-            // Copy port name before borrowing ctx again
-            let mut name_buf = [0u8; 64];
-            let name_len = port_name.len().min(64);
-            name_buf[..name_len].copy_from_slice(&port_name[..name_len]);
+                // Copy port name before borrowing ctx again
+                let mut name_buf = [0u8; 64];
+                let name_len = port_name.len().min(64);
+                name_buf[..name_len].copy_from_slice(&port_name[..name_len]);
 
-            // Discover partition shmem_id via devd
-            match ctx.discover_port(&name_buf[..name_len]) {
-                Ok(shmem_id) => {
-                    flog!("partition {} shmem_id={}", core::str::from_utf8(&name_buf[..name_len]).unwrap_or("?"), shmem_id);
-                    self.do_init(shmem_id, &name_buf[..name_len], ctx);
+                // Discover partition shmem_id via devd
+                match ctx.discover_port(&name_buf[..name_len]) {
+                    Ok(shmem_id) => {
+                        if !self.do_init(shmem_id, &name_buf[..name_len], ctx) {
+                            uerror!("fatfsd", "init_failed";);
+                        }
+                    }
+                    Err(_) => {
+                        uerror!("fatfsd", "discover_partition_failed";);
+                    }
                 }
-                Err(e) => {
-                    ferror!("discover partition failed: {:?}", e);
-                }
+            }
+            Err(e) => {
+                uerror!("fatfsd", "no_spawn_context";);
             }
         }
         // If no spawn context, wait for ATTACH_DISK command
@@ -1088,7 +1054,7 @@ impl Driver for FatfsDriver {
         match msg.msg_type {
             bus_msg::ATTACH_DISK => {
                 let shmem_id = msg.read_u32(0);
-                flog!("AttachDisk shmem_id={}", shmem_id);
+                uinfo!("fatfsd", "attach_disk"; shmem_id = shmem_id);
 
                 // Extract source name from payload
                 let source_end = (msg.payload_len as usize).min(240);

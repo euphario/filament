@@ -145,9 +145,6 @@ pub const MAX_CHILDREN: usize = 16;
 /// Maximum number of PIDs allowed to send signals to this process
 pub const MAX_SIGNAL_SENDERS: usize = 8;
 
-/// Maximum number of timers per task (BSD kqueue style)
-pub const MAX_TIMERS_PER_TASK: usize = 8;
-
 /// Per-process resource limits (prevent exhaustion attacks)
 pub const MAX_CHANNELS_PER_TASK: u16 = 32;
 pub const MAX_PORTS_PER_TASK: u16 = 4;
@@ -156,32 +153,6 @@ pub const MAX_SHMEM_PER_TASK: u16 = 16;
 /// Number of timer ticks to wait between Phase 1 (notify) and Phase 2 (force cleanup)
 /// At 100 ticks/sec, 10 ticks = 100ms grace period for servers to release resources
 pub const CLEANUP_GRACE_TICKS: u8 = 10;
-
-/// Timer descriptor for unified event system
-/// Supports multiple independent timers per task, including recurring.
-#[derive(Clone, Copy)]
-pub struct TimerDesc {
-    /// Timer ID (1-8 for user timers, 0 reserved for legacy timer_set)
-    pub id: u32,
-    /// Interval in ticks (0 = one-shot, >0 = recurring)
-    pub interval: u64,
-    /// Next deadline tick (0 = inactive)
-    pub deadline: u64,
-}
-
-impl TimerDesc {
-    pub const fn empty() -> Self {
-        Self {
-            id: 0,
-            interval: 0,
-            deadline: 0,
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.deadline != 0
-    }
-}
 
 /// Task Control Block
 ///
@@ -237,8 +208,6 @@ pub struct Task {
     pub(crate) children: [TaskId; MAX_CHILDREN],
     /// Number of children
     pub(crate) num_children: usize,
-    /// Multiple timers per task (BSD kqueue style)
-    pub(crate) timers: [TimerDesc; MAX_TIMERS_PER_TASK],
     /// Capability set for this task
     pub(crate) capabilities: crate::kernel::caps::Capabilities,
     /// Signal allowlist - PIDs allowed to send signals
@@ -350,7 +319,7 @@ impl Task {
             parent_id: 0,
             children: [0; MAX_CHILDREN],
             num_children: 0,
-            timers: [TimerDesc::empty(); MAX_TIMERS_PER_TASK],
+
             capabilities: crate::kernel::caps::Capabilities::ALL,
             signal_allowlist: [0; MAX_SIGNAL_SENDERS],
             signal_allowlist_count: 0,
@@ -401,7 +370,7 @@ impl Task {
             parent_id: 0,
             children: [0; MAX_CHILDREN],
             num_children: 0,
-            timers: [TimerDesc::empty(); MAX_TIMERS_PER_TASK],
+
             capabilities: crate::kernel::caps::Capabilities::NONE,  // No capabilities needed
             signal_allowlist: [0; MAX_SIGNAL_SENDERS],
             signal_allowlist_count: 0,
@@ -471,7 +440,7 @@ impl Task {
             parent_id: 0,
             children: [0; MAX_CHILDREN],
             num_children: 0,
-            timers: [TimerDesc::empty(); MAX_TIMERS_PER_TASK],
+
             capabilities: crate::kernel::caps::Capabilities::DRIVER_DEFAULT,
             signal_allowlist: [0; MAX_SIGNAL_SENDERS],
             signal_allowlist_count: 0,
@@ -1008,15 +977,6 @@ impl Task {
         true
     }
 
-    /// Clear all timers (helper for task exit/kill)
-    ///
-    /// Resets all timer slots to inactive state.
-    pub fn clear_timers(&mut self) {
-        for timer in self.timers.iter_mut() {
-            timer.deadline = 0;
-            timer.interval = 0;
-        }
-    }
 }
 
 impl Drop for Task {

@@ -64,14 +64,14 @@ impl Rule {
 ///
 /// Order matters - first matching rule wins.
 pub static RULES: &[Rule] = &[
-    // xhcid branch disabled — testing pcied → nvmed → partd → fatfsd path only
-    // Rule {
-    //     match_parent_type: None,
-    //     match_port_type: Some(PortType::Usb),
-    //     driver_binary: "xhcid",
-    //     pass_port_name: true,
-    //     caps: userlib::devd::caps::DRIVER,
-    // },
+    // When a USB controller appears (xHCI via PCI), spawn usbd
+    Rule {
+        match_parent_type: None,
+        match_port_type: Some(PortType::Usb),
+        driver_binary: "usbd",
+        pass_port_name: true,
+        caps: userlib::devd::caps::DRIVER,
+    },
     // When a Storage controller appears (NVMe, AHCI), spawn nvmed
     Rule {
         match_parent_type: None,

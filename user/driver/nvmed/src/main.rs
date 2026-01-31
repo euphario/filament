@@ -14,7 +14,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall::{self, LogLevel};
+use userlib::syscall;
 use userlib::mmio::{MmioRegion, DmaPool};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
@@ -23,52 +23,7 @@ use userlib::bus::{
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{io_op, io_status, side_msg};
 use userlib::devd::PortType;
-
-// =============================================================================
-// Logging
-// =============================================================================
-
-macro_rules! nlog {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[nvmed] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &byte in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = byte; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Info, &buf[..pos]);
-    }};
-}
-
-macro_rules! nerror {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[nvmed] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &byte in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = byte; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Error, &buf[..pos]);
-    }};
-}
+use userlib::{uinfo, uerror};
 
 // =============================================================================
 // NVMe Register Definitions (NVMe 1.4 spec)
@@ -433,7 +388,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
     let bar0 = match MmioRegion::open(bar0_addr, bar0_size) {
         Some(m) => m,
         None => {
-            nerror!("bar0 map failed");
+            uerror!("nvmed", "bar0_map_failed";);
             syscall::exit(1);
         }
     };
@@ -442,7 +397,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
     let queue_pool = match DmaPool::alloc(QUEUE_MEM_SIZE) {
         Some(p) => p,
         None => {
-            nerror!("dma alloc failed");
+            uerror!("nvmed", "dma_alloc_failed";);
             syscall::exit(1);
         }
     };
@@ -496,13 +451,13 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
         let csts_val = ctrl.read32(regs::CSTS);
         if (csts_val & csts::RDY) != 0 { rdy = true; break; }
         if (csts_val & csts::CFS) != 0 {
-            nerror!("controller fatal status");
+            uerror!("nvmed", "controller_fatal";);
             syscall::exit(1);
         }
         syscall::sleep_ms(1);
     }
     if !rdy {
-        nerror!("controller enable timeout");
+        uerror!("nvmed", "controller_timeout";);
         syscall::exit(1);
     }
 
@@ -510,7 +465,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
     let id_pool = match DmaPool::alloc(4096) {
         Some(p) => p,
         None => {
-            nerror!("identify buffer alloc failed");
+            uerror!("nvmed", "identify_alloc_failed";);
             syscall::exit(1);
         }
     };
@@ -521,10 +476,10 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
     match ctrl.identify_controller(id_buf_phys) {
         Ok(_) => {
             let id_ctrl = unsafe { &*(id_buf_virt as *const IdentifyController) };
-            nlog!("controller vendor={:#x}", id_ctrl.vid);
+            uinfo!("nvmed", "controller"; vendor = id_ctrl.vid as u32);
         }
         Err(e) => {
-            nerror!("identify_ctrl err={}", e);
+            uerror!("nvmed", "identify_ctrl_err"; status = e as u32);
             syscall::exit(1);
         }
     }
@@ -539,22 +494,22 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
             ctrl.block_size = 1 << lba_ds;
         }
         Err(e) => {
-            nerror!("identify_ns err={}", e);
+            uerror!("nvmed", "identify_ns_err"; status = e as u32);
             syscall::exit(1);
         }
     }
 
     // Create I/O queues
     if let Err(e) = ctrl.create_iocq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 12288) {
-        nerror!("create_iocq err={}", e);
+        uerror!("nvmed", "create_iocq_err"; status = e as u32);
         syscall::exit(1);
     }
     if let Err(e) = ctrl.create_iosq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 8192, 1) {
-        nerror!("create_iosq err={}", e);
+        uerror!("nvmed", "create_iosq_err"; status = e as u32);
         syscall::exit(1);
     }
 
-    nlog!("controller_ready blocks={} bs={}", ctrl.ns_size, ctrl.block_size);
+    uinfo!("nvmed", "controller_ready"; blocks = ctrl.ns_size, block_size = ctrl.block_size);
     ctrl
 }
 
@@ -699,12 +654,12 @@ impl NvmeDriver {
 
 impl Driver for NvmeDriver {
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        nlog!("starting");
+        uinfo!("nvmed", "starting";);
 
         // Get spawn context — the port name and BAR0 metadata from pcied
         // (e.g., "pci/00:02.0:nvme" registered by pcied with BAR0 info)
         let spawn_ctx = ctx.spawn_context().map_err(|e| {
-            nerror!("no spawn context — must be rule-spawned ({:?})", e);
+            uerror!("nvmed", "no_spawn_context";);
             e
         })?;
 
@@ -712,7 +667,7 @@ impl Driver for NvmeDriver {
         // pcied embeds [bar0_phys: u64 LE, bar0_size: u32 LE] = 12 bytes
         let meta = spawn_ctx.metadata();
         if meta.len() < 12 {
-            nerror!("spawn context metadata too short: {} bytes (need 12)", meta.len());
+            uerror!("nvmed", "metadata_too_short"; len = meta.len() as u32);
             return Err(BusError::Internal);
         }
 
@@ -724,7 +679,7 @@ impl Driver for NvmeDriver {
             meta[8], meta[9], meta[10], meta[11],
         ]) as u64;
 
-        nlog!("device_found bar0={:#x} size={:#x}", bar0_addr, bar0_size);
+        uinfo!("nvmed", "device_found"; bar0 = bar0_addr, size = bar0_size);
 
         // Initialize NVMe hardware
         let ctrl = init_nvme_hardware(bar0_addr, bar0_size);
@@ -751,7 +706,7 @@ impl Driver for NvmeDriver {
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
         let _ = ctx.register_port(b"nvme0:", PortType::Block, shmem_id, None);
 
-        nlog!("ready blocks={} bs={}", block_count, block_size);
+        uinfo!("nvmed", "ready"; blocks = block_count, block_size = block_size);
 
         Ok(())
     }

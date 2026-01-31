@@ -746,8 +746,12 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                         kernel::pci::release_all_devices(pid);
                         let port_wake = kernel::ipc::port_cleanup_task(pid);
                         kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
-                        let ipc_wake = kernel::ipc::process_cleanup(pid);
-                        kernel::ipc::waker::wake(&ipc_wake, kernel::ipc::WakeReason::Closed);
+                        let ipc_peers = kernel::ipc::process_cleanup(pid);
+                        for peer in ipc_peers.iter() {
+                            let wake_list = kernel::object_service::object_service()
+                                .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
+                            kernel::ipc::waker::wake(&wake_list, kernel::ipc::WakeReason::Closed);
+                        }
 
                         // Free slot immediately (bump generation to invalidate stale PIDs)
                         sched.bump_generation(slot_idx);
@@ -1052,8 +1056,12 @@ pub extern "C" fn recover_devd() {
                 kernel::pci::release_all_devices(pid);
                 let port_wake = kernel::ipc::port_cleanup_task(pid);
                 kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
-                let ipc_wake = kernel::ipc::process_cleanup(pid);
-                kernel::ipc::waker::wake(&ipc_wake, kernel::ipc::WakeReason::Closed);
+                let ipc_peers = kernel::ipc::process_cleanup(pid);
+                for peer in ipc_peers.iter() {
+                    let wake_list = kernel::object_service::object_service()
+                        .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
+                    kernel::ipc::waker::wake(&wake_list, kernel::ipc::WakeReason::Closed);
+                }
 
                 // Clean up ObjectService tables
                 kernel::object_service::object_service().remove_task_table(pid);

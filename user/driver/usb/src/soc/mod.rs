@@ -125,7 +125,7 @@ pub struct GenericSoc {
 
 impl GenericSoc {
     /// Create a generic SoC wrapper
-    pub fn new(xhci_base: u64, xhci_size: usize, irq: u32) -> Self {
+    pub const fn new(xhci_base: u64, xhci_size: usize, irq: u32) -> Self {
         Self {
             xhci_base,
             xhci_size,

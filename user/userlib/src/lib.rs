@@ -36,7 +36,7 @@ pub use syscall::{exit, exec, klog};
 pub use syscall::{open, read, write, map, close, channel_pair};
 pub use ipc::{Channel, Port, Timer, Mux, MuxFilter, MuxEvent, Process, Message, ObjHandle as IpcHandle, EventLoop, Shmem, PciDevice, Msi, MsiInfo, PipeRing};
 pub use mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interval};
-pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_status, side_msg, side_status};
+pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_status, side_msg, side_status, Doorbell, ChannelDoorbell};
 pub use data_port::{DataPort, DataPortConfig, PortRole, Layer, ConnectedLayer, GeometryInfo};
 pub use devd::{
     DevdClient, PortType, DeviceClass, DeviceInfo, ClientState, DriverState,

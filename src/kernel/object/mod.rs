@@ -476,8 +476,6 @@ impl Pollable for ChannelObject {
 
     fn subscribe(&mut self, subscriber: Subscriber) {
         self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, poll::READABLE | poll::CLOSED));
-        // Also register with ipc backend (dual-subscribe — to be removed in Phase 3 channel unification)
-        let _ = crate::kernel::ipc::subscribe(self.channel_id, subscriber.task_id, subscriber, crate::kernel::ipc::WakeReason::Readable);
     }
 
     fn unsubscribe(&mut self) {

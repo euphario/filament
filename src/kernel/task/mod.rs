@@ -280,12 +280,6 @@ impl Scheduler {
                     }
                 }
 
-                // Check all task timers
-                for timer in &task.timers {
-                    if timer.is_active() && timer.deadline < soonest {
-                        soonest = timer.deadline;
-                    }
-                }
             }
         }
 
@@ -412,30 +406,6 @@ impl Scheduler {
                         woken += 1;
                         need_recalculate = true;
                     }
-                }
-
-                // Check all timers for this task (BSD kqueue style)
-                let mut should_wake = false;
-                for timer in task.timers.iter_mut() {
-                    if timer.is_active() && current_tick >= timer.deadline {
-                        if timer.interval > 0 {
-                            // Recurring timer - reset deadline
-                            timer.deadline = timer.deadline.saturating_add(timer.interval);
-                        } else {
-                            // One-shot timer - clear it
-                            timer.deadline = 0;
-                        }
-
-                        should_wake = true;
-                        need_recalculate = true;
-                    }
-                }
-
-                // Wake task if any timer fired and task was blocked
-                if should_wake && task.is_blocked() {
-                    crate::transition_or_log!(task, wake);
-                    task.liveness_state = super::liveness::LivenessState::Normal;
-                    woken += 1;
                 }
 
                 // Collect task ID for TimerObject checking via ObjectService
@@ -634,11 +604,6 @@ impl Scheduler {
         let slot = current_slot();
         if let Some(ref mut task) = self.tasks[slot] {
             crate::transition_or_evict!(task, set_exiting, exit_code);
-            // Clear timers so they don't fire for terminated task
-            for timer in task.timers.iter_mut() {
-                timer.deadline = 0;
-                timer.interval = 0;
-            }
             // Clear is_init flag so new devd can be the init
             task.is_init = false;
         }
@@ -651,15 +616,15 @@ impl Scheduler {
     /// - Removing from subscriber lists (prevents stale wakes)
     /// - Notifying IPC peers (sends Close messages, wakes blocked receivers)
     ///
-    /// Returns the wake list for IPC peers.
-    fn do_ipc_cleanup(pid: TaskId) -> super::ipc::waker::WakeList {
+    /// Returns the peer info list for IPC peers to wake via ObjectService.
+    fn do_ipc_cleanup(pid: TaskId) -> super::ipc::PeerInfoList {
         // Stop DMA first (critical for safety)
         super::bus::process_cleanup(pid);
 
-        // Remove dying task from ALL subscriber lists (prevent stale wakes)
+        // Remove dying task from ALL port subscriber lists (prevent stale wakes)
         super::ipc::remove_subscriber_from_all(pid);
 
-        // Notify IPC peers (sends Close messages, wakes blocked receivers)
+        // Notify IPC peers (sends Close messages)
         super::ipc::process_cleanup(pid)
     }
 
@@ -726,8 +691,12 @@ impl Scheduler {
                     self.wake_parent_if_sleeping(slot_idx);
 
                     // Perform IPC cleanup (DMA stop, subscriber removal, peer notification)
-                    let ipc_wake_list = Self::do_ipc_cleanup(pid);
-                    super::ipc::waker::wake(&ipc_wake_list, super::ipc::WakeReason::Closed);
+                    let ipc_peers = Self::do_ipc_cleanup(pid);
+                    for peer in ipc_peers.iter() {
+                        let wake_list = super::object_service::object_service()
+                            .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
+                        super::ipc::waker::wake(&wake_list, super::ipc::WakeReason::Closed);
+                    }
 
                     // Notify shmem mappers (marks regions as Dying, sends ShmemInvalid events)
                     super::shmem::begin_cleanup(pid);
@@ -790,8 +759,12 @@ impl Scheduler {
                     self.wake_parent_if_sleeping(slot_idx);
 
                     // Perform IPC cleanup (DMA stop, subscriber removal, peer notification)
-                    let ipc_wake_list = Self::do_ipc_cleanup(pid);
-                    super::ipc::waker::wake(&ipc_wake_list, super::ipc::WakeReason::Closed);
+                    let ipc_peers = Self::do_ipc_cleanup(pid);
+                    for peer in ipc_peers.iter() {
+                        let wake_list = super::object_service::object_service()
+                            .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
+                        super::ipc::waker::wake(&wake_list, super::ipc::WakeReason::Closed);
+                    }
 
                     // Finalize shmem immediately (no grace period)
                     super::shmem::begin_cleanup(pid);

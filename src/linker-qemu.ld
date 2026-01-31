@@ -61,9 +61,11 @@ SECTIONS
         __bss_end = .;
     } > RAM
 
-    /* Stack - 64KB, grows downward */
+    /* Early boot stack - 16KB, grows downward.
+     * Only used until PMM init, then switched to a PMM-allocated stack
+     * with a proper guard page. Keep small to minimize kernel image size. */
     . = ALIGN(16);
-    . = . + 64K;
+    . = . + 16K;
     __stack_top = .;
 
     /* Heap starts after stack */

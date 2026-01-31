@@ -81,8 +81,6 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), Lif
             return Err(LifecycleError::InvalidState);
         }
 
-        // Clear timers
-        task.clear_timers();
 
         // Clear is_init flag so new devd can be init
         task.is_init = false;
@@ -157,8 +155,6 @@ pub fn kill(
             return Err(LifecycleError::InvalidState);
         }
 
-        // Clear timers
-        task.clear_timers();
 
         task.is_init = false;
 

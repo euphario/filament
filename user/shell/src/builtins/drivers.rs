@@ -45,7 +45,7 @@ fn show_help() {
     println!("  drivers help         Show this help");
     println!();
     println!("Examples:");
-    println!("  drivers xhcid        Query USB controller info");
+    println!("  drivers usbd         Query USB controller info");
     println!("  drivers partd        Query partition driver info");
 }
 

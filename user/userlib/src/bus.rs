@@ -852,6 +852,9 @@ pub trait BlockTransport {
     /// Poll for sidechannel request (provider side).
     fn poll_side_request(&self) -> Option<crate::ring::SideEntry>;
 
+    /// Poll for sidechannel response (consumer side).
+    fn poll_side_response(&self) -> Option<crate::ring::SideEntry>;
+
     /// Send a sidechannel entry (consumer side).
     fn side_send(&self, entry: &crate::ring::SideEntry) -> bool;
 
@@ -863,6 +866,12 @@ pub trait BlockTransport {
 
     /// Notify peer that work is available.
     fn notify(&self);
+
+    /// Block until peer notifies (completion or request available).
+    ///
+    /// Uses shmem wait — no polling, no busy loops. Returns true if
+    /// notified, false on timeout.
+    fn wait(&self, timeout_ms: u32) -> bool;
 
     /// Get the underlying shmem handle for Mux registration.
     fn mux_handle(&self) -> Option<crate::syscall::Handle>;

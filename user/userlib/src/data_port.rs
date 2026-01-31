@@ -47,6 +47,7 @@
 use crate::ring::{
     LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc,
     io_status, side_status, side_msg,
+    Doorbell, ChannelDoorbell,
 };
 use crate::error::SysError;
 
@@ -102,21 +103,29 @@ pub struct DataPort {
     alloc: Option<PoolAlloc>,
     /// Next tag for requests (only used by Consumer)
     next_tag: u32,
+    /// Optional doorbell for event-driven notification.
+    /// When set, `notify()` rings the doorbell instead of shmem notify.
+    doorbell: Option<ChannelDoorbell>,
 }
 
 impl DataPort {
     /// Create a new data port (Provider side)
     ///
     /// The provider creates the shared memory and waits for consumers.
+    /// Both provider and consumer can allocate from the shared pool
+    /// (e.g., network driver writes RX packets to pool for consumer).
     pub fn create(config: DataPortConfig) -> Result<Self, SysError> {
         let ring = LayeredRing::create(config.ring_size, config.side_size, config.pool_size)
             .ok_or(SysError::OutOfMemory)?;
 
+        let alloc = PoolAlloc::new(0, ring.pool_size());
+
         Ok(Self {
             ring,
             role: PortRole::Provider,
-            alloc: None, // Provider doesn't allocate from pool
+            alloc: Some(alloc),
             next_tag: 0,
+            doorbell: None,
         })
     }
 
@@ -135,6 +144,7 @@ impl DataPort {
             role: PortRole::Consumer,
             alloc: Some(alloc),
             next_tag: 1,
+            doorbell: None,
         })
     }
 
@@ -158,7 +168,9 @@ impl DataPort {
         self.role
     }
 
-    /// Get the shmem handle for Mux registration
+    /// Get the raw shmem handle (for backward compatibility).
+    ///
+    /// Prefer `mux_handle()` which respects the doorbell if set.
     pub fn shmem_handle(&self) -> crate::syscall::Handle {
         self.ring.shmem_handle()
     }
@@ -314,9 +326,19 @@ impl DataPort {
         self.ring.has_sidechannel()
     }
 
-    /// Send sidechannel entry
+    /// Send sidechannel entry and ring doorbell.
+    ///
+    /// Every sidechannel write notifies the peer so it wakes up to
+    /// process the entry. Without this, sidechannel writes that happen
+    /// outside of `query()` (e.g., `handle_query()`, `respond_geometry()`,
+    /// `ConnectedLayer::poll()`) would silently drop into the ring with
+    /// no wake — the receiver would only see them on its next unrelated wake.
     pub fn side_send(&self, entry: &SideEntry) -> bool {
-        self.ring.side_send(entry)
+        let ok = self.ring.side_send(entry);
+        if ok {
+            self.notify();
+        }
+        ok
     }
 
     /// Send a query and wait for response
@@ -343,7 +365,7 @@ impl DataPort {
         if !self.side_send(&entry) {
             return None;
         }
-        self.notify();
+        // side_send() already rings the doorbell
 
         // Wait for response (simple blocking wait)
         // In production, integrate with event loop
@@ -438,15 +460,56 @@ impl DataPort {
     }
 
     // =========================================================================
+    // Doorbell
+    // =========================================================================
+
+    /// Attach a doorbell for event-driven notifications.
+    ///
+    /// When set, `notify()` rings the doorbell instead of shmem notify,
+    /// and `mux_handle()` returns the doorbell's handle.
+    pub fn set_doorbell(&mut self, bell: ChannelDoorbell) {
+        self.doorbell = Some(bell);
+    }
+
+    /// Get the handle to register with a Mux.
+    ///
+    /// Returns the doorbell handle if set, otherwise the shmem handle.
+    pub fn mux_handle(&self) -> crate::syscall::Handle {
+        if let Some(ref bell) = self.doorbell {
+            bell.mux_handle()
+        } else {
+            self.ring.shmem_handle()
+        }
+    }
+
+    /// Acknowledge a doorbell notification (drain pending state).
+    ///
+    /// Call after Mux fires on this port's handle to prevent spurious wakes.
+    /// No-op if no doorbell is set (shmem notify is edge-triggered).
+    pub fn ack(&self) {
+        if let Some(ref bell) = self.doorbell {
+            bell.ack();
+        }
+    }
+
+    // =========================================================================
     // Notifications
     // =========================================================================
 
-    /// Notify peer (ring doorbell)
+    /// Notify peer that new entries are available.
+    ///
+    /// Rings the doorbell if set, otherwise falls back to shmem notify.
     pub fn notify(&self) {
-        self.ring.notify();
+        if let Some(ref bell) = self.doorbell {
+            bell.ring();
+        } else {
+            self.ring.notify();
+        }
     }
 
-    /// Wait for notification
+    /// Wait for notification (blocking, legacy).
+    ///
+    /// Prefer using a Mux with `mux_handle()` instead.
     pub fn wait(&self, timeout_ms: u32) -> bool {
         self.ring.wait(timeout_ms)
     }

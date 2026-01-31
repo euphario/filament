@@ -17,9 +17,50 @@
 
 use super::types::{ChannelId, TaskId, Message, MAX_CHANNELS};
 use super::channel::{Channel, ChannelState};
-use super::traits::{Subscriber, WakeReason, Waitable};
-use super::waker::WakeList;
 use super::error::IpcError;
+use super::traits::WakeReason;
+
+/// Information about a channel's peer, for wake routing after lock release.
+///
+/// After an IPC operation (send, close), the caller uses this to find the
+/// peer's ChannelObject in the Object layer and wake its WaitQueue.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerInfo {
+    /// Peer's owner task ID
+    pub task_id: TaskId,
+    /// Peer's channel ID (to locate the ChannelObject)
+    pub channel_id: ChannelId,
+}
+
+/// List of peer infos collected during cleanup operations
+pub struct PeerInfoList {
+    entries: [Option<PeerInfo>; 16],
+    count: usize,
+}
+
+impl PeerInfoList {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; 16],
+            count: 0,
+        }
+    }
+
+    pub fn push(&mut self, info: PeerInfo) {
+        if self.count < self.entries.len() {
+            self.entries[self.count] = Some(info);
+            self.count += 1;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PeerInfo> {
+        self.entries[..self.count].iter().filter_map(|e| e.as_ref())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
 
 /// Channel table entry state
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,18 +148,21 @@ impl ChannelTable {
     /// This is the unified cleanup path - called by close(), close_unchecked(),
     /// and cleanup_task(). Assumes slot is valid and contains a channel.
     ///
-    /// Returns a wake list containing subscribers from both this channel and peer.
-    fn close_slot(&mut self, slot: usize) -> WakeList {
-        // Get peer ID before closing
-        let peer_id = self.channels[slot].as_ref()
-            .and_then(|ch| ch.peer_id());
+    /// Returns peer info for the caller to wake via ObjectService.
+    fn close_slot(&mut self, slot: usize) -> Option<PeerInfo> {
+        // Get peer info before closing
+        let peer_info = self.channels[slot].as_ref().and_then(|ch| {
+            if let ChannelState::Open { peer_id, peer_owner } = ch.state() {
+                Some(PeerInfo { task_id: *peer_owner, channel_id: *peer_id })
+            } else {
+                None
+            }
+        });
 
-        // Close this channel and collect its subscribers
-        let mut wake_list = if let Some(channel) = self.channels[slot].as_mut() {
-            channel.do_close()
-        } else {
-            WakeList::new()
-        };
+        // Close this channel
+        if let Some(channel) = self.channels[slot].as_mut() {
+            channel.do_close();
+        }
 
         // Free the slot
         self.channels[slot] = None;
@@ -126,15 +170,14 @@ impl ChannelTable {
         self.bump_generation(slot);
         self.active_count -= 1;
 
-        // Notify peer that we've closed
-        if let Some(peer) = peer_id {
-            if let Some(peer_channel) = self.get_unchecked_mut(peer) {
-                let peer_wake = peer_channel.notify_peer_closed();
-                wake_list.merge(&peer_wake);
+        // Notify peer that we've closed (state transition only, no wake)
+        if let Some(ref info) = peer_info {
+            if let Some(peer_channel) = self.get_unchecked_mut(info.channel_id) {
+                peer_channel.notify_peer_closed();
             }
         }
 
-        wake_list
+        peer_info
     }
 
     // ========================================================================
@@ -210,8 +253,8 @@ impl ChannelTable {
 
     /// Send a message on a channel
     ///
-    /// Returns subscribers to wake.
-    pub fn send(&mut self, id: ChannelId, msg: Message, caller: TaskId) -> Result<WakeList, IpcError> {
+    /// Returns peer info for the caller to wake via ObjectService.
+    pub fn send(&mut self, id: ChannelId, msg: Message, caller: TaskId) -> Result<PeerInfo, IpcError> {
         // Validate sender's channel
         let slot = self.find_slot(id).ok_or(IpcError::InvalidChannel { id })?;
 
@@ -224,13 +267,15 @@ impl ChannelTable {
 
         // Check sender's state
         match channel.state() {
-            ChannelState::Open { peer_id, .. } => {
+            ChannelState::Open { peer_id, peer_owner } => {
                 let peer = *peer_id;
+                let peer_task = *peer_owner;
                 // Get peer and deliver message
                 let peer_channel = self.get_unchecked_mut(peer)
                     .ok_or(IpcError::PeerClosed)?;
 
-                peer_channel.deliver(msg)
+                peer_channel.deliver(msg)?;
+                Ok(PeerInfo { task_id: peer_task, channel_id: peer })
             }
             ChannelState::HalfClosed { .. } => Err(IpcError::PeerClosed),
             ChannelState::Closed => Err(IpcError::Closed),
@@ -245,8 +290,8 @@ impl ChannelTable {
 
     /// Close a channel
     ///
-    /// Returns subscribers to wake (from both this channel and peer).
-    pub fn close(&mut self, id: ChannelId, caller: TaskId) -> Result<WakeList, IpcError> {
+    /// Returns peer info for the caller to wake via ObjectService.
+    pub fn close(&mut self, id: ChannelId, caller: TaskId) -> Result<Option<PeerInfo>, IpcError> {
         let slot = self.find_slot(id).ok_or(IpcError::InvalidChannel { id })?;
 
         // Validate ownership
@@ -263,23 +308,10 @@ impl ChannelTable {
         Ok(self.close_slot(slot))
     }
 
-    /// Subscribe to events on a channel
-    pub fn subscribe(&mut self, id: ChannelId, caller: TaskId, sub: Subscriber, filter: WakeReason) -> Result<(), IpcError> {
-        let channel = self.get_mut(id, caller)?;
-        channel.subscribe(sub, filter).map_err(|_| IpcError::SubscribersFull)
-    }
-
-    /// Unsubscribe from events on a channel
-    pub fn unsubscribe(&mut self, id: ChannelId, caller: TaskId, sub: Subscriber) -> Result<(), IpcError> {
-        let channel = self.get_mut(id, caller)?;
-        channel.unsubscribe(sub);
-        Ok(())
-    }
-
     /// Poll channel readiness
     pub fn poll(&self, id: ChannelId, caller: TaskId, filter: WakeReason) -> Result<bool, IpcError> {
         let channel = self.get(id, caller)?;
-        Ok(channel.poll(filter))
+        Ok(Self::channel_poll(channel, filter))
     }
 
     /// Poll channel readiness without ownership check (for handle system)
@@ -290,16 +322,26 @@ impl ChannelTable {
         };
 
         match &self.channels[slot] {
-            Some(channel) => channel.poll(filter),
+            Some(channel) => Self::channel_poll(channel, filter),
             None => false,
+        }
+    }
+
+    /// Check channel readiness for a given filter
+    fn channel_poll(channel: &Channel, filter: WakeReason) -> bool {
+        match filter {
+            WakeReason::Readable => channel.has_messages(),
+            WakeReason::Writable => channel.has_space(),
+            WakeReason::Closed => !channel.state().is_open(),
+            _ => false,
         }
     }
 
     /// Clean up all channels owned by a task
     ///
-    /// Returns all subscribers to wake.
-    pub fn cleanup_task(&mut self, task_id: TaskId) -> WakeList {
-        let mut wake_list = WakeList::new();
+    /// Returns peer infos for the caller to wake via ObjectService.
+    pub fn cleanup_task(&mut self, task_id: TaskId) -> PeerInfoList {
+        let mut peers = PeerInfoList::new();
 
         for slot in 0..MAX_CHANNELS {
             if self.states[slot] != SlotState::Active {
@@ -312,12 +354,13 @@ impl ChannelTable {
 
             if owner == task_id {
                 // Use unified cleanup path
-                let slot_wake = self.close_slot(slot);
-                wake_list.merge(&slot_wake);
+                if let Some(peer) = self.close_slot(slot) {
+                    peers.push(peer);
+                }
             }
         }
 
-        wake_list
+        peers
     }
 
     /// Get queue status for a channel
@@ -352,29 +395,6 @@ impl ChannelTable {
         }
     }
 
-    /// Register a waker for a channel (for handle system compatibility)
-    pub fn register_waker(&mut self, id: ChannelId, task_id: TaskId) -> Result<(), IpcError> {
-        // Find the channel without ownership check (for handle system)
-        let slot = self.find_slot(id).ok_or(IpcError::InvalidChannel { id })?;
-
-        let channel = self.channels[slot].as_mut()
-            .ok_or(IpcError::InvalidChannel { id })?;
-
-        channel.subscribe(Subscriber::simple(task_id), WakeReason::Readable)
-            .map_err(|_| IpcError::SubscribersFull)
-    }
-
-    /// Unregister a waker for a channel
-    pub fn unregister_waker(&mut self, id: ChannelId, task_id: TaskId) -> Result<(), IpcError> {
-        let slot = self.find_slot(id).ok_or(IpcError::InvalidChannel { id })?;
-
-        let channel = self.channels[slot].as_mut()
-            .ok_or(IpcError::InvalidChannel { id })?;
-
-        channel.unsubscribe(Subscriber::simple(task_id));
-        Ok(())
-    }
-
     // ========================================================================
     // Kernel Dispatch
     // ========================================================================
@@ -405,15 +425,15 @@ impl ChannelTable {
     /// Send a message directly to a channel (bypass ownership check)
     /// Used by kernel components to send messages on kernel-owned channels.
     /// Like regular send(), this delivers to the PEER channel.
-    pub fn send_direct(&mut self, id: ChannelId, msg: Message) -> Result<WakeList, IpcError> {
+    pub fn send_direct(&mut self, id: ChannelId, msg: Message) -> Result<PeerInfo, IpcError> {
         let slot = self.find_slot(id).ok_or(IpcError::InvalidChannel { id })?;
 
         let channel = self.channels[slot].as_ref()
             .ok_or(IpcError::InvalidChannel { id })?;
 
-        // Get peer ID from sender's channel state
-        let peer_id = match channel.state() {
-            ChannelState::Open { peer_id, .. } => *peer_id,
+        // Get peer info from sender's channel state
+        let (peer_id, peer_owner) = match channel.state() {
+            ChannelState::Open { peer_id, peer_owner } => (*peer_id, *peer_owner),
             ChannelState::HalfClosed { .. } => return Err(IpcError::PeerClosed),
             ChannelState::Closed => return Err(IpcError::Closed),
         };
@@ -422,11 +442,12 @@ impl ChannelTable {
         let peer_channel = self.get_unchecked_mut(peer_id)
             .ok_or(IpcError::PeerClosed)?;
 
-        peer_channel.deliver(msg)
+        peer_channel.deliver(msg)?;
+        Ok(PeerInfo { task_id: peer_owner, channel_id: peer_id })
     }
 
     /// Close a channel without ownership check (for liveness recovery)
-    pub fn close_unchecked(&mut self, id: ChannelId) -> Result<WakeList, IpcError> {
+    pub fn close_unchecked(&mut self, id: ChannelId) -> Result<Option<PeerInfo>, IpcError> {
         let slot = self.find_slot(id).ok_or(IpcError::InvalidChannel { id })?;
 
         // Use unified cleanup path
@@ -439,17 +460,6 @@ impl ChannelTable {
         self.channels[slot].as_ref()?.peer_id()
     }
 
-    /// Remove a task from ALL subscriber lists
-    ///
-    /// Called when a task dies to prevent stale wakes.
-    /// This scans all channels and removes the task from their subscriber sets.
-    pub fn remove_subscriber_from_all(&mut self, task_id: TaskId) {
-        for slot in 0..MAX_CHANNELS {
-            if let Some(ref mut channel) = self.channels[slot] {
-                channel.unsubscribe_by_task(task_id);
-            }
-        }
-    }
 }
 
 impl Default for ChannelTable {
@@ -507,8 +517,9 @@ mod tests {
 
         // Task 1 sends on id_a, message goes to id_b's queue
         let msg = Message::data(1, b"hello");
-        let wake_list = table.send(id_a, msg, 1).unwrap();
-        assert!(wake_list.is_empty()); // No subscribers
+        let peer = table.send(id_a, msg, 1).unwrap();
+        assert_eq!(peer.task_id, 2);
+        assert_eq!(peer.channel_id, id_b);
 
         // Task 2 receives on id_b
         let received = table.receive(id_b, 2).unwrap();
@@ -590,20 +601,4 @@ mod tests {
         assert!(matches!(result, Err(IpcError::PeerClosed)));
     }
 
-    #[test]
-    fn test_table_subscribe_wake() {
-        let mut table = ChannelTable::new();
-
-        let (id_a, id_b) = table.create_pair(1, 2).unwrap();
-
-        // Subscribe task 2 to id_b for Readable
-        table.subscribe(id_b, 2, Subscriber::new(2, 1), WakeReason::Readable).unwrap();
-
-        // Send message - should return wake list with task 2
-        let wake_list = table.send(id_a, Message::data(1, b"test"), 1).unwrap();
-        assert_eq!(wake_list.len(), 1);
-
-        let sub = wake_list.iter().next().unwrap();
-        assert_eq!(sub.task_id, 2);
-    }
 }

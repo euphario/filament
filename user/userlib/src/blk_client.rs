@@ -5,10 +5,9 @@
 
 use crate::ipc::Channel;
 use crate::blk::{
-    BlkHeader, BlkInfo, BlkInfoResp, BlkRead, BlkData, BlkWrite, BlkResult,
+    BlkInfo, BlkInfoResp, BlkRead, BlkData, BlkWrite, BlkResult,
     BlkError, msg, error,
 };
-use crate::error::SysError;
 
 /// Block device client - connects to a block device port
 pub struct BlockClient {

@@ -633,7 +633,7 @@ fn enumerate_device(host: &PciHostImpl, bdf: PciBdf, bar_alloc: &mut BarAllocato
         return None;
     }
 
-    // Find first MMIO BAR, probe size, allocate if needed
+    // Probe and allocate ALL MMIO BARs, record the first one as bar0
     let mut bar0_addr = 0u64;
     let mut bar0_size = 0u64;
     let mut bar_idx = 0u8;
@@ -670,10 +670,10 @@ fn enumerate_device(host: &PciHostImpl, bdf: PciBdf, bar_alloc: &mut BarAllocato
                         }
                     }
 
-                    if final_addr != 0 {
+                    // Record first MMIO BAR as bar0
+                    if final_addr != 0 && bar0_addr == 0 {
                         bar0_addr = final_addr;
                         bar0_size = size;
-                        break;
                     }
                 }
             }

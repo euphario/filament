@@ -24,7 +24,6 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall::{self, LogLevel};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, bus_msg,
@@ -32,58 +31,9 @@ use userlib::bus::{
 use userlib::bus_runtime::driver_main;
 use userlib::ring::side_msg;
 use userlib::vfs_proto::{MountTable, MountEntry};
-
-// =============================================================================
-// Constants
-// =============================================================================
+use userlib::{uinfo, uerror};
 
 const MAX_MOUNTS: usize = MountTable::MAX_MOUNTS;
-
-// =============================================================================
-// Logging
-// =============================================================================
-
-macro_rules! vlog {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[vfsd] ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Info, &buf[..pos]);
-    }};
-}
-
-macro_rules! verror {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        const PREFIX: &[u8] = b"[vfsd] ERROR: ";
-        let mut buf = [0u8; 128];
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut pos = PREFIX.len();
-        struct W<'a> { b: &'a mut [u8], p: &'a mut usize }
-        impl core::fmt::Write for W<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for &b in s.as_bytes() {
-                    if *self.p < self.b.len() { self.b[*self.p] = b; *self.p += 1; }
-                }
-                Ok(())
-            }
-        }
-        let _ = write!(W { b: &mut buf, p: &mut pos }, $($arg)*);
-        syscall::klog(LogLevel::Error, &buf[..pos]);
-    }};
-}
 
 // =============================================================================
 // VFS Driver
@@ -124,7 +74,7 @@ impl VfsDriver {
         let mount_name = &payload[5..5 + name_len];
 
         if self.mount_count >= MAX_MOUNTS {
-            verror!("mount table full, rejecting {}", core::str::from_utf8(mount_name).unwrap_or("?"));
+            uerror!("vfsd", "mount_table_full";);
             return;
         }
 
@@ -161,7 +111,7 @@ impl VfsDriver {
         let slot_idx = match slot {
             Some(i) => i,
             None => {
-                verror!("no empty mount slot");
+                uerror!("vfsd", "no_empty_slot";);
                 return;
             }
         };
@@ -190,11 +140,9 @@ impl VfsDriver {
         // Write back to pool
         port.pool_write(0, &raw[..MountTable::TOTAL_SIZE]);
 
-        vlog!("mounted {} → shmem={} at /{}/ (slot={})",
-            core::str::from_utf8(mount_name).unwrap_or("?"),
-            fs_shmem_id,
-            core::str::from_utf8(mount_name).unwrap_or("?"),
-            slot_idx);
+        uinfo!("vfsd", "mounted";
+            shmem_id = fs_shmem_id,
+            slot = slot_idx as u32);
     }
 
     fn format_info(&self, ctx: &mut dyn BusCtx) -> [u8; 256] {
@@ -278,11 +226,11 @@ impl Driver for VfsDriver {
                         None,
                     );
 
-                    vlog!("mount table ready shmem_id={}", shmem_id);
+                    uinfo!("vfsd", "mount_table_ready"; shmem_id = shmem_id);
                 }
             }
             Err(e) => {
-                verror!("create DataPort failed: {:?}", e);
+                uerror!("vfsd", "create_port_failed";);
                 return Err(e);
             }
         }

@@ -35,7 +35,7 @@ pub struct ConsoleRing {
     /// Shared memory region
     shmem: Shmem,
     /// Are we the owner (creator)?
-    is_owner: bool,
+    _is_owner: bool,
     /// TX config
     tx_config: RingConfig,
     /// RX config
@@ -81,7 +81,7 @@ impl ConsoleRing {
 
         Some(Self {
             shmem,
-            is_owner: true,
+            _is_owner: true,
             tx_config,
             rx_config,
         })
@@ -104,7 +104,7 @@ impl ConsoleRing {
 
         Some(Self {
             shmem,
-            is_owner: false,
+            _is_owner: false,
             tx_config,
             rx_config,
         })

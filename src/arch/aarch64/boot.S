@@ -488,14 +488,14 @@ post_mmu_entry:
     add     x1, x1, x2              // physical addr of TTBR1 tables
 
     /* Store in globals for Rust */
-    adrp    x3, BOOT_TTBR0
-    str     x0, [x3, :lo12:BOOT_TTBR0]
-    adrp    x3, BOOT_TTBR1
-    str     x1, [x3, :lo12:BOOT_TTBR1]
+    ldr     x3, =BOOT_TTBR0
+    str     x0, [x3]
+    ldr     x3, =BOOT_TTBR1
+    str     x1, [x3]
 
     /* Store DTB pointer (from x20, saved at _start) */
-    adrp    x3, BOOT_DTB_ADDR
-    str     x20, [x3, :lo12:BOOT_DTB_ADDR]
+    ldr     x3, =BOOT_DTB_ADDR
+    str     x20, [x3]
 
     /*
      * Jump to Rust entry point.
@@ -825,8 +825,8 @@ exception_from_user:
     stp     x11, x12, [sp, #-16]!
 
     /* Get pointer to current task's trap frame */
-    adrp    x9, CURRENT_TRAP_FRAME
-    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    ldr     x9, =CURRENT_TRAP_FRAME
+    ldr     x9, [x9]
 
     /* Save all general purpose registers to trap frame */
     stp     x0, x1, [x9, #0]
@@ -867,12 +867,16 @@ exception_from_user:
 
     /* Rust handler terminates the task and schedules next.
      * Reload CURRENT_TRAP_FRAME (now points to next task). */
-    adrp    x9, CURRENT_TRAP_FRAME
-    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    ldr     x9, =CURRENT_TRAP_FRAME
+    ldr     x9, [x9]
 
     /* Switch TTBR0 to current task's user address space */
-    adrp    x10, CURRENT_TTBR0
-    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    ldr     x10, =CURRENT_TTBR0
+    ldr     x10, [x10]
+    cbnz    x10, 1f
+    mov     x0, #1              // caller ID = exception_from_user
+    b       ttbr0_zero_guard
+1:
     msr     ttbr0_el1, x10
     isb
     tlbi    vmalle1
@@ -963,8 +967,8 @@ irq_from_kernel:
 
     /* Clear SYSCALL_SWITCHED_TASK before calling do_resched_if_needed
      * so we can detect if it switched to a user task */
-    adrp    x10, SYSCALL_SWITCHED_TASK
-    str     xzr, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    ldr     x10, =SYSCALL_SWITCHED_TASK
+    str     xzr, [x10]
 
     /* Check if reschedule is needed (e.g., timer woke a task).
      * This may context_switch to another task. When we're switched back,
@@ -975,8 +979,8 @@ irq_from_kernel:
     /* Check if we switched to a user task.
      * If so, we need to use the user return path to restore from trap frame
      * and switch TTBR0. This handles devd recovery when IRQ came from idle. */
-    adrp    x10, SYSCALL_SWITCHED_TASK
-    ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    ldr     x10, =SYSCALL_SWITCHED_TASK
+    ldr     x10, [x10]
     cbnz    x10, irq_kernel_to_user     // If switched, use user return path
 
     /* Returning to kernel (idle task) - restore from stack */
@@ -1017,12 +1021,16 @@ irq_kernel_to_user:
     add     sp, sp, #(8 + 15*16)        // x0 + x1-x30 pairs
 
     /* Now use the user return path - restore from CURRENT_TRAP_FRAME */
-    adrp    x9, CURRENT_TRAP_FRAME
-    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    ldr     x9, =CURRENT_TRAP_FRAME
+    ldr     x9, [x9]
 
     /* Switch TTBR0 to user task's address space */
-    adrp    x10, CURRENT_TTBR0
-    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    ldr     x10, =CURRENT_TTBR0
+    ldr     x10, [x10]
+    cbnz    x10, 1f
+    mov     x0, #2              // caller ID = irq_kernel_to_user
+    b       ttbr0_zero_guard
+1:
     msr     ttbr0_el1, x10
     isb
     tlbi    vmalle1
@@ -1074,8 +1082,8 @@ irq_from_user:
     stp     x11, x12, [sp, #-16]!
 
     /* Get pointer to current task's trap frame (already a virtual address) */
-    adrp    x9, CURRENT_TRAP_FRAME
-    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    ldr     x9, =CURRENT_TRAP_FRAME
+    ldr     x9, [x9]
 
     /* Save all general purpose registers to trap frame */
     stp     x0, x1, [x9, #0]        // x0=0, x1=8
@@ -1114,8 +1122,8 @@ irq_from_user:
 
     /* Clear SYSCALL_SWITCHED_TASK before calling irq_exit_resched
      * so we can detect if it actually switched tasks */
-    adrp    x10, SYSCALL_SWITCHED_TASK
-    str     xzr, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    ldr     x10, =SYSCALL_SWITCHED_TASK
+    str     xzr, [x10]
 
     /* Safe point: check NEED_RESCHED flag and do deferred scheduling.
      * This is where timer preemption actually happens - the IRQ handler
@@ -1125,13 +1133,17 @@ irq_from_user:
 
     /* irq_exit_resched may have scheduled a different task */
     /* Reload CURRENT_TRAP_FRAME (may have changed!) */
-    adrp    x9, CURRENT_TRAP_FRAME
-    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    ldr     x9, =CURRENT_TRAP_FRAME
+    ldr     x9, [x9]
 
     /* Switch TTBR0 to current task's user address space for eret.
      * Use TLBI to ensure no stale TLB entries. */
-    adrp    x10, CURRENT_TTBR0
-    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    ldr     x10, =CURRENT_TTBR0
+    ldr     x10, [x10]
+    cbnz    x10, 1f
+    mov     x0, #3              // caller ID = irq_from_user
+    b       ttbr0_zero_guard
+1:
     msr     ttbr0_el1, x10
     isb
     tlbi    vmalle1
@@ -1185,8 +1197,8 @@ svc_handler:
     stp     x11, x12, [sp, #-16]!
 
     /* Get pointer to current task's trap frame (already a virtual address) */
-    adrp    x9, CURRENT_TRAP_FRAME
-    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    ldr     x9, =CURRENT_TRAP_FRAME
+    ldr     x9, [x9]
 
     /* Save all general purpose registers to trap frame */
     /* TrapFrame layout: x0(0) x1(8) x2(16) ... x30(240), sp_el0(248), elr_el1(256), spsr_el1(264) */
@@ -1225,8 +1237,8 @@ svc_handler:
      * syscall_handler_rust(arg0, arg1, arg2, arg3, arg4, arg5, unused, num)
      */
     /* Clear switch flag before syscall */
-    adrp    x10, SYSCALL_SWITCHED_TASK
-    str     xzr, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    ldr     x10, =SYSCALL_SWITCHED_TASK
+    str     xzr, [x10]
 
     ldp     x0, x1, [x9, #0]        // arg0, arg1
     ldp     x2, x3, [x9, #16]       // arg2, arg3
@@ -1239,8 +1251,8 @@ svc_handler:
     mov     x19, x0
 
     /* Check if syscall already switched tasks */
-    adrp    x10, SYSCALL_SWITCHED_TASK
-    ldr     x10, [x10, :lo12:SYSCALL_SWITCHED_TASK]
+    ldr     x10, =SYSCALL_SWITCHED_TASK
+    ldr     x10, [x10]
     cbnz    x10, .Lsvc_already_switched
 
     /* Syscall didn't switch - store return value to trap frame BEFORE
@@ -1249,8 +1261,8 @@ svc_handler:
      * be reloaded to point to the new task's trap frame after the switch.
      * Note: x9 may have been clobbered by syscall_handler_rust (caller-saved),
      * so we must reload CURRENT_TRAP_FRAME here. */
-    adrp    x9, CURRENT_TRAP_FRAME
-    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    ldr     x9, =CURRENT_TRAP_FRAME
+    ldr     x9, [x9]
     str     x19, [x9, #0]
 
     /* Now check if reschedule is needed (e.g., timer preemption) */
@@ -1259,8 +1271,8 @@ svc_handler:
 .Lsvc_already_switched:
     /* syscall_handler_rust or do_resched_if_needed may have scheduled a different task */
     /* Reload CURRENT_TRAP_FRAME (may have changed!) */
-    adrp    x9, CURRENT_TRAP_FRAME
-    ldr     x9, [x9, :lo12:CURRENT_TRAP_FRAME]
+    ldr     x9, =CURRENT_TRAP_FRAME
+    ldr     x9, [x9]
 
     /* Note: return value was already stored above if syscall didn't switch.
      * If syscall DID switch, the new task's trap frame already has its x0. */
@@ -1268,8 +1280,12 @@ svc_handler:
 .Lsvc_skip_retval:
     /* Switch TTBR0 to current task's user address space for eret.
      * Use TLBI to ensure no stale TLB entries. */
-    adrp    x10, CURRENT_TTBR0
-    ldr     x10, [x10, :lo12:CURRENT_TTBR0]
+    ldr     x10, =CURRENT_TTBR0
+    ldr     x10, [x10]
+    cbnz    x10, 1f
+    mov     x0, #4              // caller ID = svc_handler
+    b       ttbr0_zero_guard
+1:
     msr     ttbr0_el1, x10
     isb
     tlbi    vmalle1
@@ -1308,6 +1324,19 @@ svc_handler:
 
     /* Return to user mode (possibly different task!) */
     eret
+
+/*
+ * TTBR0 zero guard - called when CURRENT_TTBR0 is 0 before eret
+ * x0 = caller ID (1=exception, 2=irq_kernel_to_user, 3=irq_from_user, 4=svc)
+ * x9 = trap frame pointer (for diagnostic)
+ */
+ttbr0_zero_guard:
+    /* Call Rust diagnostic with caller ID in x0 */
+    bl      ttbr0_zero_diagnostic
+
+    /* Rust handler should not return, but if it does, hang */
+1:  wfe
+    b       1b
 
 /* =============================================================================
  * Data Section - Boot Page Tables

@@ -29,22 +29,23 @@ impl PciBdf {
         Self { bus, device, function, port }
     }
 
-    /// Convert to u32 for syscall passing
-    /// Format: port(8) | bus(8) | device(5) | function(3)
+    /// Convert to u32 using the canonical ABI encoding.
+    ///
+    /// See [`abi::pci_bdf`] for the bit layout. Port is not included
+    /// (it is a kernel-internal concept, not part of the PCI BDF ABI).
     pub const fn to_u32(&self) -> u32 {
-        ((self.port as u32) << 24)
-            | ((self.bus as u32) << 16)
-            | ((self.device as u32) << 8)
-            | (self.function as u32)
+        abi::pci_bdf::pack(self.bus, self.device, self.function)
     }
 
-    /// Create from u32
+    /// Create from u32 using the canonical ABI encoding.
+    ///
+    /// See [`abi::pci_bdf`] for the bit layout.
     pub const fn from_u32(val: u32) -> Self {
         Self {
-            port: ((val >> 24) & 0xFF) as u8,
-            bus: ((val >> 16) & 0xFF) as u8,
-            device: ((val >> 8) & 0x1F) as u8,
-            function: (val & 0x07) as u8,
+            port: 0,
+            bus: abi::pci_bdf::bus(val),
+            device: abi::pci_bdf::device(val),
+            function: abi::pci_bdf::function(val),
         }
     }
 

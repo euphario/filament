@@ -30,6 +30,10 @@ impl MmioRegion {
 
         // Get virtual address via map syscall
         let base = syscall::map(handle, 0).ok()?;
+        if base == 0 {
+            let _ = syscall::close(handle);
+            return None;
+        }
 
         Some(Self { handle, base, size })
     }
@@ -180,8 +184,8 @@ impl DmaPool {
 
         // Get virtual address via map syscall
         let vaddr = match syscall::map(handle, 0) {
-            Ok(v) => v,
-            Err(_) => {
+            Ok(v) if v != 0 => v,
+            _ => {
                 let _ = syscall::close(handle);
                 return None;
             }
@@ -295,6 +299,7 @@ impl Drop for DmaPool {
 }
 
 /// Format MMIO URL: "mmio:ADDR/SIZE"
+#[allow(dead_code)]
 fn format_mmio_url(buf: &mut [u8], addr: u64, size: u64) -> usize {
     let prefix = b"mmio:";
     let mut pos = 0;
@@ -313,6 +318,7 @@ fn format_mmio_url(buf: &mut [u8], addr: u64, size: u64) -> usize {
 }
 
 /// Format u64 as hex string, return length
+#[allow(dead_code)]
 fn format_hex(buf: &mut [u8], val: u64) -> usize {
     const HEX: &[u8] = b"0123456789abcdef";
 

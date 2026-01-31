@@ -192,12 +192,6 @@ fn do_evict_task(task_id: TaskId, reason: EvictionReason) -> bool {
                     return false;
                 }
 
-                // Clear timers
-                for timer in task.timers.iter_mut() {
-                    timer.deadline = 0;
-                    timer.interval = 0;
-                }
-
                 true
             } else {
                 false

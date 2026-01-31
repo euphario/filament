@@ -20,7 +20,7 @@ use super::{
     port::PortState,
     types::Message,
     waker::WakeList,
-    traits::{Subscriber as InternalSubscriber, WakeReason as InternalWakeReason},
+    traits::{WakeReason as InternalWakeReason},
 };
 
 /// Global IPC backend instance
@@ -113,8 +113,31 @@ fn convert_message_to_internal(m: &TraitMessage) -> Message {
 fn convert_wake_list(list: WakeList) -> TraitWakeList {
     let mut result = TraitWakeList::new();
     for sub in list.iter() {
-        // Convert internal subscriber to trait subscriber
         result.push(TraitSubscriber::new(sub.task_id, sub.generation));
+    }
+    result
+}
+
+/// Convert a PeerInfo into a single-element trait WakeList
+fn peer_info_to_wake_list(peer: super::table::PeerInfo) -> TraitWakeList {
+    let mut result = TraitWakeList::new();
+    result.push(TraitSubscriber::simple(peer.task_id));
+    result
+}
+
+/// Convert an Option<PeerInfo> into a trait WakeList (0 or 1 entries)
+fn opt_peer_info_to_wake_list(peer: Option<super::table::PeerInfo>) -> TraitWakeList {
+    match peer {
+        Some(p) => peer_info_to_wake_list(p),
+        None => TraitWakeList::new(),
+    }
+}
+
+/// Convert a PeerInfoList into a trait WakeList
+fn peer_info_list_to_wake_list(list: super::table::PeerInfoList) -> TraitWakeList {
+    let mut result = TraitWakeList::new();
+    for peer in list.iter() {
+        result.push(TraitSubscriber::simple(peer.task_id));
     }
     result
 }
@@ -130,11 +153,6 @@ fn convert_wake_reason(reason: TraitWakeReason) -> InternalWakeReason {
         TraitWakeReason::Signal => InternalWakeReason::Signal,
         TraitWakeReason::ChildExit => InternalWakeReason::ChildExit,
     }
-}
-
-/// Convert trait Subscriber to internal Subscriber
-fn convert_subscriber(sub: TraitSubscriber) -> InternalSubscriber {
-    InternalSubscriber::new(sub.task_id, sub.generation)
 }
 
 // ============================================================================
@@ -200,7 +218,7 @@ impl IpcBackend for KernelIpcBackend {
     ) -> Result<TraitWakeList, TraitIpcError> {
         let internal_msg = convert_message_to_internal(msg);
         super::send(channel_id, internal_msg, caller)
-            .map(convert_wake_list)
+            .map(peer_info_to_wake_list)
             .map_err(convert_error)
     }
 
@@ -220,19 +238,20 @@ impl IpcBackend for KernelIpcBackend {
         caller: TaskId,
     ) -> Result<TraitWakeList, TraitIpcError> {
         super::close_channel(channel_id, caller)
-            .map(convert_wake_list)
+            .map(opt_peer_info_to_wake_list)
             .map_err(convert_error)
     }
 
     fn subscribe_channel(
         &self,
-        channel_id: ChannelId,
-        caller: TaskId,
-        sub: TraitSubscriber,
-        reason: TraitWakeReason,
+        _channel_id: ChannelId,
+        _caller: TaskId,
+        _sub: TraitSubscriber,
+        _reason: TraitWakeReason,
     ) -> Result<(), TraitIpcError> {
-        super::subscribe(channel_id, caller, convert_subscriber(sub), convert_wake_reason(reason))
-            .map_err(convert_error)
+        // Wake notifications are handled by the Object layer's WaitQueue,
+        // not by the IPC channel directly. This is a no-op at the IPC level.
+        Ok(())
     }
 
     fn poll_channel(
@@ -264,7 +283,7 @@ impl IpcBackend for KernelIpcBackend {
     }
 
     fn cleanup_task(&self, task_id: TaskId) -> TraitWakeList {
-        convert_wake_list(super::cleanup_task(task_id))
+        peer_info_list_to_wake_list(super::cleanup_task(task_id))
     }
 
     fn remove_subscriber(&self, task_id: TaskId) {

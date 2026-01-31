@@ -26,6 +26,7 @@ use crate::platform::current::uart;
 use crate::kernel::ipc;
 use crate::kernel::ipc::waker;
 use crate::kernel::shmem;
+use crate::kernel::object_service::object_service;
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -947,10 +948,9 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
 /// it subscribes to the channel, blocks the task, and waits for data.
 fn read_channel_blocking(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
     use crate::kernel::ipc::traits::Subscriber;
-    use crate::kernel::object_service::object_service;
 
     let slot = task::current_slot();
-    let subscriber = Subscriber {
+    let _subscriber = Subscriber {
         task_id,
         generation: task::Scheduler::generation_from_pid(task_id),
     };
@@ -980,10 +980,8 @@ fn read_channel_blocking(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: us
             return KernelError::PeerClosed.to_errno();
         }
 
-        // Phase 2: Subscribe to channel events (before checking for data)
-        let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
-
-        // Phase 3: Check if channel is closed or has data
+        // Phase 2: Check if channel is closed or has data
+        // (Subscription is handled by ChannelObject.subscribe() via WaitQueue)
         let is_closed = ipc::channel_is_closed(channel_id);
         let has_messages = ipc::channel_has_messages(channel_id);
 
@@ -1501,16 +1499,13 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
 
         for watch_opt in &watches {
             let Some(watch) = watch_opt.0 else { continue };
-            let channel_id = watch_opt.1;
+            let _channel_id = watch_opt.1;
             let watched_handle = Handle::from_raw(watch.handle());
 
             if let Some(entry) = table.get_mut(watched_handle) {
                 match &mut entry.object {
                     Object::Channel(ch) => {
                         ch.wait_queue_mut().subscribe(super::Waiter::from_subscriber(subscriber, watch.filter()));
-                        if channel_id != 0 {
-                            let _ = ipc::subscribe(channel_id, task_id, subscriber, ipc::WakeReason::Readable);
-                        }
                     }
                     Object::Port(p) => { p.wait_queue_mut().subscribe(super::Waiter::from_subscriber(subscriber, watch.filter())); }
                     Object::Timer(t) => {
@@ -1871,7 +1866,11 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
     let is_bus_channel = ipc::is_kernel_dispatch(channel_id);
 
     match ipc::send(channel_id, msg, pid) {
-        Ok(wake_list) => {
+        Ok(peer) => {
+            // Wake peer's ChannelObject via ObjectService WaitQueue
+            let wake_list = object_service().wake_channel(
+                peer.task_id, peer.channel_id, super::poll::READABLE,
+            );
             waker::wake(&wake_list, ipc::WakeReason::Readable);
 
             // Kernel bus channels are dispatched synchronously — the bus
@@ -2266,9 +2265,14 @@ fn map_mmio(m: &mut super::MmioObject, _task_id: u32) -> i64 {
 fn close_channel(ch: super::ChannelObject, owner: u32) {
     // Only close if not already closed (queries ipc backend)
     if !ch.is_closed() && ch.channel_id() != 0 {
-        if let Ok(wake_list) = ipc::close_channel(ch.channel_id(), owner) {
-            // Wake any subscribers waiting on this channel
-            waker::wake(&wake_list, ipc::WakeReason::Closed);
+        if let Ok(peer_opt) = ipc::close_channel(ch.channel_id(), owner) {
+            // Wake peer's ChannelObject via ObjectService WaitQueue
+            if let Some(peer) = peer_opt {
+                let wake_list = object_service().wake_channel(
+                    peer.task_id, peer.channel_id, super::poll::CLOSED,
+                );
+                waker::wake(&wake_list, ipc::WakeReason::Closed);
+            }
         }
     }
 }

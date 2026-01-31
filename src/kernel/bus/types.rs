@@ -74,49 +74,10 @@ impl BusType {
 }
 
 // =============================================================================
-// Bus Info Structure
+// Bus Info Structure (from ABI crate - single source of truth)
 // =============================================================================
 
-/// Bus information returned by bus_list syscall
-/// Layout must match userlib::syscall::BusInfo
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BusInfo {
-    /// Bus type (0=PCIe, 1=USB, 2=Platform)
-    pub bus_type: u8,
-    /// Bus index within type (e.g., 0 for pcie0)
-    pub bus_index: u8,
-    /// Current state (0=Safe, 1=Claimed, 2=Resetting)
-    pub state: u8,
-    /// Padding for alignment
-    pub _pad: u8,
-    /// MMIO base address (from DTB/hardcoded)
-    pub base_addr: u32,
-    /// Owner PID (0 if no owner)
-    pub owner_pid: u32,
-    /// Port path (e.g., "/kernel/bus/pcie0")
-    pub path: [u8; 32],
-    /// Length of path string
-    pub path_len: u8,
-    /// Reserved for future use
-    pub _reserved: [u8; 3],
-}
-
-impl BusInfo {
-    pub const fn empty() -> Self {
-        Self {
-            bus_type: 0,
-            bus_index: 0,
-            state: 0,
-            _pad: 0,
-            base_addr: 0,
-            owner_pid: 0,
-            path: [0; 32],
-            path_len: 0,
-            _reserved: [0; 3],
-        }
-    }
-}
+pub use abi::BusInfo;
 
 // =============================================================================
 // Device Info Structure

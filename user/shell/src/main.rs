@@ -246,6 +246,8 @@ fn execute_command(cmd: &[u8]) {
         cmd_jobs();
     } else if cmd_starts_with(cmd, b"log ") {
         cmd_log(&cmd[4..]);
+    } else if cmd_eq(cmd, b"klog") {
+        cmd_klog();
     } else if cmd_eq(cmd, b"logs") {
         cmd_logs(b"");
     } else if cmd_starts_with(cmd, b"logs ") {
@@ -789,6 +791,27 @@ fn cmd_fan(arg: &[u8]) {
 }
 
 /// Set kernel log level
+/// Dump all pending records from the kernel log ring
+fn cmd_klog() {
+    let mut buf = [0u8; 1024];
+    let mut count = 0u32;
+    loop {
+        let n = syscall::klog_read(&mut buf);
+        if n <= 0 {
+            break;
+        }
+        print_bytes(&buf[..n as usize]);
+        // Add newline if record doesn't end with one
+        if n > 0 && buf[(n - 1) as usize] != b'\n' {
+            println!();
+        }
+        count += 1;
+    }
+    if count == 0 {
+        println!("(kernel log ring empty)");
+    }
+}
+
 fn cmd_log(arg: &[u8]) {
     let level_str = trim(arg);
 
@@ -918,7 +941,49 @@ fn cmd_pwd() {
 
 /// Change directory
 fn cmd_cd(path_arg: &[u8]) {
+    use userlib::vfs_proto::open_flags;
+
     let path = trim(path_arg);
+
+    // "cd" with no args goes to root — always valid
+    if path.is_empty() {
+        unsafe {
+            let cwd = &mut *core::ptr::addr_of_mut!(CWD);
+            cwd.cd(path);
+        }
+        return;
+    }
+
+    // Resolve the target path relative to cwd
+    let mut resolved_buf = [0u8; cwd::MAX_PATH];
+    let resolved = unsafe {
+        let cwd = &*core::ptr::addr_of!(CWD);
+        cwd.resolve(path, &mut resolved_buf)
+    };
+    let resolved = match resolved {
+        Some(p) => p,
+        None => {
+            println!("cd: invalid path");
+            return;
+        }
+    };
+
+    // "/" is always valid (no mount needed)
+    if resolved != b"/" {
+        // Verify the directory exists via VFS
+        if let Some(client) = get_vfs_client() {
+            match client.open(resolved, open_flags::DIR | open_flags::RDONLY) {
+                Ok(handle) => {
+                    client.close(handle);
+                }
+                Err(e) => {
+                    builtins::ls::print_vfs_error(b"cd", resolved, e);
+                    return;
+                }
+            }
+        }
+        // If vfsd isn't available, allow cd anyway (path-only mode)
+    }
 
     let success = unsafe {
         let cwd = &mut *core::ptr::addr_of_mut!(CWD);
@@ -935,13 +1000,15 @@ pub fn get_cwd() -> &'static cwd::WorkingDir {
     unsafe { &*core::ptr::addr_of!(CWD) }
 }
 
-/// Get cached VFS client (discovers on first call, reuses afterward)
+/// Get cached VFS client (discovers lazily, retries on failure)
 pub fn get_vfs_client() -> Option<&'static mut VfsClient> {
     unsafe {
         let client = &mut *core::ptr::addr_of_mut!(VFS_CLIENT);
-        if client.is_none() {
-            *client = VfsClient::discover().ok();
+        if client.is_some() {
+            return client.as_mut();
         }
+        // Always retry discovery — vfsd may not have started yet
+        *client = VfsClient::discover().ok();
         client.as_mut()
     }
 }

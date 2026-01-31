@@ -129,8 +129,6 @@ pub enum TaskError {
     PermissionDenied,
     /// Signal allowlist full
     AllowlistFull,
-    /// Timer not found
-    TimerNotFound,
 }
 
 impl TaskError {
@@ -141,7 +139,6 @@ impl TaskError {
             TaskError::InvalidState => -22,    // EINVAL
             TaskError::PermissionDenied => -1, // EPERM
             TaskError::AllowlistFull => -28,   // ENOSPC
-            TaskError::TimerNotFound => -2,    // ENOENT
         }
     }
 }
@@ -218,31 +215,6 @@ pub trait TaskOperations: Send + Sync {
 
     /// Allow task to receive signals from sender
     fn allow_signals_from(&self, task_id: TaskId, sender: TaskId) -> Result<(), TaskError>;
-
-    // ========================================================================
-    // Timers
-    // ========================================================================
-
-    /// Arm a timer for the task
-    ///
-    /// # Arguments
-    /// * `task_id` - Target task
-    /// * `timer_id` - Timer slot (0-7)
-    /// * `deadline` - Tick when timer fires
-    /// * `interval` - Interval for recurring (0 = one-shot)
-    fn arm_timer(
-        &self,
-        task_id: TaskId,
-        timer_id: u32,
-        deadline: u64,
-        interval: u64,
-    ) -> Result<(), TaskError>;
-
-    /// Disarm a timer
-    fn disarm_timer(&self, task_id: TaskId, timer_id: u32) -> Result<(), TaskError>;
-
-    /// Check if timer is armed
-    fn is_timer_armed(&self, task_id: TaskId, timer_id: u32) -> bool;
 
     // ========================================================================
     // Task Info

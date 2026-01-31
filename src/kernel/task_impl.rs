@@ -12,7 +12,7 @@
 use crate::kernel::traits::task::{
     TaskOperations, TaskId, ResourceCounts, Capabilities as TraitCapabilities, TaskError,
 };
-use crate::kernel::task::{self, tcb::MAX_TIMERS_PER_TASK};
+use crate::kernel::task::{self};
 use crate::kernel::caps::Capabilities as KernelCapabilities;
 
 // ============================================================================
@@ -230,66 +230,6 @@ impl TaskOperations for KernelTaskOperations {
     }
 
     // ========================================================================
-    // Timers
-    // ========================================================================
-
-    fn arm_timer(
-        &self,
-        task_id: TaskId,
-        timer_id: u32,
-        deadline: u64,
-        interval: u64,
-    ) -> Result<(), TaskError> {
-        if timer_id as usize >= MAX_TIMERS_PER_TASK {
-            return Err(TaskError::TimerNotFound);
-        }
-
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    t.timers[timer_id as usize].id = timer_id;
-                    t.timers[timer_id as usize].deadline = deadline;
-                    t.timers[timer_id as usize].interval = interval;
-                    // Note the deadline for tickless optimization
-                    sched.note_deadline(deadline);
-                    return Ok(());
-                }
-            }
-            Err(TaskError::NotFound)
-        })
-    }
-
-    fn disarm_timer(&self, task_id: TaskId, timer_id: u32) -> Result<(), TaskError> {
-        if timer_id as usize >= MAX_TIMERS_PER_TASK {
-            return Err(TaskError::TimerNotFound);
-        }
-
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    t.timers[timer_id as usize].deadline = 0;
-                    t.timers[timer_id as usize].interval = 0;
-                    return Ok(());
-                }
-            }
-            Err(TaskError::NotFound)
-        })
-    }
-
-    fn is_timer_armed(&self, task_id: TaskId, timer_id: u32) -> bool {
-        if timer_id as usize >= MAX_TIMERS_PER_TASK {
-            return false;
-        }
-
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.timers[timer_id as usize].is_active())
-                .unwrap_or(false)
-        })
-    }
-
-    // ========================================================================
     // Task Info
     // ========================================================================
 
@@ -346,8 +286,6 @@ pub mod mock {
     const MAX_MOCK_TASKS: usize = 16;
     /// Maximum signal allowlist entries
     const MAX_ALLOWLIST: usize = 8;
-    /// Maximum timers per task
-    const MAX_TIMERS: usize = 8;
 
     /// Mock task info
     #[derive(Clone)]
@@ -361,7 +299,6 @@ pub mod mock {
         capabilities: TraitCapabilities,
         signal_allowlist: [TaskId; MAX_ALLOWLIST],
         signal_allowlist_count: usize,
-        timers: [(u64, u64); MAX_TIMERS], // (deadline, interval)
     }
 
     impl Default for MockTaskInfo {
@@ -376,7 +313,6 @@ pub mod mock {
                 capabilities: TraitCapabilities::NONE,
                 signal_allowlist: [0; MAX_ALLOWLIST],
                 signal_allowlist_count: 0,
-                timers: [(0, 0); MAX_TIMERS],
             }
         }
     }
@@ -701,62 +637,6 @@ pub mod mock {
             Err(TaskError::NotFound)
         }
 
-        fn arm_timer(
-            &self,
-            task_id: TaskId,
-            timer_id: u32,
-            deadline: u64,
-            interval: u64,
-        ) -> Result<(), TaskError> {
-            if timer_id as usize >= MAX_TIMERS {
-                return Err(TaskError::TimerNotFound);
-            }
-
-            let mut tasks = self.tasks.borrow_mut();
-            for slot in tasks.iter_mut() {
-                if let Some(ref mut t) = slot {
-                    if t.id == task_id {
-                        t.timers[timer_id as usize] = (deadline, interval);
-                        return Ok(());
-                    }
-                }
-            }
-            Err(TaskError::NotFound)
-        }
-
-        fn disarm_timer(&self, task_id: TaskId, timer_id: u32) -> Result<(), TaskError> {
-            if timer_id as usize >= MAX_TIMERS {
-                return Err(TaskError::TimerNotFound);
-            }
-
-            let mut tasks = self.tasks.borrow_mut();
-            for slot in tasks.iter_mut() {
-                if let Some(ref mut t) = slot {
-                    if t.id == task_id {
-                        t.timers[timer_id as usize] = (0, 0);
-                        return Ok(());
-                    }
-                }
-            }
-            Err(TaskError::NotFound)
-        }
-
-        fn is_timer_armed(&self, task_id: TaskId, timer_id: u32) -> bool {
-            if timer_id as usize >= MAX_TIMERS {
-                return false;
-            }
-
-            let tasks = self.tasks.borrow();
-            for slot in tasks.iter() {
-                if let Some(ref t) = slot {
-                    if t.id == task_id {
-                        return t.timers[timer_id as usize].0 != 0;
-                    }
-                }
-            }
-            false
-        }
-
         fn get_name(&self, task_id: TaskId) -> Option<[u8; 32]> {
             let tasks = self.tasks.borrow();
             for slot in tasks.iter() {
@@ -956,50 +836,6 @@ mod tests {
     }
 
     #[test]
-    fn test_timer_operations() {
-        let mock = MockTaskOperations::new();
-        mock.add_task(1, 0, "test");
-
-        // Initially not armed
-        assert!(!mock.is_timer_armed(1, 0));
-
-        // Arm timer
-        mock.arm_timer(1, 0, 1000, 100).unwrap();
-        assert!(mock.is_timer_armed(1, 0));
-
-        // Disarm timer
-        mock.disarm_timer(1, 0).unwrap();
-        assert!(!mock.is_timer_armed(1, 0));
-    }
-
-    #[test]
-    fn test_timer_invalid_id() {
-        let mock = MockTaskOperations::new();
-        mock.add_task(1, 0, "test");
-
-        // Timer ID 8 is out of range (0-7 valid)
-        assert!(matches!(mock.arm_timer(1, 8, 1000, 0), Err(TaskError::TimerNotFound)));
-        assert!(matches!(mock.disarm_timer(1, 8), Err(TaskError::TimerNotFound)));
-    }
-
-    #[test]
-    fn test_multiple_timers() {
-        let mock = MockTaskOperations::new();
-        mock.add_task(1, 0, "test");
-
-        // Arm multiple timers
-        mock.arm_timer(1, 0, 1000, 0).unwrap();
-        mock.arm_timer(1, 3, 2000, 500).unwrap();
-        mock.arm_timer(1, 7, 3000, 0).unwrap();
-
-        assert!(mock.is_timer_armed(1, 0));
-        assert!(!mock.is_timer_armed(1, 1));
-        assert!(!mock.is_timer_armed(1, 2));
-        assert!(mock.is_timer_armed(1, 3));
-        assert!(mock.is_timer_armed(1, 7));
-    }
-
-    #[test]
     fn test_task_name() {
         let mock = MockTaskOperations::new();
         mock.add_task(1, 0, "test_task");
@@ -1031,8 +867,6 @@ mod tests {
         assert!(!mock.has_capability(999, TraitCapabilities::PCI_ACCESS));
         assert!(!mock.can_receive_signal_from(999, 1));
         assert!(matches!(mock.allow_signals_from(999, 1), Err(TaskError::NotFound)));
-        assert!(!mock.has_pending_events(999));
-        assert!(matches!(mock.arm_timer(999, 0, 1000, 0), Err(TaskError::NotFound)));
         assert!(mock.get_name(999).is_none());
         assert!(mock.get_parent(999).is_none());
         assert!(!mock.exists(999));

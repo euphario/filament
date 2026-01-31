@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 userlib = { path = "../../userlib" }
+abi = { path = "../../abi" }
 
 [profile.release]
 # Changed from opt-level = "s" to "2" to fix x29 frame pointer bug

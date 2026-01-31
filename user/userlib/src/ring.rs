@@ -737,6 +737,12 @@ pub mod io_op {
     pub const CRYPTO_BASE: u8 = 0x40;
     pub const NET_BASE: u8 = 0x60;
     pub const FS_BASE: u8 = 0x80;
+
+    // Network opcodes (NET_BASE + offset)
+    pub const NET_SEND: u8 = NET_BASE;         // TX packet
+    pub const NET_RECV: u8 = NET_BASE + 1;     // RX packet (CQE from NIC)
+    pub const NET_LINK_UP: u8 = NET_BASE + 2;  // Link state change: up
+    pub const NET_LINK_DOWN: u8 = NET_BASE + 3; // Link state change: down
 }
 
 /// Layered I/O completion status codes
@@ -780,6 +786,11 @@ pub mod side_msg {
 
     // VFS registration (fatfsd → vfsd) - 0x03xx
     pub const REGISTER_MOUNT: u16 = 0x0300;
+
+    // Network queries (netsvc → NIC driver) - 0x04xx
+    pub const NET_QUERY_MAC: u16 = 0x0400;   // → 6-byte MAC in payload[0..6]
+    pub const NET_QUERY_MTU: u16 = 0x0401;   // → u16 MTU in payload[0..2]
+    pub const NET_QUERY_CAPS: u16 = 0x0402;  // → u32 capability flags in payload[0..4]
 }
 
 /// Sidechannel status codes
@@ -935,6 +946,9 @@ impl LayeredRing {
         // Allocate shared memory
         let shmem = crate::ipc::Shmem::create(total_size).ok()?;
         let base = shmem.as_ptr();
+        if base.is_null() {
+            return None;
+        }
 
         // Initialize header
         unsafe {
@@ -964,6 +978,9 @@ impl LayeredRing {
         let shmem = crate::ipc::Shmem::open_existing(shmem_id).ok()?;
 
         let base = shmem.as_ptr();
+        if base.is_null() {
+            return None;
+        }
 
         // Validate header
         unsafe {
@@ -1313,4 +1330,97 @@ pub const fn layered_ring_size(ring_size: u16, side_size: u16, pool_size: u32) -
     let cq = ring_size as usize * 16; // IoCqe is 16 bytes
     let side = side_size as usize * 32; // SideEntry is 32 bytes
     header + sq + cq + side + pool_size as usize
+}
+
+// =============================================================================
+// Doorbell - notification mechanism for ring wakeup
+// =============================================================================
+
+/// Doorbell — notification primitive for ring activity.
+///
+/// Producers ring the doorbell after posting SQ/CQ entries.
+/// Consumers register the doorbell's handle with their Mux.
+/// When the Mux fires, the consumer drains the ring then calls `ack()`.
+///
+/// Current implementation: [`ChannelDoorbell`] (backed by IPC channel).
+/// Future: could be a futex on the CQ tail, or a lightweight event object.
+pub trait Doorbell {
+    /// Notify peer that new entries are available.
+    fn ring(&self);
+
+    /// Get handle for Mux registration (event-driven wakeup).
+    fn mux_handle(&self) -> crate::syscall::Handle;
+
+    /// Drain pending notifications after Mux fires.
+    ///
+    /// Call this after the Mux wakes to clear the pending readable state,
+    /// preventing spurious re-fires.
+    fn ack(&self);
+}
+
+/// Channel-backed doorbell.
+///
+/// Uses one end of an IPC channel for notification. The ringer writes
+/// a byte, the listener's Mux fires on the channel handle.
+///
+/// Create a pair with [`ChannelDoorbell::pair()`], give the ringer to
+/// the producer and the listener to the consumer.
+pub struct ChannelDoorbell {
+    handle: crate::syscall::Handle,
+}
+
+impl ChannelDoorbell {
+    /// Create a doorbell pair: `(ringer, listener)`.
+    ///
+    /// The ringer calls [`ring()`](Doorbell::ring) after posting entries.
+    /// The listener registers [`mux_handle()`](Doorbell::mux_handle) with their Mux.
+    pub fn pair() -> Option<(Self, Self)> {
+        let (a, b) = crate::ipc::Channel::pair().ok()?;
+        let ha = a.handle();
+        let hb = b.handle();
+        // Detach handles from Channel — ChannelDoorbell owns the lifetime now
+        core::mem::forget(a);
+        core::mem::forget(b);
+        Some((
+            Self { handle: ha },
+            Self { handle: hb },
+        ))
+    }
+
+    /// Wrap an existing channel handle as a doorbell.
+    ///
+    /// Use this when the channel was obtained from a port connection
+    /// (cross-process doorbell).
+    pub fn from_handle(handle: crate::syscall::Handle) -> Self {
+        Self { handle }
+    }
+
+    /// Get the raw handle (e.g., to transfer via devd metadata).
+    pub fn handle(&self) -> crate::syscall::Handle {
+        self.handle
+    }
+}
+
+impl Doorbell for ChannelDoorbell {
+    fn ring(&self) {
+        // Write a single byte. If the channel buffer is full, the peer
+        // already has a pending notification — safe to ignore the error.
+        let _ = crate::syscall::write(self.handle, &[1]);
+    }
+
+    fn mux_handle(&self) -> crate::syscall::Handle {
+        self.handle
+    }
+
+    fn ack(&self) {
+        // Drain all pending notification bytes in one read.
+        let mut buf = [0u8; 64];
+        let _ = crate::syscall::try_read(self.handle, &mut buf);
+    }
+}
+
+impl Drop for ChannelDoorbell {
+    fn drop(&mut self) {
+        let _ = crate::syscall::close(self.handle);
+    }
 }

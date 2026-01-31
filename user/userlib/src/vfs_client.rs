@@ -94,8 +94,8 @@ impl VfsError {
 
 struct MountConnection {
     port: DataPort,
-    prefix: [u8; 24],
-    prefix_len: u8,
+    _prefix: [u8; 24],
+    _prefix_len: u8,
 }
 
 // =============================================================================
@@ -251,8 +251,8 @@ impl VfsClient {
                 .map_err(|_| VfsError::ConnectFailed)?;
             self.connections[mount_idx] = Some(MountConnection {
                 port,
-                prefix: entry.prefix,
-                prefix_len: entry.prefix_len,
+                _prefix: entry.prefix,
+                _prefix_len: entry.prefix_len,
             });
         }
         Ok(&mut self.connections[mount_idx].as_mut().unwrap().port)
@@ -714,9 +714,8 @@ fn recv_with_timeout(channel: &mut Channel, timeout_ms: u64) -> Option<[u8; 512]
     let mux = Mux::new().ok()?;
     let mut timer = Timer::new().ok()?;
 
-    let now = syscall::gettime();
-    let deadline = now + timeout_ms * 1_000_000;
-    timer.set(deadline).ok()?;
+    // Timer::set() takes a relative duration in nanoseconds
+    timer.set(timeout_ms * 1_000_000).ok()?;
 
     mux.add(channel.handle(), MuxFilter::Readable).ok()?;
     mux.add(timer.handle(), MuxFilter::Readable).ok()?;

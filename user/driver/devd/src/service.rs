@@ -185,33 +185,42 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         context_port_type: 0,
         caps: 0,
     },
-    // PCIe bus driver - enumerates PCI devices and registers them with devd
     ServiceDef {
-        binary: "pcied",
-        registers: &[PortDef::new(b"pcie:", pt::SERVICE)],  // PCI bus port
-        dependencies: &[],  // No dependencies - spawns immediately
-        auto_restart: false,
+        binary: "netsvc",
+        registers: &[PortDef::new(b"netsvc:", pt::SERVICE)],
+        dependencies: &[Dependency::Requires(b"console:")],
+        auto_restart: true,
         parent: None,
-        context_port: b"/kernel/bus/pcie0",
-        context_port_type: pt::SERVICE,
-        caps: userlib::devd::caps::DRIVER,
+        context_port: b"",
+        context_port_type: 0,
+        caps: 0,
     },
-    // xHCI USB host controller driver - DISABLED (does its own ECAM, bypasses pcied)
-    // ServiceDef {
-    //     binary: "xhcid",
-    //     registers: &[],  // Registers disk0: dynamically
-    //     dependencies: &[],  // No dependencies - spawns immediately
-    //     auto_restart: false,  // Don't restart on failure during testing
-    //     parent: None,
-    // },
-    // NVMe storage controller driver — now rule-spawned (Storage → nvmed)
-    // ServiceDef {
-    //     binary: "nvmed",
-    //     registers: &[],
-    //     dependencies: &[Dependency::Requires(b"pcie:")],
-    //     auto_restart: false,
-    //     parent: None,
-    // },
+    // Bus drivers (pcied, usbd) are now spawned dynamically via discover_kernel_buses().
+    // Device drivers (nvmed, netd, partd, fatfsd) are spawned via rules in rules.rs.
+];
+
+// =============================================================================
+// Bus Driver Rules (dynamic bus → driver mapping)
+// =============================================================================
+
+/// Maps kernel bus types to driver binaries.
+///
+/// Used by `discover_kernel_buses()` to spawn one driver per bus.
+pub struct BusDriverRule {
+    /// Bus type to match (see `abi::bus_type`)
+    pub bus_type: u8,
+    /// Binary name in initrd
+    pub binary: &'static str,
+    /// Capability bits for the spawned driver
+    pub caps: u64,
+}
+
+/// Static table mapping bus types to driver binaries.
+///
+/// Platform buses are skipped for now — consoled/gpio/pwm stay as static services.
+pub static BUS_DRIVER_RULES: &[BusDriverRule] = &[
+    BusDriverRule { bus_type: abi::bus_type::PCIE, binary: "pcied", caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::USB,  binary: "usbd",  caps: userlib::devd::caps::DRIVER },
 ];
 
 // =============================================================================
@@ -467,12 +476,22 @@ impl ServiceRegistry {
     ///
     /// Returns the slot index if successful, None if no slots available.
     pub fn create_dynamic_service(&mut self, pid: u32, name: &[u8], now: u64) -> Option<usize> {
+        self.create_dynamic_service_with_state(pid, name, now, ServiceState::Ready)
+    }
+
+    pub fn create_dynamic_service_with_state(
+        &mut self,
+        pid: u32,
+        name: &[u8],
+        now: u64,
+        initial_state: ServiceState,
+    ) -> Option<usize> {
         let slot_idx = self.find_empty_slot()?;
 
         // Create a new service in the slot
         let mut service = Service::empty();
         service.pid = pid;
-        service.state = ServiceState::Ready;  // Children are ready immediately
+        service.state = initial_state;
         service.last_change = now;
         service.def_index = 0xFF;  // No static definition
         service.set_dynamic_name(name);

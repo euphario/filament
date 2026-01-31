@@ -48,7 +48,7 @@ impl StormConfig {
     /// Create default storm config
     pub const fn new() -> Self {
         Self {
-            syscall_threshold: 50,    // Per tick
+            syscall_threshold: 500,   // Per tick (raised for driver init bursts)
             wake_threshold: 50,        // Per tick
             throttle_ticks: 10,        // ~100ms at 10ms tick
             max_strikes: 3,            // 3 strikes and you're out

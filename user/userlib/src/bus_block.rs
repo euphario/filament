@@ -5,8 +5,7 @@
 
 use crate::bus::{BlockTransport, BlockCompletion, BlockGeometry, PortError};
 use crate::data_port::{DataPort, DataPortConfig};
-use crate::ring::{IoSqe, IoCqe, SideEntry, io_status};
-use crate::error::SysError;
+use crate::ring::{IoSqe, IoCqe, SideEntry};
 
 // ============================================================================
 // ShmemBlockPort
@@ -46,6 +45,16 @@ impl ShmemBlockPort {
     /// Get mutable reference to underlying DataPort.
     pub fn data_port_mut(&mut self) -> &mut DataPort {
         &mut self.port
+    }
+
+    /// Attach a doorbell for event-driven notifications.
+    pub fn set_doorbell(&mut self, bell: crate::ring::ChannelDoorbell) {
+        self.port.set_doorbell(bell);
+    }
+
+    /// Acknowledge doorbell notification (drain pending state).
+    pub fn ack(&self) {
+        self.port.ack();
     }
 }
 
@@ -160,6 +169,10 @@ impl BlockTransport for ShmemBlockPort {
         self.port.poll_side_request()
     }
 
+    fn poll_side_response(&self) -> Option<SideEntry> {
+        self.port.poll_side_response()
+    }
+
     fn side_send(&self, entry: &SideEntry) -> bool {
         self.port.side_send(entry)
     }
@@ -176,7 +189,11 @@ impl BlockTransport for ShmemBlockPort {
         self.port.notify();
     }
 
+    fn wait(&self, timeout_ms: u32) -> bool {
+        self.port.wait(timeout_ms)
+    }
+
     fn mux_handle(&self) -> Option<crate::syscall::Handle> {
-        Some(self.port.shmem_handle())
+        Some(self.port.mux_handle())
     }
 }

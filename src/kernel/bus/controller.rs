@@ -467,7 +467,9 @@ impl BusController {
     pub fn handle_disconnect(&mut self, reason: StateChangeReason) {
         // Close the kernel-owned channel to free resources
         if let Some(ch) = self.owner_channel {
-            if let Ok(wake_list) = ipc::close_unchecked(ch) {
+            if let Ok(Some(peer)) = ipc::close_unchecked(ch) {
+                let wake_list = crate::kernel::object_service::object_service()
+                    .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
                 waker::wake(&wake_list, WakeReason::Closed);
             }
         }
@@ -552,7 +554,9 @@ impl BusController {
             msg.payload[..bytes.len()].copy_from_slice(&bytes);
 
             match ipc::send_unchecked(channel, msg) {
-                Ok(wake_list) => {
+                Ok(peer) => {
+                    let wake_list = crate::kernel::object_service::object_service()
+                        .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
                     waker::wake(&wake_list, WakeReason::Readable);
                     Ok(())
                 }

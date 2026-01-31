@@ -19,7 +19,7 @@ use crate::service::{ServiceManager, ServiceRegistry, Service};
 // =============================================================================
 
 /// Maximum number of concurrent query clients
-pub const MAX_QUERY_CLIENTS: usize = 8;
+pub const MAX_QUERY_CLIENTS: usize = 16;
 
 /// Message buffer size
 pub const MSG_BUFFER_SIZE: usize = 512;
@@ -108,6 +108,11 @@ impl QueryHandler {
     /// Get mutable client reference
     pub fn get_mut(&mut self, slot: usize) -> Option<&mut QueryClient> {
         self.clients.get_mut(slot).and_then(|c| c.as_mut())
+    }
+
+    /// Return the number of active clients
+    pub fn active_count(&self) -> usize {
+        self.client_count
     }
 
     /// Get service index for a client (if it's a driver)

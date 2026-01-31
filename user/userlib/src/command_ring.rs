@@ -594,6 +594,7 @@ mod state_flags {
     /// Consumer has closed the ring
     pub const CONSUMER_CLOSED: u32 = 1 << 1;
     /// Ring encountered an error
+    #[allow(dead_code)]
     pub const ERROR: u32 = 1 << 2;
 }
 
@@ -707,6 +708,7 @@ enum RingState {
     /// Ring has been closed.
     Closed,
     /// Ring encountered an unrecoverable error.
+    #[allow(dead_code)]
     Error,
 }
 

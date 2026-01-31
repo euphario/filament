@@ -402,28 +402,22 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
   - `ProcessOps` - Process lifecycle (exit/kill/spawn)
   - `UserAccess` - Safe user memory access
 
-### Driver Stack Migration (IN PROGRESS)
+### Driver Stack Migration (COMPLETE)
 See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for architecture.
 
-Infrastructure complete (Phases 1-4):
 - `userlib/src/ring.rs` - Ring protocol with IoSqe/IoCqe/SideEntry
 - `userlib/src/data_port.rs` - DataPort API with Layer trait
 - `devd/src/ports.rs` - Port hierarchy with parent/child
 - `devd/src/rules.rs` - Auto-spawn rules for port events
+- Consumer block ports registered with Mux for event-driven callbacks
+- partd uses async forwarding with inflight table (no blocking)
+- fatfsd uses kernel-backed `wait()` instead of `sleep_us()` polling
 
-Driver conversion TODO (Phases 5-6):
-- [ ] Convert qemu-usbd to use DataPort
-- [ ] Convert partition to use DataPort
-- [ ] Convert fatfs to use DataPort
-- [ ] Remove IPC-based block protocol
-
-### Next Steps
-1. Convert USB stack to DataPort ring protocol
-2. Migrate Service framework (`userlib/src/service.rs`) to ipc2
-3. Update devd to use ipc2 directly or updated Service
-4. Update consoled to use ipc2
-5. Update shell to use ipc2
-6. Remove legacy syscalls after all userspace migrated
+### IPC Migration (COMPLETE)
+- Unified `userlib::ipc` module (Channel, Port, Timer, Mux, EventLoop) used by all userspace
+- Legacy Service framework removed; devd, consoled, shell all use `ipc` directly
+- Legacy syscalls (6-17, 28-30, 80+) removed from kernel enum, return Invalid
+- IPC cohesion fixes applied: sidechannel doorbell, send_down() deadline enforcement
 
 ### MT7996 WiFi Driver
 - Prefetch configuration fixed to match Linux exactly
@@ -433,6 +427,16 @@ Driver conversion TODO (Phases 5-6):
 ---
 
 ## Changelog (Recent)
+
+### 2026-01-31
+- **Async Driver Stack (polling removal)**
+  - Consumer block ports now registered with Mux in `bus_runtime.rs`
+  - partd: async forwarding with fixed-size inflight table (`[Option<InflightRequest>; 16]`)
+    - `handle_ring_read()` submits to consumer and returns immediately
+    - `process_completions()` handles CQEs via `data_ready()` callback
+    - `read_block()` kept for init-time MBR scan only
+  - fatfsd: replaced `sleep_us(1000)` polling with `port.wait(10)` kernel-backed wait
+  - CLAUDE.md: Driver Stack Migration marked COMPLETE
 
 ### 2026-01-27
 - **Driver Stack Architecture Documentation**

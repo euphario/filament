@@ -23,6 +23,8 @@
 #![no_std]
 #![no_main]
 
+extern crate abi;
+
 mod service;
 mod ports;
 mod process;
@@ -43,6 +45,7 @@ use userlib::query::{
 
 use service::{
     ServiceState, ServiceManager, ServiceRegistry, PortDef,
+    BUS_DRIVER_RULES,
     MAX_SERVICES, MAX_PORTS_PER_SERVICE, MAX_RESTARTS,
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
 };
@@ -50,7 +53,7 @@ use ports::{PortRegistry, Ports, PortType};
 use process::{ProcessManager, SyscallProcessManager};
 use deps::{DependencyResolver, Dependencies};
 use devices::{DeviceStore, DeviceRegistry};
-use query::{QueryHandler, MSG_BUFFER_SIZE};
+use query::{QueryHandler, MSG_BUFFER_SIZE, MAX_QUERY_CLIENTS};
 use rules::{RulesEngine, StaticRules};
 
 // =============================================================================
@@ -662,7 +665,89 @@ impl Devd {
 
         self.services.init_from_defs();
 
+        // Discover kernel buses and spawn drivers before checking static deps
+        self.discover_kernel_buses();
+
         Ok(())
+    }
+
+    // =========================================================================
+    // Bus Discovery
+    // =========================================================================
+
+    /// Query kernel for registered buses and spawn a driver for each.
+    ///
+    /// Replaces the hardcoded pcied ServiceDef — one driver per bus instance.
+    /// Uses BUS_DRIVER_RULES to map bus_type → binary.
+    fn discover_kernel_buses(&mut self) {
+        let mut buses = [abi::BusInfo::empty(); 16];
+        let count = match userlib::ipc::bus_list(&mut buses) {
+            Ok(n) => n,
+            Err(e) => {
+                uerror!("devd", "bus_list_failed"; err = e.to_errno());
+                return;
+            }
+        };
+
+
+        uinfo!("devd", "bus_discovery"; count = count as u32);
+
+        let now = Self::now_ms();
+        for i in 0..count {
+            let bus = &buses[i];
+
+            // Find matching driver rule
+            let rule = BUS_DRIVER_RULES.iter().find(|r| r.bus_type == bus.bus_type);
+            let rule = match rule {
+                Some(r) => r,
+                None => continue,  // No driver for this bus type (e.g., Platform)
+            };
+
+            let path = &bus.path[..bus.path_len as usize];
+
+            // Spawn the driver
+            let (pid, watcher) = match self.process_mgr.spawn_with_caps(rule.binary, rule.caps) {
+                Ok(result) => result,
+                Err(_) => {
+                    uerror!("devd", "bus_driver_spawn_failed"; binary = rule.binary);
+                    continue;
+                }
+            };
+
+            // Store spawn context so driver can query GET_SPAWN_CONTEXT
+            // port_type = SERVICE (7) — bus drivers are services
+            self.store_spawn_context(pid, 7, path, &[]);
+
+            // Create dynamic service slot in Starting state.
+            // Bus drivers transition to Ready when they send STATE_CHANGE(Ready)
+            // after init(). This prevents devd from sending SpawnChild commands
+            // on the query channel while the driver is still doing synchronous
+            // register_port calls during init().
+            let slot_idx = self.services.create_dynamic_service_with_state(
+                pid, rule.binary.as_bytes(), now, ServiceState::Starting,
+            );
+
+            if let Some(idx) = slot_idx {
+                if let Some(service) = self.services.get_mut(idx) {
+                    service.watcher = Some(watcher);
+                }
+
+                self.add_recent_dynamic_pid(pid, idx as u8);
+
+                // Add watcher to event loop
+                if let Some(events) = &mut self.events {
+                    if let Some(service) = self.services.get(idx) {
+                        if let Some(w) = &service.watcher {
+                            let _ = events.watch(w.handle());
+                        }
+                    }
+                }
+
+                uinfo!("devd", "bus_driver_spawned"; binary = rule.binary, pid = pid);
+            } else {
+                uerror!("devd", "no_dynamic_slot"; binary = rule.binary, pid = pid);
+            }
+        }
     }
 
     // =========================================================================
@@ -1075,6 +1160,11 @@ impl Devd {
         let now = Self::now_ms();
 
         self.services.for_each_mut(|_i, service| {
+            // Dynamic services (bus-spawned drivers) use explicit STATE_CHANGE(Ready)
+            // protocol — never auto-transition them
+            if service.is_dynamic() {
+                return;
+            }
             let registers_empty = service.def().map(|d| d.registers.is_empty()).unwrap_or(true);
             if service.state == ServiceState::Starting
                 && registers_empty
@@ -1374,17 +1464,28 @@ impl Devd {
                     }
                 }
 
-                // Add to event loop
-                if let Some(events) = &mut self.events {
-                    let _ = events.watch(channel.handle());
-                }
+                // Save handle before moving channel into query handler
+                let ch_handle = channel.handle();
 
                 // Add to query handler
                 match self.query_handler.add_client(channel, service_idx, client_pid) {
-                    Some(_slot) => {
+                    Some(slot) => {
                         // Check if this is partd for orchestration
                         if let Some(idx) = service_idx {
                             self.check_orchestration_driver_connected(idx);
+                        }
+
+                        // Try immediate non-blocking read — clients often send
+                        // their request before we accept, so the message is
+                        // already buffered in the channel.  Process it now so
+                        // we don't depend on fitting the handle into the Mux.
+                        self.try_immediate_query_read(slot);
+
+                        // Add to event loop for future messages (best-effort —
+                        // may fail if Mux is full, but clients use non-blocking
+                        // recv with polling to avoid deadlock in that case)
+                        if let Some(events) = &mut self.events {
+                            let _ = events.watch(ch_handle);
                         }
                     }
                     None => {
@@ -1399,123 +1500,147 @@ impl Devd {
         }
     }
 
-    fn handle_query_client_event(&mut self, handle: ObjHandle) {
-        use userlib::query::{msg, QueryHeader};
-
-        let slot = match self.query_handler.find_by_handle(handle) {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Read message from client
-        let mut recv_buf = [0u8; MSG_BUFFER_SIZE];
-        let mut response_buf = [0u8; MSG_BUFFER_SIZE];
-
+    /// Try a non-blocking read from a newly accepted query client.
+    ///
+    /// Clients typically send their request before we accept, so the
+    /// message is already buffered.  Processing it here avoids depending
+    /// on fitting the channel handle into the Mux (which has limited slots).
+    fn try_immediate_query_read(&mut self, slot: usize) {
         let client = match self.query_handler.get_mut(slot) {
             Some(c) => c,
             None => return,
         };
 
-        match client.channel.recv(&mut recv_buf) {
-            Ok(len) if len > 0 => {
-                // Check message type for special handling
-                let msg_type = QueryHeader::from_bytes(&recv_buf[..len])
-                    .map(|h| h.msg_type);
-
-                match msg_type {
-                    Some(msg::REGISTER_PORT) => {
-                        // Handle port registration specially
-                        self.handle_port_register_msg(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::STATE_CHANGE) => {
-                        // Handle driver state change
-                        self.handle_state_change_msg(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::SPAWN_ACK) => {
-                        // Handle spawn acknowledgement from driver
-                        self.handle_spawn_ack_msg(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::QUERY_DRIVER) => {
-                        // Forward to driver
-                        self.handle_query_driver_forward(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::GET_SPAWN_CONTEXT) => {
-                        // Handle spawn context query from child
-                        self.handle_get_spawn_context(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::QUERY_PORT) => {
-                        // Handle port info query
-                        self.handle_query_port(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::UPDATE_PORT_SHMEM_ID) => {
-                        // Handle update shmem_id for existing port
-                        self.handle_update_port_shmem_id(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::LIST_PORTS) => {
-                        // Handle port list query
-                        self.handle_list_ports(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::LIST_SERVICES) => {
-                        // Handle service list query
-                        self.handle_list_services(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::QUERY_SERVICE_INFO) => {
-                        // Forward service info query to driver
-                        self.handle_query_service_info(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::SERVICE_INFO_RESULT) => {
-                        // Response from driver - relay to original client
-                        self.handle_service_info_result(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::LOG_MESSAGE) => {
-                        // Log message from driver
-                        self.handle_log_message(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::LOG_QUERY) => {
-                        // Query log history
-                        self.handle_log_query(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::LOG_CONTROL) => {
-                        // Control logging (on/off)
-                        self.handle_log_control(slot, &recv_buf[..len]);
-                    }
-                    // Orchestration messages from partd
-                    Some(msg::REPORT_PARTITIONS) => {
-                        self.handle_report_partitions(slot, &recv_buf[..len]);
-                    }
-                    Some(msg::PARTITION_READY) => {
-                        self.handle_partition_ready(slot, &recv_buf[..len]);
-                    }
-                    _ => {
-                        // Process normally
-                        let response_len = self.query_handler.handle_message(
-                            slot,
-                            &recv_buf[..len],
-                            &mut self.devices,
-                            &self.services,
-                            &mut response_buf,
-                        );
-
-                        if let Some(resp_len) = response_len {
-                            if let Some(client) = self.query_handler.get_mut(slot) {
-                                let _ = client.channel.send(&response_buf[..resp_len]);
-                            }
-                        }
-                    }
-                }
+        let mut recv_buf = [0u8; MSG_BUFFER_SIZE];
+        match client.channel.try_recv(&mut recv_buf) {
+            Ok(Some(len)) if len > 0 => {
+                self.dispatch_query_message(slot, &recv_buf[..len]);
             }
-            Ok(_) => {
-                // Empty read or EOF - client disconnected
+            _ => {} // No data yet — EventLoop will handle it later
+        }
+    }
+
+    fn handle_query_client_event(&mut self, handle: ObjHandle) {
+        let slot = match self.query_handler.find_by_handle(handle) {
+            Some(s) => s,
+            None => return,
+        };
+        self.try_read_query_slot(slot);
+    }
+
+    /// Non-blocking read from a single query slot.  Shared by Mux-driven
+    /// handle_query_client_event and the periodic poll_query_clients sweep.
+    fn try_read_query_slot(&mut self, slot: usize) {
+        let client = match self.query_handler.get_mut(slot) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut recv_buf = [0u8; MSG_BUFFER_SIZE];
+        match client.channel.try_recv(&mut recv_buf) {
+            Ok(Some(len)) if len > 0 => {
+                self.dispatch_query_message(slot, &recv_buf[..len]);
+            }
+            Ok(Some(_)) | Ok(None) => {
+                // No data yet — will be picked up next poll or Mux event
+            }
+            Err(SysError::PeerClosed) | Err(SysError::ConnectionReset) => {
                 self.remove_query_client(slot);
             }
-            Err(SysError::WouldBlock) => {}
-            Err(SysError::PeerClosed) => {
-                // Expected - client disconnected after query completed
-                self.remove_query_client(slot);
-            }
-            Err(e) => {
+            Err(_e) => {
                 uerror!("devd", "query_recv_failed"; slot = slot as u32);
                 self.remove_query_client(slot);
+            }
+        }
+    }
+
+    /// Poll all active query clients for pending messages.
+    ///
+    /// This handles channels that could not be watched in the Mux due to
+    /// the 16-handle limit.  Called on every event loop iteration (including
+    /// timeouts) so messages are never stuck for long.
+    fn poll_query_clients(&mut self) {
+        if self.query_handler.active_count() == 0 {
+            return;
+        }
+        for slot in 0..MAX_QUERY_CLIENTS {
+            if self.query_handler.get(slot).is_some() {
+                self.try_read_query_slot(slot);
+            }
+        }
+    }
+
+    /// Dispatch a query message by type.  Shared by handle_query_client_event
+    /// (Mux-driven) and try_immediate_query_read (accept-driven).
+    fn dispatch_query_message(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{msg, QueryHeader};
+
+        let msg_type = QueryHeader::from_bytes(buf).map(|h| h.msg_type);
+
+        match msg_type {
+            Some(msg::REGISTER_PORT) => {
+                self.handle_port_register_msg(slot, buf);
+            }
+            Some(msg::STATE_CHANGE) => {
+                self.handle_state_change_msg(slot, buf);
+            }
+            Some(msg::SPAWN_ACK) => {
+                self.handle_spawn_ack_msg(slot, buf);
+            }
+            Some(msg::QUERY_DRIVER) => {
+                self.handle_query_driver_forward(slot, buf);
+            }
+            Some(msg::GET_SPAWN_CONTEXT) => {
+                self.handle_get_spawn_context(slot, buf);
+            }
+            Some(msg::QUERY_PORT) => {
+                self.handle_query_port(slot, buf);
+            }
+            Some(msg::UPDATE_PORT_SHMEM_ID) => {
+                self.handle_update_port_shmem_id(slot, buf);
+            }
+            Some(msg::LIST_PORTS) => {
+                self.handle_list_ports(slot, buf);
+            }
+            Some(msg::LIST_SERVICES) => {
+                self.handle_list_services(slot, buf);
+            }
+            Some(msg::QUERY_SERVICE_INFO) => {
+                self.handle_query_service_info(slot, buf);
+            }
+            Some(msg::SERVICE_INFO_RESULT) => {
+                self.handle_service_info_result(slot, buf);
+            }
+            Some(msg::LOG_MESSAGE) => {
+                self.handle_log_message(slot, buf);
+            }
+            Some(msg::LOG_QUERY) => {
+                self.handle_log_query(slot, buf);
+            }
+            Some(msg::LOG_CONTROL) => {
+                self.handle_log_control(slot, buf);
+            }
+            Some(msg::REPORT_PARTITIONS) => {
+                self.handle_report_partitions(slot, buf);
+            }
+            Some(msg::PARTITION_READY) => {
+                self.handle_partition_ready(slot, buf);
+            }
+            _ => {
+                let mut response_buf = [0u8; MSG_BUFFER_SIZE];
+                let response_len = self.query_handler.handle_message(
+                    slot,
+                    buf,
+                    &mut self.devices,
+                    &self.services,
+                    &mut response_buf,
+                );
+
+                if let Some(resp_len) = response_len {
+                    if let Some(client) = self.query_handler.get_mut(slot) {
+                        let _ = client.channel.send(&response_buf[..resp_len]);
+                    }
+                }
             }
         }
     }
@@ -1566,6 +1691,7 @@ impl Devd {
     fn handle_state_change_msg(&mut self, slot: usize, buf: &[u8]) {
         use userlib::query::{StateChange, driver_state};
 
+
         // Parse the state change message
         let state_msg = match StateChange::from_bytes(buf) {
             Some(s) => s,
@@ -1579,14 +1705,21 @@ impl Devd {
         let driver_idx = match self.query_handler.get_service_idx(slot) {
             Some(idx) => idx,
             None => {
+
                 return;
             }
         };
 
         uinfo!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
 
-        // When driver reports Ready, send any pending spawn commands
+        // When driver reports Ready, transition state and send pending spawns
         if state_msg.new_state == driver_state::READY {
+            let now = Self::now_ms();
+            if let Some(service) = self.services.get_mut(driver_idx as usize) {
+                service.state = ServiceState::Ready;
+                service.last_change = now;
+            }
+
             self.flush_pending_spawns(driver_idx);
         }
     }
@@ -2376,8 +2509,8 @@ impl Devd {
     ///
     /// When a rule matches, we send SpawnChild to the port owner (parent driver)
     /// instead of spawning directly. This ensures capabilities flow down properly:
-    /// - pcied spawns xhcid (USB capability from PCI)
-    /// - xhcid spawns usbd (USB device access)
+    /// - pcied registers USB port → rules engine spawns usbd
+    /// - usbd enumerates USB devices, registers block ports
     /// - etc.
     ///
     /// IMPORTANT: SpawnChild is only sent after the owner has reported Ready.
@@ -2396,6 +2529,7 @@ impl Devd {
 
         let rule_caps = rule.caps;
 
+
         uinfo!("devd", "rule_matched"; binary = rule.driver_binary, owner = self.svc_name(owner_idx));
 
         // Check if owner service is Ready
@@ -2406,6 +2540,7 @@ impl Devd {
 
         if !owner_ready {
             // Owner not ready yet - queue for when they report Ready
+
             uinfo!("devd", "spawn_queued"; owner = self.svc_name(owner_idx), binary = rule.driver_binary);
             self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
             return;
@@ -3073,6 +3208,13 @@ impl Devd {
         // Start services that have no dependencies
         self.check_pending_services();
 
+        // Set a persistent timeout so the Mux wakes periodically even if no
+        // watched handles fire.  This lets us poll query clients whose channel
+        // handles couldn't fit into the Mux (16-handle limit).
+        if let Some(events) = &self.events {
+            let _ = events.set_timeout(100); // 100 ms
+        }
+
         loop {
             let events = self.events.as_ref().expect("devd: events not initialized");
             let wait_result = events.wait();
@@ -3083,6 +3225,7 @@ impl Devd {
                     if let Some(port) = &self.port {
                         if handle == port.handle() {
                             self.handle_port_event();
+                            self.poll_query_clients();
                             continue;
                         }
                     }
@@ -3091,6 +3234,7 @@ impl Devd {
                     if let Some(query_port) = &self.query_port {
                         if handle == query_port.handle() {
                             self.handle_query_port_event();
+                            self.poll_query_clients();
                             continue;
                         }
                     }
@@ -3098,31 +3242,38 @@ impl Devd {
                     // Query client message?
                     if self.query_handler.find_by_handle(handle).is_some() {
                         self.handle_query_client_event(handle);
+                        self.poll_query_clients();
                         continue;
                     }
 
                     // Admin client (shell) message?
                     if self.admin_clients.find_by_handle(handle).is_some() {
                         self.handle_admin_client_event(handle);
+                        self.poll_query_clients();
                         continue;
                     }
 
                     // Service restart timer?
                     if let Some(idx) = self.services.find_by_timer(handle) {
                         self.handle_restart_timer(idx);
+                        self.poll_query_clients();
                         continue;
                     }
 
                     // Process exit (watcher)?
                     self.handle_process_exit(handle);
                 }
-                Err(SysError::WouldBlock) => {
-                    // No events pending - this is normal during polling, not an error
+                Err(SysError::Timeout) | Err(SysError::WouldBlock) => {
+                    // Timeout fired or spurious wake — poll query clients
                 }
-                Err(e) => {
+                Err(_e) => {
                     uerror!("devd", "wait_failed";);
                 }
             }
+
+            // Poll all query clients for pending messages.  Handles channels
+            // that could not be added to the Mux due to the 16-slot limit.
+            self.poll_query_clients();
         }
     }
 }

@@ -104,7 +104,8 @@ mod tests;
 // Re-export types used by other kernel modules
 pub use types::{Message, MessageHeader, MessageType, ChannelId, MAX_INLINE_PAYLOAD};
 pub use error::IpcError;
-pub use traits::{Subscriber, WakeReason, Waitable, Closable};
+pub use traits::{WakeReason, Waitable, Closable};
+pub use table::{PeerInfo, PeerInfoList};
 // Note: KernelIpcBackend exists in backend.rs for trait-based testing
 // but is not re-exported since ObjectService handles operations directly
 
@@ -173,8 +174,8 @@ pub fn create_channel_pair(owner_a: u32, owner_b: u32) -> Result<(ChannelId, Cha
 
 /// Send a message on a channel.
 ///
-/// Returns a list of subscribers to wake. **Caller must wake them after
-/// releasing the lock** using `waker::wake(&wake_list, WakeReason::Readable)`.
+/// Returns peer info so the caller can wake the peer's ChannelObject
+/// via ObjectService after releasing the lock.
 ///
 /// # Arguments
 /// * `channel_id` - Channel to send on
@@ -186,7 +187,7 @@ pub fn create_channel_pair(owner_a: u32, owner_b: u32) -> Result<(ChannelId, Cha
 /// - `IpcError::NotOwner` - Caller doesn't own this channel
 /// - `IpcError::PeerClosed` - Peer channel is closed
 /// - `IpcError::QueueFull` - Message queue is full
-pub fn send(channel_id: ChannelId, msg: Message, caller: u32) -> Result<waker::WakeList, IpcError> {
+pub fn send(channel_id: ChannelId, msg: Message, caller: u32) -> Result<PeerInfo, IpcError> {
     with_channel_table(|table| table.send(channel_id, msg, caller))
 }
 
@@ -209,7 +210,8 @@ pub fn receive(channel_id: ChannelId, caller: u32) -> Result<Message, IpcError> 
 
 /// Close a channel.
 ///
-/// Notifies peer that this end is closed. Returns subscribers to wake.
+/// Notifies peer that this end is closed. Returns peer info for the caller
+/// to wake via ObjectService.
 ///
 /// # Arguments
 /// * `channel_id` - Channel to close
@@ -218,26 +220,8 @@ pub fn receive(channel_id: ChannelId, caller: u32) -> Result<Message, IpcError> 
 /// # Errors
 /// - `IpcError::NotFound` - Channel doesn't exist
 /// - `IpcError::NotOwner` - Caller doesn't own this channel
-pub fn close_channel(channel_id: ChannelId, caller: u32) -> Result<waker::WakeList, IpcError> {
+pub fn close_channel(channel_id: ChannelId, caller: u32) -> Result<Option<PeerInfo>, IpcError> {
     with_channel_table(|table| table.close(channel_id, caller))
-}
-
-/// Subscribe to events on a channel.
-///
-/// When the requested event occurs, the subscriber's task will be woken.
-///
-/// # Arguments
-/// * `channel_id` - Channel to subscribe to
-/// * `caller` - PID of subscribing task (must be owner)
-/// * `sub` - Subscriber info (task_id + generation for stale detection)
-/// * `filter` - Which events to subscribe to (Readable, Writable, Closed)
-pub fn subscribe(channel_id: ChannelId, caller: u32, sub: Subscriber, filter: WakeReason) -> Result<(), IpcError> {
-    with_channel_table(|table| table.subscribe(channel_id, caller, sub, filter))
-}
-
-/// Unsubscribe from events on a channel.
-pub fn unsubscribe(channel_id: ChannelId, caller: u32, sub: Subscriber) -> Result<(), IpcError> {
-    with_channel_table(|table| table.unsubscribe(channel_id, caller, sub))
 }
 
 /// Check if channel is ready for an operation (non-blocking poll).
@@ -252,17 +236,16 @@ pub fn poll(channel_id: ChannelId, caller: u32, filter: WakeReason) -> Result<bo
 }
 
 /// Clean up all channels owned by a task
-pub fn cleanup_task(task_id: u32) -> waker::WakeList {
+pub fn cleanup_task(task_id: u32) -> PeerInfoList {
     with_channel_table(|table| table.cleanup_task(task_id))
 }
 
-/// Remove a dying task from ALL subscriber lists
+/// Remove a dying task from ALL port subscriber lists
 ///
 /// Called when a task dies to prevent stale wakes.
-/// Scans all channels and ports to remove the task from their subscriber sets.
+/// Channel subscribers are managed by the Object layer's WaitQueue.
 pub fn remove_subscriber_from_all(task_id: u32) {
-    with_both_tables(|chan_table, port_reg| {
-        chan_table.remove_subscriber_from_all(task_id);
+    with_port_registry(|port_reg| {
         port_reg.remove_subscriber_from_all(task_id);
     })
 }
@@ -448,18 +431,6 @@ pub fn port_exists(port_id: u32) -> bool {
     with_port_registry(|reg| reg.get(port_id).is_some())
 }
 
-/// Register a waker for a channel (handle system compatibility)
-///
-/// Returns true on success, false if channel not found or subscriber set full.
-pub fn channel_register_waker(channel_id: ChannelId, task_id: u32) -> bool {
-    with_channel_table(|table| table.register_waker(channel_id, task_id).is_ok())
-}
-
-/// Unregister a waker for a channel
-pub fn channel_unregister_waker(channel_id: ChannelId, task_id: u32) {
-    let _ = with_channel_table(|table| table.unregister_waker(channel_id, task_id));
-}
-
 /// Register a waker for port Accepted events (when channel is a listen channel)
 ///
 /// Returns true on success, false if port not found or subscriber set full.
@@ -491,12 +462,12 @@ pub fn port_unregister_waker_for_channel(channel_id: ChannelId, task_id: u32) {
 
 /// Send a message directly to a channel (bypass ownership check)
 /// Used by liveness checker to send ping messages
-pub fn send_direct(channel_id: ChannelId, msg: Message) -> Result<waker::WakeList, IpcError> {
+pub fn send_direct(channel_id: ChannelId, msg: Message) -> Result<PeerInfo, IpcError> {
     with_channel_table(|table| table.send_direct(channel_id, msg))
 }
 
 /// Close a channel without ownership check (for liveness recovery)
-pub fn close_unchecked(channel_id: ChannelId) -> Result<waker::WakeList, IpcError> {
+pub fn close_unchecked(channel_id: ChannelId) -> Result<Option<PeerInfo>, IpcError> {
     with_channel_table(|table| table.close_unchecked(channel_id))
 }
 
@@ -532,8 +503,12 @@ pub fn sys_channel_create(owner: u32) -> Result<(ChannelId, ChannelId), IpcError
 /// Returns 0 on success, negative error on failure
 pub fn sys_channel_close(channel_id: ChannelId, caller: u32) -> i64 {
     match close_channel(channel_id, caller) {
-        Ok(wake_list) => {
-            waker::wake(&wake_list, WakeReason::Closed);
+        Ok(peer_opt) => {
+            if let Some(peer) = peer_opt {
+                let wake_list = crate::kernel::object_service::object_service()
+                    .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
+                waker::wake(&wake_list, WakeReason::Closed);
+            }
             0
         }
         Err(e) => e.to_errno(),
@@ -541,7 +516,7 @@ pub fn sys_channel_close(channel_id: ChannelId, caller: u32) -> i64 {
 }
 
 /// Clean up all IPC resources for a process
-pub fn process_cleanup(pid: u32) -> waker::WakeList {
+pub fn process_cleanup(pid: u32) -> PeerInfoList {
     cleanup_task(pid)
 }
 
@@ -549,7 +524,9 @@ pub fn process_cleanup(pid: u32) -> waker::WakeList {
 /// This is the kernel-internal API used by handle system
 pub fn sys_send(channel_id: ChannelId, caller: u32, data: &[u8]) -> Result<(), IpcError> {
     let msg = Message::data(caller, data);
-    let wake_list = send(channel_id, msg, caller)?;
+    let peer = send(channel_id, msg, caller)?;
+    let wake_list = crate::kernel::object_service::object_service()
+        .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
     waker::wake(&wake_list, WakeReason::Readable);
     Ok(())
 }
@@ -579,6 +556,6 @@ pub fn get_peer_owner_unchecked(channel_id: ChannelId) -> Option<u32> {
 }
 
 /// Send to a channel without ownership check (for scheme.rs connecting to daemon)
-pub fn send_unchecked(channel_id: ChannelId, msg: Message) -> Result<waker::WakeList, IpcError> {
+pub fn send_unchecked(channel_id: ChannelId, msg: Message) -> Result<PeerInfo, IpcError> {
     with_channel_table(|table| table.send_direct(channel_id, msg))
 }

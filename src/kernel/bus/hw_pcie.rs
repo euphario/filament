@@ -203,11 +203,7 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<
     // ECAM-based platforms (QEMU): set bus mastering via kernel PCI subsystem
     if bus_config().is_pcie_ecam_based() {
         use crate::kernel::pci::{self, PciBdf};
-        let bdf = PciBdf::new(
-            (device_id >> 8) as u8,
-            ((device_id >> 3) & 0x1F) as u8,
-            (device_id & 0x07) as u8,
-        );
+        let bdf = PciBdf::from_u32(device_id as u32);
         let cmd_status = pci::config_read32(bdf, 0x04).map_err(|_| super::BusError::HardwareError)?;
         let cmd16 = cmd_status as u16;
         let new_cmd = if enable { cmd16 | 0x4 } else { cmd16 & !0x4 };

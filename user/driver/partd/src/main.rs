@@ -1,7 +1,7 @@
 //! Partition Driver
 //!
 //! Composable block layer that reads MBR/GPT, discovers partitions, and serves
-//! block requests with LBA translation.
+//! block requests with LBA translation. Supports multiple disks concurrently.
 //!
 //! ## Architecture
 //!
@@ -22,7 +22,7 @@
 //! ## Flow
 //!
 //! 1. devd spawns this driver when a Block port is registered
-//! 2. Receives ATTACH_DISK command via bus framework
+//! 2. Receives ATTACH_DISK command via bus framework (one per disk)
 //! 3. Connects to disk DataPort, reads MBR, reports partitions
 //! 4. Receives REGISTER_PARTITION, creates per-partition DataPort
 //! 5. Serves block requests with LBA translation (zero-copy path)
@@ -34,7 +34,7 @@ use userlib::syscall::{self, LogLevel};
 use userlib::uerror;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
-    BlockTransport, BlockPortConfig, bus_msg,
+    BlockPortConfig, bus_msg,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::io_status;
@@ -44,11 +44,8 @@ use userlib::query::{PartitionInfoMsg, part_scheme};
 // Constants
 // =============================================================================
 
-const MAX_PARTITIONS: usize = 4;
-
-// =============================================================================
-// Logging — uses structured ulog macros from userlib
-// =============================================================================
+const MAX_DISKS: usize = 4;
+const MAX_PARTITIONS_PER_DISK: usize = 4;
 
 // =============================================================================
 // MBR Structures
@@ -56,7 +53,7 @@ const MAX_PARTITIONS: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 struct MbrEntry {
-    bootable: u8,
+    _bootable: u8,
     partition_type: u8,
     start_lba: u32,
     sector_count: u32,
@@ -65,7 +62,7 @@ struct MbrEntry {
 impl MbrEntry {
     fn from_bytes(data: &[u8]) -> Self {
         Self {
-            bootable: data[0],
+            _bootable: data[0],
             partition_type: data[4],
             start_lba: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
             sector_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
@@ -77,8 +74,6 @@ impl MbrEntry {
     }
 }
 
-
-
 struct Mbr {
     entries: [MbrEntry; 4],
     valid: bool,
@@ -88,7 +83,7 @@ impl Mbr {
     fn parse(sector: &[u8]) -> Self {
         let valid = sector.len() >= 512 && sector[510] == 0x55 && sector[511] == 0xAA;
         let mut entries = [MbrEntry {
-            bootable: 0, partition_type: 0, start_lba: 0, sector_count: 0,
+            _bootable: 0, partition_type: 0, start_lba: 0, sector_count: 0,
         }; 4];
         if valid {
             for i in 0..4 {
@@ -119,51 +114,97 @@ impl PartitionInfo {
 }
 
 // =============================================================================
+// Per-Disk State
+// =============================================================================
+
+struct DiskEntry {
+    /// Consumer port (connection to underlying disk DataPort)
+    consumer_port: PortId,
+    /// Provider port (DataPort exposed to fatfs)
+    provider_port: Option<PortId>,
+    /// Block size from underlying device
+    block_size: u32,
+    /// Discovered partitions
+    partitions: [PartitionInfo; MAX_PARTITIONS_PER_DISK],
+    partition_count: usize,
+    /// Parent disk port name
+    name: [u8; 32],
+    name_len: usize,
+}
+
+// =============================================================================
+// Inflight Request Tracking
+// =============================================================================
+
+const MAX_INFLIGHT: usize = 16;
+
+#[derive(Clone, Copy)]
+struct InflightRequest {
+    /// Tag from fatfsd's SQE (used to complete back to fatfsd)
+    provider_tag: u32,
+    /// Tag from our submit to usbd (used to match CQE)
+    consumer_tag: u32,
+    /// Offset in consumer pool where data will land
+    consumer_offset: u32,
+    /// Offset in provider pool where data should go
+    provider_offset: u32,
+    /// Which disk this request belongs to
+    disk_idx: u8,
+}
+
+// =============================================================================
 // Partition Driver (Bus Framework)
 // =============================================================================
 
 struct PartitionDriver {
-    /// Consumer port ID (connection to underlying disk DataPort)
-    consumer_port: Option<PortId>,
-    /// Provider port ID (DataPort we expose to fatfs)
-    provider_port: Option<PortId>,
-    /// Block size from underlying device
-    block_size: u32,
-    /// Total blocks from underlying device
-    total_blocks: u64,
-    /// Discovered partitions
-    partitions: [PartitionInfo; MAX_PARTITIONS],
-    partition_count: usize,
-    /// Disk shmem_id (saved for reporting)
-    disk_shmem_id: u32,
-    /// Parent disk port name
-    disk_name: [u8; 32],
-    disk_name_len: usize,
+    disks: [Option<DiskEntry>; MAX_DISKS],
+    disk_count: usize,
+    inflight: [Option<InflightRequest>; MAX_INFLIGHT],
+    inflight_count: usize,
 }
 
 impl PartitionDriver {
     const fn new() -> Self {
         Self {
-            consumer_port: None,
-            provider_port: None,
-            block_size: 512,
-            total_blocks: 0,
-            partitions: [PartitionInfo::empty(); MAX_PARTITIONS],
-            partition_count: 0,
-            disk_shmem_id: 0,
-            disk_name: [0; 32],
-            disk_name_len: 0,
+            disks: [None, None, None, None],
+            disk_count: 0,
+            inflight: [None; MAX_INFLIGHT],
+            inflight_count: 0,
         }
     }
 
-    /// Read a block from the consumer (disk) port
-    fn read_block(&self, lba: u64, buf: &mut [u8], ctx: &mut dyn BusCtx) -> bool {
-        let port_id = match self.consumer_port {
-            Some(id) => id,
+    /// Find disk by provider port ID
+    fn find_disk_by_provider(&self, port: PortId) -> Option<usize> {
+        for (i, slot) in self.disks.iter().enumerate() {
+            if let Some(d) = slot {
+                if d.provider_port == Some(port) {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find disk by consumer port ID
+    fn find_disk_by_consumer(&self, port: PortId) -> Option<usize> {
+        for (i, slot) in self.disks.iter().enumerate() {
+            if let Some(d) = slot {
+                if d.consumer_port == port {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Read a block from a specific disk's consumer port
+    fn read_block(&self, disk_idx: usize, lba: u64, buf: &mut [u8], ctx: &mut dyn BusCtx) -> bool {
+        let consumer_id = match &self.disks[disk_idx] {
+            Some(d) => d.consumer_port,
             None => return false,
         };
 
-        let port = match ctx.block_port(port_id) {
+        let port = match ctx.block_port(consumer_id) {
             Some(p) => p,
             None => return false,
         };
@@ -199,10 +240,10 @@ impl PartitionDriver {
         false
     }
 
-    /// Read MBR and discover partitions
-    fn scan_partitions(&mut self, ctx: &mut dyn BusCtx) -> usize {
+    /// Read MBR and discover partitions for a specific disk
+    fn scan_partitions(&mut self, disk_idx: usize, ctx: &mut dyn BusCtx) -> usize {
         let mut mbr_buf = [0u8; 512];
-        if !self.read_block(0, &mut mbr_buf, ctx) {
+        if !self.read_block(disk_idx, 0, &mut mbr_buf, ctx) {
             uerror!("partd", "mbr_read_failed";);
             return 0;
         }
@@ -213,25 +254,35 @@ impl PartitionDriver {
             return 0;
         }
 
-        self.partition_count = 0;
+        let disk = match &mut self.disks[disk_idx] {
+            Some(d) => d,
+            None => return 0,
+        };
+
+        disk.partition_count = 0;
         for (i, entry) in mbr.entries.iter().enumerate() {
-            if entry.is_valid() && self.partition_count < MAX_PARTITIONS {
-                self.partitions[self.partition_count] = PartitionInfo {
+            if entry.is_valid() && disk.partition_count < MAX_PARTITIONS_PER_DISK {
+                disk.partitions[disk.partition_count] = PartitionInfo {
                     index: i as u8,
                     partition_type: entry.partition_type,
                     start_lba: entry.start_lba as u64,
                     sector_count: entry.sector_count as u64,
                 };
-                self.partition_count += 1;
+                disk.partition_count += 1;
             }
         }
-        self.partition_count
+
+        let count = disk.partition_count;
+        count
     }
 
-    /// Process ring requests from fatfs on the provider port
-    fn process_ring_requests(&mut self, ctx: &mut dyn BusCtx) {
-        let provider_id = match self.provider_port {
-            Some(id) => id,
+    /// Process ring requests from fatfs on a provider port
+    fn process_ring_requests(&mut self, disk_idx: usize, ctx: &mut dyn BusCtx) {
+        let provider_id = match &self.disks[disk_idx] {
+            Some(d) => match d.provider_port {
+                Some(id) => id,
+                None => return,
+            },
             None => return,
         };
 
@@ -255,7 +306,7 @@ impl PartitionDriver {
             if let Some(sqe) = requests[i].take() {
                 match sqe.opcode {
                     userlib::ring::io_op::READ => {
-                        self.handle_ring_read(&sqe, ctx);
+                        self.handle_ring_read(disk_idx, &sqe, ctx);
                     }
                     _ => {
                         if let Some(port) = ctx.block_port(provider_id) {
@@ -287,10 +338,14 @@ impl PartitionDriver {
                 use userlib::ring::side_msg;
                 match entry.msg_type {
                     side_msg::QUERY_GEOMETRY => {
+                        let disk = match &self.disks[disk_idx] {
+                            Some(d) => d,
+                            None => continue,
+                        };
                         let info = userlib::bus::BlockGeometry {
-                            block_size: self.block_size,
-                            block_count: if self.partition_count > 0 {
-                                self.partitions[0].sector_count
+                            block_size: disk.block_size,
+                            block_count: if disk.partition_count > 0 {
+                                disk.partitions[0].sector_count
                             } else {
                                 0
                             },
@@ -302,11 +357,7 @@ impl PartitionDriver {
                         }
                     }
                     _ => {
-                        // Unknown query - complete with error
                         if let Some(port) = ctx.block_port(provider_id) {
-                            let mut eol = entry;
-                            eol.status = userlib::ring::side_status::EOL;
-                            // side_send not available via trait, use complete_error as signal
                             port.notify();
                         }
                     }
@@ -315,26 +366,34 @@ impl PartitionDriver {
         }
     }
 
-    /// Handle a ring READ request from fatfs
-    fn handle_ring_read(&mut self, sqe: &userlib::ring::IoSqe, ctx: &mut dyn BusCtx) {
-        let provider_id = match self.provider_port {
-            Some(id) => id,
+    /// Handle a ring READ request from fatfs — async submit, no polling.
+    ///
+    /// Translates LBA, submits to consumer port, stores inflight entry.
+    /// Completion arrives later via `process_completions()` when the consumer
+    /// port fires a data_ready callback.
+    fn handle_ring_read(&mut self, disk_idx: usize, sqe: &userlib::ring::IoSqe, ctx: &mut dyn BusCtx) {
+        let (provider_id, consumer_id, block_size, partition_count) = match &self.disks[disk_idx] {
+            Some(d) => (
+                match d.provider_port { Some(id) => id, None => return },
+                d.consumer_port,
+                d.block_size,
+                d.partition_count,
+            ),
             None => return,
         };
-        let consumer_id = match self.consumer_port {
-            Some(id) => id,
-            None => {
-                if let Some(port) = ctx.block_port(provider_id) {
-                    port.complete_error(sqe.tag, io_status::IO_ERROR);
-                    port.notify();
-                }
-                return;
+
+        // Check inflight capacity
+        if self.inflight_count >= MAX_INFLIGHT {
+            if let Some(port) = ctx.block_port(provider_id) {
+                port.complete_error(sqe.tag, io_status::IO_ERROR);
+                port.notify();
             }
-        };
+            return;
+        }
 
         // Partition index from param field
         let part_idx = sqe.param as usize;
-        if part_idx >= self.partition_count {
+        if part_idx >= partition_count {
             if let Some(port) = ctx.block_port(provider_id) {
                 port.complete_error(sqe.tag, io_status::INVALID);
                 port.notify();
@@ -342,11 +401,14 @@ impl PartitionDriver {
             return;
         }
 
-        let part = &self.partitions[part_idx];
+        let (start_lba, sector_count) = match &self.disks[disk_idx] {
+            Some(d) => (d.partitions[part_idx].start_lba, d.partitions[part_idx].sector_count),
+            None => return,
+        };
 
         // Validate LBA
-        let sectors = (sqe.data_len / self.block_size) as u64;
-        if sqe.lba + sectors > part.sector_count {
+        let sectors = (sqe.data_len / block_size) as u64;
+        if sqe.lba + sectors > sector_count {
             if let Some(port) = ctx.block_port(provider_id) {
                 port.complete_error(sqe.tag, io_status::IO_ERROR);
                 port.notify();
@@ -355,7 +417,7 @@ impl PartitionDriver {
         }
 
         // Translate LBA
-        let disk_lba = part.start_lba + sqe.lba;
+        let disk_lba = start_lba + sqe.lba;
 
         // Allocate in consumer's pool
         let consumer_offset = match ctx.block_port(consumer_id).and_then(|p| p.alloc(sqe.data_len)) {
@@ -387,69 +449,123 @@ impl PartitionDriver {
             port.notify();
         }
 
-        // Poll for completion from disk
-        let mut transferred = 0u32;
-        let mut success = false;
+        // Store inflight entry — completion arrives via process_completions()
+        for slot in &mut self.inflight {
+            if slot.is_none() {
+                *slot = Some(InflightRequest {
+                    provider_tag: sqe.tag,
+                    consumer_tag,
+                    consumer_offset,
+                    provider_offset: sqe.data_offset,
+                    disk_idx: disk_idx as u8,
+                });
+                self.inflight_count += 1;
+                return;
+            }
+        }
 
-        for _ in 0..1000 {
-            if let Some(port) = ctx.block_port(consumer_id) {
-                if let Some(cqe) = port.poll_completion() {
-                    if cqe.tag == consumer_tag {
-                        if cqe.status == io_status::OK as u16 {
-                            transferred = cqe.transferred;
-                            success = true;
-                        }
+        // Should not reach here (checked capacity above), but handle gracefully
+        if let Some(port) = ctx.block_port(provider_id) {
+            port.complete_error(sqe.tag, io_status::IO_ERROR);
+            port.notify();
+        }
+    }
+
+    /// Process completions from a consumer port (CQEs from usbd/nvmed).
+    ///
+    /// For each CQE, matches the inflight entry by consumer_tag, copies data
+    /// from consumer pool to provider pool, and completes back to fatfsd.
+    fn process_completions(&mut self, disk_idx: usize, ctx: &mut dyn BusCtx) {
+        let consumer_id = match &self.disks[disk_idx] {
+            Some(d) => d.consumer_port,
+            None => return,
+        };
+
+        // Drain all available CQEs
+        loop {
+            let cqe = match ctx.block_port(consumer_id).and_then(|p| p.poll_completion()) {
+                Some(c) => c,
+                None => break,
+            };
+
+            // Find matching inflight entry
+            let mut found = None;
+            for (i, slot) in self.inflight.iter_mut().enumerate() {
+                if let Some(req) = slot {
+                    if req.consumer_tag == cqe.tag {
+                        found = Some((i, *req));
+                        *slot = None;
+                        self.inflight_count -= 1;
                         break;
                     }
                 }
             }
-            syscall::sleep_us(1000);
-        }
 
-        if !success {
-            if let Some(port) = ctx.block_port(provider_id) {
-                port.complete_error(sqe.tag, io_status::IO_ERROR);
-                port.notify();
+            let (_, req) = match found {
+                Some(f) => f,
+                None => continue, // Stale or unknown CQE
+            };
+
+            let provider_id = match &self.disks[req.disk_idx as usize] {
+                Some(d) => match d.provider_port {
+                    Some(id) => id,
+                    None => continue,
+                },
+                None => continue,
+            };
+
+            if cqe.status != io_status::OK as u16 {
+                if let Some(port) = ctx.block_port(provider_id) {
+                    port.complete_error(req.provider_tag, io_status::IO_ERROR);
+                    port.notify();
+                }
+                continue;
             }
-            return;
-        }
 
-        // Copy from consumer pool to provider pool (the ONE copy in the chain)
-        let copy_ok = {
-            let src_info = ctx.block_port(consumer_id).and_then(|p| {
-                p.pool_slice(consumer_offset, transferred).map(|s| {
-                    (s.as_ptr(), s.len())
-                })
-            });
-
-            if let Some((src_ptr, src_len)) = src_info {
-                let dst_info = ctx.block_port(provider_id).and_then(|p| {
-                    p.pool_slice_mut(sqe.data_offset, transferred).map(|d| {
-                        (d.as_mut_ptr(), d.len())
+            // Copy from consumer pool to provider pool
+            let copy_ok = {
+                let src_info = ctx.block_port(consumer_id).and_then(|p| {
+                    p.pool_slice(req.consumer_offset, cqe.transferred).map(|s| {
+                        (s.as_ptr(), s.len())
                     })
                 });
 
-                if let Some((dst_ptr, dst_len)) = dst_info {
-                    let copy_len = src_len.min(dst_len);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_len);
+                if let Some((src_ptr, src_len)) = src_info {
+                    let dst_info = ctx.block_port(provider_id).and_then(|p| {
+                        p.pool_slice_mut(req.provider_offset, cqe.transferred).map(|d| {
+                            (d.as_mut_ptr(), d.len())
+                        })
+                    });
+
+                    if let Some((dst_ptr, dst_len)) = dst_info {
+                        let copy_len = src_len.min(dst_len);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_len);
+                        }
+                        true
+                    } else {
+                        false
                     }
-                    true
                 } else {
                     false
                 }
-            } else {
-                false
-            }
-        };
+            };
 
-        if let Some(port) = ctx.block_port(provider_id) {
-            if copy_ok {
-                port.complete_ok(sqe.tag, transferred);
-            } else {
-                port.complete_error(sqe.tag, io_status::IO_ERROR);
+            if let Some(port) = ctx.block_port(provider_id) {
+                if copy_ok {
+                    port.complete_ok(req.provider_tag, cqe.transferred);
+                } else {
+                    port.complete_error(req.provider_tag, io_status::IO_ERROR);
+                }
+                port.notify();
             }
-            port.notify();
+        }
+
+        // Reset consumer pool when all inflight requests are done
+        if self.inflight_count == 0 {
+            if let Some(port) = ctx.block_port(consumer_id) {
+                port.reset_pool();
+            }
         }
     }
 
@@ -465,45 +581,59 @@ impl PartitionDriver {
         };
 
         append(&mut buf, &mut pos, b"Partition Driver (bus framework)\n");
-        append(&mut buf, &mut pos, b"  Disk: ");
-        append(&mut buf, &mut pos, &self.disk_name[..self.disk_name_len]);
-        append(&mut buf, &mut pos, b" (");
         let mut num_buf = [0u8; 16];
-        let num_len = format_u32(&mut num_buf, self.block_size);
-        append(&mut buf, &mut pos, &num_buf[..num_len]);
-        append(&mut buf, &mut pos, b" bytes/sector)\n\nPartitions: ");
-        let num_len = format_u32(&mut num_buf, self.partition_count as u32);
+        append(&mut buf, &mut pos, b"  Disks: ");
+        let num_len = format_u32(&mut num_buf, self.disk_count as u32);
         append(&mut buf, &mut pos, &num_buf[..num_len]);
         append(&mut buf, &mut pos, b"\n");
 
-        for i in 0..self.partition_count {
-            let p = &self.partitions[i];
-            let type_name = match p.partition_type {
-                0x01 | 0x04 | 0x06 | 0x0E => b"FAT16" as &[u8],
-                0x0B | 0x0C => b"FAT32",
-                0x07 => b"NTFS",
-                0x82 => b"Linux swap",
-                0x83 => b"Linux",
-                0xEE => b"GPT",
-                _ => b"Unknown",
+        for (di, slot) in self.disks.iter().enumerate() {
+            let d = match slot {
+                Some(d) => d,
+                None => continue,
             };
-            let size_mb = (p.sector_count * self.block_size as u64) / (1024 * 1024);
-
-            append(&mut buf, &mut pos, b"  part");
-            let num_len = format_u32(&mut num_buf, i as u32);
+            append(&mut buf, &mut pos, b"\n  Disk ");
+            let num_len = format_u32(&mut num_buf, di as u32);
             append(&mut buf, &mut pos, &num_buf[..num_len]);
             append(&mut buf, &mut pos, b": ");
-            append(&mut buf, &mut pos, type_name);
-            append(&mut buf, &mut pos, b" (0x");
-            let num_len = format_hex(&mut num_buf, p.partition_type as u32, 2);
+            append(&mut buf, &mut pos, &d.name[..d.name_len]);
+            append(&mut buf, &mut pos, b" (");
+            let num_len = format_u32(&mut num_buf, d.block_size);
             append(&mut buf, &mut pos, &num_buf[..num_len]);
-            append(&mut buf, &mut pos, b"), LBA ");
-            let num_len = format_u64(&mut num_buf, p.start_lba);
+            append(&mut buf, &mut pos, b" bytes/sector, ");
+            let num_len = format_u32(&mut num_buf, d.partition_count as u32);
             append(&mut buf, &mut pos, &num_buf[..num_len]);
-            append(&mut buf, &mut pos, b", ");
-            let num_len = format_u64(&mut num_buf, size_mb);
-            append(&mut buf, &mut pos, &num_buf[..num_len]);
-            append(&mut buf, &mut pos, b" MB\n");
+            append(&mut buf, &mut pos, b" partitions)\n");
+
+            for i in 0..d.partition_count {
+                let p = &d.partitions[i];
+                let type_name = match p.partition_type {
+                    0x01 | 0x04 | 0x06 | 0x0E => b"FAT16" as &[u8],
+                    0x0B | 0x0C => b"FAT32",
+                    0x07 => b"NTFS",
+                    0x82 => b"Linux swap",
+                    0x83 => b"Linux",
+                    0xEE => b"GPT",
+                    _ => b"Unknown",
+                };
+                let size_mb = (p.sector_count * d.block_size as u64) / (1024 * 1024);
+
+                append(&mut buf, &mut pos, b"    part");
+                let num_len = format_u32(&mut num_buf, i as u32);
+                append(&mut buf, &mut pos, &num_buf[..num_len]);
+                append(&mut buf, &mut pos, b": ");
+                append(&mut buf, &mut pos, type_name);
+                append(&mut buf, &mut pos, b" (0x");
+                let num_len = format_hex(&mut num_buf, p.partition_type as u32, 2);
+                append(&mut buf, &mut pos, &num_buf[..num_len]);
+                append(&mut buf, &mut pos, b"), LBA ");
+                let num_len = format_u64(&mut num_buf, p.start_lba);
+                append(&mut buf, &mut pos, &num_buf[..num_len]);
+                append(&mut buf, &mut pos, b", ");
+                let num_len = format_u64(&mut num_buf, size_mb);
+                append(&mut buf, &mut pos, &num_buf[..num_len]);
+                append(&mut buf, &mut pos, b" MB\n");
+            }
         }
 
         buf
@@ -516,7 +646,7 @@ impl PartitionDriver {
 
 impl Driver for PartitionDriver {
     fn init(&mut self, _ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        // Nothing to do — wait for ATTACH_DISK command from devd
+        // Nothing to do — wait for ATTACH_DISK commands from devd
         Ok(())
     }
 
@@ -525,7 +655,7 @@ impl Driver for PartitionDriver {
             bus_msg::ATTACH_DISK => {
                 let shmem_id = msg.read_u32(0);
                 let block_size = msg.read_u32(4);
-                let block_count = msg.read_u64(8);
+                let _block_count = msg.read_u64(8);
                 // Source name starts at offset 16
                 let source_end = (msg.payload_len as usize).min(240);
                 let source_start = 16;
@@ -538,51 +668,67 @@ impl Driver for PartitionDriver {
 
                 syscall::klog(LogLevel::Info, b"[partd] AttachDisk");
 
-                // Save disk info
-                self.disk_shmem_id = shmem_id;
-                let copy_len = source_len.min(32);
-                self.disk_name[..copy_len].copy_from_slice(&source_name[..copy_len]);
-                self.disk_name_len = copy_len;
+                // Find an empty disk slot
+                let disk_idx = match self.disks.iter().position(|s| s.is_none()) {
+                    Some(i) => i,
+                    None => {
+                        uerror!("partd", "too_many_disks";);
+                        return Disposition::Handled;
+                    }
+                };
 
                 // Connect to disk DataPort
                 match ctx.connect_block_port(shmem_id) {
                     Ok(port_id) => {
-                        self.consumer_port = Some(port_id);
+                        let mut name = [0u8; 32];
+                        let copy_len = source_len.min(32);
+                        name[..copy_len].copy_from_slice(&source_name[..copy_len]);
+
+                        let mut bs = if block_size > 0 { block_size } else { 512 };
 
                         // Query geometry
                         if let Some(port) = ctx.block_port(port_id) {
                             if let Some(geo) = port.query_geometry() {
-                                self.block_size = geo.block_size;
-                                self.total_blocks = geo.block_count;
-                            } else {
-                                self.block_size = if block_size > 0 { block_size } else { 512 };
-                                self.total_blocks = block_count;
+                                bs = geo.block_size;
                             }
                         }
 
+                        self.disks[disk_idx] = Some(DiskEntry {
+                            consumer_port: port_id,
+                            provider_port: None,
+                            block_size: bs,
+                            partitions: [PartitionInfo::empty(); MAX_PARTITIONS_PER_DISK],
+                            partition_count: 0,
+                            name,
+                            name_len: copy_len,
+                        });
+                        self.disk_count += 1;
+
                         // Scan partitions
-                        let count = self.scan_partitions(ctx);
+                        let count = self.scan_partitions(disk_idx, ctx);
 
                         if count > 0 {
                             // Build partition info for devd
-                            let mut part_infos = [PartitionInfoMsg::new(); MAX_PARTITIONS];
-                            for i in 0..count {
-                                let p = &self.partitions[i];
-                                part_infos[i] = PartitionInfoMsg {
-                                    index: p.index,
-                                    part_type: p.partition_type,
-                                    bootable: 0,
-                                    _pad: 0,
-                                    start_lba: p.start_lba,
-                                    size_sectors: p.sector_count,
-                                    guid: [0; 16],
-                                    label: [0; 36],
-                                };
+                            let mut part_infos = [PartitionInfoMsg::new(); MAX_PARTITIONS_PER_DISK];
+                            if let Some(d) = &self.disks[disk_idx] {
+                                for i in 0..count {
+                                    let p = &d.partitions[i];
+                                    part_infos[i] = PartitionInfoMsg {
+                                        index: p.index,
+                                        part_type: p.partition_type,
+                                        bootable: 0,
+                                        _pad: 0,
+                                        start_lba: p.start_lba,
+                                        size_sectors: p.sector_count,
+                                        guid: [0; 16],
+                                        label: [0; 36],
+                                    };
+                                }
                             }
 
                             // Report to devd
                             if let Err(_) = ctx.report_partitions(
-                                self.disk_shmem_id,
+                                shmem_id,
                                 part_scheme::MBR,
                                 &part_infos[..count],
                             ) {
@@ -590,7 +736,7 @@ impl Driver for PartitionDriver {
                             }
                         }
                     }
-                    Err(e) => {
+                    Err(_) => {
                         uerror!("partd", "disk_connect_failed";);
                     }
                 }
@@ -599,10 +745,31 @@ impl Driver for PartitionDriver {
             }
 
             bus_msg::REGISTER_PARTITION => {
-                let index = msg.read_u8(0) as usize;
+                let _index = msg.read_u8(0) as usize;
                 let name = msg.read_bytes(1, 32);
                 let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
                 let part_name = &msg.payload[1..1 + name_len];
+
+                // Find the disk that has a partition at this index without a provider port yet.
+                // We look for the most recently added disk that needs a provider port for this
+                // partition index, since REGISTER_PARTITION arrives in order after REPORT_PARTITIONS.
+                let disk_idx = self.disks.iter().enumerate().rev()
+                    .find_map(|(i, slot)| {
+                        if let Some(d) = slot {
+                            if d.provider_port.is_none() && d.partition_count > 0 {
+                                return Some(i);
+                            }
+                        }
+                        None
+                    });
+
+                let disk_idx = match disk_idx {
+                    Some(i) => i,
+                    None => {
+                        uerror!("partd", "no_disk_for_partition";);
+                        return Disposition::Handled;
+                    }
+                };
 
                 // Create provider DataPort for this partition
                 let config = BlockPortConfig {
@@ -616,13 +783,16 @@ impl Driver for PartitionDriver {
                         if let Some(port) = ctx.block_port(port_id) {
                             port.set_public();
                             let shmem_id = port.shmem_id();
-                            self.provider_port = Some(port_id);
+
+                            if let Some(d) = &mut self.disks[disk_idx] {
+                                d.provider_port = Some(port_id);
+                            }
 
                             // Notify devd
                             let _ = ctx.partition_ready(part_name, shmem_id);
                         }
                     }
-                    Err(e) => {
+                    Err(_) => {
                         uerror!("partd", "dataport_create_failed";);
                     }
                 }
@@ -642,8 +812,12 @@ impl Driver for PartitionDriver {
     }
 
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        if self.provider_port == Some(port) {
-            self.process_ring_requests(ctx);
+        if let Some(disk_idx) = self.find_disk_by_provider(port) {
+            // SQEs from fatfsd — translate and forward to consumer
+            self.process_ring_requests(disk_idx, ctx);
+        } else if let Some(disk_idx) = self.find_disk_by_consumer(port) {
+            // CQEs from usbd — match inflight, copy data, complete to fatfsd
+            self.process_completions(disk_idx, ctx);
         }
     }
 }

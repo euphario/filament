@@ -818,7 +818,10 @@ impl ObjectService {
         let msg = ipc::Message::data(task_id, buf);
 
         match ipc::send(channel_id, msg, task_id) {
-            Ok(wake_list) => {
+            Ok(peer) => {
+                let wake_list = self.wake_channel(
+                    peer.task_id, peer.channel_id, abi::mux_filter::READABLE,
+                );
                 waker::wake(&wake_list, ipc::WakeReason::Readable);
                 Ok(buf.len())
             }
@@ -1214,6 +1217,50 @@ impl ObjectService {
         }
 
         wake_list
+    }
+
+    // ========================================================================
+    // Channel Wake (for unified subscriber model)
+    // ========================================================================
+
+    /// Wake subscribers on a ChannelObject's WaitQueue
+    ///
+    /// Called after ipc::send() or ipc::close_channel() returns PeerInfo.
+    /// Scans the peer task's handle table for a ChannelObject matching
+    /// the given channel_id, then fires its WaitQueue with the event.
+    ///
+    /// Safe to call even if the peer has already closed — the scan simply
+    /// finds no matching ChannelObject and returns an empty WakeList.
+    pub fn wake_channel(
+        &self,
+        task_id: TaskId,
+        channel_id: u32,
+        event: u8,
+    ) -> crate::kernel::ipc::waker::WakeList {
+        let slot = match slot_from_task_id(task_id) {
+            Some(s) => s,
+            None => return crate::kernel::ipc::waker::WakeList::new(),
+        };
+
+        let mut guard = match self.lock_slot(slot) {
+            Ok(g) => g,
+            Err(_) => return crate::kernel::ipc::waker::WakeList::new(),
+        };
+
+        let table = match guard.table_mut() {
+            Ok(t) => t,
+            Err(_) => return crate::kernel::ipc::waker::WakeList::new(),
+        };
+
+        for entry in table.entries_mut() {
+            if let Object::Channel(ref mut ch) = entry.object {
+                if ch.channel_id() == channel_id {
+                    return ch.wait_queue_mut().wake(event);
+                }
+            }
+        }
+
+        crate::kernel::ipc::waker::WakeList::new()
     }
 }
 

@@ -14,16 +14,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "userlib"
-version = "0.1.0"
-dependencies = [
- "abi",
-]
-
-[[package]]
-name = "xhcid"
+name = "usbd"
 version = "0.1.0"
 dependencies = [
  "usb",
  "userlib",
+]
+
+[[package]]
+name = "userlib"
+version = "0.1.0"
+dependencies = [
+ "abi",
 ]

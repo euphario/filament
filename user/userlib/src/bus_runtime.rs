@@ -14,14 +14,14 @@
 //! - **driver-registered handles** — custom handles via `ctx.watch_handle()`
 
 use crate::bus::{
-    BusMsg, BusMsgFlags, BusError, BusCtx, Driver, Disposition, SpawnContext,
+    BusMsg, BusError, BusCtx, Driver, Disposition, SpawnContext,
     ChildId, PortId, KernelBusId, KernelBusInfo, KernelBusState, KernelBusChangeReason,
     BlockTransport, BlockPortConfig,
-    MAX_CHILDREN, MAX_PORTS, MAX_KERNEL_BUSES, bus_msg,
+    MAX_CHILDREN, MAX_PORTS, MAX_KERNEL_BUSES, MAX_PENDING, bus_msg,
 };
 use crate::bus_block::ShmemBlockPort;
 use crate::devd::{DevdClient, DevdCommand, DriverState};
-use crate::ipc::{Channel, Mux, MuxFilter, ObjHandle};
+use crate::ipc::{Channel, Mux, MuxFilter};
 use crate::syscall::{self, Handle, LogLevel};
 
 // ============================================================================
@@ -155,6 +155,19 @@ fn build_set_driver_msg(driver_pid: u32) -> [u8; 5] {
 }
 
 // ============================================================================
+// Pending Request Tracking
+// ============================================================================
+
+/// A pending request sent via `send_down()` with a deadline.
+struct PendingRequest {
+    /// Sequence ID returned to the caller.
+    seq: u32,
+    /// Absolute deadline in nanoseconds (from `gettime()`).
+    /// 0 means no deadline (infinite timeout).
+    deadline_ns: u64,
+}
+
+// ============================================================================
 // Runtime Context
 // ============================================================================
 
@@ -209,6 +222,10 @@ struct RuntimeCtx {
     name_len: usize,
     /// Cached spawn context (queried once from devd).
     spawn_ctx: SpawnCtxCache,
+    /// Pending requests with deadlines (from `send_down()`).
+    pending: [Option<PendingRequest>; MAX_PENDING],
+    /// Number of active pending requests.
+    pending_count: usize,
 }
 
 impl RuntimeCtx {
@@ -233,6 +250,8 @@ impl RuntimeCtx {
             name: name_buf,
             name_len: len,
             spawn_ctx: SpawnCtxCache::NotQueried,
+            pending: [const { None }; MAX_PENDING],
+            pending_count: 0,
         }
     }
 
@@ -245,6 +264,73 @@ impl RuntimeCtx {
         seq
     }
 
+    /// Return the nearest deadline in ms from now, or 0 if no pending deadlines.
+    ///
+    /// Used to set the Mux timeout so the event loop wakes up to fire
+    /// expired deadline callbacks even if no I/O event arrives.
+    fn nearest_deadline_ms(&self) -> u32 {
+        if self.pending_count == 0 {
+            return 0;
+        }
+        let now = syscall::gettime();
+        let mut nearest: u64 = u64::MAX;
+        for slot in &self.pending {
+            if let Some(req) = slot {
+                if req.deadline_ns > 0 && req.deadline_ns < nearest {
+                    nearest = req.deadline_ns;
+                }
+            }
+        }
+        if nearest == u64::MAX {
+            return 0;
+        }
+        if nearest <= now {
+            return 1; // Already expired, wake immediately
+        }
+        // Convert delta to ms, round up
+        let delta_ns = nearest - now;
+        let ms = (delta_ns + 999_999) / 1_000_000;
+        ms.min(u32::MAX as u64) as u32
+    }
+
+    /// Drain all expired pending requests. Returns seq IDs of expired ones.
+    ///
+    /// Caller should invoke `Driver::deadline()` for each returned seq ID.
+    fn drain_expired(&mut self, expired: &mut [u32; MAX_PENDING]) -> usize {
+        if self.pending_count == 0 {
+            return 0;
+        }
+        let now = syscall::gettime();
+        let mut count = 0;
+        for slot in &mut self.pending {
+            if let Some(req) = slot {
+                if req.deadline_ns > 0 && req.deadline_ns <= now {
+                    if count < MAX_PENDING {
+                        expired[count] = req.seq;
+                        count += 1;
+                    }
+                    *slot = None;
+                    self.pending_count -= 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Remove a pending request by seq ID (called when response arrives).
+    #[allow(dead_code)]
+    fn cancel_pending(&mut self, seq: u32) {
+        for slot in &mut self.pending {
+            if let Some(req) = slot {
+                if req.seq == seq {
+                    *slot = None;
+                    self.pending_count -= 1;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Register the devd channel with the Mux.
     fn register_devd_handle(&mut self) {
         if let Some(h) = self.devd.handle() {
@@ -253,7 +339,9 @@ impl RuntimeCtx {
         }
     }
 
-    /// Register a block port's shmem handle with the Mux.
+    /// Register a block port's handle with the Mux.
+    ///
+    /// Uses the doorbell handle if set, otherwise falls back to shmem handle.
     fn register_block_port_handle(&mut self, port_idx: usize) {
         if let Some(ref port) = self.block_ports[port_idx] {
             if let Some(h) = port.mux_handle() {
@@ -283,11 +371,26 @@ impl BusCtx for RuntimeCtx {
         &mut self,
         msg_type: u32,
         payload: &[u8],
-        _deadline_ms: u32,
+        deadline_ms: u32,
     ) -> Result<u32, BusError> {
         let seq = self.alloc_seq();
         let _ = msg_type;
         let _ = payload;
+
+        // Track deadline if non-zero
+        if deadline_ms > 0 {
+            let deadline_ns = syscall::gettime() + (deadline_ms as u64) * 1_000_000;
+            // Find a free slot
+            for slot in &mut self.pending {
+                if slot.is_none() {
+                    *slot = Some(PendingRequest { seq, deadline_ns });
+                    self.pending_count += 1;
+                    return Ok(seq);
+                }
+            }
+            // No space — still return the seq but without deadline tracking
+        }
+
         Ok(seq)
     }
 
@@ -634,18 +737,38 @@ impl<D: Driver> DriverRuntime<D> {
             };
             let elen = err_name.len().min(40);
             buf[19..19 + elen].copy_from_slice(&err_name.as_bytes()[..elen]);
+            crate::ulog::flush();
             syscall::klog(LogLevel::Error, &buf[..19 + elen]);
             syscall::exit(1);
         }
 
+        // Flush structured logs from init before entering event loop
+        crate::ulog::flush();
+
         // Report ready to devd
         let _ = self.ctx.devd.report_state(DriverState::Ready);
 
-        // Event loop: block on Mux, dispatch, repeat
+        // Event loop: block on Mux, dispatch deadlines, repeat
         loop {
-            let event = match self.ctx.mux.wait() {
-                Ok(ev) => ev,
-                Err(_) => continue,
+            // Fire any expired deadlines before blocking
+            let mut expired = [0u32; MAX_PENDING];
+            let n_expired = self.ctx.drain_expired(&mut expired);
+            for i in 0..n_expired {
+                self.driver.deadline(expired[i], &mut self.ctx);
+            }
+
+            // Block until next event or nearest deadline
+            let timeout_ms = self.ctx.nearest_deadline_ms();
+            let event = if timeout_ms > 0 {
+                match self.ctx.mux.wait_timeout(timeout_ms) {
+                    Ok(ev) => ev,
+                    Err(_) => continue, // Timeout or error — loop to check deadlines
+                }
+            } else {
+                match self.ctx.mux.wait() {
+                    Ok(ev) => ev,
+                    Err(_) => continue,
+                }
             };
 
             let handle = event.handle;
@@ -661,32 +784,36 @@ impl<D: Driver> DriverRuntime<D> {
                 // (Mux fires again if more data is pending on the channel)
                 match self.ctx.devd.poll_command() {
                     Ok(Some(cmd)) => self.dispatch_devd_command(cmd),
-                    Ok(None) | Err(_) => {}
+                    Ok(None) => {}
+                    Err(_) => {
+                        // Devd channel broken — remove from Mux to prevent hot-loop.
+                        // Driver continues running with existing state but cannot
+                        // receive new commands from devd.
+                        let _ = self.ctx.mux.remove(handle);
+                        self.ctx.handles.remove(handle);
+                    }
                 }
             } else if tag >= TAG_KERNEL_BUS_BASE && tag < TAG_BLOCK_PORT_BASE {
                 // Kernel bus state notification
                 let bus_idx = (tag - TAG_KERNEL_BUS_BASE) as usize;
                 self.handle_kernel_bus_event(bus_idx);
             } else if tag >= TAG_BLOCK_PORT_BASE && tag < TAG_DEVD {
-                // Block port shmem notification
+                // Block port notification (doorbell or shmem)
                 let port_idx = (tag - TAG_BLOCK_PORT_BASE) as usize;
                 if port_idx < MAX_BLOCK_PORTS {
-                    // Check for actual activity before dispatching
-                    let has_activity = if let Some(ref port) = self.ctx.block_ports[port_idx] {
-                        let dp = port.data_port();
-                        dp.sq_pending() > 0 || dp.cq_pending() > 0 || dp.side_pending() > 0
-                    } else {
-                        false
-                    };
-
-                    if has_activity {
-                        self.driver.data_ready(PortId(port_idx as u8), &mut self.ctx);
+                    // Ack the doorbell to prevent spurious re-fires
+                    if let Some(ref port) = self.ctx.block_ports[port_idx] {
+                        port.ack();
                     }
+                    self.driver.data_ready(PortId(port_idx as u8), &mut self.ctx);
                 }
             } else {
                 // Driver-registered handle
                 self.driver.handle_event(tag, handle, &mut self.ctx);
             }
+
+            // Flush any structured logs emitted during dispatch
+            crate::ulog::flush();
         }
     }
 
@@ -760,7 +887,7 @@ impl<D: Driver> DriverRuntime<D> {
                 seq_id,
                 binary,
                 binary_len,
-                filter,
+                filter: _,
                 caps,
             } => {
                 let binary_str = match core::str::from_utf8(&binary[..*binary_len]) {

@@ -33,8 +33,7 @@
 
 use super::types::{ChannelId, TaskId, Message};
 use super::queue::MessageQueue;
-use super::traits::{Subscriber, WakeReason, Waitable, Closable, CloseAction};
-use super::waker::{SubscriberSet, WakeList};
+use super::traits::{Closable, CloseAction};
 use super::error::IpcError;
 
 // ============================================================================
@@ -125,7 +124,8 @@ impl ChannelState {
 
 /// A complete channel endpoint
 ///
-/// Contains the state machine, message queue, and subscriber set.
+/// Contains the state machine and message queue.
+/// Wake notifications are handled by the Object layer's WaitQueue, not here.
 pub struct Channel {
     /// This channel's ID
     id: ChannelId,
@@ -138,9 +138,6 @@ pub struct Channel {
 
     /// Incoming message queue
     queue: MessageQueue,
-
-    /// Subscribers waiting for events
-    subscribers: SubscriberSet,
 
     /// When true, writes on this channel are dispatched to the kernel bus
     /// controller synchronously. Set for client channels connected to
@@ -156,7 +153,6 @@ impl Channel {
             owner,
             state: ChannelState::Open { peer_id, peer_owner },
             queue: MessageQueue::new(),
-            subscribers: SubscriberSet::new(),
             kernel_dispatch: false,
         }
     }
@@ -168,7 +164,6 @@ impl Channel {
             owner: 0,
             state: ChannelState::Closed,
             queue: MessageQueue::new(),
-            subscribers: SubscriberSet::new(),
             kernel_dispatch: false,
         }
     }
@@ -233,8 +228,9 @@ impl Channel {
 
     /// Push a message to this channel's queue (called by peer's send)
     ///
-    /// Returns subscribers to wake if message was queued.
-    pub fn deliver(&mut self, msg: Message) -> Result<WakeList, IpcError> {
+    /// Just pushes the message. Wake notifications are handled by the caller
+    /// via the Object layer's WaitQueue.
+    pub fn deliver(&mut self, msg: Message) -> Result<(), IpcError> {
         if self.state.is_closed() {
             return Err(IpcError::Closed);
         }
@@ -243,8 +239,7 @@ impl Channel {
             return Err(IpcError::QueueFull);
         }
 
-        // Return subscribers wanting Readable events
-        Ok(self.subscribers.get_for(WakeReason::Readable))
+        Ok(())
     }
 
     /// Receive a message from queue
@@ -276,8 +271,9 @@ impl Channel {
 
     /// Notify that peer has closed
     ///
-    /// Transitions to HalfClosed state and returns subscribers to wake.
-    pub fn notify_peer_closed(&mut self) -> WakeList {
+    /// Transitions to HalfClosed or Closed state.
+    /// Wake notifications are handled by the caller via the Object layer's WaitQueue.
+    pub fn notify_peer_closed(&mut self) {
         match &self.state {
             ChannelState::Open { .. } => {
                 let remaining = self.queue.len() as u8;
@@ -288,53 +284,23 @@ impl Channel {
                     // SAFETY: Open -> Closed is valid when no pending messages
                     self.state = ChannelState::Closed;
                 }
-                // Wake all subscribers with Closed reason
-                self.subscribers.get_all()
             }
-            _ => WakeList::new(), // Already closed
+            _ => {} // Already closed
         }
     }
 
     /// Close this channel
     ///
-    /// Returns subscribers to wake.
-    pub fn do_close(&mut self) -> WakeList {
-        let subs = self.subscribers.drain();
+    /// Wake notifications are handled by the caller via the Object layer's WaitQueue.
+    pub fn do_close(&mut self) {
         // SAFETY: Any state -> Closed is always valid (terminal state)
         self.state = ChannelState::Closed;
-        subs
-    }
-
-    /// Remove a specific task from subscriber list
-    ///
-    /// Called when a task dies to prevent stale wakes.
-    pub fn unsubscribe_by_task(&mut self, task_id: TaskId) {
-        self.subscribers.remove_by_task(task_id);
     }
 }
 
 // ============================================================================
 // Trait Implementations
 // ============================================================================
-
-impl Waitable for Channel {
-    fn poll(&self, filter: WakeReason) -> bool {
-        match filter {
-            WakeReason::Readable => !self.queue.is_empty(),
-            WakeReason::Writable => self.state.can_send() && !self.queue.is_full(),
-            WakeReason::Closed => self.state.is_closed() || self.state.is_half_closed(),
-            _ => false,
-        }
-    }
-
-    fn subscribe(&mut self, sub: Subscriber, filter: WakeReason) -> Result<(), ()> {
-        self.subscribers.add(sub, filter)
-    }
-
-    fn unsubscribe(&mut self, sub: Subscriber) {
-        self.subscribers.remove(sub);
-    }
-}
 
 impl Closable for Channel {
     fn close(&mut self, _owner: TaskId) -> CloseAction {
@@ -358,7 +324,6 @@ impl Closable for Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::ipc::types::MessageType;
 
     #[test]
     fn test_channel_state_transitions() {
@@ -405,14 +370,11 @@ mod tests {
 
         // Deliver a message
         let msg = Message::data(20, b"hello");
-        let wake_list = ch.deliver(msg).unwrap();
-        assert!(wake_list.is_empty()); // No subscribers yet
+        ch.deliver(msg).unwrap();
 
-        // Add subscriber and deliver another
-        ch.subscribe(Subscriber::new(10, 1), WakeReason::Readable);
+        // Deliver another
         let msg2 = Message::data(20, b"world");
-        let wake_list2 = ch.deliver(msg2).unwrap();
-        assert_eq!(wake_list2.len(), 1);
+        ch.deliver(msg2).unwrap();
 
         // Receive messages
         let received1 = ch.receive().unwrap();
@@ -434,7 +396,7 @@ mod tests {
         ch.deliver(Message::data(20, b"msg2")).unwrap();
 
         // Peer closes
-        let wake_list = ch.notify_peer_closed();
+        ch.notify_peer_closed();
         assert!(ch.state().is_half_closed());
 
         // Can still receive
@@ -456,43 +418,5 @@ mod tests {
 
         let result = ch.deliver(Message::data(20, b"test"));
         assert_eq!(result, Err(IpcError::Closed));
-    }
-
-    #[test]
-    fn test_channel_poll() {
-        let mut ch = Channel::new(1, 10, 2, 20);
-
-        // Empty queue - not readable
-        assert!(!ch.poll(WakeReason::Readable));
-        assert!(ch.poll(WakeReason::Writable));
-        assert!(!ch.poll(WakeReason::Closed));
-
-        // Add message - now readable
-        ch.deliver(Message::data(20, b"test")).unwrap();
-        assert!(ch.poll(WakeReason::Readable));
-
-        // Half-closed - shows as closed
-        ch.notify_peer_closed();
-        assert!(ch.poll(WakeReason::Closed));
-        assert!(!ch.poll(WakeReason::Writable));
-    }
-
-    #[test]
-    fn test_channel_subscribe_unsubscribe() {
-        let mut ch = Channel::new(1, 10, 2, 20);
-
-        let sub = Subscriber::new(100, 1);
-        ch.subscribe(sub, WakeReason::Readable);
-
-        // Deliver should return subscriber
-        let wake = ch.deliver(Message::data(20, b"test")).unwrap();
-        assert_eq!(wake.len(), 1);
-
-        // Unsubscribe
-        ch.unsubscribe(sub);
-
-        // Deliver should return empty
-        let wake2 = ch.deliver(Message::data(20, b"test2")).unwrap();
-        assert!(wake2.is_empty());
     }
 }

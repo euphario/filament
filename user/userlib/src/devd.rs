@@ -66,14 +66,13 @@ use crate::query::{
     QueryHeader, PortRegister, PortRegisterResponse, DeviceRegister,
     ListDevices, DeviceListResponse, StateChange, SpawnChild, SpawnAck,
     PortFilter, filter_mode, GetSpawnContext, SpawnContextResponse,
-    QueryPort, PortInfoResponse, port_flags, UpdatePortShmemId,
-    ListPorts, PortsListResponse, PortEntry,
-    ListServices, ServicesListResponse, ServiceEntry,
+    QueryPort, PortInfoResponse, UpdatePortShmemId,
+    PortEntry,
+    ServiceEntry,
     QueryServiceInfo, ServiceInfoResult,
     AttachDisk, ReportPartitions, RegisterPartitionMsg, PartitionReadyMsg,
     PartitionInfoMsg,
-    msg, port_type, error, class, driver_state, service_state,
-    part_scheme,
+    msg, port_type, error, class, driver_state,
 };
 
 // =============================================================================
@@ -426,11 +425,16 @@ impl DevdClient {
     /// Returns (port_name, port_type) if this driver was spawned by devd rules,
     /// or None if no context available (e.g., manually started driver).
     pub fn get_spawn_context(&mut self) -> Result<Option<([u8; 64], usize, PortType, [u8; 64], usize)>, SysError> {
-        // Retry outer loop handles NOT_FOUND race condition
-        // When pcied spawns xhcid, xhcid might query spawn context before devd
-        // has processed the SPAWN_ACK that contains the PID -> context mapping
+        // Retry outer loop handles NOT_FOUND race condition.
+        // When a parent driver spawns a child, the child might query spawn
+        // context before devd has processed the SPAWN_ACK that maps PID → context.
+        //
+        // Uses non-blocking try_recv to avoid deadlock when devd's EventLoop
+        // is full and cannot watch this channel for future messages.
         const SPAWN_ACK_RETRIES: usize = 10;
         const SPAWN_ACK_DELAY_MS: u32 = 20;
+        const RECV_POLL_RETRIES: usize = 50;
+        const RECV_POLL_DELAY_MS: u32 = 5;
 
         for retry in 0..SPAWN_ACK_RETRIES {
             let seq_id = self.next_seq();
@@ -439,11 +443,11 @@ impl DevdClient {
             let req = GetSpawnContext::new(seq_id);
             channel.send(&req.to_bytes())?;
 
-            // Wait for response
+            // Poll for response (non-blocking to avoid deadlock)
             let mut resp_buf = [0u8; 256];
-            for _ in 0..Self::MAX_RETRIES {
-                match channel.recv(&mut resp_buf) {
-                    Ok(resp_len) if resp_len >= SpawnContextResponse::HEADER_SIZE => {
+            for _poll in 0..RECV_POLL_RETRIES {
+                match channel.try_recv(&mut resp_buf) {
+                    Ok(Some(resp_len)) if resp_len >= SpawnContextResponse::HEADER_SIZE => {
                         if let Some((resp, port_name, metadata)) = SpawnContextResponse::from_bytes(&resp_buf[..resp_len]) {
                             if resp.header.msg_type == msg::SPAWN_CONTEXT {
                                 if resp.result == error::OK && resp.port_name_len > 0 {
@@ -476,9 +480,10 @@ impl DevdClient {
                         }
                         return Err(SysError::IoError);
                     }
-                    Ok(_) => return Err(SysError::IoError),
-                    Err(SysError::WouldBlock) => {
-                        syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                    Ok(Some(_)) => return Err(SysError::IoError),
+                    Ok(None) => {
+                        // No response yet — yield to let devd process our request
+                        syscall::sleep_ms(RECV_POLL_DELAY_MS);
                         continue;
                     }
                     Err(e) => return Err(e),
