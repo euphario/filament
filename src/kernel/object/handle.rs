@@ -44,30 +44,21 @@ impl HandleTable {
         table.entries[1] = Some(HandleEntry {
             generation: 1,
             object_type: super::ObjectType::Stdin,
-            object: super::Object::Console(super::ConsoleObject {
-                console_type: super::ConsoleType::Stdin,
-                subscriber: None,
-            }),
+            object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stdin)),
         });
 
         // Handle 2 = stdout
         table.entries[2] = Some(HandleEntry {
             generation: 1,
             object_type: super::ObjectType::Stdout,
-            object: super::Object::Console(super::ConsoleObject {
-                console_type: super::ConsoleType::Stdout,
-                subscriber: None,
-            }),
+            object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stdout)),
         });
 
         // Handle 3 = stderr
         table.entries[3] = Some(HandleEntry {
             generation: 1,
             object_type: super::ObjectType::Stderr,
-            object: super::Object::Console(super::ConsoleObject {
-                console_type: super::ConsoleType::Stderr,
-                subscriber: None,
-            }),
+            object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stderr)),
         });
 
         table

@@ -52,6 +52,8 @@ pub enum SysError {
     InvalidArgument,
     /// ENFILE (23) - Too many open files in system
     TooManyFiles,
+    /// EMFILE (24) - Too many open handles per process
+    OutOfHandles,
     /// ENOSPC (28) - No space left on device
     NoSpace,
     /// ENOSYS (38) - Function not implemented
@@ -94,6 +96,7 @@ impl SysError {
             errno::ENODEV => SysError::NotSupported,
             errno::EINVAL => SysError::InvalidArgument,
             errno::ENFILE => SysError::TooManyFiles,
+            errno::EMFILE => SysError::OutOfHandles,
             errno::ENOSPC => SysError::NoSpace,
             errno::ENOSYS => SysError::NotImplemented,
             errno::EMSGSIZE => SysError::MessageTooLarge,
@@ -127,6 +130,7 @@ impl SysError {
             SysError::NotSupported => errno::ENODEV,
             SysError::InvalidArgument => errno::EINVAL,
             SysError::TooManyFiles => errno::ENFILE,
+            SysError::OutOfHandles => errno::EMFILE,
             SysError::NoSpace => errno::ENOSPC,
             SysError::NotImplemented => errno::ENOSYS,
             SysError::MessageTooLarge => errno::EMSGSIZE,
@@ -168,6 +172,7 @@ impl SysError {
             SysError::NotSupported => "not supported",
             SysError::InvalidArgument => "invalid argument",
             SysError::TooManyFiles => "too many files",
+            SysError::OutOfHandles => "too many handles",
             SysError::NoSpace => "no space",
             SysError::NotImplemented => "not implemented",
             SysError::MessageTooLarge => "message too large",

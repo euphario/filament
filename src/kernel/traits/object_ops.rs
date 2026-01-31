@@ -16,6 +16,7 @@
 
 use super::task::TaskId;
 use super::waker::Subscriber;
+use crate::kernel::error::KernelError;
 
 /// Handle to a kernel object
 pub type Handle = u32;
@@ -85,47 +86,8 @@ impl ObjectType {
     }
 }
 
-/// Error type for object operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectError {
-    /// Handle not found or invalid
-    BadHandle,
-    /// Invalid argument
-    InvalidArgument,
-    /// Operation would block
-    WouldBlock,
-    /// Out of memory / no slots
-    OutOfMemory,
-    /// Permission denied
-    PermissionDenied,
-    /// Object type doesn't support this operation
-    NotSupported,
-    /// Peer closed / connection reset
-    Closed,
-    /// Already exists
-    AlreadyExists,
-    /// Not found
-    NotFound,
-    /// Message too large
-    MessageTooLarge,
-}
-
-impl ObjectError {
-    pub fn to_errno(self) -> i64 {
-        match self {
-            ObjectError::BadHandle => -9,          // EBADF
-            ObjectError::InvalidArgument => -22,   // EINVAL
-            ObjectError::WouldBlock => -11,        // EAGAIN
-            ObjectError::OutOfMemory => -12,       // ENOMEM
-            ObjectError::PermissionDenied => -1,   // EPERM
-            ObjectError::NotSupported => -95,      // EOPNOTSUPP
-            ObjectError::Closed => -104,           // ECONNRESET
-            ObjectError::AlreadyExists => -17,     // EEXIST
-            ObjectError::NotFound => -2,           // ENOENT
-            ObjectError::MessageTooLarge => -90,   // EMSGSIZE
-        }
-    }
-}
+/// Error type for object operations — unified KernelError
+pub type ObjectError = KernelError;
 
 /// Result of a read operation
 pub struct ReadResult {

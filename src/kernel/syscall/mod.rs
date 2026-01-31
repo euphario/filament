@@ -30,6 +30,7 @@ use crate::span;
 use crate::hal::Platform;
 use super::uaccess::UAccessError;
 use super::caps::Capabilities;
+use super::error::KernelError;
 
 /// Syscall numbers
 ///
@@ -140,50 +141,7 @@ impl From<u64> for SyscallNumber {
     }
 }
 
-/// Syscall error codes (POSIX-like)
-#[repr(i64)]
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Infrastructure: some variants reserved for future use
-pub enum SyscallError {
-    Success = 0,
-    /// EPERM - Operation not permitted
-    PermissionDenied = -1,
-    /// ENOENT - No such file or directory
-    NotFound = -2,
-    /// ESRCH - No such process
-    NoProcess = -3,
-    /// EINTR - Interrupted system call
-    Interrupted = -4,
-    /// EIO - I/O error
-    IoError = -5,
-    /// EBADF - Bad file descriptor
-    BadFd = -9,
-    /// ECHILD - No child processes
-    NoChild = -10,
-    /// EAGAIN - Resource temporarily unavailable
-    WouldBlock = -11,
-    /// ENOMEM - Out of memory
-    OutOfMemory = -12,
-    /// EACCES - Permission denied
-    AccessDenied = -13,
-    /// EFAULT - Bad address
-    BadAddress = -14,
-    /// EBUSY - Device or resource busy
-    Busy = -16,
-    /// EEXIST - File/resource already exists
-    AlreadyExists = -17,
-    /// EINVAL - Invalid argument
-    InvalidArgument = -22,
-    /// ENOSYS - Function not implemented
-    NotImplemented = -38,
-}
-
-impl SyscallError {
-    /// Convert to errno-style error code
-    pub fn to_errno(self) -> i32 {
-        self as i32
-    }
-}
+// SyscallError enum removed — use KernelError from kernel::error instead.
 
 /// Syscall arguments structure
 #[repr(C)]
@@ -227,7 +185,7 @@ pub(crate) fn require_capability(cap: Capabilities) -> Result<(), i64> {
             );
             kwarn!("security", "cap_denied"; pid = task.id as u64, cap = core::any::type_name_of_val(&cap));
         }
-        Err(SyscallError::PermissionDenied as i64)
+        Err(KernelError::PermDenied.to_errno())
     })
 }
 
@@ -306,7 +264,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         // Invalid or legacy syscall numbers -> ENOSYS
         SyscallNumber::Invalid => {
             kwarn!("syscall", "invalid"; num = args.num, pid = pid as u64);
-            SyscallError::NotImplemented as i64
+            KernelError::NotSupported.to_errno()
         }
     };
 

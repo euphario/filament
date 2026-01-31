@@ -4,7 +4,6 @@
 //! This is the per-task state, separate from the scheduler.
 
 use crate::kernel::addrspace::AddressSpace;
-use crate::kernel::event::EventQueue;
 use crate::kernel::pmm;
 use crate::arch::aarch64::{mmu, tlb};
 
@@ -234,8 +233,6 @@ pub struct Task {
     pub(crate) channel_count: u16,
     pub(crate) port_count: u16,
     pub(crate) shmem_count: u16,
-    /// Event queue for async notifications
-    pub(crate) event_queue: EventQueue,
     /// Child task IDs
     pub(crate) children: [TaskId; MAX_CHILDREN],
     /// Number of children
@@ -274,7 +271,7 @@ fn user_task_trampoline() -> ! {
     // CRITICAL: Extract data while holding lock, then RELEASE LOCK before enter_usermode.
     // If we call enter_usermode while holding the lock, it never returns (eret),
     // so the lock would never be released, causing deadlock on next scheduler() call.
-    let (trap_frame, ttbr0) = {
+    let (trap_frame, ttbr0, kstack_top) = {
         let mut sched = super::scheduler();
 
         let task = match sched.tasks[slot].as_mut() {
@@ -291,17 +288,22 @@ fn user_task_trampoline() -> ! {
         let ttbr0 = addr_space.get_ttbr0();
         let trap_frame = &mut task.trap_frame as *mut TrapFrame;
 
+        // Kernel stack top (virtual) - becomes SP_EL1 for this task's exceptions
+        let kstack_top = crate::arch::aarch64::mmu::phys_to_virt(
+            task.kernel_stack + task.kernel_stack_size as u64
+        );
+
         // Set globals for exception handler
         super::CURRENT_TRAP_FRAME.store(trap_frame, core::sync::atomic::Ordering::Release);
         super::CURRENT_TTBR0.store(ttbr0, core::sync::atomic::Ordering::Release);
 
-        (trap_frame as *const TrapFrame, ttbr0)
+        (trap_frame as *const TrapFrame, ttbr0, kstack_top)
         // sched guard dropped here - lock released
     };
 
     // Enter userspace via eret (this never returns)
     unsafe {
-        super::enter_usermode(trap_frame, ttbr0);
+        super::enter_usermode(trap_frame, ttbr0, kstack_top);
     }
 }
 
@@ -344,7 +346,7 @@ impl Task {
             channel_count: 0,
             port_count: 0,
             shmem_count: 0,
-            event_queue: EventQueue::new(),
+
             parent_id: 0,
             children: [0; MAX_CHILDREN],
             num_children: 0,
@@ -395,7 +397,7 @@ impl Task {
             channel_count: 0,
             port_count: 0,
             shmem_count: 0,
-            event_queue: EventQueue::new(),
+
             parent_id: 0,
             children: [0; MAX_CHILDREN],
             num_children: 0,
@@ -465,7 +467,7 @@ impl Task {
             channel_count: 0,
             port_count: 0,
             shmem_count: 0,
-            event_queue: EventQueue::new(),
+
             parent_id: 0,
             children: [0; MAX_CHILDREN],
             num_children: 0,
@@ -476,7 +478,7 @@ impl Task {
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
-            needs_context_restore: true,  // New tasks need context_switch to run their trampoline
+            needs_context_restore: true,
         })
     }
 
@@ -1072,7 +1074,9 @@ context_switch_asm:
 .global enter_usermode_asm
 .type enter_usermode_asm, @function
 enter_usermode_asm:
+    // x0 = trap_frame, x1 = ttbr0, x2 = kernel_stack_top
     mov     x9, x1
+    mov     x19, x2         // save kernel_stack_top (x19 is callee-saved, safe to use here since we never return)
 
     ldr     x2, [x0, #248]
     ldr     x3, [x0, #256]
@@ -1097,6 +1101,12 @@ enter_usermode_asm:
     ic      ialluis         // Invalidate all I-caches in inner shareable domain
     dsb     sy
     isb
+
+    // Set SP to task's kernel stack top BEFORE eret.
+    // This becomes SP_EL1 for subsequent exceptions from EL0.
+    // Without this, the boot stack is used for all syscalls,
+    // which overflows BSS and corrupts kernel globals.
+    mov     sp, x19
 
     mov     x0, #0
     mov     x1, #0
@@ -1135,7 +1145,7 @@ enter_usermode_asm:
 
 extern "C" {
     fn context_switch_asm(current: *mut CpuContext, next: *const CpuContext);
-    fn enter_usermode_asm(trap_frame: *const TrapFrame, ttbr0: u64) -> !;
+    fn enter_usermode_asm(trap_frame: *const TrapFrame, ttbr0: u64, kernel_stack_top: u64) -> !;
 }
 
 /// Perform a raw context switch between two CPU contexts
@@ -1158,7 +1168,8 @@ pub unsafe fn switch_context(current: &mut Task, next: &Task) {
 
 /// Enter user mode with given trap frame and address space
 /// # Safety
-/// trap_frame must point to valid TrapFrame, ttbr0 must be valid page table
-pub unsafe fn enter_usermode(trap_frame: *const TrapFrame, ttbr0: u64) -> ! {
-    enter_usermode_asm(trap_frame, ttbr0)
+/// trap_frame must point to valid TrapFrame, ttbr0 must be valid page table,
+/// kernel_stack_top must be a valid kernel virtual address for SP_EL1.
+pub unsafe fn enter_usermode(trap_frame: *const TrapFrame, ttbr0: u64, kernel_stack_top: u64) -> ! {
+    enter_usermode_asm(trap_frame, ttbr0, kernel_stack_top)
 }

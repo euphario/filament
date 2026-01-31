@@ -23,7 +23,7 @@ use super::super::syscall_ctx_impl::create_syscall_context;
 use super::super::traits::syscall_ctx::SyscallContext;
 
 /// Syscall error codes (re-exported from parent for convenience)
-use super::SyscallError;
+use crate::kernel::error::KernelError;
 
 // Use shared helpers from parent module
 use super::uaccess_to_errno;
@@ -42,7 +42,7 @@ pub(super) fn sys_debug_write(buf_ptr: u64, len: usize) -> i64 {
     }
     if len > 256 {
         // Limit to 256 bytes for direct UART (unbuffered = slow)
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Copy from user space using proper VA-to-PA translation
@@ -94,7 +94,7 @@ pub(super) fn sys_sleep(deadline_ns: u64) -> i64 {
 
     // Set task to Waiting state via state machine
     if !sched::wait_current(WaitReason::Timer, deadline) {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Reschedule to another task
@@ -111,7 +111,7 @@ pub(super) fn sys_set_log_level(level: u8) -> i64 {
             crate::klog::set_level(lvl);
             0
         }
-        None => SyscallError::InvalidArgument as i64,
+        None => KernelError::InvalidArg.to_errno(),
     }
 }
 
@@ -121,7 +121,7 @@ pub(super) fn sys_set_log_level(level: u8) -> i64 {
 pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
     // Validate buffer
     if buf_len == 0 || buf_len > 1024 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Allocate temporary buffer for formatted output
@@ -149,7 +149,7 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
     let copy_len = text_len.min(buf_len);
     match uaccess::copy_to_user(buf_ptr, &text_buf[..copy_len]) {
         Ok(n) => n as i64,
-        Err(_) => SyscallError::BadAddress as i64,
+        Err(_) => KernelError::BadAddress.to_errno(),
     }
 }
 
@@ -160,19 +160,19 @@ pub(super) fn sys_klog(level: u8, buf_ptr: u64, buf_len: usize) -> i64 {
     // Validate level
     let level = match crate::klog::Level::from_u8(level) {
         Some(l) => l,
-        None => return SyscallError::InvalidArgument as i64,
+        None => return KernelError::InvalidArg.to_errno(),
     };
 
     // Validate buffer size
     if buf_len == 0 || buf_len > 256 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Copy message from userspace
     let mut msg_buf = [0u8; 256];
     match uaccess::copy_from_user(&mut msg_buf[..buf_len], buf_ptr) {
         Ok(_) => {}
-        Err(_) => return SyscallError::BadAddress as i64,
+        Err(_) => return KernelError::BadAddress.to_errno(),
     }
 
     // Get caller PID for log message
@@ -236,26 +236,26 @@ pub(super) fn sys_klog(level: u8, buf_ptr: u64, buf_len: usize) -> i64 {
 pub(super) fn sys_klog_write(buf_ptr: u64, buf_len: usize) -> i64 {
     // Validate size
     if buf_len < crate::klog::RecordHeader::SIZE || buf_len > crate::klog::MAX_RECORD_SIZE {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Copy record from userspace
     let mut record = [0u8; crate::klog::MAX_RECORD_SIZE];
     match uaccess::copy_from_user(&mut record[..buf_len], buf_ptr) {
         Ok(_) => {}
-        Err(_) => return SyscallError::BadAddress as i64,
+        Err(_) => return KernelError::BadAddress.to_errno(),
     }
 
     // Validate: total_len in header must match buf_len
     let total_len = u16::from_le_bytes([record[0], record[1]]) as usize;
     if total_len != buf_len {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Validate: level must be known
     let level = record[6];
     if crate::klog::Level::from_u8(level).is_none() {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Re-stamp the timestamp from kernel's clock so all records use the
@@ -324,7 +324,7 @@ pub(super) fn sys_reset() -> i64 {
     // Only processes with ALL capabilities can reset the system
     let ctx = create_syscall_context();
     if let Err(_) = ctx.require_capability(Capabilities::ALL.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     print_direct!("\n========================================\n");
@@ -348,24 +348,7 @@ pub(super) fn sys_reset() -> i64 {
 ///   [104..112] size (u64)
 ///   [112]      file_type (0=regular, 1=directory)
 ///   [113..120] _pad
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RamfsListEntry {
-    /// Filename (null-terminated)
-    pub name: [u8; 100],
-    /// File size in bytes
-    pub size: u64,
-    /// File type: 0 = regular, 1 = directory
-    pub file_type: u8,
-    /// Padding for alignment
-    pub _pad: [u8; 7],
-}
-
-const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
-
-impl RamfsListEntry {
-    const SIZE: usize = core::mem::size_of::<Self>();
-}
+use abi::RamfsListEntry;
 
 /// List ramfs entries
 /// Args: buf_ptr (output buffer), buf_len (buffer size in bytes)
@@ -381,7 +364,7 @@ pub(super) fn sys_ramfs_list(buf_ptr: u64, buf_len: usize) -> i64 {
     // Calculate how many entries we can fit
     let max_entries = buf_len / RamfsListEntry::SIZE;
     if max_entries == 0 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Validate user pointer for writing

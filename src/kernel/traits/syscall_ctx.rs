@@ -14,39 +14,10 @@
 //! scheduler, task structs, or internal state directly.
 
 use super::task::TaskId;
+use crate::kernel::error::KernelError;
 
-/// Error type for syscall context operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyscallError {
-    /// No current task (kernel context)
-    NoCurrentTask,
-    /// Permission denied
-    PermissionDenied,
-    /// Invalid argument
-    InvalidArgument,
-    /// Out of memory
-    OutOfMemory,
-    /// Not found
-    NotFound,
-    /// Would block
-    WouldBlock,
-    /// Bad handle
-    BadHandle,
-}
-
-impl SyscallError {
-    pub fn to_errno(self) -> i64 {
-        match self {
-            SyscallError::NoCurrentTask => -3,     // ESRCH
-            SyscallError::PermissionDenied => -1,  // EPERM
-            SyscallError::InvalidArgument => -22,  // EINVAL
-            SyscallError::OutOfMemory => -12,      // ENOMEM
-            SyscallError::NotFound => -2,          // ENOENT
-            SyscallError::WouldBlock => -11,       // EAGAIN
-            SyscallError::BadHandle => -9,         // EBADF
-        }
-    }
-}
+/// Error type for syscall context operations — unified KernelError
+pub type SyscallError = KernelError;
 
 /// Syscall context - provides access to all kernel subsystems for syscalls
 ///
@@ -77,7 +48,7 @@ pub trait SyscallContext: Send + Sync {
         if self.has_capability(cap) {
             Ok(())
         } else {
-            Err(SyscallError::PermissionDenied)
+            Err(SyscallError::PermDenied)
         }
     }
 

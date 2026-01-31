@@ -12,7 +12,8 @@
 //!
 //! This allows syscalls to be thin dispatchers that validate, dispatch, and return.
 
-use crate::kernel::traits::syscall_ctx::{SyscallContext, SyscallError};
+use crate::kernel::traits::syscall_ctx::SyscallContext;
+use crate::kernel::error::KernelError;
 use crate::kernel::traits::task::TaskId;
 use crate::kernel::traits::object_ops::ObjectOps;
 use crate::kernel::traits::memory_ops::MemoryOps;
@@ -69,11 +70,11 @@ impl SyscallContext for KernelSyscallContext {
         })
     }
 
-    fn require_capability(&self, cap: u64) -> Result<(), SyscallError> {
+    fn require_capability(&self, cap: u64) -> Result<(), KernelError> {
         if self.has_capability(cap) {
             Ok(())
         } else {
-            Err(SyscallError::PermissionDenied)
+            Err(KernelError::PermDenied)
         }
     }
 

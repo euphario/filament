@@ -19,14 +19,15 @@ use super::super::uaccess;
 use super::super::caps::Capabilities;
 use super::super::syscall_ctx_impl::create_syscall_context;
 use super::super::traits::syscall_ctx::SyscallContext;
-use super::{SyscallError, uaccess_to_errno};
+use super::uaccess_to_errno;
+use crate::kernel::error::KernelError;
 
 /// Map memory pages into user address space
 /// Args: addr (hint, ignored for now), size, prot
 /// Returns: virtual address on success, negative error on failure
 pub(super) fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
     if size == 0 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Parse protection flags (simplified: bit 0 = write, bit 1 = exec)
@@ -37,12 +38,12 @@ pub(super) fn sys_mmap(_addr: u64, size: usize, prot: u32) -> i64 {
     let ctx = create_syscall_context();
     let task_id = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::InvalidArgument as i64,
+        None => return KernelError::InvalidArg.to_errno(),
     };
 
     match ctx.memory().mmap(task_id, size, writable, executable) {
         Ok(vaddr) => vaddr as i64,
-        Err(_) => SyscallError::OutOfMemory as i64,
+        Err(_) => KernelError::OutOfMemory.to_errno(),
     }
 }
 
@@ -62,11 +63,11 @@ pub(super) fn sys_mmap_dma(size: usize, dma_ptr: u64) -> i64 {
     // Check DMA capability
     let ctx = create_syscall_context();
     if let Err(_) = ctx.require_capability(Capabilities::DMA.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     if size == 0 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Validate dma_ptr
@@ -79,7 +80,7 @@ pub(super) fn sys_mmap_dma(size: usize, dma_ptr: u64) -> i64 {
     super::super::task::with_scheduler(|sched| {
         let task = match sched.current_task_mut() {
             Some(t) => t,
-            None => return SyscallError::InvalidArgument as i64,
+            None => return KernelError::InvalidArg.to_errno(),
         };
 
         match task.mmap_dma(size) {
@@ -98,7 +99,7 @@ pub(super) fn sys_mmap_dma(size: usize, dma_ptr: u64) -> i64 {
                 }
                 virt_addr as i64
             }
-            None => SyscallError::OutOfMemory as i64,
+            None => KernelError::OutOfMemory.to_errno(),
         }
     })
 }
@@ -108,24 +109,24 @@ pub(super) fn sys_mmap_dma(size: usize, dma_ptr: u64) -> i64 {
 /// Returns: 0 on success, negative error on failure
 pub(super) fn sys_munmap(addr: u64, size: usize) -> i64 {
     if size == 0 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Validate that the address is in user space (not kernel)
     if !uaccess::is_user_address(addr) {
-        return SyscallError::BadAddress as i64;
+        return KernelError::BadAddress.to_errno();
     }
 
     // Use trait-based context
     let ctx = create_syscall_context();
     let task_id = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::InvalidArgument as i64,
+        None => return KernelError::InvalidArg.to_errno(),
     };
 
     match ctx.memory().munmap(task_id, addr, size) {
-        Ok(()) => SyscallError::Success as i64,
-        Err(_) => SyscallError::InvalidArgument as i64,
+        Ok(()) => 0i64,
+        Err(_) => KernelError::InvalidArg.to_errno(),
     }
 }
 
@@ -140,13 +141,13 @@ pub(super) fn sys_mmap_device(phys_addr: u64, size: u64) -> i64 {
     // Require MMIO capability for device memory mapping
     let ctx = create_syscall_context();
     if let Err(_) = ctx.require_capability(Capabilities::MMIO.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     // Validate size
     if size == 0 || size > 16 * 1024 * 1024 {
         // Max 16MB per mapping
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Map into calling process's address space
@@ -155,10 +156,10 @@ pub(super) fn sys_mmap_device(phys_addr: u64, size: u64) -> i64 {
             Some(task) => {
                 match task.mmap_device(phys_addr, size as usize) {
                     Some(vaddr) => vaddr as i64,
-                    None => SyscallError::OutOfMemory as i64,
+                    None => KernelError::OutOfMemory.to_errno(),
                 }
             }
-            None => SyscallError::NoProcess as i64,
+            None => KernelError::NoProcess.to_errno(),
         }
     })
 }
@@ -176,11 +177,11 @@ pub(super) fn sys_dma_pool_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -
     // Require DMA capability
     let ctx = create_syscall_context();
     if let Err(_) = ctx.require_capability(Capabilities::DMA.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     if size == 0 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Validate output pointers
@@ -197,19 +198,19 @@ pub(super) fn sys_dma_pool_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -
 
     let caller_pid = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::NoProcess as i64,
+        None => return KernelError::NoProcess.to_errno(),
     };
 
     // Allocate from DMA pool
     let phys_addr = match super::super::dma_pool::alloc(size) {
         Ok(addr) => addr,
-        Err(_) => return SyscallError::OutOfMemory as i64,
+        Err(_) => return KernelError::OutOfMemory.to_errno(),
     };
 
     // Map into process address space
     let virt_addr = match super::super::dma_pool::map_into_process(caller_pid, phys_addr, size) {
         Ok(addr) => addr,
-        Err(_) => return SyscallError::OutOfMemory as i64,
+        Err(_) => return KernelError::OutOfMemory.to_errno(),
     };
 
     // Write output values
@@ -236,11 +237,11 @@ pub(super) fn sys_dma_pool_create(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -
 pub(super) fn sys_dma_pool_create_high(size: usize, vaddr_ptr: u64, paddr_ptr: u64) -> i64 {
     let ctx = create_syscall_context();
     if let Err(_) = ctx.require_capability(Capabilities::DMA.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     if size == 0 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     if vaddr_ptr != 0 {
@@ -256,19 +257,19 @@ pub(super) fn sys_dma_pool_create_high(size: usize, vaddr_ptr: u64, paddr_ptr: u
 
     let caller_pid = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::NoProcess as i64,
+        None => return KernelError::NoProcess.to_errno(),
     };
 
     // Allocate from HIGH DMA pool (36-bit addresses)
     let phys_addr = match super::super::dma_pool::alloc_high(size) {
         Ok(addr) => addr,
-        Err(_) => return SyscallError::OutOfMemory as i64,
+        Err(_) => return KernelError::OutOfMemory.to_errno(),
     };
 
     // Map into process address space
     let virt_addr = match super::super::dma_pool::map_into_process_high(caller_pid, phys_addr, size) {
         Ok(addr) => addr,
-        Err(_) => return SyscallError::OutOfMemory as i64,
+        Err(_) => return KernelError::OutOfMemory.to_errno(),
     };
 
     if vaddr_ptr != 0 {

@@ -325,6 +325,16 @@ impl Mux {
         Ok(())
     }
 
+    /// Wait for the next event on any watched handle.
+    ///
+    /// Blocks until an event fires or a timeout expires.
+    ///
+    /// Returns:
+    /// - `Ok(event)` — at least one watched handle is ready
+    /// - `Err(Timeout)` — timeout fired with no events (periodic work opportunity)
+    /// - `Err(other)` — real error
+    ///
+    /// Spurious wakes (EAGAIN) are retried internally.
     pub fn wait(&self) -> SysResult<MuxEvent> {
         let mut event = MuxEvent::empty();
         let buf = unsafe {
@@ -333,12 +343,33 @@ impl Mux {
                 core::mem::size_of::<MuxEvent>(),
             )
         };
-        let n = read(self.handle, buf)?;
-        if n > 0 {
-            return Ok(event);
+        loop {
+            match read(self.handle, buf) {
+                Ok(n) if n > 0 => return Ok(event),
+                Ok(_) => return Err(SysError::Timeout), // 0 events (shouldn't happen with new kernel)
+                Err(SysError::WouldBlock) => continue,  // Spurious wake — retry
+                Err(e) => return Err(e),                 // Timeout or real error — propagate
+            }
         }
-        // Kernel returned 0 events - return error instead of busy-looping
-        Err(SysError::WouldBlock)
+    }
+
+    /// Set a persistent timeout for future wait() calls.
+    /// 0 = no timeout (block forever). Non-zero = timeout in milliseconds.
+    pub fn set_timeout(&self, timeout_ms: u32) -> SysResult<()> {
+        let mut cmd = [0u8; 8];
+        cmd[0] = 2; // op: SET_TIMEOUT
+        cmd[4..8].copy_from_slice(&timeout_ms.to_le_bytes());
+        write(self.handle, &cmd)?;
+        Ok(())
+    }
+
+    /// Wait for an event with a specific timeout (convenience).
+    /// Sets the timeout, waits, then clears it.
+    pub fn wait_timeout(&self, timeout_ms: u32) -> SysResult<MuxEvent> {
+        self.set_timeout(timeout_ms)?;
+        let result = self.wait();
+        let _ = self.set_timeout(0); // Clear for next wait
+        result
     }
 }
 
@@ -433,6 +464,25 @@ impl Default for Message {
 }
 
 // ============================================================================
+// Bus Discovery
+// ============================================================================
+
+/// Query kernel for all registered buses.
+///
+/// Opens a BusList handle, reads BusInfo entries, closes the handle.
+/// Returns the number of buses written to `buf`.
+pub fn bus_list(buf: &mut [abi::BusInfo]) -> SysResult<usize> {
+    let handle = open(ObjectType::BusList, &[])?;
+    let byte_len = buf.len() * core::mem::size_of::<abi::BusInfo>();
+    let byte_buf = unsafe {
+        core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, byte_len)
+    };
+    let count = read(handle, byte_buf)?;
+    let _ = close(handle);
+    Ok(count)
+}
+
+// ============================================================================
 // Convenience functions - avoid Mux boilerplate
 // ============================================================================
 
@@ -482,6 +532,11 @@ impl EventLoop {
         })
     }
 
+    /// Check if the event loop is full
+    pub fn is_full(&self) -> bool {
+        self.count >= 16
+    }
+
     /// Watch a handle for readability
     pub fn watch(&mut self, handle: ObjHandle) -> SysResult<&mut Self> {
         if self.count < 16 {
@@ -502,6 +557,12 @@ impl EventLoop {
             }
         }
         Ok(self)
+    }
+
+    /// Set a persistent timeout for wait().
+    /// 0 = block forever, non-zero = timeout in milliseconds.
+    pub fn set_timeout(&self, timeout_ms: u32) -> SysResult<()> {
+        self.mux.set_timeout(timeout_ms)
     }
 
     /// Wait for next event, returns the ready handle
@@ -536,6 +597,10 @@ impl Shmem {
         let (handle, shmem_id) = crate::syscall::open_shmem_create(size)?;
         // After open, use map() to get the address
         let vaddr = map(handle, 0)?;
+        if vaddr == 0 {
+            let _ = close(handle);
+            return Err(SysError::from_errno(-12)); // ENOMEM
+        }
         // Query physical address via read (16-byte buffer returns paddr+size)
         let mut info = [0u8; 16];
         read(handle, &mut info)?;
@@ -556,6 +621,10 @@ impl Shmem {
     pub fn open_existing(shmem_id: u32) -> SysResult<Self> {
         let handle = open(ObjectType::Shmem, &shmem_id.to_le_bytes())?;
         let vaddr = map(handle, 0)?;
+        if vaddr == 0 {
+            let _ = close(handle);
+            return Err(SysError::from_errno(-12)); // ENOMEM
+        }
         // Query physical address and size via read (16-byte buffer)
         let mut info = [0u8; 16];
         read(handle, &mut info)?;
@@ -639,6 +708,9 @@ pub struct PciDevice {
 
 impl PciDevice {
     /// Open a PCI device by BDF (bus/device/function)
+    ///
+    /// `bdf` uses standard PCI BDF encoding matching `PciEnumEntry.bdf`:
+    ///   bits 15..8: bus, bits 7..3: device (0-31), bits 2..0: function (0-7)
     pub fn open(bdf: u32) -> SysResult<Self> {
         let handle = open(ObjectType::PciDevice, &bdf.to_le_bytes())?;
         Ok(Self { handle, bdf })

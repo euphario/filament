@@ -15,8 +15,9 @@
 //! | close | close | Release handle |
 
 use crate::kernel::traits::object_ops::{
-    ObjectOps, ObjectType, ObjectError, Handle, ReadResult, MapResult,
+    ObjectOps, ObjectType, Handle, ReadResult, MapResult,
 };
+use crate::kernel::error::KernelError;
 use crate::kernel::traits::task::TaskId;
 use crate::kernel::traits::waker::Subscriber;
 use crate::kernel::object;
@@ -37,22 +38,9 @@ impl KernelObjectOps {
     }
 }
 
-/// Convert object module error to trait error
-fn convert_error(errno: i64) -> ObjectError {
-    match errno {
-        -9 => ObjectError::BadHandle,      // EBADF
-        -22 => ObjectError::InvalidArgument, // EINVAL
-        -11 => ObjectError::WouldBlock,    // EAGAIN
-        -12 => ObjectError::OutOfMemory,   // ENOMEM
-        -1 => ObjectError::PermissionDenied, // EPERM
-        -95 => ObjectError::NotSupported,  // EOPNOTSUPP
-        -104 => ObjectError::Closed,       // ECONNRESET
-        -17 => ObjectError::AlreadyExists, // EEXIST
-        -2 => ObjectError::NotFound,       // ENOENT
-        -90 => ObjectError::MessageTooLarge, // EMSGSIZE
-        -14 => ObjectError::InvalidArgument, // EFAULT (bad address)
-        _ => ObjectError::InvalidArgument, // Default
-    }
+/// Convert object module error to KernelError
+fn convert_error(errno: i64) -> KernelError {
+    KernelError::from_errno(errno)
 }
 
 impl ObjectOps for KernelObjectOps {
@@ -62,7 +50,7 @@ impl ObjectOps for KernelObjectOps {
         obj_type: ObjectType,
         _flags: u32,
         arg: u64,
-    ) -> Result<Handle, ObjectError> {
+    ) -> Result<Handle, KernelError> {
         // Convert trait ObjectType to object module ObjectType
         let obj_type_num = match obj_type {
             ObjectType::Channel => 0,
@@ -102,7 +90,7 @@ impl ObjectOps for KernelObjectOps {
         handle: Handle,
         buf: &mut [u8],
         _flags: u32,
-    ) -> Result<ReadResult, ObjectError> {
+    ) -> Result<ReadResult, KernelError> {
         // Call the existing read syscall
         // Note: buf is in kernel space, but the current implementation expects user pointers
         // This is a temporary bridge - we pass the kernel buffer pointer directly
@@ -127,7 +115,7 @@ impl ObjectOps for KernelObjectOps {
         handle: Handle,
         buf: &[u8],
         _flags: u32,
-    ) -> Result<usize, ObjectError> {
+    ) -> Result<usize, KernelError> {
         // Call the existing write syscall
         let buf_ptr = buf.as_ptr() as u64;
         let result = object::syscall::write(handle, buf_ptr, buf.len());
@@ -139,7 +127,7 @@ impl ObjectOps for KernelObjectOps {
         }
     }
 
-    fn map(&self, _task_id: TaskId, handle: Handle) -> Result<MapResult, ObjectError> {
+    fn map(&self, _task_id: TaskId, handle: Handle) -> Result<MapResult, KernelError> {
         // Call the existing map syscall
         let result = object::syscall::map(handle, 0);
 
@@ -154,7 +142,7 @@ impl ObjectOps for KernelObjectOps {
         }
     }
 
-    fn close(&self, _task_id: TaskId, handle: Handle) -> Result<(), ObjectError> {
+    fn close(&self, _task_id: TaskId, handle: Handle) -> Result<(), KernelError> {
         // Call the existing close syscall
         let result = object::syscall::close(handle);
 
@@ -170,7 +158,7 @@ impl ObjectOps for KernelObjectOps {
         _task_id: TaskId,
         _handle: Handle,
         _sub: Subscriber,
-    ) -> Result<(), ObjectError> {
+    ) -> Result<(), KernelError> {
         // TODO: Implement subscription for blocking operations
         // For now, subscriptions are handled internally by the object types
         Ok(())

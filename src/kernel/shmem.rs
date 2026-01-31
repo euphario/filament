@@ -1173,23 +1173,24 @@ pub fn begin_cleanup(pid: Pid) {
     }
     // shmem lock released before touching scheduler/events
 
-    // Send ShmemInvalid events to all mappers when owner dies
+    // Notify mappers when owner dies (wake via scheduler)
     for i in 0..mapper_notify_count {
-        let (shmem_id, mapper_pid) = to_notify_mappers[i];
-        let event = super::event::Event::shmem_invalid(shmem_id, pid);
-        let _ = super::event::deliver_event_to_task(mapper_pid, event);
+        let (_shmem_id, mapper_pid) = to_notify_mappers[i];
+        super::task::with_scheduler(|sched| {
+            sched.wake_by_pid(mapper_pid);
+        });
     }
 
-    // Send MapperLeft events to owners when mapper dies (bidirectional notification)
+    // Notify owners when mapper dies (mark ShmemObject + wake)
     for i in 0..owner_notify_count {
         let (shmem_id, owner_pid) = to_notify_owners[i];
         if owner_pid != NO_PID {
-            // Send event
-            let event = super::event::Event::shmem_mapper_left(shmem_id, pid);
-            let _ = super::event::deliver_event_to_task(owner_pid, event);
-
-            // Also mark the owner's ShmemObject as notified (for mux wakeup)
+            // Mark the owner's ShmemObject as notified (for mux wakeup)
             super::object::syscall::mark_shmem_notified_for_task(owner_pid, shmem_id);
+
+            super::task::with_scheduler(|sched| {
+                sched.wake_by_pid(owner_pid);
+            });
 
             kinfo!("shmem", "mapper_left_notify"; shmem_id = shmem_id as u64, mapper = pid as u64, owner = owner_pid as u64);
         }

@@ -33,73 +33,7 @@ use crate::kernel::lock::{SpinLock, SpinLockGuard};
 use crate::kernel::task::{TaskId, MAX_TASKS};
 use crate::kernel::object::{HandleTable, Handle, Object, ObjectType, ConsoleType};
 use crate::kernel::object::handle::HandleEntry;
-
-// ============================================================================
-// Error Types
-// ============================================================================
-
-/// Errors from ObjectService operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjError {
-    /// Invalid handle (wrong generation or not found)
-    BadHandle,
-    /// Object type mismatch
-    TypeMismatch,
-    /// Operation not supported for this object type
-    NotSupported,
-    /// Would block (internal - not returned to userspace)
-    WouldBlock,
-    /// Peer closed
-    Closed,
-    /// Out of memory
-    OutOfMemory,
-    /// Out of handles
-    OutOfHandles,
-    /// Invalid argument
-    InvalidArg,
-    /// Permission denied
-    PermissionDenied,
-    /// Task not found
-    TaskNotFound,
-    /// Already exists
-    AlreadyExists,
-}
-
-impl ObjError {
-    /// Convert to errno for syscall return
-    pub fn to_errno(self) -> i64 {
-        match self {
-            ObjError::BadHandle => -9,      // EBADF
-            ObjError::TypeMismatch => -22,  // EINVAL
-            ObjError::NotSupported => -38,  // ENOSYS
-            ObjError::WouldBlock => -11,    // EAGAIN (internal only)
-            ObjError::Closed => -32,        // EPIPE
-            ObjError::OutOfMemory => -12,   // ENOMEM
-            ObjError::OutOfHandles => -24,  // EMFILE
-            ObjError::InvalidArg => -22,    // EINVAL
-            ObjError::PermissionDenied => -1,  // EPERM
-            ObjError::TaskNotFound => -3,   // ESRCH
-            ObjError::AlreadyExists => -17, // EEXIST
-        }
-    }
-
-    /// Convert from errno
-    pub fn from_errno(e: i64) -> Self {
-        match e {
-            -9 => ObjError::BadHandle,
-            -22 => ObjError::InvalidArg,
-            -38 => ObjError::NotSupported,
-            -11 => ObjError::WouldBlock,
-            -32 => ObjError::Closed,
-            -12 => ObjError::OutOfMemory,
-            -24 => ObjError::OutOfHandles,
-            -13 => ObjError::PermissionDenied,
-            -3 => ObjError::TaskNotFound,
-            -17 => ObjError::AlreadyExists,
-            _ => ObjError::InvalidArg, // Default
-        }
-    }
-}
+use crate::kernel::error::KernelError;
 
 // ============================================================================
 // Read Attempt Result (for blocking implementation)
@@ -132,13 +66,13 @@ pub struct TableGuard<'a> {
 
 impl<'a> TableGuard<'a> {
     /// Get immutable reference to the table
-    pub fn table(&self) -> Result<&HandleTable, ObjError> {
-        self.guard.as_ref().ok_or(ObjError::TaskNotFound)
+    pub fn table(&self) -> Result<&HandleTable, KernelError> {
+        self.guard.as_ref().ok_or(KernelError::NoProcess)
     }
 
     /// Get mutable reference to the table
-    pub fn table_mut(&mut self) -> Result<&mut HandleTable, ObjError> {
-        self.guard.as_mut().ok_or(ObjError::TaskNotFound)
+    pub fn table_mut(&mut self) -> Result<&mut HandleTable, KernelError> {
+        self.guard.as_mut().ok_or(KernelError::NoProcess)
     }
 
     /// Get the slot index this guard protects
@@ -204,16 +138,16 @@ impl ObjectService {
     /// Acquire lock on a single task's table.
     ///
     /// Returns a TableGuard that proves the lock is held.
-    pub fn lock_table(&self, task_id: TaskId) -> Result<TableGuard<'_>, ObjError> {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+    pub fn lock_table(&self, task_id: TaskId) -> Result<TableGuard<'_>, KernelError> {
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
         let guard = self.tables[slot].lock();
         Ok(TableGuard { guard, slot })
     }
 
     /// Lock a table by slot index directly (internal use)
-    fn lock_slot(&self, slot: usize) -> Result<TableGuard<'_>, ObjError> {
+    fn lock_slot(&self, slot: usize) -> Result<TableGuard<'_>, KernelError> {
         if slot >= MAX_TASKS {
-            return Err(ObjError::TaskNotFound);
+            return Err(KernelError::NoProcess);
         }
         let guard = self.tables[slot].lock();
         Ok(TableGuard { guard, slot })
@@ -225,16 +159,16 @@ impl ObjectService {
     /// This prevents ABBA deadlocks when multiple tables need to be locked.
     ///
     /// # Errors
-    /// Returns `ObjError::InvalidArg` if trying to lock a lower or equal slot.
+    /// Returns `KernelError::InvalidArg` if trying to lock a lower or equal slot.
     pub fn lock_table_ordered(
         &self,
         held: &TableGuard<'_>,
         task_id: TaskId,
-    ) -> Result<TableGuard<'_>, ObjError> {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+    ) -> Result<TableGuard<'_>, KernelError> {
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
         if slot <= held.slot {
             // Lock order violation - would cause ABBA deadlock
-            return Err(ObjError::InvalidArg);
+            return Err(KernelError::InvalidArg);
         }
         let guard = self.tables[slot].lock();
         Ok(TableGuard { guard, slot })
@@ -243,8 +177,8 @@ impl ObjectService {
     /// Try to lock a table without blocking.
     ///
     /// Returns Ok(None) if lock is already held by another CPU.
-    pub fn try_lock_table(&self, task_id: TaskId) -> Result<Option<TableGuard<'_>>, ObjError> {
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+    pub fn try_lock_table(&self, task_id: TaskId) -> Result<Option<TableGuard<'_>>, KernelError> {
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
         match self.tables[slot].try_lock() {
             Some(guard) => Ok(Some(TableGuard { guard, slot })),
             None => Ok(None),
@@ -293,36 +227,36 @@ impl ObjectService {
         guard: &mut TableGuard<'_>,
         object_type: ObjectType,
         object: Object,
-    ) -> Result<Handle, ObjError> {
+    ) -> Result<Handle, KernelError> {
         let table = guard.table_mut()?;
-        table.alloc(object_type, object).ok_or(ObjError::OutOfHandles)
+        table.alloc(object_type, object).ok_or(KernelError::OutOfHandles)
     }
 
     /// Close handle in a locked table
     pub fn close_handle_with(
         guard: &mut TableGuard<'_>,
         handle: Handle,
-    ) -> Result<Object, ObjError> {
+    ) -> Result<Object, KernelError> {
         let table = guard.table_mut()?;
-        table.close(handle).ok_or(ObjError::BadHandle)
+        table.close(handle).ok_or(KernelError::BadHandle)
     }
 
     /// Get entry from a locked table
     pub fn get_entry_with<'b>(
         guard: &'b TableGuard<'b>,
         handle: Handle,
-    ) -> Result<&'b HandleEntry, ObjError> {
+    ) -> Result<&'b HandleEntry, KernelError> {
         let table = guard.table()?;
-        table.get(handle).ok_or(ObjError::BadHandle)
+        table.get(handle).ok_or(KernelError::BadHandle)
     }
 
     /// Get mutable entry from a locked table
     pub fn get_entry_mut_with<'b>(
         guard: &'b mut TableGuard<'b>,
         handle: Handle,
-    ) -> Result<&'b mut HandleEntry, ObjError> {
+    ) -> Result<&'b mut HandleEntry, KernelError> {
         let table = guard.table_mut()?;
-        table.get_mut(handle).ok_or(ObjError::BadHandle)
+        table.get_mut(handle).ok_or(KernelError::BadHandle)
     }
 
     // ========================================================================
@@ -335,41 +269,41 @@ impl ObjectService {
         task_id: TaskId,
         object_type: ObjectType,
         object: Object,
-    ) -> Result<Handle, ObjError> {
+    ) -> Result<Handle, KernelError> {
         let mut guard = self.lock_table(task_id)?;
         Self::alloc_handle_with(&mut guard, object_type, object)
     }
 
     /// Get a handle entry (immutable)
-    pub fn get_entry<F, R>(&self, task_id: TaskId, handle: Handle, f: F) -> Result<R, ObjError>
+    pub fn get_entry<F, R>(&self, task_id: TaskId, handle: Handle, f: F) -> Result<R, KernelError>
     where
         F: FnOnce(&HandleEntry) -> R,
     {
         let guard = self.lock_table(task_id)?;
         let table = guard.table()?;
-        let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
+        let entry = table.get(handle).ok_or(KernelError::BadHandle)?;
         Ok(f(entry))
     }
 
     /// Get a handle entry (mutable)
-    pub fn get_entry_mut<F, R>(&self, task_id: TaskId, handle: Handle, f: F) -> Result<R, ObjError>
+    pub fn get_entry_mut<F, R>(&self, task_id: TaskId, handle: Handle, f: F) -> Result<R, KernelError>
     where
         F: FnOnce(&mut HandleEntry) -> R,
     {
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
-        let entry = table.get_mut(handle).ok_or(ObjError::BadHandle)?;
+        let entry = table.get_mut(handle).ok_or(KernelError::BadHandle)?;
         Ok(f(entry))
     }
 
     /// Close a handle
-    pub fn close_handle(&self, task_id: TaskId, handle: Handle) -> Result<Object, ObjError> {
+    pub fn close_handle(&self, task_id: TaskId, handle: Handle) -> Result<Object, KernelError> {
         let mut guard = self.lock_table(task_id)?;
         Self::close_handle_with(&mut guard, handle)
     }
 
     /// Access the full table for a task (for complex operations like Mux polling)
-    pub fn with_table<F, R>(&self, task_id: TaskId, f: F) -> Result<R, ObjError>
+    pub fn with_table<F, R>(&self, task_id: TaskId, f: F) -> Result<R, KernelError>
     where
         F: FnOnce(&HandleTable) -> R,
     {
@@ -379,7 +313,7 @@ impl ObjectService {
     }
 
     /// Access the full table mutably for a task
-    pub fn with_table_mut<F, R>(&self, task_id: TaskId, f: F) -> Result<R, ObjError>
+    pub fn with_table_mut<F, R>(&self, task_id: TaskId, f: F) -> Result<R, KernelError>
     where
         F: FnOnce(&mut HandleTable) -> R,
     {
@@ -393,7 +327,7 @@ impl ObjectService {
     // ========================================================================
 
     /// Open a console handle (stdin/stdout/stderr)
-    pub fn open_console(&self, task_id: TaskId, console_type: ConsoleType) -> Result<Handle, ObjError> {
+    pub fn open_console(&self, task_id: TaskId, console_type: ConsoleType) -> Result<Handle, KernelError> {
         use crate::kernel::object::ConsoleObject;
 
         let obj = Object::Console(ConsoleObject::new(console_type));
@@ -412,22 +346,22 @@ impl ObjectService {
         task_id: TaskId,
         handle: Handle,
         buf: &mut [u8],
-    ) -> Result<ReadAttempt, ObjError> {
+    ) -> Result<ReadAttempt, KernelError> {
         use crate::platform::current::uart;
         use crate::kernel::ipc::traits::Subscriber;
         use crate::kernel::object::{Pollable};
 
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
-        let entry = table.get_mut(handle).ok_or(ObjError::BadHandle)?;
+        let entry = table.get_mut(handle).ok_or(KernelError::BadHandle)?;
 
         let Object::Console(ref mut c) = entry.object else {
-            return Err(ObjError::TypeMismatch);
+            return Err(KernelError::InvalidArg);
         };
 
         // Only stdin is readable
         if !matches!(c.console_type(), ConsoleType::Stdin) {
-            return Err(ObjError::NotSupported);
+            return Err(KernelError::NotSupported);
         }
 
         if buf.is_empty() {
@@ -464,17 +398,17 @@ impl ObjectService {
         task_id: TaskId,
         handle: Handle,
         buf: &[u8],
-    ) -> Result<usize, ObjError> {
+    ) -> Result<usize, KernelError> {
         use crate::platform::current::uart;
 
         // Validate handle and console type under lock
         let is_writable = {
             let guard = self.lock_table(task_id)?;
             let table = guard.table()?;
-            let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
+            let entry = table.get(handle).ok_or(KernelError::BadHandle)?;
 
             let Object::Console(ref c) = entry.object else {
-                return Err(ObjError::TypeMismatch);
+                return Err(KernelError::InvalidArg);
             };
 
             matches!(c.console_type(), ConsoleType::Stdout | ConsoleType::Stderr)
@@ -482,7 +416,7 @@ impl ObjectService {
         // guard dropped here
 
         if !is_writable {
-            return Err(ObjError::NotSupported);
+            return Err(KernelError::NotSupported);
         }
 
         if buf.is_empty() {
@@ -500,7 +434,7 @@ impl ObjectService {
     // ========================================================================
 
     /// Open a timer handle
-    pub fn open_timer(&self, task_id: TaskId) -> Result<Handle, ObjError> {
+    pub fn open_timer(&self, task_id: TaskId) -> Result<Handle, KernelError> {
         use crate::kernel::object::TimerObject;
 
         let obj = Object::Timer(TimerObject::new());
@@ -512,15 +446,15 @@ impl ObjectService {
     // ========================================================================
 
     /// Open (register) a named port for listening
-    pub fn open_port(&self, task_id: TaskId, name: &[u8]) -> Result<Handle, ObjError> {
+    pub fn open_port(&self, task_id: TaskId, name: &[u8]) -> Result<Handle, KernelError> {
         use crate::kernel::ipc;
         use crate::kernel::object::PortObject;
 
         if name.is_empty() || name.len() > 32 {
-            return Err(ObjError::InvalidArg);
+            return Err(KernelError::InvalidArg);
         }
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
         // Check limit via scheduler (separate from object table access)
         let can_create = crate::kernel::task::with_scheduler(|sched| {
@@ -528,14 +462,14 @@ impl ObjectService {
         });
 
         if !can_create {
-            return Err(ObjError::OutOfHandles);
+            return Err(KernelError::OutOfHandles);
         }
 
         // Register port with IPC backend (no lock held)
         let (port_id, _listen_channel) = ipc::port_register(name, task_id)
             .map_err(|e| match e {
-                ipc::IpcError::PortExists { .. } => ObjError::AlreadyExists,
-                _ => ObjError::OutOfMemory,
+                ipc::IpcError::PortExists { .. } => KernelError::Exists,
+                _ => KernelError::OutOfMemory,
             })?;
 
         // Allocate handle in object table
@@ -544,7 +478,7 @@ impl ObjectService {
             Ok(t) => t,
             Err(_) => {
                 let _ = ipc::port_unregister(port_id, task_id);
-                return Err(ObjError::TaskNotFound);
+                return Err(KernelError::NoProcess);
             }
         };
 
@@ -553,7 +487,7 @@ impl ObjectService {
             Some(h) => h,
             None => {
                 let _ = ipc::port_unregister(port_id, task_id);
-                return Err(ObjError::OutOfHandles);
+                return Err(KernelError::OutOfHandles);
             }
         };
 
@@ -575,20 +509,20 @@ impl ObjectService {
         &self,
         task_id: TaskId,
         handle: Handle,
-    ) -> Result<(ReadAttempt, Option<(Handle, TaskId)>), ObjError> {
+    ) -> Result<(ReadAttempt, Option<(Handle, TaskId)>), KernelError> {
         use crate::kernel::ipc;
         use crate::kernel::object::ChannelObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
         // Get port_id from object table
         let port_id = {
             let guard = self.lock_table(task_id)?;
             let table = guard.table()?;
-            let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
+            let entry = table.get(handle).ok_or(KernelError::BadHandle)?;
 
             let Object::Port(ref p) = entry.object else {
-                return Err(ObjError::TypeMismatch);
+                return Err(KernelError::InvalidArg);
             };
 
             if !p.is_listening() {
@@ -608,7 +542,7 @@ impl ObjectService {
                     Ok(t) => t,
                     Err(_) => {
                         let _ = ipc::close_channel(server_channel, task_id);
-                        return Err(ObjError::TaskNotFound);
+                        return Err(KernelError::NoProcess);
                     }
                 };
 
@@ -626,13 +560,13 @@ impl ObjectService {
                     }
                     None => {
                         let _ = ipc::close_channel(server_channel, task_id);
-                        Err(ObjError::OutOfHandles)
+                        Err(KernelError::OutOfHandles)
                     }
                 }
             }
             Err(ipc::IpcError::NoPending) => Ok((ReadAttempt::NeedBlock, None)),
             Err(ipc::IpcError::Closed) => Ok((ReadAttempt::Closed, None)),
-            Err(_) => Err(ObjError::BadHandle),
+            Err(_) => Err(KernelError::BadHandle),
         }
     }
 
@@ -641,23 +575,23 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a channel pair
-    pub fn open_channel_pair(&self, task_id: TaskId) -> Result<(Handle, Handle), ObjError> {
+    pub fn open_channel_pair(&self, task_id: TaskId) -> Result<(Handle, Handle), KernelError> {
         use crate::kernel::ipc;
         use crate::kernel::object::ChannelObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
         // Per-process limit check via scheduler
         let channel_count = crate::kernel::task::with_scheduler(|sched| {
             sched.task(slot).map(|t| t.channel_count).unwrap_or(u16::MAX)
         });
         if channel_count + 2 > crate::kernel::task::MAX_CHANNELS_PER_TASK {
-            return Err(ObjError::OutOfHandles);
+            return Err(KernelError::OutOfHandles);
         }
 
         // Create channel pair via IPC backend (no lock held)
         let (ch_a, ch_b) = ipc::create_channel_pair(task_id, task_id)
-            .map_err(|_| ObjError::OutOfMemory)?;
+            .map_err(|_| KernelError::OutOfMemory)?;
 
         // Allocate handles
         let mut guard = self.lock_table(task_id)?;
@@ -666,7 +600,7 @@ impl ObjectService {
             Err(_) => {
                 let _ = ipc::close_channel(ch_a, task_id);
                 let _ = ipc::close_channel(ch_b, task_id);
-                return Err(ObjError::TaskNotFound);
+                return Err(KernelError::NoProcess);
             }
         };
 
@@ -677,7 +611,7 @@ impl ObjectService {
             None => {
                 let _ = ipc::close_channel(ch_a, task_id);
                 let _ = ipc::close_channel(ch_b, task_id);
-                return Err(ObjError::OutOfHandles);
+                return Err(KernelError::OutOfHandles);
             }
         };
 
@@ -689,7 +623,7 @@ impl ObjectService {
                 let _ = table.close(handle_a);
                 let _ = ipc::close_channel(ch_a, task_id);
                 let _ = ipc::close_channel(ch_b, task_id);
-                return Err(ObjError::OutOfHandles);
+                return Err(KernelError::OutOfHandles);
             }
         };
 
@@ -711,25 +645,25 @@ impl ObjectService {
         &self,
         task_id: TaskId,
         port_name: &[u8],
-    ) -> Result<Handle, ObjError> {
+    ) -> Result<Handle, KernelError> {
         use crate::kernel::ipc::{self, waker};
         use crate::kernel::object::ChannelObject;
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
         // Per-process limit check via scheduler
         let can_create = crate::kernel::task::with_scheduler(|sched| {
             sched.task(slot).map(|t| t.can_create_channel()).unwrap_or(false)
         });
         if !can_create {
-            return Err(ObjError::OutOfHandles);
+            return Err(KernelError::OutOfHandles);
         }
 
         // Connect to port via IPC backend (no lock held)
         let (client_channel, wake_list, port_owner) = ipc::port_connect(port_name, task_id)
             .map_err(|e| match e {
-                ipc::IpcError::PortNotFound => ObjError::BadHandle,
-                _ => ObjError::InvalidArg,
+                ipc::IpcError::PortNotFound => KernelError::BadHandle,
+                _ => KernelError::InvalidArg,
             })?;
 
         // Wake the server waiting for connections (IPC backend subscribers)
@@ -769,7 +703,7 @@ impl ObjectService {
             Ok(t) => t,
             Err(_) => {
                 let _ = ipc::close_channel(client_channel, task_id);
-                return Err(ObjError::TaskNotFound);
+                return Err(KernelError::NoProcess);
             }
         };
 
@@ -778,7 +712,7 @@ impl ObjectService {
             Some(h) => h,
             None => {
                 let _ = ipc::close_channel(client_channel, task_id);
-                return Err(ObjError::OutOfHandles);
+                return Err(KernelError::OutOfHandles);
             }
         };
 
@@ -800,17 +734,17 @@ impl ObjectService {
         task_id: TaskId,
         handle: Handle,
         buf: &mut [u8],
-    ) -> Result<ReadAttempt, ObjError> {
+    ) -> Result<ReadAttempt, KernelError> {
         use crate::kernel::ipc;
 
         // Get channel info from object table
         let channel_id = {
             let guard = self.lock_table(task_id)?;
             let table = guard.table()?;
-            let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
+            let entry = table.get(handle).ok_or(KernelError::BadHandle)?;
 
             let Object::Channel(ref ch) = entry.object else {
-                return Err(ObjError::TypeMismatch);
+                return Err(KernelError::InvalidArg);
             };
 
             // Check state
@@ -839,7 +773,7 @@ impl ObjectService {
             Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
                 Ok(ReadAttempt::Closed)
             }
-            Err(_) => Err(ObjError::BadHandle),
+            Err(_) => Err(KernelError::BadHandle),
         }
     }
 
@@ -849,31 +783,31 @@ impl ObjectService {
         task_id: TaskId,
         handle: Handle,
         buf: &[u8],
-    ) -> Result<usize, ObjError> {
+    ) -> Result<usize, KernelError> {
         use crate::kernel::ipc::{self, waker};
 
         if buf.len() > ipc::MAX_INLINE_PAYLOAD {
-            return Err(ObjError::InvalidArg);
+            return Err(KernelError::InvalidArg);
         }
 
         // Get channel info from object table
         let channel_id = {
             let guard = self.lock_table(task_id)?;
             let table = guard.table()?;
-            let entry = table.get(handle).ok_or(ObjError::BadHandle)?;
+            let entry = table.get(handle).ok_or(KernelError::BadHandle)?;
 
             let Object::Channel(ref ch) = entry.object else {
-                return Err(ObjError::TypeMismatch);
+                return Err(KernelError::InvalidArg);
             };
 
             // Check state
             if !ch.is_open() {
-                return Err(ObjError::Closed);
+                return Err(KernelError::PeerClosed);
             }
 
             let channel_id = ch.channel_id();
             if channel_id == 0 {
-                return Err(ObjError::Closed);
+                return Err(KernelError::PeerClosed);
             }
 
             channel_id
@@ -888,11 +822,11 @@ impl ObjectService {
                 waker::wake(&wake_list, ipc::WakeReason::Readable);
                 Ok(buf.len())
             }
-            Err(ipc::IpcError::QueueFull) => Err(ObjError::WouldBlock),
+            Err(ipc::IpcError::QueueFull) => Err(KernelError::WouldBlock),
             Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
-                Err(ObjError::Closed)
+                Err(KernelError::PeerClosed)
             }
-            Err(_) => Err(ObjError::BadHandle),
+            Err(_) => Err(KernelError::BadHandle),
         }
     }
 
@@ -901,14 +835,14 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a new Mux
-    pub fn open_mux(&self, task_id: TaskId) -> Result<Handle, ObjError> {
+    pub fn open_mux(&self, task_id: TaskId) -> Result<Handle, KernelError> {
         use crate::kernel::object::MuxObject;
 
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
         let obj = Object::Mux(MuxObject::new());
 
-        table.alloc(ObjectType::Mux, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::Mux, obj).ok_or(KernelError::OutOfHandles)
     }
 
     // ========================================================================
@@ -916,7 +850,7 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a Process object to watch another process
-    pub fn open_process(&self, task_id: TaskId, target_pid: TaskId) -> Result<Handle, ObjError> {
+    pub fn open_process(&self, task_id: TaskId, target_pid: TaskId) -> Result<Handle, KernelError> {
         use crate::kernel::object::ProcessObject;
 
         // First, check target task state via scheduler
@@ -944,7 +878,7 @@ impl ObjectService {
         // Allocate handle in object table
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
-        table.alloc(ObjectType::Process, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::Process, obj).ok_or(KernelError::OutOfHandles)
     }
 
     // ========================================================================
@@ -952,17 +886,17 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a new shared memory region
-    pub fn open_shmem_create(&self, task_id: TaskId, size: usize) -> Result<(Handle, u32), ObjError> {
+    pub fn open_shmem_create(&self, task_id: TaskId, size: usize) -> Result<(Handle, u32), KernelError> {
         use crate::kernel::object::ShmemObject;
         use crate::kernel::shmem;
 
         if size == 0 {
-            return Err(ObjError::InvalidArg);
+            return Err(KernelError::InvalidArg);
         }
 
         // Create shmem region (outside lock)
         let (shmem_id, vaddr, paddr) = shmem::create(task_id, size)
-            .map_err(ObjError::from_errno)?;
+            .map_err(KernelError::from_errno)?;
 
         // Allocate handle in object table
         let mut guard = self.lock_table(task_id)?;
@@ -970,7 +904,7 @@ impl ObjectService {
             Ok(t) => t,
             Err(_) => {
                 let _ = shmem::destroy(shmem_id, task_id);
-                return Err(ObjError::TaskNotFound);
+                return Err(KernelError::NoProcess);
             }
         };
 
@@ -980,19 +914,19 @@ impl ObjectService {
             Some(handle) => Ok((handle, shmem_id)),
             None => {
                 let _ = shmem::destroy(shmem_id, task_id);
-                Err(ObjError::OutOfHandles)
+                Err(KernelError::OutOfHandles)
             }
         }
     }
 
     /// Open an existing shared memory region
-    pub fn open_shmem_existing(&self, task_id: TaskId, shmem_id: u32) -> Result<Handle, ObjError> {
+    pub fn open_shmem_existing(&self, task_id: TaskId, shmem_id: u32) -> Result<Handle, KernelError> {
         use crate::kernel::object::ShmemObject;
         use crate::kernel::shmem;
 
         // Map existing shmem region (outside lock)
         let (vaddr, paddr) = shmem::map(task_id, shmem_id)
-            .map_err(ObjError::from_errno)?;
+            .map_err(KernelError::from_errno)?;
         let size = shmem::get_size(shmem_id).unwrap_or(0);
 
         // Allocate handle in object table
@@ -1001,7 +935,7 @@ impl ObjectService {
             Ok(t) => t,
             Err(_) => {
                 let _ = shmem::unmap(task_id, shmem_id);
-                return Err(ObjError::TaskNotFound);
+                return Err(KernelError::NoProcess);
             }
         };
 
@@ -1011,7 +945,7 @@ impl ObjectService {
             Some(handle) => Ok(handle),
             None => {
                 let _ = shmem::unmap(task_id, shmem_id);
-                Err(ObjError::OutOfHandles)
+                Err(KernelError::OutOfHandles)
             }
         }
     }
@@ -1026,28 +960,28 @@ impl ObjectService {
         task_id: TaskId,
         size: usize,
         use_high: bool,
-    ) -> Result<Handle, ObjError> {
+    ) -> Result<Handle, KernelError> {
         use crate::kernel::dma_pool;
         use crate::kernel::object::DmaPoolObject;
 
         if size == 0 {
-            return Err(ObjError::InvalidArg);
+            return Err(KernelError::InvalidArg);
         }
 
         // Allocate from appropriate pool (outside lock)
         let paddr = if use_high {
-            dma_pool::alloc_high(size).map_err(ObjError::from_errno)?
+            dma_pool::alloc_high(size).map_err(KernelError::from_errno)?
         } else {
-            dma_pool::alloc(size).map_err(ObjError::from_errno)?
+            dma_pool::alloc(size).map_err(KernelError::from_errno)?
         };
 
         // Map into process (outside lock)
         let vaddr = if use_high {
             dma_pool::map_into_process_high(task_id, paddr, size)
-                .map_err(ObjError::from_errno)?
+                .map_err(KernelError::from_errno)?
         } else {
             dma_pool::map_into_process(task_id, paddr, size)
-                .map_err(ObjError::from_errno)?
+                .map_err(KernelError::from_errno)?
         };
 
         // Allocate handle in object table
@@ -1055,7 +989,7 @@ impl ObjectService {
         let table = guard.table_mut()?;
         let obj = Object::DmaPool(DmaPoolObject::new(paddr, size, vaddr));
 
-        table.alloc(ObjectType::DmaPool, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::DmaPool, obj).ok_or(KernelError::OutOfHandles)
     }
 
     // ========================================================================
@@ -1068,19 +1002,19 @@ impl ObjectService {
         task_id: TaskId,
         phys_addr: u64,
         size: usize,
-    ) -> Result<Handle, ObjError> {
+    ) -> Result<Handle, KernelError> {
         use crate::kernel::object::MmioObject;
 
         if size == 0 {
-            return Err(ObjError::InvalidArg);
+            return Err(KernelError::InvalidArg);
         }
 
-        let slot = slot_from_task_id(task_id).ok_or(ObjError::TaskNotFound)?;
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
         // Map MMIO into process via scheduler
         let vaddr = crate::kernel::task::with_scheduler(|sched| {
-            let task = sched.task_mut(slot).ok_or(ObjError::TaskNotFound)?;
-            task.mmap_device(phys_addr, size).ok_or(ObjError::OutOfMemory)
+            let task = sched.task_mut(slot).ok_or(KernelError::NoProcess)?;
+            task.mmap_device(phys_addr, size).ok_or(KernelError::OutOfMemory)
         })?;
         // scheduler lock dropped here
 
@@ -1089,7 +1023,7 @@ impl ObjectService {
         let table = guard.table_mut()?;
         let obj = Object::Mmio(MmioObject::new(phys_addr, size, vaddr));
 
-        table.alloc(ObjectType::Mmio, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::Mmio, obj).ok_or(KernelError::OutOfHandles)
     }
 
     // ========================================================================
@@ -1102,7 +1036,7 @@ impl ObjectService {
         task_id: TaskId,
         ring: crate::kernel::object::RingObject,
         shmem_id: u32,
-    ) -> Result<Handle, ObjError> {
+    ) -> Result<Handle, KernelError> {
         // Allocate handle in object table
         let mut guard = self.lock_table(task_id)?;
         let table = match guard.table_mut() {
@@ -1110,7 +1044,7 @@ impl ObjectService {
             Err(_) => {
                 // Clean up shmem on failure
                 let _ = crate::kernel::shmem::destroy(shmem_id, task_id);
-                return Err(ObjError::TaskNotFound);
+                return Err(KernelError::NoProcess);
             }
         };
 
@@ -1120,7 +1054,7 @@ impl ObjectService {
             Some(handle) => Ok(handle),
             None => {
                 let _ = crate::kernel::shmem::destroy(shmem_id, task_id);
-                Err(ObjError::OutOfHandles)
+                Err(KernelError::OutOfHandles)
             }
         }
     }
@@ -1130,14 +1064,14 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a kernel log reader
-    pub fn open_klog(&self, task_id: TaskId) -> Result<Handle, ObjError> {
+    pub fn open_klog(&self, task_id: TaskId) -> Result<Handle, KernelError> {
         use crate::kernel::object::KlogObject;
 
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
         let obj = Object::Klog(KlogObject::new());
 
-        table.alloc(ObjectType::Klog, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::Klog, obj).ok_or(KernelError::OutOfHandles)
     }
 
     // ========================================================================
@@ -1145,25 +1079,25 @@ impl ObjectService {
     // ========================================================================
 
     /// Create a PCI bus handle for device enumeration
-    pub fn open_pci_bus(&self, task_id: TaskId, bdf_filter: u32) -> Result<Handle, ObjError> {
+    pub fn open_pci_bus(&self, task_id: TaskId, bdf_filter: u32) -> Result<Handle, KernelError> {
         use crate::kernel::object::PciBusObject;
 
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
         let obj = Object::PciBus(PciBusObject::new(bdf_filter));
 
-        table.alloc(ObjectType::PciBus, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::PciBus, obj).ok_or(KernelError::OutOfHandles)
     }
 
     /// Create a PCI device handle for config access
-    pub fn open_pci_device(&self, task_id: TaskId, bdf: u32) -> Result<Handle, ObjError> {
+    pub fn open_pci_device(&self, task_id: TaskId, bdf: u32) -> Result<Handle, KernelError> {
         use crate::kernel::object::PciDeviceObject;
 
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
         let obj = Object::PciDevice(PciDeviceObject::new(bdf));
 
-        table.alloc(ObjectType::PciDevice, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::PciDevice, obj).ok_or(KernelError::OutOfHandles)
     }
 
     /// Allocate MSI vectors for a PCI device
@@ -1173,25 +1107,25 @@ impl ObjectService {
         bdf: u32,
         first_irq: u32,
         count: u8,
-    ) -> Result<Handle, ObjError> {
+    ) -> Result<Handle, KernelError> {
         use crate::kernel::object::MsiObject;
 
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
         let obj = Object::Msi(MsiObject::new(bdf, first_irq, count));
 
-        table.alloc(ObjectType::Msi, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::Msi, obj).ok_or(KernelError::OutOfHandles)
     }
 
     /// Create a bus list handle
-    pub fn open_bus_list(&self, task_id: TaskId) -> Result<Handle, ObjError> {
+    pub fn open_bus_list(&self, task_id: TaskId) -> Result<Handle, KernelError> {
         use crate::kernel::object::BusListObject;
 
         let mut guard = self.lock_table(task_id)?;
         let table = guard.table_mut()?;
         let obj = Object::BusList(BusListObject::new());
 
-        table.alloc(ObjectType::BusList, obj).ok_or(ObjError::OutOfHandles)
+        table.alloc(ObjectType::BusList, obj).ok_or(KernelError::OutOfHandles)
     }
 
     // ========================================================================

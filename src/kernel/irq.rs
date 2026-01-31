@@ -135,9 +135,11 @@ pub fn notify(irq_num: u32) -> Option<u32> {
         });
         Some(pid)
     } else if owner_pid != 0 {
-        // Send event to the process
-        let event = super::event::Event::irq(irq_num);
-        super::event::deliver_event_to_task(owner_pid, event);
+        // Owner exists but wasn't blocked — wake via scheduler in case
+        // they're sleeping on a Mux that watches this IRQ
+        super::task::with_scheduler(|sched| {
+            sched.wake_by_pid(owner_pid);
+        });
         Some(owner_pid)
     } else {
         None

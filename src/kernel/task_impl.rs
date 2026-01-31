@@ -230,28 +230,6 @@ impl TaskOperations for KernelTaskOperations {
     }
 
     // ========================================================================
-    // Events
-    // ========================================================================
-
-    fn has_pending_events(&self, task_id: TaskId) -> bool {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.event_queue.has_events())
-                .unwrap_or(false)
-        })
-    }
-
-    fn pending_event_count(&self, task_id: TaskId) -> usize {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.event_queue.len())
-                .unwrap_or(0)
-        })
-    }
-
-    // ========================================================================
     // Timers
     // ========================================================================
 
@@ -383,7 +361,6 @@ pub mod mock {
         capabilities: TraitCapabilities,
         signal_allowlist: [TaskId; MAX_ALLOWLIST],
         signal_allowlist_count: usize,
-        event_count: usize,
         timers: [(u64, u64); MAX_TIMERS], // (deadline, interval)
     }
 
@@ -399,7 +376,6 @@ pub mod mock {
                 capabilities: TraitCapabilities::NONE,
                 signal_allowlist: [0; MAX_ALLOWLIST],
                 signal_allowlist_count: 0,
-                event_count: 0,
                 timers: [(0, 0); MAX_TIMERS],
             }
         }
@@ -475,20 +451,6 @@ pub mod mock {
                 if let Some(ref mut t) = slot {
                     if t.id == task_id {
                         t.capabilities = caps;
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-
-        /// Add pending events to a task
-        pub fn add_events(&self, task_id: TaskId, count: usize) -> bool {
-            let mut tasks = self.tasks.borrow_mut();
-            for slot in tasks.iter_mut() {
-                if let Some(ref mut t) = slot {
-                    if t.id == task_id {
-                        t.event_count += count;
                         return true;
                     }
                 }
@@ -737,30 +699,6 @@ pub mod mock {
                 }
             }
             Err(TaskError::NotFound)
-        }
-
-        fn has_pending_events(&self, task_id: TaskId) -> bool {
-            let tasks = self.tasks.borrow();
-            for slot in tasks.iter() {
-                if let Some(ref t) = slot {
-                    if t.id == task_id {
-                        return t.event_count > 0;
-                    }
-                }
-            }
-            false
-        }
-
-        fn pending_event_count(&self, task_id: TaskId) -> usize {
-            let tasks = self.tasks.borrow();
-            for slot in tasks.iter() {
-                if let Some(ref t) = slot {
-                    if t.id == task_id {
-                        return t.event_count;
-                    }
-                }
-            }
-            0
         }
 
         fn arm_timer(
@@ -1015,19 +953,6 @@ mod tests {
 
         // Should be full now
         assert!(matches!(mock.allow_signals_from(1, 100), Err(TaskError::AllowlistFull)));
-    }
-
-    #[test]
-    fn test_pending_events() {
-        let mock = MockTaskOperations::new();
-        mock.add_task(1, 0, "test");
-
-        assert!(!mock.has_pending_events(1));
-        assert_eq!(mock.pending_event_count(1), 0);
-
-        mock.add_events(1, 3);
-        assert!(mock.has_pending_events(1));
-        assert_eq!(mock.pending_event_count(1), 3);
     }
 
     #[test]

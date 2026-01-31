@@ -4,7 +4,7 @@
 //! - Task and process management
 //! - Scheduler
 //! - System call handling
-//! - IPC (channels, ports, events)
+//! - IPC (channels, ports)
 //! - Memory management (PMM, address spaces)
 //! - ELF loader
 //!
@@ -21,8 +21,7 @@ pub mod process;
 pub mod process_impl; // ProcessBackend trait implementation
 pub mod syscall;
 pub mod memory;  // User memory mapping types
-pub(crate) mod ipc;    // IPC system - internal, use object/ for public API
-pub mod event;
+pub(crate) mod ipc;    // IPC primitives - internal, use object/ for public API
 pub mod shmem;
 pub mod shmem_impl; // ShmemBackend trait implementation
 pub mod dma_pool;
@@ -41,6 +40,7 @@ pub mod security_log;
 pub mod fdt;
 pub mod liveness;
 pub mod hw_poll;
+pub mod error; // Unified KernelError type
 pub mod object;
 pub mod irq;
 pub mod object_service;

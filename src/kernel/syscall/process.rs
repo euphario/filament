@@ -23,7 +23,8 @@ use super::super::caps::Capabilities;
 use super::super::task::{self, lifecycle};
 use super::super::syscall_ctx_impl::create_syscall_context;
 use super::super::traits::syscall_ctx::SyscallContext;
-use super::{SyscallError, uaccess_to_errno};
+use super::uaccess_to_errno;
+use crate::kernel::error::KernelError;
 
 /// Wait flags
 pub const WNOHANG: u32 = 1;  // Don't block if no child has exited
@@ -51,7 +52,7 @@ pub(super) fn sys_exit(code: i32) -> i64 {
         Some(id) => id,
         None => {
             kinfo!("sys_exit", "no_current_task");
-            return SyscallError::NoProcess as i64;
+            return KernelError::NoProcess.to_errno();
         }
     };
 
@@ -114,12 +115,12 @@ pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
 
     // Check SPAWN capability
     if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     // Validate name length
     if name_len == 0 || name_len > 15 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Copy name from user space
@@ -132,7 +133,7 @@ pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
     // Get the ELF binary by ID
     let elf_data = match super::super::elf::get_elf_by_id(elf_id) {
         Some(data) => data,
-        None => return SyscallError::NotFound as i64,
+        None => return KernelError::NotFound.to_errno(),
     };
 
     // Parse name from kernel buffer
@@ -141,13 +142,13 @@ pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
     // Get current PID as parent
     let parent_id = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::NoProcess as i64,
+        None => return KernelError::NoProcess.to_errno(),
     };
 
     // Spawn the child process
     match super::super::elf::spawn_from_elf_with_parent(elf_data, name, parent_id) {
         Ok((child_id, _slot)) => child_id as i64,
-        Err(_) => SyscallError::OutOfMemory as i64,
+        Err(_) => KernelError::OutOfMemory.to_errno(),
     }
 }
 
@@ -160,12 +161,12 @@ pub(super) fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
 
     // Check SPAWN capability
     if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     // Validate path length
     if path_len == 0 || path_len > 127 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Copy path from user space
@@ -178,20 +179,20 @@ pub(super) fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
     // Parse path from kernel buffer
     let path = match core::str::from_utf8(&path_buf[..path_len]) {
         Ok(s) => s,
-        Err(_) => return SyscallError::InvalidArgument as i64,
+        Err(_) => return KernelError::InvalidArg.to_errno(),
     };
 
     // Get current PID as parent
     let parent_id = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::NoProcess as i64,
+        None => return KernelError::NoProcess.to_errno(),
     };
 
     // Try to spawn from ramfs path
     match super::super::elf::spawn_from_path_with_parent(path, parent_id) {
         Ok((child_id, _slot)) => child_id as i64,
-        Err(super::super::elf::ElfError::NotExecutable) => SyscallError::NotFound as i64,
-        Err(_) => SyscallError::OutOfMemory as i64,
+        Err(super::super::elf::ElfError::NotExecutable) => KernelError::NotFound.to_errno(),
+        Err(_) => KernelError::OutOfMemory.to_errno(),
     }
 }
 
@@ -204,17 +205,17 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
 
     // Require SPAWN capability
     if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     // Require GRANT capability to delegate capabilities to children
     if let Err(_) = ctx.require_capability(Capabilities::GRANT.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     // Validate path length
     if path_len == 0 || path_len > 127 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Copy path from user space
@@ -227,13 +228,13 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
     // Parse path from kernel buffer
     let path = match core::str::from_utf8(&path_buf[..path_len]) {
         Ok(s) => s,
-        Err(_) => return SyscallError::InvalidArgument as i64,
+        Err(_) => return KernelError::InvalidArg.to_errno(),
     };
 
     // Get current PID as parent
     let parent_id = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::NoProcess as i64,
+        None => return KernelError::NoProcess.to_errno(),
     };
 
     // Convert capabilities bitmask
@@ -242,8 +243,8 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
     // Try to spawn from ramfs path with explicit capabilities
     match super::super::elf::spawn_from_path_with_caps_find(path, parent_id, requested_caps) {
         Ok((child_id, _slot)) => child_id as i64,
-        Err(super::super::elf::ElfError::NotExecutable) => SyscallError::NotFound as i64,
-        Err(_) => SyscallError::OutOfMemory as i64,
+        Err(super::super::elf::ElfError::NotExecutable) => KernelError::NotFound.to_errno(),
+        Err(_) => KernelError::OutOfMemory.to_errno(),
     }
 }
 
@@ -260,12 +261,12 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
 
     // Check SPAWN capability
     if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     // Validate ELF size (reasonable bounds: at least an ELF header, at most 16MB)
     if elf_len < 64 || elf_len > 16 * 1024 * 1024 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // Validate and read ELF data from userspace
@@ -279,7 +280,7 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
     let num_pages = (elf_len + 4095) / 4096;
     let elf_phys = match super::super::pmm::alloc_pages(num_pages) {
         Some(addr) => addr,
-        None => return SyscallError::OutOfMemory as i64,
+        None => return KernelError::OutOfMemory.to_errno(),
     };
 
     // Get kernel virtual address for the allocation
@@ -310,17 +311,17 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
         Some(id) => id,
         None => {
             super::super::pmm::free_pages(elf_phys, num_pages);
-            return SyscallError::NoProcess as i64;
+            return KernelError::NoProcess.to_errno();
         }
     };
 
     // Spawn from the ELF data
     let result = match super::super::elf::spawn_from_elf_with_parent(elf_slice, name, parent_id) {
         Ok((child_id, _slot)) => child_id as i64,
-        Err(super::super::elf::ElfError::BadMagic) => SyscallError::InvalidArgument as i64,
-        Err(super::super::elf::ElfError::NotExecutable) => SyscallError::InvalidArgument as i64,
-        Err(super::super::elf::ElfError::WrongArch) => SyscallError::InvalidArgument as i64,
-        Err(_) => SyscallError::OutOfMemory as i64,
+        Err(super::super::elf::ElfError::BadMagic) => KernelError::InvalidArg.to_errno(),
+        Err(super::super::elf::ElfError::NotExecutable) => KernelError::InvalidArg.to_errno(),
+        Err(super::super::elf::ElfError::WrongArch) => KernelError::InvalidArg.to_errno(),
+        Err(_) => KernelError::OutOfMemory.to_errno(),
     };
 
     // Free the kernel buffer (ELF data has been copied to process address space)
@@ -342,7 +343,7 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
     let ctx = create_syscall_context();
     let caller_pid = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::NoProcess as i64,
+        None => return KernelError::NoProcess.to_errno(),
     };
     let no_hang = (flags & WNOHANG) != 0;
 
@@ -381,22 +382,22 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
                     caller_slot,
                     task::SleepReason::EventLoop,
                 ) {
-                    return SyscallError::InvalidArgument as i64;
+                    return KernelError::InvalidArg.to_errno();
                 }
 
                 // Pre-store return value in caller's trap frame
                 if let Some(parent) = sched.task_mut(caller_slot) {
-                    parent.set_deferred_return(SyscallError::WouldBlock as i64);
+                    parent.set_deferred_return(KernelError::WouldBlock.to_errno());
                 }
 
                 // Reschedule to another task
                 super::super::sched::reschedule();
 
-                SyscallError::WouldBlock as i64
+                KernelError::WouldBlock.to_errno()
             }
 
-            lifecycle::WaitResult::NoChildren => SyscallError::NoChild as i64,
-            lifecycle::WaitResult::NotChild => SyscallError::InvalidArgument as i64,
+            lifecycle::WaitResult::NoChildren => KernelError::NoChild.to_errno(),
+            lifecycle::WaitResult::NotChild => KernelError::InvalidArg.to_errno(),
         }
     })
 }
@@ -406,7 +407,7 @@ pub(super) fn sys_daemonize() -> i64 {
     let ctx = create_syscall_context();
     let caller_pid = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::NoProcess as i64,
+        None => return KernelError::NoProcess.to_errno(),
     };
 
     task::with_scheduler(|sched| {
@@ -450,14 +451,14 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
     let ctx = create_syscall_context();
 
     if pid == 0 {
-        return SyscallError::InvalidArgument as i64;
+        return KernelError::InvalidArg.to_errno();
     }
 
     // SECURITY: Never allow killing idle (slot 0, pid 1)
     if pid == 1 {
         let caller = ctx.current_task_id().unwrap_or(0);
         kwarn!("security", "kill_idle_denied"; caller = caller as u64);
-        return SyscallError::PermissionDenied as i64;
+        return KernelError::PermDenied.to_errno();
     }
 
     // NOTE: Killing devd (is_init=true) is allowed for testing - recovery will be triggered.
@@ -467,7 +468,7 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
 
     let caller_pid = match ctx.current_task_id() {
         Some(id) => id,
-        None => return SyscallError::NoProcess as i64,
+        None => return KernelError::NoProcess.to_errno(),
     };
 
     task::with_scheduler(|sched| {
@@ -475,13 +476,13 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
         // NOTE: Resource cleanup is deferred to reap_terminated() for two-phase cleanup.
         match lifecycle::kill(sched, pid, caller_pid) {
             Ok(()) => {}
-            Err(lifecycle::LifecycleError::NotFound) => return SyscallError::NoProcess as i64,
+            Err(lifecycle::LifecycleError::NotFound) => return KernelError::NoProcess.to_errno(),
             Err(lifecycle::LifecycleError::PermissionDenied) => {
                 kwarn!("security", "kill_denied"; caller = caller_pid as u64, target = pid as u64);
-                return SyscallError::PermissionDenied as i64;
+                return KernelError::PermDenied.to_errno();
             }
-            Err(lifecycle::LifecycleError::InvalidState) => return SyscallError::InvalidArgument as i64,
-            Err(lifecycle::LifecycleError::NoChildren) => return SyscallError::InvalidArgument as i64,
+            Err(lifecycle::LifecycleError::InvalidState) => return KernelError::InvalidArg.to_errno(),
+            Err(lifecycle::LifecycleError::NoChildren) => return KernelError::InvalidArg.to_errno(),
         }
 
         // If killing current task, the reschedule will be handled by do_resched_if_needed
@@ -581,7 +582,7 @@ pub(super) fn sys_get_capabilities(pid: u32) -> i64 {
     let target_pid = if pid == 0 {
         match ctx.current_task_id() {
             Some(id) => id,
-            None => return SyscallError::NoProcess as i64,
+            None => return KernelError::NoProcess.to_errno(),
         }
     } else {
         pid
@@ -596,6 +597,6 @@ pub(super) fn sys_get_capabilities(pid: u32) -> i64 {
         }
 
         // Process not found
-        SyscallError::NoProcess as i64
+        KernelError::NoProcess.to_errno()
     })
 }

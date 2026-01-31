@@ -411,6 +411,7 @@ pub mod errno {
     pub const ENODEV: i32 = -19;       // No such device
     pub const EINVAL: i32 = -22;       // Invalid argument
     pub const ENFILE: i32 = -23;       // Too many open files in system
+    pub const EMFILE: i32 = -24;       // Too many open files per process
     pub const ENOSPC: i32 = -28;       // No space left
     pub const EROFS: i32 = -30;        // Read-only filesystem
     pub const EPIPE: i32 = -32;        // Broken pipe
@@ -801,6 +802,47 @@ pub enum PipeMessageType {
 pub const PIPE_MESSAGE_MAX: usize = 248;
 
 // ============================================================================
+// PCI BDF Encoding (Single Source of Truth)
+// ============================================================================
+
+/// Standard PCI Bus/Device/Function encoding.
+///
+/// This is the canonical BDF format used across the kernel/userspace boundary.
+/// Both the kernel's `PciBdf` and userspace drivers must use these functions.
+///
+/// Bit layout of a packed BDF u32:
+///   bits 15..8:  bus (0-255)
+///   bits 7..3:   device (0-31)
+///   bits 2..0:   function (0-7)
+///
+/// The upper 16 bits are reserved (zero for standard PCI).
+pub mod pci_bdf {
+    /// Pack bus/device/function into a u32.
+    #[inline]
+    pub const fn pack(bus: u8, device: u8, function: u8) -> u32 {
+        ((bus as u32) << 8) | ((device as u32 & 0x1F) << 3) | (function as u32 & 0x07)
+    }
+
+    /// Extract bus from packed BDF.
+    #[inline]
+    pub const fn bus(bdf: u32) -> u8 {
+        ((bdf >> 8) & 0xFF) as u8
+    }
+
+    /// Extract device from packed BDF.
+    #[inline]
+    pub const fn device(bdf: u32) -> u8 {
+        ((bdf >> 3) & 0x1F) as u8
+    }
+
+    /// Extract function from packed BDF.
+    #[inline]
+    pub const fn function(bdf: u32) -> u8 {
+        (bdf & 0x07) as u8
+    }
+}
+
+// ============================================================================
 // PCI Enumeration (Kernel → Userspace)
 // ============================================================================
 
@@ -811,7 +853,7 @@ pub const PIPE_MESSAGE_MAX: usize = 248;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PciEnumEntry {
-    /// Packed BDF: bus(8) | device(5) | function(3) in low 16 bits
+    /// Packed BDF — see [`pci_bdf`] for encoding.
     pub bdf: u32,
     /// PCI vendor ID
     pub vendor_id: u16,
@@ -848,17 +890,17 @@ impl PciEnumEntry {
 
     /// Extract bus number from packed BDF
     pub const fn bus(&self) -> u8 {
-        ((self.bdf >> 8) & 0xFF) as u8
+        pci_bdf::bus(self.bdf)
     }
 
     /// Extract device number from packed BDF
     pub const fn device(&self) -> u8 {
-        ((self.bdf >> 3) & 0x1F) as u8
+        pci_bdf::device(self.bdf)
     }
 
     /// Extract function number from packed BDF
     pub const fn function(&self) -> u8 {
-        (self.bdf & 0x07) as u8
+        pci_bdf::function(self.bdf)
     }
 
     /// Extract base class from class_code
@@ -881,6 +923,117 @@ impl PciEnumEntry {
         (self.class_code & 0xFF) as u8
     }
 }
+
+// ============================================================================
+// Bus Types (Kernel → Userspace)
+// ============================================================================
+
+/// Bus type constants for BusInfo
+pub mod bus_type {
+    /// PCIe root port
+    pub const PCIE: u8 = 0;
+    /// USB host controller (xHCI)
+    pub const USB: u8 = 1;
+    /// Platform pseudo-bus (uart, gpio, i2c, spi, etc.)
+    pub const PLATFORM: u8 = 2;
+}
+
+/// Bus state constants for BusInfo
+pub mod bus_state {
+    /// Bus is idle, ready to be claimed
+    pub const SAFE: u8 = 0;
+    /// Bus has an active driver
+    pub const CLAIMED: u8 = 1;
+    /// Bus is resetting (driver crashed or explicit reset)
+    pub const RESETTING: u8 = 2;
+}
+
+/// Bus information returned by kernel bus enumeration
+///
+/// Used by open(BusList) + read(BusList) to return discovered buses.
+/// 48 bytes per entry, packed for efficient transfer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BusInfo {
+    /// Bus type (see `bus_type` module)
+    pub bus_type: u8,
+    /// Bus index within type (e.g., 0 for pcie0)
+    pub bus_index: u8,
+    /// Current state (see `bus_state` module)
+    pub state: u8,
+    /// Padding for alignment
+    pub _pad: u8,
+    /// MMIO base address (from DTB/hardcoded)
+    pub base_addr: u32,
+    /// Owner PID (0 if no owner)
+    pub owner_pid: u32,
+    /// Port path (e.g., "/kernel/bus/pcie0")
+    pub path: [u8; 32],
+    /// Length of path string
+    pub path_len: u8,
+    /// Reserved for future use
+    pub _reserved: [u8; 3],
+}
+
+impl BusInfo {
+    pub const fn empty() -> Self {
+        Self {
+            bus_type: 0,
+            bus_index: 0,
+            state: 0,
+            _pad: 0,
+            base_addr: 0,
+            owner_pid: 0,
+            path: [0; 32],
+            path_len: 0,
+            _reserved: [0; 3],
+        }
+    }
+
+    /// Get path as byte slice
+    pub fn path_bytes(&self) -> &[u8] {
+        &self.path[..self.path_len as usize]
+    }
+}
+
+// ============================================================================
+// RamFS Directory Entry
+// ============================================================================
+
+/// Entry returned by the RAMFS_LIST syscall.
+///
+/// Shared between kernel and userspace — single source of truth.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RamfsListEntry {
+    /// Filename (null-terminated)
+    pub name: [u8; 100],
+    /// File size in bytes
+    pub size: u64,
+    /// File type: 0 = regular, 1 = directory
+    pub file_type: u8,
+    /// Padding for alignment
+    pub _pad: [u8; 7],
+}
+
+const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
+
+impl RamfsListEntry {
+    pub const SIZE: usize = core::mem::size_of::<Self>();
+
+    pub const fn empty() -> Self {
+        Self { name: [0; 100], size: 0, file_type: 0, _pad: [0; 7] }
+    }
+
+    pub fn name_str(&self) -> &[u8] {
+        let len = self.name.iter().position(|&c| c == 0).unwrap_or(100);
+        &self.name[..len]
+    }
+}
+
+// ============================================================================
+// Pipe Messages
+// ============================================================================
 
 /// Pipe message header (8 bytes)
 #[repr(C)]

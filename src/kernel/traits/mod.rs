@@ -75,6 +75,7 @@ pub use task::{TaskOperations, TaskId, ResourceCounts, Capabilities, TaskError};
 pub use syscall_ctx::{SyscallContext, SyscallError};
 #[allow(unused_imports)]
 pub use object_ops::{ObjectOps, ObjectType, ObjectError, Handle, ReadResult, MapResult};
+// ObjectError is now a type alias for crate::kernel::error::KernelError
 #[allow(unused_imports)]
 pub use memory_ops::{MemoryOps, MemoryError};
 #[allow(unused_imports)]

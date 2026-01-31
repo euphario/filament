@@ -224,7 +224,13 @@ pub fn sleep_ms(ms: u32) {
 // Logging (kernel buffer)
 // ============================================================================
 
-/// Write formatted text log message to kernel (legacy — prefer klog_write)
+/// Write formatted text log message to kernel.
+///
+/// **Do not call directly** — use the structured logging macros instead:
+/// `uinfo!`, `uerror!`, `uwarn!`, `udebug!`, `utrace!`
+///
+/// Those macros produce binary records via `klog_write`, preserving
+/// structured key-value data through the entire pipeline.
 pub fn klog(level: LogLevel, msg: &[u8]) {
     let _ = syscall3(sys::KLOG, level as u64, msg.as_ptr() as u64, msg.len() as u64);
 }
@@ -235,6 +241,13 @@ pub fn klog(level: LogLevel, msg: &[u8]) {
 /// `ulog::RecordBuilder`. Structure is preserved end-to-end.
 pub fn klog_write(record: &[u8]) -> i64 {
     syscall2(sys::KLOG_WRITE, record.as_ptr() as u64, record.len() as u64)
+}
+
+/// Read one formatted log record from the kernel log ring.
+///
+/// Returns the number of bytes written to `buf`, or 0 if no logs available.
+pub fn klog_read(buf: &mut [u8]) -> i64 {
+    syscall2(sys::KLOG_READ, buf.as_mut_ptr() as u64, buf.len() as u64)
 }
 
 /// Raw debug write to UART (bypasses klog buffer)
@@ -344,10 +357,16 @@ pub fn write(handle: Handle, buf: &[u8]) -> SysResult<usize> {
 }
 
 /// Map a handle into address space (for Shmem, DmaPool, Mmio)
+///
+/// Returns the virtual address on success. Address 0 is never valid
+/// (user heap starts at 0x50000000) and is treated as an error.
 pub fn map(handle: Handle, flags: u32) -> SysResult<u64> {
     let ret = syscall2(sys::MAP, handle.0 as u64, flags as u64);
     if ret < 0 {
         Err(SysError::from_errno(ret as i32))
+    } else if ret == 0 {
+        // Address 0 is never a valid mapping — treat as failure
+        Err(SysError::from_errno(-12)) // ENOMEM
     } else {
         Ok(ret as u64)
     }
@@ -390,37 +409,7 @@ pub fn pci_enumerate(buf: &mut [abi::PciEnumEntry]) -> SysResult<usize> {
 // Ramfs
 // ============================================================================
 
-/// Ramfs directory entry — matches kernel's #[repr(C)] RamfsListEntry (120 bytes).
-///
-/// Layout:
-///   [0..100]   name (null-terminated)
-///   [100..104] implicit padding (u64 alignment)
-///   [104..112] size (u64)
-///   [112]      file_type (0=regular, 1=directory)
-///   [113..120] _pad
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RamfsListEntry {
-    pub name: [u8; 100],
-    pub size: u64,
-    pub file_type: u8,
-    pub _pad: [u8; 7],
-}
-
-const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
-
-impl RamfsListEntry {
-    pub const SIZE: usize = core::mem::size_of::<Self>();
-
-    pub const fn empty() -> Self {
-        Self { name: [0; 100], size: 0, file_type: 0, _pad: [0; 7] }
-    }
-
-    pub fn name_str(&self) -> &[u8] {
-        let len = self.name.iter().position(|&c| c == 0).unwrap_or(100);
-        &self.name[..len]
-    }
-}
+pub use abi::RamfsListEntry;
 
 /// List ramfs entries. Returns number of entries on success, negative on error.
 pub fn ramfs_list(buf: &mut [RamfsListEntry]) -> i64 {

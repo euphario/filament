@@ -138,6 +138,27 @@ pub extern "C" fn kmain() -> ! {
         // Note: pmm::init() logs init_ok with details
     }
 
+    // Switch from linker-script boot stack to a PMM-allocated stack with guard page.
+    // The boot stack sits right above BSS with no guard page — any overflow silently
+    // corrupts kernel globals. Per-task kernel stacks (allocated later) all have guard
+    // pages, so we use the same pattern here for the boot/idle stack.
+    {
+        use kernel::task::tcb::{KERNEL_STACK_SIZE, GUARD_PAGE_SIZE};
+        let total_pages = (KERNEL_STACK_SIZE / 4096) + 1; // +1 for guard page
+        let alloc_base = pmm::alloc_pages(total_pages)
+            .expect("failed to allocate boot kernel stack");
+        // Layout: [guard page | usable stack (64KB) ]
+        //         alloc_base   alloc_base+4K          alloc_base+4K+64K
+        let stack_top_phys = alloc_base + GUARD_PAGE_SIZE + KERNEL_STACK_SIZE;
+        let stack_top_virt = arch::aarch64::mmu::phys_to_virt(stack_top_phys as u64);
+        unsafe {
+            core::arch::asm!(
+                "mov sp, {new_sp}",
+                new_sp = in(reg) stack_top_virt,
+            );
+        }
+    }
+
     // DMA pools
     {
         let _span = span!("dma", "init");
@@ -209,7 +230,6 @@ pub extern "C" fn kmain() -> ! {
         kernel::process::test();
         // IPC tests via ipc module
         // kernel::ipc::test(); // TODO: Add ipc unit tests
-        kernel::event::test();
         elf::test();
         smp::test();
 
@@ -307,7 +327,7 @@ pub extern "C" fn kmain() -> ! {
         // CRITICAL: We must release the scheduler lock BEFORE entering usermode.
         // Otherwise, the lock is never released (eret doesn't return) and all
         // subsequent scheduler() calls will deadlock.
-        let (trap_frame, ttbr0) = unsafe {
+        let (trap_frame, ttbr0, kstack_top) = unsafe {
             let mut sched = task::scheduler();
             match sched.prepare_user_task(slot) {
                 Some(data) => data,
@@ -328,7 +348,7 @@ pub extern "C" fn kmain() -> ! {
 
         // Enter usermode - this never returns
         unsafe {
-            task::enter_usermode(trap_frame, ttbr0);
+            task::enter_usermode(trap_frame, ttbr0, kstack_top);
         }
     } else {
         kerror!("kernel", "no_init_process");
@@ -369,10 +389,7 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
         // UART RX interrupt - data available on console
         // IRQ handler drains FIFO into ring buffer, so IRQ won't re-trigger
         if uart::handle_rx_irq() {
-            // Broadcast FdReadable event to all subscribers of STDIN (fd 0)
-            kernel::event::broadcast_event(kernel::event::Event::fd_readable(0));
-
-            // Also wake any process blocked in legacy blocking read syscall.
+            // Wake any process blocked waiting for console input.
             // Use deferred wake to avoid deadlock if scheduler lock is held.
             let blocked_pid = uart::get_blocked_pid();
             if blocked_pid != 0 {
@@ -429,7 +446,7 @@ pub extern "C" fn irq_exit_resched() {
 }
 
 /// Print a hex value directly to UART (no allocations, no logging)
-fn print_hex_uart(val: u64) {
+pub fn print_hex_uart(val: u64) {
     for i in (0..16).rev() {
         let nibble = ((val >> (i * 4)) & 0xf) as u8;
         let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
@@ -437,9 +454,100 @@ fn print_hex_uart(val: u64) {
     }
 }
 
-fn print_str_uart(s: &str) {
+pub fn print_str_uart(s: &str) {
     for c in s.chars() {
         uart::putc(c);
+    }
+}
+
+/// Diagnostic: called from assembly when CURRENT_TTBR0 is 0 before eret
+/// caller_id: 1=exception_from_user, 2=irq_kernel_to_user, 3=irq_from_user, 4=svc_handler
+#[no_mangle]
+pub extern "C" fn ttbr0_zero_diagnostic(caller_id: u64) {
+    print_str_uart("\r\n=== TTBR0 ZERO DETECTED ===\r\n");
+    print_str_uart("  Caller: ");
+    let caller_name = match caller_id {
+        1 => "exception_from_user",
+        2 => "irq_kernel_to_user",
+        3 => "irq_from_user",
+        4 => "svc_handler",
+        _ => "unknown",
+    };
+    print_str_uart(caller_name);
+    print_str_uart("\r\n");
+
+    // Read current TTBR0 value from hardware
+    let hw_ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) hw_ttbr0); }
+    print_str_uart("  HW TTBR0: ");
+    print_hex_uart(hw_ttbr0);
+    print_str_uart("\r\n");
+
+    // Read CURRENT_TTBR0 atomic
+    let atomic_val = kernel::task::CURRENT_TTBR0.load(core::sync::atomic::Ordering::SeqCst);
+    print_str_uart("  Atomic CURRENT_TTBR0: ");
+    print_hex_uart(atomic_val);
+    print_str_uart("\r\n");
+
+    // Read CURRENT_TRAP_FRAME
+    let trap_ptr = kernel::task::CURRENT_TRAP_FRAME.load(core::sync::atomic::Ordering::SeqCst);
+    print_str_uart("  CURRENT_TRAP_FRAME: ");
+    print_hex_uart(trap_ptr as u64);
+    print_str_uart("\r\n");
+
+    // Read current slot
+    let slot = kernel::task::current_slot();
+    print_str_uart("  Current slot: ");
+    print_hex_uart(slot as u64);
+    print_str_uart("\r\n");
+
+    // Read SYSCALL_SWITCHED_TASK
+    let switched = kernel::task::SYSCALL_SWITCHED_TASK.load(core::sync::atomic::Ordering::SeqCst);
+    print_str_uart("  SYSCALL_SWITCHED_TASK: ");
+    print_hex_uart(switched);
+    print_str_uart("\r\n");
+
+    // Try to get task info from scheduler
+    if let Some(sched) = unsafe { kernel::task::try_scheduler() } {
+        if let Some(task) = sched.task(slot) {
+            print_str_uart("  Task PID: ");
+            print_hex_uart(task.id as u64);
+            print_str_uart("\r\n");
+            print_str_uart("  Task state: ");
+            print_str_uart(task.state().name());
+            print_str_uart("\r\n");
+            print_str_uart("  Task name: ");
+            for &c in &task.name {
+                if c == 0 { break; }
+                uart::putc(c as char);
+            }
+            print_str_uart("\r\n");
+            if let Some(ref addr_space) = task.address_space {
+                print_str_uart("  addr_space.get_ttbr0(): ");
+                print_hex_uart(addr_space.get_ttbr0());
+                print_str_uart("\r\n");
+            } else {
+                print_str_uart("  addr_space: NONE\r\n");
+            }
+            print_str_uart("  needs_context_restore: ");
+            print_hex_uart(task.needs_context_restore as u64);
+            print_str_uart("\r\n");
+        } else {
+            print_str_uart("  Slot is EMPTY\r\n");
+        }
+    } else {
+        print_str_uart("  Cannot acquire scheduler lock (held by another context)\r\n");
+    }
+
+    // Read address of CURRENT_TTBR0 symbol itself for sanity check
+    let addr = &kernel::task::CURRENT_TTBR0 as *const _ as u64;
+    print_str_uart("  &CURRENT_TTBR0: ");
+    print_hex_uart(addr);
+    print_str_uart("\r\n");
+
+    print_str_uart("=== HALTING ===\r\n");
+    loop {
+        unsafe { core::arch::asm!("wfe"); }
     }
 }
 
@@ -742,12 +850,10 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
             let _ = task.set_exiting(exit_code);
         }
 
-        // Notify parent via event queue (legacy path)
+        // Wake parent if blocked (child exit notification via ProcessObject/Mux)
         if parent_id != 0 {
             if let Some(parent_slot) = sched.slot_by_pid(parent_id) {
                 if let Some(parent) = sched.task_mut(parent_slot) {
-                    let event = kernel::event::Event::child_exit(pid, exit_code);
-                    parent.event_queue.push(event);
                     if parent.is_blocked() {
                         let _ = parent.wake();
                     }
@@ -782,7 +888,10 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 if let Some(task) = sched.task_mut(0) {
                     let _ = task.set_running();
                 }
-                // Enter idle loop - this doesn't return
+                // Drop scheduler lock before entering idle (idle_entry never
+                // returns, so the MutexGuard would never be dropped, deadlocking
+                // when timer IRQ tries to acquire the scheduler lock).
+                drop(sched);
                 kernel::idle::idle_entry();
             }
 
@@ -800,8 +909,9 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 if let Some(task) = sched.task_mut(0) {
                     let _ = task.set_running();
                 }
-                // Enter idle loop - when the timer fires, normal scheduling will
-                // properly context_switch to the blocked task
+                // Drop scheduler lock before entering idle (idle_entry never
+                // returns, so the MutexGuard would never be dropped).
+                drop(sched);
                 kernel::idle::idle_entry();
             }
 

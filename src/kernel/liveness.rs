@@ -353,19 +353,10 @@ pub fn check_liveness(current_tick: u64) -> usize {
 }
 
 /// Find the channel a task is waiting on
-fn find_wait_channel(task: &super::task::Task) -> Option<u32> {
-    // Check event subscriptions (event-driven processes)
-    // With ipc, tasks subscribe to channels via the subscriber system,
-    // but for liveness we use the event queue subscriptions
-    for sub in &task.event_queue.subscriptions {
-        if sub.is_active() && sub.event_type == super::event::EventType::IpcReady {
-            return Some(sub.filter as u32);
-        }
-    }
-
-    // With ipc's subscriber-based system, if a task is sleeping on IPC
-    // it should be subscribed to the channel. We've already checked event
-    // subscriptions above. Return None if no channel found.
+fn find_wait_channel(_task: &super::task::Task) -> Option<u32> {
+    // With the unified object system, tasks block via Mux which subscribes
+    // to channels through the WaitQueue mechanism. Liveness checking doesn't
+    // need to know the specific channel — it just checks if the task is blocked.
     None
 }
 

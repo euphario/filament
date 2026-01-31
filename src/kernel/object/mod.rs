@@ -150,32 +150,177 @@ pub trait Pollable {
 }
 
 // ============================================================================
-// HasSubscriber Trait - Reduces boilerplate for subscriber management
+// WaitQueue - Unified subscriber mechanism (Phase 1: type definition only)
 // ============================================================================
 
-/// Internal trait for objects that have a subscriber field.
-///
-/// This trait reduces boilerplate across the 7 object types that use
-/// the subscriber pattern (Channel, Timer, Process, Port, Console, Klog, Mux).
-///
-/// # Design Note
-/// This trait is pub(crate) because subscriber management is an internal
-/// concern - external code uses the Pollable trait's subscribe/unsubscribe.
-pub(crate) trait HasSubscriber {
-    /// Get mutable reference to the subscriber field
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber>;
+/// Maximum tasks that can wait on a single object.
+/// 8 covers all current use cases (Mux watches up to 16 objects,
+/// but each object typically has 1-2 waiters).
+pub const MAX_WAITERS: usize = 8;
 
-    /// Get the current subscriber (provided)
-    fn get_subscriber(&self) -> Option<Subscriber>;
+/// A task waiting for events on an object.
+///
+/// Similar to `Subscriber` but includes the filter bitmask so the
+/// WaitQueue knows which events each waiter cares about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Waiter {
+    /// Task ID to wake
+    pub task_id: TaskId,
+    /// Generation counter to detect stale waiters (task slot reuse)
+    pub generation: u32,
+    /// Event filter bitmask (READABLE | WRITABLE | CLOSED)
+    pub filter: u8,
+}
 
-    /// Check if a subscriber is registered (provided)
-    fn has_subscriber(&self) -> bool {
-        self.get_subscriber().is_some()
+impl Waiter {
+    /// Create a new waiter
+    pub const fn new(task_id: TaskId, generation: u32, filter: u8) -> Self {
+        Self { task_id, generation, filter }
     }
 
-    /// Set or clear the subscriber (provided)
-    fn set_subscriber(&mut self, sub: Option<Subscriber>) {
-        *self.subscriber_mut() = sub;
+    /// Create from an existing Subscriber with a filter
+    pub const fn from_subscriber(sub: Subscriber, filter: u8) -> Self {
+        Self {
+            task_id: sub.task_id,
+            generation: sub.generation,
+            filter,
+        }
+    }
+
+    /// Convert to a Subscriber (for waking via existing WakeList)
+    pub const fn to_subscriber(&self) -> Subscriber {
+        Subscriber { task_id: self.task_id, generation: self.generation }
+    }
+}
+
+/// Queue of tasks waiting for events on an object.
+///
+/// Every waitable object embeds one WaitQueue. This replaces the
+/// scattered `subscriber: Option<Subscriber>` fields.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Subscribe (during Mux read, Phase 1 subscribe step)
+/// obj.wait_queue_mut().subscribe(waiter);
+///
+/// // Wake (when object becomes ready, e.g. message delivered)
+/// let wake_list = obj.wait_queue_mut().wake(poll::READABLE);
+/// // ... release locks ...
+/// ipc::waker::wake(&wake_list, WakeReason::Readable);
+///
+/// // Cleanup (when object is closed)
+/// let wake_list = obj.wait_queue_mut().drain();
+/// ```
+pub struct WaitQueue {
+    waiters: [Option<Waiter>; MAX_WAITERS],
+    count: u8,
+}
+
+impl WaitQueue {
+    /// Create an empty wait queue
+    pub const fn new() -> Self {
+        Self {
+            waiters: [None; MAX_WAITERS],
+            count: 0,
+        }
+    }
+
+    /// Add a waiter. Returns true if added, false if queue is full.
+    ///
+    /// If the task is already subscribed, updates the filter instead
+    /// of adding a duplicate entry.
+    pub fn subscribe(&mut self, waiter: Waiter) -> bool {
+        // Check for existing subscription from same task — update filter
+        for slot in self.waiters.iter_mut() {
+            if let Some(existing) = slot {
+                if existing.task_id == waiter.task_id {
+                    existing.filter = waiter.filter;
+                    existing.generation = waiter.generation;
+                    return true;
+                }
+            }
+        }
+
+        // Find empty slot
+        if (self.count as usize) < MAX_WAITERS {
+            for slot in self.waiters.iter_mut() {
+                if slot.is_none() {
+                    *slot = Some(waiter);
+                    self.count += 1;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Remove all waiters for a given task.
+    pub fn unsubscribe(&mut self, task_id: TaskId) {
+        for slot in self.waiters.iter_mut() {
+            if let Some(w) = slot {
+                if w.task_id == task_id {
+                    *slot = None;
+                    self.count = self.count.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// Collect waiters matching the event filter, convert to WakeList, and clear them.
+    ///
+    /// Called when an object becomes ready. Returns a WakeList for waking
+    /// outside locks.
+    pub fn wake(&mut self, event: u8) -> crate::kernel::ipc::waker::WakeList {
+        let mut list = crate::kernel::ipc::waker::WakeList::new();
+        for slot in self.waiters.iter_mut() {
+            if let Some(w) = slot {
+                if (w.filter & event) != 0 {
+                    list.push(w.to_subscriber());
+                    *slot = None;
+                    self.count = self.count.saturating_sub(1);
+                }
+            }
+        }
+        list
+    }
+
+    /// Drain all waiters (for close/cleanup). Returns WakeList.
+    pub fn drain(&mut self) -> crate::kernel::ipc::waker::WakeList {
+        let mut list = crate::kernel::ipc::waker::WakeList::new();
+        for slot in self.waiters.iter_mut() {
+            if let Some(w) = slot.take() {
+                list.push(w.to_subscriber());
+            }
+        }
+        self.count = 0;
+        list
+    }
+
+    /// Number of active waiters
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Check if queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Get the first subscriber (bridge for callers that expect Option<Subscriber>)
+    pub fn first_subscriber(&self) -> Option<Subscriber> {
+        for slot in &self.waiters {
+            if let Some(w) = slot {
+                return Some(w.to_subscriber());
+            }
+        }
+        None
+    }
+}
+
+impl Default for WaitQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -259,8 +404,8 @@ pub enum Object {
 pub struct ChannelObject {
     /// Channel ID in ipc backend (our end)
     channel_id: u32,
-    /// Subscriber for wake
-    subscriber: Option<Subscriber>,
+    /// Wait queue for tasks blocked on this channel
+    wait_queue: WaitQueue,
 }
 
 impl ChannelObject {
@@ -268,7 +413,7 @@ impl ChannelObject {
     pub fn new(channel_id: u32) -> Self {
         Self {
             channel_id,
-            subscriber: None,
+            wait_queue: WaitQueue::new(),
         }
     }
 
@@ -287,19 +432,15 @@ impl ChannelObject {
             || crate::kernel::ipc::channel_is_closed(self.channel_id)
     }
 
-    /// Get subscriber (for waking) - delegates to trait
-    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    /// Get first subscriber (bridge for existing callers)
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
+    /// Access wait queue
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 }
 
-impl HasSubscriber for ChannelObject {
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
-        &mut self.subscriber
-    }
-
-    fn get_subscriber(&self) -> Option<Subscriber> {
-        self.subscriber
-    }
-}
 
 impl Pollable for ChannelObject {
     fn poll(&self, filter: u8) -> PollResult {
@@ -334,13 +475,13 @@ impl Pollable for ChannelObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.set_subscriber(Some(subscriber));
-        // Also register with ipc backend
+        self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, poll::READABLE | poll::CLOSED));
+        // Also register with ipc backend (dual-subscribe — to be removed in Phase 3 channel unification)
         let _ = crate::kernel::ipc::subscribe(self.channel_id, subscriber.task_id, subscriber, crate::kernel::ipc::WakeReason::Readable);
     }
 
     fn unsubscribe(&mut self) {
-        self.set_subscriber(None);
+        self.wait_queue.drain();
     }
 }
 
@@ -407,8 +548,8 @@ pub struct TimerObject {
     deadline: u64,
     /// Interval for recurring (0 = one-shot)
     interval: u64,
-    /// Subscriber to wake
-    subscriber: Option<Subscriber>,
+    /// Wait queue for tasks blocked on this timer
+    wait_queue: WaitQueue,
 }
 
 impl TimerObject {
@@ -417,7 +558,7 @@ impl TimerObject {
             state: TimerState::Disarmed,
             deadline: 0,
             interval: 0,
-            subscriber: None,
+            wait_queue: WaitQueue::new(),
         }
     }
 
@@ -427,8 +568,13 @@ impl TimerObject {
     pub fn deadline(&self) -> u64 { self.deadline }
     /// Get the interval
     pub fn interval(&self) -> u64 { self.interval }
-    /// Get subscriber (for waking) - delegates to trait
-    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    /// Get first subscriber (for waking via WakeList)
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
+    /// Access wait queue
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 
     /// Check if timer is armed
     pub fn is_armed(&self) -> bool {
@@ -496,15 +642,6 @@ impl TimerObject {
     }
 }
 
-impl HasSubscriber for TimerObject {
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
-        &mut self.subscriber
-    }
-
-    fn get_subscriber(&self) -> Option<Subscriber> {
-        self.subscriber
-    }
-}
 
 impl Pollable for TimerObject {
     fn poll(&self, filter: u8) -> PollResult {
@@ -524,11 +661,12 @@ impl Pollable for TimerObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.set_subscriber(Some(subscriber));
+        self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, poll::READABLE));
     }
 
     fn unsubscribe(&mut self) {
-        self.set_subscriber(None);
+        // Clear all waiters (no task_id available here)
+        self.wait_queue.drain();
     }
 }
 
@@ -542,8 +680,8 @@ pub struct ProcessObject {
     pid: TaskId,
     /// Exit code (Some when exited)
     exit_code: Option<i32>,
-    /// Subscriber to wake on exit
-    subscriber: Option<Subscriber>,
+    /// Wait queue for tasks waiting on this child
+    wait_queue: WaitQueue,
 }
 
 impl ProcessObject {
@@ -552,7 +690,7 @@ impl ProcessObject {
         Self {
             pid,
             exit_code: None,
-            subscriber: None,
+            wait_queue: WaitQueue::new(),
         }
     }
 
@@ -560,8 +698,13 @@ impl ProcessObject {
     pub fn pid(&self) -> TaskId { self.pid }
     /// Get the exit code (if exited)
     pub fn exit_code(&self) -> Option<i32> { self.exit_code }
-    /// Get subscriber (for waking) - delegates to trait
-    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    /// Get first subscriber (for waking via WakeList)
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
+    /// Access wait queue
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 
     /// Set exit code (internal use)
     pub(crate) fn set_exit_code(&mut self, code: Option<i32>) {
@@ -592,15 +735,6 @@ impl ProcessObject {
     }
 }
 
-impl HasSubscriber for ProcessObject {
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
-        &mut self.subscriber
-    }
-
-    fn get_subscriber(&self) -> Option<Subscriber> {
-        self.subscriber
-    }
-}
 
 impl Pollable for ProcessObject {
     fn poll(&self, filter: u8) -> PollResult {
@@ -636,11 +770,11 @@ impl Pollable for ProcessObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.set_subscriber(Some(subscriber));
+        self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, poll::READABLE));
     }
 
     fn unsubscribe(&mut self) {
-        self.set_subscriber(None);
+        self.wait_queue.drain();
     }
 }
 
@@ -662,8 +796,8 @@ pub struct PortObject {
     /// Port name
     name: [u8; 32],
     name_len: u8,
-    /// Subscriber to wake on connection
-    subscriber: Option<Subscriber>,
+    /// Wait queue for tasks waiting on connections
+    wait_queue: WaitQueue,
 }
 
 impl PortObject {
@@ -672,7 +806,7 @@ impl PortObject {
             port_id,
             name: [0u8; 32],
             name_len: name.len().min(32) as u8,
-            subscriber: None,
+            wait_queue: WaitQueue::new(),
         };
         let len = obj.name_len as usize;
         obj.name[..len].copy_from_slice(&name[..len]);
@@ -701,19 +835,15 @@ impl PortObject {
         self.name() == other
     }
 
-    /// Get subscriber (for waking) - delegates to trait
-    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    /// Get first subscriber (for waking via WakeList)
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
+    /// Access wait queue
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 }
 
-impl HasSubscriber for PortObject {
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
-        &mut self.subscriber
-    }
-
-    fn get_subscriber(&self) -> Option<Subscriber> {
-        self.subscriber
-    }
-}
 
 impl Pollable for PortObject {
     fn poll(&self, filter: u8) -> PollResult {
@@ -736,11 +866,11 @@ impl Pollable for PortObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.set_subscriber(Some(subscriber));
+        self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, poll::READABLE));
     }
 
     fn unsubscribe(&mut self) {
-        self.set_subscriber(None);
+        self.wait_queue.drain();
     }
 }
 
@@ -758,29 +888,38 @@ pub struct ShmemObject {
     size: usize,
     /// Mapped virtual address (per-task, 0 = not mapped)
     vaddr: u64,
-    /// Peer notification (for signaling)
-    peer_subscriber: Option<Subscriber>,
-    /// Subscriber for mux integration (woken when notified)
-    mux_subscriber: Option<Subscriber>,
+    /// Wait queue for tasks waiting on notifications
+    wait_queue: WaitQueue,
     /// Notified flag - set by notify(), cleared by read/poll
     notified: bool,
 }
 
 impl ShmemObject {
     pub fn new(shmem_id: u32, paddr: u64, size: usize, vaddr: u64) -> Self {
-        Self { shmem_id, paddr, size, vaddr, peer_subscriber: None, mux_subscriber: None, notified: false }
+        Self { shmem_id, paddr, size, vaddr, wait_queue: WaitQueue::new(), notified: false }
     }
     pub fn shmem_id(&self) -> u32 { self.shmem_id }
     pub fn paddr(&self) -> u64 { self.paddr }
     pub fn size(&self) -> usize { self.size }
     pub fn vaddr(&self) -> u64 { self.vaddr }
-    pub fn peer_subscriber(&self) -> Option<Subscriber> { self.peer_subscriber }
     pub(crate) fn set_vaddr(&mut self, vaddr: u64) { self.vaddr = vaddr; }
-    pub(crate) fn set_peer_subscriber(&mut self, sub: Option<Subscriber>) { self.peer_subscriber = sub; }
-
-    // Mux integration
-    pub fn mux_subscriber(&self) -> Option<Subscriber> { self.mux_subscriber }
-    pub fn set_mux_subscriber(&mut self, sub: Option<Subscriber>) { self.mux_subscriber = sub; }
+    /// Access wait queue
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
+    /// Get first subscriber (bridge for existing callers)
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
+    /// Bridge: set_mux_subscriber → subscribe to wait queue
+    pub fn set_mux_subscriber(&mut self, sub: Option<Subscriber>) {
+        if let Some(s) = sub {
+            self.wait_queue.subscribe(Waiter::from_subscriber(s, poll::READABLE));
+        }
+    }
+    /// Bridge: mux_subscriber → first subscriber from wait queue
+    pub fn mux_subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
     pub fn is_notified(&self) -> bool { self.notified }
     pub fn set_notified(&mut self, notified: bool) { self.notified = notified; }
 }
@@ -838,30 +977,26 @@ pub enum ConsoleType {
 
 pub struct ConsoleObject {
     console_type: ConsoleType,
-    subscriber: Option<Subscriber>,
+    wait_queue: WaitQueue,
 }
 
 impl ConsoleObject {
     pub fn new(console_type: ConsoleType) -> Self {
         Self {
             console_type,
-            subscriber: None,
+            wait_queue: WaitQueue::new(),
         }
     }
     pub fn console_type(&self) -> ConsoleType { self.console_type }
-    /// Get subscriber (for waking) - delegates to trait
-    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    /// Get first subscriber (bridge for existing callers)
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
+    /// Access wait queue
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 }
 
-impl HasSubscriber for ConsoleObject {
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
-        &mut self.subscriber
-    }
-
-    fn get_subscriber(&self) -> Option<Subscriber> {
-        self.subscriber
-    }
-}
 
 impl Pollable for ConsoleObject {
     fn poll(&self, filter: u8) -> PollResult {
@@ -887,20 +1022,20 @@ impl Pollable for ConsoleObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        let is_stdin = self.console_type() == ConsoleType::Stdin;
-        self.set_subscriber(Some(subscriber));
-        // For stdin, register with UART for input notification
-        if is_stdin {
+        let filter = if self.console_type() == ConsoleType::Stdin {
             crate::platform::current::uart::block_for_input(subscriber.task_id);
-        }
+            poll::READABLE
+        } else {
+            poll::WRITABLE
+        };
+        self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, filter));
     }
 
     fn unsubscribe(&mut self) {
-        let is_stdin = self.console_type() == ConsoleType::Stdin;
-        self.set_subscriber(None);
-        if is_stdin {
+        if self.console_type() == ConsoleType::Stdin {
             crate::platform::current::uart::clear_blocked();
         }
+        self.wait_queue.drain();
     }
 }
 
@@ -911,28 +1046,22 @@ impl Pollable for ConsoleObject {
 pub struct KlogObject {
     /// Read position in kernel log buffer
     read_pos: usize,
-    subscriber: Option<Subscriber>,
+    wait_queue: WaitQueue,
 }
 
 impl KlogObject {
     pub fn new() -> Self {
-        Self { read_pos: 0, subscriber: None }
+        Self { read_pos: 0, wait_queue: WaitQueue::new() }
     }
     pub fn read_pos(&self) -> usize { self.read_pos }
-    /// Get subscriber (for waking) - delegates to trait
-    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
     pub(crate) fn set_read_pos(&mut self, pos: usize) { self.read_pos = pos; }
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 }
 
-impl HasSubscriber for KlogObject {
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
-        &mut self.subscriber
-    }
-
-    fn get_subscriber(&self) -> Option<Subscriber> {
-        self.subscriber
-    }
-}
 
 impl Pollable for KlogObject {
     fn poll(&self, filter: u8) -> PollResult {
@@ -945,11 +1074,11 @@ impl Pollable for KlogObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.set_subscriber(Some(subscriber));
+        self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, poll::READABLE));
     }
 
     fn unsubscribe(&mut self) {
-        self.set_subscriber(None);
+        self.wait_queue.drain();
     }
 }
 
@@ -985,29 +1114,31 @@ pub use abi::MuxEvent;
 pub struct MuxObject {
     /// Watched handles
     watches: [Option<MuxWatch>; MAX_MUX_WATCHES],
-    /// Subscriber to wake
-    subscriber: Option<Subscriber>,
+    /// Wait queue for the mux itself (task blocked in mux.wait())
+    wait_queue: WaitQueue,
+    /// Timeout in nanoseconds for wait (0 = no timeout, block forever)
+    timeout_ns: u64,
 }
 
 impl MuxObject {
     pub fn new() -> Self {
-        Self { watches: [None; MAX_MUX_WATCHES], subscriber: None }
+        Self { watches: [None; MAX_MUX_WATCHES], wait_queue: WaitQueue::new(), timeout_ns: 0 }
     }
-    /// Get subscriber (for waking) - delegates to trait
-    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    /// Get first subscriber (bridge for existing callers)
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
     pub fn watches(&self) -> &[Option<MuxWatch>; MAX_MUX_WATCHES] { &self.watches }
     pub fn watches_mut(&mut self) -> &mut [Option<MuxWatch>; MAX_MUX_WATCHES] { &mut self.watches }
+    /// Get timeout in nanoseconds (0 = no timeout)
+    pub fn timeout_ns(&self) -> u64 { self.timeout_ns }
+    /// Set timeout in nanoseconds (0 = no timeout)
+    pub fn set_timeout_ns(&mut self, ns: u64) { self.timeout_ns = ns; }
+    /// Access wait queue
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 }
 
-impl HasSubscriber for MuxObject {
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
-        &mut self.subscriber
-    }
-
-    fn get_subscriber(&self) -> Option<Subscriber> {
-        self.subscriber
-    }
-}
 
 // ============================================================================
 // PCIe Bus Object
@@ -1130,8 +1261,8 @@ pub struct RingObject {
     rx_config: u16,
     /// Peer task ID (for waking)
     peer_pid: Option<u32>,
-    /// Subscriber for wake notifications
-    subscriber: Option<Subscriber>,
+    /// Wait queue for wake notifications
+    wait_queue: WaitQueue,
     /// Is this the "creator" side (owns the physical memory)?
     is_creator: bool,
 }
@@ -1146,7 +1277,7 @@ impl RingObject {
             tx_config,
             rx_config,
             peer_pid: None,
-            subscriber: None,
+            wait_queue: WaitQueue::new(),
             is_creator: true,
         }
     }
@@ -1160,7 +1291,7 @@ impl RingObject {
             tx_config,
             rx_config,
             peer_pid: None,
-            subscriber: None,
+            wait_queue: WaitQueue::new(),
             is_creator: false,
         }
     }
@@ -1172,7 +1303,12 @@ impl RingObject {
     pub fn rx_config(&self) -> u16 { self.rx_config }
     pub fn peer_pid(&self) -> Option<u32> { self.peer_pid }
     pub fn is_creator(&self) -> bool { self.is_creator }
-    pub fn subscriber(&self) -> Option<Subscriber> { self.get_subscriber() }
+    pub fn subscriber(&self) -> Option<Subscriber> {
+        self.wait_queue.first_subscriber()
+    }
+    /// Access wait queue
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 
     pub(crate) fn set_vaddr(&mut self, vaddr: u64) { self.vaddr = vaddr; }
     pub(crate) fn set_peer_pid(&mut self, pid: Option<u32>) { self.peer_pid = pid; }
@@ -1198,15 +1334,6 @@ impl RingObject {
     }
 }
 
-impl HasSubscriber for RingObject {
-    fn subscriber_mut(&mut self) -> &mut Option<Subscriber> {
-        &mut self.subscriber
-    }
-
-    fn get_subscriber(&self) -> Option<Subscriber> {
-        self.subscriber
-    }
-}
 
 impl Pollable for RingObject {
     fn poll(&self, filter: u8) -> PollResult {
@@ -1244,11 +1371,11 @@ impl Pollable for RingObject {
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {
-        self.set_subscriber(Some(subscriber));
+        self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, poll::READABLE | poll::CLOSED));
     }
 
     fn unsubscribe(&mut self) {
-        self.set_subscriber(None);
+        self.wait_queue.drain();
     }
 }
 
@@ -1322,10 +1449,7 @@ impl MessageQueue {
 
 impl Default for ChannelObject {
     fn default() -> Self {
-        Self {
-            channel_id: 0,
-            subscriber: None,
-        }
+        Self::new(0)
     }
 }
 
@@ -1337,10 +1461,7 @@ impl Default for TimerObject {
 
 impl Default for MuxObject {
     fn default() -> Self {
-        Self {
-            watches: [const { None }; 16],
-            subscriber: None,
-        }
+        MuxObject::new()
     }
 }
 
@@ -1350,17 +1471,14 @@ impl Default for PortObject {
             port_id: 0,
             name: [0u8; 32],
             name_len: 0,
-            subscriber: None,
+            wait_queue: WaitQueue::new(),
         }
     }
 }
 
 impl Default for ConsoleObject {
     fn default() -> Self {
-        Self {
-            console_type: ConsoleType::Stdin,
-            subscriber: None,
-        }
+        ConsoleObject::new(ConsoleType::Stdin)
     }
 }
 
@@ -1543,7 +1661,7 @@ mod tests {
     // ConsoleType tests
     #[test]
     fn test_console_type() {
-        let console = ConsoleObject { console_type: ConsoleType::Stdout, subscriber: None };
+        let console = ConsoleObject::new(ConsoleType::Stdout);
         assert_eq!(console.console_type, ConsoleType::Stdout);
     }
 }

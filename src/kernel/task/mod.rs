@@ -415,23 +415,11 @@ impl Scheduler {
                 }
 
                 // Check all timers for this task (BSD kqueue style)
-                // Multiple timers can fire per tick, each generates a separate event
                 let mut should_wake = false;
                 for timer in task.timers.iter_mut() {
                     if timer.is_active() && current_tick >= timer.deadline {
-                        // Timer fired - deliver event with timer ID
-                        let timer_event = super::event::Event::timer_with_id(timer.id, timer.deadline);
-                        if !task.event_queue.push(timer_event) {
-                            // Queue full - log for diagnostics (timer still fires, event lost)
-                            crate::kwarn!("timer", "event_dropped";
-                                pid = task.id as u64,
-                                timer_id = timer.id as u64
-                            );
-                        }
-
                         if timer.interval > 0 {
                             // Recurring timer - reset deadline
-                            // Use saturating_add to prevent overflow on very long uptime
                             timer.deadline = timer.deadline.saturating_add(timer.interval);
                         } else {
                             // One-shot timer - clear it
@@ -446,7 +434,6 @@ impl Scheduler {
                 // Wake task if any timer fired and task was blocked
                 if should_wake && task.is_blocked() {
                     crate::transition_or_log!(task, wake);
-                    // Reset liveness - timer event means task is active
                     task.liveness_state = super::liveness::LivenessState::Normal;
                     woken += 1;
                 }
@@ -851,15 +838,16 @@ impl Scheduler {
 
     /// Prepare a task for running and return data needed for usermode entry.
     ///
-    /// This extracts the trap frame pointer and ttbr0, setting up globals.
-    /// The caller MUST release the scheduler lock before calling enter_usermode().
+    /// This extracts the trap frame pointer, ttbr0, and kernel stack top,
+    /// setting up globals. The caller MUST release the scheduler lock before
+    /// calling enter_usermode().
     ///
     /// # Returns
-    /// Some((trap_frame_ptr, ttbr0)) on success, None if task isn't valid.
+    /// Some((trap_frame_ptr, ttbr0, kernel_stack_top)) on success, None if task isn't valid.
     ///
     /// # Safety
     /// Task must be properly set up with valid trap frame and address space.
-    pub unsafe fn prepare_user_task(&mut self, slot: usize) -> Option<(*const TrapFrame, u64)> {
+    pub unsafe fn prepare_user_task(&mut self, slot: usize) -> Option<(*const TrapFrame, u64, u64)> {
         // Set current task slot for this CPU
         set_current_slot(slot);
 
@@ -886,11 +874,16 @@ impl Scheduler {
         let ttbr0 = addr_space.get_ttbr0();
         let trap_frame = &mut task.trap_frame as *mut TrapFrame;
 
+        // Kernel stack top (virtual) - becomes SP_EL1 for this task's exceptions
+        let kstack_top = crate::arch::aarch64::mmu::phys_to_virt(
+            task.kernel_stack + task.kernel_stack_size as u64
+        );
+
         // Set globals for exception handler (atomic for SMP safety)
         CURRENT_TRAP_FRAME.store(trap_frame, Ordering::Release);
         CURRENT_TTBR0.store(ttbr0, Ordering::Release);
 
-        Some((trap_frame as *const TrapFrame, ttbr0))
+        Some((trap_frame as *const TrapFrame, ttbr0, kstack_top))
     }
 
     /// Get the next deadline (for tickless timer reprogramming)

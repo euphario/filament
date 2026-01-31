@@ -131,8 +131,6 @@ pub enum TaskError {
     AllowlistFull,
     /// Timer not found
     TimerNotFound,
-    /// Event queue full
-    EventQueueFull,
 }
 
 impl TaskError {
@@ -144,7 +142,6 @@ impl TaskError {
             TaskError::PermissionDenied => -1, // EPERM
             TaskError::AllowlistFull => -28,   // ENOSPC
             TaskError::TimerNotFound => -2,    // ENOENT
-            TaskError::EventQueueFull => -11,  // EAGAIN
         }
     }
 }
@@ -221,16 +218,6 @@ pub trait TaskOperations: Send + Sync {
 
     /// Allow task to receive signals from sender
     fn allow_signals_from(&self, task_id: TaskId, sender: TaskId) -> Result<(), TaskError>;
-
-    // ========================================================================
-    // Events
-    // ========================================================================
-
-    /// Check if task has pending events
-    fn has_pending_events(&self, task_id: TaskId) -> bool;
-
-    /// Get count of pending events
-    fn pending_event_count(&self, task_id: TaskId) -> usize;
 
     // ========================================================================
     // Timers

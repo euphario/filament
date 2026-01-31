@@ -172,14 +172,8 @@ impl LogRing {
         self.head.store(pos as u32, Ordering::Release);
         self.sequence.fetch_add(1, Ordering::Relaxed);
 
-        // Notify any subscribed processes (like logd) that logs are available
-        // This is safe to call even during early boot - broadcast_event handles
-        // the case where no tasks exist yet
-        #[cfg(not(test))]
-        {
-            let event = crate::kernel::event::Event::klog_ready();
-            crate::kernel::event::broadcast_event(event);
-        }
+        // KlogObject subscribers are woken via the object system's
+        // subscriber mechanism when they poll their Mux.
 
         true
     }
