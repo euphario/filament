@@ -26,7 +26,7 @@ mod rsh;
 mod tftp;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
@@ -40,6 +40,7 @@ use userlib::{uinfo, uerror};
 use device::{RxOffsetQueue, SmolDevice};
 use rsh::RemoteShell;
 use tftp::TftpServer;
+use userlib::vfs_client::VfsClient;
 
 // =============================================================================
 // Constants
@@ -47,7 +48,9 @@ use tftp::TftpServer;
 
 const TAG_DISCOVERY_TIMER: u32 = 1;
 const TAG_POLL_TIMER: u32 = 2;
+const TAG_DHCP_FALLBACK_TIMER: u32 = 3;
 const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
+const DHCP_FALLBACK_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
 const NIC_PORT_NAME: &[u8] = b"net0";
 const MAX_FRAME_SIZE: usize = 1514;
 const STATIC_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
@@ -65,7 +68,7 @@ const RSH_PORT: u16 = 23;
 // of the SmolStack that holds the SocketSet.
 // =============================================================================
 
-const SOCKET_SLOTS: usize = 4;
+const SOCKET_SLOTS: usize = 5;
 const UDP_META_SLOTS: usize = 8;
 const UDP_BUF_SIZE: usize = 4096;
 const TCP_BUF_SIZE: usize = 4096;
@@ -99,6 +102,7 @@ struct SmolStack {
     udp_handle: SocketHandle,
     tcp_handle: SocketHandle,
     tcp_rsh_handle: SocketHandle,
+    dhcp_handle: SocketHandle,
 }
 
 /// Global smoltcp stack. Initialized once, never moved.
@@ -116,6 +120,20 @@ enum NicState {
 }
 
 // =============================================================================
+// IP Configuration State
+// =============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IpState {
+    /// No IP address configured yet. DHCP in progress.
+    Unconfigured,
+    /// IP assigned by DHCP.
+    DhcpConfigured,
+    /// DHCP timed out, using static fallback.
+    StaticFallback,
+}
+
+// =============================================================================
 // ipd Driver State
 // =============================================================================
 
@@ -125,12 +143,18 @@ struct IpdDriver {
     mac: [u8; 6],
     discovery_timer: Option<Timer>,
     poll_timer: Option<Timer>,
+    dhcp_fallback_timer: Option<Timer>,
     discovering: bool,
     rx_queue: RxOffsetQueue,
     /// Set when NIC info arrives, cleared after setup_smoltcp runs.
     iface_ready: bool,
+    ip_state: IpState,
+    assigned_ip: [u8; 4],
+    assigned_gateway: [u8; 4],
+    assigned_prefix: u8,
     tftp: TftpServer,
     rsh: RemoteShell,
+    vfs_client: Option<VfsClient>,
 }
 
 impl IpdDriver {
@@ -141,11 +165,17 @@ impl IpdDriver {
             mac: [0u8; 6],
             discovery_timer: None,
             poll_timer: None,
+            dhcp_fallback_timer: None,
             discovering: false,
             rx_queue: RxOffsetQueue::new(),
             iface_ready: false,
+            ip_state: IpState::Unconfigured,
+            assigned_ip: [0; 4],
+            assigned_gateway: [0; 4],
+            assigned_prefix: 0,
             tftp: TftpServer::new(),
             rsh: RemoteShell::new(),
+            vfs_client: None,
         }
     }
 
@@ -210,7 +240,7 @@ impl IpdDriver {
 
         self.nic_state = NicState::Up;
         self.iface_ready = true;
-        uinfo!("ipd", "nic_up"; ip = "10.0.2.15");
+        uinfo!("ipd", "nic_up"; dhcp = "starting");
     }
 
     // =========================================================================
@@ -227,23 +257,10 @@ impl IpdDriver {
         let config = Config::new(hw_addr);
         let now = Self::smoltcp_now();
 
-        // Create Interface (needs a temporary device for capabilities)
+        // Create Interface — start with NO IP address; DHCP will assign one.
         let iface = if let Some(port) = ctx.block_port(self.nic_port) {
             let mut device = SmolDevice::new(port, &mut self.rx_queue);
-            let mut iface = Interface::new(config, &mut device, now);
-
-            iface.update_ip_addrs(|addrs| {
-                let _ = addrs.push(IpCidr::new(
-                    IpAddress::Ipv4(STATIC_IP),
-                    STATIC_PREFIX_LEN,
-                ));
-            });
-            iface
-                .routes_mut()
-                .add_default_ipv4_route(STATIC_GATEWAY)
-                .ok();
-
-            iface
+            Interface::new(config, &mut device, now)
         } else {
             uerror!("ipd", "setup_failed"; reason = "no block port");
             return;
@@ -291,6 +308,10 @@ impl IpdDriver {
         rsh_socket.listen(RSH_PORT).ok();
         let tcp_rsh_handle = sockets.add(rsh_socket);
 
+        // Create DHCP socket
+        let dhcp_socket = dhcpv4::Socket::new();
+        let dhcp_handle = sockets.add(dhcp_socket);
+
         // Store persistent stack
         // SAFETY: SMOL_STACK is only written here (once) and read in poll_smoltcp.
         unsafe {
@@ -300,10 +321,15 @@ impl IpdDriver {
                 udp_handle,
                 tcp_handle,
                 tcp_rsh_handle,
+                dhcp_handle,
             });
         }
 
+        // Arm the DHCP fallback timer — if no DHCP response in 10s, use static IP
+        self.arm_dhcp_fallback_timer(ctx);
+
         uinfo!("ipd", "smoltcp_ready"; sockets = SOCKET_SLOTS as u32);
+        uinfo!("ipd", "dhcp_start";);
     }
 
     // =========================================================================
@@ -340,6 +366,64 @@ impl IpdDriver {
             let _ = ctx.watch_handle(handle, TAG_POLL_TIMER);
             self.poll_timer = Some(timer);
         }
+    }
+
+    fn arm_dhcp_fallback_timer(&mut self, ctx: &mut dyn BusCtx) {
+        if let Ok(mut timer) = Timer::new() {
+            let _ = timer.set(DHCP_FALLBACK_TIMEOUT_NS);
+            let handle = timer.handle();
+            let _ = ctx.watch_handle(handle, TAG_DHCP_FALLBACK_TIMER);
+            self.dhcp_fallback_timer = Some(timer);
+        }
+    }
+
+    /// Apply an IP configuration to the smoltcp interface and update driver state.
+    fn apply_ip_config(&mut self, ip: Ipv4Address, prefix: u8, gateway: Ipv4Address, state: IpState) {
+        let ip_bytes = ip.octets();
+        let gw_bytes = gateway.octets();
+
+        self.ip_state = state;
+        self.assigned_ip = ip_bytes;
+        self.assigned_gateway = gw_bytes;
+        self.assigned_prefix = prefix;
+
+        // Update remote shell with current IP info
+        self.rsh.ip = ip_bytes;
+        self.rsh.ip_source = match state {
+            IpState::DhcpConfigured => 1,
+            IpState::StaticFallback => 2,
+            IpState::Unconfigured => 0,
+        };
+
+        // SAFETY: single-threaded, SMOL_STACK initialized before this is called.
+        if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
+            stack.iface.update_ip_addrs(|addrs| {
+                addrs.clear();
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(ip), prefix));
+            });
+            stack.iface.routes_mut().add_default_ipv4_route(gateway).ok();
+        }
+
+        let state_str = match state {
+            IpState::DhcpConfigured => "dhcp",
+            IpState::StaticFallback => "static_fallback",
+            IpState::Unconfigured => "none",
+        };
+        uinfo!("ipd", "ip_configured";
+            ip0 = ip_bytes[0] as u32,
+            ip1 = ip_bytes[1] as u32,
+            ip2 = ip_bytes[2] as u32,
+            ip3 = ip_bytes[3] as u32,
+            prefix = prefix as u32,
+            source = state_str);
+    }
+
+    /// Apply the static fallback IP when DHCP times out.
+    fn apply_static_fallback(&mut self) {
+        if self.ip_state != IpState::Unconfigured {
+            return;
+        }
+        self.apply_ip_config(STATIC_IP, STATIC_PREFIX_LEN, STATIC_GATEWAY, IpState::StaticFallback);
     }
 
     // =========================================================================
@@ -411,13 +495,43 @@ impl IpdDriver {
             stack.iface.poll(now, &mut device, &mut stack.sockets);
         }
 
+        // Poll DHCP socket for configuration events
+        {
+            let event = stack.sockets.get_mut::<dhcpv4::Socket>(stack.dhcp_handle).poll();
+            match event {
+                Some(dhcpv4::Event::Configured(config)) => {
+                    let ip = config.address.address();
+                    let prefix = config.address.prefix_len();
+                    let gateway = config.router.unwrap_or(STATIC_GATEWAY);
+                    self.apply_ip_config(ip, prefix, gateway, IpState::DhcpConfigured);
+
+                    // Cancel the fallback timer
+                    if let Some(ref timer) = self.dhcp_fallback_timer {
+                        let _ = ctx.unwatch_handle(timer.handle());
+                    }
+                    self.dhcp_fallback_timer = None;
+                }
+                Some(dhcpv4::Event::Deconfigured) => {
+                    uinfo!("ipd", "dhcp_deconfigured";);
+                    self.ip_state = IpState::Unconfigured;
+                    self.assigned_ip = [0; 4];
+                    self.assigned_gateway = [0; 4];
+                    self.assigned_prefix = 0;
+
+                    // Clear IP from interface
+                    stack.iface.update_ip_addrs(|addrs| { addrs.clear(); });
+                }
+                None => {}
+            }
+        }
+
         // Process TFTP socket (UDP)
         {
             let sock = stack.sockets.get_mut::<udp::Socket>(stack.udp_handle);
             while let Ok((data, meta)) = sock.recv() {
                 let remote = meta.endpoint;
                 let mut resp_buf = [0u8; 516]; // 4 header + 512 data
-                let resp_len = self.tftp.handle(data, remote, &mut resp_buf);
+                let resp_len = self.tftp.handle(data, remote, &mut resp_buf, &mut self.vfs_client);
                 if resp_len > 0 {
                     let _ = sock.send_slice(&resp_buf[..resp_len], remote);
                 }
@@ -425,7 +539,12 @@ impl IpdDriver {
         }
 
         // Process HTTP socket (TCP)
-        Self::process_http(&mut stack.sockets, stack.tcp_handle);
+        let ip_source = match self.ip_state {
+            IpState::DhcpConfigured => "dhcp",
+            IpState::StaticFallback => "static",
+            IpState::Unconfigured => "none",
+        };
+        Self::process_http(&mut stack.sockets, stack.tcp_handle, self.assigned_ip, ip_source);
 
         // Process remote shell socket (TCP port 23)
         self.rsh.process(&mut stack.sockets, stack.tcp_rsh_handle);
@@ -449,7 +568,7 @@ impl IpdDriver {
     // =========================================================================
 
     /// Process the HTTP TCP socket: read request, send response, re-listen.
-    fn process_http(sockets: &mut SocketSet<'static>, handle: SocketHandle) {
+    fn process_http(sockets: &mut SocketSet<'static>, handle: SocketHandle, ip: [u8; 4], ip_source: &str) {
         let sock = sockets.get_mut::<tcp::Socket>(handle);
 
         if !sock.is_active() && !sock.is_listening() {
@@ -483,7 +602,7 @@ impl IpdDriver {
 
         // Build response
         let mut resp = [0u8; 2048];
-        let resp_len = build_http_response(&req_buf[..req_len], &mut resp);
+        let resp_len = build_http_response(&req_buf[..req_len], &mut resp, ip, ip_source);
 
         // Send response
         if resp_len > 0 {
@@ -511,7 +630,7 @@ fn contains_header_end(data: &[u8]) -> bool {
 }
 
 /// Build an HTTP/1.0 response with system status page.
-fn build_http_response(_request: &[u8], out: &mut [u8]) -> usize {
+fn build_http_response(_request: &[u8], out: &mut [u8], ip: [u8; 4], ip_source: &str) -> usize {
     let uptime_ns = userlib::syscall::gettime();
     let uptime_s = uptime_ns / 1_000_000_000;
 
@@ -521,7 +640,11 @@ fn build_http_response(_request: &[u8], out: &mut [u8]) -> usize {
 
     bpos += copy_str(&mut body[bpos..], "BPI-R4 ipd status\n");
     bpos += copy_str(&mut body[bpos..], "==================\n");
-    bpos += copy_str(&mut body[bpos..], "IP:     10.0.2.15\n");
+    bpos += copy_str(&mut body[bpos..], "IP:     ");
+    bpos += format_ip(&mut body[bpos..], ip);
+    bpos += copy_str(&mut body[bpos..], " (");
+    bpos += copy_str(&mut body[bpos..], ip_source);
+    bpos += copy_str(&mut body[bpos..], ")\n");
     bpos += copy_str(&mut body[bpos..], "Uptime: ");
     bpos += format_u64(uptime_s, &mut body[bpos..]);
     bpos += copy_str(&mut body[bpos..], "s\n");
@@ -574,6 +697,17 @@ fn copy_bytes(dst: &mut [u8], s: &[u8]) -> usize {
     let len = s.len().min(dst.len());
     dst[..len].copy_from_slice(&s[..len]);
     len
+}
+
+fn format_ip(buf: &mut [u8], ip: [u8; 4]) -> usize {
+    let mut pos = 0;
+    for i in 0..4 {
+        if i > 0 {
+            pos += copy_str(&mut buf[pos..], ".");
+        }
+        pos += format_u64(ip[i] as u64, &mut buf[pos..]);
+    }
+    pos
 }
 
 fn format_u64(mut val: u64, buf: &mut [u8]) -> usize {
@@ -693,6 +827,17 @@ impl Driver for IpdDriver {
                     self.drain_rx(ctx);
                     self.poll_smoltcp(ctx);
                 }
+            }
+            TAG_DHCP_FALLBACK_TIMER => {
+                if let Some(ref mut timer) = self.dhcp_fallback_timer {
+                    let _ = timer.wait();
+                }
+                self.apply_static_fallback();
+                // Clean up the one-shot timer
+                if let Some(ref timer) = self.dhcp_fallback_timer {
+                    let _ = ctx.unwatch_handle(timer.handle());
+                }
+                self.dhcp_fallback_timer = None;
             }
             _ => {}
         }

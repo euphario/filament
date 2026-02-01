@@ -2048,6 +2048,117 @@ impl QemuUsbDriver {
 
         Ok(transferred)
     }
+
+    fn write_blocks_from_pool(
+        &mut self,
+        lba: u64,
+        count: u32,
+        pool_paddr: u64,
+        pool_offset: u32,
+        pool_len: u32,
+    ) -> Result<u32, &'static str> {
+        use crate::xhci_bulk::XhciBulk;
+
+        let slot_id;
+        let bulk_in_dci;
+        let bulk_out_dci;
+        let block_size;
+        {
+            let info = &self.partition_info;
+            if !info.is_valid() {
+                return Err("No disk configured");
+            }
+            slot_id = info.slot_id;
+            bulk_in_dci = info.bulk_in_dci;
+            bulk_out_dci = info.bulk_out_dci;
+            block_size = info.block_size;
+        }
+
+        let write_len = count as usize * block_size as usize;
+        if pool_len < write_len as u32 {
+            return Err("Pool buffer too small");
+        }
+
+        self.reset_bulk_rings(slot_id, bulk_in_dci, bulk_out_dci);
+
+        let dev_idx = match (slot_id as usize).checked_sub(1) {
+            Some(idx) if idx < layout::MAX_DEVICES => idx,
+            _ => return Err("Invalid slot_id"),
+        };
+
+        let dma = self.dma.as_ref().ok_or("No DMA")?;
+        let xhci = self.xhci.as_mut().ok_or("No xHCI")?;
+        let evt_ring = self.evt_ring.as_mut().ok_or("No evt_ring")?;
+
+        let vbase = dma.vaddr();
+        let pbase = dma.paddr();
+
+        let dev_offset = layout::DEVICE_CTX_BASE + dev_idx * layout::DEVICE_CTX_SIZE;
+        let bulk_out_ring_offset = layout::DEV_EP0_RING + 0x400;
+        let bulk_in_ring_offset = bulk_out_ring_offset + 0x400;
+
+        let out_ring_vaddr = vbase + dev_offset as u64 + bulk_out_ring_offset as u64;
+        let out_ring_paddr = pbase + dev_offset as u64 + bulk_out_ring_offset as u64;
+        let in_ring_vaddr = vbase + dev_offset as u64 + bulk_in_ring_offset as u64;
+        let in_ring_paddr = pbase + dev_offset as u64 + bulk_in_ring_offset as u64;
+
+        let scratch_vaddr = vbase + layout::SCRATCH_OFFSET as u64;
+        let scratch_paddr = pbase + layout::SCRATCH_OFFSET as u64;
+        let scratch_size = 128;
+
+        let mut bulk = XhciBulk::new(
+            xhci,
+            evt_ring,
+            slot_id,
+            bulk_in_dci,
+            bulk_out_dci,
+            out_ring_vaddr as *mut Trb,
+            out_ring_paddr,
+            in_ring_vaddr as *mut Trb,
+            in_ring_paddr,
+            scratch_vaddr as *mut u8,
+            scratch_paddr,
+            scratch_size,
+        );
+
+        // Build CBW for WRITE(10)
+        let mut cbw = [0u8; 31];
+        const CBW_SIG: u32 = 0x43425355;
+        cbw[0..4].copy_from_slice(&CBW_SIG.to_le_bytes());
+        cbw[4..8].copy_from_slice(&1u32.to_le_bytes()); // tag
+        cbw[8..12].copy_from_slice(&(write_len as u32).to_le_bytes());
+        cbw[12] = 0x00; // direction: host-to-device
+        cbw[14] = 10;   // CDB length
+
+        // WRITE(10) CDB
+        let lba32 = lba as u32;
+        let blocks = count as u16;
+        cbw[15] = 0x2A; // WRITE(10) opcode
+        cbw[17] = (lba32 >> 24) as u8;
+        cbw[18] = (lba32 >> 16) as u8;
+        cbw[19] = (lba32 >> 8) as u8;
+        cbw[20] = lba32 as u8;
+        cbw[22] = (blocks >> 8) as u8;
+        cbw[23] = blocks as u8;
+
+        let mut csw = [0u8; 13];
+        let data_phys = pool_paddr + pool_offset as u64;
+
+        let transferred = bulk.bot_write_zero_copy(&cbw, data_phys, write_len as u32, &mut csw)
+            .map_err(|_| "BOT command failed")?;
+
+        // Check CSW status
+        const CSW_SIG: u32 = 0x53425355;
+        let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
+        if sig != CSW_SIG {
+            return Err("Invalid CSW signature");
+        }
+        if csw[12] != 0 {
+            return Err("CSW status indicates error");
+        }
+
+        Ok(transferred)
+    }
 }
 
 // =============================================================================
@@ -2220,8 +2331,33 @@ impl Driver for UsbdWrapper {
                     }
                 }
                 io_op::WRITE => {
+                    let count = (sqe.data_len / block_size) as u32;
+                    if count == 0 {
+                        if let Some(transport) = ctx.block_port(port) {
+                            transport.complete_error(sqe.tag, io_status::INVALID);
+                            transport.notify();
+                        }
+                        continue;
+                    }
+
+                    let pool_phys = {
+                        let Some(transport) = ctx.block_port(port) else { continue };
+                        transport.pool_phys()
+                    };
+
+                    let result = self.0.write_blocks_from_pool(
+                        sqe.lba,
+                        count,
+                        pool_phys,
+                        sqe.data_offset,
+                        sqe.data_len,
+                    );
+
                     if let Some(transport) = ctx.block_port(port) {
-                        transport.complete_error(sqe.tag, io_status::INVALID);
+                        match result {
+                            Ok(transferred) => { transport.complete_ok(sqe.tag, transferred); }
+                            Err(_) => { transport.complete_error(sqe.tag, io_status::IO_ERROR); }
+                        }
                         transport.notify();
                     }
                 }

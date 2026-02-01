@@ -66,6 +66,7 @@ mod admin_opcode {
 }
 
 mod nvm_opcode {
+    pub const WRITE: u8 = 0x01;
     pub const READ: u8 = 0x02;
 }
 
@@ -303,6 +304,18 @@ impl NvmeController {
     fn read_blocks(&mut self, lba: u64, count: u16, data_phys: u64) -> Result<u32, u16> {
         let mut cmd = SqEntry::new();
         cmd.set_opcode(nvm_opcode::READ);
+        cmd.nsid = 1;
+        cmd.prp1 = data_phys;
+        cmd.cdw10 = lba as u32;
+        cmd.cdw11 = (lba >> 32) as u32;
+        cmd.cdw12 = (count - 1) as u32;
+        self.io_cmd(&cmd)?;
+        Ok(count as u32 * self.block_size)
+    }
+
+    fn write_blocks(&mut self, lba: u64, count: u16, data_phys: u64) -> Result<u32, u16> {
+        let mut cmd = SqEntry::new();
+        cmd.set_opcode(nvm_opcode::WRITE);
         cmd.nsid = 1;
         cmd.prp1 = data_phys;
         cmd.cdw10 = lba as u32;
@@ -593,9 +606,34 @@ impl NvmeDriver {
                         }
                     }
                     io_op::WRITE => {
-                        if let Some(port) = ctx.block_port(port_id) {
-                            port.complete_error(sqe.tag, io_status::INVALID);
-                            port.notify();
+                        let count = (sqe.data_len / ctrl.block_size) as u16;
+                        if count == 0 {
+                            if let Some(port) = ctx.block_port(port_id) {
+                                port.complete_error(sqe.tag, io_status::INVALID);
+                                port.notify();
+                            }
+                            continue;
+                        }
+
+                        let target_phys = if let Some(port) = ctx.block_port(port_id) {
+                            port.pool_phys() + sqe.data_offset as u64
+                        } else {
+                            continue;
+                        };
+
+                        match ctrl.write_blocks(sqe.lba, count, target_phys) {
+                            Ok(transferred) => {
+                                if let Some(port) = ctx.block_port(port_id) {
+                                    port.complete_ok(sqe.tag, transferred);
+                                    port.notify();
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(port) = ctx.block_port(port_id) {
+                                    port.complete_error(sqe.tag, io_status::IO_ERROR);
+                                    port.notify();
+                                }
+                            }
                         }
                     }
                     _ => {

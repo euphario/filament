@@ -150,6 +150,8 @@ struct InflightRequest {
     provider_offset: u32,
     /// Which disk this request belongs to
     disk_idx: u8,
+    /// True if this is a write (no copy needed on completion)
+    is_write: bool,
 }
 
 // =============================================================================
@@ -308,6 +310,9 @@ impl PartitionDriver {
                     userlib::ring::io_op::READ => {
                         self.handle_ring_read(disk_idx, &sqe, ctx);
                     }
+                    userlib::ring::io_op::WRITE => {
+                        self.handle_ring_write(disk_idx, &sqe, ctx);
+                    }
                     _ => {
                         if let Some(port) = ctx.block_port(provider_id) {
                             port.complete_error(sqe.tag, userlib::ring::io_status::INVALID);
@@ -458,6 +463,7 @@ impl PartitionDriver {
                     consumer_offset,
                     provider_offset: sqe.data_offset,
                     disk_idx: disk_idx as u8,
+                    is_write: false,
                 });
                 self.inflight_count += 1;
                 return;
@@ -465,6 +471,139 @@ impl PartitionDriver {
         }
 
         // Should not reach here (checked capacity above), but handle gracefully
+        if let Some(port) = ctx.block_port(provider_id) {
+            port.complete_error(sqe.tag, io_status::IO_ERROR);
+            port.notify();
+        }
+    }
+
+    /// Handle a ring WRITE request — copy data to consumer pool, submit write.
+    fn handle_ring_write(&mut self, disk_idx: usize, sqe: &userlib::ring::IoSqe, ctx: &mut dyn BusCtx) {
+        let (provider_id, consumer_id, block_size, partition_count) = match &self.disks[disk_idx] {
+            Some(d) => (
+                match d.provider_port { Some(id) => id, None => return },
+                d.consumer_port,
+                d.block_size,
+                d.partition_count,
+            ),
+            None => return,
+        };
+
+        if self.inflight_count >= MAX_INFLIGHT {
+            if let Some(port) = ctx.block_port(provider_id) {
+                port.complete_error(sqe.tag, io_status::IO_ERROR);
+                port.notify();
+            }
+            return;
+        }
+
+        let part_idx = sqe.param as usize;
+        if part_idx >= partition_count {
+            if let Some(port) = ctx.block_port(provider_id) {
+                port.complete_error(sqe.tag, io_status::INVALID);
+                port.notify();
+            }
+            return;
+        }
+
+        let (start_lba, sector_count) = match &self.disks[disk_idx] {
+            Some(d) => (d.partitions[part_idx].start_lba, d.partitions[part_idx].sector_count),
+            None => return,
+        };
+
+        let sectors = (sqe.data_len / block_size) as u64;
+        if sqe.lba + sectors > sector_count {
+            if let Some(port) = ctx.block_port(provider_id) {
+                port.complete_error(sqe.tag, io_status::IO_ERROR);
+                port.notify();
+            }
+            return;
+        }
+
+        let disk_lba = start_lba + sqe.lba;
+
+        // Allocate in consumer's pool
+        let consumer_offset = match ctx.block_port(consumer_id).and_then(|p| p.alloc(sqe.data_len)) {
+            Some(o) => o,
+            None => {
+                if let Some(port) = ctx.block_port(provider_id) {
+                    port.complete_error(sqe.tag, io_status::IO_ERROR);
+                    port.notify();
+                }
+                return;
+            }
+        };
+
+        // Copy data from provider pool to consumer pool before submitting write
+        let copy_ok = {
+            let src_info = ctx.block_port(provider_id).and_then(|p| {
+                p.pool_slice(sqe.data_offset, sqe.data_len).map(|s| {
+                    (s.as_ptr(), s.len())
+                })
+            });
+
+            if let Some((src_ptr, src_len)) = src_info {
+                let dst_info = ctx.block_port(consumer_id).and_then(|p| {
+                    p.pool_slice_mut(consumer_offset, sqe.data_len).map(|d| {
+                        (d.as_mut_ptr(), d.len())
+                    })
+                });
+
+                if let Some((dst_ptr, dst_len)) = dst_info {
+                    let copy_len = src_len.min(dst_len);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_len);
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if !copy_ok {
+            if let Some(port) = ctx.block_port(provider_id) {
+                port.complete_error(sqe.tag, io_status::IO_ERROR);
+                port.notify();
+            }
+            return;
+        }
+
+        // Submit write to disk
+        let consumer_tag = match ctx.block_port(consumer_id)
+            .and_then(|p| p.submit_write(disk_lba, consumer_offset, sqe.data_len).ok())
+        {
+            Some(t) => t,
+            None => {
+                if let Some(port) = ctx.block_port(provider_id) {
+                    port.complete_error(sqe.tag, io_status::IO_ERROR);
+                    port.notify();
+                }
+                return;
+            }
+        };
+
+        if let Some(port) = ctx.block_port(consumer_id) {
+            port.notify();
+        }
+
+        for slot in &mut self.inflight {
+            if slot.is_none() {
+                *slot = Some(InflightRequest {
+                    provider_tag: sqe.tag,
+                    consumer_tag,
+                    consumer_offset,
+                    provider_offset: sqe.data_offset,
+                    disk_idx: disk_idx as u8,
+                    is_write: true,
+                });
+                self.inflight_count += 1;
+                return;
+            }
+        }
+
         if let Some(port) = ctx.block_port(provider_id) {
             port.complete_error(sqe.tag, io_status::IO_ERROR);
             port.notify();
@@ -522,42 +661,50 @@ impl PartitionDriver {
                 continue;
             }
 
-            // Copy from consumer pool to provider pool
-            let copy_ok = {
-                let src_info = ctx.block_port(consumer_id).and_then(|p| {
-                    p.pool_slice(req.consumer_offset, cqe.transferred).map(|s| {
-                        (s.as_ptr(), s.len())
-                    })
-                });
-
-                if let Some((src_ptr, src_len)) = src_info {
-                    let dst_info = ctx.block_port(provider_id).and_then(|p| {
-                        p.pool_slice_mut(req.provider_offset, cqe.transferred).map(|d| {
-                            (d.as_mut_ptr(), d.len())
+            if req.is_write {
+                // Write completions: data was already copied before submit, just complete
+                if let Some(port) = ctx.block_port(provider_id) {
+                    port.complete_ok(req.provider_tag, cqe.transferred);
+                    port.notify();
+                }
+            } else {
+                // Read completions: copy data from consumer pool to provider pool
+                let copy_ok = {
+                    let src_info = ctx.block_port(consumer_id).and_then(|p| {
+                        p.pool_slice(req.consumer_offset, cqe.transferred).map(|s| {
+                            (s.as_ptr(), s.len())
                         })
                     });
 
-                    if let Some((dst_ptr, dst_len)) = dst_info {
-                        let copy_len = src_len.min(dst_len);
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_len);
+                    if let Some((src_ptr, src_len)) = src_info {
+                        let dst_info = ctx.block_port(provider_id).and_then(|p| {
+                            p.pool_slice_mut(req.provider_offset, cqe.transferred).map(|d| {
+                                (d.as_mut_ptr(), d.len())
+                            })
+                        });
+
+                        if let Some((dst_ptr, dst_len)) = dst_info {
+                            let copy_len = src_len.min(dst_len);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_len);
+                            }
+                            true
+                        } else {
+                            false
                         }
-                        true
                     } else {
                         false
                     }
-                } else {
-                    false
-                }
-            };
+                };
 
-            if let Some(port) = ctx.block_port(provider_id) {
-                if copy_ok {
-                    port.complete_ok(req.provider_tag, cqe.transferred);
-                } else {
-                    port.complete_error(req.provider_tag, io_status::IO_ERROR);
+                if let Some(port) = ctx.block_port(provider_id) {
+                    if copy_ok {
+                        port.complete_ok(req.provider_tag, cqe.transferred);
+                    } else {
+                        port.complete_error(req.provider_tag, io_status::IO_ERROR);
+                    }
+                    port.notify();
                 }
-                port.notify();
             }
         }
 

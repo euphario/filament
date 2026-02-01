@@ -677,11 +677,6 @@ See [docs/decisions/ADR.md](docs/decisions/ADR.md) for architecture decisions.
 - **No kernel VFS** - Filesystem policy in userspace (intentional)
 - **Signature verification stub** - `verify_binary_signature()` always passes (infrastructure ready for crypto)
 
-### ABI Consolidation TODO
-
-- **`RamfsListEntry`** is defined in both `src/kernel/syscall/misc.rs` and `user/userlib/src/syscall.rs`. Must be moved to `user/abi/src/lib.rs` as single source of truth (like `ProcessInfo`, `MuxEvent`, etc. already are).
-- Any `#[repr(C)]` struct shared between kernel and userspace must live in the `abi` crate.
-
 ### Partial Implementations
 
 | File | Issue | Notes |

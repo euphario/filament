@@ -7,6 +7,7 @@
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
 use userlib::syscall::RamfsListEntry;
+use userlib::vfs_client::VfsClient;
 
 /// TFTP opcodes (RFC 1350).
 const OP_RRQ: u16 = 1;
@@ -73,7 +74,7 @@ impl TftpServer {
 
     /// Process a received UDP datagram on port 69.
     /// Returns response bytes to send back (if any), written into `out`.
-    pub fn handle(&mut self, data: &[u8], remote: IpEndpoint, out: &mut [u8]) -> usize {
+    pub fn handle(&mut self, data: &[u8], remote: IpEndpoint, out: &mut [u8], vfs: &mut Option<VfsClient>) -> usize {
         if data.len() < 2 {
             return 0;
         }
@@ -81,7 +82,7 @@ impl TftpServer {
         let opcode = u16::from_be_bytes([data[0], data[1]]);
 
         match opcode {
-            OP_RRQ => self.handle_rrq(data, remote, out),
+            OP_RRQ => self.handle_rrq(data, remote, out, vfs),
             OP_WRQ => self.handle_wrq(data, remote, out),
             OP_DATA => self.handle_data(data, remote, out),
             OP_ACK => self.handle_ack(data, remote, out),
@@ -90,7 +91,7 @@ impl TftpServer {
     }
 
     /// Handle Read Request.
-    fn handle_rrq(&mut self, data: &[u8], remote: IpEndpoint, out: &mut [u8]) -> usize {
+    fn handle_rrq(&mut self, data: &[u8], remote: IpEndpoint, out: &mut [u8], vfs: &mut Option<VfsClient>) -> usize {
         if self.state != TftpState::Idle {
             return Self::build_error(out, ERR_ACCESS, b"Transfer in progress");
         }
@@ -101,7 +102,7 @@ impl TftpServer {
         };
 
         // Try to load file content
-        let loaded = self.load_file(filename);
+        let loaded = self.load_file(filename, vfs);
         if !loaded {
             return Self::build_error(out, ERR_NOT_FOUND, b"File not found");
         }
@@ -270,9 +271,9 @@ impl TftpServer {
 
     /// Load a file into the read buffer.
     /// Supports virtual files:
-    ///   "ls" or "/" — list ramfs entries
-    ///   Any other name — search ramfs for matching entry
-    fn load_file(&mut self, name: &str) -> bool {
+    ///   "ls" or "" — list ramfs entries
+    ///   Any other name — read via VfsClient
+    fn load_file(&mut self, name: &str, vfs: &mut Option<VfsClient>) -> bool {
         // Strip leading path separators
         let name = name.trim_start_matches('/');
 
@@ -280,9 +281,64 @@ impl TftpServer {
             return self.load_ramfs_listing();
         }
 
-        // No raw file read from ramfs available yet — return listing for any request
-        // Future: VfsClient integration for real file reads
-        false
+        // Try to read via VFS
+        self.load_vfs_file(name, vfs)
+    }
+
+    /// Load a file via VfsClient into the read buffer.
+    fn load_vfs_file(&mut self, name: &str, vfs: &mut Option<VfsClient>) -> bool {
+        // Lazy-init VfsClient
+        if vfs.is_none() {
+            *vfs = VfsClient::discover().ok();
+        }
+        let client = match vfs.as_mut() {
+            Some(c) => c,
+            None => return false,
+        };
+
+        // Build path — if name doesn't start with a known prefix, try /mnt/ prefix
+        let mut path_buf = [0u8; 128];
+        let path_len = if name.starts_with("mnt/") || name.starts_with("bin/") {
+            // Already has a top-level prefix, add leading /
+            let full = name.len() + 1;
+            if full > path_buf.len() { return false; }
+            path_buf[0] = b'/';
+            path_buf[1..1 + name.len()].copy_from_slice(name.as_bytes());
+            full
+        } else {
+            // Bare filename — try as-is with leading /
+            let full = name.len() + 1;
+            if full > path_buf.len() { return false; }
+            path_buf[0] = b'/';
+            path_buf[1..1 + name.len()].copy_from_slice(name.as_bytes());
+            full
+        };
+
+        let handle = match client.open(&path_buf[..path_len], 0) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        // Read file content in chunks
+        let mut offset: u64 = 0;
+        let mut pos = 0;
+        loop {
+            let remaining = MAX_READ_SIZE - pos;
+            if remaining == 0 { break; }
+            let chunk = remaining.min(4096);
+            match client.read(handle, offset, &mut self.read_buf[pos..pos + chunk]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pos += n;
+                    offset += n as u64;
+                }
+                Err(_) => break,
+            }
+        }
+
+        let _ = client.close(handle);
+        self.read_len = pos;
+        pos > 0
     }
 
     /// Generate a listing of ramfs entries (like 'ls /bin').

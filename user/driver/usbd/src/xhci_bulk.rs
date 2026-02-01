@@ -442,4 +442,69 @@ impl<'a> XhciBulk<'a> {
 
         Ok(transferred)
     }
+
+    /// Execute BOT WRITE with zero-copy - data DMAs directly from caller's buffer
+    ///
+    /// CBW/CSW use internal scratch, DATA TRB points to caller's physical address.
+    /// CBW + Data both go on the OUT ring (host-to-device), CSW on IN ring.
+    pub fn bot_write_zero_copy(
+        &mut self,
+        cbw: &[u8],              // 31 bytes
+        data_phys: u64,          // Physical address of data to write (caller's buffer)
+        data_len: u32,           // Length of data to write
+        csw: &mut [u8],          // 13 bytes output
+    ) -> Result<u32, TransportError> {
+        const CBW_OFF: usize = 0;
+        const CSW_OFF: usize = 64;
+
+        // Copy CBW to scratch
+        unsafe {
+            core::ptr::copy_nonoverlapping(cbw.as_ptr(), self.dma_buf.add(CBW_OFF), 31);
+        }
+
+        // Queue CBW on OUT ring with IOC
+        let out_cycle = if self.out_cycle { 1 } else { 0 };
+        let cbw_trb = Trb {
+            param: self.dma_phys + CBW_OFF as u64,
+            status: 31,
+            control: (trb_type::NORMAL << 10) | (1 << 5) | out_cycle, // IOC=1
+        };
+        self.enqueue_out(cbw_trb);
+
+        dsb();
+        self.xhci.ring_doorbell(self.slot_id, self.bulk_out_dci);
+        self.wait_completion()?;
+
+        // Data OUT - DMA directly from caller's physical address (ZERO COPY!)
+        let out_cycle = if self.out_cycle { 1 } else { 0 };
+        let data_trb = Trb {
+            param: data_phys,
+            status: data_len,
+            control: (trb_type::NORMAL << 10) | (1 << 5) | out_cycle, // IOC=1
+        };
+        self.enqueue_out(data_trb);
+        dsb();
+        self.xhci.ring_doorbell(self.slot_id, self.bulk_out_dci);
+        let residual = self.wait_completion()?;
+        let transferred = (data_len as usize).saturating_sub(residual) as u32;
+
+        // CSW - on IN ring, to our scratch buffer
+        let in_cycle = if self.in_cycle { 1 } else { 0 };
+        let csw_trb = Trb {
+            param: self.dma_phys + CSW_OFF as u64,
+            status: 13,
+            control: (trb_type::NORMAL << 10) | (1 << 5) | in_cycle, // IOC=1
+        };
+        self.enqueue_in(csw_trb);
+        dsb();
+        self.xhci.ring_doorbell(self.slot_id, self.bulk_in_dci);
+        self.wait_completion()?;
+
+        // Copy CSW out
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.dma_buf.add(CSW_OFF), csw.as_mut_ptr(), 13);
+        }
+
+        Ok(transferred)
+    }
 }

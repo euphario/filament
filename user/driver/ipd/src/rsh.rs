@@ -25,6 +25,10 @@ pub struct RemoteShell {
     state: RshState,
     line_buf: [u8; 256],
     line_len: usize,
+    /// Current IP address (updated by ipd when IP state changes).
+    pub ip: [u8; 4],
+    /// IP source: 0=none, 1=dhcp, 2=static
+    pub ip_source: u8,
 }
 
 impl RemoteShell {
@@ -33,6 +37,8 @@ impl RemoteShell {
             state: RshState::Idle,
             line_buf: [0u8; 256],
             line_len: 0,
+            ip: [0; 4],
+            ip_source: 0,
         }
     }
 
@@ -292,8 +298,15 @@ impl RemoteShell {
         let secs = ns / 1_000_000_000;
 
         let mut pos = 0;
-        pos += copy_str(&mut out[pos..], "IP:      10.0.2.15/24\r\n");
-        pos += copy_str(&mut out[pos..], "Gateway: 10.0.2.2\r\n");
+        pos += copy_str(&mut out[pos..], "IP:      ");
+        pos += fmt_ip(&mut out[pos..], self.ip);
+        pos += copy_str(&mut out[pos..], " (");
+        pos += copy_str(&mut out[pos..], match self.ip_source {
+            1 => "dhcp",
+            2 => "static",
+            _ => "none",
+        });
+        pos += copy_str(&mut out[pos..], ")\r\n");
         pos += copy_str(&mut out[pos..], "Stack:   smoltcp 0.12\r\n");
         pos += copy_str(&mut out[pos..], "Sockets: UDP:69 TCP:80,23\r\n");
         pos += copy_str(&mut out[pos..], "Uptime:  ");
@@ -379,6 +392,17 @@ fn fmt_u32_pad(buf: &mut [u8], val: u32, width: usize) -> usize {
     let copy_len = digits.min(buf.len() - pos);
     buf[pos..pos + copy_len].copy_from_slice(&tmp[..copy_len]);
     pos + copy_len
+}
+
+fn fmt_ip(buf: &mut [u8], ip: [u8; 4]) -> usize {
+    let mut pos = 0;
+    for i in 0..4 {
+        if i > 0 {
+            pos += copy_str(&mut buf[pos..], ".");
+        }
+        pos += fmt_u64(&mut buf[pos..], ip[i] as u64);
+    }
+    pos
 }
 
 fn parse_u32(s: &[u8]) -> u32 {
