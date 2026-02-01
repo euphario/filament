@@ -837,6 +837,9 @@ pub trait BlockTransport {
     /// Write data to pool at offset.
     fn pool_write(&self, offset: u32, data: &[u8]) -> bool;
 
+    /// Get raw pool base pointer (for zero-copy token access).
+    fn pool_ptr(&self) -> *const u8;
+
     /// Get pool physical address (for DMA programming).
     fn pool_phys(&self) -> u64;
 

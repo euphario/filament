@@ -149,11 +149,11 @@ impl NetDriver {
         Some((bar0_addr, bar0_size))
     }
 
-    /// Parse BDF from port name like "pci/BB:DD.F:type"
+    /// Parse BDF from port name like "BB:DD.F:type"
     /// Returns (bus << 8) | (dev << 3) | func
     fn parse_bdf_from_name(name: &[u8]) -> Option<u32> {
-        // Skip "pci/" prefix
-        if name.len() < 11 || &name[..4] != b"pci/" {
+        // Format: "BB:DD.F:type" — starts directly with hex BDF
+        if name.len() < 7 {
             return None;
         }
         let hex = |b: u8| -> Option<u8> {
@@ -164,13 +164,13 @@ impl NetDriver {
                 _ => None,
             }
         };
-        // "pci/BB:DD.F:..."
-        //  0123456789...
-        let bus = (hex(name[4])? as u32) << 4 | hex(name[5])? as u32;
-        // name[6] = ':'
-        let dev = (hex(name[7])? as u32) << 4 | hex(name[8])? as u32;
-        // name[9] = '.'
-        let func = hex(name[10])? as u32;
+        // "BB:DD.F:..."
+        //  01234567...
+        let bus = (hex(name[0])? as u32) << 4 | hex(name[1])? as u32;
+        // name[2] = ':'
+        let dev = (hex(name[3])? as u32) << 4 | hex(name[4])? as u32;
+        // name[5] = '.'
+        let func = hex(name[6])? as u32;
         Some((bus << 8) | (dev << 3) | func)
     }
 

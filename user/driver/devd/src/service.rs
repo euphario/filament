@@ -186,8 +186,8 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         caps: 0,
     },
     ServiceDef {
-        binary: "netsvc",
-        registers: &[PortDef::new(b"netsvc:", pt::SERVICE)],
+        binary: "ipd",
+        registers: &[PortDef::new(b"ipd:", pt::SERVICE)],
         dependencies: &[Dependency::Requires(b"console:")],
         auto_restart: true,
         parent: None,

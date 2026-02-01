@@ -53,8 +53,8 @@ use crate::error::SysError;
 /// These match the kernel's `Capabilities` bitfield in `src/kernel/caps.rs`.
 /// Pass to `exec_with_caps()` or `ProcessManager::spawn_with_context()`.
 pub mod caps {
-    /// IPC | MEM | SPAWN | SCHEME | IRQ | MMIO | DMA | RAW_DEVICE
-    pub const DRIVER: u64 = 0x027F;
+    /// IPC | MEM | SPAWN | SCHEME | IRQ | MMIO | DMA | RAW_DEVICE | GRANT
+    pub const DRIVER: u64 = 0x067F;
     /// IPC | MEM | SPAWN
     pub const SERVICE: u64 = 0x0007;
     /// IPC | MEM | SPAWN

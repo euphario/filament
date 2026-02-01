@@ -2148,7 +2148,7 @@ impl Driver for UsbdWrapper {
 
         // Register block port with devd including shmem_id
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
-        let _ = ctx.register_port(b"disk0:", PortType::Block, shmem_id, None);
+        let _ = ctx.register_port(b"usb0:msc", PortType::Block, shmem_id, None);
 
         uinfo!("usbd", "ready"; disks = 1u32);
 

@@ -518,6 +518,11 @@ impl DataPort {
     // Pool Access
     // =========================================================================
 
+    /// Get raw pool base pointer.
+    pub fn pool_ptr(&self) -> *const u8 {
+        self.ring.pool_ptr() as *const u8
+    }
+
     /// Get pool size
     pub fn pool_size(&self) -> u32 {
         self.ring.pool_size()

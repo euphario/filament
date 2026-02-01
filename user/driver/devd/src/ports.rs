@@ -325,6 +325,61 @@ impl Ports {
         let slot = self.find_slot(name)?;
         self.ports[slot].as_ref().map(|p| p.port_type as u8)
     }
+
+    /// Build full path by walking parent chain. Returns length written.
+    ///
+    /// Concatenates port names from root to leaf separated by '/'.
+    /// Example: port "usb0:msc" with parent "00:02.0" with parent "pcie0"
+    /// produces "pcie0/00:02.0/usb0:msc".
+    pub fn build_full_path(&self, port_name: &[u8], buf: &mut [u8]) -> usize {
+        const MAX_DEPTH: usize = 8;
+        let mut stack: [&[u8]; MAX_DEPTH] = [&[]; MAX_DEPTH];
+        let mut depth = 0;
+
+        // Start with the port itself
+        stack[0] = port_name;
+        depth = 1;
+
+        // Walk up parent chain
+        let mut current = port_name;
+        loop {
+            if depth >= MAX_DEPTH {
+                break;
+            }
+            match self.parent(current) {
+                Some(parent_name) => {
+                    stack[depth] = parent_name;
+                    depth += 1;
+                    current = parent_name;
+                }
+                None => break,
+            }
+        }
+
+        // Write in reverse (root first), separated by '/'
+        let mut pos = 0;
+        for i in (0..depth).rev() {
+            if pos > 0 && pos < buf.len() {
+                buf[pos] = b'/';
+                pos += 1;
+            }
+            let seg = stack[i];
+            let end = (pos + seg.len()).min(buf.len());
+            let copy_len = end - pos;
+            buf[pos..end].copy_from_slice(&seg[..copy_len]);
+            pos = end;
+        }
+        pos
+    }
+
+    /// Extract the last segment of a port's full path.
+    ///
+    /// This is the port's own name — the leaf segment used for rule matching.
+    pub fn last_segment<'a>(&self, port_name: &'a [u8]) -> &'a [u8] {
+        // The port name itself IS the last segment. Parent names are
+        // the preceding segments. No need to build the full path.
+        port_name
+    }
 }
 
 impl PortRegistry for Ports {
@@ -634,6 +689,30 @@ mod tests {
             root_count += 1;
         }
         assert_eq!(root_count, 2);
+    }
+
+    #[test]
+    fn test_build_full_path() {
+        let mut ports = Ports::new();
+
+        // Build tree: pcie0 -> 00:02.0:xhci -> usb0:msc
+        assert!(ports.register_typed(b"pcie0", 1, PortType::Block).is_ok());
+        assert!(ports.register_child(b"00:02.0:xhci", 2, b"pcie0", PortType::Usb).is_ok());
+        assert!(ports.register_child(b"usb0:msc", 3, b"00:02.0:xhci", PortType::Block).is_ok());
+
+        let mut buf = [0u8; 128];
+
+        // Root port
+        let len = ports.build_full_path(b"pcie0", &mut buf);
+        assert_eq!(&buf[..len], b"pcie0");
+
+        // One level deep
+        let len = ports.build_full_path(b"00:02.0:xhci", &mut buf);
+        assert_eq!(&buf[..len], b"pcie0/00:02.0:xhci");
+
+        // Two levels deep
+        let len = ports.build_full_path(b"usb0:msc", &mut buf);
+        assert_eq!(&buf[..len], b"pcie0/00:02.0:xhci/usb0:msc");
     }
 
     #[test]

@@ -90,7 +90,6 @@ fn format_port_name(entry: &syscall::PciEnumEntry, buf: &mut [u8; 32]) -> usize 
     let cname = class_name(entry.base_class(), entry.subclass(), entry.prog_if());
 
     let mut i = 0;
-    for b in b"pci/" { buf[i] = *b; i += 1; }
     buf[i] = HEX[(bus >> 4) as usize]; i += 1;
     buf[i] = HEX[(bus & 0xf) as usize]; i += 1;
     buf[i] = b':'; i += 1;

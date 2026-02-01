@@ -1,70 +1,113 @@
 //! Rules Engine for Dynamic Driver Spawning
 //!
-//! When a port is registered with a specific type, check rules to determine
-//! if a driver should be auto-spawned. This enables composable driver stacks
-//! where each layer spawns the next.
+//! When a port is registered, its path suffix determines which driver to spawn.
+//! Paths are built automatically by walking the port parent chain:
 //!
-//! ## Example Flow
+//!   pcie0/00:02.0:xhci → spawn usbd
+//!   pcie0/00:02.0/usb0:msc → spawn partd
+//!   pcie0/00:02.0/usb0:msc/0:fat → spawn fatfsd
 //!
-//! 1. usbd registers `disk0:` with type Block
-//! 2. Rules engine matches Block → partd driver
-//! 3. devd spawns partd driver with `disk0:` as trigger
-//! 4. partd registers `part0:`, `part1:` with type Partition, parent=disk0:
-//! 5. Rules engine matches Partition → fatfsd driver
-//! 6. devd spawns fatfsd for each partd
-
-use crate::ports::PortType;
+//! The last segment's suffix (after ':') carries the type tag.
+//! Longest matching suffix wins.
 
 // =============================================================================
-// Rule Definition
+// Path-Based Rule
 // =============================================================================
 
-/// A rule for auto-spawning drivers
+/// A rule matching path suffixes to driver binaries.
+///
+/// The suffix is matched against the last segment of the port's full path.
+/// For example, suffix ":xhci" matches segment "00:02.0:xhci".
 #[derive(Clone, Copy)]
-pub struct Rule {
-    /// Match ports with this parent type (None = any parent)
-    pub match_parent_type: Option<PortType>,
-    /// Match ports with this type (None = any type)
-    pub match_port_type: Option<PortType>,
+pub struct PathRule {
+    /// Suffix to match against the last path segment (e.g., ":fat", ":xhci")
+    pub suffix: &'static str,
     /// Driver binary to spawn
-    pub driver_binary: &'static str,
-    /// Should the driver receive the port name as an argument?
-    pub pass_port_name: bool,
+    pub driver: &'static str,
     /// Capability bits for spawned child (0 = inherit parent's caps)
     pub caps: u64,
 }
 
+impl PathRule {
+    /// Check if a path segment's suffix matches this rule.
+    pub fn matches_segment(&self, segment: &[u8]) -> bool {
+        let suffix = self.suffix.as_bytes();
+        if segment.len() < suffix.len() {
+            return false;
+        }
+        &segment[segment.len() - suffix.len()..] == suffix
+    }
+}
+
+// =============================================================================
+// Built-in Path Rules
+// =============================================================================
+
+/// Path-based rules for driver auto-spawning.
+///
+/// Matching is done against the last segment of the port's full path.
+/// All rules are checked; the longest matching suffix wins.
+pub static PATH_RULES: &[PathRule] = &[
+    // PCI device type matches
+    PathRule { suffix: ":xhci",  driver: "usbd",   caps: userlib::devd::caps::DRIVER },
+    PathRule { suffix: ":nvme",  driver: "nvmed",  caps: userlib::devd::caps::DRIVER },
+    PathRule { suffix: ":network", driver: "netd", caps: userlib::devd::caps::DRIVER },
+    // Block device type → partition scanner
+    PathRule { suffix: ":msc",   driver: "partd",  caps: userlib::devd::caps::DRIVER },
+    // Filesystem type matches
+    PathRule { suffix: ":fat",   driver: "fatfsd", caps: userlib::devd::caps::DRIVER },
+    PathRule { suffix: ":ext2",  driver: "ext2fsd", caps: userlib::devd::caps::DRIVER },
+];
+
+/// Find the best matching path rule for a segment (longest suffix wins).
+pub fn find_path_rule(segment: &[u8]) -> Option<&'static PathRule> {
+    let mut best: Option<&PathRule> = None;
+    let mut best_len = 0;
+    for rule in PATH_RULES {
+        if rule.matches_segment(segment) && rule.suffix.len() > best_len {
+            best = Some(rule);
+            best_len = rule.suffix.len();
+        }
+    }
+    best
+}
+
+// =============================================================================
+// Legacy Rule (kept for PortType references in ports.rs)
+// =============================================================================
+
+use crate::ports::PortType;
+
+/// Legacy rule struct — kept temporarily while PortType is still used
+/// in port registration. Will be removed once all drivers use path-based names.
+#[derive(Clone, Copy)]
+pub struct Rule {
+    pub match_parent_type: Option<PortType>,
+    pub match_port_type: Option<PortType>,
+    pub driver_binary: &'static str,
+    pub pass_port_name: bool,
+    pub caps: u64,
+}
+
 impl Rule {
-    /// Check if this rule matches a port
     pub fn matches(&self, port_type: PortType, parent_type: Option<PortType>) -> bool {
-        // Check port type if specified
         if let Some(required_type) = self.match_port_type {
             if port_type != required_type {
                 return false;
             }
         }
-
-        // Check parent type if specified
         if let Some(required_parent) = self.match_parent_type {
             match parent_type {
                 Some(pt) if pt == required_parent => {}
                 _ => return false,
             }
         }
-
         true
     }
 }
 
-// =============================================================================
-// Built-in Rules
-// =============================================================================
-
-/// Static rules for driver auto-spawning
-///
-/// Order matters - first matching rule wins.
+/// Legacy static rules — kept temporarily for backward compat.
 pub static RULES: &[Rule] = &[
-    // When a USB controller appears (xHCI via PCI), spawn usbd
     Rule {
         match_parent_type: None,
         match_port_type: Some(PortType::Usb),
@@ -72,7 +115,6 @@ pub static RULES: &[Rule] = &[
         pass_port_name: true,
         caps: userlib::devd::caps::DRIVER,
     },
-    // When a Storage controller appears (NVMe, AHCI), spawn nvmed
     Rule {
         match_parent_type: None,
         match_port_type: Some(PortType::Storage),
@@ -80,7 +122,6 @@ pub static RULES: &[Rule] = &[
         pass_port_name: true,
         caps: userlib::devd::caps::DRIVER,
     },
-    // When a Network controller appears (virtio-net, etc.), spawn netd
     Rule {
         match_parent_type: None,
         match_port_type: Some(PortType::Network),
@@ -88,7 +129,6 @@ pub static RULES: &[Rule] = &[
         pass_port_name: true,
         caps: userlib::devd::caps::DRIVER,
     },
-    // When a Block device appears, spawn partd scanner
     Rule {
         match_parent_type: None,
         match_port_type: Some(PortType::Block),
@@ -96,8 +136,6 @@ pub static RULES: &[Rule] = &[
         pass_port_name: true,
         caps: userlib::devd::caps::DRIVER,
     },
-    // When a Partition appears with a Block parent, spawn fatfsd
-    // (fatfsd will probe and only attach if it recognizes the filesystem)
     Rule {
         match_parent_type: Some(PortType::Block),
         match_port_type: Some(PortType::Partition),
@@ -107,28 +145,16 @@ pub static RULES: &[Rule] = &[
     },
 ];
 
-// =============================================================================
-// Rules Engine Trait
-// =============================================================================
-
-/// Trait for rules-based driver spawning
 pub trait RulesEngine {
-    /// Find matching rule for a port
     fn find_matching_rule(
         &self,
         port_type: PortType,
         parent_type: Option<PortType>,
     ) -> Option<&'static Rule>;
 
-    /// Get all rules
     fn rules(&self) -> &'static [Rule];
 }
 
-// =============================================================================
-// Static Rules Implementation
-// =============================================================================
-
-/// Rules engine using static RULES array
 pub struct StaticRules;
 
 impl StaticRules {
@@ -165,7 +191,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rule_matches_port_type() {
+    fn test_path_rule_matches_suffix() {
+        let rule = PathRule {
+            suffix: ":xhci",
+            driver: "usbd",
+            caps: 0,
+        };
+
+        assert!(rule.matches_segment(b"00:02.0:xhci"));
+        assert!(rule.matches_segment(b":xhci"));
+        assert!(!rule.matches_segment(b"xhci")); // no colon prefix
+        assert!(!rule.matches_segment(b"00:02.0:nvme"));
+    }
+
+    #[test]
+    fn test_path_rule_matches_fat() {
+        let rule = PathRule {
+            suffix: ":fat",
+            driver: "fatfsd",
+            caps: 0,
+        };
+
+        assert!(rule.matches_segment(b"0:fat"));
+        assert!(rule.matches_segment(b"1:fat"));
+        assert!(!rule.matches_segment(b"0:ext2"));
+    }
+
+    #[test]
+    fn test_find_path_rule_longest_match() {
+        // ":msc" should match for "usb0:msc"
+        let rule = find_path_rule(b"usb0:msc");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "partd");
+
+        // ":fat" should match
+        let rule = find_path_rule(b"0:fat");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "fatfsd");
+
+        // ":network" should match netd
+        let rule = find_path_rule(b"00:01.0:network");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "netd");
+
+        // No match for console
+        let rule = find_path_rule(b"console");
+        assert!(rule.is_none());
+    }
+
+    #[test]
+    fn test_legacy_rule_matches_port_type() {
         let rule = Rule {
             match_parent_type: None,
             match_port_type: Some(PortType::Block),
@@ -175,42 +250,6 @@ mod tests {
         };
 
         assert!(rule.matches(PortType::Block, None));
-        assert!(rule.matches(PortType::Block, Some(PortType::Usb)));
         assert!(!rule.matches(PortType::Partition, None));
-    }
-
-    #[test]
-    fn test_rule_matches_parent_type() {
-        let rule = Rule {
-            match_parent_type: Some(PortType::Block),
-            match_port_type: Some(PortType::Partition),
-            driver_binary: "fatfsd",
-            pass_port_name: true,
-            caps: 0,
-        };
-
-        assert!(rule.matches(PortType::Partition, Some(PortType::Block)));
-        assert!(!rule.matches(PortType::Partition, Some(PortType::Usb)));
-        assert!(!rule.matches(PortType::Partition, None));
-        assert!(!rule.matches(PortType::Block, Some(PortType::Block)));
-    }
-
-    #[test]
-    fn test_static_rules_find() {
-        let engine = StaticRules::new();
-
-        // Block device should match partd rule
-        let rule = engine.find_matching_rule(PortType::Block, None);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver_binary, "partd");
-
-        // Partition with Block parent should match fatfsd rule
-        let rule = engine.find_matching_rule(PortType::Partition, Some(PortType::Block));
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver_binary, "fatfsd");
-
-        // Console should not match any rule
-        let rule = engine.find_matching_rule(PortType::Console, None);
-        assert!(rule.is_none());
     }
 }

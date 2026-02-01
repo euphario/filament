@@ -263,7 +263,7 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
         all_programs.push(("usbd", "driver/usbd"));
         all_programs.push(("nvmed", "driver/nvmed"));
         all_programs.push(("netd", "driver/netd"));
-        all_programs.push(("netsvc", "driver/netsvc"));
+        all_programs.push(("ipd", "driver/ipd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
         all_programs.push(("vfsd", "driver/vfsd"));
     }
@@ -614,7 +614,7 @@ fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool) -> Result<()> {
         "-drive", &nvme_drive_str,
         // Network (virtio - simpler than emulating real NIC)
         "-device", "virtio-net-pci,netdev=net0",
-        "-netdev", "user,id=net0",
+        "-netdev", "user,id=net0,hostfwd=tcp::8080-:80,hostfwd=udp::6969-:69,hostfwd=tcp::2323-:23",
     ];
 
     if gdb {

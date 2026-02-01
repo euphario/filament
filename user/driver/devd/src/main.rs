@@ -54,7 +54,7 @@ use process::{ProcessManager, SyscallProcessManager};
 use deps::{DependencyResolver, Dependencies};
 use devices::{DeviceStore, DeviceRegistry};
 use query::{QueryHandler, MSG_BUFFER_SIZE, MAX_QUERY_CLIENTS};
-use rules::{RulesEngine, StaticRules};
+// Path-based rules imported via `rules::find_path_rule()`
 
 // =============================================================================
 // Admin Client Handling (shell text commands)
@@ -532,6 +532,8 @@ struct PendingSpawn {
     port_name: [u8; 32],
     /// Length of port name
     port_name_len: u8,
+    /// Capability bits for spawned child (from rule)
+    caps: u64,
 }
 
 impl PendingSpawn {
@@ -541,6 +543,7 @@ impl PendingSpawn {
             binary: "",
             port_name: [0u8; 32],
             port_name_len: 0,
+            caps: 0,
         }
     }
 }
@@ -564,8 +567,6 @@ pub struct Devd {
     devices: DeviceRegistry,
     /// Query handler for client connections
     query_handler: QueryHandler,
-    /// Rules engine for auto-spawning drivers
-    rules: StaticRules,
     /// Admin clients (shell text commands)
     admin_clients: AdminClients,
     /// Recently spawned dynamic PIDs (workaround for spawn-before-slot-setup race)
@@ -611,7 +612,6 @@ impl Devd {
             deps: Dependencies::new(),
             devices: DeviceRegistry::new(),
             query_handler: QueryHandler::new(),
-            rules: StaticRules::new(),
             admin_clients: AdminClients::new(),
             recent_dynamic_pids: [(0, 0); MAX_RECENT_DYNAMIC_PIDS],
             pending_spawns: [const { PendingSpawn::empty() }; MAX_DRIVERS_WITH_PENDING * MAX_PENDING_SPAWNS_PER_DRIVER],
@@ -1691,7 +1691,6 @@ impl Devd {
     fn handle_state_change_msg(&mut self, slot: usize, buf: &[u8]) {
         use userlib::query::{StateChange, driver_state};
 
-
         // Parse the state change message
         let state_msg = match StateChange::from_bytes(buf) {
             Some(s) => s,
@@ -1705,7 +1704,6 @@ impl Devd {
         let driver_idx = match self.query_handler.get_service_idx(slot) {
             Some(idx) => idx,
             None => {
-
                 return;
             }
         };
@@ -1851,14 +1849,13 @@ impl Devd {
             let _ = client.channel.send(&resp.to_bytes());
         }
 
-        // Trigger block orchestration if this is a Block port getting a shmem_id
+        // Track block device for ATTACH_DISK orchestration
         if result_code == error::OK
             && update.shmem_id != 0
             && port_type == Some(PortType::Block)
         {
             if let Some(owner) = owner_idx {
-                uinfo!("devd", "block_orchestration_trigger";);
-                self.trigger_block_orchestration(port_name, update.shmem_id, owner);
+                self.track_and_attach_disk(port_name, update.shmem_id, owner);
             }
         }
     }
@@ -2259,7 +2256,7 @@ impl Devd {
     }
 
     /// Queue a spawn command for later delivery when driver reports Ready
-    fn queue_pending_spawn(&mut self, driver_idx: u8, binary: &'static str, port_name: &[u8]) {
+    fn queue_pending_spawn(&mut self, driver_idx: u8, binary: &'static str, port_name: &[u8], caps: u64) {
         // Find an empty slot
         for spawn in &mut self.pending_spawns {
             if spawn.driver_idx == 0xFF {
@@ -2268,23 +2265,28 @@ impl Devd {
                 let len = port_name.len().min(32);
                 spawn.port_name[..len].copy_from_slice(&port_name[..len]);
                 spawn.port_name_len = len as u8;
+                spawn.caps = caps;
                 return;
             }
         }
         uerror!("devd", "spawn_queue_full"; driver = self.svc_name(driver_idx));
     }
 
-    /// Send all pending spawn commands for a driver
+    /// Send all pending spawn commands for a driver.
+    ///
+    /// Called when a driver reports Ready via STATE_CHANGE. At this point
+    /// the driver has finished init() and is in its event loop, so it can
+    /// process SpawnChild commands.
     fn flush_pending_spawns(&mut self, driver_idx: u8) {
         // Collect pending spawns for this driver
-        let mut to_send: [(Option<&'static str>, [u8; 32], u8); MAX_PENDING_SPAWNS_PER_DRIVER] =
-            [(None, [0u8; 32], 0); MAX_PENDING_SPAWNS_PER_DRIVER];
+        let mut to_send: [(Option<&'static str>, [u8; 32], u8, u64); MAX_PENDING_SPAWNS_PER_DRIVER] =
+            [(None, [0u8; 32], 0, 0); MAX_PENDING_SPAWNS_PER_DRIVER];
         let mut count = 0;
 
         for spawn in &mut self.pending_spawns {
             if spawn.driver_idx == driver_idx {
                 if count < MAX_PENDING_SPAWNS_PER_DRIVER {
-                    to_send[count] = (Some(spawn.binary), spawn.port_name, spawn.port_name_len);
+                    to_send[count] = (Some(spawn.binary), spawn.port_name, spawn.port_name_len, spawn.caps);
                     count += 1;
                 }
                 // Clear the slot
@@ -2300,9 +2302,12 @@ impl Devd {
 
         // Send the commands
         for i in 0..count {
-            if let (Some(binary), port_name, port_len) = to_send[i] {
+            if let (Some(binary), port_name, port_len, caps) = to_send[i] {
                 let port = &port_name[..port_len as usize];
-                match self.query_handler.send_spawn_child(driver_idx, binary.as_bytes(), port) {
+
+                match self.query_handler.send_spawn_child_with_caps(
+                    driver_idx, binary.as_bytes(), port, caps,
+                ) {
                     Some(seq_id) => {
                         uinfo!("devd", "spawn_child_sent"; seq = seq_id, binary = binary);
                         // Track inflight spawn so we can store context when ACK arrives
@@ -2310,8 +2315,7 @@ impl Devd {
                         self.track_inflight_spawn(seq_id, port_type, port, binary);
                     }
                     None => {
-                        // Driver still not connected - fall back to direct spawn
-                        self.spawn_dynamic_driver(binary, port);
+                        uerror!("devd", "spawn_child_failed"; binary = binary, driver = self.svc_name(driver_idx));
                     }
                 }
             }
@@ -2365,8 +2369,13 @@ impl Devd {
                 continue;
             }
 
-            // Create a new service slot for this child with its binary name
-            let slot_idx = match self.services.create_dynamic_service(child_pid, binary_name, now) {
+            // Create a new service slot for this child with its binary name.
+            // Use Starting state — the child hasn't reported Ready yet.
+            // This prevents check_path_rules from sending SpawnChild
+            // while the child is still in synchronous init() IPC.
+            let slot_idx = match self.services.create_dynamic_service_with_state(
+                child_pid, binary_name, now, ServiceState::Starting,
+            ) {
                 Some(idx) => idx,
                 None => {
                     uerror!("devd", "no_child_slot"; pid = child_pid);
@@ -2478,9 +2487,6 @@ impl Devd {
             }
         }
 
-        // Get parent type for rule matching
-        let parent_type = parent_name.and_then(|p| self.ports.port_type(p));
-
         // Log registration
         if let Ok(name_str) = core::str::from_utf8(port_name) {
             if shmem_id != 0 {
@@ -2490,17 +2496,13 @@ impl Devd {
             }
         }
 
-        // For Block ports, always use orchestration path (rules disabled for Block)
-        // Orchestration will be triggered when shmem_id is set via UPDATE_PORT
-        if port_type == PortType::Block {
-            if shmem_id != 0 {
-                self.trigger_block_orchestration(port_name, shmem_id, owner_idx);
-            }
-            // else: wait for UPDATE_PORT with shmem_id
-        } else {
-            // Check rules for auto-spawning (legacy path for other port types)
-            self.check_rules_for_port(port_name, port_type, parent_type, owner_idx);
+        // Track block devices for ATTACH_DISK orchestration
+        if port_type == PortType::Block && shmem_id != 0 {
+            self.track_and_attach_disk(port_name, shmem_id, owner_idx);
         }
+
+        // Check path-based rules for auto-spawning
+        self.check_path_rules(port_name, owner_idx);
 
         Ok(())
     }
@@ -2515,51 +2517,37 @@ impl Devd {
     ///
     /// IMPORTANT: SpawnChild is only sent after the owner has reported Ready.
     /// This ensures the owner is in its event loop and can process commands.
-    fn check_rules_for_port(
-        &mut self,
-        port_name: &[u8],
-        port_type: PortType,
-        parent_type: Option<PortType>,
-        owner_idx: u8,
-    ) {
-        let rule = match self.rules.find_matching_rule(port_type, parent_type) {
+    /// Check if any path-based rules match a newly registered port.
+    ///
+    /// Builds the full path from the port's parent chain, then matches the
+    /// last segment's suffix against PATH_RULES. Longest suffix match wins.
+    fn check_path_rules(&mut self, port_name: &[u8], owner_idx: u8) {
+        // The last segment IS the port name itself (parent names are earlier segments)
+        let segment = port_name;
+
+        let rule = match rules::find_path_rule(segment) {
             Some(r) => r,
             None => return,
         };
 
-        let rule_caps = rule.caps;
-
-
-        uinfo!("devd", "rule_matched"; binary = rule.driver_binary, owner = self.svc_name(owner_idx));
-
-        // Check if owner service is Ready
-        // Only send SpawnChild to drivers that are Ready (in their event loop)
-        let owner_ready = self.services.get(owner_idx as usize)
-            .map(|s| s.state == ServiceState::Ready)
-            .unwrap_or(false);
-
-        if !owner_ready {
-            // Owner not ready yet - queue for when they report Ready
-
-            uinfo!("devd", "spawn_queued"; owner = self.svc_name(owner_idx), binary = rule.driver_binary);
-            self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
+        // Don't spawn if driver already exists (singleton idempotency)
+        if self.services.find_by_name(rule.driver).is_some() {
             return;
         }
 
-        // Owner is Ready - try to send SpawnChild with caps from rule
-        match self.query_handler.send_spawn_child_with_caps(
-            owner_idx, rule.driver_binary.as_bytes(), port_name, rule_caps,
-        ) {
-            Some(seq_id) => {
-                uinfo!("devd", "spawn_child_sent"; seq = seq_id, owner = self.svc_name(owner_idx), binary = rule.driver_binary);
-                // Track inflight spawn so we can store context when ACK arrives
-                self.track_inflight_spawn(seq_id, port_type as u8, port_name, rule.driver_binary);
-            }
-            None => {
-                // Owner Ready but channel not available? Queue anyway
-                uinfo!("devd", "spawn_queued_fallback"; owner = self.svc_name(owner_idx), binary = rule.driver_binary);
-                self.queue_pending_spawn(owner_idx, rule.driver_binary, port_name);
-            }
+        uinfo!("devd", "path_rule_matched"; suffix = rule.suffix, driver = rule.driver, owner = self.svc_name(owner_idx));
+
+        // Queue the spawn command
+        self.queue_pending_spawn(owner_idx, rule.driver, port_name, rule.caps);
+
+        // If the owner is already Ready, flush immediately.
+        // This handles ports registered after the driver's initial Ready
+        // (e.g., partd registers partition ports after scanning the disk).
+        let owner_ready = self.services.get(owner_idx as usize)
+            .map(|s| s.state == ServiceState::Ready)
+            .unwrap_or(false);
+        if owner_ready {
+            self.flush_pending_spawns(owner_idx);
         }
     }
 
@@ -2567,13 +2555,11 @@ impl Devd {
     // Block Device Orchestration
     // =========================================================================
 
-    /// Trigger orchestration for a new block device
+    /// Track a block device and send ATTACH_DISK if partd is already connected.
     ///
-    /// When a Block port with shmem_id is registered, we:
-    /// 1. Track the disk info
-    /// 2. Spawn partd if not running
-    /// 3. Send ATTACH_DISK to partd
-    fn trigger_block_orchestration(&mut self, port_name: &[u8], shmem_id: u32, owner_idx: u8) {
+    /// Does NOT spawn partd — that's the rules engine's job via SpawnChild.
+    /// If partd isn't connected yet, partd_connected() will send ATTACH_DISK later.
+    fn track_and_attach_disk(&mut self, port_name: &[u8], shmem_id: u32, owner_idx: u8) {
         // Track this disk
         let disk_slot = self.track_disk(port_name, shmem_id, owner_idx);
         if disk_slot.is_none() {
@@ -2584,14 +2570,11 @@ impl Devd {
 
         uinfo!("devd", "disk_tracked"; slot = disk_slot as u32, shmem_id = shmem_id);
 
-        // Ensure partd is running (this spawns partd if needed)
-        self.ensure_partd_running();
-
-        // Send ATTACH_DISK to partd
+        // If partd is already connected, send ATTACH_DISK immediately
         if self.partd_service_idx != 0xFF {
             self.send_attach_disk(disk_slot);
-        } else {
         }
+        // Otherwise: partd_connected() will send ATTACH_DISK when partd reports Ready
     }
 
     /// Track a disk for orchestration
@@ -2626,29 +2609,6 @@ impl Devd {
             self.tracked_disks[i].state != DiskState::Empty
                 && self.tracked_disks[i].shmem_id == shmem_id
         })
-    }
-
-    /// Ensure partd is running, spawn if not
-    fn ensure_partd_running(&mut self) {
-        if self.partd_service_idx != 0xFF {
-            return; // Already running
-        }
-
-        // Check if partd is already in services (maybe spawned but not connected yet)
-        for i in 0..MAX_SERVICES {
-            if let Some(service) = self.services.get(i) {
-                if let Some(def) = service.def() {
-                    if def.binary == "partd" && service.state == ServiceState::Ready {
-                        self.partd_service_idx = i as u8;
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Spawn partd dynamically
-        uinfo!("devd", "spawning_partd";);
-        self.spawn_dynamic_driver("partd", b"");
     }
 
     /// Get next orchestration sequence ID
@@ -2836,22 +2796,18 @@ impl Devd {
             return;
         }
 
-        // Get partition index before mutable operations
+        // Get partition info before mutable operations
         let part_table_index = self.tracked_disks[disk_slot].partitions[part_idx].index;
+        let part_type = self.tracked_disks[disk_slot].partitions[part_idx].part_type;
 
-        // Assign partition name
+        // Assign partition name with filesystem type tag: "N:fat", "N:ext2", etc.
         let part_num = self.next_partition_num;
         self.next_partition_num += 1;
 
-        // Create name like "part0:"
         let mut name_buf = [0u8; 32];
         let name_len = {
             let mut pos = 0;
-            for b in b"part" {
-                name_buf[pos] = *b;
-                pos += 1;
-            }
-            // Write number
+            // Write partition number
             if part_num == 0 {
                 name_buf[pos] = b'0';
                 pos += 1;
@@ -2869,8 +2825,20 @@ impl Devd {
                     pos += 1;
                 }
             }
+            // Write type tag based on filesystem hint
             name_buf[pos] = b':';
             pos += 1;
+            let fs_type = fs_hint::from_mbr_type(part_type);
+            let tag: &[u8] = match fs_type {
+                fs_hint::FAT12 | fs_hint::FAT16 | fs_hint::FAT32 => b"fat",
+                fs_hint::EXFAT => b"exfat",
+                fs_hint::EXT2 | fs_hint::EXT4 => b"ext2",
+                fs_hint::NTFS => b"ntfs",
+                _ => b"blk",
+            };
+            let end = (pos + tag.len()).min(name_buf.len());
+            name_buf[pos..end].copy_from_slice(&tag[..end - pos]);
+            pos = end;
             pos
         };
 
@@ -2980,8 +2948,8 @@ impl Devd {
             Some(disk_name),
         );
 
-        // Check rules for this new partition port (triggers fatfsd spawn)
-        self.check_rules_for_port(name, PortType::Partition, Some(PortType::Block), self.partd_service_idx);
+        // Check path-based rules for this new partition port (triggers fatfsd spawn)
+        self.check_path_rules(name, self.partd_service_idx);
     }
 
     /// Check if a newly connected driver is partd

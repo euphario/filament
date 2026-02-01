@@ -781,9 +781,10 @@ impl<D: Driver> DriverRuntime<D> {
 
             if tag == TAG_DEVD {
                 // Devd channel is readable — process one command per wake
-                // (Mux fires again if more data is pending on the channel)
                 match self.ctx.devd.poll_command() {
-                    Ok(Some(cmd)) => self.dispatch_devd_command(cmd),
+                    Ok(Some(cmd)) => {
+                        self.dispatch_devd_command(cmd);
+                    }
                     Ok(None) => {}
                     Err(_) => {
                         // Devd channel broken — remove from Mux to prevent hot-loop.
@@ -897,11 +898,13 @@ impl<D: Driver> DriverRuntime<D> {
                         return;
                     }
                 };
+
                 let pid = if *caps != 0 {
                     syscall::exec_with_caps(binary_str, *caps)
                 } else {
                     syscall::exec(binary_str)
                 };
+
                 if pid > 0 {
                     let _ = self.ctx.devd.ack_spawn(*seq_id, 0, pid as u32);
                     for slot in &mut self.ctx.children {

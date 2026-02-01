@@ -139,6 +139,10 @@ impl BlockTransport for ShmemBlockPort {
         self.port.pool_write(offset, data)
     }
 
+    fn pool_ptr(&self) -> *const u8 {
+        self.port.pool_ptr()
+    }
+
     fn pool_phys(&self) -> u64 {
         self.port.pool_phys()
     }

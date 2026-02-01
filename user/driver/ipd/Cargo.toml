@@ -1,0 +1,21 @@
+[package]
+name = "ipd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+userlib = { path = "../../userlib" }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-udp",
+    "socket-tcp",
+    "socket-icmp",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
