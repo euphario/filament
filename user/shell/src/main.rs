@@ -37,6 +37,7 @@ macro_rules! println {
     }};
 }
 
+use userlib::ipc::Port;
 use userlib::syscall;
 use userlib::vfs_client::VfsClient;
 
@@ -61,10 +62,22 @@ static mut CWD: cwd::WorkingDir = cwd::WorkingDir::new();
 /// Cached VFS client (discovered once, reused)
 static mut VFS_CLIENT: Option<VfsClient> = None;
 
+/// Command server port for remote shell IPC
+static mut CMD_PORT: Option<Port> = None;
+
 #[unsafe(no_mangle)]
 fn main() {
     // Initialize console connection (falls back to direct UART if consoled not available)
     console::init();
+
+    // Register shell command server port for remote shell access
+    if let Ok(port) = Port::register(b"shell-cmd:") {
+        let handle = port.handle();
+        unsafe { CMD_PORT = Some(port); }
+        // Register IPC poll callback so read_byte() services remote commands
+        // even while blocked waiting for console input
+        console::console_mut().set_ipc_poll(handle, drain_ipc_commands);
+    }
 
     // Colored welcome banner
     color::set(color::BOLD);
@@ -82,6 +95,9 @@ fn main() {
     color::reset();
 
     loop {
+        // Drain any pending IPC command requests from remote shell
+        drain_ipc_commands();
+
         // Try to connect to consoled if not connected yet (lazy connection)
         if !console::console().is_connected() {
             let retry = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE_RETRY) };
@@ -131,6 +147,55 @@ fn main() {
         }
 
         execute_command(cmd);
+    }
+}
+
+/// Drain pending IPC command requests from remote shell clients.
+/// Accepts connections on the "shell-cmd:" port, executes commands with
+/// output capture, and sends the response back over the channel.
+fn drain_ipc_commands() {
+    let port = match unsafe { &mut *core::ptr::addr_of_mut!(CMD_PORT) } {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Process up to 4 pending requests per drain cycle
+    for _ in 0..4 {
+        let mut channel = match port.try_accept() {
+            Some(ch) => ch,
+            None => break,
+        };
+
+        let mut cmd_buf = [0u8; 256];
+        let n = match channel.recv(&mut cmd_buf) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        if n == 0 {
+            continue;
+        }
+
+        let cmd = trim(&cmd_buf[..n]);
+        if cmd.is_empty() {
+            continue;
+        }
+
+        // Execute command with output captured
+        let mut capture = console::CaptureBuffer::new();
+        console::begin_capture(&mut capture);
+        execute_command(cmd);
+        console::end_capture();
+
+        // Send response in chunks (576 byte IPC limit, use 512 for data)
+        let data = capture.as_slice();
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk_end = (offset + 512).min(data.len());
+            let _ = channel.send(&data[offset..chunk_end]);
+            offset = chunk_end;
+        }
+        // Channel drops here -> closes -> signals EOF to client
     }
 }
 

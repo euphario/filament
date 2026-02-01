@@ -29,15 +29,21 @@ pub const BRIGHT_MAGENTA: &[u8] = b"\x1b[95m";
 pub const BRIGHT_CYAN: &[u8] = b"\x1b[96m";
 pub const BRIGHT_WHITE: &[u8] = b"\x1b[97m";
 
-/// Write a color code
+/// Write a color code (skipped when output is being captured for IPC)
 #[inline]
 pub fn set(color: &[u8]) {
+    if console::is_capturing() {
+        return;
+    }
     console::write(color);
 }
 
-/// Reset to default
+/// Reset to default (skipped when output is being captured for IPC)
 #[inline]
 pub fn reset() {
+    if console::is_capturing() {
+        return;
+    }
     console::write(RESET);
 }
 

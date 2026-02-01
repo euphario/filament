@@ -12,6 +12,12 @@
 
 use userlib::ipc::{Channel, Mux, MuxFilter};
 use userlib::console_ring::ConsoleRing;
+use userlib::syscall::Handle;
+
+/// IPC poll callback type — called during read_byte() when the shell-cmd port
+/// has a pending connection. This lets the shell service remote commands even
+/// while blocked waiting for console input.
+pub type IpcPollFn = fn();
 
 /// Console I/O state
 pub struct Console {
@@ -26,6 +32,12 @@ pub struct Console {
     pub log_split: bool,
     /// Number of log lines (top region)
     pub log_lines: u16,
+    /// IPC port handle to watch during read_byte() (for shell-cmd port)
+    ipc_port_handle: Option<Handle>,
+    /// Callback to drain IPC commands when port has activity
+    ipc_poll_fn: Option<IpcPollFn>,
+    /// Mux for watching both ring and IPC port (created once, reused)
+    read_mux: Option<Mux>,
 }
 
 impl Console {
@@ -38,6 +50,9 @@ impl Console {
             rows: 24,
             log_split: false,
             log_lines: 5,
+            ipc_port_handle: None,
+            ipc_poll_fn: None,
+            read_mux: None,
         }
     }
 
@@ -101,27 +116,57 @@ impl Console {
     }
 
     /// Read a single byte (blocking)
-    /// Uses RX ring (consoled -> shell)
+    /// Uses RX ring (consoled -> shell).
+    /// If an IPC port handle is registered via set_ipc_poll(), also watches
+    /// it and calls the poll callback when the port has activity (allowing
+    /// remote shell commands to be serviced while waiting for console input).
     pub fn read_byte(&mut self) -> Option<u8> {
         let ring = self.ring.as_ref()?;
 
-        // First check if data is available
+        // Fast path: data already available
+        if ring.rx_available() > 0 {
+            let mut byte = [0u8; 1];
+            if ring.rx_read(&mut byte) > 0 {
+                return Some(byte[0]);
+            }
+        }
+
+        // Mux-based wait: watches both ring and IPC port
+        if let (Some(mux), Some(port_handle), Some(poll_fn)) =
+            (&self.read_mux, self.ipc_port_handle, self.ipc_poll_fn)
+        {
+            loop {
+                if ring.rx_available() > 0 {
+                    let mut byte = [0u8; 1];
+                    if ring.rx_read(&mut byte) > 0 {
+                        return Some(byte[0]);
+                    }
+                }
+
+                match mux.wait() {
+                    Ok(event) => {
+                        if event.handle.0 == port_handle.0 {
+                            poll_fn();
+                        }
+                    }
+                    Err(_) => {
+                        userlib::syscall::sleep_us(100_000);
+                    }
+                }
+            }
+        }
+
+        // Fallback: no IPC port registered, simple ring.wait()
         loop {
-            let available = ring.rx_available();
-            if available > 0 {
+            if ring.rx_available() > 0 {
                 let mut byte = [0u8; 1];
-                let n = ring.rx_read(&mut byte);
-                if n > 0 {
+                if ring.rx_read(&mut byte) > 0 {
                     return Some(byte[0]);
                 }
             }
 
-            // No data - wait indefinitely for notification
-            // If wait fails (returns false), sleep briefly to prevent busy-loop
-            // This handles cases where shmem is broken or consoled died
             if !ring.wait(0) {
-                // Wait failed - sleep briefly to prevent syscall storm
-                userlib::syscall::sleep_us(100_000); // 100ms backoff
+                userlib::syscall::sleep_us(100_000);
             }
         }
     }
@@ -291,10 +336,66 @@ impl Console {
     pub fn set_logd_connected(&self, _connected: bool) {
         // Future: tell consoled to connect/disconnect from logd
     }
+
+    /// Register an IPC port handle and poll callback. During read_byte(),
+    /// the console will watch this handle alongside the ring and call the
+    /// callback when the port has activity (pending connection).
+    /// Creates a persistent Mux for efficient multiplexed waiting.
+    pub fn set_ipc_poll(&mut self, handle: Handle, poll_fn: IpcPollFn) {
+        self.ipc_port_handle = Some(handle);
+        self.ipc_poll_fn = Some(poll_fn);
+
+        // Create Mux and add both handles now (ring + port)
+        if let Some(ref ring) = self.ring {
+            if let Ok(mux) = Mux::new() {
+                let _ = mux.add(ring.handle(), MuxFilter::Readable);
+                let _ = mux.add(handle, MuxFilter::Readable);
+                self.read_mux = Some(mux);
+            }
+        }
+    }
+}
+
+/// Capture buffer for redirecting shell output to IPC responses.
+/// Used when executing commands on behalf of remote shell clients.
+pub struct CaptureBuffer {
+    data: [u8; 8192],
+    len: usize,
+}
+
+impl CaptureBuffer {
+    pub const fn new() -> Self {
+        Self {
+            data: [0u8; 8192],
+            len: 0,
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        let available = self.data.len() - self.len;
+        let to_copy = bytes.len().min(available);
+        self.data[self.len..self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
+        self.len += to_copy;
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
 }
 
 /// Global console instance
 static mut CONSOLE: Console = Console::new();
+
+/// Pointer to active capture buffer (set during IPC command execution)
+static mut CAPTURE_BUF: Option<*mut CaptureBuffer> = None;
 
 /// Initialize and connect to console (with retry)
 pub fn init() -> bool {
@@ -319,14 +420,43 @@ pub fn console_mut() -> &'static mut Console {
     unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) }
 }
 
+/// Begin capturing output into the given buffer.
+/// While capturing, write() pushes to the buffer instead of ConsoleRing.
+///
+/// SAFETY: Caller must ensure the buffer outlives the capture session
+/// and that end_capture() is called before the buffer is dropped.
+pub fn begin_capture(buf: &mut CaptureBuffer) {
+    unsafe {
+        *core::ptr::addr_of_mut!(CAPTURE_BUF) = Some(buf as *mut CaptureBuffer);
+    }
+}
+
+/// End output capture. Returns to normal console output.
+pub fn end_capture() {
+    unsafe {
+        *core::ptr::addr_of_mut!(CAPTURE_BUF) = None;
+    }
+}
+
+/// Check if output is currently being captured (for ANSI escape suppression).
+pub fn is_capturing() -> bool {
+    unsafe { (*core::ptr::addr_of!(CAPTURE_BUF)).is_some() }
+}
+
 /// Write bytes to console (convenience function)
 pub fn write(data: &[u8]) {
+    unsafe {
+        if let Some(ptr) = *core::ptr::addr_of!(CAPTURE_BUF) {
+            (*ptr).push(data);
+            return;
+        }
+    }
     console().write(data);
 }
 
 /// Write string to console (convenience function)
 pub fn write_str(s: &str) {
-    console().write_str(s);
+    write(s.as_bytes());
 }
 
 /// Read a byte from console (convenience function)

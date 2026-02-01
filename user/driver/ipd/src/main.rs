@@ -49,6 +49,7 @@ use userlib::vfs_client::VfsClient;
 const TAG_DISCOVERY_TIMER: u32 = 1;
 const TAG_POLL_TIMER: u32 = 2;
 const TAG_DHCP_FALLBACK_TIMER: u32 = 3;
+const TAG_RSH_SHELL_RESPONSE: u32 = 4;
 const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
 const DHCP_FALLBACK_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
 const NIC_PORT_NAME: &[u8] = b"net0";
@@ -155,6 +156,8 @@ struct IpdDriver {
     tftp: TftpServer,
     rsh: RemoteShell,
     vfs_client: Option<VfsClient>,
+    /// Currently watched rsh shell response handle (for unwatch on completion).
+    rsh_watched_handle: Option<Handle>,
 }
 
 impl IpdDriver {
@@ -176,6 +179,7 @@ impl IpdDriver {
             tftp: TftpServer::new(),
             rsh: RemoteShell::new(),
             vfs_client: None,
+            rsh_watched_handle: None,
         }
     }
 
@@ -549,6 +553,28 @@ impl IpdDriver {
         // Process remote shell socket (TCP port 23)
         self.rsh.process(&mut stack.sockets, stack.tcp_rsh_handle);
 
+        // Watch/unwatch rsh pending IPC channel for responsive wake
+        let new_handle = self.rsh.pending_handle();
+        match (self.rsh_watched_handle, new_handle) {
+            (None, Some(h)) => {
+                // New pending command — watch the channel
+                let _ = ctx.watch_handle(h, TAG_RSH_SHELL_RESPONSE);
+                self.rsh_watched_handle = Some(h);
+            }
+            (Some(old), None) => {
+                // Command completed — unwatch
+                let _ = ctx.unwatch_handle(old);
+                self.rsh_watched_handle = None;
+            }
+            (Some(old), Some(new)) if old.0 != new.0 => {
+                // Handle changed (shouldn't happen, but be safe)
+                let _ = ctx.unwatch_handle(old);
+                let _ = ctx.watch_handle(new, TAG_RSH_SHELL_RESPONSE);
+                self.rsh_watched_handle = Some(new);
+            }
+            _ => {} // No change
+        }
+
         // Re-poll after socket processing (smoltcp may have TX to send)
         if let Some(port) = ctx.block_port(self.nic_port) {
             let mut device = SmolDevice::new(port, &mut self.rx_queue);
@@ -838,6 +864,27 @@ impl Driver for IpdDriver {
                     let _ = ctx.unwatch_handle(timer.handle());
                 }
                 self.dhcp_fallback_timer = None;
+            }
+            TAG_RSH_SHELL_RESPONSE => {
+                // Shell responded on IPC channel — process rsh to drain response
+                // SAFETY: SMOL_STACK initialized before handle_event can fire.
+                if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
+                    self.rsh.process(&mut stack.sockets, stack.tcp_rsh_handle);
+
+                    // Update watch state
+                    if self.rsh.pending_handle().is_none() {
+                        if let Some(old) = self.rsh_watched_handle.take() {
+                            let _ = ctx.unwatch_handle(old);
+                        }
+                    }
+
+                    // Re-poll to flush any TCP data
+                    let now = Self::smoltcp_now();
+                    if let Some(port) = ctx.block_port(self.nic_port) {
+                        let mut device = SmolDevice::new(port, &mut self.rx_queue);
+                        stack.iface.poll(now, &mut device, &mut stack.sockets);
+                    }
+                }
             }
             _ => {}
         }
