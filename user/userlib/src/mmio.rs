@@ -168,16 +168,29 @@ pub struct DmaPool {
 }
 
 impl DmaPool {
-    /// Allocate a DMA pool of the given size
+    /// Allocate a DMA pool of the given size (low memory, < 4GB)
     ///
     /// Returns None if allocation fails.
     /// The memory is physically contiguous and non-cacheable.
     pub fn alloc(size: usize) -> Option<Self> {
+        Self::alloc_inner(size, 0)
+    }
+
+    /// Allocate a DMA pool from high memory (> 4GB, 36-bit addresses)
+    ///
+    /// Returns None if allocation fails.
+    /// Use for buffers whose hardware fields support 36-bit addresses.
+    /// Descriptors with 32-bit BASE fields must use `alloc()` instead.
+    pub fn alloc_high(size: usize) -> Option<Self> {
+        Self::alloc_inner(size, 1)
+    }
+
+    fn alloc_inner(size: usize, flags: u32) -> Option<Self> {
         // Build params: u64 size, u32 flags (16 bytes)
         // flags bit 0: 1 = high memory pool, 0 = low memory pool
         let mut params = [0u8; 16];
         params[0..8].copy_from_slice(&(size as u64).to_le_bytes());
-        params[8..12].copy_from_slice(&0u32.to_le_bytes()); // low memory
+        params[8..12].copy_from_slice(&flags.to_le_bytes());
 
         // Open DMA pool object
         let handle = syscall::open(ObjectType::DmaPool, &params).ok()?;

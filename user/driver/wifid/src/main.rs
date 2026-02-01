@@ -21,7 +21,9 @@
 
 use userlib::{print, println, syscall};
 use userlib::{uinfo, uwarn, uerror, udebug};
-use pcie::{PcieClient, consts};
+use userlib::mmio::{MmioRegion, DmaPool};
+use userlib::bus::{BusMsg, BusError, BusCtx, Driver, Disposition};
+use userlib::bus_runtime::driver_main;
 
 /// Write memory barrier for DMA - ensures stores are visible to PCIe devices
 /// Linux wmb() on ARM64 is "dsb st" - Data Synchronization Barrier, stores only
@@ -2518,39 +2520,15 @@ impl Mt7996Dev {
 // ============================================================================
 
 /// File reading helper - reads entire file into buffer
-fn read_file(path: &[u8], buf: &mut [u8]) -> Result<usize, i32> {
-    use userlib::syscall;
-
-    let fd = syscall::open(path, 0);  // O_RDONLY
-    if fd < 0 {
-        return Err(fd);
-    }
-    let fd = fd as u32;
-
-    // Kernel limits reads to 4096 bytes per syscall
-    const MAX_READ_CHUNK: usize = 4096;
-
-    let mut total = 0;
-    loop {
-        let remaining = buf.len() - total;
-        let chunk_size = core::cmp::min(remaining, MAX_READ_CHUNK);
-        if chunk_size == 0 {
-            break;
-        }
-
-        let n = syscall::read(fd, &mut buf[total..total + chunk_size]);
-        if n < 0 {
-            syscall::close(fd);
-            return Err(n as i32);
-        }
-        if n == 0 {
-            break;  // EOF
-        }
-        total += n as usize;
-    }
-
-    syscall::close(fd);
-    Ok(total)
+///
+/// NOTE: This requires a VFS layer to resolve paths. Currently stubbed
+/// to always return an error since wifid firmware loading depends on
+/// fatfs being available via the FirmwareClient protocol (not raw file I/O).
+fn read_file(_path: &[u8], _buf: &mut [u8]) -> Result<usize, i32> {
+    // Firmware loading via raw file I/O is not supported with the unified
+    // syscall interface. Use FirmwareClient protocol when fatfs is available.
+    uerror!("fw", "read_file_not_implemented");
+    Err(-1)
 }
 
 impl Mt7996Dev {
@@ -2726,13 +2704,21 @@ impl Mt7996Dev {
 
         // Allocate buffer for firmware (3MB should be enough for largest file)
         const FW_BUF_SIZE: usize = 3 * 1024 * 1024;
-        let mut fw_buf_virt: u64 = 0;
-        let mut fw_buf_phys: u64 = 0;
-        let shmem_id = syscall::shmem_create(FW_BUF_SIZE, &mut fw_buf_virt, &mut fw_buf_phys);
-        if shmem_id < 0 {
-            uerror!("fw", "alloc_fw_buf_failed");
-            return Err(-1);
-        }
+        let (shmem_handle, _shmem_id) = match syscall::open_shmem_create(FW_BUF_SIZE) {
+            Ok(v) => v,
+            Err(_) => {
+                uerror!("fw", "alloc_fw_buf_failed");
+                return Err(-1);
+            }
+        };
+        let fw_buf_virt = match syscall::map(shmem_handle, 0) {
+            Ok(v) if v != 0 => v,
+            _ => {
+                let _ = syscall::close(shmem_handle);
+                uerror!("fw", "map_fw_buf_failed");
+                return Err(-1);
+            }
+        };
 
         let fw_buf = unsafe { core::slice::from_raw_parts_mut(fw_buf_virt as *mut u8, FW_BUF_SIZE) };
         // Linux starts seq at 1 and explicitly avoids 0 (see mcu.c:249-251)
@@ -2785,7 +2771,7 @@ impl Mt7996Dev {
         uinfo!("fw", "fw_state_final"; val = fw_state);
 
         // Cleanup
-        syscall::shmem_destroy(shmem_id as u32);
+        let _ = syscall::close(shmem_handle);
 
         if fw_state == 7 {
             uinfo!("fw", "load_firmware_success");
@@ -2798,159 +2784,125 @@ impl Mt7996Dev {
 }
 
 // ============================================================================
-// Entry Point
+// Bus Framework Driver
 // ============================================================================
 
-/// MT7996 device IDs
-const DEVICE_MT7996_HIF1: u16 = 0x7990;
-const DEVICE_MT7996_HIF2: u16 = 0x7991;
+struct WifiDriver {
+    dev: Option<Mt7996Dev>,
+    bar0: Option<MmioRegion>,
+    desc_pool: Option<DmaPool>,
+    rx_pool: Option<DmaPool>,
+}
 
-#[unsafe(no_mangle)]
-fn main() {
-    uinfo!("wifid", "init_start");
-
-    // Show DMA translation mode
-    if USE_DRAM_OFFSET {
-        uinfo!("wifid", "dma_mode"; mode = "dram_offset", base = DRAM_BASE);
-    } else {
-        uinfo!("wifid", "dma_mode"; mode = "identity");
-    }
-
-    // Step 1: Connect to pcied
-    uinfo!("wifid", "connect_pcied");
-    let client = match PcieClient::connect() {
-        Some(c) => c,
-        None => {
-            uerror!("wifid", "pcied_connect_failed");
-            syscall::exit(1);
-        }
-    };
-    udebug!("wifid", "pcied_connected");
-
-    // Step 2: Find MT7996 devices
-    uinfo!("wifid", "scan_devices");
-    let devices = client.find_devices(consts::vendor::MEDIATEK, 0xFFFF);
-    uinfo!("wifid", "devices_found"; count = devices.len());
-
-    // Find HIF1 (main device) and HIF2 (secondary)
-    let mut hif1_info: Option<pcie::PcieDeviceInfo> = None;
-    let mut hif2_info: Option<pcie::PcieDeviceInfo> = None;
-
-    for info in devices.iter() {
-        // Print PCI command register: bit 0=IO, bit 1=MEM, bit 2=BME (Bus Master Enable)
-        let bme = (info.command & 0x04) != 0;
-        udebug!("wifid", "device";
-            bus = info.bus,
-            dev = info.device,
-            func = info.function,
-            vendor = info.vendor_id,
-            device_id = info.device_id,
-            bar0 = info.bar0_addr,
-            size_kb = info.bar0_size / 1024,
-            cmd = info.command,
-            bme = bme);
-
-        match info.device_id {
-            DEVICE_MT7996_HIF1 => hif1_info = Some(*info),
-            DEVICE_MT7996_HIF2 => hif2_info = Some(*info),
-            _ => {}
+impl WifiDriver {
+    const fn new() -> Self {
+        Self {
+            dev: None,
+            bar0: None,
+            desc_pool: None,
+            rx_pool: None,
         }
     }
+}
 
-    // Must have HIF1 (main interface)
-    let hif1 = match hif1_info {
-        Some(info) => info,
-        None => {
-            uerror!("wifid", "no_hif1_found");
-            syscall::exit(1);
+impl Driver for WifiDriver {
+    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        uinfo!("wifid", "init_start");
+
+        // Show DMA translation mode
+        if USE_DRAM_OFFSET {
+            uinfo!("wifid", "dma_mode"; mode = "dram_offset", base = DRAM_BASE);
+        } else {
+            uinfo!("wifid", "dma_mode"; mode = "identity");
         }
-    };
 
-    let has_hif2 = hif2_info.is_some();
+        // Step 1: Get BAR0 from spawn context (provided by pcied via devd)
+        let spawn_ctx = ctx.spawn_context().map_err(|e| {
+            uerror!("wifid", "no_spawn_context");
+            e
+        })?;
 
-    uinfo!("wifid", "hif1_found"; vendor = hif1.vendor_id, device = hif1.device_id, bar0 = hif1.bar0_addr, cmd = hif1.command);
-    // Check bus master enabled (bit 2)
-    if (hif1.command & 0x04) == 0 {
-        uwarn!("wifid", "bme_not_enabled");
-    } else {
-        udebug!("wifid", "bme_ok");
-    }
-    if let Some(ref hif2) = hif2_info {
-        uinfo!("wifid", "hif2_found"; vendor = hif2.vendor_id, device = hif2.device_id, bar0 = hif2.bar0_addr, cmd = hif2.command);
-    }
-
-    // Step 3: Map BAR0
-    uinfo!("wifid", "map_bar0"; addr = hif1.bar0_addr, size_kb = hif1.bar0_size / 1024);
-    let (bar0_virt, bar0_size) = match syscall::mmap_device(hif1.bar0_addr, hif1.bar0_size as u64) {
-        Ok(virt) => (virt, hif1.bar0_size as u64),
-        Err(e) => {
-            uerror!("wifid", "mmap_device_failed"; err = e);
-            syscall::exit(1);
+        let meta = spawn_ctx.metadata();
+        if meta.len() < 12 {
+            uerror!("wifid", "metadata_too_short"; len = meta.len() as u32);
+            return Err(BusError::Internal);
         }
-    };
-    udebug!("wifid", "bar0_mapped"; virt = bar0_virt);
 
-    // Note: HIF2 registers (0xd8xxx) are accessible through HIF1's BAR at offset 0xd8xxx
-    // Linux mmio.c __mt7996_reg_addr(): if (addr < 0x100000) return addr;
-    // So we don't need to map HIF2's BAR separately for register access.
+        let bar0_addr = u64::from_le_bytes([
+            meta[0], meta[1], meta[2], meta[3],
+            meta[4], meta[5], meta[6], meta[7],
+        ]);
+        let bar0_size = u32::from_le_bytes([
+            meta[8], meta[9], meta[10], meta[11],
+        ]) as u64;
 
-    // Step 4: Allocate DMA descriptor memory from HIGH MEMORY pool
-    // Linux uses 36-bit addresses (e.g., 0x101be8000) above 4GB for TX/RX buffers
-    // CRITICAL: Descriptor rings MUST be in LOW memory (< 4GB) because DESC_BASE is 32-bit!
-    // Only TX/RX BUFFERS can use HIGH (36-bit) addresses via buf0/buf1 fields.
-    uinfo!("wifid", "alloc_dma_mem");
+        uinfo!("wifid", "device_found"; bar0 = bar0_addr, size = bar0_size);
 
-    // Calculate descriptor memory needed for Linux-matching ring sizes:
-    // TX: BAND0(2048) + MCU_WM(256) + MCU_WA(256) + FWDL(128) = 2688 × 16 = 43KB
-    // RX: MCU_WM(512) + MCU_WA(512) + BAND0(1536) + WA_MAIN(1024) + BAND2(1536) + WA_TRI(1024) = 6144 × 16 = 98KB
-    // Total: ~141KB, round up to 192KB with 4KB alignment per queue
-    const DESC_MEM_SIZE: usize = 256 * 1024; // 256KB for all queues (was 64KB)
-    let mut desc_virt: u64 = 0;
-    let mut desc_phys: u64 = 0;
-    // Use LOW pool - DESC_BASE register is only 32-bit, can't address > 4GB!
-    let result = syscall::dma_pool_create(DESC_MEM_SIZE, &mut desc_virt, &mut desc_phys);
-    if result < 0 {
-        uerror!("wifid", "dma_pool_create_failed"; err = result);
-        syscall::exit(1);
-    }
-    udebug!("wifid", "desc_pool"; virt = desc_virt, phys = desc_phys, size = DESC_MEM_SIZE);
+        // Step 2: Map BAR0
+        uinfo!("wifid", "map_bar0"; addr = bar0_addr, size_kb = bar0_size / 1024);
+        let bar0 = MmioRegion::open(bar0_addr, bar0_size).ok_or_else(|| {
+            uerror!("wifid", "mmap_device_failed");
+            BusError::Internal
+        })?;
+        let bar0_virt = bar0.virt_base();
+        udebug!("wifid", "bar0_mapped"; virt = bar0_virt);
 
-    // Clear all descriptor memory and flush to RAM
-    unsafe {
-        core::ptr::write_bytes(desc_virt as *mut u8, 0, DESC_MEM_SIZE);
-    }
-    // CRITICAL: Flush cache to ensure zeros are visible to DMA device
-    // Without this, DMA device might see stale/random data
-    flush_buffer(desc_virt, DESC_MEM_SIZE);
+        // Note: HIF2 registers (0xd8xxx) are accessible through HIF1's BAR at offset 0xd8xxx
+        // Linux mmio.c __mt7996_reg_addr(): if (addr < 0x100000) return addr;
+        // So we don't need to map HIF2's BAR separately for register access.
+        // pcied registers separate ports for HIF1 (0x7990) and HIF2 (0x7991);
+        // wifid only gets spawned for HIF1 (the :network port).
+        let has_hif2 = false;
 
-    // Allocate RX buffer pool from HIGH MEMORY - exact Linux-matching ring sizes
-    // Linux: mt76_dma_rx_fill_buf() allocates skbs and fills descriptors with physical addresses
-    // RX queues: MCU_WM(512) + MCU_WA(512) + BAND0(1536) + WA_MAIN(1024) + BAND2(1536) + WA_TRI(1024) = 6144 buffers
-    // 6144 × 2048 = 12.6MB
-    const RX_BUF_POOL_SIZE: usize = 13 * 1024 * 1024;  // 13MB for all RX queues
-    let mut rx_buf_virt: u64 = 0;
-    let mut rx_buf_phys: u64 = 0;
-    let result = syscall::dma_pool_create_high(RX_BUF_POOL_SIZE, &mut rx_buf_virt, &mut rx_buf_phys);
-    if result < 0 {
-        uwarn!("wifid", "rx_buf_pool_high_fallback"; err = result);
-        // Fallback to low pool if high pool fails
-        let result = syscall::dma_pool_create(RX_BUF_POOL_SIZE, &mut rx_buf_virt, &mut rx_buf_phys);
-        if result < 0 {
-            uerror!("wifid", "rx_pool_create_failed"; err = result);
-            syscall::exit(1);
-        }
-    }
-    udebug!("wifid", "rx_buf_pool"; virt = rx_buf_virt, phys = rx_buf_phys, size = RX_BUF_POOL_SIZE);
+        // Step 3: Allocate DMA descriptor memory
+        // CRITICAL: Descriptor rings MUST be in LOW memory (< 4GB) because DESC_BASE is 32-bit!
+        // Only TX/RX BUFFERS can use HIGH (36-bit) addresses via buf0/buf1 fields.
+        uinfo!("wifid", "alloc_dma_mem");
 
-    // Clear RX buffer memory and flush to RAM
-    unsafe {
-        core::ptr::write_bytes(rx_buf_virt as *mut u8, 0, RX_BUF_POOL_SIZE);
-    }
-    // CRITICAL: Flush cache to ensure zeros are visible to DMA device
-    flush_buffer(rx_buf_virt, RX_BUF_POOL_SIZE);
+        // Calculate descriptor memory needed for Linux-matching ring sizes:
+        // TX: BAND0(2048) + MCU_WM(256) + MCU_WA(256) + FWDL(128) = 2688 × 16 = 43KB
+        // RX: MCU_WM(512) + MCU_WA(512) + BAND0(1536) + WA_MAIN(1024) + BAND2(1536) + WA_TRI(1024) = 6144 × 16 = 98KB
+        // Total: ~141KB, round up to 192KB with 4KB alignment per queue
+        const DESC_MEM_SIZE: usize = 256 * 1024; // 256KB for all queues (was 64KB)
+        // Use LOW pool - DESC_BASE register is only 32-bit, can't address > 4GB!
+        let mut desc_pool = DmaPool::alloc(DESC_MEM_SIZE).ok_or_else(|| {
+            uerror!("wifid", "dma_pool_create_failed");
+            BusError::Internal
+        })?;
+        let desc_virt = desc_pool.vaddr();
+        let desc_phys = desc_pool.paddr();
+        udebug!("wifid", "desc_pool"; virt = desc_virt, phys = desc_phys, size = DESC_MEM_SIZE);
 
-    // Create device
-    let dev = Mt7996Dev::new(bar0_virt, bar0_size, has_hif2);
+        // Clear all descriptor memory and flush to RAM
+        desc_pool.zero();
+        // CRITICAL: Flush cache to ensure zeros are visible to DMA device
+        // Without this, DMA device might see stale/random data
+        flush_buffer(desc_virt, DESC_MEM_SIZE);
+
+        // Allocate RX buffer pool from HIGH MEMORY - exact Linux-matching ring sizes
+        // Linux: mt76_dma_rx_fill_buf() allocates skbs and fills descriptors with physical addresses
+        // RX queues: MCU_WM(512) + MCU_WA(512) + BAND0(1536) + WA_MAIN(1024) + BAND2(1536) + WA_TRI(1024) = 6144 buffers
+        // 6144 × 2048 = 12.6MB
+        const RX_BUF_POOL_SIZE: usize = 13 * 1024 * 1024;  // 13MB for all RX queues
+        let mut rx_pool = DmaPool::alloc_high(RX_BUF_POOL_SIZE).or_else(|| {
+            uwarn!("wifid", "rx_buf_pool_high_fallback");
+            // Fallback to low pool if high pool fails
+            DmaPool::alloc(RX_BUF_POOL_SIZE)
+        }).ok_or_else(|| {
+            uerror!("wifid", "rx_pool_create_failed");
+            BusError::Internal
+        })?;
+        let rx_buf_virt = rx_pool.vaddr();
+        let rx_buf_phys = rx_pool.paddr();
+        udebug!("wifid", "rx_buf_pool"; virt = rx_buf_virt, phys = rx_buf_phys, size = RX_BUF_POOL_SIZE);
+
+        // Clear RX buffer memory and flush to RAM
+        rx_pool.zero();
+        // CRITICAL: Flush cache to ensure zeros are visible to DMA device
+        flush_buffer(rx_buf_virt, RX_BUF_POOL_SIZE);
+
+        // Create device
+        let dev = Mt7996Dev::new(bar0_virt, bar0_size, has_hif2);
 
     // ========================================================================
     // EXACT Linux initialization sequence
@@ -3238,18 +3190,15 @@ fn main() {
     // Allocate buffer memory for FWDL TX from HIGH DMA pool (36-bit, above 4GB)
     // Linux uses high addresses (0x101be8000) - matching that behavior
     const TX_BUF_SIZE: usize = MT7996_TX_FWDL_RING_SIZE as usize * MCU_FW_DL_BUF_SIZE;
-    let mut tx_buf_virt: u64 = 0;
-    let mut tx_buf_phys: u64 = 0;
-    let tx_buf_result = syscall::dma_pool_create_high(TX_BUF_SIZE, &mut tx_buf_virt, &mut tx_buf_phys);
-    if tx_buf_result < 0 {
-        uwarn!("wifid", "fwdl_tx_high_fallback"; err = tx_buf_result);
-        // Fallback to low pool
-        let tx_buf_result = syscall::dma_pool_create(TX_BUF_SIZE, &mut tx_buf_virt, &mut tx_buf_phys);
-        if tx_buf_result < 0 {
-            println!("ERROR: Failed to allocate TX buffer: {}", tx_buf_result);
-            syscall::exit(1);
-        }
-    }
+    let tx_buf_pool = DmaPool::alloc_high(TX_BUF_SIZE).or_else(|| {
+        uwarn!("wifid", "fwdl_tx_high_fallback");
+        DmaPool::alloc(TX_BUF_SIZE)
+    }).ok_or_else(|| {
+        uerror!("wifid", "fwdl_tx_alloc_failed");
+        BusError::Internal
+    })?;
+    let tx_buf_virt = tx_buf_pool.vaddr();
+    let tx_buf_phys = tx_buf_pool.paddr();
     println!("FWDL TX buffer: virt=0x{:x} phys=0x{:016x}",
              tx_buf_virt, tx_buf_phys);
 
@@ -3269,18 +3218,15 @@ fn main() {
     // Allocate separate TX buffer for MCU_WM (MCU commands are small)
     // Use HIGH pool (36-bit, above 4GB) to match Linux behavior
     const MCU_TX_BUF_SIZE: usize = MT7996_TX_MCU_RING_SIZE as usize * MCU_FW_DL_BUF_SIZE;
-    let mut mcu_tx_buf_virt: u64 = 0;
-    let mut mcu_tx_buf_phys: u64 = 0;
-    let mcu_buf_result = syscall::dma_pool_create_high(MCU_TX_BUF_SIZE, &mut mcu_tx_buf_virt, &mut mcu_tx_buf_phys);
-    if mcu_buf_result < 0 {
-        uwarn!("wifid", "mcu_tx_high_fallback"; err = mcu_buf_result);
-        // Fallback to low pool
-        let mcu_buf_result = syscall::dma_pool_create(MCU_TX_BUF_SIZE, &mut mcu_tx_buf_virt, &mut mcu_tx_buf_phys);
-        if mcu_buf_result < 0 {
-            println!("ERROR: Failed to allocate MCU TX buffer: {}", mcu_buf_result);
-            syscall::exit(1);
-        }
-    }
+    let mcu_tx_buf_pool = DmaPool::alloc_high(MCU_TX_BUF_SIZE).or_else(|| {
+        uwarn!("wifid", "mcu_tx_high_fallback");
+        DmaPool::alloc(MCU_TX_BUF_SIZE)
+    }).ok_or_else(|| {
+        uerror!("wifid", "mcu_tx_alloc_failed");
+        BusError::Internal
+    })?;
+    let mcu_tx_buf_virt = mcu_tx_buf_pool.vaddr();
+    let mcu_tx_buf_phys = mcu_tx_buf_pool.paddr();
     println!("MCU TX buffer: virt=0x{:x} phys=0x{:016x}",
              mcu_tx_buf_virt, mcu_tx_buf_phys);
 
@@ -3466,16 +3412,10 @@ fn main() {
     println!("  tx_buf_phys:      0x{:016x}", tx_buf_phys);
     println!("  tx_buf_dma:       0x{:016x}", phys_to_dma(tx_buf_phys));
 
-    // 4. BAR0 physical address (what SoC assigned)
+    // 4. BAR0 physical address (from spawn context)
     println!("\n=== PCIe BAR Configuration ===");
-    println!("  HIF1 BAR0 phys:   0x{:016x}", hif1.bar0_addr);
-    println!("  HIF1 BAR0 size:   0x{:08x} ({}KB)", hif1.bar0_size, hif1.bar0_size / 1024);
-    println!("  HIF1 Command:     0x{:04x} (BME={})", hif1.command, (hif1.command >> 2) & 1);
-    if let Some(ref h2) = hif2_info {
-        println!("  HIF2 BAR0 phys:   0x{:016x}", h2.bar0_addr);
-        println!("  HIF2 BAR0 size:   0x{:08x} ({}KB)", h2.bar0_size, h2.bar0_size / 1024);
-        println!("  HIF2 Command:     0x{:04x} (BME={})", h2.command, (h2.command >> 2) & 1);
-    }
+    println!("  HIF1 BAR0 phys:   0x{:016x}", bar0_addr);
+    println!("  HIF1 BAR0 size:   0x{:08x} ({}KB)", bar0_size, bar0_size / 1024);
 
     // 5. MT7996 Internal PCIe Registers
     println!("\n=== MT7996 Internal PCIe Registers ===");
@@ -3528,14 +3468,6 @@ fn main() {
 
     println!("\n========== END PRE-FIRMWARE DUMP ==========\n");
 
-    // === PCIe Device Status Check (Before Firmware Load) ===
-    // Read existing errors FIRST (don't clear - we want to see if pcied init caused any)
-    println!("=== PCIe Device Status (BEFORE firmware load) ===");
-    if let Some(dev_sta_before) = client.read_device_status(hif1.port, hif1.bus, hif1.device, hif1.function) {
-        let urd = (dev_sta_before & 0x08) != 0;
-        println!("DEV_STA = 0x{:04x} {}", dev_sta_before, if urd { "*** URD SET! ***" } else { "(no errors)" });
-    }
-
     // Load firmware
     // CRITICAL: Linux uses different queues for different operations:
     // - mcu_ring (MCU_WM, hw_idx=17): ALL MCU commands
@@ -3555,43 +3487,46 @@ fn main() {
         Err(e) => println!("Firmware loading failed: {}", e),
     }
 
-    // === PCIe Device Status Check (After Firmware Load) ===
-    // This reveals if DMA errors occurred (Unsupported Request = bad DMA address)
-    println!("\n=== PCIe Device Status (DMA Error Check) ===");
-    if let Some(dev_sta) = client.read_device_status(hif1.port, hif1.bus, hif1.device, hif1.function) {
-        let ced = (dev_sta & 0x01) != 0;  // Correctable Error
-        let nfed = (dev_sta & 0x02) != 0; // Non-Fatal Error
-        let fed = (dev_sta & 0x04) != 0;  // Fatal Error
-        let urd = (dev_sta & 0x08) != 0;  // Unsupported Request (BAD DMA ADDRESS!)
-        let tp = (dev_sta & 0x20) != 0;   // Transactions Pending
-
-        println!("DEV_STA = 0x{:04x}", dev_sta);
-        println!("  Correctable Error:    {}", if ced { "YES" } else { "no" });
-        println!("  Non-Fatal Error:      {}", if nfed { "YES" } else { "no" });
-        println!("  Fatal Error:          {}", if fed { "YES!" } else { "no" });
-        println!("  Unsupported Request:  {}", if urd { "*** YES - BAD DMA ADDRESS! ***" } else { "no" });
-        println!("  Transactions Pending: {}", if tp { "yes" } else { "no" });
-
-        if urd {
-            println!("\n*** CRITICAL: Unsupported Request Detected! ***");
-            println!("This means the MT7996 tried to DMA to an address that");
-            println!("was not accepted by the PCIe Root Complex.");
-            println!("Possible causes:");
-            println!("  1. DMA address translation is wrong (need dma-ranges?)");
-            println!("  2. Memory region not mapped for DMA access");
-            println!("  3. Inbound ATU not configured correctly");
-        }
-    } else {
-        println!("Failed to read PCIe Device Status");
-    }
-
     // Check final state after firmware
     println!("\n=== Post-Firmware State ===");
     let final_fw_state = dev.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
     println!("FW_STATE: {} (7=running)", final_fw_state);
 
-    // Note: DMA pool memory is not freed - it's a bump allocator for driver lifetime
-    // The pool will be reused if the driver is restarted
+    // Store resources in driver struct (keeps DMA pools alive for driver lifetime)
+    self.dev = Some(dev);
+    self.bar0 = Some(bar0);
+    self.desc_pool = Some(desc_pool);
+    self.rx_pool = Some(rx_pool);
 
-    println!("\n=== wifid3 complete ===");
+    println!("\n=== wifid init complete ===");
+    Ok(())
+    }
+
+    fn command(&mut self, _msg: &BusMsg, _ctx: &mut dyn BusCtx) -> Disposition {
+        Disposition::Handled
+    }
+}
+
+// ============================================================================
+// Entry Point
+// ============================================================================
+
+static mut DRIVER: WifiDriver = WifiDriver::new();
+
+#[unsafe(no_mangle)]
+fn main() {
+    let driver = unsafe { &mut *(&raw mut DRIVER) };
+    driver_main(b"wifid", WifiDriverWrapper(driver));
+}
+
+struct WifiDriverWrapper(&'static mut WifiDriver);
+
+impl Driver for WifiDriverWrapper {
+    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.init(ctx)
+    }
+
+    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
+        self.0.command(msg, ctx)
+    }
 }

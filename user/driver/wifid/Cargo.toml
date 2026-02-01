@@ -5,8 +5,6 @@ edition = "2021"
 
 [dependencies]
 userlib = { path = "../../userlib" }
-pcie = { path = "../pcie" }
-mt7996 = { path = "../mt7996" }
 
 [profile.release]
 panic = "abort"

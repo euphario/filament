@@ -51,7 +51,7 @@ pub static PATH_RULES: &[PathRule] = &[
     // PCI device type matches
     PathRule { suffix: ":xhci",  driver: "usbd",   caps: userlib::devd::caps::DRIVER },
     PathRule { suffix: ":nvme",  driver: "nvmed",  caps: userlib::devd::caps::DRIVER },
-    PathRule { suffix: ":network", driver: "netd", caps: userlib::devd::caps::DRIVER },
+    PathRule { suffix: ":network", driver: "wifid", caps: userlib::devd::caps::DRIVER },
     // Block device type → partition scanner
     PathRule { suffix: ":msc",   driver: "partd",  caps: userlib::devd::caps::DRIVER },
     // Filesystem type matches
@@ -125,7 +125,7 @@ pub static RULES: &[Rule] = &[
     Rule {
         match_parent_type: None,
         match_port_type: Some(PortType::Network),
-        driver_binary: "netd",
+        driver_binary: "wifid",
         pass_port_name: true,
         caps: userlib::devd::caps::DRIVER,
     },
@@ -229,10 +229,10 @@ mod tests {
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "fatfsd");
 
-        // ":network" should match netd
+        // ":network" should match wifid
         let rule = find_path_rule(b"00:01.0:network");
         assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "netd");
+        assert_eq!(rule.unwrap().driver, "wifid");
 
         // No match for console
         let rule = find_path_rule(b"console");
