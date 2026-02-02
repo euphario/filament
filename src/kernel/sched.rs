@@ -83,6 +83,16 @@ unsafe impl Send for SwitchDecision {}
 // Core Scheduling Operations
 // ============================================================================
 
+/// Block reason for atomic sleep+reschedule operations.
+enum BlockReason {
+    /// No blocking - normal preemptive reschedule
+    None,
+    /// Sleep (no deadline)
+    Sleep(task::SleepReason),
+    /// Wait with deadline
+    Wait(task::WaitReason, u64),
+}
+
 /// Reschedule: pick the next task to run and switch to it.
 ///
 /// Uses three-phase scheduling for SMP safety:
@@ -93,6 +103,35 @@ unsafe impl Send for SwitchDecision {}
 /// # Returns
 /// true if we switched to a different task, false if staying on current.
 pub fn reschedule() -> bool {
+    reschedule_inner(BlockReason::None)
+}
+
+/// Atomically sleep the current task and reschedule.
+///
+/// Returns false if called from idle task. Returns true otherwise
+/// (task was blocked and has now been woken and rescheduled back).
+pub fn sleep_and_reschedule(reason: task::SleepReason) -> bool {
+    let slot = current_slot();
+    if is_idle_slot(slot) {
+        return false;
+    }
+    reschedule_inner(BlockReason::Sleep(reason));
+    true
+}
+
+/// Atomically wait the current task and reschedule.
+///
+/// Same as sleep_and_reschedule but with a deadline.
+pub fn wait_and_reschedule(reason: task::WaitReason, deadline: u64) -> bool {
+    let slot = current_slot();
+    if is_idle_slot(slot) {
+        return false;
+    }
+    reschedule_inner(BlockReason::Wait(reason, deadline));
+    true
+}
+
+fn reschedule_inner(block: BlockReason) -> bool {
     // ========================================================================
     // PHASE 1: Decision under lock
     // ========================================================================
@@ -100,10 +139,57 @@ pub fn reschedule() -> bool {
         let mut sched = task::scheduler();
         let caller_slot = current_slot();
 
+        // If caller wants to block, do the state transition NOW under lock.
+        // This is atomic with the scheduling decision — no other CPU can see
+        // this task as Ready between the block and the context switch setup.
+        let force_full_switch = match block {
+            BlockReason::None => false,
+            BlockReason::Sleep(reason) => {
+                if is_idle_slot(caller_slot) {
+                    kerror!("sched", "block_idle_attempt");
+                    return false;
+                }
+                if let Some(task) = sched.task_mut(caller_slot) {
+                    if task.set_sleeping(reason).is_err() {
+                        kerror!("sched", "invalid_sleep_transition"; from = task.state().name());
+                        return false;
+                    }
+                }
+                sched.notify_blocked(caller_slot);
+                true // Blocked task always needs full context switch
+            }
+            BlockReason::Wait(reason, deadline) => {
+                if is_idle_slot(caller_slot) {
+                    kerror!("sched", "block_idle_attempt");
+                    return false;
+                }
+                if let Some(task) = sched.task_mut(caller_slot) {
+                    if task.set_waiting(reason, deadline).is_err() {
+                        kerror!("sched", "invalid_wait_transition"; from = task.state().name());
+                        return false;
+                    }
+                }
+                sched.notify_blocked(caller_slot);
+                sched.note_deadline(deadline);
+                true // Blocked task always needs full context switch
+            }
+        };
+
+        // Track whether the task was Running at entry (before any block transition).
+        // If force_full_switch is set, the task is now blocked and MUST use full switch.
+        let was_running = if force_full_switch {
+            false // Treat as non-running to force full context switch
+        } else {
+            sched.task(caller_slot)
+                .map(|t| *t.state() == TaskState::Running)
+                .unwrap_or(false)
+        };
+
         // Mark current task as Ready if it was Running
         if let Some(current) = sched.task_mut(caller_slot) {
             if *current.state() == TaskState::Running {
                 crate::transition_or_evict!(current, set_ready);
+                sched.notify_ready(caller_slot);
             }
         }
 
@@ -137,13 +223,20 @@ pub fn reschedule() -> bool {
             }
         };
 
-        // Check if we need full context switch
+        // Check if we need full context switch.
+        // Simple preemption (trap-frame-only swap) is ONLY safe when:
+        // 1. The from-task was Running at entry (we just set it Ready above).
+        //    If it was already non-Running (Sleeping/Ready-from-wake), reschedule()
+        //    was called from deep in a syscall handler (e.g., sys_wait retry loop)
+        //    and the kernel stack must be preserved via full context switch.
+        // 2. The from-task is not blocked (it can resume from user trap frame)
+        // 3. The to-task doesn't need kernel context restore
         let from_blocked = sched.task(caller_slot)
             .map(|t| t.is_blocked()).unwrap_or(false);
         let to_needs_context = sched.task(next_slot)
-            .map(|t| t.needs_context_restore).unwrap_or(false);
+            .map(|t| t.needs_context_restore()).unwrap_or(false);
 
-        if !from_blocked && !to_needs_context {
+        if was_running && !from_blocked && !to_needs_context {
             // Simple preemption case - no context_switch needed
             // Just update variables, actual switch at eret
             set_current_slot(next_slot);
@@ -175,7 +268,7 @@ pub fn reschedule() -> bool {
                 // Only mark for restore if task is alive
                 // Terminated tasks (Evicting, Exiting, Dying, Dead) should never be restored
                 if !t.is_terminated() {
-                    t.needs_context_restore = true;
+                    t.mark_context_saved();
                 }
                 &mut t.context as *mut task::CpuContext
             }
@@ -186,7 +279,7 @@ pub fn reschedule() -> bool {
             Some(t) => {
                 // Prepare target state while holding lock
                 crate::transition_or_evict!(t, set_running);
-                t.needs_context_restore = false;
+                t.mark_context_restored();
 
                 let ctx = &t.context as *const task::CpuContext;
                 let trap = &mut t.trap_frame as *mut TrapFrame;
@@ -314,7 +407,7 @@ pub fn reschedule() -> bool {
                     kwarn!("sched", "resume_unexpected"; slot = decision.from_slot as u64);
                 }
             }
-            t.needs_context_restore = false;
+            t.mark_context_restored();
 
             // Update per-CPU trap frame pointer
             let trap_ptr = &mut t.trap_frame as *mut TrapFrame;
@@ -361,15 +454,20 @@ pub fn wake(pid: u32) -> bool {
     }
 }
 
-/// Send reschedule IPI (SGI 0) to all other online CPUs.
+/// Send reschedule IPI (SGI 0) to ONE idle CPU.
 ///
-/// This causes the target CPUs to check for newly ready tasks.
+/// Targeted: only wakes a single idle CPU instead of broadcasting to all.
+/// If no CPU is idle, the timer tick will eventually catch up.
 fn send_reschedule_ipi() {
     let my_cpu = percpu::cpu_id();
-    let online = percpu::num_online_cpus();
-    for cpu in 0..online {
-        if cpu != my_cpu {
-            crate::platform::current::gic::send_sgi(cpu, 0);
+    for i in 0..percpu::MAX_CPUS {
+        if i as u32 != my_cpu {
+            if let Some(cpu_data) = percpu::try_get_cpu_data(i) {
+                if cpu_data.get_state() == percpu::CpuState::Online && cpu_data.is_idle() {
+                    crate::platform::current::gic::send_sgi(i as u32, 0);
+                    return; // Only need to wake ONE idle CPU
+                }
+            }
         }
     }
 }
@@ -389,14 +487,25 @@ pub fn sleep_current(reason: task::SleepReason) -> bool {
         return false;
     }
 
-    if let Some(task) = sched.task_mut(slot) {
+    let ok = if let Some(task) = sched.task_mut(slot) {
         if task.set_sleeping(reason).is_err() {
             kerror!("sched", "invalid_sleep_transition"; from = task.state().name());
             return false;
         }
-        return true;
+        // CRITICAL: Mark task as needing full context restore. This prevents
+        // another CPU from scheduling this task via simple preemption (trap-frame
+        // swap) between sleep_current() returning and reschedule() being called.
+        // Without this, the task's kernel stack is still live on this CPU, but
+        // another CPU could ERET into its trap frame, running it on two CPUs.
+        task.mark_context_saved();
+        true
+    } else {
+        false
+    };
+    if ok {
+        sched.notify_blocked(slot);
     }
-    false
+    ok
 }
 
 /// Put current task into waiting state with deadline.
@@ -414,16 +523,23 @@ pub fn wait_current(reason: task::WaitReason, deadline: u64) -> bool {
         return false;
     }
 
-    if let Some(task) = sched.task_mut(slot) {
+    let (ok, pid) = if let Some(task) = sched.task_mut(slot) {
         if task.set_waiting(reason, deadline).is_err() {
             kerror!("sched", "invalid_wait_transition"; from = task.state().name());
             return false;
         }
-        kdebug!("sched", "blocked"; pid = task.id as u64, deadline = deadline);
+        // CRITICAL: Same as sleep_current — prevent simple preemption race
+        task.mark_context_saved();
+        (true, task.id)
+    } else {
+        (false, 0)
+    };
+    if ok {
+        sched.notify_blocked(slot);
+        kdebug!("sched", "blocked"; pid = pid as u64, deadline = deadline);
         sched.note_deadline(deadline);
-        return true;
     }
-    false
+    ok
 }
 
 /// Voluntarily yield the CPU to another task.
@@ -458,11 +574,18 @@ pub fn timer_tick(current_time: u64) {
     drop(sched);
 
     // Periodic liveness check (every LIVENESS_CHECK_INTERVAL ticks)
-    static mut LIVENESS_TICK_COUNTER: u64 = 0;
-    unsafe {
-        LIVENESS_TICK_COUNTER += 1;
-        if LIVENESS_TICK_COUNTER >= super::liveness::LIVENESS_CHECK_INTERVAL {
-            LIVENESS_TICK_COUNTER = 0;
+    // Uses atomic counter — multiple CPUs call timer_tick() concurrently.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static LIVENESS_TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let prev = LIVENESS_TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if prev + 1 >= super::liveness::LIVENESS_CHECK_INTERVAL {
+        // CAS to zero — only one CPU runs the liveness check
+        if LIVENESS_TICK_COUNTER.compare_exchange(
+            prev + 1,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ).is_ok() {
             let _ = super::liveness::check_liveness(current_time);
         }
     }

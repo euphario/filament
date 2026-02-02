@@ -709,28 +709,6 @@ impl ProcessObject {
         self.exit_code = code;
     }
 
-    /// Lazy check if target process has exited
-    /// Updates exit_code cache if target has exited
-    pub fn check_exit(&mut self) {
-        if self.exit_code.is_some() {
-            return; // Already cached
-        }
-
-        use crate::kernel::task;
-        let code = task::with_scheduler(|sched| {
-            if let Some(target_slot) = sched.slot_by_pid(self.pid) {
-                if let Some(target) = sched.task(target_slot) {
-                    target.state().exit_code()
-                } else {
-                    Some(-1)
-                }
-            } else {
-                // Task not found - was reaped
-                Some(-1)
-            }
-        });
-        self.exit_code = code;
-    }
 }
 
 
@@ -740,27 +718,11 @@ impl Pollable for ProcessObject {
             return PollResult::NONE;
         }
 
-        // Check cached exit code first
+        // Only use cached exit_code — set by notify_child_exit push model.
+        // No lazy scheduler queries. If notify_child_exit is missed for some
+        // exit path, this will never become readable, surfacing the bug
+        // immediately instead of masking it with a fallback.
         if self.exit_code().is_some() {
-            return PollResult::readable();
-        }
-
-        // Lazy check - see if target has exited
-        // Note: We can't mutate self here, so do a non-caching check
-        use crate::kernel::task;
-        let has_exited = task::with_scheduler(|sched| {
-            if let Some(target_slot) = sched.slot_by_pid(self.pid()) {
-                if let Some(target) = sched.task(target_slot) {
-                    target.state().exit_code().is_some()
-                } else {
-                    true // No task in slot
-                }
-            } else {
-                true // Slot not found - task was reaped
-            }
-        });
-
-        if has_exited {
             PollResult::readable()
         } else {
             PollResult::NONE
@@ -819,12 +781,6 @@ impl PortObject {
         crate::kernel::ipc::port_is_listening(self.port_id)
     }
 
-    /// Check if port is closed (queries ipc backend)
-    pub fn is_closed(&self) -> bool {
-        !crate::kernel::ipc::port_exists(self.port_id)
-            || !crate::kernel::ipc::port_is_listening(self.port_id)
-    }
-
     /// Get the port name
     pub fn name(&self) -> &[u8] { &self.name[..self.name_len as usize] }
 
@@ -845,8 +801,8 @@ impl PortObject {
 
 impl Pollable for PortObject {
     fn poll(&self, filter: u8) -> PollResult {
-        // Query ipc backend for state (single source of truth)
-        if self.is_closed() {
+        // Single query to ipc backend (single source of truth)
+        if !self.is_listening() {
             return PollResult::closed();
         }
 
@@ -876,6 +832,17 @@ impl Pollable for PortObject {
 // Memory Objects (mappable)
 // ============================================================================
 
+/// Notification state for shared memory objects.
+///
+/// Replaces the old `notified: bool` with explicit states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShmemNotifyState {
+    /// No pending notification
+    Idle,
+    /// Notified — data available for reading
+    Notified,
+}
+
 /// Shared memory region
 pub struct ShmemObject {
     /// Region ID in shmem table (for cleanup and notifications)
@@ -888,13 +855,13 @@ pub struct ShmemObject {
     vaddr: u64,
     /// Wait queue for tasks waiting on notifications
     wait_queue: WaitQueue,
-    /// Notified flag - set by notify(), cleared by read/poll
-    notified: bool,
+    /// Notification state - set by notify(), cleared by acknowledge()
+    notify_state: ShmemNotifyState,
 }
 
 impl ShmemObject {
     pub fn new(shmem_id: u32, paddr: u64, size: usize, vaddr: u64) -> Self {
-        Self { shmem_id, paddr, size, vaddr, wait_queue: WaitQueue::new(), notified: false }
+        Self { shmem_id, paddr, size, vaddr, wait_queue: WaitQueue::new(), notify_state: ShmemNotifyState::Idle }
     }
     pub fn shmem_id(&self) -> u32 { self.shmem_id }
     pub fn paddr(&self) -> u64 { self.paddr }
@@ -918,8 +885,11 @@ impl ShmemObject {
     pub fn mux_subscriber(&self) -> Option<Subscriber> {
         self.wait_queue.first_subscriber()
     }
-    pub fn is_notified(&self) -> bool { self.notified }
-    pub fn set_notified(&mut self, notified: bool) { self.notified = notified; }
+    pub fn is_notified(&self) -> bool { self.notify_state == ShmemNotifyState::Notified }
+    /// Mark this shmem as notified (data available)
+    pub fn notify(&mut self) { self.notify_state = ShmemNotifyState::Notified; }
+    /// Acknowledge and clear the notification
+    pub fn acknowledge(&mut self) { self.notify_state = ShmemNotifyState::Idle; }
 }
 
 /// DMA pool
@@ -1263,6 +1233,8 @@ pub struct RingObject {
     wait_queue: WaitQueue,
     /// Is this the "creator" side (owns the physical memory)?
     is_creator: bool,
+    /// Shmem region ID for cleanup on close (0 = no tracking)
+    shmem_id: u32,
 }
 
 impl RingObject {
@@ -1277,6 +1249,7 @@ impl RingObject {
             peer_pid: None,
             wait_queue: WaitQueue::new(),
             is_creator: true,
+            shmem_id: 0,
         }
     }
 
@@ -1291,6 +1264,7 @@ impl RingObject {
             peer_pid: None,
             wait_queue: WaitQueue::new(),
             is_creator: false,
+            shmem_id: 0,
         }
     }
 
@@ -1308,8 +1282,11 @@ impl RingObject {
     pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
     pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
 
+    pub fn shmem_id(&self) -> u32 { self.shmem_id }
+
     pub(crate) fn set_vaddr(&mut self, vaddr: u64) { self.vaddr = vaddr; }
     pub(crate) fn set_peer_pid(&mut self, pid: Option<u32>) { self.peer_pid = pid; }
+    pub(crate) fn set_shmem_id(&mut self, id: u32) { self.shmem_id = id; }
 
     /// Calculate TX ring offset from base
     pub fn tx_ring_offset(&self) -> usize {
@@ -1564,7 +1541,7 @@ mod tests {
     // ChannelObject.is_open() and is_closed() query ipc::channel_exists/is_closed
 
     // Port state is now queried from ipc backend - no local enum to test
-    // PortObject.is_listening() and is_closed() query ipc::port_exists/is_listening
+    // PortObject.is_listening() queries ipc::port_is_listening
 
     // ProcessObject tests
     #[test]

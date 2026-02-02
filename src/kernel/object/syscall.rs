@@ -189,52 +189,83 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         return KernelError::BadHandle.to_errno();
     };
 
+    // Pending actions to perform after table lock is released.
+    // Channel wake and shmem notify both need to acquire per-task table locks,
+    // so they must not run while the caller's table lock is held (deadlock if peer == self).
+    enum PendingAction {
+        None,
+        ShmemNotify(u32, u32), // (shmem_id, caller_pid)
+        ChannelWake(ChannelWriteResult),
+    }
+
     // Use ObjectService's tables for dispatch
-    // For Shmem NOTIFY, we need to call notify_shmem_objects AFTER releasing the lock
-    // So we return (result, Option<(shmem_id, caller_pid)>) from the closure
     let result = object_service().with_table_mut(task_id, |table| {
         let Some(entry) = table.get_mut(handle) else {
-            return (KernelError::BadHandle.to_errno(), None);
+            return (KernelError::BadHandle.to_errno(), PendingAction::None);
         };
 
         if !entry.object_type.is_writable() {
-            return (KernelError::NotSupported.to_errno(), None);
+            return (KernelError::NotSupported.to_errno(), PendingAction::None);
         }
 
         // Dispatch to type-specific write
         match &mut entry.object {
-            Object::Channel(ch) => (write_channel(ch, buf_ptr, buf_len), None),
-            Object::Timer(t) => (write_timer(t, buf_ptr, buf_len), None),
+            Object::Channel(ch) => {
+                let r = write_channel(ch, buf_ptr, buf_len);
+                let errno = r.errno;
+                if r.peer.is_some() {
+                    (errno, PendingAction::ChannelWake(r))
+                } else {
+                    (errno, PendingAction::None)
+                }
+            }
+            Object::Timer(t) => (write_timer(t, buf_ptr, buf_len), PendingAction::None),
             Object::Shmem(s) => {
                 let shmem_id = s.shmem_id();
                 let res = write_shmem(s, buf_ptr, buf_len, task_id);
                 // Check if this was a NOTIFY command (buf_len == 1 and first byte == 1)
                 // If so, return shmem_id for deferred notify_shmem_objects call
-                let pending_notify = if buf_len == 1 {
+                let pending = if buf_len == 1 {
                     let mut cmd = [0u8; 1];
                     if uaccess::copy_from_user(&mut cmd, buf_ptr).is_ok() && cmd[0] == 1 {
-                        Some((shmem_id, task_id))
+                        PendingAction::ShmemNotify(shmem_id, task_id)
                     } else {
-                        None
+                        PendingAction::None
                     }
                 } else {
-                    None
+                    PendingAction::None
                 };
-                (res, pending_notify)
+                (res, pending)
             }
-            Object::Console(c) => (write_console(c, buf_ptr, buf_len), None),
-            Object::Mux(m) => (write_mux(m, buf_ptr, buf_len), None),
-            Object::PciDevice(d) => (write_pci_device(d, buf_ptr, buf_len, task_id), None),
-            Object::Ring(r) => (write_ring(r, buf_ptr, buf_len, task_id), None),
-            _ => (KernelError::NotSupported.to_errno(), None),
+            Object::Console(c) => (write_console(c, buf_ptr, buf_len), PendingAction::None),
+            Object::Mux(m) => (write_mux(m, buf_ptr, buf_len), PendingAction::None),
+            Object::PciDevice(d) => (write_pci_device(d, buf_ptr, buf_len, task_id), PendingAction::None),
+            Object::Ring(r) => (write_ring(r, buf_ptr, buf_len, task_id), PendingAction::None),
+            _ => (KernelError::NotSupported.to_errno(), PendingAction::None),
         }
     });
 
     match result {
-        Ok((errno, pending_notify)) => {
-            // Handle deferred notify_shmem_objects AFTER lock is released
-            if let Some((shmem_id, caller_pid)) = pending_notify {
-                notify_shmem_objects(shmem_id, caller_pid);
+        Ok((errno, pending)) => {
+            // Handle deferred actions AFTER table lock is released
+            match pending {
+                PendingAction::ShmemNotify(shmem_id, caller_pid) => {
+                    notify_shmem_objects(shmem_id, caller_pid);
+                }
+                PendingAction::ChannelWake(r) => {
+                    if let Some(peer) = r.peer {
+                        // Wake peer's ChannelObject via ObjectService WaitQueue
+                        let wake_list = object_service().wake_channel(
+                            peer.task_id, peer.channel_id, super::poll::READABLE,
+                        );
+                        waker::wake(&wake_list, ipc::WakeReason::Readable);
+                    }
+                    // Kernel bus channels are dispatched synchronously
+                    if let Some((buf, len, channel_id)) = r.bus_data {
+                        crate::kernel::bus::process_bus_message(channel_id, &buf[..len]);
+                    }
+                }
+                PendingAction::None => {}
             }
             errno
         }
@@ -947,14 +978,6 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
 /// This is the proper blocking recv() implementation. Instead of returning WouldBlock,
 /// it subscribes to the channel, blocks the task, and waits for data.
 fn read_channel_blocking(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
-    use crate::kernel::ipc::traits::Subscriber;
-
-    let slot = task::current_slot();
-    let _subscriber = Subscriber {
-        task_id,
-        generation: task::Scheduler::generation_from_pid(task_id),
-    };
-
     // Main loop - keep trying until we have data or peer closes
     loop {
         // Phase 1: Get channel_id and check if closed
@@ -1016,43 +1039,15 @@ fn read_channel_blocking(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: us
         }
 
         // Phase 4: No data available - block the task
-        let transition_ok = task::with_scheduler(|sched| {
-            let Some(task) = sched.task_mut(slot) else {
-                return false;
-            };
-
-            match task.state() {
-                task::TaskState::Running => {
-                    // Normal case - block
-                }
-                task::TaskState::Ready => {
-                    // Preempted - set back to running first
-                    if task.set_running().is_err() {
-                        return false;
-                    }
-                }
-                task::TaskState::Sleeping { .. } | task::TaskState::Waiting { .. } => {
-                    // Already blocked
-                    return true;
-                }
-                _ => {
-                    return false;
-                }
-            }
-
-            task.set_sleeping(crate::kernel::task::SleepReason::ChannelRecv).is_ok()
-        });
-
-        if !transition_ok {
-            // Failed to block - return error
+        // Phase 5: Atomically block and context switch to another task.
+        // Uses sleep_and_reschedule to prevent SMP race where another CPU
+        // wakes+schedules us before our kernel context is saved.
+        if !crate::kernel::sched::sleep_and_reschedule(
+            crate::kernel::task::SleepReason::ChannelRecv
+        ) {
             return KernelError::WouldBlock.to_errno();
         }
-
-        // Phase 5: Context switch to another task
         // When we're woken, we'll loop back and try to receive again
-        task::with_scheduler(|sched| {
-            sched.schedule();
-        });
     }
 }
 
@@ -1577,37 +1572,49 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
     }
 
     // ── Phase 2: Block (task sleeps until event or timeout) ──
+    // NOTE: Mux blocking cannot use sleep_and_reschedule() because it needs
+    // a post-block re-poll to catch events that arrived between the poll and
+    // the state transition. The blocking and rescheduling must be separate
+    // steps to allow this race-detection window.
     let transition_ok = task::with_scheduler(|sched| {
-        let Some(task) = sched.task_mut(slot) else {
-            return false;
-        };
+        // First pass: check state and do transition
+        let ok = {
+            let Some(task) = sched.task_mut(slot) else {
+                return false;
+            };
 
-        // Handle task state at block point
-        match task.state() {
-            task::TaskState::Running => {}
-            task::TaskState::Ready => {
-                if task.set_running().is_err() {
-                    return false;
+            // Handle task state at block point
+            match task.state() {
+                task::TaskState::Running => {}
+                task::TaskState::Ready => {
+                    if task.set_running().is_err() {
+                        return false;
+                    }
                 }
+                task::TaskState::Sleeping { .. } | task::TaskState::Waiting { .. } => {
+                    return true; // Already blocked
+                }
+                _ => return false,
             }
-            task::TaskState::Sleeping { .. } | task::TaskState::Waiting { .. } => {
-                return true; // Already blocked
-            }
-            _ => return false,
-        }
 
-        if earliest_deadline == u64::MAX {
-            // No timeout → sleep until event
-            task.set_sleeping(crate::kernel::task::SleepReason::EventLoop).is_ok()
-        } else {
-            // Timeout or timer deadline → wait with deadline
-            if task.set_waiting(crate::kernel::task::WaitReason::TimedEvent, earliest_deadline).is_ok() {
-                sched.note_deadline(earliest_deadline);
-                true
+            if earliest_deadline == u64::MAX {
+                task.set_sleeping(crate::kernel::task::SleepReason::EventLoop).is_ok()
             } else {
-                false
+                task.set_waiting(crate::kernel::task::WaitReason::TimedEvent, earliest_deadline).is_ok()
+            }
+        }; // task borrow ends here
+
+        if ok {
+            if earliest_deadline != u64::MAX {
+                sched.note_deadline(earliest_deadline);
+            }
+            // CRITICAL: Prevent simple preemption race — another CPU must not
+            // schedule this task via trap-frame swap while our kernel stack is live.
+            if let Some(task) = sched.task_mut(slot) {
+                task.mark_context_saved();
             }
         }
+        ok
     });
 
     if !transition_ok {
@@ -1647,6 +1654,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                         crate::transition_or_evict!(task, set_running);
                     }
                 }
+                // Clear flag since we're NOT context switching (self-wake path)
+                task.mark_context_restored();
             }
         });
     } else {
@@ -1768,22 +1777,14 @@ fn poll_watched_object(obj: &Object, filter: u8, channel_id: u32) -> bool {
     }
 }
 
-/// Poll a watched object (mutable, can consume timer state).
+/// Poll a watched object (mutable, can consume timer/shmem state).
+///
+/// For Timer and Shmem objects, this consumes the ready state (fires/acknowledges).
+/// For all other object types, delegates to the immutable poll_watched_object().
 fn poll_watched_object_mut(entry: &mut super::handle::HandleEntry, filter: u8, channel_id: u32, current_tick: u64) -> bool {
     use super::types::filter as f;
 
     match &mut entry.object {
-        Object::Channel(_) => {
-            let is_closed = channel_id == 0
-                || !ipc::channel_exists(channel_id)
-                || ipc::channel_is_closed(channel_id);
-            let has_messages = channel_id != 0 && ipc::channel_has_messages(channel_id);
-            ((filter & f::CLOSED) != 0 && is_closed)
-                || ((filter & f::READABLE) != 0 && (has_messages || is_closed))
-        }
-        Object::Port(p) => {
-            (filter & f::READABLE) != 0 && ipc::port_has_pending(p.port_id())
-        }
         Object::Timer(t) => {
             if (filter & f::READABLE) != 0 {
                 let state = t.state();
@@ -1801,45 +1802,44 @@ fn poll_watched_object_mut(entry: &mut super::handle::HandleEntry, filter: u8, c
                 false
             }
         }
-        Object::Console(c) => {
-            match c.console_type() {
-                ConsoleType::Stdin => (filter & f::READABLE) != 0 && uart::rx_buffer_has_data(),
-                ConsoleType::Stdout | ConsoleType::Stderr => (filter & f::WRITABLE) != 0,
-            }
-        }
-        Object::Process(p) => {
-            (filter & f::READABLE) != 0 && p.poll(f::READABLE).is_ready()
-        }
         Object::Shmem(s) => {
             if (filter & f::READABLE) != 0 && s.is_notified() {
-                s.set_notified(false);
+                s.acknowledge();
                 true
             } else {
                 false
             }
         }
-        Object::Ring(r) => {
-            r.poll(filter).is_ready()
-        }
-        _ => false,
+        _ => poll_watched_object(&entry.object, filter, channel_id),
     }
 }
 
 // Write implementations
-fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> i64 {
+/// Pending wake action from write_channel, processed after table lock is released.
+/// This avoids deadlocking when peer is in the same process (same per-task table lock).
+struct ChannelWriteResult {
+    errno: i64,
+    peer: Option<ipc::PeerInfo>,
+    is_bus_channel: bool,
+    bus_data: Option<([u8; ipc::MAX_INLINE_PAYLOAD], usize, u32)>, // (buf, len, channel_id)
+}
+
+fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> ChannelWriteResult {
+    let fail = |e: i64| ChannelWriteResult { errno: e, peer: None, is_bus_channel: false, bus_data: None };
+
     // Check state - can only write to Open channel (queries ipc backend)
     if !ch.is_open() {
-        return KernelError::PeerClosed.to_errno();
+        return fail(KernelError::PeerClosed.to_errno());
     }
 
     let channel_id = ch.channel_id();
     if channel_id == 0 {
-        return KernelError::PeerClosed.to_errno();
+        return fail(KernelError::PeerClosed.to_errno());
     }
 
     // Limit message size
     if buf_len > ipc::MAX_INLINE_PAYLOAD {
-        return KernelError::InvalidArg.to_errno();
+        return fail(KernelError::InvalidArg.to_errno());
     }
 
     let pid = task::with_scheduler(|sched| {
@@ -1849,14 +1849,14 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
         }
     });
     if pid == 0 {
-        return KernelError::BadHandle.to_errno();
+        return fail(KernelError::BadHandle.to_errno());
     }
 
     // Copy from user buffer (use MAX_INLINE_PAYLOAD to support block transfers)
     let mut kernel_buf = [0u8; ipc::MAX_INLINE_PAYLOAD];
     let copy_len = core::cmp::min(buf_len, kernel_buf.len());
     if uaccess::copy_from_user(&mut kernel_buf[..copy_len], buf_ptr).is_err() {
-        return KernelError::BadAddress.to_errno();
+        return fail(KernelError::BadAddress.to_errno());
     }
 
     // Create message and send via ipc
@@ -1867,27 +1867,25 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
 
     match ipc::send(channel_id, msg, pid) {
         Ok(peer) => {
-            // Wake peer's ChannelObject via ObjectService WaitQueue
-            let wake_list = object_service().wake_channel(
-                peer.task_id, peer.channel_id, super::poll::READABLE,
-            );
-            waker::wake(&wake_list, ipc::WakeReason::Readable);
-
-            // Kernel bus channels are dispatched synchronously — the bus
-            // controller processes the message here rather than reading
-            // from its channel queue.
-            if is_bus_channel {
-                crate::kernel::bus::process_bus_message(channel_id, &kernel_buf[..copy_len]);
+            // Return peer info for deferred wake (after table lock is released)
+            let bus_data = if is_bus_channel {
+                Some((kernel_buf, copy_len, channel_id))
+            } else {
+                None
+            };
+            ChannelWriteResult {
+                errno: copy_len as i64,
+                peer: Some(peer),
+                is_bus_channel,
+                bus_data,
             }
-
-            copy_len as i64
         }
-        Err(ipc::IpcError::QueueFull) => KernelError::WouldBlock.to_errno(),
+        Err(ipc::IpcError::QueueFull) => fail(KernelError::WouldBlock.to_errno()),
         Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
             // Backend already knows about peer close
-            KernelError::PeerClosed.to_errno()
+            fail(KernelError::PeerClosed.to_errno())
         }
-        Err(_) => KernelError::BadHandle.to_errno(),
+        Err(_) => fail(KernelError::BadHandle.to_errno()),
     }
 }
 
@@ -2036,7 +2034,7 @@ fn notify_shmem_objects(shmem_id: u32, caller_pid: u32) {
             for (_handle, entry) in table.iter_mut() {
                 if let Object::Shmem(ref mut s) = entry.object {
                     if s.shmem_id() == shmem_id {
-                        s.set_notified(true);
+                        s.notify();
                         return s.mux_subscriber();
                     }
                 }
@@ -2081,7 +2079,7 @@ pub fn mark_shmem_notified_for_task(task_pid: u32, shmem_id: u32) {
         for (_handle, entry) in table.iter_mut() {
             if let Object::Shmem(ref mut s) = entry.object {
                 if s.shmem_id() == shmem_id {
-                    s.set_notified(true);
+                    s.notify();
                     return;
                 }
             }
@@ -2096,19 +2094,17 @@ fn write_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize) -> 
             if buf_len == 0 {
                 return 0;
             }
-            // Limit buffer size
-            if buf_len > 4096 {
-                return KernelError::InvalidArg.to_errno();
-            }
-            // Copy from user
-            let mut kernel_buf = [0u8; 4096];
-            if uaccess::copy_from_user(&mut kernel_buf[..buf_len], buf_ptr).is_err() {
+            // Limit buffer size to 512 bytes per write to keep stack usage bounded.
+            // Userspace can issue multiple writes for larger outputs.
+            let write_len = buf_len.min(512);
+            let mut kernel_buf = [0u8; 512];
+            if uaccess::copy_from_user(&mut kernel_buf[..write_len], buf_ptr).is_err() {
                 return KernelError::BadAddress.to_errno();
             }
             // Write to UART and flush
-            uart::write_buffered(&kernel_buf[..buf_len]);
+            uart::write_buffered(&kernel_buf[..write_len]);
             uart::flush_buffer();
-            buf_len as i64
+            write_len as i64
         }
         ConsoleType::Stdin => KernelError::NotSupported.to_errno(),
     }
@@ -2353,7 +2349,8 @@ fn open_ring(params_ptr: u64, params_len: usize) -> i64 {
     };
 
     // Create RingObject and add to handle table
-    let ring = super::RingObject::new_creator(paddr, total_size, tx_config, rx_config);
+    let mut ring = super::RingObject::new_creator(paddr, total_size, tx_config, rx_config);
+    ring.set_shmem_id(shmem_id);
 
     match object_service().open_ring(task_id, ring, shmem_id) {
         Ok(handle) => handle.raw() as i64,
@@ -2455,7 +2452,7 @@ fn map_ring(r: &mut super::RingObject, _task_id: u32) -> i64 {
 }
 
 /// Close Ring and cleanup
-fn close_ring(r: super::RingObject, _owner: u32) {
+fn close_ring(r: super::RingObject, owner: u32) {
     // If mapped, unmap from caller's address space
     if r.vaddr() != 0 {
         task::with_scheduler(|sched| {
@@ -2473,7 +2470,8 @@ fn close_ring(r: super::RingObject, _owner: u32) {
         waker::wake(&wake_list, ipc::WakeReason::Closed);
     }
 
-    // Note: The backing shmem will be cleaned up when the shmem refcount drops to 0
-    // For now, we don't track the shmem_id in RingObject, so the memory persists
-    // until the process exits. This is acceptable for the initial implementation.
+    // Free the backing shmem region if this is the creator side
+    if r.is_creator() && r.shmem_id() != 0 {
+        let _ = shmem::destroy(r.shmem_id(), owner);
+    }
 }

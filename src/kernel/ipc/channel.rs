@@ -122,6 +122,16 @@ impl ChannelState {
 // Channel
 // ============================================================================
 
+/// How writes on a channel are dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchMode {
+    /// Normal IPC — messages queued for peer
+    Peer,
+    /// Kernel bus dispatch — writes are intercepted by kernel bus controller.
+    /// Set for client channels connected to /kernel/bus/* ports.
+    KernelBus,
+}
+
 /// A complete channel endpoint
 ///
 /// Contains the state machine and message queue.
@@ -139,10 +149,8 @@ pub struct Channel {
     /// Incoming message queue
     queue: MessageQueue,
 
-    /// When true, writes on this channel are dispatched to the kernel bus
-    /// controller synchronously. Set for client channels connected to
-    /// /kernel/bus/* ports.
-    kernel_dispatch: bool,
+    /// How writes on this channel are dispatched.
+    dispatch_mode: DispatchMode,
 }
 
 impl Channel {
@@ -153,7 +161,7 @@ impl Channel {
             owner,
             state: ChannelState::Open { peer_id, peer_owner },
             queue: MessageQueue::new(),
-            kernel_dispatch: false,
+            dispatch_mode: DispatchMode::Peer,
         }
     }
 
@@ -164,7 +172,7 @@ impl Channel {
             owner: 0,
             state: ChannelState::Closed,
             queue: MessageQueue::new(),
-            kernel_dispatch: false,
+            dispatch_mode: DispatchMode::Peer,
         }
     }
 
@@ -194,12 +202,12 @@ impl Channel {
 
     /// Check if writes on this channel dispatch to a kernel bus controller
     pub fn is_kernel_dispatch(&self) -> bool {
-        self.kernel_dispatch
+        self.dispatch_mode == DispatchMode::KernelBus
     }
 
     /// Mark this channel for kernel bus dispatch
     pub fn set_kernel_dispatch(&mut self) {
-        self.kernel_dispatch = true;
+        self.dispatch_mode = DispatchMode::KernelBus;
     }
 
     /// Get message queue reference

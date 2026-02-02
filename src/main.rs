@@ -131,6 +131,9 @@ pub extern "C" fn kmain() -> ! {
     kinfo!("mmu", "status"; ttbr0 = "user", ttbr1 = "kernel");
     mmu::print_info();
 
+    // Set up guard pages for boot stack (splits 2MB L2 block into L3 4KB pages)
+    mmu::setup_guard_pages();
+
     // Physical memory manager
     {
         let _span = span!("pmm", "init");
@@ -228,8 +231,7 @@ pub extern "C" fn kmain() -> ! {
         task::test();
         kernel::syscall::test();
         kernel::process::test();
-        // IPC tests via ipc module
-        // kernel::ipc::test(); // TODO: Add ipc unit tests
+        // IPC tests covered by object system tests in kernel::syscall::test()
         elf::test();
         smp::test();
 
@@ -288,13 +290,13 @@ pub extern "C" fn kmain() -> ! {
                 kinfo!("kernel", "devd_spawned"; slot = slot);
                 klog::flush();
                 // Give devd ALL capabilities, high priority, and mark as init process
-                unsafe {
-                    if let Some(task) = task::scheduler().task_mut(slot) {
+                task::with_scheduler(|sched| {
+                    if let Some(task) = sched.task_mut(slot) {
                         task.set_capabilities(kernel::caps::Capabilities::ALL);
                         task.set_priority(task::Priority::High);  // devd is critical
                         task.is_init = true;  // Mark as init for heartbeat watchdog
                     }
-                }
+                });
                 Some(slot)
             }
             Err(e) => {
@@ -542,7 +544,7 @@ pub extern "C" fn ttbr0_zero_diagnostic(caller_id: u64) {
                 print_str_uart("  addr_space: NONE\r\n");
             }
             print_str_uart("  needs_context_restore: ");
-            print_hex_uart(task.needs_context_restore as u64);
+            print_hex_uart(task.needs_context_restore() as u64);
             print_str_uart("\r\n");
         } else {
             print_str_uart("  Slot is EMPTY\r\n");
@@ -753,7 +755,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                     if slot_idx != 0 {  // Extra safety: skip idle (slot 0)
                         // Cleanup resources
                         kernel::bus::process_cleanup(pid);
-                        kernel::shmem::process_cleanup(pid);
+                        kernel::shmem::begin_cleanup(pid);
+                kernel::shmem::finalize_cleanup(pid);
                         kernel::irq::process_cleanup(pid);
                         kernel::pci::release_all_devices(pid);
                         let port_wake = kernel::ipc::port_cleanup_task(pid);
@@ -917,7 +920,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
             // resume its kernel execution. Fall through to idle which will properly
             // context_switch to it.
             let needs_context_switch = sched.task(next_slot)
-                .map(|t| t.needs_context_restore)
+                .map(|t| t.needs_context_restore())
                 .unwrap_or(false);
 
             if needs_context_switch {
@@ -1052,36 +1055,44 @@ pub extern "C" fn recover_devd() {
     print_str_uart("\r\n=== DEVD RECOVERY ===\r\n");
     print_str_uart("  Attempting recovery...\r\n");
 
-    // Step 1: Kill all tasks and free slots immediately
+    // Step 1: Collect PIDs under scheduler lock, then clean up without it.
+    // Cleanup functions (shmem, ipc, bus) internally acquire the scheduler
+    // lock, so we must NOT hold it during cleanup — that would deadlock.
     print_str_uart("  Killing all tasks...\r\n");
+
+    // Phase 1a: Collect PIDs and clear slots under lock
+    let mut pids_to_clean: [u32; kernel::task::MAX_TASKS] = [0; kernel::task::MAX_TASKS];
+    let mut count = 0usize;
     unsafe {
         let mut sched = kernel::task::scheduler();
-        // Start from slot 1 - slot 0 is the idle task which must never be killed
         for slot_idx in 1..kernel::task::MAX_TASKS {
             if let Some(task) = sched.task(slot_idx) {
-                let pid = task.id;
-                // Cleanup resources
-                kernel::bus::process_cleanup(pid);
-                kernel::shmem::process_cleanup(pid);
-                kernel::irq::process_cleanup(pid);
-                kernel::pci::release_all_devices(pid);
-                let port_wake = kernel::ipc::port_cleanup_task(pid);
-                kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
-                let ipc_peers = kernel::ipc::process_cleanup(pid);
-                for peer in ipc_peers.iter() {
-                    let wake_list = kernel::object_service::object_service()
-                        .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
-                    kernel::ipc::waker::wake(&wake_list, kernel::ipc::WakeReason::Closed);
-                }
-
-                // Clean up ObjectService tables
-                kernel::object_service::object_service().remove_task_table(pid);
-
-                // Free slot (bump generation to invalidate stale PIDs)
+                pids_to_clean[count] = task.id;
+                count += 1;
                 sched.bump_generation(slot_idx);
                 sched.clear_slot(slot_idx);
             }
         }
+    }
+    // Scheduler lock released here
+
+    // Phase 1b: Clean up resources for each PID without holding scheduler lock
+    for i in 0..count {
+        let pid = pids_to_clean[i];
+        kernel::bus::process_cleanup(pid);
+        kernel::shmem::begin_cleanup(pid);
+                kernel::shmem::finalize_cleanup(pid);
+        kernel::irq::process_cleanup(pid);
+        kernel::pci::release_all_devices(pid);
+        let port_wake = kernel::ipc::port_cleanup_task(pid);
+        kernel::ipc::waker::wake(&port_wake, kernel::ipc::WakeReason::Closed);
+        let ipc_peers = kernel::ipc::process_cleanup(pid);
+        for peer in ipc_peers.iter() {
+            let wake_list = kernel::object_service::object_service()
+                .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
+            kernel::ipc::waker::wake(&wake_list, kernel::ipc::WakeReason::Closed);
+        }
+        kernel::object_service::object_service().remove_task_table(pid);
     }
 
     // Step 2: Reset all buses to Safe state

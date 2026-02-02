@@ -154,6 +154,19 @@ pub const MAX_SHMEM_PER_TASK: u16 = 16;
 /// At 100 ticks/sec, 10 ticks = 100ms grace period for servers to release resources
 pub const CLEANUP_GRACE_TICKS: u8 = 10;
 
+/// Context restore state — tracks whether a task's kernel context needs restoring.
+///
+/// Replaces the old `needs_context_restore: bool` with explicit states:
+/// - `Fresh` — task was just created or its context was restored
+/// - `Saved` — task's kernel context was saved by context_switch and needs restoring
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextRestoreState {
+    /// Task was just created or context was restored — no pending restore needed
+    Fresh,
+    /// Task's kernel context was saved by context_switch and needs restoring
+    Saved,
+}
+
 /// Task Control Block
 ///
 /// Fields are private to enforce access through methods.
@@ -220,10 +233,10 @@ pub struct Task {
     pub(crate) last_activity_tick: u64,
     /// Storm protection state (syscall/wake rate limiting)
     pub(crate) storm: crate::kernel::storm::StormState,
-    /// True if this task needs its kernel context restored via context_switch.
-    /// Set when task blocks and context_switch saves its context.
-    /// Cleared when context_switch restores its context.
-    pub(crate) needs_context_restore: bool,
+    /// Whether this task needs its kernel context restored via context_switch.
+    /// Set to Saved when task blocks and context_switch saves its context.
+    /// Set to Fresh when context_switch restores its context.
+    context_restore: ContextRestoreState,
 }
 
 /// Trampoline for new user tasks.
@@ -326,7 +339,7 @@ impl Task {
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
-            needs_context_restore: true,  // Kernel task always uses CpuContext
+            context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
         })
     }
 
@@ -377,7 +390,7 @@ impl Task {
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
-            needs_context_restore: true,  // Kernel task always uses CpuContext
+            context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
         }
     }
 
@@ -447,7 +460,7 @@ impl Task {
             liveness_state: crate::kernel::liveness::LivenessState::Normal,
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
-            needs_context_restore: true,
+            context_restore: ContextRestoreState::Saved,
         })
     }
 
@@ -693,6 +706,28 @@ impl Task {
     // ========================================================================
     // These methods hide internal field access from syscall handlers.
     // Syscalls should use these instead of accessing fields directly.
+
+    // ========================================================================
+    // Context Restore State API
+    // ========================================================================
+
+    /// Mark that this task's kernel context was saved and needs restoring.
+    #[inline]
+    pub(crate) fn mark_context_saved(&mut self) {
+        self.context_restore = ContextRestoreState::Saved;
+    }
+
+    /// Mark that this task's kernel context was restored (or is fresh).
+    #[inline]
+    pub(crate) fn mark_context_restored(&mut self) {
+        self.context_restore = ContextRestoreState::Fresh;
+    }
+
+    /// Check whether this task needs its kernel context restored via context_switch.
+    #[inline]
+    pub(crate) fn needs_context_restore(&self) -> bool {
+        self.context_restore == ContextRestoreState::Saved
+    }
 
     /// Record syscall activity for liveness tracking
     /// Called at syscall entry to prove task is responsive
