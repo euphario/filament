@@ -50,6 +50,10 @@ enum Commands {
         /// Target platform: mt7988a (default) or qemu
         #[arg(long, default_value = "mt7988a")]
         platform: String,
+
+        /// Include stress test programs (testr, test_*)
+        #[arg(long)]
+        stress: bool,
     },
 
     /// Run in QEMU
@@ -65,7 +69,14 @@ enum Commands {
         /// Enable self-tests
         #[arg(short, long)]
         test: bool,
+
+        /// Include stress test programs
+        #[arg(long)]
+        stress: bool,
     },
+
+    /// Run stress tests in QEMU (build, run, parse results)
+    Test,
 
     /// Create/recreate QEMU USB disk image with FAT16 filesystem
     QemuUsb {
@@ -89,17 +100,20 @@ fn main() -> Result<()> {
     let project_root = project_root()?;
 
     match cli.command {
-        Commands::Build { test, firmware, skip_user, only, platform } => {
-            cmd_build(&project_root, test, firmware, skip_user, only, &platform)?;
+        Commands::Build { test, firmware, skip_user, only, platform, stress } => {
+            cmd_build(&project_root, test, firmware, skip_user, only, &platform, stress)?;
         }
-        Commands::Qemu { no_build, gdb, test } => {
-            cmd_qemu(&project_root, !no_build, gdb, test)?;
+        Commands::Qemu { no_build, gdb, test, stress } => {
+            cmd_qemu(&project_root, !no_build, gdb, test, stress)?;
         }
         Commands::QemuUsb { force, size } => {
             cmd_qemu_usb(force, size)?;
         }
         Commands::Clean => {
             cmd_clean(&project_root)?;
+        }
+        Commands::Test => {
+            cmd_test(&project_root)?;
         }
     }
 
@@ -129,6 +143,7 @@ fn cmd_build(
     skip_user: bool,
     only: Vec<String>,
     platform: &str,
+    stress: bool,
 ) -> Result<()> {
     let build_type = if test { "Development (self-tests)" } else { "Production" };
     let firmware_mode = if firmware { "Embedded" } else { "USB" };
@@ -152,7 +167,7 @@ fn cmd_build(
 
     // Step 1: Build user programs
     if !skip_user {
-        build_user(root, &only, platform)?;
+        build_user(root, &only, platform, stress)?;
     } else {
         println!("Step 1: Skipping user programs (--skip-user)");
     }
@@ -246,7 +261,7 @@ fn build_dtb(root: &Path) -> Result<()> {
 }
 
 /// Build user programs
-fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
+fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Result<()> {
     let user_dir = root.join("user");
 
     // Core programs (built for all platforms)
@@ -266,6 +281,15 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
         all_programs.push(("ipd", "driver/ipd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
         all_programs.push(("vfsd", "driver/vfsd"));
+    }
+
+    // Stress test programs (QEMU only)
+    if stress && (platform == "qemu" || platform == "qemu-virt") {
+        all_programs.push(("testr", "test/testr"));
+        all_programs.push(("test_ipc_flood", "test/test_ipc_flood"));
+        all_programs.push(("test_spawn_storm", "test/test_spawn_storm"));
+        all_programs.push(("test_mux_stress", "test/test_mux_stress"));
+        all_programs.push(("test_exit_ok", "test/test_exit_ok"));
     }
 
     let programs: Vec<_> = if only.is_empty() {
@@ -290,14 +314,20 @@ fn build_user(root: &Path, only: &[String], platform: &str) -> Result<()> {
     fs::create_dir_all(&bin_dir)?;
 
     for (name, path) in &programs {
-        build_user_program(root, name, path)?;
+        // Build devd with stress-test feature when stress mode is active
+        let features = if stress && *name == "devd" {
+            Some("stress-test")
+        } else {
+            None
+        };
+        build_user_program(root, name, path, features)?;
     }
 
     Ok(())
 }
 
 /// Build a single user program
-fn build_user_program(root: &Path, name: &str, path: &str) -> Result<()> {
+fn build_user_program(root: &Path, name: &str, path: &str, features: Option<&str>) -> Result<()> {
     let user_dir = root.join("user");
     let prog_dir = user_dir.join(path);
     let bin_dir = user_dir.join("bin");
@@ -320,12 +350,17 @@ fn build_user_program(root: &Path, name: &str, path: &str) -> Result<()> {
 
     // Use nightly toolchain for user programs (they need build-std for aarch64-unknown-none)
     // Clear CARGO_BUILD_TARGET to let the user programs use their own target from .cargo/config.toml
-    let output = Command::new("cargo")
-        .args(["+nightly", "build", "--release"])
+    let mut cmd = Command::new("cargo");
+    cmd.args(["+nightly", "build", "--release"])
         .current_dir(&prog_dir)
         .env("CARGO_ENCODED_RUSTFLAGS", &rustflags)
-        .env_remove("CARGO_BUILD_TARGET")
-        .output()
+        .env_remove("CARGO_BUILD_TARGET");
+
+    if let Some(feat) = features {
+        cmd.args(["--features", feat]);
+    }
+
+    let output = cmd.output()
         .context(format!("Failed to run cargo for {}", name))?;
 
     if !output.status.success() {
@@ -561,9 +596,9 @@ fn create_binary(root: &Path) -> Result<()> {
 }
 
 /// Run in QEMU
-fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool) -> Result<()> {
+fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool, stress: bool) -> Result<()> {
     if build {
-        cmd_build(root, test, false, false, vec![], "qemu")?;
+        cmd_build(root, test, false, false, vec![], "qemu", stress)?;
     }
 
     println!();
@@ -963,6 +998,145 @@ fn create_nvme_disk(path: &str, size_mb: u32) -> Result<()> {
 
     println!("  Created: {} ({} MB, FAT16, 1 file)", path, size_mb);
     Ok(())
+}
+
+/// Run stress tests in QEMU
+///
+/// 1. Build with --platform qemu --stress
+/// 2. Spawn QEMU with minimal config (no USB/NVMe)
+/// 3. Capture UART output with 120s timeout
+/// 4. Parse STRESS_RESULT lines
+/// 5. Report pass/fail
+fn cmd_test(root: &Path) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+
+    println!("========================================");
+    println!("  Stress Test Runner");
+    println!("========================================");
+    println!();
+
+    // Step 1: Build with stress
+    cmd_build(root, false, false, false, vec![], "qemu", true)?;
+
+    println!();
+    println!("Running stress tests in QEMU...");
+    println!();
+
+    // Step 2: Spawn QEMU (minimal — no USB/NVMe)
+    let kernel_path = root.join("kernel.bin");
+    if !kernel_path.exists() {
+        bail!("kernel.bin not found");
+    }
+
+    let kernel_str = kernel_path.to_string_lossy().to_string();
+    let mut child = Command::new("qemu-system-aarch64")
+        .args([
+            "-M", "virt,gic-version=3",
+            "-cpu", "cortex-a72",
+            "-smp", "2",
+            "-m", "512M",
+            "-nographic",
+            "-kernel", &kernel_str,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to spawn QEMU")?;
+
+    // Step 3: Read UART output with timeout
+    let stdout = child.stdout.take().context("No stdout")?;
+    let reader = BufReader::new(stdout);
+
+    let mut results: Vec<(String, bool)> = Vec::new();
+    let mut saw_start = false;
+    let mut saw_done = false;
+    let mut _final_exit_code: Option<u8> = None;
+
+    // Spawn a timeout killer: after 120s, kill QEMU via `kill` command
+    let pid = child.id();
+    let timeout_handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        eprintln!("TIMEOUT: killing QEMU (pid {})", pid);
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    });
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        // Echo QEMU output
+        println!("{}", line);
+
+        let trimmed = line.trim();
+
+        if trimmed == "STRESS_START" {
+            saw_start = true;
+        } else if trimmed.starts_with("STRESS_RESULT: ") {
+            let rest = &trimmed["STRESS_RESULT: ".len()..];
+            if let Some(idx) = rest.find(' ') {
+                let name = rest[..idx].to_string();
+                let verdict = &rest[idx + 1..];
+                let passed = verdict.starts_with("PASS");
+                results.push((name, passed));
+            }
+        } else if trimmed.starts_with("STRESS_DONE") {
+            saw_done = true;
+            // Parse exit code
+            if let Some(eq) = trimmed.find("exit_code=") {
+                let code_str = &trimmed[eq + "exit_code=".len()..];
+                _final_exit_code = code_str.trim().parse().ok();
+            }
+            break;
+        }
+    }
+
+    // Wait for QEMU to exit
+    let _ = child.wait();
+    drop(timeout_handle); // Thread will self-terminate once QEMU exits
+
+    // Step 4: Report results
+    println!();
+    println!("========================================");
+    println!("  Stress Test Results");
+    println!("========================================");
+
+    if !saw_start {
+        println!("  ERROR: Never saw STRESS_START — testr may not have launched");
+        println!("========================================");
+        std::process::exit(1);
+    }
+
+    let mut pass_count = 0;
+    let total = results.len();
+
+    for (name, passed) in &results {
+        let status = if *passed { "PASS" } else { "FAIL" };
+        println!("  {} ... {}", name, status);
+        if *passed {
+            pass_count += 1;
+        }
+    }
+
+    println!();
+    println!("  {}/{} passed", pass_count, total);
+
+    if !saw_done {
+        println!("  WARNING: Never saw STRESS_DONE — QEMU may have timed out");
+    }
+
+    println!("========================================");
+
+    if pass_count == total && total > 0 && saw_done {
+        println!();
+        println!("All tests passed.");
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
 }
 
 /// Clean build artifacts

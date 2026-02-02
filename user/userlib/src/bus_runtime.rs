@@ -354,33 +354,31 @@ impl RuntimeCtx {
 }
 
 impl BusCtx for RuntimeCtx {
-    fn reply(&mut self, original: &BusMsg, payload: &[u8]) -> Result<(), BusError> {
-        let _ = original;
-        let _ = payload;
-        // Most replies are handled via dedicated BusCtx methods
-        // (report_partitions, partition_ready, respond_info, ack_spawn).
+    // NOTE: reply(), forward_down(), send_up(), and emit_event() are no-ops.
+    // Replies use dedicated BusCtx methods (report_partitions, ack_spawn, etc.).
+    // Forwarding and events are not yet wired — the bus tree currently has at
+    // most 2 levels, so there is no upstream to forward to. When multi-level
+    // bus trees are needed, these must be implemented.
+
+    fn reply(&mut self, _original: &BusMsg, _payload: &[u8]) -> Result<(), BusError> {
         Ok(())
     }
 
-    fn forward_down(&mut self, msg: &BusMsg) -> Result<(), BusError> {
-        let _ = msg;
+    fn forward_down(&mut self, _msg: &BusMsg) -> Result<(), BusError> {
         Ok(())
     }
 
     fn send_down(
         &mut self,
-        msg_type: u32,
-        payload: &[u8],
+        _msg_type: u32,
+        _payload: &[u8],
         deadline_ms: u32,
     ) -> Result<u32, BusError> {
         let seq = self.alloc_seq();
-        let _ = msg_type;
-        let _ = payload;
 
         // Track deadline if non-zero
         if deadline_ms > 0 {
             let deadline_ns = syscall::gettime() + (deadline_ms as u64) * 1_000_000;
-            // Find a free slot
             for slot in &mut self.pending {
                 if slot.is_none() {
                     *slot = Some(PendingRequest { seq, deadline_ns });
@@ -388,20 +386,16 @@ impl BusCtx for RuntimeCtx {
                     return Ok(seq);
                 }
             }
-            // No space — still return the seq but without deadline tracking
         }
 
         Ok(seq)
     }
 
-    fn send_up(&mut self, msg: &BusMsg) -> Result<(), BusError> {
-        let _ = msg;
+    fn send_up(&mut self, _msg: &BusMsg) -> Result<(), BusError> {
         Ok(())
     }
 
-    fn emit_event(&mut self, msg_type: u32, payload: &[u8]) -> Result<(), BusError> {
-        let _ = msg_type;
-        let _ = payload;
+    fn emit_event(&mut self, _msg_type: u32, _payload: &[u8]) -> Result<(), BusError> {
         Ok(())
     }
 

@@ -337,18 +337,19 @@ impl Mux {
     /// Spurious wakes (EAGAIN) are retried internally.
     pub fn wait(&self) -> SysResult<MuxEvent> {
         let mut event = MuxEvent::empty();
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(
-                &mut event as *mut MuxEvent as *mut u8,
-                core::mem::size_of::<MuxEvent>(),
-            )
-        };
         loop {
+            // Build byte slice via raw pointer to avoid creating overlapping &mut
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    core::ptr::addr_of_mut!(event) as *mut u8,
+                    core::mem::size_of::<MuxEvent>(),
+                )
+            };
             match read(self.handle, buf) {
                 Ok(n) if n > 0 => return Ok(event),
-                Ok(_) => return Err(SysError::Timeout), // 0 events (shouldn't happen with new kernel)
+                Ok(_) => return Err(SysError::Timeout),
                 Err(SysError::WouldBlock) => continue,  // Spurious wake — retry
-                Err(e) => return Err(e),                 // Timeout or real error — propagate
+                Err(e) => return Err(e),
             }
         }
     }
@@ -432,7 +433,8 @@ impl Drop for Process {
 // Message buffer helper
 // ============================================================================
 
-pub const MAX_MESSAGE_SIZE: usize = 4096;
+/// Maximum IPC message payload — must match kernel MAX_INLINE_PAYLOAD (576 bytes)
+pub const MAX_MESSAGE_SIZE: usize = 576;
 
 pub struct Message {
     data: [u8; MAX_MESSAGE_SIZE],
@@ -539,11 +541,12 @@ impl EventLoop {
 
     /// Watch a handle for readability
     pub fn watch(&mut self, handle: ObjHandle) -> SysResult<&mut Self> {
-        if self.count < 16 {
-            self.mux.add(handle, MuxFilter::Readable)?;
-            self.handles[self.count] = Some(handle);
-            self.count += 1;
+        if self.count >= 16 {
+            return Err(SysError::TooManyFiles);
         }
+        self.mux.add(handle, MuxFilter::Readable)?;
+        self.handles[self.count] = Some(handle);
+        self.count += 1;
         Ok(self)
     }
 
@@ -553,6 +556,7 @@ impl EventLoop {
         for slot in &mut self.handles {
             if *slot == Some(handle) {
                 *slot = None;
+                self.count = self.count.saturating_sub(1);
                 break;
             }
         }

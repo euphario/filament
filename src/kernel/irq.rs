@@ -3,6 +3,15 @@
 //! Allows userspace drivers to register for hardware interrupts.
 //! When an IRQ fires, the owning process is woken.
 
+/// Error type for IRQ registration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrqError {
+    /// IRQ number is already registered by another process
+    AlreadyRegistered,
+    /// No free slots in the IRQ registration table
+    TableFull,
+}
+
 /// IRQ registration entry
 #[derive(Clone, Copy)]
 pub struct IrqRegistration {
@@ -49,12 +58,12 @@ fn with_irq_table<R, F: FnOnce(&mut [IrqRegistration; MAX_IRQ_REGISTRATIONS]) ->
 }
 
 /// Register a process for an IRQ
-pub fn register(irq_num: u32, pid: u32) -> bool {
+pub fn register(irq_num: u32, pid: u32) -> Result<(), IrqError> {
     with_irq_table(|table| {
         // Check if already registered
         for reg in table.iter() {
             if !reg.is_empty() && reg.irq_num == irq_num {
-                return false; // IRQ already taken
+                return Err(IrqError::AlreadyRegistered);
             }
         }
 
@@ -70,10 +79,10 @@ pub fn register(irq_num: u32, pid: u32) -> bool {
                 crate::platform::current::gic::enable_irq(irq_num);
                 crate::platform::current::gic::debug_irq(irq_num);
 
-                return true;
+                return Ok(());
             }
         }
-        false
+        Err(IrqError::TableFull)
     })
 }
 
@@ -114,7 +123,7 @@ pub fn notify(irq_num: u32) -> Option<u32> {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num {
                 reg.pending = true;
-                reg.pending_count += 1;
+                reg.pending_count = reg.pending_count.saturating_add(1);
 
                 if reg.blocked_pid != 0 {
                     let pid = reg.blocked_pid;
@@ -188,11 +197,10 @@ pub fn wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
         return Err(-22); // EINVAL - not registered for this IRQ
     }
 
-    // Block the current task (use Ipc reason - blocking without timeout)
-    if !super::sched::sleep_current(super::task::SleepReason::Irq) {
+    // Atomically block and reschedule
+    if !super::sched::sleep_and_reschedule(super::task::SleepReason::Irq) {
         return Err(-11); // EAGAIN
     }
-    super::sched::reschedule();
 
     // Woken up - check for pending IRQ
     if let Some(count) = check_pending(irq_num, pid) {

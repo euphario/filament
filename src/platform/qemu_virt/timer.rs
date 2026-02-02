@@ -4,6 +4,7 @@
 
 use crate::hal::Timer as TimerTrait;
 use super::{gic, irq};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 mod ctl {
     pub const ENABLE: u64 = 1 << 0;
@@ -13,7 +14,8 @@ mod ctl {
 
 pub struct Timer {
     frequency: u64,
-    tick_count: u64,
+    /// Tick count — atomic for SMP safety (each CPU's timer IRQ increments this)
+    tick_count: AtomicU64,
     time_slice_ms: u64,
 }
 
@@ -21,7 +23,7 @@ impl Timer {
     pub const fn new() -> Self {
         Self {
             frequency: 0,
-            tick_count: 0,
+            tick_count: AtomicU64::new(0),
             time_slice_ms: 10,
         }
     }
@@ -54,7 +56,7 @@ impl Timer {
         let ctl_val = Self::read_ctl();
 
         if (ctl_val & ctl::ISTATUS) != 0 {
-            self.tick_count += 1;
+            let tick = self.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
             // Update per-CPU tick counts
             let cpu_data = crate::kernel::percpu::cpu_local();
             cpu_data.tick();
@@ -75,7 +77,7 @@ impl Timer {
             // Reap terminated tasks - use try_scheduler to avoid deadlock
             // if scheduler lock is held by interrupted syscall
             if let Some(mut sched) = crate::kernel::task::try_scheduler() {
-                sched.reap_terminated(self.tick_count);
+                sched.reap_terminated(tick);
             }
 
             // Continue bus init (no-op for QEMU without PCIe)
@@ -98,7 +100,7 @@ impl Timer {
     }
 
     pub fn ticks(&self) -> u64 {
-        self.tick_count
+        self.tick_count.load(Ordering::Relaxed)
     }
 
     pub fn frequency(&self) -> u64 {

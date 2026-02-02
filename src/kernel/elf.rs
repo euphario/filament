@@ -167,8 +167,8 @@ pub fn verify_binary_signature(
     _name: &str,
     _requested_caps: Option<super::caps::Capabilities>,
 ) -> Result<(), ElfError> {
-    // TODO: Implement actual signature verification
-    // For now, trust all binaries (implicit trust via initrd embedding)
+    // Stub: trust all binaries via initrd embedding (no external binary loading yet).
+    // When external binary loading is added, implement ed25519 signature check here.
     Ok(())
 }
 
@@ -269,6 +269,11 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
             continue;
         }
 
+        // filesz must not exceed memsz (BSS is memsz - filesz)
+        if filesz > memsz {
+            return Err(ElfError::InvalidSegment);
+        }
+
         // Calculate number of pages needed (with overflow checks)
         let page_size = 4096usize;
         let vaddr_page = vaddr & !(page_size as u64 - 1);
@@ -365,8 +370,26 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
         segments_loaded += 1;
     }
 
+    // Validate entry point is within a loaded segment
+    let entry = header.e_entry;
+    let mut entry_valid = false;
+    for phdr in phdrs {
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+        let seg_start = phdr.p_vaddr;
+        let seg_end = seg_start.wrapping_add(phdr.p_memsz);
+        if entry >= seg_start && entry < seg_end {
+            entry_valid = true;
+            break;
+        }
+    }
+    if !entry_valid && segments_loaded > 0 {
+        return Err(ElfError::InvalidSegment);
+    }
+
     Ok(ElfInfo {
-        entry: header.e_entry,
+        entry,
         base: base_addr.unwrap_or(0),
         segments_loaded,
     })
@@ -480,8 +503,8 @@ fn spawn_from_elf_internal(
     let stack_pages = USER_STACK_SIZE / 4096;
     let stack_phys = pmm::alloc_pages(stack_pages).ok_or(ElfError::OutOfMemory)?;
 
-    // Hold scheduler lock for the entire task setup
-    let mut sched = task::scheduler();
+    // Hold scheduler lock for the entire task setup (released before logging)
+    let (task_id, slot, elf_info) = task::with_scheduler(|sched| -> Result<(task::TaskId, usize, ElfInfo), ElfError> {
 
     // Create a new user task
     let (task_id, slot) = unsafe {
@@ -609,9 +632,9 @@ fn spawn_from_elf_internal(
         }
     }
 
-    // Drop scheduler lock BEFORE logging to avoid deadlock
-    // (kinfo! -> broadcast_event -> scheduler() would deadlock)
-    drop(sched);
+        Ok((task_id, slot, elf_info))
+    })?;
+    // Scheduler lock released here — safe to log
 
     kdebug!("elf", "spawn_ok"; name = name, pid = task_id as u64, entry = crate::klog::hex64(elf_info.entry), parent = parent_id as u64);
 

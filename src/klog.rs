@@ -267,8 +267,8 @@ impl LogRing {
 // Global State
 // ============================================================================
 
-/// Global log ring buffer
-pub static mut LOG_RING: LogRing = LogRing::new();
+/// Global log ring buffer (protected by SpinLock for SMP safety)
+pub static LOG_RING: crate::kernel::lock::SpinLock<LogRing> = crate::kernel::lock::SpinLock::new(LogRing::new());
 
 /// Boot time in counter ticks
 static BOOT_TIME: AtomicU64 = AtomicU64::new(0);
@@ -420,11 +420,8 @@ impl RecordBuilder {
         self.buffer[1] = (total_len >> 8) as u8;
 
         // Write to ring buffer
-        // SAFETY: Single-threaded kernel context (for now)
-        unsafe {
-            let ring = &mut *core::ptr::addr_of_mut!(LOG_RING);
-            ring.write(&self.buffer[..self.pos]);
-        }
+        let mut ring = LOG_RING.lock();
+        ring.write(&self.buffer[..self.pos]);
     }
 }
 
@@ -790,9 +787,8 @@ pub fn drain_one() -> bool {
     let mut record_buf = [0u8; MAX_RECORD_SIZE];
     let mut text_buf = [0u8; 1024];
 
-    // SAFETY: Single-threaded or with IRQs disabled
-    let record_len = unsafe {
-        let ring = &mut *core::ptr::addr_of_mut!(LOG_RING);
+    let record_len = {
+        let mut ring = LOG_RING.lock();
         ring.read(&mut record_buf)
     };
 
@@ -828,18 +824,14 @@ pub fn try_drain(max_records: usize) -> usize {
 
 /// Check if there are pending records
 pub fn has_pending() -> bool {
-    unsafe {
-        let ring = &*core::ptr::addr_of!(LOG_RING);
-        ring.has_data()
-    }
+    let ring = LOG_RING.lock();
+    ring.has_data()
 }
 
 /// Get number of dropped records
 pub fn dropped() -> u64 {
-    unsafe {
-        let ring = &*core::ptr::addr_of!(LOG_RING);
-        ring.dropped()
-    }
+    let ring = LOG_RING.lock();
+    ring.dropped()
 }
 
 // ============================================================================

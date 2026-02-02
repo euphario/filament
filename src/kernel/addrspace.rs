@@ -464,12 +464,15 @@ impl AddressSpace {
                 options(nostack, preserves_flags)
             );
 
-            // CRITICAL: Invalidate TLB entry for this virtual address
+            // CRITICAL: Invalidate TLB entry for this virtual address + ASID
+            // Use vale1is (VA + ASID, last level, inner shareable) to avoid
+            // unnecessarily invalidating other address spaces' TLB entries.
+            let tlbi_val = ((self.asid as u64) << 48) | (virt_addr >> 12);
             core::arch::asm!(
-                "tlbi vaae1is, {va}",
+                "tlbi vale1is, {va}",
                 "dsb ish",
                 "isb",
-                va = in(reg) virt_addr >> 12,
+                va = in(reg) tlbi_val,
                 options(nostack, preserves_flags)
             );
 
@@ -565,8 +568,13 @@ impl AddressSpace {
             // Clear the L3 entry (mark as invalid)
             core::ptr::write_volatile(l3_ptr.add(l3_index), 0);
 
-            // Ensure the write is visible
+            // Ensure the store is visible to page table walkers on all CPUs
             core::arch::asm!("dsb ishst");
+
+            // Invalidate TLB for this VA on all CPUs (inner shareable)
+            // Without this, other CPUs may continue accessing the old physical
+            // page through stale TLB entries — a use-after-free via TLB.
+            tlb::invalidate_va(self.asid, virt_addr);
 
             Some(phys_addr)
         }

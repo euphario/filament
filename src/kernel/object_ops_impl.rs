@@ -1,8 +1,11 @@
 //! Object Operations Backend Implementation
 //!
-//! Implements the `ObjectOps` trait - the heart of the microkernel.
-//! This wraps the existing object/syscall.rs logic but provides a clean
-//! trait boundary.
+//! Implements the `ObjectOps` trait by delegating to `object::syscall`.
+//!
+//! NOTE: The unified syscall dispatch (100-104) currently calls
+//! `object::syscall::open/read/write/map/close` directly for zero overhead.
+//! This wrapper exists for the trait architecture (testability via mocks)
+//! and is accessed via `SyscallContext::object()`.
 //!
 //! # The 5 Syscalls
 //!
@@ -101,7 +104,11 @@ impl ObjectOps for KernelObjectOps {
         if result >= 0 {
             Ok(ReadResult {
                 bytes_read: result as usize,
-                peer_pid: None, // TODO: Extract from port accept
+                // peer_pid not available from read() return value — port accept
+                // encodes the channel handle, not the peer PID, in the result.
+                // The actual syscall path (100-104) handles this correctly via
+                // object::syscall::read which returns the raw result to userspace.
+                peer_pid: None,
                 extra: 0,
             })
         } else {
@@ -134,8 +141,12 @@ impl ObjectOps for KernelObjectOps {
         if result >= 0 {
             Ok(MapResult {
                 vaddr: result as u64,
-                paddr: 0, // TODO: Return physical address for DMA
-                size: 0,  // TODO: Return mapped size
+                // paddr and size not available from map() return value — it returns
+                // only vaddr as i64. The actual syscall path (103) returns this raw
+                // value to userspace. Userspace drivers that need paddr use the
+                // separate DMA pool output pointers or shmem map which writes both.
+                paddr: 0,
+                size: 0,
             })
         } else {
             Err(convert_error(result))
@@ -159,8 +170,9 @@ impl ObjectOps for KernelObjectOps {
         _handle: Handle,
         _sub: Subscriber,
     ) -> Result<(), KernelError> {
-        // TODO: Implement subscription for blocking operations
-        // For now, subscriptions are handled internally by the object types
+        // Subscriptions are handled internally by object types (Channel, Port,
+        // Timer, Mux) via their Pollable trait. The subscribe/unsubscribe cycle
+        // is managed by read_mux_via_service in object::syscall, not here.
         Ok(())
     }
 }

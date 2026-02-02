@@ -441,7 +441,8 @@ impl BusMsg {
 
     /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8; 256]) -> Self {
-        unsafe { core::ptr::read(data.as_ptr() as *const Self) }
+        // Use read_unaligned — data may not satisfy BusMsg alignment (4 bytes)
+        unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Self) }
     }
 }
 
@@ -737,6 +738,7 @@ impl Default for BlockPortConfig {
 }
 
 /// Block device geometry.
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct BlockGeometry {
     pub block_size: u32,

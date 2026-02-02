@@ -215,7 +215,8 @@ impl ShmemBackend for KernelShmemBackend {
     }
 
     fn cleanup_process(&self, pid: Pid) {
-        shmem::process_cleanup(pid);
+        shmem::begin_cleanup(pid);
+        shmem::finalize_cleanup(pid);
     }
 
     fn mapping_tracker(&self) -> &dyn MappingTracker {

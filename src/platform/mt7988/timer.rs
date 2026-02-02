@@ -6,6 +6,7 @@
 use crate::kdebug;
 use crate::hal::Timer as TimerTrait;
 use super::{gic, irq};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Timer control bits
 mod ctl {
@@ -16,7 +17,8 @@ mod ctl {
 
 pub struct Timer {
     frequency: u64,
-    tick_count: u64,
+    /// Tick count — atomic for SMP safety (each CPU's timer IRQ increments this)
+    tick_count: AtomicU64,
     /// Current time slice in milliseconds
     time_slice_ms: u64,
 }
@@ -25,7 +27,7 @@ impl Timer {
     pub const fn new() -> Self {
         Self {
             frequency: 0,
-            tick_count: 0,
+            tick_count: AtomicU64::new(0),
             time_slice_ms: 10, // Default 10ms time slice
         }
     }
@@ -74,7 +76,7 @@ impl Timer {
         let ctl = Self::read_ctl();
 
         if (ctl & ctl::ISTATUS) != 0 {
-            self.tick_count += 1;
+            let tick = self.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
 
             // Update per-CPU tick counts for CPU usage tracking
             let cpu_data = crate::kernel::percpu::cpu_local();
@@ -102,7 +104,7 @@ impl Timer {
             // Reap terminated tasks - use try_scheduler to avoid deadlock
             // if scheduler lock is held by interrupted syscall
             if let Some(mut sched) = crate::kernel::task::try_scheduler() {
-                sched.reap_terminated(self.tick_count);
+                sched.reap_terminated(tick);
             }
 
             // Continue bus initialization (one bus per tick until all Safe)
@@ -130,7 +132,7 @@ impl Timer {
 
     /// Get current tick count
     pub fn ticks(&self) -> u64 {
-        self.tick_count
+        self.tick_count.load(Ordering::Relaxed)
     }
 
     /// Get timer frequency in Hz
@@ -216,7 +218,7 @@ impl TimerTrait for Timer {
         let ctl_val = Self::read_ctl();
 
         if (ctl_val & ctl::ISTATUS) != 0 {
-            self.tick_count += 1;
+            let tick = self.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
 
             super::wdt::kick();
             crate::klog::try_drain(8);
@@ -227,7 +229,7 @@ impl TimerTrait for Timer {
             let current_counter = Self::read_cntpct();
             if let Some(mut sched) = crate::kernel::task::try_scheduler() {
                 sched.check_timeouts(current_counter);
-                sched.reap_terminated(self.tick_count);
+                sched.reap_terminated(tick);
             } else {
                 // Lock held - skip this tick, set need_resched to retry later
                 crate::arch::aarch64::sync::cpu_flags().set_need_resched();
@@ -244,7 +246,7 @@ impl TimerTrait for Timer {
     }
 
     fn ticks(&self) -> u64 {
-        self.tick_count
+        self.tick_count.load(Ordering::Relaxed)
     }
 
     fn frequency(&self) -> u64 {

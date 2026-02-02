@@ -402,14 +402,6 @@ fn close_channel_for_liveness(channel_id: u32) {
     }
 }
 
-/// Wake a task by PID
-fn wake_task(pid: u32) {
-    super::task::with_scheduler(|sched| {
-        // Use unified wake function
-        sched.wake_by_pid(pid);
-    });
-}
-
 /// Called when a task makes a syscall - reset liveness tracking
 /// This proves the task is alive and responsive
 pub fn task_activity(task: &mut super::task::Task, current_tick: u64) {

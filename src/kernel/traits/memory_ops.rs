@@ -92,3 +92,44 @@ pub trait MemoryOps: Send + Sync {
     /// * `size` - Size to unmap
     fn munmap(&self, task_id: TaskId, addr: u64, size: usize) -> Result<(), MemoryError>;
 }
+
+// ============================================================================
+// Mock Implementation (for testing)
+// ============================================================================
+
+#[cfg(any(test, feature = "mock"))]
+pub struct MockMemoryOps {
+    pub mmap_result: Result<u64, MemoryError>,
+    pub munmap_result: Result<(), MemoryError>,
+}
+
+#[cfg(any(test, feature = "mock"))]
+impl MockMemoryOps {
+    pub const fn new() -> Self {
+        Self {
+            mmap_result: Ok(0x1000_0000),
+            munmap_result: Ok(()),
+        }
+    }
+
+    pub const fn with_mmap_result(mut self, result: Result<u64, MemoryError>) -> Self {
+        self.mmap_result = result;
+        self
+    }
+
+    pub const fn with_munmap_result(mut self, result: Result<(), MemoryError>) -> Self {
+        self.munmap_result = result;
+        self
+    }
+}
+
+#[cfg(any(test, feature = "mock"))]
+impl MemoryOps for MockMemoryOps {
+    fn mmap(&self, _task_id: TaskId, _size: usize, _writable: bool, _executable: bool) -> Result<u64, MemoryError> {
+        self.mmap_result
+    }
+
+    fn munmap(&self, _task_id: TaskId, _addr: u64, _size: usize) -> Result<(), MemoryError> {
+        self.munmap_result
+    }
+}

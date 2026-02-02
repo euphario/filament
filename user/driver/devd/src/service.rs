@@ -197,6 +197,19 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
     },
     // Bus drivers (pcied, usbd) are now spawned dynamically via discover_kernel_buses().
     // Device drivers (nvmed, netd, partd, fatfsd) are spawned via rules in rules.rs.
+
+    // Stress test runner — only built with --features stress-test
+    #[cfg(feature = "stress-test")]
+    ServiceDef {
+        binary: "testr",
+        registers: &[],
+        dependencies: &[Dependency::Requires(b"console:")],
+        auto_restart: false,
+        parent: None,
+        context_port: b"",
+        context_port_type: 0,
+        caps: u64::MAX,  // ALL caps (needs SHUTDOWN)
+    },
 ];
 
 // =============================================================================

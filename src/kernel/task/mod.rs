@@ -16,8 +16,8 @@
 //!                    ┌────────┴────────┐
 //!                    ▼                 ▼
 //!              ┌─────────┐       ┌─────────┐
-//!              │  Task   │       │  Task   │  ...
-//!              │ slot 0  │       │ slot 1  │
+//!              │  Idle   │       │  User   │  ...
+//!              │ slot 0  │       │ slot N  │  (N = MAX_CPUS)
 //!              └────┬────┘       └────┬────┘
 //!                   │                 │
 //!        ┌─────────┴────┐    ┌──────┴───────┐
@@ -170,7 +170,7 @@ macro_rules! transition_or_log {
 }
 
 /// Maximum number of tasks (slots 0..MAX_CPUS reserved for idle)
-pub const MAX_TASKS: usize = 32;
+pub const MAX_TASKS: usize = 256;
 
 /// Scheduler state
 ///
@@ -286,23 +286,27 @@ impl Scheduler {
         self.next_deadline = soonest;
     }
 
+    /// Number of bits used for slot encoding in PID
+    const PID_SLOT_BITS: u32 = 9;
+    /// Mask for extracting slot bits from PID
+    const PID_SLOT_MASK: u32 = (1 << 9) - 1; // 0x1FF
+
     /// Generate a PID for a given slot
-    /// PID format: bits[7:0] = slot + 1 (1-16), bits[31:8] = generation (24 bits)
+    /// PID format: bits[8:0] = slot + 1 (1-256), bits[31:9] = generation (23 bits)
     ///
-    /// The generation is masked to 24 bits to prevent overflow when shifted.
-    /// After 2^24 task creations in a slot, generation wraps to 0, which is
+    /// The generation is masked to 23 bits to prevent overflow when shifted.
+    /// After 2^23 task creations in a slot, generation wraps to 0, which is
     /// acceptable since the probability of a stale reference surviving that
     /// long is negligible.
     fn make_pid(&self, slot: usize) -> TaskId {
         let slot_bits = (slot + 1) as u32;  // +1 to avoid PID 0
-        let gen = self.generations[slot] & 0xFF_FFFF;  // Mask to 24 bits
-        let gen_bits = gen << 8;
-        slot_bits | gen_bits
+        let gen = self.generations[slot] & ((1 << (32 - Self::PID_SLOT_BITS)) - 1);
+        slot_bits | (gen << Self::PID_SLOT_BITS)
     }
 
     /// Extract slot from PID (returns None if invalid)
     fn slot_from_pid(pid: TaskId) -> Option<usize> {
-        let slot_bits = (pid & 0xFF) as usize;
+        let slot_bits = (pid & Self::PID_SLOT_MASK) as usize;
         if slot_bits == 0 || slot_bits > MAX_TASKS {
             return None;
         }
@@ -312,7 +316,7 @@ impl Scheduler {
     /// Extract generation from PID
     /// Used for subscriber tracking to detect stale references
     pub fn generation_from_pid(pid: TaskId) -> u32 {
-        (pid >> 8) & 0xFF_FFFF
+        pid >> Self::PID_SLOT_BITS
     }
 
     /// Increment generation for a slot (call when task terminates)
@@ -331,6 +335,23 @@ impl Scheduler {
             }
         }
         None
+    }
+
+    /// Notify the scheduling policy that a task became ready.
+    pub fn notify_ready(&mut self, slot: usize) {
+        let priority = self.tasks[slot].as_ref()
+            .map(|t| t.priority).unwrap_or(Priority::Normal);
+        self.policy.on_task_ready(slot, priority);
+    }
+
+    /// Notify the scheduling policy that a task blocked.
+    pub fn notify_blocked(&mut self, slot: usize) {
+        self.policy.on_task_blocked(slot);
+    }
+
+    /// Notify the scheduling policy that a task exited.
+    pub fn notify_exit(&mut self, slot: usize) {
+        self.policy.on_task_exit(slot);
     }
 
     /// Wake a task by slot index - internal unified wake function
@@ -353,6 +374,9 @@ impl Scheduler {
 
             // Reset liveness state - task responded/became active
             task.liveness_state = super::liveness::LivenessState::Normal;
+
+            // Notify scheduling policy
+            self.policy.on_task_ready(slot, task.priority);
 
             true
         } else {
@@ -384,12 +408,16 @@ impl Scheduler {
         let mut woken = 0;
         let mut need_recalculate = false;
 
+        // Collect slots woken by deadline expiry for policy notification
+        let mut woken_slots = [0u16; 64];
+        let mut woken_slot_count = 0usize;
+
         // Collect TimerObject subscribers to wake (from Mux watches)
         use crate::kernel::ipc::traits::Subscriber;
         let mut timer_subscribers: [Subscriber; 32] = [Subscriber { task_id: 0, generation: 0 }; 32];
         let mut timer_sub_count = 0;
 
-        for task_opt in self.tasks.iter_mut() {
+        for (slot_idx, task_opt) in self.tasks.iter_mut().enumerate() {
             if let Some(ref mut task) = task_opt {
                 // Skip terminated tasks - their timers should not fire
                 if task.is_terminated() {
@@ -400,9 +428,11 @@ impl Scheduler {
                 // Sleeping tasks have no deadline - only Waiting tasks do
                 if let TaskState::Waiting { deadline, .. } = *task.state() {
                     if current_tick >= deadline {
-                        // Deadline expired - wake the task
-                        // Note: Don't reset liveness state for timeout - task didn't respond
                         crate::transition_or_log!(task, wake);
+                        if woken_slot_count < woken_slots.len() {
+                            woken_slots[woken_slot_count] = slot_idx as u16;
+                            woken_slot_count += 1;
+                        }
                         woken += 1;
                         need_recalculate = true;
                     }
@@ -410,7 +440,6 @@ impl Scheduler {
 
                 // Collect task ID for TimerObject checking via ObjectService
                 if timer_sub_count < timer_subscribers.len() {
-                    // Store task_id in the subscriber array (repurposed temporarily)
                     timer_subscribers[timer_sub_count] = Subscriber {
                         task_id: task.id,
                         generation: Scheduler::generation_from_pid(task.id),
@@ -422,8 +451,15 @@ impl Scheduler {
             }
         }
 
+        // Notify policy about deadline-woken tasks
+        for i in 0..woken_slot_count {
+            let slot = woken_slots[i] as usize;
+            let priority = self.tasks[slot].as_ref()
+                .map(|t| t.priority).unwrap_or(Priority::Normal);
+            self.policy.on_task_ready(slot, priority);
+        }
+
         // Check TimerObjects via ObjectService (outside task iteration)
-        // Collect all subscribers to wake
         let mut all_subscribers: [Subscriber; 32] = [Subscriber { task_id: 0, generation: 0 }; 32];
         let mut all_sub_count = 0;
 
@@ -445,14 +481,12 @@ impl Scheduler {
         // Wake all collected TimerObject subscribers
         for i in 0..all_sub_count {
             let subscriber = all_subscribers[i];
-            // Find and wake the subscriber's task
             if let Some(slot) = self.slot_by_pid(subscriber.task_id) {
                 if let Some(ref mut task) = self.tasks[slot] {
-                    // Wake if task is blocked
                     if task.is_blocked() {
                         crate::transition_or_log!(task, wake);
-                        // Reset liveness - timer event means task is active
                         task.liveness_state.reset(task.id);
+                        self.policy.on_task_ready(slot, task.priority);
                         woken += 1;
                     }
                 }
@@ -481,6 +515,7 @@ impl Scheduler {
         self.tasks[slot] = Task::new_kernel(id, entry, name);
         if self.tasks[slot].is_some() {
             self.policy.assign_task_round_robin(slot);
+            self.notify_ready(slot);
             // Create parallel object table in ObjectService (Phase 1: not used yet)
             super::object_service::object_service().create_task_table(id, false);
             Some(id)
@@ -501,6 +536,7 @@ impl Scheduler {
         self.tasks[slot] = Task::new_user(id, name);
         if self.tasks[slot].is_some() {
             self.policy.assign_task_round_robin(slot);
+            self.notify_ready(slot);
             // Create parallel object table in ObjectService
             super::object_service::object_service().create_task_table(id, true);
             Some((id, slot))
@@ -612,11 +648,43 @@ impl Scheduler {
             // Clear is_init flag so new devd can be the init
             task.is_init = false;
         }
+        self.policy.on_task_exit(slot);
     }
 
     /// Perform IPC cleanup for a terminating task.
     ///
     /// This handles:
+    /// Phase 2 / final cleanup: free remaining resources for a dead task.
+    ///
+    /// Called from reap_terminated (Phase 2 + Evicting) and reap_child.
+    /// Does NOT require scheduler lock — only touches subsystem-specific state.
+    fn do_final_cleanup(pid: TaskId) {
+        super::shmem::finalize_cleanup(pid);
+        super::irq::process_cleanup(pid);
+        super::pci::release_all_devices(pid);
+
+        let port_wake_list = super::ipc::port_cleanup_task(pid);
+        super::ipc::waker::wake(&port_wake_list, super::ipc::WakeReason::Closed);
+
+        super::object_service::object_service().remove_task_table(pid);
+    }
+
+    /// Clear per-CPU trap frame if it still points to this task's frame.
+    /// Prevents use-after-free if the task slot is about to be cleared.
+    fn clear_stale_trap_frame(task: &Task, slot_idx: usize, pid: TaskId) {
+        let task_trap_ptr = &task.trap_frame as *const TrapFrame;
+        let current_ptr = super::percpu::get_trap_frame();
+        if current_ptr == task_trap_ptr as *mut TrapFrame {
+            crate::kwarn!("task", "clearing_stale_trap_frame"; slot = slot_idx as u64, pid = pid as u64);
+            let cpu = super::percpu::cpu_id() as usize;
+            unsafe {
+                super::percpu::set_trap_frame(
+                    core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAMES[cpu])
+                );
+            }
+        }
+    }
+
     /// - Stopping DMA (critical for safety)
     /// - Removing from subscriber lists (prevents stale wakes)
     /// - Notifying IPC peers (sends Close messages, wakes blocked receivers)
@@ -716,38 +784,14 @@ impl Scheduler {
                     // ============================================================
                     // Phase 2: Force cleanup and reap (grace period expired)
                     // ============================================================
-                    // Finalize shmem (force unmap from any remaining mappers, free memory)
-                    super::shmem::finalize_cleanup(pid);
+                    Self::do_final_cleanup(pid);
 
-                    // Clean up remaining subsystems
-                    super::irq::process_cleanup(pid);
-                    super::pci::release_all_devices(pid);
-                    // Clean up ports owned by this task
-                    let port_wake_list = super::ipc::port_cleanup_task(pid);
-                    super::ipc::waker::wake(&port_wake_list, super::ipc::WakeReason::Closed);
-
-                    // Remove object table from ObjectService (Phase 1: parallel structure)
-                    super::object_service::object_service().remove_task_table(pid);
-
-                    // SAFETY: Clear per-CPU trap frame if it points to this task.
-                    // This shouldn't happen (we skip current task), but prevents use-after-free.
                     if let Some(ref task) = self.tasks[slot_idx] {
-                        let task_trap_ptr = &task.trap_frame as *const TrapFrame;
-                        let current_ptr = super::percpu::get_trap_frame();
-                        if current_ptr == task_trap_ptr as *mut TrapFrame {
-                            crate::kwarn!("task", "clearing_stale_trap_frame"; slot = slot_idx as u64, pid = pid as u64);
-                            let cpu = super::percpu::cpu_id() as usize;
-                            unsafe {
-                                super::percpu::set_trap_frame(
-                                    core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAMES[cpu])
-                                );
-                            }
-                        }
+                        Self::clear_stale_trap_frame(task, slot_idx, pid);
                     }
 
-                    // Bump generation so any stale PIDs for this slot become invalid
+                    self.notify_exit(slot_idx);
                     self.bump_generation(slot_idx);
-                    // Drop the task (frees kernel stack and heap mappings)
                     self.tasks[slot_idx] = None;
                 }
                 (TaskState::Dying { .. }, _) => {
@@ -762,10 +806,8 @@ impl Scheduler {
                         reason = reason as u8 as u64
                     );
 
-                    // Wake parent task if it's sleeping (for Process watch)
                     self.wake_parent_if_sleeping(slot_idx);
 
-                    // Perform IPC cleanup (DMA stop, subscriber removal, peer notification)
                     let ipc_peers = Self::do_ipc_cleanup(pid);
                     for peer in ipc_peers.iter() {
                         let wake_list = super::object_service::object_service()
@@ -773,43 +815,18 @@ impl Scheduler {
                         super::ipc::waker::wake(&wake_list, super::ipc::WakeReason::Closed);
                     }
 
-                    // Finalize shmem immediately (no grace period)
                     super::shmem::begin_cleanup(pid);
-                    super::shmem::finalize_cleanup(pid);
+                    Self::do_final_cleanup(pid);
 
-                    // Clean up remaining subsystems
-                    super::irq::process_cleanup(pid);
-                    super::pci::release_all_devices(pid);
-
-                    // Clean up ports
-                    let port_wake_list = super::ipc::port_cleanup_task(pid);
-                    super::ipc::waker::wake(&port_wake_list, super::ipc::WakeReason::Closed);
-
-                    // Remove object table
-                    super::object_service::object_service().remove_task_table(pid);
-
-                    // Transition to Dead via state machine
                     if let Some(ref mut task) = self.tasks[slot_idx] {
                         let _ = task.finalize(); // Evicting → Dead
                     }
 
-                    // SAFETY: Clear per-CPU trap frame if it points to this task.
-                    // This shouldn't happen (we skip current task), but prevents use-after-free.
                     if let Some(ref task) = self.tasks[slot_idx] {
-                        let task_trap_ptr = &task.trap_frame as *const TrapFrame;
-                        let current_ptr = super::percpu::get_trap_frame();
-                        if current_ptr == task_trap_ptr as *mut TrapFrame {
-                            crate::kwarn!("task", "clearing_stale_trap_frame"; slot = slot_idx as u64, pid = pid as u64);
-                            let cpu = super::percpu::cpu_id() as usize;
-                            unsafe {
-                                super::percpu::set_trap_frame(
-                                    core::ptr::addr_of_mut!(EARLY_BOOT_TRAP_FRAMES[cpu])
-                                );
-                            }
-                        }
+                        Self::clear_stale_trap_frame(task, slot_idx, pid);
                     }
 
-                    // Bump generation and remove task
+                    self.notify_exit(slot_idx);
                     self.bump_generation(slot_idx);
                     self.tasks[slot_idx] = None;
                 }

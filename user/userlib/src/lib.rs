@@ -11,15 +11,19 @@ pub mod io;
 pub mod console_ring;
 pub mod query;
 pub mod mmio;
-pub mod filter_chain;
 pub mod ring;
 pub mod data_port;
 pub mod devd;
 pub mod blk;
-pub mod blk_client;
 pub mod sync;
-pub mod command_ring;
-pub mod driver_ring;
+
+// Legacy modules — kept for compilation but not re-exported.
+// console_ring: still used by consoled.
+// command_ring, driver_ring, filter_chain, blk_client: superseded by bus framework.
+mod filter_chain;
+mod blk_client;
+mod command_ring;
+mod driver_ring;
 pub mod bus;
 pub mod bus_transport;
 pub mod bus_runtime;
@@ -40,25 +44,7 @@ pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_
 pub use data_port::{DataPort, DataPortConfig, PortRole, Layer, ConnectedLayer, GeometryInfo};
 pub use devd::{
     DevdClient, PortType, DeviceClass, DeviceInfo, ClientState, DriverState,
-    DevdCommand, SpawnFilter, SpawnResult, SpawnHandler, DefaultSpawnHandler,
-    register_block_device, register_partition, run_driver_loop,
-};
-pub use command_ring::{
-    // Traits for swappable IPC
-    CommandSender, CommandReceiver, Transport,
-    // Core ring types
-    CommandRing, Command, Response, CommandRingHeader, RingRole,
-    // Easy-to-use wrappers
-    Producer, Consumer, CommandBuilder, FireBuilder,
-    // Protocol types
-    RING_SIZE, ring_shmem_size,
-};
-pub use driver_ring::{
-    // Driver ring types
-    DriverRingProducer, DriverRingConsumer,
-    DriverCommand, DriverResponse,
-    // Protocol types
-    cmd_type as driver_cmd_type, resp_type as driver_resp_type,
+    DevdCommand, SpawnFilter, SpawnResult,
 };
 pub use bus::{
     BusMsg, BusMsgFlags, BusError, BusCtx, Driver, Disposition,

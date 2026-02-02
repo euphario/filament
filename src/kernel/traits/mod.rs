@@ -47,9 +47,11 @@ pub mod task;
 // New syscall-facing traits (microkernel interface)
 pub mod syscall_ctx;
 pub mod object_ops;
+pub mod raw_object_ops;
 pub mod memory_ops;
 pub mod process_ops;
 pub mod user_access;
+pub mod misc_ops;
 
 // Re-exports for convenient access - existing traits
 #[allow(unused_imports)]
@@ -82,3 +84,5 @@ pub use memory_ops::{MemoryOps, MemoryError};
 pub use process_ops::{ProcessOps, ProcessError as ProcOpsError};
 #[allow(unused_imports)]
 pub use user_access::{UserAccess, UserAccessExt, UAccessError};
+#[allow(unused_imports)]
+pub use misc_ops::MiscOps;

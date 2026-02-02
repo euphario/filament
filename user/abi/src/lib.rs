@@ -19,50 +19,29 @@ pub mod syscall {
     // Core process/memory (0-11)
     pub const EXIT: u64 = 0;
     pub const DEBUG_WRITE: u64 = 1;
-    pub const YIELD: u64 = 2;
     pub const GETPID: u64 = 3;
     pub const MMAP: u64 = 4;
     pub const MUNMAP: u64 = 5;
-    // 6-7: reserved
     pub const SPAWN: u64 = 8;
     pub const WAIT: u64 = 9;
     pub const GETTIME: u64 = 10;
     pub const SLEEP: u64 = 11;
 
-    // Process control (31-37)
+    // Process control
     pub const EXEC: u64 = 31;
     pub const DAEMONIZE: u64 = 32;
     pub const KILL: u64 = 33;
     pub const PS_INFO: u64 = 34;
     pub const SET_LOG_LEVEL: u64 = 35;
-    pub const MMAP_DMA: u64 = 36;
     pub const RESET: u64 = 37;
+    pub const SHUTDOWN: u64 = 38;
 
-    // Shared memory (39-47)
-    pub const SHMEM_CREATE: u64 = 39;
-    pub const SHMEM_MAP: u64 = 40;
-    pub const SHMEM_ALLOW: u64 = 41;
-    pub const SHMEM_WAIT: u64 = 42;
-    pub const SHMEM_NOTIFY: u64 = 43;
-    pub const SHMEM_DESTROY: u64 = 44;
-    pub const SHMEM_UNMAP: u64 = 47;
-
-    // PCI/Bus (51-76)
-    pub const PCI_CONFIG_READ: u64 = 51;
-    pub const PCI_CONFIG_WRITE: u64 = 52;
-    pub const PCI_MSI_ALLOC: u64 = 54;
-    pub const SIGNAL_ALLOW: u64 = 56;
-    pub const BUS_LIST: u64 = 59;
-    pub const MMAP_DEVICE: u64 = 60;
-    pub const DMA_POOL_CREATE: u64 = 61;
-    pub const DMA_POOL_CREATE_HIGH: u64 = 62;
+    // Misc
     pub const RAMFS_LIST: u64 = 63;
     pub const EXEC_MEM: u64 = 64;
     pub const KLOG_READ: u64 = 65;
     pub const GET_CAPABILITIES: u64 = 66;
-    pub const CPU_STATS: u64 = 68;
     pub const EXEC_WITH_CAPS: u64 = 74;
-    pub const DEVICE_LIST: u64 = 75;
     pub const KLOG: u64 = 76;
     pub const KLOG_WRITE: u64 = 77;
 
@@ -715,7 +694,8 @@ impl TextChunk {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data[..self.len as usize]
+        let len = (self.len as usize).min(PIPE_TEXT_MAX);
+        &self.data[..len]
     }
 }
 
@@ -1019,6 +999,21 @@ pub struct RamfsListEntry {
 }
 
 const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
+
+// ============================================================================
+// ABI Size Assertions — kernel/user boundary types must not silently change
+// ============================================================================
+
+const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 32);
+const _: () = assert!(core::mem::size_of::<MuxEvent>() == 8);
+const _: () = assert!(core::mem::size_of::<PciEnumEntry>() == 32);
+const _: () = assert!(core::mem::size_of::<BusInfo>() == 48);
+const _: () = assert!(core::mem::size_of::<DirEntry>() == 88);
+const _: () = assert!(core::mem::size_of::<PipeProcessInfo>() == 44);
+const _: () = assert!(core::mem::size_of::<TextChunk>() == 196);
+const _: () = assert!(core::mem::size_of::<TableStart>() == 164);
+const _: () = assert!(core::mem::size_of::<PipeError>() == 72);
+const _: () = assert!(core::mem::size_of::<PipeMessageHeader>() == 8);
 
 impl RamfsListEntry {
     pub const SIZE: usize = core::mem::size_of::<Self>();

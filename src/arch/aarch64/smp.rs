@@ -2,14 +2,13 @@
 //!
 //! Provides multi-core support for MT7988A's 4x Cortex-A73 cores.
 //! Uses PSCI (Power State Coordination Interface) for CPU power management.
+//!
+//! Per-CPU state is managed by `kernel::percpu::CpuData`. This module
+//! handles PSCI calls, secondary CPU boot, and stack allocation.
 
-#![allow(dead_code)]  // SMP infrastructure for future multi-core support
-
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use crate::{kinfo, kwarn, kdebug};
-
-/// Maximum number of CPUs supported
-pub const MAX_CPUS: usize = 4;
+use crate::kernel::percpu::{self, CpuState, MAX_CPUS};
 
 /// Stack size per CPU (16KB)
 pub const CPU_STACK_SIZE: usize = 16 * 1024;
@@ -32,70 +31,6 @@ pub mod psci {
     pub const ON_PENDING: i32 = -5;
 }
 
-/// CPU state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum CpuState {
-    Offline = 0,
-    Starting = 1,
-    Online = 2,
-    Halted = 3,
-}
-
-/// Per-CPU data structure
-#[repr(C, align(64))]  // Cache line aligned
-pub struct PerCpu {
-    /// CPU ID (0-3)
-    pub cpu_id: u32,
-    /// Current state
-    pub state: AtomicU32,
-    /// Stack pointer for this CPU
-    pub stack_top: u64,
-    /// Current task slot (for scheduler)
-    pub current_task: AtomicU32,
-    /// Number of ticks processed
-    pub tick_count: AtomicU64,
-    /// Is this CPU idle?
-    pub idle: AtomicBool,
-    /// Padding to cache line
-    _pad: [u8; 32],
-}
-
-impl PerCpu {
-    pub const fn new(cpu_id: u32) -> Self {
-        Self {
-            cpu_id,
-            state: AtomicU32::new(CpuState::Offline as u32),
-            stack_top: 0,
-            current_task: AtomicU32::new(0xFFFFFFFF),
-            tick_count: AtomicU64::new(0),
-            idle: AtomicBool::new(true),
-            _pad: [0; 32],
-        }
-    }
-
-    pub fn get_state(&self) -> CpuState {
-        match self.state.load(Ordering::Acquire) {
-            0 => CpuState::Offline,
-            1 => CpuState::Starting,
-            2 => CpuState::Online,
-            _ => CpuState::Halted,
-        }
-    }
-
-    pub fn set_state(&self, state: CpuState) {
-        self.state.store(state as u32, Ordering::Release);
-    }
-}
-
-/// Per-CPU data array
-static mut PER_CPU: [PerCpu; MAX_CPUS] = [
-    PerCpu::new(0),
-    PerCpu::new(1),
-    PerCpu::new(2),
-    PerCpu::new(3),
-];
-
 /// Secondary CPU entry mailbox - each CPU polls its slot
 /// Contains the entry point address (0 = not ready)
 #[no_mangle]
@@ -117,39 +52,6 @@ pub struct CpuStacks {
 pub static mut CPU_STACKS: CpuStacks = CpuStacks {
     stacks: [[0; CPU_STACK_SIZE]; MAX_CPUS],
 };
-
-/// Get current CPU ID
-#[inline]
-pub fn cpu_id() -> u32 {
-    let mpidr: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr);
-    }
-    (mpidr & 0xFF) as u32
-}
-
-/// Get per-CPU data for current CPU
-pub fn this_cpu() -> &'static PerCpu {
-    unsafe { &PER_CPU[cpu_id() as usize] }
-}
-
-/// Get per-CPU data for specific CPU
-pub fn get_cpu(id: u32) -> Option<&'static PerCpu> {
-    if (id as usize) < MAX_CPUS {
-        unsafe { Some(&PER_CPU[id as usize]) }
-    } else {
-        None
-    }
-}
-
-/// Get mutable per-CPU data (unsafe)
-pub unsafe fn get_cpu_mut(id: u32) -> Option<&'static mut PerCpu> {
-    if (id as usize) < MAX_CPUS {
-        Some(&mut (*core::ptr::addr_of_mut!(PER_CPU))[id as usize])
-    } else {
-        None
-    }
-}
 
 /// Call PSCI function via HVC (QEMU virt — no EL3 firmware).
 #[cfg(feature = "platform-qemu-virt")]
@@ -220,7 +122,7 @@ pub fn cpu_affinity_info(cpu: u32) -> i32 {
 
 /// Initialize SMP - called from primary CPU
 pub fn init() {
-    let cpu = cpu_id();
+    let cpu = percpu::cpu_id();
     kdebug!("smp", "init"; primary_cpu = cpu as u64);
 
     // Check PSCI version
@@ -230,16 +132,13 @@ pub fn init() {
         kwarn!("smp", "psci_unavailable");
     }
 
-    // Initialize primary CPU's per-CPU data
+    // Initialize primary CPU's state via CpuData
     unsafe {
-        if let Some(pcpu) = get_cpu_mut(cpu) {
-            pcpu.stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
-            pcpu.set_state(CpuState::Online);
-            kinfo!("smp", "cpu_online"; cpu = cpu as u64);
-        } else {
-            kwarn!("smp", "cpu_init_failed"; cpu = cpu as u64);
-        }
+        let stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
+        percpu::CPU_DATA[cpu as usize].set_stack_top(stack_top);
+        percpu::CPU_DATA[cpu as usize].set_state(CpuState::Online);
     }
+    kinfo!("smp", "cpu_online"; cpu = cpu as u64);
 }
 
 /// Secondary CPU entry point (called from assembly)
@@ -250,14 +149,10 @@ pub extern "C" fn secondary_cpu_entry(cpu_id_arg: u64) {
     let cpu = cpu_id_arg as u32;
 
     // 1. Initialize per-CPU data (sets TPIDR_EL1)
-    crate::kernel::percpu::init_secondary_cpu(cpu);
+    percpu::init_secondary_cpu(cpu);
 
-    // 2. Mark CPU as online in SMP data
-    unsafe {
-        if let Some(pcpu) = get_cpu_mut(cpu) {
-            pcpu.set_state(CpuState::Online);
-        }
-    }
+    // 2. Mark CPU as online via CpuData
+    percpu::cpu_local().set_state(CpuState::Online);
 
     // 3. Initialize GIC CPU interface for this CPU
     crate::platform::current::gic::init_cpu();
@@ -279,7 +174,7 @@ pub extern "C" fn secondary_cpu_entry(cpu_id_arg: u64) {
 
 /// Start secondary CPUs
 pub fn start_secondary_cpus() {
-    let primary = cpu_id();
+    let primary = percpu::cpu_id();
     kdebug!("smp", "starting_secondary"; primary = primary as u64);
 
     // Get the physical address of secondary_start from boot.S
@@ -294,19 +189,11 @@ pub fn start_secondary_cpus() {
             continue;
         }
 
-        // Set up stack for this CPU
-        let setup_ok = unsafe {
-            if let Some(pcpu) = get_cpu_mut(cpu) {
-                pcpu.stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
-                pcpu.set_state(CpuState::Starting);
-                true
-            } else {
-                kwarn!("smp", "invalid_cpu_id"; cpu = cpu as u64);
-                false
-            }
-        };
-        if !setup_ok {
-            continue;
+        // Set up stack and state for this CPU via CpuData
+        unsafe {
+            let stack_top = CPU_STACKS.stacks[cpu as usize].as_ptr() as u64 + CPU_STACK_SIZE as u64;
+            percpu::CPU_DATA[cpu as usize].set_stack_top(stack_top);
+            percpu::CPU_DATA[cpu as usize].set_state(CpuState::Starting);
         }
 
         // Store entry point in mailbox
@@ -339,14 +226,7 @@ pub fn start_secondary_cpus() {
     }
 
     // Report status
-    let mut online_count = 0u32;
-    for cpu in 0..MAX_CPUS as u32 {
-        if let Some(pcpu) = get_cpu(cpu) {
-            if pcpu.get_state() == CpuState::Online {
-                online_count += 1;
-            }
-        }
-    }
+    let online_count = percpu::num_online_cpus();
     kinfo!("smp", "cpus_online"; count = online_count as u64);
 
     // Update scheduler's round-robin to distribute across all online CPUs
@@ -357,100 +237,25 @@ pub fn start_secondary_cpus() {
     }
 }
 
-/// Get number of online CPUs
-pub fn online_cpus() -> u32 {
-    let mut count = 0;
-    for cpu in 0..MAX_CPUS as u32 {
-        if let Some(pcpu) = get_cpu(cpu) {
-            if pcpu.get_state() == CpuState::Online {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
-// ============================================================================
-// Spinlock Implementation
-// ============================================================================
-
-/// A simple ticket spinlock
-#[repr(C)]
-pub struct SpinLock {
-    next_ticket: AtomicU32,
-    now_serving: AtomicU32,
-}
-
-impl SpinLock {
-    pub const fn new() -> Self {
-        Self {
-            next_ticket: AtomicU32::new(0),
-            now_serving: AtomicU32::new(0),
-        }
-    }
-
-    /// Acquire the lock
-    #[inline]
-    pub fn lock(&self) {
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
-        while self.now_serving.load(Ordering::Acquire) != ticket {
-            core::hint::spin_loop();
-        }
-    }
-
-    /// Release the lock
-    #[inline]
-    pub fn unlock(&self) {
-        self.now_serving.fetch_add(1, Ordering::Release);
-    }
-
-    /// Try to acquire the lock without blocking
-    pub fn try_lock(&self) -> bool {
-        let current = self.now_serving.load(Ordering::Relaxed);
-        self.next_ticket
-            .compare_exchange(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    }
-}
-
-/// RAII lock guard
-pub struct SpinLockGuard<'a> {
-    lock: &'a SpinLock,
-}
-
-impl<'a> SpinLockGuard<'a> {
-    pub fn new(lock: &'a SpinLock) -> Self {
-        lock.lock();
-        Self { lock }
-    }
-}
-
-impl Drop for SpinLockGuard<'_> {
-    fn drop(&mut self) {
-        self.lock.unlock();
-    }
-}
-
 /// Test SMP functionality
 pub fn test() {
     kdebug!("smp", "test_start");
 
-    let cpu = cpu_id();
+    let cpu = percpu::cpu_id();
     kdebug!("smp", "current_cpu"; cpu = cpu as u64);
 
-    // Test spinlock
-    static TEST_LOCK: SpinLock = SpinLock::new();
-    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+    // Test kernel SpinLock (ticket lock from kernel::lock)
+    static TEST_LOCK: crate::kernel::lock::SpinLock<u32> = crate::kernel::lock::SpinLock::new(0);
 
     {
-        let _guard = SpinLockGuard::new(&TEST_LOCK);
-        TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut guard = TEST_LOCK.lock();
+        *guard += 1;
     }
-    let counter = TEST_COUNTER.load(Ordering::Relaxed);
+    let counter = *TEST_LOCK.lock();
     kdebug!("smp", "spinlock_test"; counter = counter as u64);
 
     // Show online CPUs
-    let online = online_cpus();
+    let online = percpu::num_online_cpus();
     kdebug!("smp", "online_cpus"; count = online as u64);
 
     kinfo!("smp", "test_ok");

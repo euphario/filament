@@ -164,7 +164,7 @@ pub fn getpid() -> u32 {
 
 /// Wait for a child process to exit
 pub fn wait(pid: i32) -> i64 {
-    syscall1(sys::WAIT, pid as u64)
+    syscall3(sys::WAIT, pid as u64, 0, 0)
 }
 
 /// Kill a process by PID
@@ -273,6 +273,14 @@ pub fn set_log_level(level: u8) -> i64 {
 /// Reset the system
 pub fn reset() -> i64 {
     syscall0(sys::RESET)
+}
+
+/// Shutdown the system (PSCI SYSTEM_OFF on QEMU)
+///
+/// On QEMU, this causes the emulator to exit. On real hardware,
+/// falls back to reset. Requires ALL capabilities.
+pub fn shutdown(exit_code: u8) -> i64 {
+    syscall1(sys::SHUTDOWN, exit_code as u64)
 }
 
 
@@ -394,15 +402,17 @@ pub fn pci_enumerate(buf: &mut [abi::PciEnumEntry]) -> SysResult<usize> {
     let handle = open(ObjectType::PciBus, &[])?;
 
     // Read entries into the buffer (reinterpret as bytes)
+    let entry_size = core::mem::size_of::<abi::PciEnumEntry>();
     let byte_buf = unsafe {
         core::slice::from_raw_parts_mut(
             buf.as_mut_ptr() as *mut u8,
-            buf.len() * core::mem::size_of::<abi::PciEnumEntry>(),
+            buf.len() * entry_size,
         )
     };
     let result = read(handle, byte_buf);
     let _ = close(handle);
-    result
+    // Kernel returns byte count — convert to entry count
+    result.map(|bytes| bytes / entry_size)
 }
 
 // ============================================================================

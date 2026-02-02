@@ -49,6 +49,8 @@ pub mod idle;
 // New syscall-facing trait implementations
 pub mod syscall_ctx_impl;
 pub mod object_ops_impl;
+pub mod raw_object_ops_impl;
 pub mod memory_ops_impl;
 pub mod process_ops_impl;
 pub mod user_access_impl;
+pub mod misc_ops_impl;

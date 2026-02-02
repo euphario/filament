@@ -96,6 +96,26 @@ pub trait SchedulingPolicy {
 /// Unassigned CPU sentinel
 const UNASSIGNED: u8 = 0xFF;
 
+/// 256-bit ready bitset (4 × u64 words)
+type ReadyBitset = [u64; 4];
+
+#[inline]
+fn bitset_set(bits: &mut ReadyBitset, slot: usize) {
+    bits[slot / 64] |= 1u64 << (slot % 64);
+}
+
+#[inline]
+fn bitset_clear(bits: &mut ReadyBitset, slot: usize) {
+    bits[slot / 64] &= !(1u64 << (slot % 64));
+}
+
+#[inline]
+fn bitset_clear_all(bits: &mut ReadyBitset) {
+    for w in bits.iter_mut() {
+        *w = 0;
+    }
+}
+
 /// Per-CPU queue scheduling with work stealing
 ///
 /// Each CPU has a ready bitset tracking which task slots are ready on it.
@@ -103,7 +123,7 @@ const UNASSIGNED: u8 = 0xFF;
 /// When a CPU's queue is empty, it steals from other CPUs.
 ///
 /// # Data Structures
-/// - `ready[cpu]`: u32 bitset — bit N set = task in slot N is ready on this CPU
+/// - `ready[cpu]`: [u64; 4] bitset — bit N set = task in slot N is ready on this CPU
 /// - `cpu_assign[slot]`: which CPU owns this task (0xFF = unassigned)
 ///
 /// # Complexity
@@ -111,7 +131,7 @@ const UNASSIGNED: u8 = 0xFF;
 /// - `select_next` with stealing: O(MAX_CPUS) in worst case
 pub struct PerCpuQueues {
     /// Per-CPU ready bitsets. Bit N = task slot N is ready on this CPU.
-    ready: [u32; percpu::MAX_CPUS],
+    ready: [ReadyBitset; percpu::MAX_CPUS],
     /// Which CPU each task is assigned to (UNASSIGNED = not assigned)
     cpu_assign: [u8; MAX_TASKS],
     /// Round-robin counter for task placement
@@ -123,7 +143,7 @@ pub struct PerCpuQueues {
 impl PerCpuQueues {
     pub const fn new() -> Self {
         Self {
-            ready: [0; percpu::MAX_CPUS],
+            ready: [[0u64; 4]; percpu::MAX_CPUS],
             cpu_assign: [UNASSIGNED; MAX_TASKS],
             next_cpu: 0,
             num_cpus: 1,
@@ -138,55 +158,27 @@ impl PerCpuQueues {
         }
     }
 
-    /// Rebuild ready bitsets from task array state.
-    ///
-    /// Called from `select_next` to keep bitsets in sync with actual task state,
-    /// since not all state transitions go through the policy callbacks yet.
-    fn sync_ready(&mut self, tasks: &[Option<Task>; MAX_TASKS]) {
-        // Clear all bitsets
-        for r in self.ready.iter_mut() {
-            *r = 0;
-        }
-
-        for slot in percpu::MAX_CPUS..MAX_TASKS {
-            if let Some(ref task) = tasks[slot] {
-                // Auto-assign unassigned tasks round-robin
-                if self.cpu_assign[slot] == UNASSIGNED {
-                    self.cpu_assign[slot] = self.next_cpu;
-                    self.next_cpu = (self.next_cpu + 1) % self.num_cpus;
-                }
-
-                if *task.state() == TaskState::Ready {
-                    let cpu = self.cpu_assign[slot] as usize;
-                    if cpu < percpu::MAX_CPUS {
-                        self.ready[cpu] |= 1 << slot;
-                    }
-                }
-            } else {
-                // Slot empty — clear assignment
-                self.cpu_assign[slot] = UNASSIGNED;
-            }
-        }
-    }
-
     /// Find highest-priority ready task from a bitset
-    fn best_from_bitset(&self, bitset: u32, tasks: &[Option<Task>; MAX_TASKS]) -> Option<usize> {
+    fn best_from_bitset(&self, bitset: &ReadyBitset, tasks: &[Option<Task>; MAX_TASKS]) -> Option<usize> {
         let mut best_slot: Option<usize> = None;
         let mut best_priority = Priority::Low;
-        let mut bits = bitset;
 
-        while bits != 0 {
-            let slot = bits.trailing_zeros() as usize;
-            bits &= bits - 1; // Clear lowest set bit
+        for (word_idx, &word) in bitset.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let slot = word_idx * 64 + bit;
+                bits &= bits - 1; // Clear lowest set bit
 
-            if slot < MAX_TASKS {
-                if let Some(ref task) = tasks[slot] {
-                    if *task.state() == TaskState::Ready {
-                        if best_slot.is_none() || task.priority < best_priority {
-                            best_slot = Some(slot);
-                            best_priority = task.priority;
-                            if best_priority == Priority::High {
-                                break;
+                if slot < MAX_TASKS {
+                    if let Some(ref task) = tasks[slot] {
+                        if *task.state() == TaskState::Ready {
+                            if best_slot.is_none() || task.priority < best_priority {
+                                best_slot = Some(slot);
+                                best_priority = task.priority;
+                                if best_priority == Priority::High {
+                                    return Some(slot);
+                                }
                             }
                         }
                     }
@@ -203,11 +195,8 @@ impl SchedulingPolicy for PerCpuQueues {
         let my_cpu = percpu::cpu_id() as usize;
         let my_idle = my_cpu;
 
-        // Rebuild bitsets from actual task state
-        self.sync_ready(tasks);
-
         // 1. Check local CPU's ready queue
-        if let Some(slot) = self.best_from_bitset(self.ready[my_cpu], tasks) {
+        if let Some(slot) = self.best_from_bitset(&self.ready[my_cpu], tasks) {
             return Some(slot);
         }
 
@@ -221,11 +210,9 @@ impl SchedulingPolicy for PerCpuQueues {
         }
 
         // 3. Work stealing — try other CPUs' queues (round-robin victim selection)
-        // Note: we run the task but don't reassign cpu_assign — the task returns
-        // to its home CPU on the next scheduling round via sync_ready().
         for offset in 1..percpu::MAX_CPUS {
             let victim = (my_cpu + offset) % percpu::MAX_CPUS;
-            if let Some(slot) = self.best_from_bitset(self.ready[victim], tasks) {
+            if let Some(slot) = self.best_from_bitset(&self.ready[victim], tasks) {
                 return Some(slot);
             }
         }
@@ -244,16 +231,15 @@ impl SchedulingPolicy for PerCpuQueues {
         if slot < MAX_TASKS {
             let cpu = self.cpu_assign[slot];
             if cpu != UNASSIGNED && (cpu as usize) < percpu::MAX_CPUS {
-                self.ready[cpu as usize] |= 1 << slot;
+                bitset_set(&mut self.ready[cpu as usize], slot);
             }
         }
     }
 
     fn on_task_blocked(&mut self, slot: usize) {
         if slot < MAX_TASKS {
-            // Clear from all CPU bitsets
             for r in self.ready.iter_mut() {
-                *r &= !(1 << slot);
+                bitset_clear(r, slot);
             }
         }
     }
@@ -261,7 +247,7 @@ impl SchedulingPolicy for PerCpuQueues {
     fn on_task_exit(&mut self, slot: usize) {
         if slot < MAX_TASKS {
             for r in self.ready.iter_mut() {
-                *r &= !(1 << slot);
+                bitset_clear(r, slot);
             }
             self.cpu_assign[slot] = UNASSIGNED;
         }

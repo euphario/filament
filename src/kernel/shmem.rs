@@ -413,15 +413,6 @@ impl ShmemState {
 /// Global shared memory table protected by SpinLock (SMP-safe)
 static SHMEM: SpinLock<ShmemState> = SpinLock::new(ShmemState::new());
 
-/// Execute a closure with exclusive access to the shmem table.
-/// SpinLock provides both IRQ and SMP safety.
-#[inline]
-#[allow(dead_code)]
-pub fn with_shmem_table<R, F: FnOnce(&mut [Option<SharedMem>; MAX_SHMEM_REGIONS]) -> R>(f: F) -> R {
-    let mut guard = SHMEM.lock();
-    f(&mut guard.table)
-}
-
 /// Initialize shared memory subsystem
 pub fn init() {
     let mut guard = SHMEM.lock();
@@ -517,11 +508,14 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
     region.size = aligned_size;
     region.ref_count = 1; // For compatibility - real tracking is in MappingTable
 
-    // Map into owner's address space (clean up phys pages on failure)
+    // Map into owner's address space (clean up phys pages + mapping on failure)
     let vaddr = match map_into_process(owner_pid, phys_addr as u64, aligned_size) {
         Ok(addr) => addr,
         Err(e) => {
             pmm::free_contiguous(phys_addr, num_pages);
+            // Rollback: remove the mapping we pre-registered
+            let mut guard = SHMEM.lock();
+            let _ = guard.mappings.remove_mapping(shmem_id, owner_pid);
             return Err(e);
         }
     };
@@ -1235,13 +1229,6 @@ pub fn finalize_cleanup(pid: Pid) {
 
         pmm::free_contiguous(phys_addr as usize, num_pages);
     }
-}
-
-/// Legacy single-phase cleanup (for backwards compatibility)
-/// Calls both phases immediately - use begin_cleanup + finalize_cleanup for graceful cleanup
-pub fn process_cleanup(pid: Pid) {
-    begin_cleanup(pid);
-    finalize_cleanup(pid);
 }
 
 // ============================================================================

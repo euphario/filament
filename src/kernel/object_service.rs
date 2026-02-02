@@ -102,10 +102,10 @@ impl<'a> TableGuard<'a> {
 
 /// Extract slot index from TaskId
 ///
-/// PID format: bits[7:0] = slot + 1 (1-16), bits[31:8] = generation
+/// PID format: bits[8:0] = slot + 1 (1-256), bits[31:9] = generation
 /// Returns None if invalid (slot 0 is reserved for idle)
 fn slot_from_task_id(task_id: TaskId) -> Option<usize> {
-    let slot_bits = (task_id & 0xFF) as usize;
+    let slot_bits = (task_id & 0x1FF) as usize;
     if slot_bits == 0 || slot_bits > MAX_TASKS {
         return None;
     }
@@ -338,95 +338,6 @@ impl ObjectService {
         };
 
         self.alloc_handle(task_id, obj_type, obj)
-    }
-
-    /// Read from console (stdin only)
-    pub fn read_console(
-        &self,
-        task_id: TaskId,
-        handle: Handle,
-        buf: &mut [u8],
-    ) -> Result<ReadAttempt, KernelError> {
-        use crate::platform::current::uart;
-        use crate::kernel::ipc::traits::Subscriber;
-        use crate::kernel::object::{Pollable};
-
-        let mut guard = self.lock_table(task_id)?;
-        let table = guard.table_mut()?;
-        let entry = table.get_mut(handle).ok_or(KernelError::BadHandle)?;
-
-        let Object::Console(ref mut c) = entry.object else {
-            return Err(KernelError::InvalidArg);
-        };
-
-        // Only stdin is readable
-        if !matches!(c.console_type(), ConsoleType::Stdin) {
-            return Err(KernelError::NotSupported);
-        }
-
-        if buf.is_empty() {
-            return Ok(ReadAttempt::Success(0));
-        }
-
-        // Read from UART RX buffer
-        let mut bytes_read = 0;
-        for byte in buf.iter_mut() {
-            if let Some(b) = uart::rx_buffer_read() {
-                *byte = b;
-                bytes_read += 1;
-            } else {
-                break;
-            }
-        }
-
-        if bytes_read > 0 {
-            Ok(ReadAttempt::Success(bytes_read))
-        } else {
-            // Register for wake when input arrives (IRQ-based)
-            let sub = Subscriber {
-                task_id,
-                generation: crate::kernel::task::Scheduler::generation_from_pid(task_id),
-            };
-            c.subscribe(sub);
-            Ok(ReadAttempt::NeedBlock)
-        }
-    }
-
-    /// Write to console (stdout/stderr only)
-    pub fn write_console(
-        &self,
-        task_id: TaskId,
-        handle: Handle,
-        buf: &[u8],
-    ) -> Result<usize, KernelError> {
-        use crate::platform::current::uart;
-
-        // Validate handle and console type under lock
-        let is_writable = {
-            let guard = self.lock_table(task_id)?;
-            let table = guard.table()?;
-            let entry = table.get(handle).ok_or(KernelError::BadHandle)?;
-
-            let Object::Console(ref c) = entry.object else {
-                return Err(KernelError::InvalidArg);
-            };
-
-            matches!(c.console_type(), ConsoleType::Stdout | ConsoleType::Stderr)
-        };
-        // guard dropped here
-
-        if !is_writable {
-            return Err(KernelError::NotSupported);
-        }
-
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        // Write outside lock (UART doesn't need ObjectService lock)
-        uart::write_buffered(buf);
-        uart::flush_buffer();
-        Ok(buf.len())
     }
 
     // ========================================================================
@@ -728,111 +639,6 @@ impl ObjectService {
         Ok(handle)
     }
 
-    /// Read from channel (receive message)
-    pub fn read_channel(
-        &self,
-        task_id: TaskId,
-        handle: Handle,
-        buf: &mut [u8],
-    ) -> Result<ReadAttempt, KernelError> {
-        use crate::kernel::ipc;
-
-        // Get channel info from object table
-        let channel_id = {
-            let guard = self.lock_table(task_id)?;
-            let table = guard.table()?;
-            let entry = table.get(handle).ok_or(KernelError::BadHandle)?;
-
-            let Object::Channel(ref ch) = entry.object else {
-                return Err(KernelError::InvalidArg);
-            };
-
-            // Check state
-            if ch.is_closed() && !ipc::channel_has_messages(ch.channel_id()) {
-                return Ok(ReadAttempt::Closed);
-            }
-
-            let channel_id = ch.channel_id();
-            if channel_id == 0 {
-                return Ok(ReadAttempt::Closed);
-            }
-
-            channel_id
-        };
-        // guard dropped here
-
-        // Receive from IPC backend (outside lock)
-        match ipc::receive(channel_id, task_id) {
-            Ok(msg) => {
-                let payload = msg.payload_slice();
-                let copy_len = core::cmp::min(payload.len(), buf.len());
-                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                Ok(ReadAttempt::Success(copy_len))
-            }
-            Err(ipc::IpcError::WouldBlock) => Ok(ReadAttempt::NeedBlock),
-            Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
-                Ok(ReadAttempt::Closed)
-            }
-            Err(_) => Err(KernelError::BadHandle),
-        }
-    }
-
-    /// Write to channel (send message)
-    pub fn write_channel(
-        &self,
-        task_id: TaskId,
-        handle: Handle,
-        buf: &[u8],
-    ) -> Result<usize, KernelError> {
-        use crate::kernel::ipc::{self, waker};
-
-        if buf.len() > ipc::MAX_INLINE_PAYLOAD {
-            return Err(KernelError::InvalidArg);
-        }
-
-        // Get channel info from object table
-        let channel_id = {
-            let guard = self.lock_table(task_id)?;
-            let table = guard.table()?;
-            let entry = table.get(handle).ok_or(KernelError::BadHandle)?;
-
-            let Object::Channel(ref ch) = entry.object else {
-                return Err(KernelError::InvalidArg);
-            };
-
-            // Check state
-            if !ch.is_open() {
-                return Err(KernelError::PeerClosed);
-            }
-
-            let channel_id = ch.channel_id();
-            if channel_id == 0 {
-                return Err(KernelError::PeerClosed);
-            }
-
-            channel_id
-        };
-        // guard dropped here
-
-        // Create and send message (outside lock)
-        let msg = ipc::Message::data(task_id, buf);
-
-        match ipc::send(channel_id, msg, task_id) {
-            Ok(peer) => {
-                let wake_list = self.wake_channel(
-                    peer.task_id, peer.channel_id, abi::mux_filter::READABLE,
-                );
-                waker::wake(&wake_list, ipc::WakeReason::Readable);
-                Ok(buf.len())
-            }
-            Err(ipc::IpcError::QueueFull) => Err(KernelError::WouldBlock),
-            Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
-                Err(KernelError::PeerClosed)
-            }
-            Err(_) => Err(KernelError::BadHandle),
-        }
-    }
-
     // ========================================================================
     // Mux Operations
     // ========================================================================
@@ -930,7 +736,13 @@ impl ObjectService {
         // Map existing shmem region (outside lock)
         let (vaddr, paddr) = shmem::map(task_id, shmem_id)
             .map_err(KernelError::from_errno)?;
-        let size = shmem::get_size(shmem_id).unwrap_or(0);
+        let size = match shmem::get_size(shmem_id) {
+            Some(s) => s,
+            None => {
+                let _ = shmem::unmap(task_id, shmem_id);
+                return Err(KernelError::NotFound);
+            }
+        };
 
         // Allocate handle in object table
         let mut guard = self.lock_table(task_id)?;

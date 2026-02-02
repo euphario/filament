@@ -14,6 +14,31 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// Cached count of online CPUs. Starts at 1 (boot CPU), incremented by
+/// each secondary CPU in `init_secondary_cpu()`.
+static ONLINE_CPU_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// CPU lifecycle state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CpuState {
+    Offline = 0,
+    Starting = 1,
+    Online = 2,
+    Halted = 3,
+}
+
+impl CpuState {
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0 => CpuState::Offline,
+            1 => CpuState::Starting,
+            2 => CpuState::Online,
+            _ => CpuState::Halted,
+        }
+    }
+}
+
 /// Maximum number of CPUs supported
 pub const MAX_CPUS: usize = 4;
 
@@ -71,6 +96,15 @@ pub struct CpuData {
     /// Assembly checks this to skip storing return value when switched.
     /// Replaces the former global SYSCALL_SWITCHED_TASK for SMP safety.
     pub syscall_switched: AtomicU64,
+
+    // --- Fields below are NOT accessed from assembly (offset 88+) ---
+
+    /// CPU lifecycle state (Offline/Starting/Online/Halted)
+    pub state: AtomicU32,
+    /// Padding for 8-byte alignment
+    _pad_state: u32,
+    /// Stack top address set during SMP boot
+    pub stack_top: AtomicU64,
 }
 
 // Assembly offsets into CpuData (must match #[repr(C)] layout above)
@@ -82,6 +116,17 @@ pub struct CpuData {
 pub const CPUDATA_OFFSET_TRAP_FRAME: usize = 64;
 pub const CPUDATA_OFFSET_TTBR0: usize = 72;
 pub const CPUDATA_OFFSET_SWITCHED: usize = 80;
+
+// Compile-time verification that assembly offsets match actual layout.
+// If any field is added/reordered, these will fail to compile.
+const _: () = {
+    assert!(core::mem::offset_of!(CpuData, trap_frame_ptr) == CPUDATA_OFFSET_TRAP_FRAME);
+    assert!(core::mem::offset_of!(CpuData, ttbr0) == CPUDATA_OFFSET_TTBR0);
+    assert!(core::mem::offset_of!(CpuData, syscall_switched) == CPUDATA_OFFSET_SWITCHED);
+    // New fields are after assembly-visible region — verify they don't overlap
+    assert!(core::mem::offset_of!(CpuData, state) == 88);
+    assert!(core::mem::offset_of!(CpuData, stack_top) == 96);
+};
 
 impl CpuData {
     /// Create a new CpuData for the given CPU ID.
@@ -100,6 +145,9 @@ impl CpuData {
             trap_frame_ptr: AtomicU64::new(0),
             ttbr0: AtomicU64::new(0),
             syscall_switched: AtomicU64::new(0),
+            state: AtomicU32::new(CpuState::Offline as u32),
+            _pad_state: 0,
+            stack_top: AtomicU64::new(0),
         }
     }
 
@@ -180,6 +228,30 @@ impl CpuData {
     pub fn is_idle(&self) -> bool {
         self.in_idle.load(Ordering::Acquire) != 0
     }
+
+    /// Get CPU lifecycle state
+    #[inline]
+    pub fn get_state(&self) -> CpuState {
+        CpuState::from_u32(self.state.load(Ordering::Acquire))
+    }
+
+    /// Set CPU lifecycle state
+    #[inline]
+    pub fn set_state(&self, state: CpuState) {
+        self.state.store(state as u32, Ordering::Release);
+    }
+
+    /// Get stack top address
+    #[inline]
+    pub fn get_stack_top(&self) -> u64 {
+        self.stack_top.load(Ordering::Relaxed)
+    }
+
+    /// Set stack top address
+    #[inline]
+    pub fn set_stack_top(&self, addr: u64) {
+        self.stack_top.store(addr, Ordering::Relaxed);
+    }
 }
 
 // ============================================================================
@@ -227,8 +299,8 @@ pub fn get_syscall_switched() -> u64 {
 // SAFETY: CpuData is designed for per-CPU access patterns
 unsafe impl Sync for CpuData {}
 
-/// Static array of per-CPU data (for now, single core)
-static mut CPU_DATA: [CpuData; MAX_CPUS] = [
+/// Static array of per-CPU data
+pub static mut CPU_DATA: [CpuData; MAX_CPUS] = [
     CpuData::new(0),
     CpuData::new(1),
     CpuData::new(2),
@@ -279,6 +351,9 @@ pub fn init_secondary_cpu(cpu_id: u32) {
 
         CPU_DATA[cpu_id as usize].cpu_id = cpu_id;
     }
+
+    // Increment cached online CPU count
+    ONLINE_CPU_COUNT.fetch_add(1, Ordering::Release);
 }
 
 /// Get a reference to the current CPU's data.
@@ -345,10 +420,21 @@ fn read_cpu_id() -> u32 {
     (mpidr & 0xFF) as u32
 }
 
-/// Get the number of online CPUs.
+/// Get the number of online CPUs (cached, O(1)).
 #[inline]
 pub fn num_online_cpus() -> u32 {
-    crate::arch::aarch64::smp::online_cpus()
+    ONLINE_CPU_COUNT.load(Ordering::Acquire)
+}
+
+/// Get a reference to a specific CPU's data, returning `None` if
+/// `cpu_id` is out of bounds.
+#[inline]
+pub fn try_get_cpu_data(cpu_id: usize) -> Option<&'static CpuData> {
+    if cpu_id >= MAX_CPUS {
+        return None;
+    }
+    // SAFETY: CPU_DATA is initialized at boot; index is bounds-checked above.
+    Some(unsafe { &CPU_DATA[cpu_id] })
 }
 
 /// Check if we're on the boot CPU.

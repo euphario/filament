@@ -55,26 +55,8 @@ use crate::error::SysError;
 // Configuration
 // =============================================================================
 
-/// Configuration for creating a DataPort
-#[derive(Clone, Copy)]
-pub struct DataPortConfig {
-    /// Number of SQ/CQ entries (power of 2)
-    pub ring_size: u16,
-    /// Number of sidechannel entries (power of 2, 0 to disable)
-    pub side_size: u16,
-    /// Size of data buffer pool in bytes
-    pub pool_size: u32,
-}
-
-impl Default for DataPortConfig {
-    fn default() -> Self {
-        Self {
-            ring_size: 64,
-            side_size: 8,
-            pool_size: 256 * 1024, // 256KB default pool
-        }
-    }
-}
+/// Configuration for creating a DataPort (alias for BlockPortConfig)
+pub type DataPortConfig = crate::bus::BlockPortConfig;
 
 // =============================================================================
 // Port Role
@@ -367,18 +349,16 @@ impl DataPort {
         }
         // side_send() already rings the doorbell
 
-        // Wait for response (simple blocking wait)
-        // In production, integrate with event loop
+        // Wait for response using kernel-backed blocking (no busy-wait).
+        // Each iteration blocks up to 10ms, retries up to 100 times (1s total).
         for _ in 0..100 {
-            // Use poll_side_response() which doesn't consume REQUEST entries
-            // This allows the provider to read our request while we wait
             if let Some(resp) = self.poll_side_response() {
                 if resp.tag == tag {
                     return Some(resp);
                 }
             }
-            // Use short sleep since ring.wait() doesn't support timeout properly
-            crate::syscall::sleep_us(1000);
+            // Block until doorbell/shmem notification or timeout
+            self.wait(10);
         }
         None
     }
@@ -568,14 +548,8 @@ impl DataPort {
 // Query Helpers
 // =============================================================================
 
-/// Query: Get block device geometry
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct GeometryInfo {
-    pub block_size: u32,
-    pub block_count: u64,
-    pub max_transfer: u32,
-}
+/// Block device geometry (alias for BlockGeometry)
+pub type GeometryInfo = crate::bus::BlockGeometry;
 
 impl DataPort {
     /// Query block geometry from provider

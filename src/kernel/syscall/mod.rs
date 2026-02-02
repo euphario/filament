@@ -26,11 +26,11 @@ mod process;
 
 use crate::{kwarn, kdebug};
 use crate::span;
-#[allow(unused_imports)]  // Used for phys_to_dma method on dyn Platform
-use crate::hal::Platform;
 use super::uaccess::UAccessError;
 use super::caps::Capabilities;
 use super::error::KernelError;
+use super::syscall_ctx_impl::create_syscall_context;
+use super::traits::syscall_ctx::SyscallContext;
 
 /// Syscall numbers
 ///
@@ -57,15 +57,14 @@ pub enum SyscallNumber {
     Kill = 33,
     PsInfo = 34,
     SetLogLevel = 35,
-    MmapDma = 36,
+    // 36: legacy MmapDma (removed) - use open(DmaPool) + map()
     Reset = 37,
-    // 38-47: legacy shmem (removed) - use unified open/read/write/close
+    Shutdown = 38,
+    // 39-47: legacy shmem (removed) - use unified open/read/write/close
     // 51-54: legacy PCI config (removed) - use unified open/read/write
     // SignalAllow = 56 - REMOVED: replaced by capability-based permissions
     // 57-59: legacy timer/heartbeat/bus_list (removed)
-    MmapDevice = 60,
-    DmaPoolCreate = 61,
-    DmaPoolCreateHigh = 62,
+    // 60-62: legacy MmapDevice/DmaPoolCreate/DmaPoolCreateHigh (removed) - use open(Mmio/DmaPool) + map()
     RamfsList = 63,
     ExecMem = 64,
     KlogRead = 65,
@@ -110,15 +109,14 @@ impl From<u64> for SyscallNumber {
             33 => SyscallNumber::Kill,
             34 => SyscallNumber::PsInfo,
             35 => SyscallNumber::SetLogLevel,
-            36 => SyscallNumber::MmapDma,
+            // 36: legacy MmapDma -> Invalid (use open(DmaPool) + map())
             37 => SyscallNumber::Reset,
+            38 => SyscallNumber::Shutdown,
             // 39-47: legacy shmem -> Invalid (use unified interface)
             // 51-54: legacy PCI -> Invalid (use unified interface)
             // 56 => SignalAllow - REMOVED (use capabilities)
             // 59: legacy BusList -> Invalid (use unified interface)
-            60 => SyscallNumber::MmapDevice,
-            61 => SyscallNumber::DmaPoolCreate,
-            62 => SyscallNumber::DmaPoolCreateHigh,
+            // 60-62: legacy MmapDevice/DmaPoolCreate/DmaPoolCreateHigh -> Invalid
             63 => SyscallNumber::RamfsList,
             64 => SyscallNumber::ExecMem,
             65 => SyscallNumber::KlogRead,
@@ -164,29 +162,29 @@ fn uaccess_to_errno(e: UAccessError) -> i64 {
     e.to_errno() as i64
 }
 
-/// Get current process ID from scheduler
+/// Get current process ID via SyscallContext
 fn current_pid() -> u32 {
-    super::task::with_scheduler(|sched| sched.current_task_id().unwrap_or(1))
+    create_syscall_context().current_task_id().unwrap_or(1)
 }
 
 /// Check if current task has the required capability
 /// Returns Ok(()) if the capability is present, or an error code if not
 pub(crate) fn require_capability(cap: Capabilities) -> Result<(), i64> {
-    super::task::with_scheduler(|sched| {
-        if let Some(task) = sched.current_task() {
-            if task.has_capability(cap) {
-                return Ok(());
-            }
-            // Log via security infrastructure
-            super::security_log::log_security_event(
-                super::security_log::SecurityEvent::CapabilityDenied,
-                task.id,
-                "", // cap name logged separately
-            );
-            kwarn!("security", "cap_denied"; pid = task.id as u64, cap = core::any::type_name_of_val(&cap));
-        }
-        Err(KernelError::PermDenied.to_errno())
-    })
+    let ctx = create_syscall_context();
+    if ctx.has_capability(cap.bits()) {
+        return Ok(());
+    }
+
+    // Log denied capability via security infrastructure
+    if let Some(pid) = ctx.current_task_id() {
+        super::security_log::log_security_event(
+            super::security_log::SecurityEvent::CapabilityDenied,
+            pid,
+            "",
+        );
+        kwarn!("security", "cap_denied"; pid = pid as u64, cap = core::any::type_name_of_val(&cap));
+    }
+    Err(KernelError::PermDenied.to_errno())
 }
 
 // ============================================================================
@@ -239,6 +237,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Klog => misc::sys_klog(args.arg0 as u8, args.arg1, args.arg2 as usize),
         SyscallNumber::KlogWrite => misc::sys_klog_write(args.arg0, args.arg1 as usize),
         SyscallNumber::Reset => misc::sys_reset(),
+        SyscallNumber::Shutdown => misc::sys_shutdown(args.arg0 as u8),
         // SignalAllow removed - use capability-based permissions
         // CpuStats removed - use userspace service
         SyscallNumber::RamfsList => misc::sys_ramfs_list(args.arg0, args.arg1 as usize),
@@ -246,19 +245,30 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         // Memory management (memory.rs)
         SyscallNumber::Mmap => memory::sys_mmap(args.arg0, args.arg1 as usize, args.arg2 as u32),
         SyscallNumber::Munmap => memory::sys_munmap(args.arg0, args.arg1 as usize),
-        SyscallNumber::MmapDma => memory::sys_mmap_dma(args.arg0 as usize, args.arg1),
-        SyscallNumber::MmapDevice => memory::sys_mmap_device(args.arg0, args.arg1),
-        SyscallNumber::DmaPoolCreate => memory::sys_dma_pool_create(args.arg0 as usize, args.arg1, args.arg2),
-        SyscallNumber::DmaPoolCreateHigh => memory::sys_dma_pool_create_high(args.arg0 as usize, args.arg1, args.arg2),
 
         // Legacy shmem (39-47) and PCI (51-54, 59, 75) removed - use unified interface (100-104)
 
-        // Unified interface (100-105) - THE 6 SYSCALLS
-        SyscallNumber::Open => super::object::syscall::open(args.arg0 as u32, args.arg1, args.arg2 as usize),
-        SyscallNumber::Read => super::object::syscall::read(args.arg0 as u32, args.arg1, args.arg2 as usize),
-        SyscallNumber::Write => super::object::syscall::write(args.arg0 as u32, args.arg1, args.arg2 as usize),
-        SyscallNumber::Map => super::object::syscall::map(args.arg0 as u32, args.arg1 as u32),
-        SyscallNumber::Close => super::object::syscall::close(args.arg0 as u32),
+        // Unified interface (100-105) - THE 6 SYSCALLS (via RawObjectOps trait)
+        SyscallNumber::Open => {
+            let ctx = create_syscall_context();
+            ctx.raw_objects().open(args.arg0 as u32, args.arg1, args.arg2 as usize)
+        }
+        SyscallNumber::Read => {
+            let ctx = create_syscall_context();
+            ctx.raw_objects().read(args.arg0 as u32, args.arg1, args.arg2 as usize)
+        }
+        SyscallNumber::Write => {
+            let ctx = create_syscall_context();
+            ctx.raw_objects().write(args.arg0 as u32, args.arg1, args.arg2 as usize)
+        }
+        SyscallNumber::Map => {
+            let ctx = create_syscall_context();
+            ctx.raw_objects().map(args.arg0 as u32, args.arg1 as u32)
+        }
+        SyscallNumber::Close => {
+            let ctx = create_syscall_context();
+            ctx.raw_objects().close(args.arg0 as u32)
+        }
         SyscallNumber::UnifiedExit => process::sys_exit(args.arg0 as i32),
 
         // Invalid or legacy syscall numbers -> ENOSYS
@@ -294,12 +304,9 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::Kill => "kill",
         SyscallNumber::PsInfo => "ps_info",
         SyscallNumber::SetLogLevel => "set_log_level",
-        SyscallNumber::MmapDma => "mmap_dma",
         SyscallNumber::Reset => "reset",
+        SyscallNumber::Shutdown => "shutdown",
         // Misc
-        SyscallNumber::MmapDevice => "mmap_device",
-        SyscallNumber::DmaPoolCreate => "dma_pool_create",
-        SyscallNumber::DmaPoolCreateHigh => "dma_pool_create_high",
         SyscallNumber::RamfsList => "ramfs_list",
         SyscallNumber::ExecMem => "exec_mem",
         SyscallNumber::KlogRead => "klog_read",
@@ -331,27 +338,7 @@ pub extern "C" fn syscall_handler_rust(
     arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, _unused: u64, num: u64
 ) -> i64 {
     // Storm protection: check if task is making too many syscalls
-    let storm_action = super::task::with_scheduler(|sched| {
-        let slot = super::task::current_slot();
-        if let Some(task) = sched.task_mut(slot) {
-            // Use logical ticks computed from hardware counter (not IRQ-incremented)
-            // This is more reliable since it doesn't depend on timer IRQ firing
-            let current_tick = crate::platform::current::timer::logical_ticks();
-
-            // Record activity and check for syscall storm via encapsulated methods
-            task.record_activity(current_tick);
-            let config = super::storm::StormConfig::new();
-            let action = task.record_storm_syscall(current_tick, &config);
-
-            // Reset liveness state if we're in PingSent with channel=0 (implicit pong)
-            // The syscall itself IS the pong - proves the task is alive and responsive
-            task.reset_liveness_if_implicit_pong();
-
-            action
-        } else {
-            super::storm::StormAction::Allow
-        }
-    });
+    let storm_action = super::storm::check_syscall_storm(num);
 
     // Handle storm action BEFORE processing syscall
     match storm_action {
@@ -374,7 +361,7 @@ pub extern "C" fn syscall_handler_rust(
 
             // Block the task with a deadline using the proper sched API
             // This handles state transition and deadline tracking
-            if !crate::kernel::sched::wait_current(
+            if !crate::kernel::sched::wait_and_reschedule(
                 super::task::state::WaitReason::Throttled,
                 deadline
             ) {
@@ -382,9 +369,6 @@ pub extern "C" fn syscall_handler_rust(
                 // Fall back to just returning EAGAIN
                 return -11;
             }
-
-            // Trigger reschedule - another task will run while we're blocked
-            crate::kernel::sched::reschedule();
 
             // When we wake up, return EAGAIN so userspace knows to retry
             return -11; // EAGAIN

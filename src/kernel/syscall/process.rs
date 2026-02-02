@@ -10,19 +10,20 @@
 //!
 //! Syscalls are thin wrappers that:
 //! 1. Validate user input (pointers, capabilities)
-//! 2. Call lifecycle functions for state transitions
+//! 2. Call ProcessOps trait methods for state transitions
 //! 3. Handle scheduling if task state changed
 //!
-//! Core lifecycle logic is in `kernel::task::lifecycle`.
+//! Core lifecycle logic is in `kernel::process_ops_impl`.
 //!
 //! SECURITY: All user pointers are validated before access using the uaccess module.
 
-use crate::{kwarn, kinfo, print_direct};
+use crate::{kwarn, kinfo};
 use super::super::uaccess;
 use super::super::caps::Capabilities;
-use super::super::task::{self, lifecycle};
+use crate::kernel::traits::process_ops::WaitChildResult;
 use super::super::syscall_ctx_impl::create_syscall_context;
 use super::super::traits::syscall_ctx::SyscallContext;
+use super::super::traits::process_ops::SpawnSource;
 use super::uaccess_to_errno;
 use crate::kernel::error::KernelError;
 
@@ -34,19 +35,10 @@ pub use abi::ProcessInfo;
 
 /// Exit current process
 ///
-/// Delegates to lifecycle::exit() for state transition and parent notification,
-/// then handles scheduling.
+/// Delegates to ProcessOps::exit() for state transition, parent notification,
+/// and scheduling.
 pub(super) fn sys_exit(code: i32) -> i64 {
     let ctx = create_syscall_context();
-
-    // Flush UART buffer so pending output from this process appears first
-    while crate::platform::current::uart::has_buffered_output() {
-        crate::platform::current::uart::flush_buffer();
-    }
-
-    print_direct!("\n========================================\n");
-    print_direct!("  Process exited with code: {}\n", code);
-    print_direct!("========================================\n");
 
     let pid = match ctx.current_task_id() {
         Some(id) => id,
@@ -56,54 +48,8 @@ pub(super) fn sys_exit(code: i32) -> i64 {
         }
     };
 
-    task::with_scheduler(|sched| {
-        let current_slot = task::current_slot();
-
-        // Delegate state transition and parent notification to lifecycle module
-        // NOTE: Resource cleanup is deferred to reap_terminated() for two-phase cleanup.
-        if let Err(e) = lifecycle::exit(sched, pid, code) {
-            kinfo!("sys_exit", "lifecycle_error"; err = e as i64);
-        }
-
-        // Debug: show task states before scheduling
-        print_direct!("  Task states at exit (current_slot={}):\n", current_slot);
-        for (i, task_opt) in sched.iter_tasks() {
-            if let Some(task) = task_opt {
-                print_direct!("    [{}] {} - {}\n", i, task.name_str(), task.state().name());
-            }
-        }
-
-        // Schedule next task
-        if let Some(next_slot) = sched.schedule() {
-            // Internal scheduling detail, don't log
-
-            // Update scheduler state - actual TTBR0 switch happens in assembly
-            // at exception return (assembly loads per-CPU TTBR0 and switches)
-            task::set_current_slot(next_slot);
-            if let Some(next) = sched.task_mut(next_slot) {
-                crate::transition_or_evict!(next, set_running);
-                // Update per-CPU data directly (can't call update_current_task_globals
-                // here because we already hold the scheduler lock)
-                let trap_ptr = &mut next.trap_frame as *mut task::TrapFrame;
-                crate::kernel::percpu::set_trap_frame(trap_ptr);
-                if let Some(ref addr_space) = next.address_space {
-                    crate::kernel::percpu::set_ttbr0(addr_space.get_ttbr0());
-                }
-            }
-            // Only set flag for user tasks (not idle) - this tells IRQ handler
-            // to use user return path instead of kernel return path
-            if !crate::kernel::sched::is_idle_slot(next_slot) {
-                crate::kernel::percpu::set_syscall_switched(1);
-            }
-            0
-        } else {
-            // No more tasks - halt
-            kinfo!("sys_exit", "halt_no_tasks");
-            loop {
-                unsafe { core::arch::asm!("wfi"); }
-            }
-        }
-    })
+    ctx.process().exit(pid, code);
+    // Never reached — exit() -> !
 }
 
 /// Spawn a new process from a built-in ELF binary
@@ -130,12 +76,6 @@ pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
         Err(e) => return uaccess_to_errno(e),
     }
 
-    // Get the ELF binary by ID
-    let elf_data = match super::super::elf::get_elf_by_id(elf_id) {
-        Some(data) => data,
-        None => return KernelError::NotFound.to_errno(),
-    };
-
     // Parse name from kernel buffer
     let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("child");
 
@@ -145,10 +85,9 @@ pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
         None => return KernelError::NoProcess.to_errno(),
     };
 
-    // Spawn the child process
-    match super::super::elf::spawn_from_elf_with_parent(elf_data, name, parent_id) {
-        Ok((child_id, _slot)) => child_id as i64,
-        Err(_) => KernelError::OutOfMemory.to_errno(),
+    match ctx.process().spawn(parent_id, SpawnSource::ElfId(elf_id, name)) {
+        Ok(child_id) => child_id as i64,
+        Err(e) => e.to_errno(),
     }
 }
 
@@ -188,11 +127,9 @@ pub(super) fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
         None => return KernelError::NoProcess.to_errno(),
     };
 
-    // Try to spawn from ramfs path
-    match super::super::elf::spawn_from_path_with_parent(path, parent_id) {
-        Ok((child_id, _slot)) => child_id as i64,
-        Err(super::super::elf::ElfError::NotExecutable) => KernelError::NotFound.to_errno(),
-        Err(_) => KernelError::OutOfMemory.to_errno(),
+    match ctx.process().spawn(parent_id, SpawnSource::Path(path)) {
+        Ok(child_id) => child_id as i64,
+        Err(e) => e.to_errno(),
     }
 }
 
@@ -237,14 +174,12 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
         None => return KernelError::NoProcess.to_errno(),
     };
 
-    // Convert capabilities bitmask
-    let requested_caps = Capabilities::from_bits(capabilities);
+    // Convert capabilities bitmask to trait type
+    let trait_caps = crate::kernel::traits::task::Capabilities(capabilities);
 
-    // Try to spawn from ramfs path with explicit capabilities
-    match super::super::elf::spawn_from_path_with_caps_find(path, parent_id, requested_caps) {
-        Ok((child_id, _slot)) => child_id as i64,
-        Err(super::super::elf::ElfError::NotExecutable) => KernelError::NotFound.to_errno(),
-        Err(_) => KernelError::OutOfMemory.to_errno(),
+    match ctx.process().spawn(parent_id, SpawnSource::PathWithCaps(path, trait_caps)) {
+        Ok(child_id) => child_id as i64,
+        Err(e) => e.to_errno(),
     }
 }
 
@@ -276,7 +211,6 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
     }
 
     // Allocate kernel buffer for ELF data
-    // Use the PMM for larger allocations
     let num_pages = (elf_len + 4095) / 4096;
     let elf_phys = match super::super::pmm::alloc_pages(num_pages) {
         Some(addr) => addr,
@@ -315,13 +249,10 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
         }
     };
 
-    // Spawn from the ELF data
-    let result = match super::super::elf::spawn_from_elf_with_parent(elf_slice, name, parent_id) {
-        Ok((child_id, _slot)) => child_id as i64,
-        Err(super::super::elf::ElfError::BadMagic) => KernelError::InvalidArg.to_errno(),
-        Err(super::super::elf::ElfError::NotExecutable) => KernelError::InvalidArg.to_errno(),
-        Err(super::super::elf::ElfError::WrongArch) => KernelError::InvalidArg.to_errno(),
-        Err(_) => KernelError::OutOfMemory.to_errno(),
+    // Spawn via ProcessOps trait
+    let result = match ctx.process().spawn(parent_id, SpawnSource::Memory(elf_slice, name)) {
+        Ok(child_id) => child_id as i64,
+        Err(e) => e.to_errno(),
     };
 
     // Free the kernel buffer (ELF data has been copied to process address space)
@@ -332,8 +263,7 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
 
 /// Wait for a child process to exit
 ///
-/// Delegates to lifecycle::wait_child() for child lookup and reaping,
-/// then handles user pointer write and blocking if needed.
+/// Delegates to ProcessOps::wait_child() for the blocking retry loop.
 ///
 /// Args: pid (-1 = any child, >0 = specific child), status_ptr (pointer to i32 for exit status), flags
 /// flags: 0 = block until child exits, WNOHANG (1) = return immediately if no child exited
@@ -354,55 +284,24 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
         }
     }
 
-    task::with_scheduler(|sched| {
-        let caller_slot = task::current_slot();
-
-        // Delegate to lifecycle module for child lookup and reaping
-        match lifecycle::wait_child(sched, caller_pid, pid, no_hang) {
-            lifecycle::WaitResult::Exited { pid: child_pid, code } => {
-                // Write exit status to user space if pointer provided
-                if status_ptr != 0 {
-                    if let Err(e) = uaccess::put_user::<i32>(status_ptr, code) {
-                        return uaccess_to_errno(e);
-                    }
+    match ctx.process().wait_child(caller_pid, pid, no_hang) {
+        WaitChildResult::Exited { pid: child_pid, code } => {
+            if status_ptr != 0 {
+                if let Err(e) = uaccess::put_user::<i32>(status_ptr, code) {
+                    return uaccess_to_errno(e);
                 }
-                // Return (pid << 32 | exit_code) as documented
-                ((child_pid as i64) << 32) | ((code as i64) & 0xFFFFFFFF)
             }
-
-            lifecycle::WaitResult::WouldBlock => {
-                // If WNOHANG, return 0 without blocking
-                if no_hang {
-                    return 0;
-                }
-
-                // Block caller waiting for child exit (via state machine)
-                if let Err(_e) = lifecycle::sleep_current(
-                    sched,
-                    caller_slot,
-                    task::SleepReason::EventLoop,
-                ) {
-                    return KernelError::InvalidArg.to_errno();
-                }
-
-                // Pre-store return value in caller's trap frame
-                if let Some(parent) = sched.task_mut(caller_slot) {
-                    parent.set_deferred_return(KernelError::WouldBlock.to_errno());
-                }
-
-                // Reschedule to another task
-                super::super::sched::reschedule();
-
-                KernelError::WouldBlock.to_errno()
-            }
-
-            lifecycle::WaitResult::NoChildren => KernelError::NoChild.to_errno(),
-            lifecycle::WaitResult::NotChild => KernelError::InvalidArg.to_errno(),
+            ((child_pid as i64) << 32) | ((code as i64) & 0xFFFFFFFF)
         }
-    })
+        WaitChildResult::WouldBlock => 0,
+        WaitChildResult::NoChildren => KernelError::NoChild.to_errno(),
+        WaitChildResult::NotChild => KernelError::InvalidArg.to_errno(),
+    }
 }
 
 /// Daemonize - detach from parent and become a daemon
+///
+/// Delegates to ProcessOps::daemonize() for parent-child detachment.
 pub(super) fn sys_daemonize() -> i64 {
     let ctx = create_syscall_context();
     let caller_pid = match ctx.current_task_id() {
@@ -410,37 +309,15 @@ pub(super) fn sys_daemonize() -> i64 {
         None => return KernelError::NoProcess.to_errno(),
     };
 
-    task::with_scheduler(|sched| {
-        // Find the calling task and detach from parent
-        let parent_id = if let Some(slot) = sched.slot_by_pid(caller_pid) {
-            if let Some(task) = sched.task_mut(slot) {
-                task.detach_from_parent()
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        // Remove from parent's children list and wake parent if blocked
-        if parent_id != 0 {
-            if let Some(parent_slot) = sched.slot_by_pid(parent_id) {
-                if let Some(parent) = sched.task_mut(parent_slot) {
-                    parent.remove_child(caller_pid);
-                }
-                // Wake up parent if it's blocked using unified wake function
-                sched.wake_task(parent_slot);
-            }
-        }
-    });
-
-    0  // Success
+    match ctx.process().daemonize(caller_pid) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
 }
 
 /// Kill a process by PID
 ///
-/// Delegates to lifecycle::kill() for state transition and parent notification,
-/// then handles scheduling if killing self.
+/// Delegates to ProcessOps::kill() for state transition and parent notification.
 ///
 /// SECURITY: Only allows killing:
 /// - The caller itself (suicide)
@@ -464,46 +341,16 @@ pub(super) fn sys_kill(pid: u32) -> i64 {
     // NOTE: Killing devd (is_init=true) is allowed for testing - recovery will be triggered.
     // The lifecycle::kill() function sets DEVD_LIVENESS_KILLED flag which causes
     // the timer handler to respawn devd and kill all other tasks.
-    // TODO: For production, consider requiring CAP_KILL capability for killing init.
 
     let caller_pid = match ctx.current_task_id() {
         Some(id) => id,
         None => return KernelError::NoProcess.to_errno(),
     };
 
-    task::with_scheduler(|sched| {
-        // Delegate to lifecycle module for permission check, state transition, and notification
-        // NOTE: Resource cleanup is deferred to reap_terminated() for two-phase cleanup.
-        match lifecycle::kill(sched, pid, caller_pid) {
-            Ok(()) => {}
-            Err(lifecycle::LifecycleError::NotFound) => return KernelError::NoProcess.to_errno(),
-            Err(lifecycle::LifecycleError::PermissionDenied) => {
-                kwarn!("security", "kill_denied"; caller = caller_pid as u64, target = pid as u64);
-                return KernelError::PermDenied.to_errno();
-            }
-            Err(lifecycle::LifecycleError::InvalidState) => return KernelError::InvalidArg.to_errno(),
-            Err(lifecycle::LifecycleError::NoChildren) => return KernelError::InvalidArg.to_errno(),
-        }
-
-        // If killing current task, the reschedule will be handled by do_resched_if_needed
-        // after this syscall returns. The current task is now in Exiting state, which
-        // will cause should_resched = true (is_terminated check in do_resched_if_needed).
-        //
-        // IMPORTANT: We must NOT do manual task switching here because:
-        // 1. The target task might need needs_context_restore (was context-switched out)
-        // 2. Proper context_switch requires releasing the scheduler lock first
-        // 3. do_resched_if_needed and reschedule() handle this correctly
-        //
-        // The flow after self-kill:
-        // 1. sys_kill returns 0
-        // 2. svc_handler sees SYSCALL_SWITCHED_TASK = 0 (we didn't set it)
-        // 3. svc_handler stores return value to current trap frame (dying task's)
-        // 4. svc_handler calls do_resched_if_needed
-        // 5. do_resched_if_needed sees current task is terminated -> should_resched = true
-        // 6. reschedule() properly handles context switch to next task
-
-        0  // Success
-    })
+    match ctx.process().kill(caller_pid, pid) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
 }
 
 /// Get process info list
@@ -516,59 +363,38 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
         return 0;
     }
 
-    // Validate user pointer
     let entry_size = core::mem::size_of::<ProcessInfo>();
     if let Err(e) = uaccess::validate_user_write(buf_ptr, entry_size * max_entries) {
         return uaccess_to_errno(e);
     }
 
-    task::with_scheduler(|sched| {
-        let mut count = 0usize;
+    let ctx = create_syscall_context();
 
-        for (slot, task_opt) in sched.iter_tasks() {
-            // Skip idle tasks (slots 0..MAX_CPUS) - internal kernel tasks
-            if crate::kernel::sched::is_idle_slot(slot) {
-                continue;
-            }
+    // Use stack buffer to collect entries via trait
+    // Limit to 64 to avoid excessive stack usage
+    let actual_max = max_entries.min(64);
+    let mut info_buf = [ProcessInfo {
+        pid: 0, ppid: 0, state: 0, liveness_status: 0, cpu: 0, _pad: 0,
+        activity_age_ms: 0, name: [0u8; 16],
+    }; 64];
 
-            if count >= max_entries {
-                break;
-            }
+    let count = ctx.process().list_processes(&mut info_buf[..actual_max], actual_max);
 
-            if let Some(task) = task_opt {
-                // Calculate activity age and liveness status via encapsulated accessors
-                let current_tick = crate::platform::current::timer::ticks();
-
-                let info = ProcessInfo {
-                    pid: task.id,
-                    ppid: task.parent_id,
-                    state: task.state().state_code(),
-                    liveness_status: task.get_liveness_status_code(),
-                    cpu: sched.task_cpu(slot).map_or(0xFF, |c| c as u8),
-                    _pad: 0,
-                    activity_age_ms: task.get_activity_age_ms(current_tick),
-                    name: task.name,
-                };
-
-                // Write to user buffer
-                let offset = (count * entry_size) as u64;
-                let info_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        &info as *const ProcessInfo as *const u8,
-                        entry_size
-                    )
-                };
-
-                if let Err(_) = uaccess::copy_to_user(buf_ptr + offset, info_bytes) {
-                    break;
-                }
-
-                count += 1;
-            }
+    // Copy entries to userspace
+    for i in 0..count {
+        let offset = (i * entry_size) as u64;
+        let info_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &info_buf[i] as *const ProcessInfo as *const u8,
+                entry_size,
+            )
+        };
+        if uaccess::copy_to_user(buf_ptr + offset, info_bytes).is_err() {
+            return i as i64;
         }
+    }
 
-        count as i64
-    })
+    count as i64
 }
 
 /// Get capabilities of a process
@@ -589,15 +415,8 @@ pub(super) fn sys_get_capabilities(pid: u32) -> i64 {
         pid
     };
 
-    task::with_scheduler(|sched| {
-        // Find the task by PID
-        if let Some(slot) = sched.slot_by_pid(target_pid) {
-            if let Some(task) = sched.task(slot) {
-                return task.get_capabilities_bits() as i64;
-            }
-        }
-
-        // Process not found
-        KernelError::NoProcess.to_errno()
-    })
+    match ctx.process().get_capabilities(target_pid) {
+        Ok(caps) => caps as i64,
+        Err(e) => e.to_errno(),
+    }
 }

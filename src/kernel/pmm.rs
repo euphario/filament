@@ -372,7 +372,12 @@ impl PhysicalMemoryManager {
         }
 
         if self.frame(page_idx).state == PageState::Used {
-            let new_ref = self.frame(page_idx).ref_count.saturating_sub(1);
+            let old_ref = self.frame(page_idx).ref_count;
+            if old_ref == 0 {
+                crate::kwarn!("pmm", "double_free"; addr = phys_addr as u64, page = page_idx as u64);
+                return;
+            }
+            let new_ref = old_ref - 1;
             self.frame_mut(page_idx).ref_count = new_ref;
 
             if new_ref == 0 {

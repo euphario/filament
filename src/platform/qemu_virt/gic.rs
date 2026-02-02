@@ -304,8 +304,13 @@ pub fn eoi(irq: u32) {
     unsafe { (*core::ptr::addr_of!(GIC)).eoi(irq); }
 }
 
+/// Initialize GIC for the calling CPU (ICC registers + per-CPU redistributor).
+///
+/// Called during secondary CPU boot. Sets up system register interface,
+/// wakes this CPU's redistributor, and configures SGI/PPI priorities.
 pub fn init_cpu() {
     unsafe {
+        // ICC system registers
         let mut sre: u64;
         core::arch::asm!("mrs {}, S3_0_C12_C12_5", out(reg) sre);
         sre |= 0x7;
@@ -316,6 +321,27 @@ pub fn init_cpu() {
         core::arch::asm!("msr S3_0_C12_C12_7, {}", in(reg) 1u64);
         core::arch::asm!("isb");
     }
+
+    // Per-CPU redistributor setup (each CPU has its own at GICR_BASE + cpu_id * 0x20000)
+    let cpu_id = crate::kernel::percpu::cpu_id() as usize;
+    let gicr = MmioRegion::new(GICR_BASE + cpu_id * 0x20000);
+
+    // Wake redistributor
+    let waker = gicr.read32(gicr::WAKER);
+    gicr.write32(gicr::WAKER, waker & !gicr_waker::PROCESSOR_SLEEP);
+    for _ in 0..100_000 {
+        if (gicr.read32(gicr::WAKER) & gicr_waker::CHILDREN_ASLEEP) == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    // Configure SGI/PPI group, priority, and enable SGIs
+    gicr.write32(gicr::IGROUPR0, 0xffffffff);
+    for i in 0..8u32 {
+        gicr.write32(gicr::IPRIORITYR + (i as usize) * 4, 0xa0a0a0a0);
+    }
+    gicr.write32(gicr::ISENABLER0, 0x0000ffff); // Enable SGIs 0-15
 }
 
 pub fn as_interrupt_controller() -> &'static dyn InterruptController {

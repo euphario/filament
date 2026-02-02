@@ -1091,10 +1091,18 @@ impl LayeredRing {
 
     // === Completion Queue ===
 
-    /// Post a completion
+    /// Post a completion. Returns false if CQ is full.
     pub fn cq_complete(&self, cqe: &IoCqe) -> bool {
         let h = self.header();
         let tail = h.cq_tail.load(Ordering::Relaxed);
+        let head = h.cq_head.load(Ordering::Acquire);
+        let next_tail = tail.wrapping_add(1);
+
+        // CQ full — consumer hasn't drained completions
+        if next_tail.wrapping_sub(head) > h.ring_size as u32 {
+            return false;
+        }
+
         let idx = (tail & h.ring_mask()) as usize;
 
         unsafe {
@@ -1103,7 +1111,7 @@ impl LayeredRing {
         }
 
         core::sync::atomic::fence(Ordering::Release);
-        h.cq_tail.store(tail.wrapping_add(1), Ordering::Release);
+        h.cq_tail.store(next_tail, Ordering::Release);
         true
     }
 
@@ -1245,7 +1253,8 @@ impl LayeredRing {
     /// Get slice at offset in pool
     pub fn pool_slice(&self, offset: u32, len: u32) -> Option<&[u8]> {
         let h = self.header();
-        if offset + len > h.pool_size {
+        let end = offset.checked_add(len)?;
+        if end > h.pool_size {
             return None;
         }
         unsafe {
@@ -1259,7 +1268,8 @@ impl LayeredRing {
     /// Get mutable slice at offset in pool
     pub fn pool_slice_mut(&self, offset: u32, len: u32) -> Option<&mut [u8]> {
         let h = self.header();
-        if offset + len > h.pool_size {
+        let end = offset.checked_add(len)?;
+        if end > h.pool_size {
             return None;
         }
         unsafe {
@@ -1298,13 +1308,17 @@ impl PoolAlloc {
 
     /// Allocate buffer, returns offset from pool base
     pub fn alloc(&mut self, len: u32) -> Option<u32> {
-        // Align to 64 bytes
-        let aligned = (len + 63) & !63;
-        if self.next + aligned > self.size {
+        if len == 0 {
             return None;
         }
-        let offset = self.base_offset + self.next;
-        self.next += aligned;
+        // Align to 64 bytes (checked to prevent wrap on large len)
+        let aligned = len.checked_add(63)? & !63;
+        let new_next = self.next.checked_add(aligned)?;
+        if new_next > self.size {
+            return None;
+        }
+        let offset = self.base_offset.checked_add(self.next)?;
+        self.next = new_next;
         Some(offset)
     }
 
@@ -1325,10 +1339,10 @@ impl PoolAlloc {
 
 /// Calculate minimum shared memory size for a layered ring
 pub const fn layered_ring_size(ring_size: u16, side_size: u16, pool_size: u32) -> usize {
-    let header = 64;
-    let sq = ring_size as usize * 32; // IoSqe is 32 bytes
-    let cq = ring_size as usize * 16; // IoCqe is 16 bytes
-    let side = side_size as usize * 32; // SideEntry is 32 bytes
+    let header = core::mem::size_of::<LayeredRingHeader>();
+    let sq = ring_size as usize * core::mem::size_of::<IoSqe>();
+    let cq = ring_size as usize * core::mem::size_of::<IoCqe>();
+    let side = side_size as usize * core::mem::size_of::<SideEntry>();
     header + sq + cq + side + pool_size as usize
 }
 
@@ -1378,9 +1392,10 @@ impl ChannelDoorbell {
         let (a, b) = crate::ipc::Channel::pair().ok()?;
         let ha = a.handle();
         let hb = b.handle();
-        // Detach handles from Channel — ChannelDoorbell owns the lifetime now
-        core::mem::forget(a);
-        core::mem::forget(b);
+        // Detach handles from Channel — ChannelDoorbell owns the lifetime now.
+        // ManuallyDrop prevents Channel::drop from closing the kernel handle.
+        let _ = core::mem::ManuallyDrop::new(a);
+        let _ = core::mem::ManuallyDrop::new(b);
         Some((
             Self { handle: ha },
             Self { handle: hb },

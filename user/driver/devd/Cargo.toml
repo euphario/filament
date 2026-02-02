@@ -7,6 +7,10 @@ edition = "2021"
 userlib = { path = "../../userlib" }
 abi = { path = "../../abi" }
 
+[features]
+default = []
+stress-test = []
+
 [profile.release]
 # Changed from opt-level = "s" to "2" to fix x29 frame pointer bug
 # With "s", the compiler generated code that didn't properly maintain x29,

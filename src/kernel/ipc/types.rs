@@ -26,7 +26,8 @@ pub const MAX_QUEUE_SIZE: usize = 8;
 
 /// Maximum number of channels
 /// Scales with MAX_BUSES: each bus needs ~4 channels (control + scheme opens)
-pub const MAX_CHANNELS: usize = crate::kernel::bus::MAX_BUSES * 4 + 32;
+/// +64 base for user programs (shell, stress tests, etc.)
+pub const MAX_CHANNELS: usize = crate::kernel::bus::MAX_BUSES * 4 + 64;
 
 /// Maximum number of ports
 pub const MAX_PORTS: usize = 32;

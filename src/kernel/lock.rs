@@ -22,9 +22,8 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
-#[cfg(debug_assertions)]
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, Ordering};
+
 
 // ============================================================================
 // Debug Statistics (for diagnosing lock contention)
@@ -79,14 +78,17 @@ mod stats {
     }
 }
 
-/// A spinlock that protects data with IRQ-safe semantics.
+/// A ticket spinlock that protects data with IRQ-safe semantics.
+///
+/// Uses ticket algorithm for FIFO fairness under SMP contention:
+/// each acquirer takes a ticket and waits until their number is served.
 ///
 /// When locked:
 /// 1. IRQs are disabled (prevents deadlock from interrupt handler)
 /// 2. Spinlock is acquired (for SMP safety)
 ///
 /// When guard is dropped:
-/// 1. Spinlock is released
+/// 1. Spinlock is released (now_serving incremented)
 /// 2. IRQ state is restored
 ///
 /// # Safety
@@ -94,7 +96,8 @@ mod stats {
 /// This lock is safe to use from both process and interrupt context,
 /// but code holding the lock MUST NOT block or sleep.
 pub struct SpinLock<T> {
-    locked: AtomicBool,
+    next_ticket: AtomicU32,
+    now_serving: AtomicU32,
     data: UnsafeCell<T>,
     #[cfg(debug_assertions)]
     owner_cpu: AtomicU32,
@@ -108,7 +111,8 @@ impl<T> SpinLock<T> {
     /// Create a new spinlock protecting the given data.
     pub const fn new(data: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            next_ticket: AtomicU32::new(0),
+            now_serving: AtomicU32::new(0),
             data: UnsafeCell::new(data),
             #[cfg(debug_assertions)]
             owner_cpu: AtomicU32::new(u32::MAX),
@@ -118,6 +122,7 @@ impl<T> SpinLock<T> {
     /// Acquire the lock, disabling IRQs first.
     ///
     /// Returns a guard that will release the lock and restore IRQs on drop.
+    /// Uses ticket algorithm for FIFO fairness.
     ///
     /// # Panics
     ///
@@ -127,13 +132,12 @@ impl<T> SpinLock<T> {
         // Step 1: Disable IRQs and save state
         let irqs_were_enabled = disable_irqs_save();
 
-        // Step 2: Acquire spinlock
+        // Step 2: Take a ticket and wait for our turn
         #[cfg(debug_assertions)]
         let cpu = cpu_id();
 
-        while self.locked.swap(true, Ordering::Acquire) {
-            // Spin until we acquire the lock
-            // On single-core, this should never spin (if lock is held, we have a bug)
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        while self.now_serving.load(Ordering::Acquire) != ticket {
             #[cfg(debug_assertions)]
             {
                 // Check for deadlock (same CPU already holds lock)
@@ -166,9 +170,13 @@ impl<T> SpinLock<T> {
         // Step 1: Disable IRQs and save state
         let irqs_were_enabled = disable_irqs_save();
 
-        // Step 2: Try to acquire lock
-        if self.locked.swap(true, Ordering::Acquire) {
-            // Lock was already held - restore IRQs and return None
+        // Step 2: Try to acquire lock (only succeeds if no one is waiting)
+        let current = self.now_serving.load(Ordering::Relaxed);
+        if self.next_ticket.compare_exchange(
+            current, current.wrapping_add(1),
+            Ordering::Acquire, Ordering::Relaxed
+        ).is_err() {
+            // Lock is held or someone is waiting - restore IRQs and return None
             restore_irqs(irqs_were_enabled);
             return None;
         }
@@ -195,7 +203,9 @@ impl<T> SpinLock<T> {
     /// and any action you take based on it.
     #[inline]
     pub fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Relaxed)
+        let next = self.next_ticket.load(Ordering::Relaxed);
+        let serving = self.now_serving.load(Ordering::Relaxed);
+        next != serving
     }
 
     /// Get a reference to the underlying data without locking.
@@ -267,8 +277,8 @@ impl<'a, T> Drop for SpinLockGuard<'a, T> {
             self.lock.owner_cpu.store(u32::MAX, Ordering::Relaxed);
         }
 
-        // Step 2: Release spinlock
-        self.lock.locked.store(false, Ordering::Release);
+        // Step 2: Release spinlock — advance now_serving to next ticket
+        self.lock.now_serving.fetch_add(1, Ordering::Release);
 
         // Step 3: Restore IRQ state
         restore_irqs(self.irqs_were_enabled);

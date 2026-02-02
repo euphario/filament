@@ -187,9 +187,13 @@ pub fn map_kernel_device_1gb(phys_base: u64) {
     let entry_ptr = (l1_virt + (l1_index as u64) * 8) as *mut u64;
     unsafe {
         core::ptr::write_volatile(entry_ptr, descriptor);
-        // Ensure the write is visible before any access through the new mapping
+        // Invalidate TLB for all addresses on all CPUs (inner shareable).
+        // Another CPU may have cached the old (invalid/zero) L1 entry,
+        // so we must ensure it re-walks the page table.
         core::arch::asm!(
-            "dsb sy",
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
             "isb",
             options(nostack, nomem)
         );
@@ -255,4 +259,127 @@ pub fn is_enabled() -> bool {
 /// Print MMU info
 pub fn print_info() {
     kdebug!("mmu", "info"; ttbr0 = klog::hex64(ttbr0()), ttbr1 = klog::hex64(ttbr1()), enabled = is_enabled());
+}
+
+// ============================================================================
+// Guard Page Support
+// ============================================================================
+
+/// L3 page table for splitting a 2MB block into 4KB pages (for guard pages).
+/// Statically allocated to avoid PMM dependency during early boot.
+static mut GUARD_L3_TABLE: PageTable = PageTable::new();
+
+/// Set up guard pages for boot stack and secondary CPU stacks.
+///
+/// This splits the relevant 2MB L2 block(s) into L3 4KB pages,
+/// then marks guard pages as invalid (unmapped). Any stack overflow
+/// that reaches the guard page will trigger a data abort.
+///
+/// Must be called after MMU is enabled and before userspace starts.
+pub fn setup_guard_pages() {
+    // Boot stack guard page
+    extern "C" {
+        static __boot_stack_guard: u8;
+    }
+    let guard_vaddr = unsafe { &__boot_stack_guard as *const u8 as u64 };
+    unmap_kernel_page(guard_vaddr);
+
+    // Secondary CPU stack guard pages
+    setup_cpu_stack_guards();
+}
+
+/// Unmap a single 4KB page in the kernel (TTBR1) address space.
+///
+/// Splits the containing 2MB L2 block into L3 4KB pages, then
+/// marks the target page as invalid. Uses the static GUARD_L3_TABLE.
+///
+/// Note: Currently supports unmapping one 2MB block region only
+/// (the one containing all guard pages, which are in the BSS/stack area).
+fn unmap_kernel_page(vaddr: u64) {
+    // Convert to physical address
+    let phys = virt_to_phys(vaddr);
+
+    // Find which L2 block this belongs to
+    let l2_block_base = phys & !0x1F_FFFF; // 2MB aligned
+    let l1_index = ((phys >> 30) & 0x1FF) as usize;
+    let l2_index = ((phys >> 21) & 0x1FF) as usize;
+    let l3_index = ((phys >> 12) & 0x1FF) as usize;
+
+    // Get physical address of the L3 table
+    let l3_phys = unsafe { virt_to_phys(core::ptr::addr_of!(GUARD_L3_TABLE) as u64) };
+
+    // Check if L3 table is already populated (split already done)
+    let l3_populated = unsafe { GUARD_L3_TABLE.entries[0] != 0 };
+
+    if !l3_populated {
+        // Populate L3 table: 512 x 4KB pages matching the original 2MB block
+        for i in 0..ENTRIES_PER_TABLE {
+            let page_phys = l2_block_base + (i as u64 * PAGE_SIZE as u64);
+            // Normal memory, kernel-only, inner shareable, UXN (EL1 can execute)
+            unsafe {
+                GUARD_L3_TABLE.entries[i] = page_phys
+                    | flags::VALID
+                    | flags::PAGE
+                    | flags::AF
+                    | flags::SH_INNER
+                    | attr::NORMAL
+                    | (0x0040u64 << 48); // UXN only (EL1 can execute)
+            }
+        }
+    }
+
+    // Mark the guard page as invalid (unmapped)
+    unsafe {
+        GUARD_L3_TABLE.entries[l3_index] = 0;
+    }
+
+    // Point the L2 entry to the L3 table instead of a 2MB block.
+    // We need to find the L2 table that contains this entry.
+    // For TTBR1, L1 entry points to L2 table.
+    extern "C" {
+        static boot_l2_ttbr1_0: [u64; 512];
+        static boot_l2_ttbr1_1: [u64; 512];
+    }
+
+    let l2_table_ptr: *mut u64 = if l1_index == 0 {
+        unsafe { boot_l2_ttbr1_0.as_ptr() as *mut u64 }
+    } else if l1_index == 1 {
+        unsafe { boot_l2_ttbr1_1.as_ptr() as *mut u64 }
+    } else {
+        // Guard page is in an L1 region we don't have an L2 table for
+        return;
+    };
+
+    // Replace the L2 block descriptor with a table descriptor pointing to L3
+    unsafe {
+        let entry_ptr = l2_table_ptr.add(l2_index);
+        core::ptr::write_volatile(entry_ptr, l3_phys | flags::VALID | flags::TABLE);
+
+        // Full TLB invalidation
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack, nomem)
+        );
+    }
+
+    kdebug!("mmu", "guard_page_unmapped"; vaddr = klog::hex64(vaddr), phys = klog::hex64(phys));
+}
+
+/// Set up guard pages for secondary CPU stacks.
+///
+/// The CPU stacks are laid out as [16KB stack][16KB stack]...
+/// Guard pages would go at the base of each stack. However, since
+/// secondary stacks use a separate static array (CPU_STACKS), and
+/// the stacks are in BSS, they may be in a different 2MB block than
+/// the boot stack. For simplicity, we only set up the boot stack
+/// guard page now, and document that secondary stack guards would
+/// need additional L3 tables.
+fn setup_cpu_stack_guards() {
+    // Secondary CPU stack guard pages require additional L3 tables
+    // (one per 2MB block containing stack memory). This is deferred
+    // until we have a PMM-backed L3 table allocator.
+    // For now, secondary CPUs use the full CPU_STACK_SIZE without guards.
 }

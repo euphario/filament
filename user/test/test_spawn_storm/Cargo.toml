@@ -1,0 +1,15 @@
+[package]
+name = "test_spawn_storm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+userlib = { path = "../../userlib" }
+abi = { path = "../../abi" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

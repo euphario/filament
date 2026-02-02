@@ -16,9 +16,11 @@ use crate::kernel::traits::syscall_ctx::SyscallContext;
 use crate::kernel::error::KernelError;
 use crate::kernel::traits::task::TaskId;
 use crate::kernel::traits::object_ops::ObjectOps;
+use crate::kernel::traits::raw_object_ops::RawObjectOps;
 use crate::kernel::traits::memory_ops::MemoryOps;
 use crate::kernel::traits::process_ops::ProcessOps;
 use crate::kernel::traits::user_access::UserAccess;
+use crate::kernel::traits::misc_ops::MiscOps;
 use crate::kernel::task;
 use crate::kernel::caps::Capabilities;
 
@@ -83,6 +85,10 @@ impl SyscallContext for KernelSyscallContext {
         crate::kernel::object_ops_impl::object_ops_backend()
     }
 
+    fn raw_objects(&self) -> &dyn RawObjectOps {
+        crate::kernel::raw_object_ops_impl::raw_object_ops_backend()
+    }
+
     fn memory(&self) -> &dyn MemoryOps {
         // Return the global memory ops backend
         crate::kernel::memory_ops_impl::memory_ops_backend()
@@ -96,6 +102,10 @@ impl SyscallContext for KernelSyscallContext {
     fn uaccess(&self) -> &dyn UserAccess {
         // Return the global user access backend
         crate::kernel::user_access_impl::user_access_backend()
+    }
+
+    fn misc(&self) -> &dyn MiscOps {
+        crate::kernel::misc_ops_impl::misc_ops_backend()
     }
 }
 

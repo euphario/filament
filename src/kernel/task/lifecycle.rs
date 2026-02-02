@@ -15,11 +15,8 @@
 //! - `exit(task_id, code)` - Voluntary exit, notifies parent, starts cleanup
 //! - `kill(task_id, killer_id)` - Forced termination (SIGKILL equivalent)
 //! - `wait_child(parent_id, pid, flags)` - Wait for child exit (sys_wait)
-//! - `wake(task_id)` - Wake a blocked task
-//! - `reap(task_id)` - Final cleanup, free slot
 
 use crate::kinfo;
-use super::state::SleepReason;
 use super::{TaskId, Scheduler, MAX_TASKS};
 use crate::kernel::ipc::{waker, traits::WakeReason};
 
@@ -193,7 +190,7 @@ pub fn wait_child(
     sched: &mut Scheduler,
     parent_id: TaskId,
     target_pid: i32,
-    no_hang: bool,
+    _no_hang: bool,
 ) -> WaitResult {
     let parent_slot = match sched.slot_by_pid(parent_id) {
         Some(s) => s,
@@ -243,89 +240,8 @@ pub fn wait_child(
         };
     }
 
-    // No exited child found
-    if no_hang {
-        WaitResult::WouldBlock
-    } else {
-        WaitResult::WouldBlock // Caller will block
-    }
-}
-
-/// Wake a blocked task
-///
-/// Called when an event arrives that a task is waiting for.
-///
-/// # Effects
-/// - Task state: Sleeping/Waiting → Ready
-/// - Task is added back to run queue
-/// - Liveness state reset to Normal
-///
-/// # Returns
-/// - true if task was actually woken (was blocked)
-/// - false if task was not blocked
-pub fn wake(sched: &mut Scheduler, task_id: TaskId) -> bool {
-    let slot = match sched.slot_by_pid(task_id) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    let task = match sched.tasks[slot].as_mut() {
-        Some(t) => t,
-        None => return false,
-    };
-
-    // Only wake if blocked
-    if !task.is_blocked() {
-        return false;
-    }
-
-    // Transition to Ready via state machine
-    if task.wake().is_err() {
-        return false;
-    }
-
-    // Reset liveness state
-    task.liveness_state = crate::kernel::liveness::LivenessState::Normal;
-
-    true
-}
-
-/// Sleep the current task (no deadline)
-///
-/// Called when a task blocks waiting for an event with no timeout.
-///
-/// # Effects
-/// - Task state: Running → Sleeping
-/// - Task is removed from CPU (scheduler will pick next)
-/// - Liveness will monitor this task
-pub fn sleep_current(sched: &mut Scheduler, slot: usize, reason: SleepReason) -> Result<(), LifecycleError> {
-    let task = sched.tasks[slot].as_mut().ok_or(LifecycleError::NotFound)?;
-
-    task.set_sleeping(reason).map_err(|_| LifecycleError::InvalidState)
-}
-
-/// Wait until deadline (with timeout)
-///
-/// Called when a task blocks with a deadline (timer, timed wait).
-///
-/// # Effects
-/// - Task state: Running → Waiting { deadline }
-/// - Task is removed from CPU (scheduler will pick next)
-/// - Scheduler will wake task when deadline passes
-///
-/// # Arguments
-/// - `slot`: Task slot in scheduler
-/// - `reason`: Why the task is waiting
-/// - `deadline`: Wake deadline in timer ticks
-pub fn wait_until(
-    sched: &mut Scheduler,
-    slot: usize,
-    reason: super::state::WaitReason,
-    deadline: u64,
-) -> Result<(), LifecycleError> {
-    let task = sched.tasks[slot].as_mut().ok_or(LifecycleError::NotFound)?;
-
-    task.set_waiting(reason, deadline).map_err(|_| LifecycleError::InvalidState)
+    // No exited child found — caller decides whether to block or return
+    WaitResult::WouldBlock
 }
 
 // ============================================================================
@@ -365,14 +281,47 @@ fn notify_parent_of_exit(sched: &mut Scheduler, parent_id: TaskId, child_pid: Ta
     }
 }
 
-/// Reap a terminated child - remove from parent's list, free slot
+/// Reap a terminated child - do full resource cleanup, remove from parent's list, free slot
+///
+/// This performs the same cleanup as reap_terminated() Phase 1+2, since the child
+/// may be in Exiting state (cleanup not started) or Dying state (Phase 1 done).
 fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, child_pid: TaskId) {
+    use crate::kernel::ipc::{waker, traits::WakeReason};
+
     // Remove from parent's child list
     if let Some(ref mut parent) = sched.tasks[parent_slot] {
         parent.remove_child(child_pid);
     }
 
-    // Bump generation and free the slot
+    // Check current state to determine what cleanup is needed
+    let state = sched.tasks[child_slot]
+        .as_ref()
+        .map(|t| *t.state())
+        .unwrap_or(super::state::TaskState::Dead);
+
+    let needs_phase1 = matches!(state, super::state::TaskState::Exiting { .. });
+
+    // Phase 1: IPC cleanup (only if still in Exiting — Dying already did Phase 1)
+    if needs_phase1 {
+        // Perform IPC cleanup (DMA stop, subscriber removal, peer notification)
+        let ipc_peers = super::Scheduler::do_ipc_cleanup(child_pid);
+        for peer in ipc_peers.iter() {
+            let wake_list = crate::kernel::object_service::object_service()
+                .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
+            waker::wake(&wake_list, WakeReason::Closed);
+        }
+
+        // Notify shmem mappers
+        crate::kernel::shmem::begin_cleanup(child_pid);
+    }
+
+    // Phase 2: Force cleanup and free resources (shared with reap_terminated)
+    Scheduler::do_final_cleanup(child_pid);
+
+    if let Some(ref task) = sched.tasks[child_slot] {
+        Scheduler::clear_stale_trap_frame(task, child_slot, child_pid);
+    }
+
     sched.bump_generation(child_slot);
     sched.tasks[child_slot] = None;
 }

@@ -32,28 +32,20 @@ use crate::arch::aarch64::hal::cpu;
 ///
 /// The idle task NEVER blocks - it's always Ready or Running.
 pub fn idle_entry() -> ! {
-    // Get the CPU for WFI
     let cpu_impl = cpu();
 
     loop {
         // Enable interrupts before WFI.
-        // We may enter this loop with IRQs disabled (after context_switch from
-        // reschedule which holds IrqGuard). Timer IRQs need to fire to wake tasks.
         cpu_impl.enable_irq();
 
-        // Wait for interrupt
-        // When IRQ fires, we return here, timer_tick runs check_deadlines,
-        // and if a task is ready, we get context-switched away via do_resched_if_needed
-        // in irq_from_kernel.
+        // Mark CPU as idle so targeted IPI can find us
+        super::percpu::cpu_local().set_idle();
+
+        // Wait for interrupt (WFI)
         cpu_impl.idle();
 
-        // Note: We don't call reschedule() here.
-        // The timer IRQ handler sets NEED_RESCHED flag.
-        // do_resched_if_needed() runs at safe points (syscall return, IRQ return)
-        // and will switch us away if another task became ready.
-        //
-        // When that task blocks, it will context_switch back to us,
-        // and we just loop and idle again.
+        // Back from WFI — clear idle flag before doing any work
+        super::percpu::cpu_local().clear_idle();
     }
 }
 
