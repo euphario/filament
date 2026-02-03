@@ -232,8 +232,9 @@ pub struct BusDriverRule {
 ///
 /// Platform buses are skipped for now — consoled/gpio/pwm stay as static services.
 pub static BUS_DRIVER_RULES: &[BusDriverRule] = &[
-    BusDriverRule { bus_type: abi::bus_type::PCIE, binary: "pcied", caps: userlib::devd::caps::DRIVER },
-    BusDriverRule { bus_type: abi::bus_type::USB,  binary: "usbd",  caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::PCIE,     binary: "pcied", caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::USB,      binary: "usbd",  caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::ETHERNET, binary: "ethd",  caps: userlib::devd::caps::DRIVER },
 ];
 
 // =============================================================================

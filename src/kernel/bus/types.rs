@@ -61,6 +61,8 @@ pub enum BusType {
     Usb = 1,
     /// Platform pseudo-bus (uart, gpio, i2c, spi, etc.)
     Platform = 2,
+    /// Ethernet (native GMAC)
+    Ethernet = 3,
 }
 
 impl BusType {
@@ -69,6 +71,7 @@ impl BusType {
             BusType::PCIe => "pcie",
             BusType::Usb => "usb",
             BusType::Platform => "platform",
+            BusType::Ethernet => "eth",
         }
     }
 }

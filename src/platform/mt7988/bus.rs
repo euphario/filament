@@ -40,5 +40,12 @@ pub fn register_buses(kernel_pid: Pid) {
             let _ = bus.register_port(kernel_pid);
             kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Safe");
         }
+
+        // Ethernet (GMAC1 + internal switch, no reset needed, starts Safe)
+        if let Some(bus) = registry.add(BusType::Ethernet, 0) {
+            bus.set_initial_state(BusState::Safe);
+            let _ = bus.register_port(kernel_pid);
+            kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Safe");
+        }
     });
 }

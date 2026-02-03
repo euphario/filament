@@ -918,6 +918,8 @@ pub mod bus_type {
     pub const USB: u8 = 1;
     /// Platform pseudo-bus (uart, gpio, i2c, spi, etc.)
     pub const PLATFORM: u8 = 2;
+    /// Ethernet (native GMAC)
+    pub const ETHERNET: u8 = 3;
 }
 
 /// Bus state constants for BusInfo

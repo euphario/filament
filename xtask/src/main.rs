@@ -281,6 +281,14 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         all_programs.push(("ipd", "driver/ipd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
         all_programs.push(("vfsd", "driver/vfsd"));
+    } else {
+        // MT7988A real hardware programs
+        all_programs.push(("pcied", "driver/pcied"));
+        all_programs.push(("usbd", "driver/usbd"));
+        all_programs.push(("ethd", "driver/ethd"));  // Native GMAC Ethernet
+        all_programs.push(("ipd", "driver/ipd"));
+        all_programs.push(("fatfsd", "driver/fatfsd"));
+        all_programs.push(("vfsd", "driver/vfsd"));
     }
 
     // Stress test programs (QEMU only)
