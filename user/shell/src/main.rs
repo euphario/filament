@@ -147,6 +147,11 @@ fn main() {
         }
 
         execute_command(cmd);
+
+        // Ensure cursor is at column 0 before next prompt.
+        // If async log output landed on the terminal during command
+        // execution, we may not be at the start of a line.
+        console::write(b"\r");
     }
 }
 

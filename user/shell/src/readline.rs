@@ -581,6 +581,9 @@ impl<'a> LineEditor<'a> {
 
     /// Replace current line with new content
     fn replace_line(&mut self, new: &[u8]) {
+        let old_len = self.len;
+        let old_cursor = self.cursor;
+
         // Copy new content
         let new_len = new.len().min(self.buf.len() - 1);
         self.buf[..new_len].copy_from_slice(&new[..new_len]);
@@ -590,20 +593,23 @@ impl<'a> LineEditor<'a> {
         if self.use_box {
             self.input_box.update(&self.buf[..self.len], self.cursor);
         } else {
-            // Legacy mode: Move to start
-            self.move_to_start();
-
-            // Clear current line
-            let old_len = self.len;
-            for _ in 0..old_len {
-                write_str(" ");
-            }
-            for _ in 0..old_len {
+            // Move cursor back to start of editable area
+            for _ in 0..old_cursor {
                 write_str("\x08");
             }
 
-            // Display new line
-            console::write(&self.buf[..self.len]);
+            // Write new content
+            console::write(&self.buf[..new_len]);
+
+            // Clear any leftover characters from old line
+            let clear = if old_len > new_len { old_len - new_len } else { 0 };
+            for _ in 0..clear {
+                write_str(" ");
+            }
+            // Move cursor back past the cleared area
+            for _ in 0..clear {
+                write_str("\x08");
+            }
         }
     }
 
