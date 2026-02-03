@@ -30,7 +30,7 @@ use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use userlib::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, PortId, bus_msg};
+use userlib::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, PortId, ConfigKey, bus_msg};
 use userlib::bus_runtime::driver_main;
 use userlib::ipc::Timer;
 use userlib::ring::{SideEntry, side_msg, side_status};
@@ -132,6 +132,8 @@ enum IpState {
     DhcpConfigured,
     /// DHCP timed out, using static fallback.
     StaticFallback,
+    /// Manually configured via CONFIG SET.
+    StaticConfigured,
 }
 
 // =============================================================================
@@ -395,7 +397,7 @@ impl IpdDriver {
         self.rsh.ip = ip_bytes;
         self.rsh.ip_source = match state {
             IpState::DhcpConfigured => 1,
-            IpState::StaticFallback => 2,
+            IpState::StaticFallback | IpState::StaticConfigured => 2,
             IpState::Unconfigured => 0,
         };
 
@@ -411,6 +413,7 @@ impl IpdDriver {
         let state_str = match state {
             IpState::DhcpConfigured => "dhcp",
             IpState::StaticFallback => "static_fallback",
+            IpState::StaticConfigured => "static",
             IpState::Unconfigured => "none",
         };
         uinfo!("ipd", "ip_configured";
@@ -545,7 +548,7 @@ impl IpdDriver {
         // Process HTTP socket (TCP)
         let ip_source = match self.ip_state {
             IpState::DhcpConfigured => "dhcp",
-            IpState::StaticFallback => "static",
+            IpState::StaticFallback | IpState::StaticConfigured => "static",
             IpState::Unconfigured => "none",
         };
         Self::process_http(&mut stack.sockets, stack.tcp_handle, self.assigned_ip, ip_source);
@@ -587,6 +590,122 @@ impl IpdDriver {
             .poll_delay(now, &stack.sockets)
             .map(|d| d.total_millis() as u64);
         self.arm_poll_timer(delay, ctx);
+    }
+
+    // =========================================================================
+    // Configuration Get/Set
+    // =========================================================================
+
+    fn ipd_config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        match key {
+            b"net.ip" => format_ip(buf, self.assigned_ip),
+            b"net.prefix" => format_u64(self.assigned_prefix as u64, buf),
+            b"net.gateway" => format_ip(buf, self.assigned_gateway),
+            b"net.mac" => self.format_mac(buf),
+            b"net.dhcp" => {
+                let s = match self.ip_state {
+                    IpState::DhcpConfigured | IpState::Unconfigured => b"on" as &[u8],
+                    IpState::StaticFallback | IpState::StaticConfigured => b"off",
+                };
+                let len = s.len().min(buf.len());
+                buf[..len].copy_from_slice(&s[..len]);
+                len
+            }
+            b"net.state" => {
+                let s = match self.ip_state {
+                    IpState::Unconfigured => b"unconfigured" as &[u8],
+                    IpState::DhcpConfigured => b"dhcp",
+                    IpState::StaticFallback => b"static_fallback",
+                    IpState::StaticConfigured => b"static",
+                };
+                let len = s.len().min(buf.len());
+                buf[..len].copy_from_slice(&s[..len]);
+                len
+            }
+            _ => 0,
+        }
+    }
+
+    fn ipd_config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
+        match key {
+            b"net.ip" => {
+                if let Some(ip) = parse_ipv4(value) {
+                    let gw = ipv4_from_bytes(&self.assigned_gateway);
+                    let prefix = if self.assigned_prefix == 0 { STATIC_PREFIX_LEN } else { self.assigned_prefix };
+                    self.apply_ip_config(ip, prefix, gw, IpState::StaticConfigured);
+                    self.poll_smoltcp(ctx);
+                    copy_str(buf, "OK\n")
+                } else {
+                    copy_str(buf, "ERR invalid ip\n")
+                }
+            }
+            b"net.prefix" => {
+                if let Some(prefix) = parse_u8(value) {
+                    if prefix <= 32 {
+                        let ip = ipv4_from_bytes(&self.assigned_ip);
+                        let gw = ipv4_from_bytes(&self.assigned_gateway);
+                        self.apply_ip_config(ip, prefix, gw, IpState::StaticConfigured);
+                        self.poll_smoltcp(ctx);
+                        copy_str(buf, "OK\n")
+                    } else {
+                        copy_str(buf, "ERR prefix must be 0-32\n")
+                    }
+                } else {
+                    copy_str(buf, "ERR invalid prefix\n")
+                }
+            }
+            b"net.gateway" => {
+                if let Some(gw) = parse_ipv4(value) {
+                    let ip = ipv4_from_bytes(&self.assigned_ip);
+                    let prefix = if self.assigned_prefix == 0 { STATIC_PREFIX_LEN } else { self.assigned_prefix };
+                    self.apply_ip_config(ip, prefix, gw, IpState::StaticConfigured);
+                    self.poll_smoltcp(ctx);
+                    copy_str(buf, "OK\n")
+                } else {
+                    copy_str(buf, "ERR invalid gateway\n")
+                }
+            }
+            b"net.dhcp" => {
+                match value {
+                    b"on" => {
+                        self.ip_state = IpState::Unconfigured;
+                        self.arm_dhcp_fallback_timer(ctx);
+                        if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
+                            stack.sockets.get_mut::<dhcpv4::Socket>(stack.dhcp_handle).reset();
+                        }
+                        uinfo!("ipd", "dhcp_enabled";);
+                        copy_str(buf, "OK\n")
+                    }
+                    b"off" => {
+                        if self.ip_state == IpState::DhcpConfigured || self.ip_state == IpState::Unconfigured {
+                            self.ip_state = IpState::StaticConfigured;
+                        }
+                        if let Some(ref timer) = self.dhcp_fallback_timer {
+                            let _ = ctx.unwatch_handle(timer.handle());
+                        }
+                        self.dhcp_fallback_timer = None;
+                        uinfo!("ipd", "dhcp_disabled";);
+                        copy_str(buf, "OK\n")
+                    }
+                    _ => copy_str(buf, "ERR invalid value (use on/off)\n"),
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn format_mac(&self, buf: &mut [u8]) -> usize {
+        let mut pos = 0;
+        for i in 0..6 {
+            if i > 0 {
+                pos += copy_str(&mut buf[pos..], ":");
+            }
+            let hi = self.mac[i] >> 4;
+            let lo = self.mac[i] & 0x0F;
+            if pos < buf.len() { buf[pos] = HEX_CHARS[hi as usize]; pos += 1; }
+            if pos < buf.len() { buf[pos] = HEX_CHARS[lo as usize]; pos += 1; }
+        }
+        pos
     }
 
     // =========================================================================
@@ -638,6 +757,37 @@ impl IpdDriver {
         // Close our end after sending
         sock.close();
     }
+}
+
+// =============================================================================
+// IP Parsing Helpers
+// =============================================================================
+
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+/// Parse an IPv4 address from ASCII bytes (e.g., b"10.0.2.15").
+fn parse_ipv4(s: &[u8]) -> Option<Ipv4Address> {
+    let s = core::str::from_utf8(s).ok()?;
+    let mut octets = [0u8; 4];
+    let mut idx = 0;
+    for part in s.split('.') {
+        if idx >= 4 { return None; }
+        octets[idx] = part.parse::<u8>().ok()?;
+        idx += 1;
+    }
+    if idx != 4 { return None; }
+    Some(Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]))
+}
+
+/// Construct an Ipv4Address from a 4-byte array.
+fn ipv4_from_bytes(b: &[u8; 4]) -> Ipv4Address {
+    Ipv4Address::new(b[0], b[1], b[2], b[3])
+}
+
+/// Parse a u8 from ASCII bytes.
+fn parse_u8(s: &[u8]) -> Option<u8> {
+    let s = core::str::from_utf8(s).ok()?;
+    s.parse::<u8>().ok()
 }
 
 // =============================================================================
@@ -797,6 +947,8 @@ impl Driver for IpdDriver {
                 let _ = ctx.respond_info(msg.seq_id, &info[..pos]);
                 Disposition::Handled
             }
+            // CONFIG_GET and CONFIG_SET handled by bus framework via
+            // config_keys() / config_get() / config_set() trait methods.
             _ => Disposition::Forward,
         }
     }
@@ -905,6 +1057,15 @@ fn main() {
 
 struct IpdDriverWrapper(&'static mut IpdDriver);
 
+const IPD_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_write(b"net.ip"),
+    ConfigKey::read_write(b"net.prefix"),
+    ConfigKey::read_write(b"net.gateway"),
+    ConfigKey::read_write(b"net.dhcp"),
+    ConfigKey::read_only(b"net.mac"),
+    ConfigKey::read_only(b"net.state"),
+];
+
 impl Driver for IpdDriverWrapper {
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         self.0.init(ctx)
@@ -920,5 +1081,17 @@ impl Driver for IpdDriverWrapper {
 
     fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
         self.0.handle_event(tag, handle, ctx)
+    }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        IPD_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        self.0.ipd_config_get(key, buf)
+    }
+
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
+        self.0.ipd_config_set(key, value, buf, ctx)
     }
 }

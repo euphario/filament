@@ -278,6 +278,25 @@ pub enum DevdCommand {
         name: [u8; 32],
         name_len: usize,
     },
+    /// Get a configuration value from the driver
+    ConfigGet {
+        /// Sequence ID for response
+        seq_id: u32,
+        /// Key name (null-terminated in payload)
+        key: [u8; 64],
+        key_len: usize,
+    },
+    /// Set a configuration value on the driver
+    ConfigSet {
+        /// Sequence ID for response
+        seq_id: u32,
+        /// Key name
+        key: [u8; 64],
+        key_len: usize,
+        /// Value to set
+        value: [u8; 128],
+        value_len: usize,
+    },
 }
 
 impl DevdCommand {
@@ -794,6 +813,44 @@ impl DevdClient {
                             index: reg.index,
                             name: name_buf,
                             name_len,
+                        }))
+                    }
+                    msg::CONFIG_GET => {
+                        // Payload after header is key bytes
+                        let payload = &buf[QueryHeader::SIZE..len];
+                        let mut key = [0u8; 64];
+                        let key_len = payload.len().min(64);
+                        key[..key_len].copy_from_slice(&payload[..key_len]);
+                        Ok(Some(DevdCommand::ConfigGet {
+                            seq_id: header.seq_id,
+                            key,
+                            key_len,
+                        }))
+                    }
+                    msg::CONFIG_SET => {
+                        // Payload after header is key\0value
+                        let payload = &buf[QueryHeader::SIZE..len];
+                        // Find null separator between key and value
+                        let null_pos = payload.iter().position(|&b| b == 0)
+                            .unwrap_or(payload.len());
+                        let mut key = [0u8; 64];
+                        let key_len = null_pos.min(64);
+                        key[..key_len].copy_from_slice(&payload[..key_len]);
+                        let mut value = [0u8; 128];
+                        let value_start = null_pos + 1;
+                        let value_len = if value_start < payload.len() {
+                            let vlen = (payload.len() - value_start).min(128);
+                            value[..vlen].copy_from_slice(&payload[value_start..value_start + vlen]);
+                            vlen
+                        } else {
+                            0
+                        };
+                        Ok(Some(DevdCommand::ConfigSet {
+                            seq_id: header.seq_id,
+                            key,
+                            key_len,
+                            value,
+                            value_len,
                         }))
                     }
                     _ => {
@@ -1568,6 +1625,9 @@ fn handle_command<H: SpawnHandler>(
         // Orchestration commands are handled directly by drivers in their main loop
         DevdCommand::AttachDisk { .. } => {}
         DevdCommand::RegisterPartition { .. } => {}
+        // Config commands are handled by the bus framework runtime, not SpawnHandler
+        DevdCommand::ConfigGet { .. } => {}
+        DevdCommand::ConfigSet { .. } => {}
     }
 }
 

@@ -7,6 +7,7 @@
 //! corresponding match arm in main.rs.
 
 pub mod cat;
+pub mod devc;
 pub mod devd;
 pub mod drivers;
 pub mod gpio;

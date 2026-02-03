@@ -73,6 +73,13 @@ struct AdminClients {
     clients: [Option<AdminClient>; MAX_ADMIN_CLIENTS],
 }
 
+/// Copy a static byte slice into a buffer, returning the number of bytes copied.
+fn copy_static(dst: &mut [u8], src: &[u8]) -> usize {
+    let len = src.len().min(dst.len());
+    dst[..len].copy_from_slice(&src[..len]);
+    len
+}
+
 /// Trim whitespace and newlines from a byte slice
 fn trim_bytes(b: &[u8]) -> &[u8] {
     let mut start = 0;
@@ -1210,19 +1217,22 @@ impl Devd {
         };
 
         // Parse and handle text command
-        let response = self.handle_admin_command(&buf[..len]);
+        let mut resp_buf = [0u8; 512];
+        let resp_len = self.handle_admin_command(&buf[..len], &mut resp_buf);
 
         // Send response
-        if let Some(client) = self.admin_clients.get_mut(slot) {
-            let _ = client.channel.send(response);
+        if resp_len > 0 {
+            if let Some(client) = self.admin_clients.get_mut(slot) {
+                let _ = client.channel.send(&resp_buf[..resp_len]);
+            }
         }
     }
 
-    fn handle_admin_command(&mut self, cmd: &[u8]) -> &'static [u8] {
+    fn handle_admin_command(&mut self, cmd: &[u8], resp: &mut [u8]) -> usize {
         // Trim whitespace and newline
         let cmd = trim_bytes(cmd);
 
-        if cmd.starts_with(b"START ") {
+        let static_resp = if cmd.starts_with(b"START ") {
             let name = trim_bytes(&cmd[6..]);
             self.admin_start_service(name)
         } else if cmd.starts_with(b"STOP ") {
@@ -1236,9 +1246,16 @@ impl Devd {
         } else if cmd.starts_with(b"SPAWN ") {
             let args = trim_bytes(&cmd[6..]);
             self.admin_spawn_driver(args)
+        } else if cmd.starts_with(b"CONFIG ") {
+            let args = trim_bytes(&cmd[7..]);
+            return self.admin_config_command(args, resp);
         } else {
             b"ERR unknown command\n"
-        }
+        };
+
+        let len = static_resp.len().min(resp.len());
+        resp[..len].copy_from_slice(&static_resp[..len]);
+        len
     }
 
     fn admin_start_service(&mut self, name: &[u8]) -> &'static [u8] {
@@ -1343,6 +1360,135 @@ impl Devd {
         // Spawn the driver dynamically
         self.spawn_dynamic_driver(binary, port.unwrap_or(b""));
         b"OK\n"
+    }
+
+    /// Handle CONFIG admin command: forward to driver, wait for response.
+    ///
+    /// Format: `<service> GET [key]` or `<service> SET <key> <value>`
+    /// Returns number of bytes written to resp buffer.
+    fn admin_config_command(&mut self, args: &[u8], resp: &mut [u8]) -> usize {
+        let args_str = match core::str::from_utf8(args) {
+            Ok(s) => s,
+            Err(_) => return copy_static(resp, b"ERR invalid args\n"),
+        };
+
+        let mut parts = args_str.splitn(4, ' ');
+        let service_name = match parts.next() {
+            Some(s) if !s.is_empty() => s,
+            _ => return copy_static(resp, b"ERR missing service name\n"),
+        };
+        let operation = match parts.next() {
+            Some(s) => s,
+            None => return copy_static(resp, b"ERR missing operation (GET/SET)\n"),
+        };
+
+        // Find service by name
+        let service_idx = match self.services.find_by_name(service_name) {
+            Some(i) => i,
+            None => return copy_static(resp, b"ERR service not found\n"),
+        };
+
+        // Check service is running
+        if let Some(service) = self.services.get(service_idx) {
+            if !service.state.is_running() {
+                return copy_static(resp, b"ERR service not running\n");
+            }
+        }
+
+        // Find the driver's query client slot
+        let driver_slot = match self.query_handler.find_by_service_idx(service_idx as u8) {
+            Some(slot) => slot,
+            None => return copy_static(resp, b"ERR driver not connected\n"),
+        };
+
+        // Build and send the query message
+        let seq_id = self.next_forward_seq_id;
+        self.next_forward_seq_id = self.next_forward_seq_id.wrapping_add(1);
+        if self.next_forward_seq_id == 0 {
+            self.next_forward_seq_id = 1;
+        }
+
+        let sent = match operation {
+            "GET" | "get" => {
+                let key = parts.next().unwrap_or("");
+                self.send_config_query(driver_slot, seq_id, msg::CONFIG_GET, key.as_bytes(), &[])
+            }
+            "SET" | "set" => {
+                let key = match parts.next() {
+                    Some(k) => k,
+                    None => return copy_static(resp, b"ERR missing key\n"),
+                };
+                let value = match parts.next() {
+                    Some(v) => v,
+                    None => return copy_static(resp, b"ERR missing value\n"),
+                };
+                self.send_config_query(driver_slot, seq_id, msg::CONFIG_SET, key.as_bytes(), value.as_bytes())
+            }
+            _ => return copy_static(resp, b"ERR unknown operation (use GET or SET)\n"),
+        };
+
+        if !sent {
+            return copy_static(resp, b"ERR send failed\n");
+        }
+
+        // Wait for response (blocking recv on driver channel)
+        let mut recv_buf = [0u8; 1100];
+        let recv_len = match self.query_handler.get_mut(driver_slot) {
+            Some(client) => {
+                // Use blocking recv — driver responds synchronously
+                match client.channel.recv(&mut recv_buf) {
+                    Ok(n) => n,
+                    Err(_) => return copy_static(resp, b"ERR recv failed\n"),
+                }
+            }
+            None => return copy_static(resp, b"ERR driver disconnected\n"),
+        };
+
+        // Parse ServiceInfoResult response
+        use userlib::query::{ServiceInfoResult, error};
+        if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&recv_buf[..recv_len]) {
+            if result.result == error::OK && !info_bytes.is_empty() {
+                let len = info_bytes.len().min(resp.len());
+                resp[..len].copy_from_slice(&info_bytes[..len]);
+                len
+            } else {
+                copy_static(resp, b"ERR driver returned error\n")
+            }
+        } else {
+            copy_static(resp, b"ERR invalid response\n")
+        }
+    }
+
+    /// Send a CONFIG_GET or CONFIG_SET query to a driver via its query channel.
+    fn send_config_query(&mut self, driver_slot: usize, seq_id: u32, msg_type: u16, key: &[u8], value: &[u8]) -> bool {
+        let mut buf = [0u8; 256];
+
+        // Build QueryHeader
+        let header = QueryHeader::new(msg_type, seq_id);
+        let header_bytes = header.to_bytes();
+        buf[..QueryHeader::SIZE].copy_from_slice(&header_bytes);
+
+        let mut offset = QueryHeader::SIZE;
+
+        // Write key
+        let key_len = key.len().min(buf.len() - offset - 2);
+        buf[offset..offset + key_len].copy_from_slice(&key[..key_len]);
+        offset += key_len;
+
+        if msg_type == msg::CONFIG_SET {
+            // Null separator between key and value
+            buf[offset] = 0;
+            offset += 1;
+            let value_len = value.len().min(buf.len() - offset - 1);
+            buf[offset..offset + value_len].copy_from_slice(&value[..value_len]);
+            offset += value_len;
+        }
+
+        if let Some(client) = self.query_handler.get_mut(driver_slot) {
+            client.channel.send(&buf[..offset]).is_ok()
+        } else {
+            false
+        }
     }
 
     fn remove_admin_client(&mut self, slot: usize) {

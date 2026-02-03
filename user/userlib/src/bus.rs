@@ -429,6 +429,30 @@ impl BusMsg {
         }
     }
 
+    /// Read a null-terminated byte string starting at `offset`.
+    /// Returns the bytes before the null terminator (or to end of payload).
+    pub fn read_null_terminated(&self, offset: usize) -> &[u8] {
+        let end = self.payload_len as usize;
+        if offset >= end {
+            return &[];
+        }
+        for i in offset..end {
+            if self.payload[i] == 0 {
+                return &self.payload[offset..i];
+            }
+        }
+        &self.payload[offset..end]
+    }
+
+    /// Parse a CONFIG_SET payload: `key\0value\0`.
+    /// Returns (key, value) byte slices.
+    pub fn parse_config_kv(&self) -> (&[u8], &[u8]) {
+        let key = self.read_null_terminated(0);
+        let value_start = key.len() + 1; // skip null separator
+        let value = self.read_null_terminated(value_start);
+        (key, value)
+    }
+
     /// Get valid payload slice.
     pub fn payload_data(&self) -> &[u8] {
         &self.payload[..self.payload_len as usize]
@@ -484,6 +508,52 @@ pub mod bus_msg {
     // SpawnChild (internal to runtime, not exposed to Driver)
     pub const SPAWN_CHILD: u32 = 0x0500;
     pub const STOP_CHILD: u32 = 0x0501;
+
+    // Configuration (0x06xx)
+    pub const CONFIG_GET: u32 = 0x0600;
+    pub const CONFIG_SET: u32 = 0x0601;
+    pub const CONFIG_RESPONSE: u32 = 0x0602;
+}
+
+/// Well-known configuration key strings.
+///
+/// Payload layout for CONFIG_GET: `key\0`
+/// Payload layout for CONFIG_SET: `key\0value\0`
+/// Payload layout for CONFIG_RESPONSE: value bytes (no null terminator needed)
+pub mod config_key {
+    pub const NET_IP: &[u8] = b"net.ip";
+    pub const NET_PREFIX: &[u8] = b"net.prefix";
+    pub const NET_GATEWAY: &[u8] = b"net.gateway";
+    pub const NET_DHCP: &[u8] = b"net.dhcp";
+    pub const NET_MAC: &[u8] = b"net.mac";
+    pub const NET_STATE: &[u8] = b"net.state";
+    pub const NET_SUMMARY: &[u8] = b"net.summary";
+}
+
+// ============================================================================
+// Config Key Registration
+// ============================================================================
+
+/// A configuration key advertised by a driver.
+///
+/// Drivers return a static slice of these from `config_keys()`. The framework
+/// uses them to auto-generate the summary (empty-key GET) and the `keys=` line
+/// listing writable keys.
+pub struct ConfigKey {
+    /// Key name (e.g. b"net.ip").
+    pub name: &'static [u8],
+    /// Whether SET is supported for this key.
+    pub writable: bool,
+}
+
+impl ConfigKey {
+    pub const fn read_only(name: &'static [u8]) -> Self {
+        Self { name, writable: false }
+    }
+
+    pub const fn read_write(name: &'static [u8]) -> Self {
+        Self { name, writable: true }
+    }
 }
 
 // ============================================================================
@@ -539,6 +609,27 @@ pub trait Driver {
     /// Called when a handle registered via `ctx.watch_handle()` fires.
     /// The `tag` is the value passed when the handle was registered.
     fn handle_event(&mut self, _tag: u32, _handle: crate::syscall::Handle, _ctx: &mut dyn BusCtx) {}
+
+    // === Configuration ===
+
+    /// Declare supported config keys. Return an empty slice if no config.
+    ///
+    /// The framework uses this to:
+    /// - Auto-generate the summary response for empty-key GET
+    /// - Build the `keys=` line listing writable keys
+    /// - Validate keys before calling `config_get()`/`config_set()`
+    fn config_keys(&self) -> &[ConfigKey] { &[] }
+
+    /// Get a config value. Called by the framework for CONFIG_GET.
+    /// Write the value into `buf` and return the number of bytes written.
+    fn config_get(&self, _key: &[u8], _buf: &mut [u8]) -> usize { 0 }
+
+    /// Set a config value. Called by the framework for CONFIG_SET.
+    /// Write the response (e.g. "OK\n" or "ERR ...\n") into `buf`.
+    /// Returns the number of bytes written.
+    fn config_set(&mut self, _key: &[u8], _value: &[u8], _buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize { 0 }
+
+    // === Bus state ===
 
     /// A kernel bus state changed (Safe, Claimed, Resetting).
     ///

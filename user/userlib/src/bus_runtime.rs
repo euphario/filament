@@ -681,8 +681,41 @@ fn devd_command_to_bus_msg(cmd: &DevdCommand) -> Option<BusMsg> {
             msg.seq_id = *seq_id;
             Some(msg)
         }
-        DevdCommand::SpawnChild { .. } => None,
-        DevdCommand::StopChild { .. } => None,
+        DevdCommand::ConfigGet { seq_id, key, key_len } => {
+            let mut msg = BusMsg::new(bus_msg::CONFIG_GET);
+            msg.seq_id = *seq_id;
+            msg.write_bytes(0, &key[..*key_len]);
+            msg.write_u8(*key_len, 0); // null terminator
+            msg.payload_len = (*key_len + 1) as u16;
+            Some(msg)
+        }
+        DevdCommand::ConfigSet { seq_id, key, key_len, value, value_len } => {
+            let mut msg = BusMsg::new(bus_msg::CONFIG_SET);
+            msg.seq_id = *seq_id;
+            msg.write_bytes(0, &key[..*key_len]);
+            msg.write_u8(*key_len, 0); // null separator
+            msg.write_bytes(*key_len + 1, &value[..*value_len]);
+            msg.write_u8(*key_len + 1 + *value_len, 0); // null terminator
+            msg.payload_len = (*key_len + 1 + *value_len + 1) as u16;
+            Some(msg)
+        }
+        DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, .. } => {
+            let mut msg = BusMsg::new(bus_msg::SPAWN_CHILD);
+            msg.seq_id = *seq_id;
+            msg.write_bytes(0, &binary[..*binary_len]);
+            msg.write_u8(*binary_len, 0); // null terminator
+            // caps at fixed offset after binary
+            msg.write_u64(72, *caps); // offset 72: past 64-byte binary + 8 alignment
+            msg.payload_len = 80;
+            Some(msg)
+        }
+        DevdCommand::StopChild { seq_id, child_pid } => {
+            let mut msg = BusMsg::new(bus_msg::STOP_CHILD);
+            msg.seq_id = *seq_id;
+            msg.write_u32(0, *child_pid);
+            msg.payload_len = 4;
+            Some(msg)
+        }
     }
 }
 
@@ -875,32 +908,42 @@ impl<D: Driver> DriverRuntime<D> {
     }
 
     /// Dispatch a DevdCommand to the driver.
+    ///
+    /// All commands go through BusMsg — single conversion path.
+    /// The framework intercepts known types (spawn, stop, config) before
+    /// the driver sees them. Everything else goes to `driver.command()`.
     fn dispatch_devd_command(&mut self, cmd: DevdCommand) {
-        match &cmd {
-            // SpawnChild is handled by the runtime, not the driver
-            DevdCommand::SpawnChild {
-                seq_id,
-                binary,
-                binary_len,
-                filter: _,
-                caps,
-            } => {
-                let binary_str = match core::str::from_utf8(&binary[..*binary_len]) {
+        let bus_msg = match devd_command_to_bus_msg(&cmd) {
+            Some(msg) => msg,
+            None => return,
+        };
+
+        self.ctx.current_cmd_seq = bus_msg.seq_id;
+        self.ctx.current_cmd_type = bus_msg.msg_type;
+
+        match bus_msg.msg_type {
+            // --- Framework-handled: process lifecycle ---
+
+            bus_msg::SPAWN_CHILD => {
+                let binary_name = bus_msg.read_null_terminated(0);
+                let caps = bus_msg.read_u64(72);
+
+                let binary_str = match core::str::from_utf8(binary_name) {
                     Ok(s) => s,
                     Err(_) => {
-                        let _ = self.ctx.devd.ack_spawn(*seq_id, -1, 0);
+                        let _ = self.ctx.devd.ack_spawn(bus_msg.seq_id, -1, 0);
                         return;
                     }
                 };
 
-                let pid = if *caps != 0 {
-                    syscall::exec_with_caps(binary_str, *caps)
+                let pid = if caps != 0 {
+                    syscall::exec_with_caps(binary_str, caps)
                 } else {
                     syscall::exec(binary_str)
                 };
 
                 if pid > 0 {
-                    let _ = self.ctx.devd.ack_spawn(*seq_id, 0, pid as u32);
+                    let _ = self.ctx.devd.ack_spawn(bus_msg.seq_id, 0, pid as u32);
                     for slot in &mut self.ctx.children {
                         if slot.is_none() {
                             *slot = Some(ChildEntry {
@@ -912,15 +955,16 @@ impl<D: Driver> DriverRuntime<D> {
                         }
                     }
                 } else {
-                    let _ = self.ctx.devd.ack_spawn(*seq_id, pid as i32, 0);
+                    let _ = self.ctx.devd.ack_spawn(bus_msg.seq_id, pid as i32, 0);
                 }
             }
 
-            DevdCommand::StopChild { child_pid, .. } => {
-                let _ = syscall::kill(*child_pid);
+            bus_msg::STOP_CHILD => {
+                let child_pid = bus_msg.read_u32(0);
+                let _ = syscall::kill(child_pid);
                 for slot in &mut self.ctx.children {
                     if let Some(entry) = slot {
-                        if entry.pid == *child_pid {
+                        if entry.pid == child_pid {
                             entry.alive = false;
                             break;
                         }
@@ -928,18 +972,47 @@ impl<D: Driver> DriverRuntime<D> {
                 }
             }
 
+            // --- Framework-handled: configuration ---
+
+            bus_msg::CONFIG_GET => {
+                let key = bus_msg.read_null_terminated(0);
+                let mut buf = [0u8; 512];
+
+                let len = if key.is_empty() {
+                    build_config_summary(&self.driver, &mut buf)
+                } else {
+                    self.driver.config_get(key, &mut buf)
+                };
+
+                let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+            }
+
+            bus_msg::CONFIG_SET => {
+                let (key, value) = bus_msg.parse_config_kv();
+                let mut buf = [0u8; 128];
+
+                let keys = self.driver.config_keys();
+                let valid = keys.iter().any(|k| k.name == key && k.writable);
+
+                let len = if valid {
+                    self.driver.config_set(key, value, &mut buf, &mut self.ctx)
+                } else if keys.iter().any(|k| k.name == key) {
+                    copy_static(&mut buf, b"ERR read-only key\n")
+                } else {
+                    copy_static(&mut buf, b"ERR unknown key\n")
+                };
+
+                let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+            }
+
+            // --- Driver-handled: everything else ---
+
             _ => {
-                if let Some(bus_msg) = devd_command_to_bus_msg(&cmd) {
-                    self.ctx.current_cmd_seq = bus_msg.seq_id;
-                    self.ctx.current_cmd_type = bus_msg.msg_type;
-
-                    let disposition = self.driver.command(&bus_msg, &mut self.ctx);
-
-                    match disposition {
-                        Disposition::Handled => {}
-                        Disposition::Forward | Disposition::HandledAndForward => {
-                            // Forward to children (no-op in v1 devd-backed runtime)
-                        }
+                let disposition = self.driver.command(&bus_msg, &mut self.ctx);
+                match disposition {
+                    Disposition::Handled => {}
+                    Disposition::Forward | Disposition::HandledAndForward => {
+                        // Forward to children (no-op in v1 devd-backed runtime)
                     }
                 }
             }
@@ -980,4 +1053,71 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
 
     let mut runtime = DriverRuntime::new(driver, devd, mux, name);
     runtime.run()
+}
+
+// ============================================================================
+// Config Summary Builder
+// ============================================================================
+
+/// Auto-build a summary response from the driver's registered config keys.
+///
+/// For each key, calls `config_get()` and emits `key=value\n`.
+/// Appends a `keys=` line listing all writable keys.
+fn build_config_summary<D: Driver>(driver: &D, buf: &mut [u8]) -> usize {
+    let keys = driver.config_keys();
+    let mut pos = 0;
+
+    // Emit key=value lines
+    for key in keys {
+        // key name
+        let klen = key.name.len().min(buf.len() - pos);
+        buf[pos..pos + klen].copy_from_slice(&key.name[..klen]);
+        pos += klen;
+
+        // '='
+        if pos < buf.len() { buf[pos] = b'='; pos += 1; }
+
+        // value from driver
+        let n = driver.config_get(key.name, &mut buf[pos..]);
+        pos += n;
+
+        // newline
+        if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
+    }
+
+    // Append keys= line (writable keys only)
+    let writable: [&[u8]; 16] = {
+        let mut arr: [&[u8]; 16] = [b""; 16];
+        let mut count = 0;
+        for key in keys {
+            if key.writable && count < 16 {
+                arr[count] = key.name;
+                count += 1;
+            }
+        }
+        arr
+    };
+
+    let writable_count = keys.iter().filter(|k| k.writable).count().min(16);
+    if writable_count > 0 {
+        pos += copy_static(&mut buf[pos..], b"keys=");
+        for i in 0..writable_count {
+            if i > 0 {
+                if pos < buf.len() { buf[pos] = b','; pos += 1; }
+            }
+            let name = writable[i];
+            let nlen = name.len().min(buf.len() - pos);
+            buf[pos..pos + nlen].copy_from_slice(&name[..nlen]);
+            pos += nlen;
+        }
+        if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
+    }
+
+    pos
+}
+
+fn copy_static(dst: &mut [u8], src: &[u8]) -> usize {
+    let len = src.len().min(dst.len());
+    dst[..len].copy_from_slice(&src[..len]);
+    len
 }

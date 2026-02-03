@@ -141,6 +141,10 @@ pub mod msg {
     pub const REGISTER_PARTITION: u16 = 0x0411;
     /// Mount a partition (reserved)
     pub const MOUNT_PARTITION: u16 = 0x0412;
+    /// Get a configuration value from driver (response via SERVICE_INFO_RESULT)
+    pub const CONFIG_GET: u16 = 0x0420;
+    /// Set a configuration value on driver (response via SERVICE_INFO_RESULT)
+    pub const CONFIG_SET: u16 = 0x0421;
 
     // Response messages
     /// Response containing device list

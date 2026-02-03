@@ -16,6 +16,7 @@ pub mod data_port;
 pub mod devd;
 pub mod blk;
 pub mod sync;
+pub mod config;
 
 // Legacy modules — kept for compilation but not re-exported.
 // console_ring: still used by consoled.
@@ -47,7 +48,7 @@ pub use devd::{
     DevdCommand, SpawnFilter, SpawnResult,
 };
 pub use bus::{
-    BusMsg, BusMsgFlags, BusError, BusCtx, Driver, Disposition,
+    BusMsg, BusMsgFlags, BusError, BusCtx, Driver, Disposition, ConfigKey,
     ChildId, PortId, BlockTransport, BlockPortConfig, BlockGeometry,
     BlockCompletion, PortError, bus_msg as bus_msg_types,
 };

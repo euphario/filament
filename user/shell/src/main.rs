@@ -323,6 +323,10 @@ fn execute_command(cmd: &[u8]) {
         builtins::hw::run(b"");
     } else if cmd_starts_with(cmd, b"hw ") {
         builtins::hw::run(&cmd[3..]);
+    } else if cmd_eq(cmd, b"devc") {
+        builtins::devc::run(b"");
+    } else if cmd_starts_with(cmd, b"devc ") {
+        builtins::devc::run(&cmd[5..]);
     } else if cmd_eq(cmd, b"devd") {
         builtins::devd::run(b"");
     } else if cmd_starts_with(cmd, b"devd ") {
