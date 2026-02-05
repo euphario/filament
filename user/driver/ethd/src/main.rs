@@ -135,6 +135,114 @@ const MT7531_CPU_PORT: u32 = 6;
 // User ports (ports 0-3, the 4x RJ45)
 const MT7531_USER_PORTS: u32 = 0x0F;  // Ports 0-3
 
+// =============================================================================
+// MT7531 VLAN Table Registers (for config API)
+// Reference: Linux drivers/net/dsa/mt7530.h
+// =============================================================================
+
+const MT7530_VTCR: u32 = 0x90;        // VLAN table control
+const MT7530_VAWD1: u32 = 0x94;       // VLAN data word 1
+const MT7530_VAWD2: u32 = 0x98;       // VLAN data word 2
+
+// VTCR bits
+const VTCR_BUSY: u32 = 1 << 31;
+const VTCR_INVALID: u32 = 1 << 16;
+const VTCR_FUNC_RD_VID: u32 = 0 << 12;  // Read VLAN entry
+const VTCR_FUNC_WR_VID: u32 = 1 << 12;  // Write VLAN entry
+const VTCR_FUNC_INV_VID: u32 = 2 << 12; // Invalidate VLAN entry
+
+// VAWD1 bits
+const VAWD1_IVL_MAC: u32 = 1 << 30;     // Independent VLAN learning
+const VAWD1_VTAG_EN: u32 = 1 << 28;     // VLAN tag enable
+const VAWD1_PORT_MEM_SHIFT: u32 = 16;   // Port membership bits [23:16]
+const VAWD1_PORT_MEM_MASK: u32 = 0xFF << 16;
+const VAWD1_VLAN_VALID: u32 = 1 << 0;   // Entry valid
+
+// VAWD2: Egress tag control, 2 bits per port
+// 0 = untag, 1 = tag (use PVID), 2 = tag (use VID), 3 = stack tag
+const VAWD2_PORT_ETAG_SHIFT: u32 = 0;   // Bits [13:0] for ports 0-6
+
+// =============================================================================
+// MT7531 FDB (Forwarding Database) Registers
+// =============================================================================
+
+const MT7530_ATA1: u32 = 0x74;        // Address table MAC bytes [47:16]
+const MT7530_ATA2: u32 = 0x78;        // Address table MAC bytes [15:0] + flags
+const MT7530_ATWD: u32 = 0x7c;        // Address table write data
+const MT7530_ATC: u32 = 0x80;         // Address table control
+const MT7530_TSRA1: u32 = 0x84;       // Table search result 1
+const MT7530_TSRA2: u32 = 0x88;       // Table search result 2
+const MT7530_ATRD: u32 = 0x8c;        // Address table read data
+
+// ATC bits
+const ATC_BUSY: u32 = 1 << 15;
+const ATC_SRCH_END: u32 = 1 << 14;
+const ATC_SRCH_HIT: u32 = 1 << 13;
+const ATC_SAT: u32 = 1 << 2;          // Static address table
+
+// ATC commands
+const ATC_CMD_READ: u32 = 0;
+const ATC_CMD_WRITE: u32 = 1;
+const ATC_CMD_CLEAN: u32 = 2;
+const ATC_CMD_SEARCH_START: u32 = 4;
+const ATC_CMD_SEARCH_NEXT: u32 = 5;
+
+// ATWD bits
+const ATWD_PORT_MASK_SHIFT: u32 = 4;
+const ATWD_LIVE: u32 = 3 << 0;        // Entry type: 3 = static
+
+// =============================================================================
+// MT7531 STP State Registers (per-port)
+// =============================================================================
+
+const MT7530_SSP_P: fn(u32) -> u32 = |p| 0x2000 + p * 0x100;  // Port Spanning State
+// SSP bits [1:0]: 0=disabled, 1=blocking, 2=learning, 3=forwarding
+
+// =============================================================================
+// MT7531 MIB Counter Registers (per-port)
+// =============================================================================
+
+const MT7530_MIB_PORT_BASE: fn(u32) -> u32 = |p| 0x4000 + p * 0x100;
+// MIB offsets within port base:
+const MIB_TX_DROP: u32 = 0x00;
+const MIB_TX_CRC: u32 = 0x04;
+const MIB_TX_UNI: u32 = 0x08;
+const MIB_TX_MULTI: u32 = 0x0c;
+const MIB_TX_BCAST: u32 = 0x10;
+const MIB_TX_COL: u32 = 0x14;
+const MIB_TX_BYTES_LO: u32 = 0x24;
+const MIB_TX_BYTES_HI: u32 = 0x28;
+const MIB_RX_DROP: u32 = 0x50;
+const MIB_RX_FILTER: u32 = 0x54;
+const MIB_RX_UNI: u32 = 0x58;
+const MIB_RX_MULTI: u32 = 0x5c;
+const MIB_RX_BCAST: u32 = 0x60;
+const MIB_RX_ALIGN_ERR: u32 = 0x64;
+const MIB_RX_CRC: u32 = 0x68;
+const MIB_RX_BYTES_LO: u32 = 0x80;
+const MIB_RX_BYTES_HI: u32 = 0x84;
+
+// =============================================================================
+// MT7531 Port Mirror Registers
+// =============================================================================
+
+const MT7530_MFC: u32 = 0x10;         // Mirror Forward Control (shared)
+const MFC_MIRROR_EN: u32 = 1 << 3;
+const MFC_MIRROR_PORT_SHIFT: u32 = 4;
+const MFC_MIRROR_PORT_MASK: u32 = 0x7 << 4;
+
+const MT7530_PCR_MIR: fn(u32) -> u32 = |p| 0x2004 + p * 0x100;  // Port Control (mirror bits)
+const PCR_TX_MIR: u32 = 1 << 9;       // TX mirror enable
+const PCR_RX_MIR: u32 = 1 << 8;       // RX mirror enable
+
+// =============================================================================
+// MT7531 Age Control
+// =============================================================================
+
+const MT7530_AAC: u32 = 0xa0;         // Address Aging Control
+const AAC_AGE_CNT_SHIFT: u32 = 12;    // Aging count bits [19:12]
+const AAC_AGE_UNIT_SHIFT: u32 = 0;    // Aging unit bits [11:0]
+
 // Ring sizes - MUST match Linux mtk_eth_soc exactly (MT7988)
 // Source: linux/drivers/net/ethernet/mediatek/mtk_eth_soc.c mt7988_data
 const NUM_TX_DESC: usize = 2048;      // MTK_DMA_SIZE(2K) for tx.dma_size
@@ -2213,6 +2321,533 @@ impl EthDriver {
             }
         }
     }
+
+    // =========================================================================
+    // Switch Configuration Helpers (for devc config API)
+    // =========================================================================
+
+    /// Wait for VTCR busy bit to clear
+    fn wait_vtcr_ready(&self) -> bool {
+        for _ in 0..1000 {
+            let val = self.gsw_read(MT7530_VTCR);
+            if val & VTCR_BUSY == 0 {
+                return (val & VTCR_INVALID) == 0;
+            }
+            delay_us(20);
+        }
+        false
+    }
+
+    /// Wait for ATC busy bit to clear
+    fn wait_atc_ready(&self) -> bool {
+        for _ in 0..1000 {
+            let val = self.gsw_read(MT7530_ATC);
+            if val & ATC_BUSY == 0 {
+                return true;
+            }
+            delay_us(20);
+        }
+        false
+    }
+
+    /// Read a VLAN entry. Returns (members, untagged) or None if invalid.
+    fn vlan_read(&self, vid: u16) -> Option<(u8, u8)> {
+        // Issue read command
+        self.gsw_write(MT7530_VTCR, VTCR_BUSY | VTCR_FUNC_RD_VID | (vid as u32));
+        if !self.wait_vtcr_ready() {
+            return None;
+        }
+
+        let vawd1 = self.gsw_read(MT7530_VAWD1);
+        if vawd1 & VAWD1_VLAN_VALID == 0 {
+            return None;
+        }
+
+        let members = ((vawd1 >> VAWD1_PORT_MEM_SHIFT) & 0x7f) as u8;
+        let vawd2 = self.gsw_read(MT7530_VAWD2);
+
+        // Extract untagged ports from VAWD2 (2 bits per port, 0=untag)
+        let mut untagged = 0u8;
+        for p in 0..7 {
+            if (vawd2 >> (p * 2)) & 3 == 0 {
+                untagged |= 1 << p;
+            }
+        }
+        Some((members, untagged))
+    }
+
+    /// Write a VLAN entry
+    fn vlan_write(&self, vid: u16, members: u8, untagged: u8) -> bool {
+        // Build VAWD1: IVL + members + valid
+        let vawd1 = VAWD1_IVL_MAC | ((members as u32) << VAWD1_PORT_MEM_SHIFT) | VAWD1_VLAN_VALID;
+
+        // Build VAWD2: egress tag control (2 bits per port)
+        // 0 = untag, 2 = tag with VID
+        let mut vawd2 = 0u32;
+        for p in 0..7 {
+            let tag_mode = if (untagged >> p) & 1 != 0 { 0 } else { 2 };
+            vawd2 |= tag_mode << (p * 2);
+        }
+
+        self.gsw_write(MT7530_VAWD1, vawd1);
+        self.gsw_write(MT7530_VAWD2, vawd2);
+        self.gsw_write(MT7530_VTCR, VTCR_BUSY | VTCR_FUNC_WR_VID | (vid as u32));
+        self.wait_vtcr_ready()
+    }
+
+    /// Delete a VLAN entry
+    fn vlan_delete(&self, vid: u16) -> bool {
+        self.gsw_write(MT7530_VTCR, VTCR_BUSY | VTCR_FUNC_INV_VID | (vid as u32));
+        self.wait_vtcr_ready()
+    }
+
+    /// List all valid VLANs, formatting into buffer
+    fn switch_vlan_list(&self, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+        for vid in 1..4096u16 {
+            if let Some((members, untagged)) = self.vlan_read(vid) {
+                if members != 0 {
+                    let s = format_args!("vid={} members=0x{:02x} untagged=0x{:02x}\n",
+                                         vid, members, untagged);
+                    let n = fmt_to_buf(&mut buf[offset..], s);
+                    offset += n;
+                    if offset + 64 > buf.len() {
+                        break; // Buffer full
+                    }
+                }
+            }
+        }
+        offset
+    }
+
+    /// Get a single VLAN entry
+    fn switch_vlan_get(&self, vid: u16, buf: &mut [u8]) -> usize {
+        match self.vlan_read(vid) {
+            Some((members, untagged)) => {
+                fmt_to_buf(buf, format_args!("vid={} members=0x{:02x} untagged=0x{:02x}\n",
+                                             vid, members, untagged))
+            }
+            None => fmt_to_buf(buf, format_args!("ERR VLAN {} not found\n", vid)),
+        }
+    }
+
+    /// Set/create a VLAN entry. Value format: "members,untagged" (hex)
+    fn switch_vlan_set(&self, vid: u16, value: &str, buf: &mut [u8]) -> usize {
+        // Parse "0x0f,0x07" or "15,7"
+        let mut parts = value.split(',');
+        let members = match parts.next().and_then(|s| parse_u8(s.trim())) {
+            Some(m) => m,
+            None => return fmt_to_buf(buf, format_args!("ERR invalid members\n")),
+        };
+        let untagged = match parts.next().and_then(|s| parse_u8(s.trim())) {
+            Some(u) => u,
+            None => return fmt_to_buf(buf, format_args!("ERR invalid untagged\n")),
+        };
+
+        if self.vlan_write(vid, members, untagged) {
+            fmt_to_buf(buf, format_args!("OK\n"))
+        } else {
+            fmt_to_buf(buf, format_args!("ERR write failed\n"))
+        }
+    }
+
+    /// Delete a VLAN entry
+    fn switch_vlan_del(&self, vid: u16, buf: &mut [u8]) -> usize {
+        if self.vlan_delete(vid) {
+            fmt_to_buf(buf, format_args!("OK\n"))
+        } else {
+            fmt_to_buf(buf, format_args!("ERR delete failed\n"))
+        }
+    }
+
+    /// Dump the FDB (learned MAC addresses)
+    fn switch_fdb_dump(&self, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+
+        // Start search
+        self.gsw_write(MT7530_ATC, ATC_BUSY | ATC_CMD_SEARCH_START);
+        if !self.wait_atc_ready() {
+            return fmt_to_buf(buf, format_args!("ERR timeout\n"));
+        }
+
+        loop {
+            let atc = self.gsw_read(MT7530_ATC);
+            if atc & ATC_SRCH_END != 0 {
+                break; // No more entries
+            }
+            if atc & ATC_SRCH_HIT != 0 {
+                // Read the entry
+                let tsra1 = self.gsw_read(MT7530_TSRA1);
+                let tsra2 = self.gsw_read(MT7530_TSRA2);
+                let atrd = self.gsw_read(MT7530_ATRD);
+
+                // Extract MAC address
+                let mac = [
+                    ((tsra1 >> 24) & 0xff) as u8,
+                    ((tsra1 >> 16) & 0xff) as u8,
+                    ((tsra1 >> 8) & 0xff) as u8,
+                    (tsra1 & 0xff) as u8,
+                    ((tsra2 >> 24) & 0xff) as u8,
+                    ((tsra2 >> 16) & 0xff) as u8,
+                ];
+                let vid = (tsra2 & 0xfff) as u16;
+                let port_mask = ((atrd >> 4) & 0x7f) as u8;
+                let is_static = (atrd & ATWD_LIVE) == ATWD_LIVE;
+
+                let n = fmt_to_buf(&mut buf[offset..], format_args!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} vid={} port=0x{:02x} {}\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                    vid, port_mask, if is_static { "static" } else { "dynamic" }
+                ));
+                offset += n;
+                if offset + 80 > buf.len() {
+                    break; // Buffer full
+                }
+            }
+
+            // Next entry
+            self.gsw_write(MT7530_ATC, ATC_BUSY | ATC_CMD_SEARCH_NEXT);
+            if !self.wait_atc_ready() {
+                break;
+            }
+        }
+
+        if offset == 0 {
+            fmt_to_buf(buf, format_args!("(empty)\n"))
+        } else {
+            offset
+        }
+    }
+
+    /// Add a static FDB entry. Value: "mac,vid,port"
+    fn switch_fdb_add(&self, value: &str, buf: &mut [u8]) -> usize {
+        // Parse "00:11:22:33:44:55,1,0"
+        let mut parts = value.split(',');
+        let mac_str = match parts.next() {
+            Some(s) => s.trim(),
+            None => return fmt_to_buf(buf, format_args!("ERR missing MAC\n")),
+        };
+        let vid = match parts.next().and_then(|s| s.trim().parse::<u16>().ok()) {
+            Some(v) => v,
+            None => return fmt_to_buf(buf, format_args!("ERR invalid VID\n")),
+        };
+        let port = match parts.next().and_then(|s| parse_u8(s.trim())) {
+            Some(p) => p,
+            None => return fmt_to_buf(buf, format_args!("ERR invalid port\n")),
+        };
+
+        // Parse MAC address
+        let mac = match parse_mac(mac_str) {
+            Some(m) => m,
+            None => return fmt_to_buf(buf, format_args!("ERR invalid MAC format\n")),
+        };
+
+        // Write ATA1: MAC bytes [47:16]
+        let ata1 = ((mac[0] as u32) << 24) | ((mac[1] as u32) << 16)
+                 | ((mac[2] as u32) << 8) | (mac[3] as u32);
+
+        // Write ATA2: MAC bytes [15:0] + IVL + VID
+        let ata2 = ((mac[4] as u32) << 24) | ((mac[5] as u32) << 16)
+                 | (1 << 15)  // IVL bit
+                 | (vid as u32);
+
+        // Write ATWD: port mask + static entry
+        let atwd = ((1u32 << port) << ATWD_PORT_MASK_SHIFT) | ATWD_LIVE;
+
+        self.gsw_write(MT7530_ATA1, ata1);
+        self.gsw_write(MT7530_ATA2, ata2);
+        self.gsw_write(MT7530_ATWD, atwd);
+        self.gsw_write(MT7530_ATC, ATC_BUSY | ATC_CMD_WRITE);
+
+        if self.wait_atc_ready() {
+            fmt_to_buf(buf, format_args!("OK\n"))
+        } else {
+            fmt_to_buf(buf, format_args!("ERR write failed\n"))
+        }
+    }
+
+    /// Delete a FDB entry. Value: "mac,vid"
+    fn switch_fdb_del(&self, value: &str, buf: &mut [u8]) -> usize {
+        let mut parts = value.split(',');
+        let mac_str = match parts.next() {
+            Some(s) => s.trim(),
+            None => return fmt_to_buf(buf, format_args!("ERR missing MAC\n")),
+        };
+        let vid = match parts.next().and_then(|s| s.trim().parse::<u16>().ok()) {
+            Some(v) => v,
+            None => return fmt_to_buf(buf, format_args!("ERR invalid VID\n")),
+        };
+
+        let mac = match parse_mac(mac_str) {
+            Some(m) => m,
+            None => return fmt_to_buf(buf, format_args!("ERR invalid MAC format\n")),
+        };
+
+        let ata1 = ((mac[0] as u32) << 24) | ((mac[1] as u32) << 16)
+                 | ((mac[2] as u32) << 8) | (mac[3] as u32);
+        let ata2 = ((mac[4] as u32) << 24) | ((mac[5] as u32) << 16)
+                 | (1 << 15) | (vid as u32);
+
+        self.gsw_write(MT7530_ATA1, ata1);
+        self.gsw_write(MT7530_ATA2, ata2);
+        self.gsw_write(MT7530_ATWD, 0); // Clear port mask
+        self.gsw_write(MT7530_ATC, ATC_BUSY | ATC_CMD_WRITE);
+
+        if self.wait_atc_ready() {
+            fmt_to_buf(buf, format_args!("OK\n"))
+        } else {
+            fmt_to_buf(buf, format_args!("ERR delete failed\n"))
+        }
+    }
+
+    /// Flush FDB. Value: "all" or port number
+    fn switch_fdb_flush(&self, value: &str, buf: &mut [u8]) -> usize {
+        let value = value.trim();
+        if value == "all" || value.is_empty() {
+            // Flush all
+            self.gsw_write(MT7530_ATC, ATC_BUSY | ATC_CMD_CLEAN);
+        } else {
+            // Flush specific port (not directly supported, would need iteration)
+            return fmt_to_buf(buf, format_args!("ERR per-port flush not supported\n"));
+        }
+
+        if self.wait_atc_ready() {
+            fmt_to_buf(buf, format_args!("OK\n"))
+        } else {
+            fmt_to_buf(buf, format_args!("ERR flush failed\n"))
+        }
+    }
+
+    /// Get STP state for a port
+    fn switch_stp_get(&self, port: u8, buf: &mut [u8]) -> usize {
+        if port > 6 {
+            return fmt_to_buf(buf, format_args!("ERR invalid port\n"));
+        }
+        let ssp = self.gsw_read(MT7530_SSP_P(port as u32));
+        let state = ssp & 0x3;
+        let state_name = match state {
+            0 => "disabled",
+            1 => "blocking",
+            2 => "learning",
+            3 => "forwarding",
+            _ => "unknown",
+        };
+        fmt_to_buf(buf, format_args!("{}\n", state_name))
+    }
+
+    /// Set STP state for a port
+    fn switch_stp_set(&self, port: u8, value: &str, buf: &mut [u8]) -> usize {
+        if port > 6 {
+            return fmt_to_buf(buf, format_args!("ERR invalid port\n"));
+        }
+        let state = match value.trim() {
+            "disabled" | "0" => 0,
+            "blocking" | "1" => 1,
+            "learning" | "2" => 2,
+            "forwarding" | "3" => 3,
+            _ => return fmt_to_buf(buf, format_args!("ERR invalid state\n")),
+        };
+
+        self.gsw_rmw(MT7530_SSP_P(port as u32), 0x3, state);
+        fmt_to_buf(buf, format_args!("OK\n"))
+    }
+
+    /// Get port statistics
+    fn switch_stats_get(&self, port: u8, buf: &mut [u8]) -> usize {
+        if port > 6 {
+            return fmt_to_buf(buf, format_args!("ERR invalid port\n"));
+        }
+        let base = MT7530_MIB_PORT_BASE(port as u32);
+
+        let tx_bytes = ((self.gsw_read(base + MIB_TX_BYTES_HI) as u64) << 32)
+                     | (self.gsw_read(base + MIB_TX_BYTES_LO) as u64);
+        let rx_bytes = ((self.gsw_read(base + MIB_RX_BYTES_HI) as u64) << 32)
+                     | (self.gsw_read(base + MIB_RX_BYTES_LO) as u64);
+        let tx_uni = self.gsw_read(base + MIB_TX_UNI);
+        let tx_bcast = self.gsw_read(base + MIB_TX_BCAST);
+        let tx_multi = self.gsw_read(base + MIB_TX_MULTI);
+        let rx_uni = self.gsw_read(base + MIB_RX_UNI);
+        let rx_bcast = self.gsw_read(base + MIB_RX_BCAST);
+        let rx_multi = self.gsw_read(base + MIB_RX_MULTI);
+        let tx_drop = self.gsw_read(base + MIB_TX_DROP);
+        let rx_drop = self.gsw_read(base + MIB_RX_DROP);
+        let tx_crc = self.gsw_read(base + MIB_TX_CRC);
+        let rx_crc = self.gsw_read(base + MIB_RX_CRC);
+        let tx_col = self.gsw_read(base + MIB_TX_COL);
+
+        fmt_to_buf(buf, format_args!(
+            "port={}\n\
+             tx_bytes={} rx_bytes={}\n\
+             tx_uni={} tx_bcast={} tx_multi={}\n\
+             rx_uni={} rx_bcast={} rx_multi={}\n\
+             tx_drop={} rx_drop={}\n\
+             tx_crc={} rx_crc={} tx_col={}\n",
+            port, tx_bytes, rx_bytes,
+            tx_uni, tx_bcast, tx_multi,
+            rx_uni, rx_bcast, rx_multi,
+            tx_drop, rx_drop,
+            tx_crc, rx_crc, tx_col
+        ))
+    }
+
+    /// Get mirror configuration
+    fn switch_mirror_get(&self, buf: &mut [u8]) -> usize {
+        let mfc = self.gsw_read(MT7530_MFC);
+        let enabled = (mfc & MFC_MIRROR_EN) != 0;
+        let dest = ((mfc & MFC_MIRROR_PORT_MASK) >> MFC_MIRROR_PORT_SHIFT) as u8;
+
+        // Collect source ports
+        let mut sources = 0u8;
+        for p in 0..7 {
+            let pcr = self.gsw_read(MT7530_PCR_MIR(p));
+            if (pcr & (PCR_TX_MIR | PCR_RX_MIR)) != 0 {
+                sources |= 1 << p;
+            }
+        }
+
+        if enabled {
+            fmt_to_buf(buf, format_args!("dest={} sources=0x{:02x}\n", dest, sources))
+        } else {
+            fmt_to_buf(buf, format_args!("disabled\n"))
+        }
+    }
+
+    /// Set mirror configuration. Value: "dest,sources,mode"
+    fn switch_mirror_set(&self, value: &str, buf: &mut [u8]) -> usize {
+        let mut parts = value.split(',');
+        let dest = match parts.next().and_then(|s| parse_u8(s.trim())) {
+            Some(d) if d <= 6 => d,
+            _ => return fmt_to_buf(buf, format_args!("ERR invalid dest port\n")),
+        };
+        let sources = match parts.next().and_then(|s| parse_u8(s.trim())) {
+            Some(s) => s,
+            None => return fmt_to_buf(buf, format_args!("ERR invalid sources\n")),
+        };
+        let mode = parts.next().map(|s| s.trim()).unwrap_or("both");
+
+        let (rx_en, tx_en) = match mode {
+            "rx" => (true, false),
+            "tx" => (false, true),
+            "both" => (true, true),
+            _ => return fmt_to_buf(buf, format_args!("ERR invalid mode\n")),
+        };
+
+        // Set MFC mirror port and enable
+        let mfc = self.gsw_read(MT7530_MFC);
+        let mfc_new = (mfc & !MFC_MIRROR_PORT_MASK)
+                    | ((dest as u32) << MFC_MIRROR_PORT_SHIFT)
+                    | MFC_MIRROR_EN;
+        self.gsw_write(MT7530_MFC, mfc_new);
+
+        // Configure source ports
+        for p in 0..7 {
+            let mut pcr = self.gsw_read(MT7530_PCR_MIR(p));
+            pcr &= !(PCR_TX_MIR | PCR_RX_MIR);
+            if (sources >> p) & 1 != 0 {
+                if rx_en { pcr |= PCR_RX_MIR; }
+                if tx_en { pcr |= PCR_TX_MIR; }
+            }
+            self.gsw_write(MT7530_PCR_MIR(p), pcr);
+        }
+
+        fmt_to_buf(buf, format_args!("OK\n"))
+    }
+
+    /// Disable mirroring
+    fn switch_mirror_off(&self, buf: &mut [u8]) -> usize {
+        // Clear MFC mirror enable
+        self.gsw_rmw(MT7530_MFC, MFC_MIRROR_EN, 0);
+
+        // Clear all port mirror bits
+        for p in 0..7 {
+            self.gsw_rmw(MT7530_PCR_MIR(p), PCR_TX_MIR | PCR_RX_MIR, 0);
+        }
+
+        fmt_to_buf(buf, format_args!("OK\n"))
+    }
+
+    /// Get age time
+    fn switch_age_get(&self, buf: &mut [u8]) -> usize {
+        let aac = self.gsw_read(MT7530_AAC);
+        let cnt = (aac >> AAC_AGE_CNT_SHIFT) & 0xff;
+        let unit = aac & 0xfff;
+        // Age time = cnt * unit * 2 seconds (approximate)
+        let seconds = (cnt as u32) * (unit as u32) * 2;
+        fmt_to_buf(buf, format_args!("{}\n", seconds))
+    }
+
+    /// Set age time in seconds
+    fn switch_age_set(&self, value: &str, buf: &mut [u8]) -> usize {
+        let seconds = match value.trim().parse::<u32>() {
+            Ok(s) => s,
+            Err(_) => return fmt_to_buf(buf, format_args!("ERR invalid value\n")),
+        };
+
+        // Convert to count/unit (simplified: use unit=1, count=seconds/2)
+        let unit = 1u32;
+        let cnt = (seconds / 2).min(255);
+
+        let aac = (cnt << AAC_AGE_CNT_SHIFT) | unit;
+        self.gsw_write(MT7530_AAC, aac);
+
+        fmt_to_buf(buf, format_args!("OK\n"))
+    }
+
+    /// Get DMA mode
+    fn switch_dma_get(&self, buf: &mut [u8]) -> usize {
+        let mode = if USE_QDMA { "qdma" } else { "pdma" };
+        fmt_to_buf(buf, format_args!("{}\n", mode))
+    }
+
+    /// Set DMA mode (informational only - requires recompile)
+    fn switch_dma_set(&self, _value: &str, buf: &mut [u8]) -> usize {
+        fmt_to_buf(buf, format_args!("ERR DMA mode requires recompile (USE_QDMA={})\n", USE_QDMA))
+    }
+}
+
+/// Format arguments to buffer, returns bytes written
+fn fmt_to_buf(buf: &mut [u8], args: core::fmt::Arguments<'_>) -> usize {
+    use core::fmt::Write;
+    struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+    impl Write for BufWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let remaining = self.buf.len() - self.pos;
+            let to_write = bytes.len().min(remaining);
+            self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
+            self.pos += to_write;
+            Ok(())
+        }
+    }
+    let mut w = BufWriter { buf, pos: 0 };
+    let _ = core::fmt::write(&mut w, args);
+    w.pos
+}
+
+/// Parse a u8 value from string (supports "0x" prefix)
+fn parse_u8(s: &str) -> Option<u8> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// Parse MAC address from "xx:xx:xx:xx:xx:xx" format
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut idx = 0;
+    for part in s.split(':') {
+        if idx >= 6 {
+            return None;
+        }
+        mac[idx] = u8::from_str_radix(part, 16).ok()?;
+        idx += 1;
+    }
+    if idx != 6 {
+        return None;
+    }
+    Some(mac)
 }
 
 // =============================================================================
@@ -2603,6 +3238,133 @@ impl Driver for EthDriver {
             }
         }
     }
+
+    // =========================================================================
+    // Config API (devc ethd get/set switch.*)
+    // =========================================================================
+
+    fn config_keys(&self) -> &[userlib::bus::ConfigKey] {
+        use userlib::bus::ConfigKey;
+        static KEYS: [ConfigKey; 5] = [
+            ConfigKey::read_only(b"switch.vlan"),
+            ConfigKey::read_only(b"switch.fdb"),
+            ConfigKey::read_only(b"switch.mirror"),
+            ConfigKey::read_only(b"switch.age"),
+            ConfigKey::read_only(b"switch.dma"),
+        ];
+        &KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        let key_str = core::str::from_utf8(key).unwrap_or("");
+
+        // Handle empty key (summary)
+        if key_str.is_empty() {
+            return fmt_to_buf(buf, format_args!(
+                "keys: switch.vlan switch.fdb switch.stp.<port> switch.stats.<port> switch.mirror switch.age switch.dma\n\
+                 write: switch.vlan.<vid>=members,untagged switch.vlan.del=vid\n\
+                 write: switch.fdb.add=mac,vid,port switch.fdb.del=mac,vid switch.fdb.flush=all\n\
+                 write: switch.stp.<port>=disabled|blocking|learning|forwarding\n\
+                 write: switch.mirror=dest,sources,rx|tx|both switch.mirror.off=1\n\
+                 write: switch.age=seconds\n"
+            ));
+        }
+
+        if key_str == "switch.vlan" {
+            return self.switch_vlan_list(buf);
+        }
+        if let Some(rest) = key_str.strip_prefix("switch.vlan.") {
+            if let Ok(vid) = rest.parse::<u16>() {
+                return self.switch_vlan_get(vid, buf);
+            }
+        }
+        if key_str == "switch.fdb" {
+            return self.switch_fdb_dump(buf);
+        }
+        if let Some(rest) = key_str.strip_prefix("switch.stp.") {
+            if let Ok(port) = rest.parse::<u8>() {
+                return self.switch_stp_get(port, buf);
+            }
+        }
+        if let Some(rest) = key_str.strip_prefix("switch.stats.") {
+            if let Ok(port) = rest.parse::<u8>() {
+                return self.switch_stats_get(port, buf);
+            }
+        }
+        if key_str == "switch.mirror" {
+            return self.switch_mirror_get(buf);
+        }
+        if key_str == "switch.age" {
+            return self.switch_age_get(buf);
+        }
+        if key_str == "switch.dma" {
+            return self.switch_dma_get(buf);
+        }
+
+        0 // Unknown key
+    }
+
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize {
+        let key_str = core::str::from_utf8(key).unwrap_or("");
+        let val_str = core::str::from_utf8(value).unwrap_or("");
+
+        // VLAN operations
+        if let Some(rest) = key_str.strip_prefix("switch.vlan.") {
+            if rest == "del" {
+                if let Ok(vid) = val_str.trim().parse::<u16>() {
+                    return self.switch_vlan_del(vid, buf);
+                }
+                return fmt_to_buf(buf, format_args!("ERR invalid VID\n"));
+            }
+            if let Ok(vid) = rest.parse::<u16>() {
+                return self.switch_vlan_set(vid, val_str, buf);
+            }
+        }
+
+        // FDB operations
+        if key_str == "switch.fdb.add" {
+            return self.switch_fdb_add(val_str, buf);
+        }
+        if key_str == "switch.fdb.del" {
+            return self.switch_fdb_del(val_str, buf);
+        }
+        if key_str == "switch.fdb.flush" {
+            return self.switch_fdb_flush(val_str, buf);
+        }
+
+        // STP operations
+        if let Some(rest) = key_str.strip_prefix("switch.stp.") {
+            if let Ok(port) = rest.parse::<u8>() {
+                return self.switch_stp_set(port, val_str, buf);
+            }
+        }
+
+        // Mirror operations
+        if key_str == "switch.mirror" {
+            return self.switch_mirror_set(val_str, buf);
+        }
+        if key_str == "switch.mirror.off" {
+            return self.switch_mirror_off(buf);
+        }
+
+        // Stats reset
+        if key_str == "switch.stats.reset" {
+            // MIB reset not implemented (would need CCR register)
+            return fmt_to_buf(buf, format_args!("ERR not implemented\n"));
+        }
+
+        // Age time
+        if key_str == "switch.age" {
+            return self.switch_age_set(val_str, buf);
+        }
+
+        // DMA mode
+        if key_str == "switch.dma" {
+            return self.switch_dma_set(val_str, buf);
+        }
+
+        fmt_to_buf(buf, format_args!("ERR unknown key\n"))
+    }
 }
 
 // =============================================================================
@@ -2653,6 +3415,15 @@ impl Driver for EthDriverWrapper {
     }
     fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
         self.0.handle_event(tag, handle, ctx)
+    }
+    fn config_keys(&self) -> &[userlib::bus::ConfigKey] {
+        self.0.config_keys()
+    }
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        self.0.config_get(key, buf)
+    }
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
+        self.0.config_set(key, value, buf, ctx)
     }
 }
 
