@@ -76,7 +76,33 @@
 .section .text.boot
 .global _start
 
+/*
+ * ARM64 Linux Image header (64 bytes)
+ * Required for U-Boot bootm command to recognize us as a valid kernel.
+ *
+ * Header layout:
+ *   0x00: code0 - Branch to real code
+ *   0x04: code1 - Reserved
+ *   0x08: text_offset - Image load offset from RAM start
+ *   0x10: image_size - Effective image size (0 = unknown)
+ *   0x18: flags - Kernel flags
+ *   0x20-0x30: Reserved
+ *   0x38: magic - "ARM\x64" = 0x644d5241
+ *   0x3C: res5 - Reserved (PE offset for UEFI)
+ */
 _start:
+    b       real_start              // 0x00: Branch past header (64 bytes = 16 instructions)
+    .word   0                       // 0x04: code1 (reserved)
+    .quad   0                       // 0x08: text_offset (0 = use load address from FIT)
+    .quad   0x800000                // 0x10: image_size (8MB - prevents U-Boot relocation)
+    .quad   0x0                     // 0x18: flags (0 = must be at specified address, not relocatable)
+    .quad   0                       // 0x20: res2
+    .quad   0                       // 0x28: res3
+    .quad   0                       // 0x30: res4
+    .word   0x644d5241              // 0x38: magic "ARM\x64"
+    .word   0                       // 0x3C: res5 (PE header offset)
+
+real_start:
     /*
      * Early debug output - prints 'B' to UART before any setup.
      * Output to both MT7988A and QEMU UARTs (one will work, one will be ignored).

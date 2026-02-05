@@ -770,11 +770,15 @@ impl ObjectService {
     // ========================================================================
 
     /// Allocate DMA-capable memory
+    ///
+    /// flags bit 0: use_high - allocate from high memory pool (>4GB)
+    /// flags bit 1: streaming - use cacheable memory (requires explicit cache sync)
     pub fn open_dma_pool(
         &self,
         task_id: TaskId,
         size: usize,
         use_high: bool,
+        streaming: bool,
     ) -> Result<Handle, KernelError> {
         use crate::kernel::dma_pool;
         use crate::kernel::object::DmaPoolObject;
@@ -791,10 +795,17 @@ impl ObjectService {
         };
 
         // Map into process (outside lock)
+        // Choose mapping mode based on streaming flag
         let vaddr = if use_high {
+            // High memory pool doesn't support streaming mode yet
             dma_pool::map_into_process_high(task_id, paddr, size)
                 .map_err(KernelError::from_errno)?
+        } else if streaming {
+            // Streaming: cacheable memory, requires explicit cache sync
+            dma_pool::map_into_process_streaming(task_id, paddr, size)
+                .map_err(KernelError::from_errno)?
         } else {
+            // Coherent: non-cacheable memory, no cache sync needed
             dma_pool::map_into_process(task_id, paddr, size)
                 .map_err(KernelError::from_errno)?
         };

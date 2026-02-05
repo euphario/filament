@@ -568,6 +568,7 @@ fn open_shmem_existing(params_ptr: u64) -> i64 {
 fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
     // Params: u64 size, u32 flags (16 bytes)
     // flags bit 0: 1 = high memory pool, 0 = low memory pool
+    // flags bit 1: 1 = streaming (cacheable), 0 = coherent (non-cacheable)
     if params_len != 16 {
         return KernelError::InvalidArg.to_errno();
     }
@@ -584,6 +585,7 @@ fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
     ]) as usize;
     let flags = u32::from_le_bytes([params[8], params[9], params[10], params[11]]);
     let use_high = (flags & 1) != 0;
+    let streaming = (flags & 2) != 0;
 
     let task_id = get_current_task_id();
 
@@ -593,7 +595,7 @@ fn open_dma_pool(params_ptr: u64, params_len: usize) -> i64 {
 
     // Delegate to ObjectService
     use crate::kernel::object_service::object_service;
-    match object_service().open_dma_pool(task_id, size, use_high) {
+    match object_service().open_dma_pool(task_id, size, use_high, streaming) {
         Ok(handle) => handle.raw() as i64,
         Err(e) => e.to_errno(),
     }
