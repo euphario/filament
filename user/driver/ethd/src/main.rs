@@ -312,7 +312,7 @@ const USE_SRAM_FOR_RINGS: bool = true;  // Test SRAM with clock enable
 // Debug verbosity flag
 // Set to true to enable detailed register dumps and diagnostics during init.
 // Set to false for production (reduces log spam significantly).
-const DEBUG_VERBOSE: bool = true;
+const DEBUG_VERBOSE: bool = false;
 
 // QDMA vs PDMA for TX
 // Linux uses QDMA for TX with a free queue (FQ) for automatic buffer recycling.
@@ -2870,18 +2870,9 @@ impl EthDriver {
         }
         let mut w = BufWriter { buf, pos: 0 };
 
-        // Frame Engine (GDMA) stats
-        let fe_tx_ok = self.fe_read(GDMA1_BASE + 0x40);
-        let fe_tx_drop = self.fe_read(GDMA1_BASE + 0x44);
-        let fe_rx_ok = self.fe_read(GDMA1_BASE + 0x50);
-        let fe_rx_drop = self.fe_read(GDMA1_BASE + 0x54);
-
         let _ = core::write!(w,
-            "=== Frame Engine (GDMA1) ===\n\
-             tx_ok={} tx_drop={} rx_ok={} rx_drop={}\n\n\
-             === Switch Ports ===\n\
-             port  tx_bytes      rx_bytes      tx_pkts  rx_pkts  drop\n",
-            fe_tx_ok, fe_tx_drop, fe_rx_ok, fe_rx_drop
+            "=== Switch Ports ===\n\
+             port  tx_bytes      rx_bytes      tx_pkts  rx_pkts  drop\n"
         );
 
         // Switch port stats (compact summary)
@@ -3133,21 +3124,12 @@ impl EthDriver {
         ))
     }
 
-    /// Get Frame Engine (GDMA) statistics
+    /// Get Frame Engine (GDMA) statistics - redirect to combined stats
     fn fe_stats_get(&self, buf: &mut [u8]) -> usize {
-        // GDMA statistics registers (offsets from GDMA base)
-        // Reference: Linux mtk_eth_soc.h MTK_STAT_OFFSET = 0x40
-        let tx_ok = self.fe_read(GDMA1_BASE + 0x40);
-        let tx_drop = self.fe_read(GDMA1_BASE + 0x44);
-        let rx_ok = self.fe_read(GDMA1_BASE + 0x50);
-        let rx_drop = self.fe_read(GDMA1_BASE + 0x54);
-        let rx_ovf = self.fe_read(GDMA1_BASE + 0x58);  // RX overflow
-
+        // Note: GDMA doesn't have packet counters. Real stats are in switch MIB.
         fmt_to_buf(buf, format_args!(
-            "GDMA1 (GMAC0/Switch):\n\
-             tx_ok={} tx_drop={}\n\
-             rx_ok={} rx_drop={} rx_ovf={}\n",
-            tx_ok, tx_drop, rx_ok, rx_drop, rx_ovf
+            "Use 'devc ethd get stats' for packet statistics.\n\
+             (GDMA provides config, not counters - stats are in switch MIB)\n"
         ))
     }
 
