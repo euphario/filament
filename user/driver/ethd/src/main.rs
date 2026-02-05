@@ -172,6 +172,11 @@ const USE_STREAMING_DMA: bool = false;  // Use coherent (non-cacheable) DMA for 
 // Set to true to test SRAM, false to use DMA memory (like U-Boot does).
 const USE_SRAM_FOR_RINGS: bool = false;  // DMA can't access SRAM - use regular DMA memory like U-Boot
 
+// Debug verbosity flag
+// Set to true to enable detailed register dumps and diagnostics during init.
+// Set to false for production (reduces log spam significantly).
+const DEBUG_VERBOSE: bool = false;
+
 // Legacy offsets for compatibility (will be removed)
 const TX_RING_OFF: usize = 0;
 const RX_RING_OFF: usize = TX_RING_SIZE;
@@ -947,42 +952,45 @@ impl EthDriver {
         uinfo!("ethd", "fifo_init_done";
                tx_ring = userlib::ulog::hex64(tx_ring_paddr),
                rx_ring = userlib::ulog::hex64(rx_ring_paddr));
-        uinfo!("ethd", "verify_tx";
-               base = userlib::ulog::hex32(verify_tx_base),
-               max = verify_tx_max,
-               ctx = verify_tx_ctx,
-               dtx = verify_tx_dtx);
-        uinfo!("ethd", "verify_rx";
-               base = userlib::ulog::hex32(verify_rx_base),
-               max = verify_rx_max);
 
-        // Verify ring writes by reading back first TX descriptor
-        unsafe {
-            let txd = tx_ring_vaddr as *const TxDescV2;
-            // For streaming DMA, invalidate before reading
-            if USE_STREAMING_DMA && !USE_SRAM_FOR_RINGS {
-                cache_invalidate(tx_ring_vaddr, TX_DESC_SIZE);
-            }
-            let txd1 = core::ptr::read_volatile(&(*txd).txd1);
-            let txd2 = core::ptr::read_volatile(&(*txd).txd2);
-            let txd3 = core::ptr::read_volatile(&(*txd).txd3);
-            let txd5 = core::ptr::read_volatile(&(*txd).txd5);
-            uinfo!("ethd", "verify_tx0";
-                   txd1 = userlib::ulog::hex32(txd1),
-                   txd2 = userlib::ulog::hex32(txd2),
-                   txd3 = userlib::ulog::hex32(txd3),
-                   txd5 = userlib::ulog::hex32(txd5));
+        if DEBUG_VERBOSE {
+            uinfo!("ethd", "verify_tx";
+                   base = userlib::ulog::hex32(verify_tx_base),
+                   max = verify_tx_max,
+                   ctx = verify_tx_ctx,
+                   dtx = verify_tx_dtx);
+            uinfo!("ethd", "verify_rx";
+                   base = userlib::ulog::hex32(verify_rx_base),
+                   max = verify_rx_max);
 
-            // Also verify RX descriptor 0
-            if USE_STREAMING_DMA && !USE_SRAM_FOR_RINGS {
-                cache_invalidate(rx_ring_vaddr, RX_DESC_SIZE);
+            // Verify ring writes by reading back first TX descriptor
+            unsafe {
+                let txd = tx_ring_vaddr as *const TxDescV2;
+                // For streaming DMA, invalidate before reading
+                if USE_STREAMING_DMA && !USE_SRAM_FOR_RINGS {
+                    cache_invalidate(tx_ring_vaddr, TX_DESC_SIZE);
+                }
+                let txd1 = core::ptr::read_volatile(&(*txd).txd1);
+                let txd2 = core::ptr::read_volatile(&(*txd).txd2);
+                let txd3 = core::ptr::read_volatile(&(*txd).txd3);
+                let txd5 = core::ptr::read_volatile(&(*txd).txd5);
+                uinfo!("ethd", "verify_tx0";
+                       txd1 = userlib::ulog::hex32(txd1),
+                       txd2 = userlib::ulog::hex32(txd2),
+                       txd3 = userlib::ulog::hex32(txd3),
+                       txd5 = userlib::ulog::hex32(txd5));
+
+                // Also verify RX descriptor 0
+                if USE_STREAMING_DMA && !USE_SRAM_FOR_RINGS {
+                    cache_invalidate(rx_ring_vaddr, RX_DESC_SIZE);
+                }
+                let rxd = rx_ring_vaddr as *const RxDescV2;
+                let rxd1 = core::ptr::read_volatile(&(*rxd).rxd1);
+                let rxd2 = core::ptr::read_volatile(&(*rxd).rxd2);
+                uinfo!("ethd", "verify_rx0";
+                       rxd1 = userlib::ulog::hex32(rxd1),
+                       rxd2 = userlib::ulog::hex32(rxd2));
             }
-            let rxd = rx_ring_vaddr as *const RxDescV2;
-            let rxd1 = core::ptr::read_volatile(&(*rxd).rxd1);
-            let rxd2 = core::ptr::read_volatile(&(*rxd).rxd2);
-            uinfo!("ethd", "verify_rx0";
-                   rxd1 = userlib::ulog::hex32(rxd1),
-                   rxd2 = userlib::ulog::hex32(rxd2));
         }
     }
 
@@ -1154,8 +1162,10 @@ impl EthDriver {
 
     fn eth_start(&mut self) {
         // FIRST: Dump U-Boot's state BEFORE we change anything
-        uinfo!("ethd", "dump_uboot_state";);
-        self.dump_all_registers("UBOOT");
+        if DEBUG_VERBOSE {
+            uinfo!("ethd", "dump_uboot_state";);
+            self.dump_all_registers("UBOOT");
+        }
 
         // DON'T reset Frame Engine - preserve U-Boot's working state
         // The FE reset clears internal 10G SerDes and bridge configuration
@@ -1300,8 +1310,10 @@ impl EthDriver {
         uinfo!("ethd", "dma_enabled"; glo_cfg = userlib::ulog::hex32(glo_cfg));
 
         // LAST: Dump state AFTER all our changes
-        uinfo!("ethd", "dump_our_state";);
-        self.dump_all_registers("OURS");
+        if DEBUG_VERBOSE {
+            uinfo!("ethd", "dump_our_state";);
+            self.dump_all_registers("OURS");
+        }
 
         self.link_up = true;
     }
@@ -1869,7 +1881,7 @@ impl Driver for EthDriver {
 
             // Every 100 polls (~1 second), dump TX descriptor state and MIB counters
             self.poll_count += 1;
-            if self.poll_count % 100 == 0 {
+            if DEBUG_VERBOSE && self.poll_count % 100 == 0 {
                 if self.sram_vaddr != 0 {
                     let tx_ring_vaddr = self.sram_vaddr + SRAM_TX_RING_OFF as u64;
                     let dtx = self.pdma_read(tx_dtx_idx_reg(0));
