@@ -502,8 +502,8 @@ impl IpdDriver {
             stack.iface.poll(now, &mut device, &mut stack.sockets);
         }
 
-        // Poll DHCP socket for configuration events
-        {
+        // Poll DHCP socket for configuration events (only when DHCP is enabled)
+        if self.ip_state == IpState::Unconfigured || self.ip_state == IpState::DhcpConfigured {
             let event = stack.sockets.get_mut::<dhcpv4::Socket>(stack.dhcp_handle).poll();
             match event {
                 Some(dhcpv4::Event::Configured(config)) => {
@@ -684,6 +684,10 @@ impl IpdDriver {
                             let _ = ctx.unwatch_handle(timer.handle());
                         }
                         self.dhcp_fallback_timer = None;
+                        // Reset DHCP socket to stop sending requests
+                        if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
+                            stack.sockets.get_mut::<dhcpv4::Socket>(stack.dhcp_handle).reset();
+                        }
                         uinfo!("ipd", "dhcp_disabled";);
                         copy_str(buf, "OK\n")
                     }
