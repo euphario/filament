@@ -269,6 +269,37 @@ pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i6
     })
 }
 
+/// Map DMA pool memory with streaming (cacheable) attributes
+///
+/// Unlike the default non-cacheable mapping, this uses cacheable memory
+/// for better performance. Requires explicit cache sync operations.
+pub fn map_into_process_streaming(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {
+    // OVERFLOW CHECK: Verify address bounds safely
+    let end_addr = phys_addr.checked_add(size as u64).ok_or_else(|| {
+        kerror!("dma_pool", "map_streaming_addr_overflow"; addr = klog::hex64(phys_addr), size = size as u64);
+        -22i64 // EINVAL
+    })?;
+
+    // Verify address is within pool
+    if phys_addr < DMA_POOL_BASE || end_addr > DMA_POOL_END {
+        kerror!("dma_pool", "map_streaming_addr_invalid"; addr = klog::hex64(phys_addr));
+        return Err(-1);
+    }
+
+    super::task::with_scheduler(|sched| {
+        // Find the task and map the memory
+        if let Some(slot) = sched.slot_by_pid(pid) {
+            if let Some(task) = sched.task_mut(slot) {
+                // Use streaming DMA mapping: cacheable memory
+                // Requires explicit cache sync in userspace
+                return task.mmap_shmem_dma_streaming(phys_addr, size)
+                    .ok_or(-12i64); // ENOMEM
+            }
+        }
+        Err(-3) // ESRCH - no such process
+    })
+}
+
 /// Map high DMA pool memory into a process's address space (36-bit addresses)
 /// Uses special mapping that doesn't try to access memory from kernel space
 pub fn map_into_process_high(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i64> {

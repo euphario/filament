@@ -964,6 +964,19 @@ impl Task {
         ).map(|r| r.virt_addr)
     }
 
+    /// Map DMA memory with streaming (cacheable) attributes
+    /// Use this for data buffers that benefit from caching.
+    /// Requires explicit cache sync operations via userspace.
+    #[inline]
+    pub fn mmap_shmem_dma_streaming(&mut self, phys_addr: u64, size: usize) -> Option<u64> {
+        self.map_region(
+            size,
+            MapSource::Fixed(phys_addr),
+            MapFlags::streaming_dma(),
+            MappingKind::BorrowedShmem,
+        ).map(|r| r.virt_addr)
+    }
+
     #[inline]
     pub fn mmap_device(&mut self, phys_addr: u64, size: usize) -> Option<u64> {
         self.map_region(

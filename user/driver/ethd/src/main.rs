@@ -1,27 +1,16 @@
-//! MT7988 Native Ethernet Driver
+//! MT7988 Native Ethernet Driver (U-Boot style)
 //!
-//! GMAC1 + Internal MT7530 Switch driver using the bus framework with DataPort
-//! integration for zero-copy packet I/O. Auto-spawned by devd when platform
-//! registers an eth0 bus port.
-//!
-//! Architecture:
-//! - Platform registers /kernel/bus/eth0 at boot
-//! - devd connects to claim ownership, spawns ethd with MMIO metadata
-//! - ethd initializes GMAC1/QDMA/PDMA, creates DataPort for packet I/O
-//! - TX: dequeues DataPort SQ, fills QDMA descriptors, kicks hardware
-//! - RX: timer-polled PDMA used ring, posts to DataPort CQ
-//!
-//! Hardware:
-//! - GMAC1 connects to internal MT7530 switch (4x RJ45 GbE ports)
-//! - No external PHY/MDIO needed — force mode for internal switch
-//! - QDMA for TX (hardware queue 0)
-//! - PDMA for RX (ring 0)
+//! Direct port of U-Boot's mtk_eth driver logic for GMAC0 + internal switch.
+//! Uses PDMA only (no QDMA) - same as U-Boot.
 
 #![no_std]
 #![no_main]
 
+mod uboot_mtk_eth;
+
+use uboot_mtk_eth::*;
 use userlib::syscall::Handle;
-use userlib::mmio::{MmioRegion, DmaPool, delay_us};
+use userlib::mmio::{MmioRegion, DmaPool, delay_us, cache_clean, cache_invalidate};
 use userlib::ipc::Timer;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
@@ -33,1306 +22,745 @@ use userlib::devd::PortType;
 use userlib::{uinfo, uerror, uwarn};
 
 // =============================================================================
-// MT7988 Frame Engine Register Definitions
+// Hardware Constants
 // =============================================================================
 
-/// Frame Engine base address
 const FE_BASE: u64 = 0x1510_0000;
-
-/// Frame Engine size (512KB)
 const FE_SIZE: u64 = 0x8_0000;
 
-/// Internal Switch (GSW) base address (MT7531 in MT7988)
-/// Accessed via memory-mapped I/O, NOT MDIO
-const GSW_BASE: u64 = 0x1502_0000;
+// MT7988 Internal Switch - SEPARATE memory region (not inside FE!)
+// Reference: Linux DTS mt7988a.dtsi - switch@15020000
+const SWITCH_BASE: u64 = 0x1502_0000;
+const SWITCH_SIZE: u64 = 0x8000;
 
-/// GSW size (32KB)
-const GSW_SIZE: u64 = 0x8000;
+// Ethwarp clock/reset controller - controls switch reset
+// Reference: Linux clk-mt7988-eth.c
+const ETHWARP_BASE: u64 = 0x1503_1000;
+const ETHWARP_SIZE: u64 = 0x1000;
+const ETHWARP_RST_OFS: usize = 0x8;  // Reset register offset
+const ETHWARP_RST_SWITCH_BIT: u32 = 1 << 9;  // Bit 9 = switch reset
 
-/// ETHSYS base address (Ethernet System Control - clock/reset)
-/// CRITICAL: This is SEPARATE from FE_BASE! DMA_AG_MAP lives here.
+// ETHSYS - System control for Frame Engine
+// Reference: Linux mt7988a.dtsi - ethsys: syscon@15000000
 const ETHSYS_BASE: u64 = 0x1500_0000;
-
-/// ETHSYS size (4KB is enough for our registers)
 const ETHSYS_SIZE: u64 = 0x1000;
-
-/// Register offsets from FE_BASE
-mod fe_regs {
-    // Frame Engine global registers
-    pub const FE_GLO_CFG: usize = 0x0000;
-    pub const FE_RST_GL: usize = 0x0004;
-    pub const FE_INT_STATUS: usize = 0x0020;
-    pub const FE_INT_ENABLE: usize = 0x0028;
-
-    // FE global misc (NETSYSv3)
-    pub const FE_GLO_MISC: usize = 0x0124;
-    pub const FE_GLO_MISC_PDMA_V2: u32 = 1 << 4;  // Enable PDMAv2 mode
-
-    // Reset bits
-    pub const RST_FE: u32 = 1 << 31;
-
-    // PSE (Packet Scheduling Engine) registers - required for V3!
-    pub const PSE_DROP_CFG: usize = 0x0108;
-    pub const PSE_DUMY_REQ: usize = 0x010c;
-    pub const PSE_PPE_DROP0: usize = 0x0110;
-    pub const PSE_PPE_DROP1: usize = 0x0114;
-    pub const PSE_PPE_DROP2: usize = 0x0118;
-    pub const PSE_FQFC_CFG2: usize = 0x0104;  // Free queue flow control config 2
-    // PSE_IQ_REV(x) = 0x140 + (x-1)*4 - Input Queue Reservation
-    pub const PSE_IQ_REV1: usize = 0x0140;  // 0x140 + 0*4
-    pub const PSE_IQ_REV2: usize = 0x0144;  // 0x140 + 1*4
-    pub const PSE_IQ_REV3: usize = 0x0148;  // 0x140 + 2*4
-    pub const PSE_IQ_REV4: usize = 0x014c;  // 0x140 + 3*4
-    pub const PSE_IQ_REV5: usize = 0x0150;  // 0x140 + 4*4
-    pub const PSE_IQ_REV6: usize = 0x0154;  // 0x140 + 5*4
-    pub const PSE_IQ_REV7: usize = 0x0158;  // 0x140 + 6*4
-    pub const PSE_IQ_REV8: usize = 0x015c;  // 0x140 + 7*4
-    // PSE_OQ_TH(x) = 0x160 + (x-1)*4 - Output Queue Threshold
-    pub const PSE_OQ_TH1: usize = 0x0160;  // 0x160 + 0*4
-    pub const PSE_OQ_TH2: usize = 0x0164;  // 0x160 + 1*4
-    pub const PSE_OQ_TH3: usize = 0x0168;  // 0x160 + 2*4
-    pub const PSE_OQ_TH4: usize = 0x016c;  // 0x160 + 3*4
-    pub const PSE_OQ_TH5: usize = 0x0170;  // 0x160 + 4*4
-    pub const PSE_OQ_TH6: usize = 0x0174;  // 0x160 + 5*4
-    pub const PSE_OQ_TH7: usize = 0x0178;  // 0x160 + 6*4
-    pub const PSE_OQ_TH8: usize = 0x017c;  // 0x160 + 7*4
-
-    // PSE Dummy Page bits
-    pub const PSE_DUMMY_WORK_GDM1: u32 = 1 << 17;
-    pub const PSE_DUMMY_WORK_GDM2: u32 = 1 << 18;
-    pub const PSE_DUMMY_WORK_GDM3: u32 = 1 << 19;
-    pub const PSE_DUMMY_PAGE_THR: u32 = 1;
-
-    // GDM and CDM thresholds (V3) - Linux mtk_hw_init NETSYS_V3 section
-    pub const MTK_GDM2_THRES: usize = 0x1648;
-    pub const MTK_CDMW0_THRES: usize = 0x164c;
-    pub const MTK_CDMW1_THRES: usize = 0x1650;
-    pub const MTK_CDME0_THRES: usize = 0x1654;
-    pub const MTK_CDME1_THRES: usize = 0x1658;
-    pub const MTK_CDMM_THRES: usize = 0x165c;
-
-    // DMA address generation map (confusingly named ETHSYS in Linux but at FE_BASE!)
-    // CRITICAL for DMA to work on MT7988/NETSYS_V3
-    pub const DMA_AG_MAP: usize = 0x0408;
-    pub const DMA_AG_MAP_PDMA: u32 = 1 << 0;       // Enable PDMA address generation
-    pub const DMA_AG_MAP_QDMA: u32 = 1 << 1;       // Enable QDMA address generation
-    pub const DMA_AG_MAP_PPE: u32 = 1 << 2;        // Enable PPE address generation
-    pub const DMA_AG_MAP_PPE1_BYPASS: u32 = 1 << 3; // Bypass PPE1 for NETSYS_V3
-
-    // CDMQ ingress control (for V3 CDM)
-    pub const MTK_CDMQ_IG_CTRL: usize = 0x1400;
-    pub const MTK_CDMQ_STAG_EN: u32 = 1 << 0;
-
-    // Interrupt grouping registers (from Linux mtk_hw_init)
-    // Even for polling mode, these may need to be configured
-    pub const FE_INT_GRP: usize = 0x0020;           // FE interrupt grouping
-    pub const TX_IRQ_MASK: usize = 0x461c;          // QDMA TX IRQ mask
-    pub const PDMA_IRQ_MASK: usize = 0x6a28;        // PDMA RX IRQ mask
-    pub const PDMA_INT_GRP0: usize = 0x6a50;        // PDMA interrupt group 0
-    pub const PDMA_INT_GRP1: usize = 0x6a54;        // PDMA interrupt group 1
-    pub const QDMA_INT_GRP0: usize = 0x4620;        // QDMA interrupt group 0
-    pub const QDMA_INT_GRP1: usize = 0x4624;        // QDMA interrupt group 1
-
-    // Interrupt grouping values (from Linux)
-    pub const TX_DONE_INT: u32 = 1 << 28;           // MTK_TX_DONE_INT
-    pub const RX_DONE_INT_V2: u32 = 1 << 14;        // RX done mask for V2
-    pub const FE_INT_GRP_VALUE: u32 = 0x21021000;   // FE interrupt grouping value
-}
-
-/// ETHSYS registers (at ETHSYS_BASE = 0x15000000)
-/// These control clock/reset and DMA address generation
-mod ethsys_regs {
-    /// Clock gate control register
-    /// From clk-mt7988-eth.c: ethdma_cg_regs at offset 0x30
-    /// Write 1 to enable clock, 0 to disable (inverted in hardware)
-    pub const CLK_GATE: usize = 0x30;
-    pub const CLK_FE_EN: u32 = 1 << 6;      // Frame Engine clock
-    pub const CLK_GP2_EN: u32 = 1 << 7;     // GMAC Port 2 clock
-    pub const CLK_GP1_EN: u32 = 1 << 8;     // GMAC Port 1 clock
-    pub const CLK_GP3_EN: u32 = 1 << 10;    // GMAC Port 3 clock
-    pub const CLK_ESW_EN: u32 = 1 << 16;    // Ethernet Switch clock
-
-    /// Reset idle check enable - must disable before reset, re-enable after
-    pub const FE_RST_CHK_IDLE_EN: usize = 0x28;
-
-    /// Reset control register
-    pub const RSTCTRL: usize = 0x34;
-
-    /// DMA Address Generation Map - CRITICAL for DMA!
-    /// This is at ETHSYS_BASE + 0x408 (confirmed from Linux regmap_update_bits(eth->ethsys, ...))
-    pub const DMA_AG_MAP: usize = 0x408;
-    pub const DMA_AG_MAP_PDMA: u32 = 1 << 0;   // Enable PDMA address generation
-    pub const DMA_AG_MAP_QDMA: u32 = 1 << 1;   // Enable QDMA address generation
-    pub const DMA_AG_MAP_PPE: u32 = 1 << 2;    // Enable PPE address generation
-
-    // RSTCTRL bits (for V3 / MT7988)
-    pub const RSTCTRL_FE: u32 = 1 << 6;        // Frame Engine reset
-    pub const RSTCTRL_ETH: u32 = 1 << 23;      // Ethernet reset
-    pub const RSTCTRL_PPE0_V3: u32 = 1 << 29;  // PPE0 reset (V3)
-    pub const RSTCTRL_PPE1_V3: u32 = 1 << 30;  // PPE1 reset (V3)
-    pub const RSTCTRL_WDMA0: u32 = 1 << 24;    // WDMA0 reset
-    pub const RSTCTRL_WDMA1: u32 = 1 << 25;    // WDMA1 reset
-    pub const RSTCTRL_WDMA2: u32 = 1 << 26;    // WDMA2 reset
-}
-
-/// GDM (GMAC Data Module) registers — forwards packets to correct DMA
-mod gdm_regs {
-    /// GDM1 forward config — controls where RX packets go
-    /// Offset from FE_BASE
-    pub const GDM1_FWD_CFG: usize = 0x0500;
-
-    /// Forward to PDMA (value 0 = PDMA)
-    pub const GDM_TO_PDMA: u32 = 0;
-
-    /// Enable IP/TCP/UDP checksum generation for TX
-    pub const GDM_ICS_EN: u32 = 1 << 22;
-    pub const GDM_TCS_EN: u32 = 1 << 21;
-    pub const GDM_UCS_EN: u32 = 1 << 20;
-}
-
-/// MAC registers (GMAC1)
-mod mac_regs {
-    /// Base offset for GMAC1 within FE
-    pub const GMAC1_BASE: usize = 0x10100;
-
-    /// MAC Control Register
-    pub const MAC_MCR: usize = 0x00;
-
-    /// MAC address registers
-    pub const MAC_ADRH: usize = 0x0C;  // [47:32]
-    pub const MAC_ADRL: usize = 0x10;  // [31:0]
-
-    // MCR bits (from Linux mtk_eth_soc.h)
-    /// Force mode (bypass AN)
-    pub const MCR_FORCE_MODE: u32 = 1 << 15;
-    /// TX enable
-    pub const MCR_TX_EN: u32 = 1 << 14;
-    /// RX enable
-    pub const MCR_RX_EN: u32 = 1 << 13;
-    /// Backoff enable
-    pub const MCR_BACKOFF_EN: u32 = 1 << 9;
-    /// Backpressure enable
-    pub const MCR_BACKPR_EN: u32 = 1 << 8;
-    /// Force RX flow control
-    pub const MCR_FORCE_RX_FC: u32 = 1 << 5;
-    /// Force TX flow control
-    pub const MCR_FORCE_TX_FC: u32 = 1 << 4;
-    /// Speed (bits 2-3): 00=10M, 01=100M, 10=1000M
-    pub const MCR_SPEED_1000: u32 = 2 << 2;
-    pub const MCR_SPEED_100: u32 = 1 << 2;
-    /// Full duplex (bit 1, NOT bit 8!)
-    pub const MCR_FORCE_DPX: u32 = 1 << 1;
-    /// Force link up
-    pub const MCR_FORCE_LINK: u32 = 1 << 0;
-}
-
-/// GMAC misc (MUX control)
-mod mac_misc {
-    /// MAC misc register (V3)
-    pub const MAC_MISC_V3: usize = 0x10010;
-
-    /// Route GMAC1 to internal switch (ESW)
-    pub const MUX_TO_ESW: u32 = 1 << 0;
-}
-
-/// MDIO (PHY Management) registers
-mod mdio_regs {
-    /// PHY Indirect Access Control register (within GMAC block)
-    /// Offset from FE_BASE
-    pub const PHY_IAC: usize = 0x10004;
-
-    // PHY_IAC bits
-    pub const PHY_ACS_ST: u32 = 1 << 31;      // Access start/busy
-    pub const PHY_RW_WRITE: u32 = 1 << 30;    // 1=write, 0=read
-    pub const PHY_RW_READ: u32 = 0 << 30;
-    pub const MDIO_ST_C22: u32 = 1 << 28;     // Clause 22
-
-    pub const fn phy_addr(addr: u8) -> u32 {
-        ((addr as u32) & 0x1f) << 20
-    }
-
-    pub const fn phy_reg(reg: u8) -> u32 {
-        ((reg as u32) & 0x1f) << 25
-    }
-
-    pub const fn phy_data(data: u16) -> u32 {
-        data as u32
-    }
-}
-
-/// MT7531 Switch registers (memory-mapped in MT7988)
-/// Based on Linux drivers/net/dsa/mt7530.c and mt7530.h
-mod mt7531_regs {
-    // Switch core registers
-    /// System Control Register
-    pub const SYS_CTRL: u32 = 0x7000;
-    pub const SYS_CTRL_PHY_RST: u32 = 1 << 2;  // Reset PHYs
-    pub const SYS_CTRL_SW_RST: u32 = 1 << 1;   // Software reset
-    pub const SYS_CTRL_REG_RST: u32 = 1 << 0;  // Register reset
-
-    /// Port Control Register base (per-port: + port * 0x100)
-    pub const PCR_BASE: u32 = 0x2004;
-    /// Port matrix (which ports can forward to which)
-    pub const fn pcr_matrix(ports: u8) -> u32 {
-        ((ports as u32) & 0x7f) << 16
-    }
-    /// Port VLAN and port matrix control
-    pub const PCR_PORT_VLAN_MASK: u32 = 0x3 << 0;
-    pub const PCR_PORT_VLAN_USER: u32 = 0 << 0;  // User port mode
-
-    /// Port MAC Control Register base
-    pub const PMCR_BASE: u32 = 0x3000;
-
-    // MT7531 Force Mode bits (high bits to ENABLE forcing each parameter)
-    // These are different from MT7530!
-    pub const MT7531_FORCE_MODE_LNK: u32 = 1 << 31;    // Enable force link
-    pub const MT7531_FORCE_MODE_SPD: u32 = 1 << 30;    // Enable force speed
-    pub const MT7531_FORCE_MODE_DPX: u32 = 1 << 29;    // Enable force duplex
-    pub const MT7531_FORCE_MODE_RX_FC: u32 = 1 << 28;  // Enable force RX flow control
-    pub const MT7531_FORCE_MODE_TX_FC: u32 = 1 << 27;  // Enable force TX flow control
-
-    // PMCR value bits (same for MT7530 and MT7531)
-    pub const PMCR_FORCE_LNK: u32 = 1 << 0;        // Link up value
-    pub const PMCR_FORCE_DPX: u32 = 1 << 1;        // Full duplex value
-    pub const PMCR_FORCE_SPD_1000: u32 = 2 << 2;   // Speed = 1000Mbps
-    pub const PMCR_FORCE_SPD_100: u32 = 1 << 2;    // Speed = 100Mbps
-    pub const PMCR_TX_FC_EN: u32 = 1 << 4;         // TX flow control value
-    pub const PMCR_RX_FC_EN: u32 = 1 << 5;         // RX flow control value
-
-    // PMCR control bits
-    pub const PMCR_BACKPR_EN: u32 = 1 << 9;
-    pub const PMCR_BKOFF_EN: u32 = 1 << 10;
-    pub const PMCR_RX_EN: u32 = 1 << 13;
-    pub const PMCR_TX_EN: u32 = 1 << 14;
-    pub const PMCR_MAC_MODE: u32 = 1 << 16;  // MAC mode (vs PHY mode)
-
-    /// Port MAC Status Register
-    pub const PMSR_BASE: u32 = 0x3008;
-    pub const PMSR_LINK: u32 = 1 << 0;
-    pub const PMSR_DPX: u32 = 1 << 1;
-    pub const PMSR_SPD_MASK: u32 = 3 << 2;
-
-    /// Port Security Control Register
-    pub const PSC_BASE: u32 = 0x200c;
-    pub const PSC_DIS_PORT: u32 = 1 << 31;  // Port disable bit
-
-    /// Internal PHY Indirect Access Control (MT7531 specific)
-    /// Different encoding from MT7530!
-    pub const PHY_IAC: u32 = 0x701C;
-    pub const PHY_ACS_ST: u32 = 1 << 31;     // Access start/busy
-
-    // MT7531 command encoding (bits 18-19)
-    pub const MDIO_CMD_WRITE: u32 = 0x1 << 18;  // C22 write
-    pub const MDIO_CMD_READ: u32 = 0x2 << 18;   // C22 read
-
-    // MT7531 clause type (bits 16-17)
-    pub const MDIO_ST_C22: u32 = 0x1 << 16;     // Clause 22
-
-    pub const fn phy_addr(addr: u8) -> u32 {
-        ((addr as u32) & 0x1f) << 20
-    }
-    pub const fn phy_reg(reg: u8) -> u32 {
-        ((reg as u32) & 0x1f) << 25
-    }
-    pub const fn phy_data(data: u16) -> u32 {
-        data as u32
-    }
-
-    /// CPU port number (port 6 connects to GMAC1)
-    pub const CPU_PORT: u8 = 6;
-
-    /// Number of user ports (0-3 are RJ45, 4 is SFP)
-    pub const NUM_USER_PORTS: u8 = 4;
-
-    /// GMAC Mux Control
-    pub const TOP_SIG_CTRL: u32 = 0x7808;
-    pub const TOP_SIG_CTRL_NORMAL: u32 = 0;  // Normal switch mode
-
-    /// PHY control registers (MT7531 specific)
-    pub const PLLGP_EN: u32 = 0x7820;     // PLL enable
-    pub const PLLGP_CR0: u32 = 0x78a8;    // PLL config
-    pub const PHY_CNTL: u32 = 0x7a10;     // PHY power control
-    pub const PHY_EN_MASK: u32 = 0x1F;    // PHY 0-4 enable bits
-}
-
-/// QDMA (Queue DMA) registers — for TX (NETSYS V3)
-mod qdma_regs {
-    /// QDMA base offset from FE_BASE
-    pub const QDMA_BASE: usize = 0x4400;
-
-    /// TX queue config (per queue, +0x10 each) - at QDMA_BASE
-    pub const QDMA_QTX_CFG: usize = 0x0000;  // 0x4400
-    /// TX scheduler config
-    pub const QDMA_QTX_SCH: usize = 0x0004;  // 0x4404
-
-    /// GLO_CFG register (V2/V3 offset)
-    pub const QDMA_GLO_CFG: usize = 0x0204;  // 0x4604
-
-    /// TX ring registers (MT7988 offsets)
-    /// TX context pointer (ring base) - 0x4400+0x300=0x4700
-    pub const QDMA_CTX_PTR: usize = 0x0300;
-    /// TX DMA pointer (HW read position)
-    pub const QDMA_DTX_PTR: usize = 0x0304;
-    /// TX ring count
-    pub const QDMA_TRING_CNT: usize = 0x0308;
-    /// TX CPU release pointer (kick DMA)
-    pub const QDMA_CRX_PTR: usize = 0x0310;
-    /// TX DMA release pointer
-    pub const QDMA_DRX_PTR: usize = 0x0314;
-
-    /// Free queue registers (V2/V3 offset)
-    pub const QDMA_FQ_HEAD: usize = 0x0320;
-    pub const QDMA_FQ_TAIL: usize = 0x0324;
-    pub const QDMA_FQ_COUNT: usize = 0x0328;
-    pub const QDMA_FQ_BLEN: usize = 0x032C;
-
-    /// QDMA RX ring registers (for TX completion feedback)
-    /// Linux: qdma.rx_ptr = 0x4500, rx_cnt_cfg = 0x4504, qcrx_ptr = 0x4508
-    pub const QDMA_RX_PTR: usize = 0x0100;      // 0x4400 + 0x100 = 0x4500
-    pub const QDMA_RX_CNT_CFG: usize = 0x0104;  // 0x4504
-    pub const QDMA_QCRX_PTR: usize = 0x0108;    // 0x4508
-
-    /// TX scheduler rate (per queue, +4 each)
-    pub const QDMA_TX_SCH_RATE: usize = 0x0398;  // 0x4798
-
-    /// Reset registers
-    pub const QDMA_RST_IDX: usize = 0x0208;
-
-    /// Flow control (Linux: QDMA_FC_TH, QDMA_HRED)
-    pub const QDMA_FC_TH: usize = 0x0210;  // 0x4610
-    pub const QDMA_HRED: usize = 0x0244;   // 0x4644
-
-    // Flow control bits
-    pub const FC_THRES_DROP_MODE: u32 = 1 << 20;
-    pub const FC_THRES_DROP_EN: u32 = 7 << 16;
-    pub const FC_THRES_MIN: u32 = 0x4444;
-
-    // GLO_CFG bits - from Linux mtk_eth_soc.h
-    pub const TX_DMA_EN: u32 = 1 << 0;
-    pub const TX_DMA_BUSY: u32 = 1 << 1;
-    pub const RX_DMA_EN: u32 = 1 << 2;
-    pub const RX_DMA_BUSY: u32 = 1 << 3;
-    pub const TX_BT_32DWORDS: u32 = 3 << 4;   // bits 5-4
-    pub const TX_WB_DDONE: u32 = 1 << 6;      // bit 6 (NOT 8!)
-    pub const NDP_CO_PRO: u32 = 1 << 10;      // Next Descriptor Pointer Coherent
-    pub const RX_BT_32DWORDS: u32 = 3 << 11;  // bits 12-11 (NOT 6-7!)
-    pub const MULTI_CNT: u32 = 0x4 << 12;     // bits 15-12
-    pub const RESV_BUF: u32 = 0x40 << 16;     // bits 22-16
-    pub const WCOMP_EN: u32 = 1 << 24;        // Write Complete Enable (V2+)
-    pub const DMAD_WR_WDONE: u32 = 1 << 26;   // DMA Descriptor Write DONE (V2+)
-    pub const CHK_DDONE_EN: u32 = 1 << 28;    // Check Descriptor DONE Enable (V2+)
-    pub const RX_2B_OFFSET: u32 = 1 << 31;    // bit 31 (NOT 7!)
-
-    /// Resource threshold for TX queue config
-    pub const QDMA_RES_THRES: u32 = 4;
-
-    // TX scheduler bits
-    pub const QTX_SCH_MIN_RATE_EN: u32 = 1 << 27;
-    pub const QTX_SCH_MIN_RATE_MAN: u32 = 1 << 20;  // mantissa=1
-    pub const QTX_SCH_MIN_RATE_EXP: u32 = 4 << 16;  // exponent=4 (10Mbps min)
-    pub const QTX_SCH_LEAKY_BUCKET_SIZE: u32 = 0x3 << 28;
-
-    // TX scheduler rate
-    pub const QDMA_TX_SCH_MAX_WFQ: u32 = 1 << 15;
-}
-
-/// PDMA (Packet DMA) registers — for TX and RX
-/// NOTE: For NETSYS_V3 (MT7988), PDMA base is 0x6800, not 0x6000!
-mod pdma_regs {
-    /// PDMA base offset from FE_BASE (NETSYS_V3)
-    pub const PDMA_BASE: usize = 0x6800;
-
-    // TX ring registers (at PDMA_BASE + 0x000)
-    // U-Boot: TX_BASE_PTR_REG(n) = 0x000 + n*0x10
-    pub const PDMA_TX_PTR: usize = 0x0000;      // TX ring base pointer
-    pub const PDMA_TX_MAX_CNT: usize = 0x0004;  // TX ring max count
-    pub const PDMA_TX_CPU_IDX: usize = 0x0008;  // TX CPU index (write to kick)
-    pub const PDMA_TX_DMA_IDX: usize = 0x000C;  // TX DMA index (completion)
-
-    /// RX ring 0 registers (at PDMA_BASE + 0x100)
-    pub const PDMA_RX_PTR: usize = 0x0100;      // Was 0x0900 with old base
-    pub const PDMA_RX_MAX_CNT: usize = 0x0104;
-    pub const PDMA_RX_CPU_IDX: usize = 0x0108;
-    pub const PDMA_RX_DMA_IDX: usize = 0x010C;
-
-    /// Global config (at PDMA_BASE + 0x204)
-    pub const PDMA_GLO_CFG: usize = 0x0204;
-    /// Reset index
-    pub const PDMA_RST_IDX: usize = 0x0208;
-
-    // GLO_CFG bits (from Linux mtk_eth_soc.h)
-    pub const TX_DMA_EN: u32 = 1 << 0;
-    pub const TX_DMA_BUSY: u32 = 1 << 1;
-    pub const RX_DMA_EN: u32 = 1 << 2;
-    pub const RX_DMA_BUSY: u32 = 1 << 3;
-    pub const TX_BT_32DWORDS: u32 = 3 << 4;
-    pub const TX_WB_DDONE: u32 = 1 << 6;
-    pub const RX_BT_32DWORDS: u32 = 3 << 11;  // bits 12-11
-    pub const MULTI_EN: u32 = 1 << 10;  // MTK_MULTI_EN BIT(10) - enable multiple DMA bursts
-    pub const RX_2B_OFFSET: u32 = 1 << 31;
-
-    // PDMA TX descriptor bits (V2 format)
-    pub const TXD2_DDONE: u32 = 1 << 31;   // Descriptor done
-    pub const TXD2_LS0: u32 = 1 << 30;     // Last segment
-    pub const TXD2_SDL0_SHIFT: u32 = 8;    // Length field shift (bits 23:8)
-    pub const TXD5_FPORT_SHIFT: u32 = 16;  // FPORT field shift (bits 19:16)
-}
+const ETHSYS_DUMMY_REG: usize = 0x0c;  // Dummy register with SRAM enable
+const ETHSYS_SRAM_EN: u32 = 1 << 15;   // BIT(15) enables SRAM access
+
+// Pinctrl (GPIO) - for LED pin muxing
+// Reference: Linux mt7988a.dtsi - pinctrl@1001f000
+const PINCTRL_BASE: u64 = 0x1001_f000;
+const PINCTRL_SIZE: u64 = 0x1000;
+// Pin mode registers at GPIO_BASE + 0x300, 4 bits per pin, 8 pins per register
+// GPIO 64-67 (GBE LEDs) are in register at offset 0x300 + (64/8)*0x10 = 0x380
+const PINCTRL_MODE_OFS: usize = 0x300;
+const PINCTRL_LED_REG_OFS: usize = PINCTRL_MODE_OFS + 0x80;  // 0x380 for GPIO 64-71
+
+// FE SRAM - MT7988 uses SEPARATE SRAM region (NOT at FE_BASE + 0x40000!)
+// Reference: linux/arch/arm64/boot/dts/mediatek/mt7988a.dtsi
+//   eth_sram: sram@15400000 { reg = <0 0x15400000 0 0x200000>; }
+// The MTK_ETH_SRAM_OFFSET (0x40000) is for older NETSYS V2 chips, not MT7988!
+const SRAM_BASE: u64 = 0x1540_0000;     // MT7988 SRAM at 0x15400000
+const SRAM_SIZE: u64 = 0x20_0000;       // 2MB
+
+// Legacy offset (for reference only - NOT used on MT7988)
+const FE_SRAM_OFFSET: u64 = 0x4_0000;   // MTK_ETH_SRAM_OFFSET - OLD CHIPS ONLY!
+
+// MT7531 Internal Switch (memory-mapped in MT7988)
+// Reference: Linux drivers/net/dsa/mt7530.h
+const GSW_BASE: u32 = 0x20000;
+
+// Switch port registers (per-port, 0x100 stride)
+const MT7530_PCR_P: fn(u32) -> u32 = |p| 0x2004 + p * 0x100;  // Port Control Register
+const MT7530_PVC_P: fn(u32) -> u32 = |p| 0x2010 + p * 0x100;  // Port VLAN Control
+const MT7530_PMCR_P: fn(u32) -> u32 = |p| 0x3000 + p * 0x100; // Port MAC Control Register
+
+// PCR (Port Control Register) bits - Linux: PCR_MATRIX(x) = ((x) & 0xff) << 16
+const PCR_MATRIX_SHIFT: u32 = 16;        // Port matrix at bits [23:16]
+const PCR_MATRIX_MASK: u32 = 0xFF << 16; // Port matrix mask
+const fn pcr_matrix(ports: u32) -> u32 { (ports & 0xFF) << 16 }
+const PCR_PORT_VLAN_MASK: u32 = 0x3;     // Bits [1:0]
+const MT7530_PORT_MATRIX_MODE: u32 = 0;  // Matrix-based forwarding
+const MT7530_PORT_FALLBACK_MODE: u32 = 3; // Fallback mode for VLAN
+
+// MFC (Forward Control) - flooding configuration
+const MT753X_MFC: u32 = 0x10;
+const MFC_BC_FFP_SHIFT: u32 = 24;        // Broadcast flood port bits [31:24]
+const MFC_UNM_FFP_SHIFT: u32 = 16;       // Unknown multicast flood [23:16]
+const MFC_UNU_FFP_SHIFT: u32 = 8;        // Unknown unicast flood [15:8]
+
+// CFC (CPU Forward Control) - MT7531/MT7988 specific
+const MT7531_CFC: u32 = 0x4;
+const MT7531_CPU_PMAP_SHIFT: u32 = 8;    // CPU port map bits [15:8]
+
+// PVC (Port VLAN Control) bits
+const PORT_SPEC_TAG: u32 = 1 << 5;       // Enable Mediatek header mode
+
+// PMCR (Port MAC Control Register) bits
+const PMCR_FORCE_MODE: u32 = 1 << 15;    // Force mode enable
+const PMCR_IFG_XMIT: u32 = 1 << 18;      // TX IFG
+const PMCR_MAC_MODE: u32 = 1 << 16;      // MAC mode (1G)
+const PMCR_FORCE_SPEED_1000: u32 = 2 << 2;  // Force 1Gbps
+const PMCR_FORCE_DPX: u32 = 1 << 1;      // Force full duplex
+const PMCR_FORCE_LNK: u32 = 1 << 0;      // Force link up
+const PMCR_TX_EN: u32 = 1 << 14;         // TX enable
+const PMCR_RX_EN: u32 = 1 << 13;         // RX enable
+const PMCR_BACKOFF_EN: u32 = 1 << 9;     // Backoff enable
+const PMCR_BACKPR_EN: u32 = 1 << 8;      // Backpressure enable
+const PMCR_FORCE_RX_FC_EN: u32 = 1 << 5; // RX flow control (Linux: flow control rx/tx)
+const PMCR_FORCE_TX_FC_EN: u32 = 1 << 4; // TX flow control
+
+// System control
+const MT7530_SYS_CTRL: u32 = 0x7000;
+const SYS_CTRL_SW_RST: u32 = 1 << 1;
+const SYS_CTRL_REG_RST: u32 = 1 << 0;
+
+// CPU port (port 6 in MT7531/MT7988)
+const MT7531_CPU_PORT: u32 = 6;
+// User ports (ports 0-3, the 4x RJ45)
+const MT7531_USER_PORTS: u32 = 0x0F;  // Ports 0-3
+
+// Ring sizes - MUST match Linux mtk_eth_soc exactly (MT7988)
+// Source: linux/drivers/net/ethernet/mediatek/mtk_eth_soc.c mt7988_data
+const NUM_TX_DESC: usize = 2048;      // MTK_DMA_SIZE(2K) for tx.dma_size
+const NUM_RX_DESC: usize = 2048;      // MTK_DMA_SIZE(2K) for rx.dma_size
+const NUM_FQ_DESC: usize = 4096;      // MTK_DMA_SIZE(4K) for tx.fq_dma_size
+const PKTSIZE_ALIGN: usize = 2048;    // MTK_QDMA_PAGE_SIZE
+
+// DMA memory layout - following Linux mtk_eth_soc exactly
+// Descriptor rings go to FE SRAM (at FE_BASE + FE_SRAM_OFFSET)
+// Data buffers go to regular DMA pool
+const TX_DESC_SIZE: usize = 32;        // sizeof(struct mtk_tx_dma_v2)
+const RX_DESC_SIZE: usize = 32;        // sizeof(struct mtk_rx_dma_v2)
+const TX_RING_SIZE: usize = NUM_TX_DESC * TX_DESC_SIZE;  // 2048 * 32 = 64KB
+const RX_RING_SIZE: usize = NUM_RX_DESC * RX_DESC_SIZE;  // 2048 * 32 = 64KB
+const FQ_RING_SIZE: usize = NUM_FQ_DESC * TX_DESC_SIZE;  // 4096 * 32 = 128KB
+const TX_BUF_SIZE: usize = NUM_TX_DESC * PKTSIZE_ALIGN;  // 2048 * 2048 = 4MB
+const RX_BUF_SIZE: usize = NUM_RX_DESC * PKTSIZE_ALIGN;  // 2048 * 2048 = 4MB
+
+// SRAM layout for descriptor rings (256KB total)
+const SRAM_TX_RING_OFF: usize = 0;
+const SRAM_RX_RING_OFF: usize = TX_RING_SIZE;                    // 64KB
+const SRAM_FQ_RING_OFF: usize = TX_RING_SIZE + RX_RING_SIZE;     // 128KB
+const SRAM_TOTAL_SIZE: usize = TX_RING_SIZE + RX_RING_SIZE + FQ_RING_SIZE;  // 256KB
+
+// DMA pool layout
+// When USE_SRAM_FOR_RINGS=true: descriptors in SRAM, buffers in DMA pool
+// When USE_SRAM_FOR_RINGS=false: everything in DMA pool (like U-Boot)
+//
+// Layout when not using SRAM:
+//   0x00000000: TX ring (64KB)
+//   0x00010000: RX ring (64KB)
+//   0x00020000: TX buffers (4MB)
+//   0x00420000: RX buffers (4MB)
+const DMA_RING_OFF: usize = 0;                                      // Rings at start
+const DMA_TX_RING_OFF: usize = DMA_RING_OFF;                        // 0
+const DMA_RX_RING_OFF: usize = DMA_RING_OFF + TX_RING_SIZE;         // 64KB
+const DMA_RINGS_SIZE: usize = TX_RING_SIZE + RX_RING_SIZE;          // 128KB
+const DMA_TX_BUF_OFF: usize = DMA_RINGS_SIZE;                       // 128KB
+const DMA_RX_BUF_OFF: usize = DMA_RINGS_SIZE + TX_BUF_SIZE;         // 128KB + 4MB
+const DMA_POOL_SIZE: usize = DMA_RINGS_SIZE + TX_BUF_SIZE + RX_BUF_SIZE;  // ~8.125MB
+
+// DMA mode configuration
+// Set to true to use streaming (cacheable) DMA for data buffers.
+// Streaming DMA provides better CPU performance but requires explicit cache sync.
+// Set to false to use coherent (non-cacheable) DMA for data buffers (default).
+const USE_STREAMING_DMA: bool = false;  // Use coherent (non-cacheable) DMA for simplicity
+
+// SRAM vs DMA memory for descriptor rings
+// MT7988 SRAM is at 0x15400000 (separate from FE), requires clocks to be enabled.
+// Set to true to test SRAM, false to use DMA memory (like U-Boot does).
+const USE_SRAM_FOR_RINGS: bool = false;  // DMA can't access SRAM - use regular DMA memory like U-Boot
+
+// Legacy offsets for compatibility (will be removed)
+const TX_RING_OFF: usize = 0;
+const RX_RING_OFF: usize = TX_RING_SIZE;
+const TX_BUF_OFF: usize = TX_RING_SIZE + RX_RING_SIZE;
+const RX_BUF_OFF: usize = TX_RING_SIZE + RX_RING_SIZE + TX_BUF_SIZE;
+
+// Network opcodes: use io_op::NET_SEND from userlib::ring (already imported)
 
 // =============================================================================
-// V2 Descriptor Format (32 bytes)
+// V2 Descriptor Structures (32 bytes each)
 // =============================================================================
 
-/// TX descriptor (V2 format, 32 bytes)
-#[repr(C, align(32))]
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct TxDesc {
-    /// txd1: Buffer address (low 32 bits)
-    txd1: u32,
-    /// txd2: Buffer address (high bits) or next desc pointer
-    txd2: u32,
-    /// txd3: Control/status word
-    txd3: u32,
-    /// txd4: VLAN/port info
-    txd4: u32,
-    /// txd5-8: Reserved
-    txd5: u32,
+struct TxDescV2 {
+    txd1: u32,  // Buffer address low
+    txd2: u32,  // DDONE, LS0, SDL0
+    txd3: u32,  // Buffer address high (for 36-bit)
+    txd4: u32,  // V1 FPORT
+    txd5: u32,  // V2/V3 FPORT
     txd6: u32,
     txd7: u32,
     txd8: u32,
 }
 
-impl TxDesc {
-    const fn zeroed() -> Self {
-        Self {
-            txd1: 0, txd2: 0, txd3: 0, txd4: 0,
-            txd5: 0, txd6: 0, txd7: 0, txd8: 0,
-        }
-    }
-}
-
-// TX descriptor bits (txd3) - Linux mtk_eth_soc.h
-const TX_DMA_OWNER_CPU: u32 = 1 << 31;  // BIT(31) - CPU owns descriptor
-const TX_DMA_LS0: u32 = 1 << 30;        // BIT(30) - Last segment
-const TX_DMA_PLEN0_MASK: u32 = 0xFFFF;  // For V2: max_len=0xFFFF
-const TX_DMA_PLEN0_SHIFT: u32 = 8;      // For V2: dma_len_offset=8
-
-fn tx_dma_plen0(len: usize) -> u32 {
-    // Linux V2: TX_DMA_PLEN0(x) = ((x) & 0xFFFF) << 8
-    ((len as u32) & TX_DMA_PLEN0_MASK) << TX_DMA_PLEN0_SHIFT
-}
-
-// 36-bit DMA support for MT7988 (MTK_36BIT_DMA capability)
-// High 4 address bits [35:32] go into txd3/rxd3 bits [3:0]
-// Linux: TX_DMA_ADDR64_MASK = GENMASK(3, 0) = 0xF
-// Linux: TX_DMA_PREP_ADDR64(x) = ((x >> 32) & 0xF)
-// Linux: RX_DMA_ADDR64_MASK = GENMASK(3, 0) = 0xF
-// Linux: RX_DMA_PREP_ADDR64(x) = ((x >> 32) & 0xF)
-
-/// Extract high 4 bits [35:32] of 64-bit address for txd3
-fn tx_dma_prep_addr64(addr: u64) -> u32 {
-    ((addr >> 32) & 0xF) as u32
-}
-
-/// Extract high 4 bits [35:32] of 64-bit address for rxd3
-fn rx_dma_prep_addr64(addr: u64) -> u32 {
-    ((addr >> 32) & 0xF) as u32
-}
-
-// TX descriptor bits (txd4) - V2/V3 format
-// Linux: TX_DMA_FPORT_SHIFT_V2 = 8, FPORT in bits 8-11
-// Linux: TX_DMA_SWC_V2 = BIT(30) - must be set for TX to work
-// Linux: QID_BITS_V2(x) = ((x) & 0x3f) << 16 - queue ID in bits 21:16
-const TX_DMA_SWC_V2: u32 = 1 << 30;
-const TX_DMA_FPORT_SHIFT_V2: u32 = 8;
-const TX_DMA_QID_SHIFT_V2: u32 = 16;
-const TX_DMA_QID_MASK_V2: u32 = 0x3f;
-
-/// Build QID bits for txd4 (V2/V3 format)
-/// Linux: QID_BITS_V2(x) = ((x) & 0x3f) << 16
-fn qid_bits_v2(qid: u8) -> u32 {
-    ((qid as u32) & TX_DMA_QID_MASK_V2) << TX_DMA_QID_SHIFT_V2
-}
-
-/// Build txd4 for V2/V3 descriptor format
-fn tx_dma_txd4_v2(pse_port: u8, qid: u8) -> u32 {
-    TX_DMA_SWC_V2 | (((pse_port as u32) & 0xf) << TX_DMA_FPORT_SHIFT_V2) | qid_bits_v2(qid)
-}
-
-// PSE port numbers (from Linux mtk_pse_port enum)
-/// PSE forward ports (from U-Boot: fport = gmac_id + 1)
-// GMAC numbering: GMAC0=first MAC (4x RJ45), GMAC1=second MAC (SFP+)
-const PSE_GDM1_PORT: u8 = 1;   // GMAC0 (first MAC, 4x GbE RJ45 via internal switch)
-#[allow(dead_code)]
-const PSE_GDM2_PORT: u8 = 2;   // GMAC1 (second MAC, SFP+)
-#[allow(dead_code)]
-const PSE_GDM3_PORT: u8 = 15;  // GMAC2 (third MAC, special port)
-
-/// RX descriptor (V2 format, 32 bytes)
-#[repr(C, align(32))]
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct RxDesc {
-    /// rxd1: Buffer address (low 32 bits)
-    rxd1: u32,
-    /// rxd2: Status/length
-    rxd2: u32,
-    /// rxd3: More status
-    rxd3: u32,
-    /// rxd4: VLAN/port info
+struct RxDescV2 {
+    rxd1: u32,  // Buffer address low
+    rxd2: u32,  // DDONE, LS0, PLEN0
+    rxd3: u32,  // Buffer address high
     rxd4: u32,
-    /// rxd5-8: Reserved
     rxd5: u32,
     rxd6: u32,
     rxd7: u32,
     rxd8: u32,
 }
 
-impl RxDesc {
-    const fn zeroed() -> Self {
-        Self {
-            rxd1: 0, rxd2: 0, rxd3: 0, rxd4: 0,
-            rxd5: 0, rxd6: 0, rxd7: 0, rxd8: 0,
-        }
-    }
-}
-
-// RX descriptor bits (rxd2)
-const RX_DMA_DONE: u32 = 1 << 31;
-const RX_DMA_LS0: u32 = 1 << 30;
-
-// Packet length extraction:
-// MT7988 NETSYS_V3 RX descriptor format (from Linux mtk_eth_soc.c):
-// - Length is in rxd2 (NOT rxd5!)
-// - mt7988_data: rx.dma_len_offset = 8, rx.dma_max_len = 0xffff
-// - RX_DMA_GET_PLEN0(rxd2) = (rxd2 >> 8) & 0xffff
-// - RX_DMA_DONE = BIT(31) in rxd2
-
-/// RX length mask for MT7988 (MTK_TX_DMA_BUF_LEN_V2)
-const RX_DMA_PLEN_MASK_V2: u32 = 0xFFFF;
-
-/// Extract RX packet length from rxd2 for MT7988
-/// Linux: RX_DMA_GET_PLEN0(x) = (x >> dma_len_offset) & dma_max_len
-/// MT7988: dma_len_offset=8, dma_max_len=0xffff
-fn rx_dma_plen_v2(rxd2: u32) -> usize {
-    ((rxd2 >> 8) & RX_DMA_PLEN_MASK_V2) as usize
-}
-
 // =============================================================================
-// Constants
-// =============================================================================
-
-/// Number of TX descriptors
-const TX_RING_SIZE: usize = 64;
-/// Number of RX descriptors (PDMA)
-const RX_RING_SIZE: usize = 64;
-/// Free queue size (for QDMA)
-const FQ_SIZE: usize = 64;
-/// QDMA RX ring size (for TX completion feedback - Linux allocates this)
-const QDMA_RX_RING_SIZE: usize = 64;
-
-/// Buffer size for each RX descriptor (2KB, must accommodate 1514 + padding)
-const RX_BUF_SIZE: usize = 2048;
-/// Buffer size for TX (max Ethernet frame)
-const TX_BUF_SIZE: usize = 2048;
-
-/// RX buffer offset to Ethernet frame:
-/// - 2 bytes: IP alignment padding (from RX_2B_OFFSET in PDMA_GLO_CFG)
-/// Linux skb_reserve(skb, NET_SKB_PAD + NET_IP_ALIGN) then skb_put(skb, pktlen)
-/// The DMA writes directly to buffer with 2-byte prefix for alignment
-const RX_FRAME_OFFSET: usize = 2;
-
-/// DMA pool layout:
-/// - TX descriptors: TX_RING_SIZE * 32 = 2KB
-/// - RX descriptors: RX_RING_SIZE * 32 = 2KB
-/// - Free queue descriptors: FQ_SIZE * 32 = 2KB
-/// - QDMA RX descriptors: QDMA_RX_RING_SIZE * 32 = 2KB
-/// - TX buffers: TX_RING_SIZE * 2KB = 128KB
-/// - RX buffers: RX_RING_SIZE * 2KB = 128KB
-/// - Free queue buffers: FQ_SIZE * 2KB = 128KB
-/// - QDMA RX buffers: QDMA_RX_RING_SIZE * 2KB = 128KB
-/// Total: ~520KB
-const DMA_POOL_SIZE: usize = (TX_RING_SIZE + RX_RING_SIZE + FQ_SIZE + QDMA_RX_RING_SIZE) * 32
-    + (TX_RING_SIZE + RX_RING_SIZE + FQ_SIZE + QDMA_RX_RING_SIZE) * 2048;
-
-/// Network opcodes (using io_op::NET_BASE = 0x60)
-mod net_op {
-    pub const TX: u8 = super::io_op::NET_BASE;       // 0x60 - transmit packet
-    pub const RX: u8 = super::io_op::NET_BASE + 1;   // 0x61 - received packet (CQ only)
-}
-
-/// Sidechannel query: network info
-const SIDE_QUERY_NET_INFO: u16 = side_msg::QUERY_INFO;
-
-/// RX poll timer: 10ms interval (until MSI-X interrupt support)
-const RX_POLL_INTERVAL_NS: u64 = 10_000_000;
-const TAG_RX_POLL: u32 = 1;
-
-// =============================================================================
-// EthDriver State
+// Driver State
 // =============================================================================
 
 struct EthDriver {
-    /// Frame Engine MMIO region
     fe: Option<MmioRegion>,
-    /// ETHSYS MMIO region (clock/reset/DMA_AG_MAP)
-    ethsys: Option<MmioRegion>,
-    /// Internal Switch (GSW) MMIO region
-    gsw: Option<MmioRegion>,
-    /// DMA memory pool
-    dma: Option<DmaPool>,
+    sw: Option<MmioRegion>,       // Internal switch at 0x15020000
+    ethwarp: Option<MmioRegion>,  // Reset controller at 0x15031000
+    ethsys: Option<MmioRegion>,   // System control at 0x15000000 (SRAM enable)
+    pinctrl: Option<MmioRegion>,  // Pinctrl at 0x1001f000 (LED pin mux)
+    dma: Option<DmaPool>,         // DMA pool for data buffers (8MB)
 
-    /// TX ring CPU index (next to fill)
-    tx_head: usize,
-    /// TX ring HW index (next to reclaim)
-    tx_tail: usize,
+    // SRAM for descriptor rings (within FE MMIO at FE_BASE + 0x40000)
+    // Linux: eth->scratch_ring = eth->base + MTK_ETH_SRAM_OFFSET
+    sram_vaddr: u64,   // Virtual address of SRAM region (FE vaddr + 0x40000)
+    sram_paddr: u64,   // Physical address for DMA programming (0x15140000)
 
-    /// RX ring CPU index (next to check)
-    rx_head: usize,
+    // DMA pool for data buffers
+    buf_vaddr: u64,    // Virtual address of buffer region
+    buf_paddr: u64,    // Physical address of buffer region
 
-    /// Our MAC address
-    mac: [u8; 6],
+    tx_idx: usize,
+    rx_idx: usize,
 
-    /// DataPort for consumer
     port_id: Option<PortId>,
+    poll_timer: Option<Timer>,
+    poll_tag: u32,
+    rx_seq: u64,
 
-    /// Sequence number for RX packets
-    rx_seq: u32,
-
-    /// RX poll timer
-    rx_poll_timer: Option<Timer>,
-
-    /// Link status (always up for internal switch)
+    mac: [u8; 6],
     link_up: bool,
-}
 
-/// DMA pool offsets
-struct DmaLayout {
-    tx_ring_off: usize,
-    rx_ring_off: usize,
-    fq_ring_off: usize,
-    qdma_rx_ring_off: usize,
-    tx_buf_off: usize,
-    rx_buf_off: usize,
-    fq_buf_off: usize,
-    qdma_rx_buf_off: usize,
-}
+    // GMAC configuration
+    gmac_id: u32,           // 0, 1, or 2
+    use_bridge_mode: bool,  // true for internal switch (GMAC0)
 
-impl DmaLayout {
-    const fn new() -> Self {
-        let tx_ring_off = 0;
-        let rx_ring_off = tx_ring_off + TX_RING_SIZE * 32;
-        let fq_ring_off = rx_ring_off + RX_RING_SIZE * 32;
-        let qdma_rx_ring_off = fq_ring_off + FQ_SIZE * 32;
-        let tx_buf_off = qdma_rx_ring_off + QDMA_RX_RING_SIZE * 32;
-        let rx_buf_off = tx_buf_off + TX_RING_SIZE * TX_BUF_SIZE;
-        let fq_buf_off = rx_buf_off + RX_RING_SIZE * RX_BUF_SIZE;
-        let qdma_rx_buf_off = fq_buf_off + FQ_SIZE * TX_BUF_SIZE;
-        Self {
-            tx_ring_off,
-            rx_ring_off,
-            fq_ring_off,
-            qdma_rx_ring_off,
-            tx_buf_off,
-            rx_buf_off,
-            fq_buf_off,
-            qdma_rx_buf_off,
-        }
-    }
+    // Debug
+    poll_count: u32,
 }
-
-static LAYOUT: DmaLayout = DmaLayout::new();
 
 impl EthDriver {
-    const fn new() -> Self {
-        Self {
-            fe: None,
-            ethsys: None,
-            gsw: None,
-            dma: None,
-            tx_head: 0,
-            tx_tail: 0,
-            rx_head: 0,
-            mac: [0x02, 0x12, 0xce, 0x6f, 0xbb, 0xf1], // Locally-administered MAC
-            port_id: None,
-            rx_seq: 0,
-            rx_poll_timer: None,
-            link_up: false,
+    // =========================================================================
+    // Register Access (following U-Boot's mtk_pdma_write/read pattern)
+    // =========================================================================
+
+    fn pdma_write(&self, reg: u32, val: u32) {
+        if let Some(fe) = &self.fe {
+            fe.write32(PDMA_V3_BASE as usize + reg as usize, val);
         }
     }
 
-    /// Reset the Frame Engine using ETHSYS (Linux mtk_hw_reset)
-    fn reset_fe(&self) {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
-        let ethsys = match &self.ethsys {
-            Some(e) => e,
-            None => return,
-        };
-
-        uinfo!("ethd", "reset_fe_start";);
-
-        // NOTE: 100ms delay is now in init() BEFORE this function is called
-        // (Linux mtk_hw_init:4125 does msleep(100) before reset)
-
-        // Step 1: Disable idle check (Linux mtk_hw_reset:3902)
-        // ETHSYS+0x28 = 0
-        ethsys.write32(ethsys_regs::FE_RST_CHK_IDLE_EN, 0);
-
-        // Step 3: Build reset mask for V3 (Linux mtk_hw_reset:3904-3923)
-        let reset_mask = ethsys_regs::RSTCTRL_FE
-            | ethsys_regs::RSTCTRL_ETH
-            | ethsys_regs::RSTCTRL_PPE0_V3
-            | ethsys_regs::RSTCTRL_PPE1_V3
-            | ethsys_regs::RSTCTRL_WDMA0
-            | ethsys_regs::RSTCTRL_WDMA1
-            | ethsys_regs::RSTCTRL_WDMA2;
-
-        // Step 4: Assert reset (Linux ethsys_reset via regmap_update_bits)
-        let old_rst = ethsys.read32(ethsys_regs::RSTCTRL);
-        ethsys.write32(ethsys_regs::RSTCTRL, old_rst | reset_mask);
-        uinfo!("ethd", "reset_assert"; mask = userlib::ulog::hex32(reset_mask));
-
-        // Step 5: Wait 1ms (Linux usleep_range(1000, 1100))
-        delay_us(1000);
-
-        // Step 6: Deassert reset
-        ethsys.write32(ethsys_regs::RSTCTRL, old_rst & !reset_mask);
-
-        // Step 7: Wait 10ms (Linux ethsys_reset:3781 does mdelay(10))
-        delay_us(10_000);
-
-        // Step 8: Re-enable idle check (Linux mtk_hw_reset:3925-3927)
-        // ETHSYS+0x28 = 0x6f8ff (specific value from Linux, not 0xFFFFFFFF!)
-        ethsys.write32(ethsys_regs::FE_RST_CHK_IDLE_EN, 0x6f8ff);
-
-        // NOTE: Removed FE_RST_GL (FE_BASE+0x04) reset - Linux doesn't do this!
-        // The ETHSYS reset above is sufficient.
-
-        // Enable PDMAv2 mode (required for NETSYSv3 / MT7988)
-        let misc = fe.read32(fe_regs::FE_GLO_MISC);
-        fe.write32(fe_regs::FE_GLO_MISC, misc | fe_regs::FE_GLO_MISC_PDMA_V2);
-
-        // Configure PSE (Packet Scheduling Engine) for V3
-        // CRITICAL: Without this, packets will be dropped!
-        // Values from Linux mtk_hw_init() for NETSYS_V3:
-
-        // PSE should not drop port8, port9 and port13 packets (from WDMA Tx)
-        fe.write32(fe_regs::PSE_DROP_CFG, 0x00002300);
-
-        // PSE should drop packets to port8, port9, port13 on WDMA Rx ring full
-        fe.write32(fe_regs::PSE_PPE_DROP0, 0x00002300);
-        fe.write32(fe_regs::PSE_PPE_DROP1, 0x00002300);
-        fe.write32(fe_regs::PSE_PPE_DROP2, 0x00002300);
-
-        // PSE Free Queue Flow Control (Linux mtk_hw_init:4236)
-        fe.write32(fe_regs::PSE_FQFC_CFG2, 0x01fa01f4);
-
-        // PSE config input queue threshold (Linux mtk_hw_init:4238-4246)
-        // CRITICAL: These must match Linux exactly for packet flow!
-        fe.write32(fe_regs::PSE_IQ_REV1, 0x001a000e);
-        fe.write32(fe_regs::PSE_IQ_REV2, 0x01ff001a);
-        fe.write32(fe_regs::PSE_IQ_REV3, 0x000e01ff);
-        fe.write32(fe_regs::PSE_IQ_REV4, 0x000e000e);
-        fe.write32(fe_regs::PSE_IQ_REV5, 0x000e000e);
-        fe.write32(fe_regs::PSE_IQ_REV6, 0x000e000e);
-        fe.write32(fe_regs::PSE_IQ_REV7, 0x000e000e);
-        fe.write32(fe_regs::PSE_IQ_REV8, 0x000e000e);
-
-        // PSE config output queue threshold (Linux mtk_hw_init:4248-4256)
-        // CRITICAL: Without these, packets get STUCK in PSE output queues!
-        fe.write32(fe_regs::PSE_OQ_TH1, 0x000f000a);
-        fe.write32(fe_regs::PSE_OQ_TH2, 0x001a000f);
-        fe.write32(fe_regs::PSE_OQ_TH3, 0x000f001a);
-        fe.write32(fe_regs::PSE_OQ_TH4, 0x01ff000f);
-        fe.write32(fe_regs::PSE_OQ_TH5, 0x000f000f);
-        fe.write32(fe_regs::PSE_OQ_TH6, 0x0006000f);
-        fe.write32(fe_regs::PSE_OQ_TH7, 0x00060006);
-        fe.write32(fe_regs::PSE_OQ_TH8, 0x00060006);
-
-        // GDM and CDM thresholds (V3) - Linux mtk_hw_init:4258-4264
-        fe.write32(fe_regs::MTK_GDM2_THRES, 0x00000004);
-        fe.write32(fe_regs::MTK_CDMW0_THRES, 0x00000004);
-        fe.write32(fe_regs::MTK_CDMW1_THRES, 0x00000004);
-        fe.write32(fe_regs::MTK_CDME0_THRES, 0x00000004);
-        fe.write32(fe_regs::MTK_CDME1_THRES, 0x00000004);
-        fe.write32(fe_regs::MTK_CDMM_THRES, 0x00000004);
-
-        // CDMQ ingress control - parse MTK special tag from CPU
-        // Linux: mtk_w32(eth, val | MTK_CDMQ_STAG_EN, MTK_CDMQ_IG_CTRL);
-        let cdmq = fe.read32(fe_regs::MTK_CDMQ_IG_CTRL);
-        fe.write32(fe_regs::MTK_CDMQ_IG_CTRL, cdmq | fe_regs::MTK_CDMQ_STAG_EN);
-
-        // PSE Dummy Page Mechanism (V3 CRITICAL!)
-        // Linux: PSE_DUMY_REQ = PSE_DUMMY_WORK_GDM(1) | PSE_DUMMY_WORK_GDM(2) |
-        //                       PSE_DUMMY_WORK_GDM(3) | DUMMY_PAGE_THR
-        let pse_dummy = fe_regs::PSE_DUMMY_WORK_GDM1
-            | fe_regs::PSE_DUMMY_WORK_GDM2
-            | fe_regs::PSE_DUMMY_WORK_GDM3
-            | fe_regs::PSE_DUMMY_PAGE_THR;
-        fe.write32(fe_regs::PSE_DUMY_REQ, pse_dummy);
-
-        // Interrupt grouping setup (Linux mtk_hw_init lines 4185-4193)
-        // Even though we use polling, these registers may need to be configured
-        // for the hardware to work correctly.
-
-        // Disable all interrupts first
-        fe.write32(fe_regs::TX_IRQ_MASK, 0);      // Clear TX IRQ mask
-        fe.write32(fe_regs::PDMA_IRQ_MASK, 0);    // Clear RX IRQ mask
-
-        // Configure interrupt grouping (routes interrupts to correct groups)
-        fe.write32(fe_regs::PDMA_INT_GRP0, fe_regs::TX_DONE_INT);     // 0x10000000
-        fe.write32(fe_regs::PDMA_INT_GRP1, fe_regs::RX_DONE_INT_V2);  // 0x4000
-        fe.write32(fe_regs::QDMA_INT_GRP0, fe_regs::TX_DONE_INT);     // 0x10000000
-        fe.write32(fe_regs::QDMA_INT_GRP1, fe_regs::RX_DONE_INT_V2);  // 0x4000
-        fe.write32(fe_regs::FE_INT_GRP, fe_regs::FE_INT_GRP_VALUE);   // 0x21021000
-
-        uinfo!("ethd", "reset_fe_done"; pse_drop = userlib::ulog::hex32(0x00002300), pse_dummy = userlib::ulog::hex32(pse_dummy));
+    fn pdma_read(&self, reg: u32) -> u32 {
+        self.fe.as_ref().map(|fe| fe.read32(PDMA_V3_BASE as usize + reg as usize)).unwrap_or(0)
     }
 
-    /// Initialize DMA address generation - CRITICAL for DMA to work!
-    /// This enables DMA address generation for PDMA and QDMA.
-    /// Without this, DMA engines cannot properly translate descriptor addresses.
-    /// Enable Ethernet clocks via ETHSYS clock gate register
-    /// This must be called FIRST, before any other initialization!
-    /// From clk-mt7988-eth.c: clock gates are at ETHSYS+0x30
-    /// Linux enables these via the clock framework in mtk_clk_enable()
-    fn enable_clocks(&self) {
-        let ethsys = match &self.ethsys {
-            Some(e) => e,
-            None => return,
-        };
-
-        // Read current clock gate value
-        let old_val = ethsys.read32(ethsys_regs::CLK_GATE);
-        uinfo!("ethd", "clk_gate_before"; val = userlib::ulog::hex32(old_val));
-
-        // Enable required clocks: FE, GP1, ESW (minimum for GMAC1 + internal switch)
-        // From clk-mt7988-eth.c ethdma_clks array
-        let new_val = old_val
-            | ethsys_regs::CLK_FE_EN    // Bit 6: Frame Engine
-            | ethsys_regs::CLK_GP1_EN   // Bit 8: GMAC Port 1
-            | ethsys_regs::CLK_ESW_EN;  // Bit 16: Ethernet Switch
-        ethsys.write32(ethsys_regs::CLK_GATE, new_val);
-
-        // Verify
-        let verify = ethsys.read32(ethsys_regs::CLK_GATE);
-        uinfo!("ethd", "clk_gate_after"; val = userlib::ulog::hex32(verify));
+    fn pdma_rmw(&self, reg: u32, clr: u32, set: u32) {
+        let val = self.pdma_read(reg);
+        self.pdma_write(reg, (val & !clr) | set);
     }
 
-    /// Initialize DMA address generation - CRITICAL for DMA to work!
-    /// This enables DMA address generation for PDMA and QDMA.
-    /// Without this, DMA engines cannot properly translate descriptor addresses.
-    /// IMPORTANT: This register is at ETHSYS_BASE+0x408, NOT FE_BASE!
-    fn init_dma_ag_map(&self) {
-        let ethsys = match &self.ethsys {
-            Some(e) => e,
-            None => return,
-        };
-
-        // Read current DMA_AG_MAP (at ETHSYS_BASE + 0x408 = 0x15000408)
-        let old_val = ethsys.read32(ethsys_regs::DMA_AG_MAP);
-        uinfo!("ethd", "dma_ag_map_before"; val = userlib::ulog::hex32(old_val));
-
-        // Enable DMA address generation for PDMA, QDMA, and PPE
-        // Linux: PDMA | QDMA | PPE = 0x7
-        let new_val = old_val
-            | ethsys_regs::DMA_AG_MAP_PDMA   // BIT(0)
-            | ethsys_regs::DMA_AG_MAP_QDMA   // BIT(1)
-            | ethsys_regs::DMA_AG_MAP_PPE;   // BIT(2)
-        ethsys.write32(ethsys_regs::DMA_AG_MAP, new_val);
-
-        // Verify
-        let verify = ethsys.read32(ethsys_regs::DMA_AG_MAP);
-        uinfo!("ethd", "dma_ag_map_after"; val = userlib::ulog::hex32(verify));
+    fn gdma_write(&self, gmac_id: u32, reg: u32, val: u32) {
+        if let Some(fe) = &self.fe {
+            let base = match gmac_id {
+                0 => GDMA1_BASE,
+                1 => GDMA2_BASE,
+                _ => GDMA3_BASE,
+            };
+            fe.write32(base as usize + reg as usize, val);
+        }
     }
 
-    /// Wait for DMA to be idle before initializing rings (Linux mtk_dma_busy_wait)
-    fn dma_busy_wait(&self) -> bool {
-        let fe = match &self.fe {
-            Some(f) => f,
+    fn fe_write(&self, reg: u32, val: u32) {
+        if let Some(fe) = &self.fe {
+            fe.write32(reg as usize, val);
+        }
+    }
+
+    fn fe_read(&self, reg: u32) -> u32 {
+        self.fe.as_ref().map(|fe| fe.read32(reg as usize)).unwrap_or(0)
+    }
+
+    fn gmac_write(&self, reg: u32, val: u32) {
+        if let Some(fe) = &self.fe {
+            fe.write32(GMAC_BASE as usize + reg as usize, val);
+        }
+    }
+
+    // =========================================================================
+    // MT7988 Internal Switch Register Access (at 0x15020000)
+    // =========================================================================
+
+    fn gsw_write(&self, reg: u32, val: u32) {
+        if let Some(sw) = &self.sw {
+            sw.write32(reg as usize, val);
+        }
+    }
+
+    fn gsw_read(&self, reg: u32) -> u32 {
+        self.sw.as_ref().map(|sw| sw.read32(reg as usize)).unwrap_or(0)
+    }
+
+    fn gsw_rmw(&self, reg: u32, clr: u32, set: u32) {
+        let val = self.gsw_read(reg);
+        self.gsw_write(reg, (val & !clr) | set);
+    }
+
+    // =========================================================================
+    // Ethwarp Reset Controller
+    // =========================================================================
+
+    fn reset_switch(&self) {
+        let ethwarp = match &self.ethwarp {
+            Some(e) => e,
+            None => {
+                uinfo!("ethd", "reset_switch_skip"; reason = "no_ethwarp");
+                return;
+            }
+        };
+
+        uinfo!("ethd", "reset_switch_start";);
+
+        // Read current reset state
+        let rst = ethwarp.read32(ETHWARP_RST_OFS);
+        uinfo!("ethd", "ethwarp_rst_before"; val = userlib::ulog::hex32(rst));
+
+        // Assert reset (set bit 9)
+        ethwarp.write32(ETHWARP_RST_OFS, rst | ETHWARP_RST_SWITCH_BIT);
+        delay_us(1000);  // 1ms
+
+        // Deassert reset (clear bit 9)
+        ethwarp.write32(ETHWARP_RST_OFS, rst & !ETHWARP_RST_SWITCH_BIT);
+
+        // Wait for switch to stabilize (U-Boot waits 1000ms)
+        delay_us(100_000);  // 100ms should be enough
+
+        let rst_after = ethwarp.read32(ETHWARP_RST_OFS);
+        uinfo!("ethd", "reset_switch_done"; val = userlib::ulog::hex32(rst_after));
+    }
+
+    // =========================================================================
+    // MDIO PHY Access (via GMAC registers)
+    // =========================================================================
+
+    fn mdio_read(&self, phy: u8, reg: u8) -> Option<u16> {
+        // Use switch's internal PHY_IAC register at 0x701C (not GMAC's MDIO!)
+        // Reference: Linux mt7530.c - MT7531_PHY_IAC
+        let sw = self.sw.as_ref()?;
+
+        const PHY_IAC: usize = 0x701C;
+        const PHY_ACS_ST: u32 = 1 << 31;
+        const MDIO_CL22_READ: u32 = 2 << 18;  // C22 read command
+        const MDIO_ST_C22: u32 = 1 << 16;
+
+        let cmd = PHY_ACS_ST
+            | MDIO_ST_C22
+            | MDIO_CL22_READ
+            | ((phy as u32) << 20)   // PHY_ADDR
+            | ((reg as u32) << 25);  // REG_ADDR
+
+        sw.write32(PHY_IAC, cmd);
+
+        // Wait for PHY_ACS_ST to clear (use fewer iterations with longer delays to avoid syscall storm)
+        for _ in 0..50 {
+            let val = sw.read32(PHY_IAC);
+            if (val & PHY_ACS_ST) == 0 {
+                return Some((val & 0xFFFF) as u16);
+            }
+            delay_us(100);
+        }
+        None  // Timeout
+    }
+
+    fn mdio_write(&self, phy: u8, reg: u8, data: u16) -> bool {
+        let sw = match self.sw.as_ref() {
+            Some(s) => s,
             None => return false,
         };
 
-        // Poll QDMA GLO_CFG for DMA not busy (timeout 5ms with 5us intervals)
-        let qdma_base = qdma_regs::QDMA_BASE;
-        for _ in 0..1000 {
-            let val = fe.read32(qdma_base + qdma_regs::QDMA_GLO_CFG);
-            if (val & (qdma_regs::RX_DMA_BUSY | qdma_regs::TX_DMA_BUSY)) == 0 {
+        const PHY_IAC: usize = 0x701C;
+        const PHY_ACS_ST: u32 = 1 << 31;
+        const MDIO_CL22_WRITE: u32 = 1 << 18;  // C22 write command
+        const MDIO_ST_C22: u32 = 1 << 16;
+
+        let cmd = PHY_ACS_ST
+            | MDIO_ST_C22
+            | MDIO_CL22_WRITE
+            | ((phy as u32) << 20)   // PHY_ADDR
+            | ((reg as u32) << 25)   // REG_ADDR
+            | (data as u32);         // DATA
+
+        sw.write32(PHY_IAC, cmd);
+
+        // Wait for PHY_ACS_ST to clear (use fewer iterations with longer delays to avoid syscall storm)
+        for _ in 0..50 {
+            let val = sw.read32(PHY_IAC);
+            if (val & PHY_ACS_ST) == 0 {
                 return true;
             }
-            delay_us(5);
+            delay_us(100);
         }
-        uerror!("ethd", "dma_busy_timeout";);
-        false
+        false  // Timeout
     }
 
-    /// Configure GDM1 to forward RX to PDMA with checksum offload
-    fn configure_gdm(&self) {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
+    // MMD (MDIO Managed Device) register access for extended PHY registers
+    // Uses Clause 22 indirect access: reg 13 = control, reg 14 = data
+    fn mmd_read(&self, phy: u8, devad: u8, reg: u16) -> Option<u16> {
+        const MMD_CTRL: u8 = 13;
+        const MMD_DATA: u8 = 14;
 
-        // GDM1_FWD_CFG: Forward RX to PDMA + enable checksum offload
-        // Linux mtk_gdm_config() does read-modify-write:
-        //   1. val = mtk_r32(GDM_FWD_CFG)
-        //   2. val &= ~0xffff           // Clear low 16 bits (forward port)
-        //   3. val |= ICS_EN | TCS_EN | UCS_EN
-        //   4. val |= config            // GDMA_TO_PDMA = 0x0
-        //   5. mtk_w32(GDM_FWD_CFG, val)
-        let mut val = fe.read32(gdm_regs::GDM1_FWD_CFG);
-        val &= !0xffff; // Clear low 16 bits (forward port config)
-        val |= gdm_regs::GDM_ICS_EN
-            | gdm_regs::GDM_TCS_EN
-            | gdm_regs::GDM_UCS_EN
-            | gdm_regs::GDM_TO_PDMA;
-        fe.write32(gdm_regs::GDM1_FWD_CFG, val);
-
-        uinfo!("ethd", "gdm_configured"; val = userlib::ulog::hex32(val));
+        // Step 1: Set MMD device address
+        if !self.mdio_write(phy, MMD_CTRL, devad as u16) { return None; }
+        // Step 2: Set MMD register address
+        if !self.mdio_write(phy, MMD_DATA, reg) { return None; }
+        // Step 3: Set access mode to data (no post-increment)
+        if !self.mdio_write(phy, MMD_CTRL, 0x4000 | (devad as u16)) { return None; }
+        // Step 4: Read data
+        self.mdio_read(phy, MMD_DATA)
     }
 
-    /// Configure MAC (GMAC1) for internal switch
-    fn configure_mac(&self) {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
+    fn mmd_write(&self, phy: u8, devad: u8, reg: u16, data: u16) -> bool {
+        const MMD_CTRL: u8 = 13;
+        const MMD_DATA: u8 = 14;
 
-        // Set MAC address
-        let mac_h = ((self.mac[0] as u32) << 8) | (self.mac[1] as u32);
-        let mac_l = ((self.mac[2] as u32) << 24)
-            | ((self.mac[3] as u32) << 16)
-            | ((self.mac[4] as u32) << 8)
-            | (self.mac[5] as u32);
-
-        let gmac_base = mac_regs::GMAC1_BASE;
-        fe.write32(gmac_base + mac_regs::MAC_ADRH, mac_h);
-        fe.write32(gmac_base + mac_regs::MAC_ADRL, mac_l);
-
-        // Configure MCR: force mode, 100Mbps (match switch ports), full duplex, link up, TX/RX enable
-        // Bits from Linux: FORCE_MODE | TX_EN | RX_EN | BACKOFF_EN | BACKPR_EN | SPEED | DPX | LINK
-        let mcr = mac_regs::MCR_FORCE_MODE
-            | mac_regs::MCR_TX_EN
-            | mac_regs::MCR_RX_EN
-            | mac_regs::MCR_BACKOFF_EN
-            | mac_regs::MCR_BACKPR_EN
-            | mac_regs::MCR_SPEED_1000  // Internal MAC-to-switch: always 1Gbps
-            | mac_regs::MCR_FORCE_DPX  // bit 1 = full duplex
-            | mac_regs::MCR_FORCE_LINK;
-        fe.write32(gmac_base + mac_regs::MAC_MCR, mcr);
-
-        // Route GMAC1 to internal switch
-        fe.set32(mac_misc::MAC_MISC_V3, mac_misc::MUX_TO_ESW);
-
-        uinfo!("ethd", "mac_configured"; mcr = userlib::ulog::hex32(mcr));
+        // Step 1: Set MMD device address
+        if !self.mdio_write(phy, MMD_CTRL, devad as u16) { return false; }
+        // Step 2: Set MMD register address
+        if !self.mdio_write(phy, MMD_DATA, reg) { return false; }
+        // Step 3: Set access mode to data (no post-increment)
+        if !self.mdio_write(phy, MMD_CTRL, 0x4000 | (devad as u16)) { return false; }
+        // Step 4: Write data
+        self.mdio_write(phy, MMD_DATA, data)
     }
 
-    // =========================================================================
-    // MDIO Access
-    // =========================================================================
-
-    /// Wait for MDIO access to complete
-    fn mdio_wait(&self) -> bool {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return false,
-        };
-
-        for _ in 0..1000 {
-            let val = fe.read32(mdio_regs::PHY_IAC);
-            if (val & mdio_regs::PHY_ACS_ST) == 0 {
-                return true;
+    // Configure pinctrl to mux GPIO 64-67 to LED function
+    // These are the GBE PHY LED pins on MT7988:
+    //   GPIO 64 = GBE0_LED0 (port 0 LED)
+    //   GPIO 65 = GBE1_LED0 (port 1 LED)
+    //   GPIO 66 = GBE2_LED0 (port 2 LED)
+    //   GPIO 67 = GBE3_LED0 (port 3 LED)
+    // Each pin uses 4 bits in the mode register, function 1 = LED mode
+    fn pinctrl_led_mux(&self) {
+        let pc = match &self.pinctrl {
+            Some(pc) => pc,
+            None => {
+                uwarn!("ethd", "pinctrl_led_mux"; status = "no_pinctrl");
+                return;
             }
-            delay_us(10);
-        }
-        false
-    }
-
-    /// Read a PHY register via MDIO
-    fn mdio_read(&self, phy_addr: u8, reg: u8) -> Option<u16> {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return None,
         };
 
-        if !self.mdio_wait() {
-            return None;
-        }
+        // GPIO 64-67 are in register at offset 0x380 (0x300 + 64/8 * 0x10)
+        // Each pin is 4 bits: GPIO64 = [3:0], GPIO65 = [7:4], GPIO66 = [11:8], GPIO67 = [15:12]
+        // Function 1 = LED mode (from pinctrl-mt7988.c)
+        let old_val = pc.read32(PINCTRL_LED_REG_OFS);
 
-        let cmd = mdio_regs::PHY_ACS_ST
-            | mdio_regs::MDIO_ST_C22
-            | mdio_regs::PHY_RW_READ
-            | mdio_regs::phy_addr(phy_addr)
-            | mdio_regs::phy_reg(reg);
+        // Set function 1 for GPIO 64-67 (bits 15:0)
+        // Keep upper bits (GPIO 68-71) unchanged
+        let led_func: u32 = 0x1111;  // Function 1 for each of 4 pins
+        let new_val = (old_val & 0xFFFF_0000) | led_func;
 
-        fe.write32(mdio_regs::PHY_IAC, cmd);
+        pc.write32(PINCTRL_LED_REG_OFS, new_val);
+        let verify = pc.read32(PINCTRL_LED_REG_OFS);
 
-        if !self.mdio_wait() {
-            return None;
-        }
-
-        let val = fe.read32(mdio_regs::PHY_IAC);
-        Some((val & 0xFFFF) as u16)
+        uinfo!("ethd", "pinctrl_led_mux"; reg_ofs = userlib::ulog::hex32(PINCTRL_LED_REG_OFS as u32),
+               old = userlib::ulog::hex32(old_val), new = userlib::ulog::hex32(new_val),
+               verify = userlib::ulog::hex32(verify));
     }
 
-    /// Write a PHY register via MDIO
-    fn mdio_write(&self, phy_addr: u8, reg: u8, data: u16) -> bool {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return false,
-        };
+    // Configure PHY LEDs for link/activity indication
+    fn phy_led_init(&self) {
+        // First, mux the LED pins via pinctrl
+        self.pinctrl_led_mux();
 
-        if !self.mdio_wait() {
-            return false;
+        // MediaTek internal PHY LED registers (in MMD VEND2 = 31)
+        const MDIO_MMD_VEND2: u8 = 31;
+
+        // LED ON control registers
+        const LED0_ON_CTRL: u16 = 0x24;
+        const LED1_ON_CTRL: u16 = 0x26;
+
+        // LED BLINK control registers
+        const LED0_BLINK_CTRL: u16 = 0x25;
+        const LED1_BLINK_CTRL: u16 = 0x27;
+
+        // ON control bits
+        const LED_ON_LINK1000: u16 = 1 << 0;
+        const LED_ON_LINK100: u16 = 1 << 1;
+        const LED_ON_LINK10: u16 = 1 << 2;
+        const LED_ON_POLARITY: u16 = 1 << 14;  // Active-low if set
+        const LED_ON_ENABLE: u16 = 1 << 15;
+
+        // BLINK control bits (activity)
+        const LED_BLINK_1000TX: u16 = 1 << 0;
+        const LED_BLINK_1000RX: u16 = 1 << 1;
+        const LED_BLINK_100TX: u16 = 1 << 2;
+        const LED_BLINK_100RX: u16 = 1 << 3;
+        const LED_BLINK_10TX: u16 = 1 << 4;
+        const LED_BLINK_10RX: u16 = 1 << 5;
+
+        // LED0: Link indicator (ON when link is up at any speed)
+        // Try with polarity bit - MT7988 may need active-low depending on bootstrap
+        let led0_on = LED_ON_ENABLE | LED_ON_POLARITY | LED_ON_LINK1000 | LED_ON_LINK100 | LED_ON_LINK10;
+        let led0_blink: u16 = 0;  // No blinking for link LED
+
+        // LED1: Activity indicator (blink on TX/RX)
+        let led1_on = LED_ON_ENABLE | LED_ON_POLARITY;
+        let led1_blink = LED_BLINK_1000TX | LED_BLINK_1000RX
+                       | LED_BLINK_100TX | LED_BLINK_100RX
+                       | LED_BLINK_10TX | LED_BLINK_10RX;
+
+        for phy in 0..4u8 {
+            // Configure LED0 (link)
+            let old_led0 = self.mmd_read(phy, MDIO_MMD_VEND2, LED0_ON_CTRL).unwrap_or(0);
+            self.mmd_write(phy, MDIO_MMD_VEND2, LED0_ON_CTRL, led0_on);
+            self.mmd_write(phy, MDIO_MMD_VEND2, LED0_BLINK_CTRL, led0_blink);
+
+            // Configure LED1 (activity)
+            self.mmd_write(phy, MDIO_MMD_VEND2, LED1_ON_CTRL, led1_on);
+            self.mmd_write(phy, MDIO_MMD_VEND2, LED1_BLINK_CTRL, led1_blink);
+
+            let new_led0 = self.mmd_read(phy, MDIO_MMD_VEND2, LED0_ON_CTRL).unwrap_or(0);
+            uinfo!("ethd", "phy_led_init"; phy = phy, old = userlib::ulog::hex32(old_led0 as u32),
+                   new = userlib::ulog::hex32(new_led0 as u32));
         }
 
-        let cmd = mdio_regs::PHY_ACS_ST
-            | mdio_regs::MDIO_ST_C22
-            | mdio_regs::PHY_RW_WRITE
-            | mdio_regs::phy_addr(phy_addr)
-            | mdio_regs::phy_reg(reg)
-            | mdio_regs::phy_data(data);
-
-        fe.write32(mdio_regs::PHY_IAC, cmd);
-        self.mdio_wait()
+        uinfo!("ethd", "phy_leds_enabled";);
     }
 
     // =========================================================================
-    // MT7531 Switch Access (via memory-mapped I/O)
-    // MT7988's internal switch is memory-mapped at GSW_BASE, not MDIO
+    // MT7531 Internal Switch Initialization
     // =========================================================================
 
-    /// Read a switch register via memory-mapped I/O
-    fn sw_read(&self, addr: u32) -> Option<u32> {
-        let gsw = self.gsw.as_ref()?;
-        Some(gsw.read32(addr as usize))
-    }
-
-    /// Write a switch register via memory-mapped I/O
-    fn sw_write(&self, addr: u32, val: u32) {
-        if let Some(gsw) = &self.gsw {
-            gsw.write32(addr as usize, val);
-        }
-    }
-
-    // =========================================================================
-    // MT7531 Switch Initialization (Memory-Mapped)
-    // =========================================================================
-
-    /// Wait for switch internal PHY access to complete
-    fn sw_phy_wait(&self) -> bool {
-        for _ in 0..1000 {
-            if let Some(val) = self.sw_read(mt7531_regs::PHY_IAC) {
-                if val & mt7531_regs::PHY_ACS_ST == 0 {
-                    return true;
-                }
-            }
-            delay_us(10);
-        }
-        false
-    }
-
-    /// Read internal PHY register via switch's PHY_IAC (MT7531 encoding)
-    fn sw_phy_read(&self, phy_addr: u8, reg: u8) -> Option<u16> {
-        if !self.sw_phy_wait() {
-            uwarn!("ethd", "phy_wait_timeout_pre"; addr = phy_addr as u32, reg = reg as u32);
-            return None;
-        }
-
-        // MT7531: ACS_ST | CMD_READ | ST_C22 | phy_addr | phy_reg
-        let cmd = mt7531_regs::PHY_ACS_ST
-            | mt7531_regs::MDIO_CMD_READ
-            | mt7531_regs::MDIO_ST_C22
-            | mt7531_regs::phy_addr(phy_addr)
-            | mt7531_regs::phy_reg(reg);
-
-        self.sw_write(mt7531_regs::PHY_IAC, cmd);
-
-        if !self.sw_phy_wait() {
-            uwarn!("ethd", "phy_wait_timeout_post"; addr = phy_addr as u32, reg = reg as u32);
-            return None;
-        }
-
-        let result = self.sw_read(mt7531_regs::PHY_IAC);
-        if let Some(val) = result {
-            uinfo!("ethd", "phy_read"; addr = phy_addr as u32, reg = reg as u32, val = userlib::ulog::hex32(val));
-        }
-        result.map(|v| (v & 0xFFFF) as u16)
-    }
-
-    /// Write internal PHY register via switch's PHY_IAC (MT7531 encoding)
-    fn sw_phy_write(&self, phy_addr: u8, reg: u8, data: u16) -> bool {
-        if !self.sw_phy_wait() {
-            return false;
-        }
-
-        // MT7531: ACS_ST | CMD_WRITE | ST_C22 | phy_addr | phy_reg | data
-        let cmd = mt7531_regs::PHY_ACS_ST
-            | mt7531_regs::MDIO_CMD_WRITE
-            | mt7531_regs::MDIO_ST_C22
-            | mt7531_regs::phy_addr(phy_addr)
-            | mt7531_regs::phy_reg(reg)
-            | mt7531_regs::phy_data(data);
-
-        self.sw_write(mt7531_regs::PHY_IAC, cmd);
-        self.sw_phy_wait()
-    }
-
-    /// Initialize the internal MT7531 switch
-    fn init_switch(&self) {
+    fn switch_init(&mut self) {
         uinfo!("ethd", "switch_init_start";);
 
-        // Read switch ID to verify memory mapping works
-        if let Some(sys_ctrl) = self.sw_read(mt7531_regs::SYS_CTRL) {
-            uinfo!("ethd", "switch_sys_ctrl"; val = userlib::ulog::hex32(sys_ctrl));
-        } else {
-            uerror!("ethd", "switch_read_failed";);
+        // Check if switch MMIO was mapped
+        if self.sw.is_none() {
+            uinfo!("ethd", "switch_init_skipped"; reason = "no_mmio");
             return;
         }
 
-        // NOTE: Skip switch PHY reset - Linux does this via reset controller,
-        // and doing it here might interfere with already-established links.
-        // The PHYs should already be initialized by the bootloader.
-        // let sys_ctrl = self.sw_read(mt7531_regs::SYS_CTRL).unwrap_or(0);
-        // self.sw_write(mt7531_regs::SYS_CTRL, sys_ctrl | mt7531_regs::SYS_CTRL_PHY_RST);
-        // delay_us(50000);
-        // self.sw_write(mt7531_regs::SYS_CTRL, sys_ctrl & !mt7531_regs::SYS_CTRL_PHY_RST);
-        // delay_us(100000);
-        uinfo!("ethd", "switch_phy_skip_reset";);
+        // Probe switch registers - MT7988's internal switch has different layout
+        // sys_ctrl at 0x7000 returns real data, 0x7ffc/0x7800 return deadbeef
+        let sys_ctrl = self.gsw_read(0x7000);
+        let pll_7500 = self.gsw_read(0x7500);  // MT7531_PLLGP_EN
+        let pll_7504 = self.gsw_read(0x7504);  // PLL config
+        let clk_7508 = self.gsw_read(0x7508);  // Clock config
+        let misc_7804 = self.gsw_read(0x7804); // Trap register
+        uinfo!("ethd", "switch_regs"; sys = userlib::ulog::hex32(sys_ctrl), pll0 = userlib::ulog::hex32(pll_7500),
+               pll1 = userlib::ulog::hex32(pll_7504), clk = userlib::ulog::hex32(clk_7508), misc = userlib::ulog::hex32(misc_7804));
 
-        // Configure port 6 (CPU port) - connects to GMAC1
-        // Force mode: 1000Mbps (internal switch backplane), full duplex, link up, TX/RX enabled
-        // MT7531 uses high bits (31-27) to ENABLE forcing, low bits for values
-        // NOTE: CPU port runs at 1Gbps regardless of external PHY speeds - switch handles conversion
-        let cpu_pmcr = mt7531_regs::MT7531_FORCE_MODE_LNK     // Enable force link
-            | mt7531_regs::MT7531_FORCE_MODE_SPD              // Enable force speed
-            | mt7531_regs::MT7531_FORCE_MODE_DPX              // Enable force duplex
-            | mt7531_regs::MT7531_FORCE_MODE_TX_FC            // Enable force TX FC
-            | mt7531_regs::MT7531_FORCE_MODE_RX_FC            // Enable force RX FC
-            | mt7531_regs::PMCR_FORCE_LNK                     // Link up
-            | mt7531_regs::PMCR_FORCE_DPX                     // Full duplex
-            | mt7531_regs::PMCR_FORCE_SPD_1000                // 1Gbps (internal backplane)
-            | mt7531_regs::PMCR_TX_EN
-            | mt7531_regs::PMCR_RX_EN
-            | mt7531_regs::PMCR_BACKPR_EN
-            | mt7531_regs::PMCR_BKOFF_EN;
+        // PRESERVE U-Boot's configuration - just read and log, don't write!
+        // U-Boot should have already configured MDC and MUX_TO_ESW
+        let mac_misc = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + 0x10)).unwrap_or(0);
+        let ppsc = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + 0x00)).unwrap_or(0);
+        uinfo!("ethd", "mac_misc_v3_uboot"; val = userlib::ulog::hex32(mac_misc),
+               mux_to_esw = if mac_misc & 1 != 0 { 1u32 } else { 0u32 },
+               mdc_turbo = if mac_misc & 0x10 != 0 { 1u32 } else { 0u32 });
+        uinfo!("ethd", "ppsc_uboot"; val = userlib::ulog::hex32(ppsc));
 
-        let cpu_port = mt7531_regs::CPU_PORT;
-        let cpu_pmcr_addr = mt7531_regs::PMCR_BASE + (cpu_port as u32) * 0x100;
-        self.sw_write(cpu_pmcr_addr, cpu_pmcr);
-        uinfo!("ethd", "switch_cpu_port"; port = cpu_port as u32, pmcr = userlib::ulog::hex32(cpu_pmcr));
+        // Probe and initialize internal PHYs via MDIO (addresses 0-3 for ports 0-3)
+        // PHY register definitions (IEEE 802.3):
+        const BMCR: u8 = 0;       // Basic Mode Control Register
+        const BMSR: u8 = 1;       // Basic Mode Status Register
+        const PHYID1: u8 = 2;     // PHY ID 1
+        const PHYID2: u8 = 3;     // PHY ID 2
+        const ANAR: u8 = 4;       // Auto-Negotiation Advertisement Register
 
-        // Configure user ports 0-3 (RJ45 ports)
-        for port in 0..mt7531_regs::NUM_USER_PORTS {
-            // Port Security Control - clear port disable bit
-            let psc_addr = mt7531_regs::PSC_BASE + (port as u32) * 0x100;
-            if let Some(psc) = self.sw_read(psc_addr) {
-                uinfo!("ethd", "port_psc_before"; port = port as u32, val = userlib::ulog::hex32(psc));
-                if psc & mt7531_regs::PSC_DIS_PORT != 0 {
-                    // Clear disable bit
-                    self.sw_write(psc_addr, psc & !mt7531_regs::PSC_DIS_PORT);
-                }
+        // BMCR bits
+        const BMCR_RESET: u16 = 1 << 15;
+        const BMCR_AUTONEG_EN: u16 = 1 << 12;
+        const BMCR_RESTART_AN: u16 = 1 << 9;
+        const BMCR_POWER_DOWN: u16 = 1 << 11;
+
+        // ANAR bits (advertise all capabilities)
+        const ANAR_10_HALF: u16 = 1 << 5;
+        const ANAR_10_FULL: u16 = 1 << 6;
+        const ANAR_100_HALF: u16 = 1 << 7;
+        const ANAR_100_FULL: u16 = 1 << 8;
+        const ANAR_SELECTOR: u16 = 0x0001;  // 802.3
+
+        for phy in 0..4u8 {
+            // Read PHY ID registers (reg 2 and 3)
+            let id1 = self.mdio_read(phy, PHYID1).unwrap_or(0xFFFF);
+            let id2 = self.mdio_read(phy, PHYID2).unwrap_or(0xFFFF);
+            // Read status register (reg 1) - bit 2 = link status
+            let status = self.mdio_read(phy, BMSR).unwrap_or(0);
+            let link = (status & 0x04) != 0;
+            uinfo!("ethd", "phy"; addr = phy, id1 = userlib::ulog::hex32(id1 as u32), id2 = userlib::ulog::hex32(id2 as u32),
+                   status = userlib::ulog::hex32(status as u32), link = if link { 1u32 } else { 0u32 });
+
+            // Read current BMCR
+            let bmcr = self.mdio_read(phy, BMCR).unwrap_or(0);
+            uinfo!("ethd", "phy_bmcr"; addr = phy, bmcr = userlib::ulog::hex32(bmcr as u32),
+                   power_down = if (bmcr & BMCR_POWER_DOWN) != 0 { 1u32 } else { 0u32 },
+                   autoneg = if (bmcr & BMCR_AUTONEG_EN) != 0 { 1u32 } else { 0u32 });
+
+            // If PHY is powered down, bring it up
+            if (bmcr & BMCR_POWER_DOWN) != 0 {
+                uinfo!("ethd", "phy_power_up"; addr = phy);
+                self.mdio_write(phy, BMCR, bmcr & !BMCR_POWER_DOWN);
+                delay_us(10_000);  // 10ms for PHY to power up
             }
 
-            // Port Control Register - set forwarding matrix
-            // Allow forwarding to CPU port and all other user ports
-            let pcr_addr = mt7531_regs::PCR_BASE + (port as u32) * 0x100;
-            let matrix = (1u8 << cpu_port) | 0x0F; // CPU + ports 0-3
-            let pcr_val = mt7531_regs::pcr_matrix(matrix);
-            self.sw_write(pcr_addr, pcr_val);
+            // Advertise all capabilities (10/100 half/full)
+            let anar = ANAR_10_HALF | ANAR_10_FULL | ANAR_100_HALF | ANAR_100_FULL | ANAR_SELECTOR;
+            self.mdio_write(phy, ANAR, anar);
 
-            // Port MAC Control Register - force mode to match PHY (100Mbps FD)
-            // MT7531 uses high bits to ENABLE forcing, low bits for values
-            let pmcr_addr = mt7531_regs::PMCR_BASE + (port as u32) * 0x100;
-            let pmcr_val = mt7531_regs::MT7531_FORCE_MODE_LNK     // Enable force link
-                | mt7531_regs::MT7531_FORCE_MODE_SPD              // Enable force speed
-                | mt7531_regs::MT7531_FORCE_MODE_DPX              // Enable force duplex
-                | mt7531_regs::PMCR_FORCE_LNK                     // Link up
-                | mt7531_regs::PMCR_FORCE_DPX                     // Full duplex
-                | mt7531_regs::PMCR_FORCE_SPD_100                 // 100Mbps
-                | mt7531_regs::PMCR_TX_EN
-                | mt7531_regs::PMCR_RX_EN
-                | mt7531_regs::PMCR_BACKPR_EN
-                | mt7531_regs::PMCR_BKOFF_EN;
-            self.sw_write(pmcr_addr, pmcr_val);
+            // For GbE, also set 1000BASE-T advertisement (reg 9)
+            const GBCR: u8 = 9;  // 1000BASE-T Control Register
+            const GBCR_1000_FULL: u16 = 1 << 9;
+            const GBCR_1000_HALF: u16 = 1 << 8;
+            self.mdio_write(phy, GBCR, GBCR_1000_FULL | GBCR_1000_HALF);
 
-            uinfo!("ethd", "switch_user_port"; port = port as u32);
+            // Enable auto-negotiation and restart it
+            let new_bmcr = BMCR_AUTONEG_EN | BMCR_RESTART_AN;
+            self.mdio_write(phy, BMCR, new_bmcr);
+            uinfo!("ethd", "phy_autoneg_restart"; addr = phy);
         }
 
-        // CPU port matrix - allow forwarding to all user ports
-        let cpu_pcr_addr = mt7531_regs::PCR_BASE + (cpu_port as u32) * 0x100;
-        let cpu_matrix = 0x0F; // Ports 0-3
-        self.sw_write(cpu_pcr_addr, mt7531_regs::pcr_matrix(cpu_matrix));
+        // Wait for auto-negotiation to complete (up to 3 seconds)
+        delay_us(100_000);  // 100ms initial wait
 
-        // Initialize internal PHYs for ports 0-3
-        for port in 0..mt7531_regs::NUM_USER_PORTS {
-            self.init_phy(port);
+        // Re-check link status
+        for phy in 0..4u8 {
+            let status = self.mdio_read(phy, BMSR).unwrap_or(0);
+            let link = (status & 0x04) != 0;
+            let an_complete = (status & 0x20) != 0;
+            uinfo!("ethd", "phy_status"; addr = phy, link = if link { 1u32 } else { 0u32 },
+                   an_done = if an_complete { 1u32 } else { 0u32 });
         }
 
-        // Longer delay for PHY auto-negotiation to complete
-        delay_us(500_000); // 500ms for AN
+        // DON'T configure switch - trust U-Boot's setup
+        // Just log current state for debugging
+        let cpu_pcr = self.gsw_read(MT7530_PCR_P(MT7531_CPU_PORT));
+        let cpu_pmcr = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
+        uinfo!("ethd", "cpu_port_uboot"; pcr = userlib::ulog::hex32(cpu_pcr), pmcr = userlib::ulog::hex32(cpu_pmcr));
 
-        // Read back port and PHY status
-        for port in 0..mt7531_regs::NUM_USER_PORTS {
-            // Read PHY BMSR (reg 1) TWICE - first read clears latched status
-            let _ = self.sw_phy_read(port, 1); // Clear latch
-            let bmsr = self.sw_phy_read(port, 1).unwrap_or(0); // Real status
-            let phy_link = if bmsr & 0x0004 != 0 { "up" } else { "down" };
-
-            // Read switch port status
-            let pmsr_addr = mt7531_regs::PMSR_BASE + (port as u32) * 0x100;
-            let pmsr = self.sw_read(pmsr_addr).unwrap_or(0);
-            let sw_link = if pmsr & mt7531_regs::PMSR_LINK != 0 { "up" } else { "down" };
-
-            uinfo!("ethd", "port_status"; port = port as u32, phy_link = phy_link, sw_link = sw_link, bmsr = userlib::ulog::hex32(bmsr as u32), pmsr = userlib::ulog::hex32(pmsr));
+        for port in 0..4 {
+            let pcr = self.gsw_read(MT7530_PCR_P(port));
+            let pmcr = self.gsw_read(MT7530_PMCR_P(port));
+            uinfo!("ethd", "user_port_uboot"; port = port, pcr = userlib::ulog::hex32(pcr), pmcr = userlib::ulog::hex32(pmcr));
         }
 
-        // Check CPU port (port 6) status - CRITICAL for packet flow!
-        let cpu_pmsr_addr = mt7531_regs::PMSR_BASE + (cpu_port as u32) * 0x100;
-        let cpu_pmsr = self.sw_read(cpu_pmsr_addr).unwrap_or(0xDEAD);
-        let cpu_pmcr_addr = mt7531_regs::PMCR_BASE + (cpu_port as u32) * 0x100;
-        let cpu_pmcr = self.sw_read(cpu_pmcr_addr).unwrap_or(0xDEAD);
-        uinfo!("ethd", "cpu_port"; port = cpu_port as u32, pmsr = userlib::ulog::hex32(cpu_pmsr), pmcr = userlib::ulog::hex32(cpu_pmcr));
+        // Configure switch CPU port (port 6) following Linux mt7530 driver
+        // Reference: linux/drivers/net/dsa/mt7530.c - mt753x_cpu_port_enable()
+        uinfo!("ethd", "cpu_port_config_start";);
 
-        // Also check GMAC1 MCR status
-        if let Some(fe) = &self.fe {
-            let mcr = fe.read32(mac_regs::GMAC1_BASE + mac_regs::MAC_MCR);
-            uinfo!("ethd", "gmac1_mcr"; val = userlib::ulog::hex32(mcr));
+        // Step 1: Configure MFC - enable flooding of BC/unknown UC/MC to CPU port
+        // Linux: mt7530_set(priv, MT753X_MFC, BC_FFP(BIT(port)) | UNM_FFP(BIT(port)) | UNU_FFP(BIT(port)))
+        let cpu_bit = 1u32 << MT7531_CPU_PORT;  // BIT(6) = 0x40
+        let mfc_val = (cpu_bit << MFC_BC_FFP_SHIFT)    // Broadcast flood to CPU
+                    | (cpu_bit << MFC_UNM_FFP_SHIFT)   // Unknown multicast to CPU
+                    | (cpu_bit << MFC_UNU_FFP_SHIFT);  // Unknown unicast to CPU
+        let mfc_before = self.gsw_read(MT753X_MFC);
+        self.gsw_write(MT753X_MFC, mfc_before | mfc_val);
+        let mfc_after = self.gsw_read(MT753X_MFC);
+        uinfo!("ethd", "mfc_configured"; before = userlib::ulog::hex32(mfc_before),
+               after = userlib::ulog::hex32(mfc_after));
+
+        // Step 2: DON'T modify CFC - U-Boot leaves it at 0x00000000
+        // U-Boot: pfc/cfc=0x00000000
+        // We were setting CPU_PMAP which changes forwarding behavior
+        let cfc_before = self.gsw_read(MT7531_CFC);
+        // Don't modify - keep U-Boot's setting
+        let cfc_after = cfc_before;
+        uinfo!("ethd", "cfc_configured"; before = userlib::ulog::hex32(cfc_before),
+               after = userlib::ulog::hex32(cfc_after));
+
+        // Step 3: DON'T modify PVC - U-Boot leaves it at 0x81000000
+        // U-Boot: pvc=0x81000000
+        // Ours was setting PORT_SPEC_TAG (0x20) which changes the behavior
+        let pvc_before = self.gsw_read(MT7530_PVC_P(MT7531_CPU_PORT));
+        // Don't modify - keep U-Boot's setting
+        let pvc_after = pvc_before;
+        uinfo!("ethd", "pvc_configured"; before = userlib::ulog::hex32(pvc_before),
+               after = userlib::ulog::hex32(pvc_after));
+
+        // Step 4: Configure PCR - connect CPU port to ports 0-5 (matching U-Boot)
+        // U-Boot: pcr=0x003f0000 → PORT_MATRIX = 0x3f (ports 0-5), no VLAN mode
+        // We were using ports 0-3 only, but U-Boot includes port 5 (internal 2.5G PHY)
+        let port_matrix = 0x3Fu32;  // Ports 0-5 (matching U-Boot)
+        let pcr_val = pcr_matrix(port_matrix);  // No FALLBACK_MODE
+        self.gsw_write(MT7530_PCR_P(MT7531_CPU_PORT), pcr_val);
+        let pcr_after = self.gsw_read(MT7530_PCR_P(MT7531_CPU_PORT));
+        uinfo!("ethd", "cpu_pcr_configured"; val = userlib::ulog::hex32(pcr_val),
+               readback = userlib::ulog::hex32(pcr_after));
+
+        // Step 5: Configure CPU port PMCR for internal 10G link
+        // U-Boot leaves PMCR at 0x80000000 (only MT7531_FORCE_MODE_LNK).
+        // However, we need TX_EN and RX_EN to actually forward packets.
+        // User ports have PMCR=0x00056330 which includes TX_EN (bit 14) and RX_EN (bit 13).
+        //
+        // For the internal 10G CPU port, we'll enable:
+        // - MT7531_FORCE_MODE_LNK (bit 31) - force mode for internal link
+        // - TX_EN (bit 14) - enable TX
+        // - RX_EN (bit 13) - enable RX
+        // - FORCE_LNK (bit 0) - force link up
+        const MT7531_FORCE_MODE_LNK: u32 = 1 << 31;
+        let pmcr_before = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
+        let pmcr_new = MT7531_FORCE_MODE_LNK | PMCR_TX_EN | PMCR_RX_EN | PMCR_FORCE_LNK;
+        self.gsw_write(MT7530_PMCR_P(MT7531_CPU_PORT), pmcr_new);
+        let pmcr_after = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
+        uinfo!("ethd", "cpu_pmcr_configured"; before = userlib::ulog::hex32(pmcr_before),
+               after = userlib::ulog::hex32(pmcr_after),
+               tx_en = if pmcr_after & PMCR_TX_EN != 0 { 1u32 } else { 0 },
+               rx_en = if pmcr_after & PMCR_RX_EN != 0 { 1u32 } else { 0 });
+
+        // Step 6: DON'T modify user ports - U-Boot already configured them
+        // U-Boot: port 0-3 pcr=0x00400000 → PORT_MATRIX = 0x40 (just CPU port)
+        // The U-Boot config works, so don't change it
+        for port in 0..4u32 {
+            let port_pcr = self.gsw_read(MT7530_PCR_P(port));
+            // Don't modify - keep U-Boot's setting
+            uinfo!("ethd", "user_pcr_configured"; port = port,
+                   before = userlib::ulog::hex32(port_pcr),
+                   after = userlib::ulog::hex32(port_pcr));
         }
+
+        uinfo!("ethd", "cpu_port_config_done";);
+
+        // Initialize PHY LEDs for link/activity indication
+        self.phy_led_init();
+
+        // Enable switch-level LED controller (MT7530/MT7531 registers)
+        // 0x7d00 = LED_EN (1 = enable LEDs)
+        // 0x7d04 = LED_IO_MODE (1 = PHY mode, 0 = GPIO mode)
+        const LED_EN_REG: u32 = 0x7d00;
+        const LED_IO_MODE_REG: u32 = 0x7d04;
+
+        let led_en_before = self.gsw_read(LED_EN_REG);
+        let led_io_before = self.gsw_read(LED_IO_MODE_REG);
+        uinfo!("ethd", "switch_led_before"; led_en = userlib::ulog::hex32(led_en_before),
+               led_io = userlib::ulog::hex32(led_io_before));
+
+        // Enable LEDs and set to PHY mode (not GPIO)
+        self.gsw_write(LED_EN_REG, 0xFFFFFFFF);      // Enable all LED outputs
+        self.gsw_write(LED_IO_MODE_REG, 0xFFFFFFFF); // PHY mode for all
+
+        let led_en_after = self.gsw_read(LED_EN_REG);
+        let led_io_after = self.gsw_read(LED_IO_MODE_REG);
+        uinfo!("ethd", "switch_led_after"; led_en = userlib::ulog::hex32(led_en_after),
+               led_io = userlib::ulog::hex32(led_io_after));
 
         uinfo!("ethd", "switch_init_done";);
     }
 
-    /// Initialize an internal PHY for auto-negotiation
-    fn init_phy(&self, phy_addr: u8) {
-        // Read PHY ID to verify presence (via switch's internal MDIO)
-        let id_hi = self.sw_phy_read(phy_addr, 2).unwrap_or(0);
-        let id_lo = self.sw_phy_read(phy_addr, 3).unwrap_or(0);
-        let phy_id = ((id_hi as u32) << 16) | (id_lo as u32);
+    // =========================================================================
+    // Linux mtk_eth_soc: mtk_dma_init / mtk_init_fq_dma
+    // =========================================================================
 
-        if phy_id == 0 || phy_id == 0xFFFFFFFF {
-            uwarn!("ethd", "phy_not_found"; addr = phy_addr as u32);
-            return;
-        }
-
-        uinfo!("ethd", "phy_found"; addr = phy_addr as u32, id = userlib::ulog::hex32(phy_id));
-
-        // Don't reconfigure PHY - bootloader should have set it up
-        // Just read current status
-        let bmcr = self.sw_phy_read(phy_addr, 0).unwrap_or(0);
-        let anar = self.sw_phy_read(phy_addr, 4).unwrap_or(0);
-        let bmsr = self.sw_phy_read(phy_addr, 1).unwrap_or(0);
-
-        // Check power-down bit (bit 11) in BMCR
-        let power_down = if bmcr & 0x0800 != 0 { "yes" } else { "no" };
-        let link = if bmsr & 0x0004 != 0 { "up" } else { "down" };
-
-        uinfo!("ethd", "phy_status"; addr = phy_addr as u32, bmcr = userlib::ulog::hex32(bmcr as u32), anar = userlib::ulog::hex32(anar as u32), link = link, pdown = power_down);
-    }
-
-    /// Initialize TX ring (QDMA)
-    fn init_tx_ring(&mut self) {
+    fn fifo_init(&mut self) {
         let fe = match &self.fe {
             Some(f) => f,
             None => return,
@@ -1342,547 +770,703 @@ impl EthDriver {
             None => return,
         };
 
-        let ring_paddr = dma.paddr() + LAYOUT.tx_ring_off as u64;
-        let ring_vaddr = dma.vaddr() + LAYOUT.tx_ring_off as u64;
+        // Calculate ring and buffer addresses based on USE_SRAM_FOR_RINGS config
+        let (tx_ring_vaddr, tx_ring_paddr, rx_ring_vaddr, rx_ring_paddr): (u64, u64, u64, u64);
+        let use_sram = USE_SRAM_FOR_RINGS && self.sram_vaddr != 0;
 
-        // Initialize TX descriptors as LINKED LIST via txd2
-        // CRITICAL: txd2 = next descriptor physical address (NOT buffer high bits!)
-        // Linux maintains linked list for QDMA navigation
-        for i in 0..TX_RING_SIZE {
-            let desc_ptr = (ring_vaddr + (i * 32) as u64) as *mut TxDesc;
-            let next_idx = (i + 1) % TX_RING_SIZE;
-            let next_paddr = ring_paddr + (next_idx * 32) as u64;
+        if use_sram {
+            // Use SRAM at 0x15400000 (already mapped and verified in init())
+            // DON'T overwrite sram_vaddr/sram_paddr - they were set correctly in init()!
+            tx_ring_vaddr = self.sram_vaddr + SRAM_TX_RING_OFF as u64;
+            rx_ring_vaddr = self.sram_vaddr + SRAM_RX_RING_OFF as u64;
+            tx_ring_paddr = self.sram_paddr + SRAM_TX_RING_OFF as u64;
+            rx_ring_paddr = self.sram_paddr + SRAM_RX_RING_OFF as u64;
 
-            unsafe {
-                let desc = &mut *desc_ptr;
-                *desc = TxDesc::zeroed();
-                // txd1 = 0 initially (buffer address filled at TX time)
-                desc.txd1 = 0;
-                // txd2 = NEXT DESCRIPTOR POINTER (linked list!)
-                desc.txd2 = next_paddr as u32;
-                // txd3 = LS0 | OWNER_CPU (Linux mtk_tx_alloc:2665)
-                desc.txd3 = TX_DMA_LS0 | TX_DMA_OWNER_CPU;
-                desc.txd4 = 0;
-                desc.txd5 = 0;
-                desc.txd6 = 0;
-                desc.txd7 = 0;
-                desc.txd8 = 0;
+            // Buffer addresses in DMA pool (rings in SRAM, buffers in DMA)
+            self.buf_vaddr = dma.vaddr();
+            self.buf_paddr = dma.paddr();
+
+            uinfo!("ethd", "fifo_init_sram";
+                   sram_vaddr = userlib::ulog::hex64(self.sram_vaddr),
+                   sram_paddr = userlib::ulog::hex64(self.sram_paddr),
+                   buf_paddr = userlib::ulog::hex64(self.buf_paddr));
+        } else {
+            // Use DMA memory for both rings and buffers (like U-Boot)
+            if USE_SRAM_FOR_RINGS {
+                uerror!("ethd", "sram_fallback"; reason = "sram_not_mapped");
             }
+
+            // Rings at start of DMA pool, buffers after rings
+            self.sram_vaddr = 0;  // Not using SRAM
+            self.sram_paddr = 0;
+
+            tx_ring_vaddr = dma.vaddr() + DMA_TX_RING_OFF as u64;
+            rx_ring_vaddr = dma.vaddr() + DMA_RX_RING_OFF as u64;
+            tx_ring_paddr = dma.paddr() + DMA_TX_RING_OFF as u64;
+            rx_ring_paddr = dma.paddr() + DMA_RX_RING_OFF as u64;
+
+            // Buffer addresses in DMA pool (after rings)
+            self.buf_vaddr = dma.vaddr() + DMA_RINGS_SIZE as u64;
+            self.buf_paddr = dma.paddr() + DMA_RINGS_SIZE as u64;
+
+            uinfo!("ethd", "fifo_init_dma";
+                   tx_ring_paddr = userlib::ulog::hex64(tx_ring_paddr),
+                   rx_ring_paddr = userlib::ulog::hex64(rx_ring_paddr),
+                   buf_paddr = userlib::ulog::hex64(self.buf_paddr));
         }
 
-        // Configure QDMA TX ring
-        let qdma_base = qdma_regs::QDMA_BASE;
+        uinfo!("ethd", "ring_sizes";
+               tx_desc = NUM_TX_DESC as u32,
+               rx_desc = NUM_RX_DESC as u32,
+               tx_ring_kb = (TX_RING_SIZE / 1024) as u32,
+               rx_ring_kb = (RX_RING_SIZE / 1024) as u32);
 
-        // Reset QDMA TX indices (Linux: mtk_w32(eth, RST_TX_MASK, rst_idx))
-        fe.write32(qdma_base + qdma_regs::QDMA_RST_IDX, 0xFFFF);
+        // CRITICAL: Proper PDMA reconfiguration sequence
+        // U-Boot may have left PDMA pointing to old ring. We must:
+        // 1. Disable DMA
+        // 2. Wait for DMA to become idle
+        // 3. Clear/reset state
+        // 4. Configure new rings
+        // 5. Re-enable DMA (done later in eth_start)
+
+        let glo_before = self.pdma_read(PDMA_GLO_CFG_REG);
+        uinfo!("ethd", "pdma_stop_start"; glo = userlib::ulog::hex32(glo_before));
+
+        // Step 1: Disable DMA
+        self.pdma_rmw(PDMA_GLO_CFG_REG, TX_DMA_EN | RX_DMA_EN, 0);
         delay_us(100);
-        fe.write32(qdma_base + qdma_regs::QDMA_RST_IDX, 0);
 
-        // TX ring base pointers
-        fe.write32(qdma_base + qdma_regs::QDMA_CTX_PTR, ring_paddr as u32);
-        fe.write32(qdma_base + qdma_regs::QDMA_DTX_PTR, ring_paddr as u32);
+        // Step 2: Wait for DMA busy to clear (up to 5ms)
+        for _ in 0..50 {
+            let glo = self.pdma_read(PDMA_GLO_CFG_REG);
+            if (glo & (TX_DMA_BUSY | RX_DMA_BUSY)) == 0 {
+                break;
+            }
+            delay_us(100);
+        }
 
-        // CRX/DRX point to LAST descriptor (Linux does this!)
-        let last_desc_paddr = ring_paddr + ((TX_RING_SIZE - 1) * 32) as u64;
-        fe.write32(qdma_base + qdma_regs::QDMA_CRX_PTR, last_desc_paddr as u32);
-        fe.write32(qdma_base + qdma_regs::QDMA_DRX_PTR, last_desc_paddr as u32);
+        // Step 3: Clear upper bits and reset (following U-Boot mtk_eth_fifo_init)
+        self.pdma_rmw(PDMA_GLO_CFG_REG, 0xffff0000, 0);
+        delay_us(100);
 
-        // Debug: read back to verify writes
-        let ctx_rb = fe.read32(qdma_base + qdma_regs::QDMA_CTX_PTR);
-        let dtx_rb = fe.read32(qdma_base + qdma_regs::QDMA_DTX_PTR);
-        let crx_rb = fe.read32(qdma_base + qdma_regs::QDMA_CRX_PTR);
-        let drx_rb = fe.read32(qdma_base + qdma_regs::QDMA_DRX_PTR);
-        uinfo!("ethd", "tx_ptrs_after_init"; ctx = userlib::ulog::hex32(ctx_rb), dtx = userlib::ulog::hex32(dtx_rb), crx = userlib::ulog::hex32(crx_rb), drx = userlib::ulog::hex32(drx_rb));
+        let glo_after = self.pdma_read(PDMA_GLO_CFG_REG);
+        uinfo!("ethd", "pdma_stopped"; glo = userlib::ulog::hex32(glo_after));
 
-        self.tx_head = 0;
-        self.tx_tail = 0;
-
-        uinfo!("ethd", "tx_ring_init"; paddr = userlib::ulog::hex64(ring_paddr), size = TX_RING_SIZE as u32);
-    }
-
-    /// Initialize free queue (QDMA requires this)
-    fn init_free_queue(&self) {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
-        let dma = match &self.dma {
-            Some(d) => d,
-            None => return,
-        };
-
-        let fq_ring_paddr = dma.paddr() + LAYOUT.fq_ring_off as u64;
-        let fq_ring_vaddr = dma.vaddr() + LAYOUT.fq_ring_off as u64;
-
-        // Initialize free queue descriptors as a LINEAR list (not circular!)
-        // Linux mtk_init_fq_dma(): txd3 = buffer length, last desc txd2=0
-        for i in 0..FQ_SIZE {
-            let desc_ptr = (fq_ring_vaddr + (i * 32) as u64) as *mut TxDesc;
-            let buf_paddr = dma.paddr() + (LAYOUT.fq_buf_off + i * TX_BUF_SIZE) as u64;
-
+        // Zero descriptor rings
+        if use_sram {
+            // Zero SRAM rings using volatile writes (MMIO memory)
             unsafe {
-                let desc = &mut *desc_ptr;
-                *desc = TxDesc::zeroed();
-                desc.txd1 = buf_paddr as u32;
-                // Link to next, but LAST descriptor has txd2=0 (end of list)
-                if i < FQ_SIZE - 1 {
-                    desc.txd2 = (fq_ring_paddr + ((i + 1) * 32) as u64) as u32;
-                } else {
-                    desc.txd2 = 0; // End of list
+                for i in 0..(TX_RING_SIZE + RX_RING_SIZE) {
+                    core::ptr::write_volatile((self.sram_vaddr + i as u64) as *mut u8, 0);
                 }
-                // txd3 = buffer length | ADDR64 (high 4 address bits for 36-bit DMA)
-                // Linux: TX_DMA_PLEN0(PAGE_SIZE) | TX_DMA_PREP_ADDR64(dma_addr)
-                desc.txd3 = tx_dma_plen0(TX_BUF_SIZE) | tx_dma_prep_addr64(buf_paddr);
-                // txd4-8 = 0 for V2+
-                desc.txd4 = 0;
-                desc.txd5 = 0;
-                desc.txd6 = 0;
-                desc.txd7 = 0;
-                desc.txd8 = 0;
+            }
+            // Zero DMA pool (buffers only)
+            unsafe {
+                core::ptr::write_bytes(dma.vaddr() as *mut u8, 0, TX_BUF_SIZE + RX_BUF_SIZE);
+            }
+        } else {
+            // Zero entire DMA pool (rings + buffers)
+            unsafe {
+                core::ptr::write_bytes(dma.vaddr() as *mut u8, 0, DMA_POOL_SIZE);
             }
         }
 
-        // Configure free queue registers
-        // Format from Linux mtk_eth_soc.c:mtk_init_fq_dma():
-        //   fq_count = (cnt << 16) | cnt  (high = num allocated, low = current count)
-        //   fq_blen  = buf_size << 16     (buffer length in high 16 bits)
-        let qdma_base = qdma_regs::QDMA_BASE;
-        fe.write32(qdma_base + qdma_regs::QDMA_FQ_HEAD, fq_ring_paddr as u32);
-        let fq_tail_paddr = fq_ring_paddr + ((FQ_SIZE - 1) * 32) as u64;
-        fe.write32(qdma_base + qdma_regs::QDMA_FQ_TAIL, fq_tail_paddr as u32);
-        let fq_count_val = ((FQ_SIZE as u32) << 16) | (FQ_SIZE as u32);
-        // FQ_BLEN: buffer size in bits 31-16
-        // Linux: MTK_QDMA_PAGE_SIZE << 16 = 2048 << 16 = 0x08000000
-        let fq_blen_val = (TX_BUF_SIZE as u32) << 16;  // 2048 << 16 = 0x08000000
-        fe.write32(qdma_base + qdma_regs::QDMA_FQ_COUNT, fq_count_val);
-        fe.write32(qdma_base + qdma_regs::QDMA_FQ_BLEN, fq_blen_val);
+        // If using streaming DMA, clean cache after zeroing
+        if USE_STREAMING_DMA {
+            cache_clean(dma.vaddr(), DMA_POOL_SIZE);
+        }
 
-        uinfo!("ethd", "fq_init"; paddr = userlib::ulog::hex64(fq_ring_paddr), size = FQ_SIZE as u32, count = userlib::ulog::hex32(fq_count_val), blen = userlib::ulog::hex32(fq_blen_val));
-    }
+        self.tx_idx = 0;
+        self.rx_idx = 0;
 
-    /// Initialize RX ring (PDMA)
-    fn init_rx_ring(&mut self) {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
-        let dma = match &self.dma {
-            Some(d) => d,
-            None => return,
-        };
+        // Initialize TX descriptors
+        for i in 0..NUM_TX_DESC {
+            let desc_vaddr = tx_ring_vaddr + (i * TX_DESC_SIZE) as u64;
+            let buf_paddr = self.buf_paddr + (i * PKTSIZE_ALIGN) as u64;  // TX buffers at buf_paddr
 
-        let ring_paddr = dma.paddr() + LAYOUT.rx_ring_off as u64;
-        let ring_vaddr = dma.vaddr() + LAYOUT.rx_ring_off as u64;
+            unsafe {
+                let txd = desc_vaddr as *mut TxDescV2;
+                // Use volatile writes (needed for both SRAM and DMA memory)
+                core::ptr::write_volatile(&mut (*txd).txd1, buf_paddr as u32);
+                core::ptr::write_volatile(&mut (*txd).txd2, PDMA_TXD2_DDONE | PDMA_TXD2_LS0);
+                core::ptr::write_volatile(&mut (*txd).txd3, (buf_paddr >> 32) as u32);
+                core::ptr::write_volatile(&mut (*txd).txd4, 0);
+                // V2/V3: FPORT in txd5 - GMAC1 = port 1
+                core::ptr::write_volatile(&mut (*txd).txd5, pdma_v2_txd5_fport_set(self.gmac_id + 1));
+                core::ptr::write_volatile(&mut (*txd).txd6, 0);
+                core::ptr::write_volatile(&mut (*txd).txd7, 0);
+                core::ptr::write_volatile(&mut (*txd).txd8, 0);
+            }
+        }
 
         // Initialize RX descriptors
-        // Linux: rxd2 = RX_DMA_PREP_PLEN0(buf_size) = (buf_size & dma_max_len) << dma_len_offset
-        // MT7988: dma_len_offset=8, dma_max_len=0xffff (MTK_TX_DMA_BUF_LEN_V2)
-        let rxd2_prep = ((RX_BUF_SIZE as u32) & 0xffff) << 8;
-
-        for i in 0..RX_RING_SIZE {
-            let desc_ptr = (ring_vaddr + (i * 32) as u64) as *mut RxDesc;
-            let buf_paddr = dma.paddr() + (LAYOUT.rx_buf_off + i * RX_BUF_SIZE) as u64;
+        for i in 0..NUM_RX_DESC {
+            let desc_vaddr = rx_ring_vaddr + (i * RX_DESC_SIZE) as u64;
+            // RX buffers after TX buffers
+            let buf_paddr = self.buf_paddr + (TX_BUF_SIZE + i * PKTSIZE_ALIGN) as u64;
 
             unsafe {
-                let desc = &mut *desc_ptr;
-                *desc = RxDesc::zeroed();
-                desc.rxd1 = buf_paddr as u32;
-                // rxd2: buffer size in bits 8-23 (Linux RX_DMA_PREP_PLEN0 for MT7988)
-                // DMA owns descriptor when DONE bit (31) is clear
-                desc.rxd2 = rxd2_prep;
-                // rxd3: high 4 address bits for 36-bit DMA (MTK_36BIT_DMA)
-                // Linux: RX_DMA_PREP_ADDR64(dma_addr)
-                desc.rxd3 = rx_dma_prep_addr64(buf_paddr);
+                let rxd = desc_vaddr as *mut RxDescV2;
+                core::ptr::write_volatile(&mut (*rxd).rxd1, buf_paddr as u32);
+                core::ptr::write_volatile(&mut (*rxd).rxd2, pdma_v2_rxd2_plen0_set(PKTSIZE_ALIGN as u32));
+                core::ptr::write_volatile(&mut (*rxd).rxd3, (buf_paddr >> 32) as u32);
+                core::ptr::write_volatile(&mut (*rxd).rxd4, 0);
+                core::ptr::write_volatile(&mut (*rxd).rxd5, 0);
+                core::ptr::write_volatile(&mut (*rxd).rxd6, 0);
+                core::ptr::write_volatile(&mut (*rxd).rxd7, 0);
+                core::ptr::write_volatile(&mut (*rxd).rxd8, 0);
             }
         }
 
-        uinfo!("ethd", "rx_desc_prep"; rxd2 = userlib::ulog::hex32(rxd2_prep));
+        // For streaming DMA: clean cache after writing descriptors
+        if USE_STREAMING_DMA && !USE_SRAM_FOR_RINGS {
+            cache_clean(tx_ring_vaddr, TX_RING_SIZE);
+            cache_clean(rx_ring_vaddr, RX_RING_SIZE);
+        }
 
-        // Configure PDMA RX ring
-        let pdma_base = pdma_regs::PDMA_BASE;
+        // Set up PDMA registers
+        self.pdma_write(tx_base_ptr_reg(0), tx_ring_paddr as u32);
+        self.pdma_write(tx_max_cnt_reg(0), NUM_TX_DESC as u32);
+        self.pdma_write(tx_ctx_idx_reg(0), 0);
 
-        // Reset PDMA RX index first (Linux: MTK_PST_DRX_IDX_CFG)
-        fe.write32(pdma_base + pdma_regs::PDMA_RST_IDX, 1 << 16); // Reset RX ring 0
-        delay_us(100);
+        self.pdma_write(rx_base_ptr_reg(0), rx_ring_paddr as u32);
+        self.pdma_write(rx_max_cnt_reg(0), NUM_RX_DESC as u32);
+        self.pdma_write(rx_crx_idx_reg(0), (NUM_RX_DESC - 1) as u32);
 
-        fe.write32(pdma_base + pdma_regs::PDMA_RX_PTR, ring_paddr as u32);
-        fe.write32(pdma_base + pdma_regs::PDMA_RX_MAX_CNT, RX_RING_SIZE as u32);
-        fe.write32(pdma_base + pdma_regs::PDMA_RX_CPU_IDX, (RX_RING_SIZE - 1) as u32);
+        // Reset DMA indices
+        self.pdma_write(PDMA_RST_IDX_REG, RST_DTX_IDX0 | RST_DRX_IDX0);
 
-        self.rx_head = 0;
+        // Verify configuration
+        let verify_tx_base = self.pdma_read(tx_base_ptr_reg(0));
+        let verify_tx_max = self.pdma_read(tx_max_cnt_reg(0));
+        let verify_tx_ctx = self.pdma_read(tx_ctx_idx_reg(0));
+        let verify_tx_dtx = self.pdma_read(tx_dtx_idx_reg(0));
+        let verify_rx_base = self.pdma_read(rx_base_ptr_reg(0));
+        let verify_rx_max = self.pdma_read(rx_max_cnt_reg(0));
 
-        uinfo!("ethd", "rx_ring_init"; paddr = userlib::ulog::hex64(ring_paddr), size = RX_RING_SIZE as u32);
+        uinfo!("ethd", "fifo_init_done";
+               tx_ring = userlib::ulog::hex64(tx_ring_paddr),
+               rx_ring = userlib::ulog::hex64(rx_ring_paddr));
+        uinfo!("ethd", "verify_tx";
+               base = userlib::ulog::hex32(verify_tx_base),
+               max = verify_tx_max,
+               ctx = verify_tx_ctx,
+               dtx = verify_tx_dtx);
+        uinfo!("ethd", "verify_rx";
+               base = userlib::ulog::hex32(verify_rx_base),
+               max = verify_rx_max);
+
+        // Verify ring writes by reading back first TX descriptor
+        unsafe {
+            let txd = tx_ring_vaddr as *const TxDescV2;
+            // For streaming DMA, invalidate before reading
+            if USE_STREAMING_DMA && !USE_SRAM_FOR_RINGS {
+                cache_invalidate(tx_ring_vaddr, TX_DESC_SIZE);
+            }
+            let txd1 = core::ptr::read_volatile(&(*txd).txd1);
+            let txd2 = core::ptr::read_volatile(&(*txd).txd2);
+            let txd3 = core::ptr::read_volatile(&(*txd).txd3);
+            let txd5 = core::ptr::read_volatile(&(*txd).txd5);
+            uinfo!("ethd", "verify_tx0";
+                   txd1 = userlib::ulog::hex32(txd1),
+                   txd2 = userlib::ulog::hex32(txd2),
+                   txd3 = userlib::ulog::hex32(txd3),
+                   txd5 = userlib::ulog::hex32(txd5));
+
+            // Also verify RX descriptor 0
+            if USE_STREAMING_DMA && !USE_SRAM_FOR_RINGS {
+                cache_invalidate(rx_ring_vaddr, RX_DESC_SIZE);
+            }
+            let rxd = rx_ring_vaddr as *const RxDescV2;
+            let rxd1 = core::ptr::read_volatile(&(*rxd).rxd1);
+            let rxd2 = core::ptr::read_volatile(&(*rxd).rxd2);
+            uinfo!("ethd", "verify_rx0";
+                   rxd1 = userlib::ulog::hex32(rxd1),
+                   rxd2 = userlib::ulog::hex32(rxd2));
+        }
     }
 
-    /// Initialize QDMA RX ring (for TX completion feedback)
-    /// Linux allocates this in mtk_rx_alloc() with MTK_RX_FLAGS_QDMA.
-    /// The ring is set up but never polled - hardware may use it internally.
-    fn init_qdma_rx_ring(&self) {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
-        let dma = match &self.dma {
-            Some(d) => d,
-            None => return,
-        };
+    // =========================================================================
+    // U-Boot: mtk_eth_start
+    // =========================================================================
 
-        let ring_paddr = dma.paddr() + LAYOUT.qdma_rx_ring_off as u64;
-        let ring_vaddr = dma.vaddr() + LAYOUT.qdma_rx_ring_off as u64;
+    // =========================================================================
+    // Comprehensive Register Dump (to compare U-Boot vs our state)
+    // =========================================================================
 
-        // Initialize QDMA RX descriptors (same format as PDMA RX)
-        // Linux: rxd2 = RX_DMA_PREP_PLEN0(buf_size) = (buf_size & dma_max_len) << dma_len_offset
-        // MT7988: dma_len_offset=8, dma_max_len=0xffff
-        let rxd2_prep = ((RX_BUF_SIZE as u32) & 0xffff) << 8;
+    fn dump_all_registers(&self, prefix: &str) {
+        // This dumps ALL relevant FE/GMAC/Switch registers so we can compare
+        // U-Boot's working state with our non-working state
 
-        for i in 0..QDMA_RX_RING_SIZE {
-            let desc_ptr = (ring_vaddr + (i * 32) as u64) as *mut RxDesc;
-            let buf_paddr = dma.paddr() + (LAYOUT.qdma_rx_buf_off + i * RX_BUF_SIZE) as u64;
+        // FE global
+        let fe_glo_misc = self.fe_read(FE_GLO_MISC_REG);
+        let fe_glo_cfg = self.fe_read(0x00);  // FE_GLO_CFG at 0x00
+        uinfo!("ethd", "dump_fe_glo"; prefix = prefix, glo_misc = userlib::ulog::hex32(fe_glo_misc),
+               glo_cfg = userlib::ulog::hex32(fe_glo_cfg));
 
-            unsafe {
-                let desc = &mut *desc_ptr;
-                *desc = RxDesc::zeroed();
-                desc.rxd1 = buf_paddr as u32;
-                desc.rxd2 = rxd2_prep;
-                // rxd3: high 4 address bits for 36-bit DMA (MTK_36BIT_DMA)
-                desc.rxd3 = rx_dma_prep_addr64(buf_paddr);
+        // PSE registers (Packet Switching Engine)
+        let pse_fqfc = self.fe_read(0x100);   // PSE_FQFC_CFG
+        let pse_iqfc = self.fe_read(0x104);   // PSE_IQ_CFG
+        let pse_drop = self.fe_read(0x108);   // PSE_DROP_CFG
+        let pse_dumy = self.fe_read(0x10c);   // PSE_DUMY_REQ
+        let pse_buf_ctrl = self.fe_read(0x110); // PSE_BUF_CTRL
+        uinfo!("ethd", "dump_pse"; prefix = prefix, fqfc = userlib::ulog::hex32(pse_fqfc),
+               iqfc = userlib::ulog::hex32(pse_iqfc), drop = userlib::ulog::hex32(pse_drop),
+               dumy = userlib::ulog::hex32(pse_dumy));
+        uinfo!("ethd", "dump_pse2"; prefix = prefix, buf_ctrl = userlib::ulog::hex32(pse_buf_ctrl));
+
+        // PSE IQ_REV registers (free buffer thresholds per port)
+        for i in 0..9u32 {
+            let iq_rev = self.fe_read(0x118 + i * 4);
+            if iq_rev != 0 {
+                uinfo!("ethd", "dump_pse_iq"; prefix = prefix, idx = i, val = userlib::ulog::hex32(iq_rev));
             }
         }
 
-        // Configure QDMA RX ring registers
-        // Linux: qdma.rx_ptr, qdma.rx_cnt_cfg, qdma.rst_idx, qcrx_ptr
-        let qdma_base = qdma_regs::QDMA_BASE;
+        // PSE output queue status
+        let pse_oq0 = self.fe_read(0x1a0);  // PSE_OQ_STA0
+        let pse_oq1 = self.fe_read(0x1a4);  // PSE_OQ_STA1
+        let pse_oq2 = self.fe_read(0x1b0);  // PSE_OQ_STA2
+        uinfo!("ethd", "dump_pse_oq"; prefix = prefix, oq0 = userlib::ulog::hex32(pse_oq0),
+               oq1 = userlib::ulog::hex32(pse_oq1), oq2 = userlib::ulog::hex32(pse_oq2));
 
-        // Reset QDMA RX index (Linux: MTK_PST_DRX_IDX_CFG(0) = BIT(16))
-        fe.write32(qdma_base + qdma_regs::QDMA_RST_IDX, 1 << 16);
-        delay_us(100);
-
-        // Set ring base and size
-        fe.write32(qdma_base + qdma_regs::QDMA_RX_PTR, ring_paddr as u32);
-        fe.write32(qdma_base + qdma_regs::QDMA_RX_CNT_CFG, QDMA_RX_RING_SIZE as u32);
-
-        // Set CPU index to last descriptor (Linux: ring->calc_idx = rx_dma_size - 1)
-        fe.write32(qdma_base + qdma_regs::QDMA_QCRX_PTR, (QDMA_RX_RING_SIZE - 1) as u32);
-
-        uinfo!("ethd", "qdma_rx_ring_init"; paddr = userlib::ulog::hex64(ring_paddr), size = QDMA_RX_RING_SIZE as u32);
-    }
-
-    /// Enable DMA engines
-    fn enable_dma(&mut self) {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
-
-        let qdma_base = qdma_regs::QDMA_BASE;
-
-        // Initialize TX queue config and scheduler for all 16 queues
-        // Linux: both qtx_cfg AND qtx_sch must be configured!
-        let qtx_cfg_val = (qdma_regs::QDMA_RES_THRES << 8) | qdma_regs::QDMA_RES_THRES;
-        let qtx_sch_val = qdma_regs::QTX_SCH_MIN_RATE_EN
-            | qdma_regs::QTX_SCH_MIN_RATE_MAN
-            | qdma_regs::QTX_SCH_MIN_RATE_EXP
-            | qdma_regs::QTX_SCH_LEAKY_BUCKET_SIZE;
-
-        for i in 0..16 {
-            fe.write32(qdma_base + qdma_regs::QDMA_QTX_CFG + i * 0x10, qtx_cfg_val);
-            fe.write32(qdma_base + qdma_regs::QDMA_QTX_SCH + i * 0x10, qtx_sch_val);
+        // GDM registers (all 3)
+        for gdm in 0..3u32 {
+            let base = match gdm {
+                0 => GDMA1_BASE,
+                1 => GDMA2_BASE,
+                _ => GDMA3_BASE,
+            };
+            let ig = self.fe_read(base + GDMA_IG_CTRL_REG);
+            let eg = self.fe_read(base + GDMA_EG_CTRL_REG);
+            let fwd = self.fe_read(base + 0x00);  // Forward config
+            let shp = self.fe_read(base + 0x04);  // Shaper config
+            uinfo!("ethd", "dump_gdm"; prefix = prefix, gdm = gdm, ig = userlib::ulog::hex32(ig),
+                   eg = userlib::ulog::hex32(eg), fwd = userlib::ulog::hex32(fwd), shp = userlib::ulog::hex32(shp));
         }
 
-        // TX scheduler rate (Linux: MTK_QDMA_TX_SCH_MAX_WFQ | (same << 16))
-        let tx_sch_rate = qdma_regs::QDMA_TX_SCH_MAX_WFQ
-            | (qdma_regs::QDMA_TX_SCH_MAX_WFQ << 16);
-        fe.write32(qdma_base + qdma_regs::QDMA_TX_SCH_RATE, tx_sch_rate);
-        fe.write32(qdma_base + qdma_regs::QDMA_TX_SCH_RATE + 4, tx_sch_rate);
+        // GMAC MCR and related (all 3 ports)
+        for port in 0..3u32 {
+            let mcr_ofs = GMAC_BASE as usize + gmac_port_mcr(port) as usize;
+            let mcr = self.fe.as_ref().map(|fe| fe.read32(mcr_ofs)).unwrap_or(0);
+            uinfo!("ethd", "dump_gmac"; prefix = prefix, port = port, mcr = userlib::ulog::hex32(mcr));
+        }
 
-        uinfo!("ethd", "tx_queues_configured"; qtx_cfg = userlib::ulog::hex32(qtx_cfg_val), qtx_sch = userlib::ulog::hex32(qtx_sch_val));
+        // MAC_MISC registers (including MUX_TO_ESW)
+        let mac_misc_v3 = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + 0x10)).unwrap_or(0);
+        let ppsc = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + 0x00)).unwrap_or(0);
+        uinfo!("ethd", "dump_mac_misc"; prefix = prefix, mac_misc = userlib::ulog::hex32(mac_misc_v3),
+               ppsc = userlib::ulog::hex32(ppsc));
 
-        // QDMA flow control (Linux: QDMA_FC_TH, QDMA_HRED)
-        let fc_th = qdma_regs::FC_THRES_DROP_MODE
-            | qdma_regs::FC_THRES_DROP_EN
-            | qdma_regs::FC_THRES_MIN;
-        fe.write32(qdma_base + qdma_regs::QDMA_FC_TH, fc_th);
-        fe.write32(qdma_base + qdma_regs::QDMA_HRED, 0);
+        // FE reset and clock state
+        let fe_rst = self.fe_read(0x04);  // FE_RST_GLO
+        let fe_crc = self.fe_read(0x20);  // FE CRC config
+        uinfo!("ethd", "dump_fe_rst"; prefix = prefix, rst = userlib::ulog::hex32(fe_rst),
+               crc = userlib::ulog::hex32(fe_crc));
 
-        uinfo!("ethd", "qdma_flow_ctrl"; fc_th = userlib::ulog::hex32(fc_th));
+        // SGMII/path control (for GMAC to switch connection)
+        // Linux: MTK_MAC_MISC = 0x10010 within FE (not GMAC offset)
+        // Contains MUX_TO_ESW, path selection bits
+        let mac_misc_fe = self.fe_read(0x10010);
+        uinfo!("ethd", "dump_path"; prefix = prefix, mac_misc_fe = userlib::ulog::hex32(mac_misc_fe));
 
-        // Enable QDMA (TX) with V2+ flags from Linux mtk_start_dma()
-        let qdma_cfg = qdma_regs::TX_DMA_EN
-            | qdma_regs::RX_DMA_EN  // Linux enables both
-            | qdma_regs::TX_BT_32DWORDS
-            | qdma_regs::NDP_CO_PRO
-            | qdma_regs::RX_2B_OFFSET
-            | qdma_regs::TX_WB_DDONE
-            // V2+ specific flags (critical for TX completion!)
-            | qdma_regs::MULTI_CNT
-            | qdma_regs::RESV_BUF
-            | qdma_regs::WCOMP_EN
-            | qdma_regs::DMAD_WR_WDONE
-            | qdma_regs::CHK_DDONE_EN;
-        fe.write32(qdma_base + qdma_regs::QDMA_GLO_CFG, qdma_cfg);
+        // XGMAC registers for internal 10G link diagnostics
+        // MTK_XGMAC_STS(0) = 0x1000C - status/force bits
+        // GSW_CFG = 0x10080 - bridge IPG
+        let xgmac_sts = self.fe_read(0x1000C);
+        let gsw_cfg = self.fe_read(0x10080);
+        uinfo!("ethd", "dump_xgmac"; prefix = prefix,
+               sts = userlib::ulog::hex32(xgmac_sts),
+               gsw_cfg = userlib::ulog::hex32(gsw_cfg),
+               link = if xgmac_sts & 1 != 0 { 1u32 } else { 0 },
+               force_link = if xgmac_sts & (1 << 11) != 0 { 1u32 } else { 0 },
+               force_mode = if xgmac_sts & (1 << 15) != 0 { 1u32 } else { 0 });
 
-        uinfo!("ethd", "qdma_glo_cfg"; val = userlib::ulog::hex32(qdma_cfg));
+        // XGMAC counters if available (offsets from Linux mtk_eth_soc.h)
+        // Check for any TX/RX counters or error indicators
+        // MTK_STAT_OFFSET = 0x40 for some stat registers
+        let gdm0_tx_ok = self.fe_read(GDMA1_BASE + 0x40);  // TX OK count
+        let gdm0_tx_drop = self.fe_read(GDMA1_BASE + 0x44); // TX drop count
+        let gdm0_rx_ok = self.fe_read(GDMA1_BASE + 0x50);  // RX OK count
+        let gdm0_rx_drop = self.fe_read(GDMA1_BASE + 0x54); // RX drop count
+        uinfo!("ethd", "dump_gdm_stats"; prefix = prefix,
+               tx_ok = gdm0_tx_ok, tx_drop = gdm0_tx_drop,
+               rx_ok = gdm0_rx_ok, rx_drop = gdm0_rx_drop);
 
-        // Enable PDMA (RX) - Linux mtk_start_dma:3481-3484
-        let pdma_base = pdma_regs::PDMA_BASE;
-        let pdma_cfg = pdma_regs::RX_DMA_EN
-            | pdma_regs::RX_BT_32DWORDS
-            | pdma_regs::RX_2B_OFFSET
-            | pdma_regs::MULTI_EN;  // MTK_MULTI_EN - required by Linux
-        fe.write32(pdma_base + pdma_regs::PDMA_GLO_CFG, pdma_cfg);
+        // Ethwarp reset state
+        if let Some(ew) = &self.ethwarp {
+            let ew_rst = ew.read32(ETHWARP_RST_OFS);
+            uinfo!("ethd", "dump_ethwarp"; prefix = prefix, rst = userlib::ulog::hex32(ew_rst));
+        }
 
-        // Enable TX/RX interrupts - Linux mtk_open() does this
-        // Even though we use polling, DMA engine might need IRQs enabled to function
-        // mtk_tx_irq_enable(eth, MTK_TX_DONE_INT): tx_irq_mask |= BIT(28)
-        let tx_irq_mask = fe.read32(fe_regs::TX_IRQ_MASK);
-        fe.write32(fe_regs::TX_IRQ_MASK, tx_irq_mask | fe_regs::TX_DONE_INT);
+        // PDMA global config
+        let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
+        let pdma_rst = self.pdma_read(PDMA_RST_IDX_REG);
+        let pdma_int_sta = self.pdma_read(0x20);  // INT status
+        let pdma_int_en = self.pdma_read(0x28);   // INT enable
+        uinfo!("ethd", "dump_pdma"; prefix = prefix, glo = userlib::ulog::hex32(pdma_glo),
+               rst = userlib::ulog::hex32(pdma_rst), int_sta = userlib::ulog::hex32(pdma_int_sta),
+               int_en = userlib::ulog::hex32(pdma_int_en));
 
-        // mtk_rx_irq_enable(eth, MTK_RX_DONE_INT_V2): pdma.irq_mask |= BIT(14)
-        let rx_irq_mask = fe.read32(fe_regs::PDMA_IRQ_MASK);
-        fe.write32(fe_regs::PDMA_IRQ_MASK, rx_irq_mask | fe_regs::RX_DONE_INT_V2);
+        // PDMA TX ring 0 state
+        let tx_base = self.pdma_read(tx_base_ptr_reg(0));
+        let tx_max = self.pdma_read(tx_max_cnt_reg(0));
+        let tx_ctx = self.pdma_read(tx_ctx_idx_reg(0));
+        let tx_dtx = self.pdma_read(tx_dtx_idx_reg(0));
+        uinfo!("ethd", "dump_tx_ring"; prefix = prefix, base = userlib::ulog::hex32(tx_base),
+               max = tx_max, ctx = tx_ctx, dtx = tx_dtx);
 
-        uinfo!("ethd", "irq_enabled"; tx_mask = userlib::ulog::hex32(tx_irq_mask | fe_regs::TX_DONE_INT), rx_mask = userlib::ulog::hex32(rx_irq_mask | fe_regs::RX_DONE_INT_V2));
+        // QDMA registers (at FE_BASE + 0x4400) - maybe U-Boot uses QDMA for TX?
+        const QDMA_BASE: u32 = 0x4400;
+        let qdma_glo = self.fe_read(QDMA_BASE + 0x204);  // GLO_CFG
+        let qdma_tx_base = self.fe_read(QDMA_BASE + 0x300);  // TX_BASE_PTR_0
+        let qdma_tx_max = self.fe_read(QDMA_BASE + 0x304);   // TX_MAX_CNT_0
+        let qdma_tx_ctx = self.fe_read(QDMA_BASE + 0x308);   // TX_CTX_IDX_0
+        let qdma_tx_dtx = self.fe_read(QDMA_BASE + 0x30c);   // TX_DTX_IDX_0
+        uinfo!("ethd", "dump_qdma"; prefix = prefix, glo = userlib::ulog::hex32(qdma_glo),
+               tx_base = userlib::ulog::hex32(qdma_tx_base), tx_max = qdma_tx_max,
+               tx_ctx = qdma_tx_ctx, tx_dtx = qdma_tx_dtx);
+
+        // Switch CPU port (6) state
+        if self.sw.is_some() {
+            let cpu_pcr = self.gsw_read(MT7530_PCR_P(MT7531_CPU_PORT));
+            let cpu_pmcr = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
+            let cpu_pvc = self.gsw_read(MT7530_PVC_P(MT7531_CPU_PORT));
+            uinfo!("ethd", "dump_sw_cpu"; prefix = prefix, pcr = userlib::ulog::hex32(cpu_pcr),
+                   pmcr = userlib::ulog::hex32(cpu_pmcr), pvc = userlib::ulog::hex32(cpu_pvc));
+
+            // User ports 0-3
+            for port in 0..4u32 {
+                let pcr = self.gsw_read(MT7530_PCR_P(port));
+                let pmcr = self.gsw_read(MT7530_PMCR_P(port));
+                uinfo!("ethd", "dump_sw_port"; prefix = prefix, port = port,
+                       pcr = userlib::ulog::hex32(pcr), pmcr = userlib::ulog::hex32(pmcr));
+            }
+
+            // Switch system registers
+            let sys_ctrl = self.gsw_read(0x7000);
+            let mfc = self.gsw_read(0x0010);  // MFC - frame control
+            let pfc = self.gsw_read(0x0004);  // PFC - PHY indirect
+            uinfo!("ethd", "dump_sw_sys"; prefix = prefix, sys = userlib::ulog::hex32(sys_ctrl),
+                   mfc = userlib::ulog::hex32(mfc), pfc = userlib::ulog::hex32(pfc));
+        }
+    }
+
+    fn eth_start(&mut self) {
+        // FIRST: Dump U-Boot's state BEFORE we change anything
+        uinfo!("ethd", "dump_uboot_state";);
+        self.dump_all_registers("UBOOT");
+
+        // DON'T reset Frame Engine - preserve U-Boot's working state
+        // The FE reset clears internal 10G SerDes and bridge configuration
+        // that U-Boot sets up. Since U-Boot's BOOTP/TFTP works, we should
+        // preserve that state rather than reset and try to reconfigure.
+        //
+        // If we need to reset in the future, we'd need to fully reinitialize
+        // the internal 10G link including SerDes, which requires more
+        // register configuration than we currently do.
+        const ETHSYS_RSTCTRL: usize = 0x34;
+        if let Some(ref ethsys) = self.ethsys {
+            let rst_state = ethsys.read32(ETHSYS_RSTCTRL);
+            uinfo!("ethd", "fe_reset_skipped"; rst_state = userlib::ulog::hex32(rst_state),
+                   reason = "preserve_uboot_state");
+        }
+
+        // Do what U-Boot does: configure GDM for bridge mode
+        // U-Boot's eth_halt() disables DMA but keeps GDM/PSE config.
+        // However, we need to ensure GDM is properly configured for bridge mode.
+
+        uinfo!("ethd", "configuring_gdm";);
+
+        // Set GDM0 for bridge mode (matching U-Boot's mtk_eth_start)
+        // U-Boot code in mtk_eth_start() for V3 with internal switch:
+        //   mtk_gdma_write(eth_priv, gmac_id, GDMA_IG_CTRL_REG, GDMA_BRIDGE_TO_CPU);  // 0xC0000000
+        //   mtk_gdma_write(eth_priv, gmac_id, GDMA_EG_CTRL_REG, GDMA_CPU_BRIDGE_EN);  // 0x80000000
+        //
+        // The U-Boot dump showing eg=0x00000000 is from BEFORE mtk_eth_start or after eth_halt.
+        // During active operation, U-Boot sets both registers.
+        self.gdma_write(0, GDMA_IG_CTRL_REG, GDMA_BRIDGE_TO_CPU);  // 0xC0000000
+        self.gdma_write(0, GDMA_EG_CTRL_REG, GDMA_CPU_BRIDGE_EN);  // 0x80000000
+
+        // Disable other GDMs (discard their traffic)
+        self.gdma_write(1, GDMA_IG_CTRL_REG, GDMA_FWD_DISCARD);
+        self.gdma_write(2, GDMA_IG_CTRL_REG, GDMA_FWD_DISCARD);
+
+        // Verify GDM config
+        let gdm0_ig = self.fe_read(GDMA1_BASE + GDMA_IG_CTRL_REG);
+        let gdm0_eg = self.fe_read(GDMA1_BASE + GDMA_EG_CTRL_REG);
+        uinfo!("ethd", "gdm0_configured"; ig = userlib::ulog::hex32(gdm0_ig),
+               eg = userlib::ulog::hex32(gdm0_eg));
+
+        // Initialize switch and PHYs (this now does PHY autoneg restart)
+        self.switch_init();
+
+        // Log switch state (don't modify)
+        if self.sw.is_some() {
+            let cpu_pcr = self.gsw_read(MT7530_PCR_P(MT7531_CPU_PORT));
+            let cpu_pmcr = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
+            uinfo!("ethd", "switch_cpu_port"; pcr = userlib::ulog::hex32(cpu_pcr), pmcr = userlib::ulog::hex32(cpu_pmcr));
+        }
+
+        // Initialize DMA rings
+        self.fifo_init();
+
+        // Write MAC address to all GDMs
+        let mac_msb = ((self.mac[0] as u32) << 8) | (self.mac[1] as u32);
+        let mac_lsb = ((self.mac[2] as u32) << 24)
+            | ((self.mac[3] as u32) << 16)
+            | ((self.mac[4] as u32) << 8)
+            | (self.mac[5] as u32);
+        for i in 0..3 {
+            self.gdma_write(i, GDMA_MAC_MSB_REG, mac_msb);
+            self.gdma_write(i, GDMA_MAC_LSB_REG, mac_lsb);
+        }
+
+        // CRITICAL: For internal 10G switch mode (XGMII), the 1G MAC must be DISABLED.
+        // Traffic goes through XGMAC, not the 1G MAC.
+        // Reference: Linux mtk_eth_soc.c mtk_mac_config() for XGMII mode:
+        //   mtk_w32(mac->hw, MAC_MCR_FORCE_LINK_DOWN, MTK_MAC_MCR(mac->id));
+        // where MAC_MCR_FORCE_LINK_DOWN = MAC_MCR_FORCE_MODE (only bit 15)
+        //
+        // U-Boot mtk_xmac_init() also does:
+        //   mtk_gmac_write(eth_priv, gmac_port_mcr(eth_priv.gmac_id), FORCE_MODE);
+        {
+            let mcr0_addr = GMAC_BASE as usize + gmac_port_mcr(0) as usize;
+            let mcr0 = self.fe.as_ref().map(|fe| fe.read32(mcr0_addr)).unwrap_or(0);
+            uinfo!("ethd", "gmac0_mcr_before"; mcr = userlib::ulog::hex32(mcr0));
+
+            // For XGMII/internal 10G mode: set ONLY FORCE_MODE, nothing else!
+            // This forces the 1G MAC link DOWN while XGMAC handles traffic.
+            const MAC_FORCE_MODE: u32 = 1 << 15;  // Force link parameters
+            const MAC_TX_EN: u32 = 1 << 14;
+            const MAC_RX_EN: u32 = 1 << 13;
+            const MAC_FORCE_LINK: u32 = 1 << 0;
+
+            // Set only FORCE_MODE - forces 1G MAC link down, traffic goes through XGMAC
+            let new_mcr0 = MAC_FORCE_MODE;
+            self.fe.as_ref().map(|fe| fe.write32(mcr0_addr, new_mcr0));
+
+            let mcr0_after = self.fe.as_ref().map(|fe| fe.read32(mcr0_addr)).unwrap_or(0);
+            uinfo!("ethd", "gmac0_mcr_after"; mcr = userlib::ulog::hex32(mcr0_after),
+                   tx_en = if mcr0_after & MAC_TX_EN != 0 { 1u32 } else { 0 },
+                   rx_en = if mcr0_after & MAC_RX_EN != 0 { 1u32 } else { 0 },
+                   force_link = if mcr0_after & MAC_FORCE_LINK != 0 { 1u32 } else { 0 });
+
+            // CRITICAL: Force XGMAC link up for internal switch connection
+            // Reference: Linux mtk_setup_bridge_switch()
+            // MTK_XGMAC_STS(GMAC1_ID=0) = 0x1000C
+            // MTK_XGMAC_FORCE_MODE(GMAC1_ID=0) = BIT(15)
+            const XGMAC_STS_REG: usize = 0x1000C;
+            const XGMAC_FORCE_MODE: u32 = 1 << 15;
+            const XGMAC_FORCE_LINK: u32 = 1 << 11;
+
+            let xgmac_before = self.fe.as_ref().map(|fe| fe.read32(XGMAC_STS_REG)).unwrap_or(0);
+            // Set FORCE_MODE and FORCE_LINK bits
+            let xgmac_new = xgmac_before | XGMAC_FORCE_MODE | XGMAC_FORCE_LINK;
+            self.fe.as_ref().map(|fe| fe.write32(XGMAC_STS_REG, xgmac_new));
+            let xgmac_after = self.fe.as_ref().map(|fe| fe.read32(XGMAC_STS_REG)).unwrap_or(0);
+            uinfo!("ethd", "xgmac_sts"; before = userlib::ulog::hex32(xgmac_before),
+                   after = userlib::ulog::hex32(xgmac_after),
+                   force_mode = if xgmac_after & XGMAC_FORCE_MODE != 0 { 1u32 } else { 0 },
+                   force_link = if xgmac_after & XGMAC_FORCE_LINK != 0 { 1u32 } else { 0 });
+
+            // Adjust GSW bridge IPG to 11 (Linux: mtk_setup_bridge_switch)
+            // MTK_GSW_CFG = 0x10080
+            // GSWTX_IPG at bits [19:16], GSWRX_IPG at bits [3:0] (assumed)
+            const GSW_CFG_REG: usize = 0x10080;
+            const GSWTX_IPG_MASK: u32 = 0xF << 16;
+            const GSWRX_IPG_MASK: u32 = 0xF << 0;
+            const GSW_IPG_11: u32 = 11;
+
+            let gsw_before = self.fe.as_ref().map(|fe| fe.read32(GSW_CFG_REG)).unwrap_or(0);
+            let gsw_new = (gsw_before & !(GSWTX_IPG_MASK | GSWRX_IPG_MASK))
+                        | (GSW_IPG_11 << 16) | (GSW_IPG_11 << 0);
+            self.fe.as_ref().map(|fe| fe.write32(GSW_CFG_REG, gsw_new));
+            let gsw_after = self.fe.as_ref().map(|fe| fe.read32(GSW_CFG_REG)).unwrap_or(0);
+            uinfo!("ethd", "gsw_cfg"; before = userlib::ulog::hex32(gsw_before),
+                   after = userlib::ulog::hex32(gsw_after));
+        }
+
+        for i in 1..3u32 {
+            let mcr = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + gmac_port_mcr(i) as usize)).unwrap_or(0);
+            uinfo!("ethd", "gmac_mcr_other"; port = i, mcr = userlib::ulog::hex32(mcr));
+        }
+
+        // Enable DMA (U-Boot style)
+        self.pdma_rmw(PDMA_GLO_CFG_REG, 0, TX_WB_DDONE | RX_DMA_EN | TX_DMA_EN);
+        delay_us(500);
+
+        let glo_cfg = self.pdma_read(PDMA_GLO_CFG_REG);
+        uinfo!("ethd", "dma_enabled"; glo_cfg = userlib::ulog::hex32(glo_cfg));
+
+        // LAST: Dump state AFTER all our changes
+        uinfo!("ethd", "dump_our_state";);
+        self.dump_all_registers("OURS");
 
         self.link_up = true;
-
-        // Debug: read Frame Engine and QDMA status
-        let fe_int_status = fe.read32(fe_regs::FE_INT_STATUS);
-        let gdm1_cfg = fe.read32(gdm_regs::GDM1_FWD_CFG);
-        let mac_misc = fe.read32(mac_misc::MAC_MISC_V3);
-        let qdma_glo = fe.read32(qdma_base + qdma_regs::QDMA_GLO_CFG);
-        let pdma_glo = fe.read32(pdma_base + pdma_regs::PDMA_GLO_CFG);
-        uinfo!("ethd", "fe_final"; fe_int = userlib::ulog::hex32(fe_int_status), gdm1 = userlib::ulog::hex32(gdm1_cfg), mac_misc = userlib::ulog::hex32(mac_misc));
-        uinfo!("ethd", "dma_final"; qdma = userlib::ulog::hex32(qdma_glo), pdma = userlib::ulog::hex32(pdma_glo));
-
-        // Re-write TX ring pointers AFTER enabling DMA
-        // (enabling DMA may reset them)
-        let dma = match &self.dma {
-            Some(d) => d,
-            None => {
-                uinfo!("ethd", "dma_enabled";);
-                return;
-            }
-        };
-        let ring_paddr = dma.paddr() + LAYOUT.tx_ring_off as u64;
-        let last_desc_paddr = ring_paddr + ((TX_RING_SIZE - 1) * 32) as u64;
-        fe.write32(qdma_base + qdma_regs::QDMA_CTX_PTR, ring_paddr as u32);
-        fe.write32(qdma_base + qdma_regs::QDMA_DTX_PTR, ring_paddr as u32);
-        fe.write32(qdma_base + qdma_regs::QDMA_CRX_PTR, last_desc_paddr as u32);
-        fe.write32(qdma_base + qdma_regs::QDMA_DRX_PTR, last_desc_paddr as u32);
-
-        // Debug: verify pointers after re-write
-        let ctx_rb = fe.read32(qdma_base + qdma_regs::QDMA_CTX_PTR);
-        let dtx_rb = fe.read32(qdma_base + qdma_regs::QDMA_DTX_PTR);
-        uinfo!("ethd", "tx_ptrs_after_dma_en"; ctx = userlib::ulog::hex32(ctx_rb), dtx = userlib::ulog::hex32(dtx_rb));
-
-        uinfo!("ethd", "dma_enabled";);
     }
 
-    /// Poll RX ring for received packets
-    fn poll_rx(&mut self, ctx: &mut dyn BusCtx) {
-        let port_id = match self.port_id {
-            Some(id) => id,
-            None => return,
-        };
-        let dma = match &self.dma {
-            Some(d) => d,
-            None => return,
-        };
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
+    // =========================================================================
+    // Linux mtk_eth_soc: mtk_start_xmit
+    // =========================================================================
 
-        let ring_vaddr = dma.vaddr() + LAYOUT.rx_ring_off as u64;
-        let mut processed = 0;
-
-        // Debug: read first RX descriptor and PDMA status (once per 100 polls)
-        static mut POLL_COUNT: u32 = 0;
-        unsafe {
-            POLL_COUNT += 1;
-            if POLL_COUNT % 100 == 1 {
-                let desc_ptr = (ring_vaddr) as *const RxDesc;
-                let desc = &*desc_ptr;
-                let pdma_base = pdma_regs::PDMA_BASE;
-                let glo_cfg = fe.read32(pdma_base + pdma_regs::PDMA_GLO_CFG);
-                let cpu_idx = fe.read32(pdma_base + pdma_regs::PDMA_RX_CPU_IDX);
-                let dma_idx = fe.read32(pdma_base + pdma_regs::PDMA_RX_DMA_IDX);
-                // Also check QDMA DTX to see if it changes during RX poll
-                let qdma_base = qdma_regs::QDMA_BASE;
-                let qdma_dtx = fe.read32(qdma_base + qdma_regs::QDMA_DTX_PTR);
-                uinfo!("ethd", "pdma_poll"; glo = userlib::ulog::hex32(glo_cfg), cpu = cpu_idx, dma = dma_idx, rxd2 = userlib::ulog::hex32(desc.rxd2), qdma_dtx = userlib::ulog::hex32(qdma_dtx));
-            }
+    fn eth_send(&mut self, packet: &[u8]) -> bool {
+        // Verify DMA pool is initialized
+        if self.buf_vaddr == 0 {
+            return false;
         }
 
-        loop {
-            let desc_ptr = (ring_vaddr + (self.rx_head * 32) as u64) as *const RxDesc;
-            let desc = unsafe { &*desc_ptr };
-
-            // Check if DMA has written this descriptor
-            if (desc.rxd2 & RX_DMA_DONE) == 0 {
-                break;
-            }
-
-            processed += 1;
-
-            // Get packet length from rxd2 (MT7988 NETSYS_V3 format)
-            // Linux: pktlen = RX_DMA_GET_PLEN0(trxd.rxd2) at mtk_poll_rx:2240
-            // MT7988: (rxd2 >> 8) & 0xffff
-            // Note: Length INCLUDES metadata (2-byte padding + 16-byte RX info = 18 bytes)
-            let raw_len = rx_dma_plen_v2(desc.rxd2);
-
-            // Debug: dump bytes from OFFSET 0 to see actual DMA layout
-            let buf_base = dma.vaddr() + (LAYOUT.rx_buf_off + self.rx_head * RX_BUF_SIZE) as u64;
-            let raw_bytes = unsafe { core::slice::from_raw_parts(buf_base as *const u8, 40.min(raw_len)) };
-            let mut raw_hex = [0u8; 120];
-            for (i, &b) in raw_bytes.iter().take(40).enumerate() {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                raw_hex[i * 3] = HEX[(b >> 4) as usize];
-                raw_hex[i * 3 + 1] = HEX[(b & 0xf) as usize];
-                raw_hex[i * 3 + 2] = b' ';
-            }
-            let raw_str = core::str::from_utf8(&raw_hex[..raw_bytes.len().min(40) * 3]).unwrap_or("?");
-            // Also show descriptor rxd1 (buffer paddr) and expected buf_paddr
-            let buf_paddr = dma.paddr() + (LAYOUT.rx_buf_off + self.rx_head * RX_BUF_SIZE) as u64;
-            uinfo!("ethd", "rx_raw"; idx = self.rx_head as u32, raw_len = raw_len as u32, rxd1 = userlib::ulog::hex32(desc.rxd1), buf_p = userlib::ulog::hex32(buf_paddr as u32), bytes = raw_str);
-
-            let frame_vaddr = buf_base + RX_FRAME_OFFSET as u64;
-            let frame_len = raw_len.saturating_sub(RX_FRAME_OFFSET);
-
-            // Use frame_len for validation (after stripping metadata)
-            let len = frame_len;
-            if len == 0 || len > RX_BUF_SIZE - RX_FRAME_OFFSET {
-                // Invalid length, skip
-                self.reclaim_rx_desc(self.rx_head);
-                self.rx_head = (self.rx_head + 1) % RX_RING_SIZE;
-                continue;
-            }
-
-            // Copy frame to DataPort pool for consumer
-            if let Some(port) = ctx.block_port(port_id) {
-                if let Some(pool_offset) = port.alloc(len as u32) {
-                    // Copy from DMA buffer (skip 18-byte header: 2-byte padding + 16-byte RX info)
-                    let frame_data = unsafe {
-                        core::slice::from_raw_parts(frame_vaddr as *const u8, len)
-                    };
-                    port.pool_write(pool_offset, frame_data);
-
-                    // Post CQE to notify consumer
-                    let tag = self.rx_seq;
-                    self.rx_seq = self.rx_seq.wrapping_add(1);
-                    let cqe = IoCqe {
-                        status: io_status::OK,
-                        flags: 0,
-                        tag,
-                        transferred: frame_len as u32,
-                        result: pool_offset,
-                    };
-                    port.complete(&cqe);
-                }
-            }
-
-            // Reclaim descriptor
-            self.reclaim_rx_desc(self.rx_head);
-
-            // Advance
-            let old_head = self.rx_head;
-            self.rx_head = (self.rx_head + 1) % RX_RING_SIZE;
-
-            // Update CPU index
-            let pdma_base = pdma_regs::PDMA_BASE;
-            fe.write32(pdma_base + pdma_regs::PDMA_RX_CPU_IDX, old_head as u32);
-
-            if processed >= 16 {
-                break;
-            }
-        }
-
-        if processed > 0 {
-            if let Some(port) = ctx.block_port(port_id) {
-                port.notify();
-            }
-        }
-    }
-
-    /// Reclaim an RX descriptor for reuse
-    fn reclaim_rx_desc(&self, idx: usize) {
-        let dma = match &self.dma {
-            Some(d) => d,
-            None => return,
+        // Calculate TX ring address based on mode
+        let tx_ring_vaddr = if USE_SRAM_FOR_RINGS && self.sram_vaddr != 0 {
+            self.sram_vaddr + SRAM_TX_RING_OFF as u64
+        } else {
+            self.dma.as_ref().map(|d| d.vaddr() + DMA_TX_RING_OFF as u64).unwrap_or(0)
         };
-
-        let ring_vaddr = dma.vaddr() + LAYOUT.rx_ring_off as u64;
-        let desc_ptr = (ring_vaddr + (idx * 32) as u64) as *mut RxDesc;
-        let buf_paddr = dma.paddr() + (LAYOUT.rx_buf_off + idx * RX_BUF_SIZE) as u64;
-
-        // Linux: rxd2 = RX_DMA_PREP_PLEN0(buf_size) with DONE bit clear
-        // MT7988: dma_len_offset=8, dma_max_len=0xffff
-        let rxd2_prep = ((RX_BUF_SIZE as u32) & 0xffff) << 8;
+        if tx_ring_vaddr == 0 {
+            return false;
+        }
+        let desc_vaddr = tx_ring_vaddr + (self.tx_idx * TX_DESC_SIZE) as u64;
 
         unsafe {
-            let desc = &mut *desc_ptr;
-            desc.rxd1 = buf_paddr as u32;
-            desc.rxd2 = rxd2_prep; // Buffer size in bits 8-23, DONE clear = DMA owns
-            // rxd3: high 4 address bits for 36-bit DMA (MTK_36BIT_DMA)
-            desc.rxd3 = rx_dma_prep_addr64(buf_paddr);
+            let txd = desc_vaddr as *mut TxDescV2;
+
+            // Check if descriptor is available (DDONE set means CPU owns it)
+            // SRAM requires volatile read!
+            let txd2 = core::ptr::read_volatile(&(*txd).txd2);
+            if (txd2 & PDMA_TXD2_DDONE) == 0 {
+                uinfo!("ethd", "tx_full"; idx = self.tx_idx as u32);
+                return false;
+            }
+
+            // Calculate buffer addresses
+            // buf_vaddr/buf_paddr point to start of TX buffers
+            let buf_offset = self.tx_idx * PKTSIZE_ALIGN;
+            let buf_vaddr = self.buf_vaddr + buf_offset as u64;
+            let buf_paddr = self.buf_paddr + buf_offset as u64;
+
+            // Copy packet to buffer
+            core::ptr::copy_nonoverlapping(packet.as_ptr(), buf_vaddr as *mut u8, packet.len());
+
+            // For streaming DMA: clean cache to push data to RAM before DMA reads it
+            if USE_STREAMING_DMA {
+                cache_clean(buf_vaddr, packet.len());
+            }
+
+            // Memory barrier to ensure write completes before descriptor update
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+
+            // Update descriptor - SRAM requires volatile writes!
+            core::ptr::write_volatile(&mut (*txd).txd1, buf_paddr as u32);
+            core::ptr::write_volatile(&mut (*txd).txd3, (buf_paddr >> 32) as u32);
+            // FPORT should already be set during init, but ensure it's correct
+            core::ptr::write_volatile(&mut (*txd).txd5, pdma_v2_txd5_fport_set(self.gmac_id + 1));
+            // Set length and clear DDONE (gives descriptor to DMA)
+            core::ptr::write_volatile(&mut (*txd).txd2, PDMA_TXD2_LS0 | pdma_v2_txd2_sdl0_set(packet.len() as u32));
+
+            // Memory barrier after descriptor update
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        // Advance TX index
+        self.tx_idx = (self.tx_idx + 1) % NUM_TX_DESC;
+        self.pdma_write(tx_ctx_idx_reg(0), self.tx_idx as u32);
+
+        // Debug logging
+        let dtx = self.pdma_read(tx_dtx_idx_reg(0));
+        let ctx = self.pdma_read(tx_ctx_idx_reg(0));
+        uinfo!("ethd", "tx_sent"; idx = self.tx_idx as u32, len = packet.len() as u32, dtx = dtx, ctx = ctx);
+
+        true
+    }
+
+    // =========================================================================
+    // Linux mtk_eth_soc: mtk_poll_rx
+    // =========================================================================
+
+    fn eth_recv(&mut self) -> Option<(u64, usize)> {
+        // Calculate RX ring address based on mode
+        let rx_ring_vaddr = if USE_SRAM_FOR_RINGS && self.sram_vaddr != 0 {
+            self.sram_vaddr + SRAM_RX_RING_OFF as u64
+        } else {
+            self.dma.as_ref().map(|d| d.vaddr() + DMA_RX_RING_OFF as u64)?
+        };
+        let desc_vaddr = rx_ring_vaddr + (self.rx_idx * RX_DESC_SIZE) as u64;
+
+        unsafe {
+            let rxd = desc_vaddr as *const RxDescV2;
+
+            // Check if descriptor has been filled (DDONE set by DMA)
+            // SRAM requires volatile read!
+            let rxd2 = core::ptr::read_volatile(&(*rxd).rxd2);
+            if (rxd2 & PDMA_RXD2_DDONE) == 0 {
+                return None;
+            }
+
+            // Get packet length (V2/V3: PLEN0 in bits [23:8])
+            let length = pdma_v2_rxd2_plen0_get(rxd2) as usize;
+
+            // Get buffer virtual address
+            // buf_vaddr points to start of TX buffers, RX buffers are after TX buffers
+            let buf_vaddr = self.buf_vaddr + (TX_BUF_SIZE + self.rx_idx * PKTSIZE_ALIGN) as u64;
+
+            // For streaming DMA: invalidate cache to discard stale data before CPU reads
+            if USE_STREAMING_DMA {
+                cache_invalidate(buf_vaddr, length);
+            }
+
+            Some((buf_vaddr, length))
         }
     }
 
-    /// Process TX requests from DataPort SQ
+    fn eth_free_pkt(&mut self) {
+        // Calculate RX ring address based on mode
+        let rx_ring_vaddr = if USE_SRAM_FOR_RINGS && self.sram_vaddr != 0 {
+            self.sram_vaddr + SRAM_RX_RING_OFF as u64
+        } else {
+            match self.dma.as_ref() {
+                Some(d) => d.vaddr() + DMA_RX_RING_OFF as u64,
+                None => return,
+            }
+        };
+        let desc_vaddr = rx_ring_vaddr + (self.rx_idx * RX_DESC_SIZE) as u64;
+
+        unsafe {
+            let rxd = desc_vaddr as *mut RxDescV2;
+
+            // Reset descriptor for reuse (set PLEN0, clear DDONE)
+            // SRAM requires volatile write!
+            core::ptr::write_volatile(&mut (*rxd).rxd2, pdma_v2_rxd2_plen0_set(PKTSIZE_ALIGN as u32));
+        }
+
+        // Advance RX index and update hardware
+        self.rx_idx = (self.rx_idx + 1) % NUM_RX_DESC;
+        self.pdma_write(rx_crx_idx_reg(0), self.rx_idx as u32);
+    }
+
+    // =========================================================================
+    // TX Processing (from DataPort)
+    // =========================================================================
+
     fn process_tx(&mut self, ctx: &mut dyn BusCtx) {
         let port_id = match self.port_id {
             Some(id) => id,
-            None => return,
-        };
-        let dma = match &self.dma {
-            Some(d) => d,
-            None => return,
-        };
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
-
-        // Collect TX requests
-        let mut requests: [Option<IoSqe>; 8] = [None; 8];
-        let mut req_count = 0;
-
-        if let Some(port) = ctx.block_port(port_id) {
-            while req_count < 8 {
-                if let Some(sqe) = port.recv_request() {
-                    requests[req_count] = Some(sqe);
-                    req_count += 1;
-                } else {
-                    break;
-                }
+            None => {
+                uinfo!("ethd", "process_tx_no_port";);
+                return;
             }
-        }
+        };
 
-        if req_count == 0 {
-            return;
-        }
-
-        uinfo!("ethd", "tx_req"; count = req_count as u32);
-
-        // Debug: read QDMA status
-        let qdma_base = qdma_regs::QDMA_BASE;
-        let glo_cfg = fe.read32(qdma_base + qdma_regs::QDMA_GLO_CFG);
-
-        // Debug: check DTX at start of TX handler - is it already 0?
-        let dtx_at_start = fe.read32(qdma_base + qdma_regs::QDMA_DTX_PTR);
-        let ctx_at_start = fe.read32(qdma_base + qdma_regs::QDMA_CTX_PTR);
-        uinfo!("ethd", "qdma_status"; glo_cfg = userlib::ulog::hex32(glo_cfg), ctx = userlib::ulog::hex32(ctx_at_start), dtx = userlib::ulog::hex32(dtx_at_start));
-
-        let ring_vaddr = dma.vaddr() + LAYOUT.tx_ring_off as u64;
-        let ring_paddr = dma.paddr() + LAYOUT.tx_ring_off as u64;
-
-        for i in 0..req_count {
-            let sqe = match requests[i].take() {
+        // Process up to 8 TX requests
+        let mut count = 0u32;
+        for _ in 0..8 {
+            let sqe = match ctx.block_port(port_id).and_then(|p| p.recv_request()) {
                 Some(s) => s,
-                None => continue,
+                None => break,
             };
+            count += 1;
+            uinfo!("ethd", "tx_request"; opcode = sqe.opcode, tag = sqe.tag, len = sqe.data_len);
 
-            if sqe.opcode != net_op::TX {
+            if sqe.opcode != io_op::NET_SEND {
                 if let Some(port) = ctx.block_port(port_id) {
                     port.complete_error(sqe.tag, io_status::INVALID);
                     port.notify();
@@ -1899,205 +1483,90 @@ impl EthDriver {
                 continue;
             }
 
-            // Check if TX ring is full
-            let next_head = (self.tx_head + 1) % TX_RING_SIZE;
-            if next_head == self.tx_tail {
-                // Ring full
-                if let Some(port) = ctx.block_port(port_id) {
-                    port.complete_error(sqe.tag, io_status::NO_SPACE);
-                    port.notify();
-                }
-                continue;
-            }
-
-            // Get descriptor
-            let desc_ptr = (ring_vaddr + (self.tx_head * 32) as u64) as *mut TxDesc;
-            let buf_vaddr = dma.vaddr() + (LAYOUT.tx_buf_off + self.tx_head * TX_BUF_SIZE) as u64;
-            let buf_paddr = dma.paddr() + (LAYOUT.tx_buf_off + self.tx_head * TX_BUF_SIZE) as u64;
-
-            // Copy packet from pool to TX buffer
+            // Get packet from pool
             if let Some(port) = ctx.block_port(port_id) {
-                if let Some(src) = port.pool_slice(sqe.data_offset, sqe.data_len) {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            src.as_ptr(),
-                            buf_vaddr as *mut u8,
-                            packet_len,
-                        );
+                if let Some(pkt_data) = port.pool_slice(sqe.data_offset, sqe.data_len) {
+                    // Copy to local buffer and send
+                    let mut buf = [0u8; 1536];
+                    buf[..packet_len].copy_from_slice(pkt_data);
+
+                    if self.eth_send(&buf[..packet_len]) {
+                        port.complete_ok(sqe.tag, sqe.data_len);
+                    } else {
+                        port.complete_error(sqe.tag, io_status::NO_SPACE);
                     }
+                    port.notify();
                 } else {
                     port.complete_error(sqe.tag, io_status::INVALID);
                     port.notify();
-                    continue;
                 }
             }
+        }
+        if count > 0 {
+            uinfo!("ethd", "process_tx_done"; count = count);
+        }
+    }
 
-            // Debug: show first 20 bytes of TX packet
-            let tx_hdr = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, 20.min(packet_len)) };
-            let mut tx_hex = [0u8; 60];
-            for (i, &b) in tx_hdr.iter().take(20).enumerate() {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                tx_hex[i * 3] = HEX[(b >> 4) as usize];
-                tx_hex[i * 3 + 1] = HEX[(b & 0xf) as usize];
-                tx_hex[i * 3 + 2] = b' ';
-            }
-            let tx_str = core::str::from_utf8(&tx_hex[..tx_hdr.len().min(20) * 3]).unwrap_or("?");
-            uinfo!("ethd", "tx_pkt"; idx = self.tx_head as u32, len = packet_len as u32, hdr = tx_str);
+    // =========================================================================
+    // RX Polling (timer-driven)
+    // =========================================================================
 
-            // Fill descriptor (V2/V3 format for MT7988)
-            // Based on Linux mtk_tx_set_dma_desc_v2() and audit
-            unsafe {
-                let desc = &mut *desc_ptr;
-                // txd1 = buffer address (low 32 bits)
-                desc.txd1 = buf_paddr as u32;
-                // txd2 = DO NOT TOUCH - it's the next descriptor pointer!
-                // txd3 = LS0 | PLEN0 | ADDR64 (high 4 address bits for 36-bit DMA)
-                // Linux: TX_DMA_PREP_ADDR64(addr) for MTK_36BIT_DMA systems
-                desc.txd3 = TX_DMA_LS0 | tx_dma_plen0(packet_len) | tx_dma_prep_addr64(buf_paddr);
-                // txd4 = FPORT | SWC_V2 | QID (FPORT in bits 11:8, QID in bits 21:16)
-                // Linux: data = PSE_GDM1_PORT << TX_DMA_FPORT_SHIFT_V2 | TX_DMA_SWC_V2 | QID_BITS_V2(qid)
-                desc.txd4 = tx_dma_txd4_v2(PSE_GDM1_PORT, 0);  // Queue 0
-                // txd5 = 0 (TSO/CHKSUM flags, we don't use them)
-                desc.txd5 = 0;
-                desc.txd6 = 0;
-                desc.txd7 = 0;
-                desc.txd8 = 0;
+    fn poll_rx(&mut self, ctx: &mut dyn BusCtx) {
+        let port_id = match self.port_id {
+            Some(id) => id,
+            None => return,
+        };
+
+        // Process up to 8 RX packets
+        for _ in 0..8 {
+            let (buf_vaddr, length) = match self.eth_recv() {
+                Some(r) => r,
+                None => break,
+            };
+
+            // Skip tiny packets
+            if length < 14 {
+                self.eth_free_pkt();
+                continue;
             }
 
-            // Debug: show descriptor contents after fill
-            let desc = unsafe { &*(desc_ptr as *const TxDesc) };
-            uinfo!("ethd", "tx_desc"; txd1 = userlib::ulog::hex32(desc.txd1), txd2 = userlib::ulog::hex32(desc.txd2), txd3 = userlib::ulog::hex32(desc.txd3), txd4 = userlib::ulog::hex32(desc.txd4), txd5 = userlib::ulog::hex32(desc.txd5));
-
-            // Advance head
-            self.tx_head = next_head;
-
-            // Memory barrier to ensure descriptor writes complete before kick
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-
-            // Kick QDMA by writing next descriptor address to CTX_PTR
-            // This tells QDMA "here's a new descriptor to process"
-            let qdma_base = qdma_regs::QDMA_BASE;
-            let next_desc_paddr = ring_paddr + (self.tx_head * 32) as u64;
-            fe.write32(qdma_base + qdma_regs::QDMA_CTX_PTR, next_desc_paddr as u32);
-
-            // Debug: Read back TX registers and check for errors
-            let ctx_ptr = fe.read32(qdma_base + qdma_regs::QDMA_CTX_PTR);
-            let dtx_ptr = fe.read32(qdma_base + qdma_regs::QDMA_DTX_PTR);
-            let crx_ptr = fe.read32(qdma_base + qdma_regs::QDMA_CRX_PTR);
-            let drx_ptr = fe.read32(qdma_base + qdma_regs::QDMA_DRX_PTR);
-
-            // Read FE interrupt status and free queue count for debug
-            let fe_int = fe.read32(fe_regs::FE_INT_STATUS);
-            let fq_cnt = fe.read32(qdma_base + qdma_regs::QDMA_FQ_COUNT);
-
-            uinfo!("ethd", "tx_kick"; ctx = userlib::ulog::hex32(ctx_ptr), dtx = userlib::ulog::hex32(dtx_ptr), crx = userlib::ulog::hex32(crx_ptr), drx = userlib::ulog::hex32(drx_ptr), len = packet_len as u32);
-            uinfo!("ethd", "tx_status"; fe_int = userlib::ulog::hex32(fe_int), fq_cnt = userlib::ulog::hex32(fq_cnt));
-
-            // Debug: Read MAC TX counters to see if packet reached MAC
-            // MT7988 GDM1 counters at FE_BASE + 0x1c00
-            const GDM1_CNT_BASE: usize = 0x1c00;
-            let tx_pkts = fe.read32(GDM1_CNT_BASE + 0x48);  // TX good packets
-            let tx_bytes = fe.read32(GDM1_CNT_BASE + 0x40); // TX good bytes
-            let tx_drop = fe.read32(GDM1_CNT_BASE + 0x60);  // TX drop packets
-
-            // PSE queue status registers (Linux: PSE_OQ_STA, PSE_IQ_STA)
-            let pse_oq_sta = fe.read32(0x01a0);   // Output queue status
-            let pse_iq_sta = fe.read32(0x01b0);   // Input queue status
-
-            // PSE Free Queue Flow Control (Linux: PSE_FQFC_CFG)
-            let pse_fqfc = fe.read32(0x0100);    // Free queue config
-
-            // PSE port drop counters - check if PSE is dropping our packet
-            // PSE_MQ(x)_DROP at 0x1b8 + x*4 shows drops per port
-            let pse_mq0_drop = fe.read32(0x01b8);  // Port 0 drops
-            let pse_mq1_drop = fe.read32(0x01bc);  // Port 1 (GDM1) drops
-
-            // QDMA debug: FSM state and error status
-            let qdma_fsm = fe.read32(qdma_base + 0x0200);  // QDMA_FSM
-            let qdma_err = fe.read32(qdma_base + 0x0204);  // QDMA_ERR (if exists)
-
-            uinfo!("ethd", "mac_tx"; pkts = tx_pkts, bytes = tx_bytes, drop = tx_drop);
-            uinfo!("ethd", "pse_status"; oq = userlib::ulog::hex32(pse_oq_sta), iq = userlib::ulog::hex32(pse_iq_sta), fqfc = userlib::ulog::hex32(pse_fqfc));
-            uinfo!("ethd", "pse_drops"; mq0 = pse_mq0_drop, mq1 = pse_mq1_drop);
-            uinfo!("ethd", "qdma_debug"; fsm = userlib::ulog::hex32(qdma_fsm), err = userlib::ulog::hex32(qdma_err));
-
-            // Complete to consumer
+            // Copy packet to DataPort pool
             if let Some(port) = ctx.block_port(port_id) {
-                port.complete_ok(sqe.tag, sqe.data_len);
+                if let Some(pool_offset) = port.alloc(length as u32) {
+                    // Copy from DMA buffer to pool
+                    let src = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, length) };
+                    port.pool_write(pool_offset, src);
+
+                    // Post CQE
+                    let cqe = IoCqe {
+                        status: io_status::OK,
+                        flags: 0,
+                        tag: self.rx_seq as u32,
+                        transferred: length as u32,
+                        result: pool_offset,
+                    };
+                    port.complete(&cqe);
+                    self.rx_seq += 1;
+                }
                 port.notify();
             }
+
+            // Return descriptor to DMA
+            self.eth_free_pkt();
         }
     }
 
-    /// Reclaim completed TX descriptors
-    /// QDMA uses DRX pointer for completion, not DONE bit in descriptor
-    fn poll_tx_completions(&mut self) {
-        let fe = match &self.fe {
-            Some(f) => f,
-            None => return,
-        };
-        let dma = match &self.dma {
-            Some(d) => d,
-            None => return,
-        };
+    // =========================================================================
+    // Sidechannel Handling (for ipd to query MAC/MTU)
+    // =========================================================================
 
-        let ring_paddr = dma.paddr() + LAYOUT.tx_ring_off as u64;
-        let ring_vaddr = dma.vaddr() + LAYOUT.tx_ring_off as u64;
-        let qdma_base = qdma_regs::QDMA_BASE;
-
-        // Read DRX pointer - where DMA has released/completed up to
-        let drx_ptr = fe.read32(qdma_base + qdma_regs::QDMA_DRX_PTR);
-
-        // Calculate DRX index from pointer
-        if drx_ptr < ring_paddr as u32 {
-            return; // Invalid pointer
-        }
-        let drx_offset = drx_ptr - ring_paddr as u32;
-        let drx_idx = (drx_offset / 32) as usize;
-        if drx_idx >= TX_RING_SIZE {
-            return; // Out of range
-        }
-
-        let mut completed = 0u32;
-
-        // Reclaim all descriptors from tx_tail up to (but not including) drx_idx
-        // Linux: walks linked list via txd2 and checks OWNER_CPU bit
-        // We use index increment but add OWNER_CPU sanity check
-        while self.tx_tail != drx_idx && self.tx_tail != self.tx_head {
-            // P4.1: Check OWNER_CPU bit as sanity check (like Linux mtk_poll_tx_qdma:2467)
-            // When DMA completes, it sets OWNER_CPU=1 (returns ownership to CPU)
-            // If OWNER_CPU=0, DMA still owns it - shouldn't happen if drx_ptr is valid, but check anyway
-            let desc_vaddr = ring_vaddr + (self.tx_tail * 32) as u64;
-            let desc = unsafe { &*(desc_vaddr as *const TxDesc) };
-            if (desc.txd3 & TX_DMA_OWNER_CPU) == 0 {
-                // DMA still owns this descriptor - stop reclaiming
-                uinfo!("ethd", "tx_owner_dma"; idx = self.tx_tail as u32, txd3 = userlib::ulog::hex32(desc.txd3));
-                break;
-            }
-
-            completed += 1;
-            self.tx_tail = (self.tx_tail + 1) % TX_RING_SIZE;
-        }
-
-        if completed > 0 {
-            // Update CRX pointer to acknowledge we've reclaimed these
-            let new_crx = ring_paddr + (self.tx_tail * 32) as u64;
-            fe.write32(qdma_base + qdma_regs::QDMA_CRX_PTR, new_crx as u32);
-            uinfo!("ethd", "tx_completed"; count = completed);
-        } else if self.tx_tail != self.tx_head {
-            // Debug: show why no completion
-            let dtx_ptr = fe.read32(qdma_base + qdma_regs::QDMA_DTX_PTR);
-            uinfo!("ethd", "tx_pending"; tail = self.tx_tail as u32, drx_idx = drx_idx as u32, drx = userlib::ulog::hex32(drx_ptr), dtx = userlib::ulog::hex32(dtx_ptr));
-        }
-    }
-
-    /// Handle sidechannel queries
     fn handle_side_queries(&mut self, ctx: &mut dyn BusCtx) {
         let port_id = match self.port_id {
             Some(id) => id,
             None => return,
         };
 
+        // Process up to 4 sidechannel queries
         let mut queries: [Option<SideEntry>; 4] = [None; 4];
         let mut query_count = 0;
 
@@ -2115,7 +1584,7 @@ impl EthDriver {
         for i in 0..query_count {
             if let Some(entry) = queries[i].take() {
                 match entry.msg_type {
-                    SIDE_QUERY_NET_INFO => {
+                    side_msg::QUERY_INFO => {
                         // Respond with MAC address and link status
                         let mut response = SideEntry {
                             msg_type: entry.msg_type,
@@ -2126,7 +1595,7 @@ impl EthDriver {
                         };
                         // payload[0..6] = MAC address
                         response.payload[0..6].copy_from_slice(&self.mac);
-                        // payload[6] = link status
+                        // payload[6] = link status (1 = up)
                         response.payload[6] = if self.link_up { 1 } else { 0 };
                         // payload[7..9] = MTU (1500)
                         response.payload[7..9].copy_from_slice(&1500u16.to_le_bytes());
@@ -2135,9 +1604,10 @@ impl EthDriver {
                             port.side_send(&response);
                             port.notify();
                         }
+                        uinfo!("ethd", "side_query"; msg = "info_response");
                     }
                     _ => {
-                        // Unknown query — respond with EOL
+                        // Unknown query — respond with error
                         let response = SideEntry {
                             msg_type: entry.msg_type,
                             flags: 0,
@@ -2154,19 +1624,6 @@ impl EthDriver {
             }
         }
     }
-
-    fn format_mac(&self) -> [u8; 17] {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut buf = [0u8; 17];
-        for i in 0..6 {
-            buf[i * 3] = HEX[(self.mac[i] >> 4) as usize];
-            buf[i * 3 + 1] = HEX[(self.mac[i] & 0xf) as usize];
-            if i < 5 {
-                buf[i * 3 + 2] = b':';
-            }
-        }
-        buf
-    }
 }
 
 // =============================================================================
@@ -2177,195 +1634,370 @@ impl Driver for EthDriver {
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         uinfo!("ethd", "init";);
 
-        // 1. Map Frame Engine MMIO
+        // Map Frame Engine MMIO
         let fe = MmioRegion::open(FE_BASE, FE_SIZE).ok_or_else(|| {
-            uerror!("ethd", "mmio_map_failed"; addr = userlib::ulog::hex64(FE_BASE));
+            uerror!("ethd", "fe_mmio_failed";);
             BusError::Internal
         })?;
+
+        // DIAGNOSTIC: Test FE register write capability
+        // We need to verify MMIO writes work, not just reads.
+        // Test using FE_GLO_MISC at offset 0x124
+        {
+            let glo_misc = fe.read32(FE_GLO_MISC_REG as usize);
+            uinfo!("ethd", "fe_glo_misc_uboot"; val = userlib::ulog::hex32(glo_misc),
+                   pdma_v2 = if (glo_misc & PDMA_VER_V2) != 0 { 1u32 } else { 0u32 });
+
+            // Test: Try setting BIT(4) if not already set
+            if (glo_misc & PDMA_VER_V2) == 0 {
+                uinfo!("ethd", "set_pdma_v2"; reason = "not_set_by_uboot");
+                fe.write32(FE_GLO_MISC_REG as usize, glo_misc | PDMA_VER_V2);
+                let glo_misc_after = fe.read32(FE_GLO_MISC_REG as usize);
+                uinfo!("ethd", "fe_glo_misc_after"; val = userlib::ulog::hex32(glo_misc_after),
+                       pdma_v2 = if (glo_misc_after & PDMA_VER_V2) != 0 { 1u32 } else { 0u32 });
+            }
+
+            // Test: Write to PSE_DUMY_REQ register (offset 0x10C) - should be writable
+            // This is a scratch/dummy register often used for testing
+            let pse_dumy_before = fe.read32(0x10c);
+            fe.write32(0x10c, 0x12345678);
+            let pse_dumy_after = fe.read32(0x10c);
+            uinfo!("ethd", "fe_write_test"; reg = "pse_dumy", before = userlib::ulog::hex32(pse_dumy_before),
+                   wrote = userlib::ulog::hex32(0x12345678), after = userlib::ulog::hex32(pse_dumy_after));
+
+            // Restore original value
+            fe.write32(0x10c, pse_dumy_before);
+
+            // Test: Direct SRAM access at FE offset 0x40000
+            // SRAM should be within FE region (FE_SIZE = 0x80000 = 512KB)
+            let sram_test_offset = FE_SRAM_OFFSET as usize;
+            let sram_before = fe.read32(sram_test_offset);
+            uinfo!("ethd", "sram_via_fe_before"; offset = userlib::ulog::hex32(sram_test_offset as u32),
+                   val = userlib::ulog::hex32(sram_before));
+
+            fe.write32(sram_test_offset, 0xCAFEBABE);
+            let sram_after = fe.read32(sram_test_offset);
+            uinfo!("ethd", "sram_via_fe_after"; offset = userlib::ulog::hex32(sram_test_offset as u32),
+                   wrote = userlib::ulog::hex32(0xCAFEBABE), read = userlib::ulog::hex32(sram_after));
+
+            // If sram_after != 0xCAFEBABE, SRAM writes are being ignored!
+            if sram_after != 0xCAFEBABE {
+                uerror!("ethd", "sram_write_failed"; expected = userlib::ulog::hex32(0xCAFEBABE),
+                        got = userlib::ulog::hex32(sram_after));
+            }
+        }
+
         self.fe = Some(fe);
 
-        // 2. Map ETHSYS MMIO (clock/reset/DMA_AG_MAP)
-        let ethsys = MmioRegion::open(ETHSYS_BASE, ETHSYS_SIZE).ok_or_else(|| {
-            uerror!("ethd", "ethsys_map_failed"; addr = userlib::ulog::hex64(ETHSYS_BASE));
-            BusError::Internal
-        })?;
-        self.ethsys = Some(ethsys);
+        // Map Internal Switch MMIO (separate region at 0x15020000)
+        match MmioRegion::open(SWITCH_BASE, SWITCH_SIZE) {
+            Some(sw) => {
+                uinfo!("ethd", "switch_mmio_ok"; base = userlib::ulog::hex64(SWITCH_BASE));
+                self.sw = Some(sw);
+            }
+            None => {
+                uwarn!("ethd", "switch_mmio_failed"; base = userlib::ulog::hex64(SWITCH_BASE));
+                // Continue without switch - SFP+ might still work
+            }
+        }
 
-        // 4. Map Internal Switch (GSW) MMIO
-        let gsw = MmioRegion::open(GSW_BASE, GSW_SIZE).ok_or_else(|| {
-            uerror!("ethd", "gsw_map_failed"; addr = userlib::ulog::hex64(GSW_BASE));
-            BusError::Internal
-        })?;
-        self.gsw = Some(gsw);
+        // Map Ethwarp reset controller (0x15031000)
+        match MmioRegion::open(ETHWARP_BASE, ETHWARP_SIZE) {
+            Some(ew) => {
+                uinfo!("ethd", "ethwarp_mmio_ok"; base = userlib::ulog::hex64(ETHWARP_BASE));
+                self.ethwarp = Some(ew);
+            }
+            None => {
+                uwarn!("ethd", "ethwarp_mmio_failed"; base = userlib::ulog::hex64(ETHWARP_BASE));
+            }
+        }
 
-        // 5. Allocate DMA pool
-        let mut dma = DmaPool::alloc(DMA_POOL_SIZE).ok_or_else(|| {
-            uerror!("ethd", "dma_alloc_failed"; size = DMA_POOL_SIZE as u32);
+        // Map ETHSYS system control (0x15000000)
+        // NOTE: Previous code tried to set BIT(15) at offset 0x0c (ETHSYS_DUMMY_REG) but
+        // this appears to be for older chips, not MT7988. For MT7988 (NETSYS V3), SRAM
+        // is enabled via BIT(4) in FE_GLO_MISC (already done above).
+        match MmioRegion::open(ETHSYS_BASE, ETHSYS_SIZE) {
+            Some(es) => {
+                uinfo!("ethd", "ethsys_mmio_ok"; base = userlib::ulog::hex64(ETHSYS_BASE));
+
+                // Dump ETHSYS registers for debugging
+                let dummy_reg = es.read32(ETHSYS_DUMMY_REG);
+                let clk_cfg0 = es.read32(0x00);  // CLK_CFG_0
+                let clk_cfg1 = es.read32(0x04);  // CLK_CFG_1
+                uinfo!("ethd", "ethsys_regs"; dummy = userlib::ulog::hex32(dummy_reg),
+                       clk0 = userlib::ulog::hex32(clk_cfg0), clk1 = userlib::ulog::hex32(clk_cfg1));
+
+                self.ethsys = Some(es);
+            }
+            None => {
+                uwarn!("ethd", "ethsys_mmio_failed"; base = userlib::ulog::hex64(ETHSYS_BASE));
+            }
+        }
+
+        // Map Pinctrl (GPIO) for LED pin muxing
+        match MmioRegion::open(PINCTRL_BASE, PINCTRL_SIZE) {
+            Some(pc) => {
+                uinfo!("ethd", "pinctrl_mmio_ok"; base = userlib::ulog::hex64(PINCTRL_BASE));
+                self.pinctrl = Some(pc);
+            }
+            None => {
+                uwarn!("ethd", "pinctrl_mmio_failed"; base = userlib::ulog::hex64(PINCTRL_BASE));
+            }
+        }
+
+        // MT7988 SRAM is at separate address 0x15400000 (NOT FE_BASE + 0x40000!)
+        // Reference: linux/arch/arm64/boot/dts/mediatek/mt7988a.dtsi
+        // NOTE: SRAM may require specific clocks to be enabled - Linux enables ~20 clocks!
+        if USE_SRAM_FOR_RINGS {
+            match MmioRegion::open(SRAM_BASE, SRAM_SIZE) {
+                Some(sr) => {
+                    uinfo!("ethd", "sram_mmio_ok"; base = userlib::ulog::hex64(SRAM_BASE));
+
+                    // Test SRAM write capability at the correct address
+                    let test_before = sr.read32(0);
+                    sr.write32(0, 0xCAFEBABE);
+                    let test_after = sr.read32(0);
+                    uinfo!("ethd", "sram_real_test"; before = userlib::ulog::hex32(test_before),
+                           wrote = userlib::ulog::hex32(0xCAFEBABE), after = userlib::ulog::hex32(test_after));
+
+                    if test_after == 0xCAFEBABE {
+                        uinfo!("ethd", "sram_working";);
+                        self.sram_vaddr = sr.virt_base();
+                        self.sram_paddr = SRAM_BASE;
+                        // Keep the mapping alive by storing handle (handled via Drop)
+                        core::mem::forget(sr);  // Leak the handle to keep mapping
+                    } else {
+                        uerror!("ethd", "sram_write_failed"; reason = "clocks_not_enabled?");
+                        // Fall back to DMA memory
+                    }
+                }
+                None => {
+                    uerror!("ethd", "sram_mmio_failed"; base = userlib::ulog::hex64(SRAM_BASE));
+                }
+            }
+        }
+
+        uinfo!("ethd", "sram_config";
+               use_sram = if USE_SRAM_FOR_RINGS && self.sram_vaddr != 0 { 1u32 } else { 0u32 },
+               paddr = userlib::ulog::hex64(if self.sram_vaddr != 0 { self.sram_paddr } else { 0 }));
+
+        // Allocate DMA pool for data buffers (8MB: 4MB TX + 4MB RX)
+        // Descriptor rings go to SRAM, only buffers go to DMA pool
+        // Use streaming (cacheable) or coherent (non-cacheable) mode based on config
+        let mut dma = if USE_STREAMING_DMA {
+            uinfo!("ethd", "dma_mode"; mode = "streaming");
+            DmaPool::alloc_streaming(DMA_POOL_SIZE)
+        } else {
+            uinfo!("ethd", "dma_mode"; mode = "coherent");
+            DmaPool::alloc(DMA_POOL_SIZE)
+        }.ok_or_else(|| {
+            uerror!("ethd", "dma_failed"; size = DMA_POOL_SIZE as u64);
             BusError::Internal
         })?;
         dma.zero();
 
-        // Log DMA pool address - critical for 36-bit DMA debugging
-        // If paddr > 0xFFFFFFFF, the high bits MUST be set in descriptors
-        let dma_paddr = dma.paddr();
-        let dma_hi = (dma_paddr >> 32) as u32;  // Should be non-zero if >4GB
-        uinfo!("ethd", "dma_pool"; size = DMA_POOL_SIZE as u32, paddr = userlib::ulog::hex64(dma_paddr), hi32 = userlib::ulog::hex32(dma_hi));
-
+        let paddr = dma.paddr();
+        uinfo!("ethd", "dma_pool";
+               paddr = userlib::ulog::hex64(paddr),
+               size_mb = (DMA_POOL_SIZE / (1024 * 1024)) as u32);
         self.dma = Some(dma);
 
-        // Linux order from mtk_hw_init (corrected after finding clock setup):
-        // 0. mtk_clk_enable() - enables clocks via ETHSYS+0x30 (via clock framework)
-        // 1. DMA_AG_MAP (line 4103-4105) - ETHSYS+0x408
-        // 2. msleep(100) (line 4125)
-        // 3. Reset sequence (mtk_hw_reset)
+        // Initialize hardware (U-Boot style)
+        self.eth_start();
 
-        // Step 0: Enable clocks FIRST! Without this, registers may not respond.
-        // Linux does this via mtk_clk_enable() which goes through clock framework
-        // to write ETHSYS+0x30 (clock gate register)
-        self.enable_clocks();
-
-        // Step 1: Initialize DMA address generation (before reset!)
-        // This is at ETHSYS_BASE+0x408, enables PDMA/QDMA/PPE address generation
-        self.init_dma_ag_map();
-
-        // Step 2: 100ms delay before reset (Linux mtk_hw_init:4125)
-        delay_us(100_000);
-
-        // Step 3: Reset Frame Engine
-        self.reset_fe();
-
-        // 6. Configure GDM1 (forward RX to PDMA)
-        self.configure_gdm();
-
-        // 6. Configure MAC (GMAC1)
-        self.configure_mac();
-
-        // 7. Initialize MT7531 switch and internal PHYs
-        self.init_switch();
-
-        // 8. Wait for DMA to be idle before ring init (Linux mtk_dma_busy_wait)
-        if !self.dma_busy_wait() {
-            uerror!("ethd", "dma_busy_wait_failed";);
-            // Continue anyway - may work
-        }
-
-        // 9. Initialize TX ring (QDMA)
-        self.init_tx_ring();
-
-        // 9. Initialize free queue (required by QDMA)
-        self.init_free_queue();
-
-        // 10. Initialize QDMA RX ring (for TX completion feedback - Linux does this)
-        self.init_qdma_rx_ring();
-
-        // 11. Initialize RX ring (PDMA)
-        self.init_rx_ring();
-
-        // 11. Enable DMA
-        self.enable_dma();
-
-        // 12. Create DataPort for network I/O
+        // Create DataPort
         let config = BlockPortConfig {
             ring_size: 64,
             side_size: 4,
             pool_size: 128 * 1024,
         };
         let port_id = ctx.create_block_port(config).map_err(|e| {
-            uerror!("ethd", "create_block_port_failed";);
+            uerror!("ethd", "port_failed";);
             e
         })?;
+        // Make port publicly accessible so ipd can connect
         if let Some(port) = ctx.block_port(port_id) {
             port.set_public();
         }
         self.port_id = Some(port_id);
 
-        // 13. Register with devd
+        // Register as net0
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
         let _ = ctx.register_port_with_metadata(b"net0", PortType::Network, shmem_id, None, &self.mac);
+        uinfo!("ethd", "registered"; name = "net0");
 
-        let mac_str = self.format_mac();
-        uinfo!("ethd", "ready"; mac = core::str::from_utf8(&mac_str).unwrap_or("?"));
-
-        // 14. Start RX poll timer
+        // Start RX poll timer (10ms)
         if let Ok(mut timer) = Timer::new() {
-            let _ = timer.set(RX_POLL_INTERVAL_NS);
+            let _ = timer.set(10_000_000);  // 10ms in ns
             let handle = timer.handle();
-            let _ = ctx.watch_handle(handle, TAG_RX_POLL);
-            self.rx_poll_timer = Some(timer);
+            let _ = ctx.watch_handle(handle, self.poll_tag);
+            self.poll_timer = Some(timer);
         }
 
+        uinfo!("ethd", "init_complete";);
         Ok(())
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         match msg.msg_type {
             bus_msg::QUERY_INFO => {
-                let mac_str = self.format_mac();
-                let mut info = [0u8; 128];
-                let mut pos = 0;
-                let prefix = b"mt7988-eth mac=";
-                info[..prefix.len()].copy_from_slice(prefix);
-                pos += prefix.len();
-                info[pos..pos + mac_str.len()].copy_from_slice(&mac_str);
-                pos += mac_str.len();
-                let link_str: &[u8] = if self.link_up { b" link=up" } else { b" link=down" };
-                info[pos..pos + link_str.len()].copy_from_slice(link_str);
-                pos += link_str.len();
-                let _ = ctx.respond_info(msg.seq_id, &info[..pos]);
+                // Format: "net0 LINK=up/down"
+                let mut info = [0u8; 64];
+                let status_str = if self.link_up {
+                    b"net0 LINK=up" as &[u8]
+                } else {
+                    b"net0 LINK=down" as &[u8]
+                };
+                info[..status_str.len()].copy_from_slice(status_str);
+                let _ = ctx.respond_info(msg.seq_id, &info[..status_str.len()]);
                 Disposition::Handled
             }
             _ => Disposition::Forward,
         }
     }
 
-    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        if self.port_id != Some(port) {
-            return;
-        }
-
-        // Process TX requests from consumer
+    fn data_ready(&mut self, _port: PortId, ctx: &mut dyn BusCtx) {
+        uinfo!("ethd", "data_ready";);
         self.process_tx(ctx);
-
-        // Check for received packets
-        self.poll_rx(ctx);
-
-        // Reclaim completed TX descriptors
-        self.poll_tx_completions();
-
-        // Handle sidechannel queries
         self.handle_side_queries(ctx);
     }
 
     fn handle_event(&mut self, tag: u32, _handle: Handle, ctx: &mut dyn BusCtx) {
-        if tag == TAG_RX_POLL {
-            // Read timer to clear fired state
-            if let Some(ref mut timer) = self.rx_poll_timer {
-                let _ = timer.wait();
+        if tag == self.poll_tag {
+            self.poll_rx(ctx);
+            self.handle_side_queries(ctx);
+
+            // Every 100 polls (~1 second), dump TX descriptor state and MIB counters
+            self.poll_count += 1;
+            if self.poll_count % 100 == 0 {
+                if self.sram_vaddr != 0 {
+                    let tx_ring_vaddr = self.sram_vaddr + SRAM_TX_RING_OFF as u64;
+                    let dtx = self.pdma_read(tx_dtx_idx_reg(0));
+                    let ctx_idx = self.pdma_read(tx_ctx_idx_reg(0));
+
+                    // Read txd2 of first 8 descriptors to see DDONE state (sample only, ring is 2048)
+                    let mut ddone_bits = 0u32;
+                    for i in 0..8 {
+                        let txd2 = unsafe {
+                            let txd = &*((tx_ring_vaddr + (i * TX_DESC_SIZE) as u64) as *const TxDescV2);
+                            txd.txd2
+                        };
+                        if txd2 & PDMA_TXD2_DDONE != 0 {
+                            ddone_bits |= 1 << i;
+                        }
+                    }
+                    uinfo!("ethd", "tx_status"; dtx = dtx, ctx = ctx_idx, ddone_mask = userlib::ulog::hex32(ddone_bits), poll = self.poll_count);
+                }
+
+                // Read switch MIB counters for ALL ports (0-6)
+                // MIB base = 0x4000, per-port = port * 0x100
+                // TX counters: 0x00=TxDrop, 0x04=TxCRC, 0x08=TxUnicast, 0x0C=TxMulticast, 0x10=TxBroadcast
+                //              0x24=TxOctets_lo, 0x28=TxOctets_hi
+                // RX counters: 0x50=RxDrop, 0x54=RxFiltering, 0x58=RxUnicast, 0x5C=RxMulticast, 0x60=RxBroadcast
+                //              0x80=RxOctets_lo, 0x84=RxOctets_hi
+                for port in 0..7u32 {
+                    let mib_base = 0x4000 + port * 0x100;
+                    let tx_oct = self.gsw_read(mib_base + 0x24);  // TX bytes (low 32 bits)
+                    let rx_oct = self.gsw_read(mib_base + 0x80);  // RX bytes (low 32 bits)
+                    let tx_uni = self.gsw_read(mib_base + 0x08);
+                    let tx_bcast = self.gsw_read(mib_base + 0x10);
+                    let rx_uni = self.gsw_read(mib_base + 0x58);
+                    let rx_bcast = self.gsw_read(mib_base + 0x60);
+                    let tx_drop = self.gsw_read(mib_base + 0x00);
+                    let rx_drop = self.gsw_read(mib_base + 0x50);
+                    uinfo!("ethd", "mib"; port = port,
+                           tx_oct = tx_oct, rx_oct = rx_oct,
+                           tx_u = tx_uni, tx_b = tx_bcast,
+                           rx_u = rx_uni, rx_b = rx_bcast,
+                           tx_drop = tx_drop, rx_drop = rx_drop);
+                }
+
+                // Check PHY link status on all 4 ports
+                let mut link_mask = 0u32;
+                for phy in 0..4u8 {
+                    if let Some(status) = self.mdio_read(phy, 1) {  // BMSR
+                        if (status & 0x04) != 0 {  // Link bit
+                            link_mask |= 1 << phy;
+                        }
+                    }
+                }
+                uinfo!("ethd", "phy_links"; mask = userlib::ulog::hex32(link_mask));
+
+                // Read FE status registers to debug packet path
+                // PSE buffer status, GDM counters
+                let pse_fq = self.fe_read(0x100);  // PSE_FQFC_CFG - free queue config
+                let pse_drop = self.fe_read(0x108); // PSE drop config
+                let pse_oqc = self.fe_read(0x1b0);  // PSE_OQ_STA - output queue status
+
+                // GDM counters for NETSYS V3 (MT7988) - base at 0x1c00
+                // Reference: Linux mtk_eth_soc.c: .gdm1_cnt = 0x1c00, MTK_STAT_OFFSET = 0x40
+                const GDM_CNT_BASE: u32 = 0x1c00;
+
+                // Dump all 3 GMACs counters
+                for gmac in 0..3u32 {
+                    let offs = gmac * 0x40;  // MTK_STAT_OFFSET
+                    let rx_bytes = self.fe_read(GDM_CNT_BASE + offs + 0x00);
+                    let rx_pkts = self.fe_read(GDM_CNT_BASE + offs + 0x08);
+                    let tx_bytes = self.fe_read(GDM_CNT_BASE + offs + 0x40);
+                    let tx_pkts = self.fe_read(GDM_CNT_BASE + offs + 0x44);
+                    let drop = self.fe_read(GDM_CNT_BASE + offs + 0x54);
+                    uinfo!("ethd", "gdm_cnt"; gmac = gmac, rx_b = rx_bytes, rx_p = rx_pkts,
+                           tx_b = tx_bytes, tx_p = tx_pkts, drop = drop);
+                }
+
+                // Dump all 3 GMAC MCR registers
+                for gmac in 0..3u32 {
+                    let mcr = self.fe_read(GMAC_BASE + gmac_port_mcr(gmac));
+                    uinfo!("ethd", "gmac_mcr"; port = gmac, mcr = userlib::ulog::hex32(mcr));
+                }
+
+                // PDMA status
+                let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
+                let pdma_tx_ptr = self.pdma_read(tx_base_ptr_reg(0));
+                let pdma_tx_ctx = self.pdma_read(tx_ctx_idx_reg(0));
+                let pdma_tx_dtx = self.pdma_read(tx_dtx_idx_reg(0));
+                uinfo!("ethd", "pdma_state"; glo = userlib::ulog::hex32(pdma_glo),
+                       tx_ptr = userlib::ulog::hex32(pdma_tx_ptr), ctx = pdma_tx_ctx, dtx = pdma_tx_dtx);
+
+                uinfo!("ethd", "fe_status"; pse_fq = userlib::ulog::hex32(pse_fq), pse_drop = userlib::ulog::hex32(pse_drop),
+                       pse_oq = userlib::ulog::hex32(pse_oqc));
             }
 
-            // Poll RX and reclaim TX
-            self.poll_rx(ctx);
-            self.poll_tx_completions();
-
-            // Re-arm timer
-            if let Some(ref mut timer) = self.rx_poll_timer {
-                let _ = timer.set(RX_POLL_INTERVAL_NS);
+            // Re-arm the timer
+            if let Some(ref mut timer) = self.poll_timer {
+                let _ = timer.set(10_000_000);  // 10ms
             }
         }
     }
 }
 
 // =============================================================================
-// Main
+// Entry Point
 // =============================================================================
 
-static mut DRIVER: EthDriver = EthDriver::new();
-
-#[unsafe(no_mangle)]
-fn main() {
-    let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"ethd", EthDriverWrapper(driver));
-}
+static mut DRIVER: EthDriver = EthDriver {
+    fe: None,
+    sw: None,
+    ethwarp: None,
+    ethsys: None,
+    pinctrl: None,
+    dma: None,
+    sram_vaddr: 0,
+    sram_paddr: 0,
+    buf_vaddr: 0,
+    buf_paddr: 0,
+    tx_idx: 0,
+    rx_idx: 0,
+    port_id: None,
+    poll_timer: None,
+    poll_tag: 1,
+    rx_seq: 0,
+    mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+    link_up: false,
+    gmac_id: 0,             // GMAC0 for internal switch (Linux DTS: gmac0 -> switch port 6)
+    use_bridge_mode: true,  // Default to bridge mode for internal switch
+    poll_count: 0,
+};
 
 struct EthDriverWrapper(&'static mut EthDriver);
 
@@ -2373,16 +2005,19 @@ impl Driver for EthDriverWrapper {
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         self.0.init(ctx)
     }
-
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         self.0.command(msg, ctx)
     }
-
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
         self.0.data_ready(port, ctx)
     }
-
     fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
         self.0.handle_event(tag, handle, ctx)
     }
+}
+
+#[unsafe(no_mangle)]
+fn main() {
+    let driver = unsafe { &mut *(&raw mut DRIVER) };
+    driver_main(b"ethd", EthDriverWrapper(driver));
 }

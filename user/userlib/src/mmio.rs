@@ -156,10 +156,19 @@ impl Drop for MmioRegion {
 // DMA Pool
 // =============================================================================
 
+/// DMA pool flags
+pub mod dma_flags {
+    /// Use high memory pool (>4GB, 36-bit addresses)
+    pub const HIGH: u32 = 1;
+    /// Use streaming (cacheable) memory - requires explicit cache sync
+    pub const STREAMING: u32 = 2;
+}
+
 /// DMA-capable memory pool
 ///
-/// Allocates physically contiguous, non-cacheable memory suitable for DMA.
-/// Use this for USB rings, command buffers, etc.
+/// Allocates physically contiguous memory suitable for DMA.
+/// By default uses non-cacheable (coherent) memory. Use `alloc_streaming()`
+/// for cacheable memory that requires explicit cache synchronization.
 pub struct DmaPool {
     handle: Handle,
     vaddr: u64,
@@ -171,7 +180,7 @@ impl DmaPool {
     /// Allocate a DMA pool of the given size (low memory, < 4GB)
     ///
     /// Returns None if allocation fails.
-    /// The memory is physically contiguous and non-cacheable.
+    /// The memory is physically contiguous and non-cacheable (coherent).
     pub fn alloc(size: usize) -> Option<Self> {
         Self::alloc_inner(size, 0)
     }
@@ -182,12 +191,24 @@ impl DmaPool {
     /// Use for buffers whose hardware fields support 36-bit addresses.
     /// Descriptors with 32-bit BASE fields must use `alloc()` instead.
     pub fn alloc_high(size: usize) -> Option<Self> {
-        Self::alloc_inner(size, 1)
+        Self::alloc_inner(size, dma_flags::HIGH)
+    }
+
+    /// Allocate a streaming DMA pool (cacheable memory)
+    ///
+    /// Returns None if allocation fails.
+    /// The memory is cacheable for better CPU performance, but requires
+    /// explicit cache synchronization before/after DMA transfers:
+    /// - Before DMA read (device writes): `cache_invalidate()`
+    /// - Before DMA write (device reads): `cache_clean()`
+    pub fn alloc_streaming(size: usize) -> Option<Self> {
+        Self::alloc_inner(size, dma_flags::STREAMING)
     }
 
     fn alloc_inner(size: usize, flags: u32) -> Option<Self> {
         // Build params: u64 size, u32 flags (16 bytes)
         // flags bit 0: 1 = high memory pool, 0 = low memory pool
+        // flags bit 1: 1 = streaming (cacheable), 0 = coherent (non-cacheable)
         let mut params = [0u8; 16];
         params[0..8].copy_from_slice(&(size as u64).to_le_bytes());
         params[8..12].copy_from_slice(&flags.to_le_bytes());
@@ -429,4 +450,109 @@ where
     }
     crate::println!("poll_interval '{}' timeout after {}ms", label, timeout_ms);
     false
+}
+
+// =============================================================================
+// Cache Synchronization for Streaming DMA
+// =============================================================================
+
+/// Cache line size for AArch64 (64 bytes)
+const CACHE_LINE_SIZE: usize = 64;
+
+/// Clean cache to Point of Coherency (flush dirty data to RAM)
+///
+/// Use before DMA write (device reads from memory):
+/// 1. CPU writes data to buffer
+/// 2. `cache_clean(buffer)` - ensures data is in RAM
+/// 3. Start DMA transfer
+#[inline]
+pub fn cache_clean(addr: u64, size: usize) {
+    let start = addr & !(CACHE_LINE_SIZE as u64 - 1);
+    let end = addr + size as u64;
+    let mut current = start;
+    while current < end {
+        unsafe {
+            // DC CVAC: Clean data cache by VA to Point of Coherency
+            core::arch::asm!(
+                "dc cvac, {addr}",
+                addr = in(reg) current,
+                options(nostack, preserves_flags)
+            );
+        }
+        current += CACHE_LINE_SIZE as u64;
+    }
+    unsafe {
+        // DSB SY: Ensure all cache maintenance operations complete
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Invalidate cache lines (discard cached data, force re-read from RAM)
+///
+/// Use after DMA read (device writes to memory):
+/// 1. Start DMA transfer
+/// 2. Wait for DMA completion
+/// 3. `cache_invalidate(buffer)` - discard stale cache data
+/// 4. CPU reads fresh data from buffer
+///
+/// Note: Uses DC CIVAC (clean+invalidate) because DC IVAC requires EL1.
+/// This is safe for DMA RX buffers since CPU hasn't written to them.
+#[inline]
+pub fn cache_invalidate(addr: u64, size: usize) {
+    let start = addr & !(CACHE_LINE_SIZE as u64 - 1);
+    let end = addr + size as u64;
+    let mut current = start;
+    while current < end {
+        unsafe {
+            // DC CIVAC: Clean and Invalidate - available at EL0
+            // (DC IVAC requires EL1 privilege)
+            core::arch::asm!(
+                "dc civac, {addr}",
+                addr = in(reg) current,
+                options(nostack, preserves_flags)
+            );
+        }
+        current += CACHE_LINE_SIZE as u64;
+    }
+    unsafe {
+        // DSB SY: Ensure all cache maintenance operations complete
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Clean and invalidate cache lines (flush to RAM, then discard)
+///
+/// Use for bidirectional DMA or when unsure:
+/// - Ensures dirty data is written to RAM
+/// - Then discards the cache line so next read comes from RAM
+#[inline]
+pub fn cache_clean_invalidate(addr: u64, size: usize) {
+    let start = addr & !(CACHE_LINE_SIZE as u64 - 1);
+    let end = addr + size as u64;
+    let mut current = start;
+    while current < end {
+        unsafe {
+            // DC CIVAC: Clean and Invalidate data cache by VA to Point of Coherency
+            core::arch::asm!(
+                "dc civac, {addr}",
+                addr = in(reg) current,
+                options(nostack, preserves_flags)
+            );
+        }
+        current += CACHE_LINE_SIZE as u64;
+    }
+    unsafe {
+        // DSB SY: Ensure all cache maintenance operations complete
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Memory barrier - ensure all memory accesses complete before continuing
+///
+/// Use between CPU writes and DMA operations to ensure ordering.
+#[inline]
+pub fn memory_barrier() {
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
 }

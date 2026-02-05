@@ -167,6 +167,20 @@ impl MapFlags {
             device: true,
         }
     }
+
+    /// Streaming DMA mapping (cacheable, no zeroing)
+    /// Use this for DMA data buffers that require explicit cache management.
+    /// Unlike coherent DMA (shmem_map), this uses normal cacheable memory
+    /// which provides better performance but requires cache sync operations.
+    pub const fn streaming_dma() -> Self {
+        Self {
+            writable: true,
+            executable: false,
+            zero: false,        // Data already initialized
+            flush_cache: false, // Manual cache sync via userspace
+            device: false,      // Cacheable (NORMAL attribute)
+        }
+    }
 }
 
 // ============================================================================

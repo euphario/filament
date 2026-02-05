@@ -62,17 +62,18 @@ pub const KERNEL_PHYS_BASE: usize = 0x4600_0000;
 /// This is safe since kernel loads at 0x46000000, far above this region
 pub const DMA_POOL_BASE: u64 = 0x4010_0000;
 
-/// DMA pool size (4MB - enough for MT7996 descriptor rings + TX buffers)
-pub const DMA_POOL_SIZE: usize = 4 * 1024 * 1024;
+/// DMA pool size (32MB - ethernet needs ~17MB for Linux-sized rings)
+pub const DMA_POOL_SIZE: usize = 32 * 1024 * 1024;
 
 /// High DMA pool base address (above 4GB, for 36-bit buffer addresses)
 /// This is ~3GB into DRAM (0x40000000 + 0xC0000000 = 0x100000000)
 /// Linux uses addresses like 0x1020c7490 for TX buffers
 pub const DMA_POOL_HIGH_BASE: u64 = 0x1_0010_0000;
 
-/// High DMA pool size (16MB for TX/RX buffers)
-/// MT7996 needs: descriptors(256KB) + RX(13MB) + FWDL_TX(512KB) + MCU_TX(1MB) ≈ 15MB
-pub const DMA_POOL_HIGH_SIZE: usize = 16 * 1024 * 1024;
+/// High DMA pool size (32MB for TX/RX buffers)
+/// Ethernet driver needs: 4 rings * 2048 desc * 2KB buffers = ~16MB
+/// Plus descriptors and other drivers
+pub const DMA_POOL_HIGH_SIZE: usize = 32 * 1024 * 1024;
 
 // =============================================================================
 // GIC-600 (ARM CoreLink GIC-600)
