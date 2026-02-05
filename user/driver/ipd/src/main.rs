@@ -598,6 +598,7 @@ impl IpdDriver {
 
     fn ipd_config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
         match key {
+            b"" => self.format_summary(buf),
             b"net.ip" => format_ip(buf, self.assigned_ip),
             b"net.prefix" => format_u64(self.assigned_prefix as u64, buf),
             b"net.gateway" => format_ip(buf, self.assigned_gateway),
@@ -624,6 +625,47 @@ impl IpdDriver {
             }
             _ => 0,
         }
+    }
+
+    fn format_summary(&self, buf: &mut [u8]) -> usize {
+        use core::fmt::Write;
+        struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+        impl Write for BufWriter<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let remaining = self.buf.len() - self.pos;
+                let to_write = bytes.len().min(remaining);
+                self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
+                self.pos += to_write;
+                Ok(())
+            }
+        }
+        let mut w = BufWriter { buf, pos: 0 };
+
+        let state = match self.ip_state {
+            IpState::Unconfigured => "unconfigured",
+            IpState::DhcpConfigured => "dhcp",
+            IpState::StaticFallback => "static_fallback",
+            IpState::StaticConfigured => "static",
+        };
+        let dhcp = match self.ip_state {
+            IpState::DhcpConfigured | IpState::Unconfigured => "on",
+            IpState::StaticFallback | IpState::StaticConfigured => "off",
+        };
+
+        let _ = core::write!(w,
+            "net.ip={}.{}.{}.{}\n\
+             net.prefix={}\n\
+             net.gateway={}.{}.{}.{}\n\
+             net.dhcp={}\n\
+             net.state={}\n",
+            self.assigned_ip[0], self.assigned_ip[1], self.assigned_ip[2], self.assigned_ip[3],
+            self.assigned_prefix,
+            self.assigned_gateway[0], self.assigned_gateway[1], self.assigned_gateway[2], self.assigned_gateway[3],
+            dhcp,
+            state
+        );
+        w.pos
     }
 
     fn ipd_config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
