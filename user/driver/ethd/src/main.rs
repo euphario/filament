@@ -177,6 +177,99 @@ const USE_SRAM_FOR_RINGS: bool = false;  // DMA can't access SRAM - use regular 
 // Set to false for production (reduces log spam significantly).
 const DEBUG_VERBOSE: bool = false;
 
+// QDMA vs PDMA for TX
+// Linux uses QDMA for TX with a free queue (FQ) for automatic buffer recycling.
+// U-Boot uses PDMA for simplicity. QDMA provides better throughput for high-load scenarios.
+// Set to true to use QDMA (Linux style), false to use PDMA (U-Boot style, current default).
+const USE_QDMA: bool = false;
+
+// =============================================================================
+// QDMA Register Map (MT7988 / NETSYS V3)
+// Reference: Linux mtk_eth_soc.c mt7988_reg_map
+// =============================================================================
+
+const QDMA_BASE: u32 = 0x4400;  // QDMA register base offset from FE_BASE
+
+// QDMA TX scheduling
+const QDMA_QTX_CFG: u32 = 0x4400;
+const QDMA_QTX_SCH: u32 = 0x4404;
+
+// QDMA RX (not used - we use PDMA for RX)
+const QDMA_RX_PTR: u32 = 0x4500;
+const QDMA_RX_CNT_CFG: u32 = 0x4504;
+const QDMA_QCRX_PTR: u32 = 0x4508;
+
+// QDMA global config
+const QDMA_GLO_CFG: u32 = 0x4604;
+const QDMA_RST_IDX: u32 = 0x4608;
+const QDMA_DELAY_IRQ: u32 = 0x460c;
+const QDMA_FC_TH: u32 = 0x4610;
+const QDMA_INT_GRP: u32 = 0x4620;
+const QDMA_HRED: u32 = 0x4644;
+
+// QDMA TX ring pointers
+const QDMA_CTX_PTR: u32 = 0x4700;  // TX CPU pointer (where CPU writes)
+const QDMA_DTX_PTR: u32 = 0x4704;  // TX DMA pointer (where HW reads)
+const QDMA_CRX_PTR: u32 = 0x4710;  // RX CPU pointer
+const QDMA_DRX_PTR: u32 = 0x4714;  // RX DMA pointer
+
+// QDMA Free Queue (FQ) - scratch memory for QDMA internal buffer management
+const QDMA_FQ_HEAD: u32 = 0x4720;
+const QDMA_FQ_TAIL: u32 = 0x4724;
+const QDMA_FQ_COUNT: u32 = 0x4728;
+const QDMA_FQ_BLEN: u32 = 0x472c;
+
+// QDMA TX scheduling rate
+const QDMA_TX_SCH_RATE: u32 = 0x4798;
+
+// QDMA GLO_CFG bits (same as PDMA)
+const QDMA_TX_DMA_EN: u32 = 1 << 0;
+const QDMA_TX_DMA_BUSY: u32 = 1 << 1;
+const QDMA_RX_DMA_EN: u32 = 1 << 2;
+const QDMA_RX_DMA_BUSY: u32 = 1 << 3;
+const QDMA_TX_WB_DDONE: u32 = 1 << 6;
+
+// QDMA flow control threshold bits
+const QDMA_FC_THRES_DROP_MODE: u32 = 1 << 21;
+const QDMA_FC_THRES_DROP_EN: u32 = 1 << 20;
+const QDMA_FC_THRES_MIN: u32 = 0x4444;  // Linux default
+
+// QDMA descriptor bits (V2 format)
+// Different from PDMA! QDMA uses txd2 as NEXT POINTER (linked list), not for length/flags.
+// txd1: buffer physical address (low 32 bits)
+// txd2: next descriptor physical address (linked list pointer)
+// txd3: TX_DMA_PLEN0 | TX_DMA_LS0 | TX_DMA_OWNER_CPU
+// txd4: FPORT | TX_DMA_SWC_V2 | QID
+// txd5-8: optional features (TSO, checksum, VLAN)
+
+// txd3 bits for QDMA V2
+const QDMA_TX_DMA_LS0: u32 = 1 << 28;        // Last segment (Linux: TX_DMA_LS0)
+const QDMA_TX_DMA_OWNER_CPU: u32 = 1 << 31;  // CPU owns descriptor (Linux: TX_DMA_OWNER_CPU)
+
+// For MT7988 (NETSYS V3): dma_max_len = 0xFFFF, dma_len_offset = 8
+// TX_DMA_PLEN0(x) = (x & dma_max_len) << dma_len_offset
+const fn qdma_tx_plen0(len: u32) -> u32 { (len & 0xFFFF) << 8 }
+
+// txd4 bits for QDMA V2
+const QDMA_TX_DMA_FPORT_SHIFT: u32 = 8;  // TX_DMA_FPORT_SHIFT_V2
+const QDMA_TX_DMA_SWC: u32 = 1 << 30;    // TX_DMA_SWC_V2 (switch control)
+const fn qdma_tx_fport(port: u32) -> u32 { port << QDMA_TX_DMA_FPORT_SHIFT }
+
+// PSE port numbers (from Linux mtk_eth_soc.h enum mtk_pse_port)
+const PSE_GDM1_PORT: u32 = 1;
+const PSE_GDM2_PORT: u32 = 2;
+const PSE_GDM3_PORT: u32 = 15;
+
+// FQ sizes (from Linux)
+const QDMA_PAGE_SIZE: usize = 2048;  // MTK_QDMA_PAGE_SIZE
+const QDMA_FQ_DMA_SIZE: usize = 4096;  // MTK_DMA_SIZE(4K) for MT7988 FQ
+const QDMA_TX_RING_SIZE: usize = 2048;  // MTK_QDMA_RING_SIZE
+
+// QDMA scheduling constants
+const QDMA_RES_THRES: u32 = 4;  // From Linux
+const QDMA_NUM_QUEUES: usize = 16;  // MTK_QDMA_NUM_QUEUES
+const QDMA_QTX_OFFSET: usize = 0x10;  // MTK_QTX_OFFSET
+
 // Legacy offsets for compatibility (will be removed)
 const TX_RING_OFF: usize = 0;
 const RX_RING_OFF: usize = TX_RING_SIZE;
@@ -253,6 +346,14 @@ struct EthDriver {
 
     // Debug
     poll_count: u32,
+
+    // QDMA state (when USE_QDMA is true)
+    // FQ = Free Queue (scratch memory for QDMA internal buffer management)
+    // TX ring is separate from FQ
+    qdma_fq_paddr: u64,      // FQ ring physical address
+    qdma_fq_count: usize,    // Number of FQ descriptors
+    qdma_tx_paddr: u64,      // TX ring physical address
+    qdma_tx_next: u32,       // Next TX descriptor to fill (physical addr)
 }
 
 impl EthDriver {
@@ -273,6 +374,25 @@ impl EthDriver {
     fn pdma_rmw(&self, reg: u32, clr: u32, set: u32) {
         let val = self.pdma_read(reg);
         self.pdma_write(reg, (val & !clr) | set);
+    }
+
+    // =========================================================================
+    // QDMA Register Access (Linux mtk_eth_soc pattern)
+    // =========================================================================
+
+    fn qdma_write(&self, reg: u32, val: u32) {
+        if let Some(fe) = &self.fe {
+            fe.write32(reg as usize, val);
+        }
+    }
+
+    fn qdma_read(&self, reg: u32) -> u32 {
+        self.fe.as_ref().map(|fe| fe.read32(reg as usize)).unwrap_or(0)
+    }
+
+    fn qdma_rmw(&self, reg: u32, clr: u32, set: u32) {
+        let val = self.qdma_read(reg);
+        self.qdma_write(reg, (val & !clr) | set);
     }
 
     fn gdma_write(&self, gmac_id: u32, reg: u32, val: u32) {
@@ -929,17 +1049,34 @@ impl EthDriver {
             cache_clean(rx_ring_vaddr, RX_RING_SIZE);
         }
 
-        // Set up PDMA registers
-        self.pdma_write(tx_base_ptr_reg(0), tx_ring_paddr as u32);
-        self.pdma_write(tx_max_cnt_reg(0), NUM_TX_DESC as u32);
-        self.pdma_write(tx_ctx_idx_reg(0), 0);
+        if USE_QDMA {
+            // QDMA TX + PDMA RX (Linux pattern)
+            // Initialize QDMA Free Queue and TX ring
+            self.qdma_init_fq();
+            self.qdma_init_tx_ring();
 
-        self.pdma_write(rx_base_ptr_reg(0), rx_ring_paddr as u32);
-        self.pdma_write(rx_max_cnt_reg(0), NUM_RX_DESC as u32);
-        self.pdma_write(rx_crx_idx_reg(0), (NUM_RX_DESC - 1) as u32);
+            // Still set up PDMA RX (Linux uses PDMA for RX even with QDMA TX)
+            self.pdma_write(rx_base_ptr_reg(0), rx_ring_paddr as u32);
+            self.pdma_write(rx_max_cnt_reg(0), NUM_RX_DESC as u32);
+            self.pdma_write(rx_crx_idx_reg(0), (NUM_RX_DESC - 1) as u32);
 
-        // Reset DMA indices
-        self.pdma_write(PDMA_RST_IDX_REG, RST_DTX_IDX0 | RST_DRX_IDX0);
+            // Reset RX DMA index only (TX is handled by QDMA)
+            self.pdma_write(PDMA_RST_IDX_REG, RST_DRX_IDX0);
+
+            uinfo!("ethd", "fifo_init_qdma"; mode = "qdma_tx_pdma_rx");
+        } else {
+            // PDMA for both TX and RX (U-Boot pattern)
+            self.pdma_write(tx_base_ptr_reg(0), tx_ring_paddr as u32);
+            self.pdma_write(tx_max_cnt_reg(0), NUM_TX_DESC as u32);
+            self.pdma_write(tx_ctx_idx_reg(0), 0);
+
+            self.pdma_write(rx_base_ptr_reg(0), rx_ring_paddr as u32);
+            self.pdma_write(rx_max_cnt_reg(0), NUM_RX_DESC as u32);
+            self.pdma_write(rx_crx_idx_reg(0), (NUM_RX_DESC - 1) as u32);
+
+            // Reset DMA indices
+            self.pdma_write(PDMA_RST_IDX_REG, RST_DTX_IDX0 | RST_DRX_IDX0);
+        }
 
         // Verify configuration
         let verify_tx_base = self.pdma_read(tx_base_ptr_reg(0));
@@ -992,6 +1129,269 @@ impl EthDriver {
                        rxd2 = userlib::ulog::hex32(rxd2));
             }
         }
+    }
+
+    // =========================================================================
+    // QDMA Initialization (Linux mtk_eth_soc: mtk_init_fq_dma + mtk_tx_alloc)
+    // =========================================================================
+
+    /// Initialize QDMA Free Queue (FQ) - scratch memory for QDMA internal buffer management.
+    /// This is called from fifo_init() when USE_QDMA is true.
+    /// Reference: Linux mtk_init_fq_dma()
+    fn qdma_init_fq(&mut self) {
+        // FQ is a linked list of descriptors, each pointing to a scratch buffer.
+        // QDMA uses FQ for temporary storage during packet processing.
+        // For simplicity, we use a smaller FQ than Linux (64 entries vs 4096).
+
+        let dma = match &self.dma {
+            Some(d) => d,
+            None => return,
+        };
+
+        // FQ layout in DMA pool (after PDMA rings and buffers):
+        // - FQ descriptors: 64 * 32 bytes = 2KB
+        // - FQ buffers: 64 * 2048 bytes = 128KB
+        const FQ_NUM_DESCS: usize = 64;
+        const FQ_DESC_TOTAL_SIZE: usize = FQ_NUM_DESCS * TX_DESC_SIZE;
+        const FQ_BUF_TOTAL_SIZE: usize = FQ_NUM_DESCS * QDMA_PAGE_SIZE;
+
+        // Offset in DMA pool (after PDMA rings + buffers)
+        let fq_ring_off = DMA_POOL_SIZE;  // Start after existing allocations
+        let fq_buf_off = fq_ring_off + FQ_DESC_TOTAL_SIZE;
+
+        let fq_ring_vaddr = dma.vaddr() + fq_ring_off as u64;
+        let fq_ring_paddr = dma.paddr() + fq_ring_off as u64;
+        let fq_buf_paddr = dma.paddr() + fq_buf_off as u64;
+
+        // Zero FQ descriptors
+        unsafe {
+            core::ptr::write_bytes(fq_ring_vaddr as *mut u8, 0, FQ_DESC_TOTAL_SIZE);
+        }
+
+        // Initialize FQ descriptors (linked list)
+        for i in 0..FQ_NUM_DESCS {
+            let desc_vaddr = fq_ring_vaddr + (i * TX_DESC_SIZE) as u64;
+            let buf_paddr = fq_buf_paddr + (i * QDMA_PAGE_SIZE) as u64;
+            let next_desc_paddr = if i < FQ_NUM_DESCS - 1 {
+                fq_ring_paddr + ((i + 1) * TX_DESC_SIZE) as u64
+            } else {
+                0  // Last descriptor, no next
+            };
+
+            unsafe {
+                let txd = desc_vaddr as *mut TxDescV2;
+                // txd1 = buffer physical address
+                core::ptr::write_volatile(&mut (*txd).txd1, buf_paddr as u32);
+                // txd2 = next descriptor physical address (linked list)
+                core::ptr::write_volatile(&mut (*txd).txd2, next_desc_paddr as u32);
+                // txd3 = TX_DMA_PLEN0(QDMA_PAGE_SIZE) - buffer length
+                core::ptr::write_volatile(&mut (*txd).txd3, qdma_tx_plen0(QDMA_PAGE_SIZE as u32));
+                core::ptr::write_volatile(&mut (*txd).txd4, 0);
+                core::ptr::write_volatile(&mut (*txd).txd5, 0);
+                core::ptr::write_volatile(&mut (*txd).txd6, 0);
+                core::ptr::write_volatile(&mut (*txd).txd7, 0);
+                core::ptr::write_volatile(&mut (*txd).txd8, 0);
+            }
+        }
+
+        // Cache clean if streaming DMA
+        if USE_STREAMING_DMA {
+            cache_clean(fq_ring_vaddr, FQ_DESC_TOTAL_SIZE);
+        }
+
+        // Configure FQ registers
+        let fq_tail_paddr = fq_ring_paddr + ((FQ_NUM_DESCS - 1) * TX_DESC_SIZE) as u64;
+        self.qdma_write(QDMA_FQ_HEAD, fq_ring_paddr as u32);
+        self.qdma_write(QDMA_FQ_TAIL, fq_tail_paddr as u32);
+        // fq_count: high 16 bits = total count, low 16 bits = available count
+        self.qdma_write(QDMA_FQ_COUNT, ((FQ_NUM_DESCS as u32) << 16) | (FQ_NUM_DESCS as u32));
+        // fq_blen: buffer length in high 16 bits
+        self.qdma_write(QDMA_FQ_BLEN, (QDMA_PAGE_SIZE as u32) << 16);
+
+        self.qdma_fq_paddr = fq_ring_paddr;
+        self.qdma_fq_count = FQ_NUM_DESCS;
+
+        uinfo!("ethd", "qdma_fq_init";
+               fq_head = userlib::ulog::hex64(fq_ring_paddr),
+               fq_tail = userlib::ulog::hex64(fq_tail_paddr),
+               count = FQ_NUM_DESCS as u32);
+    }
+
+    /// Initialize QDMA TX ring.
+    /// Reference: Linux mtk_tx_alloc() for QDMA
+    fn qdma_init_tx_ring(&mut self) {
+        let dma = match &self.dma {
+            Some(d) => d,
+            None => return,
+        };
+
+        // TX ring layout - use same area as PDMA TX ring for simplicity
+        // (We only use one or the other, never both)
+        let use_sram = USE_SRAM_FOR_RINGS && self.sram_vaddr != 0;
+        let (tx_ring_vaddr, tx_ring_paddr) = if use_sram {
+            (self.sram_vaddr + SRAM_TX_RING_OFF as u64,
+             self.sram_paddr + SRAM_TX_RING_OFF as u64)
+        } else {
+            (dma.vaddr() + DMA_TX_RING_OFF as u64,
+             dma.paddr() + DMA_TX_RING_OFF as u64)
+        };
+
+        // Initialize TX descriptors (circular linked list)
+        for i in 0..NUM_TX_DESC {
+            let desc_vaddr = tx_ring_vaddr + (i * TX_DESC_SIZE) as u64;
+            let next_idx = (i + 1) % NUM_TX_DESC;
+            let next_desc_paddr = tx_ring_paddr + (next_idx * TX_DESC_SIZE) as u64;
+            let buf_paddr = self.buf_paddr + (i * PKTSIZE_ALIGN) as u64;
+
+            unsafe {
+                let txd = desc_vaddr as *mut TxDescV2;
+                // txd1 = buffer address (will be overwritten on each TX)
+                core::ptr::write_volatile(&mut (*txd).txd1, buf_paddr as u32);
+                // txd2 = next descriptor physical address (circular linked list)
+                core::ptr::write_volatile(&mut (*txd).txd2, next_desc_paddr as u32);
+                // txd3 = LS0 | OWNER_CPU (CPU owns descriptor, ready for use)
+                core::ptr::write_volatile(&mut (*txd).txd3, QDMA_TX_DMA_LS0 | QDMA_TX_DMA_OWNER_CPU);
+                core::ptr::write_volatile(&mut (*txd).txd4, 0);
+                core::ptr::write_volatile(&mut (*txd).txd5, 0);
+                core::ptr::write_volatile(&mut (*txd).txd6, 0);
+                core::ptr::write_volatile(&mut (*txd).txd7, 0);
+                core::ptr::write_volatile(&mut (*txd).txd8, 0);
+            }
+        }
+
+        // Cache clean if streaming DMA and not using SRAM
+        if USE_STREAMING_DMA && !use_sram {
+            cache_clean(tx_ring_vaddr, TX_RING_SIZE);
+        }
+
+        // Configure QDMA TX ring registers
+        // ctx_ptr = dtx_ptr = ring base (both start at same place)
+        self.qdma_write(QDMA_CTX_PTR, tx_ring_paddr as u32);
+        self.qdma_write(QDMA_DTX_PTR, tx_ring_paddr as u32);
+        // crx_ptr = drx_ptr = last descriptor (for RX done indication, not used for TX-only)
+        let last_desc_paddr = tx_ring_paddr + ((NUM_TX_DESC - 1) * TX_DESC_SIZE) as u64;
+        self.qdma_write(QDMA_CRX_PTR, last_desc_paddr as u32);
+        self.qdma_write(QDMA_DRX_PTR, last_desc_paddr as u32);
+
+        // Configure TX scheduling (simplified - single queue, max rate)
+        for i in 0..QDMA_NUM_QUEUES {
+            let ofs = i * QDMA_QTX_OFFSET;
+            // QTX_CFG: resource threshold
+            self.qdma_write(QDMA_QTX_CFG + ofs as u32, (QDMA_RES_THRES << 8) | QDMA_RES_THRES);
+            // QTX_SCH: scheduling config (use defaults for now)
+        }
+
+        self.qdma_tx_paddr = tx_ring_paddr;
+        self.qdma_tx_next = tx_ring_paddr as u32;
+
+        uinfo!("ethd", "qdma_tx_init";
+               tx_ring = userlib::ulog::hex64(tx_ring_paddr),
+               ctx_ptr = userlib::ulog::hex32(tx_ring_paddr as u32),
+               num_desc = NUM_TX_DESC as u32);
+    }
+
+    /// Enable QDMA TX DMA engine
+    fn qdma_start(&mut self) {
+        // Read current GLO_CFG
+        let glo = self.qdma_read(QDMA_GLO_CFG);
+        uinfo!("ethd", "qdma_start_before"; glo = userlib::ulog::hex32(glo));
+
+        // Enable TX DMA with write-back done
+        // Note: We don't enable RX DMA here - we still use PDMA for RX (like Linux does)
+        self.qdma_rmw(QDMA_GLO_CFG, 0, QDMA_TX_DMA_EN | QDMA_TX_WB_DDONE);
+
+        let glo_after = self.qdma_read(QDMA_GLO_CFG);
+        uinfo!("ethd", "qdma_start_after"; glo = userlib::ulog::hex32(glo_after));
+    }
+
+    /// Send a packet via QDMA TX.
+    /// Returns true on success, false if TX ring is full.
+    fn qdma_send(&mut self, packet: &[u8]) -> bool {
+        if self.buf_vaddr == 0 {
+            return false;
+        }
+
+        // Get current TX descriptor
+        let use_sram = USE_SRAM_FOR_RINGS && self.sram_vaddr != 0;
+        let tx_ring_vaddr = if use_sram {
+            self.sram_vaddr + SRAM_TX_RING_OFF as u64
+        } else {
+            self.dma.as_ref().map(|d| d.vaddr() + DMA_TX_RING_OFF as u64).unwrap_or(0)
+        };
+        if tx_ring_vaddr == 0 {
+            return false;
+        }
+
+        let desc_vaddr = tx_ring_vaddr + (self.tx_idx * TX_DESC_SIZE) as u64;
+
+        unsafe {
+            let txd = desc_vaddr as *mut TxDescV2;
+
+            // Check if CPU owns this descriptor (OWNER_CPU bit set in txd3)
+            let txd3 = core::ptr::read_volatile(&(*txd).txd3);
+            if (txd3 & QDMA_TX_DMA_OWNER_CPU) == 0 {
+                // DMA still owns this descriptor, ring is full
+                uinfo!("ethd", "qdma_tx_full"; idx = self.tx_idx as u32);
+                return false;
+            }
+
+            // Calculate buffer addresses
+            let buf_offset = self.tx_idx * PKTSIZE_ALIGN;
+            let buf_vaddr = self.buf_vaddr + buf_offset as u64;
+            let buf_paddr = self.buf_paddr + buf_offset as u64;
+
+            // Copy packet to buffer
+            core::ptr::copy_nonoverlapping(packet.as_ptr(), buf_vaddr as *mut u8, packet.len());
+
+            // Cache clean if streaming DMA
+            if USE_STREAMING_DMA {
+                cache_clean(buf_vaddr, packet.len());
+            }
+
+            // Memory barrier before descriptor update
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+
+            // Fill descriptor
+            // txd1 = buffer physical address
+            core::ptr::write_volatile(&mut (*txd).txd1, buf_paddr as u32);
+            // txd2 = next descriptor (already set during init, don't change)
+            // txd3 = PLEN0 | LS0 (clear OWNER_CPU to give to DMA)
+            core::ptr::write_volatile(&mut (*txd).txd3, qdma_tx_plen0(packet.len() as u32) | QDMA_TX_DMA_LS0);
+            // txd4 = FPORT (GMAC1 = port 1) | SWC
+            let fport = match self.gmac_id {
+                0 => PSE_GDM1_PORT,
+                1 => PSE_GDM2_PORT,
+                2 => PSE_GDM3_PORT,
+                _ => PSE_GDM1_PORT,
+            };
+            core::ptr::write_volatile(&mut (*txd).txd4, qdma_tx_fport(fport) | QDMA_TX_DMA_SWC);
+            // txd5-8 = 0 (no offloads)
+            core::ptr::write_volatile(&mut (*txd).txd5, 0);
+            core::ptr::write_volatile(&mut (*txd).txd6, 0);
+            core::ptr::write_volatile(&mut (*txd).txd7, 0);
+            core::ptr::write_volatile(&mut (*txd).txd8, 0);
+
+            // Memory barrier after descriptor update
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        // Calculate next descriptor physical address
+        let next_idx = (self.tx_idx + 1) % NUM_TX_DESC;
+        let tx_ring_paddr = self.qdma_tx_paddr;
+        let next_desc_paddr = tx_ring_paddr + (next_idx * TX_DESC_SIZE) as u64;
+
+        // Update CPU TX pointer to kick QDMA
+        self.qdma_write(QDMA_CTX_PTR, next_desc_paddr as u32);
+
+        // Advance TX index
+        self.tx_idx = next_idx;
+        self.qdma_tx_next = next_desc_paddr as u32;
+
+        let dtx = self.qdma_read(QDMA_DTX_PTR);
+        let ctx = self.qdma_read(QDMA_CTX_PTR);
+        uinfo!("ethd", "qdma_tx_sent"; idx = self.tx_idx as u32, len = packet.len() as u32, dtx = userlib::ulog::hex32(dtx), ctx = userlib::ulog::hex32(ctx));
+
+        true
     }
 
     // =========================================================================
@@ -1302,12 +1702,26 @@ impl EthDriver {
             uinfo!("ethd", "gmac_mcr_other"; port = i, mcr = userlib::ulog::hex32(mcr));
         }
 
-        // Enable DMA (U-Boot style)
-        self.pdma_rmw(PDMA_GLO_CFG_REG, 0, TX_WB_DDONE | RX_DMA_EN | TX_DMA_EN);
-        delay_us(500);
+        // Enable DMA
+        if USE_QDMA {
+            // QDMA TX + PDMA RX (Linux pattern)
+            self.qdma_start();  // Enable QDMA TX
+            self.pdma_rmw(PDMA_GLO_CFG_REG, 0, TX_WB_DDONE | RX_DMA_EN);  // PDMA RX only
+            delay_us(500);
 
-        let glo_cfg = self.pdma_read(PDMA_GLO_CFG_REG);
-        uinfo!("ethd", "dma_enabled"; glo_cfg = userlib::ulog::hex32(glo_cfg));
+            let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
+            let qdma_glo = self.qdma_read(QDMA_GLO_CFG);
+            uinfo!("ethd", "dma_enabled_qdma";
+                   pdma_glo = userlib::ulog::hex32(pdma_glo),
+                   qdma_glo = userlib::ulog::hex32(qdma_glo));
+        } else {
+            // PDMA for both TX and RX (U-Boot style)
+            self.pdma_rmw(PDMA_GLO_CFG_REG, 0, TX_WB_DDONE | RX_DMA_EN | TX_DMA_EN);
+            delay_us(500);
+
+            let glo_cfg = self.pdma_read(PDMA_GLO_CFG_REG);
+            uinfo!("ethd", "dma_enabled"; glo_cfg = userlib::ulog::hex32(glo_cfg));
+        }
 
         // LAST: Dump state AFTER all our changes
         if DEBUG_VERBOSE {
@@ -1323,6 +1737,13 @@ impl EthDriver {
     // =========================================================================
 
     fn eth_send(&mut self, packet: &[u8]) -> bool {
+        // Use QDMA TX when enabled
+        if USE_QDMA {
+            return self.qdma_send(packet);
+        }
+
+        // PDMA TX path (U-Boot style)
+
         // Verify DMA pool is initialized
         if self.buf_vaddr == 0 {
             return false;
@@ -2009,6 +2430,12 @@ static mut DRIVER: EthDriver = EthDriver {
     gmac_id: 0,             // GMAC0 for internal switch (Linux DTS: gmac0 -> switch port 6)
     use_bridge_mode: true,  // Default to bridge mode for internal switch
     poll_count: 0,
+
+    // QDMA state (initialized when USE_QDMA is true)
+    qdma_fq_paddr: 0,
+    qdma_fq_count: 0,
+    qdma_tx_paddr: 0,
+    qdma_tx_next: 0,
 };
 
 struct EthDriverWrapper(&'static mut EthDriver);
