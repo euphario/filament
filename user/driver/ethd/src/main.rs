@@ -320,6 +320,38 @@ const DEBUG_VERBOSE: bool = true;
 // Set to true to use QDMA (Linux style), false to use PDMA (U-Boot style, current default).
 const USE_QDMA: bool = true;
 
+// Frame Engine feature flags - enable/disable dynamic configuration
+// These control whether the driver exposes config keys for runtime tuning.
+// Set to true to enable runtime configuration via `devc ethd set fe.*`
+const USE_CHECKSUM_OFFLOAD: bool = true;    // RX checksum offload (IP/TCP/UDP)
+const USE_INTERRUPT_COALESCING: bool = true; // RX/TX interrupt coalescing
+const USE_FLOW_CONTROL: bool = true;         // Pause frame (802.3x flow control)
+
+// =============================================================================
+// Frame Engine Delay Interrupt Registers (MT7988 / NETSYS V3)
+// Reference: Linux mtk_eth_soc.c mt7988_reg_map
+// =============================================================================
+
+// PDMA delay interrupt register (relative to PDMA_V3_BASE)
+const PDMA_DELAY_IRQ: u32 = 0x20c;  // 0x6a0c - PDMA_V3_BASE(0x6800) = 0x20c
+
+// QDMA delay interrupt register (absolute offset from FE_BASE)
+// Already defined: QDMA_DELAY_IRQ = 0x460c
+
+// Delay interrupt register bits (Linux mtk_eth_soc.h)
+const DLY_RX_EN: u32 = 1 << 15;          // RX delay enable
+const DLY_RX_PINT_SHIFT: u32 = 8;        // RX packet interrupt count [14:8]
+const DLY_RX_PTIME_SHIFT: u32 = 0;       // RX packet time delay [7:0]
+const DLY_TX_EN: u32 = 1 << 31;          // TX delay enable
+const DLY_TX_PINT_SHIFT: u32 = 24;       // TX packet interrupt count [30:24]
+const DLY_TX_PTIME_SHIFT: u32 = 16;      // TX packet time delay [23:16]
+const DLY_PINT_MASK: u32 = 0x7f;         // Max 127 packets
+const DLY_PTIME_MASK: u32 = 0xff;        // Max 255 units (20µs each = 5.1ms max)
+
+// Default coalescing values (Linux dim_default_profile)
+const DEFAULT_COALESCE_USEC: u32 = 50;   // 50µs default
+const DEFAULT_COALESCE_PKTS: u32 = 8;    // 8 packets default
+
 // =============================================================================
 // QDMA Register Map (MT7988 / NETSYS V3)
 // Reference: Linux mtk_eth_soc.c mt7988_reg_map
@@ -506,6 +538,20 @@ struct EthDriver {
     qdma_fq_count: usize,    // Number of FQ descriptors
     qdma_tx_paddr: u64,      // TX ring physical address
     qdma_tx_next: u32,       // Next TX descriptor to fill (physical addr)
+
+    // Frame Engine runtime configuration state
+    // Checksum offload (bits in GDMA_IG_CTRL_REG)
+    csum_rx_en: bool,        // RX checksum offload enabled (IP+TCP+UDP)
+
+    // Interrupt coalescing (delay interrupt register)
+    coalesce_rx_usec: u32,   // RX coalesce time in microseconds
+    coalesce_rx_pkts: u32,   // RX coalesce packet count
+    coalesce_tx_usec: u32,   // TX coalesce time in microseconds
+    coalesce_tx_pkts: u32,   // TX coalesce packet count
+
+    // Flow control (pause frames)
+    pause_rx_en: bool,       // RX pause frame handling
+    pause_tx_en: bool,       // TX pause frame generation
 }
 
 impl EthDriver {
@@ -2803,6 +2849,271 @@ impl EthDriver {
     fn switch_dma_set(&self, _value: &str, buf: &mut [u8]) -> usize {
         fmt_to_buf(buf, format_args!("ERR DMA mode requires recompile (USE_QDMA={})\n", USE_QDMA))
     }
+
+    // =========================================================================
+    // Frame Engine Config Helpers (fe.*)
+    // =========================================================================
+
+    /// Show FE config help
+    fn fe_help(&self, buf: &mut [u8]) -> usize {
+        fmt_to_buf(buf, format_args!(
+            "Frame Engine configuration:\n\
+             fe.csum       - RX checksum offload (on/off)\n\
+             fe.coalesce   - Interrupt coalescing (rx_usec,rx_pkts,tx_usec,tx_pkts)\n\
+             fe.pause      - Flow control/pause frames (rx_en,tx_en)\n\
+             fe.stats      - GDMA TX/RX statistics\n\
+             fe.regs       - Register dump (debug)\n\n\
+             Examples:\n\
+             devc ethd set fe.csum on\n\
+             devc ethd set fe.coalesce 100,16,100,16\n\
+             devc ethd set fe.pause on,on\n"
+        ))
+    }
+
+    /// Get checksum offload status
+    fn fe_csum_get(&self, buf: &mut [u8]) -> usize {
+        if !USE_CHECKSUM_OFFLOAD {
+            return fmt_to_buf(buf, format_args!("disabled (compile-time)\n"));
+        }
+
+        // Read current GDMA_IG_CTRL setting
+        let ig_ctrl = self.fe_read(GDMA1_BASE + GDMA_IG_CTRL_REG);
+        let ics = (ig_ctrl & GDM_ICS_EN) != 0;
+        let tcs = (ig_ctrl & GDM_TCS_EN) != 0;
+        let ucs = (ig_ctrl & GDM_UCS_EN) != 0;
+
+        fmt_to_buf(buf, format_args!(
+            "rx_csum={} ip={} tcp={} udp={}\n",
+            if self.csum_rx_en { "on" } else { "off" },
+            if ics { "on" } else { "off" },
+            if tcs { "on" } else { "off" },
+            if ucs { "on" } else { "off" }
+        ))
+    }
+
+    /// Set checksum offload (on/off)
+    fn fe_csum_set(&mut self, value: &str, buf: &mut [u8]) -> usize {
+        if !USE_CHECKSUM_OFFLOAD {
+            return fmt_to_buf(buf, format_args!("ERR disabled (compile-time)\n"));
+        }
+
+        let enable = match value.trim() {
+            "on" | "1" | "true" => true,
+            "off" | "0" | "false" => false,
+            _ => return fmt_to_buf(buf, format_args!("ERR use 'on' or 'off'\n")),
+        };
+
+        self.csum_rx_en = enable;
+
+        // Update GDMA_IG_CTRL for GMAC0 (internal switch)
+        let csum_bits = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN;
+        let mut ig_ctrl = self.fe_read(GDMA1_BASE + GDMA_IG_CTRL_REG);
+        if enable {
+            ig_ctrl |= csum_bits;
+        } else {
+            ig_ctrl &= !csum_bits;
+        }
+        self.fe_write(GDMA1_BASE + GDMA_IG_CTRL_REG, ig_ctrl);
+
+        fmt_to_buf(buf, format_args!("OK rx_csum={}\n", if enable { "on" } else { "off" }))
+    }
+
+    /// Get interrupt coalescing settings
+    fn fe_coalesce_get(&self, buf: &mut [u8]) -> usize {
+        if !USE_INTERRUPT_COALESCING {
+            return fmt_to_buf(buf, format_args!("disabled (compile-time)\n"));
+        }
+
+        // Read current delay interrupt register
+        let dly = self.pdma_read(PDMA_DELAY_IRQ);
+        let rx_en = (dly & DLY_RX_EN) != 0;
+        let tx_en = (dly & DLY_TX_EN) != 0;
+        let rx_ptime = (dly >> DLY_RX_PTIME_SHIFT) & DLY_PTIME_MASK;
+        let rx_pint = (dly >> DLY_RX_PINT_SHIFT) & DLY_PINT_MASK;
+        let tx_ptime = (dly >> DLY_TX_PTIME_SHIFT) & DLY_PTIME_MASK;
+        let tx_pint = (dly >> DLY_TX_PINT_SHIFT) & DLY_PINT_MASK;
+
+        fmt_to_buf(buf, format_args!(
+            "rx_usec={} rx_pkts={} rx_en={}\n\
+             tx_usec={} tx_pkts={} tx_en={}\n\
+             (state: rx_usec={} rx_pkts={} tx_usec={} tx_pkts={})\n",
+            rx_ptime * 20, rx_pint, if rx_en { "on" } else { "off" },
+            tx_ptime * 20, tx_pint, if tx_en { "on" } else { "off" },
+            self.coalesce_rx_usec, self.coalesce_rx_pkts,
+            self.coalesce_tx_usec, self.coalesce_tx_pkts
+        ))
+    }
+
+    /// Set interrupt coalescing (rx_usec,rx_pkts,tx_usec,tx_pkts)
+    fn fe_coalesce_set(&mut self, value: &str, buf: &mut [u8]) -> usize {
+        if !USE_INTERRUPT_COALESCING {
+            return fmt_to_buf(buf, format_args!("ERR disabled (compile-time)\n"));
+        }
+
+        // Parse "rx_usec,rx_pkts,tx_usec,tx_pkts" or "off"
+        let value = value.trim();
+        if value == "off" || value == "0" {
+            // Disable coalescing
+            let dly = self.pdma_read(PDMA_DELAY_IRQ);
+            self.pdma_write(PDMA_DELAY_IRQ, dly & !(DLY_RX_EN | DLY_TX_EN));
+            if USE_QDMA {
+                let qdly = self.qdma_read(QDMA_DELAY_IRQ);
+                self.qdma_write(QDMA_DELAY_IRQ, qdly & !(DLY_RX_EN | DLY_TX_EN));
+            }
+            return fmt_to_buf(buf, format_args!("OK coalescing disabled\n"));
+        }
+
+        let mut parts = value.split(',');
+        let rx_usec: u32 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let rx_pkts: u32 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let tx_usec: u32 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let tx_pkts: u32 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+
+        // Convert microseconds to 20µs units
+        let rx_ptime = (rx_usec / 20).min(DLY_PTIME_MASK);
+        let rx_pint = rx_pkts.min(DLY_PINT_MASK);
+        let tx_ptime = (tx_usec / 20).min(DLY_PTIME_MASK);
+        let tx_pint = tx_pkts.min(DLY_PINT_MASK);
+
+        // Build delay register value
+        let mut dly_val = 0u32;
+        if rx_usec > 0 || rx_pkts > 0 {
+            dly_val |= DLY_RX_EN | (rx_pint << DLY_RX_PINT_SHIFT) | (rx_ptime << DLY_RX_PTIME_SHIFT);
+        }
+        if tx_usec > 0 || tx_pkts > 0 {
+            dly_val |= DLY_TX_EN | (tx_pint << DLY_TX_PINT_SHIFT) | (tx_ptime << DLY_TX_PTIME_SHIFT);
+        }
+
+        self.pdma_write(PDMA_DELAY_IRQ, dly_val);
+        if USE_QDMA {
+            self.qdma_write(QDMA_DELAY_IRQ, dly_val);
+        }
+
+        // Save state
+        self.coalesce_rx_usec = rx_usec;
+        self.coalesce_rx_pkts = rx_pkts;
+        self.coalesce_tx_usec = tx_usec;
+        self.coalesce_tx_pkts = tx_pkts;
+
+        fmt_to_buf(buf, format_args!(
+            "OK rx_usec={} rx_pkts={} tx_usec={} tx_pkts={}\n",
+            rx_ptime * 20, rx_pint, tx_ptime * 20, tx_pint
+        ))
+    }
+
+    /// Get flow control (pause frame) status
+    fn fe_pause_get(&self, buf: &mut [u8]) -> usize {
+        if !USE_FLOW_CONTROL {
+            return fmt_to_buf(buf, format_args!("disabled (compile-time)\n"));
+        }
+
+        // Read MAC control register for GMAC0
+        let mcr = self.fe_read(GMAC_BASE + gmac_port_mcr(0));
+        let rx_fc = (mcr & FORCE_RX_FC) != 0;
+        let tx_fc = (mcr & FORCE_TX_FC) != 0;
+
+        fmt_to_buf(buf, format_args!(
+            "rx_pause={} tx_pause={}\n\
+             (state: rx={} tx={})\n",
+            if rx_fc { "on" } else { "off" },
+            if tx_fc { "on" } else { "off" },
+            if self.pause_rx_en { "on" } else { "off" },
+            if self.pause_tx_en { "on" } else { "off" }
+        ))
+    }
+
+    /// Set flow control (rx_en,tx_en or on/off)
+    fn fe_pause_set(&mut self, value: &str, buf: &mut [u8]) -> usize {
+        if !USE_FLOW_CONTROL {
+            return fmt_to_buf(buf, format_args!("ERR disabled (compile-time)\n"));
+        }
+
+        let value = value.trim();
+
+        // Parse "rx,tx" or "on"/"off" for both
+        let (rx_en, tx_en) = if value == "on" || value == "1" {
+            (true, true)
+        } else if value == "off" || value == "0" {
+            (false, false)
+        } else {
+            let mut parts = value.split(',');
+            let rx = match parts.next().map(|s| s.trim()) {
+                Some("on") | Some("1") => true,
+                Some("off") | Some("0") => false,
+                _ => return fmt_to_buf(buf, format_args!("ERR use 'on,on' or 'off,off'\n")),
+            };
+            let tx = match parts.next().map(|s| s.trim()) {
+                Some("on") | Some("1") => true,
+                Some("off") | Some("0") => false,
+                _ => return fmt_to_buf(buf, format_args!("ERR use 'on,on' or 'off,off'\n")),
+            };
+            (rx, tx)
+        };
+
+        self.pause_rx_en = rx_en;
+        self.pause_tx_en = tx_en;
+
+        // Update MAC control register for GMAC0
+        let mut mcr = self.fe_read(GMAC_BASE + gmac_port_mcr(0));
+        if rx_en {
+            mcr |= FORCE_RX_FC;
+        } else {
+            mcr &= !FORCE_RX_FC;
+        }
+        if tx_en {
+            mcr |= FORCE_TX_FC;
+        } else {
+            mcr &= !FORCE_TX_FC;
+        }
+        self.fe_write(GMAC_BASE + gmac_port_mcr(0), mcr);
+
+        fmt_to_buf(buf, format_args!(
+            "OK rx_pause={} tx_pause={}\n",
+            if rx_en { "on" } else { "off" },
+            if tx_en { "on" } else { "off" }
+        ))
+    }
+
+    /// Get Frame Engine (GDMA) statistics
+    fn fe_stats_get(&self, buf: &mut [u8]) -> usize {
+        // GDMA statistics registers (offsets from GDMA base)
+        // Reference: Linux mtk_eth_soc.h MTK_STAT_OFFSET = 0x40
+        let tx_ok = self.fe_read(GDMA1_BASE + 0x40);
+        let tx_drop = self.fe_read(GDMA1_BASE + 0x44);
+        let rx_ok = self.fe_read(GDMA1_BASE + 0x50);
+        let rx_drop = self.fe_read(GDMA1_BASE + 0x54);
+        let rx_ovf = self.fe_read(GDMA1_BASE + 0x58);  // RX overflow
+
+        fmt_to_buf(buf, format_args!(
+            "GDMA1 (GMAC0/Switch):\n\
+             tx_ok={} tx_drop={}\n\
+             rx_ok={} rx_drop={} rx_ovf={}\n",
+            tx_ok, tx_drop, rx_ok, rx_drop, rx_ovf
+        ))
+    }
+
+    /// Dump Frame Engine registers (debug)
+    fn fe_regs_get(&self, buf: &mut [u8]) -> usize {
+        let gdma_ig = self.fe_read(GDMA1_BASE + GDMA_IG_CTRL_REG);
+        let gdma_eg = self.fe_read(GDMA1_BASE + GDMA_EG_CTRL_REG);
+        let mcr = self.fe_read(GMAC_BASE + gmac_port_mcr(0));
+        let pdma_dly = self.pdma_read(PDMA_DELAY_IRQ);
+        let qdma_dly = if USE_QDMA { self.qdma_read(QDMA_DELAY_IRQ) } else { 0 };
+
+        fmt_to_buf(buf, format_args!(
+            "GDMA1_IG_CTRL=0x{:08x} (csum: ics={} tcs={} ucs={})\n\
+             GDMA1_EG_CTRL=0x{:08x}\n\
+             GMAC0_MCR=0x{:08x} (rx_fc={} tx_fc={})\n\
+             PDMA_DELAY=0x{:08x} (rx_en={} tx_en={})\n\
+             QDMA_DELAY=0x{:08x}\n",
+            gdma_ig,
+            (gdma_ig >> 22) & 1, (gdma_ig >> 21) & 1, (gdma_ig >> 20) & 1,
+            gdma_eg,
+            mcr, (mcr >> 5) & 1, (mcr >> 4) & 1,
+            pdma_dly, (pdma_dly >> 15) & 1, (pdma_dly >> 31) & 1,
+            qdma_dly
+        ))
+    }
 }
 
 /// Format arguments to buffer, returns bytes written
@@ -3240,17 +3551,25 @@ impl Driver for EthDriver {
     }
 
     // =========================================================================
-    // Config API (devc ethd get/set switch.*)
+    // Config API (devc ethd get/set switch.* and fe.*)
     // =========================================================================
 
     fn config_keys(&self) -> &[userlib::bus::ConfigKey] {
         use userlib::bus::ConfigKey;
-        static KEYS: [ConfigKey; 5] = [
+        static KEYS: [ConfigKey; 11] = [
+            // Switch management keys
             ConfigKey::read_only(b"switch.vlan"),
             ConfigKey::read_only(b"switch.fdb"),
             ConfigKey::read_only(b"switch.mirror"),
             ConfigKey::read_only(b"switch.age"),
             ConfigKey::read_only(b"switch.dma"),
+            // Frame Engine keys
+            ConfigKey::read_write(b"fe.csum"),      // Checksum offload
+            ConfigKey::read_write(b"fe.coalesce"),  // Interrupt coalescing
+            ConfigKey::read_write(b"fe.pause"),     // Flow control
+            ConfigKey::read_only(b"fe.stats"),      // GDMA statistics
+            ConfigKey::read_only(b"fe.regs"),       // Register dump (debug)
+            ConfigKey::read_only(b"fe"),            // Summary
         ];
         &KEYS
     }
@@ -3261,15 +3580,33 @@ impl Driver for EthDriver {
         // Handle empty key (summary)
         if key_str.is_empty() {
             return fmt_to_buf(buf, format_args!(
-                "keys: switch.vlan switch.fdb switch.stp.<port> switch.stats.<port> switch.mirror switch.age switch.dma\n\
-                 write: switch.vlan.<vid>=members,untagged switch.vlan.del=vid\n\
-                 write: switch.fdb.add=mac,vid,port switch.fdb.del=mac,vid switch.fdb.flush=all\n\
-                 write: switch.stp.<port>=disabled|blocking|learning|forwarding\n\
-                 write: switch.mirror=dest,sources,rx|tx|both switch.mirror.off=1\n\
-                 write: switch.age=seconds\n"
+                "keys: switch.* fe.*\n\
+                 switch: vlan fdb stp.<port> stats.<port> mirror age dma\n\
+                 fe: csum coalesce pause stats regs\n"
             ));
         }
 
+        // Frame Engine keys
+        if key_str == "fe" || key_str == "fe.help" {
+            return self.fe_help(buf);
+        }
+        if key_str == "fe.csum" {
+            return self.fe_csum_get(buf);
+        }
+        if key_str == "fe.coalesce" {
+            return self.fe_coalesce_get(buf);
+        }
+        if key_str == "fe.pause" {
+            return self.fe_pause_get(buf);
+        }
+        if key_str == "fe.stats" {
+            return self.fe_stats_get(buf);
+        }
+        if key_str == "fe.regs" {
+            return self.fe_regs_get(buf);
+        }
+
+        // Switch keys
         if key_str == "switch.vlan" {
             return self.switch_vlan_list(buf);
         }
@@ -3307,6 +3644,17 @@ impl Driver for EthDriver {
     fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize {
         let key_str = core::str::from_utf8(key).unwrap_or("");
         let val_str = core::str::from_utf8(value).unwrap_or("");
+
+        // Frame Engine operations
+        if key_str == "fe.csum" {
+            return self.fe_csum_set(val_str, buf);
+        }
+        if key_str == "fe.coalesce" {
+            return self.fe_coalesce_set(val_str, buf);
+        }
+        if key_str == "fe.pause" {
+            return self.fe_pause_set(val_str, buf);
+        }
 
         // VLAN operations
         if let Some(rest) = key_str.strip_prefix("switch.vlan.") {
@@ -3399,6 +3747,15 @@ static mut DRIVER: EthDriver = EthDriver {
     qdma_fq_count: 0,
     qdma_tx_paddr: 0,
     qdma_tx_next: 0,
+
+    // Frame Engine runtime config (defaults)
+    csum_rx_en: true,                          // RX checksum enabled by default
+    coalesce_rx_usec: DEFAULT_COALESCE_USEC,   // 50µs
+    coalesce_rx_pkts: DEFAULT_COALESCE_PKTS,   // 8 packets
+    coalesce_tx_usec: DEFAULT_COALESCE_USEC,   // 50µs
+    coalesce_tx_pkts: DEFAULT_COALESCE_PKTS,   // 8 packets
+    pause_rx_en: true,                         // RX pause enabled
+    pause_tx_en: true,                         // TX pause enabled
 };
 
 struct EthDriverWrapper(&'static mut EthDriver);
