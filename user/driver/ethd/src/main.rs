@@ -42,10 +42,25 @@ const ETHWARP_RST_SWITCH_BIT: u32 = 1 << 9;  // Bit 9 = switch reset
 
 // ETHSYS - System control for Frame Engine
 // Reference: Linux mt7988a.dtsi - ethsys: syscon@15000000
+// Reference: Linux clk-mt7988-eth.c - clock gate definitions
 const ETHSYS_BASE: u64 = 0x1500_0000;
 const ETHSYS_SIZE: u64 = 0x1000;
 const ETHSYS_DUMMY_REG: usize = 0x0c;  // Dummy register with SRAM enable
-const ETHSYS_SRAM_EN: u32 = 1 << 15;   // BIT(15) enables SRAM access
+const ETHSYS_SRAM_EN: u32 = 1 << 15;   // BIT(15) enables SRAM access (older chips)
+
+// ETHSYS clock gate register at offset 0x30
+// Reference: Linux clk-mt7988-eth.c ethdma_cg_regs
+// 1 = clock enabled (inverted logic: mtk_clk_gate_ops_no_setclr_inv)
+const ETHSYS_CLK_GATE_REG: usize = 0x30;
+const ETHSYS_CLK_XGP1_EN: u32 = 1 << 0;   // 2.5G GMAC1
+const ETHSYS_CLK_XGP2_EN: u32 = 1 << 1;   // 2.5G GMAC2
+const ETHSYS_CLK_XGP3_EN: u32 = 1 << 2;   // 2.5G GMAC3
+const ETHSYS_CLK_FE_EN: u32 = 1 << 6;     // Frame Engine (critical!)
+const ETHSYS_CLK_GP2_EN: u32 = 1 << 7;    // GMAC2
+const ETHSYS_CLK_GP1_EN: u32 = 1 << 8;    // GMAC1
+const ETHSYS_CLK_GP3_EN: u32 = 1 << 10;   // GMAC3
+const ETHSYS_CLK_ESW_EN: u32 = 1 << 16;   // Embedded Switch (critical!)
+const ETHSYS_CLK_CRYPT0_EN: u32 = 1 << 29; // Crypto engine
 
 // Pinctrl (GPIO) - for LED pin muxing
 // Reference: Linux mt7988a.dtsi - pinctrl@1001f000
@@ -184,7 +199,7 @@ const USE_STREAMING_DMA: bool = false;  // Use coherent (non-cacheable) DMA for 
 // SRAM vs DMA memory for descriptor rings
 // MT7988 SRAM is at 0x15400000 (separate from FE), requires clocks to be enabled.
 // Set to true to test SRAM, false to use DMA memory (like U-Boot does).
-const USE_SRAM_FOR_RINGS: bool = false;  // DMA can't access SRAM - use regular DMA memory like U-Boot
+const USE_SRAM_FOR_RINGS: bool = true;  // Test SRAM with clock enable
 
 // Debug verbosity flag
 // Set to true to enable detailed register dumps and diagnostics during init.
@@ -2287,19 +2302,45 @@ impl Driver for EthDriver {
         }
 
         // Map ETHSYS system control (0x15000000)
-        // NOTE: Previous code tried to set BIT(15) at offset 0x0c (ETHSYS_DUMMY_REG) but
-        // this appears to be for older chips, not MT7988. For MT7988 (NETSYS V3), SRAM
-        // is enabled via BIT(4) in FE_GLO_MISC (already done above).
+        // Reference: Linux clk-mt7988-eth.c for clock gate definitions
         match MmioRegion::open(ETHSYS_BASE, ETHSYS_SIZE) {
             Some(es) => {
                 uinfo!("ethd", "ethsys_mmio_ok"; base = userlib::ulog::hex64(ETHSYS_BASE));
 
-                // Dump ETHSYS registers for debugging
+                // Read current clock gate status
+                let clk_gate_before = es.read32(ETHSYS_CLK_GATE_REG);
+                uinfo!("ethd", "ethsys_clk_gate_before"; val = userlib::ulog::hex32(clk_gate_before));
+
+                // Enable all necessary clocks for Ethernet + SRAM
+                // Linux enables these via mtk_clk_enable() in mtk_hw_init()
+                // Inverted logic: 1 = enabled
+                let clk_enable_mask = ETHSYS_CLK_FE_EN       // Frame Engine (required)
+                                    | ETHSYS_CLK_GP1_EN     // GMAC1 port clock
+                                    | ETHSYS_CLK_GP2_EN     // GMAC2 port clock
+                                    | ETHSYS_CLK_GP3_EN     // GMAC3 port clock
+                                    | ETHSYS_CLK_ESW_EN     // Embedded Switch (required for internal switch)
+                                    | ETHSYS_CLK_XGP1_EN    // 2.5G mode for GMAC1
+                                    | ETHSYS_CLK_XGP2_EN    // 2.5G mode for GMAC2
+                                    | ETHSYS_CLK_XGP3_EN;   // 2.5G mode for GMAC3
+
+                let new_clk_gate = clk_gate_before | clk_enable_mask;
+                es.write32(ETHSYS_CLK_GATE_REG, new_clk_gate);
+
+                // Verify the write took effect
+                let clk_gate_after = es.read32(ETHSYS_CLK_GATE_REG);
+                uinfo!("ethd", "ethsys_clk_gate_after"; val = userlib::ulog::hex32(clk_gate_after),
+                       fe_en = if (clk_gate_after & ETHSYS_CLK_FE_EN) != 0 { 1u32 } else { 0u32 },
+                       esw_en = if (clk_gate_after & ETHSYS_CLK_ESW_EN) != 0 { 1u32 } else { 0u32 });
+
+                // Small delay after clock enable for HW to stabilize
+                delay_us(100);
+
+                // Also read other ETHSYS registers for debugging
                 let dummy_reg = es.read32(ETHSYS_DUMMY_REG);
-                let clk_cfg0 = es.read32(0x00);  // CLK_CFG_0
-                let clk_cfg1 = es.read32(0x04);  // CLK_CFG_1
+                let sys_cfg = es.read32(0x10);   // ETHSYS_SYSCFG
+                let sys_cfg0 = es.read32(0x14);  // ETHSYS_SYSCFG0
                 uinfo!("ethd", "ethsys_regs"; dummy = userlib::ulog::hex32(dummy_reg),
-                       clk0 = userlib::ulog::hex32(clk_cfg0), clk1 = userlib::ulog::hex32(clk_cfg1));
+                       syscfg = userlib::ulog::hex32(sys_cfg), syscfg0 = userlib::ulog::hex32(sys_cfg0));
 
                 self.ethsys = Some(es);
             }
@@ -2321,27 +2362,24 @@ impl Driver for EthDriver {
 
         // MT7988 SRAM is at separate address 0x15400000 (NOT FE_BASE + 0x40000!)
         // Reference: linux/arch/arm64/boot/dts/mediatek/mt7988a.dtsi
-        // NOTE: SRAM may require specific clocks to be enabled - Linux enables ~20 clocks!
+        // The SRAM requires Frame Engine clocks to be enabled (done above via ETHSYS_CLK_GATE_REG)
         if USE_SRAM_FOR_RINGS {
             match MmioRegion::open(SRAM_BASE, SRAM_SIZE) {
                 Some(sr) => {
-                    uinfo!("ethd", "sram_mmio_ok"; base = userlib::ulog::hex64(SRAM_BASE));
-
-                    // Test SRAM write capability at the correct address
-                    let test_before = sr.read32(0);
+                    // Quick SRAM verification - write and read back
                     sr.write32(0, 0xCAFEBABE);
-                    let test_after = sr.read32(0);
-                    uinfo!("ethd", "sram_real_test"; before = userlib::ulog::hex32(test_before),
-                           wrote = userlib::ulog::hex32(0xCAFEBABE), after = userlib::ulog::hex32(test_after));
+                    let test_val = sr.read32(0);
 
-                    if test_after == 0xCAFEBABE {
-                        uinfo!("ethd", "sram_working";);
+                    if test_val == 0xCAFEBABE {
+                        uinfo!("ethd", "sram_ok"; base = userlib::ulog::hex64(SRAM_BASE),
+                               size = userlib::ulog::hex64(SRAM_SIZE));
                         self.sram_vaddr = sr.virt_base();
                         self.sram_paddr = SRAM_BASE;
-                        // Keep the mapping alive by storing handle (handled via Drop)
-                        core::mem::forget(sr);  // Leak the handle to keep mapping
+                        // Keep the mapping alive
+                        core::mem::forget(sr);
                     } else {
-                        uerror!("ethd", "sram_write_failed"; reason = "clocks_not_enabled?");
+                        uerror!("ethd", "sram_write_failed"; expected = userlib::ulog::hex32(0xCAFEBABE),
+                                got = userlib::ulog::hex32(test_val));
                         // Fall back to DMA memory
                     }
                 }
