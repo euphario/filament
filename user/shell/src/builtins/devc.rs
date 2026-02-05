@@ -101,14 +101,22 @@ fn show_help() {
     println!("  devc ipd set net.dhcp off");
 }
 
-/// Print a byte slice as text, stopping at null bytes.
+/// Print a byte slice as text, converting \n to \r\n for proper terminal display.
 fn print_bytes(data: &[u8]) {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    if let Ok(s) = core::str::from_utf8(&data[..end]) {
-        if s.ends_with('\n') {
-            crate::print!("{}", s);
+    let data = &data[..end];
+
+    // Print byte by byte, converting \n to \r\n
+    for &b in data {
+        if b == b'\n' {
+            crate::console::write(b"\r\n");
         } else {
-            println!("{}", s);
+            crate::console::write(&[b]);
         }
+    }
+
+    // Ensure we end with a newline for clean prompt
+    if !data.is_empty() && data[data.len() - 1] != b'\n' {
+        crate::console::write(b"\r\n");
     }
 }
