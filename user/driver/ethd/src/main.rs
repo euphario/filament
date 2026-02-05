@@ -153,13 +153,27 @@ const SRAM_TOTAL_SIZE: usize = TX_RING_SIZE + RX_RING_SIZE + FQ_RING_SIZE;  // 2
 //   0x00010000: RX ring (64KB)
 //   0x00020000: TX buffers (4MB)
 //   0x00420000: RX buffers (4MB)
+//   0x00820000: QDMA FQ ring (128KB) - only when USE_QDMA=true
+//   0x00840000: QDMA FQ buffers (8MB) - only when USE_QDMA=true
 const DMA_RING_OFF: usize = 0;                                      // Rings at start
 const DMA_TX_RING_OFF: usize = DMA_RING_OFF;                        // 0
 const DMA_RX_RING_OFF: usize = DMA_RING_OFF + TX_RING_SIZE;         // 64KB
 const DMA_RINGS_SIZE: usize = TX_RING_SIZE + RX_RING_SIZE;          // 128KB
 const DMA_TX_BUF_OFF: usize = DMA_RINGS_SIZE;                       // 128KB
 const DMA_RX_BUF_OFF: usize = DMA_RINGS_SIZE + TX_BUF_SIZE;         // 128KB + 4MB
-const DMA_POOL_SIZE: usize = DMA_RINGS_SIZE + TX_BUF_SIZE + RX_BUF_SIZE;  // ~8.125MB
+
+// QDMA Free Queue layout (after TX+RX buffers) - Linux sizes
+// Linux MT7988: fq_dma_size = MTK_DMA_SIZE(4K) = 4096 descriptors
+const QDMA_FQ_NUM_DESCS: usize = NUM_FQ_DESC;                                 // 4096 (Linux)
+const QDMA_FQ_RING_OFF: usize = DMA_RINGS_SIZE + TX_BUF_SIZE + RX_BUF_SIZE;  // After RX buffers
+const QDMA_FQ_RING_SIZE: usize = QDMA_FQ_NUM_DESCS * TX_DESC_SIZE;           // 4096 * 32 = 128KB
+const QDMA_FQ_BUF_OFF: usize = QDMA_FQ_RING_OFF + QDMA_FQ_RING_SIZE;         // After FQ ring
+const QDMA_FQ_BUF_SIZE: usize = QDMA_FQ_NUM_DESCS * QDMA_PAGE_SIZE;          // 4096 * 2048 = 8MB
+const QDMA_FQ_TOTAL_SIZE: usize = QDMA_FQ_RING_SIZE + QDMA_FQ_BUF_SIZE;      // ~8.125MB
+
+// Total DMA pool size - include FQ space when QDMA is enabled
+const DMA_POOL_BASE_SIZE: usize = DMA_RINGS_SIZE + TX_BUF_SIZE + RX_BUF_SIZE;  // ~8.125MB
+const DMA_POOL_SIZE: usize = if USE_QDMA { DMA_POOL_BASE_SIZE + QDMA_FQ_TOTAL_SIZE } else { DMA_POOL_BASE_SIZE };
 
 // DMA mode configuration
 // Set to true to use streaming (cacheable) DMA for data buffers.
@@ -175,13 +189,13 @@ const USE_SRAM_FOR_RINGS: bool = false;  // DMA can't access SRAM - use regular 
 // Debug verbosity flag
 // Set to true to enable detailed register dumps and diagnostics during init.
 // Set to false for production (reduces log spam significantly).
-const DEBUG_VERBOSE: bool = false;
+const DEBUG_VERBOSE: bool = true;
 
 // QDMA vs PDMA for TX
 // Linux uses QDMA for TX with a free queue (FQ) for automatic buffer recycling.
 // U-Boot uses PDMA for simplicity. QDMA provides better throughput for high-load scenarios.
 // Set to true to use QDMA (Linux style), false to use PDMA (U-Boot style, current default).
-const USE_QDMA: bool = false;
+const USE_QDMA: bool = true;
 
 // =============================================================================
 // QDMA Register Map (MT7988 / NETSYS V3)
@@ -222,12 +236,15 @@ const QDMA_FQ_BLEN: u32 = 0x472c;
 // QDMA TX scheduling rate
 const QDMA_TX_SCH_RATE: u32 = 0x4798;
 
-// QDMA GLO_CFG bits (same as PDMA)
+// QDMA GLO_CFG bits (Linux mtk_eth_soc.h)
 const QDMA_TX_DMA_EN: u32 = 1 << 0;
 const QDMA_TX_DMA_BUSY: u32 = 1 << 1;
 const QDMA_RX_DMA_EN: u32 = 1 << 2;
 const QDMA_RX_DMA_BUSY: u32 = 1 << 3;
+const QDMA_TX_BT_32DWORDS: u32 = 3 << 4;   // TX burst size 32 DWORDs
 const QDMA_TX_WB_DDONE: u32 = 1 << 6;
+const QDMA_NDP_CO_PRO: u32 = 1 << 10;      // No-drop co-processor
+const QDMA_RX_BT_32DWORDS: u32 = 3 << 11;  // RX burst size 32 DWORDs
 
 // QDMA flow control threshold bits
 const QDMA_FC_THRES_DROP_MODE: u32 = 1 << 21;
@@ -242,9 +259,9 @@ const QDMA_FC_THRES_MIN: u32 = 0x4444;  // Linux default
 // txd4: FPORT | TX_DMA_SWC_V2 | QID
 // txd5-8: optional features (TSO, checksum, VLAN)
 
-// txd3 bits for QDMA V2
-const QDMA_TX_DMA_LS0: u32 = 1 << 28;        // Last segment (Linux: TX_DMA_LS0)
-const QDMA_TX_DMA_OWNER_CPU: u32 = 1 << 31;  // CPU owns descriptor (Linux: TX_DMA_OWNER_CPU)
+// txd3 bits for QDMA V2 (from Linux mtk_eth_soc.h)
+const QDMA_TX_DMA_LS0: u32 = 1 << 30;        // Last segment (Linux: TX_DMA_LS0 = BIT(30))
+const QDMA_TX_DMA_OWNER_CPU: u32 = 1 << 31;  // CPU owns descriptor (Linux: TX_DMA_OWNER_CPU = BIT(31))
 
 // For MT7988 (NETSYS V3): dma_max_len = 0xFFFF, dma_len_offset = 8
 // TX_DMA_PLEN0(x) = (x & dma_max_len) << dma_len_offset
@@ -269,6 +286,18 @@ const QDMA_TX_RING_SIZE: usize = 2048;  // MTK_QDMA_RING_SIZE
 const QDMA_RES_THRES: u32 = 4;  // From Linux
 const QDMA_NUM_QUEUES: usize = 16;  // MTK_QDMA_NUM_QUEUES
 const QDMA_QTX_OFFSET: usize = 0x10;  // MTK_QTX_OFFSET
+
+// QDMA TX Queue Scheduler Configuration (from Linux mtk_eth_soc.h)
+// These bits go in QDMA_QTX_SCH register (0x4404 + queue * 0x10)
+const MTK_QTX_SCH_MIN_RATE_EN: u32 = 1 << 27;       // Enable minimum rate
+const MTK_QTX_SCH_MIN_RATE_MAN_SHIFT: u32 = 20;     // Min rate mantissa bits [26:20]
+const MTK_QTX_SCH_MIN_RATE_EXP_SHIFT: u32 = 16;     // Min rate exponent bits [19:16]
+const MTK_QTX_SCH_LEAKY_BUCKET_SIZE: u32 = 0x3 << 28; // Leaky bucket size bits [29:28]
+// Note: LEAKY_BUCKET_EN (bit 30) only for NETSYS V1
+
+// QDMA TX Scheduler Rate Control (from Linux mtk_eth_soc.h)
+// This goes in tx_sch_rate register (0x4798)
+const MTK_QDMA_TX_SCH_MAX_WFQ: u32 = 1 << 15;
 
 // Legacy offsets for compatibility (will be removed)
 const TX_RING_OFF: usize = 0;
@@ -1135,44 +1164,67 @@ impl EthDriver {
     // QDMA Initialization (Linux mtk_eth_soc: mtk_init_fq_dma + mtk_tx_alloc)
     // =========================================================================
 
+    /// Stop QDMA TX engine and wait for idle.
+    /// Must be called before reconfiguring QDMA.
+    fn qdma_stop(&mut self) {
+        let glo_before = self.qdma_read(QDMA_GLO_CFG);
+        uinfo!("ethd", "qdma_stop_start"; glo = userlib::ulog::hex32(glo_before));
+
+        // Disable TX DMA
+        self.qdma_rmw(QDMA_GLO_CFG, QDMA_TX_DMA_EN | QDMA_RX_DMA_EN, 0);
+        delay_us(100);
+
+        // Wait for TX DMA busy to clear (up to 5ms)
+        for _ in 0..50 {
+            let glo = self.qdma_read(QDMA_GLO_CFG);
+            if (glo & QDMA_TX_DMA_BUSY) == 0 {
+                break;
+            }
+            delay_us(100);
+        }
+
+        // Clear upper bits (reset various states)
+        self.qdma_rmw(QDMA_GLO_CFG, 0xffff0000, 0);
+        delay_us(100);
+
+        // Reset QDMA indices
+        self.qdma_write(QDMA_RST_IDX, 0xffffffff);  // Reset all indices
+        delay_us(100);
+
+        let glo_after = self.qdma_read(QDMA_GLO_CFG);
+        uinfo!("ethd", "qdma_stopped"; glo = userlib::ulog::hex32(glo_after));
+    }
+
     /// Initialize QDMA Free Queue (FQ) - scratch memory for QDMA internal buffer management.
     /// This is called from fifo_init() when USE_QDMA is true.
     /// Reference: Linux mtk_init_fq_dma()
     fn qdma_init_fq(&mut self) {
+        // First stop QDMA to clear any U-Boot state
+        self.qdma_stop();
+
         // FQ is a linked list of descriptors, each pointing to a scratch buffer.
         // QDMA uses FQ for temporary storage during packet processing.
-        // For simplicity, we use a smaller FQ than Linux (64 entries vs 4096).
 
         let dma = match &self.dma {
             Some(d) => d,
             None => return,
         };
 
-        // FQ layout in DMA pool (after PDMA rings and buffers):
-        // - FQ descriptors: 64 * 32 bytes = 2KB
-        // - FQ buffers: 64 * 2048 bytes = 128KB
-        const FQ_NUM_DESCS: usize = 64;
-        const FQ_DESC_TOTAL_SIZE: usize = FQ_NUM_DESCS * TX_DESC_SIZE;
-        const FQ_BUF_TOTAL_SIZE: usize = FQ_NUM_DESCS * QDMA_PAGE_SIZE;
-
-        // Offset in DMA pool (after PDMA rings + buffers)
-        let fq_ring_off = DMA_POOL_SIZE;  // Start after existing allocations
-        let fq_buf_off = fq_ring_off + FQ_DESC_TOTAL_SIZE;
-
-        let fq_ring_vaddr = dma.vaddr() + fq_ring_off as u64;
-        let fq_ring_paddr = dma.paddr() + fq_ring_off as u64;
-        let fq_buf_paddr = dma.paddr() + fq_buf_off as u64;
+        // Use module-level constants for FQ layout
+        let fq_ring_vaddr = dma.vaddr() + QDMA_FQ_RING_OFF as u64;
+        let fq_ring_paddr = dma.paddr() + QDMA_FQ_RING_OFF as u64;
+        let fq_buf_paddr = dma.paddr() + QDMA_FQ_BUF_OFF as u64;
 
         // Zero FQ descriptors
         unsafe {
-            core::ptr::write_bytes(fq_ring_vaddr as *mut u8, 0, FQ_DESC_TOTAL_SIZE);
+            core::ptr::write_bytes(fq_ring_vaddr as *mut u8, 0, QDMA_FQ_RING_SIZE);
         }
 
         // Initialize FQ descriptors (linked list)
-        for i in 0..FQ_NUM_DESCS {
+        for i in 0..QDMA_FQ_NUM_DESCS {
             let desc_vaddr = fq_ring_vaddr + (i * TX_DESC_SIZE) as u64;
             let buf_paddr = fq_buf_paddr + (i * QDMA_PAGE_SIZE) as u64;
-            let next_desc_paddr = if i < FQ_NUM_DESCS - 1 {
+            let next_desc_paddr = if i < QDMA_FQ_NUM_DESCS - 1 {
                 fq_ring_paddr + ((i + 1) * TX_DESC_SIZE) as u64
             } else {
                 0  // Last descriptor, no next
@@ -1196,25 +1248,25 @@ impl EthDriver {
 
         // Cache clean if streaming DMA
         if USE_STREAMING_DMA {
-            cache_clean(fq_ring_vaddr, FQ_DESC_TOTAL_SIZE);
+            cache_clean(fq_ring_vaddr, QDMA_FQ_RING_SIZE);
         }
 
         // Configure FQ registers
-        let fq_tail_paddr = fq_ring_paddr + ((FQ_NUM_DESCS - 1) * TX_DESC_SIZE) as u64;
+        let fq_tail_paddr = fq_ring_paddr + ((QDMA_FQ_NUM_DESCS - 1) * TX_DESC_SIZE) as u64;
         self.qdma_write(QDMA_FQ_HEAD, fq_ring_paddr as u32);
         self.qdma_write(QDMA_FQ_TAIL, fq_tail_paddr as u32);
         // fq_count: high 16 bits = total count, low 16 bits = available count
-        self.qdma_write(QDMA_FQ_COUNT, ((FQ_NUM_DESCS as u32) << 16) | (FQ_NUM_DESCS as u32));
+        self.qdma_write(QDMA_FQ_COUNT, ((QDMA_FQ_NUM_DESCS as u32) << 16) | (QDMA_FQ_NUM_DESCS as u32));
         // fq_blen: buffer length in high 16 bits
         self.qdma_write(QDMA_FQ_BLEN, (QDMA_PAGE_SIZE as u32) << 16);
 
         self.qdma_fq_paddr = fq_ring_paddr;
-        self.qdma_fq_count = FQ_NUM_DESCS;
+        self.qdma_fq_count = QDMA_FQ_NUM_DESCS;
 
         uinfo!("ethd", "qdma_fq_init";
                fq_head = userlib::ulog::hex64(fq_ring_paddr),
                fq_tail = userlib::ulog::hex64(fq_tail_paddr),
-               count = FQ_NUM_DESCS as u32);
+               count = QDMA_FQ_NUM_DESCS as u32);
     }
 
     /// Initialize QDMA TX ring.
@@ -1273,13 +1325,39 @@ impl EthDriver {
         self.qdma_write(QDMA_CRX_PTR, last_desc_paddr as u32);
         self.qdma_write(QDMA_DRX_PTR, last_desc_paddr as u32);
 
-        // Configure TX scheduling (simplified - single queue, max rate)
+        // Configure TX scheduling (from Linux mtk_tx_alloc)
+        // Each TX queue needs both QTX_CFG and QTX_SCH configured
         for i in 0..QDMA_NUM_QUEUES {
             let ofs = i * QDMA_QTX_OFFSET;
-            // QTX_CFG: resource threshold
+
+            // QTX_CFG: resource threshold (high byte = res_thres, low byte = res_thres)
             self.qdma_write(QDMA_QTX_CFG + ofs as u32, (QDMA_RES_THRES << 8) | QDMA_RES_THRES);
-            // QTX_SCH: scheduling config (use defaults for now)
+
+            // QTX_SCH: scheduling config
+            // Linux sets:
+            // - MTK_QTX_SCH_MIN_RATE_EN (bit 27)
+            // - MTK_QTX_SCH_MIN_RATE_MAN = 1 (minimum: 10 Mbps)
+            // - MTK_QTX_SCH_MIN_RATE_EXP = 4
+            // - MTK_QTX_SCH_LEAKY_BUCKET_SIZE (bits 29:28)
+            // Note: LEAKY_BUCKET_EN only for NETSYS V1, skip for MT7988 (V3)
+            let qtx_sch = MTK_QTX_SCH_MIN_RATE_EN
+                | (1 << MTK_QTX_SCH_MIN_RATE_MAN_SHIFT)   // mantissa = 1
+                | (4 << MTK_QTX_SCH_MIN_RATE_EXP_SHIFT)   // exponent = 4 (10 Mbps min)
+                | MTK_QTX_SCH_LEAKY_BUCKET_SIZE;
+            self.qdma_write(QDMA_QTX_SCH + ofs as u32, qtx_sch);
         }
+
+        // Configure global TX scheduler rate control (tx_sch_rate register)
+        // Linux: val = MTK_QDMA_TX_SCH_MAX_WFQ | (MTK_QDMA_TX_SCH_MAX_WFQ << 16)
+        // For NETSYS V2+ also write to tx_sch_rate + 4
+        let tx_sch_val = MTK_QDMA_TX_SCH_MAX_WFQ | (MTK_QDMA_TX_SCH_MAX_WFQ << 16);
+        self.qdma_write(QDMA_TX_SCH_RATE, tx_sch_val);
+        self.qdma_write(QDMA_TX_SCH_RATE + 4, tx_sch_val);  // NETSYS V3 has two rate registers
+
+        uinfo!("ethd", "qdma_tx_sch"; qtx_sch = userlib::ulog::hex32(
+            MTK_QTX_SCH_MIN_RATE_EN | (1 << MTK_QTX_SCH_MIN_RATE_MAN_SHIFT)
+            | (4 << MTK_QTX_SCH_MIN_RATE_EXP_SHIFT) | MTK_QTX_SCH_LEAKY_BUCKET_SIZE),
+            tx_sch_rate = userlib::ulog::hex32(tx_sch_val));
 
         self.qdma_tx_paddr = tx_ring_paddr;
         self.qdma_tx_next = tx_ring_paddr as u32;
@@ -1296,9 +1374,14 @@ impl EthDriver {
         let glo = self.qdma_read(QDMA_GLO_CFG);
         uinfo!("ethd", "qdma_start_before"; glo = userlib::ulog::hex32(glo));
 
-        // Enable TX DMA with write-back done
+        // Enable TX DMA with all the bits Linux uses:
+        // - TX_DMA_EN: enable TX
+        // - TX_WB_DDONE: write-back done descriptor
+        // - TX_BT_32DWORDS: 32 DWORD burst
+        // - NDP_CO_PRO: no-drop co-processor
         // Note: We don't enable RX DMA here - we still use PDMA for RX (like Linux does)
-        self.qdma_rmw(QDMA_GLO_CFG, 0, QDMA_TX_DMA_EN | QDMA_TX_WB_DDONE);
+        let enable_bits = QDMA_TX_DMA_EN | QDMA_TX_WB_DDONE | QDMA_TX_BT_32DWORDS | QDMA_NDP_CO_PRO;
+        self.qdma_rmw(QDMA_GLO_CFG, 0, enable_bits);
 
         let glo_after = self.qdma_read(QDMA_GLO_CFG);
         uinfo!("ethd", "qdma_start_after"; glo = userlib::ulog::hex32(glo_after));
@@ -1389,7 +1472,30 @@ impl EthDriver {
 
         let dtx = self.qdma_read(QDMA_DTX_PTR);
         let ctx = self.qdma_read(QDMA_CTX_PTR);
-        uinfo!("ethd", "qdma_tx_sent"; idx = self.tx_idx as u32, len = packet.len() as u32, dtx = userlib::ulog::hex32(dtx), ctx = userlib::ulog::hex32(ctx));
+
+        // Read back what we wrote to the descriptor for debugging
+        let use_sram = USE_SRAM_FOR_RINGS && self.sram_vaddr != 0;
+        let tx_ring_vaddr = if use_sram {
+            self.sram_vaddr + SRAM_TX_RING_OFF as u64
+        } else {
+            self.dma.as_ref().map(|d| d.vaddr() + DMA_TX_RING_OFF as u64).unwrap_or(0)
+        };
+        let prev_idx = if self.tx_idx == 0 { NUM_TX_DESC - 1 } else { self.tx_idx - 1 };
+        let desc_vaddr = tx_ring_vaddr + (prev_idx * TX_DESC_SIZE) as u64;
+        let (txd1, txd2, txd3, txd4) = unsafe {
+            let txd = desc_vaddr as *const TxDescV2;
+            (
+                core::ptr::read_volatile(&(*txd).txd1),
+                core::ptr::read_volatile(&(*txd).txd2),
+                core::ptr::read_volatile(&(*txd).txd3),
+                core::ptr::read_volatile(&(*txd).txd4),
+            )
+        };
+
+        uinfo!("ethd", "qdma_tx_sent"; idx = self.tx_idx as u32, len = packet.len() as u32,
+               dtx = userlib::ulog::hex32(dtx), ctx = userlib::ulog::hex32(ctx),
+               txd1 = userlib::ulog::hex32(txd1), txd2 = userlib::ulog::hex32(txd2),
+               txd3 = userlib::ulog::hex32(txd3), txd4 = userlib::ulog::hex32(txd4));
 
         true
     }
@@ -1567,6 +1673,26 @@ impl EthDriver {
             self.dump_all_registers("UBOOT");
         }
 
+        // Read MAC address from U-Boot's GDM registers before we overwrite them
+        // U-Boot sets the MAC from EFUSE or environment, so we inherit it
+        let mac_msb = self.fe_read(GDMA1_BASE + GDMA_MAC_MSB_REG);
+        let mac_lsb = self.fe_read(GDMA1_BASE + GDMA_MAC_LSB_REG);
+        if mac_msb != 0 || mac_lsb != 0 {
+            // U-Boot left a valid MAC - use it
+            // Format: MSB = [0][1], LSB = [2][3][4][5]
+            self.mac[0] = ((mac_msb >> 8) & 0xFF) as u8;
+            self.mac[1] = (mac_msb & 0xFF) as u8;
+            self.mac[2] = ((mac_lsb >> 24) & 0xFF) as u8;
+            self.mac[3] = ((mac_lsb >> 16) & 0xFF) as u8;
+            self.mac[4] = ((mac_lsb >> 8) & 0xFF) as u8;
+            self.mac[5] = (mac_lsb & 0xFF) as u8;
+            uinfo!("ethd", "mac_from_uboot";
+                   mac0 = self.mac[0], mac1 = self.mac[1], mac2 = self.mac[2],
+                   mac3 = self.mac[3], mac4 = self.mac[4], mac5 = self.mac[5]);
+        } else {
+            uinfo!("ethd", "mac_using_default"; reason = "uboot_mac_zero");
+        }
+
         // DON'T reset Frame Engine - preserve U-Boot's working state
         // The FE reset clears internal 10G SerDes and bridge configuration
         // that U-Boot sets up. Since U-Boot's BOOTP/TFTP works, we should
@@ -1588,25 +1714,40 @@ impl EthDriver {
 
         uinfo!("ethd", "configuring_gdm";);
 
-        // Set GDM0 for bridge mode (matching U-Boot's mtk_eth_start)
-        // U-Boot code in mtk_eth_start() for V3 with internal switch:
-        //   mtk_gdma_write(eth_priv, gmac_id, GDMA_IG_CTRL_REG, GDMA_BRIDGE_TO_CPU);  // 0xC0000000
-        //   mtk_gdma_write(eth_priv, gmac_id, GDMA_EG_CTRL_REG, GDMA_CPU_BRIDGE_EN);  // 0x80000000
+        // MT7988 with MUX_TO_ESW=1: GMAC1 is connected to internal switch via USXGMII.
+        // This means we need to use GDM1, not GDM0!
         //
-        // The U-Boot dump showing eg=0x00000000 is from BEFORE mtk_eth_start or after eth_halt.
-        // During active operation, U-Boot sets both registers.
+        // TX path: QDMA (FPORT=1) → PSE → GDM1 → GMAC1 → USXGMII → Switch
+        // RX path: Switch → USXGMII → GMAC1 → GDM1 → PDMA
+        //
+        // Configure GDM1 for bridge mode (matching U-Boot's mtk_eth_start with gmac_id=1)
+        // U-Boot: gmac_id=1 with internal switch
+        self.gdma_write(1, GDMA_IG_CTRL_REG, GDMA_BRIDGE_TO_CPU);  // 0xC0000000
+        self.gdma_write(1, GDMA_EG_CTRL_REG, GDMA_CPU_BRIDGE_EN);  // 0x80000000
+
+        // Also configure GDM0 for RX (packets come from switch via port 6 which goes through GDM0)
+        // Actually on MT7988 with internal switch, RX path is: Switch → USXGMII → GDM1 → PDMA
+        // But some packets might come through GDM0 depending on switch config
         self.gdma_write(0, GDMA_IG_CTRL_REG, GDMA_BRIDGE_TO_CPU);  // 0xC0000000
         self.gdma_write(0, GDMA_EG_CTRL_REG, GDMA_CPU_BRIDGE_EN);  // 0x80000000
 
-        // Disable other GDMs (discard their traffic)
-        self.gdma_write(1, GDMA_IG_CTRL_REG, GDMA_FWD_DISCARD);
+        // Disable GDM2 (not used)
         self.gdma_write(2, GDMA_IG_CTRL_REG, GDMA_FWD_DISCARD);
 
         // Verify GDM config
-        let gdm0_ig = self.fe_read(GDMA1_BASE + GDMA_IG_CTRL_REG);
-        let gdm0_eg = self.fe_read(GDMA1_BASE + GDMA_EG_CTRL_REG);
-        uinfo!("ethd", "gdm0_configured"; ig = userlib::ulog::hex32(gdm0_ig),
-               eg = userlib::ulog::hex32(gdm0_eg));
+        // NOTE: Our naming is confusing. Linux hardware naming:
+        //   GDMA1_BASE (0x500) = GDM1 (for GMAC1) = where FPORT=1 sends
+        //   GDMA2_BASE (0x1500) = GDM2 (for GMAC2) = where FPORT=2 sends
+        // Our gdma_write(0, ...) uses GDMA1_BASE, gdma_write(1, ...) uses GDMA2_BASE
+        let gdm1_ig = self.fe_read(GDMA1_BASE + GDMA_IG_CTRL_REG);  // GDM1 at 0x500 (FPORT=1 target)
+        let gdm1_eg = self.fe_read(GDMA1_BASE + GDMA_EG_CTRL_REG);
+        uinfo!("ethd", "gdm1_0x500_configured"; ig = userlib::ulog::hex32(gdm1_ig),
+               eg = userlib::ulog::hex32(gdm1_eg));
+
+        let gdm2_ig = self.fe_read(GDMA2_BASE + GDMA_IG_CTRL_REG);  // GDM2 at 0x1500
+        let gdm2_eg = self.fe_read(GDMA2_BASE + GDMA_EG_CTRL_REG);
+        uinfo!("ethd", "gdm2_0x1500_configured"; ig = userlib::ulog::hex32(gdm2_ig),
+               eg = userlib::ulog::hex32(gdm2_eg));
 
         // Initialize switch and PHYs (this now does PHY autoneg restart)
         self.switch_init();
@@ -2303,7 +2444,22 @@ impl Driver for EthDriver {
             // Every 100 polls (~1 second), dump TX descriptor state and MIB counters
             self.poll_count += 1;
             if DEBUG_VERBOSE && self.poll_count % 100 == 0 {
-                if self.sram_vaddr != 0 {
+                if USE_QDMA {
+                    // QDMA TX status
+                    let ctx = self.qdma_read(QDMA_CTX_PTR);
+                    let dtx = self.qdma_read(QDMA_DTX_PTR);
+                    let glo = self.qdma_read(QDMA_GLO_CFG);
+                    let fq_cnt = self.qdma_read(QDMA_FQ_COUNT);
+                    uinfo!("ethd", "qdma_status"; ctx = userlib::ulog::hex32(ctx), dtx = userlib::ulog::hex32(dtx),
+                           glo = userlib::ulog::hex32(glo), fq_cnt = userlib::ulog::hex32(fq_cnt), poll = self.poll_count);
+
+                    // Also show PDMA RX status (we use PDMA for RX)
+                    let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
+                    let rx_drx = self.pdma_read(rx_drx_idx_reg(0));
+                    let rx_crx = self.pdma_read(rx_crx_idx_reg(0));
+                    uinfo!("ethd", "pdma_rx_status"; glo = userlib::ulog::hex32(pdma_glo),
+                           rx_drx = rx_drx, rx_crx = rx_crx);
+                } else if self.sram_vaddr != 0 {
                     let tx_ring_vaddr = self.sram_vaddr + SRAM_TX_RING_OFF as u64;
                     let dtx = self.pdma_read(tx_dtx_idx_reg(0));
                     let ctx_idx = self.pdma_read(tx_ctx_idx_reg(0));
@@ -2320,6 +2476,13 @@ impl Driver for EthDriver {
                         }
                     }
                     uinfo!("ethd", "tx_status"; dtx = dtx, ctx = ctx_idx, ddone_mask = userlib::ulog::hex32(ddone_bits), poll = self.poll_count);
+                } else {
+                    // Regular DMA mode (no SRAM, no QDMA)
+                    let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
+                    let dtx = self.pdma_read(tx_dtx_idx_reg(0));
+                    let ctx_idx = self.pdma_read(tx_ctx_idx_reg(0));
+                    uinfo!("ethd", "pdma_status"; glo = userlib::ulog::hex32(pdma_glo),
+                           dtx = dtx, ctx = ctx_idx, poll = self.poll_count);
                 }
 
                 // Read switch MIB counters for ALL ports (0-6)
