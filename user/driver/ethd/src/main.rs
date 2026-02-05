@@ -2851,6 +2851,65 @@ impl EthDriver {
     }
 
     // =========================================================================
+    // Combined Statistics (top-level `stats` key)
+    // =========================================================================
+
+    /// Get all statistics (FE + switch ports)
+    fn stats_get_all(&self, buf: &mut [u8]) -> usize {
+        use core::fmt::Write;
+        struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+        impl Write for BufWriter<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let remaining = self.buf.len() - self.pos;
+                let to_write = bytes.len().min(remaining);
+                self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
+                self.pos += to_write;
+                Ok(())
+            }
+        }
+        let mut w = BufWriter { buf, pos: 0 };
+
+        // Frame Engine (GDMA) stats
+        let fe_tx_ok = self.fe_read(GDMA1_BASE + 0x40);
+        let fe_tx_drop = self.fe_read(GDMA1_BASE + 0x44);
+        let fe_rx_ok = self.fe_read(GDMA1_BASE + 0x50);
+        let fe_rx_drop = self.fe_read(GDMA1_BASE + 0x54);
+
+        let _ = core::write!(w,
+            "=== Frame Engine (GDMA1) ===\n\
+             tx_ok={} tx_drop={} rx_ok={} rx_drop={}\n\n\
+             === Switch Ports ===\n\
+             port  tx_bytes      rx_bytes      tx_pkts  rx_pkts  drop\n",
+            fe_tx_ok, fe_tx_drop, fe_rx_ok, fe_rx_drop
+        );
+
+        // Switch port stats (compact summary)
+        for port in 0..7u8 {
+            let base = MT7530_MIB_PORT_BASE(port as u32);
+            let tx_bytes = ((self.gsw_read(base + MIB_TX_BYTES_HI) as u64) << 32)
+                         | (self.gsw_read(base + MIB_TX_BYTES_LO) as u64);
+            let rx_bytes = ((self.gsw_read(base + MIB_RX_BYTES_HI) as u64) << 32)
+                         | (self.gsw_read(base + MIB_RX_BYTES_LO) as u64);
+            let tx_pkts = self.gsw_read(base + MIB_TX_UNI)
+                        + self.gsw_read(base + MIB_TX_BCAST)
+                        + self.gsw_read(base + MIB_TX_MULTI);
+            let rx_pkts = self.gsw_read(base + MIB_RX_UNI)
+                        + self.gsw_read(base + MIB_RX_BCAST)
+                        + self.gsw_read(base + MIB_RX_MULTI);
+            let drop = self.gsw_read(base + MIB_TX_DROP)
+                     + self.gsw_read(base + MIB_RX_DROP);
+
+            let _ = core::write!(w,
+                "{:<5} {:<13} {:<13} {:<8} {:<8} {}\n",
+                port, tx_bytes, rx_bytes, tx_pkts, rx_pkts, drop
+            );
+        }
+
+        w.pos
+    }
+
+    // =========================================================================
     // Frame Engine Config Helpers (fe.*)
     // =========================================================================
 
@@ -2861,8 +2920,8 @@ impl EthDriver {
              fe.csum       - RX checksum offload (on/off)\n\
              fe.coalesce   - Interrupt coalescing (rx_usec,rx_pkts,tx_usec,tx_pkts)\n\
              fe.pause      - Flow control/pause frames (rx_en,tx_en)\n\
-             fe.stats      - GDMA TX/RX statistics\n\
              fe.regs       - Register dump (debug)\n\n\
+             Use 'devc ethd get stats' for combined FE+switch statistics.\n\n\
              Examples:\n\
              devc ethd set fe.csum on\n\
              devc ethd set fe.coalesce 100,16,100,16\n\
@@ -3557,6 +3616,8 @@ impl Driver for EthDriver {
     fn config_keys(&self) -> &[userlib::bus::ConfigKey] {
         use userlib::bus::ConfigKey;
         static KEYS: [ConfigKey; 11] = [
+            // Top-level
+            ConfigKey::read_only(b"stats"),         // Combined FE + switch stats
             // Switch management keys
             ConfigKey::read_only(b"switch.vlan"),
             ConfigKey::read_only(b"switch.fdb"),
@@ -3569,7 +3630,6 @@ impl Driver for EthDriver {
             ConfigKey::read_write(b"fe.pause"),     // Flow control
             ConfigKey::read_only(b"fe.stats"),      // GDMA statistics
             ConfigKey::read_only(b"fe.regs"),       // Register dump (debug)
-            ConfigKey::read_only(b"fe"),            // Summary
         ];
         &KEYS
     }
@@ -3580,10 +3640,15 @@ impl Driver for EthDriver {
         // Handle empty key (summary)
         if key_str.is_empty() {
             return fmt_to_buf(buf, format_args!(
-                "keys: switch.* fe.*\n\
+                "keys: stats switch.* fe.*\n\
                  switch: vlan fdb stp.<port> stats.<port> mirror age dma\n\
-                 fe: csum coalesce pause stats regs\n"
+                 fe: csum coalesce pause regs\n"
             ));
+        }
+
+        // Top-level stats (combined FE + switch)
+        if key_str == "stats" {
+            return self.stats_get_all(buf);
         }
 
         // Frame Engine keys
