@@ -32,3 +32,4 @@ user/userlib/target/
 # Debug logs
 *.log
 !docs/**/*.log
+user/initrd_staging/
