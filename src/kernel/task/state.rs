@@ -95,8 +95,9 @@ pub enum TaskState {
     /// Task is ready to run (in run queue)
     Ready,
 
-    /// Task is currently executing on a CPU
-    Running,
+    /// Task is currently executing on a specific CPU
+    /// The cpu field identifies which CPU owns this task.
+    Running { cpu: u32 },
 
     /// Task is sleeping - waiting for any event, no deadline
     /// Used for event-loop style processes (devd, servers)
@@ -132,9 +133,23 @@ impl TaskState {
     // State queries
     // ========================================================================
 
-    /// Task can be scheduled (Ready or Running)
+    /// Task can be scheduled (Ready or Running on current CPU)
+    /// Note: For SMP safety, selection should also check kernel_stack_owner.
     pub fn is_runnable(&self) -> bool {
-        matches!(self, TaskState::Ready | TaskState::Running)
+        matches!(self, TaskState::Ready | TaskState::Running { .. })
+    }
+
+    /// Check if task is currently running
+    pub fn is_running(&self) -> bool {
+        matches!(self, TaskState::Running { .. })
+    }
+
+    /// Get the CPU this task is running on, if any
+    pub fn running_cpu(&self) -> Option<u32> {
+        match self {
+            TaskState::Running { cpu } => Some(*cpu),
+            _ => None,
+        }
     }
 
     /// Task is blocked waiting for something
@@ -210,7 +225,7 @@ impl TaskState {
     pub fn name(&self) -> &'static str {
         match self {
             TaskState::Ready => "Ready",
-            TaskState::Running => "Running",
+            TaskState::Running { .. } => "Running",
             TaskState::Sleeping { .. } => "Sleeping",
             TaskState::Waiting { .. } => "Waiting",
             TaskState::Exiting { .. } => "Exiting",
@@ -224,7 +239,7 @@ impl TaskState {
     pub fn state_code(&self) -> u8 {
         match self {
             TaskState::Ready => 0,
-            TaskState::Running => 1,
+            TaskState::Running { .. } => 1,
             TaskState::Sleeping { .. } => 2,
             TaskState::Waiting { .. } => 3,
             TaskState::Exiting { .. } => 4,
@@ -244,17 +259,17 @@ impl TaskState {
 
         match (self, to) {
             // Ready can only go to Running (via scheduler)
-            (Ready, Running) => true,
+            (Ready, Running { .. }) => true,
 
             // Running can go to:
             // - Ready (yield/preempt)
             // - Sleeping (block without deadline)
             // - Waiting (block with deadline)
             // - Exiting (exit/kill)
-            (Running, Ready) => true,
-            (Running, Sleeping { .. }) => true,
-            (Running, Waiting { .. }) => true,
-            (Running, Exiting { .. }) => true,
+            (Running { .. }, Ready) => true,
+            (Running { .. }, Sleeping { .. }) => true,
+            (Running { .. }, Waiting { .. }) => true,
+            (Running { .. }, Exiting { .. }) => true,
 
             // Sleeping/Waiting can go to:
             // - Ready (wake)
@@ -278,7 +293,7 @@ impl TaskState {
             // Evicting: kernel-initiated forced termination
             // Any non-terminal state can be evicted
             (Ready, Evicting { .. }) => true,
-            (Running, Evicting { .. }) => true,
+            (Running { .. }, Evicting { .. }) => true,
             (Sleeping { .. }, Evicting { .. }) => true,
             (Waiting { .. }, Evicting { .. }) => true,
             // Evicting goes directly to Dead (no grace period)
@@ -314,9 +329,9 @@ impl TaskState {
         self.transition(TaskState::Ready).map(|_| ())
     }
 
-    /// Ready → Running (scheduled)
-    pub fn schedule(&mut self) -> Result<(), InvalidTransition> {
-        self.transition(TaskState::Running).map(|_| ())
+    /// Ready → Running (scheduled on specific CPU)
+    pub fn schedule(&mut self, cpu: u32) -> Result<(), InvalidTransition> {
+        self.transition(TaskState::Running { cpu }).map(|_| ())
     }
 
     /// Running → Sleeping (block for event, no deadline)
@@ -340,7 +355,7 @@ impl TaskState {
         // Can exit from Running, Sleeping, or Waiting
         if matches!(
             self,
-            TaskState::Running | TaskState::Sleeping { .. } | TaskState::Waiting { .. }
+            TaskState::Running { .. } | TaskState::Sleeping { .. } | TaskState::Waiting { .. }
         ) {
             *self = TaskState::Exiting { code };
             Ok(())
@@ -403,8 +418,8 @@ mod tests {
         let mut state = TaskState::Ready;
 
         // Ready → Running
-        assert!(state.schedule().is_ok());
-        assert_eq!(state, TaskState::Running);
+        assert!(state.schedule(0).is_ok());
+        assert_eq!(state, TaskState::Running { cpu: 0 });
 
         // Running → Sleeping
         assert!(state.sleep(SleepReason::EventLoop).is_ok());
@@ -415,7 +430,7 @@ mod tests {
         assert_eq!(state, TaskState::Ready);
 
         // Ready → Running → Exiting
-        assert!(state.schedule().is_ok());
+        assert!(state.schedule(0).is_ok());
         assert!(state.exit(0).is_ok());
         assert!(state.is_terminated());
 
@@ -444,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_kill_while_blocked() {
-        let mut state = TaskState::Running;
+        let mut state = TaskState::Running { cpu: 0 };
         state.sleep(SleepReason::Irq).unwrap();
 
         // Can kill a sleeping task
@@ -454,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_wait_with_deadline() {
-        let mut state = TaskState::Running;
+        let mut state = TaskState::Running { cpu: 0 };
         assert!(state.wait(WaitReason::Timer, 12345).is_ok());
 
         if let TaskState::Waiting { deadline, reason } = state {
@@ -467,33 +482,33 @@ mod tests {
 
     #[test]
     fn test_wait_reasons() {
-        let mut state = TaskState::Running;
+        let mut state = TaskState::Running { cpu: 0 };
 
         // IpcCall
         assert!(state.wait(WaitReason::IpcCall, 100).is_ok());
         assert!(state.wake().is_ok());
 
         // Child
-        assert!(state.schedule().is_ok());
+        assert!(state.schedule(0).is_ok());
         assert!(state.wait(WaitReason::Child, 200).is_ok());
         assert!(state.wake().is_ok());
 
         // ShmemNotify
-        assert!(state.schedule().is_ok());
+        assert!(state.schedule(0).is_ok());
         assert!(state.wait(WaitReason::ShmemNotify, 300).is_ok());
         assert!(state.wake().is_ok());
     }
 
     #[test]
     fn test_sleep_reasons() {
-        let mut state = TaskState::Running;
+        let mut state = TaskState::Running { cpu: 0 };
 
         // EventLoop
         assert!(state.sleep(SleepReason::EventLoop).is_ok());
         assert!(state.wake().is_ok());
 
         // Ipc
-        assert!(state.schedule().is_ok());
+        assert!(state.schedule(0).is_ok());
         assert!(state.sleep(SleepReason::Irq).is_ok());
         assert!(state.wake().is_ok());
     }
@@ -503,7 +518,7 @@ mod tests {
         let state = TaskState::Ready;
         assert!(state.is_runnable());
 
-        let state = TaskState::Running;
+        let state = TaskState::Running { cpu: 0 };
         assert!(state.is_runnable());
 
         let state = TaskState::Sleeping { reason: SleepReason::EventLoop };
@@ -521,7 +536,7 @@ mod tests {
         let state = TaskState::Waiting { reason: WaitReason::Timer, deadline: 100 };
         assert!(state.is_blocked());
 
-        let state = TaskState::Running;
+        let state = TaskState::Running { cpu: 0 };
         assert!(!state.is_blocked());
     }
 
@@ -536,7 +551,7 @@ mod tests {
         let state = TaskState::Dead;
         assert!(state.is_terminated());
 
-        let state = TaskState::Running;
+        let state = TaskState::Running { cpu: 0 };
         assert!(!state.is_terminated());
     }
 
@@ -551,13 +566,13 @@ mod tests {
         let state = TaskState::Dead;
         assert_eq!(state.exit_code(), None);
 
-        let state = TaskState::Running;
+        let state = TaskState::Running { cpu: 0 };
         assert_eq!(state.exit_code(), None);
     }
 
     #[test]
     fn test_yield_cpu() {
-        let mut state = TaskState::Running;
+        let mut state = TaskState::Running { cpu: 0 };
         assert!(state.yield_cpu().is_ok());
         assert_eq!(state, TaskState::Ready);
     }
@@ -592,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_evict_from_running() {
-        let mut state = TaskState::Running;
+        let mut state = TaskState::Running { cpu: 0 };
         assert!(state.evict(EvictionReason::InvalidStateTransition).is_ok());
         assert!(state.is_evicting());
         assert!(state.is_terminated());

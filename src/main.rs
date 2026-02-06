@@ -798,8 +798,9 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 unsafe {
                     let mut sched = kernel::task::scheduler();
                     kernel::task::set_current_slot(slot);
+                    let cpu = kernel::percpu::cpu_id();
                     if let Some(task) = sched.task_mut(slot) {
-                        let _ = task.set_running();
+                        let _ = task.set_running(cpu);
                         // Update globals directly (can't call update_current_task_globals
                         // here because we already hold the scheduler lock)
                         let trap_ptr = &mut task.trap_frame as *mut kernel::task::TrapFrame;
@@ -898,15 +899,16 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_str_uart("  Task terminated, switching to next...\r\n");
 
         // Schedule next task
+        let cpu = kernel::percpu::cpu_id();
         if let Some(next_slot) = sched.schedule() {
             // Idle task is a kernel task - can't eret to it
             // Instead, enter the idle loop directly
-            let my_idle = kernel::percpu::cpu_id() as usize;
+            let my_idle = cpu as usize;
             if kernel::sched::is_idle_slot(next_slot) {
                 print_str_uart("  Next task is idle, entering idle loop...\r\n");
                 kernel::task::set_current_slot(my_idle);
                 if let Some(task) = sched.task_mut(my_idle) {
-                    let _ = task.set_running();
+                    let _ = task.set_running(cpu);
                 }
                 // Drop scheduler lock before entering idle (idle_entry never
                 // returns, so the MutexGuard would never be dropped, deadlocking
@@ -927,7 +929,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 print_str_uart("  Next task needs context_switch, entering idle...\r\n");
                 kernel::task::set_current_slot(my_idle);
                 if let Some(task) = sched.task_mut(my_idle) {
-                    let _ = task.set_running();
+                    let _ = task.set_running(cpu);
                 }
                 // Drop scheduler lock before entering idle (idle_entry never
                 // returns, so the MutexGuard would never be dropped).
@@ -944,7 +946,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
 
             kernel::task::set_current_slot(next_slot);
             if let Some(task) = sched.task_mut(next_slot) {
-                let _ = task.set_running();
+                let _ = task.set_running(cpu);
                 let trap_ptr = &mut task.trap_frame as *mut kernel::task::TrapFrame;
                 kernel::percpu::set_trap_frame(trap_ptr);
                 if let Some(ref addr_space) = task.address_space {

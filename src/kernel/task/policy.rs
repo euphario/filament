@@ -159,6 +159,11 @@ impl PerCpuQueues {
     }
 
     /// Find highest-priority ready task from a bitset
+    ///
+    /// # SMP Safety
+    /// Only considers tasks where:
+    /// - State is Ready
+    /// - Kernel stack is available (not being used by another CPU during switch)
     fn best_from_bitset(&self, bitset: &ReadyBitset, tasks: &[Option<Task>; MAX_TASKS]) -> Option<usize> {
         let mut best_slot: Option<usize> = None;
         let mut best_priority = Priority::Low;
@@ -172,7 +177,10 @@ impl PerCpuQueues {
 
                 if slot < MAX_TASKS {
                     if let Some(ref task) = tasks[slot] {
-                        if *task.state() == TaskState::Ready {
+                        // SMP EXCLUSIVITY: Skip tasks whose kernel stack is still
+                        // owned by another CPU (mid-context-switch). This prevents
+                        // running a task on two CPUs simultaneously.
+                        if *task.state() == TaskState::Ready && task.kernel_stack_available() {
                             if best_slot.is_none() || task.priority < best_priority {
                                 best_slot = Some(slot);
                                 best_priority = task.priority;
@@ -203,7 +211,7 @@ impl SchedulingPolicy for PerCpuQueues {
         // 2. Check if current task is still runnable (not idle)
         if current_slot >= percpu::MAX_CPUS {
             if let Some(ref task) = tasks[current_slot] {
-                if task.is_runnable() {
+                if task.is_runnable() && task.kernel_stack_available() {
                     return Some(current_slot);
                 }
             }
@@ -218,8 +226,11 @@ impl SchedulingPolicy for PerCpuQueues {
         }
 
         // 4. Fall back to this CPU's idle task
+        // Note: idle tasks should never have kernel_stack_owner set since they
+        // never context switch away (they wait for interrupts). But we check
+        // for consistency.
         if let Some(ref task) = tasks[my_idle] {
-            if task.is_runnable() {
+            if task.is_runnable() && task.kernel_stack_available() {
                 return Some(my_idle);
             }
         }

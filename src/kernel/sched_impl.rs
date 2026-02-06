@@ -27,7 +27,7 @@ use crate::kernel::sched;
 fn convert_state(state: &TaskState) -> TaskStateInfo {
     match state {
         TaskState::Ready => TaskStateInfo::Ready,
-        TaskState::Running => TaskStateInfo::Running,
+        TaskState::Running { .. } => TaskStateInfo::Running,
         TaskState::Sleeping { .. } => TaskStateInfo::Sleeping,
         TaskState::Waiting { deadline, .. } => TaskStateInfo::Waiting { deadline: *deadline },
         TaskState::Exiting { .. } |

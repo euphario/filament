@@ -181,13 +181,15 @@ fn reschedule_inner(block: BlockReason) -> bool {
             false // Treat as non-running to force full context switch
         } else {
             sched.task(caller_slot)
-                .map(|t| *t.state() == TaskState::Running)
+                .map(|t| t.state().is_running())
                 .unwrap_or(false)
         };
 
+        let cpu = percpu::cpu_id();
+
         // Mark current task as Ready if it was Running
         if let Some(current) = sched.task_mut(caller_slot) {
-            if *current.state() == TaskState::Running {
+            if current.state().is_running() {
                 crate::transition_or_evict!(current, set_ready);
                 sched.notify_ready(caller_slot);
             }
@@ -200,7 +202,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 // Same task selected - set back to Running, return
                 if let Some(t) = sched.task_mut(caller_slot) {
                     if *t.state() == TaskState::Ready {
-                        crate::transition_or_evict!(t, set_running);
+                        crate::transition_or_evict!(t, set_running, cpu);
                     }
                 }
                 return false;
@@ -213,7 +215,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
                     // Not blocked, just keep running
                     if let Some(t) = sched.task_mut(caller_slot) {
                         if *t.state() == TaskState::Ready {
-                            crate::transition_or_evict!(t, set_running);
+                            crate::transition_or_evict!(t, set_running, cpu);
                         }
                     }
                     return false;
@@ -243,7 +245,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
 
             // Extract and update per-CPU data while we have the lock
             if let Some(next) = sched.task_mut(next_slot) {
-                crate::transition_or_evict!(next, set_running);
+                crate::transition_or_evict!(next, set_running, cpu);
 
                 // Update trap frame pointer
                 let trap_ptr = &mut next.trap_frame as *mut TrapFrame;
@@ -270,6 +272,11 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 if !t.is_terminated() {
                     t.mark_context_saved();
                 }
+                // SMP EXCLUSIVITY: Mark that this CPU owns this task's kernel stack.
+                // This prevents other CPUs from selecting this task until we've
+                // fully switched away. The flag is cleared in Phase 3 when we
+                // return to this task's context.
+                t.set_kernel_stack_owner(cpu);
                 &mut t.context as *mut task::CpuContext
             }
             None => return false,
@@ -278,8 +285,11 @@ fn reschedule_inner(block: BlockReason) -> bool {
         let (to_ctx, to_trap_frame, to_ttbr0) = match sched.task_mut(next_slot) {
             Some(t) => {
                 // Prepare target state while holding lock
-                crate::transition_or_evict!(t, set_running);
+                crate::transition_or_evict!(t, set_running, cpu);
                 t.mark_context_restored();
+                // Clear any stale kernel_stack_owner from previous switch.
+                // We're about to restore this task's context and run on its stack.
+                t.clear_kernel_stack_owner();
 
                 let ctx = &t.context as *const task::CpuContext;
                 let trap = &mut t.trap_frame as *mut TrapFrame;
@@ -393,12 +403,19 @@ fn reschedule_inner(block: BlockReason) -> bool {
         let mut sched = task::scheduler();
         set_current_slot(decision.from_slot);
 
+        // Get cpu id for state transitions
+        let cpu = percpu::cpu_id();
+
         if let Some(t) = sched.task_mut(decision.from_slot) {
+            // SMP EXCLUSIVITY: Clear kernel stack ownership. We're back on our
+            // own context now, so other CPUs can safely schedule this task again.
+            t.clear_kernel_stack_owner();
+
             match t.state() {
                 TaskState::Ready => {
-                    crate::transition_or_evict!(t, set_running);
+                    crate::transition_or_evict!(t, set_running, cpu);
                 }
-                TaskState::Running => { /* Already running */ }
+                TaskState::Running { .. } => { /* Already running */ }
                 TaskState::Dying { .. } | TaskState::Dead |
                 TaskState::Exiting { .. } | TaskState::Evicting { .. } => {
                     // Died while switched out - cleanup handles it

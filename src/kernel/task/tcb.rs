@@ -237,6 +237,24 @@ pub struct Task {
     /// Set to Saved when task blocks and context_switch saves its context.
     /// Set to Fresh when context_switch restores its context.
     context_restore: ContextRestoreState,
+
+    /// SMP exclusivity: which CPU is currently using this task's kernel stack?
+    ///
+    /// Set in Phase 1 of context switch (before releasing scheduler lock).
+    /// Cleared in Phase 3 of context switch (after switch completes).
+    ///
+    /// A task is selectable iff:
+    /// - `state == Ready`
+    /// - `kernel_stack_owner.is_none()`
+    ///
+    /// This prevents the bug where CPU 0 is mid-context-switch using a task's
+    /// kernel stack while CPU 1 tries to select and run the same task.
+    kernel_stack_owner: Option<u32>,
+
+    /// Debug invariant: is this task currently in a ready queue?
+    /// Used to assert that tasks are enqueued/dequeued correctly.
+    #[cfg(debug_assertions)]
+    on_runq: bool,
 }
 
 /// Trampoline for new user tasks.
@@ -340,6 +358,9 @@ impl Task {
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
             context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
+            kernel_stack_owner: None,
+            #[cfg(debug_assertions)]
+            on_runq: false,
         })
     }
 
@@ -391,6 +412,9 @@ impl Task {
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
             context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
+            kernel_stack_owner: None,
+            #[cfg(debug_assertions)]
+            on_runq: false,
         }
     }
 
@@ -461,6 +485,9 @@ impl Task {
             last_activity_tick: 0,
             storm: crate::kernel::storm::StormState::new(),
             context_restore: ContextRestoreState::Saved,
+            kernel_stack_owner: None,
+            #[cfg(debug_assertions)]
+            on_runq: false,
         })
     }
 
@@ -634,10 +661,10 @@ impl Task {
         self.state.is_terminated()
     }
 
-    /// Transition: Ready → Running (scheduled to run)
+    /// Transition: Ready → Running (scheduled to run on specific CPU)
     #[inline]
-    pub fn set_running(&mut self) -> Result<(), super::state::InvalidTransition> {
-        self.state.schedule()
+    pub fn set_running(&mut self, cpu: u32) -> Result<(), super::state::InvalidTransition> {
+        self.state.schedule(cpu)
     }
 
     /// Transition: Running → Ready (yield or preempt)
@@ -727,6 +754,72 @@ impl Task {
     #[inline]
     pub(crate) fn needs_context_restore(&self) -> bool {
         self.context_restore == ContextRestoreState::Saved
+    }
+
+    // ========================================================================
+    // Kernel Stack Ownership API (SMP Exclusivity)
+    // ========================================================================
+
+    /// Set the CPU that owns this task's kernel stack.
+    /// Called in Phase 1 of context switch before releasing the scheduler lock.
+    #[inline]
+    pub(crate) fn set_kernel_stack_owner(&mut self, cpu: u32) {
+        self.kernel_stack_owner = Some(cpu);
+    }
+
+    /// Clear kernel stack ownership.
+    /// Called in Phase 3 of context switch after the switch completes.
+    #[inline]
+    pub(crate) fn clear_kernel_stack_owner(&mut self) {
+        self.kernel_stack_owner = None;
+    }
+
+    /// Check if this task's kernel stack is available (not in use by any CPU).
+    /// A task is selectable iff state == Ready AND kernel_stack_owner.is_none().
+    #[inline]
+    pub fn kernel_stack_available(&self) -> bool {
+        self.kernel_stack_owner.is_none()
+    }
+
+    /// Get which CPU owns this task's kernel stack, if any.
+    #[inline]
+    pub fn kernel_stack_owner(&self) -> Option<u32> {
+        self.kernel_stack_owner
+    }
+
+    // ========================================================================
+    // Debug Invariants (Run Queue Tracking)
+    // ========================================================================
+
+    /// Mark task as being on a run queue (debug builds only).
+    #[cfg(debug_assertions)]
+    #[inline]
+    pub(crate) fn set_on_runq(&mut self, on: bool) {
+        debug_assert!(
+            on != self.on_runq,
+            "Task {} on_runq invariant violated: was {}, setting to {}",
+            self.id, self.on_runq, on
+        );
+        self.on_runq = on;
+    }
+
+    /// Check if task is on a run queue (debug builds only).
+    #[cfg(debug_assertions)]
+    #[inline]
+    pub fn is_on_runq(&self) -> bool {
+        self.on_runq
+    }
+
+    /// No-op for release builds.
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    pub(crate) fn set_on_runq(&mut self, _on: bool) {}
+
+    /// Always false for release builds.
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    pub fn is_on_runq(&self) -> bool {
+        false
     }
 
     /// Record syscall activity for liveness tracking

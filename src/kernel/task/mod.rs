@@ -294,23 +294,38 @@ impl Scheduler {
     /// Generate a PID for a given slot
     /// PID format: bits[8:0] = slot + 1 (1-256), bits[31:9] = generation (23 bits)
     ///
+    /// Idle tasks (slots 0..MAX_CPUS) get PID 0. User tasks start at PID 1.
+    /// This ensures devd (first user task) gets PID 1.
+    ///
     /// The generation is masked to 23 bits to prevent overflow when shifted.
     /// After 2^23 task creations in a slot, generation wraps to 0, which is
     /// acceptable since the probability of a stale reference surviving that
     /// long is negligible.
     fn make_pid(&self, slot: usize) -> TaskId {
-        let slot_bits = (slot + 1) as u32;  // +1 to avoid PID 0
+        use crate::kernel::percpu::MAX_CPUS;
+        if slot < MAX_CPUS {
+            // Idle tasks get PID 0 - they're internal kernel tasks
+            return 0;
+        }
+        // User tasks: slot MAX_CPUS → PID 1, slot MAX_CPUS+1 → PID 2, etc.
+        let slot_bits = (slot - MAX_CPUS + 1) as u32;
         let gen = self.generations[slot] & ((1 << (32 - Self::PID_SLOT_BITS)) - 1);
         slot_bits | (gen << Self::PID_SLOT_BITS)
     }
 
     /// Extract slot from PID (returns None if invalid)
     fn slot_from_pid(pid: TaskId) -> Option<usize> {
-        let slot_bits = (pid & Self::PID_SLOT_MASK) as usize;
-        if slot_bits == 0 || slot_bits > MAX_TASKS {
+        use crate::kernel::percpu::MAX_CPUS;
+        if pid == 0 {
+            // PID 0 is reserved for idle - but we can't map it back to a specific slot
+            // since all idle tasks share PID 0. Return None.
             return None;
         }
-        Some(slot_bits - 1)
+        let slot_bits = (pid & Self::PID_SLOT_MASK) as usize;
+        if slot_bits == 0 || slot_bits + MAX_CPUS > MAX_TASKS {
+            return None;
+        }
+        Some(slot_bits + MAX_CPUS - 1)
     }
 
     /// Extract generation from PID
@@ -338,19 +353,32 @@ impl Scheduler {
     }
 
     /// Notify the scheduling policy that a task became ready.
+    /// Also tracks on_runq invariant in debug builds.
     pub fn notify_ready(&mut self, slot: usize) {
-        let priority = self.tasks[slot].as_ref()
-            .map(|t| t.priority).unwrap_or(Priority::Normal);
-        self.policy.on_task_ready(slot, priority);
+        if let Some(ref mut task) = self.tasks[slot] {
+            task.set_on_runq(true);
+            self.policy.on_task_ready(slot, task.priority);
+        }
     }
 
     /// Notify the scheduling policy that a task blocked.
+    /// Also tracks on_runq invariant in debug builds.
     pub fn notify_blocked(&mut self, slot: usize) {
+        if let Some(ref mut task) = self.tasks[slot] {
+            task.set_on_runq(false);
+        }
         self.policy.on_task_blocked(slot);
     }
 
     /// Notify the scheduling policy that a task exited.
+    /// Also tracks on_runq invariant in debug builds.
     pub fn notify_exit(&mut self, slot: usize) {
+        if let Some(ref mut task) = self.tasks[slot] {
+            // Only clear if on runq (task may have been blocked when it exited)
+            if task.is_on_runq() {
+                task.set_on_runq(false);
+            }
+        }
         self.policy.on_task_exit(slot);
     }
 
@@ -374,6 +402,9 @@ impl Scheduler {
 
             // Reset liveness state - task responded/became active
             task.liveness_state = super::liveness::LivenessState::Normal;
+
+            // Track runq invariant in debug builds
+            task.set_on_runq(true);
 
             // Notify scheduling policy
             self.policy.on_task_ready(slot, task.priority);
@@ -451,12 +482,13 @@ impl Scheduler {
             }
         }
 
-        // Notify policy about deadline-woken tasks
+        // Notify policy about deadline-woken tasks and track runq invariant
         for i in 0..woken_slot_count {
             let slot = woken_slots[i] as usize;
-            let priority = self.tasks[slot].as_ref()
-                .map(|t| t.priority).unwrap_or(Priority::Normal);
-            self.policy.on_task_ready(slot, priority);
+            if let Some(ref mut task) = self.tasks[slot] {
+                task.set_on_runq(true);
+                self.policy.on_task_ready(slot, task.priority);
+            }
         }
 
         // Check TimerObjects via ObjectService (outside task iteration)
@@ -486,6 +518,7 @@ impl Scheduler {
                     if task.is_blocked() {
                         crate::transition_or_log!(task, wake);
                         task.liveness_state.reset(task.id);
+                        task.set_on_runq(true);
                         self.policy.on_task_ready(slot, task.priority);
                         woken += 1;
                     }
@@ -851,9 +884,10 @@ impl Scheduler {
         set_current_slot(slot);
 
         let task = self.tasks[slot].as_mut()?;
+        let cpu = super::percpu::cpu_id();
 
         // Task must be Ready to enter Running state
-        if !crate::transition_or_evict!(task, set_running) {
+        if !crate::transition_or_evict!(task, set_running, cpu) {
             // Transition failed - task was evicted
             kerror!("task", "run_user_task_failed"; slot = slot as u64, pid = task.id as u64, state = task.state().name());
 
@@ -918,7 +952,7 @@ impl Scheduler {
             if let Some(ref task) = slot {
                 let state_str = match *task.state() {
                     TaskState::Ready => "ready",
-                    TaskState::Running => "RUNNING",
+                    TaskState::Running { .. } => "RUNNING",
                     TaskState::Sleeping { .. } => "sleeping",
                     TaskState::Waiting { .. } => "waiting",
                     TaskState::Exiting { .. } => "exiting",

@@ -1586,10 +1586,11 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             };
 
             // Handle task state at block point
+            let cpu = crate::kernel::percpu::cpu_id();
             match task.state() {
-                task::TaskState::Running => {}
+                task::TaskState::Running { .. } => {}
                 task::TaskState::Ready => {
-                    if task.set_running().is_err() {
+                    if task.set_running(cpu).is_err() {
                         return false;
                     }
                 }
@@ -1650,10 +1651,11 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         // Self-wake: transition back to Running via state machine
         task::with_scheduler(|sched| {
             if let Some(task) = sched.task_mut(slot) {
-                if *task.state() != task::TaskState::Running {
+                let cpu = crate::kernel::percpu::cpu_id();
+                if !task.state().is_running() {
                     crate::transition_or_log!(task, wake);
                     if *task.state() == task::TaskState::Ready {
-                        crate::transition_or_evict!(task, set_running);
+                        crate::transition_or_evict!(task, set_running, cpu);
                     }
                 }
                 // Clear flag since we're NOT context switching (self-wake path)
@@ -1667,8 +1669,9 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         // Woken by event or timeout. Ensure Running.
         task::with_scheduler(|sched| {
             if let Some(task) = sched.task_mut(slot) {
+                let cpu = crate::kernel::percpu::cpu_id();
                 if *task.state() == task::TaskState::Ready {
-                    crate::transition_or_evict!(task, set_running);
+                    crate::transition_or_evict!(task, set_running, cpu);
                 }
                 // Reset liveness — proves task is responsive
                 let current_tick = crate::platform::current::timer::logical_ticks();

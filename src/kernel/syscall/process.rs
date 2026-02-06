@@ -327,18 +327,14 @@ pub(super) fn sys_daemonize() -> i64 {
 pub(super) fn sys_kill(pid: u32) -> i64 {
     let ctx = create_syscall_context();
 
+    // PID 0 is reserved for idle tasks - never allow killing them
     if pid == 0 {
-        return KernelError::InvalidArg.to_errno();
-    }
-
-    // SECURITY: Never allow killing idle (slot 0, pid 1)
-    if pid == 1 {
         let caller = ctx.current_task_id().unwrap_or(0);
         kwarn!("security", "kill_idle_denied"; caller = caller as u64);
         return KernelError::PermDenied.to_errno();
     }
 
-    // NOTE: Killing devd (is_init=true) is allowed for testing - recovery will be triggered.
+    // NOTE: Killing devd (PID 1, is_init=true) is allowed for testing - recovery will be triggered.
     // The lifecycle::kill() function sets DEVD_LIVENESS_KILLED flag which causes
     // the timer handler to respawn devd and kill all other tasks.
 
