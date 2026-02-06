@@ -515,7 +515,7 @@ impl DevdClient {
 
         channel.send(&buf[..len])?;
 
-        // Wait for response (same response type as REGISTER_PORT)
+        // Wait for response
         let mut resp_buf = [0u8; 64];
         for _ in 0..Self::MAX_RETRIES {
             match channel.recv(&mut resp_buf) {
@@ -523,8 +523,7 @@ impl DevdClient {
                     let header = QueryHeader::from_bytes(&resp_buf)
                         .ok_or(SysError::IoError)?;
 
-                    // Accept either REGISTER_PORT or REGISTER_PORT_INFO as response type
-                    if header.msg_type == msg::REGISTER_PORT || header.msg_type == msg::REGISTER_PORT_INFO {
+                    if header.msg_type == msg::REGISTER_PORT_INFO {
                         let result = i32::from_le_bytes([
                             resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
                         ]);
@@ -574,7 +573,7 @@ impl DevdClient {
                     let header = QueryHeader::from_bytes(&resp_buf)
                         .ok_or(SysError::IoError)?;
 
-                    if header.msg_type == msg::REGISTER_PORT {
+                    if header.msg_type == msg::REGISTER_PORT_INFO {
                         let result = i32::from_le_bytes([
                             resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
                         ]);

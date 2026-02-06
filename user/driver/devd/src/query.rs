@@ -7,8 +7,8 @@ use userlib::ipc::Channel;
 use userlib::query::{
     QueryHeader, DeviceRegister, ListDevices, GetDeviceInfo, DriverQuery,
     DeviceListResponse, DeviceInfoResponse, DeviceEntry, ErrorResponse,
-    PortRegister, PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
-    msg, error, port_type,
+    PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
+    msg, error,
 };
 
 use crate::devices::{DeviceStore, DeviceRegistry, MAX_DEVICES};
@@ -170,11 +170,6 @@ impl QueryHandler {
             msg::QUERY_DRIVER => {
                 // Pass-through queries need special handling (async)
                 // Return None to indicate caller should handle forwarding
-                None
-            }
-            msg::REGISTER_PORT => {
-                // Port registration needs access to Devd's ports and rules
-                // Return None to indicate caller should handle this
                 None
             }
             _ => {
@@ -397,32 +392,6 @@ impl QueryHandler {
         ))
     }
 
-    /// Parse a REGISTER_PORT message
-    /// Returns: (seq_id, port_type, name, parent, shmem_id, owner_idx)
-    pub fn parse_port_register<'a>(
-        &self,
-        slot: usize,
-        buf: &'a [u8],
-    ) -> Option<PortRegisterInfo<'a>> {
-        let (reg, name, parent, metadata) = PortRegister::from_bytes(buf)?;
-
-        // Only drivers can register ports
-        let client = self.clients[slot].as_ref()?;
-        if !client.is_driver {
-            return None;
-        }
-
-        Some(PortRegisterInfo {
-            seq_id: reg.header.seq_id,
-            port_type: reg.port_type,
-            name,
-            parent,
-            metadata,
-            shmem_id: reg.shmem_id,
-            owner_idx: client.service_idx as u8,
-        })
-    }
-
     /// Send a port registration response
     pub fn send_port_register_response(
         &mut self,
@@ -469,18 +438,7 @@ impl QueryHandler {
     }
 }
 
-/// Parsed port registration info (legacy)
-pub struct PortRegisterInfo<'a> {
-    pub seq_id: u32,
-    pub port_type: u8,
-    pub name: &'a [u8],
-    pub parent: Option<&'a [u8]>,
-    pub metadata: &'a [u8],
-    pub shmem_id: u32,
-    pub owner_idx: u8,
-}
-
-/// Parsed unified port registration info
+/// Parsed port registration info
 pub struct PortInfoRegistration {
     pub seq_id: u32,
     pub shmem_id: u32,
