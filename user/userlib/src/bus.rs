@@ -30,6 +30,10 @@
 //! └──────────────────────────────────────────────┘
 //! ```
 
+// Re-export port enumeration types from abi for driver use
+pub use abi::{PortInfo, PortClass, PortMetadata, BlockMetadata, NetworkMetadata, UsbMetadata};
+pub use abi::{port_subclass, port_caps};
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -85,8 +89,8 @@ pub struct SpawnContext {
     name: [u8; 64],
     /// Actual length of port name
     name_len: u8,
-    /// Type of the port that triggered the spawn
-    pub port_type: crate::devd::PortType,
+    /// Class of the port that triggered the spawn
+    pub port_class: abi::PortClass,
     /// Opaque metadata from the port registration (e.g., BAR0 info)
     metadata_buf: [u8; 64],
     /// Actual length of metadata
@@ -98,7 +102,7 @@ impl SpawnContext {
     pub(crate) fn new(
         name_buf: &[u8; 64],
         name_len: usize,
-        port_type: crate::devd::PortType,
+        port_class: abi::PortClass,
         metadata: &[u8],
     ) -> Self {
         let len = name_len.min(64) as u8;
@@ -108,7 +112,7 @@ impl SpawnContext {
         let mut metadata_buf = [0u8; 64];
         metadata_buf[..meta_len as usize].copy_from_slice(&metadata[..meta_len as usize]);
         Self {
-            name, name_len: len, port_type,
+            name, name_len: len, port_class,
             metadata_buf, metadata_len: meta_len,
         }
     }
@@ -756,33 +760,15 @@ pub trait BusCtx {
     /// Acknowledge a spawn request.
     fn ack_spawn(&mut self, seq_id: u32, result: i32, pid: u32) -> Result<(), BusError>;
 
-    /// Register a port with devd.
+    /// Register a port with devd using unified PortInfo.
     ///
-    /// `shmem_id` is the DataPort shared memory ID (0 = no DataPort).
-    /// For Block ports, a non-zero shmem_id triggers block orchestration
-    /// in devd (spawns partd, sends ATTACH_DISK).
-    fn register_port(
+    /// This is the preferred method for new drivers. Uses the unified PortInfo
+    /// struct from abi crate which provides type-safe, structured metadata.
+    /// Supports class/subclass matching for spawn rules instead of string patterns.
+    fn register_port_with_info(
         &mut self,
-        name: &[u8],
-        port_type: crate::devd::PortType,
+        info: &abi::PortInfo,
         shmem_id: u32,
-        parent: Option<&[u8]>,
-    ) -> Result<(), BusError> {
-        self.register_port_with_metadata(name, port_type, shmem_id, parent, &[])
-    }
-
-    /// Register a port with devd including metadata.
-    ///
-    /// Metadata is opaque bytes stored alongside the port and delivered
-    /// to child drivers via their spawn context. Used e.g. to pass BAR0
-    /// info from pcied to nvmed without requiring a separate IPC channel.
-    fn register_port_with_metadata(
-        &mut self,
-        name: &[u8],
-        port_type: crate::devd::PortType,
-        shmem_id: u32,
-        parent: Option<&[u8]>,
-        metadata: &[u8],
     ) -> Result<(), BusError>;
 
     /// Report driver state to devd.

@@ -43,6 +43,9 @@ use super::traits::{Subscriber, WakeReason, Waitable, Closable, CloseAction};
 use super::waker::{SubscriberSet, WakeList};
 use super::error::IpcError;
 
+// Re-export PortInfo from abi crate
+pub use abi::{PortInfo, PortClass, port_subclass, port_caps};
+
 /// Timeout for pending connections (in ticks)
 pub const PENDING_TIMEOUT: u64 = 30_000; // ~30 seconds at 1kHz
 
@@ -146,10 +149,13 @@ pub struct Port {
 
     /// Subscribers for events
     subscribers: SubscriberSet,
+
+    /// Structured port info (optional - None for legacy ports)
+    port_info: Option<PortInfo>,
 }
 
 impl Port {
-    /// Create a new port
+    /// Create a new port (legacy - no PortInfo)
     pub fn new(id: PortId, name: &[u8], owner: TaskId, listen_channel: ChannelId) -> Self {
         let mut name_arr = [0u8; MAX_PORT_NAME];
         let len = core::cmp::min(name.len(), MAX_PORT_NAME);
@@ -164,6 +170,26 @@ impl Port {
             listen_channel,
             pending: [const { None }; MAX_PENDING_PER_PORT],
             subscribers: SubscriberSet::new(),
+            port_info: None,
+        }
+    }
+
+    /// Create a new port with structured PortInfo
+    pub fn new_with_info(id: PortId, name: &[u8], owner: TaskId, listen_channel: ChannelId, info: PortInfo) -> Self {
+        let mut name_arr = [0u8; MAX_PORT_NAME];
+        let len = core::cmp::min(name.len(), MAX_PORT_NAME);
+        name_arr[..len].copy_from_slice(&name[..len]);
+
+        Self {
+            id,
+            name: name_arr,
+            name_len: len as u8,
+            owner,
+            state: PortState::Listening { pending_count: 0 },
+            listen_channel,
+            pending: [const { None }; MAX_PENDING_PER_PORT],
+            subscribers: SubscriberSet::new(),
+            port_info: Some(info),
         }
     }
 
@@ -178,6 +204,7 @@ impl Port {
             listen_channel: 0,
             pending: [const { None }; MAX_PENDING_PER_PORT],
             subscribers: SubscriberSet::new(),
+            port_info: None,
         }
     }
 
@@ -213,6 +240,16 @@ impl Port {
     /// Check if names match
     pub fn name_matches(&self, name: &[u8]) -> bool {
         self.name_len as usize == name.len() && self.name() == name
+    }
+
+    /// Get structured port info (if available)
+    pub fn port_info(&self) -> Option<&PortInfo> {
+        self.port_info.as_ref()
+    }
+
+    /// Set structured port info
+    pub fn set_port_info(&mut self, info: PortInfo) {
+        self.port_info = Some(info);
     }
 
     // ========================================================================
@@ -400,11 +437,24 @@ impl PortRegistry {
     // Operations
     // ========================================================================
 
-    /// Register a new port
+    /// Register a new port (legacy - no PortInfo)
     ///
     /// Creates a listen channel for the port.
     /// Returns (port_id, listen_channel_id).
     pub fn register(&mut self, name: &[u8], owner: TaskId, channel_table: &mut ChannelTable) -> Result<(PortId, ChannelId), IpcError> {
+        self.register_inner(name, owner, channel_table, None)
+    }
+
+    /// Register a new port with structured PortInfo
+    ///
+    /// Creates a listen channel for the port and attaches device classification info.
+    /// Returns (port_id, listen_channel_id).
+    pub fn register_with_info(&mut self, name: &[u8], owner: TaskId, channel_table: &mut ChannelTable, info: PortInfo) -> Result<(PortId, ChannelId), IpcError> {
+        self.register_inner(name, owner, channel_table, Some(info))
+    }
+
+    /// Internal registration implementation
+    fn register_inner(&mut self, name: &[u8], owner: TaskId, channel_table: &mut ChannelTable, info: Option<PortInfo>) -> Result<(PortId, ChannelId), IpcError> {
         // Check name length
         if name.is_empty() || name.len() > MAX_PORT_NAME {
             return Err(IpcError::port_exists(name)); // Use exists for bad name too
@@ -425,8 +475,11 @@ impl PortRegistry {
         let port_id = self.next_id;
         self.next_id += 1;
 
-        // Create port
-        self.ports[slot] = Some(Port::new(port_id, name, owner, listen_ch));
+        // Create port (with or without PortInfo)
+        self.ports[slot] = Some(match info {
+            Some(pi) => Port::new_with_info(port_id, name, owner, listen_ch, pi),
+            None => Port::new(port_id, name, owner, listen_ch),
+        });
         self.active_count += 1;
 
         Ok((port_id, listen_ch))

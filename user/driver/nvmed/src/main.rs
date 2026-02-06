@@ -19,10 +19,10 @@ use userlib::mmio::{MmioRegion, DmaPool};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, BlockGeometry, bus_msg,
+    PortInfo, PortClass, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{io_op, io_status, side_msg};
-use userlib::devd::PortType;
 use userlib::{uinfo, uerror};
 
 // =============================================================================
@@ -739,10 +739,12 @@ impl Driver for NvmeDriver {
         }
         self.port_id = Some(port_id);
 
-        // Register block port with devd including shmem_id
+        // Register block port with devd using unified PortInfo
         // Non-zero shmem_id triggers block orchestration (devd spawns partd)
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
-        let _ = ctx.register_port(b"nvme0:", PortType::Block, shmem_id, None);
+        let mut info = PortInfo::new(b"nvme0:", PortClass::Block);
+        info.port_subclass = port_subclass::BLOCK_RAW;
+        let _ = ctx.register_port_with_info(&info, shmem_id);
 
         uinfo!("nvmed", "ready"; blocks = block_count, block_size = block_size);
 

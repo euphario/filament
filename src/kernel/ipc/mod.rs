@@ -106,6 +106,7 @@ pub use types::{Message, MessageHeader, MessageType, ChannelId, MAX_INLINE_PAYLO
 pub use error::IpcError;
 pub use traits::{WakeReason, Waitable, Closable};
 pub use table::{PeerInfo, PeerInfoList};
+pub use port::{PortInfo, PortClass, port_subclass, port_caps};
 // Note: KernelIpcBackend exists in backend.rs for trait-based testing
 // but is not re-exported since ObjectService handles operations directly
 
@@ -254,10 +255,20 @@ pub fn remove_subscriber_from_all(task_id: u32) {
 // Port operations
 // ============================================================================
 
-/// Register a new port
+/// Register a new port (legacy - no PortInfo)
 pub fn port_register(name: &[u8], owner: u32) -> Result<(u32, ChannelId), IpcError> {
     with_both_tables(|chan_table, port_reg| {
         port_reg.register(name, owner, chan_table)
+    })
+}
+
+/// Register a new port with structured PortInfo
+///
+/// The PortInfo provides device classification (class, subclass, capabilities)
+/// that enables type-safe rule matching in devd.
+pub fn port_register_with_info(name: &[u8], owner: u32, info: port::PortInfo) -> Result<(u32, ChannelId), IpcError> {
+    with_both_tables(|chan_table, port_reg| {
+        port_reg.register_with_info(name, owner, chan_table, info)
     })
 }
 

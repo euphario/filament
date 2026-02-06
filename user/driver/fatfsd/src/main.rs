@@ -35,11 +35,11 @@ use userlib::syscall;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
+    PortInfo, PortClass, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, SideEntry, io_status, side_msg, side_status};
 use userlib::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
-use userlib::devd::PortType;
 use userlib::{uinfo, uerror};
 
 const FAT_CACHE_ENTRIES: usize = 8192;
@@ -909,13 +909,10 @@ impl FatfsDriver {
                             self.port_name[..pname_len].copy_from_slice(&pname[..pname_len]);
                             self.port_name_len = pname_len;
 
-                            // Register as Filesystem port with devd
-                            let _ = ctx.register_port(
-                                &pname[..pname_len],
-                                PortType::Filesystem,
-                                vfs_shmem_id,
-                                None,
-                            );
+                            // Register as Filesystem port with devd using unified PortInfo
+                            let mut info = PortInfo::new(&pname[..pname_len], PortClass::Filesystem);
+                            info.port_subclass = port_subclass::FS_FAT;
+                            let _ = ctx.register_port_with_info(&info, vfs_shmem_id);
 
                             uinfo!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
 

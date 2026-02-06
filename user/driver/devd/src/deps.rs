@@ -191,6 +191,8 @@ mod tests {
     #[test]
     fn test_deps_with_ports() {
         use crate::service::Service;
+        use crate::ports::PortRegistry;
+        use abi::{PortInfo, PortClass};
 
         let deps = Dependencies::new();
         let mut ports = Ports::new();
@@ -203,7 +205,8 @@ mod tests {
         assert!(!deps.satisfied(&service, &ports));
 
         // Register console: port
-        ports.register(b"console:", 0).unwrap();
+        let info = PortInfo::new(b"console:", PortClass::Console);
+        ports.register_with_port_info(&info, 0, 0).unwrap();
 
         // Now deps should be satisfied
         assert!(deps.satisfied(&service, &ports));

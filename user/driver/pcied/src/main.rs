@@ -21,9 +21,9 @@ use userlib::{uinfo, uerror};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId,
     KernelBusState, KernelBusChangeReason, bus_msg,
+    PortInfo, PortClass, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
-use userlib::devd::PortType;
 
 // ============================================================================
 // Logging — uses structured ulog macros from userlib
@@ -64,12 +64,18 @@ fn class_name(base_class: u8, subclass: u8, prog_if: u8) -> &'static str {
     }
 }
 
-fn port_type(base_class: u8, subclass: u8, prog_if: u8) -> PortType {
+fn port_class_subclass(base_class: u8, subclass: u8, prog_if: u8) -> (PortClass, u16) {
     match (base_class, subclass, prog_if) {
-        (pci_class::SERIAL_BUS, pci_subclass::USB, pci_prog_if::XHCI) => PortType::Usb,
-        (pci_class::MASS_STORAGE, pci_subclass::NVME, _) => PortType::Storage,
-        (pci_class::NETWORK, _, _) => PortType::Network,
-        _ => PortType::Service,
+        (pci_class::SERIAL_BUS, pci_subclass::USB, pci_prog_if::XHCI) => {
+            (PortClass::Usb, port_subclass::USB_XHCI)
+        }
+        (pci_class::MASS_STORAGE, pci_subclass::NVME, _) => {
+            (PortClass::StorageController, port_subclass::STORAGE_NVME)
+        }
+        (pci_class::NETWORK, _, _) => {
+            (PortClass::Network, port_subclass::NET_ETHERNET)
+        }
+        _ => (PortClass::Service, 0),
     }
 }
 
@@ -238,17 +244,23 @@ impl Driver for PcieDriver {
             }
         }
 
-        // Register per-device ports with devd including BAR0 metadata
+        // Register per-device ports with devd using unified PortInfo
         for idx in 0..self.count {
             let entry = &self.entries[idx];
             let mut name_buf = [0u8; 32];
             let name_len = format_port_name(entry, &mut name_buf);
             let name = &name_buf[..name_len];
 
-            // BAR0 metadata: [bar0_phys: u64 LE, bar0_size: u32 LE]
-            let metadata = bar0_metadata(entry);
-            let pt = port_type(entry.base_class(), entry.subclass(), entry.prog_if());
-            let _ = ctx.register_port_with_metadata(name, pt, 0, None, &metadata);
+            // Build PortInfo with class/subclass and vendor/device IDs
+            let (class, subclass) = port_class_subclass(
+                entry.base_class(), entry.subclass(), entry.prog_if()
+            );
+            let mut info = PortInfo::new(name, class);
+            info.port_subclass = subclass;
+            info.vendor_id = entry.vendor_id;
+            info.device_id = entry.device_id;
+
+            let _ = ctx.register_port_with_info(&info, 0);
 
             uinfo!("pcied", "port_registered";
                 name = core::str::from_utf8(name).unwrap_or("?"),

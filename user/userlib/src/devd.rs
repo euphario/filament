@@ -18,7 +18,8 @@
 //! ## Example
 //!
 //! ```rust
-//! use userlib::devd::{DevdClient, PortType, DeviceClass, DriverState};
+//! use userlib::devd::{DevdClient, DriverState};
+//! use abi::{PortInfo, PortClass, port_subclass};
 //!
 //! // Connect to devd
 //! let mut client = DevdClient::connect()?;
@@ -26,16 +27,18 @@
 //! // Report ready state
 //! client.report_state(DriverState::Ready)?;
 //!
-//! // Register a block port
-//! client.register_port(b"disk0:", PortType::Block, None)?;
+//! // Register a block port using PortInfo
+//! let mut info = PortInfo::new(b"disk0:", PortClass::Block);
+//! info.port_subclass = port_subclass::BLOCK_RAW;
+//! client.register_port_info(&info, shmem_id)?;
 //!
 //! // In event loop, check for commands from devd
 //! if let Some(cmd) = client.poll_command()? {
 //!     match cmd {
-//!         DevdCommand::SpawnChild { binary, trigger } => {
+//!         DevdCommand::SpawnChild { binary, binary_len, seq_id, .. } => {
 //!             // Spawn the child with restricted capabilities
-//!             let pid = spawn_with_caps(binary, my_caps.restrict(...))?;
-//!             client.ack_spawn(cmd.seq_id, 0, pid)?;
+//!             let pid = spawn_with_caps(&binary[..binary_len], caps)?;
+//!             client.ack_spawn(seq_id, 0, pid)?;
 //!         }
 //!         _ => {}
 //!     }
@@ -63,7 +66,7 @@ pub mod caps {
 use crate::ipc::{Channel, ObjHandle};
 use crate::syscall;
 use crate::query::{
-    QueryHeader, PortRegister, PortRegisterResponse, DeviceRegister,
+    QueryHeader, PortRegisterResponse, DeviceRegister,
     ListDevices, DeviceListResponse, StateChange, SpawnChild, SpawnAck,
     PortFilter, filter_mode, GetSpawnContext, SpawnContextResponse,
     QueryPort, PortInfoResponse, UpdatePortShmemId,
@@ -74,32 +77,6 @@ use crate::query::{
     PartitionInfoMsg,
     msg, port_type, error, class, driver_state,
 };
-
-// =============================================================================
-// Port Types (re-export for convenience)
-// =============================================================================
-
-/// Port type for registration
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PortType {
-    /// Console port (keyboard/display)
-    Console = port_type::CONSOLE,
-    /// Block device port (disk)
-    Block = port_type::BLOCK,
-    /// Network port
-    Network = port_type::NETWORK,
-    /// Partition port
-    Partition = port_type::PARTITION,
-    /// USB port
-    Usb = port_type::USB,
-    /// Filesystem port
-    Filesystem = port_type::FILESYSTEM,
-    /// Service port
-    Service = port_type::SERVICE,
-    /// Mass storage controller (NVMe, AHCI, etc.)
-    Storage = port_type::STORAGE,
-}
 
 // =============================================================================
 // Device Classes (re-export for convenience)
@@ -441,9 +418,9 @@ impl DevdClient {
     /// Call this when your driver starts to learn which port to connect to.
     /// devd tracks spawn context by PID and returns the trigger port name.
     ///
-    /// Returns (port_name, port_type) if this driver was spawned by devd rules,
+    /// Returns (port_name, port_class, metadata) if this driver was spawned by devd rules,
     /// or None if no context available (e.g., manually started driver).
-    pub fn get_spawn_context(&mut self) -> Result<Option<([u8; 64], usize, PortType, [u8; 64], usize)>, SysError> {
+    pub fn get_spawn_context(&mut self) -> Result<Option<([u8; 64], usize, abi::PortClass, [u8; 64], usize)>, SysError> {
         // Retry outer loop handles NOT_FOUND race condition.
         // When a parent driver spawns a child, the child might query spawn
         // context before devd has processed the SPAWN_ACK that maps PID → context.
@@ -476,17 +453,18 @@ impl DevdClient {
                                     let mut meta = [0u8; 64];
                                     let meta_len = (resp.metadata_len as usize).min(64);
                                     meta[..meta_len].copy_from_slice(&metadata[..meta_len]);
-                                    let ptype = match resp.port_type {
-                                        port_type::BLOCK => PortType::Block,
-                                        port_type::PARTITION => PortType::Partition,
-                                        port_type::NETWORK => PortType::Network,
-                                        port_type::CONSOLE => PortType::Console,
-                                        port_type::USB => PortType::Usb,
-                                        port_type::FILESYSTEM => PortType::Filesystem,
-                                        port_type::STORAGE => PortType::Storage,
-                                        _ => PortType::Service,
+                                    // Convert legacy port_type to PortClass
+                                    let pclass = match resp.port_type {
+                                        port_type::BLOCK | port_type::PARTITION => abi::PortClass::Block,
+                                        port_type::NETWORK => abi::PortClass::Network,
+                                        port_type::CONSOLE => abi::PortClass::Console,
+                                        port_type::USB => abi::PortClass::Usb,
+                                        port_type::FILESYSTEM => abi::PortClass::Filesystem,
+                                        port_type::STORAGE => abi::PortClass::StorageController,
+                                        port_type::SERVICE => abi::PortClass::Service,
+                                        _ => abi::PortClass::Unknown,
                                     };
-                                    return Ok(Some((name, len, ptype, meta, meta_len)));
+                                    return Ok(Some((name, len, pclass, meta, meta_len)));
                                 }
                                 // NOT_FOUND - might be race with SPAWN_ACK, retry
                                 if resp.result == error::NOT_FOUND && retry < SPAWN_ACK_RETRIES - 1 {
@@ -516,62 +494,28 @@ impl DevdClient {
     // Port/Device Registration (driver → devd)
     // =========================================================================
 
-    /// Register a port with devd
+    /// Register a port with devd using unified PortInfo struct
     ///
-    /// # Arguments
-    /// * `name` - Port name (e.g., b"disk0:")
-    /// * `port_type` - Type of port
-    /// * `parent` - Optional parent port name
-    pub fn register_port(
+    /// This is the preferred method for new drivers. Uses the unified PortInfo
+    /// struct from abi crate which provides type-safe, structured metadata.
+    pub fn register_port_info(
         &mut self,
-        name: &[u8],
-        port_type: PortType,
-        parent: Option<&[u8]>,
-    ) -> Result<(), SysError> {
-        self.register_port_full(name, port_type, 0, parent, &[])
-    }
-
-    /// Register a port with devd including DataPort shmem_id
-    ///
-    /// # Arguments
-    /// * `name` - Port name (e.g., b"disk0:")
-    /// * `port_type` - Type of port
-    /// * `shmem_id` - DataPort shared memory ID (0 = no DataPort)
-    /// * `parent` - Optional parent port name
-    pub fn register_port_with_dataport(
-        &mut self,
-        name: &[u8],
-        port_type: PortType,
+        info: &abi::PortInfo,
         shmem_id: u32,
-        parent: Option<&[u8]>,
     ) -> Result<(), SysError> {
-        self.register_port_full(name, port_type, shmem_id, parent, &[])
-    }
+        use crate::query::PortRegisterInfo;
 
-    /// Register a port with devd including DataPort shmem_id and metadata
-    ///
-    /// Metadata is opaque bytes stored with the port and passed to child
-    /// drivers via spawn context. Used e.g. to deliver BAR0 address info
-    /// from pcied to child drivers without requiring a separate IPC channel.
-    pub fn register_port_full(
-        &mut self,
-        name: &[u8],
-        port_type: PortType,
-        shmem_id: u32,
-        parent: Option<&[u8]>,
-        metadata: &[u8],
-    ) -> Result<(), SysError> {
         let seq_id = self.next_seq();
         let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
-        let reg = PortRegister::new(seq_id, port_type as u8);
+        let reg = PortRegisterInfo::new(seq_id, shmem_id);
         let mut buf = [0u8; 256];
-        let len = reg.write_to_with_metadata(&mut buf, name, parent, shmem_id, metadata)
+        let len = reg.write_to(&mut buf, info)
             .ok_or(SysError::InvalidArgument)?;
 
         channel.send(&buf[..len])?;
 
-        // Wait for response
+        // Wait for response (same response type as REGISTER_PORT)
         let mut resp_buf = [0u8; 64];
         for _ in 0..Self::MAX_RETRIES {
             match channel.recv(&mut resp_buf) {
@@ -579,7 +523,8 @@ impl DevdClient {
                     let header = QueryHeader::from_bytes(&resp_buf)
                         .ok_or(SysError::IoError)?;
 
-                    if header.msg_type == msg::REGISTER_PORT {
+                    // Accept either REGISTER_PORT or REGISTER_PORT_INFO as response type
+                    if header.msg_type == msg::REGISTER_PORT || header.msg_type == msg::REGISTER_PORT_INFO {
                         let result = i32::from_le_bytes([
                             resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
                         ]);
@@ -696,21 +641,6 @@ impl DevdClient {
             }
         }
         Err(SysError::Timeout)
-    }
-
-    /// Register both a port and device in one call
-    pub fn register_port_and_device<'a>(
-        &mut self,
-        name: &'a [u8],
-        port_type: PortType,
-        mut device_info: DeviceInfo<'a>,
-    ) -> Result<Option<u32>, SysError> {
-        self.register_port(name, port_type, None)?;
-        device_info.port_name = name;
-        match self.register_device(device_info) {
-            Ok(id) => Ok(Some(id)),
-            Err(_) => Ok(None),
-        }
     }
 
     // =========================================================================
@@ -1360,31 +1290,6 @@ impl Drop for DevdClient {
     fn drop(&mut self) {
         self.disconnect();
     }
-}
-
-// =============================================================================
-// Convenience Functions
-// =============================================================================
-
-/// Register a block device port with devd
-pub fn register_block_device(name: &[u8]) -> Result<DevdClient, SysError> {
-    let mut client = DevdClient::connect()?;
-    client.register_port(name, PortType::Block, None)?;
-    client.register_device(DeviceInfo {
-        port_name: name,
-        class: DeviceClass::MassStorage,
-        subclass: 0x06,
-        name: b"Block Device",
-        ..Default::default()
-    })?;
-    Ok(client)
-}
-
-/// Register a partition port with devd
-pub fn register_partition(name: &[u8], parent: &[u8]) -> Result<DevdClient, SysError> {
-    let mut client = DevdClient::connect()?;
-    client.register_port(name, PortType::Partition, Some(parent))?;
-    Ok(client)
 }
 
 // =============================================================================

@@ -105,6 +105,8 @@ pub mod msg {
     pub const PARTITION_READY: u16 = 0x010A;
     /// Mount ready notification (reserved)
     pub const MOUNT_READY: u16 = 0x010B;
+    /// Register port with full PortInfo (unified enumeration)
+    pub const REGISTER_PORT_INFO: u16 = 0x010C;
 
     // Query messages (client → devd → driver)
     /// List all registered devices
@@ -327,7 +329,7 @@ impl DeviceRegister {
 // Port Registration Messages
 // =============================================================================
 
-/// Port type constants (matches devd/ports.rs PortType enum)
+/// Wire protocol port type constants
 pub mod port_type {
     pub const UNKNOWN: u8 = 0;
     pub const BLOCK: u8 = 1;
@@ -530,6 +532,69 @@ impl PortRegisterResponse {
         buf[0..8].copy_from_slice(&self.header.to_bytes());
         buf[8..12].copy_from_slice(&self.result.to_le_bytes());
         buf
+    }
+}
+
+// =============================================================================
+// Port Registration with PortInfo (unified enumeration)
+// =============================================================================
+
+/// Register port with full PortInfo (driver → devd)
+///
+/// Uses the unified PortInfo struct from abi crate for type-safe,
+/// structured port metadata. This replaces the legacy PortRegister
+/// for new drivers.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PortRegisterInfo {
+    pub header: QueryHeader,
+    /// Shared memory ID for DataPort (0 = no data port)
+    pub shmem_id: u32,
+    /// Padding for alignment
+    pub _pad: u32,
+    // Followed by PortInfo bytes (112 bytes)
+}
+
+impl PortRegisterInfo {
+    /// Fixed header size before PortInfo
+    pub const HEADER_SIZE: usize = QueryHeader::SIZE + 8;
+    /// Total message size including PortInfo
+    pub const SIZE: usize = Self::HEADER_SIZE + 112; // PortInfo is 112 bytes
+
+    pub fn new(seq_id: u32, shmem_id: u32) -> Self {
+        Self {
+            header: QueryHeader::new(msg::REGISTER_PORT_INFO, seq_id),
+            shmem_id,
+            _pad: 0,
+        }
+    }
+
+    /// Serialize to buffer with PortInfo, returns total length written
+    pub fn write_to(&self, buf: &mut [u8], info: &abi::PortInfo) -> Option<usize> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8..12].copy_from_slice(&self.shmem_id.to_le_bytes());
+        buf[12..16].copy_from_slice(&self._pad.to_le_bytes());
+        // Copy PortInfo bytes
+        let info_bytes: &[u8; 112] = unsafe { &*(info as *const abi::PortInfo as *const [u8; 112]) };
+        buf[16..128].copy_from_slice(info_bytes);
+        Some(Self::SIZE)
+    }
+
+    /// Deserialize header from bytes (PortInfo follows at offset 16)
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let header = QueryHeader::from_bytes(&buf[0..8])?;
+        let shmem_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let info_bytes = &buf[16..128];
+        Some((
+            Self { header, shmem_id, _pad: 0 },
+            info_bytes,
+        ))
     }
 }
 

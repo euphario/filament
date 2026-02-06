@@ -1054,3 +1054,350 @@ impl PipeMessageHeader {
         }
     }
 }
+
+// ============================================================================
+// Port Enumeration (Unified Device Discovery)
+// ============================================================================
+
+/// High-level device/port classification
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortClass {
+    Unknown = 0,
+
+    // Storage
+    Block = 1,              // Disk, partition, ramdisk
+    StorageController = 2,  // NVMe, AHCI, SCSI controller
+
+    // Network
+    Network = 3,            // Ethernet, WiFi, switch port
+
+    // Bus controllers
+    Usb = 4,                // USB host controller or device
+    Pcie = 5,               // PCIe root port or endpoint
+
+    // Filesystems
+    Filesystem = 6,         // Mounted filesystem
+
+    // Platform
+    Console = 7,            // TTY, serial port
+    Gpio = 8,               // GPIO bank
+    I2c = 9,                // I2C bus
+    Spi = 10,               // SPI bus
+
+    // Services
+    Service = 11,           // Generic service port
+}
+
+impl PortClass {
+    pub fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            0 => Some(PortClass::Unknown),
+            1 => Some(PortClass::Block),
+            2 => Some(PortClass::StorageController),
+            3 => Some(PortClass::Network),
+            4 => Some(PortClass::Usb),
+            5 => Some(PortClass::Pcie),
+            6 => Some(PortClass::Filesystem),
+            7 => Some(PortClass::Console),
+            8 => Some(PortClass::Gpio),
+            9 => Some(PortClass::I2c),
+            10 => Some(PortClass::Spi),
+            11 => Some(PortClass::Service),
+            _ => None,
+        }
+    }
+}
+
+/// Port subclass constants (class-specific values)
+pub mod port_subclass {
+    // Block subclasses (partition types from MBR/GPT)
+    pub const BLOCK_RAW: u16 = 0x00;        // Unpartitioned disk
+    pub const BLOCK_FAT12: u16 = 0x01;
+    pub const BLOCK_FAT16: u16 = 0x06;
+    pub const BLOCK_FAT32: u16 = 0x0b;
+    pub const BLOCK_FAT32_LBA: u16 = 0x0c;
+    pub const BLOCK_LINUX: u16 = 0x83;
+    pub const BLOCK_GPT: u16 = 0xee;
+
+    // USB subclasses (from interface class)
+    pub const USB_XHCI: u16 = 0x30;
+    pub const USB_HUB: u16 = 0x09;
+    pub const USB_MSC: u16 = 0x08;
+    pub const USB_HID: u16 = 0x03;
+
+    // Network subclasses
+    pub const NET_ETHERNET: u16 = 0x00;
+    pub const NET_WIFI: u16 = 0x01;
+    pub const NET_SWITCH_PORT: u16 = 0x02;
+
+    // Storage controller subclasses
+    pub const STORAGE_NVME: u16 = 0x02;
+    pub const STORAGE_AHCI: u16 = 0x06;
+
+    // Filesystem subclasses
+    pub const FS_FAT: u16 = 0x01;
+    pub const FS_EXT4: u16 = 0x02;
+    pub const FS_RAMFS: u16 = 0x10;
+}
+
+/// Port capability bitflags
+pub mod port_caps {
+    pub const DMA: u16       = 1 << 0;   // Can do DMA
+    pub const IRQ: u16       = 1 << 1;   // Has interrupt
+    pub const MMIO: u16      = 1 << 2;   // Has MMIO region
+    pub const READONLY: u16  = 1 << 3;   // Read-only device
+    pub const REMOVABLE: u16 = 1 << 4;   // Hot-pluggable
+    pub const INTERNAL: u16  = 1 << 5;   // Not user-facing
+    pub const BOOTABLE: u16  = 1 << 6;   // Can boot from
+    pub const MULTIDRV: u16  = 1 << 7;   // Supports multiple drivers
+}
+
+/// Maximum port name length
+pub const PORT_NAME_MAX: usize = 32;
+
+/// Type-safe metadata for different port classes
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union PortMetadata {
+    /// Block device metadata
+    pub block: BlockMetadata,
+    /// Network port metadata
+    pub network: NetworkMetadata,
+    /// USB device metadata
+    pub usb: UsbMetadata,
+    /// Generic bytes (for classes without specific metadata)
+    pub raw: [u8; 24],
+}
+
+/// Block device metadata
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BlockMetadata {
+    /// Total size in bytes
+    pub size_bytes: u64,
+    /// Sector size (typically 512)
+    pub sector_size: u32,
+    /// Partition index (0 = whole disk)
+    pub partition_index: u8,
+    /// Flags
+    pub flags: u8,
+    /// Reserved
+    pub _reserved: [u8; 10],
+}
+
+/// Network port metadata
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NetworkMetadata {
+    /// MAC address (6 bytes)
+    pub mac: [u8; 6],
+    /// Port number (for switches)
+    pub port_number: u8,
+    /// Flags
+    pub flags: u8,
+    /// Link speed in Mbps (0 = unknown)
+    pub link_speed_mbps: u16,
+    /// VLAN ID (0 = none)
+    pub vlan_id: u16,
+    /// Reserved
+    pub _reserved: [u8; 12],
+}
+
+/// USB device metadata
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UsbMetadata {
+    /// USB device address
+    pub device_addr: u8,
+    /// USB speed (1=low, 2=full, 3=high, 4=super)
+    pub speed: u8,
+    /// Interface class
+    pub iface_class: u8,
+    /// Interface subclass
+    pub iface_subclass: u8,
+    /// Interface protocol
+    pub iface_protocol: u8,
+    /// Configuration number
+    pub config_num: u8,
+    /// Interface number
+    pub iface_num: u8,
+    /// Flags
+    pub flags: u8,
+    /// Reserved
+    pub _reserved: [u8; 16],
+}
+
+impl BlockMetadata {
+    pub const fn empty() -> Self {
+        Self {
+            size_bytes: 0,
+            sector_size: 512,
+            partition_index: 0,
+            flags: 0,
+            _reserved: [0; 10],
+        }
+    }
+}
+
+impl NetworkMetadata {
+    pub const fn empty() -> Self {
+        Self {
+            mac: [0; 6],
+            link_speed_mbps: 0,
+            port_number: 0,
+            vlan_id: 0,
+            flags: 0,
+            _reserved: [0; 12],
+        }
+    }
+}
+
+impl UsbMetadata {
+    pub const fn empty() -> Self {
+        Self {
+            device_addr: 0,
+            speed: 0,
+            iface_class: 0,
+            iface_subclass: 0,
+            iface_protocol: 0,
+            config_num: 0,
+            iface_num: 0,
+            flags: 0,
+            _reserved: [0; 16],
+        }
+    }
+}
+
+/// Unified port enumeration record
+///
+/// Used by both kernel (hardware discovery) and drivers (sub-device enumeration).
+/// This is the single source of truth for device information flowing through devd.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PortInfo {
+    /// Port name (becomes the IPC port name, null-terminated)
+    pub name: [u8; PORT_NAME_MAX],
+    /// Length of name (excluding null terminator)
+    pub name_len: u8,
+
+    /// What kind of port is this?
+    pub port_class: PortClass,
+
+    /// Subclass for finer matching (class-specific, see port_subclass)
+    pub port_subclass: u16,
+
+    /// Parent port name (empty = root level)
+    pub parent: [u8; PORT_NAME_MAX],
+    /// Length of parent name
+    pub parent_len: u8,
+
+    /// Hardware vendor ID (0 = not applicable)
+    pub vendor_id: u16,
+    /// Hardware device ID (0 = not applicable)
+    pub device_id: u16,
+
+    /// Capability flags (see port_caps)
+    pub caps: u16,
+
+    /// Type-safe metadata (interpretation depends on port_class)
+    pub metadata: PortMetadata,
+
+    /// Reserved for future use
+    pub _reserved: [u8; 4],
+}
+
+// Size assertion: ensure PortInfo has a stable size
+const _: () = assert!(core::mem::size_of::<PortInfo>() == 112);
+const _: () = assert!(core::mem::size_of::<PortMetadata>() == 24);
+const _: () = assert!(core::mem::size_of::<BlockMetadata>() == 24);
+const _: () = assert!(core::mem::size_of::<NetworkMetadata>() == 24);
+const _: () = assert!(core::mem::size_of::<UsbMetadata>() == 24);
+
+impl PortInfo {
+    /// Create an empty PortInfo
+    pub const fn empty() -> Self {
+        Self {
+            name: [0; PORT_NAME_MAX],
+            name_len: 0,
+            port_class: PortClass::Unknown,
+            port_subclass: 0,
+            parent: [0; PORT_NAME_MAX],
+            parent_len: 0,
+            vendor_id: 0,
+            device_id: 0,
+            caps: 0,
+            metadata: PortMetadata { raw: [0; 24] },
+            _reserved: [0; 4],
+        }
+    }
+
+    /// Create a new PortInfo with the given name and class
+    pub fn new(name: &[u8], class: PortClass) -> Self {
+        let mut info = Self::empty();
+        info.set_name(name);
+        info.port_class = class;
+        info
+    }
+
+    /// Set the port name
+    pub fn set_name(&mut self, name: &[u8]) {
+        let len = name.len().min(PORT_NAME_MAX - 1);
+        self.name[..len].copy_from_slice(&name[..len]);
+        self.name[len] = 0; // null terminate
+        self.name_len = len as u8;
+    }
+
+    /// Get the port name as a byte slice
+    pub fn name_bytes(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+
+    /// Set the parent port name
+    pub fn set_parent(&mut self, parent: &[u8]) {
+        let len = parent.len().min(PORT_NAME_MAX - 1);
+        self.parent[..len].copy_from_slice(&parent[..len]);
+        self.parent[len] = 0;
+        self.parent_len = len as u8;
+    }
+
+    /// Get the parent name as a byte slice
+    pub fn parent_bytes(&self) -> &[u8] {
+        &self.parent[..self.parent_len as usize]
+    }
+
+    /// Check if this port has a specific capability
+    pub fn has_cap(&self, cap: u16) -> bool {
+        (self.caps & cap) != 0
+    }
+
+    /// Set block metadata (only valid if port_class == Block)
+    pub fn set_block_metadata(&mut self, meta: BlockMetadata) {
+        self.metadata = PortMetadata { block: meta };
+    }
+
+    /// Set network metadata (only valid if port_class == Network)
+    pub fn set_network_metadata(&mut self, meta: NetworkMetadata) {
+        self.metadata = PortMetadata { network: meta };
+    }
+
+    /// Set USB metadata (only valid if port_class == Usb)
+    pub fn set_usb_metadata(&mut self, meta: UsbMetadata) {
+        self.metadata = PortMetadata { usb: meta };
+    }
+
+    /// Get block metadata (caller must verify port_class == Block)
+    pub unsafe fn block_metadata(&self) -> &BlockMetadata {
+        &self.metadata.block
+    }
+
+    /// Get network metadata (caller must verify port_class == Network)
+    pub unsafe fn network_metadata(&self) -> &NetworkMetadata {
+        &self.metadata.network
+    }
+
+    /// Get USB metadata (caller must verify port_class == Usb)
+    pub unsafe fn usb_metadata(&self) -> &UsbMetadata {
+        &self.metadata.usb
+    }
+}

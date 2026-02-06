@@ -4,6 +4,7 @@
 //! Supports hierarchical port trees (e.g., disk0: → part0:, part1:).
 //! Uses trait-based design for testability.
 
+use abi::{PortInfo, PortClass};
 use userlib::error::SysError;
 
 // =============================================================================
@@ -14,54 +15,10 @@ pub const MAX_PORT_NAME: usize = 32;
 pub const MAX_PORTS: usize = 64;
 
 // =============================================================================
-// Port Type
-// =============================================================================
-
-/// Type of port - used for matching rules and understanding hierarchy
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PortType {
-    /// Unknown or unspecified type
-    Unknown = 0,
-    /// Raw block device (scsi0:, nvme0:, disk0:)
-    Block = 1,
-    /// Partition on a block device (part0:, part1:)
-    Partition = 2,
-    /// Mounted filesystem (fat0:, ext0:)
-    Filesystem = 3,
-    /// USB endpoint or device
-    Usb = 4,
-    /// Network endpoint
-    Network = 5,
-    /// Console/TTY
-    Console = 6,
-    /// Service port (devd:, logd:)
-    Service = 7,
-    /// Mass storage controller (NVMe, AHCI, etc.)
-    Storage = 8,
-}
-
-impl PortType {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            1 => PortType::Block,
-            2 => PortType::Partition,
-            3 => PortType::Filesystem,
-            4 => PortType::Usb,
-            5 => PortType::Network,
-            6 => PortType::Console,
-            7 => PortType::Service,
-            8 => PortType::Storage,
-            _ => PortType::Unknown,
-        }
-    }
-}
-
-// =============================================================================
 // RegisteredPort
 // =============================================================================
 
-/// A registered port with optional parent for hierarchy
+/// A registered port with unified PortInfo
 #[derive(Clone, Copy)]
 pub struct RegisteredPort {
     /// Port name (e.g., "console:")
@@ -71,16 +28,12 @@ pub struct RegisteredPort {
     owner: u8,
     /// Is the port currently available?
     available: bool,
-    /// Port type for matching and hierarchy
-    port_type: PortType,
     /// Parent port index (0xFF = no parent / root)
     parent_idx: u8,
     /// DataPort shared memory ID (0 = no DataPort)
     shmem_id: u32,
-    /// Opaque metadata (e.g., BAR0 info from pcied)
-    metadata: [u8; 64],
-    /// Length of metadata
-    metadata_len: u8,
+    /// Unified port info
+    port_info: PortInfo,
 }
 
 /// No parent sentinel value
@@ -93,11 +46,9 @@ impl RegisteredPort {
             name_len: 0,
             owner: 0,
             available: false,
-            port_type: PortType::Unknown,
             parent_idx: NO_PARENT,
             shmem_id: 0,
-            metadata: [0; 64],
-            metadata_len: 0,
+            port_info: PortInfo::empty(),
         }
     }
 
@@ -118,8 +69,23 @@ impl RegisteredPort {
         self.available
     }
 
-    pub fn port_type(&self) -> PortType {
-        self.port_type
+    /// Get wire protocol port type (u8) derived from PortClass
+    /// Values: 0=Unknown, 1=Block, 2=Partition (Block with subclass), 3=Filesystem,
+    ///         4=Usb, 5=Network, 6=Console, 7=Service, 8=Storage
+    pub fn port_type(&self) -> u8 {
+        match self.port_info.port_class {
+            PortClass::Block => {
+                // Distinguish block vs partition by subclass
+                if self.port_info.port_subclass != 0 { 2 } else { 1 }
+            }
+            PortClass::Filesystem => 3,
+            PortClass::Usb => 4,
+            PortClass::Network => 5,
+            PortClass::Console => 6,
+            PortClass::Service => 7,
+            PortClass::StorageController => 8,
+            _ => 0,
+        }
     }
 
     pub fn parent_idx(&self) -> Option<u8> {
@@ -146,14 +112,40 @@ impl RegisteredPort {
         self.shmem_id = shmem_id;
     }
 
+    /// Get raw metadata bytes from PortInfo
     pub fn metadata(&self) -> &[u8] {
-        &self.metadata[..self.metadata_len as usize]
+        // Safety: accessing raw union field is always safe for reads
+        unsafe { &self.port_info.metadata.raw }
     }
 
-    pub fn set_metadata(&mut self, data: &[u8]) {
-        let len = data.len().min(64);
-        self.metadata[..len].copy_from_slice(&data[..len]);
-        self.metadata_len = len as u8;
+    /// Get unified PortInfo
+    pub fn port_info(&self) -> &PortInfo {
+        &self.port_info
+    }
+
+    /// Get port class
+    pub fn port_class(&self) -> PortClass {
+        self.port_info.port_class
+    }
+
+    /// Get port subclass
+    pub fn port_subclass(&self) -> u16 {
+        self.port_info.port_subclass
+    }
+
+    /// Get vendor ID
+    pub fn vendor_id(&self) -> u16 {
+        self.port_info.vendor_id
+    }
+
+    /// Get device ID
+    pub fn device_id(&self) -> u16 {
+        self.port_info.device_id
+    }
+
+    /// Get capability flags
+    pub fn caps(&self) -> u16 {
+        self.port_info.caps
     }
 }
 
@@ -163,38 +155,16 @@ impl RegisteredPort {
 
 /// Port registration and lookup trait
 pub trait PortRegistry {
-    /// Register a new port (root level, no parent)
-    fn register(&mut self, name: &[u8], owner: u8) -> Result<(), SysError>;
-
-    /// Register a child port with parent and type
-    fn register_child(
-        &mut self,
-        name: &[u8],
-        owner: u8,
-        parent: &[u8],
-        port_type: PortType,
-    ) -> Result<(), SysError>;
-
-    /// Register a port with type (root level)
-    fn register_typed(
-        &mut self,
-        name: &[u8],
-        owner: u8,
-        port_type: PortType,
-    ) -> Result<(), SysError>;
-
-    /// Register a port with type and DataPort shmem_id
-    fn register_with_dataport(
-        &mut self,
-        name: &[u8],
-        owner: u8,
-        port_type: PortType,
-        shmem_id: u32,
-        parent: Option<&[u8]>,
-    ) -> Result<(), SysError>;
-
     /// Update shmem_id for an existing port
     fn set_shmem_id(&mut self, name: &[u8], shmem_id: u32) -> Result<(), SysError>;
+
+    /// Register a port with unified PortInfo
+    fn register_with_port_info(
+        &mut self,
+        info: &PortInfo,
+        owner: u8,
+        shmem_id: u32,
+    ) -> Result<(), SysError>;
 
     /// Unregister a port by name
     fn unregister(&mut self, name: &[u8]);
@@ -210,9 +180,6 @@ pub trait PortRegistry {
 
     /// Get port by name
     fn get(&self, name: &[u8]) -> Option<&RegisteredPort>;
-
-    /// Get port type
-    fn port_type(&self, name: &[u8]) -> Option<PortType>;
 
     /// Get parent port name
     fn parent(&self, name: &[u8]) -> Option<&[u8]>;
@@ -320,10 +287,10 @@ impl Ports {
         self.find_slot(name).and_then(|i| self.ports[i].as_mut())
     }
 
-    /// Get the type of a registered port
+    /// Get the type of a registered port (wire protocol value)
     pub fn get_port_type(&self, name: &[u8]) -> Option<u8> {
         let slot = self.find_slot(name)?;
-        self.ports[slot].as_ref().map(|p| p.port_type as u8)
+        self.ports[slot].as_ref().map(|p| p.port_type())
     }
 
     /// Build full path by walking parent chain. Returns length written.
@@ -383,59 +350,46 @@ impl Ports {
 }
 
 impl PortRegistry for Ports {
-    fn register(&mut self, name: &[u8], owner: u8) -> Result<(), SysError> {
-        self.register_typed(name, owner, PortType::Unknown)
+    fn set_shmem_id(&mut self, name: &[u8], shmem_id: u32) -> Result<(), SysError> {
+        if let Some(idx) = self.find_slot(name) {
+            if let Some(port) = &mut self.ports[idx] {
+                port.shmem_id = shmem_id;
+                return Ok(());
+            }
+        }
+        Err(SysError::NotFound)
     }
 
-    fn register_child(
+    fn register_with_port_info(
         &mut self,
-        name: &[u8],
+        info: &PortInfo,
         owner: u8,
-        parent: &[u8],
-        port_type: PortType,
-    ) -> Result<(), SysError> {
-        self.register_with_dataport(name, owner, port_type, 0, Some(parent))
-    }
-
-    fn register_typed(
-        &mut self,
-        name: &[u8],
-        owner: u8,
-        port_type: PortType,
-    ) -> Result<(), SysError> {
-        self.register_with_dataport(name, owner, port_type, 0, None)
-    }
-
-    fn register_with_dataport(
-        &mut self,
-        name: &[u8],
-        owner: u8,
-        port_type: PortType,
         shmem_id: u32,
-        parent: Option<&[u8]>,
     ) -> Result<(), SysError> {
+        let name = info.name_bytes();
         if name.len() > MAX_PORT_NAME {
             return Err(SysError::InvalidArgument);
         }
 
-        // Find parent if specified
-        let parent_idx = match parent {
-            Some(p) => self.find_slot(p).ok_or(SysError::NotFound)? as u8,
-            None => NO_PARENT,
+        // Find parent if specified in PortInfo
+        let parent_idx = if info.parent_len > 0 {
+            let parent_name = info.parent_bytes();
+            self.find_slot(parent_name).ok_or(SysError::NotFound)? as u8
+        } else {
+            NO_PARENT
         };
 
         // Check for existing port
         if let Some(slot_idx) = self.find_slot(name) {
-            // Port exists - allow update if same owner (service re-registering with more info)
             if let Some(port) = &mut self.ports[slot_idx] {
                 if port.owner != owner {
                     return Err(SysError::AlreadyExists);
                 }
-                // Update with new info from the service
-                port.port_type = port_type;
+                // Update with new info
                 port.parent_idx = parent_idx;
                 port.shmem_id = shmem_id;
                 port.available = true;
+                port.port_info = *info;
                 return Ok(());
             }
         }
@@ -448,24 +402,14 @@ impl PortRegistry for Ports {
         port.name_len = name.len() as u8;
         port.owner = owner;
         port.available = true;
-        port.port_type = port_type;
         port.parent_idx = parent_idx;
         port.shmem_id = shmem_id;
+        port.port_info = *info;
 
         self.ports[slot_idx] = Some(port);
         self.count += 1;
 
         Ok(())
-    }
-
-    fn set_shmem_id(&mut self, name: &[u8], shmem_id: u32) -> Result<(), SysError> {
-        if let Some(idx) = self.find_slot(name) {
-            if let Some(port) = &mut self.ports[idx] {
-                port.shmem_id = shmem_id;
-                return Ok(());
-            }
-        }
-        Err(SysError::NotFound)
     }
 
     fn unregister(&mut self, name: &[u8]) {
@@ -498,10 +442,6 @@ impl PortRegistry for Ports {
 
     fn get(&self, name: &[u8]) -> Option<&RegisteredPort> {
         self.find_slot(name).and_then(|i| self.ports[i].as_ref())
-    }
-
-    fn port_type(&self, name: &[u8]) -> Option<PortType> {
-        self.get(name).map(|p| p.port_type)
     }
 
     fn parent(&self, name: &[u8]) -> Option<&[u8]> {
@@ -579,11 +519,24 @@ impl PortRegistry for Ports {
 mod tests {
     use super::*;
 
+    /// Helper to register a port with PortInfo
+    fn register_port(ports: &mut Ports, name: &[u8], owner: u8, class: PortClass) -> Result<(), SysError> {
+        let info = PortInfo::new(name, class);
+        ports.register_with_port_info(&info, owner, 0)
+    }
+
+    /// Helper to register a child port with PortInfo
+    fn register_child_port(ports: &mut Ports, name: &[u8], owner: u8, parent: &[u8], class: PortClass) -> Result<(), SysError> {
+        let mut info = PortInfo::new(name, class);
+        info.set_parent(parent);
+        ports.register_with_port_info(&info, owner, 0)
+    }
+
     #[test]
     fn test_register_unregister() {
         let mut ports = Ports::new();
 
-        assert!(ports.register(b"test:", 1).is_ok());
+        assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
         assert_eq!(ports.count(), 1);
         assert!(ports.available(b"test:"));
 
@@ -596,15 +549,15 @@ mod tests {
     fn test_duplicate_register() {
         let mut ports = Ports::new();
 
-        assert!(ports.register(b"test:", 1).is_ok());
-        assert!(ports.register(b"test:", 2).is_err());
+        assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
+        assert!(register_port(&mut ports, b"test:", 2, PortClass::Service).is_err());
     }
 
     #[test]
     fn test_availability() {
         let mut ports = Ports::new();
 
-        assert!(ports.register(b"test:", 1).is_ok());
+        assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
         assert!(ports.available(b"test:"));
 
         ports.set_availability(b"test:", false);
@@ -618,21 +571,20 @@ mod tests {
     fn test_find_owner() {
         let mut ports = Ports::new();
 
-        assert!(ports.register(b"test:", 42).is_ok());
+        assert!(register_port(&mut ports, b"test:", 42, PortClass::Service).is_ok());
         assert_eq!(ports.find_owner(b"test:"), Some(42));
         assert_eq!(ports.find_owner(b"nonexistent:"), None);
     }
 
     #[test]
-    fn test_port_type() {
+    fn test_port_class() {
         let mut ports = Ports::new();
 
-        assert!(ports.register_typed(b"disk0:", 1, PortType::Block).is_ok());
-        assert_eq!(ports.port_type(b"disk0:"), Some(PortType::Block));
+        assert!(register_port(&mut ports, b"disk0:", 1, PortClass::Block).is_ok());
+        assert_eq!(ports.get(b"disk0:").map(|p| p.port_class()), Some(PortClass::Block));
 
-        // Default register uses Unknown type
-        assert!(ports.register(b"other:", 2).is_ok());
-        assert_eq!(ports.port_type(b"other:"), Some(PortType::Unknown));
+        assert!(register_port(&mut ports, b"other:", 2, PortClass::Unknown).is_ok());
+        assert_eq!(ports.get(b"other:").map(|p| p.port_class()), Some(PortClass::Unknown));
     }
 
     #[test]
@@ -640,11 +592,11 @@ mod tests {
         let mut ports = Ports::new();
 
         // Register parent
-        assert!(ports.register_typed(b"disk0:", 1, PortType::Block).is_ok());
+        assert!(register_port(&mut ports, b"disk0:", 1, PortClass::Block).is_ok());
 
         // Register children
-        assert!(ports.register_child(b"part0:", 1, b"disk0:", PortType::Partition).is_ok());
-        assert!(ports.register_child(b"part1:", 1, b"disk0:", PortType::Partition).is_ok());
+        assert!(register_child_port(&mut ports, b"part0:", 1, b"disk0:", PortClass::Block).is_ok());
+        assert!(register_child_port(&mut ports, b"part1:", 1, b"disk0:", PortClass::Block).is_ok());
 
         // Check parent
         assert_eq!(ports.parent(b"part0:"), Some(b"disk0:".as_slice()));
@@ -658,9 +610,9 @@ mod tests {
         }
         assert_eq!(child_count, 2);
 
-        // Check types
-        assert_eq!(ports.port_type(b"part0:"), Some(PortType::Partition));
-        assert_eq!(ports.port_type(b"part1:"), Some(PortType::Partition));
+        // Check class
+        assert_eq!(ports.get(b"part0:").map(|p| p.port_class()), Some(PortClass::Block));
+        assert_eq!(ports.get(b"part1:").map(|p| p.port_class()), Some(PortClass::Block));
     }
 
     #[test]
@@ -668,7 +620,7 @@ mod tests {
         let mut ports = Ports::new();
 
         // Should fail - parent doesn't exist
-        let result = ports.register_child(b"part0:", 1, b"disk0:", PortType::Partition);
+        let result = register_child_port(&mut ports, b"part0:", 1, b"disk0:", PortClass::Block);
         assert!(result.is_err());
     }
 
@@ -677,11 +629,11 @@ mod tests {
         let mut ports = Ports::new();
 
         // Register two root ports
-        assert!(ports.register_typed(b"disk0:", 1, PortType::Block).is_ok());
-        assert!(ports.register_typed(b"console:", 2, PortType::Console).is_ok());
+        assert!(register_port(&mut ports, b"disk0:", 1, PortClass::Block).is_ok());
+        assert!(register_port(&mut ports, b"console:", 2, PortClass::Console).is_ok());
 
         // Register a child
-        assert!(ports.register_child(b"part0:", 1, b"disk0:", PortType::Partition).is_ok());
+        assert!(register_child_port(&mut ports, b"part0:", 1, b"disk0:", PortClass::Block).is_ok());
 
         // Only roots should be returned (count manually)
         let mut root_count = 0;
@@ -696,9 +648,9 @@ mod tests {
         let mut ports = Ports::new();
 
         // Build tree: pcie0 -> 00:02.0:xhci -> usb0:msc
-        assert!(ports.register_typed(b"pcie0", 1, PortType::Block).is_ok());
-        assert!(ports.register_child(b"00:02.0:xhci", 2, b"pcie0", PortType::Usb).is_ok());
-        assert!(ports.register_child(b"usb0:msc", 3, b"00:02.0:xhci", PortType::Block).is_ok());
+        assert!(register_port(&mut ports, b"pcie0", 1, PortClass::Pcie).is_ok());
+        assert!(register_child_port(&mut ports, b"00:02.0:xhci", 2, b"pcie0", PortClass::Usb).is_ok());
+        assert!(register_child_port(&mut ports, b"usb0:msc", 3, b"00:02.0:xhci", PortClass::Block).is_ok());
 
         let mut buf = [0u8; 128];
 
@@ -720,10 +672,10 @@ mod tests {
         let mut ports = Ports::new();
 
         // Build tree: disk0: -> part0:, part1: -> fat0:
-        assert!(ports.register_typed(b"disk0:", 1, PortType::Block).is_ok());
-        assert!(ports.register_child(b"part0:", 1, b"disk0:", PortType::Partition).is_ok());
-        assert!(ports.register_child(b"part1:", 1, b"disk0:", PortType::Partition).is_ok());
-        assert!(ports.register_child(b"fat0:", 2, b"part1:", PortType::Filesystem).is_ok());
+        assert!(register_port(&mut ports, b"disk0:", 1, PortClass::Block).is_ok());
+        assert!(register_child_port(&mut ports, b"part0:", 1, b"disk0:", PortClass::Block).is_ok());
+        assert!(register_child_port(&mut ports, b"part1:", 1, b"disk0:", PortClass::Block).is_ok());
+        assert!(register_child_port(&mut ports, b"fat0:", 2, b"part1:", PortClass::Filesystem).is_ok());
 
         // Walk and track what we see
         let mut count = 0;

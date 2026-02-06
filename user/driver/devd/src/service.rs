@@ -140,7 +140,7 @@ pub struct ServiceDef {
     pub parent: Option<&'static str>,
     /// Port name for spawn context (empty = no context)
     pub context_port: &'static [u8],
-    /// PortType of the context port
+    /// Wire protocol port type of the context port
     pub context_port_type: u8,
     /// Capability bits (0 = inherit parent's caps unchanged)
     pub caps: u64,

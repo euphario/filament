@@ -338,16 +338,52 @@ impl BusController {
         }
     }
 
-    /// Register the bus control port
+    /// Register the bus control port with structured PortInfo
     /// Called during kernel init
     pub fn register_port(&mut self, kernel_pid: Pid) -> Result<(), IpcError> {
         let name = self.port_name_str();
         kinfo!("bus", "register_port"; name = name);
 
-        let (_port_id, listen_ch) = ipc::port_register(name.as_bytes(), kernel_pid)?;
+        // Build PortInfo for this bus
+        let mut info = ipc::PortInfo::new(name.as_bytes(), self.port_class());
+        info.port_subclass = self.port_subclass();
+        info.caps = self.port_capabilities();
+
+        let (_port_id, listen_ch) = ipc::port_register_with_info(name.as_bytes(), kernel_pid, info)?;
 
         self.listen_channel = Some(listen_ch);
         Ok(())
+    }
+
+    /// Get the PortClass for this bus type
+    fn port_class(&self) -> ipc::PortClass {
+        match self.bus_type {
+            BusType::PCIe => ipc::PortClass::Pcie,
+            BusType::Usb => ipc::PortClass::Usb,
+            BusType::Platform => ipc::PortClass::Service,
+            BusType::Ethernet => ipc::PortClass::Network,
+        }
+    }
+
+    /// Get the port subclass for this bus type
+    fn port_subclass(&self) -> u16 {
+        match self.bus_type {
+            BusType::PCIe => 0, // Root port
+            BusType::Usb => ipc::port_subclass::USB_XHCI,
+            BusType::Platform => 0,
+            BusType::Ethernet => ipc::port_subclass::NET_ETHERNET,
+        }
+    }
+
+    /// Get capability flags for this bus type
+    fn port_capabilities(&self) -> u16 {
+        use ipc::port_caps;
+        match self.bus_type {
+            BusType::PCIe => port_caps::DMA | port_caps::IRQ | port_caps::MMIO,
+            BusType::Usb => port_caps::DMA | port_caps::IRQ | port_caps::MMIO,
+            BusType::Platform => port_caps::MMIO | port_caps::IRQ,
+            BusType::Ethernet => port_caps::DMA | port_caps::IRQ | port_caps::MMIO,
+        }
     }
 
     /// Check state machine invariants

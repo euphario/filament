@@ -204,14 +204,9 @@ impl Consoled {
     }
 
     pub fn init(&mut self) -> SysResult<()> {
-        // Skip terminal size detection at boot - causes blank output due to ANSI
-        // escape sequences interleaving with kernel logs. Shell can query via
-        // GETSIZE if needed. Defaults: 80x24
-
-        // Open stdin handle for use with Mux
         self.stdin_handle = syscall::open(ObjectType::Stdin, &[])?;
 
-        // Drain any stale input that accumulated before we were ready
+        // Drain any stale input
         let mut buf = [0u8; 64];
         loop {
             match syscall::read(self.stdin_handle, &mut buf) {
@@ -220,24 +215,17 @@ impl Consoled {
             }
         }
 
-        // Create event multiplexer
         let mux = Mux::new()?;
-
-        // Add stdin to mux (readable)
         mux.add(self.stdin_handle, MuxFilter::Readable)?;
 
-        // Register console port (limit: 1 shell connection)
         let port = Port::with_limit(b"console:", 1)?;
-
-        // Add port to mux (readable = accept pending)
         mux.add(port.handle(), MuxFilter::Readable)?;
 
         self.port = Some(port);
         self.mux = Some(mux);
 
-        // Announce ready to devd
+        // Connect to devd (optional - shell spawn works without this)
         if let Ok(devd_channel) = Channel::connect(b"devd:") {
-            // Keep the channel open - devd uses it to know we're alive
             self.devd_channel = Some(devd_channel);
         }
 
@@ -786,8 +774,7 @@ static mut CONSOLED: Consoled = Consoled::new();
 fn main() -> ! {
     let consoled = unsafe { &mut CONSOLED };
 
-    if let Err(e) = consoled.init() {
-        cerror!("init failed: {:?}", e);
+    if consoled.init().is_err() {
         syscall::exit(1);
     }
 

@@ -49,12 +49,12 @@ use service::{
     MAX_SERVICES, MAX_PORTS_PER_SERVICE, MAX_RESTARTS,
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
 };
-use ports::{PortRegistry, Ports, PortType};
+use ports::{PortRegistry, Ports};
 use process::{ProcessManager, SyscallProcessManager};
 use deps::{DependencyResolver, Dependencies};
 use devices::{DeviceStore, DeviceRegistry};
 use query::{QueryHandler, MSG_BUFFER_SIZE, MAX_QUERY_CLIENTS};
-// Path-based rules imported via `rules::find_path_rule()`
+// Class-based rules via `rules::find_class_rule()`
 
 // =============================================================================
 // Admin Client Handling (shell text commands)
@@ -667,8 +667,11 @@ impl Devd {
         self.query_port = Some(query_port);
         self.events = Some(events);
 
-        self.ports.register_typed(b"devd:", 0xFF, PortType::Service)?; // 0xFF = devd itself
-        self.ports.register_typed(b"devd-query:", 0xFF, PortType::Service)?;
+        // Register devd's own service ports using PortInfo
+        let mut devd_info = abi::PortInfo::new(b"devd:", abi::PortClass::Service);
+        let _ = self.ports.register_with_port_info(&devd_info, 0xFF, 0);
+        devd_info.set_name(b"devd-query:");
+        let _ = self.ports.register_with_port_info(&devd_info, 0xFF, 0);
 
         self.services.init_from_defs();
 
@@ -803,8 +806,7 @@ impl Devd {
         // Spawn the process (with caps if specified)
         let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
             Ok(result) => result,
-            Err(e) => {
-                uerror!("devd", "spawn_failed"; binary = binary);
+            Err(_) => {
                 self.services.transition(idx, ServiceState::Failed { code: -1 }, now);
                 return;
             }
@@ -858,7 +860,20 @@ impl Devd {
 
         // Pre-register ports this service will provide (not available yet)
         for pd in port_defs.iter().flatten() {
-            let _ = self.ports.register_typed(pd.name, idx as u8, PortType::from_u8(pd.port_type));
+            // Convert legacy port_type to PortClass
+            let port_class = match pd.port_type {
+                1 => abi::PortClass::Block,       // BLOCK
+                2 => abi::PortClass::Block,       // PARTITION
+                3 => abi::PortClass::Filesystem,  // FILESYSTEM
+                4 => abi::PortClass::Usb,         // USB
+                5 => abi::PortClass::Network,     // NETWORK
+                6 => abi::PortClass::Console,     // CONSOLE
+                7 => abi::PortClass::Service,     // SERVICE
+                8 => abi::PortClass::StorageController, // STORAGE
+                _ => abi::PortClass::Unknown,
+            };
+            let info = abi::PortInfo::new(pd.name, port_class);
+            let _ = self.ports.register_with_port_info(&info, idx as u8, 0);
             self.ports.set_availability(pd.name, false);
         }
 
@@ -1724,8 +1739,8 @@ impl Devd {
         let msg_type = QueryHeader::from_bytes(buf).map(|h| h.msg_type);
 
         match msg_type {
-            Some(msg::REGISTER_PORT) => {
-                self.handle_port_register_msg(slot, buf);
+            Some(msg::REGISTER_PORT_INFO) => {
+                self.handle_port_register_info_msg(slot, buf);
             }
             Some(msg::STATE_CHANGE) => {
                 self.handle_state_change_msg(slot, buf);
@@ -1791,11 +1806,12 @@ impl Devd {
         }
     }
 
-    fn handle_port_register_msg(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{error, port_type};
+    /// Handle REGISTER_PORT_INFO message (unified PortInfo registration)
+    fn handle_port_register_info_msg(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::error;
 
         // Parse the registration message
-        let info = match self.query_handler.parse_port_register(slot, buf) {
+        let info = match self.query_handler.parse_port_register_info(slot, buf) {
             Some(i) => i,
             None => {
                 // Permission denied or invalid format
@@ -1808,24 +1824,18 @@ impl Devd {
             }
         };
 
-        // Convert port_type u8 to PortType enum
-        let port_type_enum = PortType::from_u8(info.port_type);
-
-        // Register the port (with metadata if provided)
+        // Register the port with unified PortInfo
         let result = self.handle_port_registration(
-            info.name,
-            port_type_enum,
-            info.parent,
+            &info.port_info,
             info.owner_idx,
             info.shmem_id,
-            info.metadata,
         );
 
         // Send response
         let result_code = match result {
             Ok(()) => error::OK,
             Err(_e) => {
-                if let Ok(name_str) = core::str::from_utf8(info.name) {
+                if let Ok(name_str) = core::str::from_utf8(info.port_info.name_bytes()) {
                     uerror!("devd", "port_register_failed"; name = name_str, owner = info.owner_idx as u32);
                 }
                 error::INVALID_REQUEST
@@ -1942,7 +1952,7 @@ impl Devd {
 
             PortInfoResponse::success(
                 seq_id,
-                port.port_type() as u8,
+                port.port_type(),
                 flags,
                 port.shmem_id(),
                 owner_pid,
@@ -1972,7 +1982,7 @@ impl Devd {
         let seq_id = update.header.seq_id;
 
         // Get port info before updating (for orchestration check)
-        let port_type = self.ports.port_type(port_name);
+        let port_class = self.ports.get(port_name).map(|p| p.port_class());
         let owner_idx = self.ports.find_owner(port_name);
 
         // Update the port's shmem_id
@@ -1998,7 +2008,7 @@ impl Devd {
         // Track block device for ATTACH_DISK orchestration
         if result_code == error::OK
             && update.shmem_id != 0
-            && port_type == Some(PortType::Block)
+            && port_class == Some(abi::PortClass::Block)
         {
             if let Some(owner) = owner_idx {
                 self.track_and_attach_disk(port_name, update.shmem_id, owner);
@@ -2055,7 +2065,7 @@ impl Devd {
 
             let entry = PortEntry {
                 name,
-                port_type: port.port_type() as u8,
+                port_type: port.port_type(),
                 flags,
                 owner_idx: port.owner(),
                 parent_idx: port.parent_idx().unwrap_or(0xFF),
@@ -2517,7 +2527,7 @@ impl Devd {
 
             // Create a new service slot for this child with its binary name.
             // Use Starting state — the child hasn't reported Ready yet.
-            // This prevents check_path_rules from sending SpawnChild
+            // This prevents check_class_rules from sending SpawnChild
             // while the child is still in synchronous init() IPC.
             let slot_idx = match self.services.create_dynamic_service_with_state(
                 child_pid, binary_name, now, ServiceState::Starting,
@@ -2610,68 +2620,59 @@ impl Devd {
     // Dynamic Port Registration
     // =========================================================================
 
-    /// Handle a port registration request from a driver
+    /// Handle port registration with unified PortInfo
     ///
-    /// Called when a driver sends REGISTER_PORT to devd-query:.
-    /// Registers the port with hierarchy info and checks rules for auto-spawning.
+    /// Called when a driver sends REGISTER_PORT_INFO to devd-query:.
+    /// Uses the unified PortInfo struct for type-safe, structured metadata.
     pub fn handle_port_registration(
         &mut self,
-        port_name: &[u8],
-        port_type: PortType,
-        parent_name: Option<&[u8]>,
+        port_info: &abi::PortInfo,
         owner_idx: u8,
         shmem_id: u32,
-        metadata: &[u8],
     ) -> Result<(), SysError> {
-        // Register the port with DataPort info
-        self.ports.register_with_dataport(port_name, owner_idx, port_type, shmem_id, parent_name)?;
+        use crate::ports::PortRegistry;
 
-        // Store metadata on the port if provided
-        if !metadata.is_empty() {
-            if let Some(port) = self.ports.get_mut(port_name) {
-                port.set_metadata(metadata);
-            }
-        }
+        // Register the port with unified PortInfo
+        self.ports.register_with_port_info(port_info, owner_idx, shmem_id)?;
 
-        // Log registration
+        let port_name = port_info.name_bytes();
+
+        // Log registration with class info
         if let Ok(name_str) = core::str::from_utf8(port_name) {
             if shmem_id != 0 {
-                uinfo!("devd", "port_registered"; name = name_str, shmem_id = shmem_id);
+                uinfo!("devd", "port_info_registered";
+                    name = name_str,
+                    class = port_info.port_class as u16,
+                    subclass = port_info.port_subclass,
+                    shmem_id = shmem_id
+                );
             } else {
-                uinfo!("devd", "port_registered"; name = name_str);
+                uinfo!("devd", "port_info_registered";
+                    name = name_str,
+                    class = port_info.port_class as u16,
+                    subclass = port_info.port_subclass
+                );
             }
         }
 
         // Track block devices for ATTACH_DISK orchestration
-        if port_type == PortType::Block && shmem_id != 0 {
+        if port_info.port_class == abi::PortClass::Block && shmem_id != 0 {
             self.track_and_attach_disk(port_name, shmem_id, owner_idx);
         }
 
-        // Check path-based rules for auto-spawning
-        self.check_path_rules(port_name, owner_idx);
+        // Check class-based rules for auto-spawning
+        self.check_class_rules(port_info, owner_idx);
 
         Ok(())
     }
 
-    /// Check if any rules match a newly registered port
+    /// Check if any class-based rules match a newly registered port.
     ///
-    /// When a rule matches, we send SpawnChild to the port owner (parent driver)
-    /// instead of spawning directly. This ensures capabilities flow down properly:
-    /// - pcied registers USB port → rules engine spawns usbd
-    /// - usbd enumerates USB devices, registers block ports
-    /// - etc.
-    ///
-    /// IMPORTANT: SpawnChild is only sent after the owner has reported Ready.
-    /// This ensures the owner is in its event loop and can process commands.
-    /// Check if any path-based rules match a newly registered port.
-    ///
-    /// Builds the full path from the port's parent chain, then matches the
-    /// last segment's suffix against PATH_RULES. Longest suffix match wins.
-    fn check_path_rules(&mut self, port_name: &[u8], owner_idx: u8) {
-        // The last segment IS the port name itself (parent names are earlier segments)
-        let segment = port_name;
-
-        let rule = match rules::find_path_rule(segment) {
+    /// Uses PortInfo's class and subclass for type-safe rule matching.
+    /// This replaces the legacy string-based suffix matching for ports
+    /// registered via REGISTER_PORT_INFO.
+    fn check_class_rules(&mut self, port_info: &abi::PortInfo, owner_idx: u8) {
+        let rule = match rules::find_class_rule(port_info) {
             Some(r) => r,
             None => return,
         };
@@ -2681,7 +2682,13 @@ impl Devd {
             return;
         }
 
-        uinfo!("devd", "path_rule_matched"; suffix = rule.suffix, driver = rule.driver, owner = self.svc_name(owner_idx));
+        let port_name = port_info.name_bytes();
+        uinfo!("devd", "class_rule_matched";
+            class = port_info.port_class as u16,
+            subclass = port_info.port_subclass,
+            driver = rule.driver,
+            owner = self.svc_name(owner_idx)
+        );
 
         // Queue the spawn command
         self.queue_pending_spawn(owner_idx, rule.driver, port_name, rule.caps);
@@ -3083,19 +3090,21 @@ impl Devd {
             uinfo!("devd", "partition_ready"; name = name_str, shmem_id = ready.shmem_id);
         }
 
-        // Register the partition port with devd
+        // Get partition type for class-based rule matching and registration
+        let part_type = self.tracked_disks[disk_idx].partitions[part_idx].part_type;
         let disk = &self.tracked_disks[disk_idx];
         let disk_name = &disk.port_name[..disk.port_name_len as usize];
-        let _ = self.ports.register_with_dataport(
-            name,
-            self.partd_service_idx,
-            PortType::Partition,
-            ready.shmem_id,
-            Some(disk_name),
-        );
 
-        // Check path-based rules for this new partition port (triggers fatfsd spawn)
-        self.check_path_rules(name, self.partd_service_idx);
+        // Create PortInfo for the partition with MBR type as subclass
+        let mut port_info = abi::PortInfo::new(name, abi::PortClass::Block);
+        port_info.port_subclass = part_type as u16;  // MBR type codes map to port_subclass
+        port_info.set_parent(disk_name);
+
+        // Register the partition port with unified PortInfo
+        let _ = self.ports.register_with_port_info(&port_info, self.partd_service_idx, ready.shmem_id);
+
+        // Check class-based rules for auto-spawning filesystem drivers
+        self.check_class_rules(&port_info, self.partd_service_idx);
     }
 
     /// Check if a newly connected driver is partd

@@ -32,9 +32,8 @@ mod page_frame;
 mod object;
 mod mapping;
 
-pub use page_frame::{PageFrame, PageFrameFlags};
-pub use object::{VmObject, VmObjectId, VmObjectKind, VmObjectState, MAX_PAGES_PER_OBJECT};
-pub use mapping::{VmMapping, VmMappingId, Protection, VmMappingState};
+pub use page_frame::PageFrame;
+pub use object::{VmObjectId, VmObjectKind, VmObjectState};
 
 use crate::kernel::lock::SpinLock;
 use object::VmObjectSlot;

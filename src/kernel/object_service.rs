@@ -102,14 +102,17 @@ impl<'a> TableGuard<'a> {
 
 /// Extract slot index from TaskId
 ///
-/// PID format: bits[8:0] = slot + 1 (1-256), bits[31:9] = generation
-/// Returns None if invalid (slot 0 is reserved for idle)
+/// PID format: bits[8:0] = encoded_slot (1-252), bits[31:9] = generation
+/// Encoded slot = slot - MAX_CPUS + 1 (because slots 0..MAX_CPUS are idle tasks)
+/// Returns None if invalid (PID 0 is for idle tasks)
 fn slot_from_task_id(task_id: TaskId) -> Option<usize> {
+    use crate::kernel::percpu::MAX_CPUS;
     let slot_bits = (task_id & 0x1FF) as usize;
-    if slot_bits == 0 || slot_bits > MAX_TASKS {
+    if slot_bits == 0 || slot_bits > MAX_TASKS - MAX_CPUS {
         return None;
     }
-    Some(slot_bits - 1)
+    // Reverse the encoding: encoded = slot - MAX_CPUS + 1 → slot = encoded + MAX_CPUS - 1
+    Some(slot_bits - 1 + MAX_CPUS)
 }
 
 /// Central service that owns all object tables.

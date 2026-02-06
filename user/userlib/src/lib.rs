@@ -44,7 +44,7 @@ pub use mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interva
 pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_status, side_msg, side_status, Doorbell, ChannelDoorbell};
 pub use data_port::{DataPort, DataPortConfig, PortRole, Layer, ConnectedLayer, GeometryInfo};
 pub use devd::{
-    DevdClient, PortType, DeviceClass, DeviceInfo, ClientState, DriverState,
+    DevdClient, DeviceClass, DeviceInfo, ClientState, DriverState,
     DevdCommand, SpawnFilter, SpawnResult,
 };
 pub use bus::{

@@ -1,185 +1,127 @@
 //! Rules Engine for Dynamic Driver Spawning
 //!
-//! When a port is registered, its path suffix determines which driver to spawn.
-//! Paths are built automatically by walking the port parent chain:
+//! When a port is registered with PortInfo, its class and subclass determine
+//! which driver to spawn. This replaces the legacy string-based suffix matching.
 //!
-//!   pcie0/00:02.0:xhci → spawn usbd
-//!   pcie0/00:02.0/usb0:msc → spawn partd
-//!   pcie0/00:02.0/usb0:msc/0:fat → spawn fatfsd
-//!
-//! The last segment's suffix (after ':') carries the type tag.
-//! Longest matching suffix wins.
+//! Class-based matching:
+//!   PortClass::Usb + USB_XHCI → spawn usbd
+//!   PortClass::Block + BLOCK_RAW → spawn partd
+//!   PortClass::Block + BLOCK_FAT* → spawn fatfsd
+
+use abi::{PortClass, PortInfo, port_subclass};
 
 // =============================================================================
-// Path-Based Rule
+// Class-Based Rule
 // =============================================================================
 
-/// A rule matching path suffixes to driver binaries.
-///
-/// The suffix is matched against the last segment of the port's full path.
-/// For example, suffix ":xhci" matches segment "00:02.0:xhci".
+/// Subclass matching strategy
 #[derive(Clone, Copy)]
-pub struct PathRule {
-    /// Suffix to match against the last path segment (e.g., ":fat", ":xhci")
-    pub suffix: &'static str,
+pub enum SubclassMatch {
+    /// Match any subclass value
+    Any,
+    /// Match exact subclass value
+    Exact(u16),
+    /// Match one of several subclass values
+    OneOf(&'static [u16]),
+}
+
+impl SubclassMatch {
+    /// Check if a subclass value matches this matcher
+    pub fn matches(&self, subclass: u16) -> bool {
+        match self {
+            SubclassMatch::Any => true,
+            SubclassMatch::Exact(v) => subclass == *v,
+            SubclassMatch::OneOf(values) => values.contains(&subclass),
+        }
+    }
+}
+
+/// A rule matching PortClass + subclass to driver binaries.
+#[derive(Clone, Copy)]
+pub struct ClassRule {
+    /// Port class to match
+    pub class: PortClass,
+    /// Subclass matcher
+    pub subclass: SubclassMatch,
     /// Driver binary to spawn
     pub driver: &'static str,
     /// Capability bits for spawned child (0 = inherit parent's caps)
     pub caps: u64,
 }
 
-impl PathRule {
-    /// Check if a path segment's suffix matches this rule.
-    pub fn matches_segment(&self, segment: &[u8]) -> bool {
-        let suffix = self.suffix.as_bytes();
-        if segment.len() < suffix.len() {
+impl ClassRule {
+    /// Check if a PortInfo matches this rule
+    pub fn matches(&self, info: &PortInfo) -> bool {
+        if info.port_class != self.class {
             return false;
         }
-        &segment[segment.len() - suffix.len()..] == suffix
+        self.subclass.matches(info.port_subclass)
     }
 }
 
 // =============================================================================
-// Built-in Path Rules
+// Built-in Class Rules
 // =============================================================================
 
-/// Path-based rules for driver auto-spawning.
+/// FAT filesystem subclass values (MBR partition type codes)
+static FAT_SUBCLASSES: &[u16] = &[
+    port_subclass::BLOCK_FAT12,
+    port_subclass::BLOCK_FAT16,
+    port_subclass::BLOCK_FAT32,
+    port_subclass::BLOCK_FAT32_LBA,
+];
+
+/// Class-based rules for driver auto-spawning.
 ///
-/// Matching is done against the last segment of the port's full path.
-/// All rules are checked; the longest matching suffix wins.
-pub static PATH_RULES: &[PathRule] = &[
-    // PCI device type matches
-    PathRule { suffix: ":xhci",  driver: "usbd",   caps: userlib::devd::caps::DRIVER },
-    PathRule { suffix: ":nvme",  driver: "nvmed",  caps: userlib::devd::caps::DRIVER },
-    PathRule { suffix: ":network", driver: "wifid", caps: userlib::devd::caps::DRIVER },
-    // Block device type → partition scanner
-    PathRule { suffix: ":msc",   driver: "partd",  caps: userlib::devd::caps::DRIVER },
-    // Filesystem type matches
-    PathRule { suffix: ":fat",   driver: "fatfsd", caps: userlib::devd::caps::DRIVER },
-    PathRule { suffix: ":ext2",  driver: "ext2fsd", caps: userlib::devd::caps::DRIVER },
-];
-
-/// Find the best matching path rule for a segment (longest suffix wins).
-pub fn find_path_rule(segment: &[u8]) -> Option<&'static PathRule> {
-    let mut best: Option<&PathRule> = None;
-    let mut best_len = 0;
-    for rule in PATH_RULES {
-        if rule.matches_segment(segment) && rule.suffix.len() > best_len {
-            best = Some(rule);
-            best_len = rule.suffix.len();
-        }
-    }
-    best
-}
-
-// =============================================================================
-// Legacy Rule (kept for PortType references in ports.rs)
-// =============================================================================
-
-use crate::ports::PortType;
-
-/// Legacy rule struct — kept temporarily while PortType is still used
-/// in port registration. Will be removed once all drivers use path-based names.
-#[derive(Clone, Copy)]
-pub struct Rule {
-    pub match_parent_type: Option<PortType>,
-    pub match_port_type: Option<PortType>,
-    pub driver_binary: &'static str,
-    pub pass_port_name: bool,
-    pub caps: u64,
-}
-
-impl Rule {
-    pub fn matches(&self, port_type: PortType, parent_type: Option<PortType>) -> bool {
-        if let Some(required_type) = self.match_port_type {
-            if port_type != required_type {
-                return false;
-            }
-        }
-        if let Some(required_parent) = self.match_parent_type {
-            match parent_type {
-                Some(pt) if pt == required_parent => {}
-                _ => return false,
-            }
-        }
-        true
-    }
-}
-
-/// Legacy static rules — kept temporarily for backward compat.
-pub static RULES: &[Rule] = &[
-    Rule {
-        match_parent_type: None,
-        match_port_type: Some(PortType::Usb),
-        driver_binary: "usbd",
-        pass_port_name: true,
+/// Rules are checked in order; first match wins.
+pub static CLASS_RULES: &[ClassRule] = &[
+    // USB xHCI controller → spawn USB daemon
+    ClassRule {
+        class: PortClass::Usb,
+        subclass: SubclassMatch::Exact(port_subclass::USB_XHCI),
+        driver: "usbd",
         caps: userlib::devd::caps::DRIVER,
     },
-    Rule {
-        match_parent_type: None,
-        match_port_type: Some(PortType::Storage),
-        driver_binary: "nvmed",
-        pass_port_name: true,
+    // NVMe storage controller → spawn NVMe daemon
+    ClassRule {
+        class: PortClass::StorageController,
+        subclass: SubclassMatch::Exact(port_subclass::STORAGE_NVME),
+        driver: "nvmed",
         caps: userlib::devd::caps::DRIVER,
     },
-    Rule {
-        match_parent_type: None,
-        match_port_type: Some(PortType::Network),
-        driver_binary: "wifid",
-        pass_port_name: true,
+    // Any network device → spawn WiFi daemon
+    ClassRule {
+        class: PortClass::Network,
+        subclass: SubclassMatch::Any,
+        driver: "wifid",
         caps: userlib::devd::caps::DRIVER,
     },
-    Rule {
-        match_parent_type: None,
-        match_port_type: Some(PortType::Block),
-        driver_binary: "partd",
-        pass_port_name: true,
+    // Raw block device (whole disk) → spawn partition scanner
+    ClassRule {
+        class: PortClass::Block,
+        subclass: SubclassMatch::Exact(port_subclass::BLOCK_RAW),
+        driver: "partd",
         caps: userlib::devd::caps::DRIVER,
     },
-    Rule {
-        match_parent_type: Some(PortType::Block),
-        match_port_type: Some(PortType::Partition),
-        driver_binary: "fatfsd",
-        pass_port_name: true,
+    // FAT partition → spawn FAT filesystem driver
+    ClassRule {
+        class: PortClass::Block,
+        subclass: SubclassMatch::OneOf(FAT_SUBCLASSES),
+        driver: "fatfsd",
+        caps: userlib::devd::caps::DRIVER,
+    },
+    // Linux partition → spawn ext2 filesystem driver
+    ClassRule {
+        class: PortClass::Block,
+        subclass: SubclassMatch::Exact(port_subclass::BLOCK_LINUX),
+        driver: "ext2fsd",
         caps: userlib::devd::caps::DRIVER,
     },
 ];
 
-pub trait RulesEngine {
-    fn find_matching_rule(
-        &self,
-        port_type: PortType,
-        parent_type: Option<PortType>,
-    ) -> Option<&'static Rule>;
-
-    fn rules(&self) -> &'static [Rule];
-}
-
-pub struct StaticRules;
-
-impl StaticRules {
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl RulesEngine for StaticRules {
-    fn find_matching_rule(
-        &self,
-        port_type: PortType,
-        parent_type: Option<PortType>,
-    ) -> Option<&'static Rule> {
-        for rule in RULES {
-            if rule.matches(port_type, parent_type) {
-                return Some(rule);
-            }
-        }
-        None
-    }
-
-    fn rules(&self) -> &'static [Rule] {
-        RULES
-    }
+/// Find the first matching class rule for a PortInfo.
+pub fn find_class_rule(info: &PortInfo) -> Option<&'static ClassRule> {
+    CLASS_RULES.iter().find(|rule| rule.matches(info))
 }
 
 // =============================================================================
@@ -190,66 +132,124 @@ impl RulesEngine for StaticRules {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_path_rule_matches_suffix() {
-        let rule = PathRule {
-            suffix: ":xhci",
-            driver: "usbd",
-            caps: 0,
-        };
-
-        assert!(rule.matches_segment(b"00:02.0:xhci"));
-        assert!(rule.matches_segment(b":xhci"));
-        assert!(!rule.matches_segment(b"xhci")); // no colon prefix
-        assert!(!rule.matches_segment(b"00:02.0:nvme"));
+    fn make_port_info(class: PortClass, subclass: u16) -> PortInfo {
+        let mut info = PortInfo::empty();
+        info.port_class = class;
+        info.port_subclass = subclass;
+        info
     }
 
     #[test]
-    fn test_path_rule_matches_fat() {
-        let rule = PathRule {
-            suffix: ":fat",
-            driver: "fatfsd",
-            caps: 0,
-        };
-
-        assert!(rule.matches_segment(b"0:fat"));
-        assert!(rule.matches_segment(b"1:fat"));
-        assert!(!rule.matches_segment(b"0:ext2"));
+    fn test_subclass_match_any() {
+        let matcher = SubclassMatch::Any;
+        assert!(matcher.matches(0));
+        assert!(matcher.matches(0x30));
+        assert!(matcher.matches(0xFFFF));
     }
 
     #[test]
-    fn test_find_path_rule_longest_match() {
-        // ":msc" should match for "usb0:msc"
-        let rule = find_path_rule(b"usb0:msc");
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "partd");
+    fn test_subclass_match_exact() {
+        let matcher = SubclassMatch::Exact(0x30);
+        assert!(matcher.matches(0x30));
+        assert!(!matcher.matches(0x00));
+        assert!(!matcher.matches(0x08));
+    }
 
-        // ":fat" should match
-        let rule = find_path_rule(b"0:fat");
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "fatfsd");
+    #[test]
+    fn test_subclass_match_one_of() {
+        let values: &[u16] = &[0x01, 0x06, 0x0b, 0x0c];
+        let matcher = SubclassMatch::OneOf(values);
+        assert!(matcher.matches(0x01));
+        assert!(matcher.matches(0x06));
+        assert!(matcher.matches(0x0b));
+        assert!(matcher.matches(0x0c));
+        assert!(!matcher.matches(0x00));
+        assert!(!matcher.matches(0x83));
+    }
 
-        // ":network" should match wifid
-        let rule = find_path_rule(b"00:01.0:network");
+    #[test]
+    fn test_class_rule_usb_xhci() {
+        let info = make_port_info(PortClass::Usb, port_subclass::USB_XHCI);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "usbd");
+    }
+
+    #[test]
+    fn test_class_rule_nvme() {
+        let info = make_port_info(PortClass::StorageController, port_subclass::STORAGE_NVME);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "nvmed");
+    }
+
+    #[test]
+    fn test_class_rule_network_any() {
+        // Any network subclass should match wifid
+        let info = make_port_info(PortClass::Network, 0x00);
+        let rule = find_class_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "wifid");
 
-        // No match for console
-        let rule = find_path_rule(b"console");
-        assert!(rule.is_none());
+        let info = make_port_info(PortClass::Network, 0x01);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "wifid");
     }
 
     #[test]
-    fn test_legacy_rule_matches_port_type() {
-        let rule = Rule {
-            match_parent_type: None,
-            match_port_type: Some(PortType::Block),
-            driver_binary: "partd",
-            pass_port_name: true,
-            caps: 0,
-        };
+    fn test_class_rule_block_raw() {
+        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_RAW);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "partd");
+    }
 
-        assert!(rule.matches(PortType::Block, None));
-        assert!(!rule.matches(PortType::Partition, None));
+    #[test]
+    fn test_class_rule_fat_partitions() {
+        // FAT12
+        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_FAT12);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "fatfsd");
+
+        // FAT16
+        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_FAT16);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "fatfsd");
+
+        // FAT32
+        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_FAT32);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "fatfsd");
+
+        // FAT32 LBA
+        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_FAT32_LBA);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "fatfsd");
+    }
+
+    #[test]
+    fn test_class_rule_linux_partition() {
+        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_LINUX);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "ext2fsd");
+    }
+
+    #[test]
+    fn test_class_rule_no_match() {
+        // Console should not match any rule
+        let info = make_port_info(PortClass::Console, 0);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_none());
+
+        // Service should not match any rule
+        let info = make_port_info(PortClass::Service, 0);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_none());
     }
 }

@@ -7,7 +7,7 @@ use userlib::ipc::Channel;
 use userlib::query::{
     QueryHeader, DeviceRegister, ListDevices, GetDeviceInfo, DriverQuery,
     DeviceListResponse, DeviceInfoResponse, DeviceEntry, ErrorResponse,
-    PortRegister, PortRegisterResponse, SpawnChild, SpawnAck,
+    PortRegister, PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
     msg, error, port_type,
 };
 
@@ -435,9 +435,41 @@ impl QueryHandler {
             let _ = client.channel.send(&resp.to_bytes());
         }
     }
+
+    /// Parse a REGISTER_PORT_INFO message (unified PortInfo)
+    /// Returns parsed info if valid and caller is a driver
+    pub fn parse_port_register_info(
+        &self,
+        slot: usize,
+        buf: &[u8],
+    ) -> Option<PortInfoRegistration> {
+        // Parse message header and body
+        let (reg, info_bytes) = PortRegisterInfoMsg::from_bytes(buf)?;
+
+        // Only drivers can register ports
+        let client = self.clients[slot].as_ref()?;
+        if !client.is_driver {
+            return None;
+        }
+
+        // Parse PortInfo from bytes (112 bytes at offset 16)
+        if info_bytes.len() < 112 {
+            return None;
+        }
+        let port_info: abi::PortInfo = unsafe {
+            core::ptr::read_unaligned(info_bytes.as_ptr() as *const abi::PortInfo)
+        };
+
+        Some(PortInfoRegistration {
+            seq_id: reg.header.seq_id,
+            shmem_id: reg.shmem_id,
+            port_info,
+            owner_idx: client.service_idx as u8,
+        })
+    }
 }
 
-/// Parsed port registration info
+/// Parsed port registration info (legacy)
 pub struct PortRegisterInfo<'a> {
     pub seq_id: u32,
     pub port_type: u8,
@@ -445,6 +477,14 @@ pub struct PortRegisterInfo<'a> {
     pub parent: Option<&'a [u8]>,
     pub metadata: &'a [u8],
     pub shmem_id: u32,
+    pub owner_idx: u8,
+}
+
+/// Parsed unified port registration info
+pub struct PortInfoRegistration {
+    pub seq_id: u32,
+    pub shmem_id: u32,
+    pub port_info: abi::PortInfo,
     pub owner_idx: u8,
 }
 

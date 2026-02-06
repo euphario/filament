@@ -585,16 +585,13 @@ impl BusCtx for RuntimeCtx {
             .map_err(|_| BusError::Internal)
     }
 
-    fn register_port_with_metadata(
+    fn register_port_with_info(
         &mut self,
-        name: &[u8],
-        port_type: crate::devd::PortType,
+        info: &abi::PortInfo,
         shmem_id: u32,
-        parent: Option<&[u8]>,
-        metadata: &[u8],
     ) -> Result<(), BusError> {
         self.devd
-            .register_port_full(name, port_type, shmem_id, parent, metadata)
+            .register_port_info(info, shmem_id)
             .map_err(|_| BusError::Internal)
     }
 
@@ -608,9 +605,9 @@ impl BusCtx for RuntimeCtx {
         // Query devd on first call, cache the result
         if matches!(self.spawn_ctx, SpawnCtxCache::NotQueried) {
             match self.devd.get_spawn_context() {
-                Ok(Some((name_buf, name_len, port_type, meta_buf, meta_len))) => {
+                Ok(Some((name_buf, name_len, port_class, meta_buf, meta_len))) => {
                     self.spawn_ctx = SpawnCtxCache::Cached(
-                        SpawnContext::new(&name_buf, name_len, port_type, &meta_buf[..meta_len]),
+                        SpawnContext::new(&name_buf, name_len, port_class, &meta_buf[..meta_len]),
                     );
                 }
                 Ok(None) => {

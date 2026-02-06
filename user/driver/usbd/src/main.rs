@@ -50,9 +50,9 @@ use userlib::{uinfo, uerror};
 use userlib::bus::{
     Driver, BusCtx, Disposition, BusError, BusMsg, bus_msg,
     BlockPortConfig, BlockGeometry, PortId,
+    PortInfo, PortClass, port_subclass,
 };
 use userlib::driver_main;
-use userlib::devd::PortType;
 use userlib::ring::{io_op, io_status, side_msg, side_status};
 use usb::{MmioRegion, DmaPool, XhciController, XhciCaps};
 use usb::soc::{GenericSoc, SocUsb};
@@ -2257,9 +2257,11 @@ impl Driver for UsbdWrapper {
         }
         self.0.block_port_id = Some(port_id);
 
-        // Register block port with devd including shmem_id
+        // Register block port with devd using unified PortInfo
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
-        let _ = ctx.register_port(b"usb0:msc", PortType::Block, shmem_id, None);
+        let mut info = PortInfo::new(b"usb0:msc", PortClass::Block);
+        info.port_subclass = port_subclass::BLOCK_RAW;
+        let _ = ctx.register_port_with_info(&info, shmem_id);
 
         uinfo!("usbd", "ready"; disks = 1u32);
 

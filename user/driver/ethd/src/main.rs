@@ -15,10 +15,10 @@ use userlib::ipc::Timer;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
+    PortInfo, PortClass, port_subclass, NetworkMetadata,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, IoCqe, io_op, io_status, side_msg, side_status, SideEntry};
-use userlib::devd::PortType;
 use userlib::{uinfo, uerror, uwarn};
 
 // =============================================================================
@@ -3420,9 +3420,14 @@ impl Driver for EthDriver {
         }
         self.port_id = Some(port_id);
 
-        // Register as net0
+        // Register as net0 using unified PortInfo
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
-        let _ = ctx.register_port_with_metadata(b"net0", PortType::Network, shmem_id, None, &self.mac);
+        let mut info = PortInfo::new(b"net0", PortClass::Network);
+        info.port_subclass = port_subclass::NET_ETHERNET;
+        let mut meta = NetworkMetadata::empty();
+        meta.mac.copy_from_slice(&self.mac);
+        info.set_network_metadata(meta);
+        let _ = ctx.register_port_with_info(&info, shmem_id);
         uinfo!("ethd", "registered"; name = "net0");
 
         // Start RX poll timer (10ms)
