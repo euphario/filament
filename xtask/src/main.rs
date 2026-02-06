@@ -612,11 +612,12 @@ fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool, stress: bool) -> Re
     println!();
     println!("Starting QEMU...");
 
-    // With the QEMU linker script, kernel is linked at 0x40000000 which matches
-    // where QEMU loads raw binaries (-kernel loads at DRAM_BASE for virt machine)
-    let kernel_path = root.join("kernel.bin");
+    // Use the ELF file directly for QEMU - it has correct PhysAddr for loading.
+    // The flat binary (kernel.bin) doesn't preserve the ELF load addresses that
+    // QEMU needs to load the kernel at the correct physical address.
+    let kernel_path = root.join("target/aarch64-unknown-none/release/bpi-r4-kernel");
     if !kernel_path.exists() {
-        bail!("kernel.bin not found - run './x build --platform qemu' first");
+        bail!("kernel ELF not found - run './x build --platform qemu' first");
     }
 
     // Create disk images for emulated devices if they don't exist

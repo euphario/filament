@@ -13,6 +13,9 @@
  *
  * Physical: 0x0000_0000_4008_0000
  * Virtual:  0xFFFF_0000_4008_0000
+ *
+ * CRITICAL: The ELF must have PhysAddr = 0x40080000 so QEMU loads
+ * the kernel at the correct physical address. Use AT() to set this.
  */
 
 ENTRY(_start)
@@ -23,6 +26,9 @@ KERNEL_PHYS_BASE = 0x40080000;
 /* Virtual address base (TTBR1 upper half) */
 KERNEL_VIRT_BASE = 0xFFFF000000000000;
 
+/* Combined virtual start */
+KERNEL_VIRT_START = KERNEL_VIRT_BASE + KERNEL_PHYS_BASE;
+
 MEMORY
 {
     /*
@@ -30,31 +36,35 @@ MEMORY
      * Physical load address is 0x40080000
      * Virtual address is 0xFFFF000040080000
      */
-    RAM (rwx) : ORIGIN = KERNEL_VIRT_BASE + KERNEL_PHYS_BASE, LENGTH = 16M
+    RAM (rwx) : ORIGIN = KERNEL_VIRT_START, LENGTH = 16M
 }
 
 SECTIONS
 {
     . = ORIGIN(RAM);
 
-    /* Code section - must be first for entry point */
-    .text : {
+    /* Code section - must be first for entry point
+     * AT() specifies the physical load address for QEMU */
+    .text : AT(KERNEL_PHYS_BASE) {
         KEEP(*(.text.boot))    /* Boot code first */
         *(.text .text.*)
     } > RAM
 
     /* Read-only data */
-    .rodata : ALIGN(4K) {
+    . = ALIGN(4K);
+    .rodata : AT(KERNEL_PHYS_BASE + (ADDR(.rodata) - KERNEL_VIRT_START)) {
         *(.rodata .rodata.*)
     } > RAM
 
     /* Initialized data */
-    .data : ALIGN(4K) {
+    . = ALIGN(4K);
+    .data : AT(KERNEL_PHYS_BASE + (ADDR(.data) - KERNEL_VIRT_START)) {
         *(.data .data.*)
     } > RAM
 
-    /* BSS - zero-initialized data */
-    .bss : ALIGN(4K) {
+    /* BSS - zero-initialized data (no load data needed) */
+    . = ALIGN(4K);
+    .bss (NOLOAD) : {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
