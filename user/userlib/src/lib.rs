@@ -18,13 +18,6 @@ pub mod blk;
 pub mod sync;
 pub mod config;
 
-// Legacy modules — kept for compilation but not re-exported.
-// console_ring: still used by consoled.
-// command_ring, driver_ring, filter_chain, blk_client: superseded by bus framework.
-mod filter_chain;
-mod blk_client;
-mod command_ring;
-mod driver_ring;
 pub mod bus;
 pub mod bus_transport;
 pub mod bus_runtime;
