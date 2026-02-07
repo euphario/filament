@@ -267,6 +267,13 @@ pub struct Task {
 /// # Safety
 /// Must only be called via context_switch with proper scheduler state set up.
 fn user_task_trampoline() -> ! {
+    // CRITICAL: Process pending_stack_release from the context_switch that
+    // brought us here. Since this is a new task (first schedule), context_switch
+    // ret'd to this trampoline instead of back to reschedule_inner's Phase 3.
+    // Without this, the from-task stays stuck (Running never→Ready, or
+    // kernel_stack_owner never cleared).
+    crate::kernel::sched::process_pending_from_switch();
+
     // Get current slot (was set by switch_to_task before context_switch)
     let slot = crate::kernel::percpu::cpu_local().get_current_slot();
 

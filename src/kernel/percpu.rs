@@ -105,6 +105,13 @@ pub struct CpuData {
     _pad_state: u32,
     /// Stack top address set during SMP boot
     pub stack_top: AtomicU64,
+
+    /// Slot of task whose kernel_stack_owner should be cleared after context_switch.
+    /// Set before context_switch, read after (same CPU, different stack).
+    /// 0xFFFFFFFF = no pending release.
+    pub pending_stack_release: AtomicU32,
+    /// Padding for 8-byte alignment
+    _pad_release: u32,
 }
 
 // Assembly offsets into CpuData (must match #[repr(C)] layout above)
@@ -148,6 +155,8 @@ impl CpuData {
             state: AtomicU32::new(CpuState::Offline as u32),
             _pad_state: 0,
             stack_top: AtomicU64::new(0),
+            pending_stack_release: AtomicU32::new(0xFFFFFFFF),
+            _pad_release: 0,
         }
     }
 
@@ -252,6 +261,21 @@ impl CpuData {
     pub fn set_stack_top(&self, addr: u64) {
         self.stack_top.store(addr, Ordering::Relaxed);
     }
+
+    /// Set the pending stack release slot.
+    /// Called before context_switch to record which task needs finalization
+    /// after context_switch completes (transition to Ready or clear kernel_stack_owner).
+    #[inline]
+    pub fn set_pending_release(&self, slot: u32) {
+        self.pending_stack_release.store(slot, Ordering::Release);
+    }
+
+    /// Take the pending stack release slot, resetting to 0xFFFFFFFF (none).
+    /// Called after context_switch to retrieve the from-task slot for finalization.
+    #[inline]
+    pub fn take_pending_release(&self) -> u32 {
+        self.pending_stack_release.swap(0xFFFFFFFF, Ordering::AcqRel)
+    }
 }
 
 // ============================================================================
@@ -294,6 +318,20 @@ pub fn set_syscall_switched(val: u64) {
 #[inline]
 pub fn get_syscall_switched() -> u64 {
     cpu_local().syscall_switched.load(Ordering::Acquire)
+}
+
+/// Set the pending stack release slot (per-CPU).
+/// Records which from-task needs finalization after context_switch.
+#[inline]
+pub fn set_pending_release(slot: u32) {
+    cpu_local().set_pending_release(slot);
+}
+
+/// Take the pending stack release slot (per-CPU), resetting to none.
+/// Returns 0xFFFFFFFF if no pending release.
+#[inline]
+pub fn take_pending_release() -> u32 {
+    cpu_local().take_pending_release()
 }
 
 // SAFETY: CpuData is designed for per-CPU access patterns

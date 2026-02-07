@@ -187,50 +187,45 @@ fn reschedule_inner(block: BlockReason) -> bool {
 
         let cpu = percpu::cpu_id();
 
-        // Mark current task as Ready if it was Running
-        if let Some(current) = sched.task_mut(caller_slot) {
-            if current.state().is_running() {
-                crate::transition_or_evict!(current, set_ready);
-                sched.notify_ready(caller_slot);
-            }
-        }
+        // SMP FIX: Do NOT mark current task Ready here. A task must not
+        // become Ready (schedulable) while its context hasn't been saved yet.
+        // For simple preemption: transition happens below (safe - trap frame
+        // already saved by IRQ handler, no kernel stack involvement).
+        // For full context switch: transition happens in Phase 3 via
+        // pending_stack_release after context_switch saves the context.
 
-        // Find next task to run
+        // Find next task to run (from-task NOT on ready bitset)
         let next_slot = match sched.schedule() {
             Some(slot) if slot != caller_slot => slot,
             Some(_) => {
-                // Same task selected - set back to Running, return
-                if let Some(t) = sched.task_mut(caller_slot) {
-                    if *t.state() == TaskState::Ready {
-                        crate::transition_or_evict!(t, set_running, cpu);
-                    }
-                }
+                // Same task selected — keep running (task is still Running, no undo needed)
                 return false;
             }
             None => {
-                // No ready tasks - check if we need idle
+                // No ready tasks — check if we need idle
                 let blocked = sched.task(caller_slot)
                     .map(|t| t.is_blocked()).unwrap_or(false);
                 if !blocked {
-                    // Not blocked, just keep running
+                    // Not blocked — keep running. May be Ready if woken between
+                    // sleep_current/wait_current and this reschedule call. Fix up.
                     if let Some(t) = sched.task_mut(caller_slot) {
                         if *t.state() == TaskState::Ready {
+                            t.clear_kernel_stack_owner();
                             crate::transition_or_evict!(t, set_running, cpu);
                         }
                     }
                     return false;
                 }
-                // Blocked and nothing ready - go to this CPU's idle
+                // Blocked and nothing ready — go to this CPU's idle
                 idle_slot_for_cpu(percpu::cpu_id())
             }
         };
 
         // Check if we need full context switch.
         // Simple preemption (trap-frame-only swap) is ONLY safe when:
-        // 1. The from-task was Running at entry (we just set it Ready above).
-        //    If it was already non-Running (Sleeping/Ready-from-wake), reschedule()
-        //    was called from deep in a syscall handler (e.g., sys_wait retry loop)
-        //    and the kernel stack must be preserved via full context switch.
+        // 1. The from-task was Running at entry (entered from userspace via IRQ).
+        //    If it was already non-Running, reschedule() was called from deep in a
+        //    syscall handler and the kernel stack must be preserved.
         // 2. The from-task is not blocked (it can resume from user trap frame)
         // 3. The to-task doesn't need kernel context restore
         let from_blocked = sched.task(caller_slot)
@@ -239,8 +234,16 @@ fn reschedule_inner(block: BlockReason) -> bool {
             .map(|t| t.needs_context_restore()).unwrap_or(false);
 
         if was_running && !from_blocked && !to_needs_context {
-            // Simple preemption case - no context_switch needed
-            // Just update variables, actual switch at eret
+            // Simple preemption: trap-frame-only swap, no context_switch.
+            // Safe to mark Ready now — trap frame already saved by IRQ handler,
+            // no kernel stack involvement, no context_switch race window.
+            if let Some(current) = sched.task_mut(caller_slot) {
+                if current.state().is_running() {
+                    crate::transition_or_evict!(current, set_ready);
+                    sched.notify_ready(caller_slot);
+                }
+            }
+
             set_current_slot(next_slot);
 
             // Extract and update per-CPU data while we have the lock
@@ -272,10 +275,15 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 if !t.is_terminated() {
                     t.mark_context_saved();
                 }
-                // SMP EXCLUSIVITY: Only set kernel_stack_owner for BLOCKED tasks.
-                // Blocked tasks will have this cleared when woken (via wake_task).
-                // Ready tasks (preemption case) should be immediately selectable
-                // by any CPU - don't set kernel_stack_owner or they'll be stuck.
+                // SMP EXCLUSIVITY for blocked tasks:
+                // Blocked tasks are visible to wake paths (which add them to the
+                // ready bitset). kernel_stack_owner prevents a woken task from being
+                // scheduled while context_switch is still saving its registers.
+                // Cleared by pending_stack_release handler after context_switch.
+                //
+                // Preempted tasks (Running) don't need this — they stay Running
+                // (not on ready bitset) until the pending handler transitions them
+                // to Ready after context_switch saves their context.
                 if t.is_blocked() {
                     t.set_kernel_stack_owner(cpu);
                 }
@@ -383,6 +391,10 @@ fn reschedule_inner(block: BlockReason) -> bool {
         return false;
     }
 
+    // Record which task needs finalization after context_switch.
+    // Set AFTER all safety checks (x30 verify) so abort paths don't leave stale pending.
+    percpu::set_pending_release(decision.from_slot as u32);
+
     // Do context switch - returns when switched BACK to us
     unsafe {
         task::context_switch(decision.from_ctx, decision.to_ctx);
@@ -391,7 +403,14 @@ fn reschedule_inner(block: BlockReason) -> bool {
     // ========================================================================
     // PHASE 3: Finalization (reacquire lock)
     // ========================================================================
-    // We've been switched back to from_slot
+    // We've been switched back to from_slot.
+    //
+    // CRITICAL: Read pending_stack_release BEFORE re-enabling IRQs.
+    // This was set by whoever context_switch'd TO us on this CPU.
+    // Reading it while IRQs are disabled prevents a nested reschedule
+    // from overwriting it.
+    let pending_slot = percpu::take_pending_release();
+
     drop(_irq_guard);
 
     // CRITICAL: Clear syscall_switched because we're returning to our
@@ -403,16 +422,33 @@ fn reschedule_inner(block: BlockReason) -> bool {
 
     {
         let mut sched = task::scheduler();
-        set_current_slot(decision.from_slot);
 
-        // Get cpu id for state transitions
+        // --- Process pending_stack_release from the context_switch that brought us here ---
+        // The CPU that context_switch'd TO us stored its from-task slot in per-CPU
+        // pending. We finalize that task now (under lock):
+        //   - Preempted (Running): transition to Ready + add to ready bitset
+        //   - Blocked (Sleeping/Waiting): clear kernel_stack_owner so wake makes it schedulable
+        //   - Terminated: nothing to do
+        if pending_slot != 0xFFFFFFFF {
+            let ps = pending_slot as usize;
+            if let Some(t) = sched.task_mut(ps) {
+                if t.state().is_running() {
+                    // Preempted task: context saved, now truly Ready
+                    crate::transition_or_evict!(t, set_ready);
+                    sched.notify_ready(ps);
+                } else if !t.is_terminated() {
+                    // Blocked or woken-before-reschedule: context saved,
+                    // clear kernel_stack_owner so task is schedulable
+                    t.clear_kernel_stack_owner();
+                }
+            }
+        }
+
+        // --- Restore our own state (from_slot) ---
+        set_current_slot(decision.from_slot);
         let cpu = percpu::cpu_id();
 
         if let Some(t) = sched.task_mut(decision.from_slot) {
-            // SMP EXCLUSIVITY: Clear kernel stack ownership. We're back on our
-            // own context now, so other CPUs can safely schedule this task again.
-            t.clear_kernel_stack_owner();
-
             match t.state() {
                 TaskState::Ready => {
                     crate::transition_or_evict!(t, set_running, cpu);
@@ -511,12 +547,14 @@ pub fn sleep_current(reason: task::SleepReason) -> bool {
             kerror!("sched", "invalid_sleep_transition"; from = task.state().name());
             return false;
         }
-        // CRITICAL: Mark task as needing full context restore. This prevents
-        // another CPU from scheduling this task via simple preemption (trap-frame
-        // swap) between sleep_current() returning and reschedule() being called.
-        // Without this, the task's kernel stack is still live on this CPU, but
-        // another CPU could ERET into its trap frame, running it on two CPUs.
+        // CRITICAL: Mark task as needing full context restore and set
+        // kernel_stack_owner. Between sleep_current() returning and the caller's
+        // reschedule(), a wake could make this task Ready + on bitset. Without
+        // kernel_stack_owner, another CPU could select it while our kernel stack
+        // is still live. The pending_stack_release handler clears this after
+        // context_switch.
         task.mark_context_saved();
+        task.set_kernel_stack_owner(percpu::cpu_id());
         true
     } else {
         false
@@ -547,8 +585,9 @@ pub fn wait_current(reason: task::WaitReason, deadline: u64) -> bool {
             kerror!("sched", "invalid_wait_transition"; from = task.state().name());
             return false;
         }
-        // CRITICAL: Same as sleep_current — prevent simple preemption race
+        // CRITICAL: Same as sleep_current — prevent race with wake paths
         task.mark_context_saved();
+        task.set_kernel_stack_owner(percpu::cpu_id());
         (true, task.id)
     } else {
         (false, 0)
@@ -606,6 +645,37 @@ pub fn timer_tick(current_time: u64) {
             Ordering::Relaxed,
         ).is_ok() {
             let _ = super::liveness::check_liveness(current_time);
+        }
+    }
+}
+
+// ============================================================================
+// Pending Stack Release Processing (Trampoline Support)
+// ============================================================================
+
+/// Process any pending_stack_release left by a context_switch that returned
+/// to a trampoline (user_task_trampoline, idle_entry) instead of back to
+/// reschedule_inner's Phase 3.
+///
+/// Must be called from code paths entered via context_switch that bypass
+/// Phase 3. This finalizes the from-task:
+/// - Preempted (Running): transition to Ready + add to ready bitset
+/// - Blocked: clear kernel_stack_owner so wake makes it schedulable
+/// - Terminated: nothing to do
+pub fn process_pending_from_switch() {
+    let pending_slot = percpu::take_pending_release();
+    if pending_slot == 0xFFFFFFFF {
+        return;
+    }
+
+    let mut sched = task::scheduler();
+    let ps = pending_slot as usize;
+    if let Some(t) = sched.task_mut(ps) {
+        if t.state().is_running() {
+            crate::transition_or_evict!(t, set_ready);
+            sched.notify_ready(ps);
+        } else if !t.is_terminated() {
+            t.clear_kernel_stack_owner();
         }
     }
 }

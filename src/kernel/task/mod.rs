@@ -403,11 +403,10 @@ impl Scheduler {
             // Reset liveness state - task responded/became active
             task.liveness_state = super::liveness::LivenessState::Normal;
 
-            // Clear kernel_stack_owner so the task is selectable.
-            // When a task blocked and context-switched away, it had
-            // kernel_stack_owner set. Now that it's being woken, it's
-            // ready to be scheduled again.
-            task.clear_kernel_stack_owner();
+            // NOTE: Do NOT clear kernel_stack_owner here. If the task is
+            // still mid-context-switch on another CPU, clearing would allow
+            // premature scheduling. The pending_stack_release handler in
+            // sched.rs Phase 3 clears it after context_switch completes.
 
             // Track runq invariant in debug builds
             task.set_on_runq(true);
@@ -496,8 +495,7 @@ impl Scheduler {
         for i in 0..woken_slot_count {
             let slot = woken_slots[i] as usize;
             if let Some(ref mut task) = self.tasks[slot] {
-                // Clear kernel_stack_owner so task is selectable
-                task.clear_kernel_stack_owner();
+                // kernel_stack_owner cleared by pending_stack_release handler
                 task.set_on_runq(true);
                 self.policy.on_task_ready(slot, task.priority);
             }
@@ -530,8 +528,7 @@ impl Scheduler {
                     if task.is_blocked() {
                         crate::transition_or_log!(task, wake);
                         task.liveness_state.reset(task.id);
-                        // Clear kernel_stack_owner so task is selectable
-                        task.clear_kernel_stack_owner();
+                        // kernel_stack_owner cleared by pending_stack_release handler
                         task.set_on_runq(true);
                         self.policy.on_task_ready(slot, task.priority);
                         woken += 1;

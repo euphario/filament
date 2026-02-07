@@ -32,6 +32,12 @@ use crate::arch::aarch64::hal::cpu;
 ///
 /// The idle task NEVER blocks - it's always Ready or Running.
 pub fn idle_entry() -> ! {
+    // CRITICAL: Process pending_stack_release from the context_switch that
+    // brought us here. The first time idle is scheduled via context_switch,
+    // ret jumps to this entry point instead of back to reschedule_inner's
+    // Phase 3. Without this, the from-task stays stuck.
+    super::sched::process_pending_from_switch();
+
     let cpu_impl = cpu();
 
     loop {
