@@ -7,7 +7,7 @@
 //!
 //! Uses try_scheduler() to avoid deadlocks when called from contexts that
 //! already hold the scheduler lock (e.g., cleanup paths, reap_terminated).
-//! If the lock is held, defers the wake via request_wake().
+//! If the lock is held, defers the wake via microtask queue.
 
 use crate::kernel::traits::waker::{Waker, Subscriber, WakeReason, WakeList};
 use crate::kernel::task;
@@ -33,8 +33,10 @@ impl Waker for KernelWaker {
             // bits, so stale PIDs will fail the lookup and won't wake anything.
             sched.wake_by_pid(sub.task_id);
         } else {
-            // Lock held - defer the wake
-            crate::kernel::arch::sync::cpu_flags().request_wake(sub.task_id);
+            // Lock held — defer via microtask queue (lock ordering: SCHEDULER(10)→MICROTASK(15))
+            let _ = crate::kernel::microtask::enqueue(
+                crate::kernel::microtask::MicroTask::Wake { pid: sub.task_id },
+            );
         }
     }
 

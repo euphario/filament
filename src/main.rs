@@ -404,18 +404,22 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
         // IRQ handler drains FIFO into ring buffer, so IRQ won't re-trigger
         if uart::handle_rx_irq() {
             // Wake any process blocked waiting for console input.
-            // Use deferred wake to avoid deadlock if scheduler lock is held.
+            // Deferred via microtask queue — processed at irq_exit_resched.
             let blocked_pid = uart::get_blocked_pid();
             if blocked_pid != 0 {
-                sync::cpu_flags().request_wake(blocked_pid);
+                let _ = crate::kernel::microtask::enqueue(
+                    crate::kernel::microtask::MicroTask::Wake { pid: blocked_pid },
+                );
                 uart::clear_blocked();
             }
         }
     } else {
         // Check if this IRQ is registered by a userspace driver
         if let Some(owner_pid) = irq::notify(irq) {
-            // Wake the owner process - use deferred wake to avoid deadlock
-            sync::cpu_flags().request_wake(owner_pid);
+            // Wake the owner process — deferred via microtask queue
+            let _ = crate::kernel::microtask::enqueue(
+                crate::kernel::microtask::MicroTask::Wake { pid: owner_pid },
+            );
         } else {
             // Record unhandled IRQ (don't print in IRQ context!)
             sync::cpu_flags().record_unhandled_irq(irq);
@@ -428,29 +432,26 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
 
 /// Called from assembly after IRQ handler, at the safe point before eret.
 /// This is where deferred work happens:
-/// 1. Process pending wake requests from IRQ context
+/// 1. Drain microtask queue (deferred wakes, cleanup, evictions)
 /// 2. Reschedule if timer set the flag
 /// 3. Log any deferred messages (e.g., unhandled IRQs)
 /// 4. Flush log buffer before returning to user
 #[no_mangle]
 pub extern "C" fn irq_exit_resched() {
-    // 1. Process pending wake requests from IRQ context.
-    // IRQ handlers use cpu_flags().request_wake(pid) instead of directly
-    // acquiring the scheduler lock (which may be held by interrupted code).
-    task::process_pending_wakes();
-
-    // 2. Drain microtask queue (cleanup, evictions, deferred wakes)
+    // 1. Drain microtask queue (cleanup, evictions, deferred wakes).
+    // IRQ handlers enqueue Wake microtasks instead of directly acquiring the
+    // scheduler lock (which may be held by interrupted code).
     crate::kernel::microtask::drain(16);
 
-    // 3. Handle deferred reschedule
+    // 2. Handle deferred reschedule
     unsafe {
         task::do_resched_if_needed();
     }
 
-    // 4. Process any pending task evictions (legacy — kept for lock-free IRQ path)
+    // 3. Process any pending task evictions (legacy — kept for lock-free IRQ path)
     task::eviction::process_pending_evictions();
 
-    // 3. Log any unhandled IRQs from interrupt context (deferred logging)
+    // 4. Log any unhandled IRQs from interrupt context (deferred logging)
     let (unhandled_count, last_irq) = sync::cpu_flags().get_unhandled_stats();
     if unhandled_count > 0 {
         kwarn!("irq", "unhandled"; count = unhandled_count as u64, last = last_irq as u64);

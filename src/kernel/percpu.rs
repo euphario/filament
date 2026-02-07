@@ -13,7 +13,7 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use super::microtask::{PerCpuMicroTaskQueue, RingQueue};
+use super::microtask::{MpscInbox, PerCpuMicroTaskQueue, RingQueue};
 
 /// Cached count of online CPUs. Starts at 1 (boot CPU), incremented by
 /// each secondary CPU in `init_secondary_cpu()`.
@@ -119,6 +119,10 @@ pub struct CpuData {
     /// Per-CPU microtask queue. Accessed with IRQs disabled (no SpinLock needed).
     /// Enqueue tries this first, falls back to global overflow queue.
     pub microtask_queue: UnsafeCell<PerCpuMicroTaskQueue>,
+
+    /// Lock-free MPSC inbox for cross-CPU microtask enqueue.
+    /// Other CPUs enqueue via CAS; only this CPU dequeues (IRQs disabled).
+    pub remote_inbox: UnsafeCell<MpscInbox>,
 }
 
 // Assembly offsets into CpuData (must match #[repr(C)] layout above)
@@ -165,6 +169,7 @@ impl CpuData {
             pending_stack_release: AtomicU32::new(0xFFFFFFFF),
             _pad_release: 0,
             microtask_queue: UnsafeCell::new(RingQueue::new()),
+            remote_inbox: UnsafeCell::new(MpscInbox::new()),
         }
     }
 

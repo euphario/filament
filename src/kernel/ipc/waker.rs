@@ -282,7 +282,7 @@ pub fn wake(list: &WakeList, _reason: WakeReason) {
 ///
 /// SERIALIZATION: Uses try_scheduler() to avoid deadlock when called from
 /// contexts that already hold the scheduler lock (e.g., reap_terminated).
-/// If lock is held, defers wake via request_wake.
+/// If lock is held, defers wake via microtask queue.
 fn wake_one(sub: &Subscriber) {
     // Use try_scheduler to avoid deadlock if called from reap_terminated
     if let Some(mut sched) = task::try_scheduler() {
@@ -290,8 +290,10 @@ fn wake_one(sub: &Subscriber) {
         // liveness state reset, and state validation
         sched.wake_by_pid(sub.task_id);
     } else {
-        // Lock held - defer the wake
-        crate::kernel::arch::sync::cpu_flags().request_wake(sub.task_id);
+        // Lock held — defer via microtask queue (lock ordering: SCHEDULER(10)→MICROTASK(15))
+        let _ = crate::kernel::microtask::enqueue(
+            crate::kernel::microtask::MicroTask::Wake { pid: sub.task_id },
+        );
     }
 }
 

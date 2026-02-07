@@ -1081,8 +1081,8 @@ pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
 /// }) {
 ///     // Lock acquired, operation completed
 /// } else {
-///     // Lock was held, use fallback (e.g., request_wake)
-///     cpu_flags().request_wake(pid);
+///     // Lock was held, use fallback (e.g., microtask enqueue)
+///     microtask::enqueue(MicroTask::Wake { pid });
 /// }
 /// ```
 #[inline]
@@ -1093,36 +1093,6 @@ pub fn try_with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> Option<R> 
 // ============================================================================
 // Public API - Locking Hidden Inside
 // ============================================================================
-
-/// Process any pending wake requests queued by IRQ handlers.
-///
-/// Must be called from a safe point where the scheduler lock is NOT held.
-/// This is typically called from `irq_exit_resched()` after the interrupt
-/// handler returns but before returning to the interrupted code.
-///
-/// IRQ handlers use `cpu_flags().request_wake(pid)` to queue wakes because
-/// they cannot safely acquire the scheduler lock (it may be held by the
-/// interrupted code, causing deadlock). This function processes those
-/// queued requests at a point where it's safe to acquire the lock.
-pub fn process_pending_wakes() {
-    let pending = crate::kernel::arch::sync::cpu_flags().drain_pending_wakes();
-    let mut any_woken = false;
-
-    for pid in pending {
-        if pid != 0 {
-            with_scheduler(|sched| {
-                if sched.wake_by_pid(pid) {
-                    any_woken = true;
-                }
-            });
-        }
-    }
-
-    // Ensure need_resched is set if we woke anyone
-    if any_woken {
-        crate::kernel::arch::sync::cpu_flags().set_need_resched();
-    }
-}
 
 /// Access a task by slot (read-only).
 ///
@@ -1226,13 +1196,9 @@ pub fn spawn_user_task(name: &str) -> Option<(TaskId, usize)> {
 /// Must be called from kernel context (not IRQ context).
 #[no_mangle]
 pub unsafe extern "C" fn do_resched_if_needed() {
-    // First, process any pending wake requests from IRQ context.
-    // This is critical because IRQ handlers can't acquire the scheduler lock
-    // directly (to avoid deadlock), so they queue wakes via request_wake().
-    // We must process these before checking need_resched.
-    process_pending_wakes();
-
-    // Drain microtask queue (cleanup, evictions, deferred wakes)
+    // Drain microtask queue (deferred wakes, cleanup, evictions).
+    // IRQ handlers enqueue Wake microtasks instead of using the old
+    // request_wake() path — all wakes are now unified through the queue.
     super::microtask::drain(16);
 
     // Process any pending task evictions (legacy lock-free IRQ path).
