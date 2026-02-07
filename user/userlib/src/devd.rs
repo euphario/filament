@@ -596,6 +596,89 @@ impl DevdClient {
         Err(SysError::Timeout)
     }
 
+    /// Set port state
+    ///
+    /// Transitions a port to a new state. Rules are checked when
+    /// a port transitions to Ready state.
+    pub fn set_port_state(
+        &mut self,
+        name: &[u8],
+        state: abi::PortState,
+    ) -> Result<(), SysError> {
+        use crate::query::SetPortState;
+
+        // Validate input
+        if name.is_empty() || name.len() > 32 {
+            return Err(SysError::InvalidArgument);
+        }
+
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = SetPortState::new(seq_id, state);
+        let mut buf = [0u8; 64];
+        let len = req.write_to(&mut buf, name)
+            .ok_or(SysError::InvalidArgument)?;
+
+        channel.send(&buf[..len])?;
+
+        // Response format: header (8 bytes) + result (4 bytes) = 12 bytes minimum
+        const MIN_RESPONSE_SIZE: usize = 12;
+        let mut resp_buf = [0u8; 64];
+
+        for _ in 0..Self::MAX_RETRIES {
+            match channel.recv(&mut resp_buf) {
+                Ok(resp_len) => {
+                    // Check minimum size
+                    if resp_len < MIN_RESPONSE_SIZE {
+                        // Malformed response - too short, retry
+                        syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                        continue;
+                    }
+
+                    // Parse header safely
+                    let header = match QueryHeader::from_bytes(&resp_buf[..resp_len]) {
+                        Some(h) => h,
+                        None => {
+                            // Malformed header, retry
+                            syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                            continue;
+                        }
+                    };
+
+                    // Check if this is our response (matching seq_id)
+                    if header.seq_id != seq_id {
+                        // Response for different request, retry
+                        syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                        continue;
+                    }
+
+                    if header.msg_type == msg::SET_PORT_STATE {
+                        // Safe bounds-checked access for result
+                        let result = i32::from_le_bytes(
+                            resp_buf.get(8..12)
+                                .and_then(|s| s.try_into().ok())
+                                .unwrap_or([0xff, 0xff, 0xff, 0xff])
+                        );
+                        if result == error::OK {
+                            return Ok(());
+                        }
+                        return Err(SysError::NotFound);
+                    } else if header.msg_type == msg::ERROR {
+                        return Err(SysError::IoError);
+                    }
+                    // Unexpected msg_type - ignore and retry
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                }
+                Err(SysError::WouldBlock) => {
+                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SysError::Timeout)
+    }
+
     /// Register a device with devd
     pub fn register_device(&mut self, info: DeviceInfo) -> Result<u32, SysError> {
         let seq_id = self.next_seq();
@@ -1070,6 +1153,7 @@ impl DevdClient {
                             child_count: 0,
                             total_restarts: 0,
                             last_change: 0,
+                            bus_path: [0u8; 32],
                         }; 16];
 
                         let data_start = ServicesListResponse::HEADER_SIZE;

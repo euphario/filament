@@ -154,17 +154,10 @@ mod pt {
 }
 
 /// Service definitions - the "service tree"
+///
+/// Note: consoled is NOT here - it's spawned dynamically via BUS_DRIVER_RULES
+/// when the kernel exposes the UART bus.
 pub static SERVICE_DEFS: &[ServiceDef] = &[
-    ServiceDef {
-        binary: "consoled",
-        registers: &[PortDef::new(b"console:", pt::CONSOLE)],
-        dependencies: &[],  // devd: is implicit
-        auto_restart: true,
-        parent: None,
-        context_port: b"",
-        context_port_type: 0,
-        caps: 0,  // inherit parent's caps
-    },
     ServiceDef {
         binary: "vfsd",
         registers: &[PortDef::new(b"vfs:", pt::FILESYSTEM)],
@@ -180,9 +173,9 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         registers: &[],  // shell doesn't register any ports
         dependencies: &[Dependency::Requires(b"console:")],  // Wait for consoled
         auto_restart: true,
-        parent: None,
-        context_port: b"",
-        context_port_type: 0,
+        parent: Some("consoled"),  // Spawned BY consoled, inherits its limits
+        context_port: b"console:",
+        context_port_type: pt::CONSOLE,
         caps: 0,
     },
     ServiceDef {
@@ -230,11 +223,13 @@ pub struct BusDriverRule {
 
 /// Static table mapping bus types to driver binaries.
 ///
-/// Platform buses are skipped for now — consoled/gpio/pwm stay as static services.
+/// Each kernel bus triggers spawning of the corresponding driver.
 pub static BUS_DRIVER_RULES: &[BusDriverRule] = &[
-    BusDriverRule { bus_type: abi::bus_type::PCIE,     binary: "pcied", caps: userlib::devd::caps::DRIVER },
-    BusDriverRule { bus_type: abi::bus_type::USB,      binary: "usbd",  caps: userlib::devd::caps::DRIVER },
-    BusDriverRule { bus_type: abi::bus_type::ETHERNET, binary: "ethd",  caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::PCIE,     binary: "pcied",    caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::USB,      binary: "usbd",     caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::ETHERNET, binary: "ethd",     caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::UART,     binary: "consoled", caps: userlib::devd::caps::DRIVER },
+    BusDriverRule { bus_type: abi::bus_type::KLOG,     binary: "logd",     caps: userlib::devd::caps::DRIVER },
 ];
 
 // =============================================================================
@@ -477,6 +472,16 @@ impl ServiceRegistry {
     /// Used for dynamically spawned drivers that don't have static definitions.
     pub fn find_empty_slot(&self) -> Option<usize> {
         (0..MAX_SERVICES).find(|&i| self.services[i].is_none())
+    }
+
+    /// Find a service by binary name
+    pub fn find_by_binary(&self, binary: &str) -> Option<usize> {
+        (0..self.count).find(|&i| {
+            self.services[i]
+                .as_ref()
+                .map(|s| s.name() == binary)
+                .unwrap_or(false)
+        })
     }
 
     /// Ensure count includes a specific slot index (for dynamic services)

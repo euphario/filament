@@ -31,7 +31,7 @@
 //! ```
 
 // Re-export port enumeration types from abi for driver use
-pub use abi::{PortInfo, PortClass, PortMetadata, BlockMetadata, NetworkMetadata, UsbMetadata};
+pub use abi::{PortInfo, PortClass, PortState, PortMetadata, BlockMetadata, NetworkMetadata, UsbMetadata};
 pub use abi::{port_subclass, port_caps};
 
 // ============================================================================
@@ -773,6 +773,12 @@ pub trait BusCtx {
 
     /// Report driver state to devd.
     fn report_state(&mut self, state: crate::devd::DriverState) -> Result<(), BusError>;
+
+    /// Set port state.
+    ///
+    /// Transitions a registered port to a new state. Rules are checked
+    /// when a port transitions to Ready.
+    fn set_port_state(&mut self, name: &[u8], state: abi::PortState) -> Result<(), BusError>;
 
     /// Get spawn context from devd (cached after first call).
     ///

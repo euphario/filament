@@ -403,11 +403,21 @@ impl Scheduler {
             // Reset liveness state - task responded/became active
             task.liveness_state = super::liveness::LivenessState::Normal;
 
+            // Clear kernel_stack_owner so the task is selectable.
+            // When a task blocked and context-switched away, it had
+            // kernel_stack_owner set. Now that it's being woken, it's
+            // ready to be scheduled again.
+            task.clear_kernel_stack_owner();
+
             // Track runq invariant in debug builds
             task.set_on_runq(true);
 
             // Notify scheduling policy
             self.policy.on_task_ready(slot, task.priority);
+
+            // Set need_resched so the woken task gets scheduled
+            // when the current syscall returns
+            crate::arch::aarch64::sync::cpu_flags().set_need_resched();
 
             true
         } else {
@@ -486,6 +496,8 @@ impl Scheduler {
         for i in 0..woken_slot_count {
             let slot = woken_slots[i] as usize;
             if let Some(ref mut task) = self.tasks[slot] {
+                // Clear kernel_stack_owner so task is selectable
+                task.clear_kernel_stack_owner();
                 task.set_on_runq(true);
                 self.policy.on_task_ready(slot, task.priority);
             }
@@ -518,6 +530,8 @@ impl Scheduler {
                     if task.is_blocked() {
                         crate::transition_or_log!(task, wake);
                         task.liveness_state.reset(task.id);
+                        // Clear kernel_stack_owner so task is selectable
+                        task.clear_kernel_stack_owner();
                         task.set_on_runq(true);
                         self.policy.on_task_ready(slot, task.priority);
                         woken += 1;

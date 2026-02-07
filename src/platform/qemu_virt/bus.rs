@@ -39,6 +39,20 @@ pub fn register_buses(kernel_pid: Pid) {
             }
         }
 
+        // UART bus (serial console)
+        if let Some(bus) = registry.add(BusType::Uart, 0) {
+            bus.set_initial_state(BusState::Safe);
+            let _ = bus.register_port(kernel_pid);
+            kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Safe");
+        }
+
+        // Klog bus (kernel log)
+        if let Some(bus) = registry.add(BusType::Klog, 0) {
+            bus.set_initial_state(BusState::Safe);
+            let _ = bus.register_port(kernel_pid);
+            kinfo!("bus", "registered"; name = bus.port_name_str(), state = "Safe");
+        }
+
         // Platform pseudo-bus (always present)
         if let Some(bus) = registry.add(BusType::Platform, 0) {
             bus.set_initial_state(BusState::Safe);

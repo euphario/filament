@@ -585,6 +585,7 @@ impl ObjectService {
 
         // Get port subscriber from owner's table (if owner != caller)
         let owner_slot = slot_from_task_id(port_owner);
+
         let port_subscriber = match owner_slot {
             Some(os) if os != slot => {
                 // Different task - lock owner's table
@@ -603,7 +604,7 @@ impl ObjectService {
                 found_sub
                 // owner_guard dropped here
             }
-            _ => None,
+            _ => None
         };
 
         // Wake subscriber (no locks held)

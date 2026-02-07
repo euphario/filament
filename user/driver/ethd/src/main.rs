@@ -15,7 +15,7 @@ use userlib::ipc::Timer;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
-    PortInfo, PortClass, port_subclass, NetworkMetadata,
+    PortInfo, PortClass, PortState, port_subclass, NetworkMetadata,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, IoCqe, io_op, io_status, side_msg, side_status, SideEntry};
@@ -3428,7 +3428,15 @@ impl Driver for EthDriver {
         meta.mac.copy_from_slice(&self.mac);
         info.set_network_metadata(meta);
         let _ = ctx.register_port_with_info(&info, shmem_id);
+        let _ = ctx.set_port_state(b"net0", PortState::Ready);
         uinfo!("ethd", "registered"; name = "net0");
+
+        // Register switch: port to trigger switchd spawn
+        let mut switch_info = PortInfo::new(b"switch:", PortClass::Network);
+        switch_info.port_subclass = port_subclass::NET_SWITCH;
+        let _ = ctx.register_port_with_info(&switch_info, 0);
+        let _ = ctx.set_port_state(b"switch:", PortState::Ready);
+        uinfo!("ethd", "registered"; name = "switch:");
 
         // Start RX poll timer (10ms)
         if let Ok(mut timer) = Timer::new() {

@@ -4,7 +4,7 @@
 //! Supports hierarchical port trees (e.g., disk0: → part0:, part1:).
 //! Uses trait-based design for testability.
 
-use abi::{PortInfo, PortClass};
+use abi::{PortInfo, PortClass, PortState};
 use userlib::error::SysError;
 
 // =============================================================================
@@ -26,8 +26,8 @@ pub struct RegisteredPort {
     name_len: u8,
     /// Service index that owns this port (0xFF = devd itself)
     owner: u8,
-    /// Is the port currently available?
-    available: bool,
+    /// Port lifecycle state
+    state: PortState,
     /// Parent port index (0xFF = no parent / root)
     parent_idx: u8,
     /// DataPort shared memory ID (0 = no DataPort)
@@ -45,7 +45,7 @@ impl RegisteredPort {
             name: [0; MAX_PORT_NAME],
             name_len: 0,
             owner: 0,
-            available: false,
+            state: PortState::Registered,
             parent_idx: NO_PARENT,
             shmem_id: 0,
             port_info: PortInfo::empty(),
@@ -65,8 +65,17 @@ impl RegisteredPort {
         self.owner
     }
 
+    pub fn state(&self) -> PortState {
+        self.state
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.state == PortState::Ready
+    }
+
+    /// Legacy compatibility - returns true if Ready
     pub fn is_available(&self) -> bool {
-        self.available
+        self.state == PortState::Ready
     }
 
     /// Get wire protocol port type (u8) derived from PortClass
@@ -169,11 +178,17 @@ pub trait PortRegistry {
     /// Unregister a port by name
     fn unregister(&mut self, name: &[u8]);
 
-    /// Check if a port is available (registered and ready)
-    fn available(&self, name: &[u8]) -> bool;
+    /// Check if a port is ready
+    fn is_ready(&self, name: &[u8]) -> bool;
 
-    /// Set port availability status
-    fn set_availability(&mut self, name: &[u8], available: bool);
+    /// Get port state
+    fn get_state(&self, name: &[u8]) -> Option<PortState>;
+
+    /// Set port state. Returns previous state if port exists.
+    fn set_state(&mut self, name: &[u8], state: PortState) -> Option<PortState>;
+
+    /// Legacy: Check if a port is available (alias for is_ready)
+    fn available(&self, name: &[u8]) -> bool { self.is_ready(name) }
 
     /// Find owner of a port
     fn find_owner(&self, name: &[u8]) -> Option<u8>;
@@ -388,7 +403,7 @@ impl PortRegistry for Ports {
                 // Update with new info
                 port.parent_idx = parent_idx;
                 port.shmem_id = shmem_id;
-                port.available = true;
+                // Keep existing state on re-registration
                 port.port_info = *info;
                 return Ok(());
             }
@@ -401,7 +416,7 @@ impl PortRegistry for Ports {
         port.name[..name.len()].copy_from_slice(name);
         port.name_len = name.len() as u8;
         port.owner = owner;
-        port.available = true;
+        port.state = PortState::Registered;  // Starts Registered, driver sets Ready
         port.parent_idx = parent_idx;
         port.shmem_id = shmem_id;
         port.port_info = *info;
@@ -419,19 +434,28 @@ impl PortRegistry for Ports {
         }
     }
 
-    fn available(&self, name: &[u8]) -> bool {
+    fn is_ready(&self, name: &[u8]) -> bool {
         self.find_slot(name)
             .and_then(|i| self.ports[i].as_ref())
-            .map(|p| p.available)
+            .map(|p| p.state == PortState::Ready)
             .unwrap_or(false)
     }
 
-    fn set_availability(&mut self, name: &[u8], available: bool) {
+    fn get_state(&self, name: &[u8]) -> Option<PortState> {
+        self.find_slot(name)
+            .and_then(|i| self.ports[i].as_ref())
+            .map(|p| p.state)
+    }
+
+    fn set_state(&mut self, name: &[u8], state: PortState) -> Option<PortState> {
         if let Some(idx) = self.find_slot(name) {
             if let Some(port) = &mut self.ports[idx] {
-                port.available = available;
+                let old = port.state;
+                port.state = state;
+                return Some(old);
             }
         }
+        None
     }
 
     fn find_owner(&self, name: &[u8]) -> Option<u8> {
@@ -554,17 +578,23 @@ mod tests {
     }
 
     #[test]
-    fn test_availability() {
+    fn test_port_state() {
         let mut ports = Ports::new();
 
         assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
-        assert!(ports.available(b"test:"));
+        assert_eq!(ports.get_state(b"test:"), Some(PortState::Ready));
+        assert!(ports.is_ready(b"test:"));
 
-        ports.set_availability(b"test:", false);
-        assert!(!ports.available(b"test:"));
+        // Transition to Unavailable
+        let old = ports.set_state(b"test:", PortState::Unavailable);
+        assert_eq!(old, Some(PortState::Ready));
+        assert!(!ports.is_ready(b"test:"));
+        assert_eq!(ports.get_state(b"test:"), Some(PortState::Unavailable));
 
-        ports.set_availability(b"test:", true);
-        assert!(ports.available(b"test:"));
+        // Transition back to Ready
+        let old = ports.set_state(b"test:", PortState::Ready);
+        assert_eq!(old, Some(PortState::Unavailable));
+        assert!(ports.is_ready(b"test:"));
     }
 
     #[test]

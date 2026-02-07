@@ -150,7 +150,7 @@ impl ProcessOps for KernelProcessOps {
                     break;
                 }
                 if let Some(task) = task_opt {
-                    let current_tick = crate::platform::current::timer::ticks();
+                    let current_tick = crate::platform::current::timer::logical_ticks();
                     buf[count] = abi::ProcessInfo {
                         pid: task.id,
                         ppid: task.parent_id,

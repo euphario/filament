@@ -205,7 +205,11 @@ pub fn check_liveness(current_tick: u64) -> usize {
         let mut notifications: [Option<PendingNotification>; 4] = [None, None, None, None];
         let mut notify_count = 0usize;
 
-        for (_slot, task_opt) in sched.iter_tasks_mut() {
+        // Collect slots that need to be woken (can't call wake_task during iteration)
+        let mut wake_slots: [Option<usize>; 8] = [None; 8];
+        let mut wake_count = 0usize;
+
+        for (slot, task_opt) in sched.iter_tasks_mut() {
             if let Some(task) = task_opt {
                 // Reset liveness state for non-blocked tasks
                 if !task.is_blocked() {
@@ -240,13 +244,17 @@ pub fn check_liveness(current_tick: u64) -> usize {
                             // For EventLoop sleep (handle_wait), use implicit pong:
                             // Just wake the task - its next syscall proves it's alive
                             if matches!(sleep_reason, Some(SleepReason::EventLoop)) {
-                                // Wake the task - it will return 0 from handle_wait
-                                crate::transition_or_log!(task, wake);
+                                // Mark slot to wake after iteration (can't call wake_task during iteration)
+                                // Set liveness state now while we have the task reference
                                 let new_state = LivenessState::PingSent {
                                     channel: 0, // No channel - implicit pong via syscall
                                     sent_at: current_tick,
                                 };
                                 let _ = task.liveness_state.transition_to(new_state, task.id);
+                                if wake_count < wake_slots.len() {
+                                    wake_slots[wake_count] = Some(slot);
+                                    wake_count += 1;
+                                }
                                 actions += 1;
                                 crate::kdebug!("live", "wake"; pid = task.id as u64);
                             } else if matches!(sleep_reason, Some(SleepReason::Irq)) {
@@ -332,6 +340,35 @@ pub fn check_liveness(current_tick: u64) -> usize {
                     }
                 }
             }
+        }
+
+        // Now wake the collected slots using the proper wake mechanism
+        // This ensures state transition, kernel_stack_owner cleared, and task added to ready queue
+        for i in 0..wake_count {
+            if let Some(slot) = wake_slots[i] {
+                // Check if still blocked, transition state, clear kernel_stack_owner
+                let should_notify = if let Some(task) = sched.task_mut(slot) {
+                    if task.is_blocked() {
+                        // Transition state: Sleeping -> Ready
+                        crate::transition_or_log!(task, wake);
+                        // Clear kernel_stack_owner so task is selectable
+                        task.clear_kernel_stack_owner();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                // Notify scheduler (handles set_on_runq and policy.on_task_ready)
+                if should_notify {
+                    sched.notify_ready(slot);
+                }
+            }
+        }
+        // Set need_resched if any tasks were woken
+        if wake_count > 0 {
+            crate::arch::aarch64::sync::cpu_flags().set_need_resched();
         }
 
         (actions, notifications, notify_count)

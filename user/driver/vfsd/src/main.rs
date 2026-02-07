@@ -27,7 +27,7 @@
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, bus_msg,
-    PortInfo, PortClass, port_subclass,
+    PortInfo, PortClass, PortState, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::side_msg;
@@ -223,6 +223,7 @@ impl Driver for VfsDriver {
                     let mut info = PortInfo::new(b"vfs:", PortClass::Filesystem);
                     info.port_subclass = port_subclass::FS_RAMFS;
                     let _ = ctx.register_port_with_info(&info, shmem_id);
+                    let _ = ctx.set_port_state(b"vfs:", PortState::Ready);
 
                     uinfo!("vfsd", "mount_table_ready"; shmem_id = shmem_id);
                 }

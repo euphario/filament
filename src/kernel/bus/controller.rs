@@ -253,7 +253,7 @@ impl BusController {
             BusType::Usb => {
                 config.usb_base(self.bus_index as usize).unwrap_or(0) as u32
             }
-            BusType::Platform | BusType::Ethernet => 0, // Individual addresses
+            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => 0, // No hardware base
         };
 
         let mut info = BusInfo {
@@ -294,7 +294,7 @@ impl BusController {
                     (0, 0)
                 }
             }
-            BusType::Platform | BusType::Ethernet => (0, 0),
+            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => (0, 0),
         };
 
         // Build device name: "mt7988-pcie:0", "xhci:0", etc.
@@ -306,6 +306,8 @@ impl BusController {
             BusType::Usb => b"xhci:",
             BusType::Platform => b"platform:",
             BusType::Ethernet => b"gmac:",
+            BusType::Uart => b"uart:",
+            BusType::Klog => b"klog:",
         };
 
         for &b in chipset_type {
@@ -335,6 +337,7 @@ impl BusController {
             BusType::PCIe => hw_pcie::query_capabilities(self.bus_index),
             BusType::Usb => hw_usb::query_capabilities(self.bus_index),
             BusType::Platform | BusType::Ethernet => bus_caps::PLATFORM_MMIO | bus_caps::PLATFORM_IRQ,
+            BusType::Uart | BusType::Klog => 0, // No hardware capabilities to report
         }
     }
 
@@ -362,6 +365,8 @@ impl BusController {
             BusType::Usb => ipc::PortClass::Usb,
             BusType::Platform => ipc::PortClass::Service,
             BusType::Ethernet => ipc::PortClass::Network,
+            BusType::Uart => ipc::PortClass::Console,
+            BusType::Klog => ipc::PortClass::Service,
         }
     }
 
@@ -372,6 +377,8 @@ impl BusController {
             BusType::Usb => ipc::port_subclass::USB_XHCI,
             BusType::Platform => 0,
             BusType::Ethernet => ipc::port_subclass::NET_ETHERNET,
+            BusType::Uart => ipc::port_subclass::CONSOLE_SERIAL,
+            BusType::Klog => 0,
         }
     }
 
@@ -383,6 +390,7 @@ impl BusController {
             BusType::Usb => port_caps::DMA | port_caps::IRQ | port_caps::MMIO,
             BusType::Platform => port_caps::MMIO | port_caps::IRQ,
             BusType::Ethernet => port_caps::DMA | port_caps::IRQ | port_caps::MMIO,
+            BusType::Uart | BusType::Klog => 0, // No hardware capabilities
         }
     }
 
@@ -460,7 +468,7 @@ impl BusController {
         match self.bus_type {
             BusType::PCIe => hw_pcie::disable_all_bus_mastering(self.bus_index),
             BusType::Usb => { let _ = hw_usb::force_halt(self.bus_index); }
-            BusType::Platform | BusType::Ethernet => {
+            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => {
                 // No bus mastering to disable
             }
         }
@@ -628,7 +636,9 @@ impl BusController {
         match self.bus_type {
             BusType::PCIe => self.pcie_reset_sequence(),
             BusType::Usb => self.usb_reset_sequence(),
-            BusType::Platform | BusType::Ethernet => self.hardware_verified = true, // No hardware to reset
+            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => {
+                self.hardware_verified = true; // No hardware to reset
+            }
         }
     }
 
@@ -808,7 +818,7 @@ impl BusController {
         let hw_result = match self.bus_type {
             BusType::PCIe => hw_pcie::set_bus_mastering(self.bus_index, device_id, true),
             BusType::Usb => hw_usb::set_dma_allowed(self.bus_index, device_id, true),
-            BusType::Platform | BusType::Ethernet => Ok(()), // No bus mastering control
+            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => Ok(()), // No bus mastering control
         };
 
         if let Err(e) = hw_result {
@@ -833,7 +843,7 @@ impl BusController {
             let hw_result = match self.bus_type {
                 BusType::PCIe => hw_pcie::set_bus_mastering(self.bus_index, device_id, false),
                 BusType::Usb => hw_usb::set_dma_allowed(self.bus_index, device_id, false),
-                BusType::Platform | BusType::Ethernet => Ok(()), // No bus mastering control
+                BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => Ok(()), // No bus mastering control
             };
 
             if let Err(e) = hw_result {

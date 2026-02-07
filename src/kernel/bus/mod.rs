@@ -380,6 +380,15 @@ pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: 
     } else if suffix.starts_with("platform") {
         let idx = suffix[8..].parse::<u8>().map_err(|_| BusError::NotFound)?;
         (BusType::Platform, idx)
+    } else if suffix.starts_with("eth") {
+        let idx = suffix[3..].parse::<u8>().map_err(|_| BusError::NotFound)?;
+        (BusType::Ethernet, idx)
+    } else if suffix.starts_with("uart") {
+        let idx = suffix[4..].parse::<u8>().map_err(|_| BusError::NotFound)?;
+        (BusType::Uart, idx)
+    } else if suffix.starts_with("klog") {
+        let idx = suffix[4..].parse::<u8>().map_err(|_| BusError::NotFound)?;
+        (BusType::Klog, idx)
     } else {
         return Err(BusError::NotFound);
     };

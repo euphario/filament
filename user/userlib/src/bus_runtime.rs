@@ -601,6 +601,12 @@ impl BusCtx for RuntimeCtx {
             .map_err(|_| BusError::Internal)
     }
 
+    fn set_port_state(&mut self, name: &[u8], state: abi::PortState) -> Result<(), BusError> {
+        self.devd
+            .set_port_state(name, state)
+            .map_err(|_| BusError::Internal)
+    }
+
     fn spawn_context(&mut self) -> Result<&SpawnContext, BusError> {
         // Query devd on first call, cache the result
         if matches!(self.spawn_ctx, SpawnCtxCache::NotQueried) {

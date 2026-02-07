@@ -35,7 +35,7 @@ use userlib::syscall;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
-    PortInfo, PortClass, port_subclass,
+    PortInfo, PortClass, PortState, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, SideEntry, io_status, side_msg, side_status};
@@ -913,6 +913,7 @@ impl FatfsDriver {
                             let mut info = PortInfo::new(&pname[..pname_len], PortClass::Filesystem);
                             info.port_subclass = port_subclass::FS_FAT;
                             let _ = ctx.register_port_with_info(&info, vfs_shmem_id);
+                            let _ = ctx.set_port_state(&pname[..pname_len], PortState::Ready);
 
                             uinfo!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
 

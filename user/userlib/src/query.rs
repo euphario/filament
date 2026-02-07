@@ -104,6 +104,8 @@ pub mod msg {
     pub const MOUNT_READY: u16 = 0x010B;
     /// Register port with full PortInfo (unified enumeration)
     pub const REGISTER_PORT_INFO: u16 = 0x010C;
+    /// Set port state (driver → devd)
+    pub const SET_PORT_STATE: u16 = 0x010D;
 
     // Query messages (client → devd → driver)
     /// List all registered devices
@@ -775,6 +777,79 @@ impl UpdatePortShmemId {
                 shmem_id,
                 name_len: name_len as u8,
                 _pad: [0; 3],
+            },
+            name,
+        ))
+    }
+}
+
+/// Set port state message (driver → devd)
+///
+/// Transitions a port to a new state. Rules are checked when
+/// a port transitions to Ready state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SetPortState {
+    pub header: QueryHeader,
+    /// New state (see abi::PortState)
+    pub state: u8,
+    /// Length of port name
+    pub name_len: u8,
+    pub _pad: [u8; 2],
+    // Followed by: port name bytes
+}
+
+impl SetPortState {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4;
+
+    pub fn new(seq_id: u32, state: abi::PortState) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SET_PORT_STATE, seq_id),
+            state: state as u8,
+            name_len: 0,
+            _pad: [0; 2],
+        }
+    }
+
+    /// Serialize to buffer, returns total length written
+    pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
+        let total_len = Self::FIXED_SIZE + name.len();
+        if buf.len() < total_len || name.len() > 255 {
+            return None;
+        }
+
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = self.state;
+        buf[9] = name.len() as u8;
+        buf[10..12].copy_from_slice(&[0, 0]);
+        buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
+
+        Some(total_len)
+    }
+
+    /// Parse from buffer
+    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+
+        let header = QueryHeader::from_bytes(buf)?;
+        let state = buf[8];
+        let name_len = buf[9] as usize;
+
+        let total_len = Self::FIXED_SIZE + name_len;
+        if buf.len() < total_len {
+            return None;
+        }
+
+        let name = &buf[Self::FIXED_SIZE..total_len];
+
+        Some((
+            Self {
+                header,
+                state,
+                name_len: name_len as u8,
+                _pad: [0; 2],
             },
             name,
         ))
@@ -1841,7 +1916,7 @@ pub mod service_state {
     pub const FAILED: u8 = 5;
 }
 
-/// Service entry in services list response (32 bytes per entry)
+/// Service entry in services list response (64 bytes per entry)
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ServiceEntry {
@@ -1861,10 +1936,13 @@ pub struct ServiceEntry {
     pub total_restarts: u32,
     /// Last state change timestamp (ms since boot)
     pub last_change: u32,
+    /// Bus/port path that triggered this service's spawn (null-padded)
+    /// e.g., "/kernel/bus/uart0" for bus drivers
+    pub bus_path: [u8; 32],
 }
 
 impl ServiceEntry {
-    pub const SIZE: usize = 32;
+    pub const SIZE: usize = 64;
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
@@ -1876,6 +1954,7 @@ impl ServiceEntry {
         buf[23] = self.child_count;
         buf[24..28].copy_from_slice(&self.total_restarts.to_le_bytes());
         buf[28..32].copy_from_slice(&self.last_change.to_le_bytes());
+        buf[32..64].copy_from_slice(&self.bus_path);
         buf
     }
 
@@ -1885,6 +1964,8 @@ impl ServiceEntry {
         }
         let mut name = [0u8; 16];
         name.copy_from_slice(&buf[0..16]);
+        let mut bus_path = [0u8; 32];
+        bus_path.copy_from_slice(&buf[32..64]);
         Some(Self {
             name,
             pid: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
@@ -1894,6 +1975,7 @@ impl ServiceEntry {
             child_count: buf[23],
             total_restarts: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
             last_change: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
+            bus_path,
         })
     }
 
@@ -1914,6 +1996,17 @@ impl ServiceEntry {
             service_state::FAILED => "failed",
             _ => "unknown",
         }
+    }
+
+    /// Get bus path as slice (up to null terminator)
+    pub fn bus_path_str(&self) -> &[u8] {
+        let len = self.bus_path.iter().position(|&b| b == 0).unwrap_or(32);
+        &self.bus_path[..len]
+    }
+
+    /// Check if this service has a bus path (was spawned for a kernel bus)
+    pub fn has_bus_path(&self) -> bool {
+        self.bus_path[0] != 0
     }
 }
 

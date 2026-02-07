@@ -59,10 +59,14 @@ pub enum BusType {
     PCIe = 0,
     /// USB host controller (xHCI)
     Usb = 1,
-    /// Platform pseudo-bus (uart, gpio, i2c, spi, etc.)
+    /// Platform pseudo-bus (gpio, i2c, spi, etc.) - NOT uart
     Platform = 2,
     /// Ethernet (native GMAC)
     Ethernet = 3,
+    /// UART serial port
+    Uart = 4,
+    /// Kernel log (klog)
+    Klog = 5,
 }
 
 impl BusType {
@@ -72,6 +76,8 @@ impl BusType {
             BusType::Usb => "usb",
             BusType::Platform => "platform",
             BusType::Ethernet => "eth",
+            BusType::Uart => "uart",
+            BusType::Klog => "klog",
         }
     }
 }

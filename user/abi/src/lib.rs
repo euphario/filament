@@ -916,10 +916,14 @@ pub mod bus_type {
     pub const PCIE: u8 = 0;
     /// USB host controller (xHCI)
     pub const USB: u8 = 1;
-    /// Platform pseudo-bus (uart, gpio, i2c, spi, etc.)
+    /// Platform pseudo-bus (gpio, i2c, spi, etc.) - NOT uart
     pub const PLATFORM: u8 = 2;
     /// Ethernet (native GMAC)
     pub const ETHERNET: u8 = 3;
+    /// UART serial port
+    pub const UART: u8 = 4;
+    /// Kernel log (klog)
+    pub const KLOG: u8 = 5;
 }
 
 /// Bus state constants for BusInfo
@@ -1109,6 +1113,35 @@ impl PortClass {
     }
 }
 
+/// Port lifecycle state
+///
+/// All ports have an explicit state. Rules only fire on Ready transitions.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortState {
+    /// Port registered, driver initializing
+    Registered = 0,
+    /// Port is ready for use
+    Ready = 1,
+    /// Port is temporarily unavailable
+    Unavailable = 2,
+}
+
+impl PortState {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(PortState::Registered),
+            1 => Some(PortState::Ready),
+            2 => Some(PortState::Unavailable),
+            _ => None,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, PortState::Ready)
+    }
+}
+
 /// Port subclass constants (class-specific values)
 pub mod port_subclass {
     // Block subclasses (partition types from MBR/GPT)
@@ -1130,6 +1163,7 @@ pub mod port_subclass {
     pub const NET_ETHERNET: u16 = 0x00;
     pub const NET_WIFI: u16 = 0x01;
     pub const NET_SWITCH_PORT: u16 = 0x02;
+    pub const NET_SWITCH: u16 = 0x10;  // L2 switch (spawns switchd)
 
     // Storage controller subclasses
     pub const STORAGE_NVME: u16 = 0x02;
@@ -1139,6 +1173,10 @@ pub mod port_subclass {
     pub const FS_FAT: u16 = 0x01;
     pub const FS_EXT4: u16 = 0x02;
     pub const FS_RAMFS: u16 = 0x10;
+
+    // Console subclasses
+    pub const CONSOLE_SERIAL: u16 = 0x00;  // Serial console (UART)
+    pub const CONSOLE_VT: u16 = 0x01;      // Virtual terminal
 }
 
 /// Port capability bitflags

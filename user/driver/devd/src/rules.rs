@@ -75,6 +75,13 @@ static FAT_SUBCLASSES: &[u16] = &[
 ///
 /// Rules are checked in order; first match wins.
 pub static CLASS_RULES: &[ClassRule] = &[
+    // Console port → spawn shell
+    ClassRule {
+        class: PortClass::Console,
+        subclass: SubclassMatch::Any,
+        driver: "shell",
+        caps: userlib::devd::caps::USER,
+    },
     // USB xHCI controller → spawn USB daemon
     ClassRule {
         class: PortClass::Usb,
@@ -89,10 +96,31 @@ pub static CLASS_RULES: &[ClassRule] = &[
         driver: "nvmed",
         caps: userlib::devd::caps::DRIVER,
     },
-    // Any network device → spawn WiFi daemon
+    // L2 switch → spawn switch manager
     ClassRule {
         class: PortClass::Network,
-        subclass: SubclassMatch::Any,
+        subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH),
+        driver: "switchd",
+        caps: userlib::devd::caps::DRIVER,
+    },
+    // Switch port (NIC) → spawn IP stack
+    ClassRule {
+        class: PortClass::Network,
+        subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH_PORT),
+        driver: "ipd",
+        caps: userlib::devd::caps::DRIVER,
+    },
+    // Ethernet NIC → spawn IP stack
+    ClassRule {
+        class: PortClass::Network,
+        subclass: SubclassMatch::Exact(port_subclass::NET_ETHERNET),
+        driver: "ipd",
+        caps: userlib::devd::caps::DRIVER,
+    },
+    // WiFi adapter → spawn WiFi daemon
+    ClassRule {
+        class: PortClass::Network,
+        subclass: SubclassMatch::Exact(port_subclass::NET_WIFI),
         driver: "wifid",
         caps: userlib::devd::caps::DRIVER,
     },
@@ -184,17 +212,39 @@ mod tests {
     }
 
     #[test]
-    fn test_class_rule_network_any() {
-        // Any network subclass should match wifid
-        let info = make_port_info(PortClass::Network, 0x00);
+    fn test_class_rule_network_ethernet() {
+        // NET_ETHERNET (0x00) should match ipd
+        let info = make_port_info(PortClass::Network, port_subclass::NET_ETHERNET);
         let rule = find_class_rule(&info);
         assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "wifid");
+        assert_eq!(rule.unwrap().driver, "ipd");
+    }
 
-        let info = make_port_info(PortClass::Network, 0x01);
+    #[test]
+    fn test_class_rule_network_wifi() {
+        // NET_WIFI (0x01) should match wifid
+        let info = make_port_info(PortClass::Network, port_subclass::NET_WIFI);
         let rule = find_class_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "wifid");
+    }
+
+    #[test]
+    fn test_class_rule_network_switch() {
+        // NET_SWITCH (0x10) should match switchd
+        let info = make_port_info(PortClass::Network, port_subclass::NET_SWITCH);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "switchd");
+    }
+
+    #[test]
+    fn test_class_rule_network_switch_port() {
+        // NET_SWITCH_PORT (0x02) should match ipd
+        let info = make_port_info(PortClass::Network, port_subclass::NET_SWITCH_PORT);
+        let rule = find_class_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "ipd");
     }
 
     #[test]

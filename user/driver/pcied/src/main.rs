@@ -21,7 +21,7 @@ use userlib::{uinfo, uerror};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId,
     KernelBusState, KernelBusChangeReason, bus_msg,
-    PortInfo, PortClass, port_subclass,
+    PortInfo, PortClass, PortState, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
 
@@ -261,6 +261,7 @@ impl Driver for PcieDriver {
             info.device_id = entry.device_id;
 
             let _ = ctx.register_port_with_info(&info, 0);
+            let _ = ctx.set_port_state(name, PortState::Ready);
 
             uinfo!("pcied", "port_registered";
                 name = core::str::from_utf8(name).unwrap_or("?"),

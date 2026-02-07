@@ -286,6 +286,7 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         all_programs.push(("pcied", "driver/pcied"));
         all_programs.push(("usbd", "driver/usbd"));
         all_programs.push(("ethd", "driver/ethd"));  // Native GMAC Ethernet
+        all_programs.push(("switchd", "driver/switchd"));  // MT7531 L2 switch
         all_programs.push(("ipd", "driver/ipd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
         all_programs.push(("vfsd", "driver/vfsd"));

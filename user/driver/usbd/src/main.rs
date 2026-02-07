@@ -50,7 +50,7 @@ use userlib::{uinfo, uerror};
 use userlib::bus::{
     Driver, BusCtx, Disposition, BusError, BusMsg, bus_msg,
     BlockPortConfig, BlockGeometry, PortId,
-    PortInfo, PortClass, port_subclass,
+    PortInfo, PortClass, PortState, port_subclass,
 };
 use userlib::driver_main;
 use userlib::ring::{io_op, io_status, side_msg, side_status};
@@ -2262,6 +2262,7 @@ impl Driver for UsbdWrapper {
         let mut info = PortInfo::new(b"usb0:msc", PortClass::Block);
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
+        let _ = ctx.set_port_state(b"usb0:msc", PortState::Ready);
 
         uinfo!("usbd", "ready"; disks = 1u32);
 

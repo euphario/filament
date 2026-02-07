@@ -184,11 +184,12 @@ The `./build.sh` script is deprecated but still works for compatibility.
 ```bash
 # Build and run (recommended)
 ./x qemu
-
-# Manual run
-./x build --platform qemu
-qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -smp 2 -m 512M -nographic -kernel kernel.bin
 ```
+
+**IMPORTANT**: Always use `./x qemu` for QEMU testing. It uses the ELF file directly
+(`target/aarch64-unknown-none/release/bpi-r4-kernel`) which has correct load addresses.
+Do NOT manually run `qemu-system-aarch64 -kernel kernel.bin` - the flat binary lacks
+the ELF PhysAddr information needed for correct loading.
 
 QEMU differences from real hardware:
 - Loads kernel at 0x40080000 (vs 0x46000000 on MT7988A)

@@ -272,11 +272,13 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 if !t.is_terminated() {
                     t.mark_context_saved();
                 }
-                // SMP EXCLUSIVITY: Mark that this CPU owns this task's kernel stack.
-                // This prevents other CPUs from selecting this task until we've
-                // fully switched away. The flag is cleared in Phase 3 when we
-                // return to this task's context.
-                t.set_kernel_stack_owner(cpu);
+                // SMP EXCLUSIVITY: Only set kernel_stack_owner for BLOCKED tasks.
+                // Blocked tasks will have this cleared when woken (via wake_task).
+                // Ready tasks (preemption case) should be immediately selectable
+                // by any CPU - don't set kernel_stack_owner or they'll be stuck.
+                if t.is_blocked() {
+                    t.set_kernel_stack_owner(cpu);
+                }
                 &mut t.context as *mut task::CpuContext
             }
             None => return false,
