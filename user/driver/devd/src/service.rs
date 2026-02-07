@@ -155,8 +155,8 @@ mod pt {
 
 /// Service definitions - the "service tree"
 ///
-/// Note: consoled is NOT here - it's spawned dynamically via BUS_DRIVER_RULES
-/// when the kernel exposes the UART bus.
+/// Note: consoled is NOT here - it's spawned dynamically via PORT_RULES
+/// when the kernel UART bus port transitions to Ready.
 pub static SERVICE_DEFS: &[ServiceDef] = &[
     ServiceDef {
         binary: "vfsd",
@@ -203,33 +203,6 @@ pub static SERVICE_DEFS: &[ServiceDef] = &[
         context_port_type: 0,
         caps: u64::MAX,  // ALL caps (needs SHUTDOWN)
     },
-];
-
-// =============================================================================
-// Bus Driver Rules (dynamic bus → driver mapping)
-// =============================================================================
-
-/// Maps kernel bus types to driver binaries.
-///
-/// Used by `discover_kernel_buses()` to spawn one driver per bus.
-pub struct BusDriverRule {
-    /// Bus type to match (see `abi::bus_type`)
-    pub bus_type: u8,
-    /// Binary name in initrd
-    pub binary: &'static str,
-    /// Capability bits for the spawned driver
-    pub caps: u64,
-}
-
-/// Static table mapping bus types to driver binaries.
-///
-/// Each kernel bus triggers spawning of the corresponding driver.
-pub static BUS_DRIVER_RULES: &[BusDriverRule] = &[
-    BusDriverRule { bus_type: abi::bus_type::PCIE,     binary: "pcied",    caps: userlib::devd::caps::DRIVER },
-    BusDriverRule { bus_type: abi::bus_type::USB,      binary: "usbd",     caps: userlib::devd::caps::DRIVER },
-    BusDriverRule { bus_type: abi::bus_type::ETHERNET, binary: "ethd",     caps: userlib::devd::caps::DRIVER },
-    BusDriverRule { bus_type: abi::bus_type::UART,     binary: "consoled", caps: userlib::devd::caps::DRIVER },
-    BusDriverRule { bus_type: abi::bus_type::KLOG,     binary: "logd",     caps: userlib::devd::caps::DRIVER },
 ];
 
 // =============================================================================

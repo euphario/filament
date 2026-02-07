@@ -1,17 +1,24 @@
-//! Rules Engine for Dynamic Driver Spawning
+//! Unified Port Rules Engine
 //!
-//! When a port is registered with PortInfo, its class and subclass determine
-//! which driver to spawn. This replaces the legacy string-based suffix matching.
+//! Single rule table for all driver auto-spawning. Rules fire when a port
+//! transitions to Ready — never at registration time.
 //!
-//! Class-based matching:
-//!   PortClass::Usb + USB_XHCI → spawn usbd
-//!   PortClass::Block + BLOCK_RAW → spawn partd
-//!   PortClass::Block + BLOCK_FAT* → spawn fatfsd
+//! Hardware-layer rules (kernel bus ports → bus drivers):
+//!   PortClass::Pcie → pcied
+//!   PortClass::Uart → consoled
+//!   PortClass::Klog → logd
+//!   PortClass::Ethernet → ethd
+//!
+//! Driver-layer rules (driver ports → children):
+//!   PortClass::Console → shell
+//!   PortClass::Usb + USB_XHCI → usbd
+//!   PortClass::Block + BLOCK_RAW → partd
+//!   PortClass::Block + BLOCK_FAT* → fatfsd
 
 use abi::{PortClass, PortInfo, port_subclass};
 
 // =============================================================================
-// Class-Based Rule
+// Port Rule
 // =============================================================================
 
 /// Subclass matching strategy
@@ -38,18 +45,18 @@ impl SubclassMatch {
 
 /// A rule matching PortClass + subclass to driver binaries.
 #[derive(Clone, Copy)]
-pub struct ClassRule {
+pub struct PortRule {
     /// Port class to match
     pub class: PortClass,
     /// Subclass matcher
     pub subclass: SubclassMatch,
     /// Driver binary to spawn
     pub driver: &'static str,
-    /// Capability bits for spawned child (0 = inherit parent's caps)
+    /// Capability bits for spawned child
     pub caps: u64,
 }
 
-impl ClassRule {
+impl PortRule {
     /// Check if a PortInfo matches this rule
     pub fn matches(&self, info: &PortInfo) -> bool {
         if info.port_class != self.class {
@@ -60,7 +67,7 @@ impl ClassRule {
 }
 
 // =============================================================================
-// Built-in Class Rules
+// Unified Port Rules Table
 // =============================================================================
 
 /// FAT filesystem subclass values (MBR partition type codes)
@@ -71,75 +78,97 @@ static FAT_SUBCLASSES: &[u16] = &[
     port_subclass::BLOCK_FAT32_LBA,
 ];
 
-/// Class-based rules for driver auto-spawning.
+/// Unified port rules for all driver auto-spawning.
 ///
-/// Rules are checked in order; first match wins.
-pub static CLASS_RULES: &[ClassRule] = &[
-    // Console port → spawn shell
-    ClassRule {
-        class: PortClass::Console,
+/// Rules are checked in order; first match wins. This table replaces
+/// the former BUS_DRIVER_RULES (hardware layer) and CLASS_RULES (driver layer).
+pub static PORT_RULES: &[PortRule] = &[
+    // =========================================================================
+    // Hardware layer (kernel bus ports → bus drivers)
+    // =========================================================================
+    PortRule {
+        class: PortClass::Pcie,
         subclass: SubclassMatch::Any,
-        driver: "shell",
-        caps: userlib::devd::caps::USER,
+        driver: "pcied",
+        caps: userlib::devd::caps::DRIVER,
     },
-    // USB xHCI controller → spawn USB daemon
-    ClassRule {
+    PortRule {
         class: PortClass::Usb,
         subclass: SubclassMatch::Exact(port_subclass::USB_XHCI),
         driver: "usbd",
         caps: userlib::devd::caps::DRIVER,
     },
-    // NVMe storage controller → spawn NVMe daemon
-    ClassRule {
+    PortRule {
+        class: PortClass::Ethernet,
+        subclass: SubclassMatch::Any,
+        driver: "ethd",
+        caps: userlib::devd::caps::DRIVER,
+    },
+    PortRule {
+        class: PortClass::Uart,
+        subclass: SubclassMatch::Any,
+        driver: "consoled",
+        caps: userlib::devd::caps::DRIVER,
+    },
+    PortRule {
+        class: PortClass::Klog,
+        subclass: SubclassMatch::Any,
+        driver: "logd",
+        caps: userlib::devd::caps::DRIVER,
+    },
+
+    // =========================================================================
+    // Driver layer (driver ports → children)
+    // =========================================================================
+    PortRule {
+        class: PortClass::Console,
+        subclass: SubclassMatch::Any,
+        driver: "shell",
+        caps: userlib::devd::caps::USER,
+    },
+    PortRule {
         class: PortClass::StorageController,
         subclass: SubclassMatch::Exact(port_subclass::STORAGE_NVME),
         driver: "nvmed",
         caps: userlib::devd::caps::DRIVER,
     },
-    // L2 switch → spawn switch manager
-    ClassRule {
+    PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH),
         driver: "switchd",
         caps: userlib::devd::caps::DRIVER,
     },
-    // Switch port (NIC) → spawn IP stack
-    ClassRule {
+    PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH_PORT),
         driver: "ipd",
         caps: userlib::devd::caps::DRIVER,
     },
-    // Ethernet NIC → spawn IP stack
-    ClassRule {
+    PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_ETHERNET),
         driver: "ipd",
         caps: userlib::devd::caps::DRIVER,
     },
-    // WiFi adapter → spawn WiFi daemon
-    ClassRule {
+    PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_WIFI),
         driver: "wifid",
         caps: userlib::devd::caps::DRIVER,
     },
-    // Raw block device (whole disk) → spawn partition scanner
-    ClassRule {
+    PortRule {
         class: PortClass::Block,
         subclass: SubclassMatch::Exact(port_subclass::BLOCK_RAW),
         driver: "partd",
         caps: userlib::devd::caps::DRIVER,
     },
-    // FAT partition → spawn FAT filesystem driver
-    ClassRule {
+    PortRule {
         class: PortClass::Block,
         subclass: SubclassMatch::OneOf(FAT_SUBCLASSES),
         driver: "fatfsd",
         caps: userlib::devd::caps::DRIVER,
     },
-    // Linux partition → spawn ext2 filesystem driver
-    ClassRule {
+    PortRule {
         class: PortClass::Block,
         subclass: SubclassMatch::Exact(port_subclass::BLOCK_LINUX),
         driver: "ext2fsd",
@@ -147,9 +176,9 @@ pub static CLASS_RULES: &[ClassRule] = &[
     },
 ];
 
-/// Find the first matching class rule for a PortInfo.
-pub fn find_class_rule(info: &PortInfo) -> Option<&'static ClassRule> {
-    CLASS_RULES.iter().find(|rule| rule.matches(info))
+/// Find the first matching port rule for a PortInfo.
+pub fn find_port_rule(info: &PortInfo) -> Option<&'static PortRule> {
+    PORT_RULES.iter().find(|rule| rule.matches(info))
 }
 
 // =============================================================================
@@ -195,111 +224,127 @@ mod tests {
         assert!(!matcher.matches(0x83));
     }
 
+    // Hardware-layer rules
     #[test]
-    fn test_class_rule_usb_xhci() {
+    fn test_rule_pcie() {
+        let info = make_port_info(PortClass::Pcie, 0);
+        let rule = find_port_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "pcied");
+    }
+
+    #[test]
+    fn test_rule_uart() {
+        let info = make_port_info(PortClass::Uart, 0);
+        let rule = find_port_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "consoled");
+    }
+
+    #[test]
+    fn test_rule_klog() {
+        let info = make_port_info(PortClass::Klog, 0);
+        let rule = find_port_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "logd");
+    }
+
+    #[test]
+    fn test_rule_ethernet() {
+        let info = make_port_info(PortClass::Ethernet, 0);
+        let rule = find_port_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "ethd");
+    }
+
+    // Driver-layer rules
+    #[test]
+    fn test_rule_console() {
+        let info = make_port_info(PortClass::Console, 0);
+        let rule = find_port_rule(&info);
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "shell");
+    }
+
+    #[test]
+    fn test_rule_usb_xhci() {
         let info = make_port_info(PortClass::Usb, port_subclass::USB_XHCI);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "usbd");
     }
 
     #[test]
-    fn test_class_rule_nvme() {
+    fn test_rule_nvme() {
         let info = make_port_info(PortClass::StorageController, port_subclass::STORAGE_NVME);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "nvmed");
     }
 
     #[test]
-    fn test_class_rule_network_ethernet() {
-        // NET_ETHERNET (0x00) should match ipd
+    fn test_rule_network_ethernet() {
         let info = make_port_info(PortClass::Network, port_subclass::NET_ETHERNET);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "ipd");
     }
 
     #[test]
-    fn test_class_rule_network_wifi() {
-        // NET_WIFI (0x01) should match wifid
+    fn test_rule_network_wifi() {
         let info = make_port_info(PortClass::Network, port_subclass::NET_WIFI);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "wifid");
     }
 
     #[test]
-    fn test_class_rule_network_switch() {
-        // NET_SWITCH (0x10) should match switchd
+    fn test_rule_network_switch() {
         let info = make_port_info(PortClass::Network, port_subclass::NET_SWITCH);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "switchd");
     }
 
     #[test]
-    fn test_class_rule_network_switch_port() {
-        // NET_SWITCH_PORT (0x02) should match ipd
+    fn test_rule_network_switch_port() {
         let info = make_port_info(PortClass::Network, port_subclass::NET_SWITCH_PORT);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "ipd");
     }
 
     #[test]
-    fn test_class_rule_block_raw() {
+    fn test_rule_block_raw() {
         let info = make_port_info(PortClass::Block, port_subclass::BLOCK_RAW);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "partd");
     }
 
     #[test]
-    fn test_class_rule_fat_partitions() {
-        // FAT12
-        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_FAT12);
-        let rule = find_class_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "fatfsd");
-
-        // FAT16
-        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_FAT16);
-        let rule = find_class_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "fatfsd");
-
-        // FAT32
-        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_FAT32);
-        let rule = find_class_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "fatfsd");
-
-        // FAT32 LBA
-        let info = make_port_info(PortClass::Block, port_subclass::BLOCK_FAT32_LBA);
-        let rule = find_class_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "fatfsd");
+    fn test_rule_fat_partitions() {
+        for &sub in FAT_SUBCLASSES {
+            let info = make_port_info(PortClass::Block, sub);
+            let rule = find_port_rule(&info);
+            assert!(rule.is_some());
+            assert_eq!(rule.unwrap().driver, "fatfsd");
+        }
     }
 
     #[test]
-    fn test_class_rule_linux_partition() {
+    fn test_rule_linux_partition() {
         let info = make_port_info(PortClass::Block, port_subclass::BLOCK_LINUX);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_some());
         assert_eq!(rule.unwrap().driver, "ext2fsd");
     }
 
     #[test]
-    fn test_class_rule_no_match() {
-        // Console should not match any rule
-        let info = make_port_info(PortClass::Console, 0);
-        let rule = find_class_rule(&info);
-        assert!(rule.is_none());
-
+    fn test_rule_no_match() {
         // Service should not match any rule
         let info = make_port_info(PortClass::Service, 0);
-        let rule = find_class_rule(&info);
+        let rule = find_port_rule(&info);
         assert!(rule.is_none());
     }
 }

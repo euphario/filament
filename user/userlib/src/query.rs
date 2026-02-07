@@ -339,6 +339,10 @@ pub mod port_type {
     pub const CONSOLE: u8 = 6;
     pub const SERVICE: u8 = 7;
     pub const STORAGE: u8 = 8;
+    pub const PCIE: u8 = 9;
+    pub const UART: u8 = 10;
+    pub const KLOG: u8 = 11;
+    pub const ETHERNET: u8 = 12;
 }
 
 /// Filesystem type hints for partition mounting

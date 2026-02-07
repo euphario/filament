@@ -226,6 +226,11 @@ struct RuntimeCtx {
     pending: [Option<PendingRequest>; MAX_PENDING],
     /// Number of active pending requests.
     pending_count: usize,
+    /// Port names registered during init (set to Ready after report_state(Ready)).
+    /// Each entry: (name, name_len). Max 4 ports per driver during init.
+    init_ports: [([u8; 32], u8); 4],
+    /// Number of ports registered during init.
+    init_port_count: usize,
 }
 
 impl RuntimeCtx {
@@ -252,6 +257,8 @@ impl RuntimeCtx {
             spawn_ctx: SpawnCtxCache::NotQueried,
             pending: [const { None }; MAX_PENDING],
             pending_count: 0,
+            init_ports: [([0u8; 32], 0); 4],
+            init_port_count: 0,
         }
     }
 
@@ -592,7 +599,18 @@ impl BusCtx for RuntimeCtx {
     ) -> Result<(), BusError> {
         self.devd
             .register_port_info(info, shmem_id)
-            .map_err(|_| BusError::Internal)
+            .map_err(|_| BusError::Internal)?;
+
+        // Track port name for deferred Ready (set after report_state(Ready))
+        if self.init_port_count < 4 {
+            let name = info.name_bytes();
+            let len = name.len().min(32);
+            self.init_ports[self.init_port_count].0[..len].copy_from_slice(&name[..len]);
+            self.init_ports[self.init_port_count].1 = len as u8;
+            self.init_port_count += 1;
+        }
+
+        Ok(())
     }
 
     fn report_state(&mut self, state: DriverState) -> Result<(), BusError> {
@@ -777,6 +795,15 @@ impl<D: Driver> DriverRuntime<D> {
 
         // Report ready to devd
         let _ = self.ctx.devd.report_state(DriverState::Ready);
+
+        // Set all ports registered during init() to Ready.
+        // This ensures rules fire AFTER the driver is in its event loop
+        // and can process SpawnChild commands immediately.
+        for i in 0..self.ctx.init_port_count {
+            let (ref name, len) = self.ctx.init_ports[i];
+            let _ = self.ctx.devd.set_port_state(&name[..len as usize], abi::PortState::Ready);
+        }
+        self.ctx.init_port_count = 0;
 
         // Event loop: block on Mux, dispatch deadlines, repeat
         loop {

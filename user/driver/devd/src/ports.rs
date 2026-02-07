@@ -45,7 +45,7 @@ impl RegisteredPort {
             name: [0; MAX_PORT_NAME],
             name_len: 0,
             owner: 0,
-            state: PortState::Registered,
+            state: PortState::Initialize,
             parent_idx: NO_PARENT,
             shmem_id: 0,
             port_info: PortInfo::empty(),
@@ -80,7 +80,8 @@ impl RegisteredPort {
 
     /// Get wire protocol port type (u8) derived from PortClass
     /// Values: 0=Unknown, 1=Block, 2=Partition (Block with subclass), 3=Filesystem,
-    ///         4=Usb, 5=Network, 6=Console, 7=Service, 8=Storage
+    ///         4=Usb, 5=Network, 6=Console, 7=Service, 8=Storage,
+    ///         9=Pcie, 10=Uart, 11=Klog, 12=Ethernet
     pub fn port_type(&self) -> u8 {
         match self.port_info.port_class {
             PortClass::Block => {
@@ -93,6 +94,10 @@ impl RegisteredPort {
             PortClass::Console => 6,
             PortClass::Service => 7,
             PortClass::StorageController => 8,
+            PortClass::Pcie => 9,
+            PortClass::Uart => 10,
+            PortClass::Klog => 11,
+            PortClass::Ethernet => 12,
             _ => 0,
         }
     }
@@ -416,7 +421,7 @@ impl PortRegistry for Ports {
         port.name[..name.len()].copy_from_slice(name);
         port.name_len = name.len() as u8;
         port.owner = owner;
-        port.state = PortState::Registered;  // Starts Registered, driver sets Ready
+        port.state = PortState::Initialize;  // Starts Initialize, driver/runtime sets Ready
         port.parent_idx = parent_idx;
         port.shmem_id = shmem_id;
         port.port_info = *info;
@@ -586,14 +591,14 @@ mod tests {
         assert!(ports.is_ready(b"test:"));
 
         // Transition to Unavailable
-        let old = ports.set_state(b"test:", PortState::Unavailable);
+        let old = ports.set_state(b"test:", PortState::Resetting);
         assert_eq!(old, Some(PortState::Ready));
         assert!(!ports.is_ready(b"test:"));
-        assert_eq!(ports.get_state(b"test:"), Some(PortState::Unavailable));
+        assert_eq!(ports.get_state(b"test:"), Some(PortState::Resetting));
 
         // Transition back to Ready
         let old = ports.set_state(b"test:", PortState::Ready);
-        assert_eq!(old, Some(PortState::Unavailable));
+        assert_eq!(old, Some(PortState::Resetting));
         assert!(ports.is_ready(b"test:"));
     }
 

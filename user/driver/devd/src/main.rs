@@ -45,7 +45,6 @@ use userlib::query::{
 
 use service::{
     ServiceState, ServiceManager, ServiceRegistry, PortDef,
-    BUS_DRIVER_RULES,
     MAX_SERVICES, MAX_PORTS_PER_SERVICE, MAX_RESTARTS,
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
 };
@@ -54,7 +53,6 @@ use process::{ProcessManager, SyscallProcessManager};
 use deps::{DependencyResolver, Dependencies};
 use devices::{DeviceStore, DeviceRegistry};
 use query::{QueryHandler, MSG_BUFFER_SIZE, MAX_QUERY_CLIENTS};
-// Class-based rules via `rules::find_class_rule()`
 
 // =============================================================================
 // Admin Client Handling (shell text commands)
@@ -141,12 +139,6 @@ impl AdminClients {
 
 /// Maximum number of recently spawned dynamic PIDs to track
 const MAX_RECENT_DYNAMIC_PIDS: usize = 8;
-
-/// Maximum number of pending spawn commands per driver
-const MAX_PENDING_SPAWNS_PER_DRIVER: usize = 4;
-
-/// Maximum number of drivers that can have pending spawns
-const MAX_DRIVERS_WITH_PENDING: usize = 8;
 
 /// Maximum spawn contexts to track (PID -> trigger port)
 const MAX_SPAWN_CONTEXTS: usize = 32;
@@ -531,33 +523,6 @@ impl LogBuffer {
     }
 }
 
-/// A pending spawn command waiting for driver to report Ready
-#[derive(Clone, Copy)]
-struct PendingSpawn {
-    /// Service index of the driver that should spawn
-    driver_idx: u8,
-    /// Binary name to spawn (index into static strings)
-    binary: &'static str,
-    /// Trigger port name
-    port_name: [u8; 32],
-    /// Length of port name
-    port_name_len: u8,
-    /// Capability bits for spawned child (from rule)
-    caps: u64,
-}
-
-impl PendingSpawn {
-    const fn empty() -> Self {
-        Self {
-            driver_idx: 0xFF,
-            binary: "",
-            port_name: [0u8; 32],
-            port_name_len: 0,
-            caps: 0,
-        }
-    }
-}
-
 pub struct Devd {
     /// Our port for services to announce ready
     port: Option<Port>,
@@ -582,9 +547,6 @@ pub struct Devd {
     /// Recently spawned dynamic PIDs (workaround for spawn-before-slot-setup race)
     /// Maps PID -> service_idx for dynamic drivers that haven't connected yet
     recent_dynamic_pids: [(u32, u8); MAX_RECENT_DYNAMIC_PIDS],
-    /// Pending spawn commands waiting for drivers to report Ready
-    /// Keyed by driver service index
-    pending_spawns: [PendingSpawn; MAX_DRIVERS_WITH_PENDING * MAX_PENDING_SPAWNS_PER_DRIVER],
     /// Spawn context: maps child PID to trigger port (for GET_SPAWN_CONTEXT)
     spawn_contexts: [SpawnContext; MAX_SPAWN_CONTEXTS],
     /// In-flight spawn commands: maps seq_id to port info
@@ -624,7 +586,6 @@ impl Devd {
             query_handler: QueryHandler::new(),
             admin_clients: AdminClients::new(),
             recent_dynamic_pids: [(0, 0); MAX_RECENT_DYNAMIC_PIDS],
-            pending_spawns: [const { PendingSpawn::empty() }; MAX_DRIVERS_WITH_PENDING * MAX_PENDING_SPAWNS_PER_DRIVER],
             spawn_contexts: [const { SpawnContext::empty() }; MAX_SPAWN_CONTEXTS],
             inflight_spawns: [const { InflightSpawn::empty() }; MAX_INFLIGHT_SPAWNS],
             pending_info_queries: [const { PendingInfoQuery::empty() }; MAX_PENDING_INFO_QUERIES],
@@ -688,10 +649,11 @@ impl Devd {
     // Bus Discovery
     // =========================================================================
 
-    /// Query kernel for registered buses and spawn a driver for each.
+    /// Query kernel for registered buses, register as ports, and let rules spawn drivers.
     ///
-    /// Replaces the hardcoded pcied ServiceDef — one driver per bus instance.
-    /// Uses BUS_DRIVER_RULES to map bus_type → binary.
+    /// Each kernel bus is mirrored as a port in devd's port registry.
+    /// The port transitions to Ready, which triggers the unified PORT_RULES
+    /// to spawn the appropriate bus driver.
     fn discover_kernel_buses(&mut self) {
         let mut buses = [abi::BusInfo::empty(); 16];
         let count = match userlib::ipc::bus_list(&mut buses) {
@@ -702,64 +664,84 @@ impl Devd {
             }
         };
 
-
         uinfo!("devd", "bus_discovery"; count = count as u32);
 
-        let now = Self::now_ms();
         for i in 0..count {
             let bus = &buses[i];
-
-            // Find matching driver rule
-            let rule = BUS_DRIVER_RULES.iter().find(|r| r.bus_type == bus.bus_type);
-            let rule = match rule {
-                Some(r) => r,
-                None => continue,  // No driver for this bus type (e.g., Platform)
-            };
-
             let path = &bus.path[..bus.path_len as usize];
 
-            // Spawn the driver
-            let (pid, watcher) = match self.process_mgr.spawn_with_caps(rule.binary, rule.caps) {
-                Ok(result) => result,
-                Err(_) => {
-                    uerror!("devd", "bus_driver_spawn_failed"; binary = rule.binary);
-                    continue;
-                }
+            // Map bus_type → PortClass
+            let (port_class, port_subclass) = match bus.bus_type {
+                abi::bus_type::PCIE     => (abi::PortClass::Pcie, 0u16),
+                abi::bus_type::USB      => (abi::PortClass::Usb, abi::port_subclass::USB_XHCI),
+                abi::bus_type::ETHERNET => (abi::PortClass::Ethernet, 0),
+                abi::bus_type::UART     => (abi::PortClass::Uart, 0),
+                abi::bus_type::KLOG     => (abi::PortClass::Klog, 0),
+                _ => continue,  // No PortClass for this bus type (e.g., Platform)
             };
 
-            // Store spawn context so driver can query GET_SPAWN_CONTEXT
-            // port_type = SERVICE (7) — bus drivers are services
-            self.store_spawn_context(pid, 7, path, &[]);
+            // Build PortInfo from BusInfo
+            let mut port_info = abi::PortInfo::new(path, port_class);
+            port_info.port_subclass = port_subclass;
 
-            // Create dynamic service slot in Starting state.
-            // Bus drivers transition to Ready when they send STATE_CHANGE(Ready)
-            // after init(). This prevents devd from sending SpawnChild commands
-            // on the query channel while the driver is still doing synchronous
-            // register_port calls during init().
-            let slot_idx = self.services.create_dynamic_service_with_state(
-                pid, rule.binary.as_bytes(), now, ServiceState::Starting,
+            // Register in devd's port registry (owner = 0xFF = devd/kernel)
+            let _ = self.ports.register_with_port_info(&port_info, 0xFF, 0);
+
+            uinfo!("devd", "bus_port_registered";
+                name = core::str::from_utf8(path).unwrap_or("?"),
+                class = port_class as u16
             );
 
-            if let Some(idx) = slot_idx {
-                if let Some(service) = self.services.get_mut(idx) {
-                    service.watcher = Some(watcher);
-                }
+            // Set port to Ready — this triggers check_class_rules via
+            // the same path as handle_set_port_state, but we call it directly
+            // since these ports don't have a driver channel yet.
+            let _ = self.ports.set_state(path, abi::PortState::Ready);
 
-                self.add_recent_dynamic_pid(pid, idx as u8);
+            // Fire rules on the Ready transition
+            self.check_class_rules(&port_info, 0xFF);
+        }
+    }
 
-                // Add watcher to event loop
-                if let Some(events) = &mut self.events {
-                    if let Some(service) = self.services.get(idx) {
-                        if let Some(w) = &service.watcher {
-                            let _ = events.watch(w.handle());
-                        }
+    /// Spawn a bus driver directly (for kernel bus ports where owner=0xFF).
+    ///
+    /// Unlike driver-owned ports where SpawnChild goes via the owner's channel,
+    /// kernel bus ports are owned by devd itself, so we spawn directly.
+    fn spawn_bus_driver(&mut self, binary: &'static str, caps: u64, bus_path: &[u8]) {
+        let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
+            Ok(result) => result,
+            Err(_) => {
+                uerror!("devd", "bus_driver_spawn_failed"; binary = binary);
+                return;
+            }
+        };
+
+        // Store spawn context so driver can query GET_SPAWN_CONTEXT
+        self.store_spawn_context(pid, 7, bus_path, &[]);
+
+        let now = Self::now_ms();
+        let slot_idx = self.services.create_dynamic_service_with_state(
+            pid, binary.as_bytes(), now, ServiceState::Starting,
+        );
+
+        if let Some(idx) = slot_idx {
+            if let Some(service) = self.services.get_mut(idx) {
+                service.watcher = Some(watcher);
+            }
+
+            self.add_recent_dynamic_pid(pid, idx as u8);
+
+            // Add watcher to event loop
+            if let Some(events) = &mut self.events {
+                if let Some(service) = self.services.get(idx) {
+                    if let Some(w) = &service.watcher {
+                        let _ = events.watch(w.handle());
                     }
                 }
-
-                uinfo!("devd", "bus_driver_spawned"; binary = rule.binary, pid = pid);
-            } else {
-                uerror!("devd", "no_dynamic_slot"; binary = rule.binary, pid = pid);
             }
+
+            uinfo!("devd", "bus_driver_spawned"; binary = binary, pid = pid);
+        } else {
+            uerror!("devd", "no_dynamic_slot"; binary = binary, pid = pid);
         }
     }
 
@@ -820,6 +802,17 @@ impl Devd {
                 if !parent_ready {
                     // Parent not ready yet - stay Pending, will retry when parent reports Ready
                     return;
+                }
+
+                // Link parent-child relationship (deferred from init because
+                // dynamic services like consoled don't exist at init_from_defs time)
+                if let Some(service) = self.services.get_mut(idx) {
+                    if service.parent.is_none() {
+                        service.parent = Some(pidx as u8);
+                    }
+                }
+                if let Some(parent_svc) = self.services.get_mut(pidx) {
+                    parent_svc.add_child(idx as u8);
                 }
 
                 // Parent is ready - send SPAWN_CHILD now
@@ -917,8 +910,8 @@ impl Devd {
             };
             let info = abi::PortInfo::new(pd.name, port_class);
             let _ = self.ports.register_with_port_info(&info, idx as u8, 0);
-            // Pre-registered ports start in Registered state, not Ready
-            self.ports.set_state(pd.name, abi::PortState::Registered);
+            // Pre-registered ports start in Initialize state, not Ready
+            self.ports.set_state(pd.name, abi::PortState::Initialize);
         }
 
         // For services that don't register ports, mark Ready immediately
@@ -1920,7 +1913,7 @@ impl Devd {
 
         uinfo!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
 
-        // When driver reports Ready, transition state and send pending spawns
+        // When driver reports Ready, transition state
         if state_msg.new_state == driver_state::READY {
             let now = Self::now_ms();
             if let Some(service) = self.services.get_mut(driver_idx as usize) {
@@ -1928,9 +1921,10 @@ impl Devd {
                 service.last_change = now;
             }
 
-            self.flush_pending_spawns(driver_idx);
+            // Rules fire on port Ready transitions (handle_set_port_state),
+            // not on service Ready. No flush needed.
 
-            // Also retry pending services that may have been waiting for this driver
+            // Retry pending services that may have been waiting for this driver
             // to become Ready (e.g., shell waiting for consoled)
             self.check_pending_services();
         }
@@ -2601,73 +2595,6 @@ impl Devd {
         }
     }
 
-    /// Queue a spawn command for later delivery when driver reports Ready
-    fn queue_pending_spawn(&mut self, driver_idx: u8, binary: &'static str, port_name: &[u8], caps: u64) {
-        // Find an empty slot
-        for spawn in &mut self.pending_spawns {
-            if spawn.driver_idx == 0xFF {
-                spawn.driver_idx = driver_idx;
-                spawn.binary = binary;
-                let len = port_name.len().min(32);
-                spawn.port_name[..len].copy_from_slice(&port_name[..len]);
-                spawn.port_name_len = len as u8;
-                spawn.caps = caps;
-                return;
-            }
-        }
-        uerror!("devd", "spawn_queue_full"; driver = self.svc_name(driver_idx));
-    }
-
-    /// Send all pending spawn commands for a driver.
-    ///
-    /// Called when a driver reports Ready via STATE_CHANGE. At this point
-    /// the driver has finished init() and is in its event loop, so it can
-    /// process SpawnChild commands.
-    fn flush_pending_spawns(&mut self, driver_idx: u8) {
-        // Collect pending spawns for this driver
-        let mut to_send: [(Option<&'static str>, [u8; 32], u8, u64); MAX_PENDING_SPAWNS_PER_DRIVER] =
-            [(None, [0u8; 32], 0, 0); MAX_PENDING_SPAWNS_PER_DRIVER];
-        let mut count = 0;
-
-        for spawn in &mut self.pending_spawns {
-            if spawn.driver_idx == driver_idx {
-                if count < MAX_PENDING_SPAWNS_PER_DRIVER {
-                    to_send[count] = (Some(spawn.binary), spawn.port_name, spawn.port_name_len, spawn.caps);
-                    count += 1;
-                }
-                // Clear the slot
-                *spawn = PendingSpawn::empty();
-            }
-        }
-
-        if count == 0 {
-            return;
-        }
-
-        uinfo!("devd", "flush_pending_spawns"; count = count as u32, driver = self.svc_name(driver_idx as u8));
-
-        // Send the commands
-        for i in 0..count {
-            if let (Some(binary), port_name, port_len, caps) = to_send[i] {
-                let port = &port_name[..port_len as usize];
-
-                match self.query_handler.send_spawn_child_with_caps(
-                    driver_idx, binary.as_bytes(), port, caps,
-                ) {
-                    Some(seq_id) => {
-                        uinfo!("devd", "spawn_child_sent"; seq = seq_id, binary = binary);
-                        // Track inflight spawn so we can store context when ACK arrives
-                        let port_type = self.ports.get_port_type(port).unwrap_or(0);
-                        self.track_inflight_spawn(seq_id, port_type, port, binary);
-                    }
-                    None => {
-                        uerror!("devd", "spawn_child_failed"; binary = binary, driver = self.svc_name(driver_idx));
-                    }
-                }
-            }
-        }
-    }
-
     /// Handle SPAWN_ACK message from a driver
     ///
     /// When a driver spawns children and sends SPAWN_ACK, we need to:
@@ -2889,8 +2816,9 @@ impl Devd {
             self.track_and_attach_disk(port_name, shmem_id, owner_idx);
         }
 
-        // Check class-based rules for auto-spawning
-        self.check_class_rules(port_info, owner_idx);
+        // Note: rules do NOT fire at registration time.
+        // Ports start as Initialize; rules fire only on Ready transitions
+        // (handled in handle_set_port_state).
 
         // Check if any pending services now have their dependencies satisfied
         // (e.g., shell depends on console: port existing)
@@ -2899,13 +2827,13 @@ impl Devd {
         Ok(())
     }
 
-    /// Check if any class-based rules match a newly registered port.
+    /// Check if any port rules match a port that transitioned to Ready.
     ///
-    /// Uses PortInfo's class and subclass for type-safe rule matching.
-    /// This replaces the legacy string-based suffix matching for ports
-    /// registered via REGISTER_PORT_INFO.
+    /// Rules fire ONLY on Ready transitions — never at registration time.
+    /// For driver-owned ports (owner_idx < 0xFF), sends SpawnChild via the
+    /// owner's channel. For kernel bus ports (owner_idx == 0xFF), spawns directly.
     fn check_class_rules(&mut self, port_info: &abi::PortInfo, owner_idx: u8) {
-        let rule = match rules::find_class_rule(port_info) {
+        let rule = match rules::find_port_rule(port_info) {
             Some(r) => r,
             None => return,
         };
@@ -2916,24 +2844,30 @@ impl Devd {
         }
 
         let port_name = port_info.name_bytes();
-        uinfo!("devd", "class_rule_matched";
+        uinfo!("devd", "port_rule_matched";
             class = port_info.port_class as u16,
             subclass = port_info.port_subclass,
             driver = rule.driver,
             owner = self.svc_name(owner_idx)
         );
 
-        // Queue the spawn command
-        self.queue_pending_spawn(owner_idx, rule.driver, port_name, rule.caps);
-
-        // If the owner is already Ready, flush immediately.
-        // This handles ports registered after the driver's initial Ready
-        // (e.g., partd registers partition ports after scanning the disk).
-        let owner_ready = self.services.get(owner_idx as usize)
-            .map(|s| s.state == ServiceState::Ready)
-            .unwrap_or(false);
-        if owner_ready {
-            self.flush_pending_spawns(owner_idx);
+        if owner_idx == 0xFF {
+            // Kernel bus port — devd spawns directly
+            self.spawn_bus_driver(rule.driver, rule.caps, port_name);
+        } else {
+            // Driver-owned port — send SpawnChild via owner's channel
+            match self.query_handler.send_spawn_child_with_caps(
+                owner_idx, rule.driver.as_bytes(), port_name, rule.caps,
+            ) {
+                Some(seq_id) => {
+                    uinfo!("devd", "spawn_child_sent"; seq = seq_id, binary = rule.driver);
+                    let port_type = self.ports.get_port_type(port_name).unwrap_or(0);
+                    self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver);
+                }
+                None => {
+                    uerror!("devd", "spawn_child_failed"; binary = rule.driver, driver = self.svc_name(owner_idx));
+                }
+            }
         }
     }
 

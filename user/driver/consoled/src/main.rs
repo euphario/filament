@@ -487,8 +487,8 @@ impl ConsoledDriver {
         }
         self.state = ConsoleState::WaitingForShell;
 
-        // Notify devd: port briefly Registered then Ready to trigger spawn rule
-        let _ = ctx.set_port_state(b"console:", PortState::Registered);
+        // Notify devd: port briefly Initialize then Ready to trigger spawn rule
+        let _ = ctx.set_port_state(b"console:", PortState::Initialize);
         let _ = ctx.set_port_state(b"console:", PortState::Ready);
     }
 }
@@ -543,7 +543,8 @@ impl Driver for ConsoledDriver {
         info.port_subclass = port_subclass::CONSOLE_SERIAL;
 
         ctx.register_port_with_info(&info, 0)?;
-        ctx.set_port_state(b"console:", PortState::Ready)?;
+        // Port starts in Initialize. bus_runtime sets it Ready after report_state(Ready),
+        // ensuring consoled is in its event loop before devd sends SpawnChild.
 
         uinfo!("consoled", "ready";);
         Ok(())

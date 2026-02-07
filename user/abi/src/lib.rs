@@ -1091,6 +1091,11 @@ pub enum PortClass {
 
     // Services
     Service = 11,           // Generic service port
+
+    // Hardware-layer classes (kernel bus ports)
+    Uart = 12,              // UART controller (kernel bus)
+    Klog = 13,              // Kernel log (kernel bus)
+    Ethernet = 14,          // Ethernet controller (kernel bus)
 }
 
 impl PortClass {
@@ -1108,6 +1113,9 @@ impl PortClass {
             9 => Some(PortClass::I2c),
             10 => Some(PortClass::Spi),
             11 => Some(PortClass::Service),
+            12 => Some(PortClass::Uart),
+            13 => Some(PortClass::Klog),
+            14 => Some(PortClass::Ethernet),
             _ => None,
         }
     }
@@ -1116,23 +1124,31 @@ impl PortClass {
 /// Port lifecycle state
 ///
 /// All ports have an explicit state. Rules only fire on Ready transitions.
+///
+/// State machine:
+///   Initialize ──→ Ready ──→ Disconnect
+///                    ↑            │
+///                    └─ Resetting ←┘
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortState {
-    /// Port registered, driver initializing
-    Registered = 0,
-    /// Port is ready for use
+    /// Port exists, owner setting up (hardware reset, driver init)
+    Initialize = 0,
+    /// Port is live, owner can process commands
     Ready = 1,
-    /// Port is temporarily unavailable
-    Unavailable = 2,
+    /// Owner exited (clean or crash), port removed
+    Disconnect = 2,
+    /// Hardware/driver resetting, will return to Ready
+    Resetting = 3,
 }
 
 impl PortState {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(PortState::Registered),
+            0 => Some(PortState::Initialize),
             1 => Some(PortState::Ready),
-            2 => Some(PortState::Unavailable),
+            2 => Some(PortState::Disconnect),
+            3 => Some(PortState::Resetting),
             _ => None,
         }
     }

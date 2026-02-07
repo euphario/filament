@@ -364,9 +364,9 @@ impl BusController {
             BusType::PCIe => ipc::PortClass::Pcie,
             BusType::Usb => ipc::PortClass::Usb,
             BusType::Platform => ipc::PortClass::Service,
-            BusType::Ethernet => ipc::PortClass::Network,
-            BusType::Uart => ipc::PortClass::Console,
-            BusType::Klog => ipc::PortClass::Service,
+            BusType::Ethernet => ipc::PortClass::Ethernet,
+            BusType::Uart => ipc::PortClass::Uart,
+            BusType::Klog => ipc::PortClass::Klog,
         }
     }
 
