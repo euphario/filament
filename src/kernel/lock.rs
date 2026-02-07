@@ -43,6 +43,8 @@ pub mod lock_class {
     pub const UNORDERED: u8 = 0;
     /// Scheduler lock — acquired first (outermost)
     pub const SCHEDULER: u8 = 10;
+    /// Microtask queue — between scheduler and ObjectService
+    pub const MICROTASK: u8 = 15;
     /// ObjectService per-task table locks
     pub const OBJ_SERVICE: u8 = 20;
     /// Subsystem locks: CHANNEL_TABLE, PORT_REGISTRY, IRQ_TABLE, LOG_RING

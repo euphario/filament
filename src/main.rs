@@ -439,12 +439,15 @@ pub extern "C" fn irq_exit_resched() {
     // acquiring the scheduler lock (which may be held by interrupted code).
     task::process_pending_wakes();
 
-    // 2. Handle deferred reschedule
+    // 2. Drain microtask queue (cleanup, evictions, deferred wakes)
+    crate::kernel::microtask::drain();
+
+    // 3. Handle deferred reschedule
     unsafe {
         task::do_resched_if_needed();
     }
 
-    // 3. Process any pending task evictions
+    // 4. Process any pending task evictions (legacy — kept for lock-free IRQ path)
     task::eviction::process_pending_evictions();
 
     // 3. Log any unhandled IRQs from interrupt context (deferred logging)

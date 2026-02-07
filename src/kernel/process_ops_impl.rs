@@ -26,42 +26,98 @@ impl KernelProcessOps {
 
 impl ProcessOps for KernelProcessOps {
     fn exit(&self, task_id: TaskId, code: i32) -> ! {
+        use crate::kernel::microtask::{self, MicroTask};
+        use crate::kernel::task::tcb::CleanupPhase;
+
         // Flush UART buffer so pending output from this process appears first
         while crate::platform::current::uart::has_buffered_output() {
             crate::platform::current::uart::flush_buffer();
         }
 
+        // Phase 1: Transition state under scheduler lock, enqueue microtasks
         task::with_scheduler(|sched| {
-            if let Err(e) = lifecycle::exit(sched, task_id, code) {
-                kinfo!("process_ops", "exit_lifecycle_error"; pid = task_id as u64, err = e as i64);
+            let info = match lifecycle::exit(sched, task_id, code) {
+                Ok(info) => info,
+                Err(e) => {
+                    kinfo!("process_ops", "exit_lifecycle_error"; pid = task_id as u64, err = e as i64);
+                    None
+                }
+            };
+
+            // Set cleanup phase on the task
+            if let Some(slot) = sched.slot_by_pid(task_id) {
+                if let Some(task) = sched.task_mut(slot) {
+                    task.cleanup_phase = CleanupPhase::Phase1Enqueued;
+                }
             }
+
+            // Enqueue Phase 1 microtasks (lock ordering: SCHEDULER(10) → MICROTASK(15) is valid)
+            if let Some(ref info) = info {
+                let _ = microtask::enqueue(MicroTask::NotifyParentExit {
+                    parent_id: info.parent_id,
+                    child_pid: info.child_pid,
+                    code: info.code,
+                });
+            }
+            let _ = microtask::enqueue(MicroTask::IpcCleanup { pid: task_id });
+            let _ = microtask::enqueue(MicroTask::ReparentChildren { pid: task_id });
         });
+
+        // Drain microtasks immediately (outside scheduler lock)
+        // This gives us the same low-latency peer notification as the old
+        // do_exit_ipc_cleanup() path, but through the unified queue.
+        microtask::drain();
 
         // If probed just exited, spawn devd now (scheduler lock is released)
         lifecycle::complete_probed_exit();
 
-        // Reschedule — properly handles tasks needing full context restore
-        crate::kernel::sched::reschedule();
-
-        // If reschedule returns (shouldn't for exiting task), halt
+        // Enable IRQs and enter WFI. The next timer IRQ will call
+        // do_resched_if_needed() which detects the Exiting state and
+        // reschedules. The grace period scanner enqueues Phase 2 later.
         unsafe {
-            kinfo!("process_ops", "halt_no_tasks");
-            loop {
+            core::arch::asm!("msr daifclr, #2"); // enable IRQs
+        }
+        loop {
+            unsafe {
                 core::arch::asm!("wfi");
             }
         }
     }
 
     fn kill(&self, killer: TaskId, target: TaskId) -> Result<(), ProcessError> {
+        use crate::kernel::microtask::{self, MicroTask};
+        use crate::kernel::task::tcb::CleanupPhase;
+
         // Never allow killing init (PID 1)
         if target == 1 {
             kwarn!("security", "kill_init_denied"; caller = killer as u64);
             return Err(ProcessError::PermissionDenied);
         }
 
+        // Phase 1: Transition state under scheduler lock, enqueue microtasks
         let (result, need_resched) = task::with_scheduler(|sched| {
             match lifecycle::kill(sched, target, killer) {
-                Ok(()) => (Ok(()), target == killer),
+                Ok(info) => {
+                    // Set cleanup phase
+                    if let Some(slot) = sched.slot_by_pid(target) {
+                        if let Some(task) = sched.task_mut(slot) {
+                            task.cleanup_phase = CleanupPhase::Phase1Enqueued;
+                        }
+                    }
+
+                    // Enqueue Phase 1 microtasks
+                    if let Some(ref info) = info {
+                        let _ = microtask::enqueue(MicroTask::NotifyParentExit {
+                            parent_id: info.parent_id,
+                            child_pid: info.child_pid,
+                            code: info.code,
+                        });
+                    }
+                    let _ = microtask::enqueue(MicroTask::IpcCleanup { pid: target });
+                    let _ = microtask::enqueue(MicroTask::ReparentChildren { pid: target });
+
+                    (Ok(()), target == killer)
+                }
                 Err(lifecycle::LifecycleError::NotFound) => (Err(ProcessError::NotFound), false),
                 Err(lifecycle::LifecycleError::PermissionDenied) => {
                     kwarn!("security", "kill_denied"; caller = killer as u64, target = target as u64);
@@ -71,6 +127,9 @@ impl ProcessOps for KernelProcessOps {
                 Err(lifecycle::LifecycleError::NoChildren) => (Err(ProcessError::InvalidState), false),
             }
         });
+
+        // Drain microtasks immediately (outside scheduler lock)
+        microtask::drain();
 
         if need_resched {
             crate::kernel::sched::reschedule();

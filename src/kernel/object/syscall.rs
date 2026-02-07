@@ -1732,6 +1732,20 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
     // ── Phase 3: Woken — re-poll and return ──
     uart::clear_blocked_if_pid(task_id);
 
+    // Fast path: if wake delivered data, skip the O(n) re-poll
+    let wake_data = task::with_scheduler(|sched| {
+        sched.task_mut(slot).and_then(|t| t.take_wake_data())
+    });
+    if let Some(wd) = wake_data {
+        let mut events = [super::MuxEvent::empty(); super::MAX_MUX_EVENTS];
+        events[0] = super::MuxEvent {
+            handle: abi::Handle::from_raw(wd.handle),
+            event: wd.events,
+            _pad: [0; 3],
+        };
+        return copy_mux_events_to_user(buf_ptr, &events, 1);
+    }
+
     let repoll_result = object_service().with_table_mut(task_id, |table| {
         let mut events = [super::MuxEvent::empty(); super::MAX_MUX_EVENTS];
         let mut event_count = 0usize;

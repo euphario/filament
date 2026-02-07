@@ -73,7 +73,7 @@ fn reason_to_u8(reason: EvictionReason) -> u8 {
 }
 
 /// Convert u8 back to EvictionReason
-fn u8_to_reason(val: u8) -> Option<EvictionReason> {
+pub(crate) fn u8_to_reason(val: u8) -> Option<EvictionReason> {
     match val {
         1 => Some(EvictionReason::InvalidStateTransition),
         2 => Some(EvictionReason::StateCorruption),
@@ -157,7 +157,7 @@ pub fn process_pending_evictions() -> usize {
 /// Actually perform the eviction of a single task.
 ///
 /// This transitions the task to Evicting state and marks it for cleanup.
-fn do_evict_task(task_id: TaskId, reason: EvictionReason) -> bool {
+pub(crate) fn do_evict_task(task_id: TaskId, reason: EvictionReason) -> bool {
     use super::with_scheduler;
 
     with_scheduler(|sched| {

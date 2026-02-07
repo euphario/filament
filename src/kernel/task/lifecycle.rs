@@ -68,7 +68,14 @@ pub enum LifecycleError {
 ///
 /// # Safety
 /// Must be called with scheduler lock held (or from task context)
-pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), LifecycleError> {
+/// Info needed for deferred parent notification (outside scheduler lock)
+pub struct ExitInfo {
+    pub parent_id: TaskId,
+    pub child_pid: TaskId,
+    pub code: i32,
+}
+
+pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<Option<ExitInfo>, LifecycleError> {
     let slot = sched.slot_by_pid(task_id).ok_or(LifecycleError::NotFound)?;
 
     let (parent_id, was_probed) = {
@@ -78,7 +85,7 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), Lif
         if let Err(_e) = task.set_exiting(code) {
             // Already terminated? That's ok, just return
             if task.is_terminated() {
-                return Ok(());
+                return Ok(None);
             }
             return Err(LifecycleError::InvalidState);
         }
@@ -97,17 +104,24 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), Lif
         (task.parent_id, probed)
     };
 
-    // Notify parent (outside of task borrow)
-    if parent_id != 0 {
-        notify_parent_of_exit(sched, parent_id, task_id, code);
-    }
+    // NOTE: Don't wake parent here. Parent will be woken by:
+    // 1. NotifyParentExit microtask → ProcessObject WaitQueue (immediate, outside lock)
+    // 2. ReparentChildren microtask → wake_parent_if_sleeping
+    // Waking here causes a lost-wake race: devd wakes, polls Mux, finds nothing,
+    // goes back to sleep. Then consoled's set_port_state arrives during the
+    // Running→Sleeping transition and the channel wake is lost.
 
     // If probed just exited, lock bus creation and spawn devd
     if was_probed {
         handle_probed_exit(sched);
     }
 
-    Ok(())
+    // Return info for deferred ObjectService notification (must happen outside scheduler lock)
+    if parent_id != 0 {
+        Ok(Some(ExitInfo { parent_id, child_pid: task_id, code }))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Kill a task forcefully (SIGKILL)
@@ -119,11 +133,13 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), Lif
 /// - Checks kill permission
 /// - Uses exit code -9 (SIGKILL)
 /// - Can kill blocked tasks
+///
+/// Returns ExitInfo for deferred ObjectService notification (must happen outside scheduler lock).
 pub fn kill(
     sched: &mut Scheduler,
     task_id: TaskId,
     killer_id: TaskId,
-) -> Result<(), LifecycleError> {
+) -> Result<Option<ExitInfo>, LifecycleError> {
     let slot = sched.slot_by_pid(task_id).ok_or(LifecycleError::NotFound)?;
 
     // Check permission
@@ -162,21 +178,20 @@ pub fn kill(
 
         if let Err(_e) = task.set_exiting(-9) {
             if task.is_terminated() {
-                return Ok(());
+                return Ok(None);
             }
             return Err(LifecycleError::InvalidState);
         }
-
 
         task.is_init = false;
 
         kinfo!("lifecycle", "kill"; pid = task_id, killer = killer_id);
     }
 
-    // Notify parent
-    if parent_id != 0 && parent_id != killer_id {
-        notify_parent_of_exit(sched, parent_id, task_id, -9);
-    }
+    // NOTE: Don't wake parent here — same lost-wake race as exit().
+    // Parent will be woken by microtask pipeline:
+    // 1. NotifyParentExit → ProcessObject WaitQueue (immediate, outside lock)
+    // 2. ReparentChildren → wake_parent_if_sleeping
 
     // If this was the init process (devd), trigger recovery
     if was_init {
@@ -184,7 +199,12 @@ pub fn kill(
         crate::DEVD_LIVENESS_KILLED.store(true, core::sync::atomic::Ordering::SeqCst);
     }
 
-    Ok(())
+    // Return info for deferred ObjectService notification (must happen outside scheduler lock)
+    if parent_id != 0 && parent_id != killer_id {
+        Ok(Some(ExitInfo { parent_id, child_pid: task_id, code: -9 }))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Wait for a child to exit
@@ -263,62 +283,47 @@ pub fn wait_child(
 // Helper Functions
 // ============================================================================
 
-/// Notify parent that a child has exited
+/// Complete deferred parent notification after scheduler lock is released.
 ///
-/// This handles both:
-/// 1. ProcessObject handle notifications (for unified syscall waiting)
-/// 2. Direct wake of blocked parent (for sys_wait compatibility)
-fn notify_parent_of_exit(sched: &mut Scheduler, parent_id: TaskId, child_pid: TaskId, code: i32) {
-    let parent_slot = match sched.slot_by_pid(parent_id) {
-        Some(s) => s,
-        None => return,
-    };
-
-    // Check if parent is blocked
-    let should_wake_parent = sched.task(parent_slot)
-        .map(|p| p.is_blocked())
-        .unwrap_or(false);
-
-    // Notify via ObjectService (acquires ObjectService.tables lock, not scheduler)
+/// This performs the ObjectService notification that cannot happen under the
+/// scheduler lock (would cause ABBA deadlock with devd's ObjectService→scheduler
+/// lock order in read_mux_via_service → sleep_and_reschedule).
+///
+/// Must be called OUTSIDE the scheduler lock.
+pub fn complete_exit_notification(info: ExitInfo) {
+    // Notify via ObjectService (acquires per-slot ObjectService lock)
     let wake_list = crate::kernel::object_service::object_service().notify_child_exit(
-        parent_id, child_pid, code,
+        info.parent_id, info.child_pid, info.code,
     );
 
-    // Wake handle subscribers
+    // Wake handle subscribers (e.g. ProcessObject waiters)
     waker::wake(&wake_list, WakeReason::ChildExit);
-
-    // Direct wake of parent if blocked (outside borrow)
-    if should_wake_parent {
-        if let Some(ref mut parent) = sched.tasks[parent_slot] {
-            crate::transition_or_log!(parent, wake);
-            parent.liveness_state = crate::kernel::liveness::LivenessState::Normal;
-        }
-    }
 }
 
 /// Reap a terminated child - do full resource cleanup, remove from parent's list, free slot
 ///
-/// This performs the same cleanup as reap_terminated() Phase 1+2, since the child
-/// may be in Exiting state (cleanup not started) or Dying state (Phase 1 done).
+/// This performs the same cleanup as the microtask Phase 1+2 pipeline, since the child
+/// may be in Exiting state with cleanup_phase anywhere from None to Phase2Enqueued.
+/// Checks cleanup_phase to determine what work remains.
 fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, child_pid: TaskId) {
     use crate::kernel::ipc::{waker, traits::WakeReason};
+    use crate::kernel::task::tcb::CleanupPhase;
 
     // Remove from parent's child list
     if let Some(ref mut parent) = sched.tasks[parent_slot] {
         parent.remove_child(child_pid);
     }
 
-    // Check current state to determine what cleanup is needed
-    let state = sched.tasks[child_slot]
+    // Check cleanup progress to determine what work remains
+    let cleanup_phase = sched.tasks[child_slot]
         .as_ref()
-        .map(|t| *t.state())
-        .unwrap_or(super::state::TaskState::Dead);
+        .map(|t| t.cleanup_phase)
+        .unwrap_or(CleanupPhase::None);
 
-    let needs_phase1 = matches!(state, super::state::TaskState::Exiting { .. });
+    let needs_phase1 = matches!(cleanup_phase, CleanupPhase::None);
 
-    // Phase 1: IPC cleanup (only if still in Exiting — Dying already did Phase 1)
+    // Phase 1: IPC cleanup (only if not yet started by microtask pipeline)
     if needs_phase1 {
-        // Perform IPC cleanup (DMA stop, subscriber removal, peer notification)
         let ipc_peers = super::Scheduler::do_ipc_cleanup(child_pid);
         for peer in ipc_peers.iter() {
             let wake_list = crate::kernel::object_service::object_service()
@@ -326,11 +331,11 @@ fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, chil
             waker::wake(&wake_list, WakeReason::Closed);
         }
 
-        // Notify shmem mappers
         crate::kernel::shmem::begin_cleanup(child_pid);
     }
 
-    // Phase 2: Force cleanup and free resources (shared with reap_terminated)
+    // Phase 2: Force cleanup and free resources
+    // Always run — idempotent, and catches partially-completed Phase 2
     Scheduler::do_final_cleanup(child_pid);
 
     if let Some(ref task) = sched.tasks[child_slot] {

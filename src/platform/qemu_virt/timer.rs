@@ -56,7 +56,7 @@ impl Timer {
         let ctl_val = Self::read_ctl();
 
         if (ctl_val & ctl::ISTATUS) != 0 {
-            let tick = self.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let _tick = self.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
             // Update per-CPU tick counts
             let cpu_data = crate::kernel::percpu::cpu_local();
             cpu_data.tick();
@@ -74,10 +74,10 @@ impl Timer {
             let current_counter = Self::read_cntpct();
             crate::kernel::sched::timer_tick(current_counter);
 
-            // Reap terminated tasks - use try_scheduler to avoid deadlock
-            // if scheduler lock is held by interrupted syscall
+            // Scan for cleanup-ready tasks and enqueue microtasks
+            // Uses try_scheduler to avoid deadlock if scheduler lock is held
             if let Some(mut sched) = crate::kernel::task::try_scheduler() {
-                sched.reap_terminated(tick);
+                sched.enqueue_cleanup_if_ready(current_counter);
             }
 
             // Continue bus init (no-op for QEMU without PCIe)

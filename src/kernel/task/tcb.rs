@@ -154,6 +154,28 @@ pub const MAX_SHMEM_PER_TASK: u16 = 16;
 /// At 100 ticks/sec, 10 ticks = 100ms grace period for servers to release resources
 pub const CLEANUP_GRACE_TICKS: u8 = 10;
 
+/// Cleanup phase for exiting tasks — tracks progress through microtask-driven cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupPhase {
+    /// Not exiting
+    None,
+    /// Phase 1 microtasks submitted (IpcCleanup, ReparentChildren, etc.)
+    Phase1Enqueued,
+    /// Phase 1 done, waiting for servers to process notifications
+    GracePeriod { until: u64 },
+    /// Phase 2 microtasks submitted (FinalCleanup, SlotReap)
+    Phase2Enqueued,
+}
+
+/// Data delivered with a wake — allows Mux fast path to skip re-poll.
+#[derive(Debug, Clone, Copy)]
+pub struct WakeData {
+    /// Which handle triggered the event
+    pub handle: u32,
+    /// Event bitmask (READABLE, WRITABLE, CLOSED, etc.)
+    pub events: u8,
+}
+
 /// Context restore state — tracks whether a task's kernel context needs restoring.
 ///
 /// Replaces the old `needs_context_restore: bool` with explicit states:
@@ -252,6 +274,12 @@ pub struct Task {
     /// This prevents the bug where CPU 0 is mid-context-switch using a task's
     /// kernel stack while CPU 1 tries to select and run the same task.
     kernel_stack_owner: Option<u32>,
+
+    /// Cleanup phase for exiting tasks (microtask-driven)
+    pub(crate) cleanup_phase: CleanupPhase,
+
+    /// Data delivered with the last wake (for Mux fast path)
+    pub(crate) wake_data: Option<WakeData>,
 
     /// Debug invariant: is this task currently in a ready queue?
     /// Used to assert that tasks are enqueued/dequeued correctly.
@@ -369,6 +397,8 @@ impl Task {
             storm: crate::kernel::storm::StormState::new(),
             context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
             kernel_stack_owner: None,
+            cleanup_phase: CleanupPhase::None,
+            wake_data: None,
             #[cfg(debug_assertions)]
             on_runq: false,
         })
@@ -424,6 +454,8 @@ impl Task {
             storm: crate::kernel::storm::StormState::new(),
             context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
             kernel_stack_owner: None,
+            cleanup_phase: CleanupPhase::None,
+            wake_data: None,
             #[cfg(debug_assertions)]
             on_runq: false,
         }
@@ -498,6 +530,8 @@ impl Task {
             storm: crate::kernel::storm::StormState::new(),
             context_restore: ContextRestoreState::Saved,
             kernel_stack_owner: None,
+            cleanup_phase: CleanupPhase::None,
+            wake_data: None,
             #[cfg(debug_assertions)]
             on_runq: false,
         })
@@ -641,6 +675,11 @@ impl Task {
 
     pub fn address_space_mut(&mut self) -> Option<&mut AddressSpace> {
         self.address_space.as_mut()
+    }
+
+    /// Take wake data (consumes it — returns None on second call).
+    pub fn take_wake_data(&mut self) -> Option<WakeData> {
+        self.wake_data.take()
     }
 
     // ========================================================================

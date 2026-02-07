@@ -46,6 +46,7 @@ pub mod object;
 pub mod irq;
 pub mod object_service;
 pub mod idle;
+pub mod microtask;
 
 // New syscall-facing trait implementations
 pub mod syscall_ctx_impl;

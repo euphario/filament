@@ -101,10 +101,9 @@ impl Timer {
             let current_counter = Self::read_cntpct();
             crate::kernel::sched::timer_tick(current_counter);
 
-            // Reap terminated tasks - use try_scheduler to avoid deadlock
-            // if scheduler lock is held by interrupted syscall
+            // Scan for cleanup-ready tasks and enqueue microtasks
             if let Some(mut sched) = crate::kernel::task::try_scheduler() {
-                sched.reap_terminated(tick);
+                sched.enqueue_cleanup_if_ready(current_counter);
             }
 
             // Continue bus initialization (one bus per tick until all Safe)
@@ -229,7 +228,7 @@ impl TimerTrait for Timer {
             let current_counter = Self::read_cntpct();
             if let Some(mut sched) = crate::kernel::task::try_scheduler() {
                 sched.check_timeouts(current_counter);
-                sched.reap_terminated(tick);
+                sched.enqueue_cleanup_if_ready(current_counter);
             } else {
                 // Lock held - skip this tick, set need_resched to retry later
                 crate::arch::aarch64::sync::cpu_flags().set_need_resched();

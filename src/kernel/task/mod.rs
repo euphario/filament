@@ -114,7 +114,7 @@ pub use policy::{SchedulingPolicy, PerCpuQueues};
 // Re-export TCB types
 pub use tcb::{
     Priority, TrapFrame, CpuContext, TaskId, Task,
-    MAX_CHILDREN, MAX_CHANNELS_PER_TASK, CLEANUP_GRACE_TICKS,
+    MAX_CHANNELS_PER_TASK,
     enter_usermode, context_switch,
 };
 
@@ -237,7 +237,7 @@ impl Scheduler {
     ///
     /// This allows EventLoop to poll ProcessObjects and see child exits.
     /// Called during task termination to notify parent.
-    fn wake_parent_if_sleeping(&mut self, slot_idx: usize) {
+    pub(crate) fn wake_parent_if_sleeping(&mut self, slot_idx: usize) {
         let parent_id = match self.tasks[slot_idx].as_ref() {
             Some(task) => task.parent_id,
             None => return,
@@ -695,14 +695,11 @@ impl Scheduler {
         self.policy.on_task_exit(slot);
     }
 
-    /// Perform IPC cleanup for a terminating task.
+    /// Phase 2 / final cleanup: free remaining resources for an exiting task.
     ///
-    /// This handles:
-    /// Phase 2 / final cleanup: free remaining resources for a dead task.
-    ///
-    /// Called from reap_terminated (Phase 2 + Evicting) and reap_child.
+    /// Called from FinalCleanup microtask and reap_child.
     /// Does NOT require scheduler lock — only touches subsystem-specific state.
-    fn do_final_cleanup(pid: TaskId) {
+    pub(crate) fn do_final_cleanup(pid: TaskId) {
         super::shmem::finalize_cleanup(pid);
         super::irq::process_cleanup(pid);
         super::pci::release_all_devices(pid);
@@ -715,7 +712,7 @@ impl Scheduler {
 
     /// Clear per-CPU trap frame if it still points to this task's frame.
     /// Prevents use-after-free if the task slot is about to be cleared.
-    fn clear_stale_trap_frame(task: &Task, slot_idx: usize, pid: TaskId) {
+    pub(crate) fn clear_stale_trap_frame(task: &Task, slot_idx: usize, pid: TaskId) {
         let task_trap_ptr = &task.trap_frame as *const TrapFrame;
         let current_ptr = super::percpu::get_trap_frame();
         if current_ptr == task_trap_ptr as *mut TrapFrame {
@@ -734,7 +731,7 @@ impl Scheduler {
     /// - Notifying IPC peers (sends Close messages, wakes blocked receivers)
     ///
     /// Returns the peer info list for IPC peers to wake via ObjectService.
-    fn do_ipc_cleanup(pid: TaskId) -> super::ipc::PeerInfoList {
+    pub(crate) fn do_ipc_cleanup(pid: TaskId) -> super::ipc::PeerInfoList {
         // Stop DMA first (critical for safety)
         super::bus::process_cleanup(pid);
 
@@ -745,137 +742,67 @@ impl Scheduler {
         super::ipc::process_cleanup(pid)
     }
 
-    /// Remove terminated tasks and free resources
-    /// Uses two-phase cleanup to give servers a chance to release shared resources gracefully:
-    /// - Exiting: Phase 1 - Send notifications (IPC Close, ShmemInvalid events), transition to Dying
-    /// - Dying: Grace period (~100ms) for servers to react, then Phase 2
-    /// - Dead: Task slot can be reused
-    pub fn reap_terminated(&mut self, current_tick: u64) {
-        // CRITICAL: Cleanup must be atomic - no preemption during dying cycle.
-        // This is typically called from IRQ context (IRQs already disabled),
-        // but we take IrqGuard defensively to guarantee atomicity.
-        let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    /// Scan tasks and enqueue cleanup microtasks when ready.
+    ///
+    /// Handles:
+    /// - Exiting tasks whose Phase 1 wasn't enqueued yet (killed from timer context)
+    /// - Grace period expiration → enqueue Phase 2
+    /// - Evicting tasks → immediate full cleanup (no grace period)
+    ///
+    /// Called from timer IRQ under scheduler lock. Pure read + enqueue — no heavy
+    /// work, no subsystem locks acquired.
+    pub fn enqueue_cleanup_if_ready(&mut self, current_counter: u64) {
+        use tcb::CleanupPhase;
+        use super::microtask::{self, MicroTask};
 
-        // CRITICAL: Never reap the current task - it's still executing!
-        // If it needs to die, let it reach a safe point first (syscall return, reschedule).
         let current = current_slot();
 
+        // First pass: collect work items (avoid borrow issues with wake_parent_if_sleeping)
+        let mut evicting_slots: [usize; 8] = [usize::MAX; 8];
+        let mut evicting_count = 0usize;
+
         for slot_idx in 0..MAX_TASKS {
-            // Skip current task - can't reap while still running
             if slot_idx == current {
                 continue;
             }
 
-            let state = self.tasks[slot_idx]
-                .as_ref()
-                .map(|t| (*t.state(), t.id))
-                .unwrap_or((TaskState::Dead, 0));
+            let Some(ref mut task) = self.tasks[slot_idx] else { continue };
+            let pid = task.id;
 
-            match state {
-                (TaskState::Exiting { code: _ }, pid) => {
-                    // ============================================================
-                    // Phase 1: Notify servers about dying resources
-                    // ============================================================
-
-                    // Reparent children to init (PID 1) or kill them if init doesn't exist
-                    // Collect children first to avoid borrow issues
-                    let children_to_reparent: [TaskId; MAX_CHILDREN] = self.tasks[slot_idx]
-                        .as_ref()
-                        .map(|t| t.children)
-                        .unwrap_or([0; MAX_CHILDREN]);
-
-                    // Check if init (PID 1) exists before the mutable borrow
-                    let has_init = self.slot_by_pid(1).is_some();
-
-                    for child_pid in children_to_reparent {
-                        if child_pid == 0 {
-                            continue;
-                        }
-                        if let Some(child_slot) = self.slot_by_pid(child_pid) {
-                            if let Some(ref mut child) = self.tasks[child_slot] {
-                                // Reparent to init (PID 1) - devd
-                                // If init doesn't exist (shouldn't happen), leave orphan with parent_id=0
-                                if has_init {
-                                    child.parent_id = 1;
-                                } else {
-                                    child.parent_id = 0;  // Orphan
-                                }
-                            }
-                        }
-                    }
-
-                    // Wake parent task if it's sleeping (for Process watch)
-                    self.wake_parent_if_sleeping(slot_idx);
-
-                    // Perform IPC cleanup (DMA stop, subscriber removal, peer notification)
-                    let ipc_peers = Self::do_ipc_cleanup(pid);
-                    for peer in ipc_peers.iter() {
-                        let wake_list = super::object_service::object_service()
-                            .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
-                        super::ipc::waker::wake(&wake_list, super::ipc::WakeReason::Closed);
-                    }
-
-                    // Notify shmem mappers (marks regions as Dying, sends ShmemInvalid events)
-                    super::shmem::begin_cleanup(pid);
-
-                    // Transition to Dying with grace period deadline
-                    let grace_until = current_tick + CLEANUP_GRACE_TICKS as u64;
-                    if let Some(ref mut task) = self.tasks[slot_idx] {
-                        crate::transition_or_evict!(task, set_dying, grace_until);
-                    }
+            match (*task.state(), task.cleanup_phase) {
+                // Exiting task whose Phase 1 wasn't enqueued yet
+                (TaskState::Exiting { .. }, CleanupPhase::None) => {
+                    task.cleanup_phase = CleanupPhase::Phase1Enqueued;
+                    let _ = microtask::enqueue(MicroTask::IpcCleanup { pid });
+                    let _ = microtask::enqueue(MicroTask::ReparentChildren { pid });
                 }
-                (TaskState::Dying { code: _, until }, pid) if current_tick >= until => {
-                    // ============================================================
-                    // Phase 2: Force cleanup and reap (grace period expired)
-                    // ============================================================
-                    Self::do_final_cleanup(pid);
 
-                    if let Some(ref task) = self.tasks[slot_idx] {
-                        Self::clear_stale_trap_frame(task, slot_idx, pid);
-                    }
-
-                    self.notify_exit(slot_idx);
-                    self.bump_generation(slot_idx);
-                    self.tasks[slot_idx] = None;
+                // Grace period expired → enqueue Phase 2
+                (_, CleanupPhase::GracePeriod { until }) if current_counter >= until => {
+                    task.cleanup_phase = CleanupPhase::Phase2Enqueued;
+                    let _ = microtask::enqueue(MicroTask::FinalCleanup { pid });
+                    let _ = microtask::enqueue(MicroTask::SlotReap { pid, slot: slot_idx as u16 });
                 }
-                (TaskState::Dying { .. }, _) => {
-                    // Still in grace period - let servers process notifications
+
+                // Evicting task: record for second pass (needs wake_parent_if_sleeping)
+                (TaskState::Evicting { .. }, CleanupPhase::None) => {
+                    task.cleanup_phase = CleanupPhase::Phase2Enqueued;
+                    if evicting_count < evicting_slots.len() {
+                        evicting_slots[evicting_count] = slot_idx;
+                        evicting_count += 1;
+                    }
+                    let _ = microtask::enqueue(MicroTask::IpcCleanup { pid });
+                    let _ = microtask::enqueue(MicroTask::FinalCleanup { pid });
+                    let _ = microtask::enqueue(MicroTask::SlotReap { pid, slot: slot_idx as u16 });
                 }
-                (TaskState::Evicting { reason }, pid) => {
-                    // ============================================================
-                    // Evicted task: Immediate cleanup, no grace period
-                    // ============================================================
-                    kerror!("evict", "reaping";
-                        pid = pid as u64,
-                        reason = reason as u8 as u64
-                    );
 
-                    self.wake_parent_if_sleeping(slot_idx);
-
-                    let ipc_peers = Self::do_ipc_cleanup(pid);
-                    for peer in ipc_peers.iter() {
-                        let wake_list = super::object_service::object_service()
-                            .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
-                        super::ipc::waker::wake(&wake_list, super::ipc::WakeReason::Closed);
-                    }
-
-                    super::shmem::begin_cleanup(pid);
-                    Self::do_final_cleanup(pid);
-
-                    if let Some(ref mut task) = self.tasks[slot_idx] {
-                        let _ = task.finalize(); // Evicting → Dead
-                    }
-
-                    if let Some(ref task) = self.tasks[slot_idx] {
-                        Self::clear_stale_trap_frame(task, slot_idx, pid);
-                    }
-
-                    self.notify_exit(slot_idx);
-                    self.bump_generation(slot_idx);
-                    self.tasks[slot_idx] = None;
-                }
-                _ => {}
+                _ => {} // Not ready yet or already enqueued
             }
+        }
+
+        // Second pass: wake parents for evicting tasks (requires &mut self)
+        for i in 0..evicting_count {
+            self.wake_parent_if_sleeping(evicting_slots[i]);
         }
     }
 
@@ -1000,9 +927,9 @@ use super::lock::SpinLock;
 ///
 /// Most code should use the public API functions which hide locking:
 /// - `with_task()` / `with_task_mut()` - access a task by slot
-/// - `reap_terminated()` - cleanup dead tasks
 /// - `check_timeouts()` - wake timed-out tasks
 /// - `current_task_id()` - get current task's PID
+/// - `enqueue_cleanup_if_ready()` - scan and enqueue cleanup microtasks
 ///
 /// See docs/architecture/SCHEDULER_DESIGN_V2.md for details.
 static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(crate::kernel::lock::lock_class::SCHEDULER, Scheduler::new());
@@ -1224,15 +1151,6 @@ pub fn current_task_id() -> Option<TaskId> {
     sched.tasks[current_slot()].as_ref().map(|t| t.id)
 }
 
-/// Remove terminated tasks and free resources.
-///
-/// Called from timer interrupt to clean up dead tasks.
-#[inline]
-pub fn reap_terminated(current_tick: u64) {
-    let mut sched = SCHEDULER.lock();
-    sched.reap_terminated(current_tick);
-}
-
 /// Check for timed-out tasks and wake them.
 ///
 /// Returns the number of tasks woken.
@@ -1314,10 +1232,10 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     // We must process these before checking need_resched.
     process_pending_wakes();
 
-    // Process any pending task evictions.
-    // This is critical for storm detection: when a task is marked for eviction
-    // during syscall handling, we must process it before returning to userspace.
-    // Otherwise the task keeps making syscalls and hitting storm detection again.
+    // Drain microtask queue (cleanup, evictions, deferred wakes)
+    super::microtask::drain();
+
+    // Process any pending task evictions (legacy lock-free IRQ path).
     eviction::process_pending_evictions();
 
     // Check and clear the flag atomically (before taking lock)
