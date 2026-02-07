@@ -317,6 +317,13 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
             }
         }
 
+        // Ensure data writes are visible to all CPUs before mapping pages.
+        // Without this barrier, a process scheduled on a different CPU could
+        // see stale (unzeroed) BSS data.
+        unsafe {
+            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+
         // Map pages into address space
         let writable = (flags & PF_W) != 0;
         let executable = (flags & PF_X) != 0;

@@ -617,6 +617,34 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
     print_hex_uart(far);
     print_str_uart("\r\n");
 
+    // Dump key registers from trap frame for crash diagnosis
+    let trap_ptr = kernel::percpu::get_trap_frame();
+    if !trap_ptr.is_null() {
+        let tf = unsafe { &*trap_ptr };
+        print_str_uart("  LR=0x");
+        print_hex_uart(tf.x30);
+        print_str_uart(" FP=0x");
+        print_hex_uart(tf.x29);
+        print_str_uart("\r\n");
+        // Dump x0-x3 (arguments) and x19-x21 (callee-saved)
+        print_str_uart("  x0=0x");
+        print_hex_uart(tf.x0);
+        print_str_uart(" x1=0x");
+        print_hex_uart(tf.x1);
+        print_str_uart(" x2=0x");
+        print_hex_uart(tf.x2);
+        print_str_uart(" x3=0x");
+        print_hex_uart(tf.x3);
+        print_str_uart("\r\n");
+        print_str_uart("  x19=0x");
+        print_hex_uart(tf.x19);
+        print_str_uart(" x20=0x");
+        print_hex_uart(tf.x20);
+        print_str_uart(" x21=0x");
+        print_hex_uart(tf.x21);
+        print_str_uart("\r\n");
+    }
+
     // Debug: Print TTBR0 and user sp for crash diagnosis
     print_str_uart("  TTBR0=0x");
     let ttbr0: u64;
