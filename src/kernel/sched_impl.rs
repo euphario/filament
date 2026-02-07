@@ -115,7 +115,7 @@ impl SchedulerBackend for KernelSchedulerBackend {
     }
 
     fn request_resched(&self) {
-        crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+        crate::kernel::arch::sync::cpu_flags().set_need_resched();
     }
 
     fn current_tick(&self) -> u64 {

@@ -177,8 +177,8 @@ pub(super) fn sys_klog_write(buf_ptr: u64, buf_len: usize) -> i64 {
 pub fn hardware_reset() -> ! {
     #[cfg(feature = "platform-mt7988a")]
     {
-        use crate::arch::aarch64::mmio::MmioRegion;
-        use crate::arch::aarch64::mmu;
+        use crate::kernel::arch::mmio::MmioRegion;
+        use crate::kernel::arch::mmu;
         use crate::platform::mt7988 as platform;
 
         let wdt = MmioRegion::new(mmu::phys_to_virt(platform::TOPRGU_BASE as u64) as usize);
@@ -191,9 +191,9 @@ pub fn hardware_reset() -> ! {
         const WDT_SWRST_KEY: u32 = 0x1209;
 
         wdt.write32(WDT_MODE, WDT_MODE_KEY | WDT_MODE_EXTEN | WDT_MODE_EN);
-        crate::arch::aarch64::mmio::dsb();
+        crate::kernel::arch::mmio::dsb();
         wdt.write32(WDT_SWRST, WDT_SWRST_KEY);
-        crate::arch::aarch64::mmio::dsb();
+        crate::kernel::arch::mmio::dsb();
     }
 
     #[cfg(feature = "platform-qemu-virt")]

@@ -300,11 +300,15 @@ pub fn complete_exit_notification(info: ExitInfo) {
     waker::wake(&wake_list, WakeReason::ChildExit);
 }
 
-/// Reap a terminated child - do full resource cleanup, remove from parent's list, free slot
+/// Reap a terminated child — collect exit code, defer cleanup to microtask pipeline.
 ///
-/// This performs the same cleanup as the microtask Phase 1+2 pipeline, since the child
-/// may be in Exiting state with cleanup_phase anywhere from None to Phase2Enqueued.
-/// Checks cleanup_phase to determine what work remains.
+/// Phase 1 (IPC teardown) runs inline if the microtask pipeline hasn't started it yet.
+/// Phase 2 (shmem finalize, slot free) is NEVER run here — it goes through the
+/// microtask grace period so dependent tasks (e.g. shell using consoled's shmem)
+/// have time to be killed and unmap before their pages are pulled out.
+///
+/// The child is detached (parent_id = 0) so wait_child won't find it again.
+/// The timer scanner picks up the GracePeriod and enqueues Phase 2 later.
 fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, child_pid: TaskId) {
     use crate::kernel::ipc::{waker, traits::WakeReason};
     use crate::kernel::task::tcb::CleanupPhase;
@@ -334,16 +338,16 @@ fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, chil
         crate::kernel::shmem::begin_cleanup(child_pid);
     }
 
-    // Phase 2: Force cleanup and free resources
-    // Always run — idempotent, and catches partially-completed Phase 2
-    Scheduler::do_final_cleanup(child_pid);
-
-    if let Some(ref task) = sched.tasks[child_slot] {
-        Scheduler::clear_stale_trap_frame(task, child_slot, child_pid);
+    // Detach from parent so wait_child won't find this task again.
+    // Phase 2 (FinalCleanup + SlotReap) goes through the microtask grace period.
+    if let Some(task) = sched.task_mut(child_slot) {
+        task.parent_id = 0;
+        if matches!(task.cleanup_phase, CleanupPhase::None | CleanupPhase::Phase1Enqueued) {
+            task.cleanup_phase = CleanupPhase::GracePeriod {
+                until: crate::platform::current::timer::deadline_ns(100_000_000),
+            };
+        }
     }
-
-    sched.bump_generation(child_slot);
-    sched.tasks[child_slot] = None;
 }
 
 /// Handle probed exit: lock bus creation, set flag for deferred devd spawn

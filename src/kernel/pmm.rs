@@ -38,7 +38,7 @@
 //! Safe to call from both process and interrupt context.
 
 use crate::{kinfo, kwarn, kdebug, print_direct, klog};
-use crate::arch::aarch64::mmu;
+use crate::kernel::arch::mmu;
 use crate::platform::current::{DRAM_BASE, DRAM_END, KERNEL_PHYS_BASE};
 use super::lock::SpinLock;
 

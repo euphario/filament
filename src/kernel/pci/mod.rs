@@ -378,7 +378,7 @@ impl EcamPciHost {
     /// Calculate config space virtual address for a BDF + register
     #[inline]
     fn config_addr(&self, bdf: PciBdf, offset: u16) -> usize {
-        use crate::arch::aarch64::mmu;
+        use crate::kernel::arch::mmu;
         let phys = self.base
             + ((bdf.bus as usize) << 20)
             + ((bdf.device as usize) << 15)
@@ -505,7 +505,7 @@ pub fn register_ecam_host(base: usize) {
     // ECAM config space is at most 256MB (256 buses * 32 devices * 8 functions * 4KB).
     // Map the containing 1GB block as device memory.
     let gb_aligned = (base as u64) & !0x3FFF_FFFF;
-    crate::arch::aarch64::mmu::map_kernel_device_1gb(gb_aligned);
+    crate::kernel::arch::mmu::map_kernel_device_1gb(gb_aligned);
     kinfo!("pci", "ecam_mapped"; phys = gb_aligned);
 
     if let Some(pci) = subsystem_mut() {

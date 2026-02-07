@@ -89,7 +89,7 @@ impl Protection {
 
     /// Convert to page table flags for ARM64
     pub fn to_pte_flags(self) -> u64 {
-        use crate::arch::aarch64::mmu::flags;
+        use crate::kernel::arch::mmu::flags;
 
         let mut pte = flags::AF | flags::VALID | flags::PAGE;
 

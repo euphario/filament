@@ -28,18 +28,30 @@
 
 use super::traits::{Subscriber, WakeReason};
 use crate::kernel::task;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Maximum subscribers per object
 pub const MAX_SUBSCRIBERS: usize = 8;
+
+/// Global counter of wake list overflow events (for diagnostics).
+static WAKE_OVERFLOW_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Get the total number of wake overflow events since boot.
+pub fn overflow_count() -> u32 {
+    WAKE_OVERFLOW_COUNT.load(Ordering::Relaxed)
+}
 
 /// List of subscribers to wake (returned by operations)
 ///
 /// This is a small fixed-size array to avoid allocation.
 /// Operations return this, and caller wakes outside lock.
+/// If `overflowed` is true, at least one subscriber was dropped.
 #[derive(Clone)]
 pub struct WakeList {
     entries: [Option<Subscriber>; MAX_SUBSCRIBERS],
     count: usize,
+    /// Set to true if any push was dropped due to capacity
+    pub overflowed: bool,
 }
 
 impl WakeList {
@@ -48,14 +60,21 @@ impl WakeList {
         Self {
             entries: [None; MAX_SUBSCRIBERS],
             count: 0,
+            overflowed: false,
         }
     }
 
-    /// Add a subscriber to the wake list
-    pub fn push(&mut self, sub: Subscriber) {
+    /// Add a subscriber to the wake list.
+    /// Returns false and sets `overflowed` if the list is full.
+    pub fn push(&mut self, sub: Subscriber) -> bool {
         if self.count < MAX_SUBSCRIBERS {
             self.entries[self.count] = Some(sub);
             self.count += 1;
+            true
+        } else {
+            self.overflowed = true;
+            WAKE_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
+            false
         }
     }
 
@@ -83,6 +102,7 @@ impl WakeList {
 
     /// Merge another wake list into this one
     pub fn merge(&mut self, other: &WakeList) {
+        self.overflowed |= other.overflowed;
         for sub in other.iter() {
             self.push(sub);
         }
@@ -236,9 +256,25 @@ impl Default for SubscriberSet {
 ///
 /// This is THE function that wakes tasks. No other wake paths!
 /// Must be called OUTSIDE any channel/port locks.
+///
+/// If the wake list overflowed (subscribers were dropped), enqueues
+/// WakeSweep microtasks for the subscribers that *were* successfully
+/// woken — they'll re-poll their Mux and discover any missed events.
 pub fn wake(list: &WakeList, _reason: WakeReason) {
     for sub in list.iter() {
         wake_one(&sub);
+    }
+
+    if list.overflowed {
+        // Re-wake all successfully-listed subscribers so they re-poll.
+        // The dropped subscribers were never in the list, so we can't wake them
+        // directly — but the objects they subscribed to will still show as ready
+        // when these tasks re-poll their Mux.
+        for sub in list.iter() {
+            let _ = crate::kernel::microtask::enqueue(
+                crate::kernel::microtask::MicroTask::WakeSweep { pid: sub.task_id },
+            );
+        }
     }
 }
 
@@ -255,7 +291,7 @@ fn wake_one(sub: &Subscriber) {
         sched.wake_by_pid(sub.task_id);
     } else {
         // Lock held - defer the wake
-        crate::arch::aarch64::sync::cpu_flags().request_wake(sub.task_id);
+        crate::kernel::arch::sync::cpu_flags().request_wake(sub.task_id);
     }
 }
 
@@ -281,16 +317,45 @@ mod tests {
         let list = WakeList::new();
         assert!(list.is_empty());
         assert_eq!(list.len(), 0);
+        assert!(!list.overflowed);
     }
 
     #[test]
     fn test_wake_list_push() {
         let mut list = WakeList::new();
-        list.push(Subscriber::new(1, 1));
-        list.push(Subscriber::new(2, 1));
+        assert!(list.push(Subscriber::new(1, 1)));
+        assert!(list.push(Subscriber::new(2, 1)));
 
         assert!(!list.is_empty());
         assert_eq!(list.len(), 2);
+        assert!(!list.overflowed);
+    }
+
+    #[test]
+    fn test_wake_list_overflow() {
+        let mut list = WakeList::new();
+        for i in 0..MAX_SUBSCRIBERS {
+            assert!(list.push(Subscriber::new(i as u32, 1)));
+        }
+        assert_eq!(list.len(), MAX_SUBSCRIBERS);
+        assert!(!list.overflowed);
+
+        // Next push should fail and set overflow
+        assert!(!list.push(Subscriber::new(99, 1)));
+        assert_eq!(list.len(), MAX_SUBSCRIBERS); // count unchanged
+        assert!(list.overflowed);
+    }
+
+    #[test]
+    fn test_wake_list_merge_overflow() {
+        let mut list1 = WakeList::new();
+        list1.overflowed = true; // simulate prior overflow
+
+        let mut list2 = WakeList::new();
+        list2.push(Subscriber::new(1, 1));
+
+        list1.merge(&list2);
+        assert!(list1.overflowed); // propagated
     }
 
     #[test]

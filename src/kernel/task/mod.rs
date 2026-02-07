@@ -416,7 +416,7 @@ impl Scheduler {
 
             // Set need_resched so the woken task gets scheduled
             // when the current syscall returns
-            crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+            crate::kernel::arch::sync::cpu_flags().set_need_resched();
 
             true
         } else {
@@ -846,7 +846,7 @@ impl Scheduler {
         let trap_frame = &mut task.trap_frame as *mut TrapFrame;
 
         // Kernel stack top (virtual) - becomes SP_EL1 for this task's exceptions
-        let kstack_top = crate::arch::aarch64::mmu::phys_to_virt(
+        let kstack_top = crate::kernel::arch::mmu::phys_to_virt(
             task.kernel_stack + task.kernel_stack_size as u64
         );
 
@@ -1105,7 +1105,7 @@ pub fn try_with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> Option<R> 
 /// interrupted code, causing deadlock). This function processes those
 /// queued requests at a point where it's safe to acquire the lock.
 pub fn process_pending_wakes() {
-    let pending = crate::arch::aarch64::sync::cpu_flags().drain_pending_wakes();
+    let pending = crate::kernel::arch::sync::cpu_flags().drain_pending_wakes();
     let mut any_woken = false;
 
     for pid in pending {
@@ -1120,7 +1120,7 @@ pub fn process_pending_wakes() {
 
     // Ensure need_resched is set if we woke anyone
     if any_woken {
-        crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+        crate::kernel::arch::sync::cpu_flags().set_need_resched();
     }
 }
 
@@ -1233,13 +1233,13 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     process_pending_wakes();
 
     // Drain microtask queue (cleanup, evictions, deferred wakes)
-    super::microtask::drain();
+    super::microtask::drain(16);
 
     // Process any pending task evictions (legacy lock-free IRQ path).
     eviction::process_pending_evictions();
 
     // Check and clear the flag atomically (before taking lock)
-    let need_resched = crate::arch::aarch64::sync::cpu_flags().check_and_clear_resched();
+    let need_resched = crate::kernel::arch::sync::cpu_flags().check_and_clear_resched();
 
     // Check if we need to reschedule (must hold IrqGuard for SMP safety)
     let (should_resched, blocked_pid) = if need_resched {

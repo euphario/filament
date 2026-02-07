@@ -13,7 +13,7 @@
 use super::addrspace::AddressSpace;
 use super::pmm;
 use crate::print_direct;
-use crate::arch::aarch64::mmu;
+use crate::kernel::arch::mmu;
 
 /// Process ID type
 pub type Pid = u32;

@@ -131,7 +131,7 @@ pub fn mark_for_eviction(task_id: TaskId, reason: EvictionReason) {
 /// Returns the number of tasks evicted.
 pub fn process_pending_evictions() -> usize {
     // Guarantee atomicity - no preemption during eviction
-    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    let _guard = crate::kernel::arch::sync::IrqGuard::new();
 
     let mut evicted = 0;
 

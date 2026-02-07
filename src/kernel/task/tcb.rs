@@ -5,7 +5,7 @@
 
 use crate::kernel::addrspace::AddressSpace;
 use crate::kernel::pmm;
-use crate::arch::aarch64::{mmu, tlb};
+use crate::kernel::arch::{mmu, tlb};
 
 use super::state::TaskState;
 use crate::kernel::memory::{
@@ -326,7 +326,7 @@ fn user_task_trampoline() -> ! {
         let trap_frame = &mut task.trap_frame as *mut TrapFrame;
 
         // Kernel stack top (virtual) - becomes SP_EL1 for this task's exceptions
-        let kstack_top = crate::arch::aarch64::mmu::phys_to_virt(
+        let kstack_top = crate::kernel::arch::mmu::phys_to_virt(
             task.kernel_stack + task.kernel_stack_size as u64
         );
 
@@ -474,7 +474,7 @@ impl Task {
         let stack_top = stack_base + KERNEL_STACK_SIZE;
 
         // Convert to kernel virtual address (MMU is enabled)
-        let stack_top_virt = crate::arch::aarch64::mmu::phys_to_virt(stack_top as u64);
+        let stack_top_virt = crate::kernel::arch::mmu::phys_to_virt(stack_top as u64);
 
         let address_space = match AddressSpace::new() {
             Some(addr_space) => addr_space,

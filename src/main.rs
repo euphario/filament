@@ -440,7 +440,7 @@ pub extern "C" fn irq_exit_resched() {
     task::process_pending_wakes();
 
     // 2. Drain microtask queue (cleanup, evictions, deferred wakes)
-    crate::kernel::microtask::drain();
+    crate::kernel::microtask::drain(16);
 
     // 3. Handle deferred reschedule
     unsafe {

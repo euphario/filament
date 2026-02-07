@@ -279,7 +279,7 @@ pub(crate) unsafe fn bus_registry() -> &'static mut BusRegistry {
 /// Execute a closure with exclusive access to the bus registry
 #[inline]
 pub fn with_bus_registry<R, F: FnOnce(&mut BusRegistry) -> R>(f: F) -> R {
-    let _guard = crate::arch::aarch64::sync::IrqGuard::new();
+    let _guard = crate::kernel::arch::sync::IrqGuard::new();
     unsafe { f(bus_registry()) }
 }
 

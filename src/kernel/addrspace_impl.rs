@@ -16,7 +16,7 @@ use crate::kernel::traits::addrspace::{
     AddressSpaceBackend, Asid, VirtAddr, PhysAddr, PageFlags,
 };
 use crate::kernel::addrspace;
-use crate::arch::aarch64::{mmu, tlb};
+use crate::kernel::arch::{mmu, tlb};
 
 // ============================================================================
 // Kernel Address Space Backend

@@ -522,7 +522,7 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
 
     // Zero the memory through kernel's direct-map
     unsafe {
-        let kern_vaddr = crate::arch::aarch64::mmu::phys_to_virt(phys_addr as u64);
+        let kern_vaddr = crate::kernel::arch::mmu::phys_to_virt(phys_addr as u64);
         core::ptr::write_bytes(kern_vaddr as *mut u8, 0, aligned_size);
 
         // CRITICAL: Flush kernel cache to physical memory and invalidate

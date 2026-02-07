@@ -32,8 +32,8 @@
 
 #![allow(dead_code)]
 
-use crate::arch::aarch64::mmu::{self, flags, attr};
-use crate::arch::aarch64::tlb;
+use crate::kernel::arch::mmu::{self, flags, attr};
+use crate::kernel::arch::tlb;
 use super::pmm;
 use super::lock::SpinLock;
 use crate::print_direct;

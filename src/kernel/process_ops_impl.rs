@@ -66,7 +66,8 @@ impl ProcessOps for KernelProcessOps {
         // Drain microtasks immediately (outside scheduler lock)
         // This gives us the same low-latency peer notification as the old
         // do_exit_ipc_cleanup() path, but through the unified queue.
-        microtask::drain();
+        // Higher budget at exit — task is terminating, cleanup is priority.
+        microtask::drain(64);
 
         // If probed just exited, spawn devd now (scheduler lock is released)
         lifecycle::complete_probed_exit();
@@ -129,7 +130,8 @@ impl ProcessOps for KernelProcessOps {
         });
 
         // Drain microtasks immediately (outside scheduler lock)
-        microtask::drain();
+        // Higher budget at kill — cleanup is priority.
+        microtask::drain(64);
 
         if need_resched {
             crate::kernel::sched::reschedule();

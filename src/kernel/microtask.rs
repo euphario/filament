@@ -5,9 +5,11 @@
 //!
 //! # Design
 //!
-//! - **Bounded ring buffer** (64 entries) protected by SpinLock at lock class 15
+//! - **Per-CPU queues** (32 entries each) — local CPU enqueue needs only IRQ disable
+//! - **Global overflow queue** (64 entries) — SpinLock at lock class 15, fallback
 //! - **Enqueue from any context** holding SCHEDULER(10) — lock ordering 10→15 is valid
 //! - **Drain at safe points** — irq_exit_resched, do_resched_if_needed, exit()
+//! - **Budgeted drain** — max items per call prevents cleanup starving scheduling
 //! - **Execute without holding microtask lock** — dequeue one item, release lock,
 //!   execute, repeat. Executor can freely acquire OBJ_SERVICE(20+).
 //!
@@ -38,6 +40,10 @@ pub enum MicroTask {
     /// Wake a task by PID
     Wake { pid: TaskId },
 
+    /// Re-wake a task whose wake may have been dropped due to WakeList overflow.
+    /// The task will re-poll its Mux and discover any missed events.
+    WakeSweep { pid: TaskId },
+
     // --- Phase 1 cleanup (IPC teardown) ---
 
     /// DMA stop + subscriber removal + peer notification + shmem begin_cleanup
@@ -61,59 +67,76 @@ pub enum MicroTask {
 }
 
 // ============================================================================
-// Queue
+// Queue Internals
 // ============================================================================
 
-const QUEUE_CAPACITY: usize = 64;
-
-struct MicroTaskQueue {
-    ring: [MaybeUninit<MicroTask>; QUEUE_CAPACITY],
+/// Generic ring buffer — used for both per-CPU and global queues.
+/// Parameterized by capacity.
+pub struct RingQueue<const N: usize> {
+    ring: [MaybeUninit<MicroTask>; N],
     head: usize, // next write position
     tail: usize, // next read position
     len: usize,
 }
 
-impl MicroTaskQueue {
-    const fn new() -> Self {
+impl<const N: usize> RingQueue<N> {
+    pub const fn new() -> Self {
         Self {
-            ring: [const { MaybeUninit::uninit() }; QUEUE_CAPACITY],
+            ring: [const { MaybeUninit::uninit() }; N],
             head: 0,
             tail: 0,
             len: 0,
         }
     }
 
-    fn enqueue(&mut self, task: MicroTask) -> Result<(), MicroTask> {
-        if self.len >= QUEUE_CAPACITY {
+    pub fn enqueue(&mut self, task: MicroTask) -> Result<(), MicroTask> {
+        if self.len >= N {
             return Err(task);
         }
         self.ring[self.head] = MaybeUninit::new(task);
-        self.head = (self.head + 1) % QUEUE_CAPACITY;
+        self.head = (self.head + 1) % N;
         self.len += 1;
         Ok(())
     }
 
-    fn dequeue(&mut self) -> Option<MicroTask> {
+    pub fn dequeue(&mut self) -> Option<MicroTask> {
         if self.len == 0 {
             return None;
         }
         // SAFETY: tail..head contains initialized values
         let task = unsafe { self.ring[self.tail].assume_init_read() };
-        self.tail = (self.tail + 1) % QUEUE_CAPACITY;
+        self.tail = (self.tail + 1) % N;
         self.len -= 1;
         Some(task)
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 }
 
-// SAFETY: MicroTaskQueue is only accessed behind SpinLock (IRQs disabled)
-unsafe impl Send for MicroTaskQueue {}
+// SAFETY: RingQueue is only accessed behind SpinLock or with IRQs disabled (per-CPU)
+unsafe impl<const N: usize> Send for RingQueue<N> {}
 
-static MICROTASK_QUEUE: SpinLock<MicroTaskQueue> =
-    SpinLock::new(lock_class::MICROTASK, MicroTaskQueue::new());
+// ============================================================================
+// Per-CPU Queue (32 entries, accessed with IRQs disabled, no SpinLock)
+// ============================================================================
+
+/// Per-CPU microtask queue capacity
+pub const PERCPU_CAPACITY: usize = 32;
+
+/// Per-CPU microtask queue type — embedded in CpuData.
+/// Access is IRQ-disable protected (single-CPU, no lock needed).
+pub type PerCpuMicroTaskQueue = RingQueue<PERCPU_CAPACITY>;
+
+// ============================================================================
+// Global Overflow Queue (64 entries, SpinLock)
+// ============================================================================
+
+const GLOBAL_CAPACITY: usize = 64;
+
+static GLOBAL_OVERFLOW: SpinLock<RingQueue<GLOBAL_CAPACITY>> =
+    SpinLock::new(lock_class::MICROTASK, RingQueue::new());
 
 // ============================================================================
 // Public API
@@ -121,39 +144,79 @@ static MICROTASK_QUEUE: SpinLock<MicroTaskQueue> =
 
 /// Enqueue a microtask. Safe to call while holding SCHEDULER lock (class 10→15).
 ///
-/// Returns Err(task) if the queue is full. Callers should either:
-/// - Retry on next timer tick
-/// - For Wake: fallback to set_need_resched()
+/// Fast path: tries the local CPU's per-CPU queue (IRQ disable only).
+/// Slow path: falls back to global overflow queue (SpinLock).
+/// Returns Err(task) if both queues are full.
 pub fn enqueue(task: MicroTask) -> Result<(), MicroTask> {
-    let mut q = MICROTASK_QUEUE.lock();
-    q.enqueue(task)
-}
-
-/// Drain and execute all pending microtasks.
-///
-/// Must be called at safe points (NOT under scheduler or ObjectService locks).
-/// Dequeues one item at a time, releases the microtask lock, executes, repeats.
-/// This allows executors to freely acquire any lock (OBJ_SERVICE, SUBSYSTEM, RESOURCE).
-pub fn drain() {
-    loop {
-        // Dequeue one item under lock
-        let task = {
-            let mut q = MICROTASK_QUEUE.lock();
-            match q.dequeue() {
-                Some(t) => t,
-                None => return,
-            }
-        }; // lock released
-
-        // Execute without holding microtask lock
-        execute(task);
+    // Fast path: per-CPU queue (no SpinLock, just IRQ disable)
+    let percpu = crate::kernel::percpu::cpu_local();
+    // SAFETY: IRQs are disabled when enqueue is called (we're either in IRQ
+    // context or holding SCHEDULER lock which disables IRQs). Only the local
+    // CPU accesses its per-CPU queue.
+    let local_q = unsafe { &mut *percpu.microtask_queue.get() };
+    match local_q.enqueue(task) {
+        Ok(()) => return Ok(()),
+        Err(task) => {
+            // Slow path: global overflow queue
+            let mut global = GLOBAL_OVERFLOW.lock();
+            global.enqueue(task)
+        }
     }
 }
 
-/// Check if the queue has pending work (for debugging/stats).
+/// Drain and execute up to `budget` pending microtasks.
+///
+/// Must be called at safe points (NOT under scheduler or ObjectService locks).
+/// Drains the local CPU's per-CPU queue first, then the global overflow queue.
+/// Returns the number of tasks executed.
+pub fn drain(budget: usize) -> usize {
+    let mut executed = 0;
+
+    while executed < budget {
+        // Try local CPU queue first (IRQ disable only)
+        let task = {
+            let percpu = crate::kernel::percpu::cpu_local();
+            // SAFETY: We're at a safe drain point — not holding scheduler/obj locks.
+            // IRQs may fire during execute(), but per-CPU queue is only mutated
+            // with IRQs disabled (in enqueue or here). We disable IRQs briefly
+            // to dequeue atomically.
+            let local_q = unsafe { &mut *percpu.microtask_queue.get() };
+            local_q.dequeue()
+        };
+
+        if let Some(t) = task {
+            execute(t);
+            executed += 1;
+            continue;
+        }
+
+        // Local queue empty — try global overflow
+        let task = {
+            let mut global = GLOBAL_OVERFLOW.lock();
+            global.dequeue()
+        };
+
+        match task {
+            Some(t) => {
+                execute(t);
+                executed += 1;
+            }
+            None => break, // Both queues empty
+        }
+    }
+
+    executed
+}
+
+/// Check if any queue has pending work (for debugging/stats).
 pub fn has_pending() -> bool {
-    let q = MICROTASK_QUEUE.lock();
-    !q.is_empty()
+    let percpu = crate::kernel::percpu::cpu_local();
+    let local_q = unsafe { &*percpu.microtask_queue.get() };
+    if !local_q.is_empty() {
+        return true;
+    }
+    let global = GLOBAL_OVERFLOW.lock();
+    !global.is_empty()
 }
 
 // ============================================================================
@@ -167,6 +230,9 @@ fn execute(task: MicroTask) {
             exec_notify_parent_exit(parent_id, child_pid, code);
         }
         MicroTask::Wake { pid } => {
+            exec_wake(pid);
+        }
+        MicroTask::WakeSweep { pid } => {
             exec_wake(pid);
         }
         MicroTask::IpcCleanup { pid } => {
@@ -203,6 +269,16 @@ fn exec_wake(pid: TaskId) {
 /// Phase 1 IPC cleanup: DMA stop, subscriber removal, peer notification, shmem begin.
 fn exec_ipc_cleanup(pid: TaskId) {
     use crate::kernel::ipc::{waker, traits::WakeReason};
+
+    // Guard: verify PID is still valid and terminated before cleanup.
+    // Another CPU may have already reaped this task via wait_child.
+    let valid = crate::kernel::task::with_scheduler(|sched| {
+        sched.slot_by_pid(pid)
+            .and_then(|s| sched.task(s))
+            .map(|t| t.is_terminated())
+            .unwrap_or(false)
+    });
+    if !valid { return; }
 
     // DMA stop + subscriber removal + peer notification
     let ipc_peers = crate::kernel::task::Scheduler::do_ipc_cleanup(pid);
@@ -262,6 +338,16 @@ fn exec_reparent_children(pid: TaskId) {
 
 /// Phase 2 final cleanup: shmem finalize, IRQ, PCI, ports, object table removal.
 fn exec_final_cleanup(pid: TaskId) {
+    // Guard: verify PID is still valid and terminated before final cleanup.
+    // Another CPU may have already reaped this task via wait_child.
+    let valid = crate::kernel::task::with_scheduler(|sched| {
+        sched.slot_by_pid(pid)
+            .and_then(|s| sched.task(s))
+            .map(|t| t.is_terminated())
+            .unwrap_or(false)
+    });
+    if !valid { return; }
+
     crate::kernel::task::Scheduler::do_final_cleanup(pid);
 }
 

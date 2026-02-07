@@ -23,7 +23,7 @@
 //! - When woken, blocked task's context is restored properly
 
 use crate::hal::Cpu;
-use crate::arch::aarch64::hal::cpu;
+use crate::kernel::arch::hal::cpu;
 
 /// Idle task entry point
 ///

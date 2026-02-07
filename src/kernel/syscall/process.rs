@@ -218,7 +218,7 @@ pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len
     };
 
     // Get kernel virtual address for the allocation
-    let elf_virt = crate::arch::aarch64::mmu::phys_to_virt(elf_phys as u64) as *mut u8;
+    let elf_virt = crate::kernel::arch::mmu::phys_to_virt(elf_phys as u64) as *mut u8;
 
     // Copy ELF data from userspace to kernel buffer
     let elf_slice = unsafe { core::slice::from_raw_parts_mut(elf_virt, elf_len) };

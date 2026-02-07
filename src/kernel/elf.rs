@@ -10,7 +10,7 @@ use super::pmm;
 #[cfg(debug_assertions)]
 use crate::kdebug;
 use crate::{kinfo, print_direct};
-use crate::arch::aarch64::mmu;
+use crate::kernel::arch::mmu;
 use super::task;
 
 /// ELF magic number

@@ -21,7 +21,7 @@
 //! this pool instead of regular shmem.
 
 use crate::{kinfo, kerror, klog};
-use crate::arch::aarch64::mmu;
+use crate::kernel::arch::mmu;
 use crate::platform::current;
 use super::lock::SpinLock;
 use super::process::Pid;

@@ -355,7 +355,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
     // PHASE 2: Context switch with NO LOCK
     // ========================================================================
     // Only IRQs are disabled (IrqGuard from SpinLock was dropped, take new one)
-    let _irq_guard = crate::arch::aarch64::sync::IrqGuard::new();
+    let _irq_guard = crate::kernel::arch::sync::IrqGuard::new();
 
     // Activate target address space
     if decision.to_ttbr0 != 0 {
@@ -517,7 +517,7 @@ pub fn wake(pid: u32) -> bool {
         woken
     } else {
         // Lock held - defer the wake
-        crate::arch::aarch64::sync::cpu_flags().request_wake(pid);
+        crate::kernel::arch::sync::cpu_flags().request_wake(pid);
         true // Wake will be processed by process_pending_wakes
     }
 }
@@ -631,14 +631,14 @@ pub fn timer_tick(current_time: u64) {
     let Some(mut sched) = task::try_scheduler() else {
         // Lock held - skip this tick, timeouts will be checked next tick
         // Still set need_resched so we retry after the syscall completes
-        crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+        crate::kernel::arch::sync::cpu_flags().set_need_resched();
         return;
     };
 
     let woken = sched.check_timeouts(current_time);
 
     if woken > 0 {
-        crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+        crate::kernel::arch::sync::cpu_flags().set_need_resched();
     }
 
     // Drop scheduler lock before liveness check (it takes its own lock)

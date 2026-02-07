@@ -4,7 +4,7 @@
 //! xHCI operations, and power management. Base addresses are stored
 //! per-bus in BusController (set by probed via open(Bus) syscall).
 
-use crate::arch::aarch64::mmio::{MmioRegion, delay_ms, delay_us, dsb};
+use crate::kernel::arch::mmio::{MmioRegion, delay_ms, delay_us, dsb};
 use super::hw_poll::poll_until;
 
 /// IPPC (IP Port Control) offset from MAC base

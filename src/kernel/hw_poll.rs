@@ -25,7 +25,7 @@
 //! }
 //! ```
 
-use crate::arch::aarch64::mmio::delay_ms;
+use crate::kernel::arch::mmio::delay_ms;
 
 /// Poll a condition with a maximum iteration count.
 ///

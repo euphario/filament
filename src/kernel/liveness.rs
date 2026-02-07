@@ -368,7 +368,7 @@ pub fn check_liveness(current_tick: u64) -> usize {
         }
         // Set need_resched if any tasks were woken
         if wake_count > 0 {
-            crate::arch::aarch64::sync::cpu_flags().set_need_resched();
+            crate::kernel::arch::sync::cpu_flags().set_need_resched();
         }
 
         (actions, notifications, notify_count)

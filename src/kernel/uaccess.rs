@@ -32,8 +32,8 @@
 
 #![allow(dead_code)]  // Infrastructure for future use
 
-use crate::arch::aarch64::mmu::{self, flags, PAGE_SIZE};
-use crate::arch::aarch64::mmio::cache_clean_range;
+use crate::kernel::arch::mmu::{self, flags, PAGE_SIZE};
+use crate::kernel::arch::mmio::cache_clean_range;
 
 /// Maximum valid user space address (48-bit, upper half is kernel)
 pub const USER_SPACE_END: u64 = 0x0000_FFFF_FFFF_FFFF;

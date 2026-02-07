@@ -28,6 +28,24 @@
 //! - **TableGuard** - Type-safe proof of lock ownership
 //! - **Lock ordering** - `lock_table_ordered()` prevents ABBA deadlocks
 //! - **Continuation pattern** - Operations release lock before waking
+//!
+//! # Cross-Lock Safety Contract
+//!
+//! Object references (channel_id, port_id) extracted under one lock may go
+//! stale after lock release if another CPU closes the object concurrently.
+//! The following invariants prevent this from causing panics:
+//!
+//! - **IPC backends return errors, never panic** — `channel_send()`,
+//!   `channel_recv()`, `close_channel()` all return `Err(InvalidChannel)`
+//!   or `Err(PeerClosed)` for stale/closed IDs. Double-close is a no-op.
+//! - **Subscriber.generation prevents stale wakes** — wake delivery checks
+//!   that the task slot's generation matches the subscriber's generation.
+//! - **Microtask executors validate PID** — `exec_ipc_cleanup()`,
+//!   `exec_final_cleanup()`, and `exec_slot_reap()` all verify the task
+//!   still exists and is terminated before operating.
+//! - **Callers handle "object vanished" gracefully** — all cross-lock
+//!   call sites (channel write, port accept, port connect) propagate
+//!   errors to userspace rather than panicking.
 
 use crate::kernel::lock::{SpinLock, SpinLockGuard};
 use crate::kernel::task::{TaskId, MAX_TASKS};

@@ -647,7 +647,7 @@ impl BusController {
     /// - Assert PEXTP_MAC_SWRST = MAC in reset (safe state, no DMA)
     /// - Deassert PEXTP_MAC_SWRST = MAC running
     fn pcie_reset_sequence(&mut self) {
-        use crate::arch::aarch64::mmio::MmioRegion;
+        use crate::kernel::arch::mmio::MmioRegion;
         use crate::klog;
 
         let index = self.bus_index as usize;

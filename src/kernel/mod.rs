@@ -10,6 +10,7 @@
 //!
 //! Code in this module should be architecture and platform independent.
 
+pub mod arch;   // Architecture re-exports (change this file to port)
 pub mod traits; // Trait boundaries for swappable subsystems
 pub mod vm;     // Virtual memory object system (PageFrame, VmObject, VmMapping)
 pub mod waker_impl; // Waker trait implementation

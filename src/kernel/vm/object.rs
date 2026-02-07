@@ -324,7 +324,7 @@ impl VmObject {
             let phys_addr = pmm::alloc_page()? as u64;
 
             // Zero-fill the page
-            let kernel_va = crate::arch::aarch64::mmu::phys_to_virt(phys_addr);
+            let kernel_va = crate::kernel::arch::mmu::phys_to_virt(phys_addr);
             unsafe {
                 core::ptr::write_bytes(kernel_va as *mut u8, 0, PageFrame::SIZE);
             }

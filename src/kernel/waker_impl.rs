@@ -34,7 +34,7 @@ impl Waker for KernelWaker {
             sched.wake_by_pid(sub.task_id);
         } else {
             // Lock held - defer the wake
-            crate::arch::aarch64::sync::cpu_flags().request_wake(sub.task_id);
+            crate::kernel::arch::sync::cpu_flags().request_wake(sub.task_id);
         }
     }
 

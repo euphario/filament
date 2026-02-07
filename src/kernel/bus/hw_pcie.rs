@@ -4,7 +4,7 @@
 //! reset control, and bus mastering. Base addresses are stored per-bus
 //! in BusController (set by probed via open(Bus) syscall).
 
-use crate::arch::aarch64::mmio::{MmioRegion, delay_us, dsb};
+use crate::kernel::arch::mmio::{MmioRegion, delay_us, dsb};
 
 /// Get INFRACFG_AO base address (platform-specific constant)
 #[inline]
