@@ -1,0 +1,18 @@
+[package]
+name = "probed"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+platform-qemu-virt = []
+platform-mt7988a = []
+
+[dependencies]
+userlib = { path = "../../userlib" }
+abi = { path = "../../abi" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

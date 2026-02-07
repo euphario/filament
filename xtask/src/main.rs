@@ -266,6 +266,7 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
 
     // Core programs (built for all platforms)
     let mut all_programs: Vec<(&str, &str)> = vec![
+        ("probed", "driver/probed"),
         ("devd", "driver/devd"),
         ("consoled", "driver/consoled"),
         ("shell", "shell"),
@@ -322,9 +323,16 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
     let bin_dir = user_dir.join("bin");
     fs::create_dir_all(&bin_dir)?;
 
+    // Determine platform feature for probed
+    let platform_feature = match platform {
+        "qemu" | "qemu-virt" => "platform-qemu-virt",
+        _ => "platform-mt7988a",
+    };
+
     for (name, path) in &programs {
-        // Build devd with stress-test feature when stress mode is active
-        let features = if stress && *name == "devd" {
+        let features = if *name == "probed" {
+            Some(platform_feature)
+        } else if stress && *name == "devd" {
             Some("stress-test")
         } else {
             None

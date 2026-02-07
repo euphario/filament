@@ -184,10 +184,11 @@ pub extern "C" fn kmain() -> ! {
         kinfo!("pci", "init_ok");
     }
 
-    // Bus controllers
+    // Bus controllers — registry only, no buses registered yet
+    // Buses are created by probed (userspace) via open(Bus) syscall
     {
         let _span = span!("bus", "init");
-        bus::init(0);  // Kernel PID = 0
+        bus::init(0);  // Initialize registry (kernel PID = 0), no buses
         kinfo!("bus", "init_ok");
     }
 
@@ -281,20 +282,19 @@ pub extern "C" fn kmain() -> ! {
     // Note: idle task is created automatically by init_scheduler() in slot 0
     kinfo!("kernel", "scheduler_ready");
 
-    // Spawn devd (init process) - after scheduler is ready
-    kinfo!("kernel", "spawning_devd");
+    // Spawn probed (bus discovery) - runs first, exits quickly, then devd is spawned
+    kinfo!("kernel", "spawning_probed");
     let slot1 = {
-        let _span = span!("elf", "spawn"; path = "bin/devd");
-        match elf::spawn_from_path("bin/devd") {
+        let _span = span!("elf", "spawn"; path = "bin/probed");
+        match elf::spawn_from_path("bin/probed") {
             Ok((_task_id, slot)) => {
-                kinfo!("kernel", "devd_spawned"; slot = slot);
+                kinfo!("kernel", "probed_spawned"; slot = slot);
                 klog::flush();
-                // Give devd ALL capabilities, high priority, and mark as init process
+                // Give probed PROBED capabilities and mark as probed process
                 task::with_scheduler(|sched| {
                     if let Some(task) = sched.task_mut(slot) {
-                        task.set_capabilities(kernel::caps::Capabilities::ALL);
-                        task.set_priority(task::Priority::High);  // devd is critical
-                        task.is_init = true;  // Mark as init for heartbeat watchdog
+                        task.set_capabilities(kernel::caps::Capabilities::PROBED);
+                        task.is_probed = true;
                     }
                 });
                 Some(slot)
@@ -311,7 +311,7 @@ pub extern "C" fn kmain() -> ! {
                     elf::ElfError::InvalidSegment => "invalid_seg",
                     elf::ElfError::SignatureInvalid => "sig_invalid",
                 };
-                kerror!("kernel", "devd_spawn_failed"; err = err_str);
+                kerror!("kernel", "probed_spawn_failed"; err = err_str);
                 None
             }
         }

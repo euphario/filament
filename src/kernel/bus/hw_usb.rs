@@ -1,24 +1,11 @@
 //! USB/xHCI Hardware Constants and Operations
 //!
 //! This module contains USB hardware addresses, IPPC registers,
-//! xHCI operations, and power management. Base addresses come from
-//! the platform configuration (selected at boot based on DTB).
+//! xHCI operations, and power management. Base addresses are stored
+//! per-bus in BusController (set by probed via open(Bus) syscall).
 
 use crate::arch::aarch64::mmio::{MmioRegion, delay_ms, delay_us, dsb};
 use super::hw_poll::poll_until;
-use super::config::bus_config;
-
-/// Get USB MAC base address for a controller (from platform config)
-#[inline]
-fn mac_base(index: usize) -> Option<usize> {
-    bus_config().usb_base(index)
-}
-
-/// Get number of USB controllers (from platform config)
-#[inline]
-pub fn controller_count() -> usize {
-    bus_config().usb_controller_count()
-}
 
 /// IPPC (IP Port Control) offset from MAC base
 pub const IPPC_OFFSET: usize = 0x3E00;
@@ -87,12 +74,12 @@ pub const STS_HCE: u32 = 1 << 12;   // Host Controller Error
 /// 8. xHCI: Verify halted state
 ///
 /// Returns (hardware_verified, u3_port_count, u2_port_count)
-pub fn reset_sequence(bus_index: u8) -> (bool, usize, usize) {
-    let index = bus_index as usize;
-    let Some(base) = mac_base(index) else {
-        crate::kerror!("bus", "usb_invalid_index"; index = index as u64);
+pub fn reset_sequence(bus_index: u8, mac_base_addr: u64) -> (bool, usize, usize) {
+    let base = mac_base_addr as usize;
+    if base == 0 {
+        crate::kerror!("bus", "usb_invalid_base"; index = bus_index as u64);
         return (false, 0, 0);
-    };
+    }
     let ippc_base = base + IPPC_OFFSET;
     let ippc = MmioRegion::new(ippc_base);
 
@@ -161,15 +148,16 @@ pub fn reset_sequence(bus_index: u8) -> (bool, usize, usize) {
     }
 
     // Verify state
-    let verified = verify_state(index);
+    let verified = verify_state(mac_base_addr);
     (verified, u3_port_num, u2_port_num)
 }
 
 /// Verify USB controller is in expected state after power-on
-pub fn verify_state(index: usize) -> bool {
-    let Some(base) = mac_base(index) else {
+pub fn verify_state(mac_base_addr: u64) -> bool {
+    let base = mac_base_addr as usize;
+    if base == 0 {
         return false;
-    };
+    }
     let mac = MmioRegion::new(base);
     let ippc = MmioRegion::new(base + IPPC_OFFSET);
 
@@ -184,17 +172,17 @@ pub fn verify_state(index: usize) -> bool {
 
     // After power-on: CNR=0 (ready), HCE=0 (no error)
     if (usbsts & STS_CNR) != 0 {
-        crate::kerror!("bus", "usb_cnr_set"; index = index as u64);
+        crate::kerror!("bus", "usb_cnr_set"; base = base as u64);
         return false;
     }
     if (usbsts & STS_HCE) != 0 {
-        crate::kerror!("bus", "usb_hce_set"; index = index as u64);
+        crate::kerror!("bus", "usb_hce_set"; base = base as u64);
         return false;
     }
 
     // Verify IP is not in sleep mode
     if (ippc.read32(IP_PW_STS1) & STS1_IP_SLEEP_STS) != 0 {
-        crate::kerror!("bus", "usb_sleep_mode"; index = index as u64);
+        crate::kerror!("bus", "usb_sleep_mode"; base = base as u64);
         return false;
     }
 
@@ -203,11 +191,11 @@ pub fn verify_state(index: usize) -> bool {
 
 /// Power down USB controller to put in safe state
 /// Powers down host IP and all ports - no DMA can occur.
-pub fn power_down(bus_index: u8) {
-    let index = bus_index as usize;
-    let Some(base) = mac_base(index) else {
+pub fn power_down(_bus_index: u8, mac_base_addr: u64) {
+    let base = mac_base_addr as usize;
+    if base == 0 {
         return;
-    };
+    }
     let ippc = MmioRegion::new(base + IPPC_OFFSET);
 
     let xhci_cap = ippc.read32(IP_XHCI_CAP);
@@ -232,11 +220,11 @@ pub fn power_down(bus_index: u8) {
 }
 
 /// Force halt the USB controller (emergency stop)
-pub fn force_halt(bus_index: u8) -> Result<(), super::BusError> {
-    let index = bus_index as usize;
-    let Some(base) = mac_base(index) else {
+pub fn force_halt(bus_index: u8, mac_base_addr: u64) -> Result<(), super::BusError> {
+    let base = mac_base_addr as usize;
+    if base == 0 {
         return Err(super::BusError::NotFound);
-    };
+    }
     let mac = MmioRegion::new(base);
 
     // Read capability length
@@ -263,7 +251,7 @@ pub fn force_halt(bus_index: u8) -> Result<(), super::BusError> {
         }
     }
 
-    crate::kerror!("bus", "usb_force_halt_failed"; index = index as u64);
+    crate::kerror!("bus", "usb_force_halt_failed"; index = bus_index as u64);
     Err(super::BusError::HardwareError)
 }
 
@@ -272,9 +260,8 @@ pub fn force_halt(bus_index: u8) -> Result<(), super::BusError> {
 /// For USB, DMA is controlled by xHCI Run/Stop bit
 /// We don't directly control R/S here - that's the driver's job
 /// Instead, we track permission and can forcibly halt if needed
-pub fn set_dma_allowed(bus_index: u8, device_id: u16, allow: bool) -> Result<(), super::BusError> {
-    let index = bus_index as usize;
-    if mac_base(index).is_none() {
+pub fn set_dma_allowed(bus_index: u8, device_id: u16, allow: bool, mac_base_addr: u64) -> Result<(), super::BusError> {
+    if mac_base_addr == 0 {
         return Err(super::BusError::NotFound);
     }
 
@@ -286,7 +273,7 @@ pub fn set_dma_allowed(bus_index: u8, device_id: u16, allow: bool) -> Result<(),
         // xHCI controller - this controls whether the controller can DMA at all
         if !allow {
             // Force halt the controller
-            force_halt(bus_index)?;
+            force_halt(bus_index, mac_base_addr)?;
         }
         // If allowing, driver will set Run/Stop when ready
     }
@@ -295,7 +282,7 @@ pub fn set_dma_allowed(bus_index: u8, device_id: u16, allow: bool) -> Result<(),
 }
 
 /// Query USB-specific capabilities by reading xHCI registers
-pub fn query_capabilities(bus_index: u8) -> u8 {
+pub fn query_capabilities(_bus_index: u8, mac_base_addr: u64) -> u8 {
     use super::bus_caps;
     let mut caps = 0u8;
 
@@ -304,7 +291,8 @@ pub fn query_capabilities(bus_index: u8) -> u8 {
     caps |= bus_caps::USB_3_0;
 
     // Check if controller is running (not halted)
-    if let Some(base) = mac_base(bus_index as usize) {
+    let base = mac_base_addr as usize;
+    if base != 0 {
         let mmio = MmioRegion::new(base);
 
         // Read CAPLENGTH to find operational registers offset

@@ -15,7 +15,6 @@ pub mod uart;
 pub mod gic;
 pub mod timer;
 pub mod platform;
-pub mod bus;
 
 // =============================================================================
 // Memory Map (QEMU virt machine)

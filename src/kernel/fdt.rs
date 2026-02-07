@@ -590,7 +590,6 @@ pub fn init() {
         // Using embedded DTB
         if let Some(fdt) = Fdt::parse_from_ptr(dtb_data.as_ptr()) {
             store_fdt(fdt);
-            select_platform();
             return;
         }
     }
@@ -600,7 +599,6 @@ pub fn init() {
     kdebug!("fdt", "boot_addr"; addr = crate::klog::hex64(boot_dtb));
     if let Some(fdt) = Fdt::parse(boot_dtb) {
         store_fdt(fdt);
-        select_platform();
         return;
     }
 
@@ -609,21 +607,9 @@ pub fn init() {
     if let Some(addr) = find_dtb() {
         if let Some(fdt) = Fdt::parse(addr) {
             store_fdt(fdt);
-            select_platform();
             return;
         }
     }
 
     kwarn!("fdt", "not_found");
-    // No FDT found - use compile-time default platform
-    crate::kernel::bus::use_default_platform();
-}
-
-/// Select platform based on FDT compatible string
-fn select_platform() {
-    if let Some(fdt) = get() {
-        crate::kernel::bus::select_platform_from_fdt(fdt);
-    } else {
-        crate::kernel::bus::use_default_platform();
-    }
 }

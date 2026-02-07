@@ -522,8 +522,6 @@ pub fn register_ecam_host(base: usize) {
 ///
 /// Returns the number of devices found.
 pub fn enumerate() -> usize {
-    use crate::kernel::bus::bus_config;
-
     let pci = match subsystem_mut() {
         Some(p) => p,
         None => return 0,
@@ -534,10 +532,12 @@ pub fn enumerate() -> usize {
         None => return 0,
     };
 
-    // Initialize BAR allocator from platform config
-    if let Some((base, end)) = bus_config().pcie_mmio_window() {
-        pci.bar_alloc.init(base, end);
+    // Initialize BAR allocator from platform-specific MMIO window
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        pci.bar_alloc.init(0x1000_0000, 0x3EFF_FFFF);
     }
+    // MT7988A uses firmware-assigned BARs (no kernel allocation needed)
 
     let mut count = 0;
 

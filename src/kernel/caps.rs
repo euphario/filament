@@ -32,6 +32,11 @@ impl Capabilities {
         Self::DMA.0 | Self::RAW_DEVICE.0
     );
 
+    /// Capabilities for probed (bus discovery)
+    pub const PROBED: Self = Self(
+        Self::IPC.0 | Self::MEMORY.0 | Self::BUS_CREATE.0
+    );
+
     // Individual capability bits
 
     /// Can use IPC (send/receive messages)
@@ -69,7 +74,8 @@ impl Capabilities {
 
     /// Can kill any process (except init)
     pub const KILL: Self = Self(1 << 11);
-    pub const RESERVED_12: Self = Self(1 << 12);
+    /// Can create bus controllers (probed only)
+    pub const BUS_CREATE: Self = Self(1 << 12);
     pub const RESERVED_13: Self = Self(1 << 13);
     pub const RESERVED_14: Self = Self(1 << 14);
     pub const RESERVED_15: Self = Self(1 << 15);

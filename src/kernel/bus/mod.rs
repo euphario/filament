@@ -48,27 +48,37 @@
 mod types;
 mod protocol;
 mod controller;
-mod config;
 mod hw_pcie;
 mod hw_usb;
-
-// Re-export platform config API
-#[allow(unused_imports)]
-pub use config::{BusConfig, bus_config, select_platform_from_fdt, use_default_platform, is_platform_selected};
 
 // Re-export for use by hw modules
 use super::hw_poll;
 
-pub use types::{BusType, BusInfo, DeviceInfo, bus_caps, device_flags};
+pub use types::{BusType, BusInfo, DeviceInfo, bus_caps};
 pub use protocol::StateChangeReason;
 pub use controller::BusController;
 
 use super::ipc::{ChannelId, Message};
 use super::process::Pid;
 use crate::{kinfo, kerror, print_direct};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum number of buses
 pub const MAX_BUSES: usize = 8;
+
+/// Once set, no more buses can be created via open(Bus)
+static BUS_CREATION_LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Lock bus creation permanently (called after probed exits)
+pub fn lock_bus_creation() {
+    BUS_CREATION_LOCKED.store(true, Ordering::SeqCst);
+    kinfo!("bus", "creation_locked");
+}
+
+/// Check if bus creation is locked
+pub fn is_bus_creation_locked() -> bool {
+    BUS_CREATION_LOCKED.load(Ordering::SeqCst)
+}
 
 // =============================================================================
 // Bus State Machine
@@ -274,6 +284,56 @@ pub fn with_bus_registry<R, F: FnOnce(&mut BusRegistry) -> R>(f: F) -> R {
 }
 
 // =============================================================================
+// Bus Creation (from userspace via probed)
+// =============================================================================
+
+/// Create a bus from userspace (called by probed via open(Bus))
+/// Returns Ok(()) on success
+pub fn create_bus(info: &abi::BusCreateInfo, kernel_pid: Pid) -> Result<(), BusError> {
+    if is_bus_creation_locked() {
+        return Err(BusError::NotClaimed); // Repurpose: creation locked
+    }
+
+    let bus_type = match info.bus_type {
+        abi::bus_type::PCIE => BusType::PCIe,
+        abi::bus_type::USB => BusType::Usb,
+        abi::bus_type::PLATFORM => BusType::Platform,
+        abi::bus_type::ETHERNET => BusType::Ethernet,
+        abi::bus_type::UART => BusType::Uart,
+        abi::bus_type::KLOG => BusType::Klog,
+        _ => return Err(BusError::InvalidMessage),
+    };
+
+    let ecam_based = (info.flags & abi::bus_create_flags::ECAM) != 0;
+
+    // Determine initial state: PCIe/USB need hardware reset, others start Safe
+    let initial_state = match bus_type {
+        BusType::PCIe | BusType::Usb => BusState::Resetting,
+        BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => BusState::Safe,
+    };
+
+    with_bus_registry(|registry| {
+        let bus = registry.add(bus_type, info.bus_index)
+            .ok_or(BusError::AlreadyClaimed)?;
+
+        bus.init_from_create_info(info.base_addr, info.size, info.irq, ecam_based);
+        bus.set_initial_state(initial_state);
+        let _ = bus.register_port(kernel_pid);
+
+        kinfo!("bus", "created"; name = bus.port_name_str(),
+            state = initial_state.as_str(),
+            base = crate::klog::hex64(info.base_addr));
+
+        // For ECAM PCIe: register the host controller
+        if bus_type == BusType::PCIe && ecam_based && info.base_addr != 0 {
+            crate::kernel::pci::register_ecam_host(info.base_addr as usize);
+        }
+
+        Ok(())
+    })
+}
+
+// =============================================================================
 // Initialization
 // =============================================================================
 
@@ -282,19 +342,12 @@ fn uptime_ms() -> u64 {
     crate::platform::current::timer::now_ns() / 1_000_000
 }
 
-/// Initialize bus controllers for MT7988A
-/// Called during kernel early boot
-///
-/// This function:
-/// 1. Creates bus controllers for each PCIe/USB port
-/// 2. Sets buses to Resetting state (actual reset deferred)
-/// 3. Registers control ports for devd to connect
-///
-/// Hardware reset is deferred - call complete_init() after devd can run,
-/// or let buses reset async. devd handles any state and waits for Safe.
-pub fn init(kernel_pid: Pid) {
-    // Call platform-specific bus registration
-    crate::platform::current::bus::register_buses(kernel_pid);
+/// Initialize bus registry
+/// Called during kernel early boot to set up the empty registry.
+/// Buses are created later by probed (userspace) via open(Bus) syscall.
+pub fn init(_kernel_pid: Pid) {
+    // Registry is statically initialized. Nothing to do here.
+    // Buses will be created by probed via create_bus().
 }
 
 /// Continue bus initialization work (called from timer interrupt)
@@ -457,21 +510,10 @@ pub fn get_bus_count() -> usize {
 // Unified Device List
 // =============================================================================
 
-/// Platform device definitions for MT7988
-/// Naming: chipset:instance (e.g., ns16550:0, xhci:0)
-/// These are static devices from DTB/hardcoded
-static PLATFORM_DEVICES: &[DeviceInfo] = &[
-    // UART0 - 16550-compatible debug console
-    DeviceInfo {
-        name: *b"ns16550:0\0\0\0\0\0\0\0",
-        name_len: 9,
-        flags: device_flags::MMIO | device_flags::IRQ,
-        irq: 155,  // SPI 123 + 32
-        base_addr: 0x1100_0000,
-        size: 0x1000,
-        _reserved: [0; 4],
-    },
-];
+/// Platform device definitions
+/// Now empty — all buses and devices are registered by probed.
+/// Bus controllers report their own DeviceInfo via to_device_info().
+static PLATFORM_DEVICES: &[DeviceInfo] = &[];
 
 /// Get unified list of all devices (platform + bus controllers)
 /// Returns number of devices written to buffer

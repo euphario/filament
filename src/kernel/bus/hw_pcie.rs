@@ -1,28 +1,18 @@
 //! PCIe Hardware Constants and Operations
 //!
 //! This module contains PCIe MAC operations including clock gate control,
-//! reset control, and bus mastering. Base addresses come from the platform
-//! configuration (selected at boot based on DTB).
+//! reset control, and bus mastering. Base addresses are stored per-bus
+//! in BusController (set by probed via open(Bus) syscall).
 
 use crate::arch::aarch64::mmio::{MmioRegion, delay_us, dsb};
-use super::config::bus_config;
 
-/// Get PCIe MAC base address for a port (from platform config)
-#[inline]
-fn mac_base(index: usize) -> Option<usize> {
-    bus_config().pcie_base(index)
-}
-
-/// Get number of PCIe ports (from platform config)
-#[inline]
-pub fn port_count() -> usize {
-    bus_config().pcie_port_count()
-}
-
-/// Get INFRACFG_AO base address (from platform config)
+/// Get INFRACFG_AO base address (platform-specific constant)
 #[inline]
 fn infracfg_base() -> usize {
-    bus_config().infracfg_base
+    #[cfg(feature = "platform-mt7988a")]
+    { 0x1000_1000 }
+    #[cfg(not(feature = "platform-mt7988a"))]
+    { 0 } // No INFRACFG on QEMU
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -199,9 +189,9 @@ pub fn disable_clocks(index: usize) {
 ///
 /// device_id format: (bus << 8) | (dev << 3) | func
 /// For root port devices, this is typically 0x0000
-pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<(), super::BusError> {
+pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool, ecam_based: bool, mac_base_addr: u64) -> Result<(), super::BusError> {
     // ECAM-based platforms (QEMU): set bus mastering via kernel PCI subsystem
-    if bus_config().is_pcie_ecam_based() {
+    if ecam_based {
         use crate::kernel::pci::{self, PciBdf};
         let bdf = PciBdf::from_u32(device_id as u32);
         let cmd_status = pci::config_read32(bdf, 0x04).map_err(|_| super::BusError::HardwareError)?;
@@ -216,10 +206,10 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<
         return Ok(());
     }
 
-    let index = bus_index as usize;
-    let Some(base) = mac_base(index) else {
+    let base = mac_base_addr as usize;
+    if base == 0 {
         return Err(super::BusError::NotFound);
-    };
+    }
     let cfg_base = base + CFG_OFFSET;
     let cfg = MmioRegion::new(cfg_base);
 
@@ -259,7 +249,7 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<
         // Verify
         let verify = cfg.read16(cmd_offset);
         if (verify & CMD_BUS_MASTER != 0) != enable {
-            crate::kerror!("bus", "pcie_bm_verify_failed"; index = index as u64, cmd = verify as u64);
+            crate::kerror!("bus", "pcie_bm_verify_failed"; index = bus_index as u64, cmd = verify as u64);
             return Err(super::BusError::HardwareError);
         }
     }
@@ -268,9 +258,9 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool) -> Result<
 }
 
 /// Disable bus mastering for ALL devices on a PCIe port
-pub fn disable_all_bus_mastering(bus_index: u8) {
+pub fn disable_all_bus_mastering(bus_index: u8, ecam_based: bool, mac_base_addr: u64) {
     // ECAM-based platforms (QEMU): disable via kernel PCI subsystem for all known devices
-    if bus_config().is_pcie_ecam_based() {
+    if ecam_based {
         use crate::kernel::pci;
         pci::with_devices(|registry| {
             for i in 0..registry.len() {
@@ -278,35 +268,35 @@ pub fn disable_all_bus_mastering(bus_index: u8) {
                     let device_id = ((dev.bdf.bus as u16) << 8)
                         | ((dev.bdf.device as u16) << 3)
                         | (dev.bdf.function as u16);
-                    let _ = set_bus_mastering(bus_index, device_id, false);
+                    let _ = set_bus_mastering(bus_index, device_id, false, ecam_based, mac_base_addr);
                 }
             }
         });
         return;
     }
 
-    let index = bus_index as usize;
-    if mac_base(index).is_none() {
+    if mac_base_addr == 0 {
         return;
     }
 
     // Disable on root port (device 0)
-    let _ = set_bus_mastering(bus_index, 0x0000, false);
+    let _ = set_bus_mastering(bus_index, 0x0000, false, ecam_based, mac_base_addr);
 
     // Disable on first device behind root port (bus 1, device 0)
-    let _ = set_bus_mastering(bus_index, 0x0100, false);
+    let _ = set_bus_mastering(bus_index, 0x0100, false, ecam_based, mac_base_addr);
 }
 
 /// Verify PCIe link is in expected state after reset
-pub fn verify_link(index: usize) -> bool {
+pub fn verify_link(index: usize, ecam_based: bool, mac_base_addr: u64) -> bool {
     // ECAM-based platforms (QEMU): always assume valid
-    if bus_config().is_pcie_ecam_based() {
+    if ecam_based {
         return true;
     }
 
-    let Some(base) = mac_base(index) else {
+    let base = mac_base_addr as usize;
+    if base == 0 {
         return false;
-    };
+    }
     let mac = MmioRegion::new(base);
 
     // Check reset control is deasserted
@@ -320,7 +310,7 @@ pub fn verify_link(index: usize) -> bool {
 }
 
 /// Query PCIe-specific capabilities by reading hardware registers
-pub fn query_capabilities(bus_index: u8) -> u8 {
+pub fn query_capabilities(_bus_index: u8, ecam_based: bool, mac_base_addr: u64) -> u8 {
     use super::bus_caps;
     let mut caps = 0u8;
 
@@ -329,13 +319,14 @@ pub fn query_capabilities(bus_index: u8) -> u8 {
     caps |= bus_caps::PCIE_MSI;
 
     // ECAM-based platforms (QEMU): can't read MAC registers, assume link up
-    if bus_config().is_pcie_ecam_based() {
+    if ecam_based {
         caps |= bus_caps::PCIE_LINK_UP;
         return caps;
     }
 
     // MAC-based platforms (MT7988): check if link is up by reading LTSSM state
-    if let Some(base) = mac_base(bus_index as usize) {
+    let base = mac_base_addr as usize;
+    if base != 0 {
         let mmio = MmioRegion::new(base);
 
         // Read K_CNT_APPL register (offset 0x104C) for LTSSM state

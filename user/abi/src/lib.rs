@@ -95,6 +95,8 @@ pub enum ObjectType {
     BusList = 15,
     /// Ring buffer IPC (high-performance typed messages)
     Ring = 16,
+    /// Bus creation (probed only)
+    Bus = 17,
 }
 
 impl ObjectType {
@@ -117,6 +119,7 @@ impl ObjectType {
             14 => Some(ObjectType::Msi),
             15 => Some(ObjectType::BusList),
             16 => Some(ObjectType::Ring),
+            17 => Some(ObjectType::Bus),
             _ => None,
         }
     }
@@ -924,6 +927,52 @@ pub mod bus_type {
     pub const UART: u8 = 4;
     /// Kernel log (klog)
     pub const KLOG: u8 = 5;
+}
+
+/// Bus creation info passed to open(Bus)
+/// Used by probed to register buses at boot
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BusCreateInfo {
+    /// Bus type (bus_type::PCIE, USB, etc.)
+    pub bus_type: u8,
+    /// Bus index within type (0, 1, 2...)
+    pub bus_index: u8,
+    /// Flags: bit 0 = ECAM-based PCIe
+    pub flags: u8,
+    /// Padding
+    pub _pad: u8,
+    /// MMIO base address
+    pub base_addr: u64,
+    /// MMIO region size
+    pub size: u64,
+    /// Primary IRQ number
+    pub irq: u32,
+    /// Reserved
+    pub _reserved: [u8; 4],
+}
+
+const _: () = assert!(core::mem::size_of::<BusCreateInfo>() == 32);
+
+impl BusCreateInfo {
+    pub const fn new(bus_type: u8, bus_index: u8) -> Self {
+        Self {
+            bus_type,
+            bus_index,
+            flags: 0,
+            _pad: 0,
+            base_addr: 0,
+            size: 0,
+            irq: 0,
+            _reserved: [0; 4],
+        }
+    }
+}
+
+/// BusCreateInfo flag constants
+pub mod bus_create_flags {
+    /// PCIe uses ECAM config space (vs MAC-based)
+    pub const ECAM: u8 = 1 << 0;
 }
 
 /// Bus state constants for BusInfo

@@ -20,6 +20,11 @@ use crate::kinfo;
 use super::{TaskId, Scheduler, MAX_TASKS};
 use crate::kernel::ipc::{waker, traits::WakeReason};
 
+/// Flag set when probed exits — checked by exit handler to spawn devd
+#[no_mangle]
+pub static PROBED_EXITED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Result of wait_child operation
 #[derive(Debug, Clone, Copy)]
 pub enum WaitResult {
@@ -66,7 +71,7 @@ pub enum LifecycleError {
 pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), LifecycleError> {
     let slot = sched.slot_by_pid(task_id).ok_or(LifecycleError::NotFound)?;
 
-    let parent_id = {
+    let (parent_id, was_probed) = {
         let task = sched.tasks[slot].as_mut().ok_or(LifecycleError::NotFound)?;
 
         // Transition state via state machine
@@ -78,18 +83,28 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<(), Lif
             return Err(LifecycleError::InvalidState);
         }
 
-
         // Clear is_init flag so new devd can be init
         task.is_init = false;
 
+        // Detect probed exit — trigger bus creation lock and devd spawn
+        let probed = task.is_probed;
+        if probed {
+            task.is_probed = false;
+        }
+
         kinfo!("lifecycle", "exit"; pid = task_id, code = code as i64);
 
-        task.parent_id
+        (task.parent_id, probed)
     };
 
     // Notify parent (outside of task borrow)
     if parent_id != 0 {
         notify_parent_of_exit(sched, parent_id, task_id, code);
+    }
+
+    // If probed just exited, lock bus creation and spawn devd
+    if was_probed {
+        handle_probed_exit(sched);
     }
 
     Ok(())
@@ -324,6 +339,59 @@ fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, chil
 
     sched.bump_generation(child_slot);
     sched.tasks[child_slot] = None;
+}
+
+/// Handle probed exit: lock bus creation, set flag for deferred devd spawn
+///
+/// Called from lifecycle::exit() when the probed process exits.
+/// At this point the scheduler lock is held by the caller, so we can't
+/// spawn devd here (spawn_from_path needs the scheduler lock).
+/// Instead we set PROBED_EXITED flag and handle devd spawn after lock release.
+fn handle_probed_exit(_sched: &mut Scheduler) {
+    use crate::kernel::bus;
+
+    kinfo!("lifecycle", "probed_exit"; action = "lock_bus_creation");
+
+    // 1. Lock bus creation permanently
+    bus::lock_bus_creation();
+
+    // 2. Run hardware reset sequences for buses that need it (PCIe, USB)
+    while bus::continue_init() {}
+
+    // 3. Set flag — devd will be spawned after scheduler lock is released
+    PROBED_EXITED.store(true, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Complete probed exit: spawn devd
+/// Must be called OUTSIDE the scheduler lock.
+pub fn complete_probed_exit() {
+    use crate::kernel::elf;
+    use crate::kernel::caps::Capabilities;
+
+    if !PROBED_EXITED.swap(false, core::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    kinfo!("lifecycle", "probed_exit"; action = "spawning_devd");
+    match elf::spawn_from_path("bin/devd") {
+        Ok((_task_id, slot)) => {
+            super::with_scheduler(|sched| {
+                if let Some(task) = sched.task_mut(slot) {
+                    task.set_capabilities(Capabilities::ALL);
+                    task.set_priority(super::Priority::High);
+                    task.is_init = true;
+                }
+            });
+            kinfo!("lifecycle", "devd_spawned"; slot = slot as u64);
+        }
+        Err(_e) => {
+            // Fatal: can't spawn devd
+            crate::print_str_uart("FATAL: probed_exit: cannot spawn devd\r\n");
+            loop {
+                unsafe { core::arch::asm!("wfe"); }
+            }
+        }
+    }
 }
 
 // ============================================================================

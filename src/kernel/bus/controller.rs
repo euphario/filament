@@ -169,6 +169,15 @@ pub struct BusController {
 
     /// Hardware verified after reset
     pub hardware_verified: bool,
+
+    /// MMIO base address (from probed)
+    pub base_addr: u64,
+    /// MMIO region size
+    pub size: u64,
+    /// Primary IRQ number
+    pub irq: u32,
+    /// ECAM-based PCIe (vs MAC-based)
+    pub ecam_based: bool,
 }
 
 impl BusController {
@@ -195,6 +204,10 @@ impl BusController {
             device_count: 0,
             bus_master_enabled: false,
             hardware_verified: false,
+            base_addr: 0,
+            size: 0,
+            irq: 0,
+            ecam_based: false,
         }
     }
 
@@ -230,6 +243,14 @@ impl BusController {
         self.port_name_len = pos;
     }
 
+    /// Initialize hardware fields from BusCreateInfo
+    pub fn init_from_create_info(&mut self, base_addr: u64, size: u64, irq: u32, ecam_based: bool) {
+        self.base_addr = base_addr;
+        self.size = size;
+        self.irq = irq;
+        self.ecam_based = ecam_based;
+    }
+
     /// Get port name as string
     pub fn port_name_str(&self) -> &str {
         core::str::from_utf8(&self.port_name[..self.port_name_len]).unwrap_or("???")
@@ -245,23 +266,12 @@ impl BusController {
 
     /// Convert to BusInfo for syscall
     pub fn to_info(&self) -> BusInfo {
-        let config = super::config::bus_config();
-        let base_addr = match self.bus_type {
-            BusType::PCIe => {
-                config.pcie_base(self.bus_index as usize).unwrap_or(0) as u32
-            }
-            BusType::Usb => {
-                config.usb_base(self.bus_index as usize).unwrap_or(0) as u32
-            }
-            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => 0, // No hardware base
-        };
-
         let mut info = BusInfo {
             bus_type: self.bus_type as u8,
             bus_index: self.bus_index,
             state: self.state as u8,
             _pad: 0,
-            base_addr,
+            base_addr: self.base_addr as u32,
             owner_pid: self.owner_pid.unwrap_or(0),
             path: [0; 32],
             path_len: self.port_name_len as u8,
@@ -278,25 +288,6 @@ impl BusController {
     /// Convert to DeviceInfo for unified device list
     /// Uses chipset:instance naming (e.g., "mt7988-pcie:0", "xhci:0")
     pub fn to_device_info(&self) -> DeviceInfo {
-        let config = super::config::bus_config();
-        let (base_addr, size) = match self.bus_type {
-            BusType::PCIe => {
-                if let Some(base) = config.pcie_base(self.bus_index as usize) {
-                    (base as u64, 0x10000)
-                } else {
-                    (0, 0)
-                }
-            }
-            BusType::Usb => {
-                if let Some(base) = config.usb_base(self.bus_index as usize) {
-                    (base as u64, 0x10000)
-                } else {
-                    (0, 0)
-                }
-            }
-            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => (0, 0),
-        };
-
         // Build device name: "mt7988-pcie:0", "xhci:0", etc.
         let mut name = [0u8; 16];
         let mut pos = 0;
@@ -323,9 +314,9 @@ impl BusController {
             name,
             name_len: pos as u8,
             flags: device_flags::ENUMERABLE | device_flags::MMIO,
-            irq: 0,  // Bus controllers don't have a single IRQ
-            base_addr,
-            size,
+            irq: self.irq as u16,
+            base_addr: self.base_addr,
+            size: self.size as u32,
             _reserved: [0; 4],
         }
     }
@@ -334,8 +325,8 @@ impl BusController {
     /// Returns a bitmask of bus_caps flags appropriate for the bus type
     pub fn query_capabilities(&self) -> u8 {
         match self.bus_type {
-            BusType::PCIe => hw_pcie::query_capabilities(self.bus_index),
-            BusType::Usb => hw_usb::query_capabilities(self.bus_index),
+            BusType::PCIe => hw_pcie::query_capabilities(self.bus_index, self.ecam_based, self.base_addr),
+            BusType::Usb => hw_usb::query_capabilities(self.bus_index, self.base_addr),
             BusType::Platform | BusType::Ethernet => bus_caps::PLATFORM_MMIO | bus_caps::PLATFORM_IRQ,
             BusType::Uart | BusType::Klog => 0, // No hardware capabilities to report
         }
@@ -466,8 +457,8 @@ impl BusController {
     fn disable_all_bus_mastering(&mut self) {
         // First, disable at hardware level
         match self.bus_type {
-            BusType::PCIe => hw_pcie::disable_all_bus_mastering(self.bus_index),
-            BusType::Usb => { let _ = hw_usb::force_halt(self.bus_index); }
+            BusType::PCIe => hw_pcie::disable_all_bus_mastering(self.bus_index, self.ecam_based, self.base_addr),
+            BusType::Usb => { let _ = hw_usb::force_halt(self.bus_index, self.base_addr); }
             BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => {
                 // No bus mastering to disable
             }
@@ -660,19 +651,18 @@ impl BusController {
         use crate::klog;
 
         let index = self.bus_index as usize;
-        let config = super::config::bus_config();
 
         // ECAM-based platforms (QEMU virt): no hardware reset needed
-        // The hypervisor manages PCIe state, we just need to register the bus
-        if config.is_pcie_ecam_based() {
+        if self.ecam_based {
             kinfo!("bus", "pcie_ecam_mode"; port = index as u64);
             self.hardware_verified = true;
             return;
         }
 
         // MAC-based platforms (MT7988): full hardware reset sequence
-        let Some(mac_base) = config.pcie_base(index) else {
-            kerror!("bus", "pcie_invalid_index"; index = index as u64);
+        let mac_base = self.base_addr as usize;
+        if mac_base == 0 {
+            kerror!("bus", "pcie_invalid_base"; index = index as u64);
             self.hardware_verified = false;
             return;
         };
@@ -702,7 +692,7 @@ impl BusController {
 
     /// USB/xHCI hardware reset sequence
     fn usb_reset_sequence(&mut self) {
-        let (verified, u3_count, u2_count) = hw_usb::reset_sequence(self.bus_index);
+        let (verified, u3_count, u2_count) = hw_usb::reset_sequence(self.bus_index, self.base_addr);
         self.hardware_verified = verified;
 
         if verified {
@@ -712,7 +702,7 @@ impl BusController {
         }
 
         // Power down to safe state
-        hw_usb::power_down(self.bus_index);
+        hw_usb::power_down(self.bus_index, self.base_addr);
     }
 
     /// Handle a control message from devd
@@ -816,8 +806,8 @@ impl BusController {
 
         // Actually write to hardware
         let hw_result = match self.bus_type {
-            BusType::PCIe => hw_pcie::set_bus_mastering(self.bus_index, device_id, true),
-            BusType::Usb => hw_usb::set_dma_allowed(self.bus_index, device_id, true),
+            BusType::PCIe => hw_pcie::set_bus_mastering(self.bus_index, device_id, true, self.ecam_based, self.base_addr),
+            BusType::Usb => hw_usb::set_dma_allowed(self.bus_index, device_id, true, self.base_addr),
             BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => Ok(()), // No bus mastering control
         };
 
@@ -841,8 +831,8 @@ impl BusController {
         {
             // Actually write to hardware
             let hw_result = match self.bus_type {
-                BusType::PCIe => hw_pcie::set_bus_mastering(self.bus_index, device_id, false),
-                BusType::Usb => hw_usb::set_dma_allowed(self.bus_index, device_id, false),
+                BusType::PCIe => hw_pcie::set_bus_mastering(self.bus_index, device_id, false, self.ecam_based, self.base_addr),
+                BusType::Usb => hw_usb::set_dma_allowed(self.bus_index, device_id, false, self.base_addr),
                 BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => Ok(()), // No bus mastering control
             };
 

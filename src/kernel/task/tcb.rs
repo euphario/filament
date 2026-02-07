@@ -206,6 +206,8 @@ pub struct Task {
     pub(crate) address_space: Option<AddressSpace>,
     /// Is this the init process (devd)?
     pub(crate) is_init: bool,
+    /// Is this the probed process (boot-time bus discovery)?
+    pub is_probed: bool,
     /// Task name for debugging
     pub(crate) name: [u8; 16],
     /// Heap mappings for mmap/munmap tracking
@@ -340,6 +342,7 @@ impl Task {
             address_space: None,
             is_user: false,
             is_init: false,
+            is_probed: false,
             name: task_name,
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
@@ -394,6 +397,7 @@ impl Task {
             address_space: None,
             is_user: false,
             is_init: false,
+            is_probed: false,
             name: *b"idle\0\0\0\0\0\0\0\0\0\0\0\0",
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
@@ -467,6 +471,7 @@ impl Task {
             address_space: Some(address_space),
             is_user: true,
             is_init: false,
+            is_probed: false,
             name: task_name,
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,

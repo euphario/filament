@@ -74,6 +74,7 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         ObjectType::Msi => open_msi(params_ptr, params_len),
         ObjectType::BusList => open_bus_list(params_ptr, params_len),
         ObjectType::Ring => open_ring(params_ptr, params_len),
+        ObjectType::Bus => open_bus_create(params_ptr, params_len),
     }
 }
 
@@ -806,6 +807,42 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
     match object_service().open_msi(task_id, bdf, first_irq, count) {
         Ok(handle) => handle.raw() as i64,
         Err(e) => e.to_errno(),
+    }
+}
+
+fn open_bus_create(params_ptr: u64, params_len: usize) -> i64 {
+    use crate::kernel::bus;
+    use crate::kernel::caps;
+
+    if params_len != core::mem::size_of::<abi::BusCreateInfo>() {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    // Check caller has CAP_BUS_CREATE
+    let has_cap = task::with_scheduler(|sched| {
+        let slot = task::current_slot();
+        sched.task(slot).map(|t| t.has_capability(caps::Capabilities::BUS_CREATE)).unwrap_or(false)
+    });
+    if !has_cap {
+        return KernelError::PermDenied.to_errno();
+    }
+
+    // Check bus creation is not locked
+    if bus::is_bus_creation_locked() {
+        return KernelError::PermDenied.to_errno();
+    }
+
+    // Copy BusCreateInfo from user memory
+    let mut info_bytes = [0u8; 32];
+    if uaccess::copy_from_user(&mut info_bytes, params_ptr).is_err() {
+        return KernelError::BadAddress.to_errno();
+    }
+    let info = unsafe { &*(info_bytes.as_ptr() as *const abi::BusCreateInfo) };
+
+    // Create the bus (kernel_pid = 0 for kernel-owned ports)
+    match bus::create_bus(info, 0) {
+        Ok(()) => 0, // Success, no handle returned
+        Err(e) => e.to_errno() as i64,
     }
 }
 

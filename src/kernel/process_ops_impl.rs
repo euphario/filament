@@ -37,6 +37,9 @@ impl ProcessOps for KernelProcessOps {
             }
         });
 
+        // If probed just exited, spawn devd now (scheduler lock is released)
+        lifecycle::complete_probed_exit();
+
         // Reschedule — properly handles tasks needing full context restore
         crate::kernel::sched::reschedule();
 
