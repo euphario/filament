@@ -2137,6 +2137,26 @@ impl Devd {
         // Send response with correct msg_type
         self.send_set_port_state_response(slot, seq_id, result_code);
 
+        // When a port goes back to Initialize, the service spawned for it is gone.
+        // Mark it as Stopped so the spawn rule can fire on the next Ready.
+        if result_code == error::OK && new_state == abi::PortState::Initialize {
+            if let Some(info) = port_info {
+                if let Some(rule) = rules::find_port_rule(&info) {
+                    if let Some(idx) = self.services.find_by_name(rule.driver) {
+                        if let Some(svc) = self.services.get_mut(idx) {
+                            if svc.state.is_running() {
+                                uinfo!("devd", "service_stopped_by_port";
+                                    service = rule.driver,
+                                    pid = svc.pid
+                                );
+                                svc.state = service::ServiceState::Stopped { code: 0 };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Check rules on transition to Ready
         if result_code == error::OK
             && new_state == abi::PortState::Ready
@@ -2838,9 +2858,11 @@ impl Devd {
             None => return,
         };
 
-        // Don't spawn if driver already exists (singleton idempotency)
-        if self.services.find_by_name(rule.driver).is_some() {
-            return;
+        // Don't spawn if driver already exists — unless previous instance exited
+        if let Some(idx) = self.services.find_by_name(rule.driver) {
+            if !self.services.get(idx).map(|s| s.state.is_exited()).unwrap_or(false) {
+                return;
+            }
         }
 
         let port_name = port_info.name_bytes();

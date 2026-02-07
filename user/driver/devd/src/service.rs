@@ -72,6 +72,11 @@ impl ServiceState {
         matches!(self, ServiceState::Stopped { .. } | ServiceState::Failed { .. })
     }
 
+    /// Service exited and can be respawned (Stopped, Crashed, or Failed)
+    pub fn is_exited(&self) -> bool {
+        matches!(self, ServiceState::Stopped { .. } | ServiceState::Crashed { .. } | ServiceState::Failed { .. })
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             ServiceState::Pending => "pending",

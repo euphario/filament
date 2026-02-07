@@ -226,6 +226,9 @@ impl WaitQueue {
         }
     }
 
+    /// Number of active waiters (debug).
+    pub fn waiter_count(&self) -> u8 { self.count }
+
     /// Add a waiter. Returns true if added, false if queue is full.
     ///
     /// If the task is already subscribed, updates the filter instead
@@ -271,11 +274,17 @@ impl WaitQueue {
     ///
     /// Called when an object becomes ready. Returns a WakeList for waking
     /// outside locks.
+    ///
+    /// Terminal events (CLOSED, ERROR) always wake all subscribers regardless
+    /// of their registered filter — like Linux EPOLLHUP/EPOLLERR. A closed
+    /// channel IS readable (returns PeerClosed/EOF) and writable (returns
+    /// PeerClosed immediately), so any subscriber must be notified.
     pub fn wake(&mut self, event: u8) -> crate::kernel::ipc::waker::WakeList {
         let mut list = crate::kernel::ipc::waker::WakeList::new();
+        let terminal = (event & (abi::mux_filter::CLOSED | abi::mux_filter::ERROR)) != 0;
         for slot in self.waiters.iter_mut() {
             if let Some(w) = slot {
-                if (w.filter & event) != 0 {
+                if terminal || (w.filter & event) != 0 {
                     list.push(w.to_subscriber());
                     *slot = None;
                     self.count = self.count.saturating_sub(1);

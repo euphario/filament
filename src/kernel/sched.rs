@@ -195,8 +195,12 @@ fn reschedule_inner(block: BlockReason) -> bool {
         // pending_stack_release after context_switch saves the context.
 
         // Find next task to run (from-task NOT on ready bitset)
+        let caller_state_name = sched.task(caller_slot).map(|t| t.state().name()).unwrap_or("none");
         let next_slot = match sched.schedule() {
-            Some(slot) if slot != caller_slot => slot,
+            Some(slot) if slot != caller_slot => {
+                kdebug!("resched", "pick"; from = caller_slot as u64, to = slot as u64);
+                slot
+            }
             Some(_) => {
                 // Same task selected — keep running (task is still Running, no undo needed)
                 return false;
@@ -206,18 +210,27 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 let blocked = sched.task(caller_slot)
                     .map(|t| t.is_blocked()).unwrap_or(false);
                 if !blocked {
-                    // Not blocked — keep running. May be Ready if woken between
-                    // sleep_current/wait_current and this reschedule call. Fix up.
-                    if let Some(t) = sched.task_mut(caller_slot) {
-                        if *t.state() == TaskState::Ready {
-                            t.clear_kernel_stack_owner();
-                            crate::transition_or_evict!(t, set_running, cpu);
+                    let terminated = sched.task(caller_slot)
+                        .map(|t| t.is_terminated()).unwrap_or(false);
+                    if terminated {
+                        // BUG: Exiting task with nothing ready — must go to idle, not keep running!
+                        kerror!("resched", "terminated_no_ready"; slot = caller_slot as u64, state = caller_state_name);
+                        idle_slot_for_cpu(percpu::cpu_id())
+                    } else {
+                        // Not blocked — keep running. May be Ready if woken between
+                        // sleep_current/wait_current and this reschedule call. Fix up.
+                        if let Some(t) = sched.task_mut(caller_slot) {
+                            if *t.state() == TaskState::Ready {
+                                t.clear_kernel_stack_owner();
+                                crate::transition_or_evict!(t, set_running, cpu);
+                            }
                         }
+                        return false;
                     }
-                    return false;
+                } else {
+                    // Blocked and nothing ready — go to this CPU's idle
+                    idle_slot_for_cpu(percpu::cpu_id())
                 }
-                // Blocked and nothing ready — go to this CPU's idle
-                idle_slot_for_cpu(percpu::cpu_id())
             }
         };
 
