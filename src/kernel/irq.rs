@@ -48,7 +48,7 @@ pub const MAX_IRQ_REGISTRATIONS: usize = 32;
 
 /// Global IRQ registration table (protected by SpinLock)
 static IRQ_TABLE: super::lock::SpinLock<[IrqRegistration; MAX_IRQ_REGISTRATIONS]> =
-    super::lock::SpinLock::new([IrqRegistration::empty(); MAX_IRQ_REGISTRATIONS]);
+    super::lock::SpinLock::new(super::lock::lock_class::SUBSYSTEM, [IrqRegistration::empty(); MAX_IRQ_REGISTRATIONS]);
 
 /// Execute a closure with exclusive access to the IRQ table
 #[inline]

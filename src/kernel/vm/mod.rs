@@ -42,7 +42,7 @@ use object::VmObjectSlot;
 pub const MAX_VM_OBJECTS: usize = 256;
 
 /// Global VmObject registry
-static VM_OBJECTS: SpinLock<VmObjectRegistry> = SpinLock::new(VmObjectRegistry::new());
+static VM_OBJECTS: SpinLock<VmObjectRegistry> = SpinLock::new(crate::kernel::lock::lock_class::RESOURCE, VmObjectRegistry::new());
 
 /// Registry for all VmObjects in the system
 pub struct VmObjectRegistry {

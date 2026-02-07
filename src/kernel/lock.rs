@@ -12,7 +12,7 @@
 //! ## Usage
 //!
 //! ```rust
-//! static DATA: SpinLock<MyData> = SpinLock::new(MyData::new());
+//! static DATA: SpinLock<MyData> = SpinLock::new(lock_class::RESOURCE, MyData::new());
 //!
 //! fn access_data() {
 //!     let mut guard = DATA.lock();
@@ -24,14 +24,43 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+// ============================================================================
+// Lock Ordering Classes
+// ============================================================================
+
+/// Lock ordering classes for deadlock prevention.
+///
+/// Locks must be acquired in strictly increasing class order.
+/// Gaps between values allow inserting new classes without renumbering.
+///
+/// ## Ordering (outermost → innermost)
+///
+/// ```text
+/// SCHEDULER(10) → OBJ_SERVICE(20) → SUBSYSTEM(30) → RESOURCE(40)
+/// ```
+pub mod lock_class {
+    /// Skip ordering checks (test locks, one-off locks)
+    pub const UNORDERED: u8 = 0;
+    /// Scheduler lock — acquired first (outermost)
+    pub const SCHEDULER: u8 = 10;
+    /// ObjectService per-task table locks
+    pub const OBJ_SERVICE: u8 = 20;
+    /// Subsystem locks: CHANNEL_TABLE, PORT_REGISTRY, IRQ_TABLE, LOG_RING
+    pub const SUBSYSTEM: u8 = 30;
+    /// Resource locks: DMA_POOL, SHMEM, PMM, ASID_ALLOCATOR, VM_OBJECTS
+    pub const RESOURCE: u8 = 40;
+}
 
 // ============================================================================
-// Debug Statistics (for diagnosing lock contention)
+// Debug Statistics (for diagnosing lock contention + ordering enforcement)
 // ============================================================================
 
 #[cfg(debug_assertions)]
 mod stats {
     use super::*;
+
+    /// Maximum allowed lock nesting depth
+    pub const MAX_LOCK_DEPTH: usize = 8;
 
     /// Per-CPU lock nesting depth
     static LOCK_DEPTH: [AtomicU32; 4] = [
@@ -41,31 +70,71 @@ mod stats {
         AtomicU32::new(0),
     ];
 
-    /// Maximum allowed lock nesting depth
-    pub const MAX_LOCK_DEPTH: u32 = 8;
+    /// Per-CPU stack of held lock classes (for ordering enforcement)
+    /// Each CPU tracks which lock classes it currently holds.
+    static HELD_CLASSES: [[AtomicU32; MAX_LOCK_DEPTH]; 4] = [
+        [const { AtomicU32::new(0) }; MAX_LOCK_DEPTH],
+        [const { AtomicU32::new(0) }; MAX_LOCK_DEPTH],
+        [const { AtomicU32::new(0) }; MAX_LOCK_DEPTH],
+        [const { AtomicU32::new(0) }; MAX_LOCK_DEPTH],
+    ];
 
-    /// Increment lock depth, panic if too deep
-    pub fn increment_depth(cpu: u32) {
-        if (cpu as usize) < LOCK_DEPTH.len() {
-            let depth = LOCK_DEPTH[cpu as usize].fetch_add(1, Ordering::Relaxed) + 1;
-            if depth > MAX_LOCK_DEPTH {
+    /// Push lock class onto per-CPU stack, enforce ordering.
+    ///
+    /// Panics if:
+    /// - Nesting depth exceeds MAX_LOCK_DEPTH
+    /// - Class is <= the top of the stack (ordering violation), unless class == 0
+    pub fn increment_depth(cpu: u32, class: u8) {
+        let cpu_idx = cpu as usize;
+        if cpu_idx >= LOCK_DEPTH.len() {
+            return;
+        }
+        let depth = LOCK_DEPTH[cpu_idx].fetch_add(1, Ordering::Relaxed) as usize;
+        if depth >= MAX_LOCK_DEPTH {
+            panic!(
+                "Lock nesting too deep ({} >= {}) on CPU {} - possible deadlock",
+                depth + 1, MAX_LOCK_DEPTH, cpu
+            );
+        }
+
+        // Enforce ordering: new class must be > top of stack (unless UNORDERED)
+        if class != lock_class::UNORDERED && depth > 0 {
+            let top = HELD_CLASSES[cpu_idx][depth - 1].load(Ordering::Relaxed) as u8;
+            if top != lock_class::UNORDERED && class <= top {
                 panic!(
-                    "Lock nesting too deep ({} > {}) on CPU {} - possible deadlock or bad design",
-                    depth, MAX_LOCK_DEPTH, cpu
+                    "Lock ordering violation on CPU {}: acquiring class {} while holding class {} (depth {})",
+                    cpu, class, top, depth
                 );
             }
         }
+
+        // Push class onto stack
+        HELD_CLASSES[cpu_idx][depth].store(class as u32, Ordering::Relaxed);
     }
 
-    /// Decrement lock depth
-    pub fn decrement_depth(cpu: u32) {
-        if (cpu as usize) < LOCK_DEPTH.len() {
-            let old = LOCK_DEPTH[cpu as usize].fetch_sub(1, Ordering::Relaxed);
-            if old == 0 {
-                // This should never happen - indicates mismatched lock/unlock
-                panic!("Lock depth underflow on CPU {} - mismatched lock/unlock", cpu);
-            }
+    /// Pop lock class from per-CPU stack, verify it matches.
+    pub fn decrement_depth(cpu: u32, class: u8) {
+        let cpu_idx = cpu as usize;
+        if cpu_idx >= LOCK_DEPTH.len() {
+            return;
         }
+        let old_depth = LOCK_DEPTH[cpu_idx].fetch_sub(1, Ordering::Relaxed);
+        if old_depth == 0 {
+            panic!("Lock depth underflow on CPU {} - mismatched lock/unlock", cpu);
+        }
+        let depth = (old_depth - 1) as usize;
+
+        // Verify LIFO: the class being released must match the top of stack
+        let top = HELD_CLASSES[cpu_idx][depth].load(Ordering::Relaxed) as u8;
+        if top != class {
+            panic!(
+                "Lock release order violation on CPU {}: releasing class {} but top is class {} (depth {})",
+                cpu, class, top, depth
+            );
+        }
+
+        // Clear the stack slot
+        HELD_CLASSES[cpu_idx][depth].store(0, Ordering::Relaxed);
     }
 
     /// Get current lock depth for a CPU
@@ -99,6 +168,8 @@ pub struct SpinLock<T> {
     next_ticket: AtomicU32,
     now_serving: AtomicU32,
     data: UnsafeCell<T>,
+    /// Lock ordering class (always present, zero-cost in release — only checked in debug)
+    lock_class: u8,
     #[cfg(debug_assertions)]
     owner_cpu: AtomicU32,
 }
@@ -109,11 +180,16 @@ unsafe impl<T: Send> Send for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
     /// Create a new spinlock protecting the given data.
-    pub const fn new(data: T) -> Self {
+    ///
+    /// `class` is the lock ordering class (see `lock_class` module).
+    /// In debug builds, acquiring locks out of order panics.
+    /// Use `lock_class::UNORDERED` (0) to skip ordering checks.
+    pub const fn new(class: u8, data: T) -> Self {
         Self {
             next_ticket: AtomicU32::new(0),
             now_serving: AtomicU32::new(0),
             data: UnsafeCell::new(data),
+            lock_class: class,
             #[cfg(debug_assertions)]
             owner_cpu: AtomicU32::new(u32::MAX),
         }
@@ -151,7 +227,7 @@ impl<T> SpinLock<T> {
         #[cfg(debug_assertions)]
         {
             self.owner_cpu.store(cpu, Ordering::Relaxed);
-            stats::increment_depth(cpu);
+            stats::increment_depth(cpu, self.lock_class);
         }
 
         SpinLockGuard {
@@ -159,6 +235,8 @@ impl<T> SpinLock<T> {
             irqs_were_enabled,
             #[cfg(debug_assertions)]
             owner_cpu: cpu,
+            #[cfg(debug_assertions)]
+            lock_class: self.lock_class,
         }
     }
 
@@ -186,7 +264,7 @@ impl<T> SpinLock<T> {
         #[cfg(debug_assertions)]
         {
             self.owner_cpu.store(cpu, Ordering::Relaxed);
-            stats::increment_depth(cpu);
+            stats::increment_depth(cpu, self.lock_class);
         }
 
         Some(SpinLockGuard {
@@ -194,6 +272,8 @@ impl<T> SpinLock<T> {
             irqs_were_enabled,
             #[cfg(debug_assertions)]
             owner_cpu: cpu,
+            #[cfg(debug_assertions)]
+            lock_class: self.lock_class,
         })
     }
 
@@ -247,6 +327,8 @@ pub struct SpinLockGuard<'a, T> {
     irqs_were_enabled: bool,
     #[cfg(debug_assertions)]
     owner_cpu: u32,
+    #[cfg(debug_assertions)]
+    lock_class: u8,
 }
 
 impl<'a, T> Deref for SpinLockGuard<'a, T> {
@@ -273,7 +355,7 @@ impl<'a, T> Drop for SpinLockGuard<'a, T> {
         // Step 1: Update debug stats and clear owner
         #[cfg(debug_assertions)]
         {
-            stats::decrement_depth(self.owner_cpu);
+            stats::decrement_depth(self.owner_cpu, self.lock_class);
             self.lock.owner_cpu.store(u32::MAX, Ordering::Relaxed);
         }
 
@@ -483,7 +565,7 @@ pub fn test() {
 
     // Test 1: Basic SpinLock acquire/release
     {
-        static TEST_LOCK: SpinLock<u32> = SpinLock::new(42);
+        static TEST_LOCK: SpinLock<u32> = SpinLock::new(0, 42);
 
         let guard = TEST_LOCK.lock();
         assert_eq!(*guard, 42, "SpinLock initial value wrong");
@@ -495,7 +577,7 @@ pub fn test() {
 
     // Test 2: SpinLock mutation
     {
-        static COUNTER: SpinLock<u32> = SpinLock::new(0);
+        static COUNTER: SpinLock<u32> = SpinLock::new(0, 0);
 
         {
             let mut guard = COUNTER.lock();
@@ -514,7 +596,7 @@ pub fn test() {
 
     // Test 3: try_lock succeeds when unlocked
     {
-        static TRY_LOCK: SpinLock<u32> = SpinLock::new(100);
+        static TRY_LOCK: SpinLock<u32> = SpinLock::new(0, 100);
 
         let result = TRY_LOCK.try_lock();
         assert!(result.is_some(), "try_lock should succeed when unlocked");
@@ -525,7 +607,7 @@ pub fn test() {
     // Test 4: IRQ state preservation
     // This tests that IRQs are properly saved/restored
     {
-        static IRQ_TEST: SpinLock<u32> = SpinLock::new(0);
+        static IRQ_TEST: SpinLock<u32> = SpinLock::new(0, 0);
 
         // Get IRQ state before
         let daif_before: u64;
@@ -589,7 +671,7 @@ pub fn test() {
     // Test 8: Lock depth tracking (debug builds only)
     #[cfg(debug_assertions)]
     {
-        static DEPTH_TEST: SpinLock<u32> = SpinLock::new(0);
+        static DEPTH_TEST: SpinLock<u32> = SpinLock::new(0, 0);
 
         let depth_before = current_lock_depth();
         {
@@ -615,13 +697,13 @@ mod tests {
 
     #[test]
     fn test_spinlock_new() {
-        let lock: SpinLock<u32> = SpinLock::new(42);
+        let lock: SpinLock<u32> = SpinLock::new(0, 42);
         assert_eq!(*lock.lock(), 42);
     }
 
     #[test]
     fn test_spinlock_lock_unlock() {
-        let lock = SpinLock::new(0u32);
+        let lock = SpinLock::new(0, 0u32);
         {
             let mut guard = lock.lock();
             *guard = 100;
@@ -631,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_spinlock_try_lock() {
-        let lock = SpinLock::new(0u32);
+        let lock = SpinLock::new(0, 0u32);
 
         let guard = lock.try_lock();
         assert!(guard.is_some());
@@ -640,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_spinlock_multiple_access() {
-        let lock = SpinLock::new(0u32);
+        let lock = SpinLock::new(0, 0u32);
 
         {
             let mut g = lock.lock();
@@ -692,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_spinlock_const_new() {
-        static LOCK: SpinLock<u32> = SpinLock::new(999);
+        static LOCK: SpinLock<u32> = SpinLock::new(0, 999);
         assert_eq!(*LOCK.lock(), 999);
     }
 

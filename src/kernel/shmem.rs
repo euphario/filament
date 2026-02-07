@@ -411,7 +411,7 @@ impl ShmemState {
 }
 
 /// Global shared memory table protected by SpinLock (SMP-safe)
-static SHMEM: SpinLock<ShmemState> = SpinLock::new(ShmemState::new());
+static SHMEM: SpinLock<ShmemState> = SpinLock::new(crate::kernel::lock::lock_class::RESOURCE, ShmemState::new());
 
 /// Initialize shared memory subsystem
 pub fn init() {

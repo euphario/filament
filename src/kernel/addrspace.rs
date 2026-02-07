@@ -124,7 +124,7 @@ impl AsidAllocator {
 /// The SpinLock provides:
 /// - IRQ-safe access (disables interrupts while held)
 /// - SMP-safe access (atomic spinlock for multi-core)
-static ASID_ALLOCATOR: SpinLock<AsidAllocator> = SpinLock::new(AsidAllocator::new());
+static ASID_ALLOCATOR: SpinLock<AsidAllocator> = SpinLock::new(crate::kernel::lock::lock_class::RESOURCE, AsidAllocator::new());
 
 /// Allocate an ASID (thread-safe)
 fn alloc_asid() -> Option<u16> {

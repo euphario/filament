@@ -268,7 +268,7 @@ impl LogRing {
 // ============================================================================
 
 /// Global log ring buffer (protected by SpinLock for SMP safety)
-pub static LOG_RING: crate::kernel::lock::SpinLock<LogRing> = crate::kernel::lock::SpinLock::new(LogRing::new());
+pub static LOG_RING: crate::kernel::lock::SpinLock<LogRing> = crate::kernel::lock::SpinLock::new(crate::kernel::lock::lock_class::SUBSYSTEM, LogRing::new());
 
 /// Boot time in counter ticks
 static BOOT_TIME: AtomicU64 = AtomicU64::new(0);

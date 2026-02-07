@@ -67,10 +67,10 @@ impl DmaPool {
 }
 
 /// Global DMA pool (protected by spinlock) - for descriptors (< 4GB)
-static DMA_POOL: SpinLock<DmaPool> = SpinLock::new(DmaPool::new());
+static DMA_POOL: SpinLock<DmaPool> = SpinLock::new(crate::kernel::lock::lock_class::RESOURCE, DmaPool::new());
 
 /// Global high DMA pool (protected by spinlock) - for buffers (> 4GB, 36-bit)
-static DMA_POOL_HIGH: SpinLock<DmaPool> = SpinLock::new(DmaPool::new());
+static DMA_POOL_HIGH: SpinLock<DmaPool> = SpinLock::new(crate::kernel::lock::lock_class::RESOURCE, DmaPool::new());
 
 /// Initialize the DMA pool
 ///

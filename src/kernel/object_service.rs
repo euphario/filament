@@ -128,7 +128,7 @@ pub struct ObjectService {
 impl ObjectService {
     /// Create a new ObjectService with per-task locks
     pub const fn new() -> Self {
-        const LOCKED_NONE: SpinLock<Option<HandleTable>> = SpinLock::new(None);
+        const LOCKED_NONE: SpinLock<Option<HandleTable>> = SpinLock::new(crate::kernel::lock::lock_class::OBJ_SERVICE, None);
         Self {
             tables: [LOCKED_NONE; MAX_TASKS],
         }

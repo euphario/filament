@@ -245,7 +245,7 @@ pub fn test() {
     kdebug!("smp", "current_cpu"; cpu = cpu as u64);
 
     // Test kernel SpinLock (ticket lock from kernel::lock)
-    static TEST_LOCK: crate::kernel::lock::SpinLock<u32> = crate::kernel::lock::SpinLock::new(0);
+    static TEST_LOCK: crate::kernel::lock::SpinLock<u32> = crate::kernel::lock::SpinLock::new(0, 0);
 
     {
         let mut guard = TEST_LOCK.lock();

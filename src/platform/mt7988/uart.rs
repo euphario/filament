@@ -80,7 +80,7 @@ impl UartBuffer {
 }
 
 /// Global UART output buffer (SMP-safe)
-static UART_BUFFER: SpinLock<UartBuffer> = SpinLock::new(UartBuffer::new());
+static UART_BUFFER: SpinLock<UartBuffer> = SpinLock::new(0, UartBuffer::new());
 
 // ============================================================================
 // RX Ring Buffer for Input (IRQ-driven)
@@ -174,7 +174,7 @@ impl RxBuffer {
 }
 
 /// Global UART RX buffer (SMP-safe)
-static RX_BUFFER: SpinLock<RxBuffer> = SpinLock::new(RxBuffer::new());
+static RX_BUFFER: SpinLock<RxBuffer> = SpinLock::new(0, RxBuffer::new());
 
 /// RTS state - true means RTS is asserted (sender can send)
 static RTS_ASSERTED: core::sync::atomic::AtomicBool =
@@ -378,7 +378,7 @@ impl UartTrait for Uart {
 
 /// Global UART instance (SMP-safe)
 /// pub for macro access
-pub static UART: SpinLock<Uart> = SpinLock::new(Uart::new());
+pub static UART: SpinLock<Uart> = SpinLock::new(0, Uart::new());
 
 /// Initialize the global UART
 pub fn init() {

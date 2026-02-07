@@ -9,7 +9,121 @@ use crate::kernel::task::TaskId;
 // Import Handle from abi crate - single source of truth
 pub use abi::Handle;
 
-/// Maximum handles per task
+// ============================================================================
+// Handle Rights — per-handle capability scoping
+// ============================================================================
+
+/// Per-handle rights bitfield.
+///
+/// Each handle carries a set of rights that gate which syscalls can be
+/// performed through it. Rights can only be narrowed when delegating
+/// handles via IPC — never widened.
+///
+/// `close()` is always permitted (owner can always release their reference).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandleRights(u8);
+
+impl HandleRights {
+    /// Can call read() on this handle
+    pub const READ: Self = Self(1 << 0);
+    /// Can call write() on this handle
+    pub const WRITE: Self = Self(1 << 1);
+    /// Can call map() on this handle
+    pub const MAP: Self = Self(1 << 2);
+    /// Can delegate this handle to another task via IPC
+    pub const GRANT: Self = Self(1 << 3);
+    /// All rights
+    pub const ALL: Self = Self(0x0F);
+    /// No rights (close-only handle)
+    pub const NONE: Self = Self(0);
+
+    /// Check if this rights set includes a specific right
+    #[inline]
+    pub fn has(self, right: HandleRights) -> bool {
+        (self.0 & right.0) == right.0
+    }
+
+    /// Intersect two rights sets (used for delegation: sender_rights & handle_rights)
+    #[inline]
+    pub fn intersect(self, other: HandleRights) -> HandleRights {
+        HandleRights(self.0 & other.0)
+    }
+
+    /// Combine two rights sets
+    #[inline]
+    pub fn union(self, other: HandleRights) -> HandleRights {
+        HandleRights(self.0 | other.0)
+    }
+
+    /// Get the raw bits
+    #[inline]
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+/// Default rights for each object type.
+///
+/// These are the rights assigned when a handle is created via open().
+/// close() is always permitted regardless of rights.
+pub fn default_rights(obj_type: ObjectType) -> HandleRights {
+    match obj_type {
+        // Channels: read + write + grant (IPC delegation)
+        ObjectType::Channel => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::GRANT.0
+        ),
+        // Ports: full access (accept, configure, map, delegate)
+        ObjectType::Port => HandleRights::ALL,
+        // Timers: read (wait) + write (arm)
+        ObjectType::Timer => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0
+        ),
+        // DMA pools: read (get paddr) + map
+        ObjectType::DmaPool => HandleRights(
+            HandleRights::READ.0 | HandleRights::MAP.0
+        ),
+        // Shared memory: read + write + map
+        ObjectType::Shmem => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::MAP.0
+        ),
+        // Mux: read (poll) + write (add/remove watch)
+        ObjectType::Mux => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0
+        ),
+        // Console stdio: read + write
+        ObjectType::Stdin | ObjectType::Stdout | ObjectType::Stderr => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0
+        ),
+        // Process: read only (wait for exit)
+        ObjectType::Process => HandleRights::READ,
+        // Bus: read only
+        ObjectType::Bus | ObjectType::BusList => HandleRights::READ,
+        // MMIO: read + map
+        ObjectType::Mmio => HandleRights(
+            HandleRights::READ.0 | HandleRights::MAP.0
+        ),
+        // PCI: read + write
+        ObjectType::PciBus | ObjectType::PciDevice => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0
+        ),
+        // MSI: read + write
+        ObjectType::Msi => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0
+        ),
+        // Klog: read
+        ObjectType::Klog => HandleRights::READ,
+        // Ring: read + write + map
+        ObjectType::Ring => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::MAP.0
+        ),
+    }
+}
+
+/// Maximum handles per task.
+///
+/// Handle ABI supports 24-bit indices (16M+), so this is purely a table size limit.
+/// NOTE: Increasing to 128 adds ~3MB to the kernel image (ObjectService array).
+/// Requires moving to demand-allocated tables before this can grow.
 pub const MAX_HANDLES: usize = 64;
 
 /// Entry in the handle table
@@ -18,6 +132,8 @@ pub struct HandleEntry {
     pub generation: u8,
     /// Object type (for quick dispatch)
     pub object_type: ObjectType,
+    /// Per-handle rights (READ, WRITE, MAP, GRANT)
+    pub rights: HandleRights,
     /// The actual object
     pub object: Object,
 }
@@ -44,6 +160,7 @@ impl HandleTable {
         table.entries[1] = Some(HandleEntry {
             generation: 1,
             object_type: super::ObjectType::Stdin,
+            rights: default_rights(super::ObjectType::Stdin),
             object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stdin)),
         });
 
@@ -51,6 +168,7 @@ impl HandleTable {
         table.entries[2] = Some(HandleEntry {
             generation: 1,
             object_type: super::ObjectType::Stdout,
+            rights: default_rights(super::ObjectType::Stdout),
             object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stdout)),
         });
 
@@ -58,14 +176,20 @@ impl HandleTable {
         table.entries[3] = Some(HandleEntry {
             generation: 1,
             object_type: super::ObjectType::Stderr,
+            rights: default_rights(super::ObjectType::Stderr),
             object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stderr)),
         });
 
         table
     }
 
-    /// Allocate a new handle
+    /// Allocate a new handle with default rights for the object type
     pub fn alloc(&mut self, object_type: ObjectType, object: Object) -> Option<Handle> {
+        self.alloc_with_rights(object_type, default_rights(object_type), object)
+    }
+
+    /// Allocate a new handle with explicit rights
+    pub fn alloc_with_rights(&mut self, object_type: ObjectType, rights: HandleRights, object: Object) -> Option<Handle> {
         // Find free slot (skip 0, reserved for INVALID)
         for i in 1..MAX_HANDLES {
             if self.entries[i].is_none() {
@@ -73,6 +197,7 @@ impl HandleTable {
                 self.entries[i] = Some(HandleEntry {
                     generation: gen,
                     object_type,
+                    rights,
                     object,
                 });
                 return Some(Handle::new(i, gen));

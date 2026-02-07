@@ -329,7 +329,7 @@ pub mod handle;
 pub mod syscall;
 
 // Re-exports (ObjectType is defined below, not in types)
-pub use handle::{Handle, HandleTable};
+pub use handle::{Handle, HandleTable, HandleRights};
 
 // ============================================================================
 // Object Type - imported from abi crate (single source of truth)

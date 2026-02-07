@@ -448,7 +448,7 @@ impl PhysicalMemoryManager {
 // ============================================================================
 
 /// Global PMM protected by SpinLock
-static PMM: SpinLock<PhysicalMemoryManager> = SpinLock::new(PhysicalMemoryManager::new());
+static PMM: SpinLock<PhysicalMemoryManager> = SpinLock::new(crate::kernel::lock::lock_class::RESOURCE, PhysicalMemoryManager::new());
 
 /// Initialize the physical memory manager
 pub fn init() {

@@ -117,10 +117,10 @@ use port::PortRegistry;
 use super::lock::SpinLock;
 
 /// Global channel table
-static CHANNEL_TABLE: SpinLock<ChannelTable> = SpinLock::new(ChannelTable::new());
+static CHANNEL_TABLE: SpinLock<ChannelTable> = SpinLock::new(crate::kernel::lock::lock_class::SUBSYSTEM, ChannelTable::new());
 
 /// Global port registry
-static PORT_REGISTRY: SpinLock<PortRegistry> = SpinLock::new(PortRegistry::new());
+static PORT_REGISTRY: SpinLock<PortRegistry> = SpinLock::new(crate::kernel::lock::lock_class::SUBSYSTEM, PortRegistry::new());
 
 /// Access the global channel table (IRQ-safe)
 /// Internal only - use the typed API functions below

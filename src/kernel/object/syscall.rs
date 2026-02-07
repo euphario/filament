@@ -105,10 +105,13 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 
     // Use ObjectService's tables for dispatch
     let result = object_service().with_table_mut(task_id, |table| {
-        // Check handle validity and get type
+        // Check handle validity, rights, and get type
         let Some(entry) = table.get(handle) else {
             return Err(KernelError::BadHandle);
         };
+        if !entry.rights.has(super::HandleRights::READ) {
+            return Err(KernelError::PermDenied);
+        }
         if !entry.object_type.is_readable() {
             return Err(KernelError::NotSupported);
         }
@@ -204,6 +207,10 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         let Some(entry) = table.get_mut(handle) else {
             return (KernelError::BadHandle.to_errno(), PendingAction::None);
         };
+
+        if !entry.rights.has(super::HandleRights::WRITE) {
+            return (KernelError::PermDenied.to_errno(), PendingAction::None);
+        }
 
         if !entry.object_type.is_writable() {
             return (KernelError::NotSupported.to_errno(), PendingAction::None);
@@ -301,6 +308,10 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
         let Some(entry) = table.get_mut(handle) else {
             return KernelError::BadHandle.to_errno();
         };
+
+        if !entry.rights.has(super::HandleRights::MAP) {
+            return KernelError::PermDenied.to_errno();
+        }
 
         if !entry.object_type.is_mappable() {
             return KernelError::NotSupported.to_errno();

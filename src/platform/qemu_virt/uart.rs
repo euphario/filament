@@ -156,8 +156,8 @@ impl RxBuffer {
     }
 }
 
-static UART_BUFFER: SpinLock<UartBuffer> = SpinLock::new(UartBuffer::new());
-static RX_BUFFER: SpinLock<RxBuffer> = SpinLock::new(RxBuffer::new());
+static UART_BUFFER: SpinLock<UartBuffer> = SpinLock::new(0, UartBuffer::new());
+static RX_BUFFER: SpinLock<RxBuffer> = SpinLock::new(0, RxBuffer::new());
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 use core::sync::atomic::AtomicU32;

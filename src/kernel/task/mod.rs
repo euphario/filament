@@ -1005,7 +1005,7 @@ use super::lock::SpinLock;
 /// - `current_task_id()` - get current task's PID
 ///
 /// See docs/architecture/SCHEDULER_DESIGN_V2.md for details.
-static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
+static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(crate::kernel::lock::lock_class::SCHEDULER, Scheduler::new());
 
 /// Initialize scheduler (call once at boot)
 /// This explicitly resets all task slots to None to handle static initialization issues

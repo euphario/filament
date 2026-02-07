@@ -262,7 +262,7 @@ impl I2cState {
 }
 
 /// Global I2C state protected by SpinLock
-static I2C: SpinLock<I2cState> = SpinLock::new(I2cState::new());
+static I2C: SpinLock<I2cState> = SpinLock::new(0, I2cState::new());
 
 /// Get I2C controller for bus and perform operation under lock
 /// Returns None if bus is invalid or initialization failed
