@@ -834,6 +834,7 @@ pub struct BlockGeometry {
 pub struct BlockCompletion {
     pub tag: u32,
     pub status: u16,
+    pub flags: u16,
     pub transferred: u32,
     pub result: u32,
 }

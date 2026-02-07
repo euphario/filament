@@ -114,6 +114,7 @@ impl BlockTransport for ShmemBlockPort {
         Some(BlockCompletion {
             tag: cqe.tag,
             status: cqe.status,
+            flags: cqe.flags,
             transferred: cqe.transferred,
             result: cqe.result,
         })

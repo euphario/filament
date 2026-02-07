@@ -160,6 +160,10 @@ struct IpdDriver {
     vfs_client: Option<VfsClient>,
     /// Currently watched rsh shell response handle (for unwatch on completion).
     rsh_watched_handle: Option<Handle>,
+    /// Bridge group ID for CQE demux (set from spawning port name).
+    /// ethd tags each RX CQE with the source port's group_id in IoCqe.flags.
+    /// This ipd instance only processes frames matching its group_id.
+    group_id: u8,
 }
 
 impl IpdDriver {
@@ -182,6 +186,7 @@ impl IpdDriver {
             rsh: RemoteShell::new(),
             vfs_client: None,
             rsh_watched_handle: None,
+            group_id: 0,
         }
     }
 
@@ -265,7 +270,7 @@ impl IpdDriver {
 
         // Create Interface — start with NO IP address; DHCP will assign one.
         let iface = if let Some(port) = ctx.block_port(self.nic_port) {
-            let mut device = SmolDevice::new(port, &mut self.rx_queue);
+            let mut device = SmolDevice::new(port, &mut self.rx_queue, self.group_id);
             Interface::new(config, &mut device, now)
         } else {
             uerror!("ipd", "setup_failed"; reason = "no block port");
@@ -440,11 +445,17 @@ impl IpdDriver {
     /// Drain CQEs from the NIC DataPort into the RX offset queue.
     ///
     /// Zero-copy: only stores (offset, len) pairs — frame data stays in pool.
+    /// Filters by group_id: ethd sets IoCqe.flags = group_id for bridge demux.
+    /// This ipd instance only accepts frames matching its own group_id.
     fn drain_rx(&mut self, ctx: &mut dyn BusCtx) {
         let port_id = self.nic_port;
         if let Some(port) = ctx.block_port(port_id) {
             for _ in 0..16 {
                 if let Some(completion) = port.poll_completion() {
+                    // Filter: only accept CQEs for our bridge group
+                    if completion.flags != self.group_id as u16 {
+                        continue;
+                    }
                     let offset = completion.result;
                     let len = completion.transferred;
                     if len > 0 && len <= MAX_FRAME_SIZE as u32 {
@@ -498,7 +509,7 @@ impl IpdDriver {
 
         // Poll the interface (processes RX queue, handles ARP/ICMP)
         if let Some(port) = ctx.block_port(self.nic_port) {
-            let mut device = SmolDevice::new(port, &mut self.rx_queue);
+            let mut device = SmolDevice::new(port, &mut self.rx_queue, self.group_id);
             stack.iface.poll(now, &mut device, &mut stack.sockets);
         }
 
@@ -580,7 +591,7 @@ impl IpdDriver {
 
         // Re-poll after socket processing (smoltcp may have TX to send)
         if let Some(port) = ctx.block_port(self.nic_port) {
-            let mut device = SmolDevice::new(port, &mut self.rx_queue);
+            let mut device = SmolDevice::new(port, &mut self.rx_queue, self.group_id);
             stack.iface.poll(now, &mut device, &mut stack.sockets);
         }
 
@@ -959,7 +970,10 @@ fn format_u64(mut val: u64, buf: &mut [u8]) -> usize {
 
 impl Driver for IpdDriver {
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        uinfo!("ipd", "starting";);
+        // group_id defaults to 0 (all ports in one bridge group).
+        // When multiple bridge groups exist, switchd registers per-group ports
+        // (br0:, br1:) and the group_id will be set via sidechannel query.
+        uinfo!("ipd", "starting"; group_id = self.group_id as u32);
 
         if self.try_discover_nic(ctx) {
             self.discovering = false;
@@ -1079,7 +1093,7 @@ impl Driver for IpdDriver {
                     // Re-poll to flush any TCP data
                     let now = Self::smoltcp_now();
                     if let Some(port) = ctx.block_port(self.nic_port) {
-                        let mut device = SmolDevice::new(port, &mut self.rx_queue);
+                        let mut device = SmolDevice::new(port, &mut self.rx_queue, self.group_id);
                         stack.iface.poll(now, &mut device, &mut stack.sockets);
                     }
                 }

@@ -80,13 +80,14 @@ pub struct SmolDevice<'a> {
     rx_queue: &'a mut RxOffsetQueue,
     pool_base: *const u8,
     pool_size: u32,
+    group_id: u8,
 }
 
 impl<'a> SmolDevice<'a> {
-    pub fn new(port: &'a mut dyn BlockTransport, rx_queue: &'a mut RxOffsetQueue) -> Self {
+    pub fn new(port: &'a mut dyn BlockTransport, rx_queue: &'a mut RxOffsetQueue, group_id: u8) -> Self {
         let pool_base = port.pool_ptr();
         let pool_size = port.pool_size();
-        Self { port, rx_queue, pool_base, pool_size }
+        Self { port, rx_queue, pool_base, pool_size, group_id }
     }
 }
 
@@ -108,7 +109,7 @@ impl<'a> Device for SmolDevice<'a> {
                 offset: r.offset,
                 len: r.len,
             };
-            let tx = IpdTxToken { port: self.port };
+            let tx = IpdTxToken { port: self.port, group_id: self.group_id };
             Some((rx, tx))
         } else {
             None
@@ -116,7 +117,7 @@ impl<'a> Device for SmolDevice<'a> {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(IpdTxToken { port: self.port })
+        Some(IpdTxToken { port: self.port, group_id: self.group_id })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -163,9 +164,12 @@ impl phy::RxToken for IpdRxToken {
     }
 }
 
-/// TX token: writes a frame directly to DataPort pool and submits to netd.
+/// TX token: writes a frame directly to DataPort pool and submits to ethd.
+/// The group_id is encoded in IoSqe.flags so ethd inserts the correct
+/// MTK special tag destination port mask for this bridge group.
 pub struct IpdTxToken<'a> {
     port: &'a mut dyn BlockTransport,
+    group_id: u8,
 }
 
 impl<'a> phy::TxToken for IpdTxToken<'a> {
@@ -185,7 +189,7 @@ impl<'a> phy::TxToken for IpdTxToken<'a> {
 
             let sqe = IoSqe {
                 opcode: io_op::NET_SEND,
-                flags: 0,
+                flags: self.group_id,
                 priority: 0,
                 tag: 0,
                 data_offset: offset,

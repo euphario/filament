@@ -791,6 +791,11 @@ pub mod side_msg {
     pub const NET_QUERY_MAC: u16 = 0x0400;   // → 6-byte MAC in payload[0..6]
     pub const NET_QUERY_MTU: u16 = 0x0401;   // → u16 MTU in payload[0..2]
     pub const NET_QUERY_CAPS: u16 = 0x0402;  // → u32 capability flags in payload[0..4]
+
+    // Bridge group config (switchd → ethd) - 0x05xx
+    // payload[0..5] = port_to_group map (5 bytes, one per switch port 0-4)
+    // payload[5..13] = group_to_ports map (8 bytes, bitmask per group 0-7)
+    pub const NET_SET_GROUPS: u16 = 0x0500;
 }
 
 /// Sidechannel status codes

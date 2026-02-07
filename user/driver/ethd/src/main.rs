@@ -552,6 +552,12 @@ struct EthDriver {
     // Flow control (pause frames)
     pause_rx_en: bool,       // RX pause frame handling
     pause_tx_en: bool,       // TX pause frame generation
+
+    // Bridge group demux (MTK special tag)
+    // port_to_group: switch port index (0-4) → bridge group id (0-7)
+    port_to_group: [u8; 5],
+    // group_to_ports: bridge group id (0-7) → switch port bitmask for TX
+    group_to_ports: [u8; 8],
 }
 
 impl EthDriver {
@@ -1001,12 +1007,14 @@ impl EthDriver {
         uinfo!("ethd", "cfc_configured"; before = userlib::ulog::hex32(cfc_before),
                after = userlib::ulog::hex32(cfc_after));
 
-        // Step 3: DON'T modify PVC - U-Boot leaves it at 0x81000000
-        // U-Boot: pvc=0x81000000
-        // Ours was setting PORT_SPEC_TAG (0x20) which changes the behavior
+        // Step 3: Enable PORT_SPEC_TAG on CPU port 6 PVC register
+        // This makes the switch insert a 4-byte MTK special tag after the source MAC
+        // on all RX frames to CPU, enabling per-source-port demux for bridge groups.
+        // TX frames from CPU with the tag get the tag stripped and forwarded to the
+        // destination port(s) indicated in the tag's port mask.
         let pvc_before = self.gsw_read(MT7530_PVC_P(MT7531_CPU_PORT));
-        // Don't modify - keep U-Boot's setting
-        let pvc_after = pvc_before;
+        self.gsw_write(MT7530_PVC_P(MT7531_CPU_PORT), pvc_before | PORT_SPEC_TAG);
+        let pvc_after = self.gsw_read(MT7530_PVC_P(MT7531_CPU_PORT));
         uinfo!("ethd", "pvc_configured"; before = userlib::ulog::hex32(pvc_before),
                after = userlib::ulog::hex32(pvc_after));
 
@@ -2226,14 +2234,35 @@ impl EthDriver {
                 continue;
             }
 
-            // Get packet from pool
+            // Get packet from pool, insert MTK special tag, and send
             if let Some(port) = ctx.block_port(port_id) {
                 if let Some(pkt_data) = port.pool_slice(sqe.data_offset, sqe.data_len) {
-                    // Copy to local buffer and send
-                    let mut buf = [0u8; 1536];
-                    buf[..packet_len].copy_from_slice(pkt_data);
+                    // Look up destination port mask from SQE flags (group_id)
+                    let group_id = sqe.flags as usize;
+                    let port_mask = if group_id < self.group_to_ports.len() {
+                        self.group_to_ports[group_id]
+                    } else {
+                        0x1F // fallback: flood all user ports
+                    };
 
-                    if self.eth_send(&buf[..packet_len]) {
+                    // Build TX buffer with 4-byte MTK special tag inserted at offset 12
+                    // Layout: [dst MAC 6B][src MAC 6B][MTK tag 4B][ethertype + payload]
+                    let mut buf = [0u8; 1536];
+                    let tag_len = packet_len + 4;
+
+                    // Copy dst+src MACs (12 bytes)
+                    buf[..12].copy_from_slice(&pkt_data[..12]);
+                    // Insert MTK special tag: [0x00, 0x00, 0x00, port_mask]
+                    // Byte 0 (TPID): 0x00 = untagged
+                    // Byte 3 bits [5:0]: destination port bitmask
+                    buf[12] = 0x00;
+                    buf[13] = 0x00;
+                    buf[14] = 0x00;
+                    buf[15] = port_mask;
+                    // Copy ethertype + payload
+                    buf[16..16 + packet_len - 12].copy_from_slice(&pkt_data[12..]);
+
+                    if self.eth_send(&buf[..tag_len]) {
                         port.complete_ok(sqe.tag, sqe.data_len);
                     } else {
                         port.complete_error(sqe.tag, io_status::NO_SPACE);
@@ -2267,25 +2296,41 @@ impl EthDriver {
                 None => break,
             };
 
-            // Skip tiny packets
-            if length < 14 {
+            // MTK special tag is 4 bytes inserted at offset 12 (after src MAC).
+            // Minimum: 12 (MACs) + 4 (tag) + 2 (ethertype) = 18 bytes.
+            if length < 18 {
                 self.eth_free_pkt();
                 continue;
             }
 
-            // Copy packet to DataPort pool
-            if let Some(port) = ctx.block_port(port_id) {
-                if let Some(pool_offset) = port.alloc(length as u32) {
-                    // Copy from DMA buffer to pool
-                    let src = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, length) };
-                    port.pool_write(pool_offset, src);
+            let src = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, length) };
 
-                    // Post CQE
+            // Parse MTK special tag at bytes [12..16]
+            // tag[3] bits [2:0] = source port (0-4 for user ports, 6 for CPU)
+            let source_port = src[15] & 0x07;
+            let group_id = if (source_port as usize) < self.port_to_group.len() {
+                self.port_to_group[source_port as usize]
+            } else {
+                0 // CPU port or unknown → default group
+            };
+
+            // Strip the 4-byte tag: copy MACs [0..12] then payload [16..length]
+            let stripped_len = length - 4;
+
+            // Copy packet to DataPort pool (tag-stripped)
+            if let Some(port) = ctx.block_port(port_id) {
+                if let Some(pool_offset) = port.alloc(stripped_len as u32) {
+                    // Copy dst+src MACs (12 bytes)
+                    port.pool_write(pool_offset, &src[..12]);
+                    // Copy ethertype + payload (skip 4-byte tag at offset 12)
+                    port.pool_write(pool_offset + 12, &src[16..length]);
+
+                    // Post CQE with group_id in flags for ipd demux
                     let cqe = IoCqe {
                         status: io_status::OK,
-                        flags: 0,
+                        flags: group_id as u16,
                         tag: self.rx_seq as u32,
-                        transferred: length as u32,
+                        transferred: stripped_len as u32,
                         result: pool_offset,
                     };
                     port.complete(&cqe);
@@ -2348,6 +2393,33 @@ impl EthDriver {
                             port.notify();
                         }
                         uinfo!("ethd", "side_query"; msg = "info_response");
+                    }
+                    side_msg::NET_SET_GROUPS => {
+                        // Update bridge group mapping from switchd
+                        // payload[0..5] = port_to_group (port 0-4 → group id)
+                        // payload[5..13] = group_to_ports (group 0-7 → port bitmask)
+                        self.port_to_group.copy_from_slice(&entry.payload[0..5]);
+                        self.group_to_ports.copy_from_slice(&entry.payload[5..13]);
+
+                        uinfo!("ethd", "groups_updated";
+                            p2g0 = self.port_to_group[0] as u32,
+                            p2g1 = self.port_to_group[1] as u32,
+                            p2g2 = self.port_to_group[2] as u32,
+                            p2g3 = self.port_to_group[3] as u32,
+                            p2g4 = self.port_to_group[4] as u32,
+                            g0 = self.group_to_ports[0] as u32);
+
+                        let response = SideEntry {
+                            msg_type: entry.msg_type,
+                            flags: 0,
+                            tag: entry.tag,
+                            status: side_status::OK,
+                            payload: [0; 24],
+                        };
+                        if let Some(port) = ctx.block_port(port_id) {
+                            port.side_send(&response);
+                            port.notify();
+                        }
                     }
                     _ => {
                         // Unknown query — respond with error
@@ -3816,6 +3888,10 @@ static mut DRIVER: EthDriver = EthDriver {
     coalesce_tx_pkts: DEFAULT_COALESCE_PKTS,   // 8 packets
     pause_rx_en: true,                         // RX pause enabled
     pause_tx_en: true,                         // TX pause enabled
+
+    // Bridge group demux: default all ports in group 0
+    port_to_group: [0; 5],
+    group_to_ports: [0x1F, 0, 0, 0, 0, 0, 0, 0],  // group 0 = all 5 ports (0x1F)
 };
 
 struct EthDriverWrapper(&'static mut EthDriver);

@@ -1,6 +1,7 @@
-//! MT7531 Gigabit Switch Driver
+//! MT7531 Gigabit Switch Driver — Bridge Group Model
 //!
 //! Manages the MT7531 internal switch on MT7988A SoC:
+//! - Bridge group management (port → group mapping for frame demux)
 //! - VLAN configuration (802.1Q)
 //! - FDB (MAC address table) management
 //! - STP state control
@@ -8,7 +9,11 @@
 //! - MIB counters (port statistics)
 //!
 //! Spawned by devd when ethd registers the switch: port.
-//! Registers individual switch ports (lan0:-lan3:, wan:) as Network ports.
+//! Registers per-bridge-group ports (br0:, br1:, ...) as NET_BRIDGE_GROUP,
+//! each of which triggers devd to spawn an ipd instance.
+//!
+//! Default: one bridge group "br0" containing all 5 user ports (P0–P4).
+//! Groups can be reconfigured via the config API.
 
 #![no_std]
 #![no_main]
@@ -18,7 +23,7 @@ extern crate abi;
 use abi::{PortInfo, PortClass, PortState, port_subclass};
 use userlib::{uinfo, uerror};
 use userlib::mmio::MmioRegion;
-use userlib::bus::{Driver, BusCtx, BusMsg, Disposition};
+use userlib::bus::{Driver, BusCtx, BusMsg, Disposition, ConfigKey};
 use userlib::bus_runtime::driver_main;
 
 // =============================================================================
@@ -38,8 +43,6 @@ const MT7530_PMCR_P: fn(u8) -> u32 = |p| 0x3000 + (p as u32) * 0x100;
 const MT7530_VTCR: u32 = 0x90;       // VLAN Table Control
 const MT7530_VAWD1: u32 = 0x94;      // VLAN Table Write Data 1
 const MT7530_VAWD2: u32 = 0x98;      // VLAN Table Write Data 2
-const MT7530_VARD0: u32 = 0x9C;      // VLAN Table Read Data 0
-const MT7530_VARD1: u32 = 0xA0;      // VLAN Table Read Data 1
 
 // VLAN control bits
 const VTCR_BUSY: u32 = 1 << 31;
@@ -52,25 +55,41 @@ const VAWD1_IVL_MAC: u32 = 1 << 30;
 const VAWD1_VALID: u32 = 1 << 0;
 
 // FDB (Address Table) Registers
-const MT7530_ATA1: u32 = 0x74;       // MAC Address bytes 0-3
-const MT7530_ATA2: u32 = 0x78;       // MAC Address bytes 4-5 + VID
-const MT7530_ATWD: u32 = 0x7C;       // Address Table Write Data
 const MT7530_ATC: u32 = 0x80;        // Address Table Control
-const MT7530_ATRD: u32 = 0x8C;       // Address Table Read Data
 
 // ATC bits
 const ATC_BUSY: u32 = 1 << 15;
-const ATC_SRCH_END: u32 = 1 << 14;
-const ATC_SRCH_HIT: u32 = 1 << 13;
-const ATC_SAT_SRCH_START: u32 = 0x4 << 0;
-const ATC_SAT_SRCH_NEXT: u32 = 0x5 << 0;
 
 // MIB Counter base (per-port)
 const MT7530_MIB_PORT: fn(u8) -> u32 = |p| 0x4000 + (p as u32) * 0x100;
 
 // Port counts
 const NUM_PORTS: u8 = 5;       // lan0-lan3 + wan
-const CPU_PORT: u8 = 6;        // Internal CPU port
+
+// =============================================================================
+// Bridge Group Model
+// =============================================================================
+
+/// Maximum number of bridge groups
+const MAX_GROUPS: usize = 8;
+
+/// A bridge group maps a set of switch ports to a single ipd instance.
+/// Each group registers as a NET_BRIDGE_GROUP port so devd spawns ipd for it.
+#[derive(Clone, Copy)]
+struct BridgeGroup {
+    /// Group name suffix (0 → "br0:", 1 → "br1:", etc.)
+    id: u8,
+    /// Bitmask of switch ports in this group (bits 0-4 = ports P0-P4)
+    port_mask: u8,
+    /// Whether a port has been registered with devd
+    registered: bool,
+}
+
+impl BridgeGroup {
+    const fn empty() -> Self {
+        Self { id: 0, port_mask: 0, registered: false }
+    }
+}
 
 // =============================================================================
 // Switch Driver
@@ -78,14 +97,24 @@ const CPU_PORT: u8 = 6;        // Internal CPU port
 
 struct SwitchDriver {
     sw: Option<MmioRegion>,
-    ports_registered: bool,
+    /// Bridge groups (up to MAX_GROUPS)
+    groups: [BridgeGroup; MAX_GROUPS],
+    group_count: usize,
+    /// Reverse mapping: switch port index (0-4) → group id
+    port_to_group: [u8; 5],
 }
 
 impl SwitchDriver {
     fn new() -> Self {
+        // Default: one group "br0" with all 5 ports
+        let mut groups = [BridgeGroup::empty(); MAX_GROUPS];
+        groups[0] = BridgeGroup { id: 0, port_mask: 0x1F, registered: false };
+
         Self {
             sw: None,
-            ports_registered: false,
+            groups,
+            group_count: 1,
+            port_to_group: [0; 5],  // all ports → group 0
         }
     }
 
@@ -103,9 +132,45 @@ impl SwitchDriver {
         }
     }
 
-    fn rmw(&self, reg: u32, clr: u32, set: u32) {
-        let val = self.read(reg);
-        self.write(reg, (val & !clr) | set);
+    // =========================================================================
+    // Bridge Group Registration
+    // =========================================================================
+
+    /// Register all bridge groups as NET_BRIDGE_GROUP ports with devd.
+    fn register_groups(&mut self, ctx: &mut dyn BusCtx) {
+        for i in 0..self.group_count {
+            if self.groups[i].registered {
+                continue;
+            }
+            let name = group_port_name(self.groups[i].id);
+            let name_slice = &name[..group_port_name_len(self.groups[i].id)];
+
+            let mut info = PortInfo::new(name_slice, PortClass::Network);
+            info.port_subclass = port_subclass::NET_BRIDGE_GROUP;
+
+            if let Err(e) = ctx.register_port_with_info(&info, 0) {
+                uerror!("switchd", "group_register_failed"; group = self.groups[i].id as u32, err = e as u32);
+            } else {
+                let _ = ctx.set_port_state(name_slice, PortState::Ready);
+                self.groups[i].registered = true;
+                uinfo!("switchd", "group_registered"; group = self.groups[i].id as u32,
+                    ports = self.groups[i].port_mask as u32);
+            }
+        }
+    }
+
+    /// Rebuild port_to_group mapping from current groups.
+    fn rebuild_port_map(&mut self) {
+        // Default: unassigned ports go to group 0
+        self.port_to_group = [0; 5];
+        for i in 0..self.group_count {
+            let g = &self.groups[i];
+            for port in 0..5u8 {
+                if (g.port_mask >> port) & 1 != 0 {
+                    self.port_to_group[port as usize] = g.id;
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -124,7 +189,6 @@ impl SwitchDriver {
     }
 
     fn vlan_read(&self, vid: u16) -> Option<(u8, u8)> {
-        // Issue read command
         self.write(MT7530_VTCR, VTCR_BUSY | VTCR_FUNC_RD_VID | (vid as u32));
         if !self.wait_vtcr() {
             return None;
@@ -138,7 +202,6 @@ impl SwitchDriver {
         let members = ((vawd1 >> 16) & 0x7f) as u8;
         let vawd2 = self.read(MT7530_VAWD2);
 
-        // Extract untagged ports from VAWD2 (2 bits per port, 0=untag)
         let mut untagged = 0u8;
         for p in 0..7 {
             if (vawd2 >> (p * 2)) & 3 == 0 {
@@ -218,6 +281,72 @@ impl SwitchDriver {
     // Config API Helpers
     // =========================================================================
 
+    fn config_groups_get(&self, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+        for i in 0..self.group_count {
+            let g = &self.groups[i];
+            let n = fmt_line(&mut buf[offset..], &[
+                b"br", &[b'0' + g.id], b": ports=0x", &fmt_hex8(g.port_mask), b"\n",
+            ]);
+            offset += n;
+        }
+        offset
+    }
+
+    fn config_group_set(&mut self, key: &str, val: &str, buf: &mut [u8]) -> usize {
+        // Parse group id from key: "group.br0" → 0, "group.br1" → 1
+        let group_name = &key[6..]; // skip "group."
+        if !group_name.starts_with("br") || group_name.len() < 3 {
+            return copy_to(buf, b"ERR invalid group name\n");
+        }
+        let group_id = match group_name.as_bytes()[2] {
+            b'0'..=b'7' => group_name.as_bytes()[2] - b'0',
+            _ => return copy_to(buf, b"ERR group id must be 0-7\n"),
+        };
+
+        // Parse port list: "0,1,2,3" or "0x1f"
+        let port_mask = if val.starts_with("0x") || val.starts_with("0X") {
+            parse_hex_u8(val).unwrap_or(0)
+        } else {
+            // Parse comma-separated port numbers
+            let mut mask = 0u8;
+            for part in val.split(',') {
+                let part = part.trim();
+                if let Ok(p) = part.parse::<u8>() {
+                    if p < 5 {
+                        mask |= 1 << p;
+                    }
+                }
+            }
+            mask
+        };
+
+        // Find or create the group
+        let mut found = false;
+        for i in 0..self.group_count {
+            if self.groups[i].id == group_id {
+                self.groups[i].port_mask = port_mask;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            if self.group_count >= MAX_GROUPS {
+                return copy_to(buf, b"ERR max groups reached\n");
+            }
+            self.groups[self.group_count] = BridgeGroup {
+                id: group_id,
+                port_mask,
+                registered: false,
+            };
+            self.group_count += 1;
+        }
+
+        self.rebuild_port_map();
+        uinfo!("switchd", "group_updated"; group = group_id as u32, ports = port_mask as u32);
+        copy_to(buf, b"OK\n")
+    }
+
     fn config_vlan_list(&self, buf: &mut [u8]) -> usize {
         let mut offset = 0;
         for vid in 1..4096u16 {
@@ -248,7 +377,6 @@ impl SwitchDriver {
     }
 
     fn config_vlan_set(&self, vid: u16, val: &str, buf: &mut [u8]) -> usize {
-        // Parse "members,untagged" e.g., "0x1f,0x0f"
         let parts: [&str; 2] = {
             let mut iter = val.split(',');
             [iter.next().unwrap_or(""), iter.next().unwrap_or("")]
@@ -281,13 +409,12 @@ impl SwitchDriver {
             return copy_to(buf, b"ERR invalid port\n");
         }
 
-        // Read common MIB counters
-        let tx_bytes = self.read_mib(port, 0x00);  // TxByteCnt
-        let rx_bytes = self.read_mib(port, 0x24);  // RxByteCnt
-        let tx_pkts = self.read_mib(port, 0x10);   // TxPktCnt
-        let rx_pkts = self.read_mib(port, 0x30);   // RxPktCnt
-        let tx_drop = self.read_mib(port, 0x18);   // TxDropCnt
-        let rx_drop = self.read_mib(port, 0x60);   // RxDropCnt
+        let tx_bytes = self.read_mib(port, 0x00);
+        let rx_bytes = self.read_mib(port, 0x24);
+        let tx_pkts = self.read_mib(port, 0x10);
+        let rx_pkts = self.read_mib(port, 0x30);
+        let tx_drop = self.read_mib(port, 0x18);
+        let rx_drop = self.read_mib(port, 0x60);
 
         fmt_line(buf, &[
             b"tx_bytes=", &fmt_u32(tx_bytes), b" rx_bytes=", &fmt_u32(rx_bytes), b"\n",
@@ -313,6 +440,7 @@ impl SwitchDriver {
         let mut offset = 0;
         for port in 0..NUM_PORTS {
             let (link, speed) = self.port_link_status(port);
+            let group = self.port_to_group[port as usize];
             let name = match port {
                 0 => b"lan0",
                 1 => b"lan1",
@@ -323,13 +451,31 @@ impl SwitchDriver {
             };
             let n = fmt_line(&mut buf[offset..], &[
                 name, b": ", if link { b"up  " } else { b"down" },
-                b" ", &fmt_u32(speed), b"Mbps\n",
+                b" ", &fmt_u32(speed), b"Mbps br", &[b'0' + group], b"\n",
             ]);
             offset += n;
         }
         offset
     }
 }
+
+// =============================================================================
+// Config Keys
+// =============================================================================
+
+const SWITCH_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_only(b"ports"),
+    ConfigKey::read_only(b"groups"),
+    ConfigKey::read_write(b"group.*"),
+    ConfigKey::read_only(b"vlan"),
+    ConfigKey::read_write(b"vlan.*"),
+    ConfigKey::read_only(b"stats.*"),
+    ConfigKey::read_only(b"link.*"),
+];
+
+// =============================================================================
+// Driver Trait
+// =============================================================================
 
 impl Driver for SwitchDriver {
     fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), userlib::bus::BusError> {
@@ -351,22 +497,10 @@ impl Driver for SwitchDriver {
         let id = self.read(0x7ffc);
         uinfo!("switchd", "switch_id"; id = id);
 
-        // Register switch ports
-        let port_names: [&[u8]; 5] = [b"lan0:", b"lan1:", b"lan2:", b"lan3:", b"wan:"];
-        for (i, name) in port_names.iter().enumerate() {
-            let mut info = PortInfo::new(name, PortClass::Network);
-            info.port_subclass = port_subclass::NET_SWITCH_PORT;
+        // Register bridge groups (default: br0 with all ports)
+        self.register_groups(ctx);
 
-            if let Err(e) = ctx.register_port_with_info(&info, 0) {
-                uerror!("switchd", "port_register_failed"; port = i as u32, err = e as u32);
-            } else {
-                let _ = ctx.set_port_state(name, PortState::Ready);
-                uinfo!("switchd", "port_registered"; port = i as u32);
-            }
-        }
-        self.ports_registered = true;
-
-        uinfo!("switchd", "init_done";);
+        uinfo!("switchd", "init_done"; groups = self.group_count as u32);
         Ok(())
     }
 
@@ -374,11 +508,18 @@ impl Driver for SwitchDriver {
         Disposition::Handled
     }
 
+    fn config_keys(&self) -> &[ConfigKey] {
+        SWITCH_CONFIG_KEYS
+    }
+
     fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
         let key_str = core::str::from_utf8(key).unwrap_or("");
 
         if key_str == "ports" {
             return self.config_ports_get(buf);
+        }
+        if key_str == "groups" {
+            return self.config_groups_get(buf);
         }
         if key_str == "vlan" {
             return self.config_vlan_list(buf);
@@ -402,10 +543,16 @@ impl Driver for SwitchDriver {
         0
     }
 
-    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize {
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
         let key_str = core::str::from_utf8(key).unwrap_or("");
         let val_str = core::str::from_utf8(value).unwrap_or("");
 
+        if key_str.starts_with("group.") {
+            let result = self.config_group_set(key_str, val_str, buf);
+            // Re-register any new groups
+            self.register_groups(ctx);
+            return result;
+        }
         if key_str.starts_with("vlan.") && key_str != "vlan.del" {
             if let Ok(vid) = key_str[5..].parse::<u16>() {
                 return self.config_vlan_set(vid, val_str, buf);
@@ -417,6 +564,19 @@ impl Driver for SwitchDriver {
 
         copy_to(buf, b"ERR unknown key\n")
     }
+}
+
+// =============================================================================
+// Bridge Group Port Name Helpers
+// =============================================================================
+
+/// Generate port name for a bridge group: "br0:", "br1:", etc.
+fn group_port_name(id: u8) -> [u8; 4] {
+    [b'b', b'r', b'0' + id, b':']
+}
+
+fn group_port_name_len(_id: u8) -> usize {
+    4 // "brN:" is always 4 bytes
 }
 
 // =============================================================================
