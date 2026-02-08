@@ -82,7 +82,9 @@ pub struct CpuData {
     /// Last syscall number (for debugging)
     pub last_syscall: AtomicU32,
 
-    /// Kernel stack for this CPU (used during boot/exceptions)
+    /// Current task's kernel stack top (virtual address for SP_EL1).
+    /// Updated during simple preemption and task entry so assembly
+    /// exception return paths can set SP before ERET.
     pub kernel_stack_top: AtomicU64,
 
     /// Current task's trap frame pointer - used by exception handler (boot.S)
@@ -131,6 +133,7 @@ pub struct CpuData {
 //         tick_count(u64:32) idle_ticks(u64:40) in_idle(u32:48)
 //         last_syscall(u32:52) kernel_stack_top(u64:56)
 //         trap_frame_ptr(u64:64) ttbr0(u64:72) syscall_switched(u64:80)
+pub const CPUDATA_OFFSET_KSTACK_TOP: usize = 56;
 pub const CPUDATA_OFFSET_TRAP_FRAME: usize = 64;
 pub const CPUDATA_OFFSET_TTBR0: usize = 72;
 pub const CPUDATA_OFFSET_SWITCHED: usize = 80;
@@ -138,6 +141,7 @@ pub const CPUDATA_OFFSET_SWITCHED: usize = 80;
 // Compile-time verification that assembly offsets match actual layout.
 // If any field is added/reordered, these will fail to compile.
 const _: () = {
+    assert!(core::mem::offset_of!(CpuData, kernel_stack_top) == CPUDATA_OFFSET_KSTACK_TOP);
     assert!(core::mem::offset_of!(CpuData, trap_frame_ptr) == CPUDATA_OFFSET_TRAP_FRAME);
     assert!(core::mem::offset_of!(CpuData, ttbr0) == CPUDATA_OFFSET_TTBR0);
     assert!(core::mem::offset_of!(CpuData, syscall_switched) == CPUDATA_OFFSET_SWITCHED);
@@ -296,6 +300,14 @@ impl CpuData {
 // ============================================================================
 // These replace the former global statics CURRENT_TRAP_FRAME, CURRENT_TTBR0,
 // and SYSCALL_SWITCHED_TASK for SMP safety.
+
+/// Set the current task's kernel stack top (per-CPU).
+/// Used by assembly exception return paths to set SP_EL1 correctly
+/// when simple preemption switches to a different task.
+#[inline]
+pub fn set_kernel_stack_top(addr: u64) {
+    cpu_local().kernel_stack_top.store(addr, Ordering::Release);
+}
 
 /// Set the current task's trap frame pointer (per-CPU)
 #[inline]

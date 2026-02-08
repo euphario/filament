@@ -47,6 +47,8 @@ pub mod lock_class {
     pub const MICROTASK: u8 = 15;
     /// ObjectService per-task table locks
     pub const OBJ_SERVICE: u8 = 20;
+    /// Bus registry — between OBJ_SERVICE and SUBSYSTEM (acquires IPC locks)
+    pub const BUS: u8 = 25;
     /// Subsystem locks: CHANNEL_TABLE, PORT_REGISTRY, IRQ_TABLE, LOG_RING
     pub const SUBSYSTEM: u8 = 30;
     /// Resource locks: DMA_POOL, SHMEM, PMM, ASID_ALLOCATOR, VM_OBJECTS

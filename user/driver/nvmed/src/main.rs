@@ -19,7 +19,7 @@ use userlib::mmio::{MmioRegion, DmaPool};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, BlockGeometry, bus_msg,
-    PortInfo, PortClass, PortState, port_subclass,
+    PortInfo, PortClass, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{io_op, io_status, side_msg};
@@ -691,7 +691,7 @@ impl NvmeDriver {
 // =============================================================================
 
 impl Driver for NvmeDriver {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         uinfo!("nvmed", "starting";);
 
         // Get spawn context — the port name and BAR0 metadata from pcied
@@ -745,7 +745,6 @@ impl Driver for NvmeDriver {
         let mut info = PortInfo::new(b"nvme0:", PortClass::Block);
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
-        let _ = ctx.set_port_state(b"nvme0:", PortState::Ready);
 
         uinfo!("nvmed", "ready"; blocks = block_count, block_size = block_size);
 
@@ -788,8 +787,8 @@ fn main() {
 struct NvmeDriverWrapper(&'static mut NvmeDriver);
 
 impl Driver for NvmeDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {

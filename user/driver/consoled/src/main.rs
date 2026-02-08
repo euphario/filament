@@ -487,9 +487,10 @@ impl ConsoledDriver {
         }
         self.state = ConsoleState::WaitingForShell;
 
-        // Notify devd: port briefly Initialize then Ready to trigger spawn rule
-        let _ = ctx.set_port_state(b"console:", PortState::Initialize);
-        let _ = ctx.set_port_state(b"console:", PortState::Ready);
+        // Transition port Safe → devd fires spawn rule → new shell
+        let _ = ctx.set_port_state(b"console:", PortState::Safe);
+
+        uinfo!("consoled", "awaiting_shell";);
     }
 }
 
@@ -498,14 +499,16 @@ impl ConsoledDriver {
 // =============================================================================
 
 impl Driver for ConsoledDriver {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         uinfo!("consoled", "init";);
 
-        // Claim the kernel UART bus
+        // Claim the kernel UART bus. With Phase 2 NotifyParentExit, devd only
+        // restarts consoled after the previous instance's bus handle is released,
+        // so uart0 is guaranteed Safe here — no retry needed.
         let uart_path = b"/kernel/bus/uart0";
         match ctx.claim_kernel_bus(uart_path) {
-            Ok((bus_id, info)) => {
-                uinfo!("consoled", "uart_claimed"; bus = bus_id.0, state = info.state as u8);
+            Ok((_bus_id, _info)) => {
+                uinfo!("consoled", "uart_claimed";);
             }
             Err(e) => {
                 uerror!("consoled", "uart_claim_failed"; err = e as u8);
@@ -543,8 +546,7 @@ impl Driver for ConsoledDriver {
         info.port_subclass = port_subclass::CONSOLE_SERIAL;
 
         ctx.register_port_with_info(&info, 0)?;
-        // Port starts in Initialize. bus_runtime sets it Ready after report_state(Ready),
-        // ensuring consoled is in its event loop before devd sends SpawnChild.
+        // Port starts Safe. Supervisor (devd) fires spawn rules when port transitions to Claimed.
 
         uinfo!("consoled", "ready";);
         Ok(())
@@ -637,8 +639,8 @@ fn format_u16(buf: &mut [u8], n: u16) -> usize {
 struct ConsoledWrapper(&'static mut ConsoledDriver);
 
 impl Driver for ConsoledWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {

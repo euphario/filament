@@ -246,11 +246,7 @@ impl Scheduler {
             return;
         }
         if let Some(parent_slot) = self.slot_by_pid(parent_id) {
-            if let Some(ref mut parent) = self.tasks[parent_slot] {
-                if parent.state().is_sleeping() {
-                    crate::transition_or_log!(parent, wake);
-                }
-            }
+            self.wake_task(parent_slot);
         }
     }
 
@@ -774,12 +770,22 @@ impl Scheduler {
                 (TaskState::Exiting { .. }, CleanupPhase::None) => {
                     task.cleanup_phase = CleanupPhase::Phase1Enqueued;
                     let _ = microtask::enqueue(MicroTask::IpcCleanup { pid });
-                    let _ = microtask::enqueue(MicroTask::ReparentChildren { pid });
+                    let _ = microtask::enqueue(MicroTask::KillChildren { pid });
                 }
 
-                // Grace period expired → enqueue Phase 2
+                // Grace period expired → enqueue Phase 2 (parent notification + final cleanup)
                 (_, CleanupPhase::GracePeriod { until }) if current_counter >= until => {
                     task.cleanup_phase = CleanupPhase::Phase2Enqueued;
+                    // Parent notification — guaranteed after Phase 1 cleanup.
+                    // By this point: IPC closed, bus handles released, children killed.
+                    if task.parent_id != 0 {
+                        let code = task.state().exit_code().unwrap_or(-1);
+                        let _ = microtask::enqueue(MicroTask::NotifyParentExit {
+                            parent_id: task.parent_id,
+                            child_pid: pid,
+                            code,
+                        });
+                    }
                     let _ = microtask::enqueue(MicroTask::FinalCleanup { pid });
                     let _ = microtask::enqueue(MicroTask::SlotReap { pid, slot: slot_idx as u16 });
                 }
@@ -790,6 +796,14 @@ impl Scheduler {
                     if evicting_count < evicting_slots.len() {
                         evicting_slots[evicting_count] = slot_idx;
                         evicting_count += 1;
+                    }
+                    // Parent notification for evicted tasks
+                    if task.parent_id != 0 {
+                        let _ = microtask::enqueue(MicroTask::NotifyParentExit {
+                            parent_id: task.parent_id,
+                            child_pid: pid,
+                            code: -1,
+                        });
                     }
                     let _ = microtask::enqueue(MicroTask::IpcCleanup { pid });
                     let _ = microtask::enqueue(MicroTask::FinalCleanup { pid });

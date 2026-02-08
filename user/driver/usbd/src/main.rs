@@ -50,7 +50,7 @@ use userlib::{uinfo, uerror};
 use userlib::bus::{
     Driver, BusCtx, Disposition, BusError, BusMsg, bus_msg,
     BlockPortConfig, BlockGeometry, PortId,
-    PortInfo, PortClass, PortState, port_subclass,
+    PortInfo, PortClass, port_subclass,
 };
 use userlib::driver_main;
 use userlib::ring::{io_op, io_status, side_msg, side_status};
@@ -2192,7 +2192,7 @@ fn log_always(msg: &str) {
 struct UsbdWrapper(&'static mut QemuUsbDriver);
 
 impl Driver for UsbdWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         uinfo!("usbd", "starting";);
 
         // Get spawn context — the port name and BAR0 metadata from pcied
@@ -2262,7 +2262,6 @@ impl Driver for UsbdWrapper {
         let mut info = PortInfo::new(b"usb0:msc", PortClass::Block);
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
-        let _ = ctx.set_port_state(b"usb0:msc", PortState::Ready);
 
         uinfo!("usbd", "ready"; disks = 1u32);
 

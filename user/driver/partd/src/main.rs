@@ -792,7 +792,7 @@ impl PartitionDriver {
 // =============================================================================
 
 impl Driver for PartitionDriver {
-    fn init(&mut self, _ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, _ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         // Nothing to do — wait for ATTACH_DISK commands from devd
         Ok(())
     }
@@ -985,8 +985,8 @@ fn main() {
 struct PartitionDriverWrapper(&'static mut PartitionDriver);
 
 impl Driver for PartitionDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {

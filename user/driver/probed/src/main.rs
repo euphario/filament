@@ -26,16 +26,21 @@ fn main() {
     // exit(0) is called automatically by _start after main returns
 }
 
-fn bus_create(info: &BusCreateInfo) {
+/// Create a bus and return its handle.
+/// Caller can write(handle, BusDevice) to register devices, then close.
+fn bus_create(info: &BusCreateInfo) -> Option<userlib::Handle> {
     let params = unsafe {
         core::slice::from_raw_parts(
             info as *const BusCreateInfo as *const u8,
             core::mem::size_of::<BusCreateInfo>(),
         )
     };
-    let ret = syscall::open(ObjectType::Bus, params);
-    if ret.is_err() {
-        syscall::debug_write(b"probed: bus_create failed\r\n");
+    match syscall::open(ObjectType::Bus, params) {
+        Ok(handle) => Some(handle),
+        Err(_) => {
+            syscall::debug_write(b"probed: bus_create failed\r\n");
+            None
+        }
     }
 }
 

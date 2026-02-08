@@ -22,7 +22,10 @@ pub enum BusControlMsgType {
     /// Error notification
     Error = 2,
 
-    // ─── devd → kernel (requests) ───
+    /// Device list chunk (sent after StateSnapshot on connect)
+    DeviceList = 3,
+
+    // ─── owner → kernel (requests on owner channel) ───
 
     /// Enable bus mastering for a device
     EnableBusMastering = 16,
@@ -36,15 +39,16 @@ pub enum BusControlMsgType {
     /// Release IOMMU mapping
     UnmapDma = 19,
 
-    /// Request nuclear reset (devd will disconnect after this)
+    /// Request nuclear reset
     RequestReset = 20,
 
     /// Atomic handoff to new owner (for live update)
     Handoff = 21,
 
-    /// Set driver PID (devd tells kernel which process is using the bus)
-    /// When this PID exits, kernel auto-resets bus and notifies devd
-    SetDriver = 22,
+    /// Register a device on this bus (probed → kernel via write(bus_handle))
+    RegisterDevice = 23,
+
+    // SetDriver removed — owner is identified by who connects
 
     // ─── Responses ───
 

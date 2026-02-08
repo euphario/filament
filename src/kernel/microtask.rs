@@ -17,9 +17,12 @@
 //!
 //! Task exit cleanup is split into two phases with a grace period:
 //!
-//! 1. **Phase 1** (Exiting): NotifyParentExit, IpcCleanup, ShmemNotify, ReparentChildren
+//! 1. **Phase 1** (Exiting): IpcCleanup, ShmemNotify, KillChildren
 //! 2. **Grace period**: Servers process Close/ShmemInvalid notifications
-//! 3. **Phase 2** (after grace): FinalCleanup, SlotReap
+//! 3. **Phase 2** (after grace): NotifyParentExit, FinalCleanup, SlotReap
+//!
+//! NotifyParentExit is in Phase 2 so the parent (e.g. devd) learns about
+//! child exit only after all IPC/bus cleanup is complete — safe to respawn.
 
 use crate::kernel::lock::{SpinLock, lock_class};
 use crate::kernel::task::TaskId;
@@ -34,10 +37,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 /// A unit of deferred work. Each variant is small (≤16 bytes) and does bounded work.
 #[derive(Debug, Clone, Copy)]
 pub enum MicroTask {
-    // --- Notifications (run first) ---
-
-    /// Notify parent that a child exited (ObjectService ProcessObject wake)
-    NotifyParentExit { parent_id: TaskId, child_pid: TaskId, code: i32 },
+    // --- Immediate notifications ---
 
     /// Wake a task by PID
     Wake { pid: TaskId },
@@ -51,10 +51,15 @@ pub enum MicroTask {
     /// DMA stop + subscriber removal + peer notification + shmem begin_cleanup
     IpcCleanup { pid: TaskId },
 
-    /// Snapshot children under brief sched lock, reparent to init
-    ReparentChildren { pid: TaskId },
+    /// Kill children of dying task (cascading teardown)
+    KillChildren { pid: TaskId },
 
-    // --- Phase 2 cleanup (resource release, after grace period) ---
+    // --- Phase 2 cleanup (after grace period) ---
+
+    /// Notify parent that a child exited (ObjectService ProcessObject wake).
+    /// Deferred to Phase 2: parent learns about exit only after IPC/bus cleanup
+    /// is complete, so it's safe to immediately spawn a replacement.
+    NotifyParentExit { parent_id: TaskId, child_pid: TaskId, code: i32 },
 
     /// shmem::finalize + irq + pci + ports + object table removal
     FinalCleanup { pid: TaskId },
@@ -440,8 +445,8 @@ fn execute(task: MicroTask) {
         MicroTask::IpcCleanup { pid } => {
             exec_ipc_cleanup(pid);
         }
-        MicroTask::ReparentChildren { pid } => {
-            exec_reparent_children(pid);
+        MicroTask::KillChildren { pid } => {
+            exec_kill_children(pid);
         }
         MicroTask::FinalCleanup { pid } => {
             exec_final_cleanup(pid);
@@ -494,9 +499,16 @@ fn exec_ipc_cleanup(pid: TaskId) {
     crate::kernel::shmem::begin_cleanup(pid);
 }
 
-/// Reparent children to init (PID 1), then set cleanup_phase to GracePeriod.
-fn exec_reparent_children(pid: TaskId) {
-    use crate::kernel::task::tcb::CleanupPhase;
+/// Kill children of dying task, then set cleanup_phase to GracePeriod.
+///
+/// Cascading kill: each killed child gets its own IpcCleanup + KillChildren
+/// microtasks enqueued, so the entire subtree is torn down.
+fn exec_kill_children(pid: TaskId) {
+    use crate::kernel::task::tcb::{CleanupPhase, MAX_CHILDREN};
+    use crate::kernel::task::lifecycle;
+
+    let mut killed_pids: [TaskId; MAX_CHILDREN] = [0; MAX_CHILDREN];
+    let mut killed_count = 0usize;
 
     crate::kernel::task::with_scheduler(|sched| {
         let slot = match sched.slot_by_pid(pid) {
@@ -504,38 +516,54 @@ fn exec_reparent_children(pid: TaskId) {
             None => return,
         };
 
-        // Snapshot children
-        let children: [TaskId; crate::kernel::task::tcb::MAX_CHILDREN] = sched.task(slot)
+        // Snapshot children array
+        let children: [TaskId; MAX_CHILDREN] = sched.task(slot)
             .map(|t| t.children)
-            .unwrap_or([0; crate::kernel::task::tcb::MAX_CHILDREN]);
-
-        let has_init = sched.slot_by_pid(1).is_some();
+            .unwrap_or([0; MAX_CHILDREN]);
 
         for child_pid in children {
             if child_pid == 0 {
                 continue;
             }
-            if let Some(child_slot) = sched.slot_by_pid(child_pid) {
-                if let Some(child) = sched.task_mut(child_slot) {
-                    if has_init {
-                        child.parent_id = 1;
-                    } else {
-                        child.parent_id = 0;
+
+            // Kill child — permission check passes since pid IS the child's parent
+            match lifecycle::kill(sched, child_pid, pid) {
+                Ok(_info) => {
+                    // Set cleanup phase on the killed child
+                    if let Some(child_slot) = sched.slot_by_pid(child_pid) {
+                        if let Some(child) = sched.task_mut(child_slot) {
+                            child.cleanup_phase = CleanupPhase::Phase1Enqueued;
+                        }
                     }
+                    if killed_count < MAX_CHILDREN {
+                        killed_pids[killed_count] = child_pid;
+                        killed_count += 1;
+                    }
+                }
+                Err(_) => {
+                    // Child already exiting/dead, skip
                 }
             }
         }
 
-        // Wake parent if sleeping (for Process watch)
+        // Wake parent of the dying task if sleeping (for Process watch)
         sched.wake_parent_if_sleeping(slot);
 
-        // Transition: Phase1Enqueued → GracePeriod
+        // Transition dying task: Phase1Enqueued → GracePeriod
         // 100ms grace period in hardware counter units
         let grace_until = crate::platform::current::timer::deadline_ns(100_000_000);
         if let Some(task) = sched.task_mut(slot) {
             task.cleanup_phase = CleanupPhase::GracePeriod { until: grace_until };
         }
     });
+
+    // Enqueue Phase 1 cleanup for each killed child (outside scheduler lock).
+    // NotifyParentExit is deferred — each child's own Phase 2 will notify its parent.
+    for i in 0..killed_count {
+        let child_pid = killed_pids[i];
+        let _ = enqueue(MicroTask::IpcCleanup { pid: child_pid });
+        let _ = enqueue(MicroTask::KillChildren { pid: child_pid }); // recursive cascade
+    }
 }
 
 /// Phase 2 final cleanup: shmem finalize, IRQ, PCI, ports, object table removal.

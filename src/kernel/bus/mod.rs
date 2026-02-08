@@ -53,6 +53,7 @@ mod hw_usb;
 
 // Re-export for use by hw modules
 use super::hw_poll;
+use crate::kernel::lock::{SpinLock, lock_class};
 
 pub use types::{BusType, BusInfo, DeviceInfo, bus_caps};
 pub use protocol::StateChangeReason;
@@ -226,11 +227,11 @@ impl BusRegistry {
             .find(|b| b.bus_type == bus_type && b.bus_index == index)
     }
 
-    /// Find a bus by listen channel
+    /// Find a bus by listen channel, supervisor channel, or owner channel
     pub fn find_by_channel(&mut self, channel: ChannelId) -> Option<&mut BusController> {
         self.buses[..self.bus_count]
             .iter_mut()
-            .find(|b| b.listen_channel == Some(channel) || b.owner_channel == Some(channel))
+            .find(|b| b.listen_channel == Some(channel) || b.supervisor_ch == Some(channel) || b.owner_ch == Some(channel))
     }
 
     /// Get all buses
@@ -246,16 +247,16 @@ impl BusRegistry {
     /// Process cleanup when a process exits
     pub fn process_cleanup(&mut self, pid: Pid) {
         for bus in self.buses[..self.bus_count].iter_mut() {
-            // Check if this is the driver (usbd, etc.)
-            // If so, reset bus and notify supervisor (devd)
-            if bus.driver_pid == Some(pid) {
-                bus.handle_driver_exit(pid);
+            // Check if this is the owner (driver process)
+            // If so, reset bus hardware and notify supervisor
+            if bus.is_owner(pid) {
+                bus.handle_owner_exit(pid);
             }
             // Check if this is the supervisor (devd)
-            // If so, trigger full disconnect
-            else if bus.owner_pid == Some(pid) {
-                kinfo!("bus", "owner_exit"; name = bus.port_name_str(), pid = pid as u64);
-                bus.handle_disconnect(StateChangeReason::OwnerCrashed);
+            // Independent check — not else-if
+            if bus.is_supervisor(pid) {
+                kinfo!("bus", "supervisor_exit"; name = bus.port_name_str(), pid = pid as u64);
+                bus.handle_supervisor_disconnect(StateChangeReason::OwnerCrashed);
             }
         }
     }
@@ -265,22 +266,13 @@ impl BusRegistry {
 // Global Instance
 // =============================================================================
 
-static mut BUS_REGISTRY: BusRegistry = BusRegistry::new();
-
-/// Get the global bus registry
-/// # Safety
-/// Must ensure proper synchronization
-///
-/// NOTE: Prefer `with_bus_registry()` for safe access with automatic IRQ guard.
-pub(crate) unsafe fn bus_registry() -> &'static mut BusRegistry {
-    &mut *core::ptr::addr_of_mut!(BUS_REGISTRY)
-}
+static BUS_REGISTRY: SpinLock<BusRegistry> = SpinLock::new(lock_class::BUS, BusRegistry::new());
 
 /// Execute a closure with exclusive access to the bus registry
 #[inline]
 pub fn with_bus_registry<R, F: FnOnce(&mut BusRegistry) -> R>(f: F) -> R {
-    let _guard = crate::kernel::arch::sync::IrqGuard::new();
-    unsafe { f(bus_registry()) }
+    let mut guard = BUS_REGISTRY.lock();
+    f(&mut guard)
 }
 
 // =============================================================================
@@ -369,6 +361,14 @@ pub fn continue_init() -> bool {
                 // If this is a PCIe bus, enumerate devices now that hardware is ready
                 if bus.bus_type == BusType::PCIe {
                     let count = super::pci::enumerate();
+                    // Copy enumerated PCI devices into BusController for generic delivery
+                    super::pci::with_devices(|registry| {
+                        for i in 0..count {
+                            if let Some(dev) = registry.get(i) {
+                                bus.add_enum_device(pci_to_bus_device(dev));
+                            }
+                        }
+                    });
                     kinfo!("bus", "pci_enumerated"; devices = count as u64);
                 }
 
@@ -402,10 +402,11 @@ pub fn reset_all_buses() {
     kinfo!("bus", "reset_all_start");
     with_bus_registry(|registry| {
         for bus in registry.iter_mut() {
-            // Clear ownership
-            bus.owner_channel = None;
+            // Clear all connections
+            bus.supervisor_ch = None;
+            bus.supervisor_pid = None;
+            bus.owner_ch = None;
             bus.owner_pid = None;
-            bus.driver_pid = None;
 
             // Perform hardware reset sequence
             bus.perform_hardware_reset();
@@ -460,7 +461,7 @@ pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: 
 pub fn process_bus_message(client_channel: ChannelId, data: &[u8]) {
     // Find the bus that owns the peer of this channel
     // The client sends on client_channel, which means the message goes to server_channel's queue
-    // We need to find which bus has server_channel as its owner_channel
+    // We need to find which bus has server_channel as its owner_ch
 
     // Get the peer channel ID (server_channel)
     let server_channel = super::ipc::get_peer_id(client_channel);
@@ -472,19 +473,21 @@ pub fn process_bus_message(client_channel: ChannelId, data: &[u8]) {
     // Find the bus controller that owns this channel
     with_bus_registry(|registry| {
         for bus in registry.iter_mut() {
-            if bus.owner_channel == Some(server_ch) {
-                // Build a message from the data
+            // Messages on owner channel: hardware commands (bus mastering, reset)
+            if bus.owner_ch == Some(server_ch) {
                 let mut msg = Message::new();
                 msg.header.payload_len = data.len() as u32;
                 msg.payload[..data.len()].copy_from_slice(data);
 
-                // Process the message
                 if let Err(e) = bus.handle_message(&msg) {
                     kerror!("bus", "message_error"; name = bus.port_name_str());
-                    let _ = e;  // error logged
+                    let _ = e;
                 }
                 return;
             }
+            // Messages on supervisor channel: currently none handled by kernel
+            // (supervisor sends Spawn messages but those are handled by bus_runtime,
+            //  not by kernel bus controller directly)
         }
     });
 }
@@ -557,6 +560,69 @@ pub fn get_device_count() -> usize {
 }
 
 // =============================================================================
+// Device Registration (from probed via write(Bus))
+// =============================================================================
+
+/// Register a device on a bus (called from write(Bus) syscall)
+/// probed uses this to seed root hardware devices on platform buses.
+pub fn register_device(bus_type_id: u8, bus_index: u8, dev: abi::BusDevice) -> Result<(), BusError> {
+    let bus_type = match bus_type_id {
+        abi::bus_type::PCIE => BusType::PCIe,
+        abi::bus_type::USB => BusType::Usb,
+        abi::bus_type::PLATFORM => BusType::Platform,
+        abi::bus_type::ETHERNET => BusType::Ethernet,
+        abi::bus_type::UART => BusType::Uart,
+        abi::bus_type::KLOG => BusType::Klog,
+        _ => return Err(BusError::InvalidMessage),
+    };
+
+    with_bus_registry(|registry| {
+        let bus = registry.find(bus_type, bus_index)
+            .ok_or(BusError::NotFound)?;
+        if bus.add_enum_device(dev) {
+            Ok(())
+        } else {
+            Err(BusError::AlreadyClaimed) // Repurpose: device list full
+        }
+    })
+}
+
+// =============================================================================
+// PCI → BusDevice conversion
+// =============================================================================
+
+/// Convert a kernel PciDevice to a generic BusDevice for bus protocol delivery
+fn pci_to_bus_device(dev: &super::pci::PciDevice) -> abi::BusDevice {
+    use abi::bus_device_flags;
+
+    let mut flags: u16 = bus_device_flags::DMA | bus_device_flags::MMIO;
+    if dev.msi_cap != 0 {
+        flags |= bus_device_flags::MSI;
+    }
+    if dev.msix_cap != 0 {
+        flags |= bus_device_flags::MSIX;
+    }
+    if dev.is_bridge {
+        flags |= bus_device_flags::BRIDGE;
+    }
+
+    // Pack class_code as class(8)|subclass(8)|prog_if(8)|revision(8)
+    // PciDevice.class_code is 24-bit: class(8)|subclass(8)|prog_if(8) — shift left 8 to add revision
+    let class_code = (dev.class_code << 8) | (dev.revision as u32);
+
+    abi::BusDevice {
+        id: dev.bdf.to_u32(),
+        vendor_id: dev.vendor_id,
+        device_id: dev.device_id,
+        class_code,
+        resource0: dev.bar0_addr,
+        resource1: dev.bar0_size as u32,
+        flags,
+        _reserved: 0,
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -571,15 +637,17 @@ pub fn test() {
     assert!(bus.state() == BusState::Safe);
     assert!(bus.check_invariants());
 
-    // Simulate connect
-    bus.owner_channel = Some(100);
-    bus.owner_pid = Some(1);
+    // Simulate owner connect
+    bus.supervisor_ch = Some(99);
+    bus.supervisor_pid = Some(1);
+    bus.owner_ch = Some(100);
+    bus.owner_pid = Some(2);
     bus.transition_to(BusState::Claimed, StateChangeReason::Connected);
     assert!(bus.state() == BusState::Claimed);
     assert!(bus.check_invariants());
 
-    // Simulate disconnect
-    bus.handle_disconnect(StateChangeReason::Disconnected);
+    // Simulate owner exit
+    bus.handle_owner_exit(2);
     assert!(bus.state() == BusState::Safe);
     assert!(bus.check_invariants());
 

@@ -35,7 +35,7 @@ use userlib::syscall;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
-    PortInfo, PortClass, PortState, port_subclass,
+    PortInfo, PortClass, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, SideEntry, io_status, side_msg, side_status};
@@ -913,7 +913,6 @@ impl FatfsDriver {
                             let mut info = PortInfo::new(&pname[..pname_len], PortClass::Filesystem);
                             info.port_subclass = port_subclass::FS_FAT;
                             let _ = ctx.register_port_with_info(&info, vfs_shmem_id);
-                            let _ = ctx.set_port_state(&pname[..pname_len], PortState::Ready);
 
                             uinfo!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
 
@@ -1017,34 +1016,31 @@ impl FatfsDriver {
 // =============================================================================
 
 impl Driver for FatfsDriver {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         // Use spawn context to discover which partition we were spawned for
-        match ctx.spawn_context() {
-            Ok(spawn_ctx) => {
-                let port_name = spawn_ctx.port_name();
+        let spawn_ctx = ctx.spawn_context().map_err(|_| {
+            uerror!("fatfsd", "no_spawn_context";);
+            BusError::Internal
+        })?;
 
-                // Copy port name before borrowing ctx again
-                let mut name_buf = [0u8; 64];
-                let name_len = port_name.len().min(64);
-                name_buf[..name_len].copy_from_slice(&port_name[..name_len]);
+        let port_name = spawn_ctx.port_name();
 
-                // Discover partition shmem_id via devd
-                match ctx.discover_port(&name_buf[..name_len]) {
-                    Ok(shmem_id) => {
-                        if !self.do_init(shmem_id, &name_buf[..name_len], ctx) {
-                            uerror!("fatfsd", "init_failed";);
-                        }
-                    }
-                    Err(_) => {
-                        uerror!("fatfsd", "discover_partition_failed";);
-                    }
-                }
-            }
-            Err(e) => {
-                uerror!("fatfsd", "no_spawn_context";);
-            }
+        // Copy port name before borrowing ctx again
+        let mut name_buf = [0u8; 64];
+        let name_len = port_name.len().min(64);
+        name_buf[..name_len].copy_from_slice(&port_name[..name_len]);
+
+        // Discover partition shmem_id via devd
+        let shmem_id = ctx.discover_port(&name_buf[..name_len]).map_err(|_| {
+            uerror!("fatfsd", "discover_partition_failed";);
+            BusError::Internal
+        })?;
+
+        if !self.do_init(shmem_id, &name_buf[..name_len], ctx) {
+            uerror!("fatfsd", "init_failed";);
+            return Err(BusError::Internal);
         }
-        // If no spawn context, wait for ATTACH_DISK command
+
         Ok(())
     }
 
@@ -1102,8 +1098,8 @@ fn main() {
 struct FatfsDriverWrapper(&'static mut FatfsDriver);
 
 impl Driver for FatfsDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {

@@ -106,7 +106,7 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<Option<
 
     // NOTE: Don't wake parent here. Parent will be woken by:
     // 1. NotifyParentExit microtask → ProcessObject WaitQueue (immediate, outside lock)
-    // 2. ReparentChildren microtask → wake_parent_if_sleeping
+    // 2. KillChildren microtask → wake_parent_if_sleeping
     // Waking here causes a lost-wake race: devd wakes, polls Mux, finds nothing,
     // goes back to sleep. Then consoled's set_port_state arrives during the
     // Running→Sleeping transition and the channel wake is lost.
@@ -191,7 +191,7 @@ pub fn kill(
     // NOTE: Don't wake parent here — same lost-wake race as exit().
     // Parent will be woken by microtask pipeline:
     // 1. NotifyParentExit → ProcessObject WaitQueue (immediate, outside lock)
-    // 2. ReparentChildren → wake_parent_if_sleeping
+    // 2. KillChildren → wake_parent_if_sleeping
 
     // If this was the init process (devd), trigger recovery
     if was_init {
@@ -296,8 +296,19 @@ pub fn complete_exit_notification(info: ExitInfo) {
         info.parent_id, info.child_pid, info.code,
     );
 
+    // Diagnostic: log whether ProcessObject subscriber was found
+    kinfo!("lifecycle", "exit_notify"; parent = info.parent_id, child = info.child_pid, subscribers = wake_list.len() as u64);
+
     // Wake handle subscribers (e.g. ProcessObject waiters)
     waker::wake(&wake_list, WakeReason::ChildExit);
+
+    // Belt-and-suspenders: if no subscriber was registered on the ProcessObject
+    // (e.g. parent's Mux didn't include the watcher handle, or parent was between
+    // poll cycles), wake the parent directly. The parent will re-poll its Mux and
+    // discover the ProcessObject is now readable via exit_code.
+    if wake_list.is_empty() {
+        waker::wake_pid(info.parent_id);
+    }
 }
 
 /// Reap a terminated child — collect exit code, defer cleanup to microtask pipeline.

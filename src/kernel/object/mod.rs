@@ -396,6 +396,9 @@ pub enum Object {
 
     /// Ring buffer IPC (high-performance)
     Ring(RingObject),
+
+    /// Bus creator handle (probed writes RegisterDevice to add devices)
+    BusCreator(BusCreatorObject),
 }
 
 // ============================================================================
@@ -1189,6 +1192,21 @@ impl BusListObject {
     }
     pub fn cursor(&self) -> u32 { self.cursor }
     pub fn advance(&mut self) { self.cursor += 1; }
+}
+
+// ============================================================================
+// Bus Creator Object (probed holds this to register devices on a bus)
+// ============================================================================
+
+pub struct BusCreatorObject {
+    pub bus_type: u8,
+    pub bus_index: u8,
+}
+
+impl BusCreatorObject {
+    pub fn new(bus_type: u8, bus_index: u8) -> Self {
+        Self { bus_type, bus_index }
+    }
 }
 
 // ============================================================================

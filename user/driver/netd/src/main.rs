@@ -22,7 +22,7 @@ use userlib::ipc::{PciDevice, Timer};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
-    PortInfo, PortClass, PortState, port_subclass, NetworkMetadata,
+    PortInfo, PortClass, port_subclass, NetworkMetadata,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, IoCqe, io_op, io_status, side_msg, side_status, SideEntry};
@@ -488,7 +488,7 @@ impl NetDriver {
 // =============================================================================
 
 impl Driver for NetDriver {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         uinfo!("netd", "init";);
 
         // 1. Parse spawn context metadata
@@ -659,7 +659,6 @@ impl Driver for NetDriver {
         meta.mac.copy_from_slice(&self.mac);
         info.set_network_metadata(meta);
         let _ = ctx.register_port_with_info(&info, shmem_id);
-        let _ = ctx.set_port_state(b"net0", PortState::Ready);
 
         let mac_str = self.format_mac();
         uinfo!("netd", "ready"; mac = core::str::from_utf8(&mac_str).unwrap_or("?"));
@@ -745,8 +744,8 @@ fn main() {
 struct NetDriverWrapper(&'static mut NetDriver);
 
 impl Driver for NetDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {

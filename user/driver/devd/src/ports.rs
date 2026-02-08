@@ -34,6 +34,8 @@ pub struct RegisteredPort {
     shmem_id: u32,
     /// Unified port info
     port_info: PortInfo,
+    /// Link ID of the child service spawned for this port (0 = none)
+    child_link_id: u32,
 }
 
 /// No parent sentinel value
@@ -45,10 +47,11 @@ impl RegisteredPort {
             name: [0; MAX_PORT_NAME],
             name_len: 0,
             owner: 0,
-            state: PortState::Initialize,
+            state: PortState::Safe,
             parent_idx: NO_PARENT,
             shmem_id: 0,
             port_info: PortInfo::empty(),
+            child_link_id: 0,
         }
     }
 
@@ -70,12 +73,12 @@ impl RegisteredPort {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.state == PortState::Ready
+        self.state == PortState::Claimed
     }
 
-    /// Legacy compatibility - returns true if Ready
+    /// Legacy compatibility - returns true if Claimed
     pub fn is_available(&self) -> bool {
-        self.state == PortState::Ready
+        self.state == PortState::Claimed
     }
 
     /// Get wire protocol port type (u8) derived from PortClass
@@ -124,6 +127,14 @@ impl RegisteredPort {
 
     pub fn set_shmem_id(&mut self, shmem_id: u32) {
         self.shmem_id = shmem_id;
+    }
+
+    pub fn child_link_id(&self) -> u32 {
+        self.child_link_id
+    }
+
+    pub fn set_child_link_id(&mut self, id: u32) {
+        self.child_link_id = id;
     }
 
     /// Get raw metadata bytes from PortInfo
@@ -421,7 +432,7 @@ impl PortRegistry for Ports {
         port.name[..name.len()].copy_from_slice(name);
         port.name_len = name.len() as u8;
         port.owner = owner;
-        port.state = PortState::Initialize;  // Starts Initialize, driver/runtime sets Ready
+        port.state = PortState::Safe;  // Starts Safe, transitions to Claimed when owner connects
         port.parent_idx = parent_idx;
         port.shmem_id = shmem_id;
         port.port_info = *info;
@@ -442,7 +453,7 @@ impl PortRegistry for Ports {
     fn is_ready(&self, name: &[u8]) -> bool {
         self.find_slot(name)
             .and_then(|i| self.ports[i].as_ref())
-            .map(|p| p.state == PortState::Ready)
+            .map(|p| p.state == PortState::Claimed)
             .unwrap_or(false)
     }
 
@@ -567,7 +578,9 @@ mod tests {
 
         assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
         assert_eq!(ports.count(), 1);
-        assert!(ports.available(b"test:"));
+        // Port starts Safe (not yet claimed by owner)
+        assert!(!ports.available(b"test:"));
+        assert_eq!(ports.get_state(b"test:"), Some(PortState::Safe));
 
         ports.unregister(b"test:");
         assert_eq!(ports.count(), 0);
@@ -587,19 +600,24 @@ mod tests {
         let mut ports = Ports::new();
 
         assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
-        assert_eq!(ports.get_state(b"test:"), Some(PortState::Ready));
+        assert_eq!(ports.get_state(b"test:"), Some(PortState::Safe));
+        assert!(!ports.is_ready(b"test:"));
+
+        // Transition to Claimed
+        let old = ports.set_state(b"test:", PortState::Claimed);
+        assert_eq!(old, Some(PortState::Safe));
         assert!(ports.is_ready(b"test:"));
 
-        // Transition to Unavailable
+        // Transition to Resetting
         let old = ports.set_state(b"test:", PortState::Resetting);
-        assert_eq!(old, Some(PortState::Ready));
+        assert_eq!(old, Some(PortState::Claimed));
         assert!(!ports.is_ready(b"test:"));
         assert_eq!(ports.get_state(b"test:"), Some(PortState::Resetting));
 
-        // Transition back to Ready
-        let old = ports.set_state(b"test:", PortState::Ready);
+        // Transition back to Safe
+        let old = ports.set_state(b"test:", PortState::Safe);
         assert_eq!(old, Some(PortState::Resetting));
-        assert!(ports.is_ready(b"test:"));
+        assert!(!ports.is_ready(b"test:"));
     }
 
     #[test]

@@ -36,13 +36,9 @@ impl ProcessOps for KernelProcessOps {
 
         // Phase 1: Transition state under scheduler lock, enqueue microtasks
         task::with_scheduler(|sched| {
-            let info = match lifecycle::exit(sched, task_id, code) {
-                Ok(info) => info,
-                Err(e) => {
-                    kinfo!("process_ops", "exit_lifecycle_error"; pid = task_id as u64, err = e as i64);
-                    None
-                }
-            };
+            if let Err(e) = lifecycle::exit(sched, task_id, code) {
+                kinfo!("process_ops", "exit_lifecycle_error"; pid = task_id as u64, err = e as i64);
+            }
 
             // Set cleanup phase on the task
             if let Some(slot) = sched.slot_by_pid(task_id) {
@@ -52,15 +48,10 @@ impl ProcessOps for KernelProcessOps {
             }
 
             // Enqueue Phase 1 microtasks (lock ordering: SCHEDULER(10) → MICROTASK(15) is valid)
-            if let Some(ref info) = info {
-                let _ = microtask::enqueue(MicroTask::NotifyParentExit {
-                    parent_id: info.parent_id,
-                    child_pid: info.child_pid,
-                    code: info.code,
-                });
-            }
+            // NotifyParentExit is deferred to Phase 2 — parent learns about exit
+            // only after IPC cleanup, bus release, and grace period are complete.
             let _ = microtask::enqueue(MicroTask::IpcCleanup { pid: task_id });
-            let _ = microtask::enqueue(MicroTask::ReparentChildren { pid: task_id });
+            let _ = microtask::enqueue(MicroTask::KillChildren { pid: task_id });
         });
 
         // Drain microtasks immediately (outside scheduler lock)
@@ -98,7 +89,7 @@ impl ProcessOps for KernelProcessOps {
         // Phase 1: Transition state under scheduler lock, enqueue microtasks
         let (result, need_resched) = task::with_scheduler(|sched| {
             match lifecycle::kill(sched, target, killer) {
-                Ok(info) => {
+                Ok(_info) => {
                     // Set cleanup phase
                     if let Some(slot) = sched.slot_by_pid(target) {
                         if let Some(task) = sched.task_mut(slot) {
@@ -107,15 +98,9 @@ impl ProcessOps for KernelProcessOps {
                     }
 
                     // Enqueue Phase 1 microtasks
-                    if let Some(ref info) = info {
-                        let _ = microtask::enqueue(MicroTask::NotifyParentExit {
-                            parent_id: info.parent_id,
-                            child_pid: info.child_pid,
-                            code: info.code,
-                        });
-                    }
+                    // NotifyParentExit deferred to Phase 2 (after cleanup + grace period)
                     let _ = microtask::enqueue(MicroTask::IpcCleanup { pid: target });
-                    let _ = microtask::enqueue(MicroTask::ReparentChildren { pid: target });
+                    let _ = microtask::enqueue(MicroTask::KillChildren { pid: target });
 
                     (Ok(()), target == killer)
                 }
@@ -131,7 +116,8 @@ impl ProcessOps for KernelProcessOps {
 
         // Drain microtasks immediately (outside scheduler lock)
         // Higher budget at kill — cleanup is priority.
-        microtask::drain(64);
+        let drained = microtask::drain(64);
+        kinfo!("process_ops", "kill_drain_done"; target = target as u64, drained = drained as u64);
 
         if need_resched {
             crate::kernel::sched::reschedule();

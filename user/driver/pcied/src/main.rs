@@ -1,33 +1,26 @@
 //! PCIe Bus Driver
 //!
-//! Reads PCI device list from the kernel's PCI registry and registers
+//! Reads PCI device list from the kernel bus protocol and registers
 //! per-device ports with devd. The kernel handles all ECAM/MAC access,
 //! BAR probing, and BAR allocation. pcied is a thin policy layer.
 //!
 //! Architecture:
-//! 1. Connect to kernel's /kernel/bus/pcie0 to receive bus state
-//! 2. Wait for Safe state (kernel has already enumerated devices)
-//! 3. Read PCI device list from kernel via pci_enumerate()
-//! 4. Enable bus mastering for DMA-capable devices via kernel bus control
-//! 5. Register each device as a devd port with BAR0 metadata
-//! 6. devd rules match port types and spawn child drivers (nvmed, xhcid, etc.)
-//! 7. Child drivers read BAR0 info from spawn context metadata
+//! 1. Connect to kernel's /kernel/bus/pcie0 to receive bus state + device list
+//! 2. Read device list from BusCtx::bus_devices() (delivered via bus protocol)
+//! 3. Enable bus mastering for DMA-capable devices via kernel bus control
+//! 4. Register each device as a devd port with BAR0 metadata
+//! 5. devd rules match port types and spawn child drivers (nvmed, usbd, etc.)
+//! 6. Child drivers read BAR0 info from spawn context metadata
 
 #![no_std]
 #![no_main]
 
-use userlib::syscall;
 use userlib::{uinfo, uerror};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId,
-    KernelBusState, KernelBusChangeReason, bus_msg,
-    PortInfo, PortClass, PortState, port_subclass,
+    bus_msg, PortInfo, PortClass, PortMetadata, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
-
-// ============================================================================
-// Logging — uses structured ulog macros from userlib
-// ============================================================================
 
 // ============================================================================
 // PCI Class Constants
@@ -49,7 +42,7 @@ mod pci_prog_if {
 }
 
 // ============================================================================
-// Device Classification (from PciEnumEntry)
+// Device Classification (from BusDevice)
 // ============================================================================
 
 const MAX_PCI_DEVICES: usize = 32;
@@ -88,12 +81,12 @@ fn needs_bus_mastering(base_class: u8, subclass: u8, prog_if: u8) -> bool {
     )
 }
 
-fn format_port_name(entry: &syscall::PciEnumEntry, buf: &mut [u8; 32]) -> usize {
+fn format_port_name(dev: &userlib::BusDevice, buf: &mut [u8; 32]) -> usize {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bus = entry.bus();
-    let device = entry.device();
-    let function = entry.function();
-    let cname = class_name(entry.base_class(), entry.subclass(), entry.prog_if());
+    let bus = dev.pci_bus();
+    let device = dev.pci_device();
+    let function = dev.pci_function();
+    let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
 
     let mut i = 0;
     buf[i] = HEX[(bus >> 4) as usize]; i += 1;
@@ -112,20 +105,12 @@ fn format_port_name(entry: &syscall::PciEnumEntry, buf: &mut [u8; 32]) -> usize 
     i
 }
 
-/// Build BAR0 metadata: [bar0_phys: u64 LE, bar0_size: u32 LE] = 12 bytes
-fn bar0_metadata(entry: &syscall::PciEnumEntry) -> [u8; 12] {
-    let mut meta = [0u8; 12];
-    meta[0..8].copy_from_slice(&entry.bar0_addr.to_le_bytes());
-    meta[8..12].copy_from_slice(&entry.bar0_size.to_le_bytes());
-    meta
-}
-
 // ============================================================================
 // PCIe Driver (Bus Framework)
 // ============================================================================
 
 struct PcieDriver {
-    entries: [syscall::PciEnumEntry; MAX_PCI_DEVICES],
+    devices: [userlib::BusDevice; MAX_PCI_DEVICES],
     count: usize,
     kernel_bus: Option<KernelBusId>,
 }
@@ -133,7 +118,7 @@ struct PcieDriver {
 impl PcieDriver {
     const fn new() -> Self {
         Self {
-            entries: [syscall::PciEnumEntry::empty(); MAX_PCI_DEVICES],
+            devices: [userlib::BusDevice::empty(); MAX_PCI_DEVICES],
             count: 0,
             kernel_bus: None,
         }
@@ -158,13 +143,13 @@ impl PcieDriver {
         let mut w = W { b: &mut buf, p: &mut pos };
         let _ = writeln!(w, "PCIe Bus Driver (kernel-enumerated)");
         let _ = writeln!(w, "  Devices: {}", self.count);
-        for entry in &self.entries[..self.count] {
-            let cname = class_name(entry.base_class(), entry.subclass(), entry.prog_if());
+        for dev in &self.devices[..self.count] {
+            let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
             let _ = writeln!(w, "    {:02x}:{:02x}.{} {:04x}:{:04x} {} bar0={:#x}",
-                entry.bus(), entry.device(), entry.function(),
-                entry.vendor_id, entry.device_id,
+                dev.pci_bus(), dev.pci_device(), dev.pci_function(),
+                dev.vendor_id, dev.device_id,
                 cname,
-                entry.bar0_addr);
+                dev.resource0);
         }
 
         buf
@@ -176,18 +161,7 @@ impl PcieDriver {
 // ============================================================================
 
 impl Driver for PcieDriver {
-    fn bus_state_changed(
-        &mut self,
-        _bus: KernelBusId,
-        _old_state: KernelBusState,
-        _new_state: KernelBusState,
-        _reason: KernelBusChangeReason,
-        _ctx: &mut dyn BusCtx,
-    ) {
-        uinfo!("pcied", "bus_state_change";);
-    }
-
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         uinfo!("pcied", "starting";);
 
         // Get bus path from spawn context, falling back to default
@@ -207,8 +181,7 @@ impl Driver for PcieDriver {
         }
         let bus_path = &bus_path_buf[..bus_path_len];
 
-        // Claim the kernel bus — handles the full protocol:
-        // connect -> StateSnapshot -> wait Safe -> SetDriver -> Mux registration
+        // Claim the kernel bus — receives StateSnapshot + DeviceList
         match ctx.claim_kernel_bus(bus_path) {
             Ok((bus_id, info)) => {
                 uinfo!("pcied", "bus_claimed"; bus_type = info.bus_type as u32, caps = userlib::ulog::hex32(info.capabilities as u32));
@@ -216,29 +189,30 @@ impl Driver for PcieDriver {
             }
             Err(_) => {
                 uerror!("pcied", "bus_unavailable";);
+                return Err(BusError::Internal);
             }
         }
 
-        // Read PCI device list from kernel registry
-        match syscall::pci_enumerate(&mut self.entries) {
-            Ok(count) => {
+        // Read device list from bus protocol (delivered on connect)
+        if let Some(bus_id) = self.kernel_bus {
+            if let Some(bus_devs) = ctx.bus_devices(bus_id) {
+                let count = bus_devs.len().min(MAX_PCI_DEVICES);
+                self.devices[..count].copy_from_slice(&bus_devs[..count]);
                 self.count = count;
                 uinfo!("pcied", "pci_devices"; count = count as u32);
-            }
-            Err(e) => {
-                uerror!("pcied", "pci_enumerate_failed";);
-                return Err(BusError::Internal);
+            } else {
+                uinfo!("pcied", "no_devices";);
             }
         }
 
         // Enable bus mastering for DMA-capable devices via kernel bus control
         if let Some(bus_id) = self.kernel_bus {
             for idx in 0..self.count {
-                let entry = &self.entries[idx];
-                if needs_bus_mastering(entry.base_class(), entry.subclass(), entry.prog_if()) {
-                    let device_bdf = (entry.bdf & 0xFFFF) as u16;
-                    if let Err(e) = ctx.enable_bus_mastering(bus_id, device_bdf) {
-                        uerror!("pcied", "bus_master_failed"; bdf = entry.bdf);
+                let dev = &self.devices[idx];
+                if needs_bus_mastering(dev.base_class(), dev.subclass(), dev.prog_if()) {
+                    let device_bdf = (dev.id & 0xFFFF) as u16;
+                    if let Err(_e) = ctx.enable_bus_mastering(bus_id, device_bdf) {
+                        uerror!("pcied", "bus_master_failed"; bdf = dev.id);
                     }
                 }
             }
@@ -246,27 +220,33 @@ impl Driver for PcieDriver {
 
         // Register per-device ports with devd using unified PortInfo
         for idx in 0..self.count {
-            let entry = &self.entries[idx];
+            let dev = &self.devices[idx];
             let mut name_buf = [0u8; 32];
-            let name_len = format_port_name(entry, &mut name_buf);
+            let name_len = format_port_name(dev, &mut name_buf);
             let name = &name_buf[..name_len];
 
             // Build PortInfo with class/subclass and vendor/device IDs
             let (class, subclass) = port_class_subclass(
-                entry.base_class(), entry.subclass(), entry.prog_if()
+                dev.base_class(), dev.subclass(), dev.prog_if()
             );
             let mut info = PortInfo::new(name, class);
             info.port_subclass = subclass;
-            info.vendor_id = entry.vendor_id;
-            info.device_id = entry.device_id;
+            info.vendor_id = dev.vendor_id;
+            info.device_id = dev.device_id;
+
+            // Encode BAR0 info into metadata: [bar0_addr: u64 LE, bar0_size: u32 LE]
+            // Child drivers (usbd, nvmed) read this to map MMIO registers
+            let mut raw = [0u8; 24];
+            raw[0..8].copy_from_slice(&dev.resource0.to_le_bytes());
+            raw[8..12].copy_from_slice(&dev.resource1.to_le_bytes());
+            info.metadata = PortMetadata { raw };
 
             let _ = ctx.register_port_with_info(&info, 0);
-            let _ = ctx.set_port_state(name, PortState::Ready);
 
             uinfo!("pcied", "port_registered";
                 name = core::str::from_utf8(name).unwrap_or("?"),
-                bar0 = userlib::ulog::hex64(entry.bar0_addr),
-                size = userlib::ulog::hex32(entry.bar0_size));
+                bar0 = userlib::ulog::hex64(dev.resource0),
+                size = userlib::ulog::hex32(dev.resource1));
         }
 
         uinfo!("pcied", "ready"; devices = self.count as u32);
@@ -301,22 +281,11 @@ fn main() {
 struct PcieDriverWrapper(&'static mut PcieDriver);
 
 impl Driver for PcieDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         self.0.command(msg, ctx)
-    }
-
-    fn bus_state_changed(
-        &mut self,
-        bus: KernelBusId,
-        old_state: KernelBusState,
-        new_state: KernelBusState,
-        reason: KernelBusChangeReason,
-        ctx: &mut dyn BusCtx,
-    ) {
-        self.0.bus_state_changed(bus, old_state, new_state, reason, ctx)
     }
 }

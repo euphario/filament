@@ -969,7 +969,7 @@ fn format_u64(mut val: u64, buf: &mut [u8]) -> usize {
 // =============================================================================
 
 impl Driver for IpdDriver {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         // group_id defaults to 0 (all ports in one bridge group).
         // When multiple bridge groups exist, switchd registers per-group ports
         // (br0:, br1:) and the group_id will be set via sidechannel query.
@@ -1127,8 +1127,8 @@ const IPD_CONFIG_KEYS: &[ConfigKey] = &[
 ];
 
 impl Driver for IpdDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {

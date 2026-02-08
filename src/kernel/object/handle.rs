@@ -96,8 +96,10 @@ pub fn default_rights(obj_type: ObjectType) -> HandleRights {
         ),
         // Process: read only (wait for exit)
         ObjectType::Process => HandleRights::READ,
-        // Bus: read only
-        ObjectType::Bus | ObjectType::BusList => HandleRights::READ,
+        // Bus: write (probed writes RegisterDevice to add devices)
+        ObjectType::Bus => HandleRights::WRITE,
+        // BusList: read only
+        ObjectType::BusList => HandleRights::READ,
         // MMIO: read + map
         ObjectType::Mmio => HandleRights(
             HandleRights::READ.0 | HandleRights::MAP.0

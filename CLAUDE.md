@@ -148,6 +148,12 @@ See [docs/PRINCIPLES.md](docs/PRINCIPLES.md) for complete design philosophy.
 
 ---
 
+## Claude Code Rules
+
+- **NEVER run QEMU or other long-lived background processes** — they freeze the Claude CLI. Build only; the user will test manually.
+
+---
+
 ## Build & Run
 
 ### Build Commands (cargo xtask)

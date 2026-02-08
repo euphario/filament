@@ -346,6 +346,10 @@ pub extern "C" fn kmain() -> ! {
             // sched guard is dropped here, releasing the lock
         };
 
+        // Set per-CPU kernel stack top so exception return paths can
+        // restore SP_EL1 correctly after simple preemption switches tasks.
+        kernel::percpu::set_kernel_stack_top(kstack_top);
+
         // Start timer preemption just before entering userspace.
         // We can't start this earlier in boot because timer IRQs
         // would trigger rescheduling before we're ready.
@@ -840,6 +844,11 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                         if let Some(ref addr_space) = task.address_space {
                             kernel::percpu::set_ttbr0(addr_space.get_ttbr0());
                         }
+                        // Set kernel stack top so assembly can set SP_EL1 before eret
+                        let kstack_top = crate::arch::aarch64::mmu::phys_to_virt(
+                            task.kernel_stack + task.kernel_stack_size as u64
+                        );
+                        kernel::percpu::set_kernel_stack_top(kstack_top);
                     }
                 }
 
@@ -984,6 +993,11 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 if let Some(ref addr_space) = task.address_space {
                     kernel::percpu::set_ttbr0(addr_space.get_ttbr0());
                 }
+                // Set kernel stack top so assembly can set SP_EL1 before eret
+                let kstack_top = crate::arch::aarch64::mmu::phys_to_virt(
+                    task.kernel_stack + task.kernel_stack_size as u64
+                );
+                kernel::percpu::set_kernel_stack_top(kstack_top);
             }
             // Return to assembly which will eret to next task
         } else {

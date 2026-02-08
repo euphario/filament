@@ -6,9 +6,8 @@
 //! ## Responsibilities
 //! - Track all services and their registered ports
 //! - Route client queries to correct service
-//! - Enforce startup dependencies (requires/depends_on)
-//! - Prune service branch on crash, then restart
-//! - Supervise with exponential backoff
+//! - Auto-spawn drivers via PORT_RULES when ports transition to Ready
+//! - Supervise with exponential backoff and restart on crash
 //!
 //! ## Architecture
 //!
@@ -16,7 +15,7 @@
 //! - `service.rs` - Service state machine (ServiceManager trait)
 //! - `ports.rs` - Port registry (PortRegistry trait)
 //! - `process.rs` - Process management (ProcessManager trait)
-//! - `deps.rs` - Dependency resolution (DependencyResolver trait)
+//! - `rules.rs` - Unified port rules engine (PortClass → driver binary)
 //!
 //! Each module is testable independently via trait mocking.
 
@@ -28,7 +27,6 @@ extern crate abi;
 mod service;
 mod ports;
 mod process;
-mod deps;
 mod devices;
 mod query;
 mod rules;
@@ -44,13 +42,12 @@ use userlib::query::{
 };
 
 use service::{
-    ServiceState, ServiceManager, ServiceRegistry, PortDef,
-    MAX_SERVICES, MAX_PORTS_PER_SERVICE, MAX_RESTARTS,
+    ServiceState, ServiceManager, ServiceRegistry,
+    MAX_SERVICES, MAX_RESTARTS,
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
 };
 use ports::{PortRegistry, Ports};
 use process::{ProcessManager, SyscallProcessManager};
-use deps::{DependencyResolver, Dependencies};
 use devices::{DeviceStore, DeviceRegistry};
 use query::{QueryHandler, MSG_BUFFER_SIZE, MAX_QUERY_CLIENTS};
 
@@ -193,6 +190,10 @@ struct InflightSpawn {
     binary_name_len: u8,
     /// Service index for parent-delegated spawns (0xFF = not a service spawn)
     service_idx: u8,
+    /// Capability bits for the spawned process
+    caps: u64,
+    /// Link ID tying spawn to port (carried through to service slot)
+    link_id: u32,
 }
 
 impl InflightSpawn {
@@ -205,6 +206,8 @@ impl InflightSpawn {
             binary_name: [0u8; 16],
             binary_name_len: 0,
             service_idx: 0xFF,
+            caps: 0,
+            link_id: 0,
         }
     }
 }
@@ -309,6 +312,10 @@ impl TrackedDisk {
             (DiskState::Discovered, DiskState::AttachSent { .. }) => true,
             (DiskState::AttachSent { .. }, DiskState::PartitionsReported) => true,
             (DiskState::PartitionsReported, DiskState::Ready) => true,
+            // Backward: partd crashed, re-discover
+            (DiskState::AttachSent { .. }, DiskState::Discovered) => true,
+            (DiskState::PartitionsReported, DiskState::Discovered) => true,
+            (DiskState::Ready, DiskState::Discovered) => true,
             _ => false,
         };
         if valid {
@@ -524,9 +531,7 @@ impl LogBuffer {
 }
 
 pub struct Devd {
-    /// Our port for services to announce ready
-    port: Option<Port>,
-    /// Query port for device queries
+    /// Query port for driver supervision and admin commands
     query_port: Option<Port>,
     /// Event loop
     events: Option<EventLoop>,
@@ -536,8 +541,6 @@ pub struct Devd {
     ports: Ports,
     /// Process manager
     process_mgr: SyscallProcessManager,
-    /// Dependency resolver
-    deps: Dependencies,
     /// Device registry (for hierarchical queries)
     devices: DeviceRegistry,
     /// Query handler for client connections
@@ -570,18 +573,18 @@ pub struct Devd {
     partd_service_idx: u8,
     /// Orchestration sequence ID counter
     orch_seq_id: u32,
+    /// Next link ID for port↔service pairing (0 = sentinel, starts at 1)
+    next_link_id: u32,
 }
 
 impl Devd {
     pub const fn new() -> Self {
         Self {
-            port: None,
             query_port: None,
             events: None,
             services: ServiceRegistry::new(),
             ports: Ports::new(),
             process_mgr: SyscallProcessManager::new(),
-            deps: Dependencies::new(),
             devices: DeviceRegistry::new(),
             query_handler: QueryHandler::new(),
             admin_clients: AdminClients::new(),
@@ -597,6 +600,7 @@ impl Devd {
             next_partition_num: 0,
             partd_service_idx: 0xFF,
             orch_seq_id: 1,
+            next_link_id: 1,
         }
     }
 
@@ -606,6 +610,13 @@ impl Devd {
 
     fn now_ms() -> u64 {
         syscall::gettime() / 1_000_000
+    }
+
+    /// Allocate a unique link ID for port↔service pairing.
+    fn alloc_link_id(&mut self) -> u32 {
+        let id = self.next_link_id;
+        self.next_link_id = self.next_link_id.wrapping_add(1).max(1);
+        id
     }
 
     /// Get service name by index, for log messages
@@ -620,27 +631,24 @@ impl Devd {
     pub fn init(&mut self) -> SysResult<()> {
         let mut events = EventLoop::new()?;
 
-        let port = Port::register(b"devd:")?;
-        events.watch(port.handle())?;
-
         let query_port = Port::register(b"devd-query:")?;
         events.watch(query_port.handle())?;
         uinfo!("devd", "query_port_init"; handle = query_port.handle().raw());
 
-        self.port = Some(port);
         self.query_port = Some(query_port);
         self.events = Some(events);
 
-        // Register devd's own service ports using PortInfo
-        let mut devd_info = abi::PortInfo::new(b"devd:", abi::PortClass::Service);
-        let _ = self.ports.register_with_port_info(&devd_info, 0xFF, 0);
-        devd_info.set_name(b"devd-query:");
+        // Register devd's service port in the port registry
+        let devd_info = abi::PortInfo::new(b"devd-query:", abi::PortClass::Service);
         let _ = self.ports.register_with_port_info(&devd_info, 0xFF, 0);
 
-        self.services.init_from_defs();
-
-        // Discover kernel buses and spawn drivers before checking static deps
+        // Discover kernel buses — rules fire on Ready, spawning bus drivers
         self.discover_kernel_buses();
+
+        // Spawn boot services that don't have a port trigger
+        self.create_and_spawn("vfsd", userlib::devd::caps::DRIVER, &[], 0);
+        #[cfg(feature = "stress-test")]
+        self.create_and_spawn("testr", u64::MAX, &[], 0);
 
         Ok(())
     }
@@ -692,12 +700,11 @@ impl Devd {
                 class = port_class as u16
             );
 
-            // Set port to Ready — this triggers check_class_rules via
-            // the same path as handle_set_port_state, but we call it directly
-            // since these ports don't have a driver channel yet.
-            let _ = self.ports.set_state(path, abi::PortState::Ready);
+            // Set port to Claimed — kernel bus ports are managed by the kernel,
+            // so they're immediately available. Fire rules on the transition.
+            let _ = self.ports.set_state(path, abi::PortState::Claimed);
 
-            // Fire rules on the Ready transition
+            // Fire rules on the Claimed transition
             self.check_class_rules(&port_info, 0xFF);
         }
     }
@@ -706,152 +713,55 @@ impl Devd {
     ///
     /// Unlike driver-owned ports where SpawnChild goes via the owner's channel,
     /// kernel bus ports are owned by devd itself, so we spawn directly.
-    fn spawn_bus_driver(&mut self, binary: &'static str, caps: u64, bus_path: &[u8]) {
-        let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
-            Ok(result) => result,
-            Err(_) => {
-                uerror!("devd", "bus_driver_spawn_failed"; binary = binary);
-                return;
-            }
-        };
-
-        // Store spawn context so driver can query GET_SPAWN_CONTEXT
-        self.store_spawn_context(pid, 7, bus_path, &[]);
-
-        let now = Self::now_ms();
-        let slot_idx = self.services.create_dynamic_service_with_state(
-            pid, binary.as_bytes(), now, ServiceState::Starting,
-        );
-
-        if let Some(idx) = slot_idx {
-            if let Some(service) = self.services.get_mut(idx) {
-                service.watcher = Some(watcher);
-            }
-
-            self.add_recent_dynamic_pid(pid, idx as u8);
-
-            // Add watcher to event loop
-            if let Some(events) = &mut self.events {
-                if let Some(service) = self.services.get(idx) {
-                    if let Some(w) = &service.watcher {
-                        let _ = events.watch(w.handle());
-                    }
-                }
-            }
-
-            uinfo!("devd", "bus_driver_spawned"; binary = binary, pid = pid);
-        } else {
-            uerror!("devd", "no_dynamic_slot"; binary = binary, pid = pid);
-        }
-    }
-
-    // =========================================================================
-    // Dependency Resolution
-    // =========================================================================
-
-    fn check_pending_services(&mut self) {
-        let now = Self::now_ms();
-
-        // Collect indices of services to spawn (dependencies satisfied)
-        let mut to_spawn = [None; MAX_SERVICES];
-        let mut spawn_count = 0;
-
-        self.services.for_each(|i, service| {
-            if service.state == ServiceState::Pending {
-                let satisfied = self.deps.satisfied(service, &self.ports);
-                if satisfied {
-                    if spawn_count < MAX_SERVICES {
-                        to_spawn[spawn_count] = Some(i);
-                        spawn_count += 1;
-                    }
-                }
-            }
-        });
-
-        // Spawn all services whose dependencies are satisfied
-        for idx in to_spawn.iter().flatten().copied() {
-            self.spawn_service(idx, now);
-        }
-    }
-
-    // =========================================================================
-    // Service Spawning
-    // =========================================================================
-
-    fn spawn_service(&mut self, idx: usize, now: u64) {
+    /// Spawn (or respawn) a service from its service slot.
+    ///
+    /// The slot must already exist with name, caps, and trigger_port set.
+    /// This is the single spawn path — used by rule matching, restart timers,
+    /// and admin commands alike.
+    fn spawn_service(&mut self, idx: usize) {
         if idx >= MAX_SERVICES {
             return;
         }
 
-        // Get service definition
-        let (binary, context_port, context_port_type, caps, parent) = match self.services.get(idx).and_then(|s| s.def()) {
-            Some(d) => (d.binary, d.context_port, d.context_port_type, d.caps, d.parent),
-            None => return,
+        let now = Self::now_ms();
+
+        // Extract spawn info from service slot
+        let (name_buf, name_len, caps, trigger_port_buf, trigger_port_len) = {
+            let service = match self.services.get(idx) {
+                Some(s) => s,
+                None => return,
+            };
+            let name = service.name();
+            let mut nb = [0u8; 16];
+            let nl = name.len().min(16);
+            nb[..nl].copy_from_slice(&name.as_bytes()[..nl]);
+
+            let mut tp = [0u8; 32];
+            let tpl = service.trigger_port_len as usize;
+            tp[..tpl].copy_from_slice(&service.trigger_port[..tpl]);
+
+            (nb, nl, service.caps, tp, tpl)
         };
 
-        // If parent is specified, delegate spawning to that service
-        if let Some(parent_name) = parent {
-            // Find parent service index
-            let parent_idx = self.services.find_by_binary(parent_name);
-            if let Some(pidx) = parent_idx {
-                // Check if parent is Ready - only send if parent can receive commands
-                let parent_ready = self.services.get(pidx)
-                    .map(|s| s.state == ServiceState::Ready)
-                    .unwrap_or(false);
+        let binary = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("???");
 
-                if !parent_ready {
-                    // Parent not ready yet - stay Pending, will retry when parent reports Ready
-                    return;
-                }
-
-                // Link parent-child relationship (deferred from init because
-                // dynamic services like consoled don't exist at init_from_defs time)
-                if let Some(service) = self.services.get_mut(idx) {
-                    if service.parent.is_none() {
-                        service.parent = Some(pidx as u8);
-                    }
-                }
-                if let Some(parent_svc) = self.services.get_mut(pidx) {
-                    parent_svc.add_child(idx as u8);
-                }
-
-                // Parent is ready - send SPAWN_CHILD now
-                match self.query_handler.send_spawn_child_with_caps(
-                    pidx as u8, binary.as_bytes(), b"", caps,
-                ) {
-                    Some(seq_id) => {
-                        // Track this as an inflight spawn so we can update service on ACK
-                        // Include context_port so spawn context is stored when ACK arrives
-                        self.track_inflight_spawn_for_service(seq_id, idx, context_port, context_port_type);
-                        // Set service to Starting state
-                        if let Some(service) = self.services.get_mut(idx) {
-                            service.state = ServiceState::Starting;
-                            service.last_change = now;
-                        }
-                    }
-                    None => {
-                        self.services.transition(idx, ServiceState::Failed { code: -1 }, now);
-                    }
-                }
-            } else {
-                self.services.transition(idx, ServiceState::Failed { code: -1 }, now);
-            }
-            return;
-        }
-
-        // Spawn the process directly (with caps if specified)
+        // Spawn the process
         let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
             Ok(result) => result,
             Err(_) => {
+                uerror!("devd", "svc_spawn_failed"; binary = binary);
                 self.services.transition(idx, ServiceState::Failed { code: -1 }, now);
                 return;
             }
         };
 
-        // Store spawn context so child can query GET_SPAWN_CONTEXT
-        // Include metadata from port registration (e.g., BAR0 info)
-        if !context_port.is_empty() {
-            let metadata: ([u8; 64], usize) = self.ports.get(context_port)
+        // Store spawn context — always, even for services with no trigger port.
+        // Bus-framework drivers query GET_SPAWN_CONTEXT on startup; without an
+        // entry they crash.
+        let trigger_port = &trigger_port_buf[..trigger_port_len];
+        let (port_type, metadata_buf, metadata_len) = if trigger_port_len > 0 {
+            let pt = self.ports.get_port_type(trigger_port).unwrap_or(0);
+            let md: ([u8; 64], usize) = self.ports.get(trigger_port)
                 .map(|p| {
                     let m = p.metadata();
                     let mut buf = [0u8; 64];
@@ -860,29 +770,16 @@ impl Devd {
                     (buf, len)
                 })
                 .unwrap_or(([0u8; 64], 0));
-            self.store_spawn_context(pid, context_port_type, context_port, &metadata.0[..metadata.1]);
-        }
+            (pt, md.0, md.1)
+        } else {
+            (0u8, [0u8; 64], 0usize)
+        };
+        self.store_spawn_context(pid, port_type, trigger_port, &metadata_buf[..metadata_len]);
 
-        // Add watcher to event loop
+        // Watch the process
         if let Some(events) = &mut self.events {
             let _ = events.watch(watcher.handle());
         }
-
-        // Collect port definitions before mutable borrow
-        let port_defs: [Option<PortDef>; MAX_PORTS_PER_SERVICE] = {
-            match self.services.get(idx).and_then(|s| s.def()) {
-                Some(def) => {
-                    let mut arr = [None; MAX_PORTS_PER_SERVICE];
-                    for (i, pd) in def.registers.iter().enumerate() {
-                        if i < MAX_PORTS_PER_SERVICE {
-                            arr[i] = Some(*pd);
-                        }
-                    }
-                    arr
-                }
-                None => return,
-            }
-        };
 
         // Update service state
         if let Some(service) = self.services.get_mut(idx) {
@@ -892,30 +789,34 @@ impl Devd {
             service.last_change = now;
         }
 
-        uinfo!("devd", "svc_spawned"; binary = binary, pid = pid);
+        self.add_recent_dynamic_pid(pid, idx as u8);
 
-        // Pre-register ports this service will provide (not available yet)
-        for pd in port_defs.iter().flatten() {
-            // Convert legacy port_type to PortClass
-            let port_class = match pd.port_type {
-                1 => abi::PortClass::Block,       // BLOCK
-                2 => abi::PortClass::Block,       // PARTITION
-                3 => abi::PortClass::Filesystem,  // FILESYSTEM
-                4 => abi::PortClass::Usb,         // USB
-                5 => abi::PortClass::Network,     // NETWORK
-                6 => abi::PortClass::Console,     // CONSOLE
-                7 => abi::PortClass::Service,     // SERVICE
-                8 => abi::PortClass::StorageController, // STORAGE
-                _ => abi::PortClass::Unknown,
-            };
-            let info = abi::PortInfo::new(pd.name, port_class);
-            let _ = self.ports.register_with_port_info(&info, idx as u8, 0);
-            // Pre-registered ports start in Initialize state, not Ready
-            self.ports.set_state(pd.name, abi::PortState::Initialize);
+        uinfo!("devd", "svc_spawned"; binary = binary, pid = pid);
+    }
+
+    /// Create a service slot and spawn.  Used by check_class_rules for port-triggered
+    /// drivers and by init for boot services.
+    fn create_and_spawn(&mut self, binary: &str, caps: u64, trigger_port: &[u8], link_id: u32) {
+        let now = Self::now_ms();
+        let idx = match self.services.create_dynamic_service_with_state(
+            0, binary.as_bytes(), now, ServiceState::Pending,
+        ) {
+            Some(i) => i,
+            None => {
+                uerror!("devd", "no_service_slot"; binary = binary);
+                return;
+            }
+        };
+
+        if let Some(service) = self.services.get_mut(idx) {
+            service.caps = caps;
+            service.link_id = link_id;
+            if !trigger_port.is_empty() {
+                service.set_trigger_port(trigger_port);
+            }
         }
 
-        // For services that don't register ports, mark Ready immediately
-        self.mark_portless_services_ready();
+        self.spawn_service(idx);
     }
 
     // =========================================================================
@@ -929,7 +830,6 @@ impl Devd {
 
         let now = Self::now_ms();
 
-        // Collect info about the exit
         #[derive(Clone, Copy)]
         enum ExitAction {
             Stopped,
@@ -937,20 +837,18 @@ impl Devd {
             Failed,
         }
 
-        // First pass: collect info and update service state
-        let (port_names, should_prune, action, old_pid) = {
+        // Update service state and collect info
+        let (action, old_pid, svc_idx_u8) = {
             let service = match self.services.get_mut(idx) {
                 Some(s) => s,
                 None => return,
             };
 
-            // Copy name to local buffer (name() borrows dynamic_name)
             let mut name_buf = [0u8; 16];
             let name_str = service.name();
             let name_len = name_str.len().min(16);
             name_buf[..name_len].copy_from_slice(&name_str.as_bytes()[..name_len]);
 
-            let auto_restart = service.def().map(|d| d.auto_restart).unwrap_or(false);
             let old_pid = service.pid;
 
             // Clear PID - the process has exited
@@ -970,20 +868,10 @@ impl Devd {
                 }
             }
 
-            // Collect port names
-            let mut port_arr = [None; MAX_PORTS_PER_SERVICE];
-            if let Some(def) = service.def() {
-                for (i, pd) in def.registers.iter().enumerate() {
-                    if i < MAX_PORTS_PER_SERVICE {
-                        port_arr[i] = Some(pd.name);
-                    }
-                }
-            }
-
             if code == 0 {
                 service.state = ServiceState::Stopped { code: 0 };
                 service.last_change = now;
-                (port_arr, false, ExitAction::Stopped, old_pid)
+                (ExitAction::Stopped, old_pid, idx as u8)
             } else {
                 service.total_restarts = service.total_restarts.saturating_add(1);
 
@@ -992,17 +880,17 @@ impl Devd {
                     _ => 1,
                 };
 
-                if restarts >= MAX_RESTARTS || !auto_restart {
+                if restarts >= MAX_RESTARTS {
                     service.state = ServiceState::Failed { code };
                     service.last_change = now;
                     let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("?");
                     uerror!("devd", "svc_failed"; name = name, code = code as i32, restarts = service.total_restarts as u32);
-                    (port_arr, false, if auto_restart { ExitAction::Failed } else { ExitAction::Stopped }, old_pid)
+                    (ExitAction::Failed, old_pid, idx as u8)
                 } else {
                     service.state = ServiceState::Crashed { code, restarts };
                     service.last_change = now;
                     service.backoff_ms = (service.backoff_ms * 2).min(MAX_BACKOFF_MS);
-                    (port_arr, true, ExitAction::Crashed { backoff_ms: service.backoff_ms }, old_pid)
+                    (ExitAction::Crashed { backoff_ms: service.backoff_ms }, old_pid, idx as u8)
                 }
             }
         };
@@ -1010,16 +898,72 @@ impl Devd {
         // Clean up recent_dynamic_pids tracking for this PID
         if old_pid != 0 {
             self.remove_recent_dynamic_pid(old_pid);
+            self.remove_spawn_context(old_pid);
         }
 
-        // Unregister ports
-        for port_name in port_names.iter().flatten() {
-            self.ports.unregister(port_name);
+        // Unregister ports owned by this service (scan port registry)
+        // Collect child_link_ids before unregistering (for orphan killing)
+        let mut ports_to_remove: [Option<[u8; 32]>; 8] = [None; 8];
+        let mut removed_link_ids: [u32; 8] = [0; 8];
+        let mut remove_count = 0;
+        self.ports.for_each(|port| {
+            if port.owner() == svc_idx_u8 && remove_count < 8 {
+                let mut name = [0u8; 32];
+                let n = port.name();
+                let len = n.len().min(32);
+                name[..len].copy_from_slice(&n[..len]);
+                ports_to_remove[remove_count] = Some(name);
+                removed_link_ids[remove_count] = port.child_link_id();
+                remove_count += 1;
+            }
+        });
+        for name in ports_to_remove.iter().flatten() {
+            let len = name.iter().position(|&b| b == 0).unwrap_or(32);
+            self.ports.unregister(&name[..len]);
         }
 
-        // Prune children if needed
-        if should_prune {
-            self.prune_dependents(idx);
+        // If partd exited, reset orchestration state so new instance re-attaches
+        if svc_idx_u8 == self.partd_service_idx {
+            self.partd_service_idx = 0xFF;
+            for disk in self.tracked_disks.iter_mut() {
+                if disk.state != DiskState::Empty && disk.state != DiskState::Discovered {
+                    disk.state = DiskState::Discovered;
+                    disk.partition_count = 0;
+                    for p in disk.partitions.iter_mut() {
+                        *p = TrackedPartition::empty();
+                    }
+                }
+            }
+            uinfo!("devd", "partd_reset"; disks_rediscovered = true);
+        }
+
+        // Kill child services whose link_id matches a removed port's child_link_id.
+        // Example: consoled owns "console:" port with child_link_id=5 → shell has link_id=5.
+        // When consoled dies, shell must be killed so a new one can be spawned.
+        if remove_count > 0 {
+            let mut children_to_kill: [(u32, usize); 8] = [(0, 0); 8];
+            let mut kill_count = 0;
+            self.services.for_each(|child_idx, child_svc| {
+                if child_svc.link_id == 0 || child_idx == idx || !child_svc.state.is_running() || child_svc.pid == 0 {
+                    return;
+                }
+                for i in 0..remove_count {
+                    if child_svc.link_id == removed_link_ids[i] && removed_link_ids[i] != 0 && kill_count < 8 {
+                        children_to_kill[kill_count] = (child_svc.pid, child_idx);
+                        kill_count += 1;
+                        break;
+                    }
+                }
+            });
+            for i in 0..kill_count {
+                let (pid, child_idx) = children_to_kill[i];
+                if let Some(child_svc) = self.services.get(child_idx) {
+                    uinfo!("devd", "kill_orphaned_child";
+                        name = child_svc.name(), pid = pid);
+                }
+                let _ = self.process_mgr.kill(pid);
+                // Exit watcher will fire and handle cleanup via handle_service_exit
+            }
         }
 
         // Create restart timer if needed
@@ -1052,189 +996,6 @@ impl Devd {
             }
             ExitAction::Stopped => {}
         }
-    }
-
-    fn handle_service_ready(&mut self, idx: usize) {
-        if idx >= MAX_SERVICES {
-            return;
-        }
-
-        let now = Self::now_ms();
-
-        // Update service state and collect port names
-        let port_names: [Option<&'static [u8]>; MAX_PORTS_PER_SERVICE] = {
-            let service = match self.services.get_mut(idx) {
-                Some(s) => s,
-                None => return,
-            };
-
-            let mut arr = [None; MAX_PORTS_PER_SERVICE];
-            if let Some(def) = service.def() {
-                for (i, pd) in def.registers.iter().enumerate() {
-                    if i < MAX_PORTS_PER_SERVICE {
-                        arr[i] = Some(pd.name);
-                    }
-                }
-            }
-
-            uinfo!("devd", "svc_ready"; name = service.name());
-            service.state = ServiceState::Ready;
-            service.last_change = now;
-            service.backoff_ms = INITIAL_BACKOFF_MS;
-            arr
-        };
-
-        // Transition ports to Ready state
-        for port_name in port_names.iter().flatten() {
-            self.ports.set_state(port_name, abi::PortState::Ready);
-        }
-
-        // Check pending services
-        self.check_pending_services();
-    }
-
-    // =========================================================================
-    // Branch Pruning
-    // =========================================================================
-
-    fn prune_dependents(&mut self, provider_idx: usize) {
-        if provider_idx >= MAX_SERVICES {
-            return;
-        }
-
-        let dependents = self.deps.find_dependents(provider_idx, &self.services);
-
-        // Kill dependents recursively (depth-first)
-        for dep_idx in dependents.iter() {
-            self.prune_dependents(dep_idx);
-            self.kill_service(dep_idx);
-        }
-    }
-
-    fn kill_service(&mut self, idx: usize) {
-        if idx >= MAX_SERVICES {
-            return;
-        }
-
-        let now = Self::now_ms();
-
-        // Get service info
-        let (pid, port_names) = {
-            let service = match self.services.get_mut(idx) {
-                Some(s) => s,
-                None => return,
-            };
-
-            if !service.state.is_running() {
-                return;
-            }
-
-            let pid = service.pid;
-
-            // Clean up watcher
-            if let Some(watcher) = service.watcher.take() {
-                if let Some(events) = &mut self.events {
-                    let _ = events.unwatch(watcher.handle());
-                }
-            }
-
-            // Collect port names
-            let mut arr = [None; MAX_PORTS_PER_SERVICE];
-            if let Some(def) = service.def() {
-                for (i, pd) in def.registers.iter().enumerate() {
-                    if i < MAX_PORTS_PER_SERVICE {
-                        arr[i] = Some(pd.name);
-                    }
-                }
-            }
-
-            service.pid = 0;
-            service.state = ServiceState::Pending;
-            service.last_change = now;
-            (pid, arr)
-        };
-
-        // Kill the process
-        if pid != 0 {
-            let _ = self.process_mgr.kill(pid);
-            // Clean up recent_dynamic_pids tracking for this PID
-            self.remove_recent_dynamic_pid(pid);
-        }
-
-        // Unregister ports
-        for port_name in port_names.iter().flatten() {
-            self.ports.unregister(port_name);
-        }
-
-        // Remove devices registered by this service
-        let _removed = self.devices.remove_by_owner(idx as u8);
-    }
-
-    // =========================================================================
-    // Event Handling
-    // =========================================================================
-
-    fn handle_port_event(&mut self) {
-        let port = match &mut self.port {
-            Some(p) => p,
-            None => return,
-        };
-
-        match port.accept_with_pid() {
-            Ok((channel, client_pid)) => {
-                // Find which service connected by PID
-                let service_idx = self.services.find_by_pid(client_pid)
-                    .filter(|&i| {
-                        self.services.get(i)
-                            .map(|s| s.state == ServiceState::Starting)
-                            .unwrap_or(false)
-                    });
-
-                if let Some(idx) = service_idx {
-                    // Store channel and add to event loop
-                    if let Some(events) = &mut self.events {
-                        let _ = events.watch(channel.handle());
-                    }
-                    if let Some(service) = self.services.get_mut(idx) {
-                        service.channel = Some(channel);
-                    }
-                    // Mark service as Ready
-                    self.handle_service_ready(idx);
-                } else {
-                    // Unknown connection - treat as admin client (shell)
-                    if let Some(events) = &mut self.events {
-                        let _ = events.watch(channel.handle());
-                    }
-                    let _ = self.admin_clients.add(channel);
-                }
-            }
-            Err(SysError::WouldBlock) => {}
-            Err(_e) => {
-                uerror!("devd", "accept_failed";);
-            }
-        }
-    }
-
-    fn mark_portless_services_ready(&mut self) {
-        let now = Self::now_ms();
-
-        self.services.for_each_mut(|_i, service| {
-            // Dynamic services (bus-spawned drivers) use explicit STATE_CHANGE(Ready)
-            // protocol — never auto-transition them
-            if service.is_dynamic() {
-                return;
-            }
-            let registers_empty = service.def().map(|d| d.registers.is_empty()).unwrap_or(true);
-            if service.state == ServiceState::Starting
-                && registers_empty
-                && service.pid != 0
-            {
-                uinfo!("devd", "svc_ready_portless"; name = service.name());
-                service.state = ServiceState::Ready;
-                service.last_change = now;
-                service.backoff_ms = INITIAL_BACKOFF_MS;
-            }
-        });
     }
 
     // =========================================================================
@@ -1329,10 +1090,7 @@ impl Devd {
             }
         }
 
-        // Spawn it
-        let now = Self::now_ms();
-        self.spawn_service(idx, now);
-
+        self.spawn_service(idx);
         b"OK\n"
     }
 
@@ -1348,13 +1106,14 @@ impl Devd {
         };
 
         // Check if running
-        if let Some(service) = self.services.get(idx) {
-            if !service.state.is_running() {
-                return b"ERR not running\n";
-            }
+        let pid = self.services.get(idx).map(|s| s.pid).unwrap_or(0);
+        if pid == 0 {
+            return b"ERR not running\n";
         }
 
-        self.kill_service(idx);
+        // Kill the process — kernel cascading kill handles children
+        let _ = self.process_mgr.kill(pid);
+        // The process exit watcher will fire and handle cleanup
         b"OK\n"
     }
 
@@ -1369,22 +1128,21 @@ impl Devd {
             None => return b"ERR service not found\n",
         };
 
-        // Kill if running
-        if let Some(service) = self.services.get(idx) {
-            if service.state.is_running() {
-                self.kill_service(idx);
-            }
+        // Kill if running — exit handler will fire, then we respawn
+        let pid = self.services.get(idx).map(|s| s.pid).unwrap_or(0);
+        if pid != 0 {
+            let _ = self.process_mgr.kill(pid);
+            // Exit handler will transition state. For immediate restart, set a short timer.
         }
 
-        // Reset state to Pending so it can be spawned
+        // Reset state and respawn
         let now = Self::now_ms();
         if let Some(service) = self.services.get_mut(idx) {
             service.state = ServiceState::Pending;
             service.last_change = now;
         }
 
-        // Spawn it
-        self.spawn_service(idx, now);
+        self.spawn_service(idx);
         b"OK\n"
     }
 
@@ -1569,7 +1327,6 @@ impl Devd {
         }
 
         let now = Self::now_ms();
-
         // Clear timer and determine action
         let should_spawn = {
             let service = match self.services.get_mut(idx) {
@@ -1587,26 +1344,40 @@ impl Devd {
             match service.state {
                 ServiceState::Crashed { .. } => true,
                 ServiceState::Failed { .. } => {
-                    // Copy name to local buffer before modifying service
-                    let mut name_buf = [0u8; 16];
-                    let name_str = service.name();
-                    let name_len = name_str.len().min(16);
-                    name_buf[..name_len].copy_from_slice(&name_str.as_bytes()[..name_len]);
-
+                    // Reset for retry
                     service.backoff_ms = INITIAL_BACKOFF_MS;
-                    service.state = ServiceState::Pending;
                     service.last_change = now;
-
-                    false
+                    true
                 }
                 _ => false,
             }
         };
 
         if should_spawn {
-            self.spawn_service(idx, now);
-        } else {
-            self.check_pending_services();
+            self.spawn_service(idx);
+        }
+    }
+
+    /// Poll restart timers using wall-clock comparison.
+    ///
+    /// Fallback for timers that couldn't be added to the Mux (16-handle limit).
+    /// Called on every event loop iteration (100ms timeout). Timers that ARE
+    /// in the Mux fire immediately via Mux events; this catches the rest.
+    fn poll_restart_timers(&mut self) {
+        let now = Self::now_ms();
+        let mut ready = [0u16; MAX_SERVICES];
+        let mut count = 0;
+        self.services.for_each(|idx, svc| {
+            if svc.restart_timer.is_some() && count < MAX_SERVICES {
+                let deadline = svc.last_change + svc.backoff_ms as u64;
+                if now >= deadline {
+                    ready[count] = idx as u16;
+                    count += 1;
+                }
+            }
+        });
+        for i in 0..count {
+            self.handle_restart_timer(ready[i] as usize);
         }
     }
 
@@ -1660,6 +1431,16 @@ impl Devd {
                         // Don't remove yet - keep tracking until slot is fully set up
                         // The entry will be cleaned up on next lookup or service exit
                     }
+                }
+
+                // Unknown PID — treat as admin client (shell)
+                if service_idx.is_none() {
+                    uinfo!("devd", "admin_accept"; pid = client_pid);
+                    if let Some(events) = &mut self.events {
+                        let _ = events.watch(channel.handle());
+                    }
+                    let _ = self.admin_clients.add(channel);
+                    return;
                 }
 
                 // Save handle before moving channel into query handler
@@ -1880,7 +1661,12 @@ impl Devd {
 
         // Send response
         let result_code = match result {
-            Ok(()) => error::OK,
+            Ok(()) => {
+                // Port registered successfully — set to Claimed and fire rules.
+                // Port registered but not yet Ready. Rules fire when the
+                // driver sends STATE_CHANGE(Ready) — see handle_state_change_msg.
+                error::OK
+            }
             Err(_e) => {
                 if let Ok(name_str) = core::str::from_utf8(info.port_info.name_bytes()) {
                     uerror!("devd", "port_register_failed"; name = name_str, owner = info.owner_idx as u32);
@@ -1913,20 +1699,40 @@ impl Devd {
 
         uinfo!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
 
-        // When driver reports Ready, transition state
+        // When driver reports Ready, transition service state and activate ports
         if state_msg.new_state == driver_state::READY {
             let now = Self::now_ms();
             if let Some(service) = self.services.get_mut(driver_idx as usize) {
                 service.state = ServiceState::Ready;
                 service.last_change = now;
+                service.backoff_ms = INITIAL_BACKOFF_MS;
             }
 
-            // Rules fire on port Ready transitions (handle_set_port_state),
-            // not on service Ready. No flush needed.
-
-            // Retry pending services that may have been waiting for this driver
-            // to become Ready (e.g., shell waiting for consoled)
-            self.check_pending_services();
+            // Transition all ports owned by this driver to Claimed and fire rules.
+            // Ports were registered during reset() but held in Initialize state
+            // until the driver reports Ready.
+            let owner_idx = driver_idx as u8;
+            let mut ready_ports: [([u8; 32], usize); 8] = [([0u8; 32], 0); 8];
+            let mut ready_count = 0usize;
+            self.ports.for_each(|port| {
+                if port.owner() == owner_idx && port.state() != abi::PortState::Claimed && ready_count < 8 {
+                    let mut name = [0u8; 32];
+                    let n = port.name();
+                    let len = n.len().min(32);
+                    name[..len].copy_from_slice(&n[..len]);
+                    ready_ports[ready_count] = (name, len);
+                    ready_count += 1;
+                }
+            });
+            for i in 0..ready_count {
+                let (name, len) = &ready_ports[i];
+                let port_name = &name[..*len];
+                let _ = self.ports.set_state(port_name, abi::PortState::Claimed);
+                if let Some(port) = self.ports.get(port_name) {
+                    let info = *port.port_info();
+                    self.check_class_rules(&info, owner_idx);
+                }
+            }
         }
     }
 
@@ -2137,36 +1943,42 @@ impl Devd {
         // Send response with correct msg_type
         self.send_set_port_state_response(slot, seq_id, result_code);
 
-        // When a port goes back to Initialize, the service spawned for it is gone.
-        // Mark it as Stopped so the spawn rule can fire on the next Ready.
-        if result_code == error::OK && new_state == abi::PortState::Initialize {
-            if let Some(info) = port_info {
-                if let Some(rule) = rules::find_port_rule(&info) {
-                    if let Some(idx) = self.services.find_by_name(rule.driver) {
-                        if let Some(svc) = self.services.get_mut(idx) {
-                            if svc.state.is_running() {
-                                uinfo!("devd", "service_stopped_by_port";
-                                    service = rule.driver,
-                                    pid = svc.pid
-                                );
-                                svc.state = service::ServiceState::Stopped { code: 0 };
-                            }
-                        }
+        // Port went Safe — child service is gone, mark matching service Stopped.
+        // If owning driver is still Ready, transition Safe → Claimed and re-fire rules.
+        if result_code == error::OK && new_state == abi::PortState::Safe {
+            // Mark services bound to this port (by link_id) as Stopped
+            let port_link_id = self.ports.get(port_name)
+                .map(|p| p.child_link_id())
+                .unwrap_or(0);
+            if port_link_id != 0 {
+                self.services.for_each_mut(|_, svc| {
+                    if svc.link_id == port_link_id && svc.state.is_running() {
+                        svc.state = service::ServiceState::Stopped { code: 0 };
                     }
+                });
+            }
+
+            // Driver still alive — re-claim the port and fire spawn rules
+            let driver_ready = owner_idx
+                .and_then(|oi| self.services.get(oi as usize))
+                .map(|s| s.state == service::ServiceState::Ready)
+                .unwrap_or(false);
+            if driver_ready {
+                let _ = self.ports.set_state(port_name, abi::PortState::Claimed);
+                if let (Some(info), Some(owner)) = (port_info, owner_idx) {
+                    self.check_class_rules(&info, owner);
                 }
             }
         }
 
-        // Check rules on transition to Ready
+        // Check rules on transition to Claimed (from external SET_PORT_STATE)
         if result_code == error::OK
-            && new_state == abi::PortState::Ready
-            && old_state != Some(abi::PortState::Ready)
+            && new_state == abi::PortState::Claimed
+            && old_state != Some(abi::PortState::Claimed)
         {
             if let (Some(info), Some(owner)) = (port_info, owner_idx) {
                 self.check_class_rules(&info, owner);
             }
-            // Also check pending services that might depend on this port
-            self.check_pending_services();
         }
     }
 
@@ -2318,8 +2130,8 @@ impl Devd {
                 pid: service.pid,
                 state,
                 index: idx as u8,
-                parent_idx: service.parent.unwrap_or(0xFF),
-                child_count: service.child_count,
+                parent_idx: 0xFF,
+                child_count: 0,
                 total_restarts: service.total_restarts,
                 last_change: service.last_change as u32,
             });
@@ -2646,8 +2458,7 @@ impl Devd {
         let spawn_ctx = self.consume_inflight_spawn(seq_id);
 
         if spawn_count == 0 || result < 0 {
-            // If this was a service spawn that failed, mark the service as failed
-            if let Some((_, _, _, _, _, service_idx)) = spawn_ctx {
+            if let Some((_, _, _, _, _, service_idx, _, _)) = spawn_ctx {
                 if service_idx != 0xFF {
                     let now = Self::now_ms();
                     self.services.transition(service_idx as usize, ServiceState::Failed { code: result as i32 }, now);
@@ -2656,20 +2467,19 @@ impl Devd {
             return;
         }
 
-        // Check if this is a predefined service spawn (parent-delegated)
-        if let Some((port_type, port_name, port_name_len, _, _, service_idx)) = spawn_ctx {
+        // Check if this is a service spawn (parent-delegated)
+        if let Some((port_type, port_name, port_name_len, _, _, service_idx, spawn_caps, link_id)) = spawn_ctx {
             if service_idx != 0xFF && spawn_count >= 1 {
-                // Update the predefined service slot with the spawned pid
                 let child_pid = pids[0];
                 let now = Self::now_ms();
+                let pname = &port_name[..port_name_len as usize];
                 if let Some(service) = self.services.get_mut(service_idx as usize) {
                     service.pid = child_pid;
-                    // State is already Starting (set in spawn_service)
+                    service.set_trigger_port(pname);
+                    service.caps = spawn_caps;
+                    service.link_id = link_id;
                     uinfo!("devd", "service_spawn_ack"; service = service.name(), pid = child_pid);
                 }
-                // Store spawn context so child can query GET_SPAWN_CONTEXT
-                // (e.g., shell needs to know it was spawned for console:)
-                let pname = &port_name[..port_name_len as usize];
                 if !pname.is_empty() {
                     let metadata: ([u8; 64], usize) = self.ports.get(pname)
                         .map(|p| {
@@ -2682,18 +2492,23 @@ impl Devd {
                         .unwrap_or(([0u8; 64], 0));
                     self.store_spawn_context(child_pid, port_type, pname, &metadata.0[..metadata.1]);
                 }
-                // Upgrade any already-connected client with this PID to driver status
                 self.query_handler.upgrade_client_to_driver(child_pid, service_idx);
                 return;
             }
         }
 
-        // Extract binary name from spawn context (for dynamic spawns)
+        // Extract binary name, caps, and link_id from spawn context (for dynamic spawns)
         let binary_name: &[u8] = spawn_ctx.as_ref()
-            .map(|(_, _, _, bin, bin_len, _)| &bin[..*bin_len as usize])
+            .map(|(_, _, _, bin, bin_len, _, _, _)| &bin[..*bin_len as usize])
             .unwrap_or(b"???");
+        let spawn_caps: u64 = spawn_ctx.as_ref()
+            .map(|(_, _, _, _, _, _, caps, _)| *caps)
+            .unwrap_or(0);
+        let spawn_link_id: u32 = spawn_ctx.as_ref()
+            .map(|(_, _, _, _, _, _, _, lid)| *lid)
+            .unwrap_or(0);
 
-        // Create service slots for each spawned child
+        // Create or reuse service slots for each spawned child
         let now = Self::now_ms();
         for i in 0..spawn_count as usize {
             let child_pid = pids[i];
@@ -2701,26 +2516,55 @@ impl Devd {
                 continue;
             }
 
-            // Create a new service slot for this child with its binary name.
-            // Use Starting state — the child hasn't reported Ready yet.
-            // This prevents check_class_rules from sending SpawnChild
-            // while the child is still in synchronous init() IPC.
-            let slot_idx = match self.services.create_dynamic_service_with_state(
-                child_pid, binary_name, now, ServiceState::Starting,
-            ) {
-                Some(idx) => idx,
-                None => {
-                    uerror!("devd", "no_child_slot"; pid = child_pid);
-                    continue;
+            // Reuse existing service slot by link_id if available,
+            // otherwise create a new one. This prevents slot accumulation on respawn.
+            let mut reused_idx: Option<usize> = None;
+            if spawn_link_id != 0 {
+                self.services.for_each(|idx, svc| {
+                    if svc.link_id == spawn_link_id {
+                        reused_idx = Some(idx);
+                    }
+                });
+            }
+
+            let slot_idx = if let Some(idx) = reused_idx {
+                // Reuse existing slot — update PID and state
+                if let Some(svc) = self.services.get_mut(idx) {
+                    svc.pid = child_pid;
+                    svc.state = ServiceState::Starting;
+                    svc.caps = spawn_caps;
+                }
+                idx
+            } else {
+                // Create a new service slot.
+                // Use Starting state — the child hasn't reported Ready yet.
+                match self.services.create_dynamic_service_with_state(
+                    child_pid, binary_name, now, ServiceState::Starting,
+                ) {
+                    Some(idx) => idx,
+                    None => {
+                        uerror!("devd", "no_child_slot"; pid = child_pid);
+                        continue;
+                    }
                 }
             };
+
+            // Store trigger_port, caps, and link_id on the service slot (for restart)
+            if let Some((_, port_name, port_name_len, _, _, _, _, link_id)) = spawn_ctx {
+                let pname = &port_name[..port_name_len as usize];
+                if let Some(service) = self.services.get_mut(slot_idx) {
+                    service.set_trigger_port(pname);
+                    service.caps = spawn_caps;
+                    service.link_id = link_id;
+                }
+            }
 
             // Add to recent_dynamic_pids (for race condition handling)
             self.add_recent_dynamic_pid(child_pid, slot_idx as u8);
 
             // Store spawn context (port that triggered spawn) for GET_SPAWN_CONTEXT
             // Include metadata from the port registration (e.g., BAR0 info)
-            if let Some((port_type, port_name, port_name_len, _, _, _)) = spawn_ctx {
+            if let Some((port_type, port_name, port_name_len, _, _, _, _, _)) = spawn_ctx {
                 let pname = &port_name[..port_name_len as usize];
                 // Look up metadata from the registered port
                 let metadata: ([u8; 64], usize) = self.ports.get(pname)
@@ -2836,59 +2680,83 @@ impl Devd {
             self.track_and_attach_disk(port_name, shmem_id, owner_idx);
         }
 
-        // Note: rules do NOT fire at registration time.
-        // Ports start as Initialize; rules fire only on Ready transitions
-        // (handled in handle_set_port_state).
-
-        // Check if any pending services now have their dependencies satisfied
-        // (e.g., shell depends on console: port existing)
-        self.check_pending_services();
-
         Ok(())
     }
 
-    /// Check if any port rules match a port that transitioned to Ready.
+    /// Fire spawn rules for a port that transitioned to Claimed.
     ///
-    /// Rules fire ONLY on Ready transitions — never at registration time.
-    /// For driver-owned ports (owner_idx < 0xFF), sends SpawnChild via the
-    /// owner's channel. For kernel bus ports (owner_idx == 0xFF), spawns directly.
+    /// For kernel bus ports (owner=0xFF): devd spawns directly.
+    /// For driver-owned ports: devd sends SPAWN_CHILD to the owning driver,
+    /// which spawns the child as its own child process.
     fn check_class_rules(&mut self, port_info: &abi::PortInfo, owner_idx: u8) {
         let rule = match rules::find_port_rule(port_info) {
             Some(r) => r,
             None => return,
         };
 
-        // Don't spawn if driver already exists — unless previous instance exited
-        if let Some(idx) = self.services.find_by_name(rule.driver) {
+        // Guard: don't spawn if a running service is already bound to this port.
+        // Match by link_id from the port, not by trigger_port string.
+        let port_name = port_info.name_bytes();
+        let port_link_id = self.ports.get(port_name)
+            .map(|p| p.child_link_id())
+            .unwrap_or(0);
+        let mut existing_idx: Option<usize> = None;
+        if port_link_id != 0 {
+            self.services.for_each(|idx, svc| {
+                if svc.link_id == port_link_id {
+                    existing_idx = Some(idx);
+                }
+            });
+        }
+        if let Some(idx) = existing_idx {
             if !self.services.get(idx).map(|s| s.state.is_exited()).unwrap_or(false) {
                 return;
             }
+            // Cancel old instance's restart timer to prevent duplicate spawn
+            let old_timer = self.services.get_mut(idx).and_then(|s| s.restart_timer.take());
+            if let Some(timer) = old_timer {
+                if let Some(events) = &mut self.events {
+                    let _ = events.unwatch(timer.handle());
+                }
+            }
+            if let Some(service) = self.services.get_mut(idx) {
+                service.state = ServiceState::Stopped { code: 0 };
+            }
         }
 
-        let port_name = port_info.name_bytes();
+        // Allocate a link_id for this port↔service pairing
+        let link_id = self.alloc_link_id();
+        if let Some(port) = self.ports.get_mut(port_name) {
+            port.set_child_link_id(link_id);
+        }
+
         uinfo!("devd", "port_rule_matched";
             class = port_info.port_class as u16,
             subclass = port_info.port_subclass,
-            driver = rule.driver,
-            owner = self.svc_name(owner_idx)
+            driver = rule.driver
         );
 
-        if owner_idx == 0xFF {
-            // Kernel bus port — devd spawns directly
-            self.spawn_bus_driver(rule.driver, rule.caps, port_name);
-        } else {
-            // Driver-owned port — send SpawnChild via owner's channel
-            match self.query_handler.send_spawn_child_with_caps(
+        if owner_idx != 0xFF {
+            // Driver-owned port: delegate spawn to the owning driver.
+            // The child becomes the driver's child, not devd's.
+            let port_type = self.ports.get_port_type(port_name).unwrap_or(0);
+            if let Some(seq_id) = self.query_handler.send_spawn_child_with_caps(
                 owner_idx, rule.driver.as_bytes(), port_name, rule.caps,
             ) {
-                Some(seq_id) => {
-                    uinfo!("devd", "spawn_child_sent"; seq = seq_id, binary = rule.driver);
-                    let port_type = self.ports.get_port_type(port_name).unwrap_or(0);
-                    self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver);
+                self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver, rule.caps, link_id);
+            } else {
+                uerror!("devd", "spawn_child_send_failed"; driver = rule.driver, owner = owner_idx as u32);
+            }
+        } else {
+            // Kernel bus port: devd spawns directly (no driver to delegate to)
+            if let Some(idx) = existing_idx {
+                // Update existing service's link_id to the new one
+                if let Some(service) = self.services.get_mut(idx) {
+                    service.link_id = link_id;
                 }
-                None => {
-                    uerror!("devd", "spawn_child_failed"; binary = rule.driver, driver = self.svc_name(owner_idx));
-                }
+                self.spawn_service(idx);
+            } else {
+                self.create_and_spawn(rule.driver, rule.caps, port_name, link_id);
             }
         }
     }
@@ -2897,10 +2765,11 @@ impl Devd {
     // Block Device Orchestration
     // =========================================================================
 
-    /// Track a block device and send ATTACH_DISK if partd is already connected.
+    /// Track a block device, spawn partd if needed, and send ATTACH_DISK.
     ///
-    /// Does NOT spawn partd — that's the rules engine's job via SpawnChild.
-    /// If partd isn't connected yet, partd_connected() will send ATTACH_DISK later.
+    /// partd is a singleton — spawned on first disk discovery, reused for all
+    /// subsequent disks.  When partd connects it receives ATTACH_DISK for every
+    /// pending disk via partd_connected().
     fn track_and_attach_disk(&mut self, port_name: &[u8], shmem_id: u32, owner_idx: u8) {
         // Track this disk
         let disk_slot = self.track_disk(port_name, shmem_id, owner_idx);
@@ -2912,11 +2781,23 @@ impl Devd {
 
         uinfo!("devd", "disk_tracked"; slot = disk_slot as u32, shmem_id = shmem_id);
 
-        // If partd is already connected, send ATTACH_DISK immediately
         if self.partd_service_idx != 0xFF {
+            // partd already connected — send ATTACH_DISK immediately
             self.send_attach_disk(disk_slot);
+        } else {
+            // Spawn partd if not already spawned (check by name)
+            let already_spawned = {
+                let mut found = false;
+                self.services.for_each(|_idx, svc| {
+                    if svc.name() == "partd" { found = true; }
+                });
+                found
+            };
+            if !already_spawned {
+                self.create_and_spawn("partd", userlib::devd::caps::DRIVER, &[], 0);
+            }
+            // partd_connected() will send ATTACH_DISK for all Discovered disks
         }
-        // Otherwise: partd_connected() will send ATTACH_DISK when partd reports Ready
     }
 
     /// Track a disk for orchestration
@@ -3298,19 +3179,9 @@ impl Devd {
 
     /// Check if a newly connected driver is partd
     fn check_orchestration_driver_connected(&mut self, service_idx: u8) {
-        // Look up the service to find its binary name
         if let Some(service) = self.services.get(service_idx as usize) {
-            // Check dynamic name first (for dynamically spawned drivers)
-            let name = service.name();
-
-            if name == "partd" {
+            if service.name() == "partd" {
                 self.partd_connected(service_idx);
-            }
-            // Also check def (for statically defined services)
-            else if let Some(def) = service.def() {
-                if def.binary == "partd" {
-                    self.partd_connected(service_idx);
-                }
             }
         }
     }
@@ -3333,7 +3204,7 @@ impl Devd {
         }
     }
 
-    /// Spawn a driver dynamically (not from SERVICE_DEFS)
+    /// Spawn a driver dynamically
     fn spawn_dynamic_driver(&mut self, binary: &str, trigger_port: &[u8]) {
         self.spawn_dynamic_driver_with_caps(binary, trigger_port, 0);
     }
@@ -3370,10 +3241,12 @@ impl Devd {
         // Create service slot using create_dynamic_service (which actually creates the entry)
         let slot_idx = self.services.create_dynamic_service(pid, binary.as_bytes(), now);
 
-        // Set up the service slot with watcher
+        // Set up the service slot with watcher, trigger_port, and caps
         if let Some(idx) = slot_idx {
             if let Some(service) = self.services.get_mut(idx) {
                 service.watcher = Some(watcher);
+                service.set_trigger_port(trigger_port);
+                service.caps = caps;
             }
 
             // Add to recent_dynamic_pids for race condition handling
@@ -3394,7 +3267,6 @@ impl Devd {
             }
             uerror!("devd", "no_dynamic_slot"; pid = pid);
         }
-
     }
 
     /// Add a recently spawned dynamic PID to the tracking array
@@ -3434,8 +3306,8 @@ impl Devd {
     // Spawn Context Tracking
     // =========================================================================
 
-    /// Track an in-flight spawn command (seq_id -> port info + binary name)
-    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8], binary: &str) {
+    /// Track an in-flight spawn command (seq_id -> port info + binary name + caps)
+    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8], binary: &str, caps: u64, link_id: u32) {
         // Find empty slot
         for entry in &mut self.inflight_spawns {
             if entry.seq_id == 0 {
@@ -3448,35 +3320,21 @@ impl Devd {
                 entry.binary_name[..bin_len].copy_from_slice(&binary.as_bytes()[..bin_len]);
                 entry.binary_name_len = bin_len as u8;
                 entry.service_idx = 0xFF;  // Not a service spawn
-                return;
-            }
-        }
-        // No slot available - oldest will be overwritten implicitly when it's used
-    }
-
-    /// Track an in-flight spawn for a predefined service with parent delegation
-    fn track_inflight_spawn_for_service(&mut self, seq_id: u32, service_idx: usize, context_port: &[u8], context_port_type: u8) {
-        for entry in &mut self.inflight_spawns {
-            if entry.seq_id == 0 {
-                entry.seq_id = seq_id;
-                entry.service_idx = service_idx as u8;
-                // Also store context port for spawn context lookup
-                entry.port_type = context_port_type;
-                let len = context_port.len().min(32);
-                entry.port_name[..len].copy_from_slice(&context_port[..len]);
-                entry.port_name_len = len as u8;
+                entry.caps = caps;
+                entry.link_id = link_id;
                 return;
             }
         }
     }
 
     /// Consume an in-flight spawn by seq_id
-    /// Returns (port_type, port_name, port_len, binary_name, binary_len, service_idx)
-    fn consume_inflight_spawn(&mut self, seq_id: u32) -> Option<(u8, [u8; 32], u8, [u8; 16], u8, u8)> {
+    /// Returns (port_type, port_name, port_len, binary_name, binary_len, service_idx, caps, link_id)
+    fn consume_inflight_spawn(&mut self, seq_id: u32) -> Option<(u8, [u8; 32], u8, [u8; 16], u8, u8, u64, u32)> {
         for entry in &mut self.inflight_spawns {
             if entry.seq_id == seq_id {
                 let result = (entry.port_type, entry.port_name, entry.port_name_len,
-                              entry.binary_name, entry.binary_name_len, entry.service_idx);
+                              entry.binary_name, entry.binary_name_len, entry.service_idx,
+                              entry.caps, entry.link_id);
                 *entry = InflightSpawn::empty();
                 return Some(result);
             }
@@ -3535,9 +3393,6 @@ impl Devd {
     // =========================================================================
 
     pub fn run(&mut self) -> ! {
-        // Start services that have no dependencies
-        self.check_pending_services();
-
         // Set a persistent timeout so the Mux wakes periodically even if no
         // watched handles fire.  This lets us poll query clients whose channel
         // handles couldn't fit into the Mux (16-handle limit).
@@ -3555,15 +3410,6 @@ impl Devd {
 
             match wait_result {
                 Ok(handle) => {
-                    // Service port event?
-                    if let Some(port) = &self.port {
-                        if handle == port.handle() {
-                            self.handle_port_event();
-                            self.poll_query_clients();
-                            continue;
-                        }
-                    }
-
                     // Query port event?
                     if let Some(query_port) = &self.query_port {
                         if handle == query_port.handle() {
@@ -3608,6 +3454,13 @@ impl Devd {
             // Poll all query clients for pending messages.  Handles channels
             // that could not be added to the Mux due to the 16-slot limit.
             self.poll_query_clients();
+
+            // Poll restart timers via wall-clock comparison.  Catches timers
+            // that couldn't be added to the Mux (16-handle limit).
+            self.poll_restart_timers();
+
+            // Flush structured logs so they appear on the console
+            userlib::ulog::flush();
         }
     }
 }
@@ -3631,5 +3484,6 @@ fn main() -> ! {
     }
 
     uinfo!("devd", "started"; services = devd.services.count() as u32);
+    userlib::ulog::flush();
     devd.run()
 }

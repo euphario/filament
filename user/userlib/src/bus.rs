@@ -61,10 +61,6 @@ pub const MAX_KERNEL_BUSES: usize = 4;
 // Opaque Handles
 // ============================================================================
 
-/// Opaque child identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChildId(pub u8);
-
 /// Opaque port identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortId(pub u8);
@@ -156,74 +152,18 @@ pub enum BusError {
 }
 
 // ============================================================================
-// Kernel Bus State
+// Kernel Bus Info
 // ============================================================================
-
-/// Kernel bus state (mirrors kernel BusState enum).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum KernelBusState {
-    /// Bus is idle, hardware safe, ready for a driver.
-    Safe = 0,
-    /// Bus is claimed by a driver.
-    Claimed = 1,
-    /// Bus is being reset (hardware quiescing).
-    Resetting = 2,
-}
-
-impl KernelBusState {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::Safe,
-            1 => Self::Claimed,
-            2 => Self::Resetting,
-            _ => Self::Safe,
-        }
-    }
-}
-
-/// Reason for a kernel bus state change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum KernelBusChangeReason {
-    Connected = 0,
-    Disconnected = 1,
-    OwnerCrashed = 2,
-    ResetRequested = 3,
-    ResetComplete = 4,
-    Handoff = 5,
-    DriverClaimed = 6,
-    DriverExited = 7,
-}
-
-impl KernelBusChangeReason {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::Connected,
-            1 => Self::Disconnected,
-            2 => Self::OwnerCrashed,
-            3 => Self::ResetRequested,
-            4 => Self::ResetComplete,
-            5 => Self::Handoff,
-            6 => Self::DriverClaimed,
-            7 => Self::DriverExited,
-            _ => Self::Connected,
-        }
-    }
-}
 
 /// Information about a kernel bus obtained via `claim_kernel_bus()`.
 ///
-/// Parsed from the kernel's StateSnapshot message. Updated automatically
-/// by the runtime when StateChanged notifications arrive.
+/// Parsed from the kernel's StateSnapshot message.
 #[derive(Clone, Copy, Debug)]
 pub struct KernelBusInfo {
     /// Bus type (0=PCIe, 1=USB, 2=Platform).
     pub bus_type: u8,
     /// Bus index (e.g., 0 for pcie0).
     pub bus_index: u8,
-    /// Current state.
-    pub state: KernelBusState,
     /// Number of devices on the bus.
     pub device_count: u8,
     /// Hardware capability flags.
@@ -235,7 +175,6 @@ impl KernelBusInfo {
         Self {
             bus_type: 0,
             bus_index: 0,
-            state: KernelBusState::Safe,
             device_count: 0,
             capabilities: 0,
         }
@@ -583,24 +522,23 @@ pub enum Disposition {
 /// The runtime calls these callbacks in response to events. The driver
 /// uses `BusCtx` to interact with the system.
 pub trait Driver {
-    /// Called once when the bus link to parent is established.
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError>;
+    /// Parent port is Safe. Initialize hardware, register child ports.
+    ///
+    /// Called once when the bus link to parent is established, and again
+    /// after a hardware reset. The hardware is in a safe state (no DMA,
+    /// no interrupts). The driver should reinitialize from scratch.
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError>;
 
     /// A command arrived from above (parent or further up the tree).
     /// Peek at it: return Handled, Forward, or HandledAndForward.
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition;
 
-    /// An unsolicited event arrived from a child.
-    fn event(&mut self, _child: ChildId, msg: &BusMsg, ctx: &mut dyn BusCtx) {
-        // Default: forward up to parent
-        let _ = ctx.send_up(msg);
-    }
-
-    /// A response arrived for a request this driver sent via send_down().
-    fn response(&mut self, _msg: &BusMsg, _ctx: &mut dyn BusCtx) {}
-
-    /// A child process died.
-    fn child_exited(&mut self, _child: ChildId, _exit_code: i32, _ctx: &mut dyn BusCtx) {}
+    /// A port this driver registered changed state.
+    ///
+    /// Safe = previous owner gone, port available for new owner.
+    /// Claimed = new owner connected and operational.
+    /// Resetting = owner exiting, cleanup in progress.
+    fn port_event(&mut self, _port: PortId, _state: PortState, _ctx: &mut dyn BusCtx) {}
 
     /// Data is ready on a data port (SQ entry arrived, CQ completion, etc).
     fn data_ready(&mut self, _port: PortId, _ctx: &mut dyn BusCtx) {}
@@ -617,37 +555,13 @@ pub trait Driver {
     // === Configuration ===
 
     /// Declare supported config keys. Return an empty slice if no config.
-    ///
-    /// The framework uses this to:
-    /// - Auto-generate the summary response for empty-key GET
-    /// - Build the `keys=` line listing writable keys
-    /// - Validate keys before calling `config_get()`/`config_set()`
     fn config_keys(&self) -> &[ConfigKey] { &[] }
 
     /// Get a config value. Called by the framework for CONFIG_GET.
-    /// Write the value into `buf` and return the number of bytes written.
     fn config_get(&self, _key: &[u8], _buf: &mut [u8]) -> usize { 0 }
 
     /// Set a config value. Called by the framework for CONFIG_SET.
-    /// Write the response (e.g. "OK\n" or "ERR ...\n") into `buf`.
-    /// Returns the number of bytes written.
     fn config_set(&mut self, _key: &[u8], _value: &[u8], _buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize { 0 }
-
-    // === Bus state ===
-
-    /// A kernel bus state changed (Safe, Claimed, Resetting).
-    ///
-    /// Called when a bus claimed via `ctx.claim_kernel_bus()` receives a
-    /// StateChanged notification from the kernel. The runtime automatically
-    /// forwards these to devd — this callback is for driver-specific reactions.
-    fn bus_state_changed(
-        &mut self,
-        _bus: KernelBusId,
-        _old_state: KernelBusState,
-        _new_state: KernelBusState,
-        _reason: KernelBusChangeReason,
-        _ctx: &mut dyn BusCtx,
-    ) {}
 }
 
 // ============================================================================
@@ -680,14 +594,6 @@ pub trait BusCtx {
     /// Send an unsolicited event up with fresh payload.
     fn emit_event(&mut self, msg_type: u32, payload: &[u8]) -> Result<(), BusError>;
 
-    // === Child management ===
-
-    /// Spawn a child process. Returns ChildId for tracking.
-    fn spawn_child(&mut self, binary_name: &[u8]) -> Result<ChildId, BusError>;
-
-    /// Number of connected children.
-    fn child_count(&self) -> usize;
-
     // === Data ports ===
 
     /// Create a block data port (this driver is provider). Returns PortId.
@@ -712,23 +618,27 @@ pub trait BusCtx {
 
     // === Kernel bus ===
 
-    /// Connect to a kernel bus and claim it.
+    /// Connect to a kernel bus as owner (claim it).
     ///
     /// Encapsulates the full kernel bus protocol:
     /// 1. Connect to the bus port (e.g., `/kernel/bus/pcie0`)
-    /// 2. Receive StateSnapshot
-    /// 3. Wait for Safe state if bus is Resetting
-    /// 4. Send SetDriver with this process's PID
-    /// 5. Register the channel with Mux for ongoing state notifications
+    /// 2. Receive StateSnapshot (kernel sends on connect)
+    /// 3. Register the channel with Mux for hardware messages
     ///
-    /// State changes are automatically forwarded to devd and dispatched
-    /// to `Driver::bus_state_changed()`.
+    /// The kernel identifies the owner by who connects (no SetDriver needed).
+    /// The supervisor (devd) connects first; the driver connects second.
     ///
     /// Returns the initial bus info on success.
     fn claim_kernel_bus(&mut self, path: &[u8]) -> Result<(KernelBusId, KernelBusInfo), BusError>;
 
     /// Get cached info for a claimed kernel bus.
     fn kernel_bus_info(&self, id: KernelBusId) -> Option<&KernelBusInfo>;
+
+    /// Get enumerated devices for a claimed kernel bus.
+    ///
+    /// Returns the device list delivered by the kernel on connect.
+    /// Same API for PCI (auto-enumerated) and platform (probed-registered) buses.
+    fn bus_devices(&self, id: KernelBusId) -> Option<&[abi::BusDevice]>;
 
     /// Enable bus mastering for a PCI device via kernel bus control.
     ///
@@ -757,28 +667,26 @@ pub trait BusCtx {
     /// Respond to a QueryInfo request with text.
     fn respond_info(&mut self, seq_id: u32, info: &[u8]) -> Result<(), BusError>;
 
-    /// Acknowledge a spawn request.
-    fn ack_spawn(&mut self, seq_id: u32, result: i32, pid: u32) -> Result<(), BusError>;
-
-    /// Register a port with devd using unified PortInfo.
+    /// Register a port with the framework.
     ///
-    /// This is the preferred method for new drivers. Uses the unified PortInfo
-    /// struct from abi crate which provides type-safe, structured metadata.
-    /// Supports class/subclass matching for spawn rules instead of string patterns.
+    /// Registers a port with the runtime's managed port table and notifies
+    /// the supervisor (devd). The port starts in Safe state and the supervisor
+    /// will fire rules to spawn an owner.
     fn register_port_with_info(
         &mut self,
         info: &abi::PortInfo,
         shmem_id: u32,
     ) -> Result<(), BusError>;
 
-    /// Report driver state to devd.
-    fn report_state(&mut self, state: crate::devd::DriverState) -> Result<(), BusError>;
-
-    /// Set port state.
+    /// Transition a port's state via devd.
     ///
-    /// Transitions a registered port to a new state. Rules are checked
-    /// when a port transitions to Ready.
-    fn set_port_state(&mut self, name: &[u8], state: abi::PortState) -> Result<(), BusError>;
+    /// Drivers use this to signal port availability changes (e.g. Claimed → Safe
+    /// when a child disconnects). devd fires spawn rules on state transitions.
+    fn set_port_state(
+        &mut self,
+        name: &[u8],
+        state: abi::PortState,
+    ) -> Result<(), BusError>;
 
     /// Get spawn context from devd (cached after first call).
     ///

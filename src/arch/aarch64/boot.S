@@ -817,6 +817,7 @@ secondary_hang:
  * Per-CPU data offsets (must match CpuData #[repr(C)] layout in percpu.rs)
  * These are byte offsets from TPIDR_EL1 base.
  */
+.equ CPUDATA_KSTACK_TOP,  56
 .equ CPUDATA_TRAP_FRAME,  64
 .equ CPUDATA_TTBR0,       72
 .equ CPUDATA_SWITCHED,    80
@@ -975,6 +976,11 @@ exception_from_user:
     dsb     ish
     isb
 
+    /* Set SP to next task's kernel stack top for SP_EL1 */
+    mrs     x10, tpidr_el1
+    ldr     x10, [x10, #CPUDATA_KSTACK_TOP]
+    mov     sp, x10
+
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]
     ldr     x11, [x9, #256]
@@ -1128,6 +1134,14 @@ irq_kernel_to_user:
     dsb     ish
     isb
 
+    /* Set SP to target task's kernel stack top.
+     * Simple preemption updated per-CPU kernel_stack_top but not SP.
+     * Without this, subsequent exceptions from the new task would use
+     * the old task's (idle's) kernel stack, corrupting it. */
+    mrs     x10, tpidr_el1
+    ldr     x10, [x10, #CPUDATA_KSTACK_TOP]
+    mov     sp, x10
+
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]             // sp_el0
     ldr     x11, [x9, #256]             // elr_el1
@@ -1240,6 +1254,13 @@ irq_from_user:
     tlbi    vmalle1is
     dsb     ish
     isb
+
+    /* Set SP to current task's kernel stack top.
+     * If simple preemption switched tasks, per-CPU kernel_stack_top
+     * was updated but SP still points to the old task's stack. */
+    mrs     x10, tpidr_el1
+    ldr     x10, [x10, #CPUDATA_KSTACK_TOP]
+    mov     sp, x10
 
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]         // sp_el0
@@ -1382,6 +1403,13 @@ svc_handler:
     tlbi    vmalle1is
     dsb     ish
     isb
+
+    /* Set SP to current task's kernel stack top.
+     * If simple preemption switched tasks, per-CPU kernel_stack_top
+     * was updated but SP still points to the old task's stack. */
+    mrs     x10, tpidr_el1
+    ldr     x10, [x10, #CPUDATA_KSTACK_TOP]
+    mov     sp, x10
 
     /* Restore special registers from trap frame */
     ldr     x10, [x9, #248]         // sp_el0

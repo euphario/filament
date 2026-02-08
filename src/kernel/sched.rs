@@ -31,7 +31,7 @@
 //! - **Running** → Waiting (via `wait_current`) - has deadline
 //! - **Sleeping/Waiting** → Ready (via `wake` or timeout)
 
-use crate::{kerror, kdebug, kwarn};
+use crate::{kerror, kdebug, kwarn, kinfo};
 use super::task::{self, TaskState, current_slot, set_current_slot, TrapFrame};
 use super::percpu;
 
@@ -72,6 +72,8 @@ struct SwitchDecision {
     to_trap_frame: *mut TrapFrame,
     /// TTBR0 value for target task's address space (0 if kernel task)
     to_ttbr0: u64,
+    /// Kernel stack top (virtual) for target task's SP_EL1
+    to_kstack_top: u64,
 }
 
 // SAFETY: Pointers are valid for duration of context switch because both tasks
@@ -199,6 +201,11 @@ fn reschedule_inner(block: BlockReason) -> bool {
         let next_slot = match sched.schedule() {
             Some(slot) if slot != caller_slot => {
                 kdebug!("resched", "pick"; from = caller_slot as u64, to = slot as u64);
+                // Diagnostic: log switches away from terminated tasks (kill/exit path)
+                if sched.task(caller_slot).map(|t| t.is_terminated()).unwrap_or(false) {
+                    let to_pid = sched.task(slot).map(|t| t.id as u64).unwrap_or(0);
+                    kinfo!("resched", "exit_switch"; from_slot = caller_slot as u64, to_slot = slot as u64, to_pid = to_pid);
+                }
                 slot
             }
             Some(_) => {
@@ -271,6 +278,14 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 if let Some(ref addr_space) = next.address_space {
                     percpu::set_ttbr0(addr_space.get_ttbr0());
                 }
+
+                // Update kernel stack top for SP_EL1.
+                // Without this, exception return paths ERET with SP still
+                // pointing to the old task's kernel stack, corrupting it.
+                let kstack_top = crate::kernel::arch::mmu::phys_to_virt(
+                    next.kernel_stack + next.kernel_stack_size as u64
+                );
+                percpu::set_kernel_stack_top(kstack_top);
             }
             // Only set flag for user tasks (not idle) - this tells IRQ handler
             // to use user return path instead of kernel return path
@@ -305,7 +320,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
             None => return false,
         };
 
-        let (to_ctx, to_trap_frame, to_ttbr0) = match sched.task_mut(next_slot) {
+        let (to_ctx, to_trap_frame, to_ttbr0, to_kstack_top) = match sched.task_mut(next_slot) {
             Some(t) => {
                 // Prepare target state while holding lock
                 crate::transition_or_evict!(t, set_running, cpu);
@@ -318,7 +333,10 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 let trap = &mut t.trap_frame as *mut TrapFrame;
                 let ttbr0 = t.address_space.as_ref()
                     .map(|a| a.get_ttbr0()).unwrap_or(0);
-                (ctx, trap, ttbr0)
+                let kstack_top = crate::kernel::arch::mmu::phys_to_virt(
+                    t.kernel_stack + t.kernel_stack_size as u64
+                );
+                (ctx, trap, ttbr0, kstack_top)
             }
             None => return false,
         };
@@ -343,6 +361,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
             to_ctx,
             to_trap_frame,
             to_ttbr0,
+            to_kstack_top,
         })
     }; // LOCK RELEASED HERE
 
@@ -374,6 +393,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
 
     // Update per-CPU data
     percpu::set_trap_frame(decision.to_trap_frame);
+    percpu::set_kernel_stack_top(decision.to_kstack_top);
     // Only set flag for user tasks (not idle) - this tells IRQ handler
     // to use user return path instead of kernel return path
     if !is_idle_slot(decision.to_slot) {

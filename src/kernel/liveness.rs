@@ -187,23 +187,19 @@ pub enum LivenessTransitionError {
     },
 }
 
-/// Pending child exit notification (collected during liveness check)
-struct PendingNotification {
-    parent_id: u32,
-    child_pid: u32,
-    exit_code: i32,
-}
-
 /// Check liveness of all waiting tasks
 /// Called periodically from timer tick (not every tick, use counter)
 ///
 /// Returns number of actions taken (pings sent, channels closed, tasks killed)
+///
+/// IMPORTANT: This runs in IRQ context. Must NOT acquire ObjectService locks
+/// (the interrupted task may hold one → deadlock). Killed tasks go through the
+/// normal Phase 1 → Phase 2 cleanup pipeline which runs in task context and
+/// handles parent notification safely.
 pub fn check_liveness(current_tick: u64) -> usize {
-    // Execute liveness check with scheduler lock, returning actions and notifications
-    let (actions, notifications, notify_count) = super::task::with_scheduler(|sched| {
+    // Execute liveness check with scheduler lock
+    super::task::with_scheduler(|sched| {
         let mut actions = 0usize;
-        let mut notifications: [Option<PendingNotification>; 4] = [None, None, None, None];
-        let mut notify_count = 0usize;
 
         // Collect slots that need to be woken (can't call wake_task during iteration)
         let mut wake_slots: [Option<usize>; 8] = [None; 8];
@@ -327,15 +323,10 @@ pub fn check_liveness(current_tick: u64) -> usize {
                                 // Defer recovery to avoid recursive scheduler access
                                 // The timer tick handler will check and trigger recovery
                                 crate::DEVD_LIVENESS_KILLED.store(true, core::sync::atomic::Ordering::SeqCst);
-                            } else if task.parent_id != 0 && notify_count < 4 {
-                                // Collect notification to process after loop
-                                notifications[notify_count] = Some(PendingNotification {
-                                    parent_id: task.parent_id,
-                                    child_pid: pid,
-                                    exit_code: -9,
-                                });
-                                notify_count += 1;
                             }
+                            // Parent notification handled by Phase 2 microtask
+                            // (NotifyParentExit) — NOT here, because we're in IRQ
+                            // context and can't safely acquire ObjectService locks.
                         }
                     }
                 }
@@ -371,23 +362,10 @@ pub fn check_liveness(current_tick: u64) -> usize {
             crate::kernel::arch::sync::cpu_flags().set_need_resched();
         }
 
-        (actions, notifications, notify_count)
-    }); // Scheduler lock released here
-
-    // Process collected notifications via ObjectService (outside scheduler lock)
-    for i in 0..notify_count {
-        if let Some(ref notif) = notifications[i] {
-            let wake_list = super::object_service::object_service().notify_child_exit(
-                notif.parent_id,
-                notif.child_pid,
-                notif.exit_code,
-            );
-            waker::wake(&wake_list, WakeReason::ChildExit);
-        }
-    }
-
-    actions
+        actions
+    })
 }
+
 
 /// Find the channel a task is waiting on
 fn find_wait_channel(_task: &super::task::Task) -> Option<u32> {

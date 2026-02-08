@@ -192,8 +192,8 @@ fn format_msg(a: &[u8], b: &[u8], c: &[u8], d: &[u8]) -> [u8; 128] {
 
 /// Send a command to devd and get response
 fn send_command(cmd: &[u8]) -> Result<&'static str, &'static str> {
-    // Connect to devd
-    let mut channel = match Channel::connect(b"devd:") {
+    // Connect to devd (admin commands via query port)
+    let mut channel = match Channel::connect(b"devd-query:") {
         Ok(ch) => ch,
         Err(_) => return Err("failed to connect to devd"),
     };

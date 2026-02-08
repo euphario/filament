@@ -249,6 +249,7 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::Mux(m) => (write_mux(m, buf_ptr, buf_len), PendingAction::None),
             Object::PciDevice(d) => (write_pci_device(d, buf_ptr, buf_len, task_id), PendingAction::None),
             Object::Ring(r) => (write_ring(r, buf_ptr, buf_len, task_id), PendingAction::None),
+            Object::BusCreator(bc) => (write_bus_creator(bc, buf_ptr, buf_len), PendingAction::None),
             _ => (KernelError::NotSupported.to_errno(), PendingAction::None),
         }
     });
@@ -851,9 +852,23 @@ fn open_bus_create(params_ptr: u64, params_len: usize) -> i64 {
     let info = unsafe { &*(info_bytes.as_ptr() as *const abi::BusCreateInfo) };
 
     // Create the bus (kernel_pid = 0 for kernel-owned ports)
-    match bus::create_bus(info, 0) {
-        Ok(()) => 0, // Success, no handle returned
-        Err(e) => e.to_errno() as i64,
+    if let Err(e) = bus::create_bus(info, 0) {
+        return e.to_errno() as i64;
+    }
+
+    // Allocate a BusCreator handle so probed can write RegisterDevice
+    let task_id = get_current_task_id();
+    let Some(task_id) = task_id else {
+        return KernelError::BadHandle.to_errno();
+    };
+
+    let obj = Object::BusCreator(super::BusCreatorObject::new(info.bus_type, info.bus_index));
+    match object_service().with_table_mut(task_id, |table| {
+        table.alloc(ObjectType::Bus, obj).ok_or(KernelError::OutOfHandles)
+    }) {
+        Ok(Ok(handle)) => handle.raw() as i64,
+        Ok(Err(e)) => e.to_errno(),
+        Err(e) => e.to_errno(),
     }
 }
 
@@ -2473,6 +2488,33 @@ fn write_ring(r: &mut super::RingObject, _buf_ptr: u64, _buf_len: usize, _task_i
     }
 
     0 // Success
+}
+
+/// Write a BusDevice to a bus (RegisterDevice from probed)
+fn write_bus_creator(bc: &mut super::BusCreatorObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    use crate::kernel::bus;
+
+    if buf_len != core::mem::size_of::<abi::BusDevice>() {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    // Check bus creation is not locked (probed must still be running)
+    if bus::is_bus_creation_locked() {
+        return KernelError::PermDenied.to_errno();
+    }
+
+    // Copy BusDevice from user memory
+    let mut dev_bytes = [0u8; 32];
+    if uaccess::copy_from_user(&mut dev_bytes, buf_ptr).is_err() {
+        return KernelError::BadAddress.to_errno();
+    }
+    let dev = unsafe { *(dev_bytes.as_ptr() as *const abi::BusDevice) };
+
+    // Store in BusController
+    match bus::register_device(bc.bus_type, bc.bus_index, dev) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno() as i64,
+    }
 }
 
 /// Map Ring shared memory into task's address space

@@ -1,6 +1,7 @@
 //! Service State Machine
 //!
-//! Defines service lifecycle states, definitions, and runtime instances.
+//! Defines service lifecycle states and runtime instances.
+//! All services are dynamically spawned via PORT_RULES or boot services.
 //! Uses trait-based design for testability.
 
 use userlib::ipc::{Channel, Timer, Process, ObjHandle};
@@ -10,8 +11,6 @@ use userlib::ipc::{Channel, Timer, Process, ObjHandle};
 // =============================================================================
 
 pub const MAX_SERVICES: usize = 16;
-pub const MAX_CHILDREN_PER_SERVICE: usize = 8;
-pub const MAX_PORTS_PER_SERVICE: usize = 4;
 pub const MAX_RESTARTS: u8 = 3;
 pub const INITIAL_BACKOFF_MS: u32 = 1000;
 pub const MAX_BACKOFF_MS: u32 = 30000;
@@ -26,11 +25,8 @@ pub const FAILED_RETRY_MS: u64 = 5 * 60 * 1000;
 ///
 /// All transitions are event-driven, no polling:
 ///
-///   Pending ──[deps satisfied]──► Starting
-///       Event: Another service becomes Ready
-///
-///   Starting ──[service connects to devd:]──► Ready
-///       Event: Port accept on devd: port
+///   Starting ──[service reports Ready via STATE_CHANGE]──► Ready
+///       Event: Driver sends STATE_CHANGE(Ready) on query channel
 ///
 ///   Ready ──[exit(0)]──► Stopped
 ///       Event: Process watcher fires
@@ -44,16 +40,16 @@ pub const FAILED_RETRY_MS: u64 = 5 * 60 * 1000;
 ///   Crashed ──[restarts >= MAX]──► Failed (sets recovery timer)
 ///       Immediate transition, no event needed
 ///
-///   Failed ──[recovery timer fires]──► Pending
+///   Failed ──[recovery timer fires]──► Starting (retry)
 ///       Event: Per-service Timer fires (5 minute delay)
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceState {
-    /// Waiting for dependencies to be satisfied
+    /// Waiting (unused — kept for compatibility with handle_service_ready callers)
     Pending,
-    /// Spawned, waiting for service to connect to devd:
+    /// Spawned, waiting for service to report Ready
     Starting,
-    /// Service is ready (connected to devd:)
+    /// Service is ready
     Ready,
     /// Service exited cleanly
     Stopped { code: i32 },
@@ -90,134 +86,15 @@ impl ServiceState {
 }
 
 // =============================================================================
-// Dependency Types
-// =============================================================================
-
-/// Dependency specification
-#[derive(Clone, Copy, Debug)]
-pub enum Dependency {
-    /// Hard dependency - service won't start until this port exists
-    Requires(&'static [u8]),
-    /// Soft dependency - service starts anyway, handles missing gracefully
-    DependsOn(&'static [u8]),
-}
-
-impl Dependency {
-    pub fn port_name(&self) -> &'static [u8] {
-        match self {
-            Dependency::Requires(name) | Dependency::DependsOn(name) => name,
-        }
-    }
-
-    pub fn is_required(&self) -> bool {
-        matches!(self, Dependency::Requires(_))
-    }
-}
-
-// =============================================================================
-// Service Definition (static config)
-// =============================================================================
-
-/// Port definition with name and type
-#[derive(Clone, Copy, Debug)]
-pub struct PortDef {
-    pub name: &'static [u8],
-    pub port_type: u8,
-}
-
-impl PortDef {
-    pub const fn new(name: &'static [u8], port_type: u8) -> Self {
-        Self { name, port_type }
-    }
-}
-
-/// Static service definition (compiled-in)
-pub struct ServiceDef {
-    /// Binary name in initrd
-    pub binary: &'static str,
-    /// Ports this service will register (with types)
-    pub registers: &'static [PortDef],
-    /// Dependencies
-    pub dependencies: &'static [Dependency],
-    /// Auto-restart on crash?
-    pub auto_restart: bool,
-    /// Parent service (None = direct child of devd)
-    pub parent: Option<&'static str>,
-    /// Port name for spawn context (empty = no context)
-    pub context_port: &'static [u8],
-    /// Wire protocol port type of the context port
-    pub context_port_type: u8,
-    /// Capability bits (0 = inherit parent's caps unchanged)
-    pub caps: u64,
-}
-
-// Port type constants for SERVICE_DEFS
-mod pt {
-    pub const CONSOLE: u8 = 6;
-    pub const SERVICE: u8 = 7;
-    pub const FILESYSTEM: u8 = 3;
-}
-
-/// Service definitions - the "service tree"
-///
-/// Note: consoled is NOT here - it's spawned dynamically via PORT_RULES
-/// when the kernel UART bus port transitions to Ready.
-pub static SERVICE_DEFS: &[ServiceDef] = &[
-    ServiceDef {
-        binary: "vfsd",
-        registers: &[PortDef::new(b"vfs:", pt::FILESYSTEM)],
-        dependencies: &[Dependency::Requires(b"console:")],  // Wait for console so we see output
-        auto_restart: true,
-        parent: None,
-        context_port: b"",
-        context_port_type: 0,
-        caps: 0,
-    },
-    ServiceDef {
-        binary: "shell",
-        registers: &[],  // shell doesn't register any ports
-        dependencies: &[Dependency::Requires(b"console:")],  // Wait for consoled
-        auto_restart: true,
-        parent: Some("consoled"),  // Spawned BY consoled, inherits its limits
-        context_port: b"console:",
-        context_port_type: pt::CONSOLE,
-        caps: 0,
-    },
-    ServiceDef {
-        binary: "ipd",
-        registers: &[PortDef::new(b"ipd:", pt::SERVICE)],
-        dependencies: &[Dependency::Requires(b"console:")],
-        auto_restart: true,
-        parent: None,
-        context_port: b"",
-        context_port_type: 0,
-        caps: 0,
-    },
-    // Bus drivers (pcied, usbd) are now spawned dynamically via discover_kernel_buses().
-    // Device drivers (nvmed, netd, partd, fatfsd) are spawned via rules in rules.rs.
-
-    // Stress test runner — only built with --features stress-test
-    #[cfg(feature = "stress-test")]
-    ServiceDef {
-        binary: "testr",
-        registers: &[],
-        dependencies: &[Dependency::Requires(b"console:")],
-        auto_restart: false,
-        parent: None,
-        context_port: b"",
-        context_port_type: 0,
-        caps: u64::MAX,  // ALL caps (needs SHUTDOWN)
-    },
-];
-
-// =============================================================================
 // Service Instance (runtime state)
 // =============================================================================
 
-/// A running or tracked service instance
+/// A running or tracked service instance.
+///
+/// All services are created dynamically — there are no static definitions.
+/// Services are spawned either by PORT_RULES (when a port transitions to Ready)
+/// or as boot services (spawned directly during init).
 pub struct Service {
-    /// Index into SERVICE_DEFS (0xFF = dynamic service)
-    pub def_index: u8,
     /// Current state
     pub state: ServiceState,
     /// Process ID (0 if not running)
@@ -226,12 +103,6 @@ pub struct Service {
     pub watcher: Option<Process>,
     /// Channel from this service (for ready announcement)
     pub channel: Option<Channel>,
-    /// Indices of child services
-    pub children: [Option<u8>; MAX_CHILDREN_PER_SERVICE],
-    /// Number of children
-    pub child_count: u8,
-    /// Parent service index (None = devd)
-    pub parent: Option<u8>,
     /// Restart backoff in ms
     pub backoff_ms: u32,
     /// Last state change timestamp
@@ -240,49 +111,44 @@ pub struct Service {
     pub total_restarts: u32,
     /// Restart timer (set when Crashed or Failed)
     pub restart_timer: Option<Timer>,
-    /// Name for dynamic services (when def_index == 0xFF)
+    /// Service binary name
     pub dynamic_name: [u8; 16],
+    /// Port name that triggered this service's spawn (for restart)
+    pub trigger_port: [u8; 32],
+    /// Length of trigger_port name
+    pub trigger_port_len: u8,
+    /// Capability bits (stored at spawn time, used for restart)
+    pub caps: u64,
+    /// Unique link ID tying this service to its trigger port (0 = unlinked)
+    pub link_id: u32,
 }
 
 impl Service {
     pub const fn empty() -> Self {
         Self {
-            def_index: 0,
             state: ServiceState::Pending,
             pid: 0,
             watcher: None,
             channel: None,
-            children: [None; MAX_CHILDREN_PER_SERVICE],
-            child_count: 0,
-            parent: None,
             backoff_ms: INITIAL_BACKOFF_MS,
             last_change: 0,
             total_restarts: 0,
             restart_timer: None,
             dynamic_name: [0; 16],
+            trigger_port: [0; 32],
+            trigger_port_len: 0,
+            caps: 0,
+            link_id: 0,
         }
     }
 
-    pub fn def(&self) -> Option<&'static ServiceDef> {
-        if (self.def_index as usize) < SERVICE_DEFS.len() {
-            Some(&SERVICE_DEFS[self.def_index as usize])
-        } else {
-            None
-        }
-    }
-
-    /// Get service name (static or dynamic)
+    /// Get service name
     pub fn name(&self) -> &str {
-        if let Some(def) = self.def() {
-            def.binary
-        } else {
-            // Dynamic service - use stored name
-            let len = self.dynamic_name.iter().position(|&b| b == 0).unwrap_or(16);
-            core::str::from_utf8(&self.dynamic_name[..len]).unwrap_or("???")
-        }
+        let len = self.dynamic_name.iter().position(|&b| b == 0).unwrap_or(16);
+        core::str::from_utf8(&self.dynamic_name[..len]).unwrap_or("???")
     }
 
-    /// Set dynamic name (for dynamic services)
+    /// Set service name
     pub fn set_dynamic_name(&mut self, name: &[u8]) {
         let len = name.len().min(16);
         self.dynamic_name[..len].copy_from_slice(&name[..len]);
@@ -291,34 +157,19 @@ impl Service {
         }
     }
 
-    /// Check if this is a dynamic service (no static definition)
-    pub fn is_dynamic(&self) -> bool {
-        self.def_index == 0xFF
+    /// Set trigger port (the port that caused this service to be spawned)
+    pub fn set_trigger_port(&mut self, port_name: &[u8]) {
+        let len = port_name.len().min(32);
+        self.trigger_port[..len].copy_from_slice(&port_name[..len]);
+        if len < 32 {
+            self.trigger_port[len..].fill(0);
+        }
+        self.trigger_port_len = len as u8;
     }
 
-    /// Add a child service index
-    pub fn add_child(&mut self, child_idx: u8) -> bool {
-        if self.child_count as usize >= MAX_CHILDREN_PER_SERVICE {
-            return false;
-        }
-        self.children[self.child_count as usize] = Some(child_idx);
-        self.child_count += 1;
-        true
-    }
-
-    /// Remove a child service index
-    pub fn remove_child(&mut self, child_idx: u8) {
-        for i in 0..self.child_count as usize {
-            if self.children[i] == Some(child_idx) {
-                // Shift remaining
-                for j in i..self.child_count as usize - 1 {
-                    self.children[j] = self.children[j + 1];
-                }
-                self.children[self.child_count as usize - 1] = None;
-                self.child_count -= 1;
-                return;
-            }
-        }
+    /// Get trigger port name (empty slice if none)
+    pub fn trigger_port(&self) -> &[u8] {
+        &self.trigger_port[..self.trigger_port_len as usize]
     }
 }
 
@@ -377,77 +228,7 @@ impl ServiceRegistry {
         }
     }
 
-    /// Initialize services from static definitions
-    pub fn init_from_defs(&mut self) {
-        for (i, _def) in SERVICE_DEFS.iter().enumerate() {
-            if self.count >= MAX_SERVICES {
-                break;
-            }
-
-            let mut service = Service::empty();
-            service.def_index = i as u8;
-            service.state = ServiceState::Pending;
-
-            self.services[self.count] = Some(service);
-            self.count += 1;
-        }
-
-        // Link parents and children
-        self.link_parent_child();
-    }
-
-    fn link_parent_child(&mut self) {
-        // First pass: find parent indices
-        for i in 0..self.count {
-            if let Some(service) = &self.services[i] {
-                if let Some(parent_name) = service.def().and_then(|d| d.parent) {
-                    // Find parent index
-                    let parent_idx = (0..self.count).find(|&j| {
-                        self.services[j]
-                            .as_ref()
-                            .map(|s| s.name() == parent_name)
-                            .unwrap_or(false)
-                    });
-
-                    if let Some(pidx) = parent_idx {
-                        if let Some(s) = &mut self.services[i] {
-                            s.parent = Some(pidx as u8);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Second pass: add children to parents
-        for i in 0..self.count {
-            let parent_idx = self.services[i]
-                .as_ref()
-                .and_then(|s| s.parent)
-                .map(|p| p as usize);
-
-            if let Some(pidx) = parent_idx {
-                if let Some(parent) = &mut self.services[pidx] {
-                    parent.add_child(i as u8);
-                }
-            }
-        }
-    }
-
-    /// Add a new service (returns index)
-    pub fn add(&mut self, service: Service) -> Option<usize> {
-        if self.count >= MAX_SERVICES {
-            return None;
-        }
-        let idx = self.count;
-        self.services[idx] = Some(service);
-        self.count += 1;
-        Some(idx)
-    }
-
-    /// Find an empty service slot (for dynamic drivers)
-    ///
-    /// Unlike `add()` which only uses count, this searches for any None slot.
-    /// Used for dynamically spawned drivers that don't have static definitions.
+    /// Find an empty service slot
     pub fn find_empty_slot(&self) -> Option<usize> {
         (0..MAX_SERVICES).find(|&i| self.services[i].is_none())
     }
@@ -462,14 +243,14 @@ impl ServiceRegistry {
         })
     }
 
-    /// Ensure count includes a specific slot index (for dynamic services)
+    /// Ensure count includes a specific slot index
     pub fn ensure_count_includes(&mut self, slot_idx: usize) {
         if slot_idx >= self.count {
             self.count = slot_idx + 1;
         }
     }
 
-    /// Create a dynamic service slot for a spawned child
+    /// Create a service slot for a spawned process.
     ///
     /// Returns the slot index if successful, None if no slots available.
     pub fn create_dynamic_service(&mut self, pid: u32, name: &[u8], now: u64) -> Option<usize> {
@@ -485,12 +266,10 @@ impl ServiceRegistry {
     ) -> Option<usize> {
         let slot_idx = self.find_empty_slot()?;
 
-        // Create a new service in the slot
         let mut service = Service::empty();
         service.pid = pid;
         service.state = initial_state;
         service.last_change = now;
-        service.def_index = 0xFF;  // No static definition
         service.set_dynamic_name(name);
 
         self.services[slot_idx] = Some(service);

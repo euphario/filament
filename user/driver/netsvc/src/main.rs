@@ -412,7 +412,7 @@ impl NetSvcDriver {
 // =============================================================================
 
 impl Driver for NetSvcDriver {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         uinfo!("netsvc", "starting";);
 
         // Try to discover NIC immediately (may fail if netd hasn't started yet)
@@ -565,8 +565,8 @@ fn main() {
 struct NetSvcDriverWrapper(&'static mut NetSvcDriver);
 
 impl Driver for NetSvcDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {

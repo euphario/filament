@@ -15,12 +15,12 @@
 
 use crate::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, SpawnContext,
-    ChildId, PortId, KernelBusId, KernelBusInfo, KernelBusState, KernelBusChangeReason,
+    PortId, KernelBusId, KernelBusInfo,
     BlockTransport, BlockPortConfig,
-    MAX_CHILDREN, MAX_PORTS, MAX_KERNEL_BUSES, MAX_PENDING, bus_msg,
+    MAX_PORTS, MAX_KERNEL_BUSES, MAX_PENDING, bus_msg,
 };
 use crate::bus_block::ShmemBlockPort;
-use crate::devd::{DevdClient, DevdCommand, DriverState};
+use crate::devd::{DevdClient, DevdCommand};
 use crate::ipc::{Channel, Mux, MuxFilter};
 use crate::syscall::{self, Handle, LogLevel};
 
@@ -95,29 +95,25 @@ impl HandleRegistry {
 }
 
 // ============================================================================
-// Child Tracking
-// ============================================================================
-
-struct ChildEntry {
-    pid: u32,
-    alive: bool,
-}
-
-// ============================================================================
 // Kernel Bus Entry
 // ============================================================================
 
 /// Kernel bus protocol message types (wire format, first byte of payload).
 mod kbus_proto {
     pub const STATE_SNAPSHOT: u8 = 0;
-    pub const STATE_CHANGED: u8 = 1;
-    pub const SET_DRIVER: u8 = 22;
+    pub const DEVICE_LIST: u8 = 3;
+    // STATE_CHANGED uses supervision protocol (abi::supervision::STATE_CHANGED = 3)
 }
+
+/// Maximum enumerated devices per bus
+const MAX_BUS_DEVICES: usize = 32;
 
 /// A claimed kernel bus connection.
 struct KernelBusEntry {
     channel: Channel,
     info: KernelBusInfo,
+    devices: [abi::BusDevice; MAX_BUS_DEVICES],
+    device_count: usize,
 }
 
 /// Parse a StateSnapshot message (16 bytes from kernel).
@@ -128,30 +124,9 @@ fn parse_state_snapshot(data: &[u8]) -> Option<KernelBusInfo> {
     Some(KernelBusInfo {
         bus_type: data[1],
         bus_index: data[2],
-        state: KernelBusState::from_u8(data[3]),
         device_count: data[4],
         capabilities: data[5],
     })
-}
-
-/// Parse a StateChanged message (4 bytes from kernel).
-fn parse_state_changed(data: &[u8]) -> Option<(KernelBusState, KernelBusState, KernelBusChangeReason)> {
-    if data.len() < 4 || data[0] != kbus_proto::STATE_CHANGED {
-        return None;
-    }
-    Some((
-        KernelBusState::from_u8(data[1]),
-        KernelBusState::from_u8(data[2]),
-        KernelBusChangeReason::from_u8(data[3]),
-    ))
-}
-
-/// Build a SetDriver message.
-fn build_set_driver_msg(driver_pid: u32) -> [u8; 5] {
-    let mut msg = [0u8; 5];
-    msg[0] = kbus_proto::SET_DRIVER;
-    msg[1..5].copy_from_slice(&driver_pid.to_le_bytes());
-    msg
 }
 
 // ============================================================================
@@ -192,7 +167,7 @@ enum SpawnCtxCache {
 /// This is separated from DriverRuntime so we can borrow it mutably
 /// while the driver is also borrowed mutably by the runtime.
 struct RuntimeCtx {
-    /// Connection to devd.
+    /// Connection to devd (supervision channel).
     devd: DevdClient,
     /// Event multiplexer — single Mux for all event sources.
     mux: Mux,
@@ -202,10 +177,6 @@ struct RuntimeCtx {
     block_ports: [Option<ShmemBlockPort>; MAX_BLOCK_PORTS],
     /// Block port count.
     block_port_count: usize,
-    /// Children.
-    children: [Option<ChildEntry>; MAX_CHILDREN],
-    /// Child count.
-    child_count: usize,
     /// Kernel bus connections.
     kernel_buses: [Option<KernelBusEntry>; MAX_KERNEL_BUSES],
     /// Kernel bus count.
@@ -226,11 +197,6 @@ struct RuntimeCtx {
     pending: [Option<PendingRequest>; MAX_PENDING],
     /// Number of active pending requests.
     pending_count: usize,
-    /// Port names registered during init (set to Ready after report_state(Ready)).
-    /// Each entry: (name, name_len). Max 4 ports per driver during init.
-    init_ports: [([u8; 32], u8); 4],
-    /// Number of ports registered during init.
-    init_port_count: usize,
 }
 
 impl RuntimeCtx {
@@ -245,8 +211,6 @@ impl RuntimeCtx {
             handles: HandleRegistry::new(),
             block_ports: [const { None }; MAX_BLOCK_PORTS],
             block_port_count: 0,
-            children: [const { None }; MAX_CHILDREN],
-            child_count: 0,
             kernel_buses: [const { None }; MAX_KERNEL_BUSES],
             kernel_bus_count: 0,
             next_seq: 1,
@@ -257,8 +221,6 @@ impl RuntimeCtx {
             spawn_ctx: SpawnCtxCache::NotQueried,
             pending: [const { None }; MAX_PENDING],
             pending_count: 0,
-            init_ports: [([0u8; 32], 0); 4],
-            init_port_count: 0,
         }
     }
 
@@ -406,30 +368,6 @@ impl BusCtx for RuntimeCtx {
         Ok(())
     }
 
-    fn spawn_child(&mut self, binary_name: &[u8]) -> Result<ChildId, BusError> {
-        let binary_str = core::str::from_utf8(binary_name).map_err(|_| BusError::SpawnFailed)?;
-        let pid = syscall::exec(binary_str);
-        if pid <= 0 {
-            return Err(BusError::SpawnFailed);
-        }
-
-        for (i, slot) in self.children.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(ChildEntry {
-                    pid: pid as u32,
-                    alive: true,
-                });
-                self.child_count += 1;
-                return Ok(ChildId(i as u8));
-            }
-        }
-        Err(BusError::NoSpace)
-    }
-
-    fn child_count(&self) -> usize {
-        self.child_count
-    }
-
     fn create_block_port(&mut self, config: BlockPortConfig) -> Result<PortId, BusError> {
         let port = ShmemBlockPort::create(&config).map_err(|_| BusError::ShmemError)?;
 
@@ -476,39 +414,48 @@ impl BusCtx for RuntimeCtx {
             return Err(BusError::NoSpace);
         }
 
-        // Connect to the kernel bus port
+        // Connect to the kernel bus port (as owner — supervisor already connected)
         let mut ch = Channel::connect(path).map_err(|_| BusError::LinkDown)?;
 
-        // Receive initial StateSnapshot
-        let mut buf = [0u8; 16];
+        // Receive initial StateSnapshot (kernel sends on connect)
+        // Use large buffer to also handle DeviceList if it arrives in same recv
+        let mut buf = [0u8; 576];
         let n = ch.recv(&mut buf).map_err(|_| BusError::LinkDown)?;
-        let mut info = parse_state_snapshot(&buf[..n]).ok_or(BusError::InvalidMessage)?;
+        let info = parse_state_snapshot(&buf[..n]).ok_or(BusError::InvalidMessage)?;
 
-        // If bus is Resetting, wait for Safe
-        if info.state == KernelBusState::Resetting {
-            loop {
-                let n = ch.recv(&mut buf).map_err(|_| BusError::LinkDown)?;
-                if n == 0 { continue; }
-                if buf[0] == kbus_proto::STATE_SNAPSHOT {
-                    if let Some(new_info) = parse_state_snapshot(&buf[..n]) {
-                        info = new_info;
-                        if info.state == KernelBusState::Safe { break; }
-                    }
-                } else if buf[0] == kbus_proto::STATE_CHANGED && n >= 4 {
-                    if KernelBusState::from_u8(buf[2]) == KernelBusState::Safe {
-                        info.state = KernelBusState::Safe;
-                        break;
-                    }
+        // Receive DeviceList message(s) if devices are present
+        let mut devices = [abi::BusDevice::empty(); MAX_BUS_DEVICES];
+        let mut device_count: usize = 0;
+        let total_expected = info.device_count as usize;
+
+        while device_count < total_expected {
+            let n = ch.recv(&mut buf).map_err(|_| BusError::LinkDown)?;
+            if n < 8 || buf[0] != kbus_proto::DEVICE_LIST {
+                break; // Unexpected message, stop
+            }
+            let _total = buf[1] as usize;
+            let offset = buf[2] as usize;
+            let count = buf[3] as usize;
+            let dev_start = 8;
+            let dev_end = dev_start + count * 32;
+            if n < dev_end {
+                break; // Message too short
+            }
+            for i in 0..count {
+                let idx = offset + i;
+                if idx >= MAX_BUS_DEVICES {
+                    break;
+                }
+                let src = dev_start + i * 32;
+                let dev_bytes = &buf[src..src + 32];
+                devices[idx] = unsafe { *(dev_bytes.as_ptr() as *const abi::BusDevice) };
+                if idx + 1 > device_count {
+                    device_count = idx + 1;
                 }
             }
         }
 
-        // Send SetDriver with our PID
-        let my_pid = syscall::getpid() as u32;
-        let msg = build_set_driver_msg(my_pid);
-        ch.send(&msg).map_err(|_| BusError::LinkDown)?;
-
-        // Register the channel with Mux for ongoing state notifications
+        // Register the channel with Mux for ongoing messages
         let bus_idx = self.kernel_bus_count;
         let tag = TAG_KERNEL_BUS_BASE + bus_idx as u32;
         let ch_handle = ch.handle();
@@ -519,7 +466,12 @@ impl BusCtx for RuntimeCtx {
         }
 
         // Store the entry
-        self.kernel_buses[bus_idx] = Some(KernelBusEntry { channel: ch, info });
+        self.kernel_buses[bus_idx] = Some(KernelBusEntry {
+            channel: ch,
+            info,
+            devices,
+            device_count,
+        });
         self.kernel_bus_count += 1;
 
         Ok((KernelBusId(bus_idx as u8), info))
@@ -528,6 +480,12 @@ impl BusCtx for RuntimeCtx {
     fn kernel_bus_info(&self, id: KernelBusId) -> Option<&KernelBusInfo> {
         let idx = id.0 as usize;
         self.kernel_buses.get(idx)?.as_ref().map(|e| &e.info)
+    }
+
+    fn bus_devices(&self, id: KernelBusId) -> Option<&[abi::BusDevice]> {
+        let idx = id.0 as usize;
+        let entry = self.kernel_buses.get(idx)?.as_ref()?;
+        Some(&entry.devices[..entry.device_count])
     }
 
     fn enable_bus_mastering(&mut self, bus_id: KernelBusId, device_bdf: u16) -> Result<(), BusError> {
@@ -586,40 +544,24 @@ impl BusCtx for RuntimeCtx {
             .map_err(|_| BusError::Internal)
     }
 
-    fn ack_spawn(&mut self, seq_id: u32, result: i32, pid: u32) -> Result<(), BusError> {
-        self.devd
-            .ack_spawn(seq_id, result, pid)
-            .map_err(|_| BusError::Internal)
-    }
-
     fn register_port_with_info(
         &mut self,
         info: &abi::PortInfo,
         shmem_id: u32,
     ) -> Result<(), BusError> {
+        // Register with devd via supervision channel
+        // Port starts in Safe state — supervisor will fire rules
         self.devd
             .register_port_info(info, shmem_id)
             .map_err(|_| BusError::Internal)?;
-
-        // Track port name for deferred Ready (set after report_state(Ready))
-        if self.init_port_count < 4 {
-            let name = info.name_bytes();
-            let len = name.len().min(32);
-            self.init_ports[self.init_port_count].0[..len].copy_from_slice(&name[..len]);
-            self.init_ports[self.init_port_count].1 = len as u8;
-            self.init_port_count += 1;
-        }
-
         Ok(())
     }
 
-    fn report_state(&mut self, state: DriverState) -> Result<(), BusError> {
-        self.devd
-            .report_state(state)
-            .map_err(|_| BusError::Internal)
-    }
-
-    fn set_port_state(&mut self, name: &[u8], state: abi::PortState) -> Result<(), BusError> {
+    fn set_port_state(
+        &mut self,
+        name: &[u8],
+        state: abi::PortState,
+    ) -> Result<(), BusError> {
         self.devd
             .set_port_state(name, state)
             .map_err(|_| BusError::Internal)
@@ -720,23 +662,9 @@ fn devd_command_to_bus_msg(cmd: &DevdCommand) -> Option<BusMsg> {
             msg.payload_len = (*key_len + 1 + *value_len + 1) as u16;
             Some(msg)
         }
-        DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, .. } => {
-            let mut msg = BusMsg::new(bus_msg::SPAWN_CHILD);
-            msg.seq_id = *seq_id;
-            msg.write_bytes(0, &binary[..*binary_len]);
-            msg.write_u8(*binary_len, 0); // null terminator
-            // caps at fixed offset after binary
-            msg.write_u64(72, *caps); // offset 72: past 64-byte binary + 8 alignment
-            msg.payload_len = 80;
-            Some(msg)
-        }
-        DevdCommand::StopChild { seq_id, child_pid } => {
-            let mut msg = BusMsg::new(bus_msg::STOP_CHILD);
-            msg.seq_id = *seq_id;
-            msg.write_u32(0, *child_pid);
-            msg.payload_len = 4;
-            Some(msg)
-        }
+        // SpawnChild/StopChild handled by framework (supervision protocol),
+        // not dispatched to driver
+        DevdCommand::SpawnChild { .. } | DevdCommand::StopChild { .. } => None,
     }
 }
 
@@ -768,10 +696,10 @@ impl<D: Driver> DriverRuntime<D> {
         // Register devd channel with Mux
         self.ctx.register_devd_handle();
 
-        // Initialize the driver
-        if let Err(e) = self.driver.init(&mut self.ctx) {
+        // Initialize the driver (hardware is Safe — bring it up)
+        if let Err(e) = self.driver.reset(&mut self.ctx) {
             let mut buf = [0u8; 64];
-            buf[..19].copy_from_slice(b"[bus] init failed: ");
+            buf[..20].copy_from_slice(b"[bus] reset failed: ");
             let err_name = match e {
                 BusError::LinkDown => "LinkDown",
                 BusError::BufferFull => "BufferFull",
@@ -784,26 +712,17 @@ impl<D: Driver> DriverRuntime<D> {
                 BusError::Internal => "Internal",
             };
             let elen = err_name.len().min(40);
-            buf[19..19 + elen].copy_from_slice(&err_name.as_bytes()[..elen]);
+            buf[20..20 + elen].copy_from_slice(&err_name.as_bytes()[..elen]);
             crate::ulog::flush();
-            syscall::klog(LogLevel::Error, &buf[..19 + elen]);
+            syscall::klog(LogLevel::Error, &buf[..20 + elen]);
             syscall::exit(1);
         }
 
-        // Flush structured logs from init before entering event loop
+        // Report Ready to devd — transitions service from Starting to Ready
+        let _ = self.ctx.devd.report_state(crate::devd::DriverState::Ready);
+
+        // Flush structured logs from reset before entering event loop
         crate::ulog::flush();
-
-        // Report ready to devd
-        let _ = self.ctx.devd.report_state(DriverState::Ready);
-
-        // Set all ports registered during init() to Ready.
-        // This ensures rules fire AFTER the driver is in its event loop
-        // and can process SpawnChild commands immediately.
-        for i in 0..self.ctx.init_port_count {
-            let (ref name, len) = self.ctx.init_ports[i];
-            let _ = self.ctx.devd.set_port_state(&name[..len as usize], abi::PortState::Ready);
-        }
-        self.ctx.init_port_count = 0;
 
         // Event loop: block on Mux, dispatch deadlines, repeat
         loop {
@@ -875,7 +794,7 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
-    /// Handle a kernel bus state notification.
+    /// Handle a kernel bus channel event (state snapshot or supervision message).
     fn handle_kernel_bus_event(&mut self, bus_idx: usize) {
         let mut buf = [0u8; 16];
 
@@ -894,41 +813,16 @@ impl<D: Driver> DriverRuntime<D> {
             match buf[0] {
                 kbus_proto::STATE_SNAPSHOT => {
                     if let Some(new_info) = parse_state_snapshot(&buf[..n]) {
-                        let old_state = self.ctx.kernel_buses[bus_idx]
-                            .as_ref()
-                            .map(|e| e.info.state)
-                            .unwrap_or(KernelBusState::Safe);
                         if let Some(entry) = &mut self.ctx.kernel_buses[bus_idx] {
                             entry.info = new_info;
                         }
-                        // Auto-forward to devd
-                        let _ = self.ctx.devd.report_state(DriverState::Ready);
-                        // Notify driver
-                        self.driver.bus_state_changed(
-                            KernelBusId(bus_idx as u8),
-                            old_state,
-                            new_info.state,
-                            KernelBusChangeReason::Connected,
-                            &mut self.ctx,
-                        );
                     }
                 }
-                kbus_proto::STATE_CHANGED => {
-                    if let Some((from, to, reason)) = parse_state_changed(&buf[..n]) {
-                        if let Some(entry) = &mut self.ctx.kernel_buses[bus_idx] {
-                            entry.info.state = to;
-                        }
-                        // Auto-forward to devd
-                        let _ = self.ctx.devd.report_state(DriverState::Ready);
-                        // Notify driver
-                        self.driver.bus_state_changed(
-                            KernelBusId(bus_idx as u8),
-                            from,
-                            to,
-                            reason,
-                            &mut self.ctx,
-                        );
-                    }
+                abi::supervision::STATE_CHANGED if n >= 4 => {
+                    // Supervision protocol: [STATE_CHANGED, old, new, reason]
+                    // We're the owner — kernel is telling us about state changes
+                    // (normally we wouldn't see these since we ARE the owner,
+                    //  but they can arrive on Reset/Safe transitions)
                 }
                 _ => {
                     // Unknown message type, ignore
@@ -943,6 +837,23 @@ impl<D: Driver> DriverRuntime<D> {
     /// The framework intercepts known types (spawn, stop, config) before
     /// the driver sees them. Everything else goes to `driver.command()`.
     fn dispatch_devd_command(&mut self, cmd: DevdCommand) {
+        // SpawnChild: framework spawns the child and acks back to devd.
+        if let DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, .. } = &cmd {
+            let name = core::str::from_utf8(&binary[..*binary_len]).unwrap_or("???");
+            let pid = if *caps != 0 {
+                syscall::exec_with_caps(name, *caps)
+            } else {
+                syscall::exec(name)
+            };
+            let (result, child_pid) = if pid > 0 {
+                (0i32, pid as u32)
+            } else {
+                (-1i32, 0u32)
+            };
+            let _ = self.ctx.devd.ack_spawn(*seq_id, result, child_pid);
+            return;
+        }
+
         let bus_msg = match devd_command_to_bus_msg(&cmd) {
             Some(msg) => msg,
             None => return,
@@ -952,56 +863,6 @@ impl<D: Driver> DriverRuntime<D> {
         self.ctx.current_cmd_type = bus_msg.msg_type;
 
         match bus_msg.msg_type {
-            // --- Framework-handled: process lifecycle ---
-
-            bus_msg::SPAWN_CHILD => {
-                let binary_name = bus_msg.read_null_terminated(0);
-                let caps = bus_msg.read_u64(72);
-
-                let binary_str = match core::str::from_utf8(binary_name) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        let _ = self.ctx.devd.ack_spawn(bus_msg.seq_id, -1, 0);
-                        return;
-                    }
-                };
-
-                let pid = if caps != 0 {
-                    syscall::exec_with_caps(binary_str, caps)
-                } else {
-                    syscall::exec(binary_str)
-                };
-
-                if pid > 0 {
-                    let _ = self.ctx.devd.ack_spawn(bus_msg.seq_id, 0, pid as u32);
-                    for slot in &mut self.ctx.children {
-                        if slot.is_none() {
-                            *slot = Some(ChildEntry {
-                                pid: pid as u32,
-                                alive: true,
-                            });
-                            self.ctx.child_count += 1;
-                            break;
-                        }
-                    }
-                } else {
-                    let _ = self.ctx.devd.ack_spawn(bus_msg.seq_id, pid as i32, 0);
-                }
-            }
-
-            bus_msg::STOP_CHILD => {
-                let child_pid = bus_msg.read_u32(0);
-                let _ = syscall::kill(child_pid);
-                for slot in &mut self.ctx.children {
-                    if let Some(entry) = slot {
-                        if entry.pid == child_pid {
-                            entry.alive = false;
-                            break;
-                        }
-                    }
-                }
-            }
-
             // --- Framework-handled: configuration ---
 
             bus_msg::CONFIG_GET => {

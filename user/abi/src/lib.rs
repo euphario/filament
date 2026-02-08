@@ -910,6 +910,112 @@ impl PciEnumEntry {
 }
 
 // ============================================================================
+// Bus Device (Generic per-bus device entry)
+// ============================================================================
+
+/// Generic device entry on a bus
+///
+/// Used for all bus types: PCI, I2C, GPIO, PWM, etc.
+/// Stored in kernel BusController, delivered to drivers via DeviceList message.
+/// 32 bytes, same size as PciEnumEntry.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BusDevice {
+    /// Device identifier (BDF for PCI, address for I2C, pin for GPIO)
+    pub id: u32,
+    /// Vendor ID (PCI vendor; 0 for non-PCI)
+    pub vendor_id: u16,
+    /// Device ID (PCI device; chip type for I2C)
+    pub device_id: u16,
+    /// Packed class: class(8) | subclass(8) | prog_if(8) | revision(8)
+    pub class_code: u32,
+    /// Primary resource address (BAR0 for PCI, base addr for MMIO)
+    pub resource0: u64,
+    /// Primary resource size (BAR0 size for PCI, IRQ for others)
+    pub resource1: u32,
+    /// Capability flags (see `bus_device_flags`)
+    pub flags: u16,
+    /// Reserved
+    pub _reserved: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<BusDevice>() == 32);
+
+/// Bus device capability flags
+pub mod bus_device_flags {
+    /// Device supports MSI interrupts
+    pub const MSI: u16 = 1 << 0;
+    /// Device supports MSI-X interrupts
+    pub const MSIX: u16 = 1 << 1;
+    /// Device is a PCI bridge
+    pub const BRIDGE: u16 = 1 << 2;
+    /// Device supports DMA / bus mastering
+    pub const DMA: u16 = 1 << 3;
+    /// Device has MMIO region (resource0/resource1 valid)
+    pub const MMIO: u16 = 1 << 4;
+    /// Device has interrupt (resource1 is IRQ for non-PCI)
+    pub const IRQ: u16 = 1 << 5;
+}
+
+impl BusDevice {
+    pub const fn empty() -> Self {
+        Self {
+            id: 0,
+            vendor_id: 0,
+            device_id: 0,
+            class_code: 0,
+            resource0: 0,
+            resource1: 0,
+            flags: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Extract PCI bus number from id (BDF encoding)
+    pub const fn pci_bus(&self) -> u8 {
+        pci_bdf::bus(self.id)
+    }
+
+    /// Extract PCI device number from id (BDF encoding)
+    pub const fn pci_device(&self) -> u8 {
+        pci_bdf::device(self.id)
+    }
+
+    /// Extract PCI function number from id (BDF encoding)
+    pub const fn pci_function(&self) -> u8 {
+        pci_bdf::function(self.id)
+    }
+
+    /// Extract base class from class_code
+    pub const fn base_class(&self) -> u8 {
+        ((self.class_code >> 24) & 0xFF) as u8
+    }
+
+    /// Extract subclass from class_code
+    pub const fn subclass(&self) -> u8 {
+        ((self.class_code >> 16) & 0xFF) as u8
+    }
+
+    /// Extract prog_if from class_code
+    pub const fn prog_if(&self) -> u8 {
+        ((self.class_code >> 8) & 0xFF) as u8
+    }
+
+    /// Extract revision from class_code
+    pub const fn revision(&self) -> u8 {
+        (self.class_code & 0xFF) as u8
+    }
+
+    pub const fn has_msi(&self) -> bool {
+        (self.flags & bus_device_flags::MSI) != 0
+    }
+
+    pub const fn has_msix(&self) -> bool {
+        (self.flags & bus_device_flags::MSIX) != 0
+    }
+}
+
+// ============================================================================
 // Bus Types (Kernel → Userspace)
 // ============================================================================
 
@@ -1170,41 +1276,79 @@ impl PortClass {
     }
 }
 
-/// Port lifecycle state
-///
-/// All ports have an explicit state. Rules only fire on Ready transitions.
+/// Port lifecycle state (universal — kernel bus, driver port, child port)
 ///
 /// State machine:
-///   Initialize ──→ Ready ──→ Disconnect
-///                    ↑            │
-///                    └─ Resetting ←┘
+///   Safe ──→ Claimed ──→ Resetting ──→ Safe
+///
+/// Guards:
+/// - Spawn: only accepted in Safe
+/// - Owner connect: only accepted in Safe
+/// - Claimed/Resetting: reject all spawn/connect attempts
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortState {
-    /// Port exists, owner setting up (hardware reset, driver init)
-    Initialize = 0,
-    /// Port is live, owner can process commands
-    Ready = 1,
-    /// Owner exited (clean or crash), port removed
-    Disconnect = 2,
-    /// Hardware/driver resetting, will return to Ready
-    Resetting = 3,
+    /// No owner. Hardware safe. Ready for spawn.
+    Safe = 0,
+    /// Owner connected and operational.
+    Claimed = 1,
+    /// Owner died/disconnected. Cleanup in progress.
+    Resetting = 2,
 }
 
 impl PortState {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(PortState::Initialize),
-            1 => Some(PortState::Ready),
-            2 => Some(PortState::Disconnect),
-            3 => Some(PortState::Resetting),
+            0 => Some(PortState::Safe),
+            1 => Some(PortState::Claimed),
+            2 => Some(PortState::Resetting),
             _ => None,
         }
     }
 
-    pub fn is_ready(&self) -> bool {
-        matches!(self, PortState::Ready)
+    pub fn is_safe(&self) -> bool {
+        matches!(self, PortState::Safe)
     }
+
+    pub fn is_claimed(&self) -> bool {
+        matches!(self, PortState::Claimed)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortState::Safe => "safe",
+            PortState::Claimed => "claimed",
+            PortState::Resetting => "resetting",
+        }
+    }
+}
+
+/// Supervision protocol constants
+///
+/// Used on the supervision channel between devd and port managers
+/// (kernel bus controller or bus_runtime). Same protocol at every level.
+pub mod supervision {
+    // Message types on supervision channel (devd ↔ kernel or devd ↔ bus_runtime)
+
+    /// supervisor → manager: spawn owner for port
+    pub const SPAWN: u8 = 1;
+    /// manager → supervisor: spawn result
+    pub const SPAWN_ACK: u8 = 2;
+    /// manager → supervisor: port state transition
+    pub const STATE_CHANGED: u8 = 3;
+    /// manager → supervisor: new port available
+    pub const PORT_REGISTERED: u8 = 4;
+
+    // StateChanged reason codes
+
+    /// Owner process connected and is operational
+    pub const REASON_OWNER_CONNECTED: u8 = 0;
+    /// Owner process exited (crash or clean exit)
+    pub const REASON_OWNER_EXITED: u8 = 1;
+    /// Hardware/software reset completed, port back to Safe
+    pub const REASON_RESET_COMPLETE: u8 = 2;
+    /// Hardware error occurred
+    pub const REASON_HARDWARE_ERROR: u8 = 3;
 }
 
 /// Port subclass constants (class-specific values)

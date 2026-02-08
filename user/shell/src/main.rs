@@ -40,7 +40,6 @@ macro_rules! println {
 use userlib::ipc::Port;
 use userlib::syscall;
 use userlib::vfs_client::VfsClient;
-use userlib::devd::{DevdClient, DriverState};
 
 /// Maximum background jobs to track
 const MAX_BG_JOBS: usize = 16;
@@ -94,11 +93,6 @@ fn main() {
     }
     console::write(b"Type 'help' for commands\r\n\r\n");
     color::reset();
-
-    // Report ready to devd
-    if let Ok(mut devd) = DevdClient::connect() {
-        let _ = devd.report_state(DriverState::Ready);
-    }
 
     loop {
         // Drain any pending IPC command requests from remote shell

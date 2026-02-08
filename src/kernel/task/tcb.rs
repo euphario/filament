@@ -159,7 +159,7 @@ pub const CLEANUP_GRACE_TICKS: u8 = 10;
 pub enum CleanupPhase {
     /// Not exiting
     None,
-    /// Phase 1 microtasks submitted (IpcCleanup, ReparentChildren, etc.)
+    /// Phase 1 microtasks submitted (IpcCleanup, KillChildren, etc.)
     Phase1Enqueued,
     /// Phase 1 done, waiting for servers to process notifications
     GracePeriod { until: u64 },
@@ -333,6 +333,7 @@ fn user_task_trampoline() -> ! {
         // Set per-CPU data for exception handler
         crate::kernel::percpu::set_trap_frame(trap_frame);
         crate::kernel::percpu::set_ttbr0(ttbr0);
+        crate::kernel::percpu::set_kernel_stack_top(kstack_top);
 
         (trap_frame as *const TrapFrame, ttbr0, kstack_top)
         // sched guard dropped here - lock released

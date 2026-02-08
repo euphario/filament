@@ -39,14 +39,15 @@ pub use dma::{DmaBuf, DmaDirection, CoherentBuf, StreamingBuf};
 pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_status, side_msg, side_status, Doorbell, ChannelDoorbell};
 pub use data_port::{DataPort, DataPortConfig, PortRole, Layer, ConnectedLayer, GeometryInfo};
 pub use devd::{
-    DevdClient, DeviceClass, DeviceInfo, ClientState, DriverState,
+    DevdClient, DeviceClass, DeviceInfo, ClientState,
     DevdCommand, SpawnFilter, SpawnResult,
 };
 pub use bus::{
     BusMsg, BusMsgFlags, BusError, BusCtx, Driver, Disposition, ConfigKey,
-    ChildId, PortId, BlockTransport, BlockPortConfig, BlockGeometry,
+    PortId, BlockTransport, BlockPortConfig, BlockGeometry,
     BlockCompletion, PortError, bus_msg as bus_msg_types,
 };
+pub use abi::{BusDevice, bus_device_flags};
 pub use bus_block::ShmemBlockPort;
 pub use vfs_proto::{VfsDirEntry, VfsStat, fs_op, open_flags, file_type, vfs_error};
 pub use vfs_client::{VfsClient, VfsError};

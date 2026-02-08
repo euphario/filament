@@ -142,16 +142,15 @@ pub struct BusController {
     /// When we entered current state (for watchdog)
     pub state_entered_at: u64,
 
-    /// Owner's channel (from bus control port connection)
-    pub owner_channel: Option<ChannelId>,
+    /// Supervisor (devd) — persists across owners
+    pub supervisor_ch: Option<ChannelId>,
+    pub supervisor_pid: Option<Pid>,
 
-    /// Owner's PID (for cleanup on process exit)
+    /// Owner — whoever claimed this port (consoled, pcied, etc.)
+    /// Set when owner process connects to the bus port.
+    /// When this PID exits, kernel auto-resets bus and notifies supervisor.
+    pub owner_ch: Option<ChannelId>,
     pub owner_pid: Option<Pid>,
-
-    /// Driver PID - the actual process using the hardware
-    /// Set by devd via SetDriver message. When this PID exits,
-    /// kernel auto-resets bus and notifies devd via owner_channel.
-    pub driver_pid: Option<Pid>,
 
     /// Control port name (e.g., "/kernel/bus/pcie0")
     pub port_name: [u8; 32],
@@ -161,8 +160,12 @@ pub struct BusController {
     pub listen_channel: Option<ChannelId>,
 
     /// Per-device bus mastering state
-    pub devices: [DeviceBusMasterState; MAX_DEVICES_PER_BUS],
-    pub device_count: usize,
+    pub bm_devices: [DeviceBusMasterState; MAX_DEVICES_PER_BUS],
+    pub bm_count: usize,
+
+    /// Enumerated devices on this bus (generic, delivered to drivers)
+    pub enum_devices: [abi::BusDevice; MAX_DEVICES_PER_BUS],
+    pub enum_count: usize,
 
     /// Global bus mastering enabled (hardware level)
     pub bus_master_enabled: bool,
@@ -190,18 +193,21 @@ impl BusController {
             bus_index: 0,
             state: BusState::Safe,
             state_entered_at: 0,
-            owner_channel: None,
+            supervisor_ch: None,
+            supervisor_pid: None,
+            owner_ch: None,
             owner_pid: None,
-            driver_pid: None,
             port_name: [0; 32],
             port_name_len: 0,
             listen_channel: None,
-            devices: [DeviceBusMasterState {
+            bm_devices: [DeviceBusMasterState {
                 device_id: 0,
                 state: BusMasteringState::Disabled,
                 iommu_mappings: 0,
             }; MAX_DEVICES_PER_BUS],
-            device_count: 0,
+            bm_count: 0,
+            enum_devices: [abi::BusDevice::empty(); MAX_DEVICES_PER_BUS],
+            enum_count: 0,
             bus_master_enabled: false,
             hardware_verified: false,
             base_addr: 0,
@@ -283,6 +289,16 @@ impl BusController {
         info.path[..len].copy_from_slice(&self.port_name[..len]);
 
         info
+    }
+
+    /// Check if a PID is the supervisor
+    pub fn is_supervisor(&self, pid: Pid) -> bool {
+        self.supervisor_pid == Some(pid)
+    }
+
+    /// Check if a PID is the owner
+    pub fn is_owner(&self, pid: Pid) -> bool {
+        self.owner_pid == Some(pid)
     }
 
     /// Convert to DeviceInfo for unified device list
@@ -389,17 +405,15 @@ impl BusController {
     pub fn check_invariants(&self) -> bool {
         match self.state {
             BusState::Safe => {
-                // Safe: bus mastering off, owner (devd) MAY be connected
-                // Owner stays connected so it can receive notifications and restart drivers
+                // Safe: bus mastering off, supervisor MAY be connected
                 !self.bus_master_enabled
             }
             BusState::Claimed => {
-                // Claimed: owner must be connected, driver is managing hardware
-                self.owner_channel.is_some() &&
+                // Claimed: owner must exist
                 self.owner_pid.is_some()
             }
             BusState::Resetting => {
-                // Resetting: temporary state, owner stays so we can notify after reset
+                // Resetting: temporary state, bus mastering off
                 !self.bus_master_enabled
             }
         }
@@ -425,28 +439,28 @@ impl BusController {
         // Enforce invariants based on new state
         match new_state {
             BusState::Safe => {
-                // Keep owner_channel/owner_pid - devd stays connected to manage bus
-                // Only clear driver_pid (driver is gone)
-                self.driver_pid = None;
+                // Clear owner (owner is gone or reset complete)
+                self.owner_ch = None;
+                self.owner_pid = None;
                 self.bus_master_enabled = false;
                 self.disable_all_bus_mastering();
 
-                // Notify owner (devd) that bus is now Safe
-                // This allows devd to spawn drivers
-                let _ = self.notify_owner();
+                // Notify supervisor (devd) — port is Safe, ready for new owner
+                let _ = self.notify_supervisor(old_state, new_state, reason);
             }
             BusState::Claimed => {
                 // Owner should already be set before calling transition
+                let _ = self.notify_supervisor(old_state, new_state, reason);
             }
             BusState::Resetting => {
-                // Keep owner_channel/owner_pid - need to notify after reset
-                // Clear driver since it crashed
-                self.driver_pid = None;
+                // Owner is gone, disable hardware
+                self.owner_ch = None;
+                self.owner_pid = None;
                 self.bus_master_enabled = false;
                 self.disable_all_bus_mastering();
 
-                // Notify owner (devd) that bus is resetting
-                let _ = self.notify_owner();
+                // Notify supervisor (devd) that bus is resetting
+                let _ = self.notify_supervisor(old_state, new_state, reason);
             }
         }
 
@@ -465,44 +479,46 @@ impl BusController {
         }
 
         // Then update our tracking - reset all device states including IOMMU mappings
-        for i in 0..self.device_count {
-            self.devices[i].reset();
+        for i in 0..self.bm_count {
+            self.bm_devices[i].reset();
         }
         self.bus_master_enabled = false;
     }
 
     /// Handle a new connection to the bus control port
-    /// Only supervisor (devd) should connect - drivers are authorized via SetDriver
+    ///
+    /// Accepts one owner connection at a time. Bus must be in Safe state.
+    /// Supervisor (devd) channels are set separately when devd connects
+    /// via the supervision protocol.
     pub fn handle_connect(&mut self, client_channel: ChannelId, client_pid: Pid) -> Result<(), BusError> {
-        // Reject if already has an owner
+        if self.state != BusState::Safe {
+            return Err(BusError::Busy);
+        }
         if self.owner_pid.is_some() {
             return Err(BusError::AlreadyClaimed);
         }
 
-        match self.state {
-            BusState::Safe | BusState::Resetting => {
-                // Accept connection in any state
-                // devd sees current state and waits for Safe if needed
-                self.owner_channel = Some(client_channel);
-                self.owner_pid = Some(client_pid);
-                kinfo!("bus", "supervisor_connected";
-                    name = self.port_name_str(),
-                    pid = client_pid as u64,
-                    state = self.state.as_str());
-                self.send_state_snapshot(client_channel)?;
-                Ok(())
-            }
-            BusState::Claimed => {
-                // Bus is in use by a driver - reject
-                Err(BusError::AlreadyClaimed)
-            }
-        }
+        self.owner_ch = Some(client_channel);
+        self.owner_pid = Some(client_pid);
+        kinfo!("bus", "owner_connected";
+            name = self.port_name_str(),
+            pid = client_pid as u64);
+
+        // Transition to Claimed — owner is now managing hardware
+        self.transition_to(BusState::Claimed, StateChangeReason::Connected);
+
+        // Send state snapshot to owner so it knows hardware details
+        self.send_state_snapshot(client_channel)?;
+
+        // Send enumerated device list (if any devices)
+        self.send_device_list(client_channel)?;
+        Ok(())
     }
 
-    /// Handle owner (devd) disconnecting
-    pub fn handle_disconnect(&mut self, reason: StateChangeReason) {
-        // Close the kernel-owned channel to free resources
-        if let Some(ch) = self.owner_channel {
+    /// Handle supervisor (devd) disconnecting
+    pub fn handle_supervisor_disconnect(&mut self, _reason: StateChangeReason) {
+        // Close the kernel-owned supervision channel
+        if let Some(ch) = self.supervisor_ch {
             if let Ok(Some(peer)) = ipc::close_unchecked(ch) {
                 let wake_list = crate::kernel::object_service::object_service()
                     .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
@@ -510,44 +526,37 @@ impl BusController {
             }
         }
 
-        // Clear ownership so new devd can connect
-        self.owner_channel = None;
-        self.owner_pid = None;
-        self.driver_pid = None;
+        // Clear supervisor state so new devd can connect
+        self.supervisor_ch = None;
+        self.supervisor_pid = None;
 
-        if self.state == BusState::Claimed {
-            // Owner left while bus was claimed - go to RESETTING then SAFE
-            self.transition_to(BusState::Resetting, reason);
-
-            // Perform hardware reset
-            self.perform_hardware_reset();
-
-            // Reset complete - go to SAFE
-            self.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
-        }
-        // If already Safe, just clear ownership (done above)
+        // Bus stays in current state — owner keeps running if present
+        // devd crash doesn't kill a working driver
     }
 
-    /// Handle driver process exit
-    ///
-    /// Called when the driver_pid process exits. Resets the bus and notifies
-    /// the supervisor (devd) via owner_channel so it can restart the driver.
-    pub fn handle_driver_exit(&mut self, driver_pid: Pid) {
-        kinfo!("bus", "driver_exit"; name = self.port_name_str(), pid = driver_pid as u64);
+    /// Handle owner (driver) disconnecting/exiting
+    pub fn handle_owner_exit(&mut self, owner_pid: Pid) {
+        kinfo!("bus", "owner_exit"; name = self.port_name_str(), pid = owner_pid as u64);
 
-        // Clear driver_pid
-        self.driver_pid = None;
+        // Close the kernel-owned owner channel
+        if let Some(ch) = self.owner_ch {
+            if let Ok(Some(peer)) = ipc::close_unchecked(ch) {
+                let wake_list = crate::kernel::object_service::object_service()
+                    .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
+                waker::wake(&wake_list, WakeReason::Closed);
+            }
+        }
 
-        // Reset bus if claimed
+        // Clear owner state
+        self.owner_ch = None;
+        self.owner_pid = None;
+
         if self.state == BusState::Claimed {
+            // Owner left while bus was claimed — reset hardware
             self.transition_to(BusState::Resetting, StateChangeReason::DriverExited);
             self.perform_hardware_reset();
             self.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
         }
-
-        // Notify supervisor (devd) via owner_channel that bus is Safe
-        // This wakes devd so it can restart the driver
-        self.notify_owner_safe();
     }
 
     /// Handle atomic handoff to new owner
@@ -559,11 +568,12 @@ impl BusController {
         // Atomic transfer - NO state change, NO reset
         kinfo!("bus", "handoff"; name = self.port_name_str(), new_pid = new_pid as u64);
 
-        self.owner_channel = Some(new_channel);
+        self.owner_ch = Some(new_channel);
         self.owner_pid = Some(new_pid);
 
-        // Send snapshot to new owner
+        // Send snapshot and device list to new owner
         self.send_state_snapshot(new_channel)?;
+        self.send_device_list(new_channel)?;
 
         Ok(())
     }
@@ -575,7 +585,7 @@ impl BusController {
             bus_type: self.bus_type as u8,
             bus_index: self.bus_index,
             state: self.state as u8,
-            device_count: self.device_count as u8,
+            device_count: self.enum_count as u8,
             capabilities: self.query_capabilities(),
             _reserved: [0; 2],
             since_boot_ms: uptime_ms(),
@@ -601,24 +611,48 @@ impl BusController {
         }
     }
 
-    /// Notify owner (devd) of state change
+    /// Notify supervisor (devd) of state change via supervision protocol
     ///
-    /// Sends a state snapshot to the owner channel if connected.
-    /// Returns Ok(()) if no owner or send succeeded, Err on send failure.
-    fn notify_owner(&self) -> Result<(), BusError> {
-        if let Some(channel) = self.owner_channel {
-            self.send_state_snapshot(channel)
-        } else {
-            Ok(())
-        }
-    }
+    /// Sends a StateChanged message on the supervision channel.
+    fn notify_supervisor(&self, old_state: BusState, new_state: BusState, reason: StateChangeReason) -> Result<(), BusError> {
+        let Some(channel) = self.supervisor_ch else {
+            return Ok(());
+        };
 
-    /// Notify owner, logging error if it fails
-    ///
-    /// Use this when notification failure shouldn't affect control flow.
-    fn notify_owner_safe(&self) {
-        if let Err(_) = self.notify_owner() {
-            kerror!("bus", "notify_failed"; name = self.port_name_str());
+        // Build supervision::STATE_CHANGED message
+        let reason_code = match reason {
+            StateChangeReason::Connected => abi::supervision::REASON_OWNER_CONNECTED,
+            StateChangeReason::DriverExited | StateChangeReason::OwnerCrashed | StateChangeReason::Disconnected => {
+                abi::supervision::REASON_OWNER_EXITED
+            }
+            StateChangeReason::ResetComplete | StateChangeReason::ResetRequested => {
+                abi::supervision::REASON_RESET_COMPLETE
+            }
+            StateChangeReason::Handoff | StateChangeReason::DriverClaimed => {
+                abi::supervision::REASON_OWNER_CONNECTED
+            }
+        };
+
+        let payload = [
+            abi::supervision::STATE_CHANGED,
+            old_state as u8,
+            new_state as u8,
+            reason_code,
+        ];
+
+        let mut msg = Message::new();
+        msg.header.msg_type = MessageType::Data;
+        msg.header.payload_len = payload.len() as u32;
+        msg.payload[..payload.len()].copy_from_slice(&payload);
+
+        match ipc::send_unchecked(channel, msg) {
+            Ok(peer) => {
+                let wake_list = crate::kernel::object_service::object_service()
+                    .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
+                waker::wake(&wake_list, WakeReason::Readable);
+                Ok(())
+            }
+            Err(_) => Err(BusError::SendFailed),
         }
     }
 
@@ -705,7 +739,77 @@ impl BusController {
         hw_usb::power_down(self.bus_index, self.base_addr);
     }
 
-    /// Handle a control message from devd
+    /// Add an enumerated device to this bus
+    /// Returns true if added, false if full
+    pub fn add_enum_device(&mut self, dev: abi::BusDevice) -> bool {
+        if self.enum_count >= MAX_DEVICES_PER_BUS {
+            return false;
+        }
+        self.enum_devices[self.enum_count] = dev;
+        self.enum_count += 1;
+        true
+    }
+
+    /// Send device list to a channel (after StateSnapshot)
+    /// Chunks devices into IPC-sized messages (max 17 per chunk at 32 bytes each)
+    fn send_device_list(&self, channel: ChannelId) -> Result<(), BusError> {
+        if self.enum_count == 0 {
+            return Ok(());
+        }
+
+        const MAX_PER_CHUNK: usize = 17; // (576 - 8 header) / 32 = 17
+        let total = self.enum_count;
+        let mut offset = 0;
+
+        while offset < total {
+            let count = (total - offset).min(MAX_PER_CHUNK);
+
+            // Build DeviceList message
+            let mut msg = Message::new();
+            msg.header.msg_type = MessageType::Data;
+
+            // Header: [msg_type, total, offset, count, reserved(4)]
+            msg.payload[0] = super::protocol::BusControlMsgType::DeviceList as u8;
+            msg.payload[1] = total as u8;
+            msg.payload[2] = offset as u8;
+            msg.payload[3] = count as u8;
+            // payload[4..8] = reserved (already zeroed)
+
+            // Copy BusDevice entries
+            let dev_start = 8;
+            for i in 0..count {
+                let dev = &self.enum_devices[offset + i];
+                let dev_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        dev as *const abi::BusDevice as *const u8,
+                        core::mem::size_of::<abi::BusDevice>(),
+                    )
+                };
+                let dst = dev_start + i * 32;
+                msg.payload[dst..dst + 32].copy_from_slice(dev_bytes);
+            }
+
+            msg.header.payload_len = (dev_start + count * 32) as u32;
+
+            match ipc::send_unchecked(channel, msg) {
+                Ok(peer) => {
+                    let wake_list = crate::kernel::object_service::object_service()
+                        .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
+                    waker::wake(&wake_list, WakeReason::Readable);
+                }
+                Err(_) => return Err(BusError::SendFailed),
+            }
+
+            offset += count;
+        }
+
+        Ok(())
+    }
+
+    /// Handle a control message on the owner channel
+    ///
+    /// Owner sends hardware-access messages (bus mastering, reset).
+    /// SetDriver is removed — owner is identified by who connects.
     pub fn handle_message(&mut self, msg: &Message) -> Result<(), BusError> {
         if msg.header.payload_len == 0 {
             return Err(BusError::InvalidMessage);
@@ -739,9 +843,7 @@ impl BusController {
             }
             x if x == BusControlMsgType::RequestReset as u8 => {
                 // Reset can be requested from Claimed OR Safe state
-                // Always perform full hardware reset - devd knows best
                 if self.state == BusState::Resetting {
-                    // Already resetting - don't nest
                     return Err(BusError::Busy);
                 }
 
@@ -753,33 +855,8 @@ impl BusController {
                 // Perform actual hardware reset
                 self.perform_hardware_reset();
 
-                // Transition to Safe (driver can now claim)
+                // Transition to Safe
                 self.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
-
-                // Clear owner info - they need to reconnect
-                self.owner_channel = None;
-                self.owner_pid = None;
-
-                Ok(())
-            }
-            x if x == BusControlMsgType::SetDriver as u8 => {
-                // devd tells us which PID is the actual driver
-                // When this PID exits, we auto-reset and notify devd
-                if msg.header.payload_len < 5 {
-                    return Err(BusError::InvalidMessage);
-                }
-                let driver_pid = u32::from_le_bytes([
-                    msg.payload[1], msg.payload[2], msg.payload[3], msg.payload[4]
-                ]);
-
-                kinfo!("bus", "driver_set"; name = self.port_name_str(), driver_pid = driver_pid as u64);
-
-                self.driver_pid = Some(driver_pid);
-
-                // Transition to Claimed state now that we have a driver
-                if self.state == BusState::Safe {
-                    self.transition_to(BusState::Claimed, StateChangeReason::DriverClaimed);
-                }
 
                 Ok(())
             }
@@ -790,14 +867,14 @@ impl BusController {
     /// Enable bus mastering for a device
     fn enable_bus_mastering(&mut self, device_id: u16) -> Result<(), BusError> {
         // Find or create device entry
-        let slot = self.devices[..self.device_count]
+        let slot = self.bm_devices[..self.bm_count]
             .iter()
             .position(|d| d.device_id == device_id)
             .unwrap_or_else(|| {
-                if self.device_count < MAX_DEVICES_PER_BUS {
-                    let slot = self.device_count;
-                    self.device_count += 1;
-                    self.devices[slot].device_id = device_id;
+                if self.bm_count < MAX_DEVICES_PER_BUS {
+                    let slot = self.bm_count;
+                    self.bm_count += 1;
+                    self.bm_devices[slot].device_id = device_id;
                     slot
                 } else {
                     0 // Shouldn't happen, but fallback
@@ -817,7 +894,7 @@ impl BusController {
         }
 
         // Use transition method
-        let _ = self.devices[slot].enable();
+        let _ = self.bm_devices[slot].enable();
         self.bus_master_enabled = true;
 
         Ok(())
@@ -825,7 +902,7 @@ impl BusController {
 
     /// Disable bus mastering for a device
     fn disable_bus_mastering(&mut self, device_id: u16) -> Result<(), BusError> {
-        if let Some(slot) = self.devices[..self.device_count]
+        if let Some(slot) = self.bm_devices[..self.bm_count]
             .iter()
             .position(|d| d.device_id == device_id)
         {
@@ -843,11 +920,11 @@ impl BusController {
             }
 
             // Use transition method
-            self.devices[slot].disable();
+            self.bm_devices[slot].disable();
         }
 
         // Update global flag
-        self.bus_master_enabled = self.devices[..self.device_count]
+        self.bus_master_enabled = self.bm_devices[..self.bm_count]
             .iter()
             .any(|d| d.is_enabled());
 

@@ -2806,7 +2806,7 @@ impl WifiDriver {
 }
 
 impl Driver for WifiDriver {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         uinfo!("wifid", "init_start");
 
         // Show DMA translation mode
@@ -3522,8 +3522,8 @@ fn main() {
 struct WifiDriverWrapper(&'static mut WifiDriver);
 
 impl Driver for WifiDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {

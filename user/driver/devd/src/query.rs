@@ -12,7 +12,7 @@ use userlib::query::{
 };
 
 use crate::devices::{DeviceStore, DeviceRegistry, MAX_DEVICES};
-use crate::service::{ServiceManager, ServiceRegistry, Service};
+use crate::service::{ServiceManager, ServiceRegistry};
 
 // =============================================================================
 // Constants
@@ -355,12 +355,10 @@ impl QueryHandler {
             Some(dev) => {
                 let entry = dev.to_entry();
 
-                // Get driver port name
+                // Get driver port name (the port that triggered this service's spawn)
                 let driver_port: &[u8] = services
                     .get(dev.owner_service_idx as usize)
-                    .and_then(|s: &Service| s.def())
-                    .and_then(|d| d.registers.first())
-                    .map(|pd| pd.name)
+                    .map(|s| s.trigger_port())
                     .unwrap_or(b"");
 
                 let resp = DeviceInfoResponse::new(req.header.seq_id, entry);

@@ -27,7 +27,7 @@
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, bus_msg,
-    PortInfo, PortClass, PortState, port_subclass,
+    PortInfo, PortClass, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::side_msg;
@@ -193,7 +193,7 @@ impl VfsDriver {
 // =============================================================================
 
 impl Driver for VfsDriver {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         // Create DataPort for side-channel registration
         // Pool holds the mount table (288 bytes needed, use 4096 for alignment)
         let config = BlockPortConfig {
@@ -223,7 +223,6 @@ impl Driver for VfsDriver {
                     let mut info = PortInfo::new(b"vfs:", PortClass::Filesystem);
                     info.port_subclass = port_subclass::FS_RAMFS;
                     let _ = ctx.register_port_with_info(&info, shmem_id);
-                    let _ = ctx.set_port_state(b"vfs:", PortState::Ready);
 
                     uinfo!("vfsd", "mount_table_ready"; shmem_id = shmem_id);
                 }
@@ -287,8 +286,8 @@ fn main() {
 struct VfsDriverWrapper(&'static mut VfsDriver);
 
 impl Driver for VfsDriverWrapper {
-    fn init(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init(ctx)
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.0.reset(ctx)
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
