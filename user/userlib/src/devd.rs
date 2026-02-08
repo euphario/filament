@@ -343,6 +343,8 @@ impl DevdClient {
     const MAX_RETRIES: usize = 50;
     /// Delay between retries in milliseconds
     const RETRY_DELAY_MS: u32 = 10;
+    /// Deadline for introspection queries (2 seconds in ns)
+    const RECV_DEADLINE_NS: u64 = 2_000_000_000;
 
     /// Create a new disconnected client
     pub const fn new() -> Self {
@@ -1069,53 +1071,54 @@ impl DevdClient {
         let req = ListPorts::new(seq_id);
         channel.send(&req.to_bytes())?;
 
-        // Buffer for response: header + up to 32 entries
-        let mut resp_buf = [0u8; 12 + 32 * PortEntry::SIZE];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(len) if len >= PortsListResponse::HEADER_SIZE => {
-                    let header = QueryHeader::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
+        let empty_entry = PortEntry {
+            name: [0u8; 20], port_type: 0, flags: 0, owner_idx: 0,
+            parent_idx: 0xFF, shmem_id: 0, owner_pid: 0,
+        };
+        let mut entries = [empty_entry; 32];
+        let mut received = 0usize;
+        let mut total = 0usize;
 
-                    if header.msg_type == msg::PORTS_LIST {
-                        let resp = PortsListResponse::from_bytes(&resp_buf)
-                            .ok_or(SysError::IoError)?;
+        // Receive chunks until we have all entries (or timeout)
+        loop {
+            let mut resp_buf = [0u8; PortsListResponse::HEADER_SIZE + PortsListResponse::MAX_PER_MSG * PortEntry::SIZE];
+            let len = match channel.recv_deadline(&mut resp_buf, Self::RECV_DEADLINE_NS) {
+                Ok(n) if n >= PortsListResponse::HEADER_SIZE => n,
+                Ok(_) => return Err(SysError::IoError),
+                Err(e) => return Err(e),
+            };
 
-                        let count = (resp.count as usize).min(32);
-                        let mut entries = [PortEntry {
-                            name: [0u8; 20],
-                            port_type: 0,
-                            flags: 0,
-                            owner_idx: 0,
-                            parent_idx: 0xFF,
-                            shmem_id: 0,
-                            owner_pid: 0,
-                        }; 32];
+            let header = QueryHeader::from_bytes(&resp_buf).ok_or(SysError::IoError)?;
+            if header.msg_type == msg::ERROR {
+                return Err(SysError::NotFound);
+            }
+            if header.msg_type != msg::PORTS_LIST {
+                return Err(SysError::IoError);
+            }
 
-                        let data_start = PortsListResponse::HEADER_SIZE;
-                        for i in 0..count {
-                            let offset = data_start + i * PortEntry::SIZE;
-                            if offset + PortEntry::SIZE <= len {
-                                if let Some(entry) = PortEntry::from_bytes(&resp_buf[offset..]) {
-                                    entries[i] = entry;
-                                }
-                            }
-                        }
+            let resp = PortsListResponse::from_bytes(&resp_buf).ok_or(SysError::IoError)?;
+            let chunk = (resp.count as usize).min(32 - received);
+            if total == 0 {
+                total = (resp.total as usize).min(32);
+            }
 
-                        return Ok((entries, count));
-                    } else if header.msg_type == msg::ERROR {
-                        return Err(SysError::NotFound);
+            let data_start = PortsListResponse::HEADER_SIZE;
+            for i in 0..chunk {
+                let offset = data_start + i * PortEntry::SIZE;
+                if offset + PortEntry::SIZE <= len {
+                    if let Some(entry) = PortEntry::from_bytes(&resp_buf[offset..]) {
+                        entries[received + i] = entry;
                     }
                 }
-                Ok(_) => return Err(SysError::IoError),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
+            }
+            received += chunk;
+
+            if received >= total {
+                break;
             }
         }
-        Err(SysError::Timeout)
+
+        Ok((entries, received))
     }
 
     /// List all services
@@ -1131,55 +1134,55 @@ impl DevdClient {
         let req = ListServices::new(seq_id);
         channel.send(&req.to_bytes())?;
 
-        // Buffer for response: header + up to 16 entries
-        let mut resp_buf = [0u8; 12 + 16 * ServiceEntry::SIZE];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(len) if len >= ServicesListResponse::HEADER_SIZE => {
-                    let header = QueryHeader::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
+        let empty_entry = ServiceEntry {
+            name: [0u8; 16], pid: 0, state: 0, index: 0,
+            parent_idx: 0xFF, child_count: 0, total_restarts: 0,
+            last_change: 0, bus_path: [0u8; 32],
+        };
+        let mut entries = [empty_entry; 16];
+        let mut received = 0usize;
+        let mut total = 0usize;
 
-                    if header.msg_type == msg::SERVICES_LIST {
-                        let resp = ServicesListResponse::from_bytes(&resp_buf)
-                            .ok_or(SysError::IoError)?;
+        // Receive chunks until we have all entries (or timeout)
+        loop {
+            let mut resp_buf = [0u8; ServicesListResponse::HEADER_SIZE + ServicesListResponse::MAX_PER_MSG * ServiceEntry::SIZE];
+            let len = match channel.recv_deadline(&mut resp_buf, Self::RECV_DEADLINE_NS) {
+                Ok(n) if n >= ServicesListResponse::HEADER_SIZE => n,
+                Ok(_) => return Err(SysError::IoError),
+                Err(e) => return Err(e),
+            };
 
-                        let count = (resp.count as usize).min(16);
-                        let mut entries = [ServiceEntry {
-                            name: [0u8; 16],
-                            pid: 0,
-                            state: 0,
-                            index: 0,
-                            parent_idx: 0xFF,
-                            child_count: 0,
-                            total_restarts: 0,
-                            last_change: 0,
-                            bus_path: [0u8; 32],
-                        }; 16];
+            let header = QueryHeader::from_bytes(&resp_buf).ok_or(SysError::IoError)?;
+            if header.msg_type == msg::ERROR {
+                return Err(SysError::NotFound);
+            }
+            if header.msg_type != msg::SERVICES_LIST {
+                return Err(SysError::IoError);
+            }
 
-                        let data_start = ServicesListResponse::HEADER_SIZE;
-                        for i in 0..count {
-                            let offset = data_start + i * ServiceEntry::SIZE;
-                            if offset + ServiceEntry::SIZE <= len {
-                                if let Some(entry) = ServiceEntry::from_bytes(&resp_buf[offset..]) {
-                                    entries[i] = entry;
-                                }
-                            }
-                        }
+            let resp = ServicesListResponse::from_bytes(&resp_buf).ok_or(SysError::IoError)?;
+            let chunk = (resp.count as usize).min(16 - received);
+            if total == 0 {
+                total = (resp.total as usize).min(16);
+            }
 
-                        return Ok((entries, count));
-                    } else if header.msg_type == msg::ERROR {
-                        return Err(SysError::NotFound);
+            let data_start = ServicesListResponse::HEADER_SIZE;
+            for i in 0..chunk {
+                let offset = data_start + i * ServiceEntry::SIZE;
+                if offset + ServiceEntry::SIZE <= len {
+                    if let Some(entry) = ServiceEntry::from_bytes(&resp_buf[offset..]) {
+                        entries[received + i] = entry;
                     }
                 }
-                Ok(_) => return Err(SysError::IoError),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
+            }
+            received += chunk;
+
+            if received >= total {
+                break;
             }
         }
-        Err(SysError::Timeout)
+
+        Ok((entries, received))
     }
 
     /// Query detailed info from a service by name

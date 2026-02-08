@@ -2015,24 +2015,31 @@ impl ServiceEntry {
 }
 
 /// Ports list response header (devd → client)
+///
+/// When more than `MAX_PER_MSG` entries exist, devd sends multiple messages
+/// with the same `seq_id`.  Each carries `count` entries; `total` is the grand
+/// total across all chunks.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PortsListResponse {
     pub header: QueryHeader,
-    /// Number of port entries following
+    /// Number of port entries in this message
     pub count: u16,
-    pub _pad: u16,
+    /// Total number of port entries across all chunks
+    pub total: u16,
     // Followed by: count * PortEntry
 }
 
 impl PortsListResponse {
     pub const HEADER_SIZE: usize = QueryHeader::SIZE + 4;
+    /// Max entries that fit in one IPC message: (576 - 12) / 32 = 17
+    pub const MAX_PER_MSG: usize = 17;
 
-    pub fn new(seq_id: u32, count: u16) -> Self {
+    pub fn new(seq_id: u32, count: u16, total: u16) -> Self {
         Self {
             header: QueryHeader::new(msg::PORTS_LIST, seq_id),
             count,
-            _pad: 0,
+            total,
         }
     }
 
@@ -2040,7 +2047,7 @@ impl PortsListResponse {
         let mut buf = [0u8; Self::HEADER_SIZE];
         buf[0..8].copy_from_slice(&self.header.to_bytes());
         buf[8..10].copy_from_slice(&self.count.to_le_bytes());
-        buf[10..12].copy_from_slice(&[0, 0]);
+        buf[10..12].copy_from_slice(&self.total.to_le_bytes());
         buf
     }
 
@@ -2051,30 +2058,38 @@ impl PortsListResponse {
         Some(Self {
             header: QueryHeader::from_bytes(buf)?,
             count: u16::from_le_bytes([buf[8], buf[9]]),
-            _pad: 0,
+            total: u16::from_le_bytes([buf[10], buf[11]]),
         })
     }
 }
 
 /// Services list response header (devd → client)
+///
+/// When more than `MAX_PER_MSG` entries exist, devd sends multiple messages
+/// with the same `seq_id`.  Each message carries `count` entries in this chunk
+/// and `total` = total entries across all chunks.  The client accumulates until
+/// it has received `total` entries.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ServicesListResponse {
     pub header: QueryHeader,
-    /// Number of service entries following
+    /// Number of service entries in this message
     pub count: u16,
-    pub _pad: u16,
+    /// Total number of service entries across all chunks
+    pub total: u16,
     // Followed by: count * ServiceEntry
 }
 
 impl ServicesListResponse {
     pub const HEADER_SIZE: usize = QueryHeader::SIZE + 4;
+    /// Max entries that fit in one IPC message: (576 - 12) / 64 = 8
+    pub const MAX_PER_MSG: usize = 8;
 
-    pub fn new(seq_id: u32, count: u16) -> Self {
+    pub fn new(seq_id: u32, count: u16, total: u16) -> Self {
         Self {
             header: QueryHeader::new(msg::SERVICES_LIST, seq_id),
             count,
-            _pad: 0,
+            total,
         }
     }
 
@@ -2082,7 +2097,7 @@ impl ServicesListResponse {
         let mut buf = [0u8; Self::HEADER_SIZE];
         buf[0..8].copy_from_slice(&self.header.to_bytes());
         buf[8..10].copy_from_slice(&self.count.to_le_bytes());
-        buf[10..12].copy_from_slice(&[0, 0]);
+        buf[10..12].copy_from_slice(&self.total.to_le_bytes());
         buf
     }
 
@@ -2093,7 +2108,7 @@ impl ServicesListResponse {
         Some(Self {
             header: QueryHeader::from_bytes(buf)?,
             count: u16::from_le_bytes([buf[8], buf[9]]),
-            _pad: 0,
+            total: u16::from_le_bytes([buf[10], buf[11]]),
         })
     }
 }

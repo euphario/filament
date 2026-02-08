@@ -1433,16 +1433,6 @@ impl Devd {
                     }
                 }
 
-                // Unknown PID — treat as admin client (shell)
-                if service_idx.is_none() {
-                    uinfo!("devd", "admin_accept"; pid = client_pid);
-                    if let Some(events) = &mut self.events {
-                        let _ = events.watch(channel.handle());
-                    }
-                    let _ = self.admin_clients.add(channel);
-                    return;
-                }
-
                 // Save handle before moving channel into query handler
                 let ch_handle = channel.handle();
 
@@ -1615,7 +1605,8 @@ impl Devd {
             Some(msg::PARTITION_READY) => {
                 self.handle_partition_ready(slot, buf);
             }
-            _ => {
+            Some(_) => {
+                // Unknown binary message type — delegate to query_handler
                 let mut response_buf = [0u8; MSG_BUFFER_SIZE];
                 let response_len = self.query_handler.handle_message(
                     slot,
@@ -1628,6 +1619,17 @@ impl Devd {
                 if let Some(resp_len) = response_len {
                     if let Some(client) = self.query_handler.get_mut(slot) {
                         let _ = client.channel.send(&response_buf[..resp_len]);
+                    }
+                }
+            }
+            None => {
+                // Not a valid binary protocol message — try as text admin command
+                // (from shell `devd` builtin which sends "START x\n", "LIST\n", etc.)
+                let mut resp_buf = [0u8; MSG_BUFFER_SIZE];
+                let resp_len = self.handle_admin_command(buf, &mut resp_buf);
+                if resp_len > 0 {
+                    if let Some(client) = self.query_handler.get_mut(slot) {
+                        let _ = client.channel.send(&resp_buf[..resp_len]);
                     }
                 }
             }
@@ -2059,22 +2061,32 @@ impl Devd {
             count += 1;
         });
 
-        // Build response
-        let resp_header = PortsListResponse::new(seq_id, count as u16);
+        // Send response in chunks that fit within IPC payload limit (576 bytes).
+        // Each chunk: 12-byte header + up to 17 × 32-byte entries = 556 bytes.
+        let total = count as u16;
+        let mut sent = 0usize;
+        while sent < count {
+            let chunk = (count - sent).min(PortsListResponse::MAX_PER_MSG);
+            let resp_header = PortsListResponse::new(seq_id, chunk as u16, total);
 
-        // Send response: header + entries
-        let mut resp_buf = [0u8; 12 + 32 * 32]; // header + 32 entries max
-        let header_bytes = resp_header.header_to_bytes();
-        resp_buf[..PortsListResponse::HEADER_SIZE].copy_from_slice(&header_bytes);
+            let mut resp_buf = [0u8; PortsListResponse::HEADER_SIZE + PortsListResponse::MAX_PER_MSG * PortEntry::SIZE];
+            resp_buf[..PortsListResponse::HEADER_SIZE].copy_from_slice(&resp_header.header_to_bytes());
 
-        let mut offset = PortsListResponse::HEADER_SIZE;
-        for i in 0..count {
-            resp_buf[offset..offset + PortEntry::SIZE].copy_from_slice(&entries[i]);
-            offset += PortEntry::SIZE;
-        }
+            let mut offset = PortsListResponse::HEADER_SIZE;
+            for i in 0..chunk {
+                resp_buf[offset..offset + PortEntry::SIZE].copy_from_slice(&entries[sent + i]);
+                offset += PortEntry::SIZE;
+            }
 
-        if let Some(client) = self.query_handler.get_mut(slot) {
-            let _ = client.channel.send(&resp_buf[..offset]);
+            if let Some(client) = self.query_handler.get_mut(slot) {
+                if client.channel.send(&resp_buf[..offset]).is_err() {
+                    uerror!("devd", "list_ports_send_fail"; slot = slot as u32, chunk = chunk as u32);
+                    break;
+                }
+            } else {
+                break;
+            }
+            sent += chunk;
         }
     }
 
@@ -2092,18 +2104,10 @@ impl Devd {
 
         let seq_id = header.seq_id;
 
-        // First pass: collect service data (to avoid borrow issues with spawn_contexts lookup)
-        struct ServiceData {
-            name: [u8; 16],
-            pid: u32,
-            state: u8,
-            index: u8,
-            parent_idx: u8,
-            child_count: u8,
-            total_restarts: u32,
-            last_change: u32,
-        }
-        let mut service_data: [Option<ServiceData>; 16] = [const { None }; 16];
+        // Collect service data into entries.
+        // trigger_port is on the Service struct so bus_path is available even
+        // for non-running services (pid=0), unlike the old spawn_context lookup.
+        let mut entries = [[0u8; ServiceEntry::SIZE]; 16];
         let mut count = 0usize;
 
         self.services.for_each(|idx, service| {
@@ -2125,7 +2129,13 @@ impl Devd {
                 ServiceState::Failed { .. } => service_state::FAILED,
             };
 
-            service_data[count] = Some(ServiceData {
+            // Use trigger_port directly — persists across crashes/restarts
+            let mut bus_path = [0u8; 32];
+            let tp = service.trigger_port();
+            let tp_len = tp.len().min(32);
+            bus_path[..tp_len].copy_from_slice(&tp[..tp_len]);
+
+            let entry = ServiceEntry {
                 name,
                 pid: service.pid,
                 state,
@@ -2134,54 +2144,38 @@ impl Devd {
                 child_count: 0,
                 total_restarts: service.total_restarts,
                 last_change: service.last_change as u32,
-            });
+                bus_path,
+            };
+            entries[count] = entry.to_bytes();
             count += 1;
         });
 
-        // Second pass: build entries with spawn context lookup
-        let mut entries = [[0u8; ServiceEntry::SIZE]; 16];
-        for i in 0..count {
-            if let Some(data) = &service_data[i] {
-                // Look up spawn context for this service's PID
-                let mut bus_path = [0u8; 32];
-                if data.pid != 0 {
-                    if let Some((_port_type, port_name, _metadata)) = self.get_spawn_context(data.pid) {
-                        let len = port_name.len().min(32);
-                        bus_path[..len].copy_from_slice(&port_name[..len]);
-                    }
-                }
+        // Send response in chunks that fit within IPC payload limit (576 bytes).
+        // Each chunk: 12-byte header + up to 8 × 64-byte entries = 524 bytes.
+        let total = count as u16;
+        let mut sent = 0usize;
+        while sent < count {
+            let chunk = (count - sent).min(ServicesListResponse::MAX_PER_MSG);
+            let resp_header = ServicesListResponse::new(seq_id, chunk as u16, total);
 
-                let entry = ServiceEntry {
-                    name: data.name,
-                    pid: data.pid,
-                    state: data.state,
-                    index: data.index,
-                    parent_idx: data.parent_idx,
-                    child_count: data.child_count,
-                    total_restarts: data.total_restarts,
-                    last_change: data.last_change,
-                    bus_path,
-                };
-                entries[i] = entry.to_bytes();
+            let mut resp_buf = [0u8; ServicesListResponse::HEADER_SIZE + ServicesListResponse::MAX_PER_MSG * ServiceEntry::SIZE];
+            resp_buf[..ServicesListResponse::HEADER_SIZE].copy_from_slice(&resp_header.header_to_bytes());
+
+            let mut offset = ServicesListResponse::HEADER_SIZE;
+            for i in 0..chunk {
+                resp_buf[offset..offset + ServiceEntry::SIZE].copy_from_slice(&entries[sent + i]);
+                offset += ServiceEntry::SIZE;
             }
-        }
 
-        // Build response
-        let resp_header = ServicesListResponse::new(seq_id, count as u16);
-
-        // Send response: header + entries
-        let mut resp_buf = [0u8; 12 + 16 * ServiceEntry::SIZE]; // header + 16 entries max
-        let header_bytes = resp_header.header_to_bytes();
-        resp_buf[..ServicesListResponse::HEADER_SIZE].copy_from_slice(&header_bytes);
-
-        let mut offset = ServicesListResponse::HEADER_SIZE;
-        for i in 0..count {
-            resp_buf[offset..offset + ServiceEntry::SIZE].copy_from_slice(&entries[i]);
-            offset += ServiceEntry::SIZE;
-        }
-
-        if let Some(client) = self.query_handler.get_mut(slot) {
-            let _ = client.channel.send(&resp_buf[..offset]);
+            if let Some(client) = self.query_handler.get_mut(slot) {
+                if client.channel.send(&resp_buf[..offset]).is_err() {
+                    uerror!("devd", "list_svc_send_fail"; slot = slot as u32, chunk = chunk as u32);
+                    break;
+                }
+            } else {
+                break;
+            }
+            sent += chunk;
         }
     }
 

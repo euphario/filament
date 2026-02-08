@@ -95,6 +95,48 @@ impl Channel {
             }
         }
     }
+
+    /// Receive with a deadline. Returns Err(Timeout) if no data arrives
+    /// within `timeout_ns` nanoseconds. Uses Mux+Timer internally.
+    pub fn recv_deadline(&mut self, buf: &mut [u8], timeout_ns: u64) -> SysResult<usize> {
+        if self.state == ChannelState::Closed {
+            return Err(SysError::ConnectionReset);
+        }
+
+        // Try non-blocking first
+        match read(self.handle, buf) {
+            Ok(n) => return Ok(n),
+            Err(SysError::ConnectionReset) => {
+                self.state = ChannelState::HalfClosed;
+                return Err(SysError::ConnectionReset);
+            }
+            Err(SysError::WouldBlock) => {} // Fall through to timed wait
+            Err(e) => return Err(e),
+        }
+
+        // Set up Mux+Timer for deadline
+        let mux = Mux::new()?;
+        let mut timer = Timer::new()?;
+        let now = crate::syscall::gettime();
+        timer.set(now + timeout_ns)?;
+        mux.add(self.handle, MuxFilter::Readable)?;
+        mux.add(timer.handle(), MuxFilter::Readable)?;
+
+        let event = mux.wait()?;
+        if event.handle == timer.handle() {
+            return Err(SysError::Timeout);
+        }
+
+        // Channel ready — read
+        match read(self.handle, buf) {
+            Ok(n) => Ok(n),
+            Err(SysError::ConnectionReset) => {
+                self.state = ChannelState::HalfClosed;
+                Err(SysError::ConnectionReset)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl Drop for Channel {

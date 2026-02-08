@@ -152,18 +152,19 @@ fn cmd_tree() -> CommandResult {
         }
     }
 
-    // Then: top-level services not spawned from a kernel bus port
+    // Then: top-level services not already shown as children of a port
     for i in 0..svc_count {
         let svc = &services[i];
         if svc.parent_idx != 0xFF { continue; }
         if name_str(&svc.name) == "devd" { continue; }
 
-        // Skip if this service has a bus_path that matches a kernel port
+        // Skip if this service's bus_path matches ANY registered port —
+        // it will be rendered as a child of that port's owner in the tree.
         let bp = svc_bus_path_str(svc);
         if !bp.is_empty() {
             let mut matched = false;
             for j in 0..port_count {
-                if ports[j].owner_idx == 0xFF && port_name_str(&ports[j].name) == bp {
+                if port_name_str(&ports[j].name) == bp {
                     matched = true;
                     break;
                 }
