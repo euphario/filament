@@ -494,6 +494,13 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
   - `libf::prelude` — re-exports alloc types + common libf/userlib symbols
   - Shell integrated: replaced duplicated functions in main.rs, output.rs, handle.rs, ls.rs, logs.rs
   - Shell ELF size unchanged (95.7K)
+- **libf::io module** (`user/libf/src/io.rs`)
+  - `Read`, `Write`, `BufRead` traits mirroring `std::io` signatures exactly
+  - `Error`/`ErrorKind` two-tier error model, `impl From<SysError>` mapping
+  - `impl Read + Write for Channel` — bridge from IPC to byte-stream traits
+  - `Cursor<T>` for in-memory Read/Write/BufRead on `&[u8]` and `Vec<u8>`
+  - `copy()` helper — 512-byte stack buffer loop
+  - Foundational traits for future `libf::fs`, `libf::net` modules
 
 ### 2026-01-31
 - **SMP (2-core, QEMU virt)**
