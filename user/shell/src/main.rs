@@ -41,6 +41,12 @@ use userlib::ipc::Port;
 use userlib::syscall;
 use userlib::vfs_client::VfsClient;
 
+// Re-export libf utilities so builtins can use crate::trim, crate::cmd_eq, etc.
+pub use libf::str::trim;
+pub use libf::str::eq_ignore_ascii_case as cmd_eq;
+pub use libf::str::starts_with_ignore_case as cmd_starts_with;
+pub use libf::parse::parse_u32 as parse_decimal;
+
 /// Maximum background jobs to track
 const MAX_BG_JOBS: usize = 16;
 
@@ -206,54 +212,10 @@ fn drain_ipc_commands() {
 
 /// Print a decimal number
 fn print_dec(val: usize) {
-    if val == 0 {
-        console::write(b"0");
-        return;
-    }
-    let mut buf = [0u8; 10];
-    let mut n = val;
-    let mut i = 10;
-    while n > 0 && i > 0 {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    console::write(&buf[i..]);
+    let s = libf::fmt::StackStr::from_u64(val as u64);
+    console::write(s.as_bytes());
 }
 
-/// Trim whitespace from a byte slice
-pub fn trim(input: &[u8]) -> &[u8] {
-    let start = input.iter().position(|&c| c != b' ' && c != b'\t' && c != b'\r' && c != b'\n');
-    let end = input.iter().rposition(|&c| c != b' ' && c != b'\t' && c != b'\r' && c != b'\n');
-
-    match (start, end) {
-        (Some(s), Some(e)) => &input[s..=e],
-        _ => &[],
-    }
-}
-
-/// Check if command matches (case-insensitive for ASCII)
-fn cmd_eq(cmd: &[u8], expected: &[u8]) -> bool {
-    if cmd.len() != expected.len() {
-        return false;
-    }
-    for (a, b) in cmd.iter().zip(expected.iter()) {
-        let a_lower = if *a >= b'A' && *a <= b'Z' { a + 32 } else { *a };
-        let b_lower = if *b >= b'A' && *b <= b'Z' { b + 32 } else { *b };
-        if a_lower != b_lower {
-            return false;
-        }
-    }
-    true
-}
-
-/// Check if command starts with prefix
-fn cmd_starts_with(cmd: &[u8], prefix: &[u8]) -> bool {
-    if cmd.len() < prefix.len() {
-        return false;
-    }
-    cmd_eq(&cmd[..prefix.len()], prefix)
-}
 
 /// Execute a command
 fn execute_command(cmd: &[u8]) {
@@ -677,24 +639,6 @@ fn cmd_run_program_bg(path: &str) {
     } else {
         println!("exec failed: {}", result);
     }
-}
-
-/// Parse decimal number from byte slice
-pub fn parse_decimal(input: &[u8]) -> Option<u32> {
-    let trimmed = trim(input);
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut value: u32 = 0;
-    for &ch in trimmed {
-        if ch >= b'0' && ch <= b'9' {
-            value = value.saturating_mul(10).saturating_add((ch - b'0') as u32);
-        } else {
-            return None;
-        }
-    }
-    Some(value)
 }
 
 

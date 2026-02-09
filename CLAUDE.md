@@ -10,6 +10,7 @@ A reliability-focused microkernel for the Banana Pi BPI-R4 (MT7988A SoC).
 | [docs/README.md](docs/README.md) | Documentation index |
 | [docs/architecture/](docs/architecture/) | System architecture |
 | [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) | Zero-copy ring-based driver I/O |
+| [docs/architecture/LIBF.md](docs/architecture/LIBF.md) | libf standard library — std migration path |
 | [docs/decisions/ADR.md](docs/decisions/ADR.md) | Architecture decisions |
 
 ## The Laws
@@ -132,6 +133,22 @@ fn main() { driver_main(b"mydriver", MyDriver::new()); }
 - **Extend the framework, don't bypass it** - If a driver needs something missing (new data transport, new callback, new BusCtx method), update `bus.rs`/`bus_runtime.rs` — never work around it with ad-hoc IPC
 - **Domain logic only** - A driver struct contains device state and hardware interaction, nothing else
 
+### 8. libf Mirrors std Signatures
+
+libf (`user/libf/`) is the Filament standard library. See [docs/architecture/LIBF.md](docs/architecture/LIBF.md).
+
+**The rule:** When libf provides something Rust's `std` also provides, use the **same function names, argument types, return types, and module layout**. This creates a clean migration path to a real `std` port when ecosystem compatibility is needed.
+
+```
+Today:     core + alloc + libf      (no_std, our code only)
+Tomorrow:  core + alloc + std       (real target, crates.io unlocked)
+```
+
+- **Same signatures** - `libf::io::Read` matches `std::io::Read` method signatures
+- **Same module layout** - `libf::fs`, `libf::io`, `libf::net` mirror std
+- **Don't force std's design** - Where Filament's model is cleaner (object handles vs file descriptors), lean into Filament. Mirror the signatures, not the implementation.
+- **No std dependency** - libf is `no_std`. The port to real `std` happens later, when a concrete crate need arises.
+
 ---
 
 ## Key Principles (Summary)
@@ -145,6 +162,7 @@ See [docs/PRINCIPLES.md](docs/PRINCIPLES.md) for complete design philosophy.
 - **DMA memory non-cacheable** - No cache flushes in driver code
 - **Capability-based security** - Check permissions for privileged ops
 - **Bus framework for all drivers** - `driver_main()` + `Driver` trait, no exceptions
+- **libf mirrors std** - Same signatures and module layout as Rust's std, enabling future std port
 
 ---
 
@@ -238,7 +256,8 @@ bpi-r4-kernel/
 │   ├── arch/aarch64/       # ARM64-specific code
 │   └── platform/mt7988/    # MT7988A SoC code
 ├── user/
-│   ├── userlib/            # Userspace library
+│   ├── userlib/            # Kernel interface (raw syscalls, IPC, bus)
+│   ├── libf/               # Standard library (fmt, str, parse — mirrors std)
 │   ├── shell/              # Shell program
 │   └── driver/
 │       ├── devd/           # Device supervisor (PID 1)
@@ -448,6 +467,14 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
 - Legacy syscalls (6-17, 28-30, 80+) removed from kernel enum, return Invalid
 - IPC cohesion fixes applied: sidechannel doorbell, send_down() deadline enforcement
 
+### libf Standard Library (IN PROGRESS)
+- `user/libf/` — Filament's standard library, mirrors Rust std signatures
+- See [docs/architecture/LIBF.md](docs/architecture/LIBF.md) for design rationale
+- v0.1 ships: `fmt` (StackStr, format_u32/u64/hex), `str` (trim, case-insensitive ops), `parse` (u32/u64/hex)
+- Shell integrated: replaced 7 duplicated utility functions across 5 files
+- Future: `fs`, `io`, `net`, `process`, `time`, `sync` modules — grow as OS needs them
+- **Migration path**: libf implementations become `std::sys::pal::filament` when ecosystem compat is needed
+
 ### MT7996 WiFi Driver
 - Prefetch configuration fixed to match Linux exactly
 - Cache coherency fix applied (kernel DMA pool flush)
@@ -456,6 +483,17 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
 ---
 
 ## Changelog (Recent)
+
+### 2026-02-09
+- **libf standard library** (`user/libf/`)
+  - New crate: Filament's standard library, deliberately mirrors Rust std API signatures
+  - Design doc: `docs/architecture/LIBF.md` — rationale for std-mirroring strategy
+  - `libf::fmt` — StackStr (64-byte stack buffer with Display/Write), format_u32/u64/hex_into
+  - `libf::str` — trim, eq_ignore_ascii_case, starts_with/contains_ignore_case, split_once, split_whitespace
+  - `libf::parse` — parse_u32/u64 (decimal, overflow-checked), parse_hex_u32/u64
+  - `libf::prelude` — re-exports alloc types + common libf/userlib symbols
+  - Shell integrated: replaced duplicated functions in main.rs, output.rs, handle.rs, ls.rs, logs.rs
+  - Shell ELF size unchanged (95.7K)
 
 ### 2026-01-31
 - **SMP (2-core, QEMU virt)**

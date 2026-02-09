@@ -147,48 +147,12 @@ fn test_poll(out: &mut dyn Output) {
 // Helper functions to write numbers
 fn write_u32(out: &mut dyn Output, val: u32) {
     let mut buf = [0u8; 12];
-    let len = format_u32(&mut buf, val);
+    let len = libf::fmt::format_u32_into(&mut buf, val);
     out.write(&buf[..len]);
 }
 
 fn write_u64(out: &mut dyn Output, val: u64) {
     let mut buf = [0u8; 20];
-    let len = format_u64(&mut buf, val);
+    let len = libf::fmt::format_u64_into(&mut buf, val);
     out.write(&buf[..len]);
-}
-
-fn format_u32(buf: &mut [u8], mut val: u32) -> usize {
-    if val == 0 {
-        buf[0] = b'0';
-        return 1;
-    }
-    let mut pos = 0;
-    let mut tmp = [0u8; 12];
-    while val > 0 {
-        tmp[pos] = b'0' + (val % 10) as u8;
-        val /= 10;
-        pos += 1;
-    }
-    for i in 0..pos {
-        buf[i] = tmp[pos - 1 - i];
-    }
-    pos
-}
-
-fn format_u64(buf: &mut [u8], mut val: u64) -> usize {
-    if val == 0 {
-        buf[0] = b'0';
-        return 1;
-    }
-    let mut pos = 0;
-    let mut tmp = [0u8; 20];
-    while val > 0 {
-        tmp[pos] = b'0' + (val % 10) as u8;
-        val /= 10;
-        pos += 1;
-    }
-    for i in 0..pos {
-        buf[i] = tmp[pos - 1 - i];
-    }
-    pos
 }

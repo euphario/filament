@@ -470,26 +470,7 @@ fn uint_width(n: u64) -> usize {
 
 /// Case-insensitive substring check
 fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
-    if needle.len() > haystack.len() {
-        return false;
-    }
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    for i in 0..=(h.len() - n.len()) {
-        let mut matched = true;
-        for j in 0..n.len() {
-            let hc = if h[i + j] >= b'A' && h[i + j] <= b'Z' { h[i + j] + 32 } else { h[i + j] };
-            let nc = if n[j] >= b'A' && n[j] <= b'Z' { n[j] + 32 } else { n[j] };
-            if hc != nc {
-                matched = false;
-                break;
-            }
-        }
-        if matched {
-            return true;
-        }
-    }
-    false
+    libf::str::contains_ignore_ascii_case(haystack.as_bytes(), needle.as_bytes())
 }
 
 /// Maximum size for raw byte output (cat, etc.)

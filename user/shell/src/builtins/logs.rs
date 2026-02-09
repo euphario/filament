@@ -11,29 +11,12 @@ use userlib::devd::DevdClient;
 use crate::output::CommandResult;
 use crate::{print, println};
 
-/// Parse a number from bytes
-fn parse_num(s: &[u8]) -> Option<usize> {
-    let mut n = 0usize;
-    for &b in s {
-        if b >= b'0' && b <= b'9' {
-            n = n * 10 + (b - b'0') as usize;
-        } else {
-            return None;
-        }
-    }
-    Some(n)
-}
+use libf::str::trim;
+use libf::parse::parse_u32;
 
-/// Check if bytes equal a string
+/// Check if bytes equal a string (exact, case-sensitive for this module)
 fn cmd_eq(a: &[u8], b: &[u8]) -> bool {
     a == b
-}
-
-/// Trim whitespace
-fn trim(s: &[u8]) -> &[u8] {
-    let start = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
-    let end = s.iter().rposition(|&b| b != b' ' && b != b'\t').map(|p| p + 1).unwrap_or(start);
-    &s[start..end]
 }
 
 pub fn run(args: &[u8]) -> CommandResult {
@@ -57,7 +40,7 @@ pub fn run(args: &[u8]) -> CommandResult {
     // logs -n <count>
     if args.starts_with(b"-n ") {
         let rest = trim(&args[3..]);
-        if let Some(count) = parse_num(rest) {
+        if let Some(count) = parse_u32(rest) {
             return cmd_show(count.min(100) as u8);
         } else {
             println!("Invalid count");

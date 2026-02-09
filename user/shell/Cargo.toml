@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 userlib = { path = "../userlib" }
+libf = { path = "../libf" }
 
 [profile.release]
 opt-level = "s"       # Optimize for size

@@ -7,9 +7,17 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
+name = "libf"
+version = "0.1.0"
+dependencies = [
+ "userlib",
+]
+
+[[package]]
 name = "shell"
 version = "0.1.0"
 dependencies = [
+ "libf",
  "userlib",
 ]
 

@@ -93,22 +93,7 @@ fn format_size(size: u32) -> ([u8; 16], usize) {
 }
 
 fn write_dec(buf: &mut [u8], val: u32) -> usize {
-    if val == 0 {
-        buf[0] = b'0';
-        return 1;
-    }
-    let mut n = val;
-    let mut digits = 0;
-    let mut tmp = [0u8; 10];
-    while n > 0 {
-        tmp[digits] = b'0' + (n % 10) as u8;
-        n /= 10;
-        digits += 1;
-    }
-    for i in 0..digits {
-        buf[i] = tmp[digits - 1 - i];
-    }
-    digits
+    libf::fmt::format_u32_into(buf, val)
 }
 
 pub fn print_vfs_error(cmd: &[u8], path: &[u8], e: userlib::vfs_client::VfsError) {
