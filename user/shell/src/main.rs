@@ -350,14 +350,6 @@ fn execute_command(cmd: &[u8]) {
         builtins::handle::run(&cmd[7..], &mut output::ShellOutput::new());
     } else if cmd_eq(cmd, b"resize") {
         cmd_resize();
-    } else if cmd_eq(cmd, b"lsdev") {
-        builtins::lsdev::cmd_lsdev(b"");
-    } else if cmd_starts_with(cmd, b"lsdev ") {
-        builtins::lsdev::cmd_lsdev(&cmd[6..]);
-    } else if cmd_starts_with(cmd, b"devinfo ") {
-        builtins::lsdev::cmd_devinfo(&cmd[8..]);
-    } else if cmd_starts_with(cmd, b"devquery ") {
-        builtins::lsdev::cmd_devquery(&cmd[9..]);
     } else {
         // Try to run as a binary from bin/ directory
         try_run_binary(cmd);
@@ -503,9 +495,6 @@ fn cmd_help() {
         ("handle", "Test handle API (timer/channel/poll)"),
         ("devd spawn", "Spawn driver via devd (with caps)"),
         ("drivers", "Show driver/port tree (services, ports, shmem)"),
-        ("lsdev [class]", "List registered devices"),
-        ("devinfo <id>", "Get device info by ID"),
-        ("devquery <id>", "Query driver (blockinfo/partition)"),
         ("yield", "Yield CPU to other processes"),
         ("ps", "Show running processes"),
         ("kill <pid>", "Terminate a process"),

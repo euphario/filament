@@ -11,7 +11,7 @@ const BUILTINS: &[&[u8]] = &[
     b"spawn", b"yield", b"panic", b"usb", b"gpio", b"pcied",
     b"wifi", b"fan", b"ps", b"kill", b"bg", b"jobs", b"log", b"reset",
     b"reboot", b"hw", b"devd", b"handle", b"resize",
-    b"ls", b"cat", b"lsdev", b"devinfo", b"devquery", b"drivers", b"dlog",
+    b"ls", b"cat", b"drivers", b"dlog",
 ];
 
 /// Completion result

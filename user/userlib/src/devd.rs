@@ -66,46 +66,15 @@ pub mod caps {
 use crate::ipc::{Channel, ObjHandle};
 use crate::syscall;
 use crate::query::{
-    QueryHeader, PortRegisterResponse, DeviceRegister,
-    ListDevices, DeviceListResponse, StateChange, SpawnChild, SpawnAck,
+    QueryHeader, PortRegisterResponse,
+    StateChange, SpawnChild, SpawnAck,
     PortFilter, filter_mode, GetSpawnContext, SpawnContextResponse,
     QueryPort, PortInfoResponse, UpdatePortShmemId,
     PortEntry,
     ServiceEntry,
     QueryServiceInfo, ServiceInfoResult,
-    AttachDisk, ReportPartitions, RegisterPartitionMsg, PartitionReadyMsg,
-    PartitionInfoMsg,
-    msg, port_type, error, class, driver_state,
+    msg, port_type, error, driver_state,
 };
-
-// =============================================================================
-// Device Classes (re-export for convenience)
-// =============================================================================
-
-/// Device class for registration
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u16)]
-pub enum DeviceClass {
-    /// Mass storage device
-    MassStorage = class::MASS_STORAGE,
-    /// USB hub
-    Hub = class::HUB,
-    /// Human interface device
-    Hid = class::HID,
-    /// Other class
-    Other(u16),
-}
-
-impl DeviceClass {
-    pub fn as_u16(self) -> u16 {
-        match self {
-            DeviceClass::MassStorage => class::MASS_STORAGE,
-            DeviceClass::Hub => class::HUB,
-            DeviceClass::Hid => class::HID,
-            DeviceClass::Other(c) => c,
-        }
-    }
-}
 
 // =============================================================================
 // Driver State
@@ -123,40 +92,6 @@ pub enum DriverState {
     Error = driver_state::ERROR,
     /// Driver is stopping
     Stopping = driver_state::STOPPING,
-}
-
-// =============================================================================
-// Device Info
-// =============================================================================
-
-/// Device information for registration
-#[derive(Clone, Copy, Debug)]
-pub struct DeviceInfo<'a> {
-    /// Port name this device is associated with
-    pub port_name: &'a [u8],
-    /// Device class
-    pub class: DeviceClass,
-    /// Device subclass
-    pub subclass: u16,
-    /// Vendor ID (0 if unknown)
-    pub vendor_id: u16,
-    /// Product ID (0 if unknown)
-    pub product_id: u16,
-    /// Human-readable device name
-    pub name: &'a [u8],
-}
-
-impl Default for DeviceInfo<'_> {
-    fn default() -> Self {
-        Self {
-            port_name: b"",
-            class: DeviceClass::Other(0),
-            subclass: 0,
-            vendor_id: 0,
-            product_id: 0,
-            name: b"Unknown Device",
-        }
-    }
 }
 
 // =============================================================================
@@ -230,30 +165,6 @@ pub enum DevdCommand {
     QueryInfo {
         /// Sequence ID for response
         seq_id: u32,
-    },
-    /// Attach to a block device (devd → partd)
-    AttachDisk {
-        /// Sequence ID for response
-        seq_id: u32,
-        /// DataPort shared memory ID
-        shmem_id: u32,
-        /// Source port name (e.g., "disk0:")
-        source: [u8; 32],
-        source_len: usize,
-        /// Block size in bytes
-        block_size: u32,
-        /// Total number of blocks
-        block_count: u64,
-    },
-    /// Register a partition with assigned name (devd → partd)
-    RegisterPartition {
-        /// Sequence ID for response
-        seq_id: u32,
-        /// Partition index from ReportPartitions
-        index: u8,
-        /// Assigned partition name (e.g., "part0:")
-        name: [u8; 32],
-        name_len: usize,
     },
     /// Get a configuration value from the driver
     ConfigGet {
@@ -681,52 +592,6 @@ impl DevdClient {
         Err(SysError::Timeout)
     }
 
-    /// Register a device with devd
-    pub fn register_device(&mut self, info: DeviceInfo) -> Result<u32, SysError> {
-        let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
-        let reg = DeviceRegister::new(
-            seq_id,
-            info.class.as_u16(),
-            info.subclass,
-            info.vendor_id,
-            info.product_id,
-        );
-
-        let mut buf = [0u8; 128];
-        let len = reg.write_to(&mut buf, info.port_name, info.name)
-            .ok_or(SysError::InvalidArgument)?;
-
-        channel.send(&buf[..len])?;
-
-        let mut resp_buf = [0u8; 64];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(resp_len) if resp_len >= 12 => {
-                    let header = QueryHeader::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
-
-                    if header.msg_type == msg::DEVICE_INFO {
-                        let device_id = u32::from_le_bytes([
-                            resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
-                        ]);
-                        return Ok(device_id);
-                    } else if header.msg_type == msg::ERROR {
-                        return Err(SysError::PermissionDenied);
-                    }
-                }
-                Ok(_) => return Err(SysError::IoError),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(SysError::Timeout)
-    }
-
     // =========================================================================
     // Command Reception (devd → driver)
     // =========================================================================
@@ -799,34 +664,6 @@ impl DevdClient {
                         // devd is forwarding a service info query
                         Ok(Some(DevdCommand::QueryInfo {
                             seq_id: header.seq_id,
-                        }))
-                    }
-                    msg::ATTACH_DISK => {
-                        let (attach, source) = AttachDisk::from_bytes(&buf[..len])
-                            .ok_or(SysError::IoError)?;
-                        let mut source_buf = [0u8; 32];
-                        let source_len = source.len().min(32);
-                        source_buf[..source_len].copy_from_slice(&source[..source_len]);
-                        Ok(Some(DevdCommand::AttachDisk {
-                            seq_id: header.seq_id,
-                            shmem_id: attach.shmem_id,
-                            source: source_buf,
-                            source_len,
-                            block_size: attach.block_size,
-                            block_count: attach.block_count,
-                        }))
-                    }
-                    msg::REGISTER_PARTITION => {
-                        let (reg, name) = RegisterPartitionMsg::from_bytes(&buf[..len])
-                            .ok_or(SysError::IoError)?;
-                        let mut name_buf = [0u8; 32];
-                        let name_len = name.len().min(32);
-                        name_buf[..name_len].copy_from_slice(&name[..name_len]);
-                        Ok(Some(DevdCommand::RegisterPartition {
-                            seq_id: header.seq_id,
-                            index: reg.index,
-                            name: name_buf,
-                            name_len,
                         }))
                     }
                     msg::CONFIG_GET => {
@@ -911,96 +748,8 @@ impl DevdClient {
     }
 
     // =========================================================================
-    // Orchestration Responses (driver → devd)
-    // =========================================================================
-
-    /// Report discovered partitions to devd (partd → devd)
-    ///
-    /// Call this after scanning a disk's partition table.
-    pub fn report_partitions(
-        &mut self,
-        source_shmem_id: u32,
-        scheme: u8,
-        partitions: &[PartitionInfoMsg],
-    ) -> Result<(), SysError> {
-        let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
-        // Build message: header + partition entries
-        let mut buf = [0u8; 1024];
-        let header = ReportPartitions::new(seq_id, source_shmem_id, partitions.len() as u8, scheme);
-        buf[..ReportPartitions::FIXED_SIZE].copy_from_slice(&header.to_bytes());
-
-        let mut offset = ReportPartitions::FIXED_SIZE;
-        for part in partitions {
-            let part_bytes = part.to_bytes();
-            if offset + part_bytes.len() > buf.len() {
-                return Err(SysError::InvalidArgument);
-            }
-            buf[offset..offset + part_bytes.len()].copy_from_slice(&part_bytes);
-            offset += part_bytes.len();
-        }
-
-        channel.send(&buf[..offset])?;
-        Ok(())
-    }
-
-    /// Notify devd that a partition DataPort is ready (partd → devd)
-    ///
-    /// Call this after creating a DataPort for a partition.
-    pub fn partition_ready(
-        &mut self,
-        name: &[u8],
-        shmem_id: u32,
-    ) -> Result<(), SysError> {
-        let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
-        let msg = PartitionReadyMsg::new(seq_id, shmem_id);
-        let mut buf = [0u8; 64];
-        let len = msg.write_to(&mut buf, name).ok_or(SysError::IoError)?;
-        channel.send(&buf[..len])?;
-        Ok(())
-    }
-
-    // =========================================================================
     // Queries
     // =========================================================================
-
-    /// List devices of a specific class
-    pub fn list_devices(&mut self, class_filter: Option<DeviceClass>) -> Result<usize, SysError> {
-        let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
-        let class_val = class_filter.map(|c| c.as_u16());
-        let req = ListDevices::new(seq_id, class_val);
-        channel.send(&req.to_bytes())?;
-
-        let mut resp_buf = [0u8; 512];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(resp_len) if resp_len >= DeviceListResponse::HEADER_SIZE => {
-                    let header = QueryHeader::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
-
-                    if header.msg_type == msg::ERROR {
-                        return Ok(0);
-                    }
-
-                    let resp = DeviceListResponse::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
-                    return Ok(resp.count as usize);
-                }
-                Ok(_) => return Ok(0),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(SysError::Timeout)
-    }
 
     /// Query port info by name
     ///
@@ -1613,9 +1362,6 @@ fn handle_command<H: SpawnHandler>(
             let info = handler.get_info();
             let _ = client.respond_info(seq_id, info);
         }
-        // Orchestration commands are handled directly by drivers in their main loop
-        DevdCommand::AttachDisk { .. } => {}
-        DevdCommand::RegisterPartition { .. } => {}
         // Config commands are handled by the bus framework runtime, not SpawnHandler
         DevdCommand::ConfigGet { .. } => {}
         DevdCommand::ConfigSet { .. } => {}

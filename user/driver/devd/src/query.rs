@@ -1,17 +1,15 @@
 //! Query Handling Module
 //!
-//! Handles device queries from clients and registration from drivers.
+//! Handles queries from clients and port registration from managed services.
 //! Implements the query protocol defined in `userlib::query`.
 
 use userlib::ipc::Channel;
 use userlib::query::{
-    QueryHeader, DeviceRegister, ListDevices, GetDeviceInfo, DriverQuery,
-    DeviceListResponse, DeviceInfoResponse, DeviceEntry, ErrorResponse,
+    QueryHeader, ErrorResponse,
     PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
     msg, error,
 };
 
-use crate::devices::{DeviceStore, DeviceRegistry, MAX_DEVICES};
 use crate::service::{ServiceManager, ServiceRegistry};
 
 // =============================================================================
@@ -32,9 +30,9 @@ pub const MSG_BUFFER_SIZE: usize = 512;
 pub struct QueryClient {
     /// Channel to client
     pub channel: Channel,
-    /// Is this a driver (can register devices) or regular client
-    pub is_driver: bool,
-    /// Service index if this is a driver (-1 for regular clients)
+    /// Is this a managed service spawned by devd (can register ports)
+    pub is_managed: bool,
+    /// Service index if this is a managed service (-1 for regular clients)
     pub service_idx: i8,
     /// Client PID (for later identification)
     pub pid: u32,
@@ -67,7 +65,7 @@ impl QueryHandler {
 
         self.clients[slot] = Some(QueryClient {
             channel,
-            is_driver: service_idx.is_some(),
+            is_managed: service_idx.is_some(),
             service_idx: service_idx.map(|i| i as i8).unwrap_or(-1),
             pid,
         });
@@ -115,24 +113,24 @@ impl QueryHandler {
         self.client_count
     }
 
-    /// Get service index for a client (if it's a driver)
+    /// Get service index for a client (if it's a managed service)
     pub fn get_service_idx(&self, slot: usize) -> Option<u8> {
         self.clients.get(slot)
             .and_then(|c| c.as_ref())
-            .filter(|c| c.is_driver && c.service_idx >= 0)
+            .filter(|c| c.is_managed && c.service_idx >= 0)
             .map(|c| c.service_idx as u8)
     }
 
-    /// Upgrade a client to driver status by PID
+    /// Upgrade a client to managed status by PID
     ///
     /// This handles the race condition where a child process connects to
     /// devd-query before its parent sends SPAWN_ACK. When we receive the
-    /// SPAWN_ACK, we need to upgrade that client to driver status.
-    pub fn upgrade_client_to_driver(&mut self, pid: u32, service_idx: u8) {
+    /// SPAWN_ACK, we need to upgrade that client to managed status.
+    pub fn upgrade_to_managed(&mut self, pid: u32, service_idx: u8) {
         for client in &mut self.clients {
             if let Some(c) = client {
-                if c.pid == pid && !c.is_driver {
-                    c.is_driver = true;
+                if c.pid == pid && !c.is_managed {
+                    c.is_managed = true;
                     c.service_idx = service_idx as i8;
                     return;
                 }
@@ -143,251 +141,18 @@ impl QueryHandler {
     /// Process an incoming message from a client
     pub fn handle_message(
         &mut self,
-        slot: usize,
+        _slot: usize,
         buf: &[u8],
-        devices: &mut DeviceRegistry,
-        services: &ServiceRegistry,
+        _services: &ServiceRegistry,
         response_buf: &mut [u8],
     ) -> Option<usize> {
         let header = QueryHeader::from_bytes(buf)?;
 
-        match header.msg_type {
-            msg::REGISTER_DEVICE => {
-                self.handle_register_device(slot, buf, devices, response_buf)
-            }
-            msg::UNREGISTER_DEVICE => {
-                self.handle_unregister_device(buf, devices, response_buf)
-            }
-            msg::UPDATE_STATE => {
-                self.handle_update_state(buf, devices, response_buf)
-            }
-            msg::LIST_DEVICES => {
-                self.handle_list_devices(buf, devices, response_buf)
-            }
-            msg::GET_DEVICE_INFO => {
-                self.handle_get_device_info(buf, devices, services, response_buf)
-            }
-            msg::QUERY_DRIVER => {
-                // Pass-through queries need special handling (async)
-                // Return None to indicate caller should handle forwarding
-                None
-            }
-            _ => {
-                // Unknown message type
-                let resp = ErrorResponse::new(header.seq_id, error::INVALID_REQUEST);
-                let bytes = resp.to_bytes();
-                response_buf[..bytes.len()].copy_from_slice(&bytes);
-                Some(bytes.len())
-            }
-        }
-    }
-
-    // =========================================================================
-    // Message Handlers
-    // =========================================================================
-
-    fn handle_register_device(
-        &self,
-        slot: usize,
-        buf: &[u8],
-        devices: &mut DeviceRegistry,
-        response_buf: &mut [u8],
-    ) -> Option<usize> {
-        let (info, path, _name) = DeviceRegister::from_bytes(buf)?;
-
-        // Only drivers can register devices
-        let client = self.clients[slot].as_ref()?;
-        if !client.is_driver {
-            let resp = ErrorResponse::new(info.header.seq_id, error::PERMISSION_DENIED);
-            let bytes = resp.to_bytes();
-            response_buf[..bytes.len()].copy_from_slice(&bytes);
-            return Some(bytes.len());
-        }
-
-        let owner = client.service_idx as u8;
-        let device_id = devices.register(&info, path, owner);
-
-        match device_id {
-            Some(id) => {
-                // Return device ID in a DeviceInfoResponse
-                let entry = DeviceEntry {
-                    device_id: id,
-                    device_class: info.device_class,
-                    device_subclass: info.device_subclass,
-                    vendor_id: info.vendor_id,
-                    product_id: info.product_id,
-                    state: userlib::query::state::DISCOVERED,
-                    _pad: [0; 3],
-                };
-                let resp = DeviceInfoResponse::new(info.header.seq_id, entry);
-                resp.write_to(response_buf, &[])
-            }
-            None => {
-                let resp = ErrorResponse::new(info.header.seq_id, error::DEVICE_ERROR);
-                let bytes = resp.to_bytes();
-                response_buf[..bytes.len()].copy_from_slice(&bytes);
-                Some(bytes.len())
-            }
-        }
-    }
-
-    fn handle_unregister_device(
-        &self,
-        buf: &[u8],
-        devices: &mut DeviceRegistry,
-        response_buf: &mut [u8],
-    ) -> Option<usize> {
-        let header = QueryHeader::from_bytes(buf)?;
-
-        // Device ID follows header
-        if buf.len() < QueryHeader::SIZE + 4 {
-            let resp = ErrorResponse::new(header.seq_id, error::INVALID_REQUEST);
-            let bytes = resp.to_bytes();
-            response_buf[..bytes.len()].copy_from_slice(&bytes);
-            return Some(bytes.len());
-        }
-
-        let device_id = u32::from_le_bytes([
-            buf[QueryHeader::SIZE],
-            buf[QueryHeader::SIZE + 1],
-            buf[QueryHeader::SIZE + 2],
-            buf[QueryHeader::SIZE + 3],
-        ]);
-
-        let success = devices.unregister(device_id);
-
-        let resp = if success {
-            ErrorResponse::new(header.seq_id, error::OK)
-        } else {
-            ErrorResponse::new(header.seq_id, error::NOT_FOUND)
-        };
-
+        // Unknown message type
+        let resp = ErrorResponse::new(header.seq_id, error::INVALID_REQUEST);
         let bytes = resp.to_bytes();
         response_buf[..bytes.len()].copy_from_slice(&bytes);
         Some(bytes.len())
-    }
-
-    fn handle_update_state(
-        &self,
-        buf: &[u8],
-        devices: &mut DeviceRegistry,
-        response_buf: &mut [u8],
-    ) -> Option<usize> {
-        let header = QueryHeader::from_bytes(buf)?;
-
-        // Device ID and new state follow header
-        if buf.len() < QueryHeader::SIZE + 5 {
-            let resp = ErrorResponse::new(header.seq_id, error::INVALID_REQUEST);
-            let bytes = resp.to_bytes();
-            response_buf[..bytes.len()].copy_from_slice(&bytes);
-            return Some(bytes.len());
-        }
-
-        let device_id = u32::from_le_bytes([
-            buf[QueryHeader::SIZE],
-            buf[QueryHeader::SIZE + 1],
-            buf[QueryHeader::SIZE + 2],
-            buf[QueryHeader::SIZE + 3],
-        ]);
-        let new_state = buf[QueryHeader::SIZE + 4];
-
-        let success = devices.update_state(device_id, new_state);
-
-        let resp = if success {
-            ErrorResponse::new(header.seq_id, error::OK)
-        } else {
-            ErrorResponse::new(header.seq_id, error::NOT_FOUND)
-        };
-
-        let bytes = resp.to_bytes();
-        response_buf[..bytes.len()].copy_from_slice(&bytes);
-        Some(bytes.len())
-    }
-
-    fn handle_list_devices(
-        &self,
-        buf: &[u8],
-        devices: &DeviceRegistry,
-        response_buf: &mut [u8],
-    ) -> Option<usize> {
-        let req = ListDevices::from_bytes(buf)?;
-
-        let class_filter = if req.class_filter == 0 {
-            None
-        } else {
-            Some(req.class_filter)
-        };
-
-        let count = devices.count(class_filter);
-
-        // Write response header
-        let resp = DeviceListResponse::new(req.header.seq_id, count as u16);
-        resp.write_header(response_buf)?;
-
-        // Write device entries
-        let mut offset = DeviceListResponse::HEADER_SIZE;
-        let mut written = 0;
-
-        devices.for_each(class_filter, |device| {
-            if written < MAX_DEVICES && offset + DeviceEntry::SIZE <= response_buf.len() {
-                let entry = device.to_entry();
-                response_buf[offset..offset + DeviceEntry::SIZE].copy_from_slice(&entry.to_bytes());
-                offset += DeviceEntry::SIZE;
-                written += 1;
-            }
-        });
-
-        Some(offset)
-    }
-
-    fn handle_get_device_info(
-        &self,
-        buf: &[u8],
-        devices: &DeviceRegistry,
-        services: &ServiceRegistry,
-        response_buf: &mut [u8],
-    ) -> Option<usize> {
-        let req = GetDeviceInfo::from_bytes(buf)?;
-
-        let device = devices.get(req.device_id);
-
-        match device {
-            Some(dev) => {
-                let entry = dev.to_entry();
-
-                // Get driver port name (the port that triggered this service's spawn)
-                let driver_port: &[u8] = services
-                    .get(dev.owner_service_idx as usize)
-                    .map(|s| s.trigger_port())
-                    .unwrap_or(b"");
-
-                let resp = DeviceInfoResponse::new(req.header.seq_id, entry);
-                resp.write_to(response_buf, driver_port)
-            }
-            None => {
-                let resp = ErrorResponse::new(req.header.seq_id, error::NOT_FOUND);
-                let bytes = resp.to_bytes();
-                response_buf[..bytes.len()].copy_from_slice(&bytes);
-                Some(bytes.len())
-            }
-        }
-    }
-
-    /// Parse a QUERY_DRIVER message and return the device ID and driver index
-    pub fn parse_driver_query<'a>(
-        &self,
-        buf: &'a [u8],
-        devices: &DeviceRegistry,
-    ) -> Option<(u32, u8, u32, &'a [u8])> {
-        let (query, payload) = DriverQuery::from_bytes(buf)?;
-        let device = devices.get(query.device_id)?;
-
-        Some((
-            query.header.seq_id,
-            device.owner_service_idx,
-            query.query_type,
-            payload,
-        ))
     }
 
     /// Send a port registration response
@@ -404,7 +169,7 @@ impl QueryHandler {
     }
 
     /// Parse a REGISTER_PORT_INFO message (unified PortInfo)
-    /// Returns parsed info if valid and caller is a driver
+    /// Returns parsed info if valid and caller is a managed service
     pub fn parse_port_register_info(
         &self,
         slot: usize,
@@ -413,9 +178,9 @@ impl QueryHandler {
         // Parse message header and body
         let (reg, info_bytes) = PortRegisterInfoMsg::from_bytes(buf)?;
 
-        // Only drivers can register ports
+        // Only managed services can register ports
         let client = self.clients[slot].as_ref()?;
-        if !client.is_driver {
+        if !client.is_managed {
             return None;
         }
 
@@ -487,7 +252,7 @@ impl QueryHandler {
         let slot = self.find_by_service_idx(service_idx)?;
         let client = self.clients[slot].as_mut()?;
 
-        if !client.is_driver {
+        if !client.is_managed {
             return None;
         }
 

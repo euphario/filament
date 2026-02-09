@@ -39,7 +39,7 @@ pub use dma::{DmaBuf, DmaDirection, CoherentBuf, StreamingBuf};
 pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_status, side_msg, side_status, Doorbell, ChannelDoorbell};
 pub use data_port::{DataPort, DataPortConfig, PortRole, Layer, ConnectedLayer, GeometryInfo};
 pub use devd::{
-    DevdClient, DeviceClass, DeviceInfo, ClientState,
+    DevdClient, ClientState,
     DevdCommand, SpawnFilter, SpawnResult,
 };
 pub use bus::{
