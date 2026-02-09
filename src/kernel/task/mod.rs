@@ -114,7 +114,7 @@ pub use policy::{SchedulingPolicy, PerCpuQueues};
 // Re-export TCB types
 pub use tcb::{
     Priority, TrapFrame, CpuContext, TaskId, Task,
-    MAX_CHANNELS_PER_TASK,
+    MAX_CHANNELS_PER_TASK, STACK_CANARY,
     enter_usermode, context_switch,
 };
 

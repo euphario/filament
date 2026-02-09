@@ -586,7 +586,19 @@ fn exec_slot_reap(pid: TaskId, slot: usize) {
     crate::kernel::task::with_scheduler(|sched| {
         // Verify the slot still belongs to this pid
         match sched.task(slot) {
-            Some(task) if task.id == pid => {}
+            Some(task) if task.id == pid => {
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    task.is_terminated(),
+                    "SlotReap: task {} in slot {} is {:?}, expected terminated",
+                    pid, slot, task.state().name()
+                );
+                // Verify stack canary before freeing (catches corruption that happened during lifetime)
+                #[cfg(debug_assertions)]
+                if !task.verify_stack_canary() {
+                    crate::kwarn!("reap", "stack_canary_corrupt"; pid = pid as u64, slot = slot as u64);
+                }
+            }
             _ => return, // Already reaped (e.g. by wait_child) or PID mismatch
         }
 

@@ -306,6 +306,18 @@ impl CpuData {
 /// when simple preemption switches to a different task.
 #[inline]
 pub fn set_kernel_stack_top(addr: u64) {
+    #[cfg(debug_assertions)]
+    {
+        // Must be in kernel VA range (high half) and 16-byte aligned for ARM stack
+        debug_assert!(
+            addr >= 0xFFFF_0000_0000_0000 || addr == 0,
+            "set_kernel_stack_top: 0x{:x} not in kernel VA range", addr
+        );
+        debug_assert!(
+            addr & 0xF == 0,
+            "set_kernel_stack_top: 0x{:x} not 16-byte aligned", addr
+        );
+    }
     cpu_local().kernel_stack_top.store(addr, Ordering::Release);
 }
 

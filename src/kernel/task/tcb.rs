@@ -13,6 +13,10 @@ use crate::kernel::memory::{
     MappingKind, HeapMapping, MapFlags, MapSource, MapResult,
 };
 
+/// Magic value written to the bottom of every kernel stack at allocation time.
+/// Checked at context switch and slot reap to detect stack overflow/corruption.
+pub const STACK_CANARY: u64 = 0xCA4A_B1E5_DEAD_BEEF;
+
 /// Task priority levels
 /// Lower number = higher priority
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -356,6 +360,12 @@ impl Task {
         let stack_base = alloc_base + GUARD_PAGE_SIZE;
         let stack_top = stack_base + KERNEL_STACK_SIZE;
 
+        // Write canary at the bottom of the stack to detect overflow/corruption
+        unsafe {
+            let canary_virt = mmu::phys_to_virt(stack_base as u64) as *mut u64;
+            core::ptr::write_volatile(canary_virt, STACK_CANARY);
+        }
+
         let mut context = CpuContext::new();
         context.sp = stack_top as u64;
         context.pc = entry as u64;
@@ -473,6 +483,12 @@ impl Task {
         let guard_page = alloc_base;
         let stack_base = alloc_base + GUARD_PAGE_SIZE;
         let stack_top = stack_base + KERNEL_STACK_SIZE;
+
+        // Write canary at the bottom of the stack to detect overflow/corruption
+        unsafe {
+            let canary_virt = mmu::phys_to_virt(stack_base as u64) as *mut u64;
+            core::ptr::write_volatile(canary_virt, STACK_CANARY);
+        }
 
         // Convert to kernel virtual address (MMU is enabled)
         let stack_top_virt = crate::kernel::arch::mmu::phys_to_virt(stack_top as u64);
@@ -676,6 +692,20 @@ impl Task {
 
     pub fn address_space_mut(&mut self) -> Option<&mut AddressSpace> {
         self.address_space.as_mut()
+    }
+
+    /// Verify that the stack canary at the bottom of this task's kernel stack is intact.
+    /// Returns true if the canary is valid (or this is a static-stack idle task).
+    /// Returns false if the canary has been corrupted (stack overflow or use-after-free).
+    pub fn verify_stack_canary(&self) -> bool {
+        // Idle tasks have static stacks (kernel_stack == 0), no canary written
+        if self.kernel_stack == 0 {
+            return true;
+        }
+        unsafe {
+            let canary_virt = mmu::phys_to_virt(self.kernel_stack) as *const u64;
+            core::ptr::read_volatile(canary_virt) == STACK_CANARY
+        }
     }
 
     /// Take wake data (consumes it — returns None on second call).
@@ -1180,8 +1210,18 @@ impl Drop for Task {
             }
         }
 
-        let total_pages = (self.kernel_stack_size / 4096) + 1;
-        pmm::free_pages(self.guard_page as usize, total_pages);
+        // Don't free static idle stacks (guard_page == 0 means not from PMM)
+        if self.guard_page != 0 {
+            // Poison the stack before freeing so any use-after-free reads garbage
+            #[cfg(debug_assertions)]
+            unsafe {
+                let stack_virt = mmu::phys_to_virt(self.kernel_stack) as *mut u8;
+                core::ptr::write_bytes(stack_virt, 0xDF, self.kernel_stack_size);
+            }
+
+            let total_pages = (self.kernel_stack_size / 4096) + 1;
+            pmm::free_pages(self.guard_page as usize, total_pages);
+        }
     }
 }
 
