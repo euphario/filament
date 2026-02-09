@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod fmt;
+pub mod io;
 pub mod parse;
 pub mod str;
 
