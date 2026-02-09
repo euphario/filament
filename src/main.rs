@@ -340,7 +340,7 @@ pub extern "C" fn kmain() -> ! {
                     // Task preparation failed - enter idle instead
                     drop(sched);
                     kerror!("kernel", "task_prep_failed"; slot = slot);
-                    kernel::idle::idle_entry();
+                    enter_idle_with_correct_stack(0);
                 }
             }
             // sched guard is dropped here, releasing the lock
@@ -570,6 +570,29 @@ pub extern "C" fn ttbr0_zero_diagnostic(caller_id: u64) {
     print_str_uart("=== HALTING ===\r\n");
     loop {
         unsafe { core::arch::asm!("wfe"); }
+    }
+}
+
+/// Switch SP to the idle task's own stack and enter idle_entry().
+///
+/// When exception_from_user_rust terminates a task and enters idle,
+/// SP_EL1 still points to the terminated task's kernel stack. That
+/// stack gets freed during slot reap, leaving idle on freed memory.
+/// This function switches SP to the per-CPU idle stack before calling
+/// idle_entry(), preventing use-after-free.
+fn enter_idle_with_correct_stack(cpu: u32) -> ! {
+    let idle_stack_top = unsafe {
+        kernel::idle::idle_stack_top_for_cpu(cpu) as u64
+    };
+    kernel::percpu::set_kernel_stack_top(idle_stack_top);
+    unsafe {
+        core::arch::asm!(
+            "mov sp, {stack}",
+            "b {entry}",
+            stack = in(reg) idle_stack_top,
+            entry = sym kernel::idle::idle_entry,
+            options(noreturn),
+        );
     }
 }
 
@@ -955,7 +978,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 // returns, so the MutexGuard would never be dropped, deadlocking
                 // when timer IRQ tries to acquire the scheduler lock).
                 drop(sched);
-                kernel::idle::idle_entry();
+                enter_idle_with_correct_stack(cpu);
             }
 
             // Check if the next task has saved kernel context (was blocked in kernel mode).
@@ -975,7 +998,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 // Drop scheduler lock before entering idle (idle_entry never
                 // returns, so the MutexGuard would never be dropped).
                 drop(sched);
-                kernel::idle::idle_entry();
+                enter_idle_with_correct_stack(cpu);
             }
 
             // Switch address space BEFORE changing current slot

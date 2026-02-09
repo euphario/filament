@@ -843,7 +843,7 @@ impl FatfsDriver {
 
     /// Core initialization: connect to partition, read FAT16, create VFS port.
     ///
-    /// Called from init() (spawn context path) or from ATTACH_DISK command.
+    /// Called from reset() via spawn context discovery.
     fn do_init(&mut self, shmem_id: u32, source_name: &[u8], ctx: &mut dyn BusCtx) -> bool {
         // Connect to partition DataPort
         match ctx.connect_block_port(shmem_id) {
@@ -1046,25 +1046,6 @@ impl Driver for FatfsDriver {
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         match msg.msg_type {
-            bus_msg::ATTACH_DISK => {
-                let shmem_id = msg.read_u32(0);
-                uinfo!("fatfsd", "attach_disk"; shmem_id = shmem_id);
-
-                // Extract source name from payload
-                let source_end = (msg.payload_len as usize).min(240);
-                let source_start = 16;
-                let source_name = if source_start < source_end {
-                    let name = &msg.payload[source_start..source_end];
-                    let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-                    &msg.payload[source_start..source_start + len]
-                } else {
-                    b"fat0:" as &[u8]
-                };
-
-                self.do_init(shmem_id, source_name, ctx);
-                Disposition::Handled
-            }
-
             bus_msg::QUERY_INFO => {
                 let info = self.format_info();
                 let info_len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);

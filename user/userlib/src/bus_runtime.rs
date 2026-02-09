@@ -9,7 +9,7 @@
 //! ## Event sources
 //!
 //! The Mux watches:
-//! - **devd channel** — commands from devd (SpawnChild, AttachDisk, etc.)
+//! - **devd channel** — commands from devd (SpawnChild, QueryInfo, etc.)
 //! - **block port shmem handles** — data port notifications (SQ/CQ activity)
 //! - **driver-registered handles** — custom handles via `ctx.watch_handle()`
 
@@ -324,7 +324,7 @@ impl RuntimeCtx {
 
 impl BusCtx for RuntimeCtx {
     // NOTE: reply(), forward_down(), send_up(), and emit_event() are no-ops.
-    // Replies use dedicated BusCtx methods (report_partitions, ack_spawn, etc.).
+    // Replies use dedicated BusCtx methods (respond_info, ack_spawn, etc.).
     // Forwarding and events are not yet wired — the bus tree currently has at
     // most 2 levels, so there is no upstream to forward to. When multi-level
     // bus trees are needed, these must be implemented.
@@ -521,23 +521,6 @@ impl BusCtx for RuntimeCtx {
         &self.name[..self.name_len]
     }
 
-    fn report_partitions(
-        &mut self,
-        disk_shmem_id: u32,
-        scheme: u8,
-        parts: &[crate::query::PartitionInfoMsg],
-    ) -> Result<(), BusError> {
-        self.devd
-            .report_partitions(disk_shmem_id, scheme, parts)
-            .map_err(|_| BusError::Internal)
-    }
-
-    fn partition_ready(&mut self, name: &[u8], shmem_id: u32) -> Result<(), BusError> {
-        self.devd
-            .partition_ready(name, shmem_id)
-            .map_err(|_| BusError::Internal)
-    }
-
     fn respond_info(&mut self, seq_id: u32, info: &[u8]) -> Result<(), BusError> {
         self.devd
             .respond_info(seq_id, info)
@@ -609,36 +592,6 @@ impl BusCtx for RuntimeCtx {
 /// Translate a DevdCommand into a BusMsg for the driver's command() callback.
 fn devd_command_to_bus_msg(cmd: &DevdCommand) -> Option<BusMsg> {
     match cmd {
-        DevdCommand::AttachDisk {
-            seq_id,
-            shmem_id,
-            source,
-            source_len,
-            block_size,
-            block_count,
-            ..
-        } => {
-            let mut msg = BusMsg::new(bus_msg::ATTACH_DISK);
-            msg.seq_id = *seq_id;
-            msg.write_u32(0, *shmem_id);
-            msg.write_u32(4, *block_size);
-            msg.write_u64(8, *block_count);
-            msg.write_bytes(16, &source[..*source_len]);
-            msg.write_u8(16 + *source_len, 0); // null terminator
-            Some(msg)
-        }
-        DevdCommand::RegisterPartition {
-            seq_id,
-            index,
-            name,
-            name_len,
-        } => {
-            let mut msg = BusMsg::new(bus_msg::REGISTER_PARTITION);
-            msg.seq_id = *seq_id;
-            msg.write_u8(0, *index);
-            msg.write_bytes(1, &name[..*name_len]);
-            Some(msg)
-        }
         DevdCommand::QueryInfo { seq_id } => {
             let mut msg = BusMsg::new(bus_msg::QUERY_INFO);
             msg.seq_id = *seq_id;

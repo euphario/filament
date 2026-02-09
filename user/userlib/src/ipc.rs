@@ -513,11 +513,11 @@ impl Default for Message {
 
 /// Query kernel for all registered buses.
 ///
-/// Opens a BusList handle, reads BusInfo entries, closes the handle.
+/// Opens a BusList handle, reads PortInfo entries, closes the handle.
 /// Returns the number of buses written to `buf`.
-pub fn bus_list(buf: &mut [abi::BusInfo]) -> SysResult<usize> {
+pub fn bus_list(buf: &mut [abi::PortInfo]) -> SysResult<usize> {
     let handle = open(ObjectType::BusList, &[])?;
-    let byte_len = buf.len() * core::mem::size_of::<abi::BusInfo>();
+    let byte_len = buf.len() * core::mem::size_of::<abi::PortInfo>();
     let byte_buf = unsafe {
         core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, byte_len)
     };

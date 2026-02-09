@@ -291,6 +291,27 @@ impl BusController {
         info
     }
 
+    /// Convert to abi::PortInfo for bus_list syscall
+    pub fn to_port_info(&self) -> abi::PortInfo {
+        let port_class = match self.bus_type {
+            BusType::PCIe => abi::PortClass::Pcie,
+            BusType::Usb => abi::PortClass::Usb,
+            BusType::Ethernet => abi::PortClass::Ethernet,
+            BusType::Uart => abi::PortClass::Uart,
+            BusType::Klog => abi::PortClass::Klog,
+            BusType::Platform => abi::PortClass::Service,
+        };
+        let port_subclass = match self.bus_type {
+            BusType::Usb => abi::port_subclass::USB_XHCI,
+            BusType::Ethernet => abi::port_subclass::NET_ETHERNET,
+            BusType::Uart => abi::port_subclass::CONSOLE_SERIAL,
+            _ => 0,
+        };
+        let mut info = abi::PortInfo::new(&self.port_name[..self.port_name_len], port_class);
+        info.port_subclass = port_subclass;
+        info
+    }
+
     /// Check if a PID is the supervisor
     pub fn is_supervisor(&self, pid: Pid) -> bool {
         self.supervisor_pid == Some(pid)

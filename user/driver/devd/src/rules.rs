@@ -164,8 +164,12 @@ pub static PORT_RULES: &[PortRule] = &[
         driver: "wifid",
         caps: userlib::devd::caps::DRIVER,
     },
-    // Block(BLOCK_RAW) → partd is NOT here.  partd is a singleton spawned by
-    // disk orchestration on first block device discovery (track_and_attach_disk).
+    PortRule {
+        class: PortClass::Block,
+        subclass: SubclassMatch::Exact(port_subclass::BLOCK_RAW),
+        driver: "partd",
+        caps: userlib::devd::caps::DRIVER,
+    },
     PortRule {
         class: PortClass::Block,
         subclass: SubclassMatch::OneOf(FAT_SUBCLASSES),
@@ -327,12 +331,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rule_block_raw_no_match() {
-        // BLOCK_RAW doesn't match any rule — partd is a singleton
-        // spawned by disk orchestration, not by port rules.
+    fn test_rule_block_raw_partd() {
         let info = make_port_info(PortClass::Block, port_subclass::BLOCK_RAW);
         let rule = find_port_rule(&info);
-        assert!(rule.is_none());
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "partd");
     }
 
     #[test]

@@ -435,12 +435,6 @@ pub mod bus_msg {
     pub const QUERY_TREE: u32 = 0x0201;
     pub const QUERY_CAPS: u32 = 0x0202;
 
-    // Device orchestration (0x03xx)
-    pub const ATTACH_DISK: u32 = 0x0300;
-    pub const REPORT_PARTITIONS: u32 = 0x0301;
-    pub const REGISTER_PARTITION: u32 = 0x0302;
-    pub const PARTITION_READY: u32 = 0x0303;
-    pub const MOUNT_PARTITION: u32 = 0x0304;
     // Events (0x04xx) — unsolicited, flow up
     pub const LINK_DOWN: u32 = 0x0400;
     pub const LINK_UP: u32 = 0x0401;
@@ -652,17 +646,6 @@ pub trait BusCtx {
     fn name(&self) -> &[u8];
 
     // === Devd integration (v1) ===
-
-    /// Report partitions to devd (orchestration shortcut).
-    fn report_partitions(
-        &mut self,
-        disk_shmem_id: u32,
-        scheme: u8,
-        parts: &[crate::query::PartitionInfoMsg],
-    ) -> Result<(), BusError>;
-
-    /// Notify devd that a partition DataPort is ready.
-    fn partition_ready(&mut self, name: &[u8], shmem_id: u32) -> Result<(), BusError>;
 
     /// Respond to a QueryInfo request with text.
     fn respond_info(&mut self, seq_id: u32, info: &[u8]) -> Result<(), BusError>;

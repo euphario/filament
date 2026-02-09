@@ -1,50 +1,50 @@
 //! Partition Driver
 //!
-//! Composable block layer that reads MBR/GPT, discovers partitions, and serves
-//! block requests with LBA translation. Supports multiple disks concurrently.
+//! Per-disk block layer that reads MBR, discovers partitions, and serves
+//! block requests with LBA translation. One partd instance per disk.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────┐
 //! │  fatfs (spawned per partition)          │
-//! │  connects to: part0:, part1:, ...       │
+//! │  connects to: 0:fat, 1:ext2, ...        │
 //! ├─────────────────────────────────────────┤
-//! │  partition (this driver)                │
-//! │  provides: part0:, part1:, ...          │
-//! │  consumes: disk0: (or msc0:, nvme0:)    │
+//! │  partd (this driver, one per disk)      │
+//! │  provides: 0:fat, 1:ext2, ...           │
+//! │  consumes: usb0:msc (or nvme0:)         │
 //! ├─────────────────────────────────────────┤
 //! │  usbd / nvmed (block device)            │
-//! │  provides: disk0: (Block type)          │
+//! │  provides: usb0:msc / nvme0: (Block)    │
 //! └─────────────────────────────────────────┘
 //! ```
 //!
 //! ## Flow
 //!
-//! 1. devd spawns this driver when a Block port is registered
-//! 2. Receives ATTACH_DISK command via bus framework (one per disk)
-//! 3. Connects to disk DataPort, reads MBR, reports partitions
-//! 4. Receives REGISTER_PARTITION, creates per-partition DataPort
+//! 1. devd rule spawns partd when a Block(BLOCK_RAW) port appears
+//! 2. In reset(), partd queries spawn context to find the trigger port
+//! 3. Discovers and connects to disk DataPort, reads MBR
+//! 4. Registers per-partition ports (Block with filesystem subclass)
 //! 5. Serves block requests with LBA translation (zero-copy path)
 
 #![no_std]
 #![no_main]
 
-use userlib::syscall::{self, LogLevel};
+use userlib::syscall;
 use userlib::uerror;
+use userlib::uinfo;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
-    BlockPortConfig, bus_msg,
+    BlockPortConfig, BlockMetadata, PortInfo, PortClass, port_subclass, bus_msg,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::io_status;
-use userlib::query::{PartitionInfoMsg, part_scheme};
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-const MAX_DISKS: usize = 4;
+const MAX_DISKS: usize = 1;
 const MAX_PARTITIONS_PER_DISK: usize = 4;
 
 // =============================================================================
@@ -168,7 +168,7 @@ struct PartitionDriver {
 impl PartitionDriver {
     const fn new() -> Self {
         Self {
-            disks: [None, None, None, None],
+            disks: [None],
             disk_count: 0,
             inflight: [None; MAX_INFLIGHT],
             inflight_count: 0,
@@ -792,161 +792,133 @@ impl PartitionDriver {
 // =============================================================================
 
 impl Driver for PartitionDriver {
-    fn reset(&mut self, _ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        // Nothing to do — wait for ATTACH_DISK commands from devd
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        // 1. Get spawn context — partd is spawned per-disk by PORT_RULES
+        //    Copy port name to local buffer before further ctx calls (avoids borrow conflict)
+        let mut port_name_buf = [0u8; 64];
+        let port_name_len;
+        {
+            let spawn_ctx = ctx.spawn_context()?;
+            let pn = spawn_ctx.port_name();
+            port_name_len = pn.len().min(64);
+            port_name_buf[..port_name_len].copy_from_slice(&pn[..port_name_len]);
+        }
+        let port_name = &port_name_buf[..port_name_len];
+
+        // Copy port name for disk entry (shorter buffer)
+        let mut name = [0u8; 32];
+        let name_len = port_name_len.min(32);
+        name[..name_len].copy_from_slice(&port_name[..name_len]);
+
+        uinfo!("partd", "attach"; port = core::str::from_utf8(port_name).unwrap_or("?"));
+
+        // 2. Discover the disk DataPort shmem_id via devd
+        let shmem_id = ctx.discover_port(port_name)?;
+
+        // 3. Connect to the disk DataPort as consumer
+        let consumer_port = ctx.connect_block_port(shmem_id)?;
+
+        // Query block size from geometry
+        let mut block_size: u32 = 512;
+        if let Some(port) = ctx.block_port(consumer_port) {
+            if let Some(geo) = port.query_geometry() {
+                block_size = geo.block_size;
+            }
+        }
+
+        self.disks[0] = Some(DiskEntry {
+            consumer_port,
+            provider_port: None,
+            block_size,
+            partitions: [PartitionInfo::empty(); MAX_PARTITIONS_PER_DISK],
+            partition_count: 0,
+            name,
+            name_len,
+        });
+        self.disk_count = 1;
+
+        // 4. Scan MBR
+        let count = self.scan_partitions(0, ctx);
+
+        if count == 0 {
+            uerror!("partd", "no_partitions";);
+            return Ok(());
+        }
+
+        // 5. Create provider DataPort and register a port for each partition
+        let config = BlockPortConfig {
+            ring_size: 64,
+            side_size: 8,
+            pool_size: 256 * 1024,
+        };
+
+        match ctx.create_block_port(config) {
+            Ok(port_id) => {
+                // Get shmem_id and set public — release borrow before register_port_with_info
+                let provider_shmem_id = if let Some(port) = ctx.block_port(port_id) {
+                    port.set_public();
+                    port.shmem_id()
+                } else {
+                    uerror!("partd", "dataport_access_failed";);
+                    return Ok(());
+                };
+
+                if let Some(d) = &mut self.disks[0] {
+                    d.provider_port = Some(port_id);
+                }
+
+                // Register a port for each discovered partition
+                if let Some(d) = &self.disks[0] {
+                    for i in 0..d.partition_count {
+                        let p = &d.partitions[i];
+
+                        // Map MBR type to port_subclass
+                        let subclass = mbr_type_to_subclass(p.partition_type);
+
+                        // Build partition port name: "N:type"
+                        let type_suffix = mbr_type_to_suffix(p.partition_type);
+                        let mut pname = [0u8; 32];
+                        let mut plen = 0;
+                        // Partition index digit
+                        pname[0] = b'0' + (i as u8);
+                        plen += 1;
+                        pname[plen] = b':';
+                        plen += 1;
+                        let slen = type_suffix.len().min(pname.len() - plen);
+                        pname[plen..plen + slen].copy_from_slice(&type_suffix[..slen]);
+                        plen += slen;
+
+                        let mut info = PortInfo::new(&pname[..plen], PortClass::Block);
+                        info.port_subclass = subclass;
+                        info.set_parent(port_name);
+                        info.set_block_metadata(BlockMetadata {
+                            size_bytes: p.sector_count * block_size as u64,
+                            sector_size: block_size,
+                            partition_index: i as u8,
+                            flags: 0,
+                            _reserved: [0; 10],
+                        });
+
+                        let _ = ctx.register_port_with_info(&info, provider_shmem_id);
+
+                        uinfo!("partd", "partition";
+                            idx = i as u32,
+                            mbr_type = p.partition_type as u32,
+                            start_lba = p.start_lba,
+                            sectors = p.sector_count);
+                    }
+                }
+            }
+            Err(_) => {
+                uerror!("partd", "dataport_create_failed";);
+            }
+        }
+
         Ok(())
     }
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         match msg.msg_type {
-            bus_msg::ATTACH_DISK => {
-                let shmem_id = msg.read_u32(0);
-                let block_size = msg.read_u32(4);
-                let _block_count = msg.read_u64(8);
-                // Source name starts at offset 16
-                let source_end = (msg.payload_len as usize).min(240);
-                let source_start = 16;
-                let source_name = if source_start < source_end {
-                    &msg.payload[source_start..source_end]
-                } else {
-                    &[]
-                };
-                let source_len = source_name.iter().position(|&b| b == 0).unwrap_or(source_name.len());
-
-                syscall::klog(LogLevel::Info, b"[partd] AttachDisk");
-
-                // Find an empty disk slot
-                let disk_idx = match self.disks.iter().position(|s| s.is_none()) {
-                    Some(i) => i,
-                    None => {
-                        uerror!("partd", "too_many_disks";);
-                        return Disposition::Handled;
-                    }
-                };
-
-                // Connect to disk DataPort
-                match ctx.connect_block_port(shmem_id) {
-                    Ok(port_id) => {
-                        let mut name = [0u8; 32];
-                        let copy_len = source_len.min(32);
-                        name[..copy_len].copy_from_slice(&source_name[..copy_len]);
-
-                        let mut bs = if block_size > 0 { block_size } else { 512 };
-
-                        // Query geometry
-                        if let Some(port) = ctx.block_port(port_id) {
-                            if let Some(geo) = port.query_geometry() {
-                                bs = geo.block_size;
-                            }
-                        }
-
-                        self.disks[disk_idx] = Some(DiskEntry {
-                            consumer_port: port_id,
-                            provider_port: None,
-                            block_size: bs,
-                            partitions: [PartitionInfo::empty(); MAX_PARTITIONS_PER_DISK],
-                            partition_count: 0,
-                            name,
-                            name_len: copy_len,
-                        });
-                        self.disk_count += 1;
-
-                        // Scan partitions
-                        let count = self.scan_partitions(disk_idx, ctx);
-
-                        if count > 0 {
-                            // Build partition info for devd
-                            let mut part_infos = [PartitionInfoMsg::new(); MAX_PARTITIONS_PER_DISK];
-                            if let Some(d) = &self.disks[disk_idx] {
-                                for i in 0..count {
-                                    let p = &d.partitions[i];
-                                    part_infos[i] = PartitionInfoMsg {
-                                        index: p.index,
-                                        part_type: p.partition_type,
-                                        bootable: 0,
-                                        _pad: 0,
-                                        start_lba: p.start_lba,
-                                        size_sectors: p.sector_count,
-                                        guid: [0; 16],
-                                        label: [0; 36],
-                                    };
-                                }
-                            }
-
-                            // Report to devd
-                            if let Err(_) = ctx.report_partitions(
-                                shmem_id,
-                                part_scheme::MBR,
-                                &part_infos[..count],
-                            ) {
-                                uerror!("partd", "report_failed";);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        uerror!("partd", "disk_connect_failed";);
-                    }
-                }
-
-                Disposition::Handled
-            }
-
-            bus_msg::REGISTER_PARTITION => {
-                let _index = msg.read_u8(0) as usize;
-                let name = msg.read_bytes(1, 32);
-                let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-                let part_name = &msg.payload[1..1 + name_len];
-
-                // Find the disk that has a partition at this index without a provider port yet.
-                // We look for the most recently added disk that needs a provider port for this
-                // partition index, since REGISTER_PARTITION arrives in order after REPORT_PARTITIONS.
-                let disk_idx = self.disks.iter().enumerate().rev()
-                    .find_map(|(i, slot)| {
-                        if let Some(d) = slot {
-                            if d.provider_port.is_none() && d.partition_count > 0 {
-                                return Some(i);
-                            }
-                        }
-                        None
-                    });
-
-                let disk_idx = match disk_idx {
-                    Some(i) => i,
-                    None => {
-                        uerror!("partd", "no_disk_for_partition";);
-                        return Disposition::Handled;
-                    }
-                };
-
-                // Create provider DataPort for this partition
-                let config = BlockPortConfig {
-                    ring_size: 64,
-                    side_size: 8,
-                    pool_size: 256 * 1024,
-                };
-
-                match ctx.create_block_port(config) {
-                    Ok(port_id) => {
-                        if let Some(port) = ctx.block_port(port_id) {
-                            port.set_public();
-                            let shmem_id = port.shmem_id();
-
-                            if let Some(d) = &mut self.disks[disk_idx] {
-                                d.provider_port = Some(port_id);
-                            }
-
-                            // Notify devd
-                            let _ = ctx.partition_ready(part_name, shmem_id);
-                        }
-                    }
-                    Err(_) => {
-                        uerror!("partd", "dataport_create_failed";);
-                    }
-                }
-
-                Disposition::Handled
-            }
-
             bus_msg::QUERY_INFO => {
                 let info = self.format_info();
                 let info_len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
@@ -1001,6 +973,27 @@ impl Driver for PartitionDriverWrapper {
 // =============================================================================
 // Helper Functions for Formatting
 // =============================================================================
+
+/// Map MBR partition type byte to port_subclass constant.
+fn mbr_type_to_subclass(mbr_type: u8) -> u16 {
+    match mbr_type {
+        0x01 => port_subclass::BLOCK_FAT12,
+        0x06 => port_subclass::BLOCK_FAT16,
+        0x0B => port_subclass::BLOCK_FAT32,
+        0x0C => port_subclass::BLOCK_FAT32_LBA,
+        0x83 => port_subclass::BLOCK_LINUX,
+        _ => 0,
+    }
+}
+
+/// Map MBR partition type byte to a short port name suffix.
+fn mbr_type_to_suffix(mbr_type: u8) -> &'static [u8] {
+    match mbr_type {
+        0x01 | 0x06 | 0x0B | 0x0C => b"fat",
+        0x83 => b"ext2",
+        _ => b"blk",
+    }
+}
 
 fn format_u32(buf: &mut [u8], val: u32) -> usize {
     if val == 0 {

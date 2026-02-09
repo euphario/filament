@@ -1447,20 +1447,20 @@ fn read_msi(m: &mut super::MsiObject, buf_ptr: u64, buf_len: usize) -> i64 {
 }
 
 fn read_bus_list(b: &mut super::BusListObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    use crate::kernel::bus::{BusInfo, get_bus_list, get_bus_count};
+    use crate::kernel::bus::{get_bus_list, get_bus_count};
 
     if buf_ptr == 0 {
         // Just return count
         return get_bus_count() as i64;
     }
 
-    let max = buf_len / core::mem::size_of::<BusInfo>();
+    let max = buf_len / core::mem::size_of::<abi::PortInfo>();
     if max == 0 {
         return 0;
     }
 
     // Create temporary buffer (max 16 buses)
-    let mut temp = [BusInfo::empty(); 16];
+    let mut temp = [abi::PortInfo::empty(); 16];
     let count = get_bus_list(&mut temp[..max.min(16)]);
 
     // Skip already-read entries
@@ -1473,7 +1473,7 @@ fn read_bus_list(b: &mut super::BusListObject, buf_ptr: u64, buf_len: usize) -> 
     let to_copy = remaining.min(max.min(16 - cursor));
 
     // Copy to userspace
-    let copy_size = to_copy * core::mem::size_of::<BusInfo>();
+    let copy_size = to_copy * core::mem::size_of::<abi::PortInfo>();
     let src_bytes = unsafe {
         core::slice::from_raw_parts(temp[cursor..].as_ptr() as *const u8, copy_size)
     };

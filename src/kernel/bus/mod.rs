@@ -494,11 +494,11 @@ pub fn process_bus_message(client_channel: ChannelId, data: &[u8]) {
 
 /// Get list of all buses for bus_list syscall
 /// Returns number of buses written to buffer
-pub fn get_bus_list(buf: &mut [BusInfo]) -> usize {
+pub fn get_bus_list(buf: &mut [abi::PortInfo]) -> usize {
     with_bus_registry(|registry| {
         let count = registry.bus_count.min(buf.len());
         for i in 0..count {
-            buf[i] = registry.buses[i].to_info();
+            buf[i] = registry.buses[i].to_port_info();
         }
         count
     })
