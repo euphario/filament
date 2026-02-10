@@ -26,9 +26,9 @@ fn panic(info: &PanicInfo) -> ! {
         );
     }
 
-    if let Some(message) = info.message().as_str() {
-        println_direct!("  message: {}", message);
-    }
+    // message() returns fmt::Arguments — as_str() only works for literals,
+    // so always use Display formatting to handle panic!("fmt {}", val)
+    println_direct!("  {}", info.message());
 
     println_direct!("====================");
     println_direct!();

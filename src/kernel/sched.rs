@@ -74,14 +74,11 @@ struct SwitchDecision {
     to_ttbr0: u64,
     /// Kernel stack top (virtual) for target task's SP_EL1
     to_kstack_top: u64,
-    /// Debug: from-task kernel stack base (virtual) for SP bounds check
-    #[cfg(debug_assertions)]
+    /// From-task kernel stack base (virtual) for SP bounds check and canary verify
     from_kstack_base: u64,
-    /// Debug: from-task kernel stack size for SP bounds check
-    #[cfg(debug_assertions)]
+    /// From-task kernel stack size for SP bounds check
     from_kstack_size: usize,
-    /// Debug: from-task has canary (not idle with static stack)
-    #[cfg(debug_assertions)]
+    /// From-task has canary (not idle with static stack)
     from_has_canary: bool,
 }
 
@@ -363,8 +360,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
             to_x30 = to_x30
         );
 
-        // Extract debug info for SP bounds check
-        #[cfg(debug_assertions)]
+        // Extract stack info for SP bounds check and canary verify
         let (from_kstack_base, from_kstack_size, from_has_canary) = sched.task(caller_slot)
             .map(|t| (
                 crate::kernel::arch::mmu::phys_to_virt(t.kernel_stack),
@@ -381,11 +377,8 @@ fn reschedule_inner(block: BlockReason) -> bool {
             to_trap_frame,
             to_ttbr0,
             to_kstack_top,
-            #[cfg(debug_assertions)]
             from_kstack_base,
-            #[cfg(debug_assertions)]
             from_kstack_size,
-            #[cfg(debug_assertions)]
             from_has_canary,
         })
     }; // LOCK RELEASED HERE
@@ -449,29 +442,30 @@ fn reschedule_inner(block: BlockReason) -> bool {
         return false;
     }
 
-    // Debug: verify from-task SP is within its kernel stack bounds
-    #[cfg(debug_assertions)]
-    if decision.from_kstack_base != 0 {
+    // Safety checks for tasks with dynamically allocated kernel stacks.
+    // Idle tasks (slot 0..MAX_CPUS-1) use static stacks and have kernel_stack == 0,
+    // so from_has_canary is false — skip them.
+    if decision.from_has_canary {
+        // Verify SP is within kernel stack bounds
         let from_sp = unsafe { (*decision.from_ctx).sp };
         let from_base = decision.from_kstack_base;
         let from_top = from_base + decision.from_kstack_size as u64;
-        debug_assert!(
-            from_sp >= from_base && from_sp <= from_top,
-            "from-task (slot {}) SP 0x{:x} outside stack [0x{:x}..0x{:x}]",
-            decision.from_slot, from_sp, from_base, from_top
-        );
-    }
+        if from_sp < from_base || from_sp > from_top {
+            panic!(
+                "from-task (slot {}) SP 0x{:x} outside stack [0x{:x}..0x{:x}]",
+                decision.from_slot, from_sp, from_base, from_top
+            );
+        }
 
-    // Debug: verify from-task stack canary is intact
-    #[cfg(debug_assertions)]
-    if decision.from_has_canary {
+        // Verify stack canary at bottom of stack is intact
         let canary_ptr = decision.from_kstack_base as *const u64;
         let canary = unsafe { core::ptr::read_volatile(canary_ptr) };
-        debug_assert!(
-            canary == task::STACK_CANARY,
-            "from-task (slot {}) stack canary corrupted: 0x{:x} (expected 0x{:x})",
-            decision.from_slot, canary, task::STACK_CANARY
-        );
+        if canary != task::STACK_CANARY {
+            panic!(
+                "from-task (slot {}) stack canary corrupted: 0x{:x} (expected 0x{:x})",
+                decision.from_slot, canary, task::STACK_CANARY
+            );
+        }
     }
 
     // Record which task needs finalization after context_switch.
