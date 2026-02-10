@@ -1040,6 +1040,7 @@ impl LayeredRing {
 
     /// Space available in SQ
     pub fn sq_space(&self) -> u32 {
+        if self.base().is_null() { return 0; }
         let h = self.header();
         let head = h.sq_head.load(Ordering::Acquire);
         let tail = h.sq_tail.load(Ordering::Relaxed);
@@ -1048,6 +1049,7 @@ impl LayeredRing {
 
     /// Submit a request
     pub fn sq_submit(&self, sqe: &IoSqe) -> bool {
+        if self.base().is_null() { return false; }
         let h = self.header();
         if self.sq_space() == 0 {
             return false;
@@ -1068,6 +1070,7 @@ impl LayeredRing {
 
     /// Pending SQ entries
     pub fn sq_pending(&self) -> u32 {
+        if self.base().is_null() { return 0; }
         let h = self.header();
         let head = h.sq_head.load(Ordering::Relaxed);
         let tail = h.sq_tail.load(Ordering::Acquire);
@@ -1076,6 +1079,7 @@ impl LayeredRing {
 
     /// Consume next SQ entry
     pub fn sq_consume(&self) -> Option<IoSqe> {
+        if self.base().is_null() { return None; }
         let h = self.header();
         if self.sq_pending() == 0 {
             return None;
@@ -1098,6 +1102,7 @@ impl LayeredRing {
 
     /// Post a completion. Returns false if CQ is full.
     pub fn cq_complete(&self, cqe: &IoCqe) -> bool {
+        if self.base().is_null() { return false; }
         let h = self.header();
         let tail = h.cq_tail.load(Ordering::Relaxed);
         let head = h.cq_head.load(Ordering::Acquire);
@@ -1122,6 +1127,7 @@ impl LayeredRing {
 
     /// Pending CQ entries
     pub fn cq_pending(&self) -> u32 {
+        if self.base().is_null() { return 0; }
         let h = self.header();
         let head = h.cq_head.load(Ordering::Relaxed);
         let tail = h.cq_tail.load(Ordering::Acquire);
@@ -1130,6 +1136,7 @@ impl LayeredRing {
 
     /// Consume next CQ entry
     pub fn cq_consume(&self) -> Option<IoCqe> {
+        if self.base().is_null() { return None; }
         let h = self.header();
         if self.cq_pending() == 0 {
             return None;
@@ -1152,11 +1159,13 @@ impl LayeredRing {
 
     /// Is sidechannel enabled?
     pub fn has_sidechannel(&self) -> bool {
+        if self.base().is_null() { return false; }
         self.header().side_size > 0
     }
 
     /// Space in sidechannel
     pub fn side_space(&self) -> u32 {
+        if self.base().is_null() { return 0; }
         let h = self.header();
         if h.side_size == 0 {
             return 0;
@@ -1168,6 +1177,7 @@ impl LayeredRing {
 
     /// Send sidechannel entry
     pub fn side_send(&self, entry: &SideEntry) -> bool {
+        if self.base().is_null() { return false; }
         let h = self.header();
         if h.side_size == 0 || self.side_space() == 0 {
             return false;
@@ -1188,6 +1198,7 @@ impl LayeredRing {
 
     /// Pending sidechannel entries
     pub fn side_pending(&self) -> u32 {
+        if self.base().is_null() { return 0; }
         let h = self.header();
         if h.side_size == 0 {
             return 0;
@@ -1199,6 +1210,7 @@ impl LayeredRing {
 
     /// Receive sidechannel entry (consumes it)
     pub fn side_recv(&self) -> Option<SideEntry> {
+        if self.base().is_null() { return None; }
         let h = self.header();
         if h.side_size == 0 || self.side_pending() == 0 {
             return None;
@@ -1219,6 +1231,7 @@ impl LayeredRing {
 
     /// Peek at next sidechannel entry without consuming
     pub fn side_peek(&self) -> Option<SideEntry> {
+        if self.base().is_null() { return None; }
         let h = self.header();
         if h.side_size == 0 || self.side_pending() == 0 {
             return None;
@@ -1241,22 +1254,26 @@ impl LayeredRing {
 
     /// Get data pool base pointer
     pub fn pool_ptr(&self) -> *mut u8 {
+        if self.base().is_null() { return core::ptr::null_mut(); }
         let h = self.header();
         unsafe { self.base().add(h.pool_offset as usize) }
     }
 
     /// Get data pool size
     pub fn pool_size(&self) -> u32 {
+        if self.base().is_null() { return 0; }
         self.header().pool_size
     }
 
     /// Get data pool physical address (for DMA)
     pub fn pool_phys(&self) -> u64 {
+        if self.base().is_null() { return 0; }
         self.shmem.paddr() + self.header().pool_offset as u64
     }
 
     /// Get slice at offset in pool
     pub fn pool_slice(&self, offset: u32, len: u32) -> Option<&[u8]> {
+        if self.base().is_null() { return None; }
         let h = self.header();
         let end = offset.checked_add(len)?;
         if end > h.pool_size {
@@ -1272,6 +1289,7 @@ impl LayeredRing {
 
     /// Get mutable slice at offset in pool
     pub fn pool_slice_mut(&self, offset: u32, len: u32) -> Option<&mut [u8]> {
+        if self.base().is_null() { return None; }
         let h = self.header();
         let end = offset.checked_add(len)?;
         if end > h.pool_size {

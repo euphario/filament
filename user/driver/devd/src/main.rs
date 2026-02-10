@@ -31,11 +31,11 @@ mod query;
 mod rules;
 
 use userlib::syscall;
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, uwarn, uerror};
 use userlib::ipc::{Port, Timer, EventLoop, ObjHandle};
 use userlib::error::{SysError, SysResult};
 use userlib::query::{
-    QueryHeader, msg,
+    QueryHeader, SpawnChildContext, msg,
 };
 
 use service::{
@@ -81,12 +81,58 @@ const MAX_SPAWN_CONTEXTS: usize = 32;
 const MAX_INFLIGHT_SPAWNS: usize = 8;
 
 /// Spawn context entry - maps child PID to trigger port
+
+/// Max context key-value pairs per spawn
+const MAX_CONTEXT_KV: usize = 4;
+/// Max key length for context KV
+const MAX_CONTEXT_KEY: usize = 32;
+/// Max value length for context KV
+const MAX_CONTEXT_VALUE: usize = 64;
+
+/// A single context key-value pair stored with spawn context
 #[derive(Clone, Copy)]
+struct ContextKv {
+    key: [u8; MAX_CONTEXT_KEY],
+    key_len: u8,
+    value: [u8; MAX_CONTEXT_VALUE],
+    value_len: u8,
+}
+
+impl ContextKv {
+    const fn empty() -> Self {
+        Self {
+            key: [0u8; MAX_CONTEXT_KEY],
+            key_len: 0,
+            value: [0u8; MAX_CONTEXT_VALUE],
+            value_len: 0,
+        }
+    }
+
+    fn set(&mut self, key: &[u8], value: &[u8]) {
+        let klen = key.len().min(MAX_CONTEXT_KEY);
+        self.key[..klen].copy_from_slice(&key[..klen]);
+        self.key_len = klen as u8;
+        let vlen = value.len().min(MAX_CONTEXT_VALUE);
+        self.value[..vlen].copy_from_slice(&value[..vlen]);
+        self.value_len = vlen as u8;
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.key[..self.key_len as usize]
+    }
+
+    fn value(&self) -> &[u8] {
+        &self.value[..self.value_len as usize]
+    }
+}
+
 struct SpawnContext {
     /// Child process PID (0 = empty slot)
     pid: u32,
     /// Port type that triggered spawn
     port_type: u8,
+    /// Port ID of the trigger port (monotonic, from port registry)
+    trigger_port_id: u8,
     /// Trigger port name
     port_name: [u8; 32],
     /// Length of port name
@@ -95,6 +141,10 @@ struct SpawnContext {
     metadata: [u8; 64],
     /// Length of metadata
     metadata_len: u8,
+    /// Context key-value pairs from rule template expansion
+    context_kv: [ContextKv; MAX_CONTEXT_KV],
+    /// Number of context KV pairs
+    context_kv_count: u8,
 }
 
 impl SpawnContext {
@@ -102,12 +152,92 @@ impl SpawnContext {
         Self {
             pid: 0,
             port_type: 0,
+            trigger_port_id: 0xFF,
             port_name: [0u8; 32],
             port_name_len: 0,
             metadata: [0u8; 64],
             metadata_len: 0,
+            context_kv: [const { ContextKv::empty() }; MAX_CONTEXT_KV],
+            context_kv_count: 0,
         }
     }
+}
+
+/// Lookup table for template expansion: up to 4 key→value pairs.
+struct TemplateLookup {
+    keys: [[u8; 16]; 4],
+    key_lens: [u8; 4],
+    values: [[u8; 32]; 4],
+    value_lens: [u8; 4],
+    count: usize,
+}
+
+impl TemplateLookup {
+    fn new() -> Self {
+        Self {
+            keys: [[0u8; 16]; 4],
+            key_lens: [0; 4],
+            values: [[0u8; 32]; 4],
+            value_lens: [0; 4],
+            count: 0,
+        }
+    }
+
+    fn add(&mut self, key: &[u8], value: &[u8]) {
+        if self.count >= 4 { return; }
+        let kl = key.len().min(16);
+        self.keys[self.count][..kl].copy_from_slice(&key[..kl]);
+        self.key_lens[self.count] = kl as u8;
+        let vl = value.len().min(32);
+        self.values[self.count][..vl].copy_from_slice(&value[..vl]);
+        self.value_lens[self.count] = vl as u8;
+        self.count += 1;
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        for i in 0..self.count {
+            if &self.keys[i][..self.key_lens[i] as usize] == key {
+                return Some(&self.values[i][..self.value_lens[i] as usize]);
+            }
+        }
+        None
+    }
+}
+
+/// Expand a template string containing `{key}` placeholders.
+///
+/// Looks up keys against the provided lookup table.
+/// Returns the number of bytes written to `out`.
+fn expand_template(template: &[u8], out: &mut [u8], lookup: &TemplateLookup) -> usize {
+    let mut wi = 0; // write index into out
+    let mut ri = 0; // read index into template
+
+    while ri < template.len() && wi < out.len() {
+        if template[ri] == b'{' {
+            // Find matching '}'
+            if let Some(close) = template[ri + 1..].iter().position(|&b| b == b'}') {
+                let key = &template[ri + 1..ri + 1 + close];
+                if let Some(val) = lookup.get(key) {
+                    let copy_len = val.len().min(out.len() - wi);
+                    out[wi..wi + copy_len].copy_from_slice(&val[..copy_len]);
+                    wi += copy_len;
+                }
+                // Skip past the closing '}'
+                ri += 1 + close + 1;
+            } else {
+                // No matching '}' — copy the '{' literally
+                out[wi] = template[ri];
+                wi += 1;
+                ri += 1;
+            }
+        } else {
+            out[wi] = template[ri];
+            wi += 1;
+            ri += 1;
+        }
+    }
+
+    wi
 }
 
 /// In-flight spawn tracking - maps seq_id to port info for SPAWN_ACK
@@ -117,6 +247,8 @@ struct InflightSpawn {
     seq_id: u32,
     /// Port type that triggered spawn
     port_type: u8,
+    /// Port ID of the trigger port (monotonic, from port registry)
+    trigger_port_id: u8,
     /// Trigger port name
     port_name: [u8; 32],
     /// Length of port name
@@ -131,6 +263,9 @@ struct InflightSpawn {
     caps: u64,
     /// Link ID tying spawn to port (carried through to service slot)
     link_id: u32,
+    /// Context KV pairs from rule expansion (carried through SPAWN_ACK)
+    context_kv: [ContextKv; MAX_CONTEXT_KV],
+    context_kv_count: u8,
 }
 
 impl InflightSpawn {
@@ -138,6 +273,7 @@ impl InflightSpawn {
         Self {
             seq_id: 0,
             port_type: 0,
+            trigger_port_id: 0xFF,
             port_name: [0u8; 32],
             port_name_len: 0,
             binary_name: [0u8; 16],
@@ -145,6 +281,8 @@ impl InflightSpawn {
             service_idx: 0xFF,
             caps: 0,
             link_id: 0,
+            context_kv: [const { ContextKv::empty() }; MAX_CONTEXT_KV],
+            context_kv_count: 0,
         }
     }
 }
@@ -329,6 +467,9 @@ pub struct Devd {
     live_logging: bool,
     /// Next link ID for port↔service pairing (0 = sentinel, starts at 1)
     next_link_id: u32,
+    /// Pending context KV pairs for next spawn (set by check_class_rules, consumed by spawn_service)
+    pending_context_kvs: [ContextKv; MAX_CONTEXT_KV],
+    pending_context_kv_count: u8,
 }
 
 impl Devd {
@@ -348,6 +489,8 @@ impl Devd {
             log_buffer: LogBuffer::new(),
             live_logging: false, // Off during boot, enable after all services ready
             next_link_id: 1,
+            pending_context_kvs: [const { ContextKv::empty() }; MAX_CONTEXT_KV],
+            pending_context_kv_count: 0,
         }
     }
 
@@ -387,7 +530,9 @@ impl Devd {
 
         // Register devd's service port in the port registry
         let devd_info = abi::PortInfo::new(b"devd-query:", abi::PortClass::Service);
-        let _ = self.ports.register_with_port_info(&devd_info, 0xFF, 0);
+        if let Err(e) = self.ports.register_with_port_info(&devd_info, 0xFF, 0) {
+            uerror!("devd", "port_reg_failed"; name = "devd-query:", err = e.to_errno());
+        }
 
         // Discover kernel buses — rules fire on Ready, spawning bus drivers
         self.discover_kernel_buses();
@@ -431,7 +576,11 @@ impl Devd {
             }
 
             // Register in devd's port registry (owner = 0xFF = devd/kernel)
-            let _ = self.ports.register_with_port_info(port_info, 0xFF, 0);
+            if let Err(e) = self.ports.register_with_port_info(port_info, 0xFF, 0) {
+                uerror!("devd", "bus_port_reg_failed";
+                    name = core::str::from_utf8(path).unwrap_or("?"), err = e.to_errno());
+                continue;
+            }
 
             uinfo!("devd", "bus_port_registered";
                 name = core::str::from_utf8(path).unwrap_or("?"),
@@ -440,10 +589,14 @@ impl Devd {
 
             // Set port to Claimed — kernel bus ports are managed by the kernel,
             // so they're immediately available. Fire rules on the transition.
-            let _ = self.ports.set_state(path, abi::PortState::Claimed);
+            let pid = self.ports.get_port_id(path).unwrap_or(0xFF);
+            if self.ports.set_state(path, abi::PortState::Claimed).is_none() {
+                uwarn!("devd", "bus_port_state_failed";
+                    name = core::str::from_utf8(path).unwrap_or("?"));
+            }
 
             // Fire rules on the Claimed transition
-            self.check_class_rules(port_info, 0xFF);
+            self.check_class_rules(port_info, 0xFF, pid);
         }
     }
 
@@ -493,8 +646,9 @@ impl Devd {
         // Bus-framework drivers query GET_SPAWN_CONTEXT on startup; without an
         // entry they crash.
         let trigger_port = &trigger_port_buf[..trigger_port_len];
-        let (port_type, metadata_buf, metadata_len) = if trigger_port_len > 0 {
+        let (port_type, metadata_buf, metadata_len, trig_port_id) = if trigger_port_len > 0 {
             let pt = self.ports.get_port_type(trigger_port).unwrap_or(0);
+            let pid_val = self.ports.get_port_id(trigger_port).unwrap_or(0xFF);
             let md: ([u8; 64], usize) = self.ports.get(trigger_port)
                 .map(|p| {
                     let m = p.metadata();
@@ -504,15 +658,29 @@ impl Devd {
                     (buf, len)
                 })
                 .unwrap_or(([0u8; 64], 0));
-            (pt, md.0, md.1)
+            (pt, md.0, md.1, pid_val)
         } else {
-            (0u8, [0u8; 64], 0usize)
+            (0u8, [0u8; 64], 0usize, 0xFF)
         };
-        self.store_spawn_context(pid, port_type, trigger_port, &metadata_buf[..metadata_len]);
+        // Store spawn context with any pending context KV pairs from rule expansion
+        // Copy out of self to avoid borrow conflict
+        let kv_count = self.pending_context_kv_count as usize;
+        let pending_kvs = self.pending_context_kvs;
+        self.pending_context_kv_count = 0;
+        let mut kv_refs: [(&[u8], &[u8]); MAX_CONTEXT_KV] = [(&[], &[]); MAX_CONTEXT_KV];
+        for i in 0..kv_count {
+            kv_refs[i] = (pending_kvs[i].key(), pending_kvs[i].value());
+        }
+        self.store_spawn_context_with_kv(
+            pid, port_type, trigger_port, &metadata_buf[..metadata_len], trig_port_id,
+            &kv_refs[..kv_count],
+        );
 
         // Watch the process
         if let Some(events) = &mut self.events {
-            let _ = events.watch(watcher.handle());
+            if events.watch(watcher.handle()).is_err() {
+                uwarn!("devd", "watcher_watch_failed"; pid = pid);
+            }
         }
 
         // Update service state
@@ -692,7 +860,9 @@ impl Devd {
                     let deadline_ns = (backoff_ms as u64) * 1_000_000;
                     if timer.set(deadline_ns).is_ok() {
                         if let Some(events) = &mut self.events {
-                            let _ = events.watch(timer.handle());
+                            if events.watch(timer.handle()).is_err() {
+                                uwarn!("devd", "restart_timer_watch_failed"; idx = idx as u32);
+                            }
                         }
                         if let Some(service) = self.services.get_mut(idx) {
                             service.restart_timer = Some(timer);
@@ -705,7 +875,9 @@ impl Devd {
                     let deadline_ns = FAILED_RETRY_MS * 1_000_000;
                     if timer.set(deadline_ns).is_ok() {
                         if let Some(events) = &mut self.events {
-                            let _ = events.watch(timer.handle());
+                            if events.watch(timer.handle()).is_err() {
+                                uwarn!("devd", "restart_timer_watch_failed"; idx = idx as u32);
+                            }
                         }
                         if let Some(service) = self.services.get_mut(idx) {
                             service.restart_timer = Some(timer);
@@ -1041,7 +1213,8 @@ impl Devd {
                     if owner != 0xFF {
                         if let Some(port) = self.ports.get(tp_name) {
                             let info = *port.port_info();
-                            self.check_class_rules(&info, owner);
+                            let pid = port.port_id();
+                            self.check_class_rules(&info, owner, pid);
                             return;
                         }
                     }
@@ -1145,11 +1318,11 @@ impl Devd {
                         // we don't depend on fitting the handle into the Mux.
                         self.try_immediate_query_read(slot);
 
-                        // Add to event loop for future messages (best-effort —
-                        // may fail if Mux is full, but clients use non-blocking
-                        // recv with polling to avoid deadlock in that case)
+                        // Add to event loop for future messages
                         if let Some(events) = &mut self.events {
-                            let _ = events.watch(ch_handle);
+                            if events.watch(ch_handle).is_err() {
+                                uwarn!("devd", "query_watch_failed"; pid = client_pid);
+                            }
                         }
                     }
                     None => {
@@ -1392,25 +1565,22 @@ impl Devd {
             // Ports were registered during reset() but held in Initialize state
             // until the driver reports Ready.
             let owner_idx = driver_idx as u8;
-            let mut ready_ports: [([u8; 32], usize); 8] = [([0u8; 32], 0); 8];
+            let mut ready_port_ids: [u8; 8] = [0xFF; 8];
             let mut ready_count = 0usize;
             self.ports.for_each(|port| {
                 if port.owner() == owner_idx && port.state() != abi::PortState::Claimed && ready_count < 8 {
-                    let mut name = [0u8; 32];
-                    let n = port.name();
-                    let len = n.len().min(32);
-                    name[..len].copy_from_slice(&n[..len]);
-                    ready_ports[ready_count] = (name, len);
+                    ready_port_ids[ready_count] = port.port_id();
                     ready_count += 1;
                 }
             });
             for i in 0..ready_count {
-                let (name, len) = &ready_ports[i];
-                let port_name = &name[..*len];
-                let _ = self.ports.set_state(port_name, abi::PortState::Claimed);
-                if let Some(port) = self.ports.get(port_name) {
+                let pid = ready_port_ids[i];
+                if self.ports.set_state_by_id(pid, abi::PortState::Claimed).is_none() {
+                    uwarn!("devd", "port_claim_failed"; port_id = pid as u32);
+                }
+                if let Some(port) = self.ports.get_by_id(pid) {
                     let info = *port.port_info();
-                    self.check_class_rules(&info, owner_idx);
+                    self.check_class_rules(&info, owner_idx, pid);
                 }
             }
         }
@@ -1418,7 +1588,8 @@ impl Devd {
 
     /// Handle GET_SPAWN_CONTEXT message from a child driver
     ///
-    /// Returns the port name that triggered this driver's spawn.
+    /// Returns the port name that triggered this driver's spawn,
+    /// plus any context key-value pairs from rule template expansion.
     fn handle_get_spawn_context(&mut self, slot: usize, buf: &[u8]) {
         use userlib::query::{QueryHeader, SpawnContextResponse, error};
 
@@ -1439,11 +1610,22 @@ impl Devd {
             }
         };
 
-        // Look up spawn context for this PID
-        let mut response_buf = [0u8; 256];
-        let resp_len = if let Some((port_type, port_name, metadata)) = self.get_spawn_context(client_pid) {
-            let resp = SpawnContextResponse::new(header.seq_id, error::OK, port_type);
-            resp.write_to_with_metadata(&mut response_buf, port_name, metadata)
+        // Look up spawn context for this PID (including context KV pairs)
+        let mut response_buf = [0u8; 512];
+        let resp_len = if let Some(spawn_ctx) = self.get_spawn_context_full(client_pid) {
+            let mut resp = SpawnContextResponse::new(header.seq_id, error::OK, spawn_ctx.port_type);
+            resp.port_id = spawn_ctx.trigger_port_id;
+            let port_name = &spawn_ctx.port_name[..spawn_ctx.port_name_len as usize];
+            let metadata = &spawn_ctx.metadata[..spawn_ctx.metadata_len as usize];
+
+            // Build context KV slice for serialization
+            let kv_count = spawn_ctx.context_kv_count as usize;
+            let mut kv_refs: [(&[u8], &[u8]); MAX_CONTEXT_KV] = [(&[], &[]); MAX_CONTEXT_KV];
+            for i in 0..kv_count {
+                kv_refs[i] = (spawn_ctx.context_kv[i].key(), spawn_ctx.context_kv[i].value());
+            }
+
+            resp.write_to_full(&mut response_buf, port_name, metadata, &kv_refs[..kv_count])
                 .unwrap_or(SpawnContextResponse::HEADER_SIZE)
         } else {
             // No context available - return error
@@ -1459,6 +1641,10 @@ impl Devd {
     }
 
     /// Handle QUERY_PORT message - returns port info including shmem_id
+    ///
+    /// Supports two lookup modes:
+    /// - port_id != 0xFF: lookup by port_id (unambiguous, for same-name ports)
+    /// - port_id == 0xFF: lookup by name (legacy/default)
     fn handle_query_port(&mut self, slot: usize, buf: &[u8]) {
         use userlib::query::{QueryPort, PortInfoResponse, port_flags, error};
 
@@ -1472,8 +1658,14 @@ impl Devd {
 
         let seq_id = query.header.seq_id;
 
-        // Look up the port
-        let resp = if let Some(port) = self.ports.get(port_name) {
+        // Look up the port — by port_id if specified, else by name
+        let port = if query.port_id != 0xFF {
+            self.ports.get_by_id(query.port_id)
+        } else {
+            self.ports.get(port_name)
+        };
+
+        let resp = if let Some(port) = port {
             // Get owner PID from service index
             let owner_pid = self.services.get(port.owner() as usize)
                 .map(|s| s.pid)
@@ -1585,7 +1777,9 @@ impl Devd {
         };
 
         // Get port info before state change (for rule checking)
+        // Get port info + port_id before state change (for rule checking)
         let port_info = self.ports.get(port_name).map(|p| *p.port_info());
+        let port_id = self.ports.get_port_id(port_name).unwrap_or(0xFF);
         let owner_idx = self.ports.find_owner(port_name);
 
         // Update the port's state
@@ -1613,7 +1807,7 @@ impl Devd {
         // If owning driver is still Ready, transition Safe → Claimed and re-fire rules.
         if result_code == error::OK && new_state == abi::PortState::Safe {
             // Mark services bound to this port (by link_id) as Stopped
-            let port_link_id = self.ports.get(port_name)
+            let port_link_id = self.ports.get_by_id(port_id)
                 .map(|p| p.child_link_id())
                 .unwrap_or(0);
             if port_link_id != 0 {
@@ -1630,9 +1824,11 @@ impl Devd {
                 .map(|s| s.state == service::ServiceState::Ready)
                 .unwrap_or(false);
             if driver_ready {
-                let _ = self.ports.set_state(port_name, abi::PortState::Claimed);
+                if self.ports.set_state_by_id(port_id, abi::PortState::Claimed).is_none() {
+                    uwarn!("devd", "port_reclaim_failed"; port_id = port_id as u32);
+                }
                 if let (Some(info), Some(owner)) = (port_info, owner_idx) {
-                    self.check_class_rules(&info, owner);
+                    self.check_class_rules(&info, owner, port_id);
                 }
             }
         }
@@ -1643,7 +1839,7 @@ impl Devd {
             && old_state != Some(abi::PortState::Claimed)
         {
             if let (Some(info), Some(owner)) = (port_info, owner_idx) {
-                self.check_class_rules(&info, owner);
+                self.check_class_rules(&info, owner, port_id);
             }
         }
     }
@@ -1706,17 +1902,19 @@ impl Devd {
             }
 
             // Build entry
-            let mut name = [0u8; 20];
+            let mut name = [0u8; 18];
             let name_bytes = port.name();
-            let name_len = name_bytes.len().min(20);
+            let name_len = name_bytes.len().min(18);
             name[..name_len].copy_from_slice(&name_bytes[..name_len]);
 
             let entry = PortEntry {
                 name,
+                port_id: port.port_id(),
                 port_type: port.port_type(),
                 flags,
                 owner_idx: port.owner(),
-                parent_idx: 0xFF,
+                parent_idx: port.parent_port_id(),
+                _pad: 0,
                 shmem_id: port.shmem_id(),
                 owner_pid,
             };
@@ -2116,7 +2314,7 @@ impl Devd {
         let spawn_ctx = self.consume_inflight_spawn(seq_id);
 
         if spawn_count == 0 || result < 0 {
-            if let Some((_, _, _, _, _, service_idx, _, _)) = spawn_ctx {
+            if let Some((_, _, _, _, _, service_idx, _, _, _)) = spawn_ctx {
                 if service_idx != 0xFF {
                     let now = Self::now_ms();
                     self.services.transition(service_idx as usize, ServiceState::Failed { code: result as i32 }, now);
@@ -2126,7 +2324,7 @@ impl Devd {
         }
 
         // Check if this is a service spawn (parent-delegated)
-        if let Some((port_type, port_name, port_name_len, _, _, service_idx, spawn_caps, link_id)) = spawn_ctx {
+        if let Some((port_type, port_name, port_name_len, _, _, service_idx, spawn_caps, link_id, trig_port_id)) = spawn_ctx {
             if service_idx != 0xFF && spawn_count >= 1 {
                 let child_pid = pids[0];
                 let now = Self::now_ms();
@@ -2148,7 +2346,19 @@ impl Devd {
                             (buf, len)
                         })
                         .unwrap_or(([0u8; 64], 0));
-                    self.store_spawn_context(child_pid, port_type, pname, &metadata.0[..metadata.1]);
+                    // Use pending context KVs (moved from inflight spawn by consume_inflight_spawn)
+                    // Copy out of self to avoid borrow conflict
+                    let kv_count = self.pending_context_kv_count as usize;
+                    let pending_kvs = self.pending_context_kvs;
+                    self.pending_context_kv_count = 0;
+                    let mut kv_refs: [(&[u8], &[u8]); MAX_CONTEXT_KV] = [(&[], &[]); MAX_CONTEXT_KV];
+                    for i in 0..kv_count {
+                        kv_refs[i] = (pending_kvs[i].key(), pending_kvs[i].value());
+                    }
+                    self.store_spawn_context_with_kv(
+                        child_pid, port_type, pname, &metadata.0[..metadata.1], trig_port_id,
+                        &kv_refs[..kv_count],
+                    );
                 }
                 self.query_handler.upgrade_to_managed(child_pid, service_idx);
                 return;
@@ -2157,13 +2367,13 @@ impl Devd {
 
         // Extract binary name, caps, and link_id from spawn context (for dynamic spawns)
         let binary_name: &[u8] = spawn_ctx.as_ref()
-            .map(|(_, _, _, bin, bin_len, _, _, _)| &bin[..*bin_len as usize])
+            .map(|(_, _, _, bin, bin_len, _, _, _, _)| &bin[..*bin_len as usize])
             .unwrap_or(b"???");
         let spawn_caps: u64 = spawn_ctx.as_ref()
-            .map(|(_, _, _, _, _, _, caps, _)| *caps)
+            .map(|(_, _, _, _, _, _, caps, _, _)| *caps)
             .unwrap_or(0);
         let spawn_link_id: u32 = spawn_ctx.as_ref()
-            .map(|(_, _, _, _, _, _, _, lid)| *lid)
+            .map(|(_, _, _, _, _, _, _, lid, _)| *lid)
             .unwrap_or(0);
 
         // Create or reuse service slots for each spawned child
@@ -2208,7 +2418,7 @@ impl Devd {
             };
 
             // Store trigger_port, caps, and link_id on the service slot (for restart)
-            if let Some((_, port_name, port_name_len, _, _, _, _, link_id)) = spawn_ctx {
+            if let Some((_, port_name, port_name_len, _, _, _, _, link_id, _)) = spawn_ctx {
                 let pname = &port_name[..port_name_len as usize];
                 if let Some(service) = self.services.get_mut(slot_idx) {
                     service.set_trigger_port(pname);
@@ -2222,7 +2432,7 @@ impl Devd {
 
             // Store spawn context (port that triggered spawn) for GET_SPAWN_CONTEXT
             // Include metadata from the port registration (e.g., BAR0 info)
-            if let Some((port_type, port_name, port_name_len, _, _, _, _, _)) = spawn_ctx {
+            if let Some((port_type, port_name, port_name_len, _, _, _, _, _, trig_port_id)) = spawn_ctx {
                 let pname = &port_name[..port_name_len as usize];
                 // Look up metadata from the registered port
                 let metadata: ([u8; 64], usize) = self.ports.get(pname)
@@ -2234,7 +2444,7 @@ impl Devd {
                         (buf, len)
                     })
                     .unwrap_or(([0u8; 64], 0));
-                self.store_spawn_context(child_pid, port_type, pname, &metadata.0[..metadata.1]);
+                self.store_spawn_context(child_pid, port_type, pname, &metadata.0[..metadata.1], trig_port_id);
             }
 
             // Upgrade any already-connected client with this PID to driver status
@@ -2301,16 +2511,15 @@ impl Devd {
     /// For kernel bus ports (owner=0xFF): devd spawns directly.
     /// For driver-owned ports: devd sends SPAWN_CHILD to the owning driver,
     /// which spawns the child as its own child process.
-    fn check_class_rules(&mut self, port_info: &abi::PortInfo, owner_idx: u8) {
+    fn check_class_rules(&mut self, port_info: &abi::PortInfo, owner_idx: u8, port_id: u8) {
         let rule = match rules::find_port_rule(port_info) {
             Some(r) => r,
             None => return,
         };
 
         // Guard: don't spawn if a running service is already bound to this port.
-        // Match by link_id from the port, not by trigger_port string.
-        let port_name = port_info.name_bytes();
-        let port_link_id = self.ports.get(port_name)
+        // Use port_id for unambiguous lookup (two ports can share a name).
+        let port_link_id = self.ports.get_by_id(port_id)
             .map(|p| p.child_link_id())
             .unwrap_or(0);
         let mut existing_idx: Option<usize> = None;
@@ -2338,8 +2547,9 @@ impl Devd {
         }
 
         // Allocate a link_id for this port↔service pairing
+        let port_name = port_info.name_bytes();
         let link_id = self.alloc_link_id();
-        if let Some(port) = self.ports.get_mut(port_name) {
+        if let Some(port) = self.ports.get_mut_by_id(port_id) {
             port.set_child_link_id(link_id);
         }
 
@@ -2349,14 +2559,69 @@ impl Devd {
             driver = rule.driver
         );
 
+        // Expand rule context templates (if any)
+        self.pending_context_kv_count = 0;
+        if !rule.context.is_empty() {
+            // Build lookup table for template expansion
+            let mut lookup = TemplateLookup::new();
+            lookup.add(b"trigger.name", port_info.name_bytes());
+
+            let parent_port_id = port_info.parent_port_id;
+            if parent_port_id != 0xFF {
+                if let Some(parent) = self.ports.get_by_id(parent_port_id) {
+                    lookup.add(b"block.name", parent.name());
+                }
+            }
+
+            let count = rule.context.len().min(MAX_CONTEXT_KV);
+            for i in 0..count {
+                let (key, template) = rule.context[i];
+                let mut value_buf = [0u8; MAX_CONTEXT_VALUE];
+                let value_len = expand_template(template.as_bytes(), &mut value_buf, &lookup);
+                self.pending_context_kvs[i].set(key.as_bytes(), &value_buf[..value_len]);
+            }
+            self.pending_context_kv_count = count as u8;
+        }
+
         if owner_idx != 0xFF {
             // Driver-owned port: delegate spawn to the owning driver.
             // The child becomes the driver's child, not devd's.
-            let port_type = self.ports.get_port_type(port_name).unwrap_or(0);
-            if let Some(seq_id) = self.query_handler.send_spawn_child_with_caps(
-                owner_idx, rule.driver.as_bytes(), port_name, rule.caps,
+            // Build context so parent can answer GET_SPAWN_CONTEXT locally.
+            let port_type = self.ports.get_by_id(port_id)
+                .map(|p| p.port_type())
+                .unwrap_or(0);
+            let shmem_id = self.ports.get_by_id(port_id)
+                .map(|p| p.shmem_id())
+                .unwrap_or(0);
+            let mut spawn_ctx = SpawnChildContext::empty();
+            spawn_ctx.port_type = port_type;
+            spawn_ctx.port_id = port_id;
+            spawn_ctx.shmem_id = shmem_id;
+            // Copy metadata from port
+            if let Some(p) = self.ports.get_by_id(port_id) {
+                let m = p.metadata();
+                let mlen = m.len().min(64);
+                spawn_ctx.metadata[..mlen].copy_from_slice(&m[..mlen]);
+                spawn_ctx.metadata_len = mlen as u8;
+            }
+            // Copy pending context KVs
+            let kv_n = (self.pending_context_kv_count as usize).min(4);
+            for i in 0..kv_n {
+                let k = self.pending_context_kvs[i].key();
+                let v = self.pending_context_kvs[i].value();
+                let klen = k.len().min(32);
+                spawn_ctx.kv_keys[i][..klen].copy_from_slice(&k[..klen]);
+                spawn_ctx.kv_keys_len[i] = klen as u8;
+                let vlen = v.len().min(64);
+                spawn_ctx.kv_values[i][..vlen].copy_from_slice(&v[..vlen]);
+                spawn_ctx.kv_values_len[i] = vlen as u8;
+            }
+            spawn_ctx.kv_count = kv_n as u8;
+
+            if let Some(seq_id) = self.query_handler.send_spawn_child_with_context(
+                owner_idx, rule.driver.as_bytes(), port_name, rule.caps, Some(&spawn_ctx),
             ) {
-                self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver, rule.caps, link_id);
+                self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver, rule.caps, link_id, port_id);
             } else {
                 uerror!("devd", "spawn_child_send_failed"; driver = rule.driver, owner = owner_idx as u32);
             }
@@ -2396,6 +2661,7 @@ impl Devd {
         // Include metadata from port registration (e.g., BAR0 info)
         if !trigger_port.is_empty() {
             let port_type = self.ports.get_port_type(trigger_port).unwrap_or(0);
+            let trig_port_id = self.ports.get_port_id(trigger_port).unwrap_or(0xFF);
             let metadata: ([u8; 64], usize) = self.ports.get(trigger_port)
                 .map(|p| {
                     let m = p.metadata();
@@ -2405,7 +2671,7 @@ impl Devd {
                     (buf, len)
                 })
                 .unwrap_or(([0u8; 64], 0));
-            self.store_spawn_context(pid, port_type, trigger_port, &metadata.0[..metadata.1]);
+            self.store_spawn_context(pid, port_type, trigger_port, &metadata.0[..metadata.1], trig_port_id);
         }
 
         // Create service slot using create_dynamic_service (which actually creates the entry)
@@ -2426,14 +2692,18 @@ impl Devd {
             if let Some(events) = &mut self.events {
                 if let Some(service) = self.services.get(idx) {
                     if let Some(w) = &service.watcher {
-                        let _ = events.watch(w.handle());
+                        if events.watch(w.handle()).is_err() {
+                            uwarn!("devd", "dyn_watcher_failed"; pid = pid);
+                        }
                     }
                 }
             }
         } else {
-            // No slot available
+            // No slot available — still try to watch so we see the exit
             if let Some(events) = &mut self.events {
-                let _ = events.watch(watcher.handle());
+                if events.watch(watcher.handle()).is_err() {
+                    uwarn!("devd", "orphan_watcher_failed"; pid = pid);
+                }
             }
             uerror!("devd", "no_dynamic_slot"; pid = pid);
         }
@@ -2477,12 +2747,13 @@ impl Devd {
     // =========================================================================
 
     /// Track an in-flight spawn command (seq_id -> port info + binary name + caps)
-    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8], binary: &str, caps: u64, link_id: u32) {
+    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8], binary: &str, caps: u64, link_id: u32, trigger_port_id: u8) {
         // Find empty slot
         for entry in &mut self.inflight_spawns {
             if entry.seq_id == 0 {
                 entry.seq_id = seq_id;
                 entry.port_type = port_type;
+                entry.trigger_port_id = trigger_port_id;
                 let len = port_name.len().min(32);
                 entry.port_name[..len].copy_from_slice(&port_name[..len]);
                 entry.port_name_len = len as u8;
@@ -2492,19 +2763,34 @@ impl Devd {
                 entry.service_idx = 0xFF;  // Not a service spawn
                 entry.caps = caps;
                 entry.link_id = link_id;
+                // Copy pending context KVs
+                let kv_count = self.pending_context_kv_count as usize;
+                for i in 0..kv_count {
+                    entry.context_kv[i] = self.pending_context_kvs[i];
+                }
+                entry.context_kv_count = self.pending_context_kv_count;
+                self.pending_context_kv_count = 0;
                 return;
             }
         }
     }
 
-    /// Consume an in-flight spawn by seq_id
-    /// Returns (port_type, port_name, port_len, binary_name, binary_len, service_idx, caps, link_id)
-    fn consume_inflight_spawn(&mut self, seq_id: u32) -> Option<(u8, [u8; 32], u8, [u8; 16], u8, u8, u64, u32)> {
+    /// Consume an in-flight spawn by seq_id.
+    ///
+    /// Returns (port_type, port_name, port_len, binary_name, binary_len, service_idx, caps, link_id, trigger_port_id).
+    /// Any context KV pairs from the inflight spawn are moved to `pending_context_kvs`.
+    fn consume_inflight_spawn(&mut self, seq_id: u32) -> Option<(u8, [u8; 32], u8, [u8; 16], u8, u8, u64, u32, u8)> {
         for entry in &mut self.inflight_spawns {
             if entry.seq_id == seq_id {
                 let result = (entry.port_type, entry.port_name, entry.port_name_len,
                               entry.binary_name, entry.binary_name_len, entry.service_idx,
-                              entry.caps, entry.link_id);
+                              entry.caps, entry.link_id, entry.trigger_port_id);
+                // Move context KVs to pending
+                let kv_count = entry.context_kv_count as usize;
+                for i in 0..kv_count {
+                    self.pending_context_kvs[i] = entry.context_kv[i];
+                }
+                self.pending_context_kv_count = entry.context_kv_count;
                 *entry = InflightSpawn::empty();
                 return Some(result);
             }
@@ -2513,7 +2799,20 @@ impl Devd {
     }
 
     /// Store spawn context for a child PID (with optional metadata from port registration)
-    fn store_spawn_context(&mut self, pid: u32, port_type: u8, port_name: &[u8], metadata: &[u8]) {
+    fn store_spawn_context(&mut self, pid: u32, port_type: u8, port_name: &[u8], metadata: &[u8], trigger_port_id: u8) {
+        self.store_spawn_context_with_kv(pid, port_type, port_name, metadata, trigger_port_id, &[]);
+    }
+
+    /// Store spawn context with context key-value pairs from rule template expansion
+    fn store_spawn_context_with_kv(
+        &mut self,
+        pid: u32,
+        port_type: u8,
+        port_name: &[u8],
+        metadata: &[u8],
+        trigger_port_id: u8,
+        context_kvs: &[(&[u8], &[u8])],
+    ) {
         // Find empty slot or oldest entry
         let mut empty_slot = None;
         for (i, entry) in self.spawn_contexts.iter_mut().enumerate() {
@@ -2524,28 +2823,44 @@ impl Devd {
         }
 
         let slot = empty_slot.unwrap_or(0); // Overwrite first slot if full
+        self.spawn_contexts[slot] = SpawnContext::empty();
         self.spawn_contexts[slot].pid = pid;
         self.spawn_contexts[slot].port_type = port_type;
+        self.spawn_contexts[slot].trigger_port_id = trigger_port_id;
         let len = port_name.len().min(32);
         self.spawn_contexts[slot].port_name[..len].copy_from_slice(&port_name[..len]);
         self.spawn_contexts[slot].port_name_len = len as u8;
         let meta_len = metadata.len().min(64);
         self.spawn_contexts[slot].metadata[..meta_len].copy_from_slice(&metadata[..meta_len]);
         self.spawn_contexts[slot].metadata_len = meta_len as u8;
+
+        // Store context KV pairs
+        let kv_count = context_kvs.len().min(MAX_CONTEXT_KV);
+        for (i, (key, value)) in context_kvs[..kv_count].iter().enumerate() {
+            self.spawn_contexts[slot].context_kv[i].set(key, value);
+        }
+        self.spawn_contexts[slot].context_kv_count = kv_count as u8;
     }
 
     /// Get spawn context for a PID
-    fn get_spawn_context(&self, pid: u32) -> Option<(u8, &[u8], &[u8])> {
+    /// Returns (port_type, port_name, metadata, trigger_port_id)
+    fn get_spawn_context(&self, pid: u32) -> Option<(u8, &[u8], &[u8], u8)> {
         for entry in &self.spawn_contexts {
             if entry.pid == pid {
                 return Some((
                     entry.port_type,
                     &entry.port_name[..entry.port_name_len as usize],
                     &entry.metadata[..entry.metadata_len as usize],
+                    entry.trigger_port_id,
                 ));
             }
         }
         None
+    }
+
+    /// Get full spawn context for a PID, including context KV pairs
+    fn get_spawn_context_full(&self, pid: u32) -> Option<&SpawnContext> {
+        self.spawn_contexts.iter().find(|e| e.pid == pid)
     }
 
     /// Remove spawn context for a PID (when process exits)

@@ -236,6 +236,20 @@ pub fn poll(channel_id: ChannelId, caller: u32, filter: WakeReason) -> Result<bo
     with_channel_table(|table| table.poll(channel_id, caller, filter))
 }
 
+/// Transfer ownership of a channel from one task to another
+pub fn transfer_channel_owner(channel_id: ChannelId, old_owner: u32, new_owner: u32) -> Result<(), IpcError> {
+    with_channel_table(|table| table.transfer_owner(channel_id, old_owner, new_owner))
+}
+
+/// Update peer_owner on the peer of a transferred channel.
+///
+/// After transferring channel_id to new_owner, the peer channel still has
+/// the old peer_owner in its Open state. This function fixes the peer's
+/// peer_owner so that send() returns correct PeerInfo for deferred wake.
+pub fn update_peer_owner(channel_id: ChannelId, new_peer_owner: u32) -> Result<(), IpcError> {
+    with_channel_table(|table| table.update_peer_owner(channel_id, new_peer_owner))
+}
+
 /// Clean up all channels owned by a task
 pub fn cleanup_task(task_id: u32) -> PeerInfoList {
     with_channel_table(|table| table.cleanup_task(task_id))

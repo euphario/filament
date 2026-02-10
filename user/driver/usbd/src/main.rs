@@ -857,7 +857,10 @@ impl QemuUsbDriver {
                         // For IN transfers, copy data to caller's buffer
                         if has_data && is_in {
                             if let Some(buf) = data_buf {
-                                let copy_len = buf.len().min(data_len);
+                                // Read residual from xHCI event (same as bulk_transfer)
+                                let residual = (evt.status & 0xFFFFFF) as usize;
+                                let transferred = data_len.saturating_sub(residual);
+                                let copy_len = buf.len().min(transferred);
                                 unsafe {
                                     core::ptr::copy_nonoverlapping(scratch_vaddr as *const u8, buf.as_mut_ptr(), copy_len);
                                 }
@@ -909,10 +912,23 @@ impl QemuUsbDriver {
         );
 
         let mut header = [0u8; 9];
-        self.control_transfer(slot_id, &setup, Some(&mut header))?;
+        let header_len = self.control_transfer(slot_id, &setup, Some(&mut header))?;
+
+        // Need at least 4 bytes to read wTotalLength
+        if header_len < 4 {
+            log("[qemu-usbd] Config descriptor header too short");
+            return None;
+        }
 
         // Get total length from config descriptor
         let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+
+        // Sanity: config descriptor must be at least 9 bytes
+        if total_len < 9 {
+            log("[qemu-usbd] Config descriptor total_len too small");
+            return None;
+        }
+
         let fetch_len = total_len.min(buf.len());
 
         // Now fetch the full descriptor

@@ -4,6 +4,13 @@
 
 #![no_std]
 
+extern crate alloc;
+
+pub mod allocator;
+
+#[global_allocator]
+static ALLOCATOR: allocator::FilamentAlloc = allocator::FilamentAlloc::new();
+
 pub mod error;
 pub mod syscall;
 pub mod ipc;

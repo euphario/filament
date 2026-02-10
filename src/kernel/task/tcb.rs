@@ -948,15 +948,18 @@ impl Task {
         self.capabilities.bits()
     }
 
-    /// Get activity age in milliseconds since last syscall
-    /// Returns 0 if no activity recorded yet
+    /// Get activity age in milliseconds since last syscall.
+    /// `current_counter` must be a raw hardware counter value (same units as last_activity_tick).
     #[inline]
-    pub fn get_activity_age_ms(&self, current_tick: u64) -> u32 {
+    pub fn get_activity_age_ms(&self, current_counter: u64) -> u32 {
         if self.last_activity_tick == 0 {
             0
         } else {
-            let age_ticks = current_tick.saturating_sub(self.last_activity_tick);
-            (age_ticks * 10) as u32  // 10ms per tick
+            let delta = current_counter.saturating_sub(self.last_activity_tick);
+            let freq = crate::platform::current::timer::frequency();
+            if freq == 0 { return 0; }
+            // delta * 1000 / freq — safe for up to ~9 years at 62.5MHz
+            (delta * 1000 / freq) as u32
         }
     }
 

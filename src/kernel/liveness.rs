@@ -202,7 +202,9 @@ pub fn check_liveness(current_tick: u64) -> usize {
         let mut actions = 0usize;
 
         // Collect slots that need to be woken (can't call wake_task during iteration)
-        let mut wake_slots: [Option<usize>; 8] = [None; 8];
+        // Must be >= max sleeping EventLoop tasks; 8 was too small for 9+ sleepers,
+        // causing the last task in iteration order to get PingSent but never woken.
+        let mut wake_slots: [Option<usize>; 16] = [None; 16];
         let mut wake_count = 0usize;
 
         for (slot, task_opt) in sched.iter_tasks_mut() {

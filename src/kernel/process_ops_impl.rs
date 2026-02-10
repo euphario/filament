@@ -200,7 +200,7 @@ impl ProcessOps for KernelProcessOps {
                     break;
                 }
                 if let Some(task) = task_opt {
-                    let current_tick = crate::platform::current::timer::logical_ticks();
+                    let current_tick = crate::platform::current::timer::counter();
                     buf[count] = abi::ProcessInfo {
                         pid: task.id,
                         ppid: task.parent_id,
@@ -238,6 +238,18 @@ impl ProcessOps for KernelProcessOps {
             SpawnSource::PathWithCaps(path, caps) => {
                 let kernel_caps = Capabilities::from_bits(caps.bits());
                 match elf::spawn_from_path_with_caps_find(path, parent, kernel_caps) {
+                    Ok((child_id, _)) => Ok(child_id),
+                    Err(elf::ElfError::NotExecutable) => Err(ProcessError::InvalidElf),
+                    Err(elf::ElfError::BadMagic) => Err(ProcessError::InvalidElf),
+                    Err(elf::ElfError::WrongArch) => Err(ProcessError::InvalidElf),
+                    Err(elf::ElfError::Not64Bit) => Err(ProcessError::InvalidElf),
+                    Err(elf::ElfError::NotLittleEndian) => Err(ProcessError::InvalidElf),
+                    Err(_) => Err(ProcessError::NoSlots),
+                }
+            }
+            SpawnSource::PathWithCapsAndChannel(path, caps, channel_handle) => {
+                let kernel_caps = Capabilities::from_bits(caps.bits());
+                match elf::spawn_from_path_with_caps_and_channel(path, parent, kernel_caps, channel_handle) {
                     Ok((child_id, _)) => Ok(child_id),
                     Err(elf::ElfError::NotExecutable) => Err(ProcessError::InvalidElf),
                     Err(elf::ElfError::BadMagic) => Err(ProcessError::InvalidElf),

@@ -372,8 +372,10 @@ pub struct SpawnContextResponse {
     pub port_name_len: u8,
     /// Length of metadata
     pub metadata_len: u8,
-    pub _pad: u8,
-    // Followed by: port_name bytes, then metadata bytes
+    /// Port ID of the trigger port (monotonic, from port registry)
+    pub port_id: u8,
+    // Followed by: port_name bytes, then metadata bytes,
+    // then context_kv_count (u8), then KV entries (each: key_len(u8) + key + value_len(u8) + value)
 }
 
 impl SpawnContextResponse {
@@ -387,7 +389,7 @@ impl SpawnContextResponse {
             port_type,
             port_name_len: 0,
             metadata_len: 0,
-            _pad: 0,
+            port_id: 0xFF,
         }
     }
 
@@ -396,10 +398,28 @@ impl SpawnContextResponse {
     }
 
     pub fn write_to_with_metadata(&self, buf: &mut [u8], port_name: &[u8], metadata: &[u8]) -> Option<usize> {
+        self.write_to_full(buf, port_name, metadata, &[])
+    }
+
+    /// Serialize with port name, metadata, and context key-value pairs.
+    ///
+    /// KV pairs are appended as: kv_count(u8) + (key_len(u8) + key + value_len(u8) + value)*
+    pub fn write_to_full(
+        &self,
+        buf: &mut [u8],
+        port_name: &[u8],
+        metadata: &[u8],
+        context_kvs: &[(&[u8], &[u8])],
+    ) -> Option<usize> {
         if port_name.len() > 255 || metadata.len() > 255 {
             return None;
         }
-        let total = Self::HEADER_SIZE + port_name.len() + metadata.len();
+        // Calculate total size: header + port_name + metadata + kv_count + kv entries
+        let mut kv_size = 1; // kv_count byte
+        for (k, v) in context_kvs {
+            kv_size += 1 + k.len() + 1 + v.len(); // key_len + key + value_len + value
+        }
+        let total = Self::HEADER_SIZE + port_name.len() + metadata.len() + kv_size;
         if buf.len() < total {
             return None;
         }
@@ -408,13 +428,32 @@ impl SpawnContextResponse {
         buf[12] = self.port_type;
         buf[13] = port_name.len() as u8;
         buf[14] = metadata.len() as u8;
-        buf[15] = 0;
+        buf[15] = self.port_id;
         buf[16..16 + port_name.len()].copy_from_slice(port_name);
         let meta_start = 16 + port_name.len();
         buf[meta_start..meta_start + metadata.len()].copy_from_slice(metadata);
+
+        // Append context KV pairs
+        let mut pos = meta_start + metadata.len();
+        buf[pos] = context_kvs.len() as u8;
+        pos += 1;
+        for (k, v) in context_kvs {
+            buf[pos] = k.len() as u8;
+            pos += 1;
+            buf[pos..pos + k.len()].copy_from_slice(k);
+            pos += k.len();
+            buf[pos] = v.len() as u8;
+            pos += 1;
+            buf[pos..pos + v.len()].copy_from_slice(v);
+            pos += v.len();
+        }
+
         Some(total)
     }
 
+    /// Parse header, port_name, and metadata from bytes.
+    ///
+    /// Context KV pairs (if present) can be parsed separately via `parse_context_kvs()`.
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8], &[u8])> {
         if buf.len() < Self::HEADER_SIZE {
             return None;
@@ -424,6 +463,7 @@ impl SpawnContextResponse {
         let port_type = buf[12];
         let port_name_len = buf[13] as usize;
         let metadata_len = buf[14] as usize;
+        let port_id = buf[15];
 
         let total = Self::HEADER_SIZE + port_name_len + metadata_len;
         if buf.len() < total {
@@ -436,12 +476,79 @@ impl SpawnContextResponse {
             port_type,
             port_name_len: port_name_len as u8,
             metadata_len: metadata_len as u8,
-            _pad: 0,
+            port_id,
         };
         let port_name = &buf[Self::HEADER_SIZE..Self::HEADER_SIZE + port_name_len];
         let meta_start = Self::HEADER_SIZE + port_name_len;
         let metadata = &buf[meta_start..meta_start + metadata_len];
         Some((resp, port_name, metadata))
+    }
+
+    /// Parse context key-value pairs from the trailing bytes of a spawn context response.
+    ///
+    /// Call after `from_bytes()`. `buf` is the full message buffer.
+    /// Returns a small fixed-size array of (key, value) pairs.
+    pub fn parse_context_kvs(buf: &[u8], port_name_len: usize, metadata_len: usize)
+        -> ([([u8; 32], u8, [u8; 64], u8); 4], usize)
+    {
+        let mut result = [([0u8; 32], 0u8, [0u8; 64], 0u8); 4];
+        let kv_start = Self::HEADER_SIZE + port_name_len + metadata_len;
+        if buf.len() <= kv_start {
+            return (result, 0);
+        }
+        let kv_count = buf[kv_start] as usize;
+        let count = kv_count.min(4);
+        let mut pos = kv_start + 1;
+        for i in 0..count {
+            if pos >= buf.len() { return (result, i); }
+            let key_len = buf[pos] as usize;
+            pos += 1;
+            if pos + key_len > buf.len() { return (result, i); }
+            let kl = key_len.min(32);
+            result[i].0[..kl].copy_from_slice(&buf[pos..pos + kl]);
+            result[i].1 = kl as u8;
+            pos += key_len;
+            if pos >= buf.len() { return (result, i); }
+            let value_len = buf[pos] as usize;
+            pos += 1;
+            if pos + value_len > buf.len() { return (result, i); }
+            let vl = value_len.min(64);
+            result[i].2[..vl].copy_from_slice(&buf[pos..pos + vl]);
+            result[i].3 = vl as u8;
+            pos += value_len;
+        }
+        (result, count)
+    }
+
+    /// Parse trailing shmem_id appended after the KV section by parent relay.
+    ///
+    /// The parent relay appends 4 bytes of shmem_id (LE) after the standard
+    /// SpawnContextResponse + KV data. Root-mode devd responses omit this,
+    /// so returns 0 if there aren't enough trailing bytes.
+    pub fn parse_trailing_shmem_id(buf: &[u8], port_name_len: usize, metadata_len: usize) -> u32 {
+        let kv_start = Self::HEADER_SIZE + port_name_len + metadata_len;
+        if buf.len() <= kv_start {
+            return 0;
+        }
+        let kv_count = buf[kv_start] as usize;
+        let count = kv_count.min(4);
+        let mut pos = kv_start + 1;
+        for _ in 0..count {
+            if pos >= buf.len() { return 0; }
+            let key_len = buf[pos] as usize;
+            pos += 1;
+            pos += key_len;
+            if pos >= buf.len() { return 0; }
+            let value_len = buf[pos] as usize;
+            pos += 1;
+            pos += value_len;
+        }
+        // pos now points past KV section — check for 4-byte shmem_id
+        if pos + 4 <= buf.len() {
+            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+        } else {
+            0
+        }
     }
 }
 
@@ -449,17 +556,22 @@ impl SpawnContextResponse {
 // Port Query Messages (client → devd)
 // =============================================================================
 
-/// Query port information by name
+/// Query port information by name or port_id
 ///
 /// Allows consumers to discover DataPort shmem_id for a named port.
 /// This replaces hardcoded shmem_id constants in drivers.
+///
+/// When `port_id != 0xFF`, devd uses port_id for lookup (unambiguous).
+/// Otherwise falls back to name-based lookup.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct QueryPort {
     pub header: QueryHeader,
     /// Length of port name
     pub name_len: u8,
-    pub _pad: [u8; 3],
+    /// Port ID hint (0xFF = use name-based lookup)
+    pub port_id: u8,
+    pub _pad: [u8; 2],
     // Followed by: port name bytes
 }
 
@@ -470,7 +582,18 @@ impl QueryPort {
         Self {
             header: QueryHeader::new(msg::QUERY_PORT, seq_id),
             name_len: 0,
-            _pad: [0; 3],
+            port_id: 0xFF,
+            _pad: [0; 2],
+        }
+    }
+
+    /// Create a query that looks up by port_id (unambiguous)
+    pub fn by_id(seq_id: u32, port_id: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::QUERY_PORT, seq_id),
+            name_len: 0,
+            port_id,
+            _pad: [0; 2],
         }
     }
 
@@ -483,7 +606,8 @@ impl QueryPort {
 
         buf[0..8].copy_from_slice(&self.header.to_bytes());
         buf[8] = name.len() as u8;
-        buf[9..12].copy_from_slice(&[0, 0, 0]);
+        buf[9] = self.port_id;
+        buf[10..12].copy_from_slice(&[0, 0]);
         buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
 
         Some(total_len)
@@ -497,6 +621,7 @@ impl QueryPort {
 
         let header = QueryHeader::from_bytes(buf)?;
         let name_len = buf[8] as usize;
+        let port_id = buf[9];
 
         let total_len = Self::FIXED_SIZE + name_len;
         if buf.len() < total_len {
@@ -509,7 +634,8 @@ impl QueryPort {
             Self {
                 header,
                 name_len: name_len as u8,
-                _pad: [0; 3],
+                port_id,
+                _pad: [0; 2],
             },
             name,
         ))
@@ -884,6 +1010,53 @@ impl PortFilter {
 }
 
 // =============================================================================
+// Spawn Child Context (embedded in SPAWN_CHILD message)
+// =============================================================================
+
+/// Context data embedded in a SPAWN_CHILD command so the parent driver
+/// can answer GET_SPAWN_CONTEXT locally without querying devd.
+#[derive(Clone, Copy)]
+pub struct SpawnChildContext {
+    /// Port type of the trigger port
+    pub port_type: u8,
+    /// Port ID of the trigger port
+    pub port_id: u8,
+    /// Length of metadata bytes
+    pub metadata_len: u8,
+    /// Number of context KV pairs
+    pub kv_count: u8,
+    /// Shared memory ID for the trigger port's DataPort
+    pub shmem_id: u32,
+    /// Metadata bytes from port registration
+    pub metadata: [u8; 64],
+    /// Context key names
+    pub kv_keys: [[u8; 32]; 4],
+    /// Context key name lengths
+    pub kv_keys_len: [u8; 4],
+    /// Context values
+    pub kv_values: [[u8; 64]; 4],
+    /// Context value lengths
+    pub kv_values_len: [u8; 4],
+}
+
+impl SpawnChildContext {
+    pub const fn empty() -> Self {
+        Self {
+            port_type: 0,
+            port_id: 0xFF,
+            metadata_len: 0,
+            kv_count: 0,
+            shmem_id: 0,
+            metadata: [0u8; 64],
+            kv_keys: [[0u8; 32]; 4],
+            kv_keys_len: [0u8; 4],
+            kv_values: [[0u8; 64]; 4],
+            kv_values_len: [0u8; 4],
+        }
+    }
+}
+
+// =============================================================================
 // Spawn Child Command
 // =============================================================================
 
@@ -896,7 +1069,14 @@ impl PortFilter {
 /// - Filter "part0:" (exact) → spawn 1 child for that port
 /// - Filter "*.Partition" (by_type) → spawn N children for all partition ports
 ///
-/// Variable-length: header + fixed fields + binary_name + filter
+/// Variable-length: header + fixed fields + binary_name + filter + context
+///
+/// When `context_len > 0`, a context section follows the filter:
+/// ```text
+/// context_section: port_type(1) port_id(1) metadata_len(1) kv_count(1) shmem_id(4)
+///                  metadata(metadata_len bytes)
+///                  kv_entries: (key_len(1) + key + value_len(1) + value) * kv_count
+/// ```
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct SpawnChild {
@@ -905,10 +1085,12 @@ pub struct SpawnChild {
     pub binary_len: u8,
     /// Length of filter (PortFilter + pattern)
     pub filter_len: u8,
-    pub _pad: [u8; 2],
+    /// Length of context section (0 = no context)
+    pub context_len: u8,
+    pub _pad: u8,
     /// Capability bits for spawned child (0 = inherit parent's)
     pub caps: u64,
-    // Followed by: binary name bytes, then PortFilter + pattern
+    // Followed by: binary name bytes, then PortFilter + pattern, then context section
 }
 
 impl SpawnChild {
@@ -919,7 +1101,8 @@ impl SpawnChild {
             header: QueryHeader::new(msg::SPAWN_CHILD, seq_id),
             binary_len: 0,
             filter_len: 0,
-            _pad: [0; 2],
+            context_len: 0,
+            _pad: 0,
             caps: 0,
         }
     }
@@ -929,7 +1112,8 @@ impl SpawnChild {
             header: QueryHeader::new(msg::SPAWN_CHILD, seq_id),
             binary_len: 0,
             filter_len: 0,
-            _pad: [0; 2],
+            context_len: 0,
+            _pad: 0,
             caps,
         }
     }
@@ -973,7 +1157,7 @@ impl SpawnChild {
         buf[0..8].copy_from_slice(&self.header.to_bytes());
         buf[8] = binary.len() as u8;
         buf[9] = filter_total as u8;
-        buf[10] = 0;
+        buf[10] = self.context_len;
         buf[11] = 0;
         buf[12..20].copy_from_slice(&self.caps.to_le_bytes());
 
@@ -986,12 +1170,85 @@ impl SpawnChild {
         Some(total_len)
     }
 
+    /// Serialize to buffer with filter and context section.
+    ///
+    /// Context section layout:
+    /// ```text
+    /// port_type(1) port_id(1) metadata_len(1) kv_count(1) shmem_id(4)
+    /// metadata(metadata_len bytes)
+    /// kv_entries: (key_len(1) + key + value_len(1) + value) * kv_count
+    /// ```
+    pub fn write_to_with_context(
+        &self,
+        buf: &mut [u8],
+        binary: &[u8],
+        filter: &PortFilter,
+        pattern: &[u8],
+        ctx: &SpawnChildContext,
+    ) -> Option<usize> {
+        // Calculate context section size
+        let mut ctx_size: usize = 8; // port_type + port_id + metadata_len + kv_count + shmem_id
+        ctx_size += ctx.metadata_len as usize;
+        for i in 0..ctx.kv_count as usize {
+            ctx_size += 1 + ctx.kv_keys_len[i] as usize + 1 + ctx.kv_values_len[i] as usize;
+        }
+        if ctx_size > 255 { return None; }
+
+        let filter_total = PortFilter::FIXED_SIZE + pattern.len();
+        let total_len = Self::FIXED_SIZE + binary.len() + filter_total + ctx_size;
+        if buf.len() < total_len || binary.len() > 255 || filter_total > 255 {
+            return None;
+        }
+
+        buf[0..8].copy_from_slice(&self.header.to_bytes());
+        buf[8] = binary.len() as u8;
+        buf[9] = filter_total as u8;
+        buf[10] = ctx_size as u8;
+        buf[11] = 0;
+        buf[12..20].copy_from_slice(&self.caps.to_le_bytes());
+
+        let binary_start = Self::FIXED_SIZE;
+        buf[binary_start..binary_start + binary.len()].copy_from_slice(binary);
+
+        let filter_start = binary_start + binary.len();
+        filter.write_to(&mut buf[filter_start..], pattern)?;
+
+        // Write context section
+        let ctx_start = filter_start + filter_total;
+        buf[ctx_start] = ctx.port_type;
+        buf[ctx_start + 1] = ctx.port_id;
+        buf[ctx_start + 2] = ctx.metadata_len;
+        buf[ctx_start + 3] = ctx.kv_count;
+        buf[ctx_start + 4..ctx_start + 8].copy_from_slice(&ctx.shmem_id.to_le_bytes());
+        let mut pos = ctx_start + 8;
+        let mlen = ctx.metadata_len as usize;
+        buf[pos..pos + mlen].copy_from_slice(&ctx.metadata[..mlen]);
+        pos += mlen;
+        for i in 0..ctx.kv_count as usize {
+            let klen = ctx.kv_keys_len[i] as usize;
+            buf[pos] = klen as u8;
+            pos += 1;
+            buf[pos..pos + klen].copy_from_slice(&ctx.kv_keys[i][..klen]);
+            pos += klen;
+            let vlen = ctx.kv_values_len[i] as usize;
+            buf[pos] = vlen as u8;
+            pos += 1;
+            buf[pos..pos + vlen].copy_from_slice(&ctx.kv_values[i][..vlen]);
+            pos += vlen;
+        }
+
+        Some(total_len)
+    }
+
     /// Legacy: Serialize with port name (backwards compat, uses exact filter)
     pub fn write_to(&self, buf: &mut [u8], binary: &[u8], trigger_port: &[u8]) -> Option<usize> {
         self.write_exact(buf, binary, trigger_port)
     }
 
-    /// Parse from buffer
+    /// Parse from buffer.
+    ///
+    /// Returns (header, binary_name, filter_bytes). Use `parse_context()` to
+    /// extract the optional context section.
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8], &[u8])> {
         if buf.len() < Self::FIXED_SIZE {
             return None;
@@ -1000,8 +1257,9 @@ impl SpawnChild {
         let header = QueryHeader::from_bytes(buf)?;
         let binary_len = buf[8] as usize;
         let filter_len = buf[9] as usize;
+        let context_len = buf[10] as usize;
 
-        let total_len = Self::FIXED_SIZE + binary_len + filter_len;
+        let total_len = Self::FIXED_SIZE + binary_len + filter_len + context_len;
         if buf.len() < total_len {
             return None;
         }
@@ -1025,12 +1283,73 @@ impl SpawnChild {
                 header,
                 binary_len: binary_len as u8,
                 filter_len: filter_len as u8,
-                _pad: [0; 2],
+                context_len: context_len as u8,
+                _pad: 0,
                 caps,
             },
             binary,
             filter_bytes,
         ))
+    }
+
+    /// Parse the context section from a SPAWN_CHILD message buffer.
+    ///
+    /// Call after `from_bytes()`. Returns None if context_len == 0.
+    pub fn parse_context(buf: &[u8]) -> Option<SpawnChildContext> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let binary_len = buf[8] as usize;
+        let filter_len = buf[9] as usize;
+        let context_len = buf[10] as usize;
+        if context_len == 0 {
+            return None;
+        }
+        let ctx_start = Self::FIXED_SIZE + binary_len + filter_len;
+        if buf.len() < ctx_start + context_len || context_len < 8 {
+            return None;
+        }
+        let ctx = &buf[ctx_start..ctx_start + context_len];
+        let port_type = ctx[0];
+        let port_id = ctx[1];
+        let metadata_len = ctx[2];
+        let kv_count = ctx[3];
+        let shmem_id = u32::from_le_bytes([ctx[4], ctx[5], ctx[6], ctx[7]]);
+
+        let mut result = SpawnChildContext {
+            port_type, port_id, metadata_len, kv_count, shmem_id,
+            metadata: [0u8; 64],
+            kv_keys: [[0u8; 32]; 4],
+            kv_keys_len: [0u8; 4],
+            kv_values: [[0u8; 64]; 4],
+            kv_values_len: [0u8; 4],
+        };
+
+        let mut pos = 8;
+        let mlen = (metadata_len as usize).min(64);
+        if pos + mlen > context_len { return None; }
+        result.metadata[..mlen].copy_from_slice(&ctx[pos..pos + mlen]);
+        pos += mlen;
+
+        let kv_n = (kv_count as usize).min(4);
+        for i in 0..kv_n {
+            if pos >= context_len { break; }
+            let klen = (ctx[pos] as usize).min(32);
+            pos += 1;
+            if pos + klen > context_len { break; }
+            result.kv_keys[i][..klen].copy_from_slice(&ctx[pos..pos + klen]);
+            result.kv_keys_len[i] = klen as u8;
+            pos += klen;
+            if pos >= context_len { break; }
+            let vlen = (ctx[pos] as usize).min(64);
+            pos += 1;
+            if pos + vlen > context_len { break; }
+            result.kv_values[i][..vlen].copy_from_slice(&ctx[pos..pos + vlen]);
+            result.kv_values_len[i] = vlen as u8;
+            pos += vlen;
+        }
+
+        Some(result)
     }
 
     /// Parse the filter from raw filter bytes
@@ -1276,15 +1595,19 @@ impl ListServices {
 #[derive(Clone, Copy, Debug)]
 pub struct PortEntry {
     /// Port name (null-padded)
-    pub name: [u8; 20],
+    pub name: [u8; 18],
+    /// Monotonic port ID (assigned at registration)
+    pub port_id: u8,
     /// Port type (see `port_type` module)
     pub port_type: u8,
     /// Port flags (see `port_flags` module)
     pub flags: u8,
     /// Owner service index (0xFF = devd itself)
     pub owner_idx: u8,
-    /// Parent port index (0xFF = no parent / root)
+    /// Parent port ID (0xFF = no parent / root)
     pub parent_idx: u8,
+    /// Reserved padding
+    pub _pad: u8,
     /// DataPort shared memory ID (0 if no DataPort)
     pub shmem_id: u32,
     /// Owner process PID
@@ -1296,11 +1619,13 @@ impl PortEntry {
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0..20].copy_from_slice(&self.name);
-        buf[20] = self.port_type;
-        buf[21] = self.flags;
-        buf[22] = self.owner_idx;
-        buf[23] = self.parent_idx;
+        buf[0..18].copy_from_slice(&self.name);
+        buf[18] = self.port_id;
+        buf[19] = self.port_type;
+        buf[20] = self.flags;
+        buf[21] = self.owner_idx;
+        buf[22] = self.parent_idx;
+        buf[23] = self._pad;
         buf[24..28].copy_from_slice(&self.shmem_id.to_le_bytes());
         buf[28..32].copy_from_slice(&self.owner_pid.to_le_bytes());
         buf
@@ -1310,14 +1635,16 @@ impl PortEntry {
         if buf.len() < Self::SIZE {
             return None;
         }
-        let mut name = [0u8; 20];
-        name.copy_from_slice(&buf[0..20]);
+        let mut name = [0u8; 18];
+        name.copy_from_slice(&buf[0..18]);
         Some(Self {
             name,
-            port_type: buf[20],
-            flags: buf[21],
-            owner_idx: buf[22],
-            parent_idx: buf[23],
+            port_id: buf[18],
+            port_type: buf[19],
+            flags: buf[20],
+            owner_idx: buf[21],
+            parent_idx: buf[22],
+            _pad: buf[23],
             shmem_id: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
             owner_pid: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
         })
@@ -1325,7 +1652,7 @@ impl PortEntry {
 
     /// Get port name as slice (up to null terminator)
     pub fn name_str(&self) -> &[u8] {
-        let len = self.name.iter().position(|&b| b == 0).unwrap_or(20);
+        let len = self.name.iter().position(|&b| b == 0).unwrap_or(18);
         &self.name[..len]
     }
 }

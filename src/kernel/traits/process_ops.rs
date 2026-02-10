@@ -20,6 +20,8 @@ pub enum SpawnSource<'a> {
     PathWithCaps(&'a str, Capabilities),
     /// Spawn from ELF data in memory (sys_exec_mem)
     Memory(&'a [u8], &'a str),
+    /// Spawn by ramfs path with caps, transferring a channel handle to child (sys_exec_with_channel)
+    PathWithCapsAndChannel(&'a str, Capabilities, u32),
 }
 
 /// Result of waiting for a child process

@@ -7,6 +7,7 @@ use userlib::ipc::Channel;
 use userlib::query::{
     QueryHeader, ErrorResponse,
     PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
+    SpawnChildContext,
     msg, error,
 };
 
@@ -164,7 +165,10 @@ impl QueryHandler {
     ) {
         let resp = PortRegisterResponse::new(seq_id, result);
         if let Some(client) = self.get_mut(slot) {
-            let _ = client.channel.send(&resp.to_bytes());
+            if client.channel.send(&resp.to_bytes()).is_err() {
+                userlib::syscall::klog(userlib::syscall::LogLevel::Warn,
+                    b"[devd] port_reg_resp send failed");
+            }
         }
     }
 
@@ -249,6 +253,21 @@ impl QueryHandler {
         trigger_port: &[u8],
         caps: u64,
     ) -> Option<u32> {
+        self.send_spawn_child_with_context(service_idx, binary, trigger_port, caps, None)
+    }
+
+    /// Send a SPAWN_CHILD command to a driver with capabilities and context.
+    ///
+    /// When `ctx` is Some, the context section is appended to the message
+    /// so the parent driver can answer GET_SPAWN_CONTEXT locally.
+    pub fn send_spawn_child_with_context(
+        &mut self,
+        service_idx: u8,
+        binary: &[u8],
+        trigger_port: &[u8],
+        caps: u64,
+        ctx: Option<&SpawnChildContext>,
+    ) -> Option<u32> {
         let slot = self.find_by_service_idx(service_idx)?;
         let client = self.clients[slot].as_mut()?;
 
@@ -264,8 +283,14 @@ impl QueryHandler {
         };
 
         let cmd = SpawnChild::with_caps(seq_id, caps);
-        let mut buf = [0u8; 256];
-        let len = cmd.write_to(&mut buf, binary, trigger_port)?;
+        let mut buf = [0u8; 512];
+
+        let len = if let Some(context) = ctx {
+            let (filter, pattern) = userlib::query::PortFilter::exact(trigger_port);
+            cmd.write_to_with_context(&mut buf, binary, &filter, pattern, context)?
+        } else {
+            cmd.write_to(&mut buf, binary, trigger_port)?
+        };
 
         match client.channel.send(&buf[..len]) {
             Ok(_) => Some(seq_id),

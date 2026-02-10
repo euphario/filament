@@ -844,7 +844,7 @@ impl FatfsDriver {
     /// Core initialization: connect to partition, read FAT16, create VFS port.
     ///
     /// Called from reset() via spawn context discovery.
-    fn do_init(&mut self, shmem_id: u32, source_name: &[u8], ctx: &mut dyn BusCtx) -> bool {
+    fn do_init(&mut self, shmem_id: u32, source_name: &[u8], mount_path: Option<&[u8]>, ctx: &mut dyn BusCtx) -> bool {
         // Connect to partition DataPort
         match ctx.connect_block_port(shmem_id) {
             Ok(port_id) => {
@@ -888,10 +888,20 @@ impl FatfsDriver {
                             let vfs_shmem_id = port.shmem_id();
                             self.vfs_port = Some(port_id);
 
-                            // Derive mount name from partition port name
-                            // e.g., "part0:" → "mnt/part0:"
+                            // Derive mount name from mount_path context (preferred)
+                            // or fall back to old heuristic: "part0:" → "mnt/part0:"
                             let mut pname = [0u8; 32];
-                            let pname_len = {
+                            let pname_len = if let Some(path) = mount_path {
+                                let copy_len = path.len().min(31);
+                                pname[..copy_len].copy_from_slice(&path[..copy_len]);
+                                let mut pos = copy_len;
+                                // Ensure name ends with ':'
+                                if pos > 0 && pname[pos - 1] != b':' && pos < 32 {
+                                    pname[pos] = b':';
+                                    pos += 1;
+                                }
+                                pos
+                            } else {
                                 let prefix = b"mnt/";
                                 let mut pos = prefix.len();
                                 pname[..pos].copy_from_slice(prefix);
@@ -912,7 +922,9 @@ impl FatfsDriver {
                             // Register as Filesystem port with devd using unified PortInfo
                             let mut info = PortInfo::new(&pname[..pname_len], PortClass::Filesystem);
                             info.port_subclass = port_subclass::FS_FAT;
-                            let _ = ctx.register_port_with_info(&info, vfs_shmem_id);
+                            if let Err(_) = ctx.register_port_with_info(&info, vfs_shmem_id) {
+                                uerror!("fatfsd", "port_register_failed"; shmem_id = vfs_shmem_id);
+                            }
 
                             uinfo!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
 
@@ -940,7 +952,7 @@ impl FatfsDriver {
     /// and mount name.
     fn register_mount_with_vfsd(&mut self, vfs_shmem_id: u32, port_name: &[u8], ctx: &mut dyn BusCtx) {
         // Discover vfsd's DataPort shmem_id
-        let vfsd_shmem_id = match ctx.discover_port(b"vfs:") {
+        let vfsd_shmem_id = match ctx.discover_port_by_name(b"vfs:") {
             Ok(id) => id,
             Err(e) => {
                 uerror!("fatfsd", "discover_vfs_failed";);
@@ -1030,13 +1042,27 @@ impl Driver for FatfsDriver {
         let name_len = port_name.len().min(64);
         name_buf[..name_len].copy_from_slice(&port_name[..name_len]);
 
-        // Discover partition shmem_id via devd
-        let shmem_id = ctx.discover_port(&name_buf[..name_len]).map_err(|_| {
+        // Check for mount.path from context KV (set by rule template expansion)
+        let mut mount_path_buf = [0u8; 64];
+        let mount_path_len = if let Some(path) = spawn_ctx.get(b"mount.path") {
+            let l = path.len().min(64);
+            mount_path_buf[..l].copy_from_slice(&path[..l]);
+            l
+        } else { 0 };
+
+        // Discover partition shmem_id via devd (uses port_id from spawn context)
+        let shmem_id = ctx.discover_port().map_err(|_| {
             uerror!("fatfsd", "discover_partition_failed";);
             BusError::Internal
         })?;
 
-        if !self.do_init(shmem_id, &name_buf[..name_len], ctx) {
+        let mount_path = if mount_path_len > 0 {
+            Some(&mount_path_buf[..mount_path_len])
+        } else {
+            None
+        };
+
+        if !self.do_init(shmem_id, &name_buf[..name_len], mount_path, ctx) {
             uerror!("fatfsd", "init_failed";);
             return Err(BusError::Internal);
         }

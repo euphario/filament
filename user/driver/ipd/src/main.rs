@@ -195,7 +195,7 @@ impl IpdDriver {
     // =========================================================================
 
     fn try_discover_nic(&mut self, ctx: &mut dyn BusCtx) -> bool {
-        match ctx.discover_port(NIC_PORT_NAME) {
+        match ctx.discover_port_by_name(NIC_PORT_NAME) {
             Ok(shmem_id) => {
                 uinfo!("ipd", "nic_found"; shmem_id = shmem_id);
                 match ctx.connect_block_port(shmem_id) {

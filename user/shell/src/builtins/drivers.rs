@@ -539,7 +539,7 @@ fn name_str(name: &[u8; 16]) -> &str {
 }
 
 /// Convert port name bytes to str
-fn port_name_str(name: &[u8; 20]) -> &str {
-    let len = name.iter().position(|&b| b == 0).unwrap_or(20);
+fn port_name_str(name: &[u8; 18]) -> &str {
+    let len = name.iter().position(|&b| b == 0).unwrap_or(18);
     core::str::from_utf8(&name[..len]).unwrap_or("???")
 }

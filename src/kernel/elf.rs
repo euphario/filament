@@ -9,7 +9,7 @@ use super::addrspace::AddressSpace;
 use super::pmm;
 #[cfg(debug_assertions)]
 use crate::kdebug;
-use crate::{kinfo, print_direct};
+use crate::{kinfo, kwarn, print_direct};
 use crate::kernel::arch::mmu;
 use super::task;
 
@@ -686,6 +686,72 @@ pub fn spawn_from_path_with_caps_find(
     let name = path.rsplit('/').next().unwrap_or(path);
 
     spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))
+}
+
+/// Spawn from path with caps, transferring a channel handle from parent to child at slot 4
+pub fn spawn_from_path_with_caps_and_channel(
+    path: &str,
+    parent_id: task::TaskId,
+    requested_caps: super::caps::Capabilities,
+    channel_handle_raw: u32,
+) -> Result<(task::TaskId, usize), ElfError> {
+    use crate::kernel::object_service::object_service;
+    use crate::kernel::object::{Object, ObjectType, ChannelObject};
+
+    let data = find_executable(path).ok_or(ElfError::NotExecutable)?;
+    let name = path.rsplit('/').next().unwrap_or(path);
+
+    // Validate and extract the channel from parent's handle table
+    let handle = abi::Handle(channel_handle_raw);
+    let channel_obj = object_service().close_handle(parent_id, handle)
+        .map_err(|_| ElfError::NotExecutable)?;
+
+    // Verify it's actually a channel
+    let channel_id = match &channel_obj {
+        Object::Channel(ch) => ch.channel_id(),
+        _ => {
+            // Not a channel — can't put it back easily, return error
+            return Err(ElfError::NotExecutable);
+        }
+    };
+
+    // Spawn the child process
+    let (child_id, slot) = spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))?;
+
+    // Transfer the channel to the child's handle table at slot 4 (SUPERVISION)
+    let child_channel = Object::Channel(ChannelObject::new(channel_id));
+    let result = object_service().with_table_mut(child_id, |table| {
+        table.alloc_at(4, ObjectType::Channel, child_channel)
+    });
+
+    match result {
+        Ok(Some(_handle)) => {
+            // Update IPC channel ownership: change from parent to child
+            let _ = crate::kernel::ipc::transfer_channel_owner(channel_id, parent_id, child_id);
+            // Fix peer_owner on the parent's channel so send() returns
+            // correct PeerInfo { task_id: child_id } for deferred wake.
+            let _ = crate::kernel::ipc::update_peer_owner(channel_id, child_id);
+            // Track resource usage
+            crate::kernel::task::with_scheduler(|sched| {
+                if let Some(s) = sched.slot_by_pid(parent_id) {
+                    if let Some(task) = sched.task_mut(s) {
+                        task.remove_channel();
+                    }
+                }
+                if let Some(s) = sched.slot_by_pid(child_id) {
+                    if let Some(task) = sched.task_mut(s) {
+                        task.add_channel();
+                    }
+                }
+            });
+        }
+        _ => {
+            // Failed to insert — child still spawned but without the channel
+            kwarn!("elf", "channel_transfer_failed"; child = child_id as u64);
+        }
+    }
+
+    Ok((child_id, slot))
 }
 
 /// Spawn a process from a file path with a parent

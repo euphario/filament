@@ -67,7 +67,7 @@ use crate::ipc::{Channel, ObjHandle};
 use crate::syscall;
 use crate::query::{
     QueryHeader, PortRegisterResponse,
-    StateChange, SpawnChild, SpawnAck,
+    StateChange, SpawnChild, SpawnChildContext, SpawnAck,
     PortFilter, filter_mode, GetSpawnContext, SpawnContextResponse,
     QueryPort, PortInfoResponse, UpdatePortShmemId,
     PortEntry,
@@ -140,7 +140,7 @@ impl SpawnFilter {
 }
 
 /// Command received from devd
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum DevdCommand {
     /// Spawn child driver process(es) matching a filter
     SpawnChild {
@@ -153,6 +153,8 @@ pub enum DevdCommand {
         filter: SpawnFilter,
         /// Capability bits for spawned child (0 = inherit parent's)
         caps: u64,
+        /// Optional context for parent-child relay (from devd)
+        context: Option<SpawnChildContext>,
     },
     /// Stop a child driver process
     StopChild {
@@ -250,10 +252,6 @@ pub struct DevdClient {
 }
 
 impl DevdClient {
-    /// Maximum retries for IPC operations
-    const MAX_RETRIES: usize = 50;
-    /// Delay between retries in milliseconds
-    const RETRY_DELAY_MS: u32 = 10;
     /// Deadline for introspection queries (2 seconds in ns)
     const RECV_DEADLINE_NS: u64 = 2_000_000_000;
 
@@ -276,6 +274,19 @@ impl DevdClient {
             state: ClientState::Connected,
             next_seq: 1,
         })
+    }
+
+    /// Wrap an existing channel as a supervision connection.
+    ///
+    /// Used in tree mode when the child receives a channel from its parent
+    /// at Handle::SUPERVISION (set by exec_with_channel). The child uses
+    /// this channel for all supervision traffic instead of connecting to devd.
+    pub fn from_channel(ch: Channel) -> Self {
+        Self {
+            channel: Some(ch),
+            state: ClientState::Connected,
+            next_seq: 1,
+        }
     }
 
     /// Get current connection state
@@ -333,74 +344,67 @@ impl DevdClient {
     ///
     /// Returns (port_name, port_class, metadata) if this driver was spawned by devd rules,
     /// or None if no context available (e.g., manually started driver).
-    pub fn get_spawn_context(&mut self) -> Result<Option<([u8; 64], usize, abi::PortClass, [u8; 64], usize)>, SysError> {
-        // Retry outer loop handles NOT_FOUND race condition.
-        // When a parent driver spawns a child, the child might query spawn
-        // context before devd has processed the SPAWN_ACK that maps PID → context.
-        //
-        // Uses non-blocking try_recv to avoid deadlock when devd's EventLoop
-        // is full and cannot watch this channel for future messages.
-        const SPAWN_ACK_RETRIES: usize = 10;
-        const SPAWN_ACK_DELAY_MS: u32 = 20;
-        const RECV_POLL_RETRIES: usize = 50;
-        const RECV_POLL_DELAY_MS: u32 = 5;
+    /// Returns (name, name_len, port_class, metadata, metadata_len, port_id)
+    /// Returns (name, name_len, port_class, metadata, meta_len, port_id, context_kvs, kv_count, shmem_id)
+    #[allow(clippy::type_complexity)]
+    pub fn get_spawn_context(&mut self) -> Result<Option<(
+        [u8; 64], usize, abi::PortClass, [u8; 64], usize, u8,
+        [([u8; 32], u8, [u8; 64], u8); 4], usize, u32,
+    )>, SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
-        for retry in 0..SPAWN_ACK_RETRIES {
-            let seq_id = self.next_seq();
-            let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+        let req = GetSpawnContext::new(seq_id);
+        channel.send(&req.to_bytes())?;
 
-            let req = GetSpawnContext::new(seq_id);
-            channel.send(&req.to_bytes())?;
+        // Block until response — event-driven via Mux, no polling.
+        // Tree mode: parent answers GET_SPAWN_CONTEXT locally from cached context.
+        // Root mode: devd responds via its EventLoop.
+        let mut resp_buf = [0u8; 512];
+        let n = channel.recv(&mut resp_buf)?;
 
-            // Poll for response (non-blocking to avoid deadlock)
-            let mut resp_buf = [0u8; 256];
-            for _poll in 0..RECV_POLL_RETRIES {
-                match channel.try_recv(&mut resp_buf) {
-                    Ok(Some(resp_len)) if resp_len >= SpawnContextResponse::HEADER_SIZE => {
-                        if let Some((resp, port_name, metadata)) = SpawnContextResponse::from_bytes(&resp_buf[..resp_len]) {
-                            if resp.header.msg_type == msg::SPAWN_CONTEXT {
-                                if resp.result == error::OK && resp.port_name_len > 0 {
-                                    let mut name = [0u8; 64];
-                                    let len = (resp.port_name_len as usize).min(64);
-                                    name[..len].copy_from_slice(&port_name[..len]);
-                                    let mut meta = [0u8; 64];
-                                    let meta_len = (resp.metadata_len as usize).min(64);
-                                    meta[..meta_len].copy_from_slice(&metadata[..meta_len]);
-                                    // Convert legacy port_type to PortClass
-                                    let pclass = match resp.port_type {
-                                        port_type::BLOCK | port_type::PARTITION => abi::PortClass::Block,
-                                        port_type::NETWORK => abi::PortClass::Network,
-                                        port_type::CONSOLE => abi::PortClass::Console,
-                                        port_type::USB => abi::PortClass::Usb,
-                                        port_type::FILESYSTEM => abi::PortClass::Filesystem,
-                                        port_type::STORAGE => abi::PortClass::StorageController,
-                                        port_type::SERVICE => abi::PortClass::Service,
-                                        _ => abi::PortClass::Unknown,
-                                    };
-                                    return Ok(Some((name, len, pclass, meta, meta_len)));
-                                }
-                                // NOT_FOUND - might be race with SPAWN_ACK, retry
-                                if resp.result == error::NOT_FOUND && retry < SPAWN_ACK_RETRIES - 1 {
-                                    syscall::sleep_ms(SPAWN_ACK_DELAY_MS);
-                                    break; // Retry outer loop
-                                }
-                                // No context after all retries (manually started driver)
-                                return Ok(None);
-                            }
-                        }
-                        return Err(SysError::IoError);
-                    }
-                    Ok(Some(_)) => return Err(SysError::IoError),
-                    Ok(None) => {
-                        // No response yet — yield to let devd process our request
-                        syscall::sleep_ms(RECV_POLL_DELAY_MS);
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
+        if n >= SpawnContextResponse::HEADER_SIZE {
+            if let Some(result) = Self::try_parse_spawn_context(&resp_buf[..n]) {
+                return Ok(Some(result));
             }
         }
-        Ok(None) // No context after all retries
+
+        Ok(None)
+    }
+
+    /// Try to parse a SPAWN_CONTEXT response from a raw buffer.
+    /// Returns the full context tuple on success, None if not a valid context.
+    fn try_parse_spawn_context(buf: &[u8]) -> Option<(
+        [u8; 64], usize, abi::PortClass, [u8; 64], usize, u8,
+        [([u8; 32], u8, [u8; 64], u8); 4], usize, u32,
+    )> {
+        let (resp, port_name, metadata) = SpawnContextResponse::from_bytes(buf)?;
+        if resp.header.msg_type != msg::SPAWN_CONTEXT || resp.result != error::OK || resp.port_name_len == 0 {
+            return None;
+        }
+        let mut name = [0u8; 64];
+        let len = (resp.port_name_len as usize).min(64);
+        name[..len].copy_from_slice(&port_name[..len]);
+        let mut meta = [0u8; 64];
+        let meta_len = (resp.metadata_len as usize).min(64);
+        meta[..meta_len].copy_from_slice(&metadata[..meta_len]);
+        let pclass = match resp.port_type {
+            port_type::BLOCK | port_type::PARTITION => abi::PortClass::Block,
+            port_type::NETWORK => abi::PortClass::Network,
+            port_type::CONSOLE => abi::PortClass::Console,
+            port_type::USB => abi::PortClass::Usb,
+            port_type::FILESYSTEM => abi::PortClass::Filesystem,
+            port_type::STORAGE => abi::PortClass::StorageController,
+            port_type::SERVICE => abi::PortClass::Service,
+            _ => abi::PortClass::Unknown,
+        };
+        let (kvs, kv_count) = SpawnContextResponse::parse_context_kvs(
+            buf, resp.port_name_len as usize, resp.metadata_len as usize,
+        );
+        let shmem_id = SpawnContextResponse::parse_trailing_shmem_id(
+            buf, resp.port_name_len as usize, resp.metadata_len as usize,
+        );
+        Some((name, len, pclass, meta, meta_len, resp.port_id, kvs, kv_count, shmem_id))
     }
 
     // =========================================================================
@@ -428,35 +432,27 @@ impl DevdClient {
 
         channel.send(&buf[..len])?;
 
-        // Wait for response
+        // Block until response — event-driven via Mux, no polling
         let mut resp_buf = [0u8; 64];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(resp_len) if resp_len >= PortRegisterResponse::SIZE => {
-                    let header = QueryHeader::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
+        let resp_len = channel.recv(&mut resp_buf)?;
 
-                    if header.msg_type == msg::REGISTER_PORT_INFO {
-                        let result = i32::from_le_bytes([
-                            resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
-                        ]);
-                        if result == error::OK {
-                            return Ok(());
-                        }
-                        return Err(SysError::PermissionDenied);
-                    } else if header.msg_type == msg::ERROR {
-                        return Err(SysError::PermissionDenied);
-                    }
+        if resp_len >= PortRegisterResponse::SIZE {
+            let header = QueryHeader::from_bytes(&resp_buf)
+                .ok_or(SysError::IoError)?;
+
+            if header.msg_type == msg::REGISTER_PORT_INFO {
+                let result = i32::from_le_bytes([
+                    resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
+                ]);
+                if result == error::OK {
+                    return Ok(());
                 }
-                Ok(_) => return Err(SysError::IoError),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
+                return Err(SysError::PermissionDenied);
+            } else if header.msg_type == msg::ERROR {
+                return Err(SysError::PermissionDenied);
             }
         }
-        Err(SysError::Timeout)
+        Err(SysError::IoError)
     }
 
     /// Update shmem_id for an existing port
@@ -478,35 +474,27 @@ impl DevdClient {
 
         channel.send(&buf[..len])?;
 
-        // Wait for response
+        // Block until response — event-driven via Mux, no polling
         let mut resp_buf = [0u8; 64];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(resp_len) if resp_len >= PortRegisterResponse::SIZE => {
-                    let header = QueryHeader::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
+        let resp_len = channel.recv(&mut resp_buf)?;
 
-                    if header.msg_type == msg::REGISTER_PORT_INFO {
-                        let result = i32::from_le_bytes([
-                            resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
-                        ]);
-                        if result == error::OK {
-                            return Ok(());
-                        }
-                        return Err(SysError::NotFound);
-                    } else if header.msg_type == msg::ERROR {
-                        return Err(SysError::NotFound);
-                    }
+        if resp_len >= PortRegisterResponse::SIZE {
+            let header = QueryHeader::from_bytes(&resp_buf)
+                .ok_or(SysError::IoError)?;
+
+            if header.msg_type == msg::REGISTER_PORT_INFO {
+                let result = i32::from_le_bytes([
+                    resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]
+                ]);
+                if result == error::OK {
+                    return Ok(());
                 }
-                Ok(_) => return Err(SysError::IoError),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
+                return Err(SysError::NotFound);
+            } else if header.msg_type == msg::ERROR {
+                return Err(SysError::NotFound);
             }
         }
-        Err(SysError::Timeout)
+        Err(SysError::IoError)
     }
 
     /// Set port state
@@ -535,61 +523,43 @@ impl DevdClient {
 
         channel.send(&buf[..len])?;
 
-        // Response format: header (8 bytes) + result (4 bytes) = 12 bytes minimum
+        // Block until response — event-driven via Mux, no polling.
+        // Discard messages with wrong seq_id (rare: unsolicited message in root mode).
         const MIN_RESPONSE_SIZE: usize = 12;
         let mut resp_buf = [0u8; 64];
 
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(resp_len) => {
-                    // Check minimum size
-                    if resp_len < MIN_RESPONSE_SIZE {
-                        // Malformed response - too short, retry
-                        syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                        continue;
-                    }
+        for _ in 0..8 {
+            let resp_len = channel.recv(&mut resp_buf)?;
 
-                    // Parse header safely
-                    let header = match QueryHeader::from_bytes(&resp_buf[..resp_len]) {
-                        Some(h) => h,
-                        None => {
-                            // Malformed header, retry
-                            syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                            continue;
-                        }
-                    };
-
-                    // Check if this is our response (matching seq_id)
-                    if header.seq_id != seq_id {
-                        // Response for different request, retry
-                        syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                        continue;
-                    }
-
-                    if header.msg_type == msg::SET_PORT_STATE {
-                        // Safe bounds-checked access for result
-                        let result = i32::from_le_bytes(
-                            resp_buf.get(8..12)
-                                .and_then(|s| s.try_into().ok())
-                                .unwrap_or([0xff, 0xff, 0xff, 0xff])
-                        );
-                        if result == error::OK {
-                            return Ok(());
-                        }
-                        return Err(SysError::NotFound);
-                    } else if header.msg_type == msg::ERROR {
-                        return Err(SysError::IoError);
-                    }
-                    // Unexpected msg_type - ignore and retry
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                }
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                }
-                Err(e) => return Err(e),
+            if resp_len < MIN_RESPONSE_SIZE {
+                continue;
             }
+
+            let header = match QueryHeader::from_bytes(&resp_buf[..resp_len]) {
+                Some(h) => h,
+                None => continue,
+            };
+
+            if header.seq_id != seq_id {
+                continue; // Wrong seq — discard, recv next (no sleep)
+            }
+
+            if header.msg_type == msg::SET_PORT_STATE {
+                let result = i32::from_le_bytes(
+                    resp_buf.get(8..12)
+                        .and_then(|s| s.try_into().ok())
+                        .unwrap_or([0xff, 0xff, 0xff, 0xff])
+                );
+                if result == error::OK {
+                    return Ok(());
+                }
+                return Err(SysError::NotFound);
+            } else if header.msg_type == msg::ERROR {
+                return Err(SysError::IoError);
+            }
+            // Unexpected msg_type — discard and recv again
         }
-        Err(SysError::Timeout)
+        Err(SysError::IoError)
     }
 
     // =========================================================================
@@ -604,115 +574,133 @@ impl DevdClient {
     pub fn poll_command(&mut self) -> Result<Option<DevdCommand>, SysError> {
         let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; 512];
         match channel.recv(&mut buf) {
             Ok(len) if len >= QueryHeader::SIZE => {
-                let header = QueryHeader::from_bytes(&buf)
-                    .ok_or(SysError::IoError)?;
-
-                match header.msg_type {
-                    msg::SPAWN_CHILD => {
-                        let (spawn_hdr, binary, filter_bytes) = SpawnChild::from_bytes(&buf[..len])
-                            .ok_or(SysError::IoError)?;
-
-                        // Parse binary name
-                        let mut cmd_binary = [0u8; 64];
-                        let binary_len = binary.len().min(64);
-                        cmd_binary[..binary_len].copy_from_slice(&binary[..binary_len]);
-
-                        // Parse filter
-                        let filter = if !filter_bytes.is_empty() {
-                            let (pf, pattern) = PortFilter::from_bytes(filter_bytes)
-                                .ok_or(SysError::IoError)?;
-                            let mut pattern_buf = [0u8; 64];
-                            let pattern_len = pattern.len().min(64);
-                            pattern_buf[..pattern_len].copy_from_slice(&pattern[..pattern_len]);
-                            SpawnFilter {
-                                mode: pf.mode,
-                                port_type: pf.port_type,
-                                class_filter: pf.class_filter,
-                                pattern: pattern_buf,
-                                pattern_len,
-                            }
-                        } else {
-                            // No filter = broadcast all
-                            SpawnFilter {
-                                mode: filter_mode::ALL,
-                                port_type: 0,
-                                class_filter: 0,
-                                pattern: [0u8; 64],
-                                pattern_len: 0,
-                            }
-                        };
-
-                        Ok(Some(DevdCommand::SpawnChild {
-                            seq_id: header.seq_id,
-                            binary: cmd_binary,
-                            binary_len,
-                            filter,
-                            caps: spawn_hdr.caps,
-                        }))
-                    }
-                    msg::STOP_CHILD => {
-                        let child_pid = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                        Ok(Some(DevdCommand::StopChild {
-                            seq_id: header.seq_id,
-                            child_pid,
-                        }))
-                    }
-                    msg::QUERY_SERVICE_INFO => {
-                        // devd is forwarding a service info query
-                        Ok(Some(DevdCommand::QueryInfo {
-                            seq_id: header.seq_id,
-                        }))
-                    }
-                    msg::CONFIG_GET => {
-                        // Payload after header is key bytes
-                        let payload = &buf[QueryHeader::SIZE..len];
-                        let mut key = [0u8; 64];
-                        let key_len = payload.len().min(64);
-                        key[..key_len].copy_from_slice(&payload[..key_len]);
-                        Ok(Some(DevdCommand::ConfigGet {
-                            seq_id: header.seq_id,
-                            key,
-                            key_len,
-                        }))
-                    }
-                    msg::CONFIG_SET => {
-                        // Payload after header is key\0value
-                        let payload = &buf[QueryHeader::SIZE..len];
-                        // Find null separator between key and value
-                        let null_pos = payload.iter().position(|&b| b == 0)
-                            .unwrap_or(payload.len());
-                        let mut key = [0u8; 64];
-                        let key_len = null_pos.min(64);
-                        key[..key_len].copy_from_slice(&payload[..key_len]);
-                        let mut value = [0u8; 128];
-                        let value_start = null_pos + 1;
-                        let value_len = if value_start < payload.len() {
-                            let vlen = (payload.len() - value_start).min(128);
-                            value[..vlen].copy_from_slice(&payload[value_start..value_start + vlen]);
-                            vlen
-                        } else {
-                            0
-                        };
-                        Ok(Some(DevdCommand::ConfigSet {
-                            seq_id: header.seq_id,
-                            key,
-                            key_len,
-                            value,
-                            value_len,
-                        }))
-                    }
-                    _ => {
-                        // Unknown message type - ignore
-                        Ok(None)
-                    }
-                }
+                Self::parse_command_buf(&buf[..len])
             }
             Ok(_) => Ok(None),
             Err(SysError::WouldBlock) => Ok(None),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Parse a command from a raw message buffer.
+    ///
+    /// Extracted so it can be used by both `poll_command()` and the relay
+    /// path in bus_runtime (which reads raw bytes then decides whether to
+    /// dispatch locally or forward).
+    pub fn parse_command_buf(buf: &[u8]) -> Result<Option<DevdCommand>, SysError> {
+        if buf.len() < QueryHeader::SIZE {
+            return Ok(None);
+        }
+        let header = QueryHeader::from_bytes(buf)
+            .ok_or(SysError::IoError)?;
+
+        match header.msg_type {
+            msg::SPAWN_CHILD => {
+                let (spawn_hdr, binary, filter_bytes) = SpawnChild::from_bytes(buf)
+                    .ok_or(SysError::IoError)?;
+
+                // Parse binary name
+                let mut cmd_binary = [0u8; 64];
+                let binary_len = binary.len().min(64);
+                cmd_binary[..binary_len].copy_from_slice(&binary[..binary_len]);
+
+                // Parse filter
+                let filter = if !filter_bytes.is_empty() {
+                    let (pf, pattern) = PortFilter::from_bytes(filter_bytes)
+                        .ok_or(SysError::IoError)?;
+                    let mut pattern_buf = [0u8; 64];
+                    let pattern_len = pattern.len().min(64);
+                    pattern_buf[..pattern_len].copy_from_slice(&pattern[..pattern_len]);
+                    SpawnFilter {
+                        mode: pf.mode,
+                        port_type: pf.port_type,
+                        class_filter: pf.class_filter,
+                        pattern: pattern_buf,
+                        pattern_len,
+                    }
+                } else {
+                    // No filter = broadcast all
+                    SpawnFilter {
+                        mode: filter_mode::ALL,
+                        port_type: 0,
+                        class_filter: 0,
+                        pattern: [0u8; 64],
+                        pattern_len: 0,
+                    }
+                };
+
+                // Parse optional context section
+                let context = SpawnChild::parse_context(buf);
+
+                Ok(Some(DevdCommand::SpawnChild {
+                    seq_id: header.seq_id,
+                    binary: cmd_binary,
+                    binary_len,
+                    filter,
+                    caps: spawn_hdr.caps,
+                    context,
+                }))
+            }
+            msg::STOP_CHILD => {
+                let child_pid = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                Ok(Some(DevdCommand::StopChild {
+                    seq_id: header.seq_id,
+                    child_pid,
+                }))
+            }
+            msg::QUERY_SERVICE_INFO => {
+                // devd is forwarding a service info query
+                Ok(Some(DevdCommand::QueryInfo {
+                    seq_id: header.seq_id,
+                }))
+            }
+            msg::CONFIG_GET => {
+                // Payload after header is key bytes
+                let len = buf.len();
+                let payload = &buf[QueryHeader::SIZE..len];
+                let mut key = [0u8; 64];
+                let key_len = payload.len().min(64);
+                key[..key_len].copy_from_slice(&payload[..key_len]);
+                Ok(Some(DevdCommand::ConfigGet {
+                    seq_id: header.seq_id,
+                    key,
+                    key_len,
+                }))
+            }
+            msg::CONFIG_SET => {
+                // Payload after header is key\0value
+                let len = buf.len();
+                let payload = &buf[QueryHeader::SIZE..len];
+                // Find null separator between key and value
+                let null_pos = payload.iter().position(|&b| b == 0)
+                    .unwrap_or(payload.len());
+                let mut key = [0u8; 64];
+                let key_len = null_pos.min(64);
+                key[..key_len].copy_from_slice(&payload[..key_len]);
+                let mut value = [0u8; 128];
+                let value_start = null_pos + 1;
+                let value_len = if value_start < payload.len() {
+                    let vlen = (payload.len() - value_start).min(128);
+                    value[..vlen].copy_from_slice(&payload[value_start..value_start + vlen]);
+                    vlen
+                } else {
+                    0
+                };
+                Ok(Some(DevdCommand::ConfigSet {
+                    seq_id: header.seq_id,
+                    key,
+                    key_len,
+                    value,
+                    value_len,
+                }))
+            }
+            _ => {
+                // Unknown message type - ignore
+                Ok(None)
+            }
         }
     }
 
@@ -766,28 +754,21 @@ impl DevdClient {
             .ok_or(SysError::InvalidArgument)?;
         channel.send(&buf[..len])?;
 
+        // Block until response — event-driven via Mux, no polling
         let mut resp_buf = [0u8; 64];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(resp_len) if resp_len >= PortInfoResponse::SIZE => {
-                    let resp = PortInfoResponse::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
+        let resp_len = channel.recv(&mut resp_buf)?;
 
-                    if resp.result == error::OK {
-                        return Ok(resp);
-                    } else {
-                        return Err(SysError::NotFound);
-                    }
-                }
-                Ok(_) => return Err(SysError::IoError),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
+        if resp_len >= PortInfoResponse::SIZE {
+            let resp = PortInfoResponse::from_bytes(&resp_buf)
+                .ok_or(SysError::IoError)?;
+
+            if resp.result == error::OK {
+                return Ok(resp);
+            } else {
+                return Err(SysError::NotFound);
             }
         }
-        Err(SysError::Timeout)
+        Err(SysError::IoError)
     }
 
     /// Query port and return its shmem_id
@@ -796,6 +777,48 @@ impl DevdClient {
     /// Returns None if the port doesn't have a DataPort.
     pub fn query_port_shmem_id(&mut self, port_name: &[u8]) -> Result<Option<u32>, SysError> {
         let info = self.query_port(port_name)?;
+        if info.has_dataport() {
+            Ok(Some(info.shmem_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Query port by port_id (unambiguous lookup)
+    ///
+    /// Uses the monotonic port_id assigned at registration to avoid
+    /// name collisions when multiple ports share the same name.
+    pub fn query_port_by_id(&mut self, port_id: u8) -> Result<PortInfoResponse, SysError> {
+        let seq_id = self.next_seq();
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let req = QueryPort::by_id(seq_id, port_id);
+        let mut buf = [0u8; 128];
+        // Write with empty name — port_id is the lookup key
+        let len = req.write_to(&mut buf, &[])
+            .ok_or(SysError::InvalidArgument)?;
+        channel.send(&buf[..len])?;
+
+        // Block until response — event-driven via Mux, no polling
+        let mut resp_buf = [0u8; 64];
+        let resp_len = channel.recv(&mut resp_buf)?;
+
+        if resp_len >= PortInfoResponse::SIZE {
+            let resp = PortInfoResponse::from_bytes(&resp_buf)
+                .ok_or(SysError::IoError)?;
+
+            if resp.result == error::OK {
+                return Ok(resp);
+            } else {
+                return Err(SysError::NotFound);
+            }
+        }
+        Err(SysError::IoError)
+    }
+
+    /// Query port by port_id and return its shmem_id
+    pub fn query_port_shmem_id_by_id(&mut self, port_id: u8) -> Result<Option<u32>, SysError> {
+        let info = self.query_port_by_id(port_id)?;
         if info.has_dataport() {
             Ok(Some(info.shmem_id))
         } else {
@@ -821,8 +844,8 @@ impl DevdClient {
         channel.send(&req.to_bytes())?;
 
         let empty_entry = PortEntry {
-            name: [0u8; 20], port_type: 0, flags: 0, owner_idx: 0,
-            parent_idx: 0xFF, shmem_id: 0, owner_pid: 0,
+            name: [0u8; 18], port_id: 0xFF, port_type: 0, flags: 0, owner_idx: 0,
+            parent_idx: 0xFF, _pad: 0, shmem_id: 0, owner_pid: 0,
         };
         let mut entries = [empty_entry; 32];
         let mut received = 0usize;
@@ -949,39 +972,31 @@ impl DevdClient {
             .ok_or(SysError::InvalidArgument)?;
         channel.send(&buf[..len])?;
 
-        // Wait for response (larger buffer for info text)
+        // Block until response — event-driven via Mux, no polling
         let mut resp_buf = [0u8; 1100];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut resp_buf) {
-                Ok(resp_len) if resp_len >= ServiceInfoResult::FIXED_SIZE => {
-                    let header = QueryHeader::from_bytes(&resp_buf)
-                        .ok_or(SysError::IoError)?;
+        let resp_len = channel.recv(&mut resp_buf)?;
 
-                    if header.msg_type == msg::SERVICE_INFO_RESULT {
-                        if let Some((resp, info)) = ServiceInfoResult::from_bytes(&resp_buf[..resp_len]) {
-                            if resp.result == error::OK {
-                                let mut result = [0u8; 1024];
-                                let info_len = info.len().min(1024);
-                                result[..info_len].copy_from_slice(&info[..info_len]);
-                                return Ok((result, info_len));
-                            } else {
-                                return Err(SysError::NotFound);
-                            }
-                        }
-                        return Err(SysError::IoError);
-                    } else if header.msg_type == msg::ERROR {
+        if resp_len >= ServiceInfoResult::FIXED_SIZE {
+            let header = QueryHeader::from_bytes(&resp_buf)
+                .ok_or(SysError::IoError)?;
+
+            if header.msg_type == msg::SERVICE_INFO_RESULT {
+                if let Some((resp, info)) = ServiceInfoResult::from_bytes(&resp_buf[..resp_len]) {
+                    if resp.result == error::OK {
+                        let mut result = [0u8; 1024];
+                        let info_len = info.len().min(1024);
+                        result[..info_len].copy_from_slice(&info[..info_len]);
+                        return Ok((result, info_len));
+                    } else {
                         return Err(SysError::NotFound);
                     }
                 }
-                Ok(_) => return Err(SysError::IoError),
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                    continue;
-                }
-                Err(e) => return Err(e),
+                return Err(SysError::IoError);
+            } else if header.msg_type == msg::ERROR {
+                return Err(SysError::NotFound);
             }
         }
-        Err(SysError::Timeout)
+        Err(SysError::IoError)
     }
 
     /// Respond to a service info query
@@ -1037,34 +1052,27 @@ impl DevdClient {
         let req = LogQuery::new(seq_id, max_count);
         channel.send(&req.to_bytes())?;
 
-        // Wait for response with retries
+        // Block until response — event-driven via Mux, no polling
         let mut recv_buf = [0u8; 4200];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut recv_buf) {
-                Ok(len) if len >= QueryHeader::SIZE => {
-                    let header = QueryHeader::from_bytes(&recv_buf)
-                        .ok_or(SysError::InvalidArgument)?;
+        let len = channel.recv(&mut recv_buf)?;
 
-                    if header.msg_type == query_msg::LOG_HISTORY {
-                        let (resp, text) = LogHistory::from_bytes(&recv_buf[..len])
-                            .ok_or(SysError::InvalidArgument)?;
+        if len >= QueryHeader::SIZE {
+            let header = QueryHeader::from_bytes(&recv_buf)
+                .ok_or(SysError::InvalidArgument)?;
 
-                        let mut out = [0u8; 4096];
-                        let out_len = text.len().min(4096);
-                        out[..out_len].copy_from_slice(&text[..out_len]);
+            if header.msg_type == query_msg::LOG_HISTORY {
+                let (resp, text) = LogHistory::from_bytes(&recv_buf[..len])
+                    .ok_or(SysError::InvalidArgument)?;
 
-                        return Ok((out, out_len, resp.live_enabled != 0));
-                    }
-                }
-                Ok(_) => {}
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                }
-                Err(e) => return Err(e),
+                let mut out = [0u8; 4096];
+                let out_len = text.len().min(4096);
+                out[..out_len].copy_from_slice(&text[..out_len]);
+
+                return Ok((out, out_len, resp.live_enabled != 0));
             }
         }
 
-        Err(SysError::Timeout)
+        Err(SysError::IoError)
     }
 
     /// Control logging (enable/disable live output)
@@ -1078,34 +1086,41 @@ impl DevdClient {
         let req = LogControl::new(seq_id, cmd);
         channel.send(&req.to_bytes())?;
 
-        // Wait for ack with retries
+        // Block until ack — event-driven via Mux, no polling
         let mut recv_buf = [0u8; 64];
-        for _ in 0..Self::MAX_RETRIES {
-            match channel.recv(&mut recv_buf) {
-                Ok(len) if len >= QueryHeader::SIZE => {
-                    let header = QueryHeader::from_bytes(&recv_buf)
-                        .ok_or(SysError::InvalidArgument)?;
+        let len = channel.recv(&mut recv_buf)?;
 
-                    // Accept either ERROR (with OK code) or any other ack
-                    if header.msg_type == query_msg::ERROR {
-                        if let Some(err) = ErrorResponse::from_bytes(&recv_buf[..len]) {
-                            if err.error_code == error::OK {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    // Any response is OK
-                    return Ok(());
-                }
-                Ok(_) => {}
-                Err(SysError::WouldBlock) => {
-                    syscall::sleep_ms(Self::RETRY_DELAY_MS);
-                }
-                Err(e) => return Err(e),
-            }
+        if len >= QueryHeader::SIZE {
+            // Any response is OK (including ERROR with OK code)
+            return Ok(());
         }
 
-        Err(SysError::Timeout)
+        Err(SysError::IoError)
+    }
+
+    // =========================================================================
+    // Raw IPC for relay (bus_runtime child→devd forwarding)
+    // =========================================================================
+
+    /// Receive raw bytes from the channel (non-blocking).
+    ///
+    /// Used by bus_runtime's relay path to read raw messages and decide
+    /// whether to dispatch locally or forward to a child.
+    pub fn raw_recv(&mut self, buf: &mut [u8]) -> Result<Option<usize>, SysError> {
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+        match channel.try_recv(buf) {
+            Ok(Some(n)) => Ok(Some(n)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send raw bytes on the channel.
+    ///
+    /// Used by bus_runtime's relay path to forward messages from child to devd.
+    pub fn raw_send(&mut self, buf: &[u8]) -> Result<(), SysError> {
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+        channel.send(buf)
     }
 
     /// Disconnect from devd
@@ -1341,7 +1356,7 @@ fn handle_command<H: SpawnHandler>(
     cmd: DevdCommand,
 ) {
     match cmd {
-        DevdCommand::SpawnChild { seq_id, binary, binary_len, filter, caps } => {
+        DevdCommand::SpawnChild { seq_id, binary, binary_len, filter, caps, .. } => {
             let binary_name = match core::str::from_utf8(&binary[..binary_len]) {
                 Ok(s) => s,
                 Err(_) => {

@@ -148,6 +148,13 @@ pub fn exec_with_caps(path: &str, caps: u64) -> i64 {
     syscall3(sys::EXEC_WITH_CAPS, path.as_ptr() as u64, path.len() as u64, caps)
 }
 
+/// Execute a program with capabilities, transferring a channel handle to the child.
+/// The channel handle is removed from the caller's table and placed in the child's
+/// table at Handle::SUPERVISION (slot 4). Returns child PID on success.
+pub fn exec_with_channel(path: &str, caps: u64, channel: Handle) -> i64 {
+    syscall4(sys::EXEC_WITH_CHANNEL, path.as_ptr() as u64, path.len() as u64, caps, channel.raw() as u64)
+}
+
 /// Execute ELF from memory
 pub fn exec_mem(elf_data: &[u8], name: Option<&str>) -> i64 {
     let (name_ptr, name_len) = match name {

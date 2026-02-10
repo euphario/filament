@@ -208,6 +208,25 @@ impl HandleTable {
         None
     }
 
+    /// Insert an object at a specific slot index, returning the handle.
+    /// Fails if the slot is already occupied or out of bounds.
+    pub fn alloc_at(&mut self, index: usize, object_type: ObjectType, object: Object) -> Option<Handle> {
+        if index == 0 || index >= MAX_HANDLES {
+            return None;
+        }
+        if self.entries[index].is_some() {
+            return None;
+        }
+        let gen = self.generations[index];
+        self.entries[index] = Some(HandleEntry {
+            generation: gen,
+            object_type,
+            rights: default_rights(object_type),
+            object,
+        });
+        Some(Handle::new(index, gen))
+    }
+
     /// Get object by handle
     pub fn get(&self, handle: Handle) -> Option<&HandleEntry> {
         let idx = handle.index();

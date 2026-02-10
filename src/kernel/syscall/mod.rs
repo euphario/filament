@@ -73,6 +73,7 @@ pub enum SyscallNumber {
     // CpuStats = 68 - REMOVED: statistics belong in userspace service
     // 70-75: legacy kevent/device_list (removed) - use unified open/read
     ExecWithCaps = 74,
+    ExecWithChannel = 75,
     Klog = 76,  // Compatibility shim - writes to klog ring buffer
     KlogWrite = 77,  // Inject binary log record into kernel ring
 
@@ -123,7 +124,7 @@ impl From<u64> for SyscallNumber {
             66 => SyscallNumber::GetCapabilities,
             // 68 => CpuStats - REMOVED (use service)
             74 => SyscallNumber::ExecWithCaps,
-            // 75: legacy DeviceList -> Invalid (use unified interface)
+            75 => SyscallNumber::ExecWithChannel,
             76 => SyscallNumber::Klog,
             77 => SyscallNumber::KlogWrite,
             // Unified interface (100-105)
@@ -220,6 +221,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Wait => process::sys_wait(args.arg0 as i32, args.arg1, args.arg2 as u32),
         SyscallNumber::Exec => process::sys_exec(args.arg0, args.arg1 as usize),
         SyscallNumber::ExecWithCaps => process::sys_exec_with_caps(args.arg0, args.arg1 as usize, args.arg2),
+        SyscallNumber::ExecWithChannel => process::sys_exec_with_channel(args.arg0, args.arg1 as usize, args.arg2, args.arg3 as u32),
         SyscallNumber::ExecMem => process::sys_exec_mem(args.arg0, args.arg1 as usize, args.arg2, args.arg3 as usize),
         SyscallNumber::Daemonize => process::sys_daemonize(),
         SyscallNumber::Kill => process::sys_kill(args.arg0 as u32),
@@ -314,6 +316,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::KlogWrite => "klog_write",
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::ExecWithCaps => "exec_with_caps",
+        SyscallNumber::ExecWithChannel => "exec_with_channel",
         // Unified interface (100-105)
         SyscallNumber::Open => "open",
         SyscallNumber::Read => "read",

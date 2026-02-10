@@ -190,6 +190,21 @@ impl Channel {
         self.owner
     }
 
+    /// Transfer ownership to a new task
+    pub fn set_owner(&mut self, new_owner: TaskId) {
+        self.owner = new_owner;
+    }
+
+    /// Update the peer_owner field in our Open state.
+    /// Called when the peer channel is transferred to a new task
+    /// (e.g., exec_with_channel) so that send() returns the correct
+    /// PeerInfo for deferred wake.
+    pub fn set_peer_owner(&mut self, new_peer_owner: TaskId) {
+        if let ChannelState::Open { peer_owner, .. } = &mut self.state {
+            *peer_owner = new_peer_owner;
+        }
+    }
+
     /// Get current state
     pub fn state(&self) -> &ChannelState {
         &self.state

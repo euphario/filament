@@ -43,6 +43,19 @@ impl Channel {
         Ok(Self { handle, state: ChannelState::Open })
     }
 
+    /// Wrap an existing handle as a Channel (e.g., handle 4 from exec_with_channel)
+    pub fn from_raw_handle(handle: ObjHandle) -> Self {
+        Self { handle, state: ChannelState::Open }
+    }
+
+    /// Consume the channel and return the raw handle without closing it.
+    /// Use this when transferring ownership (e.g., to exec_with_channel).
+    pub fn into_raw_handle(self) -> ObjHandle {
+        let handle = self.handle;
+        core::mem::forget(self);
+        handle
+    }
+
     pub fn handle(&self) -> ObjHandle { self.handle }
     pub fn state(&self) -> ChannelState { self.state }
 

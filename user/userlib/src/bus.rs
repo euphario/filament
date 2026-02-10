@@ -79,7 +79,9 @@ pub struct KernelBusId(pub u8);
 /// the child can query this context to discover which port triggered
 /// the spawn. The port name is the key — it identifies the parent's
 /// device port that the child should connect to.
-#[derive(Clone, Copy)]
+/// Max context key-value pairs in spawn context
+const MAX_SPAWN_CONTEXT_KV: usize = 4;
+
 pub struct SpawnContext {
     /// Port name that triggered the spawn (e.g., "pci/00:02.0:nvme")
     name: [u8; 64],
@@ -87,10 +89,20 @@ pub struct SpawnContext {
     name_len: u8,
     /// Class of the port that triggered the spawn
     pub port_class: abi::PortClass,
+    /// Port ID of the trigger port (monotonic, from port registry)
+    pub port_id: u8,
+    /// Shared memory object ID for the trigger port's DataPort (0 = none)
+    pub shmem_id: u32,
     /// Opaque metadata from the port registration (e.g., BAR0 info)
     metadata_buf: [u8; 64],
     /// Actual length of metadata
     metadata_len: u8,
+    /// Context key-value pairs from rule template expansion
+    context_keys: [[u8; 32]; MAX_SPAWN_CONTEXT_KV],
+    context_key_lens: [u8; MAX_SPAWN_CONTEXT_KV],
+    context_values: [[u8; 64]; MAX_SPAWN_CONTEXT_KV],
+    context_value_lens: [u8; MAX_SPAWN_CONTEXT_KV],
+    context_kv_count: u8,
 }
 
 impl SpawnContext {
@@ -100,6 +112,7 @@ impl SpawnContext {
         name_len: usize,
         port_class: abi::PortClass,
         metadata: &[u8],
+        port_id: u8,
     ) -> Self {
         let len = name_len.min(64) as u8;
         let mut name = [0u8; 64];
@@ -108,9 +121,27 @@ impl SpawnContext {
         let mut metadata_buf = [0u8; 64];
         metadata_buf[..meta_len as usize].copy_from_slice(&metadata[..meta_len as usize]);
         Self {
-            name, name_len: len, port_class,
+            name, name_len: len, port_class, port_id,
+            shmem_id: 0,
             metadata_buf, metadata_len: meta_len,
+            context_keys: [[0u8; 32]; MAX_SPAWN_CONTEXT_KV],
+            context_key_lens: [0u8; MAX_SPAWN_CONTEXT_KV],
+            context_values: [[0u8; 64]; MAX_SPAWN_CONTEXT_KV],
+            context_value_lens: [0u8; MAX_SPAWN_CONTEXT_KV],
+            context_kv_count: 0,
         }
+    }
+
+    /// Set context key-value pairs from parsed wire data.
+    pub(crate) fn set_context_kvs(&mut self, kvs: &[([u8; 32], u8, [u8; 64], u8)], count: usize) {
+        let n = count.min(MAX_SPAWN_CONTEXT_KV);
+        for i in 0..n {
+            self.context_keys[i] = kvs[i].0;
+            self.context_key_lens[i] = kvs[i].1;
+            self.context_values[i] = kvs[i].2;
+            self.context_value_lens[i] = kvs[i].3;
+        }
+        self.context_kv_count = n as u8;
     }
 
     /// Get the trigger port name as a byte slice.
@@ -121,6 +152,19 @@ impl SpawnContext {
     /// Get the metadata bytes attached to the port registration.
     pub fn metadata(&self) -> &[u8] {
         &self.metadata_buf[..self.metadata_len as usize]
+    }
+
+    /// Look up a context value by key.
+    ///
+    /// Context KVs come from rule template expansion in devd (e.g., `mount.path`).
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        for i in 0..self.context_kv_count as usize {
+            let k = &self.context_keys[i][..self.context_key_lens[i] as usize];
+            if k == key {
+                return Some(&self.context_values[i][..self.context_value_lens[i] as usize]);
+            }
+        }
+        None
     }
 }
 
@@ -678,12 +722,18 @@ pub trait BusCtx {
     /// Returns `LinkDown` or `Internal` on transport failure.
     fn spawn_context(&mut self) -> Result<&SpawnContext, BusError>;
 
-    /// Discover a port's DataPort shmem_id by name via devd-query.
+    /// Discover the trigger port's DataPort shmem_id via devd-query.
     ///
-    /// Queries devd for the named port (e.g., `b"vfs:"`) and returns
-    /// the shmem_id of its DataPort. Returns `NotFound` if the port
-    /// doesn't exist or has no DataPort.
-    fn discover_port(&mut self, name: &[u8]) -> Result<u32, BusError>;
+    /// Uses the port_id from spawn context to unambiguously identify
+    /// the port in the tree. Returns `NotFound` if no spawn context
+    /// or the port has no DataPort.
+    fn discover_port(&mut self) -> Result<u32, BusError>;
+
+    /// Discover a well-known port's DataPort shmem_id by name.
+    ///
+    /// For singleton ports (e.g., `b"vfs:"`, `b"net0:"`) where the name
+    /// is globally unique. Use `discover_port()` for trigger ports.
+    fn discover_port_by_name(&mut self, name: &[u8]) -> Result<u32, BusError>;
 }
 
 // ============================================================================

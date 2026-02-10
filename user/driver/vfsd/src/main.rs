@@ -79,13 +79,27 @@ impl VfsDriver {
             return;
         }
 
-        // Build prefix: "/name/"
+        // Build prefix: "/name/" (or "name/" if name already starts with '/')
         let mut prefix = [0u8; 24];
-        prefix[0] = b'/';
-        let plen = name_len.min(22);
-        prefix[1..1 + plen].copy_from_slice(&mount_name[..plen]);
-        prefix[1 + plen] = b'/';
-        let prefix_len = 2 + plen;
+        let prefix_len;
+        if name_len > 0 && mount_name[0] == b'/' {
+            // Name already has leading slash — use as-is, append trailing /
+            let plen = name_len.min(22);
+            prefix[..plen].copy_from_slice(&mount_name[..plen]);
+            if plen > 0 && prefix[plen - 1] != b'/' {
+                prefix[plen] = b'/';
+                prefix_len = plen + 1;
+            } else {
+                prefix_len = plen;
+            }
+        } else {
+            // Bare name — build /name/ prefix
+            prefix[0] = b'/';
+            let plen = name_len.min(22);
+            prefix[1..1 + plen].copy_from_slice(&mount_name[..plen]);
+            prefix[1 + plen] = b'/';
+            prefix_len = 2 + plen;
+        }
 
         // Find empty slot and write entry to pool
         let port = match ctx.block_port(port_id) {

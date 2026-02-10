@@ -460,6 +460,39 @@ impl ChannelTable {
         self.channels[slot].as_ref()?.peer_id()
     }
 
+    /// Transfer ownership of a channel from one task to another
+    pub fn transfer_owner(&mut self, id: ChannelId, old_owner: TaskId, new_owner: TaskId) -> Result<(), IpcError> {
+        let slot = self.find_slot(id).ok_or(IpcError::InvalidChannel { id })?;
+        let channel = self.channels[slot].as_mut()
+            .ok_or(IpcError::InvalidChannel { id })?;
+        if channel.owner() != old_owner {
+            return Err(IpcError::NotOwner { channel: id, caller: old_owner, owner: channel.owner() });
+        }
+        channel.set_owner(new_owner);
+        Ok(())
+    }
+
+    /// Update peer_owner on a channel's PEER.
+    ///
+    /// When channel B is transferred to a new task, channel A still has
+    /// the old peer_owner. This causes send() on A to return PeerInfo
+    /// with the wrong task_id, breaking the deferred wake mechanism.
+    pub fn update_peer_owner(&mut self, channel_id: ChannelId, new_peer_owner: TaskId) -> Result<(), IpcError> {
+        // Find this channel and get its peer_id
+        let slot = self.find_slot(channel_id).ok_or(IpcError::InvalidChannel { id: channel_id })?;
+        let peer_id = self.channels[slot].as_ref()
+            .ok_or(IpcError::InvalidChannel { id: channel_id })?
+            .peer_id()
+            .ok_or(IpcError::Closed)?;
+
+        // Update peer_owner on the peer channel
+        let peer_slot = self.find_slot(peer_id).ok_or(IpcError::InvalidChannel { id: peer_id })?;
+        let peer = self.channels[peer_slot].as_mut()
+            .ok_or(IpcError::InvalidChannel { id: peer_id })?;
+        peer.set_peer_owner(new_peer_owner);
+        Ok(())
+    }
+
 }
 
 impl Default for ChannelTable {

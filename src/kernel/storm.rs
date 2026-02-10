@@ -226,11 +226,11 @@ pub fn check_syscall_storm(num: u64) -> StormAction {
     super::task::with_scheduler(|sched| {
         let slot = super::task::current_slot();
         if let Some(task) = sched.task_mut(slot) {
-            // Use logical ticks computed from hardware counter (not IRQ-incremented)
-            let current_tick = crate::platform::current::timer::logical_ticks();
+            // Record activity using raw counter (liveness expects counter units)
+            task.record_activity(crate::platform::current::timer::counter());
 
-            // Record activity and check for syscall storm
-            task.record_activity(current_tick);
+            // Storm rate-limiting uses logical ticks (100/s granularity)
+            let current_tick = crate::platform::current::timer::logical_ticks();
             let config = StormConfig::new();
             let action = task.record_storm_syscall(current_tick, &config);
 

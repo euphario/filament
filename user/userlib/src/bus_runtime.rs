@@ -22,6 +22,7 @@ use crate::bus::{
 use crate::bus_block::ShmemBlockPort;
 use crate::devd::{DevdClient, DevdCommand};
 use crate::ipc::{Channel, Mux, MuxFilter};
+use crate::query::{QueryHeader, SpawnChildContext, SpawnContextResponse, msg as query_msg, port_type as qport_type, error as query_error};
 use crate::syscall::{self, Handle, LogLevel};
 
 // ============================================================================
@@ -34,6 +35,12 @@ const MAX_BLOCK_PORTS: usize = MAX_PORTS;
 /// Maximum driver-registered handles.
 const MAX_DRIVER_HANDLES: usize = 32;
 
+/// Maximum children this driver can relay for.
+const MAX_CHILDREN: usize = 8;
+
+/// Maximum forwarded requests awaiting relay response.
+const MAX_FORWARDED: usize = 16;
+
 /// Tag for devd channel in handle registry.
 const TAG_DEVD: u32 = 0xFFFF_FF00;
 
@@ -42,6 +49,9 @@ const TAG_BLOCK_PORT_BASE: u32 = 0xFFFF_FE00;
 
 /// Tag base for kernel bus channels.
 const TAG_KERNEL_BUS_BASE: u32 = 0xFFFF_FD00;
+
+/// Tag base for child supervision channels.
+const TAG_CHILD_BASE: u32 = 0xFFFF_FC00;
 
 // ============================================================================
 // Handle Registry
@@ -92,6 +102,43 @@ impl HandleRegistry {
         }
         None
     }
+}
+
+// ============================================================================
+// Child Entry (for parent-child relay)
+// ============================================================================
+
+/// Spawn context cached for a child — used to answer GET_SPAWN_CONTEXT locally.
+struct ChildSpawnCtx {
+    port_type: u8,
+    port_id: u8,
+    port_name: [u8; 64],
+    port_name_len: u8,
+    metadata: [u8; 64],
+    metadata_len: u8,
+    shmem_id: u32,
+    context_kvs: [([u8; 32], u8, [u8; 64], u8); 4],
+    context_kv_count: u8,
+}
+
+/// A child spawned by this driver via EXEC_WITH_CHANNEL.
+struct ChildEntry {
+    /// Supervision channel to the child.
+    channel: Channel,
+    /// Child PID.
+    pid: u32,
+    /// Cached spawn context for answering GET_SPAWN_CONTEXT.
+    ctx: ChildSpawnCtx,
+}
+
+/// A request forwarded from child to devd, awaiting response relay.
+struct ForwardedRequest {
+    /// Sequence ID used toward devd (high-bit range).
+    devd_seq_id: u32,
+    /// Index into children array.
+    child_idx: u8,
+    /// Original sequence ID from the child.
+    child_seq_id: u32,
 }
 
 // ============================================================================
@@ -197,6 +244,14 @@ struct RuntimeCtx {
     pending: [Option<PendingRequest>; MAX_PENDING],
     /// Number of active pending requests.
     pending_count: usize,
+    /// Children spawned by this driver (parent-child relay).
+    children: [Option<ChildEntry>; MAX_CHILDREN],
+    /// Number of active children.
+    child_count: usize,
+    /// Forwarded requests from children → devd awaiting response relay.
+    forwarded: [Option<ForwardedRequest>; MAX_FORWARDED],
+    /// Next sequence ID for forwarded requests (high-bit range).
+    forwarded_next_seq: u32,
 }
 
 impl RuntimeCtx {
@@ -221,6 +276,10 @@ impl RuntimeCtx {
             spawn_ctx: SpawnCtxCache::NotQueried,
             pending: [const { None }; MAX_PENDING],
             pending_count: 0,
+            children: [const { None }; MAX_CHILDREN],
+            child_count: 0,
+            forwarded: [const { None }; MAX_FORWARDED],
+            forwarded_next_seq: 0x4000_0001,
         }
     }
 
@@ -303,7 +362,9 @@ impl RuntimeCtx {
     /// Register the devd channel with the Mux.
     fn register_devd_handle(&mut self) {
         if let Some(h) = self.devd.handle() {
-            let _ = self.mux.add(h, MuxFilter::Readable);
+            if self.mux.add(h, MuxFilter::Readable).is_err() {
+                syscall::klog(LogLevel::Error, b"[bus] devd mux_add failed");
+            }
             self.handles.add(h, TAG_DEVD);
         }
     }
@@ -315,7 +376,9 @@ impl RuntimeCtx {
         if let Some(ref port) = self.block_ports[port_idx] {
             if let Some(h) = port.mux_handle() {
                 let tag = TAG_BLOCK_PORT_BASE + port_idx as u32;
-                let _ = self.mux.add(h, MuxFilter::Readable);
+                if self.mux.add(h, MuxFilter::Readable).is_err() {
+                    syscall::klog(LogLevel::Error, b"[bus] port mux_add failed");
+                }
                 self.handles.add(h, tag);
             }
         }
@@ -551,13 +614,20 @@ impl BusCtx for RuntimeCtx {
     }
 
     fn spawn_context(&mut self) -> Result<&SpawnContext, BusError> {
-        // Query devd on first call, cache the result
+        // Query devd (or parent relay) on first call, cache the result.
+        //
+        // The response may include an extra 4 bytes of shmem_id LE appended
+        // after the standard SpawnContextResponse (sent by parent relay).
+        // Root-mode devd responses omit this — shmem_id defaults to 0.
         if matches!(self.spawn_ctx, SpawnCtxCache::NotQueried) {
             match self.devd.get_spawn_context() {
-                Ok(Some((name_buf, name_len, port_class, meta_buf, meta_len))) => {
-                    self.spawn_ctx = SpawnCtxCache::Cached(
-                        SpawnContext::new(&name_buf, name_len, port_class, &meta_buf[..meta_len]),
-                    );
+                Ok(Some((name_buf, name_len, port_class, meta_buf, meta_len, port_id, kvs, kv_count, shmem_id))) => {
+                    let mut ctx = SpawnContext::new(&name_buf, name_len, port_class, &meta_buf[..meta_len], port_id);
+                    if kv_count > 0 {
+                        ctx.set_context_kvs(&kvs, kv_count);
+                    }
+                    ctx.shmem_id = shmem_id;
+                    self.spawn_ctx = SpawnCtxCache::Cached(ctx);
                 }
                 Ok(None) => {
                     self.spawn_ctx = SpawnCtxCache::NotSpawned;
@@ -576,7 +646,45 @@ impl BusCtx for RuntimeCtx {
         }
     }
 
-    fn discover_port(&mut self, name: &[u8]) -> Result<u32, BusError> {
+    fn discover_port(&mut self) -> Result<u32, BusError> {
+        // Check cached spawn context first — parent relay provides shmem_id
+        // directly, avoiding a round-trip query to devd.
+        if let SpawnCtxCache::Cached(ctx) = &self.spawn_ctx {
+            if ctx.shmem_id != 0 {
+                return Ok(ctx.shmem_id);
+            }
+        }
+
+        // Use port_id from spawn context — unambiguous tree-based identity
+        let port_id = match &self.spawn_ctx {
+            SpawnCtxCache::Cached(ctx) if ctx.port_id != 0xFF => ctx.port_id,
+            SpawnCtxCache::Cached(_) => return Err(BusError::NotFound),
+            SpawnCtxCache::NotSpawned => return Err(BusError::NotFound),
+            SpawnCtxCache::NotQueried => {
+                // Query spawn context first
+                if let Err(e) = BusCtx::spawn_context(self).map(|_| ()) {
+                    return Err(e);
+                }
+                // Re-check shmem_id from freshly cached context
+                if let SpawnCtxCache::Cached(ctx) = &self.spawn_ctx {
+                    if ctx.shmem_id != 0 {
+                        return Ok(ctx.shmem_id);
+                    }
+                    if ctx.port_id != 0xFF { ctx.port_id } else { return Err(BusError::NotFound); }
+                } else {
+                    return Err(BusError::NotFound);
+                }
+            }
+        };
+
+        match self.devd.query_port_shmem_id_by_id(port_id) {
+            Ok(Some(shmem_id)) => Ok(shmem_id),
+            Ok(None) => Err(BusError::NotFound),
+            Err(_) => Err(BusError::LinkDown),
+        }
+    }
+
+    fn discover_port_by_name(&mut self, name: &[u8]) -> Result<u32, BusError> {
         match self.devd.query_port_shmem_id(name) {
             Ok(Some(shmem_id)) => Ok(shmem_id),
             Ok(None) => Err(BusError::NotFound),
@@ -709,12 +817,24 @@ impl<D: Driver> DriverRuntime<D> {
             };
 
             if tag == TAG_DEVD {
-                // Devd channel is readable — process one command per wake
-                match self.ctx.devd.poll_command() {
-                    Ok(Some(cmd)) => {
-                        self.dispatch_devd_command(cmd);
+                // Devd channel is readable — read raw bytes first.
+                // Check if the message is a response to a forwarded child request.
+                // If so, relay it to the child and skip normal dispatch.
+                let mut raw_buf = [0u8; 512];
+                match self.ctx.devd.raw_recv(&mut raw_buf) {
+                    Ok(Some(n)) if n >= QueryHeader::SIZE => {
+                        if !self.try_relay_to_child(&raw_buf, n) {
+                            // Not a forwarded response — parse as normal command
+                            match DevdClient::parse_command_buf(&raw_buf[..n]) {
+                                Ok(Some(cmd)) => {
+                                    self.dispatch_devd_command(cmd);
+                                }
+                                Ok(None) => {}
+                                Err(_) => {}
+                            }
+                        }
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(_) => {
                         // Devd channel broken — remove from Mux to prevent hot-loop.
                         // Driver continues running with existing state but cannot
@@ -723,6 +843,10 @@ impl<D: Driver> DriverRuntime<D> {
                         self.ctx.handles.remove(handle);
                     }
                 }
+            } else if tag >= TAG_CHILD_BASE && tag < TAG_KERNEL_BUS_BASE {
+                // Child supervision channel message — relay or answer locally
+                let child_idx = (tag - TAG_CHILD_BASE) as usize;
+                self.handle_child_message(child_idx);
             } else if tag >= TAG_KERNEL_BUS_BASE && tag < TAG_BLOCK_PORT_BASE {
                 // Kernel bus state notification
                 let bus_idx = (tag - TAG_KERNEL_BUS_BASE) as usize;
@@ -790,20 +914,48 @@ impl<D: Driver> DriverRuntime<D> {
     /// The framework intercepts known types (spawn, stop, config) before
     /// the driver sees them. Everything else goes to `driver.command()`.
     fn dispatch_devd_command(&mut self, cmd: DevdCommand) {
-        // SpawnChild: framework spawns the child and acks back to devd.
-        if let DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, .. } = &cmd {
+        // SpawnChild: framework spawns the child with a supervision channel.
+        // Creates a channel pair, passes one end to child via exec_with_channel,
+        // keeps the other end for parent-child relay.
+        if let DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, filter, context } = &cmd {
             let name = core::str::from_utf8(&binary[..*binary_len]).unwrap_or("???");
-            let pid = if *caps != 0 {
-                syscall::exec_with_caps(name, *caps)
-            } else {
-                syscall::exec(name)
+
+            // Create channel pair for parent-child supervision
+            let spawn_result = match Channel::pair() {
+                Ok((parent_end, child_end)) => {
+                    let child_handle = child_end.into_raw_handle();
+                    let p = syscall::exec_with_channel(name, *caps, child_handle);
+                    if p > 0 {
+                        Some((parent_end, p as u32))
+                    } else {
+                        drop(parent_end);
+                        None
+                    }
+                }
+                Err(_) => None,
             };
-            let (result, child_pid) = if pid > 0 {
-                (0i32, pid as u32)
+
+            // Fallback: spawn without channel
+            let (result, child_pid) = if let Some((parent_end, pid)) = spawn_result {
+                // Store ChildEntry for relay
+                let stored = self.store_child_entry(parent_end, pid, filter, context.as_ref());
+                if !stored {
+                    syscall::klog(LogLevel::Warn, b"[bus] no child slot");
+                }
+                (0i32, pid)
             } else {
-                (-1i32, 0u32)
+                // Channel pair failed — fall back to plain spawn (no relay)
+                let pid = if *caps != 0 {
+                    syscall::exec_with_caps(name, *caps)
+                } else {
+                    syscall::exec(name)
+                };
+                if pid > 0 { (0i32, pid as u32) } else { (-1i32, 0u32) }
             };
-            let _ = self.ctx.devd.ack_spawn(*seq_id, result, child_pid);
+
+            if self.ctx.devd.ack_spawn(*seq_id, result, child_pid).is_err() {
+                syscall::klog(LogLevel::Warn, b"[bus] spawn_ack failed");
+            }
             return;
         }
 
@@ -862,6 +1014,266 @@ impl<D: Driver> DriverRuntime<D> {
             }
         }
     }
+
+    /// Store a ChildEntry for a newly spawned child and register its channel
+    /// with the Mux.
+    fn store_child_entry(
+        &mut self,
+        parent_end: Channel,
+        pid: u32,
+        filter: &crate::devd::SpawnFilter,
+        context: Option<&SpawnChildContext>,
+    ) -> bool {
+        // Find free slot
+        let slot = match self.ctx.children.iter().position(|c| c.is_none()) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Build ChildSpawnCtx from filter pattern (port name) and context
+        let mut spawn_ctx = ChildSpawnCtx {
+            port_type: 0,
+            port_id: 0xFF,
+            port_name: [0u8; 64],
+            port_name_len: 0,
+            metadata: [0u8; 64],
+            metadata_len: 0,
+            shmem_id: 0,
+            context_kvs: [([0u8; 32], 0u8, [0u8; 64], 0u8); 4],
+            context_kv_count: 0,
+        };
+
+        // Port name from filter pattern (exact match)
+        let pname = filter.pattern_bytes();
+        let plen = pname.len().min(64);
+        spawn_ctx.port_name[..plen].copy_from_slice(&pname[..plen]);
+        spawn_ctx.port_name_len = plen as u8;
+
+        // Fill from context if available
+        if let Some(ctx) = context {
+            spawn_ctx.port_type = ctx.port_type;
+            spawn_ctx.port_id = ctx.port_id;
+            spawn_ctx.shmem_id = ctx.shmem_id;
+            let mlen = ctx.metadata_len as usize;
+            spawn_ctx.metadata[..mlen].copy_from_slice(&ctx.metadata[..mlen]);
+            spawn_ctx.metadata_len = ctx.metadata_len;
+            let kv_n = (ctx.kv_count as usize).min(4);
+            for i in 0..kv_n {
+                let klen = ctx.kv_keys_len[i] as usize;
+                let vlen = ctx.kv_values_len[i] as usize;
+                spawn_ctx.context_kvs[i].0[..klen].copy_from_slice(&ctx.kv_keys[i][..klen]);
+                spawn_ctx.context_kvs[i].1 = klen as u8;
+                spawn_ctx.context_kvs[i].2[..vlen].copy_from_slice(&ctx.kv_values[i][..vlen]);
+                spawn_ctx.context_kvs[i].3 = vlen as u8;
+            }
+            spawn_ctx.context_kv_count = kv_n as u8;
+        }
+
+        // Register channel with Mux
+        let ch_handle = parent_end.handle();
+        let tag = TAG_CHILD_BASE + slot as u32;
+        if self.ctx.mux.add(ch_handle, MuxFilter::Readable).is_err() {
+            syscall::klog(LogLevel::Error, b"[bus] child mux_add failed");
+            return false;
+        }
+        self.ctx.handles.add(ch_handle, tag);
+
+        self.ctx.children[slot] = Some(ChildEntry {
+            channel: parent_end,
+            pid,
+            ctx: spawn_ctx,
+        });
+        self.ctx.child_count += 1;
+
+        true
+    }
+
+    /// Handle a message from a child's supervision channel.
+    ///
+    /// Dispatches locally for GET_SPAWN_CONTEXT, forwards everything else
+    /// to devd with response relay tracking.
+    fn handle_child_message(&mut self, child_idx: usize) {
+        let mut buf = [0u8; 512];
+
+        // Read message from child
+        let n = match &mut self.ctx.children[child_idx] {
+            Some(entry) => match entry.channel.try_recv(&mut buf) {
+                Ok(Some(n)) if n >= QueryHeader::SIZE => n,
+                Ok(Some(_)) => return, // Too small, ignore
+                Ok(None) => return,    // No data yet
+                Err(_) => {
+                    // Channel error (PeerClosed, etc.) — child died.
+                    // Remove from Mux and free the slot to prevent hot-loop starvation.
+                    syscall::klog(LogLevel::Info, b"[bus] child channel closed");
+                    let handle = entry.channel.handle();
+                    let _ = self.ctx.mux.remove(handle);
+                    self.ctx.handles.remove(handle);
+                    self.ctx.children[child_idx] = None;
+                    if self.ctx.child_count > 0 { self.ctx.child_count -= 1; }
+                    return;
+                }
+            },
+            None => return,
+        };
+
+        let header = match QueryHeader::from_bytes(&buf[..n]) {
+            Some(h) => h,
+            None => return,
+        };
+
+        match header.msg_type {
+            // GET_SPAWN_CONTEXT: answer locally from stored ChildSpawnCtx
+            query_msg::GET_SPAWN_CONTEXT => {
+                self.reply_spawn_context(child_idx, header.seq_id);
+            }
+
+            // REGISTER_PORT_INFO / SET_PORT_STATE / QUERY_PORT / UPDATE_PORT_SHMEM_ID:
+            // Forward to devd with response relay tracking
+            query_msg::REGISTER_PORT_INFO
+            | query_msg::SET_PORT_STATE
+            | query_msg::QUERY_PORT
+            | query_msg::UPDATE_PORT_SHMEM_ID => {
+                self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
+            }
+
+            // STATE_CHANGE: fire-and-forget forward to devd
+            query_msg::STATE_CHANGE => {
+                let _ = self.ctx.devd.raw_send(&buf[..n]);
+            }
+
+            // LOG_MESSAGE: fire-and-forget forward to devd
+            query_msg::LOG_MESSAGE => {
+                let _ = self.ctx.devd.raw_send(&buf[..n]);
+            }
+
+            // Unknown: forward to devd
+            _ => {
+                self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
+            }
+        }
+    }
+
+    /// Reply to a child's GET_SPAWN_CONTEXT with locally cached data.
+    fn reply_spawn_context(&mut self, child_idx: usize, seq_id: u32) {
+        let entry = match &self.ctx.children[child_idx] {
+            Some(e) => e,
+            None => return,
+        };
+        let c = &entry.ctx;
+
+        // Convert port_type to legacy port_type constant for wire format
+        let resp = SpawnContextResponse {
+            header: QueryHeader::new(query_msg::SPAWN_CONTEXT, seq_id),
+            result: query_error::OK,
+            port_type: c.port_type,
+            port_name_len: c.port_name_len,
+            metadata_len: c.metadata_len,
+            port_id: c.port_id,
+        };
+
+        // Build KV refs for write_to_full
+        let kv_n = c.context_kv_count as usize;
+        let mut kv_refs: [(&[u8], &[u8]); 4] = [(&[], &[]); 4];
+        for i in 0..kv_n {
+            let klen = c.context_kvs[i].1 as usize;
+            let vlen = c.context_kvs[i].3 as usize;
+            kv_refs[i] = (&c.context_kvs[i].0[..klen], &c.context_kvs[i].2[..vlen]);
+        }
+
+        let port_name = &c.port_name[..c.port_name_len as usize];
+        let metadata = &c.metadata[..c.metadata_len as usize];
+
+        let mut reply_buf = [0u8; 512];
+        if let Some(len) = resp.write_to_full(&mut reply_buf, port_name, metadata, &kv_refs[..kv_n]) {
+            // Also append shmem_id after the standard spawn context response.
+            // The child's bus_runtime will pick this up to populate SpawnContext.shmem_id.
+            // Wire: after KV section, append shmem_id(4 bytes LE).
+            if len + 4 <= reply_buf.len() {
+                reply_buf[len..len + 4].copy_from_slice(&c.shmem_id.to_le_bytes());
+                let total = len + 4;
+                if let Some(entry) = &mut self.ctx.children[child_idx] {
+                    let _ = entry.channel.send(&reply_buf[..total]);
+                }
+            }
+        }
+    }
+
+    /// Forward a child message to devd with seq_id rewriting for response relay.
+    fn forward_to_devd(&mut self, child_idx: usize, child_seq_id: u32, msg: &[u8]) {
+        // Allocate forwarded seq_id
+        let devd_seq = self.ctx.forwarded_next_seq;
+        self.ctx.forwarded_next_seq = self.ctx.forwarded_next_seq.wrapping_add(1);
+        if self.ctx.forwarded_next_seq < 0x4000_0001 {
+            self.ctx.forwarded_next_seq = 0x4000_0001;
+        }
+
+        // Store forwarding record
+        let stored = self.ctx.forwarded.iter_mut()
+            .find(|f| f.is_none())
+            .map(|slot| {
+                *slot = Some(ForwardedRequest {
+                    devd_seq_id: devd_seq,
+                    child_idx: child_idx as u8,
+                    child_seq_id,
+                });
+                true
+            })
+            .unwrap_or(false);
+
+        if !stored {
+            syscall::klog(LogLevel::Error, b"[bus] fwd table full, dropping child request");
+            return;
+        }
+
+        // Rewrite seq_id in message and send to devd
+        let mut fwd = [0u8; 512];
+        let len = msg.len().min(512);
+        fwd[..len].copy_from_slice(&msg[..len]);
+        // seq_id is at offset 4..8 in QueryHeader
+        fwd[4..8].copy_from_slice(&devd_seq.to_le_bytes());
+        let _ = self.ctx.devd.raw_send(&fwd[..len]);
+    }
+
+    /// Check if a devd response matches a forwarded request and relay it to the child.
+    ///
+    /// Returns true if the message was relayed (caller should NOT dispatch it locally).
+    fn try_relay_to_child(&mut self, buf: &[u8], len: usize) -> bool {
+        if len < QueryHeader::SIZE { return false; }
+        let header = match QueryHeader::from_bytes(&buf[..len]) {
+            Some(h) => h,
+            None => return false,
+        };
+
+        // Check if this seq_id matches any forwarded request
+        let seq = header.seq_id;
+        let mut found: Option<(u8, u32)> = None;
+        for slot in &mut self.ctx.forwarded {
+            if let Some(fwd) = slot {
+                if fwd.devd_seq_id == seq {
+                    found = Some((fwd.child_idx, fwd.child_seq_id));
+                    *slot = None;
+                    break;
+                }
+            }
+        }
+
+        let (child_idx, child_seq) = match found {
+            Some(f) => f,
+            None => return false,
+        };
+
+        // Rewrite seq_id back to child's original and send
+        let mut relay = [0u8; 512];
+        let rlen = len.min(512);
+        relay[..rlen].copy_from_slice(&buf[..rlen]);
+        relay[4..8].copy_from_slice(&child_seq.to_le_bytes());
+
+        if let Some(entry) = &mut self.ctx.children[child_idx as usize] {
+            let _ = entry.channel.send(&relay[..rlen]);
+        }
+
+        true
+    }
 }
 
 // ============================================================================
@@ -870,19 +1282,37 @@ impl<D: Driver> DriverRuntime<D> {
 
 /// Entry point for all drivers using the bus framework. Never returns.
 ///
-/// Connects to devd, creates a Mux, and enters the event-driven loop.
-/// The runtime blocks on `Mux::wait()` — no polling, no sleep loops.
+/// Checks Handle::SUPERVISION (slot 4) first for tree mode — if valid,
+/// uses it as the supervision channel to the parent driver. Otherwise
+/// connects to devd directly as a root-level driver.
 ///
 /// # Arguments
 /// * `name` - Driver name (for logging and identification)
 /// * `driver` - The Driver implementation
 pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
-    // Connect to devd
-    let devd = match DevdClient::connect() {
-        Ok(c) => c,
-        Err(_) => {
-            syscall::klog(LogLevel::Error, b"[bus] devd connect failed");
-            syscall::exit(1);
+    // Try tree mode first: check if handle 4 (SUPERVISION) is a valid, connected channel.
+    // Probe with a zero-length read:
+    //   BadFd → handle doesn't exist (root mode)
+    //   ConnectionReset/PeerClosed → handle exists but peer dropped (fall back to root mode)
+    //   WouldBlock/Ok → handle exists and peer is alive (tree mode)
+    let devd = {
+        let mut probe = [0u8; 0];
+        let supervision_alive = match crate::syscall::read(abi::Handle::SUPERVISION, &mut probe) {
+            Err(crate::error::SysError::BadFd) => false,
+            _ => true, // WouldBlock or Ok means handle exists and peer is alive
+        };
+
+        if supervision_alive {
+            let ch = Channel::from_raw_handle(abi::Handle::SUPERVISION);
+            DevdClient::from_channel(ch)
+        } else {
+            match DevdClient::connect() {
+                Ok(c) => c,
+                Err(_) => {
+                    syscall::klog(LogLevel::Error, b"[bus] devd connect failed");
+                    syscall::exit(1);
+                }
+            }
         }
     };
 

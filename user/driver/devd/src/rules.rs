@@ -6,7 +6,6 @@
 //! Hardware-layer rules (kernel bus ports → bus drivers):
 //!   PortClass::Pcie → pcied
 //!   PortClass::Uart → consoled
-//!   PortClass::Klog → logd
 //!   PortClass::Ethernet → ethd
 //!
 //! Driver-layer rules (driver ports → children):
@@ -56,6 +55,10 @@ pub struct PortRule {
     pub driver: &'static str,
     /// Capability bits for spawned child
     pub caps: u64,
+    /// Context key-value pairs to pass to spawned child.
+    /// Values may contain `{key}` placeholders expanded against the
+    /// enriched KV bag from the port's registration chain.
+    pub context: &'static [(&'static str, &'static str)],
 }
 
 impl PortRule {
@@ -93,31 +96,30 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Any,
         driver: "pcied",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Usb,
         subclass: SubclassMatch::Exact(port_subclass::USB_XHCI),
         driver: "usbd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Ethernet,
         subclass: SubclassMatch::Any,
         driver: "ethd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Uart,
         subclass: SubclassMatch::Any,
         driver: "consoled",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
-    PortRule {
-        class: PortClass::Klog,
-        subclass: SubclassMatch::Any,
-        driver: "logd",
-        caps: userlib::devd::caps::DRIVER,
-    },
+    // Klog→logd rule removed: logd needs rewrite for 5-syscall API
 
     // =========================================================================
     // Driver layer (driver ports → children)
@@ -127,60 +129,70 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Any,
         driver: "shell",
         caps: userlib::devd::caps::USER,
+        context: &[],
     },
     PortRule {
         class: PortClass::StorageController,
         subclass: SubclassMatch::Exact(port_subclass::STORAGE_NVME),
         driver: "nvmed",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH),
         driver: "switchd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH_PORT),
         driver: "ipd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_BRIDGE_GROUP),
         driver: "ipd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_ETHERNET),
         driver: "ipd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_WIFI),
         driver: "wifid",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Block,
         subclass: SubclassMatch::Exact(port_subclass::BLOCK_RAW),
         driver: "partd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
     PortRule {
         class: PortClass::Block,
         subclass: SubclassMatch::OneOf(FAT_SUBCLASSES),
         driver: "fatfsd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[("mount.path", "mnt/{block.name}.{trigger.name}")],
     },
     PortRule {
         class: PortClass::Block,
         subclass: SubclassMatch::Exact(port_subclass::BLOCK_LINUX),
         driver: "ext2fsd",
         caps: userlib::devd::caps::DRIVER,
+        context: &[],
     },
 ];
 
@@ -250,11 +262,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rule_klog() {
+    fn test_rule_klog_no_match() {
+        // Klog rule removed (logd needs rewrite)
         let info = make_port_info(PortClass::Klog, 0);
         let rule = find_port_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "logd");
+        assert!(rule.is_none());
     }
 
     #[test]

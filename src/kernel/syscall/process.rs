@@ -183,6 +183,61 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
     }
 }
 
+/// Execute a program with caps, transferring a channel handle to the child
+/// Args: path_ptr, path_len, capabilities (bitmask), channel_handle (raw u32)
+/// Returns: child PID on success, negative error on failure
+/// The channel handle is removed from parent's table and placed in child's table at slot 4
+pub(super) fn sys_exec_with_channel(path_ptr: u64, path_len: usize, capabilities: u64, channel_handle: u32) -> i64 {
+    let ctx = create_syscall_context();
+
+    // Require SPAWN capability
+    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
+        return KernelError::PermDenied.to_errno();
+    }
+
+    // Require GRANT capability to delegate capabilities to children
+    if let Err(_) = ctx.require_capability(Capabilities::GRANT.bits()) {
+        return KernelError::PermDenied.to_errno();
+    }
+
+    // Validate path length
+    if path_len == 0 || path_len > 127 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    // Validate channel handle is non-zero
+    if channel_handle == 0 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    // Copy path from user space
+    let mut path_buf = [0u8; 128];
+    match uaccess::copy_from_user(&mut path_buf[..path_len], path_ptr) {
+        Ok(_) => {}
+        Err(e) => return uaccess_to_errno(e),
+    }
+
+    // Parse path from kernel buffer
+    let path = match core::str::from_utf8(&path_buf[..path_len]) {
+        Ok(s) => s,
+        Err(_) => return KernelError::InvalidArg.to_errno(),
+    };
+
+    // Get current PID as parent
+    let parent_id = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return KernelError::NoProcess.to_errno(),
+    };
+
+    // Convert capabilities bitmask to trait type
+    let trait_caps = crate::kernel::traits::task::Capabilities(capabilities);
+
+    match ctx.process().spawn(parent_id, SpawnSource::PathWithCapsAndChannel(path, trait_caps, channel_handle)) {
+        Ok(child_id) => child_id as i64,
+        Err(e) => e.to_errno(),
+    }
+}
+
 /// Execute ELF binary from a memory buffer
 /// Args:
 ///   elf_ptr: Pointer to ELF data in userspace

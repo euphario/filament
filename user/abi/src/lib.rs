@@ -42,6 +42,7 @@ pub mod syscall {
     pub const KLOG_READ: u64 = 65;
     pub const GET_CAPABILITIES: u64 = 66;
     pub const EXEC_WITH_CAPS: u64 = 74;
+    pub const EXEC_WITH_CHANNEL: u64 = 75;
     pub const KLOG: u64 = 76;
     pub const KLOG_WRITE: u64 = 77;
 
@@ -255,6 +256,8 @@ impl Handle {
     pub const STDOUT: Handle = Handle((1 << 24) | 2);
     /// Pre-allocated stderr handle
     pub const STDERR: Handle = Handle((1 << 24) | 3);
+    /// Supervision channel handle (slot 4, set by exec_with_channel)
+    pub const SUPERVISION: Handle = Handle((1 << 24) | 4);
 
     #[inline]
     pub const fn new(index: usize, generation: u8) -> Self {
@@ -1525,34 +1528,35 @@ impl UsbMetadata {
 #[derive(Clone, Copy)]
 pub struct PortInfo {
     /// Port name (becomes the IPC port name, null-terminated)
-    pub name: [u8; PORT_NAME_MAX],
+    pub name: [u8; PORT_NAME_MAX],         // 32  offset 0
     /// Length of name (excluding null terminator)
-    pub name_len: u8,
+    pub name_len: u8,                       //  1  offset 32
+    _pad0: u8,                              //  1  offset 33
 
     /// What kind of port is this?
-    pub port_class: PortClass,
+    pub port_class: PortClass,              //  2  offset 34
 
     /// Subclass for finer matching (class-specific, see port_subclass)
-    pub port_subclass: u16,
+    pub port_subclass: u16,                 //  2  offset 36
 
-    /// Parent port name (empty = root level)
-    pub parent: [u8; PORT_NAME_MAX],
-    /// Length of parent name
-    pub parent_len: u8,
+    /// Parent port ID (0xFF = root / no parent)
+    pub parent_port_id: u8,                 //  1  offset 38
+    _pad1: u8,                              //  1  offset 39
 
     /// Hardware vendor ID (0 = not applicable)
-    pub vendor_id: u16,
+    pub vendor_id: u16,                     //  2  offset 40
     /// Hardware device ID (0 = not applicable)
-    pub device_id: u16,
+    pub device_id: u16,                     //  2  offset 42
 
     /// Capability flags (see port_caps)
-    pub caps: u16,
+    pub caps: u16,                          //  2  offset 44
+    _pad2: [u8; 2],                         //  2  offset 46
 
     /// Type-safe metadata (interpretation depends on port_class)
-    pub metadata: PortMetadata,
+    pub metadata: PortMetadata,             // 24  offset 48
 
     /// Reserved for future use
-    pub _reserved: [u8; 4],
+    pub _reserved: [u8; 40],               // 40  offset 72
 }
 
 // Size assertion: ensure PortInfo has a stable size
@@ -1568,15 +1572,17 @@ impl PortInfo {
         Self {
             name: [0; PORT_NAME_MAX],
             name_len: 0,
+            _pad0: 0,
             port_class: PortClass::Unknown,
             port_subclass: 0,
-            parent: [0; PORT_NAME_MAX],
-            parent_len: 0,
+            parent_port_id: 0xFF,
+            _pad1: 0,
             vendor_id: 0,
             device_id: 0,
             caps: 0,
+            _pad2: [0; 2],
             metadata: PortMetadata { raw: [0; 24] },
-            _reserved: [0; 4],
+            _reserved: [0; 40],
         }
     }
 
@@ -1599,19 +1605,6 @@ impl PortInfo {
     /// Get the port name as a byte slice
     pub fn name_bytes(&self) -> &[u8] {
         &self.name[..self.name_len as usize]
-    }
-
-    /// Set the parent port name
-    pub fn set_parent(&mut self, parent: &[u8]) {
-        let len = parent.len().min(PORT_NAME_MAX - 1);
-        self.parent[..len].copy_from_slice(&parent[..len]);
-        self.parent[len] = 0;
-        self.parent_len = len as u8;
-    }
-
-    /// Get the parent name as a byte slice
-    pub fn parent_bytes(&self) -> &[u8] {
-        &self.parent[..self.parent_len as usize]
     }
 
     /// Check if this port has a specific capability

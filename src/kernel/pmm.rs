@@ -39,7 +39,8 @@
 
 use crate::{kinfo, kwarn, kdebug, print_direct, klog};
 use crate::kernel::arch::mmu;
-use crate::platform::current::{DRAM_BASE, DRAM_END, KERNEL_PHYS_BASE};
+use crate::platform::current::{DRAM_BASE, DRAM_END, KERNEL_PHYS_BASE,
+    DMA_POOL_BASE, DMA_POOL_SIZE, DMA_POOL_HIGH_BASE, DMA_POOL_HIGH_SIZE};
 use super::lock::SpinLock;
 
 /// Page size (4KB) - re-exported for other modules
@@ -196,6 +197,12 @@ impl PhysicalMemoryManager {
         // First page available for allocation
         self.first_free_page = frames_end_page;
 
+        // DMA pool reserved regions (managed by dma_pool.rs bump allocator)
+        let dma_start_page = (DMA_POOL_BASE as usize).saturating_sub(DRAM_BASE) / PAGE_SIZE;
+        let dma_end_page = dma_start_page + DMA_POOL_SIZE / PAGE_SIZE;
+        let dma_high_start_page = (DMA_POOL_HIGH_BASE as usize).saturating_sub(DRAM_BASE) / PAGE_SIZE;
+        let dma_high_end_page = dma_high_start_page + DMA_POOL_HIGH_SIZE / PAGE_SIZE;
+
         // Initialize all frames
         for i in 0..total_pages {
             let frame = self.frame_mut(i);
@@ -210,6 +217,12 @@ impl PhysicalMemoryManager {
                 frame.state = PageState::Reserved;
             } else if i >= frames_start_page && i < frames_end_page {
                 // Reserved: PageFrame array itself
+                frame.state = PageState::Reserved;
+            } else if i >= dma_start_page && i < dma_end_page {
+                // Reserved: DMA pool (managed by dma_pool.rs)
+                frame.state = PageState::Reserved;
+            } else if i >= dma_high_start_page && i < dma_high_end_page {
+                // Reserved: DMA pool high (managed by dma_pool.rs)
                 frame.state = PageState::Reserved;
             } else {
                 frame.state = PageState::Free;

@@ -812,8 +812,8 @@ impl Driver for PartitionDriver {
 
         uinfo!("partd", "attach"; port = core::str::from_utf8(port_name).unwrap_or("?"));
 
-        // 2. Discover the disk DataPort shmem_id via devd
-        let shmem_id = ctx.discover_port(port_name)?;
+        // 2. Discover the disk DataPort shmem_id via devd (uses port_id from spawn context)
+        let shmem_id = ctx.discover_port()?;
 
         // 3. Connect to the disk DataPort as consumer
         let consumer_port = ctx.connect_block_port(shmem_id)?;
@@ -890,7 +890,9 @@ impl Driver for PartitionDriver {
 
                         let mut info = PortInfo::new(&pname[..plen], PortClass::Block);
                         info.port_subclass = subclass;
-                        info.set_parent(port_name);
+                        // Set parent to the trigger port's ID from spawn context
+                        let parent_id = ctx.spawn_context().map(|sc| sc.port_id).unwrap_or(0xFF);
+                        info.parent_port_id = parent_id;
                         info.set_block_metadata(BlockMetadata {
                             size_bytes: p.sector_count * block_size as u64,
                             sector_size: block_size,

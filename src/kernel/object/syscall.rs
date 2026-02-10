@@ -1736,9 +1736,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 if *task.state() == task::TaskState::Ready {
                     crate::transition_or_evict!(task, set_running, cpu);
                 }
-                // Reset liveness — proves task is responsive
-                let current_tick = crate::platform::current::timer::logical_ticks();
-                task.record_activity(current_tick);
+                // Reset liveness — proves task is responsive (raw counter units)
+                task.record_activity(crate::platform::current::timer::counter());
                 task.reset_liveness_if_implicit_pong();
             }
         });
