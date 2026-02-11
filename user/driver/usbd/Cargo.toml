@@ -6,7 +6,7 @@ description = "USB host controller driver (xHCI, bus framework)"
 
 [dependencies]
 userlib = { path = "../../userlib" }
-usb = { path = "../usb" }
+usb = { path = "../usb", features = ["mt7988a"] }
 
 [profile.release]
 opt-level = "s"

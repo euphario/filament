@@ -31,7 +31,7 @@
 use super::pmm;
 use super::process::Pid;
 use super::lock::SpinLock;
-use crate::{kinfo, kwarn, kerror};
+use crate::{kdebug, kwarn, kerror};
 
 /// Maximum number of shared memory regions
 const MAX_SHMEM_REGIONS: usize = 32;
@@ -421,7 +421,7 @@ pub fn init() {
     }
     guard.next_id = 1;
     drop(guard);
-    kinfo!("shmem", "init_ok"; max_regions = MAX_SHMEM_REGIONS as u64);
+    kdebug!("shmem", "init_ok"; max_regions = MAX_SHMEM_REGIONS as u64);
 }
 
 /// Get a copy of a shared memory region by ID
@@ -736,7 +736,7 @@ pub fn set_public(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
                 }
 
                 region.is_public = true;
-                kinfo!("shmem", "set_public"; id = shmem_id as u64, owner = owner_pid as u64);
+                kdebug!("shmem", "set_public"; id = shmem_id as u64, owner = owner_pid as u64);
                 return Ok(());
             }
         }
@@ -1186,7 +1186,7 @@ pub fn begin_cleanup(pid: Pid) {
                 sched.wake_by_pid(owner_pid);
             });
 
-            kinfo!("shmem", "mapper_left_notify"; shmem_id = shmem_id as u64, mapper = pid as u64, owner = owner_pid as u64);
+            kdebug!("shmem", "mapper_left_notify"; shmem_id = shmem_id as u64, mapper = pid as u64, owner = owner_pid as u64);
         }
     }
 }
@@ -1384,5 +1384,5 @@ pub fn test() {
         kdebug!("shmem", "unique_ids_ok"; id1 = r1.0 as u64, id2 = r2.0 as u64);
     }
 
-    kinfo!("shmem", "test_ok");
+    kdebug!("shmem", "test_ok");
 }

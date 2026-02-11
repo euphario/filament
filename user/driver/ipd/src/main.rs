@@ -35,7 +35,7 @@ use userlib::bus_runtime::driver_main;
 use userlib::ipc::Timer;
 use userlib::ring::{SideEntry, side_msg, side_status};
 use userlib::syscall::Handle;
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, udebug, uerror};
 
 use device::{RxOffsetQueue, SmolDevice};
 use rsh::RemoteShell;
@@ -197,12 +197,12 @@ impl IpdDriver {
     fn try_discover_nic(&mut self, ctx: &mut dyn BusCtx) -> bool {
         match ctx.discover_port_by_name(NIC_PORT_NAME) {
             Ok(shmem_id) => {
-                uinfo!("ipd", "nic_found"; shmem_id = shmem_id);
+                udebug!("ipd", "nic_found"; shmem_id = shmem_id);
                 match ctx.connect_block_port(shmem_id) {
                     Ok(port_id) => {
                         self.nic_port = port_id;
                         self.nic_state = NicState::Probing;
-                        uinfo!("ipd", "nic_connected";);
+                        udebug!("ipd", "nic_connected";);
                         self.send_nic_query(ctx);
                         true
                     }
@@ -240,7 +240,7 @@ impl IpdDriver {
 
         self.mac.copy_from_slice(&response.payload[0..6]);
         let mtu = u16::from_le_bytes([response.payload[7], response.payload[8]]);
-        uinfo!("ipd", "nic_info";
+        udebug!("ipd", "nic_info";
             mac0 = self.mac[0] as u32,
             mac1 = self.mac[1] as u32,
             mac2 = self.mac[2] as u32,
@@ -251,7 +251,7 @@ impl IpdDriver {
 
         self.nic_state = NicState::Up;
         self.iface_ready = true;
-        uinfo!("ipd", "nic_up"; dhcp = "starting");
+        udebug!("ipd", "nic_up"; dhcp = "starting");
     }
 
     // =========================================================================
@@ -339,8 +339,8 @@ impl IpdDriver {
         // Arm the DHCP fallback timer — if no DHCP response in 10s, use static IP
         self.arm_dhcp_fallback_timer(ctx);
 
-        uinfo!("ipd", "smoltcp_ready"; sockets = SOCKET_SLOTS as u32);
-        uinfo!("ipd", "dhcp_start";);
+        udebug!("ipd", "smoltcp_ready"; sockets = SOCKET_SLOTS as u32);
+        udebug!("ipd", "dhcp_start";);
     }
 
     // =========================================================================
@@ -973,15 +973,15 @@ impl Driver for IpdDriver {
         // group_id defaults to 0 (all ports in one bridge group).
         // When multiple bridge groups exist, switchd registers per-group ports
         // (br0:, br1:) and the group_id will be set via sidechannel query.
-        uinfo!("ipd", "starting"; group_id = self.group_id as u32);
+        udebug!("ipd", "starting"; group_id = self.group_id as u32);
 
         if self.try_discover_nic(ctx) {
             self.discovering = false;
-            uinfo!("ipd", "nic_probing";);
+            udebug!("ipd", "nic_probing";);
         } else {
             self.discovering = true;
             self.arm_discovery_timer(ctx);
-            uinfo!("ipd", "waiting_for_nic";);
+            udebug!("ipd", "waiting_for_nic";);
         }
 
         Ok(())
@@ -1051,7 +1051,7 @@ impl Driver for IpdDriver {
                         let _ = ctx.unwatch_handle(timer.handle());
                     }
                     self.discovery_timer = None;
-                    uinfo!("ipd", "nic_probing";);
+                    udebug!("ipd", "nic_probing";);
                 } else {
                     self.arm_discovery_timer(ctx);
                 }

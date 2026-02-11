@@ -32,7 +32,7 @@ use userlib::bus_runtime::driver_main;
 use userlib::ipc::Timer;
 use userlib::ring::{IoSqe, SideEntry, io_op, side_msg, side_status};
 use userlib::syscall::Handle;
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, udebug, uerror};
 
 use types::{EthAddr, Ipv4Addr, ethertype, ip_proto};
 use nic::{NicTable, NicState};
@@ -92,11 +92,11 @@ impl NetSvcDriver {
     fn try_discover_nic(&mut self, ctx: &mut dyn BusCtx) -> bool {
         match ctx.discover_port_by_name(NIC_PORT_NAME) {
             Ok(shmem_id) => {
-                uinfo!("netsvc", "nic_found"; shmem_id = shmem_id);
+                udebug!("netsvc", "nic_found"; shmem_id = shmem_id);
                 match ctx.connect_block_port(shmem_id) {
                     Ok(port_id) => {
                         if let Some(idx) = self.nics.add(port_id, NIC_PORT_NAME) {
-                            uinfo!("netsvc", "nic_connected"; idx = idx as u32);
+                            udebug!("netsvc", "nic_connected"; idx = idx as u32);
 
                             // Send NIC info query (response arrives in data_ready)
                             self.send_nic_query(idx, ctx);
@@ -157,7 +157,7 @@ impl NetSvcDriver {
 
         let mut mac_buf = [0u8; 17];
         self.nics.nics[idx].mac.format(&mut mac_buf);
-        uinfo!("netsvc", "nic_info";
+        udebug!("netsvc", "nic_info";
             mac = core::str::from_utf8(&mac_buf).unwrap_or("?"),
             mtu = mtu as u32);
 
@@ -266,7 +266,7 @@ impl NetSvcDriver {
 
             let total_len = eth_len + arp_len;
             self.send_frame(nic_idx, &frame_buf[..total_len], ctx);
-            uinfo!("netsvc", "arp_reply";
+            udebug!("netsvc", "arp_reply";
                 to_ip = pkt.sender_ip.as_u32());
         } else if arp::is_reply(&pkt) {
             // Already learned above, nothing else to do
@@ -373,7 +373,7 @@ impl NetSvcDriver {
 
             let total_len = icmp_start + icmp_len;
             self.send_frame(nic_idx, &frame_buf[..total_len], ctx);
-            uinfo!("netsvc", "icmp_reply";
+            udebug!("netsvc", "icmp_reply";
                 to_ip = dst_ip.as_u32(),
                 id = icmp_hdr.id as u32,
                 seq = icmp_hdr.seq as u32);
@@ -413,17 +413,17 @@ impl NetSvcDriver {
 
 impl Driver for NetSvcDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        uinfo!("netsvc", "starting";);
+        udebug!("netsvc", "starting";);
 
         // Try to discover NIC immediately (may fail if netd hasn't started yet)
         if self.try_discover_nic(ctx) {
             self.discovering = false;
-            uinfo!("netsvc", "nic_probing";);
+            udebug!("netsvc", "nic_probing";);
         } else {
             // Start discovery timer for retry
             self.discovering = true;
             self.arm_discovery_timer(ctx);
-            uinfo!("netsvc", "waiting_for_nic";);
+            udebug!("netsvc", "waiting_for_nic";);
         }
 
         Ok(())
@@ -541,7 +541,7 @@ impl Driver for NetSvcDriver {
                 }
                 self.discovery_timer = None;
 
-                uinfo!("netsvc", "nic_probing";);
+                udebug!("netsvc", "nic_probing";);
             } else {
                 // Retry
                 self.arm_discovery_timer(ctx);

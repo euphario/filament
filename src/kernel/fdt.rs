@@ -6,7 +6,7 @@
 // For device tree dump (visual/structured output), we use direct UART output
 // For status/error messages, we use structured klog
 
-use crate::{kinfo, kwarn, kerror, kdebug, print_direct};
+use crate::{kwarn, kerror, kdebug, print_direct};
 
 /// FDT magic number (big-endian)
 const FDT_MAGIC: u32 = 0xd00dfeed;
@@ -112,7 +112,7 @@ impl Fdt {
         let off_dt_strings = be32(header.off_dt_strings);
         let _version = be32(header.version);
 
-        kinfo!("fdt", "parsed"; source = "memory", addr = crate::klog::hex64(phys_addr));
+        kdebug!("fdt", "parsed"; source = "memory", addr = crate::klog::hex64(phys_addr));
 
         let struct_base = unsafe { base.add(off_dt_struct as usize) };
         let strings_base = unsafe { base.add(off_dt_strings as usize) };

@@ -268,6 +268,6 @@ mod tests {
         assert!(flags.check_and_clear_resched());
         assert!(!flags.need_resched());
 
-        kinfo!("sync", "test_ok");
+        kdebug!("sync", "test_ok");
     }
 }

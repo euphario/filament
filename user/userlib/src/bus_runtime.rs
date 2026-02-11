@@ -771,12 +771,16 @@ impl<D: Driver> DriverRuntime<D> {
                 BusError::SpawnFailed => "SpawnFailed",
                 BusError::ShmemError => "ShmemError",
                 BusError::Internal => "Internal",
+                BusError::NotPresent => "NotPresent",
             };
             let elen = err_name.len().min(40);
             buf[20..20 + elen].copy_from_slice(&err_name.as_bytes()[..elen]);
             crate::ulog::flush();
             syscall::klog(LogLevel::Error, &buf[..20 + elen]);
-            syscall::exit(1);
+            // NotPresent = hardware absent, exit cleanly (devd won't respawn)
+            // Other errors = crash, exit with code 1 (devd will respawn)
+            let code = if matches!(e, BusError::NotPresent) { 0 } else { 1 };
+            syscall::exit(code);
         }
 
         // Report Ready to devd — transitions service from Starting to Ready

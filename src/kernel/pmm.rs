@@ -37,7 +37,7 @@
 //! All operations are protected by a SpinLock with IRQ-save semantics.
 //! Safe to call from both process and interrupt context.
 
-use crate::{kinfo, kwarn, kdebug, print_direct, klog};
+use crate::{kwarn, kdebug, print_direct, klog};
 use crate::kernel::arch::mmu;
 use crate::platform::current::{DRAM_BASE, DRAM_END, KERNEL_PHYS_BASE,
     DMA_POOL_BASE, DMA_POOL_SIZE, DMA_POOL_HIGH_BASE, DMA_POOL_HIGH_SIZE};
@@ -248,7 +248,7 @@ impl PhysicalMemoryManager {
         // Debug: direct UART output
         print_direct!("PMM: {} free pages, {} MB free\r\n", self.free_pages, free_mb);
 
-        kinfo!("pmm", "init_ok"; free_mb = free_mb as u64);
+        kdebug!("pmm", "init_ok"; free_mb = free_mb as u64);
     }
 
     /// Push a page onto the free list (O(1))
@@ -555,5 +555,5 @@ pub fn test() {
         return;
     }
 
-    kinfo!("pmm", "test_ok");
+    kdebug!("pmm", "test_ok");
 }

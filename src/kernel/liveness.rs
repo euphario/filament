@@ -154,7 +154,7 @@ impl LivenessState {
                     );
                 }
                 LivenessState::ClosePending { channel, closed_at } => {
-                    crate::kinfo!("liveness", "close_pending";
+                    crate::kdebug!("liveness", "close_pending";
                         pid = pid as u64,
                         channel = *channel as u64,
                         ms = counter_to_ms(*closed_at)

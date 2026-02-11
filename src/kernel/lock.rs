@@ -688,7 +688,7 @@ pub fn test() {
         kdebug!("lock", "depth_tracking_ok");
     }
 
-    kinfo!("lock", "test_ok");
+    kdebug!("lock", "test_ok");
 }
 
 // ============================================================================

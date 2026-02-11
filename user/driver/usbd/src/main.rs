@@ -3,12 +3,12 @@
 //! Unified USB driver using the bus framework (Driver trait + driver_main).
 //! Uses the `usb` crate's SoC HAL traits for platform abstraction:
 //! - QEMU: GenericSoc (no vendor-specific init, PCI BAR from pcied)
-//! - BPI-R4: Mt7988aSoc (IPPC/PHY init, future `mt7988a` feature flag)
+//! - BPI-R4: Mt7988aSoc (IPPC power/clock/port init, detected by base address)
 //!
 //! ## Spawning
 //!
-//! usbd is rule-spawned by devd when pcied registers a USB port.
-//! BAR0 address and size are delivered via spawn context metadata.
+//! usbd is spawned by devd for USB bus ports. Base address and size are
+//! delivered via spawn context metadata (from probed → kernel → devd).
 
 #![no_std]
 #![no_main]
@@ -55,7 +55,8 @@ use userlib::bus::{
 use userlib::driver_main;
 use userlib::ring::{io_op, io_status, side_msg, side_status};
 use usb::{MmioRegion, DmaPool, XhciController, XhciCaps};
-use usb::soc::{GenericSoc, SocUsb};
+use usb::soc::{GenericSoc, SocUsb, SocError};
+use usb::soc::mt7988a::{Mt7988aSoc, addrs as mt_addrs};
 use usb::ring::{Ring, EventRing, ErstEntry};
 use usb::trb::{Trb, trb_type};
 use usb::xhci::op as xhci_op;
@@ -126,6 +127,37 @@ mod layout {
 }
 
 // =============================================================================
+// SoC Abstraction
+// =============================================================================
+
+/// Runtime SoC selection — same binary runs on QEMU (GenericSoc) and MT7988A.
+/// Platform is detected from the spawn context base address.
+enum SocImpl {
+    Generic(GenericSoc),
+    Mt7988a(Mt7988aSoc),
+}
+
+impl SocImpl {
+    const fn generic() -> Self {
+        SocImpl::Generic(GenericSoc::new(0, 0, 0))
+    }
+
+    fn pre_init(&mut self) -> Result<(), SocError> {
+        match self {
+            SocImpl::Generic(s) => s.pre_init(),
+            SocImpl::Mt7988a(s) => s.pre_init(),
+        }
+    }
+
+    fn post_init(&mut self) -> Result<(), SocError> {
+        match self {
+            SocImpl::Generic(s) => s.post_init(),
+            SocImpl::Mt7988a(s) => s.post_init(),
+        }
+    }
+}
+
+// =============================================================================
 // Device Tracking
 // =============================================================================
 
@@ -167,10 +199,10 @@ struct CommandResult {
 // Driver State
 // =============================================================================
 
-/// QEMU USB driver instance
-struct QemuUsbDriver {
-    /// SoC wrapper (generic, no vendor init)
-    soc: GenericSoc,
+/// USB host controller driver instance
+struct UsbDriver {
+    /// SoC wrapper (detected at runtime from spawn context base address)
+    soc: SocImpl,
     /// xHCI controller (owns MMIO region)
     xhci: Option<XhciController>,
     /// xHCI capabilities
@@ -201,11 +233,11 @@ struct QemuUsbDriver {
     block_port_id: Option<PortId>,
 }
 
-impl QemuUsbDriver {
+impl UsbDriver {
     /// Create an empty driver instance for static initialization.
     const fn new_empty() -> Self {
         Self {
-            soc: GenericSoc::new(0, 0, 0),
+            soc: SocImpl::generic(),
             xhci: None,
             caps: None,
             dma: None,
@@ -225,10 +257,36 @@ impl QemuUsbDriver {
     }
 
     /// Reinitialize with actual hardware addresses from spawn context.
-    fn configure(&mut self, xhci_base: u64, xhci_size: usize) {
-        self.soc = GenericSoc::new(xhci_base, xhci_size, 0);
-        self.xhci_base = xhci_base;
-        self.xhci_size = xhci_size;
+    /// Detects MT7988A SSUSB controllers by base address and performs
+    /// SoC-level global init (clocks, resets) + IPPC MMIO setup.
+    fn configure(&mut self, base_addr: u64, size: usize) {
+        match base_addr {
+            mt_addrs::SSUSB0_MAC | mt_addrs::SSUSB1_MAC => {
+                // MT7988A SSUSB controller detected
+                Mt7988aSoc::global_init();
+
+                let mut soc = if base_addr == mt_addrs::SSUSB0_MAC {
+                    Mt7988aSoc::ssusb0()
+                } else {
+                    Mt7988aSoc::ssusb1()
+                };
+
+                // Map MAC region for IPPC register access during pre_init
+                if let Some(mmio) = MmioRegion::open(base_addr, mt_addrs::MAC_SIZE as u64) {
+                    soc.set_mac(mmio);
+                }
+
+                self.soc = SocImpl::Mt7988a(soc);
+                self.xhci_base = base_addr;
+                self.xhci_size = mt_addrs::MAC_SIZE;
+            }
+            _ => {
+                // Generic xHCI (QEMU, PCI-based)
+                self.soc = SocImpl::Generic(GenericSoc::new(base_addr, size, 0));
+                self.xhci_base = base_addr;
+                self.xhci_size = size;
+            }
+        }
     }
 
     /// Format info text for introspection queries
@@ -323,47 +381,45 @@ impl QemuUsbDriver {
 
     /// Initialize the USB controller
     fn init(&mut self) -> Result<(), &'static str> {
-        log("[qemu-usbd] Starting initialization");
-
-        // Step 1: SoC pre-init (no-op for GenericSoc)
-        self.soc.pre_init().map_err(|_| "SoC pre-init failed")?;
+        // Step 1: SoC pre-init (IPPC init for MT7988A, no-op for generic)
+        self.soc.pre_init().map_err(|_| "soc_pre_init_failed")?;
 
         // Step 2: Map xHCI MMIO region
-        log("[qemu-usbd] Mapping xHCI MMIO");
         let mmio = MmioRegion::open(self.xhci_base, self.xhci_size as u64)
-            .ok_or("Failed to map xHCI MMIO")?;
+            .ok_or("mmio_map_failed")?;
 
-        // Step 3: Create controller (takes ownership of mmio) and read capabilities
-        log("[qemu-usbd] Reading xHCI capabilities");
+        // Step 3: Create controller and read capabilities
         let mut xhci = XhciController::new(mmio);
-        let caps = xhci.read_capabilities().ok_or("Failed to read capabilities")?;
+        let caps = xhci.read_capabilities().ok_or("read_caps_failed")?;
 
-        log_val("[qemu-usbd] Max slots: ", caps.max_slots as u64);
-        log_val("[qemu-usbd] Max ports: ", caps.max_ports as u64);
-        log_hex("[qemu-usbd] Version: ", caps.version as u64);
+        uinfo!("usbd", "xhci_caps"; slots = caps.max_slots as u32, ports = caps.max_ports as u32, version = caps.version as u32);
+
+        // Caps all-zero means the xHCI core isn't powered (e.g. combo PHY in PCIe mode)
+        if caps.max_slots == 0 && caps.max_ports == 0 {
+            return Err("xhci_not_present");
+        }
 
         self.caps = Some(caps);
 
         // Step 4: Halt and reset controller
-        log("[qemu-usbd] Halting controller");
         let (halt_ok, reset_ok) = xhci.halt_and_reset();
         if !halt_ok {
-            return Err("Failed to halt controller");
+            return Err("halt_failed");
         }
         if !reset_ok {
-            return Err("Failed to reset controller");
+            return Err("reset_failed");
         }
         usb::delay_ms(50);  // Let controller stabilize
 
         self.xhci = Some(xhci);
 
         // Step 5: Allocate DMA memory
-        log("[qemu-usbd] Allocating DMA memory");
+        log("[usbd] Allocating DMA memory");
         let dma = DmaPool::alloc(layout::TOTAL_SIZE)
             .ok_or("Failed to allocate DMA memory")?;
 
-        log_hex("[qemu-usbd] DMA vaddr: ", dma.vaddr());
-        log_hex("[qemu-usbd] DMA paddr: ", dma.paddr());
+        log_hex("[usbd] DMA vaddr: ", dma.vaddr());
+        log_hex("[usbd] DMA paddr: ", dma.paddr());
 
         self.dma = Some(dma);
 
@@ -376,7 +432,7 @@ impl QemuUsbDriver {
         // Step 8: Start controller
         self.start_controller()?;
 
-        log("[qemu-usbd] Initialization complete");
+        log("[usbd] Initialization complete");
         Ok(())
     }
 
@@ -390,17 +446,17 @@ impl QemuUsbDriver {
         dma.zero();
 
         // Initialize DCBAA (already zeroed)
-        log("[qemu-usbd] Initializing DCBAA");
+        log("[usbd] Initializing DCBAA");
 
         // Initialize Command Ring
-        log("[qemu-usbd] Initializing Command Ring");
+        log("[usbd] Initializing Command Ring");
         let cmd_ring_virt = (vbase + layout::CMD_RING_OFFSET as u64) as *mut Trb;
         let cmd_ring_phys = pbase + layout::CMD_RING_OFFSET as u64;
         let cmd_ring = Ring::init(cmd_ring_virt, cmd_ring_phys);
         self.cmd_ring = Some(cmd_ring);
 
         // Initialize Event Ring and ERST
-        log("[qemu-usbd] Initializing Event Ring");
+        log("[usbd] Initializing Event Ring");
         let evt_ring_virt = (vbase + layout::EVT_RING_OFFSET as u64) as *mut Trb;
         let evt_ring_phys = pbase + layout::EVT_RING_OFFSET as u64;
         let erst_virt = (vbase + layout::ERST_OFFSET as u64) as *mut ErstEntry;
@@ -432,19 +488,19 @@ impl QemuUsbDriver {
         let evt_ring_phys = pbase + layout::EVT_RING_OFFSET as u64;
 
         // Set max slots
-        log_val("[qemu-usbd] Setting max slots: ", caps.max_slots as u64);
+        log_val("[usbd] Setting max slots: ", caps.max_slots as u64);
         xhci.set_max_slots(caps.max_slots);
 
         // Set DCBAAP
-        log_hex("[qemu-usbd] Setting DCBAAP: ", dcbaa_phys);
+        log_hex("[usbd] Setting DCBAAP: ", dcbaa_phys);
         xhci.set_dcbaap(dcbaa_phys);
 
         // Set CRCR (Command Ring Control Register)
-        log_hex("[qemu-usbd] Setting CRCR: ", cmd_ring_phys);
+        log_hex("[usbd] Setting CRCR: ", cmd_ring_phys);
         xhci.set_crcr(cmd_ring_phys, true);  // cycle = true
 
         // Program interrupter 0
-        log("[qemu-usbd] Programming interrupter 0");
+        log("[usbd] Programming interrupter 0");
         xhci.program_interrupter(0, erst_phys, 1, evt_ring_phys);
 
         Ok(())
@@ -456,29 +512,40 @@ impl QemuUsbDriver {
         let caps = self.caps.as_ref().ok_or("No capabilities")?;
 
         // Start controller
-        log("[qemu-usbd] Starting controller");
         xhci.start();
         usb::delay_ms(10);
 
         if !xhci.is_running() {
-            return Err("Controller failed to start");
+            return Err("controller_not_running");
         }
-        log("[qemu-usbd] Controller running");
 
-        // Power on all ports
-        log_val("[qemu-usbd] Powering on ports: ", caps.max_ports as u64);
+        // Power on all ports and wait for link negotiation
         xhci.power_on_all_ports();
-        usb::delay_ms(100);  // Let ports stabilize
+        usb::delay_ms(200);
 
-        // Check port status
+        // Log PORTSC for every root port — critical for hardware debugging
         for port in 0..caps.max_ports {
-            let connected = xhci.port_connected(port);
-            let enabled = xhci.port_enabled(port);
+            let portsc = xhci.read_portsc(port);
+            uinfo!("usbd", "portsc"; port = port as u32, val = portsc);
+        }
+
+        // Reset connected ports to put devices in Default state
+        for port in 0..caps.max_ports {
+            if xhci.port_connected(port) && !xhci.port_enabled(port) {
+                xhci.reset_port(port);
+            }
+        }
+        usb::delay_ms(100);
+
+        // Clear port change bits and log final state
+        for port in 0..caps.max_ports {
+            xhci.clear_port_changes(port);
+            let portsc = xhci.read_portsc(port);
+            let connected = (portsc & usb::portsc::CCS) != 0;
+            let enabled = (portsc & usb::portsc::PED) != 0;
+            let speed = ((portsc & usb::portsc::SPEED_MASK) >> usb::portsc::SPEED_SHIFT) as u8;
             if connected {
-                log_val("[qemu-usbd] Port connected: ", port as u64);
-                if enabled {
-                    log_val("[qemu-usbd] Port enabled: ", port as u64);
-                }
+                uinfo!("usbd", "port_ready"; port = port as u32, enabled = enabled as u32, speed = speed as u32);
             }
         }
 
@@ -504,8 +571,8 @@ impl QemuUsbDriver {
         for port in 0..caps.max_ports {
             if xhci.port_connected(port) {
                 let speed = xhci.port_speed(port);
-                log_val("[qemu-usbd] Device on port ", port as u64);
-                log_val("[qemu-usbd]   Speed: ", speed as u64);
+                log_val("[usbd] Device on port ", port as u64);
+                log_val("[usbd]   Speed: ", speed as u64);
             }
         }
 
@@ -518,18 +585,18 @@ impl QemuUsbDriver {
                 // Port Status Change Event
                 trb_type::PORT_STATUS_CHANGE => {
                     let port_id = ((trb.control >> 24) & 0xFF) as u32;
-                    log_val("[qemu-usbd] Port status change: ", port_id as u64);
+                    log_val("[usbd] Port status change: ", port_id as u64);
                 }
                 // Command Completion Event
                 trb_type::COMMAND_COMPLETION => {
-                    log_val("[qemu-usbd] Command completion, cc=", cc as u64);
+                    log_val("[usbd] Command completion, cc=", cc as u64);
                 }
                 // Transfer Event
                 trb_type::TRANSFER_EVENT => {
-                    log_val("[qemu-usbd] Transfer event, cc=", cc as u64);
+                    log_val("[usbd] Transfer event, cc=", cc as u64);
                 }
                 _ => {
-                    log_val("[qemu-usbd] Event type: ", trb_type_val as u64);
+                    log_val("[usbd] Event type: ", trb_type_val as u64);
                 }
             }
         }
@@ -576,7 +643,7 @@ impl QemuUsbDriver {
             xhci.update_erdp(0, evt_ring.erdp());
         }
 
-        log("[qemu-usbd] Command timeout");
+        log("[usbd] Command timeout");
         None
     }
 
@@ -623,24 +690,24 @@ impl QemuUsbDriver {
             xhci.port_speed(port)
         };
 
-        log_val("[qemu-usbd] Enumerating port ", port as u64);
-        log_val("[qemu-usbd]   Speed: ", speed as u64);
+        log_val("[usbd] Enumerating port ", port as u64);
+        log_val("[usbd]   Speed: ", speed as u64);
 
         // Step 1: Enable Slot
         let enable_slot = build_enable_slot_trb();
         let result = self.send_command(enable_slot)?;
 
         if result.completion_code != 1 {  // 1 = Success
-            log_val("[qemu-usbd]   EnableSlot failed, cc=", result.completion_code as u64);
+            log_val("[usbd]   EnableSlot failed, cc=", result.completion_code as u64);
             return None;
         }
 
         let slot_id = result.slot_id;
-        log_val("[qemu-usbd]   Slot ID: ", slot_id as u64);
+        log_val("[usbd]   Slot ID: ", slot_id as u64);
 
         // Check slot is valid
         if slot_id == 0 || slot_id as usize > layout::MAX_DEVICES {
-            log("[qemu-usbd]   Invalid slot ID");
+            log("[usbd]   Invalid slot ID");
             return None;
         }
 
@@ -704,11 +771,11 @@ impl QemuUsbDriver {
         let result = self.send_command(addr_cmd)?;
 
         if result.completion_code != 1 {
-            log_val("[qemu-usbd]   AddressDevice failed, cc=", result.completion_code as u64);
+            log_val("[usbd]   AddressDevice failed, cc=", result.completion_code as u64);
             return None;
         }
 
-        log("[qemu-usbd]   Device addressed");
+        log("[usbd]   Device addressed");
 
         // Create device tracking entry
         let device = UsbDevice {
@@ -736,21 +803,26 @@ impl QemuUsbDriver {
             None => return,
         };
 
-        log("[qemu-usbd] Enumerating devices...");
-
+        let mut found = 0u32;
         for port in 0..max_ports {
-            let connected = match self.xhci.as_ref() {
-                Some(x) => x.port_connected(port),
-                None => false,
+            let (connected, enabled) = match self.xhci.as_ref() {
+                Some(x) => (x.port_connected(port), x.port_enabled(port)),
+                None => (false, false),
             };
 
-            if connected {
-                if let Some(slot_id) = self.enumerate_device(port) {
-                    log_val("[qemu-usbd]   Port ", port as u64);
-                    log_val("[qemu-usbd]   -> Slot ", slot_id as u64);
+            if connected && enabled {
+                match self.enumerate_device(port) {
+                    Some(slot_id) => {
+                        uinfo!("usbd", "device_enumerated"; port = port as u32, slot = slot_id as u32);
+                        found += 1;
+                    }
+                    None => {
+                        uerror!("usbd", "device_enum_failed"; port = port as u32);
+                    }
                 }
             }
         }
+        uinfo!("usbd", "enum_done"; devices = found);
     }
 
     // =========================================================================
@@ -869,7 +941,7 @@ impl QemuUsbDriver {
                         }
                         return Some(0);
                     } else {
-                        log_val("[qemu-usbd] Control transfer failed, cc=", cc as u64);
+                        log_val("[usbd] Control transfer failed, cc=", cc as u64);
                         return None;
                     }
                 }
@@ -877,7 +949,7 @@ impl QemuUsbDriver {
             xhci.update_erdp(0, evt_ring.erdp());
         }
 
-        log("[qemu-usbd] Control transfer timeout");
+        log("[usbd] Control transfer timeout");
         None
     }
 
@@ -916,7 +988,7 @@ impl QemuUsbDriver {
 
         // Need at least 4 bytes to read wTotalLength
         if header_len < 4 {
-            log("[qemu-usbd] Config descriptor header too short");
+            log("[usbd] Config descriptor header too short");
             return None;
         }
 
@@ -925,7 +997,7 @@ impl QemuUsbDriver {
 
         // Sanity: config descriptor must be at least 9 bytes
         if total_len < 9 {
-            log("[qemu-usbd] Config descriptor total_len too small");
+            log("[usbd] Config descriptor total_len too small");
             return None;
         }
 
@@ -962,18 +1034,18 @@ impl QemuUsbDriver {
 
     /// Detect if device is MSC and configure bulk endpoints
     fn detect_msc(&mut self, slot_id: u8) -> bool {
-        log_val("[qemu-usbd] Detecting MSC for slot ", slot_id as u64);
+        log_val("[usbd] Detecting MSC for slot ", slot_id as u64);
 
         // Get device descriptor for vendor/product info
         let dev_desc = match self.get_device_descriptor(slot_id) {
             Some(d) => d,
             None => {
-                log("[qemu-usbd]   Failed to get device descriptor");
+                log("[usbd]   Failed to get device descriptor");
                 return false;
             }
         };
 
-        log_hex("[qemu-usbd]   VID:PID = ", ((dev_desc.vendor_id as u64) << 16) | dev_desc.product_id as u64);
+        log_hex("[usbd]   VID:PID = ", ((dev_desc.vendor_id as u64) << 16) | dev_desc.product_id as u64);
 
         // Update device info
         if let Some(dev) = self.devices[(slot_id as usize) - 1].as_mut() {
@@ -986,12 +1058,12 @@ impl QemuUsbDriver {
         let config_len = match self.get_config_descriptor(slot_id, 0, &mut config_buf) {
             Some(len) => len,
             None => {
-                log("[qemu-usbd]   Failed to get config descriptor");
+                log("[usbd]   Failed to get config descriptor");
                 return false;
             }
         };
 
-        log_val("[qemu-usbd]   Config descriptor length: ", config_len as u64);
+        log_val("[usbd]   Config descriptor length: ", config_len as u64);
 
         // Parse descriptors to find MSC interface
         let mut offset = 0;
@@ -1015,13 +1087,13 @@ impl QemuUsbDriver {
                         let iface_subclass = config_buf[offset + 6];
                         let iface_protocol = config_buf[offset + 7];
 
-                        log_val("[qemu-usbd]   Interface ", iface_num as u64);
-                        log_hex("[qemu-usbd]     Class: ", iface_class as u64);
+                        log_val("[usbd]   Interface ", iface_num as u64);
+                        log_hex("[usbd]     Class: ", iface_class as u64);
 
                         if iface_class == msc::CLASS &&
                            iface_subclass == msc::SUBCLASS_SCSI &&
                            iface_protocol == msc::PROTOCOL_BOT {
-                            log("[qemu-usbd]     -> MSC BOT device!");
+                            log("[usbd]     -> MSC BOT device!");
                             msc_interface = Some(iface_num);
                         }
                     }
@@ -1035,8 +1107,8 @@ impl QemuUsbDriver {
                         let ep_type = ep_attr & 0x03;
                         let is_in = (ep_addr & 0x80) != 0;
 
-                        log_hex("[qemu-usbd]     EP: ", ep_addr as u64);
-                        log_val("[qemu-usbd]       MaxPacket: ", max_packet as u64);
+                        log_hex("[usbd]     EP: ", ep_addr as u64);
+                        log_val("[usbd]       MaxPacket: ", max_packet as u64);
 
                         if ep_type == 2 {  // Bulk
                             if is_in && bulk_in_ep.is_none() {
@@ -1055,16 +1127,16 @@ impl QemuUsbDriver {
 
         // Check if we found MSC with both endpoints
         if msc_interface.is_none() || bulk_in_ep.is_none() || bulk_out_ep.is_none() {
-            log("[qemu-usbd]   Not an MSC device");
+            log("[usbd]   Not an MSC device");
             return false;
         }
 
         let (bulk_in_addr, bulk_in_max) = bulk_in_ep.unwrap();
         let (bulk_out_addr, bulk_out_max) = bulk_out_ep.unwrap();
 
-        log("[qemu-usbd]   MSC device detected!");
-        log_hex("[qemu-usbd]   Bulk IN:  ", bulk_in_addr as u64);
-        log_hex("[qemu-usbd]   Bulk OUT: ", bulk_out_addr as u64);
+        log("[usbd]   MSC device detected!");
+        log_hex("[usbd]   Bulk IN:  ", bulk_in_addr as u64);
+        log_hex("[usbd]   Bulk OUT: ", bulk_out_addr as u64);
 
         // Update device tracking
         if let Some(dev) = self.devices[(slot_id as usize) - 1].as_mut() {
@@ -1077,17 +1149,17 @@ impl QemuUsbDriver {
         // Set configuration
         let config_value = config_buf[5];  // bConfigurationValue from config descriptor
         if !self.set_configuration(slot_id, config_value) {
-            log("[qemu-usbd]   Failed to set configuration");
+            log("[usbd]   Failed to set configuration");
             return false;
         }
-        log_val("[qemu-usbd]   Configuration set: ", config_value as u64);
+        log_val("[usbd]   Configuration set: ", config_value as u64);
 
         true
     }
 
     /// Enumerate and detect MSC devices
     fn detect_all_msc(&mut self) {
-        log("[qemu-usbd] Detecting MSC devices...");
+        log("[usbd] Detecting MSC devices...");
 
         // Iterate through enumerated devices
         for slot_idx in 0..layout::MAX_DEVICES {
@@ -1103,10 +1175,10 @@ impl QemuUsbDriver {
         for slot_idx in 0..layout::MAX_DEVICES {
             if let Some(dev) = &self.devices[slot_idx] {
                 if dev.is_msc {
-                    log_val("[qemu-usbd] MSC device at slot ", dev.slot_id as u64);
-                    log_hex("[qemu-usbd]   VID:PID = ", ((dev.vendor_id as u64) << 16) | dev.product_id as u64);
-                    log_val("[qemu-usbd]   Bulk IN DCI:  ", dev.bulk_in_dci as u64);
-                    log_val("[qemu-usbd]   Bulk OUT DCI: ", dev.bulk_out_dci as u64);
+                    log_val("[usbd] MSC device at slot ", dev.slot_id as u64);
+                    log_hex("[usbd]   VID:PID = ", ((dev.vendor_id as u64) << 16) | dev.product_id as u64);
+                    log_val("[usbd]   Bulk IN DCI:  ", dev.bulk_in_dci as u64);
+                    log_val("[usbd]   Bulk OUT DCI: ", dev.bulk_out_dci as u64);
                 }
             }
         }
@@ -1220,17 +1292,17 @@ impl QemuUsbDriver {
         let result = match self.send_command(cmd) {
             Some(r) => r,
             None => {
-                log("[qemu-usbd] Configure Endpoint command timeout");
+                log("[usbd] Configure Endpoint command timeout");
                 return false;
             }
         };
 
         if result.completion_code != 1 {
-            log_val("[qemu-usbd] Configure Endpoint failed, cc=", result.completion_code as u64);
+            log_val("[usbd] Configure Endpoint failed, cc=", result.completion_code as u64);
             return false;
         }
 
-        log("[qemu-usbd] Bulk endpoints configured");
+        log("[usbd] Bulk endpoints configured");
         true
     }
 
@@ -1440,19 +1512,19 @@ impl QemuUsbDriver {
         };
 
         if !self.bulk_out(slot_id, cbw_bytes) {
-            log("[qemu-usbd] CBW send failed");
+            log("[usbd] CBW send failed");
             return None;
         }
 
         // === Step 2: Data phase (if any) ===
         if let Some(buf) = data_in {
             if self.bulk_in(slot_id, buf).is_none() {
-                log("[qemu-usbd] Data IN failed");
+                log("[usbd] Data IN failed");
                 return None;
             }
         } else if let Some(buf) = data_out {
             if !self.bulk_out(slot_id, buf) {
-                log("[qemu-usbd] Data OUT failed");
+                log("[usbd] Data OUT failed");
                 return None;
             }
         }
@@ -1461,7 +1533,7 @@ impl QemuUsbDriver {
         // Again, WE know the response is 13 bytes CSW - hardware doesn't
         let mut csw_bytes = [0u8; 13];
         if self.bulk_in(slot_id, &mut csw_bytes).is_none() {
-            log("[qemu-usbd] CSW receive failed");
+            log("[usbd] CSW receive failed");
             return None;
         }
 
@@ -1470,11 +1542,11 @@ impl QemuUsbDriver {
 
         // Validate CSW
         if csw.signature != msc::CSW_SIGNATURE {
-            log("[qemu-usbd] Invalid CSW signature");
+            log("[usbd] Invalid CSW signature");
             return None;
         }
         if csw.tag != tag {
-            log("[qemu-usbd] CSW tag mismatch");
+            log("[usbd] CSW tag mismatch");
             return None;
         }
 
@@ -1512,34 +1584,34 @@ impl QemuUsbDriver {
 
     /// Test MSC device with SCSI commands
     fn test_msc(&mut self, slot_id: u8) {
-        log_val("[qemu-usbd] Testing MSC device at slot ", slot_id as u64);
+        log_val("[usbd] Testing MSC device at slot ", slot_id as u64);
 
         // Configure endpoints first
         if !self.configure_msc_endpoints(slot_id) {
-            log("[qemu-usbd] Failed to configure endpoints");
+            log("[usbd] Failed to configure endpoints");
             return;
         }
 
         // INQUIRY
-        log("[qemu-usbd] Sending INQUIRY...");
+        log("[usbd] Sending INQUIRY...");
         if let Some(inquiry) = self.scsi_inquiry(slot_id) {
             // Bytes 8-15: vendor, 16-31: product
-            log("[qemu-usbd] INQUIRY response received");
-            log_val("[qemu-usbd]   Device type: ", (inquiry[0] & 0x1F) as u64);
+            log("[usbd] INQUIRY response received");
+            log_val("[usbd]   Device type: ", (inquiry[0] & 0x1F) as u64);
         } else {
-            log("[qemu-usbd] INQUIRY failed");
+            log("[usbd] INQUIRY failed");
         }
 
         // READ CAPACITY
-        log("[qemu-usbd] Sending READ CAPACITY...");
+        log("[usbd] Sending READ CAPACITY...");
         if let Some((last_lba, block_size)) = self.scsi_read_capacity(slot_id) {
             let total_blocks = last_lba + 1;
             let size_mb = (total_blocks as u64 * block_size as u64) / (1024 * 1024);
-            log_val("[qemu-usbd]   Last LBA: ", last_lba as u64);
-            log_val("[qemu-usbd]   Block size: ", block_size as u64);
-            log_val("[qemu-usbd]   Total size MB: ", size_mb);
+            log_val("[usbd]   Last LBA: ", last_lba as u64);
+            log_val("[usbd]   Block size: ", block_size as u64);
+            log_val("[usbd]   Total size MB: ", size_mb);
         } else {
-            log("[qemu-usbd] READ CAPACITY failed");
+            log("[usbd] READ CAPACITY failed");
         }
     }
 
@@ -1564,14 +1636,14 @@ impl QemuUsbDriver {
         use crate::block::{BlockDevice, ScsiBlockDevice, BotScsi};
         use crate::xhci_bulk::XhciBulk;
 
-        log("[qemu-usbd] === Testing composable block stack ===");
+        log("[usbd] === Testing composable block stack ===");
 
         // Configure bulk endpoints first (required before any bulk transfers)
         if !self.configure_msc_endpoints(slot_id) {
-            log("[qemu-usbd] Failed to configure endpoints");
+            log("[usbd] Failed to configure endpoints");
             return;
         }
-        log("[qemu-usbd] Bulk endpoints configured");
+        log("[usbd] Bulk endpoints configured");
 
         let dev_idx = match (slot_id as usize).checked_sub(1) {
             Some(idx) if idx < layout::MAX_DEVICES => idx,
@@ -1641,7 +1713,7 @@ impl QemuUsbDriver {
         let block_dev = match ScsiBlockDevice::new(scsi) {
             Some(dev) => dev,
             None => {
-                log("[qemu-usbd] Failed to create block device");
+                log("[usbd] Failed to create block device");
                 return;
             }
         };
@@ -1649,8 +1721,8 @@ impl QemuUsbDriver {
         // Now we have a BlockDevice!
         // The application only sees: read_blocks, write_blocks, block_size, block_count
         // It has NO IDEA there's USB, xHCI, TRBs, BOT, SCSI underneath
-        log_val("[qemu-usbd] Block size: ", block_dev.block_size() as u64);
-        log_val("[qemu-usbd] Block count: ", block_dev.block_count());
+        log_val("[usbd] Block size: ", block_dev.block_size() as u64);
+        log_val("[usbd] Block count: ", block_dev.block_count());
 
         // Save RAW disk info for block service (disk0: exposes the full disk)
         let raw_disk_block_count = block_dev.block_count();
@@ -1662,32 +1734,32 @@ impl QemuUsbDriver {
 
         let mut block_dev = block_dev;
 
-        log("[qemu-usbd] Reading partition table...");
+        log("[usbd] Reading partition table...");
         let mbr = match read_partition_table(&mut block_dev) {
             Some(m) => m,
             None => {
-                log("[qemu-usbd] No valid MBR found");
+                log("[usbd] No valid MBR found");
                 return;
             }
         };
 
         if mbr.is_gpt {
-            log("[qemu-usbd] GPT disk detected (not supported yet)");
+            log("[usbd] GPT disk detected (not supported yet)");
             return;
         }
 
-        log("[qemu-usbd] MBR partition table:");
+        log("[usbd] MBR partition table:");
         for (i, entry) in mbr.partitions() {
-            log_val("[qemu-usbd]   Partition ", i as u64);
-            log_hex("[qemu-usbd]     Type: ", entry.partition_type as u64);
-            log("[qemu-usbd]     Name: ");
+            log_val("[usbd]   Partition ", i as u64);
+            log_hex("[usbd]     Type: ", entry.partition_type as u64);
+            log("[usbd]     Name: ");
             log(partition_type_name(entry.partition_type));
-            log_val("[qemu-usbd]     Start LBA: ", entry.start_lba as u64);
-            log_val("[qemu-usbd]     Sectors: ", entry.sector_count as u64);
+            log_val("[usbd]     Start LBA: ", entry.start_lba as u64);
+            log_val("[usbd]     Sectors: ", entry.sector_count as u64);
             let size_mb = (entry.sector_count as u64 * 512) / (1024 * 1024);
-            log_val("[qemu-usbd]     Size MB: ", size_mb);
+            log_val("[usbd]     Size MB: ", size_mb);
             if entry.bootable == 0x80 {
-                log("[qemu-usbd]     (bootable)");
+                log("[usbd]     (bootable)");
             }
         }
 
@@ -1697,18 +1769,18 @@ impl QemuUsbDriver {
         let mut partition_found = false;
 
         if let Some(fat_entry) = mbr.find_fat_partition() {
-            log("[qemu-usbd] Found FAT partition, creating PartitionDevice...");
+            log("[usbd] Found FAT partition, creating PartitionDevice...");
 
             let part_dev = match PartitionDevice::from_mbr_entry(block_dev, fat_entry) {
                 Some(p) => p,
                 None => {
-                    log("[qemu-usbd] Failed to create partition device");
+                    log("[usbd] Failed to create partition device");
                     return;
                 }
             };
 
-            log_val("[qemu-usbd] Partition start LBA: ", part_dev.start_lba());
-            log_val("[qemu-usbd] Partition blocks: ", part_dev.block_count());
+            log_val("[usbd] Partition start LBA: ", part_dev.start_lba());
+            log_val("[usbd] Partition blocks: ", part_dev.block_count());
 
             // Now the filesystem would use this PartitionDevice
             // It sees a BlockDevice starting at LBA 0, completely unaware that:
@@ -1726,11 +1798,11 @@ impl QemuUsbDriver {
             let mut boot_sector = [0u8; 512];
             let mut part_dev = part_dev;
             if part_dev.read_blocks(0, &mut boot_sector).is_ok() {
-                log("[qemu-usbd] Read partition boot sector!");
+                log("[usbd] Read partition boot sector!");
 
                 // Check for FAT signature
                 if boot_sector[510] == 0x55 && boot_sector[511] == 0xAA {
-                    log("[qemu-usbd]   FAT boot signature found");
+                    log("[usbd]   FAT boot signature found");
                     partition_found = true;
 
                     // Parse some FAT fields
@@ -1739,13 +1811,13 @@ impl QemuUsbDriver {
                     let reserved_sectors = u16::from_le_bytes([boot_sector[14], boot_sector[15]]);
                     let num_fats = boot_sector[16];
 
-                    log_val("[qemu-usbd]   Bytes/sector: ", bytes_per_sector as u64);
-                    log_val("[qemu-usbd]   Sectors/cluster: ", sectors_per_cluster as u64);
-                    log_val("[qemu-usbd]   Reserved sectors: ", reserved_sectors as u64);
-                    log_val("[qemu-usbd]   Number of FATs: ", num_fats as u64);
+                    log_val("[usbd]   Bytes/sector: ", bytes_per_sector as u64);
+                    log_val("[usbd]   Sectors/cluster: ", sectors_per_cluster as u64);
+                    log_val("[usbd]   Reserved sectors: ", reserved_sectors as u64);
+                    log_val("[usbd]   Number of FATs: ", num_fats as u64);
 
                     // OEM name (bytes 3-10)
-                    log("[qemu-usbd]   OEM: ");
+                    log("[usbd]   OEM: ");
                     let oem = &boot_sector[3..11];
                     // Just show as hex for now
                     for b in oem {
@@ -1755,10 +1827,10 @@ impl QemuUsbDriver {
                     }
                 }
             } else {
-                log("[qemu-usbd] Failed to read partition boot sector");
+                log("[usbd] Failed to read partition boot sector");
             }
         } else {
-            log("[qemu-usbd] No FAT partition found");
+            log("[usbd] No FAT partition found");
         }
 
         // Save RAW disk info for DataPort geometry responses
@@ -1772,10 +1844,10 @@ impl QemuUsbDriver {
                 bulk_in_dci,
                 bulk_out_dci,
             };
-            log("[qemu-usbd] Raw disk info saved for DataPort");
+            log("[usbd] Raw disk info saved for DataPort");
         }
 
-        log("[qemu-usbd] === Block stack test complete ===");
+        log("[usbd] === Block stack test complete ===");
 
         // Reset ring state so service loop starts fresh
         self.reset_bulk_rings(slot_id, bulk_in_dci, bulk_out_dci);
@@ -1856,7 +1928,7 @@ impl QemuUsbDriver {
         self.bulk_in_enqueue = 0;
         self.bulk_in_cycle = true;
 
-        log("[qemu-usbd] Bulk rings reset (hardware + software)");
+        log("[usbd] Bulk rings reset (hardware + software)");
     }
 
     /// Read blocks using the block stack
@@ -2205,7 +2277,7 @@ fn log_always(msg: &str) {
 // =============================================================================
 
 /// Wrapper for bus framework integration.
-struct UsbdWrapper(&'static mut QemuUsbDriver);
+struct UsbdWrapper(&'static mut UsbDriver);
 
 impl Driver for UsbdWrapper {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
@@ -2237,9 +2309,14 @@ impl Driver for UsbdWrapper {
 
         // Configure and initialize xHCI hardware
         self.0.configure(bar0_addr, bar0_size);
-        self.0.init().map_err(|_| {
+        self.0.init().map_err(|reason| {
+            log_always(reason);
             uerror!("usbd", "xhci_init_failed";);
-            BusError::Internal
+            if reason == "xhci_not_present" {
+                BusError::NotPresent
+            } else {
+                BusError::Internal
+            }
         })?;
 
         // Enumerate all connected USB devices
@@ -2425,7 +2502,7 @@ impl Driver for UsbdWrapper {
 // Entry Point
 // =============================================================================
 
-static mut DRIVER: QemuUsbDriver = QemuUsbDriver::new_empty();
+static mut DRIVER: UsbDriver = UsbDriver::new_empty();
 
 #[unsafe(no_mangle)]
 fn main() {

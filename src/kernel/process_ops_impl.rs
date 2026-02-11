@@ -8,7 +8,7 @@ use crate::kernel::traits::task::TaskId;
 use crate::kernel::task::{self, lifecycle};
 use crate::kernel::caps::Capabilities;
 use crate::kernel::elf;
-use crate::{kinfo, kwarn};
+use crate::{kdebug, kwarn};
 
 // ============================================================================
 // Kernel Process Operations Implementation
@@ -37,7 +37,7 @@ impl ProcessOps for KernelProcessOps {
         // Phase 1: Transition state under scheduler lock, enqueue microtasks
         task::with_scheduler(|sched| {
             if let Err(e) = lifecycle::exit(sched, task_id, code) {
-                kinfo!("process_ops", "exit_lifecycle_error"; pid = task_id as u64, err = e as i64);
+                kdebug!("process_ops", "exit_lifecycle_error"; pid = task_id as u64, err = e as i64);
             }
 
             // Set cleanup phase on the task
@@ -117,7 +117,7 @@ impl ProcessOps for KernelProcessOps {
         // Drain microtasks immediately (outside scheduler lock)
         // Higher budget at kill — cleanup is priority.
         let drained = microtask::drain(64);
-        kinfo!("process_ops", "kill_drain_done"; target = target as u64, drained = drained as u64);
+        kdebug!("process_ops", "kill_drain_done"; target = target as u64, drained = drained as u64);
 
         if need_resched {
             crate::kernel::sched::reschedule();

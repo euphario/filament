@@ -221,7 +221,7 @@ impl NvmeController {
         dsb();
         self.ring_asq_doorbell();
 
-        for _ in 0..1000 {
+        for i in 0..1000u32 {
             let cq_entry = self.acq_entry(self.acq_head);
             if cq_entry.phase() == self.acq_phase {
                 let status = cq_entry.status();
@@ -232,8 +232,20 @@ impl NvmeController {
                 if status != 0 { return Err(status); }
                 return Ok(result);
             }
+            // Check for CFS early to avoid wasting 100ms polling a dead controller
+            if i % 100 == 99 {
+                if (self.read32(regs::CSTS) & csts::CFS) != 0 { break; }
+            }
             syscall::sleep_us(100);
         }
+        let csts_val = self.read32(regs::CSTS);
+        let cq0 = self.acq_entry(self.acq_head);
+        uerror!("nvmed", "admin_timeout";
+            csts = csts_val as u64,
+            cq_dw2 = cq0.dw2 as u64,
+            cq_dw3 = cq0.dw3 as u64,
+            asq_phys = self.queue_mem_phys,
+            acq_phys = (self.queue_mem_phys + 4096));
         Err(0xFFFF)
     }
 
@@ -395,14 +407,18 @@ fn dsb() {
 // NVMe Controller Initialization (one-time, during init)
 // =============================================================================
 
-/// Initialize NVMe hardware. Returns the controller or exits on failure.
-fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
+/// Initialize NVMe hardware. Returns the controller or an error string.
+///
+/// All errors are returned (not exit()) so the bus framework can flush
+/// the structured log ring before terminating — otherwise uerror! messages
+/// are silently lost.
+fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, BusError> {
     // Map BAR0
     let bar0 = match MmioRegion::open(bar0_addr, bar0_size) {
         Some(m) => m,
         None => {
-            uerror!("nvmed", "bar0_map_failed";);
-            syscall::exit(1);
+            uerror!("nvmed", "bar0_map_failed"; addr = bar0_addr, size = bar0_size);
+            return Err(BusError::Internal);
         }
     };
 
@@ -411,7 +427,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
         Some(p) => p,
         None => {
             uerror!("nvmed", "dma_alloc_failed";);
-            syscall::exit(1);
+            return Err(BusError::Internal);
         }
     };
 
@@ -440,7 +456,8 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
     let cap_val = ctrl.read64(regs::CAP);
     let dstrd = ((cap_val & cap::DSTRD_MASK) >> cap::DSTRD_SHIFT) as u32;
     ctrl.doorbell_stride = 4 << dstrd;
-    let _vs = ctrl.read32(regs::VS);
+    let vs = ctrl.read32(regs::VS);
+    uinfo!("nvmed", "hw_probe"; cap = cap_val, vs = vs as u64, stride = ctrl.doorbell_stride);
 
     // Disable controller
     ctrl.write32(regs::CC, 0);
@@ -454,6 +471,15 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
     ctrl.write32(regs::AQA, aqa);
     ctrl.write64(regs::ASQ, queue_mem_phys);
     ctrl.write64(regs::ACQ, queue_mem_phys + 4096);
+    uinfo!("nvmed", "admin_queues";
+        asq = queue_mem_phys, acq = queue_mem_phys + 4096,
+        virt = queue_mem_virt, aqa = aqa as u64);
+
+    // Verify registers were written (readback)
+    let asq_rb = ctrl.read64(regs::ASQ);
+    let acq_rb = ctrl.read64(regs::ACQ);
+    let aqa_rb = ctrl.read32(regs::AQA);
+    uinfo!("nvmed", "reg_readback"; asq_rb = asq_rb, acq_rb = acq_rb, aqa = aqa_rb as u64);
 
     // Enable controller
     let cc_val = cc::EN | cc::CSS_NVM | cc::AMS_RR
@@ -464,22 +490,23 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
         let csts_val = ctrl.read32(regs::CSTS);
         if (csts_val & csts::RDY) != 0 { rdy = true; break; }
         if (csts_val & csts::CFS) != 0 {
-            uerror!("nvmed", "controller_fatal";);
-            syscall::exit(1);
+            uerror!("nvmed", "controller_fatal"; csts = csts_val);
+            return Err(BusError::Internal);
         }
         syscall::sleep_ms(1);
     }
     if !rdy {
         uerror!("nvmed", "controller_timeout";);
-        syscall::exit(1);
+        return Err(BusError::Timeout);
     }
+    uinfo!("nvmed", "controller_ready"; cc = cc_val as u64, csts = ctrl.read32(regs::CSTS) as u64);
 
     // Identify buffer
     let id_pool = match DmaPool::alloc(4096) {
         Some(p) => p,
         None => {
             uerror!("nvmed", "identify_alloc_failed";);
-            syscall::exit(1);
+            return Err(BusError::Internal);
         }
     };
     let id_buf_virt = id_pool.vaddr();
@@ -493,7 +520,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
         }
         Err(e) => {
             uerror!("nvmed", "identify_ctrl_err"; status = e as u32);
-            syscall::exit(1);
+            return Err(BusError::Internal);
         }
     }
 
@@ -508,22 +535,22 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> NvmeController {
         }
         Err(e) => {
             uerror!("nvmed", "identify_ns_err"; status = e as u32);
-            syscall::exit(1);
+            return Err(BusError::Internal);
         }
     }
 
     // Create I/O queues
     if let Err(e) = ctrl.create_iocq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 12288) {
         uerror!("nvmed", "create_iocq_err"; status = e as u32);
-        syscall::exit(1);
+        return Err(BusError::Internal);
     }
     if let Err(e) = ctrl.create_iosq(1, IO_QUEUE_SIZE as u16, queue_mem_phys + 8192, 1) {
         uerror!("nvmed", "create_iosq_err"; status = e as u32);
-        syscall::exit(1);
+        return Err(BusError::Internal);
     }
 
     uinfo!("nvmed", "controller_ready"; blocks = ctrl.ns_size, block_size = ctrl.block_size);
-    ctrl
+    Ok(ctrl)
 }
 
 // =============================================================================
@@ -720,7 +747,7 @@ impl Driver for NvmeDriver {
         uinfo!("nvmed", "device_found"; bar0 = bar0_addr, size = bar0_size);
 
         // Initialize NVMe hardware
-        let ctrl = init_nvme_hardware(bar0_addr, bar0_size);
+        let ctrl = init_nvme_hardware(bar0_addr, bar0_size)?;
 
         let block_size = ctrl.block_size;
         let block_count = ctrl.ns_size;

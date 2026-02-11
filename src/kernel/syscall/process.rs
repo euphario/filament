@@ -17,7 +17,7 @@
 //!
 //! SECURITY: All user pointers are validated before access using the uaccess module.
 
-use crate::{kwarn, kinfo};
+use crate::{kwarn, kdebug};
 use super::super::uaccess;
 use super::super::caps::Capabilities;
 use crate::kernel::traits::process_ops::WaitChildResult;
@@ -43,7 +43,7 @@ pub(super) fn sys_exit(code: i32) -> i64 {
     let pid = match ctx.current_task_id() {
         Some(id) => id,
         None => {
-            kinfo!("sys_exit", "no_current_task");
+            kdebug!("sys_exit", "no_current_task");
             return KernelError::NoProcess.to_errno();
         }
     };

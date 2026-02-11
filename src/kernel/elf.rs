@@ -7,9 +7,7 @@
 
 use super::addrspace::AddressSpace;
 use super::pmm;
-#[cfg(debug_assertions)]
-use crate::kdebug;
-use crate::{kinfo, kwarn, print_direct};
+use crate::{kdebug, kwarn, print_direct};
 use crate::kernel::arch::mmu;
 use super::task;
 
@@ -645,7 +643,7 @@ fn spawn_from_elf_internal(
     })?;
     // Scheduler lock released here — safe to log
 
-    kinfo!("elf", "spawn_ok"; name = name, pid = task_id as u64, slot = slot as u64, entry = crate::klog::hex64(elf_info.entry), parent = parent_id as u64);
+    kdebug!("elf", "spawn_ok"; name = name, pid = task_id as u64, slot = slot as u64, entry = crate::klog::hex64(elf_info.entry), parent = parent_id as u64);
 
     Ok((task_id, slot))
 }

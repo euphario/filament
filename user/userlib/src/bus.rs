@@ -193,6 +193,8 @@ pub enum BusError {
     ShmemError,
     /// Internal error.
     Internal,
+    /// Hardware not present or not powered.
+    NotPresent,
 }
 
 // ============================================================================

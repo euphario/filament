@@ -31,7 +31,7 @@
 //! - **Running** → Waiting (via `wait_current`) - has deadline
 //! - **Sleeping/Waiting** → Ready (via `wake` or timeout)
 
-use crate::{kerror, kdebug, kwarn, kinfo};
+use crate::{kerror, kdebug, kwarn};
 use super::task::{self, TaskState, current_slot, set_current_slot, TrapFrame};
 use super::percpu;
 
@@ -210,7 +210,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 // Diagnostic: log switches away from terminated tasks (kill/exit path)
                 if sched.task(caller_slot).map(|t| t.is_terminated()).unwrap_or(false) {
                     let to_pid = sched.task(slot).map(|t| t.id as u64).unwrap_or(0);
-                    kinfo!("resched", "exit_switch"; from_slot = caller_slot as u64, to_slot = slot as u64, to_pid = to_pid);
+                    kdebug!("resched", "exit_switch"; from_slot = caller_slot as u64, to_slot = slot as u64, to_pid = to_pid);
                 }
                 slot
             }

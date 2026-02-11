@@ -21,7 +21,7 @@
 extern crate abi;
 
 use abi::{PortInfo, PortClass, port_subclass};
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, udebug, uerror};
 use userlib::mmio::MmioRegion;
 use userlib::bus::{Driver, BusCtx, BusMsg, Disposition, ConfigKey};
 use userlib::bus_runtime::driver_main;
@@ -152,7 +152,7 @@ impl SwitchDriver {
                 uerror!("switchd", "group_register_failed"; group = self.groups[i].id as u32, err = e as u32);
             } else {
                 self.groups[i].registered = true;
-                uinfo!("switchd", "group_registered"; group = self.groups[i].id as u32,
+                udebug!("switchd", "group_registered"; group = self.groups[i].id as u32,
                     ports = self.groups[i].port_mask as u32);
             }
         }
@@ -478,12 +478,12 @@ const SWITCH_CONFIG_KEYS: &[ConfigKey] = &[
 
 impl Driver for SwitchDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), userlib::bus::BusError> {
-        uinfo!("switchd", "init_start";);
+        udebug!("switchd", "init_start";);
 
         // Map switch MMIO region
         match MmioRegion::open(SWITCH_BASE as u64, SWITCH_SIZE as u64) {
             Some(sw) => {
-                uinfo!("switchd", "mmio_mapped"; base = SWITCH_BASE as u32, size = SWITCH_SIZE as u32);
+                udebug!("switchd", "mmio_mapped"; base = SWITCH_BASE as u32, size = SWITCH_SIZE as u32);
                 self.sw = Some(sw);
             }
             None => {
@@ -494,7 +494,7 @@ impl Driver for SwitchDriver {
 
         // Read switch ID to verify access
         let id = self.read(0x7ffc);
-        uinfo!("switchd", "switch_id"; id = id);
+        udebug!("switchd", "switch_id"; id = id);
 
         // Register bridge groups (default: br0 with all ports)
         self.register_groups(ctx);

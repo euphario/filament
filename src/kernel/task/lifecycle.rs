@@ -16,7 +16,7 @@
 //! - `kill(task_id, killer_id)` - Forced termination (SIGKILL equivalent)
 //! - `wait_child(parent_id, pid, flags)` - Wait for child exit (sys_wait)
 
-use crate::kinfo;
+use crate::{kinfo, kdebug};
 use super::{TaskId, Scheduler, MAX_TASKS};
 use crate::kernel::ipc::{waker, traits::WakeReason};
 
@@ -297,7 +297,7 @@ pub fn complete_exit_notification(info: ExitInfo) {
     );
 
     // Diagnostic: log whether ProcessObject subscriber was found
-    kinfo!("lifecycle", "exit_notify"; parent = info.parent_id, child = info.child_pid, subscribers = wake_list.len() as u64);
+    kdebug!("lifecycle", "exit_notify"; parent = info.parent_id, child = info.child_pid, subscribers = wake_list.len() as u64);
 
     // Wake handle subscribers (e.g. ProcessObject waiters)
     waker::wake(&wake_list, WakeReason::ChildExit);
@@ -370,7 +370,7 @@ fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, chil
 fn handle_probed_exit(_sched: &mut Scheduler) {
     use crate::kernel::bus;
 
-    kinfo!("lifecycle", "probed_exit"; action = "lock_bus_creation");
+    kdebug!("lifecycle", "probed_exit"; action = "lock_bus_creation");
 
     // 1. Lock bus creation permanently
     bus::lock_bus_creation();
@@ -392,7 +392,7 @@ pub fn complete_probed_exit() {
         return;
     }
 
-    kinfo!("lifecycle", "probed_exit"; action = "spawning_devd");
+    kdebug!("lifecycle", "probed_exit"; action = "spawning_devd");
     match elf::spawn_from_path("bin/devd") {
         Ok((_task_id, slot)) => {
             super::with_scheduler(|sched| {

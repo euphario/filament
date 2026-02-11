@@ -393,15 +393,18 @@ fn digit_count(n: u32) -> usize {
     c
 }
 
-/// Fixed-size string buffer for building output
+/// Fixed-size string buffer for building output.
+///
+/// Translates `\n` → `\r\n` during writes so the tree renders correctly
+/// on serial terminals (the shell's `print!` macro doesn't do CR translation).
 struct StringBuf {
-    buf: [u8; 4096],
+    buf: [u8; 8192],
     len: usize,
 }
 
 impl StringBuf {
     fn new() -> Self {
-        Self { buf: [0; 4096], len: 0 }
+        Self { buf: [0; 8192], len: 0 }
     }
 
     fn as_str(&self) -> &str {
@@ -411,23 +414,27 @@ impl StringBuf {
 
 impl Write for StringBuf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = self.buf.len() - self.len;
-        let to_copy = bytes.len().min(remaining);
-        self.buf[self.len..self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
-        self.len += to_copy;
+        for &b in s.as_bytes() {
+            if self.len >= self.buf.len() { break; }
+            if b == b'\n' && self.len + 1 < self.buf.len() {
+                self.buf[self.len] = b'\r';
+                self.len += 1;
+            }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
         Ok(())
     }
 }
 
 /// Small buffer for building tree prefix strings
 struct PrefixBuf {
-    buf: [u8; 16],
+    buf: [u8; 32],
     len: usize,
 }
 
 impl PrefixBuf {
-    fn new() -> Self { Self { buf: [0; 16], len: 0 } }
+    fn new() -> Self { Self { buf: [0; 32], len: 0 } }
 
     fn push(&mut self, s: &str) {
         let b = s.as_bytes();

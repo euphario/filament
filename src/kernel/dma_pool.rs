@@ -20,7 +20,7 @@
 //! Userspace drivers call `shmem_create_dma()` syscall to allocate from
 //! this pool instead of regular shmem.
 
-use crate::{kinfo, kerror, klog};
+use crate::{kdebug, kerror, klog};
 use crate::kernel::arch::mmu;
 use crate::platform::current;
 use super::lock::SpinLock;
@@ -178,7 +178,7 @@ pub fn alloc_high(size: usize) -> Result<u64, i64> {
     let phys_addr = DMA_POOL_HIGH_BASE + pool.next_offset as u64;
     pool.next_offset = new_offset;
 
-    kinfo!("dma_pool", "alloc_high_ok";
+    kdebug!("dma_pool", "alloc_high_ok";
         size = aligned_size as u64,
         addr = klog::hex64(phys_addr),
         usage = pool.next_offset as u64,
@@ -227,7 +227,7 @@ pub fn alloc(size: usize) -> Result<u64, i64> {
     let phys_addr = DMA_POOL_BASE + pool.next_offset as u64;
     pool.next_offset = new_offset;
 
-    kinfo!("dma_pool", "alloc_ok";
+    kdebug!("dma_pool", "alloc_ok";
         size = aligned_size as u64,
         addr = klog::hex64(phys_addr),
         usage = pool.next_offset as u64,
@@ -258,7 +258,7 @@ pub fn map_into_process(pid: Pid, phys_addr: u64, size: usize) -> Result<u64, i6
         // Find the task and map the memory
         if let Some(slot) = sched.slot_by_pid(pid) {
             if let Some(task) = sched.task_mut(slot) {
-                // Use mmap_shmem_dma: device memory attributes for DMA coherency
+                // Use mmap_shmem_dma: Normal Non-Cacheable for DMA coherency
                 // BorrowedShmem kind means pages won't be freed when unmapped
                 // (they're owned by the DMA pool)
                 return task.mmap_shmem_dma(phys_addr, size)
@@ -422,5 +422,5 @@ pub fn test() {
         kdebug!("dma_pool", "stats_ok"; used = used as u64, total = total as u64);
     }
 
-    kinfo!("dma_pool", "test_ok");
+    kdebug!("dma_pool", "test_ok");
 }

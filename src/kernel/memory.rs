@@ -144,16 +144,17 @@ impl MapFlags {
     }
 
     /// Mapping existing shmem (no zeroing - data already initialized)
-    /// Uses non-cacheable (device memory) for cross-process coherency.
+    /// Uses Normal Non-Cacheable (NORMAL_NC) for cross-process coherency.
     /// This ensures writes are immediately visible to other processes without
-    /// requiring userspace memory barriers.
+    /// requiring userspace memory barriers, while still allowing write combining
+    /// (unlike Device memory which forces single-access transactions).
     pub const fn shmem_map() -> Self {
         Self {
             writable: true,
             executable: false,
             zero: false,       // CRITICAL: Don't zero - data already there!
             flush_cache: false, // No flush needed - NC memory bypasses cache
-            device: true,      // Non-cacheable for cross-process safety
+            device: false,     // Non-cacheable via NORMAL_NC (not Device-nGnRnE)
         }
     }
 

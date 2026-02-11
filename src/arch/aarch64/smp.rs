@@ -7,7 +7,7 @@
 //! handles PSCI calls, secondary CPU boot, and stack allocation.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::{kinfo, kwarn, kdebug};
+use crate::{kwarn, kdebug};
 use crate::kernel::percpu::{self, CpuState, MAX_CPUS};
 
 /// Stack size per CPU (16KB)
@@ -127,7 +127,7 @@ pub fn init() {
 
     // Check PSCI version
     if let Some((major, minor)) = psci_version() {
-        kinfo!("smp", "psci_version"; major = major as u64, minor = minor as u64);
+        kdebug!("smp", "psci_version"; major = major as u64, minor = minor as u64);
     } else {
         kwarn!("smp", "psci_unavailable");
     }
@@ -138,7 +138,7 @@ pub fn init() {
         percpu::CPU_DATA[cpu as usize].set_stack_top(stack_top);
         percpu::CPU_DATA[cpu as usize].set_state(CpuState::Online);
     }
-    kinfo!("smp", "cpu_online"; cpu = cpu as u64);
+    kdebug!("smp", "cpu_online"; cpu = cpu as u64);
 }
 
 /// Secondary CPU entry point (called from assembly)
@@ -166,7 +166,7 @@ pub extern "C" fn secondary_cpu_entry(cpu_id_arg: u64) {
     // 6. Start timer for this CPU
     crate::platform::current::timer::start(10);
 
-    kinfo!("smp", "cpu_online"; cpu = cpu as u64);
+    kdebug!("smp", "cpu_online"; cpu = cpu as u64);
 
     // 7. Enter idle loop (never returns)
     crate::kernel::idle::idle_entry();
@@ -227,7 +227,7 @@ pub fn start_secondary_cpus() {
 
     // Report status
     let online_count = percpu::num_online_cpus();
-    kinfo!("smp", "cpus_online"; count = online_count as u64);
+    kdebug!("smp", "cpus_online"; count = online_count as u64);
 
     // Update scheduler's round-robin to distribute across all online CPUs
     if online_count > 1 {
@@ -258,5 +258,5 @@ pub fn test() {
     let online = percpu::num_online_cpus();
     kdebug!("smp", "online_cpus"; count = online as u64);
 
-    kinfo!("smp", "test_ok");
+    kdebug!("smp", "test_ok");
 }

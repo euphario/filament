@@ -53,7 +53,7 @@ pub use host::{PciHost, PciHostOps};
 pub use device::{PciDevice, PciDeviceRegistry, PciBdf};
 pub use msi::MsiAllocator;
 
-use crate::{kinfo, print_direct};
+use crate::{kdebug, print_direct};
 
 /// Maximum number of PCI devices we track
 pub const MAX_PCI_DEVICES: usize = 64;
@@ -236,7 +236,12 @@ impl Mt7988aPciHost {
         if port >= self.port_count || self.port_bases[port] == 0 {
             return 0xFFFF_FFFF;
         }
-        let addr = self.port_bases[port] + offset;
+        let phys = self.port_bases[port] + offset;
+        let addr = if crate::kernel::arch::mmu::is_enabled() {
+            phys | crate::kernel::arch::mmu::KERNEL_VIRT_BASE as usize
+        } else {
+            phys
+        };
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
@@ -245,7 +250,12 @@ impl Mt7988aPciHost {
         if port >= self.port_count || self.port_bases[port] == 0 {
             return;
         }
-        let addr = self.port_bases[port] + offset;
+        let phys = self.port_bases[port] + offset;
+        let addr = if crate::kernel::arch::mmu::is_enabled() {
+            phys | crate::kernel::arch::mmu::KERNEL_VIRT_BASE as usize
+        } else {
+            phys
+        };
         unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
     }
 }
@@ -264,56 +274,45 @@ impl PciHostOps for Mt7988aPciHost {
     }
 
     fn config_read32(&self, bdf: PciBdf, offset: u16) -> u32 {
-        // MT7988A uses TLP-based config access
-        // Port is encoded in upper bits of bus number or passed separately
-        let port = (bdf.bus >> 4) as usize; // Simple encoding: port in upper nibble
-
-        if port >= self.port_count {
+        // Port is encoded in upper nibble of bus number
+        let port = (bdf.bus >> 4) as usize;
+        if port >= self.port_count || self.port_bases[port] == 0 {
             return 0xFFFF_FFFF;
         }
 
-        // Setup TLP header
+        let bus = (bdf.bus & 0x0F) as u32;
+
+        // Always set CFGNUM before reading MAC+0x1000, even for bus 0.
+        // Matches Linux mtk_pcie_config_tlp_header() which always writes
+        // CFGNUM with bus/devfn before every config read. Without this,
+        // stale CFGNUM state causes bus 0 reads to return downstream device
+        // data instead of root port config.
         let devfn = ((bdf.device as u32) << 3) | (bdf.function as u32);
-        let bus = bdf.bus & 0x0F; // Lower nibble is actual bus
+        let cfgnum = (1u32 << 20)       // FORCE_BYTE_EN
+            | (0xFu32 << 16)            // BYTE_EN = all bytes
+            | ((bus & 0xFF) << 8)       // bus number
+            | (devfn & 0xFF);           // devfn
+        self.write_mac(port, 0x140, cfgnum);
 
-        // CFGNUM register format for MT7988A
-        const CFGNUM_FORCE_BYTE_EN: u32 = 1 << 18;
-        const CFGNUM_BYTE_EN_SHIFT: u32 = 14;
-        const CFGNUM_BUS_SHIFT: u32 = 6;
-
-        let cfgnum = CFGNUM_FORCE_BYTE_EN
-            | (0xF << CFGNUM_BYTE_EN_SHIFT)  // All bytes enabled
-            | ((bus as u32) << CFGNUM_BUS_SHIFT)
-            | (devfn & 0x3F);
-
-        // Write CFGNUM register (offset 0x8)
-        self.write_mac(port, 0x8, cfgnum);
-
-        // Read from config space window (offset 0x1000 + reg)
         let cfg_offset = 0x1000 + ((offset as usize) & !0x3);
         self.read_mac(port, cfg_offset)
     }
 
     fn config_write32(&self, bdf: PciBdf, offset: u16, value: u32) {
         let port = (bdf.bus >> 4) as usize;
-
-        if port >= self.port_count {
+        if port >= self.port_count || self.port_bases[port] == 0 {
             return;
         }
 
+        let bus = (bdf.bus & 0x0F) as u32;
+
+        // Always set CFGNUM before writing, matching Linux behavior
         let devfn = ((bdf.device as u32) << 3) | (bdf.function as u32);
-        let bus = bdf.bus & 0x0F;
-
-        const CFGNUM_FORCE_BYTE_EN: u32 = 1 << 18;
-        const CFGNUM_BYTE_EN_SHIFT: u32 = 14;
-        const CFGNUM_BUS_SHIFT: u32 = 6;
-
-        let cfgnum = CFGNUM_FORCE_BYTE_EN
-            | (0xF << CFGNUM_BYTE_EN_SHIFT)
-            | ((bus as u32) << CFGNUM_BUS_SHIFT)
-            | (devfn & 0x3F);
-
-        self.write_mac(port, 0x8, cfgnum);
+        let cfgnum = (1u32 << 20)
+            | (0xFu32 << 16)
+            | ((bus & 0xFF) << 8)
+            | (devfn & 0xFF);
+        self.write_mac(port, 0x140, cfgnum);
 
         let cfg_offset = 0x1000 + ((offset as usize) & !0x3);
         self.write_mac(port, cfg_offset, value);
@@ -495,8 +494,33 @@ pub fn register_mt7988a_host(host: Mt7988aPciHost) {
     let port_count = host.port_count;
     if let Some(pci) = subsystem_mut() {
         pci.register_host(PciHostImpl::Mt7988a(host));
-        kinfo!("pci", "host_registered"; ports = port_count as u64);
+        kdebug!("pci", "host_registered"; ports = port_count as u64);
     }
+}
+
+/// Register a single MT7988A PCIe port (called from bus::create_bus for non-ECAM PCIe)
+///
+/// Creates the Mt7988aPciHost on first call, then adds each port's MAC base address.
+/// probed calls bus_create() for each PCIe port; the kernel accumulates them here.
+pub fn register_mt7988a_port(port_index: u8, base_addr: usize) {
+    let pci = match subsystem_mut() {
+        Some(p) => p,
+        None => return,
+    };
+
+    match &mut pci.host {
+        Some(PciHostImpl::Mt7988a(h)) => {
+            h.init_port(port_index as usize, base_addr);
+        }
+        None => {
+            let mut host = Mt7988aPciHost::new();
+            host.init_port(port_index as usize, base_addr);
+            pci.host = Some(PciHostImpl::Mt7988a(host));
+        }
+        _ => return, // Already registered as different host type
+    }
+
+    kdebug!("pci", "mt7988a_port"; port = port_index as u64, base = base_addr as u64);
 }
 
 /// Register an ECAM-based host controller (QEMU virt)
@@ -506,11 +530,11 @@ pub fn register_ecam_host(base: usize) {
     // Map the containing 1GB block as device memory.
     let gb_aligned = (base as u64) & !0x3FFF_FFFF;
     crate::kernel::arch::mmu::map_kernel_device_1gb(gb_aligned);
-    kinfo!("pci", "ecam_mapped"; phys = gb_aligned);
+    kdebug!("pci", "ecam_mapped"; phys = gb_aligned);
 
     if let Some(pci) = subsystem_mut() {
         pci.register_host(PciHostImpl::Ecam(EcamPciHost::new(base)));
-        kinfo!("pci", "ecam_registered"; base = base as u64);
+        kdebug!("pci", "ecam_registered"; base = base as u64);
     }
 }
 
@@ -537,12 +561,40 @@ pub fn enumerate() -> usize {
     {
         pci.bar_alloc.init(0x1000_0000, 0x3EFF_FFFF);
     }
-    // MT7988A uses firmware-assigned BARs (no kernel allocation needed)
+    #[cfg(feature = "platform-mt7988a")]
+    {
+        // PCIe memory aperture for port 3 (from DTS pcie@11290000 ranges)
+        // MEM: 0x28200000 - 0x2FFFFFFF (126MB)
+        // TODO: per-port allocation when multiple ports have link
+        pci.bar_alloc.init(0x2820_0000, 0x2FFF_FFFF);
+    }
 
     let mut count = 0;
 
-    // Walk bus 0..4, device 0..32, function 0..8
-    for bus in 0..4u8 {
+    // Build list of bus numbers to scan based on host type.
+    // ECAM: single hierarchy, scan buses 0-3.
+    // MT7988A MAC-TLP: port encoded in upper nibble of bus number.
+    //   Each port has bus 0 (root port bridge) and bus 1 (devices behind it).
+    //   We scan both: root ports are skipped (Type 1), endpoints found on bus 1.
+    let mut bus_list = [0xFFu8; 12];
+    let bus_count = match host {
+        PciHostImpl::Ecam(_) => {
+            bus_list[0] = 0; bus_list[1] = 1; bus_list[2] = 2; bus_list[3] = 3;
+            4
+        }
+        PciHostImpl::Mt7988a(h) => {
+            let mut n = 0;
+            for p in 0..h.port_count.min(4) {
+                bus_list[n] = (p as u8) << 4;       // Root bus (bridge, skipped by header_type check)
+                bus_list[n + 1] = ((p as u8) << 4) | 1; // Secondary bus (endpoints)
+                n += 2;
+            }
+            n
+        }
+    };
+
+    for bi in 0..bus_count {
+        let bus = bus_list[bi];
         for device in 0..32u8 {
             // Check function 0 first
             let vendor_device = host_config_read32(host, PciBdf::new(bus, device, 0), 0x00);
@@ -570,7 +622,7 @@ pub fn enumerate() -> usize {
                 if let Some(dev) = enumerate_device(host, bdf, &mut pci.bar_alloc) {
                     if pci.registry.register(dev).is_ok() {
                         count += 1;
-                        kinfo!("pci", "device_found";
+                        kdebug!("pci", "device_found";
                             bdf_bus = bdf.bus as u64,
                             bdf_dev = bdf.device as u64,
                             bdf_func = bdf.function as u64,

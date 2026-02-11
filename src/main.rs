@@ -104,7 +104,7 @@ pub extern "C" fn kmain() -> ! {
         (midr, (el >> 2) & 0x3, vbar)
     };
 
-    kinfo!("kernel", "cpu_info"; midr = klog::hex64(midr), el = current_el, vbar = klog::hex64(vbar));
+    kdebug!("kernel", "cpu_info"; midr = klog::hex64(midr), el = current_el, vbar = klog::hex64(vbar));
 
     if current_el != 1 {
         kerror!("kernel", "el_check_failed"; expected = 1u64, actual = current_el);
@@ -121,14 +121,14 @@ pub extern "C" fn kmain() -> ! {
         let _span = span!("gic", "init");
         gic::init();
         let (product, variant, num_irqs) = gic::info();
-        kinfo!("gic", "init_ok"; product = klog::hex32(product as u32), variant = variant, irqs = num_irqs);
+        kdebug!("gic", "init_ok"; product = klog::hex32(product as u32), variant = variant, irqs = num_irqs);
 
         uart::enable_rx_interrupt();
         gic::enable_irq(plat::irq::UART0);
     }
 
     // MMU info (already initialized by boot.S)
-    kinfo!("mmu", "status"; ttbr0 = "user", ttbr1 = "kernel");
+    kdebug!("mmu", "status"; ttbr0 = "user", ttbr1 = "kernel");
     mmu::print_info();
 
     // Set up guard pages for boot stack (splits 2MB L2 block into L3 4KB pages)
@@ -167,7 +167,7 @@ pub extern "C" fn kmain() -> ! {
         let _span = span!("dma", "init");
         dma_pool::init();
         dma_pool::init_high();
-        kinfo!("dma", "pools_ready");
+        kdebug!("dma", "pools_ready");
     }
 
     // Shared memory
@@ -181,7 +181,7 @@ pub extern "C" fn kmain() -> ! {
     {
         let _span = span!("pci", "init");
         pci::init();
-        kinfo!("pci", "init_ok");
+        kdebug!("pci", "init_ok");
     }
 
     // Bus controllers — registry only, no buses registered yet
@@ -189,7 +189,7 @@ pub extern "C" fn kmain() -> ! {
     {
         let _span = span!("bus", "init");
         bus::init(0);  // Initialize registry (kernel PID = 0), no buses
-        kinfo!("bus", "init_ok");
+        kdebug!("bus", "init_ok");
     }
 
     // Watchdog (MT7988A only)
@@ -197,7 +197,7 @@ pub extern "C" fn kmain() -> ! {
     {
         let _span = span!("wdt", "init");
         wdt::init();
-        kinfo!("wdt", "init_ok"; enabled = false);
+        kdebug!("wdt", "init_ok"; enabled = false);
     }
 
     // Timer
@@ -222,7 +222,7 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "selftest")]
     {
         let _span = span!("kernel", "selftest");
-        kinfo!("kernel", "selftest_start");
+        kdebug!("kernel", "selftest_start");
 
         kernel::lock::test();  // Test locks early - other modules depend on them
         pmm::test();
@@ -243,7 +243,7 @@ pub extern "C" fn kmain() -> ! {
             plat::sd::test();
         }
 
-        kinfo!("kernel", "selftest_complete");
+        kdebug!("kernel", "selftest_complete");
     }
 
     #[cfg(not(feature = "selftest"))]
@@ -268,7 +268,7 @@ pub extern "C" fn kmain() -> ! {
     unsafe {
         core::arch::asm!("msr daifclr, #2");
     }
-    kinfo!("kernel", "irq_enabled");
+    kdebug!("kernel", "irq_enabled");
 
     // =========================================================================
     // Phase 4: Start scheduler
@@ -283,12 +283,12 @@ pub extern "C" fn kmain() -> ! {
     kinfo!("kernel", "scheduler_ready");
 
     // Spawn probed (bus discovery) - runs first, exits quickly, then devd is spawned
-    kinfo!("kernel", "spawning_probed");
+    kdebug!("kernel", "spawning_probed");
     let slot1 = {
         let _span = span!("elf", "spawn"; path = "bin/probed");
         match elf::spawn_from_path("bin/probed") {
             Ok((_task_id, slot)) => {
-                kinfo!("kernel", "probed_spawned"; slot = slot);
+                kdebug!("kernel", "probed_spawned"; slot = slot);
                 klog::flush();
                 // Give probed PROBED capabilities and mark as probed process
                 task::with_scheduler(|sched| {
@@ -646,6 +646,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
     print_hex_uart(elr);
     print_str_uart(" FAR=0x");
     print_hex_uart(far);
+    print_str_uart(" ESR=0x");
+    print_hex_uart(esr);
     print_str_uart("\r\n");
 
     // Dump key registers from trap frame for crash diagnosis
@@ -657,7 +659,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_str_uart(" FP=0x");
         print_hex_uart(tf.x29);
         print_str_uart("\r\n");
-        // Dump x0-x3 (arguments) and x19-x21 (callee-saved)
+        // Dump x0-x3 (arguments), x8-x9 (scratch), x19-x21 (callee-saved)
         print_str_uart("  x0=0x");
         print_hex_uart(tf.x0);
         print_str_uart(" x1=0x");
@@ -666,6 +668,15 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_hex_uart(tf.x2);
         print_str_uart(" x3=0x");
         print_hex_uart(tf.x3);
+        print_str_uart("\r\n");
+        print_str_uart("  x8=0x");
+        print_hex_uart(tf.x8);
+        print_str_uart(" x9=0x");
+        print_hex_uart(tf.x9);
+        print_str_uart(" x10=0x");
+        print_hex_uart(tf.x10);
+        print_str_uart(" x11=0x");
+        print_hex_uart(tf.x11);
         print_str_uart("\r\n");
         print_str_uart("  x19=0x");
         print_hex_uart(tf.x19);
@@ -1224,7 +1235,7 @@ fn init_ramfs() {
     // First, try embedded initrd (compiled into kernel)
     if let Some((addr, size)) = initrd::get_embedded_initrd() {
         let count = ramfs::init(addr, size);
-        kinfo!("ramfs", "loaded"; source = "embedded", files = count);
+        kdebug!("ramfs", "loaded"; source = "embedded", files = count);
         return;
     }
 
@@ -1238,7 +1249,7 @@ fn init_ramfs() {
 
     if magic_check {
         let count = ramfs::init(plat::INITRD_ADDR, plat::INITRD_MAX_SIZE);
-        kinfo!("ramfs", "loaded"; source = "external", files = count);
+        kdebug!("ramfs", "loaded"; source = "external", files = count);
     } else {
         kwarn!("ramfs", "not_found"; hint = "build with mkinitrd.sh");
     }

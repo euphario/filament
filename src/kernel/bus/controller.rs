@@ -11,7 +11,7 @@ use super::{
 };
 use crate::kernel::ipc::{self, ChannelId, Message, MessageType, waker, WakeReason, IpcError};
 use crate::kernel::process::Pid;
-use crate::{kinfo, kerror};
+use crate::{kinfo, kdebug, kerror};
 
 /// Maximum devices per bus (for tracking bus mastering)
 pub const MAX_DEVICES_PER_BUS: usize = 32;
@@ -181,6 +181,9 @@ pub struct BusController {
     pub irq: u32,
     /// ECAM-based PCIe (vs MAC-based)
     pub ecam_based: bool,
+
+    /// True after hardware init has been processed (regardless of success/failure)
+    pub init_complete: bool,
 }
 
 impl BusController {
@@ -214,6 +217,7 @@ impl BusController {
             size: 0,
             irq: 0,
             ecam_based: false,
+            init_complete: false,
         }
     }
 
@@ -309,6 +313,14 @@ impl BusController {
         };
         let mut info = abi::PortInfo::new(&self.port_name[..self.port_name_len], port_class);
         info.port_subclass = port_subclass;
+        // Embed base_addr (u64 LE) + size (u32 LE) in metadata raw bytes.
+        // This is the format drivers expect (e.g., usbd reads BAR0 from metadata).
+        let addr_bytes = self.base_addr.to_le_bytes();
+        let size_bytes = (self.size as u32).to_le_bytes();
+        unsafe {
+            info.metadata.raw[0..8].copy_from_slice(&addr_bytes);
+            info.metadata.raw[8..12].copy_from_slice(&size_bytes);
+        }
         info
     }
 
@@ -373,7 +385,7 @@ impl BusController {
     /// Called during kernel init
     pub fn register_port(&mut self, kernel_pid: Pid) -> Result<(), IpcError> {
         let name = self.port_name_str();
-        kinfo!("bus", "register_port"; name = name);
+        kdebug!("bus", "register_port"; name = name);
 
         // Build PortInfo for this bus
         let mut info = ipc::PortInfo::new(name.as_bytes(), self.port_class());
@@ -448,7 +460,7 @@ impl BusController {
             return;
         }
 
-        kinfo!("bus", "state_change";
+        kdebug!("bus", "state_change";
             name = self.port_name_str(),
             from = old_state.as_str(),
             to = new_state.as_str(),
@@ -521,7 +533,7 @@ impl BusController {
 
         self.owner_ch = Some(client_channel);
         self.owner_pid = Some(client_pid);
-        kinfo!("bus", "owner_connected";
+        kdebug!("bus", "owner_connected";
             name = self.port_name_str(),
             pid = client_pid as u64);
 
@@ -557,7 +569,7 @@ impl BusController {
 
     /// Handle owner (driver) disconnecting/exiting
     pub fn handle_owner_exit(&mut self, owner_pid: Pid) {
-        kinfo!("bus", "owner_exit"; name = self.port_name_str(), pid = owner_pid as u64);
+        kdebug!("bus", "owner_exit"; name = self.port_name_str(), pid = owner_pid as u64);
 
         // Close the kernel-owned owner channel
         if let Some(ch) = self.owner_ch {
@@ -587,7 +599,7 @@ impl BusController {
         }
 
         // Atomic transfer - NO state change, NO reset
-        kinfo!("bus", "handoff"; name = self.port_name_str(), new_pid = new_pid as u64);
+        kdebug!("bus", "handoff"; name = self.port_name_str(), new_pid = new_pid as u64);
 
         self.owner_ch = Some(new_channel);
         self.owner_pid = Some(new_pid);
@@ -692,29 +704,29 @@ impl BusController {
     ///
     /// Behavior depends on platform:
     /// - ECAM-based (QEMU): Skip hardware reset, just mark as verified
-    /// - MAC-based (MT7988): Full reset via INFRACFG
+    /// - MAC-based (MT7988): Full init via INFRACFG + RST_CTRL + link training
     ///
-    /// MT7988 Note: The RST_CTRL register at offset 0x148 has unusual behavior
-    /// on MT7988 - writes don't take effect. This is similar to EN7581 which
-    /// skips RST_CTRL manipulation entirely in the Linux driver.
+    /// Matches Linux pcie-mediatek-gen3.c mtk_pcie_startup_port():
+    /// 1. Enable clocks + deassert PEXTP_MAC_SWRST (INFRACFG level)
+    /// 2. Verify MAC registers accessible
+    /// 3. Check if link is already up (U-Boot may have left it running)
+    /// 4. If not, deassert RST_CTRL resets and wait for link training
     ///
-    /// For MT7988, we rely on INFRACFG PEXTP_MAC_SWRST for reset control:
-    /// - Assert PEXTP_MAC_SWRST = MAC in reset (safe state, no DMA)
-    /// - Deassert PEXTP_MAC_SWRST = MAC running
+    /// If link doesn't come up, clocks are disabled and hardware_verified=false.
+    /// Buses without link won't enumerate and stay in Resetting state.
     fn pcie_reset_sequence(&mut self) {
         use crate::kernel::arch::mmio::MmioRegion;
         use crate::klog;
-
         let index = self.bus_index as usize;
 
         // ECAM-based platforms (QEMU virt): no hardware reset needed
         if self.ecam_based {
-            kinfo!("bus", "pcie_ecam_mode"; port = index as u64);
+            kdebug!("bus", "pcie_ecam_mode"; port = index as u64);
             self.hardware_verified = true;
             return;
         }
 
-        // MAC-based platforms (MT7988): full hardware reset sequence
+        // MAC-based platforms (MT7988): full hardware startup sequence
         let mac_base = self.base_addr as usize;
         if mac_base == 0 {
             kerror!("bus", "pcie_invalid_base"; index = index as u64);
@@ -725,24 +737,59 @@ impl BusController {
         // Step 1: Enable clocks and deassert INFRACFG reset
         hw_pcie::enable_clocks(index);
 
-        // Now MAC should be accessible
+        // Step 2: Read diagnostic state before modifying anything
         let mac = MmioRegion::new(mac_base);
+        let hw_id = mac.read32(0x00);
+        let rst_ctrl = mac.read32(hw_pcie::RST_CTRL_REG);
+        let link_status = mac.read32(hw_pcie::LINK_STATUS_REG);
 
-        // Step 2: Verify MAC is accessible
-        let test_read = mac.read32(0x00);
-        if test_read == 0 || test_read == 0xFFFFFFFF {
-            kerror!("bus", "pcie_mac_not_accessible"; index = index as u64, mac = klog::hex32(mac_base as u32));
+        kdebug!("bus", "pcie_diag"; port = index as u64,
+            hw_id = klog::hex32(hw_id),
+            rst = klog::hex32(rst_ctrl),
+            link = klog::hex32(link_status));
+
+        if hw_id == 0 || hw_id == 0xFFFFFFFF {
+            kerror!("bus", "pcie_mac_not_accessible"; index = index as u64);
             hw_pcie::disable_clocks(index);
             self.hardware_verified = false;
             return;
         }
 
-        // MAC is accessible - mark as verified
-        self.hardware_verified = true;
-        kinfo!("bus", "pcie_verified"; port = index as u64, mac = klog::hex32(mac_base as u32));
+        // Step 3: If link is already up (U-Boot left it running), skip reset
+        if (link_status & hw_pcie::LINK_UP) != 0 {
+            self.hardware_verified = true;
+            kdebug!("bus", "pcie_link_preserved"; port = index as u64);
+            return;
+        }
 
-        // Step 3: Assert INFRACFG reset and disable clocks (safe state)
-        hw_pcie::disable_clocks(index);
+        // Step 4: Deassert RST_CTRL + wait for link training
+        let link_up = hw_pcie::startup_port(mac_base);
+        if link_up {
+            self.hardware_verified = true;
+            kinfo!("bus", "pcie_link_up"; port = index as u64);
+
+            // Configure root port: bus numbers, command, memory window
+            hw_pcie::configure_root_port(mac_base);
+
+            // Set up ATR translation tables for outbound memory access
+            hw_pcie::setup_atr(mac_base, index);
+
+            // Diagnostic: dump root port config after setup
+            let cfg0 = mac.read32(hw_pcie::CFG_OFFSET);       // Vendor/Device
+            let cfg4 = mac.read32(hw_pcie::CFG_OFFSET + 0x04); // Cmd/Status
+            let cfg18 = mac.read32(hw_pcie::CFG_OFFSET + 0x18); // Bus numbers
+            let cfg20 = mac.read32(hw_pcie::CFG_OFFSET + 0x20); // Memory window
+            kdebug!("bus", "pcie_cfg_dump"; port = index as u64,
+                cfg00 = klog::hex32(cfg0),
+                cmd = klog::hex32(cfg4),
+                busno = klog::hex32(cfg18),
+                memwin = klog::hex32(cfg20));
+        } else {
+            // No device or PHY not initialized — disable per-port clocks
+            hw_pcie::disable_clocks(index);
+            self.hardware_verified = false;
+            kinfo!("bus", "pcie_no_link"; port = index as u64);
+        }
     }
 
     /// USB/xHCI hardware reset sequence
@@ -751,7 +798,7 @@ impl BusController {
         self.hardware_verified = verified;
 
         if verified {
-            kinfo!("bus", "usb_verified"; port = self.bus_index as u64, u3 = u3_count as u64, u2 = u2_count as u64);
+            kdebug!("bus", "usb_verified"; port = self.bus_index as u64, u3 = u3_count as u64, u2 = u2_count as u64);
         } else {
             kerror!("bus", "usb_verify_failed"; index = self.bus_index as u64);
         }
@@ -868,7 +915,7 @@ impl BusController {
                     return Err(BusError::Busy);
                 }
 
-                kinfo!("bus", "reset_requested"; name = self.port_name_str());
+                kdebug!("bus", "reset_requested"; name = self.port_name_str());
 
                 // Transition to Resetting state
                 self.transition_to(BusState::Resetting, StateChangeReason::ResetRequested);

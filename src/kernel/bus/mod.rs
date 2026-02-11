@@ -61,11 +61,11 @@ pub use controller::BusController;
 
 use super::ipc::{ChannelId, Message};
 use super::process::Pid;
-use crate::{kinfo, kerror, print_direct};
+use crate::{kinfo, kdebug, kerror, print_direct};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Maximum number of buses
-pub const MAX_BUSES: usize = 8;
+/// Maximum number of buses (MT7988A needs 10: 4xPCIe + 2xUSB + eth + platform + uart + klog)
+pub const MAX_BUSES: usize = 12;
 
 /// Once set, no more buses can be created via open(Bus)
 static BUS_CREATION_LOCKED: AtomicBool = AtomicBool::new(false);
@@ -73,7 +73,7 @@ static BUS_CREATION_LOCKED: AtomicBool = AtomicBool::new(false);
 /// Lock bus creation permanently (called after probed exits)
 pub fn lock_bus_creation() {
     BUS_CREATION_LOCKED.store(true, Ordering::SeqCst);
-    kinfo!("bus", "creation_locked");
+    kdebug!("bus", "creation_locked");
 }
 
 /// Check if bus creation is locked
@@ -255,7 +255,7 @@ impl BusRegistry {
             // Check if this is the supervisor (devd)
             // Independent check — not else-if
             if bus.is_supervisor(pid) {
-                kinfo!("bus", "supervisor_exit"; name = bus.port_name_str(), pid = pid as u64);
+                kdebug!("bus", "supervisor_exit"; name = bus.port_name_str(), pid = pid as u64);
                 bus.handle_supervisor_disconnect(StateChangeReason::OwnerCrashed);
             }
         }
@@ -312,13 +312,17 @@ pub fn create_bus(info: &abi::BusCreateInfo, kernel_pid: Pid) -> Result<(), BusE
         bus.set_initial_state(initial_state);
         let _ = bus.register_port(kernel_pid);
 
-        kinfo!("bus", "created"; name = bus.port_name_str(),
+        kdebug!("bus", "created"; name = bus.port_name_str(),
             state = initial_state.as_str(),
             base = crate::klog::hex64(info.base_addr));
 
-        // For ECAM PCIe: register the host controller
-        if bus_type == BusType::PCIe && ecam_based && info.base_addr != 0 {
-            crate::kernel::pci::register_ecam_host(info.base_addr as usize);
+        // Register the PCIe host controller
+        if bus_type == BusType::PCIe && info.base_addr != 0 {
+            if ecam_based {
+                crate::kernel::pci::register_ecam_host(info.base_addr as usize);
+            } else {
+                crate::kernel::pci::register_mt7988a_port(info.bus_index, info.base_addr as usize);
+            }
         }
 
         Ok(())
@@ -347,36 +351,53 @@ pub fn init(_kernel_pid: Pid) {
 /// Returns true if there's more work to do.
 pub fn continue_init() -> bool {
     with_bus_registry(|registry| {
-        // Find first bus still in Resetting state
+        // Find first bus still in Resetting state that hasn't been processed
         for bus in registry.iter_mut() {
-            if bus.state() == BusState::Resetting {
+            if bus.state() == BusState::Resetting && !bus.init_complete {
                 // Do hardware reset for this bus
                 bus.perform_hardware_reset();
+                bus.init_complete = true;
+
                 if !bus.hardware_verified {
-                    kerror!("bus", "hw_verify_failed"; name = bus.port_name_str());
+                    // Hardware failed or no link — stay in Resetting state.
+                    // devd can't claim a bus in Resetting, so no driver spawned.
+                    kdebug!("bus", "hw_init_skipped"; name = bus.port_name_str());
+                    return true;
                 }
+
                 // Transition to Safe (notifies connected devd if any)
                 bus.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
 
                 // If this is a PCIe bus, enumerate devices now that hardware is ready
                 if bus.bus_type == BusType::PCIe {
+                    let bus_index = bus.bus_index;
+                    let ecam = bus.ecam_based;
                     let count = super::pci::enumerate();
-                    // Copy enumerated PCI devices into BusController for generic delivery
-                    super::pci::with_devices(|registry| {
-                        for i in 0..count {
-                            if let Some(dev) = registry.get(i) {
-                                bus.add_enum_device(pci_to_bus_device(dev));
+                    // Copy only THIS bus's devices into BusController for generic delivery.
+                    // For ECAM (single host): all devices belong to bus 0.
+                    // For MT7988A MAC-TLP: port is encoded in upper nibble of BDF bus number.
+                    super::pci::with_devices(|dev_registry| {
+                        for i in 0..super::pci::device_count() {
+                            if let Some(dev) = dev_registry.get(i) {
+                                let mine = if ecam {
+                                    bus_index == 0 // ECAM: all on bus 0
+                                } else {
+                                    (dev.bdf.bus >> 4) == bus_index
+                                };
+                                if mine {
+                                    bus.add_enum_device(pci_to_bus_device(dev));
+                                }
                             }
                         }
                     });
-                    kinfo!("bus", "pci_enumerated"; devices = count as u64);
+                    kinfo!("bus", "pci_enumerated"; devices = count as u64, bus_idx = bus_index as u64);
                 }
 
                 // Return true = more work might remain
                 return true;
             }
         }
-        // All buses are Safe
+        // All buses processed
         false
     })
 }
@@ -384,7 +405,7 @@ pub fn continue_init() -> bool {
 /// Check if all buses have completed initialization
 pub fn init_complete() -> bool {
     with_bus_registry(|registry| {
-        registry.iter().all(|bus| bus.state() != BusState::Resetting)
+        registry.iter().all(|bus| bus.state() != BusState::Resetting || bus.init_complete)
     })
 }
 
@@ -399,7 +420,7 @@ pub fn process_cleanup(pid: Pid) {
 /// This is called when devd crashes and needs to be restarted.
 /// All hardware is reset and put in safe state so devd can claim buses again.
 pub fn reset_all_buses() {
-    kinfo!("bus", "reset_all_start");
+    kdebug!("bus", "reset_all_start");
     with_bus_registry(|registry| {
         for bus in registry.iter_mut() {
             // Clear all connections
@@ -414,10 +435,10 @@ pub fn reset_all_buses() {
             // Transition to Safe state using proper transition method
             bus.transition_to(BusState::Safe, StateChangeReason::ResetComplete);
 
-            kinfo!("bus", "reset_ok"; name = bus.port_name_str());
+            kdebug!("bus", "reset_ok"; name = bus.port_name_str());
         }
     });
-    kinfo!("bus", "reset_all_complete");
+    kdebug!("bus", "reset_all_complete");
 }
 
 /// Handle port_connect for kernel bus ports
@@ -459,54 +480,61 @@ pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: 
 /// Process a message sent to a kernel bus channel
 /// Called synchronously from sys_send when message is for a kernel-owned channel
 pub fn process_bus_message(client_channel: ChannelId, data: &[u8]) {
-    // Find the bus that owns the peer of this channel
-    // The client sends on client_channel, which means the message goes to server_channel's queue
-    // We need to find which bus has server_channel as its owner_ch
-
-    // Get the peer channel ID (server_channel)
+    // client_channel is the user's end. owner_ch stores server_channel
+    // (set in handle_connect via connect_to_bus_port's server_channel arg).
+    // Look up peer to find server_channel.
     let server_channel = super::ipc::get_peer_id(client_channel);
 
     let Some(server_ch) = server_channel else {
         return;
     };
 
-    // Find the bus controller that owns this channel
     with_bus_registry(|registry| {
         for bus in registry.iter_mut() {
-            // Messages on owner channel: hardware commands (bus mastering, reset)
             if bus.owner_ch == Some(server_ch) {
                 let mut msg = Message::new();
                 msg.header.payload_len = data.len() as u32;
                 msg.payload[..data.len()].copy_from_slice(data);
 
-                if let Err(e) = bus.handle_message(&msg) {
+                if let Err(_e) = bus.handle_message(&msg) {
                     kerror!("bus", "message_error"; name = bus.port_name_str());
-                    let _ = e;
                 }
                 return;
             }
-            // Messages on supervisor channel: currently none handled by kernel
-            // (supervisor sends Spawn messages but those are handled by bus_runtime,
-            //  not by kernel bus controller directly)
         }
     });
 }
 
 /// Get list of all buses for bus_list syscall
-/// Returns number of buses written to buffer
+/// Returns number of buses written to buffer.
+/// Excludes buses that failed hardware verification (stuck in Resetting after init).
 pub fn get_bus_list(buf: &mut [abi::PortInfo]) -> usize {
     with_bus_registry(|registry| {
-        let count = registry.bus_count.min(buf.len());
-        for i in 0..count {
-            buf[i] = registry.buses[i].to_port_info();
+        let mut written = 0;
+        for bus in registry.iter() {
+            if written >= buf.len() {
+                break;
+            }
+            // Skip buses that completed init but failed hardware verification.
+            // They are stuck in Resetting and can never be claimed.
+            if bus.state() == BusState::Resetting && bus.init_complete {
+                continue;
+            }
+            buf[written] = bus.to_port_info();
+            written += 1;
         }
-        count
+        written
     })
 }
 
 /// Get total number of buses (for sizing buffer)
+/// Matches get_bus_list() filtering — excludes failed buses.
 pub fn get_bus_count() -> usize {
-    with_bus_registry(|registry| registry.bus_count)
+    with_bus_registry(|registry| {
+        registry.iter()
+            .filter(|b| !(b.state() == BusState::Resetting && b.init_complete))
+            .count()
+    })
 }
 
 // =============================================================================
