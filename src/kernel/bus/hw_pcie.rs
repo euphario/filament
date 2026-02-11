@@ -321,7 +321,7 @@ pub fn startup_port(mac_base: usize) -> bool {
 ///
 /// Without this, CFGNUM-based downstream config reads (bus 1+) return 0xFFFF
 /// because the root port won't forward Type 1 config cycles.
-pub fn configure_root_port(mac_base: usize) {
+pub fn configure_root_port(mac_base: usize, port_index: usize) {
     let mac = MmioRegion::new(mac_base);
 
     // Set CFGNUM to target root port (bus=0, devfn=0) before config writes.
@@ -337,10 +337,17 @@ pub fn configure_root_port(mac_base: usize) {
     let cmd = mac.read32(CFG_OFFSET + PCI_COMMAND);
     mac.write32(CFG_OFFSET + PCI_COMMAND, (cmd & 0xFFFF_0000) | 0x0107);
 
-    // Memory window: set a wide range so root port forwards all memory accesses
-    // Offset 0x20: Memory Base / Memory Limit (upper 12 bits of 32-bit address, 1MB granularity)
-    // Set base=0x20000000 (0x2000 << 16), limit=0x2FFF0000 (0x2FFF << 16)
-    mac.write32(CFG_OFFSET + 0x20, 0x2FFF_2000);
+    // Memory window: per-port range matching ATR and DTS ranges.
+    // Offset 0x20: Memory Base [15:4] = addr[31:20], Memory Limit [31:20] = addr[31:20]
+    // Root port forwards downstream memory accesses within this window.
+    let mem_window = match port_index {
+        0 => 0x37FF_3000u32, // pcie0: base=0x30000000, limit=0x37FF0000
+        1 => 0x3FFF_3800u32, // pcie1: base=0x38000000, limit=0x3FFF0000
+        2 => 0x27FF_2000u32, // pcie2: base=0x20000000, limit=0x27FF0000
+        3 => 0x2FFF_2800u32, // pcie3: base=0x28000000, limit=0x2FFF0000
+        _ => 0x3FFF_2000u32, // Fallback: full range
+    };
+    mac.write32(CFG_OFFSET + 0x20, mem_window);
 
     // Prefetchable memory: set base > limit to disable (no prefetchable window)
     mac.write32(CFG_OFFSET + 0x24, 0x0000_FFF0);
@@ -357,12 +364,13 @@ pub fn configure_root_port(mac_base: usize) {
 /// Uses 1:1 mapping (CPU addr = PCIe bus addr) matching the DTS ranges.
 /// Splits non-power-of-2 ranges into multiple entries (up to 8).
 pub fn setup_atr(mac_base: usize, port_index: usize) {
-    // Memory aperture per port (from MT7988A DTS)
+    // Memory aperture per port (from MT7988A DTS mt7988a.dtsi ranges property)
+    // Port index corresponds to MAC base: [0x11300000, 0x11310000, 0x11280000, 0x11290000]
     let (cpu_addr, size): (u64, u64) = match port_index {
-        0 => (0x2020_0000, 0x07E0_0000), // 126MB
-        1 => (0x2420_0000, 0x03E0_0000), // 62MB
-        2 => (0x2620_0000, 0x01E0_0000), // 30MB
-        3 => (0x2820_0000, 0x07E0_0000), // 126MB
+        0 => (0x3020_0000, 0x07E0_0000), // pcie0 @ 0x11300000: 0x30200000-0x37FFFFFF
+        1 => (0x3820_0000, 0x07E0_0000), // pcie1 @ 0x11310000: 0x38200000-0x3FFFFFFF
+        2 => (0x2020_0000, 0x07E0_0000), // pcie2 @ 0x11280000: 0x20200000-0x27FFFFFF
+        3 => (0x2820_0000, 0x07E0_0000), // pcie3 @ 0x11290000: 0x28200000-0x2FFFFFFF
         _ => return,
     };
 

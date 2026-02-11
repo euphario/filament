@@ -768,8 +768,8 @@ impl BusController {
             self.hardware_verified = true;
             kinfo!("bus", "pcie_link_up"; port = index as u64);
 
-            // Configure root port: bus numbers, command, memory window
-            hw_pcie::configure_root_port(mac_base);
+            // Configure root port: bus numbers, command, per-port memory window
+            hw_pcie::configure_root_port(mac_base, index);
 
             // Set up ATR translation tables for outbound memory access
             hw_pcie::setup_atr(mac_base, index);

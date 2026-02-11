@@ -149,8 +149,8 @@ pub struct PciSubsystem {
     msi: MsiAllocator,
     /// Host controller (trait object would need alloc, use enum instead)
     host: Option<PciHostImpl>,
-    /// BAR address allocator (for ECAM platforms where kernel assigns BARs)
-    bar_alloc: BarAllocator,
+    /// Per-port BAR address allocators (MT7988A: 4 ports with distinct memory windows)
+    bar_allocs: [BarAllocator; 4],
 }
 
 /// Concrete host implementations (avoid dyn trait)
@@ -166,7 +166,8 @@ impl PciSubsystem {
             registry: PciDeviceRegistry::new(),
             msi: MsiAllocator::new(),
             host: None,
-            bar_alloc: BarAllocator::empty(),
+            bar_allocs: [BarAllocator::empty(), BarAllocator::empty(),
+                         BarAllocator::empty(), BarAllocator::empty()],
         }
     }
 
@@ -556,17 +557,20 @@ pub fn enumerate() -> usize {
         None => return 0,
     };
 
-    // Initialize BAR allocator from platform-specific MMIO window
+    // Initialize per-port BAR allocators from platform-specific MMIO windows
     #[cfg(feature = "platform-qemu-virt")]
     {
-        pci.bar_alloc.init(0x1000_0000, 0x3EFF_FFFF);
+        // QEMU: single ECAM hierarchy, one allocator suffices
+        pci.bar_allocs[0].init(0x1000_0000, 0x3EFF_FFFF);
     }
     #[cfg(feature = "platform-mt7988a")]
     {
-        // PCIe memory aperture for port 3 (from DTS pcie@11290000 ranges)
-        // MEM: 0x28200000 - 0x2FFFFFFF (126MB)
-        // TODO: per-port allocation when multiple ports have link
-        pci.bar_alloc.init(0x2820_0000, 0x2FFF_FFFF);
+        // Per-port memory apertures from MT7988A DTS (mt7988a.dtsi ranges property)
+        // Port index → MAC base: [0x11300000, 0x11310000, 0x11280000, 0x11290000]
+        pci.bar_allocs[0].init(0x3020_0000, 0x37FF_FFFF); // pcie0: 126MB
+        pci.bar_allocs[1].init(0x3820_0000, 0x3FFF_FFFF); // pcie1: 126MB
+        pci.bar_allocs[2].init(0x2020_0000, 0x27FF_FFFF); // pcie2: 126MB
+        pci.bar_allocs[3].init(0x2820_0000, 0x2FFF_FFFF); // pcie3: 126MB
     }
 
     let mut count = 0;
@@ -619,7 +623,14 @@ pub fn enumerate() -> usize {
                     }
                 }
 
-                if let Some(dev) = enumerate_device(host, bdf, &mut pci.bar_alloc) {
+                // Select per-port BAR allocator.
+                // MT7988A: upper nibble of bus = port index.
+                // ECAM: all devices use allocator 0.
+                let alloc_idx = match host {
+                    PciHostImpl::Mt7988a(_) => ((bdf.bus >> 4) as usize).min(3),
+                    PciHostImpl::Ecam(_) => 0,
+                };
+                if let Some(dev) = enumerate_device(host, bdf, &mut pci.bar_allocs[alloc_idx]) {
                     if pci.registry.register(dev).is_ok() {
                         count += 1;
                         kdebug!("pci", "device_found";

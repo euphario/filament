@@ -35,6 +35,7 @@ mod pci_class {
 mod pci_subclass {
     pub const USB: u8 = 0x03;
     pub const NVME: u8 = 0x08;
+    pub const WIFI: u8 = 0x80;
 }
 
 mod pci_prog_if {
@@ -50,6 +51,7 @@ const MAX_PCI_DEVICES: usize = 32;
 fn class_name(base_class: u8, subclass: u8, prog_if: u8) -> &'static str {
     match (base_class, subclass, prog_if) {
         (pci_class::SERIAL_BUS, pci_subclass::USB, pci_prog_if::XHCI) => "xhci",
+        (pci_class::NETWORK, pci_subclass::WIFI, _) => "wifi",
         (pci_class::NETWORK, _, _) => "network",
         (pci_class::MASS_STORAGE, pci_subclass::NVME, _) => "nvme",
         (0x06, _, _) => "bridge",
@@ -64,6 +66,9 @@ fn port_class_subclass(base_class: u8, subclass: u8, prog_if: u8) -> (PortClass,
         }
         (pci_class::MASS_STORAGE, pci_subclass::NVME, _) => {
             (PortClass::StorageController, port_subclass::STORAGE_NVME)
+        }
+        (pci_class::NETWORK, pci_subclass::WIFI, _) => {
+            (PortClass::Network, port_subclass::NET_WIFI)
         }
         (pci_class::NETWORK, _, _) => {
             (PortClass::Network, port_subclass::NET_ETHERNET)
