@@ -29,6 +29,7 @@ mod dma;
 mod device;
 mod mcu;
 mod firmware;
+mod mac;
 
 use regs::*;
 use dma::{TxRing, flush_buffer};
@@ -350,8 +351,21 @@ impl WifiDriver {
 
     // wa_cmd(SET, RED, 0, 0) — enable Random Early Drop
     dev.mcu_wa_cmd(&mut wa_ring, mcu::MCU_WA_PARAM_RED, 0, 0, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
 
     uinfo!("mcu", "mcu_init_ok");
+
+    // ====================================================================
+    // MAC initialization — register writes + MCU commands
+    // Linux: init.c mt7996_init_work() → mcu_set_eeprom() → mac_init()
+    // ====================================================================
+
+    // Tell MCU about EEPROM mode (efuse) — mcu.c:3810
+    dev.mcu_set_eeprom(&mut wa_ring, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+
+    // Full MAC init: WTBL clear, RRO, HIF TXD version, per-band regs, basic rates
+    dev.mac_init(&mut wa_ring, &mut seq).map_err(mcu_err)?;
 
     // Final state
     let final_fw_state = dev.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;

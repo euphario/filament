@@ -82,7 +82,10 @@ const CMD_FIELD_WM: u32 = 1 << 20;
 
 /// UNI command IDs — from mt76_connac_mcu.h enum
 pub const MCU_UNI_CMD_WSYS_CONFIG: u16 = 0x0b;
+pub const MCU_UNI_CMD_EFUSE_CTRL: u16 = 0x2d;
 pub const MCU_UNI_CMD_VOW: u16 = 0x37;
+pub const MCU_UNI_CMD_FIXED_RATE_TABLE: u16 = 0x40;
+pub const MCU_UNI_CMD_RRO: u16 = 0x57;
 pub const MCU_UNI_CMD_SDO: u16 = 0x88;
 
 /// UNI TLV tags — from mt7996/mcu.h
@@ -90,11 +93,25 @@ const UNI_WSYS_CONFIG_FW_LOG_CTRL: u16 = 0;
 const UNI_VOW_RX_AT_AIRTIME_EN: u16 = 0x0b;
 const UNI_VOW_RX_AT_AIRTIME_CLR_EN: u16 = 0x0e;
 
+/// EFUSE TLV tags — from mt7996/mcu.h
+const UNI_EFUSE_BUFFER_MODE: u16 = 2;
+
+/// EEPROM mode/format — from mt76_connac_mcu.h
+const EE_MODE_EFUSE: u8 = 0;
+const EE_FORMAT_WHOLE: u8 = 1;
+
+/// RRO TLV tags — from mt7996/mcu.h enum (starts at DEL_ENTRY=1)
+pub const UNI_RRO_SET_PLATFORM_TYPE: u16 = 0x2;
+pub const UNI_RRO_SET_BYPASS_MODE: u16 = 0x4;
+pub const UNI_RRO_SET_TXFREE_PATH: u16 = 0x5;
+pub const UNI_RRO_SET_FLUSH_TIMEOUT: u16 = 0x7;
+
 /// MCU_EXT_CMD — from mt76_connac_mcu.h
 const MCU_EXT_CMD_MWDS_SUPPORT: u8 = 0x80;
 
 /// MCU_WA_PARAM — from mt7996/mcu.h
 pub const MCU_WA_PARAM_RED: u32 = 0x0e;
+pub const MCU_WA_PARAM_HW_PATH_HIF_VER: u32 = 0x2f;
 
 /// Compute download mode from region's feature_set.
 /// Exact translation of Linux mt76_connac_mcu_gen_dl_mode().
@@ -762,5 +779,139 @@ impl Mt7996Dev {
         // Linux passes wait=false for this command
         userlib::delay_ms(10);
         Ok(())
+    }
+
+    // ========================================================================
+    // MAC Init MCU Commands
+    // ========================================================================
+
+    /// Set RRO (Reorder) module parameters
+    /// Linux: mt7996/mcu.c:4688-4739 mt7996_mcu_set_rro()
+    ///
+    /// UNI command MCU_WM_UNI_CMD(RRO) (0x57).
+    /// Tags: PLATFORM_TYPE=2, BYPASS_MODE=4, TXFREE_PATH=5, FLUSH_TIMEOUT=7
+    pub fn mcu_set_rro(&self, ring: &mut TxRing, tag: u16, val: u16, seq: u8) -> Result<(), i32> {
+        // Struct layout from Linux mcu.c:4688-4720:
+        //   u8 __rsv1[4];        // uni_header
+        //   le16 tag;
+        //   le16 len;
+        //   union { ... } (max 8 bytes)
+        // Total: 4 + 4 + 8 = 16 bytes
+        let mut data = [0u8; 16];
+
+        // uni_header = 0 (4 bytes)
+        // tag
+        data[4..6].copy_from_slice(&tag.to_le_bytes());
+        // len = sizeof(req) - 4 = 12
+        data[6..8].copy_from_slice(&12u16.to_le_bytes());
+
+        // Union contents depend on tag — mcu.c:4722-4737
+        match tag {
+            UNI_RRO_SET_PLATFORM_TYPE => {
+                // platform_type.type = val
+                data[8] = val as u8;
+            }
+            UNI_RRO_SET_BYPASS_MODE => {
+                // bypass_mode.type = val
+                data[8] = val as u8;
+            }
+            UNI_RRO_SET_TXFREE_PATH => {
+                // txfree_path.path = val
+                data[8] = val as u8;
+            }
+            UNI_RRO_SET_FLUSH_TIMEOUT => {
+                // timeout.flush_one = val, timeout.flush_all = 2*val
+                data[8..10].copy_from_slice(&val.to_le_bytes());
+                data[10..12].copy_from_slice(&(2 * val).to_le_bytes());
+            }
+            _ => return Err(-1),
+        }
+
+        // MCU_WM_UNI_CMD(RRO) = __MCU_CMD_FIELD_UNI | 0x57 | __MCU_CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_RRO as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "set_rro"; tag = tag, val = val);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Tell MCU about EEPROM mode (efuse, not flash)
+    /// Linux: mt7996/mcu.c:3810-3824 mt7996_mcu_set_eeprom()
+    ///
+    /// UNI command MCU_WM_UNI_CMD(EFUSE_CTRL) (0x2d).
+    /// Sends buffer_mode=0 (efuse), format=1 (whole).
+    pub fn mcu_set_eeprom(&self, ring: &mut TxRing, seq: u8) -> Result<(), i32> {
+        // struct mt7996_mcu_eeprom from mcu.h:150-158:
+        //   u8 _rsv[4];          // uni_header
+        //   le16 tag;            // UNI_EFUSE_BUFFER_MODE (2)
+        //   le16 len;
+        //   u8 buffer_mode;      // EE_MODE_EFUSE (0)
+        //   u8 format;           // EE_FORMAT_WHOLE (1)
+        //   le16 buf_len;        // 0
+        // Total: 12 bytes
+        let mut data = [0u8; 12];
+
+        // tag = UNI_EFUSE_BUFFER_MODE (2)
+        data[4..6].copy_from_slice(&UNI_EFUSE_BUFFER_MODE.to_le_bytes());
+        // len = sizeof(req) - 4 = 8
+        data[6..8].copy_from_slice(&8u16.to_le_bytes());
+        // buffer_mode = EE_MODE_EFUSE (0)
+        data[8] = EE_MODE_EFUSE;
+        // format = EE_FORMAT_WHOLE (1)
+        data[9] = EE_FORMAT_WHOLE;
+        // buf_len = 0 (le16, already zero)
+
+        // MCU_WM_UNI_CMD(EFUSE_CTRL) = __MCU_CMD_FIELD_UNI | 0x2d | __MCU_CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "set_eeprom"; mode = EE_MODE_EFUSE, fmt = EE_FORMAT_WHOLE);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Program a fixed rate table entry
+    /// Linux: mt7996/mcu.c:4604-4631 mt7996_mcu_set_fixed_rate_table()
+    ///
+    /// UNI command MCU_WM_UNI_CMD(FIXED_RATE_TABLE) (0x40), tag=0.
+    /// Used for basic rate programming (12 CCK+OFDM rates).
+    pub fn mcu_set_fixed_rate_table(&self, ring: &mut TxRing, table_idx: u8, rate_idx: u16, seq: u8) -> Result<(), i32> {
+        // struct fixed_rate_table_ctrl from mcu.h:954-972:
+        //   u8 _rsv[4];          // uni_header
+        //   le16 tag;            // UNI_FIXED_RATE_TABLE_SET (0)
+        //   le16 len;
+        //   u8 table_idx;
+        //   u8 antenna_idx;
+        //   le16 rate_idx;
+        //   u8 spe_idx_sel;      // SPE_IXD_SELECT_BMC_WTBL (1) for non-beacon
+        //   u8 spe_idx;
+        //   u8 gi;               // 1
+        //   u8 he_ltf;           // 1
+        //   bool ldpc;
+        //   bool txbf;
+        //   bool dynamic_bw;
+        //   u8 _rsv2;
+        // Total: 4 + 16 = 20 bytes
+        let mut data = [0u8; 20];
+
+        // tag = UNI_FIXED_RATE_TABLE_SET (0)
+        data[4..6].copy_from_slice(&0u16.to_le_bytes());
+        // len = sizeof(req) - 4 = 16
+        data[6..8].copy_from_slice(&16u16.to_le_bytes());
+        // table_idx
+        data[8] = table_idx;
+        // antenna_idx = 0
+        // rate_idx
+        data[10..12].copy_from_slice(&rate_idx.to_le_bytes());
+        // spe_idx_sel = SPE_IXD_SELECT_BMC_WTBL (1) for non-beacon
+        data[12] = 1;
+        // spe_idx = 0
+        // gi = 1
+        data[14] = 1;
+        // he_ltf = 1
+        data[15] = 1;
+        // ldpc, txbf, dynamic_bw, _rsv2 = 0
+
+        // MCU_WM_UNI_CMD(FIXED_RATE_TABLE) = __MCU_CMD_FIELD_UNI | 0x40 | __MCU_CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_FIXED_RATE_TABLE as u32) | CMD_FIELD_WM;
+
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)
     }
 }

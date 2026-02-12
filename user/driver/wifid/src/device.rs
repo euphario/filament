@@ -9,6 +9,61 @@ use userlib::{uinfo, uwarn, uerror, udebug};
 use crate::regs::*;
 use crate::dma::DmaConfig;
 
+/// MT7996 fixed register map — direct BAR offset for high addresses.
+/// Source: mmio.c:144-194 mt7996_reg_map[] (MT7996 variant)
+/// Format: (phys_addr, mapped_offset, size)
+const FIXED_MAP: &[(u32, u32, u32)] = &[
+    (0x54000000, 0x02000, 0x1000),  // WFDMA_0 (PCIE0 MCU DMA0)
+    (0x55000000, 0x03000, 0x1000),  // WFDMA_1 (PCIE0 MCU DMA1)
+    (0x56000000, 0x04000, 0x1000),  // WFDMA reserved
+    (0x57000000, 0x05000, 0x1000),  // WFDMA MCU wrap CR
+    (0x58000000, 0x06000, 0x1000),  // WFDMA PCIE1 MCU DMA0 (MEM_DMA)
+    (0x59000000, 0x07000, 0x1000),  // WFDMA PCIE1 MCU DMA1
+    (0x820c0000, 0x08000, 0x4000),  // WF_UMAC_TOP (PLE)
+    (0x820c8000, 0x0c000, 0x2000),  // WF_UMAC_TOP (PSE)
+    (0x820cc000, 0x0e000, 0x1000),  // WF_UMAC_TOP (PP/MDP)
+    (0x74030000, 0x10000, 0x1000),  // PCIe MAC
+    (0x820e0000, 0x20000, 0x0400),  // WF_LMAC_TOP BN0 (WF_CFG)
+    (0x820e1000, 0x20400, 0x0200),  // WF_LMAC_TOP BN0 (WF_TRB)
+    (0x820e2000, 0x20800, 0x0400),  // WF_LMAC_TOP BN0 (WF_AGG)
+    (0x820e3000, 0x20c00, 0x0400),  // WF_LMAC_TOP BN0 (WF_ARB)
+    (0x820e4000, 0x21000, 0x0400),  // WF_LMAC_TOP BN0 (WF_TMAC)
+    (0x820e5000, 0x21400, 0x0800),  // WF_LMAC_TOP BN0 (WF_RMAC)
+    (0x820ce000, 0x21c00, 0x0200),  // WF_LMAC_TOP (WF_SEC)
+    (0x820e7000, 0x21e00, 0x0200),  // WF_LMAC_TOP BN0 (WF_DMA)
+    (0x820cf000, 0x22000, 0x1000),  // WF_LMAC_TOP (WF_PF)
+    (0x820e9000, 0x23400, 0x0200),  // WF_LMAC_TOP BN0 (WF_WTBLOFF)
+    (0x820ea000, 0x24000, 0x0200),  // WF_LMAC_TOP BN0 (WF_ETBF)
+    (0x820eb000, 0x24200, 0x0400),  // WF_LMAC_TOP BN0 (WF_LPON)
+    (0x820ec000, 0x24600, 0x0200),  // WF_LMAC_TOP BN0 (WF_INT)
+    (0x820ed000, 0x24800, 0x0800),  // WF_LMAC_TOP BN0 (WF_MIB)
+    (0x820ca000, 0x26000, 0x2000),  // WF_LMAC_TOP BN0 (WF_MUCOP)
+    (0x820d0000, 0x30000, 0x10000), // WF_LMAC_TOP (WF_WTBLON)
+    (0x40000000, 0x70000, 0x10000), // WF_UMAC_SYSRAM
+    (0x00400000, 0x80000, 0x10000), // WF_MCU_SYSRAM
+    (0x00410000, 0x90000, 0x10000), // WF_MCU_SYSRAM (configure register)
+    (0x820f0000, 0xa0000, 0x0400),  // WF_LMAC_TOP BN1 (WF_CFG)
+    (0x820f1000, 0xa0600, 0x0200),  // WF_LMAC_TOP BN1 (WF_TRB)
+    (0x820f2000, 0xa0800, 0x0400),  // WF_LMAC_TOP BN1 (WF_AGG)
+    (0x820f3000, 0xa0c00, 0x0400),  // WF_LMAC_TOP BN1 (WF_ARB)
+    (0x820f4000, 0xa1000, 0x0400),  // WF_LMAC_TOP BN1 (WF_TMAC)
+    (0x820f5000, 0xa1400, 0x0800),  // WF_LMAC_TOP BN1 (WF_RMAC)
+    (0x820f7000, 0xa1e00, 0x0200),  // WF_LMAC_TOP BN1 (WF_DMA)
+    (0x820f9000, 0xa3400, 0x0200),  // WF_LMAC_TOP BN1 (WF_WTBLOFF)
+    (0x820fa000, 0xa4000, 0x0200),  // WF_LMAC_TOP BN1 (WF_ETBF)
+    (0x820fb000, 0xa4200, 0x0400),  // WF_LMAC_TOP BN1 (WF_LPON)
+    (0x820fc000, 0xa4600, 0x0200),  // WF_LMAC_TOP BN1 (WF_INT)
+    (0x820fd000, 0xa4800, 0x0800),  // WF_LMAC_TOP BN1 (WF_MIB)
+    (0x820cc000, 0xa5000, 0x2000),  // WF_LMAC_TOP BN1 (WF_MUCOP)
+    (0x820c4000, 0xa8000, 0x4000),  // WF_LMAC_TOP BN1 (WF_MUCOP)
+    (0x820b0000, 0xae000, 0x1000),  // [APB2] WFSYS_ON
+    (0x80020000, 0xb0000, 0x10000), // WF_TOP_MISC_OFF
+    (0x81020000, 0xc0000, 0x10000), // WF_TOP_MISC_ON
+    (0x7c020000, 0xd0000, 0x10000), // CONN_INFRA, wfdma
+    (0x7c060000, 0xe0000, 0x10000), // CONN_INFRA, conn_host_csr_top
+    (0x7c000000, 0xf0000, 0x10000), // CONN_INFRA
+];
+
 /// MT7996 device state
 pub struct Mt7996Dev {
     pub(crate) bar0_base: u64,
@@ -96,6 +151,72 @@ impl Mt7996Dev {
             userlib::delay_ms(1);
         }
         false
+    }
+
+    // ========================================================================
+    // Fixed Register Map + Translated Access — EXACT Linux translation
+    // Source: mmio.c:mt7996_reg_map[] (lines 144-194), __mt7996_reg_addr()
+    //
+    // Band registers (0x820eXXXX for band 0, 0x820fXXXX for band 1,
+    // 0x830eXXXX for band 2) need address translation. The fixed map table
+    // provides direct BAR offsets for mapped regions. Unmapped addresses
+    // fall back to L1 remap.
+    //
+    // DMA code continues using mt76_wr/mt76_rr (raw BAR offsets < 0x100000).
+    // MAC init code uses reg_wr/reg_rr/reg_set/reg_clear/reg_rmw (translated).
+    // ========================================================================
+
+    /// Translate a register address through the fixed map table.
+    /// If addr < 0x100000, returns as-is (already a BAR offset).
+    /// Otherwise searches FIXED_MAP, falls back to L1 remap.
+    /// Source: mmio.c:317-338 __mt7996_reg_addr()
+    fn reg_addr(&self, addr: u32) -> u32 {
+        if addr < 0x100000 {
+            return addr;
+        }
+        for &(phys, mapped, size) in FIXED_MAP {
+            if addr >= phys && (addr - phys) < size {
+                return mapped + (addr - phys);
+            }
+        }
+        self.mt7996_reg_map_l1(addr)
+    }
+
+    /// Write to a translated register address
+    pub fn reg_wr(&self, addr: u32, val: u32) {
+        self.mt76_wr(self.reg_addr(addr), val);
+    }
+
+    /// Read from a translated register address
+    pub fn reg_rr(&self, addr: u32) -> u32 {
+        self.mt76_rr(self.reg_addr(addr))
+    }
+
+    /// Set bits at a translated register address (read | bits)
+    pub fn reg_set(&self, addr: u32, bits: u32) {
+        let mapped = self.reg_addr(addr);
+        let val = self.mt76_rr(mapped);
+        self.mt76_wr(mapped, val | bits);
+    }
+
+    /// Clear bits at a translated register address (read & ~bits)
+    pub fn reg_clear(&self, addr: u32, bits: u32) {
+        let mapped = self.reg_addr(addr);
+        let val = self.mt76_rr(mapped);
+        self.mt76_wr(mapped, val & !bits);
+    }
+
+    /// Read-modify-write at a translated register address
+    pub fn reg_rmw(&self, addr: u32, mask: u32, val: u32) {
+        let mapped = self.reg_addr(addr);
+        let old = self.mt76_rr(mapped);
+        self.mt76_wr(mapped, (old & !mask) | val);
+    }
+
+    /// Poll a translated register for expected value
+    pub fn reg_poll(&self, addr: u32, mask: u32, val: u32, timeout_us: u32) -> bool {
+        let mapped = self.reg_addr(addr);
+        self.mt76_poll(mapped, mask, val, timeout_us)
     }
 
     // ========================================================================

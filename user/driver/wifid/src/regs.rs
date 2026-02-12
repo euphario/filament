@@ -250,3 +250,76 @@ pub fn dma_addr_hi(addr: u64) -> u32 {
 
 /// Maximum DMA buffer size for firmware chunks
 pub const MCU_FW_DL_BUF_SIZE: usize = 4096;
+
+// ============================================================================
+// Per-band register bases — from regs.h and mmio.c mt7996_reg_base[]
+// Band 0: 0x820eXXXX, Band 1: 0x820fXXXX, Band 2: 0x830eXXXX
+// ============================================================================
+
+/// WF_RMAC per-band base addresses
+pub const WF_RMAC_BASE: [u32; 3] = [0x820e5000, 0x820f5000, 0x830e5000];
+/// WF_AGG per-band base addresses
+pub const WF_AGG_BASE: [u32; 3] = [0x820e2000, 0x820f2000, 0x830e2000];
+/// WF_WTBLOFF per-band base addresses
+pub const WF_WTBLOFF_BASE: [u32; 3] = [0x820e9000, 0x820f9000, 0x830e9000];
+
+// RMAC offsets + masks — from regs.h
+pub const MT_WF_RMAC_RSVD0_OFS: u32 = 0x03e0;
+pub const MT_WF_RMAC_RSVD0_EIFS_CLR: u32 = 1 << 21;
+
+pub const MT_WF_RMAC_MIB_AIRTIME0_OFS: u32 = 0x0380;
+pub const MT_WF_RMAC_MIB_OBSS_BACKOFF: u32 = 0xFFFF;          // GENMASK(15,0)
+pub const MT_WF_RMAC_MIB_ED_OFFSET: u32 = 0x1F << 16;         // GENMASK(20,16)
+
+pub const MT_WF_RMAC_MIB_AIRTIME1_OFS: u32 = 0x0384;
+pub const MT_WF_RMAC_MIB_NONQOSD_BACKOFF: u32 = 0xFFFF << 16; // GENMASK(31,16)
+
+pub const MT_WF_RMAC_MIB_AIRTIME3_OFS: u32 = 0x038c;
+pub const MT_WF_RMAC_MIB_QOS01_BACKOFF: u32 = 0xFFFFFFFF;     // GENMASK(31,0)
+
+pub const MT_WF_RMAC_MIB_AIRTIME4_OFS: u32 = 0x0390;
+pub const MT_WF_RMAC_MIB_QOS23_BACKOFF: u32 = 0xFFFFFFFF;     // GENMASK(31,0)
+
+// WTBLOFF offsets + masks — from regs.h
+pub const MT_WTBLOFF_ACR_OFS: u32 = 0x010;
+pub const MT_WTBLOFF_ADM_BACKOFFTIME: u32 = 1 << 29;
+
+pub const MT_WTBLOFF_RSCR_OFS: u32 = 0x008;
+pub const MT_WTBLOFF_RSCR_RCPI_MODE: u32 = 0x3 << 30;         // GENMASK(31,30)
+pub const MT_WTBLOFF_RSCR_RCPI_PARAM: u32 = 0x3 << 24;        // GENMASK(25,24)
+
+// AGG offsets + masks — from regs.h
+pub const MT_AGG_ACR4_OFS: u32 = 0x3c;
+pub const MT_AGG_ACR_PPDU_TXS2H: u32 = 1 << 1;
+
+// MDP (global) — from regs.h
+pub const MT_MDP_BASE: u32 = 0x820cc000;
+pub const MT_MDP_DCR2: u32 = MT_MDP_BASE + 0x8e8;
+pub const MT_MDP_DCR2_RX_TRANS_SHORT: u32 = 1 << 2;
+
+// WTBL (global) — from regs.h
+pub const MT_WTBLON_TOP_BASE: u32 = 0x820d4000;
+/// MT7996 uses __OFFS(WTBL_UPDATE) = 0x380 — regs.h
+pub const MT_WTBL_UPDATE: u32 = MT_WTBLON_TOP_BASE + 0x380;
+pub const MT_WTBL_UPDATE_WLAN_IDX: u32 = 0xFFF;               // GENMASK(11,0)
+pub const MT_WTBL_UPDATE_ADM_COUNT_CLEAR: u32 = 1 << 14;
+pub const MT_WTBL_UPDATE_BUSY: u32 = 1u32 << 31;
+
+// WTBL size defaults for MT7996 — from mt7996.h
+pub const MT7996_WTBL_SIZE_GROUP: u32 = 4;
+pub const MT7996_WTBL_BMC_SIZE: u32 = 64;
+
+// Rate table — from mt7996.h
+pub const MT7996_BASIC_RATES_TBL: u16 = 31;
+
+// Rate encoding — from mt76.h
+pub const MT_TX_RATE_MODE: u32 = 0x3C0;                        // GENMASK(9,6)
+pub const MT_TX_RATE_IDX: u32 = 0x3F;                          // GENMASK(5,0)
+
+// Per-band register address helpers
+#[inline]
+pub const fn mt_wf_rmac(band: usize, ofs: u32) -> u32 { WF_RMAC_BASE[band] + ofs }
+#[inline]
+pub const fn mt_wf_agg(band: usize, ofs: u32) -> u32 { WF_AGG_BASE[band] + ofs }
+#[inline]
+pub const fn mt_wtbloff(band: usize, ofs: u32) -> u32 { WF_WTBLOFF_BASE[band] + ofs }
