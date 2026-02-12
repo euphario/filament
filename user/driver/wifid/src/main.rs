@@ -227,17 +227,6 @@ const MT_DMA_CTL_LAST_SEC0: u32 = 1 << 30;             // BIT(30)
 const MT_DMA_CTL_DMA_DONE: u32 = 1u32 << 31;           // BIT(31)
 const MT_DMA_CTL_SDP0_H: u32 = 0xF;                    // GENMASK(3, 0) - high 4 bits of buf0 addr
 
-/// Format u32 as hex into a buffer, returns bytes written
-fn fmt_hex32(buf: &mut [u8], val: u32) -> usize {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    if buf.len() < 10 { return 0; }
-    buf[0] = b'0'; buf[1] = b'x';
-    for i in 0..8 {
-        buf[2 + i] = HEX[((val >> (28 - i * 4)) & 0xf) as usize];
-    }
-    10
-}
-
 /// Get low 32 bits of DMA address (for buf0)
 #[inline]
 fn dma_addr_lo(addr: u64) -> u32 {
@@ -695,7 +684,6 @@ impl Mt7996Dev {
                 MT_WFDMA0_RST_DMASHDL_ALL_RST | MT_WFDMA0_RST_LOGIC_RST);
 
             // dma.c:557-566 - Same for HIF2
-            userlib::syscall::debug_write(b"[wifid] dma_disable: hif1 rst done, hif2\r\n");
             if self.has_hif2 {
                 self.mt76_clear(MT_WFDMA0_RST + hif1_ofs,
                     MT_WFDMA0_RST_DMASHDL_ALL_RST | MT_WFDMA0_RST_LOGIC_RST);
@@ -817,7 +805,6 @@ impl Mt7996Dev {
         let hif1_ofs = if self.has_hif2 { HIF1_OFS } else { 0 };
 
         // dma.c:633-635 - Reset DMA index
-        userlib::syscall::debug_write(b"[wifid] dma_enable: rst_dtx_ptr\r\n");
         self.mt76_wr(MT_WFDMA0_RST_DTX_PTR, !0u32);
         if self.has_hif2 {
             self.mt76_wr(MT_WFDMA0_RST_DTX_PTR + hif1_ofs, !0u32);
@@ -834,7 +821,6 @@ impl Mt7996Dev {
         }
 
         // dma.c:649 - Configure prefetch settings
-        userlib::syscall::debug_write(b"[wifid] dma_enable: prefetch\r\n");
         self.mt7996_dma_prefetch();
 
         // dma.c:651-655 - Configure BUSY_ENA on HIF1
@@ -852,7 +838,6 @@ impl Mt7996Dev {
         }
 
         // dma.c:663-664 - Wait for HIF_MISC_BUSY
-        userlib::syscall::debug_write(b"[wifid] dma_enable: busy_ena done, poll hif_misc\r\n");
         if !self.mt76_poll(MT_WFDMA_EXT_CSR_HIF_MISC,
             MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000) {
             uwarn!("dma", "hif_misc_busy_timeout");
@@ -874,7 +859,6 @@ impl Mt7996Dev {
         self.mt76_wr(MT_WFDMA0_PAUSE_RX_Q_RRO_TH, 0x20);
 
         // HIF2 configuration
-        userlib::syscall::debug_write(b"[wifid] dma_enable: hif1 done, hif2 config\r\n");
         if self.has_hif2 {
             self.mt76_set(WF_WFDMA0_GLO_CFG_EXT0 + hif1_ofs,
                 WF_WFDMA0_GLO_CFG_EXT0_RX_WB_RXD |
@@ -908,10 +892,8 @@ impl Mt7996Dev {
             self.mt76_set(MT_WFDMA0_RX_INT_PCIE_SEL, MT_WFDMA0_RX_INT_SEL_RING3);
         }
 
-        userlib::syscall::debug_write(b"[wifid] dma_enable: hif2 done, dma_start\r\n");
         // dma.c:754 - Call dma_start
         self.mt7996_dma_start(reset, true);
-        userlib::syscall::debug_write(b"[wifid] dma_enable: dma_start done\r\n");
     }
 
     // ========================================================================
@@ -1052,9 +1034,7 @@ impl Mt7996Dev {
         // dma.c:613 - mt76_dma_attach (sets up DMA ops - we do this implicitly)
 
         // dma.c:618 - Disable DMA with reset
-        userlib::syscall::debug_write(b"[wifid] dma_disable(reset)\r\n");
         self.mt7996_dma_disable(true);
-        userlib::syscall::debug_write(b"[wifid] dma_disable done\r\n");
 
         // Track offset in descriptor memory
         let mut offset: usize = 0;
@@ -1260,19 +1240,13 @@ impl Mt7996Dev {
         let _ = offset;
         let _ = rx_buf_offset;
 
-        userlib::syscall::debug_write(b"[wifid] tx+rx queues init done\r\n");
-
         // Fill RX buffers BEFORE enabling DMA
-        userlib::syscall::debug_write(b"[wifid] rx_fill start\r\n");
         for i in 0..rx_queue_idx {
             self.rx_fill(&rx_queues[i]);
         }
-        userlib::syscall::debug_write(b"[wifid] rx_fill done\r\n");
 
         // dma.c:853 - Enable DMA AFTER RX queues are filled
-        userlib::syscall::debug_write(b"[wifid] dma_enable start\r\n");
         self.mt7996_dma_enable(false);
-        userlib::syscall::debug_write(b"[wifid] dma_enable done\r\n");
     }
 }
 
@@ -1824,26 +1798,18 @@ impl Mt7996Dev {
         let req = InitDlRequest::new(addr, len, mode | dl_mode::NEED_RSP);
         // Snapshot RX DMA_IDX BEFORE sending — MCU may respond before we poll
         let rx_snap = self.snapshot_mcu_rx_idx();
-        userlib::syscall::debug_write(b"[wifid] mcu_send_cmd\r\n");
         self.mcu_send_cmd(ring, cmd, req.as_bytes(), seq)?;
-        userlib::syscall::debug_write(b"[wifid] mcu_send_cmd ok, waiting\r\n");
 
         // Wait for TX complete
         let prev_idx = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
         if !self.mcu_wait_tx_done(ring, prev_idx, 1000) {
-            userlib::syscall::debug_write(b"[wifid] TX TIMEOUT!\r\n");
             return Err(-1);
         }
-
-        userlib::syscall::debug_write(b"[wifid] tx_done ok\r\n");
 
         // Wait for MCU to respond using pre-send snapshot
-        userlib::syscall::debug_write(b"[wifid] wait_mcu_rx\r\n");
         if let Err(_) = self.wait_mcu_rx_response(rx_snap, 2000) {
-            userlib::syscall::debug_write(b"[wifid] MCU RX TIMEOUT\r\n");
             return Err(-1);
         }
-        userlib::syscall::debug_write(b"[wifid] mcu_rx ok\r\n");
 
         Ok(())
     }
@@ -2066,10 +2032,8 @@ impl Mt7996Dev {
     /// (Linux mt76_connac_mcu.c:8-20 mt76_connac_mcu_start_firmware)
     fn mcu_start_firmware(&self, ring: &mut TxRing, is_patch: bool, option: u32, addr: u32, seq: u8) -> Result<(), i32> {
         let cmd = if is_patch {
-            userlib::syscall::debug_write(b"[wifid] mcu_start_firmware PATCH_FINISH_REQ\r\n");
             mcu_cmd::PATCH_FINISH_REQ
         } else {
-            userlib::syscall::debug_write(b"[wifid] mcu_start_firmware FW_START_REQ\r\n");
             mcu_cmd::FW_START_REQ
         };
 
@@ -2090,29 +2054,14 @@ impl Mt7996Dev {
 
         let prev_idx = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
         if !self.mcu_wait_tx_done(ring, prev_idx, 1000) {
-            userlib::syscall::debug_write(b"[wifid] start_fw TX TIMEOUT\r\n");
             uerror!("wifid", "mcu_start_fw_timeout";);
             return Err(-1);
         }
-        userlib::syscall::debug_write(b"[wifid] start_fw tx_done, waiting MCU rx\r\n");
 
         // Wait for MCU response (Linux blocks here via mt76_mcu_skb_send_and_wait)
         if let Err(_) = self.wait_mcu_rx_response(rx_snap, 5000) {
-            userlib::syscall::debug_write(b"[wifid] start_fw MCU RX TIMEOUT\r\n");
-            // Dump MT_TOP_MISC for firmware state
-            let fw_state = self.mt76_rr(MT_TOP_MISC);
-            let mut buf = [0u8; 50];
-            let mut p = 0;
-            let prefix = b"[wifid] fw_state=";
-            buf[p..p+prefix.len()].copy_from_slice(prefix);
-            p += prefix.len();
-            p += fmt_hex32(&mut buf[p..], fw_state);
-            buf[p..p+2].copy_from_slice(b"\r\n");
-            p += 2;
-            userlib::syscall::debug_write(&buf[..p]);
             return Err(-1);
         }
-        userlib::syscall::debug_write(b"[wifid] start_fw ok\r\n");
         Ok(())
     }
 
@@ -2180,7 +2129,6 @@ impl Mt7996Dev {
         // Get semaphore first (MCU command → mcu_ring)
         self.mcu_patch_sem_ctrl(mcu_ring, true, *seq)?;
         *seq = seq.wrapping_add(1);
-        userlib::syscall::debug_write(b"[wifid] sem_ctrl ok\r\n");
 
         // Iterate through patch sections (right after header)
         // From Linux mcu.c:2242-2279
@@ -2197,7 +2145,6 @@ impl Mt7996Dev {
             let sec_type = u32::from_be(sec.sec_type);
             if (sec_type & 0xFFFF) != 0x2 {
                 // PATCH_SEC_TYPE_INFO = 0x2
-                userlib::syscall::debug_write(b"[wifid] BAD sec_type!\r\n");
                 uerror!("fw", "bad_sec_type"; sec_type = sec_type);
                 return Err(-1);
             }
@@ -2218,27 +2165,9 @@ impl Mt7996Dev {
                 }
                 0x02 => dl_mode::ENCRYPT,  // SCRAMBLE
                 _ => {
-                    userlib::syscall::debug_write(b"[wifid] BAD enc_type!\r\n");
                     return Err(-1);
                 }
             };
-
-            // Print section info via debug_write (real-time)
-            {
-                let mut buf = [0u8; 80];
-                let mut p = 0;
-                let prefix = b"[wifid] sec: type=";
-                buf[p..p+prefix.len()].copy_from_slice(prefix);
-                p += prefix.len();
-                p += fmt_hex32(&mut buf[p..], sec_type);
-                buf[p..p+6].copy_from_slice(b" enc=0");
-                p += 6;
-                buf[p] = b'0' + (enc_type as u8);
-                p += 1;
-                buf[p..p+2].copy_from_slice(b"\r\n");
-                p += 2;
-                userlib::syscall::debug_write(&buf[..p]);
-            }
 
             udebug!("fw", "patch_region"; idx = i, addr = addr, len = len);
 
@@ -2248,7 +2177,6 @@ impl Mt7996Dev {
             }
 
             // Init download for this section (MCU command → mcu_ring)
-            userlib::syscall::debug_write(b"[wifid] patch init_dl\r\n");
             self.mcu_init_download(mcu_ring, addr, len, mode, *seq)?;
             *seq = seq.wrapping_add(1);
 
@@ -2268,54 +2196,15 @@ impl Mt7996Dev {
                 chunk_idx += 1;
             }
 
-            // Real-time diagnostic: region done, FWDL ring state
             let fwdl_cpu = self.mt76_rr(fwdl_ring.regs_base + MT_QUEUE_CPU_IDX);
             let fwdl_dma = self.mt76_rr(fwdl_ring.regs_base + MT_QUEUE_DMA_IDX);
-            {
-                let mut buf = [0u8; 80];
-                let mut p = 0;
-                let prefix = b"[wifid] chunks=";
-                buf[p..p+prefix.len()].copy_from_slice(prefix);
-                p += prefix.len();
-                // chunk count as decimal (max 2 digits for patch)
-                if chunk_idx >= 10 { buf[p] = b'0' + ((chunk_idx / 10) as u8); p += 1; }
-                buf[p] = b'0' + ((chunk_idx % 10) as u8); p += 1;
-                let mid = b" fwdl cpu=";
-                buf[p..p+mid.len()].copy_from_slice(mid);
-                p += mid.len();
-                if fwdl_cpu >= 10 { buf[p] = b'0' + ((fwdl_cpu / 10) as u8); p += 1; }
-                buf[p] = b'0' + ((fwdl_cpu % 10) as u8); p += 1;
-                let mid2 = b" dma=";
-                buf[p..p+mid2.len()].copy_from_slice(mid2);
-                p += mid2.len();
-                if fwdl_dma >= 10 { buf[p] = b'0' + ((fwdl_dma / 10) as u8); p += 1; }
-                buf[p] = b'0' + ((fwdl_dma % 10) as u8); p += 1;
-                buf[p..p+2].copy_from_slice(b"\r\n");
-                p += 2;
-                userlib::syscall::debug_write(&buf[..p]);
-            }
             udebug!("fw", "patch_region_done"; idx = i, cpu = fwdl_cpu, dma = fwdl_dma);
-        }
-
-        // Check firmware state before PATCH_FINISH_REQ
-        let fw_state_pre = self.mt76_rr(MT_TOP_MISC);
-        {
-            let mut buf = [0u8; 50];
-            let mut p = 0;
-            let prefix = b"[wifid] pre_finish fw=";
-            buf[p..p+prefix.len()].copy_from_slice(prefix);
-            p += prefix.len();
-            p += fmt_hex32(&mut buf[p..], fw_state_pre);
-            buf[p..p+2].copy_from_slice(b"\r\n");
-            p += 2;
-            userlib::syscall::debug_write(&buf[..p]);
         }
 
         // Give MCU time to process all chunks before sending PATCH_FINISH_REQ
         userlib::delay_ms(100);
 
         // Start patch (MCU command → mcu_ring)
-        userlib::syscall::debug_write(b"[wifid] sending PATCH_FINISH_REQ\r\n");
         self.mcu_start_firmware(mcu_ring, true, 0, 0, *seq)?;
         *seq = seq.wrapping_add(1);
 
@@ -2339,7 +2228,6 @@ impl Mt7996Dev {
     /// - fw_start_bits: 0 for WM, FW_START_WORKING_PDA_DSP for DSP, FW_START_WORKING_PDA_CR4 for WA
     /// - FW_START_REQ sends 8 bytes {option: le32, addr: le32}
     fn load_ram(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing, fw_buf: &[u8], name: &str, fw_start_bits: u32, seq: &mut u8) -> Result<(), i32> {
-        userlib::syscall::debug_write(b"[wifid] load_ram entry\r\n");
         uinfo!("fw", "load_ram_start"; size = fw_buf.len());
 
         if fw_buf.len() < core::mem::size_of::<FwTrailer>() {
@@ -2364,7 +2252,6 @@ impl Mt7996Dev {
         let mut override_addr: u32 = 0;
 
         let mut data_offset = 0usize;
-        let mut total_chunks: u32 = 0;
         for i in 0..n_region {
             let region_ptr = fw_buf.as_ptr().wrapping_add(regions_start + i as usize * region_size);
             let region = unsafe { &*(region_ptr as *const FwRegion) };
@@ -2382,13 +2269,6 @@ impl Mt7996Dev {
                 override_addr = addr;
             }
 
-            // Region checkpoint with index (hex digit for compactness)
-            {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                let mut tag = *b"[wifid] region[X] init_download\r\n";
-                tag[15] = HEX[(i & 0xf) as usize];
-                userlib::syscall::debug_write(&tag);
-            }
             udebug!("fw", "ram_region"; idx = i, addr = addr, len = len);
 
             // Force any pending async bus errors to surface BEFORE init_download
@@ -2398,33 +2278,13 @@ impl Mt7996Dev {
             // mode from gen_dl_mode; mcu_init_download adds NEED_RSP
             self.mcu_init_download(mcu_ring, addr, len, mode, *seq)?;
             *seq = seq.wrapping_add(1);
-            userlib::syscall::debug_write(b"[wifid] init_download ok\r\n");
 
             // Send region data in chunks (FW_SCATTER data → fwdl_ring)
             // Linux mcu.c:3064 passes max_len=4096 for FW_SCATTER (no TXD header)
             let region_data = &fw_buf[data_offset..data_offset + len as usize];
-            {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                let mut tag = *b"[wifid] region[X] chunks\r\n";
-                tag[15] = HEX[(i & 0xf) as usize];
-                userlib::syscall::debug_write(&tag);
-            }
-            let mut region_chunks: u32 = 0;
             for chunk in region_data.chunks(MCU_FW_DL_BUF_SIZE) {
                 self.mcu_send_firmware_chunk(fwdl_ring, chunk, *seq)?;
                 *seq = seq.wrapping_add(1);
-                region_chunks += 1;
-                total_chunks += 1;
-                // Progress every 50 chunks
-                if region_chunks % 50 == 0 {
-                    userlib::syscall::debug_write(b"[wifid] +50 chunks\r\n");
-                }
-            }
-            {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                let mut tag = *b"[wifid] region[X] done\r\n";
-                tag[15] = HEX[(i & 0xf) as usize];
-                userlib::syscall::debug_write(&tag);
             }
 
             data_offset += len as usize;
@@ -2438,30 +2298,11 @@ impl Mt7996Dev {
         // WM: 0, DSP: FW_START_WORKING_PDA_DSP, WA: FW_START_WORKING_PDA_CR4
         option |= fw_start_bits;
 
-        // Log option and override for diagnosis
-        {
-            let mut buf = [0u8; 60];
-            let mut p = 0;
-            let prefix = b"[wifid] fw_start opt=";
-            buf[p..p+prefix.len()].copy_from_slice(prefix);
-            p += prefix.len();
-            p += fmt_hex32(&mut buf[p..], option);
-            let mid = b" addr=";
-            buf[p..p+mid.len()].copy_from_slice(mid);
-            p += mid.len();
-            p += fmt_hex32(&mut buf[p..], override_addr);
-            buf[p..p+2].copy_from_slice(b"\r\n");
-            p += 2;
-            userlib::syscall::debug_write(&buf[..p]);
-        }
-
         // Start firmware (MCU command → mcu_ring)
         // Linux mt76_connac_mcu_start_firmware: sends {option: le32, addr: le32}
-        userlib::syscall::debug_write(b"[wifid] start_firmware cmd\r\n");
         self.mcu_start_firmware(mcu_ring, false, option, override_addr, *seq)?;
         *seq = seq.wrapping_add(1);
 
-        userlib::syscall::debug_write(b"[wifid] load_ram done\r\n");
         uinfo!("fw", "load_ram_done");
         Ok(())
     }
@@ -2474,7 +2315,6 @@ impl Mt7996Dev {
     ///
     /// Reference: mt7996/mcu.c:250-260
     pub fn load_firmware(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing) -> Result<(), i32> {
-        userlib::syscall::debug_write(b"[wifid] load_firmware entry\r\n");
         uinfo!("fw", "load_firmware_start");
 
         // Linux starts seq at 1 and explicitly avoids 0 (see mcu.c:249-251)
@@ -2485,80 +2325,52 @@ impl Mt7996Dev {
         uinfo!("fw", "fw_state_before"; val = fw_state);
 
         // 1. Load patch (ROM patch) — embedded via include_bytes!()
-        userlib::syscall::debug_write(b"[wifid] load_patch start\r\n");
         uinfo!("fw", "load_patch"; size = FW_ROM_PATCH.len() as u32);
         if let Err(_) = self.load_patch(mcu_ring, fwdl_ring, FW_ROM_PATCH, &mut seq) {
-            userlib::syscall::debug_write(b"[wifid] load_patch FAILED\r\n");
             uerror!("fw", "patch_failed");
         }
-        userlib::syscall::debug_write(b"[wifid] load_patch done\r\n");
 
         userlib::delay_ms(100);
 
         // 2. Load WM (Wireless Manager firmware) — fw_start_bits=0
-        userlib::syscall::debug_write(b"[wifid] load_wm start\r\n");
         uinfo!("fw", "load_wm"; size = FW_WM.len() as u32);
         if let Err(_) = self.load_ram(mcu_ring, fwdl_ring, FW_WM, "WM", 0, &mut seq) {
-            userlib::syscall::debug_write(b"[wifid] load_wm FAILED\r\n");
             uerror!("fw", "wm_failed");
         }
-        userlib::syscall::debug_write(b"[wifid] load_wm done\r\n");
 
         userlib::delay_ms(100);
 
         // 3. Load DSP firmware — fw_start_bits=FW_START_WORKING_PDA_DSP
         //    Linux mcu.c:3134-3135: loaded between WM and WA
-        userlib::syscall::debug_write(b"[wifid] load_dsp start\r\n");
         uinfo!("fw", "load_dsp"; size = FW_DSP.len() as u32);
         if let Err(_) = self.load_ram(mcu_ring, fwdl_ring, FW_DSP, "DSP", fw_start::WORKING_PDA_DSP, &mut seq) {
-            userlib::syscall::debug_write(b"[wifid] load_dsp FAILED\r\n");
             uerror!("fw", "dsp_failed");
         }
-        userlib::syscall::debug_write(b"[wifid] load_dsp done\r\n");
 
         userlib::delay_ms(100);
 
         // 4. Load WA (Wireless Accelerator firmware) — fw_start_bits=FW_START_WORKING_PDA_CR4
-        userlib::syscall::debug_write(b"[wifid] load_wa start\r\n");
         uinfo!("fw", "load_wa"; size = FW_WA.len() as u32);
         if let Err(_) = self.load_ram(mcu_ring, fwdl_ring, FW_WA, "WA", fw_start::WORKING_PDA_CR4, &mut seq) {
-            userlib::syscall::debug_write(b"[wifid] load_wa FAILED\r\n");
             uerror!("fw", "wa_failed");
         }
-        userlib::syscall::debug_write(b"[wifid] load_wa done\r\n");
 
         // Wait for firmware to boot — Linux mt7996_firmware_state(dev, FW_STATE_RDY)
         // polls MT_TOP_MISC for up to 1000ms. FW_STATE_RDY=7 for devices with WA.
-        userlib::syscall::debug_write(b"[wifid] waiting fw_state\r\n");
         let mut fw_state = 0u32;
-        for i in 0..50u32 {
+        for _i in 0..50u32 {
             fw_state = self.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
             if fw_state == 7 {
                 break;
-            }
-            if i % 10 == 0 {
-                // Log progress every 200ms
-                let mut buf = [0u8; 40];
-                let mut p = 0;
-                let prefix = b"[wifid] fw_state=";
-                buf[p..p+prefix.len()].copy_from_slice(prefix);
-                p += prefix.len();
-                buf[p] = b'0' + (fw_state as u8);
-                p += 1;
-                buf[p..p+2].copy_from_slice(b"\r\n");
-                p += 2;
-                userlib::syscall::debug_write(&buf[..p]);
             }
             userlib::delay_ms(20);
         }
         uinfo!("fw", "fw_state_final"; val = fw_state);
 
         if fw_state == 7 {
-            userlib::syscall::debug_write(b"[wifid] firmware READY!\r\n");
             uinfo!("fw", "load_firmware_success");
             Ok(())
         } else {
-            userlib::syscall::debug_write(b"[wifid] firmware NOT READY\r\n");
             uerror!("fw", "load_firmware_incomplete"; state = fw_state);
             Err(-1)
         }
@@ -2589,7 +2401,6 @@ impl WifiDriver {
 
 impl Driver for WifiDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        userlib::syscall::debug_write(b"[wifid] reset entry\r\n");
         uinfo!("wifid", "init_start");
 
         // Step 1: Get BAR0 from spawn context (provided by pcied via devd)
@@ -2621,7 +2432,6 @@ impl Driver for WifiDriver {
             BusError::Internal
         })?;
         let bar0_virt = bar0.virt_base();
-        userlib::syscall::debug_write(b"[wifid] bar0 mapped\r\n");
         udebug!("wifid", "bar0_mapped"; virt = bar0_virt);
 
         // HIF2 registers (0xd8xxx) are accessible through HIF1's BAR at offset 0xd8xxx.
@@ -2677,8 +2487,6 @@ impl Driver for WifiDriver {
         // CRITICAL: Flush cache to ensure zeros are visible to DMA device
         flush_buffer(rx_buf_virt, RX_BUF_POOL_SIZE);
 
-        userlib::syscall::debug_write(b"[wifid] dma pools allocated\r\n");
-
         // Create device
         let dev = Mt7996Dev::new(bar0_virt, bar0_size, has_hif2);
 
@@ -2690,14 +2498,12 @@ impl Driver for WifiDriver {
     uinfo!("wifid", "init_hw_start");
 
     // Fix HOST_CONFIG to match OpenWRT (bits 8,10-14)
-    userlib::syscall::debug_write(b"[wifid] read HOST_CONFIG\r\n");
     let host_cfg_initial = dev.mt76_rr(0xd7030);
     if (host_cfg_initial & 0x7d00) != 0x7d00 {
         dev.mt76_set(0xd7030, 0x7d00);
         udebug!("wifid", "host_config_fix"; before = host_cfg_initial, after = dev.mt76_rr(0xd7030));
     }
 
-    userlib::syscall::debug_write(b"[wifid] read PCIE_SETTING\r\n");
     // Fix PCIE_SETTING to match OpenWRT (0x00003180)
     let pcie_setting_initial = dev.mt76_rr(0x10080);
     if pcie_setting_initial != 0x00003180 {
@@ -2705,7 +2511,6 @@ impl Driver for WifiDriver {
         udebug!("wifid", "pcie_setting_fix"; before = pcie_setting_initial);
     }
 
-    userlib::syscall::debug_write(b"[wifid] read HW_REV\r\n");
     // Read MT_HW_REV via L1 remap (mmio.c:672)
     let hw_rev = dev.mt76_rr_remap(MT_HW_REV);
     uinfo!("wifid", "hw_rev"; rev = hw_rev & 0xff);
@@ -2714,20 +2519,15 @@ impl Driver for WifiDriver {
     dev.mt76_wr(MT_INT_MASK_CSR, 0);
 
     // WFSYS Reset — ensure clean hardware state (init.c:762-769)
-    userlib::syscall::debug_write(b"[wifid] wfsys_reset start\r\n");
     uinfo!("wifid", "wfsys_reset");
     dev.mt7996_wfsys_reset();
-    userlib::syscall::debug_write(b"[wifid] wfsys_reset done\r\n");
 
     // PCIe setup (pci.c:mt7996_pci_probe, AFTER wfsys_reset)
-    userlib::syscall::debug_write(b"[wifid] pcie_mac_int_enable\r\n");
     dev.mt76_wr(MT_PCIE_MAC_INT_ENABLE, 0xff);
 
     // HIF2: Via L1 remap (dual-HIF setup)
-    userlib::syscall::debug_write(b"[wifid] pcie1_mac_int_enable (L1 remap)\r\n");
     let pcie1_mapped = dev.mt7996_reg_map_l1(MT_PCIE1_MAC_INT_ENABLE_PHYS);
     dev.mt76_wr(pcie1_mapped, 0xff);
-    userlib::syscall::debug_write(b"[wifid] int_masks\r\n");
 
     // Disable interrupt masks, clear sources
     dev.mt76_wr(MT_INT_MASK_CSR, 0);
@@ -2735,10 +2535,8 @@ impl Driver for WifiDriver {
     dev.mt76_wr(MT_INT_SOURCE_CSR, !0u32);
 
     // DMA init (init.c — dma_init() BEFORE mcu_init())
-    userlib::syscall::debug_write(b"[wifid] dma_init start\r\n");
     uinfo!("wifid", "dma_init");
     dev.mt7996_dma_init(desc_phys, desc_virt, DESC_MEM_SIZE, rx_buf_phys, rx_buf_virt, RX_BUF_POOL_SIZE);
-    userlib::syscall::debug_write(b"[wifid] dma_init done\r\n");
 
     // Trace RX DMA_IDX at every step to prove DMA is working
     let trace_rx = || -> [u32; 4] {
@@ -2755,25 +2553,16 @@ impl Driver for WifiDriver {
     uinfo!("wifid", "rx_trace_dma_init"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
 
     // MCU init (mcu.c:3299-3312 — SWDEF_MODE then driver_own)
-    userlib::syscall::debug_write(b"[wifid] mcu_init start\r\n");
     uinfo!("wifid", "mcu_init");
     dev.mt76_wr(MT_SWDEF_MODE, MT_SWDEF_NORMAL_MODE);
 
     // Band 0 driver_own
-    userlib::syscall::debug_write(b"[wifid] driver_own band0\r\n");
-    match dev.mt7996_driver_own(0) {
-        Ok(()) => userlib::syscall::debug_write(b"[wifid] driver_own band0 ok\r\n"),
-        Err(_) => userlib::syscall::debug_write(b"[wifid] driver_own band0 FAIL\r\n"),
-    }
+    let _ = dev.mt7996_driver_own(0);
     let rx = trace_rx();
     uinfo!("wifid", "rx_trace_drv_own0"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
 
     // Band 1 driver_own (HIF2)
-    userlib::syscall::debug_write(b"[wifid] driver_own band1\r\n");
-    match dev.mt7996_driver_own(1) {
-        Ok(()) => userlib::syscall::debug_write(b"[wifid] driver_own band1 ok\r\n"),
-        Err(_) => userlib::syscall::debug_write(b"[wifid] driver_own band1 FAIL\r\n"),
-    }
+    let _ = dev.mt7996_driver_own(1);
     let rx = trace_rx();
     uinfo!("wifid", "rx_trace_drv_own1"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
 
@@ -2782,7 +2571,6 @@ impl Driver for WifiDriver {
     uinfo!("wifid", "fw_state_after_mcu"; val = fw_state);
 
     // Firmware loading
-    userlib::syscall::debug_write(b"[wifid] firmware_load_start\r\n");
     uinfo!("wifid", "firmware_load_start");
 
     let tx_ring_base = MT_WFDMA0_BASE + 0x300;
@@ -2844,11 +2632,9 @@ impl Driver for WifiDriver {
 
     match dev.load_firmware(&mut mcu_ring, &mut fwdl_ring) {
         Ok(()) => {
-            userlib::syscall::debug_write(b"[wifid] firmware_load OK\r\n");
             uinfo!("wifid", "firmware_load_ok");
         }
         Err(e) => {
-            userlib::syscall::debug_write(b"[wifid] firmware_load FAIL\r\n");
             uerror!("wifid", "firmware_load_fail"; err = e);
         }
     }
