@@ -139,21 +139,19 @@ impl QueryHandler {
         }
     }
 
-    /// Process an incoming message from a client
+    /// Process an incoming message from a client.
+    /// Returns None so the caller can try text admin handling as a fallback
+    /// (text commands >= 8 bytes parse as QueryHeader with garbage msg_type).
     pub fn handle_message(
         &mut self,
         _slot: usize,
-        buf: &[u8],
+        _buf: &[u8],
         _services: &ServiceRegistry,
-        response_buf: &mut [u8],
+        _response_buf: &mut [u8],
     ) -> Option<usize> {
-        let header = QueryHeader::from_bytes(buf)?;
-
-        // Unknown message type
-        let resp = ErrorResponse::new(header.seq_id, error::INVALID_REQUEST);
-        let bytes = resp.to_bytes();
-        response_buf[..bytes.len()].copy_from_slice(&bytes);
-        Some(bytes.len())
+        // All known binary message types are handled in dispatch_query_message.
+        // If we get here, the message type is unknown — return None.
+        None
     }
 
     /// Send a port registration response

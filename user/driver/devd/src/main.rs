@@ -31,8 +31,8 @@ mod query;
 mod rules;
 
 use userlib::syscall;
-use userlib::{uinfo, uwarn, uerror};
-use userlib::ipc::{Port, Timer, EventLoop, ObjHandle};
+use userlib::{uinfo, uwarn, uerror, udebug};
+use userlib::ipc::{Port, Timer, EventLoop, ObjHandle, Mux, MuxFilter};
 use userlib::error::{SysError, SysResult};
 use userlib::query::{
     QueryHeader, SpawnChildContext, msg,
@@ -53,6 +53,7 @@ fn copy_static(dst: &mut [u8], src: &[u8]) -> usize {
     dst[..len].copy_from_slice(&src[..len]);
     len
 }
+
 
 /// Trim whitespace and newlines from a byte slice
 fn trim_bytes(b: &[u8]) -> &[u8] {
@@ -1027,6 +1028,7 @@ impl Devd {
     /// Handle CONFIG admin command: forward to driver, wait for response.
     ///
     /// Format: `<service> GET [key]` or `<service> SET <key> <value>`
+    /// Broadcast: `GET [key]` or `SET <key> <value>` (no service name)
     /// Returns number of bytes written to resp buffer.
     fn admin_config_command(&mut self, args: &[u8], resp: &mut [u8]) -> usize {
         let args_str = match core::str::from_utf8(args) {
@@ -1035,10 +1037,17 @@ impl Devd {
         };
 
         let mut parts = args_str.splitn(4, ' ');
-        let service_name = match parts.next() {
+        let first = match parts.next() {
             Some(s) if !s.is_empty() => s,
-            _ => return copy_static(resp, b"ERR missing service name\n"),
+            _ => return copy_static(resp, b"ERR missing args\n"),
         };
+
+        // Detect broadcast: first token is operation, not service name
+        if matches!(first, "GET" | "get" | "SET" | "set") {
+            return self.admin_config_broadcast(first, parts, resp);
+        }
+
+        let service_name = first;
         let operation = match parts.next() {
             Some(s) => s,
             None => return copy_static(resp, b"ERR missing operation (GET/SET)\n"),
@@ -1153,6 +1162,107 @@ impl Devd {
         }
     }
 
+    /// Broadcast a CONFIG command to all connected managed drivers.
+    ///
+    /// Iterates all managed query clients, sends the config query to each,
+    /// and returns the first non-empty successful response. Each driver's
+    /// bus_runtime will propagate to its children automatically.
+    fn admin_config_broadcast(
+        &mut self,
+        operation: &str,
+        mut parts: core::str::SplitN<'_, char>,
+        resp: &mut [u8],
+    ) -> usize {
+        let msg_type;
+        let key;
+        let value;
+
+        match operation {
+            "GET" | "get" => {
+                msg_type = msg::CONFIG_GET;
+                key = parts.next().unwrap_or("");
+                value = "";
+            }
+            "SET" | "set" => {
+                msg_type = msg::CONFIG_SET;
+                key = match parts.next() {
+                    Some(k) => k,
+                    None => return copy_static(resp, b"ERR missing key\n"),
+                };
+                value = match parts.next() {
+                    Some(v) => v,
+                    None => return copy_static(resp, b"ERR missing value\n"),
+                };
+            }
+            _ => return copy_static(resp, b"ERR unknown operation\n"),
+        }
+
+        // Iterate all connected managed query clients
+        // For GET: accumulate all responses (allows devc get to show everything)
+        // For SET: return first successful response
+        let mut resp_pos = 0;
+
+        for slot in 0..MAX_QUERY_CLIENTS {
+            let is_managed = match self.query_handler.get(slot) {
+                Some(c) if c.is_managed => true,
+                _ => continue,
+            };
+            if !is_managed { continue; }
+
+            let seq_id = self.next_forward_seq_id;
+            self.next_forward_seq_id = self.next_forward_seq_id.wrapping_add(1);
+            if self.next_forward_seq_id == 0 {
+                self.next_forward_seq_id = 1;
+            }
+
+            if !self.send_config_query(slot, seq_id, msg_type, key.as_bytes(), value.as_bytes()) {
+                continue;
+            }
+
+            // Poll for response with timeout (can't use temp Mux — handle is in EventLoop)
+            let mut recv_buf = [0u8; 1100];
+            let mut recv_len = 0;
+            for _ in 0..500 {
+                match self.query_handler.get_mut(slot) {
+                    Some(client) => match client.channel.try_recv(&mut recv_buf) {
+                        Ok(Some(n)) => { recv_len = n; break; }
+                        Ok(None) => {} // not ready yet
+                        Err(_) => break,
+                    },
+                    None => break,
+                }
+                userlib::delay_ms(1);
+            }
+            if recv_len == 0 { continue; }
+
+            use userlib::query::{ServiceInfoResult, error};
+            if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&recv_buf[..recv_len]) {
+                if result.result == error::OK && !info_bytes.is_empty() {
+                    // Skip "ERR unknown key" responses
+                    if info_bytes == b"ERR unknown key\n" {
+                        continue;
+                    }
+                    // For SET, return first match immediately
+                    if msg_type == msg::CONFIG_SET {
+                        let len = info_bytes.len().min(resp.len());
+                        resp[..len].copy_from_slice(&info_bytes[..len]);
+                        return len;
+                    }
+                    // For GET, accumulate responses
+                    let len = info_bytes.len().min(resp.len() - resp_pos);
+                    resp[resp_pos..resp_pos + len].copy_from_slice(&info_bytes[..len]);
+                    resp_pos += len;
+                }
+            }
+        }
+
+        if resp_pos > 0 {
+            resp_pos
+        } else {
+            copy_static(resp, b"ERR key not found\n")
+        }
+    }
+
     fn handle_process_exit(&mut self, handle: ObjHandle) {
         let found_idx = self.services.find_by_watcher(handle);
 
@@ -1259,7 +1369,7 @@ impl Devd {
 
         match query_port.accept_with_pid() {
             Ok((channel, client_pid)) => {
-                uinfo!("devd", "query_accept"; pid = client_pid);
+                udebug!("devd", "query_accept"; pid = client_pid);
                 // Check if this is a known service (driver)
                 // First try the normal service registry lookup for Ready services
                 let mut service_idx = self.services.find_by_pid(client_pid)
@@ -1305,7 +1415,7 @@ impl Devd {
                 // Log the service_idx that will be used
                 if let Some(idx) = service_idx {
                     if let Some(svc) = self.services.get(idx as usize) {
-                        uinfo!("devd", "query_driver"; pid = client_pid, idx = idx as u32, name = svc.name());
+                        udebug!("devd", "query_driver"; pid = client_pid, idx = idx as u32, name = svc.name());
                     }
                 }
 
@@ -1471,11 +1581,21 @@ impl Devd {
                     if let Some(client) = self.query_handler.get_mut(slot) {
                         let _ = client.channel.send(&response_buf[..resp_len]);
                     }
+                } else {
+                    // Not a known binary message — fall through to text admin
+                    // (QueryHeader::from_bytes returns Some for ANY >=8 byte buffer,
+                    // so text commands like "CONFIG GET key\n" land here too)
+                    let resp_len = self.handle_admin_command(buf, &mut response_buf);
+                    if resp_len > 0 {
+                        if let Some(client) = self.query_handler.get_mut(slot) {
+                            let _ = client.channel.send(&response_buf[..resp_len]);
+                        }
+                    }
                 }
             }
             None => {
-                // Not a valid binary protocol message — try as text admin command
-                // (from shell `devd` builtin which sends "START x\n", "LIST\n", etc.)
+                // Buffer too short for QueryHeader — try as text admin command
+                // (e.g. "LIST\n" which is < 8 bytes)
                 let mut resp_buf = [0u8; MSG_BUFFER_SIZE];
                 let resp_len = self.handle_admin_command(buf, &mut resp_buf);
                 if resp_len > 0 {

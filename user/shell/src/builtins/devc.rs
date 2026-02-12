@@ -3,6 +3,8 @@
 //! Get and set configuration values on running drivers via devd.
 //!
 //! Usage:
+//!   devc get <key>                  Broadcast: find key across all drivers
+//!   devc set <key> <value>          Broadcast: set key on owning driver
 //!   devc <service> get [key]        Get config (all if key omitted)
 //!   devc <service> set <key> <value> Set config value
 
@@ -17,7 +19,8 @@ pub fn run(args: &[u8]) -> CommandResult {
         return CommandResult::None;
     }
 
-    // Parse: <service> <get|set> [key] [value]
+    // Parse: [service] <get|set> [key] [value]
+    // If first token is get/set, broadcast to all drivers (no service name).
     let args_str = match core::str::from_utf8(args) {
         Ok(s) => s,
         Err(_) => {
@@ -27,20 +30,26 @@ pub fn run(args: &[u8]) -> CommandResult {
     };
 
     let mut parts = args_str.splitn(4, ' ');
-    let service = match parts.next() {
+    let first = match parts.next() {
         Some(s) if !s.is_empty() => s,
         _ => {
-            println!("Usage: devc <service> get [key] | set <key> <value>");
+            println!("Usage: devc [service] get [key] | set <key> <value>");
             return CommandResult::None;
         }
     };
 
-    let op = match parts.next() {
-        Some(s) => s,
-        None => {
-            println!("Usage: devc <service> get [key] | set <key> <value>");
-            return CommandResult::None;
-        }
+    // Detect broadcast: first token is operation, not service name
+    let (service, op) = if first == "get" || first == "set" {
+        ("", first)
+    } else {
+        let op = match parts.next() {
+            Some(s) => s,
+            None => {
+                println!("Usage: devc [service] get [key] | set <key> <value>");
+                return CommandResult::None;
+            }
+        };
+        (first, op)
     };
 
     match op {
@@ -50,6 +59,8 @@ pub fn run(args: &[u8]) -> CommandResult {
             let n = userlib::config::get(service.as_bytes(), key.as_bytes(), &mut buf);
             if n > 0 {
                 return format_response(&buf[..n]);
+            } else if service.is_empty() {
+                println!("No driver has that key");
             } else {
                 println!("Failed: no response from {}", service);
             }
@@ -58,14 +69,14 @@ pub fn run(args: &[u8]) -> CommandResult {
             let key = match parts.next() {
                 Some(k) => k,
                 None => {
-                    println!("Usage: devc <service> set <key> <value>");
+                    println!("Usage: devc [service] set <key> <value>");
                     return CommandResult::None;
                 }
             };
             let value = match parts.next() {
                 Some(v) => v,
                 None => {
-                    println!("Usage: devc <service> set <key> <value>");
+                    println!("Usage: devc [service] set <key> <value>");
                     return CommandResult::None;
                 }
             };
@@ -73,6 +84,8 @@ pub fn run(args: &[u8]) -> CommandResult {
             let n = userlib::config::set_raw(service.as_bytes(), key.as_bytes(), value.as_bytes(), &mut buf);
             if n > 0 {
                 return format_response(&buf[..n]);
+            } else if service.is_empty() {
+                println!("No driver has that key");
             } else {
                 println!("Failed: no response from {}", service);
             }
@@ -89,16 +102,17 @@ fn show_help() {
     println!("devc - Driver Configuration");
     println!();
     println!("Usage:");
-    println!("  devc <service> get            Get all config (summary)");
+    println!("  devc get <key>                Broadcast: find key across all drivers");
+    println!("  devc set <key> <val>          Broadcast: set key on owning driver");
+    println!("  devc <service> get            Get all config from a specific driver");
     println!("  devc <service> get <key>      Get specific config value");
     println!("  devc <service> set <key> <val> Set config value");
     println!();
     println!("Examples:");
-    println!("  devc ipd get                  Show IP config summary");
-    println!("  devc ipd get net.ip           Show current IP address");
-    println!("  devc ipd set net.ip 10.0.2.50");
-    println!("  devc ipd set net.gateway 10.0.2.1");
-    println!("  devc ipd set net.dhcp off");
+    println!("  devc get wifi.radio           Find wifi.radio across all drivers");
+    println!("  devc set wifi.channel 6       Set channel on owning driver");
+    println!("  devc wifid get                Show wifid config summary");
+    println!("  devc wifid get wifi.radio     Get specific key from wifid");
 }
 
 /// Format driver response as a structured table.
@@ -106,13 +120,16 @@ fn show_help() {
 fn format_response(data: &[u8]) -> CommandResult {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     let text = match core::str::from_utf8(&data[..end]) {
-        Ok(s) => s,
+        Ok(s) => s.trim(),
         Err(_) => return CommandResult::None,
     };
 
-    // Try to parse as key=value table format
+    if text.is_empty() {
+        return CommandResult::None;
+    }
+
+    // Parse key=value pairs into table
     let mut table = Table::new(&["KEY", "VALUE"]);
-    let mut has_kv = false;
 
     for line in text.lines() {
         let line = line.trim();
@@ -120,29 +137,21 @@ fn format_response(data: &[u8]) -> CommandResult {
             continue;
         }
 
-        // Check if line has key=value pairs (space or newline separated)
         for part in line.split_whitespace() {
             if let Some(eq_pos) = part.find('=') {
                 let key = &part[..eq_pos];
                 let val = &part[eq_pos + 1..];
                 if !key.is_empty() {
                     table.add_row(Row::empty().string(key).string(val));
-                    has_kv = true;
                 }
             }
         }
-
-        // If no key=value on this line, treat as header/message
-        if !line.contains('=') && !line.is_empty() {
-            // This is a header line - add as a single-column row
-            table.add_row(Row::empty().string(line).str(""));
-        }
     }
 
-    if has_kv || !table.is_empty() {
+    if !table.is_empty() {
         CommandResult::Table(table)
     } else {
-        // Fallback: print raw text
+        // No key=value pairs — print raw (e.g. "OK" from set)
         print_raw(text);
         CommandResult::None
     }

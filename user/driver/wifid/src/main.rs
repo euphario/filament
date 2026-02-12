@@ -49,6 +49,7 @@ struct WifiDriver {
     seq: u8,
     radio_on: bool,
     tx_throttle: u8,
+    channel: u8,
 }
 
 impl WifiDriver {
@@ -63,6 +64,7 @@ impl WifiDriver {
             seq: 0,
             radio_on: false,
             tx_throttle: 100,
+            channel: 1,
         }
     }
 
@@ -394,13 +396,66 @@ impl WifiDriver {
     }
     uinfo!("wifid", "thermal_throttle_ok");
 
-    // Radio OFF by default — explicitly logged, safe for testing
-    // Linux: mt7996/mcu.c:4539 mt7996_mcu_set_radio_en()
-    for band in 0..3u8 {
-        dev.mcu_set_radio_en(&mut wa_ring, band, false, seq).map_err(mcu_err)?;
-        seq = seq.wrapping_add(1);
-    }
-    uinfo!("wifid", "radio_off_default"; reason = "init");
+    // ====================================================================
+    // Band 0 radio startup + interface creation
+    // Linux: mt7996/main.c mt7996_start() + mt7996_run() + mt7996_vif_link_add()
+    // ====================================================================
+
+    // Locally-administered MAC for initial bringup
+    let mac_addr: [u8; 6] = [0x02, 0x0c, 0x43, 0x28, 0x80, 0x01];
+
+    // === Global setup ===
+
+    // Header translation (global, once) — Linux mcu.c:3387
+    dev.mcu_set_hdr_trans(&mut wa_ring, true, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+    uinfo!("wifid", "hdr_trans_ok");
+
+    // RTS threshold (band 0) — Linux mcu.c:4517
+    dev.mcu_set_rts_thresh(&mut wa_ring, 0, 0x92b, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+    uinfo!("wifid", "rts_thresh_ok");
+
+    // === Band 0 RX path (initial, before radio ON) ===
+    // Linux: mt7996_run() → mcu_set_chan_info(RX_PATH)
+    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_RX_PATH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+    uinfo!("wifid", "rx_path_init_ok");
+
+    // === Interface creation (band 0) ===
+    // Linux: mt7996_vif_link_add() → add_dev_info + add_bss_info + add_sta
+
+    // DEV_INFO: activate OMAC 1 (first STA interface) — Linux mcu.c:2623
+    dev.mcu_add_dev_info(&mut wa_ring, 0, HW_BSSID_1, &mac_addr, true, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+    uinfo!("wifid", "dev_info_ok");
+
+    // BSS_INFO: create BSS on band 0 — Linux mcu.c:1123
+    dev.mcu_add_bss_info(&mut wa_ring, 0, HW_BSSID_1, HW_BSSID_1, &mac_addr, true, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+    uinfo!("wifid", "bss_info_ok");
+
+    // STA_REC: add STA with PORT_SECURE — Linux mcu.c:2438
+    dev.mcu_add_sta(&mut wa_ring, HW_BSSID_1 as u8, 0, HW_BSSID_1, CONN_STATE_PORT_SECURE, &mac_addr, true, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+    uinfo!("wifid", "sta_rec_ok");
+
+    // === Radio ON + channel tune (band 0 only) ===
+
+    // Radio ON — Linux mcu.c:4539
+    dev.mcu_set_radio_en(&mut wa_ring, 0, true, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+
+    // Channel switch — Linux mcu.c:3696 mt7996_set_channel()
+    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_SWITCH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+
+    // RX path after switch — repeated per Linux sequence
+    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_RX_PATH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+
+    // Bands 1,2 stay OFF — no radio_en call
+    uinfo!("wifid", "band0_up"; channel = 1u32, bw = "20MHz");
 
     // Final state
     let final_fw_state = dev.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
@@ -408,8 +463,9 @@ impl WifiDriver {
 
     // Store resources and state in driver struct
     self.seq = seq;
-    self.radio_on = false;
+    self.radio_on = true;
     self.tx_throttle = 100;
+    self.channel = 1;
     self.dev = Some(dev);
     self.bar0 = Some(bar0);
     self.desc_pool = Some(desc_pool);
@@ -458,6 +514,7 @@ struct WifiDriverWrapper(&'static mut WifiDriver);
 
 const WIFI_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_write(b"wifi.radio"),
+    ConfigKey::read_write(b"wifi.channel"),
     ConfigKey::read_write(b"wifi.tx_throttle"),
     ConfigKey::read_only(b"wifi.state"),
 ];
@@ -488,6 +545,11 @@ impl Driver for WifiDriverWrapper {
             b"wifi.radio" => {
                 let s = if self.0.radio_on { b"on" as &[u8] } else { b"off" };
                 Self::copy_to_buf(buf, s)
+            }
+            b"wifi.channel" => {
+                let mut tmp = [0u8; 4];
+                let n = fmt_u8(self.0.channel, &mut tmp);
+                Self::copy_to_buf(buf, &tmp[..n])
             }
             b"wifi.tx_throttle" => {
                 let mut tmp = [0u8; 4];
@@ -521,6 +583,7 @@ impl Driver for WifiDriverWrapper {
                     b"off" | b"0" | b"false" => false,
                     _ => return Self::copy_to_buf(buf, b"ERR invalid_value\n"),
                 };
+                // Disable/enable all 3 bands (0=2.4GHz, 1=5GHz, 2=6GHz)
                 for band in 0..3u8 {
                     if dev.mcu_set_radio_en(wa_ring, band, enable, self.0.seq).is_err() {
                         return Self::copy_to_buf(buf, b"ERR mcu_failed\n");
@@ -533,6 +596,26 @@ impl Driver for WifiDriverWrapper {
                 } else {
                     uinfo!("wifid", "radio_disable");
                 }
+                Self::copy_to_buf(buf, b"OK\n")
+            }
+            b"wifi.channel" => {
+                let val_str = core::str::from_utf8(value).unwrap_or("");
+                let ch: u8 = match val_str.parse::<u8>() {
+                    Ok(v) if v >= 1 && v <= 14 => v,
+                    Ok(_) => return Self::copy_to_buf(buf, b"ERR range_1_14\n"),
+                    Err(_) => return Self::copy_to_buf(buf, b"ERR invalid_number\n"),
+                };
+                // Channel switch + RX path for band 0 (2.4GHz only)
+                if dev.mcu_set_chan_info(wa_ring, 0, UNI_CHANNEL_SWITCH, ch, CMD_CBW_20MHZ, CH_BAND_2GHZ, self.0.seq).is_err() {
+                    return Self::copy_to_buf(buf, b"ERR chan_switch_failed\n");
+                }
+                self.0.seq = self.0.seq.wrapping_add(1);
+                if dev.mcu_set_chan_info(wa_ring, 0, UNI_CHANNEL_RX_PATH, ch, CMD_CBW_20MHZ, CH_BAND_2GHZ, self.0.seq).is_err() {
+                    return Self::copy_to_buf(buf, b"ERR rx_path_failed\n");
+                }
+                self.0.seq = self.0.seq.wrapping_add(1);
+                self.0.channel = ch;
+                uinfo!("wifid", "channel_switch"; channel = ch as u32);
                 Self::copy_to_buf(buf, b"OK\n")
             }
             b"wifi.tx_throttle" => {

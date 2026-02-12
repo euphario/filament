@@ -22,7 +22,7 @@ use crate::bus::{
 use crate::bus_block::ShmemBlockPort;
 use crate::devd::{DevdClient, DevdCommand};
 use crate::ipc::{Channel, Mux, MuxFilter};
-use crate::query::{QueryHeader, SpawnChildContext, SpawnContextResponse, msg as query_msg, port_type as qport_type, error as query_error};
+use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, port_type as qport_type, error as query_error};
 use crate::syscall::{self, Handle, LogLevel};
 
 // ============================================================================
@@ -978,13 +978,37 @@ impl<D: Driver> DriverRuntime<D> {
                 let key = bus_msg.read_null_terminated(0);
                 let mut buf = [0u8; 512];
 
-                let len = if key.is_empty() {
-                    build_config_summary(&self.driver, &mut buf)
+                if key.is_empty() {
+                    // Summary: build_config_summary already formats key=value\n
+                    let len = build_config_summary(&self.driver, &mut buf);
+                    let child_len = if self.ctx.child_count > 0 {
+                        self.forward_config_to_children(
+                            query_msg::CONFIG_GET, key, &[], &mut buf[len..],
+                        )
+                    } else { 0 };
+                    let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len + child_len]);
                 } else {
-                    self.driver.config_get(key, &mut buf)
-                };
+                    // Specific key: try exact match first
+                    let mut val_tmp = [0u8; 256];
+                    let vlen = self.driver.config_get(key, &mut val_tmp);
 
-                let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+                    if vlen > 0 {
+                        // Exact match — format: key=value
+                        let len = format_kv(key, &val_tmp[..vlen], &mut buf);
+                        let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+                    } else {
+                        // No exact match — try prefix: return all keys starting with prefix
+                        let plen = build_prefix_matches(&self.driver, key, &mut buf);
+                        // Also propagate to children
+                        let child_len = if self.ctx.child_count > 0 {
+                            self.forward_config_to_children(
+                                query_msg::CONFIG_GET, key, &[], &mut buf[plen..],
+                            )
+                        } else { 0 };
+                        let total = plen + child_len;
+                        let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..total]);
+                    }
+                }
             }
 
             bus_msg::CONFIG_SET => {
@@ -998,6 +1022,9 @@ impl<D: Driver> DriverRuntime<D> {
                     self.driver.config_set(key, value, &mut buf, &mut self.ctx)
                 } else if keys.iter().any(|k| k.name == key) {
                     copy_static(&mut buf, b"ERR read-only key\n")
+                } else if self.ctx.child_count > 0 {
+                    // Unknown key — propagate to children
+                    self.forward_config_to_children(query_msg::CONFIG_SET, key, value, &mut buf)
                 } else {
                     copy_static(&mut buf, b"ERR unknown key\n")
                 };
@@ -1016,6 +1043,80 @@ impl<D: Driver> DriverRuntime<D> {
                     }
                 }
             }
+        }
+    }
+
+    /// Forward a CONFIG_GET/SET to children, return first non-empty response.
+    ///
+    /// Sends the query to each child's supervision channel (which the child's
+    /// bus_runtime processes synchronously as a devd command). Returns the number
+    /// of bytes written to `out`, or 0 if no child knew the key.
+    fn forward_config_to_children(
+        &mut self,
+        msg_type: u16,
+        key: &[u8],
+        value: &[u8],
+        out: &mut [u8],
+    ) -> usize {
+        // Build the query message (same wire format as devd → driver)
+        let mut qbuf = [0u8; 256];
+        let header = QueryHeader::new(msg_type, 1); // seq_id=1 (arbitrary, synchronous)
+        let hdr_bytes = header.to_bytes();
+        qbuf[..QueryHeader::SIZE].copy_from_slice(&hdr_bytes);
+        let mut offset = QueryHeader::SIZE;
+
+        // Write key (null-terminated for CONFIG_GET, null-separated for CONFIG_SET)
+        let klen = key.len().min(qbuf.len() - offset - 2);
+        qbuf[offset..offset + klen].copy_from_slice(&key[..klen]);
+        offset += klen;
+
+        if msg_type == query_msg::CONFIG_SET {
+            // Null separator between key and value
+            qbuf[offset] = 0;
+            offset += 1;
+            let vlen = value.len().min(qbuf.len() - offset - 1);
+            qbuf[offset..offset + vlen].copy_from_slice(&value[..vlen]);
+            offset += vlen;
+        }
+
+        // Try each child sequentially
+        for i in 0..MAX_CHILDREN {
+            let child = match &mut self.ctx.children[i] {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Send query
+            if child.channel.send(&qbuf[..offset]).is_err() {
+                continue;
+            }
+
+            // Blocking recv — child responds synchronously within dispatch_devd_command
+            let mut recv_buf = [0u8; 1100];
+            let n = match child.channel.recv(&mut recv_buf) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            // Parse ServiceInfoResult
+            if let Some((_result, info_bytes)) = ServiceInfoResult::from_bytes(&recv_buf[..n]) {
+                if !info_bytes.is_empty() {
+                    // For CONFIG_SET, skip "ERR unknown key" (child didn't know either)
+                    if msg_type == query_msg::CONFIG_SET && info_bytes == b"ERR unknown key\n" {
+                        continue;
+                    }
+                    let len = info_bytes.len().min(out.len());
+                    out[..len].copy_from_slice(&info_bytes[..len]);
+                    return len;
+                }
+            }
+        }
+
+        // No child knew the key
+        if msg_type == query_msg::CONFIG_SET {
+            copy_static(out, b"ERR unknown key\n")
+        } else {
+            0
         }
     }
 
@@ -1398,4 +1499,45 @@ fn copy_static(dst: &mut [u8], src: &[u8]) -> usize {
     let len = src.len().min(dst.len());
     dst[..len].copy_from_slice(&src[..len]);
     len
+}
+
+/// Format key=value into buf (uses a temp buffer to avoid overlap with value).
+/// Returns bytes written.
+fn format_kv(key: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
+    let mut tmp = [0u8; 512];
+    let mut pos = 0;
+    let klen = key.len().min(tmp.len());
+    tmp[..klen].copy_from_slice(&key[..klen]);
+    pos += klen;
+    if pos < tmp.len() { tmp[pos] = b'='; pos += 1; }
+    let vlen = value.len().min(tmp.len() - pos);
+    tmp[pos..pos + vlen].copy_from_slice(&value[..vlen]);
+    pos += vlen;
+    let out_len = pos.min(buf.len());
+    buf[..out_len].copy_from_slice(&tmp[..out_len]);
+    out_len
+}
+
+/// Return all keys whose name starts with `prefix`, formatted as key=value\n lines.
+fn build_prefix_matches<D: Driver>(driver: &D, prefix: &[u8], buf: &mut [u8]) -> usize {
+    let keys = driver.config_keys();
+    let mut pos = 0;
+
+    for key in keys {
+        if key.name.len() >= prefix.len() && &key.name[..prefix.len()] == prefix {
+            // key name
+            let klen = key.name.len().min(buf.len() - pos);
+            buf[pos..pos + klen].copy_from_slice(&key.name[..klen]);
+            pos += klen;
+            // '='
+            if pos < buf.len() { buf[pos] = b'='; pos += 1; }
+            // value
+            let n = driver.config_get(key.name, &mut buf[pos..]);
+            pos += n;
+            // newline
+            if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
+        }
+    }
+
+    pos
 }

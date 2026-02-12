@@ -102,8 +102,10 @@ fn send_devd_cmd(service: &[u8], op: &[u8], key: &[u8], value: &[u8], out: &mut 
     let mut pos = 0;
 
     pos += copy(&mut cmd[pos..], b"CONFIG ");
-    pos += copy(&mut cmd[pos..], service);
-    pos += copy(&mut cmd[pos..], b" ");
+    if !service.is_empty() {
+        pos += copy(&mut cmd[pos..], service);
+        pos += copy(&mut cmd[pos..], b" ");
+    }
     pos += copy(&mut cmd[pos..], op);
 
     if !key.is_empty() {
@@ -126,7 +128,7 @@ fn send_devd_cmd(service: &[u8], op: &[u8], key: &[u8], value: &[u8], out: &mut 
 
 /// Open a channel to devd, send a message, wait for response with timeout.
 fn send_and_recv(msg: &[u8], out: &mut [u8]) -> usize {
-    let mut ch = match Channel::connect(b"devd:") {
+    let mut ch = match Channel::connect(b"devd-query:") {
         Ok(ch) => ch,
         Err(_) => return 0,
     };

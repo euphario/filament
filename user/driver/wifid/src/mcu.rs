@@ -513,7 +513,7 @@ impl Mt7996Dev {
         for _ in 0..timeout_ms {
             let dma_idx = self.mt76_rr(rx_regs + MT_QUEUE_DMA_IDX);
             if dma_idx != pre_send_dma_idx {
-                uinfo!("mcu", "rx_ok"; snap = pre_send_dma_idx, now = dma_idx);
+                udebug!("mcu", "rx_ok"; snap = pre_send_dma_idx, now = dma_idx);
                 return Ok(());
             }
             userlib::delay_ms(1);
@@ -996,6 +996,282 @@ impl Mt7996Dev {
 
         udebug!("mcu", "thermal_throttle_set"; band = band, state = state);
         Ok(())
+    }
+
+    // ========================================================================
+    // Band 0 Radio Startup + Interface Creation MCU Commands
+    // ========================================================================
+
+    /// Set RTS threshold for a band
+    /// Linux: mt7996/mcu.c:4517-4537 mt7996_mcu_set_rts_thresh()
+    ///
+    /// UNI cmd MCU_WM_UNI_CMD(BAND_CONFIG) (0x08), tag=UNI_BAND_CONFIG_RTS_THRESHOLD(0x08).
+    /// Layout (16 bytes): {band_idx:u8, rsv[3], tag:le16, len:le16=12, len_thresh:le32, pkt_thresh:le32=0x2}
+    /// Wait: yes
+    pub fn mcu_set_rts_thresh(&self, ring: &mut TxRing, band: u8, val: u32, seq: u8) -> Result<(), i32> {
+        let mut data = [0u8; 16];
+
+        // band_idx
+        data[0] = band;
+        // tag = UNI_BAND_CONFIG_RTS_THRESHOLD (0x08)
+        data[4..6].copy_from_slice(&UNI_BAND_CONFIG_RTS_THRESHOLD.to_le_bytes());
+        // len = 12
+        data[6..8].copy_from_slice(&12u16.to_le_bytes());
+        // len_thresh = val
+        data[8..12].copy_from_slice(&val.to_le_bytes());
+        // pkt_thresh = 0x2
+        data[12..16].copy_from_slice(&2u32.to_le_bytes());
+
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BAND_CONFIG as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "set_rts_thresh"; band = band, val = val);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Set channel info (switch or RX path)
+    /// Linux: mt7996/mcu.c:3696-3762 mt7996_mcu_set_chan_info()
+    ///
+    /// UNI cmd MCU_WMWA_UNI_CMD(CHANNEL_SWITCH) (0x34) — both WM+WA.
+    /// tag: UNI_CHANNEL_SWITCH(0) or UNI_CHANNEL_RX_PATH(1)
+    /// Wait: yes
+    pub fn mcu_set_chan_info(&self, ring: &mut TxRing, band: u8, tag: u16,
+                            channel: u8, bw: u8, channel_band: u8, seq: u8) -> Result<(), i32> {
+        // 76 bytes: {rsv[4], tag:le16, len:le16=72, fields...}
+        let mut data = [0u8; 76];
+
+        // tag
+        data[4..6].copy_from_slice(&tag.to_le_bytes());
+        // len = 72
+        data[6..8].copy_from_slice(&72u16.to_le_bytes());
+
+        // control_ch = channel
+        data[8] = channel;
+        // center_ch = channel (same for 20MHz)
+        data[9] = channel;
+        // bw
+        data[10] = bw;
+
+        // tx_path_num: count of TX antennas (MT7996 band 0 = 2T2R → 2)
+        // Linux: hweight16(phy->chainmask) — band 0 chainmask = 0x3 → 2
+        data[11] = 2;
+
+        // rx_path: depends on tag
+        // For UNI_CHANNEL_RX_PATH: bitmask (chainmask = 0x3)
+        // For UNI_CHANNEL_SWITCH: hweight8(rx_path) = count of bits
+        // Linux mcu.c:3731-3735
+        if tag == UNI_CHANNEL_RX_PATH {
+            data[12] = 0x3;  // chainmask bitmask
+        } else {
+            data[12] = 2;    // hweight8(0x3) = 2
+        }
+
+        // switch_reason
+        data[13] = CH_SWITCH_NORMAL;
+        // band_idx
+        data[14] = band;
+        // center_ch2 = 0 (not 80+80)
+        // cac_case = 0
+        // channel_band
+        data[18] = channel_band;
+        // rest is zeros (outband_freq, txpower_drop, ap_bw, ap_center_ch, rsv)
+
+        // MCU_WMWA_UNI_CMD(CHANNEL_SWITCH) = __MCU_CMD_FIELD_UNI | 0x34 | WM | WA
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_CHANNEL_SWITCH as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
+
+        udebug!("mcu", "set_chan_info"; band = band, tag = tag, ch = channel, bw = bw);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Enable/disable RX header translation
+    /// Linux: mt7996/mcu.c:3387-3420 mt7996_mcu_set_hdr_trans()
+    ///
+    /// UNI cmd MCU_WM_UNI_CMD(RX_HDR_TRANS) (0x12) — WM only.
+    /// Multi-TLV: HDR_TRANS_EN + HDR_TRANS_VLAN + HDR_TRANS_BLACKLIST (if enable)
+    /// Wait: yes
+    pub fn mcu_set_hdr_trans(&self, ring: &mut TxRing, enable: bool, seq: u8) -> Result<(), i32> {
+        // 4-byte uni_header + 3 TLVs (8 bytes each) = 28 bytes when enabled
+        // 4-byte uni_header + 2 TLVs (8 bytes each) = 20 bytes when disabled
+        let total = if enable { 28 } else { 20 };
+        let mut data = [0u8; 28];
+
+        // uni_header = 0 (4 bytes)
+        let mut off = 4usize;
+
+        // TLV1: HDR_TRANS_EN — mcu.c:3395-3402
+        data[off..off + 2].copy_from_slice(&UNI_HDR_TRANS_EN.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        data[off + 4] = if enable { 1 } else { 0 };  // enable
+        data[off + 5] = 0;  // check_bssid
+        data[off + 6] = 0;  // mode
+        off += 8;
+
+        // TLV2: HDR_TRANS_VLAN — mcu.c:3404-3409
+        data[off..off + 2].copy_from_slice(&UNI_HDR_TRANS_VLAN.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        // insert_vlan=0, remove_vlan=0, tid=0
+        off += 8;
+
+        // TLV3: HDR_TRANS_BLACKLIST (only if enable) — mcu.c:3411-3418
+        if enable {
+            data[off..off + 2].copy_from_slice(&UNI_HDR_TRANS_BLACKLIST.to_le_bytes());
+            data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+            data[off + 4] = 0;  // idx
+            data[off + 5] = 1;  // enable
+            data[off + 6..off + 8].copy_from_slice(&ETH_P_PAE.to_le_bytes());  // type
+        }
+
+        // MCU_WM_UNI_CMD(RX_HDR_TRANS) = __MCU_CMD_FIELD_UNI | 0x12 | __MCU_CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_RX_HDR_TRANS as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "set_hdr_trans"; enable = enable as u8);
+        self.mcu_send_uni_cmd(ring, cmd, &data[..total], true, seq)
+    }
+
+    /// Add/remove device info (OMAC)
+    /// Linux: mt7996/mcu.c:2623-2651 mt7996_mcu_add_dev_info()
+    ///
+    /// UNI cmd MCU_WMWA_UNI_CMD(DEV_INFO_UPDATE) (0x01) — both WM+WA.
+    /// Wait: yes
+    pub fn mcu_add_dev_info(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
+                            mac_addr: &[u8; 6], enable: bool, seq: u8) -> Result<(), i32> {
+        // hdr(4) + DEV_INFO_ACTIVE tlv: tag(2) + len(2) + active(1) + rsv(1) + omac_addr(6) = 16
+        let mut data = [0u8; 16];
+
+        // Header: omac_idx, band_idx, rsv[2]
+        data[0] = omac_idx;
+        data[1] = band;
+
+        // TLV: DEV_INFO_ACTIVE — mcu.c:2632-2643
+        data[4..6].copy_from_slice(&DEV_INFO_ACTIVE.to_le_bytes());
+        // len = 12 (includes tag+len itself)
+        data[6..8].copy_from_slice(&12u16.to_le_bytes());
+        data[8] = if enable { 1 } else { 0 };  // active
+        // rsv = 0
+        data[10..16].copy_from_slice(mac_addr);  // omac_addr[6]
+
+        // MCU_WMWA_UNI_CMD(DEV_INFO_UPDATE) = __MCU_CMD_FIELD_UNI | 0x01 | WM | WA
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_DEV_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
+
+        udebug!("mcu", "add_dev_info"; band = band, omac = omac_idx, enable = enable as u8);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Add/remove BSS info
+    /// Linux: mt7996/mcu.c:1123-1185 mt7996_mcu_bss_basic_tlv()
+    ///        mt7996/mcu.c:1216-1222 mt7996_mcu_bss_sec_tlv()
+    ///
+    /// UNI cmd MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) (0x02) — both WM+WA.
+    /// Minimal TLVs: BSS_INFO_BASIC + BSS_INFO_SEC
+    /// Wait: yes
+    pub fn mcu_add_bss_info(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
+                            hw_bss_idx: u8, mac_addr: &[u8; 6], enable: bool, seq: u8) -> Result<(), i32> {
+        // Layout: uni_header(4) + BSS_INFO_BASIC(32) + BSS_INFO_SEC(8) = 44 bytes
+        let mut data = [0u8; 44];
+
+        // uni_header = 0 (4 bytes)
+
+        // === BSS_INFO_BASIC TLV (32 bytes) — mcu.c:1123-1185 ===
+        let off = 4;
+        // tag = UNI_BSS_INFO_BASIC (0)
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_BASIC.to_le_bytes());
+        // len = 32
+        data[off + 2..off + 4].copy_from_slice(&32u16.to_le_bytes());
+        // active
+        data[off + 4] = if enable { 1 } else { 0 };
+        // omac_idx
+        data[off + 5] = omac_idx;
+        // hw_bss_idx
+        data[off + 6] = hw_bss_idx;
+        // band_idx
+        data[off + 7] = band;
+        // conn_type:le32 = CONNECTION_INFRA_STA
+        data[off + 8..off + 12].copy_from_slice(&CONNECTION_INFRA_STA.to_le_bytes());
+        // conn_state = DISCONNECT
+        data[off + 12] = CONN_STATE_DISCONNECT;
+        // wmm_idx = 0
+        // bssid[6] = zeros (unassociated)
+        // bmc_tx_wlan_idx:le16 = 0
+        // bcn_interval:le16 = 100
+        data[off + 22..off + 24].copy_from_slice(&100u16.to_le_bytes());
+        // dtim_period = 1
+        data[off + 24] = 1;
+        // phymode = 0
+        // sta_idx:le16 = 0
+        // nonht_basic_phy:le16 = 0
+        // phymode_ext = 0
+        // link_idx = 0
+
+        // === BSS_INFO_SEC TLV (8 bytes) — mcu.c:1216-1222 ===
+        let off2 = 36;
+        // tag = UNI_BSS_INFO_SEC (16)
+        data[off2..off2 + 2].copy_from_slice(&UNI_BSS_INFO_SEC.to_le_bytes());
+        // len = 8
+        data[off2 + 2..off2 + 4].copy_from_slice(&8u16.to_le_bytes());
+        // rsv[2] = 0
+        // cipher = 0 (NONE)
+        // rsv = 0
+
+        // MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) = __MCU_CMD_FIELD_UNI | 0x02 | WM | WA
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BSS_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
+
+        udebug!("mcu", "add_bss_info"; band = band, omac = omac_idx, bss = hw_bss_idx, enable = enable as u8);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Add/update STA record
+    /// Linux: mt7996/mcu.c:2438-2477 mt7996_mcu_add_sta()
+    ///        mt76_connac_mcu.c:388-415 mt76_connac_mcu_sta_basic_tlv()
+    ///
+    /// UNI cmd MCU_WMWA_UNI_CMD(STA_REC_UPDATE) (0x03) — both WM+WA.
+    /// Layout: sta_req_hdr(8) + STA_REC_BASIC(20) = 28 bytes
+    /// Wait: yes
+    pub fn mcu_add_sta(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
+                       omac_idx: u8, conn_state: u8, mac_addr: &[u8; 6],
+                       newly: bool, seq: u8) -> Result<(), i32> {
+        let mut data = [0u8; 28];
+
+        // === sta_req_hdr (8 bytes) — mt76_connac_mcu.h ===
+        // bss_idx
+        data[0] = bss_idx;
+        // wlan_idx_lo (low 8 bits)
+        data[1] = wlan_idx as u8;
+        // tlv_num = 1
+        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        // is_tlv_append = 1
+        data[4] = 1;
+        // muar_idx = omac_idx
+        data[5] = omac_idx;
+        // wlan_idx_hi (high 8 bits)
+        data[6] = (wlan_idx >> 8) as u8;
+        // rsv = 0
+
+        // === STA_REC_BASIC TLV (20 bytes) — mt76_connac_mcu.c:388-415 ===
+        let off = 8;
+        // tag = STA_REC_BASIC (0)
+        data[off..off + 2].copy_from_slice(&STA_REC_BASIC.to_le_bytes());
+        // len = 20
+        data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());
+        // conn_type:le32 = CONNECTION_INFRA_STA
+        data[off + 4..off + 8].copy_from_slice(&CONNECTION_INFRA_STA.to_le_bytes());
+        // conn_state
+        data[off + 8] = conn_state;
+        // qos = 1
+        data[off + 9] = 1;
+        // aid:le16 = 0
+        // peer_addr[6]
+        data[off + 12..off + 18].copy_from_slice(mac_addr);
+        // extra_info:le16
+        let mut extra = EXTRA_INFO_VER;
+        if newly {
+            extra |= EXTRA_INFO_NEW;
+        }
+        data[off + 18..off + 20].copy_from_slice(&extra.to_le_bytes());
+
+        // MCU_WMWA_UNI_CMD(STA_REC_UPDATE) = __MCU_CMD_FIELD_UNI | 0x03 | WM | WA
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
+
+        udebug!("mcu", "add_sta"; bss = bss_idx, wlan = wlan_idx, state = conn_state);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
     }
 
     /// Program a fixed rate table entry
