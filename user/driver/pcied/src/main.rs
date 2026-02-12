@@ -46,6 +46,21 @@ mod pci_prog_if {
 // Device Classification (from BusDevice)
 // ============================================================================
 
+/// MediaTek WiFi HIF2 companion device IDs.
+/// These are secondary PCIe functions managed through the primary HIF1 BAR.
+/// The main driver (wifid) accesses HIF2 registers at 0xd8xxx via HIF1's MMIO space.
+/// Registering them as separate ports would spawn duplicate driver instances that
+/// race on shared WFSYS hardware (both do reset + DMA init on same registers).
+mod mt_hif2 {
+    pub const MT7996: u16 = 0x7991;
+    pub const MT7992: u16 = 0x7993;
+    pub const MT7990: u16 = 0x799b;
+}
+
+fn is_hif2_companion(vendor_id: u16, device_id: u16) -> bool {
+    vendor_id == 0x14c3 && matches!(device_id, mt_hif2::MT7996 | mt_hif2::MT7992 | mt_hif2::MT7990)
+}
+
 const MAX_PCI_DEVICES: usize = 32;
 
 fn class_name(base_class: u8, subclass: u8, prog_if: u8) -> &'static str {
@@ -226,6 +241,13 @@ impl Driver for PcieDriver {
         // Register per-device ports with devd using unified PortInfo
         for idx in 0..self.count {
             let dev = &self.devices[idx];
+
+            // Skip HIF2 companion devices — managed through primary driver's BAR
+            if is_hif2_companion(dev.vendor_id, dev.device_id) {
+                uinfo!("pcied", "skip_hif2"; device_id = dev.device_id);
+                continue;
+            }
+
             let mut name_buf = [0u8; 32];
             let name_len = format_port_name(dev, &mut name_buf);
             let name = &name_buf[..name_len];
