@@ -867,6 +867,137 @@ impl Mt7996Dev {
         self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
     }
 
+    /// Enable/disable radio for a band
+    /// Linux: mt7996/mcu.c:4539-4558 mt7996_mcu_set_radio_en()
+    ///
+    /// UNI cmd MCU_WM_UNI_CMD(BAND_CONFIG) (0x08), tag=UNI_BAND_CONFIG_RADIO_ENABLE(0).
+    /// Layout (12 bytes): {band_idx:u8, rsv[3], tag:le16, len:le16, enable:u8, rsv2[3]}
+    /// Note: first 4 bytes are band_idx header (NOT empty uni_header — BAND_CONFIG specific).
+    /// Wait: yes
+    pub fn mcu_set_radio_en(&self, ring: &mut TxRing, band: u8, enable: bool, seq: u8) -> Result<(), i32> {
+        // struct from mcu.c:4539-4558
+        //   u8 band_idx;      // band index (NOT in uni_header position)
+        //   u8 _rsv[3];
+        //   le16 tag;         // UNI_BAND_CONFIG_RADIO_ENABLE (0)
+        //   le16 len;         // sizeof(req) - 4 = 8
+        //   u8 enable;
+        //   u8 _rsv2[3];
+        // Total: 12 bytes
+        let mut data = [0u8; 12];
+
+        // band_idx
+        data[0] = band;
+        // tag = UNI_BAND_CONFIG_RADIO_ENABLE (0)
+        data[4..6].copy_from_slice(&UNI_BAND_CONFIG_RADIO_ENABLE.to_le_bytes());
+        // len = 8
+        data[6..8].copy_from_slice(&8u16.to_le_bytes());
+        // enable
+        data[8] = if enable { 1 } else { 0 };
+
+        // MCU_WM_UNI_CMD(BAND_CONFIG) = __MCU_CMD_FIELD_UNI | 0x08 | __MCU_CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BAND_CONFIG as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "set_radio_en"; band = band, enable = enable as u8);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Enable/disable thermal protection for a band
+    /// Linux: mt7996/mcu.c:4105-4143 mt7996_mcu_set_thermal_protect()
+    ///
+    /// Always sends DISABLE first (tag=0x7, 12 bytes).
+    /// If enable, follows with ENABLE (tag=0x6, 24 bytes) with temperature thresholds.
+    /// Temps in raw °C: trigger=120, restore=110, sustain=10.
+    /// Wait: no
+    pub fn mcu_set_thermal_protect(&self, ring: &mut TxRing, band: u8, enable: bool, seq: u8) -> Result<(), i32> {
+        // MCU_WM_UNI_CMD(THERMAL) = __MCU_CMD_FIELD_UNI | 0x35 | __MCU_CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_THERMAL as u32) | CMD_FIELD_WM;
+
+        // Step 1: Always send DISABLE first — mcu.c:4130-4132
+        // struct { u8 _rsv[4]; le16 tag; le16 len; thermal_ctrl(4 bytes) } = 12 bytes
+        // thermal_ctrl: { ctrl_id:0, band_idx, protect_type:1, trigger_type:1 }
+        {
+            let mut data = [0u8; 12];
+            // uni_header = 0 (4 bytes)
+            // tag = UNI_CMD_THERMAL_PROTECT_DISABLE (7)
+            data[4..6].copy_from_slice(&UNI_CMD_THERMAL_PROTECT_DISABLE.to_le_bytes());
+            // len = sizeof(req) - 4 = 8  (excludes uni_header, includes tag+len+ctrl)
+            data[6..8].copy_from_slice(&8u16.to_le_bytes());
+            // thermal_ctrl: ctrl_id=0, band_idx, protect_type=1, trigger_type=1
+            data[8] = 0;       // ctrl_id
+            data[9] = band;    // band_idx
+            data[10] = 1;      // protect_type (duty admit)
+            data[11] = 1;      // trigger_type (high)
+
+            udebug!("mcu", "thermal_protect_disable"; band = band);
+            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+        }
+
+        if !enable {
+            return Ok(());
+        }
+
+        // Step 2: Send ENABLE with temperature thresholds — mcu.c:4135-4142
+        // struct { u8 _rsv[4]; le16 tag; le16 len; thermal_ctrl(4); thermal_enable(12) } = 24 bytes
+        // thermal_enable: { trigger_temp:le32, restore_temp:le32, sustain_time:le16, rsv[2] }
+        {
+            let mut data = [0u8; 24];
+            // tag = UNI_CMD_THERMAL_PROTECT_ENABLE (6)
+            data[4..6].copy_from_slice(&UNI_CMD_THERMAL_PROTECT_ENABLE.to_le_bytes());
+            // len = sizeof(req) - 4 = 20
+            data[6..8].copy_from_slice(&20u16.to_le_bytes());
+            // thermal_ctrl: ctrl_id=0, band_idx, protect_type=1, trigger_type=1
+            data[8] = 0;
+            data[9] = band;
+            data[10] = 1;      // protect_type
+            data[11] = 1;      // trigger_type
+            // thermal_enable: trigger_temp (120°C)
+            data[12..16].copy_from_slice(&MT7996_MAX_TEMP.to_le_bytes());
+            // restore_temp (110°C)
+            data[16..20].copy_from_slice(&MT7996_CRIT_TEMP.to_le_bytes());
+            // sustain_time = 10 (SUSTAIN_PERIOD from mcu.c:4106)
+            data[20..22].copy_from_slice(&10u16.to_le_bytes());
+
+            udebug!("mcu", "thermal_protect_enable"; band = band, trigger = MT7996_MAX_TEMP, restore = MT7996_CRIT_TEMP);
+            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+        }
+
+        Ok(())
+    }
+
+    /// Set thermal throttling duty cycle for a band
+    /// Linux: mt7996/mcu.c:4072-4103 mt7996_mcu_set_thermal_throttling()
+    ///
+    /// Sends 4 commands for duty levels 0-3, each halving the duty cycle:
+    ///   Level 0: duty_cycle=state, Level 1: state/2, Level 2: state/4, Level 3: state/8
+    /// Wait: no
+    pub fn mcu_set_thermal_throttling(&self, ring: &mut TxRing, band: u8, state: u8, seq: u8) -> Result<(), i32> {
+        // MCU_WM_UNI_CMD(THERMAL) = __MCU_CMD_FIELD_UNI | 0x35 | __MCU_CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_THERMAL as u32) | CMD_FIELD_WM;
+
+        // struct { u8 _rsv[4]; le16 tag; le16 len; thermal_ctrl(4) } = 12 bytes
+        // thermal_ctrl.duty: { ctrl_id:0, band_idx, duty_level, duty_cycle }
+        let mut duty_cycle = state;
+
+        for level in 0u8..4 {
+            let mut data = [0u8; 12];
+            // tag = UNI_CMD_THERMAL_PROTECT_DUTY_CONFIG (8)
+            data[4..6].copy_from_slice(&UNI_CMD_THERMAL_PROTECT_DUTY_CONFIG.to_le_bytes());
+            // len = sizeof(req) - 4 = 8
+            data[6..8].copy_from_slice(&8u16.to_le_bytes());
+            // thermal_ctrl.duty: ctrl_id=0, band_idx, duty_level, duty_cycle
+            data[8] = 0;          // ctrl_id
+            data[9] = band;       // band_idx
+            data[10] = level;     // duty_level
+            data[11] = duty_cycle; // duty_cycle
+
+            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+            duty_cycle /= 2;
+        }
+
+        udebug!("mcu", "thermal_throttle_set"; band = band, state = state);
+        Ok(())
+    }
+
     /// Program a fixed rate table entry
     /// Linux: mt7996/mcu.c:4604-4631 mt7996_mcu_set_fixed_rate_table()
     ///

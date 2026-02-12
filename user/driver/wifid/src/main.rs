@@ -21,7 +21,7 @@
 
 use userlib::{uinfo, uwarn, uerror, udebug};
 use userlib::mmio::{MmioRegion, DmaPool};
-use userlib::bus::{BusMsg, BusError, BusCtx, Driver, Disposition};
+use userlib::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, ConfigKey};
 use userlib::bus_runtime::driver_main;
 
 mod regs;
@@ -46,6 +46,9 @@ struct WifiDriver {
     rx_pool: Option<DmaPool>,
     wa_ring: Option<TxRing>,
     wa_tx_buf_pool: Option<DmaPool>,
+    seq: u8,
+    radio_on: bool,
+    tx_throttle: u8,
 }
 
 impl WifiDriver {
@@ -57,6 +60,9 @@ impl WifiDriver {
             rx_pool: None,
             wa_ring: None,
             wa_tx_buf_pool: None,
+            seq: 0,
+            radio_on: false,
+            tx_throttle: 100,
         }
     }
 
@@ -367,11 +373,43 @@ impl WifiDriver {
     // Full MAC init: WTBL clear, RRO, HIF TXD version, per-band regs, basic rates
     dev.mac_init(&mut wa_ring, &mut seq).map_err(mcu_err)?;
 
+    // ====================================================================
+    // Thermal protection + radio control
+    // Linux: mt7996/main.c mt7996_start() — thermal protect, throttle, radio
+    // ====================================================================
+
+    // Thermal protection: enable for all 3 bands
+    // Linux: mt7996/mcu.c:4105 mt7996_mcu_set_thermal_protect()
+    for band in 0..3u8 {
+        dev.mcu_set_thermal_protect(&mut wa_ring, band, true, seq).map_err(mcu_err)?;
+        seq = seq.wrapping_add(1);
+    }
+    uinfo!("wifid", "thermal_protect_ok");
+
+    // Thermal throttling: 100% (full power — throttle only on overtemp)
+    // Linux: mt7996/mcu.c:4072 mt7996_mcu_set_thermal_throttling()
+    for band in 0..3u8 {
+        dev.mcu_set_thermal_throttling(&mut wa_ring, band, 100, seq).map_err(mcu_err)?;
+        seq = seq.wrapping_add(1);
+    }
+    uinfo!("wifid", "thermal_throttle_ok");
+
+    // Radio OFF by default — explicitly logged, safe for testing
+    // Linux: mt7996/mcu.c:4539 mt7996_mcu_set_radio_en()
+    for band in 0..3u8 {
+        dev.mcu_set_radio_en(&mut wa_ring, band, false, seq).map_err(mcu_err)?;
+        seq = seq.wrapping_add(1);
+    }
+    uinfo!("wifid", "radio_off_default"; reason = "init");
+
     // Final state
     let final_fw_state = dev.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
     uinfo!("wifid", "init_complete"; fw_state = final_fw_state);
 
-    // Store resources in driver struct (keeps DMA pools alive for driver lifetime)
+    // Store resources and state in driver struct
+    self.seq = seq;
+    self.radio_on = false;
+    self.tx_throttle = 100;
     self.dev = Some(dev);
     self.bar0 = Some(bar0);
     self.desc_pool = Some(desc_pool);
@@ -384,6 +422,23 @@ impl WifiDriver {
 
     fn command(&mut self, _msg: &BusMsg, _ctx: &mut dyn BusCtx) -> Disposition {
         Disposition::Handled
+    }
+}
+
+/// Format u8 as decimal into buffer, return number of bytes written.
+fn fmt_u8(val: u8, buf: &mut [u8]) -> usize {
+    if val >= 100 {
+        buf[0] = b'0' + val / 100;
+        buf[1] = b'0' + (val / 10) % 10;
+        buf[2] = b'0' + val % 10;
+        3
+    } else if val >= 10 {
+        buf[0] = b'0' + val / 10;
+        buf[1] = b'0' + val % 10;
+        2
+    } else {
+        buf[0] = b'0' + val;
+        1
     }
 }
 
@@ -401,6 +456,20 @@ fn main() {
 
 struct WifiDriverWrapper(&'static mut WifiDriver);
 
+const WIFI_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_write(b"wifi.radio"),
+    ConfigKey::read_write(b"wifi.tx_throttle"),
+    ConfigKey::read_only(b"wifi.state"),
+];
+
+impl WifiDriverWrapper {
+    fn copy_to_buf(buf: &mut [u8], s: &[u8]) -> usize {
+        let n = s.len().min(buf.len());
+        buf[..n].copy_from_slice(&s[..n]);
+        n
+    }
+}
+
 impl Driver for WifiDriverWrapper {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         self.0.reset(ctx)
@@ -408,5 +477,82 @@ impl Driver for WifiDriverWrapper {
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         self.0.command(msg, ctx)
+    }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        WIFI_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        match key {
+            b"wifi.radio" => {
+                let s = if self.0.radio_on { b"on" as &[u8] } else { b"off" };
+                Self::copy_to_buf(buf, s)
+            }
+            b"wifi.tx_throttle" => {
+                let mut tmp = [0u8; 4];
+                let n = fmt_u8(self.0.tx_throttle, &mut tmp);
+                Self::copy_to_buf(buf, &tmp[..n])
+            }
+            b"wifi.state" => {
+                let s: &[u8] = if self.0.dev.is_none() {
+                    b"init"
+                } else if self.0.radio_on {
+                    b"radio_on"
+                } else {
+                    b"radio_off"
+                };
+                Self::copy_to_buf(buf, s)
+            }
+            _ => 0,
+        }
+    }
+
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize {
+        let (dev, wa_ring) = match (self.0.dev.as_ref(), self.0.wa_ring.as_mut()) {
+            (Some(d), Some(r)) => (d, r),
+            _ => return Self::copy_to_buf(buf, b"ERR not_initialized\n"),
+        };
+
+        match key {
+            b"wifi.radio" => {
+                let enable = match value {
+                    b"on" | b"1" | b"true" => true,
+                    b"off" | b"0" | b"false" => false,
+                    _ => return Self::copy_to_buf(buf, b"ERR invalid_value\n"),
+                };
+                for band in 0..3u8 {
+                    if dev.mcu_set_radio_en(wa_ring, band, enable, self.0.seq).is_err() {
+                        return Self::copy_to_buf(buf, b"ERR mcu_failed\n");
+                    }
+                    self.0.seq = self.0.seq.wrapping_add(1);
+                }
+                self.0.radio_on = enable;
+                if enable {
+                    uinfo!("wifid", "radio_enable");
+                } else {
+                    uinfo!("wifid", "radio_disable");
+                }
+                Self::copy_to_buf(buf, b"OK\n")
+            }
+            b"wifi.tx_throttle" => {
+                let val_str = core::str::from_utf8(value).unwrap_or("");
+                let throttle: u8 = match val_str.parse::<u8>() {
+                    Ok(v) if v <= 100 => v,
+                    Ok(_) => return Self::copy_to_buf(buf, b"ERR range_0_100\n"),
+                    Err(_) => return Self::copy_to_buf(buf, b"ERR invalid_number\n"),
+                };
+                for band in 0..3u8 {
+                    if dev.mcu_set_thermal_throttling(wa_ring, band, throttle, self.0.seq).is_err() {
+                        return Self::copy_to_buf(buf, b"ERR mcu_failed\n");
+                    }
+                    self.0.seq = self.0.seq.wrapping_add(1);
+                }
+                self.0.tx_throttle = throttle;
+                uinfo!("wifid", "thermal_throttle_set"; level = throttle);
+                Self::copy_to_buf(buf, b"OK\n")
+            }
+            _ => Self::copy_to_buf(buf, b"ERR unknown_key\n"),
+        }
     }
 }

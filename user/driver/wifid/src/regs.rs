@@ -316,6 +316,26 @@ pub const MT7996_BASIC_RATES_TBL: u16 = 31;
 pub const MT_TX_RATE_MODE: u32 = 0x3C0;                        // GENMASK(9,6)
 pub const MT_TX_RATE_IDX: u32 = 0x3F;                          // GENMASK(5,0)
 
+// ============================================================================
+// MCU UNI command IDs — from mt76_connac_mcu.h enum
+// ============================================================================
+
+pub const MCU_UNI_CMD_BAND_CONFIG: u16 = 0x08;
+pub const MCU_UNI_CMD_THERMAL: u16 = 0x35;
+
+// Thermal tags — mcu.h enum UNI_CMD_THERMAL_*
+pub const UNI_CMD_THERMAL_PROTECT_ENABLE: u16 = 0x6;
+pub const UNI_CMD_THERMAL_PROTECT_DISABLE: u16 = 0x7;
+pub const UNI_CMD_THERMAL_PROTECT_DUTY_CONFIG: u16 = 0x8;
+
+// Band config tags — mcu.h enum UNI_BAND_CONFIG_*
+pub const UNI_BAND_CONFIG_RADIO_ENABLE: u16 = 0;
+
+// Thermal defaults — mt7996.h
+pub const MT7996_CRIT_TEMP: u32 = 110;   // restore temp (°C)
+pub const MT7996_MAX_TEMP: u32 = 120;    // trigger temp (°C)
+pub const MT7996_THERMAL_THROTTLE_MAX: u8 = 100;
+
 // Per-band register address helpers
 #[inline]
 pub const fn mt_wf_rmac(band: usize, ofs: u32) -> u32 { WF_RMAC_BASE[band] + ofs }
