@@ -330,11 +330,102 @@ pub const UNI_CMD_THERMAL_PROTECT_DUTY_CONFIG: u16 = 0x8;
 
 // Band config tags — mcu.h enum UNI_BAND_CONFIG_*
 pub const UNI_BAND_CONFIG_RADIO_ENABLE: u16 = 0;
+pub const UNI_BAND_CONFIG_RTS_THRESHOLD: u16 = 0x08;
 
 // Thermal defaults — mt7996.h
 pub const MT7996_CRIT_TEMP: u32 = 110;   // restore temp (°C)
 pub const MT7996_MAX_TEMP: u32 = 120;    // trigger temp (°C)
 pub const MT7996_THERMAL_THROTTLE_MAX: u8 = 100;
+
+// ============================================================================
+// Channel switch — mcu.h, mt76_connac_mcu.h
+// ============================================================================
+
+pub const MCU_UNI_CMD_CHANNEL_SWITCH: u16 = 0x34;
+pub const UNI_CHANNEL_SWITCH: u16 = 0;
+pub const UNI_CHANNEL_RX_PATH: u16 = 1;
+
+// Bandwidth encoding — mt76_connac.h CMD_CBW_*
+pub const CMD_CBW_20MHZ: u8 = 0;
+#[allow(dead_code)]
+pub const CMD_CBW_40MHZ: u8 = 1;
+#[allow(dead_code)]
+pub const CMD_CBW_80MHZ: u8 = 2;
+#[allow(dead_code)]
+pub const CMD_CBW_160MHZ: u8 = 3;
+
+// Channel switch reasons — mt76_connac_mcu.h
+pub const CH_SWITCH_NORMAL: u8 = 0;
+#[allow(dead_code)]
+pub const CH_SWITCH_SCAN_BYPASS_DPD: u8 = 9;
+
+// Channel band encoding
+pub const CH_BAND_2GHZ: u8 = 0;
+#[allow(dead_code)]
+pub const CH_BAND_5GHZ: u8 = 1;
+#[allow(dead_code)]
+pub const CH_BAND_6GHZ: u8 = 2;
+
+// ============================================================================
+// Header translation — mcu.h
+// ============================================================================
+
+pub const MCU_UNI_CMD_RX_HDR_TRANS: u16 = 0x12;
+pub const UNI_HDR_TRANS_EN: u16 = 0;
+pub const UNI_HDR_TRANS_VLAN: u16 = 1;
+pub const UNI_HDR_TRANS_BLACKLIST: u16 = 2;
+
+// ETH_P_PAE for hdr_trans blacklist
+pub const ETH_P_PAE: u16 = 0x888E;
+
+// ============================================================================
+// Interface management — mcu.h, mt76_connac_mcu.h
+// ============================================================================
+
+pub const MCU_UNI_CMD_DEV_INFO_UPDATE: u16 = 0x01;
+pub const MCU_UNI_CMD_BSS_INFO_UPDATE: u16 = 0x02;
+pub const MCU_UNI_CMD_STA_REC_UPDATE: u16 = 0x03;
+
+// DEV_INFO TLV tags
+pub const DEV_INFO_ACTIVE: u16 = 0;
+
+// BSS_INFO TLV tags
+pub const UNI_BSS_INFO_BASIC: u16 = 0;
+pub const UNI_BSS_INFO_BCN_CONTENT: u16 = 7;  // mt76_connac_mcu.h:1369
+pub const UNI_BSS_INFO_SEC: u16 = 16;
+
+// STA_REC TLV tags
+pub const STA_REC_BASIC: u16 = 0;
+
+// Connection types — mt76_connac_mcu.h
+pub const CONNECTION_INFRA_STA: u32 = 0x04 | 0x02;  // STA_TYPE_STA | NETWORK_INFRA
+pub const CONN_STATE_DISCONNECT: u8 = 0;
+pub const CONN_STATE_PORT_SECURE: u8 = 2;
+
+// EXTRA_INFO flags for STA_REC
+pub const EXTRA_INFO_VER: u16 = 1 << 0;
+pub const EXTRA_INFO_NEW: u16 = 1 << 1;
+
+// OMAC indices
+#[allow(dead_code)]
+pub const HW_BSSID_0: u8 = 0;
+pub const HW_BSSID_1: u8 = 1;  // First STA interface
+
+// ============================================================================
+// Beacon TX constants — from mt76_connac3_mac.h
+// ============================================================================
+
+/// Hardware TXD size (8 × u32) — mt76_connac3_mac.h
+pub const MT_TXD_SIZE: usize = 32;
+
+/// Beacon queue index — mt76_connac3_mac.h:16
+pub const MT_LMAC_BCN0: u8 = 0x12;
+
+/// TX packet format: firmware — mt76_connac3_mac.h:172
+pub const MT_TX_TYPE_FW: u8 = 3;
+
+/// Header format: 802.11 — mt76_connac3_mac.h:167
+pub const MT_HDR_FORMAT_802_11: u8 = 2;
 
 // Per-band register address helpers
 #[inline]

@@ -10,7 +10,6 @@
 
 use crate::println;
 use userlib::ipc::{Channel, Timer, Mux, MuxFilter};
-use userlib::syscall;
 use crate::output::CommandResult;
 
 /// Main entry point for devd builtin
@@ -214,10 +213,8 @@ fn send_command(cmd: &[u8]) -> Result<&'static str, &'static str> {
         Err(_) => return Err("failed to create timer"),
     };
 
-    // 5 second timeout
-    let now = syscall::gettime();
-    let deadline = now + 5_000_000_000; // 5 seconds in ns
-    if timer.set(deadline).is_err() {
+    // 5 second timeout (Timer.set takes duration, kernel adds current time)
+    if timer.set(5_000_000_000).is_err() {
         return Err("failed to set timer");
     }
 

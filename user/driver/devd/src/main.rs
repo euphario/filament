@@ -894,7 +894,7 @@ impl Devd {
     // Admin Client Handling (shell text commands)
     // =========================================================================
 
-    fn handle_admin_command(&mut self, cmd: &[u8], resp: &mut [u8]) -> usize {
+    fn handle_admin_command(&mut self, cmd: &[u8], resp: &mut [u8], from_slot: usize) -> usize {
         // Trim whitespace and newline
         let cmd = trim_bytes(cmd);
 
@@ -914,7 +914,7 @@ impl Devd {
             self.admin_spawn_driver(args)
         } else if cmd.starts_with(b"CONFIG ") {
             let args = trim_bytes(&cmd[7..]);
-            return self.admin_config_command(args, resp);
+            return self.admin_config_command(args, resp, from_slot);
         } else {
             b"ERR unknown command\n"
         };
@@ -1030,7 +1030,7 @@ impl Devd {
     /// Format: `<service> GET [key]` or `<service> SET <key> <value>`
     /// Broadcast: `GET [key]` or `SET <key> <value>` (no service name)
     /// Returns number of bytes written to resp buffer.
-    fn admin_config_command(&mut self, args: &[u8], resp: &mut [u8]) -> usize {
+    fn admin_config_command(&mut self, args: &[u8], resp: &mut [u8], from_slot: usize) -> usize {
         let args_str = match core::str::from_utf8(args) {
             Ok(s) => s,
             Err(_) => return copy_static(resp, b"ERR invalid args\n"),
@@ -1044,7 +1044,7 @@ impl Devd {
 
         // Detect broadcast: first token is operation, not service name
         if matches!(first, "GET" | "get" | "SET" | "set") {
-            return self.admin_config_broadcast(first, parts, resp);
+            return self.admin_config_broadcast(first, parts, resp, from_slot);
         }
 
         let service_name = first;
@@ -1102,14 +1102,14 @@ impl Devd {
             return copy_static(resp, b"ERR send failed\n");
         }
 
-        // Wait for response (blocking recv on driver channel)
+        // Wait for response with timeout (driver responds synchronously)
         let mut recv_buf = [0u8; 1100];
         let recv_len = match self.query_handler.get_mut(driver_slot) {
             Some(client) => {
-                // Use blocking recv — driver responds synchronously
-                match client.channel.recv(&mut recv_buf) {
+                // 2 second timeout — driver should respond quickly for single-service queries
+                match client.channel.recv_deadline(&mut recv_buf, 2_000_000_000) {
                     Ok(n) => n,
-                    Err(_) => return copy_static(resp, b"ERR recv failed\n"),
+                    Err(_) => return copy_static(resp, b"ERR recv timeout\n"),
                 }
             }
             None => return copy_static(resp, b"ERR driver disconnected\n"),
@@ -1172,6 +1172,7 @@ impl Devd {
         operation: &str,
         mut parts: core::str::SplitN<'_, char>,
         resp: &mut [u8],
+        exclude_slot: usize,
     ) -> usize {
         let msg_type;
         let key;
@@ -1203,6 +1204,10 @@ impl Devd {
         let mut resp_pos = 0;
 
         for slot in 0..MAX_QUERY_CLIENTS {
+            // Skip the requesting client's slot to avoid sending the query
+            // back to the requester (e.g. shell connects as managed because
+            // its PID matches a service entry, but it's an admin client)
+            if slot == exclude_slot { continue; }
             let is_managed = match self.query_handler.get(slot) {
                 Some(c) if c.is_managed => true,
                 _ => continue,
@@ -1222,7 +1227,7 @@ impl Devd {
             // Poll for response with timeout (can't use temp Mux — handle is in EventLoop)
             let mut recv_buf = [0u8; 1100];
             let mut recv_len = 0;
-            for _ in 0..500 {
+            for _ in 0..500u32 {
                 match self.query_handler.get_mut(slot) {
                     Some(client) => match client.channel.try_recv(&mut recv_buf) {
                         Ok(Some(n)) => { recv_len = n; break; }
@@ -1233,6 +1238,7 @@ impl Devd {
                 }
                 userlib::delay_ms(1);
             }
+
             if recv_len == 0 { continue; }
 
             use userlib::query::{ServiceInfoResult, error};
@@ -1585,7 +1591,7 @@ impl Devd {
                     // Not a known binary message — fall through to text admin
                     // (QueryHeader::from_bytes returns Some for ANY >=8 byte buffer,
                     // so text commands like "CONFIG GET key\n" land here too)
-                    let resp_len = self.handle_admin_command(buf, &mut response_buf);
+                    let resp_len = self.handle_admin_command(buf, &mut response_buf, slot);
                     if resp_len > 0 {
                         if let Some(client) = self.query_handler.get_mut(slot) {
                             let _ = client.channel.send(&response_buf[..resp_len]);
@@ -1597,7 +1603,7 @@ impl Devd {
                 // Buffer too short for QueryHeader — try as text admin command
                 // (e.g. "LIST\n" which is < 8 bytes)
                 let mut resp_buf = [0u8; MSG_BUFFER_SIZE];
-                let resp_len = self.handle_admin_command(buf, &mut resp_buf);
+                let resp_len = self.handle_admin_command(buf, &mut resp_buf, slot);
                 if resp_len > 0 {
                     if let Some(client) = self.query_handler.get_mut(slot) {
                         let _ = client.channel.send(&resp_buf[..resp_len]);

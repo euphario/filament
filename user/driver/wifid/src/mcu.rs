@@ -1274,6 +1274,173 @@ impl Mt7996Dev {
         self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
     }
 
+    /// Upload beacon template to MCU
+    /// Linux: mt7996/mcu.c:2766 mt7996_mcu_add_beacon() + mcu.c:2732 mt7996_mcu_beacon_cont()
+    ///
+    /// Builds BSS_INFO_UPDATE with UNI_BSS_INFO_BCN_CONTENT TLV containing:
+    ///   - bcn_content_tlv header (14 bytes)
+    ///   - Hardware TXD (32 bytes)
+    ///   - 802.11 beacon frame (65 bytes)
+    ///
+    /// Uses MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) (0x02) — same as mcu_add_bss_info.
+    /// Wait: yes
+    pub fn mcu_set_beacon(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
+                           mac_addr: &[u8; 6], channel: u8, enable: bool,
+                           seq: u8) -> Result<(), i32> {
+        // 802.11 beacon frame layout:
+        //   MAC header (24) + timestamp (8) + interval (2) + capability (2) +
+        //   SSID IE (10) + Rates IE (10) + DS IE (3) + TIM IE (6) = 65 bytes
+        const BEACON_LEN: usize = 65;
+
+        // TLV data after uni_header:
+        //   bcn_content header (14) + TXD (32) + beacon (65) = 111
+        //   ALIGN(111, 4) = 112  →  TLV len field
+        // Total buffer: uni_header (4) + TLV (112) = 116
+        const TLV_BODY_LEN: usize = 14 + MT_TXD_SIZE + BEACON_LEN; // 111
+        const TLV_ALIGNED: usize = (TLV_BODY_LEN + 3) & !3;        // 112
+        const DATA_LEN: usize = 4 + TLV_ALIGNED;                    // 116
+
+        let mut data = [0u8; DATA_LEN];
+
+        // uni_header = 0 (4 bytes)
+
+        // === bcn_content_tlv header (14 bytes) — mcu.c:2732 mt7996_mcu_beacon_cont() ===
+        let off = 4usize;
+        // tag = UNI_BSS_INFO_BCN_CONTENT (7)
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_BCN_CONTENT.to_le_bytes());
+        // len = ALIGN(14 + 32 + beacon_len, 4)
+        data[off + 2..off + 4].copy_from_slice(&(TLV_ALIGNED as u16).to_le_bytes());
+        // tim_ie_pos — offset of TIM IE tag from start of beacon frame
+        // = 24(mac) + 8(ts) + 2(interval) + 2(cap) + 10(SSID) + 10(rates) + 3(DS) = 59
+        data[off + 4..off + 6].copy_from_slice(&59u16.to_le_bytes());
+        // csa_ie_pos = 0
+        // bcc_ie_pos = 0
+        // enable
+        data[off + 10] = if enable { 1 } else { 0 };
+        // type = 0
+        // pkt_len = TXD + beacon
+        data[off + 12..off + 14].copy_from_slice(&((MT_TXD_SIZE + BEACON_LEN) as u16).to_le_bytes());
+
+        // === TXD (32 bytes = 8 × u32 LE) — mac.c:892 mt7996_mac_write_txwi() ===
+        let txd_off = off + 14;
+
+        // txd[0]: TX_BYTES | PKT_FMT | Q_IDX
+        //   tx_bytes = TXD + beacon_len
+        //   pkt_fmt = MT_TX_TYPE_FW (3) at bits 24:23
+        //   q_idx = MT_LMAC_BCN0 (0x12) at bits 31:25
+        let txd0 = ((MT_TXD_SIZE + BEACON_LEN) as u32)
+            | ((MT_TX_TYPE_FW as u32) << 23)
+            | ((MT_LMAC_BCN0 as u32) << 25);
+        data[txd_off..txd_off + 4].copy_from_slice(&txd0.to_le_bytes());
+
+        // txd[1]: WLAN_IDX(11:0) | HDR_FORMAT(15:14) | HDR_INFO(20:16) | OWN_MAC(30:25) | FIXED_RATE(31)
+        //   wlan_idx = 0 (global wcid)
+        //   hdr_format = MT_HDR_FORMAT_802_11 (2) — 802.11 native
+        //   hdr_info = 24/2 = 12 (802.11 header length / 2)
+        //   tid = 0 (beacon = management, not QoS)
+        //   own_mac = omac_idx
+        //   fixed_rate = 1
+        let txd1 = ((MT_HDR_FORMAT_802_11 as u32) << 14)
+            | (12u32 << 16)
+            | ((omac_idx as u32) << 25)
+            | (1u32 << 31);
+        data[txd_off + 4..txd_off + 8].copy_from_slice(&txd1.to_le_bytes());
+
+        // txd[2]: FRAME_TYPE(5:4) | SUB_TYPE(3:0)
+        //   type = 0 (management), subtype = 8 (beacon)
+        let txd2 = 8u32;  // (0 << 4) | 8
+        data[txd_off + 8..txd_off + 12].copy_from_slice(&txd2.to_le_bytes());
+
+        // txd[3]: NO_ACK(0) | BCM(4) | REM_TX_COUNT(15:11) | BA_DISABLE(28)
+        //   no_ack = 1 (beacons don't get ACK'd)
+        //   bcm = 1 (broadcast/multicast)
+        //   rem_tx_count = 0x1F (full field, per Linux beacon override)
+        //   ba_disable = 1 (set because fixed_rate is set)
+        let txd3 = 1u32 | (1u32 << 4) | (0x1Fu32 << 11) | (1u32 << 28);
+        data[txd_off + 12..txd_off + 16].copy_from_slice(&txd3.to_le_bytes());
+
+        // txd[4]: 0 (no PN / encryption)
+        // txd[5]: 0 (no PID tracking)
+
+        // txd[6]: DAS(2) | DIS_MAT(3) | MSDU_CNT(9:4) | TX_RATE(21:16) | FIXED_BW(25) | VTA(28)
+        //   das = 1, dis_mat = 1, msdu_cnt = 1
+        //   tx_rate = MT7996_BASIC_RATES_TBL (31)
+        //   fixed_bw = 1, vta = 1
+        let txd6 = (1u32 << 2)
+            | (1u32 << 3)
+            | (1u32 << 4)
+            | ((MT7996_BASIC_RATES_TBL as u32) << 16)
+            | (1u32 << 25)
+            | (1u32 << 28);
+        data[txd_off + 24..txd_off + 28].copy_from_slice(&txd6.to_le_bytes());
+
+        // txd[7]: 0
+
+        // === 802.11 Beacon Frame (65 bytes) ===
+        let bcn_off = txd_off + MT_TXD_SIZE;
+
+        // MAC Header (24 bytes)
+        // frame_control: type=0 mgmt, subtype=8 beacon → 0x0080
+        data[bcn_off..bcn_off + 2].copy_from_slice(&0x0080u16.to_le_bytes());
+        // duration = 0
+        // addr1 (DA): ff:ff:ff:ff:ff:ff (broadcast)
+        data[bcn_off + 4..bcn_off + 10].copy_from_slice(&[0xff; 6]);
+        // addr2 (SA): our MAC
+        data[bcn_off + 10..bcn_off + 16].copy_from_slice(mac_addr);
+        // addr3 (BSSID): our MAC
+        data[bcn_off + 16..bcn_off + 22].copy_from_slice(mac_addr);
+        // seq_ctrl = 0 (MCU manages sequence)
+
+        // Beacon Body
+        let body_off = bcn_off + 24;
+        // timestamp: u64 = 0 (MCU fills this) — 8 bytes
+        // beacon_interval: 100 TU
+        data[body_off + 8..body_off + 10].copy_from_slice(&100u16.to_le_bytes());
+        // capability: ESS(0x0001) | Short Preamble(0x0020) | Short Slot Time(0x0400) = 0x0421
+        data[body_off + 10..body_off + 12].copy_from_slice(&0x0421u16.to_le_bytes());
+
+        // IE 0: SSID "Filament" (10 bytes)
+        let ie_off = body_off + 12;
+        data[ie_off] = 0x00;      // element ID
+        data[ie_off + 1] = 8;     // length
+        data[ie_off + 2..ie_off + 10].copy_from_slice(b"Filament");
+
+        // IE 1: Supported Rates (10 bytes)
+        // 1,2,5.5,11 Mbps basic (0x80|rate) + 6,9,12,18 Mbps
+        let rates_off = ie_off + 10;
+        data[rates_off] = 0x01;    // element ID
+        data[rates_off + 1] = 8;   // length
+        data[rates_off + 2] = 0x82; // 1 Mbps (basic)
+        data[rates_off + 3] = 0x84; // 2 Mbps (basic)
+        data[rates_off + 4] = 0x8b; // 5.5 Mbps (basic)
+        data[rates_off + 5] = 0x96; // 11 Mbps (basic)
+        data[rates_off + 6] = 0x0c; // 6 Mbps
+        data[rates_off + 7] = 0x12; // 9 Mbps
+        data[rates_off + 8] = 0x18; // 12 Mbps
+        data[rates_off + 9] = 0x24; // 18 Mbps
+
+        // IE 3: DS Parameter Set (3 bytes)
+        let ds_off = rates_off + 10;
+        data[ds_off] = 0x03;       // element ID
+        data[ds_off + 1] = 1;      // length
+        data[ds_off + 2] = channel;
+
+        // IE 5: TIM (6 bytes)
+        let tim_off = ds_off + 3;
+        data[tim_off] = 0x05;      // element ID
+        data[tim_off + 1] = 4;     // length
+        data[tim_off + 2] = 0;     // DTIM count
+        data[tim_off + 3] = 1;     // DTIM period
+        data[tim_off + 4] = 0;     // bitmap control
+        data[tim_off + 5] = 0;     // partial virtual bitmap
+
+        // MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) = __MCU_CMD_FIELD_UNI | 0x02 | WM | WA
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BSS_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
+
+        udebug!("mcu", "set_beacon"; band = band, omac = omac_idx, ch = channel, enable = enable as u8);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
     /// Program a fixed rate table entry
     /// Linux: mt7996/mcu.c:4604-4631 mt7996_mcu_set_fixed_rate_table()
     ///

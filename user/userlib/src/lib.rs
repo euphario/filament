@@ -82,17 +82,69 @@ pub extern "C" fn _start() -> ! {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Minimal panic - just log and exit
-    let mut buf = [0u8; 64];
-    let msg = if let Some(loc) = info.location() {
+    // Flush any buffered ulog records before they're lost
+    ulog::flush();
+
+    // Log location: "PANIC: src/mcu.rs:123"
+    let mut buf = [0u8; 80];
+    let loc_len = if let Some(loc) = info.location() {
         let file = loc.file().as_bytes();
-        let len = file.len().min(40);
+        let flen = file.len().min(50);
         buf[..7].copy_from_slice(b"PANIC: ");
-        buf[7..7+len].copy_from_slice(&file[..len]);
-        &buf[..7+len]
+        buf[7..7 + flen].copy_from_slice(&file[..flen]);
+        let mut pos = 7 + flen;
+        // Append :line
+        buf[pos] = b':';
+        pos += 1;
+        pos += fmt_u32(&mut buf[pos..], loc.line());
+        pos
     } else {
-        b"PANIC: unknown"
+        buf[..14].copy_from_slice(b"PANIC: unknown");
+        14
     };
-    syscall::klog(syscall::LogLevel::Error, msg);
+    syscall::klog(syscall::LogLevel::Error, &buf[..loc_len]);
+
+    // Log panic message if available (second klog call)
+    let mut msg_buf = [0u8; 128];
+    struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+    impl core::fmt::Write for BufWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let n = bytes.len().min(self.buf.len() - self.pos);
+            self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+            self.pos += n;
+            Ok(())
+        }
+    }
+    let msg_len = {
+        let mut w = BufWriter { buf: &mut msg_buf, pos: 0 };
+        use core::fmt::Write;
+        let _ = write!(w, "{}", info.message());
+        w.pos
+    };
+    if msg_len > 0 {
+        syscall::klog(syscall::LogLevel::Error, &msg_buf[..msg_len]);
+    }
+
     syscall::exit(1)
+}
+
+/// Format u32 as decimal into buffer, return bytes written.
+fn fmt_u32(buf: &mut [u8], mut n: u32) -> usize {
+    if n == 0 && !buf.is_empty() {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = 0;
+    while n > 0 && i < 10 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    let len = i.min(buf.len());
+    for j in 0..len {
+        buf[j] = tmp[i - 1 - j];
+    }
+    len
 }

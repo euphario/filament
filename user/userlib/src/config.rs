@@ -16,10 +16,10 @@
 //! let n = config::list(b"ipd", &mut buf);
 //! ```
 
-use crate::ipc::{Channel, Mux, MuxFilter};
+use crate::ipc::Channel;
 
-/// Response timeout in milliseconds.
-const TIMEOUT_MS: u32 = 5_000;
+/// Response timeout in nanoseconds (5 seconds).
+const TIMEOUT_NS: u64 = 5_000_000_000;
 
 // ============================================================================
 // Trait
@@ -137,17 +137,11 @@ fn send_and_recv(msg: &[u8], out: &mut [u8]) -> usize {
         return 0;
     }
 
-    let mux = match Mux::new() {
-        Ok(m) => m,
-        Err(_) => return 0,
-    };
-    let _ = mux.add(ch.handle(), MuxFilter::Readable);
-
-    match mux.wait_timeout(TIMEOUT_MS) {
-        Ok(_) => match ch.try_recv(out) {
-            Ok(Some(n)) => n,
-            _ => 0,
-        },
+    // Use recv_deadline (explicit Timer) instead of Mux.wait_timeout
+    // to ensure the timeout fires even if the mux internal mechanism
+    // has edge-trigger issues with already-readable channels.
+    match ch.recv_deadline(out, TIMEOUT_NS) {
+        Ok(n) => n,
         Err(_) => 0,
     }
 }

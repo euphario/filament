@@ -128,10 +128,11 @@ impl Channel {
         }
 
         // Set up Mux+Timer for deadline
+        // Note: Timer.set() takes a DURATION in ns — the kernel converts to
+        // counter ticks and adds the current counter value internally.
         let mux = Mux::new()?;
         let mut timer = Timer::new()?;
-        let now = crate::syscall::gettime();
-        timer.set(now + timeout_ns)?;
+        timer.set(timeout_ns)?;
         mux.add(self.handle, MuxFilter::Readable)?;
         mux.add(timer.handle(), MuxFilter::Readable)?;
 
@@ -318,11 +319,15 @@ impl Timer {
     pub fn handle(&self) -> ObjHandle { self.handle }
     pub fn state(&self) -> TimerState { self.state }
 
-    pub fn set(&mut self, deadline_ns: u64) -> SysResult<()> {
+    /// Arm the timer with a duration in nanoseconds.
+    ///
+    /// The kernel converts the duration to an absolute deadline internally
+    /// (counter + duration_ticks). Pass 0 to disarm.
+    pub fn set(&mut self, duration_ns: u64) -> SysResult<()> {
         if self.state == TimerState::Closed {
             return Err(SysError::BadFd);
         }
-        write(self.handle, &deadline_ns.to_le_bytes())?;
+        write(self.handle, &duration_ns.to_le_bytes())?;
         self.state = TimerState::Armed;
         Ok(())
     }

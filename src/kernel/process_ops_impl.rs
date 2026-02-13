@@ -29,6 +29,8 @@ impl ProcessOps for KernelProcessOps {
         use crate::kernel::microtask::{self, MicroTask};
         use crate::kernel::task::tcb::CleanupPhase;
 
+        // Flush klog ring so all pending structured logs appear before exit message
+        crate::klog::flush();
         // Flush UART buffer so pending output from this process appears first
         while crate::platform::current::uart::has_buffered_output() {
             crate::platform::current::uart::flush_buffer();

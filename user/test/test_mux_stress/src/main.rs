@@ -29,7 +29,6 @@ fn phase1_timers() -> bool {
     };
 
     let mut timers: [Option<Timer>; NUM_TIMERS] = [const { None }; NUM_TIMERS];
-    let now = syscall::gettime();
 
     for i in 0..NUM_TIMERS {
         let mut timer = match Timer::new() {
@@ -40,8 +39,8 @@ fn phase1_timers() -> bool {
             }
         };
 
-        // Stagger: 10ms, 20ms, 30ms, ...
-        let deadline = now + ((i as u64 + 1) * 10_000_000);
+        // Stagger: 10ms, 20ms, 30ms, ... (Timer.set takes duration)
+        let deadline = (i as u64 + 1) * 10_000_000;
         if timer.set(deadline).is_err() {
             log(b"  phase1: FAIL - timer.set\r\n");
             return false;
@@ -209,7 +208,6 @@ fn phase3_mixed() -> bool {
 
     // Create timers
     let mut timers: [Option<Timer>; NUM_TIMERS] = [const { None }; NUM_TIMERS];
-    let now = syscall::gettime();
 
     for i in 0..NUM_TIMERS {
         let mut timer = match Timer::new() {
@@ -220,7 +218,8 @@ fn phase3_mixed() -> bool {
             }
         };
 
-        let deadline = now + ((i as u64 + 1) * 10_000_000);
+        // Timer.set takes duration in ns
+        let deadline = (i as u64 + 1) * 10_000_000;
         if timer.set(deadline).is_err() {
             log(b"  phase3: FAIL - timer.set\r\n");
             return false;

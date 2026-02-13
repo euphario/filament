@@ -1087,29 +1087,41 @@ impl<D: Driver> DriverRuntime<D> {
             };
 
             // Send query
-            if child.channel.send(&qbuf[..offset]).is_err() {
-                continue;
-            }
+            if child.channel.send(&qbuf[..offset]).is_err() { continue; }
 
-            // Blocking recv — child responds synchronously within dispatch_devd_command
+            // Poll for response — use try_recv loop (not recv_deadline/recv)
+            // because the child channel is already in the EventLoop Mux.
+            // Drain non-ServiceInfoResult messages (logs, state changes) that
+            // may be buffered ahead of the config response.
             let mut recv_buf = [0u8; 1100];
-            let n = match child.channel.recv(&mut recv_buf) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-
-            // Parse ServiceInfoResult
-            if let Some((_result, info_bytes)) = ServiceInfoResult::from_bytes(&recv_buf[..n]) {
-                if !info_bytes.is_empty() {
-                    // For CONFIG_SET, skip "ERR unknown key" (child didn't know either)
-                    if msg_type == query_msg::CONFIG_SET && info_bytes == b"ERR unknown key\n" {
-                        continue;
+            let mut got_response = false;
+            for _ in 0..30u32 {
+                match child.channel.try_recv(&mut recv_buf) {
+                    Ok(Some(n)) => {
+                        if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&recv_buf[..n]) {
+                            if result.header.msg_type == query_msg::SERVICE_INFO_RESULT {
+                                if !info_bytes.is_empty() {
+                                    if msg_type == query_msg::CONFIG_SET && info_bytes == b"ERR unknown key\n" {
+                                        break; // child didn't know, try next
+                                    }
+                                    let len = info_bytes.len().min(out.len());
+                                    out[..len].copy_from_slice(&info_bytes[..len]);
+                                    return len;
+                                }
+                                got_response = true;
+                                break; // empty response — child didn't know
+                            }
+                            // else: parsed as SIR but wrong msg_type, skip
+                        }
+                        // Unparseable message — skip and keep polling
                     }
-                    let len = info_bytes.len().min(out.len());
-                    out[..len].copy_from_slice(&info_bytes[..len]);
-                    return len;
+                    Ok(None) => {}
+                    Err(_) => break,
                 }
+                crate::delay_ms(1);
             }
+
+            if got_response { continue; } // empty response, try next child
         }
 
         // No child knew the key

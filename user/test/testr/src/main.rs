@@ -101,8 +101,8 @@ fn run_test(name: &str) -> i32 {
     }
 
     let mut timer = timer;
-    let deadline = syscall::gettime() + (TEST_TIMEOUT_MS as u64) * 1_000_000;
-    if timer.set(deadline).is_err() {
+    // Timer.set takes duration in ns, kernel adds current time
+    if timer.set((TEST_TIMEOUT_MS as u64) * 1_000_000).is_err() {
         log_str("  ERROR: timer.set failed\r\n");
         return 1;
     }

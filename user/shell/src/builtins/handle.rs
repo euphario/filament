@@ -44,10 +44,8 @@ fn test_timer(out: &mut dyn Output) {
         }
     };
 
-    // 2. Arm timer for 500ms
-    let now = gettime();
-    let deadline = now + 500_000_000; // 500ms from now
-    if let Err(_) = timer.set(deadline) {
+    // 2. Arm timer for 500ms (Timer.set takes duration, kernel adds current time)
+    if let Err(_) = timer.set(500_000_000) {
         out.write(b"  ERROR: Failed to arm timer\r\n");
         return;
     }

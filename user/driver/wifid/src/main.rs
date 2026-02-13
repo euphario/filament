@@ -48,6 +48,7 @@ struct WifiDriver {
     wa_tx_buf_pool: Option<DmaPool>,
     seq: u8,
     radio_on: bool,
+    beacon_on: bool,
     tx_throttle: u8,
     channel: u8,
 }
@@ -63,6 +64,7 @@ impl WifiDriver {
             wa_tx_buf_pool: None,
             seq: 0,
             radio_on: false,
+            beacon_on: false,
             tx_throttle: 100,
             channel: 1,
         }
@@ -440,6 +442,11 @@ impl WifiDriver {
     seq = seq.wrapping_add(1);
     uinfo!("wifid", "sta_rec_ok");
 
+    // Beacon: upload beacon template — Linux mcu.c:2766
+    dev.mcu_set_beacon(&mut wa_ring, 0, HW_BSSID_1, &mac_addr, 1, true, seq).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+    uinfo!("wifid", "beacon_ok");
+
     // === Radio ON + channel tune (band 0 only) ===
 
     // Radio ON — Linux mcu.c:4539
@@ -464,6 +471,7 @@ impl WifiDriver {
     // Store resources and state in driver struct
     self.seq = seq;
     self.radio_on = true;
+    self.beacon_on = true;
     self.tx_throttle = 100;
     self.channel = 1;
     self.dev = Some(dev);
@@ -514,6 +522,7 @@ struct WifiDriverWrapper(&'static mut WifiDriver);
 
 const WIFI_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_write(b"wifi.radio"),
+    ConfigKey::read_write(b"wifi.beacon"),
     ConfigKey::read_write(b"wifi.channel"),
     ConfigKey::read_write(b"wifi.tx_throttle"),
     ConfigKey::read_only(b"wifi.state"),
@@ -544,6 +553,10 @@ impl Driver for WifiDriverWrapper {
         match key {
             b"wifi.radio" => {
                 let s = if self.0.radio_on { b"on" as &[u8] } else { b"off" };
+                Self::copy_to_buf(buf, s)
+            }
+            b"wifi.beacon" => {
+                let s = if self.0.beacon_on { b"on" as &[u8] } else { b"off" };
                 Self::copy_to_buf(buf, s)
             }
             b"wifi.channel" => {
@@ -598,6 +611,25 @@ impl Driver for WifiDriverWrapper {
                 }
                 Self::copy_to_buf(buf, b"OK\n")
             }
+            b"wifi.beacon" => {
+                let enable = match value {
+                    b"on" | b"1" | b"true" => true,
+                    b"off" | b"0" | b"false" => false,
+                    _ => return Self::copy_to_buf(buf, b"ERR invalid_value\n"),
+                };
+                let mac_addr: [u8; 6] = [0x02, 0x0c, 0x43, 0x28, 0x80, 0x01];
+                if dev.mcu_set_beacon(wa_ring, 0, HW_BSSID_1, &mac_addr, self.0.channel, enable, self.0.seq).is_err() {
+                    return Self::copy_to_buf(buf, b"ERR mcu_failed\n");
+                }
+                self.0.seq = self.0.seq.wrapping_add(1);
+                self.0.beacon_on = enable;
+                if enable {
+                    uinfo!("wifid", "beacon_enable");
+                } else {
+                    uinfo!("wifid", "beacon_disable");
+                }
+                Self::copy_to_buf(buf, b"OK\n")
+            }
             b"wifi.channel" => {
                 let val_str = core::str::from_utf8(value).unwrap_or("");
                 let ch: u8 = match val_str.parse::<u8>() {
@@ -614,6 +646,14 @@ impl Driver for WifiDriverWrapper {
                     return Self::copy_to_buf(buf, b"ERR rx_path_failed\n");
                 }
                 self.0.seq = self.0.seq.wrapping_add(1);
+                // Re-upload beacon with new channel
+                if self.0.beacon_on {
+                    let mac_addr: [u8; 6] = [0x02, 0x0c, 0x43, 0x28, 0x80, 0x01];
+                    if dev.mcu_set_beacon(wa_ring, 0, HW_BSSID_1, &mac_addr, ch, true, self.0.seq).is_err() {
+                        return Self::copy_to_buf(buf, b"ERR beacon_update_failed\n");
+                    }
+                    self.0.seq = self.0.seq.wrapping_add(1);
+                }
                 self.0.channel = ch;
                 uinfo!("wifid", "channel_switch"; channel = ch as u32);
                 Self::copy_to_buf(buf, b"OK\n")
