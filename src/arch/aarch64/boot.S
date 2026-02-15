@@ -861,10 +861,13 @@ curr_el_spx_serror:
 /* Lower EL using AArch64 */
 .balign 0x80
 lower_el_aarch64_sync:
-    /* Check if this is an SVC (syscall) */
+    /* Save x9 before using it for ESR check — otherwise exception_from_user
+     * saves the clobbered value, corrupting crash dumps. */
+    str     x9, [sp, #-16]!     // Save original x9 to kernel stack (SP_EL1)
     mrs     x9, esr_el1
     lsr     x9, x9, #26         // Extract EC (exception class)
     cmp     x9, #0x15           // EC 0x15 = SVC from AArch64
+    ldr     x9, [sp], #16       // Restore original x9 (flags preserved by ldr)
     b.eq    svc_handler
     b       exception_from_user // User fault - terminate task and continue
 .balign 0x80
@@ -1017,11 +1020,16 @@ exception_from_user:
  * NOTE: Cannot use UART debug here - TTBR0 may be user space (0x11000000 not mapped)
  */
 irq_handler:
-    /* Check if IRQ came from EL0 (user mode) by examining SPSR_EL1.M[3:0] */
+    /* Check if IRQ came from EL0 (user mode) by examining SPSR_EL1.M[3:0]
+     * CRITICAL: Save x9 first! Without this, x9 is clobbered to 0 for user-mode
+     * IRQs (SPSR.M[3:0]=0 for EL0t), and irq_from_user saves 0 to tf[72]
+     * instead of the task's actual x9 value. Same pattern as lower_el_aarch64_sync. */
+    str     x9, [sp, #-16]!         // Save original x9 to kernel stack
     mrs     x9, spsr_el1
-    and     x9, x9, #0xf            // Extract M[3:0] - exception level
-    cbnz    x9, irq_from_kernel     // If not 0, came from EL1 (kernel)
-    b       irq_from_user           // Came from EL0 (user)
+    tst     x9, #0xf                // Z=1 if M[3:0]==0 (EL0t, user mode)
+    ldr     x9, [sp], #16           // Restore original x9 (ldr preserves flags)
+    b.eq    irq_from_user           // Z=1: came from EL0 (user)
+    b       irq_from_kernel         // Z=0: came from EL1 (kernel)
 
 /*
  * IRQ from kernel mode - save/restore on kernel stack
@@ -1289,7 +1297,6 @@ irq_from_user:
     ldp     x26, x27, [x9, #208]
     ldp     x28, x29, [x9, #224]
     ldr     x30, [x9, #240]
-    /* Finally restore x9 */
     ldr     x9, [x9, #72]
 
     /* Return to user mode (possibly different task!) */
@@ -1438,7 +1445,6 @@ svc_handler:
     ldp     x26, x27, [x9, #208]    // x26=208, x27=216
     ldp     x28, x29, [x9, #224]    // x28=224, x29=232
     ldr     x30, [x9, #240]         // x30=240
-    /* Finally restore x9 */
     ldr     x9, [x9, #72]           // x9=72
 
     /* Return to user mode (possibly different task!) */
@@ -1456,6 +1462,7 @@ ttbr0_zero_guard:
     /* Rust handler should not return, but if it does, hang */
 1:  wfe
     b       1b
+
 
 /* =============================================================================
  * Data Section - Boot Page Tables

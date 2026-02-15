@@ -659,7 +659,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_str_uart(" FP=0x");
         print_hex_uart(tf.x29);
         print_str_uart("\r\n");
-        // Dump x0-x3 (arguments), x8-x9 (scratch), x19-x21 (callee-saved)
+        // Dump all key registers for crash diagnosis
         print_str_uart("  x0=0x");
         print_hex_uart(tf.x0);
         print_str_uart(" x1=0x");
@@ -668,8 +668,15 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_hex_uart(tf.x2);
         print_str_uart(" x3=0x");
         print_hex_uart(tf.x3);
-        print_str_uart("\r\n");
-        print_str_uart("  x8=0x");
+        print_str_uart("\r\n  x4=0x");
+        print_hex_uart(tf.x4);
+        print_str_uart(" x5=0x");
+        print_hex_uart(tf.x5);
+        print_str_uart(" x6=0x");
+        print_hex_uart(tf.x6);
+        print_str_uart(" x7=0x");
+        print_hex_uart(tf.x7);
+        print_str_uart("\r\n  x8=0x");
         print_hex_uart(tf.x8);
         print_str_uart(" x9=0x");
         print_hex_uart(tf.x9);
@@ -677,14 +684,89 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         print_hex_uart(tf.x10);
         print_str_uart(" x11=0x");
         print_hex_uart(tf.x11);
-        print_str_uart("\r\n");
-        print_str_uart("  x19=0x");
+        print_str_uart("\r\n  x12=0x");
+        print_hex_uart(tf.x12);
+        print_str_uart(" x13=0x");
+        print_hex_uart(tf.x13);
+        print_str_uart(" x14=0x");
+        print_hex_uart(tf.x14);
+        print_str_uart(" x15=0x");
+        print_hex_uart(tf.x15);
+        print_str_uart("\r\n  x16=0x");
+        print_hex_uart(tf.x16);
+        print_str_uart(" x17=0x");
+        print_hex_uart(tf.x17);
+        print_str_uart(" x18=0x");
+        print_hex_uart(tf.x18);
+        print_str_uart("\r\n  x19=0x");
         print_hex_uart(tf.x19);
         print_str_uart(" x20=0x");
         print_hex_uart(tf.x20);
         print_str_uart(" x21=0x");
         print_hex_uart(tf.x21);
+        print_str_uart(" x22=0x");
+        print_hex_uart(tf.x22);
+        print_str_uart("\r\n  x23=0x");
+        print_hex_uart(tf.x23);
+        print_str_uart(" x24=0x");
+        print_hex_uart(tf.x24);
+        print_str_uart(" x25=0x");
+        print_hex_uart(tf.x25);
+        print_str_uart(" x26=0x");
+        print_hex_uart(tf.x26);
+        print_str_uart("\r\n  x27=0x");
+        print_hex_uart(tf.x27);
+        print_str_uart(" x28=0x");
+        print_hex_uart(tf.x28);
         print_str_uart("\r\n");
+    }
+
+    // SMP diagnostic: check if per-CPU trap_frame_ptr matches the task's actual trap frame.
+    // If they differ, the assembly saved/restored registers to/from the WRONG task's frame.
+    {
+        let percpu_tf = kernel::percpu::get_trap_frame() as u64;
+        let cpu = kernel::percpu::cpu_id();
+        let slot = kernel::task::current_slot();
+        print_str_uart("  CPU=");
+        print_hex_uart(cpu as u64);
+        print_str_uart(" slot=");
+        print_hex_uart(slot as u64);
+        print_str_uart(" per-CPU tf=0x");
+        print_hex_uart(percpu_tf);
+        print_str_uart("\r\n");
+
+        if let Some(sched) = unsafe { kernel::task::try_scheduler() } {
+            if let Some(task) = sched.task(slot) {
+                let task_tf = &task.trap_frame as *const _ as u64;
+                print_str_uart("  task.tf=0x");
+                print_hex_uart(task_tf);
+                if percpu_tf != task_tf {
+                    print_str_uart(" !!! MISMATCH — WRONG TRAP FRAME !!!");
+                    // Scan all tasks to find whose frame the per-CPU ptr points to
+                    for s in 0..64usize {
+                        if let Some(other) = sched.task(s) {
+                            let other_tf = &other.trap_frame as *const _ as u64;
+                            if other_tf == percpu_tf {
+                                print_str_uart("\r\n  per-CPU tf belongs to slot=");
+                                print_hex_uart(s as u64);
+                                print_str_uart(" pid=");
+                                print_hex_uart(other.id as u64);
+                                print_str_uart(" (");
+                                for &c in &other.name {
+                                    if c == 0 { break; }
+                                    uart::putc(c as char);
+                                }
+                                print_str_uart(")");
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    print_str_uart(" (OK)");
+                }
+                print_str_uart("\r\n");
+            }
+        }
     }
 
     // Debug: Print TTBR0 and user sp for crash diagnosis
