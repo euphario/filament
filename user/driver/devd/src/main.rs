@@ -35,7 +35,7 @@ use userlib::{uinfo, uwarn, uerror, udebug};
 use userlib::ipc::{Port, Timer, EventLoop, ObjHandle, Mux, MuxFilter};
 use userlib::error::{SysError, SysResult};
 use userlib::query::{
-    QueryHeader, SpawnChildContext, msg,
+    QueryHeader, SpawnChildContext, msg, query_flags,
 };
 
 use service::{
@@ -55,6 +55,80 @@ fn copy_static(dst: &mut [u8], src: &[u8]) -> usize {
 }
 
 
+/// Append config response data to buf at `pos`, annotating with source path.
+///
+/// Builds full paths through the supervision tree:
+/// - Existing `[path]` headers in `data` are rewritten to `[prefix/path]`
+/// - Raw key=value lines before any header get a new `[prefix]` header prepended
+/// - If `prefix` is empty, data is copied as-is
+fn append_with_source(buf: &mut [u8], pos: usize, prefix: &[u8], data: &[u8]) -> usize {
+    let cap = buf.len();
+    if pos >= cap || data.is_empty() {
+        return 0;
+    }
+    if prefix.is_empty() {
+        let n = data.len().min(cap - pos);
+        buf[pos..pos + n].copy_from_slice(&data[..n]);
+        return n;
+    }
+
+    let mut out = pos;
+    let mut prepended = false;
+    let mut i = 0;
+
+    while i < data.len() && out < cap {
+        let line_end = data[i..].iter().position(|&b| b == b'\n')
+            .map(|p| i + p + 1)
+            .unwrap_or(data.len());
+        let line = &data[i..line_end];
+        let trimmed_end = if line.ends_with(b"\n") { line.len() - 1 } else { line.len() };
+        let trimmed = &line[..trimmed_end];
+
+        if trimmed.starts_with(b"[") && trimmed.ends_with(b"]") && trimmed.len() > 2 {
+            let old_path = &trimmed[1..trimmed.len() - 1];
+            if old_path == prefix {
+                // Driver's own [name] header matches service prefix — keep as-is
+                let n = line.len().min(cap - out);
+                if n > 0 {
+                    buf[out..out + n].copy_from_slice(&line[..n]);
+                    out += n;
+                }
+            } else {
+                let needed = 1 + prefix.len() + 1 + old_path.len() + 2;
+                if out + needed <= cap {
+                    buf[out] = b'['; out += 1;
+                    buf[out..out + prefix.len()].copy_from_slice(prefix); out += prefix.len();
+                    buf[out] = b'/'; out += 1;
+                    buf[out..out + old_path.len()].copy_from_slice(old_path); out += old_path.len();
+                    buf[out] = b']'; out += 1;
+                    buf[out] = b'\n'; out += 1;
+                }
+            }
+            prepended = true;
+        } else if !trimmed.is_empty() {
+            if !prepended {
+                let hdr = 1 + prefix.len() + 2;
+                if out + hdr <= cap {
+                    buf[out] = b'['; out += 1;
+                    buf[out..out + prefix.len()].copy_from_slice(prefix); out += prefix.len();
+                    buf[out] = b']'; out += 1;
+                    buf[out] = b'\n'; out += 1;
+                }
+                prepended = true;
+            }
+            let n = line.len().min(cap - out);
+            if n > 0 {
+                buf[out..out + n].copy_from_slice(&line[..n]);
+                out += n;
+            }
+        }
+
+        i = line_end;
+    }
+
+    out - pos
+}
+
 /// Trim whitespace and newlines from a byte slice
 fn trim_bytes(b: &[u8]) -> &[u8] {
     let mut start = 0;
@@ -66,6 +140,24 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
         end -= 1;
     }
     &b[start..end]
+}
+
+/// Check if a class name matches a registered port.
+fn class_name_matches(name: &[u8], port: &ports::RegisteredPort) -> bool {
+    match name {
+        b"wifi" => port.port_class() == abi::PortClass::Network
+            && port.port_subclass() == abi::port_subclass::NET_WIFI,
+        b"nvme" => port.port_subclass() == abi::port_subclass::STORAGE_NVME,
+        b"block" => port.port_class() == abi::PortClass::Block,
+        b"net" | b"network" => port.port_class() == abi::PortClass::Network,
+        b"usb" => port.port_class() == abi::PortClass::Usb,
+        b"pcie" => port.port_class() == abi::PortClass::Pcie,
+        b"fs" | b"filesystem" => port.port_class() == abi::PortClass::Filesystem,
+        b"console" => port.port_class() == abi::PortClass::Console,
+        b"storage" => port.port_class() == abi::PortClass::StorageController,
+        b"ethernet" => port.port_class() == abi::PortClass::Ethernet,
+        _ => false,
+    }
 }
 
 // =============================================================================
@@ -288,30 +380,111 @@ impl InflightSpawn {
     }
 }
 
-/// Maximum pending info queries
-const MAX_PENDING_INFO_QUERIES: usize = 8;
+// =============================================================================
+// Pending Admin Request (unified async tracking for config + info queries)
+// =============================================================================
 
-/// A pending service info query waiting for driver response
-#[derive(Clone, Copy)]
-struct PendingInfoQuery {
-    /// Sequence ID we used when forwarding (0 = empty slot)
-    forward_seq_id: u32,
-    /// Original client's sequence ID
-    client_seq_id: u32,
-    /// Client slot to relay response to
+/// Maximum concurrent admin requests (config broadcast, config single, info query).
+const MAX_PENDING_REQUESTS: usize = 8;
+
+/// Maximum targets per admin request.
+const MAX_REQUEST_TARGETS: usize = 16;
+
+/// A pending admin request forwarded to one or more drivers.
+///
+/// Unifies PendingConfigBroadcast, blocking config single-service,
+/// and PendingInfoQuery into one tracking struct with deadlines on everything.
+///
+/// - `deadline_ns == 0` → empty slot
+/// - EOL convergence: `(eol_mask & sent_mask) == sent_mask` → all targets responded
+/// - `client_seq_id != 0` → info query (response gets seq_id rewriting)
+struct PendingAdminRequest {
+    /// Admin client slot to send response to.
     client_slot: u8,
-    /// Driver slot we forwarded to
-    driver_slot: u8,
+    /// Original client's sequence ID (nonzero for info queries needing seq_id rewrite).
+    client_seq_id: u32,
+    /// Message type: CONFIG_GET, CONFIG_SET, or QUERY_SERVICE_INFO.
+    msg_type: u16,
+    /// Bitmask of targets sent to (bit N = forward_seq_ids[N]).
+    sent_mask: u16,
+    /// Bitmask of targets that have sent EOL (or channel close).
+    eol_mask: u16,
+    /// Forward seq_ids used toward each target (0 = unused).
+    forward_seq_ids: [u32; MAX_REQUEST_TARGETS],
+    /// Accumulated response buffer (unused in relay mode).
+    response_buf: [u8; 1024],
+    /// Bytes written to response_buf (unused in relay mode).
+    response_len: u16,
+    /// Deadline in nanoseconds (0 = inactive slot).
+    deadline_ns: u64,
+    /// Relay mode: send each driver response immediately instead of accumulating.
+    relay: bool,
 }
 
-impl PendingInfoQuery {
+/// A target for an admin request: query handler slot + optional address.
+#[derive(Clone, Copy)]
+struct AdminTarget {
+    slot: usize,
+    address: [u8; 64],
+    address_len: usize,
+}
+
+impl AdminTarget {
+    const fn empty() -> Self {
+        Self { slot: 0, address: [0u8; 64], address_len: 0 }
+    }
+
+    fn with_address(slot: usize, address: &[u8]) -> Self {
+        let mut t = Self { slot, address: [0u8; 64], address_len: 0 };
+        let len = address.len().min(64);
+        let dst = &mut t.address[..len];
+        dst.copy_from_slice(&address[..len]);
+        t.address_len = len;
+        t
+    }
+
+    /// Build a path address: "/name" for routing through bus_runtime.
+    fn with_path_address(slot: usize, name: &[u8]) -> Self {
+        let mut t = Self { slot, address: [0u8; 64], address_len: 0 };
+        let nlen = name.len().min(63);
+        t.address[0] = b'/';
+        t.address[1..1 + nlen].copy_from_slice(&name[..nlen]);
+        t.address_len = 1 + nlen;
+        t
+    }
+}
+
+impl PendingAdminRequest {
     const fn empty() -> Self {
         Self {
-            forward_seq_id: 0,
-            client_seq_id: 0,
             client_slot: 0,
-            driver_slot: 0,
+            client_seq_id: 0,
+            msg_type: 0,
+            sent_mask: 0,
+            eol_mask: 0,
+            forward_seq_ids: [0; MAX_REQUEST_TARGETS],
+            response_buf: [0u8; 1024],
+            response_len: 0,
+            deadline_ns: 0,
+            relay: false,
         }
+    }
+
+    fn is_active(&self) -> bool {
+        self.deadline_ns != 0
+    }
+
+    fn is_converged(&self) -> bool {
+        (self.eol_mask & self.sent_mask) == self.sent_mask
+    }
+
+    fn matches_seq(&self, seq_id: u32) -> bool {
+        seq_id != 0 && self.forward_seq_ids.iter().any(|&s| s == seq_id)
+    }
+
+    /// Find the bit index for a given seq_id in forward_seq_ids.
+    fn seq_bit_index(&self, seq_id: u32) -> Option<usize> {
+        self.forward_seq_ids.iter().position(|&s| s == seq_id)
     }
 }
 
@@ -458,8 +631,8 @@ pub struct Devd {
     spawn_contexts: [SpawnContext; MAX_SPAWN_CONTEXTS],
     /// In-flight spawn commands: maps seq_id to port info
     inflight_spawns: [InflightSpawn; MAX_INFLIGHT_SPAWNS],
-    /// Pending info queries: maps forwarded seq_id to client info
-    pending_info_queries: [PendingInfoQuery; MAX_PENDING_INFO_QUERIES],
+    /// Pending admin requests: unified tracking for config + info queries
+    pending_requests: [PendingAdminRequest; MAX_PENDING_REQUESTS],
     /// Next sequence ID for forwarded queries
     next_forward_seq_id: u32,
     /// Log ring buffer
@@ -485,7 +658,7 @@ impl Devd {
             recent_dynamic_pids: [(0, 0); MAX_RECENT_DYNAMIC_PIDS],
             spawn_contexts: [const { SpawnContext::empty() }; MAX_SPAWN_CONTEXTS],
             inflight_spawns: [const { InflightSpawn::empty() }; MAX_INFLIGHT_SPAWNS],
-            pending_info_queries: [const { PendingInfoQuery::empty() }; MAX_PENDING_INFO_QUERIES],
+            pending_requests: [const { PendingAdminRequest::empty() }; MAX_PENDING_REQUESTS],
             next_forward_seq_id: 1,
             log_buffer: LogBuffer::new(),
             live_logging: false, // Off during boot, enable after all services ready
@@ -826,7 +999,7 @@ impl Devd {
         }
 
         // Kill child services whose link_id matches a removed port's child_link_id.
-        // Example: consoled owns "console:" port with child_link_id=5 → shell has link_id=5.
+        // Example: consoled owns "console:0" port with child_link_id=5 → shell has link_id=5.
         // When consoled dies, shell must be killed so a new one can be spawned.
         if remove_count > 0 {
             let mut children_to_kill: [(u32, usize); 8] = [(0, 0); 8];
@@ -895,6 +1068,9 @@ impl Devd {
     // =========================================================================
 
     fn handle_admin_command(&mut self, cmd: &[u8], resp: &mut [u8], from_slot: usize) -> usize {
+        if cmd.is_empty() || resp.is_empty() {
+            return 0;
+        }
         // Trim whitespace and newline
         let cmd = trim_bytes(cmd);
 
@@ -1029,6 +1205,9 @@ impl Devd {
     ///
     /// Format: `<service> GET [key]` or `<service> SET <key> <value>`
     /// Broadcast: `GET [key]` or `SET <key> <value>` (no service name)
+    /// Address: `<address> GET [key]` or `<address> SET <key> <value>`
+    ///   - Path:  `/pcie:0/nvme:0 GET channel`
+    ///   - Class: `@wifi GET`
     /// Returns number of bytes written to resp buffer.
     fn admin_config_command(&mut self, args: &[u8], resp: &mut [u8], from_slot: usize) -> usize {
         let args_str = match core::str::from_utf8(args) {
@@ -1044,45 +1223,99 @@ impl Devd {
 
         // Detect broadcast: first token is operation, not service name
         if matches!(first, "GET" | "get" | "SET" | "set") {
+            if matches!(first, "GET" | "get") {
+                let key = parts.next().unwrap_or("");
+                // Key already consumed — broadcast directly
+                return self.admin_config_broadcast_inner(msg::CONFIG_GET, key.as_bytes(), &[], resp, from_slot);
+            }
             return self.admin_config_broadcast(first, parts, resp, from_slot);
         }
 
+        // Address mode: first token starts with '/' (path) or '@' (class)
+        if first.starts_with('/') || first.starts_with('@') {
+            return self.admin_config_addressed(first, parts, resp, from_slot);
+        }
+
+        // Tree path mode: service/child/path (e.g. pcied/00:01.0:xhci)
+        // The sub-route is forwarded through the supervision tree.
+        if let Some(slash_pos) = first.find('/') {
+            let service_name = &first[..slash_pos];
+            let sub_route = &first[slash_pos..]; // includes leading '/'
+            let operation = match parts.next() {
+                Some(s) => s,
+                None => return copy_static(resp, b"ERR missing operation (GET/SET)\n"),
+            };
+            return self.admin_config_tree_path(service_name, sub_route, operation, parts, resp, from_slot);
+        }
+
+        // Service name mode (existing behavior)
         let service_name = first;
         let operation = match parts.next() {
             Some(s) => s,
             None => return copy_static(resp, b"ERR missing operation (GET/SET)\n"),
         };
 
-        // Find service by name
-        let service_idx = match self.services.find_by_name(service_name) {
-            Some(i) => i,
-            None => return copy_static(resp, b"ERR service not found\n"),
-        };
+        self.admin_config_single_service(service_name, operation, parts, resp, from_slot)
+    }
 
-        // Check service is running
-        if let Some(service) = self.services.get(service_idx) {
-            if !service.state.is_running() {
-                return copy_static(resp, b"ERR service not running\n");
+    /// Handle CONFIG for a named service (async via PendingAdminRequest).
+    ///
+    /// Finds ALL services matching the name. Direct-channel services get a
+    /// self-addressed query (local-only, no child forwarding). Tree children
+    /// get routed through their parent with `/trigger_port` addressing.
+    fn admin_config_single_service(
+        &mut self,
+        service_name: &str,
+        operation: &str,
+        mut parts: core::str::SplitN<'_, char>,
+        resp: &mut [u8],
+        from_slot: usize,
+    ) -> usize {
+        // Collect all matching services
+        let mut admin_targets = [AdminTarget::empty(); MAX_REQUEST_TARGETS];
+        let mut target_count = 0usize;
+
+        for idx in 0..self.services.count() {
+            let svc = match self.services.get(idx) {
+                Some(s) if s.name() == service_name && s.state.is_running() => s,
+                _ => continue,
+            };
+
+            // Determine driver slot and address for this service
+            if let Some(slot) = self.query_handler.find_by_service_idx(idx as u8) {
+                // Direct channel: self-address for local-only (no child forwarding)
+                let name = self.ctx_name(idx);
+                if target_count < MAX_REQUEST_TARGETS {
+                    admin_targets[target_count] = AdminTarget::with_path_address(slot, &name.0[..name.1]);
+                    target_count += 1;
+                }
+            } else {
+                // Tree child: route through parent with /trigger_port address
+                let tp = svc.trigger_port();
+                if tp.is_empty() { continue; }
+                let owner = match self.ports.get(tp).map(|p| p.owner()) {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let parent_slot = match self.query_handler.find_by_service_idx(owner) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if target_count < MAX_REQUEST_TARGETS {
+                    admin_targets[target_count] = AdminTarget::with_path_address(parent_slot, tp);
+                    target_count += 1;
+                }
             }
         }
 
-        // Find the driver's query client slot
-        let driver_slot = match self.query_handler.find_by_service_idx(service_idx as u8) {
-            Some(slot) => slot,
-            None => return copy_static(resp, b"ERR driver not connected\n"),
-        };
-
-        // Build and send the query message
-        let seq_id = self.next_forward_seq_id;
-        self.next_forward_seq_id = self.next_forward_seq_id.wrapping_add(1);
-        if self.next_forward_seq_id == 0 {
-            self.next_forward_seq_id = 1;
+        if target_count == 0 {
+            return copy_static(resp, b"ERR service not found\n");
         }
 
-        let sent = match operation {
+        let (msg_type, key, value) = match operation {
             "GET" | "get" => {
                 let key = parts.next().unwrap_or("");
-                self.send_config_query(driver_slot, seq_id, msg::CONFIG_GET, key.as_bytes(), &[])
+                (msg::CONFIG_GET, key, "")
             }
             "SET" | "set" => {
                 let key = match parts.next() {
@@ -1093,53 +1326,313 @@ impl Devd {
                     Some(v) => v,
                     None => return copy_static(resp, b"ERR missing value\n"),
                 };
-                self.send_config_query(driver_slot, seq_id, msg::CONFIG_SET, key.as_bytes(), value.as_bytes())
+                (msg::CONFIG_SET, key, value)
             }
             _ => return copy_static(resp, b"ERR unknown operation (use GET or SET)\n"),
         };
 
-        if !sent {
+        if !self.start_admin_request_multi(from_slot as u8, 0, msg_type, &admin_targets[..target_count], key.as_bytes(), value.as_bytes()) {
             return copy_static(resp, b"ERR send failed\n");
         }
 
-        // Wait for response with timeout (driver responds synchronously)
-        let mut recv_buf = [0u8; 1100];
-        let recv_len = match self.query_handler.get_mut(driver_slot) {
-            Some(client) => {
-                // 2 second timeout — driver should respond quickly for single-service queries
-                match client.channel.recv_deadline(&mut recv_buf, 2_000_000_000) {
-                    Ok(n) => n,
-                    Err(_) => return copy_static(resp, b"ERR recv timeout\n"),
+        // Return 0 — response sent asynchronously when driver responds or timeout
+        0
+    }
+
+    /// Handle tree-path CONFIG command (e.g. "pcied/00:01.0:xhci get count").
+    ///
+    /// Splits into service name + sub-route. Finds the service's direct query
+    /// channel and sends with the sub-route as an ADDRESSED path, which
+    /// bus_runtime forwards through the supervision tree.
+    fn admin_config_tree_path(
+        &mut self,
+        service_name: &str,
+        sub_route: &str,
+        operation: &str,
+        mut parts: core::str::SplitN<'_, char>,
+        resp: &mut [u8],
+        from_slot: usize,
+    ) -> usize {
+        // Find direct-channel service matching the name
+        let mut admin_targets = [AdminTarget::empty(); MAX_REQUEST_TARGETS];
+        let mut target_count = 0usize;
+
+        for idx in 0..self.services.count() {
+            let svc = match self.services.get(idx) {
+                Some(s) if s.name() == service_name && s.state.is_running() => s,
+                _ => continue,
+            };
+
+            // Only target direct-channel services (root of the tree)
+            if let Some(slot) = self.query_handler.find_by_service_idx(idx as u8) {
+                if target_count < MAX_REQUEST_TARGETS {
+                    admin_targets[target_count] = AdminTarget::with_address(slot, sub_route.as_bytes());
+                    target_count += 1;
                 }
             }
-            None => return copy_static(resp, b"ERR driver disconnected\n"),
+        }
+
+        if target_count == 0 {
+            return copy_static(resp, b"ERR service not found\n");
+        }
+
+        let (msg_type, key, value) = match operation {
+            "GET" | "get" => {
+                let key = parts.next().unwrap_or("");
+                (msg::CONFIG_GET, key, "")
+            }
+            "SET" | "set" => {
+                let key = match parts.next() {
+                    Some(k) => k,
+                    None => return copy_static(resp, b"ERR missing key\n"),
+                };
+                let value = match parts.next() {
+                    Some(v) => v,
+                    None => return copy_static(resp, b"ERR missing value\n"),
+                };
+                (msg::CONFIG_SET, key, value)
+            }
+            _ => return copy_static(resp, b"ERR unknown operation (use GET or SET)\n"),
         };
 
-        // Parse ServiceInfoResult response
-        use userlib::query::{ServiceInfoResult, error};
-        if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&recv_buf[..recv_len]) {
-            if result.result == error::OK && !info_bytes.is_empty() {
-                let len = info_bytes.len().min(resp.len());
-                resp[..len].copy_from_slice(&info_bytes[..len]);
-                len
-            } else {
-                copy_static(resp, b"ERR driver returned error\n")
-            }
+        if !self.start_admin_request_multi(from_slot as u8, 0, msg_type, &admin_targets[..target_count], key.as_bytes(), value.as_bytes()) {
+            return copy_static(resp, b"ERR send failed\n");
+        }
+
+        0
+    }
+
+    /// Get the bus_runtime name for a service (used as self-address).
+    fn ctx_name(&self, service_idx: usize) -> ([u8; 32], usize) {
+        // The bus_runtime name is the service's dynamic_name (e.g. "pcied", "consoled")
+        if let Some(svc) = self.services.get(service_idx) {
+            let name = svc.name();
+            let mut buf = [0u8; 32];
+            let len = name.len().min(32);
+            buf[..len].copy_from_slice(&name.as_bytes()[..len]);
+            (buf, len)
         } else {
-            copy_static(resp, b"ERR invalid response\n")
+            ([0u8; 32], 0)
         }
     }
 
+    /// Handle addressed CONFIG command (/path or @class routing).
+    fn admin_config_addressed(
+        &mut self,
+        address: &str,
+        mut parts: core::str::SplitN<'_, char>,
+        resp: &mut [u8],
+        from_slot: usize,
+    ) -> usize {
+        let operation = match parts.next() {
+            Some(s) => s,
+            None => return copy_static(resp, b"ERR missing operation (GET/SET)\n"),
+        };
+
+        if matches!(operation, "GET" | "get") {
+            let key = parts.next().unwrap_or("");
+            // Find target services by address, then broadcast to them
+            return self.send_addressed_query(address, operation, key, "", resp, from_slot);
+        }
+
+        if matches!(operation, "SET" | "set") {
+            let key = match parts.next() {
+                Some(k) => k,
+                None => return copy_static(resp, b"ERR missing key\n"),
+            };
+            let value = match parts.next() {
+                Some(v) => v,
+                None => return copy_static(resp, b"ERR missing value\n"),
+            };
+            return self.send_addressed_query(address, operation, key, value, resp, from_slot);
+        }
+
+        copy_static(resp, b"ERR unknown operation (use GET or SET)\n")
+    }
+
+    /// Find service indices matching an address and send config queries (async).
+    ///
+    /// Path mode (`/pcie:0/nvme:0/block:0/partd`): parse first segment as root
+    /// port, find owning service, forward remaining path as ADDRESSED route.
+    /// Class mode (`@wifi`): find all matching services, broadcast.
+    fn send_addressed_query(
+        &mut self,
+        address: &str,
+        operation: &str,
+        key: &str,
+        value: &str,
+        resp: &mut [u8],
+        from_slot: usize,
+    ) -> usize {
+        let msg_type = if matches!(operation, "GET" | "get") {
+            msg::CONFIG_GET
+        } else {
+            msg::CONFIG_SET
+        };
+
+        if address.starts_with('/') {
+            // Path mode: split first segment (root port) from remaining route
+            let path = &address[1..]; // strip leading '/'
+            let (first_seg, remaining) = match path.find('/') {
+                Some(pos) => (&path[..pos], &path[pos + 1..]),
+                None => (path, ""),
+            };
+
+            if first_seg.is_empty() {
+                return copy_static(resp, b"ERR empty path segment\n");
+            }
+
+            // First segment should contain ':' (port name) — find owning service
+            let mut target_slot = None;
+            for idx in 0..self.services.count() {
+                let svc = match self.services.get(idx) {
+                    Some(s) if s.state.is_running() => s,
+                    _ => continue,
+                };
+                let tp = svc.trigger_port();
+                let seg_bytes = first_seg.as_bytes();
+                // Match: trigger_port ends with the first segment
+                // e.g., "/pcie:0" ends with "pcie:0"
+                if tp.len() >= seg_bytes.len() {
+                    let suffix = &tp[tp.len() - seg_bytes.len()..];
+                    if suffix == seg_bytes {
+                        // Verify it's preceded by '/' or is the full path
+                        let preceded_by_slash = tp.len() > seg_bytes.len()
+                            && tp[tp.len() - seg_bytes.len() - 1] == b'/';
+                        if tp.len() == seg_bytes.len() || preceded_by_slash {
+                            if let Some(slot) = self.query_handler.find_by_service_idx(idx as u8) {
+                                target_slot = Some(slot);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let slot = match target_slot {
+                Some(s) => s,
+                None => return copy_static(resp, b"ERR no matching service\n"),
+            };
+
+            // Build AdminTarget with remaining route as address
+            let mut admin_targets = [AdminTarget::empty(); 1];
+            admin_targets[0] = AdminTarget::with_address(slot, remaining.as_bytes());
+
+            if !self.start_admin_request_multi(from_slot as u8, 0, msg_type, &admin_targets[..1], key.as_bytes(), value.as_bytes()) {
+                return copy_static(resp, b"ERR send failed\n");
+            }
+            return 0;
+        }
+
+        if address.starts_with('@') {
+            // Class mode: find all matching services
+            let (targets, count) = self.find_services_by_class(address.as_bytes());
+            if count == 0 {
+                return copy_static(resp, b"ERR no matching service\n");
+            }
+            if !self.start_admin_request(from_slot as u8, 0, msg_type, &targets[..count], key.as_bytes(), value.as_bytes(), &[]) {
+                return copy_static(resp, b"ERR send failed\n");
+            }
+            return 0;
+        }
+
+        copy_static(resp, b"ERR invalid address format\n")
+    }
+
+    /// Find query client slots matching a class address (@wifi, @storage, etc.)
+    fn find_services_by_class(&self, address: &[u8]) -> ([usize; 16], usize) {
+        let mut slots = [0usize; 16];
+        let mut count = 0;
+
+        if address.starts_with(b"@") {
+            let class_name = &address[1..];
+            self.ports.for_each(|port| {
+                if count >= 16 { return; }
+                if class_name_matches(class_name, port) {
+                    let owner = port.owner();
+                    if let Some(slot) = self.query_handler.find_by_service_idx(owner) {
+                        // Deduplicate
+                        if !slots[..count].contains(&slot) {
+                            slots[count] = slot;
+                            count += 1;
+                        }
+                    }
+                }
+            });
+        }
+
+        (slots, count)
+    }
+
+    /// Broadcast a CONFIG query to all managed drivers (async via PendingAdminRequest).
+    fn admin_config_broadcast_inner(
+        &mut self,
+        msg_type: u16,
+        key: &[u8],
+        value: &[u8],
+        resp: &mut [u8],
+        from_slot: usize,
+    ) -> usize {
+        // Collect managed driver slots
+        let mut targets = [0usize; MAX_REQUEST_TARGETS];
+        let mut count = 0;
+        for slot in 0..MAX_QUERY_CLIENTS {
+            if slot == from_slot { continue; }
+            let is_managed = match self.query_handler.get(slot) {
+                Some(c) if c.is_managed => true,
+                _ => continue,
+            };
+            if !is_managed { continue; }
+            if count < MAX_REQUEST_TARGETS {
+                targets[count] = slot;
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            return copy_static(resp, b"ERR no drivers connected\n");
+        }
+
+        if !self.start_admin_request(from_slot as u8, 0, msg_type, &targets[..count], key, value, &[]) {
+            return copy_static(resp, b"ERR send failed\n");
+        }
+
+        0
+    }
+
     /// Send a CONFIG_GET or CONFIG_SET query to a driver via its query channel.
-    fn send_config_query(&mut self, driver_slot: usize, seq_id: u32, msg_type: u16, key: &[u8], value: &[u8]) -> bool {
+    ///
+    /// When `address` is non-empty, sets ADDRESSED flag and prepends
+    /// route_len + route before the key payload.
+    fn send_config_query(
+        &mut self,
+        driver_slot: usize,
+        seq_id: u32,
+        msg_type: u16,
+        key: &[u8],
+        value: &[u8],
+        address: &[u8],
+    ) -> bool {
         let mut buf = [0u8; 256];
 
         // Build QueryHeader
-        let header = QueryHeader::new(msg_type, seq_id);
+        let mut header = QueryHeader::new(msg_type, seq_id);
+        if !address.is_empty() {
+            header.flags |= query_flags::ADDRESSED;
+        }
         let header_bytes = header.to_bytes();
         buf[..QueryHeader::SIZE].copy_from_slice(&header_bytes);
 
         let mut offset = QueryHeader::SIZE;
+
+        // Write address route if present
+        if !address.is_empty() {
+            let alen = address.len().min(255);
+            buf[offset] = alen as u8;
+            offset += 1;
+            buf[offset..offset + alen].copy_from_slice(&address[..alen]);
+            offset += alen;
+        }
 
         // Write key
         let key_len = key.len().min(buf.len() - offset - 2);
@@ -1162,17 +1655,16 @@ impl Devd {
         }
     }
 
-    /// Broadcast a CONFIG command to all connected managed drivers.
+    /// Broadcast a CONFIG command to all connected managed drivers (async).
     ///
-    /// Iterates all managed query clients, sends the config query to each,
-    /// and returns the first non-empty successful response. Each driver's
-    /// bus_runtime will propagate to its children automatically.
+    /// Parses operation/key/value from remaining args and delegates to
+    /// admin_config_broadcast_inner via PendingAdminRequest.
     fn admin_config_broadcast(
         &mut self,
         operation: &str,
         mut parts: core::str::SplitN<'_, char>,
         resp: &mut [u8],
-        exclude_slot: usize,
+        from_slot: usize,
     ) -> usize {
         let msg_type;
         let key;
@@ -1198,75 +1690,281 @@ impl Devd {
             _ => return copy_static(resp, b"ERR unknown operation\n"),
         }
 
-        // Iterate all connected managed query clients
-        // For GET: accumulate all responses (allows devc get to show everything)
-        // For SET: return first successful response
-        let mut resp_pos = 0;
+        self.admin_config_broadcast_inner(msg_type, key.as_bytes(), value.as_bytes(), resp, from_slot)
+    }
 
-        for slot in 0..MAX_QUERY_CLIENTS {
-            // Skip the requesting client's slot to avoid sending the query
-            // back to the requester (e.g. shell connects as managed because
-            // its PID matches a service entry, but it's an admin client)
-            if slot == exclude_slot { continue; }
-            let is_managed = match self.query_handler.get(slot) {
-                Some(c) if c.is_managed => true,
-                _ => continue,
-            };
-            if !is_managed { continue; }
+    /// Allocate a pending admin request slot, send queries to targets, set deadline.
+    ///
+    /// `client_seq_id` is nonzero for info queries (response gets seq_id rewriting).
+    /// `address` is the routing address for ADDRESSED queries (empty = broadcast).
+    /// Returns true if the request was started, false if no slots or no sends succeeded.
+    /// Start an admin request with per-target addresses.
+    ///
+    /// Each AdminTarget specifies a query handler slot and an optional address.
+    /// This supports multi-match queries where different targets need different routes.
+    fn start_admin_request_multi(
+        &mut self,
+        client_slot: u8,
+        client_seq_id: u32,
+        msg_type: u16,
+        targets: &[AdminTarget],
+        key: &[u8],
+        value: &[u8],
+    ) -> bool {
+        // Find empty slot
+        let req_slot = match self.pending_requests.iter().position(|r| !r.is_active()) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let mut req = PendingAdminRequest::empty();
+        req.client_slot = client_slot;
+        req.client_seq_id = client_seq_id;
+        req.msg_type = msg_type;
+
+        let mut target_idx: usize = 0;
+        for t in targets {
+            if target_idx >= MAX_REQUEST_TARGETS { break; }
 
             let seq_id = self.next_forward_seq_id;
             self.next_forward_seq_id = self.next_forward_seq_id.wrapping_add(1);
-            if self.next_forward_seq_id == 0 {
-                self.next_forward_seq_id = 1;
-            }
+            if self.next_forward_seq_id == 0 { self.next_forward_seq_id = 1; }
 
-            if !self.send_config_query(slot, seq_id, msg_type, key.as_bytes(), value.as_bytes()) {
-                continue;
-            }
+            let sent = if msg_type == msg::QUERY_SERVICE_INFO {
+                self.send_info_query_to_driver(t.slot, seq_id, key)
+            } else {
+                self.send_config_query(t.slot, seq_id, msg_type, key, value, &t.address[..t.address_len])
+            };
 
-            // Poll for response with timeout (can't use temp Mux — handle is in EventLoop)
-            let mut recv_buf = [0u8; 1100];
-            let mut recv_len = 0;
-            for _ in 0..500u32 {
-                match self.query_handler.get_mut(slot) {
-                    Some(client) => match client.channel.try_recv(&mut recv_buf) {
-                        Ok(Some(n)) => { recv_len = n; break; }
-                        Ok(None) => {} // not ready yet
-                        Err(_) => break,
-                    },
-                    None => break,
-                }
-                userlib::delay_ms(1);
-            }
-
-            if recv_len == 0 { continue; }
-
-            use userlib::query::{ServiceInfoResult, error};
-            if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&recv_buf[..recv_len]) {
-                if result.result == error::OK && !info_bytes.is_empty() {
-                    // Skip "ERR unknown key" responses
-                    if info_bytes == b"ERR unknown key\n" {
-                        continue;
-                    }
-                    // For SET, return first match immediately
-                    if msg_type == msg::CONFIG_SET {
-                        let len = info_bytes.len().min(resp.len());
-                        resp[..len].copy_from_slice(&info_bytes[..len]);
-                        return len;
-                    }
-                    // For GET, accumulate responses
-                    let len = info_bytes.len().min(resp.len() - resp_pos);
-                    resp[resp_pos..resp_pos + len].copy_from_slice(&info_bytes[..len]);
-                    resp_pos += len;
-                }
+            if sent {
+                req.forward_seq_ids[target_idx] = seq_id;
+                req.sent_mask |= 1 << target_idx;
+                target_idx += 1;
             }
         }
 
-        if resp_pos > 0 {
-            resp_pos
+        if req.sent_mask == 0 {
+            return false;
+        }
+
+        // 5s timeout — safety net only, EOL convergence is the normal path
+        req.deadline_ns = userlib::syscall::gettime() + 5_000_000_000;
+        // Relay mode for CONFIG queries: send each response immediately to avoid
+        // accumulating into a 1024-byte buffer that can silently truncate.
+        req.relay = client_seq_id == 0;
+        self.pending_requests[req_slot] = req;
+        true
+    }
+
+    /// Convenience: start an admin request with the same address for all targets.
+    fn start_admin_request(
+        &mut self,
+        client_slot: u8,
+        client_seq_id: u32,
+        msg_type: u16,
+        targets: &[usize],
+        key: &[u8],
+        value: &[u8],
+        address: &[u8],
+    ) -> bool {
+        let mut admin_targets = [AdminTarget::empty(); MAX_REQUEST_TARGETS];
+        let count = targets.len().min(MAX_REQUEST_TARGETS);
+        for i in 0..count {
+            admin_targets[i] = AdminTarget::with_address(targets[i], address);
+        }
+        self.start_admin_request_multi(client_slot, client_seq_id, msg_type, &admin_targets[..count], key, value)
+    }
+
+    /// Check if a SERVICE_INFO_RESULT matches a pending admin request.
+    ///
+    /// Returns true if the message was consumed (caller should not process further).
+    fn try_match_admin_response(&mut self, driver_slot: usize, seq_id: u32, info_bytes: &[u8], resp_flags: u16) -> bool {
+        // Find matching request
+        let req_slot = match self.pending_requests.iter().position(|r| {
+            r.is_active() && r.matches_seq(seq_id)
+        }) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Extract fields we need before taking &mut borrows on other self fields
+        let msg_type = self.pending_requests[req_slot].msg_type;
+        let is_relay = self.pending_requests[req_slot].relay;
+        let client_slot = self.pending_requests[req_slot].client_slot as usize;
+
+        // EOL detection: flag-based or string-based (backward compat for CONFIG_SET)
+        let is_eol = (resp_flags & query_flags::EOL != 0)
+            || (msg_type == msg::CONFIG_SET && info_bytes == b"ERR unknown key\n");
+
+        if !is_eol && !info_bytes.is_empty() {
+            // Annotate with trigger_port/service_name source headers
+            // e.g., "pcie:0/pcied" for a kernel bus driver
+            let mut prefix_buf = [0u8; 64];
+            let prefix_len = self.query_handler.get_service_idx(driver_slot)
+                .and_then(|idx| self.services.get(idx as usize))
+                .map(|s| {
+                    let mut pos2 = 0usize;
+                    let cap = prefix_buf.len();
+                    // Strip "/" prefix from trigger port (e.g., "/pcie:0" → "pcie:0")
+                    let tp = s.trigger_port();
+                    let short = if tp.starts_with(b"/") {
+                        &tp[1..]
+                    } else {
+                        tp
+                    };
+                    if !short.is_empty() {
+                        let tlen = short.len().min(cap.saturating_sub(1));
+                        prefix_buf[..tlen].copy_from_slice(&short[..tlen]);
+                        pos2 += tlen;
+                        if pos2 < cap {
+                            prefix_buf[pos2] = b'/';
+                            pos2 += 1;
+                        }
+                    }
+                    let n = s.name().as_bytes();
+                    let nlen = n.len().min(cap.saturating_sub(pos2));
+                    prefix_buf[pos2..pos2 + nlen].copy_from_slice(&n[..nlen]);
+                    pos2 + nlen
+                })
+                .unwrap_or(0);
+
+            if is_relay {
+                // Relay mode: annotate and send immediately instead of accumulating.
+                let mut tmp = [0u8; 576];
+                let written = append_with_source(
+                    &mut tmp, 0,
+                    &prefix_buf[..prefix_len], info_bytes,
+                );
+                if written > 0 {
+                    self.send_chunked_response(client_slot, &tmp[..written]);
+                    // Track that we relayed data (response_buf unused, but response_len
+                    // marks "data was sent" for complete_admin_request error detection).
+                    self.pending_requests[req_slot].response_len = 1;
+                }
+            } else {
+                let req = &mut self.pending_requests[req_slot];
+                let pos = req.response_len as usize;
+                let written = append_with_source(
+                    &mut req.response_buf, pos,
+                    &prefix_buf[..prefix_len], info_bytes,
+                );
+                req.response_len += written as u16;
+            }
+        }
+
+        // Set EOL bit for this target
+        let req = &mut self.pending_requests[req_slot];
+        if is_eol {
+            if let Some(bit_idx) = req.seq_bit_index(seq_id) {
+                req.eol_mask |= 1 << bit_idx;
+            }
+        }
+
+        if req.is_converged() {
+            self.complete_admin_request(req_slot);
+        }
+
+        true
+    }
+
+    /// Complete a converged or timed-out admin request — send response to client.
+    fn complete_admin_request(&mut self, req_slot: usize) {
+        let req = &self.pending_requests[req_slot];
+        let client_slot = req.client_slot as usize;
+        let client_seq_id = req.client_seq_id;
+        let response_len = req.response_len as usize;
+        let is_relay = req.relay;
+
+        if client_seq_id != 0 {
+            // Info query: build ServiceInfoResult with client's original seq_id.
+            // Uses respond_info chunking (DevdClient handles IPC limit).
+            use userlib::query::{ServiceInfoResult, ErrorResponse, error};
+
+            if response_len > 0 {
+                let client_resp = ServiceInfoResult::success(client_seq_id, response_len as u16);
+                let mut resp_buf = [0u8; 1100];
+                if let Some(len) = client_resp.write_to(&mut resp_buf, &req.response_buf[..response_len]) {
+                    if let Some(client) = self.query_handler.get_mut(client_slot) {
+                        let _ = client.channel.send(&resp_buf[..len]);
+                    }
+                }
+            } else {
+                if let Some(client) = self.query_handler.get_mut(client_slot) {
+                    let resp = ErrorResponse::new(client_seq_id, error::NOT_FOUND);
+                    let _ = client.channel.send(&resp.to_bytes());
+                }
+            }
+        } else if is_relay {
+            // Relay mode: data was already sent immediately. Nothing to accumulate.
+            // If no data was relayed at all, send error.
+            if response_len == 0 {
+                if let Some(client) = self.query_handler.get_mut(client_slot) {
+                    let _ = client.channel.send(b"ERR key not found\n");
+                }
+            }
         } else {
-            copy_static(resp, b"ERR key not found\n")
+            // Config query: send raw response or error text.
+            // IPC max payload is 576 bytes — chunk on line boundaries if needed.
+            if response_len > 0 {
+                // Copy response out of pending_requests to satisfy borrow checker
+                let mut resp_copy = [0u8; 1024];
+                resp_copy[..response_len].copy_from_slice(&req.response_buf[..response_len]);
+                self.send_chunked_response(client_slot, &resp_copy[..response_len]);
+            } else {
+                if let Some(client) = self.query_handler.get_mut(client_slot) {
+                    let _ = client.channel.send(b"ERR key not found\n");
+                }
+            }
         }
+
+        self.pending_requests[req_slot] = PendingAdminRequest::empty();
+    }
+
+    /// Send a raw text response to a query client, chunked on line boundaries
+    /// to stay within the 576-byte IPC message limit.
+    fn send_chunked_response(&mut self, client_slot: usize, response: &[u8]) {
+        const MAX_CHUNK: usize = 576;
+        let mut offset = 0;
+        while offset < response.len() {
+            let remaining = response.len() - offset;
+            let chunk_end = if remaining <= MAX_CHUNK {
+                response.len()
+            } else {
+                // Find last newline within MAX_CHUNK bytes
+                response[offset..offset + MAX_CHUNK].iter().rposition(|&b| b == b'\n')
+                    .map(|p| offset + p + 1)
+                    .unwrap_or(offset + MAX_CHUNK)
+            };
+            if let Some(client) = self.query_handler.get_mut(client_slot) {
+                let _ = client.channel.send(&response[offset..chunk_end]);
+            }
+            offset = chunk_end;
+        }
+    }
+
+    /// Drain expired admin requests — called from event loop.
+    /// Timeout is a safety net — should not fire in normal operation.
+    fn drain_expired_requests(&mut self) {
+        let now = userlib::syscall::gettime();
+        for i in 0..MAX_PENDING_REQUESTS {
+            if self.pending_requests[i].is_active() && self.pending_requests[i].deadline_ns <= now {
+                uerror!("devd", "admin_request_timeout"; slot = i);
+                self.complete_admin_request(i);
+            }
+        }
+    }
+
+    /// Send a QUERY_SERVICE_INFO to a driver with a forwarded seq_id.
+    fn send_info_query_to_driver(&mut self, driver_slot: usize, seq_id: u32, name: &[u8]) -> bool {
+        use userlib::query::QueryServiceInfo;
+        let forward_req = QueryServiceInfo::new(seq_id);
+        let mut forward_buf = [0u8; 128];
+        if let Some(len) = forward_req.write_to(&mut forward_buf, name) {
+            if let Some(client) = self.query_handler.get_mut(driver_slot) {
+                return client.channel.send(&forward_buf[..len]).is_ok();
+            }
+        }
+        false
     }
 
     fn handle_process_exit(&mut self, handle: ObjHandle) {
@@ -1523,79 +2221,148 @@ impl Devd {
         }
     }
 
+    /// Check if a msg_type value belongs to a known binary protocol message.
+    /// Binary msg_types live in ranges 0x01xx-0x05xx. Text admin commands
+    /// start with ASCII letters (e.g., 'C'=0x43) giving msg_type >= 0x4100.
+    fn is_known_binary_msg(msg_type: u16) -> bool {
+        let high = msg_type >> 8;
+        high >= 1 && high <= 5
+    }
+
+    /// Extract the ADDRESSED source path from a raw message.
+    ///
+    /// If the ADDRESSED flag is set, extracts the route bytes into `path`
+    /// and produces a stripped copy (header with ADDRESSED cleared + payload)
+    /// in `stripped`. If not ADDRESSED, path is empty and stripped = original.
+    ///
+    /// Returns (path_len, stripped_len).
+    /// Strip ADDRESSED route bytes from a binary message.
+    /// Returns (route_len, stripped_message_len).
+    fn strip_addressed_route(
+        buf: &[u8],
+        stripped: &mut [u8; 512],
+    ) -> (usize, usize) {
+        if buf.len() < QueryHeader::SIZE {
+            let len = buf.len().min(512);
+            stripped[..len].copy_from_slice(&buf[..len]);
+            return (0, len);
+        }
+
+        let flags = u16::from_le_bytes([buf[2], buf[3]]);
+        if flags & query_flags::ADDRESSED == 0 {
+            let len = buf.len().min(512);
+            stripped[..len].copy_from_slice(&buf[..len]);
+            return (0, len);
+        }
+
+        let route_len = if buf.len() > QueryHeader::SIZE {
+            buf[QueryHeader::SIZE] as usize
+        } else {
+            0
+        };
+
+        // Build stripped: header (ADDRESSED cleared) + payload (skip route)
+        let payload_start = QueryHeader::SIZE + 1 + route_len;
+        stripped[..QueryHeader::SIZE].copy_from_slice(&buf[..QueryHeader::SIZE]);
+        let new_flags = flags & !query_flags::ADDRESSED;
+        stripped[2..4].copy_from_slice(&new_flags.to_le_bytes());
+
+        if payload_start < buf.len() {
+            let payload = &buf[payload_start..];
+            let plen = payload.len().min(512 - QueryHeader::SIZE);
+            stripped[QueryHeader::SIZE..QueryHeader::SIZE + plen].copy_from_slice(&payload[..plen]);
+            (route_len, QueryHeader::SIZE + plen)
+        } else {
+            (route_len, QueryHeader::SIZE)
+        }
+    }
+
     /// Dispatch a query message by type.  Shared by handle_query_client_event
     /// (Mux-driven) and try_immediate_query_read (accept-driven).
     fn dispatch_query_message(&mut self, slot: usize, buf: &[u8]) {
         use userlib::query::{msg, QueryHeader};
 
-        let msg_type = QueryHeader::from_bytes(buf).map(|h| h.msg_type);
+        // Strip ADDRESSED route from binary messages. Text admin commands
+        // (e.g., "CONFIG GET key\n") parse as QueryHeader with garbage
+        // msg_type and may coincidentally have the ADDRESSED bit set.
+        let raw_msg_type = if buf.len() >= 2 {
+            u16::from_le_bytes([buf[0], buf[1]])
+        } else {
+            0
+        };
+        let is_binary = Self::is_known_binary_msg(raw_msg_type);
+
+        let mut stripped = [0u8; 512];
+        let dispatch_len;
+        if is_binary {
+            let (_, slen) = Self::strip_addressed_route(buf, &mut stripped);
+            dispatch_len = slen;
+        } else {
+            let len = buf.len().min(512);
+            stripped[..len].copy_from_slice(&buf[..len]);
+            dispatch_len = len;
+        }
+
+        let dispatch_buf = &stripped[..dispatch_len];
+        let msg_type = QueryHeader::from_bytes(dispatch_buf).map(|h| h.msg_type);
 
         match msg_type {
             Some(msg::REGISTER_PORT_INFO) => {
-                self.handle_port_register_info_msg(slot, buf);
+                self.handle_port_register_info_msg(slot, dispatch_buf);
             }
             Some(msg::STATE_CHANGE) => {
-                self.handle_state_change_msg(slot, buf);
+                self.handle_state_change_msg(slot, dispatch_buf);
             }
             Some(msg::SPAWN_ACK) => {
-                self.handle_spawn_ack_msg(slot, buf);
+                self.handle_spawn_ack_msg(slot, dispatch_buf);
             }
             Some(msg::GET_SPAWN_CONTEXT) => {
-                self.handle_get_spawn_context(slot, buf);
+                self.handle_get_spawn_context(slot, dispatch_buf);
             }
             Some(msg::QUERY_PORT) => {
-                self.handle_query_port(slot, buf);
+                self.handle_query_port(slot, dispatch_buf);
             }
             Some(msg::UPDATE_PORT_SHMEM_ID) => {
-                self.handle_update_port_shmem_id(slot, buf);
+                self.handle_update_port_shmem_id(slot, dispatch_buf);
             }
             Some(msg::SET_PORT_STATE) => {
-                self.handle_set_port_state(slot, buf);
+                self.handle_set_port_state(slot, dispatch_buf);
             }
             Some(msg::LIST_PORTS) => {
-                self.handle_list_ports(slot, buf);
+                self.handle_list_ports(slot, dispatch_buf);
             }
             Some(msg::LIST_SERVICES) => {
-                self.handle_list_services(slot, buf);
+                self.handle_list_services(slot, dispatch_buf);
             }
             Some(msg::QUERY_SERVICE_INFO) => {
-                self.handle_query_service_info(slot, buf);
+                self.handle_query_service_info(slot, dispatch_buf);
             }
             Some(msg::SERVICE_INFO_RESULT) => {
-                self.handle_service_info_result(slot, buf);
+                self.handle_service_info_result(slot, dispatch_buf);
             }
             Some(msg::LOG_MESSAGE) => {
-                self.handle_log_message(slot, buf);
+                self.handle_log_message(slot, dispatch_buf);
             }
             Some(msg::LOG_QUERY) => {
-                self.handle_log_query(slot, buf);
+                self.handle_log_query(slot, dispatch_buf);
             }
             Some(msg::LOG_CONTROL) => {
-                self.handle_log_control(slot, buf);
+                self.handle_log_control(slot, dispatch_buf);
+            }
+            Some(msg::CONFIG_GET) | Some(msg::CONFIG_SET) => {
+                // CONFIG_GET/SET should never arrive at devd — they are sent
+                // BY devd TO managed drivers. Ignore to prevent binary payloads
+                // from being misinterpreted as text admin commands.
             }
             Some(_) => {
-                // Unknown binary message type — delegate to query_handler
+                // Unknown binary message type — try as text admin command.
+                // (QueryHeader::from_bytes returns Some for ANY >=8 byte buffer,
+                // so text commands like "CONFIG GET key\n" land here too)
                 let mut response_buf = [0u8; MSG_BUFFER_SIZE];
-                let response_len = self.query_handler.handle_message(
-                    slot,
-                    buf,
-                    &self.services,
-                    &mut response_buf,
-                );
-
-                if let Some(resp_len) = response_len {
+                let resp_len = self.handle_admin_command(dispatch_buf, &mut response_buf, slot);
+                if resp_len > 0 {
                     if let Some(client) = self.query_handler.get_mut(slot) {
                         let _ = client.channel.send(&response_buf[..resp_len]);
-                    }
-                } else {
-                    // Not a known binary message — fall through to text admin
-                    // (QueryHeader::from_bytes returns Some for ANY >=8 byte buffer,
-                    // so text commands like "CONFIG GET key\n" land here too)
-                    let resp_len = self.handle_admin_command(buf, &mut response_buf, slot);
-                    if resp_len > 0 {
-                        if let Some(client) = self.query_handler.get_mut(slot) {
-                            let _ = client.channel.send(&response_buf[..resp_len]);
-                        }
                     }
                 }
             }
@@ -1603,7 +2370,7 @@ impl Devd {
                 // Buffer too short for QueryHeader — try as text admin command
                 // (e.g. "LIST\n" which is < 8 bytes)
                 let mut resp_buf = [0u8; MSG_BUFFER_SIZE];
-                let resp_len = self.handle_admin_command(buf, &mut resp_buf, slot);
+                let resp_len = self.handle_admin_command(dispatch_buf, &mut resp_buf, slot);
                 if resp_len > 0 {
                     if let Some(client) = self.query_handler.get_mut(slot) {
                         let _ = client.channel.send(&resp_buf[..resp_len]);
@@ -1640,8 +2407,8 @@ impl Devd {
 
         // Send response
         let result_code = match result {
-            Ok(()) => {
-                // Port registered successfully — set to Claimed and fire rules.
+            Ok(port_id) => {
+                // Port registered successfully. Store the source path
                 // Port registered but not yet Ready. Rules fire when the
                 // driver sends STATE_CHANGE(Ready) — see handle_state_change_msg.
                 error::OK
@@ -2167,9 +2934,9 @@ impl Devd {
         }
     }
 
-    /// Handle QUERY_SERVICE_INFO - forward to the named service's driver
+    /// Handle QUERY_SERVICE_INFO - forward to the named service's driver (async)
     fn handle_query_service_info(&mut self, client_slot: usize, buf: &[u8]) {
-        use userlib::query::{QueryHeader, QueryServiceInfo, ErrorResponse, error};
+        use userlib::query::{QueryServiceInfo, ErrorResponse, error};
 
         // Parse the request
         let (req, name_bytes) = match QueryServiceInfo::from_bytes(buf) {
@@ -2210,7 +2977,6 @@ impl Devd {
         let driver_slot = match self.query_handler.find_by_service_idx(service_idx as u8) {
             Some(slot) => slot,
             None => {
-                // Driver not connected to query port
                 if let Some(client) = self.query_handler.get_mut(client_slot) {
                     let resp = ErrorResponse::new(client_seq_id, error::NO_DRIVER);
                     let _ = client.channel.send(&resp.to_bytes());
@@ -2219,114 +2985,22 @@ impl Devd {
             }
         };
 
-        // Allocate a forward sequence ID
-        let forward_seq_id = self.next_forward_seq_id;
-        self.next_forward_seq_id = self.next_forward_seq_id.wrapping_add(1);
-        if self.next_forward_seq_id == 0 {
-            self.next_forward_seq_id = 1;
-        }
-
-        // Store pending query for response routing
-        let mut stored = false;
-        for pending in &mut self.pending_info_queries {
-            if pending.forward_seq_id == 0 {
-                *pending = PendingInfoQuery {
-                    forward_seq_id,
-                    client_seq_id,
-                    client_slot: client_slot as u8,
-                    driver_slot: driver_slot as u8,
-                };
-                stored = true;
-                break;
-            }
-        }
-
-        if !stored {
-            uerror!("devd", "pending_query_full";);
+        // Use unified admin request with client_seq_id for info query response rewriting
+        let targets = [driver_slot];
+        if !self.start_admin_request(client_slot as u8, client_seq_id, msg::QUERY_SERVICE_INFO, &targets, name_bytes, &[], &[]) {
             if let Some(client) = self.query_handler.get_mut(client_slot) {
                 let resp = ErrorResponse::new(client_seq_id, error::DEVICE_ERROR);
                 let _ = client.channel.send(&resp.to_bytes());
             }
-            return;
-        }
-
-        // Forward the query to the driver with our forwarded seq_id
-        let forward_req = QueryServiceInfo::new(forward_seq_id);
-        let mut forward_buf = [0u8; 128];
-        if let Some(len) = forward_req.write_to(&mut forward_buf, name_bytes) {
-            if let Some(driver_client) = self.query_handler.get_mut(driver_slot) {
-                if let Err(_e) = driver_client.channel.send(&forward_buf[..len]) {
-                    uerror!("devd", "query_forward_failed";);
-                    // Clear the pending entry
-                    for pending in &mut self.pending_info_queries {
-                        if pending.forward_seq_id == forward_seq_id {
-                            *pending = PendingInfoQuery::empty();
-                            break;
-                        }
-                    }
-                    if let Some(client) = self.query_handler.get_mut(client_slot) {
-                        let resp = ErrorResponse::new(client_seq_id, error::NO_DRIVER);
-                        let _ = client.channel.send(&resp.to_bytes());
-                    }
-                }
-            }
         }
     }
 
-    /// Handle SERVICE_INFO_RESULT - relay response to original client
+    /// Handle SERVICE_INFO_RESULT - unified matching via PendingAdminRequest
     fn handle_service_info_result(&mut self, driver_slot: usize, buf: &[u8]) {
-        use userlib::query::{QueryHeader, ServiceInfoResult, ErrorResponse, error};
+        use userlib::query::ServiceInfoResult;
 
-        // Parse the response
-        let header = match QueryHeader::from_bytes(buf) {
-            Some(h) => h,
-            None => {
-                uerror!("devd", "invalid_svc_info_result"; slot = driver_slot as u32);
-                return;
-            }
-        };
-
-        let forward_seq_id = header.seq_id;
-
-        // Find the pending query by forward_seq_id
-        let mut pending_info: Option<(u32, u8)> = None;
-        for pending in &mut self.pending_info_queries {
-            if pending.forward_seq_id == forward_seq_id && pending.driver_slot == driver_slot as u8 {
-                pending_info = Some((pending.client_seq_id, pending.client_slot));
-                *pending = PendingInfoQuery::empty();
-                break;
-            }
-        }
-
-        let (client_seq_id, client_slot) = match pending_info {
-            Some(info) => info,
-            None => {
-                uerror!("devd", "no_pending_query"; seq = forward_seq_id);
-                return;
-            }
-        };
-
-        // Parse the full response to rewrite the seq_id
         if let Some((resp, info_bytes)) = ServiceInfoResult::from_bytes(buf) {
-            // Build response with original client's seq_id
-            let client_resp = if resp.result == error::OK {
-                ServiceInfoResult::success(client_seq_id, info_bytes.len() as u16)
-            } else {
-                ServiceInfoResult::new(client_seq_id, resp.result)
-            };
-
-            let mut resp_buf = [0u8; 1100];
-            if let Some(len) = client_resp.write_to(&mut resp_buf, info_bytes) {
-                if let Some(client) = self.query_handler.get_mut(client_slot as usize) {
-                    let _ = client.channel.send(&resp_buf[..len]);
-                }
-            }
-        } else {
-            // Couldn't parse - send error
-            if let Some(client) = self.query_handler.get_mut(client_slot as usize) {
-                let resp = ErrorResponse::new(client_seq_id, error::DEVICE_ERROR);
-                let _ = client.channel.send(&resp.to_bytes());
-            }
+            self.try_match_admin_response(driver_slot, resp.header.seq_id, info_bytes, resp.header.flags);
         }
     }
 
@@ -2603,11 +3277,11 @@ impl Devd {
         port_info: &abi::PortInfo,
         owner_idx: u8,
         shmem_id: u32,
-    ) -> Result<(), SysError> {
+    ) -> Result<u8, SysError> {
         use crate::ports::PortRegistry;
 
         // Register the port with unified PortInfo
-        self.ports.register_with_port_info(port_info, owner_idx, shmem_id)?;
+        let port_id = self.ports.register_with_port_info(port_info, owner_idx, shmem_id)?;
 
         let port_name = port_info.name_bytes();
 
@@ -2629,7 +3303,7 @@ impl Devd {
             }
         }
 
-        Ok(())
+        Ok(port_id)
     }
 
     /// Fire spawn rules for a port that transitioned to Claimed.
@@ -2744,8 +3418,14 @@ impl Devd {
             }
             spawn_ctx.kv_count = kv_n as u8;
 
-            if let Some(seq_id) = self.query_handler.send_spawn_child_with_context(
-                owner_idx, rule.driver.as_bytes(), port_name, rule.caps, Some(&spawn_ctx),
+            // Build full spawn path from port's parent chain.
+            // resolve_path walks parent_port_id links to build e.g. "pcie:0/nvme:0"
+            let mut spawn_path = [0u8; 96];
+            let spawn_path_len = self.ports.resolve_path(port_id, &mut spawn_path);
+
+            if let Some(seq_id) = self.query_handler.send_spawn_child_with_path(
+                owner_idx, rule.driver.as_bytes(), port_name, rule.caps,
+                Some(&spawn_ctx), &spawn_path[..spawn_path_len],
             ) {
                 self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver, rule.caps, link_id, port_id);
             } else {
@@ -3058,6 +3738,9 @@ impl Devd {
             // Poll all query clients for pending messages.  Handles channels
             // that could not be added to the Mux due to the 16-slot limit.
             self.poll_query_clients();
+
+            // Complete any timed-out admin requests
+            self.drain_expired_requests();
 
             // Poll restart timers via wall-clock comparison.  Catches timers
             // that couldn't be added to the Mux (16-handle limit).

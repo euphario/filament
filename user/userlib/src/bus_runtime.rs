@@ -22,7 +22,7 @@ use crate::bus::{
 use crate::bus_block::ShmemBlockPort;
 use crate::devd::{DevdClient, DevdCommand};
 use crate::ipc::{Channel, Mux, MuxFilter};
-use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, port_type as qport_type, error as query_error};
+use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, query_flags, port_type as qport_type, error as query_error};
 use crate::syscall::{self, Handle, LogLevel};
 
 // ============================================================================
@@ -129,6 +129,14 @@ struct ChildEntry {
     pid: u32,
     /// Cached spawn context for answering GET_SPAWN_CONTEXT.
     ctx: ChildSpawnCtx,
+    /// Binary name of the child (e.g., "pcied", "nvmed").
+    /// Used for building full paths in config response annotation.
+    binary_name: [u8; 16],
+    binary_name_len: u8,
+    /// True once the child has sent a bus protocol message (GET_SPAWN_CONTEXT etc.).
+    /// Non-bus children (e.g., shell) never speak the bus protocol and are
+    /// skipped for config query forwarding.
+    bus_active: bool,
 }
 
 /// A request forwarded from child to devd, awaiting response relay.
@@ -139,6 +147,79 @@ struct ForwardedRequest {
     child_idx: u8,
     /// Original sequence ID from the child.
     child_seq_id: u32,
+}
+
+// ============================================================================
+// Pending Config Query (async forwarding)
+// ============================================================================
+
+/// Maximum concurrent config queries being forwarded to children.
+const MAX_PENDING_CONFIG: usize = 4;
+
+/// Who originated the config query (for routing the response back).
+#[derive(Clone, Copy)]
+enum ConfigQueryOrigin {
+    /// Query came from devd (respond via respond_info).
+    Devd { seq_id: u32 },
+    /// Query came from parent via supervision channel (respond via child channel).
+    /// (This variant is used when bus_runtime itself is a child and received
+    /// a forwarded config query from its parent.)
+    Parent { seq_id: u32 },
+}
+
+/// A config query being forwarded to children, awaiting convergence.
+///
+/// The runtime sends the query to all children simultaneously and waits
+/// for each child to respond (either with a real response or EOL).
+/// When all children have responded, the aggregated result is sent back
+/// to the originator.
+struct PendingConfigQuery {
+    /// Who asked and where to send the response.
+    origin: ConfigQueryOrigin,
+    /// CONFIG_GET or CONFIG_SET.
+    msg_type: u16,
+    /// Bitmask of children the query was sent to (bit N = child index N).
+    sent_mask: u8,
+    /// Bitmask of children that have responded with EOL (or channel close).
+    eol_mask: u8,
+    /// Sequence ID used when sending to children.
+    child_seq_id: u32,
+    /// Accumulated response buffer (for GET: concatenated, for SET: first match).
+    response_buf: [u8; 1024],
+    /// Bytes written to response_buf.
+    response_len: u16,
+    /// Deadline sequence for timeout (safety net — should not fire normally).
+    deadline_ns: u64,
+    /// Bytes of local prefix in response_buf.
+    local_prefix_len: u16,
+    /// Relay mode: annotate and forward each child response immediately
+    /// instead of aggregating into response_buf. Used by @topology to avoid
+    /// the 576-byte IPC message limit on deep trees.
+    relay: bool,
+}
+
+impl PendingConfigQuery {
+    fn is_converged(&self) -> bool {
+        (self.eol_mask & self.sent_mask) == self.sent_mask
+    }
+}
+
+// ============================================================================
+// Route Action (message routing through supervision tree)
+// ============================================================================
+
+/// Routing decision for an inbound ADDRESSED message.
+enum RouteAction<'a> {
+    /// No route or unaddressed — handle locally (includes child forwarding for CONFIG).
+    Local,
+    /// Addressed to self — handle locally only, NO child forwarding.
+    LocalOnly,
+    /// Route targets a specific child — forward only.
+    ForwardTo(usize, &'a [u8]),
+    /// Route matches this node AND children — handle locally + forward to all.
+    LocalAndForward(&'a [u8]),
+    /// Route doesn't match this node — forward to all children.
+    ForwardAll(&'a [u8]),
 }
 
 // ============================================================================
@@ -252,6 +333,12 @@ struct RuntimeCtx {
     forwarded: [Option<ForwardedRequest>; MAX_FORWARDED],
     /// Next sequence ID for forwarded requests (high-bit range).
     forwarded_next_seq: u32,
+    /// Config queries being forwarded to children (async, non-blocking).
+    pending_config: [Option<PendingConfigQuery>; MAX_PENDING_CONFIG],
+    /// Next sequence ID for config queries to children (0xC000_xxxx range).
+    config_query_next_seq: u32,
+    /// Set on first respond_info failure — suppresses subsequent klog spam.
+    devd_channel_broken: bool,
 }
 
 impl RuntimeCtx {
@@ -280,6 +367,9 @@ impl RuntimeCtx {
             child_count: 0,
             forwarded: [const { None }; MAX_FORWARDED],
             forwarded_next_seq: 0x4000_0001,
+            pending_config: [const { None }; MAX_PENDING_CONFIG],
+            config_query_next_seq: 0xC000_0001,
+            devd_channel_broken: false,
         }
     }
 
@@ -292,20 +382,42 @@ impl RuntimeCtx {
         seq
     }
 
+    /// Send an end-of-line response (this node has no answer and no children).
+    fn respond_info_eol(&mut self, seq_id: u32) -> Result<(), BusError> {
+        let result = self.devd
+            .respond_info_eol(seq_id)
+            .map_err(|_| BusError::Internal);
+        if result.is_err() && !self.devd_channel_broken {
+            self.devd_channel_broken = true;
+            let mut msg = [0u8; 64];
+            let prefix = b"[bus] devd channel broken (driver=";
+            msg[..prefix.len()].copy_from_slice(prefix);
+            let nlen = self.name_len.min(msg.len() - prefix.len() - 1);
+            msg[prefix.len()..prefix.len() + nlen].copy_from_slice(&self.name[..nlen]);
+            msg[prefix.len() + nlen] = b')';
+            syscall::klog(LogLevel::Error, &msg[..prefix.len() + nlen + 1]);
+        }
+        result
+    }
+
     /// Return the nearest deadline in ms from now, or 0 if no pending deadlines.
     ///
     /// Used to set the Mux timeout so the event loop wakes up to fire
     /// expired deadline callbacks even if no I/O event arrives.
     fn nearest_deadline_ms(&self) -> u32 {
-        if self.pending_count == 0 {
-            return 0;
-        }
         let now = syscall::gettime();
         let mut nearest: u64 = u64::MAX;
         for slot in &self.pending {
             if let Some(req) = slot {
                 if req.deadline_ns > 0 && req.deadline_ns < nearest {
                     nearest = req.deadline_ns;
+                }
+            }
+        }
+        for slot in &self.pending_config {
+            if let Some(pcq) = slot {
+                if pcq.deadline_ns > 0 && pcq.deadline_ns < nearest {
+                    nearest = pcq.deadline_ns;
                 }
             }
         }
@@ -357,6 +469,62 @@ impl RuntimeCtx {
                 }
             }
         }
+    }
+
+    /// Allocate a config query sequence ID (0xC000_xxxx range).
+    fn alloc_config_seq(&mut self) -> u32 {
+        let seq = self.config_query_next_seq;
+        self.config_query_next_seq = self.config_query_next_seq.wrapping_add(1);
+        if self.config_query_next_seq < 0xC000_0001 {
+            self.config_query_next_seq = 0xC000_0001;
+        }
+        seq
+    }
+
+    /// Find a pending config query by the seq_id used toward children.
+    fn find_pending_config(&mut self, child_seq: u32) -> Option<usize> {
+        for (i, slot) in self.pending_config.iter().enumerate() {
+            if let Some(pcq) = slot {
+                if pcq.child_seq_id == child_seq {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a free pending config query slot.
+    fn alloc_pending_config_slot(&self) -> Option<usize> {
+        self.pending_config.iter().position(|s| s.is_none())
+    }
+
+    /// Set relay mode on the most recently allocated pending config slot.
+    fn set_last_pending_relay(&mut self) {
+        // Find the most recently filled slot (last non-None)
+        for slot in self.pending_config.iter_mut().rev() {
+            if let Some(pcq) = slot {
+                pcq.relay = true;
+                return;
+            }
+        }
+    }
+
+    /// Check and fire any expired config query deadlines.
+    fn drain_expired_config(&mut self) -> [Option<usize>; MAX_PENDING_CONFIG] {
+        let mut expired = [None; MAX_PENDING_CONFIG];
+        let mut count = 0;
+        let now = syscall::gettime();
+        for (i, slot) in self.pending_config.iter().enumerate() {
+            if let Some(pcq) = slot {
+                if pcq.deadline_ns > 0 && pcq.deadline_ns <= now {
+                    if count < MAX_PENDING_CONFIG {
+                        expired[count] = Some(i);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        expired
     }
 
     /// Register the devd channel with the Mux.
@@ -585,9 +753,20 @@ impl BusCtx for RuntimeCtx {
     }
 
     fn respond_info(&mut self, seq_id: u32, info: &[u8]) -> Result<(), BusError> {
-        self.devd
+        let result = self.devd
             .respond_info(seq_id, info)
-            .map_err(|_| BusError::Internal)
+            .map_err(|_| BusError::Internal);
+        if result.is_err() && !self.devd_channel_broken {
+            self.devd_channel_broken = true;
+            let mut msg = [0u8; 64];
+            let prefix = b"[bus] devd channel broken (driver=";
+            msg[..prefix.len()].copy_from_slice(prefix);
+            let nlen = self.name_len.min(msg.len() - prefix.len() - 1);
+            msg[prefix.len()..prefix.len() + nlen].copy_from_slice(&self.name[..nlen]);
+            msg[prefix.len() + nlen] = b')';
+            syscall::klog(LogLevel::Error, &msg[..prefix.len() + nlen + 1]);
+        }
+        result
     }
 
     fn register_port_with_info(
@@ -595,10 +774,29 @@ impl BusCtx for RuntimeCtx {
         info: &abi::PortInfo,
         shmem_id: u32,
     ) -> Result<(), BusError> {
+        // Auto-set parent_port_id from spawn context if the driver didn't set it.
+        // This builds the correct port hierarchy in devd's registry.
+        let mut info_copy;
+        let info_to_send = if info.parent_port_id == 0xFF {
+            if let SpawnCtxCache::Cached(ref ctx) = self.spawn_ctx {
+                if ctx.port_id != 0xFF {
+                    info_copy = *info;
+                    info_copy.parent_port_id = ctx.port_id;
+                    &info_copy
+                } else {
+                    info
+                }
+            } else {
+                info
+            }
+        } else {
+            info
+        };
+
         // Register with devd via supervision channel
         // Port starts in Safe state — supervisor will fire rules
         self.devd
-            .register_port_info(info, shmem_id)
+            .register_port_info(info_to_send, shmem_id)
             .map_err(|_| BusError::Internal)?;
         Ok(())
     }
@@ -733,6 +931,46 @@ fn devd_command_to_bus_msg(cmd: &DevdCommand) -> Option<BusMsg> {
 // DriverRuntime
 // ============================================================================
 
+/// Routing decision for the current dispatch cycle.
+///
+/// Set before `dispatch_raw_command()`, consumed during dispatch, reset after.
+/// Single source of truth — replaces the old routed_child/skip_children/pending_child_route fields.
+enum RoutingMode {
+    /// Normal dispatch: local handling + forward to all children.
+    Broadcast,
+    /// Addressed to self: local handling only, no children.
+    LocalOnly,
+    /// Route to specific child (terminal — no remaining route).
+    ForwardTo { child: usize },
+    /// Route to specific child with remaining sub-route.
+    ForwardWithRoute { child: usize, route: [u8; 128], route_len: usize },
+}
+
+impl RoutingMode {
+    /// Target child index for routed modes.
+    fn target_child(&self) -> Option<usize> {
+        match self {
+            RoutingMode::ForwardTo { child } | RoutingMode::ForwardWithRoute { child, .. } => Some(*child),
+            _ => None,
+        }
+    }
+
+    /// True if this is a routed mode (ForwardTo or ForwardWithRoute).
+    fn is_routed(&self) -> bool {
+        matches!(self, RoutingMode::ForwardTo { .. } | RoutingMode::ForwardWithRoute { .. })
+    }
+
+    /// True if local handling should be skipped (ForwardWithRoute has sub-route = skip self).
+    fn skip_local(&self) -> bool {
+        matches!(self, RoutingMode::ForwardTo { .. } | RoutingMode::ForwardWithRoute { .. })
+    }
+
+    /// True if we should forward to children (everything except LocalOnly).
+    fn forward_to_children(&self) -> bool {
+        !matches!(self, RoutingMode::LocalOnly)
+    }
+}
+
 /// The main runtime that manages the event loop and dispatches to Driver.
 ///
 /// Uses a Mux-based event loop: blocks until an event source fires,
@@ -741,6 +979,8 @@ fn devd_command_to_bus_msg(cmd: &DevdCommand) -> Option<BusMsg> {
 pub struct DriverRuntime<D: Driver> {
     driver: D,
     ctx: RuntimeCtx,
+    /// Current routing decision (set before dispatch, reset after).
+    routing: RoutingMode,
 }
 
 impl<D: Driver> DriverRuntime<D> {
@@ -749,6 +989,7 @@ impl<D: Driver> DriverRuntime<D> {
         Self {
             driver,
             ctx: RuntimeCtx::new(devd, mux, name),
+            routing: RoutingMode::Broadcast,
         }
     }
 
@@ -798,6 +1039,17 @@ impl<D: Driver> DriverRuntime<D> {
                 self.driver.deadline(expired[i], &mut self.ctx);
             }
 
+            // Complete any timed-out config queries
+            let expired_configs = self.ctx.drain_expired_config();
+            for idx_opt in &expired_configs {
+                if let Some(slot) = idx_opt {
+                    // Timeout is a safety net — should not fire in normal operation.
+                    // Log ERROR so we can investigate stuck queries.
+                    syscall::klog(LogLevel::Error, b"[bus] config query timeout (EOL missing)");
+                    self.complete_config_query(*slot);
+                }
+            }
+
             // Block until next event or nearest deadline
             let timeout_ms = self.ctx.nearest_deadline_ms();
             let event = if timeout_ms > 0 {
@@ -828,13 +1080,44 @@ impl<D: Driver> DriverRuntime<D> {
                 match self.ctx.devd.raw_recv(&mut raw_buf) {
                     Ok(Some(n)) if n >= QueryHeader::SIZE => {
                         if !self.try_relay_to_child(&raw_buf, n) {
-                            // Not a forwarded response — parse as normal command
-                            match DevdClient::parse_command_buf(&raw_buf[..n]) {
-                                Ok(Some(cmd)) => {
-                                    self.dispatch_devd_command(cmd);
+                            // Routing layer: check if message is ADDRESSED
+                            let action = self.route_inbound(&raw_buf[..n]);
+                            match action {
+                                RouteAction::Local => {
+                                    // No route or resolved to this node
+                                    self.dispatch_raw_command(&raw_buf[..n]);
                                 }
-                                Ok(None) => {}
-                                Err(_) => {}
+                                RouteAction::LocalOnly => {
+                                    // Addressed to self — handle locally, no children
+                                    self.routing = RoutingMode::LocalOnly;
+                                    self.dispatch_raw_command(&raw_buf[..n]);
+                                    self.routing = RoutingMode::Broadcast;
+                                }
+                                RouteAction::ForwardTo(child_idx, child_route) => {
+                                    // Route to a specific child — dispatch with routing
+                                    // set so config forward targets only this child.
+                                    if child_route.is_empty() {
+                                        self.routing = RoutingMode::ForwardTo { child: child_idx };
+                                    } else {
+                                        let mut route = [0u8; 128];
+                                        let rlen = child_route.len().min(128);
+                                        route[..rlen].copy_from_slice(&child_route[..rlen]);
+                                        self.routing = RoutingMode::ForwardWithRoute {
+                                            child: child_idx, route, route_len: rlen,
+                                        };
+                                    }
+                                    self.dispatch_raw_command(&raw_buf[..n]);
+                                    self.routing = RoutingMode::Broadcast;
+                                }
+                                RouteAction::LocalAndForward(child_route) => {
+                                    // Handle locally AND forward to all children
+                                    self.dispatch_raw_command(&raw_buf[..n]);
+                                    self.forward_to_all_children(&raw_buf[..n], child_route);
+                                }
+                                RouteAction::ForwardAll(child_route) => {
+                                    // Forward to all children only
+                                    self.forward_to_all_children(&raw_buf[..n], child_route);
+                                }
                             }
                         }
                     }
@@ -912,6 +1195,156 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
+    /// Strip any ADDRESSED route from raw bytes and dispatch as a command.
+    ///
+    /// This is the entry point for locally-handled messages after routing.
+    fn dispatch_raw_command(&mut self, raw: &[u8]) {
+        // Try path-based forwarding on the RAW message (route intact).
+        // If the message has an ADDRESSED route and the first segment
+        // matches a child's port name, forward the message with the
+        // consumed segment removed.
+        if self.try_forward_spawn_to_child(raw) {
+            return;
+        }
+
+        // Strip route for local dispatch
+        let (stripped, slen) = Self::strip_route(raw);
+
+        match DevdClient::parse_command_buf(&stripped[..slen]) {
+            Ok(Some(cmd)) => {
+                self.dispatch_devd_command(cmd);
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        }
+    }
+
+    /// Try to forward a SpawnChild to the correct child using path-based routing.
+    ///
+    /// Operates on the RAW message (with ADDRESSED route intact). Walks the
+    /// route segments using the same `:` disambiguation as `route_inbound`:
+    /// - Segments with `:` are port names → match children or skip self's port
+    /// - Segments without `:` are driver names → verify matches self, skip
+    ///
+    /// Returns true if forwarded (caller should skip normal dispatch).
+    fn try_forward_spawn_to_child(&mut self, raw: &[u8]) -> bool {
+        if raw.len() < QueryHeader::SIZE {
+            return false;
+        }
+
+        // Quick check: is this a SPAWN_CHILD message?
+        let msg_type = u16::from_le_bytes([raw[0], raw[1]]);
+        if msg_type != query_msg::SPAWN_CHILD {
+            return false;
+        }
+
+        // Check ADDRESSED flag — if not set, no path routing
+        let flags = u16::from_le_bytes([raw[2], raw[3]]);
+        if flags & query_flags::ADDRESSED == 0 {
+            return false;
+        }
+
+        // Extract route
+        if raw.len() <= QueryHeader::SIZE {
+            return false;
+        }
+        let route_len = raw[QueryHeader::SIZE] as usize;
+        let route_start = QueryHeader::SIZE + 1;
+        let route_end = route_start + route_len;
+        if route_end > raw.len() || route_len == 0 {
+            return false;
+        }
+        let route = &raw[route_start..route_end];
+
+        // Walk segments — skip self's trigger port and driver name
+        let mut path = if !route.is_empty() && route[0] == b'/' {
+            &route[1..]
+        } else {
+            route
+        };
+
+        loop {
+            if path.is_empty() {
+                return false;
+            }
+
+            let (segment, rest) = match path.iter().position(|&b| b == b'/') {
+                Some(pos) => (&path[..pos], &path[pos + 1..]),
+                None => (path, &[] as &[u8]),
+            };
+
+            if segment.is_empty() {
+                return false;
+            }
+
+            if segment.iter().any(|&b| b == b':') {
+                // Port segment — try child match first
+                if let Some(child_idx) = self.find_child_by_port_name(segment) {
+                    return self.forward_spawn_message(child_idx, rest, raw, flags, route_end);
+                } else if self.matches_own_trigger_port(segment) {
+                    path = rest;
+                    continue;
+                } else {
+                    return false;
+                }
+            } else {
+                // Driver name — if matches self, skip
+                if self.matches_own_driver_name(segment) {
+                    path = rest;
+                    continue;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Forward a SpawnChild message to a child with a rewritten route.
+    fn forward_spawn_message(
+        &self,
+        child_idx: usize,
+        remaining: &[u8],
+        raw: &[u8],
+        flags: u16,
+        route_end: usize,
+    ) -> bool {
+        let payload = &raw[route_end..];
+        let mut fwd = [0u8; 576];
+
+        if remaining.is_empty() {
+            // Last segment consumed — send without ADDRESSED flag
+            fwd[..QueryHeader::SIZE].copy_from_slice(&raw[..QueryHeader::SIZE]);
+            let new_flags = flags & !query_flags::ADDRESSED;
+            fwd[2..4].copy_from_slice(&new_flags.to_le_bytes());
+            let plen = payload.len().min(576 - QueryHeader::SIZE);
+            fwd[QueryHeader::SIZE..QueryHeader::SIZE + plen].copy_from_slice(&payload[..plen]);
+            let total = QueryHeader::SIZE + plen;
+            if let Some(entry) = &self.ctx.children[child_idx] {
+                let _ = entry.channel.send(&fwd[..total]);
+            }
+        } else {
+            // More segments remain — rewrite route to remaining path
+            let new_route_len = remaining.len();
+            if new_route_len > 255 {
+                return false;
+            }
+            fwd[..QueryHeader::SIZE].copy_from_slice(&raw[..QueryHeader::SIZE]);
+            // ADDRESSED stays set
+            fwd[QueryHeader::SIZE] = new_route_len as u8;
+            let new_route_start = QueryHeader::SIZE + 1;
+            fwd[new_route_start..new_route_start + new_route_len].copy_from_slice(remaining);
+            let out_payload_start = new_route_start + new_route_len;
+            let plen = payload.len().min(576 - out_payload_start);
+            fwd[out_payload_start..out_payload_start + plen].copy_from_slice(&payload[..plen]);
+            let total = out_payload_start + plen;
+            if let Some(entry) = &self.ctx.children[child_idx] {
+                let _ = entry.channel.send(&fwd[..total]);
+            }
+        }
+
+        true
+    }
+
     /// Dispatch a DevdCommand to the driver.
     ///
     /// All commands go through BusMsg — single conversion path.
@@ -942,7 +1375,7 @@ impl<D: Driver> DriverRuntime<D> {
             // Fallback: spawn without channel
             let (result, child_pid) = if let Some((parent_end, pid)) = spawn_result {
                 // Store ChildEntry for relay
-                let stored = self.store_child_entry(parent_end, pid, filter, context.as_ref());
+                let stored = self.store_child_entry(parent_end, pid, filter, context.as_ref(), &binary[..*binary_len]);
                 if !stored {
                     syscall::klog(LogLevel::Warn, b"[bus] no child slot");
                 }
@@ -976,60 +1409,131 @@ impl<D: Driver> DriverRuntime<D> {
 
             bus_msg::CONFIG_GET => {
                 let key = bus_msg.read_null_terminated(0);
+
+                // Special: @topology forces every driver to respond with driver=<name>.
+                // Forwarded to children via normal config path — source annotation
+                // builds the full path through the supervision tree.
+                if key == b"@topology" {
+                    self.handle_topology_query(bus_msg.seq_id);
+                    return;
+                }
+
                 let mut buf = [0u8; 512];
+                let skip_local = self.routing.skip_local();
+                let forward_to_children = self.ctx.child_count > 0
+                    && self.routing.forward_to_children();
+
+                // Note: no self-annotation here. The PARENT always annotates
+                // our response with [trigger_port/driver_name] via append_with_source.
 
                 if key.is_empty() {
-                    // Summary: build_config_summary already formats key=value\n
-                    let len = build_config_summary(&self.driver, &mut buf);
-                    let child_len = if self.ctx.child_count > 0 {
-                        self.forward_config_to_children(
-                            query_msg::CONFIG_GET, key, &[], &mut buf[len..],
-                        )
-                    } else { 0 };
-                    let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len + child_len]);
-                } else {
-                    // Specific key: try exact match first
-                    let mut val_tmp = [0u8; 256];
-                    let vlen = self.driver.config_get(key, &mut val_tmp);
+                    // Summary: send local config immediately, relay children's
+                    // responses individually. Relay mode avoids accumulating a
+                    // response that might exceed the 576-byte IPC message limit.
+                    let len = if skip_local { 0 } else {
+                        build_config_summary(&self.driver, &mut buf)
+                    };
 
-                    if vlen > 0 {
-                        // Exact match — format: key=value
-                        let len = format_kv(key, &val_tmp[..vlen], &mut buf);
+                    // Send own local config immediately (before children)
+                    if len > 0 {
                         let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+                    }
+
+                    if forward_to_children {
+                        let origin = ConfigQueryOrigin::Devd { seq_id: bus_msg.seq_id };
+                        // Empty local_prefix — we already sent local data above.
+                        // Relay mode: each child's response is annotated and
+                        // forwarded immediately instead of accumulated.
+                        if self.start_config_forward(
+                            origin, query_msg::CONFIG_GET, key, &[], &[],
+                        ) {
+                            self.ctx.set_last_pending_relay();
+                            return; // EOL sent when children converge
+                        }
+                        // Fallback: no children sent — send EOL now
+                        let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
                     } else {
-                        // No exact match — try prefix: return all keys starting with prefix
-                        let plen = build_prefix_matches(&self.driver, key, &mut buf);
-                        // Also propagate to children
-                        let child_len = if self.ctx.child_count > 0 {
-                            self.forward_config_to_children(
-                                query_msg::CONFIG_GET, key, &[], &mut buf[plen..],
-                            )
-                        } else { 0 };
-                        let total = plen + child_len;
-                        let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..total]);
+                        // No children (leaf) or routed-to-child with no children
+                        let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
+                    }
+                } else {
+                    if !skip_local {
+                        // Specific key: try exact match first
+                        let mut val_tmp = [0u8; 256];
+                        let vlen = self.driver.config_get(key, &mut val_tmp);
+
+                        if vlen > 0 {
+                            // Exact match — respond immediately + EOL
+                            let len = format_kv(key, &val_tmp[..vlen], &mut buf);
+                            let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+                            let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
+                        } else {
+                            // No exact match — try prefix, then forward to children
+                            let plen = build_prefix_matches(&self.driver, key, &mut buf);
+                            // Send local prefix matches immediately
+                            if plen > 0 {
+                                let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..plen]);
+                            }
+                            if forward_to_children {
+                                let origin = ConfigQueryOrigin::Devd { seq_id: bus_msg.seq_id };
+                                // Relay mode: forward each child's response individually
+                                if self.start_config_forward(
+                                    origin, query_msg::CONFIG_GET, key, &[], &[],
+                                ) {
+                                    self.ctx.set_last_pending_relay();
+                                    return; // EOL sent when children converge
+                                }
+                            }
+                            let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
+                        }
+                    } else {
+                        // Routed to child — forward query to targeted child only
+                        if forward_to_children {
+                            let origin = ConfigQueryOrigin::Devd { seq_id: bus_msg.seq_id };
+                            if !self.start_config_forward(
+                                origin, query_msg::CONFIG_GET, key, &[], &[],
+                            ) {
+                                let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
+                            }
+                        } else {
+                            let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
+                        }
                     }
                 }
             }
 
             bus_msg::CONFIG_SET => {
                 let (key, value) = bus_msg.parse_config_kv();
-                let mut buf = [0u8; 128];
+                let mut buf = [0u8; 512];
+                let skip_local = self.routing.skip_local();
+                let forward_to_children = self.ctx.child_count > 0
+                    && self.routing.forward_to_children();
 
                 let keys = self.driver.config_keys();
-                let valid = keys.iter().any(|k| k.name == key && k.writable);
+                let valid = !skip_local && keys.iter().any(|k| k.name == key && k.writable);
 
-                let len = if valid {
-                    self.driver.config_set(key, value, &mut buf, &mut self.ctx)
-                } else if keys.iter().any(|k| k.name == key) {
-                    copy_static(&mut buf, b"ERR read-only key\n")
-                } else if self.ctx.child_count > 0 {
-                    // Unknown key — propagate to children
-                    self.forward_config_to_children(query_msg::CONFIG_SET, key, value, &mut buf)
+                if valid {
+                    let len = self.driver.config_set(key, value, &mut buf, &mut self.ctx);
+                    let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+                    let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
+                } else if !skip_local && keys.iter().any(|k| k.name == key) {
+                    let len = copy_static(&mut buf, b"ERR read-only key\n");
+                    let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+                    let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
+                } else if forward_to_children {
+                    // Unknown key or routed to child — forward asynchronously
+                    let origin = ConfigQueryOrigin::Devd { seq_id: bus_msg.seq_id };
+                    if self.start_config_forward(
+                        origin, query_msg::CONFIG_SET, key, value, &[],
+                    ) {
+                        self.ctx.set_last_pending_relay();
+                        return; // EOL sent when children converge
+                    }
+                    let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
                 } else {
-                    copy_static(&mut buf, b"ERR unknown key\n")
-                };
-
-                let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+                    // Leaf node or local-only, no match — send EOL
+                    let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
+                }
             }
 
             // --- Driver-handled: everything else ---
@@ -1046,24 +1550,58 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
-    /// Forward a CONFIG_GET/SET to children, return first non-empty response.
+    /// Start an async config forward to all children.
     ///
-    /// Sends the query to each child's supervision channel (which the child's
-    /// bus_runtime processes synchronously as a devd command). Returns the number
-    /// of bytes written to `out`, or 0 if no child knew the key.
-    fn forward_config_to_children(
+    /// Sends the query to all children simultaneously and stores a
+    /// PendingConfigQuery. When all children respond (or timeout), the
+    /// accumulated result is sent to the originator.
+    ///
+    /// `local_prefix` is pre-filled into the response buffer (e.g. local
+    /// config_get results that should precede child results).
+    ///
+    /// Returns true if the async forward was started, false on failure
+    /// (caller should respond immediately with fallback).
+    fn start_config_forward(
         &mut self,
+        origin: ConfigQueryOrigin,
         msg_type: u16,
         key: &[u8],
         value: &[u8],
-        out: &mut [u8],
-    ) -> usize {
+        local_prefix: &[u8],
+    ) -> bool {
+        // Allocate pending slot
+        let slot = match self.ctx.alloc_pending_config_slot() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Allocate seq_id for children
+        let child_seq = self.ctx.alloc_config_seq();
+
         // Build the query message (same wire format as devd → driver)
-        let mut qbuf = [0u8; 256];
-        let header = QueryHeader::new(msg_type, 1); // seq_id=1 (arbitrary, synchronous)
+        let mut qbuf = [0u8; 384];
+        let mut header = QueryHeader::new(msg_type, child_seq);
+
+        // If there's a pending child route, set ADDRESSED flag and include route
+        let (route_data, route_len) = match &self.routing {
+            RoutingMode::ForwardWithRoute { route, route_len, .. } => (&route[..*route_len], *route_len),
+            _ => (&[] as &[u8], 0),
+        };
+        if route_len > 0 {
+            header.flags |= query_flags::ADDRESSED;
+        }
+
         let hdr_bytes = header.to_bytes();
         qbuf[..QueryHeader::SIZE].copy_from_slice(&hdr_bytes);
         let mut offset = QueryHeader::SIZE;
+
+        // Insert route bytes (route_len + route_data) if ADDRESSED
+        if route_len > 0 {
+            qbuf[offset] = route_len as u8;
+            offset += 1;
+            qbuf[offset..offset + route_len].copy_from_slice(route_data);
+            offset += route_len;
+        }
 
         // Write key (null-terminated for CONFIG_GET, null-separated for CONFIG_SET)
         let klen = key.len().min(qbuf.len() - offset - 2);
@@ -1071,7 +1609,6 @@ impl<D: Driver> DriverRuntime<D> {
         offset += klen;
 
         if msg_type == query_msg::CONFIG_SET {
-            // Null separator between key and value
             qbuf[offset] = 0;
             offset += 1;
             let vlen = value.len().min(qbuf.len() - offset - 1);
@@ -1079,56 +1616,449 @@ impl<D: Driver> DriverRuntime<D> {
             offset += vlen;
         }
 
-        // Try each child sequentially
-        for i in 0..MAX_CHILDREN {
-            let child = match &mut self.ctx.children[i] {
-                Some(c) => c,
-                None => continue,
-            };
-
-            // Send query
-            if child.channel.send(&qbuf[..offset]).is_err() { continue; }
-
-            // Poll for response — use try_recv loop (not recv_deadline/recv)
-            // because the child channel is already in the EventLoop Mux.
-            // Drain non-ServiceInfoResult messages (logs, state changes) that
-            // may be buffered ahead of the config response.
-            let mut recv_buf = [0u8; 1100];
-            let mut got_response = false;
-            for _ in 0..30u32 {
-                match child.channel.try_recv(&mut recv_buf) {
-                    Ok(Some(n)) => {
-                        if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&recv_buf[..n]) {
-                            if result.header.msg_type == query_msg::SERVICE_INFO_RESULT {
-                                if !info_bytes.is_empty() {
-                                    if msg_type == query_msg::CONFIG_SET && info_bytes == b"ERR unknown key\n" {
-                                        break; // child didn't know, try next
-                                    }
-                                    let len = info_bytes.len().min(out.len());
-                                    out[..len].copy_from_slice(&info_bytes[..len]);
-                                    return len;
-                                }
-                                got_response = true;
-                                break; // empty response — child didn't know
-                            }
-                            // else: parsed as SIR but wrong msg_type, skip
-                        }
-                        // Unparseable message — skip and keep polling
-                    }
-                    Ok(None) => {}
-                    Err(_) => break,
+        // Send to children — either one targeted child or all children
+        let mut sent_mask: u8 = 0;
+        if let Some(target) = self.routing.target_child() {
+            // Routed: send only to the targeted child
+            if let Some(entry) = &mut self.ctx.children[target] {
+                if entry.channel.send(&qbuf[..offset]).is_ok() {
+                    sent_mask |= 1 << target;
                 }
-                crate::delay_ms(1);
             }
-
-            if got_response { continue; } // empty response, try next child
+        } else {
+            for i in 0..MAX_CHILDREN {
+                if let Some(entry) = &mut self.ctx.children[i] {
+                    // Skip children that haven't spoken the bus protocol
+                    // (e.g., shell) — they won't respond with EOL.
+                    if !entry.bus_active { continue; }
+                    if entry.channel.send(&qbuf[..offset]).is_ok() {
+                        sent_mask |= 1 << i;
+                    }
+                }
+            }
         }
 
-        // No child knew the key
-        if msg_type == query_msg::CONFIG_SET {
-            copy_static(out, b"ERR unknown key\n")
+        if sent_mask == 0 {
+            return false;
+        }
+
+        // Pre-fill response buffer with local data
+        let mut response_buf = [0u8; 1024];
+        let local_len = local_prefix.len().min(1024);
+        response_buf[..local_len].copy_from_slice(&local_prefix[..local_len]);
+
+        // 5s timeout — safety net only, EOL convergence is the normal path
+        let deadline_ns = syscall::gettime() + 5_000_000_000;
+
+        self.ctx.pending_config[slot] = Some(PendingConfigQuery {
+            origin,
+            msg_type,
+            sent_mask,
+            eol_mask: 0,
+            child_seq_id: child_seq,
+            response_buf,
+            response_len: local_len as u16,
+            deadline_ns,
+            local_prefix_len: local_len as u16,
+            relay: false,
+        });
+
+        true
+    }
+
+    /// Complete a converged or timed-out config query — send response to originator.
+    fn complete_config_query(&mut self, slot: usize) {
+        let mut pcq = match self.ctx.pending_config[slot].take() {
+            Some(q) => q,
+            None => return,
+        };
+
+        let seq_id = match pcq.origin {
+            ConfigQueryOrigin::Devd { seq_id } => seq_id,
+            ConfigQueryOrigin::Parent { seq_id } => seq_id,
+        };
+
+        if pcq.response_len > 0 {
+            let _ = self.ctx.respond_info(seq_id, &pcq.response_buf[..pcq.response_len as usize]);
+        }
+        // Always send EOL after data (or as sole response if no data).
+        // This signals the parent that this subtree is complete.
+        let _ = self.ctx.respond_info_eol(seq_id);
+    }
+
+    /// Handle a SERVICE_INFO_RESULT from a child that matches a pending config query.
+    ///
+    /// Returns true if the message was consumed (caller should not forward it).
+    fn handle_config_response(&mut self, child_idx: usize, seq_id: u32, info_bytes: &[u8], resp_flags: u16) -> bool {
+        let slot = match self.ctx.find_pending_config(seq_id) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Extract fields from pcq without holding mutable borrow across respond_info
+        let (is_eol, is_relay, origin_seq) = match self.ctx.pending_config[slot].as_ref() {
+            Some(pcq) => {
+                let eol = (resp_flags & query_flags::EOL != 0)
+                    || (pcq.msg_type == query_msg::CONFIG_SET && info_bytes == b"ERR unknown key\n");
+                let oseq = match pcq.origin {
+                    ConfigQueryOrigin::Devd { seq_id } => seq_id,
+                    ConfigQueryOrigin::Parent { seq_id } => seq_id,
+                };
+                (eol, pcq.relay, oseq)
+            }
+            None => return false,
+        };
+
+        if !is_eol && !info_bytes.is_empty() {
+            // Build prefix: "port_name/binary_name" for [source] headers
+            let mut child_prefix_buf = [0u8; 96];
+            let child_prefix_len = match &self.ctx.children[child_idx] {
+                Some(c) => {
+                    let plen = c.ctx.port_name_len as usize;
+                    let blen = c.binary_name_len as usize;
+                    let mut pos2 = 0;
+                    child_prefix_buf[..plen].copy_from_slice(&c.ctx.port_name[..plen]);
+                    pos2 += plen;
+                    if blen > 0 {
+                        child_prefix_buf[pos2] = b'/';
+                        pos2 += 1;
+                        child_prefix_buf[pos2..pos2 + blen].copy_from_slice(&c.binary_name[..blen]);
+                        pos2 += blen;
+                    }
+                    pos2
+                }
+                None => 0,
+            };
+            let child_prefix = &child_prefix_buf[..child_prefix_len];
+
+            if is_relay {
+                // Relay mode: annotate and send immediately, don't accumulate.
+                let mut tmp = [0u8; 512];
+                let written = append_with_source(&mut tmp, 0, child_prefix, info_bytes);
+                if written > 0 {
+                    let _ = self.ctx.respond_info(origin_seq, &tmp[..written]);
+                }
+            } else if let Some(pcq) = self.ctx.pending_config[slot].as_mut() {
+                let pos = pcq.response_len as usize;
+                let written = append_with_source(
+                    &mut pcq.response_buf, pos, child_prefix, info_bytes,
+                );
+                pcq.response_len += written as u16;
+            }
+        }
+
+        // Set EOL bit for this child when EOL received
+        if let Some(pcq) = self.ctx.pending_config[slot].as_mut() {
+            if is_eol {
+                pcq.eol_mask |= 1 << child_idx;
+            }
+        }
+
+        let converged = self.ctx.pending_config[slot]
+            .as_ref()
+            .map_or(false, |pcq| pcq.is_converged());
+        if converged {
+            self.complete_config_query(slot);
+        }
+
+        true
+    }
+
+    /// Handle @topology query: every driver responds with driver=<name>.
+    ///
+    /// Each node sends its own response immediately (small, fits IPC limit),
+    /// then forwards @topology to children. Children's responses are relayed
+    /// individually with source annotation — NOT aggregated. This avoids the
+    /// 576-byte IPC message limit that would truncate deep trees.
+    ///
+    /// EOL is sent only after all children have EOL'd.
+    fn handle_topology_query(&mut self, seq_id: u32) {
+        let name = &self.ctx.name[..self.ctx.name_len];
+        let mut buf = [0u8; 64];
+        let len = format_kv(b"driver", name, &mut buf);
+
+        // Send own identity immediately
+        let _ = self.ctx.respond_info(seq_id, &buf[..len]);
+
+        let has_bus_children = self.ctx.children.iter()
+            .any(|c| c.as_ref().map_or(false, |e| e.bus_active));
+
+        if has_bus_children {
+            // Forward @topology to children, track EOL convergence only (no aggregation).
+            // Pass empty local_prefix — we already sent our own data above.
+            let origin = ConfigQueryOrigin::Devd { seq_id };
+            if self.start_config_forward(
+                origin, query_msg::CONFIG_GET, b"@topology", &[], &[],
+            ) {
+                // Enable relay mode on the just-allocated pending slot.
+                // Relay mode annotates and forwards each child response immediately
+                // instead of aggregating (avoids 576B IPC limit on deep trees).
+                self.ctx.set_last_pending_relay();
+                return; // EOL sent when children converge
+            }
+        }
+
+        // Leaf or no children — send EOL now
+        let _ = self.ctx.respond_info_eol(seq_id);
+    }
+
+    // ========================================================================
+    // Routing Layer (ADDRESSED messages through supervision tree)
+    // ========================================================================
+
+    /// Make a routing decision for an inbound message.
+    ///
+    /// If the message has the ADDRESSED flag, extracts the route and decides
+    /// whether to handle locally, forward to a specific child, or broadcast.
+    /// Returns `Local` for non-ADDRESSED messages (legacy/broadcast).
+    /// Route an inbound ADDRESSED message using `:` disambiguation.
+    ///
+    /// Segments containing `:` are port names → match against children.
+    /// Segments without `:` are driver names → match against self.
+    ///
+    /// Both full paths (`/pcie:0/pcied/nvme:0/nvmed`) and short paths
+    /// (`/pcie:0/nvme:0`) work: port segments match children, driver name
+    /// segments match self and get skipped.
+    fn route_inbound<'a>(&self, raw: &'a [u8]) -> RouteAction<'a> {
+        if raw.len() < QueryHeader::SIZE {
+            return RouteAction::Local;
+        }
+
+        let header = match QueryHeader::from_bytes(raw) {
+            Some(h) => h,
+            None => return RouteAction::Local,
+        };
+
+        // Not addressed — handle as broadcast/legacy
+        if header.flags & query_flags::ADDRESSED == 0 {
+            return RouteAction::Local;
+        }
+
+        // Extract route: route_len(1) + route(N) after QueryHeader
+        let route_start = QueryHeader::SIZE;
+        if raw.len() <= route_start {
+            return RouteAction::Local;
+        }
+
+        let route_len = raw[route_start] as usize;
+        let route_data_start = route_start + 1;
+        if route_len == 0 || raw.len() < route_data_start + route_len {
+            return RouteAction::Local;
+        }
+
+        let route = &raw[route_data_start..route_data_start + route_len];
+
+        if route[0] == b'@' {
+            // Class routing: @name — match against all nodes
+            return RouteAction::LocalAndForward(route);
+        }
+
+        // Path routing — walk segments using : disambiguation
+        let mut path = if route[0] == b'/' { &route[1..] } else { route };
+
+        loop {
+            if path.is_empty() {
+                // Path exhausted = broadcast to subtree
+                return RouteAction::Local;
+            }
+
+            // Split at next '/'
+            let (segment, rest) = match path.iter().position(|&b| b == b'/') {
+                Some(pos) => (&path[..pos], &path[pos + 1..]),
+                None => (path, &[] as &[u8]),
+            };
+
+            if segment.iter().any(|&b| b == b':') {
+                // PORT segment — find child on that port
+                if let Some(child_idx) = self.find_child_by_port_name(segment) {
+                    return if rest.is_empty() {
+                        RouteAction::ForwardTo(child_idx, &[])
+                    } else {
+                        RouteAction::ForwardTo(child_idx, rest)
+                    };
+                } else if self.matches_own_trigger_port(segment) {
+                    // Matches our own trigger port — skip, continue routing
+                    path = rest;
+                    continue;
+                } else {
+                    // Unknown port
+                    return RouteAction::Local;
+                }
+            } else {
+                // DRIVER NAME segment — verify matches self, then skip
+                if self.matches_own_driver_name(segment) {
+                    if rest.is_empty() {
+                        return RouteAction::LocalOnly;
+                    } else {
+                        path = rest;
+                        continue;
+                    }
+                } else {
+                    // Name mismatch
+                    return RouteAction::Local;
+                }
+            }
+        }
+    }
+
+    /// Find a child by port name segment.
+    fn find_child_by_port_name(&self, segment: &[u8]) -> Option<usize> {
+        for i in 0..MAX_CHILDREN {
+            if let Some(entry) = &self.ctx.children[i] {
+                let name = &entry.ctx.port_name[..entry.ctx.port_name_len as usize];
+                if name == segment {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if a segment matches this driver's own binary name.
+    fn matches_own_driver_name(&self, segment: &[u8]) -> bool {
+        let name = &self.ctx.name[..self.ctx.name_len];
+        name == segment
+    }
+
+    /// Check if a segment matches this driver's own trigger port name.
+    fn matches_own_trigger_port(&self, segment: &[u8]) -> bool {
+        match &self.ctx.spawn_ctx {
+            SpawnCtxCache::Cached(ctx) => {
+                let pn = ctx.port_name();
+                // Try exact match
+                if pn == segment { return true; }
+                // Try stripped "/" prefix (kernel bus ports are "/pcie:0" etc.)
+                if pn.starts_with(b"/") && &pn[1..] == segment {
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Build a message with ADDRESSED flag and route prepended for forwarding.
+    ///
+    /// Takes the original raw message, strips the existing route, and prepends
+    /// the new child route. If `child_route` is empty, removes ADDRESSED flag.
+    fn build_routed_message(
+        raw: &[u8],
+        child_route: &[u8],
+        out: &mut [u8; 576],
+    ) -> usize {
+        if raw.len() < QueryHeader::SIZE {
+            return 0;
+        }
+
+        // Find payload start (skip past header + existing route)
+        let has_addressed = {
+            let flags = u16::from_le_bytes([raw[2], raw[3]]);
+            flags & query_flags::ADDRESSED != 0
+        };
+
+        let payload_start = if has_addressed && raw.len() > QueryHeader::SIZE {
+            let route_len = raw[QueryHeader::SIZE] as usize;
+            QueryHeader::SIZE + 1 + route_len
+        } else {
+            QueryHeader::SIZE
+        };
+
+        let payload = &raw[payload_start..];
+
+        if child_route.is_empty() {
+            // No route for child — send without ADDRESSED flag
+            out[..QueryHeader::SIZE].copy_from_slice(&raw[..QueryHeader::SIZE]);
+            // Clear ADDRESSED flag
+            let flags = u16::from_le_bytes([out[2], out[3]]) & !query_flags::ADDRESSED;
+            out[2..4].copy_from_slice(&flags.to_le_bytes());
+            let plen = payload.len().min(out.len() - QueryHeader::SIZE);
+            out[QueryHeader::SIZE..QueryHeader::SIZE + plen].copy_from_slice(&payload[..plen]);
+            QueryHeader::SIZE + plen
+        } else {
+            // Build: header(ADDRESSED) + route_len + route + payload
+            out[..QueryHeader::SIZE].copy_from_slice(&raw[..QueryHeader::SIZE]);
+            // Ensure ADDRESSED flag is set
+            let flags = u16::from_le_bytes([out[2], out[3]]) | query_flags::ADDRESSED;
+            out[2..4].copy_from_slice(&flags.to_le_bytes());
+
+            let mut pos = QueryHeader::SIZE;
+            let route_len = child_route.len().min(255);
+            out[pos] = route_len as u8;
+            pos += 1;
+            out[pos..pos + route_len].copy_from_slice(&child_route[..route_len]);
+            pos += route_len;
+
+            let plen = payload.len().min(out.len() - pos);
+            out[pos..pos + plen].copy_from_slice(&payload[..plen]);
+            pos + plen
+        }
+    }
+
+    /// Forward a routed message to a specific child.
+    fn forward_to_child_routed(&mut self, child_idx: usize, raw: &[u8], child_route: &[u8]) {
+        let mut buf = [0u8; 576];
+        let len = Self::build_routed_message(raw, child_route, &mut buf);
+        if len > 0 {
+            if let Some(entry) = &mut self.ctx.children[child_idx] {
+                let _ = entry.channel.send(&buf[..len]);
+            }
+        }
+    }
+
+    /// Forward a routed message to all children.
+    fn forward_to_all_children(&mut self, raw: &[u8], child_route: &[u8]) {
+        let mut buf = [0u8; 576];
+        let len = Self::build_routed_message(raw, child_route, &mut buf);
+        if len > 0 {
+            for i in 0..MAX_CHILDREN {
+                if let Some(entry) = &mut self.ctx.children[i] {
+                    let _ = entry.channel.send(&buf[..len]);
+                }
+            }
+        }
+    }
+
+    /// Strip ADDRESSED route from raw bytes for local handling.
+    ///
+    /// Returns (stripped_buf, stripped_len). The stripped message has the
+    /// ADDRESSED flag cleared and route bytes removed, so parse_command_buf
+    /// sees a standard message.
+    fn strip_route(raw: &[u8]) -> ([u8; 576], usize) {
+        let mut out = [0u8; 576];
+        if raw.len() < QueryHeader::SIZE {
+            let len = raw.len().min(576);
+            out[..len].copy_from_slice(&raw[..len]);
+            return (out, len);
+        }
+
+        let flags = u16::from_le_bytes([raw[2], raw[3]]);
+        if flags & query_flags::ADDRESSED == 0 {
+            let len = raw.len().min(576);
+            out[..len].copy_from_slice(&raw[..len]);
+            return (out, len);
+        }
+
+        // Skip route
+        let route_len = if raw.len() > QueryHeader::SIZE {
+            raw[QueryHeader::SIZE] as usize
         } else {
             0
+        };
+        let payload_start = QueryHeader::SIZE + 1 + route_len;
+
+        // Copy header with ADDRESSED cleared
+        out[..QueryHeader::SIZE].copy_from_slice(&raw[..QueryHeader::SIZE]);
+        let new_flags = flags & !query_flags::ADDRESSED;
+        out[2..4].copy_from_slice(&new_flags.to_le_bytes());
+
+        // Copy payload
+        if payload_start < raw.len() {
+            let payload = &raw[payload_start..];
+            let plen = payload.len().min(576 - QueryHeader::SIZE);
+            out[QueryHeader::SIZE..QueryHeader::SIZE + plen].copy_from_slice(&payload[..plen]);
+            (out, QueryHeader::SIZE + plen)
+        } else {
+            (out, QueryHeader::SIZE)
         }
     }
 
@@ -1140,6 +2070,7 @@ impl<D: Driver> DriverRuntime<D> {
         pid: u32,
         filter: &crate::devd::SpawnFilter,
         context: Option<&SpawnChildContext>,
+        binary_name: &[u8],
     ) -> bool {
         // Find free slot
         let slot = match self.ctx.children.iter().position(|c| c.is_none()) {
@@ -1195,10 +2126,18 @@ impl<D: Driver> DriverRuntime<D> {
         }
         self.ctx.handles.add(ch_handle, tag);
 
+        // Store binary name for path annotation
+        let mut bname = [0u8; 16];
+        let blen = binary_name.len().min(16);
+        bname[..blen].copy_from_slice(&binary_name[..blen]);
+
         self.ctx.children[slot] = Some(ChildEntry {
             channel: parent_end,
             pid,
             ctx: spawn_ctx,
+            binary_name: bname,
+            binary_name_len: blen as u8,
+            bus_active: false,
         });
         self.ctx.child_count += 1;
 
@@ -1227,6 +2166,22 @@ impl<D: Driver> DriverRuntime<D> {
                     self.ctx.handles.remove(handle);
                     self.ctx.children[child_idx] = None;
                     if self.ctx.child_count > 0 { self.ctx.child_count -= 1; }
+
+                    // Implicit EOL: set eol_mask bit for this child on all pending queries
+                    let child_bit = 1u8 << child_idx;
+                    for slot in 0..MAX_PENDING_CONFIG {
+                        let converged = if let Some(pcq) = self.ctx.pending_config[slot].as_mut() {
+                            if pcq.sent_mask & child_bit != 0 {
+                                pcq.eol_mask |= child_bit;
+                            }
+                            pcq.is_converged()
+                        } else {
+                            false
+                        };
+                        if converged {
+                            self.complete_config_query(slot);
+                        }
+                    }
                     return;
                 }
             },
@@ -1238,29 +2193,60 @@ impl<D: Driver> DriverRuntime<D> {
             None => return,
         };
 
+        // Mark child as bus-protocol-aware on first valid message
+        if let Some(entry) = &mut self.ctx.children[child_idx] {
+            entry.bus_active = true;
+        }
+
         match header.msg_type {
             // GET_SPAWN_CONTEXT: answer locally from stored ChildSpawnCtx
             query_msg::GET_SPAWN_CONTEXT => {
                 self.reply_spawn_context(child_idx, header.seq_id);
             }
 
-            // REGISTER_PORT_INFO / SET_PORT_STATE / QUERY_PORT / UPDATE_PORT_SHMEM_ID:
+            // REGISTER_PORT_INFO: forward to devd with path annotation.
+            // devd stores the source_path on the registered port for
+            // SpawnChild routing — no local port tracking needed.
+            query_msg::REGISTER_PORT_INFO => {
+                self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
+            }
+
+            // SET_PORT_STATE / QUERY_PORT / UPDATE_PORT_SHMEM_ID:
             // Forward to devd with response relay tracking
-            query_msg::REGISTER_PORT_INFO
-            | query_msg::SET_PORT_STATE
+            query_msg::SET_PORT_STATE
             | query_msg::QUERY_PORT
             | query_msg::UPDATE_PORT_SHMEM_ID => {
                 self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
             }
 
-            // STATE_CHANGE: fire-and-forget forward to devd
-            query_msg::STATE_CHANGE => {
-                let _ = self.ctx.devd.raw_send(&buf[..n]);
+            // SPAWN_ACK: forward to devd without seq_id remapping.
+            // Child is acking a SpawnChild that we forwarded — devd needs
+            // the original seq_id to match its inflight spawn tracking.
+            query_msg::SPAWN_ACK => {
+                let (annotated, alen) = self.annotate_path_upward(child_idx, &buf[..n]);
+                let _ = self.ctx.devd.raw_send(&annotated[..alen]);
             }
 
-            // LOG_MESSAGE: fire-and-forget forward to devd
+            // SERVICE_INFO_RESULT: check if it's a config query response
+            query_msg::SERVICE_INFO_RESULT => {
+                if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&buf[..n]) {
+                    if !self.handle_config_response(child_idx, header.seq_id, info_bytes, result.header.flags) {
+                        // Not a config query response — forward to devd
+                        self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
+                    }
+                }
+            }
+
+            // STATE_CHANGE: fire-and-forget forward to devd with path annotation
+            query_msg::STATE_CHANGE => {
+                let (annotated, alen) = self.annotate_path_upward(child_idx, &buf[..n]);
+                let _ = self.ctx.devd.raw_send(&annotated[..alen]);
+            }
+
+            // LOG_MESSAGE: fire-and-forget forward to devd with path annotation
             query_msg::LOG_MESSAGE => {
-                let _ = self.ctx.devd.raw_send(&buf[..n]);
+                let (annotated, alen) = self.annotate_path_upward(child_idx, &buf[..n]);
+                let _ = self.ctx.devd.raw_send(&annotated[..alen]);
             }
 
             // Unknown: forward to devd
@@ -1315,8 +2301,127 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
+    /// Annotate a child message with path information for upward routing.
+    ///
+    /// Prepends the child's trigger port name as a path segment. If the
+    /// message already has an ADDRESSED route (from a deeper relay node),
+    /// the segment is prepended to the existing route: `segment/existing`.
+    /// Otherwise creates a new route from just the segment.
+    ///
+    /// Returns (annotated_buf, length). If the child has no port name or
+    /// the message is invalid, returns a copy of the original message.
+    fn annotate_path_upward(&self, child_idx: usize, msg: &[u8]) -> ([u8; 576], usize) {
+        let mut out = [0u8; 576];
+
+        // Build segment: "port_name/binary_name" (e.g., "nvme:0/nvmed")
+        let mut segment_buf = [0u8; 96];
+        let seg_len = match &self.ctx.children[child_idx] {
+            Some(entry) => {
+                let plen = entry.ctx.port_name_len as usize;
+                if plen == 0 {
+                    let len = msg.len().min(576);
+                    out[..len].copy_from_slice(&msg[..len]);
+                    return (out, len);
+                }
+                let mut pos = 0;
+                segment_buf[pos..pos + plen].copy_from_slice(&entry.ctx.port_name[..plen]);
+                pos += plen;
+                let blen = entry.binary_name_len as usize;
+                if blen > 0 {
+                    segment_buf[pos] = b'/';
+                    pos += 1;
+                    segment_buf[pos..pos + blen].copy_from_slice(&entry.binary_name[..blen]);
+                    pos += blen;
+                }
+                pos
+            }
+            None => {
+                let len = msg.len().min(576);
+                out[..len].copy_from_slice(&msg[..len]);
+                return (out, len);
+            }
+        };
+        let segment = &segment_buf[..seg_len];
+
+        if msg.len() < QueryHeader::SIZE {
+            let len = msg.len().min(576);
+            out[..len].copy_from_slice(&msg[..len]);
+            return (out, len);
+        }
+
+        let flags = u16::from_le_bytes([msg[2], msg[3]]);
+
+        if flags & query_flags::ADDRESSED != 0 {
+            // Message already has a route — prepend our segment
+            let existing_route_len = if msg.len() > QueryHeader::SIZE {
+                msg[QueryHeader::SIZE] as usize
+            } else {
+                0
+            };
+            let payload_start = QueryHeader::SIZE + 1 + existing_route_len;
+            let existing_route = &msg[QueryHeader::SIZE + 1..payload_start.min(msg.len())];
+
+            // New route: segment + "/" + existing_route
+            let new_route_len = seg_len + 1 + existing_route.len();
+            if new_route_len > 255 {
+                // Route too long — return message unchanged
+                let len = msg.len().min(576);
+                out[..len].copy_from_slice(&msg[..len]);
+                return (out, len);
+            }
+
+            // Copy header with ADDRESSED flag (already set)
+            out[..QueryHeader::SIZE].copy_from_slice(&msg[..QueryHeader::SIZE]);
+            // Route length
+            out[QueryHeader::SIZE] = new_route_len as u8;
+            // New route: segment/existing
+            let route_start = QueryHeader::SIZE + 1;
+            out[route_start..route_start + seg_len].copy_from_slice(segment);
+            out[route_start + seg_len] = b'/';
+            out[route_start + seg_len + 1..route_start + new_route_len]
+                .copy_from_slice(existing_route);
+            // Copy payload
+            let out_payload_start = route_start + new_route_len;
+            if payload_start < msg.len() {
+                let payload = &msg[payload_start..];
+                let plen = payload.len().min(576 - out_payload_start);
+                out[out_payload_start..out_payload_start + plen].copy_from_slice(&payload[..plen]);
+                (out, out_payload_start + plen)
+            } else {
+                (out, out_payload_start)
+            }
+        } else {
+            // No existing route — create one from just the segment
+            let new_route_len = seg_len;
+            let new_flags = flags | query_flags::ADDRESSED;
+
+            // Copy header with ADDRESSED flag set
+            out[..QueryHeader::SIZE].copy_from_slice(&msg[..QueryHeader::SIZE]);
+            out[2..4].copy_from_slice(&new_flags.to_le_bytes());
+            // Route length
+            out[QueryHeader::SIZE] = new_route_len as u8;
+            // Route: just the segment
+            let route_start = QueryHeader::SIZE + 1;
+            out[route_start..route_start + seg_len].copy_from_slice(segment);
+            // Copy payload (everything after original header)
+            let out_payload_start = route_start + seg_len;
+            if QueryHeader::SIZE < msg.len() {
+                let payload = &msg[QueryHeader::SIZE..];
+                let plen = payload.len().min(576 - out_payload_start);
+                out[out_payload_start..out_payload_start + plen].copy_from_slice(&payload[..plen]);
+                (out, out_payload_start + plen)
+            } else {
+                (out, out_payload_start)
+            }
+        }
+    }
+
     /// Forward a child message to devd with seq_id rewriting for response relay.
+    ///
+    /// Annotates the message with path information before forwarding.
     fn forward_to_devd(&mut self, child_idx: usize, child_seq_id: u32, msg: &[u8]) {
+        let (annotated, alen) = self.annotate_path_upward(child_idx, msg);
+
         // Allocate forwarded seq_id
         let devd_seq = self.ctx.forwarded_next_seq;
         self.ctx.forwarded_next_seq = self.ctx.forwarded_next_seq.wrapping_add(1);
@@ -1342,13 +2447,12 @@ impl<D: Driver> DriverRuntime<D> {
             return;
         }
 
-        // Rewrite seq_id in message and send to devd
-        let mut fwd = [0u8; 512];
-        let len = msg.len().min(512);
-        fwd[..len].copy_from_slice(&msg[..len]);
+        // Rewrite seq_id in annotated message and send to devd
+        let mut fwd = [0u8; 576];
+        fwd[..alen].copy_from_slice(&annotated[..alen]);
         // seq_id is at offset 4..8 in QueryHeader
         fwd[4..8].copy_from_slice(&devd_seq.to_le_bytes());
-        let _ = self.ctx.devd.raw_send(&fwd[..len]);
+        let _ = self.ctx.devd.raw_send(&fwd[..alen]);
     }
 
     /// Check if a devd response matches a forwarded request and relay it to the child.
@@ -1447,6 +2551,82 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
 }
 
 // ============================================================================
+// Source-Annotated Config Response Appender
+// ============================================================================
+
+/// Append config response data to buf at `pos`, annotating with source path.
+///
+/// Builds full paths through the supervision tree:
+/// - Existing `[path]` headers in `data` are rewritten to `[prefix/path]`
+/// - Raw key=value lines before any header get a new `[prefix]` header prepended
+/// - If `prefix` is empty, data is copied as-is
+///
+/// Returns number of bytes written.
+fn append_with_source(buf: &mut [u8], pos: usize, prefix: &[u8], data: &[u8]) -> usize {
+    let cap = buf.len();
+    if pos >= cap || data.is_empty() {
+        return 0;
+    }
+    if prefix.is_empty() {
+        let n = data.len().min(cap - pos);
+        buf[pos..pos + n].copy_from_slice(&data[..n]);
+        return n;
+    }
+
+    let mut out = pos;
+    let mut prepended = false; // wrote [prefix]\n for raw lines?
+    let mut i = 0;
+
+    while i < data.len() && out < cap {
+        // Find end of current line
+        let line_end = data[i..].iter().position(|&b| b == b'\n')
+            .map(|p| i + p + 1)
+            .unwrap_or(data.len());
+        let line = &data[i..line_end];
+        let trimmed_end = if line.ends_with(b"\n") { line.len() - 1 } else { line.len() };
+        let trimmed = &line[..trimmed_end];
+
+        if trimmed.starts_with(b"[") && trimmed.ends_with(b"]") && trimmed.len() > 2 {
+            // [path] header — rewrite to [prefix/path]
+            let old_path = &trimmed[1..trimmed.len() - 1];
+            // Need: [ + prefix + / + old_path + ] + \n
+            let needed = 1 + prefix.len() + 1 + old_path.len() + 2;
+            if out + needed <= cap {
+                buf[out] = b'['; out += 1;
+                buf[out..out + prefix.len()].copy_from_slice(prefix); out += prefix.len();
+                buf[out] = b'/'; out += 1;
+                buf[out..out + old_path.len()].copy_from_slice(old_path); out += old_path.len();
+                buf[out] = b']'; out += 1;
+                buf[out] = b'\n'; out += 1;
+            }
+            // Header covers following raw lines — don't add another [prefix]
+            prepended = true;
+        } else if !trimmed.is_empty() {
+            // Raw key=value line — prepend [prefix]\n before the first one
+            if !prepended {
+                let hdr = 1 + prefix.len() + 2; // [prefix]\n
+                if out + hdr <= cap {
+                    buf[out] = b'['; out += 1;
+                    buf[out..out + prefix.len()].copy_from_slice(prefix); out += prefix.len();
+                    buf[out] = b']'; out += 1;
+                    buf[out] = b'\n'; out += 1;
+                }
+                prepended = true;
+            }
+            let n = line.len().min(cap - out);
+            if n > 0 {
+                buf[out..out + n].copy_from_slice(&line[..n]);
+                out += n;
+            }
+        }
+
+        i = line_end;
+    }
+
+    out - pos
+}
+
+// ============================================================================
 // Config Summary Builder
 // ============================================================================
 
@@ -1513,8 +2693,8 @@ fn copy_static(dst: &mut [u8], src: &[u8]) -> usize {
     len
 }
 
-/// Format key=value into buf (uses a temp buffer to avoid overlap with value).
-/// Returns bytes written.
+/// Format key=value\n into buf (uses a temp buffer to avoid overlap with value).
+/// Returns bytes written (including trailing newline).
 fn format_kv(key: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
     let mut tmp = [0u8; 512];
     let mut pos = 0;
@@ -1525,6 +2705,7 @@ fn format_kv(key: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
     let vlen = value.len().min(tmp.len() - pos);
     tmp[pos..pos + vlen].copy_from_slice(&value[..vlen]);
     pos += vlen;
+    if pos < tmp.len() { tmp[pos] = b'\n'; pos += 1; }
     let out_len = pos.min(buf.len());
     buf[..out_len].copy_from_slice(&tmp[..out_len]);
     out_len
