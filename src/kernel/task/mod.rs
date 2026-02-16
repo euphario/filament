@@ -113,7 +113,7 @@ pub use policy::{SchedulingPolicy, PerCpuQueues};
 
 // Re-export TCB types
 pub use tcb::{
-    Priority, TrapFrame, CpuContext, TaskId, Task,
+    Priority, NUM_PRIORITIES, TrapFrame, CpuContext, TaskId, Task,
     MAX_CHANNELS_PER_TASK, STACK_CANARY,
     enter_usermode, context_switch,
 };
@@ -353,7 +353,7 @@ impl Scheduler {
     pub fn notify_ready(&mut self, slot: usize) {
         if let Some(ref mut task) = self.tasks[slot] {
             task.set_on_runq(true);
-            self.policy.on_task_ready(slot, task.priority);
+            self.policy.on_task_ready(slot, task.effective_priority());
         }
     }
 
@@ -364,6 +364,82 @@ impl Scheduler {
             task.set_on_runq(false);
         }
         self.policy.on_task_blocked(slot);
+    }
+
+    /// Notify the scheduling policy that a task's priority changed.
+    pub fn notify_priority_change(&mut self, slot: usize, old: Priority, new: Priority) {
+        self.policy.on_priority_change(slot, old, new);
+    }
+
+    /// Apply priority inheritance boosts from a blocking task to channel peers.
+    ///
+    /// Called when a task blocks on a Mux. For each peer PID, if the blocker
+    /// has higher effective priority, boosts the peer.
+    pub fn apply_pi_boosts(&mut self, blocker_slot: usize, peer_pids: &[u32]) {
+        let (blocker_pid, blocker_prio) = match self.tasks[blocker_slot].as_ref() {
+            Some(t) => (t.id, t.effective_priority()),
+            None => return,
+        };
+
+        for &peer_pid in peer_pids {
+            if peer_pid == 0 || peer_pid == blocker_pid {
+                continue;
+            }
+            if let Some(peer_slot) = self.slot_by_pid(peer_pid) {
+                if let Some(peer_task) = self.tasks[peer_slot].as_mut() {
+                    let old = peer_task.effective_priority();
+                    if peer_task.add_pi_boost(blocker_pid, blocker_prio) {
+                        let new = peer_task.effective_priority();
+                        self.policy.on_priority_change(peer_slot, old, new);
+                    }
+                }
+            }
+        }
+
+        // Record targets on the blocker
+        if let Some(blocker) = self.tasks[blocker_slot].as_mut() {
+            blocker.clear_pi_targets();
+            for &peer_pid in peer_pids {
+                if peer_pid != 0 && peer_pid != blocker_pid {
+                    blocker.add_pi_target(peer_pid);
+                }
+            }
+        }
+    }
+
+    /// Remove all priority inheritance boosts applied by a waking task.
+    ///
+    /// Called when a blocked task wakes up. Reads its pi_targets list and
+    /// removes the corresponding PiBooster entries from each target.
+    pub fn remove_pi_boosts(&mut self, waker_slot: usize) {
+        // Collect targets before mutating
+        let (waker_pid, targets) = match self.tasks[waker_slot].as_mut() {
+            Some(t) => {
+                let pid = t.id;
+                let mut targets = [0u32; 4];
+                let count = t.pi_target_count as usize;
+                targets[..count].copy_from_slice(&t.pi_targets[..count]);
+                t.clear_pi_targets();
+                (pid, (targets, count))
+            }
+            None => return,
+        };
+
+        for i in 0..targets.1 {
+            let target_pid = targets.0[i];
+            if target_pid == 0 {
+                continue;
+            }
+            if let Some(target_slot) = self.slot_by_pid(target_pid) {
+                if let Some(target_task) = self.tasks[target_slot].as_mut() {
+                    let old = target_task.effective_priority();
+                    if target_task.remove_pi_boost(waker_pid) {
+                        let new = target_task.effective_priority();
+                        self.policy.on_priority_change(target_slot, old, new);
+                    }
+                }
+            }
+        }
     }
 
     /// Notify the scheduling policy that a task exited.
@@ -387,6 +463,12 @@ impl Scheduler {
     ///
     /// Returns true if task was actually woken (was blocked).
     pub fn wake_task(&mut self, slot: usize) -> bool {
+        // Collect PI unboost info before mutating (avoids double borrow)
+        let has_pi_targets = self.tasks[slot]
+            .as_ref()
+            .map(|t| t.pi_target_count > 0)
+            .unwrap_or(false);
+
         if let Some(ref mut task) = self.tasks[slot] {
             // Only wake if task is blocked
             if !task.is_blocked() {
@@ -408,16 +490,21 @@ impl Scheduler {
             task.set_on_runq(true);
 
             // Notify scheduling policy
-            self.policy.on_task_ready(slot, task.priority);
+            self.policy.on_task_ready(slot, task.effective_priority());
 
             // Set need_resched so the woken task gets scheduled
             // when the current syscall returns
             crate::kernel::arch::sync::cpu_flags().set_need_resched();
-
-            true
         } else {
-            false
+            return false;
         }
+
+        // Remove PI boosts this task applied to peers (must be after task borrow ends)
+        if has_pi_targets {
+            self.remove_pi_boosts(slot);
+        }
+
+        true
     }
 
     /// Wake a task by PID - O(1) lookup
@@ -493,7 +580,7 @@ impl Scheduler {
             if let Some(ref mut task) = self.tasks[slot] {
                 // kernel_stack_owner cleared by pending_stack_release handler
                 task.set_on_runq(true);
-                self.policy.on_task_ready(slot, task.priority);
+                self.policy.on_task_ready(slot, task.effective_priority());
             }
         }
 
@@ -526,7 +613,7 @@ impl Scheduler {
                         task.liveness_state.reset(task.id);
                         // kernel_stack_owner cleared by pending_stack_release handler
                         task.set_on_runq(true);
-                        self.policy.on_task_ready(slot, task.priority);
+                        self.policy.on_task_ready(slot, task.effective_priority());
                         woken += 1;
                     }
                 }

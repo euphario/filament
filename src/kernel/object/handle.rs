@@ -307,6 +307,11 @@ impl HandleTable {
             })
         })
     }
+
+    /// Count number of used (non-empty) handle slots
+    pub fn count_used(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_some()).count()
+    }
 }
 
 impl Default for HandleTable {

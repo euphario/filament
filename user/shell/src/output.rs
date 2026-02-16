@@ -44,11 +44,11 @@ impl Output for ShellOutput {
 }
 
 /// Maximum columns per table
-pub const MAX_COLS: usize = 8;
+pub const MAX_COLS: usize = 16;
 
 /// Maximum rows per table (for static allocation)
-/// Note: Keep this small - Table lives on stack! 16 rows * ~400 bytes/row = ~6KB
-pub const MAX_ROWS: usize = 16;
+/// Note: Keep this small - Table lives on stack! 32 rows * ~800 bytes/row = ~25KB
+pub const MAX_ROWS: usize = 32;
 
 /// Maximum string length in a cell
 pub const MAX_CELL_STR: usize = 64;
@@ -77,10 +77,11 @@ impl Value {
         Value::Str { buf, len: len as u8 }
     }
 
-    /// Create from byte slice
+    /// Create from byte slice (trims at first null byte)
     pub fn from_bytes(b: &[u8]) -> Self {
         let mut buf = [0u8; MAX_CELL_STR];
-        let len = b.len().min(MAX_CELL_STR);
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        let len = end.min(MAX_CELL_STR);
         buf[..len].copy_from_slice(&b[..len]);
         Value::Str { buf, len: len as u8 }
     }

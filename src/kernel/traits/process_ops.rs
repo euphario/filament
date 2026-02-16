@@ -21,7 +21,8 @@ pub enum SpawnSource<'a> {
     /// Spawn from ELF data in memory (sys_exec_mem)
     Memory(&'a [u8], &'a str),
     /// Spawn by ramfs path with caps, transferring a channel handle to child (sys_exec_with_channel)
-    PathWithCapsAndChannel(&'a str, Capabilities, u32),
+    /// u32 = channel handle, u8 = priority (INHERIT=0xFF means use parent's)
+    PathWithCapsAndChannel(&'a str, Capabilities, u32, u8),
 }
 
 /// Result of waiting for a child process
@@ -126,6 +127,13 @@ pub trait ProcessOps: Send + Sync {
     ///
     /// Returns the number of entries written. Skips idle tasks.
     fn list_processes(&self, buf: &mut [abi::ProcessInfo], max: usize) -> usize;
+
+    /// List running processes with extended resource info.
+    ///
+    /// Two-pass: Pass 1 fills TCB fields under scheduler lock,
+    /// Pass 2 fills handle_count from ObjectService (no scheduler lock).
+    /// Returns the number of entries written. Skips idle tasks.
+    fn list_processes_ex(&self, buf: &mut [abi::ProcessInfoEx], max: usize) -> usize;
 }
 
 // ============================================================================
@@ -209,6 +217,10 @@ impl ProcessOps for MockProcessOps {
     }
 
     fn list_processes(&self, _buf: &mut [abi::ProcessInfo], _max: usize) -> usize {
+        self.list_processes_count
+    }
+
+    fn list_processes_ex(&self, _buf: &mut [abi::ProcessInfoEx], _max: usize) -> usize {
         self.list_processes_count
     }
 }

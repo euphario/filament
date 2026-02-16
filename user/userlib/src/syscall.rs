@@ -7,7 +7,7 @@ use core::arch::asm;
 use crate::error::{SysError, SysResult};
 
 // Re-export types from abi crate for convenience
-pub use abi::{ProcessInfo, ObjectType, Handle, LogLevel, PciEnumEntry};
+pub use abi::{ProcessInfo, ProcessInfoEx, ObjectType, Handle, LogLevel, PciEnumEntry};
 pub use abi::{syscall as syscall_num, log_level, liveness_status, prot, errno};
 
 // Local aliases for syscall numbers (shorter names for internal use)
@@ -128,6 +128,31 @@ fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     ret
 }
 
+#[inline(always)]
+fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") num,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+            in("x2") a2,
+            in("x3") a3,
+            in("x4") a4,
+            lateout("x9") _,
+            lateout("x10") _,
+            lateout("x11") _,
+            lateout("x12") _,
+            lateout("x13") _,
+            lateout("x14") _,
+            lateout("x15") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 // ============================================================================
 // Process Lifecycle
 // ============================================================================
@@ -151,8 +176,9 @@ pub fn exec_with_caps(path: &str, caps: u64) -> i64 {
 /// Execute a program with capabilities, transferring a channel handle to the child.
 /// The channel handle is removed from the caller's table and placed in the child's
 /// table at Handle::SUPERVISION (slot 4). Returns child PID on success.
-pub fn exec_with_channel(path: &str, caps: u64, channel: Handle) -> i64 {
-    syscall4(sys::EXEC_WITH_CHANNEL, path.as_ptr() as u64, path.len() as u64, caps, channel.raw() as u64)
+/// Priority: abi::priority::INHERIT (0xFF) means inherit parent's priority.
+pub fn exec_with_channel(path: &str, caps: u64, channel: Handle, priority: u8) -> i64 {
+    syscall5(sys::EXEC_WITH_CHANNEL, path.as_ptr() as u64, path.len() as u64, caps, channel.raw() as u64, priority as u64)
 }
 
 /// Execute ELF from memory
@@ -222,6 +248,13 @@ pub fn sleep_us(us: u32) {
     sleep_ns(us as u64 * 1_000);
 }
 
+/// Get caller's base and effective priority
+/// Returns: (base_priority, effective_priority)
+pub fn get_priority() -> (u8, u8) {
+    let raw = syscall0(sys::GET_PRIORITY);
+    ((raw & 0xFF) as u8, ((raw >> 8) & 0xFF) as u8)
+}
+
 /// Sleep for duration in milliseconds
 pub fn sleep_ms(ms: u32) {
     sleep_ns(ms as u64 * 1_000_000);
@@ -269,6 +302,12 @@ pub fn debug_write(msg: &[u8]) {
 /// Get process list info (debug)
 pub fn ps_info(buf: &mut [ProcessInfo]) -> usize {
     let ret = syscall2(sys::PS_INFO, buf.as_mut_ptr() as u64, buf.len() as u64);
+    if ret < 0 { 0 } else { ret as usize }
+}
+
+/// Get extended process list info with resource accounting
+pub fn ps_info_ex(buf: &mut [ProcessInfoEx]) -> usize {
+    let ret = syscall2(sys::PS_INFO_EX, buf.as_mut_ptr() as u64, buf.len() as u64);
     if ret < 0 { 0 } else { ret as usize }
 }
 

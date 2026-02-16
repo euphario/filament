@@ -398,7 +398,7 @@ pub fn complete_probed_exit() {
             super::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
                     task.set_capabilities(Capabilities::ALL);
-                    task.set_priority(super::Priority::High);
+                    task.set_priority(super::Priority::Critical);
                     task.is_init = true;
                 }
             });

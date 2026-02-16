@@ -1103,7 +1103,8 @@ pub struct SpawnChild {
     pub filter_len: u8,
     /// Length of context section (0 = no context)
     pub context_len: u8,
-    pub _pad: u8,
+    /// Priority for spawned child (abi::priority::*, INHERIT=0xFF means use parent's)
+    pub priority: u8,
     /// Capability bits for spawned child (0 = inherit parent's)
     pub caps: u64,
     // Followed by: binary name bytes, then PortFilter + pattern, then context section
@@ -1118,7 +1119,7 @@ impl SpawnChild {
             binary_len: 0,
             filter_len: 0,
             context_len: 0,
-            _pad: 0,
+            priority: abi::priority::INHERIT,
             caps: 0,
         }
     }
@@ -1129,7 +1130,18 @@ impl SpawnChild {
             binary_len: 0,
             filter_len: 0,
             context_len: 0,
-            _pad: 0,
+            priority: abi::priority::INHERIT,
+            caps,
+        }
+    }
+
+    pub fn with_caps_and_priority(seq_id: u32, caps: u64, priority: u8) -> Self {
+        Self {
+            header: QueryHeader::new(msg::SPAWN_CHILD, seq_id),
+            binary_len: 0,
+            filter_len: 0,
+            context_len: 0,
+            priority,
             caps,
         }
     }
@@ -1174,7 +1186,7 @@ impl SpawnChild {
         buf[8] = binary.len() as u8;
         buf[9] = filter_total as u8;
         buf[10] = self.context_len;
-        buf[11] = 0;
+        buf[11] = self.priority;
         buf[12..20].copy_from_slice(&self.caps.to_le_bytes());
 
         let binary_start = Self::FIXED_SIZE;
@@ -1220,7 +1232,7 @@ impl SpawnChild {
         buf[8] = binary.len() as u8;
         buf[9] = filter_total as u8;
         buf[10] = ctx_size as u8;
-        buf[11] = 0;
+        buf[11] = self.priority;
         buf[12..20].copy_from_slice(&self.caps.to_le_bytes());
 
         let binary_start = Self::FIXED_SIZE;
@@ -1294,13 +1306,15 @@ impl SpawnChild {
             0
         };
 
+        let priority = buf[11];
+
         Some((
             Self {
                 header,
                 binary_len: binary_len as u8,
                 filter_len: filter_len as u8,
                 context_len: context_len as u8,
-                _pad: 0,
+                priority,
                 caps,
             },
             binary,

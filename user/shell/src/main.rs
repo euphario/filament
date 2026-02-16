@@ -270,6 +270,8 @@ fn execute_command(cmd: &[u8]) {
         cmd_fan(&cmd[4..]);
     } else if cmd_eq(cmd, b"ps") {
         builtins::ps::run(b"").print();
+    } else if cmd_starts_with(cmd, b"ps ") {
+        builtins::ps::run(&cmd[3..]).print();
     } else if cmd_starts_with(cmd, b"kill ") {
         cmd_kill(&cmd[5..]);
     } else if cmd_starts_with(cmd, b"bg ") {
@@ -458,7 +460,7 @@ fn cmd_help() {
         ("devd spawn", "Spawn driver via devd (with caps)"),
         ("drivers", "Show driver/port tree (services, ports, shmem)"),
         ("yield", "Yield CPU to other processes"),
-        ("ps", "Show running processes"),
+        ("ps [-v|-vv|-vvv]", "Show processes (verbose: handles, mem, caps)"),
         ("kill <pid>", "Terminate a process"),
         ("bg <path>", "Run program in background"),
         ("jobs", "Show background jobs"),

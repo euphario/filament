@@ -45,6 +45,8 @@ pub mod syscall {
     pub const EXEC_WITH_CHANNEL: u64 = 75;
     pub const KLOG: u64 = 76;
     pub const KLOG_WRITE: u64 = 77;
+    pub const GET_PRIORITY: u64 = 78;
+    pub const PS_INFO_EX: u64 = 79;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;
@@ -155,8 +157,12 @@ pub struct ProcessInfo {
     pub state: u8,
     pub liveness_status: u8,
     pub cpu: u8,
-    pub _pad: u8,
+    pub base_priority: u8,
+    pub effective_priority: u8,
+    pub _pad: [u8; 3],
     pub activity_age_ms: u32,
+    // 4 bytes implicit padding for u64 alignment (repr(C))
+    pub cpu_time_ns: u64,
     pub name: [u8; 16],
 }
 
@@ -168,9 +174,76 @@ impl ProcessInfo {
             state: 0,
             liveness_status: 0,
             cpu: 0xFF,
-            _pad: 0,
+            base_priority: priority::NORMAL,
+            effective_priority: priority::NORMAL,
+            _pad: [0; 3],
             activity_age_ms: 0,
+            cpu_time_ns: 0,
             name: [0; 16],
+        }
+    }
+
+    pub fn state_str(&self) -> &'static str {
+        match self.state {
+            0 => "Ready",
+            1 => "Running",
+            2 => "Sleeping",
+            3 => "Waiting",
+            4 => "Exiting",
+            5 => "Dying",
+            6 => "Dead",
+            _ => "Unknown",
+        }
+    }
+}
+
+/// Extended process info structure for ps_info_ex syscall
+///
+/// Includes resource accounting data (handles, memory, children, capabilities)
+/// not present in the basic ProcessInfo struct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessInfoEx {
+    pub pid: u32,               // 0
+    pub ppid: u32,              // 4
+    pub state: u8,              // 8
+    pub cpu: u8,                // 9
+    pub base_priority: u8,      // 10
+    pub effective_priority: u8, // 11
+    pub handle_count: u16,      // 12
+    pub channel_count: u16,     // 14
+    pub cpu_time_ns: u64,       // 16
+    pub name: [u8; 16],         // 24
+    pub port_count: u16,        // 40
+    pub shmem_count: u16,       // 42
+    pub heap_pages: u32,        // 44
+    pub mapping_count: u8,      // 48
+    pub num_children: u8,       // 49
+    pub _pad: [u8; 6],          // 50
+    pub capabilities: u64,      // 56
+}
+// Total: 64 bytes
+
+impl ProcessInfoEx {
+    pub const fn empty() -> Self {
+        Self {
+            pid: 0,
+            ppid: 0,
+            state: 0,
+            cpu: 0xFF,
+            base_priority: priority::NORMAL,
+            effective_priority: priority::NORMAL,
+            handle_count: 0,
+            channel_count: 0,
+            cpu_time_ns: 0,
+            name: [0; 16],
+            port_count: 0,
+            shmem_count: 0,
+            heap_pages: 0,
+            mapping_count: 0,
+            num_children: 0,
+            _pad: [0; 6],
+            capabilities: 0,
         }
     }
 
@@ -1168,7 +1241,8 @@ const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
 // ABI Size Assertions — kernel/user boundary types must not silently change
 // ============================================================================
 
-const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 32);
+const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 48);
+const _: () = assert!(core::mem::size_of::<ProcessInfoEx>() == 64);
 const _: () = assert!(core::mem::size_of::<MuxEvent>() == 8);
 const _: () = assert!(core::mem::size_of::<PciEnumEntry>() == 32);
 const _: () = assert!(core::mem::size_of::<BusInfo>() == 48);
@@ -1352,6 +1426,20 @@ pub mod supervision {
     pub const REASON_RESET_COMPLETE: u8 = 2;
     /// Hardware error occurred
     pub const REASON_HARDWARE_ERROR: u8 = 3;
+}
+
+/// Task priority levels (lower number = higher priority)
+pub mod priority {
+    pub const REALTIME: u8 = 0;
+    pub const CRITICAL: u8 = 1;
+    pub const HIGH: u8 = 2;
+    pub const ABOVE_NORM: u8 = 3;
+    pub const NORMAL: u8 = 4;
+    pub const BELOW_NORM: u8 = 5;
+    pub const LOW: u8 = 6;
+    pub const IDLE: u8 = 7;
+    /// Sentinel: inherit parent's priority
+    pub const INHERIT: u8 = 0xFF;
 }
 
 /// Port subclass constants (class-specific values)

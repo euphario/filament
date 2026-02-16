@@ -263,7 +263,9 @@ fn reschedule_inner(block: BlockReason) -> bool {
             // Simple preemption: trap-frame-only swap, no context_switch.
             // Safe to mark Ready now — trap frame already saved by IRQ handler,
             // no kernel stack involvement, no context_switch race window.
+            let now = crate::platform::current::timer::now_ns();
             if let Some(current) = sched.task_mut(caller_slot) {
+                current.account_cpu_time(now);
                 if current.state().is_running() {
                     crate::transition_or_evict!(current, set_ready);
                     sched.notify_ready(caller_slot);
@@ -274,6 +276,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
 
             // Extract and update per-CPU data while we have the lock
             if let Some(next) = sched.task_mut(next_slot) {
+                next.mark_scheduled(now);
                 crate::transition_or_evict!(next, set_running, cpu);
 
                 // Update trap frame pointer
@@ -299,6 +302,12 @@ fn reschedule_inner(block: BlockReason) -> bool {
                 percpu::set_syscall_switched(1);
             }
             return true;
+        }
+
+        // Account CPU time for from-task before switch
+        let now = crate::platform::current::timer::now_ns();
+        if let Some(from_task) = sched.task_mut(caller_slot) {
+            from_task.account_cpu_time(now);
         }
 
         // Need full context switch - extract everything we need
@@ -329,6 +338,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
         let (to_ctx, to_trap_frame, to_ttbr0, to_kstack_top) = match sched.task_mut(next_slot) {
             Some(t) => {
                 // Prepare target state while holding lock
+                t.mark_scheduled(now);
                 crate::transition_or_evict!(t, set_running, cpu);
                 t.mark_context_restored();
                 // Clear any stale kernel_stack_owner from previous switch.

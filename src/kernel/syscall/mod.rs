@@ -76,6 +76,8 @@ pub enum SyscallNumber {
     ExecWithChannel = 75,
     Klog = 76,  // Compatibility shim - writes to klog ring buffer
     KlogWrite = 77,  // Inject binary log record into kernel ring
+    GetPriority = 78,  // Get caller's base and effective priority
+    PsInfoEx = 79,     // Extended process info with resource accounting
 
     // 80-96: legacy handle system (removed) - use 100-104
 
@@ -127,6 +129,8 @@ impl From<u64> for SyscallNumber {
             75 => SyscallNumber::ExecWithChannel,
             76 => SyscallNumber::Klog,
             77 => SyscallNumber::KlogWrite,
+            78 => SyscallNumber::GetPriority,
+            79 => SyscallNumber::PsInfoEx,
             // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -221,11 +225,12 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Wait => process::sys_wait(args.arg0 as i32, args.arg1, args.arg2 as u32),
         SyscallNumber::Exec => process::sys_exec(args.arg0, args.arg1 as usize),
         SyscallNumber::ExecWithCaps => process::sys_exec_with_caps(args.arg0, args.arg1 as usize, args.arg2),
-        SyscallNumber::ExecWithChannel => process::sys_exec_with_channel(args.arg0, args.arg1 as usize, args.arg2, args.arg3 as u32),
+        SyscallNumber::ExecWithChannel => process::sys_exec_with_channel(args.arg0, args.arg1 as usize, args.arg2, args.arg3 as u32, args.arg4 as u8),
         SyscallNumber::ExecMem => process::sys_exec_mem(args.arg0, args.arg1 as usize, args.arg2, args.arg3 as usize),
         SyscallNumber::Daemonize => process::sys_daemonize(),
         SyscallNumber::Kill => process::sys_kill(args.arg0 as u32),
         SyscallNumber::PsInfo => process::sys_ps_info(args.arg0, args.arg1 as usize),
+        SyscallNumber::PsInfoEx => process::sys_ps_info_ex(args.arg0, args.arg1 as usize),
         SyscallNumber::GetCapabilities => process::sys_get_capabilities(args.arg0 as u32),
 
         // Misc syscalls (misc.rs)
@@ -238,6 +243,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::KlogRead => misc::sys_klog_read(args.arg0, args.arg1 as usize),
         SyscallNumber::Klog => misc::sys_klog(args.arg0 as u8, args.arg1, args.arg2 as usize),
         SyscallNumber::KlogWrite => misc::sys_klog_write(args.arg0, args.arg1 as usize),
+        SyscallNumber::GetPriority => misc::sys_get_priority(),
         SyscallNumber::Reset => misc::sys_reset(),
         SyscallNumber::Shutdown => misc::sys_shutdown(args.arg0 as u8),
         // SignalAllow removed - use capability-based permissions
@@ -305,6 +311,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::Daemonize => "daemonize",
         SyscallNumber::Kill => "kill",
         SyscallNumber::PsInfo => "ps_info",
+        SyscallNumber::PsInfoEx => "ps_info_ex",
         SyscallNumber::SetLogLevel => "set_log_level",
         SyscallNumber::Reset => "reset",
         SyscallNumber::Shutdown => "shutdown",
@@ -314,6 +321,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::KlogRead => "klog_read",
         SyscallNumber::Klog => "klog",
         SyscallNumber::KlogWrite => "klog_write",
+        SyscallNumber::GetPriority => "get_priority",
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::ExecWithCaps => "exec_with_caps",
         SyscallNumber::ExecWithChannel => "exec_with_channel",

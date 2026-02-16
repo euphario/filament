@@ -55,6 +55,8 @@ pub struct PortRule {
     pub driver: &'static str,
     /// Capability bits for spawned child
     pub caps: u64,
+    /// Priority for spawned child (abi::priority::* constants, INHERIT = use parent's)
+    pub priority: u8,
     /// Context key-value pairs to pass to spawned child.
     /// Values may contain `{key}` placeholders expanded against the
     /// enriched KV bag from the port's registration chain.
@@ -96,6 +98,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Any,
         driver: "pcied",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::HIGH,
         context: &[],
     },
     PortRule {
@@ -103,6 +106,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Exact(port_subclass::USB_XHCI),
         driver: "usbd",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::HIGH,
         context: &[],
     },
     PortRule {
@@ -110,6 +114,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Any,
         driver: "ethd",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::HIGH,
         context: &[],
     },
     PortRule {
@@ -117,6 +122,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Any,
         driver: "consoled",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::CRITICAL,
         context: &[],
     },
     // Klog→logd rule removed: logd needs rewrite for 5-syscall API
@@ -129,6 +135,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Any,
         driver: "shell",
         caps: userlib::devd::caps::USER,
+        priority: abi::priority::NORMAL,
         context: &[],
     },
     PortRule {
@@ -136,6 +143,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Exact(port_subclass::STORAGE_NVME),
         driver: "nvmed",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::HIGH,
         context: &[],
     },
     PortRule {
@@ -143,6 +151,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH),
         driver: "switchd",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::ABOVE_NORM,
         context: &[],
     },
     // TODO: ipd disabled temporarily to isolate SError
@@ -151,6 +160,7 @@ pub static PORT_RULES: &[PortRule] = &[
     //     subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH_PORT),
     //     driver: "ipd",
     //     caps: userlib::devd::caps::DRIVER,
+    //     priority: abi::priority::ABOVE_NORM,
     //     context: &[],
     // },
     // PortRule {
@@ -158,6 +168,7 @@ pub static PORT_RULES: &[PortRule] = &[
     //     subclass: SubclassMatch::Exact(port_subclass::NET_BRIDGE_GROUP),
     //     driver: "ipd",
     //     caps: userlib::devd::caps::DRIVER,
+    //     priority: abi::priority::ABOVE_NORM,
     //     context: &[],
     // },
     // PortRule {
@@ -165,6 +176,7 @@ pub static PORT_RULES: &[PortRule] = &[
     //     subclass: SubclassMatch::Exact(port_subclass::NET_ETHERNET),
     //     driver: "ipd",
     //     caps: userlib::devd::caps::DRIVER,
+    //     priority: abi::priority::ABOVE_NORM,
     //     context: &[],
     // },
     PortRule {
@@ -172,6 +184,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Exact(port_subclass::NET_WIFI),
         driver: "wifid",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::HIGH,
         context: &[],
     },
     PortRule {
@@ -179,6 +192,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Exact(port_subclass::BLOCK_RAW),
         driver: "partd",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::ABOVE_NORM,
         context: &[],
     },
     PortRule {
@@ -186,6 +200,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::OneOf(FAT_SUBCLASSES),
         driver: "fatfsd",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::ABOVE_NORM,
         context: &[("mount.path", "mnt/{block.name}.{trigger.name}")],
     },
     PortRule {
@@ -193,6 +208,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Exact(port_subclass::BLOCK_LINUX),
         driver: "ext2fsd",
         caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::ABOVE_NORM,
         context: &[],
     },
 ];

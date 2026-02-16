@@ -5,7 +5,7 @@
 //! # Design
 //!
 //! - **Always Ready**: The idle task never blocks - it's always Ready or Running
-//! - **Lowest Priority**: Uses Priority::Low (or conceptual Priority::Idle)
+//! - **Lowest Priority**: Uses Priority::Idle
 //! - **WFI Loop**: Enters low-power wait state until next interrupt
 //! - **Real Task**: Has proper kernel context for context switching
 //! - **Per-CPU**: Each CPU has its own idle task and stack

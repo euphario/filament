@@ -17,22 +17,76 @@ use crate::kernel::memory::{
 /// Checked at context switch and slot reap to detect stack overflow/corruption.
 pub const STACK_CANARY: u64 = 0xCA4A_B1E5_DEAD_BEEF;
 
-/// Task priority levels
-/// Lower number = higher priority
+/// Number of priority levels
+pub const NUM_PRIORITIES: usize = 8;
+
+/// Task priority levels (8 levels, lower number = higher priority)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Priority {
-    /// High priority - drivers and critical services
-    High = 0,
-    /// Normal priority - regular applications
-    Normal = 1,
-    /// Low priority - background tasks
-    Low = 2,
+    /// Realtime - hardware interrupt handlers (future)
+    Realtime = 0,
+    /// Critical - devd, consoled — must always respond
+    Critical = 1,
+    /// High - device drivers (pcied, usbd, wifid, nvmed)
+    High = 2,
+    /// Above normal - driver children (partd, fatfsd, switchd)
+    AboveNorm = 3,
+    /// Normal - default for shell, user apps
+    Normal = 4,
+    /// Below normal - background services
+    BelowNorm = 5,
+    /// Low - batch / best-effort
+    Low = 6,
+    /// Idle - only runs when nothing else ready
+    Idle = 7,
+}
+
+impl Priority {
+    /// Convert from u8, returning None for invalid values
+    pub fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(Priority::Realtime),
+            1 => Some(Priority::Critical),
+            2 => Some(Priority::High),
+            3 => Some(Priority::AboveNorm),
+            4 => Some(Priority::Normal),
+            5 => Some(Priority::BelowNorm),
+            6 => Some(Priority::Low),
+            7 => Some(Priority::Idle),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Priority {
     fn default() -> Self {
         Priority::Normal
+    }
+}
+
+/// Maximum concurrent priority inheritance boosters per task.
+/// Bounded to prevent unbounded chains — deeper PI is rare in practice.
+pub const MAX_PI_BOOSTERS: usize = 4;
+
+/// A priority inheritance boost from a blocked higher-priority task.
+#[derive(Debug, Clone, Copy)]
+pub struct PiBooster {
+    /// PID of the task that caused this boost (INVALID_PID = empty slot)
+    pub task_id: u32,
+    /// The effective priority of the boosting task at boost time
+    pub priority: Priority,
+}
+
+impl PiBooster {
+    /// Sentinel value for empty booster slots.
+    /// Must NOT be a valid PID (0 is used by idle tasks).
+    const INVALID_PID: u32 = u32::MAX;
+
+    pub const EMPTY: Self = Self { task_id: Self::INVALID_PID, priority: Priority::Idle };
+
+    pub fn is_empty(&self) -> bool {
+        self.task_id == Self::INVALID_PID
     }
 }
 
@@ -222,8 +276,18 @@ pub struct Task {
     /// Current state - use state() accessor and transition methods
     /// PRIVATE: all access must go through state machine methods
     state: TaskState,
-    /// Scheduling priority - use priority() and set_priority()
-    pub(crate) priority: Priority,
+    /// Base scheduling priority - set at spawn, changed by supervisor
+    pub(crate) base_priority: Priority,
+    /// Effective scheduling priority - min(base, PI boosts) — used by scheduler
+    pub(crate) effective_priority: Priority,
+    /// Priority inheritance boosters (tasks whose blocked read boosted us)
+    pub(crate) pi_boosters: [PiBooster; MAX_PI_BOOSTERS],
+    /// Number of active PI boosters
+    pub(crate) pi_booster_count: u8,
+    /// PIDs of tasks we are currently boosting (for fast unboost on wake)
+    pub(crate) pi_targets: [u32; MAX_PI_BOOSTERS],
+    /// Number of active PI targets
+    pub(crate) pi_target_count: u8,
     /// Saved CPU context (for kernel threads) - internal use only
     pub(crate) context: CpuContext,
     /// Saved trap frame (for user processes) - use trap_frame() / trap_frame_mut()
@@ -281,6 +345,11 @@ pub struct Task {
 
     /// Cleanup phase for exiting tasks (microtask-driven)
     pub(crate) cleanup_phase: CleanupPhase,
+
+    /// Total CPU time consumed by this task (nanoseconds)
+    pub(crate) cpu_time_ns: u64,
+    /// Counter snapshot when this task was last scheduled to run
+    pub(crate) last_scheduled_at: u64,
 
     /// Data delivered with the last wake (for Mux fast path)
     pub(crate) wake_data: Option<WakeData>,
@@ -379,7 +448,12 @@ impl Task {
         Some(Self {
             id,
             state: TaskState::Ready,
-            priority: Priority::Normal,
+            base_priority: Priority::Normal,
+            effective_priority: Priority::Normal,
+            pi_boosters: [PiBooster::EMPTY; MAX_PI_BOOSTERS],
+            pi_booster_count: 0,
+            pi_targets: [0; MAX_PI_BOOSTERS],
+            pi_target_count: 0,
             context,
             trap_frame: TrapFrame::new(),
             kernel_stack: stack_base as u64,
@@ -409,6 +483,8 @@ impl Task {
             context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
             kernel_stack_owner: None,
             cleanup_phase: CleanupPhase::None,
+            cpu_time_ns: 0,
+            last_scheduled_at: 0,
             wake_data: None,
             #[cfg(debug_assertions)]
             on_runq: false,
@@ -436,7 +512,12 @@ impl Task {
         Self {
             id,
             state: TaskState::Ready,
-            priority: Priority::Low,  // Idle is lowest priority
+            base_priority: Priority::Idle,
+            effective_priority: Priority::Idle,
+            pi_boosters: [PiBooster::EMPTY; MAX_PI_BOOSTERS],
+            pi_booster_count: 0,
+            pi_targets: [0; MAX_PI_BOOSTERS],
+            pi_target_count: 0,
             context,
             trap_frame: TrapFrame::new(),
             kernel_stack: 0,  // Static stack, not from PMM
@@ -466,6 +547,8 @@ impl Task {
             context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
             kernel_stack_owner: None,
             cleanup_phase: CleanupPhase::None,
+            cpu_time_ns: 0,
+            last_scheduled_at: 0,
             wake_data: None,
             #[cfg(debug_assertions)]
             on_runq: false,
@@ -518,7 +601,12 @@ impl Task {
         Some(Self {
             id,
             state: TaskState::Ready,
-            priority: Priority::Normal,
+            base_priority: Priority::Normal,
+            effective_priority: Priority::Normal,
+            pi_boosters: [PiBooster::EMPTY; MAX_PI_BOOSTERS],
+            pi_booster_count: 0,
+            pi_targets: [0; MAX_PI_BOOSTERS],
+            pi_target_count: 0,
             context,
             trap_frame,
             kernel_stack: stack_base as u64,
@@ -548,6 +636,8 @@ impl Task {
             context_restore: ContextRestoreState::Saved,
             kernel_stack_owner: None,
             cleanup_phase: CleanupPhase::None,
+            cpu_time_ns: 0,
+            last_scheduled_at: 0,
             wake_data: None,
             #[cfg(debug_assertions)]
             on_runq: false,
@@ -646,8 +736,132 @@ impl Task {
         false
     }
 
-    pub fn set_priority(&mut self, priority: Priority) {
-        self.priority = priority;
+    /// Set base priority. Recomputes effective priority.
+    /// Returns the old effective priority (for policy notification).
+    pub fn set_priority(&mut self, priority: Priority) -> Priority {
+        let old_effective = self.effective_priority;
+        self.base_priority = priority;
+        self.recompute_effective_priority();
+        old_effective
+    }
+
+    /// Get the effective priority (used by scheduler for task selection).
+    #[inline]
+    pub fn effective_priority(&self) -> Priority {
+        self.effective_priority
+    }
+
+    /// Get the base priority.
+    #[inline]
+    pub fn base_priority(&self) -> Priority {
+        self.base_priority
+    }
+
+    /// Recompute effective_priority from base_priority and PI boosts.
+    /// Lower enum value = higher priority, so we use min().
+    fn recompute_effective_priority(&mut self) {
+        let mut best = self.base_priority;
+        for i in 0..self.pi_booster_count as usize {
+            if !self.pi_boosters[i].is_empty() && self.pi_boosters[i].priority < best {
+                best = self.pi_boosters[i].priority;
+            }
+        }
+        self.effective_priority = best;
+    }
+
+    /// Add a priority inheritance boost from a blocking task.
+    /// Returns true if effective priority changed (caller should notify policy).
+    pub fn add_pi_boost(&mut self, booster_pid: u32, booster_priority: Priority) -> bool {
+        // Don't boost if booster has same or lower priority
+        if booster_priority >= self.effective_priority {
+            return false;
+        }
+        // Check for existing boost from this task
+        for i in 0..self.pi_booster_count as usize {
+            if self.pi_boosters[i].task_id == booster_pid {
+                // Update existing boost
+                self.pi_boosters[i].priority = booster_priority;
+                let old = self.effective_priority;
+                self.recompute_effective_priority();
+                return self.effective_priority != old;
+            }
+        }
+        // Add new booster if space available
+        if (self.pi_booster_count as usize) < MAX_PI_BOOSTERS {
+            self.pi_boosters[self.pi_booster_count as usize] = PiBooster {
+                task_id: booster_pid,
+                priority: booster_priority,
+            };
+            self.pi_booster_count += 1;
+            let old = self.effective_priority;
+            self.recompute_effective_priority();
+            return self.effective_priority != old;
+        }
+        false
+    }
+
+    /// Remove a priority inheritance boost from a specific task.
+    /// Returns true if effective priority changed (caller should notify policy).
+    pub fn remove_pi_boost(&mut self, booster_pid: u32) -> bool {
+        for i in 0..self.pi_booster_count as usize {
+            if self.pi_boosters[i].task_id == booster_pid {
+                // Swap-remove
+                let last = self.pi_booster_count as usize - 1;
+                self.pi_boosters[i] = self.pi_boosters[last];
+                self.pi_boosters[last] = PiBooster::EMPTY;
+                self.pi_booster_count -= 1;
+                let old = self.effective_priority;
+                self.recompute_effective_priority();
+                return self.effective_priority != old;
+            }
+        }
+        false
+    }
+
+    /// Remove all PI boosts on us (used during task exit cleanup).
+    pub fn clear_pi_boosts(&mut self) {
+        self.pi_boosters = [PiBooster::EMPTY; MAX_PI_BOOSTERS];
+        self.pi_booster_count = 0;
+        self.recompute_effective_priority();
+    }
+
+    /// Record that we are boosting target_pid. Called on the blocker task.
+    pub fn add_pi_target(&mut self, target_pid: u32) {
+        if (self.pi_target_count as usize) < MAX_PI_BOOSTERS {
+            self.pi_targets[self.pi_target_count as usize] = target_pid;
+            self.pi_target_count += 1;
+        }
+    }
+
+    /// Get the list of tasks we are currently boosting.
+    pub fn pi_targets(&self) -> &[u32] {
+        &self.pi_targets[..self.pi_target_count as usize]
+    }
+
+    /// Clear our PI target list (called when we wake up).
+    pub fn clear_pi_targets(&mut self) {
+        self.pi_targets = [0; MAX_PI_BOOSTERS];
+        self.pi_target_count = 0;
+    }
+
+    /// Record that this task is starting to run now.
+    #[inline]
+    pub fn mark_scheduled(&mut self, now_ns: u64) {
+        self.last_scheduled_at = now_ns;
+    }
+
+    /// Account CPU time since last scheduled, return elapsed ns.
+    #[inline]
+    pub fn account_cpu_time(&mut self, now_ns: u64) -> u64 {
+        let elapsed = now_ns.saturating_sub(self.last_scheduled_at);
+        self.cpu_time_ns += elapsed;
+        elapsed
+    }
+
+    /// Get total CPU time in nanoseconds.
+    #[inline]
+    pub fn cpu_time_ns(&self) -> u64 {
+        self.cpu_time_ns
     }
 
     pub fn set_parent(&mut self, parent_id: TaskId) {
@@ -940,6 +1154,28 @@ impl Task {
         let old_parent = self.parent_id;
         self.parent_id = 0;
         old_parent
+    }
+
+    /// Total heap pages across all heap mappings
+    pub fn total_heap_pages(&self) -> u32 {
+        let mut total: u32 = 0;
+        for m in &self.heap_mappings {
+            if !m.is_empty() {
+                total = total.saturating_add(m.num_pages as u32);
+            }
+        }
+        total
+    }
+
+    /// Count of non-empty heap mappings
+    pub fn mapping_count(&self) -> u8 {
+        let mut count: u8 = 0;
+        for m in &self.heap_mappings {
+            if !m.is_empty() {
+                count = count.saturating_add(1);
+            }
+        }
+        count
     }
 
     /// Get capabilities as raw bits for syscall return

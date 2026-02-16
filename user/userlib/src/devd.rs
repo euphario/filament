@@ -153,6 +153,8 @@ pub enum DevdCommand {
         filter: SpawnFilter,
         /// Capability bits for spawned child (0 = inherit parent's)
         caps: u64,
+        /// Priority for spawned child (abi::priority::*, INHERIT=0xFF means use parent's)
+        priority: u8,
         /// Optional context for parent-child relay (from devd)
         context: Option<SpawnChildContext>,
     },
@@ -641,6 +643,7 @@ impl DevdClient {
                     binary_len,
                     filter,
                     caps: spawn_hdr.caps,
+                    priority: spawn_hdr.priority,
                     context,
                 }))
             }

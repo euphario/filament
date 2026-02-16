@@ -487,6 +487,21 @@ fn exec_ipc_cleanup(pid: TaskId) {
     });
     if !valid { return; }
 
+    // Remove any PI boosts this task applied to others, and clear boosts on us
+    crate::kernel::task::with_scheduler(|sched| {
+        if let Some(slot) = sched.slot_by_pid(pid) {
+            sched.remove_pi_boosts(slot);
+            if let Some(task) = sched.task_mut(slot) {
+                let old = task.effective_priority();
+                task.clear_pi_boosts();
+                let new = task.effective_priority();
+                if old != new {
+                    sched.notify_priority_change(slot, old, new);
+                }
+            }
+        }
+    });
+
     // DMA stop + subscriber removal + peer notification
     let ipc_peers = crate::kernel::task::Scheduler::do_ipc_cleanup(pid);
     for peer in ipc_peers.iter() {

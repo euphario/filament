@@ -184,10 +184,11 @@ pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u
 }
 
 /// Execute a program with caps, transferring a channel handle to the child
-/// Args: path_ptr, path_len, capabilities (bitmask), channel_handle (raw u32)
+/// Args: path_ptr, path_len, capabilities (bitmask), channel_handle (raw u32), priority (u8)
 /// Returns: child PID on success, negative error on failure
 /// The channel handle is removed from parent's table and placed in child's table at slot 4
-pub(super) fn sys_exec_with_channel(path_ptr: u64, path_len: usize, capabilities: u64, channel_handle: u32) -> i64 {
+/// Priority: abi::priority::INHERIT (0xFF) means inherit parent's priority
+pub(super) fn sys_exec_with_channel(path_ptr: u64, path_len: usize, capabilities: u64, channel_handle: u32, priority: u8) -> i64 {
     let ctx = create_syscall_context();
 
     // Require SPAWN capability
@@ -232,7 +233,7 @@ pub(super) fn sys_exec_with_channel(path_ptr: u64, path_len: usize, capabilities
     // Convert capabilities bitmask to trait type
     let trait_caps = crate::kernel::traits::task::Capabilities(capabilities);
 
-    match ctx.process().spawn(parent_id, SpawnSource::PathWithCapsAndChannel(path, trait_caps, channel_handle)) {
+    match ctx.process().spawn(parent_id, SpawnSource::PathWithCapsAndChannel(path, trait_caps, channel_handle, priority)) {
         Ok(child_id) => child_id as i64,
         Err(e) => e.to_errno(),
     }
@@ -424,10 +425,7 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
     // Use stack buffer to collect entries via trait
     // Limit to 64 to avoid excessive stack usage
     let actual_max = max_entries.min(64);
-    let mut info_buf = [ProcessInfo {
-        pid: 0, ppid: 0, state: 0, liveness_status: 0, cpu: 0, _pad: 0,
-        activity_age_ms: 0, name: [0u8; 16],
-    }; 64];
+    let mut info_buf = [ProcessInfo::empty(); 64];
 
     let count = ctx.process().list_processes(&mut info_buf[..actual_max], actual_max);
 
@@ -437,6 +435,44 @@ pub(super) fn sys_ps_info(buf_ptr: u64, max_entries: usize) -> i64 {
         let info_bytes = unsafe {
             core::slice::from_raw_parts(
                 &info_buf[i] as *const ProcessInfo as *const u8,
+                entry_size,
+            )
+        };
+        if uaccess::copy_to_user(buf_ptr + offset, info_bytes).is_err() {
+            return i as i64;
+        }
+    }
+
+    count as i64
+}
+
+/// Get extended process info list (with resource accounting)
+/// Args: buf_ptr (pointer to ProcessInfoEx array), max_entries
+/// Returns: number of entries written
+pub(super) fn sys_ps_info_ex(buf_ptr: u64, max_entries: usize) -> i64 {
+    if max_entries == 0 {
+        return 0;
+    }
+
+    let entry_size = core::mem::size_of::<abi::ProcessInfoEx>();
+    if let Err(e) = uaccess::validate_user_write(buf_ptr, entry_size * max_entries) {
+        return uaccess_to_errno(e);
+    }
+
+    let ctx = create_syscall_context();
+
+    // Use stack buffer — 64 bytes × 32 = 2KB, safe for kernel stack
+    let actual_max = max_entries.min(32);
+    let mut info_buf = [abi::ProcessInfoEx::empty(); 32];
+
+    let count = ctx.process().list_processes_ex(&mut info_buf[..actual_max], actual_max);
+
+    // Copy entries to userspace
+    for i in 0..count {
+        let offset = (i * entry_size) as u64;
+        let info_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &info_buf[i] as *const abi::ProcessInfoEx as *const u8,
                 entry_size,
             )
         };

@@ -1354,14 +1354,14 @@ impl<D: Driver> DriverRuntime<D> {
         // SpawnChild: framework spawns the child with a supervision channel.
         // Creates a channel pair, passes one end to child via exec_with_channel,
         // keeps the other end for parent-child relay.
-        if let DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, filter, context } = &cmd {
+        if let DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, filter, priority, context } = &cmd {
             let name = core::str::from_utf8(&binary[..*binary_len]).unwrap_or("???");
 
             // Create channel pair for parent-child supervision
             let spawn_result = match Channel::pair() {
                 Ok((parent_end, child_end)) => {
                     let child_handle = child_end.into_raw_handle();
-                    let p = syscall::exec_with_channel(name, *caps, child_handle);
+                    let p = syscall::exec_with_channel(name, *caps, child_handle, *priority);
                     if p > 0 {
                         Some((parent_end, p as u32))
                     } else {

@@ -1726,6 +1726,33 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             }
         });
     } else {
+        // Apply priority inheritance boosts to channel peers before blocking
+        {
+            // Collect peer PIDs from watched channels (outside scheduler lock)
+            let mut peer_pids = [0u32; 4];
+            let mut peer_count = 0usize;
+            for watch_opt in &watches {
+                if peer_count >= 4 { break; }
+                let channel_id = watch_opt.1;
+                if channel_id == 0 { continue; }
+                if let Some(peer_owner) = ipc::get_peer_owner_unchecked(channel_id) {
+                    if peer_owner != 0 && peer_owner != task_id {
+                        // Avoid duplicates
+                        let dup = peer_pids[..peer_count].contains(&peer_owner);
+                        if !dup {
+                            peer_pids[peer_count] = peer_owner;
+                            peer_count += 1;
+                        }
+                    }
+                }
+            }
+            if peer_count > 0 {
+                task::with_scheduler(|sched| {
+                    sched.apply_pi_boosts(slot, &peer_pids[..peer_count]);
+                });
+            }
+        }
+
         // No late events, still blocked → reschedule (task is OFF the CPU)
         crate::kernel::sched::reschedule();
 

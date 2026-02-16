@@ -644,6 +644,13 @@ pub struct Devd {
     /// Pending context KV pairs for next spawn (set by check_class_rules, consumed by spawn_service)
     pending_context_kvs: [ContextKv; MAX_CONTEXT_KV],
     pending_context_kv_count: u8,
+    /// Bitmask of query client slots that failed to be added to the Mux
+    /// (bit N = slot N needs polling because watch() failed)
+    overflow_query_mask: u16,
+    /// Number of active restart timers (for skipping poll_restart_timers)
+    active_restart_count: u8,
+    /// Number of active pending admin requests (for skipping drain_expired_requests)
+    active_request_count: u8,
 }
 
 impl Devd {
@@ -665,6 +672,9 @@ impl Devd {
             next_link_id: 1,
             pending_context_kvs: [const { ContextKv::empty() }; MAX_CONTEXT_KV],
             pending_context_kv_count: 0,
+            overflow_query_mask: 0,
+            active_restart_count: 0,
+            active_request_count: 0,
         }
     }
 
@@ -674,6 +684,22 @@ impl Devd {
 
     fn now_ms() -> u64 {
         syscall::gettime() / 1_000_000
+    }
+
+    /// Whether any state requires periodic polling (overflow clients, timers, requests).
+    fn needs_polling(&self) -> bool {
+        self.overflow_query_mask != 0
+            || self.active_restart_count != 0
+            || self.active_request_count != 0
+    }
+
+    /// Recalculate the Mux timeout based on whether polling is needed.
+    /// 100ms when polling is needed, 0 (block forever) otherwise.
+    fn update_timeout(&mut self) {
+        if let Some(events) = &self.events {
+            let timeout = if self.needs_polling() { 100 } else { 0 };
+            let _ = events.set_timeout(timeout);
+        }
     }
 
     /// Allocate a unique link ID for port↔service pairing.
@@ -1040,6 +1066,8 @@ impl Devd {
                         }
                         if let Some(service) = self.services.get_mut(idx) {
                             service.restart_timer = Some(timer);
+                            self.active_restart_count += 1;
+                            self.update_timeout();
                         }
                     }
                 }
@@ -1055,6 +1083,8 @@ impl Devd {
                         }
                         if let Some(service) = self.services.get_mut(idx) {
                             service.restart_timer = Some(timer);
+                            self.active_restart_count += 1;
+                            self.update_timeout();
                         }
                     }
                 }
@@ -1753,6 +1783,8 @@ impl Devd {
         // accumulating into a 1024-byte buffer that can silently truncate.
         req.relay = client_seq_id == 0;
         self.pending_requests[req_slot] = req;
+        self.active_request_count += 1;
+        self.update_timeout();
         true
     }
 
@@ -1918,6 +1950,8 @@ impl Devd {
         }
 
         self.pending_requests[req_slot] = PendingAdminRequest::empty();
+        self.active_request_count = self.active_request_count.saturating_sub(1);
+        self.update_timeout();
     }
 
     /// Send a raw text response to a query client, chunked on line boundaries
@@ -1945,6 +1979,9 @@ impl Devd {
     /// Drain expired admin requests — called from event loop.
     /// Timeout is a safety net — should not fire in normal operation.
     fn drain_expired_requests(&mut self) {
+        if self.active_request_count == 0 {
+            return;
+        }
         let now = userlib::syscall::gettime();
         for i in 0..MAX_PENDING_REQUESTS {
             if self.pending_requests[i].is_active() && self.pending_requests[i].deadline_ns <= now {
@@ -1985,20 +2022,22 @@ impl Devd {
         }
 
         let now = Self::now_ms();
-        // Clear timer and determine action
+        // Extract timer first (separate borrow scope)
+        let timer = self.services.get_mut(idx).and_then(|s| s.restart_timer.take());
+        if let Some(timer) = timer {
+            if let Some(events) = &mut self.events {
+                let _ = events.unwatch(timer.handle());
+            }
+            self.active_restart_count = self.active_restart_count.saturating_sub(1);
+            self.update_timeout();
+        }
+
+        // Determine action
         let should_spawn = {
             let service = match self.services.get_mut(idx) {
                 Some(s) => s,
                 None => return,
             };
-
-            // Clear the timer
-            if let Some(timer) = service.restart_timer.take() {
-                if let Some(events) = &mut self.events {
-                    let _ = events.unwatch(timer.handle());
-                }
-            }
-
             match service.state {
                 ServiceState::Crashed { .. } => true,
                 ServiceState::Failed { .. } => {
@@ -2044,6 +2083,9 @@ impl Devd {
     /// Called on every event loop iteration (100ms timeout). Timers that ARE
     /// in the Mux fire immediately via Mux events; this catches the rest.
     fn poll_restart_timers(&mut self) {
+        if self.active_restart_count == 0 {
+            return;
+        }
         let now = Self::now_ms();
         let mut ready = [0u16; MAX_SERVICES];
         let mut count = 0;
@@ -2135,6 +2177,9 @@ impl Devd {
                         // Add to event loop for future messages
                         if let Some(events) = &mut self.events {
                             if events.watch(ch_handle).is_err() {
+                                // Mux full — mark this slot for polling
+                                self.overflow_query_mask |= 1 << slot;
+                                self.update_timeout();
                                 uwarn!("devd", "query_watch_failed"; pid = client_pid);
                             }
                         }
@@ -2205,19 +2250,20 @@ impl Devd {
         }
     }
 
-    /// Poll all active query clients for pending messages.
+    /// Poll overflow query clients for pending messages.
     ///
-    /// This handles channels that could not be watched in the Mux due to
-    /// the 16-handle limit.  Called on every event loop iteration (including
-    /// timeouts) so messages are never stuck for long.
+    /// Only polls clients whose channel handles could not be added to the Mux
+    /// (tracked in overflow_query_mask).  Skips entirely when all clients are
+    /// Mux-watched.
     fn poll_query_clients(&mut self) {
-        if self.query_handler.active_count() == 0 {
+        if self.overflow_query_mask == 0 {
             return;
         }
-        for slot in 0..MAX_QUERY_CLIENTS {
-            if self.query_handler.get(slot).is_some() {
-                self.try_read_query_slot(slot);
-            }
+        let mut mask = self.overflow_query_mask;
+        while mask != 0 {
+            let slot = mask.trailing_zeros() as usize;
+            mask &= mask - 1; // clear lowest set bit
+            self.try_read_query_slot(slot);
         }
     }
 
@@ -3257,11 +3303,16 @@ impl Devd {
 
 
     fn remove_query_client(&mut self, slot: usize) {
+        let was_overflow = self.overflow_query_mask & (1 << slot) != 0;
+        self.overflow_query_mask &= !(1 << slot);
         if let Some(channel) = self.query_handler.remove_client(slot) {
-            if let Some(events) = &mut self.events {
-                let _ = events.unwatch(channel.handle());
+            if !was_overflow {
+                if let Some(events) = &mut self.events {
+                    let _ = events.unwatch(channel.handle());
+                }
             }
         }
+        self.update_timeout();
     }
 
     // =========================================================================
@@ -3340,6 +3391,8 @@ impl Devd {
                 if let Some(events) = &mut self.events {
                     let _ = events.unwatch(timer.handle());
                 }
+                self.active_restart_count = self.active_restart_count.saturating_sub(1);
+                self.update_timeout();
             }
             if let Some(service) = self.services.get_mut(idx) {
                 service.state = ServiceState::Stopped { code: 0 };
@@ -3424,7 +3477,7 @@ impl Devd {
             let spawn_path_len = self.ports.resolve_path(port_id, &mut spawn_path);
 
             if let Some(seq_id) = self.query_handler.send_spawn_child_with_path(
-                owner_idx, rule.driver.as_bytes(), port_name, rule.caps,
+                owner_idx, rule.driver.as_bytes(), port_name, rule.caps, rule.priority,
                 Some(&spawn_ctx), &spawn_path[..spawn_path_len],
             ) {
                 self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver, rule.caps, link_id, port_id);
@@ -3684,16 +3737,10 @@ impl Devd {
     // =========================================================================
 
     pub fn run(&mut self) -> ! {
-        // Set a persistent timeout so the Mux wakes periodically even if no
-        // watched handles fire.  This lets us poll query clients whose channel
-        // handles couldn't fit into the Mux (16-handle limit).
-        if let Some(events) = &self.events {
-            if events.set_timeout(100).is_err() {
-                uerror!("devd", "timeout_set_failed";);
-            }
-        } else {
-            uerror!("devd", "events_not_init";);
-        }
+        // Start with no timeout — the Mux blocks until an event fires.
+        // update_timeout() will enable 100ms polling if overflow clients,
+        // restart timers, or pending admin requests appear.
+        self.update_timeout();
 
         loop {
             let events = self.events.as_ref().expect("devd: events not initialized");
@@ -3705,27 +3752,23 @@ impl Devd {
                     if let Some(query_port) = &self.query_port {
                         if handle == query_port.handle() {
                             self.handle_query_port_event();
-                            self.poll_query_clients();
-                            continue;
+                        } else if self.query_handler.find_by_handle(handle).is_some() {
+                            // Query client message?
+                            self.handle_query_client_event(handle);
+                        } else if let Some(idx) = self.services.find_by_timer(handle) {
+                            // Service restart timer?
+                            self.handle_restart_timer(idx);
+                        } else {
+                            // Process exit (watcher)?
+                            self.handle_process_exit(handle);
                         }
-                    }
-
-                    // Query client message?
-                    if self.query_handler.find_by_handle(handle).is_some() {
+                    } else if self.query_handler.find_by_handle(handle).is_some() {
                         self.handle_query_client_event(handle);
-                        self.poll_query_clients();
-                        continue;
-                    }
-
-                    // Service restart timer?
-                    if let Some(idx) = self.services.find_by_timer(handle) {
+                    } else if let Some(idx) = self.services.find_by_timer(handle) {
                         self.handle_restart_timer(idx);
-                        self.poll_query_clients();
-                        continue;
+                    } else {
+                        self.handle_process_exit(handle);
                     }
-
-                    // Process exit (watcher)?
-                    self.handle_process_exit(handle);
                 }
                 Err(SysError::Timeout) | Err(SysError::WouldBlock) => {
                     // Timeout fired or spurious wake — poll query clients
@@ -3735,15 +3778,13 @@ impl Devd {
                 }
             }
 
-            // Poll all query clients for pending messages.  Handles channels
-            // that could not be added to the Mux due to the 16-slot limit.
+            // Poll overflow query clients (skipped when all are Mux-watched)
             self.poll_query_clients();
 
-            // Complete any timed-out admin requests
+            // Complete any timed-out admin requests (skipped when none active)
             self.drain_expired_requests();
 
-            // Poll restart timers via wall-clock comparison.  Catches timers
-            // that couldn't be added to the Mux (16-handle limit).
+            // Poll restart timers (skipped when none active)
             self.poll_restart_timers();
 
             // Flush structured logs so they appear on the console

@@ -323,3 +323,18 @@ pub(super) fn sys_ramfs_list(buf_ptr: u64, buf_len: usize) -> i64 {
 
     count as i64
 }
+
+/// Get caller's base and effective priority
+/// Returns: bits [7:0] = base_priority, bits [15:8] = effective_priority
+pub(super) fn sys_get_priority() -> i64 {
+    let slot = crate::kernel::task::current_slot();
+    crate::kernel::task::with_scheduler(|sched| {
+        if let Some(task) = sched.task(slot) {
+            let base = task.base_priority() as u8;
+            let effective = task.effective_priority() as u8;
+            ((effective as i64) << 8) | (base as i64)
+        } else {
+            -1
+        }
+    })
+}

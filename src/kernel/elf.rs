@@ -610,7 +610,7 @@ fn spawn_from_elf_internal(
             .find_map(|(_, task_opt)| {
                 task_opt.as_ref()
                     .filter(|t| t.id == parent_id)
-                    .map(|t| t.priority)
+                    .map(|t| t.base_priority)
             });
 
         // Compute and apply child capabilities and priority
@@ -687,11 +687,13 @@ pub fn spawn_from_path_with_caps_find(
 }
 
 /// Spawn from path with caps, transferring a channel handle from parent to child at slot 4
+/// Priority: abi::priority::INHERIT (0xFF) means inherit parent's priority
 pub fn spawn_from_path_with_caps_and_channel(
     path: &str,
     parent_id: task::TaskId,
     requested_caps: super::caps::Capabilities,
     channel_handle_raw: u32,
+    priority: u8,
 ) -> Result<(task::TaskId, usize), ElfError> {
     use crate::kernel::object_service::object_service;
     use crate::kernel::object::{Object, ObjectType, ChannelObject};
@@ -713,8 +715,23 @@ pub fn spawn_from_path_with_caps_and_channel(
         }
     };
 
-    // Spawn the child process
+    // Spawn the child process (inherits parent priority by default)
     let (child_id, slot) = spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))?;
+
+    // Apply explicit priority override if not INHERIT
+    if priority != abi::priority::INHERIT {
+        use crate::kernel::task::tcb::Priority;
+        if let Some(prio) = Priority::from_u8(priority) {
+            crate::kernel::task::with_scheduler(|sched| {
+                if let Some(child_task) = sched.task_mut(slot) {
+                    let old = child_task.set_priority(prio);
+                    if old != prio {
+                        sched.notify_priority_change(slot, old, prio);
+                    }
+                }
+            });
+        }
+    }
 
     // Transfer the channel to the child's handle table at slot 4 (SUPERVISION)
     let child_channel = Object::Channel(ChannelObject::new(channel_id));

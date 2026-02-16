@@ -941,7 +941,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 unsafe {
                     if let Some(task) = kernel::task::scheduler().task_mut(slot) {
                         task.set_capabilities(kernel::caps::Capabilities::ALL);
-                        task.set_priority(kernel::task::Priority::High);  // devd is critical
+                        task.set_priority(kernel::task::Priority::Critical);  // devd is critical
                         task.is_init = true;  // Mark as init for heartbeat watchdog
                     }
                 }
@@ -1277,7 +1277,7 @@ pub extern "C" fn recover_devd() {
             unsafe {
                 if let Some(task) = kernel::task::scheduler().task_mut(slot) {
                     task.set_capabilities(kernel::caps::Capabilities::ALL);
-                    task.set_priority(kernel::task::Priority::High);
+                    task.set_priority(kernel::task::Priority::Critical);
                     task.is_init = true;
                 }
             }

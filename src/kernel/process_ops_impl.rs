@@ -209,8 +209,11 @@ impl ProcessOps for KernelProcessOps {
                         state: task.state().state_code(),
                         liveness_status: task.get_liveness_status_code(),
                         cpu: sched.task_cpu(slot).map_or(0xFF, |c| c as u8),
-                        _pad: 0,
+                        base_priority: task.base_priority() as u8,
+                        effective_priority: task.effective_priority() as u8,
+                        _pad: [0; 3],
                         activity_age_ms: task.get_activity_age_ms(current_tick),
+                        cpu_time_ns: task.cpu_time_ns(),
                         name: task.name,
                     };
                     count += 1;
@@ -219,6 +222,62 @@ impl ProcessOps for KernelProcessOps {
 
             count
         })
+    }
+
+    fn list_processes_ex(&self, buf: &mut [abi::ProcessInfoEx], max: usize) -> usize {
+        // Two-pass approach: scheduler lock first, then ObjectService (lock ordering safe)
+        let actual_max = max.min(buf.len());
+
+        // Temporary storage for slot indices (needed for Pass 2)
+        let mut slots = [0usize; 32];
+        let count;
+
+        // Pass 1: Fill all TCB fields under scheduler lock
+        count = task::with_scheduler(|sched| {
+            let mut i = 0usize;
+
+            for (slot, task_opt) in sched.iter_tasks() {
+                if crate::kernel::sched::is_idle_slot(slot) {
+                    continue;
+                }
+                if i >= actual_max || i >= 32 {
+                    break;
+                }
+                if let Some(task) = task_opt {
+                    slots[i] = slot;
+                    buf[i] = abi::ProcessInfoEx {
+                        pid: task.id,
+                        ppid: task.parent_id,
+                        state: task.state().state_code(),
+                        cpu: sched.task_cpu(slot).map_or(0xFF, |c| c as u8),
+                        base_priority: task.base_priority() as u8,
+                        effective_priority: task.effective_priority() as u8,
+                        handle_count: 0, // filled in Pass 2
+                        channel_count: task.channel_count,
+                        cpu_time_ns: task.cpu_time_ns(),
+                        name: task.name,
+                        port_count: task.port_count,
+                        shmem_count: task.shmem_count,
+                        heap_pages: task.total_heap_pages(),
+                        mapping_count: task.mapping_count(),
+                        num_children: task.num_children as u8,
+                        _pad: [0; 6],
+                        capabilities: task.get_capabilities_bits(),
+                    };
+                    i += 1;
+                }
+            }
+
+            i
+        });
+
+        // Pass 2: Fill handle_count from ObjectService (no scheduler lock held)
+        let obj_svc = crate::kernel::object_service::object_service();
+        for i in 0..count {
+            buf[i].handle_count = obj_svc.handle_count(slots[i]);
+        }
+
+        count
     }
 
     fn spawn(&self, parent: TaskId, source: SpawnSource) -> Result<TaskId, ProcessError> {
@@ -249,9 +308,9 @@ impl ProcessOps for KernelProcessOps {
                     Err(_) => Err(ProcessError::NoSlots),
                 }
             }
-            SpawnSource::PathWithCapsAndChannel(path, caps, channel_handle) => {
+            SpawnSource::PathWithCapsAndChannel(path, caps, channel_handle, priority) => {
                 let kernel_caps = Capabilities::from_bits(caps.bits());
-                match elf::spawn_from_path_with_caps_and_channel(path, parent, kernel_caps, channel_handle) {
+                match elf::spawn_from_path_with_caps_and_channel(path, parent, kernel_caps, channel_handle, priority) {
                     Ok((child_id, _)) => Ok(child_id),
                     Err(elf::ElfError::NotExecutable) => Err(ProcessError::InvalidElf),
                     Err(elf::ElfError::BadMagic) => Err(ProcessError::InvalidElf),

@@ -977,6 +977,27 @@ impl ObjectService {
     }
 
     // ========================================================================
+    // Resource Accounting
+    // ========================================================================
+
+    /// Count handles for a task by slot index.
+    ///
+    /// Called OUTSIDE scheduler lock (safe lock ordering: objservice is class 20).
+    /// Returns 0 if slot is invalid or has no table.
+    pub fn handle_count(&self, slot: usize) -> u16 {
+        if slot >= MAX_TASKS {
+            return 0;
+        }
+        match self.lock_slot(slot) {
+            Ok(guard) => match guard.table() {
+                Ok(table) => table.count_used() as u16,
+                Err(_) => 0,
+            },
+            Err(_) => 0,
+        }
+    }
+
+    // ========================================================================
     // Timer Checking (for scheduler tick)
     // ========================================================================
 

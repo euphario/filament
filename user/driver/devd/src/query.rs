@@ -251,7 +251,7 @@ impl QueryHandler {
         trigger_port: &[u8],
         caps: u64,
     ) -> Option<u32> {
-        self.send_spawn_child_with_context(service_idx, binary, trigger_port, caps, None)
+        self.send_spawn_child_with_context(service_idx, binary, trigger_port, caps, abi::priority::INHERIT, None)
     }
 
     /// Send a SPAWN_CHILD command to a driver with capabilities and context.
@@ -264,6 +264,7 @@ impl QueryHandler {
         binary: &[u8],
         trigger_port: &[u8],
         caps: u64,
+        priority: u8,
         ctx: Option<&SpawnChildContext>,
     ) -> Option<u32> {
         let slot = self.find_by_service_idx(service_idx)?;
@@ -280,7 +281,7 @@ impl QueryHandler {
             id
         };
 
-        let cmd = SpawnChild::with_caps(seq_id, caps);
+        let cmd = SpawnChild::with_caps_and_priority(seq_id, caps, priority);
         let mut buf = [0u8; 512];
 
         let len = if let Some(context) = ctx {
@@ -309,12 +310,13 @@ impl QueryHandler {
         binary: &[u8],
         trigger_port: &[u8],
         caps: u64,
+        priority: u8,
         ctx: Option<&SpawnChildContext>,
         path: &[u8],
     ) -> Option<u32> {
         if path.is_empty() {
             return self.send_spawn_child_with_context(
-                service_idx, binary, trigger_port, caps, ctx,
+                service_idx, binary, trigger_port, caps, priority, ctx,
             );
         }
 
@@ -333,7 +335,7 @@ impl QueryHandler {
         };
 
         // Build the base SpawnChild message (without route)
-        let cmd = SpawnChild::with_caps(seq_id, caps);
+        let cmd = SpawnChild::with_caps_and_priority(seq_id, caps, priority);
         let mut base = [0u8; 512];
 
         let base_len = if let Some(context) = ctx {
