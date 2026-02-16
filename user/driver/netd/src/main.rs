@@ -151,27 +151,12 @@ impl NetDriver {
 
     /// Parse BDF from port name like "BB:DD.F:type"
     /// Returns (bus << 8) | (dev << 3) | func
-    fn parse_bdf_from_name(name: &[u8]) -> Option<u32> {
-        // Format: "BB:DD.F:type" — starts directly with hex BDF
-        if name.len() < 7 {
+    /// Parse BDF from spawn context metadata bytes [12..16] (u32 LE)
+    fn parse_bdf_from_metadata(meta: &[u8]) -> Option<u32> {
+        if meta.len() < 16 {
             return None;
         }
-        let hex = |b: u8| -> Option<u8> {
-            match b {
-                b'0'..=b'9' => Some(b - b'0'),
-                b'a'..=b'f' => Some(b - b'a' + 10),
-                b'A'..=b'F' => Some(b - b'A' + 10),
-                _ => None,
-            }
-        };
-        // "BB:DD.F:..."
-        //  01234567...
-        let bus = (hex(name[0])? as u32) << 4 | hex(name[1])? as u32;
-        // name[2] = ':'
-        let dev = (hex(name[3])? as u32) << 4 | hex(name[4])? as u32;
-        // name[5] = '.'
-        let func = hex(name[6])? as u32;
-        Some((bus << 8) | (dev << 3) | func)
+        Some(u32::from_le_bytes([meta[12], meta[13], meta[14], meta[15]]))
     }
 
     /// Pre-fill RX queue with buffers
@@ -498,13 +483,12 @@ impl Driver for NetDriver {
         })?;
 
         let meta = spawn_ctx.metadata();
-        let port_name = spawn_ctx.port_name();
         let (bar0_addr, bar0_size) = NetDriver::parse_metadata(meta).ok_or_else(|| {
             uerror!("netd", "bad_metadata"; len = meta.len() as u32);
             BusError::Internal
         })?;
 
-        let bdf = NetDriver::parse_bdf_from_name(port_name).ok_or_else(|| {
+        let bdf = NetDriver::parse_bdf_from_metadata(meta).ok_or_else(|| {
             uerror!("netd", "bad_bdf";);
             BusError::Internal
         })?;
@@ -653,7 +637,7 @@ impl Driver for NetDriver {
 
         // 12. Register with devd using unified PortInfo
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
-        let mut info = PortInfo::new(b"net0", PortClass::Network);
+        let mut info = PortInfo::new(b"net:0", PortClass::Network);
         info.port_subclass = port_subclass::NET_ETHERNET;
         let mut meta = NetworkMetadata::empty();
         meta.mac.copy_from_slice(&self.mac);

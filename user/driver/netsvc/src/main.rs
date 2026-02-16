@@ -48,7 +48,7 @@ const TAG_DISCOVERY_TIMER: u32 = 1;
 const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
 
 /// NIC port name to discover.
-const NIC_PORT_NAME: &[u8] = b"net0";
+const NIC_PORT_NAME: &[u8] = b"net:0";
 
 /// Static IP configuration (QEMU user networking defaults).
 const STATIC_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);

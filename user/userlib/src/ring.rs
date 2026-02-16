@@ -1219,8 +1219,15 @@ impl LayeredRing {
         let head = h.side_head.load(Ordering::Relaxed);
         let idx = (head & h.side_mask()) as usize;
 
+        // Bounds check: verify the side entry address is within the shmem region.
+        let side_off = h.side_offset();
+        let entry_end = side_off + (idx + 1) * core::mem::size_of::<SideEntry>();
+        if entry_end > self.shmem.size() {
+            return None;
+        }
+
         let entry = unsafe {
-            let side = self.base().add(h.side_offset()) as *const SideEntry;
+            let side = self.base().add(side_off) as *const SideEntry;
             core::ptr::read_volatile(side.add(idx))
         };
 
@@ -1240,8 +1247,16 @@ impl LayeredRing {
         let head = h.side_head.load(Ordering::Relaxed);
         let idx = (head & h.side_mask()) as usize;
 
+        // Bounds check: verify the side entry address is within the shmem region.
+        // Defends against corrupted ring_size/side_size producing out-of-bounds pointers.
+        let side_off = h.side_offset();
+        let entry_end = side_off + (idx + 1) * core::mem::size_of::<SideEntry>();
+        if entry_end > self.shmem.size() {
+            return None;
+        }
+
         let entry = unsafe {
-            let side = self.base().add(h.side_offset()) as *const SideEntry;
+            let side = self.base().add(side_off) as *const SideEntry;
             core::ptr::read_volatile(side.add(idx))
         };
 

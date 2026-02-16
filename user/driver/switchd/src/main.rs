@@ -8,11 +8,11 @@
 //! - Port mirroring
 //! - MIB counters (port statistics)
 //!
-//! Spawned by devd when ethd registers the switch: port.
-//! Registers per-bridge-group ports (br0:, br1:, ...) as NET_BRIDGE_GROUP,
+//! Spawned by devd when ethd registers the switch:0 port.
+//! Registers per-bridge-group ports (bridge:0, bridge:1, ...) as NET_BRIDGE_GROUP,
 //! each of which triggers devd to spawn an ipd instance.
 //!
-//! Default: one bridge group "br0" containing all 5 user ports (P0–P4).
+//! Default: one bridge group "bridge:0" containing all 5 user ports (P0–P4).
 //! Groups can be reconfigured via the config API.
 
 #![no_std]
@@ -77,7 +77,7 @@ const MAX_GROUPS: usize = 8;
 /// Each group registers as a NET_BRIDGE_GROUP port so devd spawns ipd for it.
 #[derive(Clone, Copy)]
 struct BridgeGroup {
-    /// Group name suffix (0 → "br0:", 1 → "br1:", etc.)
+    /// Group name suffix (0 → "bridge:0", 1 → "bridge:1", etc.)
     id: u8,
     /// Bitmask of switch ports in this group (bits 0-4 = ports P0-P4)
     port_mask: u8,
@@ -569,13 +569,13 @@ impl Driver for SwitchDriver {
 // Bridge Group Port Name Helpers
 // =============================================================================
 
-/// Generate port name for a bridge group: "br0:", "br1:", etc.
-fn group_port_name(id: u8) -> [u8; 4] {
-    [b'b', b'r', b'0' + id, b':']
+/// Generate port name for a bridge group: "bridge:0", "bridge:1", etc.
+fn group_port_name(id: u8) -> [u8; 8] {
+    [b'b', b'r', b'i', b'd', b'g', b'e', b':', b'0' + id]
 }
 
 fn group_port_name_len(_id: u8) -> usize {
-    4 // "brN:" is always 4 bytes
+    8 // "bridge:N" is always 8 bytes
 }
 
 // =============================================================================

@@ -18,6 +18,7 @@ pub static FW_ROM_PATCH: &[u8] = include_bytes!("../../../../firmware/mediatek/m
 pub static FW_WM: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_wm.bin");
 pub static FW_DSP: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_dsp.bin");
 pub static FW_WA: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_wa.bin");
+pub static FW_EEPROM: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_eeprom.bin");
 
 // ============================================================================
 // Firmware Header Structures

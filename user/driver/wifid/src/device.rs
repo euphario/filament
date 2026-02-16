@@ -168,8 +168,8 @@ impl Mt7996Dev {
 
     /// Translate a register address through the fixed map table.
     /// If addr < 0x100000, returns as-is (already a BAR offset).
-    /// Otherwise searches FIXED_MAP, falls back to L1 remap.
-    /// Source: mmio.c:317-338 __mt7996_reg_addr()
+    /// Otherwise searches FIXED_MAP, then routes to L1 or L2 remap.
+    /// Source: mmio.c:317-338 __mt7996_reg_addr(), 340-362 __mt7996_reg_remap_addr()
     fn reg_addr(&self, addr: u32) -> u32 {
         if addr < 0x100000 {
             return addr;
@@ -179,7 +179,26 @@ impl Mt7996Dev {
                 return mapped + (addr - phys);
             }
         }
-        self.mt7996_reg_map_l1(addr)
+        self.reg_remap_addr(addr)
+    }
+
+    /// Route unmapped addresses to L1 or L2 remap based on address ranges.
+    /// Source: mmio.c:340-362 __mt7996_reg_remap_addr()
+    fn reg_remap_addr(&self, addr: u32) -> u32 {
+        // L1: INFRA/WFSYS range 0x18000000..=0x18bfffff
+        if addr >= MT_INFRA_BASE && addr <= MT_WFSYS1_PHY_END {
+            return self.mt7996_reg_map_l1(addr);
+        }
+        // L1: CONN_INFRA MCU → convert to physical addr
+        if addr >= MT_INFRA_MCU_START && addr <= MT_INFRA_MCU_END {
+            return self.mt7996_reg_map_l1(addr - MT_INFRA_MCU_START + MT_INFRA_BASE);
+        }
+        // L1: CBTOP 0x70000000..=0x77ffffff (PCIe, MT7996)
+        if addr >= 0x70000000 && addr <= MT_CBTOP1_PHY_END {
+            return self.mt7996_reg_map_l1(addr);
+        }
+        // L2: everything else (including PHYRX 0x83xxxxxx)
+        self.mt7996_reg_map_l2(addr)
     }
 
     /// Write to a translated register address
@@ -239,6 +258,35 @@ impl Mt7996Dev {
         let _ = self.mt76_rr(MT_HIF_REMAP_L1);
 
         HIF_REMAP_BASE_L1 + offset
+    }
+
+    // ========================================================================
+    // L2 Address Remapping — EXACT Linux translation
+    // Source: mmio.c:280-301 mt7996_reg_map_l2()
+    //
+    // L2 has a 4KB window at BAR offset 0x1000 (HIF_REMAP_BASE_L2).
+    // Addr bits[31:12] are written to the remap register at 0x1b4.
+    // Addr bits[11:0] become the offset within the window.
+    // ========================================================================
+
+    /// Remap a high address via L2 remap mechanism
+    pub fn mt7996_reg_map_l2(&self, addr: u32) -> u32 {
+        // MT7996 (not mt7990):
+        // offset = FIELD_GET(GENMASK(11,0), addr)
+        // base = FIELD_GET(GENMASK(31,12), addr)
+        // l2_mask = GENMASK(19,0)
+        // val = FIELD_PREP(GENMASK(19,0), base)
+        let offset = addr & 0xFFF;
+        let base = addr >> 12;
+        let l2_mask: u32 = 0x000F_FFFF; // GENMASK(19,0)
+        let val = base & 0x000F_FFFF;
+
+        let current = self.mt76_rr(MT_HIF_REMAP_L2);
+        self.mt76_wr(MT_HIF_REMAP_L2, (current & !l2_mask) | val);
+        // Read back to push write (memory barrier)
+        let _ = self.mt76_rr(MT_HIF_REMAP_L2);
+
+        HIF_REMAP_BASE_L2 + offset
     }
 
     /// Write to a high address using L1 remap

@@ -34,7 +34,7 @@
 use userlib::syscall;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
-    BlockPortConfig, bus_msg,
+    BlockPortConfig, bus_msg, ConfigKey,
     PortInfo, PortClass, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
@@ -952,7 +952,7 @@ impl FatfsDriver {
     /// and mount name.
     fn register_mount_with_vfsd(&mut self, vfs_shmem_id: u32, port_name: &[u8], ctx: &mut dyn BusCtx) {
         // Discover vfsd's DataPort shmem_id
-        let vfsd_shmem_id = match ctx.discover_port_by_name(b"vfs:") {
+        let vfsd_shmem_id = match ctx.discover_port_by_name(b"vfs:0") {
             Ok(id) => id,
             Err(e) => {
                 uerror!("fatfsd", "discover_vfs_failed";);
@@ -1102,7 +1102,23 @@ fn main() {
     driver_main(b"fatfsd", FatfsDriverWrapper(driver));
 }
 
+const FAT_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_only(b"type"),
+    ConfigKey::read_only(b"mount"),
+    ConfigKey::read_only(b"cluster_size"),
+    ConfigKey::read_only(b"total_sectors"),
+    ConfigKey::read_only(b"open_files"),
+];
+
 struct FatfsDriverWrapper(&'static mut FatfsDriver);
+
+impl FatfsDriverWrapper {
+    fn copy_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
+        let len = src.len().min(buf.len().saturating_sub(pos));
+        buf[pos..pos + len].copy_from_slice(&src[..len]);
+        pos + len
+    }
+}
 
 impl Driver for FatfsDriverWrapper {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
@@ -1115,6 +1131,35 @@ impl Driver for FatfsDriverWrapper {
 
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
         self.0.data_ready(port, ctx)
+    }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        FAT_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        let drv = &self.0;
+        match key {
+            b"type" => Self::copy_to_buf(buf, 0, b"FAT16"),
+            b"mount" => Self::copy_to_buf(buf, 0, &drv.port_name[..drv.port_name_len]),
+            b"cluster_size" => {
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, drv.cluster_size());
+                Self::copy_to_buf(buf, 0, &tmp[..len])
+            }
+            b"total_sectors" => {
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, drv.total_sectors);
+                Self::copy_to_buf(buf, 0, &tmp[..len])
+            }
+            b"open_files" => {
+                let count = drv.open_files.iter().filter(|f| f.in_use).count() as u32;
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, count);
+                Self::copy_to_buf(buf, 0, &tmp[..len])
+            }
+            _ => 0,
+        }
     }
 }
 

@@ -8,6 +8,18 @@
 // Message Header
 // =============================================================================
 
+/// Query header flags (u16 bitfield).
+pub mod query_flags {
+    /// Response is end-of-line: this node has no answer and no children to forward to.
+    pub const EOL: u16 = 0x0001;
+    /// Response contains an error.
+    pub const ERROR: u16 = 0x0002;
+    /// More responses will follow for this seq_id (partial delivery).
+    pub const PARTIAL: u16 = 0x0004;
+    /// Payload contains an address prefix (address_len + address before key).
+    pub const ADDRESSED: u16 = 0x0008;
+}
+
 /// Query message header (8 bytes)
 ///
 /// All query messages start with this header.
@@ -16,7 +28,7 @@
 pub struct QueryHeader {
     /// Message type (see `msg` module)
     pub msg_type: u16,
-    /// Flags (reserved, set to 0)
+    /// Flags (see `query_flags` module)
     pub flags: u16,
     /// Sequence ID for matching requests to responses
     pub seq_id: u32,
@@ -31,6 +43,10 @@ impl QueryHeader {
             flags: 0,
             seq_id,
         }
+    }
+
+    pub const fn with_flags(msg_type: u16, flags: u16, seq_id: u32) -> Self {
+        Self { msg_type, flags, seq_id }
     }
 
     /// Serialize header to bytes
@@ -1694,7 +1710,7 @@ pub struct ServiceEntry {
     /// Last state change timestamp (ms since boot)
     pub last_change: u32,
     /// Bus/port path that triggered this service's spawn (null-padded)
-    /// e.g., "/kernel/bus/uart0" for bus drivers
+    /// e.g., "/uart:0" for bus drivers
     pub bus_path: [u8; 32],
 }
 
@@ -1969,6 +1985,16 @@ impl ServiceInfoResult {
             header: QueryHeader::new(msg::SERVICE_INFO_RESULT, seq_id),
             result: error::OK,
             info_len,
+            _pad: 0,
+        }
+    }
+
+    /// Create an end-of-line response: this node has no answer and no children.
+    pub fn eol(seq_id: u32) -> Self {
+        Self {
+            header: QueryHeader::with_flags(msg::SERVICE_INFO_RESULT, query_flags::EOL, seq_id),
+            result: error::OK,
+            info_len: 0,
             _pad: 0,
         }
     }

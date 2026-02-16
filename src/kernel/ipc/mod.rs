@@ -289,10 +289,10 @@ pub fn port_register_with_info(name: &[u8], owner: u32, info: port::PortInfo) ->
 /// Connect to a port
 /// Returns (client_channel, subscribers_to_wake, port_owner_id)
 pub fn port_connect(name: &[u8], client: u32) -> Result<(ChannelId, waker::WakeList, u32), IpcError> {
-    // Check if this is a kernel bus port (/kernel/bus/*)
+    // Check if this is a kernel bus port (/*:N)
     // These are special: auto-accept and call bus handler
-    const BUS_PREFIX: &[u8] = b"/kernel/bus/";
-    if name.starts_with(BUS_PREFIX) && name.len() > BUS_PREFIX.len() {
+    const BUS_PREFIX: &[u8] = b"/";
+    if name.starts_with(BUS_PREFIX) && name.len() > BUS_PREFIX.len() && name.contains(&b':') {
         return connect_to_bus_port(name, client);
     }
 
@@ -304,9 +304,9 @@ pub fn port_connect(name: &[u8], client: u32) -> Result<(ChannelId, waker::WakeL
 /// Connect to a kernel bus port
 /// Bus ports are kernel-owned, so we auto-accept and call the bus handler
 fn connect_to_bus_port(name: &[u8], client: u32) -> Result<(ChannelId, waker::WakeList, u32), IpcError> {
-    const BUS_PREFIX: &[u8] = b"/kernel/bus/";
+    const BUS_PREFIX: &[u8] = b"/";
 
-    // Get suffix (e.g., "pcie0", "usb0")
+    // Get suffix (e.g., "pcie:0", "usb:0")
     let suffix = &name[BUS_PREFIX.len()..];
     let suffix_str = core::str::from_utf8(suffix).map_err(|_| IpcError::PortNotFound)?;
 

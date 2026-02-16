@@ -40,7 +40,7 @@
 //! ## Ownership Model
 //!
 //! Bus ownership is tracked via port connections:
-//! - Kernel creates bus control ports at boot (e.g., "/kernel/bus/pcie0")
+//! - Kernel creates bus control ports at boot (e.g., "/pcie:0")
 //! - devd connects to claim ownership
 //! - If devd disconnects (crash or intentional), kernel goes to RESETTING
 //! - Atomic handoff supported for live updates
@@ -442,30 +442,21 @@ pub fn reset_all_buses() {
 }
 
 /// Handle port_connect for kernel bus ports
-/// Called synchronously from port::connect() for /kernel/bus/* ports
-/// suffix is the part after "/kernel/bus/" e.g. "usb0", "pcie1", "platform0"
+/// Called synchronously from port::connect() for /* bus ports
+/// suffix is the part after "/" e.g. "pcie:0", "uart:0", "platform:0"
 pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: Pid) -> Result<(), BusError> {
-    // Parse bus type and index from suffix
-    let (bus_type, index) = if suffix.starts_with("usb") {
-        let idx = suffix[3..].parse::<u8>().map_err(|_| BusError::NotFound)?;
-        (BusType::Usb, idx)
-    } else if suffix.starts_with("pcie") {
-        let idx = suffix[4..].parse::<u8>().map_err(|_| BusError::NotFound)?;
-        (BusType::PCIe, idx)
-    } else if suffix.starts_with("platform") {
-        let idx = suffix[8..].parse::<u8>().map_err(|_| BusError::NotFound)?;
-        (BusType::Platform, idx)
-    } else if suffix.starts_with("eth") {
-        let idx = suffix[3..].parse::<u8>().map_err(|_| BusError::NotFound)?;
-        (BusType::Ethernet, idx)
-    } else if suffix.starts_with("uart") {
-        let idx = suffix[4..].parse::<u8>().map_err(|_| BusError::NotFound)?;
-        (BusType::Uart, idx)
-    } else if suffix.starts_with("klog") {
-        let idx = suffix[4..].parse::<u8>().map_err(|_| BusError::NotFound)?;
-        (BusType::Klog, idx)
-    } else {
-        return Err(BusError::NotFound);
+    // Parse "type:index" format (e.g. "pcie:0", "uart:1")
+    let (type_str, idx_str) = suffix.split_once(':').ok_or(BusError::NotFound)?;
+    let index = idx_str.parse::<u8>().map_err(|_| BusError::NotFound)?;
+
+    let bus_type = match type_str {
+        "usb" => BusType::Usb,
+        "pcie" => BusType::PCIe,
+        "platform" => BusType::Platform,
+        "eth" => BusType::Ethernet,
+        "uart" => BusType::Uart,
+        "klog" => BusType::Klog,
+        _ => return Err(BusError::NotFound),
     };
 
     with_bus_registry(|registry| {

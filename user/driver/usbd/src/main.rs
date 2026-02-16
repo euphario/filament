@@ -2352,7 +2352,7 @@ impl Driver for UsbdWrapper {
 
         // Register block port with devd using unified PortInfo
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
-        let mut info = PortInfo::new(b"usb0:msc", PortClass::Block);
+        let mut info = PortInfo::new(b"msc:0", PortClass::Block);
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
 

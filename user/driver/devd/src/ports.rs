@@ -20,7 +20,7 @@ pub const MAX_PORTS: usize = 64;
 /// A registered port with unified PortInfo
 #[derive(Clone, Copy)]
 pub struct RegisteredPort {
-    /// Port name (e.g., "console:")
+    /// Port name (e.g., "console:0")
     name: [u8; MAX_PORT_NAME],
     name_len: u8,
     /// Monotonic port ID assigned at registration
@@ -132,6 +132,7 @@ impl RegisteredPort {
         self.child_link_id = id;
     }
 
+    /// Get the supervision tree source path for this port.
     /// Get raw metadata bytes from PortInfo
     pub fn metadata(&self) -> &[u8] {
         // Safety: accessing raw union field is always safe for reads
@@ -178,13 +179,13 @@ pub trait PortRegistry {
     /// Update shmem_id for an existing port
     fn set_shmem_id(&mut self, name: &[u8], shmem_id: u32) -> Result<(), SysError>;
 
-    /// Register a port with unified PortInfo
+    /// Register a port with unified PortInfo. Returns the assigned port_id.
     fn register_with_port_info(
         &mut self,
         info: &PortInfo,
         owner: u8,
         shmem_id: u32,
-    ) -> Result<(), SysError>;
+    ) -> Result<u8, SysError>;
 
     /// Unregister a port by name
     fn unregister(&mut self, name: &[u8]);
@@ -307,9 +308,9 @@ impl Ports {
             }
             buf[pos..pos + name_len].copy_from_slice(&chain[i].0[..name_len]);
             pos += name_len;
-            // Add colon separator (except after the last segment)
+            // Add '/' separator (except after the last segment)
             if i > 0 && pos < buf.len() {
-                buf[pos] = b':';
+                buf[pos] = b'/';
                 pos += 1;
             }
         }
@@ -342,6 +343,59 @@ impl Ports {
         let slot = self.find_slot(name)?;
         self.ports[slot].as_ref().map(|p| p.port_id)
     }
+
+    /// Find a port by walking a `/`-separated path from root.
+    ///
+    /// Path format: `segment0/segment1/...` (leading `/` is stripped by caller).
+    /// Each segment is matched against port names at the correct tree level.
+    /// Returns the port_id of the final segment, or None if not found.
+    pub fn find_by_path(&self, path: &[u8]) -> Option<u8> {
+        if path.is_empty() {
+            return None;
+        }
+
+        let mut parent_id: u8 = 0xFF; // Start at root
+
+        // Walk segments separated by '/'
+        let mut remaining = path;
+        loop {
+            // Find next '/' separator
+            let (segment, rest) = match remaining.iter().position(|&b| b == b'/') {
+                Some(pos) => (&remaining[..pos], &remaining[pos + 1..]),
+                None => (remaining, &[] as &[u8]),
+            };
+
+            if segment.is_empty() {
+                if rest.is_empty() {
+                    return None;
+                }
+                remaining = rest;
+                continue;
+            }
+
+            // Find port with this name under current parent
+            let found = (0..MAX_PORTS).find(|&i| {
+                self.ports[i]
+                    .as_ref()
+                    .map(|p| p.matches(segment) && p.parent_port_id == parent_id)
+                    .unwrap_or(false)
+            });
+
+            match found {
+                Some(slot) => {
+                    let port = self.ports[slot].as_ref().unwrap();
+                    if rest.is_empty() {
+                        // This is the final segment — found it
+                        return Some(port.port_id);
+                    }
+                    // Continue walking with this port as parent
+                    parent_id = port.port_id;
+                    remaining = rest;
+                }
+                None => return None,
+            }
+        }
+    }
 }
 
 impl PortRegistry for Ports {
@@ -360,7 +414,7 @@ impl PortRegistry for Ports {
         info: &PortInfo,
         owner: u8,
         shmem_id: u32,
-    ) -> Result<(), SysError> {
+    ) -> Result<u8, SysError> {
         let name = info.name_bytes();
         if name.len() > MAX_PORT_NAME {
             return Err(SysError::InvalidArgument);
@@ -376,9 +430,10 @@ impl PortRegistry for Ports {
                     return Err(SysError::AlreadyExists);
                 }
                 // Same owner re-registration — update in place
+                let pid = port.port_id;
                 port.shmem_id = shmem_id;
                 port.port_info = *info;
-                return Ok(());
+                return Ok(pid);
             }
         }
 
@@ -406,7 +461,7 @@ impl PortRegistry for Ports {
         self.ports[slot_idx] = Some(port);
         self.count += 1;
 
-        Ok(())
+        Ok(port_id)
     }
 
     fn unregister(&mut self, name: &[u8]) {
@@ -484,29 +539,29 @@ mod tests {
     /// Helper to register a port with PortInfo (root level, no parent)
     fn register_port(ports: &mut Ports, name: &[u8], owner: u8, class: PortClass) -> Result<(), SysError> {
         let info = PortInfo::new(name, class);
-        ports.register_with_port_info(&info, owner, 0)
+        ports.register_with_port_info(&info, owner, 0).map(|_| ())
     }
 
     /// Helper to register a port with a parent
     fn register_port_with_parent(ports: &mut Ports, name: &[u8], parent: &[u8], owner: u8, class: PortClass) -> Result<(), SysError> {
         let mut info = PortInfo::new(name, class);
         info.parent_port_id = ports.get(parent).map(|p| p.port_id()).unwrap_or(0xFF);
-        ports.register_with_port_info(&info, owner, 0)
+        ports.register_with_port_info(&info, owner, 0).map(|_| ())
     }
 
     #[test]
     fn test_register_unregister() {
         let mut ports = Ports::new();
 
-        assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
+        assert!(register_port(&mut ports, b"test:0", 1, PortClass::Service).is_ok());
         assert_eq!(ports.count(), 1);
         // Port starts Safe (not yet claimed by owner)
-        assert!(!ports.available(b"test:"));
-        assert_eq!(ports.get_state(b"test:"), Some(PortState::Safe));
+        assert!(!ports.available(b"test:0"));
+        assert_eq!(ports.get_state(b"test:0"), Some(PortState::Safe));
 
-        ports.unregister(b"test:");
+        ports.unregister(b"test:0");
         assert_eq!(ports.count(), 0);
-        assert!(!ports.available(b"test:"));
+        assert!(!ports.available(b"test:0"));
     }
 
     #[test]
@@ -514,8 +569,8 @@ mod tests {
         let mut ports = Ports::new();
 
         // Same name, same parent (root), different owner → collision
-        assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
-        assert!(register_port(&mut ports, b"test:", 2, PortClass::Service).is_err());
+        assert!(register_port(&mut ports, b"test:0", 1, PortClass::Service).is_ok());
+        assert!(register_port(&mut ports, b"test:0", 2, PortClass::Service).is_err());
     }
 
     #[test]
@@ -523,13 +578,13 @@ mod tests {
         let mut ports = Ports::new();
 
         // Register parent ports
-        assert!(register_port(&mut ports, b"nvme0", 1, PortClass::StorageController).is_ok());
-        assert!(register_port(&mut ports, b"usb0:msc", 2, PortClass::Usb).is_ok());
+        assert!(register_port(&mut ports, b"block:0", 1, PortClass::StorageController).is_ok());
+        assert!(register_port(&mut ports, b"msc:0", 2, PortClass::Usb).is_ok());
 
-        // Register "0:fat" under nvme0 → ok
-        assert!(register_port_with_parent(&mut ports, b"0:fat", b"nvme0", 3, PortClass::Block).is_ok());
-        // Register "0:fat" under usb0:msc → ok (different parent = no collision)
-        assert!(register_port_with_parent(&mut ports, b"0:fat", b"usb0:msc", 4, PortClass::Block).is_ok());
+        // Register "fat:0" under block:0 → ok
+        assert!(register_port_with_parent(&mut ports, b"fat:0", b"block:0", 3, PortClass::Block).is_ok());
+        // Register "fat:0" under msc:0 → ok (different parent = no collision)
+        assert!(register_port_with_parent(&mut ports, b"fat:0", b"msc:0", 4, PortClass::Block).is_ok());
         assert_eq!(ports.count(), 4);
     }
 
@@ -537,11 +592,11 @@ mod tests {
     fn test_port_id_assigned() {
         let mut ports = Ports::new();
 
-        assert!(register_port(&mut ports, b"pcie0", 1, PortClass::Pcie).is_ok());
-        assert!(register_port(&mut ports, b"uart0", 2, PortClass::Uart).is_ok());
+        assert!(register_port(&mut ports, b"pcie:0", 1, PortClass::Pcie).is_ok());
+        assert!(register_port(&mut ports, b"uart:0", 2, PortClass::Uart).is_ok());
 
-        let p0 = ports.get(b"pcie0").unwrap();
-        let p1 = ports.get(b"uart0").unwrap();
+        let p0 = ports.get(b"pcie:0").unwrap();
+        let p1 = ports.get(b"uart:0").unwrap();
         assert_eq!(p0.port_id(), 0);
         assert_eq!(p1.port_id(), 1);
         assert_eq!(p0.parent_port_id(), 0xFF); // root
@@ -551,25 +606,25 @@ mod tests {
     fn test_resolve_path() {
         let mut ports = Ports::new();
 
-        // Build a tree: pcie0 → 00:02.0 → nvme0 → 0:fat
-        assert!(register_port(&mut ports, b"pcie0", 1, PortClass::Pcie).is_ok());
-        assert!(register_port_with_parent(&mut ports, b"00:02.0", b"pcie0", 2, PortClass::Pcie).is_ok());
-        assert!(register_port_with_parent(&mut ports, b"nvme0", b"00:02.0", 3, PortClass::StorageController).is_ok());
-        assert!(register_port_with_parent(&mut ports, b"0:fat", b"nvme0", 4, PortClass::Block).is_ok());
+        // Build a tree: pcie:0 → nvme:0 → block:0 → fat:0
+        assert!(register_port(&mut ports, b"pcie:0", 1, PortClass::Pcie).is_ok());
+        assert!(register_port_with_parent(&mut ports, b"nvme:0", b"pcie:0", 2, PortClass::StorageController).is_ok());
+        assert!(register_port_with_parent(&mut ports, b"block:0", b"nvme:0", 3, PortClass::Block).is_ok());
+        assert!(register_port_with_parent(&mut ports, b"fat:0", b"block:0", 4, PortClass::Block).is_ok());
 
-        // Resolve path for leaf port (0:fat)
-        let fat_id = ports.get(b"0:fat").unwrap().port_id();
+        // Resolve path for leaf port (fat:0)
+        let fat_id = ports.get(b"fat:0").unwrap().port_id();
         let mut buf = [0u8; 128];
         let len = ports.resolve_path(fat_id, &mut buf);
-        assert_eq!(&buf[..len], b"pcie0:00:02.0:nvme0:0:fat");
+        assert_eq!(&buf[..len], b"pcie:0/nvme:0/block:0/fat:0");
     }
 
     #[test]
     fn test_find_by_id() {
         let mut ports = Ports::new();
 
-        assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
-        let port_id = ports.get(b"test:").unwrap().port_id();
+        assert!(register_port(&mut ports, b"test:0", 1, PortClass::Service).is_ok());
+        let port_id = ports.get(b"test:0").unwrap().port_id();
         assert!(ports.find_by_id(port_id).is_some());
         assert!(ports.find_by_id(0xFE).is_none());
     }
@@ -578,44 +633,70 @@ mod tests {
     fn test_port_state() {
         let mut ports = Ports::new();
 
-        assert!(register_port(&mut ports, b"test:", 1, PortClass::Service).is_ok());
-        assert_eq!(ports.get_state(b"test:"), Some(PortState::Safe));
-        assert!(!ports.is_ready(b"test:"));
+        assert!(register_port(&mut ports, b"test:0", 1, PortClass::Service).is_ok());
+        assert_eq!(ports.get_state(b"test:0"), Some(PortState::Safe));
+        assert!(!ports.is_ready(b"test:0"));
 
         // Transition to Claimed
-        let old = ports.set_state(b"test:", PortState::Claimed);
+        let old = ports.set_state(b"test:0", PortState::Claimed);
         assert_eq!(old, Some(PortState::Safe));
-        assert!(ports.is_ready(b"test:"));
+        assert!(ports.is_ready(b"test:0"));
 
         // Transition to Resetting
-        let old = ports.set_state(b"test:", PortState::Resetting);
+        let old = ports.set_state(b"test:0", PortState::Resetting);
         assert_eq!(old, Some(PortState::Claimed));
-        assert!(!ports.is_ready(b"test:"));
-        assert_eq!(ports.get_state(b"test:"), Some(PortState::Resetting));
+        assert!(!ports.is_ready(b"test:0"));
+        assert_eq!(ports.get_state(b"test:0"), Some(PortState::Resetting));
 
         // Transition back to Safe
-        let old = ports.set_state(b"test:", PortState::Safe);
+        let old = ports.set_state(b"test:0", PortState::Safe);
         assert_eq!(old, Some(PortState::Resetting));
-        assert!(!ports.is_ready(b"test:"));
+        assert!(!ports.is_ready(b"test:0"));
     }
 
     #[test]
     fn test_find_owner() {
         let mut ports = Ports::new();
 
-        assert!(register_port(&mut ports, b"test:", 42, PortClass::Service).is_ok());
-        assert_eq!(ports.find_owner(b"test:"), Some(42));
-        assert_eq!(ports.find_owner(b"nonexistent:"), None);
+        assert!(register_port(&mut ports, b"test:0", 42, PortClass::Service).is_ok());
+        assert_eq!(ports.find_owner(b"test:0"), Some(42));
+        assert_eq!(ports.find_owner(b"nonexistent:0"), None);
+    }
+
+    #[test]
+    fn test_find_by_path() {
+        let mut ports = Ports::new();
+
+        // Build: pcie:0 → wifi:0
+        assert!(register_port(&mut ports, b"pcie:0", 1, PortClass::Pcie).is_ok());
+        assert!(register_port_with_parent(&mut ports, b"wifi:0", b"pcie:0", 2, PortClass::Network).is_ok());
+
+        // Full path
+        let wifi_id = ports.find_by_path(b"pcie:0/wifi:0");
+        assert!(wifi_id.is_some());
+        assert_eq!(wifi_id, ports.get(b"wifi:0").map(|p| p.port_id()));
+
+        // Partial path
+        let pcie_id = ports.find_by_path(b"pcie:0");
+        assert!(pcie_id.is_some());
+        assert_eq!(pcie_id, ports.get(b"pcie:0").map(|p| p.port_id()));
+
+        // Non-existent
+        assert!(ports.find_by_path(b"nonexistent").is_none());
+        assert!(ports.find_by_path(b"pcie:0/nonexistent").is_none());
+
+        // Empty path
+        assert!(ports.find_by_path(b"").is_none());
     }
 
     #[test]
     fn test_port_class() {
         let mut ports = Ports::new();
 
-        assert!(register_port(&mut ports, b"disk0:", 1, PortClass::Block).is_ok());
-        assert_eq!(ports.get(b"disk0:").map(|p| p.port_class()), Some(PortClass::Block));
+        assert!(register_port(&mut ports, b"disk:0", 1, PortClass::Block).is_ok());
+        assert_eq!(ports.get(b"disk:0").map(|p| p.port_class()), Some(PortClass::Block));
 
-        assert!(register_port(&mut ports, b"other:", 2, PortClass::Unknown).is_ok());
-        assert_eq!(ports.get(b"other:").map(|p| p.port_class()), Some(PortClass::Unknown));
+        assert!(register_port(&mut ports, b"other:0", 2, PortClass::Unknown).is_ok());
+        assert_eq!(ports.get(b"other:0").map(|p| p.port_class()), Some(PortClass::Unknown));
     }
 }

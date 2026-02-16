@@ -3494,19 +3494,19 @@ impl Driver for EthDriver {
 
         // Register as net0 using unified PortInfo
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
-        let mut info = PortInfo::new(b"net0", PortClass::Network);
+        let mut info = PortInfo::new(b"net:0", PortClass::Network);
         info.port_subclass = port_subclass::NET_ETHERNET;
         let mut meta = NetworkMetadata::empty();
         meta.mac.copy_from_slice(&self.mac);
         info.set_network_metadata(meta);
         let _ = ctx.register_port_with_info(&info, shmem_id);
-        uinfo!("ethd", "registered"; name = "net0");
+        uinfo!("ethd", "registered"; name = "net:0");
 
-        // Register switch: port to trigger switchd spawn
-        let mut switch_info = PortInfo::new(b"switch:", PortClass::Network);
+        // Register switch:0 port to trigger switchd spawn
+        let mut switch_info = PortInfo::new(b"switch:0", PortClass::Network);
         switch_info.port_subclass = port_subclass::NET_SWITCH;
         let _ = ctx.register_port_with_info(&switch_info, 0);
-        uinfo!("ethd", "registered"; name = "switch:");
+        uinfo!("ethd", "registered"; name = "switch:0");
 
         // Start RX poll timer (10ms)
         if let Ok(mut timer) = Timer::new() {
@@ -3523,12 +3523,12 @@ impl Driver for EthDriver {
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         match msg.msg_type {
             bus_msg::QUERY_INFO => {
-                // Format: "net0 LINK=up/down"
+                // Format: "net:0 LINK=up/down"
                 let mut info = [0u8; 64];
                 let status_str = if self.link_up {
-                    b"net0 LINK=up" as &[u8]
+                    b"net:0 LINK=up" as &[u8]
                 } else {
-                    b"net0 LINK=down" as &[u8]
+                    b"net:0 LINK=down" as &[u8]
                 };
                 info[..status_str.len()].copy_from_slice(status_str);
                 let _ = ctx.respond_info(msg.seq_id, &info[..status_str.len()]);

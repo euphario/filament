@@ -11,6 +11,40 @@ use crate::dma::TxRing;
 use crate::mcu;
 
 impl Mt7996Dev {
+    /// Enable noise floor measurement for a band.
+    /// Source: mac.c:2124-2132 mt7996_mac_enable_nf()
+    ///
+    /// Enables IPI (Interference Power Indicator) measurement for CCA
+    /// (Clear Channel Assessment) and signal detection. Without this,
+    /// the radio cannot determine if the channel is clear for TX.
+    pub fn mac_enable_nf(&self, band: u32) {
+        // mt76_set(dev, MT_WF_PHYRX_CSD_BAND_RXTD12(band),
+        //          MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR_ONLY |
+        //          MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR);
+        self.reg_set(
+            mt_wf_phyrx_band(band, MT_WF_PHYRX_CSD_BAND_RXTD12_OFS),
+            MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR_ONLY
+                | MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR,
+        );
+
+        // mt76_set(dev, MT_WF_PHYRX_BAND_RX_CTRL1(band),
+        //          FIELD_PREP(MT_WF_PHYRX_BAND_RX_CTRL1_IPI_EN, 0x5));
+        self.reg_set(
+            mt_wf_phyrx_band(band, MT_WF_PHYRX_BAND_RX_CTRL1_OFS),
+            0x5, // FIELD_PREP(GENMASK(2,0), 0x5) = 0x5
+        );
+    }
+
+    /// Reset CCA stats for a band.
+    /// Source: mac.c:2062-2069 mt7996_mac_cca_stats_reset()
+    pub fn mac_cca_stats_reset(&self, band: u32) {
+        let reg = mt_wf_phyrx_band(band, MT_WF_PHYRX_BAND_RX_CTRL1_OFS);
+        // mt76_clear(dev, reg, MT_WF_PHYRX_BAND_RX_CTRL1_STSCNT_EN);
+        self.reg_clear(reg, MT_WF_PHYRX_BAND_RX_CTRL1_STSCNT_EN);
+        // mt76_set(dev, reg, BIT(11) | BIT(9));
+        self.reg_set(reg, (1 << 11) | (1 << 9));
+    }
+
     /// Update a WTBL entry's admin count (or other mask bits).
     /// Source: mac.c:97-104 mt7996_mac_wtbl_update()
     fn mac_wtbl_update(&self, idx: u32, mask: u32) -> bool {
@@ -115,7 +149,7 @@ impl Mt7996Dev {
         for (i, &hw_val) in HW_VALUES.iter().enumerate() {
             // odd index for driver, even index for firmware
             // u16 idx = MT7996_BASIC_RATES_TBL + 2 * i;
-            let idx = MT7996_BASIC_RATES_TBL + 2 * (i as u16);
+            let idx = (MT7996_BASIC_RATES_TBL as u16) + 2 * (i as u16);
 
             // rate = FIELD_PREP(MT_TX_RATE_MODE, hw_val >> 8) |
             //        FIELD_PREP(MT_TX_RATE_IDX, hw_val & 0xFF);
@@ -124,7 +158,7 @@ impl Mt7996Dev {
             let rate_bits = (hw_val & 0xFF) as u16;
             let rate = (mode << 6) | (rate_bits & 0x3F);
 
-            self.mcu_set_fixed_rate_table(ring, idx as u8, rate, *seq)?;
+            self.mcu_set_fixed_rate_table(ring, idx as u8, rate, false, 0, *seq)?;
             *seq = seq.wrapping_add(1);
         }
         Ok(())
@@ -135,11 +169,11 @@ impl Mt7996Dev {
     ///
     /// 1. Clear MDP_DCR2.RX_TRANS_SHORT
     /// 2. Clear WTBL admin count for all entries
-    /// 3. RRO module init
-    /// 4. WA HIF TXD version
+    /// 3. RRO module init (WM-only → wm_ring)
+    /// 4. WA HIF TXD version (WA → wa_ring)
     /// 5. Per-band register init (bands 0, 1, 2)
-    /// 6. Basic rate programming (12 MCU commands)
-    pub fn mac_init(&self, ring: &mut TxRing, seq: &mut u8) -> Result<(), i32> {
+    /// 6. Basic rate programming (WM-only → wm_ring)
+    pub fn mac_init(&self, wm_ring: &mut TxRing, wa_ring: &mut TxRing, seq: &mut u8) -> Result<(), i32> {
         // mt76_clear(dev, MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
         self.reg_clear(MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
 
@@ -156,27 +190,29 @@ impl Mt7996Dev {
         }
 
         // RRO module init — init.c:609-626
+        // MCU_WM_UNI_CMD(RRO) — WM-only, uses wm_ring
         // BPI-R4 MT7996 has HIF2, is_mt7996=true.
         // has_hwrro is effectively false (WED not yet initialized).
         // if (dev->hif2)
         //     mt7996_mcu_set_rro(dev, UNI_RRO_SET_PLATFORM_TYPE, 2);  // is_mt7996
-        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_PLATFORM_TYPE, 2, *seq)?;
+        self.mcu_set_rro(wm_ring, mcu::UNI_RRO_SET_PLATFORM_TYPE, 2, *seq)?;
         *seq = seq.wrapping_add(1);
 
         // No HW RRO path:
         // mt7996_mcu_set_rro(dev, UNI_RRO_SET_BYPASS_MODE, 3);
-        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_BYPASS_MODE, 3, *seq)?;
+        self.mcu_set_rro(wm_ring, mcu::UNI_RRO_SET_BYPASS_MODE, 3, *seq)?;
         *seq = seq.wrapping_add(1);
 
         // mt7996_mcu_set_rro(dev, UNI_RRO_SET_TXFREE_PATH, 1);
-        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_TXFREE_PATH, 1, *seq)?;
+        self.mcu_set_rro(wm_ring, mcu::UNI_RRO_SET_TXFREE_PATH, 1, *seq)?;
         *seq = seq.wrapping_add(1);
 
         // WA HIF TXD version — init.c:628-630
+        // MCU_WA_PARAM_CMD(SET) — WA command, uses wa_ring
         // mt7996_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(SET),
         //                   MCU_WA_PARAM_HW_PATH_HIF_VER, HIF_TXD_V2_1, 0);
         const HIF_TXD_V2_1: u32 = 0x21;
-        self.mcu_wa_cmd(ring, mcu::MCU_WA_PARAM_HW_PATH_HIF_VER, HIF_TXD_V2_1, 0, *seq)?;
+        self.mcu_wa_cmd(wa_ring, mcu::MCU_WA_PARAM_HW_PATH_HIF_VER, HIF_TXD_V2_1, 0, *seq)?;
         *seq = seq.wrapping_add(1);
 
         // Per-band init — init.c:632-633
@@ -187,8 +223,9 @@ impl Mt7996Dev {
         }
 
         // Basic rates — init.c:635
+        // MCU_WM_UNI_CMD(FIXED_RATE_TABLE) — WM-only, uses wm_ring
         // mt7996_mac_init_basic_rates(dev);
-        self.mac_init_basic_rates(ring, seq)?;
+        self.mac_init_basic_rates(wm_ring, seq)?;
 
         uinfo!("mac", "mac_init_done");
         Ok(())

@@ -504,13 +504,13 @@ pub mod bus_msg {
 /// Payload layout for CONFIG_SET: `key\0value\0`
 /// Payload layout for CONFIG_RESPONSE: value bytes (no null terminator needed)
 pub mod config_key {
-    pub const NET_IP: &[u8] = b"net.ip";
-    pub const NET_PREFIX: &[u8] = b"net.prefix";
-    pub const NET_GATEWAY: &[u8] = b"net.gateway";
-    pub const NET_DHCP: &[u8] = b"net.dhcp";
-    pub const NET_MAC: &[u8] = b"net.mac";
-    pub const NET_STATE: &[u8] = b"net.state";
-    pub const NET_SUMMARY: &[u8] = b"net.summary";
+    pub const NET_IP: &[u8] = b"ip";
+    pub const NET_PREFIX: &[u8] = b"prefix";
+    pub const NET_GATEWAY: &[u8] = b"gateway";
+    pub const NET_DHCP: &[u8] = b"dhcp";
+    pub const NET_MAC: &[u8] = b"mac";
+    pub const NET_STATE: &[u8] = b"state";
+    pub const NET_SUMMARY: &[u8] = b"summary";
 }
 
 // ============================================================================
@@ -523,7 +523,7 @@ pub mod config_key {
 /// uses them to auto-generate the summary (empty-key GET) and the `keys=` line
 /// listing writable keys.
 pub struct ConfigKey {
-    /// Key name (e.g. b"net.ip").
+    /// Key name (e.g. b"ip").
     pub name: &'static [u8],
     /// Whether SET is supported for this key.
     pub writable: bool,
@@ -661,7 +661,7 @@ pub trait BusCtx {
     /// Connect to a kernel bus as owner (claim it).
     ///
     /// Encapsulates the full kernel bus protocol:
-    /// 1. Connect to the bus port (e.g., `/kernel/bus/pcie0`)
+    /// 1. Connect to the bus port (e.g., `/pcie:0`)
     /// 2. Receive StateSnapshot (kernel sends on connect)
     /// 3. Register the channel with Mux for hardware messages
     ///

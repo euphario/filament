@@ -17,7 +17,7 @@ use crate::{kinfo, kdebug, kerror};
 pub const MAX_DEVICES_PER_BUS: usize = 32;
 
 /// Bus control port name prefix
-pub const BUS_PORT_PREFIX: &str = "/kernel/bus/";
+pub const BUS_PORT_PREFIX: &str = "/";
 
 /// Get current uptime in milliseconds
 fn uptime_ms() -> u64 {
@@ -152,7 +152,7 @@ pub struct BusController {
     pub owner_ch: Option<ChannelId>,
     pub owner_pid: Option<Pid>,
 
-    /// Control port name (e.g., "/kernel/bus/pcie0")
+    /// Control port name (e.g., "/pcie:0")
     pub port_name: [u8; 32],
     pub port_name_len: usize,
 
@@ -228,7 +228,7 @@ impl BusController {
         // Use set_initial_state for constructor-like initialization
         self.set_initial_state(BusState::Safe);
 
-        // Build port name: "/kernel/bus/pcie0" or "/kernel/bus/usb0"
+        // Build port name: "/pcie:0" or "/usb:0"
         let prefix = BUS_PORT_PREFIX.as_bytes();
         let type_str = bus_type.as_str().as_bytes();
 
@@ -245,7 +245,11 @@ impl BusController {
                 pos += 1;
             }
         }
-        // Add index as ASCII digit
+        // Add ':' separator and index digit: "pcie:0"
+        if pos < self.port_name.len() {
+            self.port_name[pos] = b':';
+            pos += 1;
+        }
         if pos < self.port_name.len() {
             self.port_name[pos] = b'0' + index;
             pos += 1;

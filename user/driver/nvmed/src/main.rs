@@ -769,7 +769,7 @@ impl Driver for NvmeDriver {
         // Register block port with devd using unified PortInfo
         // Non-zero shmem_id triggers block orchestration (devd spawns partd)
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
-        let mut info = PortInfo::new(b"nvme0:", PortClass::Block);
+        let mut info = PortInfo::new(b"block:0", PortClass::Block);
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
 

@@ -121,6 +121,19 @@ pub const HIF_REMAP_L1_OFFSET: u32 = 0x24;
 pub const HIF_REMAP_BASE_L1: u32 = 0x130000;
 pub const MT_HIF_REMAP_L1: u32 = CONN_BUS_CR_VON_BASE + HIF_REMAP_L1_OFFSET;
 
+// L2 remap — Source: mmio.c mt7996_reg_map_l2(), regs.h:630-637
+// MT7996 offsets from mt7996_offs[]: HIF_REMAP_L2=0x1b4, HIF_REMAP_BASE_L2=0x1000
+pub const MT_HIF_REMAP_L2: u32 = 0x1b4;
+pub const HIF_REMAP_BASE_L2: u32 = 0x1000;
+
+// Address range constants for L1/L2 routing
+// Source: regs.h:646-654, mmio.c:340-362 __mt7996_reg_remap_addr()
+pub const MT_WFSYS1_PHY_END: u32 = 0x18bfffff;
+pub const MT_INFRA_MCU_START: u32 = 0x7c000000;
+pub const MT_INFRA_MCU_END: u32 = 0x7c3fffff;
+pub const MT_INFRA_BASE: u32 = 0x18000000;
+pub const MT_CBTOP1_PHY_END: u32 = 0x77ffffff;
+
 // WFSYS reset register (accessed via L1 remap)
 pub const MT_WF_SUBSYS_RST: u32 = 0x70028600;
 
@@ -137,6 +150,22 @@ pub const MT_PCIE_RECOG_ID_SEM: u32 = 1 << 31;
 // SWDEF registers
 pub const MT_SWDEF_MODE: u32 = 0x8143C;
 pub const MT_SWDEF_NORMAL_MODE: u32 = 0;
+
+// ADIE (Analog Die) registers — accessed via MCU rf_regval
+// regs.h:722-724
+pub const MT_ADIE_CHIP_ID_0: u32 = 0x0f00002c;
+pub const MT_ADIE_CHIP_ID_1: u32 = 0x1f00002c;
+
+// GPIO pad register — init.c:1160 variant detection
+pub const MT_PAD_GPIO: u32 = 0x700056f0;
+pub const MT_PAD_GPIO_ADIE_COMB_MASK: u32 = 0x3 << 15;
+
+// MCU REG_ACCESS command — mt76_connac_mcu.h:1278
+pub const MCU_UNI_CMD_REG_ACCESS: u16 = 0x0d;
+pub const UNI_CMD_ACCESS_RF_REG_BASIC: u16 = 1;
+
+// PHYRX register for IPI enable readback — regs.h
+pub const MT_WF_PHYRX_BAND_RX_CTRL1_IPI_EN_MASK: u32 = 0x7;
 
 // ============================================================================
 // Queue register offsets (from mt76.h)
@@ -263,7 +292,64 @@ pub const WF_AGG_BASE: [u32; 3] = [0x820e2000, 0x820f2000, 0x830e2000];
 /// WF_WTBLOFF per-band base addresses
 pub const WF_WTBLOFF_BASE: [u32; 3] = [0x820e9000, 0x820f9000, 0x830e9000];
 
+// WF_ARB (Arbiter) — mmio.c:22, regs.h:351-356
+pub const WF_ARB_BASE: [u32; 3] = [0x820e3000, 0x820f3000, 0x830e3000];
+// ARB_SCR — regs.h:354 — controls TX/RX enable/disable
+pub const MT_ARB_SCR_OFS: u32 = 0x000;
+pub const MT_ARB_SCR_TX_DISABLE: u32 = 1 << 8;
+pub const MT_ARB_SCR_RX_DISABLE: u32 = 1 << 9;
+
+// PLE (Packet List Engine) — debugfs.c:687-691
+// Base: 0x820c0000
+pub const MT_PLE_BASE: u32 = 0x820c0000;
+// FL_Q_EMPTY: bit 10 = BCN_Q0 empty, bit 14 = BCN_Q1 empty — debugfs.c:688
+pub const MT_PLE_FL_Q_EMPTY: u32 = MT_PLE_BASE + 0x360;
+// FL_Q_CTRL: write (pid<<10 | qid<<24 | BIT(31)) to query queue depth
+pub const MT_PLE_FL_Q0_CTRL: u32 = MT_PLE_BASE + 0x3e0;
+pub const MT_PLE_FL_Q3_CTRL: u32 = MT_PLE_BASE + 0x3ec;
+
+// WF_TMAC (TX MAC) — mmio.c:23, regs.h:368-383
+pub const WF_TMAC_BASE: [u32; 3] = [0x820e4000, 0x820f4000, 0x830e4000];
+// Timeout/IFS timing registers — mac.c:2010-2040 mt7996_mac_set_timing()
+pub const MT_TMAC_CDTR_OFS: u32 = 0x0c8;  // CCK detection timeout — regs.h:374
+pub const MT_TMAC_ODTR_OFS: u32 = 0x0cc;  // OFDM detection timeout — regs.h:377
+pub const MT_TMAC_ICR0_OFS: u32 = 0x014;  // IFS control 0 (EIFS/RIFS/SIFS/SLOT) — regs.h:382
+pub const MT_TMAC_ICR1_OFS: u32 = 0x018;  // IFS control 1 (EIFS_CCK) — regs.h:390
+
 // RMAC offsets + masks — from regs.h
+
+// RFCR (RX Filter Control Register) — regs.h:362-389
+// MT_WF_RFCR(_band) = MT_WF_RMAC(_band, 0x000)
+pub const MT_WF_RFCR_OFS: u32 = 0x000;
+pub const MT_WF_RFCR_DROP_STBC_MULTI: u32 = 1 << 0;
+pub const MT_WF_RFCR_DROP_FCSFAIL: u32 = 1 << 1;
+pub const MT_WF_RFCR_DROP_PROBEREQ: u32 = 1 << 4;
+pub const MT_WF_RFCR_DROP_MCAST: u32 = 1 << 5;
+pub const MT_WF_RFCR_DROP_BCAST: u32 = 1 << 6;
+pub const MT_WF_RFCR_DROP_MCAST_FILTERED: u32 = 1 << 7;
+pub const MT_WF_RFCR_DROP_A3_MAC: u32 = 1 << 8;
+pub const MT_WF_RFCR_DROP_A3_BSSID: u32 = 1 << 9;
+pub const MT_WF_RFCR_DROP_A2_BSSID: u32 = 1 << 10;
+pub const MT_WF_RFCR_DROP_OTHER_BEACON: u32 = 1 << 11;
+pub const MT_WF_RFCR_DROP_FRAME_REPORT: u32 = 1 << 12;
+pub const MT_WF_RFCR_DROP_CTL_RSV: u32 = 1 << 13;
+pub const MT_WF_RFCR_DROP_CTS: u32 = 1 << 14;
+pub const MT_WF_RFCR_DROP_RTS: u32 = 1 << 15;
+pub const MT_WF_RFCR_DROP_DUPLICATE: u32 = 1 << 16;
+pub const MT_WF_RFCR_DROP_OTHER_BSS: u32 = 1 << 17;
+pub const MT_WF_RFCR_DROP_OTHER_UC: u32 = 1 << 18;
+pub const MT_WF_RFCR_DROP_OTHER_TIM: u32 = 1 << 19;
+pub const MT_WF_RFCR_DROP_NDPA: u32 = 1 << 20;
+pub const MT_WF_RFCR_DROP_UNWANTED_CTL: u32 = 1 << 21;
+
+// RFCR1 (secondary filter) — regs.h:391-398
+pub const MT_WF_RFCR1_OFS: u32 = 0x004;
+pub const MT_WF_RFCR1_DROP_ACK: u32 = 1 << 4;
+pub const MT_WF_RFCR1_DROP_BF_POLL: u32 = 1 << 5;
+pub const MT_WF_RFCR1_DROP_BA: u32 = 1 << 6;
+pub const MT_WF_RFCR1_DROP_CFEND: u32 = 1 << 7;
+pub const MT_WF_RFCR1_DROP_CFACK: u32 = 1 << 8;
+
 pub const MT_WF_RMAC_RSVD0_OFS: u32 = 0x03e0;
 pub const MT_WF_RMAC_RSVD0_EIFS_CLR: u32 = 1 << 21;
 
@@ -308,13 +394,23 @@ pub const MT_WTBL_UPDATE_BUSY: u32 = 1u32 << 31;
 // WTBL size defaults for MT7996 — from mt7996.h
 pub const MT7996_WTBL_SIZE_GROUP: u32 = 4;
 pub const MT7996_WTBL_BMC_SIZE: u32 = 64;
+// mt7996_wtbl_size(dev) = (group << 8) + bmc_size = 1088
+// MT7996_WTBL_RESERVED = wtbl_size - 1 = 1087 — BMC STA goes here
+// Linux: mt7996.h:18 — mlink->wcid.idx = MT7996_WTBL_RESERVED - mlink->idx
+pub const MT7996_WTBL_RESERVED: u16 = (MT7996_WTBL_SIZE_GROUP * 256 + MT7996_WTBL_BMC_SIZE - 1) as u16;
 
-// Rate table — from mt7996.h
-pub const MT7996_BASIC_RATES_TBL: u16 = 31;
+// Rate table — from mt7996/mt7996.h:105-106
+pub const MT7996_BEACON_RATES_TBL: u8 = 25;
+pub const MT7996_BASIC_RATES_TBL: u8 = 31;
 
 // Rate encoding — from mt76.h
 pub const MT_TX_RATE_MODE: u32 = 0x3C0;                        // GENMASK(9,6)
 pub const MT_TX_RATE_IDX: u32 = 0x3F;                          // GENMASK(5,0)
+
+// PHY mode bits — mt76_connac_mcu.h:915-920
+pub const PHY_MODE_B: u8 = 1 << 1;   // BIT(1) = 0x02
+pub const PHY_MODE_G: u8 = 1 << 2;   // BIT(2) = 0x04
+pub const PHY_MODE_GN: u8 = 1 << 3;  // BIT(3) = 0x08
 
 // ============================================================================
 // MCU UNI command IDs — from mt76_connac_mcu.h enum
@@ -336,6 +432,17 @@ pub const UNI_BAND_CONFIG_RTS_THRESHOLD: u16 = 0x08;
 pub const MT7996_CRIT_TEMP: u32 = 110;   // restore temp (°C)
 pub const MT7996_MAX_TEMP: u32 = 120;    // trigger temp (°C)
 pub const MT7996_THERMAL_THROTTLE_MAX: u8 = 100;
+
+// ============================================================================
+// TX Power — mcu.h, mt76_connac_mcu.h
+// ============================================================================
+
+// mt76_connac_mcu.h:1293
+pub const MCU_UNI_CMD_TXPOWER: u16 = 0x2b;
+// mt7996/mcu.h:906
+pub const UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL: u16 = 4;
+// mt7996/mt7996.h:97
+pub const MT7996_SKU_PATH_NUM: usize = 494;
 
 // ============================================================================
 // Channel switch — mcu.h, mt76_connac_mcu.h
@@ -361,7 +468,6 @@ pub const CH_SWITCH_SCAN_BYPASS_DPD: u8 = 9;
 
 // Channel band encoding
 pub const CH_BAND_2GHZ: u8 = 0;
-#[allow(dead_code)]
 pub const CH_BAND_5GHZ: u8 = 1;
 #[allow(dead_code)]
 pub const CH_BAND_6GHZ: u8 = 2;
@@ -389,16 +495,33 @@ pub const MCU_UNI_CMD_STA_REC_UPDATE: u16 = 0x03;
 // DEV_INFO TLV tags
 pub const DEV_INFO_ACTIVE: u16 = 0;
 
-// BSS_INFO TLV tags
+// BSS_INFO TLV tags — mt76_connac_mcu.h:1363-1382
 pub const UNI_BSS_INFO_BASIC: u16 = 0;
-pub const UNI_BSS_INFO_BCN_CONTENT: u16 = 7;  // mt76_connac_mcu.h:1369
+pub const UNI_BSS_INFO_RA: u16 = 1;
+pub const UNI_BSS_INFO_RLM: u16 = 2;
+pub const UNI_BSS_INFO_BCN_CONTENT: u16 = 7;
+pub const UNI_BSS_INFO_RATE: u16 = 11;
 pub const UNI_BSS_INFO_SEC: u16 = 16;
+pub const UNI_BSS_INFO_TXCMD: u16 = 18;
+pub const UNI_BSS_INFO_IFS_TIME: u16 = 23;
+pub const UNI_BSS_INFO_MLD: u16 = 26;
 
-// STA_REC TLV tags
+// STA_REC TLV tags — mt76_connac_mcu.h:802-836
 pub const STA_REC_BASIC: u16 = 0;
+pub const STA_REC_TX_PROC: u16 = 8;       // for hdr trans and CSO in CR4
+pub const STA_REC_HDR_TRANS: u16 = 0x2B;
 
-// Connection types — mt76_connac_mcu.h
-pub const CONNECTION_INFRA_STA: u32 = 0x04 | 0x02;  // STA_TYPE_STA | NETWORK_INFRA
+// VOW (airtime fairness) — mcu.h:860
+pub const UNI_VOW_DRR_CTRL: u16 = 0;
+
+// Connection types — mt76_connac_mcu.h:860-876
+pub const STA_TYPE_STA: u32 = 1 << 0;    // BIT(0)
+pub const STA_TYPE_AP: u32 = 1 << 1;     // BIT(1)
+pub const NETWORK_INFRA: u32 = 1 << 16;  // BIT(16)
+pub const CONNECTION_INFRA_STA: u32 = STA_TYPE_STA | NETWORK_INFRA;  // 0x10001
+pub const STA_TYPE_BC: u32 = 1 << 5;    // BIT(5)
+pub const CONNECTION_INFRA_AP: u32 = STA_TYPE_AP | NETWORK_INFRA;    // 0x10002
+pub const CONNECTION_INFRA_BC: u32 = STA_TYPE_BC | NETWORK_INFRA;    // 0x10020
 pub const CONN_STATE_DISCONNECT: u8 = 0;
 pub const CONN_STATE_PORT_SECURE: u8 = 2;
 
@@ -427,6 +550,102 @@ pub const MT_TX_TYPE_FW: u8 = 3;
 /// Header format: 802.11 — mt76_connac3_mac.h:167
 pub const MT_HDR_FORMAT_802_11: u8 = 2;
 
+// ============================================================================
+// MIB counter registers — from regs.h
+// WF_MIB_BASE: band 0 = 0x820ed000, band 1 = 0x820fd000, band 2 = 0x830ed000
+// ============================================================================
+
+pub const WF_MIB_BASE: [u32; 3] = [0x820ed000, 0x820fd000, 0x830ed000];
+
+#[inline]
+pub const fn mt_wf_mib(band: usize, ofs: u32) -> u32 { WF_MIB_BASE[band] + ofs }
+
+// Channel idle count — regs.h:259
+pub const MT_MIB_SDR6_OFS: u32 = 0x020;
+
+// TX AMPDU count — regs.h:268
+pub const MT_MIB_TSCR0_OFS: u32 = 0x6b0;
+
+// TX MPDU attempts (all mpdus in ampdu, regardless of success) — regs.h:272
+pub const MT_MIB_TSCR3_OFS: u32 = 0x6bc;
+
+// TX MPDU success — regs.h:275
+pub const MT_MIB_TSCR4_OFS: u32 = 0x6c0;
+
+// RX FCS error count — mmio.c:38 offset 0x7ac for MT7996
+pub const MT_MIB_RSCR1_OFS: u32 = 0x7ac;
+
+// RX vector mismatch — mmio.c:34 offset 0x720 for MT7996
+pub const MT_MIB_RVSR0_OFS: u32 = 0x720;
+
+// RX MPDU count — mmio.c:43 offset 0x964 for MT7996
+pub const MT_MIB_RSCR31_OFS: u32 = 0x964;
+
+// RX FIFO full — mmio.c:44 offset 0x96c for MT7996
+pub const MT_MIB_RSCR33_OFS: u32 = 0x96c;
+
+// RX delimiter fail — mmio.c:45 offset 0x974 for MT7996
+pub const MT_MIB_RSCR35_OFS: u32 = 0x974;
+
+// ============================================================================
+// LPON (TSF timer) — regs.h:217-228
+// WF_LPON_BASE band 0 = 0x820eb000 (in FIXED_MAP, size 0x0400)
+// ============================================================================
+
+pub const WF_LPON_BASE: [u32; 3] = [0x820eb000, 0x820fb000, 0x830eb000];
+
+#[inline]
+pub const fn mt_wf_lpon(band: usize, ofs: u32) -> u32 { WF_LPON_BASE[band] + ofs }
+
+// TSF read: write SW_READ to TCR, then read UTTR0/UTTR1
+// regs.h:220-228
+pub const MT_LPON_UTTR0_OFS: u32 = 0x360;
+pub const MT_LPON_UTTR1_OFS: u32 = 0x364;
+pub const MT_LPON_TCR_OFS: u32 = 0x0a8;  // TCR(band, n=0) for BSS 0
+pub const MT_LPON_TCR_SW_MODE: u32 = 0x3;     // GENMASK(1,0)
+pub const MT_LPON_TCR_SW_READ: u32 = 0x3;     // GENMASK(1,0) — both bits set
+
+// ============================================================================
+// PHYRX registers — from regs.h:749-774
+// These are accessed via L2 remap (0x83xxxxxx > CBTOP1_PHY_END)
+// ============================================================================
+
+// PHYRX BAND base — regs.h:756
+// MT_WF_PHYRX_BAND(_band, ofs) = 0x83080000 + (band << 20) + ofs
+pub const MT_WF_PHYRX_BAND_BASE: u32 = 0x83080000;
+
+#[inline]
+pub const fn mt_wf_phyrx_band(band: u32, ofs: u32) -> u32 {
+    MT_WF_PHYRX_BAND_BASE + (band << 20) + ofs
+}
+
+// RX_CTRL1 — regs.h:767-768
+// MT_WF_PHYRX_BAND_RX_CTRL1(_band) = MT_WF_PHYRX_BAND(_band, 0x2004)
+pub const MT_WF_PHYRX_BAND_RX_CTRL1_OFS: u32 = 0x2004;
+pub const MT_WF_PHYRX_BAND_RX_CTRL1_IPI_EN: u32 = 0x7; // GENMASK(2,0)
+pub const MT_WF_PHYRX_BAND_RX_CTRL1_STSCNT_EN: u32 = 0x7 << 9; // GENMASK(11,9)
+
+// CSD_BAND_RXTD12 — regs.h:772-774
+// MT_WF_PHYRX_CSD_BAND_RXTD12(_band) = MT_WF_PHYRX_BAND(_band, 0x8230)
+pub const MT_WF_PHYRX_CSD_BAND_RXTD12_OFS: u32 = 0x8230;
+pub const MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR_ONLY: u32 = 1 << 18;
+pub const MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR: u32 = 1 << 29;
+
+// ============================================================================
+// RXD field definitions — mt76_connac3_mac.h
+// Used for parsing received frames on BAND0 data RX ring
+// ============================================================================
+
+pub const MT_RXD0_LENGTH: u32 = 0xFFFF;           // GENMASK(15,0) — packet length
+pub const MT_RXD1_NORMAL_GROUP_1: u32 = 1 << 16;  // IV (4 bytes)
+pub const MT_RXD1_NORMAL_GROUP_2: u32 = 1 << 17;  // Timestamp (4 bytes)
+pub const MT_RXD1_NORMAL_GROUP_3: u32 = 1 << 18;  // P-RXV (16 bytes, RSSI/RCPI)
+pub const MT_RXD1_NORMAL_GROUP_4: u32 = 1 << 19;  // FC/QoS/Seq (16 bytes)
+pub const MT_RXD1_NORMAL_GROUP_5: u32 = 1 << 20;  // C-RXV (24 bytes, HE/EHT)
+pub const MT_RXD2_NORMAL_HDR_TRANS: u32 = 1 << 7;
+pub const MT_RXD2_NORMAL_HDR_OFFSET: u32 = 0x7 << 13; // GENMASK(15,13) — pad units×2
+pub const MT_RXD3_NORMAL_FCS_ERR: u32 = 1 << 24;
+
 // Per-band register address helpers
 #[inline]
 pub const fn mt_wf_rmac(band: usize, ofs: u32) -> u32 { WF_RMAC_BASE[band] + ofs }
@@ -434,3 +653,7 @@ pub const fn mt_wf_rmac(band: usize, ofs: u32) -> u32 { WF_RMAC_BASE[band] + ofs
 pub const fn mt_wf_agg(band: usize, ofs: u32) -> u32 { WF_AGG_BASE[band] + ofs }
 #[inline]
 pub const fn mt_wtbloff(band: usize, ofs: u32) -> u32 { WF_WTBLOFF_BASE[band] + ofs }
+#[inline]
+pub const fn mt_wf_arb(band: usize, ofs: u32) -> u32 { WF_ARB_BASE[band] + ofs }
+#[inline]
+pub const fn mt_wf_tmac(band: usize, ofs: u32) -> u32 { WF_TMAC_BASE[band] + ofs }

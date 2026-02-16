@@ -305,10 +305,10 @@ mod tests {
 
     #[test]
     fn test_rule_network_ethernet() {
+        // ipd rules are currently commented out
         let info = make_port_info(PortClass::Network, port_subclass::NET_ETHERNET);
         let rule = find_port_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "ipd");
+        assert!(rule.is_none());
     }
 
     #[test]
@@ -329,18 +329,18 @@ mod tests {
 
     #[test]
     fn test_rule_network_switch_port() {
+        // ipd rules are currently commented out
         let info = make_port_info(PortClass::Network, port_subclass::NET_SWITCH_PORT);
         let rule = find_port_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "ipd");
+        assert!(rule.is_none());
     }
 
     #[test]
     fn test_rule_network_bridge_group() {
+        // ipd rules are currently commented out
         let info = make_port_info(PortClass::Network, port_subclass::NET_BRIDGE_GROUP);
         let rule = find_port_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "ipd");
+        assert!(rule.is_none());
     }
 
     #[test]

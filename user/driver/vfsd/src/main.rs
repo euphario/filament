@@ -234,7 +234,7 @@ impl Driver for VfsDriver {
                     port.pool_write(0, &raw);
 
                     // Register as "vfs:" Filesystem port using unified PortInfo
-                    let mut info = PortInfo::new(b"vfs:", PortClass::Filesystem);
+                    let mut info = PortInfo::new(b"vfs:0", PortClass::Filesystem);
                     info.port_subclass = port_subclass::FS_RAMFS;
                     let _ = ctx.register_port_with_info(&info, shmem_id);
 

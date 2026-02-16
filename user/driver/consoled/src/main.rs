@@ -488,7 +488,7 @@ impl ConsoledDriver {
         self.state = ConsoleState::WaitingForShell;
 
         // Transition port Safe → devd fires spawn rule → new shell
-        let _ = ctx.set_port_state(b"console:", PortState::Safe);
+        let _ = ctx.set_port_state(b"console:0", PortState::Safe);
 
         uinfo!("consoled", "awaiting_shell";);
     }
@@ -505,7 +505,7 @@ impl Driver for ConsoledDriver {
         // Claim the kernel UART bus. With Phase 2 NotifyParentExit, devd only
         // restarts consoled after the previous instance's bus handle is released,
         // so uart0 is guaranteed Safe here — no retry needed.
-        let uart_path = b"/kernel/bus/uart0";
+        let uart_path = b"/uart:0";
         match ctx.claim_kernel_bus(uart_path) {
             Ok((_bus_id, _info)) => {
                 uinfo!("consoled", "uart_claimed";);
@@ -530,7 +530,7 @@ impl Driver for ConsoledDriver {
         }
 
         // Create console port
-        let port = Port::with_limit(b"console:", 1)
+        let port = Port::with_limit(b"console:0", 1)
             .map_err(|_| BusError::Internal)?;
 
         // Watch stdin and port for events
@@ -541,7 +541,7 @@ impl Driver for ConsoledDriver {
 
         // Register console: port with devd
         let mut info = PortInfo::empty();
-        info.set_name(b"console:");
+        info.set_name(b"console:0");
         info.port_class = PortClass::Console;
         info.port_subclass = port_subclass::CONSOLE_SERIAL;
 

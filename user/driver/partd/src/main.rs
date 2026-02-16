@@ -36,6 +36,7 @@ use userlib::uinfo;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, BlockMetadata, PortInfo, PortClass, port_subclass, bus_msg,
+    ConfigKey,
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::io_status;
@@ -875,18 +876,18 @@ impl Driver for PartitionDriver {
                         // Map MBR type to port_subclass
                         let subclass = mbr_type_to_subclass(p.partition_type);
 
-                        // Build partition port name: "N:type"
+                        // Build partition port name: "type:N" (e.g., "fat:0")
                         let type_suffix = mbr_type_to_suffix(p.partition_type);
                         let mut pname = [0u8; 32];
                         let mut plen = 0;
-                        // Partition index digit
-                        pname[0] = b'0' + (i as u8);
-                        plen += 1;
+                        let slen = type_suffix.len().min(pname.len());
+                        pname[..slen].copy_from_slice(&type_suffix[..slen]);
+                        plen += slen;
                         pname[plen] = b':';
                         plen += 1;
-                        let slen = type_suffix.len().min(pname.len() - plen);
-                        pname[plen..plen + slen].copy_from_slice(&type_suffix[..slen]);
-                        plen += slen;
+                        // Partition index digit
+                        pname[plen] = b'0' + (i as u8);
+                        plen += 1;
 
                         let mut info = PortInfo::new(&pname[..plen], PortClass::Block);
                         info.port_subclass = subclass;
@@ -958,6 +959,20 @@ fn main() {
 /// Wrapper to pass &'static mut PartitionDriver to driver_main
 struct PartitionDriverWrapper(&'static mut PartitionDriver);
 
+const PART_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_only(b"count"),
+    ConfigKey::read_only(b"table"),
+];
+
+impl PartitionDriverWrapper {
+    fn copy_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
+        let end = (pos + src.len()).min(buf.len());
+        let n = end - pos;
+        buf[pos..end].copy_from_slice(&src[..n]);
+        end
+    }
+}
+
 impl Driver for PartitionDriverWrapper {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         self.0.reset(ctx)
@@ -969,6 +984,56 @@ impl Driver for PartitionDriverWrapper {
 
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
         self.0.data_ready(port, ctx)
+    }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        PART_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        let drv = &self.0;
+        match key {
+            b"count" => {
+                // Total partition count across all disks
+                let mut total = 0u32;
+                for disk in &drv.disks {
+                    if let Some(d) = disk {
+                        total += d.partition_count as u32;
+                    }
+                }
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, total);
+                Self::copy_to_buf(buf, 0, &tmp[..len])
+            }
+            b"table" => {
+                // Compact: "0:fat@2048+131072 1:ext2@200000+50000"
+                let mut pos = 0;
+                for disk in &drv.disks {
+                    let Some(d) = disk else { continue };
+                    for i in 0..d.partition_count {
+                        let p = &d.partitions[i];
+                        if pos >= buf.len() { break; }
+                        if pos > 0 { pos = Self::copy_to_buf(buf, pos, b" "); }
+                        // index:type
+                        let mut tmp = [0u8; 24];
+                        let len = format_u32(&mut tmp, p.index as u32);
+                        pos = Self::copy_to_buf(buf, pos, &tmp[..len]);
+                        pos = Self::copy_to_buf(buf, pos, b":");
+                        let suffix = mbr_type_to_suffix(p.partition_type);
+                        pos = Self::copy_to_buf(buf, pos, suffix);
+                        // @start_lba+sectors
+                        pos = Self::copy_to_buf(buf, pos, b"@");
+                        let len = format_u64(&mut tmp, p.start_lba);
+                        pos = Self::copy_to_buf(buf, pos, &tmp[..len]);
+                        pos = Self::copy_to_buf(buf, pos, b"+");
+                        let len = format_u64(&mut tmp, p.sector_count);
+                        pos = Self::copy_to_buf(buf, pos, &tmp[..len]);
+                    }
+                }
+                pos
+            }
+            _ => 0,
+        }
     }
 }
 

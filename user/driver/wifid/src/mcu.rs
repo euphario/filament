@@ -4,7 +4,7 @@
 //! Contains both the legacy MCU TXD (for firmware download and WA commands)
 //! and the UNI TXD (for post-firmware init commands).
 
-use userlib::{uinfo, uerror, udebug};
+use userlib::{uinfo, uerror, uwarn, udebug};
 use crate::regs::*;
 use crate::device::Mt7996Dev;
 use crate::dma::{TxRing, Mt76Desc, dma_wmb, flush_buffer};
@@ -81,11 +81,14 @@ const CMD_FIELD_WA: u32 = 1 << 19;
 const CMD_FIELD_WM: u32 = 1 << 20;
 
 /// UNI command IDs — from mt76_connac_mcu.h enum
+pub const MCU_UNI_CMD_EDCA_UPDATE: u16 = 0x04;
 pub const MCU_UNI_CMD_WSYS_CONFIG: u16 = 0x0b;
 pub const MCU_UNI_CMD_EFUSE_CTRL: u16 = 0x2d;
 pub const MCU_UNI_CMD_VOW: u16 = 0x37;
+pub const MCU_UNI_CMD_BF: u16 = 0x33;
 pub const MCU_UNI_CMD_FIXED_RATE_TABLE: u16 = 0x40;
 pub const MCU_UNI_CMD_RRO: u16 = 0x57;
+pub const MCU_UNI_CMD_OFFCH_SCAN_CTRL: u16 = 0x58; // mt76_connac_mcu.h:1307
 pub const MCU_UNI_CMD_SDO: u16 = 0x88;
 
 /// UNI TLV tags — from mt7996/mcu.h
@@ -93,12 +96,18 @@ const UNI_WSYS_CONFIG_FW_LOG_CTRL: u16 = 0;
 const UNI_VOW_RX_AT_AIRTIME_EN: u16 = 0x0b;
 const UNI_VOW_RX_AT_AIRTIME_CLR_EN: u16 = 0x0e;
 
-/// EFUSE TLV tags — from mt7996/mcu.h
+/// EFUSE TLV tags — from mt7996/mcu.h enum (starts at ACCESS=1)
+const UNI_EFUSE_ACCESS: u16 = 1;
 const UNI_EFUSE_BUFFER_MODE: u16 = 2;
+const UNI_EFUSE_FREE_BLOCK: u16 = 3;
 
 /// EEPROM mode/format — from mt76_connac_mcu.h
-const EE_MODE_EFUSE: u8 = 0;
+const _EE_MODE_EFUSE: u8 = 0;
+const EE_MODE_BUFFER: u8 = 1;
 const EE_FORMAT_WHOLE: u8 = 1;
+
+/// Flash-mode page size — from mt7996/mcu.c:3768
+const PER_PAGE_SIZE: usize = 0x400; // 1024 bytes
 
 /// RRO TLV tags — from mt7996/mcu.h enum (starts at DEL_ENTRY=1)
 pub const UNI_RRO_SET_PLATFORM_TYPE: u16 = 0x2;
@@ -424,9 +433,9 @@ impl Mt7996Dev {
         }
 
         // Snapshot RX DMA_IDX BEFORE sending — must be before CPU_IDX write
-        // After firmware loaded, responses arrive on WA RX queue (q1), not WM (q0).
         // Linux: mt7996_mcu_send_message() lines 295-298
-        let rx_snap = if wait { self.snapshot_rx_idx(MCU_WA_RX_REGS) } else { 0 };
+        // WM ring → responses on MCU_WM RX (q0), WA ring → responses on MCU_WA RX (q1)
+        let rx_snap = if wait { self.snapshot_rx_idx(ring.rx_regs) } else { 0 };
 
         // Copy UniTxd + data to buffer
         let buf = ring.buf(idx);
@@ -476,9 +485,9 @@ impl Mt7996Dev {
             return Err(-1);
         }
 
-        // Wait for MCU response if requested (on WA RX queue)
+        // Wait for MCU response on the corresponding RX queue
         if wait {
-            self.wait_rx_response(MCU_WA_RX_REGS, rx_snap, 5000)?;
+            self.wait_rx_response(ring, rx_snap, 5000)?;
         }
 
         Ok(())
@@ -509,28 +518,58 @@ impl Mt7996Dev {
     }
 
     /// Wait for MCU response — polls rx_regs DMA_IDX until it advances past pre_send_dma_idx.
-    pub fn wait_rx_response(&self, rx_regs: u32, pre_send_dma_idx: u32, timeout_ms: u32) -> Result<(), i32> {
+    /// If rx_buf_virt is non-zero, reads the response status and logs errors.
+    /// Also polls the alternate queue (q0 if polling q1, vice versa) to detect misrouted responses.
+    pub fn wait_rx_response(&self, ring: &TxRing, pre_send_dma_idx: u32, timeout_ms: u32) -> Result<(), i32> {
+        // Snapshot the alternate RX queue to detect misrouted responses
+        let alt_regs = if ring.rx_regs == MCU_WA_RX_REGS { MCU_WM_RX_REGS } else { MCU_WA_RX_REGS };
+        let alt_snap = self.mt76_rr(alt_regs + MT_QUEUE_DMA_IDX);
+
         for _ in 0..timeout_ms {
-            let dma_idx = self.mt76_rr(rx_regs + MT_QUEUE_DMA_IDX);
+            let dma_idx = self.mt76_rr(ring.rx_regs + MT_QUEUE_DMA_IDX);
             if dma_idx != pre_send_dma_idx {
-                udebug!("mcu", "rx_ok"; snap = pre_send_dma_idx, now = dma_idx);
+                // Parse MCU response status if buffer info available
+                if ring.rx_buf_virt != 0 {
+                    let buf_ptr = (ring.rx_buf_virt + pre_send_dma_idx as u64 * ring.rx_buf_size as u64) as *const u8;
+                    // mt7996_mcu_rxd is 44 bytes, then uni_event: {cid(u8), rsv[3], status(le32)}
+                    // Dump response header for debugging
+                    let w11 = unsafe { core::ptr::read_volatile(buf_ptr.add(44) as *const u32) }; // cid+rsv or status
+                    let w12 = unsafe { core::ptr::read_volatile(buf_ptr.add(48) as *const u32) }; // status or data
+                    let rxd_seq = unsafe { core::ptr::read_volatile(buf_ptr.add(37)) };
+                    let rxd_eid = unsafe { core::ptr::read_volatile(buf_ptr.add(36)) };
+                    let rxd_ext_eid = unsafe { core::ptr::read_volatile(buf_ptr.add(40)) };
+                    uinfo!("mcu", "rx_resp"; snap = pre_send_dma_idx, seq = rxd_seq, eid = rxd_eid, ext = rxd_ext_eid, w11 = w11, w12 = w12);
+                } else {
+                    udebug!("mcu", "rx_ok"; snap = pre_send_dma_idx, now = dma_idx);
+                }
                 return Ok(());
             }
             userlib::delay_ms(1);
         }
 
+        // Timeout — check all queues to diagnose where the response went
         let rx_base = MT_WFDMA0_BASE + 0x500;
         let q0 = self.mt76_rr(rx_base + 0 * MT_RING_SIZE + MT_QUEUE_DMA_IDX);
         let q1 = self.mt76_rr(rx_base + 1 * MT_RING_SIZE + MT_QUEUE_DMA_IDX);
         let q2 = self.mt76_rr(rx_base + 2 * MT_RING_SIZE + MT_QUEUE_DMA_IDX);
         let q3 = self.mt76_rr(rx_base + 3 * MT_RING_SIZE + MT_QUEUE_DMA_IDX);
-        uerror!("mcu", "rx_response_timeout"; snap = pre_send_dma_idx, q0 = q0, q1 = q1, q2 = q2, q3 = q3);
+        let alt_now = self.mt76_rr(alt_regs + MT_QUEUE_DMA_IDX);
+        uerror!("mcu", "rx_response_timeout"; snap = pre_send_dma_idx, q0 = q0, q1 = q1, q2 = q2, q3 = q3, alt_snap = alt_snap, alt_now = alt_now);
         Err(-1)
     }
 
-    /// Legacy: wait on MCU_WM RX queue (used by firmware loading)
+    /// Legacy: wait on MCU_WM RX queue (used by firmware loading, no response parsing)
     pub fn wait_mcu_rx_response(&self, pre_send_dma_idx: u32, timeout_ms: u32) -> Result<(), i32> {
-        self.wait_rx_response(MCU_WM_RX_REGS, pre_send_dma_idx, timeout_ms)
+        // Firmware loading uses WM RX queue — no buffer info available for response parsing
+        for _ in 0..timeout_ms {
+            let dma_idx = self.mt76_rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX);
+            if dma_idx != pre_send_dma_idx {
+                return Ok(());
+            }
+            userlib::delay_ms(1);
+        }
+        uerror!("mcu", "rx_response_timeout_wm"; snap = pre_send_dma_idx);
+        Err(-1)
     }
 
     /// Send init download command
@@ -834,6 +873,48 @@ impl Mt7996Dev {
         self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
     }
 
+    /// Read an RF register via MCU.
+    /// Linux: mt7996/mcu.c:4633-4670 mt7996_mcu_rf_regval()
+    ///
+    /// regidx = (chip_idx << 24) | register_offset
+    /// Returns the 32-bit register value.
+    pub fn mcu_rf_regval(&self, ring: &mut TxRing, regidx: u32, seq: u8) -> Result<u32, i32> {
+        // Layout: rsv(4) + tag(2) + len(2) + idx(2) + rsv(2) + ofs(4) + data(4) = 20 bytes
+        let mut data = [0u8; 20];
+
+        // tag = UNI_CMD_ACCESS_RF_REG_BASIC (1)
+        data[4..6].copy_from_slice(&UNI_CMD_ACCESS_RF_REG_BASIC.to_le_bytes());
+        // len = 16
+        data[6..8].copy_from_slice(&16u16.to_le_bytes());
+        // idx = regidx[31:24] (chip index)
+        let idx = ((regidx >> 24) & 0xFF) as u16;
+        data[8..10].copy_from_slice(&idx.to_le_bytes());
+        // ofs = regidx[23:0]
+        let ofs = regidx & 0x00FFFFFF;
+        data[12..16].copy_from_slice(&ofs.to_le_bytes());
+        // data = 0 (read)
+
+        // Snapshot RX index before sending
+        let rx_snap = self.snapshot_rx_idx(ring.rx_regs);
+
+        // MCU_WM_UNI_CMD_QUERY(REG_ACCESS)
+        let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_REG_ACCESS as u32) | CMD_FIELD_WM;
+
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)?;
+
+        // Read result from RX buffer
+        // Response layout: RXD(44) + {rsv(4) + tag(2) + len(2) + idx(2) + rsv(2) + ofs(4) + data(4)}
+        // data field at raw offset 44 + 16 = 60
+        if ring.rx_buf_virt == 0 {
+            return Err(-1);
+        }
+        let buf_ptr = (ring.rx_buf_virt + rx_snap as u64 * ring.rx_buf_size as u64) as *const u8;
+        let val = unsafe {
+            u32::from_le(core::ptr::read_volatile(buf_ptr.add(60) as *const u32))
+        };
+        Ok(val)
+    }
+
     /// Tell MCU about EEPROM mode (efuse, not flash)
     /// Linux: mt7996/mcu.c:3810-3824 mt7996_mcu_set_eeprom()
     ///
@@ -855,7 +936,7 @@ impl Mt7996Dev {
         // len = sizeof(req) - 4 = 8
         data[6..8].copy_from_slice(&8u16.to_le_bytes());
         // buffer_mode = EE_MODE_EFUSE (0)
-        data[8] = EE_MODE_EFUSE;
+        data[8] = _EE_MODE_EFUSE;
         // format = EE_FORMAT_WHOLE (1)
         data[9] = EE_FORMAT_WHOLE;
         // buf_len = 0 (le16, already zero)
@@ -863,8 +944,191 @@ impl Mt7996Dev {
         // MCU_WM_UNI_CMD(EFUSE_CTRL) = __MCU_CMD_FIELD_UNI | 0x2d | __MCU_CMD_FIELD_WM
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
 
-        udebug!("mcu", "set_eeprom"; mode = EE_MODE_EFUSE, fmt = EE_FORMAT_WHOLE);
+        udebug!("mcu", "set_eeprom"; mode = 0u8, fmt = EE_FORMAT_WHOLE);
         self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Query number of free eFuse blocks from firmware.
+    /// Linux: mt7996/mcu.c:3872-3900 mt7996_mcu_get_eeprom_free_block()
+    ///
+    /// Uses MCU_WM_UNI_CMD_QUERY(EFUSE_CTRL) — the QUERY variant sets CMD_FIELD_QUERY
+    /// which changes option from MCU_CMD_UNI_EXT_ACK(7) to MCU_CMD_UNI_QUERY_ACK(3).
+    ///
+    /// If free_block_num >= 59, eFuse is empty → need default EEPROM binary (flash upload).
+    /// Response: free_block_num at RXD(44) + offset 8 in response payload.
+    pub fn mcu_get_eeprom_free_block(&self, ring: &mut TxRing, seq: u8) -> Result<u8, i32> {
+        // struct {
+        //     u8 _rsv[4];          // uni_header
+        //     __le16 tag;          // UNI_EFUSE_FREE_BLOCK (3)
+        //     __le16 len;          // sizeof(req) - 4 = 8
+        //     u8 num;              // 0 (filled by firmware in response)
+        //     u8 version;          // 2
+        //     u8 die_idx;          // 0
+        //     u8 _rsv2;            // 0
+        // } = 12 bytes total
+        let mut data = [0u8; 12];
+
+        // tag = UNI_EFUSE_FREE_BLOCK (3)
+        data[4..6].copy_from_slice(&UNI_EFUSE_FREE_BLOCK.to_le_bytes());
+        // len = sizeof(req) - 4 = 8
+        data[6..8].copy_from_slice(&8u16.to_le_bytes());
+        // num = 0 (already zero)
+        // version = 2
+        data[9] = 2;
+        // die_idx = 0 (already zero)
+
+        // Snapshot RX index before sending — need this to read response buffer
+        let rx_snap = self.snapshot_rx_idx(ring.rx_regs);
+
+        // MCU_WM_UNI_CMD_QUERY(EFUSE_CTRL) = CMD_FIELD_UNI | CMD_FIELD_QUERY | CMD_FIELD_WM | 0x2d
+        let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
+
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)?;
+
+        // Read response: free_block_num at RXD(44) + offset 8 = byte 52
+        if ring.rx_buf_virt != 0 {
+            let buf_ptr = (ring.rx_buf_virt + rx_snap as u64 * ring.rx_buf_size as u64) as *const u8;
+            let free_blocks = unsafe { core::ptr::read_volatile(buf_ptr.add(52)) };
+            uinfo!("mcu", "efuse_free_blocks"; count = free_blocks);
+            Ok(free_blocks)
+        } else {
+            // No RX buffer info — can't read response, assume eFuse empty
+            uwarn!("mcu", "efuse_free_block_no_rx_buf");
+            Ok(59)
+        }
+    }
+
+    /// Read a 16-byte EEPROM block from eFuse via firmware.
+    /// Linux: mt7996/mcu.c:3826-3870 mt7996_mcu_get_eeprom()
+    ///
+    /// Uses MCU_WM_UNI_CMD_QUERY(EFUSE_CTRL) with tag UNI_EFUSE_ACCESS(1).
+    /// Response: valid flag at RXD(44)+16, data at RXD(44)+48 (16 bytes).
+    /// Returns 16 bytes of EEPROM data at the given offset, or Err if invalid.
+    pub fn mcu_get_eeprom(&self, ring: &mut TxRing, offset: u32, seq: u8) -> Result<[u8; 16], i32> {
+        // struct {
+        //     u8 _rsv[4];          // uni_header
+        //     __le16 tag;          // UNI_EFUSE_ACCESS (1)
+        //     __le16 len;          // sizeof(req) - 4 = 28
+        //     __le32 addr;         // offset (rounded down to 16-byte block)
+        //     __le32 valid;        // 0
+        //     u8 data[16];         // 0
+        // } = 32 bytes total
+        let mut data = [0u8; 32];
+
+        // tag = UNI_EFUSE_ACCESS (1)
+        data[4..6].copy_from_slice(&UNI_EFUSE_ACCESS.to_le_bytes());
+        // len = 28
+        data[6..8].copy_from_slice(&28u16.to_le_bytes());
+        // addr = offset (rounded to 16-byte boundary)
+        let aligned_offset = offset & !0xF;
+        data[8..12].copy_from_slice(&aligned_offset.to_le_bytes());
+
+        // Snapshot RX index before sending
+        let rx_snap = self.snapshot_rx_idx(ring.rx_regs);
+
+        // MCU_WM_UNI_CMD_QUERY(EFUSE_CTRL) = CMD_FIELD_UNI | CMD_FIELD_QUERY | CMD_FIELD_WM | 0x2d
+        let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
+
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)?;
+
+        // Read response from RX buffer
+        if ring.rx_buf_virt == 0 {
+            return Err(-1);
+        }
+        let buf_ptr = (ring.rx_buf_virt + rx_snap as u64 * ring.rx_buf_size as u64) as *const u8;
+
+        // Dump first 16 u32s of response payload (after 44-byte RXD) for debugging
+        let w0 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(44) as *const u32)) };
+        let w1 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(48) as *const u32)) };
+        let w2 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(52) as *const u32)) };
+        let w3 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(56) as *const u32)) };
+        let w4 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(60) as *const u32)) };
+        let w5 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(64) as *const u32)) };
+        uinfo!("mcu", "efuse_resp_dump"; snap = rx_snap, w0 = w0, w1 = w1, w2 = w2, w3 = w3, w4 = w4, w5 = w5);
+
+        // Response layout after RXD (44 bytes):
+        //   mt7996_mcu_uni_event: {cid(1), rsv(3), status(4)} = 8 bytes
+        //   TLV: {tag(2), len(2), addr(4), valid(4), ...padding..., data(16)}
+        //   Linux: skb->data+16 = valid, skb_pull(48) then data
+        //   Raw offsets: valid at 44+16=60, data at 44+48=92
+        let valid = unsafe {
+            let v = core::ptr::read_volatile(buf_ptr.add(44 + 16) as *const u32);
+            u32::from_le(v)
+        };
+        if valid == 0 {
+            uwarn!("mcu", "efuse_read_invalid"; offs = aligned_offset, valid = valid);
+            return Err(-2); // Invalid block
+        }
+
+        let mut result = [0u8; 16];
+        for i in 0..16 {
+            result[i] = unsafe { core::ptr::read_volatile(buf_ptr.add(44 + 48 + i)) };
+        }
+        Ok(result)
+    }
+
+    /// Upload EEPROM data to firmware in flash/buffer mode.
+    /// Linux: mt7996/mcu.c:3765-3808 mt7996_mcu_set_eeprom_flash()
+    ///
+    /// Sends the full EEPROM binary (7680 bytes) in 1024-byte pages.
+    /// Each page is a separate MCU_WM_UNI_CMD(EFUSE_CTRL) message with
+    /// buffer_mode=EE_MODE_BUFFER(1) and format encoding page index/total.
+    ///
+    /// struct mt7996_mcu_eeprom (8 bytes after uni_header):
+    ///   le16 tag;        // UNI_EFUSE_BUFFER_MODE (2)
+    ///   le16 len;        // payload length excluding uni_header
+    ///   u8 buffer_mode;  // EE_MODE_BUFFER (1)
+    ///   u8 format;       // MAX_PAGE_IDX[7:5] | PAGE_IDX[4:2] | EE_FORMAT_WHOLE
+    ///   le16 buf_len;    // EEPROM data length in this page
+    pub fn mcu_set_eeprom_flash(&self, ring: &mut TxRing, eeprom: &[u8], seq: &mut u8) -> Result<(), i32> {
+        let eeprom_size = eeprom.len();
+        let total_pages = (eeprom_size + PER_PAGE_SIZE - 1) / PER_PAGE_SIZE; // DIV_ROUND_UP
+
+        uinfo!("mcu", "eeprom_flash"; size = eeprom_size as u32, pages = total_pages as u32);
+
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
+
+        for i in 0..total_pages {
+            let offset = i * PER_PAGE_SIZE;
+            let eep_len = if i == total_pages - 1 && (eeprom_size % PER_PAGE_SIZE) != 0 {
+                eeprom_size % PER_PAGE_SIZE // last page: remainder
+            } else {
+                PER_PAGE_SIZE // full page
+            };
+
+            // Message layout: uni_header(4) + eeprom_hdr(8) + eeprom_data(eep_len)
+            let msg_len = 4 + 8 + eep_len;
+
+            // format byte: MAX_PAGE_IDX[7:5] | PAGE_IDX[4:2] | EE_FORMAT_WHOLE
+            // Linux: FIELD_PREP(GENMASK(7,5), total-1) | FIELD_PREP(GENMASK(4,2), i) | EE_FORMAT_WHOLE
+            let format = (((total_pages - 1) as u8) << 5) | ((i as u8) << 2) | EE_FORMAT_WHOLE;
+
+            // Build in a stack buffer: max 4 + 8 + 1024 = 1036 bytes
+            let mut data = [0u8; 4 + 8 + PER_PAGE_SIZE];
+            let data = &mut data[..msg_len];
+
+            // uni_header: 4 zero bytes (already zero)
+
+            // tag = UNI_EFUSE_BUFFER_MODE (2) at offset 4
+            data[4..6].copy_from_slice(&UNI_EFUSE_BUFFER_MODE.to_le_bytes());
+            // len = msg_len - 4 (exclude uni_header)
+            data[6..8].copy_from_slice(&((msg_len - 4) as u16).to_le_bytes());
+            // buffer_mode = EE_MODE_BUFFER (1) at offset 8
+            data[8] = EE_MODE_BUFFER;
+            // format at offset 9
+            data[9] = format;
+            // buf_len at offset 10 (le16)
+            data[10..12].copy_from_slice(&(eep_len as u16).to_le_bytes());
+
+            // Copy EEPROM data at offset 12
+            data[12..12 + eep_len].copy_from_slice(&eeprom[offset..offset + eep_len]);
+
+            self.mcu_send_uni_cmd(ring, cmd, data, true, *seq)?;
+            *seq = seq.wrapping_add(1);
+        }
+
+        uinfo!("mcu", "eeprom_flash_done");
+        Ok(())
     }
 
     /// Enable/disable radio for a band
@@ -1036,13 +1300,14 @@ impl Mt7996Dev {
     /// Wait: yes
     pub fn mcu_set_chan_info(&self, ring: &mut TxRing, band: u8, tag: u16,
                             channel: u8, bw: u8, channel_band: u8, seq: u8) -> Result<(), i32> {
-        // 76 bytes: {rsv[4], tag:le16, len:le16=72, fields...}
-        let mut data = [0u8; 76];
+        // 80 bytes: {rsv[4], tag:le16, len:le16=76, fields..., rsv1[53]}
+        // Linux struct is 80 bytes total, len = sizeof(req) - 4 = 76
+        let mut data = [0u8; 80];
 
         // tag
         data[4..6].copy_from_slice(&tag.to_le_bytes());
-        // len = 72
-        data[6..8].copy_from_slice(&72u16.to_le_bytes());
+        // len = 76
+        data[6..8].copy_from_slice(&76u16.to_le_bytes());
 
         // control_ch = channel
         data[8] = channel;
@@ -1051,16 +1316,18 @@ impl Mt7996Dev {
         // bw
         data[10] = bw;
 
-        // tx_path_num: count of TX antennas (MT7996 band 0 = 2T2R → 2)
-        // Linux: hweight16(phy->chainmask) — band 0 chainmask = 0x3 → 2
+        // tx_path_num: count of TX antennas
+        // Linux: hweight16(phy->chainmask)
+        // BPI-R4 MT7996: assumed 2T2R pending eFuse readback confirmation
         data[11] = 2;
 
         // rx_path: depends on tag
-        // For UNI_CHANNEL_RX_PATH: bitmask (chainmask = 0x3)
+        // For UNI_CHANNEL_RX_PATH: bitmask (rx_chainmask)
         // For UNI_CHANNEL_SWITCH: hweight8(rx_path) = count of bits
-        // Linux mcu.c:3731-3735
+        // Linux mcu.c:3731-3753
+        // BPI-R4 MT7996: assumed 2T2R pending eFuse readback confirmation
         if tag == UNI_CHANNEL_RX_PATH {
-            data[12] = 0x3;  // chainmask bitmask
+            data[12] = 0x3;  // chainmask bitmask (2 chains)
         } else {
             data[12] = 2;    // hweight8(0x3) = 2
         }
@@ -1079,6 +1346,59 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_CHANNEL_SWITCH as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "set_chan_info"; band = band, tag = tag, ch = channel, bw = bw);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Set TX power SKU rate limits
+    /// Linux: mt7996/mcu.c:4798-4857 mt7996_mcu_set_txpower_sku()
+    ///
+    /// Sends per-rate power limits to firmware. Without this, the firmware
+    /// may not transmit (no power limits configured → default to zero).
+    ///
+    /// In Linux, limits come from mt76_get_rate_power_limits() which fills
+    /// all rate entries with target_power from EEPROM. We use 127 (max s8)
+    /// to impose no host-side limit, letting firmware use EEPROM defaults.
+    ///
+    /// UNI command MCU_WM_UNI_CMD(TXPOWER) (0x2b) — WM only.
+    /// Wait: yes
+    pub fn mcu_set_txpower_sku(&self, ring: &mut TxRing, band: u8, seq: u8) -> Result<(), i32> {
+        // struct tx_power_limit_table_ctrl from mcu.c:4803-4816:
+        //   u8 __rsv1[4];           // uni_header (4)
+        //   le16 tag;               // UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL (4)
+        //   le16 len;               // sizeof(ctrl) + SKU_PATH_NUM - 4 = 501
+        //   u8 power_ctrl_id;       // UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL (4)
+        //   u8 power_limit_type;    // TX_POWER_LIMIT_TABLE_RATE (0)
+        //   u8 band_idx;
+        // Total header: 11 bytes, then SKU_PATH_NUM (494) bytes of rate power limits
+        const HEADER_SIZE: usize = 11;
+        const TOTAL_SIZE: usize = HEADER_SIZE + MT7996_SKU_PATH_NUM; // 505
+
+        let mut data = [0u8; TOTAL_SIZE];
+
+        // tag = UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL (4) — mcu.c:4812
+        data[4..6].copy_from_slice(&UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL.to_le_bytes());
+        // len = sizeof(ctrl) + SKU_PATH_NUM - 4 = 11 + 494 - 4 = 501 — mcu.c:4813
+        data[6..8].copy_from_slice(&((HEADER_SIZE + MT7996_SKU_PATH_NUM - 4) as u16).to_le_bytes());
+        // power_ctrl_id = UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL (4) — mcu.c:4814
+        data[8] = UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL as u8;
+        // power_limit_type = TX_POWER_LIMIT_TABLE_RATE (0) — mcu.c:4815
+        data[9] = 0;
+        // band_idx — mcu.c:4816
+        data[10] = band;
+
+        // Fill rate power limits with 127 (max s8 = +63.5 dBm half-dBm)
+        // This imposes no host-side limit — firmware uses EEPROM-based power.
+        // Linux: memset(dest, target_power, ...) in mt76_get_rate_power_limits()
+        // fills with EEPROM target power (typically ~34 half-dBm for 2.4GHz).
+        // Using 127 is safe: firmware caps to its own EEPROM limits.
+        for b in &mut data[HEADER_SIZE..] {
+            *b = 127;
+        }
+
+        // MCU_WM_UNI_CMD(TXPOWER) = __MCU_CMD_FIELD_UNI | 0x2b | __MCU_CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_TXPOWER as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "set_txpower_sku"; band = band);
         self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
     }
 
@@ -1156,62 +1476,132 @@ impl Mt7996Dev {
         self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
     }
 
-    /// Add/remove BSS info
-    /// Linux: mt7996/mcu.c:1123-1185 mt7996_mcu_bss_basic_tlv()
-    ///        mt7996/mcu.c:1216-1222 mt7996_mcu_bss_sec_tlv()
+    /// Add/remove BSS info with all required AP TLVs
+    /// Linux: mt7996/mcu.c:1028-1090 mt7996_mcu_bss_basic_tlv()
+    ///        mt7996/mcu.c:1216 mt7996_mcu_bss_sec_tlv()
+    ///        mt7996/mcu.c:805 mt7996_mcu_bss_rfch_tlv()
+    ///        mt7996/mcu.c:834 mt7996_mcu_bss_ra_tlv()
+    ///        mt7996/mcu.c:896 mt7996_mcu_bss_bmc_tlv()
+    ///        mt7996/mcu.c:916 mt7996_mcu_bss_txcmd_tlv()
+    ///        mt7996/mcu.c:1002 mt7996_mcu_bss_ifs_timing_tlv()
     ///
     /// UNI cmd MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) (0x02) — both WM+WA.
-    /// Minimal TLVs: BSS_INFO_BASIC + BSS_INFO_SEC
+    /// TLVs: BASIC(32) + SEC(8) + RLM(16) + RA(16) + RATE(24) + TXCMD(8) + IFS_TIME(20)
     /// Wait: yes
     pub fn mcu_add_bss_info(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
-                            hw_bss_idx: u8, mac_addr: &[u8; 6], enable: bool, seq: u8) -> Result<(), i32> {
-        // Layout: uni_header(4) + BSS_INFO_BASIC(32) + BSS_INFO_SEC(8) = 44 bytes
-        let mut data = [0u8; 44];
+                            hw_bss_idx: u8, mac_addr: &[u8; 6], enable: bool,
+                            channel: u8, seq: u8) -> Result<(), i32> {
+        // Layout: uni_header(4) + BASIC(32) + SEC(8) + RLM(16) + RA(16) + RATE(24) + TXCMD(8) + IFS_TIME(20) + MLD(16) = 144
+        let mut data = [0u8; 144];
 
-        // uni_header = 0 (4 bytes)
+        // uni_header: bss_idx = 0 (first vif) — __mt7996_mcu_alloc_bss_req()
+        // In Linux, bss_req_hdr.bss_idx = mvif->idx (VIF software index)
 
-        // === BSS_INFO_BASIC TLV (32 bytes) — mcu.c:1123-1185 ===
+        // === BSS_INFO_BASIC TLV (32 bytes) — mcu.c:1028-1090 ===
         let off = 4;
-        // tag = UNI_BSS_INFO_BASIC (0)
-        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_BASIC.to_le_bytes());
-        // len = 32
-        data[off + 2..off + 4].copy_from_slice(&32u16.to_le_bytes());
-        // active
-        data[off + 4] = if enable { 1 } else { 0 };
-        // omac_idx
-        data[off + 5] = omac_idx;
-        // hw_bss_idx
-        data[off + 6] = hw_bss_idx;
-        // band_idx
-        data[off + 7] = band;
-        // conn_type:le32 = CONNECTION_INFRA_STA
-        data[off + 8..off + 12].copy_from_slice(&CONNECTION_INFRA_STA.to_le_bytes());
-        // conn_state = DISCONNECT
-        data[off + 12] = CONN_STATE_DISCONNECT;
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_BASIC.to_le_bytes());  // tag
+        data[off + 2..off + 4].copy_from_slice(&32u16.to_le_bytes());           // len
+        data[off + 4] = if enable { 1 } else { 0 };  // active — mcu.c:1082
+        data[off + 5] = omac_idx;                      // omac_idx
+        // hw_bss_idx MUST match bss_req_hdr.bss_idx (uni_header byte 0).
+        // Linux: mt7996_get_hw_bss_idx() = mvif->idx & 0x1f = same as bss_idx.
+        data[off + 6] = hw_bss_idx;                    // hw_bss_idx — mcu.c:1087
+        data[off + 7] = band;                          // band_idx
+        // conn_type = CONNECTION_INFRA_AP — mcu.c:1038
+        data[off + 8..off + 12].copy_from_slice(&CONNECTION_INFRA_AP.to_le_bytes());
+        // conn_state = !enable — mcu.c:1083 (0 for AP enable)
+        data[off + 12] = if enable { 0 } else { 1 };
         // wmm_idx = 0
-        // bssid[6] = zeros (unassociated)
-        // bmc_tx_wlan_idx:le16 = 0
+        // bssid[6] at off+14..off+20: set to our MAC for AP mode
+        data[off + 14..off + 20].copy_from_slice(mac_addr);
+        // bmc_tx_wlan_idx:le16 at off+20 — Linux: mcu.c:1078 = mvif->sta.wcid.idx
+        // MT7996_WTBL_RESERVED - bss_idx (1087 for first BSS)
+        let bmc_wlan_idx = MT7996_WTBL_RESERVED - hw_bss_idx as u16;
+        data[off + 20..off + 22].copy_from_slice(&bmc_wlan_idx.to_le_bytes());
         // bcn_interval:le16 = 100
         data[off + 22..off + 24].copy_from_slice(&100u16.to_le_bytes());
         // dtim_period = 1
         data[off + 24] = 1;
-        // phymode = 0
-        // sta_idx:le16 = 0
-        // nonht_basic_phy:le16 = 0
-        // phymode_ext = 0
-        // link_idx = 0
+        // phymode = B|G|GN for 2.4GHz — mt76_connac_mcu.c:1319
+        data[off + 25] = PHY_MODE_B | PHY_MODE_G | PHY_MODE_GN;  // 0x0E
+        // sta_idx:le16 at off+26 — Linux: mcu.c:1079 = wlan_idx (BMC STA WCID)
+        data[off + 26..off + 28].copy_from_slice(&bmc_wlan_idx.to_le_bytes());
+        // nonht_basic_phy:le16 at off+28 — mt7996's bss_basic_tlv() does NOT set this
+        // (only mt76_connac_mcu.c for older chips sets it to 0x0015)
+        // Leave at 0 to match mt7996 behavior.
 
-        // === BSS_INFO_SEC TLV (8 bytes) — mcu.c:1216-1222 ===
-        let off2 = 36;
-        // tag = UNI_BSS_INFO_SEC (16)
-        data[off2..off2 + 2].copy_from_slice(&UNI_BSS_INFO_SEC.to_le_bytes());
-        // len = 8
-        data[off2 + 2..off2 + 4].copy_from_slice(&8u16.to_le_bytes());
-        // rsv[2] = 0
-        // cipher = 0 (NONE)
+        // === BSS_INFO_SEC TLV (8 bytes) — mcu.c:1216 ===
+        let off = 36;
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_SEC.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        // cipher = 0 (NONE/open)
+
+        // === BSS_INFO_RLM TLV (16 bytes) — mcu.c:805-832 ===
+        let off = 44;
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_RLM.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
+        data[off + 4] = channel;   // control_channel
+        data[off + 5] = channel;   // center_chan (same for 20MHz)
+        // center_chan2 = 0
+        data[off + 7] = 0;         // bw = 0 (20MHz, matches CMD_CBW_20MHZ)
+        // tx_streams = hweight8(antenna_mask) — mcu.c:823
+        // BPI-R4 MT7996: assumed 2T2R pending eFuse readback confirmation
+        let nstreams: u8 = 2;
+        data[off + 8] = nstreams;  // tx_streams
+        data[off + 9] = nstreams;  // rx_streams
+        // ht_op_info = 0, sco = 0
+        data[off + 12] = 1;        // band = 1 (2GHz) — mcu.c:807-810 rlm_ch_band
+
+        // === BSS_INFO_RA TLV (16 bytes) — mcu.c:834-844 ===
+        let off = 60;
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_RA.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
+        data[off + 4] = 1;         // short_preamble = true — mcu.c:843
+
+        // === BSS_INFO_RATE TLV (24 bytes) — mcu.c:896-914 ===
+        let off = 76;
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_RATE.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&24u16.to_le_bytes());
+        // __rsv1[4] at off+4..off+8
+        // bc_trans:le16 at off+8, mc_trans:le16 at off+10
+        data[off + 12] = 1;        // short_preamble = true (2GHz) — mcu.c:911
+        data[off + 13] = MT7996_BASIC_RATES_TBL;  // bc_fixed_rate — mcu.c:912
+        data[off + 14] = MT7996_BASIC_RATES_TBL;  // mc_fixed_rate — mcu.c:913
+
+        // === BSS_INFO_TXCMD TLV (8 bytes) — mcu.c:916-926 ===
+        let off = 100;
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_TXCMD.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        data[off + 4] = 1;         // txcmd_mode = true — mcu.c:925
+
+        // === BSS_INFO_IFS_TIME TLV (20 bytes) — mcu.c:1002-1026 ===
+        let off = 108;
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_IFS_TIME.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());
+        data[off + 4] = 1;         // slot_valid
+        data[off + 5] = 1;         // sifs_valid
+        data[off + 6] = 1;         // rifs_valid
+        data[off + 7] = 1;         // eifs_valid
+        data[off + 8..off + 10].copy_from_slice(&9u16.to_le_bytes());    // slot_time (short slot)
+        data[off + 10..off + 12].copy_from_slice(&10u16.to_le_bytes());  // sifs_time — mcu.c:1018
+        data[off + 12..off + 14].copy_from_slice(&2u16.to_le_bytes());   // rifs_time — mcu.c:1019
+        data[off + 14..off + 16].copy_from_slice(&78u16.to_le_bytes());  // eifs_time (2GHz) — mcu.c:1020
+        data[off + 16] = 1;        // eifs_cck_valid (2GHz) — mcu.c:1022
         // rsv = 0
+        data[off + 18..off + 20].copy_from_slice(&314u16.to_le_bytes()); // eifs_cck_time — mcu.c:1024
 
-        // MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) = __MCU_CMD_FIELD_UNI | 0x02 | WM | WA
+        // === BSS_INFO_MLD TLV (16 bytes) — mcu.c:929-951 ===
+        // MANDATORY: "this tag is necessary no matter if the vif is MLD" (mcu.c:1161)
+        let off = 128;
+        data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_MLD.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
+        data[off + 4] = 0xff;         // group_mld_id = 0xff (not MLD) — mcu.c:948
+        data[off + 5] = hw_bss_idx;   // own_mld_id = BSS index — mcu.c:940
+        // mac_addr[6] at off+6..off+12: zeros for non-MLD
+        data[off + 12] = 0xff;        // remap_idx = 0xff (not MLD) — mcu.c:949
+        data[off + 13] = 0;           // link_id = 0 (single link) — mcu.c:941
+        // __rsv[2] = 0
+
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BSS_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "add_bss_info"; band = band, omac = omac_idx, bss = hw_bss_idx, enable = enable as u8);
@@ -1223,20 +1613,25 @@ impl Mt7996Dev {
     ///        mt76_connac_mcu.c:388-415 mt76_connac_mcu_sta_basic_tlv()
     ///
     /// UNI cmd MCU_WMWA_UNI_CMD(STA_REC_UPDATE) (0x03) — both WM+WA.
-    /// Layout: sta_req_hdr(8) + STA_REC_BASIC(20) = 28 bytes
+    /// Layout: sta_req_hdr(8) + STA_REC_BASIC(20) + STA_REC_HDR_TRANS(8) + STA_REC_TX_PROC(8) = 44 bytes
     /// Wait: yes
+    ///
+    /// Linux sends 3 TLVs for the BMC STA (link_sta=NULL path):
+    ///   1. STA_REC_BASIC — connection type, state, extra_info
+    ///   2. STA_REC_HDR_TRANS — header translation config (mcu.c:1908-1937)
+    ///   3. STA_REC_TX_PROC — TX processing flags (mcu.c:1884-1893)
     pub fn mcu_add_sta(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
                        omac_idx: u8, conn_state: u8, mac_addr: &[u8; 6],
                        newly: bool, seq: u8) -> Result<(), i32> {
-        let mut data = [0u8; 28];
+        let mut data = [0u8; 44];
 
         // === sta_req_hdr (8 bytes) — mt76_connac_mcu.h ===
         // bss_idx
         data[0] = bss_idx;
         // wlan_idx_lo (low 8 bits)
         data[1] = wlan_idx as u8;
-        // tlv_num = 1
-        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        // tlv_num = 3 (BASIC + HDR_TRANS + TX_PROC)
+        data[2..4].copy_from_slice(&3u16.to_le_bytes());
         // is_tlv_append = 1
         data[4] = 1;
         // muar_idx = omac_idx
@@ -1246,20 +1641,22 @@ impl Mt7996Dev {
         // rsv = 0
 
         // === STA_REC_BASIC TLV (20 bytes) — mt76_connac_mcu.c:388-415 ===
+        // This is the broadcast/multicast STA for AP mode (link_sta=NULL path).
         let off = 8;
         // tag = STA_REC_BASIC (0)
         data[off..off + 2].copy_from_slice(&STA_REC_BASIC.to_le_bytes());
         // len = 20
         data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());
-        // conn_type:le32 = CONNECTION_INFRA_STA
-        data[off + 4..off + 8].copy_from_slice(&CONNECTION_INFRA_STA.to_le_bytes());
+        // conn_type:le32 = CONNECTION_INFRA_BC — mt76_connac_mcu.c:396
+        // Broadcast/multicast STA for AP mode (link_sta==NULL → INFRA_BC)
+        data[off + 4..off + 8].copy_from_slice(&CONNECTION_INFRA_BC.to_le_bytes());
         // conn_state
         data[off + 8] = conn_state;
-        // qos = 1
-        data[off + 9] = 1;
+        // qos = 0 (broadcast STA has no WME) — mt76_connac_mcu.c:411
         // aid:le16 = 0
-        // peer_addr[6]
-        data[off + 12..off + 18].copy_from_slice(mac_addr);
+        // peer_addr[6] = ff:ff:ff:ff:ff:ff (broadcast) — mt76_connac_mcu.c:397
+        // AP mode + link_sta==NULL → eth_broadcast_addr(basic->peer_addr)
+        data[off + 12..off + 18].copy_from_slice(&[0xff; 6]);
         // extra_info:le16
         let mut extra = EXTRA_INFO_VER;
         if newly {
@@ -1267,10 +1664,171 @@ impl Mt7996Dev {
         }
         data[off + 18..off + 20].copy_from_slice(&extra.to_le_bytes());
 
+        // === STA_REC_HDR_TRANS TLV (8 bytes) — mcu.c:1908-1937 ===
+        // For AP mode: from_ds=1, to_ds=0
+        // dis_rx_hdr_tran=1 (new WCID, MT_WCID_FLAG_HDR_TRANS not yet set)
+        let off = 28;
+        data[off..off + 2].copy_from_slice(&STA_REC_HDR_TRANS.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        data[off + 4] = 1;  // from_ds = true (AP mode) — mcu.c:1921
+        data[off + 5] = 0;  // to_ds = false (AP mode)
+        data[off + 6] = 1;  // dis_rx_hdr_tran = true (no HDR_TRANS flag) — mcu.c:1916
+        // mesh = 0
+
+        // === STA_REC_TX_PROC TLV (8 bytes) — mcu.c:1884-1893 ===
+        // flag = 0 (no special TX processing flags)
+        let off = 36;
+        data[off..off + 2].copy_from_slice(&STA_REC_TX_PROC.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        // flag:le32 = 0 — mcu.c:1892
+
         // MCU_WMWA_UNI_CMD(STA_REC_UPDATE) = __MCU_CMD_FIELD_UNI | 0x03 | WM | WA
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "add_sta"; bss = bss_idx, wlan = wlan_idx, state = conn_state);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Assign WCID to BSS scheduling group (VOW DRR control)
+    /// Linux: mt7996/mcu.c:2343-2367 mt7996_mcu_add_group()
+    ///
+    /// Called after add_sta() to assign the WCID to the correct BSS group
+    /// for airtime fairness scheduling.
+    ///
+    /// Command: MCU_WM_UNI_CMD(VOW) = CMD_FIELD_UNI | 0x37 | CMD_FIELD_WM
+    /// Wait: yes
+    pub fn mcu_add_group(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
+                         seq: u8) -> Result<(), i32> {
+        // Layout: uni_header(4) + TLV(20) = 24 bytes
+        // Linux struct: __rsv1[4] + tag(2) + len(2) + wlan_idx(2) + __rsv2[2] + action(4) + val(4) + __rsv3[8]
+        let mut data = [0u8; 24];
+
+        // uni_header: bss_idx (not actually used by VOW, but kept for consistency)
+
+        // TLV: UNI_VOW_DRR_CTRL
+        let off = 4;
+        data[off..off + 2].copy_from_slice(&UNI_VOW_DRR_CTRL.to_le_bytes());   // tag = 0
+        data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());           // len = 20 (sizeof - 4)
+        data[off + 4..off + 6].copy_from_slice(&wlan_idx.to_le_bytes());        // wlan_idx
+        // __rsv2[2] = 0
+        // action = MT_STA_BSS_GROUP (1) — mcu.c:2346,2360
+        data[off + 8..off + 12].copy_from_slice(&1u32.to_le_bytes());
+        // val = bss_idx % 16 — mcu.c:2361
+        data[off + 12..off + 16].copy_from_slice(&((bss_idx as u32) % 16).to_le_bytes());
+        // __rsv3[8] = 0
+
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_VOW as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "add_group"; wlan = wlan_idx, bss = bss_idx);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+    }
+
+    /// Initialize transmit beamforming subsystem
+    /// Linux: mt7996/init.c:640-658 mt7996_txbf_init()
+    ///        mt7996/mcu.c:4185-4235 mt7996_mcu_set_txbf()
+    ///
+    /// Sends 3 MCU commands via MCU_WM_UNI_CMD(BF) (0x33):
+    ///   1. BF_MOD_EN_CTRL (tag=20) — enable BF for all bands
+    ///   2. BF_SOUNDING_ON (tag=1) — set sounding mode to BF_PROCESSING(4)
+    ///   3. BF_HW_EN_UPDATE (tag=17) — enable explicit beamforming
+    ///
+    /// Called from init_work() after mac_init(). Required before TX works.
+    pub fn mcu_txbf_init(&self, ring: &mut TxRing, seq: &mut u8) -> Result<(), i32> {
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BF as u32) | CMD_FIELD_WM;
+
+        // 1. BF_MOD_EN_CTRL (tag=20, len=16) — init.c:645-654
+        // MT7996 tri-band: bf_num=3, bf_bitmap=0x07
+        {
+            let mut data = [0u8; 20]; // uni_header(4) + TLV(16)
+            data[4..6].copy_from_slice(&20u16.to_le_bytes()); // tag = BF_MOD_EN_CTRL
+            data[6..8].copy_from_slice(&16u16.to_le_bytes()); // len
+            data[8] = 3;    // bf_num = 3 (tri-band)
+            data[9] = 0x07; // bf_bitmap = GENMASK(2,0)
+            // bf_sel[8] + rsv[2] = 0
+            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq)?;
+            *seq = seq.wrapping_add(1);
+        }
+
+        // 2. BF_SOUNDING_ON (tag=1, len=20) — init.c:656
+        {
+            let mut data = [0u8; 24]; // uni_header(4) + TLV(20)
+            data[4..6].copy_from_slice(&1u16.to_le_bytes()); // tag = BF_SOUNDING_ON
+            data[6..8].copy_from_slice(&20u16.to_le_bytes()); // len
+            data[8] = 4; // snd_mode = BF_PROCESSING
+            // sta_num, rsv, wlan_id[4], snd_period = 0
+            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq)?;
+            *seq = seq.wrapping_add(1);
+        }
+
+        // 3. BF_HW_EN_UPDATE (tag=17, len=8) — init.c:657
+        {
+            let mut data = [0u8; 12]; // uni_header(4) + TLV(8)
+            data[4..6].copy_from_slice(&17u16.to_le_bytes()); // tag = BF_HW_EN_UPDATE
+            data[6..8].copy_from_slice(&8u16.to_le_bytes());  // len
+            data[8] = 1; // ebf = true (explicit BF always enabled)
+            data[9] = 0; // ibf = false (implicit BF off by default)
+            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq)?;
+            *seq = seq.wrapping_add(1);
+        }
+
+        uinfo!("mcu", "txbf_init_ok");
+        Ok(())
+    }
+
+    /// Send EDCA/WMM queue parameters for AP mode
+    /// Linux: mt7996/mcu.c:3423-3481 mt7996_mcu_set_tx()
+    ///
+    /// Called on BSS_CHANGED_BEACON_ENABLED to configure per-AC queue parameters.
+    /// Sends 4 EDCA TLVs (one per AC) with default AP EDCA values.
+    /// Comment from Linux main.c:883: "ensure that enable txcmd_mode after bss_info"
+    ///
+    /// Command: MCU_WM_UNI_CMD(EDCA_UPDATE) = CMD_FIELD_UNI | 0x04 | CMD_FIELD_WM
+    /// Wait: yes
+    pub fn mcu_set_edca(&self, ring: &mut TxRing, bss_idx: u8, seq: u8) -> Result<(), i32> {
+        // Layout: hdr(4) + 4 × edca_tlv(12) = 52 bytes
+        // struct edca from mcu.h:284-295:
+        //   tag:le16, len:le16, queue:u8, set:u8, cw_min:u8, cw_max:u8,
+        //   txop:le16, aifs:u8, __rsv:u8
+        let mut data = [0u8; 52];
+
+        // Header: bss_idx + 3 bytes padding — mcu.c:3444-3447
+        data[0] = bss_idx;
+
+        // Default AP EDCA values (802.11-2020, OFDM, bss_notify=true)
+        // cw_min/cw_max values are fls() of the CW values — mcu.c:3466-3474
+        //   AC_VO: aifs=2, cw_min=fls(3)=2,  cw_max=fls(7)=3,    txop=47
+        //   AC_VI: aifs=2, cw_min=fls(7)=3,  cw_max=fls(15)=4,   txop=94
+        //   AC_BE: aifs=3, cw_min=fls(15)=4, cw_max=fls(1023)=10, txop=0
+        //   AC_BK: aifs=7, cw_min=fls(15)=4, cw_max=fls(1023)=10, txop=0
+        // (queue, cw_min, cw_max, txop, aifs)
+        const EDCA_PARAMS: [(u8, u8, u8, u16, u8); 4] = [
+            (0, 2, 3, 47, 2),   // AC_VO
+            (1, 3, 4, 94, 2),   // AC_VI
+            (2, 4, 10, 0, 3),   // AC_BE
+            (3, 4, 10, 0, 7),   // AC_BK
+        ];
+
+        const WMM_PARAM_SET: u8 = 0x0F; // WMM_AIFS_SET|CW_MIN_SET|CW_MAX_SET|TXOP_SET
+
+        for (i, &(queue, cw_min, cw_max, txop, aifs)) in EDCA_PARAMS.iter().enumerate() {
+            let off = 4 + i * 12;
+            // tag = MCU_EDCA_AC_PARAM (0) — mcu.c:3457
+            data[off..off + 2].copy_from_slice(&0u16.to_le_bytes());
+            // len = 12
+            data[off + 2..off + 4].copy_from_slice(&12u16.to_le_bytes());
+            data[off + 4] = queue;        // queue — mcu.c:3460
+            data[off + 5] = WMM_PARAM_SET; // set — mcu.c:3459
+            data[off + 6] = cw_min;        // cw_min — mcu.c:3466
+            data[off + 7] = cw_max;        // cw_max — mcu.c:3471
+            data[off + 8..off + 10].copy_from_slice(&txop.to_le_bytes()); // txop — mcu.c:3462
+            data[off + 10] = aifs;         // aifs — mcu.c:3461
+            // rsv = 0
+        }
+
+        // MCU_WM_UNI_CMD(EDCA_UPDATE) = CMD_FIELD_UNI | 0x04 | CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_EDCA_UPDATE as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "set_edca"; bss = bss_idx);
         self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
     }
 
@@ -1334,12 +1892,12 @@ impl Mt7996Dev {
         data[txd_off..txd_off + 4].copy_from_slice(&txd0.to_le_bytes());
 
         // txd[1]: WLAN_IDX(11:0) | HDR_FORMAT(15:14) | HDR_INFO(20:16) | OWN_MAC(30:25) | FIXED_RATE(31)
-        //   wlan_idx = 0 (global wcid)
+        //   wlan_idx = 0 (global_wcid) — mcu.c:2745 uses dev->mt76.global_wcid for MT7996
         //   hdr_format = MT_HDR_FORMAT_802_11 (2) — 802.11 native
         //   hdr_info = 24/2 = 12 (802.11 header length / 2)
-        //   tid = 0 (beacon = management, not QoS)
+        //   tid = 0 (beacon = management, MT_TX_NORMAL) — mac.c:812
         //   own_mac = omac_idx
-        //   fixed_rate = 1
+        //   fixed_rate = 1 (beacon is not data) — mac.c:820-822
         let txd1 = ((MT_HDR_FORMAT_802_11 as u32) << 14)
             | (12u32 << 16)
             | ((omac_idx as u32) << 25)
@@ -1352,10 +1910,11 @@ impl Mt7996Dev {
         data[txd_off + 8..txd_off + 12].copy_from_slice(&txd2.to_le_bytes());
 
         // txd[3]: NO_ACK(0) | BCM(4) | REM_TX_COUNT(15:11) | BA_DISABLE(28)
-        //   no_ack = 1 (beacons don't get ACK'd)
-        //   bcm = 1 (broadcast/multicast)
-        //   rem_tx_count = 0x1F (full field, per Linux beacon override)
-        //   ba_disable = 1 (set because fixed_rate is set)
+        //   no_ack = 1 — mac80211 sets IEEE80211_TX_CTL_NO_ACK for beacons (mac.c:966)
+        //   bcm = 1 (broadcast, addr1=ff:ff:ff:ff:ff:ff) — mac.c:852
+        //   rem_tx_count = 0x1F (all bits set for beacon) — mac.c:855
+        //   ba_disable = 1 (set because fixed_rate is set) — mac.c:1013
+        //   SW_POWER_MGMT is NOT set — Linux clears it for beacons (mac.c:854)
         let txd3 = 1u32 | (1u32 << 4) | (0x1Fu32 << 11) | (1u32 << 28);
         data[txd_off + 12..txd_off + 16].copy_from_slice(&txd3.to_le_bytes());
 
@@ -1364,12 +1923,12 @@ impl Mt7996Dev {
 
         // txd[6]: DAS(2) | DIS_MAT(3) | MSDU_CNT(9:4) | TX_RATE(21:16) | FIXED_BW(25) | VTA(28)
         //   das = 1, dis_mat = 1, msdu_cnt = 1
-        //   tx_rate = MT7996_BASIC_RATES_TBL (31)
+        //   tx_rate = MT7996_BEACON_RATES_TBL (25) — mcu.c:4604, mac.c:1006
         //   fixed_bw = 1, vta = 1
         let txd6 = (1u32 << 2)
             | (1u32 << 3)
             | (1u32 << 4)
-            | ((MT7996_BASIC_RATES_TBL as u32) << 16)
+            | ((MT7996_BEACON_RATES_TBL as u32) << 16)
             | (1u32 << 25)
             | (1u32 << 28);
         data[txd_off + 24..txd_off + 28].copy_from_slice(&txd6.to_le_bytes());
@@ -1446,7 +2005,8 @@ impl Mt7996Dev {
     ///
     /// UNI command MCU_WM_UNI_CMD(FIXED_RATE_TABLE) (0x40), tag=0.
     /// Used for basic rate programming (12 CCK+OFDM rates).
-    pub fn mcu_set_fixed_rate_table(&self, ring: &mut TxRing, table_idx: u8, rate_idx: u16, seq: u8) -> Result<(), i32> {
+    pub fn mcu_set_fixed_rate_table(&self, ring: &mut TxRing, table_idx: u8, rate_idx: u16,
+                                    is_beacon: bool, band: u8, seq: u8) -> Result<(), i32> {
         // struct fixed_rate_table_ctrl from mcu.h:954-972:
         //   u8 _rsv[4];          // uni_header
         //   le16 tag;            // UNI_FIXED_RATE_TABLE_SET (0)
@@ -1474,9 +2034,15 @@ impl Mt7996Dev {
         // antenna_idx = 0
         // rate_idx
         data[10..12].copy_from_slice(&rate_idx.to_le_bytes());
-        // spe_idx_sel = SPE_IXD_SELECT_BMC_WTBL (1) for non-beacon
-        data[12] = 1;
-        // spe_idx = 0
+        // spe_idx_sel: beacon → SPE_IXD_SELECT_TXD (0), non-beacon → SPE_IXD_SELECT_BMC_WTBL (1)
+        // spe_idx: beacon → 24 + band_idx, non-beacon → 0
+        // Linux: mcu.c:4617-4621
+        if is_beacon {
+            data[12] = 0; // SPE_IXD_SELECT_TXD
+            data[13] = 24 + band;
+        } else {
+            data[12] = 1; // SPE_IXD_SELECT_BMC_WTBL
+        }
         // gi = 1
         data[14] = 1;
         // he_ltf = 1
@@ -1487,5 +2053,75 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_FIXED_RATE_TABLE as u32) | CMD_FIELD_WM;
 
         self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)
+    }
+
+    /// Background chain control — start/stop offchannel scan
+    /// Linux: mt7996/mcu.c:3604-3658 mt7996_mcu_background_chain_ctrl()
+    /// Struct: mt7996/mcu.h:122-148 mt7996_mcu_background_chain_ctrl (24 bytes)
+    ///
+    /// scan_mode: 0=stop, 1=start
+    /// ch_band: 0=2.4GHz, 1=5GHz
+    pub fn mcu_background_chain_ctrl(
+        &self, ring: &mut TxRing,
+        band: u8, channel: u8, bw: u8, ch_band: u8,
+        scan_mode: u8,
+        seq: u8,
+    ) -> Result<(), i32> {
+        // struct mt7996_mcu_background_chain_ctrl — 24 bytes packed
+        // [0..4]   _rsv (uni_header)
+        // [4..6]   tag = 0 (le16)
+        // [6..8]   len = sizeof(req) - 4 = 20 (le16)
+        // [8]      chan (primary channel)
+        // [9]      central_chan
+        // [10]     bw
+        // [11]     tx_stream
+        // [12]     rx_stream (antenna mask)
+        // [13]     monitor_chan
+        // [14]     monitor_central_chan
+        // [15]     monitor_bw
+        // [16]     monitor_tx_stream
+        // [17]     monitor_rx_stream
+        // [18]     scan_mode
+        // [19]     band_idx (DBDC)
+        // [20]     monitor_scan_type
+        // [21]     band (0=2.4GHz, 1=5GHz)
+        // [22..24] _rsv2
+        let mut data = [0u8; 24];
+
+        // tag = 0 — mcu.c:3613
+        data[4..6].copy_from_slice(&0u16.to_le_bytes());
+        // len = 20 — mcu.c:3614
+        data[6..8].copy_from_slice(&20u16.to_le_bytes());
+        // monitor_scan_type = 2 (simple rx) — mcu.c:3615
+        data[20] = 2;
+
+        if scan_mode == 1 {
+            // CH_SWITCH_BACKGROUND_SCAN_START — mcu.c:3625-3635
+            data[8] = channel;                // chan — mcu.c:3626
+            data[9] = channel;                // central_chan — mcu.c:3627
+            data[10] = bw;                    // bw — mcu.c:3628
+            data[13] = channel;               // monitor_chan — mcu.c:3629
+            data[14] = channel;               // monitor_central_chan — mcu.c:3630-3631
+            data[15] = bw;                    // monitor_bw — mcu.c:3632
+            data[18] = 1;                     // scan_mode = 1 — mcu.c:3634
+            data[19] = band;                  // band_idx — mcu.c:3633
+        } else {
+            // CH_SWITCH_BACKGROUND_SCAN_STOP — mcu.c:3644-3650
+            data[8] = channel;                // chan — mcu.c:3645
+            data[9] = channel;                // central_chan — mcu.c:3646
+            data[10] = bw;                    // bw — mcu.c:3647
+            data[11] = 2;                     // tx_stream = hweight8(antenna_mask=3) = 2 — mcu.c:3648
+            data[12] = 3;                     // rx_stream = antenna_mask = 0x3 (2T2R) — mcu.c:3649
+            data[18] = 0;                     // scan_mode = 0
+        }
+
+        // band — mcu.c:3654
+        data[21] = ch_band;
+
+        // MCU_WM_UNI_CMD(OFFCH_SCAN_CTRL) — mcu.c:3656
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_OFFCH_SCAN_CTRL as u32) | CMD_FIELD_WM;
+
+        udebug!("mcu", "background_chain_ctrl"; scan_mode = scan_mode, channel = channel);
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)  // wait=false — mcu.c:3657
     }
 }

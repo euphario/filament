@@ -7,7 +7,7 @@ use userlib::ipc::Channel;
 use userlib::query::{
     QueryHeader, ErrorResponse,
     PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
-    SpawnChildContext,
+    SpawnChildContext, query_flags,
     msg, error,
 };
 
@@ -291,6 +291,84 @@ impl QueryHandler {
         };
 
         match client.channel.send(&buf[..len]) {
+            Ok(_) => Some(seq_id),
+            Err(_) => None,
+        }
+    }
+
+    /// Send a SPAWN_CHILD command with path-based ADDRESSED routing.
+    ///
+    /// Wraps the normal SpawnChild message with an ADDRESSED route prefix
+    /// so that intermediate bus_runtime nodes can consume path segments
+    /// and forward to the correct child subtree.
+    ///
+    /// When `path` is empty, falls back to `send_spawn_child_with_context`.
+    pub fn send_spawn_child_with_path(
+        &mut self,
+        service_idx: u8,
+        binary: &[u8],
+        trigger_port: &[u8],
+        caps: u64,
+        ctx: Option<&SpawnChildContext>,
+        path: &[u8],
+    ) -> Option<u32> {
+        if path.is_empty() {
+            return self.send_spawn_child_with_context(
+                service_idx, binary, trigger_port, caps, ctx,
+            );
+        }
+
+        let slot = self.find_by_service_idx(service_idx)?;
+        let client = self.clients[slot].as_mut()?;
+
+        if !client.is_managed {
+            return None;
+        }
+
+        // Get next sequence ID
+        let seq_id = unsafe {
+            let id = SPAWN_SEQ_ID;
+            SPAWN_SEQ_ID = SPAWN_SEQ_ID.wrapping_add(1);
+            id
+        };
+
+        // Build the base SpawnChild message (without route)
+        let cmd = SpawnChild::with_caps(seq_id, caps);
+        let mut base = [0u8; 512];
+
+        let base_len = if let Some(context) = ctx {
+            let (filter, pattern) = userlib::query::PortFilter::exact(trigger_port);
+            cmd.write_to_with_context(&mut base, binary, &filter, pattern, context)?
+        } else {
+            cmd.write_to(&mut base, binary, trigger_port)?
+        };
+
+        // Wrap with ADDRESSED route: header(flags|=ADDRESSED) + route_len + route + payload
+        let route_len = path.len();
+        if route_len > 255 {
+            return None;
+        }
+        let total = QueryHeader::SIZE + 1 + route_len + (base_len - QueryHeader::SIZE);
+        if total > 576 {
+            return None;
+        }
+
+        let mut out = [0u8; 576];
+        // Copy header with ADDRESSED flag set
+        out[..QueryHeader::SIZE].copy_from_slice(&base[..QueryHeader::SIZE]);
+        let flags = u16::from_le_bytes([out[2], out[3]]) | query_flags::ADDRESSED;
+        out[2..4].copy_from_slice(&flags.to_le_bytes());
+        // Route length + route bytes
+        out[QueryHeader::SIZE] = route_len as u8;
+        let route_start = QueryHeader::SIZE + 1;
+        out[route_start..route_start + route_len].copy_from_slice(path);
+        // Copy payload (everything after header from base message)
+        let out_payload = route_start + route_len;
+        let base_payload_len = base_len - QueryHeader::SIZE;
+        out[out_payload..out_payload + base_payload_len]
+            .copy_from_slice(&base[QueryHeader::SIZE..base_len]);
+
+        match client.channel.send(&out[..total]) {
             Ok(_) => Some(seq_id),
             Err(_) => None,
         }

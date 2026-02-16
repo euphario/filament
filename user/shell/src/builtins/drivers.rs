@@ -92,14 +92,14 @@ fn cmd_info(service_name: &[u8]) -> CommandResult {
 /// Output format (port → service → port → service ...):
 /// ```text
 /// devd ─────────────────────────────────────────
-/// ├─ ○ pcie0 ·····························     pcie
+/// ├─ ○ pcie:0 ····························     pcie
 /// │ └─ ● pcied ··························· 2 ● ready
-/// ├─ ○ uart0 ·····························     uart
+/// ├─ ○ uart:0 ····························     uart
 /// │ └─ ● consoled ························ 3 ● ready
-/// │   └─ ○ console: ······················     console
+/// │   └─ ○ console:0 ·····················     console
 /// │     └─ ● shell ······················· 6 ● ready
 /// ├─ ● vfsd ······························ 4 ● ready
-/// │ └─ ○ vfs: ····························     filesystem shmem=1
+/// │ └─ ○ vfs:0 ···························     filesystem shmem=1
 /// └─ ● ipd ······························· 5 ● ready
 ///   └─ ○ ipd: ····························     service
 /// ```
@@ -308,8 +308,8 @@ fn emit_svc_line(out: &mut StringBuf, prefix: &str, conn: &str, svc: &ServiceEnt
 /// Emit a port line: prefix + conn + ○ name ···· type
 fn emit_port_line(out: &mut StringBuf, prefix: &str, conn: &str, port: &PortEntry) {
     let pname_full = port_name_str(&port.name);
-    // Strip /kernel/bus/ prefix for display
-    let pname = pname_full.strip_prefix("/kernel/bus/").unwrap_or(pname_full);
+    // Strip "/" prefix from kernel bus ports for display
+    let pname = pname_full.strip_prefix("/").unwrap_or(pname_full);
     let type_s = port_type_str(port.port_type);
     let has_data = port.flags & port_flags::HAS_DATAPORT != 0;
 
@@ -361,11 +361,11 @@ fn visible_len(s: &str) -> usize {
     n
 }
 
-/// Extract short bus name from bus_path (e.g., "/kernel/bus/uart0" → "uart0")
+/// Extract short bus name from bus_path (e.g., "/pcie:0" → "pcie:0")
 fn extract_bus_short(svc: &ServiceEntry) -> Option<&str> {
     if !svc.has_bus_path() { return None; }
     let bp = core::str::from_utf8(svc.bus_path_str()).ok()?;
-    bp.strip_prefix("/kernel/bus/").filter(|s| !s.is_empty())
+    bp.strip_prefix("/").filter(|s| !s.is_empty())
 }
 
 /// Get bus_path as str for matching children to ports

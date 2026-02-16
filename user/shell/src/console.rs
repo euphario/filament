@@ -5,7 +5,7 @@
 //!
 //! ## Protocol
 //!
-//! 1. Connect to "console:" port (Channel)
+//! 1. Connect to "console:0" port (Channel)
 //! 2. Receive "RING" + shmem_id + cols + rows message
 //! 3. Map the shmem as ConsoleRing
 //! 4. Use TX ring for output, RX ring for input
@@ -60,7 +60,7 @@ impl Console {
     /// Returns true if connected, false if falling back to direct UART
     pub fn connect(&mut self) -> bool {
         // Connect to consoled port
-        let mut channel = match Channel::connect(b"console:") {
+        let mut channel = match Channel::connect(b"console:0") {
             Ok(ch) => ch,
             Err(_) => return false,
         };

@@ -128,7 +128,7 @@ pub enum DispatchMode {
     /// Normal IPC — messages queued for peer
     Peer,
     /// Kernel bus dispatch — writes are intercepted by kernel bus controller.
-    /// Set for client channels connected to /kernel/bus/* ports.
+    /// Set for client channels connected to kernel bus ports (e.g., /pcie:0).
     KernelBus,
 }
 

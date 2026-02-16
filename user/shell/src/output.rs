@@ -51,7 +51,7 @@ pub const MAX_COLS: usize = 8;
 pub const MAX_ROWS: usize = 16;
 
 /// Maximum string length in a cell
-pub const MAX_CELL_STR: usize = 24;
+pub const MAX_CELL_STR: usize = 64;
 
 /// Cell value types
 #[derive(Clone, Copy)]

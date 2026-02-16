@@ -53,7 +53,7 @@ fn show_help() {
     println!("Examples:");
     println!("  devd start consoled");
     println!("  devd restart logd");
-    println!("  devd spawn wifid /bus/pcie0/01:00.0");
+    println!("  devd spawn wifid /bus/pcie:0/wifi:0");
 }
 
 fn cmd_spawn(args: &[u8]) -> CommandResult {

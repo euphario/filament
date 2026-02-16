@@ -1007,9 +1007,51 @@ impl DevdClient {
     pub fn respond_info(&mut self, seq_id: u32, info: &[u8]) -> Result<(), SysError> {
         let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
-        let resp = ServiceInfoResult::success(seq_id, info.len() as u16);
-        let mut buf = [0u8; 1100];
-        let len = resp.write_to(&mut buf, info)
+        // IPC max payload is 576 bytes. ServiceInfoResult header is 16 bytes,
+        // so max info per message is 560 bytes. Split on line boundaries if needed
+        // so [source] annotations aren't broken across messages.
+        const MAX_INFO: usize = 576 - ServiceInfoResult::FIXED_SIZE;
+
+        if info.len() <= MAX_INFO {
+            let resp = ServiceInfoResult::success(seq_id, info.len() as u16);
+            let mut buf = [0u8; 576];
+            let len = resp.write_to(&mut buf, info)
+                .ok_or(SysError::InvalidArgument)?;
+            channel.send(&buf[..len])?;
+            return Ok(());
+        }
+
+        // Chunk on newline boundaries to preserve [header] + data integrity
+        let mut offset = 0;
+        while offset < info.len() {
+            let remaining = info.len() - offset;
+            let chunk_end = if remaining <= MAX_INFO {
+                info.len()
+            } else {
+                // Find last newline within MAX_INFO bytes
+                info[offset..offset + MAX_INFO].iter().rposition(|&b| b == b'\n')
+                    .map(|p| offset + p + 1) // include the newline
+                    .unwrap_or(offset + MAX_INFO) // no newline? force split
+            };
+            let chunk = &info[offset..chunk_end];
+            let resp = ServiceInfoResult::success(seq_id, chunk.len() as u16);
+            let mut buf = [0u8; 576];
+            let len = resp.write_to(&mut buf, chunk)
+                .ok_or(SysError::InvalidArgument)?;
+            channel.send(&buf[..len])?;
+            offset = chunk_end;
+        }
+
+        Ok(())
+    }
+
+    /// Send an end-of-line response (this node has no answer and no children).
+    pub fn respond_info_eol(&mut self, seq_id: u32) -> Result<(), SysError> {
+        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
+
+        let resp = ServiceInfoResult::eol(seq_id);
+        let mut buf = [0u8; ServiceInfoResult::FIXED_SIZE];
+        let len = resp.write_to(&mut buf, &[])
             .ok_or(SysError::InvalidArgument)?;
         channel.send(&buf[..len])?;
 

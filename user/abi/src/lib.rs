@@ -1113,7 +1113,7 @@ pub struct BusInfo {
     pub base_addr: u32,
     /// Owner PID (0 if no owner)
     pub owner_pid: u32,
-    /// Port path (e.g., "/kernel/bus/pcie0")
+    /// Port path (e.g., "/pcie:0")
     pub path: [u8; 32],
     /// Length of path string
     pub path_len: u8,

@@ -183,6 +183,13 @@ pub struct TxRing {
     pub desc_phys: u64,
     pub buf_virt: u64,
     pub buf_phys: u64,
+    /// RX queue registers to poll for MCU responses.
+    /// WM ring → MCU_WM_RX_REGS (q0), WA ring → MCU_WA_RX_REGS (q1).
+    /// Linux: mt7996_mcu_send_message() lines 295-298.
+    pub rx_regs: u32,
+    /// RX buffer virtual address and size for response parsing.
+    pub rx_buf_virt: u64,
+    pub rx_buf_size: u32,
 }
 
 impl TxRing {
@@ -195,6 +202,9 @@ impl TxRing {
             desc_phys,
             buf_virt,
             buf_phys,
+            rx_regs: 0,
+            rx_buf_virt: 0,
+            rx_buf_size: 0,
         }
     }
 
@@ -517,7 +527,8 @@ impl Mt7996Dev {
             let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
             let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
 
-            let ctrl = (q.buf_size as u32) << 16;
+            // Linux mt76_dma_rx_fill_buf(): SD_LEN0(buf_len) | LAST_SEC0
+            let ctrl = ((q.buf_size as u32) << 16) | MT_DMA_CTL_LAST_SEC0;
 
             unsafe {
                 core::ptr::write_volatile(&mut (*desc_ptr).buf0, dma_addr_lo(buf_phys));
@@ -540,8 +551,10 @@ impl Mt7996Dev {
     // Source: dma.c:599-854
     // ========================================================================
 
+    /// Returns (mcu_wa_rx_buf_virt, mcu_wa_rx_buf_size, band0_rx_info) for MCU
+    /// response parsing and BAND0 data RX frame monitoring.
     pub fn mt7996_dma_init(&self, desc_phys: u64, desc_virt: u64, _desc_size: usize,
-                       rx_buf_phys: u64, rx_buf_virt: u64, _rx_buf_size: usize) {
+                       rx_buf_phys: u64, rx_buf_virt: u64, _rx_buf_size: usize) -> (u64, u32, RxQueueInfo) {
         let hif1_ofs = if self.has_hif2 { HIF1_OFS } else { 0 };
 
         const DESC_SIZE: usize = 16;
@@ -695,5 +708,9 @@ impl Mt7996Dev {
 
         // Enable DMA AFTER RX queues are filled
         self.mt7996_dma_enable(false);
+
+        // Return MCU_WA RX buffer info (queue index 1) for response parsing,
+        // plus BAND0 RX queue info (queue index 2) for frame monitoring.
+        (rx_queues[1].buf_virt, rx_queues[1].buf_size, rx_queues[2])
     }
 }

@@ -5,7 +5,7 @@
 //! BAR probing, and BAR allocation. pcied is a thin policy layer.
 //!
 //! Architecture:
-//! 1. Connect to kernel's /kernel/bus/pcie0 to receive bus state + device list
+//! 1. Connect to kernel's /pcie:0 to receive bus state + device list
 //! 2. Read device list from BusCtx::bus_devices() (delivered via bus protocol)
 //! 3. Enable bus mastering for DMA-capable devices via kernel bus control
 //! 4. Register each device as a devd port with BAR0 metadata
@@ -17,7 +17,7 @@
 
 use userlib::{uinfo, uerror};
 use userlib::bus::{
-    BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId,
+    BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId, ConfigKey,
     bus_msg, PortInfo, PortClass, PortMetadata, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
@@ -101,27 +101,16 @@ fn needs_bus_mastering(base_class: u8, subclass: u8, prog_if: u8) -> bool {
     )
 }
 
-fn format_port_name(dev: &userlib::BusDevice, buf: &mut [u8; 32]) -> usize {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bus = dev.pci_bus();
-    let device = dev.pci_device();
-    let function = dev.pci_function();
-    let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
-
+/// Format port name as "class:index" (e.g., "nvme:0", "xhci:0")
+fn format_port_name(cname: &str, index: u8, buf: &mut [u8; 32]) -> usize {
     let mut i = 0;
-    buf[i] = HEX[(bus >> 4) as usize]; i += 1;
-    buf[i] = HEX[(bus & 0xf) as usize]; i += 1;
-    buf[i] = b':'; i += 1;
-    buf[i] = HEX[(device >> 4) as usize]; i += 1;
-    buf[i] = HEX[(device & 0xf) as usize]; i += 1;
-    buf[i] = b'.'; i += 1;
-    buf[i] = HEX[(function & 0xf) as usize]; i += 1;
-    buf[i] = b':'; i += 1;
-    for b in cname.as_bytes() {
+    for &b in cname.as_bytes() {
         if i >= buf.len() { break; }
-        buf[i] = *b;
+        buf[i] = b;
         i += 1;
     }
+    if i < buf.len() { buf[i] = b':'; i += 1; }
+    if i < buf.len() { buf[i] = b'0' + index; i += 1; }
     i
 }
 
@@ -133,6 +122,30 @@ struct PcieDriver {
     devices: [userlib::BusDevice; MAX_PCI_DEVICES],
     count: usize,
     kernel_bus: Option<KernelBusId>,
+    /// Per-class port index counters for class:index naming
+    class_counters: [u8; 8], // indexed by ClassCounter enum
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum ClassCounter {
+    Nvme = 0,
+    Xhci = 1,
+    Wifi = 2,
+    Network = 3,
+    Bridge = 4,
+    Unknown = 5,
+}
+
+fn class_counter_for(base_class: u8, subclass: u8, prog_if: u8) -> ClassCounter {
+    match (base_class, subclass, prog_if) {
+        (pci_class::MASS_STORAGE, pci_subclass::NVME, _) => ClassCounter::Nvme,
+        (pci_class::SERIAL_BUS, pci_subclass::USB, pci_prog_if::XHCI) => ClassCounter::Xhci,
+        (pci_class::NETWORK, pci_subclass::WIFI, _) => ClassCounter::Wifi,
+        (pci_class::NETWORK, _, _) => ClassCounter::Network,
+        (0x06, _, _) => ClassCounter::Bridge,
+        _ => ClassCounter::Unknown,
+    }
 }
 
 impl PcieDriver {
@@ -141,8 +154,10 @@ impl PcieDriver {
             devices: [userlib::BusDevice::empty(); MAX_PCI_DEVICES],
             count: 0,
             kernel_bus: None,
+            class_counters: [0; 8],
         }
     }
+
 
     fn format_info(&self) -> [u8; 256] {
         use core::fmt::Write;
@@ -194,7 +209,7 @@ impl Driver for PcieDriver {
                 bus_path_buf[..bus_path_len].copy_from_slice(&name[..bus_path_len]);
             }
             Err(_) => {
-                let default = b"/kernel/bus/pcie0";
+                let default = b"/pcie:0";
                 bus_path_len = default.len();
                 bus_path_buf[..bus_path_len].copy_from_slice(default);
             }
@@ -239,6 +254,8 @@ impl Driver for PcieDriver {
         }
 
         // Register per-device ports with devd using unified PortInfo
+        // Reset class counters for deterministic naming
+        self.class_counters = [0; 8];
         for idx in 0..self.count {
             let dev = &self.devices[idx];
 
@@ -248,8 +265,14 @@ impl Driver for PcieDriver {
                 continue;
             }
 
+            // Compute class:index port name
+            let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
+            let counter = class_counter_for(dev.base_class(), dev.subclass(), dev.prog_if());
+            let cidx = self.class_counters[counter as usize];
+            self.class_counters[counter as usize] = cidx + 1;
+
             let mut name_buf = [0u8; 32];
-            let name_len = format_port_name(dev, &mut name_buf);
+            let name_len = format_port_name(cname, cidx, &mut name_buf);
             let name = &name_buf[..name_len];
 
             // Build PortInfo with class/subclass and vendor/device IDs
@@ -261,11 +284,16 @@ impl Driver for PcieDriver {
             info.vendor_id = dev.vendor_id;
             info.device_id = dev.device_id;
 
-            // Encode BAR0 info into metadata: [bar0_addr: u64 LE, bar0_size: u32 LE]
-            // Child drivers (usbd, nvmed) read this to map MMIO registers
+            // Encode BAR0 info into metadata:
+            //   [0..8]  bar0_addr: u64 LE
+            //   [8..12] bar0_size: u32 LE
+            //   [12..16] bdf: u32 LE (bus<<8 | dev<<3 | fn)
+            // Child drivers (usbd, nvmed, netd) read this to map MMIO and access PCI config
             let mut raw = [0u8; 24];
             raw[0..8].copy_from_slice(&dev.resource0.to_le_bytes());
             raw[8..12].copy_from_slice(&dev.resource1.to_le_bytes());
+            let device_bdf = (dev.id & 0xFFFF) as u32;
+            raw[12..16].copy_from_slice(&device_bdf.to_le_bytes());
             info.metadata = PortMetadata { raw };
 
             let _ = ctx.register_port_with_info(&info, 0);
@@ -307,6 +335,23 @@ fn main() {
 
 struct PcieDriverWrapper(&'static mut PcieDriver);
 
+const PCIE_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_only(b"devices"),
+];
+
+impl PcieDriverWrapper {
+    fn fmt_hex16(val: u16, buf: &mut [u8]) -> usize {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        if buf.len() < 6 { return 0; }
+        buf[0] = b'0'; buf[1] = b'x';
+        buf[2] = HEX[((val >> 12) & 0xf) as usize];
+        buf[3] = HEX[((val >> 8) & 0xf) as usize];
+        buf[4] = HEX[((val >> 4) & 0xf) as usize];
+        buf[5] = HEX[(val & 0xf) as usize];
+        6
+    }
+}
+
 impl Driver for PcieDriverWrapper {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         self.0.reset(ctx)
@@ -314,5 +359,47 @@ impl Driver for PcieDriverWrapper {
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         self.0.command(msg, ctx)
+    }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        PCIE_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        match key {
+            b"devices" => {
+                // Compact list: "class:N(vid:did) class:N(...) ..."
+                let mut pos = 0;
+                let mut counters = [0u8; 8];
+                for dev in &self.0.devices[..self.0.count] {
+                    if pos > 0 && pos < buf.len() { buf[pos] = b' '; pos += 1; }
+                    // class:index
+                    let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
+                    let counter = class_counter_for(dev.base_class(), dev.subclass(), dev.prog_if());
+                    let cidx = counters[counter as usize];
+                    counters[counter as usize] = cidx + 1;
+                    let mut name_buf = [0u8; 32];
+                    let nlen = format_port_name(cname, cidx, &mut name_buf);
+                    let copy = nlen.min(buf.len() - pos);
+                    buf[pos..pos + copy].copy_from_slice(&name_buf[..copy]);
+                    pos += copy;
+                    // (class,vid:did)
+                    if pos < buf.len() { buf[pos] = b'('; pos += 1; }
+                    let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
+                    let clen = cname.len().min(buf.len() - pos);
+                    buf[pos..pos + clen].copy_from_slice(&cname.as_bytes()[..clen]);
+                    pos += clen;
+                    if pos < buf.len() { buf[pos] = b','; pos += 1; }
+                    let n = Self::fmt_hex16(dev.vendor_id, &mut buf[pos..]);
+                    pos += n;
+                    if pos < buf.len() { buf[pos] = b':'; pos += 1; }
+                    let n = Self::fmt_hex16(dev.device_id, &mut buf[pos..]);
+                    pos += n;
+                    if pos < buf.len() { buf[pos] = b')'; pos += 1; }
+                }
+                pos
+            }
+            _ => 0,
+        }
     }
 }

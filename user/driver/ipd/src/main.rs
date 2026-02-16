@@ -52,7 +52,7 @@ const TAG_DHCP_FALLBACK_TIMER: u32 = 3;
 const TAG_RSH_SHELL_RESPONSE: u32 = 4;
 const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
 const DHCP_FALLBACK_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
-const NIC_PORT_NAME: &[u8] = b"net0";
+const NIC_PORT_NAME: &[u8] = b"net:0";
 const MAX_FRAME_SIZE: usize = 1514;
 const STATIC_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const STATIC_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
@@ -610,11 +610,11 @@ impl IpdDriver {
     fn ipd_config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
         match key {
             b"" => self.format_summary(buf),
-            b"net.ip" => format_ip(buf, self.assigned_ip),
-            b"net.prefix" => format_u64(self.assigned_prefix as u64, buf),
-            b"net.gateway" => format_ip(buf, self.assigned_gateway),
-            b"net.mac" => self.format_mac(buf),
-            b"net.dhcp" => {
+            b"ip" => format_ip(buf, self.assigned_ip),
+            b"prefix" => format_u64(self.assigned_prefix as u64, buf),
+            b"gateway" => format_ip(buf, self.assigned_gateway),
+            b"mac" => self.format_mac(buf),
+            b"dhcp" => {
                 let s = match self.ip_state {
                     IpState::DhcpConfigured | IpState::Unconfigured => b"on" as &[u8],
                     IpState::StaticFallback | IpState::StaticConfigured => b"off",
@@ -623,7 +623,7 @@ impl IpdDriver {
                 buf[..len].copy_from_slice(&s[..len]);
                 len
             }
-            b"net.state" => {
+            b"state" => {
                 let s = match self.ip_state {
                     IpState::Unconfigured => b"unconfigured" as &[u8],
                     IpState::DhcpConfigured => b"dhcp",
@@ -665,11 +665,11 @@ impl IpdDriver {
         };
 
         let _ = core::write!(w,
-            "net.ip={}.{}.{}.{}\n\
-             net.prefix={}\n\
-             net.gateway={}.{}.{}.{}\n\
-             net.dhcp={}\n\
-             net.state={}\n",
+            "ip={}.{}.{}.{}\n\
+             prefix={}\n\
+             gateway={}.{}.{}.{}\n\
+             dhcp={}\n\
+             state={}\n",
             self.assigned_ip[0], self.assigned_ip[1], self.assigned_ip[2], self.assigned_ip[3],
             self.assigned_prefix,
             self.assigned_gateway[0], self.assigned_gateway[1], self.assigned_gateway[2], self.assigned_gateway[3],
@@ -681,7 +681,7 @@ impl IpdDriver {
 
     fn ipd_config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
         match key {
-            b"net.ip" => {
+            b"ip" => {
                 if let Some(ip) = parse_ipv4(value) {
                     let gw = ipv4_from_bytes(&self.assigned_gateway);
                     let prefix = if self.assigned_prefix == 0 { STATIC_PREFIX_LEN } else { self.assigned_prefix };
@@ -692,7 +692,7 @@ impl IpdDriver {
                     copy_str(buf, "ERR invalid ip\n")
                 }
             }
-            b"net.prefix" => {
+            b"prefix" => {
                 if let Some(prefix) = parse_u8(value) {
                     if prefix <= 32 {
                         let ip = ipv4_from_bytes(&self.assigned_ip);
@@ -707,7 +707,7 @@ impl IpdDriver {
                     copy_str(buf, "ERR invalid prefix\n")
                 }
             }
-            b"net.gateway" => {
+            b"gateway" => {
                 if let Some(gw) = parse_ipv4(value) {
                     let ip = ipv4_from_bytes(&self.assigned_ip);
                     let prefix = if self.assigned_prefix == 0 { STATIC_PREFIX_LEN } else { self.assigned_prefix };
@@ -718,7 +718,7 @@ impl IpdDriver {
                     copy_str(buf, "ERR invalid gateway\n")
                 }
             }
-            b"net.dhcp" => {
+            b"dhcp" => {
                 match value {
                     b"on" => {
                         self.ip_state = IpState::Unconfigured;
@@ -972,7 +972,7 @@ impl Driver for IpdDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         // group_id defaults to 0 (all ports in one bridge group).
         // When multiple bridge groups exist, switchd registers per-group ports
-        // (br0:, br1:) and the group_id will be set via sidechannel query.
+        // (bridge:0, bridge:1) and the group_id will be set via sidechannel query.
         udebug!("ipd", "starting"; group_id = self.group_id as u32);
 
         if self.try_discover_nic(ctx) {
@@ -1118,12 +1118,12 @@ fn main() {
 struct IpdDriverWrapper(&'static mut IpdDriver);
 
 const IPD_CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey::read_write(b"net.ip"),
-    ConfigKey::read_write(b"net.prefix"),
-    ConfigKey::read_write(b"net.gateway"),
-    ConfigKey::read_write(b"net.dhcp"),
-    ConfigKey::read_only(b"net.mac"),
-    ConfigKey::read_only(b"net.state"),
+    ConfigKey::read_write(b"ip"),
+    ConfigKey::read_write(b"prefix"),
+    ConfigKey::read_write(b"gateway"),
+    ConfigKey::read_write(b"dhcp"),
+    ConfigKey::read_only(b"mac"),
+    ConfigKey::read_only(b"state"),
 ];
 
 impl Driver for IpdDriverWrapper {

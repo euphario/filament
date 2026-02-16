@@ -11,15 +11,15 @@
 //! Usage:
 //! ```
 //! let mut buf = [0u8; 256];
-//! let n = config::get(b"ipd", b"net.ip", &mut buf);
-//! let ok = config::set(b"ipd", b"net.ip", b"10.0.2.50");
+//! let n = config::get(b"ipd", b"ip", &mut buf);
+//! let ok = config::set(b"ipd", b"ip", b"10.0.2.50");
 //! let n = config::list(b"ipd", &mut buf);
 //! ```
 
 use crate::ipc::Channel;
 
-/// Response timeout in nanoseconds (5 seconds).
-const TIMEOUT_NS: u64 = 5_000_000_000;
+/// Response timeout in nanoseconds (2 seconds).
+const TIMEOUT_NS: u64 = 2_000_000_000;
 
 // ============================================================================
 // Trait
@@ -127,6 +127,9 @@ fn send_devd_cmd(service: &[u8], op: &[u8], key: &[u8], value: &[u8], out: &mut 
 }
 
 /// Open a channel to devd, send a message, wait for response with timeout.
+///
+/// Reads multiple messages if the response was chunked by devd (responses
+/// that exceed the 576-byte IPC message limit are split on line boundaries).
 fn send_and_recv(msg: &[u8], out: &mut [u8]) -> usize {
     let mut ch = match Channel::connect(b"devd-query:") {
         Ok(ch) => ch,
@@ -137,13 +140,30 @@ fn send_and_recv(msg: &[u8], out: &mut [u8]) -> usize {
         return 0;
     }
 
-    // Use recv_deadline (explicit Timer) instead of Mux.wait_timeout
-    // to ensure the timeout fires even if the mux internal mechanism
-    // has edge-trigger issues with already-readable channels.
-    match ch.recv_deadline(out, TIMEOUT_NS) {
+    // First read with full timeout — blocks until devd responds
+    let mut total = match ch.recv_deadline(out, TIMEOUT_NS) {
         Ok(n) => n,
-        Err(_) => 0,
+        Err(_) => return 0,
+    };
+
+    // Read additional chunks. devd sends all chunks synchronously before
+    // yielding, so they should already be queued. Use non-blocking reads
+    // first (cheap), fall back to short timeout if WouldBlock.
+    while total < out.len() {
+        match ch.try_recv(&mut out[total..]) {
+            Ok(Some(n)) if n > 0 => total += n,
+            Ok(Some(_)) | Ok(None) => {
+                // WouldBlock — try once more with short deadline
+                match ch.recv_deadline(&mut out[total..], 50_000_000) {
+                    Ok(n) if n > 0 => total += n,
+                    _ => break,
+                }
+            }
+            Err(_) => break,
+        }
     }
+
+    total
 }
 
 fn copy(dst: &mut [u8], src: &[u8]) -> usize {
