@@ -262,7 +262,9 @@ impl ProcessOps for KernelProcessOps {
                         mapping_count: task.mapping_count(),
                         num_children: task.num_children as u8,
                         signal_pending: task.signal_count,
-                        _pad: [0; 5],
+                        _pad: 0,
+                        ipc_sent: task.ipc_sent.min(u16::MAX as u32) as u16,
+                        ipc_recv: task.ipc_recv.min(u16::MAX as u32) as u16,
                         capabilities: task.get_capabilities_bits(),
                     };
                     i += 1;

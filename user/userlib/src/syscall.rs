@@ -7,7 +7,7 @@ use core::arch::asm;
 use crate::error::{SysError, SysResult};
 
 // Re-export types from abi crate for convenience
-pub use abi::{ProcessInfo, ProcessInfoEx, ObjectType, Handle, LogLevel, PciEnumEntry};
+pub use abi::{ProcessInfo, ProcessInfoEx, SysInfo, ObjectType, Handle, LogLevel, PciEnumEntry};
 pub use abi::{syscall as syscall_num, log_level, liveness_status, prot, errno};
 
 // Local aliases for syscall numbers (shorter names for internal use)
@@ -319,6 +319,11 @@ pub fn ps_info_ex(buf: &mut [ProcessInfoEx]) -> usize {
 /// Set kernel log level
 pub fn set_log_level(level: u8) -> i64 {
     syscall1(sys::SET_LOG_LEVEL, level as u64)
+}
+
+/// Get system-wide information (memory, tasks, uptime)
+pub fn sysinfo(info: &mut SysInfo) -> i64 {
+    syscall1(sys::SYSINFO, info as *mut SysInfo as u64)
 }
 
 /// Reset the system

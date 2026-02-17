@@ -48,6 +48,7 @@ pub mod syscall {
     pub const GET_PRIORITY: u64 = 78;
     pub const PS_INFO_EX: u64 = 79;
     pub const SIGNAL: u64 = 80;
+    pub const SYSINFO: u64 = 81;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;
@@ -221,7 +222,9 @@ pub struct ProcessInfoEx {
     pub mapping_count: u8,      // 48
     pub num_children: u8,       // 49
     pub signal_pending: u8,     // 50
-    pub _pad: [u8; 5],          // 51
+    pub _pad: u8,               // 51
+    pub ipc_sent: u16,          // 52
+    pub ipc_recv: u16,          // 54
     pub capabilities: u64,      // 56
 }
 // Total: 64 bytes
@@ -245,7 +248,9 @@ impl ProcessInfoEx {
             mapping_count: 0,
             num_children: 0,
             signal_pending: 0,
-            _pad: [0; 5],
+            _pad: 0,
+            ipc_sent: 0,
+            ipc_recv: 0,
             capabilities: 0,
         }
     }
@@ -263,6 +268,34 @@ impl ProcessInfoEx {
         }
     }
 }
+
+/// System-wide information returned by the SYSINFO syscall
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SysInfo {
+    pub uptime_ns: u64,       // 0
+    pub total_pages: u32,     // 8
+    pub free_pages: u32,      // 12
+    pub num_tasks: u16,       // 16
+    pub num_cpus: u16,        // 18
+    pub _pad: [u8; 4],        // 20
+}
+// Total: 24 bytes
+
+impl SysInfo {
+    pub const fn empty() -> Self {
+        Self {
+            uptime_ns: 0,
+            total_pages: 0,
+            free_pages: 0,
+            num_tasks: 0,
+            num_cpus: 0,
+            _pad: [0; 4],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<SysInfo>() == 24);
 
 /// Process state values
 pub mod process_state {

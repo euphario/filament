@@ -241,7 +241,11 @@ fn execute_command(cmd: &[u8]) {
         cmd_pid();
     } else if cmd_eq(cmd, b"uptime") {
         cmd_uptime();
-    } else if cmd_eq(cmd, b"mem") {
+    } else if cmd_eq(cmd, b"clear") || cmd_eq(cmd, b"cls") {
+        cmd_clear();
+    } else if cmd_eq(cmd, b"uname") {
+        cmd_uname();
+    } else if cmd_eq(cmd, b"mem") || cmd_eq(cmd, b"free") {
         cmd_mem();
     } else if cmd_starts_with(cmd, b"echo ") {
         cmd_echo(&cmd[5..]);
@@ -474,7 +478,9 @@ fn cmd_help() {
         ("cd [path]", "Change directory"),
         ("pid", "Show current process ID"),
         ("uptime", "Show system uptime"),
-        ("mem", "Test memory allocation"),
+        ("clear", "Clear the screen"),
+        ("uname", "Show system info"),
+        ("free", "Show memory & system stats"),
         ("echo <msg>", "Echo a message"),
         ("ls [path]", "List directory (default: cwd)"),
         ("cat <path>", "Display file contents"),
@@ -503,7 +509,7 @@ fn cmd_help() {
         ("log <level>", "Set log level (error/warn/info/debug/trace)"),
         ("logs [on|off|n]", "Control console log region"),
         ("resize", "Detect/display terminal size"),
-        ("reset", "Reset the system"),
+        ("reset, reboot", "Graceful shutdown + reset"),
     ];
 
     for (cmd, desc) in commands {
@@ -534,59 +540,57 @@ fn cmd_pid() {
 }
 
 fn cmd_uptime() {
-    // Read cycle counter (available in EL0 if enabled)
-    let cycles: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntvct_el0", out(reg) cycles);
-    }
-    // Assuming 24MHz timer (typical for ARM)
-    let seconds = cycles / 24_000_000;
-    let millis = (cycles % 24_000_000) / 24_000;
+    let ns = syscall::gettime();
+    let total_secs = ns / 1_000_000_000;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    let millis = (ns % 1_000_000_000) / 1_000_000;
 
-    console::write(b"Uptime: ");
-    print_dec(seconds as usize);
-    console::write(b".");
-    // Print millis with leading zeros (3 digits)
-    if millis < 100 { console::write(b"0"); }
-    if millis < 10 { console::write(b"0"); }
-    print_dec(millis as usize);
-    console::write(b"s (");
-    print_dec(cycles as usize);
-    console::write(b" cycles)\r\n");
+    print!("Uptime: {}h {}m {}.{:03}s", hours, mins, secs, millis);
+    println!();
+}
+
+fn cmd_clear() {
+    // ANSI: clear screen + cursor home
+    console::write(b"\x1b[2J\x1b[H");
+}
+
+fn cmd_uname() {
+    #[cfg(feature = "platform-mt7988a")]
+    const PLATFORM: &str = "MT7988A";
+    #[cfg(feature = "platform-qemu-virt")]
+    const PLATFORM: &str = "qemu-virt";
+    #[cfg(not(any(feature = "platform-mt7988a", feature = "platform-qemu-virt")))]
+    const PLATFORM: &str = "unknown";
+
+    println!("Filament 0.1.0 aarch64 {}", PLATFORM);
 }
 
 fn cmd_mem() {
-    println!("Testing memory allocation...");
-
-    // Try to allocate a page
-    let addr = syscall::mmap(0, 4096, syscall::PROT_READ | syscall::PROT_WRITE);
-
-    if addr < 0 {
-        println!("mmap failed: {}", addr);
+    let mut info = syscall::SysInfo::empty();
+    let ret = syscall::sysinfo(&mut info);
+    if ret < 0 {
+        println!("sysinfo failed: {}", ret);
         return;
     }
 
-    println!("Allocated page at 0x{:x}", addr as u64);
+    let used = info.total_pages.saturating_sub(info.free_pages);
+    let total_mb = (info.total_pages as u64 * 4096) / (1024 * 1024);
+    let free_mb = (info.free_pages as u64 * 4096) / (1024 * 1024);
+    let used_mb = (used as u64 * 4096) / (1024 * 1024);
 
-    // Write and read back
-    let ptr = addr as *mut u8;
-    unsafe {
-        ptr.write_volatile(0x42);
-        let val = ptr.read_volatile();
-        if val == 0x42 {
-            println!("Write/read test: OK");
-        } else {
-            println!("Write/read test: FAILED (got 0x{:x})", val);
-        }
-    }
+    println!("Memory:");
+    println!("  Total: {} pages ({} MB)", info.total_pages, total_mb);
+    println!("  Free:  {} pages ({} MB)", info.free_pages, free_mb);
+    println!("  Used:  {} pages ({} MB)", used, used_mb);
 
-    // Free the page
-    let ret = syscall::munmap(addr as u64, 4096);
-    if ret == 0 {
-        println!("Page freed");
-    } else {
-        println!("munmap failed: {}", ret);
-    }
+    let total_secs = info.uptime_ns / 1_000_000_000;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    println!("Tasks: {} / CPUs: {}", info.num_tasks, info.num_cpus);
+    println!("Uptime: {}h {}m {}s", hours, mins, secs);
 }
 
 fn cmd_echo(msg: &[u8]) {
@@ -980,9 +984,25 @@ fn cmd_logs(arg: &[u8]) {
     }
 }
 
-/// Reset the system
+/// Reset the system with graceful shutdown
 fn cmd_reset() {
-    println!("Resetting system...");
+    println!("Shutting down...");
+
+    // Send SHUTDOWN signal to all user processes (skip idle tasks and ourselves)
+    let my_pid = syscall::getpid();
+    let mut buf: [syscall::ProcessInfo; 32] = [syscall::ProcessInfo::empty(); 32];
+    let count = syscall::ps_info(&mut buf);
+    for i in 0..count {
+        let pid = buf[i].pid;
+        if pid <= 4 || pid == my_pid { continue; } // skip idle/kernel/devd/self
+        // signal_event::SHUTDOWN = 3
+        let _ = syscall::signal(pid, 3, 0);
+    }
+
+    // Brief delay to let drivers flush
+    syscall::sleep_ms(200);
+
+    println!("Resetting...");
     let result = syscall::reset();
     if result < 0 {
         println!("Reset failed: error {}", result);

@@ -349,6 +349,11 @@ pub struct Task {
     /// Cleanup phase for exiting tasks (microtask-driven)
     pub(crate) cleanup_phase: CleanupPhase,
 
+    /// IPC messages sent by this task (saturating counter)
+    pub(crate) ipc_sent: u32,
+    /// IPC messages received by this task (saturating counter)
+    pub(crate) ipc_recv: u32,
+
     /// Total CPU time consumed by this task (nanoseconds)
     pub(crate) cpu_time_ns: u64,
     /// Counter snapshot when this task was last scheduled to run
@@ -492,6 +497,8 @@ impl Task {
             context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
             kernel_stack_owner: None,
             cleanup_phase: CleanupPhase::None,
+            ipc_sent: 0,
+            ipc_recv: 0,
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,
@@ -560,6 +567,8 @@ impl Task {
             context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
             kernel_stack_owner: None,
             cleanup_phase: CleanupPhase::None,
+            ipc_sent: 0,
+            ipc_recv: 0,
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,
@@ -653,6 +662,8 @@ impl Task {
             context_restore: ContextRestoreState::Saved,
             kernel_stack_owner: None,
             cleanup_phase: CleanupPhase::None,
+            ipc_sent: 0,
+            ipc_recv: 0,
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,

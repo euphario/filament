@@ -920,6 +920,13 @@ fn read_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> 
                 return KernelError::BadAddress.to_errno();
             }
 
+            // Increment IPC recv counter
+            task::with_scheduler(|sched| {
+                if let Some(t) = sched.current_task_mut() {
+                    t.ipc_recv = t.ipc_recv.saturating_add(1);
+                }
+            });
+
             copy_len as i64
         }
         Err(ipc::IpcError::WouldBlock) => KernelError::WouldBlock.to_errno(),
@@ -2044,6 +2051,12 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) ->
 
     match ipc::send(channel_id, msg, pid) {
         Ok(peer) => {
+            // Increment IPC sent counter
+            task::with_scheduler(|sched| {
+                if let Some(t) = sched.current_task_mut() {
+                    t.ipc_sent = t.ipc_sent.saturating_add(1);
+                }
+            });
             // Return peer info for deferred wake (after table lock is released)
             let bus_data = if is_bus_channel {
                 Some((kernel_buf, copy_len, channel_id))

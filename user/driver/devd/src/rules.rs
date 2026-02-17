@@ -121,7 +121,7 @@ pub static PORT_RULES: &[PortRule] = &[
         class: PortClass::Uart,
         subclass: SubclassMatch::Any,
         driver: "consoled",
-        caps: userlib::devd::caps::DRIVER,
+        caps: userlib::devd::caps::DRIVER | 0x0800, // DRIVER + KILL (delegates to shell)
         priority: abi::priority::CRITICAL,
         context: &[],
     },
@@ -142,7 +142,7 @@ pub static PORT_RULES: &[PortRule] = &[
         class: PortClass::Console,
         subclass: SubclassMatch::Any,
         driver: "shell",
-        caps: userlib::devd::caps::USER,
+        caps: userlib::devd::caps::USER_ADMIN,
         priority: abi::priority::NORMAL,
         context: &[],
     },

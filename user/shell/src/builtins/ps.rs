@@ -103,8 +103,8 @@ fn run_extended(verbosity: u8) -> Table {
     // Build headers based on verbosity
     let headers: &[&'static str] = match verbosity {
         1 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG"],
-        2 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "PAGES", "MAPS"],
-        _ => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "PAGES", "MAPS", "KIDS", "CAPS"],
+        2 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "SENT", "RECV", "PAGES", "MAPS"],
+        _ => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "SENT", "RECV", "PAGES", "MAPS", "KIDS", "CAPS"],
     };
 
     let mut table = Table::new(headers)
@@ -120,14 +120,16 @@ fn run_extended(verbosity: u8) -> Table {
 
     let table = if verbosity >= 2 {
         table
-            .align(12, Align::Right)  // PAGES
-            .align(13, Align::Right)  // MAPS
+            .align(12, Align::Right)  // SENT
+            .align(13, Align::Right)  // RECV
+            .align(14, Align::Right)  // PAGES
+            .align(15, Align::Right)  // MAPS
     } else {
         table
     };
 
     let mut table = if verbosity >= 3 {
-        table.align(14, Align::Right) // KIDS
+        table.align(16, Align::Right) // KIDS
     } else {
         table
     };
@@ -165,9 +167,11 @@ fn run_extended(verbosity: u8) -> Table {
             .uint(info.shmem_count as u64)
             .uint(info.signal_pending as u64);
 
-        // -vv: pages, mappings
+        // -vv: IPC stats, pages, mappings
         if verbosity >= 2 {
             row = row
+                .uint(info.ipc_sent as u64)
+                .uint(info.ipc_recv as u64)
                 .uint(info.heap_pages as u64)
                 .uint(info.mapping_count as u64);
         }

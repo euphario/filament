@@ -218,9 +218,9 @@ pub fn hardware_reset() -> ! {
 
 /// Reset/reboot the system syscall
 pub(super) fn sys_reset() -> i64 {
-    // Only processes with ALL capabilities can reset the system
+    // Requires KILL capability (system-level privilege)
     let ctx = create_syscall_context();
-    if let Err(_) = ctx.require_capability(Capabilities::ALL.bits()) {
+    if let Err(_) = ctx.require_capability(Capabilities::KILL.bits()) {
         return KernelError::PermDenied.to_errno();
     }
 
@@ -236,9 +236,9 @@ pub(super) fn sys_reset() -> i64 {
 /// Unlike reset, this powers off the machine. On QEMU this causes
 /// the emulator to exit cleanly, which is needed for automated testing.
 pub(super) fn sys_shutdown(exit_code: u8) -> i64 {
-    // Only processes with ALL capabilities can shutdown
+    // Requires KILL capability (system-level privilege)
     let ctx = create_syscall_context();
-    if let Err(_) = ctx.require_capability(Capabilities::ALL.bits()) {
+    if let Err(_) = ctx.require_capability(Capabilities::KILL.bits()) {
         return KernelError::PermDenied.to_errno();
     }
 
@@ -322,6 +322,49 @@ pub(super) fn sys_ramfs_list(buf_ptr: u64, buf_len: usize) -> i64 {
     }
 
     count as i64
+}
+
+/// Get system-wide information (memory, tasks, uptime)
+/// Args: buf_ptr (pointer to SysInfo struct, 24 bytes)
+pub(super) fn sys_sysinfo(buf_ptr: u64) -> i64 {
+    use crate::kernel::pmm;
+    use crate::kernel::task;
+    use crate::kernel::sched;
+    use crate::kernel::percpu::MAX_CPUS;
+
+    if let Err(e) = uaccess::validate_user_write(buf_ptr, core::mem::size_of::<abi::SysInfo>()) {
+        return uaccess_to_errno(e);
+    }
+
+    let num_tasks = task::with_scheduler(|sched_ref| {
+        let mut count: u16 = 0;
+        for (slot, task_opt) in sched_ref.iter_tasks() {
+            if sched::is_idle_slot(slot) { continue; }
+            if task_opt.is_some() { count += 1; }
+        }
+        count
+    });
+
+    let info = abi::SysInfo {
+        uptime_ns: crate::platform::current::timer::now_ns(),
+        total_pages: pmm::total_count() as u32,
+        free_pages: pmm::free_count() as u32,
+        num_tasks,
+        num_cpus: MAX_CPUS as u16,
+        _pad: [0; 4],
+    };
+
+    let info_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &info as *const abi::SysInfo as *const u8,
+            core::mem::size_of::<abi::SysInfo>(),
+        )
+    };
+
+    match uaccess::copy_to_user(buf_ptr, info_bytes) {
+        Ok(_) => 0,
+        Err(e) => uaccess_to_errno(e),
+    }
 }
 
 /// Get caller's base and effective priority
