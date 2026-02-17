@@ -1067,7 +1067,9 @@ impl Pollable for KlogObject {
 // ============================================================================
 
 /// Maximum watches per Mux object
-pub const MAX_MUX_WATCHES: usize = 16;
+/// NOTE: Each slot costs ~100KB kernel .data (64 tasks × MuxWatch per handle).
+/// 24 gives devd headroom for ~10 buses + watchers + query port.
+pub const MAX_MUX_WATCHES: usize = 24;
 
 /// Maximum events returned per mux poll
 pub const MAX_MUX_EVENTS: usize = 16;

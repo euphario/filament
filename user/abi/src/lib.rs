@@ -1109,6 +1109,8 @@ pub mod bus_type {
     pub const UART: u8 = 4;
     /// Kernel log (klog)
     pub const KLOG: u8 = 5;
+    /// CPU power management
+    pub const CPU: u8 = 6;
 }
 
 /// Bus creation info passed to open(Bus)
@@ -1328,6 +1330,7 @@ pub enum PortClass {
     Uart = 12,              // UART controller (kernel bus)
     Klog = 13,              // Kernel log (kernel bus)
     Ethernet = 14,          // Ethernet controller (kernel bus)
+    Cpu = 15,               // CPU power management (kernel bus)
 }
 
 impl PortClass {
@@ -1348,6 +1351,7 @@ impl PortClass {
             12 => Some(PortClass::Uart),
             13 => Some(PortClass::Klog),
             14 => Some(PortClass::Ethernet),
+            15 => Some(PortClass::Cpu),
             _ => None,
         }
     }
@@ -1440,6 +1444,20 @@ pub mod priority {
     pub const IDLE: u8 = 7;
     /// Sentinel: inherit parent's priority
     pub const INHERIT: u8 = 0xFF;
+}
+
+/// CPU governor modes
+pub mod governor {
+    pub const PERFORMANCE: u8 = 0;
+    pub const BALANCED: u8 = 1;
+    pub const POWERSAVE: u8 = 2;
+}
+
+/// CPU capability flags for StateSnapshot.capabilities (CPU bus only)
+pub mod cpu_caps {
+    pub const GOV_PERFORMANCE: u8 = 1 << 0;
+    pub const GOV_BALANCED: u8 = 1 << 1;
+    pub const GOV_POWERSAVE: u8 = 1 << 2;
 }
 
 /// Port subclass constants (class-specific values)

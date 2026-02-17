@@ -832,8 +832,8 @@ impl Devd {
 
         let binary = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("???");
 
-        // Spawn the process
-        let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
+        // Spawn the process (returns supervision channel)
+        let (pid, channel) = match self.process_mgr.spawn_with_caps(binary, caps) {
             Ok(result) => result,
             Err(_) => {
                 uerror!("devd", "svc_spawn_failed"; binary = binary);
@@ -876,17 +876,26 @@ impl Devd {
             &kv_refs[..kv_count],
         );
 
-        // Watch the process
-        if let Some(events) = &mut self.events {
-            if events.watch(watcher.handle()).is_err() {
-                uwarn!("devd", "watcher_watch_failed"; pid = pid);
+        // Add supervision channel to query handler as pre-connected managed client
+        let ch_handle = channel.handle();
+        match self.query_handler.add_client(channel, Some(idx as u8), pid) {
+            Some(slot) => {
+                if let Some(events) = &mut self.events {
+                    if events.watch(ch_handle).is_err() {
+                        uwarn!("devd", "svc_channel_watch_failed"; pid = pid);
+                        self.overflow_query_mask |= 1 << slot;
+                        self.update_timeout();
+                    }
+                }
+            }
+            None => {
+                uwarn!("devd", "no_query_slot"; pid = pid);
             }
         }
 
         // Update service state
         if let Some(service) = self.services.get_mut(idx) {
             service.pid = pid;
-            service.watcher = Some(watcher);
             service.state = ServiceState::Starting;
             service.last_change = now;
         }
@@ -955,13 +964,6 @@ impl Devd {
 
             // Clear PID - the process has exited
             service.pid = 0;
-
-            // Remove watcher from event loop
-            if let Some(watcher) = service.watcher.take() {
-                if let Some(events) = &mut self.events {
-                    let _ = events.unwatch(watcher.handle());
-                }
-            }
 
             // Remove service channel from event loop
             if let Some(channel) = service.channel.take() {
@@ -1049,7 +1051,7 @@ impl Devd {
                         name = child_svc.name(), pid = pid);
                 }
                 let _ = self.process_mgr.kill(pid);
-                // Exit watcher will fire and handle cleanup via handle_service_exit
+                // Supervision channel close will trigger cleanup via handle_service_exit
             }
         }
 
@@ -1172,7 +1174,7 @@ impl Devd {
 
         // Kill the process — kernel cascading kill handles children
         let _ = self.process_mgr.kill(pid);
-        // The process exit watcher will fire and handle cleanup
+        // Supervision channel close will trigger cleanup via handle_service_exit
         b"OK\n"
     }
 
@@ -2004,18 +2006,6 @@ impl Devd {
         false
     }
 
-    fn handle_process_exit(&mut self, handle: ObjHandle) {
-        let found_idx = self.services.find_by_watcher(handle);
-
-        if let Some(idx) = found_idx {
-            let code = self.services.get_mut(idx)
-                .and_then(|s| s.watcher.as_mut())
-                .map(|w| w.wait().unwrap_or(-1))
-                .unwrap_or(-1);
-            self.handle_service_exit(idx, code);
-        }
-    }
-
     fn handle_restart_timer(&mut self, idx: usize) {
         if idx >= MAX_SERVICES {
             return;
@@ -2241,7 +2231,15 @@ impl Devd {
                 // No data yet — will be picked up next poll or Mux event
             }
             Err(SysError::PeerClosed) | Err(SysError::ConnectionReset) => {
+                // If managed service, channel close = child died
+                let managed_svc_idx = self.query_handler.get(slot)
+                    .filter(|c| c.is_managed && c.service_idx >= 0)
+                    .map(|c| c.service_idx as usize);
                 self.remove_query_client(slot);
+                if let Some(svc_idx) = managed_svc_idx {
+                    self.handle_service_exit(svc_idx, -1);
+                }
+                return;
             }
             Err(_e) => {
                 uerror!("devd", "query_recv_failed"; slot = slot as u32);
@@ -3507,8 +3505,8 @@ impl Devd {
     fn spawn_dynamic_driver_with_caps(&mut self, binary: &str, trigger_port: &[u8], caps: u64) {
         let now = Self::now_ms();
 
-        // Spawn the process first (with caps if specified)
-        let (pid, watcher) = match self.process_mgr.spawn_with_caps(binary, caps) {
+        // Spawn the process (returns supervision channel)
+        let (pid, channel) = match self.process_mgr.spawn_with_caps(binary, caps) {
             Ok(result) => result,
             Err(_) => {
                 uerror!("devd", "dynamic_spawn_failed"; binary = binary);
@@ -3536,10 +3534,9 @@ impl Devd {
         // Create service slot using create_dynamic_service (which actually creates the entry)
         let slot_idx = self.services.create_dynamic_service(pid, binary.as_bytes(), now);
 
-        // Set up the service slot with watcher, trigger_port, and caps
+        // Set up the service slot with trigger_port and caps
         if let Some(idx) = slot_idx {
             if let Some(service) = self.services.get_mut(idx) {
-                service.watcher = Some(watcher);
                 service.set_trigger_port(trigger_port);
                 service.caps = caps;
             }
@@ -3547,23 +3544,24 @@ impl Devd {
             // Add to recent_dynamic_pids for race condition handling
             self.add_recent_dynamic_pid(pid, idx as u8);
 
-            // Add watcher to event loop
-            if let Some(events) = &mut self.events {
-                if let Some(service) = self.services.get(idx) {
-                    if let Some(w) = &service.watcher {
-                        if events.watch(w.handle()).is_err() {
-                            uwarn!("devd", "dyn_watcher_failed"; pid = pid);
+            // Add supervision channel to query handler as pre-connected managed client
+            let ch_handle = channel.handle();
+            match self.query_handler.add_client(channel, Some(idx as u8), pid) {
+                Some(slot) => {
+                    if let Some(events) = &mut self.events {
+                        if events.watch(ch_handle).is_err() {
+                            uwarn!("devd", "dyn_channel_watch_failed"; pid = pid);
+                            self.overflow_query_mask |= 1 << slot;
+                            self.update_timeout();
                         }
                     }
                 }
-            }
-        } else {
-            // No slot available — still try to watch so we see the exit
-            if let Some(events) = &mut self.events {
-                if events.watch(watcher.handle()).is_err() {
-                    uwarn!("devd", "orphan_watcher_failed"; pid = pid);
+                None => {
+                    uwarn!("devd", "no_query_slot_dyn"; pid = pid);
                 }
             }
+        } else {
+            // No slot available — channel will be dropped (child sees PeerClosed)
             uerror!("devd", "no_dynamic_slot"; pid = pid);
         }
     }
@@ -3753,21 +3751,16 @@ impl Devd {
                         if handle == query_port.handle() {
                             self.handle_query_port_event();
                         } else if self.query_handler.find_by_handle(handle).is_some() {
-                            // Query client message?
+                            // Query client message (or supervision channel close)
                             self.handle_query_client_event(handle);
                         } else if let Some(idx) = self.services.find_by_timer(handle) {
                             // Service restart timer?
                             self.handle_restart_timer(idx);
-                        } else {
-                            // Process exit (watcher)?
-                            self.handle_process_exit(handle);
                         }
                     } else if self.query_handler.find_by_handle(handle).is_some() {
                         self.handle_query_client_event(handle);
                     } else if let Some(idx) = self.services.find_by_timer(handle) {
                         self.handle_restart_timer(idx);
-                    } else {
-                        self.handle_process_exit(handle);
                     }
                 }
                 Err(SysError::Timeout) | Err(SysError::WouldBlock) => {

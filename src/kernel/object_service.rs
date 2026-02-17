@@ -14,7 +14,7 @@
 //!                                 │
 //! ┌───────────────────────────────▼────────────────────────────────┐
 //! │                    ObjectService                               │
-//! │    *mut SpinLock<Option<HandleTable>> (PMM-allocated)           │
+//! │    *mut SpinLock<HandleTableSlot> (PMM-allocated)               │
 //! │    - One lock per task slot (eliminates global lock deadlocks) │
 //! │    - TableGuard proves lock is held (type-safe)                │
 //! │    - Blocking read() implementation                            │
@@ -68,6 +68,71 @@ pub enum ReadAttempt {
 }
 
 // ============================================================================
+// HandleTableSlot - In-place table storage
+// ============================================================================
+
+/// Handle table slot using MaybeUninit for in-place initialization.
+///
+/// HandleTable is ~110KB (64 entries × ~1.7KB Object enum each).
+/// `Option<HandleTable>` would require constructing the full struct on the
+/// 64KB kernel stack before moving it into the PMM slot. This wrapper uses
+/// MaybeUninit to enable direct in-place initialization via raw pointer
+/// writes, avoiding the stack overflow.
+pub struct HandleTableSlot {
+    table: core::mem::MaybeUninit<HandleTable>,
+    initialized: bool,
+}
+
+impl HandleTableSlot {
+    pub const fn empty() -> Self {
+        Self {
+            table: core::mem::MaybeUninit::uninit(),
+            initialized: false,
+        }
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.initialized
+    }
+
+    pub fn as_ref(&self) -> Option<&HandleTable> {
+        if self.initialized {
+            Some(unsafe { self.table.assume_init_ref() })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_mut(&mut self) -> Option<&mut HandleTable> {
+        if self.initialized {
+            Some(unsafe { self.table.assume_init_mut() })
+        } else {
+            None
+        }
+    }
+
+    /// Initialize the table in-place without stack allocation.
+    ///
+    /// Uses `HandleTable::init_at()` to write fields directly to the
+    /// MaybeUninit storage via raw pointers.
+    pub fn init_in_place(&mut self, is_user: bool) {
+        debug_assert!(!self.initialized, "double init of HandleTableSlot");
+        unsafe {
+            HandleTable::init_at(self.table.as_mut_ptr(), is_user);
+        }
+        self.initialized = true;
+    }
+
+    /// Mark slot as empty without moving the table to the stack.
+    ///
+    /// Safe because Object/HandleEntry/HandleTable don't implement Drop.
+    /// The MaybeUninit prevents automatic drop of the payload.
+    pub fn clear(&mut self) {
+        self.initialized = false;
+    }
+}
+
+// ============================================================================
 // TableGuard - Lock Token
 // ============================================================================
 
@@ -77,7 +142,7 @@ pub enum ReadAttempt {
 /// table and records which slot is locked for ordering verification.
 pub struct TableGuard<'a> {
     /// The actual spinlock guard
-    guard: SpinLockGuard<'a, Option<HandleTable>>,
+    guard: SpinLockGuard<'a, HandleTableSlot>,
     /// Which slot this guards (for ordering checks)
     slot: usize,
 }
@@ -103,14 +168,14 @@ impl<'a> TableGuard<'a> {
         self.guard.is_some()
     }
 
-    /// Take the table out of the guard (for remove_task_table)
-    pub fn take(&mut self) -> Option<HandleTable> {
-        self.guard.take()
+    /// Initialize a new table in-place (for create_task_table)
+    pub fn init_in_place(&mut self, is_user: bool) {
+        self.guard.init_in_place(is_user);
     }
 
-    /// Put a table into the guard (for create_task_table)
-    pub fn put(&mut self, table: HandleTable) {
-        *self.guard = Some(table);
+    /// Mark the table slot as empty (for remove_task_table)
+    pub fn clear(&mut self) {
+        self.guard.clear();
     }
 }
 
@@ -144,7 +209,7 @@ fn slot_from_task_id(task_id: TaskId) -> Option<usize> {
 /// (256 slots × ~40KB each).
 pub struct ObjectService {
     /// Pointer to PMM-allocated array of per-slot locks
-    tables: *mut SpinLock<Option<HandleTable>>,
+    tables: *mut SpinLock<HandleTableSlot>,
 }
 
 // SAFETY: The pointer targets are protected by per-element SpinLocks.
@@ -168,7 +233,7 @@ impl ObjectService {
     /// # Panics
     /// Panics if ObjectService has not been initialized or slot is out of range.
     #[inline]
-    fn table_slot(&self, slot: usize) -> &SpinLock<Option<HandleTable>> {
+    fn table_slot(&self, slot: usize) -> &SpinLock<HandleTableSlot> {
         debug_assert!(!self.tables.is_null(), "ObjectService not initialized");
         debug_assert!(slot < MAX_TASKS, "slot {} out of range", slot);
         unsafe { &*self.tables.add(slot) }
@@ -234,24 +299,25 @@ impl ObjectService {
 
     /// Create object table for a new task
     ///
-    /// Called when a task is created. Creates an empty HandleTable
+    /// Called when a task is created. Initializes the HandleTable in-place
     /// (or one with stdin/stdout/stderr for user tasks).
+    ///
+    /// Uses in-place initialization to avoid placing the ~110KB HandleTable
+    /// on the 64KB kernel stack.
     pub fn create_task_table(&self, task_id: TaskId, is_user: bool) {
         if let Ok(mut guard) = self.lock_table(task_id) {
-            let table = if is_user {
-                HandleTable::new_with_stdio()
-            } else {
-                HandleTable::new()
-            };
-            guard.put(table);
+            guard.init_in_place(is_user);
         }
     }
 
     /// Remove object table for an exiting task
     ///
-    /// Called when a task exits. Closes all handles and removes the table.
-    pub fn remove_task_table(&self, task_id: TaskId) -> Option<HandleTable> {
-        self.lock_table(task_id).ok()?.take()
+    /// Marks the table slot as empty. Does not move the ~110KB table to
+    /// the stack — safe because HandleTable has no Drop implementation.
+    pub fn remove_task_table(&self, task_id: TaskId) {
+        if let Ok(mut guard) = self.lock_table(task_id) {
+            guard.clear();
+        }
     }
 
     /// Check if a task has an object table
@@ -1170,19 +1236,19 @@ pub fn init() {
     use crate::kernel::pmm;
     use crate::arch::aarch64::mmu;
 
-    let elem_size = core::mem::size_of::<SpinLock<Option<HandleTable>>>();
+    let elem_size = core::mem::size_of::<SpinLock<HandleTableSlot>>();
     let total_bytes = MAX_TASKS * elem_size;
     let pages = (total_bytes + 4095) / 4096;
 
     let phys = pmm::alloc_pages(pages)
         .expect("ObjectService: out of memory");
-    let virt = mmu::phys_to_virt(phys as u64) as *mut SpinLock<Option<HandleTable>>;
+    let virt = mmu::phys_to_virt(phys as u64) as *mut SpinLock<HandleTableSlot>;
 
     // Initialize each SpinLock in place (PMM returns zeroed memory but
     // SpinLock needs proper field initialization for ticket lock)
     for i in 0..MAX_TASKS {
         unsafe {
-            core::ptr::write(virt.add(i), SpinLock::new(lock_class::OBJ_SERVICE, None));
+            core::ptr::write(virt.add(i), SpinLock::new(lock_class::OBJ_SERVICE, HandleTableSlot::empty()));
         }
     }
 

@@ -494,7 +494,6 @@ pub fn spawn_from_elf_with_caps(
     spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))
 }
 
-/// Internal spawn implementation
 fn spawn_from_elf_internal(
     data: &[u8],
     name: &str,
@@ -636,6 +635,13 @@ fn spawn_from_elf_internal(
             if let Some(prio) = parent_priority {
                 child_task.set_priority(prio);
             }
+        }
+    } else if let Some(caps) = explicit_caps {
+        // No parent (kernel-spawned): apply explicit capabilities directly.
+        // Must be set under the scheduler lock before the task can be
+        // scheduled on another CPU (notify_ready already called above).
+        if let Some(child_task) = sched.task_mut(slot) {
+            child_task.set_capabilities(caps);
         }
     }
 

@@ -733,6 +733,14 @@ impl BusCtx for RuntimeCtx {
         Ok(())
     }
 
+    fn bus_send(&mut self, bus_id: KernelBusId, msg: &[u8]) -> Result<(), BusError> {
+        let idx = bus_id.0 as usize;
+        let entry = self.kernel_buses.get_mut(idx)
+            .and_then(|e| e.as_mut())
+            .ok_or(BusError::InvalidMessage)?;
+        entry.channel.send(msg).map_err(|_| BusError::LinkDown)
+    }
+
     fn watch_handle(&mut self, handle: Handle, tag: u32) -> Result<(), BusError> {
         self.mux.add(handle, MuxFilter::Readable).map_err(|_| BusError::Internal)?;
         if !self.handles.add(handle, tag) {
@@ -1160,7 +1168,7 @@ impl<D: Driver> DriverRuntime<D> {
 
     /// Handle a kernel bus channel event (state snapshot or supervision message).
     fn handle_kernel_bus_event(&mut self, bus_idx: usize) {
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 32];
 
         // Drain all pending messages from the bus channel
         loop {
@@ -1188,8 +1196,10 @@ impl<D: Driver> DriverRuntime<D> {
                     // (normally we wouldn't see these since we ARE the owner,
                     //  but they can arrive on Reset/Safe transitions)
                 }
-                _ => {
-                    // Unknown message type, ignore
+                other => {
+                    // Forward unknown message types to driver
+                    let bus_id = KernelBusId(bus_idx as u8);
+                    self.driver.bus_event(bus_id, other, &buf[1..n], &mut self.ctx);
                 }
             }
         }

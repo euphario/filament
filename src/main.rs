@@ -293,14 +293,16 @@ pub extern "C" fn kmain() -> ! {
     kdebug!("kernel", "spawning_probed");
     let slot1 = {
         let _span = span!("elf", "spawn"; path = "bin/probed");
-        match elf::spawn_from_path("bin/probed") {
+        // Pass PROBED capabilities at spawn time so they're set atomically
+        // under the scheduler lock — avoids SMP race where probed runs
+        // before capabilities are applied.
+        match elf::spawn_from_path_with_caps_find("bin/probed", 0, kernel::caps::Capabilities::PROBED) {
             Ok((_task_id, slot)) => {
                 kdebug!("kernel", "probed_spawned"; slot = slot);
                 klog::flush();
-                // Give probed PROBED capabilities and mark as probed process
+                // Mark as probed process (for lifecycle/devd spawn trigger)
                 task::with_scheduler(|sched| {
                     if let Some(task) = sched.task_mut(slot) {
-                        task.set_capabilities(kernel::caps::Capabilities::PROBED);
                         task.is_probed = true;
                     }
                 });

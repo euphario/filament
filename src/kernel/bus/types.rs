@@ -67,6 +67,8 @@ pub enum BusType {
     Uart = 4,
     /// Kernel log (klog)
     Klog = 5,
+    /// CPU power management
+    Cpu = 6,
 }
 
 impl BusType {
@@ -78,6 +80,7 @@ impl BusType {
             BusType::Ethernet => "eth",
             BusType::Uart => "uart",
             BusType::Klog => "klog",
+            BusType::Cpu => "cpu",
         }
     }
 }

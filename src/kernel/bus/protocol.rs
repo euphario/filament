@@ -50,6 +50,22 @@ pub enum BusControlMsgType {
 
     // SetDriver removed — owner is identified by who connects
 
+    // ─── CPU bus: kernel → owner ───
+
+    /// CPU state update (governor, active CPUs, utilization)
+    CpuStateUpdate = 32,
+
+    // ─── CPU bus: owner → kernel ───
+
+    /// Set CPU governor mode
+    SetGovernor = 33,
+
+    /// Set CPU OPP (frequency) — owner → kernel
+    SetOpp = 34,
+
+    /// OPP table — kernel → owner (sent once after claim)
+    OppTable = 35,
+
     // ─── Responses ───
 
     /// Success response

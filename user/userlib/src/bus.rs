@@ -592,6 +592,12 @@ pub trait Driver {
     /// The `tag` is the value passed when the handle was registered.
     fn handle_event(&mut self, _tag: u32, _handle: crate::syscall::Handle, _ctx: &mut dyn BusCtx) {}
 
+    /// Kernel bus sent a bus-type-specific message.
+    ///
+    /// Called by the runtime for message types it doesn't handle itself
+    /// (i.e., not StateSnapshot, DeviceList, or StateChanged).
+    fn bus_event(&mut self, _bus_id: KernelBusId, _msg_type: u8, _data: &[u8], _ctx: &mut dyn BusCtx) {}
+
     // === Configuration ===
 
     /// Declare supported config keys. Return an empty slice if no config.
@@ -685,6 +691,9 @@ pub trait BusCtx {
     /// `bus_id`: The kernel bus returned by `claim_kernel_bus()`.
     /// `device_bdf`: Packed BDF (bus<<8 | dev<<3 | func).
     fn enable_bus_mastering(&mut self, bus_id: KernelBusId, device_bdf: u16) -> Result<(), BusError>;
+
+    /// Send a raw bus protocol message to the kernel on a claimed bus.
+    fn bus_send(&mut self, bus_id: KernelBusId, msg: &[u8]) -> Result<(), BusError>;
 
     // === Identity ===
 

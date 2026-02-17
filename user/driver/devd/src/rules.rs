@@ -125,6 +125,14 @@ pub static PORT_RULES: &[PortRule] = &[
         priority: abi::priority::CRITICAL,
         context: &[],
     },
+    PortRule {
+        class: PortClass::Cpu,
+        subclass: SubclassMatch::Any,
+        driver: "cpud",
+        caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::CRITICAL,
+        context: &[],
+    },
     // Klog→logd rule removed: logd needs rewrite for 5-syscall API
 
     // =========================================================================

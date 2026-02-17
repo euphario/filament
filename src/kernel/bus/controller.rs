@@ -308,6 +308,7 @@ impl BusController {
             BusType::Uart => abi::PortClass::Uart,
             BusType::Klog => abi::PortClass::Klog,
             BusType::Platform => abi::PortClass::Service,
+            BusType::Cpu => abi::PortClass::Cpu,
         };
         let port_subclass = match self.bus_type {
             BusType::Usb => abi::port_subclass::USB_XHCI,
@@ -352,6 +353,7 @@ impl BusController {
             BusType::Ethernet => b"gmac:",
             BusType::Uart => b"uart:",
             BusType::Klog => b"klog:",
+            BusType::Cpu => b"cpu:",
         };
 
         for &b in chipset_type {
@@ -381,6 +383,7 @@ impl BusController {
             BusType::PCIe => hw_pcie::query_capabilities(self.bus_index, self.ecam_based, self.base_addr),
             BusType::Usb => hw_usb::query_capabilities(self.bus_index, self.base_addr),
             BusType::Platform | BusType::Ethernet => bus_caps::PLATFORM_MMIO | bus_caps::PLATFORM_IRQ,
+            BusType::Cpu => abi::cpu_caps::GOV_PERFORMANCE | abi::cpu_caps::GOV_BALANCED | abi::cpu_caps::GOV_POWERSAVE,
             BusType::Uart | BusType::Klog => 0, // No hardware capabilities to report
         }
     }
@@ -411,6 +414,7 @@ impl BusController {
             BusType::Ethernet => ipc::PortClass::Ethernet,
             BusType::Uart => ipc::PortClass::Uart,
             BusType::Klog => ipc::PortClass::Klog,
+            BusType::Cpu => ipc::PortClass::Cpu,
         }
     }
 
@@ -422,7 +426,7 @@ impl BusController {
             BusType::Platform => 0,
             BusType::Ethernet => ipc::port_subclass::NET_ETHERNET,
             BusType::Uart => ipc::port_subclass::CONSOLE_SERIAL,
-            BusType::Klog => 0,
+            BusType::Klog | BusType::Cpu => 0,
         }
     }
 
@@ -434,7 +438,7 @@ impl BusController {
             BusType::Usb => port_caps::DMA | port_caps::IRQ | port_caps::MMIO,
             BusType::Platform => port_caps::MMIO | port_caps::IRQ,
             BusType::Ethernet => port_caps::DMA | port_caps::IRQ | port_caps::MMIO,
-            BusType::Uart | BusType::Klog => 0, // No hardware capabilities
+            BusType::Uart | BusType::Klog | BusType::Cpu => 0,
         }
     }
 
@@ -510,7 +514,7 @@ impl BusController {
         match self.bus_type {
             BusType::PCIe => hw_pcie::disable_all_bus_mastering(self.bus_index, self.ecam_based, self.base_addr),
             BusType::Usb => { let _ = hw_usb::force_halt(self.bus_index, self.base_addr); }
-            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => {
+            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog | BusType::Cpu => {
                 // No bus mastering to disable
             }
         }
@@ -549,6 +553,12 @@ impl BusController {
 
         // Send enumerated device list (if any devices)
         self.send_device_list(client_channel)?;
+
+        // CPU bus: send OPP table so cpud knows available frequencies
+        if self.bus_type == BusType::Cpu {
+            crate::kernel::power::push_opp_table_to_bus(client_channel);
+        }
+
         Ok(())
     }
 
@@ -698,7 +708,7 @@ impl BusController {
         match self.bus_type {
             BusType::PCIe => self.pcie_reset_sequence(),
             BusType::Usb => self.usb_reset_sequence(),
-            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => {
+            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog | BusType::Cpu => {
                 self.hardware_verified = true; // No hardware to reset
             }
         }
@@ -932,6 +942,34 @@ impl BusController {
 
                 Ok(())
             }
+            x if x == BusControlMsgType::SetGovernor as u8 => {
+                if self.bus_type != BusType::Cpu {
+                    return Err(BusError::InvalidMessage);
+                }
+                if msg.header.payload_len < 2 {
+                    return Err(BusError::InvalidMessage);
+                }
+                let gov_id = msg.payload[1];
+                if crate::kernel::power::set_governor(gov_id) {
+                    Ok(())
+                } else {
+                    Err(BusError::InvalidMessage)
+                }
+            }
+            x if x == BusControlMsgType::SetOpp as u8 => {
+                if self.bus_type != BusType::Cpu {
+                    return Err(BusError::InvalidMessage);
+                }
+                if msg.header.payload_len < 2 {
+                    return Err(BusError::InvalidMessage);
+                }
+                let opp_index = msg.payload[1];
+                if crate::kernel::power::set_target_opp(opp_index) {
+                    Ok(())
+                } else {
+                    Err(BusError::InvalidMessage)
+                }
+            }
             _ => Err(BusError::InvalidMessage),
         }
     }
@@ -957,7 +995,7 @@ impl BusController {
         let hw_result = match self.bus_type {
             BusType::PCIe => hw_pcie::set_bus_mastering(self.bus_index, device_id, true, self.ecam_based, self.base_addr),
             BusType::Usb => hw_usb::set_dma_allowed(self.bus_index, device_id, true, self.base_addr),
-            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => Ok(()), // No bus mastering control
+            BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog | BusType::Cpu => Ok(()),
         };
 
         if let Err(e) = hw_result {
@@ -982,7 +1020,7 @@ impl BusController {
             let hw_result = match self.bus_type {
                 BusType::PCIe => hw_pcie::set_bus_mastering(self.bus_index, device_id, false, self.ecam_based, self.base_addr),
                 BusType::Usb => hw_usb::set_dma_allowed(self.bus_index, device_id, false, self.base_addr),
-                BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog => Ok(()), // No bus mastering control
+                BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog | BusType::Cpu => Ok(()),
             };
 
             if let Err(e) = hw_result {

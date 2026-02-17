@@ -129,6 +129,8 @@ pub struct PerCpuQueues {
     next_cpu: u8,
     /// Number of CPUs to distribute across
     num_cpus: u8,
+    /// Number of active CPUs for scheduling (governor-controlled)
+    num_active: u8,
 }
 
 impl PerCpuQueues {
@@ -139,6 +141,7 @@ impl PerCpuQueues {
             task_prio: [0xFF; MAX_TASKS],
             next_cpu: 0,
             num_cpus: 1,
+            num_active: 1,
         }
     }
 
@@ -147,7 +150,20 @@ impl PerCpuQueues {
     pub fn set_num_cpus(&mut self, n: u8) {
         if n > 0 && (n as usize) <= percpu::MAX_CPUS {
             self.num_cpus = n;
+            self.num_active = n;
         }
+    }
+
+    /// Set the number of active CPUs (governor-controlled).
+    /// Tasks are only assigned to CPUs 0..num_active via round-robin.
+    /// Parked CPUs drain naturally via work stealing, then idle in WFI.
+    pub fn set_num_active(&mut self, n: u8) {
+        self.num_active = n.max(1).min(self.num_cpus);
+    }
+
+    /// Get the current number of active CPUs.
+    pub fn num_active(&self) -> u8 {
+        self.num_active
     }
 
     /// Find the first ready task from a CPU's per-priority bitsets.
@@ -289,7 +305,7 @@ impl SchedulingPolicy for PerCpuQueues {
     fn assign_task_round_robin(&mut self, slot: usize) {
         if slot < MAX_TASKS {
             self.cpu_assign[slot] = self.next_cpu;
-            self.next_cpu = (self.next_cpu + 1) % self.num_cpus;
+            self.next_cpu = (self.next_cpu + 1) % self.num_active;
         }
     }
 

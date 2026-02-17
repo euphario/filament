@@ -4,7 +4,7 @@
 //! All services are dynamically spawned via PORT_RULES or boot services.
 //! Uses trait-based design for testability.
 
-use userlib::ipc::{Channel, Timer, Process, ObjHandle};
+use userlib::ipc::{Channel, Timer, ObjHandle};
 
 // =============================================================================
 // Constants
@@ -29,10 +29,10 @@ pub const FAILED_RETRY_MS: u64 = 5 * 60 * 1000;
 ///       Event: Driver sends STATE_CHANGE(Ready) on query channel
 ///
 ///   Ready ──[exit(0)]──► Stopped
-///       Event: Process watcher fires
+///       Event: Supervision channel CLOSED
 ///
 ///   Ready ──[exit(!=0)]──► Crashed (sets restart timer)
-///       Event: Process watcher fires
+///       Event: Supervision channel CLOSED
 ///
 ///   Crashed ──[restart timer fires, restarts < MAX]──► Starting
 ///       Event: Per-service Timer fires
@@ -99,8 +99,6 @@ pub struct Service {
     pub state: ServiceState,
     /// Process ID (0 if not running)
     pub pid: u32,
-    /// Process watcher handle
-    pub watcher: Option<Process>,
     /// Channel from this service (for ready announcement)
     pub channel: Option<Channel>,
     /// Restart backoff in ms
@@ -128,7 +126,6 @@ impl Service {
         Self {
             state: ServiceState::Pending,
             pid: 0,
-            watcher: None,
             channel: None,
             backoff_ms: INITIAL_BACKOFF_MS,
             last_change: 0,
@@ -196,9 +193,6 @@ pub trait ServiceManager {
 
     /// Get total service count
     fn count(&self) -> usize;
-
-    /// Find service by watcher handle
-    fn find_by_watcher(&self, handle: ObjHandle) -> Option<usize>;
 
     /// Find service by restart timer handle
     fn find_by_timer(&self, handle: ObjHandle) -> Option<usize>;
@@ -315,16 +309,6 @@ impl ServiceManager for ServiceRegistry {
 
     fn count(&self) -> usize {
         self.count
-    }
-
-    fn find_by_watcher(&self, handle: ObjHandle) -> Option<usize> {
-        (0..self.count).find(|&i| {
-            self.services[i]
-                .as_ref()
-                .and_then(|s| s.watcher.as_ref())
-                .map(|w| w.handle() == handle)
-                .unwrap_or(false)
-        })
     }
 
     fn find_by_timer(&self, handle: ObjHandle) -> Option<usize> {

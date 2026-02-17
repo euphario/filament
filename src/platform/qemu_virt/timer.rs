@@ -80,6 +80,11 @@ impl Timer {
                 sched.enqueue_cleanup_if_ready(current_counter);
             }
 
+            // CPU power management (CPU 0 only)
+            if crate::kernel::percpu::cpu_id() == 0 {
+                crate::kernel::power::tick();
+            }
+
             // Continue bus init (no-op for QEMU without PCIe)
             crate::kernel::bus::continue_init();
 

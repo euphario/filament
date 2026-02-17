@@ -79,6 +79,9 @@ fn register_qemu_buses() {
 
     // Platform
     bus_create(&BusCreateInfo::new(bus_type::PLATFORM, 0));
+
+    // CPU power management
+    bus_create(&BusCreateInfo::new(bus_type::CPU, 0));
 }
 
 // ============================================================================
@@ -158,4 +161,7 @@ fn register_mt7988_buses() {
 
     // Klog
     bus_create(&BusCreateInfo::new(bus_type::KLOG, 0));
+
+    // CPU power management
+    bus_create(&BusCreateInfo::new(bus_type::CPU, 0));
 }

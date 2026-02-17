@@ -185,6 +185,61 @@ impl HandleTable {
         table
     }
 
+    /// Initialize a HandleTable in-place at the given pointer.
+    ///
+    /// This avoids placing the ~110KB HandleTable on the 64KB kernel stack.
+    /// Fields are written directly to the destination via raw pointer operations.
+    ///
+    /// Each entry is written individually as `None` via `ptr::write` because
+    /// Rust uses niche optimization for `Option<HandleEntry>`: the `None`
+    /// discriminant is NOT zero (it's a niche value in the `Object` enum's
+    /// discriminant byte). Zero-filling would produce `Some(...)` instead.
+    ///
+    /// # Safety
+    /// `dest` must point to valid, writable, properly aligned memory of
+    /// at least `size_of::<HandleTable>()` bytes.
+    pub unsafe fn init_at(dest: *mut Self, is_user: bool) {
+        use core::ptr;
+
+        // Write each entry as None individually.
+        // Cannot use memset(0) — niche optimization means None != all-zeros.
+        // Stack cost: one Option<HandleEntry> temporary per iteration (~1.7KB),
+        // but the compiler optimizes None writes to just the discriminant byte.
+        let entries_ptr = ptr::addr_of_mut!((*dest).entries);
+        for i in 0..MAX_HANDLES {
+            ptr::write(&mut (*entries_ptr)[i], None);
+        }
+
+        // Set all generations to 1 (generation 0 is invalid)
+        ptr::write_bytes(
+            ptr::addr_of_mut!((*dest).generations) as *mut u8,
+            1,
+            MAX_HANDLES,
+        );
+
+        if is_user {
+            // Individual HandleEntry writes are small, safe on stack
+            ptr::write(&mut (*entries_ptr)[1], Some(HandleEntry {
+                generation: 1,
+                object_type: super::ObjectType::Stdin,
+                rights: default_rights(super::ObjectType::Stdin),
+                object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stdin)),
+            }));
+            ptr::write(&mut (*entries_ptr)[2], Some(HandleEntry {
+                generation: 1,
+                object_type: super::ObjectType::Stdout,
+                rights: default_rights(super::ObjectType::Stdout),
+                object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stdout)),
+            }));
+            ptr::write(&mut (*entries_ptr)[3], Some(HandleEntry {
+                generation: 1,
+                object_type: super::ObjectType::Stderr,
+                rights: default_rights(super::ObjectType::Stderr),
+                object: super::Object::Console(super::ConsoleObject::new(super::ConsoleType::Stderr)),
+            }));
+        }
+    }
+
     /// Allocate a new handle with default rights for the object type
     pub fn alloc(&mut self, object_type: ObjectType, object: Object) -> Option<Handle> {
         self.alloc_with_rights(object_type, default_rights(object_type), object)

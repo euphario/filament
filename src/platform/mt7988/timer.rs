@@ -106,6 +106,11 @@ impl Timer {
                 sched.enqueue_cleanup_if_ready(current_counter);
             }
 
+            // CPU power management (CPU 0 only)
+            if crate::kernel::percpu::cpu_id() == 0 {
+                crate::kernel::power::tick();
+            }
+
             // Continue bus initialization (one bus per tick until all Safe)
             // This runs in parallel with devd - devd gets notified as each bus becomes Safe
             crate::kernel::bus::continue_init();

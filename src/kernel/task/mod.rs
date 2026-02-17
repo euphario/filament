@@ -198,7 +198,7 @@ pub struct Scheduler {
     /// This allows check_timeouts to early-return most ticks.
     next_deadline: u64,
     /// Scheduling policy for task selection
-    policy: PerCpuQueues,
+    pub(crate) policy: PerCpuQueues,
 }
 
 /// Get current CPU's running task slot index (SMP-safe)
