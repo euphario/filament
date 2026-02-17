@@ -2094,6 +2094,26 @@ impl Devd {
     }
 
     // =========================================================================
+    // Signal Event Handling
+    // =========================================================================
+
+    fn handle_signal_event(&mut self, event: &abi::MuxEvent) {
+        match event.signal_event as u32 {
+            abi::signal_event::PORT_STATE => {
+                let port_idx = (event.signal_value >> 32) as u16;
+                let new_state = event.signal_value as u32;
+                udebug!("devd", "port_state_signal"; port = port_idx, state = new_state);
+                // Port state signals complement channel-based notifications.
+                // Currently channel-based path handles all port state logic,
+                // so this is a forward-looking hook for when we remove channel notifications.
+            }
+            _ => {
+                udebug!("devd", "unknown_signal"; event = event.signal_event, value = event.signal_value);
+            }
+        }
+    }
+
+    // =========================================================================
     // Query Event Handling
     // =========================================================================
 
@@ -3742,25 +3762,32 @@ impl Devd {
 
         loop {
             let events = self.events.as_ref().expect("devd: events not initialized");
-            let wait_result = events.wait();
+            let wait_result = events.wait_event();
 
             match wait_result {
-                Ok(handle) => {
-                    // Query port event?
-                    if let Some(query_port) = &self.query_port {
-                        if handle == query_port.handle() {
-                            self.handle_query_port_event();
+                Ok(event) => {
+                    // Signal event (handle is INVALID)
+                    if event.is_signal() {
+                        self.handle_signal_event(&event);
+                        // Fall through to poll/flush below
+                    } else {
+                        let handle = event.handle;
+                        // Query port event?
+                        if let Some(query_port) = &self.query_port {
+                            if handle == query_port.handle() {
+                                self.handle_query_port_event();
+                            } else if self.query_handler.find_by_handle(handle).is_some() {
+                                // Query client message (or supervision channel close)
+                                self.handle_query_client_event(handle);
+                            } else if let Some(idx) = self.services.find_by_timer(handle) {
+                                // Service restart timer?
+                                self.handle_restart_timer(idx);
+                            }
                         } else if self.query_handler.find_by_handle(handle).is_some() {
-                            // Query client message (or supervision channel close)
                             self.handle_query_client_event(handle);
                         } else if let Some(idx) = self.services.find_by_timer(handle) {
-                            // Service restart timer?
                             self.handle_restart_timer(idx);
                         }
-                    } else if self.query_handler.find_by_handle(handle).is_some() {
-                        self.handle_query_client_event(handle);
-                    } else if let Some(idx) = self.services.find_by_timer(handle) {
-                        self.handle_restart_timer(idx);
                     }
                 }
                 Err(SysError::Timeout) | Err(SysError::WouldBlock) => {

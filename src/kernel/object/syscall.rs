@@ -1615,7 +1615,9 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 events[event_count] = super::MuxEvent {
                     handle: abi::Handle::from_raw(watch.handle()),
                     event: watch.filter(),
-                    _pad: [0; 3],
+                    signal_event: 0,
+                    _pad: [0; 2],
+                    signal_value: 0,
                 };
                 event_count += 1;
             }
@@ -1624,11 +1626,32 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         Ok((watches, earliest_deadline, timeout_ns, events, event_count))
     });
 
-    let (watches, earliest_deadline, timeout_ns, events, event_count) = match subscribe_and_poll_result {
+    let (watches, earliest_deadline, timeout_ns, mut events, mut event_count) = match subscribe_and_poll_result {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => return e.to_errno(),
         Err(_) => return KernelError::BadHandle.to_errno(),
     };
+
+    // Drain pending signals (task-level, bypasses per-watch filters)
+    let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
+    task::with_scheduler(|sched| {
+        if let Some(task) = sched.task_mut(slot) {
+            while event_count < max_events {
+                if let Some(sig) = task.dequeue_signal() {
+                    events[event_count] = super::MuxEvent {
+                        handle: abi::Handle::INVALID,
+                        event: abi::mux_filter::SIGNAL,
+                        signal_event: sig.event as u8,
+                        _pad: [0; 2],
+                        signal_value: sig.value,
+                    };
+                    event_count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    });
 
     // Events already ready → return immediately (no blocking needed)
     if event_count > 0 {
@@ -1782,9 +1805,32 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         events[0] = super::MuxEvent {
             handle: abi::Handle::from_raw(wd.handle),
             event: wd.events,
-            _pad: [0; 3],
+            signal_event: 0,
+            _pad: [0; 2],
+            signal_value: 0,
         };
-        return copy_mux_events_to_user(buf_ptr, &events, 1);
+        let mut event_count = 1usize;
+        // Also drain pending signals alongside the WakeData event
+        let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
+        task::with_scheduler(|sched| {
+            if let Some(task) = sched.task_mut(slot) {
+                while event_count < max_events {
+                    if let Some(sig) = task.dequeue_signal() {
+                        events[event_count] = super::MuxEvent {
+                            handle: abi::Handle::INVALID,
+                            event: abi::mux_filter::SIGNAL,
+                            signal_event: sig.event as u8,
+                            _pad: [0; 2],
+                            signal_value: sig.value,
+                        };
+                        event_count += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        });
+        return copy_mux_events_to_user(buf_ptr, &events, event_count);
     }
 
     let repoll_result = object_service().with_table_mut(task_id, |table| {
@@ -1805,7 +1851,9 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 events[event_count] = super::MuxEvent {
                     handle: abi::Handle::from_raw(watch.handle()),
                     event: watch.filter(),
-                    _pad: [0; 3],
+                    signal_event: 0,
+                    _pad: [0; 2],
+                    signal_value: 0,
                 };
                 event_count += 1;
             }
@@ -1814,10 +1862,31 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         (events, event_count)
     });
 
-    let (events, event_count) = match repoll_result {
+    let (mut events, mut event_count) = match repoll_result {
         Ok((e, c)) => (e, c),
         Err(_) => return KernelError::BadHandle.to_errno(),
     };
+
+    // Drain pending signals after re-poll (same pattern as Phase 1)
+    let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
+    task::with_scheduler(|sched| {
+        if let Some(task) = sched.task_mut(slot) {
+            while event_count < max_events {
+                if let Some(sig) = task.dequeue_signal() {
+                    events[event_count] = super::MuxEvent {
+                        handle: abi::Handle::INVALID,
+                        event: abi::mux_filter::SIGNAL,
+                        signal_event: sig.event as u8,
+                        _pad: [0; 2],
+                        signal_value: sig.value,
+                    };
+                    event_count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    });
 
     if event_count > 0 {
         return copy_mux_events_to_user(buf_ptr, &events, event_count);

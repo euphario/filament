@@ -507,3 +507,40 @@ pub(super) fn sys_get_capabilities(pid: u32) -> i64 {
         Err(e) => e.to_errno(),
     }
 }
+
+/// Send an async signal to another task
+/// Args: target_pid, event (signal_event::*), value
+/// Returns: 0 on success, negative error on failure
+pub(super) fn sys_signal(target_pid: u32, event: u32, value: u64) -> i64 {
+    use crate::kernel::task;
+    use crate::kernel::microtask;
+
+    let caller_pid = super::current_pid();
+
+    // Validate target exists and is allowed to receive signals from caller
+    let allowed = task::with_scheduler(|sched| {
+        if let Some(slot) = sched.slot_by_pid(target_pid) {
+            if let Some(target) = sched.task(slot) {
+                if target.is_terminated() {
+                    return false;
+                }
+                return target.can_receive_signal_from(caller_pid);
+            }
+        }
+        false
+    });
+
+    if !allowed {
+        return KernelError::PermDenied.to_errno();
+    }
+
+    // Enqueue signal delivery via microtask (deferred, safe from any lock context)
+    match microtask::enqueue(crate::kernel::microtask::MicroTask::Signal {
+        target: target_pid,
+        event,
+        value,
+    }) {
+        Ok(()) => 0,
+        Err(_) => KernelError::OutOfMemory.to_errno(),
+    }
+}

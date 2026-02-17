@@ -205,6 +205,11 @@ pub fn kill(pid: u32) -> i64 {
     syscall1(sys::KILL, pid as u64)
 }
 
+/// Send an async signal to another task
+pub fn signal(target_pid: u32, event: u32, value: u64) -> i64 {
+    syscall3(sys::SIGNAL, target_pid as u64, event as u64, value)
+}
+
 // ============================================================================
 // Memory
 // ============================================================================

@@ -71,6 +71,11 @@ pub enum MicroTask {
 
     /// Kernel-initiated forced termination
     Evict { pid: TaskId, reason: u8 },
+
+    // --- Signals ---
+
+    /// Deliver a signal to a target task's queue and wake it
+    Signal { target: TaskId, event: u32, value: u64 },
 }
 
 // ============================================================================
@@ -300,8 +305,8 @@ static GLOBAL_OVERFLOW: SpinLock<RingQueue<GLOBAL_CAPACITY>> =
 /// For Wake/WakeSweep variants, also sets need_resched so the wake is
 /// processed at the next safe point (irq_exit_resched / do_resched_if_needed).
 pub fn enqueue(task: MicroTask) -> Result<(), MicroTask> {
-    // Set need_resched for wake variants so the scheduler runs at the next safe point
-    if matches!(task, MicroTask::Wake { .. } | MicroTask::WakeSweep { .. }) {
+    // Set need_resched for wake/signal variants so the scheduler runs at the next safe point
+    if matches!(task, MicroTask::Wake { .. } | MicroTask::WakeSweep { .. } | MicroTask::Signal { .. }) {
         crate::kernel::percpu::cpu_local().set_need_resched();
     }
 
@@ -456,6 +461,9 @@ fn execute(task: MicroTask) {
         }
         MicroTask::Evict { pid, reason } => {
             exec_evict(pid, reason);
+        }
+        MicroTask::Signal { target, event, value } => {
+            exec_signal(target, event, value);
         }
     }
 }
@@ -633,4 +641,21 @@ fn exec_evict(pid: TaskId, reason_val: u8) {
     let reason = eviction::u8_to_reason(reason_val)
         .unwrap_or(crate::kernel::task::EvictionReason::StateCorruption);
     eviction::do_evict_task(pid, reason);
+}
+
+/// Deliver a signal to a target task's queue and wake it.
+fn exec_signal(target: TaskId, event: u32, value: u64) {
+    crate::kernel::task::with_scheduler(|sched| {
+        if let Some(slot) = sched.slot_by_pid(target) {
+            if let Some(task) = sched.task_mut(slot) {
+                // Only deliver to non-terminated tasks
+                if !task.is_terminated() {
+                    if !task.enqueue_signal(event, value) {
+                        crate::kwarn!("signal", "queue_full"; target = target as u64, event = event as u64);
+                    }
+                }
+            }
+            sched.wake_task(slot);
+        }
+    });
 }

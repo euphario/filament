@@ -662,6 +662,18 @@ impl BusController {
     ///
     /// Sends a StateChanged message on the supervision channel.
     fn notify_supervisor(&self, old_state: BusState, new_state: BusState, reason: StateChangeReason) -> Result<(), BusError> {
+        // Signal-based notification to devd (parallel path, lightweight)
+        if let Some(devd_pid) = self.supervisor_pid {
+            let value = ((self.bus_index as u64) << 32) | (new_state as u64);
+            let _ = crate::kernel::microtask::enqueue(
+                crate::kernel::microtask::MicroTask::Signal {
+                    target: devd_pid,
+                    event: abi::signal_event::PORT_STATE,
+                    value,
+                },
+            );
+        }
+
         let Some(channel) = self.supervisor_ch else {
             return Ok(());
         };

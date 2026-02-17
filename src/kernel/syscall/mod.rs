@@ -78,8 +78,9 @@ pub enum SyscallNumber {
     KlogWrite = 77,  // Inject binary log record into kernel ring
     GetPriority = 78,  // Get caller's base and effective priority
     PsInfoEx = 79,     // Extended process info with resource accounting
+    Signal = 80,       // Send async signal to another task
 
-    // 80-96: legacy handle system (removed) - use 100-104
+    // 81-96: legacy handle system (removed) - use 100-104
 
     // Unified interface (100-105) - THE 6 SYSCALLS
     Open = 100,
@@ -131,6 +132,7 @@ impl From<u64> for SyscallNumber {
             77 => SyscallNumber::KlogWrite,
             78 => SyscallNumber::GetPriority,
             79 => SyscallNumber::PsInfoEx,
+            80 => SyscallNumber::Signal,
             // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -244,6 +246,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Klog => misc::sys_klog(args.arg0 as u8, args.arg1, args.arg2 as usize),
         SyscallNumber::KlogWrite => misc::sys_klog_write(args.arg0, args.arg1 as usize),
         SyscallNumber::GetPriority => misc::sys_get_priority(),
+        SyscallNumber::Signal => process::sys_signal(args.arg0 as u32, args.arg1 as u32, args.arg2),
         SyscallNumber::Reset => misc::sys_reset(),
         SyscallNumber::Shutdown => misc::sys_shutdown(args.arg0 as u8),
         // SignalAllow removed - use capability-based permissions
@@ -322,6 +325,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::Klog => "klog",
         SyscallNumber::KlogWrite => "klog_write",
         SyscallNumber::GetPriority => "get_priority",
+        SyscallNumber::Signal => "signal",
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::ExecWithCaps => "exec_with_caps",
         SyscallNumber::ExecWithChannel => "exec_with_channel",

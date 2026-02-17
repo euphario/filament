@@ -203,6 +203,9 @@ pub const MAX_CHILDREN: usize = 16;
 /// Maximum number of PIDs allowed to send signals to this process
 pub const MAX_SIGNAL_SENDERS: usize = 8;
 
+/// Maximum pending signals per task
+pub const MAX_PENDING_SIGNALS: usize = 8;
+
 /// Per-process resource limits (prevent exhaustion attacks)
 pub const MAX_CHANNELS_PER_TASK: u16 = 32;
 pub const MAX_PORTS_PER_TASK: u16 = 4;
@@ -354,6 +357,12 @@ pub struct Task {
     /// Data delivered with the last wake (for Mux fast path)
     pub(crate) wake_data: Option<WakeData>,
 
+    /// Per-task signal queue (fixed ring buffer)
+    pub(crate) signal_queue: [abi::PendingSignal; MAX_PENDING_SIGNALS],
+    pub(crate) signal_head: u8,  // next write position
+    pub(crate) signal_tail: u8,  // next read position
+    pub(crate) signal_count: u8, // current count
+
     /// Debug invariant: is this task currently in a ready queue?
     /// Used to assert that tasks are enqueued/dequeued correctly.
     #[cfg(debug_assertions)]
@@ -486,6 +495,10 @@ impl Task {
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,
+            signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
+            signal_head: 0,
+            signal_tail: 0,
+            signal_count: 0,
             #[cfg(debug_assertions)]
             on_runq: false,
         })
@@ -550,6 +563,10 @@ impl Task {
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,
+            signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
+            signal_head: 0,
+            signal_tail: 0,
+            signal_count: 0,
             #[cfg(debug_assertions)]
             on_runq: false,
         }
@@ -639,6 +656,10 @@ impl Task {
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,
+            signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
+            signal_head: 0,
+            signal_tail: 0,
+            signal_count: 0,
             #[cfg(debug_assertions)]
             on_runq: false,
         })
@@ -925,6 +946,38 @@ impl Task {
     /// Take wake data (consumes it — returns None on second call).
     pub fn take_wake_data(&mut self) -> Option<WakeData> {
         self.wake_data.take()
+    }
+
+    // ========================================================================
+    // Signal Queue API
+    // ========================================================================
+
+    /// Enqueue a signal into this task's signal queue. Returns false if full.
+    pub fn enqueue_signal(&mut self, event: u32, value: u64) -> bool {
+        debug_assert!(event <= 255, "signal event {} exceeds u8 range for MuxEvent delivery", event);
+        if self.signal_count >= MAX_PENDING_SIGNALS as u8 {
+            return false;
+        }
+        self.signal_queue[self.signal_head as usize] = abi::PendingSignal { event, value };
+        self.signal_head = (self.signal_head + 1) % MAX_PENDING_SIGNALS as u8;
+        self.signal_count += 1;
+        true
+    }
+
+    /// Dequeue a signal from this task's signal queue.
+    pub fn dequeue_signal(&mut self) -> Option<abi::PendingSignal> {
+        if self.signal_count == 0 {
+            return None;
+        }
+        let sig = self.signal_queue[self.signal_tail as usize];
+        self.signal_tail = (self.signal_tail + 1) % MAX_PENDING_SIGNALS as u8;
+        self.signal_count -= 1;
+        Some(sig)
+    }
+
+    /// Check if this task has pending signals.
+    pub fn has_pending_signals(&self) -> bool {
+        self.signal_count > 0
     }
 
     // ========================================================================

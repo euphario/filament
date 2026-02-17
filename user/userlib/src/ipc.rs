@@ -635,6 +635,11 @@ impl EventLoop {
         Ok(event.handle)
     }
 
+    /// Wait for next event, returns the full MuxEvent (including signal info)
+    pub fn wait_event(&self) -> SysResult<abi::MuxEvent> {
+        self.mux.wait()
+    }
+
     /// Get underlying mux handle (for advanced use)
     pub fn mux_handle(&self) -> ObjHandle {
         self.mux.handle()

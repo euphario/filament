@@ -47,6 +47,7 @@ pub mod syscall {
     pub const KLOG_WRITE: u64 = 77;
     pub const GET_PRIORITY: u64 = 78;
     pub const PS_INFO_EX: u64 = 79;
+    pub const SIGNAL: u64 = 80;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;
@@ -493,6 +494,27 @@ pub mod mux_filter {
     pub const WRITABLE: u8 = 1 << 1;
     pub const CLOSED: u8 = 1 << 2;
     pub const ERROR: u8 = 1 << 3;
+    pub const SIGNAL: u8 = 1 << 4;
+}
+
+/// Signal event types (delivered via Mux as task-level async notifications)
+pub mod signal_event {
+    /// Child process exited (value = pid<<32 | exit_code)
+    pub const CHILD_EXIT: u32 = 1;
+    /// Ctrl+C / interrupt (value = 0)
+    pub const INTERRUPT: u32 = 2;
+    /// Graceful shutdown request (value = 0)
+    pub const SHUTDOWN: u32 = 3;
+    /// Bus port state changed (value = port_idx<<32 | new_state)
+    pub const PORT_STATE: u32 = 4;
+}
+
+/// A pending signal in the per-task signal queue
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PendingSignal {
+    pub event: u32,
+    pub value: u64,
 }
 
 /// Filter for Mux events (enum for simple cases)
@@ -509,14 +531,16 @@ pub enum MuxFilter {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MuxEvent {
-    pub handle: Handle,
-    pub event: u8,
-    pub _pad: [u8; 3],
+    pub handle: Handle,       // 4 bytes (Handle::INVALID for signals)
+    pub event: u8,            // mux_filter bits, including SIGNAL
+    pub signal_event: u8,     // signal_event::* when SIGNAL set, 0 otherwise
+    pub _pad: [u8; 2],
+    pub signal_value: u64,    // signal value when SIGNAL set, 0 otherwise
 }
 
 impl MuxEvent {
     pub const fn empty() -> Self {
-        Self { handle: Handle::INVALID, event: 0, _pad: [0; 3] }
+        Self { handle: Handle::INVALID, event: 0, signal_event: 0, _pad: [0; 2], signal_value: 0 }
     }
 
     /// Check if this event indicates readable
@@ -532,6 +556,11 @@ impl MuxEvent {
     /// Check if this event indicates closed
     pub fn is_closed(&self) -> bool {
         (self.event & mux_filter::CLOSED) != 0
+    }
+
+    /// Check if this event is a signal
+    pub fn is_signal(&self) -> bool {
+        (self.event & mux_filter::SIGNAL) != 0
     }
 }
 
@@ -1245,7 +1274,7 @@ const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
 
 const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 48);
 const _: () = assert!(core::mem::size_of::<ProcessInfoEx>() == 64);
-const _: () = assert!(core::mem::size_of::<MuxEvent>() == 8);
+const _: () = assert!(core::mem::size_of::<MuxEvent>() == 16);
 const _: () = assert!(core::mem::size_of::<PciEnumEntry>() == 32);
 const _: () = assert!(core::mem::size_of::<BusInfo>() == 48);
 const _: () = assert!(core::mem::size_of::<DirEntry>() == 88);

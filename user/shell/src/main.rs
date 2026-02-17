@@ -37,7 +37,7 @@ macro_rules! println {
     }};
 }
 
-use userlib::ipc::Port;
+use userlib::ipc::{Port, Process, Mux, MuxFilter};
 use userlib::syscall;
 use userlib::vfs_client::VfsClient;
 
@@ -389,22 +389,55 @@ fn try_run_binary(cmd: &[u8]) {
     color::reset();
 }
 
-/// Wait for a child process to complete
+/// Wait for a child process to complete, interruptible by signals (Ctrl+C)
 fn wait_for_child(pid: u32) {
-    loop {
-        let wait_result = syscall::wait(pid as i32);
-        if wait_result >= 0 {
-            let exit_code = (wait_result & 0xFFFFFFFF) as i32;
-            if exit_code != 0 {
-                println!("Process {} exited with code {}", pid, exit_code);
+    // Try Mux-based wait (supports signal delivery for Ctrl+C)
+    let proc = match Process::watch(pid) {
+        Ok(p) => p,
+        Err(_) => {
+            // Fallback: blocking wait (no signal support)
+            loop {
+                let r = syscall::wait(pid as i32);
+                if r >= 0 {
+                    let code = (r & 0xFFFFFFFF) as i32;
+                    if code != 0 { println!("Process {} exited with code {}", pid, code); }
+                    break;
+                } else if r != -11 { break; }
             }
-            break;
-        } else if wait_result == -11 {
-            // EAGAIN - child still running, retry
-            continue;
-        } else {
-            println!("Wait failed: {}", wait_result);
-            break;
+            return;
+        }
+    };
+
+    let mux = match Mux::new() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let _ = mux.add(proc.handle(), MuxFilter::Readable);
+
+    loop {
+        match mux.wait() {
+            Ok(event) => {
+                if event.is_signal() {
+                    // signal_event::INTERRUPT = 2
+                    if event.signal_event == 2 {
+                        // Ctrl+C: kill the foreground child
+                        syscall::kill(pid);
+                        continue; // Wait for actual exit
+                    }
+                }
+                if event.is_readable() || event.is_closed() {
+                    // Child exited
+                    let r = syscall::wait(pid as i32);
+                    if r >= 0 {
+                        let code = (r & 0xFFFFFFFF) as i32;
+                        if code != 0 {
+                            println!("Process {} exited with code {}", pid, code);
+                        }
+                    }
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
 }
@@ -601,30 +634,7 @@ fn cmd_run_program(path: &str) {
     if result >= 0 {
         let pid = result as u32;
         println!("Spawned process with PID {}", pid);
-
-        // Wait for child to complete
-        // Loop until child exits - kernel handles blocking
-        loop {
-            let wait_result = syscall::wait(pid as i32);
-
-            if wait_result >= 0 {
-                // Success - child exited, unpack (pid << 32 | exit_code)
-                let exit_code = (wait_result & 0xFFFFFFFF) as i32;
-                println!("Process {} exited with code {}", pid, exit_code);
-                break;
-            } else if wait_result == -11 {
-                // EAGAIN - child still running, just retry
-                // Don't call yield_now() - it would undo the Blocked state
-                continue;
-            } else if wait_result == -10 {
-                // ECHILD - no such child (probably daemonized)
-                println!("Process {} detached (daemonized)", pid);
-                break;
-            } else {
-                println!("wait failed: {}", wait_result);
-                break;
-            }
-        }
+        wait_for_child(pid);
     } else {
         println!("exec failed: {}", result);
     }

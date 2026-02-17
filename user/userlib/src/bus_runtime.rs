@@ -1072,6 +1072,12 @@ impl<D: Driver> DriverRuntime<D> {
                 }
             };
 
+            // Signal events have Handle::INVALID — dispatch before tag lookup
+            if event.is_signal() {
+                self.driver.signal(event.signal_event, event.signal_value, &mut self.ctx);
+                continue;
+            }
+
             let handle = event.handle;
 
             // Look up what this handle maps to

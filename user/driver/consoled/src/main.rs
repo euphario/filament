@@ -154,6 +154,8 @@ pub struct ConsoledDriver {
     split_enabled: bool,
     /// Number of lines for log region (top)
     log_lines: u16,
+    /// PID of the connected shell (for signal delivery)
+    shell_pid: Option<u32>,
 }
 
 impl ConsoledDriver {
@@ -168,6 +170,7 @@ impl ConsoledDriver {
             rows: 24,
             split_enabled: false,
             log_lines: 5,
+            shell_pid: None,
         }
     }
 
@@ -293,6 +296,7 @@ impl ConsoledDriver {
                         return;
                     }
 
+                    self.shell_pid = Some(client_pid);
                     uinfo!("consoled", "shell_connected"; pid = client_pid);
 
                     // Drain any stale UART input before shell starts
@@ -339,6 +343,35 @@ impl ConsoledDriver {
                             }
                             _ => {} // Ok(None)=WouldBlock, Ok(Some)=got data - shell alive
                         }
+                    }
+                }
+
+                // Check for Ctrl+C (0x03) — signal shell instead of writing to ring
+                if let Some(pid) = self.shell_pid {
+                    if rx_buf[..n].iter().any(|&b| b == 0x03) {
+                        // Scan entire buffer: write non-Ctrl+C segments, signal for each 0x03
+                        let mut seg_start = 0;
+                        for i in 0..n {
+                            if rx_buf[i] == 0x03 {
+                                // Write segment before this Ctrl+C
+                                if i > seg_start {
+                                    if let Some(ring) = &self.shell_ring {
+                                        let written = ring.rx_write(&rx_buf[seg_start..i]);
+                                        if written > 0 { ring.notify(); }
+                                    }
+                                }
+                                let _ = syscall::signal(pid, 2, 0);
+                                seg_start = i + 1;
+                            }
+                        }
+                        // Write any remaining bytes after last Ctrl+C
+                        if seg_start < n {
+                            if let Some(ring) = &self.shell_ring {
+                                let written = ring.rx_write(&rx_buf[seg_start..n]);
+                                if written > 0 { ring.notify(); }
+                            }
+                        }
+                        return;
                     }
                 }
 
@@ -480,6 +513,7 @@ impl ConsoledDriver {
 
         self.shell_ring = None;
         self.handshake_channel = None;
+        self.shell_pid = None;
 
         // Notify port that connection is closed (allows new connections)
         if let Some(port) = &mut self.port {

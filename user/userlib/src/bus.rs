@@ -592,6 +592,13 @@ pub trait Driver {
     /// The `tag` is the value passed when the handle was registered.
     fn handle_event(&mut self, _tag: u32, _handle: crate::syscall::Handle, _ctx: &mut dyn BusCtx) {}
 
+    /// A signal was delivered to this task.
+    ///
+    /// Called when the Mux returns a signal event (handle=INVALID, event=SIGNAL).
+    /// `signal_event` is the signal type (e.g., signal_event::INTERRUPT).
+    /// `signal_value` is the signal payload.
+    fn signal(&mut self, _signal_event: u8, _signal_value: u64, _ctx: &mut dyn BusCtx) {}
+
     /// Kernel bus sent a bus-type-specific message.
     ///
     /// Called by the runtime for message types it doesn't handle itself
