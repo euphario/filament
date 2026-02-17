@@ -494,7 +494,7 @@ fn cmd_help() {
         ("drivers", "Show driver/port tree (services, ports, shmem)"),
         ("yield", "Yield CPU to other processes"),
         ("ps [-v|-vv|-vvv]", "Show processes (verbose: handles, mem, caps)"),
-        ("kill <pid>", "Terminate a process"),
+        ("kill [-9] <pid>", "Signal (SHUTDOWN) or force-kill a process"),
         ("bg <path>", "Run program in background"),
         ("jobs", "Show background jobs"),
         ("log <level>", "Set log level (error/warn/info/debug/trace)"),
@@ -655,18 +655,39 @@ fn cmd_run_program_bg(path: &str) {
 
 
 /// Kill a process by PID
+/// `kill <pid>` — send SHUTDOWN signal (graceful, like SIGTERM)
+/// `kill -9 <pid>` — hard kill (like SIGKILL)
 fn cmd_kill(arg: &[u8]) {
-    match parse_decimal(arg) {
+    let arg = trim(arg);
+    let (force, pid_arg) = if arg.starts_with(b"-9 ") {
+        (true, trim(&arg[3..]))
+    } else if arg.starts_with(b"-9") && arg.len() > 2 {
+        (true, trim(&arg[2..]))
+    } else {
+        (false, arg)
+    };
+
+    match parse_decimal(pid_arg) {
         Some(pid) => {
-            let result = syscall::kill(pid);
-            if result == 0 {
-                println!("Killed process {}", pid);
+            if force {
+                let result = syscall::kill(pid);
+                if result == 0 {
+                    println!("Killed process {}", pid);
+                } else {
+                    println!("Failed to kill {}: error {}", pid, result);
+                }
             } else {
-                println!("Failed to kill {}: error {}", pid, result);
+                // Graceful: send SHUTDOWN signal (signal_event::SHUTDOWN = 3)
+                let sig_result = syscall::signal(pid, 3, 0);
+                if sig_result == 0 {
+                    println!("Sent SHUTDOWN to {}", pid);
+                } else {
+                    println!("Signal failed (error {}), use kill -9 {}", sig_result, pid);
+                }
             }
         }
         None => {
-            println!("Usage: kill <pid>");
+            println!("Usage: kill [-9] <pid>");
         }
     }
 }
