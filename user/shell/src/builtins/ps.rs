@@ -102,9 +102,9 @@ fn run_extended(verbosity: u8) -> Table {
 
     // Build headers based on verbosity
     let headers: &[&'static str] = match verbosity {
-        1 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM"],
-        2 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "PAGES", "MAPS"],
-        _ => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "PAGES", "MAPS", "KIDS", "CAPS"],
+        1 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG"],
+        2 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "PAGES", "MAPS"],
+        _ => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "PAGES", "MAPS", "KIDS", "CAPS"],
     };
 
     let mut table = Table::new(headers)
@@ -115,18 +115,19 @@ fn run_extended(verbosity: u8) -> Table {
         .align(7, Align::Right)   // HNDL
         .align(8, Align::Right)   // CH
         .align(9, Align::Right)   // PORT
-        .align(10, Align::Right); // SHMEM
+        .align(10, Align::Right)  // SHMEM
+        .align(11, Align::Right); // SIG
 
     let table = if verbosity >= 2 {
         table
-            .align(11, Align::Right)  // PAGES
-            .align(12, Align::Right)  // MAPS
+            .align(12, Align::Right)  // PAGES
+            .align(13, Align::Right)  // MAPS
     } else {
         table
     };
 
     let mut table = if verbosity >= 3 {
-        table.align(13, Align::Right) // KIDS
+        table.align(14, Align::Right) // KIDS
     } else {
         table
     };
@@ -156,12 +157,13 @@ fn run_extended(verbosity: u8) -> Table {
             .uint(cpu_ms)
             .bytes(&info.name);
 
-        // -v: handles, channels, ports, shmem
+        // -v: handles, channels, ports, shmem, signal pending
         row = row
             .uint(info.handle_count as u64)
             .uint(info.channel_count as u64)
             .uint(info.port_count as u64)
-            .uint(info.shmem_count as u64);
+            .uint(info.shmem_count as u64)
+            .uint(info.signal_pending as u64);
 
         // -vv: pages, mappings
         if verbosity >= 2 {

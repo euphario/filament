@@ -261,7 +261,8 @@ impl ProcessOps for KernelProcessOps {
                         heap_pages: task.total_heap_pages(),
                         mapping_count: task.mapping_count(),
                         num_children: task.num_children as u8,
-                        _pad: [0; 6],
+                        signal_pending: task.signal_count,
+                        _pad: [0; 5],
                         capabilities: task.get_capabilities_bits(),
                     };
                     i += 1;

@@ -274,6 +274,8 @@ fn execute_command(cmd: &[u8]) {
         builtins::ps::run(&cmd[3..]).print();
     } else if cmd_starts_with(cmd, b"kill ") {
         cmd_kill(&cmd[5..]);
+    } else if cmd_starts_with(cmd, b"signal ") {
+        cmd_signal(&cmd[7..]);
     } else if cmd_starts_with(cmd, b"bg ") {
         cmd_bg(&cmd[3..]);
     } else if cmd_eq(cmd, b"jobs") {
@@ -495,6 +497,7 @@ fn cmd_help() {
         ("yield", "Yield CPU to other processes"),
         ("ps [-v|-vv|-vvv]", "Show processes (verbose: handles, mem, caps)"),
         ("kill [-9] <pid>", "Signal (SHUTDOWN) or force-kill a process"),
+        ("signal <pid> <evt> [val]", "Send signal (evt: 1=exit 2=int 3=shut 4=port)"),
         ("bg <path>", "Run program in background"),
         ("jobs", "Show background jobs"),
         ("log <level>", "Set log level (error/warn/info/debug/trace)"),
@@ -689,6 +692,47 @@ fn cmd_kill(arg: &[u8]) {
         None => {
             println!("Usage: kill [-9] <pid>");
         }
+    }
+}
+
+/// Send a signal to a process: signal <pid> <event> [value]
+fn cmd_signal(arg: &[u8]) {
+    let arg = trim(arg);
+    let (pid_str, rest) = libf::str::split_once(arg, b' ');
+    let rest = trim(rest);
+    let (evt_str, val_str) = libf::str::split_once(rest, b' ');
+    let val_str = trim(val_str);
+
+    let pid = match parse_decimal(pid_str) {
+        Some(p) => p,
+        None => {
+            println!("Usage: signal <pid> <event> [value]");
+            println!("  Events: 1=CHILD_EXIT 2=INTERRUPT 3=SHUTDOWN 4=PORT_STATE");
+            return;
+        }
+    };
+    let event = match parse_decimal(evt_str) {
+        Some(e) => e,
+        None => {
+            println!("Usage: signal <pid> <event> [value]");
+            return;
+        }
+    };
+    let value = if val_str.is_empty() { 0u64 } else {
+        match libf::parse::parse_u64(val_str) {
+            Some(v) => v,
+            None => {
+                println!("Invalid value");
+                return;
+            }
+        }
+    };
+
+    let result = syscall::signal(pid, event, value);
+    if result == 0 {
+        println!("Signal {} sent to pid {}", event, pid);
+    } else {
+        println!("Failed: error {}", result);
     }
 }
 

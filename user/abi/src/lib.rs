@@ -220,7 +220,8 @@ pub struct ProcessInfoEx {
     pub heap_pages: u32,        // 44
     pub mapping_count: u8,      // 48
     pub num_children: u8,       // 49
-    pub _pad: [u8; 6],          // 50
+    pub signal_pending: u8,     // 50
+    pub _pad: [u8; 5],          // 51
     pub capabilities: u64,      // 56
 }
 // Total: 64 bytes
@@ -243,7 +244,8 @@ impl ProcessInfoEx {
             heap_pages: 0,
             mapping_count: 0,
             num_children: 0,
-            _pad: [0; 6],
+            signal_pending: 0,
+            _pad: [0; 5],
             capabilities: 0,
         }
     }
