@@ -14,7 +14,7 @@
 //!                                 │
 //! ┌───────────────────────────────▼────────────────────────────────┐
 //! │                    ObjectService                               │
-//! │    [SpinLock<Option<HandleTable>>; MAX_TASKS]                  │
+//! │    *mut SpinLock<Option<HandleTable>> (PMM-allocated)           │
 //! │    - One lock per task slot (eliminates global lock deadlocks) │
 //! │    - TableGuard proves lock is held (type-safe)                │
 //! │    - Blocking read() implementation                            │
@@ -47,7 +47,7 @@
 //!   call sites (channel write, port accept, port connect) propagate
 //!   errors to userspace rather than panicking.
 
-use crate::kernel::lock::{SpinLock, SpinLockGuard};
+use crate::kernel::lock::{SpinLock, SpinLockGuard, lock_class};
 use crate::kernel::task::{TaskId, MAX_TASKS};
 use crate::kernel::object::{HandleTable, Handle, Object, ObjectType, ConsoleType};
 use crate::kernel::object::handle::HandleEntry;
@@ -138,18 +138,40 @@ fn slot_from_task_id(task_id: TaskId) -> Option<usize> {
 /// Uses per-task locks for deadlock-free concurrent access.
 /// Each task slot has its own SpinLock, eliminating the class of
 /// same-lock re-acquisition deadlocks.
+///
+/// The tables array is allocated from PMM at boot time rather than
+/// stored inline. This avoids ~10MB of .data in the kernel image
+/// (256 slots × ~40KB each).
 pub struct ObjectService {
-    /// Per-slot object tables with individual locks
-    tables: [SpinLock<Option<HandleTable>>; MAX_TASKS],
+    /// Pointer to PMM-allocated array of per-slot locks
+    tables: *mut SpinLock<Option<HandleTable>>,
 }
 
+// SAFETY: The pointer targets are protected by per-element SpinLocks.
+// After init(), the pointer itself is never mutated — all mutation goes
+// through the SpinLock guards.
+unsafe impl Send for ObjectService {}
+unsafe impl Sync for ObjectService {}
+
 impl ObjectService {
-    /// Create a new ObjectService with per-task locks
+    /// Create an uninitialized ObjectService (null pointer).
+    ///
+    /// `init()` must be called after PMM is available.
     pub const fn new() -> Self {
-        const LOCKED_NONE: SpinLock<Option<HandleTable>> = SpinLock::new(crate::kernel::lock::lock_class::OBJ_SERVICE, None);
         Self {
-            tables: [LOCKED_NONE; MAX_TASKS],
+            tables: core::ptr::null_mut(),
         }
+    }
+
+    /// Access a table slot by index.
+    ///
+    /// # Panics
+    /// Panics if ObjectService has not been initialized or slot is out of range.
+    #[inline]
+    fn table_slot(&self, slot: usize) -> &SpinLock<Option<HandleTable>> {
+        debug_assert!(!self.tables.is_null(), "ObjectService not initialized");
+        debug_assert!(slot < MAX_TASKS, "slot {} out of range", slot);
+        unsafe { &*self.tables.add(slot) }
     }
 
     // ========================================================================
@@ -161,7 +183,7 @@ impl ObjectService {
     /// Returns a TableGuard that proves the lock is held.
     pub fn lock_table(&self, task_id: TaskId) -> Result<TableGuard<'_>, KernelError> {
         let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
-        let guard = self.tables[slot].lock();
+        let guard = self.table_slot(slot).lock();
         Ok(TableGuard { guard, slot })
     }
 
@@ -170,7 +192,7 @@ impl ObjectService {
         if slot >= MAX_TASKS {
             return Err(KernelError::NoProcess);
         }
-        let guard = self.tables[slot].lock();
+        let guard = self.table_slot(slot).lock();
         Ok(TableGuard { guard, slot })
     }
 
@@ -191,7 +213,7 @@ impl ObjectService {
             // Lock order violation - would cause ABBA deadlock
             return Err(KernelError::InvalidArg);
         }
-        let guard = self.tables[slot].lock();
+        let guard = self.table_slot(slot).lock();
         Ok(TableGuard { guard, slot })
     }
 
@@ -200,7 +222,7 @@ impl ObjectService {
     /// Returns Ok(None) if lock is already held by another CPU.
     pub fn try_lock_table(&self, task_id: TaskId) -> Result<Option<TableGuard<'_>>, KernelError> {
         let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
-        match self.tables[slot].try_lock() {
+        match self.table_slot(slot).try_lock() {
             Some(guard) => Ok(Some(TableGuard { guard, slot })),
             None => Ok(None),
         }
@@ -1134,10 +1156,47 @@ impl ObjectService {
 // Global Instance
 // ============================================================================
 
-/// Global ObjectService instance
-static OBJECT_SERVICE: ObjectService = ObjectService::new();
+/// Global ObjectService instance.
+///
+/// Starts with a null pointer — `init()` must be called after PMM is ready.
+/// After init, all access is through `&'static ObjectService` (immutable ref);
+/// mutation happens through the per-element SpinLocks, not the struct itself.
+static mut OBJECT_SERVICE: ObjectService = ObjectService::new();
+
+/// Initialize the ObjectService by allocating table storage from PMM.
+///
+/// Must be called exactly once, after `pmm::init()` and before any task spawns.
+pub fn init() {
+    use crate::kernel::pmm;
+    use crate::arch::aarch64::mmu;
+
+    let elem_size = core::mem::size_of::<SpinLock<Option<HandleTable>>>();
+    let total_bytes = MAX_TASKS * elem_size;
+    let pages = (total_bytes + 4095) / 4096;
+
+    let phys = pmm::alloc_pages(pages)
+        .expect("ObjectService: out of memory");
+    let virt = mmu::phys_to_virt(phys as u64) as *mut SpinLock<Option<HandleTable>>;
+
+    // Initialize each SpinLock in place (PMM returns zeroed memory but
+    // SpinLock needs proper field initialization for ticket lock)
+    for i in 0..MAX_TASKS {
+        unsafe {
+            core::ptr::write(virt.add(i), SpinLock::new(lock_class::OBJ_SERVICE, None));
+        }
+    }
+
+    // Store pointer — safe because this runs single-threaded at boot
+    // before any concurrent access
+    unsafe {
+        OBJECT_SERVICE.tables = virt;
+    }
+
+    let total_kb = total_bytes / 1024;
+    crate::kinfo!("objsvc", "init_ok"; pages = pages, size_kb = total_kb);
+}
 
 /// Get a reference to the global ObjectService
 pub fn object_service() -> &'static ObjectService {
-    &OBJECT_SERVICE
+    unsafe { &*core::ptr::addr_of!(OBJECT_SERVICE) }
 }

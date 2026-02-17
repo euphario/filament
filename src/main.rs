@@ -141,6 +141,13 @@ pub extern "C" fn kmain() -> ! {
         // Note: pmm::init() logs init_ok with details
     }
 
+    // Object service — allocate per-task handle tables from PMM
+    // (must be after PMM init, before any task spawns)
+    {
+        let _span = span!("objsvc", "init");
+        kernel::object_service::init();
+    }
+
     // Switch from linker-script boot stack to a PMM-allocated stack with guard page.
     // The boot stack sits right above BSS with no guard page — any overflow silently
     // corrupts kernel globals. Per-task kernel stacks (allocated later) all have guard

@@ -166,15 +166,16 @@ fn cmd_build(
     }
 
     // Step 1: Build user programs
-    if !skip_user {
-        build_user(root, &only, platform, stress)?;
+    let built_programs = if !skip_user {
+        build_user(root, &only, platform, stress)?
     } else {
         println!("Step 1: Skipping user programs (--skip-user)");
-    }
+        Vec::new()
+    };
     println!();
 
-    // Step 2: Create initrd
-    create_initrd(root, firmware)?;
+    // Step 2: Create initrd (only include programs that were built)
+    create_initrd(root, firmware, &built_programs)?;
     println!();
 
     // Step 3: Build kernel
@@ -260,8 +261,8 @@ fn build_dtb(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build user programs
-fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Result<()> {
+/// Build user programs. Returns the list of program names that were built.
+fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Result<Vec<String>> {
     let user_dir = root.join("user");
 
     // Core programs (built for all platforms)
@@ -271,6 +272,7 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         ("consoled", "driver/consoled"),
         ("shell", "shell"),
         ("partd", "driver/partd"),
+        ("cpud", "driver/cpud"),
     ];
 
     // Platform-specific programs
@@ -317,7 +319,7 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
 
     if programs.is_empty() {
         println!("Step 1: No programs to build");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let names: Vec<_> = programs.iter().map(|(n, _)| *n).collect();
@@ -343,7 +345,8 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         build_user_program(root, name, path, features)?;
     }
 
-    Ok(())
+    let built: Vec<String> = programs.iter().map(|(n, _)| n.to_string()).collect();
+    Ok(built)
 }
 
 /// Build a single user program
@@ -460,7 +463,12 @@ fn build_user_program(root: &Path, name: &str, path: &str, features: Option<&str
 }
 
 /// Create initrd TAR archive
-fn create_initrd(root: &Path, include_firmware: bool) -> Result<()> {
+///
+/// `programs` is the list of program names that were built for the current
+/// platform. Only these ELFs are included in the initrd, preventing stale
+/// binaries from other platforms (e.g. wifid in a QEMU build) from leaking in.
+/// If empty (--skip-user), falls back to copying all .elf files from bin/.
+fn create_initrd(root: &Path, include_firmware: bool, programs: &[String]) -> Result<()> {
     let user_dir = root.join("user");
     let bin_dir = user_dir.join("bin");
     let staging_dir = user_dir.join("initrd_staging");
@@ -474,15 +482,27 @@ fn create_initrd(root: &Path, include_firmware: bool) -> Result<()> {
     }
     fs::create_dir_all(staging_dir.join("bin"))?;
 
-    // Copy ELF binaries
-    for entry in fs::read_dir(&bin_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "elf") {
-            let name = path.file_stem().unwrap();
-            let dst = staging_dir.join("bin").join(name);
-            fs::copy(&path, &dst)?;
-            println!("  bin/{}", name.to_string_lossy());
+    // Copy ELF binaries — only those that were built for this platform
+    if programs.is_empty() {
+        // Fallback: --skip-user mode, copy all existing ELFs
+        for entry in fs::read_dir(&bin_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "elf") {
+                let name = path.file_stem().unwrap();
+                let dst = staging_dir.join("bin").join(name);
+                fs::copy(&path, &dst)?;
+                println!("  bin/{}", name.to_string_lossy());
+            }
+        }
+    } else {
+        for name in programs {
+            let elf_path = bin_dir.join(format!("{}.elf", name));
+            if elf_path.exists() {
+                let dst = staging_dir.join("bin").join(name);
+                fs::copy(&elf_path, &dst)?;
+                println!("  bin/{}", name);
+            }
         }
     }
 
