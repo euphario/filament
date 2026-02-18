@@ -80,8 +80,9 @@ pub enum SyscallNumber {
     PsInfoEx = 79,     // Extended process info with resource accounting
     Signal = 80,       // Send async signal to another task
     Sysinfo = 81,      // Get system-wide information (memory, tasks, uptime)
-
-    // 82-96: legacy handle system (removed) - use 100-104
+    SignalPeek = 82,   // Read pending signals without consuming
+    SignalFlush = 83,  // Clear pending signal queue
+    ResetStats = 84,   // Reset per-task statistics counters
 
     // Unified interface (100-105) - THE 6 SYSCALLS
     Open = 100,
@@ -135,6 +136,9 @@ impl From<u64> for SyscallNumber {
             79 => SyscallNumber::PsInfoEx,
             80 => SyscallNumber::Signal,
             81 => SyscallNumber::Sysinfo,
+            82 => SyscallNumber::SignalPeek,
+            83 => SyscallNumber::SignalFlush,
+            84 => SyscallNumber::ResetStats,
             // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -249,6 +253,9 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::KlogWrite => misc::sys_klog_write(args.arg0, args.arg1 as usize),
         SyscallNumber::GetPriority => misc::sys_get_priority(),
         SyscallNumber::Signal => process::sys_signal(args.arg0 as u32, args.arg1 as u32, args.arg2),
+        SyscallNumber::SignalPeek => process::sys_signal_peek(args.arg0 as u32, args.arg1, args.arg2 as usize),
+        SyscallNumber::SignalFlush => process::sys_signal_flush(args.arg0 as u32),
+        SyscallNumber::ResetStats => process::sys_reset_stats(args.arg0 as u32),
         SyscallNumber::Sysinfo => misc::sys_sysinfo(args.arg0),
         SyscallNumber::Reset => misc::sys_reset(),
         SyscallNumber::Shutdown => misc::sys_shutdown(args.arg0 as u8),
@@ -329,6 +336,9 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::KlogWrite => "klog_write",
         SyscallNumber::GetPriority => "get_priority",
         SyscallNumber::Signal => "signal",
+        SyscallNumber::SignalPeek => "signal_peek",
+        SyscallNumber::SignalFlush => "signal_flush",
+        SyscallNumber::ResetStats => "reset_stats",
         SyscallNumber::Sysinfo => "sysinfo",
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::ExecWithCaps => "exec_with_caps",

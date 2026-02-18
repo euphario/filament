@@ -353,6 +353,10 @@ pub struct Task {
     pub(crate) ipc_sent: u32,
     /// IPC messages received by this task (saturating counter)
     pub(crate) ipc_recv: u32,
+    /// Context switches into this task (saturating counter)
+    pub(crate) context_switches: u32,
+    /// Page faults handled for this task (demand paging)
+    pub(crate) page_faults: u32,
 
     /// Total CPU time consumed by this task (nanoseconds)
     pub(crate) cpu_time_ns: u64,
@@ -499,6 +503,8 @@ impl Task {
             cleanup_phase: CleanupPhase::None,
             ipc_sent: 0,
             ipc_recv: 0,
+            context_switches: 0,
+            page_faults: 0,
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,
@@ -569,6 +575,8 @@ impl Task {
             cleanup_phase: CleanupPhase::None,
             ipc_sent: 0,
             ipc_recv: 0,
+            context_switches: 0,
+            page_faults: 0,
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,
@@ -664,6 +672,8 @@ impl Task {
             cleanup_phase: CleanupPhase::None,
             ipc_sent: 0,
             ipc_recv: 0,
+            context_switches: 0,
+            page_faults: 0,
             cpu_time_ns: 0,
             last_scheduled_at: 0,
             wake_data: None,
@@ -894,6 +904,16 @@ impl Task {
     #[inline]
     pub fn cpu_time_ns(&self) -> u64 {
         self.cpu_time_ns
+    }
+
+    /// Reset all per-task statistics counters.
+    pub fn reset_stats(&mut self) {
+        self.cpu_time_ns = 0;
+        self.ipc_sent = 0;
+        self.ipc_recv = 0;
+        self.context_switches = 0;
+        self.page_faults = 0;
+        self.last_activity_tick = 0;
     }
 
     pub fn set_parent(&mut self, parent_id: TaskId) {

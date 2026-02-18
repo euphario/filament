@@ -544,3 +544,141 @@ pub(super) fn sys_signal(target_pid: u32, event: u32, value: u64) -> i64 {
         Err(_) => KernelError::OutOfMemory.to_errno(),
     }
 }
+
+/// Peek at pending signals for a target process (non-consuming read)
+/// Args: target_pid, buf_ptr (pointer to PendingSignal array), max_count
+/// Returns: number of signals copied, or negative error
+pub(super) fn sys_signal_peek(target_pid: u32, buf_ptr: u64, max_count: usize) -> i64 {
+    use crate::kernel::task;
+
+    if max_count == 0 {
+        return 0;
+    }
+
+    let caller_pid = super::current_pid();
+
+    // Validate output buffer
+    let entry_size = core::mem::size_of::<abi::PendingSignal>();
+    if let Err(e) = uaccess::validate_user_write(buf_ptr, entry_size * max_count) {
+        return uaccess_to_errno(e);
+    }
+
+    // Read signal queue under scheduler lock
+    let result: Result<usize, i64> = task::with_scheduler(|sched| {
+        let slot = sched.slot_by_pid(target_pid).ok_or(KernelError::NoProcess.to_errno())?;
+        let target = sched.task(slot).ok_or(KernelError::NoProcess.to_errno())?;
+
+        if target.is_terminated() {
+            return Err(KernelError::NoProcess.to_errno());
+        }
+
+        // Permission: caller is parent, or caller==target, or caller has CAP_ADMIN
+        let allowed = caller_pid == target_pid
+            || target.parent_id == caller_pid
+            || target.can_receive_signal_from(caller_pid);
+        if !allowed {
+            return Err(KernelError::PermDenied.to_errno());
+        }
+
+        // Walk the ring buffer without consuming
+        let count = (target.signal_count as usize).min(max_count);
+        for i in 0..count {
+            let idx = ((target.signal_tail as usize) + i) % crate::kernel::task::tcb::MAX_PENDING_SIGNALS;
+            let sig = target.signal_queue[idx];
+            let offset = (i * entry_size) as u64;
+            let sig_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &sig as *const abi::PendingSignal as *const u8,
+                    entry_size,
+                )
+            };
+            if uaccess::copy_to_user(buf_ptr + offset, sig_bytes).is_err() {
+                return Ok(i);
+            }
+        }
+
+        Ok(count)
+    });
+
+    match result {
+        Ok(count) => count as i64,
+        Err(e) => e,
+    }
+}
+
+/// Flush (clear) all pending signals for a target process
+/// Args: target_pid
+/// Returns: number of signals flushed, or negative error
+pub(super) fn sys_signal_flush(target_pid: u32) -> i64 {
+    use crate::kernel::task;
+
+    let caller_pid = super::current_pid();
+
+    task::with_scheduler(|sched| {
+        let slot = match sched.slot_by_pid(target_pid) {
+            Some(s) => s,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+        let target = match sched.task_mut(slot) {
+            Some(t) => t,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+
+        if target.is_terminated() {
+            return KernelError::NoProcess.to_errno();
+        }
+
+        // Permission: caller is parent, or caller==target, or caller has CAP_ADMIN
+        let allowed = caller_pid == target_pid
+            || target.parent_id == caller_pid
+            || target.can_receive_signal_from(caller_pid);
+        if !allowed {
+            return KernelError::PermDenied.to_errno();
+        }
+
+        let flushed = target.signal_count as i64;
+        target.signal_head = 0;
+        target.signal_tail = 0;
+        target.signal_count = 0;
+        flushed
+    })
+}
+
+/// Reset per-task statistics counters
+/// Args: target_pid (0 = all tasks)
+/// Returns: 0 on success, negative error
+pub(super) fn sys_reset_stats(target_pid: u32) -> i64 {
+    use crate::kernel::task;
+
+    let caller_pid = super::current_pid();
+
+    task::with_scheduler(|sched| {
+        if target_pid == 0 {
+            // Reset all — only allowed for tasks with CAP_ADMIN or as a convenience for any caller
+            // (ps -r is a diagnostic tool, not a security boundary)
+            for (_slot, task_opt) in sched.iter_tasks_mut() {
+                if let Some(t) = task_opt {
+                    t.reset_stats();
+                }
+            }
+            return 0;
+        }
+
+        let slot = match sched.slot_by_pid(target_pid) {
+            Some(s) => s,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+        let target = match sched.task_mut(slot) {
+            Some(t) => t,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+
+        // Permission: caller is parent, caller==target
+        if caller_pid != target_pid && target.parent_id != caller_pid {
+            return KernelError::PermDenied.to_errno();
+        }
+
+        target.reset_stats();
+        0
+    })
+}

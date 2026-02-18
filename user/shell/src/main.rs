@@ -699,11 +699,78 @@ fn cmd_kill(arg: &[u8]) {
     }
 }
 
-/// Send a signal to a process: signal <pid> <event> [value]
+/// Signal event name for display
+fn signal_event_name(event: u32) -> &'static str {
+    match event {
+        1 => "CHILD_EXIT",
+        2 => "INTERRUPT",
+        3 => "SHUTDOWN",
+        4 => "PORT_STATE",
+        _ => "",
+    }
+}
+
+/// Signal command: send, peek, or flush
+///   signal <pid> <event> [value]  — send
+///   signal peek <pid>             — show pending signals
+///   signal flush <pid>            — clear pending signals
 fn cmd_signal(arg: &[u8]) {
     let arg = trim(arg);
-    let (pid_str, rest) = libf::str::split_once(arg, b' ');
+    let (first, rest) = libf::str::split_once(arg, b' ');
     let rest = trim(rest);
+
+    // Check for subcommands
+    if libf::str::eq_ignore_ascii_case(first, b"peek") {
+        let pid = match parse_decimal(rest) {
+            Some(p) => p,
+            None => {
+                println!("Usage: signal peek <pid>");
+                return;
+            }
+        };
+        let mut buf = [syscall::PendingSignal { event: 0, value: 0 }; 8];
+        let result = syscall::signal_peek(pid, &mut buf);
+        if result < 0 {
+            println!("Failed: error {}", result);
+            return;
+        }
+        let count = result as usize;
+        if count == 0 {
+            println!("No pending signals for pid {}", pid);
+        } else {
+            println!("Pending signals for pid {}:", pid);
+            for i in 0..count {
+                let name = signal_event_name(buf[i].event);
+                if name.is_empty() {
+                    println!("  [{}] event={} value={}", i, buf[i].event, buf[i].value);
+                } else {
+                    println!("  [{}] {} value={}", i, name, buf[i].value);
+                }
+            }
+            println!("({} pending)", count);
+        }
+        return;
+    }
+
+    if libf::str::eq_ignore_ascii_case(first, b"flush") {
+        let pid = match parse_decimal(rest) {
+            Some(p) => p,
+            None => {
+                println!("Usage: signal flush <pid>");
+                return;
+            }
+        };
+        let result = syscall::signal_flush(pid);
+        if result < 0 {
+            println!("Failed: error {}", result);
+        } else {
+            println!("Flushed {} signals from pid {}", result, pid);
+        }
+        return;
+    }
+
+    // Original send path: signal <pid> <event> [value]
+    let pid_str = first;
     let (evt_str, val_str) = libf::str::split_once(rest, b' ');
     let val_str = trim(val_str);
 
@@ -711,6 +778,8 @@ fn cmd_signal(arg: &[u8]) {
         Some(p) => p,
         None => {
             println!("Usage: signal <pid> <event> [value]");
+            println!("       signal peek <pid>");
+            println!("       signal flush <pid>");
             println!("  Events: 1=CHILD_EXIT 2=INTERRUPT 3=SHUTDOWN 4=PORT_STATE");
             return;
         }

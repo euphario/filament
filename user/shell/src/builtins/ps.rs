@@ -3,10 +3,11 @@
 //! Display running processes with structured output.
 //!
 //! Usage:
-//!   ps              - Show all processes (7 columns)
-//!   ps -v           - + HNDL, CH, PORT, SHMEM
-//!   ps -vv          - + PAGES, MAPS
+//!   ps              - Show all processes (8 columns)
+//!   ps -v           - + HNDL, CH, PORT, SHMEM, LIVE
+//!   ps -vv          - + CSW, PF, PAGES, MAPS
 //!   ps -vvv         - + KIDS, CAPS
+//!   ps -r           - Reset all stats, then show ps
 
 use userlib::syscall;
 use crate::output::{Table, Row, Align, CommandResult};
@@ -25,26 +26,64 @@ fn prio_name(level: u8) -> &'static str {
     }
 }
 
-/// Parse verbosity level from args: count 'v' characters after '-'
-fn parse_verbosity(args: &[u8]) -> u8 {
+/// Format activity age as human-readable idle time
+fn idle_str(age_ms: u32) -> &'static str {
+    if age_ms == 0 {
+        "-"
+    } else if age_ms < 1000 {
+        "<1s"
+    } else if age_ms < 3000 {
+        "3s"
+    } else if age_ms < 15000 {
+        "15s"
+    } else if age_ms < 60000 {
+        "1m"
+    } else if age_ms < 300000 {
+        "5m"
+    } else if age_ms < 3600000 {
+        "1h"
+    } else {
+        ">1h"
+    }
+}
+
+/// Liveness status as short string
+fn liveness_str(status: u8) -> &'static str {
+    match status {
+        0 => "ok",
+        1 => "ping",
+        2 => "clos",
+        _ => "?",
+    }
+}
+
+/// Parse flags from args
+fn parse_flags(args: &[u8]) -> (u8, bool) {
     let args = libf::str::trim(args);
     if args.is_empty() {
-        return 0;
+        return (0, false);
     }
-    // Support: -v, -vv, -vvv
+    // Support: -v, -vv, -vvv, -r
     if args.first() == Some(&b'-') {
         let rest = &args[1..];
+        if rest == b"r" {
+            return (0, true);
+        }
         let v_count = rest.iter().take_while(|&&c| c == b'v').count();
         if v_count > 0 && v_count == rest.len() {
-            return (v_count as u8).min(3);
+            return ((v_count as u8).min(3), false);
         }
     }
-    0
+    (0, false)
 }
 
 /// Main entry point for ps builtin
 pub fn run(args: &[u8]) -> CommandResult {
-    let verbosity = parse_verbosity(args);
+    let (verbosity, reset) = parse_flags(args);
+
+    if reset {
+        syscall::reset_stats(0);
+    }
 
     if verbosity == 0 {
         return CommandResult::Table(run_basic());
@@ -53,12 +92,12 @@ pub fn run(args: &[u8]) -> CommandResult {
     CommandResult::Table(run_extended(verbosity))
 }
 
-/// Basic ps (unchanged 7-column output)
+/// Basic ps with IDLE column
 fn run_basic() -> Table {
     let mut buf: [syscall::ProcessInfo; 32] = [syscall::ProcessInfo::empty(); 32];
     let count = syscall::ps_info(&mut buf);
 
-    let mut table = Table::new(&["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME"])
+    let mut table = Table::new(&["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "IDLE", "NAME"])
         .align(0, Align::Right)   // PID
         .align(1, Align::Right)   // PPID
         .align(2, Align::Right)   // CPU
@@ -87,6 +126,7 @@ fn run_basic() -> Table {
         row = row
             .str(info.state_str())
             .uint(cpu_ms)
+            .str(idle_str(info.activity_age_ms))
             .bytes(&info.name);
 
         table.add_row(row);
@@ -102,34 +142,36 @@ fn run_extended(verbosity: u8) -> Table {
 
     // Build headers based on verbosity
     let headers: &[&'static str] = match verbosity {
-        1 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG"],
-        2 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "SENT", "RECV", "PAGES", "MAPS"],
-        _ => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "SENT", "RECV", "PAGES", "MAPS", "KIDS", "CAPS"],
+        1 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "IDLE", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "LIVE"],
+        2 => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "IDLE", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "LIVE", "SENT", "RECV", "CSW", "PF", "PAGES", "MAPS"],
+        _ => &["PID", "PPID", "CPU", "PRIO", "STATE", "CPU_MS", "IDLE", "NAME", "HNDL", "CH", "PORT", "SHMEM", "SIG", "LIVE", "SENT", "RECV", "CSW", "PF", "PAGES", "MAPS", "KIDS", "CAPS"],
     };
 
-    let mut table = Table::new(headers)
+    let table = Table::new(headers)
         .align(0, Align::Right)   // PID
         .align(1, Align::Right)   // PPID
         .align(2, Align::Right)   // CPU
         .align(5, Align::Right)   // CPU_MS
-        .align(7, Align::Right)   // HNDL
-        .align(8, Align::Right)   // CH
-        .align(9, Align::Right)   // PORT
-        .align(10, Align::Right)  // SHMEM
-        .align(11, Align::Right); // SIG
+        .align(8, Align::Right)   // HNDL
+        .align(9, Align::Right)   // CH
+        .align(10, Align::Right)  // PORT
+        .align(11, Align::Right)  // SHMEM
+        .align(12, Align::Right); // SIG
 
     let table = if verbosity >= 2 {
         table
-            .align(12, Align::Right)  // SENT
-            .align(13, Align::Right)  // RECV
-            .align(14, Align::Right)  // PAGES
-            .align(15, Align::Right)  // MAPS
+            .align(14, Align::Right)  // SENT
+            .align(15, Align::Right)  // RECV
+            .align(16, Align::Right)  // CSW
+            .align(17, Align::Right)  // PF
+            .align(18, Align::Right)  // PAGES
+            .align(19, Align::Right)  // MAPS
     } else {
         table
     };
 
     let mut table = if verbosity >= 3 {
-        table.align(16, Align::Right) // KIDS
+        table.align(20, Align::Right) // KIDS
     } else {
         table
     };
@@ -157,21 +199,25 @@ fn run_extended(verbosity: u8) -> Table {
         row = row
             .str(info.state_str())
             .uint(cpu_ms)
+            .str(idle_str(info.activity_age_ms))
             .bytes(&info.name);
 
-        // -v: handles, channels, ports, shmem, signal pending
+        // -v: handles, channels, ports, shmem, signal pending, liveness
         row = row
             .uint(info.handle_count as u64)
             .uint(info.channel_count as u64)
             .uint(info.port_count as u64)
             .uint(info.shmem_count as u64)
-            .uint(info.signal_pending as u64);
+            .uint(info.signal_pending as u64)
+            .str(liveness_str(info.liveness_status));
 
-        // -vv: IPC stats, pages, mappings
+        // -vv: IPC stats, context switches, page faults, pages, mappings
         if verbosity >= 2 {
             row = row
                 .uint(info.ipc_sent as u64)
                 .uint(info.ipc_recv as u64)
+                .uint(info.context_switches as u64)
+                .uint(info.page_faults as u64)
                 .uint(info.heap_pages as u64)
                 .uint(info.mapping_count as u64);
         }

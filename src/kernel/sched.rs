@@ -277,6 +277,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
             // Extract and update per-CPU data while we have the lock
             if let Some(next) = sched.task_mut(next_slot) {
                 next.mark_scheduled(now);
+                next.context_switches = next.context_switches.saturating_add(1);
                 crate::transition_or_evict!(next, set_running, cpu);
 
                 // Update trap frame pointer
@@ -339,6 +340,7 @@ fn reschedule_inner(block: BlockReason) -> bool {
             Some(t) => {
                 // Prepare target state while holding lock
                 t.mark_scheduled(now);
+                t.context_switches = t.context_switches.saturating_add(1);
                 crate::transition_or_evict!(t, set_running, cpu);
                 t.mark_context_restored();
                 // Clear any stale kernel_stack_owner from previous switch.

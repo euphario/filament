@@ -49,6 +49,9 @@ pub mod syscall {
     pub const PS_INFO_EX: u64 = 79;
     pub const SIGNAL: u64 = 80;
     pub const SYSINFO: u64 = 81;
+    pub const SIGNAL_PEEK: u64 = 82;
+    pub const SIGNAL_FLUSH: u64 = 83;
+    pub const RESET_STATS: u64 = 84;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;
@@ -222,12 +225,16 @@ pub struct ProcessInfoEx {
     pub mapping_count: u8,      // 48
     pub num_children: u8,       // 49
     pub signal_pending: u8,     // 50
-    pub _pad: u8,               // 51
+    pub liveness_status: u8,    // 51
     pub ipc_sent: u16,          // 52
     pub ipc_recv: u16,          // 54
     pub capabilities: u64,      // 56
+    pub activity_age_ms: u32,   // 64
+    pub context_switches: u32,  // 68
+    pub page_faults: u32,       // 72
+    pub _pad2: u32,             // 76
 }
-// Total: 64 bytes
+// Total: 80 bytes
 
 impl ProcessInfoEx {
     pub const fn empty() -> Self {
@@ -248,10 +255,14 @@ impl ProcessInfoEx {
             mapping_count: 0,
             num_children: 0,
             signal_pending: 0,
-            _pad: 0,
+            liveness_status: 0,
             ipc_sent: 0,
             ipc_recv: 0,
             capabilities: 0,
+            activity_age_ms: 0,
+            context_switches: 0,
+            page_faults: 0,
+            _pad2: 0,
         }
     }
 
@@ -1308,7 +1319,7 @@ const _: () = assert!(core::mem::size_of::<RamfsListEntry>() == 120);
 // ============================================================================
 
 const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 48);
-const _: () = assert!(core::mem::size_of::<ProcessInfoEx>() == 64);
+const _: () = assert!(core::mem::size_of::<ProcessInfoEx>() == 80);
 const _: () = assert!(core::mem::size_of::<MuxEvent>() == 16);
 const _: () = assert!(core::mem::size_of::<PciEnumEntry>() == 32);
 const _: () = assert!(core::mem::size_of::<BusInfo>() == 48);

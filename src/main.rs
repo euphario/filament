@@ -651,6 +651,8 @@ fn try_demand_page(far: u64) -> bool {
         let asid = task.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
         kernel::arch::tlb::invalidate_va_range(asid, page_virt, 1);
 
+        task.page_faults = task.page_faults.saturating_add(1);
+
         Some(())
     })
     .is_some()

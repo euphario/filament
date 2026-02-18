@@ -7,7 +7,7 @@ use core::arch::asm;
 use crate::error::{SysError, SysResult};
 
 // Re-export types from abi crate for convenience
-pub use abi::{ProcessInfo, ProcessInfoEx, SysInfo, ObjectType, Handle, LogLevel, PciEnumEntry};
+pub use abi::{ProcessInfo, ProcessInfoEx, SysInfo, ObjectType, Handle, LogLevel, PciEnumEntry, PendingSignal};
 pub use abi::{syscall as syscall_num, log_level, liveness_status, prot, errno};
 
 // Local aliases for syscall numbers (shorter names for internal use)
@@ -208,6 +208,21 @@ pub fn kill(pid: u32) -> i64 {
 /// Send an async signal to another task
 pub fn signal(target_pid: u32, event: u32, value: u64) -> i64 {
     syscall3(sys::SIGNAL, target_pid as u64, event as u64, value)
+}
+
+/// Peek at pending signals for a target process (non-consuming)
+pub fn signal_peek(pid: u32, buf: &mut [abi::PendingSignal]) -> i64 {
+    syscall3(sys::SIGNAL_PEEK, pid as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+
+/// Flush (clear) all pending signals for a target process
+pub fn signal_flush(pid: u32) -> i64 {
+    syscall1(sys::SIGNAL_FLUSH, pid as u64)
+}
+
+/// Reset per-task statistics counters (0 = all tasks)
+pub fn reset_stats(pid: u32) -> i64 {
+    syscall1(sys::RESET_STATS, pid as u64)
 }
 
 // ============================================================================

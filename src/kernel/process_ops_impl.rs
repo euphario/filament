@@ -235,6 +235,7 @@ impl ProcessOps for KernelProcessOps {
         // Pass 1: Fill all TCB fields under scheduler lock
         count = task::with_scheduler(|sched| {
             let mut i = 0usize;
+            let current_tick = crate::platform::current::timer::counter();
 
             for (slot, task_opt) in sched.iter_tasks() {
                 if crate::kernel::sched::is_idle_slot(slot) {
@@ -262,10 +263,14 @@ impl ProcessOps for KernelProcessOps {
                         mapping_count: task.mapping_count(),
                         num_children: task.num_children as u8,
                         signal_pending: task.signal_count,
-                        _pad: 0,
+                        liveness_status: task.get_liveness_status_code(),
                         ipc_sent: task.ipc_sent.min(u16::MAX as u32) as u16,
                         ipc_recv: task.ipc_recv.min(u16::MAX as u32) as u16,
                         capabilities: task.get_capabilities_bits(),
+                        activity_age_ms: task.get_activity_age_ms(current_tick),
+                        context_switches: task.context_switches,
+                        page_faults: task.page_faults,
+                        _pad2: 0,
                     };
                     i += 1;
                 }
