@@ -962,6 +962,9 @@ exception_from_user:
     mrs     x2, far_el1             // Fault Address Register
     bl      exception_from_user_rust
 
+    /* Check return value: 0 = demand page handled, resume current task */
+    cbz     x0, .Lfault_resume
+
     /* Rust handler terminates the task and schedules next.
      * Reload trap frame from per-CPU data (now points to next task). */
     mrs     x10, tpidr_el1
@@ -1013,6 +1016,45 @@ exception_from_user:
     ldr     x9, [x9, #72]
 
     /* Return to next task */
+    eret
+
+/*
+ * Demand page handled — resume current task by restoring from its trap frame.
+ * Per-CPU data still points to the faulting task; the page is now mapped.
+ */
+.Lfault_resume:
+    mrs     x10, tpidr_el1
+    ldr     x9, [x10, #CPUDATA_TRAP_FRAME]
+
+    /* Restore special registers */
+    ldr     x10, [x9, #248]
+    ldr     x11, [x9, #256]
+    ldr     x12, [x9, #264]
+    msr     sp_el0, x10
+    msr     elr_el1, x11
+    msr     spsr_el1, x12
+
+    /* Restore all general purpose registers */
+    ldp     x0, x1, [x9, #0]
+    ldp     x2, x3, [x9, #16]
+    ldp     x4, x5, [x9, #32]
+    ldp     x6, x7, [x9, #48]
+    ldr     x8, [x9, #64]
+    ldr     x10, [x9, #80]
+    ldr     x11, [x9, #88]
+    ldp     x12, x13, [x9, #96]
+    ldp     x14, x15, [x9, #112]
+    ldp     x16, x17, [x9, #128]
+    ldp     x18, x19, [x9, #144]
+    ldp     x20, x21, [x9, #160]
+    ldp     x22, x23, [x9, #176]
+    ldp     x24, x25, [x9, #192]
+    ldp     x26, x27, [x9, #208]
+    ldp     x28, x29, [x9, #224]
+    ldr     x30, [x9, #240]
+    ldr     x9, [x9, #72]
+
+    /* Resume faulting instruction (page now mapped) */
     eret
 
 /*

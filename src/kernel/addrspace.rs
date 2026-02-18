@@ -598,6 +598,13 @@ impl AddressSpace {
         self.asid
     }
 
+    /// Translate a virtual address to its physical address.
+    /// Returns the physical page address + page offset, or None if not mapped.
+    pub fn translate(&self, virt_addr: u64) -> Option<u64> {
+        let page_offset = virt_addr & 0xFFF;
+        self.dump_pte(virt_addr).map(|(_, _, _, phys_page)| phys_page + page_offset)
+    }
+
     /// Debug: Dump PTE for a given virtual address
     /// Returns (l1_entry, l2_entry, l3_entry, phys_addr) or None if not mapped
     pub fn dump_pte(&self, virt_addr: u64) -> Option<(u64, u64, u64, u64)> {

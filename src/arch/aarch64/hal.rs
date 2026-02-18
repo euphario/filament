@@ -20,7 +20,32 @@ impl Aarch64Cpu {
 impl Cpu for Aarch64Cpu {
     #[inline]
     fn idle(&self) {
-        unsafe { core::arch::asm!("wfi") }
+        // PSCI CPU_SUSPEND: power_state=0 (standby), entry=0, context=0
+        // Standby preserves CPU state, wakes on any interrupt.
+        // Falls back to WFI if PSCI returns NOT_SUPPORTED.
+        unsafe {
+            let ret: u64;
+            #[cfg(feature = "platform-qemu-virt")]
+            core::arch::asm!(
+                "hvc #0",
+                inout("x0") 0x84000001u64 => ret,  // CPU_SUSPEND
+                in("x1") 0u64,           // power_state = standby
+                in("x2") 0u64,           // entry (ignored for standby)
+                in("x3") 0u64,           // context_id
+            );
+            #[cfg(feature = "platform-mt7988a")]
+            core::arch::asm!(
+                "smc #0",
+                inout("x0") 0x84000001u64 => ret,  // CPU_SUSPEND
+                in("x1") 0u64,           // power_state = standby
+                in("x2") 0u64,           // entry (ignored for standby)
+                in("x3") 0u64,           // context_id
+            );
+            // If PSCI returned error (e.g. NOT_SUPPORTED), fall back to WFI
+            if ret != 0 {
+                core::arch::asm!("wfi");
+            }
+        }
     }
 
     #[inline]

@@ -213,6 +213,9 @@ pub extern "C" fn kmain() -> ! {
         timer::init();
     }
 
+    // PRNG (seeded from hardware timer counter, used for ASLR)
+    kernel::rng::init();
+
     // SMP
     {
         let _span = span!("smp", "init");
@@ -605,10 +608,74 @@ fn enter_idle_with_correct_stack(cpu: u32) -> ! {
     }
 }
 
+/// Try to handle a page fault via demand paging.
+/// Returns true if the fault was handled (a page was mapped and the instruction can retry).
+fn try_demand_page(far: u64) -> bool {
+    use kernel::memory::MappingKind;
+
+    let slot = kernel::task::current_slot();
+
+    task::with_scheduler(|sched| {
+        let task = sched.task_mut(slot)?;
+
+        // Verify the faulting address falls within a LazyAnon mapping
+        if !task.heap_mappings.iter().any(|m| {
+            m.kind == MappingKind::LazyAnon && m.contains(far)
+        }) {
+            return None;
+        }
+
+        // Calculate which page within the mapping was faulted
+        let page_virt = far & !0xFFF;
+
+        // Allocate one physical page
+        let page_phys = pmm::alloc_page()? as u64;
+
+        // Zero the page via kernel virtual address
+        unsafe {
+            let kva = mmu::phys_to_virt(page_phys) as *mut u8;
+            for i in 0..4096usize {
+                core::ptr::write_volatile(kva.add(i), 0);
+            }
+            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+
+        // Map the page in the task's address space (writable, non-executable)
+        let addr_space = task.address_space.as_mut()?;
+        if !addr_space.map_page(page_virt, page_phys, true, false) {
+            pmm::free_pages(page_phys as usize, 1);
+            return None;
+        }
+
+        // TLB invalidate for the new mapping
+        let asid = task.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
+        kernel::arch::tlb::invalidate_va_range(asid, page_virt, 1);
+
+        Some(())
+    })
+    .is_some()
+}
+
 /// Exception from user mode - terminate task and switch to next
 /// Called from assembly when a userspace task faults (page fault, illegal instruction, etc.)
+/// Returns 0 if fault was handled (demand page — resume task), non-zero to kill task.
 #[no_mangle]
-pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
+pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 {
+    let ec = (esr >> 26) & 0x3F;
+    let dfsc = esr & 0x3F;
+
+    // Data Abort from lower EL with translation fault (level 0-3)?
+    // EC=0x24 (Data Abort from EL0), DFSC=0x04..0x07 (translation fault L0-L3)
+    if ec == 0x24 && dfsc >= 0x04 && dfsc <= 0x07 {
+        if try_demand_page(far) {
+            return 0; // Handled — assembly will ERET to retry
+        }
+    }
+
+    // Instruction Abort from lower EL with translation fault?
+    // EC=0x20, DFSC=0x04..0x07 — could be demand-paged code, but we don't
+    // lazy-map executable pages, so fall through to kill.
+
     // Flush any buffered UART output first
     while uart::has_buffered_output() {
         uart::flush_buffer();
@@ -878,12 +945,12 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
         }
     }
 
-    // Debug: Print expected stack range
-    print_str_uart("  Expected stack: 0x7FFC0000-0x80000000 (256KB)\r\n");
-    if sp_el0 < 0x7FFC0000 || sp_el0 > 0x80000000 {
+    // Debug: Print expected stack range (with ASLR jitter up to 64KB)
+    print_str_uart("  Expected stack: ~0x7FFB0000-0x80000000 (256KB + jitter)\r\n");
+    if sp_el0 < 0x7FFB0000 || sp_el0 > 0x80000000 {
         print_str_uart("  WARNING: SP_EL0 outside expected stack range!\r\n");
     }
-    if far < 0x7FFC0000 || far > 0x80000000 {
+    if far < 0x7FFB0000 || far > 0x80000000 {
         print_str_uart("  WARNING: FAR outside expected stack range!\r\n");
     } else {
         print_str_uart("  FAR is within stack range - page table issue?\r\n");
@@ -978,7 +1045,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
                 }
 
                 print_str_uart("  Recovery complete, continuing.\r\n");
-                return;  // Return to assembly, will eret to new devd
+                return 1;  // Return to assembly, will eret to new devd
             }
             Err(e) => {
                 print_str_uart("  FATAL: Failed to respawn devd: ");
@@ -1132,6 +1199,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) {
             }
         }
     }
+
+    1 // Non-zero: task was killed, assembly switches to next task
 }
 
 /// Exception handler called from assembly (kernel mode - fatal)

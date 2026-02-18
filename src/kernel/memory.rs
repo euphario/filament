@@ -43,6 +43,9 @@ pub enum MappingKind {
     BorrowedShmem,
     /// Device MMIO mapped via mmap_device() - not RAM, never free
     DeviceMmio,
+    /// Lazy anonymous — virtual region reserved, no physical page yet.
+    /// Physical pages allocated on demand via page fault handler.
+    LazyAnon,
 }
 
 /// A single heap mapping entry
@@ -70,6 +73,11 @@ impl HeapMapping {
 
     pub fn is_empty(&self) -> bool {
         self.num_pages == 0
+    }
+
+    /// Returns true if the given virtual address falls within this mapping.
+    pub fn contains(&self, addr: u64) -> bool {
+        addr >= self.virt_addr && addr < self.virt_addr + (self.num_pages as u64) * 4096
     }
 
     /// Returns true if this mapping owns its physical pages (should free on unmap)

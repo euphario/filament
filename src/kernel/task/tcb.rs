@@ -1392,6 +1392,35 @@ impl Task {
     // Legacy Mapping Functions
     // ========================================================================
 
+    /// Reserve a virtual region without allocating physical pages.
+    /// Pages are allocated on demand when accessed (page fault handler).
+    pub fn mmap_lazy(&mut self, size: usize) -> Option<u64> {
+        let num_pages = size.checked_add(4095)? / 4096;
+        if num_pages == 0 {
+            return None;
+        }
+
+        let slot = self.heap_mappings.iter().position(|m| m.is_empty())?;
+
+        let virt_addr = self.heap_next;
+        let mapping_size = num_pages.checked_mul(4096)? as u64;
+        let end_addr = virt_addr.checked_add(mapping_size)?;
+        if end_addr > USER_HEAP_END {
+            return None;
+        }
+
+        // No physical allocation — pages filled in by fault handler
+        self.heap_mappings[slot] = HeapMapping {
+            virt_addr,
+            phys_addr: 0,
+            num_pages,
+            kind: MappingKind::LazyAnon,
+        };
+
+        self.heap_next = virt_addr + mapping_size;
+        Some(virt_addr)
+    }
+
     #[inline]
     pub fn mmap(&mut self, size: usize, writable: bool, executable: bool) -> Option<u64> {
         self.map_region(
@@ -1485,9 +1514,21 @@ impl Task {
         let mapping = self.heap_mappings[slot];
 
         if let Some(ref mut addr_space) = self.address_space {
-            for i in 0..mapping.num_pages {
-                let page_virt = mapping.virt_addr + (i * 4096) as u64;
-                addr_space.unmap_page(page_virt);
+            if mapping.kind == MappingKind::LazyAnon {
+                // Demand-paged: free each individually-allocated page
+                for i in 0..mapping.num_pages {
+                    let page_virt = mapping.virt_addr + (i * 4096) as u64;
+                    if let Some(phys) = addr_space.translate(page_virt) {
+                        let page_phys = phys & !0xFFF;
+                        pmm::free_page(page_phys as usize);
+                    }
+                    addr_space.unmap_page(page_virt);
+                }
+            } else {
+                for i in 0..mapping.num_pages {
+                    let page_virt = mapping.virt_addr + (i * 4096) as u64;
+                    addr_space.unmap_page(page_virt);
+                }
             }
         }
 
@@ -1508,7 +1549,21 @@ impl Task {
 impl Drop for Task {
     fn drop(&mut self) {
         for mapping in &self.heap_mappings {
-            if !mapping.is_empty() && mapping.owns_pages() {
+            if mapping.is_empty() {
+                continue;
+            }
+            if mapping.kind == MappingKind::LazyAnon {
+                // Demand-paged: walk each page and free if mapped
+                if let Some(ref addr_space) = self.address_space {
+                    for i in 0..mapping.num_pages {
+                        let vaddr = mapping.virt_addr + (i * 4096) as u64;
+                        if let Some(phys) = addr_space.translate(vaddr) {
+                            let page_phys = phys & !0xFFF;
+                            pmm::free_page(page_phys as usize);
+                        }
+                    }
+                }
+            } else if mapping.owns_pages() {
                 pmm::free_pages(mapping.phys_addr as usize, mapping.num_pages);
             }
         }

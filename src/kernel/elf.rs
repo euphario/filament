@@ -30,11 +30,30 @@ pub const EM_AARCH64: u16 = 183;
 
 /// Program header type: loadable segment
 pub const PT_LOAD: u32 = 1;
+/// Program header type: dynamic linking info
+pub const PT_DYNAMIC: u32 = 2;
 
 /// Segment flags
 pub const PF_X: u32 = 1;  // Executable
 pub const PF_W: u32 = 2;  // Writable
 pub const PF_R: u32 = 4;  // Readable
+
+/// Dynamic section entry tags
+pub const DT_NULL: u64 = 0;
+pub const DT_RELA: u64 = 7;
+pub const DT_RELASZ: u64 = 8;
+
+/// AArch64 relocation type: R_AARCH64_RELATIVE (value = base + addend)
+pub const R_AARCH64_RELATIVE: u32 = 0x403;
+
+/// ELF64 Rela entry (relocation with addend)
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct Elf64Rela {
+    pub r_offset: u64,
+    pub r_info: u64,
+    pub r_addend: i64,
+}
 
 /// ELF64 file header
 #[repr(C, packed)]
@@ -243,6 +262,10 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
     let header = validate_header(data)?;
     let phdrs = get_program_headers(data, header)?;
 
+    // No PIE relocation — binaries are linked at fixed USER_BASE.
+    // ASLR is applied via stack jitter and heap jitter instead.
+    let load_offset: u64 = 0;
+
     let mut segments_loaded = 0;
     let mut base_addr: Option<u64> = None;
 
@@ -253,7 +276,7 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
             continue;
         }
 
-        let vaddr = phdr.p_vaddr;
+        let vaddr = phdr.p_vaddr + load_offset;
         let memsz = phdr.p_memsz as usize;
         let filesz = phdr.p_filesz as usize;
         let offset = phdr.p_offset as usize;
@@ -395,11 +418,130 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
         return Err(ElfError::InvalidSegment);
     }
 
+    // Apply load offset to entry point for PIE
+    let final_entry = entry + load_offset;
+
     Ok(ElfInfo {
-        entry,
+        entry: final_entry,
         base: base_addr.unwrap_or(0),
         segments_loaded,
     })
+}
+
+/// Process R_AARCH64_RELATIVE relocations for PIE binaries.
+///
+/// Finds the PT_DYNAMIC segment, extracts DT_RELA/DT_RELASZ entries,
+/// and applies R_AARCH64_RELATIVE relocations (value = load_offset + addend).
+fn process_relocations(
+    data: &[u8],
+    phdrs: &[Elf64ProgramHeader],
+    load_offset: u64,
+    addr_space: &mut AddressSpace,
+) -> Result<(), ElfError> {
+    // Find PT_DYNAMIC segment
+    let dyn_phdr = phdrs.iter().find(|p| p.p_type == PT_DYNAMIC);
+    let dyn_phdr = match dyn_phdr {
+        Some(p) => p,
+        None => return Ok(()), // No dynamic section — static PIE with no relocations
+    };
+
+    let dyn_offset = dyn_phdr.p_offset as usize;
+    let dyn_size = dyn_phdr.p_filesz as usize;
+    if dyn_offset.checked_add(dyn_size).map_or(true, |end| end > data.len()) {
+        return Err(ElfError::InvalidSegment);
+    }
+
+    // Parse dynamic entries to find DT_RELA and DT_RELASZ
+    let entry_size = 16usize; // sizeof(Elf64_Dyn) = 2 * u64
+    let mut rela_offset: Option<u64> = None;
+    let mut rela_size: u64 = 0;
+
+    let mut i = 0;
+    while i + entry_size <= dyn_size {
+        let base = dyn_offset + i;
+        let d_tag = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
+        let d_val = u64::from_le_bytes(data[base + 8..base + 16].try_into().unwrap());
+
+        match d_tag {
+            DT_NULL => break,
+            DT_RELA => rela_offset = Some(d_val),
+            DT_RELASZ => rela_size = d_val,
+            _ => {}
+        }
+        i += entry_size;
+    }
+
+    // Apply relocations
+    let rela_vaddr = match rela_offset {
+        Some(v) => v,
+        None => return Ok(()), // No RELA section
+    };
+
+    if rela_size == 0 {
+        return Ok(());
+    }
+
+    // Find the rela data in the ELF file by mapping vaddr back to file offset
+    let rela_file_offset = vaddr_to_file_offset(phdrs, rela_vaddr)
+        .ok_or(ElfError::InvalidSegment)?;
+    let rela_end = rela_file_offset.checked_add(rela_size as usize)
+        .ok_or(ElfError::InvalidSegment)?;
+    if rela_end > data.len() {
+        return Err(ElfError::InvalidSegment);
+    }
+
+    let rela_entry_size = core::mem::size_of::<Elf64Rela>();
+    let num_relas = rela_size as usize / rela_entry_size;
+
+    for idx in 0..num_relas {
+        let offset = rela_file_offset + idx * rela_entry_size;
+        let rela = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Rela) };
+
+        let r_offset = rela.r_offset;
+        let r_info = rela.r_info;
+        let r_addend = rela.r_addend;
+        let r_type = (r_info & 0xFFFF_FFFF) as u32;
+
+        if r_type != R_AARCH64_RELATIVE {
+            continue; // Skip non-relative relocations
+        }
+
+        // Target virtual address (with load offset applied)
+        let target_vaddr = r_offset + load_offset;
+        // Value to write: load_offset + addend
+        let value = (load_offset as i64 + r_addend) as u64;
+
+        // Write via kernel virtual address: walk page tables to find physical page
+        if let Some(phys) = addr_space.translate(target_vaddr) {
+            let kva = mmu::phys_to_virt(phys);
+            unsafe {
+                core::ptr::write_volatile(kva as *mut u64, value);
+            }
+        }
+    }
+
+    // Ensure relocation writes are visible
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+
+    Ok(())
+}
+
+/// Map a virtual address back to a file offset using PT_LOAD segments.
+fn vaddr_to_file_offset(phdrs: &[Elf64ProgramHeader], vaddr: u64) -> Option<usize> {
+    for phdr in phdrs {
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+        let seg_start = phdr.p_vaddr;
+        let seg_end = seg_start + phdr.p_filesz;
+        if vaddr >= seg_start && vaddr < seg_end {
+            let offset_in_seg = vaddr - seg_start;
+            return Some((phdr.p_offset + offset_in_seg) as usize);
+        }
+    }
+    None
 }
 
 /// Print ELF header info
@@ -521,7 +663,7 @@ fn spawn_from_elf_internal(
     };
 
     // Load ELF into the task's address space
-    let elf_info = {
+    let (elf_info, stack_top) = {
         let task = sched.task_mut(slot).ok_or_else(|| {
             pmm::free_pages(stack_phys, stack_pages);
             ElfError::OutOfMemory
@@ -547,14 +689,19 @@ fn spawn_from_elf_internal(
             }
         }
 
+        // ASLR: randomize stack top (up to 64KB jitter, page-aligned so mapped pages
+        // cover the full stack region including the top page where SP starts)
+        let stack_jitter = super::rng::random_offset(16 * 4096, 4096);
+        let stack_top = USER_STACK_TOP - stack_jitter;
+
         // Map user stack with guard page below
         // Layout (addresses grow up):
         //   [guard page - NOT MAPPED - will fault on access]  <- catches stack overflow
         //   [usable stack pages]
-        //   [USER_STACK_TOP - 1]  <- initial SP points here
+        //   [stack_top - 1]  <- initial SP points here
         //
         // Guard page virtual address (not mapped - any access faults)
-        let guard_page_virt = USER_STACK_TOP - USER_STACK_SIZE as u64 - USER_GUARD_PAGE_SIZE as u64;
+        let guard_page_virt = stack_top - USER_STACK_SIZE as u64 - USER_GUARD_PAGE_SIZE as u64;
         let stack_base_virt = guard_page_virt + USER_GUARD_PAGE_SIZE as u64;
 
         // Only map the usable stack pages (guard page left unmapped)
@@ -569,13 +716,17 @@ fn spawn_from_elf_internal(
         // Note: guard_page_virt is intentionally NOT mapped
         // Any stack overflow that reaches it will trigger a page fault
 
-        info
+        (info, stack_top)
     };
 
     // Set up the trap frame with entry point and user stack
     {
         let task = sched.task_mut(slot).ok_or(ElfError::OutOfMemory)?;
-        task.set_user_entry(elf_info.entry, USER_STACK_TOP);
+        task.set_user_entry(elf_info.entry, stack_top);
+
+        // ASLR: randomize heap start (up to 1MB jitter, page-aligned)
+        let heap_jitter = super::rng::random_offset(256 * 4096, 4096);
+        task.heap_next = super::memory::USER_HEAP_START + heap_jitter;
 
         // Set parent if specified
         if parent_id != 0 {

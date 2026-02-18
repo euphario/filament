@@ -2,9 +2,8 @@
 
 ENTRY(_start)
 
-/* User programs load at 0x40010000 by default */
-/* Override with --defsym=USER_BASE=0xADDRESS if needed */
-USER_BASE = DEFINED(USER_BASE) ? USER_BASE : 0x40010000;
+/* PIE: base at 0, kernel ELF loader applies random offset at load time */
+USER_BASE = 0;
 
 SECTIONS {
     . = USER_BASE;

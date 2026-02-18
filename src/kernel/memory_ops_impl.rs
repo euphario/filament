@@ -43,10 +43,16 @@ impl MemoryOps for KernelMemoryOps {
             let task = sched.task_mut(slot)
                 .ok_or(MemoryError::NoTask)?;
 
-            // Use task's mmap method for anonymous memory
-            // The task method handles page allocation and mapping
-            task.mmap(size, writable, executable)
-                .ok_or(MemoryError::OutOfMemory)
+            // Demand paging: non-executable anonymous mappings are lazy
+            // (physical pages allocated on first access via page fault).
+            // Executable mappings need immediate allocation (code must be present).
+            if executable {
+                task.mmap(size, writable, executable)
+                    .ok_or(MemoryError::OutOfMemory)
+            } else {
+                task.mmap_lazy(size)
+                    .ok_or(MemoryError::OutOfMemory)
+            }
         })
     }
 
