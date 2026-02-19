@@ -3974,6 +3974,7 @@ impl Devd {
             // SuperQ serialization: only one command in-flight per driver.
             // If the relay driver already has a pending SpawnChild, defer this rule.
             if self.has_inflight_superq_spawn(relay_idx) {
+                uwarn!("devd", "spawn_deferred_inflight"; relay = relay_idx as u32, port_id = port_id as u32);
                 self.defer_rule_fire(port_id, owner_idx);
                 return;
             }

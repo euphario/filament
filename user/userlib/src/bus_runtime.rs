@@ -559,6 +559,33 @@ impl RuntimeCtx {
             }
         }
     }
+
+
+    /// Remove all children whose trigger port matches `port_name`.
+    fn remove_children_for_port(&mut self, port_name: &[u8]) {
+        for i in 0..MAX_CHILDREN {
+            let matches = self.children[i].as_ref().map(|e| {
+                let n = &e.ctx.port_name[..e.ctx.port_name_len as usize];
+                n == port_name
+            }).unwrap_or(false);
+            if matches {
+                self.drop_child_entry(i);
+            }
+        }
+    }
+
+    /// Clean up a child entry: unwatch SuperQ from Mux and drop.
+    fn drop_child_entry(&mut self, child_idx: usize) {
+        if let Some(entry) = &self.children[child_idx] {
+            if let Some(ref superq) = entry.superq {
+                let h = superq.handle();
+                let _ = self.mux.remove(h);
+                self.handles.remove(h);
+            }
+        }
+        self.children[child_idx] = None;
+        if self.child_count > 0 { self.child_count -= 1; }
+    }
 }
 
 impl BusCtx for RuntimeCtx {
@@ -822,6 +849,14 @@ impl BusCtx for RuntimeCtx {
         name: &[u8],
         state: abi::PortState,
     ) -> Result<(), BusError> {
+        // Port going Safe: remove children spawned for this port.
+        // The EXIT note hasn't arrived yet (microtask delay), so the stale
+        // child entry would cause the next ADDRESSED SpawnChild to be
+        // forwarded to the dead child's SuperQ instead of handled locally.
+        if state == abi::PortState::Safe {
+            self.remove_children_for_port(name);
+        }
+
         self.devd
             .set_port_state(name, state)
             .map_err(|_| BusError::Internal)
@@ -910,6 +945,7 @@ impl BusCtx for RuntimeCtx {
         self.devd.register_mount(prefix, shmem_id)
             .map_err(|_| BusError::Internal)
     }
+
 }
 
 // ============================================================================
@@ -2247,17 +2283,7 @@ impl<D: Driver> DriverRuntime<D> {
 
         syscall::klog(LogLevel::Info, b"[bus] child exited");
 
-        // Remove SuperQ handle from Mux before dropping the entry
-        if let Some(entry) = &self.ctx.children[child_idx] {
-            if let Some(ref superq) = entry.superq {
-                let h = superq.handle();
-                let _ = self.ctx.mux.remove(h);
-                self.ctx.handles.remove(h);
-            }
-        }
-
-        self.ctx.children[child_idx] = None;
-        if self.ctx.child_count > 0 { self.ctx.child_count -= 1; }
+        self.ctx.drop_child_entry(child_idx);
 
         // Implicit EOL: set eol_mask bit for this child on all pending queries
         let child_bit = 1u8 << child_idx;
@@ -2282,6 +2308,11 @@ impl<D: Driver> DriverRuntime<D> {
     /// Reads FORWARD notes from our SupervisionChild handle and dispatches
     /// as raw commands (SpawnChild, ConfigGet, etc).
     fn handle_parent_superq_command(&mut self) {
+        // Drain pending EXIT notes from all children BEFORE processing parent
+        // commands. This prevents try_forward_spawn_to_child from forwarding
+        // a SpawnChild to a dead child whose EXIT note hasn't been processed yet.
+        self.drain_child_superq_exits();
+
         let mut raw_buf = [0u8; 512];
         // Drain all available commands from parent
         loop {
@@ -2297,11 +2328,32 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
+    /// Drain pending EXIT notes from all child SuperQs.
     ///
-    /// Reads all pending FORWARD notes from the child's SuperQ and dispatches
-    /// them based on the query protocol msg_type in the payload.
+    /// Only peeks for EXIT notes — if a FORWARD note is found, it's left
+    /// for the normal handle_child_superq_event path by re-processing it here.
+    fn drain_child_superq_exits(&mut self) {
+        for child_idx in 0..MAX_CHILDREN {
+            // Only check children that exist and have a SuperQ
+            let has_superq = self.ctx.children[child_idx]
+                .as_ref()
+                .map(|e| e.superq.is_some())
+                .unwrap_or(false);
+            if !has_superq { continue; }
+
+            // Delegate to the full handler which now detects EXIT notes
+            self.handle_child_superq_event(child_idx);
+        }
+    }
+
+    ///
+    /// Reads all pending notes from the child's SuperQ and dispatches
+    /// FORWARD notes based on the query protocol msg_type in the payload.
+    /// EXIT notes trigger child cleanup via handle_child_exit().
     fn handle_child_superq_event(&mut self, child_idx: usize) {
-        // Drain all available notes from this child's SuperQ
+        // Drain all available notes from this child's SuperQ.
+        // Use try_recv() instead of recv_forward() so we see EXIT notes
+        // (recv_forward silently drops non-FORWARD notes).
         loop {
             let superq = match &self.ctx.children[child_idx] {
                 Some(entry) => match &entry.superq {
@@ -2311,12 +2363,48 @@ impl<D: Driver> DriverRuntime<D> {
                 None => return,
             };
 
-            let mut payload_buf = [0u8; 576];
-            let len = match superq.recv_forward(&mut payload_buf) {
+            let note = match superq.try_recv() {
                 Ok(Some(n)) => n,
                 Ok(None) => break, // No more notes
                 Err(_) => break,
             };
+
+            // EXIT note: child died — clean up entry and stop draining
+            if note.note_type == abi::supervision_note::EXIT {
+                let pid = self.ctx.children[child_idx]
+                    .as_ref().map(|e| e.pid).unwrap_or(0);
+                self.handle_child_exit(pid);
+                return;
+            }
+
+            // Only process FORWARD notes (skip unknown types)
+            if note.note_type != abi::supervision_note::FORWARD {
+                continue;
+            }
+
+            // Reassemble FORWARD payload
+            let mut payload_buf = [0u8; 576];
+            let chunk_len = (note.len as usize).min(120).min(payload_buf.len());
+            payload_buf[..chunk_len].copy_from_slice(&note.payload[..chunk_len]);
+            let mut pos = chunk_len;
+
+            // Read continuation fragments (HAS_MORE flag)
+            if note.flags & 1 != 0 {
+                loop {
+                    let cont = match superq.recv() {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    let clen = (cont.len as usize).min(120);
+                    let n = clen.min(payload_buf.len().saturating_sub(pos));
+                    if n > 0 {
+                        payload_buf[pos..pos + n].copy_from_slice(&cont.payload[..n]);
+                        pos += n;
+                    }
+                    if cont.flags & 1 == 0 { break; }
+                }
+            }
+            let len = pos;
 
             if len < QueryHeader::SIZE {
                 continue;
