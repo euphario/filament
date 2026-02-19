@@ -115,6 +115,8 @@ pub struct Service {
     pub trigger_port_len: u8,
     /// Capability bits (stored at spawn time, used for restart)
     pub caps: u64,
+    /// Spawn priority (abi::priority::*, stored for restart)
+    pub priority: u8,
     /// Unique link ID tying this service to its trigger port (0 = unlinked)
     pub link_id: u32,
 }
@@ -132,6 +134,7 @@ impl Service {
             trigger_port: [0; 32],
             trigger_port_len: 0,
             caps: 0,
+            priority: abi::priority::INHERIT,
             link_id: 0,
         }
     }

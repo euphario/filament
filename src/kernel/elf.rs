@@ -1,13 +1,12 @@
 //! ELF64 Loader
 
-#![allow(dead_code)]  // Infrastructure for future use
 //!
 //! Minimal ELF loader for AArch64 executables.
 //! Parses ELF headers and loads PT_LOAD segments into process memory.
 
 use super::addrspace::AddressSpace;
 use super::pmm;
-use crate::{kdebug, kwarn, print_direct};
+use crate::{kdebug, kwarn};
 use crate::kernel::arch::mmu;
 use super::task;
 
@@ -30,30 +29,10 @@ pub const EM_AARCH64: u16 = 183;
 
 /// Program header type: loadable segment
 pub const PT_LOAD: u32 = 1;
-/// Program header type: dynamic linking info
-pub const PT_DYNAMIC: u32 = 2;
-
 /// Segment flags
 pub const PF_X: u32 = 1;  // Executable
 pub const PF_W: u32 = 2;  // Writable
 pub const PF_R: u32 = 4;  // Readable
-
-/// Dynamic section entry tags
-pub const DT_NULL: u64 = 0;
-pub const DT_RELA: u64 = 7;
-pub const DT_RELASZ: u64 = 8;
-
-/// AArch64 relocation type: R_AARCH64_RELATIVE (value = base + addend)
-pub const R_AARCH64_RELATIVE: u32 = 0x403;
-
-/// ELF64 Rela entry (relocation with addend)
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct Elf64Rela {
-    pub r_offset: u64,
-    pub r_info: u64,
-    pub r_addend: i64,
-}
 
 /// ELF64 file header
 #[repr(C, packed)]
@@ -428,176 +407,6 @@ pub fn load_elf(data: &[u8], addr_space: &mut AddressSpace) -> Result<ElfInfo, E
     })
 }
 
-/// Process R_AARCH64_RELATIVE relocations for PIE binaries.
-///
-/// Finds the PT_DYNAMIC segment, extracts DT_RELA/DT_RELASZ entries,
-/// and applies R_AARCH64_RELATIVE relocations (value = load_offset + addend).
-fn process_relocations(
-    data: &[u8],
-    phdrs: &[Elf64ProgramHeader],
-    load_offset: u64,
-    addr_space: &mut AddressSpace,
-) -> Result<(), ElfError> {
-    // Find PT_DYNAMIC segment
-    let dyn_phdr = phdrs.iter().find(|p| p.p_type == PT_DYNAMIC);
-    let dyn_phdr = match dyn_phdr {
-        Some(p) => p,
-        None => return Ok(()), // No dynamic section — static PIE with no relocations
-    };
-
-    let dyn_offset = dyn_phdr.p_offset as usize;
-    let dyn_size = dyn_phdr.p_filesz as usize;
-    if dyn_offset.checked_add(dyn_size).map_or(true, |end| end > data.len()) {
-        return Err(ElfError::InvalidSegment);
-    }
-
-    // Parse dynamic entries to find DT_RELA and DT_RELASZ
-    let entry_size = 16usize; // sizeof(Elf64_Dyn) = 2 * u64
-    let mut rela_offset: Option<u64> = None;
-    let mut rela_size: u64 = 0;
-
-    let mut i = 0;
-    while i + entry_size <= dyn_size {
-        let base = dyn_offset + i;
-        let d_tag = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
-        let d_val = u64::from_le_bytes(data[base + 8..base + 16].try_into().unwrap());
-
-        match d_tag {
-            DT_NULL => break,
-            DT_RELA => rela_offset = Some(d_val),
-            DT_RELASZ => rela_size = d_val,
-            _ => {}
-        }
-        i += entry_size;
-    }
-
-    // Apply relocations
-    let rela_vaddr = match rela_offset {
-        Some(v) => v,
-        None => return Ok(()), // No RELA section
-    };
-
-    if rela_size == 0 {
-        return Ok(());
-    }
-
-    // Find the rela data in the ELF file by mapping vaddr back to file offset
-    let rela_file_offset = vaddr_to_file_offset(phdrs, rela_vaddr)
-        .ok_or(ElfError::InvalidSegment)?;
-    let rela_end = rela_file_offset.checked_add(rela_size as usize)
-        .ok_or(ElfError::InvalidSegment)?;
-    if rela_end > data.len() {
-        return Err(ElfError::InvalidSegment);
-    }
-
-    let rela_entry_size = core::mem::size_of::<Elf64Rela>();
-    let num_relas = rela_size as usize / rela_entry_size;
-
-    for idx in 0..num_relas {
-        let offset = rela_file_offset + idx * rela_entry_size;
-        let rela = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Rela) };
-
-        let r_offset = rela.r_offset;
-        let r_info = rela.r_info;
-        let r_addend = rela.r_addend;
-        let r_type = (r_info & 0xFFFF_FFFF) as u32;
-
-        if r_type != R_AARCH64_RELATIVE {
-            continue; // Skip non-relative relocations
-        }
-
-        // Target virtual address (with load offset applied)
-        let target_vaddr = r_offset + load_offset;
-        // Value to write: load_offset + addend
-        let value = (load_offset as i64 + r_addend) as u64;
-
-        // Write via kernel virtual address: walk page tables to find physical page
-        if let Some(phys) = addr_space.translate(target_vaddr) {
-            let kva = mmu::phys_to_virt(phys);
-            unsafe {
-                core::ptr::write_volatile(kva as *mut u64, value);
-            }
-        }
-    }
-
-    // Ensure relocation writes are visible
-    unsafe {
-        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
-    }
-
-    Ok(())
-}
-
-/// Map a virtual address back to a file offset using PT_LOAD segments.
-fn vaddr_to_file_offset(phdrs: &[Elf64ProgramHeader], vaddr: u64) -> Option<usize> {
-    for phdr in phdrs {
-        if phdr.p_type != PT_LOAD {
-            continue;
-        }
-        let seg_start = phdr.p_vaddr;
-        let seg_end = seg_start + phdr.p_filesz;
-        if vaddr >= seg_start && vaddr < seg_end {
-            let offset_in_seg = vaddr - seg_start;
-            return Some((phdr.p_offset + offset_in_seg) as usize);
-        }
-    }
-    None
-}
-
-/// Print ELF header info
-pub fn print_header_info(header: &Elf64Header) {
-    // Copy from packed struct to avoid unaligned access
-    let e_type = { header.e_type };
-    let e_machine = { header.e_machine };
-    let e_entry = { header.e_entry };
-    let e_phoff = { header.e_phoff };
-    let e_phnum = { header.e_phnum };
-
-    print_direct!("  ELF Header:\n");
-    print_direct!("    Type:    {}\n", match e_type {
-        ET_EXEC => "Executable",
-        ET_DYN => "Shared/PIE",
-        _ => "Unknown",
-    });
-    print_direct!("    Machine: {}\n", if e_machine == EM_AARCH64 { "AArch64" } else { "Unknown" });
-    print_direct!("    Entry:   0x{:016x}\n", e_entry);
-    print_direct!("    PHoff:   0x{:x}\n", e_phoff);
-    print_direct!("    PHnum:   {}\n", e_phnum);
-}
-
-/// Print program header info
-pub fn print_phdr_info(phdr: &Elf64ProgramHeader) {
-    // Copy from packed struct to avoid unaligned access
-    let p_type = { phdr.p_type };
-    let p_flags = { phdr.p_flags };
-    let p_vaddr = { phdr.p_vaddr };
-    let p_memsz = { phdr.p_memsz };
-
-    let type_str = match p_type {
-        0 => "NULL",
-        PT_LOAD => "LOAD",
-        2 => "DYNAMIC",
-        3 => "INTERP",
-        4 => "NOTE",
-        6 => "PHDR",
-        7 => "TLS",
-        _ => "OTHER",
-    };
-
-    let mut flags_str = [b'-'; 3];
-    if (p_flags & PF_R) != 0 { flags_str[0] = b'R'; }
-    if (p_flags & PF_W) != 0 { flags_str[1] = b'W'; }
-    if (p_flags & PF_X) != 0 { flags_str[2] = b'X'; }
-
-    print_direct!("    {:8} 0x{:08x} 0x{:08x} {} {}\n",
-        type_str,
-        p_vaddr,
-        p_memsz,
-        core::str::from_utf8(&flags_str).unwrap_or("---"),
-        if p_type == PT_LOAD { "<- LOAD" } else { "" }
-    );
-}
-
 // ============================================================================
 // Process Spawning
 // ============================================================================
@@ -611,32 +420,11 @@ pub const USER_STACK_SIZE: usize = 256 * 1024;
 /// Guard page size (4KB) - unmapped page below stack to catch overflow
 pub const USER_GUARD_PAGE_SIZE: usize = 4096;
 
-/// Spawn a new process from an ELF binary
-/// Returns (task_id, task_slot) on success
-pub fn spawn_from_elf(data: &[u8], name: &str) -> Result<(task::TaskId, usize), ElfError> {
-    spawn_from_elf_with_parent(data, name, 0)
-}
-
-/// Spawn a new process from an ELF binary with a parent process
-/// Sets up parent-child relationship
-/// Returns (task_id, task_slot) on success
-pub fn spawn_from_elf_with_parent(data: &[u8], name: &str, parent_id: task::TaskId) -> Result<(task::TaskId, usize), ElfError> {
-    spawn_from_elf_internal(data, name, parent_id, None)
-}
-
-/// Spawn a new process from an ELF binary with explicit capability grant
-/// explicit_caps: If Some, use these capabilities (intersected with parent's)
-///                If None, inherit all parent capabilities (legacy behavior)
-pub fn spawn_from_elf_with_caps(
-    data: &[u8],
-    name: &str,
-    parent_id: task::TaskId,
-    requested_caps: super::caps::Capabilities
-) -> Result<(task::TaskId, usize), ElfError> {
-    spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))
-}
-
-fn spawn_from_elf_internal(
+/// THE core ELF loader. All spawns go through this.
+///
+/// Loads an ELF binary into a new address space, sets up stack, ASLR,
+/// parent-child relationship, and capabilities. Returns (task_id, slot).
+fn spawn_process(
     data: &[u8],
     name: &str,
     parent_id: task::TaskId,
@@ -805,125 +593,23 @@ fn spawn_from_elf_internal(
     Ok((task_id, slot))
 }
 
-/// Built-in ELF binary IDs for spawn syscall (legacy)
-pub const ELF_ID_TEST1: u32 = 0;  // First test binary (prints 'A')
-pub const ELF_ID_TEST2: u32 = 1;  // Second test binary (prints 'B')
-
-/// Get ELF binary by ID (for spawn syscall - legacy)
-pub fn get_elf_by_id(id: u32) -> Option<&'static [u8]> {
-    match id {
-        ELF_ID_TEST1 => Some(TEST_ELF),
-        ELF_ID_TEST2 => Some(TEST_ELF2),
-        _ => None,
-    }
-}
 
 // ============================================================================
 // Ramfs-based process spawning
 // ============================================================================
 
-/// Spawn a process from a file path in ramfs
-/// Searches /bin/<name> and /<name>
-pub fn spawn_from_path(path: &str) -> Result<(task::TaskId, usize), ElfError> {
-    spawn_from_path_with_parent(path, 0)
-}
-
-/// Spawn from path with explicit capability grant (uses find_executable)
-pub fn spawn_from_path_with_caps_find(
+/// Spawn a process from a ramfs path.
+///
+/// Used by kernel boot (main.rs) and sys_exec. Searches ramfs for the binary,
+/// then calls spawn_process.
+pub fn spawn_from_path(
     path: &str,
     parent_id: task::TaskId,
-    requested_caps: super::caps::Capabilities
+    caps: super::caps::Capabilities,
 ) -> Result<(task::TaskId, usize), ElfError> {
-    // Try to find the file in ramfs
-    let data = find_executable(path).ok_or(ElfError::NotExecutable)?;
-
-    // Extract name from path for the process name
-    let name = path.rsplit('/').next().unwrap_or(path);
-
-    spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))
-}
-
-/// Spawn from path with caps, transferring a channel handle from parent to child at slot 4
-/// Priority: abi::priority::INHERIT (0xFF) means inherit parent's priority
-pub fn spawn_from_path_with_caps_and_channel(
-    path: &str,
-    parent_id: task::TaskId,
-    requested_caps: super::caps::Capabilities,
-    channel_handle_raw: u32,
-    priority: u8,
-) -> Result<(task::TaskId, usize), ElfError> {
-    use crate::kernel::object_service::object_service;
-    use crate::kernel::object::{Object, ObjectType, ChannelObject};
-
     let data = find_executable(path).ok_or(ElfError::NotExecutable)?;
     let name = path.rsplit('/').next().unwrap_or(path);
-
-    // Validate and extract the channel from parent's handle table
-    let handle = abi::Handle(channel_handle_raw);
-    let channel_obj = object_service().close_handle(parent_id, handle)
-        .map_err(|_| ElfError::NotExecutable)?;
-
-    // Verify it's actually a channel
-    let channel_id = match &channel_obj {
-        Object::Channel(ch) => ch.channel_id(),
-        _ => {
-            // Not a channel — can't put it back easily, return error
-            return Err(ElfError::NotExecutable);
-        }
-    };
-
-    // Spawn the child process (inherits parent priority by default)
-    let (child_id, slot) = spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))?;
-
-    // Apply explicit priority override if not INHERIT
-    if priority != abi::priority::INHERIT {
-        use crate::kernel::task::tcb::Priority;
-        if let Some(prio) = Priority::from_u8(priority) {
-            crate::kernel::task::with_scheduler(|sched| {
-                if let Some(child_task) = sched.task_mut(slot) {
-                    let old = child_task.set_priority(prio);
-                    if old != prio {
-                        sched.notify_priority_change(slot, old, prio);
-                    }
-                }
-            });
-        }
-    }
-
-    // Transfer the channel to the child's handle table at slot 4 (SUPERVISION)
-    let child_channel = Object::Channel(ChannelObject::new(channel_id));
-    let result = object_service().with_table_mut(child_id, |table| {
-        table.alloc_at(4, ObjectType::Channel, child_channel)
-    });
-
-    match result {
-        Ok(Some(_handle)) => {
-            // Update IPC channel ownership: change from parent to child
-            let _ = crate::kernel::ipc::transfer_channel_owner(channel_id, parent_id, child_id);
-            // Fix peer_owner on the parent's channel so send() returns
-            // correct PeerInfo { task_id: child_id } for deferred wake.
-            let _ = crate::kernel::ipc::update_peer_owner(channel_id, child_id);
-            // Track resource usage
-            crate::kernel::task::with_scheduler(|sched| {
-                if let Some(s) = sched.slot_by_pid(parent_id) {
-                    if let Some(task) = sched.task_mut(s) {
-                        task.remove_channel();
-                    }
-                }
-                if let Some(s) = sched.slot_by_pid(child_id) {
-                    if let Some(task) = sched.task_mut(s) {
-                        task.add_channel();
-                    }
-                }
-            });
-        }
-        _ => {
-            // Failed to insert — child still spawned but without the channel
-            kwarn!("elf", "channel_transfer_failed"; child = child_id as u64);
-        }
-    }
-
-    Ok((child_id, slot))
+    spawn_process(data, name, parent_id, Some(caps))
 }
 
 /// Spawn a process from ramfs path with a mailbox shmem page.
@@ -954,7 +640,7 @@ pub fn spawn_from_path_with_caps_and_mailbox(
     let name = path.rsplit('/').next().unwrap_or(path);
 
     // Spawn the child process
-    let (child_id, slot) = spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))?;
+    let (child_id, slot) = spawn_process(data, name, parent_id, Some(requested_caps))?;
 
     // Read priority from mailbox header (byte offset 13 = priority field)
     // and apply if not INHERIT (0xFF)
@@ -1044,17 +730,6 @@ pub fn spawn_from_path_with_caps_and_mailbox(
     Ok(MailboxSpawnResult { child_id, slot, parent_handle_raw, parent_superq_handle_raw })
 }
 
-/// Spawn a process from a file path with a parent
-pub fn spawn_from_path_with_parent(path: &str, parent_id: task::TaskId) -> Result<(task::TaskId, usize), ElfError> {
-    // Try to find the file in ramfs
-    let data = find_executable(path).ok_or(ElfError::NotExecutable)?;
-
-    // Extract name from path for the process name
-    let name = path.rsplit('/').next().unwrap_or(path);
-
-    spawn_from_elf_with_parent(data, name, parent_id)
-}
-
 /// Find an executable in ramfs
 /// Searches: exact path, bin/<name>, ./bin/<name>
 fn find_executable(path: &str) -> Option<&'static [u8]> {
@@ -1107,192 +782,3 @@ fn find_executable(path: &str) -> Option<&'static [u8]> {
     None
 }
 
-/// Get the test ELF binary
-pub fn get_test_elf() -> &'static [u8] {
-    TEST_ELF
-}
-
-// ============================================================================
-// Testing
-// ============================================================================
-
-/// A minimal test ELF binary (AArch64) - LOOPING version for preemption testing
-/// This program loops forever, printing 'A' periodically.
-/// Uses FD-based Write syscall (syscall 21) with fd=1 (stdout).
-/// The timer preemption should switch between processes.
-///
-/// Entry point at 0x40010000
-const TEST_ELF: &[u8] = &[
-    // ELF Header (64 bytes)
-    0x7f, b'E', b'L', b'F',  // Magic
-    2,                        // Class: 64-bit
-    1,                        // Data: little endian
-    1,                        // Version
-    0,                        // OS/ABI
-    0, 0, 0, 0, 0, 0, 0, 0,  // Padding
-    2, 0,                     // Type: ET_EXEC
-    183, 0,                   // Machine: AArch64
-    1, 0, 0, 0,              // Version
-    0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // Entry: 0x40010000
-    0x40, 0, 0, 0, 0, 0, 0, 0,           // PHoff: 64
-    0, 0, 0, 0, 0, 0, 0, 0,              // SHoff: 0
-    0, 0, 0, 0,                          // Flags
-    64, 0,                               // EH size
-    56, 0,                               // PH entry size
-    1, 0,                                // PH count
-    0, 0,                                // SH entry size
-    0, 0,                                // SH count
-    0, 0,                                // SH string index
-
-    // Program Header (56 bytes) - at offset 64
-    1, 0, 0, 0,              // Type: PT_LOAD
-    5, 0, 0, 0,              // Flags: R-X
-    0x78, 0, 0, 0, 0, 0, 0, 0,           // Offset: 120 (where code starts)
-    0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // VAddr: 0x40010000
-    0x00, 0x00, 0x01, 0x40, 0, 0, 0, 0,  // PAddr: 0x40010000
-    0x28, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 40 bytes
-    0x28, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 40 bytes
-    0x00, 0x10, 0, 0, 0, 0, 0, 0,        // Align: 0x1000
-
-    // Code starts at offset 120 (0x78)
-    // loop:
-    //   mov x8, #21      ; syscall = Write (FD-based)
-    0xa8, 0x02, 0x80, 0xd2,
-    //   mov x0, #1       ; fd = stdout
-    0x20, 0x00, 0x80, 0xd2,
-    //   adr x1, char     ; buffer = char (PC-relative, +28 bytes from here)
-    0xe1, 0x00, 0x00, 0x10,
-    //   mov x2, #1       ; len = 1
-    0x22, 0x00, 0x80, 0xd2,
-    //   svc #0           ; syscall
-    0x01, 0x00, 0x00, 0xd4,
-    //   mov x9, #0x40000 ; delay counter (~262K iterations)
-    0x89, 0x00, 0xa0, 0xd2,
-    // wait:
-    //   sub x9, x9, #1
-    0x29, 0x05, 0x00, 0xd1,
-    //   cbnz x9, wait    ; loop if not zero
-    0xe9, 0xff, 0xff, 0xb5,
-    //   b loop           ; back to start
-    0xf8, 0xff, 0xff, 0x17,
-    // char: 'A'
-    b'A', 0, 0, 0,           // Padded to 4 bytes
-];
-
-/// Second test ELF - LOOPING version, prints 'B' periodically
-/// Uses FD-based Write syscall (syscall 21) with fd=1 (stdout).
-/// Entry point at 0x40020000 (different from first ELF)
-const TEST_ELF2: &[u8] = &[
-    // ELF Header (64 bytes)
-    0x7f, b'E', b'L', b'F',  // Magic
-    2,                        // Class: 64-bit
-    1,                        // Data: little endian
-    1,                        // Version
-    0,                        // OS/ABI
-    0, 0, 0, 0, 0, 0, 0, 0,  // Padding
-    2, 0,                     // Type: ET_EXEC
-    183, 0,                   // Machine: AArch64
-    1, 0, 0, 0,              // Version
-    0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // Entry: 0x40020000
-    0x40, 0, 0, 0, 0, 0, 0, 0,           // PHoff: 64
-    0, 0, 0, 0, 0, 0, 0, 0,              // SHoff: 0
-    0, 0, 0, 0,                          // Flags
-    64, 0,                               // EH size
-    56, 0,                               // PH entry size
-    1, 0,                                // PH count
-    0, 0,                                // SH entry size
-    0, 0,                                // SH count
-    0, 0,                                // SH string index
-
-    // Program Header (56 bytes) - at offset 64
-    1, 0, 0, 0,              // Type: PT_LOAD
-    5, 0, 0, 0,              // Flags: R-X
-    0x78, 0, 0, 0, 0, 0, 0, 0,           // Offset: 120 (where code starts)
-    0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // VAddr: 0x40020000
-    0x00, 0x00, 0x02, 0x40, 0, 0, 0, 0,  // PAddr: 0x40020000
-    0x28, 0, 0, 0, 0, 0, 0, 0,           // FileSz: 40 bytes
-    0x28, 0, 0, 0, 0, 0, 0, 0,           // MemSz: 40 bytes
-    0x00, 0x10, 0, 0, 0, 0, 0, 0,        // Align: 0x1000
-
-    // Code starts at offset 120 (0x78)
-    // loop:
-    //   mov x8, #21      ; syscall = Write (FD-based)
-    0xa8, 0x02, 0x80, 0xd2,
-    //   mov x0, #1       ; fd = stdout
-    0x20, 0x00, 0x80, 0xd2,
-    //   adr x1, char     ; buffer = char (PC-relative, +28 bytes from here)
-    0xe1, 0x00, 0x00, 0x10,
-    //   mov x2, #1       ; len = 1
-    0x22, 0x00, 0x80, 0xd2,
-    //   svc #0           ; syscall
-    0x01, 0x00, 0x00, 0xd4,
-    //   mov x9, #0x40000 ; delay counter (~262K iterations)
-    0x89, 0x00, 0xa0, 0xd2,
-    // wait:
-    //   sub x9, x9, #1
-    0x29, 0x05, 0x00, 0xd1,
-    //   cbnz x9, wait    ; loop if not zero
-    0xe9, 0xff, 0xff, 0xb5,
-    //   b loop           ; back to start
-    0xf8, 0xff, 0xff, 0x17,
-    // char: 'B'
-    b'B', 0, 0, 0,           // Padded to 4 bytes
-];
-
-/// Get the second test ELF binary
-pub fn get_test_elf2() -> &'static [u8] {
-    TEST_ELF2
-}
-
-// Note: A proper mmap test ELF would need to be compiled from assembly
-// The mmap syscall interface is:
-//   x8 = 4 (Mmap)
-//   x0 = addr hint (0 for any)
-//   x1 = size in bytes
-//   x2 = prot flags (1=read, 2=write, 4=exec)
-// Returns virtual address or negative error
-
-/// Test ELF loading
-pub fn test() {
-    print_direct!("  Testing ELF loader...\n");
-
-    // Validate the test ELF
-    match validate_header(TEST_ELF) {
-        Ok(header) => {
-            print_direct!("    Test ELF validated\n");
-            print_header_info(header);
-
-            match get_program_headers(TEST_ELF, header) {
-                Ok(phdrs) => {
-                    print_direct!("    Program headers:\n");
-                    for phdr in phdrs {
-                        print_phdr_info(phdr);
-                    }
-                }
-                Err(e) => print_direct!("    [!!] Failed to get phdrs: {:?}\n", e),
-            }
-        }
-        Err(e) => {
-            print_direct!("    [!!] ELF validation failed: {:?}\n", e);
-            return;
-        }
-    }
-
-    // Try loading into a new address space
-    print_direct!("    Loading ELF into address space...\n");
-    if let Some(mut addr_space) = AddressSpace::new() {
-        match load_elf(TEST_ELF, &mut addr_space) {
-            Ok(info) => {
-                print_direct!("    Loaded {} segments\n", info.segments_loaded);
-                print_direct!("    Entry point: 0x{:016x}\n", info.entry);
-                print_direct!("    Base address: 0x{:016x}\n", info.base);
-                print_direct!("    [OK] ELF loaded successfully\n");
-            }
-            Err(e) => print_direct!("    [!!] Load failed: {:?}\n", e),
-        }
-    } else {
-        print_direct!("    [!!] Failed to create address space\n");
-    }
-
-    print_direct!("    [OK] ELF loader test passed\n");
-}

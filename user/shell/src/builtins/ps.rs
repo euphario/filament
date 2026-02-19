@@ -26,25 +26,51 @@ fn prio_name(level: u8) -> &'static str {
     }
 }
 
-/// Format activity age as human-readable idle time
-fn idle_str(age_ms: u32) -> &'static str {
+/// Format activity age as human-readable idle time into a buffer.
+/// Returns the length of the formatted string.
+fn fmt_idle(age_ms: u32, buf: &mut [u8; 8]) -> usize {
     if age_ms == 0 {
-        "-"
-    } else if age_ms < 1000 {
-        "<1s"
-    } else if age_ms < 3000 {
-        "3s"
-    } else if age_ms < 15000 {
-        "15s"
-    } else if age_ms < 60000 {
-        "1m"
-    } else if age_ms < 300000 {
-        "5m"
-    } else if age_ms < 3600000 {
-        "1h"
-    } else {
-        ">1h"
+        buf[0] = b'-';
+        return 1;
     }
+    let secs = age_ms / 1000;
+    if secs == 0 {
+        buf[..3].copy_from_slice(b"<1s");
+        return 3;
+    }
+    if secs < 60 {
+        let len = fmt_u32(secs, buf);
+        buf[len] = b's';
+        return len + 1;
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        let len = fmt_u32(mins, buf);
+        buf[len] = b'm';
+        return len + 1;
+    }
+    let hours = mins / 60;
+    let len = fmt_u32(hours, buf);
+    buf[len] = b'h';
+    len + 1
+}
+
+fn fmt_u32(mut n: u32, buf: &mut [u8; 8]) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    for j in 0..i {
+        buf[j] = tmp[i - 1 - j];
+    }
+    i
 }
 
 /// Liveness status as short string
@@ -123,10 +149,14 @@ fn run_basic() -> Table {
             row.str(prio_name(info.base_priority))
         };
 
+        let mut idle_buf = [0u8; 8];
+        let idle_len = fmt_idle(info.activity_age_ms, &mut idle_buf);
+        let idle = core::str::from_utf8(&idle_buf[..idle_len]).unwrap_or("-");
+
         row = row
             .str(info.state_str())
             .uint(cpu_ms)
-            .str(idle_str(info.activity_age_ms))
+            .string(idle)
             .bytes(&info.name);
 
         table.add_row(row);
@@ -196,10 +226,14 @@ fn run_extended(verbosity: u8) -> Table {
             row.str(prio_name(info.base_priority))
         };
 
+        let mut idle_buf = [0u8; 8];
+        let idle_len = fmt_idle(info.activity_age_ms, &mut idle_buf);
+        let idle = core::str::from_utf8(&idle_buf[..idle_len]).unwrap_or("-");
+
         row = row
             .str(info.state_str())
             .uint(cpu_ms)
-            .str(idle_str(info.activity_age_ms))
+            .string(idle)
             .bytes(&info.name);
 
         // -v: handles, channels, ports, shmem, signal pending, liveness

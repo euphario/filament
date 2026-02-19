@@ -12,17 +12,8 @@ use super::task::{TaskId, Capabilities};
 
 /// How to locate the ELF binary for spawning
 pub enum SpawnSource<'a> {
-    /// Spawn by built-in ELF ID (legacy sys_spawn)
-    ElfId(u32, &'a str),
     /// Spawn by ramfs path (sys_exec, default caps)
     Path(&'a str),
-    /// Spawn by ramfs path with explicit caps (sys_exec_with_caps)
-    PathWithCaps(&'a str, Capabilities),
-    /// Spawn from ELF data in memory (sys_exec_mem)
-    Memory(&'a [u8], &'a str),
-    /// Spawn by ramfs path with caps, transferring a channel handle to child (sys_exec_with_channel)
-    /// u32 = channel handle, u8 = priority (INHERIT=0xFF means use parent's)
-    PathWithCapsAndChannel(&'a str, Capabilities, u32, u8),
     /// Spawn by ramfs path with caps and a mailbox shmem page (sys_exec_with_mailbox)
     /// &[u8] = mailbox content to copy into the shmem page
     PathWithCapsAndMailbox(&'a str, Capabilities, &'a [u8]),

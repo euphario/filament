@@ -105,30 +105,6 @@ fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 }
 
 #[inline(always)]
-fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        asm!(
-            "svc #0",
-            in("x8") num,
-            inlateout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            lateout("x9") _,
-            lateout("x10") _,
-            lateout("x11") _,
-            lateout("x12") _,
-            lateout("x13") _,
-            lateout("x14") _,
-            lateout("x15") _,
-            options(nostack)
-        );
-    }
-    ret
-}
-
-#[inline(always)]
 fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
     let ret: i64;
     unsafe {
@@ -168,19 +144,6 @@ pub fn exec(path: &str) -> i64 {
     syscall2(sys::EXEC, path.as_ptr() as u64, path.len() as u64)
 }
 
-/// Execute a program from initrd with explicit capabilities
-pub fn exec_with_caps(path: &str, caps: u64) -> i64 {
-    syscall3(sys::EXEC_WITH_CAPS, path.as_ptr() as u64, path.len() as u64, caps)
-}
-
-/// Execute a program with capabilities, transferring a channel handle to the child.
-/// The channel handle is removed from the caller's table and placed in the child's
-/// table at Handle::SUPERVISION (slot 4). Returns child PID on success.
-/// Priority: abi::priority::INHERIT (0xFF) means inherit parent's priority.
-pub fn exec_with_channel(path: &str, caps: u64, channel: Handle, priority: u8) -> i64 {
-    syscall5(sys::EXEC_WITH_CHANNEL, path.as_ptr() as u64, path.len() as u64, caps, channel.raw() as u64, priority as u64)
-}
-
 /// Spawn a child with a shared mailbox page.
 ///
 /// `mailbox_data` is copied into a 4KB shmem page mapped at Handle::MAILBOX in the child.
@@ -201,15 +164,6 @@ pub fn exec_with_mailbox(path: &str, caps: u64, mailbox: &[u8]) -> Result<(u32, 
         let superq_raw = ((superq_packed & 0xFF00) << 16) | (superq_packed & 0xFF);
         Ok((child_pid, Handle::from_raw(shmem_raw), Handle::from_raw(superq_raw)))
     }
-}
-
-/// Execute ELF from memory
-pub fn exec_mem(elf_data: &[u8], name: Option<&str>) -> i64 {
-    let (name_ptr, name_len) = match name {
-        Some(n) => (n.as_ptr() as u64, n.len() as u64),
-        None => (0, 0),
-    };
-    syscall4(sys::EXEC_MEM, elf_data.as_ptr() as u64, elf_data.len() as u64, name_ptr, name_len)
 }
 
 /// Get current process ID

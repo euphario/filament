@@ -1442,13 +1442,7 @@ impl<D: Driver> DriverRuntime<D> {
                 }
                 (0i32, pid)
             } else {
-                // Mailbox spawn failed — fall back to plain spawn (no relay)
-                let pid = if *caps != 0 {
-                    syscall::exec_with_caps(name, *caps)
-                } else {
-                    syscall::exec(name)
-                };
-                if pid > 0 { (0i32, pid as u32) } else { (-1i32, 0u32) }
+                (-1i32, 0u32)
             };
 
             if self.ctx.devd.ack_spawn(*seq_id, result, child_pid).is_err() {

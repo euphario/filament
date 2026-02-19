@@ -393,7 +393,7 @@ pub fn complete_probed_exit() {
     }
 
     kdebug!("lifecycle", "probed_exit"; action = "spawning_devd");
-    match elf::spawn_from_path("bin/devd") {
+    match elf::spawn_from_path("bin/devd", 0, crate::kernel::caps::Capabilities::from_bits(0)) {
         Ok((_task_id, slot)) => {
             super::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {

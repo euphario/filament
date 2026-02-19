@@ -15,7 +15,6 @@
 use crate::kernel::traits::syscall_ctx::SyscallContext;
 use crate::kernel::error::KernelError;
 use crate::kernel::traits::task::TaskId;
-use crate::kernel::traits::object_ops::ObjectOps;
 use crate::kernel::traits::raw_object_ops::RawObjectOps;
 use crate::kernel::traits::memory_ops::MemoryOps;
 use crate::kernel::traits::process_ops::ProcessOps;
@@ -78,11 +77,6 @@ impl SyscallContext for KernelSyscallContext {
         } else {
             Err(KernelError::PermDenied)
         }
-    }
-
-    fn objects(&self) -> &dyn ObjectOps {
-        // Return the global object ops backend
-        crate::kernel::object_ops_impl::object_ops_backend()
     }
 
     fn raw_objects(&self) -> &dyn RawObjectOps {

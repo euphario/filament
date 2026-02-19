@@ -128,7 +128,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Any,
         driver: "consoled",
         caps: userlib::devd::caps::DRIVER | 0x0800, // DRIVER + KILL (delegates to shell)
-        priority: abi::priority::CRITICAL,
+        priority: abi::priority::ABOVE_NORM,
         context: &[],
         mount_path: None,
     },
@@ -137,7 +137,7 @@ pub static PORT_RULES: &[PortRule] = &[
         subclass: SubclassMatch::Any,
         driver: "cpud",
         caps: userlib::devd::caps::DRIVER,
-        priority: abi::priority::CRITICAL,
+        priority: abi::priority::NORMAL,
         context: &[],
         mount_path: None,
     },

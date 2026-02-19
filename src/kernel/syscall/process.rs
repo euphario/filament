@@ -1,7 +1,7 @@
 //! Process Management Syscalls
 //!
 //! This module contains syscall handlers for process lifecycle management:
-//! - Process creation (spawn, exec, exec_with_caps, exec_mem)
+//! - Process creation (exec, exec_with_mailbox)
 //! - Process termination (exit, kill)
 //! - Process synchronization (wait, daemonize)
 //! - Process information (ps_info, get_capabilities)
@@ -20,10 +20,9 @@
 use crate::{kwarn, kdebug};
 use super::super::uaccess;
 use super::super::caps::Capabilities;
-use crate::kernel::traits::process_ops::WaitChildResult;
+use crate::kernel::traits::process_ops::{WaitChildResult, SpawnSource};
 use super::super::syscall_ctx_impl::create_syscall_context;
 use super::super::traits::syscall_ctx::SyscallContext;
-use super::super::traits::process_ops::SpawnSource;
 use super::uaccess_to_errno;
 use crate::kernel::error::KernelError;
 
@@ -50,45 +49,6 @@ pub(super) fn sys_exit(code: i32) -> i64 {
 
     ctx.process().exit(pid, code);
     // Never reached — exit() -> !
-}
-
-/// Spawn a new process from a built-in ELF binary
-/// Args: elf_id (built-in ELF identifier), name_ptr, name_len
-/// Returns: child PID on success, negative error on failure
-/// SECURITY: Copies user name buffer via page table translation
-pub(super) fn sys_spawn(elf_id: u32, name_ptr: u64, name_len: usize) -> i64 {
-    let ctx = create_syscall_context();
-
-    // Check SPAWN capability
-    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
-        return KernelError::PermDenied.to_errno();
-    }
-
-    // Validate name length
-    if name_len == 0 || name_len > 15 {
-        return KernelError::InvalidArg.to_errno();
-    }
-
-    // Copy name from user space
-    let mut name_buf = [0u8; 16];
-    match uaccess::copy_from_user(&mut name_buf[..name_len], name_ptr) {
-        Ok(_) => {}
-        Err(e) => return uaccess_to_errno(e),
-    }
-
-    // Parse name from kernel buffer
-    let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("child");
-
-    // Get current PID as parent
-    let parent_id = match ctx.current_task_id() {
-        Some(id) => id,
-        None => return KernelError::NoProcess.to_errno(),
-    };
-
-    match ctx.process().spawn(parent_id, SpawnSource::ElfId(elf_id, name)) {
-        Ok(child_id) => child_id as i64,
-        Err(e) => e.to_errno(),
-    }
 }
 
 /// Execute a program from a path (searches ramfs)
@@ -128,112 +88,6 @@ pub(super) fn sys_exec(path_ptr: u64, path_len: usize) -> i64 {
     };
 
     match ctx.process().spawn(parent_id, SpawnSource::Path(path)) {
-        Ok(child_id) => child_id as i64,
-        Err(e) => e.to_errno(),
-    }
-}
-
-/// Execute a program with explicit capability grant (privilege separation)
-/// Args: path_ptr, path_len, capabilities (bitmask)
-/// Returns: child PID on success, negative error on failure
-/// SECURITY: Child capabilities are intersected with parent's - can't escalate
-pub(super) fn sys_exec_with_caps(path_ptr: u64, path_len: usize, capabilities: u64) -> i64 {
-    let ctx = create_syscall_context();
-
-    // Require SPAWN capability
-    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
-        return KernelError::PermDenied.to_errno();
-    }
-
-    // Require GRANT capability to delegate capabilities to children
-    if let Err(_) = ctx.require_capability(Capabilities::GRANT.bits()) {
-        return KernelError::PermDenied.to_errno();
-    }
-
-    // Validate path length
-    if path_len == 0 || path_len > 127 {
-        return KernelError::InvalidArg.to_errno();
-    }
-
-    // Copy path from user space
-    let mut path_buf = [0u8; 128];
-    match uaccess::copy_from_user(&mut path_buf[..path_len], path_ptr) {
-        Ok(_) => {}
-        Err(e) => return uaccess_to_errno(e),
-    }
-
-    // Parse path from kernel buffer
-    let path = match core::str::from_utf8(&path_buf[..path_len]) {
-        Ok(s) => s,
-        Err(_) => return KernelError::InvalidArg.to_errno(),
-    };
-
-    // Get current PID as parent
-    let parent_id = match ctx.current_task_id() {
-        Some(id) => id,
-        None => return KernelError::NoProcess.to_errno(),
-    };
-
-    // Convert capabilities bitmask to trait type
-    let trait_caps = crate::kernel::traits::task::Capabilities(capabilities);
-
-    match ctx.process().spawn(parent_id, SpawnSource::PathWithCaps(path, trait_caps)) {
-        Ok(child_id) => child_id as i64,
-        Err(e) => e.to_errno(),
-    }
-}
-
-/// Execute a program with caps, transferring a channel handle to the child
-/// Args: path_ptr, path_len, capabilities (bitmask), channel_handle (raw u32), priority (u8)
-/// Returns: child PID on success, negative error on failure
-/// The channel handle is removed from parent's table and placed in child's table at slot 4
-/// Priority: abi::priority::INHERIT (0xFF) means inherit parent's priority
-pub(super) fn sys_exec_with_channel(path_ptr: u64, path_len: usize, capabilities: u64, channel_handle: u32, priority: u8) -> i64 {
-    let ctx = create_syscall_context();
-
-    // Require SPAWN capability
-    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
-        return KernelError::PermDenied.to_errno();
-    }
-
-    // Require GRANT capability to delegate capabilities to children
-    if let Err(_) = ctx.require_capability(Capabilities::GRANT.bits()) {
-        return KernelError::PermDenied.to_errno();
-    }
-
-    // Validate path length
-    if path_len == 0 || path_len > 127 {
-        return KernelError::InvalidArg.to_errno();
-    }
-
-    // Validate channel handle is non-zero
-    if channel_handle == 0 {
-        return KernelError::InvalidArg.to_errno();
-    }
-
-    // Copy path from user space
-    let mut path_buf = [0u8; 128];
-    match uaccess::copy_from_user(&mut path_buf[..path_len], path_ptr) {
-        Ok(_) => {}
-        Err(e) => return uaccess_to_errno(e),
-    }
-
-    // Parse path from kernel buffer
-    let path = match core::str::from_utf8(&path_buf[..path_len]) {
-        Ok(s) => s,
-        Err(_) => return KernelError::InvalidArg.to_errno(),
-    };
-
-    // Get current PID as parent
-    let parent_id = match ctx.current_task_id() {
-        Some(id) => id,
-        None => return KernelError::NoProcess.to_errno(),
-    };
-
-    // Convert capabilities bitmask to trait type
-    let trait_caps = crate::kernel::traits::task::Capabilities(capabilities);
-
-    match ctx.process().spawn(parent_id, SpawnSource::PathWithCapsAndChannel(path, trait_caps, channel_handle, priority)) {
         Ok(child_id) => child_id as i64,
         Err(e) => e.to_errno(),
     }
@@ -328,84 +182,6 @@ pub(super) fn sys_exec_with_mailbox(path_ptr: u64, path_len: usize, capabilities
         Err(crate::kernel::elf::ElfError::BadMagic) => KernelError::InvalidArg.to_errno(),
         Err(_) => KernelError::OutOfMemory.to_errno(),
     }
-}
-
-/// Execute ELF binary from a memory buffer
-/// Args:
-///   elf_ptr: Pointer to ELF data in userspace
-///   elf_len: Size of ELF data in bytes
-///   name_ptr: Pointer to process name (or 0 for default)
-///   name_len: Length of process name
-/// Returns: PID of new process on success, negative error on failure
-/// SECURITY: Reads ELF data via page table translation
-pub(super) fn sys_exec_mem(elf_ptr: u64, elf_len: usize, name_ptr: u64, name_len: usize) -> i64 {
-    let ctx = create_syscall_context();
-
-    // Check SPAWN capability
-    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
-        return KernelError::PermDenied.to_errno();
-    }
-
-    // Validate ELF size (reasonable bounds: at least an ELF header, at most 16MB)
-    if elf_len < 64 || elf_len > 16 * 1024 * 1024 {
-        return KernelError::InvalidArg.to_errno();
-    }
-
-    // Validate and read ELF data from userspace
-    // We need to copy to kernel memory since the ELF loader works with slices
-    if let Err(e) = uaccess::validate_user_read(elf_ptr, elf_len) {
-        return uaccess_to_errno(e);
-    }
-
-    // Allocate kernel buffer for ELF data
-    let num_pages = (elf_len + 4095) / 4096;
-    let elf_phys = match super::super::pmm::alloc_pages(num_pages) {
-        Some(addr) => addr,
-        None => return KernelError::OutOfMemory.to_errno(),
-    };
-
-    // Get kernel virtual address for the allocation
-    let elf_virt = crate::kernel::arch::mmu::phys_to_virt(elf_phys as u64) as *mut u8;
-
-    // Copy ELF data from userspace to kernel buffer
-    let elf_slice = unsafe { core::slice::from_raw_parts_mut(elf_virt, elf_len) };
-    if let Err(e) = uaccess::copy_from_user(elf_slice, elf_ptr) {
-        super::super::pmm::free_pages(elf_phys, num_pages);
-        return uaccess_to_errno(e);
-    }
-
-    // Parse process name
-    let mut name_buf = [0u8; 32];
-    let name = if name_ptr != 0 && name_len > 0 {
-        let actual_len = name_len.min(31);
-        if let Err(e) = uaccess::copy_from_user(&mut name_buf[..actual_len], name_ptr) {
-            super::super::pmm::free_pages(elf_phys, num_pages);
-            return uaccess_to_errno(e);
-        }
-        core::str::from_utf8(&name_buf[..actual_len]).unwrap_or("exec_mem")
-    } else {
-        "exec_mem"
-    };
-
-    // Get current PID as parent
-    let parent_id = match ctx.current_task_id() {
-        Some(id) => id,
-        None => {
-            super::super::pmm::free_pages(elf_phys, num_pages);
-            return KernelError::NoProcess.to_errno();
-        }
-    };
-
-    // Spawn via ProcessOps trait
-    let result = match ctx.process().spawn(parent_id, SpawnSource::Memory(elf_slice, name)) {
-        Ok(child_id) => child_id as i64,
-        Err(e) => e.to_errno(),
-    };
-
-    // Free the kernel buffer (ELF data has been copied to process address space)
-    super::super::pmm::free_pages(elf_phys, num_pages);
-
-    result
 }
 
 /// Wait for a child process to exit

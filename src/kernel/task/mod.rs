@@ -517,8 +517,6 @@ impl Scheduler {
         }
     }
 
-    // NOTE: Old heartbeat timeout constant removed - using liveness ping/pong system instead
-
     /// Check for timed-out blocked tasks, deliver timer events, and wake them
     /// Called from timer tick handler
     /// Returns number of tasks woken
@@ -627,8 +625,6 @@ impl Scheduler {
 
         woken
     }
-
-    // NOTE: check_devd_heartbeat removed - using liveness ping/pong system instead
 
     /// Add a kernel task to the scheduler
     pub fn add_kernel_task(&mut self, entry: fn() -> !, name: &str) -> Option<TaskId> {
@@ -1114,10 +1110,6 @@ static mut EARLY_BOOT_TRAP_FRAMES: [TrapFrame; super::percpu::MAX_CPUS] = [
     TrapFrame::new(),
 ];
 
-// NOTE: CURRENT_TRAP_FRAME, CURRENT_TTBR0, and SYSCALL_SWITCHED_TASK have been
-// moved to per-CPU CpuData fields (accessed via percpu::set_trap_frame() etc.)
-// for SMP safety. See percpu.rs for the new API.
-
 /// Get exclusive access to the scheduler.
 ///
 /// Returns a guard that holds the SpinLock. The lock is released when
@@ -1351,13 +1343,6 @@ pub unsafe extern "C" fn do_resched_if_needed() {
     // - Context switching for kernel tasks and blocked tasks
     crate::kernel::sched::reschedule();
 }
-
-// NOTE: yield_cpu() and yield_cpu_locked() have been removed.
-// They used context_switch() which is for kernel-to-kernel switching,
-// not user tasks. For user task scheduling, use:
-// - sched::yield_current() - kernel-internal yield
-// - sched::reschedule() - kernel-internal reschedule
-// - sys_yield() in syscall.rs - syscall entry point
 
 /// Test context switching
 pub fn test() {

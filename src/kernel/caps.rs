@@ -215,25 +215,25 @@ mod tests {
 
     #[test]
     fn test_capabilities_has() {
-        let caps = Capabilities::IPC.union(Capabilities::MEMORY);
+        let caps = Capabilities::IPC.with(Capabilities::MEMORY);
         assert!(caps.has(Capabilities::IPC));
         assert!(caps.has(Capabilities::MEMORY));
         assert!(!caps.has(Capabilities::SPAWN));
     }
 
     #[test]
-    fn test_capabilities_union() {
+    fn test_capabilities_with() {
         let a = Capabilities::IPC;
         let b = Capabilities::MEMORY;
-        let c = a.union(b);
+        let c = a.with(b);
         assert!(c.has(Capabilities::IPC));
         assert!(c.has(Capabilities::MEMORY));
     }
 
     #[test]
     fn test_capabilities_intersect() {
-        let a = Capabilities::IPC.union(Capabilities::MEMORY);
-        let b = Capabilities::MEMORY.union(Capabilities::SPAWN);
+        let a = Capabilities::IPC.with(Capabilities::MEMORY);
+        let b = Capabilities::MEMORY.with(Capabilities::SPAWN);
         let c = a.intersect(b);
         assert!(!c.has(Capabilities::IPC));
         assert!(c.has(Capabilities::MEMORY));
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn test_child_capabilities_with_grant() {
         let parent = Capabilities::ALL;
-        let requested = Capabilities::IPC.union(Capabilities::MEMORY);
+        let requested = Capabilities::IPC.with(Capabilities::MEMORY);
         let child = child_capabilities(parent, requested);
         assert!(child.has(Capabilities::IPC));
         assert!(child.has(Capabilities::MEMORY));
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_child_capabilities_without_grant() {
-        let parent = Capabilities::IPC.union(Capabilities::MEMORY).union(Capabilities::SPAWN);
+        let parent = Capabilities::IPC.with(Capabilities::MEMORY).with(Capabilities::SPAWN);
         let requested = Capabilities::ALL;
         let child = child_capabilities(parent, requested);
         // Without GRANT, child gets USER_DEFAULT intersection
@@ -278,14 +278,14 @@ mod tests {
     }
 
     #[test]
-    fn test_check_capability_success() {
-        let caps = Capabilities::IPC.union(Capabilities::MEMORY);
-        assert!(check_capability(caps, Capabilities::IPC).is_ok());
+    fn test_require_success() {
+        let caps = Capabilities::IPC.with(Capabilities::MEMORY);
+        assert!(require(caps, Capabilities::IPC).is_ok());
     }
 
     #[test]
-    fn test_check_capability_failure() {
+    fn test_require_failure() {
         let caps = Capabilities::IPC;
-        assert!(check_capability(caps, Capabilities::MMIO).is_err());
+        assert!(require(caps, Capabilities::MMIO).is_err());
     }
 }

@@ -324,30 +324,6 @@ impl QueryHandler {
     }
 
     /// Send a SPAWN_CHILD command to a driver
-    ///
-    /// Returns the sequence ID used (for tracking acknowledgement)
-    pub fn send_spawn_child(
-        &mut self,
-        service_idx: u8,
-        binary: &[u8],
-        trigger_port: &[u8],
-    ) -> Option<u32> {
-        self.send_spawn_child_with_caps(service_idx, binary, trigger_port, 0)
-    }
-
-    /// Send a SPAWN_CHILD command to a driver with explicit capabilities
-    ///
-    /// Returns the sequence ID used (for tracking acknowledgement)
-    pub fn send_spawn_child_with_caps(
-        &mut self,
-        service_idx: u8,
-        binary: &[u8],
-        trigger_port: &[u8],
-        caps: u64,
-    ) -> Option<u32> {
-        self.send_spawn_child_with_context(service_idx, binary, trigger_port, caps, abi::priority::INHERIT, None)
-    }
-
     /// Send a SPAWN_CHILD command to a driver with capabilities and context.
     ///
     /// When `ctx` is Some, the context section is appended to the message

@@ -140,10 +140,6 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
     // Supervision reads are non-blocking (same as Channel). Userspace
     // uses wait_one() or Mux for blocking semantics.
 
-    // NOTE: Channel read is non-blocking (returns WouldBlock if no data).
-    // Use Mux to wait for data, or call wait_one() then recv().
-    // A proper blocking recv API should be added via a separate syscall flag.
-
     // For other types, get mutable ref and dispatch
     let result = object_service().with_table_mut(task_id, |table| {
         let Some(entry) = table.get_mut(handle) else {
@@ -1134,84 +1130,6 @@ fn read_process(p: &mut super::ProcessObject, buf_ptr: u64, buf_len: usize, task
     };
     p.wait_queue_mut().subscribe(super::Waiter::from_subscriber(sub, super::types::filter::READABLE));
     KernelError::WouldBlock.to_errno()
-}
-
-/// Read from channel with blocking - waits until data arrives or peer closes
-///
-/// This is the proper blocking recv() implementation. Instead of returning WouldBlock,
-/// it subscribes to the channel, blocks the task, and waits for data.
-fn read_channel_blocking(task_id: u32, handle: Handle, buf_ptr: u64, buf_len: usize) -> i64 {
-    // Main loop - keep trying until we have data or peer closes
-    loop {
-        // Phase 1: Get channel_id and check if closed
-        let channel_id = {
-            let result = object_service().with_table(task_id, |table| {
-                let Some(entry) = table.get(handle) else {
-                    return Err(KernelError::BadHandle);
-                };
-                let Object::Channel(ref ch) = entry.object else {
-                    return Err(KernelError::BadHandle);
-                };
-                Ok(ch.channel_id())
-            });
-
-            match result {
-                Ok(Ok(id)) => id,
-                Ok(Err(e)) => return e.to_errno(),
-                Err(_) => return KernelError::BadHandle.to_errno(),
-            }
-        };
-
-        if channel_id == 0 {
-            return KernelError::PeerClosed.to_errno();
-        }
-
-        // Phase 2: Check if channel is closed or has data
-        // (Subscription is handled by ChannelObject.subscribe() via WaitQueue)
-        let is_closed = ipc::channel_is_closed(channel_id);
-        let has_messages = ipc::channel_has_messages(channel_id);
-
-        if is_closed && !has_messages {
-            // Peer closed and no remaining messages
-            return KernelError::PeerClosed.to_errno();
-        }
-
-        if has_messages {
-            // Try to receive the message
-            match ipc::receive(channel_id, task_id) {
-                Ok(msg) => {
-                    let payload = msg.payload_slice();
-                    let copy_len = core::cmp::min(payload.len(), buf_len);
-
-                    if uaccess::copy_to_user(buf_ptr, &payload[..copy_len]).is_err() {
-                        return KernelError::BadAddress.to_errno();
-                    }
-
-                    return copy_len as i64;
-                }
-                Err(ipc::IpcError::WouldBlock) => {
-                    // Race: message was consumed by another thread, continue to block
-                }
-                Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
-                    return KernelError::PeerClosed.to_errno();
-                }
-                Err(_) => {
-                    return KernelError::BadHandle.to_errno();
-                }
-            }
-        }
-
-        // Phase 4: No data available - block the task
-        // Phase 5: Atomically block and context switch to another task.
-        // Uses sleep_and_reschedule to prevent SMP race where another CPU
-        // wakes+schedules us before our kernel context is saved.
-        if !crate::kernel::sched::sleep_and_reschedule(
-            crate::kernel::task::SleepReason::ChannelRecv
-        ) {
-            return KernelError::WouldBlock.to_errno();
-        }
-        // When we're woken, we'll loop back and try to receive again
-    }
 }
 
 /// Read from port via service - accepts connection and allocates channel handle

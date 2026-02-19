@@ -290,42 +290,11 @@ impl ProcessOps for KernelProcessOps {
 
     fn spawn(&self, parent: TaskId, source: SpawnSource) -> Result<TaskId, ProcessError> {
         match source {
-            SpawnSource::ElfId(id, name) => {
-                let elf_data = elf::get_elf_by_id(id).ok_or(ProcessError::NotFound)?;
-                match elf::spawn_from_elf_with_parent(elf_data, name, parent) {
-                    Ok((child_id, _)) => Ok(child_id),
-                    Err(_) => Err(ProcessError::OutOfMemory),
-                }
-            }
             SpawnSource::Path(path) => {
-                match elf::spawn_from_path_with_parent(path, parent) {
+                match elf::spawn_from_path(path, parent, Capabilities::from_bits(0)) {
                     Ok((child_id, _)) => Ok(child_id),
                     Err(elf::ElfError::NotExecutable) => Err(ProcessError::NotFound),
                     Err(_) => Err(ProcessError::OutOfMemory),
-                }
-            }
-            SpawnSource::PathWithCaps(path, caps) => {
-                let kernel_caps = Capabilities::from_bits(caps.bits());
-                match elf::spawn_from_path_with_caps_find(path, parent, kernel_caps) {
-                    Ok((child_id, _)) => Ok(child_id),
-                    Err(elf::ElfError::NotExecutable) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::BadMagic) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::WrongArch) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::Not64Bit) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::NotLittleEndian) => Err(ProcessError::InvalidElf),
-                    Err(_) => Err(ProcessError::NoSlots),
-                }
-            }
-            SpawnSource::PathWithCapsAndChannel(path, caps, channel_handle, priority) => {
-                let kernel_caps = Capabilities::from_bits(caps.bits());
-                match elf::spawn_from_path_with_caps_and_channel(path, parent, kernel_caps, channel_handle, priority) {
-                    Ok((child_id, _)) => Ok(child_id),
-                    Err(elf::ElfError::NotExecutable) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::BadMagic) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::WrongArch) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::Not64Bit) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::NotLittleEndian) => Err(ProcessError::InvalidElf),
-                    Err(_) => Err(ProcessError::NoSlots),
                 }
             }
             SpawnSource::PathWithCapsAndMailbox(path, caps, mailbox_data) => {
@@ -338,15 +307,6 @@ impl ProcessOps for KernelProcessOps {
                     Err(elf::ElfError::Not64Bit) => Err(ProcessError::InvalidElf),
                     Err(elf::ElfError::NotLittleEndian) => Err(ProcessError::InvalidElf),
                     Err(_) => Err(ProcessError::NoSlots),
-                }
-            }
-            SpawnSource::Memory(data, name) => {
-                match elf::spawn_from_elf_with_parent(data, name, parent) {
-                    Ok((child_id, _)) => Ok(child_id),
-                    Err(elf::ElfError::BadMagic) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::NotExecutable) => Err(ProcessError::InvalidElf),
-                    Err(elf::ElfError::WrongArch) => Err(ProcessError::InvalidElf),
-                    Err(_) => Err(ProcessError::OutOfMemory),
                 }
             }
         }

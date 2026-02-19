@@ -49,7 +49,7 @@ pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_
 pub use data_port::{DataPort, DataPortConfig, PortRole, Layer, ConnectedLayer, GeometryInfo};
 pub use devd::{
     DevdClient, ClientState,
-    DevdCommand, SpawnFilter, SpawnResult,
+    DevdCommand, SpawnFilter,
 };
 pub use bus::{
     BusMsg, BusMsgFlags, BusError, BusCtx, Driver, Disposition, ConfigKey,

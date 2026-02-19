@@ -773,7 +773,7 @@ impl Devd {
         // Discover kernel buses — rules fire on Ready, spawning bus drivers
         self.discover_kernel_buses();
         #[cfg(feature = "stress-test")]
-        self.create_and_spawn("testr", u64::MAX, &[], 0);
+        self.create_and_spawn("testr", u64::MAX, abi::priority::INHERIT, &[], 0);
 
         Ok(())
     }
@@ -846,7 +846,7 @@ impl Devd {
         let now = Self::now_ms();
 
         // Extract spawn info from service slot
-        let (name_buf, name_len, caps, trigger_port_buf, trigger_port_len) = {
+        let (name_buf, name_len, caps, priority, trigger_port_buf, trigger_port_len) = {
             let service = match self.services.get(idx) {
                 Some(s) => s,
                 None => return,
@@ -860,7 +860,7 @@ impl Devd {
             let tpl = service.trigger_port_len as usize;
             tp[..tpl].copy_from_slice(&service.trigger_port[..tpl]);
 
-            (nb, nl, service.caps, tp, tpl)
+            (nb, nl, service.caps, service.priority, tp, tpl)
         };
 
         let binary = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("???");
@@ -893,7 +893,7 @@ impl Devd {
         let mut mb_buf = [0u8; 4096];
         Self::build_spawn_mailbox(
             &mut mb_buf, port_type, trig_port_id, trigger_port,
-            &metadata_buf[..metadata_len], &pending_kvs[..kv_count],
+            &metadata_buf[..metadata_len], &pending_kvs[..kv_count], priority,
         );
 
         // Spawn with exec_with_mailbox — parent gets shmem handle + superq handle back
@@ -967,13 +967,14 @@ impl Devd {
         trigger_port: &[u8],
         metadata: &[u8],
         kvs: &[ContextKv],
+        priority: u8,
     ) {
         buf.fill(0);
 
         let mut hdr = abi::MailboxHeader::empty();
         hdr.bus_type = port_type;
         hdr.bus_index = port_id;
-        hdr.priority = abi::priority::INHERIT;
+        hdr.priority = priority;
 
         // Write KVs starting at offset 64 (after header)
         let mut kv_count: u8 = 0;
@@ -1032,7 +1033,7 @@ impl Devd {
 
     /// Create a service slot and spawn.  Used by check_class_rules for port-triggered
     /// drivers and by init for boot services.
-    fn create_and_spawn(&mut self, binary: &str, caps: u64, trigger_port: &[u8], link_id: u32) {
+    fn create_and_spawn(&mut self, binary: &str, caps: u64, priority: u8, trigger_port: &[u8], link_id: u32) {
         let now = Self::now_ms();
         let idx = match self.services.create_dynamic_service_with_state(
             0, binary.as_bytes(), now, ServiceState::Pending,
@@ -1046,6 +1047,7 @@ impl Devd {
 
         if let Some(service) = self.services.get_mut(idx) {
             service.caps = caps;
+            service.priority = priority;
             service.link_id = link_id;
             if !trigger_port.is_empty() {
                 service.set_trigger_port(trigger_port);
@@ -1358,8 +1360,8 @@ impl Devd {
         };
         let port = parts.next().map(|p| p.as_bytes());
 
-        // Spawn the driver dynamically
-        self.spawn_dynamic_driver(binary, port.unwrap_or(b""));
+        // Spawn via create_and_spawn (creates service slot + spawns)
+        self.create_and_spawn(binary, 0, abi::priority::INHERIT, port.unwrap_or(b""), 0);
         b"OK\n"
     }
 
@@ -4026,99 +4028,12 @@ impl Devd {
                 // Update existing service's link_id to the new one
                 if let Some(service) = self.services.get_mut(idx) {
                     service.link_id = link_id;
+                    service.priority = rule.priority;
                 }
                 self.spawn_service(idx);
             } else {
-                self.create_and_spawn(rule.driver, rule.caps, port_name, link_id);
+                self.create_and_spawn(rule.driver, rule.caps, rule.priority, port_name, link_id);
             }
-        }
-    }
-
-    /// Spawn a driver dynamically
-    fn spawn_dynamic_driver(&mut self, binary: &str, trigger_port: &[u8]) {
-        self.spawn_dynamic_driver_with_caps(binary, trigger_port, 0);
-    }
-
-    /// Spawn a driver dynamically with explicit capabilities
-    fn spawn_dynamic_driver_with_caps(&mut self, binary: &str, trigger_port: &[u8], caps: u64) {
-        let now = Self::now_ms();
-
-        // Gather port metadata for the birth mailbox
-        let (port_type, metadata_buf, metadata_len, trig_port_id) = if !trigger_port.is_empty() {
-            let pt = self.ports.get_port_type(trigger_port).unwrap_or(0);
-            let pid_val = self.ports.get_port_id(trigger_port).unwrap_or(0xFF);
-            let md: ([u8; 64], usize) = self.ports.get(trigger_port)
-                .map(|p| {
-                    let m = p.metadata();
-                    let mut buf = [0u8; 64];
-                    let len = m.len().min(64);
-                    buf[..len].copy_from_slice(&m[..len]);
-                    (buf, len)
-                })
-                .unwrap_or(([0u8; 64], 0));
-            (pt, md.0, md.1, pid_val)
-        } else {
-            (0u8, [0u8; 64], 0usize, 0xFF)
-        };
-
-        // Build mailbox with spawn context
-        let mut mb_buf = [0u8; 4096];
-        let empty_kvs: [ContextKv; 0] = [];
-        Self::build_spawn_mailbox(
-            &mut mb_buf, port_type, trig_port_id, trigger_port,
-            &metadata_buf[..metadata_len], &empty_kvs,
-        );
-
-        // Spawn with mailbox
-        let (pid, parent_mb_handle, parent_superq_handle) = match self.process_mgr.spawn_with_caps(binary, caps, &mb_buf) {
-            Ok(result) => result,
-            Err(_) => {
-                uerror!("devd", "dynamic_spawn_failed"; binary = binary);
-                return;
-            }
-        };
-
-        // Map the mailbox shmem
-        let mb_addr = match userlib::syscall::map(parent_mb_handle, 0) {
-            Ok(addr) if addr != 0 => addr,
-            _ => 0,
-        };
-
-        // Store spawn context
-        if !trigger_port.is_empty() {
-            self.store_spawn_context(pid, port_type, trigger_port, &metadata_buf[..metadata_len], trig_port_id);
-        }
-
-        // Create service slot
-        let slot_idx = self.services.create_dynamic_service(pid, binary.as_bytes(), now);
-
-        if let Some(idx) = slot_idx {
-            if let Some(service) = self.services.get_mut(idx) {
-                service.set_trigger_port(trigger_port);
-                service.caps = caps;
-            }
-
-            self.add_recent_dynamic_pid(pid, idx as u8);
-
-            // Add supervision-based client (SuperQ for bidirectional communication)
-            if mb_addr != 0 {
-                let superq = userlib::SupervisionHandle::from_handle(parent_superq_handle);
-                let superq_handle = superq.handle();
-                match self.query_handler.add_supervision_client(
-                    superq, idx as u8, pid,
-                ) {
-                    Some(_slot) => {
-                        if let Some(events) = &mut self.events {
-                            let _ = events.watch(superq_handle);
-                        }
-                    }
-                    None => {
-                        uwarn!("devd", "no_query_slot_dyn"; pid = pid);
-                    }
-                }
-            }
-        } else {
-            uerror!("devd", "no_dynamic_slot"; pid = pid);
         }
     }
 

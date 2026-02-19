@@ -22,7 +22,7 @@ pub mod syscall {
     pub const GETPID: u64 = 3;
     pub const MMAP: u64 = 4;
     pub const MUNMAP: u64 = 5;
-    pub const SPAWN: u64 = 8;
+    // 8: Spawn removed — use exec + exec_with_mailbox
     pub const WAIT: u64 = 9;
     pub const GETTIME: u64 = 10;
     pub const SLEEP: u64 = 11;
@@ -38,11 +38,10 @@ pub mod syscall {
 
     // Misc
     pub const RAMFS_LIST: u64 = 63;
-    pub const EXEC_MEM: u64 = 64;
+    // 64: ExecMem removed
     pub const KLOG_READ: u64 = 65;
     pub const GET_CAPABILITIES: u64 = 66;
-    pub const EXEC_WITH_CAPS: u64 = 74;
-    pub const EXEC_WITH_CHANNEL: u64 = 75;
+    // 74-75: ExecWithCaps/ExecWithChannel removed
     pub const KLOG: u64 = 76;
     pub const KLOG_WRITE: u64 = 77;
     pub const GET_PRIORITY: u64 = 78;

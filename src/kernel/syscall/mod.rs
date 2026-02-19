@@ -46,8 +46,7 @@ pub enum SyscallNumber {
     GetPid = 3,
     Mmap = 4,
     Munmap = 5,
-    // 6-7: legacy IPC (removed)
-    Spawn = 8,
+    // 6-8: legacy IPC/spawn (removed)
     Wait = 9,
     GetTime = 10,
     Sleep = 11,
@@ -66,14 +65,12 @@ pub enum SyscallNumber {
     // 57-59: legacy timer/heartbeat/bus_list (removed)
     // 60-62: legacy MmapDevice/DmaPoolCreate/DmaPoolCreateHigh (removed) - use open(Mmio/DmaPool) + map()
     RamfsList = 63,
-    ExecMem = 64,
+    // 64: ExecMem removed — use exec + exec_with_mailbox
     KlogRead = 65,
     GetCapabilities = 66,
     // 67: legacy ChannelGetPeer (removed)
     // CpuStats = 68 - REMOVED: statistics belong in userspace service
-    // 70-75: legacy kevent/device_list (removed) - use unified open/read
-    ExecWithCaps = 74,
-    ExecWithChannel = 75,
+    // 70-75: legacy kevent/device_list/exec_with_caps/exec_with_channel (removed)
     Klog = 76,  // Compatibility shim - writes to klog ring buffer
     KlogWrite = 77,  // Inject binary log record into kernel ring
     GetPriority = 78,  // Get caller's base and effective priority
@@ -107,7 +104,6 @@ impl From<u64> for SyscallNumber {
             3 => SyscallNumber::GetPid,
             4 => SyscallNumber::Mmap,
             5 => SyscallNumber::Munmap,
-            8 => SyscallNumber::Spawn,
             9 => SyscallNumber::Wait,
             10 => SyscallNumber::GetTime,
             11 => SyscallNumber::Sleep,
@@ -125,12 +121,11 @@ impl From<u64> for SyscallNumber {
             // 59: legacy BusList -> Invalid (use unified interface)
             // 60-62: legacy MmapDevice/DmaPoolCreate/DmaPoolCreateHigh -> Invalid
             63 => SyscallNumber::RamfsList,
-            64 => SyscallNumber::ExecMem,
+            // 64: ExecMem removed
             65 => SyscallNumber::KlogRead,
             66 => SyscallNumber::GetCapabilities,
             // 68 => CpuStats - REMOVED (use service)
-            74 => SyscallNumber::ExecWithCaps,
-            75 => SyscallNumber::ExecWithChannel,
+            // 74-75: ExecWithCaps/ExecWithChannel removed
             76 => SyscallNumber::Klog,
             77 => SyscallNumber::KlogWrite,
             78 => SyscallNumber::GetPriority,
@@ -231,12 +226,8 @@ pub fn handle(args: &SyscallArgs) -> i64 {
     let result = match syscall {
         // Process management (process.rs)
         SyscallNumber::Exit => process::sys_exit(args.arg0 as i32),
-        SyscallNumber::Spawn => process::sys_spawn(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::Wait => process::sys_wait(args.arg0 as i32, args.arg1, args.arg2 as u32),
         SyscallNumber::Exec => process::sys_exec(args.arg0, args.arg1 as usize),
-        SyscallNumber::ExecWithCaps => process::sys_exec_with_caps(args.arg0, args.arg1 as usize, args.arg2),
-        SyscallNumber::ExecWithChannel => process::sys_exec_with_channel(args.arg0, args.arg1 as usize, args.arg2, args.arg3 as u32, args.arg4 as u8),
-        SyscallNumber::ExecMem => process::sys_exec_mem(args.arg0, args.arg1 as usize, args.arg2, args.arg3 as usize),
         SyscallNumber::Daemonize => process::sys_daemonize(),
         SyscallNumber::Kill => process::sys_kill(args.arg0 as u32),
         SyscallNumber::PsInfo => process::sys_ps_info(args.arg0, args.arg1 as usize),
@@ -319,7 +310,6 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::GetPid => "getpid",
         SyscallNumber::Mmap => "mmap",
         SyscallNumber::Munmap => "munmap",
-        SyscallNumber::Spawn => "spawn",
         SyscallNumber::Wait => "wait",
         SyscallNumber::GetTime => "gettime",
         SyscallNumber::Sleep => "sleep",
@@ -333,7 +323,6 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::Shutdown => "shutdown",
         // Misc
         SyscallNumber::RamfsList => "ramfs_list",
-        SyscallNumber::ExecMem => "exec_mem",
         SyscallNumber::KlogRead => "klog_read",
         SyscallNumber::Klog => "klog",
         SyscallNumber::KlogWrite => "klog_write",
@@ -344,8 +333,6 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::ResetStats => "reset_stats",
         SyscallNumber::Sysinfo => "sysinfo",
         SyscallNumber::GetCapabilities => "get_capabilities",
-        SyscallNumber::ExecWithCaps => "exec_with_caps",
-        SyscallNumber::ExecWithChannel => "exec_with_channel",
         SyscallNumber::ExecWithMailbox => "exec_with_mailbox",
         // Unified interface (100-105)
         SyscallNumber::Open => "open",

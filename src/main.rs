@@ -243,7 +243,6 @@ pub extern "C" fn kmain() -> ! {
         kernel::syscall::test();
         kernel::process::test();
         // IPC tests covered by object system tests in kernel::syscall::test()
-        elf::test();
         smp::test();
 
         // Platform-specific tests (MT7988A only)
@@ -299,7 +298,7 @@ pub extern "C" fn kmain() -> ! {
         // Pass PROBED capabilities at spawn time so they're set atomically
         // under the scheduler lock — avoids SMP race where probed runs
         // before capabilities are applied.
-        match elf::spawn_from_path_with_caps_find("bin/probed", 0, kernel::caps::Capabilities::PROBED) {
+        match elf::spawn_from_path("bin/probed", 0, kernel::caps::Capabilities::PROBED) {
             Ok((_task_id, slot)) => {
                 kdebug!("kernel", "probed_spawned"; slot = slot);
                 klog::flush();
@@ -1009,7 +1008,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
         // Step 2: Respawn devd
         // (Buses already reset to Safe by process_cleanup above)
         print_str_uart("  Respawning devd...\r\n");
-        match elf::spawn_from_path("bin/devd") {
+        match elf::spawn_from_path("bin/devd", 0, kernel::caps::Capabilities::from_bits(0)) {
             Ok((new_pid, slot)) => {
                 print_str_uart("  devd restarted as PID ");
                 print_hex_uart(new_pid as u64);
@@ -1345,7 +1344,7 @@ pub extern "C" fn recover_devd() {
 
     // Step 3: Respawn devd - same as boot
     print_str_uart("  Respawning devd...\r\n");
-    match elf::spawn_from_path("bin/devd") {
+    match elf::spawn_from_path("bin/devd", 0, kernel::caps::Capabilities::from_bits(0)) {
         Ok((new_pid, slot)) => {
             print_str_uart("  devd spawned as PID ");
             print_hex_uart(new_pid as u64);

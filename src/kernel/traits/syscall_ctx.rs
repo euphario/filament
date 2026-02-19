@@ -56,9 +56,6 @@ pub trait SyscallContext: Send + Sync {
     // Subsystem Access
     // ========================================================================
 
-    /// Access object operations (the unified 5-syscall interface)
-    fn objects(&self) -> &dyn ObjectOps;
-
     /// Access raw object operations (syscall-level, with user pointers)
     fn raw_objects(&self) -> &dyn RawObjectOps;
 
@@ -76,7 +73,6 @@ pub trait SyscallContext: Send + Sync {
 }
 
 // Forward declare the subsystem traits (defined in other files)
-use super::object_ops::ObjectOps;
 use super::raw_object_ops::RawObjectOps;
 use super::memory_ops::MemoryOps;
 use super::process_ops::ProcessOps;
