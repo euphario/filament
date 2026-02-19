@@ -294,6 +294,7 @@ pub fn create_bus(info: &abi::BusCreateInfo, kernel_pid: Pid) -> Result<(), BusE
         abi::bus_type::UART => BusType::Uart,
         abi::bus_type::KLOG => BusType::Klog,
         abi::bus_type::CPU => BusType::Cpu,
+        abi::bus_type::PWM => BusType::Pwm,
         _ => return Err(BusError::InvalidMessage),
     };
 
@@ -302,7 +303,7 @@ pub fn create_bus(info: &abi::BusCreateInfo, kernel_pid: Pid) -> Result<(), BusE
     // Determine initial state: PCIe/USB need hardware reset, others start Safe
     let initial_state = match bus_type {
         BusType::PCIe | BusType::Usb => BusState::Resetting,
-        BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog | BusType::Cpu => BusState::Safe,
+        BusType::Platform | BusType::Ethernet | BusType::Uart | BusType::Klog | BusType::Cpu | BusType::Pwm => BusState::Safe,
     };
 
     with_bus_registry(|registry| {
@@ -462,6 +463,7 @@ pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: 
         "uart" => BusType::Uart,
         "klog" => BusType::Klog,
         "cpu" => BusType::Cpu,
+        "pwm" => BusType::Pwm,
         _ => return Err(BusError::NotFound),
     };
 
@@ -599,6 +601,7 @@ pub fn register_device(bus_type_id: u8, bus_index: u8, dev: abi::BusDevice) -> R
         abi::bus_type::UART => BusType::Uart,
         abi::bus_type::KLOG => BusType::Klog,
         abi::bus_type::CPU => BusType::Cpu,
+        abi::bus_type::PWM => BusType::Pwm,
         _ => return Err(BusError::InvalidMessage),
     };
 

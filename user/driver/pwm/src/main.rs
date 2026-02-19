@@ -1,304 +1,244 @@
-//! PWM Driver for MT7988 Fan Control
+//! PWM Fan Driver for MT7988A
 //!
-//! Controls the CPU fan via PWM6 on GPIO62.
+//! Controls the CPU fan via PWM0 on GPIO57.
 //!
-//! Hardware:
+//! Hardware (from Linux DTS: fan { pwms = <&pwm 0 50000>; }):
 //!   - PWM controller: 0x10048000
-//!   - Pinctrl: 0x1001f000
+//!   - Channel 0 (offset 0x80)
+//!   - GPIO57, pinmux mode 1
 //!   - Fan connector: 3-pin (GND, 5V, PWM)
-//!   - PWM6_0 group uses GPIO62
 
 #![no_std]
 #![no_main]
-#![allow(dead_code)]  // PWM constants for different channels
 
-use userlib::{syscall, MmioRegion, uinfo, uwarn, uerror};
-use userlib::syscall::{
-    Handle, WaitFilter, WaitRequest, WaitResult,
-    handle_wait, handle_wrap_channel,
-};
+extern crate userlib;
+
+use userlib::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
+use userlib::bus_runtime::driver_main;
+use userlib::MmioRegion;
+use userlib::uinfo;
 
 // =============================================================================
-// MT7988 PWM Controller
+// MT7988 PWM Hardware Constants
 // =============================================================================
 
-/// PWM controller base address
-const PWM_BASE: u64 = 0x10048000;
-const PWM_SIZE: u64 = 0x1000;
-
-/// MT7988 PWM channel configuration
-/// Channel base offset: 0x80, channel spacing: 0x40
-const PWM_CHANNEL_BASE: usize = 0x80;
-const PWM_CHANNEL_STRIDE: usize = 0x40;
-
-/// PWM6 is used for the fan
-const FAN_PWM_CHANNEL: usize = 6;
+/// PWM channel 0 base offset within PWM controller MMIO
+const PWM_CH0_BASE: usize = 0x80;
 
 /// PWM register offsets (relative to channel base)
-mod pwm_reg {
-    pub const PWMCON: usize = 0x00;      // Control register
-    pub const PWMDWIDTH: usize = 0x2C;   // Period width (bits 12:0)
-    pub const PWMTHRES: usize = 0x30;    // Duty threshold (bits 12:0)
-}
+const PWMCON: usize = 0x00;
+const PWMDWIDTH: usize = 0x2C;
+const PWMTHRES: usize = 0x30;
 
-/// PWMCON register bits
-mod pwmcon {
-    pub const OLD_MODE: u32 = 1 << 15;   // Old PWM mode (ignores CLKSEL)
-}
+/// PWMCON bits
+const PWMCON_OLD_MODE: u32 = 1 << 15;
 
-/// Global PWM enable register
-const PWM_EN: usize = 0x0000;
+/// Global PWM enable register (offset 0 from PWM base)
+const PWM_EN: usize = 0x00;
 
-// =============================================================================
-// MT7988 Pinctrl (GPIO62 → PWM6)
-// =============================================================================
+/// Pinctrl GPIO mode register base (within pinctrl MMIO)
+const GPIO_MODE_BASE: usize = 0x300;
 
-/// Pinctrl base address
-const PINCTRL_BASE: u64 = 0x1001f000;
+/// GPIO57 pinmux: register offset = 0x300 + (57/8)*4 = 0x31C
+///                 bit shift = (57%8)*4 = 4
+///                 mode value = 1 (PWM0 function)
+const GPIO57_MODE_OFFSET: usize = GPIO_MODE_BASE + (57 / 8) * 4; // 0x31C
+const GPIO57_MODE_SHIFT: usize = (57 % 8) * 4;                    // 4
+const GPIO57_MODE_MASK: u32 = 0xF << GPIO57_MODE_SHIFT;           // 0xF0
+const GPIO57_PWM_MODE: u32 = 1;
+
+/// PWM period (13-bit max = 8191). Use 4096 for easy percentage math.
+const PWM_PERIOD: u32 = 4096;
+
+/// Pinctrl base address and size (for MMIO open)
+const PINCTRL_BASE: u64 = 0x1001_F000;
 const PINCTRL_SIZE: u64 = 0x1000;
 
-/// GPIO mode registers
-/// Each register controls 8 pins, 4 bits per pin
-/// GPIO62 is in register 62/8 = 7, bits (62%8)*4 = 24-27
-const GPIO_MODE_BASE: usize = 0x300;
-const GPIO62_MODE_REG: usize = GPIO_MODE_BASE + (62 / 8) * 4;  // 0x31C
-const GPIO62_MODE_SHIFT: usize = (62 % 8) * 4;  // 24
-const GPIO62_MODE_MASK: u32 = 0xF << 24;
-
-/// PWM function mode value for GPIO62
-/// Mode 0 = GPIO, Mode 1-7 = alternate functions
-/// PWM6_0 is typically mode 1
-const GPIO62_PWM_MODE: u32 = 1;
-
 // =============================================================================
-// PWM Driver
+// Fan Driver
 // =============================================================================
 
-struct PwmDriver {
-    pwm: MmioRegion,
-    pinctrl: MmioRegion,
-    period: u32,      // PWM period value
-    duty: u32,        // Current duty cycle (0-100)
+struct FanDriver {
+    bus_id: Option<KernelBusId>,
+    pwm: Option<MmioRegion>,
+    duty_pct: u32,
 }
 
-impl PwmDriver {
-    fn new(pwm: MmioRegion, pinctrl: MmioRegion) -> Self {
+impl FanDriver {
+    fn new() -> Self {
         Self {
-            pwm,
-            pinctrl,
-            period: 0,
-            duty: 0,
+            bus_id: None,
+            pwm: None,
+            duty_pct: 0,
         }
     }
 
-    /// Get channel register offset
-    fn channel_offset(&self, channel: usize) -> usize {
-        PWM_CHANNEL_BASE + channel * PWM_CHANNEL_STRIDE
+    /// Configure GPIO57 pinmux to PWM0 function (mode 1)
+    fn configure_pinmux(&self, pinctrl: &MmioRegion) {
+        let val = pinctrl.read32(GPIO57_MODE_OFFSET);
+        let new_val = (val & !GPIO57_MODE_MASK) | (GPIO57_PWM_MODE << GPIO57_MODE_SHIFT);
+        pinctrl.write32(GPIO57_MODE_OFFSET, new_val);
     }
 
-    /// Configure GPIO62 for PWM6 function
-    ///
-    /// MT7988 has a complex pinctrl system with multiple register regions.
-    /// The GPIO MODE registers are in the gpio region (0x1001f000).
-    /// Pin 62 is in the 7th 32-bit register (62/8 = 7), bits 24-27.
-    ///
-    /// However, the bootloader (U-Boot) may have already configured this,
-    /// and the pinctrl might need additional setup in other iocfg regions.
-    fn configure_pinmux(&mut self) -> bool {
-        // Standard 8-pins-per-register layout: offset = 0x300 + (pin/8)*4
-        // Pin 62: register 7 at offset 0x31C, bits [27:24]
-        let mode_offset_v1 = GPIO_MODE_BASE + (62 / 8) * 4;  // 0x31C
+    /// Initialize PWM channel 0 and set fan to 100%
+    fn init_pwm(&mut self) {
+        let pwm = match &self.pwm {
+            Some(p) => p,
+            None => return,
+        };
 
-        // Read current value
-        let mode_v1 = self.pinctrl.read32(mode_offset_v1);
+        // Enable PWM channel 0 in global enable register
+        let en = pwm.read32(PWM_EN);
+        pwm.write32(PWM_EN, en | (1 << 0));
 
-        // Try writing to the standard offset
-        let bit_shift = (62 % 8) * 4;  // 24
-        let mode_mask = 0xFu32 << bit_shift;
-        let new_mode = (mode_v1 & !mode_mask) | (GPIO62_PWM_MODE << bit_shift);
+        // Configure PWMCON: old mode, no clock division
+        pwm.write32(PWM_CH0_BASE + PWMCON, PWMCON_OLD_MODE);
 
-        self.pinctrl.write32(mode_offset_v1, new_mode);
+        // Set period
+        pwm.write32(PWM_CH0_BASE + PWMDWIDTH, PWM_PERIOD);
 
-        // Verify
-        let verify = self.pinctrl.read32(mode_offset_v1);
-
-        if verify == new_mode && verify != mode_v1 {
-            uinfo!("pwm", "pinmux_configured"; gpio = 62u64);
-            true
-        } else {
-            uwarn!("pwm", "pinmux_unchanged"; gpio = 62u64);
-            // Continue anyway - PWM might still work (bootloader may have pre-configured)
-            true
-        }
-    }
-
-    /// Initialize PWM6 for fan control
-    fn init_pwm(&mut self) -> bool {
-        let ch_off = self.channel_offset(FAN_PWM_CHANNEL);
-
-        // Enable PWM6 in global enable register
-        let en = self.pwm.read32(PWM_EN);
-        self.pwm.write32(PWM_EN, en | (1 << FAN_PWM_CHANNEL));
-
-        // Configure PWMCON: old mode, clock divider = 0 (no division)
-        // Old mode uses PWMDWIDTH/PWMTHRES for period/duty
-        let pwmcon = pwmcon::OLD_MODE | 0;  // divider = 0
-        self.pwm.write32(ch_off + pwm_reg::PWMCON, pwmcon);
-
-        // Set period (max 13 bits = 8191)
-        // Use 4096 for easy percentage calculation
-        self.period = 4096;
-        self.pwm.write32(ch_off + pwm_reg::PWMDWIDTH, self.period);
-
-        // Set initial duty to 0 (fan off)
-        self.duty = 0;
-        self.pwm.write32(ch_off + pwm_reg::PWMTHRES, 0);
-
-        uinfo!("pwm", "channel_ready"; channel = FAN_PWM_CHANNEL as u64);
-        true
+        // Set 100% duty (full speed at boot for thermal safety)
+        pwm.write32(PWM_CH0_BASE + PWMTHRES, PWM_PERIOD);
+        self.duty_pct = 100;
     }
 
     /// Set fan speed (0-100%)
-    fn set_fan_speed(&mut self, percent: u32) -> bool {
+    fn set_fan_speed(&mut self, percent: u32) {
         let percent = percent.min(100);
-        self.duty = percent;
+        self.duty_pct = percent;
 
-        // Calculate threshold from percentage
-        // threshold = period * percent / 100
-        let threshold = (self.period * percent) / 100;
+        if let Some(pwm) = &self.pwm {
+            let threshold = (PWM_PERIOD * percent) / 100;
+            pwm.write32(PWM_CH0_BASE + PWMTHRES, threshold);
+        }
+    }
+}
 
-        let ch_off = self.channel_offset(FAN_PWM_CHANNEL);
-        self.pwm.write32(ch_off + pwm_reg::PWMTHRES, threshold);
+fn copy_to(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
+    let len = src.len().min(buf.len().saturating_sub(pos));
+    buf[pos..pos + len].copy_from_slice(&src[..len]);
+    pos + len
+}
 
-        true
+fn fmt_u32(buf: &mut [u8], pos: usize, val: u32) -> usize {
+    let mut tmp = [0u8; 12];
+    let len = format_u32(&mut tmp, val);
+    copy_to(buf, pos, &tmp[..len])
+}
+
+fn format_u32(buf: &mut [u8], val: u32) -> usize {
+    if val == 0 {
+        if !buf.is_empty() { buf[0] = b'0'; }
+        return 1;
+    }
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 { len += 1; n /= 10; }
+    n = val;
+    let w = len.min(buf.len());
+    for i in (0..w).rev() {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    w
+}
+
+fn parse_u32(s: &[u8]) -> Option<u32> {
+    if s.is_empty() { return None; }
+    let mut val: u32 = 0;
+    for &b in s {
+        if b < b'0' || b > b'9' { return None; }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(val)
+}
+
+// =============================================================================
+// Config Keys
+// =============================================================================
+
+const FAN_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_write(b"fan"),
+];
+
+// =============================================================================
+// Driver Trait Implementation
+// =============================================================================
+
+impl Driver for FanDriver {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        let (bus_id, _info) = ctx.claim_kernel_bus(b"/pwm:0")?;
+        self.bus_id = Some(bus_id);
+
+        // Map PWM MMIO (base comes from bus info, but we also need pinctrl)
+        let pwm_mmio = match MmioRegion::open(0x1004_8000, 0x1000) {
+            Some(m) => m,
+            None => return Err(BusError::NotPresent),
+        };
+
+        // Map pinctrl MMIO for GPIO57 mux configuration
+        let pinctrl_mmio = match MmioRegion::open(PINCTRL_BASE, PINCTRL_SIZE) {
+            Some(m) => m,
+            None => return Err(BusError::NotPresent),
+        };
+
+        // Configure GPIO57 → PWM0
+        self.configure_pinmux(&pinctrl_mmio);
+
+        self.pwm = Some(pwm_mmio);
+
+        // Initialize PWM channel 0 at 100% (thermal safety default)
+        self.init_pwm();
+
+        uinfo!("pwmd", "ready"; fan = self.duty_pct as u64);
+
+        Ok(())
     }
 
-    /// Get current fan speed (0-100%)
-    fn get_fan_speed(&self) -> u32 {
-        self.duty
+    fn command(&mut self, _msg: &BusMsg, _ctx: &mut dyn BusCtx) -> Disposition {
+        Disposition::Forward
+    }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        FAN_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        match key {
+            b"fan" => {
+                let mut p = fmt_u32(buf, 0, self.duty_pct);
+                p = copy_to(buf, p, b"%");
+                p
+            }
+            _ => 0,
+        }
+    }
+
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize {
+        match key {
+            b"fan" => {
+                if let Some(pct) = parse_u32(value) {
+                    if pct > 100 {
+                        return copy_to(buf, 0, b"ERR range 0-100\n");
+                    }
+                    self.set_fan_speed(pct);
+                    let mut p = fmt_u32(buf, 0, self.duty_pct);
+                    p = copy_to(buf, p, b"%");
+                    p
+                } else {
+                    copy_to(buf, 0, b"ERR invalid number\n")
+                }
+            }
+            _ => 0,
+        }
     }
 }
 
 // =============================================================================
-// IPC Message Protocol
-// =============================================================================
-
-/// PWM IPC commands
-const PWM_CMD_SET_FAN: u8 = 1;    // Set fan speed: [1, percent]
-const PWM_CMD_GET_FAN: u8 = 2;    // Get fan speed: [2] -> [percent]
-
-// =============================================================================
-// Main
+// Entry Point
 // =============================================================================
 
 #[unsafe(no_mangle)]
 fn main() {
-    uinfo!("pwm", "init_start");
-
-    // Register the "pwm" port
-    let port_result = syscall::port_register(b"pwm");
-    if port_result < 0 {
-        if port_result == -17 {  // EEXIST
-            uerror!("pwm", "port_exists");
-        } else {
-            uerror!("pwm", "port_register_failed"; err = port_result as i64);
-        }
-        syscall::exit(1);
-    }
-    let listen_channel = port_result as u32;
-
-    // Open MMIO regions
-    let pwm_mmio = match MmioRegion::open(PWM_BASE, PWM_SIZE) {
-        Some(m) => m,
-        None => {
-            uerror!("pwm", "mmio_map_failed"; region = "pwm");
-            syscall::exit(1);
-        }
-    };
-
-    let pinctrl_mmio = match MmioRegion::open(PINCTRL_BASE, PINCTRL_SIZE) {
-        Some(m) => m,
-        None => {
-            uerror!("pwm", "mmio_map_failed"; region = "pinctrl");
-            syscall::exit(1);
-        }
-    };
-
-    // Create driver
-    let mut pwm = PwmDriver::new(pwm_mmio, pinctrl_mmio);
-
-    // Configure pinmux
-    if !pwm.configure_pinmux() {
-        uwarn!("pwm", "pinmux_failed");
-    }
-
-    // Initialize PWM
-    if !pwm.init_pwm() {
-        uerror!("pwm", "init_failed");
-        syscall::exit(1);
-    }
-
-    // Set initial fan speed to 100%
-    pwm.set_fan_speed(100);
-
-    // Wrap the listen channel as a handle (Handle API)
-    let channel_handle = match handle_wrap_channel(listen_channel) {
-        Ok(h) => h,
-        Err(_) => {
-            uerror!("pwm", "channel_wrap_failed");
-            syscall::exit(1);
-        }
-    };
-
-    uinfo!("pwm", "init_complete"; channel = listen_channel as u64);
-
-    // Event-driven main loop (Handle API)
-    let requests = [WaitRequest::new(channel_handle, WaitFilter::Readable)];
-    let mut results = [WaitResult::empty(); 1];
-    let mut msg_buf = [0u8; 16];
-
-    loop {
-        // Wait for connection (blocking)
-        let count = match handle_wait(&requests, &mut results, u64::MAX) {
-            Ok(n) => n,
-            Err(_) => {
-                syscall::yield_now();
-                continue;
-            }
-        };
-
-        if count == 0 {
-            continue;
-        }
-
-        // Accept connection (non-blocking since we know it's ready)
-        let client = syscall::port_accept(listen_channel);
-        if client < 0 {
-            continue;
-        }
-        let client_ch = client as u32;
-
-        // Read request
-        let len = syscall::receive(client_ch, &mut msg_buf);
-        if len > 0 {
-            let cmd = msg_buf[0];
-            let response = match cmd {
-                PWM_CMD_SET_FAN if len >= 2 => {
-                    let percent = msg_buf[1] as u32;
-                    pwm.set_fan_speed(percent);
-                    percent as i8
-                }
-                PWM_CMD_GET_FAN => {
-                    pwm.get_fan_speed() as i8
-                }
-                _ => -22i8,  // EINVAL
-            };
-
-            // Send response
-            let resp = [response as u8];
-            let _ = syscall::send(client_ch, &resp);
-        }
-
-        syscall::channel_close(client_ch);
-    }
+    driver_main(b"pwmd", FanDriver::new());
 }

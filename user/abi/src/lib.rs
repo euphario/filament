@@ -1219,6 +1219,8 @@ pub mod bus_type {
     pub const KLOG: u8 = 5;
     /// CPU power management
     pub const CPU: u8 = 6;
+    /// PWM controller (fan, LED, etc.)
+    pub const PWM: u8 = 7;
 }
 
 /// Bus creation info passed to open(Bus)
@@ -1611,6 +1613,7 @@ pub enum PortClass {
     Klog = 13,              // Kernel log (kernel bus)
     Ethernet = 14,          // Ethernet controller (kernel bus)
     Cpu = 15,               // CPU power management (kernel bus)
+    Pwm = 16,               // PWM controller (kernel bus)
 }
 
 impl PortClass {
@@ -1632,6 +1635,7 @@ impl PortClass {
             13 => Some(PortClass::Klog),
             14 => Some(PortClass::Ethernet),
             15 => Some(PortClass::Cpu),
+            16 => Some(PortClass::Pwm),
             _ => None,
         }
     }

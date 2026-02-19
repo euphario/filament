@@ -141,6 +141,15 @@ pub static PORT_RULES: &[PortRule] = &[
         context: &[],
         mount_path: None,
     },
+    PortRule {
+        class: PortClass::Pwm,
+        subclass: SubclassMatch::Any,
+        driver: "pwmd",
+        caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::NORMAL,
+        context: &[],
+        mount_path: None,
+    },
     // Klog→logd rule removed: logd needs rewrite for 5-syscall API
 
     // =========================================================================

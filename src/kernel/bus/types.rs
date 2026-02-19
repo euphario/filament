@@ -69,6 +69,8 @@ pub enum BusType {
     Klog = 5,
     /// CPU power management
     Cpu = 6,
+    /// PWM controller (fan, LED, etc.)
+    Pwm = 7,
 }
 
 impl BusType {
@@ -81,6 +83,7 @@ impl BusType {
             BusType::Uart => "uart",
             BusType::Klog => "klog",
             BusType::Cpu => "cpu",
+            BusType::Pwm => "pwm",
         }
     }
 }

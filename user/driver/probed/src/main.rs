@@ -164,4 +164,16 @@ fn register_mt7988_buses() {
 
     // CPU power management
     bus_create(&BusCreateInfo::new(bus_type::CPU, 0));
+
+    // PWM controller (fan control on GPIO57/PWM0)
+    bus_create(&BusCreateInfo {
+        bus_type: bus_type::PWM,
+        bus_index: 0,
+        flags: 0,
+        _pad: 0,
+        base_addr: 0x1004_8000,
+        size: 0x1000,
+        irq: 0,
+        _reserved: [0; 4],
+    });
 }
