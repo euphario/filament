@@ -328,6 +328,18 @@ impl ProcessOps for KernelProcessOps {
                     Err(_) => Err(ProcessError::NoSlots),
                 }
             }
+            SpawnSource::PathWithCapsAndMailbox(path, caps, mailbox_data) => {
+                let kernel_caps = Capabilities::from_bits(caps.bits());
+                match elf::spawn_from_path_with_caps_and_mailbox(path, parent, kernel_caps, mailbox_data) {
+                    Ok(result) => Ok(result.child_id),
+                    Err(elf::ElfError::NotExecutable) => Err(ProcessError::InvalidElf),
+                    Err(elf::ElfError::BadMagic) => Err(ProcessError::InvalidElf),
+                    Err(elf::ElfError::WrongArch) => Err(ProcessError::InvalidElf),
+                    Err(elf::ElfError::Not64Bit) => Err(ProcessError::InvalidElf),
+                    Err(elf::ElfError::NotLittleEndian) => Err(ProcessError::InvalidElf),
+                    Err(_) => Err(ProcessError::NoSlots),
+                }
+            }
             SpawnSource::Memory(data, name) => {
                 match elf::spawn_from_elf_with_parent(data, name, parent) {
                     Ok((child_id, _)) => Ok(child_id),

@@ -926,6 +926,124 @@ pub fn spawn_from_path_with_caps_and_channel(
     Ok((child_id, slot))
 }
 
+/// Spawn a process from ramfs path with a mailbox shmem page.
+///
+/// Creates a 4KB shmem page, copies mailbox_data into it, and installs
+/// the shmem handle at slot 5 (Handle::MAILBOX) in the child's handle table.
+/// Spawn result for exec_with_mailbox: child ID, slot, parent's shmem handle, and SuperQ handle.
+pub struct MailboxSpawnResult {
+    pub child_id: task::TaskId,
+    pub slot: usize,
+    /// Raw handle value for parent's shmem in parent's object table (0 if alloc failed)
+    pub parent_handle_raw: u32,
+    /// Raw handle value for parent's SuperQ endpoint in parent's object table (0 if alloc failed)
+    pub parent_superq_handle_raw: u32,
+}
+
+pub fn spawn_from_path_with_caps_and_mailbox(
+    path: &str,
+    parent_id: task::TaskId,
+    requested_caps: super::caps::Capabilities,
+    mailbox_data: &[u8],
+) -> Result<MailboxSpawnResult, ElfError> {
+    use crate::kernel::object_service::object_service;
+    use crate::kernel::object::{Object, ObjectType, ShmemObject};
+    use crate::kernel::shmem;
+
+    let data = find_executable(path).ok_or(ElfError::NotExecutable)?;
+    let name = path.rsplit('/').next().unwrap_or(path);
+
+    // Spawn the child process
+    let (child_id, slot) = spawn_from_elf_internal(data, name, parent_id, Some(requested_caps))?;
+
+    // Read priority from mailbox header (byte offset 13 = priority field)
+    // and apply if not INHERIT (0xFF)
+    if mailbox_data.len() > 13 {
+        let priority = mailbox_data[13];
+        if priority != abi::priority::INHERIT {
+            use crate::kernel::task::tcb::Priority;
+            if let Some(prio) = Priority::from_u8(priority) {
+                crate::kernel::task::with_scheduler(|sched| {
+                    if let Some(child_task) = sched.task_mut(slot) {
+                        let old = child_task.set_priority(prio);
+                        if old != prio {
+                            sched.notify_priority_change(slot, old, prio);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // Create a 4KB shmem region owned by the child
+    let mut parent_handle_raw = 0u32;
+    let shmem_result = shmem::create(child_id, 4096);
+    match shmem_result {
+        Ok((shmem_id, vaddr, paddr)) => {
+            // Copy mailbox data into the shmem page via kernel virtual mapping
+            let kernel_vaddr = crate::kernel::arch::mmu::phys_to_virt(paddr) as *mut u8;
+            let shmem_slice = unsafe { core::slice::from_raw_parts_mut(kernel_vaddr, 4096) };
+            let copy_len = mailbox_data.len().min(4096);
+            shmem_slice[..copy_len].copy_from_slice(&mailbox_data[..copy_len]);
+            // Zero the rest
+            if copy_len < 4096 {
+                shmem_slice[copy_len..].fill(0);
+            }
+
+            // Stamp parent_pid into mailbox header offset 36 so child can signal parent
+            if shmem_slice.len() >= 40 {
+                shmem_slice[36..40].copy_from_slice(&(parent_id as u32).to_le_bytes());
+            }
+
+            // Install shmem handle at slot 5 (MAILBOX) in child's table
+            let child_obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, 4096, vaddr));
+            let _ = object_service().with_table_mut(child_id, |table| {
+                table.alloc_at(5, ObjectType::Shmem, child_obj)
+            });
+
+            // Allow parent to map the child's shmem
+            let _ = shmem::allow(child_id, shmem_id, parent_id);
+
+            // Install shmem handle in parent's table (vaddr=0, parent maps later if needed)
+            let parent_obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, 4096, 0));
+            let parent_result = object_service().with_table_mut(parent_id, |table| {
+                table.alloc(ObjectType::Shmem, parent_obj)
+            });
+            if let Ok(Some(handle)) = parent_result {
+                parent_handle_raw = handle.raw();
+            }
+        }
+        Err(_) => {
+            kwarn!("elf", "mailbox_alloc_failed"; child = child_id as u64);
+        }
+    }
+
+    // Create SupervisionQueue and install handles
+    let mut parent_superq_handle_raw = 0u32;
+    if let Some(supervision_id) = crate::kernel::ipc::supervision::create(parent_id, child_id) {
+        // Install child end at slot 4 (SUPERVISION)
+        let child_obj = Object::SupervisionChild(
+            crate::kernel::object::SupervisionChildObject::new(supervision_id)
+        );
+        let _ = object_service().with_table_mut(child_id, |table| {
+            table.alloc_at(4, ObjectType::SupervisionChild, child_obj)
+        });
+
+        // Install parent end in parent's table (dynamic slot)
+        let parent_obj = Object::SupervisionParent(
+            crate::kernel::object::SupervisionParentObject::new(supervision_id)
+        );
+        let parent_result = object_service().with_table_mut(parent_id, |table| {
+            table.alloc(ObjectType::SupervisionParent, parent_obj)
+        });
+        if let Ok(Some(handle)) = parent_result {
+            parent_superq_handle_raw = handle.raw();
+        }
+    }
+
+    Ok(MailboxSpawnResult { child_id, slot, parent_handle_raw, parent_superq_handle_raw })
+}
+
 /// Spawn a process from a file path with a parent
 pub fn spawn_from_path_with_parent(path: &str, parent_id: task::TaskId) -> Result<(task::TaskId, usize), ElfError> {
     // Try to find the file in ramfs

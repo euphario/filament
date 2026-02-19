@@ -24,6 +24,7 @@
 
 extern crate abi;
 
+mod mounts;
 mod service;
 mod ports;
 mod process;
@@ -352,6 +353,9 @@ struct InflightSpawn {
     binary_name_len: u8,
     /// Service index for parent-delegated spawns (0xFF = not a service spawn)
     service_idx: u8,
+    /// Service index of the PARENT driver that received the SpawnChild command
+    /// (0xFF = direct spawn by devd, not delegated)
+    parent_service_idx: u8,
     /// Capability bits for the spawned process
     caps: u64,
     /// Link ID tying spawn to port (carried through to service slot)
@@ -372,11 +376,36 @@ impl InflightSpawn {
             binary_name: [0u8; 16],
             binary_name_len: 0,
             service_idx: 0xFF,
+            parent_service_idx: 0xFF,
             caps: 0,
             link_id: 0,
             context_kv: [const { ContextKv::empty() }; MAX_CONTEXT_KV],
             context_kv_count: 0,
         }
+    }
+}
+
+// =============================================================================
+// Deferred Rule Fire (SuperQ command serialization)
+// =============================================================================
+
+/// Maximum deferred rule fires (ports waiting for SuperQ command slot)
+const MAX_DEFERRED_RULES: usize = 8;
+
+/// A rule fire deferred because the parent driver's SuperQ was busy.
+#[derive(Clone, Copy)]
+struct DeferredRuleFire {
+    /// Port ID whose rule needs firing
+    port_id: u8,
+    /// Owner service index of the port
+    owner_idx: u8,
+    /// Active flag (false = empty slot)
+    active: bool,
+}
+
+impl DeferredRuleFire {
+    const fn empty() -> Self {
+        Self { port_id: 0, owner_idx: 0xFF, active: false }
     }
 }
 
@@ -620,6 +649,8 @@ pub struct Devd {
     services: ServiceRegistry,
     /// Port registry
     ports: Ports,
+    /// Mount table: path prefix → transport
+    mounts: mounts::MountTable,
     /// Process manager
     process_mgr: SyscallProcessManager,
     /// Query handler for client connections
@@ -644,6 +675,9 @@ pub struct Devd {
     /// Pending context KV pairs for next spawn (set by check_class_rules, consumed by spawn_service)
     pending_context_kvs: [ContextKv; MAX_CONTEXT_KV],
     pending_context_kv_count: u8,
+    /// Deferred rule fires: ports whose SpawnChild couldn't be sent because
+    /// the parent driver's SuperQ already had a command in-flight.
+    deferred_rules: [DeferredRuleFire; MAX_DEFERRED_RULES],
     /// Bitmask of query client slots that failed to be added to the Mux
     /// (bit N = slot N needs polling because watch() failed)
     overflow_query_mask: u16,
@@ -660,6 +694,7 @@ impl Devd {
             events: None,
             services: ServiceRegistry::new(),
             ports: Ports::new(),
+            mounts: mounts::MountTable::new(),
             process_mgr: SyscallProcessManager::new(),
             query_handler: QueryHandler::new(),
             recent_dynamic_pids: [(0, 0); MAX_RECENT_DYNAMIC_PIDS],
@@ -672,6 +707,7 @@ impl Devd {
             next_link_id: 1,
             pending_context_kvs: [const { ContextKv::empty() }; MAX_CONTEXT_KV],
             pending_context_kv_count: 0,
+            deferred_rules: [const { DeferredRuleFire::empty() }; MAX_DEFERRED_RULES],
             overflow_query_mask: 0,
             active_restart_count: 0,
             active_request_count: 0,
@@ -736,9 +772,6 @@ impl Devd {
 
         // Discover kernel buses — rules fire on Ready, spawning bus drivers
         self.discover_kernel_buses();
-
-        // Spawn boot services that don't have a port trigger
-        self.create_and_spawn("vfsd", userlib::devd::caps::DRIVER, &[], 0);
         #[cfg(feature = "stress-test")]
         self.create_and_spawn("testr", u64::MAX, &[], 0);
 
@@ -832,19 +865,7 @@ impl Devd {
 
         let binary = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("???");
 
-        // Spawn the process (returns supervision channel)
-        let (pid, channel) = match self.process_mgr.spawn_with_caps(binary, caps) {
-            Ok(result) => result,
-            Err(_) => {
-                uerror!("devd", "svc_spawn_failed"; binary = binary);
-                self.services.transition(idx, ServiceState::Failed { code: -1 }, now);
-                return;
-            }
-        };
-
-        // Store spawn context — always, even for services with no trigger port.
-        // Bus-framework drivers query GET_SPAWN_CONTEXT on startup; without an
-        // entry they crash.
+        // Gather spawn context for the birth mailbox
         let trigger_port = &trigger_port_buf[..trigger_port_len];
         let (port_type, metadata_buf, metadata_len, trig_port_id) = if trigger_port_len > 0 {
             let pt = self.ports.get_port_type(trigger_port).unwrap_or(0);
@@ -862,11 +883,61 @@ impl Devd {
         } else {
             (0u8, [0u8; 64], 0usize, 0xFF)
         };
-        // Store spawn context with any pending context KV pairs from rule expansion
-        // Copy out of self to avoid borrow conflict
+
+        // Collect pending context KV pairs from rule expansion
         let kv_count = self.pending_context_kv_count as usize;
         let pending_kvs = self.pending_context_kvs;
         self.pending_context_kv_count = 0;
+
+        // Build mailbox page with spawn context
+        let mut mb_buf = [0u8; 4096];
+        Self::build_spawn_mailbox(
+            &mut mb_buf, port_type, trig_port_id, trigger_port,
+            &metadata_buf[..metadata_len], &pending_kvs[..kv_count],
+        );
+
+        // Spawn with exec_with_mailbox — parent gets shmem handle + superq handle back
+        let (pid, parent_mb_handle, parent_superq_handle) = match self.process_mgr.spawn_with_caps(binary, caps, &mb_buf) {
+            Ok(result) => result,
+            Err(_) => {
+                uerror!("devd", "svc_spawn_failed"; binary = binary);
+                self.services.transition(idx, ServiceState::Failed { code: -1 }, now);
+                return;
+            }
+        };
+
+        // Map the mailbox shmem for parent-side access
+        let mb_addr = match userlib::syscall::map(parent_mb_handle, 0) {
+            Ok(addr) if addr != 0 => addr,
+            _ => {
+                uwarn!("devd", "svc_mailbox_map_failed"; pid = pid);
+                0
+            }
+        };
+
+        // Add supervision-based client (SuperQ for bidirectional communication).
+        // Watch the SuperQ handle in our EventLoop's Mux so we get woken
+        // when the child sends a message — no more scanning/polling.
+        if mb_addr != 0 {
+            let superq = userlib::SupervisionHandle::from_handle(parent_superq_handle);
+            let superq_handle = superq.handle();
+            match self.query_handler.add_supervision_client(
+                superq, idx as u8, pid,
+            ) {
+                Some(_slot) => {
+                    // Register SuperQ handle in EventLoop Mux for event-driven dispatch
+                    if let Some(events) = &mut self.events {
+                        let _ = events.watch(superq_handle);
+                    }
+                }
+                None => {
+                    uwarn!("devd", "no_query_slot"; pid = pid);
+                }
+            }
+        }
+
+        // Store spawn context for GET_SPAWN_CONTEXT queries from the child
+        // (kept for compatibility — child can also read from mailbox directly)
         let mut kv_refs: [(&[u8], &[u8]); MAX_CONTEXT_KV] = [(&[], &[]); MAX_CONTEXT_KV];
         for i in 0..kv_count {
             kv_refs[i] = (pending_kvs[i].key(), pending_kvs[i].value());
@@ -875,23 +946,6 @@ impl Devd {
             pid, port_type, trigger_port, &metadata_buf[..metadata_len], trig_port_id,
             &kv_refs[..kv_count],
         );
-
-        // Add supervision channel to query handler as pre-connected managed client
-        let ch_handle = channel.handle();
-        match self.query_handler.add_client(channel, Some(idx as u8), pid) {
-            Some(slot) => {
-                if let Some(events) = &mut self.events {
-                    if events.watch(ch_handle).is_err() {
-                        uwarn!("devd", "svc_channel_watch_failed"; pid = pid);
-                        self.overflow_query_mask |= 1 << slot;
-                        self.update_timeout();
-                    }
-                }
-            }
-            None => {
-                uwarn!("devd", "no_query_slot"; pid = pid);
-            }
-        }
 
         // Update service state
         if let Some(service) = self.services.get_mut(idx) {
@@ -903,6 +957,77 @@ impl Devd {
         self.add_recent_dynamic_pid(pid, idx as u8);
 
         uinfo!("devd", "svc_spawned"; binary = binary, pid = pid);
+    }
+
+    /// Build a mailbox page with spawn context for a child service.
+    fn build_spawn_mailbox(
+        buf: &mut [u8; 4096],
+        port_type: u8,
+        port_id: u8,
+        trigger_port: &[u8],
+        metadata: &[u8],
+        kvs: &[ContextKv],
+    ) {
+        buf.fill(0);
+
+        let mut hdr = abi::MailboxHeader::empty();
+        hdr.bus_type = port_type;
+        hdr.bus_index = port_id;
+        hdr.priority = abi::priority::INHERIT;
+
+        // Write KVs starting at offset 64 (after header)
+        let mut kv_count: u8 = 0;
+        let mut pos: usize = 64;
+
+        // KV: port.name = trigger_port
+        if !trigger_port.is_empty() {
+            let key = b"port.name";
+            let klen = key.len();
+            let vlen = trigger_port.len().min(64);
+            if pos + 1 + klen + 1 + vlen < 2048 {
+                buf[pos] = klen as u8; pos += 1;
+                buf[pos..pos + klen].copy_from_slice(key); pos += klen;
+                buf[pos] = vlen as u8; pos += 1;
+                buf[pos..pos + vlen].copy_from_slice(&trigger_port[..vlen]); pos += vlen;
+                kv_count += 1;
+            }
+        }
+
+        // KV: port.metadata
+        if !metadata.is_empty() {
+            let key = b"port.metadata";
+            let klen = key.len();
+            let mlen = metadata.len().min(64);
+            if pos + 1 + klen + 1 + mlen < 2048 {
+                buf[pos] = klen as u8; pos += 1;
+                buf[pos..pos + klen].copy_from_slice(key); pos += klen;
+                buf[pos] = mlen as u8; pos += 1;
+                buf[pos..pos + mlen].copy_from_slice(&metadata[..mlen]); pos += mlen;
+                kv_count += 1;
+            }
+        }
+
+        // Context template KVs from rule expansion
+        for kv in kvs {
+            let klen = kv.key_len as usize;
+            let vlen = kv.value_len as usize;
+            if klen == 0 { continue; }
+            if pos + 1 + klen + 1 + vlen < 2048 {
+                buf[pos] = klen as u8; pos += 1;
+                buf[pos..pos + klen].copy_from_slice(&kv.key[..klen]); pos += klen;
+                buf[pos] = vlen as u8; pos += 1;
+                buf[pos..pos + vlen].copy_from_slice(&kv.value[..vlen]); pos += vlen;
+                kv_count += 1;
+            }
+        }
+
+        hdr.kv_count = kv_count;
+
+        // Write header to buf
+        let hdr_bytes = unsafe {
+            core::slice::from_raw_parts(&hdr as *const abi::MailboxHeader as *const u8, 64)
+        };
+        buf[..64].copy_from_slice(hdr_bytes);
     }
 
     /// Create a service slot and spawn.  Used by check_class_rules for port-triggered
@@ -965,11 +1090,15 @@ impl Devd {
             // Clear PID - the process has exited
             service.pid = 0;
 
-            // Remove service channel from event loop
-            if let Some(channel) = service.channel.take() {
-                if let Some(events) = &mut self.events {
-                    let _ = events.unwatch(channel.handle());
+            // Remove query client for this service (SuperQ or channel)
+            if let Some(qslot) = self.query_handler.find_by_service_idx(idx as u8) {
+                // Unwatch from event loop if channel-based
+                if let Some(handle) = self.query_handler.get(qslot).and_then(|c| c.handle()) {
+                    if let Some(events) = &mut self.events {
+                        let _ = events.unwatch(handle);
+                    }
                 }
+                self.query_handler.remove_client(qslot);
             }
 
             if code == 0 {
@@ -1003,6 +1132,7 @@ impl Devd {
         if old_pid != 0 {
             self.remove_recent_dynamic_pid(old_pid);
             self.remove_spawn_context(old_pid);
+            self.mounts.remove_by_owner(old_pid);
         }
 
         // Unregister ports owned by this service (scan port registry)
@@ -1681,7 +1811,7 @@ impl Devd {
         }
 
         if let Some(client) = self.query_handler.get_mut(driver_slot) {
-            client.channel.send(&buf[..offset]).is_ok()
+            client.send(&buf[..offset]).is_ok()
         } else {
             false
         }
@@ -1919,13 +2049,13 @@ impl Devd {
                 let mut resp_buf = [0u8; 1100];
                 if let Some(len) = client_resp.write_to(&mut resp_buf, &req.response_buf[..response_len]) {
                     if let Some(client) = self.query_handler.get_mut(client_slot) {
-                        let _ = client.channel.send(&resp_buf[..len]);
+                        let _ = client.send(&resp_buf[..len]);
                     }
                 }
             } else {
                 if let Some(client) = self.query_handler.get_mut(client_slot) {
                     let resp = ErrorResponse::new(client_seq_id, error::NOT_FOUND);
-                    let _ = client.channel.send(&resp.to_bytes());
+                    let _ = client.send(&resp.to_bytes());
                 }
             }
         } else if is_relay {
@@ -1933,7 +2063,7 @@ impl Devd {
             // If no data was relayed at all, send error.
             if response_len == 0 {
                 if let Some(client) = self.query_handler.get_mut(client_slot) {
-                    let _ = client.channel.send(b"ERR key not found\n");
+                    let _ = client.send(b"ERR key not found\n");
                 }
             }
         } else {
@@ -1946,7 +2076,7 @@ impl Devd {
                 self.send_chunked_response(client_slot, &resp_copy[..response_len]);
             } else {
                 if let Some(client) = self.query_handler.get_mut(client_slot) {
-                    let _ = client.channel.send(b"ERR key not found\n");
+                    let _ = client.send(b"ERR key not found\n");
                 }
             }
         }
@@ -1972,7 +2102,7 @@ impl Devd {
                     .unwrap_or(offset + MAX_CHUNK)
             };
             if let Some(client) = self.query_handler.get_mut(client_slot) {
-                let _ = client.channel.send(&response[offset..chunk_end]);
+                let _ = client.send(&response[offset..chunk_end]);
             }
             offset = chunk_end;
         }
@@ -2000,7 +2130,7 @@ impl Devd {
         let mut forward_buf = [0u8; 128];
         if let Some(len) = forward_req.write_to(&mut forward_buf, name) {
             if let Some(client) = self.query_handler.get_mut(driver_slot) {
-                return client.channel.send(&forward_buf[..len]).is_ok();
+                return client.send(&forward_buf[..len]).is_ok();
             }
         }
         false
@@ -2098,17 +2228,18 @@ impl Devd {
     // =========================================================================
 
     fn handle_signal_event(&mut self, event: &abi::MuxEvent) {
-        match event.signal_event as u32 {
-            abi::signal_event::PORT_STATE => {
-                let port_idx = (event.signal_value >> 32) as u16;
-                let new_state = event.signal_value as u32;
-                udebug!("devd", "port_state_signal"; port = port_idx, state = new_state);
-                // Port state signals complement channel-based notifications.
-                // Currently channel-based path handles all port state logic,
-                // so this is a forward-looking hook for when we remove channel notifications.
-            }
-            _ => {
-                udebug!("devd", "unknown_signal"; event = event.signal_event, value = event.signal_value);
+        let sig = event.signal_event as u32;
+        if sig & abi::signal_event::PORT_CHANGED != 0 {
+            let port_idx = (event.signal_value >> 32) as u16;
+            let new_state = event.signal_value as u32;
+            udebug!("devd", "port_state_signal"; port = port_idx, state = new_state);
+        }
+        if sig & abi::signal_event::CHILD_EXIT != 0 {
+            let child_pid = (event.signal_value >> 32) as u32;
+            let exit_code = event.signal_value as i32;
+            udebug!("devd", "child_exit_signal"; pid = child_pid, code = exit_code);
+            if let Some(idx) = self.services.find_by_pid(child_pid) {
+                self.handle_service_exit(idx, exit_code);
             }
         }
     }
@@ -2218,7 +2349,7 @@ impl Devd {
         };
 
         let mut recv_buf = [0u8; MSG_BUFFER_SIZE];
-        match client.channel.try_recv(&mut recv_buf) {
+        match client.try_recv(&mut recv_buf) {
             Ok(Some(len)) if len > 0 => {
                 self.dispatch_query_message(slot, &recv_buf[..len]);
             }
@@ -2243,7 +2374,7 @@ impl Devd {
         };
 
         let mut recv_buf = [0u8; MSG_BUFFER_SIZE];
-        match client.channel.try_recv(&mut recv_buf) {
+        match client.try_recv(&mut recv_buf) {
             Ok(Some(len)) if len > 0 => {
                 self.dispatch_query_message(slot, &recv_buf[..len]);
             }
@@ -2358,7 +2489,18 @@ impl Devd {
 
         let mut stripped = [0u8; 512];
         let dispatch_len;
+        let mut route_buf = [0u8; 96];
+        let mut route_len = 0usize;
         if is_binary {
+            // Save the route before stripping it (needed for STATE_CHANGE attribution)
+            let flags = if buf.len() >= 4 { u16::from_le_bytes([buf[2], buf[3]]) } else { 0 };
+            if flags & query_flags::ADDRESSED != 0 && buf.len() > QueryHeader::SIZE {
+                route_len = (buf[QueryHeader::SIZE] as usize).min(route_buf.len());
+                let route_start = QueryHeader::SIZE + 1;
+                if route_start + route_len <= buf.len() {
+                    route_buf[..route_len].copy_from_slice(&buf[route_start..route_start + route_len]);
+                }
+            }
             let (_, slen) = Self::strip_addressed_route(buf, &mut stripped);
             dispatch_len = slen;
         } else {
@@ -2372,10 +2514,41 @@ impl Devd {
 
         match msg_type {
             Some(msg::REGISTER_PORT_INFO) => {
-                self.handle_port_register_info_msg(slot, dispatch_buf);
+                // For routed PORT_REGISTER messages (from grandchildren via parent relay),
+                // resolve the actual owning service from the route so the port is
+                // attributed to the grandchild, not the relay parent.
+                let mut owner_override = if route_len > 0 {
+                    self.resolve_service_idx_from_route(&route_buf[..route_len])
+                        .map(|i| i as u8)
+                } else {
+                    None
+                };
+                // If routed but can't resolve (SPAWN_ACK lost), create from inflight
+                if owner_override.is_none() && route_len > 0 {
+                    owner_override = self.create_service_from_inflight_route(&route_buf[..route_len])
+                        .map(|i| i as u8);
+                }
+                self.handle_port_register_info_msg(slot, dispatch_buf, owner_override);
             }
             Some(msg::STATE_CHANGE) => {
-                self.handle_state_change_msg(slot, dispatch_buf);
+                // Resolve the service index: routed messages identify the
+                // service by binary name in the route (works for grandchildren
+                // that don't have a query client slot in devd). Non-routed
+                // messages fall back to the query client's service index.
+                let mut svc_idx = if route_len > 0 {
+                    self.resolve_service_idx_from_route(&route_buf[..route_len])
+                } else {
+                    self.query_handler.get_service_idx(slot).map(|i| i as usize)
+                };
+                // If routed STATE_CHANGE can't resolve (e.g. SPAWN_ACK was
+                // lost in a race), create the service entry on the fly
+                // from the inflight spawn matching this binary name.
+                if svc_idx.is_none() && route_len > 0 {
+                    svc_idx = self.create_service_from_inflight_route(&route_buf[..route_len]);
+                }
+                if let Some(idx) = svc_idx {
+                    self.handle_state_change_for_service(idx, dispatch_buf);
+                }
             }
             Some(msg::SPAWN_ACK) => {
                 self.handle_spawn_ack_msg(slot, dispatch_buf);
@@ -2413,6 +2586,15 @@ impl Devd {
             Some(msg::LOG_CONTROL) => {
                 self.handle_log_control(slot, dispatch_buf);
             }
+            Some(msg::REGISTER_MOUNT) => {
+                self.handle_register_mount(slot, dispatch_buf);
+            }
+            Some(msg::RESOLVE_PATH) => {
+                self.handle_resolve_path(slot, dispatch_buf);
+            }
+            Some(msg::LIST_MOUNTS) => {
+                self.handle_list_mounts(slot, dispatch_buf);
+            }
             Some(msg::CONFIG_GET) | Some(msg::CONFIG_SET) => {
                 // CONFIG_GET/SET should never arrive at devd — they are sent
                 // BY devd TO managed drivers. Ignore to prevent binary payloads
@@ -2426,7 +2608,7 @@ impl Devd {
                 let resp_len = self.handle_admin_command(dispatch_buf, &mut response_buf, slot);
                 if resp_len > 0 {
                     if let Some(client) = self.query_handler.get_mut(slot) {
-                        let _ = client.channel.send(&response_buf[..resp_len]);
+                        let _ = client.send(&response_buf[..resp_len]);
                     }
                 }
             }
@@ -2437,19 +2619,142 @@ impl Devd {
                 let resp_len = self.handle_admin_command(dispatch_buf, &mut resp_buf, slot);
                 if resp_len > 0 {
                     if let Some(client) = self.query_handler.get_mut(slot) {
-                        let _ = client.channel.send(&resp_buf[..resp_len]);
+                        let _ = client.send(&resp_buf[..resp_len]);
                     }
                 }
             }
         }
     }
 
+    /// Resolve a service's query slot from an ADDRESSED route.
+    ///
+    /// The route format is "port_name/binary_name[/port_name/binary_name]*".
+    /// The last segment after the final "/" is the binary name of the actual
+    /// service that sent the message. We look up its query slot by finding the
+    /// service with that binary name and returning its query handler slot.
+    /// Resolve a route to a query client slot (for messages that need a client slot).
+    fn resolve_service_slot_from_route(&self, route: &[u8]) -> Option<usize> {
+        let svc_idx = self.resolve_service_idx_from_route(route)?;
+        self.query_handler.find_by_service_idx(svc_idx as u8)
+    }
+
+    /// Resolve a route to a service registry index.
+    ///
+    /// Works for both direct children (with query client) and grandchildren
+    /// (no query client — they communicate via their parent's SuperQ relay).
+    fn resolve_service_idx_from_route(&self, route: &[u8]) -> Option<usize> {
+        // Find the last segment: route is "a/b/c/d", we want "d"
+        // Segments alternate: port_name/binary_name/port_name/binary_name
+        // The last segment is the binary name of the service
+        let mut last_slash = None;
+        for i in (0..route.len()).rev() {
+            if route[i] == b'/' {
+                last_slash = Some(i);
+                break;
+            }
+        }
+        let binary_name = match last_slash {
+            Some(pos) => &route[pos + 1..],
+            None => route, // Single segment = binary name itself
+        };
+        if binary_name.is_empty() {
+            return None;
+        }
+        let name_str = core::str::from_utf8(binary_name).ok()?;
+        self.services.find_by_name(name_str)
+    }
+
+    /// Create a service entry from an inflight spawn when SPAWN_ACK was lost.
+    ///
+    /// Extracts the binary name from the route's last segment, matches it
+    /// against inflight_spawns, consumes the inflight entry, and creates
+    /// a service slot. Returns the service index if successful.
+    fn create_service_from_inflight_route(&mut self, route: &[u8]) -> Option<usize> {
+        // Extract binary name from route (last segment)
+        let mut last_slash = None;
+        for i in (0..route.len()).rev() {
+            if route[i] == b'/' {
+                last_slash = Some(i);
+                break;
+            }
+        }
+        let binary_name = match last_slash {
+            Some(pos) => &route[pos + 1..],
+            None => route,
+        };
+        if binary_name.is_empty() {
+            return None;
+        }
+
+        // Find matching inflight spawn by binary name, capture parent before consuming
+        let mut found_seq = 0u32;
+        let mut parent_svc_idx = 0u8;
+        for entry in &self.inflight_spawns {
+            if entry.seq_id != 0 {
+                let ename = &entry.binary_name[..entry.binary_name_len as usize];
+                if ename == binary_name {
+                    found_seq = entry.seq_id;
+                    parent_svc_idx = entry.parent_service_idx;
+                    break;
+                }
+            }
+        }
+        if found_seq == 0 {
+            return None;
+        }
+
+        // Consume the inflight spawn and create a service entry
+        let spawn_ctx = self.consume_inflight_spawn(found_seq)?;
+        let (port_type, port_name, port_name_len, _, _, _, spawn_caps, link_id, trig_port_id) = spawn_ctx;
+        let pname = &port_name[..port_name_len as usize];
+        let now = Self::now_ms();
+
+        // Reuse existing slot by link_id, or create new
+        let mut reused_idx: Option<usize> = None;
+        if link_id != 0 {
+            self.services.for_each(|idx, svc| {
+                if svc.link_id == link_id {
+                    reused_idx = Some(idx);
+                }
+            });
+        }
+
+        let slot_idx = if let Some(idx) = reused_idx {
+            if let Some(svc) = self.services.get_mut(idx) {
+                svc.pid = 0;
+                svc.state = ServiceState::Starting;
+                svc.caps = spawn_caps;
+                svc.link_id = link_id;
+            }
+            idx
+        } else {
+            self.services.create_dynamic_service_with_state(
+                0, binary_name, now, ServiceState::Starting,
+            )?
+        };
+
+        if let Some(svc) = self.services.get_mut(slot_idx) {
+            svc.set_trigger_port(pname);
+        }
+
+        uinfo!("devd", "svc_created_from_route"; name = core::str::from_utf8(binary_name).unwrap_or("?"), slot = slot_idx as u32);
+
+        // Drain deferred rules for this parent (inflight consumed = slot freed)
+        self.drain_deferred_rules(parent_svc_idx);
+
+        Some(slot_idx)
+    }
+
     /// Handle REGISTER_PORT_INFO message (unified PortInfo registration)
-    fn handle_port_register_info_msg(&mut self, slot: usize, buf: &[u8]) {
+    ///
+    /// `owner_override`: if Some, use this service index as owner instead of the
+    /// query client's service index. Used for routed PORT_REGISTER messages from
+    /// grandchildren (e.g., nvmed registering block:0 via pcied relay).
+    fn handle_port_register_info_msg(&mut self, slot: usize, buf: &[u8], owner_override: Option<u8>) {
         use userlib::query::error;
 
         // Parse the registration message
-        let info = match self.query_handler.parse_port_register_info(slot, buf) {
+        let mut info = match self.query_handler.parse_port_register_info(slot, buf) {
             Some(i) => i,
             None => {
                 // Permission denied or invalid format
@@ -2462,10 +2767,18 @@ impl Devd {
             }
         };
 
+        // For routed messages (grandchild ports), the actual owner is the
+        // grandchild but the relay parent (with query client) handles SpawnChild routing.
+        let relay_owner = info.owner_idx; // Always the query client's service (relay parent)
+        if let Some(owner) = owner_override {
+            info.owner_idx = owner; // Actual owner for rule matching
+        }
+
         // Register the port with unified PortInfo
         let result = self.handle_port_registration(
             &info.port_info,
             info.owner_idx,
+            relay_owner,
             info.shmem_id,
         );
 
@@ -2488,24 +2801,27 @@ impl Devd {
     }
 
     fn handle_state_change_msg(&mut self, slot: usize, buf: &[u8]) {
+        let driver_idx = match self.query_handler.get_service_idx(slot) {
+            Some(idx) => idx as usize,
+            None => return,
+        };
+        self.handle_state_change_for_service(driver_idx, buf);
+    }
+
+    /// Handle STATE_CHANGE for a service identified by service index.
+    fn handle_state_change_for_service(&mut self, driver_idx: usize, buf: &[u8]) {
         use userlib::query::{StateChange, driver_state};
 
         // Parse the state change message
         let state_msg = match StateChange::from_bytes(buf) {
             Some(s) => s,
             None => {
-                uerror!("devd", "invalid_state_change"; slot = slot as u32);
+                uerror!("devd", "invalid_state_change"; svc_idx = driver_idx as u32);
                 return;
             }
         };
 
-        // Get the driver's service index from the query client
-        let driver_idx = match self.query_handler.get_service_idx(slot) {
-            Some(idx) => idx,
-            None => {
-                return;
-            }
-        };
+        let driver_idx = driver_idx;
 
         uinfo!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
 
@@ -2593,7 +2909,7 @@ impl Devd {
 
         // Send response
         if let Some(client) = self.query_handler.get_mut(slot) {
-            let _ = client.channel.send(&response_buf[..resp_len]);
+            let _ = client.send(&response_buf[..resp_len]);
         }
     }
 
@@ -2650,7 +2966,7 @@ impl Devd {
 
         // Send response
         if let Some(client) = self.query_handler.get_mut(slot) {
-            let _ = client.channel.send(&resp.to_bytes());
+            let _ = client.send(&resp.to_bytes());
         }
     }
 
@@ -2685,7 +3001,7 @@ impl Devd {
         // Send response (reuse PortRegisterResponse format)
         let resp = PortRegisterResponse::new(seq_id, result_code);
         if let Some(client) = self.query_handler.get_mut(slot) {
-            let _ = client.channel.send(&resp.to_bytes());
+            let _ = client.send(&resp.to_bytes());
         }
     }
 
@@ -2813,7 +3129,7 @@ impl Devd {
         resp[8..12].copy_from_slice(&result.to_le_bytes());
 
         if let Some(client) = self.query_handler.get_mut(slot) {
-            let _ = client.channel.send(&resp);
+            let _ = client.send(&resp);
         }
     }
 
@@ -2898,7 +3214,7 @@ impl Devd {
             }
 
             if let Some(client) = self.query_handler.get_mut(slot) {
-                if client.channel.send(&resp_buf[..offset]).is_err() {
+                if client.send(&resp_buf[..offset]).is_err() {
                     uerror!("devd", "list_ports_send_fail"; slot = slot as u32, chunk = chunk as u32);
                     break;
                 }
@@ -2987,7 +3303,7 @@ impl Devd {
             }
 
             if let Some(client) = self.query_handler.get_mut(slot) {
-                if client.channel.send(&resp_buf[..offset]).is_err() {
+                if client.send(&resp_buf[..offset]).is_err() {
                     uerror!("devd", "list_svc_send_fail"; slot = slot as u32, chunk = chunk as u32);
                     break;
                 }
@@ -3019,7 +3335,7 @@ impl Devd {
             Err(_) => {
                 if let Some(client) = self.query_handler.get_mut(client_slot) {
                     let resp = ErrorResponse::new(client_seq_id, error::INVALID_REQUEST);
-                    let _ = client.channel.send(&resp.to_bytes());
+                    let _ = client.send(&resp.to_bytes());
                 }
                 return;
             }
@@ -3031,7 +3347,7 @@ impl Devd {
             None => {
                 if let Some(client) = self.query_handler.get_mut(client_slot) {
                     let resp = ErrorResponse::new(client_seq_id, error::NOT_FOUND);
-                    let _ = client.channel.send(&resp.to_bytes());
+                    let _ = client.send(&resp.to_bytes());
                 }
                 return;
             }
@@ -3043,7 +3359,7 @@ impl Devd {
             None => {
                 if let Some(client) = self.query_handler.get_mut(client_slot) {
                     let resp = ErrorResponse::new(client_seq_id, error::NO_DRIVER);
-                    let _ = client.channel.send(&resp.to_bytes());
+                    let _ = client.send(&resp.to_bytes());
                 }
                 return;
             }
@@ -3054,7 +3370,7 @@ impl Devd {
         if !self.start_admin_request(client_slot as u8, client_seq_id, msg::QUERY_SERVICE_INFO, &targets, name_bytes, &[], &[]) {
             if let Some(client) = self.query_handler.get_mut(client_slot) {
                 let resp = ErrorResponse::new(client_seq_id, error::DEVICE_ERROR);
-                let _ = client.channel.send(&resp.to_bytes());
+                let _ = client.send(&resp.to_bytes());
             }
         }
     }
@@ -3116,7 +3432,7 @@ impl Devd {
         let mut resp_buf = [0u8; 4100];
         if let Some(len) = resp.write_to(&mut resp_buf, &text_buf[..text_len]) {
             if let Some(client) = self.query_handler.get_mut(slot) {
-                let _ = client.channel.send(&resp_buf[..len]);
+                let _ = client.send(&resp_buf[..len]);
             }
         }
     }
@@ -3143,7 +3459,160 @@ impl Devd {
         // Send ack
         let resp = ErrorResponse::new(req.header.seq_id, error::OK);
         if let Some(client) = self.query_handler.get_mut(slot) {
-            let _ = client.channel.send(&resp.to_bytes());
+            let _ = client.send(&resp.to_bytes());
+        }
+    }
+
+    // =========================================================================
+    // Mount Table Handlers
+    // =========================================================================
+
+    /// Handle REGISTER_MOUNT message — driver registers a mount prefix.
+    fn handle_register_mount(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{RegisterMount, PortRegisterResponse, mount_transport, error};
+
+        let (transport_type, prefix, port_name, shmem_id) = match RegisterMount::from_bytes(buf) {
+            Some(parsed) => parsed,
+            None => {
+                uerror!("devd", "invalid_register_mount"; slot = slot as u32);
+                return;
+            }
+        };
+
+        let seq_id = QueryHeader::from_bytes(buf).map(|h| h.seq_id).unwrap_or(0);
+        let caller_pid = self.query_handler.get(slot)
+            .map(|c| c.pid)
+            .unwrap_or(0);
+
+        let transport = match transport_type {
+            mount_transport::PORT => {
+                let mut name = [0u8; 32];
+                let len = port_name.len().min(32);
+                name[..len].copy_from_slice(&port_name[..len]);
+                mounts::MountTransport::Port { name, name_len: len as u8 }
+            }
+            mount_transport::DATAPORT => {
+                mounts::MountTransport::DataPort { shmem_id }
+            }
+            _ => {
+                uerror!("devd", "unknown_mount_transport"; transport = transport_type as u32);
+                return;
+            }
+        };
+
+        let result = match self.mounts.mount(prefix, transport, caller_pid) {
+            Ok(()) => {
+                uinfo!("devd", "mount_registered";
+                    prefix = core::str::from_utf8(prefix).unwrap_or("?"),
+                    pid = caller_pid
+                );
+                error::OK
+            }
+            Err(mounts::MountError::Duplicate) => error::DUPLICATE,
+            Err(mounts::MountError::TableFull) => error::TABLE_FULL,
+            Err(_) => error::INVALID_REQUEST,
+        };
+
+        // Send ack using PortRegisterResponse (12 bytes: header + result)
+        let resp = PortRegisterResponse::new(seq_id, result);
+        if let Some(client) = self.query_handler.get_mut(slot) {
+            let _ = client.send(&resp.to_bytes());
+        }
+    }
+
+    /// Handle RESOLVE_PATH message — resolve path to mount transport.
+    fn handle_resolve_path(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{ResolvePath, ResolvePathResponse, mount_transport};
+
+        let path = match ResolvePath::from_bytes(buf) {
+            Some(p) => p,
+            None => {
+                uerror!("devd", "invalid_resolve_path"; slot = slot as u32);
+                return;
+            }
+        };
+
+        let seq_id = QueryHeader::from_bytes(buf).map(|h| h.seq_id).unwrap_or(0);
+
+        let mut resp_buf = [0u8; ResolvePathResponse::SIZE];
+        let resp_len = match self.mounts.resolve(path) {
+            Some((transport, remaining)) => {
+                match transport {
+                    mounts::MountTransport::DataPort { shmem_id } => {
+                        ResolvePathResponse::write_dataport(&mut resp_buf, seq_id, *shmem_id, remaining)
+                    }
+                    mounts::MountTransport::Port { name, name_len } => {
+                        ResolvePathResponse::write_port(&mut resp_buf, seq_id, &name[..*name_len as usize], remaining)
+                    }
+                }
+            }
+            None => {
+                ResolvePathResponse::write_not_found(&mut resp_buf, seq_id)
+            }
+        };
+
+        if let Some(client) = self.query_handler.get_mut(slot) {
+            let _ = client.send(&resp_buf[..resp_len]);
+        }
+    }
+
+    /// Handle LIST_MOUNTS message — return all registered mounts.
+    fn handle_list_mounts(&mut self, slot: usize, buf: &[u8]) {
+        use userlib::query::{MountsListResponse, MountListEntry, mount_transport};
+
+        let seq_id = QueryHeader::from_bytes(buf).map(|h| h.seq_id).unwrap_or(0);
+
+        // Collect entries
+        let mut entries = [[0u8; MountListEntry::SIZE]; mounts::MAX_MOUNTS];
+        let mut count = 0usize;
+
+        self.mounts.for_each(|entry| {
+            if count >= mounts::MAX_MOUNTS {
+                return;
+            }
+            let (transport_type, port_name, shmem_id) = match &entry.transport {
+                mounts::MountTransport::Port { name, name_len } => {
+                    (mount_transport::PORT, &name[..*name_len as usize], 0u32)
+                }
+                mounts::MountTransport::DataPort { shmem_id } => {
+                    (mount_transport::DATAPORT, &[][..], *shmem_id)
+                }
+            };
+            MountListEntry::write_to(&mut entries[count], transport_type, entry.prefix_bytes(), port_name, shmem_id);
+            count += 1;
+        });
+
+        // Send in chunks
+        let total = count as u16;
+        let mut sent = 0usize;
+        while sent < count {
+            let chunk = (count - sent).min(MountListEntry::MAX_PER_MSG);
+            let mut resp_buf = [0u8; MountsListResponse::HEADER_SIZE + MountListEntry::MAX_PER_MSG * MountListEntry::SIZE];
+            MountsListResponse::write_header(&mut resp_buf, seq_id, chunk as u16, total);
+
+            let mut offset = MountsListResponse::HEADER_SIZE;
+            for i in 0..chunk {
+                resp_buf[offset..offset + MountListEntry::SIZE].copy_from_slice(&entries[sent + i]);
+                offset += MountListEntry::SIZE;
+            }
+
+            if let Some(client) = self.query_handler.get_mut(slot) {
+                if client.send(&resp_buf[..offset]).is_err() {
+                    break;
+                }
+            } else {
+                break;
+            }
+            sent += chunk;
+        }
+
+        // If no mounts, send empty response
+        if count == 0 {
+            let mut resp_buf = [0u8; MountsListResponse::HEADER_SIZE];
+            MountsListResponse::write_header(&mut resp_buf, seq_id, 0, 0);
+            if let Some(client) = self.query_handler.get_mut(slot) {
+                let _ = client.send(&resp_buf);
+            }
         }
     }
 
@@ -3172,6 +3641,10 @@ impl Devd {
             }
         };
 
+        // Consume inflight spawn FIRST, then drain deferred rules for this parent.
+        // This must happen regardless of success/failure so deferred rules don't starve.
+        let _parent_for_drain = parent_idx;
+
         uinfo!("devd", "spawn_ack"; parent = self.svc_name(parent_idx as u8), seq = seq_id, result = result as i32, spawn = spawn_count as u32);
 
         // Consume the inflight spawn to get port context and binary name
@@ -3184,6 +3657,7 @@ impl Devd {
                     self.services.transition(service_idx as usize, ServiceState::Failed { code: result as i32 }, now);
                 }
             }
+            self.drain_deferred_rules(_parent_for_drain);
             return;
         }
 
@@ -3225,6 +3699,7 @@ impl Devd {
                     );
                 }
                 self.query_handler.upgrade_to_managed(child_pid, service_idx);
+                self.drain_deferred_rules(_parent_for_drain);
                 return;
             }
         }
@@ -3316,6 +3791,9 @@ impl Devd {
             self.query_handler.upgrade_to_managed(child_pid, slot_idx as u8);
 
         }
+
+        // Drain deferred rules now that this parent's SuperQ has capacity
+        self.drain_deferred_rules(_parent_for_drain);
     }
 
 
@@ -3323,10 +3801,14 @@ impl Devd {
     fn remove_query_client(&mut self, slot: usize) {
         let was_overflow = self.overflow_query_mask & (1 << slot) != 0;
         self.overflow_query_mask &= !(1 << slot);
-        if let Some(channel) = self.query_handler.remove_client(slot) {
+        // Get the handle before removing (for unwatch)
+        let handle = self.query_handler.get(slot).and_then(|c| c.handle());
+        if self.query_handler.remove_client(slot) {
             if !was_overflow {
-                if let Some(events) = &mut self.events {
-                    let _ = events.unwatch(channel.handle());
+                if let Some(h) = handle {
+                    if let Some(events) = &mut self.events {
+                        let _ = events.unwatch(h);
+                    }
                 }
             }
         }
@@ -3345,12 +3827,20 @@ impl Devd {
         &mut self,
         port_info: &abi::PortInfo,
         owner_idx: u8,
+        relay_owner_idx: u8,
         shmem_id: u32,
     ) -> Result<u8, SysError> {
         use crate::ports::PortRegistry;
 
         // Register the port with unified PortInfo
         let port_id = self.ports.register_with_port_info(port_info, owner_idx, shmem_id)?;
+
+        // Set relay owner (differs from owner for grandchild ports)
+        if relay_owner_idx != owner_idx {
+            if let Some(port) = self.ports.get_mut_by_id(port_id) {
+                port.set_relay_owner(relay_owner_idx);
+            }
+        }
 
         let port_name = port_info.name_bytes();
 
@@ -3385,6 +3875,21 @@ impl Devd {
             Some(r) => r,
             None => return,
         };
+
+        // Auto-mount: if rule has mount_path, register a Port mount
+        if let Some(mount_path) = rule.mount_path {
+            let port_name = port_info.name_bytes();
+            let transport = mounts::MountTransport::Port {
+                name: {
+                    let mut n = [0u8; 32];
+                    let len = port_name.len().min(32);
+                    n[..len].copy_from_slice(&port_name[..len]);
+                    n
+                },
+                name_len: port_name.len().min(32) as u8,
+            };
+            let _ = self.mounts.mount(mount_path.as_bytes(), transport, 0);
+        }
 
         // Guard: don't spawn if a running service is already bound to this port.
         // Use port_id for unambiguous lookup (two ports can share a name).
@@ -3457,6 +3962,19 @@ impl Devd {
         if owner_idx != 0xFF {
             // Driver-owned port: delegate spawn to the owning driver.
             // The child becomes the driver's child, not devd's.
+            //
+            // For grandchild ports, SpawnChild routes through the relay parent
+            // (the driver with a direct query client connection to devd).
+            let relay_idx = self.ports.get_by_id(port_id)
+                .map(|p| p.relay_owner())
+                .unwrap_or(owner_idx);
+            //
+            // SuperQ serialization: only one command in-flight per driver.
+            // If the relay driver already has a pending SpawnChild, defer this rule.
+            if self.has_inflight_superq_spawn(relay_idx) {
+                self.defer_rule_fire(port_id, owner_idx);
+                return;
+            }
             // Build context so parent can answer GET_SPAWN_CONTEXT locally.
             let port_type = self.ports.get_by_id(port_id)
                 .map(|p| p.port_type())
@@ -3495,12 +4013,12 @@ impl Devd {
             let spawn_path_len = self.ports.resolve_path(port_id, &mut spawn_path);
 
             if let Some(seq_id) = self.query_handler.send_spawn_child_with_path(
-                owner_idx, rule.driver.as_bytes(), port_name, rule.caps, rule.priority,
+                relay_idx, rule.driver.as_bytes(), port_name, rule.caps, rule.priority,
                 Some(&spawn_ctx), &spawn_path[..spawn_path_len],
             ) {
-                self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver, rule.caps, link_id, port_id);
+                self.track_inflight_spawn(seq_id, port_type, port_name, rule.driver, rule.caps, link_id, port_id, relay_idx);
             } else {
-                uerror!("devd", "spawn_child_send_failed"; driver = rule.driver, owner = owner_idx as u32);
+                uerror!("devd", "spawn_child_send_failed"; driver = rule.driver, owner = relay_idx as u32);
             }
         } else {
             // Kernel bus port: devd spawns directly (no driver to delegate to)
@@ -3525,21 +4043,11 @@ impl Devd {
     fn spawn_dynamic_driver_with_caps(&mut self, binary: &str, trigger_port: &[u8], caps: u64) {
         let now = Self::now_ms();
 
-        // Spawn the process (returns supervision channel)
-        let (pid, channel) = match self.process_mgr.spawn_with_caps(binary, caps) {
-            Ok(result) => result,
-            Err(_) => {
-                uerror!("devd", "dynamic_spawn_failed"; binary = binary);
-                return;
-            }
-        };
-
-        // Store spawn context for GET_SPAWN_CONTEXT
-        // Include metadata from port registration (e.g., BAR0 info)
-        if !trigger_port.is_empty() {
-            let port_type = self.ports.get_port_type(trigger_port).unwrap_or(0);
-            let trig_port_id = self.ports.get_port_id(trigger_port).unwrap_or(0xFF);
-            let metadata: ([u8; 64], usize) = self.ports.get(trigger_port)
+        // Gather port metadata for the birth mailbox
+        let (port_type, metadata_buf, metadata_len, trig_port_id) = if !trigger_port.is_empty() {
+            let pt = self.ports.get_port_type(trigger_port).unwrap_or(0);
+            let pid_val = self.ports.get_port_id(trigger_port).unwrap_or(0xFF);
+            let md: ([u8; 64], usize) = self.ports.get(trigger_port)
                 .map(|p| {
                     let m = p.metadata();
                     let mut buf = [0u8; 64];
@@ -3548,40 +4056,68 @@ impl Devd {
                     (buf, len)
                 })
                 .unwrap_or(([0u8; 64], 0));
-            self.store_spawn_context(pid, port_type, trigger_port, &metadata.0[..metadata.1], trig_port_id);
+            (pt, md.0, md.1, pid_val)
+        } else {
+            (0u8, [0u8; 64], 0usize, 0xFF)
+        };
+
+        // Build mailbox with spawn context
+        let mut mb_buf = [0u8; 4096];
+        let empty_kvs: [ContextKv; 0] = [];
+        Self::build_spawn_mailbox(
+            &mut mb_buf, port_type, trig_port_id, trigger_port,
+            &metadata_buf[..metadata_len], &empty_kvs,
+        );
+
+        // Spawn with mailbox
+        let (pid, parent_mb_handle, parent_superq_handle) = match self.process_mgr.spawn_with_caps(binary, caps, &mb_buf) {
+            Ok(result) => result,
+            Err(_) => {
+                uerror!("devd", "dynamic_spawn_failed"; binary = binary);
+                return;
+            }
+        };
+
+        // Map the mailbox shmem
+        let mb_addr = match userlib::syscall::map(parent_mb_handle, 0) {
+            Ok(addr) if addr != 0 => addr,
+            _ => 0,
+        };
+
+        // Store spawn context
+        if !trigger_port.is_empty() {
+            self.store_spawn_context(pid, port_type, trigger_port, &metadata_buf[..metadata_len], trig_port_id);
         }
 
-        // Create service slot using create_dynamic_service (which actually creates the entry)
+        // Create service slot
         let slot_idx = self.services.create_dynamic_service(pid, binary.as_bytes(), now);
 
-        // Set up the service slot with trigger_port and caps
         if let Some(idx) = slot_idx {
             if let Some(service) = self.services.get_mut(idx) {
                 service.set_trigger_port(trigger_port);
                 service.caps = caps;
             }
 
-            // Add to recent_dynamic_pids for race condition handling
             self.add_recent_dynamic_pid(pid, idx as u8);
 
-            // Add supervision channel to query handler as pre-connected managed client
-            let ch_handle = channel.handle();
-            match self.query_handler.add_client(channel, Some(idx as u8), pid) {
-                Some(slot) => {
-                    if let Some(events) = &mut self.events {
-                        if events.watch(ch_handle).is_err() {
-                            uwarn!("devd", "dyn_channel_watch_failed"; pid = pid);
-                            self.overflow_query_mask |= 1 << slot;
-                            self.update_timeout();
+            // Add supervision-based client (SuperQ for bidirectional communication)
+            if mb_addr != 0 {
+                let superq = userlib::SupervisionHandle::from_handle(parent_superq_handle);
+                let superq_handle = superq.handle();
+                match self.query_handler.add_supervision_client(
+                    superq, idx as u8, pid,
+                ) {
+                    Some(_slot) => {
+                        if let Some(events) = &mut self.events {
+                            let _ = events.watch(superq_handle);
                         }
                     }
-                }
-                None => {
-                    uwarn!("devd", "no_query_slot_dyn"; pid = pid);
+                    None => {
+                        uwarn!("devd", "no_query_slot_dyn"; pid = pid);
+                    }
                 }
             }
         } else {
-            // No slot available — channel will be dropped (child sees PeerClosed)
             uerror!("devd", "no_dynamic_slot"; pid = pid);
         }
     }
@@ -3624,7 +4160,7 @@ impl Devd {
     // =========================================================================
 
     /// Track an in-flight spawn command (seq_id -> port info + binary name + caps)
-    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8], binary: &str, caps: u64, link_id: u32, trigger_port_id: u8) {
+    fn track_inflight_spawn(&mut self, seq_id: u32, port_type: u8, port_name: &[u8], binary: &str, caps: u64, link_id: u32, trigger_port_id: u8, parent_svc_idx: u8) {
         // Find empty slot
         for entry in &mut self.inflight_spawns {
             if entry.seq_id == 0 {
@@ -3638,6 +4174,7 @@ impl Devd {
                 entry.binary_name[..bin_len].copy_from_slice(&binary.as_bytes()[..bin_len]);
                 entry.binary_name_len = bin_len as u8;
                 entry.service_idx = 0xFF;  // Not a service spawn
+                entry.parent_service_idx = parent_svc_idx;
                 entry.caps = caps;
                 entry.link_id = link_id;
                 // Copy pending context KVs
@@ -3647,6 +4184,40 @@ impl Devd {
                 }
                 entry.context_kv_count = self.pending_context_kv_count;
                 self.pending_context_kv_count = 0;
+                return;
+            }
+        }
+    }
+
+    /// Check if a parent driver already has an in-flight SuperQ SpawnChild command.
+    fn has_inflight_superq_spawn(&self, parent_svc_idx: u8) -> bool {
+        self.inflight_spawns.iter().any(|e| e.seq_id != 0 && e.parent_service_idx == parent_svc_idx)
+    }
+
+    /// Queue a deferred rule fire for a port whose parent SuperQ is busy.
+    fn defer_rule_fire(&mut self, port_id: u8, owner_idx: u8) {
+        for entry in &mut self.deferred_rules {
+            if !entry.active {
+                *entry = DeferredRuleFire { port_id, owner_idx, active: true };
+                return;
+            }
+        }
+        uwarn!("devd", "deferred_rules_full"; port_id = port_id as u32, owner = owner_idx as u32);
+    }
+
+    /// Drain deferred rules for a parent driver whose SuperQ has capacity.
+    fn drain_deferred_rules(&mut self, parent_svc_idx: u8) {
+        // Fire ONE deferred rule for this parent. If there are more, they'll be
+        // drained on the next spawn_ack.
+        for i in 0..MAX_DEFERRED_RULES {
+            if self.deferred_rules[i].active && self.deferred_rules[i].owner_idx == parent_svc_idx {
+                let port_id = self.deferred_rules[i].port_id;
+                let owner_idx = self.deferred_rules[i].owner_idx;
+                self.deferred_rules[i] = DeferredRuleFire::empty();
+                if let Some(port) = self.ports.get_by_id(port_id) {
+                    let info = *port.port_info();
+                    self.check_class_rules(&info, owner_idx, port_id);
+                }
                 return;
             }
         }

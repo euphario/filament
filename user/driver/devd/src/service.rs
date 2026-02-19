@@ -4,7 +4,7 @@
 //! All services are dynamically spawned via PORT_RULES or boot services.
 //! Uses trait-based design for testability.
 
-use userlib::ipc::{Channel, Timer, ObjHandle};
+use userlib::ipc::{Timer, ObjHandle};
 
 // =============================================================================
 // Constants
@@ -99,8 +99,6 @@ pub struct Service {
     pub state: ServiceState,
     /// Process ID (0 if not running)
     pub pid: u32,
-    /// Channel from this service (for ready announcement)
-    pub channel: Option<Channel>,
     /// Restart backoff in ms
     pub backoff_ms: u32,
     /// Last state change timestamp
@@ -126,7 +124,6 @@ impl Service {
         Self {
             state: ServiceState::Pending,
             pid: 0,
-            channel: None,
             backoff_ms: INITIAL_BACKOFF_MS,
             last_change: 0,
             total_restarts: 0,

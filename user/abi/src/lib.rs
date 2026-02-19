@@ -52,6 +52,7 @@ pub mod syscall {
     pub const SIGNAL_PEEK: u64 = 82;
     pub const SIGNAL_FLUSH: u64 = 83;
     pub const RESET_STATS: u64 = 84;
+    pub const EXEC_WITH_MAILBOX: u64 = 85;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;
@@ -105,6 +106,12 @@ pub enum ObjectType {
     Ring = 16,
     /// Bus creation (probed only)
     Bus = 17,
+    /// System metrics (process table, system stats, port info)
+    Metrics = 18,
+    /// Supervision queue (parent end — reads from up, writes to down)
+    SupervisionParent = 19,
+    /// Supervision queue (child end — reads from down, writes to up)
+    SupervisionChild = 20,
 }
 
 impl ObjectType {
@@ -128,6 +135,9 @@ impl ObjectType {
             15 => Some(ObjectType::BusList),
             16 => Some(ObjectType::Ring),
             17 => Some(ObjectType::Bus),
+            18 => Some(ObjectType::Metrics),
+            19 => Some(ObjectType::SupervisionParent),
+            20 => Some(ObjectType::SupervisionChild),
             _ => None,
         }
     }
@@ -145,7 +155,12 @@ impl ObjectType {
 
     /// Does this type support write()?
     pub fn is_writable(&self) -> bool {
-        !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process | ObjectType::BusList | ObjectType::Msi)
+        !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process | ObjectType::BusList | ObjectType::Msi | ObjectType::Metrics)
+    }
+
+    /// Is this a supervision queue endpoint?
+    pub fn is_supervision(&self) -> bool {
+        matches!(self, ObjectType::SupervisionParent | ObjectType::SupervisionChild)
     }
 }
 
@@ -378,6 +393,8 @@ impl Handle {
     pub const STDERR: Handle = Handle((1 << 24) | 3);
     /// Supervision channel handle (slot 4, set by exec_with_channel)
     pub const SUPERVISION: Handle = Handle((1 << 24) | 4);
+    /// Mailbox shmem handle (slot 5, set by exec_with_mailbox)
+    pub const MAILBOX: Handle = Handle((1 << 24) | 5);
 
     #[inline]
     pub const fn new(index: usize, generation: u8) -> Self {
@@ -543,16 +560,33 @@ pub mod mux_filter {
     pub const SIGNAL: u8 = 1 << 4;
 }
 
-/// Signal event types (delivered via Mux as task-level async notifications)
+/// Signal event types (bitmask — delivered via Mux as task-level async notifications)
+///
+/// Bitmask design enables coalescing: when the signal queue is full,
+/// new events OR their bits into the tail entry so no event *type* is lost.
 pub mod signal_event {
     /// Child process exited (value = pid<<32 | exit_code)
-    pub const CHILD_EXIT: u32 = 1;
-    /// Ctrl+C / interrupt (value = 0)
-    pub const INTERRUPT: u32 = 2;
+    pub const CHILD_EXIT: u32    = 1 << 0;
     /// Graceful shutdown request (value = 0)
-    pub const SHUTDOWN: u32 = 3;
-    /// Bus port state changed (value = port_idx<<32 | new_state)
-    pub const PORT_STATE: u32 = 4;
+    pub const SHUTDOWN: u32      = 1 << 1;
+    /// Ctrl+C / interrupt (value = 0)
+    pub const INTERRUPT: u32     = 1 << 2;
+    /// Driver is ready (value = 0)
+    pub const READY: u32         = 1 << 3;
+    /// Reserved (was: mailbox response signal, now replaced by SuperQ)
+    pub const _RESERVED_4: u32   = 1 << 4;
+    /// Console resize (value = cols<<16 | rows)
+    pub const RESIZE: u32        = 1 << 5;
+    /// Port state changed (value = port_idx<<32 | new_state)
+    pub const PORT_CHANGED: u32  = 1 << 6;
+    /// Hardware event (value = device-specific)
+    pub const HARDWARE: u32      = 1 << 7;
+    /// Heartbeat request (value = sequence)
+    pub const HEARTBEAT: u32     = 1 << 8;
+    /// Reserved (was: config update signal, now replaced by SuperQ)
+    pub const _RESERVED_9: u32   = 1 << 9;
+    /// Eviction notice (value = reason)
+    pub const EVICT: u32         = 1 << 10;
 }
 
 /// A pending signal in the per-task signal queue
@@ -579,14 +613,14 @@ pub enum MuxFilter {
 pub struct MuxEvent {
     pub handle: Handle,       // 4 bytes (Handle::INVALID for signals)
     pub event: u8,            // mux_filter bits, including SIGNAL
-    pub signal_event: u8,     // signal_event::* when SIGNAL set, 0 otherwise
-    pub _pad: [u8; 2],
+    pub _pad: u8,
+    pub signal_event: u16,    // signal_event::* bitmask when SIGNAL set, 0 otherwise
     pub signal_value: u64,    // signal value when SIGNAL set, 0 otherwise
 }
 
 impl MuxEvent {
     pub const fn empty() -> Self {
-        Self { handle: Handle::INVALID, event: 0, signal_event: 0, _pad: [0; 2], signal_value: 0 }
+        Self { handle: Handle::INVALID, event: 0, _pad: 0, signal_event: 0, signal_value: 0 }
     }
 
     /// Check if this event indicates readable
@@ -1232,6 +1266,178 @@ impl BusCreateInfo {
 pub mod bus_create_flags {
     /// PCIe uses ECAM config space (vs MAC-based)
     pub const ECAM: u8 = 1 << 0;
+}
+
+// ============================================================================
+// Mailbox (Spawn-Time Config Delivery)
+// ============================================================================
+
+/// Mailbox header — first 64 bytes of the 4KB mailbox shmem page.
+///
+/// The mailbox is created by the parent (devd) and mapped into the child
+/// at spawn time via exec_with_mailbox. Contains bus configuration,
+/// device list, and spawn context key-value pairs.
+///
+/// Layout:
+///   [0..64)   MailboxHeader
+///   [64..)    Device list + config KVs (variable)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MailboxHeader {
+    /// Magic: 0x4D424F58 ("MBOX")
+    pub magic: u32,
+    /// Version (currently 1)
+    pub version: u16,
+    /// Flags: bit 0 = parent has written, bit 1 = child has written
+    pub flags: u16,
+    /// Bus type (bus_type::*)
+    pub bus_type: u8,
+    /// Bus index within type
+    pub bus_index: u8,
+    /// Number of BusDevice entries following the header
+    pub device_count: u8,
+    /// Capability flags
+    pub capabilities: u8,
+    /// Number of config KV pairs following device entries
+    pub kv_count: u8,
+    /// Scheduling priority (0xFF = inherit parent)
+    pub priority: u8,
+    /// Reserved
+    pub _reserved0: [u8; 2],
+    /// MMIO base address
+    pub base_addr: u64,
+    /// MMIO region size
+    pub size: u64,
+    /// Primary IRQ number
+    pub irq: u32,
+    /// Parent PID (so child can signal parent)
+    pub parent_pid: u32,
+    /// Reserved for future use
+    pub _reserved1: [u8; 24],
+}
+
+/// Mailbox magic number: "MBOX" in little-endian
+pub const MAILBOX_MAGIC: u32 = 0x4D424F58;
+
+/// Mailbox flags
+pub mod mailbox_flags {
+    pub const PARENT_WRITTEN: u16 = 1 << 0;
+    pub const CHILD_WRITTEN: u16 = 1 << 1;
+}
+
+const _: () = assert!(core::mem::size_of::<MailboxHeader>() == 64);
+
+impl MailboxHeader {
+    pub const fn empty() -> Self {
+        Self {
+            magic: MAILBOX_MAGIC,
+            version: 1,
+            flags: 0,
+            bus_type: 0,
+            bus_index: 0,
+            device_count: 0,
+            capabilities: 0,
+            kv_count: 0,
+            priority: 0xFF,
+            _reserved0: [0; 2],
+            base_addr: 0,
+            size: 0,
+            irq: 0,
+            parent_pid: 0,
+            _reserved1: [0; 24],
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.magic == MAILBOX_MAGIC && self.version >= 1
+    }
+}
+
+// ============================================================================
+// Supervision Note (SuperQ wire format)
+// ============================================================================
+
+/// A supervision note: compact, typed, queued message between parent↔child.
+/// 128 bytes — fits 8 notes in 1KB per direction.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SupervisionNote {
+    /// Note type (supervision_note::*)
+    pub note_type: u8,
+    /// Reserved flags
+    pub flags: u8,
+    /// Request-response correlation sequence number
+    pub seq: u16,
+    /// Payload length (0..120)
+    pub len: u16,
+    /// Reserved
+    pub _reserved: u16,
+    /// Type-specific data
+    pub payload: [u8; 120],
+}
+
+const _: () = assert!(core::mem::size_of::<SupervisionNote>() == 128);
+
+impl SupervisionNote {
+    pub const fn empty() -> Self {
+        Self {
+            note_type: 0,
+            flags: 0,
+            seq: 0,
+            len: 0,
+            _reserved: 0,
+            payload: [0; 120],
+        }
+    }
+
+    /// Get the payload as a byte slice (up to len bytes).
+    pub fn payload_bytes(&self) -> &[u8] {
+        let len = (self.len as usize).min(120);
+        &self.payload[..len]
+    }
+}
+
+/// Supervision note types
+pub mod supervision_note {
+    // Child → Parent
+    /// Child reports state change (payload: { state: u8 })
+    pub const STATE_CHANGE: u8 = 1;
+    /// Child registers a port (payload: PortInfo + shmem_id)
+    pub const PORT_REGISTER: u8 = 2;
+    /// Child acknowledges a spawn command (payload: { seq: u16, result: i32, count: u8, pids: [u32; N] })
+    pub const SPAWN_ACK: u8 = 3;
+    /// Child returns config query result (payload: config data bytes)
+    pub const CONFIG_RESULT: u8 = 4;
+    /// End-of-line marker for config responses (payload: { seq: u16 })
+    pub const CONFIG_EOL: u8 = 5;
+    /// Child forwards a raw query message to parent (relayed from grandchild)
+    pub const FORWARD: u8 = 6;
+
+    // Parent → Child
+    /// Parent asks child to spawn a grandchild
+    pub const SPAWN_CHILD: u8 = 16;
+    /// Parent queries child config
+    pub const CONFIG_GET: u8 = 17;
+    /// Parent sets child config
+    pub const CONFIG_SET: u8 = 18;
+    /// Graceful shutdown request
+    pub const SHUTDOWN: u8 = 19;
+
+    // Kernel → Parent (auto-generated)
+    /// Child process exited (payload: { pid: u32, exit_code: i32 })
+    pub const EXIT: u8 = 32;
+}
+
+// ============================================================================
+// Metrics Object
+// ============================================================================
+
+/// Metric read modes (passed as flags arg to read(metrics_handle, buf, mode))
+pub mod metric_mode {
+    /// Read process table: fills buf with ProcessInfo array
+    pub const PROCTABLE: u32 = 1;
+    /// Read system-wide stats: fills buf with SysInfo
+    pub const SYSTEM: u32 = 2;
 }
 
 /// Bus state constants for BusInfo

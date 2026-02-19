@@ -551,8 +551,13 @@ impl Driver for ConsoledDriver {
         }
 
         // Get stdin handle
-        self.stdin_handle = syscall::open(ObjectType::Stdin, &[])
-            .map_err(|_| BusError::Internal)?;
+        self.stdin_handle = match syscall::open(ObjectType::Stdin, &[]) {
+            Ok(h) => h,
+            Err(_) => {
+                uerror!("consoled", "stdin_open_failed";);
+                return Err(BusError::Internal);
+            }
+        };
 
         // Drain any stale input
         let mut buf = [0u8; 64];
@@ -564,12 +569,23 @@ impl Driver for ConsoledDriver {
         }
 
         // Create console port
-        let port = Port::with_limit(b"console:0", 1)
-            .map_err(|_| BusError::Internal)?;
+        let port = match Port::with_limit(b"console:0", 1) {
+            Ok(p) => p,
+            Err(_) => {
+                uerror!("consoled", "port_create_failed";);
+                return Err(BusError::Internal);
+            }
+        };
 
         // Watch stdin and port for events
-        ctx.watch_handle(self.stdin_handle, TAG_STDIN)?;
-        ctx.watch_handle(port.handle(), TAG_PORT)?;
+        if let Err(e) = ctx.watch_handle(self.stdin_handle, TAG_STDIN) {
+            uerror!("consoled", "watch_stdin_failed";);
+            return Err(e);
+        }
+        if let Err(e) = ctx.watch_handle(port.handle(), TAG_PORT) {
+            uerror!("consoled", "watch_port_failed";);
+            return Err(e);
+        }
 
         self.port = Some(port);
 
@@ -579,7 +595,10 @@ impl Driver for ConsoledDriver {
         info.port_class = PortClass::Console;
         info.port_subclass = port_subclass::CONSOLE_SERIAL;
 
-        ctx.register_port_with_info(&info, 0)?;
+        if let Err(e) = ctx.register_port_with_info(&info, 0) {
+            uerror!("consoled", "register_port_failed";);
+            return Err(e);
+        }
         // Port starts Safe. Supervisor (devd) fires spawn rules when port transitions to Claimed.
 
         uinfo!("consoled", "ready";);

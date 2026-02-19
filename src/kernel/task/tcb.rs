@@ -983,11 +983,18 @@ impl Task {
     // Signal Queue API
     // ========================================================================
 
-    /// Enqueue a signal into this task's signal queue. Returns false if full.
+    /// Enqueue a signal into this task's signal queue.
+    ///
+    /// When the queue is full, coalesces by ORing event bits into the newest
+    /// entry. This ensures no event *type* is lost, though the value may be
+    /// from a different event. Returns true always (coalescing never fails).
     pub fn enqueue_signal(&mut self, event: u32, value: u64) -> bool {
-        debug_assert!(event <= 255, "signal event {} exceeds u8 range for MuxEvent delivery", event);
+        debug_assert!(event <= 0xFFFF, "signal event {:#x} exceeds u16 range for MuxEvent delivery", event);
         if self.signal_count >= MAX_PENDING_SIGNALS as u8 {
-            return false;
+            // Coalesce: OR event bits into the newest (head-1) entry
+            let tail_idx = (self.signal_head + MAX_PENDING_SIGNALS as u8 - 1) % MAX_PENDING_SIGNALS as u8;
+            self.signal_queue[tail_idx as usize].event |= event;
+            return true;
         }
         self.signal_queue[self.signal_head as usize] = abi::PendingSignal { event, value };
         self.signal_head = (self.signal_head + 1) % MAX_PENDING_SIGNALS as u8;

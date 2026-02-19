@@ -604,7 +604,7 @@ pub fn wake(pid: u32) -> bool {
 ///
 /// Targeted: only wakes a single idle CPU instead of broadcasting to all.
 /// If no CPU is idle, the timer tick will eventually catch up.
-fn send_reschedule_ipi() {
+pub(crate) fn send_reschedule_ipi() {
     let my_cpu = percpu::cpu_id();
     for i in 0..percpu::MAX_CPUS {
         if i as u32 != my_cpu {

@@ -97,6 +97,7 @@ pub mod channel;
 pub mod table;
 pub mod port;
 pub mod backend;
+pub mod supervision;
 
 #[cfg(test)]
 mod tests;

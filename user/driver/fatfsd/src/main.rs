@@ -38,7 +38,7 @@ use userlib::bus::{
     PortInfo, PortClass, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
-use userlib::ring::{IoSqe, SideEntry, io_status, side_msg, side_status};
+use userlib::ring::{IoSqe, io_status};
 use userlib::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
 use userlib::{uinfo, uerror};
 
@@ -928,8 +928,29 @@ impl FatfsDriver {
 
                             uinfo!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
 
-                            // Register mount with vfsd via side-channel
-                            self.register_mount_with_vfsd(vfs_shmem_id, &pname[..pname_len], ctx);
+                            // Register mount with devd so clients can resolve paths
+                            // Strip trailing ':' from port name for mount prefix,
+                            // and prepend '/' for a proper path prefix
+                            let clean_name = if pname_len > 0 && pname[pname_len - 1] == b':' {
+                                &pname[..pname_len - 1]
+                            } else {
+                                &pname[..pname_len]
+                            };
+                            let mut mount_prefix = [0u8; 65];
+                            mount_prefix[0] = b'/';
+                            let clen = clean_name.len().min(64);
+                            mount_prefix[1..1 + clen].copy_from_slice(&clean_name[..clen]);
+                            let prefix_len = 1 + clen;
+                            // Ensure trailing slash
+                            let prefix_len = if prefix_len < 65 && mount_prefix[prefix_len - 1] != b'/' {
+                                mount_prefix[prefix_len] = b'/';
+                                prefix_len + 1
+                            } else {
+                                prefix_len
+                            };
+                            if let Err(_) = ctx.register_mount(&mount_prefix[..prefix_len], vfs_shmem_id) {
+                                uerror!("fatfsd", "mount_register_failed";);
+                            }
                             return true;
                         }
                     }
@@ -945,57 +966,6 @@ impl FatfsDriver {
         false
     }
 
-    /// Register this mount with vfsd by sending REGISTER_MOUNT via side-channel.
-    ///
-    /// Discovers vfsd's DataPort via devd-query, connects, and sends the
-    /// REGISTER_MOUNT side-channel entry with our VFS DataPort shmem_id
-    /// and mount name.
-    fn register_mount_with_vfsd(&mut self, vfs_shmem_id: u32, port_name: &[u8], ctx: &mut dyn BusCtx) {
-        // Discover vfsd's DataPort shmem_id
-        let vfsd_shmem_id = match ctx.discover_port_by_name(b"vfs:0") {
-            Ok(id) => id,
-            Err(e) => {
-                uerror!("fatfsd", "discover_vfs_failed";);
-                return;
-            }
-        };
-
-        // Connect to vfsd's DataPort
-        let vfsd_port = match ctx.connect_block_port(vfsd_shmem_id) {
-            Ok(id) => id,
-            Err(e) => {
-                uerror!("fatfsd", "vfsd_connect_failed";);
-                return;
-            }
-        };
-
-        // Build REGISTER_MOUNT side-channel entry
-        // Payload: [0..4] fs_shmem_id, [4] name_len, [5..24] mount_name
-        let mut entry = SideEntry::default();
-        entry.msg_type = side_msg::REGISTER_MOUNT;
-        entry.status = side_status::REQUEST;
-        entry.payload[0..4].copy_from_slice(&vfs_shmem_id.to_le_bytes());
-
-        // Strip trailing ":" from port name for mount name
-        let clean_name = if !port_name.is_empty() && port_name[port_name.len() - 1] == b':' {
-            &port_name[..port_name.len() - 1]
-        } else {
-            port_name
-        };
-        let name_len = clean_name.len().min(19);
-        entry.payload[4] = name_len as u8;
-        entry.payload[5..5 + name_len].copy_from_slice(&clean_name[..name_len]);
-
-        // Send via side-channel
-        if let Some(port) = ctx.block_port(vfsd_port) {
-            if port.side_send(&entry) {
-                port.notify();
-                uinfo!("fatfsd", "mount_registered"; shmem_id = vfs_shmem_id);
-            } else {
-                uerror!("fatfsd", "mount_send_failed";);
-            }
-        }
-    }
 
     fn format_info(&self) -> [u8; 256] {
         let mut buf = [0u8; 256];

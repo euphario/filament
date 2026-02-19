@@ -83,6 +83,7 @@ pub enum SyscallNumber {
     SignalPeek = 82,   // Read pending signals without consuming
     SignalFlush = 83,  // Clear pending signal queue
     ResetStats = 84,   // Reset per-task statistics counters
+    ExecWithMailbox = 85, // Spawn with mailbox shmem page
 
     // Unified interface (100-105) - THE 6 SYSCALLS
     Open = 100,
@@ -139,6 +140,7 @@ impl From<u64> for SyscallNumber {
             82 => SyscallNumber::SignalPeek,
             83 => SyscallNumber::SignalFlush,
             84 => SyscallNumber::ResetStats,
+            85 => SyscallNumber::ExecWithMailbox,
             // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -256,6 +258,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::SignalPeek => process::sys_signal_peek(args.arg0 as u32, args.arg1, args.arg2 as usize),
         SyscallNumber::SignalFlush => process::sys_signal_flush(args.arg0 as u32),
         SyscallNumber::ResetStats => process::sys_reset_stats(args.arg0 as u32),
+        SyscallNumber::ExecWithMailbox => process::sys_exec_with_mailbox(args.arg0, args.arg1 as usize, args.arg2, args.arg3, args.arg4 as usize),
         SyscallNumber::Sysinfo => misc::sys_sysinfo(args.arg0),
         SyscallNumber::Reset => misc::sys_reset(),
         SyscallNumber::Shutdown => misc::sys_shutdown(args.arg0 as u8),
@@ -343,6 +346,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::ExecWithCaps => "exec_with_caps",
         SyscallNumber::ExecWithChannel => "exec_with_channel",
+        SyscallNumber::ExecWithMailbox => "exec_with_mailbox",
         // Unified interface (100-105)
         SyscallNumber::Open => "open",
         SyscallNumber::Read => "read",

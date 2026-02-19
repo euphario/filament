@@ -33,6 +33,8 @@ pub mod bus_block;
 pub mod vfs_proto;
 pub mod vfs_client;
 pub mod serialize;
+pub mod mailbox;
+pub mod supervision;
 #[macro_use]
 pub mod ulog;
 
@@ -59,6 +61,7 @@ pub use bus_block::ShmemBlockPort;
 pub use vfs_proto::{VfsDirEntry, VfsStat, fs_op, open_flags, file_type, vfs_error};
 pub use vfs_client::{VfsClient, VfsError};
 pub use bus_runtime::driver_main;
+pub use supervision::SupervisionHandle;
 
 // Entry point - called by _start
 unsafe extern "Rust" {

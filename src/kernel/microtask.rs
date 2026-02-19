@@ -469,8 +469,16 @@ fn execute(task: MicroTask) {
 }
 
 /// Notify parent that a child exited via ObjectService ProcessObject wake.
+/// Also injects an EXIT note into the SupervisionQueue so the parent
+/// receives a reliable queued notification.
 fn exec_notify_parent_exit(parent_id: TaskId, child_pid: TaskId, code: i32) {
     use crate::kernel::task::lifecycle::{ExitInfo, complete_exit_notification};
+    use crate::kernel::ipc::{waker, traits::WakeReason};
+
+    // Inject EXIT note into SupervisionQueue (if child has one)
+    let wake_list = crate::kernel::ipc::supervision::inject_exit(child_pid, code);
+    waker::wake(&wake_list, WakeReason::Readable);
+
     complete_exit_notification(ExitInfo { parent_id, child_pid, code });
 }
 
@@ -645,7 +653,7 @@ fn exec_evict(pid: TaskId, reason_val: u8) {
 
 /// Deliver a signal to a target task's queue and wake it.
 fn exec_signal(target: TaskId, event: u32, value: u64) {
-    crate::kernel::task::with_scheduler(|sched| {
+    let woken = crate::kernel::task::with_scheduler(|sched| {
         if let Some(slot) = sched.slot_by_pid(target) {
             if let Some(task) = sched.task_mut(slot) {
                 // Only deliver to non-terminated tasks
@@ -655,7 +663,14 @@ fn exec_signal(target: TaskId, event: u32, value: u64) {
                     }
                 }
             }
-            sched.wake_task(slot);
+            sched.wake_task(slot)
+        } else {
+            false
         }
     });
+    // Send IPI so the target's CPU wakes from WFI to schedule the woken task.
+    // Without this, the task waits until the next timer tick (10ms) to run.
+    if woken {
+        crate::kernel::sched::send_reschedule_ipi();
+    }
 }

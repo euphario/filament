@@ -231,7 +231,7 @@ impl BusRegistry {
     pub fn find_by_channel(&mut self, channel: ChannelId) -> Option<&mut BusController> {
         self.buses[..self.bus_count]
             .iter_mut()
-            .find(|b| b.listen_channel == Some(channel) || b.supervisor_ch == Some(channel) || b.owner_ch == Some(channel))
+            .find(|b| b.listen_channel == Some(channel) || b.owner_ch == Some(channel))
     }
 
     /// Get all buses
@@ -430,7 +430,6 @@ pub fn reset_all_buses() {
     with_bus_registry(|registry| {
         for bus in registry.iter_mut() {
             // Clear all connections
-            bus.supervisor_ch = None;
             bus.supervisor_pid = None;
             bus.owner_ch = None;
             bus.owner_pid = None;
@@ -665,7 +664,6 @@ pub fn test() {
     assert!(bus.check_invariants());
 
     // Simulate owner connect
-    bus.supervisor_ch = Some(99);
     bus.supervisor_pid = Some(1);
     bus.owner_ch = Some(100);
     bus.owner_pid = Some(2);

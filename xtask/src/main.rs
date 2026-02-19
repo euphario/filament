@@ -283,7 +283,6 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         all_programs.push(("netd", "driver/netd"));
         all_programs.push(("ipd", "driver/ipd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
-        all_programs.push(("vfsd", "driver/vfsd"));
     } else {
         // MT7988A real hardware programs
         all_programs.push(("pcied", "driver/pcied"));
@@ -295,7 +294,6 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         all_programs.push(("switchd", "driver/switchd"));  // MT7531 L2 switch
         all_programs.push(("ipd", "driver/ipd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
-        all_programs.push(("vfsd", "driver/vfsd"));
     }
 
     // Stress test programs (QEMU only)

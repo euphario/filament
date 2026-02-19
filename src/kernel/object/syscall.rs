@@ -75,6 +75,9 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         ObjectType::BusList => open_bus_list(params_ptr, params_len),
         ObjectType::Ring => open_ring(params_ptr, params_len),
         ObjectType::Bus => open_bus_create(params_ptr, params_len),
+        ObjectType::Metrics => open_metrics(),
+        // Supervision handles are created by exec_with_mailbox, not by open()
+        ObjectType::SupervisionParent | ObjectType::SupervisionChild => KernelError::NotSupported.to_errno(),
     }
 }
 
@@ -134,6 +137,9 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         return read_port_via_service(task_id, handle, buf_ptr, buf_len);
     }
 
+    // Supervision reads are non-blocking (same as Channel). Userspace
+    // uses wait_one() or Mux for blocking semantics.
+
     // NOTE: Channel read is non-blocking (returns WouldBlock if no data).
     // Use Mux to wait for data, or call wait_one() then recv().
     // A proper blocking recv API should be added via a separate syscall flag.
@@ -160,6 +166,9 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::BusList(b) => read_bus_list(b, buf_ptr, buf_len),
             Object::Ring(r) => read_ring(r, buf_ptr, buf_len, task_id),
             Object::DmaPool(d) => read_dma_pool(d, buf_ptr, buf_len),
+            Object::Metrics => read_metrics(buf_ptr, buf_len, task_id),
+            Object::SupervisionParent(sp) => read_supervision_parent(sp, buf_ptr, buf_len),
+            Object::SupervisionChild(sc) => read_supervision_child(sc, buf_ptr, buf_len),
             _ => KernelError::NotSupported.to_errno(),
         }
     });
@@ -200,6 +209,7 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         None,
         ShmemNotify(u32, u32), // (shmem_id, caller_pid)
         ChannelWake(ChannelWriteResult),
+        SupervisionWake(waker::WakeList),
     }
 
     // Use ObjectService's tables for dispatch
@@ -250,6 +260,14 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::PciDevice(d) => (write_pci_device(d, buf_ptr, buf_len, task_id), PendingAction::None),
             Object::Ring(r) => (write_ring(r, buf_ptr, buf_len, task_id), PendingAction::None),
             Object::BusCreator(bc) => (write_bus_creator(bc, buf_ptr, buf_len), PendingAction::None),
+            Object::SupervisionParent(sp) => {
+                let r = write_supervision_parent(sp, buf_ptr, buf_len);
+                (r.0, if r.1.is_empty() { PendingAction::None } else { PendingAction::SupervisionWake(r.1) })
+            }
+            Object::SupervisionChild(sc) => {
+                let r = write_supervision_child(sc, buf_ptr, buf_len);
+                (r.0, if r.1.is_empty() { PendingAction::None } else { PendingAction::SupervisionWake(r.1) })
+            }
             _ => (KernelError::NotSupported.to_errno(), PendingAction::None),
         }
     });
@@ -273,6 +291,9 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                     if let Some((buf, len, channel_id)) = r.bus_data {
                         crate::kernel::bus::process_bus_message(channel_id, &buf[..len]);
                     }
+                }
+                PendingAction::SupervisionWake(wake_list) => {
+                    waker::wake(&wake_list, ipc::WakeReason::Readable);
                 }
                 PendingAction::None => {}
             }
@@ -385,6 +406,8 @@ pub fn close(handle_raw: u32) -> i64 {
         Object::DmaPool(d) => close_dma_pool(d, task_id),
         Object::Mmio(m) => close_mmio(m, task_id),
         Object::Ring(r) => close_ring(r, task_id),
+        Object::SupervisionParent(sp) => close_supervision_parent(sp),
+        Object::SupervisionChild(sc) => close_supervision_child(sc),
         _ => {} // No cleanup needed
     }
 
@@ -869,6 +892,74 @@ fn open_bus_create(params_ptr: u64, params_len: usize) -> i64 {
         Ok(Ok(handle)) => handle.raw() as i64,
         Ok(Err(e)) => e.to_errno(),
         Err(e) => e.to_errno(),
+    }
+}
+
+fn open_metrics() -> i64 {
+    let task_id = get_current_task_id();
+    let Some(task_id) = task_id else {
+        return KernelError::BadHandle.to_errno();
+    };
+
+    match object_service().with_table_mut(task_id, |table| {
+        table.alloc(ObjectType::Metrics, Object::Metrics).ok_or(KernelError::OutOfHandles)
+    }) {
+        Ok(Ok(handle)) => handle.raw() as i64,
+        Ok(Err(e)) => e.to_errno(),
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// Read metrics — mode is passed as buf_len:
+///   PROCTABLE (1): write ProcessInfo array, return byte count
+///   SYSTEM (2):    write SysInfo, return byte count
+fn read_metrics(buf_ptr: u64, mode: usize, _task_id: u32) -> i64 {
+    match mode as u32 {
+        abi::metric_mode::PROCTABLE => read_metrics_proctable(buf_ptr),
+        abi::metric_mode::SYSTEM => read_metrics_system(buf_ptr),
+        _ => KernelError::InvalidArg.to_errno(),
+    }
+}
+
+fn read_metrics_proctable(buf_ptr: u64) -> i64 {
+    use crate::kernel::process_ops_impl::process_ops_backend;
+
+    let mut entries = [abi::ProcessInfo::empty(); 64];
+    let count = process_ops_backend().list_processes(&mut entries, 64);
+
+    let byte_count = count * core::mem::size_of::<abi::ProcessInfo>();
+    let src_bytes = unsafe { core::slice::from_raw_parts(entries.as_ptr() as *const u8, byte_count) };
+    match uaccess::copy_to_user(buf_ptr, src_bytes) {
+        Ok(_) => byte_count as i64,
+        Err(_) => KernelError::BadAddress.to_errno(),
+    }
+}
+
+fn read_metrics_system(buf_ptr: u64) -> i64 {
+    use crate::kernel::pmm;
+
+    let num_tasks = task::with_scheduler(|sched| {
+        let mut count = 0u16;
+        for (slot, task_opt) in sched.iter_tasks() {
+            if crate::kernel::sched::is_idle_slot(slot) { continue; }
+            if task_opt.is_some() { count += 1; }
+        }
+        count
+    });
+
+    let info = abi::SysInfo {
+        uptime_ns: crate::platform::current::timer::now_ns(),
+        total_pages: pmm::total_count() as u32,
+        free_pages: pmm::free_count() as u32,
+        num_tasks,
+        num_cpus: crate::kernel::percpu::MAX_CPUS as u16,
+        _pad: [0; 4],
+    };
+
+    let bytes = unsafe { core::slice::from_raw_parts(&info as *const _ as *const u8, core::mem::size_of::<abi::SysInfo>()) };
+    match uaccess::copy_to_user(buf_ptr, bytes) {
+        Ok(_) => core::mem::size_of::<abi::SysInfo>() as i64,
+        Err(_) => KernelError::BadAddress.to_errno(),
     }
 }
 
@@ -1589,6 +1680,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     }
                     Object::Process(p) => { p.wait_queue_mut().subscribe(super::Waiter::from_subscriber(subscriber, watch.filter())); }
                     Object::Shmem(s) => { s.set_mux_subscriber(Some(subscriber)); }
+                    Object::SupervisionParent(sp) => { sp.subscribe(subscriber); }
+                    Object::SupervisionChild(sc) => { sc.subscribe(subscriber); }
                     _ => {}
                 }
             }
@@ -1623,7 +1716,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     handle: abi::Handle::from_raw(watch.handle()),
                     event: watch.filter(),
                     signal_event: 0,
-                    _pad: [0; 2],
+                    _pad: 0,
                     signal_value: 0,
                 };
                 event_count += 1;
@@ -1648,8 +1741,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     events[event_count] = super::MuxEvent {
                         handle: abi::Handle::INVALID,
                         event: abi::mux_filter::SIGNAL,
-                        signal_event: sig.event as u8,
-                        _pad: [0; 2],
+                        signal_event: sig.event as u16,
+                        _pad: 0,
                         signal_value: sig.value,
                     };
                     event_count += 1;
@@ -1813,7 +1906,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             handle: abi::Handle::from_raw(wd.handle),
             event: wd.events,
             signal_event: 0,
-            _pad: [0; 2],
+            _pad: 0,
             signal_value: 0,
         };
         let mut event_count = 1usize;
@@ -1826,8 +1919,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                         events[event_count] = super::MuxEvent {
                             handle: abi::Handle::INVALID,
                             event: abi::mux_filter::SIGNAL,
-                            signal_event: sig.event as u8,
-                            _pad: [0; 2],
+                            signal_event: sig.event as u16,
+                            _pad: 0,
                             signal_value: sig.value,
                         };
                         event_count += 1;
@@ -1859,7 +1952,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     handle: abi::Handle::from_raw(watch.handle()),
                     event: watch.filter(),
                     signal_event: 0,
-                    _pad: [0; 2],
+                    _pad: 0,
                     signal_value: 0,
                 };
                 event_count += 1;
@@ -1883,8 +1976,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     events[event_count] = super::MuxEvent {
                         handle: abi::Handle::INVALID,
                         event: abi::mux_filter::SIGNAL,
-                        signal_event: sig.event as u8,
-                        _pad: [0; 2],
+                        signal_event: sig.event as u16,
+                        _pad: 0,
                         signal_value: sig.value,
                     };
                     event_count += 1;
@@ -1956,6 +2049,12 @@ fn poll_watched_object(obj: &Object, filter: u8, channel_id: u32) -> bool {
         }
         Object::Ring(r) => {
             r.poll(filter).is_ready()
+        }
+        Object::SupervisionParent(sp) => {
+            sp.poll(filter).is_ready()
+        }
+        Object::SupervisionChild(sc) => {
+            sc.poll(filter).is_ready()
         }
         _ => false,
     }
@@ -2691,4 +2790,120 @@ fn close_ring(r: super::RingObject, owner: u32) {
     if r.is_creator() && r.shmem_id() != 0 {
         let _ = shmem::destroy(r.shmem_id(), owner);
     }
+}
+
+// ============================================================================
+// Supervision Queue handlers
+// ============================================================================
+
+/// Read a note from the parent end (up ring: child→parent). Non-blocking.
+fn read_supervision_parent(sp: &mut super::SupervisionParentObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    use crate::kernel::ipc::supervision;
+
+    let note_size = core::mem::size_of::<abi::SupervisionNote>();
+    if buf_len < note_size {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    match supervision::recv_up(sp.supervision_id()) {
+        Some(note) => {
+            let note_bytes = unsafe {
+                core::slice::from_raw_parts(&note as *const abi::SupervisionNote as *const u8, note_size)
+            };
+            match uaccess::copy_to_user(buf_ptr, note_bytes) {
+                Ok(_) => note_size as i64,
+                Err(_) => KernelError::BadAddress.to_errno(),
+            }
+        }
+        None => {
+            // No notes available — caller should use Mux to wait
+            KernelError::WouldBlock.to_errno()
+        }
+    }
+}
+
+/// Read a note from the child end (down ring: parent→child).
+fn read_supervision_child(sc: &mut super::SupervisionChildObject, buf_ptr: u64, buf_len: usize) -> i64 {
+    use crate::kernel::ipc::supervision;
+
+    let note_size = core::mem::size_of::<abi::SupervisionNote>();
+    if buf_len < note_size {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    match supervision::recv_down(sc.supervision_id()) {
+        Some(note) => {
+            let note_bytes = unsafe {
+                core::slice::from_raw_parts(&note as *const abi::SupervisionNote as *const u8, note_size)
+            };
+            match uaccess::copy_to_user(buf_ptr, note_bytes) {
+                Ok(_) => note_size as i64,
+                Err(_) => KernelError::BadAddress.to_errno(),
+            }
+        }
+        None => {
+            KernelError::WouldBlock.to_errno()
+        }
+    }
+}
+
+/// Write a note from the parent end (down ring: parent→child).
+/// Returns (errno, WakeList) for deferred waking.
+fn write_supervision_parent(sp: &mut super::SupervisionParentObject, buf_ptr: u64, buf_len: usize) -> (i64, waker::WakeList) {
+    use crate::kernel::ipc::supervision;
+
+    let note_size = core::mem::size_of::<abi::SupervisionNote>();
+    if buf_len < note_size {
+        return (KernelError::InvalidArg.to_errno(), waker::WakeList::new());
+    }
+
+    // Copy note from userspace
+    let mut note = abi::SupervisionNote::empty();
+    let note_bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut note as *mut abi::SupervisionNote as *mut u8, note_size)
+    };
+    if uaccess::copy_from_user(note_bytes, buf_ptr).is_err() {
+        return (KernelError::BadAddress.to_errno(), waker::WakeList::new());
+    }
+
+    match supervision::send_down(sp.supervision_id(), note) {
+        Ok(wake_list) => (note_size as i64, wake_list),
+        Err(()) => (KernelError::NoSpace.to_errno(), waker::WakeList::new()),
+    }
+}
+
+/// Write a note from the child end (up ring: child→parent).
+/// Returns (errno, WakeList) for deferred waking.
+fn write_supervision_child(sc: &mut super::SupervisionChildObject, buf_ptr: u64, buf_len: usize) -> (i64, waker::WakeList) {
+    use crate::kernel::ipc::supervision;
+
+    let note_size = core::mem::size_of::<abi::SupervisionNote>();
+    if buf_len < note_size {
+        return (KernelError::InvalidArg.to_errno(), waker::WakeList::new());
+    }
+
+    let mut note = abi::SupervisionNote::empty();
+    let note_bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut note as *mut abi::SupervisionNote as *mut u8, note_size)
+    };
+    if uaccess::copy_from_user(note_bytes, buf_ptr).is_err() {
+        return (KernelError::BadAddress.to_errno(), waker::WakeList::new());
+    }
+
+    match supervision::send_up(sc.supervision_id(), note) {
+        Ok(wake_list) => (note_size as i64, wake_list),
+        Err(()) => (KernelError::NoSpace.to_errno(), waker::WakeList::new()),
+    }
+}
+
+/// Close the parent end of a supervision queue.
+fn close_supervision_parent(sp: super::SupervisionParentObject) {
+    let wake_list = crate::kernel::ipc::supervision::close_parent(sp.supervision_id());
+    waker::wake(&wake_list, ipc::WakeReason::Closed);
+}
+
+/// Close the child end of a supervision queue.
+fn close_supervision_child(sc: super::SupervisionChildObject) {
+    let wake_list = crate::kernel::ipc::supervision::close_child(sc.supervision_id());
+    waker::wake(&wake_list, ipc::WakeReason::Closed);
 }

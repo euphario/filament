@@ -61,6 +61,9 @@ pub struct PortRule {
     /// Values may contain `{key}` placeholders expanded against the
     /// enriched KV bag from the port's registration chain.
     pub context: &'static [(&'static str, &'static str)],
+    /// If set, auto-register a mount at this path when the port becomes Ready.
+    /// The mount maps to the port name as a Port transport.
+    pub mount_path: Option<&'static str>,
 }
 
 impl PortRule {
@@ -100,6 +103,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::HIGH,
         context: &[],
+        mount_path: None,
     },
     PortRule {
         class: PortClass::Usb,
@@ -108,6 +112,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::HIGH,
         context: &[],
+        mount_path: None,
     },
     PortRule {
         class: PortClass::Ethernet,
@@ -116,6 +121,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::HIGH,
         context: &[],
+        mount_path: None,
     },
     PortRule {
         class: PortClass::Uart,
@@ -124,6 +130,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER | 0x0800, // DRIVER + KILL (delegates to shell)
         priority: abi::priority::CRITICAL,
         context: &[],
+        mount_path: None,
     },
     PortRule {
         class: PortClass::Cpu,
@@ -132,6 +139,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::CRITICAL,
         context: &[],
+        mount_path: None,
     },
     // Klog→logd rule removed: logd needs rewrite for 5-syscall API
 
@@ -145,6 +153,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::USER_ADMIN,
         priority: abi::priority::NORMAL,
         context: &[],
+        mount_path: Some("/dev/console"),
     },
     PortRule {
         class: PortClass::StorageController,
@@ -153,6 +162,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::HIGH,
         context: &[],
+        mount_path: None,
     },
     PortRule {
         class: PortClass::Network,
@@ -161,6 +171,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::ABOVE_NORM,
         context: &[],
+        mount_path: None,
     },
     // TODO: ipd disabled temporarily to isolate SError
     // PortRule {
@@ -194,6 +205,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::HIGH,
         context: &[],
+        mount_path: None,
     },
     PortRule {
         class: PortClass::Block,
@@ -202,6 +214,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::ABOVE_NORM,
         context: &[],
+        mount_path: None,
     },
     PortRule {
         class: PortClass::Block,
@@ -210,6 +223,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::ABOVE_NORM,
         context: &[("mount.path", "mnt/{block.name}.{trigger.name}")],
+        mount_path: None,
     },
     PortRule {
         class: PortClass::Block,
@@ -218,6 +232,7 @@ pub static PORT_RULES: &[PortRule] = &[
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::ABOVE_NORM,
         context: &[],
+        mount_path: None,
     },
 ];
 

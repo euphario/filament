@@ -595,9 +595,9 @@ pub trait Driver {
     /// A signal was delivered to this task.
     ///
     /// Called when the Mux returns a signal event (handle=INVALID, event=SIGNAL).
-    /// `signal_event` is the signal type (e.g., signal_event::INTERRUPT).
+    /// `signal_event` is the signal type bitmask (e.g., signal_event::INTERRUPT).
     /// `signal_value` is the signal payload.
-    fn signal(&mut self, _signal_event: u8, _signal_value: u64, _ctx: &mut dyn BusCtx) {}
+    fn signal(&mut self, _signal_event: u16, _signal_value: u64, _ctx: &mut dyn BusCtx) {}
 
     /// Kernel bus sent a bus-type-specific message.
     ///
@@ -752,6 +752,12 @@ pub trait BusCtx {
     /// For singleton ports (e.g., `b"vfs:"`, `b"net0:"`) where the name
     /// is globally unique. Use `discover_port()` for trigger ports.
     fn discover_port_by_name(&mut self, name: &[u8]) -> Result<u32, BusError>;
+
+    /// Register a mount point with devd.
+    ///
+    /// Associates a path prefix with a DataPort shmem_id so clients can
+    /// resolve paths via devd-query.
+    fn register_mount(&mut self, prefix: &[u8], shmem_id: u32) -> Result<(), BusError>;
 }
 
 // ============================================================================

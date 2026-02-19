@@ -23,6 +23,9 @@ pub enum SpawnSource<'a> {
     /// Spawn by ramfs path with caps, transferring a channel handle to child (sys_exec_with_channel)
     /// u32 = channel handle, u8 = priority (INHERIT=0xFF means use parent's)
     PathWithCapsAndChannel(&'a str, Capabilities, u32, u8),
+    /// Spawn by ramfs path with caps and a mailbox shmem page (sys_exec_with_mailbox)
+    /// &[u8] = mailbox content to copy into the shmem page
+    PathWithCapsAndMailbox(&'a str, Capabilities, &'a [u8]),
 }
 
 /// Result of waiting for a child process

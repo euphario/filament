@@ -399,6 +399,15 @@ pub enum Object {
 
     /// Bus creator handle (probed writes RegisterDevice to add devices)
     BusCreator(BusCreatorObject),
+
+    /// System metrics (stateless — read returns process/system/port info)
+    Metrics,
+
+    /// Supervision queue — parent end (reads from up, writes to down)
+    SupervisionParent(SupervisionParentObject),
+
+    /// Supervision queue — child end (reads from down, writes to up)
+    SupervisionChild(SupervisionChildObject),
 }
 
 // ============================================================================
@@ -1380,6 +1389,69 @@ impl Pollable for RingObject {
 
     fn unsubscribe(&mut self) {
         self.wait_queue.drain();
+    }
+}
+
+// ============================================================================
+// Supervision Objects (parent and child endpoints)
+// ============================================================================
+
+/// Parent end of a supervision queue.
+/// Reads from the `up` ring (child→parent), writes to the `down` ring (parent→child).
+pub struct SupervisionParentObject {
+    /// Supervision queue ID in the global table
+    supervision_id: u32,
+}
+
+impl SupervisionParentObject {
+    pub fn new(supervision_id: u32) -> Self {
+        Self { supervision_id }
+    }
+
+    pub fn supervision_id(&self) -> u32 { self.supervision_id }
+}
+
+impl Pollable for SupervisionParentObject {
+    fn poll(&self, filter: u8) -> PollResult {
+        crate::kernel::ipc::supervision::poll_up(self.supervision_id, filter)
+    }
+
+    fn subscribe(&mut self, subscriber: Subscriber) {
+        crate::kernel::ipc::supervision::subscribe_up(self.supervision_id, subscriber);
+    }
+
+    fn unsubscribe(&mut self) {
+        // Can't unsubscribe without task_id from Pollable trait, drain via close
+        // This is only called from Mux unwatch which does its own cleanup
+    }
+}
+
+/// Child end of a supervision queue.
+/// Reads from the `down` ring (parent→child), writes to the `up` ring (child→parent).
+pub struct SupervisionChildObject {
+    /// Supervision queue ID in the global table
+    supervision_id: u32,
+}
+
+impl SupervisionChildObject {
+    pub fn new(supervision_id: u32) -> Self {
+        Self { supervision_id }
+    }
+
+    pub fn supervision_id(&self) -> u32 { self.supervision_id }
+}
+
+impl Pollable for SupervisionChildObject {
+    fn poll(&self, filter: u8) -> PollResult {
+        crate::kernel::ipc::supervision::poll_down(self.supervision_id, filter)
+    }
+
+    fn subscribe(&mut self, subscriber: Subscriber) {
+        crate::kernel::ipc::supervision::subscribe_down(self.supervision_id, subscriber);
+    }
+
+    fn unsubscribe(&mut self) {
+        // Same as parent - Mux handles cleanup
     }
 }
 

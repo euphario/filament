@@ -242,7 +242,11 @@ pub enum ClientState {
 // DevdClient
 // =============================================================================
 
-/// Client for bidirectional communication with devd
+/// Client for bidirectional communication with devd (or parent relay).
+///
+/// Two modes:
+/// - **Root mode**: communicates directly with devd via a Channel (devd-query: port).
+/// - **Tree mode**: sends/receives via SuperQ (kernel supervision queue) through parent.
 ///
 /// Provides API for drivers to:
 /// - Report state changes to devd
@@ -250,9 +254,19 @@ pub enum ClientState {
 /// - Receive spawn commands from devd
 /// - Spawn children with restricted capabilities
 pub struct DevdClient {
-    channel: Option<Channel>,
+    /// Transport: Channel for root mode, SuperQ for tree mode.
+    transport: DevdTransport,
     state: ClientState,
     next_seq: u32,
+}
+
+enum DevdTransport {
+    /// Direct connection to devd via devd-query: port.
+    Channel(Channel),
+    /// Tree mode: child↔parent via kernel supervision queue.
+    Supervision(crate::supervision::SupervisionHandle),
+    /// Not connected.
+    None,
 }
 
 impl DevdClient {
@@ -262,34 +276,58 @@ impl DevdClient {
     /// Create a new disconnected client
     pub const fn new() -> Self {
         Self {
-            channel: None,
+            transport: DevdTransport::None,
             state: ClientState::Disconnected,
             next_seq: 1,
         }
     }
 
-    /// Connect to devd-query port
+    /// Connect to devd-query port (root mode).
     ///
     /// Returns a connected client ready for communication.
     pub fn connect() -> Result<Self, SysError> {
         let channel = Channel::connect(b"devd-query:")?;
         Ok(Self {
-            channel: Some(channel),
+            transport: DevdTransport::Channel(channel),
             state: ClientState::Connected,
             next_seq: 1,
         })
     }
 
-    /// Wrap an existing channel as a supervision connection.
+    /// Create a tree-mode client with SuperQ for child↔parent communication.
     ///
-    /// Used in tree mode when the child receives a channel from its parent
-    /// at Handle::SUPERVISION (set by exec_with_channel). The child uses
-    /// this channel for all supervision traffic instead of connecting to devd.
-    pub fn from_channel(ch: Channel) -> Self {
+    /// `superq` is the supervision handle at slot 4 (child end).
+    /// All messages route through the parent via the kernel supervision queue.
+    pub fn from_supervision(
+        superq: crate::supervision::SupervisionHandle,
+    ) -> Self {
         Self {
-            channel: Some(ch),
+            transport: DevdTransport::Supervision(superq),
             state: ClientState::Connected,
             next_seq: 1,
+        }
+    }
+
+    /// Whether this client is in tree mode (SuperQ relay through parent).
+    pub fn is_tree_mode(&self) -> bool {
+        matches!(self.transport, DevdTransport::Supervision(_))
+    }
+
+    /// Get the SuperQ ObjHandle for Mux registration (tree mode only).
+    pub fn superq_obj_handle(&self) -> Option<crate::ipc::ObjHandle> {
+        match &self.transport {
+            DevdTransport::Supervision(sq) => Some(sq.handle()),
+            _ => None,
+        }
+    }
+
+    /// Read a FORWARD note from the SuperQ (parent→child direction).
+    ///
+    /// Returns Ok(Some(len)) if data was available, Ok(None) if empty.
+    pub fn recv_superq(&self, buf: &mut [u8]) -> Result<Option<usize>, crate::error::SysError> {
+        match &self.transport {
+            DevdTransport::Supervision(sq) => sq.recv_forward(buf),
+            _ => Ok(None),
         }
     }
 
@@ -303,12 +341,12 @@ impl DevdClient {
         self.state == ClientState::Connected
     }
 
-    /// Get the channel handle for event loop integration
-    ///
-    /// Use this to add the devd channel to your event loop so you can
-    /// receive commands from devd.
+    /// Get the channel handle for event loop integration (root mode only).
     pub fn handle(&self) -> Option<ObjHandle> {
-        self.channel.as_ref().map(|c| c.handle())
+        match &self.transport {
+            DevdTransport::Channel(ch) => Some(ch.handle()),
+            _ => None,
+        }
     }
 
     /// Get next sequence ID
@@ -317,6 +355,51 @@ impl DevdClient {
         self.next_seq = self.next_seq.wrapping_add(1);
         seq
     }
+
+    /// Send a message to the supervisor (devd or parent).
+    ///
+    /// Root mode: sends directly to devd via channel.
+    /// Tree mode: sends as FORWARD note(s) via SuperQ.
+    fn send_msg(&mut self, data: &[u8]) -> Result<(), SysError> {
+        match &mut self.transport {
+            DevdTransport::Supervision(sq) => {
+                let seq = self.next_seq as u16;
+                sq.send_forward(data, seq)
+            }
+            DevdTransport::Channel(ch) => ch.send(data),
+            DevdTransport::None => Err(SysError::ConnectionRefused),
+        }
+    }
+
+    /// Receive a message from the supervisor (devd or parent).
+    ///
+    /// Root mode: blocks on channel recv.
+    /// Tree mode: blocks on SuperQ read (kernel manages wake-up via Mux).
+    fn recv_msg(&mut self, buf: &mut [u8]) -> Result<usize, SysError> {
+        match &mut self.transport {
+            DevdTransport::Supervision(sq) => {
+                loop {
+                    match sq.recv_forward(buf) {
+                        Ok(Some(n)) => return Ok(n),
+                        Ok(None) => crate::ipc::wait_one(sq.handle())?,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            DevdTransport::Channel(ch) => ch.recv(buf),
+            DevdTransport::None => Err(SysError::ConnectionRefused),
+        }
+    }
+
+    /// Non-blocking receive from supervisor.
+    fn try_recv_msg(&mut self, buf: &mut [u8]) -> Result<Option<usize>, SysError> {
+        match &mut self.transport {
+            DevdTransport::Supervision(sq) => sq.recv_forward(buf),
+            DevdTransport::Channel(ch) => ch.try_recv(buf),
+            DevdTransport::None => Err(SysError::ConnectionRefused),
+        }
+    }
+
 
     // =========================================================================
     // State Reporting (driver → devd)
@@ -328,10 +411,11 @@ impl DevdClient {
     /// devd uses this to track driver lifecycle and trigger policy decisions.
     pub fn report_state(&mut self, new_state: DriverState) -> Result<(), SysError> {
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let msg = StateChange::new(seq_id, new_state as u8);
-        channel.send(&msg.to_bytes())?;
+        let data = msg.to_bytes();
+
+        self.send_msg(&data)?;
 
         // State changes don't need a response - fire and forget
         Ok(())
@@ -356,16 +440,15 @@ impl DevdClient {
         [([u8; 32], u8, [u8; 64], u8); 4], usize, u32,
     )>, SysError> {
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = GetSpawnContext::new(seq_id);
-        channel.send(&req.to_bytes())?;
+        self.send_msg(&req.to_bytes())?;
 
         // Block until response — event-driven via Mux, no polling.
         // Tree mode: parent answers GET_SPAWN_CONTEXT locally from cached context.
         // Root mode: devd responds via its EventLoop.
         let mut resp_buf = [0u8; 512];
-        let n = channel.recv(&mut resp_buf)?;
+        let n = self.recv_msg(&mut resp_buf)?;
 
         if n >= SpawnContextResponse::HEADER_SIZE {
             if let Some(result) = Self::try_parse_spawn_context(&resp_buf[..n]) {
@@ -427,18 +510,17 @@ impl DevdClient {
         use crate::query::PortRegisterInfo;
 
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let reg = PortRegisterInfo::new(seq_id, shmem_id);
         let mut buf = [0u8; 256];
         let len = reg.write_to(&mut buf, info)
             .ok_or(SysError::InvalidArgument)?;
 
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
 
-        // Block until response — event-driven via Mux, no polling
+        // Block until response
         let mut resp_buf = [0u8; 64];
-        let resp_len = channel.recv(&mut resp_buf)?;
+        let resp_len = self.recv_msg(&mut resp_buf)?;
 
         if resp_len >= PortRegisterResponse::SIZE {
             let header = QueryHeader::from_bytes(&resp_buf)
@@ -469,18 +551,17 @@ impl DevdClient {
         shmem_id: u32,
     ) -> Result<(), SysError> {
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let update = UpdatePortShmemId::new(seq_id, shmem_id);
         let mut buf = [0u8; 64];
         let len = update.write_to(&mut buf, name)
             .ok_or(SysError::InvalidArgument)?;
 
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
 
         // Block until response — event-driven via Mux, no polling
         let mut resp_buf = [0u8; 64];
-        let resp_len = channel.recv(&mut resp_buf)?;
+        let resp_len = self.recv_msg(&mut resp_buf)?;
 
         if resp_len >= PortRegisterResponse::SIZE {
             let header = QueryHeader::from_bytes(&resp_buf)
@@ -518,14 +599,13 @@ impl DevdClient {
         }
 
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = SetPortState::new(seq_id, state);
         let mut buf = [0u8; 64];
         let len = req.write_to(&mut buf, name)
             .ok_or(SysError::InvalidArgument)?;
 
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
 
         // Block until response — event-driven via Mux, no polling.
         // Discard messages with wrong seq_id (rare: unsolicited message in root mode).
@@ -533,7 +613,7 @@ impl DevdClient {
         let mut resp_buf = [0u8; 64];
 
         for _ in 0..8 {
-            let resp_len = channel.recv(&mut resp_buf)?;
+            let resp_len = self.recv_msg(&mut resp_buf)?;
 
             if resp_len < MIN_RESPONSE_SIZE {
                 continue;
@@ -576,15 +656,12 @@ impl DevdClient {
     /// Returns `Ok(Some(cmd))` if a command was received, `Ok(None)` if no
     /// command is pending, or an error.
     pub fn poll_command(&mut self) -> Result<Option<DevdCommand>, SysError> {
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
         let mut buf = [0u8; 512];
-        match channel.recv(&mut buf) {
-            Ok(len) if len >= QueryHeader::SIZE => {
+        match self.try_recv_msg(&mut buf) {
+            Ok(Some(len)) if len >= QueryHeader::SIZE => {
                 Self::parse_command_buf(&buf[..len])
             }
             Ok(_) => Ok(None),
-            Err(SysError::WouldBlock) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -713,12 +790,11 @@ impl DevdClient {
     ///
     /// Call this after processing a SPAWN_CHILD command to report the result.
     pub fn ack_spawn(&mut self, seq_id: u32, result: i32, child_pid: u32) -> Result<(), SysError> {
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
         let ack = SpawnAck::new(seq_id, result, child_pid);
         let mut buf = [0u8; 64];
         let pids = if child_pid != 0 { &[child_pid][..] } else { &[][..] };
         let len = ack.write_to(&mut buf, pids).ok_or(SysError::IoError)?;
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
         Ok(())
     }
 
@@ -732,11 +808,10 @@ impl DevdClient {
         match_count: u8,
         child_pids: &[u32],
     ) -> Result<(), SysError> {
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
         let ack = SpawnAck::new_multi(seq_id, result, match_count, child_pids.len() as u8);
         let mut buf = [0u8; 128];
         let len = ack.write_to(&mut buf, child_pids).ok_or(SysError::IoError)?;
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
         Ok(())
     }
 
@@ -751,17 +826,16 @@ impl DevdClient {
     /// hardcoding shmem_id constants.
     pub fn query_port(&mut self, port_name: &[u8]) -> Result<PortInfoResponse, SysError> {
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = QueryPort::new(seq_id);
         let mut buf = [0u8; 128];
         let len = req.write_to(&mut buf, port_name)
             .ok_or(SysError::InvalidArgument)?;
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
 
         // Block until response — event-driven via Mux, no polling
         let mut resp_buf = [0u8; 64];
-        let resp_len = channel.recv(&mut resp_buf)?;
+        let resp_len = self.recv_msg(&mut resp_buf)?;
 
         if resp_len >= PortInfoResponse::SIZE {
             let resp = PortInfoResponse::from_bytes(&resp_buf)
@@ -795,18 +869,17 @@ impl DevdClient {
     /// name collisions when multiple ports share the same name.
     pub fn query_port_by_id(&mut self, port_id: u8) -> Result<PortInfoResponse, SysError> {
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = QueryPort::by_id(seq_id, port_id);
         let mut buf = [0u8; 128];
         // Write with empty name — port_id is the lookup key
         let len = req.write_to(&mut buf, &[])
             .ok_or(SysError::InvalidArgument)?;
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
 
         // Block until response — event-driven via Mux, no polling
         let mut resp_buf = [0u8; 64];
-        let resp_len = channel.recv(&mut resp_buf)?;
+        let resp_len = self.recv_msg(&mut resp_buf)?;
 
         if resp_len >= PortInfoResponse::SIZE {
             let resp = PortInfoResponse::from_bytes(&resp_buf)
@@ -832,6 +905,34 @@ impl DevdClient {
     }
 
     // =========================================================================
+    // Mount Registration
+    // =========================================================================
+
+    /// Register a mount point with devd (DataPort-based).
+    pub fn register_mount(&mut self, prefix: &[u8], shmem_id: u32) -> Result<(), SysError> {
+        use crate::query::{RegisterMount, PortRegisterResponse, error};
+
+        let seq_id = self.next_seq();
+
+        let mut buf = [0u8; RegisterMount::MAX_SIZE];
+        let len = RegisterMount::write_dataport(&mut buf, seq_id, prefix, shmem_id)
+            .ok_or(SysError::InvalidArgument)?;
+
+        self.send_msg(&buf[..len])?;
+
+        let mut resp = [0u8; 64];
+        let n = self.recv_msg(&mut resp)?;
+
+        if n >= PortRegisterResponse::SIZE {
+            let result = i32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]]);
+            if result == error::OK {
+                return Ok(());
+            }
+        }
+        Err(SysError::IoError)
+    }
+
+    // =========================================================================
     // Introspection (client → devd)
     // =========================================================================
 
@@ -843,10 +944,9 @@ impl DevdClient {
         use crate::query::{ListPorts, PortsListResponse, PortEntry};
 
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = ListPorts::new(seq_id);
-        channel.send(&req.to_bytes())?;
+        self.send_msg(&req.to_bytes())?;
 
         let empty_entry = PortEntry {
             name: [0u8; 18], port_id: 0xFF, port_type: 0, flags: 0, owner_idx: 0,
@@ -859,7 +959,7 @@ impl DevdClient {
         // Receive chunks until we have all entries (or timeout)
         loop {
             let mut resp_buf = [0u8; PortsListResponse::HEADER_SIZE + PortsListResponse::MAX_PER_MSG * PortEntry::SIZE];
-            let len = match channel.recv_deadline(&mut resp_buf, Self::RECV_DEADLINE_NS) {
+            let len = match self.recv_msg(&mut resp_buf) {
                 Ok(n) if n >= PortsListResponse::HEADER_SIZE => n,
                 Ok(_) => return Err(SysError::IoError),
                 Err(e) => return Err(e),
@@ -906,10 +1006,9 @@ impl DevdClient {
         use crate::query::{ListServices, ServicesListResponse, ServiceEntry};
 
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = ListServices::new(seq_id);
-        channel.send(&req.to_bytes())?;
+        self.send_msg(&req.to_bytes())?;
 
         let empty_entry = ServiceEntry {
             name: [0u8; 16], pid: 0, state: 0, index: 0,
@@ -923,7 +1022,7 @@ impl DevdClient {
         // Receive chunks until we have all entries (or timeout)
         loop {
             let mut resp_buf = [0u8; ServicesListResponse::HEADER_SIZE + ServicesListResponse::MAX_PER_MSG * ServiceEntry::SIZE];
-            let len = match channel.recv_deadline(&mut resp_buf, Self::RECV_DEADLINE_NS) {
+            let len = match self.recv_msg(&mut resp_buf) {
                 Ok(n) if n >= ServicesListResponse::HEADER_SIZE => n,
                 Ok(_) => return Err(SysError::IoError),
                 Err(e) => return Err(e),
@@ -969,17 +1068,16 @@ impl DevdClient {
     /// Returns the info text and its length.
     pub fn query_service_info(&mut self, service_name: &[u8]) -> Result<([u8; 1024], usize), SysError> {
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = QueryServiceInfo::new(seq_id);
         let mut buf = [0u8; 128];
         let len = req.write_to(&mut buf, service_name)
             .ok_or(SysError::InvalidArgument)?;
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
 
         // Block until response — event-driven via Mux, no polling
         let mut resp_buf = [0u8; 1100];
-        let resp_len = channel.recv(&mut resp_buf)?;
+        let resp_len = self.recv_msg(&mut resp_buf)?;
 
         if resp_len >= ServiceInfoResult::FIXED_SIZE {
             let header = QueryHeader::from_bytes(&resp_buf)
@@ -1010,8 +1108,6 @@ impl DevdClient {
     /// The info text should be UTF-8 formatted text describing the driver's
     /// current state and configuration.
     pub fn respond_info(&mut self, seq_id: u32, info: &[u8]) -> Result<(), SysError> {
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
         // IPC max payload is 576 bytes. ServiceInfoResult header is 16 bytes,
         // so max info per message is 560 bytes. Split on line boundaries if needed
         // so [source] annotations aren't broken across messages.
@@ -1022,7 +1118,7 @@ impl DevdClient {
             let mut buf = [0u8; 576];
             let len = resp.write_to(&mut buf, info)
                 .ok_or(SysError::InvalidArgument)?;
-            channel.send(&buf[..len])?;
+            self.send_msg(&buf[..len])?;
             return Ok(());
         }
 
@@ -1043,7 +1139,7 @@ impl DevdClient {
             let mut buf = [0u8; 576];
             let len = resp.write_to(&mut buf, chunk)
                 .ok_or(SysError::InvalidArgument)?;
-            channel.send(&buf[..len])?;
+            self.send_msg(&buf[..len])?;
             offset = chunk_end;
         }
 
@@ -1052,13 +1148,11 @@ impl DevdClient {
 
     /// Send an end-of-line response (this node has no answer and no children).
     pub fn respond_info_eol(&mut self, seq_id: u32) -> Result<(), SysError> {
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-
         let resp = ServiceInfoResult::eol(seq_id);
         let mut buf = [0u8; ServiceInfoResult::FIXED_SIZE];
         let len = resp.write_to(&mut buf, &[])
             .ok_or(SysError::InvalidArgument)?;
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
 
         Ok(())
     }
@@ -1076,13 +1170,12 @@ impl DevdClient {
         use crate::query::LogMessage;
 
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let msg = LogMessage::new(seq_id, level);
         let mut buf = [0u8; 256];
         let len = msg.write_to(&mut buf, message)
             .ok_or(SysError::InvalidArgument)?;
-        channel.send(&buf[..len])?;
+        self.send_msg(&buf[..len])?;
 
         Ok(())
     }
@@ -1094,14 +1187,13 @@ impl DevdClient {
         use crate::query::{LogQuery, LogHistory, msg as query_msg};
 
         let seq_id = self.next_seq();
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = LogQuery::new(seq_id, max_count);
-        channel.send(&req.to_bytes())?;
+        self.send_msg(&req.to_bytes())?;
 
         // Block until response — event-driven via Mux, no polling
         let mut recv_buf = [0u8; 4200];
-        let len = channel.recv(&mut recv_buf)?;
+        let len = self.recv_msg(&mut recv_buf)?;
 
         if len >= QueryHeader::SIZE {
             let header = QueryHeader::from_bytes(&recv_buf)
@@ -1128,14 +1220,13 @@ impl DevdClient {
 
         let seq_id = self.next_seq();
         let cmd = if enable { log_cmd::ENABLE } else { log_cmd::DISABLE };
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
 
         let req = LogControl::new(seq_id, cmd);
-        channel.send(&req.to_bytes())?;
+        self.send_msg(&req.to_bytes())?;
 
         // Block until ack — event-driven via Mux, no polling
         let mut recv_buf = [0u8; 64];
-        let len = channel.recv(&mut recv_buf)?;
+        let len = self.recv_msg(&mut recv_buf)?;
 
         if len >= QueryHeader::SIZE {
             // Any response is OK (including ERROR with OK code)
@@ -1149,30 +1240,32 @@ impl DevdClient {
     // Raw IPC for relay (bus_runtime child→devd forwarding)
     // =========================================================================
 
-    /// Receive raw bytes from the channel (non-blocking).
+    /// Receive raw bytes (non-blocking).
     ///
     /// Used by bus_runtime's relay path to read raw messages and decide
     /// whether to dispatch locally or forward to a child.
+    ///
+    /// In tree mode, commands arrive via SuperQ Mux events —
+    /// bus_runtime handles TAG_PARENT_SUPERQ dispatch, not this method.
     pub fn raw_recv(&mut self, buf: &mut [u8]) -> Result<Option<usize>, SysError> {
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-        match channel.try_recv(buf) {
-            Ok(Some(n)) => Ok(Some(n)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+        match &mut self.transport {
+            DevdTransport::Supervision(_) => Ok(None), // Mux-driven, not polled here
+            DevdTransport::Channel(ch) => ch.try_recv(buf),
+            DevdTransport::None => Err(SysError::ConnectionRefused),
         }
     }
 
-    /// Send raw bytes on the channel.
+    /// Send raw bytes to supervisor (devd or parent relay).
     ///
-    /// Used by bus_runtime's relay path to forward messages from child to devd.
+    /// Root mode: sends directly to devd via channel.
+    /// Tree mode: sends as FORWARD note(s) via SuperQ.
     pub fn raw_send(&mut self, buf: &[u8]) -> Result<(), SysError> {
-        let channel = self.channel.as_mut().ok_or(SysError::ConnectionRefused)?;
-        channel.send(buf)
+        self.send_msg(buf)
     }
 
     /// Disconnect from devd
     pub fn disconnect(&mut self) {
-        self.channel = None;
+        self.transport = DevdTransport::None;
         self.state = ClientState::Disconnected;
     }
 }

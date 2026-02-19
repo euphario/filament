@@ -142,8 +142,7 @@ pub struct BusController {
     /// When we entered current state (for watchdog)
     pub state_entered_at: u64,
 
-    /// Supervisor (devd) — persists across owners
-    pub supervisor_ch: Option<ChannelId>,
+    /// Supervisor (devd) PID — persists across owners
     pub supervisor_pid: Option<Pid>,
 
     /// Owner — whoever claimed this port (consoled, pcied, etc.)
@@ -196,7 +195,6 @@ impl BusController {
             bus_index: 0,
             state: BusState::Safe,
             state_entered_at: 0,
-            supervisor_ch: None,
             supervisor_pid: None,
             owner_ch: None,
             owner_pid: None,
@@ -564,17 +562,7 @@ impl BusController {
 
     /// Handle supervisor (devd) disconnecting
     pub fn handle_supervisor_disconnect(&mut self, _reason: StateChangeReason) {
-        // Close the kernel-owned supervision channel
-        if let Some(ch) = self.supervisor_ch {
-            if let Ok(Some(peer)) = ipc::close_unchecked(ch) {
-                let wake_list = crate::kernel::object_service::object_service()
-                    .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
-                waker::wake(&wake_list, WakeReason::Closed);
-            }
-        }
-
         // Clear supervisor state so new devd can connect
-        self.supervisor_ch = None;
         self.supervisor_pid = None;
 
         // Bus stays in current state — owner keeps running if present
@@ -658,60 +646,22 @@ impl BusController {
         }
     }
 
-    /// Notify supervisor (devd) of state change via supervision protocol
+    /// Notify supervisor (devd) of state change via signal
     ///
-    /// Sends a StateChanged message on the supervision channel.
-    fn notify_supervisor(&self, old_state: BusState, new_state: BusState, reason: StateChangeReason) -> Result<(), BusError> {
-        // Signal-based notification to devd (parallel path, lightweight)
+    /// Sends PORT_CHANGED signal to devd with bus_index and new state.
+    fn notify_supervisor(&self, _old_state: BusState, new_state: BusState, _reason: StateChangeReason) -> Result<(), BusError> {
         if let Some(devd_pid) = self.supervisor_pid {
             let value = ((self.bus_index as u64) << 32) | (new_state as u64);
             let _ = crate::kernel::microtask::enqueue(
                 crate::kernel::microtask::MicroTask::Signal {
                     target: devd_pid,
-                    event: abi::signal_event::PORT_STATE,
+                    event: abi::signal_event::PORT_CHANGED,
                     value,
                 },
             );
-        }
-
-        let Some(channel) = self.supervisor_ch else {
-            return Ok(());
-        };
-
-        // Build supervision::STATE_CHANGED message
-        let reason_code = match reason {
-            StateChangeReason::Connected => abi::supervision::REASON_OWNER_CONNECTED,
-            StateChangeReason::DriverExited | StateChangeReason::OwnerCrashed | StateChangeReason::Disconnected => {
-                abi::supervision::REASON_OWNER_EXITED
-            }
-            StateChangeReason::ResetComplete | StateChangeReason::ResetRequested => {
-                abi::supervision::REASON_RESET_COMPLETE
-            }
-            StateChangeReason::Handoff | StateChangeReason::DriverClaimed => {
-                abi::supervision::REASON_OWNER_CONNECTED
-            }
-        };
-
-        let payload = [
-            abi::supervision::STATE_CHANGED,
-            old_state as u8,
-            new_state as u8,
-            reason_code,
-        ];
-
-        let mut msg = Message::new();
-        msg.header.msg_type = MessageType::Data;
-        msg.header.payload_len = payload.len() as u32;
-        msg.payload[..payload.len()].copy_from_slice(&payload);
-
-        match ipc::send_unchecked(channel, msg) {
-            Ok(peer) => {
-                let wake_list = crate::kernel::object_service::object_service()
-                    .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
-                waker::wake(&wake_list, WakeReason::Readable);
-                Ok(())
-            }
-            Err(_) => Err(BusError::SendFailed),
+            Ok(())
+        } else {
+            Ok(())
         }
     }
 

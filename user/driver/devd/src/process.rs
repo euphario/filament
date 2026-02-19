@@ -3,11 +3,10 @@
 //! Handles process spawning and termination.
 //! Uses trait-based design for testability.
 //!
-//! Spawns use exec_with_channel (syscall 75) to create a supervision channel
-//! at spawn time. The parent end is returned for protocol messages and
-//! presence monitoring (channel CLOSED = child died).
+//! Spawns use exec_with_mailbox (syscall 76) which creates:
+//! - A shared 4KB shmem page with birth context (MailboxHeader + spawn metadata)
+//! - A kernel SupervisionQueue for bidirectional parent↔child messaging
 
-use userlib::ipc::Channel;
 use userlib::error::SysError;
 use userlib::syscall;
 
@@ -17,15 +16,12 @@ use userlib::syscall;
 
 /// Process lifecycle operations trait
 pub trait ProcessManager {
-    /// Spawn a new process from binary name
-    /// Returns (pid, supervision_channel) on success
-    fn spawn(&mut self, binary: &str) -> Result<(u32, Channel), SysError>;
-
-    /// Spawn a new process with explicit capabilities
+    /// Spawn a new process with explicit capabilities and a mailbox page.
     ///
-    /// If `caps` is 0, inherits parent's capabilities unchanged (same as spawn).
-    /// If `caps` is non-zero, uses exec_with_channel to restrict the child.
-    fn spawn_with_caps(&mut self, binary: &str, caps: u64) -> Result<(u32, Channel), SysError>;
+    /// `mailbox_data` is copied into a shared 4KB shmem page. The child
+    /// receives it at Handle::MAILBOX (slot 5). The parent gets back
+    /// (child_pid, parent_shmem_handle, parent_superq_handle).
+    fn spawn_with_caps(&mut self, binary: &str, caps: u64, mailbox_data: &[u8]) -> Result<(u32, abi::Handle, abi::Handle), SysError>;
 
     /// Kill a process by PID
     fn kill(&mut self, pid: u32) -> Result<(), SysError>;
@@ -45,23 +41,11 @@ impl SyscallProcessManager {
 }
 
 impl ProcessManager for SyscallProcessManager {
-    fn spawn(&mut self, binary: &str) -> Result<(u32, Channel), SysError> {
-        self.spawn_with_caps(binary, 0)
-    }
-
-    fn spawn_with_caps(&mut self, binary: &str, caps: u64) -> Result<(u32, Channel), SysError> {
-        let (parent_ch, child_ch) = Channel::pair()?;
-        let child_handle = child_ch.into_raw_handle();
-
-        let pid = syscall::exec_with_channel(binary, caps, child_handle, abi::priority::INHERIT);
-        if pid < 0 {
-            // Child handle was consumed by into_raw_handle but exec failed —
-            // the kernel did not transfer it, so it's leaked. We can't recover
-            // it, but parent_ch will be dropped and cleaned up.
-            return Err(SysError::from_errno(-pid as i32));
+    fn spawn_with_caps(&mut self, binary: &str, caps: u64, mailbox_data: &[u8]) -> Result<(u32, abi::Handle, abi::Handle), SysError> {
+        match syscall::exec_with_mailbox(binary, caps, mailbox_data) {
+            Ok((pid, shmem_handle, superq_handle)) => Ok((pid, shmem_handle, superq_handle)),
+            Err(errno) => Err(SysError::from_errno(-errno as i32)),
         }
-
-        Ok((pid as u32, parent_ch))
     }
 
     fn kill(&mut self, pid: u32) -> Result<(), SysError> {
@@ -106,17 +90,12 @@ impl MockProcessManager {
 
 #[cfg(test)]
 impl ProcessManager for MockProcessManager {
-    fn spawn(&mut self, binary: &str) -> Result<(u32, Channel), SysError> {
+    fn spawn_with_caps(&mut self, binary: &str, _caps: u64, _mailbox_data: &[u8]) -> Result<(u32, abi::Handle, abi::Handle), SysError> {
         let pid = self.next_pid;
         self.next_pid += 1;
         self.spawned.push((pid, binary.to_string()));
-        // Can't create real Channel in mock, so this would need adjustment
-        // For now, return error to indicate mock limitation
+        // Can't create real Handle in mock
         Err(SysError::Unsupported)
-    }
-
-    fn spawn_with_caps(&mut self, binary: &str, _caps: u64) -> Result<(u32, Channel), SysError> {
-        self.spawn(binary)
     }
 
     fn kill(&mut self, pid: u32) -> Result<(), SysError> {

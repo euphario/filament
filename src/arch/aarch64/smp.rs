@@ -163,7 +163,9 @@ pub extern "C" fn secondary_cpu_entry(cpu_id_arg: u64) {
     // 5. Set current slot to this CPU's idle task
     crate::kernel::task::set_current_slot(cpu as usize);
 
-    // 6. Start timer for this CPU
+    // 6. Initialize and start timer for this CPU
+    // init() sets CNTKCTL_EL1 (EL0 counter access) and enables timer PPI in GIC
+    crate::platform::current::timer::init();
     crate::platform::current::timer::start(10);
 
     kdebug!("smp", "cpu_online"; cpu = cpu as u64);

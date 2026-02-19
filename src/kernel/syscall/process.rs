@@ -239,6 +239,97 @@ pub(super) fn sys_exec_with_channel(path_ptr: u64, path_len: usize, capabilities
     }
 }
 
+/// Spawn a child process with a mailbox shmem page
+/// Args:
+///   path_ptr: Pointer to executable name in ramfs
+///   path_len: Length of path
+///   capabilities: Bitmask of capabilities to grant
+///   mailbox_ptr: Pointer to mailbox content (up to 4KB) in parent's user memory
+///   mailbox_len: Length of mailbox content
+/// Returns: (parent_mailbox_handle << 32) | child_pid on success, negative error on failure
+///
+/// The kernel:
+/// 1. Allocates a 4KB shmem page
+/// 2. Copies mailbox_content from parent's user memory into shmem
+/// 3. Maps shmem in child's address space
+/// 4. Child gets Handle::MAILBOX at slot 5 (shmem handle)
+/// 5. Parent gets a shmem handle to the same page (for post-spawn writes)
+pub(super) fn sys_exec_with_mailbox(path_ptr: u64, path_len: usize, capabilities: u64, mailbox_ptr: u64, mailbox_len: usize) -> i64 {
+    use crate::kernel::caps::Capabilities as KernelCaps;
+
+    let ctx = create_syscall_context();
+
+    // Require SPAWN + GRANT capabilities
+    if let Err(_) = ctx.require_capability(Capabilities::SPAWN.bits()) {
+        return KernelError::PermDenied.to_errno();
+    }
+    if let Err(_) = ctx.require_capability(Capabilities::GRANT.bits()) {
+        return KernelError::PermDenied.to_errno();
+    }
+
+    // Validate path
+    if path_len == 0 || path_len > 127 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    // Validate mailbox
+    if mailbox_len > 4096 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    // Copy path from user space
+    let mut path_buf = [0u8; 128];
+    match uaccess::copy_from_user(&mut path_buf[..path_len], path_ptr) {
+        Ok(_) => {}
+        Err(e) => return uaccess_to_errno(e),
+    }
+
+    let path = match core::str::from_utf8(&path_buf[..path_len]) {
+        Ok(s) => s,
+        Err(_) => return KernelError::InvalidArg.to_errno(),
+    };
+
+    // Copy mailbox content from user space
+    let mut mailbox_buf = [0u8; 4096];
+    if mailbox_len > 0 {
+        match uaccess::copy_from_user(&mut mailbox_buf[..mailbox_len], mailbox_ptr) {
+            Ok(_) => {}
+            Err(e) => return uaccess_to_errno(e),
+        }
+    }
+
+    let parent_id = match ctx.current_task_id() {
+        Some(id) => id,
+        None => return KernelError::NoProcess.to_errno(),
+    };
+
+    let kernel_caps = KernelCaps::from_bits(capabilities);
+
+    // Call elf directly to get both child PID and parent's mailbox handle
+    match crate::kernel::elf::spawn_from_path_with_caps_and_mailbox(
+        path, parent_id, kernel_caps, &mailbox_buf[..mailbox_len]
+    ) {
+        Ok(result) => {
+            // Pack three values into 64 bits:
+            //   bits  0-15: child_pid (u16, max 256 task slots)
+            //   bits 16-31: shmem_handle packed (gen:8 << 8 | index:8)
+            //   bits 32-47: superq_handle packed (gen:8 << 8 | index:8)
+            // Handle raw format: (gen << 24) | index
+            // Packed format: (gen << 8) | (index & 0xFF) — fits in u16
+            let shmem_packed = ((result.parent_handle_raw >> 16) & 0xFF00)
+                | (result.parent_handle_raw & 0xFF);
+            let superq_packed = ((result.parent_superq_handle_raw >> 16) & 0xFF00)
+                | (result.parent_superq_handle_raw & 0xFF);
+            ((superq_packed as i64) << 32)
+                | ((shmem_packed as i64) << 16)
+                | (result.child_id as i64 & 0xFFFF)
+        }
+        Err(crate::kernel::elf::ElfError::NotExecutable) => KernelError::NotFound.to_errno(),
+        Err(crate::kernel::elf::ElfError::BadMagic) => KernelError::InvalidArg.to_errno(),
+        Err(_) => KernelError::OutOfMemory.to_errno(),
+    }
+}
+
 /// Execute ELF binary from a memory buffer
 /// Args:
 ///   elf_ptr: Pointer to ELF data in userspace

@@ -1,22 +1,24 @@
 //! VFS Client Library
 //!
-//! Reads vfsd's shmem mount table to discover filesystems, then connects
-//! directly to FS drivers' DataPorts for I/O. No routing through vfsd.
+//! Resolves paths via devd's mount table, then connects directly to FS
+//! drivers' DataPorts for I/O. No vfsd process needed.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! VfsClient
-//!   ├── maps vfsd shmem (mount table in DataPort pool)
-//!   ├── reads MountEntry[] → gets fs_shmem_id per mount
+//!   ├── asks devd-query to resolve path → (shmem_id, remaining_path)
 //!   └── connects to fatfsd DataPort → issues VFS ops directly
 //! ```
 
 use crate::data_port::DataPort;
-use crate::ipc::{Channel, Shmem, Timer, Mux, MuxFilter};
+use crate::ipc::{Channel, Timer, Mux, MuxFilter};
 use crate::ring::{IoSqe, IoCqe, io_status};
-use crate::vfs_proto::{fs_op, file_type, MountTable, MountEntry, VfsDirEntry, VfsStat};
-use crate::query::{QueryHeader, QueryPort, PortInfoResponse, msg, error};
+use crate::vfs_proto::{fs_op, file_type, VfsDirEntry, VfsStat};
+use crate::query::{
+    QueryHeader, ResolvePath, ResolvePathResponse, MountsListResponse, MountListEntry,
+    mount_transport, msg, error,
+};
 use crate::syscall;
 use crate::syscall::RamfsListEntry;
 
@@ -24,7 +26,7 @@ use crate::syscall::RamfsListEntry;
 // Constants
 // =============================================================================
 
-const MAX_MOUNTS: usize = MountTable::MAX_MOUNTS;
+const MAX_CONNECTIONS: usize = 8;
 
 /// Virtual handle for root directory "/"
 const HANDLE_ROOT: u32 = 0xFF00_0000;
@@ -39,9 +41,9 @@ const HANDLE_MNT: u32 = 0xFD00_0000;
 
 #[derive(Clone, Copy, Debug)]
 pub enum VfsError {
-    /// vfsd not found or not available
+    /// devd not found or not available
     NotAvailable,
-    /// Connection to vfsd failed
+    /// Connection to devd failed
     ConnectFailed,
     /// Pool allocation failed (out of buffer space)
     PoolFull,
@@ -94,8 +96,7 @@ impl VfsError {
 
 struct MountConnection {
     port: DataPort,
-    _prefix: [u8; 24],
-    _prefix_len: u8,
+    shmem_id: u32,
 }
 
 // =============================================================================
@@ -104,69 +105,22 @@ struct MountConnection {
 
 /// Client for VFS operations.
 ///
-/// Maps vfsd's shmem mount table, reads mount entries, and connects
-/// directly to FS drivers' DataPorts for I/O.
+/// Resolves paths via devd-query, connects directly to FS drivers' DataPorts.
 pub struct VfsClient {
-    /// Mapped vfsd shmem (contains mount table in DataPort pool)
-    vfsd_shmem: Shmem,
-    /// Pool offset within the shmem (from LayeredRingHeader)
-    pool_offset: u32,
-    /// Cached per-mount DataPort connections
-    connections: [Option<MountConnection>; MAX_MOUNTS],
+    /// Channel to devd-query for path resolution
+    devd_channel: Channel,
+    /// Cached per-mount DataPort connections (keyed by shmem_id)
+    connections: [Option<MountConnection>; MAX_CONNECTIONS],
 }
 
 impl VfsClient {
-    /// Discover vfsd via devd-query and map its mount table shmem.
+    /// Discover devd-query and create a VfsClient.
     pub fn discover() -> Result<Self, VfsError> {
-        // Connect to devd-query
-        let mut channel = Channel::connect(b"devd-query:")
+        let channel = Channel::connect(b"devd-query:")
             .map_err(|_| VfsError::NotAvailable)?;
 
-        // Build QUERY_PORT request for "vfs:"
-        let req = QueryPort::new(1);
-        let mut buf = [0u8; 64];
-        let len = req.write_to(&mut buf, b"vfs:")
-            .ok_or(VfsError::NotAvailable)?;
-
-        channel.send(&buf[..len]).map_err(|_| VfsError::NotAvailable)?;
-
-        // Wait for response with timeout
-        let response = recv_with_timeout(&mut channel, 2000)
-            .ok_or(VfsError::NotAvailable)?;
-
-        // Parse PORT_INFO response
-        let header = QueryHeader::from_bytes(&response)
-            .ok_or(VfsError::NotAvailable)?;
-
-        if header.msg_type == msg::ERROR || header.msg_type != msg::PORT_INFO {
-            return Err(VfsError::NotAvailable);
-        }
-
-        let info = PortInfoResponse::from_bytes(&response)
-            .ok_or(VfsError::NotAvailable)?;
-
-        if info.result != error::OK || info.shmem_id == 0 {
-            return Err(VfsError::NotAvailable);
-        }
-
-        Self::connect(info.shmem_id)
-    }
-
-    /// Connect directly by vfsd's shmem_id.
-    pub fn connect(shmem_id: u32) -> Result<Self, VfsError> {
-        let shmem = Shmem::open_existing(shmem_id)
-            .map_err(|_| VfsError::ConnectFailed)?;
-
-        // Read pool_offset from LayeredRingHeader at byte offset 36
-        let ptr = shmem.as_ptr();
-        let pool_offset = unsafe {
-            let bytes = core::slice::from_raw_parts(ptr.add(36), 4);
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        };
-
         Ok(Self {
-            vfsd_shmem: shmem,
-            pool_offset,
+            devd_channel: channel,
             connections: [
                 None, None, None, None,
                 None, None, None, None,
@@ -174,120 +128,88 @@ impl VfsClient {
         })
     }
 
-    /// Read the mount table from the mapped shmem.
-    fn read_mount_table(&self) -> ([MountEntry; MAX_MOUNTS], u32) {
-        let ptr = self.vfsd_shmem.as_ptr();
-        let mut raw = [0u8; MountTable::TOTAL_SIZE];
-        unsafe {
-            let src = ptr.add(self.pool_offset as usize);
-            core::ptr::copy_nonoverlapping(src, raw.as_mut_ptr(), MountTable::TOTAL_SIZE);
+    /// Resolve a path via devd, returning (shmem_id, remaining_path).
+    fn resolve_path(&mut self, path: &[u8]) -> Result<(u32, [u8; 64], usize), VfsError> {
+        let mut buf = [0u8; ResolvePath::MAX_SIZE];
+        let len = ResolvePath::write_to(&mut buf, 1, path)
+            .ok_or(VfsError::NotAvailable)?;
+
+        self.devd_channel.send(&buf[..len])
+            .map_err(|_| VfsError::NotAvailable)?;
+
+        let response = recv_with_timeout(&mut self.devd_channel, 2000)
+            .ok_or(VfsError::Timeout)?;
+
+        let (result, transport_type, _port_name, remaining, shmem_id) =
+            ResolvePathResponse::from_bytes(&response)
+                .ok_or(VfsError::NotAvailable)?;
+
+        if result != 0 {
+            return Err(VfsError::NoMount);
         }
 
-        let header = MountTable::from_raw(&raw).unwrap_or(MountTable {
-            version: 0,
-            count: 0,
-            _pad: [0; 24],
+        if transport_type != mount_transport::DATAPORT || shmem_id == 0 {
+            return Err(VfsError::NotAvailable);
+        }
+
+        let mut rem = [0u8; 64];
+        let rem_len = remaining.len().min(64);
+        rem[..rem_len].copy_from_slice(&remaining[..rem_len]);
+
+        Ok((shmem_id, rem, rem_len))
+    }
+
+    /// Get or create a DataPort connection for a shmem_id.
+    fn get_connection(&mut self, shmem_id: u32) -> Result<usize, VfsError> {
+        // Check if already connected
+        for i in 0..MAX_CONNECTIONS {
+            if let Some(conn) = &self.connections[i] {
+                if conn.shmem_id == shmem_id {
+                    return Ok(i);
+                }
+            }
+        }
+
+        // Find free slot
+        let slot = self.connections.iter().position(|c| c.is_none())
+            .ok_or(VfsError::TooMany)?;
+
+        let port = DataPort::connect(shmem_id)
+            .map_err(|_| VfsError::ConnectFailed)?;
+
+        self.connections[slot] = Some(MountConnection {
+            port,
+            shmem_id,
         });
 
-        let mut entries = [MountEntry::empty(); MAX_MOUNTS];
-        for i in 0..MAX_MOUNTS {
-            if let Some(entry) = MountTable::read_entry(&raw, i) {
-                entries[i] = entry;
-            }
-        }
-
-        (entries, header.count)
-    }
-
-    /// Find the mount that matches a path (longest prefix match).
-    /// Returns (mount_index, stripped path for FS driver).
-    fn find_mount<'a>(&self, path: &'a [u8]) -> Option<(usize, MountEntry, &'a [u8])> {
-        let (entries, _count) = self.read_mount_table();
-
-        let mut best_idx = None;
-        let mut best_len = 0;
-        let mut best_entry = MountEntry::empty();
-
-        for i in 0..MAX_MOUNTS {
-            if entries[i].in_use == 0 {
-                continue;
-            }
-            let prefix = entries[i].prefix_bytes();
-            if path.len() >= prefix.len() && &path[..prefix.len()] == prefix {
-                if prefix.len() > best_len {
-                    best_len = prefix.len();
-                    best_idx = Some(i);
-                    best_entry = entries[i];
-                }
-            }
-        }
-
-        // Also match without trailing slash (e.g., "/fat0" matches "/fat0/")
-        if best_idx.is_none() {
-            for i in 0..MAX_MOUNTS {
-                if entries[i].in_use == 0 {
-                    continue;
-                }
-                let prefix = entries[i].prefix_bytes();
-                if prefix.len() > 1 && prefix[prefix.len() - 1] == b'/' {
-                    let prefix_no_slash = &prefix[..prefix.len() - 1];
-                    if path == prefix_no_slash {
-                        return Some((i, entries[i], b""));
-                    }
-                }
-            }
-        }
-
-        best_idx.map(|i| {
-            let prefix_len = entries[i].prefix_len as usize;
-            (i, best_entry, &path[prefix_len..])
-        })
-    }
-
-    /// Get or create a DataPort connection for a mount.
-    fn get_connection(&mut self, mount_idx: usize, entry: &MountEntry) -> Result<&mut DataPort, VfsError> {
-        if self.connections[mount_idx].is_none() {
-            let port = DataPort::connect(entry.fs_shmem_id)
-                .map_err(|_| VfsError::ConnectFailed)?;
-            self.connections[mount_idx] = Some(MountConnection {
-                port,
-                _prefix: entry.prefix,
-                _prefix_len: entry.prefix_len,
-            });
-        }
-        Ok(&mut self.connections[mount_idx].as_mut().unwrap().port)
+        Ok(slot)
     }
 
     /// Open a file or directory.
     ///
-    /// Returns a handle encoded as `(mount_idx << 24) | fs_handle`.
+    /// Returns a handle encoded as `(connection_idx << 24) | fs_handle`.
     pub fn open(&mut self, path: &[u8], flags: u32) -> Result<u32, VfsError> {
         // Handle virtual root
         if path == b"/" {
             return Ok(HANDLE_ROOT);
         }
-
-        // Handle /bin (ramfs)
         if path == b"/bin" || path == b"/bin/" {
             return Ok(HANDLE_BIN);
         }
-
-        // Handle /mnt (synthetic mount directory)
         if path == b"/mnt" || path == b"/mnt/" {
             return Ok(HANDLE_MNT);
         }
 
-        let (mount_idx, entry, remainder) = self.find_mount(path)
-            .ok_or(VfsError::NoMount)?;
-
-        let port = self.get_connection(mount_idx, &entry)?;
+        let (shmem_id, remaining, rem_len) = self.resolve_path(path)?;
+        let conn_idx = self.get_connection(shmem_id)?;
+        let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
 
         // Build path for FS: prepend "/" to remainder
         let mut fs_path = [0u8; 256];
         fs_path[0] = b'/';
-        let remainder_len = remainder.len().min(255);
-        fs_path[1..1 + remainder_len].copy_from_slice(&remainder[..remainder_len]);
-        let fs_path_len = 1 + remainder_len;
+        let copy_len = rem_len.min(255);
+        fs_path[1..1 + copy_len].copy_from_slice(&remaining[..copy_len]);
+        let fs_path_len = 1 + copy_len;
 
         let path_len = fs_path_len as u32;
         let offset = port.alloc(path_len).ok_or(VfsError::PoolFull)?;
@@ -317,33 +239,24 @@ impl VfsClient {
             return Err(VfsError::from_cqe(&cqe));
         }
 
-        // Encode handle: (mount_idx << 24) | fs_handle
-        let encoded = ((mount_idx as u32) << 24) | (cqe.result & 0x00FF_FFFF);
+        let encoded = ((conn_idx as u32) << 24) | (cqe.result & 0x00FF_FFFF);
         Ok(encoded)
     }
 
     /// Read from an open file.
-    ///
-    /// Returns number of bytes read.
     pub fn read(
         &mut self,
         handle: u32,
         file_offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, VfsError> {
-        let (mount_idx, fs_handle) = decode_handle(handle);
+        let (conn_idx, fs_handle) = decode_handle(handle);
 
-        if mount_idx >= MAX_MOUNTS {
+        if conn_idx >= MAX_CONNECTIONS || self.connections[conn_idx].is_none() {
             return Err(VfsError::NotFound);
         }
 
-        // Need to get connection — read mount table to get entry
-        let (entries, _) = self.read_mount_table();
-        if entries[mount_idx].in_use == 0 {
-            return Err(VfsError::NotFound);
-        }
-        let entry = entries[mount_idx];
-        let port = self.get_connection(mount_idx, &entry)?;
+        let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
 
         let buf_len = buf.len() as u32;
         let offset = port.alloc(buf_len).ok_or(VfsError::PoolFull)?;
@@ -384,21 +297,16 @@ impl VfsClient {
     /// Close an open file handle.
     pub fn close(&mut self, handle: u32) -> Result<(), VfsError> {
         if handle == HANDLE_ROOT || handle == HANDLE_BIN || handle == HANDLE_MNT {
-            return Ok(()); // Virtual handles
+            return Ok(());
         }
 
-        let (mount_idx, fs_handle) = decode_handle(handle);
+        let (conn_idx, fs_handle) = decode_handle(handle);
 
-        if mount_idx >= MAX_MOUNTS {
+        if conn_idx >= MAX_CONNECTIONS || self.connections[conn_idx].is_none() {
             return Err(VfsError::NotFound);
         }
 
-        let (entries, _) = self.read_mount_table();
-        if entries[mount_idx].in_use == 0 {
-            return Err(VfsError::NotFound);
-        }
-        let entry = entries[mount_idx];
-        let port = self.get_connection(mount_idx, &entry)?;
+        let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
 
         let tag = port.next_tag();
         let sqe = IoSqe {
@@ -428,39 +336,28 @@ impl VfsClient {
     }
 
     /// Read directory entries.
-    ///
-    /// `handle` must be an open directory handle.
-    /// Returns the number of entries read into `entries`.
     pub fn readdir(
         &mut self,
         handle: u32,
         entries: &mut [VfsDirEntry],
     ) -> Result<usize, VfsError> {
-        // Virtual root
         if handle == HANDLE_ROOT {
             return self.readdir_virtual_root(entries);
         }
-        // /bin (ramfs)
         if handle == HANDLE_BIN {
             return Self::readdir_bin(entries);
         }
-        // /mnt (synthetic)
         if handle == HANDLE_MNT {
             return self.readdir_mnt(entries);
         }
 
-        let (mount_idx, fs_handle) = decode_handle(handle);
+        let (conn_idx, fs_handle) = decode_handle(handle);
 
-        if mount_idx >= MAX_MOUNTS {
+        if conn_idx >= MAX_CONNECTIONS || self.connections[conn_idx].is_none() {
             return Err(VfsError::NotFound);
         }
 
-        let (mount_entries, _) = self.read_mount_table();
-        if mount_entries[mount_idx].in_use == 0 {
-            return Err(VfsError::NotFound);
-        }
-        let entry = mount_entries[mount_idx];
-        let port = self.get_connection(mount_idx, &entry)?;
+        let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
 
         let buf_len = (entries.len() * VfsDirEntry::SIZE) as u32;
         let offset = port.alloc(buf_len).ok_or(VfsError::PoolFull)?;
@@ -518,18 +415,13 @@ impl VfsClient {
             });
         }
 
-        let (mount_idx, fs_handle) = decode_handle(handle);
+        let (conn_idx, fs_handle) = decode_handle(handle);
 
-        if mount_idx >= MAX_MOUNTS {
+        if conn_idx >= MAX_CONNECTIONS || self.connections[conn_idx].is_none() {
             return Err(VfsError::NotFound);
         }
 
-        let (mount_entries, _) = self.read_mount_table();
-        if mount_entries[mount_idx].in_use == 0 {
-            return Err(VfsError::NotFound);
-        }
-        let entry = mount_entries[mount_idx];
-        let port = self.get_connection(mount_idx, &entry)?;
+        let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
 
         let offset = port.alloc(VfsStat::SIZE as u32).ok_or(VfsError::PoolFull)?;
 
@@ -569,11 +461,9 @@ impl VfsClient {
     // Virtual root directory
     // =========================================================================
 
-    /// List virtual root directory: /bin (ramfs) + /mnt (synthetic mount parent).
     fn readdir_virtual_root(&self, entries: &mut [VfsDirEntry]) -> Result<usize, VfsError> {
         let mut count = 0;
 
-        // Add "bin" directory (initrd)
         if count < entries.len() {
             let mut e = VfsDirEntry::empty();
             e.set_name(b"bin");
@@ -582,7 +472,6 @@ impl VfsClient {
             count += 1;
         }
 
-        // Add "mnt" directory (synthetic parent for mounts)
         if count < entries.len() {
             let mut e = VfsDirEntry::empty();
             e.set_name(b"mnt");
@@ -594,10 +483,6 @@ impl VfsClient {
         Ok(count)
     }
 
-    /// List /bin directory from ramfs (initrd binaries).
-    ///
-    /// Ramfs entries have TAR paths like `./bin/devd` or `bin/devd`.
-    /// We filter to entries under `bin/` and strip that prefix.
     fn readdir_bin(entries: &mut [VfsDirEntry]) -> Result<usize, VfsError> {
         let mut ramfs_buf = [RamfsListEntry::empty(); 16];
         let ret = syscall::ramfs_list(&mut ramfs_buf);
@@ -614,27 +499,22 @@ impl VfsClient {
             }
             let full_name = ramfs_buf[i].name_str();
 
-            // Strip leading "./" if present
             let name = if full_name.starts_with(b"./") {
                 &full_name[2..]
             } else {
                 full_name
             };
 
-            // Filter to direct children of bin/
             let child_name = if name.starts_with(b"bin/") {
                 let rest = &name[4..];
-                // Strip trailing slash
                 let rest = if !rest.is_empty() && rest[rest.len() - 1] == b'/' {
                     &rest[..rest.len() - 1]
                 } else {
                     rest
                 };
-                // Skip if empty (the "bin/" directory entry itself)
                 if rest.is_empty() {
                     continue;
                 }
-                // Skip nested entries (e.g., bin/sub/file)
                 if rest.iter().any(|&c| c == b'/') {
                     continue;
                 }
@@ -658,23 +538,57 @@ impl VfsClient {
         Ok(count)
     }
 
-    /// List /mnt directory by extracting top-level names from mount prefixes.
-    fn readdir_mnt(&self, entries: &mut [VfsDirEntry]) -> Result<usize, VfsError> {
-        let (mount_entries, _) = self.read_mount_table();
-        let mut count = 0;
+    /// List /mnt directory by querying devd for mount prefixes.
+    fn readdir_mnt(&mut self, entries: &mut [VfsDirEntry]) -> Result<usize, VfsError> {
+        // Send LIST_MOUNTS to devd
+        let header = QueryHeader::new(msg::LIST_MOUNTS, 2);
+        let buf = header.to_bytes();
+        self.devd_channel.send(&buf)
+            .map_err(|_| VfsError::NotAvailable)?;
 
-        for i in 0..MAX_MOUNTS {
-            if mount_entries[i].in_use == 0 || count >= entries.len() {
-                continue;
+        let response = recv_with_timeout(&mut self.devd_channel, 2000)
+            .ok_or(VfsError::Timeout)?;
+
+        let resp_header = QueryHeader::from_bytes(&response)
+            .ok_or(VfsError::NotAvailable)?;
+
+        if resp_header.msg_type != msg::MOUNTS_LIST {
+            return Err(VfsError::NotAvailable);
+        }
+
+        let (entry_count, _total) = MountsListResponse::parse_header(&response)
+            .ok_or(VfsError::NotAvailable)?;
+
+        let mut count = 0;
+        let data = &response[MountsListResponse::HEADER_SIZE..];
+        for i in 0..entry_count as usize {
+            if count >= entries.len() {
+                break;
             }
-            let prefix = mount_entries[i].prefix_bytes();
-            // Match "/mnt/X/" → extract "X"
-            if prefix.starts_with(b"/mnt/") {
-                let rest = &prefix[5..];
-                let name_end = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
-                if name_end > 0 {
+            let offset = i * MountListEntry::SIZE;
+            if offset + MountListEntry::SIZE > data.len() {
+                break;
+            }
+            if let Some((_transport, prefix, _port_name, _shmem_id)) =
+                MountListEntry::from_bytes(&data[offset..])
+            {
+                // Extract mount name from prefix (e.g., "/mnt/usb0/" → "usb0")
+                let name = if prefix.starts_with(b"/mnt/") {
+                    let rest = &prefix[5..];
+                    let name_end = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
+                    &rest[..name_end]
+                } else if prefix.starts_with(b"/") {
+                    // Non-mnt prefix, show the path segment after first /
+                    let rest = &prefix[1..];
+                    let name_end = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
+                    &rest[..name_end]
+                } else {
+                    prefix
+                };
+
+                if !name.is_empty() {
                     let mut e = VfsDirEntry::empty();
-                    e.set_name(&rest[..name_end]);
+                    e.set_name(name);
                     e.file_type = file_type::DIR;
                     entries[count] = e;
                     count += 1;
@@ -691,9 +605,9 @@ impl VfsClient {
 // =============================================================================
 
 fn decode_handle(handle: u32) -> (usize, u32) {
-    let mount_idx = (handle >> 24) as usize;
+    let conn_idx = (handle >> 24) as usize;
     let fs_handle = handle & 0x00FF_FFFF;
-    (mount_idx, fs_handle)
+    (conn_idx, fs_handle)
 }
 
 /// Poll for a specific completion by tag, with timeout.

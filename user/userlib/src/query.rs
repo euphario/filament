@@ -88,8 +88,12 @@ pub mod msg {
     pub const QUERY_PORT: u16 = 0x0107;
     /// Update shmem_id for an existing port
     pub const UPDATE_PORT_SHMEM_ID: u16 = 0x0108;
-    /// Mount ready notification (reserved)
-    pub const MOUNT_READY: u16 = 0x010B;
+    /// Register a filesystem mount point (driver → devd)
+    pub const REGISTER_MOUNT: u16 = 0x0109;
+    /// Resolve a path to a mount transport (client → devd)
+    pub const RESOLVE_PATH: u16 = 0x010A;
+    /// List all registered mount points (client → devd)
+    pub const LIST_MOUNTS: u16 = 0x010B;
     /// Register port with full PortInfo (unified enumeration)
     pub const REGISTER_PORT_INFO: u16 = 0x010C;
     /// Set port state (driver → devd)
@@ -138,6 +142,10 @@ pub mod msg {
     pub const SERVICE_INFO_RESULT: u16 = 0x0307;
     /// Response containing log history
     pub const LOG_HISTORY: u16 = 0x0308;
+    /// Response containing mount list
+    pub const MOUNTS_LIST: u16 = 0x0309;
+    /// Response containing path resolution result
+    pub const RESOLVE_RESULT: u16 = 0x030A;
     /// Error response
     pub const ERROR: u16 = 0x03FF;
 }
@@ -2283,68 +2291,300 @@ impl LogHistory {
     }
 }
 
-/// Mount ready notification (devd → vfsd)
-///
-/// Sent when a Filesystem port is registered, so vfsd can connect to it.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct MountReady {
-    pub header: QueryHeader,
-    /// DataPort shared memory ID of the filesystem port
-    pub shmem_id: u32,
-    /// Length of port name
-    pub name_len: u8,
-    /// Reserved padding
-    pub _pad: [u8; 3],
-    // Followed by: port name bytes (e.g., "fat0:")
+// =============================================================================
+// Mount Protocol Messages
+// =============================================================================
+
+/// Transport type constants for mount protocol
+pub mod mount_transport {
+    pub const PORT: u8 = 0;
+    pub const DATAPORT: u8 = 1;
 }
 
-impl MountReady {
-    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 4 + 4; // 16 bytes
+/// Register a filesystem mount point (driver → devd)
+///
+/// Wire format:
+/// ```text
+/// [0..8]:    QueryHeader (msg_type=REGISTER_MOUNT)
+/// [8]:       transport_type (0=Port, 1=DataPort)
+/// [9]:       prefix_len
+/// [10]:      port_name_len (if Port) OR 0
+/// [11]:      _pad
+/// [12..16]:  shmem_id (u32 LE, if DataPort) OR 0
+/// [16..80]:  prefix (up to 64 bytes)
+/// [80..112]: port_name (up to 32 bytes, if Port)
+/// ```
+pub struct RegisterMount;
 
-    pub fn new(seq_id: u32, shmem_id: u32) -> Self {
-        Self {
-            header: QueryHeader::new(msg::MOUNT_READY, seq_id),
-            shmem_id,
-            name_len: 0,
-            _pad: [0; 3],
-        }
-    }
+impl RegisterMount {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 8; // 16 bytes header
+    pub const MAX_SIZE: usize = 112;
 
-    pub fn write_to(&self, buf: &mut [u8], port_name: &[u8]) -> Option<usize> {
-        let total = Self::FIXED_SIZE + port_name.len();
-        if buf.len() < total || port_name.len() > 255 {
+    /// Serialize a DataPort mount registration.
+    pub fn write_dataport(buf: &mut [u8], seq_id: u32, prefix: &[u8], shmem_id: u32) -> Option<usize> {
+        if prefix.len() > 64 || buf.len() < Self::MAX_SIZE {
             return None;
         }
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8..12].copy_from_slice(&self.shmem_id.to_le_bytes());
-        buf[12] = port_name.len() as u8;
-        buf[13..16].copy_from_slice(&[0; 3]);
-        buf[Self::FIXED_SIZE..total].copy_from_slice(port_name);
-        Some(total)
+        let header = QueryHeader::new(msg::REGISTER_MOUNT, seq_id);
+        buf[0..8].copy_from_slice(&header.to_bytes());
+        buf[8] = mount_transport::DATAPORT;
+        buf[9] = prefix.len() as u8;
+        buf[10] = 0; // no port name
+        buf[11] = 0;
+        buf[12..16].copy_from_slice(&shmem_id.to_le_bytes());
+        buf[16..16 + prefix.len()].copy_from_slice(prefix);
+        // Zero rest
+        for b in &mut buf[16 + prefix.len()..Self::MAX_SIZE] { *b = 0; }
+        Some(Self::MAX_SIZE)
     }
 
-    pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
+    /// Serialize a Port-based mount registration.
+    pub fn write_port(buf: &mut [u8], seq_id: u32, prefix: &[u8], port_name: &[u8]) -> Option<usize> {
+        if prefix.len() > 64 || port_name.len() > 32 || buf.len() < Self::MAX_SIZE {
+            return None;
+        }
+        let header = QueryHeader::new(msg::REGISTER_MOUNT, seq_id);
+        buf[0..8].copy_from_slice(&header.to_bytes());
+        buf[8] = mount_transport::PORT;
+        buf[9] = prefix.len() as u8;
+        buf[10] = port_name.len() as u8;
+        buf[11] = 0;
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        buf[16..16 + prefix.len()].copy_from_slice(prefix);
+        for b in &mut buf[16 + prefix.len()..80] { *b = 0; }
+        buf[80..80 + port_name.len()].copy_from_slice(port_name);
+        for b in &mut buf[80 + port_name.len()..Self::MAX_SIZE] { *b = 0; }
+        Some(Self::MAX_SIZE)
+    }
+
+    /// Parse from buffer. Returns (transport_type, prefix, port_name, shmem_id).
+    pub fn from_bytes(buf: &[u8]) -> Option<(u8, &[u8], &[u8], u32)> {
         if buf.len() < Self::FIXED_SIZE {
             return None;
         }
-        let header = QueryHeader::from_bytes(buf)?;
-        let shmem_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let name_len = buf[12] as usize;
-        let total = Self::FIXED_SIZE + name_len;
+        let transport_type = buf[8];
+        let prefix_len = buf[9] as usize;
+        let port_name_len = buf[10] as usize;
+        let shmem_id = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+
+        if prefix_len > 64 || port_name_len > 32 {
+            return None;
+        }
+        if buf.len() < 16 + prefix_len {
+            return None;
+        }
+        let prefix = &buf[16..16 + prefix_len];
+        let port_name = if port_name_len > 0 && buf.len() >= 80 + port_name_len {
+            &buf[80..80 + port_name_len]
+        } else {
+            &[]
+        };
+        Some((transport_type, prefix, port_name, shmem_id))
+    }
+}
+
+/// Resolve a path to a mount transport (client → devd)
+///
+/// Wire format:
+/// ```text
+/// [0..8]:   QueryHeader (msg_type=RESOLVE_PATH)
+/// [8]:      path_len
+/// [9..73]:  path (up to 64 bytes)
+/// ```
+pub struct ResolvePath;
+
+impl ResolvePath {
+    pub const FIXED_SIZE: usize = QueryHeader::SIZE + 1; // 9 bytes
+    pub const MAX_SIZE: usize = QueryHeader::SIZE + 1 + 64; // 73 bytes
+
+    pub fn write_to(buf: &mut [u8], seq_id: u32, path: &[u8]) -> Option<usize> {
+        let path_len = path.len().min(64);
+        let total = Self::FIXED_SIZE + path_len;
         if buf.len() < total {
             return None;
         }
-        let port_name = &buf[Self::FIXED_SIZE..total];
-        Some((
-            Self {
-                header,
-                shmem_id,
-                name_len: name_len as u8,
-                _pad: [0; 3],
-            },
-            port_name,
-        ))
+        let header = QueryHeader::new(msg::RESOLVE_PATH, seq_id);
+        buf[0..8].copy_from_slice(&header.to_bytes());
+        buf[8] = path_len as u8;
+        buf[Self::FIXED_SIZE..total].copy_from_slice(&path[..path_len]);
+        Some(total)
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<&[u8]> {
+        if buf.len() < Self::FIXED_SIZE {
+            return None;
+        }
+        let path_len = buf[8] as usize;
+        if path_len > 64 || buf.len() < Self::FIXED_SIZE + path_len {
+            return None;
+        }
+        Some(&buf[Self::FIXED_SIZE..Self::FIXED_SIZE + path_len])
+    }
+}
+
+/// Response for RESOLVE_PATH
+///
+/// Wire format:
+/// ```text
+/// [0..8]:    QueryHeader (msg_type=RESOLVE_RESULT)
+/// [8]:       result (0=ok, negative=error)
+/// [9]:       transport_type (0=Port, 1=DataPort)
+/// [10]:      port_name_len
+/// [11]:      remaining_path_len
+/// [12..16]:  shmem_id (if DataPort)
+/// [16..48]:  port_name (if Port)
+/// [48..112]: remaining_path (up to 64 bytes)
+/// ```
+pub struct ResolvePathResponse;
+
+impl ResolvePathResponse {
+    pub const SIZE: usize = 112;
+
+    pub fn write_not_found(buf: &mut [u8], seq_id: u32) -> usize {
+        let header = QueryHeader::new(msg::RESOLVE_RESULT, seq_id);
+        buf[0..8].copy_from_slice(&header.to_bytes());
+        buf[8] = error::NOT_FOUND as u8;
+        for b in &mut buf[9..Self::SIZE] { *b = 0; }
+        Self::SIZE
+    }
+
+    pub fn write_dataport(buf: &mut [u8], seq_id: u32, shmem_id: u32, remaining: &[u8]) -> usize {
+        let header = QueryHeader::new(msg::RESOLVE_RESULT, seq_id);
+        buf[0..8].copy_from_slice(&header.to_bytes());
+        buf[8] = 0; // result OK
+        buf[9] = mount_transport::DATAPORT;
+        buf[10] = 0; // no port name
+        let rem_len = remaining.len().min(64);
+        buf[11] = rem_len as u8;
+        buf[12..16].copy_from_slice(&shmem_id.to_le_bytes());
+        for b in &mut buf[16..48] { *b = 0; }
+        buf[48..48 + rem_len].copy_from_slice(&remaining[..rem_len]);
+        for b in &mut buf[48 + rem_len..Self::SIZE] { *b = 0; }
+        Self::SIZE
+    }
+
+    pub fn write_port(buf: &mut [u8], seq_id: u32, port_name: &[u8], remaining: &[u8]) -> usize {
+        let header = QueryHeader::new(msg::RESOLVE_RESULT, seq_id);
+        buf[0..8].copy_from_slice(&header.to_bytes());
+        buf[8] = 0; // result OK
+        buf[9] = mount_transport::PORT;
+        let pn_len = port_name.len().min(32);
+        buf[10] = pn_len as u8;
+        let rem_len = remaining.len().min(64);
+        buf[11] = rem_len as u8;
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        buf[16..16 + pn_len].copy_from_slice(&port_name[..pn_len]);
+        for b in &mut buf[16 + pn_len..48] { *b = 0; }
+        buf[48..48 + rem_len].copy_from_slice(&remaining[..rem_len]);
+        for b in &mut buf[48 + rem_len..Self::SIZE] { *b = 0; }
+        Self::SIZE
+    }
+
+    /// Parse response. Returns (result, transport_type, port_name, remaining_path, shmem_id).
+    pub fn from_bytes(buf: &[u8]) -> Option<(i8, u8, &[u8], &[u8], u32)> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let result = buf[8] as i8;
+        let transport_type = buf[9];
+        let port_name_len = buf[10] as usize;
+        let remaining_len = buf[11] as usize;
+        let shmem_id = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+
+        let port_name = if port_name_len > 0 && port_name_len <= 32 {
+            &buf[16..16 + port_name_len]
+        } else {
+            &[]
+        };
+        let remaining = if remaining_len > 0 && remaining_len <= 64 {
+            &buf[48..48 + remaining_len]
+        } else {
+            &[]
+        };
+        Some((result, transport_type, port_name, remaining, shmem_id))
+    }
+}
+
+/// Mount list entry (used in LIST_MOUNTS response)
+///
+/// 104 bytes per entry:
+/// ```text
+/// [0]:      transport_type
+/// [1]:      prefix_len
+/// [2]:      port_name_len
+/// [3]:      _pad
+/// [4..8]:   shmem_id
+/// [8..72]:  prefix (64 bytes)
+/// [72..104]: port_name (32 bytes)
+/// ```
+pub struct MountListEntry;
+
+impl MountListEntry {
+    pub const SIZE: usize = 104;
+    /// Max entries per IPC message: (576 - 12) / 104 = 5
+    pub const MAX_PER_MSG: usize = 5;
+
+    pub fn write_to(buf: &mut [u8], transport_type: u8, prefix: &[u8], port_name: &[u8], shmem_id: u32) -> bool {
+        if buf.len() < Self::SIZE {
+            return false;
+        }
+        buf[0] = transport_type;
+        buf[1] = prefix.len().min(64) as u8;
+        buf[2] = port_name.len().min(32) as u8;
+        buf[3] = 0;
+        buf[4..8].copy_from_slice(&shmem_id.to_le_bytes());
+        let pl = prefix.len().min(64);
+        buf[8..8 + pl].copy_from_slice(&prefix[..pl]);
+        for b in &mut buf[8 + pl..72] { *b = 0; }
+        let pnl = port_name.len().min(32);
+        buf[72..72 + pnl].copy_from_slice(&port_name[..pnl]);
+        for b in &mut buf[72 + pnl..Self::SIZE] { *b = 0; }
+        true
+    }
+
+    /// Parse entry from buffer. Returns (transport_type, prefix, port_name, shmem_id).
+    pub fn from_bytes(buf: &[u8]) -> Option<(u8, &[u8], &[u8], u32)> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let transport_type = buf[0];
+        let prefix_len = buf[1] as usize;
+        let port_name_len = buf[2] as usize;
+        let shmem_id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let prefix = &buf[8..8 + prefix_len.min(64)];
+        let port_name = &buf[72..72 + port_name_len.min(32)];
+        Some((transport_type, prefix, port_name, shmem_id))
+    }
+}
+
+/// LIST_MOUNTS response header
+///
+/// ```text
+/// [0..8]:  QueryHeader (msg_type=MOUNTS_LIST)
+/// [8..10]: count (u16) - entries in this chunk
+/// [10..12]: total (u16) - total entries across all chunks
+/// ```
+pub struct MountsListResponse;
+
+impl MountsListResponse {
+    pub const HEADER_SIZE: usize = QueryHeader::SIZE + 4; // 12 bytes
+
+    pub fn write_header(buf: &mut [u8], seq_id: u32, count: u16, total: u16) -> usize {
+        let header = QueryHeader::new(msg::MOUNTS_LIST, seq_id);
+        buf[0..8].copy_from_slice(&header.to_bytes());
+        buf[8..10].copy_from_slice(&count.to_le_bytes());
+        buf[10..12].copy_from_slice(&total.to_le_bytes());
+        Self::HEADER_SIZE
+    }
+
+    /// Parse header. Returns (count, total).
+    pub fn parse_header(buf: &[u8]) -> Option<(u16, u16)> {
+        if buf.len() < Self::HEADER_SIZE {
+            return None;
+        }
+        let count = u16::from_le_bytes([buf[8], buf[9]]);
+        let total = u16::from_le_bytes([buf[10], buf[11]]);
+        Some((count, total))
     }
 }
 
@@ -2370,4 +2610,8 @@ pub mod error {
     pub const NOT_SUPPORTED: i32 = -6;
     /// Timeout waiting for response
     pub const TIMEOUT: i32 = -7;
+    /// Duplicate entry (e.g., mount prefix already exists)
+    pub const DUPLICATE: i32 = -8;
+    /// Table full (e.g., mount table)
+    pub const TABLE_FULL: i32 = -9;
 }

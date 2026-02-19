@@ -318,6 +318,10 @@ fn execute_command(cmd: &[u8]) {
         builtins::handle::run(b"", &mut output::ShellOutput::new());
     } else if cmd_starts_with(cmd, b"handle ") {
         builtins::handle::run(&cmd[7..], &mut output::ShellOutput::new());
+    } else if cmd_eq(cmd, b"mount") {
+        builtins::mount::run(b"").print();
+    } else if cmd_starts_with(cmd, b"mount ") {
+        builtins::mount::run(&cmd[6..]).print();
     } else if cmd_eq(cmd, b"resize") {
         cmd_resize();
     } else {
@@ -424,8 +428,7 @@ fn wait_for_child(pid: u32) {
         match mux.wait() {
             Ok(event) => {
                 if event.is_signal() {
-                    // signal_event::INTERRUPT = 2
-                    if event.signal_event == 2 {
+                    if event.signal_event as u32 & syscall::signal_event::INTERRUPT != 0 {
                         // Ctrl+C: kill the foreground child
                         syscall::kill(pid);
                         continue; // Wait for actual exit
@@ -684,8 +687,8 @@ fn cmd_kill(arg: &[u8]) {
                     println!("Failed to kill {}: error {}", pid, result);
                 }
             } else {
-                // Graceful: send SHUTDOWN signal (signal_event::SHUTDOWN = 3)
-                let sig_result = syscall::signal(pid, 3, 0);
+                // Graceful: send SHUTDOWN signal
+                let sig_result = syscall::signal(pid, syscall::signal_event::SHUTDOWN, 0);
                 if sig_result == 0 {
                     println!("Sent SHUTDOWN to {}", pid);
                 } else {
@@ -699,15 +702,19 @@ fn cmd_kill(arg: &[u8]) {
     }
 }
 
-/// Signal event name for display
+/// Signal event name for display (bitmask — may have multiple bits set)
 fn signal_event_name(event: u32) -> &'static str {
-    match event {
-        1 => "CHILD_EXIT",
-        2 => "INTERRUPT",
-        3 => "SHUTDOWN",
-        4 => "PORT_STATE",
-        _ => "",
-    }
+    // Return first matching bit name (for display)
+    if event & syscall::signal_event::CHILD_EXIT != 0 { return "CHILD_EXIT"; }
+    if event & syscall::signal_event::SHUTDOWN != 0 { return "SHUTDOWN"; }
+    if event & syscall::signal_event::INTERRUPT != 0 { return "INTERRUPT"; }
+    if event & syscall::signal_event::READY != 0 { return "READY"; }
+    if event & syscall::signal_event::RESIZE != 0 { return "RESIZE"; }
+    if event & syscall::signal_event::PORT_CHANGED != 0 { return "PORT_CHANGED"; }
+    if event & syscall::signal_event::HARDWARE != 0 { return "HARDWARE"; }
+    if event & syscall::signal_event::HEARTBEAT != 0 { return "HEARTBEAT"; }
+    if event & syscall::signal_event::EVICT != 0 { return "EVICT"; }
+    ""
 }
 
 /// Signal command: send, peek, or flush
@@ -780,7 +787,7 @@ fn cmd_signal(arg: &[u8]) {
             println!("Usage: signal <pid> <event> [value]");
             println!("       signal peek <pid>");
             println!("       signal flush <pid>");
-            println!("  Events: 1=CHILD_EXIT 2=INTERRUPT 3=SHUTDOWN 4=PORT_STATE");
+            println!("  Events: 1=CHILD_EXIT 2=SHUTDOWN 4=INTERRUPT 8=READY 64=PORT_CHANGED");
             return;
         }
     };
@@ -1064,8 +1071,7 @@ fn cmd_reset() {
     for i in 0..count {
         let pid = buf[i].pid;
         if pid <= 4 || pid == my_pid { continue; } // skip idle/kernel/devd/self
-        // signal_event::SHUTDOWN = 3
-        let _ = syscall::signal(pid, 3, 0);
+        let _ = syscall::signal(pid, syscall::signal_event::SHUTDOWN, 0);
     }
 
     // Brief delay to let drivers flush

@@ -867,6 +867,13 @@ impl Scheduler {
                     // By this point: IPC closed, bus handles released, children killed.
                     if task.parent_id != 0 {
                         let code = task.state().exit_code().unwrap_or(-1);
+                        // CHILD_EXIT signal: value = pid<<32 | (exit_code as u32)
+                        let value = ((pid as u64) << 32) | (code as u32 as u64);
+                        let _ = microtask::enqueue(MicroTask::Signal {
+                            target: task.parent_id,
+                            event: abi::signal_event::CHILD_EXIT,
+                            value,
+                        });
                         let _ = microtask::enqueue(MicroTask::NotifyParentExit {
                             parent_id: task.parent_id,
                             child_pid: pid,
@@ -886,6 +893,12 @@ impl Scheduler {
                     }
                     // Parent notification for evicted tasks
                     if task.parent_id != 0 {
+                        let value = ((pid as u64) << 32) | ((-1i32) as u32 as u64);
+                        let _ = microtask::enqueue(MicroTask::Signal {
+                            target: task.parent_id,
+                            event: abi::signal_event::CHILD_EXIT,
+                            value,
+                        });
                         let _ = microtask::enqueue(MicroTask::NotifyParentExit {
                             parent_id: task.parent_id,
                             child_pid: pid,

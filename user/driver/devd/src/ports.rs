@@ -29,6 +29,10 @@ pub struct RegisteredPort {
     parent_port_id: u8,
     /// Service index that owns this port (0xFF = devd itself)
     owner: u8,
+    /// Service index of the relay parent for SpawnChild routing.
+    /// For direct children: same as owner. For grandchildren: the
+    /// top-level parent with a query client connection to devd.
+    relay_owner: u8,
     /// Port lifecycle state
     state: PortState,
     /// DataPort shared memory ID (0 = no DataPort)
@@ -47,6 +51,7 @@ impl RegisteredPort {
             port_id: 0xFF,
             parent_port_id: 0xFF,
             owner: 0,
+            relay_owner: 0,
             state: PortState::Safe,
             shmem_id: 0,
             port_info: PortInfo::empty(),
@@ -73,6 +78,15 @@ impl RegisteredPort {
 
     pub fn owner(&self) -> u8 {
         self.owner
+    }
+
+    /// Service index for SpawnChild routing (may differ from owner for grandchild ports).
+    pub fn relay_owner(&self) -> u8 {
+        self.relay_owner
+    }
+
+    pub fn set_relay_owner(&mut self, idx: u8) {
+        self.relay_owner = idx;
     }
 
     pub fn state(&self) -> PortState {
@@ -454,6 +468,7 @@ impl PortRegistry for Ports {
         port.port_id = port_id;
         port.parent_port_id = parent_id;
         port.owner = owner;
+        port.relay_owner = owner; // Default: relay through owner (overridden for grandchild ports)
         port.state = PortState::Safe;  // Starts Safe, transitions to Claimed when owner connects
         port.shmem_id = shmem_id;
         port.port_info = *info;

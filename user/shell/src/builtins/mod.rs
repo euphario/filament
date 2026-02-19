@@ -15,4 +15,5 @@ pub mod handle;
 pub mod hw;
 pub mod logs;
 pub mod ls;
+pub mod mount;
 pub mod ps;

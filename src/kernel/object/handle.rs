@@ -118,6 +118,12 @@ pub fn default_rights(obj_type: ObjectType) -> HandleRights {
         ObjectType::Ring => HandleRights(
             HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::MAP.0
         ),
+        // Metrics: read only
+        ObjectType::Metrics => HandleRights::READ,
+        // Supervision: read + write (recv/send notes)
+        ObjectType::SupervisionParent | ObjectType::SupervisionChild => HandleRights(
+            HandleRights::READ.0 | HandleRights::WRITE.0
+        ),
     }
 }
 

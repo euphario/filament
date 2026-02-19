@@ -2,8 +2,13 @@
 //!
 //! Handles queries from clients and port registration from managed services.
 //! Implements the query protocol defined in `userlib::query`.
+//!
+//! Managed services (spawned by devd) communicate via SuperQ (kernel supervision queue).
+//! Dynamic clients (connected via devd-query: port) use IPC channels.
 
 use userlib::ipc::Channel;
+use userlib::error::SysError;
+use userlib::supervision::SupervisionHandle;
 use userlib::query::{
     QueryHeader, ErrorResponse,
     PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
@@ -24,19 +29,74 @@ pub const MAX_QUERY_CLIENTS: usize = 16;
 pub const MSG_BUFFER_SIZE: usize = 512;
 
 // =============================================================================
+// Client Transport
+// =============================================================================
+
+/// Transport abstraction for query clients.
+///
+/// Managed services use SuperQ (spawned with exec_with_mailbox).
+/// Dynamic clients use IPC channels (connected via devd-query: port).
+pub enum ClientTransport {
+    /// IPC channel (dynamic clients)
+    Channel(Channel),
+    /// Supervision queue (managed services).
+    /// Bidirectional: SuperQ for both parent→child and child→parent messages.
+    Supervision {
+        /// Kernel-backed supervision queue
+        superq: SupervisionHandle,
+    },
+}
+
+// =============================================================================
 // Query Client
 // =============================================================================
 
 /// A connected query client
 pub struct QueryClient {
-    /// Channel to client
-    pub channel: Channel,
+    /// Transport to client
+    pub transport: ClientTransport,
     /// Is this a managed service spawned by devd (can register ports)
     pub is_managed: bool,
     /// Service index if this is a managed service (-1 for regular clients)
     pub service_idx: i8,
     /// Client PID (for later identification)
     pub pid: u32,
+}
+
+impl QueryClient {
+    /// Send data to this client.
+    ///
+    /// For channel clients: sends via IPC channel.
+    /// For supervision clients: sends FORWARD note(s) via SuperQ.
+    pub fn send(&mut self, data: &[u8]) -> Result<(), SysError> {
+        match &mut self.transport {
+            ClientTransport::Channel(ch) => ch.send(data),
+            ClientTransport::Supervision { superq } => {
+                superq.send_forward(data, 0)
+            }
+        }
+    }
+
+    /// Non-blocking receive from this client.
+    ///
+    /// For channel clients: tries IPC recv.
+    /// For supervision clients: reads FORWARD note(s) from SuperQ, reassembles.
+    pub fn try_recv(&mut self, buf: &mut [u8]) -> Result<Option<usize>, SysError> {
+        match &mut self.transport {
+            ClientTransport::Channel(ch) => ch.try_recv(buf),
+            ClientTransport::Supervision { superq } => {
+                superq.recv_forward(buf)
+            }
+        }
+    }
+
+    /// Get the IPC handle for this client (Channel or SuperQ, both Mux-watchable).
+    pub fn handle(&self) -> Option<userlib::ipc::ObjHandle> {
+        match &self.transport {
+            ClientTransport::Channel(ch) => Some(ch.handle()),
+            ClientTransport::Supervision { superq } => Some(superq.handle()),
+        }
+    }
 }
 
 // =============================================================================
@@ -59,13 +119,12 @@ impl QueryHandler {
         }
     }
 
-    /// Add a new client connection
+    /// Add a channel-based client connection (dynamic clients from devd-query: port)
     pub fn add_client(&mut self, channel: Channel, service_idx: Option<u8>, pid: u32) -> Option<usize> {
-        // Find empty slot
         let slot = (0..MAX_QUERY_CLIENTS).find(|&i| self.clients[i].is_none())?;
 
         self.clients[slot] = Some(QueryClient {
-            channel,
+            transport: ClientTransport::Channel(channel),
             is_managed: service_idx.is_some(),
             service_idx: service_idx.map(|i| i as i8).unwrap_or(-1),
             pid,
@@ -75,26 +134,60 @@ impl QueryHandler {
         Some(slot)
     }
 
+    /// Add a supervision-based managed service (SuperQ for bidirectional communication).
+    pub fn add_supervision_client(
+        &mut self,
+        superq: SupervisionHandle,
+        service_idx: u8,
+        pid: u32,
+    ) -> Option<usize> {
+        let slot = (0..MAX_QUERY_CLIENTS).find(|&i| self.clients[i].is_none())?;
+
+        self.clients[slot] = Some(QueryClient {
+            transport: ClientTransport::Supervision {
+                superq,
+            },
+            is_managed: true,
+            service_idx: service_idx as i8,
+            pid,
+        });
+        self.client_count += 1;
+
+        Some(slot)
+    }
+
+
     /// Remove a client by slot
-    pub fn remove_client(&mut self, slot: usize) -> Option<Channel> {
+    pub fn remove_client(&mut self, slot: usize) -> bool {
         if slot >= MAX_QUERY_CLIENTS {
-            return None;
+            return false;
         }
 
-        if let Some(client) = self.clients[slot].take() {
+        if self.clients[slot].take().is_some() {
             self.client_count = self.client_count.saturating_sub(1);
-            Some(client.channel)
+            true
         } else {
-            None
+            false
         }
     }
 
-    /// Find client slot by channel handle
+    /// Find client slot by channel handle (only matches channel-based clients)
     pub fn find_by_handle(&self, handle: userlib::ipc::ObjHandle) -> Option<usize> {
         (0..MAX_QUERY_CLIENTS).find(|&i| {
             self.clients[i]
                 .as_ref()
-                .map(|c| c.channel.handle() == handle)
+                .and_then(|c| c.handle())
+                .map(|h| h == handle)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Find client slot by PID
+    pub fn find_by_pid(&self, pid: u32) -> Option<usize> {
+        (0..MAX_QUERY_CLIENTS).find(|&i| {
+            self.clients[i]
+                .as_ref()
+                .map(|c| c.pid == pid)
                 .unwrap_or(false)
         })
     }
@@ -163,7 +256,7 @@ impl QueryHandler {
     ) {
         let resp = PortRegisterResponse::new(seq_id, result);
         if let Some(client) = self.get_mut(slot) {
-            if client.channel.send(&resp.to_bytes()).is_err() {
+            if client.send(&resp.to_bytes()).is_err() {
                 userlib::syscall::klog(userlib::syscall::LogLevel::Warn,
                     b"[devd] port_reg_resp send failed");
             }
@@ -201,6 +294,7 @@ impl QueryHandler {
             owner_idx: client.service_idx as u8,
         })
     }
+
 }
 
 /// Parsed port registration info
@@ -291,7 +385,7 @@ impl QueryHandler {
             cmd.write_to(&mut buf, binary, trigger_port)?
         };
 
-        match client.channel.send(&buf[..len]) {
+        match client.send(&buf[..len]) {
             Ok(_) => Some(seq_id),
             Err(_) => None,
         }
@@ -370,7 +464,7 @@ impl QueryHandler {
         out[out_payload..out_payload + base_payload_len]
             .copy_from_slice(&base[QueryHeader::SIZE..base_len]);
 
-        match client.channel.send(&out[..total]) {
+        match client.send(&out[..total]) {
             Ok(_) => Some(seq_id),
             Err(_) => None,
         }

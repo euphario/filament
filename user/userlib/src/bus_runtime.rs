@@ -22,6 +22,7 @@ use crate::bus::{
 use crate::bus_block::ShmemBlockPort;
 use crate::devd::{DevdClient, DevdCommand};
 use crate::ipc::{Channel, Mux, MuxFilter};
+use crate::mailbox::Mailbox;
 use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, query_flags, port_type as qport_type, error as query_error};
 use crate::syscall::{self, Handle, LogLevel};
 
@@ -50,8 +51,11 @@ const TAG_BLOCK_PORT_BASE: u32 = 0xFFFF_FE00;
 /// Tag base for kernel bus channels.
 const TAG_KERNEL_BUS_BASE: u32 = 0xFFFF_FD00;
 
-/// Tag base for child supervision channels.
-const TAG_CHILD_BASE: u32 = 0xFFFF_FC00;
+/// Tag base for child supervision queue handles.
+const TAG_CHILD_SUPERQ_BASE: u32 = 0xFFFF_FC00;
+
+/// Tag for parent supervision queue (tree mode — receiving commands from parent).
+const TAG_PARENT_SUPERQ: u32 = 0xFFFF_FB00;
 
 // ============================================================================
 // Handle Registry
@@ -121,21 +125,25 @@ struct ChildSpawnCtx {
     context_kv_count: u8,
 }
 
-/// A child spawned by this driver via EXEC_WITH_CHANNEL.
+/// A child spawned by this driver via exec_with_mailbox.
+///
+/// Communication (both directions via SuperQ):
+/// - Child→parent: FORWARD notes via SuperQ up ring
+/// - Parent→child: FORWARD notes via SuperQ down ring
+/// - Child death: EXIT note via SuperQ + CHILD_EXIT signal
 struct ChildEntry {
-    /// Supervision channel to the child.
-    channel: Channel,
+    /// Shared mailbox page (keeps shmem handle alive; birth context already read).
+    mailbox: Mailbox,
+    /// Supervision queue for bidirectional parent↔child messaging.
+    superq: Option<crate::supervision::SupervisionHandle>,
     /// Child PID.
     pid: u32,
-    /// Cached spawn context for answering GET_SPAWN_CONTEXT.
+    /// Cached spawn context for path annotation and config forwarding.
     ctx: ChildSpawnCtx,
     /// Binary name of the child (e.g., "pcied", "nvmed").
-    /// Used for building full paths in config response annotation.
     binary_name: [u8; 16],
     binary_name_len: u8,
-    /// True once the child has sent a bus protocol message (GET_SPAWN_CONTEXT etc.).
-    /// Non-bus children (e.g., shell) never speak the bus protocol and are
-    /// skipped for config query forwarding.
+    /// True once the child has sent a bus protocol message.
     bus_active: bool,
 }
 
@@ -897,6 +905,11 @@ impl BusCtx for RuntimeCtx {
             Err(_) => Err(BusError::LinkDown),
         }
     }
+
+    fn register_mount(&mut self, prefix: &[u8], shmem_id: u32) -> Result<(), BusError> {
+        self.devd.register_mount(prefix, shmem_id)
+            .map_err(|_| BusError::Internal)
+    }
 }
 
 // ============================================================================
@@ -1006,6 +1019,15 @@ impl<D: Driver> DriverRuntime<D> {
         // Register devd channel with Mux
         self.ctx.register_devd_handle();
 
+        // In tree mode, register our SuperQ handle so we get woken when
+        // parent sends us commands via the kernel supervision queue.
+        if let Some(h) = self.ctx.devd.superq_obj_handle() {
+            if self.ctx.mux.add(h, MuxFilter::Readable).is_err() {
+                syscall::klog(LogLevel::Error, b"[bus] parent superq mux_add failed");
+            }
+            self.ctx.handles.add(h, TAG_PARENT_SUPERQ);
+        }
+
         // Initialize the driver (hardware is Safe — bring it up)
         if let Err(e) = self.driver.reset(&mut self.ctx) {
             let mut buf = [0u8; 64];
@@ -1074,7 +1096,20 @@ impl<D: Driver> DriverRuntime<D> {
 
             // Signal events have Handle::INVALID — dispatch before tag lookup
             if event.is_signal() {
-                self.driver.signal(event.signal_event, event.signal_value, &mut self.ctx);
+                let sig = event.signal_event as u32;
+                let val = event.signal_value;
+
+                // CHILD_EXIT: child died — clean up
+                if sig & abi::signal_event::CHILD_EXIT != 0 {
+                    let child_pid = (val >> 32) as u32;
+                    self.handle_child_exit(child_pid);
+                }
+
+                // Pass remaining signals to the driver.
+                let framework_mask = abi::signal_event::CHILD_EXIT;
+                if sig & !framework_mask != 0 {
+                    self.driver.signal(event.signal_event, event.signal_value, &mut self.ctx);
+                }
                 continue;
             }
 
@@ -1144,10 +1179,13 @@ impl<D: Driver> DriverRuntime<D> {
                         self.ctx.handles.remove(handle);
                     }
                 }
-            } else if tag >= TAG_CHILD_BASE && tag < TAG_KERNEL_BUS_BASE {
-                // Child supervision channel message — relay or answer locally
-                let child_idx = (tag - TAG_CHILD_BASE) as usize;
-                self.handle_child_message(child_idx);
+            } else if tag == TAG_PARENT_SUPERQ {
+                // Parent sent us a command via SuperQ (tree mode)
+                self.handle_parent_superq_command();
+            } else if tag >= TAG_CHILD_SUPERQ_BASE && tag < TAG_KERNEL_BUS_BASE {
+                // Child SuperQ readable — child sent a message via supervision queue
+                let child_idx = (tag - TAG_CHILD_SUPERQ_BASE) as usize;
+                self.handle_child_superq_event(child_idx);
             } else if tag >= TAG_KERNEL_BUS_BASE && tag < TAG_BLOCK_PORT_BASE {
                 // Kernel bus state notification
                 let bus_idx = (tag - TAG_KERNEL_BUS_BASE) as usize;
@@ -1317,7 +1355,7 @@ impl<D: Driver> DriverRuntime<D> {
 
     /// Forward a SpawnChild message to a child with a rewritten route.
     fn forward_spawn_message(
-        &self,
+        &mut self,
         child_idx: usize,
         remaining: &[u8],
         raw: &[u8],
@@ -1327,17 +1365,14 @@ impl<D: Driver> DriverRuntime<D> {
         let payload = &raw[route_end..];
         let mut fwd = [0u8; 576];
 
-        if remaining.is_empty() {
+        let total = if remaining.is_empty() {
             // Last segment consumed — send without ADDRESSED flag
             fwd[..QueryHeader::SIZE].copy_from_slice(&raw[..QueryHeader::SIZE]);
             let new_flags = flags & !query_flags::ADDRESSED;
             fwd[2..4].copy_from_slice(&new_flags.to_le_bytes());
             let plen = payload.len().min(576 - QueryHeader::SIZE);
             fwd[QueryHeader::SIZE..QueryHeader::SIZE + plen].copy_from_slice(&payload[..plen]);
-            let total = QueryHeader::SIZE + plen;
-            if let Some(entry) = &self.ctx.children[child_idx] {
-                let _ = entry.channel.send(&fwd[..total]);
-            }
+            QueryHeader::SIZE + plen
         } else {
             // More segments remain — rewrite route to remaining path
             let new_route_len = remaining.len();
@@ -1352,12 +1387,11 @@ impl<D: Driver> DriverRuntime<D> {
             let out_payload_start = new_route_start + new_route_len;
             let plen = payload.len().min(576 - out_payload_start);
             fwd[out_payload_start..out_payload_start + plen].copy_from_slice(&payload[..plen]);
-            let total = out_payload_start + plen;
-            if let Some(entry) = &self.ctx.children[child_idx] {
-                let _ = entry.channel.send(&fwd[..total]);
-            }
-        }
+            out_payload_start + plen
+        };
 
+        // Send via mailbox
+        self.send_to_child_superq(child_idx, &fwd[..total]);
         true
     }
 
@@ -1367,37 +1401,48 @@ impl<D: Driver> DriverRuntime<D> {
     /// The framework intercepts known types (spawn, stop, config) before
     /// the driver sees them. Everything else goes to `driver.command()`.
     fn dispatch_devd_command(&mut self, cmd: DevdCommand) {
-        // SpawnChild: framework spawns the child with a supervision channel.
-        // Creates a channel pair, passes one end to child via exec_with_channel,
-        // keeps the other end for parent-child relay.
+        // SpawnChild: framework spawns the child with a shared mailbox page.
+        //
+        // The mailbox contains the spawn context (MailboxHeader + KVs) so the
+        // child reads it at boot without a GET_SPAWN_CONTEXT round-trip.
+        // Post-spawn communication uses mailbox writes + signals:
+        // - Parent writes commands at offset 64, signals child with CONFIG
+        // - Child writes responses at offset 2048, signals parent with MAILBOX
         if let DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, filter, priority, context } = &cmd {
             let name = core::str::from_utf8(&binary[..*binary_len]).unwrap_or("???");
 
-            // Create channel pair for parent-child supervision
-            let spawn_result = match Channel::pair() {
-                Ok((parent_end, child_end)) => {
-                    let child_handle = child_end.into_raw_handle();
-                    let p = syscall::exec_with_channel(name, *caps, child_handle, *priority);
-                    if p > 0 {
-                        Some((parent_end, p as u32))
-                    } else {
-                        drop(parent_end);
-                        None
+            // Build mailbox content: MailboxHeader + spawn context KVs
+            let mut mb_buf = [0u8; 4096];
+            build_child_mailbox(&mut mb_buf, filter, context.as_ref(), *priority);
+
+            // Spawn with mailbox — parent gets shmem handle + superq handle back
+            let spawn_result = match syscall::exec_with_mailbox(name, *caps, &mb_buf) {
+                Ok((pid, parent_mb_handle, parent_superq_handle)) => {
+                    match Mailbox::from_handle(parent_mb_handle) {
+                        Ok(mb) => {
+                            let superq = crate::supervision::SupervisionHandle::from_handle(parent_superq_handle);
+                            Some((mb, superq, pid))
+                        }
+                        Err(_e) => {
+                            syscall::klog(LogLevel::Warn, b"[bus] mailbox map fail");
+                            None
+                        }
                     }
                 }
-                Err(_) => None,
+                Err(_e) => {
+                    syscall::klog(LogLevel::Warn, b"[bus] exec_with_mb fail");
+                    None
+                }
             };
 
-            // Fallback: spawn without channel
-            let (result, child_pid) = if let Some((parent_end, pid)) = spawn_result {
-                // Store ChildEntry for relay
-                let stored = self.store_child_entry(parent_end, pid, filter, context.as_ref(), &binary[..*binary_len]);
+            let (result, child_pid) = if let Some((mailbox, superq, pid)) = spawn_result {
+                let stored = self.store_child_entry_with_superq(mailbox, superq, pid, filter, context.as_ref(), &binary[..*binary_len]);
                 if !stored {
                     syscall::klog(LogLevel::Warn, b"[bus] no child slot");
                 }
                 (0i32, pid)
             } else {
-                // Channel pair failed — fall back to plain spawn (no relay)
+                // Mailbox spawn failed — fall back to plain spawn (no relay)
                 let pid = if *caps != 0 {
                     syscall::exec_with_caps(name, *caps)
                 } else {
@@ -1632,24 +1677,22 @@ impl<D: Driver> DriverRuntime<D> {
             offset += vlen;
         }
 
-        // Send to children — either one targeted child or all children
+        // Send to children via mailbox — either one targeted child or all
         let mut sent_mask: u8 = 0;
         if let Some(target) = self.routing.target_child() {
             // Routed: send only to the targeted child
-            if let Some(entry) = &mut self.ctx.children[target] {
-                if entry.channel.send(&qbuf[..offset]).is_ok() {
-                    sent_mask |= 1 << target;
-                }
+            if self.ctx.children[target].is_some() {
+                self.send_to_child_superq(target, &qbuf[..offset]);
+                sent_mask |= 1 << target;
             }
         } else {
             for i in 0..MAX_CHILDREN {
-                if let Some(entry) = &mut self.ctx.children[i] {
+                if let Some(entry) = &self.ctx.children[i] {
                     // Skip children that haven't spoken the bus protocol
                     // (e.g., shell) — they won't respond with EOL.
                     if !entry.bus_active { continue; }
-                    if entry.channel.send(&qbuf[..offset]).is_ok() {
-                        sent_mask |= 1 << i;
-                    }
+                    self.send_to_child_superq(i, &qbuf[..offset]);
+                    sent_mask |= 1 << i;
                 }
             }
         }
@@ -2010,25 +2053,35 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
-    /// Forward a routed message to a specific child.
-    fn forward_to_child_routed(&mut self, child_idx: usize, raw: &[u8], child_route: &[u8]) {
-        let mut buf = [0u8; 576];
-        let len = Self::build_routed_message(raw, child_route, &mut buf);
-        if len > 0 {
-            if let Some(entry) = &mut self.ctx.children[child_idx] {
-                let _ = entry.channel.send(&buf[..len]);
+    /// Send a command to a child via its SuperQ (parent→child direction).
+    ///
+    /// Writes a FORWARD note containing the raw payload into the child's
+    /// supervision queue down ring. The kernel wakes the child's subscriber.
+    fn send_to_child_superq(&mut self, child_idx: usize, payload: &[u8]) {
+        if let Some(entry) = &self.ctx.children[child_idx] {
+            if let Some(ref superq) = entry.superq {
+                let _ = superq.send_forward(payload, 0);
             }
         }
     }
 
-    /// Forward a routed message to all children.
+    /// Forward a routed message to a specific child via SuperQ.
+    fn forward_to_child_routed(&mut self, child_idx: usize, raw: &[u8], child_route: &[u8]) {
+        let mut buf = [0u8; 576];
+        let len = Self::build_routed_message(raw, child_route, &mut buf);
+        if len > 0 {
+            self.send_to_child_superq(child_idx, &buf[..len]);
+        }
+    }
+
+    /// Forward a routed message to all children via SuperQ.
     fn forward_to_all_children(&mut self, raw: &[u8], child_route: &[u8]) {
         let mut buf = [0u8; 576];
         let len = Self::build_routed_message(raw, child_route, &mut buf);
         if len > 0 {
             for i in 0..MAX_CHILDREN {
-                if let Some(entry) = &mut self.ctx.children[i] {
-                    let _ = entry.channel.send(&buf[..len]);
+                if self.ctx.children[i].is_some() {
+                    self.send_to_child_superq(i, &buf[..len]);
                 }
             }
         }
@@ -2078,11 +2131,13 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
-    /// Store a ChildEntry for a newly spawned child and register its channel
-    /// with the Mux.
+    /// Store a ChildEntry for a newly spawned child.
+    ///
+    /// No Mux registration needed — children communicate via signals,
+    /// not polled channels.
     fn store_child_entry(
         &mut self,
-        parent_end: Channel,
+        mailbox: Mailbox,
         pid: u32,
         filter: &crate::devd::SpawnFilter,
         context: Option<&SpawnChildContext>,
@@ -2133,22 +2188,14 @@ impl<D: Driver> DriverRuntime<D> {
             spawn_ctx.context_kv_count = kv_n as u8;
         }
 
-        // Register channel with Mux
-        let ch_handle = parent_end.handle();
-        let tag = TAG_CHILD_BASE + slot as u32;
-        if self.ctx.mux.add(ch_handle, MuxFilter::Readable).is_err() {
-            syscall::klog(LogLevel::Error, b"[bus] child mux_add failed");
-            return false;
-        }
-        self.ctx.handles.add(ch_handle, tag);
-
         // Store binary name for path annotation
         let mut bname = [0u8; 16];
         let blen = binary_name.len().min(16);
         bname[..blen].copy_from_slice(&binary_name[..blen]);
 
         self.ctx.children[slot] = Some(ChildEntry {
-            channel: parent_end,
+            mailbox,
+            superq: None,
             pid,
             ctx: spawn_ctx,
             binary_name: bname,
@@ -2160,161 +2207,196 @@ impl<D: Driver> DriverRuntime<D> {
         true
     }
 
-    /// Handle a message from a child's supervision channel.
+    /// Store a child entry with a SuperQ handle for reliable child→parent messaging.
+    /// Registers the SuperQ handle in the Mux with TAG_CHILD_SUPERQ_BASE + slot.
+    fn store_child_entry_with_superq(
+        &mut self,
+        mailbox: Mailbox,
+        superq: crate::supervision::SupervisionHandle,
+        pid: u32,
+        filter: &crate::devd::SpawnFilter,
+        context: Option<&SpawnChildContext>,
+        binary_name: &[u8],
+    ) -> bool {
+        // Reuse existing logic — store_child_entry sets superq=None
+        if !self.store_child_entry(mailbox, pid, filter, context, binary_name) {
+            // store failed — need to drop superq cleanly
+            core::mem::forget(superq); // don't close, slot not stored
+            return false;
+        }
+        // Find the slot we just stored (last child with this pid)
+        let slot = match self.find_child_by_pid(pid) {
+            Some(s) => s,
+            None => return true, // shouldn't happen
+        };
+        // Register SuperQ handle in Mux
+        let sq_handle = superq.handle();
+        let tag = TAG_CHILD_SUPERQ_BASE + slot as u32;
+        if self.ctx.mux.add(sq_handle, MuxFilter::Readable).is_ok() {
+            self.ctx.handles.add(sq_handle, tag);
+        }
+        // Store superq in entry
+        if let Some(entry) = &mut self.ctx.children[slot] {
+            entry.superq = Some(superq);
+        }
+        true
+    }
+
+    /// Handle CHILD_EXIT signal — child process died.
     ///
-    /// Dispatches locally for GET_SPAWN_CONTEXT, forwards everything else
-    /// to devd with response relay tracking.
-    fn handle_child_message(&mut self, child_idx: usize) {
-        let mut buf = [0u8; 512];
-
-        // Read message from child
-        let n = match &mut self.ctx.children[child_idx] {
-            Some(entry) => match entry.channel.try_recv(&mut buf) {
-                Ok(Some(n)) if n >= QueryHeader::SIZE => n,
-                Ok(Some(_)) => return, // Too small, ignore
-                Ok(None) => return,    // No data yet
-                Err(_) => {
-                    // Channel error (PeerClosed, etc.) — child died.
-                    // Remove from Mux and free the slot to prevent hot-loop starvation.
-                    syscall::klog(LogLevel::Info, b"[bus] child channel closed");
-                    let handle = entry.channel.handle();
-                    let _ = self.ctx.mux.remove(handle);
-                    self.ctx.handles.remove(handle);
-                    self.ctx.children[child_idx] = None;
-                    if self.ctx.child_count > 0 { self.ctx.child_count -= 1; }
-
-                    // Implicit EOL: set eol_mask bit for this child on all pending queries
-                    let child_bit = 1u8 << child_idx;
-                    for slot in 0..MAX_PENDING_CONFIG {
-                        let converged = if let Some(pcq) = self.ctx.pending_config[slot].as_mut() {
-                            if pcq.sent_mask & child_bit != 0 {
-                                pcq.eol_mask |= child_bit;
-                            }
-                            pcq.is_converged()
-                        } else {
-                            false
-                        };
-                        if converged {
-                            self.complete_config_query(slot);
-                        }
-                    }
-                    return;
-                }
-            },
-            None => return,
+    /// Cleans up the ChildEntry and sets EOL on pending config queries.
+    fn handle_child_exit(&mut self, child_pid: u32) {
+        let child_idx = match self.find_child_by_pid(child_pid) {
+            Some(i) => i,
+            None => return, // Not one of our children
         };
 
-        let header = match QueryHeader::from_bytes(&buf[..n]) {
-            Some(h) => h,
-            None => return,
-        };
+        syscall::klog(LogLevel::Info, b"[bus] child exited");
 
-        // Mark child as bus-protocol-aware on first valid message
-        if let Some(entry) = &mut self.ctx.children[child_idx] {
-            entry.bus_active = true;
+        // Remove SuperQ handle from Mux before dropping the entry
+        if let Some(entry) = &self.ctx.children[child_idx] {
+            if let Some(ref superq) = entry.superq {
+                let h = superq.handle();
+                let _ = self.ctx.mux.remove(h);
+                self.ctx.handles.remove(h);
+            }
         }
 
-        match header.msg_type {
-            // GET_SPAWN_CONTEXT: answer locally from stored ChildSpawnCtx
-            query_msg::GET_SPAWN_CONTEXT => {
-                self.reply_spawn_context(child_idx, header.seq_id);
-            }
+        self.ctx.children[child_idx] = None;
+        if self.ctx.child_count > 0 { self.ctx.child_count -= 1; }
 
-            // REGISTER_PORT_INFO: forward to devd with path annotation.
-            // devd stores the source_path on the registered port for
-            // SpawnChild routing — no local port tracking needed.
-            query_msg::REGISTER_PORT_INFO => {
-                self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
-            }
-
-            // SET_PORT_STATE / QUERY_PORT / UPDATE_PORT_SHMEM_ID:
-            // Forward to devd with response relay tracking
-            query_msg::SET_PORT_STATE
-            | query_msg::QUERY_PORT
-            | query_msg::UPDATE_PORT_SHMEM_ID => {
-                self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
-            }
-
-            // SPAWN_ACK: forward to devd without seq_id remapping.
-            // Child is acking a SpawnChild that we forwarded — devd needs
-            // the original seq_id to match its inflight spawn tracking.
-            query_msg::SPAWN_ACK => {
-                let (annotated, alen) = self.annotate_path_upward(child_idx, &buf[..n]);
-                let _ = self.ctx.devd.raw_send(&annotated[..alen]);
-            }
-
-            // SERVICE_INFO_RESULT: check if it's a config query response
-            query_msg::SERVICE_INFO_RESULT => {
-                if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&buf[..n]) {
-                    if !self.handle_config_response(child_idx, header.seq_id, info_bytes, result.header.flags) {
-                        // Not a config query response — forward to devd
-                        self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
-                    }
+        // Implicit EOL: set eol_mask bit for this child on all pending queries
+        let child_bit = 1u8 << child_idx;
+        for slot in 0..MAX_PENDING_CONFIG {
+            let converged = if let Some(pcq) = self.ctx.pending_config[slot].as_mut() {
+                if pcq.sent_mask & child_bit != 0 {
+                    pcq.eol_mask |= child_bit;
                 }
-            }
-
-            // STATE_CHANGE: fire-and-forget forward to devd with path annotation
-            query_msg::STATE_CHANGE => {
-                let (annotated, alen) = self.annotate_path_upward(child_idx, &buf[..n]);
-                let _ = self.ctx.devd.raw_send(&annotated[..alen]);
-            }
-
-            // LOG_MESSAGE: fire-and-forget forward to devd with path annotation
-            query_msg::LOG_MESSAGE => {
-                let (annotated, alen) = self.annotate_path_upward(child_idx, &buf[..n]);
-                let _ = self.ctx.devd.raw_send(&annotated[..alen]);
-            }
-
-            // Unknown: forward to devd
-            _ => {
-                self.forward_to_devd(child_idx, header.seq_id, &buf[..n]);
+                pcq.is_converged()
+            } else {
+                false
+            };
+            if converged {
+                self.complete_config_query(slot);
             }
         }
     }
 
-    /// Reply to a child's GET_SPAWN_CONTEXT with locally cached data.
-    fn reply_spawn_context(&mut self, child_idx: usize, seq_id: u32) {
-        let entry = match &self.ctx.children[child_idx] {
-            Some(e) => e,
-            None => return,
-        };
-        let c = &entry.ctx;
-
-        // Convert port_type to legacy port_type constant for wire format
-        let resp = SpawnContextResponse {
-            header: QueryHeader::new(query_msg::SPAWN_CONTEXT, seq_id),
-            result: query_error::OK,
-            port_type: c.port_type,
-            port_name_len: c.port_name_len,
-            metadata_len: c.metadata_len,
-            port_id: c.port_id,
-        };
-
-        // Build KV refs for write_to_full
-        let kv_n = c.context_kv_count as usize;
-        let mut kv_refs: [(&[u8], &[u8]); 4] = [(&[], &[]); 4];
-        for i in 0..kv_n {
-            let klen = c.context_kvs[i].1 as usize;
-            let vlen = c.context_kvs[i].3 as usize;
-            kv_refs[i] = (&c.context_kvs[i].0[..klen], &c.context_kvs[i].2[..vlen]);
-        }
-
-        let port_name = &c.port_name[..c.port_name_len as usize];
-        let metadata = &c.metadata[..c.metadata_len as usize];
-
-        let mut reply_buf = [0u8; 512];
-        if let Some(len) = resp.write_to_full(&mut reply_buf, port_name, metadata, &kv_refs[..kv_n]) {
-            // Also append shmem_id after the standard spawn context response.
-            // The child's bus_runtime will pick this up to populate SpawnContext.shmem_id.
-            // Wire: after KV section, append shmem_id(4 bytes LE).
-            if len + 4 <= reply_buf.len() {
-                reply_buf[len..len + 4].copy_from_slice(&c.shmem_id.to_le_bytes());
-                let total = len + 4;
-                if let Some(entry) = &mut self.ctx.children[child_idx] {
-                    let _ = entry.channel.send(&reply_buf[..total]);
+    /// Handle child SuperQ readable event — child sent a FORWARD note.
+    /// Handle parent command received via SuperQ (tree mode).
+    ///
+    /// Reads FORWARD notes from our SupervisionChild handle and dispatches
+    /// as raw commands (SpawnChild, ConfigGet, etc).
+    fn handle_parent_superq_command(&mut self) {
+        let mut raw_buf = [0u8; 512];
+        // Drain all available commands from parent
+        loop {
+            let n = match self.ctx.devd.recv_superq(&mut raw_buf) {
+                Ok(Some(n)) => n,
+                _ => break,
+            };
+            if n >= QueryHeader::SIZE {
+                if !self.try_relay_to_child(&raw_buf, n) {
+                    self.dispatch_raw_command(&raw_buf[..n]);
                 }
             }
         }
+    }
+
+    ///
+    /// Reads all pending FORWARD notes from the child's SuperQ and dispatches
+    /// them based on the query protocol msg_type in the payload.
+    fn handle_child_superq_event(&mut self, child_idx: usize) {
+        // Drain all available notes from this child's SuperQ
+        loop {
+            let superq = match &self.ctx.children[child_idx] {
+                Some(entry) => match &entry.superq {
+                    Some(sq) => sq,
+                    None => return,
+                },
+                None => return,
+            };
+
+            let mut payload_buf = [0u8; 576];
+            let len = match superq.recv_forward(&mut payload_buf) {
+                Ok(Some(n)) => n,
+                Ok(None) => break, // No more notes
+                Err(_) => break,
+            };
+
+            if len < QueryHeader::SIZE {
+                continue;
+            }
+
+            // Mark child as active
+            if let Some(entry) = &mut self.ctx.children[child_idx] {
+                entry.bus_active = true;
+            }
+
+            // Dispatch based on query protocol msg_type
+            let header = match QueryHeader::from_bytes(&payload_buf[..len]) {
+                Some(h) => h,
+                None => continue,
+            };
+
+            match header.msg_type {
+                // Fire-and-forget messages: annotate path and send to devd
+                query_msg::STATE_CHANGE | query_msg::SPAWN_ACK => {
+                    let (annotated, alen) = self.annotate_path_upward(child_idx, &payload_buf[..len]);
+                    let _ = self.ctx.devd.raw_send(&annotated[..alen]);
+                }
+                // Config/info result from child
+                query_msg::SERVICE_INFO_RESULT => {
+                    // Check EOL flag — if set, this is a CONFIG_EOL
+                    if header.flags & query_flags::EOL != 0 {
+                        // CONFIG_EOL: mark this child as done in pending config queries
+                        let child_bit = 1u8 << child_idx;
+                        let mut converged_slot = None;
+                        for slot in 0..MAX_PENDING_CONFIG {
+                            if let Some(pcq) = self.ctx.pending_config[slot].as_mut() {
+                                if pcq.sent_mask & child_bit != 0 {
+                                    pcq.eol_mask |= child_bit;
+                                    if pcq.is_converged() {
+                                        converged_slot = Some(slot);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(slot) = converged_slot {
+                            self.complete_config_query(slot);
+                        }
+                    } else {
+                        // CONFIG_RESULT: try to handle as config response
+                        if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&payload_buf[..len]) {
+                            if !self.handle_config_response(child_idx, header.seq_id, info_bytes, result.header.flags) {
+                                self.forward_to_devd(child_idx, header.seq_id, &payload_buf[..len]);
+                            }
+                        }
+                    }
+                }
+                // Port registration: forward to devd with seq rewriting
+                query_msg::REGISTER_PORT_INFO => {
+                    self.forward_to_devd(child_idx, header.seq_id, &payload_buf[..len]);
+                }
+                // Everything else: forward to devd
+                _ => {
+                    self.forward_to_devd(child_idx, header.seq_id, &payload_buf[..len]);
+                }
+            }
+        }
+    }
+
+
+    /// Find a child entry index by PID.
+    fn find_child_by_pid(&self, pid: u32) -> Option<usize> {
+        for i in 0..MAX_CHILDREN {
+            if let Some(entry) = &self.ctx.children[i] {
+                if entry.pid == pid {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     /// Annotate a child message with path information for upward routing.
@@ -2499,15 +2581,14 @@ impl<D: Driver> DriverRuntime<D> {
             None => return false,
         };
 
-        // Rewrite seq_id back to child's original and send
+        // Rewrite seq_id back to child's original and send via mailbox
         let mut relay = [0u8; 512];
         let rlen = len.min(512);
         relay[..rlen].copy_from_slice(&buf[..rlen]);
         relay[4..8].copy_from_slice(&child_seq.to_le_bytes());
 
-        if let Some(entry) = &mut self.ctx.children[child_idx as usize] {
-            let _ = entry.channel.send(&relay[..rlen]);
-        }
+        // Forward devd response to child via SuperQ
+        self.send_to_child_superq(child_idx as usize, &relay[..rlen]);
 
         true
     }
@@ -2519,36 +2600,41 @@ impl<D: Driver> DriverRuntime<D> {
 
 /// Entry point for all drivers using the bus framework. Never returns.
 ///
-/// Checks Handle::SUPERVISION (slot 4) first for tree mode — if valid,
-/// uses it as the supervision channel to the parent driver. Otherwise
-/// connects to devd directly as a root-level driver.
+/// If spawned with exec_with_mailbox (tree mode), reads spawn context from
+/// the mailbox and routes all devd protocol through the parent via mailbox
+/// writes + signals. The parent annotates paths and relays to devd.
+///
+/// If no mailbox (root mode), connects to devd directly.
 ///
 /// # Arguments
 /// * `name` - Driver name (for logging and identification)
 /// * `driver` - The Driver implementation
 pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
-    // Try tree mode first: check if handle 4 (SUPERVISION) is a valid, connected channel.
-    // Probe with a zero-length read:
-    //   BadFd → handle doesn't exist (root mode)
-    //   ConnectionReset/PeerClosed → handle exists but peer dropped (fall back to root mode)
-    //   WouldBlock/Ok → handle exists and peer is alive (tree mode)
-    let devd = {
-        let mut probe = [0u8; 0];
-        let supervision_alive = match crate::syscall::read(abi::Handle::SUPERVISION, &mut probe) {
-            Err(crate::error::SysError::BadFd) => false,
-            _ => true, // WouldBlock or Ok means handle exists and peer is alive
-        };
+    // Check for mailbox (Handle::MAILBOX = slot 5).
+    // If present, this child was spawned via exec_with_mailbox and its
+    // spawn context is in the mailbox header — no GET_SPAWN_CONTEXT needed.
+    let mailbox = Mailbox::from_handle(abi::Handle::MAILBOX).ok();
+    let has_mailbox = mailbox.as_ref().map_or(false, |mb| mb.is_valid());
 
-        if supervision_alive {
-            let ch = Channel::from_raw_handle(abi::Handle::SUPERVISION);
-            DevdClient::from_channel(ch)
-        } else {
-            match DevdClient::connect() {
-                Ok(c) => c,
-                Err(_) => {
-                    syscall::klog(LogLevel::Error, b"[bus] devd connect failed");
-                    syscall::exit(1);
-                }
+    // Pre-populate spawn context from mailbox if available
+    let pre_spawn_ctx = if has_mailbox {
+        parse_spawn_context_from_mailbox(mailbox.as_ref().unwrap())
+    } else {
+        None
+    };
+
+    // Two modes:
+    // 1. Tree mode: spawned by exec_with_mailbox, SuperQ at slot 4 for parent↔child
+    // 2. Root mode: no mailbox, connect to devd-query: port (e.g. devd itself)
+    let devd = if has_mailbox {
+        let superq = crate::supervision::SupervisionHandle::from_handle(abi::Handle::SUPERVISION);
+        DevdClient::from_supervision(superq)
+    } else {
+        match DevdClient::connect() {
+            Ok(c) => c,
+            Err(_) => {
+                syscall::klog(LogLevel::Error, b"[bus] devd connect failed");
+                syscall::exit(1);
             }
         }
     };
@@ -2563,7 +2649,88 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
     };
 
     let mut runtime = DriverRuntime::new(driver, devd, mux, name);
+
+    // If we have a pre-populated spawn context from mailbox, cache it
+    // so the child never needs GET_SPAWN_CONTEXT.
+    if let Some(ctx) = pre_spawn_ctx {
+        runtime.ctx.spawn_ctx = SpawnCtxCache::Cached(ctx);
+    }
+
     runtime.run()
+}
+
+/// Parse SpawnContext from a mailbox header + KVs.
+///
+/// Called during driver_main startup to pre-populate the spawn context cache
+/// so the child never needs to query GET_SPAWN_CONTEXT via IPC.
+fn parse_spawn_context_from_mailbox(mb: &Mailbox) -> Option<SpawnContext> {
+    use crate::bus::SpawnContext;
+
+    let hdr = mb.header();
+    if !hdr.is_valid() {
+        return None;
+    }
+
+    // Read KVs from mailbox
+    let mut keys = [[0u8; 32]; 4];
+    let mut key_lens = [0u8; 4];
+    let mut values = [[0u8; 64]; 4];
+    let mut value_lens = [0u8; 4];
+    let kv_count = mb.read_kvs(&mut keys, &mut key_lens, &mut values, &mut value_lens);
+
+    // Parse well-known KVs and collect pass-through KVs
+    let mut port_name = [0u8; 64];
+    let mut port_name_len = 0usize;
+    let mut metadata = [0u8; 64];
+    let mut metadata_len = 0usize;
+    let mut shmem_id: u32 = 0;
+    // Pass-through context KVs packed for set_context_kvs
+    let mut kv_pack: [([u8; 32], u8, [u8; 64], u8); 4] = [([0; 32], 0, [0; 64], 0); 4];
+    let mut ctx_kv_count = 0usize;
+
+    for i in 0..kv_count {
+        let klen = key_lens[i] as usize;
+        let vlen = value_lens[i] as usize;
+        let key = &keys[i][..klen];
+        let val = &values[i][..vlen];
+
+        if key == b"port.name" {
+            let n = val.len().min(64);
+            port_name[..n].copy_from_slice(&val[..n]);
+            port_name_len = n;
+        } else if key == b"port.metadata" {
+            let n = val.len().min(64);
+            metadata[..n].copy_from_slice(&val[..n]);
+            metadata_len = n;
+        } else if key == b"port.shmem_id" && vlen >= 4 {
+            shmem_id = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
+        } else if ctx_kv_count < 4 {
+            // Pass-through context KV (e.g., "mount.path")
+            kv_pack[ctx_kv_count].0[..klen].copy_from_slice(key);
+            kv_pack[ctx_kv_count].1 = klen as u8;
+            kv_pack[ctx_kv_count].2[..vlen].copy_from_slice(val);
+            kv_pack[ctx_kv_count].3 = vlen as u8;
+            ctx_kv_count += 1;
+        }
+    }
+
+    let port_class = abi::PortClass::from_u16(hdr.bus_type as u16)
+        .unwrap_or(abi::PortClass::Unknown);
+
+    let mut ctx = SpawnContext::new(
+        &port_name,
+        port_name_len,
+        port_class,
+        &metadata[..metadata_len],
+        hdr.bus_index,
+    );
+    ctx.shmem_id = shmem_id;
+
+    if ctx_kv_count > 0 {
+        ctx.set_context_kvs(&kv_pack, ctx_kv_count);
+    }
+
+    Some(ctx)
 }
 
 // ============================================================================
@@ -2749,4 +2916,108 @@ fn build_prefix_matches<D: Driver>(driver: &D, prefix: &[u8], buf: &mut [u8]) ->
     }
 
     pos
+}
+
+// ============================================================================
+// Mailbox Builder
+// ============================================================================
+
+/// Build a child mailbox buffer with MailboxHeader + spawn context KVs.
+///
+/// The MailboxHeader fields encode the spawn context that the child
+/// reads at startup instead of querying GET_SPAWN_CONTEXT via IPC.
+///
+/// Layout: [0..64) MailboxHeader, [64..) KV pairs in wire format:
+///   key_len(u8) + key + value_len(u8) + value, repeated kv_count times.
+fn build_child_mailbox(
+    buf: &mut [u8; 4096],
+    filter: &crate::devd::SpawnFilter,
+    context: Option<&SpawnChildContext>,
+    priority: u8,
+) {
+    buf.fill(0);
+
+    // Build MailboxHeader at offset 0
+    // Note: parent_pid is stamped by kernel during exec_with_mailbox (offset 36)
+    let mut hdr = abi::MailboxHeader::empty();
+    hdr.priority = priority;
+
+    if let Some(ctx) = context {
+        hdr.bus_type = ctx.port_type; // Reuse bus_type for port_type
+        hdr.bus_index = ctx.port_id;
+        hdr.kv_count = 0; // Will be set below
+    }
+
+    // Write port name as a KV: "port.name" = filter.pattern
+    let pname = filter.pattern_bytes();
+    let mut kv_count: u8 = 0;
+    let mut pos: usize = 64; // KVs start right after header
+
+    // KV: port.name
+    if !pname.is_empty() {
+        let key = b"port.name";
+        let klen = key.len();
+        let vlen = pname.len().min(64);
+        if pos + 1 + klen + 1 + vlen < 2048 {
+            buf[pos] = klen as u8; pos += 1;
+            buf[pos..pos + klen].copy_from_slice(key); pos += klen;
+            buf[pos] = vlen as u8; pos += 1;
+            buf[pos..pos + vlen].copy_from_slice(&pname[..vlen]); pos += vlen;
+            kv_count += 1;
+        }
+    }
+
+    // KV: metadata (if present)
+    if let Some(ctx) = context {
+        let mlen = ctx.metadata_len as usize;
+        if mlen > 0 {
+            let key = b"port.metadata";
+            let klen = key.len();
+            if pos + 1 + klen + 1 + mlen < 2048 {
+                buf[pos] = klen as u8; pos += 1;
+                buf[pos..pos + klen].copy_from_slice(key); pos += klen;
+                buf[pos] = mlen as u8; pos += 1;
+                buf[pos..pos + mlen].copy_from_slice(&ctx.metadata[..mlen]); pos += mlen;
+                kv_count += 1;
+            }
+        }
+
+        // KV: shmem_id (if non-zero)
+        if ctx.shmem_id != 0 {
+            let key = b"port.shmem_id";
+            let klen = key.len();
+            let val = ctx.shmem_id.to_le_bytes();
+            let vlen = 4;
+            if pos + 1 + klen + 1 + vlen < 2048 {
+                buf[pos] = klen as u8; pos += 1;
+                buf[pos..pos + klen].copy_from_slice(key); pos += klen;
+                buf[pos] = vlen as u8; pos += 1;
+                buf[pos..pos + vlen].copy_from_slice(&val); pos += vlen;
+                kv_count += 1;
+            }
+        }
+
+        // Context template KVs from SpawnChildContext
+        let ctx_kv_n = (ctx.kv_count as usize).min(4);
+        for i in 0..ctx_kv_n {
+            let klen = ctx.kv_keys_len[i] as usize;
+            let vlen = ctx.kv_values_len[i] as usize;
+            if klen == 0 { continue; }
+            if pos + 1 + klen + 1 + vlen < 2048 {
+                buf[pos] = klen as u8; pos += 1;
+                buf[pos..pos + klen].copy_from_slice(&ctx.kv_keys[i][..klen]); pos += klen;
+                buf[pos] = vlen as u8; pos += 1;
+                buf[pos..pos + vlen].copy_from_slice(&ctx.kv_values[i][..vlen]); pos += vlen;
+                kv_count += 1;
+            }
+        }
+    }
+
+    hdr.kv_count = kv_count;
+
+    // Write header to buf
+    let hdr_bytes = unsafe {
+        core::slice::from_raw_parts(&hdr as *const abi::MailboxHeader as *const u8, 64)
+    };
+    buf[..64].copy_from_slice(hdr_bytes);
 }
