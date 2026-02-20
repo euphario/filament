@@ -437,7 +437,7 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool, ecam_based
         }
         // Verify and log
         let verify = pci::config_read32(bdf, 0x04).unwrap_or(0xFFFFFFFF);
-        crate::kinfo!("bus", "ecam_bm_set";
+        crate::knotice!("bus", "ecam_bm_set";
             bdf = device_id as u64,
             bus = bdf.bus as u64,
             dev = bdf.device as u64,
@@ -474,7 +474,7 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool, ecam_based
             cfg.write32(CFG_OFFSET + PCI_COMMAND, rp_new);
             dsb();
             let rp_verify = (cfg.read32(CFG_OFFSET + PCI_COMMAND) & 0xFFFF) as u16;
-            crate::kinfo!("bus", "mac_bm_set"; port = bus_index as u64, bus = 0u64, devfn = 0u64, before = rp_current as u64, after = rp_verify as u64);
+            crate::knotice!("bus", "mac_bm_set"; port = bus_index as u64, bus = 0u64, devfn = 0u64, before = rp_current as u64, after = rp_verify as u64);
         }
     }
 
@@ -514,7 +514,7 @@ pub fn set_bus_mastering(bus_index: u8, device_id: u16, enable: bool, ecam_based
             crate::kerror!("bus", "pcie_bm_verify_failed"; index = bus_index as u64, cmd = verify_cmd as u64);
             return Err(super::BusError::HardwareError);
         }
-        crate::kinfo!("bus", "mac_bm_set"; port = bus_index as u64, bus = bus_num as u64, devfn = devfn as u64, before = current as u64, after = verify_cmd as u64);
+        crate::knotice!("bus", "mac_bm_set"; port = bus_index as u64, bus = bus_num as u64, devfn = devfn as u64, before = current as u64, after = verify_cmd as u64);
     }
 
     Ok(())

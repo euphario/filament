@@ -15,7 +15,7 @@
 #![no_main]
 #![allow(dead_code)]  // Constants/registers for future use
 
-use userlib::{syscall, uinfo, uwarn, uerror};
+use userlib::{syscall, uinfo, unotice, uwarn, uerror};
 use userlib::syscall::{
     Handle, WaitFilter, WaitRequest, WaitResult,
     handle_timer_create, handle_timer_set, handle_wait,
@@ -377,7 +377,7 @@ fn main() {
 
     // Enable USB VBUS by default (pin 11)
     if gpio.set_output(GPIO_USB_VBUS, true) {
-        uinfo!("gpio", "gpio_ready"; pin = GPIO_USB_VBUS as u64);
+        unotice!("gpio", "gpio_ready"; pin = GPIO_USB_VBUS as u64);
     } else {
         uwarn!("gpio", "usb_vbus_failed");
     }

@@ -23,7 +23,7 @@ use userlib::bus::{
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{io_op, io_status, side_msg};
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, unotice, udebug, uerror};
 
 // =============================================================================
 // NVMe Register Definitions (NVMe 1.4 spec)
@@ -457,7 +457,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
     let dstrd = ((cap_val & cap::DSTRD_MASK) >> cap::DSTRD_SHIFT) as u32;
     ctrl.doorbell_stride = 4 << dstrd;
     let vs = ctrl.read32(regs::VS);
-    uinfo!("nvmed", "hw_probe"; cap = cap_val, vs = vs as u64, stride = ctrl.doorbell_stride);
+    unotice!("nvmed", "hw_probe"; cap = cap_val, vs = vs as u64, stride = ctrl.doorbell_stride);
 
     // Disable controller
     ctrl.write32(regs::CC, 0);
@@ -471,7 +471,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
     ctrl.write32(regs::AQA, aqa);
     ctrl.write64(regs::ASQ, queue_mem_phys);
     ctrl.write64(regs::ACQ, queue_mem_phys + 4096);
-    uinfo!("nvmed", "admin_queues";
+    udebug!("nvmed", "admin_queues";
         asq = queue_mem_phys, acq = queue_mem_phys + 4096,
         virt = queue_mem_virt, aqa = aqa as u64);
 
@@ -479,7 +479,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
     let asq_rb = ctrl.read64(regs::ASQ);
     let acq_rb = ctrl.read64(regs::ACQ);
     let aqa_rb = ctrl.read32(regs::AQA);
-    uinfo!("nvmed", "reg_readback"; asq_rb = asq_rb, acq_rb = acq_rb, aqa = aqa_rb as u64);
+    udebug!("nvmed", "reg_readback"; asq_rb = asq_rb, acq_rb = acq_rb, aqa = aqa_rb as u64);
 
     // Enable controller
     let cc_val = cc::EN | cc::CSS_NVM | cc::AMS_RR
@@ -499,7 +499,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
         uerror!("nvmed", "controller_timeout";);
         return Err(BusError::Timeout);
     }
-    uinfo!("nvmed", "controller_ready"; cc = cc_val as u64, csts = ctrl.read32(regs::CSTS) as u64);
+    unotice!("nvmed", "controller_ready"; cc = cc_val as u64, csts = ctrl.read32(regs::CSTS) as u64);
 
     // Identify buffer
     let id_pool = match DmaPool::alloc(4096) {
@@ -516,7 +516,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
     match ctrl.identify_controller(id_buf_phys) {
         Ok(_) => {
             let id_ctrl = unsafe { &*(id_buf_virt as *const IdentifyController) };
-            uinfo!("nvmed", "controller"; vendor = id_ctrl.vid as u32);
+            unotice!("nvmed", "controller"; vendor = id_ctrl.vid as u32);
         }
         Err(e) => {
             uerror!("nvmed", "identify_ctrl_err"; status = e as u32);
@@ -549,7 +549,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
         return Err(BusError::Internal);
     }
 
-    uinfo!("nvmed", "controller_ready"; blocks = ctrl.ns_size, block_size = ctrl.block_size);
+    unotice!("nvmed", "controller_ready"; blocks = ctrl.ns_size, block_size = ctrl.block_size);
     Ok(ctrl)
 }
 
@@ -744,7 +744,7 @@ impl Driver for NvmeDriver {
             meta[8], meta[9], meta[10], meta[11],
         ]) as u64;
 
-        uinfo!("nvmed", "device_found"; bar0 = bar0_addr, size = bar0_size);
+        unotice!("nvmed", "device_found"; bar0 = bar0_addr, size = bar0_size);
 
         // Initialize NVMe hardware
         let ctrl = init_nvme_hardware(bar0_addr, bar0_size)?;

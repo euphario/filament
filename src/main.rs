@@ -698,6 +698,7 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
 
     // If task has an exception channel, freeze it instead of killing.
     // Send fault info on the channel so supervisor can inspect and decide.
+    // If delivery fails (channel closed/broken), fall through to normal kill.
     if let Some((parent_task_id, channel_id)) = exc_channel {
         // Build ExceptionInfo message: [pid:4][fault_type:1][pad:3][esr:8][elr:8][far:8] = 32 bytes
         let mut info = [0u8; 32];
@@ -715,48 +716,51 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
         info[16..24].copy_from_slice(&elr.to_le_bytes());
         info[24..32].copy_from_slice(&far.to_le_bytes());
 
-        // Send on the exception channel
+        // Send on the exception channel — if this fails, fall through to kill
         let msg = kernel::ipc::Message::data(0, &info);
-        let _ = kernel::ipc::send(channel_id, msg, 0);
+        let send_ok = kernel::ipc::send(channel_id, msg, 0).is_ok();
 
-        // Freeze the task
-        unsafe {
-            let mut sched = kernel::task::scheduler();
-            let current_slot = kernel::task::current_slot();
-            if let Some(task) = sched.task_mut(current_slot) {
-                let _ = task.freeze(esr, elr, far);
-            }
+        if send_ok {
+            // Freeze the task
+            unsafe {
+                let mut sched = kernel::task::scheduler();
+                let current_slot = kernel::task::current_slot();
+                if let Some(task) = sched.task_mut(current_slot) {
+                    let _ = task.freeze(esr, elr, far);
+                }
 
-            // Wake parent if blocked
-            if let Some(parent_slot) = sched.slot_by_pid(parent_task_id) {
-                if let Some(parent) = sched.task_mut(parent_slot) {
-                    if parent.is_blocked() {
-                        let _ = parent.wake();
+                // Wake parent if blocked
+                if let Some(parent_slot) = sched.slot_by_pid(parent_task_id) {
+                    if let Some(parent) = sched.task_mut(parent_slot) {
+                        if parent.is_blocked() {
+                            let _ = parent.wake();
+                        }
                     }
                 }
             }
-        }
 
-        // Wake parent via ObjectService channel wake (for Mux)
-        {
-            let wake_list = kernel::object_service::object_service().wake_channel(
-                parent_task_id, channel_id, abi::mux_filter::READABLE,
-            );
-            kernel::ipc::waker::wake(&wake_list, kernel::ipc::WakeReason::Readable);
-        }
-
-        // Enter idle — idle loop will context_switch to the next ready task
-        let cpu = kernel::percpu::cpu_id();
-        unsafe {
-            let mut sched = kernel::task::scheduler();
-            let my_idle = cpu as usize;
-            kernel::task::set_current_slot(my_idle);
-            if let Some(task) = sched.task_mut(my_idle) {
-                let _ = task.set_running(cpu);
+            // Wake parent via ObjectService channel wake (for Mux)
+            {
+                let wake_list = kernel::object_service::object_service().wake_channel(
+                    parent_task_id, channel_id, abi::mux_filter::READABLE,
+                );
+                kernel::ipc::waker::wake(&wake_list, kernel::ipc::WakeReason::Readable);
             }
-            drop(sched);
+
+            // Enter idle — idle loop will context_switch to the next ready task
+            let cpu = kernel::percpu::cpu_id();
+            unsafe {
+                let mut sched = kernel::task::scheduler();
+                let my_idle = cpu as usize;
+                kernel::task::set_current_slot(my_idle);
+                if let Some(task) = sched.task_mut(my_idle) {
+                    let _ = task.set_running(cpu);
+                }
+                drop(sched);
+            }
+            enter_idle_with_correct_stack(cpu);
         }
-        enter_idle_with_correct_stack(cpu);
+        // send_ok == false: fall through to normal kill path below
     }
 
     // Decode exception class

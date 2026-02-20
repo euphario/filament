@@ -40,7 +40,7 @@ use userlib::bus::{
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, io_status};
 use userlib::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, unotice, udebug, uerror};
 
 const FAT_CACHE_ENTRIES: usize = 8192;
 const MAX_OPEN_FILES: usize = 16;
@@ -223,7 +223,7 @@ impl FatfsDriver {
             return false;
         }
 
-        uinfo!("fatfsd", "fat16_parsed";
+        udebug!("fatfsd", "fat16_parsed";
             bps = self.bytes_per_sector as u32,
             spc = self.sectors_per_cluster as u32,
             root_entries = self.root_entry_count as u32,
@@ -265,7 +265,7 @@ impl FatfsDriver {
         }
 
         self.fat_cache_valid = true;
-        uinfo!("fatfsd", "fat_cached"; entries = cached as u32);
+        udebug!("fatfsd", "fat_cached"; entries = cached as u32);
         true
     }
 
@@ -926,7 +926,7 @@ impl FatfsDriver {
                                 uerror!("fatfsd", "port_register_failed"; shmem_id = vfs_shmem_id);
                             }
 
-                            uinfo!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
+                            unotice!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
 
                             // Register mount with devd so clients can resolve paths
                             // Strip trailing ':' from port name for mount prefix,

@@ -4,7 +4,7 @@
 //! Contains both the legacy MCU TXD (for firmware download and WA commands)
 //! and the UNI TXD (for post-firmware init commands).
 
-use userlib::{uinfo, uerror, uwarn, udebug};
+use userlib::{uerror, uwarn, udebug};
 use crate::regs::*;
 use crate::device::Mt7996Dev;
 use crate::dma::{TxRing, Mt76Desc, dma_wmb, flush_buffer};
@@ -538,7 +538,7 @@ impl Mt7996Dev {
                     let rxd_seq = unsafe { core::ptr::read_volatile(buf_ptr.add(37)) };
                     let rxd_eid = unsafe { core::ptr::read_volatile(buf_ptr.add(36)) };
                     let rxd_ext_eid = unsafe { core::ptr::read_volatile(buf_ptr.add(40)) };
-                    uinfo!("mcu", "rx_resp"; snap = pre_send_dma_idx, seq = rxd_seq, eid = rxd_eid, ext = rxd_ext_eid, w11 = w11, w12 = w12);
+                    udebug!("mcu", "rx_resp"; snap = pre_send_dma_idx, seq = rxd_seq, eid = rxd_eid, ext = rxd_ext_eid, w11 = w11, w12 = w12);
                 } else {
                     udebug!("mcu", "rx_ok"; snap = pre_send_dma_idx, now = dma_idx);
                 }
@@ -989,7 +989,7 @@ impl Mt7996Dev {
         if ring.rx_buf_virt != 0 {
             let buf_ptr = (ring.rx_buf_virt + rx_snap as u64 * ring.rx_buf_size as u64) as *const u8;
             let free_blocks = unsafe { core::ptr::read_volatile(buf_ptr.add(52)) };
-            uinfo!("mcu", "efuse_free_blocks"; count = free_blocks);
+            udebug!("mcu", "efuse_free_blocks"; count = free_blocks);
             Ok(free_blocks)
         } else {
             // No RX buffer info — can't read response, assume eFuse empty
@@ -1044,7 +1044,7 @@ impl Mt7996Dev {
         let w3 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(56) as *const u32)) };
         let w4 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(60) as *const u32)) };
         let w5 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(64) as *const u32)) };
-        uinfo!("mcu", "efuse_resp_dump"; snap = rx_snap, w0 = w0, w1 = w1, w2 = w2, w3 = w3, w4 = w4, w5 = w5);
+        udebug!("mcu", "efuse_resp_dump"; snap = rx_snap, w0 = w0, w1 = w1, w2 = w2, w3 = w3, w4 = w4, w5 = w5);
 
         // Response layout after RXD (44 bytes):
         //   mt7996_mcu_uni_event: {cid(1), rsv(3), status(4)} = 8 bytes
@@ -1084,7 +1084,7 @@ impl Mt7996Dev {
         let eeprom_size = eeprom.len();
         let total_pages = (eeprom_size + PER_PAGE_SIZE - 1) / PER_PAGE_SIZE; // DIV_ROUND_UP
 
-        uinfo!("mcu", "eeprom_flash"; size = eeprom_size as u32, pages = total_pages as u32);
+        udebug!("mcu", "eeprom_flash"; size = eeprom_size as u32, pages = total_pages as u32);
 
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
 
@@ -1127,7 +1127,7 @@ impl Mt7996Dev {
             *seq = seq.wrapping_add(1);
         }
 
-        uinfo!("mcu", "eeprom_flash_done");
+        udebug!("mcu", "eeprom_flash_done");
         Ok(())
     }
 
@@ -1771,7 +1771,7 @@ impl Mt7996Dev {
             *seq = seq.wrapping_add(1);
         }
 
-        uinfo!("mcu", "txbf_init_ok");
+        udebug!("mcu", "txbf_init_ok");
         Ok(())
     }
 

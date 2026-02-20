@@ -532,6 +532,41 @@ pub(super) fn sys_set_exception_channel(child_pid: u32, channel_handle: u32) -> 
     })
 }
 
+/// Set resource limits on a child task.
+///
+/// Args: child_pid, max_channels, max_ports, max_shmem, max_children
+/// Caller must be parent of child_pid.
+pub(super) fn sys_set_resource_limits(child_pid: u32, max_channels: u16, max_ports: u16, max_shmem: u16, max_children: u16) -> i64 {
+    use crate::kernel::task;
+
+    let caller_slot = task::current_slot();
+    let caller_pid = task::with_scheduler(|sched| {
+        sched.task(caller_slot).map(|t| t.id).unwrap_or(0)
+    });
+    if caller_pid == 0 {
+        return KernelError::NoProcess.to_errno();
+    }
+
+    task::with_scheduler(|sched| {
+        let child_slot = match sched.slot_by_pid(child_pid) {
+            Some(s) => s,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+        let child = match sched.task_mut(child_slot) {
+            Some(t) => t,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+        if child.parent_id != caller_pid {
+            return KernelError::PermDenied.to_errno();
+        }
+        child.limits.max_channels = max_channels;
+        child.limits.max_ports = max_ports;
+        child.limits.max_shmem = max_shmem;
+        child.limits.max_children = max_children;
+        0
+    })
+}
+
 /// Resume or kill a frozen (faulted) child task.
 ///
 /// Args: child_pid, action (0=resume, 1=kill)

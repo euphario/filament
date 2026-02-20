@@ -61,7 +61,7 @@ pub use controller::BusController;
 
 use super::ipc::{ChannelId, Message};
 use super::process::Pid;
-use crate::{kinfo, kdebug, kerror, print_direct};
+use crate::{kdebug, kerror, print_direct};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum number of buses (MT7988A needs 10: 4xPCIe + 2xUSB + eth + platform + uart + klog)
@@ -397,7 +397,7 @@ pub fn continue_init() -> bool {
                             }
                         }
                     });
-                    kinfo!("bus", "pci_enumerated"; devices = count as u64, bus_idx = bus_index as u64);
+                    crate::knotice!("bus", "pci_enumerated"; devices = count as u64, bus_idx = bus_index as u64);
                 }
 
                 // Return true = more work might remain

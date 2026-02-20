@@ -56,6 +56,7 @@ pub mod syscall {
     pub const SET_MODULE_LEVEL: u64 = 87;
     pub const SET_EXCEPTION_CHANNEL: u64 = 88;
     pub const EXCEPTION_RESUME: u64 = 89;
+    pub const SET_RESOURCE_LIMITS: u64 = 90;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;

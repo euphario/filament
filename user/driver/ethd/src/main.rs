@@ -19,7 +19,7 @@ use userlib::bus::{
 };
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, IoCqe, io_op, io_status, side_msg, side_status, SideEntry};
-use userlib::{uinfo, udebug, uerror, uwarn};
+use userlib::{uinfo, unotice, udebug, uerror, uwarn};
 
 // =============================================================================
 // Hardware Constants
@@ -3485,13 +3485,13 @@ impl Driver for EthDriver {
         meta.mac.copy_from_slice(&self.mac);
         info.set_network_metadata(meta);
         let _ = ctx.register_port_with_info(&info, shmem_id);
-        uinfo!("ethd", "registered"; name = "net:0");
+        unotice!("ethd", "registered"; name = "net:0");
 
         // Register switch:0 port to trigger switchd spawn
         let mut switch_info = PortInfo::new(b"switch:0", PortClass::Network);
         switch_info.port_subclass = port_subclass::NET_SWITCH;
         let _ = ctx.register_port_with_info(&switch_info, 0);
-        uinfo!("ethd", "registered"; name = "switch:0");
+        unotice!("ethd", "registered"; name = "switch:0");
 
         // Start RX poll timer (10ms)
         if let Ok(mut timer) = Timer::new() {

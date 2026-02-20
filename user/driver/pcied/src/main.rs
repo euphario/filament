@@ -15,7 +15,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, unotice, udebug, uerror};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId, ConfigKey,
     bus_msg, PortInfo, PortClass, PortMetadata, port_subclass,
@@ -236,7 +236,7 @@ impl Driver for PcieDriver {
                 self.count = count;
                 uinfo!("pcied", "pci_devices"; count = count as u32);
             } else {
-                uinfo!("pcied", "no_devices";);
+                unotice!("pcied", "no_devices";);
             }
         }
 
@@ -261,7 +261,7 @@ impl Driver for PcieDriver {
 
             // Skip HIF2 companion devices — managed through primary driver's BAR
             if is_hif2_companion(dev.vendor_id, dev.device_id) {
-                uinfo!("pcied", "skip_hif2"; device_id = dev.device_id);
+                udebug!("pcied", "skip_hif2"; device_id = dev.device_id);
                 continue;
             }
 
@@ -298,7 +298,7 @@ impl Driver for PcieDriver {
 
             let _ = ctx.register_port_with_info(&info, 0);
 
-            uinfo!("pcied", "port_registered";
+            unotice!("pcied", "port_registered";
                 name = core::str::from_utf8(name).unwrap_or("?"),
                 bar0 = userlib::ulog::hex64(dev.resource0),
                 size = userlib::ulog::hex32(dev.resource1));

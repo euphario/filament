@@ -824,6 +824,33 @@ impl Shmem {
         })
     }
 
+    /// Wrap a transferred shmem handle (received via handle transfer).
+    /// Maps the shmem and queries its physical address and size.
+    pub fn from_transferred_handle(handle: ObjHandle) -> SysResult<Self> {
+        let vaddr = map(handle, 0)?;
+        if vaddr == 0 {
+            let _ = close(handle);
+            return Err(SysError::from_errno(-12)); // ENOMEM
+        }
+        let mut info = [0u8; 16];
+        read(handle, &mut info)?;
+        let paddr = u64::from_le_bytes([
+            info[0], info[1], info[2], info[3],
+            info[4], info[5], info[6], info[7],
+        ]);
+        let size = u64::from_le_bytes([
+            info[8], info[9], info[10], info[11],
+            info[12], info[13], info[14], info[15],
+        ]) as usize;
+        Ok(Self {
+            handle,
+            shmem_id: 0, // Not needed — handle already in our table
+            vaddr,
+            paddr,
+            size,
+        })
+    }
+
     pub fn handle(&self) -> ObjHandle { self.handle }
     pub fn shmem_id(&self) -> u32 { self.shmem_id }
     pub fn vaddr(&self) -> u64 { self.vaddr }

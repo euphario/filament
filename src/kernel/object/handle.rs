@@ -82,9 +82,9 @@ pub fn default_rights(obj_type: ObjectType) -> HandleRights {
         ObjectType::DmaPool => HandleRights(
             HandleRights::READ.0 | HandleRights::MAP.0
         ),
-        // Shared memory: read + write + map
+        // Shared memory: read + write + map + grant (transferable via IPC)
         ObjectType::Shmem => HandleRights(
-            HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::MAP.0
+            HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::MAP.0 | HandleRights::GRANT.0
         ),
         // Mux: read (poll) + write (add/remove watch)
         ObjectType::Mux => HandleRights(

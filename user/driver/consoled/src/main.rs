@@ -30,7 +30,7 @@ use userlib::bus::{
     PortInfo, PortClass, PortState, port_subclass,
 };
 use userlib::bus_runtime::driver_main;
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, unotice, uerror};
 
 // =============================================================================
 // Handle Tags
@@ -280,12 +280,13 @@ impl ConsoledDriver {
                         }
                     };
 
-                    // Allow shell to map the ring using its actual PID
-                    ring.allow(client_pid);
-
-                    // Send shmem_id to shell via channel
+                    // Grant shell access to shmem and send shmem_id
+                    if !ring.allow(client_pid) {
+                        uerror!("consoled", "shmem_allow_failed";);
+                        return;
+                    }
                     let shmem_id = ring.shmem_id();
-                    let mut msg = [0u8; 16];
+                    let mut msg = [0u8; 12];
                     msg[..4].copy_from_slice(b"RING");
                     msg[4..8].copy_from_slice(&shmem_id.to_le_bytes());
                     msg[8..10].copy_from_slice(&self.cols.to_le_bytes());
@@ -542,7 +543,7 @@ impl Driver for ConsoledDriver {
         let uart_path = b"/uart:0";
         match ctx.claim_kernel_bus(uart_path) {
             Ok((_bus_id, _info)) => {
-                uinfo!("consoled", "uart_claimed";);
+                unotice!("consoled", "uart_claimed";);
             }
             Err(e) => {
                 uerror!("consoled", "uart_claim_failed"; err = e as u8);

@@ -118,6 +118,10 @@ pub struct Service {
     pub priority: u8,
     /// Unique link ID tying this service to its trigger port (0 = unlinked)
     pub link_id: u32,
+    /// Exception channel handle (raw) — parent side, watched in Mux (0 = none)
+    pub exc_channel: u32,
+    /// Exception channel handle (raw) — child side, kept alive for kernel delivery (0 = none)
+    pub exc_channel_child: u32,
 }
 
 impl Service {
@@ -135,6 +139,8 @@ impl Service {
             caps: 0,
             priority: abi::priority::INHERIT,
             link_id: 0,
+            exc_channel: 0,
+            exc_channel_child: 0,
         }
     }
 
@@ -216,6 +222,17 @@ impl ServiceRegistry {
             services: [const { None }; MAX_SERVICES],
             count: 0,
         }
+    }
+
+    /// Find a service by its exception channel handle
+    pub fn find_by_exc_channel(&self, handle_raw: u32) -> Option<usize> {
+        if handle_raw == 0 { return None; }
+        (0..self.count).find(|&i| {
+            self.services[i]
+                .as_ref()
+                .map(|s| s.exc_channel == handle_raw)
+                .unwrap_or(false)
+        })
     }
 
     /// Find an empty service slot

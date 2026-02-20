@@ -4,7 +4,7 @@
 //! Contains embedded firmware bytes, binary format parsers, and the
 //! load_firmware() entry point.
 
-use userlib::{uinfo, uerror, udebug};
+use userlib::{unotice, uerror, udebug};
 use crate::regs::*;
 use crate::device::Mt7996Dev;
 use crate::dma::TxRing;
@@ -106,7 +106,7 @@ impl Mt7996Dev {
     /// Load patch firmware
     /// From Linux mcu.c:2208-2296
     fn load_patch(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing, fw_buf: &[u8], seq: &mut u8) -> Result<(), i32> {
-        uinfo!("fw", "load_patch_start");
+        udebug!("fw", "load_patch_start");
 
         let fw_state = self.mt76_rr(MT_TOP_MISC);
         udebug!("fw", "fw_state_before"; val = fw_state);
@@ -129,7 +129,7 @@ impl Mt7996Dev {
         let hw_ver = u32::from_be(hdr.hw_sw_ver);
         let patch_ver = u32::from_be(hdr.patch_ver);
         let n_region = u32::from_be(hdr.desc.n_region);
-        uinfo!("fw", "patch_header"; hw = hw_ver, ver = patch_ver, regions = n_region);
+        udebug!("fw", "patch_header"; hw = hw_ver, ver = patch_ver, regions = n_region);
 
         // Get semaphore (MCU command → mcu_ring)
         self.mcu_patch_sem_ctrl(mcu_ring, true, *seq)?;
@@ -196,14 +196,14 @@ impl Mt7996Dev {
 
         let fwdl_cpu = self.mt76_rr(fwdl_ring.regs_base + MT_QUEUE_CPU_IDX);
         let fwdl_dma = self.mt76_rr(fwdl_ring.regs_base + MT_QUEUE_DMA_IDX);
-        uinfo!("fw", "load_patch_done"; cpu = fwdl_cpu, dma = fwdl_dma);
+        udebug!("fw", "load_patch_done"; cpu = fwdl_cpu, dma = fwdl_dma);
         Ok(())
     }
 
     /// Load RAM firmware (WM, DSP, or WA)
     /// Exact translation of Linux mt7996_mcu_send_ram_firmware() (mcu.c:3032-3083).
     fn load_ram(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing, fw_buf: &[u8], _name: &str, fw_start_bits: u32, seq: &mut u8) -> Result<(), i32> {
-        uinfo!("fw", "load_ram_start"; size = fw_buf.len());
+        udebug!("fw", "load_ram_start"; size = fw_buf.len());
 
         if fw_buf.len() < core::mem::size_of::<FwTrailer>() {
             uerror!("fw", "ram_too_small"; size = fw_buf.len());
@@ -215,7 +215,7 @@ impl Mt7996Dev {
 
         let chip_id = trailer.chip_id;
         let n_region = trailer.n_region;
-        uinfo!("fw", "ram_header"; chip_id = chip_id, regions = n_region);
+        udebug!("fw", "ram_header"; chip_id = chip_id, regions = n_region);
 
         let region_size = core::mem::size_of::<FwRegion>();
         let regions_end = trailer_offset;
@@ -263,7 +263,7 @@ impl Mt7996Dev {
         self.mcu_start_firmware(mcu_ring, false, option, override_addr, *seq)?;
         *seq = seq.wrapping_add(1);
 
-        uinfo!("fw", "load_ram_done");
+        udebug!("fw", "load_ram_done");
         Ok(())
     }
 
@@ -272,33 +272,33 @@ impl Mt7996Dev {
     /// Loads patch → WM → DSP → WA, then polls for FW_STATE_RDY(7).
     /// After firmware boots, runs post-init MCU commands.
     pub fn load_firmware(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing) -> Result<(), i32> {
-        uinfo!("fw", "load_firmware_start");
+        unotice!("fw", "load_firmware_start");
 
         let mut seq: u8 = 1;
 
         let fw_state = self.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
-        uinfo!("fw", "fw_state_before"; val = fw_state);
+        udebug!("fw", "fw_state_before"; val = fw_state);
 
         // 1. Load patch
-        uinfo!("fw", "load_patch"; size = FW_ROM_PATCH.len() as u32);
+        udebug!("fw", "load_patch"; size = FW_ROM_PATCH.len() as u32);
         self.load_patch(mcu_ring, fwdl_ring, FW_ROM_PATCH, &mut seq)?;
 
         userlib::delay_ms(100);
 
         // 2. Load WM
-        uinfo!("fw", "load_wm"; size = FW_WM.len() as u32);
+        udebug!("fw", "load_wm"; size = FW_WM.len() as u32);
         self.load_ram(mcu_ring, fwdl_ring, FW_WM, "WM", 0, &mut seq)?;
 
         userlib::delay_ms(100);
 
         // 3. Load DSP
-        uinfo!("fw", "load_dsp"; size = FW_DSP.len() as u32);
+        udebug!("fw", "load_dsp"; size = FW_DSP.len() as u32);
         self.load_ram(mcu_ring, fwdl_ring, FW_DSP, "DSP", fw_start::WORKING_PDA_DSP, &mut seq)?;
 
         userlib::delay_ms(100);
 
         // 4. Load WA
-        uinfo!("fw", "load_wa"; size = FW_WA.len() as u32);
+        udebug!("fw", "load_wa"; size = FW_WA.len() as u32);
         self.load_ram(mcu_ring, fwdl_ring, FW_WA, "WA", fw_start::WORKING_PDA_CR4, &mut seq)?;
 
         // Wait for fw_state=7
@@ -310,14 +310,14 @@ impl Mt7996Dev {
             }
             userlib::delay_ms(20);
         }
-        uinfo!("fw", "fw_state_final"; val = fw_state);
+        udebug!("fw", "fw_state_final"; val = fw_state);
 
         if fw_state != 7 {
             uerror!("fw", "load_firmware_incomplete"; state = fw_state);
             return Err(-1);
         }
 
-        uinfo!("fw", "load_firmware_success");
+        unotice!("fw", "load_firmware_success");
         Ok(())
     }
 }

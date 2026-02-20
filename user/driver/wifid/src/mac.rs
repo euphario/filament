@@ -4,7 +4,7 @@
 //! Per-band register writes, WTBL clearing, RRO module setup, HIF TXD
 //! version, and basic rate table programming.
 
-use userlib::{uinfo, udebug};
+use userlib::udebug;
 use crate::regs::*;
 use crate::device::Mt7996Dev;
 use crate::dma::TxRing;
@@ -184,7 +184,7 @@ impl Mt7996Dev {
 
         // for (i = 0; i < mt7996_wtbl_size(dev); i++)
         //     mt7996_mac_wtbl_update(dev, i, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
-        uinfo!("mac", "wtbl_clear"; count = wtbl_size);
+        udebug!("mac", "wtbl_clear"; count = wtbl_size);
         for i in 0..wtbl_size {
             self.mac_wtbl_update(i, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
         }
@@ -227,7 +227,7 @@ impl Mt7996Dev {
         // mt7996_mac_init_basic_rates(dev);
         self.mac_init_basic_rates(wm_ring, seq)?;
 
-        uinfo!("mac", "mac_init_done");
+        udebug!("mac", "mac_init_done");
         Ok(())
     }
 }

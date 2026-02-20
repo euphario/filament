@@ -19,7 +19,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::{uinfo, uwarn, uerror, udebug};
+use userlib::{uinfo, unotice, uwarn, uerror, udebug};
 use userlib::mmio::{MmioRegion, DmaPool};
 use userlib::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, ConfigKey};
 use userlib::bus_runtime::driver_main;
@@ -99,10 +99,10 @@ impl WifiDriver {
             meta[8], meta[9], meta[10], meta[11],
         ]) as u64;
 
-        uinfo!("wifid", "device_found"; bar0 = bar0_addr, size = bar0_size);
+        unotice!("wifid", "device_found"; bar0 = bar0_addr, size = bar0_size);
 
         // Step 2: Map BAR0
-        uinfo!("wifid", "map_bar0"; addr = bar0_addr, size_kb = bar0_size / 1024);
+        udebug!("wifid", "map_bar0"; addr = bar0_addr, size_kb = bar0_size / 1024);
         let bar0 = MmioRegion::open(bar0_addr, bar0_size).ok_or_else(|| {
             uerror!("wifid", "mmap_device_failed");
             BusError::Internal
@@ -119,7 +119,7 @@ impl WifiDriver {
         // Step 3: Allocate DMA descriptor memory
         // CRITICAL: Descriptor rings MUST be in LOW memory (< 4GB) because DESC_BASE is 32-bit!
         // Only TX/RX BUFFERS can use HIGH (36-bit) addresses via buf0/buf1 fields.
-        uinfo!("wifid", "alloc_dma_mem");
+        udebug!("wifid", "alloc_dma_mem");
 
         // Calculate descriptor memory needed for Linux-matching ring sizes:
         // TX: BAND0(2048) + MCU_WM(256) + MCU_WA(256) + FWDL(128) = 2688 × 16 = 43KB
@@ -171,7 +171,7 @@ impl WifiDriver {
     // Source: pci.c (probe) + init.c:mt7996_init_hardware()
     // ========================================================================
 
-    uinfo!("wifid", "init_hw_start");
+    udebug!("wifid", "init_hw_start");
 
     // Fix HOST_CONFIG to match OpenWRT (bits 8,10-14)
     let host_cfg_initial = dev.mt76_rr(0xd7030);
@@ -189,13 +189,13 @@ impl WifiDriver {
 
     // Read MT_HW_REV via L1 remap (mmio.c:672)
     let hw_rev = dev.mt76_rr_remap(MT_HW_REV);
-    uinfo!("wifid", "hw_rev"; rev = hw_rev & 0xff);
+    unotice!("wifid", "hw_rev"; rev = hw_rev & 0xff);
 
     // Clear interrupts before WFSYS reset (Linux armbian_golden.log line 13)
     dev.mt76_wr(MT_INT_MASK_CSR, 0);
 
     // WFSYS Reset — ensure clean hardware state (init.c:762-769)
-    uinfo!("wifid", "wfsys_reset");
+    udebug!("wifid", "wfsys_reset");
     dev.mt7996_wfsys_reset();
 
     // PCIe setup (pci.c:mt7996_pci_probe, AFTER wfsys_reset)
@@ -211,7 +211,7 @@ impl WifiDriver {
     dev.mt76_wr(MT_INT_SOURCE_CSR, !0u32);
 
     // DMA init (init.c — dma_init() BEFORE mcu_init())
-    uinfo!("wifid", "dma_init");
+    udebug!("wifid", "dma_init");
     let (mcu_wa_rx_buf_virt, mcu_wa_rx_buf_size, band0_rx_info) = dev.mt7996_dma_init(desc_phys, desc_virt, DESC_MEM_SIZE, rx_buf_phys, rx_buf_virt, RX_BUF_POOL_SIZE);
 
     // Trace RX DMA_IDX at every step to prove DMA is working
@@ -226,28 +226,28 @@ impl WifiDriver {
     };
 
     let rx = trace_rx();
-    uinfo!("wifid", "rx_trace_dma_init"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
+    udebug!("wifid", "rx_trace_dma_init"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
 
     // MCU init (mcu.c:3299-3312 — SWDEF_MODE then driver_own)
-    uinfo!("wifid", "mcu_init");
+    udebug!("wifid", "mcu_init");
     dev.mt76_wr(MT_SWDEF_MODE, MT_SWDEF_NORMAL_MODE);
 
     // Band 0 driver_own
     let _ = dev.mt7996_driver_own(0);
     let rx = trace_rx();
-    uinfo!("wifid", "rx_trace_drv_own0"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
+    udebug!("wifid", "rx_trace_drv_own0"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
 
     // Band 1 driver_own (HIF2)
     let _ = dev.mt7996_driver_own(1);
     let rx = trace_rx();
-    uinfo!("wifid", "rx_trace_drv_own1"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
+    udebug!("wifid", "rx_trace_drv_own1"; q0 = rx[0], q1 = rx[1], q2 = rx[2], q3 = rx[3]);
 
     // Check firmware state after MCU init
     let fw_state = dev.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
-    uinfo!("wifid", "fw_state_after_mcu"; val = fw_state);
+    udebug!("wifid", "fw_state_after_mcu"; val = fw_state);
 
     // Firmware loading
-    uinfo!("wifid", "firmware_load_start");
+    unotice!("wifid", "firmware_load_start");
 
     let tx_ring_base = MT_WFDMA0_BASE + 0x300;
 
@@ -358,7 +358,7 @@ impl WifiDriver {
     mcu_ring.rx_buf_virt = mcu_wa_rx_buf_virt;
     mcu_ring.rx_buf_size = mcu_wa_rx_buf_size;
 
-    uinfo!("mcu", "post_init_start");
+    udebug!("mcu", "post_init_start");
     let mut seq: u8 = 1;
 
     let mcu_err = |_e: i32| { BusError::Internal };
@@ -388,7 +388,7 @@ impl WifiDriver {
     dev.mcu_wa_cmd(&mut wa_ring, mcu::MCU_WA_PARAM_RED, 0, 0, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
-    uinfo!("mcu", "mcu_init_ok");
+    udebug!("mcu", "mcu_init_ok");
 
     // ====================================================================
     // MAC initialization — register writes + MCU commands
@@ -404,12 +404,12 @@ impl WifiDriver {
 
     if free_blocks >= 59 {
         // eFuse empty — upload embedded mt7996_eeprom.bin via flash/buffer mode
-        uinfo!("wifid", "eeprom_flash_upload"; size = firmware::FW_EEPROM.len() as u32);
+        udebug!("wifid", "eeprom_flash_upload"; size = firmware::FW_EEPROM.len() as u32);
         dev.mcu_set_eeprom_flash(&mut mcu_ring, firmware::FW_EEPROM, &mut seq).map_err(mcu_err)?;
-        uinfo!("wifid", "eeprom_flash_ok");
+        udebug!("wifid", "eeprom_flash_ok");
     } else {
         // eFuse has calibration data — use eFuse mode
-        uinfo!("wifid", "eeprom_efuse_mode"; free = free_blocks);
+        udebug!("wifid", "eeprom_efuse_mode"; free = free_blocks);
         dev.mcu_set_eeprom(&mut mcu_ring, seq).map_err(mcu_err)?;
         seq = seq.wrapping_add(1);
     }
@@ -426,13 +426,13 @@ impl WifiDriver {
             let tx_path_b0 = (wifi_conf[1] >> 3) & 0x7;
             let rx_path_b0 = wifi_conf[3] & 0x7;
             let nss_b0 = (wifi_conf[4] >> 3) & 0x7;
-            uinfo!("wifid", "efuse_wifi_conf"; tx = tx_path_b0 as u32, rx = rx_path_b0 as u32, nss = nss_b0 as u32);
+            udebug!("wifid", "efuse_wifi_conf"; tx = tx_path_b0 as u32, rx = rx_path_b0 as u32, nss = nss_b0 as u32);
             // Also dump device ID from eFuse offset 0
             match dev.mcu_get_eeprom(&mut mcu_ring, 0, seq) {
                 Ok(id_block) => {
                     seq = seq.wrapping_add(1);
                     let dev_id = u16::from_le_bytes([id_block[0], id_block[1]]);
-                    uinfo!("wifid", "efuse_dev_id"; id = dev_id as u32);
+                    udebug!("wifid", "efuse_dev_id"; id = dev_id as u32);
                 }
                 Err(e) => {
                     uwarn!("wifid", "efuse_dev_id_read_fail"; err = e);
@@ -451,7 +451,7 @@ impl WifiDriver {
         Ok(regval) => {
             let adie_id = (regval >> 16) & 0xFFFF;
             let adie_ver = regval & 0xFFFF;
-            uinfo!("wifid", "adie_chip_id"; id = adie_id as u32, ver = adie_ver as u32);
+            udebug!("wifid", "adie_chip_id"; id = adie_id as u32, ver = adie_ver as u32);
         }
         Err(e) => {
             uwarn!("wifid", "adie_read_fail"; err = e);
@@ -462,7 +462,7 @@ impl WifiDriver {
     // Read GPIO pad for variant detection — init.c:1160
     let pad_gpio = dev.reg_rr(MT_PAD_GPIO);
     let adie_comb = (pad_gpio >> 15) & 0x3;
-    uinfo!("wifid", "pad_gpio"; val = pad_gpio, adie_comb = adie_comb);
+    udebug!("wifid", "pad_gpio"; val = pad_gpio, adie_comb = adie_comb);
 
     // Full MAC init: WTBL clear, RRO(WM), HIF TXD(WA), per-band regs, basic rates(WM)
     dev.mac_init(&mut mcu_ring, &mut wa_ring, &mut seq).map_err(mcu_err)?;
@@ -482,7 +482,7 @@ impl WifiDriver {
         dev.mcu_set_thermal_protect(&mut mcu_ring, band, true, seq).map_err(mcu_err)?;
         seq = seq.wrapping_add(1);
     }
-    uinfo!("wifid", "thermal_protect_ok");
+    udebug!("wifid", "thermal_protect_ok");
 
     // Thermal throttling: 100% (full power — throttle only on overtemp)
     // MCU_WM_UNI_CMD(THERMAL) — WM-only, uses mcu_ring
@@ -490,7 +490,7 @@ impl WifiDriver {
         dev.mcu_set_thermal_throttling(&mut mcu_ring, band, 100, seq).map_err(mcu_err)?;
         seq = seq.wrapping_add(1);
     }
-    uinfo!("wifid", "thermal_throttle_ok");
+    udebug!("wifid", "thermal_throttle_ok");
 
     // ====================================================================
     // Band 0 radio startup + interface creation
@@ -502,7 +502,7 @@ impl WifiDriver {
 
     // Log interface creation parameters
     let m = &mac_addr;
-    uinfo!("wifid", "iface_create";
+    udebug!("wifid", "iface_create";
         mac0 = m[0] as u32, mac1 = m[1] as u32, mac2 = m[2] as u32,
         mac3 = m[3] as u32, mac4 = m[4] as u32, mac5 = m[5] as u32,
         band = 0u32, omac = HW_BSSID_0 as u32, bss_idx = 0u32,
@@ -514,14 +514,14 @@ impl WifiDriver {
     // MCU_WM_UNI_CMD(RX_HDR_TRANS) — WM-only, uses mcu_ring
     dev.mcu_set_hdr_trans(&mut mcu_ring, true, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
-    uinfo!("wifid", "hdr_trans_ok");
+    udebug!("wifid", "hdr_trans_ok");
 
     // === Band 0 radio startup — Linux main.c:10-48 mt7996_run() ===
 
     // Enable noise floor measurement — Linux main.c:15 (FIRST thing in mt7996_run!)
     // Enables IPI for CCA (Clear Channel Assessment) — required before TX
     dev.mac_enable_nf(0);
-    uinfo!("wifid", "enable_nf_ok");
+    udebug!("wifid", "enable_nf_ok");
 
     // Configure RX filter — Linux init.c:414 + main.c:676-724 mt7996_configure_filter()
     // Linux default: phy->rxfilter = MT_WF_RFCR_DROP_OTHER_UC (init.c:414)
@@ -542,13 +542,13 @@ impl WifiDriver {
         | MT_WF_RFCR1_DROP_CFEND
         | MT_WF_RFCR1_DROP_CFACK;
     dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR1_OFS), rfcr1_val);
-    uinfo!("wifid", "rfcr_ok"; rfcr = rfcr_val, rfcr1 = rfcr1_val);
+    udebug!("wifid", "rfcr_ok"; rfcr = rfcr_val, rfcr1 = rfcr1_val);
 
     // RTS threshold (band 0) — Linux main.c:17
     // MCU_WM_UNI_CMD(BAND_CONFIG) — WM-only, uses mcu_ring
     dev.mcu_set_rts_thresh(&mut mcu_ring, 0, 0x92b, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
-    uinfo!("wifid", "rts_thresh_ok");
+    udebug!("wifid", "rts_thresh_ok");
 
     // Radio ON — Linux main.c:21 (before RX_PATH in mt7996_run!)
     // MCU_WM_UNI_CMD(BAND_CONFIG) — WM-only, uses mcu_ring
@@ -558,36 +558,36 @@ impl WifiDriver {
     // RX path — Linux main.c:25 (after radio enable in mt7996_run)
     dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_RX_PATH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
-    uinfo!("wifid", "rx_path_init_ok");
+    udebug!("wifid", "rx_path_init_ok");
 
     // === Interface creation (band 0) ===
     // Linux: mt7996_vif_link_add() → add_dev_info + add_bss_info + add_sta
 
     // DEV_INFO: activate OMAC on band 0 — Linux mcu.c:2623
-    uinfo!("wifid", "dev_info_send"; band = 0u32, omac = HW_BSSID_0 as u32, active = 1u32);
+    udebug!("wifid", "dev_info_send"; band = 0u32, omac = HW_BSSID_0 as u32, active = 1u32);
     dev.mcu_add_dev_info(&mut wa_ring, 0, HW_BSSID_0, &mac_addr, true, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
-    uinfo!("wifid", "dev_info_ok");
+    udebug!("wifid", "dev_info_ok");
 
     // BSS_INFO: create BSS on band 0 — Linux mcu.c:1123
     // hw_bss_idx = 0 (matches bss_req_hdr.bss_idx in uni_header)
     // omac_idx = HW_BSSID_0 (OMAC to use, independent of bss_idx)
-    uinfo!("wifid", "bss_info_send"; band = 0u32, omac = HW_BSSID_0 as u32, bss = 0u32, active = 1u32, ch = 1u32);
+    udebug!("wifid", "bss_info_send"; band = 0u32, omac = HW_BSSID_0 as u32, bss = 0u32, active = 1u32, ch = 1u32);
     dev.mcu_add_bss_info(&mut wa_ring, 0, HW_BSSID_0, 0, &mac_addr, true, 1, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
-    uinfo!("wifid", "bss_info_ok");
+    udebug!("wifid", "bss_info_ok");
 
     // STA_REC: add broadcast/multicast STA — Linux mcu.c:2438
     // bss_idx = 0 (must match BSS_INFO's bss_req_hdr.bss_idx)
     // wlan_idx = MT7996_WTBL_RESERVED - bss_idx = 1087 (Linux: main.c:334)
     // muar_idx(omac_idx param) = 0 (band_idx, Linux: wcid.phy_idx = band_idx)
-    uinfo!("wifid", "sta_rec_send"; bss = 0u32, wlan = MT7996_WTBL_RESERVED as u32, omac = 0u32, newly = 1u32);
+    udebug!("wifid", "sta_rec_send"; bss = 0u32, wlan = MT7996_WTBL_RESERVED as u32, omac = 0u32, newly = 1u32);
     dev.mcu_add_sta(&mut wa_ring, 0, MT7996_WTBL_RESERVED, 0, CONN_STATE_PORT_SECURE, &mac_addr, true, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
-    uinfo!("wifid", "sta_rec_ok");
+    udebug!("wifid", "sta_rec_ok");
 
     // VOW: assign WCID to BSS group — Linux mcu.c:2504 mt7996_mcu_add_group()
-    uinfo!("wifid", "vow_send"; bss = 0u32, wlan = MT7996_WTBL_RESERVED as u32);
+    udebug!("wifid", "vow_send"; bss = 0u32, wlan = MT7996_WTBL_RESERVED as u32);
     dev.mcu_add_group(&mut wa_ring, 0, MT7996_WTBL_RESERVED, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
@@ -595,7 +595,7 @@ impl WifiDriver {
     // Radio is already ON from mt7996_run() sequence above.
 
     // Channel switch — Linux main.c:561
-    uinfo!("wifid", "chan_switch"; band = 0u32, ch = 1u32, bw = 0u32, ch_band = 0u32);
+    udebug!("wifid", "chan_switch"; band = 0u32, ch = 1u32, bw = 0u32, ch_band = 0u32);
     dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_SWITCH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
@@ -615,7 +615,7 @@ impl WifiDriver {
     let arb_scr = dev.reg_rr(mt_wf_arb(0, MT_ARB_SCR_OFS));
     let rfcr = dev.reg_rr(mt_wf_rmac(0, MT_WF_RFCR_OFS));
     let phyrx_ctrl1 = dev.reg_rr(mt_wf_phyrx_band(0, MT_WF_PHYRX_BAND_RX_CTRL1_OFS));
-    uinfo!("wifid", "radio_diag"; arb = arb_scr, rfcr = rfcr, phyrx = phyrx_ctrl1);
+    udebug!("wifid", "radio_diag"; arb = arb_scr, rfcr = rfcr, phyrx = phyrx_ctrl1);
     if arb_scr & MT_ARB_SCR_RX_DISABLE != 0 {
         uerror!("wifid", "RX_DISABLED_IN_ARB_SCR");
     }
@@ -623,7 +623,7 @@ impl WifiDriver {
         uwarn!("wifid", "TX_DISABLED_IN_ARB_SCR");
     }
 
-    uinfo!("wifid", "band0_up"; channel = 1u32, bw = "20MHz");
+    unotice!("wifid", "band0_up"; channel = 1u32, bw = "20MHz");
 
     // === Band 1 (5GHz) radio startup — diagnostic: check if 5GHz antennas receive ===
     // Same sequence as band 0 but without BSS/STA/beacon (just radio + channel for MIB)
@@ -653,7 +653,7 @@ impl WifiDriver {
     dev.mac_cca_stats_reset(1);
 
     let arb1 = dev.reg_rr(mt_wf_arb(1, MT_ARB_SCR_OFS));
-    uinfo!("wifid", "band1_up"; channel = 36u32, bw = "20MHz", arb = arb1);
+    unotice!("wifid", "band1_up"; channel = 36u32, bw = "20MHz", arb = arb1);
 
     // Program beacon rate table: 1 Mbps CCK (most compatible 2.4GHz rate)
     // MCU_WM_UNI_CMD(FIXED_RATE_TABLE) — WM-only, uses mcu_ring
@@ -672,12 +672,12 @@ impl WifiDriver {
     // Linux re-sends BSS_INFO + STA_REC at this point to confirm BSS on channel.
 
     // Second BSS_INFO: re-send after channel is configured — Linux main.c:859
-    uinfo!("wifid", "bss_info2_send"; band = 0u32, omac = HW_BSSID_0 as u32, bss = 0u32, active = 1u32);
+    udebug!("wifid", "bss_info2_send"; band = 0u32, omac = HW_BSSID_0 as u32, bss = 0u32, active = 1u32);
     dev.mcu_add_bss_info(&mut wa_ring, 0, HW_BSSID_0, 0, &mac_addr, true, 1, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
     // Second STA_REC: update existing BMC STA (newly=false) — Linux main.c:861
-    uinfo!("wifid", "sta_rec2_send"; bss = 0u32, wlan = MT7996_WTBL_RESERVED as u32, newly = 0u32);
+    udebug!("wifid", "sta_rec2_send"; bss = 0u32, wlan = MT7996_WTBL_RESERVED as u32, newly = 0u32);
     dev.mcu_add_sta(&mut wa_ring, 0, MT7996_WTBL_RESERVED, 0, CONN_STATE_PORT_SECURE, &mac_addr, false, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
@@ -689,16 +689,16 @@ impl WifiDriver {
     // MCU_WM_UNI_CMD(EDCA_UPDATE) — WM-only, uses mcu_ring
     // "ensure that enable txcmd_mode after bss_info"
     // bss_idx = 0 (must match BSS_INFO's bss_req_hdr.bss_idx)
-    uinfo!("wifid", "edca_send"; bss = 0u32);
+    udebug!("wifid", "edca_send"; bss = 0u32);
     dev.mcu_set_edca(&mut mcu_ring, 0, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
-    uinfo!("wifid", "edca_ok");
+    udebug!("wifid", "edca_ok");
 
     // Beacon: upload beacon template — Linux main.c:903
-    uinfo!("wifid", "beacon_send"; band = 0u32, omac = HW_BSSID_0 as u32, ch = 1u32, enable = 1u32);
+    udebug!("wifid", "beacon_send"; band = 0u32, omac = HW_BSSID_0 as u32, ch = 1u32, enable = 1u32);
     dev.mcu_set_beacon(&mut wa_ring, 0, HW_BSSID_0, &mac_addr, 1, true, seq).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
-    uinfo!("wifid", "beacon_ok");
+    udebug!("wifid", "beacon_ok");
 
     // Re-set RFCR after beacon enable — Linux mac80211 calls configure_filter()
     // after BSS changes, which re-writes RFCR. Without this, MCU commands during
@@ -1194,9 +1194,9 @@ impl Driver for WifiDriverWrapper {
                 }
                 self.0.radio_on = enable;
                 if enable {
-                    uinfo!("wifid", "radio_enable");
+                    unotice!("wifid", "radio_enable");
                 } else {
-                    uinfo!("wifid", "radio_disable");
+                    unotice!("wifid", "radio_disable");
                 }
                 Self::copy_to_buf(buf, b"OK\n")
             }
@@ -1214,9 +1214,9 @@ impl Driver for WifiDriverWrapper {
                 self.0.seq = self.0.seq.wrapping_add(1);
                 self.0.beacon_on = enable;
                 if enable {
-                    uinfo!("wifid", "beacon_enable");
+                    unotice!("wifid", "beacon_enable");
                 } else {
-                    uinfo!("wifid", "beacon_disable");
+                    unotice!("wifid", "beacon_disable");
                 }
                 Self::copy_to_buf(buf, b"OK\n")
             }
@@ -1263,7 +1263,7 @@ impl Driver for WifiDriverWrapper {
                     self.0.seq = self.0.seq.wrapping_add(1);
                 }
                 self.0.channel = ch;
-                uinfo!("wifid", "channel_switch"; channel = ch as u32);
+                unotice!("wifid", "channel_switch"; channel = ch as u32);
                 Self::copy_to_buf(buf, b"OK\n")
             }
             b"tx_throttle" => {
@@ -1281,7 +1281,7 @@ impl Driver for WifiDriverWrapper {
                     self.0.seq = self.0.seq.wrapping_add(1);
                 }
                 self.0.tx_throttle = throttle;
-                uinfo!("wifid", "thermal_throttle_set"; level = throttle);
+                udebug!("wifid", "thermal_throttle_set"; level = throttle);
                 Self::copy_to_buf(buf, b"OK\n")
             }
             b"rx" => {
@@ -1297,7 +1297,7 @@ impl Driver for WifiDriverWrapper {
                         // Re-arm CPU_IDX to ndesc-1 so DMA has full ring available
                         // (CPU_IDX=0 with DMA_IDX=0 gives DMA zero free slots)
                         dev.mt76_wr(rx.regs_base + MT_QUEUE_CPU_IDX, rx.ndesc - 1);
-                        uinfo!("wifid", "rx_monitor_mode");
+                        udebug!("wifid", "rx_monitor_mode");
                         Self::copy_to_buf(buf, b"OK monitor\n")
                     }
                     b"normal" => {
@@ -1314,14 +1314,14 @@ impl Driver for WifiDriverWrapper {
                             | MT_WF_RFCR1_DROP_CFEND
                             | MT_WF_RFCR1_DROP_CFACK;
                         dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR1_OFS), rfcr1);
-                        uinfo!("wifid", "rx_normal_mode");
+                        udebug!("wifid", "rx_normal_mode");
                         Self::copy_to_buf(buf, b"OK normal\n")
                     }
                     b"reset" => {
                         // Re-initialize all RX descriptors and reset CPU_IDX
                         // This clears stale frames and gives DMA a fresh ring
                         dev.rx_fill(rx);
-                        uinfo!("wifid", "rx_ring_reset");
+                        udebug!("wifid", "rx_ring_reset");
                         Self::copy_to_buf(buf, b"OK reset\n")
                     }
                     _ => Self::copy_to_buf(buf, b"ERR monitor|normal|reset\n"),
@@ -1346,7 +1346,7 @@ impl Driver for WifiDriverWrapper {
                 // Step 3: Send MCU OFFCH_SCAN_CTRL START — mcu.c:3604
                 let ch = self.0.channel;
                 if dev.mcu_background_chain_ctrl(wm_ring, 0, ch, 0, 0, 1, self.0.seq).is_err() {
-                    uinfo!("wifid", "scan_mcu_start_failed");
+                    uwarn!("wifid", "scan_mcu_start_failed");
                     // Continue anyway — scan via monitor mode even if MCU rejects
                 }
                 self.0.seq = self.0.seq.wrapping_add(1);
@@ -1467,7 +1467,7 @@ impl Driver for WifiDriverWrapper {
                     // Log beacon — BSSID, SSID, channel, RSSI
                     let ssid_str = core::str::from_utf8(&ssid_buf[..ssid_len]).unwrap_or("?");
                     let abs_rssi = if rssi < 0 { (-rssi) as u32 } else { rssi as u32 };
-                    uinfo!("scan", "beacon";
+                    udebug!("scan", "beacon";
                         ssid = ssid_str,
                         ch = ie_chan,
                         rssi_neg = abs_rssi,

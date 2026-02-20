@@ -1109,7 +1109,12 @@ fn read_channel_dispatch(
             // Phase 3: Handle transfer — insert received Object into table
             let mut transfer_result: i64 = 0;
             if has_transfer {
-                if let Some((obj_type, rights, object)) = crate::kernel::object_service::take_transfer(channel_id) {
+                if let Some((obj_type, rights, mut object)) = crate::kernel::object_service::take_transfer(channel_id) {
+                    // Fix up transferred shmem: reset sender's vaddr and grant receiver access
+                    if let super::Object::Shmem(ref mut s) = object {
+                        let _ = shmem::grant_access(s.shmem_id(), task_id);
+                        s.set_vaddr(0);
+                    }
                     match table.alloc_with_rights(obj_type, rights, object) {
                         Some(new_handle) => {
                             let handle_bytes = new_handle.0.to_le_bytes();

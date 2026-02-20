@@ -21,7 +21,7 @@
 extern crate abi;
 
 use abi::{PortInfo, PortClass, port_subclass};
-use userlib::{uinfo, udebug, uerror};
+use userlib::{uinfo, unotice, udebug, uerror};
 use userlib::mmio::MmioRegion;
 use userlib::bus::{Driver, BusCtx, BusMsg, Disposition, ConfigKey};
 use userlib::bus_runtime::driver_main;
@@ -342,7 +342,7 @@ impl SwitchDriver {
         }
 
         self.rebuild_port_map();
-        uinfo!("switchd", "group_updated"; group = group_id as u32, ports = port_mask as u32);
+        unotice!("switchd", "group_updated"; group = group_id as u32, ports = port_mask as u32);
         copy_to(buf, b"OK\n")
     }
 

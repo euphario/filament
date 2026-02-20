@@ -32,8 +32,9 @@ mod query;
 mod rules;
 
 use userlib::syscall;
-use userlib::{uinfo, uwarn, uerror, udebug};
-use userlib::ipc::{Port, EventLoop, ObjHandle, Mux, MuxFilter};
+use userlib::{uinfo, unotice, uwarn, uerror, udebug};
+use userlib::ipc::{Port, Channel, EventLoop, ObjHandle, Mux, MuxFilter};
+use userlib::syscall::Handle;
 use userlib::error::{SysError, SysResult};
 use userlib::query::{
     QueryHeader, SpawnChildContext, msg, query_flags,
@@ -752,7 +753,7 @@ impl Devd {
 
         let query_port = Port::register(b"devd-query:")?;
         events.watch(query_port.handle())?;
-        uinfo!("devd", "query_port_init"; handle = query_port.handle().raw());
+        udebug!("devd", "query_port_init"; handle = query_port.handle().raw());
 
         self.query_port = Some(query_port);
         self.events = Some(events);
@@ -808,7 +809,7 @@ impl Devd {
                 continue;
             }
 
-            uinfo!("devd", "bus_port_registered";
+            udebug!("devd", "bus_port_registered";
                 name = core::str::from_utf8(path).unwrap_or("?"),
                 class = port_info.port_class as u16
             );
@@ -940,11 +941,44 @@ impl Devd {
             &kv_refs[..kv_count],
         );
 
+        // Set up exception channel so child faults produce a diagnostic log
+        // instead of silent death. The kernel freezes the child and sends
+        // ExceptionInfo on the channel; devd reads it, logs, then kills.
+        let mut exc_handle_raw = 0u32;
+        let mut exc_child_raw = 0u32;
+        if let Ok((exc_a, exc_b)) = Channel::pair() {
+            let child_handle = exc_b.into_raw_handle();
+            if syscall::set_exception_channel(pid, child_handle).is_ok() {
+                let h = exc_a.handle();
+                if let Some(events) = &mut self.events {
+                    let _ = events.watch(h);
+                }
+                exc_handle_raw = h.raw();
+                exc_child_raw = child_handle.raw();
+            }
+            // Keep BOTH channel ends alive:
+            // - exc_a: watched in Mux for fault notifications
+            // - exc_b (child_handle): kept so the channel stays Open;
+            //   closing it would HalfClose the channel, firing a spurious
+            //   CLOSED event on exc_a and preventing the kernel from
+            //   delivering ExceptionInfo via send(channel_id).
+            core::mem::forget(exc_a);
+        }
+
+        // Set per-child resource limits based on driver presets
+        let preset = rules::resource_preset(binary);
+        let _ = syscall::set_resource_limits(
+            pid, preset.max_channels, preset.max_ports,
+            preset.max_shmem, preset.max_children,
+        );
+
         // Update service state
         if let Some(service) = self.services.get_mut(idx) {
             service.pid = pid;
             service.state = ServiceState::Starting;
             service.last_change = now;
+            service.exc_channel = exc_handle_raw;
+            service.exc_channel_child = exc_child_raw;
         }
 
         self.add_recent_dynamic_pid(pid, idx as u8);
@@ -1094,6 +1128,20 @@ impl Devd {
                     }
                 }
                 self.query_handler.remove_client(qslot);
+            }
+
+            // Close exception channel for this service (both ends)
+            if service.exc_channel != 0 {
+                let h = Handle(service.exc_channel);
+                if let Some(events) = &mut self.events {
+                    let _ = events.unwatch(h);
+                }
+                let _ = syscall::close(h);
+                service.exc_channel = 0;
+            }
+            if service.exc_channel_child != 0 {
+                let _ = syscall::close(Handle(service.exc_channel_child));
+                service.exc_channel_child = 0;
             }
 
             if code == 0 {
@@ -2173,6 +2221,52 @@ impl Devd {
 
 
     // =========================================================================
+    // Exception Channel Handling
+    // =========================================================================
+
+    /// Handle an exception channel event — a child has faulted.
+    /// Reads ExceptionInfo, logs the crash, and kills the frozen child.
+    fn handle_exception_event(&mut self, handle: ObjHandle) {
+        let mut buf = [0u8; 32];
+        let n = match syscall::read(handle, &mut buf) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if n < 32 { return; }
+
+        // Parse ExceptionInfo: [pid:4][fault_type:1][_pad:3][esr:8][elr:8][far:8]
+        let pid = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let fault_type = buf[4];
+        let esr = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+        let elr = u64::from_le_bytes(buf[16..24].try_into().unwrap_or([0; 8]));
+        let far = u64::from_le_bytes(buf[24..32].try_into().unwrap_or([0; 8]));
+
+        let fault_name = match fault_type {
+            0 => "DataAbort",
+            1 => "InstrAbort",
+            2 => "SError",
+            _ => "Other",
+        };
+
+        // Find service name for the faulted child
+        let svc_name = self.services.find_by_pid(pid)
+            .and_then(|idx| self.services.get(idx))
+            .map(|s| s.name())
+            .unwrap_or("unknown");
+
+        uwarn!("devd", "child_fault";
+            pid = pid,
+            name = svc_name,
+            fault = fault_name,
+            elr = userlib::ulog::hex64(elr),
+            far = userlib::ulog::hex64(far),
+            esr = userlib::ulog::hex64(esr));
+
+        // Kill the frozen child — normal restart flow will handle respawn
+        let _ = syscall::exception_resume(pid, abi::exception_action::KILL);
+    }
+
+    // =========================================================================
     // Signal Event Handling
     // =========================================================================
 
@@ -2686,7 +2780,7 @@ impl Devd {
             svc.set_trigger_port(pname);
         }
 
-        uinfo!("devd", "svc_created_from_route"; name = core::str::from_utf8(binary_name).unwrap_or("?"), slot = slot_idx as u32);
+        unotice!("devd", "svc_created_from_route"; name = core::str::from_utf8(binary_name).unwrap_or("?"), slot = slot_idx as u32);
 
         // Drain deferred rules for this parent (inflight consumed = slot freed)
         self.drain_deferred_rules(parent_svc_idx);
@@ -2772,7 +2866,7 @@ impl Devd {
 
         let driver_idx = driver_idx;
 
-        uinfo!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
+        unotice!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
 
         // When driver reports Ready, transition service state and activate ports
         if state_msg.new_state == driver_state::READY {
@@ -2938,7 +3032,7 @@ impl Devd {
 
         let result_code = match result {
             Ok(()) => {
-                uinfo!("devd", "port_shmem_update"; port = core::str::from_utf8(port_name).unwrap_or("?"), shmem_id = update.shmem_id);
+                udebug!("devd", "port_shmem_update"; port = core::str::from_utf8(port_name).unwrap_or("?"), shmem_id = update.shmem_id);
                 error::OK
             }
             Err(_) => {
@@ -3009,7 +3103,7 @@ impl Devd {
 
         let result_code = match old_state {
             Some(old) => {
-                uinfo!("devd", "port_state_change";
+                unotice!("devd", "port_state_change";
                     port = core::str::from_utf8(port_name).unwrap_or("?"),
                     from = old as u8,
                     to = new_state as u8
@@ -3594,7 +3688,7 @@ impl Devd {
         // This must happen regardless of success/failure so deferred rules don't starve.
         let _parent_for_drain = parent_idx;
 
-        uinfo!("devd", "spawn_ack"; parent = self.svc_name(parent_idx as u8), seq = seq_id, result = result as i32, spawn = spawn_count as u32);
+        unotice!("devd", "spawn_ack"; parent = self.svc_name(parent_idx as u8), seq = seq_id, result = result as i32, spawn = spawn_count as u32);
 
         // Consume the inflight spawn to get port context and binary name
         let spawn_ctx = self.consume_inflight_spawn(seq_id);
@@ -3796,14 +3890,14 @@ impl Devd {
         // Log registration with class info
         if let Ok(name_str) = core::str::from_utf8(port_name) {
             if shmem_id != 0 {
-                uinfo!("devd", "port_info_registered";
+                unotice!("devd", "port_info_registered";
                     name = name_str,
                     class = port_info.port_class as u16,
                     subclass = port_info.port_subclass,
                     shmem_id = shmem_id
                 );
             } else {
-                uinfo!("devd", "port_info_registered";
+                unotice!("devd", "port_info_registered";
                     name = name_str,
                     class = port_info.port_class as u16,
                     subclass = port_info.port_subclass
@@ -3882,7 +3976,7 @@ impl Devd {
             port.set_child_link_id(link_id);
         }
 
-        uinfo!("devd", "port_rule_matched";
+        unotice!("devd", "port_rule_matched";
             class = port_info.port_class as u16,
             subclass = port_info.port_subclass,
             driver = rule.driver
@@ -4226,8 +4320,12 @@ impl Devd {
                         // Fall through to poll/flush below
                     } else {
                         let handle = event.handle;
+                        // Exception channel event? (child faulted)
+                        if self.services.find_by_exc_channel(handle.raw()).is_some() {
+                            self.handle_exception_event(handle);
+                        }
                         // Query port event?
-                        if let Some(query_port) = &self.query_port {
+                        else if let Some(query_port) = &self.query_port {
                             if handle == query_port.handle() {
                                 self.handle_query_port_event();
                             } else if self.query_handler.find_by_handle(handle).is_some() {

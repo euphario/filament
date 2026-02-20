@@ -46,7 +46,7 @@ impl BlockInfo {
 }
 
 use userlib::syscall;
-use userlib::{uinfo, uerror};
+use userlib::{uinfo, unotice, udebug, uerror};
 use userlib::bus::{
     Driver, BusCtx, Disposition, BusError, BusMsg, bus_msg,
     BlockPortConfig, BlockGeometry, PortId,
@@ -392,7 +392,7 @@ impl UsbDriver {
         let mut xhci = XhciController::new(mmio);
         let caps = xhci.read_capabilities().ok_or("read_caps_failed")?;
 
-        uinfo!("usbd", "xhci_caps"; slots = caps.max_slots as u32, ports = caps.max_ports as u32, version = caps.version as u32);
+        unotice!("usbd", "xhci_caps"; slots = caps.max_slots as u32, ports = caps.max_ports as u32, version = caps.version as u32);
 
         // Caps all-zero means the xHCI core isn't powered (e.g. combo PHY in PCIe mode)
         if caps.max_slots == 0 && caps.max_ports == 0 {
@@ -526,7 +526,7 @@ impl UsbDriver {
         // Log PORTSC for every root port — critical for hardware debugging
         for port in 0..caps.max_ports {
             let portsc = xhci.read_portsc(port);
-            uinfo!("usbd", "portsc"; port = port as u32, val = portsc);
+            udebug!("usbd", "portsc"; port = port as u32, val = portsc);
         }
 
         // Reset connected ports to put devices in Default state
@@ -545,7 +545,7 @@ impl UsbDriver {
             let enabled = (portsc & usb::portsc::PED) != 0;
             let speed = ((portsc & usb::portsc::SPEED_MASK) >> usb::portsc::SPEED_SHIFT) as u8;
             if connected {
-                uinfo!("usbd", "port_ready"; port = port as u32, enabled = enabled as u32, speed = speed as u32);
+                unotice!("usbd", "port_ready"; port = port as u32, enabled = enabled as u32, speed = speed as u32);
             }
         }
 
@@ -2305,7 +2305,7 @@ impl Driver for UsbdWrapper {
             meta[8], meta[9], meta[10], meta[11],
         ]) as usize;
 
-        uinfo!("usbd", "device_found"; bar0 = bar0_addr, size = bar0_size as u32);
+        unotice!("usbd", "device_found"; bar0 = bar0_addr, size = bar0_size as u32);
 
         // Configure and initialize xHCI hardware
         self.0.configure(bar0_addr, bar0_size);

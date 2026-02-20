@@ -85,6 +85,7 @@ pub enum SyscallNumber {
     SetModuleLevel = 87,  // Set per-module log level override
     SetExceptionChannel = 88, // Register exception channel on child task
     ExceptionResume = 89,     // Resume or kill a frozen (faulted) child task
+    SetResourceLimits = 90,   // Set per-task resource limits on child
 
     // Unified interface (100-105) - THE 6 SYSCALLS
     Open = 100,
@@ -144,6 +145,7 @@ impl From<u64> for SyscallNumber {
             87 => SyscallNumber::SetModuleLevel,
             88 => SyscallNumber::SetExceptionChannel,
             89 => SyscallNumber::ExceptionResume,
+            90 => SyscallNumber::SetResourceLimits,
             // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -262,6 +264,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::SetModuleLevel => misc::sys_set_module_level(args.arg0, args.arg1 as usize, args.arg2 as u8),
         SyscallNumber::SetExceptionChannel => misc::sys_set_exception_channel(args.arg0 as u32, args.arg1 as u32),
         SyscallNumber::ExceptionResume => misc::sys_exception_resume(args.arg0 as u32, args.arg1 as u32),
+        SyscallNumber::SetResourceLimits => misc::sys_set_resource_limits(args.arg0 as u32, args.arg1 as u16, args.arg2 as u16, args.arg3 as u16, args.arg4 as u16),
         SyscallNumber::Sysinfo => misc::sys_sysinfo(args.arg0),
         SyscallNumber::Reset => misc::sys_reset(),
         SyscallNumber::Shutdown => misc::sys_shutdown(args.arg0 as u8),
@@ -350,6 +353,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::SetModuleLevel => "set_module_level",
         SyscallNumber::SetExceptionChannel => "set_exception_channel",
         SyscallNumber::ExceptionResume => "exception_resume",
+        SyscallNumber::SetResourceLimits => "set_resource_limits",
         // Unified interface (100-105)
         SyscallNumber::Open => "open",
         SyscallNumber::Read => "read",

@@ -318,6 +318,17 @@ pub fn exception_resume(child_pid: u32, action: u32) -> SysResult<()> {
     }
 }
 
+/// Set per-task resource limits on a child process.
+/// Caller must be parent of child_pid.
+pub fn set_resource_limits(child_pid: u32, max_channels: u16, max_ports: u16, max_shmem: u16, max_children: u16) -> SysResult<()> {
+    let ret = syscall5(sys::SET_RESOURCE_LIMITS, child_pid as u64, max_channels as u64, max_ports as u64, max_shmem as u64, max_children as u64);
+    if ret < 0 {
+        Err(SysError::from_errno(ret as i32))
+    } else {
+        Ok(())
+    }
+}
+
 /// Non-destructive read from kernel log ring at a cursor position.
 ///
 /// The `cursor` is read and updated: pass 0 to start from oldest record.

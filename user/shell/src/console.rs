@@ -7,7 +7,7 @@
 //!
 //! 1. Connect to "console:0" port (Channel)
 //! 2. Receive "RING" + shmem_id + cols + rows message
-//! 3. Map the shmem as ConsoleRing
+//! 3. Open shmem by ID and map as ConsoleRing
 //! 4. Use TX ring for output, RX ring for input
 
 use userlib::ipc::{Channel, Mux, MuxFilter};
@@ -80,14 +80,14 @@ impl Console {
             return false;
         }
 
-        // Read the RING message
+        // Read the RING message with shmem_id
         let mut buf = [0u8; 16];
-        let n = match channel.recv(&mut buf) {
-            Ok(n) => n,
-            Err(_) => return false,
+        let n = match channel.try_recv(&mut buf) {
+            Ok(Some(n)) => n,
+            _ => return false,
         };
 
-        // Parse: "RING" + shmem_id (4 bytes) + cols (2 bytes) + rows (2 bytes)
+        // Parse: "RING" (4) + shmem_id (4) + cols (2) + rows (2)
         if n < 12 || &buf[..4] != b"RING" {
             return false;
         }
@@ -96,7 +96,7 @@ impl Console {
         let cols = u16::from_le_bytes([buf[8], buf[9]]);
         let rows = u16::from_le_bytes([buf[10], buf[11]]);
 
-        // Map the ring
+        // Open and map the shared memory ring
         let ring = match ConsoleRing::map(shmem_id) {
             Some(r) => r,
             None => return false,

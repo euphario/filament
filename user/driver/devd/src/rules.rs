@@ -251,6 +251,43 @@ pub fn find_port_rule(info: &PortInfo) -> Option<&'static PortRule> {
 }
 
 // =============================================================================
+// Resource Limits Presets
+// =============================================================================
+
+/// Per-driver resource limits: (channels, ports, shmem, children)
+pub struct ResourcePreset {
+    pub max_channels: u16,
+    pub max_ports: u16,
+    pub max_shmem: u16,
+    pub max_children: u16,
+}
+
+/// Default resource limits for drivers without a specific preset.
+pub const DEFAULT_PRESET: ResourcePreset = ResourcePreset {
+    max_channels: 16, max_ports: 4, max_shmem: 8, max_children: 4,
+};
+
+/// Look up resource limits for a driver binary name.
+pub fn resource_preset(driver: &str) -> &'static ResourcePreset {
+    static PRESETS: &[(&str, ResourcePreset)] = &[
+        ("shell",    ResourcePreset { max_channels: 4,  max_ports: 1, max_shmem: 2, max_children: 0 }),
+        ("consoled", ResourcePreset { max_channels: 8,  max_ports: 2, max_shmem: 4, max_children: 0 }),
+        ("pcied",    ResourcePreset { max_channels: 16, max_ports: 8, max_shmem: 8, max_children: 8 }),
+        ("nvmed",    ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 8, max_children: 4 }),
+        ("usbd",     ResourcePreset { max_channels: 16, max_ports: 8, max_shmem: 8, max_children: 4 }),
+        ("fatfsd",   ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 8, max_children: 0 }),
+        ("partd",    ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 4, max_children: 4 }),
+    ];
+
+    for (name, preset) in PRESETS.iter() {
+        if *name == driver {
+            return preset;
+        }
+    }
+    &DEFAULT_PRESET
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

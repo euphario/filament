@@ -691,6 +691,26 @@ pub fn unmap(pid: Pid, shmem_id: u32) -> Result<(), i64> {
 }
 
 /// Grant another process permission to map this shared memory
+/// Grant access to a shmem region without ownership check (kernel-internal).
+/// Used by handle transfer to allow the receiver to map a transferred shmem.
+pub fn grant_access(shmem_id: u32, pid: Pid) -> Result<(), i64> {
+    let mut guard = SHMEM.lock();
+    for slot in guard.table.iter_mut() {
+        if let Some(ref mut region) = slot {
+            if region.id == shmem_id {
+                if region.state() == RegionState::Dying {
+                    return Err(-11);
+                }
+                if !region.allow_pid(pid) {
+                    return Err(-12);
+                }
+                return Ok(());
+            }
+        }
+    }
+    Err(-2) // ENOENT
+}
+
 pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
     let mut guard = SHMEM.lock();
     for slot in guard.table.iter_mut() {
