@@ -50,6 +50,10 @@ const GPIO57_PWM_MODE: u32 = 1;
 /// PWM period (13-bit max = 8191). Use 4096 for easy percentage math.
 const PWM_PERIOD: u32 = 4096;
 
+/// Minimum duty cycle the fan motor can sustain (below this it stalls).
+/// 0 = off, anything 1-19 is clamped up to 20.
+const MIN_DUTY_PCT: u32 = 20;
+
 /// Pinctrl base address and size (for MMIO open)
 const PINCTRL_BASE: u64 = 0x1001_F000;
 const PINCTRL_SIZE: u64 = 0x1000;
@@ -102,13 +106,14 @@ impl FanDriver {
         self.duty_pct = 100;
     }
 
-    /// Set fan speed (0-100%)
+    /// Set fan speed (0-100%). 0 = off, 1-19 clamped to MIN_DUTY_PCT.
     fn set_fan_speed(&mut self, percent: u32) {
         let percent = percent.min(100);
+        let effective = if percent == 0 { 0 } else { percent.max(MIN_DUTY_PCT) };
         self.duty_pct = percent;
 
         if let Some(pwm) = &self.pwm {
-            let threshold = (PWM_PERIOD * percent) / 100;
+            let threshold = (PWM_PERIOD * effective) / 100;
             pwm.write32(PWM_CH0_BASE + PWMTHRES, threshold);
         }
     }
