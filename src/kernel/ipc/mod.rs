@@ -103,7 +103,7 @@ pub mod supervision;
 mod tests;
 
 // Re-export types used by other kernel modules
-pub use types::{Message, MessageHeader, MessageType, ChannelId, MAX_INLINE_PAYLOAD};
+pub use types::{Message, MessageHeader, MessageType, ChannelId, MAX_INLINE_PAYLOAD, FLAG_HANDLE_TRANSFER};
 pub use error::IpcError;
 pub use traits::{WakeReason, Waitable, Closable};
 pub use table::{PeerInfo, PeerInfoList};

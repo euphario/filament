@@ -270,7 +270,7 @@ impl ProcessOps for KernelProcessOps {
                         activity_age_ms: task.get_activity_age_ms(current_tick),
                         context_switches: task.context_switches,
                         page_faults: task.page_faults,
-                        _pad2: 0,
+                        total_syscalls: task.total_syscalls as u32,
                     };
                     i += 1;
                 }

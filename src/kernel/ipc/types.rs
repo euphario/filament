@@ -38,6 +38,11 @@ pub const MAX_PORT_NAME: usize = 32;
 /// Maximum pending connections per port
 pub const MAX_PENDING_PER_PORT: usize = 4;
 
+/// Message flag: this message carries a transferred handle.
+/// First 4 bytes of payload contain the raw handle value (on send)
+/// or the new handle value in receiver's table (on receive).
+pub const FLAG_HANDLE_TRANSFER: u32 = 1 << 0;
+
 /// Channel ID type (0 = invalid)
 pub type ChannelId = u32;
 
@@ -103,7 +108,7 @@ pub struct MessageHeader {
     pub msg_id: u32,
     /// Payload length (actual bytes used in payload)
     pub payload_len: u32,
-    /// Flags (reserved for future use)
+    /// Flags (bit 0 = HANDLE_TRANSFER)
     pub flags: u32,
 }
 

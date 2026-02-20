@@ -2294,7 +2294,7 @@ impl Driver for UsbdWrapper {
         let meta = spawn_ctx.metadata();
         if meta.len() < 12 {
             uerror!("usbd", "metadata_too_short"; len = meta.len() as u32);
-            return Err(BusError::Internal);
+            return Err(BusError::NotPresent);
         }
 
         let bar0_addr = u64::from_le_bytes([
@@ -2312,10 +2312,13 @@ impl Driver for UsbdWrapper {
         self.0.init().map_err(|reason| {
             log_always(reason);
             uerror!("usbd", "xhci_init_failed";);
-            if reason == "xhci_not_present" {
-                BusError::NotPresent
-            } else {
-                BusError::Internal
+            // Map hardware-absent conditions to NotPresent (exit code 0, no respawn)
+            // rather than Internal (exit code 1, respawn loop forever)
+            match reason {
+                "xhci_not_present" | "soc_pre_init_failed" | "mmio_map_failed" => {
+                    BusError::NotPresent
+                }
+                _ => BusError::Internal,
             }
         })?;
 

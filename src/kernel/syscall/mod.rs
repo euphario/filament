@@ -81,6 +81,10 @@ pub enum SyscallNumber {
     SignalFlush = 83,  // Clear pending signal queue
     ResetStats = 84,   // Reset per-task statistics counters
     ExecWithMailbox = 85, // Spawn with mailbox shmem page
+    SetConsoleLevel = 86, // Set console output log level
+    SetModuleLevel = 87,  // Set per-module log level override
+    SetExceptionChannel = 88, // Register exception channel on child task
+    ExceptionResume = 89,     // Resume or kill a frozen (faulted) child task
 
     // Unified interface (100-105) - THE 6 SYSCALLS
     Open = 100,
@@ -136,6 +140,10 @@ impl From<u64> for SyscallNumber {
             83 => SyscallNumber::SignalFlush,
             84 => SyscallNumber::ResetStats,
             85 => SyscallNumber::ExecWithMailbox,
+            86 => SyscallNumber::SetConsoleLevel,
+            87 => SyscallNumber::SetModuleLevel,
+            88 => SyscallNumber::SetExceptionChannel,
+            89 => SyscallNumber::ExceptionResume,
             // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -250,6 +258,10 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::SignalFlush => process::sys_signal_flush(args.arg0 as u32),
         SyscallNumber::ResetStats => process::sys_reset_stats(args.arg0 as u32),
         SyscallNumber::ExecWithMailbox => process::sys_exec_with_mailbox(args.arg0, args.arg1 as usize, args.arg2, args.arg3, args.arg4 as usize),
+        SyscallNumber::SetConsoleLevel => misc::sys_set_console_level(args.arg0 as u8),
+        SyscallNumber::SetModuleLevel => misc::sys_set_module_level(args.arg0, args.arg1 as usize, args.arg2 as u8),
+        SyscallNumber::SetExceptionChannel => misc::sys_set_exception_channel(args.arg0 as u32, args.arg1 as u32),
+        SyscallNumber::ExceptionResume => misc::sys_exception_resume(args.arg0 as u32, args.arg1 as u32),
         SyscallNumber::Sysinfo => misc::sys_sysinfo(args.arg0),
         SyscallNumber::Reset => misc::sys_reset(),
         SyscallNumber::Shutdown => misc::sys_shutdown(args.arg0 as u8),
@@ -334,6 +346,10 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::Sysinfo => "sysinfo",
         SyscallNumber::GetCapabilities => "get_capabilities",
         SyscallNumber::ExecWithMailbox => "exec_with_mailbox",
+        SyscallNumber::SetConsoleLevel => "set_console_level",
+        SyscallNumber::SetModuleLevel => "set_module_level",
+        SyscallNumber::SetExceptionChannel => "set_exception_channel",
+        SyscallNumber::ExceptionResume => "exception_resume",
         // Unified interface (100-105)
         SyscallNumber::Open => "open",
         SyscallNumber::Read => "read",
@@ -358,7 +374,7 @@ pub extern "C" fn syscall_handler_rust(
     arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, _unused: u64, num: u64
 ) -> i64 {
     // Storm protection: check if task is making too many syscalls
-    let storm_action = super::storm::check_syscall_storm(num);
+    let (storm_action, is_init) = super::storm::check_syscall_storm(num);
 
     // Handle storm action BEFORE processing syscall
     match storm_action {
@@ -400,6 +416,13 @@ pub extern "C" fn syscall_handler_rust(
                     .map(|t| t.id).unwrap_or(0)
             });
             crate::kerror!("storm", "evict"; pid = pid as u64, syscall = num);
+
+            // Safety net: if somehow init is being evicted (should be prevented
+            // by storm check above), set recovery flag
+            if is_init {
+                crate::DEVD_LIVENESS_KILLED.store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+
             super::task::eviction::mark_for_eviction(
                 pid,
                 super::task::state::EvictionReason::ResourceExhaustion,

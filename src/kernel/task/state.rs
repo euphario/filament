@@ -117,6 +117,11 @@ pub enum TaskState {
     /// Kernel-initiated termination - goes directly to Dead (no grace period)
     Evicting { reason: EvictionReason },
 
+    /// Task frozen by exception handler — awaiting supervisor decision
+    /// Reachable from Running (user fault with exception channel).
+    /// Transitions to Ready (resume) or Exiting (kill).
+    Frozen { esr: u64, elr: u64, far: u64 },
+
     /// Task fully cleaned up, slot can be reused
     Dead,
 }
@@ -175,6 +180,11 @@ impl TaskState {
         )
     }
 
+    /// Task is frozen by exception handler (awaiting supervisor decision)
+    pub fn is_frozen(&self) -> bool {
+        matches!(self, TaskState::Frozen { .. })
+    }
+
     /// Task is being evicted (kernel-initiated forced termination)
     pub fn is_evicting(&self) -> bool {
         matches!(self, TaskState::Evicting { .. })
@@ -231,6 +241,7 @@ impl TaskState {
             TaskState::Exiting { .. } => "Exiting",
             TaskState::Dying { .. } => "Dying",
             TaskState::Evicting { .. } => "Evicting",
+            TaskState::Frozen { .. } => "Frozen",
             TaskState::Dead => "Dead",
         }
     }
@@ -246,6 +257,7 @@ impl TaskState {
             TaskState::Dying { .. } => 5,
             TaskState::Dead => 6,
             TaskState::Evicting { .. } => 7,
+            TaskState::Frozen { .. } => 8,
         }
     }
 
@@ -289,6 +301,14 @@ impl TaskState {
 
             // Dead goes to Ready (slot reused for new task)
             (Dead, Ready) => true,
+
+            // Running can go to Frozen (user fault with exception channel)
+            (Running { .. }, Frozen { .. }) => true,
+            // Frozen can go to Ready (resume) or Exiting (kill by supervisor)
+            (Frozen { .. }, Ready) => true,
+            (Frozen { .. }, Exiting { .. }) => true,
+            // Frozen can also be evicted
+            (Frozen { .. }, Evicting { .. }) => true,
 
             // Evicting: kernel-initiated forced termination
             // Any non-terminal state can be evicted
@@ -350,17 +370,14 @@ impl TaskState {
         self.transition(TaskState::Ready).map(|_| ())
     }
 
-    /// Any runnable/blocked → Exiting (voluntary exit or killed)
+    /// Any runnable/blocked/frozen → Exiting (voluntary exit or killed)
     pub fn exit(&mut self, code: i32) -> Result<(), InvalidTransition> {
-        // Can exit from Running, Sleeping, or Waiting
+        // Can exit from Running, Sleeping, Waiting, Frozen, or Ready
         if matches!(
             self,
             TaskState::Running { .. } | TaskState::Sleeping { .. } | TaskState::Waiting { .. }
+            | TaskState::Frozen { .. } | TaskState::Ready
         ) {
-            *self = TaskState::Exiting { code };
-            Ok(())
-        } else if matches!(self, TaskState::Ready) {
-            // Ready task being killed before it got to run
             *self = TaskState::Exiting { code };
             Ok(())
         } else {
@@ -406,6 +423,16 @@ impl TaskState {
     /// Any non-terminal → Evicting (kernel-initiated forced termination)
     pub fn evict(&mut self, reason: EvictionReason) -> Result<(), InvalidTransition> {
         self.transition(TaskState::Evicting { reason }).map(|_| ())
+    }
+
+    /// Running → Frozen (user fault with exception channel)
+    pub fn freeze(&mut self, esr: u64, elr: u64, far: u64) -> Result<(), InvalidTransition> {
+        self.transition(TaskState::Frozen { esr, elr, far }).map(|_| ())
+    }
+
+    /// Frozen → Ready (supervisor resumed the task)
+    pub fn resume_from_freeze(&mut self) -> Result<(), InvalidTransition> {
+        self.transition(TaskState::Ready).map(|_| ())
     }
 }
 

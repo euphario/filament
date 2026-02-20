@@ -43,8 +43,8 @@ impl Output for ShellOutput {
     }
 }
 
-/// Maximum columns per table
-pub const MAX_COLS: usize = 16;
+/// Maximum columns per table (ps -vvv needs 23)
+pub const MAX_COLS: usize = 24;
 
 /// Maximum rows per table (for static allocation)
 /// Note: Keep this small - Table lives on stack! 32 rows * ~800 bytes/row = ~25KB

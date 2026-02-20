@@ -206,10 +206,34 @@ pub const MAX_SIGNAL_SENDERS: usize = 8;
 /// Maximum pending signals per task
 pub const MAX_PENDING_SIGNALS: usize = 8;
 
-/// Per-process resource limits (prevent exhaustion attacks)
-pub const MAX_CHANNELS_PER_TASK: u16 = 32;
-pub const MAX_PORTS_PER_TASK: u16 = 4;
-pub const MAX_SHMEM_PER_TASK: u16 = 16;
+/// Default per-process resource limits (prevent exhaustion attacks)
+pub const DEFAULT_MAX_CHANNELS: u16 = 32;
+pub const DEFAULT_MAX_PORTS: u16 = 8;
+pub const DEFAULT_MAX_SHMEM: u16 = 16;
+pub const DEFAULT_MAX_CHILDREN: u16 = 16;
+
+/// Per-task resource limits.
+///
+/// Each task carries its own limits (set at spawn, defaults if not overridden).
+/// Parent can configure child limits via birth context.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceLimits {
+    pub max_channels: u16,
+    pub max_ports: u16,
+    pub max_shmem: u16,
+    pub max_children: u16,
+}
+
+impl ResourceLimits {
+    pub const fn default() -> Self {
+        Self {
+            max_channels: DEFAULT_MAX_CHANNELS,
+            max_ports: DEFAULT_MAX_PORTS,
+            max_shmem: DEFAULT_MAX_SHMEM,
+            max_children: DEFAULT_MAX_CHILDREN,
+        }
+    }
+}
 
 /// Number of timer ticks to wait between Phase 1 (notify) and Phase 2 (force cleanup)
 /// At 100 ticks/sec, 10 ticks = 100ms grace period for servers to release resources
@@ -308,6 +332,8 @@ pub struct Task {
     /// Next heap address for bump allocation
     pub(crate) heap_next: u64,
     // NOTE: object_table removed - now owned by ObjectService
+    /// Per-process resource limits
+    pub(crate) limits: ResourceLimits,
     /// Per-process resource counters
     pub(crate) channel_count: u16,
     pub(crate) port_count: u16,
@@ -360,11 +386,17 @@ pub struct Task {
 
     /// Total CPU time consumed by this task (nanoseconds)
     pub(crate) cpu_time_ns: u64,
+    /// Cumulative syscall count (saturating)
+    pub(crate) total_syscalls: u64,
     /// Counter snapshot when this task was last scheduled to run
     pub(crate) last_scheduled_at: u64,
 
     /// Data delivered with the last wake (for Mux fast path)
     pub(crate) wake_data: Option<WakeData>,
+
+    /// Exception channel: if set, user faults freeze the task and deliver
+    /// fault info on this channel instead of killing. (parent_task_id, channel_id)
+    pub(crate) exception_channel: Option<(TaskId, u32)>,
 
     /// Per-task signal queue (fixed ring buffer)
     pub(crate) signal_queue: [abi::PendingSignal; MAX_PENDING_SIGNALS],
@@ -484,6 +516,7 @@ impl Task {
             name: task_name,
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
+            limits: ResourceLimits::default(),
             channel_count: 0,
             port_count: 0,
             shmem_count: 0,
@@ -506,8 +539,10 @@ impl Task {
             context_switches: 0,
             page_faults: 0,
             cpu_time_ns: 0,
+            total_syscalls: 0,
             last_scheduled_at: 0,
             wake_data: None,
+            exception_channel: None,
             signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
             signal_head: 0,
             signal_tail: 0,
@@ -556,6 +591,7 @@ impl Task {
             name: *b"idle\0\0\0\0\0\0\0\0\0\0\0\0",
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
+            limits: ResourceLimits::default(),
             channel_count: 0,
             port_count: 0,
             shmem_count: 0,
@@ -578,8 +614,10 @@ impl Task {
             context_switches: 0,
             page_faults: 0,
             cpu_time_ns: 0,
+            total_syscalls: 0,
             last_scheduled_at: 0,
             wake_data: None,
+            exception_channel: None,
             signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
             signal_head: 0,
             signal_tail: 0,
@@ -653,6 +691,7 @@ impl Task {
             name: task_name,
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
+            limits: ResourceLimits::default(),
             channel_count: 0,
             port_count: 0,
             shmem_count: 0,
@@ -675,8 +714,10 @@ impl Task {
             context_switches: 0,
             page_faults: 0,
             cpu_time_ns: 0,
+            total_syscalls: 0,
             last_scheduled_at: 0,
             wake_data: None,
+            exception_channel: None,
             signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
             signal_head: 0,
             signal_tail: 0,
@@ -699,7 +740,7 @@ impl Task {
     /// Check if task can create another channel
     #[inline]
     pub fn can_create_channel(&self) -> bool {
-        self.channel_count < MAX_CHANNELS_PER_TASK
+        self.channel_count < self.limits.max_channels
     }
 
     #[inline]
@@ -714,7 +755,7 @@ impl Task {
 
     #[inline]
     pub fn can_create_port(&self) -> bool {
-        self.port_count < MAX_PORTS_PER_TASK
+        self.port_count < self.limits.max_ports
     }
 
     #[inline]
@@ -729,7 +770,7 @@ impl Task {
 
     #[inline]
     pub fn can_create_shmem(&self) -> bool {
-        self.shmem_count < MAX_SHMEM_PER_TASK
+        self.shmem_count < self.limits.max_shmem
     }
 
     #[inline]
@@ -740,6 +781,12 @@ impl Task {
     #[inline]
     pub fn remove_shmem(&mut self) {
         self.shmem_count = self.shmem_count.saturating_sub(1);
+    }
+
+    /// Check if task can spawn another child
+    #[inline]
+    pub fn can_add_child(&self) -> bool {
+        (self.num_children as u16) < self.limits.max_children
     }
 
     /// Add a PID to the signal allowlist
@@ -909,6 +956,7 @@ impl Task {
     /// Reset all per-task statistics counters.
     pub fn reset_stats(&mut self) {
         self.cpu_time_ns = 0;
+        self.total_syscalls = 0;
         self.ipc_sent = 0;
         self.ipc_recv = 0;
         self.context_switches = 0;
@@ -1100,6 +1148,24 @@ impl Task {
     #[inline]
     pub fn evict(&mut self, reason: super::state::EvictionReason) -> Result<(), super::state::InvalidTransition> {
         self.state.evict(reason)
+    }
+
+    /// Transition: Running → Frozen (user fault with exception channel)
+    #[inline]
+    pub fn freeze(&mut self, esr: u64, elr: u64, far: u64) -> Result<(), super::state::InvalidTransition> {
+        self.state.freeze(esr, elr, far)
+    }
+
+    /// Transition: Frozen → Ready (supervisor resumed the task)
+    #[inline]
+    pub fn resume_from_freeze(&mut self) -> Result<(), super::state::InvalidTransition> {
+        self.state.resume_from_freeze()
+    }
+
+    /// Check if task is frozen
+    #[inline]
+    pub fn is_frozen(&self) -> bool {
+        self.state.is_frozen()
     }
 
     /// Transition: Exiting/Dying/Evicting → Dead (cleanup complete)

@@ -286,6 +286,10 @@ fn execute_command(cmd: &[u8]) {
         cmd_jobs();
     } else if cmd_starts_with(cmd, b"log ") {
         cmd_log(&cmd[4..]);
+    } else if cmd_eq(cmd, b"dmesg") {
+        builtins::dmesg::run(b"");
+    } else if cmd_starts_with(cmd, b"dmesg ") {
+        builtins::dmesg::run(&cmd[6..]);
     } else if cmd_eq(cmd, b"klog") {
         cmd_klog();
     } else if cmd_eq(cmd, b"logs") {
@@ -509,7 +513,8 @@ fn cmd_help() {
         ("signal <pid> <evt> [val]", "Send signal (evt: 1=exit 2=int 3=shut 4=port)"),
         ("bg <path>", "Run program in background"),
         ("jobs", "Show background jobs"),
-        ("log <level>", "Set log level (error/warn/info/debug/trace)"),
+        ("dmesg [-l] [-m]", "Dump kernel log ring (non-destructive)"),
+        ("log <level>", "Set log level (error/warn/info/notice/debug/trace)"),
         ("logs [on|off|n]", "Control console log region"),
         ("resize", "Detect/display terminal size"),
         ("reset, reboot", "Graceful shutdown + reset"),
@@ -977,30 +982,103 @@ fn cmd_klog() {
 }
 
 fn cmd_log(arg: &[u8]) {
-    let level_str = trim(arg);
+    let arg = trim(arg);
 
-    let level = if cmd_eq(level_str, b"error") {
-        syscall::log_level::ERROR
-    } else if cmd_eq(level_str, b"warn") {
-        syscall::log_level::WARN
-    } else if cmd_eq(level_str, b"info") {
-        syscall::log_level::INFO
-    } else if cmd_eq(level_str, b"debug") {
-        syscall::log_level::DEBUG
-    } else if cmd_eq(level_str, b"trace") {
-        syscall::log_level::TRACE
-    } else {
-        println!("Unknown log level. Use: error, warn, info, debug, trace");
+    // Parse subcommands: "log console <level>", "log module <subsys> <level>"
+    let (first, rest) = libf::str::split_once(arg, b' ');
+    let rest = trim(rest);
+
+    if cmd_eq(first, b"console") && !rest.is_empty() {
+        // Set console output level
+        let level = match parse_log_level(rest) {
+            Some(l) => l,
+            None => {
+                println!("Unknown level. Use: error, warn, info, notice, debug, trace");
+                return;
+            }
+        };
+        let result = syscall::set_console_level(level);
+        if result == 0 {
+            print!("Console level set to ");
+            print_bytes(rest);
+            println!();
+        } else {
+            println!("Failed: {}", result);
+        }
         return;
+    }
+
+    if cmd_eq(first, b"module") && !rest.is_empty() {
+        // Set per-module level: "log module pcie debug" or "log module pcie off"
+        let (subsys, level_str) = libf::str::split_once(rest, b' ');
+        let level_str = trim(level_str);
+        if subsys.is_empty() || level_str.is_empty() {
+            println!("Usage: log module <subsys> <level|off>");
+            return;
+        }
+        let level = if cmd_eq(level_str, b"off") {
+            0xFF // sentinel: remove override
+        } else {
+            match parse_log_level(level_str) {
+                Some(l) => l,
+                None => {
+                    println!("Unknown level. Use: error, warn, info, notice, debug, trace, off");
+                    return;
+                }
+            }
+        };
+        let result = syscall::set_module_level(subsys, level);
+        if result == 0 {
+            print!("Module ");
+            print_bytes(subsys);
+            print!(" level set to ");
+            print_bytes(level_str);
+            println!();
+        } else {
+            println!("Failed: {}", result);
+        }
+        return;
+    }
+
+    // Simple "log <level>" — sets both write and console levels
+    let level = match parse_log_level(arg) {
+        Some(l) => l,
+        None => {
+            println!("Usage: log <level>              Set write+console level");
+            println!("       log console <level>      Set console output level only");
+            println!("       log module <name> <level> Set per-module level");
+            println!("Levels: error, warn, info, notice, debug, trace");
+            return;
+        }
     };
 
-    let result = syscall::set_log_level(level);
-    if result == 0 {
+    let r1 = syscall::set_log_level(level);
+    let r2 = syscall::set_console_level(level);
+    if r1 == 0 && r2 == 0 {
         print!("Log level set to ");
-        print_bytes(level_str);
+        print_bytes(arg);
         println!();
     } else {
-        println!("Failed to set log level: {}", result);
+        println!("Failed: write={}, console={}", r1, r2);
+    }
+}
+
+/// Parse a log level name to a u8 value
+fn parse_log_level(name: &[u8]) -> Option<u8> {
+    if cmd_eq(name, b"error") {
+        Some(syscall::log_level::ERROR)
+    } else if cmd_eq(name, b"warn") {
+        Some(syscall::log_level::WARN)
+    } else if cmd_eq(name, b"info") {
+        Some(syscall::log_level::INFO)
+    } else if cmd_eq(name, b"notice") {
+        Some(syscall::log_level::NOTICE)
+    } else if cmd_eq(name, b"debug") {
+        Some(syscall::log_level::DEBUG)
+    } else if cmd_eq(name, b"trace") {
+        Some(syscall::log_level::TRACE)
+    } else {
+        None
     }
 }
 

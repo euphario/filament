@@ -181,6 +181,15 @@ pub(crate) fn do_evict_task(task_id: TaskId, reason: EvictionReason) -> bool {
                     parent = task.parent_id as u64
                 );
 
+                // Safety net: if evicting init, set DEVD_LIVENESS_KILLED so
+                // the timer tick handler triggers recovery (respawn devd)
+                if task.is_init {
+                    crate::DEVD_LIVENESS_KILLED.store(true, core::sync::atomic::Ordering::SeqCst);
+                    kerror!("evict", "init_evicted_recovery";
+                        pid = task_id as u64
+                    );
+                }
+
                 // Transition to Evicting
                 if let Err(e) = task.evict(reason) {
                     // This shouldn't happen since we checked is_terminated

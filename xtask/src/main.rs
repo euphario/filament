@@ -54,6 +54,10 @@ enum Commands {
         /// Include stress test programs (testr, test_*)
         #[arg(long)]
         stress: bool,
+
+        /// Boot-time log level (info, notice, debug, trace)
+        #[arg(long)]
+        log_level: Option<String>,
     },
 
     /// Run in QEMU
@@ -100,8 +104,8 @@ fn main() -> Result<()> {
     let project_root = project_root()?;
 
     match cli.command {
-        Commands::Build { test, firmware, skip_user, only, platform, stress } => {
-            cmd_build(&project_root, test, firmware, skip_user, only, &platform, stress)?;
+        Commands::Build { test, firmware, skip_user, only, platform, stress, log_level } => {
+            cmd_build(&project_root, test, firmware, skip_user, only, &platform, stress, log_level)?;
         }
         Commands::Qemu { no_build, gdb, test, stress } => {
             cmd_qemu(&project_root, !no_build, gdb, test, stress)?;
@@ -144,6 +148,7 @@ fn cmd_build(
     only: Vec<String>,
     platform: &str,
     stress: bool,
+    log_level: Option<String>,
 ) -> Result<()> {
     let build_type = if test { "Development (self-tests)" } else { "Production" };
     let firmware_mode = if firmware { "Embedded" } else { "USB" };
@@ -179,7 +184,7 @@ fn cmd_build(
     println!();
 
     // Step 3: Build kernel
-    build_kernel(root, test, platform_feature)?;
+    build_kernel(root, test, platform_feature, log_level.as_deref())?;
     println!();
 
     // Step 4: Create binary
@@ -566,15 +571,28 @@ fn create_initrd(root: &Path, include_firmware: bool, programs: &[String]) -> Re
 }
 
 /// Build the kernel
-fn build_kernel(root: &Path, test: bool, platform_feature: &str) -> Result<()> {
+fn build_kernel(root: &Path, test: bool, platform_feature: &str, log_level: Option<&str>) -> Result<()> {
     println!("Step 3: Building kernel...");
 
     // Build features list
-    let features = if test {
+    let mut features = if test {
         format!("selftest,{}", platform_feature)
     } else {
         platform_feature.to_string()
     };
+
+    // Add boot-time log level feature
+    match log_level {
+        Some("notice") => features.push_str(",log-level-notice"),
+        Some("debug") => features.push_str(",log-level-debug"),
+        Some("trace") => features.push_str(",log-level-trace"),
+        Some(other) => {
+            if other != "info" {
+                println!("  Warning: unknown log level '{}', using default (info)", other);
+            }
+        }
+        None => {}
+    }
 
     // Include embed-initrd always, embed-dtb only for real hardware
     // (QEMU doesn't need embedded DTB - it constructs its own)
@@ -637,7 +655,7 @@ fn create_binary(root: &Path) -> Result<()> {
 /// Run in QEMU
 fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool, stress: bool) -> Result<()> {
     if build {
-        cmd_build(root, test, false, false, vec![], "qemu", stress)?;
+        cmd_build(root, test, false, false, vec![], "qemu", stress, None)?;
     }
 
     println!();
@@ -1056,7 +1074,7 @@ fn cmd_test(root: &Path) -> Result<()> {
     println!();
 
     // Step 1: Build with stress
-    cmd_build(root, false, false, false, vec![], "qemu", true)?;
+    cmd_build(root, false, false, false, vec![], "qemu", true, None)?;
 
     println!();
     println!("Running stress tests in QEMU...");

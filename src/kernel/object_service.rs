@@ -71,66 +71,93 @@ pub enum ReadAttempt {
 // HandleTableSlot - In-place table storage
 // ============================================================================
 
-/// Handle table slot using MaybeUninit for in-place initialization.
+/// Handle table slot using demand-allocated PMM pages.
 ///
-/// HandleTable is ~110KB (64 entries × ~1.7KB Object enum each).
-/// `Option<HandleTable>` would require constructing the full struct on the
-/// 64KB kernel stack before moving it into the PMM slot. This wrapper uses
-/// MaybeUninit to enable direct in-place initialization via raw pointer
-/// writes, avoiding the stack overflow.
+/// HandleTable is large (~220KB at 128 entries × ~1.7KB Object enum each).
+/// Instead of storing the table inline (which would bloat the kernel image),
+/// we allocate pages from PMM when a task spawns and free them on exit.
+///
+/// This enables growing MAX_HANDLES without affecting kernel image size.
 pub struct HandleTableSlot {
-    table: core::mem::MaybeUninit<HandleTable>,
-    initialized: bool,
+    /// Pointer to PMM-allocated HandleTable (null if uninitialized)
+    table_ptr: *mut HandleTable,
+    /// Number of PMM pages allocated (for freeing)
+    pages: u8,
 }
 
 impl HandleTableSlot {
     pub const fn empty() -> Self {
         Self {
-            table: core::mem::MaybeUninit::uninit(),
-            initialized: false,
+            table_ptr: core::ptr::null_mut(),
+            pages: 0,
         }
     }
 
     pub fn is_some(&self) -> bool {
-        self.initialized
+        !self.table_ptr.is_null()
     }
 
     pub fn as_ref(&self) -> Option<&HandleTable> {
-        if self.initialized {
-            Some(unsafe { self.table.assume_init_ref() })
-        } else {
+        if self.table_ptr.is_null() {
             None
+        } else {
+            Some(unsafe { &*self.table_ptr })
         }
     }
 
     pub fn as_mut(&mut self) -> Option<&mut HandleTable> {
-        if self.initialized {
-            Some(unsafe { self.table.assume_init_mut() })
-        } else {
+        if self.table_ptr.is_null() {
             None
+        } else {
+            Some(unsafe { &mut *self.table_ptr })
         }
     }
 
-    /// Initialize the table in-place without stack allocation.
+    /// Allocate PMM pages and initialize the HandleTable in-place.
     ///
-    /// Uses `HandleTable::init_at()` to write fields directly to the
-    /// MaybeUninit storage via raw pointers.
+    /// Uses `HandleTable::init_at()` to write fields directly via raw
+    /// pointer (avoids placing ~220KB on the 64KB kernel stack).
     pub fn init_in_place(&mut self, is_user: bool) {
-        debug_assert!(!self.initialized, "double init of HandleTableSlot");
+        use crate::kernel::pmm;
+        use crate::arch::aarch64::mmu;
+
+        debug_assert!(self.table_ptr.is_null(), "double init of HandleTableSlot");
+
+        let size = core::mem::size_of::<HandleTable>();
+        let pages = (size + 4095) / 4096;
+
+        let phys = pmm::alloc_pages(pages)
+            .expect("HandleTableSlot: out of memory");
+        let virt = mmu::phys_to_virt(phys as u64) as *mut HandleTable;
+
         unsafe {
-            HandleTable::init_at(self.table.as_mut_ptr(), is_user);
+            HandleTable::init_at(virt, is_user);
         }
-        self.initialized = true;
+
+        self.table_ptr = virt;
+        self.pages = pages as u8;
     }
 
-    /// Mark slot as empty without moving the table to the stack.
+    /// Free the PMM pages and mark slot as empty.
     ///
     /// Safe because Object/HandleEntry/HandleTable don't implement Drop.
-    /// The MaybeUninit prevents automatic drop of the payload.
     pub fn clear(&mut self) {
-        self.initialized = false;
+        if !self.table_ptr.is_null() {
+            use crate::kernel::pmm;
+            use crate::arch::aarch64::mmu;
+
+            let phys = mmu::virt_to_phys(self.table_ptr as u64) as usize;
+            pmm::free_pages(phys, self.pages as usize);
+
+            self.table_ptr = core::ptr::null_mut();
+            self.pages = 0;
+        }
     }
 }
+
+// SAFETY: HandleTableSlot's pointer is only accessed under a SpinLock,
+// and the pointed-to memory is owned exclusively by this slot.
+unsafe impl Send for HandleTableSlot {}
 
 // ============================================================================
 // TableGuard - Lock Token
@@ -204,9 +231,10 @@ fn slot_from_task_id(task_id: TaskId) -> Option<usize> {
 /// Each task slot has its own SpinLock, eliminating the class of
 /// same-lock re-acquisition deadlocks.
 ///
-/// The tables array is allocated from PMM at boot time rather than
-/// stored inline. This avoids ~10MB of .data in the kernel image
-/// (256 slots × ~40KB each).
+/// The lock array is PMM-allocated at boot (tiny — just pointers per slot).
+/// Individual HandleTables are demand-allocated from PMM when tasks spawn
+/// and freed when tasks exit. This keeps kernel image size constant
+/// regardless of MAX_HANDLES.
 pub struct ObjectService {
     /// Pointer to PMM-allocated array of per-slot locks
     tables: *mut SpinLock<HandleTableSlot>,
@@ -602,10 +630,10 @@ impl ObjectService {
         let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
         // Per-process limit check via scheduler
-        let channel_count = crate::kernel::task::with_scheduler(|sched| {
-            sched.task(slot).map(|t| t.channel_count).unwrap_or(u16::MAX)
+        let can_create = crate::kernel::task::with_scheduler(|sched| {
+            sched.task(slot).map(|t| t.can_create_channel()).unwrap_or(false)
         });
-        if channel_count + 2 > crate::kernel::task::MAX_CHANNELS_PER_TASK {
+        if !can_create {
             return Err(KernelError::OutOfHandles);
         }
 
@@ -1265,4 +1293,86 @@ pub fn init() {
 /// Get a reference to the global ObjectService
 pub fn object_service() -> &'static ObjectService {
     unsafe { &*core::ptr::addr_of!(OBJECT_SERVICE) }
+}
+
+// ============================================================================
+// Handle Transfer Table
+// ============================================================================
+
+use crate::kernel::object::handle::HandleRights;
+
+/// Maximum concurrent in-flight handle transfers.
+/// Transfers are short-lived (placed on send, consumed on next read),
+/// so 8 slots is plenty for concurrent IPC.
+const MAX_TRANSFERS: usize = 8;
+
+/// A pending handle transfer attached to a channel message.
+struct PendingTransfer {
+    /// Channel ID this transfer is associated with (0 = empty slot)
+    channel_id: u32,
+    /// The transferred object
+    object_type: ObjectType,
+    rights: HandleRights,
+    object: Object,
+}
+
+/// Global transfer table for in-flight handle transfers.
+///
+/// When a task sends a message with FLAG_HANDLE_TRANSFER, the kernel
+/// extracts the Object from the sender's handle table and stores it here.
+/// When the receiver reads the message, the kernel takes the Object from
+/// here and inserts it into the receiver's handle table.
+static TRANSFER_TABLE: SpinLock<[Option<PendingTransfer>; MAX_TRANSFERS]> =
+    SpinLock::new(lock_class::RESOURCE, [const { None }; MAX_TRANSFERS]);
+
+/// Store a transferred handle for a channel.
+///
+/// Returns Ok(()) on success, Err(object) if table is full.
+pub fn store_transfer(
+    channel_id: u32,
+    object_type: ObjectType,
+    rights: HandleRights,
+    object: Object,
+) -> Result<(), Object> {
+    let mut table = TRANSFER_TABLE.lock();
+    for slot in table.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(PendingTransfer {
+                channel_id,
+                object_type,
+                rights,
+                object,
+            });
+            return Ok(());
+        }
+    }
+    Err(object)
+}
+
+/// Take a transferred handle for a channel.
+///
+/// Returns the object type, rights, and object if a transfer is pending.
+pub fn take_transfer(channel_id: u32) -> Option<(ObjectType, HandleRights, Object)> {
+    let mut table = TRANSFER_TABLE.lock();
+    for slot in table.iter_mut() {
+        if let Some(ref t) = slot {
+            if t.channel_id == channel_id {
+                let t = slot.take().unwrap();
+                return Some((t.object_type, t.rights, t.object));
+            }
+        }
+    }
+    None
+}
+
+/// Clean up any pending transfers for a channel (called on channel close).
+pub fn cleanup_transfers(channel_id: u32) {
+    let mut table = TRANSFER_TABLE.lock();
+    for slot in table.iter_mut() {
+        if let Some(ref t) = slot {
+            if t.channel_id == channel_id {
+                *slot = None;
+            }
+        }
+    }
 }

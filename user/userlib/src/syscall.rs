@@ -82,7 +82,7 @@ fn syscall2(num: u64, a0: u64, a1: u64) -> i64 {
 }
 
 #[inline(always)]
-fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+pub(crate) fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     let ret: i64;
     unsafe {
         asm!(
@@ -284,6 +284,61 @@ pub fn klog_write(record: &[u8]) -> i64 {
 /// Returns the number of bytes written to `buf`, or 0 if no logs available.
 pub fn klog_read(buf: &mut [u8]) -> i64 {
     syscall2(sys::KLOG_READ, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+
+/// Set console output log level
+pub fn set_console_level(level: u8) -> i64 {
+    syscall1(sys::SET_CONSOLE_LEVEL, level as u64)
+}
+
+/// Set per-module log level override (level=0xFF removes override)
+pub fn set_module_level(subsys: &[u8], level: u8) -> i64 {
+    syscall3(sys::SET_MODULE_LEVEL, subsys.as_ptr() as u64, subsys.len() as u64, level as u64)
+}
+
+/// Register exception channel on a child task.
+/// When child faults, kernel sends ExceptionInfo on this channel instead of killing.
+pub fn set_exception_channel(child_pid: u32, channel_handle: Handle) -> SysResult<()> {
+    let ret = syscall2(sys::SET_EXCEPTION_CHANNEL, child_pid as u64, channel_handle.0 as u64);
+    if ret < 0 {
+        Err(SysError::from_errno(ret as i32))
+    } else {
+        Ok(())
+    }
+}
+
+/// Resume or kill a frozen (faulted) child task.
+/// action: 0=resume, 1=kill
+pub fn exception_resume(child_pid: u32, action: u32) -> SysResult<()> {
+    let ret = syscall2(sys::EXCEPTION_RESUME, child_pid as u64, action as u64);
+    if ret < 0 {
+        Err(SysError::from_errno(ret as i32))
+    } else {
+        Ok(())
+    }
+}
+
+/// Non-destructive read from kernel log ring at a cursor position.
+///
+/// The `cursor` is read and updated: pass 0 to start from oldest record.
+/// Returns the number of formatted text bytes, or 0 if caught up.
+/// The formatted text is written to `buf[4..]`, cursor to `buf[0..4]`.
+pub fn klog_read_at(buf: &mut [u8], cursor: &mut u32) -> i64 {
+    if buf.len() < 5 {
+        return -22; // EINVAL
+    }
+    // Write cursor into first 4 bytes
+    buf[0..4].copy_from_slice(&cursor.to_le_bytes());
+
+    // Signal cursor mode with bit 31 set on length
+    let len_with_flag = buf.len() | 0x80000000;
+    let ret = syscall2(sys::KLOG_READ, buf.as_mut_ptr() as u64, len_with_flag as u64);
+
+    if ret > 0 {
+        // Read back updated cursor from first 4 bytes
+        *cursor = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    }
+    ret
 }
 
 /// Raw debug write to UART (bypasses klog buffer)

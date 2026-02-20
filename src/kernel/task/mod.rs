@@ -114,7 +114,7 @@ pub use policy::{SchedulingPolicy, PerCpuQueues};
 // Re-export TCB types
 pub use tcb::{
     Priority, NUM_PRIORITIES, TrapFrame, CpuContext, TaskId, Task,
-    MAX_CHANNELS_PER_TASK, STACK_CANARY,
+    STACK_CANARY,
     enter_usermode, context_switch,
 };
 
@@ -1006,6 +1006,7 @@ impl Scheduler {
                     TaskState::Exiting { .. } => "exiting",
                     TaskState::Dying { .. } => "dying",
                     TaskState::Evicting { .. } => "evicting",
+                    TaskState::Frozen { .. } => "FROZEN",
                     TaskState::Dead => "dead",
                 };
                 let marker = if i == current { ">" } else { " " };

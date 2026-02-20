@@ -130,9 +130,9 @@ pub fn default_rights(obj_type: ObjectType) -> HandleRights {
 /// Maximum handles per task.
 ///
 /// Handle ABI supports 24-bit indices (16M+), so this is purely a table size limit.
-/// NOTE: Increasing to 128 adds ~3MB to the kernel image (ObjectService array).
-/// Requires moving to demand-allocated tables before this can grow.
-pub const MAX_HANDLES: usize = 64;
+/// Tables are demand-allocated from PMM (not inline in kernel .data), so this
+/// can grow without affecting kernel image size.
+pub const MAX_HANDLES: usize = 128;
 
 /// Entry in the handle table
 pub struct HandleEntry {

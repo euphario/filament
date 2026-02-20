@@ -52,6 +52,10 @@ pub mod syscall {
     pub const SIGNAL_FLUSH: u64 = 83;
     pub const RESET_STATS: u64 = 84;
     pub const EXEC_WITH_MAILBOX: u64 = 85;
+    pub const SET_CONSOLE_LEVEL: u64 = 86;
+    pub const SET_MODULE_LEVEL: u64 = 87;
+    pub const SET_EXCEPTION_CHANNEL: u64 = 88;
+    pub const EXCEPTION_RESUME: u64 = 89;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;
@@ -351,16 +355,18 @@ pub enum LogLevel {
     Error = 0,
     Warn = 1,
     Info = 2,
-    Debug = 3,
-    Trace = 4,
+    Notice = 3,
+    Debug = 4,
+    Trace = 5,
 }
 
 pub mod log_level {
     pub const ERROR: u8 = 0;
     pub const WARN: u8 = 1;
     pub const INFO: u8 = 2;
-    pub const DEBUG: u8 = 3;
-    pub const TRACE: u8 = 4;
+    pub const NOTICE: u8 = 3;
+    pub const DEBUG: u8 = 4;
+    pub const TRACE: u8 = 5;
 }
 
 // ============================================================================
@@ -544,6 +550,50 @@ pub mod errno {
     pub const ECONNRESET: i32 = -104;  // Connection reset
     pub const ETIMEDOUT: i32 = -110;   // Connection timed out
     pub const ECONNREFUSED: i32 = -111; // Connection refused
+}
+
+// ============================================================================
+// IPC Message Flags
+// ============================================================================
+
+/// IPC message flags (used in write syscall buf_len bit 31 and message headers)
+pub mod message_flags {
+    /// This message carries a transferred handle.
+    /// Send: first 4 bytes of payload = raw handle to transfer.
+    /// Recv: first 4 bytes of payload = new handle in receiver's table.
+    /// Write syscall: set bit 31 of buf_len to enable.
+    /// Read syscall: bit 31 of return value set if handle was transferred.
+    pub const HANDLE_TRANSFER: u32 = 1 << 0;
+
+    /// Bit mask for write syscall buf_len to signal handle transfer
+    pub const WRITE_FLAG_HANDLE_TRANSFER: usize = 1 << 31;
+
+    /// Bit mask for read syscall return value to signal handle was received
+    pub const READ_FLAG_HANDLE_RECEIVED: i64 = 1 << 31;
+}
+
+// ============================================================================
+// Exception Channel
+// ============================================================================
+
+/// Exception info delivered to supervisor when a child faults.
+/// Layout: [pid:4][fault_type:1][_pad:3][esr:8][elr:8][far:8] = 32 bytes
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ExceptionInfo {
+    pub pid: u32,
+    /// 0=DataAbort, 1=InstrAbort, 2=SError, 3=Other
+    pub fault_type: u8,
+    pub _pad: [u8; 3],
+    pub esr: u64,
+    pub elr: u64,
+    pub far: u64,
+}
+
+/// Actions for exception_resume syscall
+pub mod exception_action {
+    pub const RESUME: u32 = 0;
+    pub const KILL: u32 = 1;
 }
 
 // ============================================================================

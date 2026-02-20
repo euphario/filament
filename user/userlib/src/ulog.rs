@@ -32,10 +32,12 @@ pub enum Level {
     Warn = 1,
     /// Major lifecycle events (boot, init, shutdown)
     Info = 2,
+    /// Detailed operational ("enumerated 3 ports", "link 1Gbps")
+    Notice = 3,
     /// Diagnostic - state transitions, operations
-    Debug = 3,
+    Debug = 4,
     /// Very verbose, per-operation
-    Trace = 4,
+    Trace = 5,
 }
 
 impl Level {
@@ -44,6 +46,7 @@ impl Level {
             Level::Error => "ERROR",
             Level::Warn => "WARN ",
             Level::Info => "INFO ",
+            Level::Notice => "NOTCE",
             Level::Debug => "DEBUG",
             Level::Trace => "TRACE",
         }
@@ -55,6 +58,7 @@ impl Level {
             Level::Error => b"\x1b[1;31m",  // Bold red
             Level::Warn => b"\x1b[33m",     // Yellow
             Level::Info => b"\x1b[32m",     // Green
+            Level::Notice => b"\x1b[34m",   // Blue
             Level::Debug => b"\x1b[2;37m",  // Dim white
             Level::Trace => b"\x1b[2;36m",  // Dim cyan
         }
@@ -65,8 +69,9 @@ impl Level {
             0 => Some(Level::Error),
             1 => Some(Level::Warn),
             2 => Some(Level::Info),
-            3 => Some(Level::Debug),
-            4 => Some(Level::Trace),
+            3 => Some(Level::Notice),
+            4 => Some(Level::Debug),
+            5 => Some(Level::Trace),
             _ => None,
         }
     }
@@ -835,6 +840,11 @@ macro_rules! uerror {
 #[macro_export]
 macro_rules! uwarn {
     ($($tt:tt)*) => { $crate::ulog!(Warn, $($tt)*) };
+}
+
+#[macro_export]
+macro_rules! unotice {
+    ($($tt:tt)*) => { $crate::ulog!(Notice, $($tt)*) };
 }
 
 #[macro_export]

@@ -110,26 +110,119 @@ pub(super) fn sys_set_log_level(level: u8) -> i64 {
     }
 }
 
-/// Read one formatted kernel log record into userspace buffer
-/// Args: buf (pointer to buffer), len (buffer size)
+/// Read one formatted kernel log record into userspace buffer.
+///
+/// Two modes:
+/// - Legacy (buf_len only): destructive drain from ring. Used by logd.
+/// - Cursor-based (buf_len has bit 31 set): non-destructive peek.
+///   arg0 = buf_ptr, arg1 = buf_len | 0x80000000
+///   First 4 bytes of buf are a u32 cursor (read + written back).
+///   Remaining buf_len-4 bytes receive the formatted record.
+///
 /// Returns: number of bytes written, 0 if no logs available, negative on error
 pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
-    if buf_len == 0 || buf_len > 1024 {
+    // Check for cursor mode (bit 31 set)
+    let cursor_mode = (buf_len & 0x80000000) != 0;
+    let actual_len = buf_len & 0x7FFFFFFF;
+
+    if cursor_mode {
+        // Cursor-based non-destructive read
+        if actual_len < 5 {
+            return KernelError::InvalidArg.to_errno();
+        }
+
+        // Read cursor from first 4 bytes of user buffer
+        let mut cursor_bytes = [0u8; 4];
+        match uaccess::copy_from_user(&mut cursor_bytes, buf_ptr) {
+            Ok(_) => {}
+            Err(_) => return KernelError::BadAddress.to_errno(),
+        }
+        let cursor = u32::from_le_bytes(cursor_bytes);
+
+        let mut record_buf = [0u8; crate::klog::MAX_RECORD_SIZE];
+        let result = {
+            let ring = crate::klog::LOG_RING.lock();
+            ring.peek_at(cursor, &mut record_buf)
+        };
+
+        let Some((len, new_cursor)) = result else {
+            return 0;
+        };
+
+        // Format to text
+        let text_space = actual_len - 4;
+        let mut text_buf = [0u8; 1024];
+        let text_len = crate::klog::format_record(&record_buf[..len], &mut text_buf);
+        if text_len == 0 {
+            return 0;
+        }
+
+        let copy_len = text_len.min(text_space);
+
+        // Write back new cursor
+        let new_cursor_bytes = new_cursor.to_le_bytes();
+        if uaccess::copy_to_user(buf_ptr, &new_cursor_bytes).is_err() {
+            return KernelError::BadAddress.to_errno();
+        }
+
+        // Write formatted text after cursor
+        match uaccess::copy_to_user(buf_ptr + 4, &text_buf[..copy_len]) {
+            Ok(n) => n as i64,
+            Err(_) => KernelError::BadAddress.to_errno(),
+        }
+    } else {
+        // Legacy destructive drain
+        if actual_len == 0 || actual_len > 1024 {
+            return KernelError::InvalidArg.to_errno();
+        }
+
+        let ctx = create_syscall_context();
+        let mut text_buf = [0u8; 1024];
+        let text_len = ctx.misc().read_log_record(&mut text_buf);
+        if text_len <= 0 {
+            return text_len;
+        }
+
+        let copy_len = (text_len as usize).min(actual_len);
+        match uaccess::copy_to_user(buf_ptr, &text_buf[..copy_len]) {
+            Ok(n) => n as i64,
+            Err(_) => KernelError::BadAddress.to_errno(),
+        }
+    }
+}
+
+/// Set console output log level
+/// Args: level (0=Error, 1=Warn, 2=Info, 3=Notice, 4=Debug, 5=Trace)
+pub(super) fn sys_set_console_level(level: u8) -> i64 {
+    match crate::klog::Level::from_u8(level) {
+        Some(lvl) => {
+            crate::klog::set_console_level(lvl);
+            0
+        }
+        None => KernelError::InvalidArg.to_errno(),
+    }
+}
+
+/// Set per-module log level override
+/// Args: subsys_ptr (subsystem name), subsys_len (name length), level (0xFF = remove)
+pub(super) fn sys_set_module_level(subsys_ptr: u64, subsys_len: usize, level: u8) -> i64 {
+    if subsys_len == 0 || subsys_len > 32 {
         return KernelError::InvalidArg.to_errno();
     }
 
-    let ctx = create_syscall_context();
-    let mut text_buf = [0u8; 1024];
-    let text_len = ctx.misc().read_log_record(&mut text_buf);
-    if text_len <= 0 {
-        return text_len;
+    // Validate level (0xFF = remove override, otherwise must be valid level)
+    if level != 0xFF && crate::klog::Level::from_u8(level).is_none() {
+        return KernelError::InvalidArg.to_errno();
     }
 
-    let copy_len = (text_len as usize).min(buf_len);
-    match uaccess::copy_to_user(buf_ptr, &text_buf[..copy_len]) {
-        Ok(n) => n as i64,
-        Err(_) => KernelError::BadAddress.to_errno(),
+    let mut name_buf = [0u8; 32];
+    match uaccess::copy_from_user(&mut name_buf[..subsys_len], subsys_ptr) {
+        Ok(_) => {}
+        Err(_) => return KernelError::BadAddress.to_errno(),
     }
+
+    crate::klog::set_module_level(&name_buf[..subsys_len], level);
+    0
 }
 
 /// Write a log message to kernel log buffer
@@ -378,6 +471,118 @@ pub(super) fn sys_get_priority() -> i64 {
             ((effective as i64) << 8) | (base as i64)
         } else {
             -1
+        }
+    })
+}
+
+/// Register exception channel on a child task.
+///
+/// When the child faults, instead of being killed, it is frozen and fault info
+/// is sent on the specified channel. The parent can then resume or kill the child.
+///
+/// Args: child_pid, channel_handle (raw u32 handle value from caller's table)
+pub(super) fn sys_set_exception_channel(child_pid: u32, channel_handle: u32) -> i64 {
+    use crate::kernel::error::KernelError;
+    use crate::kernel::object::{Handle, Object};
+    use crate::kernel::object_service::object_service;
+    use crate::kernel::task;
+
+    let caller_slot = task::current_slot();
+    let caller_pid = task::with_scheduler(|sched| {
+        sched.task(caller_slot).map(|t| t.id).unwrap_or(0)
+    });
+    if caller_pid == 0 {
+        return KernelError::NoProcess.to_errno();
+    }
+
+    // Verify channel handle exists and extract channel_id
+    let handle = Handle::from_raw(channel_handle);
+    let channel_id = object_service().with_table(caller_pid, |table| {
+        match table.get(handle) {
+            Some(entry) => match &entry.object {
+                Object::Channel(ch) => Ok(ch.channel_id()),
+                _ => Err(KernelError::BadHandle),
+            },
+            None => Err(KernelError::BadHandle),
+        }
+    });
+
+    let channel_id = match channel_id {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => return e.to_errno(),
+        Err(e) => return e.to_errno(),
+    };
+
+    // Verify child_pid is a child of caller and set exception_channel
+    task::with_scheduler(|sched| {
+        // Find child and verify parent relationship
+        let child_slot = match sched.slot_by_pid(child_pid) {
+            Some(s) => s,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+        let child = match sched.task_mut(child_slot) {
+            Some(t) => t,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+        if child.parent_id != caller_pid {
+            return KernelError::PermDenied.to_errno();
+        }
+        child.exception_channel = Some((caller_pid, channel_id));
+        0
+    })
+}
+
+/// Resume or kill a frozen (faulted) child task.
+///
+/// Args: child_pid, action (0=resume, 1=kill)
+pub(super) fn sys_exception_resume(child_pid: u32, action: u32) -> i64 {
+    use crate::kernel::error::KernelError;
+    use crate::kernel::task;
+
+    let caller_slot = task::current_slot();
+    let caller_pid = task::with_scheduler(|sched| {
+        sched.task(caller_slot).map(|t| t.id).unwrap_or(0)
+    });
+    if caller_pid == 0 {
+        return KernelError::NoProcess.to_errno();
+    }
+
+    task::with_scheduler(|sched| {
+        let child_slot = match sched.slot_by_pid(child_pid) {
+            Some(s) => s,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+        let child = match sched.task_mut(child_slot) {
+            Some(t) => t,
+            None => return KernelError::NoProcess.to_errno(),
+        };
+
+        // Verify parent relationship
+        if child.parent_id != caller_pid {
+            return KernelError::PermDenied.to_errno();
+        }
+
+        // Must be frozen
+        if !child.is_frozen() {
+            return KernelError::InvalidArg.to_errno();
+        }
+
+        match action {
+            0 => {
+                // Resume: Frozen → Ready
+                match child.resume_from_freeze() {
+                    Ok(()) => 0,
+                    Err(_) => KernelError::InvalidArg.to_errno(),
+                }
+            }
+            1 => {
+                // Kill: Frozen → Exiting
+                match child.set_exiting(-11) { // SIGSEGV
+                    Ok(()) => 0,
+                    Err(_) => KernelError::InvalidArg.to_errno(),
+                }
+            }
+            _ => KernelError::InvalidArg.to_errno(),
         }
     })
 }

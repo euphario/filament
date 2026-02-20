@@ -30,6 +30,7 @@ fn convert_state(state: &TaskState) -> TaskStateInfo {
         TaskState::Running { .. } => TaskStateInfo::Running,
         TaskState::Sleeping { .. } => TaskStateInfo::Sleeping,
         TaskState::Waiting { deadline, .. } => TaskStateInfo::Waiting { deadline: *deadline },
+        TaskState::Frozen { .. } => TaskStateInfo::Sleeping,  // Not schedulable, like sleeping
         TaskState::Exiting { .. } |
         TaskState::Dying { .. } |
         TaskState::Evicting { .. } |

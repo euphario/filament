@@ -9,6 +9,7 @@
 pub mod cat;
 pub mod devc;
 pub mod devd;
+pub mod dmesg;
 pub mod drivers;
 pub mod gpio;
 pub mod handle;

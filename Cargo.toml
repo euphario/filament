@@ -28,6 +28,11 @@ mock = []          # Enable mock implementations for unit testing
 platform-mt7988a = []    # BPI-R4 hardware (MediaTek MT7988A)
 platform-qemu-virt = []  # QEMU virt machine for testing
 
+# Boot-time log level (default: Info if none specified)
+log-level-notice = []    # Boot with Notice level
+log-level-debug = []     # Boot with Debug level
+log-level-trace = []     # Boot with Trace level
+
 [dependencies]
 abi = { path = "user/abi" }
 

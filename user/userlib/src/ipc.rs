@@ -68,6 +68,77 @@ impl Channel {
         Ok(())
     }
 
+    /// Send data with a handle transfer.
+    ///
+    /// The handle is removed from the sender's table and delivered to the
+    /// receiver. The receiver gets a new handle in their table when they
+    /// call `recv_with_handle()`.
+    ///
+    /// The transferred handle must have the GRANT right.
+    pub fn send_with_handle(&self, data: &[u8], xfer_handle: Handle) -> SysResult<()> {
+        if self.state == ChannelState::Closed || self.state == ChannelState::HalfClosed {
+            return Err(SysError::ConnectionReset);
+        }
+        // Build payload: [raw_handle:4] + [data:...]
+        let mut buf = [0u8; 580]; // MAX_INLINE_PAYLOAD + 4
+        let handle_bytes = xfer_handle.0.to_le_bytes();
+        buf[..4].copy_from_slice(&handle_bytes);
+        let data_len = data.len().min(576);
+        buf[4..4 + data_len].copy_from_slice(&data[..data_len]);
+        let total_len = 4 + data_len;
+        // Set bit 31 to signal handle transfer
+        let flagged_len = total_len | abi::message_flags::WRITE_FLAG_HANDLE_TRANSFER;
+        let ret = crate::syscall::syscall3(
+            abi::syscall::WRITE,
+            self.handle.0 as u64,
+            buf.as_ptr() as u64,
+            flagged_len as u64,
+        );
+        if ret < 0 {
+            Err(SysError::from_errno(ret as i32))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Try to receive without blocking, with handle transfer support.
+    ///
+    /// Returns Ok(Some((n, handle))) if data received. If a handle was
+    /// transferred, `handle` is Some(Handle), otherwise None.
+    /// The first 4 bytes of `buf` contain the new handle value when transferred.
+    pub fn try_recv_with_handle(&mut self, buf: &mut [u8]) -> SysResult<Option<(usize, Option<Handle>)>> {
+        if self.state == ChannelState::Closed {
+            return Err(SysError::ConnectionReset);
+        }
+        let ret = crate::syscall::syscall3(
+            abi::syscall::READ,
+            self.handle.0 as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+        );
+        if ret < 0 {
+            let err = SysError::from_errno(ret as i32);
+            match err {
+                SysError::ConnectionReset => {
+                    self.state = ChannelState::HalfClosed;
+                    Err(SysError::ConnectionReset)
+                }
+                SysError::WouldBlock => Ok(None),
+                e => Err(e),
+            }
+        } else {
+            let has_handle = (ret & abi::message_flags::READ_FLAG_HANDLE_RECEIVED) != 0;
+            let n = (ret & 0x7FFF_FFFF) as usize;
+            let handle = if has_handle && n >= 4 {
+                let raw = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                Some(Handle(raw))
+            } else {
+                None
+            };
+            Ok(Some((n, handle)))
+        }
+    }
+
     /// Try to receive without blocking.
     /// Returns Ok(Some(n)) if data received, Ok(None) if no data available.
     /// Use this after Mux tells you the channel is ready.

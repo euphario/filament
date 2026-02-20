@@ -33,10 +33,12 @@ pub enum Level {
     Warn = 1,
     /// Major lifecycle events (boot, init, shutdown)
     Info = 2,
+    /// Detailed operational ("enumerated 3 ports", "link 1Gbps")
+    Notice = 3,
     /// Diagnostic - state transitions, operations
-    Debug = 3,
+    Debug = 4,
     /// Very verbose, per-operation
-    Trace = 4,
+    Trace = 5,
 }
 
 impl Level {
@@ -45,6 +47,7 @@ impl Level {
             Level::Error => "ERROR",
             Level::Warn => "WARN ",
             Level::Info => "INFO ",
+            Level::Notice => "NOTCE",
             Level::Debug => "DEBUG",
             Level::Trace => "TRACE",
         }
@@ -56,6 +59,7 @@ impl Level {
             Level::Error => b"\x1b[1;31m",  // Bold red
             Level::Warn => b"\x1b[33m",     // Yellow
             Level::Info => b"\x1b[32m",     // Green
+            Level::Notice => b"\x1b[34m",   // Blue
             Level::Debug => b"\x1b[2;37m",  // Dim white
             Level::Trace => b"\x1b[2;36m",  // Dim cyan
         }
@@ -66,8 +70,9 @@ impl Level {
             0 => Some(Level::Error),
             1 => Some(Level::Warn),
             2 => Some(Level::Info),
-            3 => Some(Level::Debug),
-            4 => Some(Level::Trace),
+            3 => Some(Level::Notice),
+            4 => Some(Level::Debug),
+            5 => Some(Level::Trace),
             _ => None,
         }
     }
@@ -99,19 +104,29 @@ impl RecordHeader {
 // Ring Buffer
 // ============================================================================
 
-/// Ring buffer size (64KB)
-const RING_SIZE: usize = 65536;
+/// Ring buffer size (256KB)
+const RING_SIZE: usize = 262144;
 
 /// Maximum record size (512 bytes)
 pub const MAX_RECORD_SIZE: usize = 512;
 
 /// Ring buffer for log records (binary format)
+///
+/// Split cursor design:
+/// - `tail`: oldest valid record (only advanced by make_space when overwriting)
+/// - `drain_cursor`: console drain position (advanced by drain_one for UART output)
+/// - `head`: write position
+///
+/// Records between tail..head are always valid for non-destructive reads (dmesg).
+/// drain_cursor tracks what has been printed to console (UART).
 pub struct LogRing {
     buffer: [u8; RING_SIZE],
     /// Write position
     head: AtomicU32,
-    /// Read position
+    /// Oldest valid record (only advanced by make_space)
     tail: AtomicU32,
+    /// Console drain position (advanced by drain_one)
+    drain_cursor: AtomicU32,
     /// Number of dropped messages (monotonic)
     dropped: AtomicU64,
     /// Message sequence number
@@ -124,6 +139,7 @@ impl LogRing {
             buffer: [0; RING_SIZE],
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
+            drain_cursor: AtomicU32::new(0),
             dropped: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
         }
@@ -179,6 +195,7 @@ impl LogRing {
     }
 
     /// Make space by advancing tail (dropping oldest records)
+    /// Also snaps drain_cursor forward if it fell behind tail
     fn make_space(&mut self, needed: usize) {
         let mut freed = 0;
         while freed < needed {
@@ -198,19 +215,117 @@ impl LogRing {
             if record_len == 0 || record_len as usize > MAX_RECORD_SIZE {
                 // Corrupted record, reset buffer
                 self.tail.store(head as u32, Ordering::Release);
+                self.drain_cursor.store(head as u32, Ordering::Release);
                 break;
             }
 
             let aligned_len = ((record_len as usize) + 7) & !7;
             let new_tail = (tail + aligned_len) % RING_SIZE;
             self.tail.store(new_tail as u32, Ordering::Release);
+
+            // Snap drain_cursor forward if it was pointing at the dropped record
+            let drain = self.drain_cursor.load(Ordering::Relaxed) as usize;
+            if drain == tail {
+                self.drain_cursor.store(new_tail as u32, Ordering::Release);
+            }
+
             self.dropped.fetch_add(1, Ordering::Relaxed);
             freed += aligned_len;
         }
     }
 
-    /// Read next record from the ring buffer
-    /// Returns the record data, or None if empty
+    /// Read next record for console drain (advances drain_cursor, NOT tail).
+    /// Record stays in ring for non-destructive reads (dmesg).
+    /// Returns the record data, or None if drain_cursor has caught up to head.
+    pub fn drain_read(&mut self, out: &mut [u8; MAX_RECORD_SIZE]) -> Option<usize> {
+        let cursor = self.drain_cursor.load(Ordering::Relaxed) as usize;
+        let head = self.head.load(Ordering::Acquire) as usize;
+
+        if cursor == head {
+            return None;
+        }
+
+        // Read record length from header
+        let len_lo = self.buffer[cursor] as u16;
+        let len_hi = self.buffer[(cursor + 1) % RING_SIZE] as u16;
+        let record_len = (len_hi << 8) | len_lo;
+
+        if record_len == 0 || record_len as usize > MAX_RECORD_SIZE {
+            // Corrupted, snap to head
+            self.drain_cursor.store(head as u32, Ordering::Release);
+            return None;
+        }
+
+        let len = record_len as usize;
+        let aligned_len = (len + 7) & !7;
+
+        // Copy record data
+        let mut pos = cursor;
+        for i in 0..len {
+            out[i] = self.buffer[pos];
+            pos = (pos + 1) % RING_SIZE;
+        }
+
+        // Advance drain_cursor past padding
+        let new_cursor = (cursor + aligned_len) % RING_SIZE;
+        self.drain_cursor.store(new_cursor as u32, Ordering::Release);
+
+        Some(len)
+    }
+
+    /// Non-destructive read at an arbitrary cursor position.
+    /// Used by dmesg to iterate through the ring without consuming records.
+    ///
+    /// If `cursor` has been overwritten (behind tail), snaps to tail.
+    /// Returns `Some((bytes_read, new_cursor))` or `None` if cursor == head.
+    pub fn peek_at(&self, cursor: u32, out: &mut [u8; MAX_RECORD_SIZE]) -> Option<(usize, u32)> {
+        let tail = self.tail.load(Ordering::Acquire) as usize;
+        let head = self.head.load(Ordering::Acquire) as usize;
+        let mut cur = cursor as usize;
+
+        // Snap cursor to tail if it fell behind (data was overwritten)
+        // Check if cursor is in the invalid region between head and tail
+        if head >= tail {
+            // Valid range: [tail..head)
+            if cur < tail || cur >= head {
+                if cur == head { return None; }
+                cur = tail;
+            }
+        } else {
+            // Wrapped: valid range is [tail..RING_SIZE) + [0..head)
+            if cur >= head && cur < tail {
+                cur = tail;
+            }
+        }
+
+        if cur == head {
+            return None;
+        }
+
+        // Read record length from header
+        let len_lo = self.buffer[cur] as u16;
+        let len_hi = self.buffer[(cur + 1) % RING_SIZE] as u16;
+        let record_len = (len_hi << 8) | len_lo;
+
+        if record_len == 0 || record_len as usize > MAX_RECORD_SIZE {
+            return None;
+        }
+
+        let len = record_len as usize;
+        let aligned_len = (len + 7) & !7;
+
+        // Copy record data
+        let mut pos = cur;
+        for i in 0..len {
+            out[i] = self.buffer[pos];
+            pos = (pos + 1) % RING_SIZE;
+        }
+
+        let new_cursor = ((cur + aligned_len) % RING_SIZE) as u32;
+        Some((len, new_cursor))
+    }
+
+    /// Legacy read: destructive, advances tail. Used for backward compat.
     pub fn read(&mut self, out: &mut [u8; MAX_RECORD_SIZE]) -> Option<usize> {
         let tail = self.tail.load(Ordering::Relaxed) as usize;
         let head = self.head.load(Ordering::Acquire) as usize;
@@ -247,6 +362,11 @@ impl LogRing {
         Some(len)
     }
 
+    /// Get current tail position (for dmesg to start iteration)
+    pub fn tail_cursor(&self) -> u32 {
+        self.tail.load(Ordering::Acquire)
+    }
+
     /// Get number of dropped messages
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
@@ -257,7 +377,12 @@ impl LogRing {
         self.sequence.load(Ordering::Relaxed)
     }
 
-    /// Check if buffer has data
+    /// Check if drain has pending data
+    pub fn has_drain_data(&self) -> bool {
+        self.drain_cursor.load(Ordering::Acquire) != self.head.load(Ordering::Acquire)
+    }
+
+    /// Check if buffer has data (any records between tail and head)
     pub fn has_data(&self) -> bool {
         self.tail.load(Ordering::Acquire) != self.head.load(Ordering::Acquire)
     }
@@ -276,8 +401,26 @@ static BOOT_TIME: AtomicU64 = AtomicU64::new(0);
 /// Counter frequency in Hz
 static COUNTER_FREQ: AtomicU64 = AtomicU64::new(24_000_000);
 
-/// Current log level
-static LOG_LEVEL: AtomicU32 = AtomicU32::new(Level::Info as u32);
+/// Initial log level determined at compile time
+const fn initial_log_level() -> u32 {
+    if cfg!(feature = "log-level-trace") {
+        Level::Trace as u32
+    } else if cfg!(feature = "log-level-debug") {
+        Level::Debug as u32
+    } else if cfg!(feature = "log-level-notice") {
+        Level::Notice as u32
+    } else {
+        Level::Info as u32
+    }
+}
+
+/// Current log level (controls which records are written to ring)
+static LOG_LEVEL: AtomicU32 = AtomicU32::new(initial_log_level());
+
+/// Console output level (controls which records are printed to UART)
+/// Records above this level are consumed from drain_cursor but NOT printed.
+/// They remain in the ring for dmesg.
+static CONSOLE_LEVEL: AtomicU32 = AtomicU32::new(initial_log_level());
 
 /// Initialize the logging system
 pub fn init() {
@@ -323,6 +466,106 @@ pub fn get_level() -> Level {
 #[inline]
 pub fn is_enabled(level: Level) -> bool {
     (level as u32) <= LOG_LEVEL.load(Ordering::Relaxed)
+}
+
+/// Set the console output level
+pub fn set_console_level(level: Level) {
+    CONSOLE_LEVEL.store(level as u32, Ordering::Release);
+}
+
+/// Get the current console output level
+pub fn get_console_level() -> Level {
+    Level::from_u8(CONSOLE_LEVEL.load(Ordering::Acquire) as u8).unwrap_or(Level::Info)
+}
+
+// ============================================================================
+// Per-Module Filtering
+// ============================================================================
+
+/// Per-module log level override
+struct ModuleFilter {
+    subsys_hash: u32,
+    level: u8,
+    active: bool,
+}
+
+/// Maximum number of per-module overrides
+const MAX_MODULE_FILTERS: usize = 16;
+
+/// Per-module filter table
+static MODULE_FILTERS: crate::kernel::lock::SpinLock<[ModuleFilter; MAX_MODULE_FILTERS]> =
+    crate::kernel::lock::SpinLock::new(
+        crate::kernel::lock::lock_class::UNORDERED,
+        {
+            const EMPTY: ModuleFilter = ModuleFilter { subsys_hash: 0, level: 0, active: false };
+            [EMPTY; MAX_MODULE_FILTERS]
+        }
+    );
+
+/// FNV-1a hash for subsystem name matching
+fn fnv1a_hash(data: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for &byte in data {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+/// Check if a log level is enabled for a specific subsystem
+/// Fast path: global level allows → true
+/// Slow path: check per-module overrides
+#[inline]
+pub fn is_enabled_for(level: Level, subsys: &str) -> bool {
+    // Fast path: global level check
+    if (level as u32) <= LOG_LEVEL.load(Ordering::Relaxed) {
+        return true;
+    }
+
+    // Slow path: check per-module overrides
+    let hash = fnv1a_hash(subsys.as_bytes());
+    let filters = MODULE_FILTERS.lock();
+    for f in filters.iter() {
+        if f.active && f.subsys_hash == hash {
+            return (level as u8) <= f.level;
+        }
+    }
+
+    false
+}
+
+/// Set a per-module log level override (level=0xFF removes the override)
+pub fn set_module_level(subsys: &[u8], level: u8) {
+    let hash = fnv1a_hash(subsys);
+    let mut filters = MODULE_FILTERS.lock();
+
+    if level == 0xFF {
+        // Remove override
+        for f in filters.iter_mut() {
+            if f.active && f.subsys_hash == hash {
+                f.active = false;
+                return;
+            }
+        }
+        return;
+    }
+
+    // Update existing or find empty slot
+    for f in filters.iter_mut() {
+        if f.active && f.subsys_hash == hash {
+            f.level = level;
+            return;
+        }
+    }
+    for f in filters.iter_mut() {
+        if !f.active {
+            f.subsys_hash = hash;
+            f.level = level;
+            f.active = true;
+            return;
+        }
+    }
+    // Table full — silently drop
 }
 
 // ============================================================================
@@ -781,20 +1024,31 @@ fn write_hex64(out: &mut [u8], val: u64) -> usize {
 // Drain (called from timer interrupt or explicit flush)
 // ============================================================================
 
-/// Drain one record from the ring buffer and output directly to UART
-/// Returns true if a record was drained
+/// Drain one record from the ring buffer and output directly to UART.
+/// Uses drain_cursor (not tail), so records remain in ring for dmesg.
+/// Returns true if a record was drained.
 pub fn drain_one() -> bool {
     let mut record_buf = [0u8; MAX_RECORD_SIZE];
     let mut text_buf = [0u8; 1024];
 
     let record_len = {
         let mut ring = LOG_RING.lock();
-        ring.read(&mut record_buf)
+        ring.drain_read(&mut record_buf)
     };
 
     let Some(len) = record_len else {
         return false;
     };
+
+    // Check console level filter — skip printing if record level is above threshold
+    let console_level = CONSOLE_LEVEL.load(Ordering::Relaxed);
+    if len >= RecordHeader::SIZE {
+        let record_level = record_buf[6];
+        if record_level > console_level as u8 {
+            // Record is filtered from console but stays in ring for dmesg
+            return true;
+        }
+    }
 
     let text_len = format_record(&record_buf[..len], &mut text_buf);
     if text_len > 0 {
@@ -822,10 +1076,10 @@ pub fn try_drain(max_records: usize) -> usize {
     count
 }
 
-/// Check if there are pending records
+/// Check if there are pending records for console drain
 pub fn has_pending() -> bool {
     let ring = LOG_RING.lock();
-    ring.has_data()
+    ring.has_drain_data()
 }
 
 /// Get number of dropped records
@@ -943,7 +1197,7 @@ macro_rules! _klog_count {
 macro_rules! klog {
     // With context: klog!(LEVEL, "subsys", [ctx...], "event"; kvs...)
     ($level:ident, $subsys:expr, [$($ctx_key:ident = $ctx_val:expr),* $(,)?], $event:expr; $($key:ident = $val:expr),* $(,)?) => {{
-        if $crate::klog::is_enabled($crate::klog::Level::$level) {
+        if $crate::klog::is_enabled_for($crate::klog::Level::$level, $subsys) {
             let ctx_count = $crate::_klog_count!($($ctx_key)*);
             let kv_count = $crate::_klog_count!($($key)*);
             let mut builder = $crate::klog::_start_record(
@@ -964,7 +1218,7 @@ macro_rules! klog {
     }};
     // Without context: klog!(LEVEL, "subsys", "event"; kvs...)
     ($level:ident, $subsys:expr, $event:expr; $($key:ident = $val:expr),* $(,)?) => {{
-        if $crate::klog::is_enabled($crate::klog::Level::$level) {
+        if $crate::klog::is_enabled_for($crate::klog::Level::$level, $subsys) {
             let kv_count = $crate::_klog_count!($($key)*);
             let mut builder = $crate::klog::_start_record(
                 $crate::klog::Level::$level,
@@ -981,7 +1235,7 @@ macro_rules! klog {
     }};
     // Event only: klog!(LEVEL, "subsys", "event")
     ($level:ident, $subsys:expr, $event:expr) => {{
-        if $crate::klog::is_enabled($crate::klog::Level::$level) {
+        if $crate::klog::is_enabled_for($crate::klog::Level::$level, $subsys) {
             let builder = $crate::klog::_start_record(
                 $crate::klog::Level::$level,
                 $subsys,
@@ -1010,6 +1264,12 @@ macro_rules! kerror {
 #[macro_export]
 macro_rules! kwarn {
     ($($tt:tt)*) => { $crate::klog!(Warn, $($tt)*) };
+}
+
+/// Convenience macro for NOTICE level
+#[macro_export]
+macro_rules! knotice {
+    ($($tt:tt)*) => { $crate::klog!(Notice, $($tt)*) };
 }
 
 /// Convenience macro for DEBUG level
