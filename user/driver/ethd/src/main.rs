@@ -3316,23 +3316,8 @@ impl Driver for EthDriver {
             // Restore original value
             fe.write32(0x10c, pse_dumy_before);
 
-            // Test: Direct SRAM access at FE offset 0x40000
-            // SRAM should be within FE region (FE_SIZE = 0x80000 = 512KB)
-            let sram_test_offset = FE_SRAM_OFFSET as usize;
-            let sram_before = fe.read32(sram_test_offset);
-            udebug!("ethd", "sram_via_fe_before"; offset = userlib::ulog::hex32(sram_test_offset as u32),
-                   val = userlib::ulog::hex32(sram_before));
-
-            fe.write32(sram_test_offset, 0xCAFEBABE);
-            let sram_after = fe.read32(sram_test_offset);
-            udebug!("ethd", "sram_via_fe_after"; offset = userlib::ulog::hex32(sram_test_offset as u32),
-                   wrote = userlib::ulog::hex32(0xCAFEBABE), read = userlib::ulog::hex32(sram_after));
-
-            // If sram_after != 0xCAFEBABE, SRAM writes are being ignored!
-            if sram_after != 0xCAFEBABE {
-                uerror!("ethd", "sram_write_failed"; expected = userlib::ulog::hex32(0xCAFEBABE),
-                        got = userlib::ulog::hex32(sram_after));
-            }
+            // NOTE: FE_SRAM_OFFSET (0x40000) is for older NETSYS V2 chips.
+            // MT7988 SRAM is at a separate address (0x15400000), tested below.
         }
 
         self.fe = Some(fe);

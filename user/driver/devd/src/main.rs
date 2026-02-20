@@ -3854,7 +3854,11 @@ impl Devd {
             });
         }
         if let Some(idx) = existing_idx {
-            if !self.services.get(idx).map(|s| s.state.is_exited()).unwrap_or(false) {
+            // Only respawn if Crashed or Failed — NOT Stopped (code 0 = hardware absent).
+            let can_respawn = self.services.get(idx)
+                .map(|s| matches!(s.state, ServiceState::Crashed { .. } | ServiceState::Failed { .. }))
+                .unwrap_or(false);
+            if !can_respawn {
                 return;
             }
             // Cancel old instance's inline restart timer to prevent duplicate spawn
