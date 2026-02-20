@@ -1080,6 +1080,10 @@ impl Pollable for KlogObject {
 /// 24 gives devd headroom for ~10 buses + watchers + query port.
 pub const MAX_MUX_WATCHES: usize = 24;
 
+/// Maximum inline timers per Mux object
+/// 8 covers restart timers + admin request timeouts.
+pub const MAX_MUX_TIMERS: usize = 8;
+
 /// Maximum events returned per mux poll
 pub const MAX_MUX_EVENTS: usize = 16;
 
@@ -1102,9 +1106,20 @@ impl MuxWatch {
 // Re-export MuxEvent from abi crate - single source of truth
 pub use abi::MuxEvent;
 
+/// Inline timer slot inside a MuxObject
+#[derive(Clone, Copy)]
+pub struct MuxInlineTimer {
+    /// Userspace identifier, returned in MuxEvent.handle
+    pub tag: u32,
+    /// Absolute deadline in counter ticks
+    pub deadline: u64,
+}
+
 pub struct MuxObject {
     /// Watched handles
     watches: [Option<MuxWatch>; MAX_MUX_WATCHES],
+    /// Inline timer slots (one-shot, auto-removed on fire)
+    timers: [Option<MuxInlineTimer>; MAX_MUX_TIMERS],
     /// Wait queue for the mux itself (task blocked in mux.wait())
     wait_queue: WaitQueue,
     /// Timeout in nanoseconds for wait (0 = no timeout, block forever)
@@ -1113,7 +1128,7 @@ pub struct MuxObject {
 
 impl MuxObject {
     pub fn new() -> Self {
-        Self { watches: [None; MAX_MUX_WATCHES], wait_queue: WaitQueue::new(), timeout_ns: 0 }
+        Self { watches: [None; MAX_MUX_WATCHES], timers: [None; MAX_MUX_TIMERS], wait_queue: WaitQueue::new(), timeout_ns: 0 }
     }
     /// Get first subscriber (bridge for existing callers)
     pub fn subscriber(&self) -> Option<Subscriber> {
@@ -1121,6 +1136,9 @@ impl MuxObject {
     }
     pub fn watches(&self) -> &[Option<MuxWatch>; MAX_MUX_WATCHES] { &self.watches }
     pub fn watches_mut(&mut self) -> &mut [Option<MuxWatch>; MAX_MUX_WATCHES] { &mut self.watches }
+    /// Get inline timer slots
+    pub fn timers(&self) -> &[Option<MuxInlineTimer>; MAX_MUX_TIMERS] { &self.timers }
+    pub fn timers_mut(&mut self) -> &mut [Option<MuxInlineTimer>; MAX_MUX_TIMERS] { &mut self.timers }
     /// Get timeout in nanoseconds (0 = no timeout)
     pub fn timeout_ns(&self) -> u64 { self.timeout_ns }
     /// Set timeout in nanoseconds (0 = no timeout)
@@ -1128,6 +1146,54 @@ impl MuxObject {
     /// Access wait queue
     pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
     pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
+
+    /// Add an inline timer. Returns Ok(()) or Err if full.
+    pub fn add_timer(&mut self, tag: u32, deadline: u64) -> Result<(), ()> {
+        // Replace existing timer with same tag, or find empty slot
+        for slot in self.timers.iter_mut() {
+            if let Some(t) = slot {
+                if t.tag == tag {
+                    t.deadline = deadline;
+                    return Ok(());
+                }
+            }
+        }
+        for slot in self.timers.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(MuxInlineTimer { tag, deadline });
+                return Ok(());
+            }
+        }
+        Err(())
+    }
+
+    /// Remove an inline timer by tag. Returns true if found.
+    pub fn remove_timer(&mut self, tag: u32) -> bool {
+        for slot in self.timers.iter_mut() {
+            if let Some(t) = slot {
+                if t.tag == tag {
+                    *slot = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get the earliest inline timer deadline (for scheduler note_deadline).
+    /// Returns None if no timers are set.
+    pub fn earliest_timer_deadline(&self) -> Option<u64> {
+        let mut earliest: Option<u64> = None;
+        for slot in &self.timers {
+            if let Some(t) = slot {
+                earliest = Some(match earliest {
+                    Some(e) if e < t.deadline => e,
+                    _ => t.deadline,
+                });
+            }
+        }
+        earliest
+    }
 }
 
 

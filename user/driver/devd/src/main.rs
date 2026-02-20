@@ -33,7 +33,7 @@ mod rules;
 
 use userlib::syscall;
 use userlib::{uinfo, uwarn, uerror, udebug};
-use userlib::ipc::{Port, Timer, EventLoop, ObjHandle, Mux, MuxFilter};
+use userlib::ipc::{Port, EventLoop, ObjHandle, Mux, MuxFilter};
 use userlib::error::{SysError, SysResult};
 use userlib::query::{
     QueryHeader, SpawnChildContext, msg, query_flags,
@@ -681,10 +681,6 @@ pub struct Devd {
     /// Bitmask of query client slots that failed to be added to the Mux
     /// (bit N = slot N needs polling because watch() failed)
     overflow_query_mask: u16,
-    /// Number of active restart timers (for skipping poll_restart_timers)
-    active_restart_count: u8,
-    /// Number of active pending admin requests (for skipping drain_expired_requests)
-    active_request_count: u8,
 }
 
 impl Devd {
@@ -709,8 +705,6 @@ impl Devd {
             pending_context_kv_count: 0,
             deferred_rules: [const { DeferredRuleFire::empty() }; MAX_DEFERRED_RULES],
             overflow_query_mask: 0,
-            active_restart_count: 0,
-            active_request_count: 0,
         }
     }
 
@@ -722,11 +716,10 @@ impl Devd {
         syscall::gettime() / 1_000_000
     }
 
-    /// Whether any state requires periodic polling (overflow clients, timers, requests).
+    /// Whether any state requires periodic polling (overflow clients only).
+    /// Restart timers and admin request timeouts are handled by Mux inline timers.
     fn needs_polling(&self) -> bool {
         self.overflow_query_mask != 0
-            || self.active_restart_count != 0
-            || self.active_request_count != 0
     }
 
     /// Recalculate the Mux timeout based on whether polling is needed.
@@ -1187,40 +1180,28 @@ impl Devd {
             }
         }
 
-        // Create restart timer if needed
+        // Create restart timer if needed (inline timer in Mux — tag = service index)
         match action {
             ExitAction::Crashed { backoff_ms } => {
-                if let Ok(mut timer) = Timer::new() {
-                    let deadline_ns = (backoff_ms as u64) * 1_000_000;
-                    if timer.set(deadline_ns).is_ok() {
-                        if let Some(events) = &mut self.events {
-                            if events.watch(timer.handle()).is_err() {
-                                uwarn!("devd", "restart_timer_watch_failed"; idx = idx as u32);
-                            }
-                        }
-                        if let Some(service) = self.services.get_mut(idx) {
-                            service.restart_timer = Some(timer);
-                            self.active_restart_count += 1;
-                            self.update_timeout();
-                        }
+                let deadline_ns = (backoff_ms as u64) * 1_000_000;
+                if let Some(events) = &self.events {
+                    if events.add_timer(idx as u32, deadline_ns).is_err() {
+                        uwarn!("devd", "restart_timer_add_failed"; idx = idx as u32);
                     }
+                }
+                if let Some(service) = self.services.get_mut(idx) {
+                    service.has_restart_timer = true;
                 }
             }
             ExitAction::Failed => {
-                if let Ok(mut timer) = Timer::new() {
-                    let deadline_ns = FAILED_RETRY_MS * 1_000_000;
-                    if timer.set(deadline_ns).is_ok() {
-                        if let Some(events) = &mut self.events {
-                            if events.watch(timer.handle()).is_err() {
-                                uwarn!("devd", "restart_timer_watch_failed"; idx = idx as u32);
-                            }
-                        }
-                        if let Some(service) = self.services.get_mut(idx) {
-                            service.restart_timer = Some(timer);
-                            self.active_restart_count += 1;
-                            self.update_timeout();
-                        }
+                let deadline_ns = FAILED_RETRY_MS * 1_000_000;
+                if let Some(events) = &self.events {
+                    if events.add_timer(idx as u32, deadline_ns).is_err() {
+                        uwarn!("devd", "restart_timer_add_failed"; idx = idx as u32);
                     }
+                }
+                if let Some(service) = self.services.get_mut(idx) {
+                    service.has_restart_timer = true;
                 }
             }
             ExitAction::Stopped => {}
@@ -1911,14 +1892,15 @@ impl Devd {
             return false;
         }
 
-        // 5s timeout — safety net only, EOL convergence is the normal path
+        // 5s timeout via inline timer (tag = 0x100 | req_slot)
         req.deadline_ns = userlib::syscall::gettime() + 5_000_000_000;
         // Relay mode for CONFIG queries: send each response immediately to avoid
         // accumulating into a 1024-byte buffer that can silently truncate.
         req.relay = client_seq_id == 0;
         self.pending_requests[req_slot] = req;
-        self.active_request_count += 1;
-        self.update_timeout();
+        if let Some(events) = &self.events {
+            let _ = events.add_timer(0x100 | req_slot as u32, 5_000_000_000);
+        }
         true
     }
 
@@ -2084,8 +2066,10 @@ impl Devd {
         }
 
         self.pending_requests[req_slot] = PendingAdminRequest::empty();
-        self.active_request_count = self.active_request_count.saturating_sub(1);
-        self.update_timeout();
+        // Cancel the inline timer (may already be auto-removed if it fired)
+        if let Some(events) = &self.events {
+            let _ = events.remove_timer(0x100 | req_slot as u32);
+        }
     }
 
     /// Send a raw text response to a query client, chunked on line boundaries
@@ -2110,18 +2094,11 @@ impl Devd {
         }
     }
 
-    /// Drain expired admin requests — called from event loop.
-    /// Timeout is a safety net — should not fire in normal operation.
-    fn drain_expired_requests(&mut self) {
-        if self.active_request_count == 0 {
-            return;
-        }
-        let now = userlib::syscall::gettime();
-        for i in 0..MAX_PENDING_REQUESTS {
-            if self.pending_requests[i].is_active() && self.pending_requests[i].deadline_ns <= now {
-                uerror!("devd", "admin_request_timeout"; slot = i);
-                self.complete_admin_request(i);
-            }
+    /// Handle an admin request timeout (inline timer fired).
+    fn handle_admin_request_timeout(&mut self, req_slot: usize) {
+        if req_slot < MAX_PENDING_REQUESTS && self.pending_requests[req_slot].is_active() {
+            uerror!("devd", "admin_request_timeout"; slot = req_slot);
+            self.complete_admin_request(req_slot);
         }
     }
 
@@ -2144,14 +2121,9 @@ impl Devd {
         }
 
         let now = Self::now_ms();
-        // Extract timer first (separate borrow scope)
-        let timer = self.services.get_mut(idx).and_then(|s| s.restart_timer.take());
-        if let Some(timer) = timer {
-            if let Some(events) = &mut self.events {
-                let _ = events.unwatch(timer.handle());
-            }
-            self.active_restart_count = self.active_restart_count.saturating_sub(1);
-            self.update_timeout();
+        // Inline timer auto-removed by kernel on fire — just clear the flag
+        if let Some(service) = self.services.get_mut(idx) {
+            service.has_restart_timer = false;
         }
 
         // Determine action
@@ -2199,31 +2171,6 @@ impl Devd {
         }
     }
 
-    /// Poll restart timers using wall-clock comparison.
-    ///
-    /// Fallback for timers that couldn't be added to the Mux (16-handle limit).
-    /// Called on every event loop iteration (100ms timeout). Timers that ARE
-    /// in the Mux fire immediately via Mux events; this catches the rest.
-    fn poll_restart_timers(&mut self) {
-        if self.active_restart_count == 0 {
-            return;
-        }
-        let now = Self::now_ms();
-        let mut ready = [0u16; MAX_SERVICES];
-        let mut count = 0;
-        self.services.for_each(|idx, svc| {
-            if svc.restart_timer.is_some() && count < MAX_SERVICES {
-                let deadline = svc.last_change + svc.backoff_ms as u64;
-                if now >= deadline {
-                    ready[count] = idx as u16;
-                    count += 1;
-                }
-            }
-        });
-        for i in 0..count {
-            self.handle_restart_timer(ready[i] as usize);
-        }
-    }
 
     // =========================================================================
     // Signal Event Handling
@@ -3910,14 +3857,14 @@ impl Devd {
             if !self.services.get(idx).map(|s| s.state.is_exited()).unwrap_or(false) {
                 return;
             }
-            // Cancel old instance's restart timer to prevent duplicate spawn
-            let old_timer = self.services.get_mut(idx).and_then(|s| s.restart_timer.take());
-            if let Some(timer) = old_timer {
-                if let Some(events) = &mut self.events {
-                    let _ = events.unwatch(timer.handle());
+            // Cancel old instance's inline restart timer to prevent duplicate spawn
+            if let Some(service) = self.services.get_mut(idx) {
+                if service.has_restart_timer {
+                    if let Some(events) = &self.events {
+                        let _ = events.remove_timer(idx as u32);
+                    }
+                    service.has_restart_timer = false;
                 }
-                self.active_restart_count = self.active_restart_count.saturating_sub(1);
-                self.update_timeout();
             }
             if let Some(service) = self.services.get_mut(idx) {
                 service.state = ServiceState::Stopped { code: 0 };
@@ -4105,9 +4052,17 @@ impl Devd {
         }
     }
 
-    /// Check if a parent driver already has an in-flight SuperQ SpawnChild command.
+    /// Check if a parent driver's SuperQ is at capacity for inflight spawns.
+    ///
+    /// The SuperQ down-ring has 8 entries. Each SpawnChild message with ADDRESSED
+    /// routing takes ~3 FORWARD notes. Allow 2 concurrent inflight spawns per
+    /// parent (6 notes), leaving headroom in the 8-entry ring.
     fn has_inflight_superq_spawn(&self, parent_svc_idx: u8) -> bool {
-        self.inflight_spawns.iter().any(|e| e.seq_id != 0 && e.parent_service_idx == parent_svc_idx)
+        const MAX_INFLIGHT_PER_PARENT: usize = 2;
+        let count = self.inflight_spawns.iter()
+            .filter(|e| e.seq_id != 0 && e.parent_service_idx == parent_svc_idx)
+            .count();
+        count >= MAX_INFLIGHT_PER_PARENT
     }
 
     /// Queue a deferred rule fire for a port whose parent SuperQ is busy.
@@ -4243,8 +4198,7 @@ impl Devd {
 
     pub fn run(&mut self) -> ! {
         // Start with no timeout — the Mux blocks until an event fires.
-        // update_timeout() will enable 100ms polling if overflow clients,
-        // restart timers, or pending admin requests appear.
+        // update_timeout() will enable 100ms polling if overflow clients appear.
         self.update_timeout();
 
         loop {
@@ -4253,8 +4207,17 @@ impl Devd {
 
             match wait_result {
                 Ok(event) => {
+                    // Inline timer event (restart timers + admin request timeouts)
+                    if (event.event & abi::mux_filter::TIMER) != 0 {
+                        let tag = event.handle.raw();
+                        if tag < MAX_SERVICES as u32 {
+                            self.handle_restart_timer(tag as usize);
+                        } else if tag >= 0x100 && tag < 0x100 + MAX_PENDING_REQUESTS as u32 {
+                            self.handle_admin_request_timeout((tag - 0x100) as usize);
+                        }
+                    }
                     // Signal event (handle is INVALID)
-                    if event.is_signal() {
+                    else if event.is_signal() {
                         self.handle_signal_event(&event);
                         // Fall through to poll/flush below
                     } else {
@@ -4266,14 +4229,9 @@ impl Devd {
                             } else if self.query_handler.find_by_handle(handle).is_some() {
                                 // Query client message (or supervision channel close)
                                 self.handle_query_client_event(handle);
-                            } else if let Some(idx) = self.services.find_by_timer(handle) {
-                                // Service restart timer?
-                                self.handle_restart_timer(idx);
                             }
                         } else if self.query_handler.find_by_handle(handle).is_some() {
                             self.handle_query_client_event(handle);
-                        } else if let Some(idx) = self.services.find_by_timer(handle) {
-                            self.handle_restart_timer(idx);
                         }
                     }
                 }
@@ -4287,12 +4245,6 @@ impl Devd {
 
             // Poll overflow query clients (skipped when all are Mux-watched)
             self.poll_query_clients();
-
-            // Complete any timed-out admin requests (skipped when none active)
-            self.drain_expired_requests();
-
-            // Poll restart timers (skipped when none active)
-            self.poll_restart_timers();
 
             // Flush structured logs so they appear on the console
             userlib::ulog::flush();

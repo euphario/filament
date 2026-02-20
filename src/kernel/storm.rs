@@ -220,8 +220,8 @@ impl Default for StormState {
 /// Called at syscall entry. Records activity, checks rate limits,
 /// and resets liveness state (the syscall itself is an implicit pong).
 ///
-/// Returns the `StormAction` the caller should enforce.
-pub fn check_syscall_storm(num: u64) -> StormAction {
+/// Returns `(StormAction, is_init)` so the caller can handle init specially.
+pub fn check_syscall_storm(num: u64) -> (StormAction, bool) {
     let _ = num; // available for future per-syscall tuning
     super::task::with_scheduler(|sched| {
         let slot = super::task::current_slot();
@@ -229,17 +229,26 @@ pub fn check_syscall_storm(num: u64) -> StormAction {
             // Record activity using raw counter (liveness expects counter units)
             task.record_activity(crate::platform::current::timer::counter());
 
+            // Increment cumulative syscall counter
+            task.total_syscalls = task.total_syscalls.saturating_add(1);
+
             // Storm rate-limiting uses logical ticks (100/s granularity)
             let current_tick = crate::platform::current::timer::logical_ticks();
             let config = StormConfig::new();
-            let action = task.record_storm_syscall(current_tick, &config);
+            let mut action = task.record_storm_syscall(current_tick, &config);
+
+            // Never evict init, but throttling is acceptable as a safety net.
+            // With inline timers, devd should stay well under the storm threshold.
+            if task.is_init && action == StormAction::Evict {
+                action = StormAction::Throttle;
+            }
 
             // The syscall itself IS the pong — proves the task is alive
             task.reset_liveness_if_implicit_pong();
 
-            action
+            (action, task.is_init)
         } else {
-            StormAction::Allow
+            (StormAction::Allow, false)
         }
     })
 }

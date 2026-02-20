@@ -246,7 +246,7 @@ pub struct ProcessInfoEx {
     pub activity_age_ms: u32,   // 64
     pub context_switches: u32,  // 68
     pub page_faults: u32,       // 72
-    pub _pad2: u32,             // 76
+    pub total_syscalls: u32,    // 76 (truncated from u64, wraps at ~4B)
 }
 // Total: 80 bytes
 
@@ -276,7 +276,7 @@ impl ProcessInfoEx {
             activity_age_ms: 0,
             context_switches: 0,
             page_faults: 0,
-            _pad2: 0,
+            total_syscalls: 0,
         }
     }
 
@@ -557,6 +557,8 @@ pub mod mux_filter {
     pub const CLOSED: u8 = 1 << 2;
     pub const ERROR: u8 = 1 << 3;
     pub const SIGNAL: u8 = 1 << 4;
+    /// Inline timer fired (handle field carries the tag, not a real handle)
+    pub const TIMER: u8 = 1 << 5;
 }
 
 /// Signal event types (bitmask — delivered via Mux as task-level async notifications)

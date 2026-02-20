@@ -4,7 +4,6 @@
 //! All services are dynamically spawned via PORT_RULES or boot services.
 //! Uses trait-based design for testability.
 
-use userlib::ipc::{Timer, ObjHandle};
 
 // =============================================================================
 // Constants
@@ -105,8 +104,8 @@ pub struct Service {
     pub last_change: u64,
     /// Total restarts (for monitoring, not reset)
     pub total_restarts: u32,
-    /// Restart timer (set when Crashed or Failed)
-    pub restart_timer: Option<Timer>,
+    /// Whether an inline restart timer is active in the Mux (tag = service index)
+    pub has_restart_timer: bool,
     /// Service binary name
     pub dynamic_name: [u8; 16],
     /// Port name that triggered this service's spawn (for restart)
@@ -129,7 +128,7 @@ impl Service {
             backoff_ms: INITIAL_BACKOFF_MS,
             last_change: 0,
             total_restarts: 0,
-            restart_timer: None,
+            has_restart_timer: false,
             dynamic_name: [0; 16],
             trigger_port: [0; 32],
             trigger_port_len: 0,
@@ -193,9 +192,6 @@ pub trait ServiceManager {
 
     /// Get total service count
     fn count(&self) -> usize;
-
-    /// Find service by restart timer handle
-    fn find_by_timer(&self, handle: ObjHandle) -> Option<usize>;
 
     /// Iterate over all services
     fn for_each<F: FnMut(usize, &Service)>(&self, f: F);
@@ -309,16 +305,6 @@ impl ServiceManager for ServiceRegistry {
 
     fn count(&self) -> usize {
         self.count
-    }
-
-    fn find_by_timer(&self, handle: ObjHandle) -> Option<usize> {
-        (0..self.count).find(|&i| {
-            self.services[i]
-                .as_ref()
-                .and_then(|s| s.restart_timer.as_ref())
-                .map(|t| t.handle() == handle)
-                .unwrap_or(false)
-        })
     }
 
     fn for_each<F: FnMut(usize, &Service)>(&self, mut f: F) {

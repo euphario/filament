@@ -432,6 +432,26 @@ impl Mux {
         let _ = self.set_timeout(0); // Clear for next wait
         result
     }
+
+    /// Add an inline timer. Fires once as a MuxEvent with TIMER filter.
+    /// The tag is returned in MuxEvent.handle when the timer fires.
+    pub fn add_timer(&self, tag: u32, duration_ns: u64) -> SysResult<()> {
+        let mut cmd = [0u8; 16];
+        cmd[0] = 3; // op: ADD_TIMER
+        cmd[4..8].copy_from_slice(&tag.to_le_bytes());
+        cmd[8..16].copy_from_slice(&duration_ns.to_le_bytes());
+        write(self.handle, &cmd)?;
+        Ok(())
+    }
+
+    /// Remove an inline timer by tag.
+    pub fn remove_timer(&self, tag: u32) -> SysResult<()> {
+        let mut cmd = [0u8; 8];
+        cmd[0] = 4; // op: REMOVE_TIMER
+        cmd[4..8].copy_from_slice(&tag.to_le_bytes());
+        write(self.handle, &cmd)?;
+        Ok(())
+    }
 }
 
 impl Drop for Mux {
@@ -578,9 +598,11 @@ pub fn wait_one(handle: ObjHandle) -> SysResult<()> {
 }
 
 /// Event loop builder - fluent API for setting up event handling
+///
+/// Capacity matches kernel MAX_MUX_WATCHES (24 slots).
 pub struct EventLoop {
     mux: Mux,
-    handles: [Option<ObjHandle>; 16],
+    handles: [Option<ObjHandle>; 24],
     count: usize,
 }
 
@@ -589,23 +611,29 @@ impl EventLoop {
     pub fn new() -> SysResult<Self> {
         Ok(Self {
             mux: Mux::new()?,
-            handles: [None; 16],
+            handles: [None; 24],
             count: 0,
         })
     }
 
     /// Check if the event loop is full
     pub fn is_full(&self) -> bool {
-        self.count >= 16
+        self.count >= 24
     }
 
     /// Watch a handle for readability
     pub fn watch(&mut self, handle: ObjHandle) -> SysResult<&mut Self> {
-        if self.count >= 16 {
+        if self.count >= 24 {
             return Err(SysError::TooManyFiles);
         }
         self.mux.add(handle, MuxFilter::Readable)?;
-        self.handles[self.count] = Some(handle);
+        // Scan for first free slot (don't clobber after unwatch frees a middle slot)
+        for slot in &mut self.handles {
+            if slot.is_none() {
+                *slot = Some(handle);
+                break;
+            }
+        }
         self.count += 1;
         Ok(self)
     }
@@ -643,6 +671,17 @@ impl EventLoop {
     /// Get underlying mux handle (for advanced use)
     pub fn mux_handle(&self) -> ObjHandle {
         self.mux.handle()
+    }
+
+    /// Add an inline timer. Fires once as a MuxEvent with TIMER filter.
+    /// The tag is returned in MuxEvent.handle when the timer fires.
+    pub fn add_timer(&self, tag: u32, duration_ns: u64) -> SysResult<()> {
+        self.mux.add_timer(tag, duration_ns)
+    }
+
+    /// Remove an inline timer by tag.
+    pub fn remove_timer(&self, tag: u32) -> SysResult<()> {
+        self.mux.remove_timer(tag)
     }
 }
 
