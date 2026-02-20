@@ -19,6 +19,9 @@ pub mod eth;
 pub mod sd;
 pub mod i2c;
 pub mod wdt;
+pub mod clocks;
+pub mod rng;
+pub mod thermal;
 pub mod cpufreq;
 pub mod platform;
 

@@ -37,8 +37,8 @@ mod mode {
     pub const IRQ: u32 = 1 << 3;
     /// Dual mode (IRQ then reset)
     pub const DUAL_MODE: u32 = 1 << 6;
-    /// Key to unlock register writes
-    pub const KEY: u32 = 0x22 << 8;
+    /// Key to unlock register writes (Linux: WDT_MODE_KEY = 0x22 << 24)
+    pub const KEY: u32 = 0x22 << 24;
 }
 
 /// WDT restart key to kick the watchdog

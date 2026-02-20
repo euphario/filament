@@ -275,6 +275,21 @@ pub trait Platform {
     /// Inverse of `phys_to_dma`. Used when reading addresses from device
     /// descriptors that need to be accessed by the CPU.
     fn dma_to_phys(&self, dma: u64) -> u64;
+
+    /// Read hardware RNG seed words for the kernel PRNG.
+    ///
+    /// Returns Some([u32; 4]) if hardware RNG is available, None otherwise
+    /// (e.g., QEMU has no TRNG). Called once at boot to seed xorshift64.
+    fn seed_rng(&self) -> Option<[u32; 4]> {
+        None
+    }
+
+    /// Read CPU temperature in millidegrees Celsius.
+    ///
+    /// Returns 0 if thermal sensor is not available (e.g., QEMU).
+    fn cpu_temp_mc(&self) -> i32 {
+        0
+    }
 }
 
 /// IRQ handler type

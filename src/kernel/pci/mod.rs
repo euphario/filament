@@ -58,8 +58,6 @@ use crate::{kdebug, print_direct};
 /// Maximum number of PCI devices we track
 pub const MAX_PCI_DEVICES: usize = 64;
 
-/// Maximum number of MSI vectors
-pub const MAX_MSI_VECTORS: usize = 256;
 
 /// PCI error types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

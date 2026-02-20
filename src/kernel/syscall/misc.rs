@@ -438,13 +438,15 @@ pub(super) fn sys_sysinfo(buf_ptr: u64) -> i64 {
         count
     });
 
+    let cpu_temp_mc = crate::platform::current::platform::platform().cpu_temp_mc();
+
     let info = abi::SysInfo {
         uptime_ns: crate::platform::current::timer::now_ns(),
         total_pages: pmm::total_count() as u32,
         free_pages: pmm::free_count() as u32,
         num_tasks,
         num_cpus: MAX_CPUS as u16,
-        _pad: [0; 4],
+        cpu_temp_mc,
     };
 
     let info_bytes = unsafe {

@@ -275,6 +275,8 @@ fn execute_command(cmd: &[u8]) {
         cmd_uname();
     } else if cmd_eq(cmd, b"mem") || cmd_eq(cmd, b"free") {
         cmd_mem();
+    } else if cmd_eq(cmd, b"temp") {
+        cmd_temp();
     } else if cmd_starts_with(cmd, b"echo ") {
         cmd_echo(&cmd[5..]);
     } else if cmd_eq(cmd, b"echo") {
@@ -516,6 +518,7 @@ fn cmd_help() {
         ("clear", "Clear the screen"),
         ("uname", "Show system info"),
         ("free", "Show memory & system stats"),
+        ("temp", "Show CPU temperature"),
         ("echo <msg>", "Echo a message"),
         ("ls [path]", "List directory (default: cwd)"),
         ("cat <path>", "Display file contents"),
@@ -627,6 +630,23 @@ fn cmd_mem() {
     let secs = total_secs % 60;
     println!("Tasks: {} / CPUs: {}", info.num_tasks, info.num_cpus);
     println!("Uptime: {}h {}m {}s", hours, mins, secs);
+}
+
+fn cmd_temp() {
+    let mut info = syscall::SysInfo::empty();
+    let ret = syscall::sysinfo(&mut info);
+    if ret < 0 {
+        println!("sysinfo failed: {}", ret);
+        return;
+    }
+
+    if info.cpu_temp_mc == 0 {
+        println!("CPU temperature: N/A");
+    } else {
+        let degrees = info.cpu_temp_mc / 1000;
+        let frac = ((info.cpu_temp_mc % 1000).abs()) / 100;
+        println!("CPU temperature: {}.{}°C", degrees, frac);
+    }
 }
 
 fn cmd_echo(msg: &[u8]) {

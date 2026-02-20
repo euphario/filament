@@ -65,6 +65,9 @@ impl Platform for Mt7988Platform {
     fn late_init(&mut self) {
         // Timer is initialized and started by the caller after scheduler is ready
         timer::init();
+
+        // Initialize LVTS thermal sensor
+        super::thermal::init();
     }
 
     fn kick_watchdog(&self) {
@@ -94,6 +97,14 @@ impl Platform for Mt7988Platform {
     fn dma_to_phys(&self, dma: u64) -> u64 {
         // Identity mapping: DMA address == CPU physical address
         dma
+    }
+
+    fn seed_rng(&self) -> Option<[u32; 4]> {
+        super::rng::seed_words()
+    }
+
+    fn cpu_temp_mc(&self) -> i32 {
+        super::thermal::read_cpu_temp_mc()
     }
 }
 

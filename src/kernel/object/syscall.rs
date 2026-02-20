@@ -960,7 +960,7 @@ fn read_metrics_system(buf_ptr: u64) -> i64 {
         free_pages: pmm::free_count() as u32,
         num_tasks,
         num_cpus: crate::kernel::percpu::MAX_CPUS as u16,
-        _pad: [0; 4],
+        cpu_temp_mc: crate::platform::current::platform::platform().cpu_temp_mc(),
     };
 
     let bytes = unsafe { core::slice::from_raw_parts(&info as *const _ as *const u8, core::mem::size_of::<abi::SysInfo>()) };

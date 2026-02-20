@@ -216,6 +216,15 @@ pub extern "C" fn kmain() -> ! {
     // PRNG (seeded from hardware timer counter, used for ASLR)
     kernel::rng::init();
 
+    // Seed PRNG with hardware RNG if available (improves entropy over timer-only seed)
+    {
+        let platform = plat::platform::platform();
+        if let Some(words) = platform.seed_rng() {
+            kernel::rng::seed_from_hardware(words);
+            kdebug!("rng", "hw_seed_ok");
+        }
+    }
+
     // SMP
     {
         let _span = span!("smp", "init");

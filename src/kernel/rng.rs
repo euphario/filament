@@ -15,6 +15,23 @@ pub fn init() {
     *RNG.lock() = seed;
 }
 
+/// Mix hardware entropy into the PRNG state.
+///
+/// XORs 4 hardware random words into the state for better entropy
+/// than a timer counter alone. Called once at boot if the platform
+/// has a hardware RNG.
+pub fn seed_from_hardware(words: [u32; 4]) {
+    let mut state = RNG.lock();
+    let hw = ((words[0] as u64) << 32) | (words[1] as u64);
+    let hw2 = ((words[2] as u64) << 32) | (words[3] as u64);
+    *state ^= hw;
+    *state ^= hw2;
+    // Ensure non-zero (xorshift requires it)
+    if *state == 0 {
+        *state = 0xDEAD_BEEF_CAFE_BABE;
+    }
+}
+
 /// Generate a pseudo-random u64.
 pub fn next_u64() -> u64 {
     let mut state = RNG.lock();

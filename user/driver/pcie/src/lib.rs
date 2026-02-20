@@ -36,6 +36,7 @@ pub mod regs;
 pub mod config;
 pub mod controller;
 pub mod client;
+pub mod msi;
 
 // Re-export key types
 pub use soc::{SocPcie, SocError, PciePortConfig};
@@ -45,6 +46,7 @@ pub use board::BpiR4;
 pub use config::{PcieBdf, PcieDeviceId, PcieConfigSpace};
 pub use controller::{PcieController, PcieError, PcieDevice, PcieDeviceList};
 pub use client::{PcieClient, PcieDeviceInfo, DeviceList};
+pub use msi::{MsiController, MsiAssignment, MsiEvent};
 
 // Re-export MmioRegion from userlib for use by submodules
 pub use userlib::MmioRegion;

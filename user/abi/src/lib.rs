@@ -308,7 +308,8 @@ pub struct SysInfo {
     pub free_pages: u32,      // 12
     pub num_tasks: u16,       // 16
     pub num_cpus: u16,        // 18
-    pub _pad: [u8; 4],        // 20
+    /// CPU temperature in millidegrees Celsius (0 = unavailable)
+    pub cpu_temp_mc: i32,     // 20
 }
 // Total: 24 bytes
 
@@ -320,7 +321,7 @@ impl SysInfo {
             free_pages: 0,
             num_tasks: 0,
             num_cpus: 0,
-            _pad: [0; 4],
+            cpu_temp_mc: 0,
         }
     }
 }
