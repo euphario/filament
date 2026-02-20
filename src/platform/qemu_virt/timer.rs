@@ -64,10 +64,10 @@ impl Timer {
                 cpu_data.idle_tick();
             }
 
-            // Drain klog (limit to 2 records per tick to avoid UART saturation)
-            // At 115200 baud, UART can only output ~115 bytes per 10ms tick
-            // Each formatted log line is ~100-200 bytes with ANSI codes
-            crate::klog::try_drain(2);
+            // Drain klog — CPU 0 only to prevent SMP interleaving on UART
+            if crate::kernel::percpu::cpu_id() == 0 {
+                crate::klog::try_drain(2);
+            }
 
             // Check timeouts using hardware counter (canonical time source)
             // All deadlines in the system use counter units for consistency

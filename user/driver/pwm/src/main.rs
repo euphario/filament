@@ -101,9 +101,9 @@ impl FanDriver {
         // Set period
         pwm.write32(PWM_CH0_BASE + PWMDWIDTH, PWM_PERIOD);
 
-        // Set 100% duty (full speed at boot for thermal safety)
-        pwm.write32(PWM_CH0_BASE + PWMTHRES, PWM_PERIOD);
-        self.duty_pct = 100;
+        // Set 50% duty (quiet default, thermal feedback will adjust if needed)
+        pwm.write32(PWM_CH0_BASE + PWMTHRES, PWM_PERIOD / 2);
+        self.duty_pct = 50;
     }
 
     /// Set fan speed (0-100%). 0 = off, 1-19 clamped to MIN_DUTY_PCT.

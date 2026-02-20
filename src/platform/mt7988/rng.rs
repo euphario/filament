@@ -8,6 +8,7 @@
 //!   RNG_DATA (0x08): 32-bit random output
 
 use super::KERNEL_VIRT_BASE;
+use super::clocks;
 
 /// TRNG base address
 const TRNG_BASE: usize = 0x1020_F000;
@@ -71,6 +72,9 @@ fn read_u32() -> Option<u32> {
 /// Returns None if the TRNG fails to produce data (hardware not present
 /// or not responding).
 pub fn seed_words() -> Option<[u32; 4]> {
+    // Enable TRNG peripheral clock before any register access
+    clocks::enable_trng_clock();
+
     enable();
 
     let mut words = [0u32; 4];

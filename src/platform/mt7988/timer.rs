@@ -88,13 +88,13 @@ impl Timer {
             // Kick the watchdog to prevent system reset
             super::wdt::kick();
 
-
-            // Drain klog ring directly to UART
-            crate::klog::try_drain(8);
-
-            // Flush UART output buffer (userspace console output)
-            // Use try_flush to avoid deadlock if syscall is holding UART lock
-            super::uart::try_flush_buffer();
+            // UART output — CPU 0 only to prevent SMP interleaving.
+            // Without this, klog lines and userspace ANSI escape sequences
+            // from different CPUs interleave on the wire.
+            if crate::kernel::percpu::cpu_id() == 0 {
+                crate::klog::try_drain(8);
+                super::uart::try_flush_buffer();
+            }
 
             // Check timeouts using hardware counter (canonical time source)
             // All deadlines in the system use counter units for consistency
@@ -225,8 +225,10 @@ impl TimerTrait for Timer {
             let tick = self.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
 
             super::wdt::kick();
-            crate::klog::try_drain(8);
-            super::uart::try_flush_buffer();
+            if crate::kernel::percpu::cpu_id() == 0 {
+                crate::klog::try_drain(8);
+                super::uart::try_flush_buffer();
+            }
 
             // Use try_scheduler to avoid deadlock if scheduler lock is held
             // by interrupted syscall

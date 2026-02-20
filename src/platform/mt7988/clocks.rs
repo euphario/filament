@@ -15,6 +15,13 @@ use super::KERNEL_VIRT_BASE;
 const INFRACFG_AO_BASE: usize = 0x1000_1000;
 
 // Gate register sets (SET=gate/disable, CLR=ungate/enable, STA=status)
+mod infra0 {
+    pub const CLR: usize = 0x14;
+
+    /// CLK_INFRA_66M_TRNG (bit 26) — TRNG peripheral clock
+    pub const TRNG: u32 = 1 << 26;
+}
+
 mod infra2 {
     pub const CLR: usize = 0x54;
 
@@ -37,6 +44,14 @@ fn write_reg(offset: usize, value: u32) {
     unsafe {
         core::ptr::write_volatile(addr as *mut u32, value);
     }
+}
+
+/// Enable the TRNG peripheral clock (66MHz).
+///
+/// Writes to INFRA0 CLR register (clear gate = enable clock).
+/// Must be called before accessing TRNG registers at 0x1020F000.
+pub fn enable_trng_clock() {
+    write_reg(infra0::CLR, infra0::TRNG);
 }
 
 /// Enable the 26MHz thermal system clock.

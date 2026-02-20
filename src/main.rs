@@ -225,6 +225,10 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
+    // Thermal sensor (MT7988A LVTS — needs clocks enabled first)
+    #[cfg(feature = "platform-mt7988a")]
+    plat::thermal::init();
+
     // SMP
     {
         let _span = span!("smp", "init");

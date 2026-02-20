@@ -100,7 +100,10 @@ impl Platform for Mt7988Platform {
     }
 
     fn seed_rng(&self) -> Option<[u32; 4]> {
-        super::rng::seed_words()
+        // TRNG at 0x1020F000 causes synchronous external abort on MT7988A.
+        // Address may not exist on this SoC — needs hardware verification.
+        // Disabled until confirmed.
+        None
     }
 
     fn cpu_temp_mc(&self) -> i32 {
