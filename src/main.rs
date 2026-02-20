@@ -333,7 +333,7 @@ pub extern "C" fn kmain() -> ! {
         smp::start_secondary_cpus();
 
         // Flush all logs before entering userspace
-        kinfo!("kernel", "entering_userspace"; slot = slot);
+        knotice!("kernel", "entering_userspace"; slot = slot);
         klog::flush();
         ktrace::flush();
 
@@ -727,6 +727,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
                 let current_slot = kernel::task::current_slot();
                 if let Some(task) = sched.task_mut(current_slot) {
                     let _ = task.freeze(esr, elr, far);
+                    // 5-second timeout — kill if parent doesn't respond
+                    task.frozen_deadline = crate::platform::current::timer::deadline_ns(5_000_000_000);
                 }
 
                 // Wake parent if blocked

@@ -719,6 +719,22 @@ pub fn timer_tick(current_time: u64) {
         crate::kernel::arch::sync::cpu_flags().set_need_resched();
     }
 
+    // Check frozen task timeouts — kill if deadline exceeded
+    {
+        let now = crate::platform::current::timer::counter();
+        for slot in percpu::MAX_CPUS..task::MAX_TASKS {
+            let should_kill = sched.task(slot).map(|t| {
+                t.is_frozen() && t.frozen_deadline > 0 && now >= t.frozen_deadline
+            }).unwrap_or(false);
+            if should_kill {
+                if let Some(task) = sched.task_mut(slot) {
+                    crate::kwarn!("sched", "frozen_timeout"; pid = task.id as u64, slot = slot as u64);
+                    let _ = task.set_exiting(-9); // SIGKILL equivalent
+                }
+            }
+        }
+    }
+
     // Drop scheduler lock before liveness check (it takes its own lock)
     drop(sched);
 

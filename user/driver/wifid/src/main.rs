@@ -77,7 +77,7 @@ impl WifiDriver {
     }
 
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        uinfo!("wifid", "init_start");
+        unotice!("wifid", "init_start");
 
         // Step 1: Get BAR0 from spawn context (provided by pcied via devd)
         let spawn_ctx = ctx.spawn_context().map_err(|e| {
@@ -708,7 +708,7 @@ impl WifiDriver {
 
     // Final state
     let final_fw_state = dev.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
-    uinfo!("wifid", "init_complete"; fw_state = final_fw_state);
+    unotice!("wifid", "init_complete"; fw_state = final_fw_state);
 
     // Store resources and state in driver struct
     self.seq = seq;

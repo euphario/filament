@@ -813,7 +813,7 @@ impl UsbDriver {
             if connected && enabled {
                 match self.enumerate_device(port) {
                     Some(slot_id) => {
-                        uinfo!("usbd", "device_enumerated"; port = port as u32, slot = slot_id as u32);
+                        unotice!("usbd", "device_enumerated"; port = port as u32, slot = slot_id as u32);
                         found += 1;
                     }
                     None => {
@@ -822,7 +822,7 @@ impl UsbDriver {
                 }
             }
         }
-        uinfo!("usbd", "enum_done"; devices = found);
+        unotice!("usbd", "enum_done"; devices = found);
     }
 
     // =========================================================================
@@ -2281,7 +2281,7 @@ struct UsbdWrapper(&'static mut UsbDriver);
 
 impl Driver for UsbdWrapper {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        uinfo!("usbd", "starting";);
+        unotice!("usbd", "starting";);
 
         // Get spawn context — the port name and BAR0 metadata from pcied
         let spawn_ctx = ctx.spawn_context().map_err(|e| {
@@ -2336,7 +2336,7 @@ impl Driver for UsbdWrapper {
         }
 
         if !self.0.partition_info.is_valid() {
-            uinfo!("usbd", "ready_no_disks";);
+            unotice!("usbd", "ready_no_disks";);
             return Ok(());
         }
 
@@ -2359,7 +2359,7 @@ impl Driver for UsbdWrapper {
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
 
-        uinfo!("usbd", "ready"; disks = 1u32);
+        unotice!("usbd", "ready"; disks = 1u32);
 
         Ok(())
     }

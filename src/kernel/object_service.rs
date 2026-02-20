@@ -841,6 +841,17 @@ impl ObjectService {
             return Err(KernelError::InvalidArg);
         }
 
+        let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
+
+        // Check per-task shmem limit
+        let can_create = crate::kernel::task::with_scheduler(|sched| {
+            sched.task(slot).map(|t| t.can_create_shmem()).unwrap_or(false)
+        });
+
+        if !can_create {
+            return Err(KernelError::OutOfHandles);
+        }
+
         // Create shmem region (outside lock)
         let (shmem_id, vaddr, paddr) = shmem::create(task_id, size)
             .map_err(KernelError::from_errno)?;
@@ -858,7 +869,15 @@ impl ObjectService {
         let obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, size, vaddr));
 
         match table.alloc(ObjectType::Shmem, obj) {
-            Some(handle) => Ok((handle, shmem_id)),
+            Some(handle) => {
+                // Update limit counter via scheduler
+                crate::kernel::task::with_scheduler(|sched| {
+                    if let Some(task) = sched.task_mut(slot) {
+                        task.add_shmem();
+                    }
+                });
+                Ok((handle, shmem_id))
+            }
             None => {
                 let _ = shmem::destroy(shmem_id, task_id);
                 Err(KernelError::OutOfHandles)
@@ -1287,7 +1306,7 @@ pub fn init() {
     }
 
     let total_kb = total_bytes / 1024;
-    crate::kinfo!("objsvc", "init_ok"; pages = pages, size_kb = total_kb);
+    crate::knotice!("objsvc", "init_ok"; pages = pages, size_kb = total_kb);
 }
 
 /// Get a reference to the global ObjectService
@@ -1299,80 +1318,3 @@ pub fn object_service() -> &'static ObjectService {
 // Handle Transfer Table
 // ============================================================================
 
-use crate::kernel::object::handle::HandleRights;
-
-/// Maximum concurrent in-flight handle transfers.
-/// Transfers are short-lived (placed on send, consumed on next read),
-/// so 8 slots is plenty for concurrent IPC.
-const MAX_TRANSFERS: usize = 8;
-
-/// A pending handle transfer attached to a channel message.
-struct PendingTransfer {
-    /// Channel ID this transfer is associated with (0 = empty slot)
-    channel_id: u32,
-    /// The transferred object
-    object_type: ObjectType,
-    rights: HandleRights,
-    object: Object,
-}
-
-/// Global transfer table for in-flight handle transfers.
-///
-/// When a task sends a message with FLAG_HANDLE_TRANSFER, the kernel
-/// extracts the Object from the sender's handle table and stores it here.
-/// When the receiver reads the message, the kernel takes the Object from
-/// here and inserts it into the receiver's handle table.
-static TRANSFER_TABLE: SpinLock<[Option<PendingTransfer>; MAX_TRANSFERS]> =
-    SpinLock::new(lock_class::RESOURCE, [const { None }; MAX_TRANSFERS]);
-
-/// Store a transferred handle for a channel.
-///
-/// Returns Ok(()) on success, Err(object) if table is full.
-pub fn store_transfer(
-    channel_id: u32,
-    object_type: ObjectType,
-    rights: HandleRights,
-    object: Object,
-) -> Result<(), Object> {
-    let mut table = TRANSFER_TABLE.lock();
-    for slot in table.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(PendingTransfer {
-                channel_id,
-                object_type,
-                rights,
-                object,
-            });
-            return Ok(());
-        }
-    }
-    Err(object)
-}
-
-/// Take a transferred handle for a channel.
-///
-/// Returns the object type, rights, and object if a transfer is pending.
-pub fn take_transfer(channel_id: u32) -> Option<(ObjectType, HandleRights, Object)> {
-    let mut table = TRANSFER_TABLE.lock();
-    for slot in table.iter_mut() {
-        if let Some(ref t) = slot {
-            if t.channel_id == channel_id {
-                let t = slot.take().unwrap();
-                return Some((t.object_type, t.rights, t.object));
-            }
-        }
-    }
-    None
-}
-
-/// Clean up any pending transfers for a channel (called on channel close).
-pub fn cleanup_transfers(channel_id: u32) {
-    let mut table = TRANSFER_TABLE.lock();
-    for slot in table.iter_mut() {
-        if let Some(ref t) = slot {
-            if t.channel_id == channel_id {
-                *slot = None;
-            }
-        }
-    }
-}

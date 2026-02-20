@@ -70,9 +70,8 @@ mod ansi {
                     break;
                 }
             } else {
-                for _ in 0..10000 {
-                    core::hint::spin_loop();
-                }
+                // Short wait for terminal CPR response (~1ms)
+                syscall::sleep_us(1000);
             }
         }
 
@@ -298,7 +297,7 @@ impl ConsoledDriver {
                     }
 
                     self.shell_pid = Some(client_pid);
-                    uinfo!("consoled", "shell_connected"; pid = client_pid);
+                    unotice!("consoled", "shell_connected"; pid = client_pid);
 
                     // Drain any stale UART input before shell starts
                     let mut buf = [0u8; 64];
@@ -338,7 +337,7 @@ impl ConsoledDriver {
                         let mut probe = [0u8; 1];
                         match ch.try_recv(&mut probe) {
                             Err(SysError::ConnectionReset) => {
-                                uinfo!("consoled", "shell_dead_on_stdin";);
+                                unotice!("consoled", "shell_dead_on_stdin";);
                                 self.disconnect_shell(ctx);
                                 return;
                             }
@@ -495,7 +494,7 @@ impl ConsoledDriver {
             let mut probe = [0u8; 1];
             match ch.recv(&mut probe) {
                 Err(SysError::PeerClosed) | Err(SysError::ConnectionReset) => {
-                    uinfo!("consoled", "shell_disconnected";);
+                    unotice!("consoled", "shell_disconnected";);
                     self.disconnect_shell(ctx);
                 }
                 _ => {} // Got data or would block - shell still alive
@@ -525,7 +524,7 @@ impl ConsoledDriver {
         // Transition port Safe → devd fires spawn rule → new shell
         let _ = ctx.set_port_state(b"console:0", PortState::Safe);
 
-        uinfo!("consoled", "awaiting_shell";);
+        unotice!("consoled", "awaiting_shell";);
     }
 }
 
@@ -535,7 +534,7 @@ impl ConsoledDriver {
 
 impl Driver for ConsoledDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        uinfo!("consoled", "init";);
+        unotice!("consoled", "init";);
 
         // Claim the kernel UART bus. With Phase 2 NotifyParentExit, devd only
         // restarts consoled after the previous instance's bus handle is released,
@@ -602,7 +601,7 @@ impl Driver for ConsoledDriver {
         }
         // Port starts Safe. Supervisor (devd) fires spawn rules when port transitions to Claimed.
 
-        uinfo!("consoled", "ready";);
+        unotice!("consoled", "ready";);
         Ok(())
     }
 

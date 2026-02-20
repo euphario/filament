@@ -11,10 +11,16 @@
 
 use abi::{bus_type, bus_create_flags, BusCreateInfo, ObjectType};
 use userlib::syscall;
+use userlib::unotice;
 
 #[unsafe(no_mangle)]
 fn main() {
-    syscall::debug_write(b"probed: starting bus discovery\r\n");
+    #[cfg(feature = "platform-qemu-virt")]
+    let platform = "qemu-virt";
+    #[cfg(feature = "platform-mt7988a")]
+    let platform = "mt7988a";
+
+    userlib::uinfo!("probed", "platform"; name = platform);
 
     #[cfg(feature = "platform-qemu-virt")]
     register_qemu_buses();
@@ -22,7 +28,8 @@ fn main() {
     #[cfg(feature = "platform-mt7988a")]
     register_mt7988_buses();
 
-    syscall::debug_write(b"probed: bus discovery complete\r\n");
+    unotice!("probed", "bus_discovery_done");
+    userlib::ulog::flush();
     // exit(0) is called automatically by _start after main returns
 }
 
@@ -38,7 +45,7 @@ fn bus_create(info: &BusCreateInfo) -> Option<userlib::Handle> {
     match syscall::open(ObjectType::Bus, params) {
         Ok(handle) => Some(handle),
         Err(_) => {
-            syscall::debug_write(b"probed: bus_create failed\r\n");
+            userlib::uerror!("probed", "bus_create_failed");
             None
         }
     }

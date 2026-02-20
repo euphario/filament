@@ -157,6 +157,16 @@ pub(super) fn sys_exec_with_mailbox(path_ptr: u64, path_len: usize, capabilities
         None => return KernelError::NoProcess.to_errno(),
     };
 
+    // Check per-task children limit
+    let can_spawn = crate::kernel::task::with_scheduler(|sched| {
+        let slot = crate::kernel::task::current_slot();
+        sched.task(slot).map(|t| t.can_add_child()).unwrap_or(false)
+    });
+
+    if !can_spawn {
+        return KernelError::OutOfHandles.to_errno();
+    }
+
     let kernel_caps = KernelCaps::from_bits(capabilities);
 
     // Call elf directly to get both child PID and parent's mailbox handle

@@ -4,6 +4,8 @@
 //! All services are dynamically spawned via PORT_RULES or boot services.
 //! Uses trait-based design for testability.
 
+use userlib::uwarn;
+
 
 // =============================================================================
 // Constants
@@ -80,6 +82,30 @@ impl ServiceState {
             ServiceState::Stopped { .. } => "stopped",
             ServiceState::Crashed { .. } => "crashed",
             ServiceState::Failed { .. } => "failed",
+        }
+    }
+
+    /// Check if transitioning from self to `to` is valid.
+    pub fn can_transition_to(&self, to: &ServiceState) -> bool {
+        match (self, to) {
+            // Pending → Starting (spawn)
+            (ServiceState::Pending, ServiceState::Starting) => true,
+            // Starting → Ready | Stopped | Crashed | Failed
+            (ServiceState::Starting, ServiceState::Ready) => true,
+            (ServiceState::Starting, ServiceState::Stopped { .. }) => true,
+            (ServiceState::Starting, ServiceState::Crashed { .. }) => true,
+            (ServiceState::Starting, ServiceState::Failed { .. }) => true,
+            // Ready → Stopped | Crashed | Failed
+            (ServiceState::Ready, ServiceState::Stopped { .. }) => true,
+            (ServiceState::Ready, ServiceState::Crashed { .. }) => true,
+            (ServiceState::Ready, ServiceState::Failed { .. }) => true,
+            // Crashed → Starting (restart) | Failed (max restarts)
+            (ServiceState::Crashed { .. }, ServiceState::Starting) => true,
+            (ServiceState::Crashed { .. }, ServiceState::Failed { .. }) => true,
+            // Stopped/Failed → Starting (manual restart)
+            (ServiceState::Stopped { .. }, ServiceState::Starting) => true,
+            (ServiceState::Failed { .. }, ServiceState::Starting) => true,
+            _ => false,
         }
     }
 }
@@ -297,6 +323,9 @@ impl ServiceManager for ServiceRegistry {
 
     fn transition(&mut self, idx: usize, state: ServiceState, now: u64) {
         if let Some(service) = self.get_mut(idx) {
+            if !service.state.can_transition_to(&state) {
+                uwarn!("devd", "invalid_transition"; from = service.state.as_str(), to = state.as_str());
+            }
             service.state = state;
             service.last_change = now;
         }

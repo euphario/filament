@@ -926,8 +926,6 @@ impl FatfsDriver {
                                 uerror!("fatfsd", "port_register_failed"; shmem_id = vfs_shmem_id);
                             }
 
-                            unotice!("fatfsd", "vfs_port_registered"; shmem_id = vfs_shmem_id);
-
                             // Register mount with devd so clients can resolve paths
                             // Strip trailing ':' from port name for mount prefix,
                             // and prepend '/' for a proper path prefix

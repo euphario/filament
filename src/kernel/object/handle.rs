@@ -30,10 +30,8 @@ impl HandleRights {
     pub const WRITE: Self = Self(1 << 1);
     /// Can call map() on this handle
     pub const MAP: Self = Self(1 << 2);
-    /// Can delegate this handle to another task via IPC
-    pub const GRANT: Self = Self(1 << 3);
     /// All rights
-    pub const ALL: Self = Self(0x0F);
+    pub const ALL: Self = Self(0x07);
     /// No rights (close-only handle)
     pub const NONE: Self = Self(0);
 
@@ -68,9 +66,9 @@ impl HandleRights {
 /// close() is always permitted regardless of rights.
 pub fn default_rights(obj_type: ObjectType) -> HandleRights {
     match obj_type {
-        // Channels: read + write + grant (IPC delegation)
+        // Channels: read + write
         ObjectType::Channel => HandleRights(
-            HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::GRANT.0
+            HandleRights::READ.0 | HandleRights::WRITE.0
         ),
         // Ports: full access (accept, configure, map, delegate)
         ObjectType::Port => HandleRights::ALL,
@@ -82,9 +80,9 @@ pub fn default_rights(obj_type: ObjectType) -> HandleRights {
         ObjectType::DmaPool => HandleRights(
             HandleRights::READ.0 | HandleRights::MAP.0
         ),
-        // Shared memory: read + write + map + grant (transferable via IPC)
+        // Shared memory: read + write + map
         ObjectType::Shmem => HandleRights(
-            HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::MAP.0 | HandleRights::GRANT.0
+            HandleRights::READ.0 | HandleRights::WRITE.0 | HandleRights::MAP.0
         ),
         // Mux: read (poll) + write (add/remove watch)
         ObjectType::Mux => HandleRights(
@@ -140,7 +138,7 @@ pub struct HandleEntry {
     pub generation: u8,
     /// Object type (for quick dispatch)
     pub object_type: ObjectType,
-    /// Per-handle rights (READ, WRITE, MAP, GRANT)
+    /// Per-handle rights (READ, WRITE, MAP)
     pub rights: HandleRights,
     /// The actual object
     pub object: Object,

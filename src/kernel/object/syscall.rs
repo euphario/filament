@@ -210,17 +210,12 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         None,
         ShmemNotify(u32, u32), // (shmem_id, caller_pid)
         ChannelWake(ChannelWriteResult),
-        ChannelWakeWithTransfer(ChannelWriteResult, ObjectType, super::HandleRights, Object),
         SupervisionWake(waker::WakeList),
     }
 
-    // Check for handle transfer flag (bit 31 of buf_len)
-    let transfer_flag = buf_len & abi::message_flags::WRITE_FLAG_HANDLE_TRANSFER != 0;
-    let actual_len = if transfer_flag { buf_len & 0x7FFF_FFFF } else { buf_len };
-
     // Use ObjectService's tables for dispatch
     let result = object_service().with_table_mut(task_id, |table| {
-        // Phase 1: Validate handle rights and type (short borrow, then drop)
+        // Validate handle rights and type
         {
             let Some(entry) = table.get(handle) else {
                 return (KernelError::BadHandle.to_errno(), PendingAction::None);
@@ -233,70 +228,17 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             }
         } // entry borrow dropped
 
-        // Phase 2: Extract transfer object if needed (separate table access)
-        let transfer_data = if transfer_flag {
-            // Only channels support handle transfer
-            let is_channel = table.get(handle)
-                .map(|e| matches!(e.object, Object::Channel(_)))
-                .unwrap_or(false);
-            if !is_channel {
-                return (KernelError::NotSupported.to_errno(), PendingAction::None);
-            }
-
-            // Read raw handle from first 4 bytes of user buffer
-            let mut handle_bytes = [0u8; 4];
-            if uaccess::copy_from_user(&mut handle_bytes, buf_ptr).is_err() {
-                return (KernelError::BadAddress.to_errno(), PendingAction::None);
-            }
-            let raw_handle = u32::from_le_bytes(handle_bytes);
-            let xfer_handle = Handle::from_raw(raw_handle);
-
-            // Verify handle exists and has GRANT right, read type+rights
-            let (obj_type, rights) = match table.get(xfer_handle) {
-                Some(xfer_entry) => {
-                    if !xfer_entry.rights.has(super::HandleRights::GRANT) {
-                        return (KernelError::PermDenied.to_errno(), PendingAction::None);
-                    }
-                    (xfer_entry.object_type, xfer_entry.rights)
-                }
-                None => return (KernelError::BadHandle.to_errno(), PendingAction::None),
-            };
-
-            // Close handle in sender's table (extracts Object)
-            match table.close(xfer_handle) {
-                Some(object) => Some((obj_type, rights, object)),
-                None => return (KernelError::BadHandle.to_errno(), PendingAction::None),
-            }
-        } else {
-            None
-        };
-
-        // Phase 3: Dispatch to type-specific write (now safe to borrow entry mutably)
+        // Dispatch to type-specific write
         let Some(entry) = table.get_mut(handle) else {
             return (KernelError::BadHandle.to_errno(), PendingAction::None);
         };
 
         match &mut entry.object {
             Object::Channel(ch) => {
-                let r = write_channel(ch, buf_ptr, actual_len, transfer_flag);
+                let r = write_channel(ch, buf_ptr, buf_len);
                 let errno = r.errno;
 
-                if errno < 0 {
-                    // Send failed — re-insert the extracted object back into sender's table
-                    if let Some((obj_type, _rights, object)) = transfer_data {
-                        let _ = table.alloc(obj_type, object);
-                    }
-                    return (errno, PendingAction::None);
-                }
-
-                if let Some((obj_type, rights, object)) = transfer_data {
-                    if r.peer.is_some() {
-                        (errno, PendingAction::ChannelWakeWithTransfer(r, obj_type, rights, object))
-                    } else {
-                        let _ = table.alloc(obj_type, object);
-                        (errno, PendingAction::None)
-                    }
-                } else if r.peer.is_some() {
+                if errno >= 0 && r.peer.is_some() {
                     (errno, PendingAction::ChannelWake(r))
                 } else {
                     (errno, PendingAction::None)
@@ -353,22 +295,6 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                         waker::wake(&wake_list, ipc::WakeReason::Readable);
                     }
                     // Kernel bus channels are dispatched synchronously
-                    if let Some((buf, len, channel_id)) = r.bus_data {
-                        crate::kernel::bus::process_bus_message(channel_id, &buf[..len]);
-                    }
-                }
-                PendingAction::ChannelWakeWithTransfer(r, obj_type, rights, object) => {
-                    if let Some(peer) = r.peer {
-                        // Store transferred object in transfer table, keyed by peer channel_id
-                        let _ = crate::kernel::object_service::store_transfer(
-                            peer.channel_id, obj_type, rights, object,
-                        );
-                        // Wake peer's ChannelObject
-                        let wake_list = object_service().wake_channel(
-                            peer.task_id, peer.channel_id, super::poll::READABLE,
-                        );
-                        waker::wake(&wake_list, ipc::WakeReason::Readable);
-                    }
                     if let Some((buf, len, channel_id)) = r.bus_data {
                         crate::kernel::bus::process_bus_message(channel_id, &buf[..len]);
                     }
@@ -1060,15 +986,7 @@ fn open_bus_list(_params_ptr: u64, _params_len: usize) -> i64 {
 }
 
 // Read implementations
-/// Read from channel with handle transfer support.
-///
-/// If the received message has FLAG_HANDLE_TRANSFER set, the kernel
-/// takes the pending Object from the transfer table, inserts it into
-/// the receiver's handle table, and writes the new handle value to
-/// the first 4 bytes of the user buffer. Bit 31 of the return value
-/// is set to signal that a handle was transferred.
-/// Channel read with handle transfer support.
-/// Uses two-phase table access to avoid overlapping borrows.
+/// Channel read dispatch — extracts channel_id then delegates to read_channel.
 fn read_channel_dispatch(
     table: &mut super::HandleTable,
     handle: Handle,
@@ -1097,36 +1015,12 @@ fn read_channel_dispatch(
     // Phase 2: Receive message from IPC (no table borrow needed)
     match ipc::receive(channel_id, task_id) {
         Ok(msg) => {
-            let has_transfer = (msg.header.flags & ipc::FLAG_HANDLE_TRANSFER) != 0;
             let payload = msg.payload_slice();
             let copy_len = core::cmp::min(payload.len(), buf_len);
 
             // Copy to user buffer
             if uaccess::copy_to_user(buf_ptr, &payload[..copy_len]).is_err() {
                 return KernelError::BadAddress.to_errno();
-            }
-
-            // Phase 3: Handle transfer — insert received Object into table
-            let mut transfer_result: i64 = 0;
-            if has_transfer {
-                if let Some((obj_type, rights, mut object)) = crate::kernel::object_service::take_transfer(channel_id) {
-                    // Fix up transferred shmem: reset sender's vaddr and grant receiver access
-                    if let super::Object::Shmem(ref mut s) = object {
-                        let _ = shmem::grant_access(s.shmem_id(), task_id);
-                        s.set_vaddr(0);
-                    }
-                    match table.alloc_with_rights(obj_type, rights, object) {
-                        Some(new_handle) => {
-                            let handle_bytes = new_handle.0.to_le_bytes();
-                            if uaccess::copy_to_user(buf_ptr, &handle_bytes).is_ok() {
-                                transfer_result = abi::message_flags::READ_FLAG_HANDLE_RECEIVED;
-                            }
-                        }
-                        None => {
-                            // Out of handles — object is lost
-                        }
-                    }
-                }
             }
 
             // Increment IPC recv counter
@@ -1136,7 +1030,7 @@ fn read_channel_dispatch(
                 }
             });
 
-            (copy_len as i64) | transfer_result
+            copy_len as i64
         }
         Err(ipc::IpcError::WouldBlock) => KernelError::WouldBlock.to_errno(),
         Err(ipc::IpcError::PeerClosed) | Err(ipc::IpcError::Closed) => {
@@ -2213,7 +2107,7 @@ struct ChannelWriteResult {
     bus_data: Option<([u8; ipc::MAX_INLINE_PAYLOAD], usize, u32)>, // (buf, len, channel_id)
 }
 
-fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize, transfer_flag: bool) -> ChannelWriteResult {
+fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize) -> ChannelWriteResult {
     let fail = |e: i64| ChannelWriteResult { errno: e, peer: None, is_bus_channel: false, bus_data: None };
 
     // Check state - can only write to Open channel (queries ipc backend)
@@ -2228,11 +2122,6 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize, tr
 
     // Limit message size
     if buf_len > ipc::MAX_INLINE_PAYLOAD {
-        return fail(KernelError::InvalidArg.to_errno());
-    }
-
-    // Handle transfer requires at least 4 bytes for the raw handle value
-    if transfer_flag && buf_len < 4 {
         return fail(KernelError::InvalidArg.to_errno());
     }
 
@@ -2254,10 +2143,7 @@ fn write_channel(ch: &mut super::ChannelObject, buf_ptr: u64, buf_len: usize, tr
     }
 
     // Create message and send via ipc
-    let mut msg = ipc::Message::data(pid, &kernel_buf[..copy_len]);
-    if transfer_flag {
-        msg.header.flags |= ipc::FLAG_HANDLE_TRANSFER;
-    }
+    let msg = ipc::Message::data(pid, &kernel_buf[..copy_len]);
 
     // Check before send — avoids re-acquiring channel table lock after send
     let is_bus_channel = ipc::is_kernel_dispatch(channel_id);
@@ -2687,9 +2573,6 @@ fn map_mmio(m: &mut super::MmioObject, _task_id: u32) -> i64 {
 fn close_channel(ch: super::ChannelObject, owner: u32) {
     // Only close if not already closed (queries ipc backend)
     if !ch.is_closed() && ch.channel_id() != 0 {
-        // Clean up any pending handle transfers for this channel
-        crate::kernel::object_service::cleanup_transfers(ch.channel_id());
-
         if let Ok(peer_opt) = ipc::close_channel(ch.channel_id(), owner) {
             // Wake peer's ChannelObject via ObjectService WaitQueue
             if let Some(peer) = peer_opt {

@@ -499,7 +499,7 @@ impl Driver for SwitchDriver {
         // Register bridge groups (default: br0 with all ports)
         self.register_groups(ctx);
 
-        uinfo!("switchd", "init_done"; groups = self.group_count as u32);
+        unotice!("switchd", "init_done"; groups = self.group_count as u32);
         Ok(())
     }
 

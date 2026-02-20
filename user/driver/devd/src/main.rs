@@ -791,7 +791,7 @@ impl Devd {
             }
         };
 
-        uinfo!("devd", "bus_discovery"; count = count as u32);
+        unotice!("devd", "bus_discovery"; count = count as u32);
 
         for i in 0..count {
             let port_info = &buses[i];
@@ -817,9 +817,19 @@ impl Devd {
             // Set port to Claimed — kernel bus ports are managed by the kernel,
             // so they're immediately available. Fire rules on the transition.
             let pid = self.ports.get_port_id(path).unwrap_or(0xFF);
-            if self.ports.set_state(path, abi::PortState::Claimed).is_none() {
-                uwarn!("devd", "bus_port_state_failed";
-                    name = core::str::from_utf8(path).unwrap_or("?"));
+            let old_state = self.ports.set_state(path, abi::PortState::Claimed);
+            match old_state {
+                Some(old) => {
+                    uinfo!("devd", "port_transition";
+                        port = core::str::from_utf8(path).unwrap_or("?"),
+                        from = old.as_str(),
+                        to = abi::PortState::Claimed.as_str()
+                    );
+                }
+                None => {
+                    uwarn!("devd", "bus_port_state_failed";
+                        name = core::str::from_utf8(path).unwrap_or("?"));
+                }
             }
 
             // Fire rules on the Claimed transition
@@ -983,7 +993,7 @@ impl Devd {
 
         self.add_recent_dynamic_pid(pid, idx as u8);
 
-        uinfo!("devd", "svc_spawned"; binary = binary, pid = pid);
+        unotice!("devd", "svc_spawned"; binary = binary, pid = pid);
     }
 
     /// Build a mailbox page with spawn context for a child service.
@@ -2780,7 +2790,7 @@ impl Devd {
             svc.set_trigger_port(pname);
         }
 
-        unotice!("devd", "svc_created_from_route"; name = core::str::from_utf8(binary_name).unwrap_or("?"), slot = slot_idx as u32);
+        udebug!("devd", "svc_created_from_route"; name = core::str::from_utf8(binary_name).unwrap_or("?"), slot = slot_idx as u32);
 
         // Drain deferred rules for this parent (inflight consumed = slot freed)
         self.drain_deferred_rules(parent_svc_idx);
@@ -2866,7 +2876,7 @@ impl Devd {
 
         let driver_idx = driver_idx;
 
-        unotice!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
+        udebug!("devd", "svc_state_change"; name = self.svc_name(driver_idx as u8), state = state_msg.new_state as u32);
 
         // When driver reports Ready, transition service state and activate ports
         if state_msg.new_state == driver_state::READY {
@@ -2891,8 +2901,21 @@ impl Devd {
             });
             for i in 0..ready_count {
                 let pid = ready_port_ids[i];
-                if self.ports.set_state_by_id(pid, abi::PortState::Claimed).is_none() {
-                    uwarn!("devd", "port_claim_failed"; port_id = pid as u32);
+                let old_state = self.ports.set_state_by_id(pid, abi::PortState::Claimed);
+                match old_state {
+                    Some(old) => {
+                        let port_name = self.ports.get_by_id(pid)
+                            .map(|p| core::str::from_utf8(p.name()).unwrap_or("?"))
+                            .unwrap_or("?");
+                        uinfo!("devd", "port_transition";
+                            port = port_name,
+                            from = old.as_str(),
+                            to = abi::PortState::Claimed.as_str()
+                        );
+                    }
+                    None => {
+                        uwarn!("devd", "port_claim_failed"; port_id = pid as u32);
+                    }
                 }
                 if let Some(port) = self.ports.get_by_id(pid) {
                     let info = *port.port_info();
@@ -3092,21 +3115,19 @@ impl Devd {
             }
         };
 
-        // Get port info before state change (for rule checking)
         // Get port info + port_id before state change (for rule checking)
         let port_info = self.ports.get(port_name).map(|p| *p.port_info());
         let port_id = self.ports.get_port_id(port_name).unwrap_or(0xFF);
         let owner_idx = self.ports.find_owner(port_name);
-
         // Update the port's state
         let old_state = self.ports.set_state(port_name, new_state);
 
         let result_code = match old_state {
             Some(old) => {
-                unotice!("devd", "port_state_change";
+                uinfo!("devd", "port_transition";
                     port = core::str::from_utf8(port_name).unwrap_or("?"),
-                    from = old as u8,
-                    to = new_state as u8
+                    from = old.as_str(),
+                    to = new_state.as_str()
                 );
                 error::OK
             }
@@ -3688,7 +3709,7 @@ impl Devd {
         // This must happen regardless of success/failure so deferred rules don't starve.
         let _parent_for_drain = parent_idx;
 
-        unotice!("devd", "spawn_ack"; parent = self.svc_name(parent_idx as u8), seq = seq_id, result = result as i32, spawn = spawn_count as u32);
+        udebug!("devd", "spawn_ack"; parent = self.svc_name(parent_idx as u8), seq = seq_id, result = result as i32, spawn = spawn_count as u32);
 
         // Consume the inflight spawn to get port context and binary name
         let spawn_ctx = self.consume_inflight_spawn(seq_id);
@@ -3890,17 +3911,15 @@ impl Devd {
         // Log registration with class info
         if let Ok(name_str) = core::str::from_utf8(port_name) {
             if shmem_id != 0 {
-                unotice!("devd", "port_info_registered";
+                udebug!("devd", "port_registered";
                     name = name_str,
-                    class = port_info.port_class as u16,
-                    subclass = port_info.port_subclass,
+                    class = port_info.port_class.as_str(),
                     shmem_id = shmem_id
                 );
             } else {
-                unotice!("devd", "port_info_registered";
+                udebug!("devd", "port_registered";
                     name = name_str,
-                    class = port_info.port_class as u16,
-                    subclass = port_info.port_subclass
+                    class = port_info.port_class.as_str()
                 );
             }
         }
@@ -3976,10 +3995,10 @@ impl Devd {
             port.set_child_link_id(link_id);
         }
 
-        unotice!("devd", "port_rule_matched";
-            class = port_info.port_class as u16,
-            subclass = port_info.port_subclass,
-            driver = rule.driver
+        uinfo!("devd", "spawn_driver";
+            driver = rule.driver,
+            port = core::str::from_utf8(port_info.name_bytes()).unwrap_or("?"),
+            class = port_info.port_class.as_str()
         );
 
         // Expand rule context templates (if any)
@@ -4372,7 +4391,7 @@ fn main() -> ! {
         syscall::exit(1);
     }
 
-    uinfo!("devd", "started"; services = devd.services.count() as u32);
+    unotice!("devd", "started"; services = devd.services.count() as u32);
     userlib::ulog::flush();
     devd.run()
 }

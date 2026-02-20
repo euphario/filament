@@ -719,7 +719,7 @@ impl NvmeDriver {
 
 impl Driver for NvmeDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        uinfo!("nvmed", "starting";);
+        unotice!("nvmed", "starting";);
 
         // Get spawn context — the port name and BAR0 metadata from pcied
         // (e.g., "pci/00:02.0:nvme" registered by pcied with BAR0 info)

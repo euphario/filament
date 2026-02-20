@@ -397,13 +397,7 @@ impl RuntimeCtx {
             .map_err(|_| BusError::Internal);
         if result.is_err() && !self.devd_channel_broken {
             self.devd_channel_broken = true;
-            let mut msg = [0u8; 64];
-            let prefix = b"[bus] devd channel broken (driver=";
-            msg[..prefix.len()].copy_from_slice(prefix);
-            let nlen = self.name_len.min(msg.len() - prefix.len() - 1);
-            msg[prefix.len()..prefix.len() + nlen].copy_from_slice(&self.name[..nlen]);
-            msg[prefix.len() + nlen] = b')';
-            syscall::klog(LogLevel::Error, &msg[..prefix.len() + nlen + 1]);
+            crate::uerror!("bus", "devd_channel_broken");
         }
         result
     }
@@ -538,8 +532,8 @@ impl RuntimeCtx {
     /// Register the devd channel with the Mux.
     fn register_devd_handle(&mut self) {
         if let Some(h) = self.devd.handle() {
-            if self.mux.add(h, MuxFilter::Readable).is_err() {
-                syscall::klog(LogLevel::Error, b"[bus] devd mux_add failed");
+            if let Err(e) = self.mux.add(h, MuxFilter::Readable) {
+                crate::uerror!("bus", "devd_mux_add_failed"; err = e.as_str());
             }
             self.handles.add(h, TAG_DEVD);
         }
@@ -552,8 +546,8 @@ impl RuntimeCtx {
         if let Some(ref port) = self.block_ports[port_idx] {
             if let Some(h) = port.mux_handle() {
                 let tag = TAG_BLOCK_PORT_BASE + port_idx as u32;
-                if self.mux.add(h, MuxFilter::Readable).is_err() {
-                    syscall::klog(LogLevel::Error, b"[bus] port mux_add failed");
+                if let Err(e) = self.mux.add(h, MuxFilter::Readable) {
+                    crate::uerror!("bus", "port_mux_add_failed"; err = e.as_str());
                 }
                 self.handles.add(h, tag);
             }
@@ -801,13 +795,7 @@ impl BusCtx for RuntimeCtx {
             .map_err(|_| BusError::Internal);
         if result.is_err() && !self.devd_channel_broken {
             self.devd_channel_broken = true;
-            let mut msg = [0u8; 64];
-            let prefix = b"[bus] devd channel broken (driver=";
-            msg[..prefix.len()].copy_from_slice(prefix);
-            let nlen = self.name_len.min(msg.len() - prefix.len() - 1);
-            msg[prefix.len()..prefix.len() + nlen].copy_from_slice(&self.name[..nlen]);
-            msg[prefix.len() + nlen] = b')';
-            syscall::klog(LogLevel::Error, &msg[..prefix.len() + nlen + 1]);
+            crate::uerror!("bus", "devd_channel_broken");
         }
         result
     }
@@ -841,6 +829,16 @@ impl BusCtx for RuntimeCtx {
         self.devd
             .register_port_info(info_to_send, shmem_id)
             .map_err(|_| BusError::Internal)?;
+
+        // Log port registration from the framework — drivers don't need to
+        if let Ok(name_str) = core::str::from_utf8(info_to_send.name_bytes()) {
+            crate::uinfo!("bus", "port_registered";
+                driver = core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?"),
+                port = name_str,
+                class = info_to_send.port_class.as_str()
+            );
+        }
+
         Ok(())
     }
 
@@ -856,6 +854,13 @@ impl BusCtx for RuntimeCtx {
         if state == abi::PortState::Safe {
             self.remove_children_for_port(name);
         }
+
+        // Log state transition from the framework — consistent across all drivers
+        crate::uinfo!("bus", "port_transition";
+            driver = core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?"),
+            port = core::str::from_utf8(name).unwrap_or("?"),
+            state = state.as_str()
+        );
 
         self.devd
             .set_port_state(name, state)
@@ -1058,16 +1063,14 @@ impl<D: Driver> DriverRuntime<D> {
         // In tree mode, register our SuperQ handle so we get woken when
         // parent sends us commands via the kernel supervision queue.
         if let Some(h) = self.ctx.devd.superq_obj_handle() {
-            if self.ctx.mux.add(h, MuxFilter::Readable).is_err() {
-                syscall::klog(LogLevel::Error, b"[bus] parent superq mux_add failed");
+            if let Err(e) = self.ctx.mux.add(h, MuxFilter::Readable) {
+                crate::uerror!("bus", "superq_mux_add_failed"; err = e.as_str());
             }
             self.ctx.handles.add(h, TAG_PARENT_SUPERQ);
         }
 
         // Initialize the driver (hardware is Safe — bring it up)
         if let Err(e) = self.driver.reset(&mut self.ctx) {
-            let mut buf = [0u8; 64];
-            buf[..20].copy_from_slice(b"[bus] reset failed: ");
             let err_name = match e {
                 BusError::LinkDown => "LinkDown",
                 BusError::BufferFull => "BufferFull",
@@ -1080,10 +1083,8 @@ impl<D: Driver> DriverRuntime<D> {
                 BusError::Internal => "Internal",
                 BusError::NotPresent => "NotPresent",
             };
-            let elen = err_name.len().min(40);
-            buf[20..20 + elen].copy_from_slice(&err_name.as_bytes()[..elen]);
             crate::ulog::flush();
-            syscall::klog(LogLevel::Error, &buf[..20 + elen]);
+            crate::uerror!("bus", "reset_failed"; err = err_name);
             // NotPresent = hardware absent, exit cleanly (devd won't respawn)
             // Other errors = crash, exit with code 1 (devd will respawn)
             let code = if matches!(e, BusError::NotPresent) { 0 } else { 1 };
@@ -1111,7 +1112,7 @@ impl<D: Driver> DriverRuntime<D> {
                 if let Some(slot) = idx_opt {
                     // Timeout is a safety net — should not fire in normal operation.
                     // Log ERROR so we can investigate stuck queries.
-                    syscall::klog(LogLevel::Error, b"[bus] config query timeout (EOL missing)");
+                    crate::uerror!("bus", "config_query_timeout");
                     self.complete_config_query(*slot);
                 }
             }
@@ -1207,10 +1208,11 @@ impl<D: Driver> DriverRuntime<D> {
                         }
                     }
                     Ok(_) => {}
-                    Err(_) => {
+                    Err(e) => {
                         // Devd channel broken — remove from Mux to prevent hot-loop.
                         // Driver continues running with existing state but cannot
                         // receive new commands from devd.
+                        crate::uwarn!("bus", "devd_recv_failed"; err = e.as_str());
                         let _ = self.ctx.mux.remove(handle);
                         self.ctx.handles.remove(handle);
                     }
@@ -1305,7 +1307,9 @@ impl<D: Driver> DriverRuntime<D> {
                 self.dispatch_devd_command(cmd);
             }
             Ok(None) => {}
-            Err(_) => {}
+            Err(e) => {
+                crate::uwarn!("bus", "devd_cmd_parse_failed"; err = e.as_str());
+            }
         }
     }
 
@@ -1459,14 +1463,14 @@ impl<D: Driver> DriverRuntime<D> {
                             let superq = crate::supervision::SupervisionHandle::from_handle(parent_superq_handle);
                             Some((mb, superq, pid))
                         }
-                        Err(_e) => {
-                            syscall::klog(LogLevel::Warn, b"[bus] mailbox map fail");
+                        Err(e) => {
+                            crate::uwarn!("bus", "mailbox_map_failed"; err = e.as_str());
                             None
                         }
                     }
                 }
-                Err(_e) => {
-                    syscall::klog(LogLevel::Warn, b"[bus] exec_with_mb fail");
+                Err(e) => {
+                    crate::uwarn!("bus", "exec_with_mb_failed"; errno = e);
                     None
                 }
             };
@@ -1474,7 +1478,7 @@ impl<D: Driver> DriverRuntime<D> {
             let (result, child_pid) = if let Some((mailbox, superq, pid)) = spawn_result {
                 let stored = self.store_child_entry_with_superq(mailbox, superq, pid, filter, context.as_ref(), &binary[..*binary_len]);
                 if !stored {
-                    syscall::klog(LogLevel::Warn, b"[bus] no child slot");
+                    crate::uwarn!("bus", "no_child_slot");
                 }
                 (0i32, pid)
             } else {
@@ -1482,7 +1486,7 @@ impl<D: Driver> DriverRuntime<D> {
             };
 
             if self.ctx.devd.ack_spawn(*seq_id, result, child_pid).is_err() {
-                syscall::klog(LogLevel::Warn, b"[bus] spawn_ack failed");
+                crate::uwarn!("bus", "spawn_ack_failed");
             }
             return;
         }
@@ -2281,7 +2285,7 @@ impl<D: Driver> DriverRuntime<D> {
             None => return, // Not one of our children
         };
 
-        syscall::klog(LogLevel::Info, b"[bus] child exited");
+        crate::uinfo!("bus", "child_exited"; pid = child_pid as u64);
 
         self.ctx.drop_child_entry(child_idx);
 
@@ -2365,8 +2369,11 @@ impl<D: Driver> DriverRuntime<D> {
 
             let note = match superq.try_recv() {
                 Ok(Some(n)) => n,
-                Ok(None) => break, // No more notes
-                Err(_) => break,
+                Ok(None) => break,
+                Err(e) => {
+                    crate::udebug!("bus", "child_superq_recv_err"; err = e.as_str());
+                    break;
+                }
             };
 
             // EXIT note: child died — clean up entry and stop draining
@@ -2393,7 +2400,10 @@ impl<D: Driver> DriverRuntime<D> {
                 loop {
                     let cont = match superq.recv() {
                         Ok(n) => n,
-                        Err(_) => break,
+                        Err(e) => {
+                            crate::uwarn!("bus", "superq_frag_recv_err"; err = e.as_str());
+                            break;
+                        }
                     };
                     let clen = (cont.len as usize).min(120);
                     let n = clen.min(payload_buf.len().saturating_sub(pos));
@@ -2623,7 +2633,7 @@ impl<D: Driver> DriverRuntime<D> {
             .unwrap_or(false);
 
         if !stored {
-            syscall::klog(LogLevel::Error, b"[bus] fwd table full, dropping child request");
+            crate::uerror!("bus", "fwd_table_full");
             return;
         }
 
@@ -2714,8 +2724,8 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
     } else {
         match DevdClient::connect() {
             Ok(c) => c,
-            Err(_) => {
-                syscall::klog(LogLevel::Error, b"[bus] devd connect failed");
+            Err(e) => {
+                crate::uerror!("bus", "devd_connect_failed"; err = e.as_str());
                 syscall::exit(1);
             }
         }
@@ -2724,8 +2734,8 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
     // Create the event loop Mux
     let mux = match Mux::new() {
         Ok(m) => m,
-        Err(_) => {
-            syscall::klog(LogLevel::Error, b"[bus] mux create failed");
+        Err(e) => {
+            crate::uerror!("bus", "mux_create_failed"; err = e.as_str());
             syscall::exit(1);
         }
     };

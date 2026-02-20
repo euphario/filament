@@ -16,7 +16,7 @@ extern crate userlib;
 use userlib::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
 use userlib::bus_runtime::driver_main;
 use userlib::MmioRegion;
-use userlib::uinfo;
+use userlib::unotice;
 
 // =============================================================================
 // MT7988 PWM Hardware Constants
@@ -195,7 +195,7 @@ impl Driver for FanDriver {
         // Initialize PWM channel 0 at 100% (thermal safety default)
         self.init_pwm();
 
-        uinfo!("pwmd", "ready"; fan = self.duty_pct as u64);
+        unotice!("pwmd", "ready"; fan = self.duty_pct as u64);
 
         Ok(())
     }

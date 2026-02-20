@@ -7,7 +7,7 @@
 //! handles PSCI calls, secondary CPU boot, and stack allocation.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::{kwarn, kdebug};
+use crate::{kinfo, kwarn, kdebug};
 use crate::kernel::percpu::{self, CpuState, MAX_CPUS};
 
 /// Stack size per CPU (16KB)
@@ -216,6 +216,10 @@ pub fn start_secondary_cpus() {
                     core::arch::asm!("sev");
                 }
             }
+            Err(psci::INVALID_PARAMS) | Err(psci::DENIED) => {
+                // CPU does not exist on this platform — not an error
+                kdebug!("smp", "cpu_not_present"; cpu = cpu as u64);
+            }
             Err(e) => {
                 kwarn!("smp", "cpu_start_failed"; cpu = cpu as u64, err = e as i64);
             }
@@ -229,7 +233,7 @@ pub fn start_secondary_cpus() {
 
     // Report status
     let online_count = percpu::num_online_cpus();
-    kdebug!("smp", "cpus_online"; count = online_count as u64);
+    kinfo!("smp", "cpus_online"; count = online_count as u64);
 
     // Update scheduler's round-robin to distribute across all online CPUs
     if online_count > 1 {

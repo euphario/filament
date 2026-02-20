@@ -110,26 +110,6 @@ impl ConsoleRing {
         })
     }
 
-    /// Wrap a transferred shmem handle as a ConsoleRing (client side).
-    /// Used with handle transfer — no shmem_id or allow() needed.
-    pub fn from_transferred_handle(handle: crate::syscall::Handle) -> Option<Self> {
-        let shmem = Shmem::from_transferred_handle(handle).ok()?;
-
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-
-        let vaddr = shmem.vaddr();
-        let header = unsafe { &*(vaddr as *const RingHeader) };
-        let tx_config = header.tx_config;
-        let rx_config = header.rx_config;
-
-        Some(Self {
-            shmem,
-            _is_owner: false,
-            tx_config,
-            rx_config,
-        })
-    }
-
     /// Get shmem ID (to send to peer for mapping)
     pub fn shmem_id(&self) -> u32 {
         self.shmem.shmem_id()

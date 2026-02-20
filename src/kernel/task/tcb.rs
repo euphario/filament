@@ -398,6 +398,9 @@ pub struct Task {
     /// fault info on this channel instead of killing. (parent_task_id, channel_id)
     pub(crate) exception_channel: Option<(TaskId, u32)>,
 
+    /// Deadline (counter ticks) for frozen task timeout — kill if exceeded
+    pub(crate) frozen_deadline: u64,
+
     /// Per-task signal queue (fixed ring buffer)
     pub(crate) signal_queue: [abi::PendingSignal; MAX_PENDING_SIGNALS],
     pub(crate) signal_head: u8,  // next write position
@@ -543,6 +546,7 @@ impl Task {
             last_scheduled_at: 0,
             wake_data: None,
             exception_channel: None,
+            frozen_deadline: 0,
             signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
             signal_head: 0,
             signal_tail: 0,
@@ -618,6 +622,7 @@ impl Task {
             last_scheduled_at: 0,
             wake_data: None,
             exception_channel: None,
+            frozen_deadline: 0,
             signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
             signal_head: 0,
             signal_tail: 0,
@@ -718,6 +723,7 @@ impl Task {
             last_scheduled_at: 0,
             wake_data: None,
             exception_channel: None,
+            frozen_deadline: 0,
             signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
             signal_head: 0,
             signal_tail: 0,

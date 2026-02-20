@@ -271,7 +271,7 @@ pub const DEFAULT_PRESET: ResourcePreset = ResourcePreset {
 pub fn resource_preset(driver: &str) -> &'static ResourcePreset {
     static PRESETS: &[(&str, ResourcePreset)] = &[
         ("shell",    ResourcePreset { max_channels: 4,  max_ports: 1, max_shmem: 2, max_children: 0 }),
-        ("consoled", ResourcePreset { max_channels: 8,  max_ports: 2, max_shmem: 4, max_children: 0 }),
+        ("consoled", ResourcePreset { max_channels: 8,  max_ports: 2, max_shmem: 4, max_children: 1 }),
         ("pcied",    ResourcePreset { max_channels: 16, max_ports: 8, max_shmem: 8, max_children: 8 }),
         ("nvmed",    ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 8, max_children: 4 }),
         ("usbd",     ResourcePreset { max_channels: 16, max_ports: 8, max_shmem: 8, max_children: 4 }),

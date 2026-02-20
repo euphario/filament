@@ -16,7 +16,7 @@
 //! - `kill(task_id, killer_id)` - Forced termination (SIGKILL equivalent)
 //! - `wait_child(parent_id, pid, flags)` - Wait for child exit (sys_wait)
 
-use crate::{kinfo, kdebug};
+use crate::{kinfo, knotice, kdebug};
 use super::{TaskId, Scheduler, MAX_TASKS};
 use crate::kernel::ipc::{waker, traits::WakeReason};
 
@@ -99,7 +99,7 @@ pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<Option<
             task.is_probed = false;
         }
 
-        kinfo!("lifecycle", "exit"; pid = task_id, code = code as i64);
+        knotice!("lifecycle", "exit"; pid = task_id, code = code as i64);
 
         (task.parent_id, probed)
     };
@@ -402,7 +402,7 @@ pub fn complete_probed_exit() {
                     task.is_init = true;
                 }
             });
-            kinfo!("lifecycle", "devd_spawned"; slot = slot as u64);
+            knotice!("lifecycle", "devd_spawned"; slot = slot as u64);
         }
         Err(_e) => {
             // Fatal: can't spawn devd

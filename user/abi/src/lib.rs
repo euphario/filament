@@ -557,20 +557,8 @@ pub mod errno {
 // IPC Message Flags
 // ============================================================================
 
-/// IPC message flags (used in write syscall buf_len bit 31 and message headers)
+/// IPC message flags
 pub mod message_flags {
-    /// This message carries a transferred handle.
-    /// Send: first 4 bytes of payload = raw handle to transfer.
-    /// Recv: first 4 bytes of payload = new handle in receiver's table.
-    /// Write syscall: set bit 31 of buf_len to enable.
-    /// Read syscall: bit 31 of return value set if handle was transferred.
-    pub const HANDLE_TRANSFER: u32 = 1 << 0;
-
-    /// Bit mask for write syscall buf_len to signal handle transfer
-    pub const WRITE_FLAG_HANDLE_TRANSFER: usize = 1 << 31;
-
-    /// Bit mask for read syscall return value to signal handle was received
-    pub const READ_FLAG_HANDLE_RECEIVED: i64 = 1 << 31;
 }
 
 // ============================================================================
@@ -1670,6 +1658,28 @@ pub enum PortClass {
 }
 
 impl PortClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortClass::Unknown => "unknown",
+            PortClass::Block => "block",
+            PortClass::StorageController => "storage",
+            PortClass::Network => "network",
+            PortClass::Usb => "usb",
+            PortClass::Pcie => "pcie",
+            PortClass::Filesystem => "filesystem",
+            PortClass::Console => "console",
+            PortClass::Gpio => "gpio",
+            PortClass::I2c => "i2c",
+            PortClass::Spi => "spi",
+            PortClass::Service => "service",
+            PortClass::Uart => "uart",
+            PortClass::Klog => "klog",
+            PortClass::Ethernet => "ethernet",
+            PortClass::Cpu => "cpu",
+            PortClass::Pwm => "pwm",
+        }
+    }
+
     pub fn from_u16(v: u16) -> Option<Self> {
         match v {
             0 => Some(PortClass::Unknown),
@@ -1715,6 +1725,14 @@ pub enum PortState {
 }
 
 impl PortState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortState::Safe => "Safe",
+            PortState::Claimed => "Claimed",
+            PortState::Resetting => "Resetting",
+        }
+    }
+
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(PortState::Safe),
@@ -1732,13 +1750,6 @@ impl PortState {
         matches!(self, PortState::Claimed)
     }
 
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PortState::Safe => "safe",
-            PortState::Claimed => "claimed",
-            PortState::Resetting => "resetting",
-        }
-    }
 }
 
 /// Supervision protocol constants

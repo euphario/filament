@@ -596,20 +596,24 @@ pub fn init() {
 
     // Try address from U-Boot (only valid with booti, not go)
     let boot_dtb = get_dtb_address();
-    kdebug!("fdt", "boot_addr"; addr = crate::klog::hex64(boot_dtb));
-    if let Some(fdt) = Fdt::parse(boot_dtb) {
-        store_fdt(fdt);
-        return;
-    }
-
-    // Fallback: scan known locations for DTB magic
-    kdebug!("fdt", "scanning");
-    if let Some(addr) = find_dtb() {
-        if let Some(fdt) = Fdt::parse(addr) {
+    if boot_dtb != 0 {
+        kdebug!("fdt", "boot_addr"; addr = crate::klog::hex64(boot_dtb));
+        if let Some(fdt) = Fdt::parse(boot_dtb) {
             store_fdt(fdt);
             return;
         }
-    }
 
-    kwarn!("fdt", "not_found");
+        // Fallback: scan known locations for DTB magic
+        kdebug!("fdt", "scanning");
+        if let Some(addr) = find_dtb() {
+            if let Some(fdt) = Fdt::parse(addr) {
+                store_fdt(fdt);
+                return;
+            }
+        }
+
+        kwarn!("fdt", "not_found");
+    } else {
+        kdebug!("fdt", "no_dtb_addr");
+    }
 }
