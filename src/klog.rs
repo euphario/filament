@@ -386,6 +386,11 @@ impl LogRing {
     pub fn has_data(&self) -> bool {
         self.tail.load(Ordering::Acquire) != self.head.load(Ordering::Acquire)
     }
+
+    /// Get current head position (for KlogObject poll)
+    pub fn head_pos(&self) -> u32 {
+        self.head.load(Ordering::Acquire)
+    }
 }
 
 // ============================================================================
@@ -394,6 +399,20 @@ impl LogRing {
 
 /// Global log ring buffer (protected by SpinLock for SMP safety)
 pub static LOG_RING: crate::kernel::lock::SpinLock<LogRing> = crate::kernel::lock::SpinLock::new(crate::kernel::lock::lock_class::SUBSYSTEM, LogRing::new());
+
+/// When true, drain_one() skips UART output (klogd owns the drain).
+/// Set when klog bus is claimed, cleared when klog owner exits.
+static DRAIN_SUPPRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Suppress UART drain (called when klogd claims klog bus)
+pub fn suppress_drain() {
+    DRAIN_SUPPRESSED.store(true, Ordering::Release);
+}
+
+/// Resume UART drain (called when klogd exits)
+pub fn resume_drain() {
+    DRAIN_SUPPRESSED.store(false, Ordering::Release);
+}
 
 /// Boot time in counter ticks
 static BOOT_TIME: AtomicU64 = AtomicU64::new(0);
@@ -1027,7 +1046,11 @@ fn write_hex64(out: &mut [u8], val: u64) -> usize {
 /// Drain one record from the ring buffer and output directly to UART.
 /// Uses drain_cursor (not tail), so records remain in ring for dmesg.
 /// Returns true if a record was drained.
+/// When drain is suppressed (klogd owns the bus), advances drain_cursor
+/// without writing to UART.
 pub fn drain_one() -> bool {
+    let suppressed = DRAIN_SUPPRESSED.load(Ordering::Relaxed);
+
     let mut record_buf = [0u8; MAX_RECORD_SIZE];
     let mut text_buf = [0u8; 1024];
 
@@ -1039,6 +1062,11 @@ pub fn drain_one() -> bool {
     let Some(len) = record_len else {
         return false;
     };
+
+    // When suppressed, just advance drain_cursor (already done by drain_read)
+    if suppressed {
+        return true;
+    }
 
     // Check console level filter — skip printing if record level is above threshold
     let console_level = CONSOLE_LEVEL.load(Ordering::Relaxed);

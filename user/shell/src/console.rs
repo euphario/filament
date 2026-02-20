@@ -332,6 +332,64 @@ impl Console {
         }
     }
 
+    /// Enter input rendering mode by setting InputState flags in shmem.
+    /// Consoled detects the ACTIVE flag and sets up scroll region + renders.
+    /// `prompt` may contain ANSI escapes; `visible_width` is the printable char count.
+    pub fn send_input_on(&self, prompt: &[u8], visible_width: u8) {
+        if let Some(ptr) = self.input_state_ptr() {
+            use core::sync::atomic::Ordering;
+            let plen = prompt.len().min(48);
+            unsafe {
+                // Write prompt
+                let prompt_ptr = core::ptr::addr_of_mut!((*ptr).prompt) as *mut u8;
+                core::ptr::copy_nonoverlapping(prompt.as_ptr(), prompt_ptr, plen);
+                core::ptr::write(core::ptr::addr_of_mut!((*ptr).prompt_len), plen as u8);
+                core::ptr::write(core::ptr::addr_of_mut!((*ptr).prompt_visible_len), visible_width);
+                // Set ACTIVE flag
+                core::ptr::write(
+                    core::ptr::addr_of_mut!((*ptr).flags),
+                    userlib::console_ring::input_flags::ACTIVE,
+                );
+                // Bump seq so consoled notices
+                (*ptr).seq.fetch_add(1, Ordering::Release);
+            }
+        }
+        // Notify consoled to check InputState
+        self.notify_ring();
+    }
+
+    /// Exit input rendering mode by clearing InputState flags in shmem.
+    pub fn send_input_off(&self) {
+        if let Some(ptr) = self.input_state_ptr() {
+            use core::sync::atomic::Ordering;
+            unsafe {
+                // Clear ACTIVE flag
+                core::ptr::write(core::ptr::addr_of_mut!((*ptr).flags), 0u8);
+                // Bump seq so consoled notices
+                (*ptr).seq.fetch_add(1, Ordering::Release);
+            }
+        }
+        self.notify_ring();
+    }
+
+    /// Get reference to InputState in shmem (for reading)
+    pub fn input_state(&self) -> Option<&userlib::console_ring::InputState> {
+        self.ring.as_ref().map(|r| r.input_state())
+    }
+
+    /// Get raw mutable pointer to InputState in shmem (for shell-side writes).
+    /// Safety: Shell is the only writer of buf/len/cursor fields.
+    pub fn input_state_ptr(&self) -> Option<*mut userlib::console_ring::InputState> {
+        self.ring.as_ref().map(|r| r.input_state() as *const _ as *mut _)
+    }
+
+    /// Notify consoled that shmem has changed (e.g., InputState updated)
+    pub fn notify_ring(&self) {
+        if let Some(ring) = &self.ring {
+            ring.notify();
+        }
+    }
+
     /// Connect/disconnect from logd (placeholder - logd integration not yet implemented)
     pub fn set_logd_connected(&self, _connected: bool) {
         // Future: tell consoled to connect/disconnect from logd

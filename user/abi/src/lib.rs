@@ -1780,6 +1780,48 @@ pub mod supervision {
     pub const REASON_HARDWARE_ERROR: u8 = 3;
 }
 
+// ============================================================================
+// Console Input State (Shared Memory)
+// ============================================================================
+
+/// Input line state shared between shell and consoled via shmem.
+///
+/// Lives at the end of the ConsoleRing shmem region:
+///   [RingHeader 64B][TX ring][RX ring][InputState 192B]
+///
+/// Shell updates this struct on every edit; consoled reads it to render
+/// the input line at the bottom of the terminal.
+#[repr(C, align(64))]
+pub struct InputState {
+    /// Sequence number — bumped on every edit (Release/Acquire ordering)
+    pub seq: core::sync::atomic::AtomicU32,  // 4
+    /// Cursor position in buf (byte offset)
+    pub cursor: u16,                          // 2
+    /// Bytes used in buf
+    pub len: u16,                             // 2
+    /// Flags (see `input_flags`)
+    pub flags: u8,                            // 1
+    /// Prompt length (bytes used in prompt[])
+    pub prompt_len: u8,                       // 1
+    /// Visible prompt width (excluding ANSI escapes) for cursor positioning
+    pub prompt_visible_len: u8,               // 1
+    /// Prompt string (e.g., "\x1b[1m\x1b[34m/\x1b[32m > \x1b[0m")
+    pub prompt: [u8; 48],                     // 48
+    /// Padding to 64 bytes
+    pub _pad: [u8; 5],                        // 5
+    /// Line content (matches MAX_LINE = 128)
+    pub buf: [u8; 128],                       // 128
+}
+// Total: 64 + 128 = 192 bytes
+
+const _: () = assert!(core::mem::size_of::<InputState>() == 192);
+
+/// InputState flag bits
+pub mod input_flags {
+    /// Consoled should render the input area
+    pub const ACTIVE: u8 = 1 << 0;
+}
+
 /// Task priority levels (lower number = higher priority)
 pub mod priority {
     pub const REALTIME: u8 = 0;

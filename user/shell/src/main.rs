@@ -116,17 +116,22 @@ fn main() {
             }
         }
 
-        // Draw prompt with cwd
-        color::set(color::BOLD);
-        color::set(color::BLUE);
+        // Build prompt: bold-blue cwd + green " > " + reset
         let cwd_str = unsafe {
             let cwd = &*core::ptr::addr_of!(CWD);
             cwd.as_bytes()
         };
-        console::write(cwd_str);
-        color::set(color::GREEN);
-        console::write(b" > ");
-        color::reset();
+
+        let use_input_mode = console::console().is_connected();
+        if !use_input_mode {
+            // Legacy mode: write prompt directly
+            color::set(color::BOLD);
+            color::set(color::BLUE);
+            console::write(cwd_str);
+            color::set(color::GREEN);
+            console::write(b" > ");
+            color::reset();
+        }
 
         // Read a line using readline with history
         let (buf_slice, history) = unsafe {
@@ -140,6 +145,34 @@ fn main() {
         };
 
         let mut editor = readline::LineEditor::new(buf_slice, history);
+
+        // Build colored prompt for input mode
+        if use_input_mode {
+            let mut pbuf = [0u8; 48];
+            let mut p = 0;
+            // Bold blue
+            pbuf[p..p+4].copy_from_slice(b"\x1b[1m");
+            p += 4;
+            pbuf[p..p+5].copy_from_slice(b"\x1b[34m");
+            p += 5;
+            // CWD (truncate if needed)
+            let clen = cwd_str.len().min(48 - p - 12); // reserve for " > " + color codes
+            pbuf[p..p+clen].copy_from_slice(&cwd_str[..clen]);
+            p += clen;
+            // Green
+            pbuf[p..p+5].copy_from_slice(b"\x1b[32m");
+            p += 5;
+            // " > "
+            pbuf[p..p+3].copy_from_slice(b" > ");
+            p += 3;
+            // Reset
+            pbuf[p..p+4].copy_from_slice(b"\x1b[0m");
+            p += 4;
+
+            let visible_width = (clen + 3) as u8; // cwd + " > "
+            editor.set_prompt(&pbuf[..p], visible_width);
+        }
+
         let len = editor.read();
 
         if len == 0 {
@@ -153,11 +186,6 @@ fn main() {
         }
 
         execute_command(cmd);
-
-        // Ensure cursor is at column 0 before next prompt.
-        // If async log output landed on the terminal during command
-        // execution, we may not be at the start of a line.
-        console::write(b"\r");
     }
 }
 

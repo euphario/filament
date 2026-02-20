@@ -1,6 +1,6 @@
 //! Readline - Line Editing with History
 //!
-//! Provides bash-like line editing with Claude Code-style input box:
+//! Provides bash-like line editing:
 //! - Left/Right arrows: move cursor
 //! - Home/End: move to start/end of line
 //! - Backspace: delete before cursor
@@ -12,6 +12,14 @@
 //! - Ctrl+W: delete word before cursor
 //! - Ctrl+C: cancel line
 //! - Ctrl+D: exit (if line empty)
+//!
+//! ## Rendering Modes
+//!
+//! - **Input mode** (default when connected to consoled): Shell writes its
+//!   line buffer to InputState in shared memory; consoled renders the input
+//!   line at the bottom of the terminal with a scroll region for output.
+//! - **Legacy mode** (direct UART / old consoled): Shell echoes characters
+//!   and ANSI escapes through the TX ring.
 
 use userlib::syscall;
 use crate::console;
@@ -127,10 +135,19 @@ pub struct LineEditor<'a> {
     input_box: InputBox,
     /// Whether to use box mode (false = legacy mode)
     use_box: bool,
+    /// Whether consoled owns input rendering (InputState shmem mode)
+    input_mode: bool,
+    /// Prompt bytes (with ANSI colors) sent to consoled in input mode
+    prompt: [u8; 48],
+    prompt_len: u8,
+    /// Visible prompt width (excluding ANSI escapes) for cursor positioning
+    prompt_visible_width: u8,
 }
 
 impl<'a> LineEditor<'a> {
     pub fn new(buf: &'a mut [u8], history: &'a mut History) -> Self {
+        // Use input mode when connected to consoled
+        let input_mode = console::console().is_connected();
         history.reset_browse();
         Self {
             buf,
@@ -140,12 +157,25 @@ impl<'a> LineEditor<'a> {
             saved_line: [0u8; MAX_LINE],
             saved_len: 0,
             input_box: InputBox::new(),
-            use_box: false, // Disabled - triggers storm detection due to many write syscalls
+            use_box: false,
+            input_mode,
+            prompt: [0u8; 48],
+            prompt_len: 0,
+            prompt_visible_width: 0,
         }
+    }
+
+    /// Set the prompt string (with ANSI escapes) and its visible width
+    pub fn set_prompt(&mut self, prompt: &[u8], visible_width: u8) {
+        let len = prompt.len().min(48);
+        self.prompt[..len].copy_from_slice(&prompt[..len]);
+        self.prompt_len = len as u8;
+        self.prompt_visible_width = visible_width;
     }
 
     /// Create editor with explicit box mode setting
     pub fn with_box_mode(buf: &'a mut [u8], history: &'a mut History, use_box: bool) -> Self {
+        let input_mode = console::console().is_connected();
         history.reset_browse();
         Self {
             buf,
@@ -156,12 +186,42 @@ impl<'a> LineEditor<'a> {
             saved_len: 0,
             input_box: InputBox::new(),
             use_box,
+            input_mode,
+            prompt: [0u8; 48],
+            prompt_len: 0,
+            prompt_visible_width: 0,
         }
     }
 
     /// Set terminal dimensions for box rendering
     pub fn set_dimensions(&mut self, cols: u16, rows: u16) {
         self.input_box.init(cols, rows);
+    }
+
+    /// Sync current line buffer to InputState in shmem (for consoled rendering)
+    fn sync_input_state(&self) {
+        use core::sync::atomic::Ordering;
+
+        if let Some(ptr) = console::console().input_state_ptr() {
+            let len = self.len.min(128);
+            // Write buf, len, cursor, then bump seq (Release ordering)
+            // Safety: shell is the only writer of buf/len/cursor fields.
+            // InputState lives in shmem (shared with consoled who only reads).
+            unsafe {
+                let buf_ptr = core::ptr::addr_of_mut!((*ptr).buf) as *mut u8;
+                core::ptr::copy_nonoverlapping(self.buf.as_ptr(), buf_ptr, len);
+                core::ptr::write(core::ptr::addr_of_mut!((*ptr).len), len as u16);
+                core::ptr::write(
+                    core::ptr::addr_of_mut!((*ptr).cursor),
+                    self.cursor.min(len) as u16,
+                );
+                // Bump seq with Release ordering so consoled sees our writes
+                (*ptr).seq.fetch_add(1, Ordering::Release);
+            }
+
+            // Notify consoled to check InputState
+            console::console().notify_ring();
+        }
     }
 
     /// Read a line with editing support
@@ -176,11 +236,25 @@ impl<'a> LineEditor<'a> {
             self.input_box.draw(&[], 0);
         }
 
+        // Enter input mode: tell consoled to set up scroll region and render
+        if self.input_mode {
+            let (p, vis) = if self.prompt_len > 0 {
+                (&self.prompt[..self.prompt_len as usize], self.prompt_visible_width)
+            } else {
+                (b"> ".as_slice(), 2u8)
+            };
+            con.send_input_on(p, vis);
+            self.sync_input_state();
+        }
+
         while self.len < self.buf.len() - 1 {
             let ch = match console::read_byte() {
                 Some(c) => c,
                 None => {
                     // Connection lost - clean up and return
+                    if self.input_mode {
+                        console::console().send_input_off();
+                    }
                     if self.use_box {
                         self.input_box.clear();
                     }
@@ -190,8 +264,11 @@ impl<'a> LineEditor<'a> {
             match ch {
                     // Enter - end of line
                     b'\r' | b'\n' => {
+                        // Exit input mode before output
+                        if self.input_mode {
+                            console::console().send_input_off();
+                        }
                         if self.use_box {
-                            // Clear box first, then move cursor to output area
                             self.input_box.clear();
                         }
                         write_str("\r\n");
@@ -209,6 +286,9 @@ impl<'a> LineEditor<'a> {
 
                     // Ctrl+C - cancel line
                     0x03 => {
+                        if self.input_mode {
+                            console::console().send_input_off();
+                        }
                         if self.use_box {
                             self.input_box.clear();
                         }
@@ -219,6 +299,9 @@ impl<'a> LineEditor<'a> {
                     // Ctrl+D - EOF (exit if empty line)
                     0x04 => {
                         if self.len == 0 {
+                            if self.input_mode {
+                                console::console().send_input_off();
+                            }
                             if self.use_box {
                                 self.input_box.clear();
                             }
@@ -328,16 +411,16 @@ impl<'a> LineEditor<'a> {
         self.len += 1;
         self.cursor += 1;
 
-        if self.use_box {
+        if self.input_mode {
+            self.sync_input_state();
+        } else if self.use_box {
             self.input_box.update(&self.buf[..self.len], self.cursor);
+        } else if self.cursor == self.len {
+            // Inserting at end — just write the char
+            console::write(&[ch]);
         } else {
-            // Legacy mode
-            let inserting_at_end = self.cursor == self.len;
-            if inserting_at_end {
-                console::write(&[ch]);
-            } else {
-                self.redraw_from_cursor();
-            }
+            // Mid-line insert: terminal cursor is at cursor-1, refresh from there
+            self.refresh_line_from(self.cursor - 1);
         }
     }
 
@@ -355,13 +438,14 @@ impl<'a> LineEditor<'a> {
         self.len -= 1;
         self.cursor -= 1;
 
-        if self.use_box {
+        if self.input_mode {
+            self.sync_input_state();
+        } else if self.use_box {
             self.input_box.update(&self.buf[..self.len], self.cursor);
         } else {
-            // Legacy mode: Move cursor back and redraw
-            write_str("\x08");
-            self.redraw_from_cursor();
-            write_str(" \x08");
+            // Move terminal cursor back one, then refresh from there
+            console::write(b"\x08");
+            self.refresh_line_from(self.cursor);
         }
     }
 
@@ -378,11 +462,12 @@ impl<'a> LineEditor<'a> {
 
         self.len -= 1;
 
-        if self.use_box {
+        if self.input_mode {
+            self.sync_input_state();
+        } else if self.use_box {
             self.input_box.update(&self.buf[..self.len], self.cursor);
         } else {
-            self.redraw_from_cursor();
-            write_str(" \x08");
+            self.refresh_line_from(self.cursor);
         }
     }
 
@@ -390,7 +475,9 @@ impl<'a> LineEditor<'a> {
     fn move_left(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            if self.use_box {
+            if self.input_mode {
+                self.sync_input_state();
+            } else if self.use_box {
                 self.input_box.position_cursor(self.cursor);
             } else {
                 write_str("\x08");
@@ -402,7 +489,9 @@ impl<'a> LineEditor<'a> {
     fn move_right(&mut self) {
         if self.cursor < self.len {
             self.cursor += 1;
-            if self.use_box {
+            if self.input_mode {
+                self.sync_input_state();
+            } else if self.use_box {
                 self.input_box.position_cursor(self.cursor);
             } else {
                 console::write(&[self.buf[self.cursor - 1]]);
@@ -416,7 +505,10 @@ impl<'a> LineEditor<'a> {
             return;
         }
 
-        if self.use_box {
+        if self.input_mode {
+            self.cursor = 0;
+            self.sync_input_state();
+        } else if self.use_box {
             self.cursor = 0;
             self.input_box.position_cursor(0);
         } else {
@@ -433,7 +525,10 @@ impl<'a> LineEditor<'a> {
             return;
         }
 
-        if self.use_box {
+        if self.input_mode {
+            self.cursor = self.len;
+            self.sync_input_state();
+        } else if self.use_box {
             self.cursor = self.len;
             self.input_box.position_cursor(self.cursor);
         } else {
@@ -450,31 +545,36 @@ impl<'a> LineEditor<'a> {
             return;
         }
 
-        let chars_to_clear = self.len - self.cursor;
         self.len = self.cursor;
 
-        if self.use_box {
+        if self.input_mode {
+            self.sync_input_state();
+        } else if self.use_box {
             self.input_box.update(&self.buf[..self.len], self.cursor);
         } else {
-            for _ in 0..chars_to_clear {
-                write_str(" ");
-            }
-            for _ in 0..chars_to_clear {
-                write_str("\x08");
-            }
+            // Clear from cursor to end of line
+            console::write(b"\x1b[K");
         }
     }
 
     /// Delete entire line
     fn delete_line(&mut self) {
-        self.len = 0;
-        self.cursor = 0;
-
-        if self.use_box {
+        if self.input_mode {
+            self.len = 0;
+            self.cursor = 0;
+            self.sync_input_state();
+        } else if self.use_box {
+            self.len = 0;
+            self.cursor = 0;
             self.input_box.update(&[], 0);
         } else {
-            self.move_to_start();
-            self.delete_to_end();
+            // Move terminal cursor to start of editable area
+            for _ in 0..self.cursor {
+                console::write(b"\x08");
+            }
+            self.len = 0;
+            self.cursor = 0;
+            console::write(b"\x1b[K");
         }
     }
 
@@ -509,21 +609,16 @@ impl<'a> LineEditor<'a> {
         self.len -= chars_deleted;
         self.cursor = start;
 
-        if self.use_box {
+        if self.input_mode {
+            self.sync_input_state();
+        } else if self.use_box {
             self.input_box.update(&self.buf[..self.len], self.cursor);
         } else {
-            // Move cursor back
+            // Move terminal cursor back to new cursor position
             for _ in 0..chars_deleted {
-                write_str("\x08");
+                console::write(b"\x08");
             }
-            // Redraw and clear
-            self.redraw_from_cursor();
-            for _ in 0..chars_deleted {
-                write_str(" ");
-            }
-            for _ in 0..chars_deleted {
-                write_str("\x08");
-            }
+            self.refresh_line_from(self.cursor);
         }
     }
 
@@ -581,7 +676,6 @@ impl<'a> LineEditor<'a> {
 
     /// Replace current line with new content
     fn replace_line(&mut self, new: &[u8]) {
-        let old_len = self.len;
         let old_cursor = self.cursor;
 
         // Copy new content
@@ -590,37 +684,34 @@ impl<'a> LineEditor<'a> {
         self.len = new_len;
         self.cursor = new_len;
 
-        if self.use_box {
+        if self.input_mode {
+            self.sync_input_state();
+        } else if self.use_box {
             self.input_box.update(&self.buf[..self.len], self.cursor);
         } else {
-            // Move cursor back to start of editable area
+            // Move terminal cursor to start of editable area
             for _ in 0..old_cursor {
-                write_str("\x08");
+                console::write(b"\x08");
             }
-
-            // Write new content
-            console::write(&self.buf[..new_len]);
-
-            // Clear any leftover characters from old line
-            let clear = if old_len > new_len { old_len - new_len } else { 0 };
-            for _ in 0..clear {
-                write_str(" ");
-            }
-            // Move cursor back past the cleared area
-            for _ in 0..clear {
-                write_str("\x08");
-            }
+            // Write new content and clear remainder
+            self.refresh_line_from(0);
         }
     }
 
-    /// Redraw from cursor to end of line
-    fn redraw_from_cursor(&mut self) {
-        if self.cursor < self.len {
-            console::write(&self.buf[self.cursor..self.len]);
-            // Move cursor back to position
-            for _ in self.cursor..self.len {
-                write_str("\x08");
-            }
+    /// Refresh display from terminal's current position.
+    ///
+    /// Writes buf[from..len] to screen, clears to end of line,
+    /// then moves cursor back to self.cursor.
+    fn refresh_line_from(&self, from: usize) {
+        if from < self.len {
+            console::write(&self.buf[from..self.len]);
+        }
+        // Clear any leftover characters from previous content
+        console::write(b"\x1b[K");
+        // Move cursor back to self.cursor
+        let back = self.len.saturating_sub(self.cursor);
+        for _ in 0..back {
+            console::write(b"\x08");
         }
     }
 
@@ -693,7 +784,12 @@ impl<'a> LineEditor<'a> {
             }
             write_str("\r\n");
 
-            if self.use_box {
+            if self.input_mode {
+                // In input mode, completions go through TX ring → consoled
+                // writes them into the scroll region. Input line stays pinned.
+                // Just re-sync the input state (unchanged content).
+                self.sync_input_state();
+            } else if self.use_box {
                 // Redraw box with current content
                 self.input_box.draw(&self.buf[..self.len], self.cursor);
             } else {

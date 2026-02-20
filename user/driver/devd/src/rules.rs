@@ -150,7 +150,15 @@ pub static PORT_RULES: &[PortRule] = &[
         context: &[],
         mount_path: None,
     },
-    // Klog→logd rule removed: logd needs rewrite for 5-syscall API
+    PortRule {
+        class: PortClass::Klog,
+        subclass: SubclassMatch::Any,
+        driver: "klogd",
+        caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::ABOVE_NORM,
+        context: &[],
+        mount_path: None,
+    },
 
     // =========================================================================
     // Driver layer (driver ports → children)
@@ -348,11 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rule_klog_no_match() {
-        // Klog rule removed (logd needs rewrite)
+    fn test_rule_klog() {
         let info = make_port_info(PortClass::Klog, 0);
         let rule = find_port_rule(&info);
-        assert!(rule.is_none());
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().driver, "klogd");
     }
 
     #[test]

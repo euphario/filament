@@ -155,6 +155,18 @@ pub struct ConsoledDriver {
     log_lines: u16,
     /// PID of the connected shell (for signal delivery)
     shell_pid: Option<u32>,
+    /// Input rendering mode (consoled owns the input line)
+    input_mode: bool,
+    /// Prompt for input mode (e.g., "\x1b[1m\x1b[34m/\x1b[32m > \x1b[0m")
+    input_prompt: [u8; 48],
+    input_prompt_len: u8,
+    /// Visible prompt width (excluding ANSI escapes) for cursor positioning
+    input_prompt_visible: u8,
+    /// Last seen InputState sequence number
+    last_input_seq: u32,
+    /// Column position in scroll region after last output write (1-based).
+    /// Used to resume multi-chunk output at the correct position.
+    output_col: u16,
 }
 
 impl ConsoledDriver {
@@ -170,7 +182,329 @@ impl ConsoledDriver {
             split_enabled: false,
             log_lines: 5,
             shell_pid: None,
+            input_mode: false,
+            input_prompt: [0u8; 48],
+            input_prompt_len: 0,
+            input_prompt_visible: 0,
+            last_input_seq: 0,
+            output_col: 1,
         }
+    }
+
+    // =========================================================================
+    // Input Line Rendering (consoled-owned input area)
+    // =========================================================================
+
+    /// Check InputState flags and enter/exit input mode accordingly.
+    /// Called on every shmem event.
+    fn check_input_flags(&mut self) {
+        let ring = match self.shell_ring.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let input = ring.input_state();
+        let flags = input.flags;
+        let active = (flags & userlib::console_ring::input_flags::ACTIVE) != 0;
+
+        if active && !self.input_mode {
+            // Read prompt from InputState
+            let plen = (input.prompt_len as usize).min(48);
+            self.input_prompt[..plen].copy_from_slice(&input.prompt[..plen]);
+            self.input_prompt_len = plen as u8;
+            self.input_prompt_visible = input.prompt_visible_len;
+            self.enter_input_mode();
+        } else if !active && self.input_mode {
+            self.exit_input_mode();
+        }
+    }
+
+    /// Enter input mode: set up scroll region, render prompt on input row.
+    ///
+    /// Output position is tracked via `output_col` — no ESC[s/ESC[u needed.
+    /// This is resilient to external UART writes (klog) that would corrupt
+    /// terminal save/restore state.
+    fn enter_input_mode(&mut self) {
+        if self.input_mode {
+            return;
+        }
+        self.last_input_seq = 0;
+        self.output_col = 1;
+
+        // Disable split if it was on — input mode replaces it
+        if self.split_enabled {
+            self.split_enabled = false;
+        }
+
+        // Scroll screen up to make room for separator + input lines.
+        // Without this, short output (e.g., `uptime`) at the bottom of the
+        // screen gets overwritten by the separator drawn at rows-1.
+        let mut scroll = [0u8; 16];
+        let mut spos = 0;
+        // Move to bottom of screen
+        scroll[spos..spos+2].copy_from_slice(b"\x1b[");
+        spos += 2;
+        spos += write_u16_to_buf(&mut scroll[spos..], self.rows);
+        scroll[spos..spos+3].copy_from_slice(b";1H");
+        spos += 3;
+        // Print newlines to push content up (2 = separator + input)
+        scroll[spos] = b'\n';
+        scroll[spos+1] = b'\n';
+        spos += 2;
+        self.write_uart(&scroll[..spos]);
+
+        let mut buf = [0u8; 64];
+        let mut pos = 0;
+
+        // Set scroll region: rows 1..rows-2 for output
+        // Row rows-1 = separator line, row rows = input
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        buf[pos..pos+2].copy_from_slice(b"1;");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 2);
+        buf[pos] = b'r';
+        pos += 1;
+
+        self.write_uart(&buf[..pos]);
+
+        // Draw separator line on row rows-1
+        self.draw_separator();
+
+        // Move cursor to input row and draw prompt
+        let mut buf2 = [0u8; 32];
+        let mut pos2 = 0;
+        buf2[pos2..pos2+2].copy_from_slice(b"\x1b[");
+        pos2 += 2;
+        pos2 += write_u16_to_buf(&mut buf2[pos2..], self.rows);
+        buf2[pos2..pos2+3].copy_from_slice(b";1H");
+        pos2 += 3;
+        buf2[pos2..pos2+3].copy_from_slice(b"\x1b[K");
+        pos2 += 3;
+        self.write_uart(&buf2[..pos2]);
+
+        // Draw prompt
+        self.write_uart(&self.input_prompt[..self.input_prompt_len as usize]);
+
+        self.input_mode = true;
+    }
+
+    /// Draw horizontal separator line on row rows-1
+    fn draw_separator(&mut self) {
+        let mut buf = [0u8; 512];
+        let mut pos = 0;
+
+        // Move to separator row
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
+        buf[pos..pos+3].copy_from_slice(b";1H");
+        pos += 3;
+
+        // Dim color for separator
+        buf[pos..pos+4].copy_from_slice(b"\x1b[2m");
+        pos += 4;
+
+        // Fill with ─ (U+2500 = 0xE2 0x94 0x80), 3 bytes per character
+        let max_chars = ((buf.len() - pos - 8) / 3).min(self.cols as usize);
+        for _ in 0..max_chars {
+            buf[pos] = 0xe2;
+            buf[pos+1] = 0x94;
+            buf[pos+2] = 0x80;
+            pos += 3;
+        }
+
+        // Reset color
+        buf[pos..pos+4].copy_from_slice(b"\x1b[0m");
+        pos += 4;
+
+        self.write_uart(&buf[..pos]);
+    }
+
+    /// Exit input mode: reset scroll region, position cursor after output.
+    fn exit_input_mode(&mut self) {
+        if !self.input_mode {
+            return;
+        }
+        self.input_mode = false;
+
+        let mut buf = [0u8; 64];
+        let mut pos = 0;
+
+        // Clear separator line (row=rows-1)
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
+        buf[pos..pos+6].copy_from_slice(b";1H\x1b[K");
+        pos += 6;
+
+        // Clear the input line (row=rows)
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows);
+        buf[pos..pos+6].copy_from_slice(b";1H\x1b[K");
+        pos += 6;
+
+        // Reset scroll region (ESC[r moves cursor to 1,1 — VT100 spec)
+        buf[pos..pos+3].copy_from_slice(b"\x1b[r");
+        pos += 3;
+
+        // Reposition cursor to where output was (ESC[r reset it to 1,1)
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 2);
+        buf[pos..pos+3].copy_from_slice(b";1H");
+        pos += 3;
+
+        self.write_uart(&buf[..pos]);
+    }
+
+    /// Render the input line from InputState in shmem.
+    ///
+    /// Moves directly to the input row (row=rows) without save/restore —
+    /// ESC[s/ESC[u is reserved for the output cursor position.
+    fn render_input_line(&mut self) {
+        use core::sync::atomic::Ordering;
+
+        let ring = match self.shell_ring.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let input = ring.input_state();
+        let seq = input.seq.load(Ordering::Acquire);
+        if seq == self.last_input_seq {
+            return; // No change
+        }
+        self.last_input_seq = seq;
+
+        // Check if input mode should change
+        let active = (input.flags & userlib::console_ring::input_flags::ACTIVE) != 0;
+        if !active {
+            if self.input_mode {
+                self.exit_input_mode();
+            }
+            return;
+        }
+
+        let len = (input.len as usize).min(128);
+        let cursor = (input.cursor as usize).min(len);
+        let prompt_bytes = self.input_prompt_len as usize;
+        let prompt_vis = self.input_prompt_visible as usize;
+
+        // Build the entire UART write in one buffer to minimize syscalls
+        let mut buf = [0u8; 256];
+        let mut pos = 0;
+
+        // Move to input row, column 1 (no save/restore — ESC[s is for output pos)
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows);
+        buf[pos..pos+3].copy_from_slice(b";1H");
+        pos += 3;
+
+        // Write prompt (may contain ANSI escapes)
+        let prompt = &self.input_prompt[..prompt_bytes];
+        let copy_len = prompt.len().min(buf.len() - pos);
+        buf[pos..pos+copy_len].copy_from_slice(&prompt[..copy_len]);
+        pos += copy_len;
+
+        // Write input text
+        let text_copy = len.min(buf.len() - pos);
+        buf[pos..pos+text_copy].copy_from_slice(&input.buf[..text_copy]);
+        pos += text_copy;
+
+        // Clear to end of line
+        buf[pos..pos+3].copy_from_slice(b"\x1b[K");
+        pos += 3;
+
+        // Position cursor using visible prompt width (not byte length)
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows);
+        buf[pos] = b';';
+        pos += 1;
+        pos += write_u16_to_buf(&mut buf[pos..], (prompt_vis + cursor + 1) as u16);
+        buf[pos] = b'H';
+        pos += 1;
+
+        self.write_uart(&buf[..pos]);
+    }
+
+    /// Write output while in input mode — output goes into scroll region,
+    /// then cursor returns to input line position.
+    ///
+    /// Uses explicit column tracking (`output_col`) instead of ESC[s/ESC[u,
+    /// which is resilient to external UART writes (klog) that corrupt
+    /// terminal save/restore state.
+    fn write_output_input_mode(&mut self, data: &[u8]) {
+        let ring = match self.shell_ring.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let input = ring.input_state();
+        let len = (input.len as usize).min(128);
+        let cursor = (input.cursor as usize).min(len);
+        let prompt_vis = self.input_prompt_visible as usize;
+
+        // Move to output position in scroll region (bottom row, tracked column)
+        let mut pre = [0u8; 16];
+        let mut ppos = 0;
+        pre[ppos..ppos+2].copy_from_slice(b"\x1b[");
+        ppos += 2;
+        ppos += write_u16_to_buf(&mut pre[ppos..], self.rows - 2);
+        pre[ppos] = b';';
+        ppos += 1;
+        ppos += write_u16_to_buf(&mut pre[ppos..], self.output_col);
+        pre[ppos] = b'H';
+        ppos += 1;
+        self.write_uart(&pre[..ppos]);
+
+        // Write the output data (scroll region handles scrolling)
+        self.write_uart(data);
+
+        // Update output_col by scanning data, properly skipping ANSI escapes
+        let cols = self.cols;
+        let mut esc: u8 = 0; // 0=normal, 1=after ESC, 2=in CSI
+        for &b in data {
+            match esc {
+                1 => {
+                    // After ESC: '[' starts CSI, anything else = 2-char escape
+                    esc = if b == b'[' { 2 } else { 0 };
+                }
+                2 => {
+                    // In CSI: terminated by 0x40..=0x7e (letter)
+                    if b >= 0x40 && b <= 0x7e {
+                        esc = 0;
+                    }
+                }
+                _ => match b {
+                    0x1b => esc = 1,
+                    b'\n' | b'\r' => self.output_col = 1,
+                    0x20..=0x7e => {
+                        self.output_col += 1;
+                        if self.output_col > cols {
+                            self.output_col = 1; // Line wrap
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        // Return cursor to input line
+        let mut post = [0u8; 16];
+        let mut qpos = 0;
+        post[qpos..qpos+2].copy_from_slice(b"\x1b[");
+        qpos += 2;
+        qpos += write_u16_to_buf(&mut post[qpos..], self.rows);
+        post[qpos] = b';';
+        qpos += 1;
+        qpos += write_u16_to_buf(&mut post[qpos..], (prompt_vis + cursor + 1) as u16);
+        post[qpos] = b'H';
+        qpos += 1;
+        self.write_uart(&post[..qpos]);
     }
 
     // =========================================================================
@@ -398,21 +732,33 @@ impl ConsoledDriver {
             };
             let tx_avail = ring.tx_available();
             if tx_avail == 0 {
-                return;
+                0 // No TX data — handle below after borrow ends
+            } else {
+                let to_read = tx_avail.min(tx_buf.len());
+                ring.tx_read(&mut tx_buf[..to_read])
             }
-            let to_read = tx_avail.min(tx_buf.len());
-            ring.tx_read(&mut tx_buf[..to_read])
         };
+        // Borrow of self.shell_ring is released here
 
         if n == 0 {
+            // No TX data — check InputState flags and render
+            self.check_input_flags();
+            if self.input_mode {
+                self.render_input_line();
+            }
             return;
         }
+
+        // Check InputState flags for input mode transitions (flag-based, not in-band)
+        self.check_input_flags();
 
         // Find command start (skip leading whitespace/newlines which may be echo)
         let mut cmd_start = 0;
         while cmd_start < n && (tx_buf[cmd_start] == b'\n' || tx_buf[cmd_start] == b'\r') {
             // Output the newline first (it's echo from shell)
-            if self.split_enabled {
+            if self.input_mode {
+                self.write_output_input_mode(&tx_buf[cmd_start..cmd_start+1]);
+            } else if self.split_enabled {
                 self.write_output(&tx_buf[cmd_start..cmd_start+1]);
             } else {
                 self.write_uart(&tx_buf[cmd_start..cmd_start+1]);
@@ -451,7 +797,11 @@ impl ConsoledDriver {
             }
         } else if cmd_len >= 7 && &cmd_buf[..7] == b"GETSIZE" {
             // Temporarily disable scroll region for size detection
-            if self.split_enabled {
+            let was_input = self.input_mode;
+            if was_input {
+                // Temporarily remove scroll region
+                self.write_uart(b"\x1b[r");
+            } else if self.split_enabled {
                 self.write_uart(b"\x1b[r");
             }
 
@@ -463,8 +813,11 @@ impl ConsoledDriver {
                 None => {}
             }
 
-            // Re-enable scroll region if split mode
-            if self.split_enabled {
+            // Re-enable scroll region
+            if was_input {
+                self.input_mode = false;
+                self.enter_input_mode();
+            } else if self.split_enabled {
                 self.split_enabled = false;
                 self.enable_split();
             }
@@ -477,11 +830,18 @@ impl ConsoledDriver {
             }
         } else if cmd_len > 0 {
             // Regular output (not a command)
-            if self.split_enabled {
+            if self.input_mode {
+                self.write_output_input_mode(cmd_buf);
+            } else if self.split_enabled {
                 self.write_output(cmd_buf);
             } else {
                 self.write_uart(cmd_buf);
             }
+        }
+
+        // If in input mode, check InputState after processing TX data
+        if self.input_mode {
+            self.render_input_line();
         }
 
         // Check for more data (recursively, but bounded by buffer)
@@ -503,6 +863,11 @@ impl ConsoledDriver {
     }
 
     fn disconnect_shell(&mut self, ctx: &mut dyn BusCtx) {
+        // Exit input mode if active
+        if self.input_mode {
+            self.exit_input_mode();
+        }
+
         // Unwatch handles before dropping
         if let Some(ring) = &self.shell_ring {
             let _ = ctx.unwatch_handle(ring.handle());
@@ -566,6 +931,13 @@ impl Driver for ConsoledDriver {
                 Ok(n) if n > 0 => {}
                 _ => break,
             }
+        }
+
+        // Detect terminal size via CPR
+        if let Some((cols, rows)) = ansi::query_screen_size() {
+            self.cols = cols;
+            self.rows = rows;
+            unotice!("consoled", "terminal_size"; cols = cols, rows = rows);
         }
 
         // Create console port

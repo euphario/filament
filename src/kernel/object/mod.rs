@@ -1057,9 +1057,14 @@ impl Pollable for KlogObject {
         if (filter & poll::READABLE) == 0 {
             return PollResult::NONE;
         }
-        // Check if there's unread log data
-        // For now, always report readable (log buffer always has data)
-        PollResult::readable()
+        // Check if read_pos has caught up to head
+        let ring = crate::klog::LOG_RING.lock();
+        let head = ring.head_pos();
+        if self.read_pos as u32 == head {
+            PollResult::NONE
+        } else {
+            PollResult::readable()
+        }
     }
 
     fn subscribe(&mut self, subscriber: Subscriber) {

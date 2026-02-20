@@ -278,6 +278,7 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         ("shell", "shell"),
         ("partd", "driver/partd"),
         ("cpud", "driver/cpud"),
+        ("klogd", "driver/klogd"),
     ];
 
     // Platform-specific programs

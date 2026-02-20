@@ -28,7 +28,7 @@ use core::sync::atomic::Ordering;
 use crate::ipc::Shmem;
 
 // Re-export ring types from abi
-pub use abi::{RingHeader, RingConfig, ring_config, ring_presets};
+pub use abi::{RingHeader, RingConfig, ring_config, ring_presets, InputState, input_flags};
 
 /// Console ring - bidirectional I/O over shared memory
 pub struct ConsoleRing {
@@ -57,7 +57,7 @@ impl ConsoleRing {
         // Calculate sizes
         let tx_size = ring_config::ring_size(tx_config);
         let rx_size = ring_config::ring_size(rx_config);
-        let total_size = 64 + tx_size + rx_size; // Header + TX + RX
+        let total_size = 64 + tx_size + rx_size + 192; // Header + TX + RX + InputState
 
         // Create shared memory via unified interface
         let shmem = Shmem::create(total_size).ok()?;
@@ -154,6 +154,12 @@ impl ConsoleRing {
     /// Get RX buffer size
     pub fn rx_size(&self) -> usize {
         ring_config::ring_size(self.rx_config)
+    }
+
+    /// Get InputState at the end of the shmem region
+    pub fn input_state(&self) -> &InputState {
+        let offset = 64 + self.tx_size() + self.rx_size();
+        unsafe { &*((self.vaddr() as *const u8).add(offset) as *const InputState) }
     }
 
     // ========================================================================

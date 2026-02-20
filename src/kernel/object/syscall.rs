@@ -1322,8 +1322,38 @@ fn read_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize, task
 }
 
 fn read_klog(k: &mut super::KlogObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    let _ = (k, buf_ptr, buf_len);
-    KernelError::NotSupported.to_errno()
+    if buf_len == 0 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    let mut record_buf = [0u8; crate::klog::MAX_RECORD_SIZE];
+    let cursor = k.read_pos() as u32;
+
+    let result = {
+        let ring = crate::klog::LOG_RING.lock();
+        ring.peek_at(cursor, &mut record_buf)
+    };
+
+    let Some((len, new_cursor)) = result else {
+        return KernelError::WouldBlock.to_errno();
+    };
+
+    // Format to text
+    let mut text_buf = [0u8; 1024];
+    let text_len = crate::klog::format_record(&record_buf[..len], &mut text_buf);
+    if text_len == 0 {
+        // Corrupted record, skip it
+        k.set_read_pos(new_cursor as usize);
+        return KernelError::WouldBlock.to_errno();
+    }
+
+    let copy_len = text_len.min(buf_len);
+    if uaccess::copy_to_user(buf_ptr, &text_buf[..copy_len]).is_err() {
+        return KernelError::BadAddress.to_errno();
+    }
+
+    k.set_read_pos(new_cursor as usize);
+    copy_len as i64
 }
 
 fn read_mux(_m: &mut super::MuxObject, _buf_ptr: u64, _buf_len: usize, _task_id: u32) -> i64 {
