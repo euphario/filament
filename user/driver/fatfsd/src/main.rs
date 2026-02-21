@@ -1,6 +1,6 @@
-//! FAT16 Filesystem Driver
+//! FAT16/FAT32 Filesystem Driver
 //!
-//! Read-only FAT16 driver that serves the VFS protocol over DataPort.
+//! Read-only FAT16/FAT32 driver that serves the VFS protocol over DataPort.
 //! Consumes a partition block port, provides a VFS protocol port.
 //!
 //! ## Architecture
@@ -23,8 +23,8 @@
 //!
 //! 1. Spawned by partd via devd rules when Partition port appears
 //! 2. Gets SpawnContext → connects to partition DataPort (consumer)
-//! 3. Reads BPB at sector 0, validates FAT16
-//! 4. Caches FAT table
+//! 3. Reads BPB at sector 0, detects FAT16 or FAT32
+//! 4. Caches FAT table (windowed for FAT32)
 //! 5. Creates VFS DataPort (provider), registers as Filesystem port
 //! 6. Serves VFS requests: OPEN, READ, READDIR, STAT, CLOSE
 
@@ -53,7 +53,7 @@ const MAX_OPEN_FILES: usize = 16;
 struct OpenFile {
     in_use: bool,
     is_dir: bool,
-    start_cluster: u16,
+    start_cluster: u32,
     size: u32,
 }
 
@@ -64,7 +64,7 @@ impl OpenFile {
 }
 
 // =============================================================================
-// FAT16 Driver
+// FAT16/FAT32 Driver
 // =============================================================================
 
 struct FatfsDriver {
@@ -73,14 +73,18 @@ struct FatfsDriver {
     /// VFS protocol provider port
     vfs_port: Option<PortId>,
 
-    // FAT16 BPB fields
+    // BPB fields (shared)
     bytes_per_sector: u16,
     sectors_per_cluster: u8,
     reserved_sectors: u16,
     num_fats: u8,
     root_entry_count: u16,
     total_sectors: u32,
-    fat_size_sectors: u16,
+    fat_size_sectors: u32,
+
+    // FAT32-specific
+    is_fat32: bool,
+    root_cluster: u32,
 
     // Derived layout
     fat_start_lba: u32,
@@ -88,8 +92,9 @@ struct FatfsDriver {
     root_dir_sectors: u32,
     data_start_lba: u32,
 
-    // FAT cache (2 bytes per entry for FAT16)
-    fat_cache: [u16; FAT_CACHE_ENTRIES],
+    // FAT cache — windowed: stores entries [fat_cache_base .. fat_cache_base + 8192)
+    fat_cache: [u32; FAT_CACHE_ENTRIES],
+    fat_cache_base: u32,
     fat_cache_valid: bool,
 
     // Open files
@@ -112,11 +117,14 @@ impl FatfsDriver {
             root_entry_count: 0,
             total_sectors: 0,
             fat_size_sectors: 0,
+            is_fat32: false,
+            root_cluster: 0,
             fat_start_lba: 0,
             root_dir_start_lba: 0,
             root_dir_sectors: 0,
             data_start_lba: 0,
-            fat_cache: [0u16; FAT_CACHE_ENTRIES],
+            fat_cache: [0u32; FAT_CACHE_ENTRIES],
+            fat_cache_base: 0,
             fat_cache_valid: false,
             open_files: [OpenFile::empty(); MAX_OPEN_FILES],
             port_name: [0; 32],
@@ -171,7 +179,7 @@ impl FatfsDriver {
     }
 
     // =========================================================================
-    // FAT16 initialization
+    // FAT16/FAT32 initialization
     // =========================================================================
 
     fn parse_bpb(&mut self, sector: &[u8]) -> bool {
@@ -195,86 +203,144 @@ impl FatfsDriver {
         let total_sectors_32 = u32::from_le_bytes([sector[32], sector[33], sector[34], sector[35]]);
         self.total_sectors = if total_sectors_16 != 0 { total_sectors_16 as u32 } else { total_sectors_32 };
 
-        self.fat_size_sectors = u16::from_le_bytes([sector[22], sector[23]]);
+        // Detect FAT16 vs FAT32: BPB_FATSz16 at offset 22-23
+        let fat_size_16 = u16::from_le_bytes([sector[22], sector[23]]);
+        if fat_size_16 != 0 {
+            self.fat_size_sectors = fat_size_16 as u32;
+            self.is_fat32 = false;
+        } else {
+            // FAT32: BPB_FATSz32 at offset 36-39
+            let fat_size_32 = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
+            if fat_size_32 == 0 {
+                uerror!("fatfsd", "invalid_bpb_fat_size";);
+                return false;
+            }
+            self.fat_size_sectors = fat_size_32;
+            self.is_fat32 = true;
+            // BPB_RootClus at offset 44-47
+            self.root_cluster = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]);
+        }
 
-        // Validate FAT16
+        // Validate common fields
         if self.bytes_per_sector == 0 || self.sectors_per_cluster == 0 || self.num_fats == 0 {
             uerror!("fatfsd", "invalid_bpb_zero";);
             return false;
         }
 
-        if self.fat_size_sectors == 0 {
-            uerror!("fatfsd", "invalid_bpb_fat32";);
-            return false;
-        }
-
         // Compute layout
         self.fat_start_lba = self.reserved_sectors as u32;
-        self.root_dir_start_lba = self.fat_start_lba + (self.num_fats as u32 * self.fat_size_sectors as u32);
-        self.root_dir_sectors = ((self.root_entry_count as u32 * 32) + self.bytes_per_sector as u32 - 1)
-            / self.bytes_per_sector as u32;
+        self.root_dir_start_lba = self.fat_start_lba + (self.num_fats as u32 * self.fat_size_sectors);
+        if self.is_fat32 {
+            // FAT32: no fixed root directory region
+            self.root_dir_sectors = 0;
+        } else {
+            self.root_dir_sectors = ((self.root_entry_count as u32 * 32) + self.bytes_per_sector as u32 - 1)
+                / self.bytes_per_sector as u32;
+        }
         self.data_start_lba = self.root_dir_start_lba + self.root_dir_sectors;
 
-        // Validate cluster count is FAT16 range (4085..65525)
+        // Validate cluster count matches expected FAT type
         let data_sectors = self.total_sectors.saturating_sub(self.data_start_lba);
         let cluster_count = data_sectors / self.sectors_per_cluster as u32;
-        if cluster_count < 4085 || cluster_count >= 65525 {
-            uerror!("fatfsd", "not_fat16"; clusters = cluster_count);
-            return false;
+        if self.is_fat32 {
+            if cluster_count < 65525 {
+                uerror!("fatfsd", "fat32_too_few_clusters"; clusters = cluster_count);
+                return false;
+            }
+            uinfo!("fatfsd", "fat32_parsed";
+                bps = self.bytes_per_sector as u32,
+                spc = self.sectors_per_cluster as u32,
+                root_cluster = self.root_cluster,
+                clusters = cluster_count);
+        } else {
+            if cluster_count < 4085 || cluster_count >= 65525 {
+                uerror!("fatfsd", "not_fat16"; clusters = cluster_count);
+                return false;
+            }
+            udebug!("fatfsd", "fat16_parsed";
+                bps = self.bytes_per_sector as u32,
+                spc = self.sectors_per_cluster as u32,
+                root_entries = self.root_entry_count as u32,
+                clusters = cluster_count);
         }
-
-        udebug!("fatfsd", "fat16_parsed";
-            bps = self.bytes_per_sector as u32,
-            spc = self.sectors_per_cluster as u32,
-            root_entries = self.root_entry_count as u32,
-            clusters = cluster_count);
 
         true
     }
 
-    fn cache_fat(&mut self, ctx: &mut dyn BusCtx) -> bool {
-        let fat_bytes = self.fat_size_sectors as u32 * self.bytes_per_sector as u32;
-        let entries_to_cache = (fat_bytes / 2).min(FAT_CACHE_ENTRIES as u32) as usize;
+    /// Load a window of FAT entries starting at `base_cluster` into the cache.
+    /// For FAT16: 2 bytes per entry. For FAT32: 4 bytes per entry (masked to 28 bits).
+    fn cache_fat_window(&mut self, base_cluster: u32, ctx: &mut dyn BusCtx) -> bool {
+        let entry_size: u32 = if self.is_fat32 { 4 } else { 2 };
+        let bps = self.bytes_per_sector as u32;
+        let entries_per_sector = bps / entry_size;
 
-        // Read FAT sector by sector
+        // Calculate total entries in the FAT
+        let fat_bytes = self.fat_size_sectors * bps;
+        let total_fat_entries = fat_bytes / entry_size;
+        let entries_to_cache = (total_fat_entries - base_cluster).min(FAT_CACHE_ENTRIES as u32) as usize;
+
+        // Calculate which FAT sector contains base_cluster
+        let byte_offset = base_cluster * entry_size;
+        let first_fat_sector = byte_offset / bps;
+        let offset_in_first_sector = (byte_offset % bps) as usize;
+
         let mut sector_buf = [0u8; 512];
-        let entries_per_sector = self.bytes_per_sector as usize / 2;
-
         let mut cached = 0;
-        for sector_offset in 0..self.fat_size_sectors as u32 {
+
+        let sectors_needed = ((entries_to_cache as u32 * entry_size + bps - 1) / bps) + 1;
+        for s in 0..sectors_needed {
             if cached >= entries_to_cache {
                 break;
             }
+            let sector_idx = first_fat_sector + s;
+            if sector_idx >= self.fat_size_sectors {
+                break;
+            }
 
-            let lba = self.fat_start_lba as u64 + sector_offset as u64;
-            if !self.read_block(lba, &mut sector_buf[..self.bytes_per_sector as usize], ctx) {
-                uerror!("fatfsd", "fat_read_failed"; sector = sector_offset);
+            let lba = self.fat_start_lba as u64 + sector_idx as u64;
+            if !self.read_block(lba, &mut sector_buf[..bps as usize], ctx) {
+                uerror!("fatfsd", "fat_read_failed"; sector = sector_idx);
                 return false;
             }
 
-            for i in 0..entries_per_sector {
-                if cached >= entries_to_cache {
-                    break;
+            let start = if s == 0 { offset_in_first_sector } else { 0 };
+            let mut off = start;
+            while off + entry_size as usize <= bps as usize && cached < entries_to_cache {
+                if self.is_fat32 {
+                    let val = u32::from_le_bytes([
+                        sector_buf[off], sector_buf[off + 1],
+                        sector_buf[off + 2], sector_buf[off + 3],
+                    ]);
+                    self.fat_cache[cached] = val & 0x0FFF_FFFF;
+                } else {
+                    let val = u16::from_le_bytes([sector_buf[off], sector_buf[off + 1]]);
+                    self.fat_cache[cached] = val as u32;
                 }
-                let offset = i * 2;
-                self.fat_cache[cached] = u16::from_le_bytes([
-                    sector_buf[offset], sector_buf[offset + 1],
-                ]);
                 cached += 1;
+                off += entry_size as usize;
             }
         }
 
+        self.fat_cache_base = base_cluster;
         self.fat_cache_valid = true;
-        udebug!("fatfsd", "fat_cached"; entries = cached as u32);
+        udebug!("fatfsd", "fat_cached"; base = base_cluster, entries = cached as u32);
         true
     }
 
-    fn next_cluster(&self, cluster: u16) -> Option<u16> {
-        if !self.fat_cache_valid || cluster as usize >= FAT_CACHE_ENTRIES {
-            return None;
+    fn next_cluster(&mut self, cluster: u32, ctx: &mut dyn BusCtx) -> Option<u32> {
+        // Check if cluster is within cached window; reload if not
+        if !self.fat_cache_valid
+            || cluster < self.fat_cache_base
+            || (cluster - self.fat_cache_base) as usize >= FAT_CACHE_ENTRIES
+        {
+            if !self.cache_fat_window(cluster, ctx) {
+                return None;
+            }
         }
-        let next = self.fat_cache[cluster as usize];
-        if next >= 0xFFF8 {
+        let idx = (cluster - self.fat_cache_base) as usize;
+        let next = self.fat_cache[idx];
+        let eoc = if self.is_fat32 { 0x0FFF_FFF8 } else { 0xFFF8 };
+        if next >= eoc {
             None // End of chain
         } else if next < 2 {
             None // Invalid
@@ -283,7 +349,7 @@ impl FatfsDriver {
         }
     }
 
-    fn cluster_to_lba(&self, cluster: u16) -> u64 {
+    fn cluster_to_lba(&self, cluster: u32) -> u64 {
         self.data_start_lba as u64 + (cluster as u64 - 2) * self.sectors_per_cluster as u64
     }
 
@@ -297,7 +363,7 @@ impl FatfsDriver {
 
     /// Parse an 8.3 directory entry at offset in sector data.
     /// Returns (name, name_len, is_dir, start_cluster, file_size) or None if invalid.
-    fn parse_dir_entry(&self, data: &[u8], offset: usize) -> Option<([u8; 12], usize, bool, u16, u32)> {
+    fn parse_dir_entry(&self, data: &[u8], offset: usize) -> Option<([u8; 12], usize, bool, u32, u32)> {
         if offset + 32 > data.len() {
             return None;
         }
@@ -321,7 +387,11 @@ impl FatfsDriver {
         }
 
         let is_dir = entry[11] & 0x10 != 0;
-        let start_cluster = u16::from_le_bytes([entry[26], entry[27]]);
+        // FAT32: high 16 bits at offset 20-21, low 16 bits at offset 26-27
+        // FAT16: offset 20-21 is zero, so this works for both
+        let cluster_hi = u16::from_le_bytes([entry[20], entry[21]]) as u32;
+        let cluster_lo = u16::from_le_bytes([entry[26], entry[27]]) as u32;
+        let start_cluster = (cluster_hi << 16) | cluster_lo;
         let file_size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
 
         // Convert 8.3 name to readable form
@@ -505,7 +575,7 @@ impl FatfsDriver {
 
         let mut cluster = file.start_cluster;
         for _ in 0..start_cluster_index {
-            match self.next_cluster(cluster) {
+            match self.next_cluster(cluster, ctx) {
                 Some(c) => cluster = c,
                 None => {
                     Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
@@ -555,7 +625,7 @@ impl FatfsDriver {
 
             // Next cluster
             if total_read < to_read {
-                match self.next_cluster(cluster) {
+                match self.next_cluster(cluster, ctx) {
                     Some(c) => cluster = c,
                     None => break, // End of chain
                 }
@@ -591,8 +661,15 @@ impl FatfsDriver {
         let mut entry_count = 0u32;
         let mut total_bytes = 0u32;
 
-        if file.start_cluster == 0 {
-            // Root directory - read from root_dir_start_lba
+        // Resolve root sentinel: cluster 0 means root directory
+        let start_cluster = if file.start_cluster == 0 {
+            if self.is_fat32 { self.root_cluster } else { 0 }
+        } else {
+            file.start_cluster
+        };
+
+        if start_cluster == 0 {
+            // FAT16 root directory - fixed region at root_dir_start_lba
             self.readdir_linear(
                 self.root_dir_start_lba as u64,
                 self.root_dir_sectors,
@@ -604,8 +681,8 @@ impl FatfsDriver {
                 ctx,
             );
         } else {
-            // Subdirectory - follow cluster chain
-            let mut cluster = file.start_cluster;
+            // Cluster chain (FAT32 root dir or any subdirectory)
+            let mut cluster = start_cluster;
             loop {
                 let lba = self.cluster_to_lba(cluster);
                 let sectors = self.sectors_per_cluster as u32;
@@ -620,7 +697,7 @@ impl FatfsDriver {
                     ctx,
                 );
 
-                match self.next_cluster(cluster) {
+                match self.next_cluster(cluster, ctx) {
                     Some(c) => cluster = c,
                     None => break,
                 }
@@ -732,26 +809,56 @@ impl FatfsDriver {
 
     /// Search root directory for a file/dir by name (case-insensitive 8.3 match).
     /// Returns (is_dir, start_cluster, file_size).
-    fn find_in_root(&self, name: &[u8], ctx: &mut dyn BusCtx) -> Option<(bool, u16, u32)> {
+    fn find_in_root(&mut self, name: &[u8], ctx: &mut dyn BusCtx) -> Option<(bool, u32, u32)> {
         let mut sector_buf = [0u8; 512];
 
-        for sec in 0..self.root_dir_sectors {
-            let lba = self.root_dir_start_lba as u64 + sec as u64;
-            if !self.read_block(lba, &mut sector_buf[..self.bytes_per_sector as usize], ctx) {
-                return None;
-            }
-
-            let entries_per_sector = self.bytes_per_sector as usize / 32;
-            for i in 0..entries_per_sector {
-                let offset = i * 32;
-                match self.parse_dir_entry(&sector_buf, offset) {
-                    Some((_, 0, _, _, _)) => continue,
-                    Some((entry_name, entry_len, is_dir, cluster, size)) => {
-                        if name_eq_ci(&entry_name[..entry_len], name) {
-                            return Some((is_dir, cluster, size));
+        if self.is_fat32 {
+            // FAT32: root directory is a cluster chain
+            let mut cluster = self.root_cluster;
+            loop {
+                let lba = self.cluster_to_lba(cluster);
+                for sec in 0..self.sectors_per_cluster as u32 {
+                    if !self.read_block(lba + sec as u64, &mut sector_buf[..self.bytes_per_sector as usize], ctx) {
+                        return None;
+                    }
+                    let entries_per_sector = self.bytes_per_sector as usize / 32;
+                    for i in 0..entries_per_sector {
+                        let offset = i * 32;
+                        match self.parse_dir_entry(&sector_buf, offset) {
+                            Some((_, 0, _, _, _)) => continue,
+                            Some((entry_name, entry_len, is_dir, cl, size)) => {
+                                if name_eq_ci(&entry_name[..entry_len], name) {
+                                    return Some((is_dir, cl, size));
+                                }
+                            }
+                            None => return None,
                         }
                     }
-                    None => return None, // End of directory
+                }
+                match self.next_cluster(cluster, ctx) {
+                    Some(c) => cluster = c,
+                    None => break,
+                }
+            }
+        } else {
+            // FAT16: fixed root directory region
+            for sec in 0..self.root_dir_sectors {
+                let lba = self.root_dir_start_lba as u64 + sec as u64;
+                if !self.read_block(lba, &mut sector_buf[..self.bytes_per_sector as usize], ctx) {
+                    return None;
+                }
+                let entries_per_sector = self.bytes_per_sector as usize / 32;
+                for i in 0..entries_per_sector {
+                    let offset = i * 32;
+                    match self.parse_dir_entry(&sector_buf, offset) {
+                        Some((_, 0, _, _, _)) => continue,
+                        Some((entry_name, entry_len, is_dir, cluster, size)) => {
+                            if name_eq_ci(&entry_name[..entry_len], name) {
+                                return Some((is_dir, cluster, size));
+                            }
+                        }
+                        None => return None,
+                    }
                 }
             }
         }
@@ -865,11 +972,11 @@ impl FatfsDriver {
                 }
 
                 if !self.parse_bpb(&bpb_buf) {
-                    uerror!("fatfsd", "invalid_fat16";);
+                    uerror!("fatfsd", "invalid_bpb";);
                     return false;
                 }
-                // Cache FAT
-                if !self.cache_fat(ctx) {
+                // Cache initial FAT window (starting at cluster 0)
+                if !self.cache_fat_window(0, ctx) {
                     uerror!("fatfsd", "fat_cache_failed";);
                     return false;
                 }
@@ -975,7 +1082,11 @@ impl FatfsDriver {
             *pos += len;
         };
 
-        append(&mut buf, &mut pos, b"FAT16 Filesystem Driver (read-only)\n");
+        if self.is_fat32 {
+            append(&mut buf, &mut pos, b"FAT32 Filesystem Driver (read-only)\n");
+        } else {
+            append(&mut buf, &mut pos, b"FAT16 Filesystem Driver (read-only)\n");
+        }
         append(&mut buf, &mut pos, b"  Port: ");
         append(&mut buf, &mut pos, &self.port_name[..self.port_name_len]);
         append(&mut buf, &mut pos, b"\n  Cluster size: ");
@@ -1108,7 +1219,7 @@ impl Driver for FatfsDriverWrapper {
     fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
         let drv = &self.0;
         match key {
-            b"type" => Self::copy_to_buf(buf, 0, b"FAT16"),
+            b"type" => Self::copy_to_buf(buf, 0, if drv.is_fat32 { b"FAT32" as &[u8] } else { b"FAT16" }),
             b"mount" => Self::copy_to_buf(buf, 0, &drv.port_name[..drv.port_name_len]),
             b"cluster_size" => {
                 let mut tmp = [0u8; 16];
