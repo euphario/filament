@@ -1302,6 +1302,15 @@ impl<D: Driver> DriverRuntime<D> {
         // Strip route for local dispatch
         let (stripped, slen) = Self::strip_route(raw);
 
+        // Diagnostic: log raw command details for SpawnChild
+        if slen >= QueryHeader::SIZE {
+            let msg_type = u16::from_le_bytes([stripped[0], stripped[1]]);
+            if msg_type == crate::query::msg::SPAWN_CHILD && slen >= 20 {
+                let ctx_len = stripped[10];
+                crate::udebug!("bus", "strip_spawn"; raw_len = raw.len() as u32, stripped_len = slen as u32, ctx_len = ctx_len as u32);
+            }
+        }
+
         match DevdClient::parse_command_buf(&stripped[..slen]) {
             Ok(Some(cmd)) => {
                 self.dispatch_devd_command(cmd);
@@ -1451,6 +1460,10 @@ impl<D: Driver> DriverRuntime<D> {
         if let DevdCommand::SpawnChild { seq_id, binary, binary_len, caps, filter, priority, context } = &cmd {
             let name = core::str::from_utf8(&binary[..*binary_len]).unwrap_or("???");
 
+            // Diagnostic: log context presence and metadata length
+            let ctx_meta_len = context.as_ref().map(|c| c.metadata_len).unwrap_or(0);
+            crate::udebug!("bus", "spawn_child"; child = name, has_ctx = context.is_some() as u32, ctx_meta = ctx_meta_len as u32);
+
             // Build mailbox content: MailboxHeader + spawn context KVs
             let mut mb_buf = [0u8; 4096];
             build_child_mailbox(&mut mb_buf, filter, context.as_ref(), *priority);
@@ -1464,7 +1477,7 @@ impl<D: Driver> DriverRuntime<D> {
                             Some((mb, superq, pid))
                         }
                         Err(e) => {
-                            crate::uwarn!("bus", "mailbox_map_failed"; err = e.as_str());
+                            crate::uwarn!("bus", "mailbox_map_failed"; err = e.as_str(), handle = parent_mb_handle.raw());
                             None
                         }
                     }
@@ -2370,9 +2383,13 @@ impl<D: Driver> DriverRuntime<D> {
             let note = match superq.try_recv() {
                 Ok(Some(n)) => n,
                 Ok(None) => break,
-                Err(e) => {
-                    crate::udebug!("bus", "child_superq_recv_err"; err = e.as_str());
-                    break;
+                Err(_) => {
+                    // PeerClosed — child exited, SuperQ is HalfClosed with empty ring.
+                    // Treat like EXIT note: clean up child entry.
+                    let pid = self.ctx.children[child_idx]
+                        .as_ref().map(|e| e.pid).unwrap_or(0);
+                    self.handle_child_exit(pid);
+                    return;
                 }
             };
 
@@ -2708,6 +2725,19 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
     let mailbox = Mailbox::from_handle(abi::Handle::MAILBOX).ok();
     let has_mailbox = mailbox.as_ref().map_or(false, |mb| mb.is_valid());
 
+    // Diagnostic: log mailbox state
+    let mb_mapped = mailbox.is_some();
+    let driver_name_str = core::str::from_utf8(name).unwrap_or("?");
+    crate::unotice!("bus", "driver_init"; driver = driver_name_str, mb_mapped = mb_mapped as u32, mb_valid = has_mailbox as u32);
+    if has_mailbox {
+        let hdr = mailbox.as_ref().unwrap().header();
+        crate::unotice!("bus", "mailbox_hdr"; kv_count = hdr.kv_count as u32, dev_count = hdr.device_count as u32, bus_type = hdr.bus_type as u32);
+    } else if mb_mapped {
+        // Mailbox shmem exists but header is invalid — dump raw magic for debugging
+        let hdr = mailbox.as_ref().unwrap().header();
+        crate::unotice!("bus", "mailbox_invalid"; magic = crate::ulog::hex32(hdr.magic), version = hdr.version as u32);
+    }
+
     // Pre-populate spawn context from mailbox if available
     let pre_spawn_ctx = if has_mailbox {
         parse_spawn_context_from_mailbox(mailbox.as_ref().unwrap())
@@ -2745,8 +2775,15 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
     // If we have a pre-populated spawn context from mailbox, cache it
     // so the child never needs GET_SPAWN_CONTEXT.
     if let Some(ctx) = pre_spawn_ctx {
+        crate::unotice!("bus", "spawn_ctx_from_mb"; meta_len = ctx.metadata().len() as u32);
         runtime.ctx.spawn_ctx = SpawnCtxCache::Cached(ctx);
+    } else if has_mailbox {
+        crate::unotice!("bus", "mb_parse_failed";);
     }
+
+    // Flush diagnostic logs before entering reset — guarantees visibility
+    // even if the driver crashes during init
+    crate::ulog::flush();
 
     runtime.run()
 }
@@ -3033,6 +3070,7 @@ fn build_child_mailbox(
     // Note: parent_pid is stamped by kernel during exec_with_mailbox (offset 36)
     let mut hdr = abi::MailboxHeader::empty();
     hdr.priority = priority;
+    hdr.flags = 0;
 
     if let Some(ctx) = context {
         hdr.bus_type = ctx.port_type; // Reuse bus_type for port_type

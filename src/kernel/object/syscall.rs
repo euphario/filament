@@ -2859,7 +2859,7 @@ fn read_supervision_parent(sp: &mut super::SupervisionParentObject, buf_ptr: u64
     }
 
     match supervision::recv_up(sp.supervision_id()) {
-        Some(note) => {
+        Ok(note) => {
             let note_bytes = unsafe {
                 core::slice::from_raw_parts(&note as *const abi::SupervisionNote as *const u8, note_size)
             };
@@ -2868,8 +2868,12 @@ fn read_supervision_parent(sp: &mut super::SupervisionParentObject, buf_ptr: u64
                 Err(_) => KernelError::BadAddress.to_errno(),
             }
         }
-        None => {
-            // No notes available — caller should use Mux to wait
+        Err(true) => {
+            // Ring empty AND child exited (HalfClosed/Closed) — report peer closed
+            KernelError::PeerClosed.to_errno()
+        }
+        Err(false) => {
+            // Ring empty but child still alive — caller should use Mux to wait
             KernelError::WouldBlock.to_errno()
         }
     }
@@ -2885,7 +2889,7 @@ fn read_supervision_child(sc: &mut super::SupervisionChildObject, buf_ptr: u64, 
     }
 
     match supervision::recv_down(sc.supervision_id()) {
-        Some(note) => {
+        Ok(note) => {
             let note_bytes = unsafe {
                 core::slice::from_raw_parts(&note as *const abi::SupervisionNote as *const u8, note_size)
             };
@@ -2894,7 +2898,10 @@ fn read_supervision_child(sc: &mut super::SupervisionChildObject, buf_ptr: u64, 
                 Err(_) => KernelError::BadAddress.to_errno(),
             }
         }
-        None => {
+        Err(true) => {
+            KernelError::PeerClosed.to_errno()
+        }
+        Err(false) => {
             KernelError::WouldBlock.to_errno()
         }
     }

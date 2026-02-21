@@ -1366,6 +1366,8 @@ pub const MAILBOX_MAGIC: u32 = 0x4D424F58;
 pub mod mailbox_flags {
     pub const PARENT_WRITTEN: u16 = 1 << 0;
     pub const CHILD_WRITTEN: u16 = 1 << 1;
+    /// Child should use tree mode (SuperQ to parent) instead of root mode (connect to devd)
+    pub const TREE_MODE: u16 = 1 << 2;
 }
 
 const _: () = assert!(core::mem::size_of::<MailboxHeader>() == 64);

@@ -681,6 +681,19 @@ pub fn spawn_from_path_with_caps_and_mailbox(
                 shmem_slice[36..40].copy_from_slice(&(parent_id as u32).to_le_bytes());
             }
 
+            // Cache clean+invalidate: kernel writes via cached TTBR1 mapping,
+            // but child maps shmem as Normal Non-Cacheable. Without this,
+            // child on another CPU reads stale zeros directly from RAM.
+            unsafe {
+                let mut addr = kernel_vaddr as u64;
+                let end = addr + 4096;
+                while addr < end {
+                    core::arch::asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags));
+                    addr += 64;
+                }
+                core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+            }
+
             // Install shmem handle at slot 5 (MAILBOX) in child's table
             let child_obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, 4096, vaddr));
             let _ = object_service().with_table_mut(child_id, |table| {

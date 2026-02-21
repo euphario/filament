@@ -776,54 +776,49 @@ macro_rules! _ulog_count {
 macro_rules! ulog {
     // With context
     ($level:ident, $subsys:expr, [$($ctx_key:ident = $ctx_val:expr),* $(,)?], $event:expr; $($key:ident = $val:expr),* $(,)?) => {{
-        if $crate::ulog::is_enabled($crate::ulog::Level::$level) {
-            let ctx_count = $crate::_ulog_count!($($ctx_key)*);
-            let kv_count = $crate::_ulog_count!($($key)*);
-            let mut builder = $crate::ulog::_start_record(
-                $crate::ulog::Level::$level,
-                $subsys,
-                $event,
-                ctx_count,
-                kv_count,
-            );
-            $(
-                builder.kv(stringify!($ctx_key), $ctx_val);
-            )*
-            $(
-                builder.kv(stringify!($key), $val);
-            )*
-            builder.finish();
-        }
+        // Always write to ring — filtering happens on the display side
+        let ctx_count = $crate::_ulog_count!($($ctx_key)*);
+        let kv_count = $crate::_ulog_count!($($key)*);
+        let mut builder = $crate::ulog::_start_record(
+            $crate::ulog::Level::$level,
+            $subsys,
+            $event,
+            ctx_count,
+            kv_count,
+        );
+        $(
+            builder.kv(stringify!($ctx_key), $ctx_val);
+        )*
+        $(
+            builder.kv(stringify!($key), $val);
+        )*
+        builder.finish();
     }};
     // Without context
     ($level:ident, $subsys:expr, $event:expr; $($key:ident = $val:expr),* $(,)?) => {{
-        if $crate::ulog::is_enabled($crate::ulog::Level::$level) {
-            let kv_count = $crate::_ulog_count!($($key)*);
-            let mut builder = $crate::ulog::_start_record(
-                $crate::ulog::Level::$level,
-                $subsys,
-                $event,
-                0,
-                kv_count,
-            );
-            $(
-                builder.kv(stringify!($key), $val);
-            )*
-            builder.finish();
-        }
+        let kv_count = $crate::_ulog_count!($($key)*);
+        let mut builder = $crate::ulog::_start_record(
+            $crate::ulog::Level::$level,
+            $subsys,
+            $event,
+            0,
+            kv_count,
+        );
+        $(
+            builder.kv(stringify!($key), $val);
+        )*
+        builder.finish();
     }};
     // Event only
     ($level:ident, $subsys:expr, $event:expr) => {{
-        if $crate::ulog::is_enabled($crate::ulog::Level::$level) {
-            let mut builder = $crate::ulog::_start_record(
-                $crate::ulog::Level::$level,
-                $subsys,
-                $event,
-                0,
-                0,
-            );
-            builder.finish();
-        }
+        let mut builder = $crate::ulog::_start_record(
+            $crate::ulog::Level::$level,
+            $subsys,
+            $event,
+            0,
+            0,
+        );
+        builder.finish();
     }};
 }
 

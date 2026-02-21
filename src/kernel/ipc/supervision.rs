@@ -270,18 +270,33 @@ pub fn send_down(supervision_id: u32, note: SupervisionNote) -> Result<WakeList,
 }
 
 /// Receive a note in parent from child (up direction).
-pub fn recv_up(supervision_id: u32) -> Option<SupervisionNote> {
+///
+/// Returns Ok(note) if a note was available, Err(true) if ring is empty
+/// and child has exited (HalfClosed/Closed), Err(false) if ring is just empty.
+pub fn recv_up(supervision_id: u32) -> Result<SupervisionNote, bool> {
     with_supervision_table(|t| {
-        let q = t.get_mut(supervision_id)?;
-        q.up.pop()
+        let Some(q) = t.get_mut(supervision_id) else {
+            return Err(true);
+        };
+        match q.up.pop() {
+            Some(note) => Ok(note),
+            None => Err(q.state != SuperQState::Open),
+        }
     })
 }
 
 /// Receive a note in child from parent (down direction).
-pub fn recv_down(supervision_id: u32) -> Option<SupervisionNote> {
+///
+/// Same semantics as recv_up: Err(true) = peer gone, Err(false) = just empty.
+pub fn recv_down(supervision_id: u32) -> Result<SupervisionNote, bool> {
     with_supervision_table(|t| {
-        let q = t.get_mut(supervision_id)?;
-        q.down.pop()
+        let Some(q) = t.get_mut(supervision_id) else {
+            return Err(true);
+        };
+        match q.down.pop() {
+            Some(note) => Ok(note),
+            None => Err(q.state != SuperQState::Open),
+        }
     })
 }
 
