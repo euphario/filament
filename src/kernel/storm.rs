@@ -82,6 +82,9 @@ pub enum StormAction {
     Evict,
 }
 
+/// Ticks of clean behavior before decaying one strike (~5 seconds at 100 ticks/s)
+const STRIKE_DECAY_TICKS: u64 = 500;
+
 /// Per-task storm state
 #[derive(Debug, Clone, Copy)]
 pub struct StormState {
@@ -95,6 +98,8 @@ pub struct StormState {
     throttle_until: u64,
     /// Strike count (repeated offenses)
     strikes: u8,
+    /// Tick when the last storm was detected (for strike decay)
+    last_storm_tick: u64,
 }
 
 impl StormState {
@@ -106,6 +111,7 @@ impl StormState {
             last_reset_tick: 0,
             throttle_until: 0,
             strikes: 0,
+            last_storm_tick: 0,
         }
     }
 
@@ -136,6 +142,14 @@ impl StormState {
             return StormAction::Throttle;
         }
 
+        // Strike decay: if the task has been well-behaved for STRIKE_DECAY_TICKS
+        // since its last storm, forgive one strike. This prevents permanent
+        // condemnation from occasional bursts (e.g., dmesg output).
+        if self.strikes > 0 && current_tick >= self.last_storm_tick + STRIKE_DECAY_TICKS {
+            self.strikes -= 1;
+            self.last_storm_tick = current_tick; // Reset decay timer for next strike
+        }
+
         self.maybe_reset(current_tick);
         self.syscall_count = self.syscall_count.saturating_add(1);
 
@@ -159,6 +173,12 @@ impl StormState {
             return StormAction::Throttle;
         }
 
+        // Strike decay (same as record_syscall)
+        if self.strikes > 0 && current_tick >= self.last_storm_tick + STRIKE_DECAY_TICKS {
+            self.strikes -= 1;
+            self.last_storm_tick = current_tick;
+        }
+
         self.maybe_reset(current_tick);
         self.wake_count = self.wake_count.saturating_add(1);
 
@@ -172,6 +192,7 @@ impl StormState {
     /// Trigger throttling
     fn trigger_throttle(&mut self, current_tick: u64, config: &StormConfig) -> StormAction {
         self.strikes = self.strikes.saturating_add(1);
+        self.last_storm_tick = current_tick;
 
         if self.strikes >= config.max_strikes {
             StormAction::Evict

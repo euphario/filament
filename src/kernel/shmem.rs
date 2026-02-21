@@ -188,15 +188,23 @@ impl SharedMem {
         false // No space
     }
 
-    /// Add a waiter
+    /// Add a waiter (deduplicates — same PID won't consume multiple slots)
     pub fn add_waiter(&mut self, pid: Pid) -> bool {
-        for slot in &mut self.waiters {
-            if *slot == NO_PID {
-                *slot = pid;
-                return true;
+        let mut first_free = None;
+        for (i, slot) in self.waiters.iter().enumerate() {
+            if *slot == pid {
+                return true; // Already waiting — dedup
+            }
+            if *slot == NO_PID && first_free.is_none() {
+                first_free = Some(i);
             }
         }
-        false // No space
+        if let Some(i) = first_free {
+            self.waiters[i] = pid;
+            true
+        } else {
+            false // No space
+        }
     }
 
     /// Remove a waiter
@@ -864,8 +872,53 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
         });
     }
 
+    // RACE WINDOW FIX: Between releasing SHMEM lock (after add_waiter) and
+    // setting the task to Sleeping/Waiting (under scheduler lock), a concurrent
+    // notify() on another CPU can drain our waiter and call wake_by_pid while
+    // we're still Running — which is a no-op. The task then enters Sleeping
+    // with no waiter entry and no pending_for — permanent deadlock.
+    //
+    // Fix: re-check the waiter list. If we've been drained, a notify() fired
+    // during the gap. Since we're now Sleeping/Waiting, self-wake succeeds.
+    {
+        let guard = SHMEM.lock();
+        let mut still_in_waiters = true;
+        for slot in guard.table.iter() {
+            if let Some(ref region) = slot {
+                if region.id == shmem_id {
+                    still_in_waiters = region.waiters.iter().any(|&w| w == pid);
+                    break;
+                }
+            }
+        }
+        drop(guard);
+
+        if !still_in_waiters {
+            // Drained during the gap — the notify's wake was a no-op because
+            // we were still Running. Now we're blocked, so self-wake works.
+            super::task::with_scheduler(|sched| {
+                sched.wake_by_pid(pid);
+            });
+        }
+    }
+
     // Return "would block" - syscall exit path will reschedule
     Err(-11) // EAGAIN
+}
+
+/// Remove a specific waiter from a shared memory region.
+/// Called when a task's shmem wait times out (deadline fires) to prevent
+/// waiter slot leaks.
+pub fn remove_waiter_by_pid(pid: Pid, shmem_id: u32) {
+    let mut guard = SHMEM.lock();
+    for slot in guard.table.iter_mut() {
+        if let Some(ref mut region) = slot {
+            if region.id == shmem_id {
+                region.remove_waiter(pid);
+                return;
+            }
+        }
+    }
 }
 
 /// Notify all waiters on shared memory

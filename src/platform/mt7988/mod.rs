@@ -222,6 +222,10 @@ pub mod irq {
     /// UART0 interrupt (SPI 123 -> IRQ 155)
     pub const UART0: u32 = 155;
 
+    /// Watchdog interrupt (SPI 91 -> IRQ 123)
+    /// DUAL_MODE first-half timeout fires this as Group 0 FIQ
+    pub const WDT: u32 = 123;
+
     /// Convert SPI number to GIC IRQ number
     #[inline]
     pub const fn spi_to_irq(spi: u32) -> u32 {

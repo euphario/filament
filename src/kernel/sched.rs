@@ -713,7 +713,7 @@ pub fn timer_tick(current_time: u64) {
         return;
     };
 
-    let woken = sched.check_timeouts(current_time);
+    let (woken, shmem_cleanups) = sched.check_timeouts(current_time);
 
     if woken > 0 {
         crate::kernel::arch::sync::cpu_flags().set_need_resched();
@@ -735,8 +735,16 @@ pub fn timer_tick(current_time: u64) {
         }
     }
 
-    // Drop scheduler lock before liveness check (it takes its own lock)
+    // Drop scheduler lock before shmem cleanup and liveness check
     drop(sched);
+
+    // Clean up shmem waiters for tasks whose deadlines expired.
+    // Must happen after scheduler lock is released (lock ordering).
+    for &(pid, shmem_id) in &shmem_cleanups {
+        if pid != 0 {
+            crate::kernel::shmem::remove_waiter_by_pid(pid, shmem_id);
+        }
+    }
 
     // Periodic liveness check (every LIVENESS_CHECK_INTERVAL ticks)
     // Uses atomic counter — multiple CPUs call timer_tick() concurrently.

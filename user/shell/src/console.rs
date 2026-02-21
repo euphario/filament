@@ -165,14 +165,19 @@ impl Console {
                 }
             }
 
-            if !ring.wait(0) {
-                userlib::syscall::sleep_us(100_000);
-            }
+            // Use 5-second timeout as safety net against missed wakes.
+            // Normally consoled's notify wakes us immediately; the timeout
+            // only fires if a notification was lost (SMP race).
+            ring.wait(5000);
         }
     }
 
     /// Write bytes to console
     /// Uses TX ring (shell -> consoled)
+    ///
+    /// Blocking: writes all data, waiting for consoled to drain when ring is full.
+    /// Back-pressure: when ring is full, waits until consoled drains to 50% free
+    /// before resuming, reducing context switch overhead.
     pub fn write(&self, data: &[u8]) {
         let ring = match &self.ring {
             Some(r) => r,
@@ -180,19 +185,33 @@ impl Console {
         };
 
         let mut offset = 0;
+        let mut needs_notify = false;
         while offset < data.len() {
             let written = ring.tx_write(&data[offset..]);
+            offset += written;
+            needs_notify |= written > 0;
 
-            if written > 0 {
-                offset += written;
-                // Notify consoled that data is available
-                ring.notify();
-            } else {
-                // TX ring full - wait a bit for consoled to drain
-                if !ring.wait(1) {
-                    userlib::syscall::sleep_us(1_000); // 1ms backoff
+            if offset < data.len() {
+                // Ring full — notify consoled to start draining, then wait
+                if needs_notify {
+                    ring.notify();
+                    needs_notify = false;
+                }
+                loop {
+                    ring.wait(1000); // 1 second timeout (safety)
+                    if ring.tx_space() >= ring.tx_size() / 2 {
+                        break; // 50% free, resume writing
+                    }
+                    // Re-notify consoled on timeout — if a notification was
+                    // lost, this ensures consoled re-enters its drain loop.
+                    ring.notify();
                 }
             }
+        }
+
+        // One notification per write() call — tells consoled data is available
+        if needs_notify {
+            ring.notify();
         }
     }
 
@@ -408,6 +427,9 @@ impl Console {
             if let Ok(mux) = Mux::new() {
                 let _ = mux.add(ring.handle(), MuxFilter::Readable);
                 let _ = mux.add(handle, MuxFilter::Readable);
+                // Safety timeout: if a shmem notification is ever lost,
+                // we wake up after 2 seconds and re-check rx_available.
+                let _ = mux.set_timeout(2000);
                 self.read_mux = Some(mux);
             }
         }

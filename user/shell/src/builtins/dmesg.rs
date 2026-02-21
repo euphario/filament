@@ -39,10 +39,21 @@ pub fn run(args: &[u8]) {
         i += 1;
     }
 
-    // Read from kernel ring non-destructively
-    let mut buf = [0u8; 1024];
+    // Flush any stale INTERRUPT signals before starting
+    let pid = syscall::getpid();
+    syscall::signal_flush(pid);
+
+    // Read from kernel ring non-destructively.
+    // The kernel packs multiple length-prefixed records per syscall:
+    //   [cursor:4]([len:2][text:len])*
+    // A 4KB read buffer holds ~30 records, so ~7 syscalls for 200 records.
+    // Output is batched into a 2KB buffer to reduce console::write() calls.
+    let mut buf = [0u8; 4096];
+    let mut out = [0u8; 2048];
+    let mut out_len: usize = 0;
     let mut cursor: u32 = 0;
     let mut count: u32 = 0;
+    let has_filter = level_filter.is_some() || !module_filter.is_empty();
 
     loop {
         let n = syscall::klog_read_at(&mut buf, &mut cursor);
@@ -50,26 +61,61 @@ pub fn run(args: &[u8]) {
             break;
         }
 
-        let text = &buf[4..4 + n as usize];
+        // Parse length-prefixed records from buf[4..4+n]
+        let data = &buf[4..4 + n as usize];
+        let mut pos = 0;
 
-        // Apply level filter (check ANSI-colored level field in formatted output)
-        if let Some(max_level) = level_filter {
-            if let Some(record_level) = extract_level_from_text(text) {
-                if record_level > max_level {
+        while pos + 2 <= data.len() {
+            let rec_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if rec_len == 0 || pos + rec_len > data.len() {
+                break;
+            }
+            let text = &data[pos..pos + rec_len];
+            pos += rec_len;
+
+            // Apply filters
+            if has_filter {
+                if let Some(max_level) = level_filter {
+                    if let Some(record_level) = extract_level_from_text(text) {
+                        if record_level > max_level {
+                            continue;
+                        }
+                    }
+                }
+                if !module_filter.is_empty() && !text_contains_subsys(text, module_filter) {
                     continue;
                 }
             }
-        }
 
-        // Apply module filter (check subsystem field in formatted output)
-        if !module_filter.is_empty() {
-            if !text_contains_subsys(text, module_filter) {
-                continue;
+            // Accumulate in output buffer; flush when full
+            if out_len + text.len() > out.len() {
+                crate::console::write(&out[..out_len]);
+                out_len = 0;
             }
+            if text.len() > out.len() {
+                crate::console::write(text);
+            } else {
+                out[out_len..out_len + text.len()].copy_from_slice(text);
+                out_len += text.len();
+            }
+            count += 1;
         }
 
-        crate::console::write(text);
-        count += 1;
+        // Check for Ctrl+C between batches (flush output first)
+        if out_len > 0 {
+            crate::console::write(&out[..out_len]);
+            out_len = 0;
+        }
+        if crate::interrupted() {
+            crate::println!("\r\n^C");
+            return;
+        }
+    }
+
+    // Flush remaining buffered output
+    if out_len > 0 {
+        crate::console::write(&out[..out_len]);
     }
 
     if count == 0 {

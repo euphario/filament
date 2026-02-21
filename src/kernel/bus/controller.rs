@@ -550,8 +550,12 @@ impl BusController {
         // Transition to Claimed — owner is now managing hardware
         self.transition_to(BusState::Claimed, StateChangeReason::Connected);
 
-        // Klog bus: suppress kernel UART drain (klogd now owns log output)
-        if self.bus_type == BusType::Klog {
+        // Klog/UART bus: suppress kernel UART drain.
+        // Klog: klogd owns log output.
+        // UART: consoled owns the console — klog records interleave with
+        // consoled's ANSI sequences, corrupting terminal output. Records
+        // stay in the klog ring for dmesg; panic handler bypasses drain.
+        if self.bus_type == BusType::Klog || self.bus_type == BusType::Uart {
             crate::klog::suppress_drain();
         }
 
@@ -596,8 +600,8 @@ impl BusController {
         self.owner_pid = None;
 
         if self.state == BusState::Claimed {
-            // Klog bus: resume kernel UART drain
-            if self.bus_type == BusType::Klog {
+            // Klog/UART bus: resume kernel UART drain
+            if self.bus_type == BusType::Klog || self.bus_type == BusType::Uart {
                 crate::klog::resume_drain();
             }
             // Owner left while bus was claimed — reset hardware

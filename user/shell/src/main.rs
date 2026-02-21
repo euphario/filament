@@ -47,6 +47,23 @@ pub use libf::str::eq_ignore_ascii_case as cmd_eq;
 pub use libf::str::starts_with_ignore_case as cmd_starts_with;
 pub use libf::parse::parse_u32 as parse_decimal;
 
+/// Check if the shell has a pending INTERRUPT signal (Ctrl+C).
+/// Consumes the signal if found.
+pub fn interrupted() -> bool {
+    let pid = syscall::getpid();
+    let mut sigs = [syscall::PendingSignal { event: 0, value: 0 }; 4];
+    let n = syscall::signal_peek(pid, &mut sigs);
+    if n > 0 {
+        for i in 0..n as usize {
+            if sigs[i].event & syscall::signal_event::INTERRUPT != 0 {
+                syscall::signal_flush(pid);
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Maximum background jobs to track
 const MAX_BG_JOBS: usize = 16;
 
@@ -462,8 +479,9 @@ fn wait_for_child(pid: u32) {
         match mux.wait() {
             Ok(event) => {
                 if event.is_signal() {
-                    if event.signal_event as u32 & syscall::signal_event::INTERRUPT != 0 {
-                        // Ctrl+C: kill the foreground child
+                    let sig = event.signal_event as u32;
+                    if sig & (syscall::signal_event::INTERRUPT | syscall::signal_event::SHUTDOWN) != 0 {
+                        // Ctrl+C or Ctrl+\: kill the foreground child
                         syscall::kill(pid);
                         continue; // Wait for actual exit
                     }

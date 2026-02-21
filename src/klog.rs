@@ -400,18 +400,25 @@ impl LogRing {
 /// Global log ring buffer (protected by SpinLock for SMP safety)
 pub static LOG_RING: crate::kernel::lock::SpinLock<LogRing> = crate::kernel::lock::SpinLock::new(crate::kernel::lock::lock_class::SUBSYSTEM, LogRing::new());
 
-/// When true, drain_one() skips UART output (klogd owns the drain).
-/// Set when klog bus is claimed, cleared when klog owner exits.
-static DRAIN_SUPPRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Reference count of bus owners that need UART drain suppressed.
+/// When >0, drain_one() skips UART output. Incremented when klog or uart
+/// bus is claimed, decremented when owner exits. Counter (not bool) handles
+/// multiple suppressors (klogd + consoled) without one's exit resuming for both.
+static DRAIN_SUPPRESS_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Suppress UART drain (called when klogd claims klog bus)
+/// Suppress UART drain (called when klog or uart bus is claimed)
 pub fn suppress_drain() {
-    DRAIN_SUPPRESSED.store(true, Ordering::Release);
+    DRAIN_SUPPRESS_COUNT.fetch_add(1, Ordering::Release);
 }
 
-/// Resume UART drain (called when klogd exits)
+/// Resume UART drain (called when klog/uart bus owner exits)
 pub fn resume_drain() {
-    DRAIN_SUPPRESSED.store(false, Ordering::Release);
+    DRAIN_SUPPRESS_COUNT.fetch_sub(1, Ordering::Release);
+}
+
+/// Check if drain is currently suppressed
+fn drain_suppressed() -> bool {
+    DRAIN_SUPPRESS_COUNT.load(Ordering::Relaxed) > 0
 }
 
 /// Boot time in counter ticks
@@ -1049,7 +1056,7 @@ fn write_hex64(out: &mut [u8], val: u64) -> usize {
 /// When drain is suppressed (klogd owns the bus), advances drain_cursor
 /// without writing to UART.
 pub fn drain_one() -> bool {
-    let suppressed = DRAIN_SUPPRESSED.load(Ordering::Relaxed);
+    let suppressed = drain_suppressed();
 
     let mut record_buf = [0u8; MAX_RECORD_SIZE];
     let mut text_buf = [0u8; 1024];

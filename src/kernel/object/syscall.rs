@@ -2414,16 +2414,24 @@ fn write_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize) -> 
                 return 0;
             }
             // Limit buffer size to 512 bytes per write to keep stack usage bounded.
-            // Userspace can issue multiple writes for larger outputs.
             let write_len = buf_len.min(512);
             let mut kernel_buf = [0u8; 512];
             if uaccess::copy_from_user(&mut kernel_buf[..write_len], buf_ptr).is_err() {
                 return KernelError::BadAddress.to_errno();
             }
-            // Write to UART and flush
-            uart::write_buffered(&kernel_buf[..write_len]);
-            uart::flush_buffer();
-            write_len as i64
+            // Write to UART ring buffer — returns actual bytes pushed.
+            // TX interrupt drains ring to FIFO asynchronously (no spinning).
+            let written = uart::write_buffered(&kernel_buf[..write_len]);
+            uart::flush_buffer(); // Enable TX interrupt to start draining
+            if written == 0 {
+                // Ring completely full — register caller for TX wake and
+                // return WouldBlock. Caller should wait_one(STDOUT, WRITABLE)
+                // then retry.
+                let task_id = get_current_task_id().unwrap_or(0);
+                uart::block_for_tx(task_id);
+                return KernelError::WouldBlock.to_errno();
+            }
+            written as i64
         }
         ConsoleType::Stdin => KernelError::NotSupported.to_errno(),
     }

@@ -839,7 +839,7 @@ curr_el_sp0_irq:
     b       exception_handler
 .balign 0x80
 curr_el_sp0_fiq:
-    b       exception_handler
+    b       fiq_handler
 .balign 0x80
 curr_el_sp0_serror:
     b       exception_handler
@@ -853,7 +853,7 @@ curr_el_spx_irq:
     b       irq_handler
 .balign 0x80
 curr_el_spx_fiq:
-    b       exception_handler
+    b       fiq_handler
 .balign 0x80
 curr_el_spx_serror:
     b       exception_handler
@@ -875,7 +875,7 @@ lower_el_aarch64_irq:
     b       irq_handler
 .balign 0x80
 lower_el_aarch64_fiq:
-    b       exception_handler
+    b       fiq_handler
 .balign 0x80
 lower_el_aarch64_serror:
     b       exception_handler
@@ -889,7 +889,7 @@ lower_el_aarch32_irq:
     b       exception_handler
 .balign 0x80
 lower_el_aarch32_fiq:
-    b       exception_handler
+    b       fiq_handler
 .balign 0x80
 lower_el_aarch32_serror:
     b       exception_handler
@@ -1491,6 +1491,30 @@ svc_handler:
 
     /* Return to user mode (possibly different task!) */
     eret
+
+/*
+ * FIQ handler - entry for watchdog NMI (Group 0 interrupt)
+ *
+ * Fires even when IRQs are masked (I-bit set in DAIF) because FIQ uses
+ * the F-bit which we leave unmasked. This enables deadlock diagnostics.
+ *
+ * Captures ELR/SPSR (interrupted PC and PSTATE), resets SP to a known-good
+ * kernel stack from TPIDR_EL1, then calls Rust handler which never returns.
+ */
+fiq_handler:
+    mrs     x0, elr_el1             // x0 = interrupted PC
+    mrs     x1, spsr_el1            // x1 = interrupted PSTATE
+    // Reset SP to known-good kernel stack via TPIDR_EL1
+    mrs     x2, tpidr_el1
+    cbz     x2, 1f
+    ldr     x2, [x2, #CPUDATA_KSTACK_TOP]
+    cbz     x2, 1f
+    mov     sp, x2
+1:  stp     xzr, x30, [sp, #-16]!
+    bl      fiq_handler_rust        // diverging (-> !)
+    // unreachable
+2:  wfe
+    b       2b
 
 /*
  * TTBR0 zero guard - called when per-CPU TTBR0 is 0 before eret

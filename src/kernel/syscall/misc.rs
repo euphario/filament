@@ -126,8 +126,11 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
     let actual_len = buf_len & 0x7FFFFFFF;
 
     if cursor_mode {
-        // Cursor-based non-destructive read
-        if actual_len < 5 {
+        // Cursor-based non-destructive batch read.
+        // Packs multiple records into the buffer to reduce syscall count.
+        // Format: [cursor:4]([len:2][text:len])* — iterate until buffer full.
+        if actual_len < 7 {
+            // Need room for cursor(4) + at least one len(2) + 1 byte
             return KernelError::InvalidArg.to_errno();
         }
 
@@ -137,36 +140,66 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
             Ok(_) => {}
             Err(_) => return KernelError::BadAddress.to_errno(),
         }
-        let cursor = u32::from_le_bytes(cursor_bytes);
+        let mut cursor = u32::from_le_bytes(cursor_bytes);
+
+        let text_space = actual_len - 4;
+        let mut out_buf = [0u8; 4096]; // Stack buffer for packed records
+        let mut out_pos: usize = 0;
 
         let mut record_buf = [0u8; crate::klog::MAX_RECORD_SIZE];
-        let result = {
-            let ring = crate::klog::LOG_RING.lock();
-            ring.peek_at(cursor, &mut record_buf)
-        };
-
-        let Some((len, new_cursor)) = result else {
-            return 0;
-        };
-
-        // Format to text
-        let text_space = actual_len - 4;
         let mut text_buf = [0u8; 1024];
-        let text_len = crate::klog::format_record(&record_buf[..len], &mut text_buf);
-        if text_len == 0 {
+
+        loop {
+            // Need room for at least len(2) + 1 byte of text
+            if out_pos + 3 > text_space.min(out_buf.len()) {
+                break;
+            }
+
+            let result = {
+                let ring = crate::klog::LOG_RING.lock();
+                ring.peek_at(cursor, &mut record_buf)
+            };
+
+            let Some((len, new_cursor)) = result else {
+                break;
+            };
+
+            let text_len = crate::klog::format_record(&record_buf[..len], &mut text_buf);
+            if text_len == 0 {
+                cursor = new_cursor;
+                continue;
+            }
+
+            // Check if this record fits: 2 bytes length + text
+            if out_pos + 2 + text_len > text_space.min(out_buf.len()) {
+                break; // Record doesn't fit — leave cursor pointing here for next call
+            }
+
+            // Write length prefix (u16 LE)
+            let len_bytes = (text_len as u16).to_le_bytes();
+            out_buf[out_pos] = len_bytes[0];
+            out_buf[out_pos + 1] = len_bytes[1];
+            out_pos += 2;
+
+            // Write text
+            out_buf[out_pos..out_pos + text_len].copy_from_slice(&text_buf[..text_len]);
+            out_pos += text_len;
+
+            cursor = new_cursor;
+        }
+
+        if out_pos == 0 {
             return 0;
         }
 
-        let copy_len = text_len.min(text_space);
-
-        // Write back new cursor
-        let new_cursor_bytes = new_cursor.to_le_bytes();
+        // Write back updated cursor
+        let new_cursor_bytes = cursor.to_le_bytes();
         if uaccess::copy_to_user(buf_ptr, &new_cursor_bytes).is_err() {
             return KernelError::BadAddress.to_errno();
         }
 
-        // Write formatted text after cursor
-        match uaccess::copy_to_user(buf_ptr + 4, &text_buf[..copy_len]) {
+        // Write packed records
+        match uaccess::copy_to_user(buf_ptr + 4, &out_buf[..out_pos]) {
             Ok(n) => n as i64,
             Err(_) => KernelError::BadAddress.to_errno(),
         }

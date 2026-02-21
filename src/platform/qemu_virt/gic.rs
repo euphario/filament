@@ -135,7 +135,8 @@ impl Gic {
         }
 
         // Enable distributor
-        let ctlr = gicd_ctlr::ENABLE_GRP1_NS
+        let ctlr = gicd_ctlr::ENABLE_GRP0
+            | gicd_ctlr::ENABLE_GRP1_NS
             | gicd_ctlr::ENABLE_GRP1_S
             | gicd_ctlr::ARE_S
             | gicd_ctlr::ARE_NS
@@ -371,6 +372,33 @@ pub fn send_sgi(target_cpu: u32, sgi_id: u32) {
             "isb",
             in(reg) val,
         );
+    }
+}
+
+/// Per-CPU FIQ (Group 0) setup. Configures SGI 1 as Group 0 and enables
+/// Group 0 delivery + FIQ unmask. Called on every CPU after init_cpu().
+pub fn init_fiq_cpu() {
+    let cpu_id = crate::kernel::percpu::cpu_id() as usize;
+    let gicr = MmioRegion::new(GICR_BASE + cpu_id * 0x20000);
+
+    // Move SGI 1 from Group 1 to Group 0: clear bit 1 in IGROUPR0
+    let igroupr0 = gicr.read32(gicr::IGROUPR0);
+    gicr.write32(gicr::IGROUPR0, igroupr0 & !(1u32 << 1));
+
+    // Set SGI 1 priority to 0x00 (highest)
+    let prio = gicr.read32(gicr::IPRIORITYR);
+    let prio = (prio & !0x0000FF00) | 0x00000000;
+    gicr.write32(gicr::IPRIORITYR, prio);
+
+    // Enable Group 0 interrupts (ICC_IGRPEN0_EL1)
+    unsafe {
+        core::arch::asm!("msr S3_0_C12_C12_6, {}", in(reg) 1u64);
+        core::arch::asm!("isb");
+    }
+
+    // Unmask FIQ in DAIF (clear F bit)
+    unsafe {
+        core::arch::asm!("msr daifclr, #1");
     }
 }
 

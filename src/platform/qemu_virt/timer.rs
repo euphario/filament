@@ -64,6 +64,9 @@ impl Timer {
                 cpu_data.idle_tick();
             }
 
+            // Kick the software watchdog (every CPU kicks — any kick resets timeout)
+            super::wdt::kick();
+
             // Drain klog — CPU 0 only to prevent SMP interleaving on UART
             if crate::kernel::percpu::cpu_id() == 0 {
                 crate::klog::try_drain(2);
@@ -91,6 +94,11 @@ impl Timer {
             // Check devd liveness
             if crate::DEVD_LIVENESS_KILLED.swap(false, core::sync::atomic::Ordering::SeqCst) {
                 crate::recover_devd();
+            }
+
+            // Software watchdog — CPU 0 checks for timeout
+            if crate::kernel::percpu::cpu_id() == 0 && super::wdt::check_timeout() {
+                crate::kernel::watchdog::soft_nmi();
             }
 
             // Use simple fixed interval (tickless deferred for future work)

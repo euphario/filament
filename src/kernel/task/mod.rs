@@ -519,11 +519,11 @@ impl Scheduler {
 
     /// Check for timed-out blocked tasks, deliver timer events, and wake them
     /// Called from timer tick handler
-    /// Returns number of tasks woken
-    pub fn check_timeouts(&mut self, current_tick: u64) -> usize {
+    /// Returns (number of tasks woken, shmem waiter cleanups needed)
+    pub fn check_timeouts(&mut self, current_tick: u64) -> (usize, [(u32, u32); 16]) {
         // Tickless optimization: early return if no deadlines are due
         if current_tick < self.next_deadline {
-            return 0;
+            return (0, [(0, 0); 16]);
         }
 
         let mut woken = 0;
@@ -532,6 +532,10 @@ impl Scheduler {
         // Collect slots woken by deadline expiry for policy notification
         let mut woken_slots = [0u16; 64];
         let mut woken_slot_count = 0usize;
+
+        // Collect shmem waiter cleanups: (pid, shmem_id) pairs
+        let mut shmem_cleanups: [(u32, u32); 16] = [(0, 0); 16];
+        let mut shmem_cleanup_count = 0usize;
 
         // Collect TimerObject subscribers to wake (from Mux watches)
         use crate::kernel::ipc::traits::Subscriber;
@@ -547,8 +551,15 @@ impl Scheduler {
 
                 // Check waiting deadline (for request-response patterns)
                 // Sleeping tasks have no deadline - only Waiting tasks do
-                if let TaskState::Waiting { deadline, .. } = *task.state() {
+                if let TaskState::Waiting { deadline, reason } = *task.state() {
                     if current_tick >= deadline {
+                        // Capture shmem cleanup info BEFORE state transition
+                        if let WaitReason::ShmemNotify { shmem_id } = reason {
+                            if shmem_cleanup_count < shmem_cleanups.len() {
+                                shmem_cleanups[shmem_cleanup_count] = (task.id, shmem_id);
+                                shmem_cleanup_count += 1;
+                            }
+                        }
                         crate::transition_or_log!(task, wake);
                         if woken_slot_count < woken_slots.len() {
                             woken_slots[woken_slot_count] = slot_idx as u16;
@@ -623,7 +634,7 @@ impl Scheduler {
             self.recalculate_next_deadline();
         }
 
-        woken
+        (woken, shmem_cleanups)
     }
 
     /// Add a kernel task to the scheduler
@@ -1233,8 +1244,18 @@ pub fn current_task_id() -> Option<TaskId> {
 /// Returns the number of tasks woken.
 #[inline]
 pub fn check_timeouts(current_time: u64) -> usize {
-    let mut sched = SCHEDULER.lock();
-    sched.check_timeouts(current_time)
+    let (woken, shmem_cleanups) = {
+        let mut sched = SCHEDULER.lock();
+        sched.check_timeouts(current_time)
+    };
+    // Scheduler lock released — now clean up shmem waiters for timed-out tasks.
+    // This prevents waiter slot leaks when shmem::wait() expires by deadline.
+    for &(pid, shmem_id) in &shmem_cleanups {
+        if pid != 0 {
+            super::shmem::remove_waiter_by_pid(pid, shmem_id);
+        }
+    }
+    woken
 }
 
 /// Record a deadline for the next wake time.

@@ -159,7 +159,8 @@ impl Gic {
 
         // Enable distributor with affinity routing
         // DS (bit 6) = Disable Security - makes all interrupts non-secure
-        let ctlr = gicd_ctlr::ENABLE_GRP1_NS
+        let ctlr = gicd_ctlr::ENABLE_GRP0
+            | gicd_ctlr::ENABLE_GRP1_NS
             | gicd_ctlr::ENABLE_GRP1_S
             | gicd_ctlr::ARE_S
             | gicd_ctlr::ARE_NS
@@ -392,6 +393,60 @@ pub fn ack_irq() -> u32 {
 pub fn eoi(irq: u32) {
     unsafe {
         (*core::ptr::addr_of!(GIC)).eoi(irq);
+    }
+}
+
+/// Configure the WDT SPI as Group 0 (FIQ) so it fires even with IRQs masked.
+/// Must be called once on primary CPU after gicd_init().
+pub fn configure_wdt_fiq(wdt_irq: u32) {
+    let gic = unsafe { &*core::ptr::addr_of!(GIC) };
+
+    // Move WDT SPI from Group 1 to Group 0: clear the bit in IGROUPR
+    let reg_idx = (wdt_irq / 32) as usize;
+    let bit = 1u32 << (wdt_irq % 32);
+    let group = gic.gicd_read(gicd::IGROUPR + reg_idx * 4);
+    gic.gicd_write(gicd::IGROUPR + reg_idx * 4, group & !bit);
+
+    // Set priority to 0x00 (highest)
+    let prio_idx = (wdt_irq / 4) as usize;
+    let prio_shift = (wdt_irq % 4) * 8;
+    let prio = gic.gicd_read(gicd::IPRIORITYR + prio_idx * 4);
+    let prio = (prio & !(0xFF << prio_shift)) | (0x00 << prio_shift);
+    gic.gicd_write(gicd::IPRIORITYR + prio_idx * 4, prio);
+
+    // Route to CPU 0 via IROUTER
+    let irouter_offset = gicd::IROUTER + ((wdt_irq - 32) as usize) * 8;
+    gic.gicd_write64(irouter_offset, 0); // Aff = 0.0.0.0 = CPU 0
+
+    // Enable the interrupt
+    gic.gicd_write(gicd::ISENABLER + reg_idx * 4, bit);
+}
+
+/// Per-CPU FIQ (Group 0) setup. Configures SGI 1 as Group 0 and enables
+/// Group 0 delivery + FIQ unmask. Called on every CPU after init_cpu().
+pub fn init_fiq_cpu() {
+    let cpu_id = crate::kernel::percpu::cpu_id() as usize;
+    let gicr = MmioRegion::new(GICR_BASE + cpu_id * 0x20000);
+
+    // Move SGI 1 from Group 1 to Group 0: clear bit 1 in IGROUPR0
+    let igroupr0 = gicr.read32(gicr::IGROUPR0);
+    gicr.write32(gicr::IGROUPR0, igroupr0 & !(1u32 << 1));
+
+    // Set SGI 1 priority to 0x00 (highest)
+    // IPRIORITYR byte 1 = SGI 1 priority
+    let prio = gicr.read32(gicr::IPRIORITYR);
+    let prio = (prio & !0x0000FF00) | 0x00000000; // byte 1 = 0x00
+    gicr.write32(gicr::IPRIORITYR, prio);
+
+    // Enable Group 0 interrupts (ICC_IGRPEN0_EL1)
+    unsafe {
+        core::arch::asm!("msr S3_0_C12_C12_6, {}", in(reg) 1u64);
+        core::arch::asm!("isb");
+    }
+
+    // Unmask FIQ in DAIF (clear F bit)
+    unsafe {
+        core::arch::asm!("msr daifclr, #1");
     }
 }
 

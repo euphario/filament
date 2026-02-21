@@ -22,7 +22,7 @@
 #![no_main]
 
 use userlib::syscall::{self, Handle, ObjectType};
-use userlib::ipc::{Port, Channel, ObjHandle};
+use userlib::ipc::{Port, Channel, Timer, ObjHandle};
 use userlib::console_ring::ConsoleRing;
 use userlib::error::SysError;
 use userlib::bus::{
@@ -40,6 +40,7 @@ const TAG_STDIN: u32 = 1;
 const TAG_PORT: u32 = 2;
 const TAG_SHMEM: u32 = 3;
 const TAG_HANDSHAKE: u32 = 4;
+const TAG_STATUS_TIMER: u32 = 5;
 
 // =============================================================================
 // ANSI helpers
@@ -167,6 +168,10 @@ pub struct ConsoledDriver {
     /// Column position in scroll region after last output write (1-based).
     /// Used to resume multi-chunk output at the correct position.
     output_col: u16,
+    /// 1-second periodic timer for status bar updates
+    status_timer: Option<Timer>,
+    /// Alternates heartbeat symbol each tick
+    heartbeat_toggle: bool,
 }
 
 impl ConsoledDriver {
@@ -188,6 +193,8 @@ impl ConsoledDriver {
             input_prompt_visible: 0,
             last_input_seq: 0,
             output_col: 1,
+            status_timer: None,
+            heartbeat_toggle: false,
         }
     }
 
@@ -236,9 +243,9 @@ impl ConsoledDriver {
             self.split_enabled = false;
         }
 
-        // Scroll screen up to make room for separator + input lines.
+        // Scroll screen up to make room for separator + input + status lines.
         // Without this, short output (e.g., `uptime`) at the bottom of the
-        // screen gets overwritten by the separator drawn at rows-1.
+        // screen gets overwritten by the separator drawn at rows-2.
         let mut scroll = [0u8; 16];
         let mut spos = 0;
         // Move to bottom of screen
@@ -247,36 +254,37 @@ impl ConsoledDriver {
         spos += write_u16_to_buf(&mut scroll[spos..], self.rows);
         scroll[spos..spos+3].copy_from_slice(b";1H");
         spos += 3;
-        // Print newlines to push content up (2 = separator + input)
+        // Print newlines to push content up (3 = separator + input + status)
         scroll[spos] = b'\n';
         scroll[spos+1] = b'\n';
-        spos += 2;
+        scroll[spos+2] = b'\n';
+        spos += 3;
         self.write_uart(&scroll[..spos]);
 
         let mut buf = [0u8; 64];
         let mut pos = 0;
 
-        // Set scroll region: rows 1..rows-2 for output
-        // Row rows-1 = separator line, row rows = input
+        // Set scroll region: rows 1..rows-3 for output
+        // Row rows-2 = separator, row rows-1 = input, row rows = status
         buf[pos..pos+2].copy_from_slice(b"\x1b[");
         pos += 2;
         buf[pos..pos+2].copy_from_slice(b"1;");
         pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 2);
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 3);
         buf[pos] = b'r';
         pos += 1;
 
         self.write_uart(&buf[..pos]);
 
-        // Draw separator line on row rows-1
+        // Draw separator line on row rows-2
         self.draw_separator();
 
-        // Move cursor to input row and draw prompt
+        // Move cursor to input row (rows-1) and draw prompt
         let mut buf2 = [0u8; 32];
         let mut pos2 = 0;
         buf2[pos2..pos2+2].copy_from_slice(b"\x1b[");
         pos2 += 2;
-        pos2 += write_u16_to_buf(&mut buf2[pos2..], self.rows);
+        pos2 += write_u16_to_buf(&mut buf2[pos2..], self.rows - 1);
         buf2[pos2..pos2+3].copy_from_slice(b";1H");
         pos2 += 3;
         buf2[pos2..pos2+3].copy_from_slice(b"\x1b[K");
@@ -287,17 +295,20 @@ impl ConsoledDriver {
         self.write_uart(&self.input_prompt[..self.input_prompt_len as usize]);
 
         self.input_mode = true;
+
+        // Draw initial status line
+        self.render_status_line();
     }
 
-    /// Draw horizontal separator line on row rows-1
+    /// Draw horizontal separator line on row rows-2
     fn draw_separator(&mut self) {
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 1024];
         let mut pos = 0;
 
         // Move to separator row
         buf[pos..pos+2].copy_from_slice(b"\x1b[");
         pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 2);
         buf[pos..pos+3].copy_from_slice(b";1H");
         pos += 3;
 
@@ -328,17 +339,24 @@ impl ConsoledDriver {
         }
         self.input_mode = false;
 
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 80];
         let mut pos = 0;
 
-        // Clear separator line (row=rows-1)
+        // Clear separator line (row=rows-2)
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 2);
+        buf[pos..pos+6].copy_from_slice(b";1H\x1b[K");
+        pos += 6;
+
+        // Clear the input line (row=rows-1)
         buf[pos..pos+2].copy_from_slice(b"\x1b[");
         pos += 2;
         pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
         buf[pos..pos+6].copy_from_slice(b";1H\x1b[K");
         pos += 6;
 
-        // Clear the input line (row=rows)
+        // Clear the status line (row=rows)
         buf[pos..pos+2].copy_from_slice(b"\x1b[");
         pos += 2;
         pos += write_u16_to_buf(&mut buf[pos..], self.rows);
@@ -352,7 +370,7 @@ impl ConsoledDriver {
         // Reposition cursor to where output was (ESC[r reset it to 1,1)
         buf[pos..pos+2].copy_from_slice(b"\x1b[");
         pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 2);
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 3);
         buf[pos..pos+3].copy_from_slice(b";1H");
         pos += 3;
 
@@ -361,7 +379,7 @@ impl ConsoledDriver {
 
     /// Render the input line from InputState in shmem.
     ///
-    /// Moves directly to the input row (row=rows) without save/restore —
+    /// Moves directly to the input row (row=rows-1) without save/restore —
     /// ESC[s/ESC[u is reserved for the output cursor position.
     fn render_input_line(&mut self) {
         use core::sync::atomic::Ordering;
@@ -396,10 +414,10 @@ impl ConsoledDriver {
         let mut buf = [0u8; 256];
         let mut pos = 0;
 
-        // Move to input row, column 1 (no save/restore — ESC[s is for output pos)
+        // Move to input row (rows-1), column 1
         buf[pos..pos+2].copy_from_slice(b"\x1b[");
         pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows);
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
         buf[pos..pos+3].copy_from_slice(b";1H");
         pos += 3;
 
@@ -421,7 +439,7 @@ impl ConsoledDriver {
         // Position cursor using visible prompt width (not byte length)
         buf[pos..pos+2].copy_from_slice(b"\x1b[");
         pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows);
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
         buf[pos] = b';';
         pos += 1;
         pos += write_u16_to_buf(&mut buf[pos..], (prompt_vis + cursor + 1) as u16);
@@ -448,12 +466,12 @@ impl ConsoledDriver {
         let cursor = (input.cursor as usize).min(len);
         let prompt_vis = self.input_prompt_visible as usize;
 
-        // Move to output position in scroll region (bottom row, tracked column)
+        // Move to output position in scroll region (bottom row = rows-3, tracked column)
         let mut pre = [0u8; 16];
         let mut ppos = 0;
         pre[ppos..ppos+2].copy_from_slice(b"\x1b[");
         ppos += 2;
-        ppos += write_u16_to_buf(&mut pre[ppos..], self.rows - 2);
+        ppos += write_u16_to_buf(&mut pre[ppos..], self.rows - 3);
         pre[ppos] = b';';
         ppos += 1;
         ppos += write_u16_to_buf(&mut pre[ppos..], self.output_col);
@@ -493,18 +511,173 @@ impl ConsoledDriver {
             }
         }
 
-        // Return cursor to input line
+        // Return cursor to input line (rows-1)
         let mut post = [0u8; 16];
         let mut qpos = 0;
         post[qpos..qpos+2].copy_from_slice(b"\x1b[");
         qpos += 2;
-        qpos += write_u16_to_buf(&mut post[qpos..], self.rows);
+        qpos += write_u16_to_buf(&mut post[qpos..], self.rows - 1);
         post[qpos] = b';';
         qpos += 1;
         qpos += write_u16_to_buf(&mut post[qpos..], (prompt_vis + cursor + 1) as u16);
         post[qpos] = b'H';
         qpos += 1;
         self.write_uart(&post[..qpos]);
+    }
+
+    /// Render the status line on row=rows (below input line).
+    /// Shows uptime and heartbeat indicator, returns cursor to input line.
+    fn render_status_line(&mut self) {
+        let now_ns = syscall::gettime();
+        let total_secs = (now_ns / 1_000_000_000) as u32;
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        let secs = total_secs % 60;
+
+        // ♥ = U+2665 (E2 99 A5), ♡ = U+2661 (E2 99 A1)
+        let heart: &[u8] = if self.heartbeat_toggle {
+            &[0xe2, 0x99, 0xa5] // ♥
+        } else {
+            &[0xe2, 0x99, 0xa1] // ♡
+        };
+
+        let mut buf = [0u8; 1024];
+        let mut pos = 0;
+
+        // Hide cursor during status line render to prevent flicker
+        buf[pos..pos+6].copy_from_slice(b"\x1b[?25l");
+        pos += 6;
+
+        // Move to status row
+        buf[pos..pos+2].copy_from_slice(b"\x1b[");
+        pos += 2;
+        pos += write_u16_to_buf(&mut buf[pos..], self.rows);
+        buf[pos..pos+3].copy_from_slice(b";1H");
+        pos += 3;
+
+        // Dim color
+        buf[pos..pos+4].copy_from_slice(b"\x1b[2m");
+        pos += 4;
+
+        // Leading "── up "
+        // ─ = U+2500 (E2 94 80)
+        buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
+        pos += 3;
+        buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
+        pos += 3;
+        buf[pos..pos+4].copy_from_slice(b" up ");
+        pos += 4;
+
+        // Format uptime
+        if hours > 0 {
+            pos += write_u16_to_buf(&mut buf[pos..], hours as u16);
+            buf[pos] = b'h';
+            pos += 1;
+        }
+        pos += write_u16_to_buf(&mut buf[pos..], mins as u16);
+        buf[pos] = b'm';
+        pos += 1;
+        // Zero-pad seconds
+        if secs < 10 {
+            buf[pos] = b'0';
+            pos += 1;
+        }
+        pos += write_u16_to_buf(&mut buf[pos..], secs as u16);
+        buf[pos] = b's';
+        pos += 1;
+
+        // " ── "
+        buf[pos] = b' ';
+        pos += 1;
+        buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
+        pos += 3;
+        buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
+        pos += 3;
+        buf[pos] = b' ';
+        pos += 1;
+
+        // Heartbeat (reset dim, show heart in red or dim red)
+        buf[pos..pos+4].copy_from_slice(b"\x1b[0m"); // reset
+        pos += 4;
+        if self.heartbeat_toggle {
+            buf[pos..pos+5].copy_from_slice(b"\x1b[31m"); // red
+            pos += 5;
+        } else {
+            buf[pos..pos+7].copy_from_slice(b"\x1b[2;31m"); // dim red
+            pos += 7;
+        }
+        buf[pos..pos+3].copy_from_slice(heart);
+        pos += 3;
+        buf[pos..pos+4].copy_from_slice(b"\x1b[0m"); // reset
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(b"\x1b[2m"); // dim again
+        pos += 4;
+
+        // " ──────..." fill remaining with ─
+        buf[pos] = b' ';
+        pos += 1;
+
+        // Calculate how many chars we've drawn so far (visible)
+        // "── up XhYYmZZs ── ♥ " = ~20-25 chars depending on uptime
+        // Each ─ and ♥ is 1 display column despite multi-byte UTF-8
+        let used_cols: u16 = {
+            // "── up " = 6
+            let mut c: u16 = 6;
+            if hours > 0 {
+                c += if hours >= 10 { 3 } else { 2 }; // Nh
+            }
+            c += if mins >= 10 { 3 } else { 2 }; // Nm or NNm
+            c += 3; // NNs (always 2 digits + s)
+            c += 6; // " ── ♥ "
+            c
+        };
+
+        let remaining = if self.cols > used_cols {
+            (self.cols - used_cols) as usize
+        } else {
+            0
+        };
+        let fill = remaining.min((buf.len() - pos - 8) / 3);
+        for _ in 0..fill {
+            buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
+            pos += 3;
+        }
+
+        // Reset color
+        buf[pos..pos+4].copy_from_slice(b"\x1b[0m");
+        pos += 4;
+
+        self.write_uart(&buf[..pos]);
+
+        // Return cursor to input line (rows-1)
+        if self.input_mode {
+            let ring = match self.shell_ring.as_ref() {
+                Some(r) => r,
+                None => return,
+            };
+            let input = ring.input_state();
+            let len = (input.len as usize).min(128);
+            let cursor = (input.cursor as usize).min(len);
+            let prompt_vis = self.input_prompt_visible as usize;
+
+            let mut ret = [0u8; 32];
+            let mut rpos = 0;
+            ret[rpos..rpos+2].copy_from_slice(b"\x1b[");
+            rpos += 2;
+            rpos += write_u16_to_buf(&mut ret[rpos..], self.rows - 1);
+            ret[rpos] = b';';
+            rpos += 1;
+            rpos += write_u16_to_buf(&mut ret[rpos..], (prompt_vis + cursor + 1) as u16);
+            ret[rpos] = b'H';
+            rpos += 1;
+            // Show cursor again after repositioning
+            ret[rpos..rpos+6].copy_from_slice(b"\x1b[?25h");
+            rpos += 6;
+            self.write_uart(&ret[..rpos]);
+        } else {
+            // Not in input mode — just show cursor
+            self.write_uart(b"\x1b[?25h");
+        }
     }
 
     // =========================================================================
@@ -587,9 +760,26 @@ impl ConsoledDriver {
         self.write_uart(data);
     }
 
-    /// Write directly to UART
+    /// Write directly to UART (blocking — retries on partial write)
+    ///
+    /// With event-driven TX drain, write(STDOUT) pushes into a 4KB kernel
+    /// ring buffer. The TX interrupt drains the ring to the UART FIFO
+    /// asynchronously. When the ring is full, write returns partial or
+    /// WouldBlock. We sleep briefly and retry — the TX IRQ frees space
+    /// within ~1ms at 115200 baud.
     fn write_uart(&self, data: &[u8]) {
-        let _ = syscall::write(Handle::STDOUT, data);
+        let mut offset = 0;
+        while offset < data.len() {
+            match syscall::write(Handle::STDOUT, &data[offset..]) {
+                Ok(n) if n > 0 => {
+                    offset += n;
+                }
+                _ => {
+                    // WouldBlock or 0 bytes: UART ring full — wait for TX IRQ to drain
+                    syscall::sleep_us(500); // ~0.5ms, enough for 16 bytes at 115200
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -680,14 +870,17 @@ impl ConsoledDriver {
                     }
                 }
 
-                // Check for Ctrl+C (0x03) — signal shell instead of writing to ring
+                // Ctrl+C (0x03): INTERRUPT signal + pass byte to ring (readline ^C cancel)
+                // Ctrl+\ (0x1c): SHUTDOWN signal, strip from ring (hard kill)
                 if let Some(pid) = self.shell_pid {
-                    if rx_buf[..n].iter().any(|&b| b == 0x03) {
-                        // Scan entire buffer: write non-Ctrl+C segments, signal for each 0x03
+                    if rx_buf[..n].iter().any(|&b| b == 0x03 || b == 0x1c) {
                         let mut seg_start = 0;
                         for i in 0..n {
                             if rx_buf[i] == 0x03 {
-                                // Write segment before this Ctrl+C
+                                // Send signal; keep 0x03 in stream for readline
+                                let _ = syscall::signal(pid, 4, 0);
+                            } else if rx_buf[i] == 0x1c {
+                                // Write segment before Ctrl+\, skip the byte itself
                                 if i > seg_start {
                                     if let Some(ring) = &self.shell_ring {
                                         let written = ring.rx_write(&rx_buf[seg_start..i]);
@@ -698,7 +891,7 @@ impl ConsoledDriver {
                                 seg_start = i + 1;
                             }
                         }
-                        // Write any remaining bytes after last Ctrl+C
+                        // Write remaining (includes Ctrl+C bytes, excludes Ctrl+\)
                         if seg_start < n {
                             if let Some(ring) = &self.shell_ring {
                                 let written = ring.rx_write(&rx_buf[seg_start..n]);
@@ -721,131 +914,256 @@ impl ConsoledDriver {
         }
     }
 
-    fn handle_shmem_readable(&mut self, ctx: &mut dyn BusCtx) {
-        let mut tx_buf = [0u8; 512];
+    /// Poll STDIN for Ctrl+C / Ctrl+\ between TX drain chunks.
+    /// Returns true if a kill signal was sent (caller should stop output).
+    fn poll_stdin_for_ctrl(&mut self) -> bool {
+        let mut byte = [0u8; 1];
+        // Non-blocking read — drain any pending input
+        loop {
+            match syscall::read(self.stdin_handle, &mut byte) {
+                Ok(1) => {
+                    if let Some(pid) = self.shell_pid {
+                        if byte[0] == 0x03 {
+                            // Ctrl+C: INTERRUPT + pass to ring for readline
+                            let _ = syscall::signal(pid, 4, 0);
+                            if let Some(ring) = &self.shell_ring {
+                                ring.rx_write(&byte);
+                                ring.notify();
+                            }
+                            return true;
+                        } else if byte[0] == 0x1c {
+                            // Ctrl+\: SHUTDOWN (hard kill), strip from ring
+                            let _ = syscall::signal(pid, 2, 0);
+                            return true;
+                        } else {
+                            // Normal byte — write to ring
+                            if let Some(ring) = &self.shell_ring {
+                                ring.rx_write(&byte);
+                                ring.notify();
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        false
+    }
 
-        // Read data from TX ring
-        let n = {
-            let ring = match self.shell_ring.as_ref() {
-                Some(r) => r,
-                None => return,
+    /// Handle shmem event: drain TX ring to UART.
+    ///
+    /// Tight loop is fine — write_uart() blocks at UART speed, which IS
+    /// the natural pacing. write_uart() retries internally when the UART
+    /// ring is full, yielding CPU via sleep (not spinning). The TX IRQ
+    /// drains the UART ring to the FIFO asynchronously.
+    ///
+    /// After reading each chunk, if the shmem ring drops below 50% full,
+    /// notify the shell so it can resume writing (back-pressure).
+    ///
+    /// Drains ALL available data from the shmem ring into a 4KB accumulation
+    /// buffer before writing to UART. This prevents ANSI escape sequences in
+    /// the shell's output from being split across multiple write_output calls,
+    /// where consoled's cursor-positioning ANSI would be inserted between
+    /// chunks, breaking the terminal's escape sequence parser.
+    fn handle_shmem_readable(&mut self, _ctx: &mut dyn BusCtx) {
+        // Outer loop: process all available data in 4KB chunks.
+        // Each chunk is accumulated fully before writing, preventing ANSI
+        // escape sequences from being split by consoled's cursor-positioning.
+        //
+        // Carry buffer: if a chunk ends mid-ANSI-escape (e.g. \x1b[2;3 at
+        // the 4KB boundary), the incomplete tail is carried to the next chunk
+        // so it isn't split by cursor-positioning sequences between writes.
+        let mut did_output = false;
+        let mut carry = [0u8; 16];
+        let mut carry_len: usize = 0;
+
+        loop {
+            let mut acc = [0u8; 4096];
+            let mut acc_len: usize = 0;
+
+            // Prepend any carried-over bytes from previous chunk
+            if carry_len > 0 {
+                acc[..carry_len].copy_from_slice(&carry[..carry_len]);
+                acc_len = carry_len;
+                carry_len = 0;
+            }
+
+            // Accumulate up to 4KB from ring
+            loop {
+                let ring = match self.shell_ring.as_ref() {
+                    Some(r) => r,
+                    None => return,
+                };
+                let tx_avail = ring.tx_available();
+                if tx_avail == 0 {
+                    break;
+                }
+                let space = acc.len() - acc_len;
+                if space == 0 {
+                    break;
+                }
+                let to_read = tx_avail.min(space);
+                let n = ring.tx_read(&mut acc[acc_len..acc_len + to_read]);
+                if n == 0 {
+                    break;
+                }
+                acc_len += n;
+
+                // Notify shell after each drain chunk so it can refill
+                ring.notify();
+            }
+
+            if acc_len == 0 {
+                break; // Ring empty — exit outer loop
+            }
+
+            // Check if ring has more data (we'll loop again).
+            // If so, scan for an incomplete ANSI escape at the end and carry it over.
+            let more_data = match self.shell_ring.as_ref() {
+                Some(r) => r.tx_available() > 0 || acc_len == acc.len(),
+                None => false,
             };
-            let tx_avail = ring.tx_available();
-            if tx_avail == 0 {
-                0 // No TX data — handle below after borrow ends
-            } else {
-                let to_read = tx_avail.min(tx_buf.len());
-                ring.tx_read(&mut tx_buf[..to_read])
+            if more_data {
+                // Find last ESC (0x1B) in the final 16 bytes
+                let scan_start = if acc_len > 16 { acc_len - 16 } else { 0 };
+                let mut last_esc = None;
+                for i in (scan_start..acc_len).rev() {
+                    if acc[i] == 0x1b {
+                        last_esc = Some(i);
+                        break;
+                    }
+                }
+                if let Some(esc_pos) = last_esc {
+                    // Check if the escape sequence is complete (terminated by a letter)
+                    let mut complete = false;
+                    for j in (esc_pos + 1)..acc_len {
+                        if acc[j] >= b'A' && acc[j] <= b'z' {
+                            complete = true;
+                            break;
+                        }
+                    }
+                    if !complete {
+                        // Incomplete ANSI escape — carry it to next chunk
+                        let tail_len = acc_len - esc_pos;
+                        if tail_len <= carry.len() {
+                            carry[..tail_len].copy_from_slice(&acc[esc_pos..acc_len]);
+                            carry_len = tail_len;
+                            acc_len = esc_pos;
+                            if acc_len == 0 {
+                                continue; // Entire chunk was just a partial escape
+                            }
+                        }
+                    }
+                }
             }
-        };
-        // Borrow of self.shell_ring is released here
 
-        if n == 0 {
-            // No TX data — check InputState flags and render
+            did_output = true;
+
+            // Poll STDIN so Ctrl+C/Ctrl+\ remain responsive between chunks
+            if self.poll_stdin_for_ctrl() {
+                break;
+            }
+
+            // Check InputState flags for input mode transitions
             self.check_input_flags();
-            if self.input_mode {
-                self.render_input_line();
+
+            // First chunk: scan for commands (SPLIT, NOSPLIT, GETSIZE).
+            // Commands are only sent as complete messages from the shell, never
+            // interleaved with bulk output data. They start at byte 0 after
+            // any leading newlines.
+            let mut data_start = 0;
+            while data_start < acc_len && (acc[data_start] == b'\n' || acc[data_start] == b'\r') {
+                data_start += 1;
             }
-            return;
-        }
 
-        // Check InputState flags for input mode transitions (flag-based, not in-band)
-        self.check_input_flags();
-
-        // Find command start (skip leading whitespace/newlines which may be echo)
-        let mut cmd_start = 0;
-        while cmd_start < n && (tx_buf[cmd_start] == b'\n' || tx_buf[cmd_start] == b'\r') {
-            // Output the newline first (it's echo from shell)
-            if self.input_mode {
-                self.write_output_input_mode(&tx_buf[cmd_start..cmd_start+1]);
-            } else if self.split_enabled {
-                self.write_output(&tx_buf[cmd_start..cmd_start+1]);
-            } else {
-                self.write_uart(&tx_buf[cmd_start..cmd_start+1]);
-            }
-            cmd_start += 1;
-        }
-
-        // Process the remaining data
-        let cmd_buf = &tx_buf[cmd_start..n];
-        let cmd_len = n - cmd_start;
-
-        if cmd_len >= 5 && &cmd_buf[..5] == b"SPLIT" {
-            // Parse optional line count: "SPLIT 5\n" or just "SPLIT\n"
-            if cmd_len > 6 && cmd_buf[5] == b' ' {
-                let mut lines: u16 = 0;
-                let mut i = 6;
-                while i < cmd_len && cmd_buf[i] >= b'0' && cmd_buf[i] <= b'9' {
-                    lines = lines.saturating_mul(10).saturating_add((cmd_buf[i] - b'0') as u16);
-                    i += 1;
-                }
-                if lines >= 1 && lines <= 20 {
-                    self.log_lines = lines;
+            // Write leading newlines
+            if data_start > 0 {
+                if self.input_mode {
+                    self.write_output_input_mode(&acc[..data_start]);
+                } else if self.split_enabled {
+                    self.write_output(&acc[..data_start]);
+                } else {
+                    self.write_uart(&acc[..data_start]);
                 }
             }
-            self.enable_split();
-            // Send OK response
-            if let Some(ring) = &self.shell_ring {
-                ring.rx_write(b"OK\n");
-                ring.notify();
-            }
-        } else if cmd_len >= 7 && &cmd_buf[..7] == b"NOSPLIT" {
-            self.disable_split();
-            if let Some(ring) = &self.shell_ring {
-                ring.rx_write(b"OK\n");
-                ring.notify();
-            }
-        } else if cmd_len >= 7 && &cmd_buf[..7] == b"GETSIZE" {
-            // Temporarily disable scroll region for size detection
-            let was_input = self.input_mode;
-            if was_input {
-                // Temporarily remove scroll region
-                self.write_uart(b"\x1b[r");
-            } else if self.split_enabled {
-                self.write_uart(b"\x1b[r");
-            }
 
-            match ansi::query_screen_size() {
-                Some((cols, rows)) => {
-                    self.cols = cols;
-                    self.rows = rows;
+            let cmd_buf = &acc[data_start..acc_len];
+            let cmd_len = acc_len - data_start;
+
+            if cmd_len >= 5 && &cmd_buf[..5] == b"SPLIT" {
+                if cmd_len > 6 && cmd_buf[5] == b' ' {
+                    let mut lines: u16 = 0;
+                    let mut i = 6;
+                    while i < cmd_len && cmd_buf[i] >= b'0' && cmd_buf[i] <= b'9' {
+                        lines = lines.saturating_mul(10).saturating_add((cmd_buf[i] - b'0') as u16);
+                        i += 1;
+                    }
+                    if lines >= 1 && lines <= 20 {
+                        self.log_lines = lines;
+                    }
                 }
-                None => {}
-            }
-
-            // Re-enable scroll region
-            if was_input {
-                self.input_mode = false;
-                self.enter_input_mode();
-            } else if self.split_enabled {
-                self.split_enabled = false;
                 self.enable_split();
-            }
+                if let Some(ring) = &self.shell_ring {
+                    ring.rx_write(b"OK\n");
+                    ring.notify();
+                }
+            } else if cmd_len >= 7 && &cmd_buf[..7] == b"NOSPLIT" {
+                self.disable_split();
+                if let Some(ring) = &self.shell_ring {
+                    ring.rx_write(b"OK\n");
+                    ring.notify();
+                }
+            } else if cmd_len >= 7 && &cmd_buf[..7] == b"GETSIZE" {
+                let was_input = self.input_mode;
+                if was_input {
+                    self.write_uart(b"\x1b[r");
+                } else if self.split_enabled {
+                    self.write_uart(b"\x1b[r");
+                }
 
-            let mut msg = [0u8; 32];
-            let len = format_size_msg(&mut msg, self.cols, self.rows);
-            if let Some(ring) = &self.shell_ring {
-                ring.rx_write(&msg[..len]);
-                ring.notify();
+                match ansi::query_screen_size() {
+                    Some((cols, rows)) => {
+                        self.cols = cols;
+                        self.rows = rows;
+                    }
+                    None => {}
+                }
+
+                if was_input {
+                    self.input_mode = false;
+                    self.enter_input_mode();
+                } else if self.split_enabled {
+                    self.split_enabled = false;
+                    self.enable_split();
+                }
+
+                let mut msg = [0u8; 32];
+                let len = format_size_msg(&mut msg, self.cols, self.rows);
+                if let Some(ring) = &self.shell_ring {
+                    ring.rx_write(&msg[..len]);
+                    ring.notify();
+                }
+            } else if cmd_len > 0 {
+                // Bulk data output — write accumulated chunk at once.
+                if self.input_mode {
+                    self.write_output_input_mode(cmd_buf);
+                } else if self.split_enabled {
+                    self.write_output(cmd_buf);
+                } else {
+                    self.write_uart(cmd_buf);
+                }
             }
-        } else if cmd_len > 0 {
-            // Regular output (not a command)
-            if self.input_mode {
-                self.write_output_input_mode(cmd_buf);
-            } else if self.split_enabled {
-                self.write_output(cmd_buf);
-            } else {
-                self.write_uart(cmd_buf);
-            }
+        } // end outer loop
+
+        if !did_output {
+            // No TX data — shell may have only updated InputState (echo).
+            // Check flags and render input line from shared memory.
+            self.check_input_flags();
         }
 
-        // If in input mode, check InputState after processing TX data
         if self.input_mode {
             self.render_input_line();
         }
-
-        // Check for more data (recursively, but bounded by buffer)
-        self.handle_shmem_readable(ctx);
     }
 
     fn handle_channel_readable(&mut self, ctx: &mut dyn BusCtx) {
@@ -961,6 +1279,19 @@ impl Driver for ConsoledDriver {
 
         self.port = Some(port);
 
+        // Create 1-second status bar timer
+        if let Ok(timer) = Timer::new() {
+            if let Err(e) = ctx.watch_handle(timer.handle(), TAG_STATUS_TIMER) {
+                uerror!("consoled", "watch_timer_failed";);
+                return Err(e);
+            }
+            self.status_timer = Some(timer);
+            // Arm for 1 second
+            if let Some(t) = &mut self.status_timer {
+                let _ = t.set(1_000_000_000);
+            }
+        }
+
         // Register console: port with devd
         let mut info = PortInfo::empty();
         info.set_name(b"console:0");
@@ -988,6 +1319,17 @@ impl Driver for ConsoledDriver {
             TAG_PORT => self.handle_port_readable(ctx),
             TAG_SHMEM => self.handle_shmem_readable(ctx),
             TAG_HANDSHAKE => self.handle_channel_readable(ctx),
+            TAG_STATUS_TIMER => {
+                // Re-arm timer for 1 second
+                if let Some(t) = &mut self.status_timer {
+                    let _ = t.set(1_000_000_000);
+                }
+                // Toggle heartbeat and render if in input mode
+                self.heartbeat_toggle = !self.heartbeat_toggle;
+                if self.input_mode {
+                    self.render_status_line();
+                }
+            }
             _ => {}
         }
     }

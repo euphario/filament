@@ -199,13 +199,25 @@ pub extern "C" fn kmain() -> ! {
         kdebug!("bus", "init_ok");
     }
 
-    // Watchdog (MT7988A only)
+    // Watchdog
     #[cfg(feature = "platform-mt7988a")]
     {
         let _span = span!("wdt", "init");
         wdt::init();
-        kdebug!("wdt", "init_ok"; enabled = false);
+        wdt::set_timeout(30);
+        wdt::enable_dual_mode();
+        kdebug!("wdt", "init_ok"; mode = "dual", timeout_s = 30u64);
     }
+
+    // Configure WDT SPI as Group 0 FIQ (MT7988A) + enable FIQ on primary CPU
+    #[cfg(feature = "platform-mt7988a")]
+    gic::configure_wdt_fiq(plat::irq::WDT);
+
+    gic::init_fiq_cpu();
+
+    // QEMU software watchdog
+    #[cfg(feature = "platform-qemu-virt")]
+    plat::wdt::init();
 
     // Timer
     {
@@ -428,17 +440,28 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
             sync::cpu_flags().set_need_resched();
         }
     } else if irq == plat::irq::UART0 {
-        // UART RX interrupt - data available on console
-        // IRQ handler drains FIFO into ring buffer, so IRQ won't re-trigger
-        if uart::handle_rx_irq() {
-            // Wake any process blocked waiting for console input.
-            // Deferred via microtask queue — processed at irq_exit_resched.
+        // Unified UART interrupt handler — reads IIR to identify and clear sources.
+        // On 16550, reading IIR is required to clear THRE interrupt pending status.
+        let (rx_received, tx_freed) = uart::handle_uart_irq();
+
+        if rx_received {
+            // Wake any process blocked waiting for console input
             let blocked_pid = uart::get_blocked_pid();
             if blocked_pid != 0 {
                 let _ = crate::kernel::microtask::enqueue(
                     crate::kernel::microtask::MicroTask::Wake { pid: blocked_pid },
                 );
                 uart::clear_blocked();
+            }
+        }
+        if tx_freed {
+            // Wake any process blocked waiting for TX buffer space (consoled)
+            let tx_pid = uart::get_tx_blocked_pid();
+            if tx_pid != 0 {
+                let _ = crate::kernel::microtask::enqueue(
+                    crate::kernel::microtask::MicroTask::Wake { pid: tx_pid },
+                );
+                uart::clear_tx_blocked();
             }
         }
     } else {

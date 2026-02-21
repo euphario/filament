@@ -190,7 +190,10 @@ mod regs {
     pub const THR: usize = 0x00;
     /// Interrupt Enable Register
     pub const IER: usize = 0x04;
-    /// FIFO Control Register
+    /// Interrupt Identification Register (read) / FIFO Control Register (write)
+    /// Same offset — IIR is read-only, FCR is write-only
+    pub const IIR: usize = 0x08;
+    /// FIFO Control Register (write-only, same offset as IIR)
     pub const FCR: usize = 0x08;
     /// Line Control Register
     pub const LCR: usize = 0x0C;
@@ -198,6 +201,22 @@ mod regs {
     pub const MCR: usize = 0x10;
     /// Line Status Register
     pub const LSR: usize = 0x14;
+}
+
+/// Interrupt Identification Register bits
+mod iir {
+    /// Bit 0: 0 = interrupt pending, 1 = no interrupt
+    pub const NO_INTERRUPT: u32 = 1 << 0;
+    /// Bits [3:1] interrupt ID:
+    ///   0b001 (0x02) = THR Empty
+    ///   0b010 (0x04) = Received Data Available
+    ///   0b011 (0x06) = Receiver Line Status
+    ///   0b110 (0x0C) = Character Timeout
+    pub const ID_MASK: u32 = 0x0E;
+    pub const ID_THRE: u32 = 0x02;
+    pub const ID_RDA: u32 = 0x04;
+    pub const ID_RLS: u32 = 0x06;
+    pub const ID_TIMEOUT: u32 = 0x0C;
 }
 
 /// Line Status Register bits
@@ -214,6 +233,8 @@ mod lsr {
 mod ier {
     /// Enable Received Data Available Interrupt
     pub const ERBFI: u32 = 1 << 0;
+    /// Enable Transmitter Holding Register Empty Interrupt
+    pub const ETBEI: u32 = 1 << 1;
 }
 
 /// Modem Control Register bits
@@ -256,8 +277,10 @@ impl Uart {
     /// Write a single byte to the UART
     /// Returns false if timeout (character dropped), true if sent successfully
     pub fn putc(&self, byte: u8) -> bool {
-        // Wait until transmit holding register is empty (with timeout)
-        const MAX_RETRIES: u32 = 100_000;
+        // Wait until transmit holding register is empty (with timeout).
+        // 5M iterations ≈ 2.8ms at 1.8GHz — covers full 16-byte FIFO
+        // drain at 115200 baud (~1.4ms).
+        const MAX_RETRIES: u32 = 5_000_000;
         let mut retries = 0;
         while (self.regs.read32(regs::LSR) & lsr::THRE) == 0 {
             retries += 1;
@@ -266,7 +289,6 @@ impl Uart {
             }
             core::hint::spin_loop();
         }
-        // Write the byte
         self.regs.write32(regs::THR, byte as u32);
         true
     }
@@ -472,63 +494,81 @@ pub fn print_buffered(s: &str) {
     }
 }
 
-/// Write raw bytes to the output buffer (non-blocking)
-pub fn write_buffered(data: &[u8]) {
+/// Write raw bytes to the output buffer.
+/// Returns number of bytes written (may be less than data.len() if ring is full).
+pub fn write_buffered(data: &[u8]) -> usize {
     let mut buf = UART_BUFFER.lock();
+    let mut written = 0;
     for &byte in data {
         if !buf.push(byte) {
-            // Buffer full - flush directly while holding lock
-            let uart = UART.lock();
-            for _ in 0..64 {
-                if let Some(b) = buf.pop() {
-                    uart.putc(b);
-                } else {
-                    break;
-                }
-            }
-            drop(uart);
-            let _ = buf.push(byte);
+            break; // Ring full — caller should block and retry
         }
+        written += 1;
     }
+    written
 }
 
-/// Flush the output buffer to UART hardware
-/// Called from timer interrupt or explicitly
+/// Flush the output buffer to UART hardware.
+/// Spin-drains ring into FIFO, waiting for THRE between each byte.
+/// Bounded by ring contents at call time (max 4KB, ~350ms at 115200).
+///
+/// write_console caps each call to 512 bytes, so typical drain is ~45ms.
+/// The calling task (consoled) blocks during drain — this is intentional:
+/// it naturally paces output at wire speed and yields CPU between syscalls.
+///
+/// LOCK ORDER: UART_BUFFER first, then UART — same as try_flush_buffer().
+/// Acquiring UART first would deadlock with try_flush_buffer() on another
+/// core (timer IRQ holds UART_BUFFER, waits for UART; we hold UART, wait
+/// for UART_BUFFER).
 pub fn flush_buffer() {
     let mut buf = UART_BUFFER.lock();
     let uart = UART.lock();
 
-    // Drain up to 64 bytes per flush call to limit time spent
-    // (will continue on next timer tick if more data)
-    for _ in 0..64 {
+    while buf.has_data() {
+        // Wait for THRE (transmit holding register empty) BEFORE popping.
+        // On 16550 with FIFO mode, THRE is set when the TX FIFO is empty —
+        // NOT when there's room for one byte. A full 16-byte FIFO at 115200
+        // baud takes ~1.4ms to drain (16 bytes × 87μs/byte).
+        //
+        // 5M iterations × ~0.56ns/iter ≈ 2.8ms — safely covers FIFO drain.
+        // On timeout, stop draining (remaining bytes stay in ring for next
+        // flush). Never write to a full FIFO — that corrupts the byte stream.
+        let mut retries = 0u32;
+        while (uart.regs.read32(regs::LSR) & lsr::THRE) == 0 {
+            retries += 1;
+            if retries >= 5_000_000 {
+                return; // UART stuck — leave remaining bytes for next flush
+            }
+            core::hint::spin_loop();
+        }
         if let Some(byte) = buf.pop() {
-            uart.putc(byte);
-        } else {
-            break;
+            uart.regs.write32(regs::THR, byte as u32);
         }
     }
 }
 
 /// Try to flush the output buffer (non-blocking, IRQ-safe)
 /// Returns true if flush was performed, false if lock was held
-/// Safe to call from timer interrupt - skips flush if buffer lock is held
+/// Safe to call from timer interrupt - drains up to 64 bytes
 pub fn try_flush_buffer() -> bool {
     // Try to acquire buffer lock - if held by syscall, skip this tick
     let Some(mut buf) = UART_BUFFER.try_lock() else {
         return false;
     };
 
-    // Try to acquire UART lock - if held, skip this tick
-    let Some(uart) = UART.try_lock() else {
-        return false;
-    };
+    if !buf.has_data() {
+        return true;
+    }
 
-    // Drain up to 64 bytes per flush call
+    let uart = UART.lock();
     for _ in 0..64 {
+        if (uart.regs.read32(regs::LSR) & lsr::THRE) == 0 {
+            break; // FIFO busy
+        }
         if let Some(byte) = buf.pop() {
-            uart.putc(byte);
+            uart.regs.write32(regs::THR, byte as u32);
         } else {
-            break;
+            break; // Ring empty
         }
     }
     true
@@ -550,20 +590,27 @@ static CONSOLE_BLOCKED_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Enable UART RX interrupt
 pub fn enable_rx_interrupt() {
-    // Enable RX data available interrupt
-    UART.lock().regs.write32(regs::IER, ier::ERBFI);
+    // Enable RX data available interrupt (preserve other IER bits like ETBEI)
+    let uart = UART.lock();
+    let ier = uart.regs.read32(regs::IER);
+    uart.regs.write32(regs::IER, ier | ier::ERBFI);
+    drop(uart);
     // Enable in GIC
     super::gic::enable_irq(super::irq::UART0);
 }
 
 /// Disable UART RX interrupt (called from IRQ handler to prevent re-triggering)
 pub fn disable_rx_interrupt() {
-    UART.lock().regs.write32(regs::IER, 0);
+    let uart = UART.lock();
+    let ier = uart.regs.read32(regs::IER);
+    uart.regs.write32(regs::IER, ier & !ier::ERBFI);
 }
 
 /// Re-enable UART RX interrupt (called after reading data)
 pub fn reenable_rx_interrupt() {
-    UART.lock().regs.write32(regs::IER, ier::ERBFI);
+    let uart = UART.lock();
+    let ier = uart.regs.read32(regs::IER);
+    uart.regs.write32(regs::IER, ier | ier::ERBFI);
 }
 
 /// Register a process as blocked waiting for console input
@@ -595,32 +642,78 @@ pub fn get_blocked_pid() -> u32 {
     CONSOLE_BLOCKED_PID.load(Ordering::Acquire)
 }
 
-/// Handle UART RX interrupt - reads all available data into ring buffer
-/// Returns true if data was received
-pub fn handle_rx_irq() -> bool {
+/// Handle all pending UART interrupts via IIR loop (standard 16550 pattern).
+/// Returns (rx_received, tx_freed) so caller can wake blocked processes.
+///
+/// Reading IIR is critical on 16550 — it identifies the interrupt source AND
+/// clears THRE interrupt pending status. Without reading IIR, THRE interrupt
+/// stays pending and may never re-fire on some implementations.
+pub fn handle_uart_irq() -> (bool, bool) {
     let uart = UART.lock();
-    let mut rx_buf = RX_BUFFER.lock();
-    let mut received = false;
+    let mut rx_received = false;
+    let mut tx_freed = false;
 
-    // Read all available characters into the ring buffer
-    while (uart.regs.read32(regs::LSR) & lsr::DR) != 0 {
-        let byte = uart.regs.read32(regs::THR) as u8;
-        if !rx_buf.push(byte) {
-            // Buffer full - drop character (shouldn't happen with flow control)
+    // Standard 16550 ISR: loop reading IIR until no interrupt pending
+    loop {
+        let iir_val = uart.regs.read32(regs::IIR);
+
+        // Bit 0 = 1 means no interrupt pending
+        if (iir_val & iir::NO_INTERRUPT) != 0 {
             break;
         }
-        received = true;
+
+        match iir_val & iir::ID_MASK {
+            iir::ID_RDA | iir::ID_TIMEOUT => {
+                // Received Data Available or Character Timeout
+                let mut rx_buf = RX_BUFFER.lock();
+                while (uart.regs.read32(regs::LSR) & lsr::DR) != 0 {
+                    let byte = uart.regs.read32(regs::THR) as u8;
+                    if !rx_buf.push(byte) {
+                        break; // Buffer full
+                    }
+                    rx_received = true;
+                }
+                // RTS flow control
+                if rx_buf.above_high_water() && RTS_ASSERTED.load(Ordering::Relaxed) {
+                    uart.deassert_rts();
+                    RTS_ASSERTED.store(false, Ordering::Release);
+                }
+            }
+            iir::ID_THRE => {
+                // THR Empty — reading IIR already cleared THRE pending status.
+                // Drain ring buffer into FIFO (16 bytes = FIFO depth).
+                let mut buf = UART_BUFFER.lock();
+                for _ in 0..16 {
+                    if let Some(byte) = buf.pop() {
+                        uart.regs.write32(regs::THR, byte as u32);
+                        tx_freed = true;
+                    } else {
+                        // Ring empty — disable ETBEI
+                        let ier = uart.regs.read32(regs::IER);
+                        uart.regs.write32(regs::IER, ier & !ier::ETBEI);
+                        break;
+                    }
+                }
+            }
+            iir::ID_RLS => {
+                // Receiver Line Status — clear by reading LSR
+                let _ = uart.regs.read32(regs::LSR);
+            }
+            _ => {
+                // Modem status or unknown — clear by reading MSR (offset 0x18)
+                // Just break to avoid infinite loop on unexpected IIR values
+                break;
+            }
+        }
     }
 
-    // Manage RTS flow control
-    // TODO: Abstract flow control into a platform trait for hardware auto-RTS support
-    if rx_buf.above_high_water() && RTS_ASSERTED.load(Ordering::Relaxed) {
-        // Buffer getting full - tell sender to stop
-        uart.deassert_rts();
-        RTS_ASSERTED.store(false, Ordering::Release);
-    }
+    (rx_received, tx_freed)
+}
 
-    received
+/// Legacy handle_rx_irq — kept for API compatibility but now delegates to handle_uart_irq
+pub fn handle_rx_irq() -> bool {
+    // This is now handled by handle_uart_irq() — should not be called directly
+    false
 }
 
 /// Read a byte from the RX ring buffer (non-blocking)
@@ -668,6 +761,51 @@ pub fn rx_buffer_read_bytes(buf: &mut [u8]) -> usize {
 /// Check if RX buffer has data available
 pub fn rx_buffer_has_data() -> bool {
     RX_BUFFER.lock().has_data()
+}
+
+// ============================================================================
+// UART TX Interrupt Support (Event-Driven Drain)
+// ============================================================================
+
+/// PID of process blocked waiting for TX buffer space (0 = none)
+static CONSOLE_TX_BLOCKED_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Enable UART TX interrupt (ETBEI — fires when THR is empty)
+pub fn enable_tx_interrupt() {
+    let uart = UART.lock();
+    let ier = uart.regs.read32(regs::IER);
+    uart.regs.write32(regs::IER, ier | ier::ETBEI);
+}
+
+/// Disable UART TX interrupt
+pub fn disable_tx_interrupt() {
+    let uart = UART.lock();
+    let ier = uart.regs.read32(regs::IER);
+    uart.regs.write32(regs::IER, ier & !ier::ETBEI);
+}
+
+/// Legacy handle_tx_irq — kept for API compatibility but now handled by handle_uart_irq
+pub fn handle_tx_irq() -> bool {
+    // TX is now handled by handle_uart_irq() — should not be called directly
+    false
+}
+
+/// Register a process as blocked waiting for TX buffer space
+pub fn block_for_tx(pid: u32) -> bool {
+    CONSOLE_TX_BLOCKED_PID.compare_exchange(
+        0, pid,
+        Ordering::SeqCst, Ordering::SeqCst
+    ).is_ok()
+}
+
+/// Get the PID waiting for TX buffer space (0 if none)
+pub fn get_tx_blocked_pid() -> u32 {
+    CONSOLE_TX_BLOCKED_PID.load(Ordering::Acquire)
+}
+
+/// Clear the TX-blocked process
+pub fn clear_tx_blocked() {
+    CONSOLE_TX_BLOCKED_PID.store(0, Ordering::Release);
 }
 
 // ============================================================================

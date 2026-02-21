@@ -749,7 +749,8 @@ pub mod ring_presets {
     use super::RingConfig;
     use super::ring_config::make;
 
-    /// Console TX: 64KB ring, 256B slots (256 slots) - shell output bursts
+    /// Console TX: 64KB ring with back-pressure flow control.
+    /// Shell blocks when ring is full; consoled notifies when 50% free.
     pub const CONSOLE_TX: RingConfig = make(4, 3);
 
     /// Console RX: 4KB ring, 64B slots (64 slots) - keyboard input

@@ -157,6 +157,9 @@ pub extern "C" fn secondary_cpu_entry(cpu_id_arg: u64) {
     // 3. Initialize GIC CPU interface for this CPU
     crate::platform::current::gic::init_cpu();
 
+    // 3b. Enable FIQ (Group 0) for watchdog NMI on this CPU
+    crate::platform::current::gic::init_fiq_cpu();
+
     // 4. Create idle task for this CPU in the scheduler
     crate::kernel::task::init_secondary_scheduler(cpu);
 

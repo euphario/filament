@@ -278,21 +278,24 @@ pub fn print_buffered(s: &str) {
 }
 
 /// Buffered write - goes to ring buffer (bytes version)
-pub fn write_buffered(data: &[u8]) {
+/// Returns number of bytes written (may be less than data.len() if ring is full).
+pub fn write_buffered(data: &[u8]) -> usize {
     let mut buf = UART_BUFFER.lock();
+    let mut written = 0;
     for &byte in data {
         if !buf.push(byte) {
-            // Buffer full - drop or flush
-            break;
+            break; // Ring full — caller should block and retry
         }
+        written += 1;
     }
+    written
 }
 
-/// Flush buffer to hardware
+/// Flush buffer to hardware — spin-drain ring into FIFO.
 pub fn flush() {
     let mut buf = UART_BUFFER.lock();
     while let Some(byte) = buf.pop() {
-        // Wait for space
+        // Wait for TX FIFO to have space
         while (uart_read(UARTFR) & FR_TXFF) != 0 {
             core::hint::spin_loop();
         }
@@ -306,6 +309,14 @@ pub fn enable_rx_interrupt() {
     // Enable RXIM (bit 4) and RTIM (bit 6 - receive timeout)
     // RTIM fires when data sits in FIFO for 32 bit periods without more data
     uart_write(UARTIMSC, imsc | (1 << 4) | (1 << 6));
+}
+
+/// Handle all pending UART interrupts.
+/// Returns (rx_received, tx_freed) for caller to wake blocked processes.
+pub fn handle_uart_irq() -> (bool, bool) {
+    let rx = handle_rx_irq();
+    let tx = handle_tx_irq();
+    (rx, tx)
 }
 
 /// Handle UART RX interrupt - reads all available data into ring buffer
@@ -384,20 +395,81 @@ pub fn write_bytes(bytes: &[u8]) {
     }
 }
 
-/// Flush the output buffer to UART hardware
-/// Called from timer interrupt or explicitly
+/// Flush the output buffer to UART hardware.
+/// Primes FIFO then enables TX interrupt for remainder.
 pub fn flush_buffer() {
-    let mut buf = UART_BUFFER.lock();
+    flush();
+}
 
-    // Drain all buffered data to UART
-    // QEMU's virtual UART is fast so no need to limit bytes per call
-    while let Some(byte) = buf.pop() {
-        // Wait for space in TX FIFO
-        while (uart_read(UARTFR) & FR_TXFF) != 0 {
-            core::hint::spin_loop();
-        }
-        uart_write(UARTDR, byte as u32);
+// ============================================================================
+// UART TX Interrupt Support (Event-Driven Drain)
+// ============================================================================
+
+/// PID of process blocked waiting for TX buffer space (0 = none)
+static CONSOLE_TX_BLOCKED_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Enable PL011 TX interrupt (TXIM — bit 5 of UARTIMSC)
+pub fn enable_tx_interrupt() {
+    let imsc = uart_read(UARTIMSC);
+    uart_write(UARTIMSC, imsc | (1 << 5));
+}
+
+/// Disable PL011 TX interrupt
+pub fn disable_tx_interrupt() {
+    let imsc = uart_read(UARTIMSC);
+    uart_write(UARTIMSC, imsc & !(1 << 5));
+}
+
+/// Handle TX interrupt — drain ring buffer into FIFO.
+/// Returns true if space was freed in the ring buffer.
+pub fn handle_tx_irq() -> bool {
+    let mis = uart_read(UARTMIS);
+
+    // TX interrupt is bit 5
+    if (mis & (1 << 5)) == 0 {
+        return false;
     }
+
+    let mut buf = UART_BUFFER.lock();
+    let mut freed = false;
+
+    // PL011 FIFO depth is 16 — drain up to 16 from ring into FIFO
+    for _ in 0..16 {
+        if (uart_read(UARTFR) & FR_TXFF) != 0 {
+            break; // FIFO full
+        }
+        if let Some(byte) = buf.pop() {
+            uart_write(UARTDR, byte as u32);
+            freed = true;
+        } else {
+            // Ring empty — disable TX interrupt
+            disable_tx_interrupt();
+            break;
+        }
+    }
+
+    // Clear TX interrupt
+    uart_write(UARTICR, 1 << 5);
+
+    freed
+}
+
+/// Register a process as blocked waiting for TX buffer space
+pub fn block_for_tx(pid: u32) -> bool {
+    CONSOLE_TX_BLOCKED_PID.compare_exchange(
+        0, pid,
+        Ordering::SeqCst, Ordering::SeqCst
+    ).is_ok()
+}
+
+/// Get the PID waiting for TX buffer space (0 if none)
+pub fn get_tx_blocked_pid() -> u32 {
+    CONSOLE_TX_BLOCKED_PID.load(Ordering::Acquire)
+}
+
+/// Clear the TX-blocked process
+pub fn clear_tx_blocked() {
+    CONSOLE_TX_BLOCKED_PID.store(0, Ordering::Release);
 }
 
 // ============================================================================

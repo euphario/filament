@@ -50,6 +50,7 @@ pub mod microtask;
 pub mod power;
 pub mod cpufreq;
 pub mod rng;
+pub mod watchdog;
 
 // New syscall-facing trait implementations
 pub mod syscall_ctx_impl;

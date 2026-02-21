@@ -106,6 +106,22 @@ pub fn software_reset() -> ! {
     }
 }
 
+/// Enable watchdog in DUAL_MODE: first half of timeout fires IRQ (Group 0 FIQ),
+/// second half does hardware reset. This provides an NMI for deadlock diagnostics.
+pub fn enable_dual_mode() {
+    let mode = mode::ENABLE | mode::EXTEN | mode::DUAL_MODE | mode::KEY;
+    write_reg(reg::WDT_MODE, mode);
+    // Kick immediately so the timer starts from the full timeout
+    kick();
+}
+
+/// Clear the WDT IRQ status flag (acknowledge the DUAL_MODE first-half interrupt).
+/// Must be called from the FIQ handler before the second-half reset fires.
+pub fn clear_irq_status() {
+    // Writing any value to WDT_STATUS clears the IRQ-fired flag
+    write_reg(reg::WDT_STATUS, 0xFFFF_FFFF);
+}
+
 /// Set watchdog timeout in seconds (approximate)
 /// Valid range: 1-512 seconds
 pub fn set_timeout(seconds: u32) {
