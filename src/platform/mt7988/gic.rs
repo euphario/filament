@@ -348,6 +348,28 @@ impl InterruptController for Gic {
         let typer = self.gicd_read(gicd::TYPER);
         ((typer & 0x1f) + 1) * 32
     }
+
+    fn set_affinity(&self, irq: u32, cpu: u32) {
+        if irq < 32 {
+            return; // SGIs/PPIs are per-CPU, cannot be rerouted
+        }
+        // GICD_IROUTER[n] is 64-bit: write target affinity
+        // For MT7988A (single cluster), Aff0 = cpu, Aff1/2/3 = 0
+        let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
+        self.gicd_write64(irouter_offset, cpu as u64);
+    }
+
+    fn send_ipi(&self, target_cpu: u32, sgi_id: u32) {
+        let target_list = 1u64 << target_cpu;
+        let val = (sgi_id as u64 & 0xF) << 24 | target_list;
+        unsafe {
+            core::arch::asm!(
+                "msr S3_0_C12_C11_5, {}",
+                "isb",
+                in(reg) val,
+            );
+        }
+    }
 }
 
 /// Global GIC instance
@@ -510,6 +532,13 @@ pub fn init_cpu() {
         core::arch::asm!("msr S3_0_C12_C12_7, {}", in(reg) igrpen);
 
         core::arch::asm!("isb");
+    }
+}
+
+/// Set IRQ affinity to a specific CPU
+pub fn set_affinity(irq: u32, cpu: u32) {
+    unsafe {
+        (*core::ptr::addr_of!(GIC)).set_affinity(irq, cpu);
     }
 }
 

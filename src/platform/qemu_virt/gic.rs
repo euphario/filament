@@ -263,6 +263,27 @@ impl InterruptController for Gic {
     fn num_irqs(&self) -> u32 {
         Gic::num_irqs(self)
     }
+
+    fn set_affinity(&self, irq: u32, cpu: u32) {
+        if irq < 32 {
+            return; // SGIs/PPIs are per-CPU, cannot be rerouted
+        }
+        // GICD_IROUTER[n]: Aff0 = cpu, Aff1/2/3 = 0 (single cluster)
+        let irouter_offset = gicd::IROUTER + ((irq - 32) as usize) * 8;
+        self.gicd_write64(irouter_offset, cpu as u64);
+    }
+
+    fn send_ipi(&self, target_cpu: u32, sgi_id: u32) {
+        let target_list = 1u64 << target_cpu;
+        let val = (sgi_id as u64 & 0xF) << 24 | target_list;
+        unsafe {
+            core::arch::asm!(
+                "msr S3_0_C12_C11_5, {}",
+                "isb",
+                in(reg) val,
+            );
+        }
+    }
 }
 
 // ============================================================================
@@ -343,6 +364,13 @@ pub fn init_cpu() {
         gicr.write32(gicr::IPRIORITYR + (i as usize) * 4, 0xa0a0a0a0);
     }
     gicr.write32(gicr::ISENABLER0, 0x0000ffff); // Enable SGIs 0-15
+}
+
+/// Set IRQ affinity to a specific CPU
+pub fn set_affinity(irq: u32, cpu: u32) {
+    unsafe {
+        (*core::ptr::addr_of!(GIC)).set_affinity(irq, cpu);
+    }
 }
 
 pub fn as_interrupt_controller() -> &'static dyn InterruptController {

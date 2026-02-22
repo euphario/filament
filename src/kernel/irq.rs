@@ -100,6 +100,20 @@ pub fn unregister(irq_num: u32, pid: u32) -> bool {
     })
 }
 
+/// Set IRQ affinity — route an SPI to a specific CPU core.
+/// Only the owning process can change affinity.
+pub fn set_affinity(irq_num: u32, pid: u32, cpu: u32) -> bool {
+    let is_owner = with_irq_table(|table| {
+        table.iter().any(|reg| !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid)
+    });
+    if is_owner {
+        crate::platform::current::gic::set_affinity(irq_num, cpu);
+        true
+    } else {
+        false
+    }
+}
+
 /// Clean up all IRQ registrations for a process (called on process exit)
 pub fn process_cleanup(pid: u32) {
     with_irq_table(|table| {

@@ -21,7 +21,7 @@ use crate::bus::{
 };
 use crate::bus_block::ShmemBlockPort;
 use crate::devd::{DevdClient, DevdCommand};
-use crate::ipc::{Channel, Mux, MuxFilter};
+use crate::ipc::{Channel, Irq, Mux, MuxFilter, Timer};
 use crate::mailbox::Mailbox;
 use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, query_flags, port_type as qport_type, error as query_error};
 use crate::syscall::{self, Handle, LogLevel};
@@ -56,6 +56,29 @@ const TAG_CHILD_SUPERQ_BASE: u32 = 0xFFFF_FC00;
 
 /// Tag for parent supervision queue (tree mode — receiving commands from parent).
 const TAG_PARENT_SUPERQ: u32 = 0xFFFF_FB00;
+
+/// Maximum managed IRQs per driver.
+const MAX_MANAGED_IRQS: usize = 4;
+
+/// Maximum managed timers per driver.
+const MAX_MANAGED_TIMERS: usize = 4;
+
+// ============================================================================
+// Managed IRQ / Timer
+// ============================================================================
+
+/// An IRQ managed by the runtime — auto-acked after handle_event.
+struct ManagedIrq {
+    irq: Irq,
+    tag: u32,
+}
+
+/// A recurring timer managed by the runtime — auto-rearmed after handle_event.
+struct ManagedTimer {
+    timer: Timer,
+    tag: u32,
+    interval_ns: u64,
+}
 
 // ============================================================================
 // Handle Registry
@@ -347,6 +370,10 @@ struct RuntimeCtx {
     config_query_next_seq: u32,
     /// Set on first respond_info failure — suppresses subsequent klog spam.
     devd_channel_broken: bool,
+    /// Managed IRQs (auto-ack after handle_event).
+    managed_irqs: [Option<ManagedIrq>; MAX_MANAGED_IRQS],
+    /// Managed timers (auto-rearm after handle_event).
+    managed_timers: [Option<ManagedTimer>; MAX_MANAGED_TIMERS],
 }
 
 impl RuntimeCtx {
@@ -378,6 +405,8 @@ impl RuntimeCtx {
             pending_config: [const { None }; MAX_PENDING_CONFIG],
             config_query_next_seq: 0xC000_0001,
             devd_channel_broken: false,
+            managed_irqs: [const { None }; MAX_MANAGED_IRQS],
+            managed_timers: [const { None }; MAX_MANAGED_TIMERS],
         }
     }
 
@@ -783,6 +812,73 @@ impl BusCtx for RuntimeCtx {
         let _ = self.mux.remove(handle);
         self.handles.remove(handle);
         Ok(())
+    }
+
+    fn watch_irq(&mut self, irq_num: u32, tag: u32) -> Result<(), BusError> {
+        let irq = Irq::new(irq_num).map_err(|_| BusError::NotFound)?;
+        let handle = irq.handle();
+        self.mux.add(handle, MuxFilter::Readable).map_err(|_| BusError::Internal)?;
+        if !self.handles.add(handle, tag) {
+            let _ = self.mux.remove(handle);
+            return Err(BusError::NoSpace);
+        }
+        for slot in self.managed_irqs.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(ManagedIrq { irq, tag });
+                return Ok(());
+            }
+        }
+        // No managed slot — undo mux/handle registration
+        let _ = self.mux.remove(handle);
+        self.handles.remove(handle);
+        Err(BusError::NoSpace)
+    }
+
+    fn set_irq_affinity(&mut self, tag: u32, cpu: u32) -> Result<(), BusError> {
+        for slot in self.managed_irqs.iter_mut() {
+            if let Some(mirq) = slot {
+                if mirq.tag == tag {
+                    mirq.irq.set_affinity(cpu).map_err(|_| BusError::Internal)?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(BusError::NotFound)
+    }
+
+    fn start_timer(&mut self, tag: u32, interval_ns: u64) -> Result<(), BusError> {
+        let mut timer = Timer::new().map_err(|_| BusError::Internal)?;
+        let _ = timer.set(interval_ns);
+        let handle = timer.handle();
+        self.mux.add(handle, MuxFilter::Readable).map_err(|_| BusError::Internal)?;
+        if !self.handles.add(handle, tag) {
+            let _ = self.mux.remove(handle);
+            return Err(BusError::NoSpace);
+        }
+        for slot in self.managed_timers.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(ManagedTimer { timer, tag, interval_ns });
+                return Ok(());
+            }
+        }
+        let _ = self.mux.remove(handle);
+        self.handles.remove(handle);
+        Err(BusError::NoSpace)
+    }
+
+    fn stop_timer(&mut self, tag: u32) -> Result<(), BusError> {
+        for slot in self.managed_timers.iter_mut() {
+            if let Some(mt) = slot {
+                if mt.tag == tag {
+                    let handle = mt.timer.handle();
+                    let _ = self.mux.remove(handle);
+                    self.handles.remove(handle);
+                    *slot = None;
+                    return Ok(());
+                }
+            }
+        }
+        Err(BusError::NotFound)
     }
 
     fn name(&self) -> &[u8] {
@@ -1241,6 +1337,26 @@ impl<D: Driver> DriverRuntime<D> {
             } else {
                 // Driver-registered handle
                 self.driver.handle_event(tag, handle, &mut self.ctx);
+
+                // Auto-ack managed IRQs
+                for slot in self.ctx.managed_irqs.iter_mut() {
+                    if let Some(mirq) = slot {
+                        if mirq.tag == tag {
+                            let _ = mirq.irq.ack();
+                            break;
+                        }
+                    }
+                }
+
+                // Auto-rearm managed timers
+                for slot in self.ctx.managed_timers.iter_mut() {
+                    if let Some(mt) = slot {
+                        if mt.tag == tag {
+                            let _ = mt.timer.set(mt.interval_ns);
+                            break;
+                        }
+                    }
+                }
             }
 
             // Flush any structured logs emitted during dispatch

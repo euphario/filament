@@ -65,6 +65,18 @@ pub trait InterruptController {
 
     /// Get the number of supported IRQs
     fn num_irqs(&self) -> u32;
+
+    /// Set IRQ affinity — route an SPI to a specific CPU core.
+    ///
+    /// On GICv3 this writes GICD_IROUTER[irq] with the target CPU's
+    /// affinity value. SGIs/PPIs (irq < 32) are per-CPU and cannot
+    /// be rerouted — this is a no-op for them.
+    fn set_affinity(&self, irq: u32, cpu: u32);
+
+    /// Send a Software Generated Interrupt (IPI) to a target CPU.
+    ///
+    /// `sgi_id` selects the SGI number (0-15). SGI 0 is the reschedule IPI.
+    fn send_ipi(&self, target_cpu: u32, sgi_id: u32);
 }
 
 /// Timer abstraction

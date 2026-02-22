@@ -535,6 +535,13 @@ impl Irq {
         read(self.handle, &mut buf)?;
         Ok(u32::from_le_bytes(buf))
     }
+
+    /// Pin this IRQ to a specific CPU core.
+    /// Subsequent interrupts will be delivered to that core only.
+    pub fn set_affinity(&mut self, cpu: u32) -> SysResult<()> {
+        write(self.handle, &cpu.to_le_bytes())?;
+        Ok(())
+    }
 }
 
 impl Drop for Irq {

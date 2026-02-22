@@ -669,6 +669,22 @@ pub trait BusCtx {
     /// Remove a handle from the runtime's Mux.
     fn unwatch_handle(&mut self, handle: crate::syscall::Handle) -> Result<(), BusError>;
 
+    // === Managed IRQ/Timer helpers ===
+
+    /// Register a hardware IRQ. Runtime watches it in Mux.
+    /// When it fires, `handle_event(tag)` is called. Runtime auto-acks after.
+    fn watch_irq(&mut self, irq_num: u32, tag: u32) -> Result<(), BusError>;
+
+    /// Set CPU affinity for a managed IRQ (identified by tag).
+    fn set_irq_affinity(&mut self, tag: u32, cpu: u32) -> Result<(), BusError>;
+
+    /// Start a recurring timer. `handle_event(tag)` fires every `interval_ns`.
+    /// Runtime auto-rearms after `handle_event` returns.
+    fn start_timer(&mut self, tag: u32, interval_ns: u64) -> Result<(), BusError>;
+
+    /// Stop a recurring timer (identified by tag).
+    fn stop_timer(&mut self, tag: u32) -> Result<(), BusError>;
+
     // === Kernel bus ===
 
     /// Connect to a kernel bus as owner (claim it).

@@ -277,6 +277,7 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                 let r = write_supervision_child(sc, buf_ptr, buf_len);
                 (r.0, if r.1.is_empty() { PendingAction::None } else { PendingAction::SupervisionWake(r.1) })
             }
+            Object::Irq(irq) => (write_irq(irq, buf_ptr, buf_len, task_id), PendingAction::None),
             _ => (KernelError::NotSupported.to_errno(), PendingAction::None),
         }
     });
@@ -988,6 +989,25 @@ fn read_irq(irq: &mut super::IrqObject, buf_ptr: u64, buf_len: usize, task_id: u
         task_id, generation, super::poll::READABLE,
     ));
     KernelError::WouldBlock.to_errno()
+}
+
+fn write_irq(irq: &super::IrqObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    if buf_len < 4 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    // Read target CPU from user buffer (u32 LE)
+    let mut cpu_bytes = [0u8; 4];
+    if uaccess::copy_from_user(&mut cpu_bytes, buf_ptr).is_err() {
+        return KernelError::BadAddress.to_errno();
+    }
+    let cpu = u32::from_le_bytes(cpu_bytes);
+
+    if crate::kernel::irq::set_affinity(irq.irq_num(), task_id, cpu) {
+        0 // success
+    } else {
+        KernelError::PermDenied.to_errno()
+    }
 }
 
 fn close_irq(irq: super::IrqObject) {

@@ -162,7 +162,7 @@ impl ObjectType {
 
     /// Does this type support write()?
     pub fn is_writable(&self) -> bool {
-        !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process | ObjectType::BusList | ObjectType::Msi | ObjectType::Metrics | ObjectType::Irq)
+        !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process | ObjectType::BusList | ObjectType::Msi | ObjectType::Metrics)
     }
 
     /// Is this a supervision queue endpoint?
