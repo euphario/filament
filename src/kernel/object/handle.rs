@@ -122,6 +122,8 @@ pub fn default_rights(obj_type: ObjectType) -> HandleRights {
         ObjectType::SupervisionParent | ObjectType::SupervisionChild => HandleRights(
             HandleRights::READ.0 | HandleRights::WRITE.0
         ),
+        // IRQ: read only (ack/consume pending)
+        ObjectType::Irq => HandleRights::READ,
     }
 }
 

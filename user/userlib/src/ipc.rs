@@ -510,6 +510,40 @@ impl Drop for Process {
 }
 
 // ============================================================================
+// Irq - Hardware interrupt handle
+// ============================================================================
+
+pub struct Irq {
+    handle: ObjHandle,
+    irq_num: u32,
+}
+
+impl Irq {
+    /// Register for a hardware IRQ. Returns the handle for Mux watching.
+    pub fn new(irq_num: u32) -> SysResult<Self> {
+        let handle = open(ObjectType::Irq, &irq_num.to_le_bytes())?;
+        Ok(Self { handle, irq_num })
+    }
+
+    pub fn handle(&self) -> ObjHandle { self.handle }
+    pub fn irq_num(&self) -> u32 { self.irq_num }
+
+    /// Read and acknowledge: clears pending flag, re-enables IRQ at GIC.
+    /// Returns the number of coalesced interrupts.
+    pub fn ack(&mut self) -> SysResult<u32> {
+        let mut buf = [0u8; 4];
+        read(self.handle, &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+}
+
+impl Drop for Irq {
+    fn drop(&mut self) {
+        let _ = close(self.handle);
+    }
+}
+
+// ============================================================================
 // Message buffer helper
 // ============================================================================
 

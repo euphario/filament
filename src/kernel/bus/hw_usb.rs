@@ -43,6 +43,7 @@ pub const PORT_HOST_SEL: u32 = 1 << 2;
 
 /// xHCI capability registers
 pub const CAPLENGTH: usize = 0x00;
+pub const HCSPARAMS1: usize = 0x04;
 
 /// xHCI operational registers (offset from CAPLENGTH)
 pub const USBCMD: usize = 0x00;
@@ -183,6 +184,16 @@ pub fn verify_state(mac_base_addr: u64) -> bool {
     // Verify IP is not in sleep mode
     if (ippc.read32(IP_PW_STS1) & STS1_IP_SLEEP_STS) != 0 {
         crate::kerror!("bus", "usb_sleep_mode"; base = base as u64);
+        return false;
+    }
+
+    // Verify xHCI has real ports and slots (HCSPARAMS1)
+    // A dead or absent controller reads as all-zeros — no ports, no slots.
+    let hcsparams1 = mac.read32(HCSPARAMS1);
+    let max_slots = hcsparams1 & 0xFF;
+    let max_ports = (hcsparams1 >> 24) & 0xFF;
+    if max_slots == 0 || max_ports == 0 {
+        crate::kerror!("bus", "usb_no_ports"; base = base as u64, slots = max_slots as u64, ports = max_ports as u64);
         return false;
     }
 

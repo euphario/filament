@@ -118,16 +118,9 @@ fn register_mt7988_buses() {
     }
 
     // USB controllers
-    bus_create(&BusCreateInfo {
-        bus_type: bus_type::USB,
-        bus_index: 0,
-        flags: 0,
-        _pad: 0,
-        base_addr: 0x1119_0000,
-        size: 0x1_0000,
-        irq: 205, // SSUSB0
-        _reserved: [0; 4],
-    });
+    // SSUSB0 (M.2 KEY-B, bus_index 0) not registered: combo PHY shared with
+    // PCIe2 — serdes is in PCIe mode for WiFi. Enable here (with XS-PHY init)
+    // if a 5G modem is installed and PCIe2 is removed.
     bus_create(&BusCreateInfo {
         bus_type: bus_type::USB,
         bus_index: 1,

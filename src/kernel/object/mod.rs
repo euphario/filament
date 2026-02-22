@@ -408,6 +408,9 @@ pub enum Object {
 
     /// Supervision queue — child end (reads from down, writes to up)
     SupervisionChild(SupervisionChildObject),
+
+    /// Hardware IRQ handle
+    Irq(IrqObject),
 }
 
 // ============================================================================
@@ -1523,6 +1526,61 @@ impl Pollable for SupervisionChildObject {
 
     fn unsubscribe(&mut self) {
         // Same as parent - Mux handles cleanup
+    }
+}
+
+// ============================================================================
+// IRQ Object
+// ============================================================================
+
+/// Hardware IRQ handle — wraps an IRQ registration for Mux-based polling.
+///
+/// State is delegated to `irq.rs` (single source of truth):
+/// - `poll()` peeks at pending state without consuming
+/// - `read()` consumes pending and re-enables IRQ at GIC
+/// - `close()` unregisters from the IRQ table
+pub struct IrqObject {
+    /// IRQ number (GIC interrupt ID)
+    irq_num: u32,
+    /// Owner PID (for IRQ table lookups)
+    owner_pid: u32,
+    /// Wait queue for Mux integration
+    wait_queue: WaitQueue,
+}
+
+impl IrqObject {
+    pub fn new(irq_num: u32, owner_pid: u32) -> Self {
+        Self {
+            irq_num,
+            owner_pid,
+            wait_queue: WaitQueue::new(),
+        }
+    }
+
+    pub fn irq_num(&self) -> u32 { self.irq_num }
+    pub fn owner_pid(&self) -> u32 { self.owner_pid }
+    pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
+    pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
+}
+
+impl Pollable for IrqObject {
+    fn poll(&self, filter: u8) -> PollResult {
+        if (filter & poll::READABLE) == 0 {
+            return PollResult::NONE;
+        }
+        if crate::kernel::irq::check_pending_peek(self.irq_num, self.owner_pid) {
+            PollResult::readable()
+        } else {
+            PollResult::NONE
+        }
+    }
+
+    fn subscribe(&mut self, subscriber: Subscriber) {
+        self.wait_queue.subscribe(Waiter::from_subscriber(subscriber, poll::READABLE));
+    }
+
+    fn unsubscribe(&mut self) {
+        self.wait_queue.drain();
     }
 }
 

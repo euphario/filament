@@ -210,7 +210,7 @@ impl BusController {
             enum_devices: [abi::BusDevice::empty(); MAX_DEVICES_PER_BUS],
             enum_count: 0,
             bus_master_enabled: false,
-            hardware_verified: false,
+            hardware_verified: true,
             base_addr: 0,
             size: 0,
             irq: 0,

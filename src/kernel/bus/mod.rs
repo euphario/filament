@@ -506,7 +506,8 @@ pub fn process_bus_message(client_channel: ChannelId, data: &[u8]) {
 
 /// Get list of all buses for bus_list syscall
 /// Returns number of buses written to buffer.
-/// Excludes buses that failed hardware verification (stuck in Resetting after init).
+/// Excludes buses that failed hardware verification — no point exposing
+/// hardware that doesn't respond.
 pub fn get_bus_list(buf: &mut [abi::PortInfo]) -> usize {
     with_bus_registry(|registry| {
         let mut written = 0;
@@ -514,9 +515,7 @@ pub fn get_bus_list(buf: &mut [abi::PortInfo]) -> usize {
             if written >= buf.len() {
                 break;
             }
-            // Skip buses that completed init but failed hardware verification.
-            // They are stuck in Resetting and can never be claimed.
-            if bus.state() == BusState::Resetting && bus.init_complete {
+            if !bus.hardware_verified {
                 continue;
             }
             buf[written] = bus.to_port_info();
@@ -527,11 +526,11 @@ pub fn get_bus_list(buf: &mut [abi::PortInfo]) -> usize {
 }
 
 /// Get total number of buses (for sizing buffer)
-/// Matches get_bus_list() filtering — excludes failed buses.
+/// Matches get_bus_list() filtering — excludes unverified buses.
 pub fn get_bus_count() -> usize {
     with_bus_registry(|registry| {
         registry.iter()
-            .filter(|b| !(b.state() == BusState::Resetting && b.init_complete))
+            .filter(|b| b.hardware_verified)
             .count()
     })
 }

@@ -43,7 +43,7 @@ use userlib::query::{
 use service::{
     ServiceState, ServiceManager, ServiceRegistry,
     MAX_SERVICES, MAX_RESTARTS,
-    INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, FAILED_RETRY_MS,
+    INITIAL_BACKOFF_MS, MAX_BACKOFF_MS,
 };
 use ports::{PortRegistry, Ports};
 use process::{ProcessManager, SyscallProcessManager};
@@ -1252,15 +1252,7 @@ impl Devd {
                 }
             }
             ExitAction::Failed => {
-                let deadline_ns = FAILED_RETRY_MS * 1_000_000;
-                if let Some(events) = &self.events {
-                    if events.add_timer(idx as u32, deadline_ns).is_err() {
-                        uwarn!("devd", "restart_timer_add_failed"; idx = idx as u32);
-                    }
-                }
-                if let Some(service) = self.services.get_mut(idx) {
-                    service.has_restart_timer = true;
-                }
+                // Terminal — no retry. Service stays in Failed until manual intervention.
             }
             ExitAction::Stopped => {}
         }
@@ -2192,12 +2184,6 @@ impl Devd {
             };
             match service.state {
                 ServiceState::Crashed { .. } => true,
-                ServiceState::Failed { .. } => {
-                    // Reset for retry
-                    service.backoff_ms = INITIAL_BACKOFF_MS;
-                    service.last_change = now;
-                    true
-                }
                 _ => false,
             }
         };

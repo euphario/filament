@@ -175,6 +175,20 @@ pub fn check_pending(irq_num: u32, pid: u32) -> Option<u32> {
     })
 }
 
+/// Non-consuming check: returns true if an IRQ is pending for this process.
+/// Unlike check_pending(), does NOT clear the flag or re-enable the IRQ.
+/// Used by Mux polling to report readiness without consuming the event.
+pub fn check_pending_peek(irq_num: u32, pid: u32) -> bool {
+    with_irq_table(|table| {
+        for reg in table.iter() {
+            if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
+                return reg.pending;
+            }
+        }
+        false
+    })
+}
+
 /// Block waiting for an IRQ (called from syscall context)
 pub fn wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
     // Check if IRQ is already pending

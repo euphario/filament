@@ -116,6 +116,8 @@ pub enum ObjectType {
     SupervisionParent = 19,
     /// Supervision queue (child end — reads from down, writes to up)
     SupervisionChild = 20,
+    /// Hardware IRQ handle (readable, pollable via Mux)
+    Irq = 21,
 }
 
 impl ObjectType {
@@ -142,6 +144,7 @@ impl ObjectType {
             18 => Some(ObjectType::Metrics),
             19 => Some(ObjectType::SupervisionParent),
             20 => Some(ObjectType::SupervisionChild),
+            21 => Some(ObjectType::Irq),
             _ => None,
         }
     }
@@ -159,7 +162,7 @@ impl ObjectType {
 
     /// Does this type support write()?
     pub fn is_writable(&self) -> bool {
-        !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process | ObjectType::BusList | ObjectType::Msi | ObjectType::Metrics)
+        !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process | ObjectType::BusList | ObjectType::Msi | ObjectType::Metrics | ObjectType::Irq)
     }
 
     /// Is this a supervision queue endpoint?

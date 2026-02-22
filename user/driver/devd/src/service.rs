@@ -15,8 +15,6 @@ pub const MAX_SERVICES: usize = 16;
 pub const MAX_RESTARTS: u8 = 3;
 pub const INITIAL_BACKOFF_MS: u32 = 1000;
 pub const MAX_BACKOFF_MS: u32 = 30000;
-/// Time before Failed services are retried (5 minutes)
-pub const FAILED_RETRY_MS: u64 = 5 * 60 * 1000;
 
 // =============================================================================
 // Service State Machine

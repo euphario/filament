@@ -76,6 +76,7 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         ObjectType::Ring => open_ring(params_ptr, params_len),
         ObjectType::Bus => open_bus_create(params_ptr, params_len),
         ObjectType::Metrics => open_metrics(),
+        ObjectType::Irq => open_irq(params_ptr, params_len),
         // Supervision handles are created by exec_with_mailbox, not by open()
         ObjectType::SupervisionParent | ObjectType::SupervisionChild => KernelError::NotSupported.to_errno(),
     }
@@ -170,6 +171,7 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::Metrics => read_metrics(buf_ptr, buf_len, task_id),
             Object::SupervisionParent(sp) => read_supervision_parent(sp, buf_ptr, buf_len),
             Object::SupervisionChild(sc) => read_supervision_child(sc, buf_ptr, buf_len),
+            Object::Irq(irq) => read_irq(irq, buf_ptr, buf_len, task_id),
             _ => KernelError::NotSupported.to_errno(),
         }
     });
@@ -415,6 +417,7 @@ pub fn close(handle_raw: u32) -> i64 {
         Object::Ring(r) => close_ring(r, task_id),
         Object::SupervisionParent(sp) => close_supervision_parent(sp),
         Object::SupervisionChild(sc) => close_supervision_child(sc),
+        Object::Irq(irq) => close_irq(irq),
         _ => {} // No cleanup needed
     }
 
@@ -915,6 +918,80 @@ fn open_metrics() -> i64 {
         Ok(Err(e)) => e.to_errno(),
         Err(e) => e.to_errno(),
     }
+}
+
+// ============================================================================
+// IRQ Object
+// ============================================================================
+
+fn open_irq(params_ptr: u64, params_len: usize) -> i64 {
+    if params_len < 4 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    let task_id = match get_current_task_id() {
+        Some(id) => id,
+        None => return KernelError::BadHandle.to_errno(),
+    };
+
+    // Read IRQ number from params (u32 LE)
+    let mut irq_bytes = [0u8; 4];
+    if uaccess::copy_from_user(&mut irq_bytes, params_ptr).is_err() {
+        return KernelError::BadAddress.to_errno();
+    }
+    let irq_num = u32::from_le_bytes(irq_bytes);
+
+    // Register with the IRQ subsystem
+    if let Err(e) = crate::kernel::irq::register(irq_num, task_id) {
+        return match e {
+            crate::kernel::irq::IrqError::AlreadyRegistered => KernelError::Exists.to_errno(),
+            crate::kernel::irq::IrqError::TableFull => KernelError::OutOfHandles.to_errno(),
+        };
+    }
+
+    // Create IrqObject and insert into handle table
+    let obj = Object::Irq(super::IrqObject::new(irq_num, task_id));
+    match object_service().with_table_mut(task_id, |table| {
+        table.alloc(ObjectType::Irq, obj).ok_or(KernelError::OutOfHandles)
+    }) {
+        Ok(Ok(handle)) => handle.raw() as i64,
+        Ok(Err(e)) => {
+            // Undo registration on handle alloc failure
+            crate::kernel::irq::unregister(irq_num, task_id);
+            e.to_errno()
+        }
+        Err(e) => {
+            crate::kernel::irq::unregister(irq_num, task_id);
+            e.to_errno()
+        }
+    }
+}
+
+fn read_irq(irq: &mut super::IrqObject, buf_ptr: u64, buf_len: usize, task_id: u32) -> i64 {
+    if buf_len < 4 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    // Try consuming the pending IRQ
+    if let Some(count) = crate::kernel::irq::check_pending(irq.irq_num(), irq.owner_pid()) {
+        // Write count as u32 LE to user buffer
+        let count_bytes = count.to_le_bytes();
+        if uaccess::copy_to_user(buf_ptr, &count_bytes).is_err() {
+            return KernelError::BadAddress.to_errno();
+        }
+        return 4;
+    }
+
+    // Not pending — subscribe for Mux waking and return WouldBlock
+    let generation = task::Scheduler::generation_from_pid(task_id);
+    irq.wait_queue_mut().subscribe(super::Waiter::new(
+        task_id, generation, super::poll::READABLE,
+    ));
+    KernelError::WouldBlock.to_errno()
+}
+
+fn close_irq(irq: super::IrqObject) {
+    crate::kernel::irq::unregister(irq.irq_num(), irq.owner_pid());
 }
 
 /// Read metrics — mode is passed as buf_len:
@@ -2085,6 +2162,9 @@ fn poll_watched_object(obj: &Object, filter: u8, channel_id: u32) -> bool {
         }
         Object::SupervisionChild(sc) => {
             sc.poll(filter).is_ready()
+        }
+        Object::Irq(irq) => {
+            (filter & f::READABLE) != 0 && irq.poll(f::READABLE).is_ready()
         }
         _ => false,
     }

@@ -11,7 +11,7 @@ mod uboot_mtk_eth;
 use uboot_mtk_eth::*;
 use userlib::syscall::Handle;
 use userlib::mmio::{MmioRegion, DmaPool, delay_us, cache_clean, cache_invalidate};
-use userlib::ipc::Timer;
+use userlib::ipc::{Timer, Irq};
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
@@ -84,6 +84,29 @@ const FE_SRAM_OFFSET: u64 = 0x4_0000;   // MTK_ETH_SRAM_OFFSET - OLD CHIPS ONLY!
 // MT7531 Internal Switch (memory-mapped in MT7988)
 // Reference: Linux drivers/net/dsa/mt7530.h
 const GSW_BASE: u32 = 0x20000;
+
+// Switch system interrupt registers
+// Reference: Linux drivers/net/dsa/mt7530.h - MT7530_SYS_INT_EN, MT7530_SYS_INT_STS
+const SYS_INT_EN: u32 = 0x7008;   // System interrupt enable — bits [3:0] for port 0-3 link change
+const SYS_INT_STS: u32 = 0x700C;  // System interrupt status — write-1-to-clear
+const SWITCH_IRQ: u32 = 209;      // GIC SPI 177 -> IRQ 209
+
+// PDMA interrupt registers (relative to PDMA_V3_BASE = 0x6800)
+// Linux mtk_eth_soc.c mt7988_reg_map: irq_status=0x6a20, irq_mask=0x6a28
+// Subtract PDMA_V3_BASE: 0x6a20 - 0x6800 = 0x220, 0x6a28 - 0x6800 = 0x228
+const PDMA_INT_STATUS: u32 = 0x220;
+const PDMA_INT_MASK: u32   = 0x228;
+
+// PDMA interrupt bits — Linux mtk_eth_soc.h
+// MT7988 uses V2 interrupt layout: MTK_RX_DONE_INT_V2 = BIT(14)
+const PDMA_RX_DONE_INT: u32 = 1 << 14;
+
+// FE interrupt group routing register (absolute FE offset, use fe_write)
+// Routes PDMA interrupts to GIC lines
+const FE_INT_GRP: u32 = 0x20;
+
+// FE GRP2 IRQ (SPI 196 -> IRQ 228) — PDMA RX done
+const FE_GRP2_IRQ: u32 = 228;
 
 // Switch port registers (per-port, 0x100 stride)
 const MT7530_PCR_P: fn(u32) -> u32 = |p| 0x2004 + p * 0x100;  // Port Control Register
@@ -519,10 +542,15 @@ struct EthDriver {
     port_id: Option<PortId>,
     poll_timer: Option<Timer>,
     poll_tag: u32,
+    rx_irq: Option<Irq>,
+    rx_irq_tag: u32,
     rx_seq: u64,
 
     mac: [u8; 6],
     link_up: bool,
+    link_irq: Option<Irq>,
+    link_tag: u32,
+    port_link: [bool; 4],
 
     // GMAC configuration
     gmac_id: u32,           // 0, 1, or 2
@@ -1793,8 +1821,8 @@ impl EthDriver {
         // PDMA global config
         let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
         let pdma_rst = self.pdma_read(PDMA_RST_IDX_REG);
-        let pdma_int_sta = self.pdma_read(0x20);  // INT status
-        let pdma_int_en = self.pdma_read(0x28);   // INT enable
+        let pdma_int_sta = self.pdma_read(PDMA_INT_STATUS);
+        let pdma_int_en = self.pdma_read(PDMA_INT_MASK);
         udebug!("ethd", "dump_pdma"; prefix = prefix, glo = userlib::ulog::hex32(pdma_glo),
                rst = userlib::ulog::hex32(pdma_rst), int_sta = userlib::ulog::hex32(pdma_int_sta),
                int_en = userlib::ulog::hex32(pdma_int_en));
@@ -3491,12 +3519,60 @@ impl Driver for EthDriver {
         switch_info.port_subclass = port_subclass::NET_SWITCH;
         let _ = ctx.register_port_with_info(&switch_info, 0);
 
-        // Start RX poll timer (10ms)
-        if let Ok(mut timer) = Timer::new() {
-            let _ = timer.set(10_000_000);  // 10ms in ns
-            let handle = timer.handle();
-            let _ = ctx.watch_handle(handle, self.poll_tag);
-            self.poll_timer = Some(timer);
+        // Try IRQ-driven RX (MT7988 only — QEMU has no FE)
+        match Irq::new(FE_GRP2_IRQ) {
+            Ok(irq) => {
+                let handle = irq.handle();
+                let _ = ctx.watch_handle(handle, self.rx_irq_tag);
+                self.rx_irq = Some(irq);
+
+                // Route PDMA interrupts to FE interrupt group 2 (GIC SPI 196)
+                // Linux: mtk_w32(eth, 0x21021000, MTK_FE_INT_GRP)
+                self.fe_write(FE_INT_GRP, 0x21021000);
+
+                // Enable PDMA RX done interrupt
+                self.pdma_write(PDMA_INT_MASK, PDMA_RX_DONE_INT);
+
+                uinfo!("ethd", "rx_irq_enabled"; irq = FE_GRP2_IRQ);
+            }
+            Err(_) => {
+                // Fallback: 10ms poll timer (QEMU)
+                if let Ok(mut timer) = Timer::new() {
+                    let _ = timer.set(10_000_000);  // 10ms in ns
+                    let handle = timer.handle();
+                    let _ = ctx.watch_handle(handle, self.poll_tag);
+                    self.poll_timer = Some(timer);
+                }
+            }
+        }
+
+        // Set up IRQ-driven link detection (MT7988 only — fails gracefully on QEMU)
+        if self.sw.is_some() {
+            // Read initial link state from all 4 PHYs
+            for phy in 0..4u8 {
+                if let Some(status) = self.mdio_read(phy, 1) {  // BMSR
+                    self.port_link[phy as usize] = (status & 0x04) != 0;  // Link bit
+                }
+            }
+            self.link_up = self.port_link.iter().any(|&up| up);
+
+            match Irq::new(SWITCH_IRQ) {
+                Ok(irq) => {
+                    let handle = irq.handle();
+                    let _ = ctx.watch_handle(handle, self.link_tag);
+                    self.link_irq = Some(irq);
+
+                    // Clear any stale status, then enable link-change interrupts for ports 0-3
+                    self.gsw_write(SYS_INT_STS, 0x0F);
+                    self.gsw_write(SYS_INT_EN, 0x0F);
+
+                    uinfo!("ethd", "link_irq_enabled"; irq = SWITCH_IRQ);
+                }
+                Err(_) => {
+                    // QEMU or IRQ unavailable — link defaults to initial PHY state
+                    udebug!("ethd", "link_irq_unavailable"; irq = SWITCH_IRQ);
+                }
+            }
         }
 
         unotice!("ethd", "init_complete";);
@@ -3528,6 +3604,54 @@ impl Driver for EthDriver {
     }
 
     fn handle_event(&mut self, tag: u32, _handle: Handle, ctx: &mut dyn BusCtx) {
+        if tag == self.link_tag {
+            // Link-change IRQ fired
+            if let Some(ref mut irq) = self.link_irq {
+                let _ = irq.ack();
+            }
+
+            // Read which ports changed and clear status
+            let int_sts = self.gsw_read(SYS_INT_STS);
+            self.gsw_write(SYS_INT_STS, int_sts);  // Write-1-to-clear
+
+            // Update per-port link state for changed ports
+            for phy in 0..4u8 {
+                if (int_sts & (1 << phy)) != 0 {
+                    if let Some(status) = self.mdio_read(phy, 1) {  // BMSR
+                        let new_link = (status & 0x04) != 0;
+                        if new_link != self.port_link[phy as usize] {
+                            self.port_link[phy as usize] = new_link;
+                            if new_link {
+                                uinfo!("ethd", "link_up"; port = phy as u32);
+                            } else {
+                                uinfo!("ethd", "link_down"; port = phy as u32);
+                            }
+                        }
+                    }
+                }
+            }
+            self.link_up = self.port_link.iter().any(|&up| up);
+            return;
+        }
+
+        if tag == self.rx_irq_tag {
+            // Read and clear PDMA interrupt status (write-1-clear)
+            let status = self.pdma_read(PDMA_INT_STATUS);
+            self.pdma_write(PDMA_INT_STATUS, status);
+
+            // Process RX completions
+            if (status & PDMA_RX_DONE_INT) != 0 {
+                self.poll_rx(ctx);
+            }
+            self.handle_side_queries(ctx);
+
+            // Re-enable IRQ at GIC level
+            if let Some(ref mut irq) = self.rx_irq {
+                let _ = irq.ack();
+            }
+            return;
+        }
+
         if tag == self.poll_tag {
             self.poll_rx(ctx);
             self.handle_side_queries(ctx);
@@ -3598,17 +3722,6 @@ impl Driver for EthDriver {
                            rx_u = rx_uni, rx_b = rx_bcast,
                            tx_drop = tx_drop, rx_drop = rx_drop);
                 }
-
-                // Check PHY link status on all 4 ports
-                let mut link_mask = 0u32;
-                for phy in 0..4u8 {
-                    if let Some(status) = self.mdio_read(phy, 1) {  // BMSR
-                        if (status & 0x04) != 0 {  // Link bit
-                            link_mask |= 1 << phy;
-                        }
-                    }
-                }
-                uinfo!("ethd", "phy_links"; mask = userlib::ulog::hex32(link_mask));
 
                 // Read FE status registers to debug packet path
                 // PSE buffer status, GDM counters
@@ -3848,9 +3961,14 @@ static mut DRIVER: EthDriver = EthDriver {
     port_id: None,
     poll_timer: None,
     poll_tag: 1,
+    rx_irq: None,
+    rx_irq_tag: 3,
     rx_seq: 0,
     mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
     link_up: false,
+    link_irq: None,
+    link_tag: 2,
+    port_link: [false; 4],
     gmac_id: 0,             // GMAC0 for internal switch (Linux DTS: gmac0 -> switch port 6)
     use_bridge_mode: true,  // Default to bridge mode for internal switch
     poll_count: 0,

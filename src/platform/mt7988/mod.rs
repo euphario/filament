@@ -226,6 +226,14 @@ pub mod irq {
     /// DUAL_MODE first-half timeout fires this as Group 0 FIQ
     pub const WDT: u32 = 123;
 
+    /// Internal switch link-change interrupt (SPI 177 -> IRQ 209)
+    /// Fires when any port's PHY link status changes
+    pub const SWITCH: u32 = 209;
+
+    /// Frame Engine interrupt group 2 (SPI 196 -> IRQ 228)
+    /// Used for PDMA RX done notifications
+    pub const FE_GRP2: u32 = 228;
+
     /// Convert SPI number to GIC IRQ number
     #[inline]
     pub const fn spi_to_irq(spi: u32) -> u32 {
