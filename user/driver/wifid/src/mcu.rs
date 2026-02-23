@@ -89,6 +89,7 @@ pub const MCU_UNI_CMD_BF: u16 = 0x33;
 pub const MCU_UNI_CMD_FIXED_RATE_TABLE: u16 = 0x40;
 pub const MCU_UNI_CMD_RRO: u16 = 0x57;
 pub const MCU_UNI_CMD_OFFCH_SCAN_CTRL: u16 = 0x58; // mt76_connac_mcu.h:1307
+pub const MCU_UNI_CMD_ALL_STA_INFO: u16 = 0x6e;
 pub const MCU_UNI_CMD_SDO: u16 = 0x88;
 
 /// UNI TLV tags — from mt7996/mcu.h
@@ -487,7 +488,7 @@ impl Mt7996Dev {
 
         // Wait for MCU response on the corresponding RX queue
         if wait {
-            self.wait_rx_response(ring, rx_snap, 5000)?;
+            let _ = self.wait_rx_response(ring, rx_snap, seq, 5000)?;
         }
 
         Ok(())
@@ -517,32 +518,82 @@ impl Mt7996Dev {
         self.snapshot_rx_idx(MCU_WM_RX_REGS)
     }
 
-    /// Wait for MCU response — polls rx_regs DMA_IDX until it advances past pre_send_dma_idx.
-    /// If rx_buf_virt is non-zero, reads the response status and logs errors.
-    /// Also polls the alternate queue (q0 if polling q1, vice versa) to detect misrouted responses.
-    pub fn wait_rx_response(&self, ring: &TxRing, pre_send_dma_idx: u32, timeout_ms: u32) -> Result<(), i32> {
+    /// Wait for MCU response — polls rx_regs DMA_IDX until a response with matching seq arrives.
+    ///
+    /// Fire-and-forget WA commands (mcu_wa_cmd, mcu_set_mwds) don't consume their
+    /// RX responses. Those responses sit in the shared WA RX queue and may arrive
+    /// at the position we're monitoring. We skip responses with non-matching seq
+    /// numbers and keep scanning until we find ours or timeout.
+    ///
+    /// Linux matches responses by seq number (mt76_mcu_wait_response + parse_response),
+    /// not by eid. Different response types (UNI, WA, QUERY) may use different eids.
+    ///
+    /// Response format (UNI commands):
+    ///   mt76_connac2_mcu_rxd (44 bytes):
+    ///     rxd[8] (32B) + len(2) + pkt_type(2) + eid(1) + seq(1) + option(1) + rsv(1) + ext_eid(1) + rsv[3]
+    ///   mt7996_mcu_uni_event (8 bytes):
+    ///     cid(1) + rsv[3] + status(le32)
+    ///
+    /// Linux checks status for DEV_INFO_UPDATE, BSS_INFO_UPDATE, STA_REC_UPDATE, RRO.
+    /// Non-zero status = firmware rejected the command.
+    pub fn wait_rx_response(&self, ring: &TxRing, pre_send_dma_idx: u32, expected_seq: u8, timeout_ms: u32) -> Result<u32, i32> {
         // Snapshot the alternate RX queue to detect misrouted responses
         let alt_regs = if ring.rx_regs == MCU_WA_RX_REGS { MCU_WM_RX_REGS } else { MCU_WA_RX_REGS };
         let alt_snap = self.mt76_rr(alt_regs + MT_QUEUE_DMA_IDX);
 
+        let rx_ndesc: u32 = if ring.rx_regs == MCU_WA_RX_REGS {
+            MT7996_RX_MCU_RING_SIZE_WA
+        } else {
+            MT7996_RX_MCU_RING_SIZE
+        };
+
+        // Current position to check in the RX ring
+        let mut check_pos = pre_send_dma_idx;
+
         for _ in 0..timeout_ms {
             let dma_idx = self.mt76_rr(ring.rx_regs + MT_QUEUE_DMA_IDX);
-            if dma_idx != pre_send_dma_idx {
-                // Parse MCU response status if buffer info available
+            if dma_idx != check_pos {
+                // New response(s) available — check from check_pos
                 if ring.rx_buf_virt != 0 {
-                    let buf_ptr = (ring.rx_buf_virt + pre_send_dma_idx as u64 * ring.rx_buf_size as u64) as *const u8;
-                    // mt7996_mcu_rxd is 44 bytes, then uni_event: {cid(u8), rsv[3], status(le32)}
-                    // Dump response header for debugging
-                    let w11 = unsafe { core::ptr::read_volatile(buf_ptr.add(44) as *const u32) }; // cid+rsv or status
-                    let w12 = unsafe { core::ptr::read_volatile(buf_ptr.add(48) as *const u32) }; // status or data
-                    let rxd_seq = unsafe { core::ptr::read_volatile(buf_ptr.add(37)) };
+                    let buf_ptr = (ring.rx_buf_virt + check_pos as u64 * ring.rx_buf_size as u64) as *const u8;
+
+                    // MCU RXD header fields
                     let rxd_eid = unsafe { core::ptr::read_volatile(buf_ptr.add(36)) };
+                    let rxd_seq = unsafe { core::ptr::read_volatile(buf_ptr.add(37)) };
                     let rxd_ext_eid = unsafe { core::ptr::read_volatile(buf_ptr.add(40)) };
-                    udebug!("mcu", "rx_resp"; snap = pre_send_dma_idx, seq = rxd_seq, eid = rxd_eid, ext = rxd_ext_eid, w11 = w11, w12 = w12);
+
+                    if rxd_seq != expected_seq {
+                        // Response for a different command (fire-and-forget WA cmd, async event).
+                        // Skip it and check the next position.
+                        udebug!("mcu", "rx_skip"; pos = check_pos, eid = rxd_eid,
+                            seq = rxd_seq, expected = expected_seq, ext = rxd_ext_eid);
+                        check_pos = (check_pos + 1) % rx_ndesc;
+                        continue;
+                    }
+
+                    // Status check: only valid for UNI event responses (eid=1).
+                    // Linux mt7996_mcu_parse_response() only checks status for
+                    // DEV_INFO_UPDATE, BSS_INFO_UPDATE, STA_REC_UPDATE, RRO —
+                    // all of which return eid=1 (MCU_UNI_EVENT_RESULT).
+                    // QUERY responses may use different eid values.
+                    if rxd_eid == 1 {
+                        let resp_cid = unsafe { core::ptr::read_volatile(buf_ptr.add(44)) };
+                        let status = unsafe { core::ptr::read_volatile(buf_ptr.add(48) as *const u32) };
+                        let status = u32::from_le(status);
+
+                        if status != 0 {
+                            uerror!("mcu", "cmd_REJECTED"; cid = resp_cid, status = status,
+                                seq = rxd_seq, eid = rxd_eid, ext = rxd_ext_eid);
+                            return Err(status as i32);
+                        }
+                    }
+
+                    udebug!("mcu", "rx_ok"; snap = pre_send_dma_idx, pos = check_pos,
+                        seq = rxd_seq, eid = rxd_eid, ext = rxd_ext_eid);
                 } else {
                     udebug!("mcu", "rx_ok"; snap = pre_send_dma_idx, now = dma_idx);
                 }
-                return Ok(());
+                return Ok(check_pos);
             }
             userlib::delay_ms(1);
         }
@@ -554,7 +605,7 @@ impl Mt7996Dev {
         let q2 = self.mt76_rr(rx_base + 2 * MT_RING_SIZE + MT_QUEUE_DMA_IDX);
         let q3 = self.mt76_rr(rx_base + 3 * MT_RING_SIZE + MT_QUEUE_DMA_IDX);
         let alt_now = self.mt76_rr(alt_regs + MT_QUEUE_DMA_IDX);
-        uerror!("mcu", "rx_response_timeout"; snap = pre_send_dma_idx, q0 = q0, q1 = q1, q2 = q2, q3 = q3, alt_snap = alt_snap, alt_now = alt_now);
+        uerror!("mcu", "rx_response_timeout"; snap = pre_send_dma_idx, check = check_pos, seq = expected_seq, q0 = q0, q1 = q1, q2 = q2, q3 = q3, alt_snap = alt_snap, alt_now = alt_now);
         Err(-1)
     }
 
@@ -900,7 +951,9 @@ impl Mt7996Dev {
         // MCU_WM_UNI_CMD_QUERY(REG_ACCESS)
         let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_REG_ACCESS as u32) | CMD_FIELD_WM;
 
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)?;
+        // Send without waiting — we call wait_rx_response ourselves to get actual position
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000)?;
 
         // Read result from RX buffer
         // Response layout: RXD(44) + {rsv(4) + tag(2) + len(2) + idx(2) + rsv(2) + ofs(4) + data(4)}
@@ -908,7 +961,7 @@ impl Mt7996Dev {
         if ring.rx_buf_virt == 0 {
             return Err(-1);
         }
-        let buf_ptr = (ring.rx_buf_virt + rx_snap as u64 * ring.rx_buf_size as u64) as *const u8;
+        let buf_ptr = (ring.rx_buf_virt + resp_pos as u64 * ring.rx_buf_size as u64) as *const u8;
         let val = unsafe {
             u32::from_le(core::ptr::read_volatile(buf_ptr.add(60) as *const u32))
         };
@@ -977,17 +1030,19 @@ impl Mt7996Dev {
         data[9] = 2;
         // die_idx = 0 (already zero)
 
-        // Snapshot RX index before sending — need this to read response buffer
+        // Snapshot RX index before sending — need this to find response buffer
         let rx_snap = self.snapshot_rx_idx(ring.rx_regs);
 
         // MCU_WM_UNI_CMD_QUERY(EFUSE_CTRL) = CMD_FIELD_UNI | CMD_FIELD_QUERY | CMD_FIELD_WM | 0x2d
         let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
 
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)?;
+        // Send without waiting — we call wait_rx_response ourselves to get actual position
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000)?;
 
         // Read response: free_block_num at RXD(44) + offset 8 = byte 52
         if ring.rx_buf_virt != 0 {
-            let buf_ptr = (ring.rx_buf_virt + rx_snap as u64 * ring.rx_buf_size as u64) as *const u8;
+            let buf_ptr = (ring.rx_buf_virt + resp_pos as u64 * ring.rx_buf_size as u64) as *const u8;
             let free_blocks = unsafe { core::ptr::read_volatile(buf_ptr.add(52)) };
             udebug!("mcu", "efuse_free_blocks"; count = free_blocks);
             Ok(free_blocks)
@@ -1029,13 +1084,15 @@ impl Mt7996Dev {
         // MCU_WM_UNI_CMD_QUERY(EFUSE_CTRL) = CMD_FIELD_UNI | CMD_FIELD_QUERY | CMD_FIELD_WM | 0x2d
         let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
 
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)?;
+        // Send without waiting — we call wait_rx_response ourselves to get actual position
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000)?;
 
         // Read response from RX buffer
         if ring.rx_buf_virt == 0 {
             return Err(-1);
         }
-        let buf_ptr = (ring.rx_buf_virt + rx_snap as u64 * ring.rx_buf_size as u64) as *const u8;
+        let buf_ptr = (ring.rx_buf_virt + resp_pos as u64 * ring.rx_buf_size as u64) as *const u8;
 
         // Dump first 16 u32s of response payload (after 44-byte RXD) for debugging
         let w0 = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(44) as *const u32)) };
@@ -1634,8 +1691,10 @@ impl Mt7996Dev {
         data[2..4].copy_from_slice(&3u16.to_le_bytes());
         // is_tlv_append = 1
         data[4] = 1;
-        // muar_idx = omac_idx
-        data[5] = omac_idx;
+        // muar_idx: Linux mt76_connac_mcu.c:280-286
+        // For BMC STA (!wcid->sta && !wcid->sta_disabled), muar_idx = 0x0e.
+        // This tells firmware to use the wildcard MUAR entry, not a specific OMAC.
+        data[5] = 0x0e;
         // wlan_idx_hi (high 8 bits)
         data[6] = (wlan_idx >> 8) as u8;
         // rsv = 0
@@ -2123,5 +2182,67 @@ impl Mt7996Dev {
 
         udebug!("mcu", "background_chain_ctrl"; scan_mode = scan_mode, channel = channel);
         self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)  // wait=false — mcu.c:3657
+    }
+
+    /// Query all STA info — periodic heartbeat to firmware.
+    /// Linux: mt7996/mcu.c:4741-4756 mt7996_mcu_get_all_sta_info()
+    /// Called every 500ms from mt7996_mac_work() (HZ/10 interval × 5 ticks).
+    /// MCU_WM_UNI_CMD(ALL_STA_INFO), wait=false (fire and forget).
+    pub fn mcu_get_all_sta_info(&self, ring: &mut TxRing, tag: u16, seq: u8) -> Result<(), i32> {
+        let mut data = [0u8; 8];
+        // _rsv[4] = 0 (uni_header)
+        data[4..6].copy_from_slice(&tag.to_le_bytes());
+        data[6..8].copy_from_slice(&4u16.to_le_bytes()); // len = sizeof(req) - 4 = 4
+
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_ALL_STA_INFO as u32) | CMD_FIELD_WM;
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)
+    }
+
+    /// Read and clear channel MIB counters (TX time, RX time, OBSS airtime, non-WiFi time).
+    /// Linux: mt7996/mcu.c:3948-4025 mt7996_mcu_get_chan_mib_info()
+    /// Called every 100ms from mt7996_mac_work() via mt76_update_survey().
+    ///
+    /// Without periodic clearing, firmware CCA counters accumulate indefinitely,
+    /// causing the MAC to assess the channel as permanently busy and stop TX
+    /// after ~42 seconds.
+    ///
+    /// MCU_WM_UNI_CMD_QUERY(GET_MIB_INFO) — Linux uses wait=true to read
+    /// response, but we use wait=false since we only need the side effect
+    /// of clearing the counters. The response arrives on the MCU WM RX ring
+    /// and is silently recycled.
+    pub fn mcu_get_chan_mib_info(&self, ring: &mut TxRing, band: u8, seq: u8) -> Result<(), i32> {
+        // Request layout (36 bytes):
+        //   hdr:  { band: u8, __rsv: [u8; 3] }                      = 4 bytes
+        //   data: [{ tag: le16, len: le16, offs: le32 }; 4]          = 32 bytes
+        // Source: mt7996/mcu.c:3957-3969
+        let mut data = [0u8; 36];
+
+        // hdr.band — mcu.c:3968
+        data[0] = band;
+        // data[1..4] = 0 (__rsv)
+
+        // Four MIB entries — mcu.c:3983-3987
+        // Each: tag=UNI_CMD_MIB_DATA(0), len=8, offs=UNI_MIB_*
+        let offsets: [u32; 4] = [
+            UNI_MIB_TX_TIME,       // mcu.h:280
+            UNI_MIB_RX_TIME,       // mcu.h:281
+            UNI_MIB_OBSS_AIRTIME,  // mcu.h:278
+            UNI_MIB_NON_WIFI_TIME, // mcu.h:279
+        ];
+
+        for i in 0..4 {
+            let base = 4 + i * 8; // offset into data[]
+            data[base..base + 2].copy_from_slice(&UNI_CMD_MIB_DATA.to_le_bytes()); // tag
+            data[base + 2..base + 4].copy_from_slice(&8u16.to_le_bytes());          // len = sizeof(data[i]) = 8
+            data[base + 4..base + 8].copy_from_slice(&offsets[i].to_le_bytes());    // offs
+        }
+
+        // MCU_WM_UNI_CMD_QUERY(GET_MIB_INFO) — mcu.c:3989
+        // QUERY variant: CMD_FIELD_UNI | CMD_FIELD_QUERY | cmd_id | CMD_FIELD_WM
+        let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_GET_MIB_INFO as u32) | CMD_FIELD_WM;
+
+        // wait=false: we don't need the response data, just the clearing side-effect.
+        // The response will arrive on MCU WM RX and be recycled by rx_process_mcu().
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)
     }
 }

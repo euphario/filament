@@ -332,6 +332,91 @@ impl Mt7996Dev {
     // Source: mcu.c:3559-3572
     // ========================================================================
 
+    // ========================================================================
+    // mac_update_stats() — EXACT Linux translation
+    // Source: mac.c:2743-2882 mt7996_mac_update_stats()
+    //
+    // Reads all hardware MIB registers (which are read-to-clear) every 500ms.
+    // Without periodic clearing, accumulated counters may cause CCA/MAC issues.
+    // We don't track the values — just reading them clears the hardware.
+    // ========================================================================
+
+    pub fn mac_update_stats(&self, band: usize) {
+        use crate::regs::*;
+
+        // All MIB registers in mt7996_mac_update_stats() — mac.c:2751-2881
+        // Reading each register clears it (read-to-clear hardware design)
+        let mib_base = WF_MIB_BASE[band];
+
+        // Core counters — mac.c:2751-2767
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR1_OFS);   // FCS error
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR33_OFS);  // RX FIFO full
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR31_OFS);  // RX MPDU
+        let _ = self.reg_rr(mib_base + MT_MIB_SDR6_OFS);    // Channel idle
+        let _ = self.reg_rr(mib_base + MT_MIB_RVSR0_OFS);   // RX vec mismatch
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR35_OFS);  // RX delimiter fail
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR36_OFS);  // RX len mismatch
+
+        // TX counters — mac.c:2772-2782
+        let _ = self.reg_rr(mib_base + MT_MIB_TSCR0_OFS);   // TX AMPDU
+        let _ = self.reg_rr(mib_base + MT_MIB_TSCR2_OFS);   // TX stop queue empty
+        // NOTE: TSCR3 (TX MPDU attempts) and TSCR4 (TX MPDU success) intentionally
+        // NOT read here — they're read-to-clear and we read them in bcn_diag.
+
+        // RX AMPDU — mac.c:2784-2794
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR27_OFS);  // RX AMPDU count
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR28_OFS);  // RX AMPDU bytes
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR29_OFS);  // RX AMPDU valid subframe
+        let _ = self.reg_rr(mib_base + MT_MIB_RSCR30_OFS);  // RX AMPDU valid subframe bytes
+
+        // TX RWP — mac.c:2796-2800
+        let _ = self.reg_rr(mib_base + MT_MIB_SDR27_OFS);   // TX RWP fail
+        let _ = self.reg_rr(mib_base + MT_MIB_SDR28_OFS);   // TX RWP need
+
+        // RX pf drop — mac.c:2802-2803 (UMIB register, different base)
+        let _ = self.reg_rr(mt_umib_rpdcr(band as u32));
+
+        // RX vec queue overflow — mac.c:2805-2806
+        let _ = self.reg_rr(mib_base + MT_MIB_RVSR1_OFS);
+
+        // RX BA — mac.c:2808-2809
+        let _ = self.reg_rr(mib_base + MT_MIB_TSCR1_OFS);
+
+        // Beamforming — mac.c:2811-2842
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR0_OFS);
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR1_OFS);
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR2_OFS);
+        let _ = self.reg_rr(mib_base + MT_MIB_TSCR5_OFS);   // TX MU MPDU
+        let _ = self.reg_rr(mib_base + MT_MIB_TSCR6_OFS);   // TX MU acked MPDU
+        let _ = self.reg_rr(mib_base + MT_MIB_TSCR7_OFS);   // TX SU acked MPDU
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR3_OFS);
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR4_OFS);
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR5_OFS);
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR6_OFS);
+
+        // ETBF feedback — mac.c:2845-2848
+        let _ = self.reg_rr(mt_etbf_rx_fb_cont(band));
+
+        // BF trigger/completion — mac.c:2850-2854
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR7_OFS);
+        let _ = self.reg_rr(mib_base + MT_MIB_BSCR17_OFS);
+
+        // TX AGG counts (16 entries) — mac.c:2856-2860
+        for i in 0..16u32 {
+            let _ = self.reg_rr(mib_base + MT_MIB_TRDR1_OFS + (i << 2));
+        }
+
+        // RTS/ACK fail — mac.c:2862-2876
+        // NOTE: BTSCR0/5/6 (beacon TX counters) intentionally NOT read here —
+        // they're read-to-clear and we read them in bcn_diag for debugging.
+        let _ = self.reg_rr(mib_base + MT_MIB_BFTFCR_OFS);  // ACK fail
+    }
+
+    // ========================================================================
+    // mt7996_driver_own() — EXACT Linux translation
+    // Source: mcu.c:3559-3572
+    // ========================================================================
+
     pub fn mt7996_driver_own(&self, band: u32) -> Result<(), i32> {
         self.mt76_wr(mt_top_lpcr_host_band(band), MT_TOP_LPCR_HOST_DRV_OWN);
 

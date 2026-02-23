@@ -14,10 +14,14 @@ use crate::mcu::{dl_mode, fw_feature, fw_start, gen_dl_mode};
 // Embedded firmware images (loaded at compile time)
 // ============================================================================
 
-pub static FW_ROM_PATCH: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_rom_patch.bin");
-pub static FW_WM: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_wm.bin");
+// BPI-R4 is a 233 variant (dual-ADIE TBTC, 2+3+3 chains)
+// Detected via MT_PAD_GPIO bit 19 — confirmed on hardware
+pub static FW_ROM_PATCH: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_rom_patch_233.bin");
+pub static FW_WM: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_wm_233.bin");
+pub static FW_WA: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_wa_233.bin");
+
+// Shared (same for both variants)
 pub static FW_DSP: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_dsp.bin");
-pub static FW_WA: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_wa.bin");
 pub static FW_EEPROM: &[u8] = include_bytes!("../../../../firmware/mediatek/mt7996/mt7996_eeprom.bin");
 
 // ============================================================================

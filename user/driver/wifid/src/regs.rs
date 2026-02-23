@@ -156,9 +156,10 @@ pub const MT_SWDEF_NORMAL_MODE: u32 = 0;
 pub const MT_ADIE_CHIP_ID_0: u32 = 0x0f00002c;
 pub const MT_ADIE_CHIP_ID_1: u32 = 0x1f00002c;
 
-// GPIO pad register — init.c:1160 variant detection
+// GPIO pad register — init.c:1115-1143 variant detection
 pub const MT_PAD_GPIO: u32 = 0x700056f0;
 pub const MT_PAD_GPIO_ADIE_COMB_MASK: u32 = 0x3 << 15;
+pub const MT_PAD_GPIO_2ADIE_TBTC: u32 = 1 << 19; // BIT(19) — set = 233 variant
 
 // MCU REG_ACCESS command — mt76_connac_mcu.h:1278
 pub const MCU_UNI_CMD_REG_ACCESS: u16 = 0x0d;
@@ -184,7 +185,8 @@ pub const MT_QUEUE_DMA_IDX: u32 = 0xc;
 pub const MT_DMA_CTL_SD_LEN0: u32 = 0x3fff_0000;
 pub const MT_DMA_CTL_LAST_SEC0: u32 = 1 << 30;
 pub const MT_DMA_CTL_DMA_DONE: u32 = 1u32 << 31;
-pub const MT_DMA_CTL_SDP0_H: u32 = 0xF;
+pub const MT_DMA_CTL_SDP0_H: u32 = 0xF;           // GENMASK(3,0) — buf0 addr[35:32]
+pub const MT_DMA_CTL_SDP1_H: u32 = 0xF << 16;     // GENMASK(19,16) — buf1 addr[35:32]
 
 // ============================================================================
 // Ring sizes from Linux mt7996.h
@@ -246,7 +248,18 @@ pub const MT_INT_TX_DONE_BAND0: u32 = 1 << 30;
 pub const MT_INT_TX_DONE_BAND1: u32 = 1u32 << 31;
 pub const MT_INT_MCU_CMD: u32 = 1 << 29;
 
+// MCU command register — firmware WDT and error status
+// Linux: mt7996/regs.h:610-619
+pub const MT_MCU_CMD: u32 = mt_wfdma0(0x1f0);
+pub const MT_MCU_CMD_WDT_MASK: u32 = (1u32 << 31) | (1u32 << 30); // WA_WDT | WM_WDT
+pub const MT_MCU_CMD_ERROR_MASK: u32 = 0x3E; // GENMASK(5,1) — firmware error bits
+
 pub const MT_INT_RX_DONE_MCU: u32 = MT_INT_RX_DONE_WM | MT_INT_RX_DONE_WA;
+
+/// Combined mask of all RX done interrupt bits
+pub const MT_INT_RX_DONE_ALL: u32 = MT_INT_RX_DONE_WM | MT_INT_RX_DONE_WA
+    | MT_INT_RX_DONE_WA_MAIN | MT_INT_RX_DONE_WA_TRI
+    | MT_INT_RX_DONE_BAND0 | MT_INT_RX_DONE_BAND2;
 pub const MT_INT_TX_DONE_MCU: u32 = MT_INT_TX_DONE_MCU_WA | MT_INT_TX_DONE_MCU_WM | MT_INT_TX_DONE_FWDL;
 
 // HIF2 interrupt registers
@@ -306,10 +319,17 @@ pub const MT_PLE_BASE: u32 = 0x820c0000;
 pub const MT_PLE_FL_Q_EMPTY: u32 = MT_PLE_BASE + 0x360;
 // FL_Q_CTRL: write (pid<<10 | qid<<24 | BIT(31)) to query queue depth
 pub const MT_PLE_FL_Q0_CTRL: u32 = MT_PLE_BASE + 0x3e0;
+pub const MT_PLE_FL_Q2_CTRL: u32 = MT_PLE_BASE + 0x3e8;
 pub const MT_PLE_FL_Q3_CTRL: u32 = MT_PLE_BASE + 0x3ec;
+// Free page counters — debugfs.c
+pub const MT_PLE_FREEPG_CNT: u32 = MT_PLE_BASE + 0x380;
+pub const MT_PLE_FREEPG_HEAD_TAIL: u32 = MT_PLE_BASE + 0x384;
+pub const MT_PLE_HIF_PG_INFO: u32 = MT_PLE_BASE + 0x388;
 
 // WF_TMAC (TX MAC) — mmio.c:23, regs.h:368-383
 pub const WF_TMAC_BASE: [u32; 3] = [0x820e4000, 0x820f4000, 0x830e4000];
+// TCR0 — TX control register — regs.h:368
+pub const MT_TMAC_TCR0_OFS: u32 = 0x0;
 // Timeout/IFS timing registers — mac.c:2010-2040 mt7996_mac_set_timing()
 pub const MT_TMAC_CDTR_OFS: u32 = 0x0c8;  // CCK detection timeout — regs.h:374
 pub const MT_TMAC_ODTR_OFS: u32 = 0x0cc;  // OFDM detection timeout — regs.h:377
@@ -378,6 +398,10 @@ pub const MT_WTBLOFF_RSCR_RCPI_PARAM: u32 = 0x3 << 24;        // GENMASK(25,24)
 pub const MT_AGG_ACR4_OFS: u32 = 0x3c;
 pub const MT_AGG_ACR_PPDU_TXS2H: u32 = 1 << 1;
 
+// NOTE: PSE registers (0x820c8xxx) are NOT host-accessible on MT7996.
+// Reads return 0xDEADBEEF. Linux's MT7996 driver never defines PSE register addresses.
+// PSE is firmware-internal; use PLE registers (0x820c0xxx) for host diagnostics.
+
 // MDP (global) — from regs.h
 pub const MT_MDP_BASE: u32 = 0x820cc000;
 pub const MT_MDP_DCR2: u32 = MT_MDP_BASE + 0x8e8;
@@ -387,6 +411,10 @@ pub const MT_MDP_DCR2_RX_TRANS_SHORT: u32 = 1 << 2;
 pub const MT_WTBLON_TOP_BASE: u32 = 0x820d4000;
 /// MT7996 uses __OFFS(WTBL_UPDATE) = 0x380 — regs.h
 pub const MT_WTBL_UPDATE: u32 = MT_WTBLON_TOP_BASE + 0x380;
+// WTBL indirect read — regs.h
+pub const MT_WTBL_ITCR: u32 = MT_WTBLON_TOP_BASE + 0x3b0;
+pub const MT_WTBL_ITDR0: u32 = MT_WTBLON_TOP_BASE + 0x3b8;
+pub const MT_WTBL_ITDR1: u32 = MT_WTBLON_TOP_BASE + 0x3bc;
 pub const MT_WTBL_UPDATE_WLAN_IDX: u32 = 0xFFF;               // GENMASK(11,0)
 pub const MT_WTBL_UPDATE_ADM_COUNT_CLEAR: u32 = 1 << 14;
 pub const MT_WTBL_UPDATE_BUSY: u32 = 1u32 << 31;
@@ -544,11 +572,58 @@ pub const MT_TXD_SIZE: usize = 32;
 /// Beacon queue index — mt76_connac3_mac.h:16
 pub const MT_LMAC_BCN0: u8 = 0x12;
 
+/// TX packet format: cut-through — mt76_connac3_mac.h:175
+pub const MT_TX_TYPE_CT: u8 = 0;
 /// TX packet format: firmware — mt76_connac3_mac.h:172
 pub const MT_TX_TYPE_FW: u8 = 3;
 
 /// Header format: 802.11 — mt76_connac3_mac.h:167
 pub const MT_HDR_FORMAT_802_11: u8 = 2;
+
+// NOTE: There is NO LONG_FORMAT bit in connac3 (MT7996).
+// All TXDs are 8 DWORDs (32 bytes). BIT(13) of TXD1 is TGID[0] (band index).
+// Setting BIT(13) routes frames to band 1 instead of band 0!
+// Source: mt76_connac3_mac.h — MT_TXD1_TGID = GENMASK(13,12)
+
+// NOTE: VTA is in TXD6 BIT(28) (MT_TXD6_VTA), NOT in TXD1!
+// TXD1 bit 28 falls within OWN_MAC GENMASK(30,25). Setting it corrupts
+// OWN_MAC from 0 to 8, causing firmware to drop all frames.
+// The old MT_TXD1_VTA constant was WRONG and has been removed.
+
+/// ALTX queue index for management frames — mt76_connac3_mac.h:15
+pub const MT_LMAC_ALTX0: u8 = 0x10;
+
+// ============================================================================
+// CT mode TXP (TX Packet) — mt76_connac3_mac.h, mt76_connac.h
+// In CT mode (PKT_FMT=0), a fw_txp follows the 32-byte TXD. The MAC reads
+// the TXP to find buffer pointers for the actual frame data.
+// ============================================================================
+
+/// CT info flags — mt76_connac3_mac.h:207-212
+pub const MT_CT_INFO_APPLY_TXD: u16 = 1 << 0;
+pub const MT_CT_INFO_MGMT_FRAME: u16 = 1 << 2;
+pub const MT_CT_INFO_NONE_CIPHER_FRAME: u16 = 1 << 3;
+pub const MT_CT_INFO_FROM_HOST: u16 = 1 << 7;
+
+/// CT parse length — first N bytes of frame copied to descriptor buf1
+/// for firmware header parsing. Source: mt76_connac3_mac.h:292
+pub const MT_CT_PARSE_LEN: usize = 72;
+
+/// fw_txp structure size (packed) — mt76_connac.h:135-143
+/// Layout: flags(2) + token(2) + bss_idx(1) + rept_wds_wcid(2) + nbuf(1) +
+///         buf[6](24) + len[6](12) = 44 bytes
+pub const MT_FW_TXP_SIZE: usize = 44;
+
+/// Total TXWI size = TXD + TXP — mt7996/mmio.c:820-821
+pub const MT_TXWI_SIZE: usize = MT_TXD_SIZE + MT_FW_TXP_SIZE; // 76
+
+/// DMA descriptor ctrl — SD_LEN1 and LAST_SEC1 for 2-buffer mode
+/// ctrl[13:0] = SD_LEN1, ctrl[14] = LAST_SEC1
+pub const MT_DMA_CTL_SD_LEN1_MASK: u32 = 0x3FFF;
+pub const MT_DMA_CTL_LAST_SEC1: u32 = 1 << 14;
+
+/// TXD3 broadcast/multicast flag — mt76_connac3_mac.h
+pub const MT_TXD3_BCM: u32 = 1 << 4;
 
 // ============================================================================
 // MIB counter registers — from regs.h
@@ -587,6 +662,54 @@ pub const MT_MIB_RSCR33_OFS: u32 = 0x96c;
 // RX delimiter fail — mmio.c:45 offset 0x974 for MT7996
 pub const MT_MIB_RSCR35_OFS: u32 = 0x974;
 
+// Beacon TX counters — debugfs.c
+pub const MT_MIB_BTSCR0_OFS: u32 = 0x5e0;
+pub const MT_MIB_BTSCR5_OFS: u32 = 0x788;
+pub const MT_MIB_BTSCR6_OFS: u32 = 0x798;
+
+// Beacon statistics — debugfs.c
+pub const MT_MIB_BSCR0_OFS: u32 = 0x9cc;
+pub const MT_MIB_BSCR1_OFS: u32 = 0x9d0;
+pub const MT_MIB_BSCR2_OFS: u32 = 0x9d4;
+pub const MT_MIB_BSCR3_OFS: u32 = 0x9d8;
+pub const MT_MIB_BSCR4_OFS: u32 = 0x9dc;
+pub const MT_MIB_BSCR17_OFS: u32 = 0xa10;
+
+// TX AMPDU attempts — regs.h
+pub const MT_MIB_TSCR5_OFS: u32 = 0x6c4;
+pub const MT_MIB_TSCR6_OFS: u32 = 0x6c8;
+pub const MT_MIB_TSCR7_OFS: u32 = 0x6d0;
+
+// Additional MIB registers — mac.c:2743-2882 mt7996_mac_update_stats()
+// All offsets from mt7996_offs[] in mmio.c (MT7996 variant)
+pub const MT_MIB_TSCR1_OFS: u32 = 0x6b4;   // RX BA count
+pub const MT_MIB_TSCR2_OFS: u32 = 0x6b8;   // TX stop queue empty
+pub const MT_MIB_SDR27_OFS: u32 = 0x080;    // TX RWP fail
+pub const MT_MIB_SDR28_OFS: u32 = 0x084;    // TX RWP need
+pub const MT_MIB_RSCR27_OFS: u32 = 0x954;   // RX AMPDU count
+pub const MT_MIB_RSCR28_OFS: u32 = 0x958;   // RX AMPDU bytes
+pub const MT_MIB_RSCR29_OFS: u32 = 0x95c;   // RX AMPDU valid subframe
+pub const MT_MIB_RSCR30_OFS: u32 = 0x960;   // RX AMPDU valid subframe bytes
+pub const MT_MIB_RSCR36_OFS: u32 = 0x978;   // RX len mismatch
+pub const MT_MIB_RVSR1_OFS: u32 = 0x724;    // RX vec queue overflow
+pub const MT_MIB_BSCR5_OFS: u32 = 0x9e0;    // Beamforming HE
+pub const MT_MIB_BSCR6_OFS: u32 = 0x9e4;    // Beamforming EHT
+pub const MT_MIB_BSCR7_OFS: u32 = 0x9e8;    // BF trigger
+pub const MT_MIB_BFTFCR_OFS: u32 = 0x5d0;   // ACK fail count
+pub const MT_MIB_TRDR1_OFS: u32 = 0xa28;    // TX AGG count base
+
+// UMIB (unified MIB) — regs.h:312-315
+pub const MT_WF_UMIB_BASE: u32 = 0x820cd000;
+/// UMIB_RPDCR per-band: base + 0x594 + band * 0x164
+#[inline]
+pub const fn mt_umib_rpdcr(band: u32) -> u32 { MT_WF_UMIB_BASE + 0x594 + band * 0x164 }
+
+// ETBF (e-BF) per-band base — mmio.c:27
+pub const WF_ETBF_BASE: [u32; 3] = [0x820ea000, 0x820fa000, 0x830ea000];
+/// ETBF_RX_FB_CONT — regs.h:211
+#[inline]
+pub const fn mt_etbf_rx_fb_cont(band: usize) -> u32 { WF_ETBF_BASE[band] + 0x100 }
+
 // ============================================================================
 // LPON (TSF timer) — regs.h:217-228
 // WF_LPON_BASE band 0 = 0x820eb000 (in FIXED_MAP, size 0x0400)
@@ -597,6 +720,8 @@ pub const WF_LPON_BASE: [u32; 3] = [0x820eb000, 0x820fb000, 0x830eb000];
 #[inline]
 pub const fn mt_wf_lpon(band: usize, ofs: u32) -> u32 { WF_LPON_BASE[band] + ofs }
 
+// Free-running counter — debugfs.c
+pub const MT_LPON_FRCR_OFS: u32 = 0x37c;
 // TSF read: write SW_READ to TCR, then read UTTR0/UTTR1
 // regs.h:220-228
 pub const MT_LPON_UTTR0_OFS: u32 = 0x360;
@@ -637,14 +762,69 @@ pub const MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR: u32 = 1 << 29;
 // ============================================================================
 
 pub const MT_RXD0_LENGTH: u32 = 0xFFFF;           // GENMASK(15,0) — packet length
+/// Packet type field: GENMASK(31,27) of RXD0 — mt76_connac3_mac.h
+pub const MT_RXD0_PKT_TYPE_SHIFT: u32 = 27;
+pub const MT_RXD0_PKT_TYPE_MASK: u32 = 0xF800_0000; // GENMASK(31,27)
 pub const MT_RXD1_NORMAL_GROUP_1: u32 = 1 << 16;  // IV (4 bytes)
 pub const MT_RXD1_NORMAL_GROUP_2: u32 = 1 << 17;  // Timestamp (4 bytes)
 pub const MT_RXD1_NORMAL_GROUP_3: u32 = 1 << 18;  // P-RXV (16 bytes, RSSI/RCPI)
 pub const MT_RXD1_NORMAL_GROUP_4: u32 = 1 << 19;  // FC/QoS/Seq (16 bytes)
 pub const MT_RXD1_NORMAL_GROUP_5: u32 = 1 << 20;  // C-RXV (24 bytes, HE/EHT)
+/// WLAN index: GENMASK(11,0) of RXD1
+pub const MT_RXD1_NORMAL_WLAN_IDX: u32 = 0xFFF;
+/// Band index: GENMASK(28,27) of RXD1
+pub const MT_RXD1_NORMAL_BAND_IDX_SHIFT: u32 = 27;
+pub const MT_RXD1_NORMAL_BAND_IDX_MASK: u32 = 0x1800_0000; // GENMASK(28,27)
 pub const MT_RXD2_NORMAL_HDR_TRANS: u32 = 1 << 7;
 pub const MT_RXD2_NORMAL_HDR_OFFSET: u32 = 0x7 << 13; // GENMASK(15,13) — pad units×2
+/// Non-data frame: 1 = management/control, 0 = data — mt76_connac3_mac.h
+pub const MT_RXD2_NORMAL_NDATA: u32 = 1 << 29;
+/// Address type: GENMASK(17,16) of RXD3 — U2M=0, MCAST=1, BCAST=2, OTHER=3
+pub const MT_RXD3_NORMAL_ADDR_TYPE_SHIFT: u32 = 16;
+pub const MT_RXD3_NORMAL_ADDR_TYPE_MASK: u32 = 0x3_0000; // GENMASK(17,16)
 pub const MT_RXD3_NORMAL_FCS_ERR: u32 = 1 << 24;
+
+// ============================================================================
+// RXD packet types — mt76_connac3_mac.h PKT_TYPE_*
+// ============================================================================
+
+pub const PKT_TYPE_TXS: u32 = 0;           // TX status
+pub const PKT_TYPE_TXRXV: u32 = 1;         // TX/RX vector
+pub const PKT_TYPE_NORMAL: u32 = 2;        // Normal data/mgmt frame
+pub const PKT_TYPE_TXRX_NOTIFY: u32 = 6;   // TX/RX notification
+pub const PKT_TYPE_RX_EVENT: u32 = 7;      // MCU RX event
+pub const PKT_TYPE_RX_FW_MONITOR: u32 = 0x0c; // FW monitor
+
+// ============================================================================
+// MCU UNI event EIDs — mt76_connac_mcu.h / mt7996/mcu.h
+// ============================================================================
+
+pub const MCU_UNI_EVENT_FW_LOG: u8 = 0x04;
+pub const MCU_UNI_EVENT_IE_COUNTDOWN: u8 = 0x09;
+pub const MCU_UNI_EVENT_RDD_REPORT: u8 = 0x11;
+pub const MCU_UNI_EVENT_THERMAL: u8 = 0x35;
+pub const MCU_UNI_EVENT_ALL_STA_INFO: u8 = 0x6e;
+
+/// MCU_UNI_CMD_ALL_STA_INFO = 0x6e — mt76_connac_mcu.h:1309
+pub const MCU_UNI_CMD_ALL_STA_INFO: u8 = 0x6e;
+/// UNI_ALL_STA_TXRX_RATE = 0 — mt76_connac_mcu.h:1396
+pub const UNI_ALL_STA_TXRX_RATE: u16 = 0;
+
+/// MCU_UNI_CMD_GET_MIB_INFO = 0x22 — mt76_connac_mcu.h:1287
+pub const MCU_UNI_CMD_GET_MIB_INFO: u16 = 0x22;
+/// UNI_CMD_MIB_DATA = 0 — mt7996/mcu.h:866 (first enum member)
+pub const UNI_CMD_MIB_DATA: u16 = 0;
+/// Channel MIB offsets — mt7996/mcu.h:278-281
+pub const UNI_MIB_OBSS_AIRTIME: u32 = 26;
+pub const UNI_MIB_NON_WIFI_TIME: u32 = 27;
+pub const UNI_MIB_TX_TIME: u32 = 28;
+pub const UNI_MIB_RX_TIME: u32 = 29;
+
+// ============================================================================
+// PCIe IRQ number — GIC SPI 171 + 32 (MT7996 on pcie3)
+// ============================================================================
+
+pub const PCIE3_IRQ: u32 = 203;
 
 // Per-band register address helpers
 #[inline]

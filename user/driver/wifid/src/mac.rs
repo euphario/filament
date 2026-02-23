@@ -173,7 +173,7 @@ impl Mt7996Dev {
     /// 4. WA HIF TXD version (WA → wa_ring)
     /// 5. Per-band register init (bands 0, 1, 2)
     /// 6. Basic rate programming (WM-only → wm_ring)
-    pub fn mac_init(&self, wm_ring: &mut TxRing, wa_ring: &mut TxRing, seq: &mut u8) -> Result<(), i32> {
+    pub fn mac_init(&self, ring: &mut TxRing, seq: &mut u8) -> Result<(), i32> {
         // mt76_clear(dev, MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
         self.reg_clear(MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
 
@@ -190,42 +190,30 @@ impl Mt7996Dev {
         }
 
         // RRO module init — init.c:609-626
-        // MCU_WM_UNI_CMD(RRO) — WM-only, uses wm_ring
-        // BPI-R4 MT7996 has HIF2, is_mt7996=true.
-        // has_hwrro is effectively false (WED not yet initialized).
-        // if (dev->hif2)
-        //     mt7996_mcu_set_rro(dev, UNI_RRO_SET_PLATFORM_TYPE, 2);  // is_mt7996
-        self.mcu_set_rro(wm_ring, mcu::UNI_RRO_SET_PLATFORM_TYPE, 2, *seq)?;
+        // MCU_WM_UNI_CMD(RRO) — WM-only but routed via WA queue
+        // Linux: if (dev->hif2) → 2, else → 0
+        // BPI-R4 has single PCIe to MT7996 (no HIF2) → platform_type = 0
+        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_PLATFORM_TYPE, 0, *seq)?;
         *seq = seq.wrapping_add(1);
 
-        // No HW RRO path:
-        // mt7996_mcu_set_rro(dev, UNI_RRO_SET_BYPASS_MODE, 3);
-        self.mcu_set_rro(wm_ring, mcu::UNI_RRO_SET_BYPASS_MODE, 3, *seq)?;
+        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_BYPASS_MODE, 3, *seq)?;
         *seq = seq.wrapping_add(1);
 
-        // mt7996_mcu_set_rro(dev, UNI_RRO_SET_TXFREE_PATH, 1);
-        self.mcu_set_rro(wm_ring, mcu::UNI_RRO_SET_TXFREE_PATH, 1, *seq)?;
+        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_TXFREE_PATH, 1, *seq)?;
         *seq = seq.wrapping_add(1);
 
         // WA HIF TXD version — init.c:628-630
-        // MCU_WA_PARAM_CMD(SET) — WA command, uses wa_ring
-        // mt7996_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(SET),
-        //                   MCU_WA_PARAM_HW_PATH_HIF_VER, HIF_TXD_V2_1, 0);
         const HIF_TXD_V2_1: u32 = 0x21;
-        self.mcu_wa_cmd(wa_ring, mcu::MCU_WA_PARAM_HW_PATH_HIF_VER, HIF_TXD_V2_1, 0, *seq)?;
+        self.mcu_wa_cmd(ring, mcu::MCU_WA_PARAM_HW_PATH_HIF_VER, HIF_TXD_V2_1, 0, *seq)?;
         *seq = seq.wrapping_add(1);
 
         // Per-band init — init.c:632-633
-        // for (i = MT_BAND0; i <= MT_BAND2; i++)
-        //     mt7996_mac_init_band(dev, i);
         for band in 0..3 {
             self.mac_init_band(band);
         }
 
         // Basic rates — init.c:635
-        // MCU_WM_UNI_CMD(FIXED_RATE_TABLE) — WM-only, uses wm_ring
-        // mt7996_mac_init_basic_rates(dev);
-        self.mac_init_basic_rates(wm_ring, seq)?;
+        self.mac_init_basic_rates(ring, seq)?;
 
         udebug!("mac", "mac_init_done");
         Ok(())
