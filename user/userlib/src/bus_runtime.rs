@@ -15,7 +15,7 @@
 
 use crate::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, SpawnContext,
-    PortId, KernelBusId, KernelBusInfo,
+    PortId, KernelBusId, KernelBusInfo, IrqPolicy,
     BlockTransport, BlockPortConfig,
     MAX_PORTS, MAX_KERNEL_BUSES, MAX_PENDING, bus_msg,
 };
@@ -67,10 +67,13 @@ const MAX_MANAGED_TIMERS: usize = 4;
 // Managed IRQ / Timer
 // ============================================================================
 
-/// An IRQ managed by the runtime — auto-acked after handle_event.
+/// An IRQ managed by the runtime.
+/// AutoAck: acked after handle_event (default).
+/// DriverManaged: driver calls ack_irq(tag) when ready.
 struct ManagedIrq {
     irq: Irq,
     tag: u32,
+    policy: IrqPolicy,
 }
 
 /// A recurring timer managed by the runtime — auto-rearmed after handle_event.
@@ -374,6 +377,9 @@ struct RuntimeCtx {
     managed_irqs: [Option<ManagedIrq>; MAX_MANAGED_IRQS],
     /// Managed timers (auto-rearm after handle_event).
     managed_timers: [Option<ManagedTimer>; MAX_MANAGED_TIMERS],
+    /// Last timeout set on Mux (for sticky timeout optimization).
+    /// u32::MAX means "no timeout set yet".
+    last_timeout_ms: u32,
 }
 
 impl RuntimeCtx {
@@ -407,6 +413,7 @@ impl RuntimeCtx {
             devd_channel_broken: false,
             managed_irqs: [const { None }; MAX_MANAGED_IRQS],
             managed_timers: [const { None }; MAX_MANAGED_TIMERS],
+            last_timeout_ms: u32::MAX,
         }
     }
 
@@ -815,6 +822,10 @@ impl BusCtx for RuntimeCtx {
     }
 
     fn watch_irq(&mut self, irq_num: u32, tag: u32) -> Result<(), BusError> {
+        self.watch_irq_with_policy(irq_num, tag, IrqPolicy::AutoAck)
+    }
+
+    fn watch_irq_with_policy(&mut self, irq_num: u32, tag: u32, policy: IrqPolicy) -> Result<(), BusError> {
         let irq = Irq::new(irq_num).map_err(|_| BusError::NotFound)?;
         let handle = irq.handle();
         self.mux.add(handle, MuxFilter::Readable).map_err(|_| BusError::Internal)?;
@@ -824,7 +835,7 @@ impl BusCtx for RuntimeCtx {
         }
         for slot in self.managed_irqs.iter_mut() {
             if slot.is_none() {
-                *slot = Some(ManagedIrq { irq, tag });
+                *slot = Some(ManagedIrq { irq, tag, policy });
                 return Ok(());
             }
         }
@@ -832,6 +843,17 @@ impl BusCtx for RuntimeCtx {
         let _ = self.mux.remove(handle);
         self.handles.remove(handle);
         Err(BusError::NoSpace)
+    }
+
+    fn ack_irq(&mut self, tag: u32) {
+        for slot in self.managed_irqs.iter_mut() {
+            if let Some(mirq) = slot {
+                if mirq.tag == tag {
+                    let _ = mirq.irq.ack();
+                    return;
+                }
+            }
+        }
     }
 
     fn set_irq_affinity(&mut self, tag: u32, cpu: u32) -> Result<(), BusError> {
@@ -1213,18 +1235,17 @@ impl<D: Driver> DriverRuntime<D> {
                 }
             }
 
-            // Block until next event or nearest deadline
+            // Block until next event or nearest deadline.
+            // Sticky timeout: only call set_timeout when the value changes,
+            // reducing 3 syscalls (set+wait+clear) to 1 (wait) per iteration.
             let timeout_ms = self.ctx.nearest_deadline_ms();
-            let event = if timeout_ms > 0 {
-                match self.ctx.mux.wait_timeout(timeout_ms) {
-                    Ok(ev) => ev,
-                    Err(_) => continue, // Timeout or error — loop to check deadlines
-                }
-            } else {
-                match self.ctx.mux.wait() {
-                    Ok(ev) => ev,
-                    Err(_) => continue,
-                }
+            if timeout_ms != self.ctx.last_timeout_ms {
+                let _ = self.ctx.mux.set_timeout(timeout_ms);
+                self.ctx.last_timeout_ms = timeout_ms;
+            }
+            let event = match self.ctx.mux.wait() {
+                Ok(ev) => ev,
+                Err(_) => continue,
             };
 
             // Signal events have Handle::INVALID — dispatch before tag lookup
@@ -1338,11 +1359,13 @@ impl<D: Driver> DriverRuntime<D> {
                 // Driver-registered handle
                 self.driver.handle_event(tag, handle, &mut self.ctx);
 
-                // Auto-ack managed IRQs
+                // Auto-ack managed IRQs (only AutoAck policy)
                 for slot in self.ctx.managed_irqs.iter_mut() {
                     if let Some(mirq) = slot {
                         if mirq.tag == tag {
-                            let _ = mirq.irq.ack();
+                            if mirq.policy == IrqPolicy::AutoAck {
+                                let _ = mirq.irq.ack();
+                            }
                             break;
                         }
                     }

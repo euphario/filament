@@ -78,16 +78,8 @@ struct WifiDriver {
     mib: [RxMibCounters; 3],
     /// TX probe response counter
     tx_probe_resp: u32,
-    /// TX beacon counter
+    /// TX beacon counter (firmware-offloaded, tracked via MIB)
     tx_beacon: u32,
-    /// Beacon tick counter (increments every 10ms event tick, resets at 10 = 100ms)
-    beacon_tick: u8,
-    /// Heartbeat tick counter (increments every 10ms, fires at 50 = 500ms)
-    heartbeat_tick: u8,
-    /// Previous tx_ok count for radio-stop detection
-    last_tx_ok: u32,
-    /// Consecutive seconds with no TX progress (0 = healthy)
-    tx_stall_count: u8,
     /// TX token allocator — monotonically increasing, wrapping u16.
     /// Firmware uses tokens to track TX completion; each enqueued frame needs a unique one.
     /// Linux: mt76_token_consume() via idr_alloc() starting from token_start=0.
@@ -98,12 +90,13 @@ struct WifiDriver {
     tx_free_entries: u32,
     /// Total TXRX_NOTIFY (pkt_type=6) entries found
     tx_free_notify_count: u32,
-    /// First TXRX_NOTIFY payload dumped (one-shot diagnostic)
-    tx_free_payload_dumped: bool,
     /// 802.11 AP state machine (STA table, auth/assoc handling)
     ap: Option<ApManager>,
     /// Next WLAN index for client STAs (starts below WTBL_RESERVED)
     next_wlan_idx: u16,
+    /// NAPI polling mode: IRQ is suppressed (hw masked, kernel IRQ not acked).
+    /// Timer tick will drain queues and re-enable when empty.
+    irq_suppressed: bool,
 }
 
 impl WifiDriver {
@@ -133,20 +126,16 @@ impl WifiDriver {
             pci_dev: None,
             msi: None,
             irq: None,
-            last_tx_ok: 0,
-            tx_stall_count: 0,
             mib: [RxMibCounters::new(); 3],
             tx_probe_resp: 0,
             tx_beacon: 0,
-            beacon_tick: 0,
-            heartbeat_tick: 0,
             tx_token: 0,
             tx_freed: 0,
             tx_free_entries: 0,
             tx_free_notify_count: 0,
-            tx_free_payload_dumped: false,
             ap: None,
             next_wlan_idx: MT7996_WTBL_RESERVED - 1,
+            irq_suppressed: false,
         }
     }
 
@@ -697,6 +686,12 @@ impl WifiDriver {
     seq = seq.wrapping_add(1);
     udebug!("wifid", "dev_info_ok");
 
+    // WTBL: clear ADM count on BMC STA — Linux main.c:343
+    // Must happen before mcu_add_bss_info + mcu_add_sta so hardware
+    // has clean admission state and will auto-ACK inbound frames.
+    dev.mac_wtbl_update(MT7996_WTBL_RESERVED as u32, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+    udebug!("wifid", "wtbl_adm_clear"; wlan = MT7996_WTBL_RESERVED as u32);
+
     // BSS_INFO: create BSS on band 0 — Linux mcu.c:1123
     // hw_bss_idx = 0 (matches bss_req_hdr.bss_idx in uni_header)
     // omac_idx = HW_BSSID_0 (OMAC to use, independent of bss_idx)
@@ -797,11 +792,12 @@ impl WifiDriver {
     seq = seq.wrapping_add(1);
     udebug!("wifid", "edca_ok");
 
-    // Beacon: firmware offload DISABLED — it autonomously stops after ~57 seconds
-    // for unknown reasons. Instead, we use software TX beacons via BAND0 CT ring
-    // which we fully control. The BSS_INFO/STA_REC/rate table setup above is still
-    // needed for the firmware to know about our BSS and allow TX.
-    udebug!("wifid", "beacon_sw_mode");
+    // Beacon: firmware offload — uploads beacon template to MCU.
+    // The ~57s death was caused by DMA CPU_IDX starvation, not beacon offload.
+    // Linux: mt7996_mcu_add_beacon() in mcu.c:2766
+    dev.mcu_set_beacon(&mut wa_ring, 0, HW_BSSID_0, &mac_addr, 1, true, seq, None).map_err(mcu_err)?;
+    seq = seq.wrapping_add(1);
+    udebug!("wifid", "beacon_fw_offload");
 
     // Re-set RFCR after all MCU commands (Linux calls configure_filter after BSS changes)
     dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR_OFS), rfcr_val);
@@ -839,7 +835,7 @@ impl WifiDriver {
     // Event processing: MSI IRQ mode with timer fallback for beacons
     const TAG_WIFI_IRQ: u32 = 101;
     const TAG_WIFI_TIMER: u32 = 100;
-    const BEACON_INTERVAL_NS: u64 = 10_000_000; // 10ms for beacon ticks
+    const HEARTBEAT_INTERVAL_NS: u64 = 500_000_000; // 500ms heartbeat
 
     // Transition MSI IRQ from synchronous firmware-loading mode to event-driven.
     // The Irq was already allocated before firmware upload; now add it to the
@@ -872,9 +868,9 @@ impl WifiDriver {
         uwarn!("wifid", "timer_fallback");
     }
 
-    // Always start beacon timer (10ms ticks for beacon generation)
-    if let Err(_) = ctx.start_timer(TAG_WIFI_TIMER, BEACON_INTERVAL_NS) {
-        uwarn!("wifid", "beacon_timer_fail");
+    // Heartbeat timer for MIB clearing, stats, STA aging (500ms)
+    if let Err(_) = ctx.start_timer(TAG_WIFI_TIMER, HEARTBEAT_INTERVAL_NS) {
+        uwarn!("wifid", "heartbeat_timer_fail");
     }
 
     // Initialize AP state machine
@@ -1182,18 +1178,6 @@ impl Driver for WifiDriverWrapper {
             self.0.tx_freed += r.tokens_freed;
             self.0.tx_free_entries += r.entries;
             self.0.tx_free_notify_count += r.txrx_notify_count;
-            // One-shot dump of first TXRX_NOTIFY buffer for debugging
-            if r.txrx_notify_count > 0 && !self.0.tx_free_payload_dumped {
-                self.0.tx_free_payload_dumped = true;
-                uinfo!("wifid", "txfree_dump";
-                    dw0 = r.first_rxd[0], dw1 = r.first_rxd[1],
-                    dw2 = r.first_rxd[2], dw3 = r.first_rxd[3],
-                    dw4 = r.first_rxd[4], dw5 = r.first_rxd[5],
-                    ver = r.first_payload[0],
-                    msdu_cnt = r.first_payload[1],
-                    byte_cnt = r.first_payload[2]
-                );
-            }
         }
 
         // BAND2 data RX (q4) — classify frames, update band2 counters
@@ -1376,63 +1360,25 @@ impl Driver for WifiDriverWrapper {
             }
         }
 
-        // Software beacon TX: every 10 ticks (100ms) send a beacon frame via BAND0 CT ring.
-        // Firmware beacon offload stops after ~57 seconds for unknown reasons, so we
-        // drive beacons entirely from software using the proven CT TX path.
-        // Only count beacon ticks on timer events (not IRQ events).
-        if self.0.beacon_on && is_timer {
-            self.0.beacon_tick = self.0.beacon_tick.wrapping_add(1);
-            if self.0.beacon_tick >= 10 {
-                self.0.beacon_tick = 0;
-                if let Some(ref mut ap) = self.0.ap {
-                    if let Some(ref mut tx_ring) = self.0.tx_band0 {
-                        let mut raw_buf = [0u8; 256];
-                        let raw_len = ap.beacon(&mut raw_buf);
-                        if raw_len > 0 {
-                            let mut txd_buf = [0u8; 256];
-                            let len = wrap_mgmt_txd(&mut txd_buf, &raw_buf[..raw_len]);
-                            let tok = self.0.tx_token;
-                            self.0.tx_token = self.0.tx_token.wrapping_add(1);
-                            match dev.tx_enqueue(tx_ring, &txd_buf[..len], tok) {
-                                Ok(()) => {
-                                    self.0.tx_beacon = self.0.tx_beacon.wrapping_add(1);
-                                }
-                                Err(e) => {
-                                    uerror!("wifid", "beacon_enqueue_failed"; err = e as u32);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Channel MIB counter clearing: every 100ms (10 ticks)
-        // Linux: mt7996_mac_work() → mt76_update_survey() → mt7996_mcu_get_chan_mib_info()
-        // Without this, firmware CCA counters accumulate and MAC assesses channel as
-        // permanently busy, stopping all TX after ~42 seconds.
-        // Source: mt7996/mac.c:2155-2170, mcu.c:3948-4025
-        if is_timer && self.0.drain_ticks % 10 == 0 {
+        // Periodic maintenance: every timer tick (500ms)
+        // Beacons are firmware-offloaded; timer handles MIB, stats, STA aging.
+        if is_timer {
+            // Channel MIB counter clearing
+            // Linux: mt7996_mac_work() → mt76_update_survey() → mt7996_mcu_get_chan_mib_info()
+            // Without this, firmware CCA counters accumulate and MAC assesses channel as
+            // permanently busy, stopping all TX.
+            // Source: mt7996/mac.c:2155-2170, mcu.c:3948-4025
             if let Some(ref mut wa_ring) = self.0.wa_ring {
                 let _ = dev.mcu_get_chan_mib_info(wa_ring, 0, self.0.seq);
                 self.0.seq = self.0.seq.wrapping_add(1);
             }
-        }
 
-        // Periodic maintenance: every 500ms (timer-driven)
-        // Linux: mt7996_mac_work() runs every 100ms, does stats every 500ms
-        if is_timer {
-        self.0.heartbeat_tick = self.0.heartbeat_tick.wrapping_add(1);
-        }
-        if is_timer && self.0.heartbeat_tick >= 50 {
-            self.0.heartbeat_tick = 0;
-
-            // Hardware MIB register clearing: every 500ms
+            // Hardware MIB register clearing
             // Linux: mac.c:2743-2882 mt7996_mac_update_stats()
             dev.mac_update_stats(0);
 
             if let Some(ref mut wa_ring) = self.0.wa_ring {
-                // Stats query every 500ms
+                // Stats query
                 let _ = dev.mcu_get_all_sta_info(wa_ring, UNI_ALL_STA_TXRX_RATE, self.0.seq);
                 self.0.seq = self.0.seq.wrapping_add(1);
             }
@@ -1445,13 +1391,12 @@ impl Driver for WifiDriverWrapper {
                     uinfo!("wifid", "sta_aged"; aid = evicted[j] as u32);
                 }
             }
-
         }
 
         // Beacon diagnostic: log key registers every second while beaconing.
-        // drain_ticks increments every 10ms, so 100 = 1 second.
-        if is_timer && self.0.beacon_on && self.0.drain_ticks % 100 == 0 {
-            let secs = self.0.drain_ticks / 100;
+        // drain_ticks increments every 500ms, so 2 = 1 second.
+        if is_timer && self.0.beacon_on && self.0.drain_ticks % 2 == 0 {
+            let secs = self.0.drain_ticks / 2;
             let arb = dev.reg_rr(mt_wf_arb(0, MT_ARB_SCR_OFS));
             let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
             let tx_mpdu = dev.reg_rr(mt_wf_mib(0, MT_MIB_TSCR4_OFS));
@@ -1521,97 +1466,6 @@ impl Driver for WifiDriverWrapper {
                 tfn = self.0.tx_free_notify_count
             );
 
-            // Radio-stop detection: when TX DMA CPU index stops advancing, the DMA engine
-            // is stuck or firmware stopped consuming frames.
-            // NOTE: tx_mpdu (TSCR4) only counts data AMPDUs, NOT management frames.
-            // We use tx_cpu (DMA CPU_IDX) which advances for every frame we enqueue.
-            if secs >= 5 { // Skip first 5 seconds (settling)
-                if tx_cpu == self.0.last_tx_ok {
-                    self.0.tx_stall_count = self.0.tx_stall_count.saturating_add(1);
-                    if self.0.tx_stall_count == 3 { // 3 consecutive seconds with no DMA progress
-                        let fw_state = dev.mt76_rr(MT_TOP_MISC) & 0x7;
-                        let glo_cfg = dev.mt76_rr(MT_WFDMA0_GLO_CFG);
-                        let swdef = dev.mt76_rr(MT_SWDEF_MODE);
-                        let rfcr = dev.reg_rr(mt_wf_rmac(0, MT_WF_RFCR_OFS));
-                        let int_src = dev.mt76_rr(MT_INT_SOURCE_CSR);
-                        let int_mask = dev.mt76_rr(MT_INT_MASK_CSR);
-                        uerror!("wifid", "RADIO_STOPPED";
-                            t = secs,
-                            fw = fw_state,
-                            arb = arb,
-                            mcu = mcu_cmd,
-                            glo = glo_cfg,
-                            swdef = swdef,
-                            rfcr = rfcr,
-                            int_s = int_src,
-                            int_m = int_mask,
-                            tx_ok = tx_mpdu,
-                            ple_f = ple_free,
-                            ple_e = ple_empty
-                        );
-                    }
-                } else {
-                    self.0.tx_stall_count = 0;
-                }
-                self.0.last_tx_ok = tx_cpu;
-            }
-
-            // One-time TXD hex dump: read back the last-written TXD+TXP from the buffer.
-            // This lets us compare byte-for-byte against Linux's mt7996_mac_write_txwi output.
-            if secs == 1 {
-                if let Some(ref ring) = self.0.tx_band0 {
-                    // Read the buffer at the previous cpu_idx (last enqueued frame)
-                    let prev = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
-                    let buf = ring.buf(prev);
-                    // Read TXD (8 DWORDs = 32 bytes) + TXP first 12 bytes
-                    let mut txd = [0u32; 8];
-                    for i in 0..8 {
-                        txd[i] = unsafe { core::ptr::read_volatile((buf as *const u32).add(i)) };
-                    }
-                    uinfo!("wifid", "txd_dump";
-                        d0 = txd[0], d1 = txd[1], d2 = txd[2], d3 = txd[3],
-                        d4 = txd[4], d5 = txd[5], d6 = txd[6], d7 = txd[7]
-                    );
-                    // Read TXP header (at offset 32): flags, token, bss_idx, rept_wds_wcid, nbuf
-                    let txp_base = unsafe { buf.add(MT_TXD_SIZE) };
-                    let txp_flags = unsafe { core::ptr::read_volatile(txp_base as *const u16) };
-                    let txp_nbuf = unsafe { core::ptr::read_volatile(txp_base.add(7)) };
-                    let txp_buf0 = unsafe { core::ptr::read_volatile((txp_base.add(8)) as *const u32) };
-                    let txp_len0 = unsafe { core::ptr::read_volatile((txp_base.add(32)) as *const u16) };
-                    uinfo!("wifid", "txp_dump";
-                        flags = txp_flags as u32,
-                        nbuf = txp_nbuf as u32,
-                        buf0 = txp_buf0,
-                        len0 = txp_len0 as u32
-                    );
-                    // Also dump the descriptor
-                    let desc = ring.desc(prev);
-                    let d_buf0 = unsafe { core::ptr::read_volatile(&(*desc).buf0) };
-                    let d_ctrl = unsafe { core::ptr::read_volatile(&(*desc).ctrl) };
-                    let d_buf1 = unsafe { core::ptr::read_volatile(&(*desc).buf1) };
-                    let d_info = unsafe { core::ptr::read_volatile(&(*desc).info) };
-                    uinfo!("wifid", "desc_dump";
-                        buf0 = d_buf0, ctrl = d_ctrl, buf1 = d_buf1, info = d_info
-                    );
-                }
-
-                // WA_MAIN buffer dump: read first buffer to see what pkt_type firmware writes
-                if qc > 3 {
-                    let q = &self.0.rx_queues[3];
-                    // Read buffer 0 (or any recently-written buffer)
-                    let buf_base = q.buf_virt;
-                    let buf_ptr = buf_base as *const u32;
-                    let mut wa_dw = [0u32; 12]; // 48 bytes: RXD(32) + tx_info[0..3]
-                    for j in 0..12 {
-                        wa_dw[j] = unsafe { core::ptr::read_volatile(buf_ptr.add(j)) };
-                    }
-                    uinfo!("wifid", "wa_main_dump";
-                        d0 = wa_dw[0], d1 = wa_dw[1], d2 = wa_dw[2], d3 = wa_dw[3],
-                        d4 = wa_dw[4], d5 = wa_dw[5], d6 = wa_dw[6], d7 = wa_dw[7],
-                        d8 = wa_dw[8], d9 = wa_dw[9], d10 = wa_dw[10], d11 = wa_dw[11]
-                    );
-                }
-            }
         }
 
         // Check MCU_CMD register for firmware watchdog/error (only on real IRQ)
@@ -1626,16 +1480,53 @@ impl Driver for WifiDriverWrapper {
             }
         }
 
-        // Re-enable interrupts (IRQ mode, after DMA processing only)
+        // NAPI-style IRQ management.
+        //
+        // Key insight: HW interrupt mask and kernel IRQ ack are independent.
+        // - HW mask (MT_INT_MASK_CSR) controls whether the device raises MSI
+        // - Kernel IRQ ack (irq.ack()) clears the "readable" flag on the handle
+        //
+        // Strategy: ALWAYS ack the kernel IRQ immediately (so the Mux handle
+        // goes not-readable and we don't hot-loop). Control whether new
+        // interrupts arrive by toggling the HW mask only.
+        //
+        // Enter polling: ack kernel IRQ, leave HW masked → timer drains
+        // Exit polling:  unmask HW → next real interrupt fires normally
         if self.0.irq_mode && is_irq {
-            let irq_mask = MT_INT_RX_DONE_ALL | MT_INT_MCU_CMD
-                | MT_INT_TX_DONE_BAND0 | MT_INT_TX_DONE_MCU_WM;
-            dev.mt76_wr(MT_INT_MASK_CSR, irq_mask);
-
-            // Ack the kernel IRQ to clear pending flag and allow next MSI notification
+            // Always ack kernel IRQ first — clears Mux readability
             if let Some(ref mut irq) = self.0.irq {
                 let _ = irq.ack();
             }
+
+            let pending = dev.mt76_rr(MT_INT_SOURCE_CSR);
+            if pending & MT_INT_RX_DONE_ALL != 0 {
+                // More RX work arrived during processing — enter polling mode.
+                // HW interrupts stay masked (we masked at top of IRQ path).
+                // Timer tick will drain queues and unmask when quiet.
+                self.0.irq_suppressed = true;
+            } else {
+                // Queues drained — unmask HW interrupts to resume normal mode.
+                let irq_mask = MT_INT_RX_DONE_ALL | MT_INT_MCU_CMD
+                    | MT_INT_TX_DONE_BAND0 | MT_INT_TX_DONE_MCU_WM;
+                dev.mt76_wr(MT_INT_MASK_CSR, irq_mask);
+                self.0.irq_suppressed = false;
+            }
+        }
+
+        // Timer tick: if IRQ was suppressed (NAPI polling), try to re-enable.
+        // The timer already drained all queues above (intr = 0xFFFF_FFFF).
+        if is_timer && self.0.irq_suppressed && self.0.irq_mode {
+            let pending = dev.mt76_rr(MT_INT_SOURCE_CSR);
+            if pending & MT_INT_RX_DONE_ALL == 0 {
+                // Queues are quiet — unmask HW interrupts to exit polling mode.
+                // Next real HW interrupt will set the IRQ handle readable
+                // and trigger a normal IRQ-path handle_event.
+                let irq_mask = MT_INT_RX_DONE_ALL | MT_INT_MCU_CMD
+                    | MT_INT_TX_DONE_BAND0 | MT_INT_TX_DONE_MCU_WM;
+                dev.mt76_wr(MT_INT_MASK_CSR, irq_mask);
+                self.0.irq_suppressed = false;
+            }
+            // Otherwise stay suppressed — next timer tick will drain again.
         }
     }
 
@@ -2103,12 +1994,14 @@ impl Driver for WifiDriverWrapper {
                     b"off" | b"0" | b"false" => false,
                     _ => return Self::copy_to_buf(buf, b"ERR invalid_value\n"),
                 };
-                // Software-driven beacons: just toggle the flag.
-                // handle_event's beacon_tick loop does the actual TX.
+                // Firmware beacon offload: upload/remove beacon template
+                if dev.mcu_set_beacon(wa_ring, 0, HW_BSSID_0, &self.0.mac_addr, 1, enable, self.0.seq, None).is_err() {
+                    return Self::copy_to_buf(buf, b"ERR beacon_cmd_failed\n");
+                }
+                self.0.seq = self.0.seq.wrapping_add(1);
                 self.0.beacon_on = enable;
-                self.0.beacon_tick = 0;
                 if enable {
-                    unotice!("wifid", "beacon_enable_sw");
+                    unotice!("wifid", "beacon_enable");
                 } else {
                     unotice!("wifid", "beacon_disable");
                 }

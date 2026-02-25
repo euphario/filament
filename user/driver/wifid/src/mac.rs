@@ -48,7 +48,7 @@ impl Mt7996Dev {
 
     /// Update a WTBL entry's admin count (or other mask bits).
     /// Source: mac.c:97-104 mt7996_mac_wtbl_update()
-    fn mac_wtbl_update(&self, idx: u32, mask: u32) -> bool {
+    pub fn mac_wtbl_update(&self, idx: u32, mask: u32) -> bool {
         // mt76_rmw(dev, MT_WTBL_UPDATE, MT_WTBL_UPDATE_WLAN_IDX,
         //          FIELD_PREP(MT_WTBL_UPDATE_WLAN_IDX, idx) | mask);
         self.reg_rmw(

@@ -169,6 +169,21 @@ impl SpawnContext {
 }
 
 // ============================================================================
+// IRQ Policy
+// ============================================================================
+
+/// Controls how managed IRQs are acked after handle_event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqPolicy {
+    /// Default: runtime auto-acks IRQ after each handle_event.
+    AutoAck,
+    /// Driver manages ack manually via BusCtx::ack_irq(tag).
+    /// Use for NAPI-style polling where the driver batches work
+    /// and defers re-enabling the IRQ until queues are drained.
+    DriverManaged,
+}
+
+// ============================================================================
 // Error Types
 // ============================================================================
 
@@ -674,6 +689,14 @@ pub trait BusCtx {
     /// Register a hardware IRQ. Runtime watches it in Mux.
     /// When it fires, `handle_event(tag)` is called. Runtime auto-acks after.
     fn watch_irq(&mut self, irq_num: u32, tag: u32) -> Result<(), BusError>;
+
+    /// Register a hardware IRQ with explicit ack policy.
+    /// `DriverManaged`: runtime skips auto-ack; driver calls `ack_irq(tag)`.
+    fn watch_irq_with_policy(&mut self, irq_num: u32, tag: u32, policy: IrqPolicy) -> Result<(), BusError>;
+
+    /// Manually ack a managed IRQ (for DriverManaged policy).
+    /// No-op if the IRQ uses AutoAck or the tag is not found.
+    fn ack_irq(&mut self, tag: u32);
 
     /// Set CPU affinity for a managed IRQ (identified by tag).
     fn set_irq_affinity(&mut self, tag: u32, cpu: u32) -> Result<(), BusError>;

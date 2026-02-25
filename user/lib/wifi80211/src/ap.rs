@@ -7,8 +7,8 @@ use crate::frame;
 use crate::types::*;
 
 /// STA inactivity timeout in ticks. STAs not seen for this many ticks
-/// are evicted. At 100 ticks/sec (10ms timer), 3000 = 30 seconds.
-pub const STA_AGING_TICKS: u32 = 3000;
+/// are evicted. At 2 ticks/sec (500ms timer), 60 = 30 seconds.
+pub const STA_AGING_TICKS: u32 = 60;
 
 /// AP management state. Owns the STA table and BSS config.
 pub struct ApManager {
