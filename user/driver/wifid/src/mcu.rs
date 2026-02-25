@@ -5,9 +5,50 @@
 //! and the UNI TXD (for post-firmware init commands).
 
 use userlib::{uerror, uwarn, udebug};
+use userlib::ipc::{Irq, Mux, MuxFilter};
 use crate::regs::*;
 use crate::device::Mt7996Dev;
 use crate::dma::{TxRing, Mt76Desc, dma_wmb, flush_buffer};
+
+/// IRQ waiter with a pre-created Mux.
+///
+/// Created once before firmware upload and reused for all DMA waits.
+/// The Mux timeout is set once at creation; `wait()` uses a single read
+/// syscall per wake. This keeps syscall rate low even if the device fires
+/// interrupts faster than expected.
+pub struct FwIrq {
+    pub irq: Irq,
+    mux: Mux,
+}
+
+impl FwIrq {
+    /// Create a new FwIrq from an existing Irq.
+    /// Allocates a Mux, registers the Irq handle, and sets a 20ms timeout.
+    pub fn new(irq: Irq) -> Result<Self, i32> {
+        let mux = Mux::new().map_err(|_| -1i32)?;
+        mux.add(irq.handle(), MuxFilter::Readable).map_err(|_| -1i32)?;
+        // Set timeout once — stays until changed. Each wait() is 1 read syscall.
+        let _ = mux.set_timeout(20);
+        Ok(Self { irq, mux })
+    }
+
+    /// Block until IRQ fires or timeout expires.
+    /// Single read syscall — timeout was set at creation.
+    pub fn wait(&self) -> bool {
+        self.mux.wait().is_ok()
+    }
+
+    /// Acknowledge the interrupt (clears pending, re-enables at kernel).
+    pub fn ack(&mut self) {
+        let _ = self.irq.ack();
+    }
+
+    /// Consume the Irq out of this wrapper (for post-firmware Mux transfer).
+    pub fn into_irq(self) -> Irq {
+        // Mux is dropped here, releasing its handle
+        self.irq
+    }
+}
 
 // ============================================================================
 // MCU packet/command constants — from mt76_connac_mcu.h
@@ -387,7 +428,7 @@ impl Mt7996Dev {
     ///   - BIT(20) = WM destination
     ///
     /// Reference: mt7996/mcu.c:275-331 mt7996_mcu_send_message()
-    pub fn mcu_send_uni_cmd(&self, ring: &mut TxRing, cmd: u32, data: &[u8], wait: bool, seq: u8) -> Result<(), i32> {
+    pub fn mcu_send_uni_cmd(&self, ring: &mut TxRing, cmd: u32, data: &[u8], wait: bool, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         let idx = ring.cpu_idx;
         let mcu_cmd = (cmd & 0xFF) as u16;
 
@@ -465,19 +506,18 @@ impl Mt7996Dev {
         dma_wmb();
         self.mt76_wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
 
-        // Interrupt management
-        let int_mask1_old = self.mt76_rr(MT_INT_MASK_CSR);
-        let int_mask2_old = self.mt76_rr(MT_INT1_MASK_CSR);
-        self.mt76_wr(MT_INT_MASK_CSR, 0);
-        self.mt76_wr(MT_INT1_MASK_CSR, 0);
-        self.mt76_wr(MT_INT_MASK_CSR, 0);
-        self.mt76_wr(MT_INT1_MASK_CSR, 0);
-        let int_src1 = self.mt76_rr(MT_INT_SOURCE_CSR);
-        self.mt76_wr(MT_INT_SOURCE_CSR, int_src1);
-        let int_src2 = self.mt76_rr(MT_INT1_SOURCE_CSR);
-        self.mt76_wr(MT_INT1_SOURCE_CSR, int_src2);
-        self.mt76_wr(MT_INT_MASK_CSR, int_mask1_old);
-        self.mt76_wr(MT_INT1_MASK_CSR, int_mask2_old);
+        // Clear stale interrupt state before waiting for this command's response.
+        // This is a one-shot clear (not in the wait loop) — gives a clean slate
+        // so irq.wait() in wait_rx_response blocks until the NEW response arrives.
+        if irq.is_some() {
+            let saved_mask = self.mt76_rr(MT_INT_MASK_CSR);
+            self.mt76_wr(MT_INT_MASK_CSR, 0);
+            let src = self.mt76_rr(MT_INT_SOURCE_CSR);
+            if src != 0 {
+                self.mt76_wr(MT_INT_SOURCE_CSR, src);
+            }
+            self.mt76_wr(MT_INT_MASK_CSR, saved_mask);
+        }
 
         // Wait for TX completion
         let prev_idx = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
@@ -488,7 +528,7 @@ impl Mt7996Dev {
 
         // Wait for MCU response on the corresponding RX queue
         if wait {
-            let _ = self.wait_rx_response(ring, rx_snap, seq, 5000)?;
+            let _ = self.wait_rx_response(ring, rx_snap, seq, 5000, irq)?;
         }
 
         Ok(())
@@ -496,15 +536,49 @@ impl Mt7996Dev {
 
     /// Wait for TX descriptor to complete
     pub fn mcu_wait_tx_done(&self, ring: &TxRing, idx: u32, timeout_ms: u32) -> bool {
+        self.mcu_wait_tx_done_irq(ring, idx, timeout_ms, None)
+    }
+
+    /// Wait for TX DMA completion on a descriptor.
+    /// With IRQ: blocks on interrupt notification instead of busy-waiting.
+    /// Without IRQ: falls back to delay_ms(1) polling.
+    pub fn mcu_wait_tx_done_irq(&self, ring: &TxRing, idx: u32, timeout_ms: u32, irq: Option<&mut FwIrq>) -> bool {
         let desc = ring.desc(idx);
-        for _ in 0..timeout_ms {
-            let ctrl = unsafe { core::ptr::read_volatile(&(*desc).ctrl) };
-            if (ctrl & MT_DMA_CTL_DMA_DONE) != 0 {
-                return true;
-            }
-            userlib::delay_ms(1);
+
+        // Quick check before waiting
+        let ctrl = unsafe { core::ptr::read_volatile(&(*desc).ctrl) };
+        if (ctrl & MT_DMA_CTL_DMA_DONE) != 0 {
+            return true;
         }
-        false
+
+        if let Some(irq) = irq {
+            // IRQ-based: block until WFDMA interrupt, then check descriptor.
+            let iterations = (timeout_ms + 19) / 20;
+            for _ in 0..iterations {
+                let _ = irq.wait();
+                let src = self.mt76_rr(MT_INT_SOURCE_CSR);
+                if src != 0 {
+                    self.mt76_wr(MT_INT_SOURCE_CSR, src);
+                }
+                irq.ack();
+
+                let ctrl = unsafe { core::ptr::read_volatile(&(*desc).ctrl) };
+                if (ctrl & MT_DMA_CTL_DMA_DONE) != 0 {
+                    return true;
+                }
+            }
+            false
+        } else {
+            // Polling fallback
+            for _ in 0..timeout_ms {
+                let ctrl = unsafe { core::ptr::read_volatile(&(*desc).ctrl) };
+                if (ctrl & MT_DMA_CTL_DMA_DONE) != 0 {
+                    return true;
+                }
+                userlib::delay_ms(1);
+            }
+            false
+        }
     }
 
     /// Snapshot MCU RX DMA_IDX — call BEFORE sending a command.
@@ -536,7 +610,7 @@ impl Mt7996Dev {
     ///
     /// Linux checks status for DEV_INFO_UPDATE, BSS_INFO_UPDATE, STA_REC_UPDATE, RRO.
     /// Non-zero status = firmware rejected the command.
-    pub fn wait_rx_response(&self, ring: &TxRing, pre_send_dma_idx: u32, expected_seq: u8, timeout_ms: u32) -> Result<u32, i32> {
+    pub fn wait_rx_response(&self, ring: &TxRing, pre_send_dma_idx: u32, expected_seq: u8, timeout_ms: u32, mut irq: Option<&mut FwIrq>) -> Result<u32, i32> {
         // Snapshot the alternate RX queue to detect misrouted responses
         let alt_regs = if ring.rx_regs == MCU_WA_RX_REGS { MCU_WM_RX_REGS } else { MCU_WA_RX_REGS };
         let alt_snap = self.mt76_rr(alt_regs + MT_QUEUE_DMA_IDX);
@@ -550,9 +624,16 @@ impl Mt7996Dev {
         // Current position to check in the RX ring
         let mut check_pos = pre_send_dma_idx;
 
-        for _ in 0..timeout_ms {
-            let dma_idx = self.mt76_rr(ring.rx_regs + MT_QUEUE_DMA_IDX);
-            if dma_idx != check_pos {
+        // IRQ path uses 20ms blocks, polling uses 1ms blocks
+        let iterations = if irq.is_some() { (timeout_ms + 19) / 20 } else { timeout_ms };
+
+        for _ in 0..iterations {
+            // Check for new RX data — scan through non-matching entries
+            'scan: loop {
+                let dma_idx = self.mt76_rr(ring.rx_regs + MT_QUEUE_DMA_IDX);
+                if dma_idx == check_pos {
+                    break 'scan; // No new data
+                }
                 // New response(s) available — check from check_pos
                 if ring.rx_buf_virt != 0 {
                     let buf_ptr = (ring.rx_buf_virt + check_pos as u64 * ring.rx_buf_size as u64) as *const u8;
@@ -563,19 +644,16 @@ impl Mt7996Dev {
                     let rxd_ext_eid = unsafe { core::ptr::read_volatile(buf_ptr.add(40)) };
 
                     if rxd_seq != expected_seq {
-                        // Response for a different command (fire-and-forget WA cmd, async event).
-                        // Skip it and check the next position.
+                        // Response for a different command — skip and advance CPU_IDX
+                        // to return consumed descriptors to hardware (like Linux NAPI).
                         udebug!("mcu", "rx_skip"; pos = check_pos, eid = rxd_eid,
                             seq = rxd_seq, expected = expected_seq, ext = rxd_ext_eid);
+                        self.rx_advance_cpu_idx(ring, check_pos, rx_ndesc);
                         check_pos = (check_pos + 1) % rx_ndesc;
-                        continue;
+                        continue 'scan;
                     }
 
-                    // Status check: only valid for UNI event responses (eid=1).
-                    // Linux mt7996_mcu_parse_response() only checks status for
-                    // DEV_INFO_UPDATE, BSS_INFO_UPDATE, STA_REC_UPDATE, RRO —
-                    // all of which return eid=1 (MCU_UNI_EVENT_RESULT).
-                    // QUERY responses may use different eid values.
+                    // Status check for UNI event responses (eid=1)
                     if rxd_eid == 1 {
                         let resp_cid = unsafe { core::ptr::read_volatile(buf_ptr.add(44)) };
                         let status = unsafe { core::ptr::read_volatile(buf_ptr.add(48) as *const u32) };
@@ -584,6 +662,7 @@ impl Mt7996Dev {
                         if status != 0 {
                             uerror!("mcu", "cmd_REJECTED"; cid = resp_cid, status = status,
                                 seq = rxd_seq, eid = rxd_eid, ext = rxd_ext_eid);
+                            self.rx_advance_cpu_idx(ring, check_pos, rx_ndesc);
                             return Err(status as i32);
                         }
                     }
@@ -593,9 +672,24 @@ impl Mt7996Dev {
                 } else {
                     udebug!("mcu", "rx_ok"; snap = pre_send_dma_idx, now = dma_idx);
                 }
+                // Advance CPU_IDX to return consumed descriptors to hardware
+                self.rx_advance_cpu_idx(ring, check_pos, rx_ndesc);
                 return Ok(check_pos);
             }
-            userlib::delay_ms(1);
+
+            // Wait for next check — IRQ-based or polling
+            // Post-firmware: do NOT clear INT_SOURCE_CSR here. Empirically,
+            // SOURCE clearing in the RX wait loop prevents MCU responses from
+            // arriving (set_eeprom timeout). Use IRQ wait + delay for spin
+            // protection only. Firmware loading uses separate wait functions
+            // (wait_mcu_rx_response_irq) that DO clear SOURCE.
+            if let Some(ref mut irq) = irq {
+                let _ = irq.wait();
+                irq.ack();
+                userlib::delay_ms(1);
+            } else {
+                userlib::delay_ms(1);
+            }
         }
 
         // Timeout — check all queues to diagnose where the response went
@@ -609,15 +703,49 @@ impl Mt7996Dev {
         Err(-1)
     }
 
+    /// Advance RX ring CPU_IDX to return consumed descriptors to hardware.
+    /// Like Linux's NAPI dequeue — tells the WFDMA that buffers up to `pos`
+    /// have been read and can be reused for new responses.
+    fn rx_advance_cpu_idx(&self, ring: &TxRing, pos: u32, _rx_ndesc: u32) {
+        self.mt76_wr(ring.rx_regs + MT_QUEUE_CPU_IDX, pos);
+    }
+
     /// Legacy: wait on MCU_WM RX queue (used by firmware loading, no response parsing)
     pub fn wait_mcu_rx_response(&self, pre_send_dma_idx: u32, timeout_ms: u32) -> Result<(), i32> {
-        // Firmware loading uses WM RX queue — no buffer info available for response parsing
-        for _ in 0..timeout_ms {
-            let dma_idx = self.mt76_rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX);
-            if dma_idx != pre_send_dma_idx {
-                return Ok(());
+        self.wait_mcu_rx_response_irq(pre_send_dma_idx, timeout_ms, None)
+    }
+
+    /// Wait on MCU_WM RX queue with optional IRQ-based waiting.
+    pub fn wait_mcu_rx_response_irq(&self, pre_send_dma_idx: u32, timeout_ms: u32, irq: Option<&mut FwIrq>) -> Result<(), i32> {
+        // Quick check
+        let dma_idx = self.mt76_rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX);
+        if dma_idx != pre_send_dma_idx {
+            return Ok(());
+        }
+
+        if let Some(irq) = irq {
+            let iterations = (timeout_ms + 19) / 20;
+            for _ in 0..iterations {
+                let _ = irq.wait();
+                let src = self.mt76_rr(MT_INT_SOURCE_CSR);
+                if src != 0 {
+                    self.mt76_wr(MT_INT_SOURCE_CSR, src);
+                }
+                irq.ack();
+
+                let dma_idx = self.mt76_rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX);
+                if dma_idx != pre_send_dma_idx {
+                    return Ok(());
+                }
             }
-            userlib::delay_ms(1);
+        } else {
+            for _ in 0..timeout_ms {
+                let dma_idx = self.mt76_rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX);
+                if dma_idx != pre_send_dma_idx {
+                    return Ok(());
+                }
+                userlib::delay_ms(1);
+            }
         }
         uerror!("mcu", "rx_response_timeout_wm"; snap = pre_send_dma_idx);
         Err(-1)
@@ -625,6 +753,11 @@ impl Mt7996Dev {
 
     /// Send init download command
     pub fn mcu_init_download(&self, ring: &mut TxRing, addr: u32, len: u32, mode: u32, seq: u8) -> Result<(), i32> {
+        self.mcu_init_download_irq(ring, addr, len, mode, seq, None)
+    }
+
+    /// Send init download command with optional IRQ-based waiting.
+    pub fn mcu_init_download_irq(&self, ring: &mut TxRing, addr: u32, len: u32, mode: u32, seq: u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         let cmd = if addr == 0x900000 {
             udebug!("mcu", "init_download_cmd"; addr = addr, cmd = "PATCH_START_REQ");
             mcu_cmd::PATCH_START_REQ
@@ -638,11 +771,11 @@ impl Mt7996Dev {
         self.mcu_send_cmd(ring, cmd, req.as_bytes(), seq)?;
 
         let prev_idx = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
-        if !self.mcu_wait_tx_done(ring, prev_idx, 1000) {
+        if !self.mcu_wait_tx_done_irq(ring, prev_idx, 1000, irq.as_mut().map(|r| &mut **r)) {
             return Err(-1);
         }
 
-        if let Err(_) = self.wait_mcu_rx_response(rx_snap, 2000) {
+        if let Err(_) = self.wait_mcu_rx_response_irq(rx_snap, 2000, irq) {
             return Err(-1);
         }
 
@@ -651,7 +784,29 @@ impl Mt7996Dev {
 
     /// Send firmware chunk (scatter command — raw data, NO TXD header)
     pub fn mcu_send_firmware_chunk(&self, ring: &mut TxRing, data: &[u8], _seq: u8) -> Result<(), i32> {
+        self.mcu_send_firmware_chunk_irq(ring, data, _seq, None)
+    }
+
+    /// Send firmware chunk — fire-and-forget like Linux __mt76_mcu_send_firmware().
+    ///
+    /// Does NOT wait for each chunk's TX completion or RX response.
+    /// Only waits if the TX ring is full (next slot not yet consumed by DMA).
+    /// Linux: mt76_dma_tx_queue_skb_raw() + mt76_dma_tx_cleanup() between chunks.
+    pub fn mcu_send_firmware_chunk_irq(&self, ring: &mut TxRing, data: &[u8], _seq: u8, _irq: Option<&mut FwIrq>) -> Result<(), i32> {
+        // Check if next slot is available (ring full check).
+        // Like Linux tx_cleanup — if DMA hasn't consumed the slot we need, wait briefly.
         let idx = ring.cpu_idx;
+        let next_idx = (idx + 1) % ring.ndesc;
+        if next_idx == self.mt76_rr(ring.regs_base + MT_QUEUE_DMA_IDX) {
+            // Ring full — wait for DMA to consume at least one entry
+            for _ in 0..100u32 {
+                if next_idx != self.mt76_rr(ring.regs_base + MT_QUEUE_DMA_IDX) {
+                    break;
+                }
+                userlib::delay_ms(1);
+            }
+        }
+
         let buf = ring.buf(idx);
 
         unsafe {
@@ -676,17 +831,16 @@ impl Mt7996Dev {
         dma_wmb();
         self.mt76_wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
 
-        let prev_idx = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
-        if !self.mcu_wait_tx_done(ring, prev_idx, 100) {
-            uerror!("wifid", "fw_chunk_timeout";);
-            return Err(-1);
-        }
-
         Ok(())
     }
 
     /// Send patch/firmware start command
     pub fn mcu_start_firmware(&self, ring: &mut TxRing, is_patch: bool, option: u32, addr: u32, seq: u8) -> Result<(), i32> {
+        self.mcu_start_firmware_irq(ring, is_patch, option, addr, seq, None)
+    }
+
+    /// Send patch/firmware start command with optional IRQ-based waiting.
+    pub fn mcu_start_firmware_irq(&self, ring: &mut TxRing, is_patch: bool, option: u32, addr: u32, seq: u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         let cmd = if is_patch {
             mcu_cmd::PATCH_FINISH_REQ
         } else {
@@ -705,12 +859,12 @@ impl Mt7996Dev {
         }
 
         let prev_idx = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
-        if !self.mcu_wait_tx_done(ring, prev_idx, 1000) {
+        if !self.mcu_wait_tx_done_irq(ring, prev_idx, 1000, irq.as_mut().map(|r| &mut **r)) {
             uerror!("wifid", "mcu_start_fw_timeout";);
             return Err(-1);
         }
 
-        if let Err(_) = self.wait_mcu_rx_response(rx_snap, 5000) {
+        if let Err(_) = self.wait_mcu_rx_response_irq(rx_snap, 5000, irq) {
             return Err(-1);
         }
         Ok(())
@@ -718,17 +872,22 @@ impl Mt7996Dev {
 
     /// Get/release patch semaphore
     pub fn mcu_patch_sem_ctrl(&self, ring: &mut TxRing, get: bool, seq: u8) -> Result<(), i32> {
+        self.mcu_patch_sem_ctrl_irq(ring, get, seq, None)
+    }
+
+    /// Get/release patch semaphore with optional IRQ-based waiting.
+    pub fn mcu_patch_sem_ctrl_irq(&self, ring: &mut TxRing, get: bool, seq: u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         let req = if get { PatchSemCtrl::get() } else { PatchSemCtrl::release() };
         let rx_snap = self.snapshot_mcu_rx_idx();
         self.mcu_send_cmd(ring, mcu_cmd::PATCH_SEM_CTRL, req.as_bytes(), seq)?;
 
         let prev_idx = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
-        if !self.mcu_wait_tx_done(ring, prev_idx, 1000) {
+        if !self.mcu_wait_tx_done_irq(ring, prev_idx, 1000, irq.as_mut().map(|r| &mut **r)) {
             uerror!("wifid", "patch_sem_timeout";);
             return Err(-1);
         }
 
-        self.wait_mcu_rx_response(rx_snap, 2000)?;
+        self.wait_mcu_rx_response_irq(rx_snap, 2000, irq)?;
         Ok(())
     }
 
@@ -741,7 +900,7 @@ impl Mt7996Dev {
     ///
     /// type: MCU_FW_LOG_WM(0) or MCU_FW_LOG_WA(1)
     /// ctrl: 0 to enable default logging
-    pub fn mcu_fw_log_2_host(&self, ring: &mut TxRing, fw_type: u8, ctrl: u8, seq: u8) -> Result<(), i32> {
+    pub fn mcu_fw_log_2_host(&self, ring: &mut TxRing, fw_type: u8, ctrl: u8, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // struct: { u8 _rsv[4]; le16 tag; le16 len; u8 ctrl; u8 interval; u8 _rsv2[2]; }
         // total 12 bytes — 4 bytes uni_header + 8 bytes TLV
         let mut data = [0u8; 12];
@@ -766,7 +925,7 @@ impl Mt7996Dev {
         };
 
         udebug!("mcu", "fw_log_2_host"; fw_type = fw_type, ctrl = ctrl);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Enable MWDS (multi-wire download steering)
@@ -803,7 +962,7 @@ impl Mt7996Dev {
     ///
     /// Sends a UNI VOW command with 2 TLVs per band (CLR_EN + EN).
     /// MT7996 has 3 bands (0, 1, 2).
-    pub fn mcu_init_rx_airtime(&self, ring: &mut TxRing, seq: u8) -> Result<(), i32> {
+    pub fn mcu_init_rx_airtime(&self, ring: &mut TxRing, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // 3 bands × 2 TLVs = 6 TLVs
         // Each TLV: struct vow_rx_airtime { le16 tag; le16 len; u8 enable; u8 band; u8 _rsv[2]; } = 8 bytes
         // uni_header(4) + 6 × 8 = 52 bytes
@@ -833,7 +992,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_VOW as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "init_rx_airtime");
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Send WA parameter command
@@ -880,7 +1039,7 @@ impl Mt7996Dev {
     ///
     /// UNI command MCU_WM_UNI_CMD(RRO) (0x57).
     /// Tags: PLATFORM_TYPE=2, BYPASS_MODE=4, TXFREE_PATH=5, FLUSH_TIMEOUT=7
-    pub fn mcu_set_rro(&self, ring: &mut TxRing, tag: u16, val: u16, seq: u8) -> Result<(), i32> {
+    pub fn mcu_set_rro(&self, ring: &mut TxRing, tag: u16, val: u16, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // Struct layout from Linux mcu.c:4688-4720:
         //   u8 __rsv1[4];        // uni_header
         //   le16 tag;
@@ -921,7 +1080,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_RRO as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "set_rro"; tag = tag, val = val);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Read an RF register via MCU.
@@ -929,7 +1088,7 @@ impl Mt7996Dev {
     ///
     /// regidx = (chip_idx << 24) | register_offset
     /// Returns the 32-bit register value.
-    pub fn mcu_rf_regval(&self, ring: &mut TxRing, regidx: u32, seq: u8) -> Result<u32, i32> {
+    pub fn mcu_rf_regval(&self, ring: &mut TxRing, regidx: u32, seq: u8, irq: Option<&mut FwIrq>) -> Result<u32, i32> {
         // Layout: rsv(4) + tag(2) + len(2) + idx(2) + rsv(2) + ofs(4) + data(4) = 20 bytes
         let mut data = [0u8; 20];
 
@@ -952,8 +1111,8 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_REG_ACCESS as u32) | CMD_FIELD_WM;
 
         // Send without waiting — we call wait_rx_response ourselves to get actual position
-        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
-        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000)?;
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)?;
+        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000, irq)?;
 
         // Read result from RX buffer
         // Response layout: RXD(44) + {rsv(4) + tag(2) + len(2) + idx(2) + rsv(2) + ofs(4) + data(4)}
@@ -973,7 +1132,7 @@ impl Mt7996Dev {
     ///
     /// UNI command MCU_WM_UNI_CMD(EFUSE_CTRL) (0x2d).
     /// Sends buffer_mode=0 (efuse), format=1 (whole).
-    pub fn mcu_set_eeprom(&self, ring: &mut TxRing, seq: u8) -> Result<(), i32> {
+    pub fn mcu_set_eeprom(&self, ring: &mut TxRing, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // struct mt7996_mcu_eeprom from mcu.h:150-158:
         //   u8 _rsv[4];          // uni_header
         //   le16 tag;            // UNI_EFUSE_BUFFER_MODE (2)
@@ -998,7 +1157,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "set_eeprom"; mode = 0u8, fmt = EE_FORMAT_WHOLE);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Query number of free eFuse blocks from firmware.
@@ -1009,7 +1168,7 @@ impl Mt7996Dev {
     ///
     /// If free_block_num >= 59, eFuse is empty → need default EEPROM binary (flash upload).
     /// Response: free_block_num at RXD(44) + offset 8 in response payload.
-    pub fn mcu_get_eeprom_free_block(&self, ring: &mut TxRing, seq: u8) -> Result<u8, i32> {
+    pub fn mcu_get_eeprom_free_block(&self, ring: &mut TxRing, seq: u8, irq: Option<&mut FwIrq>) -> Result<u8, i32> {
         // struct {
         //     u8 _rsv[4];          // uni_header
         //     __le16 tag;          // UNI_EFUSE_FREE_BLOCK (3)
@@ -1037,8 +1196,8 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
 
         // Send without waiting — we call wait_rx_response ourselves to get actual position
-        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
-        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000)?;
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)?;
+        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000, irq)?;
 
         // Read response: free_block_num at RXD(44) + offset 8 = byte 52
         if ring.rx_buf_virt != 0 {
@@ -1059,7 +1218,7 @@ impl Mt7996Dev {
     /// Uses MCU_WM_UNI_CMD_QUERY(EFUSE_CTRL) with tag UNI_EFUSE_ACCESS(1).
     /// Response: valid flag at RXD(44)+16, data at RXD(44)+48 (16 bytes).
     /// Returns 16 bytes of EEPROM data at the given offset, or Err if invalid.
-    pub fn mcu_get_eeprom(&self, ring: &mut TxRing, offset: u32, seq: u8) -> Result<[u8; 16], i32> {
+    pub fn mcu_get_eeprom(&self, ring: &mut TxRing, offset: u32, seq: u8, irq: Option<&mut FwIrq>) -> Result<[u8; 16], i32> {
         // struct {
         //     u8 _rsv[4];          // uni_header
         //     __le16 tag;          // UNI_EFUSE_ACCESS (1)
@@ -1085,8 +1244,8 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | CMD_FIELD_QUERY | (MCU_UNI_CMD_EFUSE_CTRL as u32) | CMD_FIELD_WM;
 
         // Send without waiting — we call wait_rx_response ourselves to get actual position
-        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
-        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000)?;
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)?;
+        let resp_pos = self.wait_rx_response(ring, rx_snap, seq, 5000, irq)?;
 
         // Read response from RX buffer
         if ring.rx_buf_virt == 0 {
@@ -1137,7 +1296,7 @@ impl Mt7996Dev {
     ///   u8 buffer_mode;  // EE_MODE_BUFFER (1)
     ///   u8 format;       // MAX_PAGE_IDX[7:5] | PAGE_IDX[4:2] | EE_FORMAT_WHOLE
     ///   le16 buf_len;    // EEPROM data length in this page
-    pub fn mcu_set_eeprom_flash(&self, ring: &mut TxRing, eeprom: &[u8], seq: &mut u8) -> Result<(), i32> {
+    pub fn mcu_set_eeprom_flash(&self, ring: &mut TxRing, eeprom: &[u8], seq: &mut u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         let eeprom_size = eeprom.len();
         let total_pages = (eeprom_size + PER_PAGE_SIZE - 1) / PER_PAGE_SIZE; // DIV_ROUND_UP
 
@@ -1180,7 +1339,7 @@ impl Mt7996Dev {
             // Copy EEPROM data at offset 12
             data[12..12 + eep_len].copy_from_slice(&eeprom[offset..offset + eep_len]);
 
-            self.mcu_send_uni_cmd(ring, cmd, data, true, *seq)?;
+            self.mcu_send_uni_cmd(ring, cmd, data, true, *seq, irq.as_deref_mut())?;
             *seq = seq.wrapping_add(1);
         }
 
@@ -1195,7 +1354,7 @@ impl Mt7996Dev {
     /// Layout (12 bytes): {band_idx:u8, rsv[3], tag:le16, len:le16, enable:u8, rsv2[3]}
     /// Note: first 4 bytes are band_idx header (NOT empty uni_header — BAND_CONFIG specific).
     /// Wait: yes
-    pub fn mcu_set_radio_en(&self, ring: &mut TxRing, band: u8, enable: bool, seq: u8) -> Result<(), i32> {
+    pub fn mcu_set_radio_en(&self, ring: &mut TxRing, band: u8, enable: bool, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // struct from mcu.c:4539-4558
         //   u8 band_idx;      // band index (NOT in uni_header position)
         //   u8 _rsv[3];
@@ -1219,7 +1378,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BAND_CONFIG as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "set_radio_en"; band = band, enable = enable as u8);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Enable/disable thermal protection for a band
@@ -1250,7 +1409,7 @@ impl Mt7996Dev {
             data[11] = 1;      // trigger_type (high)
 
             udebug!("mcu", "thermal_protect_disable"; band = band);
-            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)?;
         }
 
         if !enable {
@@ -1279,7 +1438,7 @@ impl Mt7996Dev {
             data[20..22].copy_from_slice(&10u16.to_le_bytes());
 
             udebug!("mcu", "thermal_protect_enable"; band = band, trigger = MT7996_MAX_TEMP, restore = MT7996_CRIT_TEMP);
-            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)?;
         }
 
         Ok(())
@@ -1311,7 +1470,7 @@ impl Mt7996Dev {
             data[10] = level;     // duty_level
             data[11] = duty_cycle; // duty_cycle
 
-            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)?;
+            self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)?;
             duty_cycle /= 2;
         }
 
@@ -1329,7 +1488,7 @@ impl Mt7996Dev {
     /// UNI cmd MCU_WM_UNI_CMD(BAND_CONFIG) (0x08), tag=UNI_BAND_CONFIG_RTS_THRESHOLD(0x08).
     /// Layout (16 bytes): {band_idx:u8, rsv[3], tag:le16, len:le16=12, len_thresh:le32, pkt_thresh:le32=0x2}
     /// Wait: yes
-    pub fn mcu_set_rts_thresh(&self, ring: &mut TxRing, band: u8, val: u32, seq: u8) -> Result<(), i32> {
+    pub fn mcu_set_rts_thresh(&self, ring: &mut TxRing, band: u8, val: u32, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         let mut data = [0u8; 16];
 
         // band_idx
@@ -1346,7 +1505,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BAND_CONFIG as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "set_rts_thresh"; band = band, val = val);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Set channel info (switch or RX path)
@@ -1356,7 +1515,7 @@ impl Mt7996Dev {
     /// tag: UNI_CHANNEL_SWITCH(0) or UNI_CHANNEL_RX_PATH(1)
     /// Wait: yes
     pub fn mcu_set_chan_info(&self, ring: &mut TxRing, band: u8, tag: u16,
-                            channel: u8, bw: u8, channel_band: u8, seq: u8) -> Result<(), i32> {
+                            channel: u8, bw: u8, channel_band: u8, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // 80 bytes: {rsv[4], tag:le16, len:le16=76, fields..., rsv1[53]}
         // Linux struct is 80 bytes total, len = sizeof(req) - 4 = 76
         let mut data = [0u8; 80];
@@ -1403,7 +1562,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_CHANNEL_SWITCH as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "set_chan_info"; band = band, tag = tag, ch = channel, bw = bw);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Set TX power SKU rate limits
@@ -1418,7 +1577,7 @@ impl Mt7996Dev {
     ///
     /// UNI command MCU_WM_UNI_CMD(TXPOWER) (0x2b) — WM only.
     /// Wait: yes
-    pub fn mcu_set_txpower_sku(&self, ring: &mut TxRing, band: u8, seq: u8) -> Result<(), i32> {
+    pub fn mcu_set_txpower_sku(&self, ring: &mut TxRing, band: u8, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // struct tx_power_limit_table_ctrl from mcu.c:4803-4816:
         //   u8 __rsv1[4];           // uni_header (4)
         //   le16 tag;               // UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL (4)
@@ -1456,7 +1615,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_TXPOWER as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "set_txpower_sku"; band = band);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Enable/disable RX header translation
@@ -1465,7 +1624,7 @@ impl Mt7996Dev {
     /// UNI cmd MCU_WM_UNI_CMD(RX_HDR_TRANS) (0x12) — WM only.
     /// Multi-TLV: HDR_TRANS_EN + HDR_TRANS_VLAN + HDR_TRANS_BLACKLIST (if enable)
     /// Wait: yes
-    pub fn mcu_set_hdr_trans(&self, ring: &mut TxRing, enable: bool, seq: u8) -> Result<(), i32> {
+    pub fn mcu_set_hdr_trans(&self, ring: &mut TxRing, enable: bool, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // 4-byte uni_header + 3 TLVs (8 bytes each) = 28 bytes when enabled
         // 4-byte uni_header + 2 TLVs (8 bytes each) = 20 bytes when disabled
         let total = if enable { 28 } else { 20 };
@@ -1501,7 +1660,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_RX_HDR_TRANS as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "set_hdr_trans"; enable = enable as u8);
-        self.mcu_send_uni_cmd(ring, cmd, &data[..total], true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data[..total], true, seq, irq)
     }
 
     /// Add/remove device info (OMAC)
@@ -1510,7 +1669,7 @@ impl Mt7996Dev {
     /// UNI cmd MCU_WMWA_UNI_CMD(DEV_INFO_UPDATE) (0x01) — both WM+WA.
     /// Wait: yes
     pub fn mcu_add_dev_info(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
-                            mac_addr: &[u8; 6], enable: bool, seq: u8) -> Result<(), i32> {
+                            mac_addr: &[u8; 6], enable: bool, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // hdr(4) + DEV_INFO_ACTIVE tlv: tag(2) + len(2) + active(1) + rsv(1) + omac_addr(6) = 16
         let mut data = [0u8; 16];
 
@@ -1530,7 +1689,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_DEV_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "add_dev_info"; band = band, omac = omac_idx, enable = enable as u8);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Add/remove BSS info with all required AP TLVs
@@ -1547,7 +1706,7 @@ impl Mt7996Dev {
     /// Wait: yes
     pub fn mcu_add_bss_info(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
                             hw_bss_idx: u8, mac_addr: &[u8; 6], enable: bool,
-                            channel: u8, seq: u8) -> Result<(), i32> {
+                            channel: u8, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // Layout: uni_header(4) + BASIC(32) + SEC(8) + RLM(16) + RA(16) + RATE(24) + TXCMD(8) + IFS_TIME(20) + MLD(16) = 144
         let mut data = [0u8; 144];
 
@@ -1662,7 +1821,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BSS_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "add_bss_info"; band = band, omac = omac_idx, bss = hw_bss_idx, enable = enable as u8);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Add/update STA record
@@ -1679,7 +1838,7 @@ impl Mt7996Dev {
     ///   3. STA_REC_TX_PROC — TX processing flags (mcu.c:1884-1893)
     pub fn mcu_add_sta(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
                        omac_idx: u8, conn_state: u8, mac_addr: &[u8; 6],
-                       newly: bool, seq: u8) -> Result<(), i32> {
+                       newly: bool, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         let mut data = [0u8; 44];
 
         // === sta_req_hdr (8 bytes) — mt76_connac_mcu.h ===
@@ -1745,7 +1904,65 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "add_sta"; bss = bss_idx, wlan = wlan_idx, state = conn_state);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
+    }
+
+    /// Add/update a client STA record in firmware.
+    /// Like mcu_add_sta() but for real client STAs (not BMC):
+    ///   - conn_type = CONNECTION_INFRA_STA (not INFRA_BC)
+    ///   - Actual client MAC address (not broadcast)
+    ///   - AID set from association
+    ///   - QoS enabled (WME)
+    ///   - muar_idx = omac_idx (maps to specific OMAC, not wildcard)
+    ///
+    /// Source: Linux mt76_connac_mcu.c:388-415 (link_sta != NULL path)
+    pub fn mcu_add_client_sta(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
+                              omac_idx: u8, conn_state: u8, mac_addr: &[u8; 6],
+                              aid: u16, newly: bool, seq: u8,
+                              irq: Option<&mut FwIrq>) -> Result<(), i32> {
+        let mut data = [0u8; 44];
+
+        // === sta_req_hdr (8 bytes) ===
+        data[0] = bss_idx;
+        data[1] = wlan_idx as u8;
+        data[2..4].copy_from_slice(&3u16.to_le_bytes()); // tlv_num = 3
+        data[4] = 1; // is_tlv_append
+        // muar_idx: for real STAs with link_sta, use omac_idx
+        // Linux: mt76_connac_mcu.c:280 — if (wcid->sta) muar_idx = mvif->omac_idx
+        data[5] = omac_idx;
+        data[6] = (wlan_idx >> 8) as u8;
+
+        // === STA_REC_BASIC TLV (20 bytes) ===
+        let off = 8;
+        data[off..off + 2].copy_from_slice(&STA_REC_BASIC.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());
+        // conn_type = CONNECTION_INFRA_STA (client STA, not BMC)
+        data[off + 4..off + 8].copy_from_slice(&CONNECTION_INFRA_STA.to_le_bytes());
+        data[off + 8] = conn_state;
+        data[off + 9] = 1; // qos = 1 (WME enabled for client STAs)
+        data[off + 10..off + 12].copy_from_slice(&aid.to_le_bytes());
+        data[off + 12..off + 18].copy_from_slice(mac_addr);
+        let mut extra = EXTRA_INFO_VER;
+        if newly { extra |= EXTRA_INFO_NEW; }
+        data[off + 18..off + 20].copy_from_slice(&extra.to_le_bytes());
+
+        // === STA_REC_HDR_TRANS TLV (8 bytes) ===
+        let off = 28;
+        data[off..off + 2].copy_from_slice(&STA_REC_HDR_TRANS.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        data[off + 4] = 1; // from_ds = true (AP mode)
+        data[off + 5] = 0; // to_ds = false
+        data[off + 6] = 1; // dis_rx_hdr_tran = true (new WCID)
+
+        // === STA_REC_TX_PROC TLV (8 bytes) ===
+        let off = 36;
+        data[off..off + 2].copy_from_slice(&STA_REC_TX_PROC.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
+
+        udebug!("mcu", "add_client_sta"; bss = bss_idx, wlan = wlan_idx, state = conn_state, aid = aid);
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Assign WCID to BSS scheduling group (VOW DRR control)
@@ -1757,7 +1974,7 @@ impl Mt7996Dev {
     /// Command: MCU_WM_UNI_CMD(VOW) = CMD_FIELD_UNI | 0x37 | CMD_FIELD_WM
     /// Wait: yes
     pub fn mcu_add_group(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
-                         seq: u8) -> Result<(), i32> {
+                         seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // Layout: uni_header(4) + TLV(20) = 24 bytes
         // Linux struct: __rsv1[4] + tag(2) + len(2) + wlan_idx(2) + __rsv2[2] + action(4) + val(4) + __rsv3[8]
         let mut data = [0u8; 24];
@@ -1779,7 +1996,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_VOW as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "add_group"; wlan = wlan_idx, bss = bss_idx);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Initialize transmit beamforming subsystem
@@ -1792,7 +2009,7 @@ impl Mt7996Dev {
     ///   3. BF_HW_EN_UPDATE (tag=17) — enable explicit beamforming
     ///
     /// Called from init_work() after mac_init(). Required before TX works.
-    pub fn mcu_txbf_init(&self, ring: &mut TxRing, seq: &mut u8) -> Result<(), i32> {
+    pub fn mcu_txbf_init(&self, ring: &mut TxRing, seq: &mut u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BF as u32) | CMD_FIELD_WM;
 
         // 1. BF_MOD_EN_CTRL (tag=20, len=16) — init.c:645-654
@@ -1804,7 +2021,7 @@ impl Mt7996Dev {
             data[8] = 3;    // bf_num = 3 (tri-band)
             data[9] = 0x07; // bf_bitmap = GENMASK(2,0)
             // bf_sel[8] + rsv[2] = 0
-            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq)?;
+            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq, irq.as_deref_mut())?;
             *seq = seq.wrapping_add(1);
         }
 
@@ -1815,7 +2032,7 @@ impl Mt7996Dev {
             data[6..8].copy_from_slice(&20u16.to_le_bytes()); // len
             data[8] = 4; // snd_mode = BF_PROCESSING
             // sta_num, rsv, wlan_id[4], snd_period = 0
-            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq)?;
+            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq, irq.as_deref_mut())?;
             *seq = seq.wrapping_add(1);
         }
 
@@ -1826,7 +2043,7 @@ impl Mt7996Dev {
             data[6..8].copy_from_slice(&8u16.to_le_bytes());  // len
             data[8] = 1; // ebf = true (explicit BF always enabled)
             data[9] = 0; // ibf = false (implicit BF off by default)
-            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq)?;
+            self.mcu_send_uni_cmd(ring, cmd, &data, true, *seq, irq)?;
             *seq = seq.wrapping_add(1);
         }
 
@@ -1843,7 +2060,7 @@ impl Mt7996Dev {
     ///
     /// Command: MCU_WM_UNI_CMD(EDCA_UPDATE) = CMD_FIELD_UNI | 0x04 | CMD_FIELD_WM
     /// Wait: yes
-    pub fn mcu_set_edca(&self, ring: &mut TxRing, bss_idx: u8, seq: u8) -> Result<(), i32> {
+    pub fn mcu_set_edca(&self, ring: &mut TxRing, bss_idx: u8, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // Layout: hdr(4) + 4 × edca_tlv(12) = 52 bytes
         // struct edca from mcu.h:284-295:
         //   tag:le16, len:le16, queue:u8, set:u8, cw_min:u8, cw_max:u8,
@@ -1888,7 +2105,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_EDCA_UPDATE as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "set_edca"; bss = bss_idx);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Upload beacon template to MCU
@@ -1903,19 +2120,20 @@ impl Mt7996Dev {
     /// Wait: yes
     pub fn mcu_set_beacon(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
                            mac_addr: &[u8; 6], channel: u8, enable: bool,
-                           seq: u8) -> Result<(), i32> {
+                           seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // 802.11 beacon frame layout:
-        //   MAC header (24) + timestamp (8) + interval (2) + capability (2) +
-        //   SSID IE (10) + Rates IE (10) + DS IE (3) + TIM IE (6) = 65 bytes
-        const BEACON_LEN: usize = 65;
+        //   MAC header (24) + fixed fields (12) +
+        //   SSID(10) + Rates(10) + DS(3) + TIM(6) + Country(8) + ERP(3) +
+        //   HT_Cap(28) + ExtRates(6) + HT_Oper(24) + WMM(26) = 160 bytes
+        const BEACON_LEN: usize = 160;
 
         // TLV data after uni_header:
-        //   bcn_content header (14) + TXD (32) + beacon (65) = 111
-        //   ALIGN(111, 4) = 112  →  TLV len field
-        // Total buffer: uni_header (4) + TLV (112) = 116
-        const TLV_BODY_LEN: usize = 14 + MT_TXD_SIZE + BEACON_LEN; // 111
-        const TLV_ALIGNED: usize = (TLV_BODY_LEN + 3) & !3;        // 112
-        const DATA_LEN: usize = 4 + TLV_ALIGNED;                    // 116
+        //   bcn_content header (14) + TXD (32) + beacon (160) = 206
+        //   ALIGN(206, 4) = 208  →  TLV len field
+        // Total buffer: uni_header (4) + TLV (208) = 212
+        const TLV_BODY_LEN: usize = 14 + MT_TXD_SIZE + BEACON_LEN; // 206
+        const TLV_ALIGNED: usize = (TLV_BODY_LEN + 3) & !3;        // 208
+        const DATA_LEN: usize = 4 + TLV_ALIGNED;                    // 212
 
         let mut data = [0u8; DATA_LEN];
 
@@ -1994,69 +2212,28 @@ impl Mt7996Dev {
 
         // txd[7]: 0
 
-        // === 802.11 Beacon Frame (65 bytes) ===
+        // === 802.11 Beacon Frame (74 bytes) ===
+        // Use wifi80211 frame builder to ensure beacon template matches software beacons
         let bcn_off = txd_off + MT_TXD_SIZE;
+        let mut bss = wifi80211::types::BssConfig {
+            bssid: *mac_addr,
+            ssid: [0u8; wifi80211::types::MAX_SSID_LEN],
+            ssid_len: 8,
+            channel,
+        };
+        bss.ssid[..8].copy_from_slice(b"Filament");
+        let bcn_len = wifi80211::frame::build_beacon(&mut data[bcn_off..], &bss, 0);
+        // seq_ctrl = 0 (MCU manages sequence) — build_beacon sets seq, override to 0
+        data[bcn_off + 22] = 0;
+        data[bcn_off + 23] = 0;
 
-        // MAC Header (24 bytes)
-        // frame_control: type=0 mgmt, subtype=8 beacon → 0x0080
-        data[bcn_off..bcn_off + 2].copy_from_slice(&0x0080u16.to_le_bytes());
-        // duration = 0
-        // addr1 (DA): ff:ff:ff:ff:ff:ff (broadcast)
-        data[bcn_off + 4..bcn_off + 10].copy_from_slice(&[0xff; 6]);
-        // addr2 (SA): our MAC
-        data[bcn_off + 10..bcn_off + 16].copy_from_slice(mac_addr);
-        // addr3 (BSSID): our MAC
-        data[bcn_off + 16..bcn_off + 22].copy_from_slice(mac_addr);
-        // seq_ctrl = 0 (MCU manages sequence)
-
-        // Beacon Body
-        let body_off = bcn_off + 24;
-        // timestamp: u64 = 0 (MCU fills this) — 8 bytes
-        // beacon_interval: 100 TU
-        data[body_off + 8..body_off + 10].copy_from_slice(&100u16.to_le_bytes());
-        // capability: ESS(0x0001) | Short Preamble(0x0020) | Short Slot Time(0x0400) = 0x0421
-        data[body_off + 10..body_off + 12].copy_from_slice(&0x0421u16.to_le_bytes());
-
-        // IE 0: SSID "Filament" (10 bytes)
-        let ie_off = body_off + 12;
-        data[ie_off] = 0x00;      // element ID
-        data[ie_off + 1] = 8;     // length
-        data[ie_off + 2..ie_off + 10].copy_from_slice(b"Filament");
-
-        // IE 1: Supported Rates (10 bytes)
-        // 1,2,5.5,11 Mbps basic (0x80|rate) + 6,9,12,18 Mbps
-        let rates_off = ie_off + 10;
-        data[rates_off] = 0x01;    // element ID
-        data[rates_off + 1] = 8;   // length
-        data[rates_off + 2] = 0x82; // 1 Mbps (basic)
-        data[rates_off + 3] = 0x84; // 2 Mbps (basic)
-        data[rates_off + 4] = 0x8b; // 5.5 Mbps (basic)
-        data[rates_off + 5] = 0x96; // 11 Mbps (basic)
-        data[rates_off + 6] = 0x0c; // 6 Mbps
-        data[rates_off + 7] = 0x12; // 9 Mbps
-        data[rates_off + 8] = 0x18; // 12 Mbps
-        data[rates_off + 9] = 0x24; // 18 Mbps
-
-        // IE 3: DS Parameter Set (3 bytes)
-        let ds_off = rates_off + 10;
-        data[ds_off] = 0x03;       // element ID
-        data[ds_off + 1] = 1;      // length
-        data[ds_off + 2] = channel;
-
-        // IE 5: TIM (6 bytes)
-        let tim_off = ds_off + 3;
-        data[tim_off] = 0x05;      // element ID
-        data[tim_off + 1] = 4;     // length
-        data[tim_off + 2] = 0;     // DTIM count
-        data[tim_off + 3] = 1;     // DTIM period
-        data[tim_off + 4] = 0;     // bitmap control
-        data[tim_off + 5] = 0;     // partial virtual bitmap
+        debug_assert_eq!(bcn_len, BEACON_LEN, "beacon template size mismatch");
 
         // MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) = __MCU_CMD_FIELD_UNI | 0x02 | WM | WA
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BSS_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "set_beacon"; band = band, omac = omac_idx, ch = channel, enable = enable as u8);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
     }
 
     /// Program a fixed rate table entry
@@ -2065,7 +2242,7 @@ impl Mt7996Dev {
     /// UNI command MCU_WM_UNI_CMD(FIXED_RATE_TABLE) (0x40), tag=0.
     /// Used for basic rate programming (12 CCK+OFDM rates).
     pub fn mcu_set_fixed_rate_table(&self, ring: &mut TxRing, table_idx: u8, rate_idx: u16,
-                                    is_beacon: bool, band: u8, seq: u8) -> Result<(), i32> {
+                                    is_beacon: bool, band: u8, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // struct fixed_rate_table_ctrl from mcu.h:954-972:
         //   u8 _rsv[4];          // uni_header
         //   le16 tag;            // UNI_FIXED_RATE_TABLE_SET (0)
@@ -2111,7 +2288,7 @@ impl Mt7996Dev {
         // MCU_WM_UNI_CMD(FIXED_RATE_TABLE) = __MCU_CMD_FIELD_UNI | 0x40 | __MCU_CMD_FIELD_WM
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_FIXED_RATE_TABLE as u32) | CMD_FIELD_WM;
 
-        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, irq)
     }
 
     /// Background chain control — start/stop offchannel scan
@@ -2181,7 +2358,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_OFFCH_SCAN_CTRL as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "background_chain_ctrl"; scan_mode = scan_mode, channel = channel);
-        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)  // wait=false — mcu.c:3657
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)  // wait=false — mcu.c:3657
     }
 
     /// Query all STA info — periodic heartbeat to firmware.
@@ -2195,7 +2372,7 @@ impl Mt7996Dev {
         data[6..8].copy_from_slice(&4u16.to_le_bytes()); // len = sizeof(req) - 4 = 4
 
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_ALL_STA_INFO as u32) | CMD_FIELD_WM;
-        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)
     }
 
     /// Read and clear channel MIB counters (TX time, RX time, OBSS airtime, non-WiFi time).
@@ -2243,6 +2420,6 @@ impl Mt7996Dev {
 
         // wait=false: we don't need the response data, just the clearing side-effect.
         // The response will arrive on MCU WM RX and be recycled by rx_process_mcu().
-        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)
     }
 }

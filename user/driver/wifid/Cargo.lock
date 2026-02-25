@@ -14,8 +14,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wifi80211"
+version = "0.1.0"
+
+[[package]]
 name = "wifid"
 version = "0.1.0"
 dependencies = [
  "userlib",
+ "wifi80211",
 ]

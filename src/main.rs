@@ -464,6 +464,11 @@ pub extern "C" fn irq_handler_rust(_from_user: u64) {
                 uart::clear_tx_blocked();
             }
         }
+    } else if let Some(port) = pci::port_for_gic_irq(irq) {
+        // PCIe port SPI — demux into virtual MSI IRQs
+        // msi_dispatch calls irq::notify() for each virtual IRQ,
+        // which enqueues Wake microtasks for the owning processes.
+        pci::msi_dispatch(port);
     } else {
         // Check if this IRQ is registered by a userspace driver
         if let Some(owner_pid) = irq::notify(irq) {

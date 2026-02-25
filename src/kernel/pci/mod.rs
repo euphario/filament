@@ -47,7 +47,7 @@
 mod host;
 mod device;
 mod config;
-mod msi;
+pub mod msi;
 
 pub use host::{PciHost, PciHostOps};
 pub use device::{PciDevice, PciDeviceRegistry, PciBdf};
@@ -196,7 +196,7 @@ impl PciSubsystem {
 /// MT7988A-specific PCI host controller
 pub struct Mt7988aPciHost {
     /// Base addresses for each port's MAC registers
-    port_bases: [usize; 4],
+    pub(crate) port_bases: [usize; 4],
     /// Number of active ports
     port_count: usize,
     /// Port link status
@@ -231,7 +231,7 @@ impl Mt7988aPciHost {
     }
 
     /// Read MAC register
-    fn read_mac(&self, port: usize, offset: usize) -> u32 {
+    pub(crate) fn read_mac(&self, port: usize, offset: usize) -> u32 {
         if port >= self.port_count || self.port_bases[port] == 0 {
             return 0xFFFF_FFFF;
         }
@@ -245,7 +245,7 @@ impl Mt7988aPciHost {
     }
 
     /// Write MAC register
-    fn write_mac(&self, port: usize, offset: usize, value: u32) {
+    pub(crate) fn write_mac(&self, port: usize, offset: usize, value: u32) {
         if port >= self.port_count || self.port_bases[port] == 0 {
             return;
         }
@@ -256,6 +256,23 @@ impl Mt7988aPciHost {
             phys
         };
         unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
+    }
+}
+
+impl Mt7988aPciHost {
+    /// Find a PCI capability by walking the capability list.
+    /// Separate from PciHostOps to avoid borrow conflicts in msi_alloc.
+    pub(crate) fn find_capability_via_ops(&self, bdf: PciBdf, cap_id: u8) -> Option<u8> {
+        let status = <Self as PciHostOps>::config_read16(self, bdf, 0x06);
+        if (status & 0x10) == 0 { return None; }
+        let mut cap_ptr = <Self as PciHostOps>::config_read8(self, bdf, 0x34) & 0xFC;
+        for _ in 0..48 {
+            if cap_ptr == 0 { break; }
+            let id = <Self as PciHostOps>::config_read8(self, bdf, cap_ptr as u16);
+            if id == cap_id { return Some(cap_ptr); }
+            cap_ptr = <Self as PciHostOps>::config_read8(self, bdf, (cap_ptr + 1) as u16) & 0xFC;
+        }
+        None
     }
 }
 
@@ -839,16 +856,198 @@ pub fn bar_info(bdf: PciBdf, bar: u8) -> PciResult<(u64, u64)> {
     host.bar_info(bdf, bar).ok_or(PciError::InvalidBar)
 }
 
-/// Allocate MSI vector for a device
+/// Allocate MSI vector for a device.
+///
+/// On first allocation for a port:
+///   1. Programs MAC MSI capture addresses and enables MSI sets
+///   2. Enables the port's GIC SPI for MSI dispatch
+///
+/// For each allocation:
+///   3. Allocates a vector from the bitmap
+///   4. Programs the endpoint's MSI capability with msg_addr/msg_data
+///
+/// Returns the virtual IRQ number that the driver watches via Irq::new().
 pub fn msi_alloc(bdf: PciBdf, count: u8) -> PciResult<u32> {
     let pci = subsystem_mut().ok_or(PciError::NotInitialized)?;
-    pci.msi.allocate(bdf, count)
+
+    // Get port and MAC base from host (single source of truth for port bases)
+    let (port, mac_phys_base) = match &pci.host {
+        Some(PciHostImpl::Mt7988a(mt)) => {
+            let port = MsiAllocator::port_for_bdf(&bdf);
+            if port >= msi::PORT_COUNT || mt.port_bases[port] == 0 {
+                return Err(PciError::NotInitialized);
+            }
+            (port, mt.port_bases[port] as u64)
+        }
+        _ => return Err(PciError::NotInitialized),
+    };
+
+    // Find MSI capability on the endpoint
+    let msi_cap = match &pci.host {
+        Some(PciHostImpl::Mt7988a(mt)) => {
+            mt.find_capability_via_ops(bdf, 0x05).ok_or(PciError::NoMsiVectors)?
+        }
+        _ => return Err(PciError::NotInitialized),
+    };
+
+    // Allocate virtual IRQ from bitmap (pure accounting, no hardware access)
+    let alloc = pci.msi.allocate(port, count)?;
+
+    // First-time MAC MSI setup for this port
+    // From Linux pcie-mediatek-gen3.c: mtk_pcie_enable_msi()
+    if pci.msi.needs_mac_init(port) {
+        if let Some(PciHostImpl::Mt7988a(ref mt)) = pci.host {
+            // Program MSI capture addresses for each set
+            // msg_addr = MAC_BASE + 0xc00 + set * 0x10 (physical address)
+            for set in 0..msi::MSI_SET_COUNT {
+                let msg_addr_phys = mac_phys_base + msi::PCIE_MSI_SET_BASE_REG as u64
+                    + (set * msi::MSI_SET_OFFSET) as u64;
+                // Write capture address (lower 32) to set base register
+                mt.write_mac(port, msi::PCIE_MSI_SET_BASE_REG + set * msi::MSI_SET_OFFSET,
+                    msg_addr_phys as u32);
+                // Write capture address (upper 32) to high address register
+                mt.write_mac(port, msi::PCIE_MSI_SET_ADDR_HI_BASE + set * msi::MSI_ADDR_HI_OFFSET,
+                    (msg_addr_phys >> 32) as u32);
+                // Enable all 32 vectors in this set
+                mt.write_mac(port, msi::PCIE_MSI_SET_BASE_REG + set * msi::MSI_SET_OFFSET
+                    + msi::MSI_SET_ENABLE_OFFSET, 0xFFFF_FFFF);
+            }
+            // Enable all MSI sets
+            mt.write_mac(port, msi::PCIE_MSI_SET_ENABLE_REG, msi::MSI_SET_ENABLE_BITS);
+            // Enable MSI interrupts in INT_ENABLE
+            let int_en = mt.read_mac(port, msi::PCIE_INT_ENABLE_REG);
+            mt.write_mac(port, msi::PCIE_INT_ENABLE_REG, int_en | msi::MSI_INT_ENABLE_BITS);
+
+            kdebug!("msi", "mac_msi_enabled"; port = port as u64, base = mac_phys_base);
+            pci.msi.mark_mac_initialized(port);
+        }
+    }
+
+    // First-time GIC SPI enable for this port
+    if pci.msi.needs_gic_spi_enable(port) {
+        #[cfg(feature = "platform-mt7988a")]
+        {
+            let spi = crate::platform::mt7988::irq::PCIE[port];
+            crate::platform::current::gic::enable_irq(spi);
+            kdebug!("msi", "gic_spi_enabled"; port = port as u64, spi = spi as u64);
+        }
+        pci.msi.mark_gic_spi_enabled(port);
+    }
+
+    // Program endpoint MSI capability
+    let msg_addr = mac_phys_base + msi::PCIE_MSI_SET_BASE_REG as u64
+        + (alloc.set as u64) * msi::MSI_SET_OFFSET as u64;
+    let msg_data = alloc.vector as u32;
+
+    if let Some(PciHostImpl::Mt7988a(ref mt)) = pci.host {
+        let msi_cap_off = msi_cap as u16;
+        let msg_ctrl = <Mt7988aPciHost as PciHostOps>::config_read16(mt, bdf, msi_cap_off + 0x02);
+        let is_64bit = (msg_ctrl & (1 << 7)) != 0;
+
+        // Write Message Address (lower 32 bits)
+        mt.config_write32(bdf, msi_cap_off + 0x04, msg_addr as u32);
+
+        if is_64bit {
+            mt.config_write32(bdf, msi_cap_off + 0x08, (msg_addr >> 32) as u32);
+            <Mt7988aPciHost as PciHostOps>::config_write16(mt, bdf, msi_cap_off + 0x0C, msg_data as u16);
+        } else {
+            <Mt7988aPciHost as PciHostOps>::config_write16(mt, bdf, msi_cap_off + 0x08, msg_data as u16);
+        }
+
+        // Enable MSI: set bit 0, MME=0 (1 vector)
+        let new_ctrl = (msg_ctrl & !0x0070) | 0x0001;
+        <Mt7988aPciHost as PciHostOps>::config_write16(mt, bdf, msi_cap_off + 0x02, new_ctrl);
+
+        kdebug!("msi", "endpoint_programmed"; cap = msi_cap_off as u64,
+            addr = msg_addr, data = msg_data as u64, is64 = is_64bit as u64);
+    }
+
+    Ok(alloc.virtual_irq)
 }
 
 /// Free MSI vectors for a device
 pub fn msi_free(bdf: PciBdf) {
     if let Some(pci) = subsystem_mut() {
         pci.msi.free(bdf);
+    }
+}
+
+/// Check if a GIC IRQ number is a PCIe port SPI.
+/// Returns the port index (0-3) if it matches.
+pub fn port_for_gic_irq(irq: u32) -> Option<usize> {
+    #[cfg(feature = "platform-mt7988a")]
+    {
+        use crate::platform::mt7988::irq as mt_irq;
+        for (port, &pcie_irq) in mt_irq::PCIE.iter().enumerate() {
+            if irq == pcie_irq {
+                return Some(port);
+            }
+        }
+    }
+    let _ = irq; // suppress unused warning on non-MT7988A platforms
+    None
+}
+
+/// Dispatch MSI interrupts for a PCIe port.
+///
+/// Called from the GIC SPI handler when a PCIe port interrupt fires.
+/// Reads MAC INT_STATUS, finds fired MSI vectors, and calls irq::notify()
+/// for each virtual IRQ.
+pub fn msi_dispatch(port: usize) {
+    let pci = match subsystem() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let mt = match &pci.host {
+        Some(PciHostImpl::Mt7988a(mt)) => mt,
+        _ => return,
+    };
+
+    let int_status = mt.read_mac(port, msi::PCIE_INT_STATUS_REG);
+
+    // MSI set bits are bits 15:8 in INT_STATUS
+    let msi_bits = (int_status >> 8) & 0xFF;
+    if msi_bits == 0 {
+        return;
+    }
+
+    // Clear MSI bits in INT_STATUS (W1C)
+    mt.write_mac(port, msi::PCIE_INT_STATUS_REG, msi_bits << 8);
+
+    for set in 0..msi::MSI_SET_COUNT {
+        if (msi_bits & (1 << set)) == 0 {
+            continue;
+        }
+
+        let set_status = mt.read_mac(port,
+            msi::PCIE_MSI_SET_BASE_REG + set * msi::MSI_SET_OFFSET + msi::MSI_SET_STATUS_OFFSET);
+        if set_status == 0 {
+            continue;
+        }
+
+        // Clear set status (W1C)
+        mt.write_mac(port,
+            msi::PCIE_MSI_SET_BASE_REG + set * msi::MSI_SET_OFFSET + msi::MSI_SET_STATUS_OFFSET,
+            set_status);
+
+        let mut remaining = set_status;
+        while remaining != 0 {
+            let vector = remaining.trailing_zeros() as usize;
+            remaining &= !(1u32 << vector);
+
+            let virtual_irq = msi::MSI_IRQ_BASE
+                + (port as u32) * msi::MSI_VECTORS_PER_PORT as u32
+                + (set as u32) * 32
+                + vector as u32;
+
+            // Wake the process watching this virtual IRQ
+            if let Some(owner_pid) = crate::kernel::irq::notify(virtual_irq) {
+                let _ = crate::kernel::microtask::enqueue(
+                    crate::kernel::microtask::MicroTask::Wake { pid: owner_pid },
+                );
+            }
+        }
     }
 }
 

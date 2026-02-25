@@ -19,6 +19,7 @@
 //! | close | Release handle |
 
 use super::{Object, ObjectType, Handle, ConsoleType, Pollable};
+use crate::kdebug;
 use crate::kernel::error::KernelError;
 use crate::kernel::task;
 use crate::kernel::uaccess;
@@ -781,6 +782,7 @@ fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
     // Check device exists
     let bdf_typed = PciBdf::from_u32(bdf);
     if pci::find_by_bdf(bdf_typed).is_none() {
+        kdebug!("pci", "open_pci_not_found"; bdf = bdf as u64);
         return KernelError::NotFound.to_errno();
     }
 
@@ -789,6 +791,12 @@ fn open_pci_device(params_ptr: u64, params_len: usize) -> i64 {
     let Some(task_id) = task_id else {
         return KernelError::BadHandle.to_errno();
     };
+
+    // Claim ownership of the device in the PCI registry
+    if let Err(_) = pci::claim_device(bdf_typed, task_id) {
+        kdebug!("pci", "open_pci_claim_fail"; bdf = bdf as u64, task = task_id as u64);
+        return KernelError::PermDenied.to_errno();
+    }
 
     // Delegate to ObjectService
     use crate::kernel::object_service::object_service;
@@ -824,7 +832,10 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
     // Check device exists and caller owns it
     let dev = match pci::find_by_bdf(bdf_typed) {
         Some(d) => d,
-        None => return KernelError::NotFound.to_errno(),
+        None => {
+            kdebug!("pci", "msi_dev_not_found"; bdf = bdf as u64);
+            return KernelError::NotFound.to_errno();
+        }
     };
 
     // Get current pid via safe scheduler access
@@ -833,19 +844,27 @@ fn open_msi(params_ptr: u64, params_len: usize) -> i64 {
     });
 
     if dev.owner() != task_id {
+        kdebug!("pci", "msi_owner_mismatch"; bdf = bdf as u64, owner = dev.owner() as u64, task = task_id as u64);
         return KernelError::PermDenied.to_errno();
     }
 
     // Check device supports MSI
     if !dev.has_msi() && !dev.has_msix() {
+        kdebug!("pci", "msi_not_supported"; bdf = bdf as u64);
         return KernelError::NotSupported.to_errno();
     }
 
     // Allocate vectors
     let first_irq = match pci::msi_alloc(bdf_typed, count) {
         Ok(irq) => irq,
-        Err(pci::PciError::NoMsiVectors) => return KernelError::NoSpace.to_errno(),
-        Err(_) => return KernelError::Io.to_errno(),
+        Err(pci::PciError::NoMsiVectors) => {
+            kdebug!("pci", "msi_no_vectors"; bdf = bdf as u64);
+            return KernelError::NoSpace.to_errno();
+        }
+        Err(_) => {
+            kdebug!("pci", "msi_alloc_io_err"; bdf = bdf as u64);
+            return KernelError::Io.to_errno();
+        }
     };
 
     // Delegate to ObjectService

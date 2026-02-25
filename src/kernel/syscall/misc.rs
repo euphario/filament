@@ -142,6 +142,13 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
         }
         let mut cursor = u32::from_le_bytes(cursor_bytes);
 
+        // cursor=0 means "start from oldest". Snap to tail so we don't
+        // land in the middle of a record that wraps the ring boundary.
+        if cursor == 0 {
+            let ring = crate::klog::LOG_RING.lock();
+            cursor = ring.tail_cursor();
+        }
+
         let text_space = actual_len - 4;
         let mut out_buf = [0u8; 4096]; // Stack buffer for packed records
         let mut out_pos: usize = 0;

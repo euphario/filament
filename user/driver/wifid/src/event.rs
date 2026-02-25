@@ -12,7 +12,9 @@ use crate::regs::*;
 // RX Frame Classification
 // ============================================================================
 
-/// Classification result for a received frame
+/// Classification result for a received frame.
+/// Beacon/ProbeReq/ProbeResp are kept for MIB counting; Auth/AssocReq/Deauth/Disassoc
+/// are folded into MgmtAction (handled by wifi80211's ApManager).
 #[derive(Clone, Copy, Debug)]
 pub enum RxFrameClass {
     Data,
@@ -20,6 +22,10 @@ pub enum RxFrameClass {
     Beacon,
     ProbeReq,
     ProbeResp,
+    Auth,
+    AssocReq,
+    Deauth,
+    Disassoc,
     TxStatus,
     TxrxNotify,
     FwMonitor,
@@ -96,9 +102,13 @@ pub fn refine_mgmt_subtype(fc0: u8) -> RxFrameClass {
     }
     let subtype = (fc0 >> 4) & 0xF;
     match subtype {
-        0x8 => RxFrameClass::Beacon,     // Beacon
+        0x0 => RxFrameClass::AssocReq,   // Association Request
         0x4 => RxFrameClass::ProbeReq,   // Probe Request
         0x5 => RxFrameClass::ProbeResp,  // Probe Response
+        0x8 => RxFrameClass::Beacon,     // Beacon
+        0xA => RxFrameClass::Disassoc,   // Disassociation
+        0xB => RxFrameClass::Auth,        // Authentication
+        0xC => RxFrameClass::Deauth,      // Deauthentication
         _ => RxFrameClass::Mgmt,
     }
 }
@@ -118,6 +128,9 @@ pub struct RxMibCounters {
     pub beacon: u32,
     pub probe_req: u32,
     pub probe_resp: u32,
+    pub auth: u32,
+    pub assoc_req: u32,
+    pub deauth: u32,
     pub fcs_err: u32,
     pub txs: u32,
     pub txrx_notify: u32,
@@ -137,6 +150,7 @@ impl RxMibCounters {
     pub const fn new() -> Self {
         Self {
             total: 0, data: 0, mgmt: 0, beacon: 0, probe_req: 0, probe_resp: 0,
+            auth: 0, assoc_req: 0, deauth: 0,
             fcs_err: 0, txs: 0, txrx_notify: 0, fw_monitor: 0, unknown: 0,
             unicast: 0, multicast: 0, broadcast: 0,
             mcu_events: 0, mcu_thermal: 0, mcu_wdt: 0,
@@ -172,6 +186,18 @@ impl RxMibCounters {
             RxFrameClass::ProbeResp => {
                 self.mgmt = self.mgmt.wrapping_add(1);
                 self.probe_resp = self.probe_resp.wrapping_add(1);
+            }
+            RxFrameClass::Auth => {
+                self.mgmt = self.mgmt.wrapping_add(1);
+                self.auth = self.auth.wrapping_add(1);
+            }
+            RxFrameClass::AssocReq => {
+                self.mgmt = self.mgmt.wrapping_add(1);
+                self.assoc_req = self.assoc_req.wrapping_add(1);
+            }
+            RxFrameClass::Deauth | RxFrameClass::Disassoc => {
+                self.mgmt = self.mgmt.wrapping_add(1);
+                self.deauth = self.deauth.wrapping_add(1);
             }
             RxFrameClass::TxStatus => self.txs = self.txs.wrapping_add(1),
             RxFrameClass::TxrxNotify => self.txrx_notify = self.txrx_notify.wrapping_add(1),

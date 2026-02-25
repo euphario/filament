@@ -273,6 +273,16 @@ impl RxRing {
 // DMA Functions on Mt7996Dev
 // ============================================================================
 
+/// Diagnostic result from TX free processing
+pub struct TxFreeResult {
+    pub tokens_freed: u32,
+    pub entries: u32,
+    pub txrx_notify_count: u32,
+    /// First TXRX_NOTIFY: RXD[0..7] + tx_info[0..3] for debugging
+    pub first_rxd: [u32; 8],
+    pub first_payload: [u32; 4],
+}
+
 impl Mt7996Dev {
     // ========================================================================
     // mt7996_dma_disable() — EXACT Linux translation
@@ -607,7 +617,7 @@ impl Mt7996Dev {
 
         // Flush descriptor memory and advance CPU_IDX
         dma_wmb();
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, dma_idx);
+        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
 
         count
     }
@@ -628,7 +638,7 @@ impl Mt7996Dev {
             q.ndesc - cpu_idx + dma_idx
         };
 
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, dma_idx);
+        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
         count
     }
 
@@ -682,7 +692,7 @@ impl Mt7996Dev {
         }
 
         dma_wmb();
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, dma_idx);
+        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
         count
     }
 
@@ -695,10 +705,12 @@ impl Mt7996Dev {
     /// For each consumed descriptor, reads RXD words, classifies the frame,
     /// and updates software MIB counters. Resets descriptors for reuse.
     ///
-    /// If `probe_req_macs` is provided, probe request source MACs (addr2) are
-    /// collected for probe response generation. Returns (entries_processed, probe_req_count).
+    /// Management frames (ProbeReq, Auth, AssocReq, Deauth, Disassoc) are
+    /// collected as `RxMgmtFrame` for the AP state machine.
+    /// Returns (entries_processed, mgmt_frame_count).
     pub fn rx_classify(&self, q: &RxQueueInfo, counters: &mut RxMibCounters,
-                       probe_req_macs: &mut [[u8; 6]], max_probes: usize) -> (u32, usize) {
+                       mgmt_frames: &mut [wifi80211::types::RxMgmtFrame],
+                       max_mgmt: usize) -> (u32, usize) {
         let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
         let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
 
@@ -708,7 +720,7 @@ impl Mt7996Dev {
 
         let ndesc = q.ndesc;
         let mut count = 0u32;
-        let mut probe_count = 0usize;
+        let mut mgmt_count = 0usize;
         let mut idx = (cpu_idx + 1) % ndesc;
 
         loop {
@@ -726,9 +738,12 @@ impl Mt7996Dev {
             let result = event::classify_rx_frame(rxd0, rxd1, rxd2, rxd3);
             let mut class = result.class;
 
-            // For management frames, try to read FC to distinguish beacon/probe subtypes
+            // For ALL normal frames (Data or Mgmt), read FC byte to classify.
+            // The NDATA bit in RXD2 is unreliable — unicast management frames
+            // (auth, assoc) may arrive with NDATA=0, getting misclassified as Data.
+            // Always check the 802.11 FC field for PKT_TYPE_NORMAL frames.
             let mut frame_ofs: usize = 0;
-            if matches!(class, RxFrameClass::Mgmt) {
+            if matches!(class, RxFrameClass::Mgmt | RxFrameClass::Data) {
                 // Navigate past RXD groups to find 802.11 header
                 // Group order: G4(16), G1(16), G2(16), G3(16), G5(96)
                 frame_ofs = 32; // Base RXD size
@@ -744,20 +759,44 @@ impl Mt7996Dev {
                     let fc0 = unsafe {
                         core::ptr::read_volatile((buf_base as *const u8).add(frame_ofs))
                     };
-                    class = event::refine_mgmt_subtype(fc0);
+                    // Check FC type field: bits [3:2] = 0 means management frame
+                    let fc_type = (fc0 >> 2) & 0x3;
+                    if fc_type == 0 {
+                        // It's actually a management frame — refine subtype
+                        class = event::refine_mgmt_subtype(fc0);
+                    }
                 }
             }
 
-            // Extract probe request source MAC (addr2) before resetting descriptor
-            // 802.11 header: FC(2) + Duration(2) + addr1(6) + addr2(6) = addr2 at offset +10
-            if matches!(class, RxFrameClass::ProbeReq) && probe_count < max_probes {
+            // Collect management frames for AP state machine
+            // ProbeReq, Auth, AssocReq, Deauth, Disassoc all need addr2
+            let is_ap_mgmt = matches!(class,
+                RxFrameClass::ProbeReq | RxFrameClass::Auth |
+                RxFrameClass::AssocReq | RxFrameClass::Deauth |
+                RxFrameClass::Disassoc);
+            if is_ap_mgmt && mgmt_count < max_mgmt {
                 let addr2_ofs = frame_ofs + 10; // FC(2) + Duration(2) + DA(6)
                 if addr2_ofs + 6 <= q.buf_size as usize {
+                    let mut addr2 = [0u8; 6];
                     let src = unsafe {
                         core::slice::from_raw_parts((buf_base as *const u8).add(addr2_ofs), 6)
                     };
-                    probe_req_macs[probe_count].copy_from_slice(src);
-                    probe_count += 1;
+                    addr2.copy_from_slice(src);
+                    // Skip frames with all-zero addr2 — false positive from
+                    // stale buffer (fc0=0x00 = AssocReq subtype). No valid client
+                    // has MAC 00:00:00:00:00:00.
+                    if addr2 != [0u8; 6] {
+                        let subtype = match class {
+                            RxFrameClass::ProbeReq => wifi80211::types::MgmtSubtype::ProbeReq,
+                            RxFrameClass::Auth => wifi80211::types::MgmtSubtype::Auth,
+                            RxFrameClass::AssocReq => wifi80211::types::MgmtSubtype::AssocReq,
+                            RxFrameClass::Deauth => wifi80211::types::MgmtSubtype::Deauth,
+                            RxFrameClass::Disassoc => wifi80211::types::MgmtSubtype::Disassoc,
+                            _ => unreachable!(),
+                        };
+                        mgmt_frames[mgmt_count] = wifi80211::types::RxMgmtFrame { subtype, addr2 };
+                        mgmt_count += 1;
+                    }
                 }
             }
 
@@ -780,8 +819,133 @@ impl Mt7996Dev {
         }
 
         dma_wmb();
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, dma_idx);
-        (count, probe_count)
+        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+        (count, mgmt_count)
+    }
+
+    // ========================================================================
+    // rx_process_tx_free() — Process TX free events from WA_MAIN/WA_TRI
+    // Source: mt7996/mac.c:1312-1437 mt7996_mac_tx_free()
+    // ========================================================================
+
+    /// Process TX free notifications from the WA firmware.
+    ///
+    /// WA_MAIN (q3) and WA_TRI (q5) carry TX free events. Buffer format:
+    ///   tx_free[0] = PKT_TYPE(31:27) | MSDU_CNT(25:16) | RX_BYTE(15:0)
+    ///   tx_free[1] = VER(19:16) | ...
+    ///   tx_free[2..] = PAIR/HEADER/MSDU entries
+    ///
+    /// NO 32-byte RXD header — the WA firmware writes tx_free data directly
+    /// at buffer offset 0. Linux mt7996_mac_tx_free() receives skb->data
+    /// pointing at the buffer start (no __skb_pull for WA events).
+    ///
+    /// Source: mt7996/mac.c:1312-1437 mt7996_mac_tx_free()
+    pub fn rx_process_tx_free(&self, q: &RxQueueInfo) -> TxFreeResult {
+        let mut result = TxFreeResult {
+            tokens_freed: 0,
+            entries: 0,
+            txrx_notify_count: 0,
+            first_rxd: [0; 8],
+            first_payload: [0; 4],
+        };
+
+        let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
+        let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
+
+        if dma_idx == cpu_idx {
+            return result;
+        }
+
+        // DSB SY after reading DMA_IDX: ensures all prior DMA buffer writes
+        // are visible to the CPU before we read buffer contents.
+        dsb_sy();
+
+        let ndesc = q.ndesc;
+        let mut idx = (cpu_idx + 1) % ndesc;
+
+        loop {
+            let i = idx as usize;
+            let buf_base = q.buf_virt + (i as u64 * q.buf_size as u64);
+
+            // TX free data starts at offset 0 — NO RXD header on WA events.
+            // tx_free[0] bits[31:27] = PKT_TYPE
+            let tx_free = buf_base as *const u32;
+            let dw0 = unsafe { core::ptr::read_volatile(tx_free) };
+            let pkt_type = (dw0 >> MT_RXD0_PKT_TYPE_SHIFT) & 0x1F;
+            result.entries += 1;
+
+            if pkt_type == PKT_TYPE_TXRX_NOTIFY {
+                result.txrx_notify_count += 1;
+
+                // Capture first TXRX_NOTIFY buffer for diagnostics
+                if result.txrx_notify_count == 1 {
+                    for j in 0..8 {
+                        result.first_rxd[j] = unsafe {
+                            core::ptr::read_volatile(tx_free.add(j))
+                        };
+                    }
+                }
+
+                // RX_BYTE_CNT in bits[15:0] tells us total data length
+                let byte_cnt = (dw0 & 0xFFFF) as usize;
+                let max_dwords = (byte_cnt / 4).min(256);
+
+                if max_dwords >= 2 {
+                    let dw1 = unsafe { core::ptr::read_volatile(tx_free.add(1)) };
+
+                    let msdu_cnt = (dw0 & MT_TXFREE0_MSDU_CNT_MASK) >> MT_TXFREE0_MSDU_CNT_SHIFT;
+                    let ver = (dw1 & MT_TXFREE1_VER_MASK) >> MT_TXFREE1_VER_SHIFT;
+
+                    // Capture ver in first_payload[0] for diagnostics
+                    if result.txrx_notify_count == 1 {
+                        result.first_payload[0] = ver;
+                        result.first_payload[1] = msdu_cnt;
+                        result.first_payload[2] = byte_cnt as u32;
+                    }
+
+                    // Source: mac.c:1340 — WARN_ON_ONCE(ver < 5)
+                    // Parse entries regardless of ver for now (diagnostic)
+                    let mut count = 0u32;
+                    let mut di = 2usize; // Start at tx_free[2]
+
+                    while count < msdu_cnt && di < max_dwords {
+                        let info = unsafe { core::ptr::read_volatile(tx_free.add(di)) };
+                        di += 1;
+
+                        // PAIR marker — new WCID context, skip
+                        if info & MT_TXFREE_INFO_PAIR != 0 { continue; }
+                        // HEADER — retry/status stats, skip
+                        if info & MT_TXFREE_INFO_HEADER != 0 { continue; }
+
+                        // Two packed 15-bit MSDU IDs per DWORD
+                        for shift in [0u32, 15] {
+                            let msdu = (info >> shift) & MT_TXFREE_INFO_MSDU_ID;
+                            if msdu == MT_TXFREE_INFO_MSDU_ID { continue; } // 0x7FFF = padding
+                            count += 1;
+                            result.tokens_freed += 1;
+                        }
+                    }
+                }
+            }
+
+            // Reset descriptor for reuse
+            let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
+            let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
+            let ctrl = (q.buf_size as u32) << 16;
+            unsafe {
+                core::ptr::write_volatile(&mut (*desc_ptr).buf0, dma_addr_lo(buf_phys));
+                core::ptr::write_volatile(&mut (*desc_ptr).buf1, dma_addr_hi(buf_phys));
+                core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, ctrl);
+            }
+
+            if idx == dma_idx { break; }
+            idx = (idx + 1) % ndesc;
+        }
+
+        dma_wmb();
+        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+        result
     }
 
     // ========================================================================
@@ -852,8 +1016,9 @@ impl Mt7996Dev {
         // Source: mt7996/mac.c:1201 txp->fw.token = cpu_to_le16(id)
         unsafe { core::ptr::copy_nonoverlapping(token.to_le_bytes().as_ptr(), txp.add(2), 2); }
 
-        // rept_wds_wcid = 0x3fff (no WDS) at offset 5
-        let wcid: u16 = 0x3fff;
+        // rept_wds_wcid = 0xfff (no WDS/no STA) at offset 5
+        // Source: mt7996/mac.c:1202 — cpu_to_le16(0xfff) for broadcast
+        let wcid: u16 = 0xfff;
         unsafe { core::ptr::copy_nonoverlapping(wcid.to_le_bytes().as_ptr(), txp.add(5), 2); }
 
         // nbuf = 1 at offset 7

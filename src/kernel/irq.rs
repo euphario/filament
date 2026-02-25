@@ -57,7 +57,10 @@ fn with_irq_table<R, F: FnOnce(&mut [IrqRegistration; MAX_IRQ_REGISTRATIONS]) ->
     f(&mut *table)
 }
 
-/// Register a process for an IRQ
+/// Register a process for an IRQ.
+///
+/// For virtual MSI IRQs (>= 1024), skips GIC enable — the GIC SPI is
+/// managed by the MSI dispatch layer, not per-IRQ registration.
 pub fn register(irq_num: u32, pid: u32) -> Result<(), IrqError> {
     with_irq_table(|table| {
         // Check if already registered
@@ -75,9 +78,11 @@ pub fn register(irq_num: u32, pid: u32) -> Result<(), IrqError> {
                 reg.pending = false;
                 reg.pending_count = 0;
 
-                // Enable the IRQ in the GIC
-                crate::platform::current::gic::enable_irq(irq_num);
-                crate::platform::current::gic::debug_irq(irq_num);
+                // Enable the IRQ in the GIC (skip for virtual MSI IRQs)
+                if !crate::kernel::pci::MsiAllocator::is_msi_irq(irq_num) {
+                    crate::platform::current::gic::enable_irq(irq_num);
+                    crate::platform::current::gic::debug_irq(irq_num);
+                }
 
                 return Ok(());
             }
@@ -91,7 +96,9 @@ pub fn unregister(irq_num: u32, pid: u32) -> bool {
     with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
-                crate::platform::current::gic::disable_irq(irq_num);
+                if !crate::kernel::pci::MsiAllocator::is_msi_irq(irq_num) {
+                    crate::platform::current::gic::disable_irq(irq_num);
+                }
                 *reg = IrqRegistration::empty();
                 return true;
             }
@@ -119,7 +126,9 @@ pub fn process_cleanup(pid: u32) {
     with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.owner_pid == pid {
-                crate::platform::current::gic::disable_irq(reg.irq_num);
+                if !crate::kernel::pci::MsiAllocator::is_msi_irq(reg.irq_num) {
+                    crate::platform::current::gic::disable_irq(reg.irq_num);
+                }
                 *reg = IrqRegistration::empty();
             }
         }
@@ -129,8 +138,12 @@ pub fn process_cleanup(pid: u32) {
 /// Called from IRQ handler when an interrupt fires
 /// Returns the PID to wake up, if any
 pub fn notify(irq_num: u32) -> Option<u32> {
-    // Mask the IRQ immediately to prevent interrupt storm
-    crate::platform::current::gic::disable_irq(irq_num);
+    // Mask the IRQ immediately to prevent interrupt storm.
+    // For virtual MSI IRQs, masking is done at the MAC level by the dispatch
+    // code (W1C of the status register), so skip GIC disable.
+    if !crate::kernel::pci::MsiAllocator::is_msi_irq(irq_num) {
+        crate::platform::current::gic::disable_irq(irq_num);
+    }
 
     // Update IRQ table state and collect wake info
     let (wake_blocked, owner_pid) = with_irq_table(|table| {
@@ -179,7 +192,10 @@ pub fn check_pending(irq_num: u32, pid: u32) -> Option<u32> {
                     let count = reg.pending_count;
                     reg.pending = false;
                     reg.pending_count = 0;
-                    crate::platform::current::gic::enable_irq(irq_num);
+                    // Re-enable at GIC (skip for virtual MSI IRQs — MAC handles it)
+                    if !crate::kernel::pci::MsiAllocator::is_msi_irq(irq_num) {
+                        crate::platform::current::gic::enable_irq(irq_num);
+                    }
                     return Some(count);
                 }
                 return None;

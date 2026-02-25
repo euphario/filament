@@ -4,11 +4,11 @@
 //! Contains embedded firmware bytes, binary format parsers, and the
 //! load_firmware() entry point.
 
-use userlib::{unotice, uerror, udebug};
+use userlib::{unotice, uerror, udebug, uinfo};
 use crate::regs::*;
 use crate::device::Mt7996Dev;
 use crate::dma::TxRing;
-use crate::mcu::{dl_mode, fw_feature, fw_start, gen_dl_mode};
+use crate::mcu::{FwIrq, dl_mode, fw_feature, fw_start, gen_dl_mode};
 
 // ============================================================================
 // Embedded firmware images (loaded at compile time)
@@ -109,7 +109,7 @@ struct FwRegion {
 impl Mt7996Dev {
     /// Load patch firmware
     /// From Linux mcu.c:2208-2296
-    fn load_patch(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing, fw_buf: &[u8], seq: &mut u8) -> Result<(), i32> {
+    fn load_patch(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing, fw_buf: &[u8], seq: &mut u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         udebug!("fw", "load_patch_start");
 
         let fw_state = self.mt76_rr(MT_TOP_MISC);
@@ -136,7 +136,7 @@ impl Mt7996Dev {
         udebug!("fw", "patch_header"; hw = hw_ver, ver = patch_ver, regions = n_region);
 
         // Get semaphore (MCU command → mcu_ring)
-        self.mcu_patch_sem_ctrl(mcu_ring, true, *seq)?;
+        self.mcu_patch_sem_ctrl_irq(mcu_ring, true, *seq, irq.as_mut().map(|r| &mut **r))?;
         *seq = seq.wrapping_add(1);
 
         for i in 0..n_region {
@@ -179,12 +179,12 @@ impl Mt7996Dev {
                 return Err(-1);
             }
 
-            self.mcu_init_download(mcu_ring, addr, len, mode, *seq)?;
+            self.mcu_init_download_irq(mcu_ring, addr, len, mode, *seq, irq.as_mut().map(|r| &mut **r))?;
             *seq = seq.wrapping_add(1);
 
             let section_data = &fw_buf[data_offs..data_offs + len as usize];
             for chunk in section_data.chunks(MCU_FW_DL_BUF_SIZE) {
-                self.mcu_send_firmware_chunk(fwdl_ring, chunk, *seq)?;
+                self.mcu_send_firmware_chunk_irq(fwdl_ring, chunk, *seq, irq.as_mut().map(|r| &mut **r))?;
                 *seq = seq.wrapping_add(1);
             }
 
@@ -195,7 +195,7 @@ impl Mt7996Dev {
 
         userlib::delay_ms(100);
 
-        self.mcu_start_firmware(mcu_ring, true, 0, 0, *seq)?;
+        self.mcu_start_firmware_irq(mcu_ring, true, 0, 0, *seq, irq)?;
         *seq = seq.wrapping_add(1);
 
         let fwdl_cpu = self.mt76_rr(fwdl_ring.regs_base + MT_QUEUE_CPU_IDX);
@@ -206,7 +206,7 @@ impl Mt7996Dev {
 
     /// Load RAM firmware (WM, DSP, or WA)
     /// Exact translation of Linux mt7996_mcu_send_ram_firmware() (mcu.c:3032-3083).
-    fn load_ram(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing, fw_buf: &[u8], _name: &str, fw_start_bits: u32, seq: &mut u8) -> Result<(), i32> {
+    fn load_ram(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing, fw_buf: &[u8], _name: &str, fw_start_bits: u32, seq: &mut u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         udebug!("fw", "load_ram_start"; size = fw_buf.len());
 
         if fw_buf.len() < core::mem::size_of::<FwTrailer>() {
@@ -246,12 +246,12 @@ impl Mt7996Dev {
 
             unsafe { core::arch::asm!("dsb sy", "isb") };
 
-            self.mcu_init_download(mcu_ring, addr, len, mode, *seq)?;
+            self.mcu_init_download_irq(mcu_ring, addr, len, mode, *seq, irq.as_mut().map(|r| &mut **r))?;
             *seq = seq.wrapping_add(1);
 
             let region_data = &fw_buf[data_offset..data_offset + len as usize];
             for chunk in region_data.chunks(MCU_FW_DL_BUF_SIZE) {
-                self.mcu_send_firmware_chunk(fwdl_ring, chunk, *seq)?;
+                self.mcu_send_firmware_chunk_irq(fwdl_ring, chunk, *seq, irq.as_mut().map(|r| &mut **r))?;
                 *seq = seq.wrapping_add(1);
             }
 
@@ -264,7 +264,7 @@ impl Mt7996Dev {
         }
         option |= fw_start_bits;
 
-        self.mcu_start_firmware(mcu_ring, false, option, override_addr, *seq)?;
+        self.mcu_start_firmware_irq(mcu_ring, false, option, override_addr, *seq, irq)?;
         *seq = seq.wrapping_add(1);
 
         udebug!("fw", "load_ram_done");
@@ -275,7 +275,11 @@ impl Mt7996Dev {
     ///
     /// Loads patch → WM → DSP → WA, then polls for FW_STATE_RDY(7).
     /// After firmware boots, runs post-init MCU commands.
-    pub fn load_firmware(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing) -> Result<(), i32> {
+    ///
+    /// When `irq` is Some, uses IRQ-based waiting (blocks on WFDMA interrupt)
+    /// instead of delay_ms(1) busy-wait polling. The WFDMA interrupt mask must
+    /// be configured before calling this function.
+    pub fn load_firmware(&self, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         unotice!("fw", "load_firmware_start");
 
         let mut seq: u8 = 1;
@@ -285,41 +289,84 @@ impl Mt7996Dev {
 
         // 1. Load patch
         udebug!("fw", "load_patch"; size = FW_ROM_PATCH.len() as u32);
-        self.load_patch(mcu_ring, fwdl_ring, FW_ROM_PATCH, &mut seq)?;
+        self.load_patch(mcu_ring, fwdl_ring, FW_ROM_PATCH, &mut seq, irq.as_mut().map(|r| &mut **r))?;
 
         userlib::delay_ms(100);
 
         // 2. Load WM
         udebug!("fw", "load_wm"; size = FW_WM.len() as u32);
-        self.load_ram(mcu_ring, fwdl_ring, FW_WM, "WM", 0, &mut seq)?;
+        self.load_ram(mcu_ring, fwdl_ring, FW_WM, "WM", 0, &mut seq, irq.as_mut().map(|r| &mut **r))?;
 
         userlib::delay_ms(100);
 
         // 3. Load DSP
         udebug!("fw", "load_dsp"; size = FW_DSP.len() as u32);
-        self.load_ram(mcu_ring, fwdl_ring, FW_DSP, "DSP", fw_start::WORKING_PDA_DSP, &mut seq)?;
+        self.load_ram(mcu_ring, fwdl_ring, FW_DSP, "DSP", fw_start::WORKING_PDA_DSP, &mut seq, irq.as_mut().map(|r| &mut **r))?;
 
         userlib::delay_ms(100);
 
         // 4. Load WA
         udebug!("fw", "load_wa"; size = FW_WA.len() as u32);
-        self.load_ram(mcu_ring, fwdl_ring, FW_WA, "WA", fw_start::WORKING_PDA_CR4, &mut seq)?;
+        self.load_ram(mcu_ring, fwdl_ring, FW_WA, "WA", fw_start::WORKING_PDA_CR4, &mut seq, irq.as_mut().map(|r| &mut **r))?;
 
-        // Wait for fw_state=7
+        // Wait for fw_state=7 — monitor interrupts to discover what fires.
+        // Linux: mt76_poll_msec(MT_TOP_MISC, FW_STATE, 7, 1000)
+        // MT_INT_MCU_CMD (bit 29) fires when firmware writes MT_MCU_CMD register.
+        // MT_MCU_CMD_NORMAL_STATE (bit 5) = firmware fully booted.
         let mut fw_state = 0u32;
+        let mut mcu_cmd_seen = 0u32;
+        let mut source_seen = 0u32;
+
+        // Enable MT_INT_MCU_CMD in mask so it triggers MSI
+        if irq.is_some() {
+            let mask = self.mt76_rr(MT_INT_MASK_CSR);
+            self.mt76_wr(MT_INT_MASK_CSR, mask | MT_INT_MCU_CMD);
+        }
+
         for _i in 0..50u32 {
             fw_state = self.mt76_rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
             if fw_state == 7 {
                 break;
             }
-            userlib::delay_ms(20);
+
+            // Monitor what interrupts fire during firmware boot
+            if let Some(ref mut fw_irq) = irq {
+                let _ = fw_irq.wait();
+                let src = self.mt76_rr(MT_INT_SOURCE_CSR);
+                if src != 0 {
+                    source_seen |= src;
+                    self.mt76_wr(MT_INT_SOURCE_CSR, src);
+                }
+                // Check MCU command register
+                if src & MT_INT_MCU_CMD != 0 {
+                    let cmd = self.mt76_rr(MT_MCU_CMD);
+                    mcu_cmd_seen |= cmd;
+                    self.mt76_wr(MT_MCU_CMD, cmd); // W1C acknowledge
+                    uinfo!("fw", "mcu_cmd_irq"; cmd = cmd, src = src, fw_state = fw_state);
+                }
+                fw_irq.ack();
+            } else {
+                userlib::delay_ms(20);
+            }
         }
-        udebug!("fw", "fw_state_final"; val = fw_state);
+
+        uinfo!("fw", "fw_wait_done"; fw_state = fw_state,
+            source_seen = source_seen, mcu_cmd_seen = mcu_cmd_seen);
 
         if fw_state != 7 {
             uerror!("fw", "load_firmware_incomplete"; state = fw_state);
             return Err(-1);
         }
+
+        // Drain RX queues — return all firmware-loading response descriptors to hardware.
+        // Fire-and-forget chunks leave responses unconsumed in WM RX (q0).
+        // Advance CPU_IDX to DMA_IDX on both MCU RX queues so the WFDMA has
+        // clean rings for post-firmware commands.
+        let wm_dma = self.mt76_rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX);
+        let wa_dma = self.mt76_rr(MCU_WA_RX_REGS + MT_QUEUE_DMA_IDX);
+        self.mt76_wr(MCU_WM_RX_REGS + MT_QUEUE_CPU_IDX, wm_dma);
+        self.mt76_wr(MCU_WA_RX_REGS + MT_QUEUE_CPU_IDX, wa_dma);
+        uinfo!("fw", "rx_drain"; wm_dma = wm_dma, wa_dma = wa_dma);
 
         unotice!("fw", "load_firmware_success");
         Ok(())

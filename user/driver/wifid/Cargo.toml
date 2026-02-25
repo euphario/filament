@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 userlib = { path = "../../userlib" }
+wifi80211 = { path = "../../lib/wifi80211" }
 
 [profile.release]
 panic = "abort"

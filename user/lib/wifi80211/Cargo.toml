@@ -1,0 +1,5 @@
+[package]
+name = "wifi80211"
+version = "0.1.0"
+edition = "2021"
+# Pure 802.11 logic — no_std, no alloc, no dependencies

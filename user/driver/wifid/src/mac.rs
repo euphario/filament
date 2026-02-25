@@ -9,6 +9,7 @@ use crate::regs::*;
 use crate::device::Mt7996Dev;
 use crate::dma::TxRing;
 use crate::mcu;
+use crate::mcu::FwIrq;
 
 impl Mt7996Dev {
     /// Enable noise floor measurement for a band.
@@ -137,7 +138,7 @@ impl Mt7996Dev {
     /// Rate hw_values from mac80211.c mt76_rates[]:
     ///   CCK:  0x0000, 0x0001, 0x0002, 0x0003
     ///   OFDM: 0x010b, 0x010f, 0x010a, 0x010e, 0x0109, 0x010d, 0x0108, 0x010c
-    fn mac_init_basic_rates(&self, ring: &mut TxRing, seq: &mut u8) -> Result<(), i32> {
+    fn mac_init_basic_rates(&self, ring: &mut TxRing, seq: &mut u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // mt76_rates[] hw_value: (phy_type << 8) | rate_idx
         // MT_PHY_TYPE_CCK = 0, MT_PHY_TYPE_OFDM = 1
         const HW_VALUES: [u16; 12] = [
@@ -158,7 +159,7 @@ impl Mt7996Dev {
             let rate_bits = (hw_val & 0xFF) as u16;
             let rate = (mode << 6) | (rate_bits & 0x3F);
 
-            self.mcu_set_fixed_rate_table(ring, idx as u8, rate, false, 0, *seq)?;
+            self.mcu_set_fixed_rate_table(ring, idx as u8, rate, false, 0, *seq, irq.as_deref_mut())?;
             *seq = seq.wrapping_add(1);
         }
         Ok(())
@@ -173,7 +174,7 @@ impl Mt7996Dev {
     /// 4. WA HIF TXD version (WA → wa_ring)
     /// 5. Per-band register init (bands 0, 1, 2)
     /// 6. Basic rate programming (WM-only → wm_ring)
-    pub fn mac_init(&self, ring: &mut TxRing, seq: &mut u8) -> Result<(), i32> {
+    pub fn mac_init(&self, ring: &mut TxRing, seq: &mut u8, mut irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // mt76_clear(dev, MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
         self.reg_clear(MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
 
@@ -192,14 +193,14 @@ impl Mt7996Dev {
         // RRO module init — init.c:609-626
         // MCU_WM_UNI_CMD(RRO) — WM-only but routed via WA queue
         // Linux: if (dev->hif2) → 2, else → 0
-        // BPI-R4 has single PCIe to MT7996 (no HIF2) → platform_type = 0
-        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_PLATFORM_TYPE, 0, *seq)?;
+        // MT7996 always has dual HIF (HIF2 accessible via BAR0+offset) → platform_type=2
+        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_PLATFORM_TYPE, 2, *seq, irq.as_deref_mut())?;
         *seq = seq.wrapping_add(1);
 
-        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_BYPASS_MODE, 3, *seq)?;
+        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_BYPASS_MODE, 3, *seq, irq.as_deref_mut())?;
         *seq = seq.wrapping_add(1);
 
-        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_TXFREE_PATH, 1, *seq)?;
+        self.mcu_set_rro(ring, mcu::UNI_RRO_SET_TXFREE_PATH, 1, *seq, irq.as_deref_mut())?;
         *seq = seq.wrapping_add(1);
 
         // WA HIF TXD version — init.c:628-630
@@ -213,7 +214,7 @@ impl Mt7996Dev {
         }
 
         // Basic rates — init.c:635
-        self.mac_init_basic_rates(ring, seq)?;
+        self.mac_init_basic_rates(ring, seq, irq)?;
 
         udebug!("mac", "mac_init_done");
         Ok(())

@@ -111,4 +111,40 @@ pub trait PciHostOps {
     fn config_read32(&self, bdf: PciBdf, offset: u16) -> u32;
     fn config_write32(&self, bdf: PciBdf, offset: u16, value: u32);
     fn bar_info(&self, bdf: PciBdf, bar: u8) -> Option<(u64, u64)>;
+
+    fn config_read16(&self, bdf: PciBdf, offset: u16) -> u16 {
+        let val32 = self.config_read32(bdf, offset & !0x3);
+        let shift = ((offset & 0x2) as u32) * 8;
+        ((val32 >> shift) & 0xFFFF) as u16
+    }
+
+    fn config_write16(&self, bdf: PciBdf, offset: u16, value: u16) {
+        let aligned = offset & !0x3;
+        let shift = ((offset & 0x2) as u32) * 8;
+        let mask = 0xFFFF << shift;
+        let val32 = self.config_read32(bdf, aligned);
+        let new_val = (val32 & !mask) | ((value as u32) << shift);
+        self.config_write32(bdf, aligned, new_val);
+    }
+
+    fn config_read8(&self, bdf: PciBdf, offset: u16) -> u8 {
+        let val32 = self.config_read32(bdf, offset & !0x3);
+        let shift = ((offset & 0x3) as u32) * 8;
+        ((val32 >> shift) & 0xFF) as u8
+    }
+
+    fn find_capability(&self, bdf: PciBdf, cap_id: u8) -> Option<u8> {
+        let status = self.config_read16(bdf, 0x06);
+        if (status & 0x10) == 0 {
+            return None;
+        }
+        let mut cap_ptr = self.config_read8(bdf, 0x34) & 0xFC;
+        for _ in 0..48 {
+            if cap_ptr == 0 { break; }
+            let id = self.config_read8(bdf, cap_ptr as u16);
+            if id == cap_id { return Some(cap_ptr); }
+            cap_ptr = self.config_read8(bdf, (cap_ptr + 1) as u16) & 0xFC;
+        }
+        None
+    }
 }

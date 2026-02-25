@@ -234,6 +234,20 @@ pub mod irq {
     /// Used for PDMA RX done notifications
     pub const FE_GRP2: u32 = 228;
 
+    /// PCIe port interrupts (from MT7988A DTS)
+    /// Index = port number, value = GIC IRQ number
+    /// Port 0 (0x11300000): SPI 168 → GIC IRQ 200
+    /// Port 1 (0x11310000): SPI 169 → GIC IRQ 201
+    /// Port 2 (0x11280000): SPI 170 → GIC IRQ 202
+    /// Port 3 (0x11290000): SPI 171 → GIC IRQ 203
+    /// PCIe port interrupts (from MT7988A DTS: SPI 168-171)
+    /// Port index matches MAC base ordering:
+    ///   Port 0 (0x11300000): SPI 168 → GIC IRQ 200
+    ///   Port 1 (0x11310000): SPI 169 → GIC IRQ 201
+    ///   Port 2 (0x11280000): SPI 170 → GIC IRQ 202
+    ///   Port 3 (0x11290000): SPI 171 → GIC IRQ 203
+    pub const PCIE: [u32; 4] = [200, 201, 202, 203];
+
     /// Convert SPI number to GIC IRQ number
     #[inline]
     pub const fn spi_to_irq(spi: u32) -> u32 {

@@ -251,8 +251,14 @@ pub const MT_INT_MCU_CMD: u32 = 1 << 29;
 // MCU command register — firmware WDT and error status
 // Linux: mt7996/regs.h:610-619
 pub const MT_MCU_CMD: u32 = mt_wfdma0(0x1f0);
-pub const MT_MCU_CMD_WDT_MASK: u32 = (1u32 << 31) | (1u32 << 30); // WA_WDT | WM_WDT
+pub const MT_MCU_CMD_STOP_DMA: u32 = 1 << 2;
+pub const MT_MCU_CMD_RESET_DONE: u32 = 1 << 3;
+pub const MT_MCU_CMD_RECOVERY_DONE: u32 = 1 << 4;
+pub const MT_MCU_CMD_NORMAL_STATE: u32 = 1 << 5;
 pub const MT_MCU_CMD_ERROR_MASK: u32 = 0x3E; // GENMASK(5,1) — firmware error bits
+pub const MT_MCU_CMD_WM_WDT: u32 = 1u32 << 30;
+pub const MT_MCU_CMD_WA_WDT: u32 = 1u32 << 31;
+pub const MT_MCU_CMD_WDT_MASK: u32 = MT_MCU_CMD_WA_WDT | MT_MCU_CMD_WM_WDT;
 
 pub const MT_INT_RX_DONE_MCU: u32 = MT_INT_RX_DONE_WM | MT_INT_RX_DONE_WA;
 
@@ -551,6 +557,7 @@ pub const STA_TYPE_BC: u32 = 1 << 5;    // BIT(5)
 pub const CONNECTION_INFRA_AP: u32 = STA_TYPE_AP | NETWORK_INFRA;    // 0x10002
 pub const CONNECTION_INFRA_BC: u32 = STA_TYPE_BC | NETWORK_INFRA;    // 0x10020
 pub const CONN_STATE_DISCONNECT: u8 = 0;
+pub const CONN_STATE_CONNECT: u8 = 1;
 pub const CONN_STATE_PORT_SECURE: u8 = 2;
 
 // EXTRA_INFO flags for STA_REC
@@ -579,6 +586,11 @@ pub const MT_TX_TYPE_FW: u8 = 3;
 
 /// Header format: 802.11 — mt76_connac3_mac.h:167
 pub const MT_HDR_FORMAT_802_11: u8 = 2;
+
+/// TXD1 TID for management frames — mt76.h: MT_TX_NORMAL = 5
+/// Routes through firmware's management TX queue (not data BE).
+/// TXD1_TID = GENMASK(24,22), value 5 → (5 << 22) = 0x01400000
+pub const MT_TX_NORMAL: u32 = 5;
 
 // NOTE: There is NO LONG_FORMAT bit in connac3 (MT7996).
 // All TXDs are 8 DWORDs (32 bytes). BIT(13) of TXD1 is TGID[0] (band index).
@@ -794,6 +806,25 @@ pub const PKT_TYPE_NORMAL: u32 = 2;        // Normal data/mgmt frame
 pub const PKT_TYPE_TXRX_NOTIFY: u32 = 6;   // TX/RX notification
 pub const PKT_TYPE_RX_EVENT: u32 = 7;      // MCU RX event
 pub const PKT_TYPE_RX_FW_MONITOR: u32 = 0x0c; // FW monitor
+
+// ============================================================================
+// TX Free event format — mt76_connac3_mac.h
+// Source: mt76/mt76_connac3_mac.h:312-323
+// ============================================================================
+
+/// tx_info[0] fields (first u32 AFTER 32-byte RXD)
+pub const MT_TXFREE0_MSDU_CNT_MASK: u32 = 0x03FF_0000; // GENMASK(25,16)
+pub const MT_TXFREE0_MSDU_CNT_SHIFT: u32 = 16;
+
+/// tx_info[1] fields
+pub const MT_TXFREE1_VER_MASK: u32 = 0x000F_0000; // GENMASK(19,16)
+pub const MT_TXFREE1_VER_SHIFT: u32 = 16;
+
+/// tx_info[2..] entry flags
+pub const MT_TXFREE_INFO_PAIR: u32 = 1 << 31;     // BIT(31) — new WCID context
+pub const MT_TXFREE_INFO_HEADER: u32 = 1 << 30;   // BIT(30) — retry/status header
+pub const MT_TXFREE_INFO_MSDU_ID: u32 = 0x7FFF;   // GENMASK(14,0) — 15-bit token
+pub const MT_TXFREE_INFO_MSDU_ID_V3: u32 = 0xFFF; // GENMASK(11,0) — 12-bit for ver<4
 
 // ============================================================================
 // MCU UNI event EIDs — mt76_connac_mcu.h / mt7996/mcu.h
