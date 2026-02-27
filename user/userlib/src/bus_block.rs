@@ -201,4 +201,28 @@ impl BlockTransport for ShmemBlockPort {
     fn mux_handle(&self) -> Option<crate::syscall::Handle> {
         Some(self.port.mux_handle())
     }
+
+    fn free(&mut self, offset: u32) {
+        self.port.free(offset);
+    }
+
+    fn peek_completion(&mut self) -> Option<IoCqe> {
+        self.port.peek_completion()
+    }
+
+    fn ack_completions(&self, n: u32) {
+        self.port.ack_completions(n);
+    }
+
+    fn cq_consumer_head(&self) -> u32 {
+        self.port.cq_consumer_head()
+    }
+
+    fn ring_mask(&self) -> u32 {
+        self.port.ring_mask()
+    }
+
+    fn ring_size(&self) -> u16 {
+        self.port.ring_size()
+    }
 }

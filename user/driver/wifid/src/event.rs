@@ -270,7 +270,11 @@ pub fn process_mcu_event(buf: &[u8], counters: &mut RxMibCounters) {
             udebug!("fw_event", "rdd_report");
         }
         MCU_UNI_EVENT_ALL_STA_INFO => {
-            udebug!("fw_event", "all_sta_info");
+            // Periodic stats response — silenced (too noisy)
+        }
+        0x0D => {
+            // MCU_UNI_CMD_REG_ACCESS response — solicited command response to
+            // mcu_get_chan_mib_info/mcu_get_all_sta_info. Silenced.
         }
         _ => {
             udebug!("fw_event", "unknown"; eid = eid as u32);

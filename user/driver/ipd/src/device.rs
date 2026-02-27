@@ -8,7 +8,7 @@ use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
 use userlib::bus::BlockTransport;
-use userlib::ring::{IoSqe, io_op};
+use userlib::ring::{IoSqe, IoCqe, io_op, io_status};
 
 /// Maximum Ethernet frame size (header + payload, no FCS).
 const MAX_FRAME_SIZE: usize = 1514;
@@ -25,7 +25,7 @@ struct RxFrameRef {
 
 /// Ring buffer of pool-offset references to received Ethernet frames.
 ///
-/// Populated in `data_ready()` from DataPort CQEs (offset + len only),
+/// Populated in `drain_rx()` from DataPort CQEs (offset + len only),
 /// drained by smoltcp via `Device::receive()`. No frame data is copied —
 /// 128 bytes total instead of 24KB.
 pub struct RxOffsetQueue {
@@ -69,7 +69,98 @@ impl RxOffsetQueue {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
 }
+
+// =============================================================================
+// TX Offset Tracking
+// =============================================================================
+
+/// Maximum in-flight TX requests (matches ring_size).
+const TX_INFLIGHT_SIZE: usize = 256;
+
+/// Tracks consumer-side TX pool offsets keyed by SQE tag.
+///
+/// When ipd submits a TX frame to the provider (wifid/ethd), it stores
+/// the pool offset here. When the TX CQE comes back (CQE_FLAG_TX_DONE),
+/// ipd looks up the offset by tag and frees the pool slot.
+pub struct TxTracker {
+    /// Pool offsets indexed by (tag & mask). 0 = unused.
+    offsets: [u32; TX_INFLIGHT_SIZE],
+    /// Next tag counter (wraps, skips 0).
+    next_tag: u32,
+}
+
+impl TxTracker {
+    pub const fn new() -> Self {
+        Self {
+            offsets: [0; TX_INFLIGHT_SIZE],
+            next_tag: 1,
+        }
+    }
+
+    /// Allocate a tag and record the pool offset. Returns the tag.
+    pub fn track(&mut self, offset: u32, mask: u32) -> u32 {
+        let tag = self.next_tag;
+        self.next_tag = self.next_tag.wrapping_add(1);
+        if self.next_tag == 0 {
+            self.next_tag = 1;
+        }
+        let idx = (tag & mask) as usize;
+        if idx < TX_INFLIGHT_SIZE {
+            self.offsets[idx] = offset;
+        }
+        tag
+    }
+
+    /// Look up and remove the pool offset for a completed TX tag.
+    pub fn complete(&mut self, tag: u32, mask: u32) -> Option<u32> {
+        let idx = (tag & mask) as usize;
+        if idx < TX_INFLIGHT_SIZE {
+            let offset = self.offsets[idx];
+            self.offsets[idx] = 0;
+            if offset != 0 { Some(offset) } else { None }
+        } else {
+            None
+        }
+    }
+}
+
+// =============================================================================
+// Data Path Statistics
+// =============================================================================
+
+/// Counters for the ipd data path.
+pub struct DataPathStats {
+    pub rx_frames: u32,
+    pub tx_frames: u32,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub tx_pool_drops: u32,
+    pub rx_pool_full: u32,
+    pub tx_cqe_reclaimed: u32,
+}
+
+impl DataPathStats {
+    pub const fn new() -> Self {
+        Self {
+            rx_frames: 0,
+            tx_frames: 0,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            tx_pool_drops: 0,
+            rx_pool_full: 0,
+            tx_cqe_reclaimed: 0,
+        }
+    }
+}
+
+// =============================================================================
+// SmolDevice
+// =============================================================================
 
 /// smoltcp Device backed by a netd DataPort.
 ///
@@ -78,16 +169,26 @@ impl RxOffsetQueue {
 pub struct SmolDevice<'a> {
     port: &'a mut dyn BlockTransport,
     rx_queue: &'a mut RxOffsetQueue,
+    tx_tracker: &'a mut TxTracker,
+    stats: &'a mut DataPathStats,
     pool_base: *const u8,
     pool_size: u32,
     group_id: u8,
+    ring_mask: u32,
 }
 
 impl<'a> SmolDevice<'a> {
-    pub fn new(port: &'a mut dyn BlockTransport, rx_queue: &'a mut RxOffsetQueue, group_id: u8) -> Self {
+    pub fn new(
+        port: &'a mut dyn BlockTransport,
+        rx_queue: &'a mut RxOffsetQueue,
+        tx_tracker: &'a mut TxTracker,
+        stats: &'a mut DataPathStats,
+        group_id: u8,
+    ) -> Self {
         let pool_base = port.pool_ptr();
         let pool_size = port.pool_size();
-        Self { port, rx_queue, pool_base, pool_size, group_id }
+        let ring_mask = port.ring_mask();
+        Self { port, rx_queue, tx_tracker, stats, pool_base, pool_size, group_id, ring_mask }
     }
 }
 
@@ -109,7 +210,13 @@ impl<'a> Device for SmolDevice<'a> {
                 offset: r.offset,
                 len: r.len,
             };
-            let tx = IpdTxToken { port: self.port, group_id: self.group_id };
+            let tx = IpdTxToken {
+                port: self.port,
+                tx_tracker: self.tx_tracker,
+                stats: self.stats,
+                group_id: self.group_id,
+                ring_mask: self.ring_mask,
+            };
             Some((rx, tx))
         } else {
             None
@@ -117,7 +224,13 @@ impl<'a> Device for SmolDevice<'a> {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(IpdTxToken { port: self.port, group_id: self.group_id })
+        Some(IpdTxToken {
+            port: self.port,
+            tx_tracker: self.tx_tracker,
+            stats: self.stats,
+            group_id: self.group_id,
+            ring_mask: self.ring_mask,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -164,12 +277,18 @@ impl phy::RxToken for IpdRxToken {
     }
 }
 
-/// TX token: writes a frame directly to DataPort pool and submits to ethd.
+/// TX token: writes a frame directly to DataPort pool and submits to provider.
+///
 /// The group_id is encoded in IoSqe.flags so ethd inserts the correct
 /// MTK special tag destination port mask for this bridge group.
+/// A unique tag is assigned via TxTracker so the TX CQE can be matched
+/// for pool reclaim.
 pub struct IpdTxToken<'a> {
     port: &'a mut dyn BlockTransport,
+    tx_tracker: &'a mut TxTracker,
+    stats: &'a mut DataPathStats,
     group_id: u8,
+    ring_mask: u32,
 }
 
 impl<'a> phy::TxToken for IpdTxToken<'a> {
@@ -182,16 +301,17 @@ impl<'a> phy::TxToken for IpdTxToken<'a> {
             let result = if let Some(buf) = self.port.pool_slice_mut(offset, len as u32) {
                 f(buf)
             } else {
-                // Alloc succeeded but slice failed — shouldn't happen.
                 let mut empty = [0u8; 0];
                 f(&mut empty)
             };
+
+            let tag = self.tx_tracker.track(offset, self.ring_mask);
 
             let sqe = IoSqe {
                 opcode: io_op::NET_SEND,
                 flags: self.group_id,
                 priority: 0,
-                tag: 0,
+                tag,
                 data_offset: offset,
                 data_len: len as u32,
                 lba: 0,
@@ -199,10 +319,13 @@ impl<'a> phy::TxToken for IpdTxToken<'a> {
             };
             self.port.submit(&sqe);
             self.port.notify();
+            self.stats.tx_frames += 1;
+            self.stats.tx_bytes += len as u64;
 
             result
         } else {
             // No pool space — drop the frame.
+            self.stats.tx_pool_drops += 1;
             let mut empty = [0u8; 0];
             f(&mut empty)
         }

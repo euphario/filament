@@ -1338,12 +1338,7 @@ impl Driver for IpdDriver {
     fn handle_event(&mut self, tag: u32, _handle: Handle, ctx: &mut dyn BusCtx) {
         match tag {
             TAG_DISCOVERY_TIMER if self.discovering => {
-                if let Some(ref mut timer) = self.discovery_timer {
-                    if timer.wait().is_err() {
-                        uerror!("ipd", "timer_wait_failed"; tag = "discovery");
-                    }
-                }
-
+                // Timer already consumed by Mux poll — no timer.wait() needed.
                 if self.try_discover_nic(ctx) {
                     self.discovering = false;
                     if let Some(ref timer) = self.discovery_timer {
@@ -1358,23 +1353,14 @@ impl Driver for IpdDriver {
                 }
             }
             TAG_POLL_TIMER => {
-                if let Some(ref mut timer) = self.poll_timer {
-                    if timer.wait().is_err() {
-                        uerror!("ipd", "timer_wait_failed"; tag = "poll");
-                    }
-                }
-
+                // Timer already consumed by Mux poll — no timer.wait() needed.
                 if self.nic_state == NicState::Up {
                     self.drain_rx(ctx);
                     self.poll_smoltcp(ctx);
                 }
             }
             TAG_DHCP_FALLBACK_TIMER => {
-                if let Some(ref mut timer) = self.dhcp_fallback_timer {
-                    if timer.wait().is_err() {
-                        uerror!("ipd", "timer_wait_failed"; tag = "dhcp_fb");
-                    }
-                }
+                // Timer already consumed by Mux poll — no timer.wait() needed.
                 self.apply_static_fallback();
                 // Clean up the one-shot timer
                 if let Some(ref timer) = self.dhcp_fallback_timer {

@@ -968,6 +968,26 @@ pub trait BlockTransport {
 
     /// Get the underlying shmem handle for Mux registration.
     fn mux_handle(&self) -> Option<crate::syscall::Handle>;
+
+    // === Pool reclaim + deferred ack ===
+
+    /// Free a pool slot by offset.
+    fn free(&mut self, offset: u32);
+
+    /// Peek at next CQE without advancing shared cq_head.
+    fn peek_completion(&mut self) -> Option<crate::ring::IoCqe>;
+
+    /// Batch-advance shared cq_head by `n` (provider can now reclaim).
+    fn ack_completions(&self, n: u32);
+
+    /// Read shared cq_head (for provider-side pool reclaim).
+    fn cq_consumer_head(&self) -> u32;
+
+    /// Ring mask (ring_size - 1).
+    fn ring_mask(&self) -> u32;
+
+    /// Ring size.
+    fn ring_size(&self) -> u16;
 }
 
 /// Stream data transport (byte ring pattern).

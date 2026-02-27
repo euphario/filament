@@ -190,7 +190,7 @@ pub static PORT_RULES: &[PortRule] = &[
         context: &[],
         mount_path: None,
     },
-    // TODO: ipd disabled temporarily to isolate SError
+    // TODO: switch port / bridge group ipd rules disabled temporarily to isolate SError
     // PortRule {
     //     class: PortClass::Network,
     //     subclass: SubclassMatch::Exact(port_subclass::NET_SWITCH_PORT),
@@ -214,7 +214,17 @@ pub static PORT_RULES: &[PortRule] = &[
     //     caps: userlib::devd::caps::DRIVER,
     //     priority: abi::priority::ABOVE_NORM,
     //     context: &[],
+    //     mount_path: None,
     // },
+    PortRule {
+        class: PortClass::Network,
+        subclass: SubclassMatch::Exact(port_subclass::NET_WIFI_DATA),
+        driver: "ipd",
+        caps: userlib::devd::caps::DRIVER,
+        priority: abi::priority::ABOVE_NORM,
+        context: &[],
+        mount_path: None,
+    },
     PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_WIFI),

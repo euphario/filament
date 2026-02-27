@@ -354,6 +354,34 @@ pub fn build_auth_response(buf: &mut [u8], bssid: &[u8; 6], dest: &[u8; 6], seq:
 }
 
 // ============================================================================
+// Deauthentication
+// ============================================================================
+
+/// Build a deauthentication frame.
+/// Reason codes: 2 = PREV_AUTH_NOT_VALID, 6 = CLASS2_FRAME_FROM_NONAUTH_STA,
+///               7 = CLASS3_FRAME_FROM_NONASSOC_STA
+/// Source: IEEE 802.11-2020 §9.3.3.1, Table 9-49
+pub fn build_deauth(buf: &mut [u8], bssid: &[u8; 6], dest: &[u8; 6], reason: u16, seq: u16) -> usize {
+    const TOTAL: usize = 24 + 2; // MAC header + reason code
+    if buf.len() < TOTAL {
+        return 0;
+    }
+    for b in buf[..TOTAL].iter_mut() { *b = 0; }
+
+    // FC: type=0 mgmt, subtype=0xC deauth → 0x00C0
+    buf[0..2].copy_from_slice(&0x00C0u16.to_le_bytes());
+    buf[4..10].copy_from_slice(dest);
+    buf[10..16].copy_from_slice(bssid);
+    buf[16..22].copy_from_slice(bssid);
+    buf[22..24].copy_from_slice(&(seq << 4).to_le_bytes());
+
+    // Reason code
+    buf[24..26].copy_from_slice(&reason.to_le_bytes());
+
+    TOTAL
+}
+
+// ============================================================================
 // Association Response
 // ============================================================================
 

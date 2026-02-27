@@ -22,8 +22,12 @@
 use userlib::{uinfo, unotice, uwarn, uerror, udebug};
 use userlib::mmio::{MmioRegion, DmaPool};
 use userlib::ipc::{Msi, Irq, PciDevice};
-use userlib::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, ConfigKey};
+use userlib::bus::{
+    BusMsg, BusError, BusCtx, Driver, Disposition, ConfigKey, PortId, BlockPortConfig,
+    PortInfo, PortClass, NetworkMetadata, port_subclass,
+};
 use userlib::bus_runtime::driver_main;
+use userlib::ring::{IoCqe, SideEntry, io_op, io_status, side_msg, side_status};
 
 mod regs;
 mod dma;
@@ -34,12 +38,34 @@ mod mac;
 mod event;
 
 use regs::*;
-use dma::{TxRing, TxFreeResult, flush_buffer};
+use dma::{TxRing, TxFreeResult, RxDataFrame, flush_buffer};
 use device::Mt7996Dev;
 use event::RxMibCounters;
 
 use wifi80211::ap::ApManager;
 use wifi80211::types::{BssConfig, RxMgmtFrame, MgmtSubtype, ApAction, MAX_SSID_LEN};
+
+// ============================================================================
+// Data Path Statistics
+// ============================================================================
+
+/// Maximum in-flight TX frames tracked for deferred CQE posting.
+/// Must be power of 2 and >= TX ring size.
+const TX_INFLIGHT_SIZE: usize = 2048;
+
+struct WifiDataPathStats {
+    rx_frames: u32,
+    tx_frames: u32,
+    rx_pool_drops: u32,
+    tx_pool_drops: u32,
+    rx_pool_reclaimed: u32,
+}
+
+impl WifiDataPathStats {
+    const fn new() -> Self {
+        Self { rx_frames: 0, tx_frames: 0, rx_pool_drops: 0, tx_pool_drops: 0, rx_pool_reclaimed: 0 }
+    }
+}
 
 // ============================================================================
 // WifiDriver — Bus framework integration
@@ -97,6 +123,26 @@ struct WifiDriver {
     /// NAPI polling mode: IRQ is suppressed (hw masked, kernel IRQ not acked).
     /// Timer tick will drain queues and re-enable when empty.
     irq_suppressed: bool,
+    /// DataPort for IP stack data exchange (wifi:0)
+    data_port: Option<PortId>,
+    /// Monotonic RX sequence counter for DataPort CQE tags
+    net_rx_seq: u32,
+    /// Monotonic CQ post sequence — incremented for EVERY CQE (RX + TX).
+    /// Tracks the provider's cq_tail position for cq_offsets indexing.
+    cq_post_seq: u32,
+    /// Provider-side: pool offsets posted at each CQ slot (for reclaim).
+    /// Indexed by (cq_post_seq & mask) — matches CQ ring position exactly.
+    /// TX CQE slots contain u32::MAX (no pool slot to reclaim).
+    cq_offsets: [u32; 256],
+    /// Last known consumer cq_head (for reclaim delta).
+    last_cq_head: u32,
+    /// Data path statistics.
+    dp_stats: WifiDataPathStats,
+    /// TX inflight: maps wifid token → ipd SQE tag for deferred CQE posting.
+    /// Indexed by (token & (TX_INFLIGHT_SIZE - 1)). 0 = unused.
+    tx_inflight_tags: [u32; TX_INFLIGHT_SIZE],
+    /// Cached DataPort pool physical address (for zero-copy TX).
+    pool_phys: u64,
 }
 
 impl WifiDriver {
@@ -136,11 +182,20 @@ impl WifiDriver {
             ap: None,
             next_wlan_idx: MT7996_WTBL_RESERVED - 1,
             irq_suppressed: false,
+            data_port: None,
+            net_rx_seq: 0,
+            cq_post_seq: 0,
+            cq_offsets: [u32::MAX; 256],
+            last_cq_head: 0,
+            dp_stats: WifiDataPathStats::new(),
+            tx_inflight_tags: [u32::MAX; TX_INFLIGHT_SIZE],
+            pool_phys: 0,
         }
     }
 
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         unotice!("wifid", "init_start");
+        userlib::ulog::flush();
 
         // Step 1: Get BAR0 from spawn context (provided by pcied via devd)
         let spawn_ctx = ctx.spawn_context().map_err(|e| {
@@ -711,7 +766,7 @@ impl WifiDriver {
 
     // VOW: assign WCID to BSS group — Linux mcu.c:2504 mt7996_mcu_add_group()
     udebug!("wifid", "vow_send"; bss = 0u32, wlan = MT7996_WTBL_RESERVED as u32);
-    dev.mcu_add_group(&mut wa_ring, 0, MT7996_WTBL_RESERVED, seq, None).map_err(mcu_err)?;
+    dev.mcu_add_group(&mut wa_ring, 0, MT7996_WTBL_RESERVED, seq, None, true).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
     // === Channel tune (band 0) — Linux main.c:553 mt7996_set_channel() ===
@@ -780,7 +835,7 @@ impl WifiDriver {
     seq = seq.wrapping_add(1);
 
     // VOW: reassign WCID to BSS group — Linux mcu.c:2504
-    dev.mcu_add_group(&mut wa_ring, 0, MT7996_WTBL_RESERVED, seq, None).map_err(mcu_err)?;
+    dev.mcu_add_group(&mut wa_ring, 0, MT7996_WTBL_RESERVED, seq, None, true).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
     // EDCA/WMM parameters — Linux main.c:883-884
@@ -883,6 +938,31 @@ impl WifiDriver {
         channel: 1,
     }));
 
+    // Create DataPort for IP stack data exchange
+    let dp_config = BlockPortConfig { ring_size: 256, side_size: 4, pool_size: 1024 * 1024 };
+    match ctx.create_block_port(dp_config) {
+        Ok(port_id) => {
+            if let Some(port) = ctx.block_port(port_id) {
+                port.set_public();
+            }
+            // Register as wifi:0
+            let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
+            let mut info = PortInfo::new(b"wifi:0", PortClass::Network);
+            info.port_subclass = port_subclass::NET_WIFI_DATA;
+            let mut meta = NetworkMetadata::empty();
+            meta.mac.copy_from_slice(&mac_addr);
+            info.set_network_metadata(meta);
+            let _ = ctx.register_port_with_info(&info, shmem_id);
+            self.data_port = Some(port_id);
+            // Cache pool physical address for zero-copy TX
+            self.pool_phys = ctx.block_port(port_id).map(|p| p.pool_phys()).unwrap_or(0);
+            uinfo!("wifid", "dataport_ready"; shmem = shmem_id, pool_phys = self.pool_phys);
+        }
+        Err(e) => {
+            uerror!("wifid", "dataport_create_failed"; err = e as u32);
+        }
+    }
+
     // Store resources and state in driver struct
     self.mac_addr = mac_addr;
     self.seq = seq;
@@ -967,6 +1047,105 @@ fn fmt_u32_dec(val: u32, buf: &mut [u8]) -> usize {
     n
 }
 
+/// Reclaim provider-side RX pool slots freed by the consumer.
+///
+/// Free function to avoid borrow conflicts with `dev` in the timer handler.
+fn reclaim_rx_pool(
+    drv: &mut WifiDriver,
+    ctx: &mut dyn BusCtx,
+) {
+    let dp = match drv.data_port {
+        Some(id) => id,
+        None => return,
+    };
+    if let Some(port) = ctx.block_port(dp) {
+        let new_head = port.cq_consumer_head();
+        let mask = port.ring_mask();
+        while drv.last_cq_head != new_head {
+            let slot = (drv.last_cq_head & mask) as usize;
+            if slot < drv.cq_offsets.len() {
+                let offset = drv.cq_offsets[slot];
+                if offset != u32::MAX {
+                    port.free(offset);
+                    drv.cq_offsets[slot] = u32::MAX;
+                    drv.dp_stats.rx_pool_reclaimed += 1;
+                }
+            }
+            drv.last_cq_head = drv.last_cq_head.wrapping_add(1);
+        }
+    }
+}
+
+/// Sweep completed TX descriptors and post deferred CQEs to ipd.
+///
+/// After hardware finishes transmitting, DMA_DONE is set on the descriptor.
+/// We walk the TX ring, read the token from each completed descriptor,
+/// look up the original SQE tag, and post CQE_FLAG_TX_DONE so ipd can
+/// safely free the pool slot (hardware is done reading it).
+fn tx_sweep_and_complete(
+    drv: &mut WifiDriver,
+    dev: &Mt7996Dev,
+    ctx: &mut dyn BusCtx,
+) {
+    let dp = match drv.data_port {
+        Some(id) => id,
+        None => return,
+    };
+    let tx_ring = match drv.tx_band0 {
+        Some(ref mut r) => r,
+        None => return,
+    };
+
+    let mut tokens = [0u16; 32]; // sweep up to 32 per call
+    let count = dev.tx_sweep(tx_ring, &mut tokens);
+    if count == 0 { return; }
+
+    if let Some(port) = ctx.block_port(dp) {
+        let mask = port.ring_mask();
+        let mut posted = false;
+        for i in 0..count {
+            let tok = tokens[i];
+            let idx = (tok as usize) & (TX_INFLIGHT_SIZE - 1);
+            let sqe_tag = drv.tx_inflight_tags[idx];
+            if sqe_tag == u32::MAX {
+                // Management frame token (no DataPort SQE) — skip CQE posting
+                continue;
+            }
+            drv.tx_inflight_tags[idx] = u32::MAX;
+
+            // Mark CQ slot as TX (no provider pool to reclaim)
+            let cq_slot = (drv.cq_post_seq & mask) as usize;
+            if port.complete(&IoCqe {
+                status: io_status::OK,
+                flags: io_status::CQE_FLAG_TX_DONE,
+                tag: sqe_tag,
+                transferred: 0,
+                result: 0,
+            }) {
+                if cq_slot < drv.cq_offsets.len() {
+                    drv.cq_offsets[cq_slot] = u32::MAX; // no pool slot for TX CQEs
+                }
+                drv.cq_post_seq = drv.cq_post_seq.wrapping_add(1);
+                posted = true;
+            }
+        }
+        if posted {
+            port.notify();
+        }
+    }
+}
+
+/// Format "prefix=value\n" into buffer, return bytes written.
+fn fmt_stat_kv(buf: &mut [u8], prefix: &[u8], val: u32) -> usize {
+    let mut pos = 0;
+    let plen = prefix.len().min(buf.len());
+    buf[..plen].copy_from_slice(&prefix[..plen]);
+    pos += plen;
+    pos += fmt_u32_dec(val, &mut buf[pos..]);
+    if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
+    pos
+}
+
 /// Format u8 as decimal into buffer, return number of bytes written.
 fn fmt_u8(val: u8, buf: &mut [u8]) -> usize {
     if val >= 100 {
@@ -1022,7 +1201,7 @@ fn wrap_mgmt_txd(buf: &mut [u8], frame: &[u8]) -> usize {
     let txd1 = (1u32 << 31)                          // FIXED_RATE
         | ((MT_HDR_FORMAT_802_11 as u32) << 14)  // HDR_FORMAT = 802.11
         | (12u32 << 16)                          // HDR_INFO = 24/2
-        | (MT_TX_NORMAL << 22)                   // TID = 5 (mgmt queue)
+        | (MT_TX_NORMAL << 22)                   // TID (mgmt)
         | ((HW_BSSID_0 as u32) << 25)           // OWN_MAC = 0
         | (MT7996_WTBL_RESERVED as u32);         // WLAN_IDX = BMC STA
     buf[4..8].copy_from_slice(&txd1.to_le_bytes());
@@ -1078,8 +1257,10 @@ const WIFI_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_only(b"diag.mib"),
     ConfigKey::read_only(b"diag.bcn"),
     ConfigKey::read_only(b"diag.dma"),
+    ConfigKey::read_only(b"diag.stas"),
     ConfigKey::read_write(b"rx"),
     ConfigKey::read_write(b"scan"),
+    ConfigKey::read_only(b"stats"),
 ];
 
 impl WifiDriverWrapper {
@@ -1087,6 +1268,128 @@ impl WifiDriverWrapper {
         let n = s.len().min(buf.len());
         buf[..n].copy_from_slice(&s[..n]);
         n
+    }
+
+    /// Process TX frames from ipd via the DataPort SQ.
+    ///
+    /// Takes `dev` as a parameter to avoid borrow conflicts in the timer
+    /// handler where `dev` is already borrowed from `self.0.dev.as_ref()`.
+    fn process_tx_from_ipd(&mut self, dev: &Mt7996Dev, ctx: &mut dyn BusCtx) {
+        let dp = match self.0.data_port {
+            Some(id) => id,
+            None => return,
+        };
+        // Drain up to 16 SQEs per event
+        let mut had_errors = false;
+        for _ in 0..16 {
+            let sqe = match ctx.block_port(dp).and_then(|p| p.recv_request()) {
+                Some(s) => s,
+                None => break,
+            };
+            if sqe.opcode != io_op::NET_SEND {
+                if let Some(port) = ctx.block_port(dp) {
+                    let mask = port.ring_mask();
+                    let cq_slot = (self.0.cq_post_seq & mask) as usize;
+                    if port.complete_error(sqe.tag, io_status::INVALID) {
+                        if cq_slot < self.0.cq_offsets.len() {
+                            self.0.cq_offsets[cq_slot] = u32::MAX;
+                        }
+                        self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
+                    }
+                    had_errors = true;
+                }
+                continue;
+            }
+
+            let frame_len = sqe.data_len as usize;
+            if frame_len < 14 || frame_len > 1514 {
+                if let Some(port) = ctx.block_port(dp) {
+                    let mask = port.ring_mask();
+                    let cq_slot = (self.0.cq_post_seq & mask) as usize;
+                    if port.complete_error(sqe.tag, io_status::INVALID) {
+                        if cq_slot < self.0.cq_offsets.len() {
+                            self.0.cq_offsets[cq_slot] = u32::MAX;
+                        }
+                        self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
+                    }
+                    had_errors = true;
+                }
+                continue;
+            }
+
+            // Read full frame from pool for TX (copy to stack buffer)
+            let mut frame_buf = [0u8; 1514];
+            let got_frame = ctx.block_port(dp).and_then(|port| {
+                port.pool_slice(sqe.data_offset, frame_len as u32).map(|s| {
+                    frame_buf[..frame_len].copy_from_slice(s);
+                })
+            });
+            if got_frame.is_none() {
+                if let Some(port) = ctx.block_port(dp) {
+                    port.complete_error(sqe.tag, io_status::INVALID);
+                    had_errors = true;
+                }
+                continue;
+            }
+
+            let dst_mac: [u8; 6] = [frame_buf[0], frame_buf[1], frame_buf[2],
+                                     frame_buf[3], frame_buf[4], frame_buf[5]];
+            let is_multicast = (dst_mac[0] & 0x01) != 0;
+            let wcid = if is_multicast {
+                MT7996_WTBL_RESERVED
+            } else {
+                self.0.ap.as_ref()
+                    .and_then(|ap| ap.find_sta(&dst_mac))
+                    .map(|sta| sta.wlan_idx)
+                    .unwrap_or(MT7996_WTBL_RESERVED)
+            };
+
+            // Copy-based TX: frame data copied into DMA buffer by tx_enqueue_data
+            let result = if let Some(ref mut tx_ring) = self.0.tx_band0 {
+                let tok = self.0.tx_token;
+                self.0.tx_token = self.0.tx_token.wrapping_add(1);
+                let r = dev.tx_enqueue_data(tx_ring, &frame_buf[..frame_len], wcid, tok);
+                if r.is_ok() {
+                    // Track inflight: tok → sqe.tag for deferred CQE
+                    let idx = (tok as usize) & (TX_INFLIGHT_SIZE - 1);
+                    self.0.tx_inflight_tags[idx] = sqe.tag;
+                    self.0.dp_stats.tx_frames += 1;
+                }
+                r
+            } else {
+                Err(-3)
+            };
+
+            // Only post immediate CQE on error (hardware never saw the frame)
+            if let Err(_) = result {
+                if let Some(port) = ctx.block_port(dp) {
+                    let mask = port.ring_mask();
+                    let cq_slot = (self.0.cq_post_seq & mask) as usize;
+                    if port.complete(&IoCqe {
+                        status: io_status::IO_ERROR,
+                        flags: io_status::CQE_FLAG_TX_DONE,
+                        tag: sqe.tag,
+                        transferred: 0,
+                        result: 0,
+                    }) {
+                        if cq_slot < self.0.cq_offsets.len() {
+                            self.0.cq_offsets[cq_slot] = u32::MAX;
+                        }
+                        self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
+                    }
+                    had_errors = true;
+                }
+                self.0.dp_stats.tx_pool_drops += 1;
+            }
+            // On success: CQE deferred until tx_sweep confirms hardware completion
+        }
+
+        // Notify only if we posted error CQEs
+        if had_errors {
+            if let Some(port) = ctx.block_port(dp) {
+                port.notify();
+            }
+        }
     }
 
 }
@@ -1111,10 +1414,15 @@ impl Driver for WifiDriverWrapper {
             return;
         }
 
-        let dev = match self.0.dev.as_ref() {
-            Some(d) => d,
+        let dev_ptr = match self.0.dev.as_ref() {
+            Some(d) => d as *const Mt7996Dev,
             None => return,
         };
+        // SAFETY: self.0.dev is Some (just checked) and is never dropped or moved
+        // during handle_event. The pointer is valid for the entire function body.
+        // We use a raw pointer because the borrow checker cannot see that
+        // process_tx_from_ipd and reclaim_rx_pool don't touch self.0.dev.
+        let dev = unsafe { &*dev_ptr };
 
         // Both timer and IRQ events process DMA queues.
         // Timer ticks MUST drain MCU RX queues (q0/q1) because the timer
@@ -1150,31 +1458,44 @@ impl Driver for WifiDriverWrapper {
 
         // MCU WM RX (q0) — firmware events from WM processor
         if intr & MT_INT_RX_DONE_WM != 0 && qc > 0 {
-            dev.rx_process_mcu(&self.0.rx_queues[0], &mut self.0.mib[2]);
+            dev.rx_process_mcu(&mut self.0.rx_queues[0], &mut self.0.mib[2]);
         }
 
         // MCU WA RX (q1) — firmware events from WA processor
         if intr & MT_INT_RX_DONE_WA != 0 && qc > 1 {
-            dev.rx_process_mcu(&self.0.rx_queues[1], &mut self.0.mib[2]);
+            dev.rx_process_mcu(&mut self.0.rx_queues[1], &mut self.0.mib[2]);
         }
 
         // BAND0 data RX (q2) — classify frames, collect management frames for AP
         let mut mgmt_frames: [RxMgmtFrame; 8] = core::array::from_fn(|_| RxMgmtFrame {
             subtype: MgmtSubtype::Other(0),
             addr2: [0; 6],
+            rssi: -128,
+            phy: wifi80211::types::RxPhyInfo::UNKNOWN,
         });
         let mut mgmt_count = 0usize;
+        let mut data_frames: [RxDataFrame; 16] = core::array::from_fn(|_| RxDataFrame {
+            copy_offset: 0, len: 0,
+        });
+        let mut data_count = 0usize;
+        // Copy buffer for data frame payloads — rx_classify copies frame data
+        // here before resetting DMA descriptors (avoids use-after-free).
+        // 16 frames × 1514 bytes max = ~24KB
+        let mut data_buf = [0u8; 16 * 1514];
         if intr & MT_INT_RX_DONE_BAND0 != 0 && qc > 2 {
-            let (_n, mc) = dev.rx_classify(
-                &self.0.rx_queues[2], &mut self.0.mib[0],
+            let (_n, mc, dc) = dev.rx_classify(
+                &mut self.0.rx_queues[2], &mut self.0.mib[0],
                 &mut mgmt_frames, 8,
+                &mut data_frames, 16,
+                &mut data_buf,
             );
             mgmt_count = mc;
+            data_count = dc;
         }
 
         // WA_MAIN (q3) — TX free notifications
         if intr & MT_INT_RX_DONE_WA_MAIN != 0 && qc > 3 {
-            let r = dev.rx_process_tx_free(&self.0.rx_queues[3]);
+            let r = dev.rx_process_tx_free(&mut self.0.rx_queues[3]);
             self.0.tx_freed += r.tokens_freed;
             self.0.tx_free_entries += r.entries;
             self.0.tx_free_notify_count += r.txrx_notify_count;
@@ -1182,16 +1503,20 @@ impl Driver for WifiDriverWrapper {
 
         // BAND2 data RX (q4) — classify frames, update band2 counters
         if intr & MT_INT_RX_DONE_BAND2 != 0 && qc > 4 {
-            let mut dummy: [RxMgmtFrame; 1] = [RxMgmtFrame {
+            let mut dummy_mgmt: [RxMgmtFrame; 1] = [RxMgmtFrame {
                 subtype: MgmtSubtype::Other(0),
                 addr2: [0; 6],
+                rssi: -128,
+                phy: wifi80211::types::RxPhyInfo::UNKNOWN,
             }];
-            dev.rx_classify(&self.0.rx_queues[4], &mut self.0.mib[1], &mut dummy, 0);
+            let mut dummy_data: [RxDataFrame; 1] = [RxDataFrame { copy_offset: 0, len: 0 }];
+            let mut dummy_buf = [0u8; 0];
+            dev.rx_classify(&mut self.0.rx_queues[4], &mut self.0.mib[1], &mut dummy_mgmt, 0, &mut dummy_data, 0, &mut dummy_buf);
         }
 
         // WA_TRI (q5) — TX free notifications (band2)
         if intr & MT_INT_RX_DONE_WA_TRI != 0 && qc > 5 {
-            let r = dev.rx_process_tx_free(&self.0.rx_queues[5]);
+            let r = dev.rx_process_tx_free(&mut self.0.rx_queues[5]);
             self.0.tx_freed += r.tokens_freed;
         }
 
@@ -1205,35 +1530,35 @@ impl Driver for WifiDriverWrapper {
             // Log every received management frame — essential for debugging the RX path
             match subtype {
                 MgmtSubtype::ProbeReq => {
-                    udebug!("wifid", "rx_probe_req";
-                        mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
-                        mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
-                        mac4 = addr2[4] as u32, mac5 = addr2[5] as u32
-                    );
+                    // Counted in mib.probe_req — no per-frame log needed
                 }
                 MgmtSubtype::Auth => {
+                    let abs_rssi = if mgmt_frames[i].rssi < 0 { (-mgmt_frames[i].rssi) as u32 } else { mgmt_frames[i].rssi as u32 };
                     uinfo!("wifid", "rx_auth";
                         mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
                         mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
-                        mac4 = addr2[4] as u32, mac5 = addr2[5] as u32
+                        mac4 = addr2[4] as u32, mac5 = addr2[5] as u32,
+                        rssi_neg = abs_rssi
                     );
                 }
                 MgmtSubtype::AssocReq => {
+                    let abs_rssi = if mgmt_frames[i].rssi < 0 { (-mgmt_frames[i].rssi) as u32 } else { mgmt_frames[i].rssi as u32 };
                     uinfo!("wifid", "rx_assoc_req";
                         mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
                         mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
-                        mac4 = addr2[4] as u32, mac5 = addr2[5] as u32
+                        mac4 = addr2[4] as u32, mac5 = addr2[5] as u32,
+                        rssi_neg = abs_rssi
                     );
                 }
                 MgmtSubtype::Deauth => {
-                    uinfo!("wifid", "rx_deauth";
+                    udebug!("wifid", "rx_deauth";
                         mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
                         mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
                         mac4 = addr2[4] as u32, mac5 = addr2[5] as u32
                     );
                 }
                 MgmtSubtype::Disassoc => {
-                    uinfo!("wifid", "rx_disassoc";
+                    udebug!("wifid", "rx_disassoc";
                         mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
                         mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
                         mac4 = addr2[4] as u32, mac5 = addr2[5] as u32
@@ -1251,6 +1576,7 @@ impl Driver for WifiDriverWrapper {
             let mut register_aid = 0u16;
             let mut do_register = false;
             let mut remove_aid = 0u16;
+            let mut remove_wlan_idx = 0u16;
             let mut do_remove = false;
 
             if let Some(ref mut ap) = self.0.ap {
@@ -1270,8 +1596,9 @@ impl Driver for WifiDriverWrapper {
                             register_aid = *aid;
                             do_register = true;
                         }
-                        ApAction::RemoveSta { aid } => {
+                        ApAction::RemoveSta { aid, wlan_idx } => {
                             remove_aid = *aid;
+                            remove_wlan_idx = *wlan_idx;
                             do_remove = true;
                         }
                     }
@@ -1283,8 +1610,9 @@ impl Driver for WifiDriverWrapper {
                             register_aid = *aid;
                             do_register = true;
                         }
-                        ApAction::RemoveSta { aid } => {
+                        ApAction::RemoveSta { aid, wlan_idx } => {
                             remove_aid = *aid;
+                            remove_wlan_idx = *wlan_idx;
                             do_remove = true;
                         }
                         ApAction::TxFrame(_) => {} // action2 is never TxFrame in practice
@@ -1293,7 +1621,7 @@ impl Driver for WifiDriverWrapper {
 
                 // Log when AP drops a frame (e.g. assoc from unauthenticated STA)
                 if result.action1.is_none() && !matches!(subtype, MgmtSubtype::ProbeReq | MgmtSubtype::Other(_)) {
-                    uwarn!("wifid", "ap_drop_frame";
+                    udebug!("wifid", "ap_drop_frame";
                         mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
                         mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
                         mac4 = addr2[4] as u32, mac5 = addr2[5] as u32
@@ -1309,8 +1637,13 @@ impl Driver for WifiDriverWrapper {
                     if len > 0 {
                         let tok = self.0.tx_token;
                         self.0.tx_token = self.0.tx_token.wrapping_add(1);
+                        // Log TXD1 for debugging TX-not-transmitted regression
+                        let txd1_val = u32::from_le_bytes([txd_buf[4], txd_buf[5], txd_buf[6], txd_buf[7]]);
                         match dev.tx_enqueue(tx_ring, &txd_buf[..len], tok) {
                             Ok(()) => {
+                                if !matches!(subtype, MgmtSubtype::ProbeReq) {
+                                    uinfo!("wifid", "tx_mgmt_ok"; tok = tok as u32, len = len as u32, txd1 = txd1_val);
+                                }
                                 self.0.tx_probe_resp = self.0.tx_probe_resp.wrapping_add(1);
                             }
                             Err(e) => {
@@ -1324,19 +1657,26 @@ impl Driver for WifiDriverWrapper {
                 let wlan_idx = self.0.next_wlan_idx;
                 self.0.next_wlan_idx = self.0.next_wlan_idx.wrapping_sub(1);
 
-                uinfo!("wifid", "sta_register";
+                udebug!("wifid", "sta_register";
                     mac0 = register_mac[0] as u32, mac1 = register_mac[1] as u32,
                     mac2 = register_mac[2] as u32, mac3 = register_mac[3] as u32,
                     mac4 = register_mac[4] as u32, mac5 = register_mac[5] as u32,
                     aid = register_aid as u32, wlan = wlan_idx as u32
                 );
 
+                // Linux main.c:992 — clear ADM count before adding STA
+                dev.mac_wtbl_update(wlan_idx as u32, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+
                 if let Some(ref mut wa_ring) = self.0.wa_ring {
                     let seq = self.0.seq;
                     self.0.seq = self.0.seq.wrapping_add(1);
+                    // Fire-and-forget: don't wait for MCU responses during event loop.
+                    // wait=true would block processing (delay_ms polling) and corrupt
+                    // the MCU RX ring (CPU_IDX advanced without descriptor reset).
+                    // Responses are drained by rx_process_mcu on the next timer tick.
                     if let Err(e) = dev.mcu_add_client_sta(
                         wa_ring, 0, wlan_idx, HW_BSSID_0,
-                        CONN_STATE_CONNECT, &register_mac, register_aid, true, seq, None,
+                        CONN_STATE_CONNECT, &register_mac, register_aid, true, seq, None, false,
                     ) {
                         uerror!("wifid", "mcu_sta_connect_failed"; err = e as u32, wlan = wlan_idx as u32);
                     }
@@ -1344,19 +1684,115 @@ impl Driver for WifiDriverWrapper {
                     self.0.seq = self.0.seq.wrapping_add(1);
                     if let Err(e) = dev.mcu_add_client_sta(
                         wa_ring, 0, wlan_idx, HW_BSSID_0,
-                        CONN_STATE_PORT_SECURE, &register_mac, register_aid, false, seq, None,
+                        CONN_STATE_PORT_SECURE, &register_mac, register_aid, false, seq, None, false,
                     ) {
                         uerror!("wifid", "mcu_sta_port_secure_failed"; err = e as u32, wlan = wlan_idx as u32);
                     }
                     let seq = self.0.seq;
                     self.0.seq = self.0.seq.wrapping_add(1);
-                    if let Err(e) = dev.mcu_add_group(wa_ring, 0, wlan_idx, seq, None) {
+                    if let Err(e) = dev.mcu_add_group(wa_ring, 0, wlan_idx, seq, None, false) {
                         uerror!("wifid", "mcu_add_group_failed"; err = e as u32, wlan = wlan_idx as u32);
                     }
                 }
+
+                // Store WCID on STA for TX routing
+                if let Some(ref mut ap) = self.0.ap {
+                    ap.set_sta_wlan_idx(&register_mac, wlan_idx);
+                }
             }
-            if do_remove {
-                uinfo!("wifid", "sta_remove"; aid = remove_aid as u32);
+            if do_remove && remove_wlan_idx != 0 {
+                udebug!("wifid", "sta_remove"; aid = remove_aid as u32, wlan = remove_wlan_idx as u32);
+                // Linux main.c:1034 — clear ADM count before removing STA
+                dev.mac_wtbl_update(remove_wlan_idx as u32, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+                if let Some(ref mut wa_ring) = self.0.wa_ring {
+                    let seq = self.0.seq;
+                    self.0.seq = self.0.seq.wrapping_add(1);
+                    let _ = dev.mcu_add_client_sta(
+                        wa_ring, 0, remove_wlan_idx, HW_BSSID_0,
+                        CONN_STATE_DISCONNECT, &[0u8; 6], remove_aid, false, seq, None, false,
+                    );
+                }
+            }
+        }
+
+        // Forward data frames to ipd via DataPort.
+        // Frame data was copied into data_buf by rx_classify (safe — DMA buffers already freed).
+        if data_count > 0 {
+            // Touch STA last_seen for each data frame (prevents aging while sending data).
+            // Ethernet frame: dst[6] + src[6] — source MAC at offset 6.
+            if let Some(ref mut ap) = self.0.ap {
+                for i in 0..data_count {
+                    let frame = &data_frames[i];
+                    let ofs = frame.copy_offset as usize;
+                    if frame.len >= 14 {
+                        let mut src_mac = [0u8; 6];
+                        src_mac.copy_from_slice(&data_buf[ofs + 6..ofs + 12]);
+                        ap.touch_sta(&src_mac, self.0.drain_ticks);
+                    }
+                }
+            }
+            if let Some(dp) = self.0.data_port {
+                if let Some(port) = _ctx.block_port(dp) {
+                    let mask = port.ring_mask();
+                    let mut posted = false;
+                    for i in 0..data_count {
+                        let frame = &data_frames[i];
+                        let flen = frame.len as u32;
+                        let src = &data_buf[frame.copy_offset as usize..(frame.copy_offset as usize + frame.len as usize)];
+
+                        // Allocate pool slot for this frame
+                        let offset = match port.alloc(flen) {
+                            Some(o) => o,
+                            None => {
+                                self.0.dp_stats.rx_pool_drops += 1;
+                                continue;
+                            }
+                        };
+
+                        // Copy frame into pool
+                        if let Some(dst) = port.pool_slice_mut(offset, flen) {
+                            dst.copy_from_slice(src);
+                        } else {
+                            port.free(offset);
+                            self.0.dp_stats.rx_pool_drops += 1;
+                            continue;
+                        }
+
+                        // Post CQE to consumer (ipd)
+                        let tag = self.0.net_rx_seq;
+                        self.0.net_rx_seq = self.0.net_rx_seq.wrapping_add(1);
+                        let cq_slot = (self.0.cq_post_seq & mask) as usize;
+                        if port.complete(&IoCqe {
+                            status: io_status::OK,
+                            flags: 0,
+                            tag,
+                            transferred: flen,
+                            result: offset,
+                        }) {
+                            if cq_slot < self.0.cq_offsets.len() {
+                                self.0.cq_offsets[cq_slot] = offset;
+                            }
+                            self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
+                            self.0.dp_stats.rx_frames += 1;
+                            posted = true;
+                        } else {
+                            port.free(offset);
+                            self.0.dp_stats.rx_pool_drops += 1;
+                        }
+                    }
+                    if posted {
+                        port.notify();
+                    }
+                }
+            }
+        }
+
+        // Process TX frames from ipd and sweep completed TX descriptors
+        if let Some(dp) = self.0.data_port {
+            if _ctx.block_port(dp).is_some() {
+                self.process_tx_from_ipd(dev, _ctx);
+                tx_sweep_and_complete(&mut self.0, dev, _ctx);
+                reclaim_rx_pool(&mut self.0, _ctx);
             }
         }
 
@@ -1383,19 +1819,32 @@ impl Driver for WifiDriverWrapper {
                 self.0.seq = self.0.seq.wrapping_add(1);
             }
 
-            // STA aging: evict STAs not seen for 30 seconds
+            // STA aging: evict STAs not seen within timeout
             if let Some(ref mut ap) = self.0.ap {
-                let mut evicted = [0u16; 16];
+                let mut evicted = [(0u16, 0u16); 16];
                 let n = ap.age_stas(self.0.drain_ticks, &mut evicted);
                 for j in 0..n {
-                    uinfo!("wifid", "sta_aged"; aid = evicted[j] as u32);
+                    let (aid, wlan_idx) = evicted[j];
+                    udebug!("wifid", "sta_aged"; aid = aid as u32, wlan = wlan_idx as u32);
+                    if wlan_idx != 0 {
+                        // Linux main.c:1034 — clear ADM count before removing STA
+                        dev.mac_wtbl_update(wlan_idx as u32, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+                        if let Some(ref mut wa_ring) = self.0.wa_ring {
+                            let seq = self.0.seq;
+                            self.0.seq = self.0.seq.wrapping_add(1);
+                            let _ = dev.mcu_add_client_sta(
+                                wa_ring, 0, wlan_idx, HW_BSSID_0,
+                                CONN_STATE_DISCONNECT, &[0u8; 6], aid, false, seq, None, false,
+                            );
+                        }
+                    }
                 }
             }
         }
 
         // Beacon diagnostic: log key registers every second while beaconing.
         // drain_ticks increments every 500ms, so 2 = 1 second.
-        if is_timer && self.0.beacon_on && self.0.drain_ticks % 2 == 0 {
+        if is_timer && self.0.beacon_on && self.0.drain_ticks % 10 == 0 {
             let secs = self.0.drain_ticks / 2;
             let arb = dev.reg_rr(mt_wf_arb(0, MT_ARB_SCR_OFS));
             let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
@@ -1432,9 +1881,13 @@ impl Driver for WifiDriverWrapper {
 
             // Monitor RX ring DMA_IDX and CPU_IDX for WA_MAIN (q3) to debug drain
             let mut rx_dma = [0u32; 6];
+            let mut r2_cpu = 0u32;
             let mut r3_cpu = 0u32;
             for ri in 0..qc.min(6) {
                 rx_dma[ri] = dev.mt76_rr(self.0.rx_queues[ri].regs_base + MT_QUEUE_DMA_IDX);
+            }
+            if qc > 2 {
+                r2_cpu = dev.mt76_rr(self.0.rx_queues[2].regs_base + MT_QUEUE_CPU_IDX);
             }
             if qc > 3 {
                 r3_cpu = dev.mt76_rr(self.0.rx_queues[3].regs_base + MT_QUEUE_CPU_IDX);
@@ -1442,28 +1895,44 @@ impl Driver for WifiDriverWrapper {
 
             let rfcr_actual = dev.reg_rr(mt_wf_rmac(0, MT_WF_RFCR_OFS));
 
+            let dp = &self.0.dp_stats;
+            // Split into two log lines to avoid uinfo buffer truncation
             uinfo!("wifid", "bcn_diag";
                 t = secs,
                 arb = arb,
                 mcu = mcu_cmd,
-                tx_ok = tx_mpdu,
+                stas = sta_count,
                 sw_bcn = self.0.tx_beacon,
                 tx_prb = self.0.tx_probe_resp,
-                stas = sta_count,
                 rx_tot = b0.total,
                 rx_dat = b0.data,
                 rx_mgmt = b0.mgmt,
-                rx_auth = b0.auth,
+                rx_prb = b0.probe_req,
                 rx_fcs = b0.fcs_err,
-                rx_txs = b0.txs,
                 rfcr = rfcr_actual,
-                r0 = rx_dma[0], r1 = rx_dma[1], r2 = rx_dma[2],
+                r0 = rx_dma[0], r1 = rx_dma[1], r2 = rx_dma[2], r2c = r2_cpu,
                 r3 = rx_dma[3], r3c = r3_cpu,
+                q0d = q0_dma, q0c = q0_cpu,
+                q1d = q1_dma, q1c = q1_cpu
+            );
+            uinfo!("wifid", "bcn_tx";
+                t = secs,
+                tx_ok = tx_mpdu,
+                tx_try = tx_try,
+                tx_amp = tx_ampdu,
+                ack_f = ack_fail,
                 tx_c = tx_cpu,
                 tx_d = tx_dma,
                 txf = self.0.tx_freed,
                 tfe = self.0.tx_free_entries,
-                tfn = self.0.tx_free_notify_count
+                tfn = self.0.tx_free_notify_count,
+                ple_f = ple_free,
+                ple_e = ple_empty,
+                dp_rx = dp.rx_frames,
+                dp_tx = dp.tx_frames,
+                dp_rxd = dp.rx_pool_drops,
+                dp_txd = dp.tx_pool_drops,
+                napi = self.0.irq_suppressed as u32
             );
 
         }
@@ -1527,6 +1996,77 @@ impl Driver for WifiDriverWrapper {
                 self.0.irq_suppressed = false;
             }
             // Otherwise stay suppressed — next timer tick will drain again.
+        }
+    }
+
+    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
+        let dp = match self.0.data_port {
+            Some(id) if id == port => id,
+            _ => return,
+        };
+
+        // Handle sidechannel queries (QUERY_INFO from ipd)
+        let mut queries: [Option<SideEntry>; 4] = [None; 4];
+        let mut qcount = 0;
+        if let Some(port) = ctx.block_port(dp) {
+            while qcount < 4 {
+                if let Some(entry) = port.poll_side_request() {
+                    queries[qcount] = Some(entry);
+                    qcount += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        for i in 0..qcount {
+            if let Some(entry) = queries[i].take() {
+                match entry.msg_type {
+                    side_msg::QUERY_INFO => {
+                        let mut response = SideEntry {
+                            msg_type: entry.msg_type,
+                            flags: 0,
+                            tag: entry.tag,
+                            status: side_status::OK,
+                            payload: [0; 24],
+                        };
+                        response.payload[0..6].copy_from_slice(&self.0.mac_addr);
+                        // payload[6] = link status (1 = up when radio is on and AP active)
+                        response.payload[6] = if self.0.radio_on && self.0.beacon_on { 1 } else { 0 };
+                        // payload[7..9] = MTU (1500)
+                        response.payload[7..9].copy_from_slice(&1500u16.to_le_bytes());
+                        if let Some(port) = ctx.block_port(dp) {
+                            port.side_send(&response);
+                            port.notify();
+                        }
+                    }
+                    _ => {
+                        let response = SideEntry {
+                            msg_type: entry.msg_type,
+                            flags: 0,
+                            tag: entry.tag,
+                            status: side_status::EOL,
+                            payload: [0; 24],
+                        };
+                        if let Some(port) = ctx.block_port(dp) {
+                            port.side_send(&response);
+                            port.notify();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process TX from IP stack (ipd → WiFi)
+        // Use a raw pointer to avoid borrow conflict — process_tx_from_ipd
+        // takes dev as a param but &mut self conflicts with self.0.dev.as_ref().
+        let dev_ptr = self.0.dev.as_ref().map(|d| d as *const Mt7996Dev);
+        if let Some(ptr) = dev_ptr {
+            // SAFETY: self.0.dev is Some (just checked), and process_tx_from_ipd
+            // does not modify or drop self.0.dev. The pointer is valid for the
+            // duration of this call.
+            let dev = unsafe { &*ptr };
+            self.process_tx_from_ipd(dev, ctx);
+            tx_sweep_and_complete(self.0, dev, ctx);
         }
     }
 
@@ -1823,6 +2363,71 @@ impl Driver for WifiDriverWrapper {
 
                 Self::copy_to_buf(buf, &tmp[..pos])
             }
+            b"diag.stas" => {
+                // STA table dump: MAC state RSSI rate/MCS BW NSS mode
+                let ap = match self.0.ap.as_ref() {
+                    Some(a) => a,
+                    None => return Self::copy_to_buf(buf, b"no AP\n"),
+                };
+                let mut tmp = [0u8; 2048];
+                let mut pos = 0;
+                let modes = [b"CCK", b"OFD" as &[u8], b"HT\0", b"???", b"VHT", b"???", b"???", b"???", b"HE\0", b"EHT"];
+                for sta in ap.iter_stas() {
+                    if pos + 80 > tmp.len() { break; }
+                    pos += fmt_mac(&sta.mac, &mut tmp[pos..]);
+                    tmp[pos] = b' '; pos += 1;
+                    let st = match sta.state {
+                        wifi80211::types::StaState::Authenticated => b"auth ",
+                        wifi80211::types::StaState::Associated => b"assoc",
+                        _ => b"?????",
+                    };
+                    tmp[pos..pos+5].copy_from_slice(st);
+                    pos += 5;
+                    tmp[pos] = b' '; pos += 1;
+                    // RSSI (signed)
+                    let rssi = sta.rssi;
+                    if rssi < 0 {
+                        tmp[pos] = b'-'; pos += 1;
+                        pos += fmt_u32_dec((-rssi as i32) as u32, &mut tmp[pos..]);
+                    } else {
+                        pos += fmt_u32_dec(rssi as u32, &mut tmp[pos..]);
+                    }
+                    tmp[pos..pos+4].copy_from_slice(b"dBm ");
+                    pos += 4;
+                    // PHY mode
+                    let mi = sta.phy.mode as usize;
+                    let mstr = if mi < modes.len() { modes[mi] } else { b"???" };
+                    tmp[pos..pos+3].copy_from_slice(mstr);
+                    pos += 3;
+                    // MCS/rate
+                    tmp[pos..pos+4].copy_from_slice(b" mcs");
+                    pos += 4;
+                    pos += fmt_u32_dec(sta.phy.rate as u32, &mut tmp[pos..]);
+                    // NSS
+                    tmp[pos..pos+4].copy_from_slice(b" ss=");
+                    pos += 4;
+                    pos += fmt_u32_dec((sta.phy.nss + 1) as u32, &mut tmp[pos..]);
+                    // BW
+                    let bw_str = match sta.phy.bw {
+                        0 => b" 20M",
+                        1 => b" 40M",
+                        2 => b" 80M",
+                        3 => b"160M",
+                        _ => b" ??M",
+                    };
+                    tmp[pos..pos+4].copy_from_slice(bw_str);
+                    pos += 4;
+                    // AID
+                    tmp[pos..pos+5].copy_from_slice(b" aid=");
+                    pos += 5;
+                    pos += fmt_u32_dec(sta.aid as u32, &mut tmp[pos..]);
+                    tmp[pos] = b'\n'; pos += 1;
+                }
+                if pos == 0 {
+                    return Self::copy_to_buf(buf, b"no STAs\n");
+                }
+                Self::copy_to_buf(buf, &tmp[..pos])
+            }
             b"diag" | b"diag.ple" | b"diag.mib" | b"diag.bcn" => {
                 let dev = match self.0.dev.as_ref() {
                     Some(d) => d,
@@ -1956,6 +2561,19 @@ impl Driver for WifiDriverWrapper {
                 Self::copy_to_buf(buf, &tmp[..pos])
             }
             b"scan" => Self::copy_to_buf(buf, b"use: devc wifid set scan start\n"),
+            b"stats" => {
+                let s = &self.0.dp_stats;
+                let mut tmp = [0u8; 256];
+                let mut pos = 0;
+
+                pos += fmt_stat_kv(&mut tmp[pos..], b"rx_frames=", s.rx_frames);
+                pos += fmt_stat_kv(&mut tmp[pos..], b"tx_frames=", s.tx_frames);
+                pos += fmt_stat_kv(&mut tmp[pos..], b"rx_pool_drops=", s.rx_pool_drops);
+                pos += fmt_stat_kv(&mut tmp[pos..], b"tx_pool_drops=", s.tx_pool_drops);
+                pos += fmt_stat_kv(&mut tmp[pos..], b"rx_pool_reclaimed=", s.rx_pool_reclaimed);
+
+                Self::copy_to_buf(buf, &tmp[..pos])
+            }
             _ => 0,
         }
     }

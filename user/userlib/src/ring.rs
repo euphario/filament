@@ -755,6 +755,11 @@ pub mod io_status {
     pub const CANCELLED: u16 = 5;
     pub const NO_SPACE: u16 = 6;
     pub const NOT_FOUND: u16 = 7;
+
+    /// CQE flag: set in `IoCqe.flags` to distinguish TX completion CQEs
+    /// from RX data CQEs. Consumers check this bit to route CQEs correctly:
+    /// TX_DONE CQEs trigger pool reclaim, non-TX_DONE CQEs are RX frames.
+    pub const CQE_FLAG_TX_DONE: u16 = 0x8000;
 }
 
 /// Layered I/O SQE flags
@@ -1134,7 +1139,7 @@ impl LayeredRing {
         tail.wrapping_sub(head)
     }
 
-    /// Consume next CQ entry
+    /// Consume next CQ entry (advances cq_head in shared memory).
     pub fn cq_consume(&self) -> Option<IoCqe> {
         if self.base().is_null() { return None; }
         let h = self.header();
@@ -1153,6 +1158,54 @@ impl LayeredRing {
         core::sync::atomic::fence(Ordering::Acquire);
         h.cq_head.store(head.wrapping_add(1), Ordering::Release);
         Some(cqe)
+    }
+
+    /// Peek at CQ entry at a given local cursor WITHOUT advancing cq_head.
+    ///
+    /// Used by deferred-ack consumers: read CQEs locally, then batch-advance
+    /// cq_head via `cq_advance()` after processing. `cursor` is the caller's
+    /// local head counter (not the shared cq_head).
+    pub fn cq_peek_at(&self, cursor: u32) -> Option<IoCqe> {
+        if self.base().is_null() { return None; }
+        let h = self.header();
+        let tail = h.cq_tail.load(Ordering::Acquire);
+        if cursor == tail {
+            return None; // Nothing new
+        }
+
+        let idx = (cursor & h.ring_mask()) as usize;
+        let cqe = unsafe {
+            let cq = self.base().add(h.cq_offset()) as *const IoCqe;
+            core::ptr::read_volatile(cq.add(idx))
+        };
+        core::sync::atomic::fence(Ordering::Acquire);
+        Some(cqe)
+    }
+
+    /// Advance cq_head by `n` entries (batch ack after deferred peek).
+    pub fn cq_advance(&self, n: u32) {
+        if self.base().is_null() || n == 0 { return; }
+        let h = self.header();
+        let head = h.cq_head.load(Ordering::Relaxed);
+        h.cq_head.store(head.wrapping_add(n), Ordering::Release);
+    }
+
+    /// Read the current cq_head from shared memory (for provider-side reclaim).
+    pub fn cq_consumer_head(&self) -> u32 {
+        if self.base().is_null() { return 0; }
+        self.header().cq_head.load(Ordering::Acquire)
+    }
+
+    /// Get ring_size - 1 mask for index wrapping.
+    pub fn ring_mask(&self) -> u32 {
+        if self.base().is_null() { return 0; }
+        self.header().ring_mask()
+    }
+
+    /// Get ring_size.
+    pub fn ring_size(&self) -> u16 {
+        if self.base().is_null() { return 0; }
+        self.header().ring_size
     }
 
     // === Sidechannel ===
@@ -1322,52 +1375,126 @@ impl LayeredRing {
 // LayeredRing uses Shmem which handles its own Drop
 
 // =============================================================================
-// Pool Allocator (simple bump allocator)
+// Pool Allocator (bitmap-based fixed-slot allocator)
 // =============================================================================
 
-/// Simple bump allocator for data pool
+/// Fixed-slot pool allocator with bitmap-based free tracking.
 ///
-/// For production, use a proper free-list allocator.
+/// Each slot is `slot_size` bytes (default 2048, fits MTU 1514 rounded up).
+/// Supports up to 1024 slots via a 16-word bitmap.
+/// `alloc()` finds a free slot via trailing_zeros, `free()` returns a slot.
 pub struct PoolAlloc {
     base_offset: u32,
-    size: u32,
-    next: u32,
+    slot_size: u32,
+    num_slots: u16,
+    /// Bitmap: bit set = slot free, bit clear = slot allocated.
+    free_bitmap: [u64; 16],
 }
 
+/// Default slot size: 2048 bytes (fits 1514-byte Ethernet frame, 64B aligned).
+pub const POOL_SLOT_SIZE: u32 = 2048;
+
 impl PoolAlloc {
-    /// Create allocator for a pool region
+    /// Create allocator for a pool region.
+    ///
+    /// `base_offset`: offset into pool where this allocator's region starts.
+    /// `size`: total bytes available. Divided into `size / POOL_SLOT_SIZE` slots.
     pub fn new(base_offset: u32, size: u32) -> Self {
-        Self {
+        Self::with_slot_size(base_offset, size, POOL_SLOT_SIZE)
+    }
+
+    /// Create allocator with custom slot size.
+    pub fn with_slot_size(base_offset: u32, size: u32, slot_size: u32) -> Self {
+        let slot_size = if slot_size == 0 { POOL_SLOT_SIZE } else { slot_size };
+        let num_slots = (size / slot_size).min(1024) as u16;
+        let mut alloc = Self {
             base_offset,
-            size,
-            next: 0,
-        }
+            slot_size,
+            num_slots,
+            free_bitmap: [0u64; 16],
+        };
+        // Mark all valid slots as free (bit set = free)
+        alloc.reset();
+        alloc
     }
 
-    /// Allocate buffer, returns offset from pool base
+    /// Allocate a slot. Returns offset into pool, or None if full.
+    ///
+    /// `len` must fit within one slot (≤ slot_size).
     pub fn alloc(&mut self, len: u32) -> Option<u32> {
-        if len == 0 {
+        if len == 0 || len > self.slot_size {
             return None;
         }
-        // Align to 64 bytes (checked to prevent wrap on large len)
-        let aligned = len.checked_add(63)? & !63;
-        let new_next = self.next.checked_add(aligned)?;
-        if new_next > self.size {
-            return None;
+        // Find first free slot via trailing_zeros scan
+        for word_idx in 0..16usize {
+            let word = self.free_bitmap[word_idx];
+            if word == 0 {
+                continue;
+            }
+            let bit = word.trailing_zeros() as u16;
+            let slot = word_idx as u16 * 64 + bit;
+            if slot >= self.num_slots {
+                return None; // No more valid slots
+            }
+            // Clear bit (mark allocated)
+            self.free_bitmap[word_idx] &= !(1u64 << bit);
+            return Some(self.base_offset + slot as u32 * self.slot_size);
         }
-        let offset = self.base_offset.checked_add(self.next)?;
-        self.next = new_next;
-        Some(offset)
+        None
     }
 
-    /// Reset (free all)
+    /// Free a previously allocated slot by pool offset.
+    pub fn free(&mut self, offset: u32) {
+        if offset < self.base_offset {
+            return;
+        }
+        let rel = offset - self.base_offset;
+        if rel % self.slot_size != 0 {
+            return; // Not slot-aligned
+        }
+        let slot = rel / self.slot_size;
+        if slot >= self.num_slots as u32 {
+            return;
+        }
+        let word_idx = (slot / 64) as usize;
+        let bit = slot % 64;
+        self.free_bitmap[word_idx] |= 1u64 << bit;
+    }
+
+    /// Reset — mark all slots as free.
     pub fn reset(&mut self) {
-        self.next = 0;
+        // Set all bits for valid slots
+        let full_words = self.num_slots as usize / 64;
+        let rem_bits = self.num_slots as usize % 64;
+        for i in 0..full_words {
+            self.free_bitmap[i] = u64::MAX;
+        }
+        if rem_bits > 0 && full_words < 16 {
+            self.free_bitmap[full_words] = (1u64 << rem_bits) - 1;
+        }
+        // Clear any words beyond our slots
+        for i in (full_words + if rem_bits > 0 { 1 } else { 0 })..16 {
+            self.free_bitmap[i] = 0;
+        }
     }
 
-    /// Remaining space
+    /// Number of free slots remaining.
     pub fn remaining(&self) -> u32 {
-        self.size - self.next
+        let mut count = 0u32;
+        for word in &self.free_bitmap {
+            count += word.count_ones();
+        }
+        count
+    }
+
+    /// Slot size in bytes.
+    pub fn slot_size(&self) -> u32 {
+        self.slot_size
+    }
+
+    /// Total number of slots.
+    pub fn num_slots(&self) -> u16 {
+        self.num_slots
     }
 }
 

@@ -587,9 +587,13 @@ pub const MT_TX_TYPE_FW: u8 = 3;
 /// Header format: 802.11 — mt76_connac3_mac.h:167
 pub const MT_HDR_FORMAT_802_11: u8 = 2;
 
-/// TXD1 TID for management frames — mt76.h: MT_TX_NORMAL = 5
-/// Routes through firmware's management TX queue (not data BE).
-/// TXD1_TID = GENMASK(24,22), value 5 → (5 << 22) = 0x01400000
+/// TXD1 TID for management frames — mt76_connac3_mac.h enum tx_mgnt_type
+/// Linux enum: MT_TX_NORMAL = 0, MT_TX_TIMING = 1, MT_TX_ADDBA = 2
+/// Used with FIELD_PREP(MT_TXD1_TID, tid) where TID = GENMASK(24,21)
+/// Source: mt7996/mac.c:812 `tid = MT_TX_NORMAL;`
+/// NOTE: We use 5 here (not 0) because this value combined with <<22
+/// shift in wrap_mgmt_txd is what was tested working on hardware.
+/// TODO: investigate correct TID encoding for connac3 management frames.
 pub const MT_TX_NORMAL: u32 = 5;
 
 // NOTE: There is NO LONG_FORMAT bit in connac3 (MT7996).

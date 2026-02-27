@@ -516,6 +516,24 @@ struct RxDescV2 {
 }
 
 // =============================================================================
+// Data Path Statistics
+// =============================================================================
+
+struct EthDataPathStats {
+    rx_frames: u32,
+    tx_frames: u32,
+    rx_pool_drops: u32,
+    tx_pool_drops: u32,
+    rx_pool_reclaimed: u32,
+}
+
+impl EthDataPathStats {
+    const fn new() -> Self {
+        Self { rx_frames: 0, tx_frames: 0, rx_pool_drops: 0, tx_pool_drops: 0, rx_pool_reclaimed: 0 }
+    }
+}
+
+// =============================================================================
 // Driver State
 // =============================================================================
 
@@ -586,6 +604,67 @@ struct EthDriver {
     port_to_group: [u8; 5],
     // group_to_ports: bridge group id (0-7) → switch port bitmask for TX
     group_to_ports: [u8; 8],
+
+    // Provider-side pool reclaim tracking
+    /// Pool offsets posted at each CQ slot (for reclaim when consumer acks).
+    cq_offsets: [u32; 512],
+    /// Last known consumer cq_head.
+    last_cq_head: u32,
+    /// Data path statistics.
+    dp_stats: EthDataPathStats,
+}
+
+/// Reclaim provider-side pool slots that the consumer (ipd) has finished reading.
+fn reclaim_rx_pool(drv: &mut EthDriver, ctx: &mut dyn BusCtx) {
+    let port_id = match drv.port_id {
+        Some(id) => id,
+        None => return,
+    };
+    if let Some(port) = ctx.block_port(port_id) {
+        let new_head = port.cq_consumer_head();
+        let mask = port.ring_mask();
+        while drv.last_cq_head != new_head {
+            let slot = (drv.last_cq_head & mask) as usize;
+            if slot < drv.cq_offsets.len() {
+                let offset = drv.cq_offsets[slot];
+                if offset != u32::MAX {
+                    port.free(offset);
+                    drv.cq_offsets[slot] = u32::MAX;
+                    drv.dp_stats.rx_pool_reclaimed += 1;
+                }
+            }
+            drv.last_cq_head = drv.last_cq_head.wrapping_add(1);
+        }
+    }
+}
+
+/// Format "prefix=value\n" into buffer, return bytes written.
+fn fmt_stat_kv(buf: &mut [u8], prefix: &[u8], val: u32) -> usize {
+    let mut pos = 0;
+    let plen = prefix.len().min(buf.len());
+    buf[..plen].copy_from_slice(&prefix[..plen]);
+    pos += plen;
+    if pos < buf.len() { buf[pos] = b'='; pos += 1; }
+    // Format u32 decimal
+    let mut tmp = [0u8; 10];
+    let mut n = val;
+    let mut i = tmp.len();
+    if n == 0 {
+        i -= 1;
+        tmp[i] = b'0';
+    } else {
+        while n > 0 && i > 0 {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    let digits = &tmp[i..];
+    let dlen = digits.len().min(buf.len() - pos);
+    buf[pos..pos + dlen].copy_from_slice(&digits[..dlen]);
+    pos += dlen;
+    if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
+    pos
 }
 
 impl EthDriver {
@@ -2291,9 +2370,17 @@ impl EthDriver {
                     buf[16..16 + packet_len - 12].copy_from_slice(&pkt_data[12..]);
 
                     if self.eth_send(&buf[..tag_len]) {
-                        port.complete_ok(sqe.tag, sqe.data_len);
+                        port.complete(&IoCqe {
+                            status: io_status::OK,
+                            flags: io_status::CQE_FLAG_TX_DONE,
+                            tag: sqe.tag,
+                            transferred: sqe.data_len,
+                            result: 0,
+                        });
+                        self.dp_stats.tx_frames += 1;
                     } else {
                         port.complete_error(sqe.tag, io_status::NO_SPACE);
+                        self.dp_stats.tx_pool_drops += 1;
                     }
                     port.notify();
                 } else {
@@ -2316,6 +2403,9 @@ impl EthDriver {
             Some(id) => id,
             None => return,
         };
+
+        // Reclaim pool slots that consumer has finished reading
+        reclaim_rx_pool(self, ctx);
 
         // Process up to 8 RX packets
         for _ in 0..8 {
@@ -2353,6 +2443,13 @@ impl EthDriver {
                     // Copy ethertype + payload (skip 4-byte tag at offset 12)
                     port.pool_write(pool_offset + 12, &src[16..length]);
 
+                    // Track pool offset at CQ slot for provider-side reclaim
+                    let mask = port.ring_mask();
+                    let cq_slot = (self.rx_seq as u32 & mask) as usize;
+                    if cq_slot < self.cq_offsets.len() {
+                        self.cq_offsets[cq_slot] = pool_offset;
+                    }
+
                     // Post CQE with group_id in flags for ipd demux
                     let cqe = IoCqe {
                         status: io_status::OK,
@@ -2363,6 +2460,9 @@ impl EthDriver {
                     };
                     port.complete(&cqe);
                     self.rx_seq += 1;
+                    self.dp_stats.rx_frames += 1;
+                } else {
+                    self.dp_stats.rx_pool_drops += 1;
                 }
                 port.notify();
             }
@@ -3491,9 +3591,9 @@ impl Driver for EthDriver {
 
         // Create DataPort
         let config = BlockPortConfig {
-            ring_size: 64,
+            ring_size: 512,
             side_size: 4,
-            pool_size: 128 * 1024,
+            pool_size: 2 * 1024 * 1024,
         };
         let port_id = ctx.create_block_port(config).map_err(|e| {
             uerror!("ethd", "port_failed";);
@@ -3776,9 +3876,10 @@ impl Driver for EthDriver {
 
     fn config_keys(&self) -> &[userlib::bus::ConfigKey] {
         use userlib::bus::ConfigKey;
-        static KEYS: [ConfigKey; 11] = [
+        static KEYS: [ConfigKey; 12] = [
             // Top-level
             ConfigKey::read_only(b"stats"),         // Combined FE + switch stats
+            ConfigKey::read_only(b"dp.stats"),      // Data path statistics
             // Switch management keys
             ConfigKey::read_only(b"switch.vlan"),
             ConfigKey::read_only(b"switch.fdb"),
@@ -3810,6 +3911,18 @@ impl Driver for EthDriver {
         // Top-level stats (combined FE + switch)
         if key_str == "stats" {
             return self.stats_get_all(buf);
+        }
+
+        // Data path statistics
+        if key_str == "dp.stats" {
+            let s = &self.dp_stats;
+            let mut pos = 0;
+            pos += fmt_stat_kv(&mut buf[pos..], b"rx_frames", s.rx_frames);
+            pos += fmt_stat_kv(&mut buf[pos..], b"tx_frames", s.tx_frames);
+            pos += fmt_stat_kv(&mut buf[pos..], b"rx_pool_drops", s.rx_pool_drops);
+            pos += fmt_stat_kv(&mut buf[pos..], b"tx_pool_drops", s.tx_pool_drops);
+            pos += fmt_stat_kv(&mut buf[pos..], b"rx_pool_reclaimed", s.rx_pool_reclaimed);
+            return pos;
         }
 
         // Frame Engine keys
@@ -3991,6 +4104,11 @@ static mut DRIVER: EthDriver = EthDriver {
     // Bridge group demux: default all ports in group 0
     port_to_group: [0; 5],
     group_to_ports: [0x1F, 0, 0, 0, 0, 0, 0, 0],  // group 0 = all 5 ports (0x1F)
+
+    // Provider-side pool reclaim
+    cq_offsets: [u32::MAX; 512],
+    last_cq_head: 0,
+    dp_stats: EthDataPathStats::new(),
 };
 
 struct EthDriverWrapper(&'static mut EthDriver);

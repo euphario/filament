@@ -88,6 +88,10 @@ pub struct DataPort {
     /// Optional doorbell for event-driven notification.
     /// When set, `notify()` rings the doorbell instead of shmem notify.
     doorbell: Option<ChannelDoorbell>,
+    /// Local CQ cursor for deferred-ack reads (consumer side).
+    /// Tracks how many CQEs we've peeked locally. Only advanced by
+    /// `ack_completions()` in shared memory.
+    local_cq_cursor: u32,
 }
 
 impl DataPort {
@@ -100,7 +104,9 @@ impl DataPort {
         let ring = LayeredRing::create(config.ring_size, config.side_size, config.pool_size)
             .ok_or(SysError::OutOfMemory)?;
 
-        let alloc = PoolAlloc::new(0, ring.pool_size());
+        // Provider uses the first half of the pool
+        let half = ring.pool_size() / 2;
+        let alloc = PoolAlloc::new(0, half);
 
         Ok(Self {
             ring,
@@ -108,6 +114,7 @@ impl DataPort {
             alloc: Some(alloc),
             next_tag: 0,
             doorbell: None,
+            local_cq_cursor: 0,
         })
     }
 
@@ -118,8 +125,9 @@ impl DataPort {
         let ring = LayeredRing::map(shmem_id)
             .ok_or(SysError::InvalidArgument)?;
 
-        // Consumer manages pool allocation
-        let alloc = PoolAlloc::new(0, ring.pool_size());
+        // Consumer uses the second half of the pool
+        let half = ring.pool_size() / 2;
+        let alloc = PoolAlloc::new(half, half);
 
         Ok(Self {
             ring,
@@ -127,6 +135,7 @@ impl DataPort {
             alloc: Some(alloc),
             next_tag: 1,
             doorbell: None,
+            local_cq_cursor: 0,
         })
     }
 
@@ -179,9 +188,16 @@ impl DataPort {
         }
     }
 
-    /// Get remaining pool space
+    /// Get remaining pool space (free slots × slot_size, or raw bytes for legacy)
     pub fn pool_remaining(&self) -> u32 {
         self.alloc.as_ref().map(|a| a.remaining()).unwrap_or(self.ring.pool_size())
+    }
+
+    /// Free a pool slot by offset. Both provider and consumer can free.
+    pub fn free(&mut self, offset: u32) {
+        if let Some(alloc) = &mut self.alloc {
+            alloc.free(offset);
+        }
     }
 
     // =========================================================================
@@ -297,6 +313,48 @@ impl DataPort {
     /// Check pending completions
     pub fn cq_pending(&self) -> u32 {
         self.ring.cq_pending()
+    }
+
+    // =========================================================================
+    // Deferred CQ Ack (zero-copy consumer pattern)
+    // =========================================================================
+
+    /// Peek at the next CQE without advancing the shared cq_head.
+    ///
+    /// Reads the CQE at `local_cq_cursor` and advances the local cursor.
+    /// The provider does NOT see progress until `ack_completions()` is called.
+    /// This lets the consumer inspect/process CQEs before committing, enabling
+    /// the provider to hold pool memory until the consumer is truly done.
+    pub fn peek_completion(&mut self) -> Option<IoCqe> {
+        let cqe = self.ring.cq_peek_at(self.local_cq_cursor)?;
+        self.local_cq_cursor = self.local_cq_cursor.wrapping_add(1);
+        Some(cqe)
+    }
+
+    /// Advance the shared cq_head by `n` entries (batch ack).
+    ///
+    /// Call after processing peeked CQEs. The provider can now see that
+    /// those CQ slots are consumed and reclaim pool memory.
+    pub fn ack_completions(&self, n: u32) {
+        self.ring.cq_advance(n);
+    }
+
+    /// Read the shared cq_head (for provider-side pool reclaim).
+    ///
+    /// The provider tracks its own `last_cq_head` and compares with this
+    /// value to know which CQ slots the consumer has finished with.
+    pub fn cq_consumer_head(&self) -> u32 {
+        self.ring.cq_consumer_head()
+    }
+
+    /// Ring mask (ring_size - 1) for index wrapping.
+    pub fn ring_mask(&self) -> u32 {
+        self.ring.ring_mask()
+    }
+
+    /// Ring size.
+    pub fn ring_size(&self) -> u16 {
+        self.ring.ring_size()
     }
 
     // =========================================================================

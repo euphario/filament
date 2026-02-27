@@ -1919,7 +1919,7 @@ impl Mt7996Dev {
     pub fn mcu_add_client_sta(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
                               omac_idx: u8, conn_state: u8, mac_addr: &[u8; 6],
                               aid: u16, newly: bool, seq: u8,
-                              irq: Option<&mut FwIrq>) -> Result<(), i32> {
+                              irq: Option<&mut FwIrq>, wait: bool) -> Result<(), i32> {
         let mut data = [0u8; 44];
 
         // === sta_req_hdr (8 bytes) ===
@@ -1952,7 +1952,7 @@ impl Mt7996Dev {
         data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
         data[off + 4] = 1; // from_ds = true (AP mode)
         data[off + 5] = 0; // to_ds = false
-        data[off + 6] = 1; // dis_rx_hdr_tran = true (new WCID)
+        data[off + 6] = 0; // dis_rx_hdr_tran = false → enable header translation
 
         // === STA_REC_TX_PROC TLV (8 bytes) ===
         let off = 36;
@@ -1962,7 +1962,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
         udebug!("mcu", "add_client_sta"; bss = bss_idx, wlan = wlan_idx, state = conn_state, aid = aid);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, wait, seq, irq)
     }
 
     /// Assign WCID to BSS scheduling group (VOW DRR control)
@@ -1974,7 +1974,7 @@ impl Mt7996Dev {
     /// Command: MCU_WM_UNI_CMD(VOW) = CMD_FIELD_UNI | 0x37 | CMD_FIELD_WM
     /// Wait: yes
     pub fn mcu_add_group(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
-                         seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
+                         seq: u8, irq: Option<&mut FwIrq>, wait: bool) -> Result<(), i32> {
         // Layout: uni_header(4) + TLV(20) = 24 bytes
         // Linux struct: __rsv1[4] + tag(2) + len(2) + wlan_idx(2) + __rsv2[2] + action(4) + val(4) + __rsv3[8]
         let mut data = [0u8; 24];
@@ -1996,7 +1996,7 @@ impl Mt7996Dev {
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_VOW as u32) | CMD_FIELD_WM;
 
         udebug!("mcu", "add_group"; wlan = wlan_idx, bss = bss_idx);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
+        self.mcu_send_uni_cmd(ring, cmd, &data, wait, seq, irq)
     }
 
     /// Initialize transmit beamforming subsystem

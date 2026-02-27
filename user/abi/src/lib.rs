@@ -1880,6 +1880,7 @@ pub mod port_subclass {
     pub const NET_SWITCH_PORT: u16 = 0x02;
     pub const NET_SWITCH: u16 = 0x10;  // L2 switch (spawns switchd)
     pub const NET_BRIDGE_GROUP: u16 = 0x03;  // Bridge group port (spawns ipd per group)
+    pub const NET_WIFI_DATA: u16 = 0x04;  // WiFi data port (Ethernet frames over WiFi, spawns ipd)
 
     // Storage controller subclasses
     pub const STORAGE_NVME: u16 = 0x02;

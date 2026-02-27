@@ -802,6 +802,11 @@ impl Devd {
                 continue;
             }
 
+            // Skip pcie3 — NVMe SSD, not needed for WiFi PoC
+            if path == b"pcie3" {
+                continue;
+            }
+
             // Register in devd's port registry (owner = 0xFF = devd/kernel)
             if let Err(e) = self.ports.register_with_port_info(port_info, 0xFF, 0) {
                 uerror!("devd", "bus_port_reg_failed";

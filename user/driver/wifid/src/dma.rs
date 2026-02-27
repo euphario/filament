@@ -78,12 +78,16 @@ pub struct RxQueueInfo {
     pub buf_size: u32,
     pub buf_phys: u64,
     pub buf_virt: u64,
+    /// Software-tracked last DMA_IDX we processed up to.
+    /// Prevents double-processing when CPU_IDX must be set to dma_idx-1
+    /// (WFDMA interprets CPU_IDX==DMA_IDX as "ring full", not "empty").
+    pub last_dma_idx: u32,
 }
 
 impl RxQueueInfo {
     pub const ZERO: Self = Self {
         hw_idx: 0, regs_base: 0, ndesc: 0, desc_virt: 0,
-        buf_size: 0, buf_phys: 0, buf_virt: 0,
+        buf_size: 0, buf_phys: 0, buf_virt: 0, last_dma_idx: u32::MAX,
     };
 }
 
@@ -187,6 +191,8 @@ pub struct TxRing {
     pub regs_base: u32,
     pub ndesc: u32,
     pub cpu_idx: u32,
+    /// Next descriptor to check for DMA completion (for tx_sweep).
+    pub sweep_idx: u32,
     pub desc_virt: u64,
     pub desc_phys: u64,
     pub buf_virt: u64,
@@ -207,6 +213,7 @@ impl TxRing {
             regs_base,
             ndesc,
             cpu_idx: 0,
+            sweep_idx: 0,
             desc_virt,
             desc_phys,
             buf_virt,
@@ -281,6 +288,15 @@ pub struct TxFreeResult {
     /// First TXRX_NOTIFY: RXD[0..7] + tx_info[0..3] for debugging
     pub first_rxd: [u32; 8],
     pub first_payload: [u32; 4],
+}
+
+/// Header-translated RX data frame copied from the DMA buffer.
+/// Frame data lives in the caller's copy buffer at `copy_offset..copy_offset+len`.
+pub struct RxDataFrame {
+    /// Offset into the caller-provided copy buffer where frame data starts
+    pub copy_offset: u32,
+    /// Frame length in bytes (Ethernet header + payload)
+    pub len: u16,
 }
 
 impl Mt7996Dev {
@@ -550,7 +566,12 @@ impl Mt7996Dev {
     // ========================================================================
 
     pub fn rx_fill(&self, q: &RxQueueInfo) {
-        let fill_count = (q.ndesc - 1) as usize;
+        // Fill ALL ndesc entries with valid buffers — not ndesc-1.
+        // The one-empty-slot convention is maintained by the hardware
+        // (DMA_IDX == CPU_IDX → full), not by leaving a slot unfilled.
+        // If entry ndesc-1 has no valid buffer, the ring stalls when
+        // DMA_IDX reaches it (hardware can't DMA to physical address 0).
+        let fill_count = q.ndesc as usize;
 
         udebug!("dma", "rx_fill"; count = fill_count, buf_size = q.buf_size, buf_phys = q.buf_phys);
 
@@ -575,22 +596,26 @@ impl Mt7996Dev {
 
         dma_wmb();
 
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, fill_count as u32);
+        // CPU_IDX = ndesc-1: tells hardware "I've prepared buffers up to
+        // ndesc-1; you can DMA into 0..ndesc-2, stopping when DMA_IDX
+        // reaches CPU_IDX". Entry ndesc-1 is valid too — it becomes
+        // usable once the first processing pass sets CPU_IDX to a lower
+        // value, allowing DMA_IDX to advance past it.
+        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (q.ndesc - 1) as u32);
     }
 
     /// Drain an RX ring: reset consumed descriptors and advance CPU_IDX.
     ///
     /// Returns number of entries drained. The firmware can then reuse those
     /// descriptor slots for new events. We don't process the data — just recycle.
-    pub fn rx_drain(&self, q: &RxQueueInfo) -> u32 {
+    pub fn rx_drain(&self, q: &mut RxQueueInfo) -> u32 {
         let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
         let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
 
         if dma_idx == cpu_idx {
-            return 0; // Nothing to drain
+            return 0;
         }
 
-        // Walk from (cpu_idx+1) to dma_idx (wrapping), reset each descriptor
         let ndesc = q.ndesc;
         let mut count = 0u32;
         let mut idx = (cpu_idx + 1) % ndesc;
@@ -600,8 +625,6 @@ impl Mt7996Dev {
             let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
             let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
 
-            // Reset descriptor: refill buffer pointer, clear DMA_DONE.
-            // Linux mt76_dma_add_rx_buf(): ctrl = SD_LEN0(buf_size), NO LAST_SEC0.
             let ctrl = (q.buf_size as u32) << 16;
             unsafe {
                 core::ptr::write_volatile(&mut (*desc_ptr).buf0, dma_addr_lo(buf_phys));
@@ -615,7 +638,6 @@ impl Mt7996Dev {
             idx = (idx + 1) % ndesc;
         }
 
-        // Flush descriptor memory and advance CPU_IDX
         dma_wmb();
         self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
 
@@ -624,7 +646,7 @@ impl Mt7996Dev {
 
     /// Soft drain: advance CPU_IDX without resetting descriptors.
     /// Use for event rings where the firmware may need buffer contents intact.
-    pub fn rx_advance(&self, q: &RxQueueInfo) -> u32 {
+    pub fn rx_advance(&self, q: &mut RxQueueInfo) -> u32 {
         let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
         let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
 
@@ -650,20 +672,31 @@ impl Mt7996Dev {
     /// Process MCU events from WM or WA RX queue.
     /// Reads each consumed descriptor's buffer and passes to event parser.
     /// Returns number of entries processed.
-    pub fn rx_process_mcu(&self, q: &RxQueueInfo, counters: &mut RxMibCounters) -> u32 {
-        let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
+    ///
+    /// Uses DMA_DONE bit in descriptor ctrl as the dequeue guard, matching
+    /// Linux mt76_dma_dequeue(). Index-based empty detection
+    /// (cpu_idx+1 == dma_idx) fails at the wrap boundary: when DMA_IDX
+    /// wraps to 0 and CPU_IDX = ndesc-1, it falsely reads as "empty" and
+    /// the MCU firmware stalls because CPU_IDX never advances.
+    pub fn rx_process_mcu(&self, q: &mut RxQueueInfo, counters: &mut RxMibCounters) -> u32 {
         let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
-
-        if dma_idx == cpu_idx {
-            return 0;
-        }
-
         let ndesc = q.ndesc;
+
         let mut count = 0u32;
         let mut idx = (cpu_idx + 1) % ndesc;
+        let mut last_idx = cpu_idx;
 
-        loop {
+        // Walk from cpu_idx+1, checking DMA_DONE on each descriptor.
+        // Firmware sets DMA_DONE when it finishes writing an entry.
+        // We stop at the first entry without DMA_DONE (not yet written).
+        // Budget: process at most ndesc-1 entries per call.
+        for _ in 0..ndesc {
             let i = idx as usize;
+            let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
+            let ctrl = unsafe { core::ptr::read_volatile(&(*desc_ptr).ctrl) };
+
+            // Linux dma.c:593 — entry not yet DMA'd by firmware
+            if ctrl & MT_DMA_CTL_DMA_DONE == 0 { break; }
 
             // Read buffer content — DMA pool is NORMAL_NC, no cache invalidate needed
             let buf_base = q.buf_virt + (i as u64 * q.buf_size as u64);
@@ -675,24 +708,28 @@ impl Mt7996Dev {
             // Process MCU event
             event::process_mcu_event(buf, counters);
 
-            // Reset descriptor for reuse
-            let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
+            // Reset descriptor for reuse — clear DMA_DONE, restore buffer pointer
+            // Linux mt76_dma_add_rx_buf(): ctrl = SD_LEN0 only (no DMA_DONE)
             let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
-            let ctrl = (q.buf_size as u32) << 16;
+            let refill_ctrl = (q.buf_size as u32) << 16;
             unsafe {
                 core::ptr::write_volatile(&mut (*desc_ptr).buf0, dma_addr_lo(buf_phys));
                 core::ptr::write_volatile(&mut (*desc_ptr).buf1, dma_addr_hi(buf_phys));
                 core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
-                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, ctrl);
+                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, refill_ctrl);
             }
 
+            last_idx = idx;
             count += 1;
-            if idx == dma_idx { break; }
             idx = (idx + 1) % ndesc;
         }
 
-        dma_wmb();
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+        if count > 0 {
+            dma_wmb();
+            // CPU_IDX = last processed entry. Tells firmware "I've consumed
+            // up to here; you can reuse entries from last_idx+1 onwards."
+            self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, last_idx);
+        }
         count
     }
 
@@ -707,23 +744,35 @@ impl Mt7996Dev {
     ///
     /// Management frames (ProbeReq, Auth, AssocReq, Deauth, Disassoc) are
     /// collected as `RxMgmtFrame` for the AP state machine.
-    /// Returns (entries_processed, mgmt_frame_count).
-    pub fn rx_classify(&self, q: &RxQueueInfo, counters: &mut RxMibCounters,
+    ///
+    /// Header-translated data frames (firmware sets HDR_TRANS bit) are
+    /// collected as `RxDataFrame` references. These point directly into
+    /// the DMA buffer and are valid until the next rx_classify call.
+    ///
+    /// Returns (entries_processed, mgmt_frame_count, data_frame_count).
+    pub fn rx_classify(&self, q: &mut RxQueueInfo, counters: &mut RxMibCounters,
                        mgmt_frames: &mut [wifi80211::types::RxMgmtFrame],
-                       max_mgmt: usize) -> (u32, usize) {
+                       max_mgmt: usize,
+                       data_frames: &mut [RxDataFrame],
+                       max_data: usize,
+                       data_buf: &mut [u8]) -> (u32, usize, usize) {
+        let mut data_buf_pos: u32 = 0;
         let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
         let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
 
-        if dma_idx == cpu_idx {
-            return (0, 0);
+        let ndesc = q.ndesc;
+        let start = (cpu_idx + 1) % ndesc;
+        if start == dma_idx {
+            return (0, 0, 0);
         }
 
-        let ndesc = q.ndesc;
         let mut count = 0u32;
         let mut mgmt_count = 0usize;
-        let mut idx = (cpu_idx + 1) % ndesc;
+        let mut data_count = 0usize;
+        let mut idx = start;
 
         loop {
+            if idx == dma_idx { break; }
             let i = idx as usize;
             let buf_base = q.buf_virt + (i as u64 * q.buf_size as u64);
             let buf_ptr = buf_base as *const u32;
@@ -742,9 +791,15 @@ impl Mt7996Dev {
             // The NDATA bit in RXD2 is unreliable — unicast management frames
             // (auth, assoc) may arrive with NDATA=0, getting misclassified as Data.
             // Always check the 802.11 FC field for PKT_TYPE_NORMAL frames.
+            //
+            // IMPORTANT: Skip FC byte check when HDR_TRANS is set — firmware has
+            // replaced the 802.11 header with an Ethernet header, so frame_ofs
+            // points at the Ethernet DA, not the 802.11 FC byte. Reading it as FC
+            // would misclassify data frames as management (e.g. fc0=0x00 → AssocReq).
             let mut frame_ofs: usize = 0;
+            let hdr_trans = rxd2 & MT_RXD2_NORMAL_HDR_TRANS != 0;
             if matches!(class, RxFrameClass::Mgmt | RxFrameClass::Data) {
-                // Navigate past RXD groups to find 802.11 header
+                // Navigate past RXD groups to find 802.11 header (or Ethernet header if HDR_TRANS)
                 // Group order: G4(16), G1(16), G2(16), G3(16), G5(96)
                 frame_ofs = 32; // Base RXD size
                 if rxd1 & MT_RXD1_NORMAL_GROUP_4 != 0 { frame_ofs += 16; }
@@ -755,7 +810,8 @@ impl Mt7996Dev {
                 let remove_pad = ((rxd2 >> 13) & 0x7) as usize;
                 frame_ofs += 2 * remove_pad;
 
-                if frame_ofs + 1 < q.buf_size as usize {
+                // Only read FC byte for non-header-translated frames
+                if !hdr_trans && frame_ofs + 1 < q.buf_size as usize {
                     let fc0 = unsafe {
                         core::ptr::read_volatile((buf_base as *const u8).add(frame_ofs))
                     };
@@ -767,6 +823,49 @@ impl Mt7996Dev {
                     }
                 }
             }
+
+            // Extract RX PHY info from Group 3 (P-RXV).
+            // Group order: G4(16), G1(16), G2(16), G3(16 bytes = 4 DWORDs).
+            // P-RXV DW0: rate[6:0], nss[9:7], bw[11:10] (partial), mode[14:12],
+            //            gi[16:15], stbc[22]
+            // P-RXV DW1: bw full [14:11] (connac3)
+            // P-RXV DW3: RCPI chain0[7:0], chain1[15:8], chain2[23:16], chain3[31:24]
+            // Source: Linux mt76/mac.c mt76_connac3_mac_fill_rx(), mt76/mt7996/mac.c:14
+            let phy: wifi80211::types::RxPhyInfo = if rxd1 & MT_RXD1_NORMAL_GROUP_3 != 0 {
+                let mut g3_ofs: usize = 32;
+                if rxd1 & MT_RXD1_NORMAL_GROUP_4 != 0 { g3_ofs += 16; }
+                if rxd1 & MT_RXD1_NORMAL_GROUP_1 != 0 { g3_ofs += 16; }
+                if rxd1 & MT_RXD1_NORMAL_GROUP_2 != 0 { g3_ofs += 16; }
+                if g3_ofs + 16 <= q.buf_size as usize {
+                    let g3_dw0 = unsafe { core::ptr::read_volatile(buf_ptr.add(g3_ofs / 4)) };
+                    let g3_dw1 = unsafe { core::ptr::read_volatile(buf_ptr.add((g3_ofs + 4) / 4)) };
+                    let g3_dw3 = unsafe { core::ptr::read_volatile(buf_ptr.add((g3_ofs + 12) / 4)) };
+                    // Per-chain RCPI (0-255, 0=unused)
+                    let rcpi = [
+                        (g3_dw3 & 0xFF) as u8,
+                        ((g3_dw3 >> 8) & 0xFF) as u8,
+                        ((g3_dw3 >> 16) & 0xFF) as u8,
+                        ((g3_dw3 >> 24) & 0xFF) as u8,
+                    ];
+                    // RSSI from chain 0 RCPI. Source: Linux mac.c:14
+                    let rssi = (((rcpi[0] as i32) - 220) / 2).clamp(-128, 0) as i8;
+                    // Rate info from P-RXV DW0
+                    let rate = (g3_dw0 & 0x7F) as u8;
+                    let nss = ((g3_dw0 >> 7) & 0x7) as u8;
+                    let mode = ((g3_dw0 >> 12) & 0x7) as u8;
+                    let gi = ((g3_dw0 >> 15) & 0x3) as u8;
+                    let stbc = (g3_dw0 >> 22) & 1 != 0;
+                    // BW from DW1[14:11] (connac3 uses wider field)
+                    // Source: Linux mt76/connac3_mac.h MT_PRXV_FRAME_MODE
+                    let bw = ((g3_dw1 >> 11) & 0xF) as u8;
+                    wifi80211::types::RxPhyInfo { rssi, rcpi, rate, nss, bw, mode, gi, stbc }
+                } else {
+                    wifi80211::types::RxPhyInfo::UNKNOWN
+                }
+            } else {
+                wifi80211::types::RxPhyInfo::UNKNOWN
+            };
+            let rssi = phy.rssi;
 
             // Collect management frames for AP state machine
             // ProbeReq, Auth, AssocReq, Deauth, Disassoc all need addr2
@@ -794,8 +893,40 @@ impl Mt7996Dev {
                             RxFrameClass::Disassoc => wifi80211::types::MgmtSubtype::Disassoc,
                             _ => unreachable!(),
                         };
-                        mgmt_frames[mgmt_count] = wifi80211::types::RxMgmtFrame { subtype, addr2 };
+                        mgmt_frames[mgmt_count] = wifi80211::types::RxMgmtFrame { subtype, addr2, rssi, phy };
                         mgmt_count += 1;
+                    }
+                }
+            }
+
+            // Collect header-translated data frames for the IP stack.
+            // When HDR_TRANS is set, firmware has converted 802.11 → Ethernet
+            // format in the DMA buffer starting at frame_ofs.
+            // IMPORTANT: Copy frame data NOW, before descriptor reset below
+            // returns this buffer to hardware.
+            if rxd2 & MT_RXD2_NORMAL_HDR_TRANS != 0 && data_count < max_data && frame_ofs > 0 {
+                // RXD0 bits[15:0] = RX_BYTE_CNT (total bytes including RXD groups)
+                let byte_cnt = (rxd0 & 0xFFFF) as usize;
+                if byte_cnt > frame_ofs && byte_cnt <= q.buf_size as usize {
+                    let eth_len = byte_cnt - frame_ofs;
+                    if eth_len >= 14 && eth_len <= 1514
+                        && (data_buf_pos as usize + eth_len) <= data_buf.len()
+                    {
+                        // Copy from DMA buffer into caller's copy buffer
+                        let src = unsafe {
+                            core::slice::from_raw_parts(
+                                (buf_base as *const u8).add(frame_ofs),
+                                eth_len,
+                            )
+                        };
+                        let dst_start = data_buf_pos as usize;
+                        data_buf[dst_start..dst_start + eth_len].copy_from_slice(src);
+                        data_frames[data_count] = RxDataFrame {
+                            copy_offset: data_buf_pos,
+                            len: eth_len as u16,
+                        };
+                        data_buf_pos += eth_len as u32;
+                        data_count += 1;
                     }
                 }
             }
@@ -814,13 +945,14 @@ impl Mt7996Dev {
             }
 
             count += 1;
-            if idx == dma_idx { break; }
             idx = (idx + 1) % ndesc;
         }
 
-        dma_wmb();
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
-        (count, mgmt_count)
+        if count > 0 {
+            dma_wmb();
+            self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+        }
+        (count, mgmt_count, data_count)
     }
 
     // ========================================================================
@@ -840,7 +972,7 @@ impl Mt7996Dev {
     /// pointing at the buffer start (no __skb_pull for WA events).
     ///
     /// Source: mt7996/mac.c:1312-1437 mt7996_mac_tx_free()
-    pub fn rx_process_tx_free(&self, q: &RxQueueInfo) -> TxFreeResult {
+    pub fn rx_process_tx_free(&self, q: &mut RxQueueInfo) -> TxFreeResult {
         let mut result = TxFreeResult {
             tokens_freed: 0,
             entries: 0,
@@ -852,7 +984,9 @@ impl Mt7996Dev {
         let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
         let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
 
-        if dma_idx == cpu_idx {
+        let ndesc = q.ndesc;
+        let start = (cpu_idx + 1) % ndesc;
+        if start == dma_idx {
             return result;
         }
 
@@ -860,10 +994,11 @@ impl Mt7996Dev {
         // are visible to the CPU before we read buffer contents.
         dsb_sy();
 
-        let ndesc = q.ndesc;
-        let mut idx = (cpu_idx + 1) % ndesc;
+        let mut idx = start;
 
         loop {
+            // dma_idx is "next to write" — not yet DMA'd, don't process it
+            if idx == dma_idx { break; }
             let i = idx as usize;
             let buf_base = q.buf_virt + (i as u64 * q.buf_size as u64);
 
@@ -939,12 +1074,13 @@ impl Mt7996Dev {
                 core::ptr::write_volatile(&mut (*desc_ptr).ctrl, ctrl);
             }
 
-            if idx == dma_idx { break; }
             idx = (idx + 1) % ndesc;
         }
 
-        dma_wmb();
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+        if result.entries > 0 {
+            dma_wmb();
+            self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+        }
         result
     }
 
@@ -1075,6 +1211,213 @@ impl Mt7996Dev {
         Ok(())
     }
 
+    /// Enqueue an Ethernet (802.3) data frame for TX.
+    ///
+    /// For 802.3 TX mode (is_8023=true), the firmware handles 802.11 encapsulation.
+    /// TXD is zeroed (firmware fills from CT info), fw_txp carries FROM_HOST and
+    /// NONE_CIPHER (no APPLY_TXD, no MGMT_FRAME).
+    ///
+    /// Source: Linux mt7996/mac.c:1133-1208 mt7996_tx_prepare_skb()
+    ///         (is_8023 path with pid < PACKET_ID_FIRST)
+    pub fn tx_enqueue_data(&self, ring: &mut TxRing, frame: &[u8],
+                           wcid: u16, token: u16) -> Result<(), i32> {
+        let frame_len = frame.len();
+        if frame_len < 14 || frame_len > 1514 {
+            return Err(-1);
+        }
+
+        // Check if ring is full
+        let next_idx = (ring.cpu_idx + 1) % ring.ndesc;
+        let dma_idx = self.mt76_rr(ring.regs_base + MT_QUEUE_DMA_IDX);
+        if next_idx == dma_idx {
+            return Err(-2);
+        }
+
+        let idx = ring.cpu_idx;
+        let buf = ring.buf(idx);
+        let buf_phys = ring.buf_phys(idx);
+
+        // TXD: zeroed for 802.3 mode — firmware fills from CT info
+        // Source: mac.c:1133 — is_8023 with pid < PACKET_ID_FIRST skips mac_write_txwi
+        unsafe { core::ptr::write_bytes(buf, 0, MT_TXD_SIZE); }
+
+        // Build fw_txp at offset 32 (44 bytes)
+        let txp = unsafe { buf.add(MT_TXD_SIZE) };
+        unsafe { core::ptr::write_bytes(txp, 0, MT_FW_TXP_SIZE); }
+
+        let frame_phys = buf_phys + MT_TXWI_SIZE as u64;
+
+        // flags: FROM_HOST | NONE_CIPHER (no APPLY_TXD, no MGMT_FRAME)
+        // Source: mac.c:1181 CT_INFO_FROM_HOST always set
+        //         mac.c:1183-1184 APPLY_TXD only if !is_8023 or pid >= PACKET_ID_FIRST
+        //         mac.c:1186-1187 NONE_CIPHER if no key
+        let flags: u16 = MT_CT_INFO_FROM_HOST | MT_CT_INFO_NONE_CIPHER_FRAME;
+        unsafe { core::ptr::copy_nonoverlapping(flags.to_le_bytes().as_ptr(), txp, 2); }
+
+        // token at offset 2
+        unsafe { core::ptr::copy_nonoverlapping(token.to_le_bytes().as_ptr(), txp.add(2), 2); }
+
+        // rept_wds_wcid at offset 5 — actual STA WCID for unicast, 0xfff for broadcast
+        unsafe { core::ptr::copy_nonoverlapping(wcid.to_le_bytes().as_ptr(), txp.add(5), 2); }
+
+        // nbuf = 1 at offset 7
+        unsafe { *txp.add(7) = 1; }
+
+        // buf[0] at offset 8: frame data physical address (lower 32 bits)
+        unsafe { core::ptr::copy_nonoverlapping(
+            (frame_phys as u32).to_le_bytes().as_ptr(), txp.add(8), 4); }
+
+        // len[0] at offset 32: frame length + upper 4 address bits
+        let addr_h = ((frame_phys >> 32) & 0xF) as u16;
+        let len0: u16 = (frame_len as u16 & 0x0FFF) | (addr_h << 12);
+        unsafe { core::ptr::copy_nonoverlapping(len0.to_le_bytes().as_ptr(), txp.add(32), 2); }
+
+        // Write Ethernet frame data at offset 76 (after TXD + TXP)
+        unsafe { core::ptr::copy_nonoverlapping(
+            frame.as_ptr(), buf.add(MT_TXWI_SIZE), frame_len); }
+
+        // 2-buffer descriptor: buf0 = TXD+TXP, buf1 = frame header
+        let sd_len0 = MT_TXWI_SIZE as u32;
+        let sd_len1 = MT_CT_PARSE_LEN as u32;
+        let ctrl_val = (sd_len0 << 16)
+            | (sd_len1 & MT_DMA_CTL_SD_LEN1_MASK)
+            | MT_DMA_CTL_LAST_SEC1;
+
+        let info_val = dma_addr_hi(buf_phys)
+            | (dma_addr_hi(frame_phys) << 16);
+
+        let desc = ring.desc(idx);
+        unsafe {
+            core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(buf_phys));
+            core::ptr::write_volatile(&mut (*desc).buf1, dma_addr_lo(frame_phys));
+            core::ptr::write_volatile(&mut (*desc).info, info_val);
+            core::ptr::write_volatile(&mut (*desc).ctrl, ctrl_val);
+        }
+
+        let total_write = MT_TXWI_SIZE + frame_len;
+        flush_buffer(buf as u64, total_write);
+        flush_buffer(desc as u64, core::mem::size_of::<Mt76Desc>());
+
+        ring.cpu_idx = next_idx;
+        dma_wmb();
+        self.mt76_wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
+
+        Ok(())
+    }
+
+    /// Zero-copy TX: frame data stays in DataPort pool, DMA reads it directly.
+    ///
+    /// Same as tx_enqueue_data but frame_pool_phys points to the Ethernet frame
+    /// in the DataPort shared memory pool (already DMA-accessible, NORMAL_NC).
+    /// No frame data is copied — only the 76-byte TXD+fw_txp is written to the
+    /// DMA buffer. The descriptor's buf1 points directly at pool memory.
+    pub fn tx_enqueue_data_zerocopy(&self, ring: &mut TxRing,
+                                     frame_pool_phys: u64, frame_len: usize,
+                                     wcid: u16, token: u16) -> Result<(), i32> {
+        if frame_len < 14 || frame_len > 1514 {
+            return Err(-1);
+        }
+
+        // Check if ring is full
+        let next_idx = (ring.cpu_idx + 1) % ring.ndesc;
+        let dma_idx = self.mt76_rr(ring.regs_base + MT_QUEUE_DMA_IDX);
+        if next_idx == dma_idx {
+            return Err(-2);
+        }
+
+        let idx = ring.cpu_idx;
+        let buf = ring.buf(idx);
+        let buf_phys = ring.buf_phys(idx);
+
+        // TXD: zeroed for 802.3 mode
+        unsafe { core::ptr::write_bytes(buf, 0, MT_TXD_SIZE); }
+
+        // Build fw_txp at offset 32 (44 bytes)
+        let txp = unsafe { buf.add(MT_TXD_SIZE) };
+        unsafe { core::ptr::write_bytes(txp, 0, MT_FW_TXP_SIZE); }
+
+        // flags: FROM_HOST | NONE_CIPHER
+        let flags: u16 = MT_CT_INFO_FROM_HOST | MT_CT_INFO_NONE_CIPHER_FRAME;
+        unsafe { core::ptr::copy_nonoverlapping(flags.to_le_bytes().as_ptr(), txp, 2); }
+
+        // token at offset 2
+        unsafe { core::ptr::copy_nonoverlapping(token.to_le_bytes().as_ptr(), txp.add(2), 2); }
+
+        // rept_wds_wcid at offset 5
+        unsafe { core::ptr::copy_nonoverlapping(wcid.to_le_bytes().as_ptr(), txp.add(5), 2); }
+
+        // nbuf = 1 at offset 7
+        unsafe { *txp.add(7) = 1; }
+
+        // buf[0] at offset 8: frame_pool_phys lower 32 bits
+        unsafe { core::ptr::copy_nonoverlapping(
+            (frame_pool_phys as u32).to_le_bytes().as_ptr(), txp.add(8), 4); }
+
+        // len[0] at offset 32: frame length + upper 4 address bits of pool phys
+        let addr_h = ((frame_pool_phys >> 32) & 0xF) as u16;
+        let len0: u16 = (frame_len as u16 & 0x0FFF) | (addr_h << 12);
+        unsafe { core::ptr::copy_nonoverlapping(len0.to_le_bytes().as_ptr(), txp.add(32), 2); }
+
+        // NO frame data copy — pool memory is DMA-accessible
+
+        // 2-buffer descriptor: buf0 = TXD+TXP (76B), buf1 = frame in pool
+        let sd_len0 = MT_TXWI_SIZE as u32;
+        let sd_len1 = MT_CT_PARSE_LEN as u32;
+        let ctrl_val = (sd_len0 << 16)
+            | (sd_len1 & MT_DMA_CTL_SD_LEN1_MASK)
+            | MT_DMA_CTL_LAST_SEC1;
+
+        let info_val = dma_addr_hi(buf_phys)
+            | (dma_addr_hi(frame_pool_phys) << 16);
+
+        let desc = ring.desc(idx);
+        unsafe {
+            core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(buf_phys));
+            core::ptr::write_volatile(&mut (*desc).buf1, dma_addr_lo(frame_pool_phys));
+            core::ptr::write_volatile(&mut (*desc).info, info_val);
+            core::ptr::write_volatile(&mut (*desc).ctrl, ctrl_val);
+        }
+
+        // Only flush TXD+fw_txp (76 bytes), not frame data (already non-cacheable)
+        flush_buffer(buf as u64, MT_TXWI_SIZE);
+        flush_buffer(desc as u64, core::mem::size_of::<Mt76Desc>());
+
+        ring.cpu_idx = next_idx;
+        dma_wmb();
+        self.mt76_wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
+
+        Ok(())
+    }
+
+    /// Sweep completed TX descriptors. Returns number of completed entries.
+    ///
+    /// Walks from ring.sweep_idx to the hardware DMA index, collecting tokens
+    /// from completed descriptors (DMA_DONE bit set in ctrl). Each completed
+    /// descriptor's token is written to `tokens_out`. Returns the count.
+    /// Sweep completed TX descriptors. Returns number of completed entries.
+    ///
+    /// Walks from ring.sweep_idx to hardware DMA_IDX (like Linux mt76_dma_tx_cleanup).
+    /// Linux does NOT check DMA_DONE for TX — DMA_IDX already indicates completion.
+    /// Each completed descriptor's token is read from the fw_txp header.
+    pub fn tx_sweep(&self, ring: &mut TxRing, tokens_out: &mut [u16]) -> usize {
+        let dma_idx = self.mt76_rr(ring.regs_base + MT_QUEUE_DMA_IDX);
+        let mut count = 0;
+
+        while ring.sweep_idx != dma_idx && count < tokens_out.len() {
+            // Read token from fw_txp at offset 2 in the buffer
+            let buf = ring.buf(ring.sweep_idx);
+            let txp = unsafe { buf.add(MT_TXD_SIZE) };
+            let mut tok_bytes = [0u8; 2];
+            unsafe { core::ptr::copy_nonoverlapping(txp.add(2), tok_bytes.as_mut_ptr(), 2); }
+            tokens_out[count] = u16::from_le_bytes(tok_bytes);
+
+            count += 1;
+            ring.sweep_idx = (ring.sweep_idx + 1) % ring.ndesc;
+        }
+
+        count
+    }
+
     // ========================================================================
     // mt7996_dma_init() — EXACT Linux translation
     // Source: dma.c:599-854
@@ -1139,6 +1482,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_MCU_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
+            last_dma_idx: u32::MAX,
         };
         rx_buf_offset += MT7996_RX_MCU_RING_SIZE as usize * MT7996_RX_MCU_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1156,6 +1500,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_MCU_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
+            last_dma_idx: u32::MAX,
         };
         rx_buf_offset += MT7996_RX_MCU_RING_SIZE_WA as usize * MT7996_RX_MCU_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1173,6 +1518,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
+            last_dma_idx: u32::MAX,
         };
         rx_buf_offset += MT7996_RX_RING_SIZE as usize * MT7996_RX_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1190,6 +1536,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
+            last_dma_idx: u32::MAX,
         };
         rx_buf_offset += MT7996_RX_MCU_RING_SIZE as usize * MT7996_RX_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1208,6 +1555,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
+            last_dma_idx: u32::MAX,
         };
         rx_buf_offset += MT7996_RX_RING_SIZE as usize * MT7996_RX_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1225,6 +1573,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
+            last_dma_idx: u32::MAX,
         };
         let _ = rx_buf_offset;
         rx_queue_idx += 1;
