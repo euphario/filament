@@ -542,6 +542,7 @@ pub const UNI_BSS_INFO_MLD: u16 = 26;
 
 // STA_REC TLV tags — mt76_connac_mcu.h:802-836
 pub const STA_REC_BASIC: u16 = 0;
+pub const STA_REC_BA: u16 = 6;            // Block Ack session — mt76_connac_mcu.h:809
 pub const STA_REC_TX_PROC: u16 = 8;       // for hdr trans and CSO in CR4
 pub const STA_REC_HDR_TRANS: u16 = 0x2B;
 
@@ -591,10 +592,7 @@ pub const MT_HDR_FORMAT_802_11: u8 = 2;
 /// Linux enum: MT_TX_NORMAL = 0, MT_TX_TIMING = 1, MT_TX_ADDBA = 2
 /// Used with FIELD_PREP(MT_TXD1_TID, tid) where TID = GENMASK(24,21)
 /// Source: mt7996/mac.c:812 `tid = MT_TX_NORMAL;`
-/// NOTE: We use 5 here (not 0) because this value combined with <<22
-/// shift in wrap_mgmt_txd is what was tested working on hardware.
-/// TODO: investigate correct TID encoding for connac3 management frames.
-pub const MT_TX_NORMAL: u32 = 5;
+pub const MT_TX_NORMAL: u32 = 0;
 
 // NOTE: There is NO LONG_FORMAT bit in connac3 (MT7996).
 // All TXDs are 8 DWORDs (32 bytes). BIT(13) of TXD1 is TGID[0] (band index).

@@ -1198,10 +1198,14 @@ fn wrap_mgmt_txd(buf: &mut [u8], frame: &[u8]) -> usize {
     buf[0..4].copy_from_slice(&txd0.to_le_bytes());
 
     // TXD1: WLAN_IDX(BMC) | FIXED_RATE | OWN_MAC | HDR_FORMAT | HDR_INFO | TID
+    // Linux mt76_connac3_mac.h bit layout:
+    //   WLAN_IDX = GENMASK(11,0), TGID = GENMASK(13,12), HDR_FORMAT = GENMASK(15,14)
+    //   HDR_INFO = GENMASK(20,16), TID = GENMASK(24,21), OWN_MAC = GENMASK(30,25)
+    //   FIXED_RATE = BIT(31)
     let txd1 = (1u32 << 31)                          // FIXED_RATE
         | ((MT_HDR_FORMAT_802_11 as u32) << 14)  // HDR_FORMAT = 802.11
         | (12u32 << 16)                          // HDR_INFO = 24/2
-        | (MT_TX_NORMAL << 22)                   // TID (mgmt)
+        | (MT_TX_NORMAL << 21)                   // TID (mgmt) = 0
         | ((HW_BSSID_0 as u32) << 25)           // OWN_MAC = 0
         | (MT7996_WTBL_RESERVED as u32);         // WLAN_IDX = BMC STA
     buf[4..8].copy_from_slice(&txd1.to_le_bytes());
@@ -1470,8 +1474,11 @@ impl Driver for WifiDriverWrapper {
         let mut mgmt_frames: [RxMgmtFrame; 8] = core::array::from_fn(|_| RxMgmtFrame {
             subtype: MgmtSubtype::Other(0),
             addr2: [0; 6],
+            addr3: [0; 6],
             rssi: -128,
             phy: wifi80211::types::RxPhyInfo::UNKNOWN,
+            body: [0; wifi80211::types::MAX_MGMT_BODY_LEN],
+            body_len: 0,
         });
         let mut mgmt_count = 0usize;
         let mut data_frames: [RxDataFrame; 16] = core::array::from_fn(|_| RxDataFrame {
@@ -1506,8 +1513,11 @@ impl Driver for WifiDriverWrapper {
             let mut dummy_mgmt: [RxMgmtFrame; 1] = [RxMgmtFrame {
                 subtype: MgmtSubtype::Other(0),
                 addr2: [0; 6],
+                addr3: [0; 6],
                 rssi: -128,
                 phy: wifi80211::types::RxPhyInfo::UNKNOWN,
+                body: [0; wifi80211::types::MAX_MGMT_BODY_LEN],
+                body_len: 0,
             }];
             let mut dummy_data: [RxDataFrame; 1] = [RxDataFrame { copy_offset: 0, len: 0 }];
             let mut dummy_buf = [0u8; 0];
@@ -1541,14 +1551,24 @@ impl Driver for WifiDriverWrapper {
                         rssi_neg = abs_rssi
                     );
                 }
-                MgmtSubtype::AssocReq => {
+                MgmtSubtype::AssocReq | MgmtSubtype::ReassocReq => {
                     let abs_rssi = if mgmt_frames[i].rssi < 0 { (-mgmt_frames[i].rssi) as u32 } else { mgmt_frames[i].rssi as u32 };
-                    uinfo!("wifid", "rx_assoc_req";
-                        mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
-                        mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
-                        mac4 = addr2[4] as u32, mac5 = addr2[5] as u32,
-                        rssi_neg = abs_rssi
-                    );
+                    let is_reassoc = matches!(mgmt_frames[i].subtype, MgmtSubtype::ReassocReq);
+                    if is_reassoc {
+                        uinfo!("wifid", "rx_reassoc_req";
+                            mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
+                            mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
+                            mac4 = addr2[4] as u32, mac5 = addr2[5] as u32,
+                            rssi_neg = abs_rssi
+                        );
+                    } else {
+                        uinfo!("wifid", "rx_assoc_req";
+                            mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
+                            mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
+                            mac4 = addr2[4] as u32, mac5 = addr2[5] as u32,
+                            rssi_neg = abs_rssi
+                        );
+                    }
                 }
                 MgmtSubtype::Deauth => {
                     udebug!("wifid", "rx_deauth";
@@ -1564,63 +1584,73 @@ impl Driver for WifiDriverWrapper {
                         mac4 = addr2[4] as u32, mac5 = addr2[5] as u32
                     );
                 }
+                MgmtSubtype::Action => {
+                    udebug!("wifid", "rx_action";
+                        mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
+                        mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
+                        mac4 = addr2[4] as u32, mac5 = addr2[5] as u32
+                    );
+                }
                 MgmtSubtype::Other(st) => {
                     udebug!("wifid", "rx_mgmt_other"; subtype = st as u32);
                 }
             }
 
             // Phase 1: Get AP response (borrows self.0.ap mutably)
-            let mut tx_frame = [0u8; 128]; // Raw 802.11 frame from AP
+            let mut tx_frame = [0u8; 256]; // Raw 802.11 frame from AP
             let mut tx_len = 0usize;
             let mut register_mac = [0u8; 6];
             let mut register_aid = 0u16;
             let mut do_register = false;
+            let mut remove_mac = [0u8; 6];
             let mut remove_aid = 0u16;
             let mut remove_wlan_idx = 0u16;
             let mut do_remove = false;
+            let mut ba_mac = [0u8; 6];
+            let mut ba_tid = 0u8;
+            let mut ba_ssn = 0u16;
+            let mut ba_win_size = 0u16;
+            let mut ba_start = false;
+            let mut do_ba = false;
 
             if let Some(ref mut ap) = self.0.ap {
                 let mut raw_buf = [0u8; 256];
                 let result = ap.handle_rx_mgmt(&mgmt_frames[i], &mut raw_buf, self.0.drain_ticks);
 
-                // Extract action data into local variables
-                if let Some(ref action) = result.action1 {
-                    match action {
-                        ApAction::TxFrame(data) => {
-                            let n = data.len().min(tx_frame.len());
-                            tx_frame[..n].copy_from_slice(&data[..n]);
-                            tx_len = n;
+                // Extract action data from up to 3 actions
+                for action_opt in result.actions.iter() {
+                    if let Some(ref action) = action_opt {
+                        match action {
+                            ApAction::TxFrame(data) => {
+                                let n = data.len().min(tx_frame.len());
+                                tx_frame[..n].copy_from_slice(&data[..n]);
+                                tx_len = n;
+                            }
+                            ApAction::RegisterSta { mac, aid } => {
+                                register_mac = *mac;
+                                register_aid = *aid;
+                                do_register = true;
+                            }
+                            ApAction::RemoveSta { mac, aid, wlan_idx } => {
+                                remove_mac = *mac;
+                                remove_aid = *aid;
+                                remove_wlan_idx = *wlan_idx;
+                                do_remove = true;
+                            }
+                            ApAction::NotifyBaSession { mac, tid, ssn, win_size, start } => {
+                                ba_mac = *mac;
+                                ba_tid = *tid;
+                                ba_ssn = *ssn;
+                                ba_win_size = *win_size;
+                                ba_start = *start;
+                                do_ba = true;
+                            }
                         }
-                        ApAction::RegisterSta { mac, aid } => {
-                            register_mac = *mac;
-                            register_aid = *aid;
-                            do_register = true;
-                        }
-                        ApAction::RemoveSta { aid, wlan_idx } => {
-                            remove_aid = *aid;
-                            remove_wlan_idx = *wlan_idx;
-                            do_remove = true;
-                        }
-                    }
-                }
-                if let Some(ref action) = result.action2 {
-                    match action {
-                        ApAction::RegisterSta { mac, aid } => {
-                            register_mac = *mac;
-                            register_aid = *aid;
-                            do_register = true;
-                        }
-                        ApAction::RemoveSta { aid, wlan_idx } => {
-                            remove_aid = *aid;
-                            remove_wlan_idx = *wlan_idx;
-                            do_remove = true;
-                        }
-                        ApAction::TxFrame(_) => {} // action2 is never TxFrame in practice
                     }
                 }
 
                 // Log when AP drops a frame (e.g. assoc from unauthenticated STA)
-                if result.action1.is_none() && !matches!(subtype, MgmtSubtype::ProbeReq | MgmtSubtype::Other(_)) {
+                if result.actions[0].is_none() && !matches!(subtype, MgmtSubtype::ProbeReq | MgmtSubtype::Other(_) | MgmtSubtype::Action) {
                     udebug!("wifid", "ap_drop_frame";
                         mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
                         mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
@@ -1709,8 +1739,37 @@ impl Driver for WifiDriverWrapper {
                     self.0.seq = self.0.seq.wrapping_add(1);
                     let _ = dev.mcu_add_client_sta(
                         wa_ring, 0, remove_wlan_idx, HW_BSSID_0,
-                        CONN_STATE_DISCONNECT, &[0u8; 6], remove_aid, false, seq, None, false,
+                        CONN_STATE_DISCONNECT, &remove_mac, remove_aid, false, seq, None, false,
                     );
+                }
+            }
+            // BA session notification — tell firmware about ADDBA/DELBA.
+            // Source: Linux mt7996/mcu.c mt7996_mcu_sta_ba()
+            // STA_REC_BA TLV via MCU_WMWA_UNI_CMD(STA_REC_UPDATE)
+            if do_ba {
+                // Look up STA's wlan_idx for the MCU command
+                let ba_wlan_idx = if let Some(ref ap) = self.0.ap {
+                    ap.find_sta(&ba_mac).map(|s| s.wlan_idx).unwrap_or(0)
+                } else {
+                    0
+                };
+                if ba_wlan_idx != 0 {
+                    if ba_start {
+                        uinfo!("wifid", "ba_session_start"; tid = ba_tid as u32,
+                            ssn = ba_ssn as u32, win = ba_win_size as u32, wlan = ba_wlan_idx as u32);
+                    } else {
+                        uinfo!("wifid", "ba_session_stop"; tid = ba_tid as u32, wlan = ba_wlan_idx as u32);
+                    }
+                    if let Some(ref mut wa_ring) = self.0.wa_ring {
+                        let seq = self.0.seq;
+                        self.0.seq = self.0.seq.wrapping_add(1);
+                        if let Err(e) = dev.mcu_sta_ba(
+                            wa_ring, 0, ba_wlan_idx, HW_BSSID_0,
+                            ba_tid, ba_ssn, ba_win_size, ba_start, seq,
+                        ) {
+                            uerror!("wifid", "mcu_sta_ba_failed"; err = e as u32, wlan = ba_wlan_idx as u32);
+                        }
+                    }
                 }
             }
         }
@@ -1821,10 +1880,10 @@ impl Driver for WifiDriverWrapper {
 
             // STA aging: evict STAs not seen within timeout
             if let Some(ref mut ap) = self.0.ap {
-                let mut evicted = [(0u16, 0u16); 16];
+                let mut evicted = [([0u8; 6], 0u16, 0u16); 16];
                 let n = ap.age_stas(self.0.drain_ticks, &mut evicted);
                 for j in 0..n {
-                    let (aid, wlan_idx) = evicted[j];
+                    let (mac, aid, wlan_idx) = evicted[j];
                     udebug!("wifid", "sta_aged"; aid = aid as u32, wlan = wlan_idx as u32);
                     if wlan_idx != 0 {
                         // Linux main.c:1034 — clear ADM count before removing STA
@@ -1834,7 +1893,7 @@ impl Driver for WifiDriverWrapper {
                             self.0.seq = self.0.seq.wrapping_add(1);
                             let _ = dev.mcu_add_client_sta(
                                 wa_ring, 0, wlan_idx, HW_BSSID_0,
-                                CONN_STATE_DISCONNECT, &[0u8; 6], aid, false, seq, None, false,
+                                CONN_STATE_DISCONNECT, &mac, aid, false, seq, None, false,
                             );
                         }
                     }
@@ -1879,6 +1938,11 @@ impl Driver for WifiDriverWrapper {
             // TSCR0 = TX AMPDU count (data only)
             let tx_ampdu = dev.reg_rr(mt_wf_mib(0, MT_MIB_TSCR0_OFS));
 
+            // Beacon TX MIB counter — read-to-clear, shows beacons sent since last read.
+            // At 100ms beacon interval, expect ~50 per 5-second diagnostic window.
+            // 0 = firmware stopped sending beacons (likely cause of client disconnect).
+            let bcn_hw = dev.reg_rr(mt_wf_mib(0, MT_MIB_BTSCR0_OFS));
+
             // Monitor RX ring DMA_IDX and CPU_IDX for WA_MAIN (q3) to debug drain
             let mut rx_dma = [0u32; 6];
             let mut r2_cpu = 0u32;
@@ -1913,10 +1977,14 @@ impl Driver for WifiDriverWrapper {
                 r0 = rx_dma[0], r1 = rx_dma[1], r2 = rx_dma[2], r2c = r2_cpu,
                 r3 = rx_dma[3], r3c = r3_cpu,
                 q0d = q0_dma, q0c = q0_cpu,
-                q1d = q1_dma, q1c = q1_cpu
+                q1d = q1_dma, q1c = q1_cpu,
+                q0h = self.0.rx_queues[0].head,
+                q0t = self.0.rx_queues[0].tail,
+                q0q = self.0.rx_queues[0].queued
             );
             uinfo!("wifid", "bcn_tx";
                 t = secs,
+                bcn_hw = bcn_hw,
                 tx_ok = tx_mpdu,
                 tx_try = tx_try,
                 tx_amp = tx_ampdu,
@@ -1982,20 +2050,26 @@ impl Driver for WifiDriverWrapper {
             }
         }
 
-        // Timer tick: if IRQ was suppressed (NAPI polling), try to re-enable.
+        // Timer tick: if IRQ was suppressed (NAPI polling), re-enable.
         // The timer already drained all queues above (intr = 0xFFFF_FFFF).
+        // Clear INT_SOURCE_CSR (W1C) to ack processed work, then unmask.
+        // If new RX arrives immediately, the IRQ handler re-enters NAPI.
+        //
+        // BUG FIX: Previously we checked INT_SOURCE_CSR without clearing it
+        // first, so stale pending bits from already-processed work kept us
+        // permanently in NAPI mode (500ms-only processing, sawtooth latency).
         if is_timer && self.0.irq_suppressed && self.0.irq_mode {
+            // Clear all pending interrupt bits (W1C register)
             let pending = dev.mt76_rr(MT_INT_SOURCE_CSR);
-            if pending & MT_INT_RX_DONE_ALL == 0 {
-                // Queues are quiet — unmask HW interrupts to exit polling mode.
-                // Next real HW interrupt will set the IRQ handle readable
-                // and trigger a normal IRQ-path handle_event.
-                let irq_mask = MT_INT_RX_DONE_ALL | MT_INT_MCU_CMD
-                    | MT_INT_TX_DONE_BAND0 | MT_INT_TX_DONE_MCU_WM;
-                dev.mt76_wr(MT_INT_MASK_CSR, irq_mask);
-                self.0.irq_suppressed = false;
-            }
-            // Otherwise stay suppressed — next timer tick will drain again.
+            dev.mt76_wr(MT_INT_SOURCE_CSR, pending);
+
+            // Unmask HW interrupts — exit polling mode unconditionally.
+            // If more RX is ready, the next IRQ fires immediately and the
+            // IRQ handler can re-enter NAPI if needed.
+            let irq_mask = MT_INT_RX_DONE_ALL | MT_INT_MCU_CMD
+                | MT_INT_TX_DONE_BAND0 | MT_INT_TX_DONE_MCU_WM;
+            dev.mt76_wr(MT_INT_MASK_CSR, irq_mask);
+            self.0.irq_suppressed = false;
         }
     }
 
@@ -2109,10 +2183,10 @@ impl Driver for WifiDriverWrapper {
                     Some(d) => d,
                     None => return Self::copy_to_buf(buf, b"not_initialized"),
                 };
-                let rx = match self.0.band0_rx.as_ref() {
-                    Some(r) => r,
-                    None => return Self::copy_to_buf(buf, b"no_band0_rx"),
-                };
+                let rx = &self.0.rx_queues[2]; // BAND0 data RX
+                if rx.ndesc == 0 {
+                    return Self::copy_to_buf(buf, b"no_band0_rx");
+                }
 
                 let dma_idx = dev.mt76_rr(rx.regs_base + MT_QUEUE_DMA_IDX);
                 let cpu_idx = dev.mt76_rr(rx.regs_base + MT_QUEUE_CPU_IDX);
@@ -2691,18 +2765,18 @@ impl Driver for WifiDriverWrapper {
                 Self::copy_to_buf(buf, b"OK\n")
             }
             b"rx" => {
-                let rx = match self.0.band0_rx.as_ref() {
-                    Some(r) => r,
-                    None => return Self::copy_to_buf(buf, b"ERR no_band0_rx\n"),
-                };
+                if self.0.band0_rx.is_none() {
+                    return Self::copy_to_buf(buf, b"ERR no_band0_rx\n");
+                }
+                let rx = &mut self.0.rx_queues[2]; // BAND0 data RX
                 match value {
                     b"monitor" => {
                         // Accept ALL frames — clear both RFCR and RFCR1
                         dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR_OFS), 0);
                         dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR1_OFS), 0);
-                        // Re-arm CPU_IDX to ndesc-1 so DMA has full ring available
-                        // (CPU_IDX=0 with DMA_IDX=0 gives DMA zero free slots)
-                        dev.mt76_wr(rx.regs_base + MT_QUEUE_CPU_IDX, rx.ndesc - 1);
+                        // Reset ring counters and refill so DMA has full ring
+                        rx.reset_counters();
+                        dev.rx_fill(rx);
                         udebug!("wifid", "rx_monitor_mode");
                         Self::copy_to_buf(buf, b"OK monitor\n")
                     }
@@ -2724,7 +2798,7 @@ impl Driver for WifiDriverWrapper {
                     }
                     b"reset" => {
                         // Re-initialize all RX descriptors and reset CPU_IDX
-                        // This clears stale frames and gives DMA a fresh ring
+                        rx.reset_counters();
                         dev.rx_fill(rx);
                         udebug!("wifid", "rx_ring_reset");
                         Self::copy_to_buf(buf, b"OK reset\n")
@@ -2736,13 +2810,17 @@ impl Driver for WifiDriverWrapper {
                 if value != b"start" {
                     return Self::copy_to_buf(buf, b"ERR use: start\n");
                 }
-                let rx = match self.0.band0_rx.as_ref() {
-                    Some(r) => r,
-                    None => return Self::copy_to_buf(buf, b"ERR no_band0_rx\n"),
-                };
+                if self.0.rx_queues[2].ndesc == 0 {
+                    return Self::copy_to_buf(buf, b"ERR no_band0_rx\n");
+                }
 
                 // Step 1: Re-arm RX ring — clear stale frames
-                dev.rx_fill(rx);
+                {
+                    let rx = &mut self.0.rx_queues[2];
+                    rx.reset_counters();
+                    dev.rx_fill(rx);
+                }
+                let rx = &self.0.rx_queues[2];
 
                 // Step 2: Accept all frames for scan — clear RFCR filters
                 dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR_OFS), 0);

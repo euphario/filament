@@ -703,11 +703,15 @@ impl Mt7996Dev {
         Err(-1)
     }
 
-    /// Advance RX ring CPU_IDX to return consumed descriptors to hardware.
-    /// Like Linux's NAPI dequeue — tells the WFDMA that buffers up to `pos`
-    /// have been read and can be reused for new responses.
-    fn rx_advance_cpu_idx(&self, ring: &TxRing, pos: u32, _rx_ndesc: u32) {
-        self.mt76_wr(ring.rx_regs + MT_QUEUE_CPU_IDX, pos);
+    /// No-op: CPU_IDX is now managed exclusively by rx_fill() via
+    /// head/tail/queued tracking in RxQueueInfo. The MCU response handler
+    /// reads the response buffer but does NOT advance CPU_IDX — that
+    /// happens when rx_process_mcu() runs on the next timer tick.
+    ///
+    /// Writing CPU_IDX here would desync from the software head/tail/queued
+    /// state, causing ring stalls at the ndesc wrap boundary.
+    fn rx_advance_cpu_idx(&self, _ring: &TxRing, _pos: u32, _rx_ndesc: u32) {
+        // Intentionally empty — rx_fill() owns CPU_IDX now
     }
 
     /// Legacy: wait on MCU_WM RX queue (used by firmware loading, no response parsing)
@@ -1963,6 +1967,48 @@ impl Mt7996Dev {
 
         udebug!("mcu", "add_client_sta"; bss = bss_idx, wlan = wlan_idx, state = conn_state, aid = aid);
         self.mcu_send_uni_cmd(ring, cmd, &data, wait, seq, irq)
+    }
+
+    /// Send STA_REC_BA TLV to notify firmware about a BA session start/stop.
+    /// Source: Linux mt7996/mcu.c:1191-1218 mt7996_mcu_sta_ba()
+    ///
+    /// Layout: sta_req_hdr(8) + sta_rec_ba_uni(16) = 24 bytes
+    /// sta_rec_ba_uni: tag(2) + len(2) + tid(1) + ba_type(1) + amsdu(1) +
+    ///                 ba_en(1) + ssn(2) + winsize(2) + ba_rdd_rro(1) + rsv[3]
+    ///
+    /// Command: MCU_WMWA_UNI_CMD(STA_REC_UPDATE) — same as add_sta
+    pub fn mcu_sta_ba(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
+                      omac_idx: u8, tid: u8, ssn: u16, win_size: u16,
+                      enable: bool, seq: u8) -> Result<(), i32> {
+        let mut data = [0u8; 24]; // sta_req_hdr(8) + sta_rec_ba_uni(16)
+
+        // === sta_req_hdr (8 bytes) ===
+        data[0] = bss_idx;
+        data[1] = wlan_idx as u8;
+        data[2..4].copy_from_slice(&1u16.to_le_bytes()); // tlv_num = 1
+        data[4] = 1; // is_tlv_append
+        data[5] = omac_idx;
+        data[6] = (wlan_idx >> 8) as u8;
+
+        // === sta_rec_ba_uni TLV (16 bytes) — mt7996/mcu.h:486-497 ===
+        let off = 8;
+        data[off..off + 2].copy_from_slice(&STA_REC_BA.to_le_bytes()); // tag = 6
+        data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes()); // len = 16
+        data[off + 4] = tid;                                          // tid
+        // ba_type: 2 = MT_BA_TYPE_RECIPIENT (we are AP receiving ADDBA from STA)
+        // Source: mt76_connac_mcu.h:996-1000
+        data[off + 5] = 2;                                            // ba_type = RECIPIENT
+        data[off + 6] = 0;                                            // amsdu = 0
+        data[off + 7] = if enable { 1u8 << tid } else { 0 };          // ba_en = bitmap
+        data[off + 8..off + 10].copy_from_slice(&ssn.to_le_bytes());  // ssn
+        data[off + 10..off + 12].copy_from_slice(&win_size.to_le_bytes()); // winsize
+        data[off + 12] = 0;                                           // ba_rdd_rro = 0 (no HW RRO)
+        // rsv[3] = 0
+
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
+
+        udebug!("mcu", "sta_ba"; wlan = wlan_idx, tid = tid, ssn = ssn, win = win_size, en = enable as u8);
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)
     }
 
     /// Assign WCID to BSS scheduling group (VOW DRR control)

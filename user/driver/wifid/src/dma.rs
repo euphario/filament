@@ -69,6 +69,16 @@ pub struct Mt76Desc {
 // RX Queue Info — for tracking RX queues that need buffer fill
 // ============================================================================
 
+/// RX queue state — matches Linux mt76_queue fields.
+///
+/// Linux uses head/tail/queued counters instead of raw hardware index
+/// comparison. This avoids the wrap-boundary ambiguity where
+/// `(cpu_idx+1) % ndesc == dma_idx` falsely reads "empty" when DMA_IDX
+/// wraps to 0 and CPU_IDX = ndesc-1.
+///
+/// - `head`: next slot to refill (after refill, written to CPU_IDX)
+/// - `tail`: next slot to dequeue (check DMA_DONE here)
+/// - `queued`: number of slots given to hardware (head - tail, mod ndesc)
 #[derive(Clone, Copy, Default)]
 pub struct RxQueueInfo {
     pub hw_idx: u32,
@@ -78,17 +88,31 @@ pub struct RxQueueInfo {
     pub buf_size: u32,
     pub buf_phys: u64,
     pub buf_virt: u64,
-    /// Software-tracked last DMA_IDX we processed up to.
-    /// Prevents double-processing when CPU_IDX must be set to dma_idx-1
-    /// (WFDMA interprets CPU_IDX==DMA_IDX as "ring full", not "empty").
-    pub last_dma_idx: u32,
+    /// Next slot to fill — written to CPU_IDX after refill.
+    /// Linux: q->head
+    pub head: u32,
+    /// Next slot to dequeue — check DMA_DONE bit here.
+    /// Linux: q->tail
+    pub tail: u32,
+    /// Number of slots owned by hardware.
+    /// Linux: q->queued
+    pub queued: u32,
 }
 
 impl RxQueueInfo {
     pub const ZERO: Self = Self {
         hw_idx: 0, regs_base: 0, ndesc: 0, desc_virt: 0,
-        buf_size: 0, buf_phys: 0, buf_virt: 0, last_dma_idx: u32::MAX,
+        buf_size: 0, buf_phys: 0, buf_virt: 0,
+        head: 0, tail: 0, queued: 0,
     };
+
+    /// Reset software counters so rx_fill() will refill the entire ring.
+    /// Use before rx_fill() when reinitializing a ring from scratch.
+    pub fn reset_counters(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+        self.queued = 0;
+    }
 }
 
 // ============================================================================
@@ -565,22 +589,28 @@ impl Mt7996Dev {
     // Source: dma.c:684-694
     // ========================================================================
 
-    pub fn rx_fill(&self, q: &RxQueueInfo) {
-        // Fill ALL ndesc entries with valid buffers — not ndesc-1.
-        // The one-empty-slot convention is maintained by the hardware
-        // (DMA_IDX == CPU_IDX → full), not by leaving a slot unfilled.
-        // If entry ndesc-1 has no valid buffer, the ring stalls when
-        // DMA_IDX reaches it (hardware can't DMA to physical address 0).
-        let fill_count = q.ndesc as usize;
+    /// Fill RX queue with buffers, matching Linux mt76_dma_rx_fill().
+    ///
+    /// Fills up to ndesc-1 slots (one-empty-slot convention: hardware
+    /// treats DMA_IDX == CPU_IDX as "full", so we leave one slot empty
+    /// to distinguish full from empty). Tracks head/queued counters.
+    ///
+    /// Called at init (fills ndesc-1 from 0) and after processing
+    /// (refills consumed slots).
+    ///
+    /// Source: dma.c:684-694 mt76_dma_rx_fill() + mt76_dma_kick_queue()
+    pub fn rx_fill(&self, q: &mut RxQueueInfo) {
+        let ndesc = q.ndesc;
+        let mut filled = 0u32;
 
-        udebug!("dma", "rx_fill"; count = fill_count, buf_size = q.buf_size, buf_phys = q.buf_phys);
-
-        for i in 0..fill_count {
+        while q.queued < ndesc - 1 {
+            let i = q.head as usize;
             let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
             let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
 
             // Linux mt76_dma_add_rx_buf(): ctrl = SD_LEN0(buf_size), NO LAST_SEC0.
             // LAST_SEC0 is hardware-generated on RX to indicate packet boundaries.
+            // DMA_DONE is cleared (0) so hardware can set it after writing.
             let ctrl = (q.buf_size as u32) << 16;
 
             unsafe {
@@ -589,78 +619,90 @@ impl Mt7996Dev {
                 core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
                 core::ptr::write_volatile(&mut (*desc_ptr).ctrl, ctrl);
             }
+
+            q.head = (q.head + 1) % ndesc;
+            q.queued += 1;
+            filled += 1;
         }
 
-        let desc_bytes = fill_count * core::mem::size_of::<Mt76Desc>();
-        flush_buffer(q.desc_virt, desc_bytes);
+        if filled > 0 {
+            let desc_bytes = ndesc as usize * core::mem::size_of::<Mt76Desc>();
+            flush_buffer(q.desc_virt, desc_bytes);
 
-        dma_wmb();
+            dma_wmb();
 
-        // CPU_IDX = ndesc-1: tells hardware "I've prepared buffers up to
-        // ndesc-1; you can DMA into 0..ndesc-2, stopping when DMA_IDX
-        // reaches CPU_IDX". Entry ndesc-1 is valid too — it becomes
-        // usable once the first processing pass sets CPU_IDX to a lower
-        // value, allowing DMA_IDX to advance past it.
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (q.ndesc - 1) as u32);
+            // Linux mt76_dma_kick_queue(): write CPU_IDX = q->head
+            // This tells hardware "buffers are valid up to head-1;
+            // you can DMA from tail to head-1".
+            self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, q.head);
+        }
     }
 
-    /// Drain an RX ring: reset consumed descriptors and advance CPU_IDX.
+    /// Drain an RX ring: dequeue all DMA_DONE entries and refill.
     ///
-    /// Returns number of entries drained. The firmware can then reuse those
-    /// descriptor slots for new events. We don't process the data — just recycle.
+    /// Returns number of entries drained. Uses DMA_DONE bit like all
+    /// other dequeue paths — no index comparison.
     pub fn rx_drain(&self, q: &mut RxQueueInfo) -> u32 {
-        let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
-        let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
-
-        if dma_idx == cpu_idx {
-            return 0;
-        }
-
-        let ndesc = q.ndesc;
         let mut count = 0u32;
-        let mut idx = (cpu_idx + 1) % ndesc;
 
-        loop {
-            let i = idx as usize;
+        // Dequeue all ready entries
+        while q.queued > 0 {
+            let i = q.tail as usize;
             let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
-            let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
+            let ctrl = unsafe { core::ptr::read_volatile(&(*desc_ptr).ctrl) };
 
-            let ctrl = (q.buf_size as u32) << 16;
+            if ctrl & MT_DMA_CTL_DMA_DONE == 0 { break; }
+
+            // Clear DMA_DONE so hardware can reuse this descriptor.
+            // dma.c:224 mt76_dma_rx_fill_buf() — ctrl = buf_size, DMA_DONE=0
             unsafe {
-                core::ptr::write_volatile(&mut (*desc_ptr).buf0, dma_addr_lo(buf_phys));
-                core::ptr::write_volatile(&mut (*desc_ptr).buf1, dma_addr_hi(buf_phys));
-                core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
-                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, ctrl);
+                core::ptr::write_volatile(
+                    &mut (*desc_ptr).ctrl,
+                    (q.buf_size as u32) << 16,
+                );
             }
 
+            q.tail = (q.tail + 1) % q.ndesc;
+            q.queued -= 1;
             count += 1;
-            if idx == dma_idx { break; }
-            idx = (idx + 1) % ndesc;
         }
 
-        dma_wmb();
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
-
+        // Refill consumed slots
+        if count > 0 {
+            self.rx_fill(q);
+        }
         count
     }
 
-    /// Soft drain: advance CPU_IDX without resetting descriptors.
+    /// Soft drain: dequeue DMA_DONE entries (advance tail) and refill,
+    /// without resetting descriptor buffer pointers first.
     /// Use for event rings where the firmware may need buffer contents intact.
     pub fn rx_advance(&self, q: &mut RxQueueInfo) -> u32 {
-        let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
-        let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
+        let mut count = 0u32;
 
-        if dma_idx == cpu_idx {
-            return 0;
+        while q.queued > 0 {
+            let i = q.tail as usize;
+            let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
+            let ctrl = unsafe { core::ptr::read_volatile(&(*desc_ptr).ctrl) };
+
+            if ctrl & MT_DMA_CTL_DMA_DONE == 0 { break; }
+
+            // Clear DMA_DONE so hardware can reuse this descriptor.
+            unsafe {
+                core::ptr::write_volatile(
+                    &mut (*desc_ptr).ctrl,
+                    (q.buf_size as u32) << 16,
+                );
+            }
+
+            q.tail = (q.tail + 1) % q.ndesc;
+            q.queued -= 1;
+            count += 1;
         }
 
-        let count = if dma_idx > cpu_idx {
-            dma_idx - cpu_idx
-        } else {
-            q.ndesc - cpu_idx + dma_idx
-        };
-
-        self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+        if count > 0 {
+            self.rx_fill(q);
+        }
         count
     }
 
@@ -673,25 +715,17 @@ impl Mt7996Dev {
     /// Reads each consumed descriptor's buffer and passes to event parser.
     /// Returns number of entries processed.
     ///
-    /// Uses DMA_DONE bit in descriptor ctrl as the dequeue guard, matching
-    /// Linux mt76_dma_dequeue(). Index-based empty detection
-    /// (cpu_idx+1 == dma_idx) fails at the wrap boundary: when DMA_IDX
-    /// wraps to 0 and CPU_IDX = ndesc-1, it falsely reads as "empty" and
-    /// the MCU firmware stalls because CPU_IDX never advances.
+    /// Uses Linux mt76_dma_dequeue() model: check DMA_DONE at tail,
+    /// advance tail, decrement queued. After processing, rx_fill()
+    /// refills consumed slots and kicks CPU_IDX.
+    ///
+    /// Source: dma.c:593-620 mt76_dma_rx_process()
     pub fn rx_process_mcu(&self, q: &mut RxQueueInfo, counters: &mut RxMibCounters) -> u32 {
-        let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
-        let ndesc = q.ndesc;
-
         let mut count = 0u32;
-        let mut idx = (cpu_idx + 1) % ndesc;
-        let mut last_idx = cpu_idx;
 
-        // Walk from cpu_idx+1, checking DMA_DONE on each descriptor.
-        // Firmware sets DMA_DONE when it finishes writing an entry.
-        // We stop at the first entry without DMA_DONE (not yet written).
-        // Budget: process at most ndesc-1 entries per call.
-        for _ in 0..ndesc {
-            let i = idx as usize;
+        // Dequeue loop: check DMA_DONE at tail
+        while q.queued > 0 {
+            let i = q.tail as usize;
             let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
             let ctrl = unsafe { core::ptr::read_volatile(&(*desc_ptr).ctrl) };
 
@@ -708,27 +742,23 @@ impl Mt7996Dev {
             // Process MCU event
             event::process_mcu_event(buf, counters);
 
-            // Reset descriptor for reuse — clear DMA_DONE, restore buffer pointer
-            // Linux mt76_dma_add_rx_buf(): ctrl = SD_LEN0 only (no DMA_DONE)
-            let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
-            let refill_ctrl = (q.buf_size as u32) << 16;
+            // Clear DMA_DONE so hardware can reuse this descriptor.
             unsafe {
-                core::ptr::write_volatile(&mut (*desc_ptr).buf0, dma_addr_lo(buf_phys));
-                core::ptr::write_volatile(&mut (*desc_ptr).buf1, dma_addr_hi(buf_phys));
-                core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
-                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, refill_ctrl);
+                core::ptr::write_volatile(
+                    &mut (*desc_ptr).ctrl,
+                    (q.buf_size as u32) << 16,
+                );
             }
 
-            last_idx = idx;
+            // Advance tail, decrement queued
+            q.tail = (q.tail + 1) % q.ndesc;
+            q.queued -= 1;
             count += 1;
-            idx = (idx + 1) % ndesc;
         }
 
+        // Refill consumed slots and kick CPU_IDX
         if count > 0 {
-            dma_wmb();
-            // CPU_IDX = last processed entry. Tells firmware "I've consumed
-            // up to here; you can reuse entries from last_idx+1 onwards."
-            self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, last_idx);
+            self.rx_fill(q);
         }
         count
     }
@@ -740,14 +770,16 @@ impl Mt7996Dev {
 
     /// Process data RX queue with frame classification.
     /// For each consumed descriptor, reads RXD words, classifies the frame,
-    /// and updates software MIB counters. Resets descriptors for reuse.
+    /// and updates software MIB counters.
+    ///
+    /// Uses DMA_DONE dequeue model (Linux mt76_dma_dequeue). After the
+    /// dequeue loop, rx_fill() refills consumed slots and kicks CPU_IDX.
     ///
     /// Management frames (ProbeReq, Auth, AssocReq, Deauth, Disassoc) are
     /// collected as `RxMgmtFrame` for the AP state machine.
     ///
     /// Header-translated data frames (firmware sets HDR_TRANS bit) are
-    /// collected as `RxDataFrame` references. These point directly into
-    /// the DMA buffer and are valid until the next rx_classify call.
+    /// copied into `data_buf` before descriptor reset.
     ///
     /// Returns (entries_processed, mgmt_frame_count, data_frame_count).
     pub fn rx_classify(&self, q: &mut RxQueueInfo, counters: &mut RxMibCounters,
@@ -757,23 +789,18 @@ impl Mt7996Dev {
                        max_data: usize,
                        data_buf: &mut [u8]) -> (u32, usize, usize) {
         let mut data_buf_pos: u32 = 0;
-        let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
-        let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
-
-        let ndesc = q.ndesc;
-        let start = (cpu_idx + 1) % ndesc;
-        if start == dma_idx {
-            return (0, 0, 0);
-        }
 
         let mut count = 0u32;
         let mut mgmt_count = 0usize;
         let mut data_count = 0usize;
-        let mut idx = start;
 
-        loop {
-            if idx == dma_idx { break; }
-            let i = idx as usize;
+        while q.queued > 0 {
+            let i = q.tail as usize;
+
+            // Check DMA_DONE before processing
+            let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
+            let ctrl = unsafe { core::ptr::read_volatile(&(*desc_ptr).ctrl) };
+            if ctrl & MT_DMA_CTL_DMA_DONE == 0 { break; }
             let buf_base = q.buf_virt + (i as u64 * q.buf_size as u64);
             let buf_ptr = buf_base as *const u32;
 
@@ -868,19 +895,28 @@ impl Mt7996Dev {
             let rssi = phy.rssi;
 
             // Collect management frames for AP state machine
-            // ProbeReq, Auth, AssocReq, Deauth, Disassoc all need addr2
+            // ProbeReq, Auth, AssocReq, Deauth, Disassoc, Action all need
+            // addr2, addr3, and frame body for protocol processing.
             let is_ap_mgmt = matches!(class,
                 RxFrameClass::ProbeReq | RxFrameClass::Auth |
-                RxFrameClass::AssocReq | RxFrameClass::Deauth |
-                RxFrameClass::Disassoc);
+                RxFrameClass::AssocReq | RxFrameClass::ReassocReq |
+                RxFrameClass::Deauth | RxFrameClass::Disassoc |
+                RxFrameClass::Action);
             if is_ap_mgmt && mgmt_count < max_mgmt {
                 let addr2_ofs = frame_ofs + 10; // FC(2) + Duration(2) + DA(6)
-                if addr2_ofs + 6 <= q.buf_size as usize {
+                let addr3_ofs = frame_ofs + 16; // FC(2) + Duration(2) + DA(6) + SA(6)
+                let body_ofs = frame_ofs + 24;  // After 24-byte MAC header
+                if addr3_ofs + 6 <= q.buf_size as usize {
                     let mut addr2 = [0u8; 6];
-                    let src = unsafe {
+                    let mut addr3 = [0u8; 6];
+                    let src2 = unsafe {
                         core::slice::from_raw_parts((buf_base as *const u8).add(addr2_ofs), 6)
                     };
-                    addr2.copy_from_slice(src);
+                    addr2.copy_from_slice(src2);
+                    let src3 = unsafe {
+                        core::slice::from_raw_parts((buf_base as *const u8).add(addr3_ofs), 6)
+                    };
+                    addr3.copy_from_slice(src3);
                     // Skip frames with all-zero addr2 — false positive from
                     // stale buffer (fc0=0x00 = AssocReq subtype). No valid client
                     // has MAC 00:00:00:00:00:00.
@@ -889,11 +925,33 @@ impl Mt7996Dev {
                             RxFrameClass::ProbeReq => wifi80211::types::MgmtSubtype::ProbeReq,
                             RxFrameClass::Auth => wifi80211::types::MgmtSubtype::Auth,
                             RxFrameClass::AssocReq => wifi80211::types::MgmtSubtype::AssocReq,
+                            RxFrameClass::ReassocReq => wifi80211::types::MgmtSubtype::ReassocReq,
                             RxFrameClass::Deauth => wifi80211::types::MgmtSubtype::Deauth,
                             RxFrameClass::Disassoc => wifi80211::types::MgmtSubtype::Disassoc,
+                            RxFrameClass::Action => wifi80211::types::MgmtSubtype::Action,
                             _ => unreachable!(),
                         };
-                        mgmt_frames[mgmt_count] = wifi80211::types::RxMgmtFrame { subtype, addr2, rssi, phy };
+                        // Copy frame body after MAC header for protocol parsing
+                        // (ADDBA params, assoc IEs, etc.)
+                        let mut body = [0u8; wifi80211::types::MAX_MGMT_BODY_LEN];
+                        let mut body_len = 0u16;
+                        let byte_cnt = (rxd0 & 0xFFFF) as usize;
+                        if body_ofs < byte_cnt && body_ofs < q.buf_size as usize {
+                            let avail = (byte_cnt - body_ofs).min((q.buf_size as usize) - body_ofs);
+                            let copy_len = avail.min(wifi80211::types::MAX_MGMT_BODY_LEN);
+                            if copy_len > 0 {
+                                let body_src = unsafe {
+                                    core::slice::from_raw_parts(
+                                        (buf_base as *const u8).add(body_ofs), copy_len,
+                                    )
+                                };
+                                body[..copy_len].copy_from_slice(body_src);
+                                body_len = copy_len as u16;
+                            }
+                        }
+                        mgmt_frames[mgmt_count] = wifi80211::types::RxMgmtFrame {
+                            subtype, addr2, addr3, rssi, phy, body, body_len,
+                        };
                         mgmt_count += 1;
                     }
                 }
@@ -933,24 +991,23 @@ impl Mt7996Dev {
 
             counters.record(class, result.addr_type, result.fcs_err);
 
-            // Reset descriptor for reuse
-            let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
-            let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
-            let ctrl = (q.buf_size as u32) << 16;
+            // Clear DMA_DONE so hardware can reuse this descriptor.
             unsafe {
-                core::ptr::write_volatile(&mut (*desc_ptr).buf0, dma_addr_lo(buf_phys));
-                core::ptr::write_volatile(&mut (*desc_ptr).buf1, dma_addr_hi(buf_phys));
-                core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
-                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, ctrl);
+                core::ptr::write_volatile(
+                    &mut (*desc_ptr).ctrl,
+                    (q.buf_size as u32) << 16,
+                );
             }
 
+            // Advance tail, decrement queued (descriptor refilled by rx_fill below)
+            q.tail = (q.tail + 1) % q.ndesc;
+            q.queued -= 1;
             count += 1;
-            idx = (idx + 1) % ndesc;
         }
 
+        // Refill consumed slots and kick CPU_IDX
         if count > 0 {
-            dma_wmb();
-            self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+            self.rx_fill(q);
         }
         (count, mgmt_count, data_count)
     }
@@ -981,25 +1038,13 @@ impl Mt7996Dev {
             first_payload: [0; 4],
         };
 
-        let dma_idx = self.mt76_rr(q.regs_base + MT_QUEUE_DMA_IDX);
-        let cpu_idx = self.mt76_rr(q.regs_base + MT_QUEUE_CPU_IDX);
+        while q.queued > 0 {
+            let i = q.tail as usize;
 
-        let ndesc = q.ndesc;
-        let start = (cpu_idx + 1) % ndesc;
-        if start == dma_idx {
-            return result;
-        }
-
-        // DSB SY after reading DMA_IDX: ensures all prior DMA buffer writes
-        // are visible to the CPU before we read buffer contents.
-        dsb_sy();
-
-        let mut idx = start;
-
-        loop {
-            // dma_idx is "next to write" — not yet DMA'd, don't process it
-            if idx == dma_idx { break; }
-            let i = idx as usize;
+            // Check DMA_DONE before processing
+            let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
+            let ctrl = unsafe { core::ptr::read_volatile(&(*desc_ptr).ctrl) };
+            if ctrl & MT_DMA_CTL_DMA_DONE == 0 { break; }
             let buf_base = q.buf_virt + (i as u64 * q.buf_size as u64);
 
             // TX free data starts at offset 0 — NO RXD header on WA events.
@@ -1063,23 +1108,22 @@ impl Mt7996Dev {
                 }
             }
 
-            // Reset descriptor for reuse
-            let desc_ptr = unsafe { (q.desc_virt as *mut Mt76Desc).add(i) };
-            let buf_phys = q.buf_phys + (i as u64 * q.buf_size as u64);
-            let ctrl = (q.buf_size as u32) << 16;
+            // Clear DMA_DONE so hardware can reuse this descriptor.
             unsafe {
-                core::ptr::write_volatile(&mut (*desc_ptr).buf0, dma_addr_lo(buf_phys));
-                core::ptr::write_volatile(&mut (*desc_ptr).buf1, dma_addr_hi(buf_phys));
-                core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
-                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, ctrl);
+                core::ptr::write_volatile(
+                    &mut (*desc_ptr).ctrl,
+                    (q.buf_size as u32) << 16,
+                );
             }
 
-            idx = (idx + 1) % ndesc;
+            // Advance tail, decrement queued (descriptor refilled by rx_fill below)
+            q.tail = (q.tail + 1) % q.ndesc;
+            q.queued -= 1;
         }
 
+        // Refill consumed slots and kick CPU_IDX
         if result.entries > 0 {
-            dma_wmb();
-            self.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, (dma_idx + q.ndesc - 1) % q.ndesc);
+            self.rx_fill(q);
         }
         result
     }
@@ -1482,7 +1526,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_MCU_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
-            last_dma_idx: u32::MAX,
+            head: 0, tail: 0, queued: 0,
         };
         rx_buf_offset += MT7996_RX_MCU_RING_SIZE as usize * MT7996_RX_MCU_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1500,7 +1544,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_MCU_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
-            last_dma_idx: u32::MAX,
+            head: 0, tail: 0, queued: 0,
         };
         rx_buf_offset += MT7996_RX_MCU_RING_SIZE_WA as usize * MT7996_RX_MCU_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1518,7 +1562,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
-            last_dma_idx: u32::MAX,
+            head: 0, tail: 0, queued: 0,
         };
         rx_buf_offset += MT7996_RX_RING_SIZE as usize * MT7996_RX_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1536,7 +1580,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
-            last_dma_idx: u32::MAX,
+            head: 0, tail: 0, queued: 0,
         };
         rx_buf_offset += MT7996_RX_MCU_RING_SIZE as usize * MT7996_RX_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1555,7 +1599,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
-            last_dma_idx: u32::MAX,
+            head: 0, tail: 0, queued: 0,
         };
         rx_buf_offset += MT7996_RX_RING_SIZE as usize * MT7996_RX_BUF_SIZE as usize;
         rx_queue_idx += 1;
@@ -1573,7 +1617,7 @@ impl Mt7996Dev {
             buf_size: MT7996_RX_BUF_SIZE,
             buf_phys: rx_buf_phys + rx_buf_offset as u64,
             buf_virt: rx_buf_virt + rx_buf_offset as u64,
-            last_dma_idx: u32::MAX,
+            head: 0, tail: 0, queued: 0,
         };
         let _ = rx_buf_offset;
         rx_queue_idx += 1;
@@ -1581,7 +1625,7 @@ impl Mt7996Dev {
 
         // Fill RX buffers BEFORE enabling DMA
         for i in 0..rx_queue_idx {
-            self.rx_fill(&rx_queues[i]);
+            self.rx_fill(&mut rx_queues[i]);
         }
 
         // Enable DMA AFTER RX queues are filled

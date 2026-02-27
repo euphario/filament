@@ -391,6 +391,17 @@ pub fn build_deauth(buf: &mut [u8], bssid: &[u8; 6], dest: &[u8; 6], reason: u16
 /// Assoc resp body: capability(2) + status(2) + AID(2) + Supported Rates IE
 /// Source: IEEE 802.11-2020 §9.3.3.7
 pub fn build_assoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], aid: u16, seq: u16) -> usize {
+    build_assoc_or_reassoc_response(buf, bss, dest, aid, seq, false)
+}
+
+/// Build a Reassociation Response frame.
+/// Identical to Association Response but with FC subtype=3 (0x0030).
+/// Source: IEEE 802.11-2020 §9.3.3.8
+pub fn build_reassoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], aid: u16, seq: u16) -> usize {
+    build_assoc_or_reassoc_response(buf, bss, dest, aid, seq, true)
+}
+
+fn build_assoc_or_reassoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], aid: u16, seq: u16, reassoc: bool) -> usize {
     const FIXED: usize = 24 + 2 + 2 + 2; // header + cap + status + AID
     let total = FIXED + 10 + 3 + 28 + 6 + 24 + 26; // Rates+ERP+HT_Cap+ExtRates+HT_Oper+WMM
     if buf.len() < total {
@@ -398,8 +409,9 @@ pub fn build_assoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], aid
     }
     for b in buf[..total].iter_mut() { *b = 0; }
 
-    // FC: type=0 mgmt, subtype=1 assoc response → 0x0010
-    buf[0..2].copy_from_slice(&0x0010u16.to_le_bytes());
+    // FC: type=0 mgmt, subtype=1 assoc response (0x0010) or subtype=3 reassoc response (0x0030)
+    let fc: u16 = if reassoc { 0x0030 } else { 0x0010 };
+    buf[0..2].copy_from_slice(&fc.to_le_bytes());
     buf[4..10].copy_from_slice(dest);
     buf[10..16].copy_from_slice(&bss.bssid);
     buf[16..22].copy_from_slice(&bss.bssid);
@@ -443,4 +455,181 @@ pub fn parse_frame_addrs(frame: &[u8]) -> Option<([u8; 6], [u8; 6], [u8; 6])> {
     sa.copy_from_slice(&frame[10..16]);
     bssid.copy_from_slice(&frame[16..22]);
     Some((da, sa, bssid))
+}
+
+// ============================================================================
+// ADDBA Response (Block Ack)
+// ============================================================================
+
+/// Build an ADDBA Response frame.
+/// Source: IEEE 802.11-2020 §9.6.5.2, FreeBSD ieee80211_send_addba_resp(),
+///         OpenBSD ieee80211_recv_addba_req()
+///
+/// Layout: MAC header (24) + Category(1) + Action(1) + Token(1) +
+///         Status(2) + BA Params(2) + Timeout(2) = 33 bytes
+pub fn build_addba_response(
+    buf: &mut [u8],
+    bssid: &[u8; 6],
+    dest: &[u8; 6],
+    token: u8,
+    tid: u8,
+    win_size: u16,
+    timeout: u16,
+    seq: u16,
+) -> usize {
+    const TOTAL: usize = 24 + 9; // MAC header + action body
+    if buf.len() < TOTAL {
+        return 0;
+    }
+    for b in buf[..TOTAL].iter_mut() { *b = 0; }
+
+    // FC: type=0 mgmt, subtype=0xD action → 0x00D0
+    buf[0..2].copy_from_slice(&0x00D0u16.to_le_bytes());
+    buf[4..10].copy_from_slice(dest);
+    buf[10..16].copy_from_slice(bssid);
+    buf[16..22].copy_from_slice(bssid);
+    buf[22..24].copy_from_slice(&(seq << 4).to_le_bytes());
+
+    let body = 24;
+    // Category: Block Ack = 3 — IEEE 802.11-2020 Table 9-51
+    buf[body] = 3;
+    // Action: ADDBA Response = 1
+    buf[body + 1] = 1;
+    // Dialog Token
+    buf[body + 2] = token;
+    // Status Code: Success = 0
+    buf[body + 3..body + 5].copy_from_slice(&0u16.to_le_bytes());
+    // BA Parameters: A-MSDU(0) | BA policy(1=immediate) | TID | buffer size
+    // Bits [0]: A-MSDU supported = 0
+    // Bits [1]: BA policy = 1 (immediate)
+    // Bits [5:2]: TID
+    // Bits [15:6]: buffer size
+    let ba_params: u16 = 0x0002 | ((tid as u16 & 0xF) << 2) | ((win_size & 0x3FF) << 6);
+    buf[body + 5..body + 7].copy_from_slice(&ba_params.to_le_bytes());
+    // BA Timeout Value
+    buf[body + 7..body + 9].copy_from_slice(&timeout.to_le_bytes());
+
+    TOTAL
+}
+
+/// Build a DELBA frame (Delete Block Ack).
+/// Source: IEEE 802.11-2020 §9.6.5.4
+///
+/// Layout: MAC header (24) + Category(1) + Action(1) + DELBA params(2) +
+///         Reason(2) = 30 bytes
+pub fn build_delba(
+    buf: &mut [u8],
+    bssid: &[u8; 6],
+    dest: &[u8; 6],
+    tid: u8,
+    initiator: bool,
+    reason: u16,
+    seq: u16,
+) -> usize {
+    const TOTAL: usize = 24 + 6;
+    if buf.len() < TOTAL {
+        return 0;
+    }
+    for b in buf[..TOTAL].iter_mut() { *b = 0; }
+
+    // FC: type=0 mgmt, subtype=0xD action → 0x00D0
+    buf[0..2].copy_from_slice(&0x00D0u16.to_le_bytes());
+    buf[4..10].copy_from_slice(dest);
+    buf[10..16].copy_from_slice(bssid);
+    buf[16..22].copy_from_slice(bssid);
+    buf[22..24].copy_from_slice(&(seq << 4).to_le_bytes());
+
+    let body = 24;
+    // Category: Block Ack = 3
+    buf[body] = 3;
+    // Action: DELBA = 2
+    buf[body + 1] = 2;
+    // DELBA Parameters: bits [11]: initiator, bits [15:12]: TID
+    let delba_params: u16 = ((initiator as u16) << 11) | ((tid as u16 & 0xF) << 12);
+    buf[body + 2..body + 4].copy_from_slice(&delba_params.to_le_bytes());
+    // Reason Code
+    buf[body + 4..body + 6].copy_from_slice(&reason.to_le_bytes());
+
+    TOTAL
+}
+
+// ============================================================================
+// Association Request IE Parsing
+// ============================================================================
+
+/// Parsed IEs from an association/reassociation request body.
+pub struct AssocIes {
+    /// Capability info from fixed fields
+    pub cap_info: u16,
+    /// HT Capabilities info word from IE 45 (0 if not present)
+    pub ht_cap: u16,
+    /// A-MPDU params byte from IE 45 (0 if not present)
+    pub ht_ampdu_param: u8,
+    /// Whether HT Capabilities IE was present
+    pub has_ht: bool,
+    /// SSID from IE 0 (length, then bytes). ssid_len=0 if not found.
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+}
+
+/// Parse IEs from an assoc/reassoc request frame body (after MAC header).
+/// For AssocReq: body starts at cap_info(2) + listen_interval(2) + IEs
+/// For ReassocReq: body starts at cap_info(2) + listen_interval(2) + current_ap(6) + IEs
+///
+/// Source: IEEE 802.11-2020 §9.3.3.6 (Assoc), §9.3.3.8 (Reassoc)
+/// FreeBSD hostap_recv_mgmt() step 7, OpenBSD ieee80211_recv_assoc_req()
+pub fn parse_assoc_ies(body: &[u8], is_reassoc: bool) -> Option<AssocIes> {
+    let fixed_len = if is_reassoc { 10 } else { 4 }; // cap(2)+listen(2) [+current_ap(6)]
+    if body.len() < fixed_len {
+        return None;
+    }
+
+    let cap_info = u16::from_le_bytes([body[0], body[1]]);
+
+    let mut result = AssocIes {
+        cap_info,
+        ht_cap: 0,
+        ht_ampdu_param: 0,
+        has_ht: false,
+        ssid: [0; 32],
+        ssid_len: 0,
+    };
+
+    // Walk IEs
+    let mut pos = fixed_len;
+    while pos + 2 <= body.len() {
+        let ie_id = body[pos];
+        let ie_len = body[pos + 1] as usize;
+        if pos + 2 + ie_len > body.len() {
+            break; // truncated IE
+        }
+        let ie_data = &body[pos + 2..pos + 2 + ie_len];
+
+        match ie_id {
+            // SSID (IE 0)
+            0 => {
+                let len = ie_len.min(32);
+                result.ssid[..len].copy_from_slice(&ie_data[..len]);
+                result.ssid_len = len as u8;
+            }
+            // HT Capabilities (IE 45) — IEEE 802.11-2020 §9.4.2.55
+            45 => {
+                if ie_len >= 2 {
+                    result.ht_cap = u16::from_le_bytes([ie_data[0], ie_data[1]]);
+                    result.has_ht = true;
+                }
+                if ie_len >= 3 {
+                    result.ht_ampdu_param = ie_data[2];
+                }
+            }
+            // RSN (IE 48) — stub, no validation yet
+            // TODO: parse RSN IE for security negotiation
+            48 => {}
+            _ => {}
+        }
+
+        pos += 2 + ie_len;
+    }
+
+    Some(result)
 }
