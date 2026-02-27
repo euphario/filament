@@ -21,7 +21,10 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod device;
+mod dhcp_server;
 mod rsh;
 mod tftp;
 
@@ -37,8 +40,9 @@ use userlib::ring::{SideEntry, side_msg, side_status};
 use userlib::syscall::Handle;
 use userlib::{uinfo, udebug, uerror};
 
-use device::{RxOffsetQueue, SmolDevice};
+use device::{RxOffsetQueue, SmolDevice, TxTracker, DataPathStats};
 use rsh::RemoteShell;
+use dhcp_server::DhcpServer;
 use tftp::TftpServer;
 use userlib::vfs_client::VfsClient;
 
@@ -52,8 +56,12 @@ const TAG_DHCP_FALLBACK_TIMER: u32 = 3;
 const TAG_RSH_SHELL_RESPONSE: u32 = 4;
 const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
 const DHCP_FALLBACK_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
-const NIC_PORT_NAME: &[u8] = b"net:0";
+const NIC_PORT_NAMES: &[&[u8]] = &[b"wifi:0"];
 const MAX_FRAME_SIZE: usize = 1514;
+/// AP mode: ipd IS the gateway — use a private subnet.
+const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
+const AP_PREFIX_LEN: u8 = 24;
+/// Client/fallback IP when DHCP fails (QEMU virtio-net, etc.)
 const STATIC_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const STATIC_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 const STATIC_PREFIX_LEN: u8 = 24;
@@ -69,7 +77,7 @@ const RSH_PORT: u16 = 23;
 // of the SmolStack that holds the SocketSet.
 // =============================================================================
 
-const SOCKET_SLOTS: usize = 5;
+const SOCKET_SLOTS: usize = 6;
 const UDP_META_SLOTS: usize = 8;
 const UDP_BUF_SIZE: usize = 4096;
 const TCP_BUF_SIZE: usize = 4096;
@@ -91,6 +99,13 @@ static mut TCP_TX_BUF: [u8; TCP_BUF_SIZE] = [0u8; TCP_BUF_SIZE];
 static mut TCP_RSH_RX_BUF: [u8; TCP_BUF_SIZE] = [0u8; TCP_BUF_SIZE];
 static mut TCP_RSH_TX_BUF: [u8; TCP_BUF_SIZE] = [0u8; TCP_BUF_SIZE];
 
+static mut DHCP_SRV_RX_META: [udp::PacketMetadata; UDP_META_SLOTS] =
+    [udp::PacketMetadata::EMPTY; UDP_META_SLOTS];
+static mut DHCP_SRV_RX_BUF: [u8; UDP_BUF_SIZE] = [0u8; UDP_BUF_SIZE];
+static mut DHCP_SRV_TX_META: [udp::PacketMetadata; UDP_META_SLOTS] =
+    [udp::PacketMetadata::EMPTY; UDP_META_SLOTS];
+static mut DHCP_SRV_TX_BUF: [u8; UDP_BUF_SIZE] = [0u8; UDP_BUF_SIZE];
+
 // =============================================================================
 // SmolStack — persistent smoltcp state
 // =============================================================================
@@ -103,7 +118,10 @@ struct SmolStack {
     udp_handle: SocketHandle,
     tcp_handle: SocketHandle,
     tcp_rsh_handle: SocketHandle,
-    dhcp_handle: SocketHandle,
+    /// None in AP mode (no DHCP client needed).
+    dhcp_handle: Option<SocketHandle>,
+    /// DHCP server socket (AP mode only, port 67).
+    dhcp_srv_handle: Option<SocketHandle>,
 }
 
 /// Global smoltcp stack. Initialized once, never moved.
@@ -156,6 +174,7 @@ struct IpdDriver {
     assigned_gateway: [u8; 4],
     assigned_prefix: u8,
     tftp: TftpServer,
+    dhcp_server: DhcpServer,
     rsh: RemoteShell,
     vfs_client: Option<VfsClient>,
     /// Currently watched rsh shell response handle (for unwatch on completion).
@@ -164,6 +183,21 @@ struct IpdDriver {
     /// ethd tags each RX CQE with the source port's group_id in IoCqe.flags.
     /// This ipd instance only processes frames matching its group_id.
     group_id: u8,
+    /// True when connected to a WiFi AP port (wifi:*). In AP mode ipd uses
+    /// a static IP and does NOT run DHCP client (no upstream to discover from).
+    ap_mode: bool,
+    /// TX pool offset tracker — maps SQE tags to pool offsets for reclaim.
+    tx_tracker: TxTracker,
+    /// Data path statistics.
+    stats: DataPathStats,
+    /// CQEs peeked but not yet acked. Ack deferred until after smoltcp
+    /// consumes RX frames, so the provider doesn't reclaim pool slots early.
+    pending_acks: u32,
+    /// Diagnostic: first 20 bytes of last RX frame (for `devc ipd get diag.rx`)
+    last_rx_hdr: [u8; 20],
+    last_rx_len: u32,
+    last_rx_offset: u32,
+    pool_base_diag: u64,
 }
 
 impl IpdDriver {
@@ -183,10 +217,19 @@ impl IpdDriver {
             assigned_gateway: [0; 4],
             assigned_prefix: 0,
             tftp: TftpServer::new(),
+            dhcp_server: DhcpServer::new(AP_IP, Ipv4Address::new(255, 255, 255, 0)),
             rsh: RemoteShell::new(),
             vfs_client: None,
             rsh_watched_handle: None,
             group_id: 0,
+            ap_mode: false,
+            tx_tracker: TxTracker::new(),
+            stats: DataPathStats::new(),
+            pending_acks: 0,
+            last_rx_hdr: [0u8; 20],
+            last_rx_len: 0,
+            last_rx_offset: 0,
+            pool_base_diag: 0,
         }
     }
 
@@ -195,24 +238,38 @@ impl IpdDriver {
     // =========================================================================
 
     fn try_discover_nic(&mut self, ctx: &mut dyn BusCtx) -> bool {
-        match ctx.discover_port_by_name(NIC_PORT_NAME) {
-            Ok(shmem_id) => {
+        // Fast path: use trigger port shmem_id from spawn context (works in tree mode)
+        if let Ok(shmem_id) = ctx.discover_port() {
+            udebug!("ipd", "nic_found_ctx"; shmem_id = shmem_id);
+            // In tree mode we're spawned by the wifi driver → AP mode
+            self.ap_mode = true;
+            return self.connect_nic(shmem_id, ctx);
+        }
+        // Fallback: query devd by name (works in root mode)
+        for name in NIC_PORT_NAMES {
+            if let Ok(shmem_id) = ctx.discover_port_by_name(name) {
                 udebug!("ipd", "nic_found"; shmem_id = shmem_id);
-                match ctx.connect_block_port(shmem_id) {
-                    Ok(port_id) => {
-                        self.nic_port = port_id;
-                        self.nic_state = NicState::Probing;
-                        udebug!("ipd", "nic_connected";);
-                        self.send_nic_query(ctx);
-                        true
-                    }
-                    Err(_) => {
-                        uerror!("ipd", "connect_failed";);
-                        false
-                    }
-                }
+                // wifi:* ports are AP mode, net:* ports would be client mode
+                self.ap_mode = name.starts_with(b"wifi:");
+                return self.connect_nic(shmem_id, ctx);
             }
-            Err(_) => false,
+        }
+        false
+    }
+
+    fn connect_nic(&mut self, shmem_id: u32, ctx: &mut dyn BusCtx) -> bool {
+        match ctx.connect_block_port(shmem_id) {
+            Ok(port_id) => {
+                self.nic_port = port_id;
+                self.nic_state = NicState::Probing;
+                udebug!("ipd", "nic_connected";);
+                self.send_nic_query(ctx);
+                true
+            }
+            Err(_) => {
+                uerror!("ipd", "connect_failed";);
+                false
+            }
         }
     }
 
@@ -270,7 +327,7 @@ impl IpdDriver {
 
         // Create Interface — start with NO IP address; DHCP will assign one.
         let iface = if let Some(port) = ctx.block_port(self.nic_port) {
-            let mut device = SmolDevice::new(port, &mut self.rx_queue, self.group_id);
+            let mut device = SmolDevice::new(port, &mut self.rx_queue, &mut self.tx_tracker, &mut self.stats, self.group_id);
             Interface::new(config, &mut device, now)
         } else {
             uerror!("ipd", "setup_failed"; reason = "no block port");
@@ -281,7 +338,8 @@ impl IpdDriver {
         // and the resulting SocketSet<'static> is stored in SMOL_STACK. The
         // buffer arrays are never accessed directly again.
         let (socket_storage, rx_meta, rx_buf, tx_meta, tx_buf, tcp_rx, tcp_tx,
-             tcp_rsh_rx, tcp_rsh_tx) = unsafe {
+             tcp_rsh_rx, tcp_rsh_tx,
+             dhcp_srv_rx_meta, dhcp_srv_rx_buf, dhcp_srv_tx_meta, dhcp_srv_tx_buf) = unsafe {
             (
                 &mut *(&raw mut SOCKET_STORAGE),
                 &mut *(&raw mut UDP_RX_META),
@@ -292,6 +350,10 @@ impl IpdDriver {
                 &mut *(&raw mut TCP_TX_BUF),
                 &mut *(&raw mut TCP_RSH_RX_BUF),
                 &mut *(&raw mut TCP_RSH_TX_BUF),
+                &mut *(&raw mut DHCP_SRV_RX_META),
+                &mut *(&raw mut DHCP_SRV_RX_BUF),
+                &mut *(&raw mut DHCP_SRV_TX_META),
+                &mut *(&raw mut DHCP_SRV_TX_BUF),
             )
         };
 
@@ -302,26 +364,49 @@ impl IpdDriver {
         let udp_rx = udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_buf[..]);
         let udp_tx = udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_buf[..]);
         let mut udp_socket = udp::Socket::new(udp_rx, udp_tx);
-        let _ = udp_socket.bind(TFTP_PORT);
+        if udp_socket.bind(TFTP_PORT).is_err() {
+            uerror!("ipd", "udp_bind_failed"; port = TFTP_PORT as u32);
+        }
         let udp_handle = sockets.add(udp_socket);
 
         // Create TCP socket for HTTP server
         let tcp_rx_buf = tcp::SocketBuffer::new(&mut tcp_rx[..]);
         let tcp_tx_buf = tcp::SocketBuffer::new(&mut tcp_tx[..]);
         let mut tcp_socket = tcp::Socket::new(tcp_rx_buf, tcp_tx_buf);
-        tcp_socket.listen(HTTP_PORT).ok();
+        if tcp_socket.listen(HTTP_PORT).is_err() {
+            uerror!("ipd", "tcp_listen_failed"; port = HTTP_PORT as u32);
+        }
         let tcp_handle = sockets.add(tcp_socket);
 
         // Create TCP socket for remote shell (port 23)
         let rsh_rx_buf = tcp::SocketBuffer::new(&mut tcp_rsh_rx[..]);
         let rsh_tx_buf = tcp::SocketBuffer::new(&mut tcp_rsh_tx[..]);
         let mut rsh_socket = tcp::Socket::new(rsh_rx_buf, rsh_tx_buf);
-        rsh_socket.listen(RSH_PORT).ok();
+        if rsh_socket.listen(RSH_PORT).is_err() {
+            uerror!("ipd", "tcp_listen_failed"; port = RSH_PORT as u32);
+        }
         let tcp_rsh_handle = sockets.add(rsh_socket);
 
-        // Create DHCP socket
-        let dhcp_socket = dhcpv4::Socket::new();
-        let dhcp_handle = sockets.add(dhcp_socket);
+        // Create DHCP socket (only in client mode — AP has no upstream)
+        let dhcp_handle = if !self.ap_mode {
+            let dhcp_socket = dhcpv4::Socket::new();
+            Some(sockets.add(dhcp_socket))
+        } else {
+            None
+        };
+
+        // Create DHCP server socket (AP mode only — serve IPs to clients)
+        let dhcp_srv_handle = if self.ap_mode {
+            let srv_rx = udp::PacketBuffer::new(&mut dhcp_srv_rx_meta[..], &mut dhcp_srv_rx_buf[..]);
+            let srv_tx = udp::PacketBuffer::new(&mut dhcp_srv_tx_meta[..], &mut dhcp_srv_tx_buf[..]);
+            let mut srv_socket = udp::Socket::new(srv_rx, srv_tx);
+            if srv_socket.bind(67).is_err() {
+                uerror!("ipd", "dhcp_srv_bind_failed"; port = 67u32);
+            }
+            Some(sockets.add(srv_socket))
+        } else {
+            None
+        };
 
         // Store persistent stack
         // SAFETY: SMOL_STACK is only written here (once) and read in poll_smoltcp.
@@ -333,14 +418,21 @@ impl IpdDriver {
                 tcp_handle,
                 tcp_rsh_handle,
                 dhcp_handle,
+                dhcp_srv_handle,
             });
         }
 
-        // Arm the DHCP fallback timer — if no DHCP response in 10s, use static IP
-        self.arm_dhcp_fallback_timer(ctx);
+        if self.ap_mode {
+            // AP mode: use static IP immediately, no DHCP
+            self.apply_ip_config(AP_IP, AP_PREFIX_LEN, AP_IP, IpState::StaticConfigured);
+            uinfo!("ipd", "ap_mode"; ip = "192.168.4.1/24");
+        } else {
+            // Client mode: arm DHCP fallback timer
+            self.arm_dhcp_fallback_timer(ctx);
+            udebug!("ipd", "dhcp_start";);
+        }
 
         udebug!("ipd", "smoltcp_ready"; sockets = SOCKET_SLOTS as u32);
-        udebug!("ipd", "dhcp_start";);
     }
 
     // =========================================================================
@@ -354,12 +446,23 @@ impl IpdDriver {
 
     fn arm_discovery_timer(&mut self, ctx: &mut dyn BusCtx) {
         if let Some(ref mut timer) = self.discovery_timer {
-            let _ = timer.set(DISCOVERY_INTERVAL_NS);
-        } else if let Ok(mut timer) = Timer::new() {
-            let _ = timer.set(DISCOVERY_INTERVAL_NS);
-            let handle = timer.handle();
-            let _ = ctx.watch_handle(handle, TAG_DISCOVERY_TIMER);
-            self.discovery_timer = Some(timer);
+            if timer.set(DISCOVERY_INTERVAL_NS).is_err() {
+                uerror!("ipd", "timer_set_failed"; tag = "discovery");
+            }
+        } else {
+            match Timer::new() {
+                Ok(mut timer) => {
+                    if timer.set(DISCOVERY_INTERVAL_NS).is_err() {
+                        uerror!("ipd", "timer_set_failed"; tag = "discovery_new");
+                    }
+                    let handle = timer.handle();
+                    if ctx.watch_handle(handle, TAG_DISCOVERY_TIMER).is_err() {
+                        uerror!("ipd", "watch_failed"; tag = "discovery");
+                    }
+                    self.discovery_timer = Some(timer);
+                }
+                Err(_) => uerror!("ipd", "timer_create_failed"; tag = "discovery"),
+            }
         }
     }
 
@@ -370,21 +473,39 @@ impl IpdDriver {
         };
 
         if let Some(ref mut timer) = self.poll_timer {
-            let _ = timer.set(ns);
-        } else if let Ok(mut timer) = Timer::new() {
-            let _ = timer.set(ns);
-            let handle = timer.handle();
-            let _ = ctx.watch_handle(handle, TAG_POLL_TIMER);
-            self.poll_timer = Some(timer);
+            if timer.set(ns).is_err() {
+                uerror!("ipd", "timer_set_failed"; tag = "poll");
+            }
+        } else {
+            match Timer::new() {
+                Ok(mut timer) => {
+                    if timer.set(ns).is_err() {
+                        uerror!("ipd", "timer_set_failed"; tag = "poll_new");
+                    }
+                    let handle = timer.handle();
+                    if ctx.watch_handle(handle, TAG_POLL_TIMER).is_err() {
+                        uerror!("ipd", "watch_failed"; tag = "poll");
+                    }
+                    self.poll_timer = Some(timer);
+                }
+                Err(_) => uerror!("ipd", "timer_create_failed"; tag = "poll"),
+            }
         }
     }
 
     fn arm_dhcp_fallback_timer(&mut self, ctx: &mut dyn BusCtx) {
-        if let Ok(mut timer) = Timer::new() {
-            let _ = timer.set(DHCP_FALLBACK_TIMEOUT_NS);
-            let handle = timer.handle();
-            let _ = ctx.watch_handle(handle, TAG_DHCP_FALLBACK_TIMER);
-            self.dhcp_fallback_timer = Some(timer);
+        match Timer::new() {
+            Ok(mut timer) => {
+                if timer.set(DHCP_FALLBACK_TIMEOUT_NS).is_err() {
+                    uerror!("ipd", "timer_set_failed"; tag = "dhcp_fb");
+                }
+                let handle = timer.handle();
+                if ctx.watch_handle(handle, TAG_DHCP_FALLBACK_TIMER).is_err() {
+                    uerror!("ipd", "watch_failed"; tag = "dhcp_fb");
+                }
+                self.dhcp_fallback_timer = Some(timer);
+            }
+            Err(_) => uerror!("ipd", "timer_create_failed"; tag = "dhcp_fb"),
         }
     }
 
@@ -410,9 +531,13 @@ impl IpdDriver {
         if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
             stack.iface.update_ip_addrs(|addrs| {
                 addrs.clear();
-                let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(ip), prefix));
+                if addrs.push(IpCidr::new(IpAddress::Ipv4(ip), prefix)).is_err() {
+                    uerror!("ipd", "ip_push_failed"; ip0 = ip_bytes[0] as u32, ip1 = ip_bytes[1] as u32);
+                }
             });
-            stack.iface.routes_mut().add_default_ipv4_route(gateway).ok();
+            if stack.iface.routes_mut().add_default_ipv4_route(gateway).is_err() {
+                uerror!("ipd", "route_add_failed"; gw0 = gw_bytes[0] as u32, gw1 = gw_bytes[1] as u32);
+            }
         }
 
         let state_str = match state {
@@ -444,28 +569,69 @@ impl IpdDriver {
 
     /// Drain CQEs from the NIC DataPort into the RX offset queue.
     ///
-    /// Zero-copy: only stores (offset, len) pairs — frame data stays in pool.
-    /// Filters by group_id: ethd sets IoCqe.flags = group_id for bridge demux.
-    /// This ipd instance only accepts frames matching its own group_id.
-    fn drain_rx(&mut self, ctx: &mut dyn BusCtx) {
+    /// Uses deferred ack: peeks CQEs without advancing shared cq_head.
+    /// Separates TX completions (CQE_FLAG_TX_DONE) from RX data CQEs.
+    /// TX completions free the consumer pool slot. RX CQEs are buffered.
+    /// Returns the number of RX CQEs peeked (for later ack).
+    fn drain_rx(&mut self, ctx: &mut dyn BusCtx) -> u32 {
+        use userlib::ring::io_status::CQE_FLAG_TX_DONE;
+
         let port_id = self.nic_port;
+        let mut rx_count = 0u32;
+        let mut total_peeked = 0u32;
+
         if let Some(port) = ctx.block_port(port_id) {
-            for _ in 0..16 {
-                if let Some(completion) = port.poll_completion() {
-                    // Filter: only accept CQEs for our bridge group
-                    if completion.flags != self.group_id as u16 {
-                        continue;
+            let ring_mask = port.ring_mask();
+            for _ in 0..32 {
+                let cqe = match port.peek_completion() {
+                    Some(c) => c,
+                    None => break,
+                };
+                total_peeked += 1;
+
+                if cqe.flags & CQE_FLAG_TX_DONE != 0 {
+                    // TX completion — reclaim consumer pool slot
+                    if let Some(offset) = self.tx_tracker.complete(cqe.tag, ring_mask) {
+                        port.free(offset);
+                        self.stats.tx_cqe_reclaimed += 1;
                     }
-                    let offset = completion.result;
-                    let len = completion.transferred;
-                    if len > 0 && len <= MAX_FRAME_SIZE as u32 {
-                        self.rx_queue.push(offset, len);
+                    continue;
+                }
+
+                // RX data CQE — filter by group_id (stored in lower bits of flags)
+                let group = cqe.flags & 0x00FF;
+                if group != self.group_id as u16 {
+                    continue;
+                }
+
+                let offset = cqe.result;
+                let len = cqe.transferred;
+                if len > 0 && len <= MAX_FRAME_SIZE as u32 {
+                    self.rx_queue.push(offset, len);
+                    rx_count += 1;
+                    self.stats.rx_frames += 1;
+                    self.stats.rx_bytes += len as u64;
+
+                    // Capture diagnostic: first bytes of frame for debugging
+                    self.last_rx_offset = offset;
+                    self.last_rx_len = len;
+                    let cap = 20.min(len as usize);
+                    if let Some(slice) = port.pool_slice(offset, cap as u32) {
+                        self.last_rx_hdr[..cap].copy_from_slice(&slice[..cap]);
                     }
-                } else {
-                    break;
+                    if self.pool_base_diag == 0 {
+                        self.pool_base_diag = port.pool_ptr() as u64;
+                    }
                 }
             }
+
+            // DON'T ack here — defer until after smoltcp consumes the RX frames.
+            // If we ack now, the provider reclaims pool slots that smoltcp
+            // hasn't read yet (use-after-free on pool memory).
+            self.pending_acks += total_peeked;
         }
+
+        rx_count
     }
 
     /// Drain sidechannel responses from the NIC.
@@ -509,13 +675,29 @@ impl IpdDriver {
 
         // Poll the interface (processes RX queue, handles ARP/ICMP)
         if let Some(port) = ctx.block_port(self.nic_port) {
-            let mut device = SmolDevice::new(port, &mut self.rx_queue, self.group_id);
+            let mut device = SmolDevice::new(
+                port,
+                &mut self.rx_queue,
+                &mut self.tx_tracker,
+                &mut self.stats,
+                self.group_id,
+            );
             stack.iface.poll(now, &mut device, &mut stack.sockets);
         }
 
+        // Ack peeked CQEs NOW — smoltcp has consumed the RX frames via
+        // IpdRxToken, so the provider can safely reclaim pool slots.
+        if self.pending_acks > 0 {
+            if let Some(port) = ctx.block_port(self.nic_port) {
+                port.ack_completions(self.pending_acks);
+            }
+            self.pending_acks = 0;
+        }
+
         // Poll DHCP socket for configuration events (only when DHCP is enabled)
+        if let Some(dhcp_handle) = stack.dhcp_handle {
         if self.ip_state == IpState::Unconfigured || self.ip_state == IpState::DhcpConfigured {
-            let event = stack.sockets.get_mut::<dhcpv4::Socket>(stack.dhcp_handle).poll();
+            let event = stack.sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
             match event {
                 Some(dhcpv4::Event::Configured(config)) => {
                     let ip = config.address.address();
@@ -525,7 +707,9 @@ impl IpdDriver {
 
                     // Cancel the fallback timer
                     if let Some(ref timer) = self.dhcp_fallback_timer {
-                        let _ = ctx.unwatch_handle(timer.handle());
+                        if ctx.unwatch_handle(timer.handle()).is_err() {
+                            uerror!("ipd", "unwatch_failed"; tag = "dhcp_fallback");
+                        }
                     }
                     self.dhcp_fallback_timer = None;
                 }
@@ -542,6 +726,7 @@ impl IpdDriver {
                 None => {}
             }
         }
+        } // if let Some(dhcp_handle)
 
         // Process TFTP socket (UDP)
         {
@@ -551,7 +736,22 @@ impl IpdDriver {
                 let mut resp_buf = [0u8; 516]; // 4 header + 512 data
                 let resp_len = self.tftp.handle(data, remote, &mut resp_buf, &mut self.vfs_client);
                 if resp_len > 0 {
-                    let _ = sock.send_slice(&resp_buf[..resp_len], remote);
+                    if sock.send_slice(&resp_buf[..resp_len], remote).is_err() {
+                        uerror!("ipd", "udp_send_failed"; len = resp_len as u32);
+                    }
+                }
+            }
+        }
+
+        // Process DHCP server socket (AP mode)
+        if let Some(dhcp_srv_handle) = stack.dhcp_srv_handle {
+            let sock = stack.sockets.get_mut::<udp::Socket>(dhcp_srv_handle);
+            while let Ok((data, _meta)) = sock.recv() {
+                let mut resp_buf = [0u8; 576];
+                if let Some((resp_len, dest)) = self.dhcp_server.handle(data, &mut resp_buf) {
+                    if sock.send_slice(&resp_buf[..resp_len], dest).is_err() {
+                        uerror!("ipd", "dhcp_srv_send_failed"; len = resp_len as u32);
+                    }
                 }
             }
         }
@@ -572,18 +772,26 @@ impl IpdDriver {
         match (self.rsh_watched_handle, new_handle) {
             (None, Some(h)) => {
                 // New pending command — watch the channel
-                let _ = ctx.watch_handle(h, TAG_RSH_SHELL_RESPONSE);
+                if ctx.watch_handle(h, TAG_RSH_SHELL_RESPONSE).is_err() {
+                    uerror!("ipd", "watch_failed"; tag = "rsh");
+                }
                 self.rsh_watched_handle = Some(h);
             }
             (Some(old), None) => {
                 // Command completed — unwatch
-                let _ = ctx.unwatch_handle(old);
+                if ctx.unwatch_handle(old).is_err() {
+                    uerror!("ipd", "unwatch_failed"; tag = "rsh");
+                }
                 self.rsh_watched_handle = None;
             }
             (Some(old), Some(new)) if old.0 != new.0 => {
                 // Handle changed (shouldn't happen, but be safe)
-                let _ = ctx.unwatch_handle(old);
-                let _ = ctx.watch_handle(new, TAG_RSH_SHELL_RESPONSE);
+                if ctx.unwatch_handle(old).is_err() {
+                    uerror!("ipd", "unwatch_failed"; tag = "rsh_old");
+                }
+                if ctx.watch_handle(new, TAG_RSH_SHELL_RESPONSE).is_err() {
+                    uerror!("ipd", "watch_failed"; tag = "rsh_new");
+                }
                 self.rsh_watched_handle = Some(new);
             }
             _ => {} // No change
@@ -591,7 +799,7 @@ impl IpdDriver {
 
         // Re-poll after socket processing (smoltcp may have TX to send)
         if let Some(port) = ctx.block_port(self.nic_port) {
-            let mut device = SmolDevice::new(port, &mut self.rx_queue, self.group_id);
+            let mut device = SmolDevice::new(port, &mut self.rx_queue, &mut self.tx_tracker, &mut self.stats, self.group_id);
             stack.iface.poll(now, &mut device, &mut stack.sockets);
         }
 
@@ -634,6 +842,8 @@ impl IpdDriver {
                 buf[..len].copy_from_slice(&s[..len]);
                 len
             }
+            b"stats" => self.format_stats(buf),
+            b"diag.rx" => self.format_diag_rx(buf),
             _ => 0,
         }
     }
@@ -679,6 +889,77 @@ impl IpdDriver {
         w.pos
     }
 
+    fn format_stats(&self, buf: &mut [u8]) -> usize {
+        use core::fmt::Write;
+        struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+        impl Write for BufWriter<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let remaining = self.buf.len() - self.pos;
+                let to_write = bytes.len().min(remaining);
+                self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
+                self.pos += to_write;
+                Ok(())
+            }
+        }
+        let mut w = BufWriter { buf, pos: 0 };
+        let s = &self.stats;
+        let _ = core::write!(w,
+            "rx_frames={}\nrx_bytes={}\ntx_frames={}\ntx_bytes={}\n\
+             tx_pool_drops={}\nrx_pool_full={}\ntx_cqe_reclaimed={}\n",
+            s.rx_frames, s.rx_bytes, s.tx_frames, s.tx_bytes,
+            s.tx_pool_drops, s.rx_pool_full, s.tx_cqe_reclaimed);
+        w.pos
+    }
+
+    fn format_diag_rx(&self, buf: &mut [u8]) -> usize {
+        use core::fmt::Write;
+        struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+        impl Write for BufWriter<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let remaining = self.buf.len() - self.pos;
+                let to_write = bytes.len().min(remaining);
+                self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
+                self.pos += to_write;
+                Ok(())
+            }
+        }
+        let mut w = BufWriter { buf, pos: 0 };
+        let _ = core::write!(w, "last_rx_len={}\nlast_rx_offset={}\npool_base=0x{:x}\n",
+            self.last_rx_len, self.last_rx_offset, self.pool_base_diag);
+        // Hex dump of first bytes
+        let _ = core::write!(w, "hdr=");
+        let cap = 20.min(self.last_rx_len as usize);
+        for i in 0..cap {
+            let _ = core::write!(w, "{:02x}", self.last_rx_hdr[i]);
+            if i % 6 == 5 && i + 1 < cap { let _ = core::write!(w, " "); }
+        }
+        let _ = core::write!(w, "\n");
+        // Parse Ethernet header if enough data
+        if cap >= 14 {
+            let _ = core::write!(w, "dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                self.last_rx_hdr[0], self.last_rx_hdr[1], self.last_rx_hdr[2],
+                self.last_rx_hdr[3], self.last_rx_hdr[4], self.last_rx_hdr[5]);
+            let _ = core::write!(w, "src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                self.last_rx_hdr[6], self.last_rx_hdr[7], self.last_rx_hdr[8],
+                self.last_rx_hdr[9], self.last_rx_hdr[10], self.last_rx_hdr[11]);
+            let ethertype = ((self.last_rx_hdr[12] as u16) << 8) | self.last_rx_hdr[13] as u16;
+            let _ = core::write!(w, "ethertype=0x{:04x}\n", ethertype);
+        }
+        let s = &self.stats;
+        let _ = core::write!(w, "rx_frames={}\ntx_frames={}\ntx_pool_drops={}\npending_acks={}\n",
+            s.rx_frames, s.tx_frames, s.tx_pool_drops, self.pending_acks);
+        let _ = core::write!(w, "mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]);
+        let _ = core::write!(w, "ip={}.{}.{}.{}/{}\n",
+            self.assigned_ip[0], self.assigned_ip[1], self.assigned_ip[2], self.assigned_ip[3],
+            self.assigned_prefix);
+        let _ = core::write!(w, "ap_mode={}\nnic_state={}\n",
+            self.ap_mode, self.nic_state as u8);
+        w.pos
+    }
+
     fn ipd_config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
         match key {
             b"ip" => {
@@ -721,25 +1002,35 @@ impl IpdDriver {
             b"dhcp" => {
                 match value {
                     b"on" => {
-                        self.ip_state = IpState::Unconfigured;
-                        self.arm_dhcp_fallback_timer(ctx);
                         if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
-                            stack.sockets.get_mut::<dhcpv4::Socket>(stack.dhcp_handle).reset();
+                            if let Some(dh) = stack.dhcp_handle {
+                                self.ip_state = IpState::Unconfigured;
+                                self.arm_dhcp_fallback_timer(ctx);
+                                stack.sockets.get_mut::<dhcpv4::Socket>(dh).reset();
+                                uinfo!("ipd", "dhcp_enabled";);
+                                copy_str(buf, "OK\n")
+                            } else {
+                                copy_str(buf, "ERR no dhcp in ap mode\n")
+                            }
+                        } else {
+                            copy_str(buf, "ERR no stack\n")
                         }
-                        uinfo!("ipd", "dhcp_enabled";);
-                        copy_str(buf, "OK\n")
                     }
                     b"off" => {
                         if self.ip_state == IpState::DhcpConfigured || self.ip_state == IpState::Unconfigured {
                             self.ip_state = IpState::StaticConfigured;
                         }
                         if let Some(ref timer) = self.dhcp_fallback_timer {
-                            let _ = ctx.unwatch_handle(timer.handle());
+                            if ctx.unwatch_handle(timer.handle()).is_err() {
+                                uerror!("ipd", "unwatch_failed"; tag = "dhcp_off");
+                            }
                         }
                         self.dhcp_fallback_timer = None;
                         // Reset DHCP socket to stop sending requests
                         if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
-                            stack.sockets.get_mut::<dhcpv4::Socket>(stack.dhcp_handle).reset();
+                            if let Some(dh) = stack.dhcp_handle {
+                                stack.sockets.get_mut::<dhcpv4::Socket>(dh).reset();
+                            }
                         }
                         uinfo!("ipd", "dhcp_disabled";);
                         copy_str(buf, "OK\n")
@@ -775,7 +1066,9 @@ impl IpdDriver {
 
         if !sock.is_active() && !sock.is_listening() {
             // Connection closed — re-listen for next connection
-            sock.listen(HTTP_PORT).ok();
+            if sock.listen(HTTP_PORT).is_err() {
+                uerror!("ipd", "http_relisten_failed";);
+            }
             return;
         }
 
@@ -808,7 +1101,9 @@ impl IpdDriver {
 
         // Send response
         if resp_len > 0 {
-            let _ = sock.send_slice(&resp[..resp_len]);
+            if sock.send_slice(&resp[..resp_len]).is_err() {
+                uerror!("ipd", "http_send_failed"; len = resp_len as u32);
+            }
         }
 
         // Close our end after sending
@@ -1004,7 +1299,9 @@ impl Driver for IpdDriver {
                 info[pos..pos + slen].copy_from_slice(&suffix[..slen]);
                 pos += slen;
 
-                let _ = ctx.respond_info(msg.seq_id, &info[..pos]);
+                if ctx.respond_info(msg.seq_id, &info[..pos]).is_err() {
+                    uerror!("ipd", "respond_info_failed";);
+                }
                 Disposition::Handled
             }
             // CONFIG_GET and CONFIG_SET handled by bus framework via
@@ -1042,13 +1339,17 @@ impl Driver for IpdDriver {
         match tag {
             TAG_DISCOVERY_TIMER if self.discovering => {
                 if let Some(ref mut timer) = self.discovery_timer {
-                    let _ = timer.wait();
+                    if timer.wait().is_err() {
+                        uerror!("ipd", "timer_wait_failed"; tag = "discovery");
+                    }
                 }
 
                 if self.try_discover_nic(ctx) {
                     self.discovering = false;
                     if let Some(ref timer) = self.discovery_timer {
-                        let _ = ctx.unwatch_handle(timer.handle());
+                        if ctx.unwatch_handle(timer.handle()).is_err() {
+                            uerror!("ipd", "unwatch_failed"; tag = "discovery");
+                        }
                     }
                     self.discovery_timer = None;
                     udebug!("ipd", "nic_probing";);
@@ -1058,7 +1359,9 @@ impl Driver for IpdDriver {
             }
             TAG_POLL_TIMER => {
                 if let Some(ref mut timer) = self.poll_timer {
-                    let _ = timer.wait();
+                    if timer.wait().is_err() {
+                        uerror!("ipd", "timer_wait_failed"; tag = "poll");
+                    }
                 }
 
                 if self.nic_state == NicState::Up {
@@ -1068,12 +1371,16 @@ impl Driver for IpdDriver {
             }
             TAG_DHCP_FALLBACK_TIMER => {
                 if let Some(ref mut timer) = self.dhcp_fallback_timer {
-                    let _ = timer.wait();
+                    if timer.wait().is_err() {
+                        uerror!("ipd", "timer_wait_failed"; tag = "dhcp_fb");
+                    }
                 }
                 self.apply_static_fallback();
                 // Clean up the one-shot timer
                 if let Some(ref timer) = self.dhcp_fallback_timer {
-                    let _ = ctx.unwatch_handle(timer.handle());
+                    if ctx.unwatch_handle(timer.handle()).is_err() {
+                        uerror!("ipd", "unwatch_failed"; tag = "dhcp_fb");
+                    }
                 }
                 self.dhcp_fallback_timer = None;
             }
@@ -1086,14 +1393,16 @@ impl Driver for IpdDriver {
                     // Update watch state
                     if self.rsh.pending_handle().is_none() {
                         if let Some(old) = self.rsh_watched_handle.take() {
-                            let _ = ctx.unwatch_handle(old);
+                            if ctx.unwatch_handle(old).is_err() {
+                                uerror!("ipd", "unwatch_failed"; tag = "rsh_evt");
+                            }
                         }
                     }
 
                     // Re-poll to flush any TCP data
                     let now = Self::smoltcp_now();
                     if let Some(port) = ctx.block_port(self.nic_port) {
-                        let mut device = SmolDevice::new(port, &mut self.rx_queue, self.group_id);
+                        let mut device = SmolDevice::new(port, &mut self.rx_queue, &mut self.tx_tracker, &mut self.stats, self.group_id);
                         stack.iface.poll(now, &mut device, &mut stack.sockets);
                     }
                 }
@@ -1124,6 +1433,8 @@ const IPD_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_write(b"dhcp"),
     ConfigKey::read_only(b"mac"),
     ConfigKey::read_only(b"state"),
+    ConfigKey::read_only(b"stats"),
+    ConfigKey::read_only(b"diag.rx"),
 ];
 
 impl Driver for IpdDriverWrapper {
