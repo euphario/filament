@@ -126,21 +126,29 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
     let actual_len = buf_len & 0x7FFFFFFF;
 
     if cursor_mode {
-        // Cursor-based non-destructive batch read.
+        // Cursor-based non-destructive batch read with optional filters.
         // Packs multiple records into the buffer to reduce syscall count.
-        // Format: [cursor:4]([len:2][text:len])* — iterate until buffer full.
-        if actual_len < 7 {
-            // Need room for cursor(4) + at least one len(2) + 1 byte
+        //
+        // Input header (9 bytes):
+        //   [cursor:4][from_ms:4][max_level:1]
+        //   from_ms=0 means no timestamp filter, max_level=0xFF means no level filter.
+        //
+        // Output: [cursor:4]([len:2][text:len])* — iterate until buffer full.
+        const HEADER_LEN: usize = 9;
+        if actual_len < HEADER_LEN + 3 {
+            // Need room for header + at least one len(2) + 1 byte
             return KernelError::InvalidArg.to_errno();
         }
 
-        // Read cursor from first 4 bytes of user buffer
-        let mut cursor_bytes = [0u8; 4];
-        match uaccess::copy_from_user(&mut cursor_bytes, buf_ptr) {
+        // Read header from user buffer
+        let mut hdr = [0u8; HEADER_LEN];
+        match uaccess::copy_from_user(&mut hdr, buf_ptr) {
             Ok(_) => {}
             Err(_) => return KernelError::BadAddress.to_errno(),
         }
-        let mut cursor = u32::from_le_bytes(cursor_bytes);
+        let mut cursor = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let from_ms = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let max_level = hdr[8];
 
         // cursor=0 means "start from oldest". Snap to tail so we don't
         // land in the middle of a record that wraps the ring boundary.
@@ -149,7 +157,7 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
             cursor = ring.tail_cursor();
         }
 
-        let text_space = actual_len - 4;
+        let text_space = actual_len - 4; // output starts at buf[4]
         let mut out_buf = [0u8; 4096]; // Stack buffer for packed records
         let mut out_pos: usize = 0;
 
@@ -170,6 +178,27 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
             let Some((len, new_cursor)) = result else {
                 break;
             };
+
+            // Filter on binary header before formatting.
+            // RecordHeader: [total_len:2][ts_ms:4][level:1][flags:1]
+            if len >= 8 {
+                if from_ms > 0 {
+                    let ts = u32::from_le_bytes([
+                        record_buf[2], record_buf[3], record_buf[4], record_buf[5],
+                    ]);
+                    if ts < from_ms {
+                        cursor = new_cursor;
+                        continue;
+                    }
+                }
+                if max_level != 0xFF {
+                    let level = record_buf[6];
+                    if level > max_level {
+                        cursor = new_cursor;
+                        continue;
+                    }
+                }
+            }
 
             let text_len = crate::klog::format_record(&record_buf[..len], &mut text_buf);
             if text_len == 0 {
@@ -199,7 +228,7 @@ pub(super) fn sys_klog_read(buf_ptr: u64, buf_len: usize) -> i64 {
             return 0;
         }
 
-        // Write back updated cursor
+        // Write back updated cursor (always at buf[0..4])
         let new_cursor_bytes = cursor.to_le_bytes();
         if uaccess::copy_to_user(buf_ptr, &new_cursor_bytes).is_err() {
             return KernelError::BadAddress.to_errno();

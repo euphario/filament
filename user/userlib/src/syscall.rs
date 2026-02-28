@@ -329,17 +329,26 @@ pub fn set_resource_limits(child_pid: u32, max_channels: u16, max_ports: u16, ma
     }
 }
 
-/// Non-destructive read from kernel log ring at a cursor position.
+/// Non-destructive read from kernel log ring at a cursor position with filters.
 ///
 /// The `cursor` is read and updated: pass 0 to start from oldest record.
+/// `from_ms`: only return records with ts_ms >= this value (0 = no filter).
+/// `max_level`: only return records with level <= this value (0xFF = no filter).
 /// Returns the number of formatted text bytes, or 0 if caught up.
 /// The formatted text is written to `buf[4..]`, cursor to `buf[0..4]`.
 pub fn klog_read_at(buf: &mut [u8], cursor: &mut u32) -> i64 {
-    if buf.len() < 5 {
-        return -22; // EINVAL
+    klog_read_filtered(buf, cursor, 0, 0xFF)
+}
+
+/// Non-destructive read with timestamp and level filters applied in-kernel.
+pub fn klog_read_filtered(buf: &mut [u8], cursor: &mut u32, from_ms: u32, max_level: u8) -> i64 {
+    if buf.len() < 13 {
+        return -22; // EINVAL: need 9-byte header + at least len(2) + 1 byte
     }
-    // Write cursor into first 4 bytes
+    // Write 9-byte header: cursor(4) + from_ms(4) + max_level(1)
     buf[0..4].copy_from_slice(&cursor.to_le_bytes());
+    buf[4..8].copy_from_slice(&from_ms.to_le_bytes());
+    buf[8] = max_level;
 
     // Signal cursor mode with bit 31 set on length
     let len_with_flag = buf.len() | 0x80000000;
