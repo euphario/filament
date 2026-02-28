@@ -323,6 +323,15 @@ pub struct RxDataFrame {
     pub len: u16,
 }
 
+/// RX Null Function / PM status notification extracted from non-HDR_TRANS data frames.
+/// Used for power save state tracking.
+pub struct RxPmEvent {
+    /// Source MAC of the STA
+    pub mac: [u8; 6],
+    /// PM bit from FC byte 1 bit 4: true = entering PS, false = exiting PS
+    pub pm: bool,
+}
+
 impl Mt7996Dev {
     // ========================================================================
     // mt7996_dma_disable() — EXACT Linux translation
@@ -781,18 +790,21 @@ impl Mt7996Dev {
     /// Header-translated data frames (firmware sets HDR_TRANS bit) are
     /// copied into `data_buf` before descriptor reset.
     ///
-    /// Returns (entries_processed, mgmt_frame_count, data_frame_count).
+    /// Returns (entries_processed, mgmt_frame_count, data_frame_count, pm_event_count).
     pub fn rx_classify(&self, q: &mut RxQueueInfo, counters: &mut RxMibCounters,
                        mgmt_frames: &mut [wifi80211::types::RxMgmtFrame],
                        max_mgmt: usize,
                        data_frames: &mut [RxDataFrame],
                        max_data: usize,
-                       data_buf: &mut [u8]) -> (u32, usize, usize) {
+                       data_buf: &mut [u8],
+                       pm_events: &mut [RxPmEvent],
+                       max_pm: usize) -> (u32, usize, usize, usize) {
         let mut data_buf_pos: u32 = 0;
 
         let mut count = 0u32;
         let mut mgmt_count = 0usize;
         let mut data_count = 0usize;
+        let mut pm_count = 0usize;
 
         while q.queued > 0 {
             let i = q.tail as usize;
@@ -837,16 +849,38 @@ impl Mt7996Dev {
                 let remove_pad = ((rxd2 >> 13) & 0x7) as usize;
                 frame_ofs += 2 * remove_pad;
 
-                // Only read FC byte for non-header-translated frames
-                if !hdr_trans && frame_ofs + 1 < q.buf_size as usize {
+                // Only read FC bytes for non-header-translated frames
+                if !hdr_trans && frame_ofs + 2 < q.buf_size as usize {
                     let fc0 = unsafe {
                         core::ptr::read_volatile((buf_base as *const u8).add(frame_ofs))
                     };
-                    // Check FC type field: bits [3:2] = 0 means management frame
+                    let fc1 = unsafe {
+                        core::ptr::read_volatile((buf_base as *const u8).add(frame_ofs + 1))
+                    };
                     let fc_type = (fc0 >> 2) & 0x3;
                     if fc_type == 0 {
-                        // It's actually a management frame — refine subtype
+                        // Management frame — refine subtype
                         class = event::refine_mgmt_subtype(fc0);
+                    } else if fc_type == 2 {
+                        // Data frame (non-HDR_TRANS). Extract PM bit for PS tracking.
+                        // Subtype 4 = Null Function, subtype 12 = QoS Null
+                        let subtype = (fc0 >> 4) & 0xF;
+                        if (subtype == 4 || subtype == 12) && pm_count < max_pm {
+                            let pm_bit = (fc1 & 0x10) != 0; // FC byte 1 bit 4 = PM
+                            // Extract source MAC (addr2 at offset 10)
+                            let addr2_ofs = frame_ofs + 10;
+                            if addr2_ofs + 6 <= q.buf_size as usize {
+                                let mut mac = [0u8; 6];
+                                let src = unsafe {
+                                    core::slice::from_raw_parts(
+                                        (buf_base as *const u8).add(addr2_ofs), 6,
+                                    )
+                                };
+                                mac.copy_from_slice(src);
+                                pm_events[pm_count] = RxPmEvent { mac, pm: pm_bit };
+                                pm_count += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1009,7 +1043,7 @@ impl Mt7996Dev {
         if count > 0 {
             self.rx_fill(q);
         }
-        (count, mgmt_count, data_count)
+        (count, mgmt_count, data_count, pm_count)
     }
 
     // ========================================================================

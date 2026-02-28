@@ -9,6 +9,14 @@ pub struct BssConfig {
     pub ssid: [u8; MAX_SSID_LEN],
     pub ssid_len: u8,
     pub channel: u8,
+    /// Channel width: 0=20MHz, 1=40MHz
+    pub bandwidth: u8,
+    /// Secondary channel offset for HT40: -1=below, 0=none, +1=above
+    pub secondary_channel_offset: i8,
+    /// ERP protection needed (non-ERP STA present)
+    pub erp_protection: bool,
+    /// HT protection mode (0=none, 1=nonmember, 2=20MHz, 3=non-HT mixed)
+    pub ht_protection: u8,
 }
 
 /// STA lifecycle state machine
@@ -126,6 +134,10 @@ impl RxBaSession {
 pub const STA_FLAG_HT: u16    = 0x0001;
 pub const STA_FLAG_QOS: u16   = 0x0002;
 pub const STA_FLAG_SGI20: u16 = 0x0004;
+pub const STA_FLAG_ERP: u16   = 0x0008;
+pub const STA_FLAG_NON_ERP: u16 = 0x0010;
+pub const STA_FLAG_HT40: u16  = 0x0020;
+pub const STA_FLAG_SGI40: u16 = 0x0040;
 
 /// Per-STA table entry
 #[derive(Clone, Copy)]
@@ -231,16 +243,15 @@ pub enum ApAction<'a> {
     /// Notify firmware about a BA session start/stop (STA_REC_BA MCU command).
     /// Source: Linux mt7996/mcu.c mt7996_mcu_sta_ba()
     NotifyBaSession { mac: [u8; 6], tid: u8, ssn: u16, win_size: u16, start: bool },
+    /// STA power save state changed (for TIM bitmap updates)
+    StaPsChanged { mac: [u8; 6], aid: u16, ps_mode: bool },
 }
 
 /// Result of processing an RX management frame.
-/// Up to 3 actions: e.g. TxFrame + RegisterSta + NotifyBaSession.
+/// Up to 12 actions to accommodate BA teardowns (8 TIDs) + RemoveSta + TxFrame.
 pub struct ApResult<'a> {
-    pub actions: [Option<ApAction<'a>>; 3],
-}
-
-impl<'a> ApResult<'a> {
-    pub const NONE: Self = Self { actions: [None, None, None] };
+    pub actions: [Option<ApAction<'a>>; 12],
+    pub count: usize,
 }
 
 /// Parse FC byte 0 into MgmtSubtype.

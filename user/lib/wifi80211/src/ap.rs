@@ -29,29 +29,46 @@ pub struct ApManager {
     pub bss: BssConfig,
     stas: [StaEntry; MAX_STAS],
     mgmt_seq: u16,
-}
-
-/// Result of processing an RX management frame.
-/// Up to 3 actions: e.g. TxFrame + RegisterSta + NotifyBaSession.
-pub struct ApResult<'a> {
-    pub actions: [Option<ApAction<'a>>; 3],
+    /// Set when beacon content needs re-upload (TIM, ERP, HT protection changed)
+    pub beacon_dirty: bool,
 }
 
 impl<'a> ApResult<'a> {
+    const NONE_SLOT: Option<ApAction<'a>> = None;
+
     fn none() -> Self {
-        Self { actions: [None, None, None] }
+        Self { actions: [Self::NONE_SLOT; 12], count: 0 }
     }
 
     fn one(a: ApAction<'a>) -> Self {
-        Self { actions: [Some(a), None, None] }
+        let mut r = Self::none();
+        r.actions[0] = Some(a);
+        r.count = 1;
+        r
     }
 
     fn two(a: ApAction<'a>, b: ApAction<'a>) -> Self {
-        Self { actions: [Some(a), Some(b), None] }
+        let mut r = Self::none();
+        r.actions[0] = Some(a);
+        r.actions[1] = Some(b);
+        r.count = 2;
+        r
     }
 
     fn three(a: ApAction<'a>, b: ApAction<'a>, c: ApAction<'a>) -> Self {
-        Self { actions: [Some(a), Some(b), Some(c)] }
+        let mut r = Self::none();
+        r.actions[0] = Some(a);
+        r.actions[1] = Some(b);
+        r.actions[2] = Some(c);
+        r.count = 3;
+        r
+    }
+
+    fn push(&mut self, a: ApAction<'a>) {
+        if self.count < 12 {
+            self.actions[self.count] = Some(a);
+            self.count += 1;
+        }
     }
 }
 
@@ -61,6 +78,7 @@ impl ApManager {
             bss,
             stas: [StaEntry::FREE; MAX_STAS],
             mgmt_seq: 0,
+            beacon_dirty: false,
         }
     }
 
@@ -279,9 +297,27 @@ impl ApManager {
             if ies.cap_info & (1 << 9) != 0 || ies.has_ht {
                 sta.flags |= STA_FLAG_QOS;
             }
-            // TODO: track non-ERP STAs, update ERP IE in beacon
-            // TODO: track non-HT STAs, update HT Oper IE protection mode
-            // TODO: validate client supports all basic rates
+            // ERP/HT detection for protection mode.
+            // Non-ERP STA: no HT capability IE AND no OFDM rates in supported rates.
+            // In practice, a "non-ERP" STA only supports 802.11b (CCK) rates.
+            // If a STA has HT, it's automatically ERP-capable.
+            if ies.has_ht {
+                sta.flags |= STA_FLAG_ERP;
+                // HT40 support (bit 1 of HT cap info)
+                if ies.ht_cap & 0x0002 != 0 {
+                    sta.flags |= STA_FLAG_HT40;
+                }
+                // SGI 40MHz (bit 6 of HT cap info)
+                if ies.ht_cap & 0x0040 != 0 {
+                    sta.flags |= STA_FLAG_SGI40;
+                }
+            } else {
+                // Non-HT STA. Check if it supports OFDM (ERP) rates.
+                // If cap_info bit 0 (ESS) and no HT → non-HT but may still be ERP (802.11g)
+                // Without parsing Supported Rates IE here, assume non-HT STA is non-ERP
+                // (conservative — triggers protection mode). Most non-HT clients are 802.11b.
+                sta.flags |= STA_FLAG_NON_ERP;
+            }
         }
 
         let aid = sta.aid;
@@ -289,6 +325,14 @@ impl ApManager {
         let ht_param = sta.ht_param;
         let flags = sta.flags;
         let is_new = !was_associated;
+
+        // Recalculate protection mode after STA capability change
+        let (erp_prot, ht_prot) = self.calc_protection();
+        if self.bss.erp_protection != erp_prot || self.bss.ht_protection != ht_prot {
+            self.bss.erp_protection = erp_prot;
+            self.bss.ht_protection = ht_prot;
+            self.beacon_dirty = true;
+        }
 
         let seq = self.next_seq();
         let len = if is_reassoc {
@@ -314,20 +358,38 @@ impl ApManager {
     }
 
     /// Handle Deauth / Disassoc frames.
+    /// Emits NotifyBaSession(stop) for each active BA session before RemoveSta,
+    /// so firmware tears down BA sessions cleanly.
     fn handle_deauth_disassoc<'a>(&mut self, frame: &RxMgmtFrame) -> ApResult<'a> {
-        // Tear down all BA sessions before removing STA
-        // (firmware cleanup happens via RemoveSta, but track state)
+        let mut result = ApResult::none();
+
+        // Notify firmware of BA session teardowns per-TID
         if let Some(slot) = self.find_sta_slot(&frame.addr2) {
+            let sta = &self.stas[slot];
+            let mac = sta.mac;
+            for tid in 0..8u8 {
+                if sta.rx_ba[tid as usize].state == BaState::Agreed {
+                    result.push(ApAction::NotifyBaSession {
+                        mac, tid, ssn: 0, win_size: 0, start: false,
+                    });
+                }
+            }
+            // Clear BA state in our table
             self.stas[slot].rx_ba = [RxBaSession::INIT; 8];
         }
 
         let removed = self.remove_sta(&frame.addr2);
-        match removed {
-            Some((mac, aid, wlan_idx)) => {
-                ApResult::one(ApAction::RemoveSta { mac, aid, wlan_idx })
+        if let Some((mac, aid, wlan_idx)) = removed {
+            result.push(ApAction::RemoveSta { mac, aid, wlan_idx });
+            // Recalculate protection — a non-ERP/non-HT STA may have left
+            let (erp_prot, ht_prot) = self.calc_protection();
+            if self.bss.erp_protection != erp_prot || self.bss.ht_protection != ht_prot {
+                self.bss.erp_protection = erp_prot;
+                self.bss.ht_protection = ht_prot;
+                self.beacon_dirty = true;
             }
-            None => ApResult::none(),
         }
+        result
     }
 
     /// Handle Action frames — BA negotiation, etc.
@@ -466,10 +528,11 @@ impl ApManager {
         }
     }
 
-    /// Generate a beacon frame. Called periodically by the driver.
+    /// Generate a beacon frame with current TIM bitmap and protection state.
     pub fn beacon(&mut self, buf: &mut [u8]) -> usize {
         let seq = self.next_seq();
-        frame::build_beacon(buf, &self.bss, seq)
+        let (bm_ctrl, bm) = self.tim_bitmap();
+        frame::build_beacon(buf, &self.bss, seq, bm_ctrl, &bm)
     }
 
     pub fn sta_count(&self) -> usize {
@@ -601,10 +664,11 @@ impl ApManager {
 
     /// Evict STAs based on inactivity. Uses different timeouts:
     /// - Authenticated (not yet associated): STA_AUTH_TIMEOUT_TICKS (5s)
-    /// - Associated: STA_AGING_TICKS (30s)
+    /// - Associated: STA_AGING_TICKS (300s)
     ///
-    /// Returns the number of Associated STAs evicted. The caller should
-    /// handle RemoveSta firmware notifications for those.
+    /// Returns the number of Associated STAs evicted. The caller should:
+    /// 1. TX a deauth frame (reason=4, inactivity) to each evicted STA
+    /// 2. Send MCU disconnect command
     /// `evicted` buffer receives (mac, AID, wlan_idx) of evicted Associated STAs.
     pub fn age_stas(&mut self, now: u32, evicted: &mut [([u8; 6], u16, u16)]) -> usize {
         let mut count = 0;
@@ -625,6 +689,65 @@ impl ApManager {
                 *sta = StaEntry::FREE;
             }
         }
+        if count > 0 {
+            self.beacon_dirty = true;
+        }
         count
+    }
+
+    /// Handle PM bit from received data/Null Function frames.
+    /// Updates STA ps_mode and sets beacon_dirty if TIM bitmap changes.
+    /// Returns true if ps_mode actually changed.
+    pub fn handle_rx_data_pm(&mut self, src_mac: &[u8; 6], pm_bit: bool, now: u32) -> bool {
+        for sta in self.stas.iter_mut() {
+            if sta.state == StaState::Associated && sta.mac == *src_mac {
+                sta.last_seen = now;
+                if sta.ps_mode != pm_bit {
+                    sta.ps_mode = pm_bit;
+                    self.beacon_dirty = true;
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Generate TIM bitmap for sleeping STAs (AIDs 1-64).
+    /// Returns (bitmap_control, partial_virtual_bitmap) for the TIM IE.
+    /// bitmap_control byte: bits[7:1] = bitmap offset (N1/2), bit[0] = multicast.
+    pub fn tim_bitmap(&self) -> (u8, [u8; 8]) {
+        let mut bitmap = [0u8; 8];
+        for sta in self.stas.iter() {
+            if sta.state == StaState::Associated && sta.ps_mode && sta.aid > 0 && sta.aid <= 64 {
+                let aid = sta.aid as usize;
+                bitmap[(aid - 1) / 8] |= 1 << ((aid - 1) % 8);
+            }
+        }
+        // Find N1 (first non-zero byte) and N2 (last non-zero byte)
+        // bitmap_control = N1 & 0xFE (even offset)
+        let n1 = bitmap.iter().position(|&b| b != 0).unwrap_or(0);
+        (((n1 & 0xFE) as u8), bitmap)
+    }
+
+    /// Calculate ERP and HT protection modes based on associated STAs.
+    /// Returns (erp_protection, ht_protection_mode).
+    /// Should be called after STA association/disassociation changes.
+    pub fn calc_protection(&self) -> (bool, u8) {
+        let mut has_non_erp = false;
+        let mut has_non_ht = false;
+        for sta in self.stas.iter() {
+            if sta.state != StaState::Associated {
+                continue;
+            }
+            if sta.flags & STA_FLAG_NON_ERP != 0 {
+                has_non_erp = true;
+            }
+            if sta.flags & STA_FLAG_HT == 0 {
+                has_non_ht = true;
+            }
+        }
+        let ht_prot = if has_non_ht { 3 } else { 0 }; // 3 = non-HT mixed mode
+        (has_non_erp, ht_prot)
     }
 }

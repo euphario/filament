@@ -70,29 +70,31 @@ fn write_country_ie(buf: &mut [u8], channel: u8) -> usize {
 /// Write ERP Information IE. Returns bytes written.
 /// Source: IEEE 802.11-2020 §9.4.2.13
 /// Byte: bit0=NonERP_Present, bit1=Use_Protection, bit2=Barker_Preamble_Mode
-/// All zeros = no protection needed (pure 802.11g/n environment)
-fn write_erp_ie(buf: &mut [u8]) -> usize {
+fn write_erp_ie(buf: &mut [u8], erp_protection: bool) -> usize {
     buf[0] = 42;   // Element ID: ERP Information
     buf[1] = 1;    // length
-    buf[2] = 0x00; // No protection needed
+    buf[2] = if erp_protection { 0x03 } else { 0x00 }; // NonERP_Present + Use_Protection
     3
 }
 
 /// Write HT Capabilities IE (ID 45). Returns bytes written (28 = 2 + 26).
 /// Source: IEEE 802.11-2020 §9.4.2.55, Linux ieee80211_ie_build_ht_cap()
-fn write_ht_cap_ie(buf: &mut [u8]) -> usize {
+///
+/// `bandwidth`: 0=20MHz only, 1=20/40MHz supported
+fn write_ht_cap_ie(buf: &mut [u8], bandwidth: u8) -> usize {
     buf[0] = 45;   // Element ID: HT Capabilities
     buf[1] = 26;   // length
 
     // HT Capability Info (2 bytes) — IEEE 802.11-2020 §9.4.2.55.2
-    //   bit 1: HT 40MHz supported = 0 (20MHz only for now)
+    //   bit 1: HT 40MHz supported
     //   bit 5: Short GI for 20MHz = 1
-    //   bit 6: Short GI for 40MHz = 0
+    //   bit 6: Short GI for 40MHz (when bandwidth=1)
     //   bit 10-11: SM Power Save = 0b11 (disabled)
-    //   bit 12: HT-Delayed Block Ack = 0
-    //   bit 13: Max A-MSDU Length = 0 (3839 bytes)
-    // = 0x0020 | (0x3 << 10) = 0x0C20
-    let ht_cap: u16 = 0x0020 | (0x3 << 10);
+    let mut ht_cap: u16 = 0x0020 | (0x3 << 10); // SGI 20MHz + SM PS disabled
+    if bandwidth >= 1 {
+        ht_cap |= 0x0002; // Supported Channel Width Set (40MHz)
+        ht_cap |= 0x0040; // Short GI for 40MHz
+    }
     buf[2..4].copy_from_slice(&ht_cap.to_le_bytes());
 
     // A-MPDU Parameters (1 byte) — §9.4.2.55.3
@@ -115,7 +117,10 @@ fn write_ht_cap_ie(buf: &mut [u8]) -> usize {
 
 /// Write HT Operation IE (ID 61). Returns bytes written (24 = 2 + 22).
 /// Source: IEEE 802.11-2020 §9.4.2.56, Linux ieee80211_ie_build_ht_oper()
-fn write_ht_oper_ie(buf: &mut [u8], channel: u8) -> usize {
+///
+/// `sec_ch_offset`: 0=none, 1=above, 3=below (802.11 encoding)
+/// `ht_protection`: 0=none, 1=nonmember, 2=20MHz, 3=non-HT mixed
+fn write_ht_oper_ie(buf: &mut [u8], channel: u8, sec_ch_offset: u8, ht_protection: u8) -> usize {
     buf[0] = 61;   // Element ID: HT Operation
     buf[1] = 22;   // length
 
@@ -123,14 +128,15 @@ fn write_ht_oper_ie(buf: &mut [u8], channel: u8) -> usize {
     buf[2] = channel;
 
     // HT Operation Information (5 bytes)
-    //   byte 0 bits 1:0 = secondary channel offset = 0 (no secondary, 20MHz)
-    //   byte 0 bit 2 = STA channel width = 0 (20MHz)
+    //   byte 0 bits 1:0 = secondary channel offset
+    //   byte 0 bit 2 = STA channel width (1 if 40MHz)
     //   byte 0 bit 3 = RIFS mode = 0
-    buf[3] = 0x00;
-    //   byte 1 bits 1:0 = HT protection = 0 (no protection)
-    //   byte 1 bit 2 = non-greenfield present = 0
-    //   byte 1 bit 4 = OBSS non-HT present = 0
-    buf[4] = 0x00;
+    let sta_ch_width = if sec_ch_offset != 0 { 1u8 << 2 } else { 0 };
+    buf[3] = (sec_ch_offset & 0x3) | sta_ch_width;
+    //   byte 1 bits 1:0 = HT protection mode
+    //   byte 1 bit 2 = non-greenfield present (set if ht_protection >= 3)
+    let non_gf = if ht_protection >= 3 { 1u8 << 2 } else { 0 };
+    buf[4] = (ht_protection & 0x3) | non_gf;
     // bytes 2-4: zeros
 
     // Basic MCS Set (16 bytes) at offset 7..23
@@ -207,15 +213,24 @@ fn write_ds_ie(buf: &mut [u8], channel: u8) -> usize {
     3
 }
 
-/// Write TIM IE (minimal). Returns bytes written.
-fn write_tim_ie(buf: &mut [u8]) -> usize {
+/// Write TIM IE with partial virtual bitmap. Returns bytes written.
+/// `bitmap_control`: bits[7:1] = bitmap offset, bit[0] = multicast indicator.
+/// `tim_bitmap`: 8-byte bitmap of sleeping STAs (AIDs 1-64).
+fn write_tim_ie(buf: &mut [u8], bitmap_control: u8, tim_bitmap: &[u8; 8]) -> usize {
+    // Find N1 (first non-zero, even-aligned) and N2 (last non-zero) to trim bitmap.
+    // Per IEEE 802.11-2020 §9.4.2.5, partial virtual bitmap is bytes N1..N2.
+    let n1 = (bitmap_control >> 1) as usize * 2; // Even offset from bitmap_control
+    let n2 = tim_bitmap.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(1);
+    let n2 = n2.max(n1 + 1); // At least 1 byte
+    let pvb_len = n2 - n1;
+
     buf[0] = 0x05; // Element ID: TIM
-    buf[1] = 4;    // length
-    buf[2] = 0;    // DTIM count
+    buf[1] = (3 + pvb_len) as u8; // length: DTIM count + DTIM period + bitmap control + PVB
+    buf[2] = 0;    // DTIM count (firmware manages actual DTIM counting)
     buf[3] = 1;    // DTIM period
-    buf[4] = 0;    // bitmap control
-    buf[5] = 0;    // partial virtual bitmap
-    6
+    buf[4] = bitmap_control;
+    buf[5..5 + pvb_len].copy_from_slice(&tim_bitmap[n1..n2]);
+    2 + 3 + pvb_len // tag(1) + len(1) + dtim_count(1) + dtim_period(1) + bm_ctrl(1) + pvb
 }
 
 // ============================================================================
@@ -225,16 +240,19 @@ fn write_tim_ie(buf: &mut [u8]) -> usize {
 /// Build a beacon frame (raw 802.11, no TXD).
 /// Returns bytes written into `buf`.
 ///
+/// `tim_bitmap`: partial virtual bitmap for sleeping STAs (from ApManager::tim_bitmap()).
+///
 /// Layout: MAC header (24) + timestamp (8) + interval (2) + capability (2) + IEs
-pub fn build_beacon(buf: &mut [u8], bss: &BssConfig, seq: u16) -> usize {
-    // SSID(2+n) + Rates(10) + DS(3) + TIM(6) + Country(8) + ERP(3) + HT_Cap(28) +
-    // ExtRates(6) + HT_Oper(24) + WMM(26)
-    let ie_len = (2 + bss.ssid_len as usize) + 10 + 3 + 6 + 8 + 3 + 28 + 6 + 24 + 26;
-    let total = 24 + 8 + 2 + 2 + ie_len;
-    if buf.len() < total {
+pub fn build_beacon(buf: &mut [u8], bss: &BssConfig, seq: u16,
+                    tim_bitmap_ctrl: u8, tim_bitmap: &[u8; 8]) -> usize {
+    // Max IE size: SSID(2+32) + Rates(10) + DS(3) + TIM(2+3+8) + Country(8) + ERP(3) +
+    // HT_Cap(28) + ExtRates(6) + HT_Oper(24) + WMM(26) = max ~153
+    // Use conservative upper bound for buffer check
+    let max_total = 24 + 12 + 34 + 10 + 3 + 13 + 8 + 3 + 28 + 6 + 24 + 26;
+    if buf.len() < max_total {
         return 0;
     }
-    for b in buf[..total].iter_mut() { *b = 0; }
+    for b in buf[..max_total].iter_mut() { *b = 0; }
 
     // MAC Header (24 bytes)
     // FC: type=0 mgmt, subtype=8 beacon → 0x0080
@@ -257,18 +275,25 @@ pub fn build_beacon(buf: &mut [u8], bss: &BssConfig, seq: u16) -> usize {
     // capability: ESS | Short Preamble | Short Slot Time = 0x0421
     buf[body + 10..body + 12].copy_from_slice(&0x0421u16.to_le_bytes());
 
+    // Encode secondary channel offset for HT Oper IE (802.11: 1=above, 3=below)
+    let sec_ch_offset = match bss.secondary_channel_offset {
+        1 => 1u8,
+        -1 => 3u8,
+        _ => 0u8,
+    };
+
     // IEs — order per IEEE 802.11-2020 §9.3.3.3 Table 9-27
     let mut p = body + 12;
     p += write_ssid_ie(&mut buf[p..], &bss.ssid, bss.ssid_len);
     p += write_rates_ie(&mut buf[p..]);
     p += write_ds_ie(&mut buf[p..], bss.channel);
-    p += write_tim_ie(&mut buf[p..]);
-    p += write_country_ie(&mut buf[p..], bss.channel);  // ID 7
-    p += write_erp_ie(&mut buf[p..]);                    // ID 42
-    p += write_ht_cap_ie(&mut buf[p..]);                 // ID 45
-    p += write_ext_rates_ie(&mut buf[p..]);              // ID 50
-    p += write_ht_oper_ie(&mut buf[p..], bss.channel);   // ID 61
-    p += write_wmm_ie(&mut buf[p..]);                    // ID 221 (vendor)
+    p += write_tim_ie(&mut buf[p..], tim_bitmap_ctrl, tim_bitmap);
+    p += write_country_ie(&mut buf[p..], bss.channel);          // ID 7
+    p += write_erp_ie(&mut buf[p..], bss.erp_protection);       // ID 42
+    p += write_ht_cap_ie(&mut buf[p..], bss.bandwidth);                         // ID 45
+    p += write_ext_rates_ie(&mut buf[p..]);                      // ID 50
+    p += write_ht_oper_ie(&mut buf[p..], bss.channel, sec_ch_offset, bss.ht_protection); // ID 61
+    p += write_wmm_ie(&mut buf[p..]);                            // ID 221 (vendor)
 
     p
 }
@@ -303,16 +328,20 @@ pub fn build_probe_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], seq
     buf[body + 8..body + 10].copy_from_slice(&100u16.to_le_bytes());
     buf[body + 10..body + 12].copy_from_slice(&0x0421u16.to_le_bytes());
 
+    let sec_ch_offset = match bss.secondary_channel_offset {
+        1 => 1u8, -1 => 3u8, _ => 0u8,
+    };
+
     // IEs — probe response omits TIM per spec
     let mut p = body + 12;
     p += write_ssid_ie(&mut buf[p..], &bss.ssid, bss.ssid_len);
     p += write_rates_ie(&mut buf[p..]);
     p += write_ds_ie(&mut buf[p..], bss.channel);
     p += write_country_ie(&mut buf[p..], bss.channel);
-    p += write_erp_ie(&mut buf[p..]);
-    p += write_ht_cap_ie(&mut buf[p..]);
+    p += write_erp_ie(&mut buf[p..], bss.erp_protection);
+    p += write_ht_cap_ie(&mut buf[p..], bss.bandwidth);
     p += write_ext_rates_ie(&mut buf[p..]);
-    p += write_ht_oper_ie(&mut buf[p..], bss.channel);
+    p += write_ht_oper_ie(&mut buf[p..], bss.channel, sec_ch_offset, bss.ht_protection);
     p += write_wmm_ie(&mut buf[p..]);
 
     p
@@ -426,13 +455,17 @@ fn build_assoc_or_reassoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 
     let aid_field = aid | 0xC000;
     buf[body + 4..body + 6].copy_from_slice(&aid_field.to_le_bytes());
 
+    let sec_ch_offset = match bss.secondary_channel_offset {
+        1 => 1u8, -1 => 3u8, _ => 0u8,
+    };
+
     // IEs
     let mut p = body + 6;
     p += write_rates_ie(&mut buf[p..]);
-    p += write_erp_ie(&mut buf[p..]);
-    p += write_ht_cap_ie(&mut buf[p..]);
+    p += write_erp_ie(&mut buf[p..], bss.erp_protection);
+    p += write_ht_cap_ie(&mut buf[p..], bss.bandwidth);
     p += write_ext_rates_ie(&mut buf[p..]);
-    p += write_ht_oper_ie(&mut buf[p..], bss.channel);
+    p += write_ht_oper_ie(&mut buf[p..], bss.channel, sec_ch_offset, bss.ht_protection);
     p += write_wmm_ie(&mut buf[p..]);
 
     p

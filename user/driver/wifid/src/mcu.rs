@@ -164,6 +164,22 @@ const MCU_EXT_CMD_MWDS_SUPPORT: u8 = 0x80;
 pub const MCU_WA_PARAM_RED: u32 = 0x0e;
 pub const MCU_WA_PARAM_HW_PATH_HIF_VER: u32 = 0x2f;
 
+/// Find the byte offset of an IE (by tag) within a raw 802.11 beacon frame.
+/// Searches the IE area after the fixed beacon fields.
+/// Returns offset from frame start, or None if not found.
+fn find_ie_offset(frame: &[u8], ie_tag: u8) -> Option<usize> {
+    // Beacon: MAC hdr(24) + timestamp(8) + interval(2) + cap(2) = 36
+    let mut pos = 36;
+    while pos + 2 <= frame.len() {
+        if frame[pos] == ie_tag {
+            return Some(pos);
+        }
+        let ie_len = frame[pos + 1] as usize;
+        pos += 2 + ie_len;
+    }
+    None
+}
+
 /// Compute download mode from region's feature_set.
 /// Exact translation of Linux mt76_connac_mcu_gen_dl_mode().
 pub fn gen_dl_mode(feature_set: u8, is_wa: bool) -> u32 {
@@ -1518,8 +1534,11 @@ impl Mt7996Dev {
     /// UNI cmd MCU_WMWA_UNI_CMD(CHANNEL_SWITCH) (0x34) — both WM+WA.
     /// tag: UNI_CHANNEL_SWITCH(0) or UNI_CHANNEL_RX_PATH(1)
     /// Wait: yes
+    /// `sec_ch_offset`: secondary channel offset for 40MHz. -1=below, 0=none, +1=above.
     pub fn mcu_set_chan_info(&self, ring: &mut TxRing, band: u8, tag: u16,
-                            channel: u8, bw: u8, channel_band: u8, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
+                            channel: u8, bw: u8, channel_band: u8,
+                            sec_ch_offset: i8,
+                            seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // 80 bytes: {rsv[4], tag:le16, len:le16=76, fields..., rsv1[53]}
         // Linux struct is 80 bytes total, len = sizeof(req) - 4 = 76
         let mut data = [0u8; 80];
@@ -1531,8 +1550,13 @@ impl Mt7996Dev {
 
         // control_ch = channel
         data[8] = channel;
-        // center_ch = channel (same for 20MHz)
-        data[9] = channel;
+        // center_ch: for 40MHz, primary +/- 2
+        let center_ch = match (bw, sec_ch_offset) {
+            (1, 1) => channel.wrapping_add(2),  // secondary above
+            (1, -1) => channel.wrapping_sub(2), // secondary below
+            _ => channel,                        // 20MHz: same as control
+        };
+        data[9] = center_ch;
         // bw
         data[10] = bw;
 
@@ -1710,7 +1734,8 @@ impl Mt7996Dev {
     /// Wait: yes
     pub fn mcu_add_bss_info(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
                             hw_bss_idx: u8, mac_addr: &[u8; 6], enable: bool,
-                            channel: u8, seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
+                            channel: u8, bw: u8, sec_ch_offset: i8,
+                            seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
         // Layout: uni_header(4) + BASIC(32) + SEC(8) + RLM(16) + RA(16) + RATE(24) + TXCMD(8) + IFS_TIME(20) + MLD(16) = 144
         let mut data = [0u8; 144];
 
@@ -1761,9 +1786,14 @@ impl Mt7996Dev {
         data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_RLM.to_le_bytes());
         data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
         data[off + 4] = channel;   // control_channel
-        data[off + 5] = channel;   // center_chan (same for 20MHz)
+        // center_chan: same for 20MHz, +/-2 for 40MHz — mcu.c:812
+        data[off + 5] = if bw >= 1 {
+            (channel as i8 + sec_ch_offset * 2) as u8
+        } else {
+            channel
+        };
         // center_chan2 = 0
-        data[off + 7] = 0;         // bw = 0 (20MHz, matches CMD_CBW_20MHZ)
+        data[off + 7] = bw;        // bw — CMD_CBW_20MHZ(0) or CMD_CBW_40MHZ(1)
         // tx_streams = hweight8(antenna_mask) — mcu.c:823
         // BPI-R4 MT7996: assumed 2T2R pending eFuse readback confirmation
         let nstreams: u8 = 2;
@@ -1998,7 +2028,7 @@ impl Mt7996Dev {
     ///
     /// Layout: sta_req_hdr(8) + sta_rec_ra_uni(58) = 66 bytes
     pub fn mcu_sta_rate_ctrl(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
-                             omac_idx: u8, channel: u8, ht_cap: u16, ht_param: u8,
+                             omac_idx: u8, channel: u8, bw: u8, ht_cap: u16, ht_param: u8,
                              sta_flags: u16, seq: u8) -> Result<(), i32> {
         let has_ht = sta_flags & wifi80211::types::STA_FLAG_HT != 0;
         let is_5g = channel >= 36;
@@ -2030,7 +2060,7 @@ impl Mt7996Dev {
         data[off + 6] = phy_mode;   // phy_mode
         data[off + 7] = channel;    // channel
 
-        data[off + 8] = 0;          // bw = 0 (20MHz)
+        data[off + 8] = bw;          // bw — CMD_CBW_20MHZ(0) or CMD_CBW_40MHZ(1)
         data[off + 9] = if is_5g { 1 } else { 0 }; // disable_cck (5GHz = no CCK)
 
         // ht_mcs32, ht_gf: leave 0 (not supported)
@@ -2313,24 +2343,30 @@ impl Mt7996Dev {
     ///
     /// Uses MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) (0x02) — same as mcu_add_bss_info.
     /// Wait: yes
+    /// Upload beacon template to firmware.
+    ///
+    /// `beacon_frame`: pre-built 802.11 beacon frame from ApManager::beacon().
+    /// The frame includes dynamic TIM bitmap, ERP, and HT protection IEs.
+    /// Maximum beacon frame size: 256 bytes.
+    ///
+    /// Linux: mt7996/mcu.c:2766 mt7996_mcu_add_beacon()
     pub fn mcu_set_beacon(&self, ring: &mut TxRing, band: u8, omac_idx: u8,
-                           mac_addr: &[u8; 6], channel: u8, enable: bool,
+                           beacon_frame: &[u8], enable: bool,
                            seq: u8, irq: Option<&mut FwIrq>) -> Result<(), i32> {
-        // 802.11 beacon frame layout:
-        //   MAC header (24) + fixed fields (12) +
-        //   SSID(10) + Rates(10) + DS(3) + TIM(6) + Country(8) + ERP(3) +
-        //   HT_Cap(28) + ExtRates(6) + HT_Oper(24) + WMM(26) = 160 bytes
-        const BEACON_LEN: usize = 160;
+        const MAX_BEACON: usize = 256;
+        let bcn_len = beacon_frame.len().min(MAX_BEACON);
 
         // TLV data after uni_header:
-        //   bcn_content header (14) + TXD (32) + beacon (160) = 206
-        //   ALIGN(206, 4) = 208  →  TLV len field
-        // Total buffer: uni_header (4) + TLV (208) = 212
-        const TLV_BODY_LEN: usize = 14 + MT_TXD_SIZE + BEACON_LEN; // 206
-        const TLV_ALIGNED: usize = (TLV_BODY_LEN + 3) & !3;        // 208
-        const DATA_LEN: usize = 4 + TLV_ALIGNED;                    // 212
+        //   bcn_content header (14) + TXD (32) + beacon (bcn_len)
+        let tlv_body_len = 14 + MT_TXD_SIZE + bcn_len;
+        let tlv_aligned = (tlv_body_len + 3) & !3;
+        let data_len = 4 + tlv_aligned;
 
-        let mut data = [0u8; DATA_LEN];
+        // Stack buffer — max 256 + 46 + 4 = 306, round up
+        let mut data = [0u8; 4 + 14 + MT_TXD_SIZE + MAX_BEACON + 4]; // 310
+        if data_len > data.len() {
+            return Err(-1);
+        }
 
         // uni_header = 0 (4 bytes)
 
@@ -2339,64 +2375,47 @@ impl Mt7996Dev {
         // tag = UNI_BSS_INFO_BCN_CONTENT (7)
         data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_BCN_CONTENT.to_le_bytes());
         // len = ALIGN(14 + 32 + beacon_len, 4)
-        data[off + 2..off + 4].copy_from_slice(&(TLV_ALIGNED as u16).to_le_bytes());
-        // tim_ie_pos — offset of TIM IE tag from start of beacon frame
-        // = 24(mac) + 8(ts) + 2(interval) + 2(cap) + 10(SSID) + 10(rates) + 3(DS) = 59
-        data[off + 4..off + 6].copy_from_slice(&59u16.to_le_bytes());
+        data[off + 2..off + 4].copy_from_slice(&(tlv_aligned as u16).to_le_bytes());
+        // tim_ie_pos — offset of TIM IE tag from start of beacon frame.
+        // Find TIM IE (tag=5) in the beacon frame body.
+        let tim_pos = find_ie_offset(beacon_frame, 5).unwrap_or(59) as u16;
+        data[off + 4..off + 6].copy_from_slice(&tim_pos.to_le_bytes());
         // csa_ie_pos = 0
         // bcc_ie_pos = 0
         // enable
         data[off + 10] = if enable { 1 } else { 0 };
         // type = 0
         // pkt_len = TXD + beacon
-        data[off + 12..off + 14].copy_from_slice(&((MT_TXD_SIZE + BEACON_LEN) as u16).to_le_bytes());
+        data[off + 12..off + 14].copy_from_slice(&((MT_TXD_SIZE + bcn_len) as u16).to_le_bytes());
 
         // === TXD (32 bytes = 8 × u32 LE) — mac.c:892 mt7996_mac_write_txwi() ===
         let txd_off = off + 14;
 
         // txd[0]: TX_BYTES | PKT_FMT | Q_IDX
-        //   tx_bytes = TXD + beacon_len
-        //   pkt_fmt = MT_TX_TYPE_FW (3) at bits 24:23
-        //   q_idx = MT_LMAC_BCN0 (0x12) at bits 31:25
-        let txd0 = ((MT_TXD_SIZE + BEACON_LEN) as u32)
+        let txd0 = ((MT_TXD_SIZE + bcn_len) as u32)
             | ((MT_TX_TYPE_FW as u32) << 23)
             | ((MT_LMAC_BCN0 as u32) << 25);
         data[txd_off..txd_off + 4].copy_from_slice(&txd0.to_le_bytes());
 
-        // txd[1]: WLAN_IDX(11:0) | HDR_FORMAT(15:14) | HDR_INFO(20:16) | OWN_MAC(30:25) | FIXED_RATE(31)
-        //   wlan_idx = 0 (global_wcid) — mcu.c:2745 uses dev->mt76.global_wcid for MT7996
-        //   hdr_format = MT_HDR_FORMAT_802_11 (2) — 802.11 native
-        //   hdr_info = 24/2 = 12 (802.11 header length / 2)
-        //   tid = 0 (beacon = management, MT_TX_NORMAL) — mac.c:812
-        //   own_mac = omac_idx
-        //   fixed_rate = 1 (beacon is not data) — mac.c:820-822
+        // txd[1]: WLAN_IDX(0) | HDR_FORMAT(802.11) | HDR_INFO(12) | OWN_MAC | FIXED_RATE
         let txd1 = ((MT_HDR_FORMAT_802_11 as u32) << 14)
             | (12u32 << 16)
             | ((omac_idx as u32) << 25)
             | (1u32 << 31);
         data[txd_off + 4..txd_off + 8].copy_from_slice(&txd1.to_le_bytes());
 
-        // txd[2]: FRAME_TYPE(5:4) | SUB_TYPE(3:0)
-        //   type = 0 (management), subtype = 8 (beacon)
-        let txd2 = 8u32;  // (0 << 4) | 8
+        // txd[2]: FRAME_TYPE(mgmt) | SUB_TYPE(beacon=8)
+        let txd2 = 8u32;
         data[txd_off + 8..txd_off + 12].copy_from_slice(&txd2.to_le_bytes());
 
-        // txd[3]: NO_ACK(0) | BCM(4) | REM_TX_COUNT(15:11) | BA_DISABLE(28)
-        //   no_ack = 1 — mac80211 sets IEEE80211_TX_CTL_NO_ACK for beacons (mac.c:966)
-        //   bcm = 1 (broadcast, addr1=ff:ff:ff:ff:ff:ff) — mac.c:852
-        //   rem_tx_count = 0x1F (all bits set for beacon) — mac.c:855
-        //   ba_disable = 1 (set because fixed_rate is set) — mac.c:1013
-        //   SW_POWER_MGMT is NOT set — Linux clears it for beacons (mac.c:854)
+        // txd[3]: NO_ACK | BCM | REM_TX_COUNT(31) | BA_DISABLE
         let txd3 = 1u32 | (1u32 << 4) | (0x1Fu32 << 11) | (1u32 << 28);
         data[txd_off + 12..txd_off + 16].copy_from_slice(&txd3.to_le_bytes());
 
         // txd[4]: 0 (no PN / encryption)
         // txd[5]: 0 (no PID tracking)
 
-        // txd[6]: DAS(2) | DIS_MAT(3) | MSDU_CNT(9:4) | TX_RATE(21:16) | FIXED_BW(25) | VTA(28)
-        //   das = 1, dis_mat = 1, msdu_cnt = 1
-        //   tx_rate = MT7996_BEACON_RATES_TBL (25) — mcu.c:4604, mac.c:1006
-        //   fixed_bw = 1, vta = 1
+        // txd[6]: DAS | DIS_MAT | MSDU_CNT(1) | TX_RATE(beacon_rates_tbl) | FIXED_BW | VTA
         let txd6 = (1u32 << 2)
             | (1u32 << 3)
             | (1u32 << 4)
@@ -2407,28 +2426,18 @@ impl Mt7996Dev {
 
         // txd[7]: 0
 
-        // === 802.11 Beacon Frame (74 bytes) ===
-        // Use wifi80211 frame builder to ensure beacon template matches software beacons
+        // === Copy pre-built beacon frame ===
         let bcn_off = txd_off + MT_TXD_SIZE;
-        let mut bss = wifi80211::types::BssConfig {
-            bssid: *mac_addr,
-            ssid: [0u8; wifi80211::types::MAX_SSID_LEN],
-            ssid_len: 8,
-            channel,
-        };
-        bss.ssid[..8].copy_from_slice(b"Filament");
-        let bcn_len = wifi80211::frame::build_beacon(&mut data[bcn_off..], &bss, 0);
-        // seq_ctrl = 0 (MCU manages sequence) — build_beacon sets seq, override to 0
+        data[bcn_off..bcn_off + bcn_len].copy_from_slice(&beacon_frame[..bcn_len]);
+        // seq_ctrl = 0 (MCU manages sequence)
         data[bcn_off + 22] = 0;
         data[bcn_off + 23] = 0;
 
-        debug_assert_eq!(bcn_len, BEACON_LEN, "beacon template size mismatch");
-
-        // MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE) = __MCU_CMD_FIELD_UNI | 0x02 | WM | WA
+        // MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE)
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BSS_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
-        udebug!("mcu", "set_beacon"; band = band, omac = omac_idx, ch = channel, enable = enable as u8);
-        self.mcu_send_uni_cmd(ring, cmd, &data, true, seq, irq)
+        udebug!("mcu", "set_beacon"; band = band, omac = omac_idx, bcn_len = bcn_len as u32, enable = enable as u8);
+        self.mcu_send_uni_cmd(ring, cmd, &data[..data_len], true, seq, irq)
     }
 
     /// Program a fixed rate table entry

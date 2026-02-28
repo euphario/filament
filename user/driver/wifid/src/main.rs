@@ -38,7 +38,7 @@ mod mac;
 mod event;
 
 use regs::*;
-use dma::{TxRing, TxFreeResult, RxDataFrame, flush_buffer};
+use dma::{TxRing, TxFreeResult, RxDataFrame, RxPmEvent, flush_buffer};
 use device::Mt7996Dev;
 use event::RxMibCounters;
 
@@ -52,6 +52,151 @@ use wifi80211::types::{BssConfig, RxMgmtFrame, MgmtSubtype, ApAction, MAX_SSID_L
 /// Maximum in-flight TX frames tracked for deferred CQE posting.
 /// Must be power of 2 and >= TX ring size.
 const TX_INFLIGHT_SIZE: usize = 2048;
+
+// ============================================================================
+// SER L1 Recovery State Machine
+// ============================================================================
+
+/// Firmware-cooperative DMA reset states.
+/// Each Wait* state checks one register bit per timer tick (500ms).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SerL1State {
+    /// Normal operation — no recovery in progress.
+    Idle,
+    /// DMA_STOPPED signaled, waiting for firmware RESET_DONE.
+    WaitResetDone,
+    /// DMA reset done, DMA_INIT signaled, waiting for RECOVERY_DONE.
+    WaitRecoveryDone,
+    /// RESET_DONE signaled, waiting for firmware NORMAL_STATE.
+    WaitNormalState,
+}
+
+// ============================================================================
+// Power Save Frame Buffering
+// ============================================================================
+
+/// Max buffered frames per STA during power save.
+const PS_MAX_PER_STA: usize = 4;
+/// Max total PS buffered frames across all STAs.
+const PS_BUF_TOTAL: usize = 32;
+/// Max frame size for PS buffering (Ethernet + payload).
+const PS_MAX_FRAME: usize = 1514;
+
+/// A buffered frame for a sleeping STA.
+struct PsBufferedFrame {
+    /// Destination STA MAC
+    dst_mac: [u8; 6],
+    /// DataPort SQE tag for deferred CQE posting
+    sqe_tag: u32,
+    /// Frame data (Ethernet header + payload)
+    data: [u8; PS_MAX_FRAME],
+    /// Actual frame length
+    len: u16,
+    /// Whether this slot is in use
+    valid: bool,
+}
+
+impl PsBufferedFrame {
+    const EMPTY: Self = Self {
+        dst_mac: [0; 6],
+        sqe_tag: 0,
+        data: [0; PS_MAX_FRAME],
+        len: 0,
+        valid: false,
+    };
+}
+
+/// PS frame buffer — global ring for all sleeping STAs.
+struct PsBuffer {
+    frames: [PsBufferedFrame; PS_BUF_TOTAL],
+    /// Number of valid buffered frames
+    count: u16,
+    /// Total frames dropped due to buffer full
+    drops: u32,
+}
+
+impl PsBuffer {
+    const fn new() -> Self {
+        Self {
+            frames: [PsBufferedFrame::EMPTY; PS_BUF_TOTAL],
+            count: 0,
+            drops: 0,
+        }
+    }
+
+    /// Count frames buffered for a specific STA.
+    fn count_for_sta(&self, mac: &[u8; 6]) -> usize {
+        let mut n = 0;
+        for f in self.frames.iter() {
+            if f.valid && f.dst_mac == *mac {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Buffer a frame for a sleeping STA. Returns false if full.
+    fn push(&mut self, dst_mac: &[u8; 6], sqe_tag: u32, data: &[u8]) -> bool {
+        // Per-STA limit
+        if self.count_for_sta(dst_mac) >= PS_MAX_PER_STA {
+            self.drops += 1;
+            return false;
+        }
+        // Find free slot
+        for f in self.frames.iter_mut() {
+            if !f.valid {
+                f.dst_mac = *dst_mac;
+                f.sqe_tag = sqe_tag;
+                let len = data.len().min(PS_MAX_FRAME);
+                f.data[..len].copy_from_slice(&data[..len]);
+                f.len = len as u16;
+                f.valid = true;
+                self.count += 1;
+                return true;
+            }
+        }
+        self.drops += 1;
+        false
+    }
+
+    /// Dequeue one frame for a STA (PS-Poll response). Returns (sqe_tag, frame_data, has_more).
+    fn pop_one(&mut self, mac: &[u8; 6]) -> Option<(u32, &[u8], bool)> {
+        let mut found_idx = None;
+        for (i, f) in self.frames.iter().enumerate() {
+            if f.valid && f.dst_mac == *mac {
+                found_idx = Some(i);
+                break;
+            }
+        }
+        let idx = found_idx?;
+        self.frames[idx].valid = false;
+        self.count -= 1;
+        let has_more = self.count_for_sta(mac) > 0;
+        let f = &self.frames[idx];
+        Some((f.sqe_tag, &f.data[..f.len as usize], has_more))
+    }
+
+    /// Find indices of all frames for a STA (for PM=0 flush).
+    /// Returns count of indices written to `out`.
+    fn find_sta_frames(&self, mac: &[u8; 6], out: &mut [usize]) -> usize {
+        let mut n = 0;
+        for (i, f) in self.frames.iter().enumerate() {
+            if f.valid && f.dst_mac == *mac && n < out.len() {
+                out[n] = i;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Release a frame slot after TX (called after find_sta_frames + tx_enqueue_data).
+    fn release(&mut self, idx: usize) {
+        if idx < PS_BUF_TOTAL && self.frames[idx].valid {
+            self.frames[idx].valid = false;
+            self.count -= 1;
+        }
+    }
+}
 
 struct WifiDataPathStats {
     rx_frames: u32,
@@ -145,6 +290,12 @@ struct WifiDriver {
     pool_phys: u64,
     /// SER L1 recovery count.
     ser_count: u32,
+    /// SER L1 recovery state machine.
+    ser_state: SerL1State,
+    /// Tick when current SER step started (for timeout).
+    ser_step_tick: u32,
+    /// Power save frame buffer for sleeping STAs.
+    ps_buf: PsBuffer,
 }
 
 impl WifiDriver {
@@ -193,6 +344,9 @@ impl WifiDriver {
             tx_inflight_tags: [u32::MAX; TX_INFLIGHT_SIZE],
             pool_phys: 0,
             ser_count: 0,
+            ser_state: SerL1State::Idle,
+            ser_step_tick: 0,
+            ps_buf: PsBuffer::new(),
         }
     }
 
@@ -725,7 +879,7 @@ impl WifiDriver {
     seq = seq.wrapping_add(1);
 
     // RX path — Linux main.c:25 (after radio enable in mt7996_run)
-    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_RX_PATH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, seq, None).map_err(mcu_err)?;
+    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_RX_PATH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, 0, seq, None).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
     udebug!("wifid", "rx_path_init_ok");
 
@@ -748,7 +902,7 @@ impl WifiDriver {
     // hw_bss_idx = 0 (matches bss_req_hdr.bss_idx in uni_header)
     // omac_idx = HW_BSSID_0 (OMAC to use, independent of bss_idx)
     udebug!("wifid", "bss_info_send"; band = 0u32, omac = HW_BSSID_0 as u32, bss = 0u32, active = 1u32, ch = 1u32);
-    dev.mcu_add_bss_info(&mut wa_ring, 0, HW_BSSID_0, 0, &mac_addr, true, 1, seq, None).map_err(mcu_err)?;
+    dev.mcu_add_bss_info(&mut wa_ring, 0, HW_BSSID_0, 0, &mac_addr, true, 1, CMD_CBW_20MHZ, 0, seq, None).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
     udebug!("wifid", "bss_info_ok");
 
@@ -771,11 +925,11 @@ impl WifiDriver {
 
     // Channel switch — Linux main.c:561
     udebug!("wifid", "chan_switch"; band = 0u32, ch = 1u32, bw = 0u32, ch_band = 0u32);
-    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_SWITCH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, seq, None).map_err(mcu_err)?;
+    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_SWITCH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, 0, seq, None).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
     // RX path after switch — Linux main.c:565
-    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_RX_PATH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, seq, None).map_err(mcu_err)?;
+    dev.mcu_set_chan_info(&mut wa_ring, 0, UNI_CHANNEL_RX_PATH, 1, CMD_CBW_20MHZ, CH_BAND_2GHZ, 0, seq, None).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
     // TX power SKU — Linux main.c:569
@@ -823,7 +977,7 @@ impl WifiDriver {
 
     // Second BSS_INFO: re-send after channel is configured — Linux main.c:859
     udebug!("wifid", "bss_info2_send"; band = 0u32, omac = HW_BSSID_0 as u32, bss = 0u32, active = 1u32);
-    dev.mcu_add_bss_info(&mut wa_ring, 0, HW_BSSID_0, 0, &mac_addr, true, 1, seq, None).map_err(mcu_err)?;
+    dev.mcu_add_bss_info(&mut wa_ring, 0, HW_BSSID_0, 0, &mac_addr, true, 1, CMD_CBW_20MHZ, 0, seq, None).map_err(mcu_err)?;
     seq = seq.wrapping_add(1);
 
     // Second STA_REC: update existing BMC STA (newly=false) — Linux main.c:861
@@ -847,7 +1001,23 @@ impl WifiDriver {
     // Beacon: firmware offload — uploads beacon template to MCU.
     // The ~57s death was caused by DMA CPU_IDX starvation, not beacon offload.
     // Linux: mt7996_mcu_add_beacon() in mcu.c:2766
-    dev.mcu_set_beacon(&mut wa_ring, 0, HW_BSSID_0, &mac_addr, 1, true, seq, None).map_err(mcu_err)?;
+    {
+        let mut init_bss = wifi80211::types::BssConfig {
+            bssid: mac_addr,
+            ssid: [0u8; MAX_SSID_LEN],
+            ssid_len: 8,
+            channel: 1,
+            bandwidth: 0,
+            secondary_channel_offset: 0,
+            erp_protection: false,
+            ht_protection: 0,
+        };
+        init_bss.ssid[..8].copy_from_slice(b"Filament");
+        let empty_tim = [0u8; 8];
+        let mut bcn_buf = [0u8; 256];
+        let bcn_len = wifi80211::frame::build_beacon(&mut bcn_buf, &init_bss, 0, 0, &empty_tim);
+        dev.mcu_set_beacon(&mut wa_ring, 0, HW_BSSID_0, &bcn_buf[..bcn_len], true, seq, None).map_err(mcu_err)?;
+    }
     seq = seq.wrapping_add(1);
     udebug!("wifid", "beacon_fw_offload");
 
@@ -933,6 +1103,10 @@ impl WifiDriver {
         ssid,
         ssid_len: 8,
         channel: 1,
+        bandwidth: 0,
+        secondary_channel_offset: 0,
+        erp_protection: false,
+        ht_protection: 0,
     }));
 
     // Create DataPort for IP stack data exchange
@@ -1144,7 +1318,13 @@ fn tx_sweep_and_complete(
 ///   6. Re-enable DMA
 ///
 /// Source: Linux mt7996/mac.c:2534-2648 mt7996_mac_reset_work()
-fn ser_l1_recover(drv: &mut WifiDriver, dev: &Mt7996Dev) {
+/// Start SER L1 recovery — non-blocking, advances via ser_l1_tick().
+///
+/// The old implementation blocked for up to 15 seconds (3 × 5s polls),
+/// which triggered syscall storms and prevented the event loop from
+/// running. Now each step is a single MMIO write; the timer tick checks
+/// if the firmware has responded yet.
+fn ser_l1_start(drv: &mut WifiDriver, dev: &Mt7996Dev) {
     unotice!("wifid", "ser_l1_start"; count = drv.ser_count);
     drv.ser_count += 1;
 
@@ -1152,30 +1332,71 @@ fn ser_l1_recover(drv: &mut WifiDriver, dev: &Mt7996Dev) {
     // Linux: mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED)
     dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
 
-    // Step 2: Wait for firmware to signal RESET_DONE (up to 5 seconds)
-    // Linux: mt7996_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE) with 30s timeout
-    // We poll MT_MCU_CMD directly since we don't have the interrupt pathway.
-    let got_reset_done = dev.mt76_poll_msec(MT_MCU_CMD, MT_MCU_CMD_RESET_DONE,
-                                             MT_MCU_CMD_RESET_DONE, 5000);
-    if !got_reset_done {
-        uerror!("wifid", "ser_l1_timeout"; step = 1);
-        // Still try to continue — worst case DMA stays broken
+    drv.ser_state = SerL1State::WaitResetDone;
+    drv.ser_step_tick = drv.drain_ticks;
+}
+
+/// SER L1 timeout per step: 10 seconds (20 × 500ms ticks).
+const SER_STEP_TIMEOUT_TICKS: u32 = 20;
+
+/// Advance SER L1 state machine — called once per timer tick.
+/// Returns without blocking; each firmware wait is a single register read.
+fn ser_l1_tick(drv: &mut WifiDriver, dev: &Mt7996Dev) {
+    let elapsed = drv.drain_ticks.wrapping_sub(drv.ser_step_tick);
+    match drv.ser_state {
+        SerL1State::Idle => {}
+        SerL1State::WaitResetDone => {
+            let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
+            if mcu_cmd & MT_MCU_CMD_RESET_DONE != 0 {
+                dev.mt76_wr(MT_MCU_CMD, mcu_cmd); // W1C
+                ser_l1_dma_reset(drv, dev);
+                dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+                drv.ser_state = SerL1State::WaitRecoveryDone;
+                drv.ser_step_tick = drv.drain_ticks;
+            } else if elapsed > SER_STEP_TIMEOUT_TICKS {
+                uerror!("wifid", "ser_l1_timeout"; step = 1u32);
+                ser_l1_dma_reset(drv, dev);
+                dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+                drv.ser_state = SerL1State::WaitRecoveryDone;
+                drv.ser_step_tick = drv.drain_ticks;
+            }
+        }
+        SerL1State::WaitRecoveryDone => {
+            let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
+            if mcu_cmd & MT_MCU_CMD_RECOVERY_DONE != 0 {
+                dev.mt76_wr(MT_MCU_CMD, mcu_cmd); // W1C
+                dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+                drv.ser_state = SerL1State::WaitNormalState;
+                drv.ser_step_tick = drv.drain_ticks;
+            } else if elapsed > SER_STEP_TIMEOUT_TICKS {
+                uerror!("wifid", "ser_l1_timeout"; step = 2u32);
+                dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+                drv.ser_state = SerL1State::WaitNormalState;
+                drv.ser_step_tick = drv.drain_ticks;
+            }
+        }
+        SerL1State::WaitNormalState => {
+            let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
+            if mcu_cmd & MT_MCU_CMD_NORMAL_STATE != 0 {
+                dev.mt76_wr(MT_MCU_CMD, mcu_cmd); // W1C
+                ser_l1_finish(drv, dev);
+            } else if elapsed > SER_STEP_TIMEOUT_TICKS {
+                uerror!("wifid", "ser_l1_timeout"; step = 3u32);
+                ser_l1_finish(drv, dev);
+            }
+        }
     }
-    // Clear the bit we just read (write-1-clear)
-    let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
-    dev.mt76_wr(MT_MCU_CMD, mcu_cmd);
+}
 
-    // Step 3: Reset DMA hardware
-    // Linux: mt7996_dma_reset(dev, false) — disable DMA, reset queues, refill
-
-    // 3a: Disable DMA engines (no logic reset — firmware is still alive)
+/// DMA reset: disable engines, zero all rings, refill RX.
+/// Pure MMIO — no syscalls, no blocking.
+fn ser_l1_dma_reset(drv: &mut WifiDriver, dev: &Mt7996Dev) {
+    // Disable DMA engines (no logic reset — firmware is still alive)
     // Linux: dma.c mt7996_dma_disable(dev, false)
     dev.mt7996_dma_disable(false);
-    userlib::delay_ms(1);
 
-    // 3b: Reset TX band0 ring
+    // Reset TX band0 ring
     if let Some(ref mut ring) = drv.tx_band0 {
-        // Zero all descriptors and set DMA_DONE
         for i in 0..ring.ndesc as usize {
             let desc_ptr = ring.desc(i as u32);
             unsafe {
@@ -1185,13 +1406,12 @@ fn ser_l1_recover(drv: &mut WifiDriver, dev: &Mt7996Dev) {
                 core::ptr::write_volatile(&mut (*desc_ptr).ctrl, MT_DMA_CTL_DMA_DONE);
             }
         }
-        // Reprogram queue: CPU_IDX=0, DMA_IDX=0
         dev.program_queue(ring.regs_base, 0, ring.desc_phys, ring.ndesc);
         ring.cpu_idx = 0;
         ring.sweep_idx = 0;
     }
 
-    // 3c: Reset MCU WA TX ring
+    // Reset MCU WA TX ring
     if let Some(ref mut ring) = drv.wa_ring {
         for i in 0..ring.ndesc as usize {
             let desc_ptr = ring.desc(i as u32);
@@ -1207,10 +1427,9 @@ fn ser_l1_recover(drv: &mut WifiDriver, dev: &Mt7996Dev) {
         ring.sweep_idx = 0;
     }
 
-    // 3d: Reset all RX rings and refill
+    // Reset all RX rings and refill
     for qi in 0..drv.rx_queue_count {
         let q = &mut drv.rx_queues[qi];
-        // Zero descriptors
         for i in 0..q.ndesc as usize {
             let desc_ptr = unsafe { (q.desc_virt as *mut dma::Mt76Desc).add(i) };
             unsafe {
@@ -1220,53 +1439,29 @@ fn ser_l1_recover(drv: &mut WifiDriver, dev: &Mt7996Dev) {
                 core::ptr::write_volatile(&mut (*desc_ptr).ctrl, MT_DMA_CTL_DMA_DONE);
             }
         }
-        // Reprogram queue indices
         dev.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, 0);
         dev.mt76_wr(q.regs_base + MT_QUEUE_DMA_IDX, 0);
         q.reset_counters();
-        // Refill RX buffers
         dev.rx_fill(q);
     }
 
-    // 3e: Clear TX inflight tokens (all orphaned after reset)
+    // Clear TX inflight tokens (all orphaned after reset)
     for i in 0..TX_INFLIGHT_SIZE {
         drv.tx_inflight_tags[i] = u32::MAX;
     }
 
-    // 3f: Reset statistics and stall detection state
+    // Reset statistics
     drv.tx_token = 0;
     drv.tx_freed = 0;
     drv.tx_free_entries = 0;
     drv.tx_free_notify_count = 0;
+}
 
-    // Step 4: Signal firmware DMA_INIT, wait for RECOVERY_DONE
-    // Linux: mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT)
-    dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
-
-    let got_recovery = dev.mt76_poll_msec(MT_MCU_CMD, MT_MCU_CMD_RECOVERY_DONE,
-                                           MT_MCU_CMD_RECOVERY_DONE, 5000);
-    if !got_recovery {
-        uerror!("wifid", "ser_l1_timeout"; step = 4);
-    }
-    let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
-    dev.mt76_wr(MT_MCU_CMD, mcu_cmd);
-
-    // Step 5: Signal RESET_DONE, wait for NORMAL_STATE
-    dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
-
-    let got_normal = dev.mt76_poll_msec(MT_MCU_CMD, MT_MCU_CMD_NORMAL_STATE,
-                                         MT_MCU_CMD_NORMAL_STATE, 5000);
-    if !got_normal {
-        uerror!("wifid", "ser_l1_timeout"; step = 5);
-    }
-    let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
-    dev.mt76_wr(MT_MCU_CMD, mcu_cmd);
-
-    // Step 6: Re-enable DMA
-    // Linux: mt7996_dma_start(dev, false, false)
+/// Finalize SER L1: re-enable DMA, return to normal operation.
+fn ser_l1_finish(drv: &mut WifiDriver, dev: &Mt7996Dev) {
     dev.mt7996_dma_enable(false);
     dev.mt7996_dma_start(false, false);
-
+    drv.ser_state = SerL1State::Idle;
     unotice!("wifid", "ser_l1_done"; count = drv.ser_count);
 }
 
@@ -1474,6 +1669,25 @@ impl WifiDriverWrapper {
             let dst_mac: [u8; 6] = [frame_buf[0], frame_buf[1], frame_buf[2],
                                      frame_buf[3], frame_buf[4], frame_buf[5]];
             let is_multicast = (dst_mac[0] & 0x01) != 0;
+
+            // PS buffering: if unicast dest STA is sleeping, buffer instead of TX
+            if !is_multicast {
+                let sta_sleeping = self.0.ap.as_ref()
+                    .and_then(|ap| ap.find_sta(&dst_mac))
+                    .map(|sta| sta.ps_mode)
+                    .unwrap_or(false);
+                if sta_sleeping {
+                    if !self.0.ps_buf.push(&dst_mac, sqe.tag, &frame_buf[..frame_len]) {
+                        // Buffer full — post error CQE
+                        if let Some(port) = ctx.block_port(dp) {
+                            port.complete_error(sqe.tag, io_status::IO_ERROR);
+                        }
+                    }
+                    // Skip normal TX path — frame is buffered or dropped
+                    continue;
+                }
+            }
+
             let wcid = if is_multicast {
                 MT7996_WTBL_RESERVED
             } else {
@@ -1575,6 +1789,21 @@ impl Driver for WifiDriverWrapper {
 
         }
 
+        // Skip all DMA work while SER L1 recovery is in progress.
+        // The rings are being reset — touching them would corrupt recovery.
+        // Timer ticks advance the SER state machine (one MMIO check per tick).
+        if self.0.ser_state != SerL1State::Idle {
+            if is_timer {
+                ser_l1_tick(&mut self.0, dev);
+            }
+            if self.0.irq_mode && is_irq {
+                if let Some(ref mut irq) = self.0.irq {
+                    let _ = irq.ack();
+                }
+            }
+            return;
+        }
+
         // Read INT_SOURCE_CSR to determine which queues need servicing
         // Source: Linux mt76/mt7996/mmio.c mt7996_irq_handler()
         let intr = if self.0.irq_mode && is_irq {
@@ -1620,19 +1849,23 @@ impl Driver for WifiDriverWrapper {
             copy_offset: 0, len: 0,
         });
         let mut data_count = 0usize;
+        let mut pm_events: [RxPmEvent; 8] = core::array::from_fn(|_| RxPmEvent { mac: [0; 6], pm: false });
+        let mut pm_count = 0usize;
         // Copy buffer for data frame payloads — rx_classify copies frame data
         // here before resetting DMA descriptors (avoids use-after-free).
         // 16 frames × 1514 bytes max = ~24KB
         let mut data_buf = [0u8; 16 * 1514];
         if intr & MT_INT_RX_DONE_BAND0 != 0 && qc > 2 {
-            let (_n, mc, dc) = dev.rx_classify(
+            let (_n, mc, dc, pc) = dev.rx_classify(
                 &mut self.0.rx_queues[2], &mut self.0.mib[0],
                 &mut mgmt_frames, 8,
                 &mut data_frames, 16,
                 &mut data_buf,
+                &mut pm_events, 8,
             );
             mgmt_count = mc;
             data_count = dc;
+            pm_count = pc;
         }
 
         // WA_MAIN (q3) — TX free notifications
@@ -1656,7 +1889,8 @@ impl Driver for WifiDriverWrapper {
             }];
             let mut dummy_data: [RxDataFrame; 1] = [RxDataFrame { copy_offset: 0, len: 0 }];
             let mut dummy_buf = [0u8; 0];
-            dev.rx_classify(&mut self.0.rx_queues[4], &mut self.0.mib[1], &mut dummy_mgmt, 0, &mut dummy_data, 0, &mut dummy_buf);
+            let mut dummy_pm: [RxPmEvent; 1] = [RxPmEvent { mac: [0; 6], pm: false }];
+            dev.rx_classify(&mut self.0.rx_queues[4], &mut self.0.mib[1], &mut dummy_mgmt, 0, &mut dummy_data, 0, &mut dummy_buf, &mut dummy_pm, 0);
         }
 
         // WA_TRI (q5) — TX free notifications (band2)
@@ -1786,12 +2020,15 @@ impl Driver for WifiDriverWrapper {
                                 ba_start = *start;
                                 do_ba = true;
                             }
+                            ApAction::StaPsChanged { .. } => {
+                                // PS state change handled by beacon_dirty flag
+                            }
                         }
                     }
                 }
 
                 // Log when AP drops a frame (e.g. assoc from unauthenticated STA)
-                if result.actions[0].is_none() && !matches!(subtype, MgmtSubtype::ProbeReq | MgmtSubtype::Other(_) | MgmtSubtype::Action) {
+                if result.count == 0 && !matches!(subtype, MgmtSubtype::ProbeReq | MgmtSubtype::Other(_) | MgmtSubtype::Action) {
                     udebug!("wifid", "ap_drop_frame";
                         mac0 = addr2[0] as u32, mac1 = addr2[1] as u32,
                         mac2 = addr2[2] as u32, mac3 = addr2[3] as u32,
@@ -1870,9 +2107,15 @@ impl Driver for WifiDriverWrapper {
                     // Without this, firmware has no rate table → uses lowest rate → PLE stall.
                     let seq = self.0.seq;
                     self.0.seq = self.0.seq.wrapping_add(1);
+                    // Effective BW: 40MHz only if BSS configured AND STA supports it
+                    let sta_bw = if register_flags & wifi80211::types::STA_FLAG_HT40 != 0 {
+                        if let Some(ref ap) = self.0.ap {
+                            if ap.bss.bandwidth >= 1 { CMD_CBW_40MHZ } else { CMD_CBW_20MHZ }
+                        } else { CMD_CBW_20MHZ }
+                    } else { CMD_CBW_20MHZ };
                     if let Err(e) = dev.mcu_sta_rate_ctrl(
                         wa_ring, 0, wlan_idx, HW_BSSID_0,
-                        self.0.channel, register_ht_cap, register_ht_param, register_flags, seq,
+                        self.0.channel, sta_bw, register_ht_cap, register_ht_param, register_flags, seq,
                     ) {
                         uerror!("wifid", "mcu_sta_rate_ctrl_failed"; err = e as u32, wlan = wlan_idx as u32);
                     }
@@ -1928,10 +2171,38 @@ impl Driver for WifiDriverWrapper {
             }
         }
 
+        // Process PM events from Null Function / QoS Null frames.
+        // These are the primary PS mode signaling mechanism.
+        if pm_count > 0 {
+            if let Some(ref mut ap) = self.0.ap {
+                for i in 0..pm_count {
+                    let changed = ap.handle_rx_data_pm(&pm_events[i].mac, pm_events[i].pm, self.0.drain_ticks);
+                    // PM=0 transition: flush all buffered frames for this STA
+                    if changed && !pm_events[i].pm {
+                        let mac = &pm_events[i].mac;
+                        let wcid = ap.find_sta(mac).map(|s| s.wlan_idx).unwrap_or(MT7996_WTBL_RESERVED);
+                        let mut indices = [0usize; PS_MAX_PER_STA];
+                        let n = self.0.ps_buf.find_sta_frames(mac, &mut indices);
+                        for j in 0..n {
+                            let idx = indices[j];
+                            let f = &self.0.ps_buf.frames[idx];
+                            if let Some(ref mut tx_ring) = self.0.tx_band0 {
+                                let tok = self.0.tx_token;
+                                self.0.tx_token = self.0.tx_token.wrapping_add(1);
+                                let _ = dev.tx_enqueue_data(tx_ring, &f.data[..f.len as usize], wcid, tok);
+                            }
+                            self.0.ps_buf.release(idx);
+                        }
+                    }
+                }
+            }
+        }
+
         // Forward data frames to ipd via DataPort.
         // Frame data was copied into data_buf by rx_classify (safe — DMA buffers already freed).
         if data_count > 0 {
-            // Touch STA last_seen for each data frame (prevents aging while sending data).
+            // Touch STA last_seen + clear PS for each data frame.
+            // If a client is sending data, it's awake (PM=0 implicit).
             // Ethernet frame: dst[6] + src[6] — source MAC at offset 6.
             if let Some(ref mut ap) = self.0.ap {
                 for i in 0..data_count {
@@ -1940,7 +2211,7 @@ impl Driver for WifiDriverWrapper {
                     if frame.len >= 14 {
                         let mut src_mac = [0u8; 6];
                         src_mac.copy_from_slice(&data_buf[ofs + 6..ofs + 12]);
-                        ap.touch_sta(&src_mac, self.0.drain_ticks);
+                        ap.handle_rx_data_pm(&src_mac, false, self.0.drain_ticks);
                     }
                 }
             }
@@ -2032,13 +2303,33 @@ impl Driver for WifiDriverWrapper {
                 self.0.seq = self.0.seq.wrapping_add(1);
             }
 
-            // STA aging: evict STAs not seen within timeout
+            // STA aging: evict STAs not seen within timeout.
+            // TX deauth frame (reason=4, inactivity) so client disconnects cleanly.
             if let Some(ref mut ap) = self.0.ap {
                 let mut evicted = [([0u8; 6], 0u16, 0u16); 16];
                 let n = ap.age_stas(self.0.drain_ticks, &mut evicted);
                 for j in 0..n {
                     let (mac, aid, wlan_idx) = evicted[j];
                     udebug!("wifid", "sta_aged"; aid = aid as u32, wlan = wlan_idx as u32);
+                    // TX deauth frame so client knows it was disconnected (reason=4, inactivity)
+                    {
+                        let seq = ap.next_seq();
+                        let mut deauth_buf = [0u8; 64];
+                        let deauth_len = wifi80211::frame::build_deauth(
+                            &mut deauth_buf, &ap.bss.bssid, &mac, 4, seq,
+                        );
+                        if deauth_len > 0 {
+                            if let Some(ref mut tx_ring) = self.0.tx_band0 {
+                                let mut txd_buf = [0u8; 320];
+                                let total = wrap_mgmt_txd(&mut txd_buf, &deauth_buf[..deauth_len]);
+                                if total > 0 {
+                                    let token = self.0.tx_token;
+                                    self.0.tx_token = self.0.tx_token.wrapping_add(1);
+                                    let _ = dev.tx_enqueue(tx_ring, &txd_buf[..total], token);
+                                }
+                            }
+                        }
+                    }
                     if wlan_idx != 0 {
                         // Linux main.c:1034 — clear ADM count before removing STA
                         dev.mac_wtbl_update(wlan_idx as u32, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
@@ -2050,6 +2341,28 @@ impl Driver for WifiDriverWrapper {
                                 CONN_STATE_DISCONNECT, &mac, aid, false, seq, None, false,
                                 0, 0, 0, // HT caps irrelevant for disconnect
                             );
+                        }
+                    }
+                }
+            }
+
+            // Beacon re-upload on dirty (TIM/ERP/HT protection changed).
+            // Rate-limited: at most once per timer tick (500ms).
+            if self.0.beacon_on {
+                let dirty = if let Some(ref mut ap) = self.0.ap {
+                    let d = ap.beacon_dirty;
+                    ap.beacon_dirty = false;
+                    d
+                } else { false };
+                if dirty {
+                    let mut bcn_buf = [0u8; 256];
+                    let bcn_len = if let Some(ref mut ap) = self.0.ap {
+                        ap.beacon(&mut bcn_buf)
+                    } else { 0 };
+                    if bcn_len > 0 {
+                        if let Some(ref mut wa_ring) = self.0.wa_ring {
+                            let _ = dev.mcu_set_beacon(wa_ring, 0, HW_BSSID_0, &bcn_buf[..bcn_len], true, self.0.seq, None);
+                            self.0.seq = self.0.seq.wrapping_add(1);
                         }
                     }
                 }
@@ -2074,7 +2387,7 @@ impl Driver for WifiDriverWrapper {
                         // For now just log it — L2 recovery is much more complex.
                     } else if mcu_cmd & MT_MCU_CMD_STOP_DMA != 0 {
                         uwarn!("wifid", "firmware_ser_l1"; mcu_cmd = mcu_cmd);
-                        ser_l1_recover(&mut self.0, dev);
+                        ser_l1_start(&mut self.0, dev);
                     }
                 }
             }
@@ -2865,8 +3178,12 @@ impl Driver for WifiDriverWrapper {
                     b"off" | b"0" | b"false" => false,
                     _ => return Self::copy_to_buf(buf, b"ERR invalid_value\n"),
                 };
-                // Firmware beacon offload: upload/remove beacon template
-                if dev.mcu_set_beacon(wa_ring, 0, HW_BSSID_0, &self.0.mac_addr, 1, enable, self.0.seq, None).is_err() {
+                // Build beacon from AP state machine, upload to firmware
+                let mut bcn_buf = [0u8; 256];
+                let bcn_len = if let Some(ref mut ap) = self.0.ap {
+                    ap.beacon(&mut bcn_buf)
+                } else { 0 };
+                if bcn_len == 0 || dev.mcu_set_beacon(wa_ring, 0, HW_BSSID_0, &bcn_buf[..bcn_len], enable, self.0.seq, None).is_err() {
                     return Self::copy_to_buf(buf, b"ERR beacon_cmd_failed\n");
                 }
                 self.0.seq = self.0.seq.wrapping_add(1);
@@ -2880,17 +3197,36 @@ impl Driver for WifiDriverWrapper {
             }
             b"channel" => {
                 let val_str = core::str::from_utf8(value).unwrap_or("");
-                let ch: u8 = match val_str.parse::<u8>() {
+                // Parse "6" (20MHz) or "6 40+" / "6 40-" (40MHz with secondary above/below)
+                let mut parts = val_str.split_whitespace();
+                let ch_str = parts.next().unwrap_or("");
+                let bw_str = parts.next().unwrap_or("");
+                let ch: u8 = match ch_str.parse::<u8>() {
                     Ok(v) if v >= 1 && v <= 14 => v,
                     Ok(_) => return Self::copy_to_buf(buf, b"ERR range_1_14\n"),
                     Err(_) => return Self::copy_to_buf(buf, b"ERR invalid_number\n"),
                 };
+                let (bw, sec_ch_off): (u8, i8) = match bw_str {
+                    "40+" => (CMD_CBW_40MHZ, 1),
+                    "40-" => (CMD_CBW_40MHZ, -1),
+                    "" | "20" => (CMD_CBW_20MHZ, 0),
+                    _ => return Self::copy_to_buf(buf, b"ERR bw: 20|40+|40-\n"),
+                };
+                // Validate 40MHz channel (2.4GHz: need room for secondary)
+                if bw == CMD_CBW_40MHZ {
+                    if sec_ch_off > 0 && ch > 9 {
+                        return Self::copy_to_buf(buf, b"ERR ch_too_high_for_40+\n");
+                    }
+                    if sec_ch_off < 0 && ch < 5 {
+                        return Self::copy_to_buf(buf, b"ERR ch_too_low_for_40-\n");
+                    }
+                }
                 // MCU_WMWA_UNI_CMD(CHANNEL_SWITCH) — WMWA, via WA queue
-                if dev.mcu_set_chan_info(wa_ring, 0, UNI_CHANNEL_SWITCH, ch, CMD_CBW_20MHZ, CH_BAND_2GHZ, self.0.seq, None).is_err() {
+                if dev.mcu_set_chan_info(wa_ring, 0, UNI_CHANNEL_SWITCH, ch, bw, CH_BAND_2GHZ, sec_ch_off, self.0.seq, None).is_err() {
                     return Self::copy_to_buf(buf, b"ERR chan_switch_failed\n");
                 }
                 self.0.seq = self.0.seq.wrapping_add(1);
-                if dev.mcu_set_chan_info(wa_ring, 0, UNI_CHANNEL_RX_PATH, ch, CMD_CBW_20MHZ, CH_BAND_2GHZ, self.0.seq, None).is_err() {
+                if dev.mcu_set_chan_info(wa_ring, 0, UNI_CHANNEL_RX_PATH, ch, bw, CH_BAND_2GHZ, sec_ch_off, self.0.seq, None).is_err() {
                     return Self::copy_to_buf(buf, b"ERR rx_path_failed\n");
                 }
                 self.0.seq = self.0.seq.wrapping_add(1);
@@ -2911,18 +3247,25 @@ impl Driver for WifiDriverWrapper {
                     | MT_WF_RFCR1_DROP_CFACK;
                 dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR_OFS), rfcr_val);
                 dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR1_OFS), rfcr1_val);
-                // Re-upload beacon with new channel
-                if self.0.beacon_on {
-                    if dev.mcu_set_beacon(wa_ring, 0, HW_BSSID_0, &self.0.mac_addr, ch, true, self.0.seq, None).is_err() {
-                        return Self::copy_to_buf(buf, b"ERR beacon_update_failed\n");
-                    }
-                    self.0.seq = self.0.seq.wrapping_add(1);
-                }
-                // Update AP BSS config channel
+                // Update AP BSS config channel + bandwidth, then re-upload beacon
                 if let Some(ref mut ap) = self.0.ap {
                     ap.bss.channel = ch;
+                    ap.bss.bandwidth = if bw == CMD_CBW_40MHZ { 1 } else { 0 };
+                    ap.bss.secondary_channel_offset = sec_ch_off;
                 }
                 self.0.channel = ch;
+                if self.0.beacon_on {
+                    let mut bcn_buf = [0u8; 256];
+                    let bcn_len = if let Some(ref mut ap) = self.0.ap {
+                        ap.beacon(&mut bcn_buf)
+                    } else { 0 };
+                    if bcn_len > 0 {
+                        if dev.mcu_set_beacon(wa_ring, 0, HW_BSSID_0, &bcn_buf[..bcn_len], true, self.0.seq, None).is_err() {
+                            return Self::copy_to_buf(buf, b"ERR beacon_update_failed\n");
+                        }
+                        self.0.seq = self.0.seq.wrapping_add(1);
+                    }
+                }
                 unotice!("wifid", "channel_switch"; channel = ch as u32);
                 Self::copy_to_buf(buf, b"OK\n")
             }
