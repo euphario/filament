@@ -5,3 +5,12 @@ edition = "2024"
 
 [dependencies]
 userlib = { path = "../userlib" }
+
+# RustCrypto crates (all no_std compatible)
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20 = { version = "0.9", default-features = false }
+poly1305 = { version = "0.8", default-features = false }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }

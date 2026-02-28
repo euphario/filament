@@ -295,6 +295,7 @@ pub fn resource_preset(driver: &str) -> &'static ResourcePreset {
         ("usbd",     ResourcePreset { max_channels: 16, max_ports: 8, max_shmem: 8, max_children: 4 }),
         ("fatfsd",   ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 8, max_children: 0 }),
         ("partd",    ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 4, max_children: 4 }),
+        ("sshd",     ResourcePreset { max_channels: 8,  max_ports: 1, max_shmem: 8, max_children: 0 }),
     ];
 
     for (name, preset) in PRESETS.iter() {

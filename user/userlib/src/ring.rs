@@ -743,6 +743,12 @@ pub mod io_op {
     pub const NET_RECV: u8 = NET_BASE + 1;     // RX packet (CQE from NIC)
     pub const NET_LINK_UP: u8 = NET_BASE + 2;  // Link state change: up
     pub const NET_LINK_DOWN: u8 = NET_BASE + 3; // Link state change: down
+
+    // Stream opcodes (for TCP socket DataPorts)
+    pub const STREAM_DATA: u8 = NET_BASE + 8;  // Payload data (SQE: client→ipd, CQE: ipd→client)
+    pub const STREAM_EOF: u8 = NET_BASE + 9;   // Clean close (FIN received)
+    pub const STREAM_RST: u8 = NET_BASE + 10;  // Connection reset
+    pub const STREAM_RX_DONE: u8 = NET_BASE + 11; // Consumer done with RX buffer, provider can free
 }
 
 /// Layered I/O completion status codes
@@ -760,6 +766,13 @@ pub mod io_status {
     /// from RX data CQEs. Consumers check this bit to route CQEs correctly:
     /// TX_DONE CQEs trigger pool reclaim, non-TX_DONE CQEs are RX frames.
     pub const CQE_FLAG_TX_DONE: u16 = 0x8000;
+
+    // Stream CQE flags (for TCP socket DataPorts)
+    // Stored in lower byte of IoCqe.flags to indicate stream event type.
+    pub const CQE_STREAM_DATA: u16 = 0x0001; // Payload data available at result offset
+    pub const CQE_STREAM_EOF: u16 = 0x0002;  // Clean close (FIN)
+    pub const CQE_STREAM_RST: u16 = 0x0003;  // Connection reset
+    pub const CQE_STREAM_TX_DONE: u16 = 0x0004; // TX buffer consumed, consumer can free offset
 }
 
 /// Layered I/O SQE flags

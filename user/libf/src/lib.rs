@@ -11,8 +11,10 @@
 
 extern crate alloc;
 
+pub mod crypto;
 pub mod fmt;
 pub mod io;
+pub mod net;
 pub mod parse;
 pub mod str;
 

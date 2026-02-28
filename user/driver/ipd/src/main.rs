@@ -26,6 +26,7 @@ extern crate alloc;
 mod device;
 mod dhcp_server;
 mod rsh;
+mod socket_svc;
 mod tftp;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
@@ -43,6 +44,7 @@ use userlib::{uinfo, udebug, uerror};
 use device::{RxOffsetQueue, SmolDevice, TxTracker, DataPathStats};
 use rsh::RemoteShell;
 use dhcp_server::DhcpServer;
+use socket_svc::SocketService;
 use tftp::TftpServer;
 use userlib::vfs_client::VfsClient;
 
@@ -54,6 +56,9 @@ const TAG_DISCOVERY_TIMER: u32 = 1;
 const TAG_POLL_TIMER: u32 = 2;
 const TAG_DHCP_FALLBACK_TIMER: u32 = 3;
 const TAG_RSH_SHELL_RESPONSE: u32 = 4;
+const TAG_SOCKET_SVC_PORT: u32 = 5;
+/// Socket service client channels: TAG_SOCKET_CLIENT_BASE + slot_index
+const TAG_SOCKET_CLIENT_BASE: u32 = 0x100;
 const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
 const DHCP_FALLBACK_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
 const NIC_PORT_NAMES: &[&[u8]] = &[b"wifi:0"];
@@ -77,7 +82,8 @@ const RSH_PORT: u16 = 23;
 // of the SmolStack that holds the SocketSet.
 // =============================================================================
 
-const SOCKET_SLOTS: usize = 6;
+/// 6 base sockets + 8 socket service connections
+const SOCKET_SLOTS: usize = 6 + SocketService::extra_socket_slots();
 const UDP_META_SLOTS: usize = 8;
 const UDP_BUF_SIZE: usize = 4096;
 const TCP_BUF_SIZE: usize = 4096;
@@ -198,6 +204,8 @@ struct IpdDriver {
     last_rx_len: u32,
     last_rx_offset: u32,
     pool_base_diag: u64,
+    /// Socket service: exposes TCP sockets to external processes via DataPorts.
+    socket_svc: SocketService,
 }
 
 impl IpdDriver {
@@ -230,6 +238,7 @@ impl IpdDriver {
             last_rx_len: 0,
             last_rx_offset: 0,
             pool_base_diag: 0,
+            socket_svc: SocketService::new(),
         }
     }
 
@@ -432,6 +441,14 @@ impl IpdDriver {
             udebug!("ipd", "dhcp_start";);
         }
 
+        // Initialize socket service (register "tcp:" port)
+        self.socket_svc.init();
+        if let Some(handle) = self.socket_svc.port_handle() {
+            if ctx.watch_handle(handle, TAG_SOCKET_SVC_PORT).is_err() {
+                uerror!("ipd", "watch_failed"; tag = "socket_svc");
+            }
+        }
+
         udebug!("ipd", "smoltcp_ready"; sockets = SOCKET_SLOTS as u32);
     }
 
@@ -469,7 +486,17 @@ impl IpdDriver {
     fn arm_poll_timer(&mut self, delay_ms: Option<u64>, ctx: &mut dyn BusCtx) {
         let ns = match delay_ms {
             Some(ms) if ms > 0 => ms * 1_000_000,
-            _ => 1_000_000_000, // Default 1s
+            _ => {
+                // When TCP connections are active, poll every 10ms so we
+                // promptly drain DataPort SQEs (TX from clients).  Without
+                // this, the default 1s sleep starves client writes — the
+                // consumer pool fills up and the client blocks.
+                if self.socket_svc.has_established() {
+                    10_000_000 // 10ms
+                } else {
+                    1_000_000_000 // 1s
+                }
+            }
         };
 
         if let Some(ref mut timer) = self.poll_timer {
@@ -796,6 +823,9 @@ impl IpdDriver {
             }
             _ => {} // No change
         }
+
+        // Poll socket service: bridge TCP sockets ↔ DataPorts
+        self.socket_svc.poll(&mut stack.sockets);
 
         // Re-poll after socket processing (smoltcp may have TX to send)
         if let Some(port) = ctx.block_port(self.nic_port) {
@@ -1386,6 +1416,33 @@ impl Driver for IpdDriver {
                     }
 
                     // Re-poll to flush any TCP data
+                    let now = Self::smoltcp_now();
+                    if let Some(port) = ctx.block_port(self.nic_port) {
+                        let mut device = SmolDevice::new(port, &mut self.rx_queue, &mut self.tx_tracker, &mut self.stats, self.group_id);
+                        stack.iface.poll(now, &mut device, &mut stack.sockets);
+                    }
+                }
+            }
+            TAG_SOCKET_SVC_PORT => {
+                // New client connecting to "tcp:" port — accept and watch
+                if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
+                    while let Some((handle, slot)) = self.socket_svc.accept_clients() {
+                        let tag = TAG_SOCKET_CLIENT_BASE + slot;
+                        if ctx.watch_handle(handle, tag).is_err() {
+                            uerror!("ipd", "watch_failed"; tag = tag);
+                        }
+                    }
+                    // Poll immediately to handle any pending LISTEN messages
+                    self.socket_svc.poll(&mut stack.sockets);
+                }
+            }
+            t if t >= TAG_SOCKET_CLIENT_BASE && t < TAG_SOCKET_CLIENT_BASE + 256 => {
+                // Client channel readable — process control message
+                let slot = (t - TAG_SOCKET_CLIENT_BASE) as usize;
+                if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
+                    self.socket_svc.process_client_msg(slot, &mut stack.sockets);
+
+                    // Re-poll to flush TCP data from new connections
                     let now = Self::smoltcp_now();
                     if let Some(port) = ctx.block_port(self.nic_port) {
                         let mut device = SmolDevice::new(port, &mut self.rx_queue, &mut self.tx_tracker, &mut self.stats, self.group_id);
