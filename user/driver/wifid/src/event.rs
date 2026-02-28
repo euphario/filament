@@ -24,8 +24,10 @@ pub enum RxFrameClass {
     ProbeResp,
     Auth,
     AssocReq,
+    ReassocReq,
     Deauth,
     Disassoc,
+    Action,
     TxStatus,
     TxrxNotify,
     FwMonitor,
@@ -103,12 +105,14 @@ pub fn refine_mgmt_subtype(fc0: u8) -> RxFrameClass {
     let subtype = (fc0 >> 4) & 0xF;
     match subtype {
         0x0 => RxFrameClass::AssocReq,   // Association Request
+        0x2 => RxFrameClass::ReassocReq, // Reassociation Request
         0x4 => RxFrameClass::ProbeReq,   // Probe Request
         0x5 => RxFrameClass::ProbeResp,  // Probe Response
         0x8 => RxFrameClass::Beacon,     // Beacon
         0xA => RxFrameClass::Disassoc,   // Disassociation
         0xB => RxFrameClass::Auth,        // Authentication
         0xC => RxFrameClass::Deauth,      // Deauthentication
+        0xD => RxFrameClass::Action,      // Action
         _ => RxFrameClass::Mgmt,
     }
 }
@@ -191,9 +195,12 @@ impl RxMibCounters {
                 self.mgmt = self.mgmt.wrapping_add(1);
                 self.auth = self.auth.wrapping_add(1);
             }
-            RxFrameClass::AssocReq => {
+            RxFrameClass::AssocReq | RxFrameClass::ReassocReq => {
                 self.mgmt = self.mgmt.wrapping_add(1);
                 self.assoc_req = self.assoc_req.wrapping_add(1);
+            }
+            RxFrameClass::Action => {
+                self.mgmt = self.mgmt.wrapping_add(1);
             }
             RxFrameClass::Deauth | RxFrameClass::Disassoc => {
                 self.mgmt = self.mgmt.wrapping_add(1);

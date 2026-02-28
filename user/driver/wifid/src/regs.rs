@@ -260,6 +260,17 @@ pub const MT_MCU_CMD_WM_WDT: u32 = 1u32 << 30;
 pub const MT_MCU_CMD_WA_WDT: u32 = 1u32 << 31;
 pub const MT_MCU_CMD_WDT_MASK: u32 = MT_MCU_CMD_WA_WDT | MT_MCU_CMD_WM_WDT;
 
+// MCU interrupt event register — host writes to notify firmware during SER L1 recovery
+// Linux: regs.h:136-139
+pub const MT_MCU_INT_EVENT: u32 = 0x2108;
+pub const MT_MCU_INT_EVENT_DMA_STOPPED: u32 = 1 << 0;
+pub const MT_MCU_INT_EVENT_DMA_INIT: u32 = 1 << 1;
+pub const MT_MCU_INT_EVENT_RESET_DONE: u32 = 1 << 3;
+
+// MCU host interrupt enable — for WDT mask control during full reset
+// Linux: regs.h:434
+pub const MT_WFDMA0_MCU_HOST_INT_ENA: u32 = mt_wfdma0(0x1f4);
+
 pub const MT_INT_RX_DONE_MCU: u32 = MT_INT_RX_DONE_WM | MT_INT_RX_DONE_WA;
 
 /// Combined mask of all RX done interrupt bits
@@ -442,9 +453,11 @@ pub const MT_TX_RATE_MODE: u32 = 0x3C0;                        // GENMASK(9,6)
 pub const MT_TX_RATE_IDX: u32 = 0x3F;                          // GENMASK(5,0)
 
 // PHY mode bits — mt76_connac_mcu.h:915-920
-pub const PHY_MODE_B: u8 = 1 << 1;   // BIT(1) = 0x02
-pub const PHY_MODE_G: u8 = 1 << 2;   // BIT(2) = 0x04
-pub const PHY_MODE_GN: u8 = 1 << 3;  // BIT(3) = 0x08
+pub const PHY_MODE_A: u8 = 1 << 0;   // BIT(0) = 0x01 — 11a OFDM (5GHz)
+pub const PHY_MODE_B: u8 = 1 << 1;   // BIT(1) = 0x02 — 11b CCK (2.4GHz)
+pub const PHY_MODE_G: u8 = 1 << 2;   // BIT(2) = 0x04 — 11g OFDM (2.4GHz)
+pub const PHY_MODE_GN: u8 = 1 << 3;  // BIT(3) = 0x08 — 11n HT (2.4GHz)
+pub const PHY_MODE_AN: u8 = 1 << 4;  // BIT(4) = 0x10 — 11n HT (5GHz)
 
 // ============================================================================
 // MCU UNI command IDs — from mt76_connac_mcu.h enum
@@ -542,9 +555,23 @@ pub const UNI_BSS_INFO_MLD: u16 = 26;
 
 // STA_REC TLV tags — mt76_connac_mcu.h:802-836
 pub const STA_REC_BASIC: u16 = 0;
+pub const STA_REC_RA: u16 = 1;            // Rate adaptation — mt76_connac_mcu.h:804
 pub const STA_REC_BA: u16 = 6;            // Block Ack session — mt76_connac_mcu.h:809
 pub const STA_REC_TX_PROC: u16 = 8;       // for hdr trans and CSO in CR4
+pub const STA_REC_HT: u16 = 9;            // HT capabilities — mt76_connac_mcu.h:812
 pub const STA_REC_HDR_TRANS: u16 = 0x2B;
+
+// STA capability flags for STA_REC_RA sta_cap field — mt76_connac_mcu.h:1128-1146
+pub const STA_CAP_WMM: u32      = 1 << 0;
+pub const STA_CAP_SGI_20: u32   = 1 << 4;
+pub const STA_CAP_SGI_40: u32   = 1 << 5;
+pub const STA_CAP_TX_STBC: u32  = 1 << 6;
+pub const STA_CAP_RX_STBC: u32  = 1 << 7;
+pub const STA_CAP_HT: u32       = 1 << 11;
+pub const STA_CAP_LDPC: u32     = 1 << 15;
+
+// RCPI initial value — mt76_connac_mcu.c INIT_RCPI
+pub const INIT_RCPI: u8 = 180;
 
 // VOW (airtime fairness) — mcu.h:860
 pub const UNI_VOW_DRR_CTRL: u16 = 0;

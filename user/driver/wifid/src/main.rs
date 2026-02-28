@@ -143,6 +143,8 @@ struct WifiDriver {
     tx_inflight_tags: [u32; TX_INFLIGHT_SIZE],
     /// Cached DataPort pool physical address (for zero-copy TX).
     pool_phys: u64,
+    /// SER L1 recovery count.
+    ser_count: u32,
 }
 
 impl WifiDriver {
@@ -190,6 +192,7 @@ impl WifiDriver {
             dp_stats: WifiDataPathStats::new(),
             tx_inflight_tags: [u32::MAX; TX_INFLIGHT_SIZE],
             pool_phys: 0,
+            ser_count: 0,
         }
     }
 
@@ -693,19 +696,13 @@ impl WifiDriver {
     udebug!("wifid", "enable_nf_ok");
 
     // Configure RX filter — Linux init.c:414 + main.c:432-454 mt7996_phy_set_rxfilter()
-    // Linux default: phy->rxfilter = DROP_OTHER_UC, then phy_set_rxfilter() expands
-    // to DROP_OTHER_UC | DROP_CTS | DROP_RTS | DROP_CTL_RSV | DROP_FCSFAIL.
-    //
-    // NOTE: 0xE002 (bits 15,14,13,1) = DROP_RTS|CTS|CTL_RSV|FCSFAIL — this IS our
-    // value, not a firmware overwrite. Previous 0xE002="firmware overwrite" was a hex
-    // calculation error (bits 11,10,9 would be 0x0E02=3586, not 0xE002=57346).
-    //
-    // DROP_FCSFAIL omitted for now: RFCR=0 (which clears DROP_FCSFAIL) allowed auth
-    // frames through in previous tests. Possible that auth frames arrive with FCS
-    // errors due to radio calibration. Test without it to isolate.
-    let rfcr_val: u32 = MT_WF_RFCR_DROP_CTL_RSV
+    // Match Linux mt7996_configure_filter() default: DROP_OTHER_UC base filter
+    // plus CTL_RSV+CTS+RTS+FCSFAIL (main.c:442-446).
+    let rfcr_val: u32 = MT_WF_RFCR_DROP_OTHER_UC
+        | MT_WF_RFCR_DROP_CTL_RSV
         | MT_WF_RFCR_DROP_CTS
-        | MT_WF_RFCR_DROP_RTS;
+        | MT_WF_RFCR_DROP_RTS
+        | MT_WF_RFCR_DROP_FCSFAIL;
     dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR_OFS), rfcr_val);
     // Secondary filter: drop ACK, BF_POLL, BA, CFEND, CFACK
     let rfcr1_val: u32 = MT_WF_RFCR1_DROP_ACK
@@ -1133,6 +1130,144 @@ fn tx_sweep_and_complete(
             port.notify();
         }
     }
+}
+
+/// SER L1 (System Error Recovery Level 1) — firmware-cooperative DMA reset.
+///
+/// When the data path stalls (band0 RX frozen but MCU alive), this function
+/// performs the Linux SER L1 recovery sequence:
+///   1. Signal firmware DMA_STOPPED
+///   2. Wait for firmware RESET_DONE
+///   3. Disable DMA, reset all ring indices, refill RX rings
+///   4. Signal firmware DMA_INIT, wait for RECOVERY_DONE
+///   5. Signal RESET_DONE, wait for NORMAL_STATE
+///   6. Re-enable DMA
+///
+/// Source: Linux mt7996/mac.c:2534-2648 mt7996_mac_reset_work()
+fn ser_l1_recover(drv: &mut WifiDriver, dev: &Mt7996Dev) {
+    unotice!("wifid", "ser_l1_start"; count = drv.ser_count);
+    drv.ser_count += 1;
+
+    // Step 1: Tell firmware we've stopped DMA
+    // Linux: mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED)
+    dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
+
+    // Step 2: Wait for firmware to signal RESET_DONE (up to 5 seconds)
+    // Linux: mt7996_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE) with 30s timeout
+    // We poll MT_MCU_CMD directly since we don't have the interrupt pathway.
+    let got_reset_done = dev.mt76_poll_msec(MT_MCU_CMD, MT_MCU_CMD_RESET_DONE,
+                                             MT_MCU_CMD_RESET_DONE, 5000);
+    if !got_reset_done {
+        uerror!("wifid", "ser_l1_timeout"; step = 1);
+        // Still try to continue — worst case DMA stays broken
+    }
+    // Clear the bit we just read (write-1-clear)
+    let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
+    dev.mt76_wr(MT_MCU_CMD, mcu_cmd);
+
+    // Step 3: Reset DMA hardware
+    // Linux: mt7996_dma_reset(dev, false) — disable DMA, reset queues, refill
+
+    // 3a: Disable DMA engines (no logic reset — firmware is still alive)
+    // Linux: dma.c mt7996_dma_disable(dev, false)
+    dev.mt7996_dma_disable(false);
+    userlib::delay_ms(1);
+
+    // 3b: Reset TX band0 ring
+    if let Some(ref mut ring) = drv.tx_band0 {
+        // Zero all descriptors and set DMA_DONE
+        for i in 0..ring.ndesc as usize {
+            let desc_ptr = ring.desc(i as u32);
+            unsafe {
+                core::ptr::write_volatile(&mut (*desc_ptr).buf0, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).buf1, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, MT_DMA_CTL_DMA_DONE);
+            }
+        }
+        // Reprogram queue: CPU_IDX=0, DMA_IDX=0
+        dev.program_queue(ring.regs_base, 0, ring.desc_phys, ring.ndesc);
+        ring.cpu_idx = 0;
+        ring.sweep_idx = 0;
+    }
+
+    // 3c: Reset MCU WA TX ring
+    if let Some(ref mut ring) = drv.wa_ring {
+        for i in 0..ring.ndesc as usize {
+            let desc_ptr = ring.desc(i as u32);
+            unsafe {
+                core::ptr::write_volatile(&mut (*desc_ptr).buf0, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).buf1, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, MT_DMA_CTL_DMA_DONE);
+            }
+        }
+        dev.program_queue(ring.regs_base, 0, ring.desc_phys, ring.ndesc);
+        ring.cpu_idx = 0;
+        ring.sweep_idx = 0;
+    }
+
+    // 3d: Reset all RX rings and refill
+    for qi in 0..drv.rx_queue_count {
+        let q = &mut drv.rx_queues[qi];
+        // Zero descriptors
+        for i in 0..q.ndesc as usize {
+            let desc_ptr = unsafe { (q.desc_virt as *mut dma::Mt76Desc).add(i) };
+            unsafe {
+                core::ptr::write_volatile(&mut (*desc_ptr).buf0, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).buf1, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).info, 0);
+                core::ptr::write_volatile(&mut (*desc_ptr).ctrl, MT_DMA_CTL_DMA_DONE);
+            }
+        }
+        // Reprogram queue indices
+        dev.mt76_wr(q.regs_base + MT_QUEUE_CPU_IDX, 0);
+        dev.mt76_wr(q.regs_base + MT_QUEUE_DMA_IDX, 0);
+        q.reset_counters();
+        // Refill RX buffers
+        dev.rx_fill(q);
+    }
+
+    // 3e: Clear TX inflight tokens (all orphaned after reset)
+    for i in 0..TX_INFLIGHT_SIZE {
+        drv.tx_inflight_tags[i] = u32::MAX;
+    }
+
+    // 3f: Reset statistics and stall detection state
+    drv.tx_token = 0;
+    drv.tx_freed = 0;
+    drv.tx_free_entries = 0;
+    drv.tx_free_notify_count = 0;
+
+    // Step 4: Signal firmware DMA_INIT, wait for RECOVERY_DONE
+    // Linux: mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT)
+    dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+
+    let got_recovery = dev.mt76_poll_msec(MT_MCU_CMD, MT_MCU_CMD_RECOVERY_DONE,
+                                           MT_MCU_CMD_RECOVERY_DONE, 5000);
+    if !got_recovery {
+        uerror!("wifid", "ser_l1_timeout"; step = 4);
+    }
+    let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
+    dev.mt76_wr(MT_MCU_CMD, mcu_cmd);
+
+    // Step 5: Signal RESET_DONE, wait for NORMAL_STATE
+    dev.mt76_wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+
+    let got_normal = dev.mt76_poll_msec(MT_MCU_CMD, MT_MCU_CMD_NORMAL_STATE,
+                                         MT_MCU_CMD_NORMAL_STATE, 5000);
+    if !got_normal {
+        uerror!("wifid", "ser_l1_timeout"; step = 5);
+    }
+    let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
+    dev.mt76_wr(MT_MCU_CMD, mcu_cmd);
+
+    // Step 6: Re-enable DMA
+    // Linux: mt7996_dma_start(dev, false, false)
+    dev.mt7996_dma_enable(false);
+    dev.mt7996_dma_start(false, false);
+
+    unotice!("wifid", "ser_l1_done"; count = drv.ser_count);
 }
 
 /// Format "prefix=value\n" into buffer, return bytes written.
@@ -1601,6 +1736,9 @@ impl Driver for WifiDriverWrapper {
             let mut tx_len = 0usize;
             let mut register_mac = [0u8; 6];
             let mut register_aid = 0u16;
+            let mut register_ht_cap = 0u16;
+            let mut register_ht_param = 0u8;
+            let mut register_flags = 0u16;
             let mut do_register = false;
             let mut remove_mac = [0u8; 6];
             let mut remove_aid = 0u16;
@@ -1626,9 +1764,12 @@ impl Driver for WifiDriverWrapper {
                                 tx_frame[..n].copy_from_slice(&data[..n]);
                                 tx_len = n;
                             }
-                            ApAction::RegisterSta { mac, aid } => {
+                            ApAction::RegisterSta { mac, aid, ht_cap, ht_param, flags } => {
                                 register_mac = *mac;
                                 register_aid = *aid;
+                                register_ht_cap = *ht_cap;
+                                register_ht_param = *ht_param;
+                                register_flags = *flags;
                                 do_register = true;
                             }
                             ApAction::RemoveSta { mac, aid, wlan_idx } => {
@@ -1707,6 +1848,7 @@ impl Driver for WifiDriverWrapper {
                     if let Err(e) = dev.mcu_add_client_sta(
                         wa_ring, 0, wlan_idx, HW_BSSID_0,
                         CONN_STATE_CONNECT, &register_mac, register_aid, true, seq, None, false,
+                        register_ht_cap, register_ht_param, register_flags,
                     ) {
                         uerror!("wifid", "mcu_sta_connect_failed"; err = e as u32, wlan = wlan_idx as u32);
                     }
@@ -1715,6 +1857,7 @@ impl Driver for WifiDriverWrapper {
                     if let Err(e) = dev.mcu_add_client_sta(
                         wa_ring, 0, wlan_idx, HW_BSSID_0,
                         CONN_STATE_PORT_SECURE, &register_mac, register_aid, false, seq, None, false,
+                        register_ht_cap, register_ht_param, register_flags,
                     ) {
                         uerror!("wifid", "mcu_sta_port_secure_failed"; err = e as u32, wlan = wlan_idx as u32);
                     }
@@ -1722,6 +1865,16 @@ impl Driver for WifiDriverWrapper {
                     self.0.seq = self.0.seq.wrapping_add(1);
                     if let Err(e) = dev.mcu_add_group(wa_ring, 0, wlan_idx, seq, None, false) {
                         uerror!("wifid", "mcu_add_group_failed"; err = e as u32, wlan = wlan_idx as u32);
+                    }
+                    // Send STA_REC_RA for rate adaptation — must follow add_sta.
+                    // Without this, firmware has no rate table → uses lowest rate → PLE stall.
+                    let seq = self.0.seq;
+                    self.0.seq = self.0.seq.wrapping_add(1);
+                    if let Err(e) = dev.mcu_sta_rate_ctrl(
+                        wa_ring, 0, wlan_idx, HW_BSSID_0,
+                        self.0.channel, register_ht_cap, register_ht_param, register_flags, seq,
+                    ) {
+                        uerror!("wifid", "mcu_sta_rate_ctrl_failed"; err = e as u32, wlan = wlan_idx as u32);
                     }
                 }
 
@@ -1740,6 +1893,7 @@ impl Driver for WifiDriverWrapper {
                     let _ = dev.mcu_add_client_sta(
                         wa_ring, 0, remove_wlan_idx, HW_BSSID_0,
                         CONN_STATE_DISCONNECT, &remove_mac, remove_aid, false, seq, None, false,
+                        0, 0, 0, // HT caps irrelevant for disconnect
                     );
                 }
             }
@@ -1894,8 +2048,33 @@ impl Driver for WifiDriverWrapper {
                             let _ = dev.mcu_add_client_sta(
                                 wa_ring, 0, wlan_idx, HW_BSSID_0,
                                 CONN_STATE_DISCONNECT, &mac, aid, false, seq, None, false,
+                                0, 0, 0, // HT caps irrelevant for disconnect
                             );
                         }
+                    }
+                }
+            }
+
+            // Firmware-initiated SER: poll MT_MCU_CMD for error/WDT bits.
+            // Linux reads this in IRQ handler (mmio.c:781-788); we poll since
+            // we don't have the MCU interrupt wired up.
+            // Source: Linux mt7996/mmio.c mt7996_irq_tasklet()
+            {
+                let mcu_cmd = dev.mt76_rr(MT_MCU_CMD);
+                if mcu_cmd & (MT_MCU_CMD_ERROR_MASK | MT_MCU_CMD_WDT_MASK) != 0 {
+                    // Ack by writing back — Linux mmio.c:784
+                    dev.mt76_wr(MT_MCU_CMD, mcu_cmd);
+
+                    if mcu_cmd & MT_MCU_CMD_WDT_MASK != 0 {
+                        uerror!("wifid", "firmware_wdt";
+                            mcu_cmd = mcu_cmd,
+                            wm = ((mcu_cmd & MT_MCU_CMD_WM_WDT) != 0) as u32,
+                            wa = ((mcu_cmd & MT_MCU_CMD_WA_WDT) != 0) as u32);
+                        // WDT = firmware crash. Full reset needed (L2+), not L1.
+                        // For now just log it — L2 recovery is much more complex.
+                    } else if mcu_cmd & MT_MCU_CMD_STOP_DMA != 0 {
+                        uwarn!("wifid", "firmware_ser_l1"; mcu_cmd = mcu_cmd);
+                        ser_l1_recover(&mut self.0, dev);
                     }
                 }
             }
@@ -2723,7 +2902,8 @@ impl Driver for WifiDriverWrapper {
                 // Re-set RFCR after channel switch
                 let rfcr_val: u32 = MT_WF_RFCR_DROP_CTL_RSV
                     | MT_WF_RFCR_DROP_CTS
-                    | MT_WF_RFCR_DROP_RTS;
+                    | MT_WF_RFCR_DROP_RTS
+                    | MT_WF_RFCR_DROP_FCSFAIL;
                 let rfcr1_val: u32 = MT_WF_RFCR1_DROP_ACK
                     | MT_WF_RFCR1_DROP_BF_POLL
                     | MT_WF_RFCR1_DROP_BA
@@ -2782,10 +2962,11 @@ impl Driver for WifiDriverWrapper {
                     }
                     b"normal" => {
                         // Restore AP default filter
-                        let rfcr: u32 = MT_WF_RFCR_DROP_CTL_RSV
+                        let rfcr: u32 = MT_WF_RFCR_DROP_OTHER_UC
+                            | MT_WF_RFCR_DROP_CTL_RSV
                             | MT_WF_RFCR_DROP_CTS
                             | MT_WF_RFCR_DROP_RTS
-                            ;
+                            | MT_WF_RFCR_DROP_FCSFAIL;
                         dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR_OFS), rfcr);
                         let rfcr1: u32 = MT_WF_RFCR1_DROP_ACK
                             | MT_WF_RFCR1_DROP_BF_POLL
@@ -2967,7 +3148,8 @@ impl Driver for WifiDriverWrapper {
                 // Step 9: Restore RFCR to normal AP filter
                 let rfcr_val: u32 = MT_WF_RFCR_DROP_CTL_RSV
                     | MT_WF_RFCR_DROP_CTS
-                    | MT_WF_RFCR_DROP_RTS;
+                    | MT_WF_RFCR_DROP_RTS
+                    | MT_WF_RFCR_DROP_FCSFAIL;
                 let rfcr1_val: u32 = MT_WF_RFCR1_DROP_ACK
                     | MT_WF_RFCR1_DROP_BF_POLL
                     | MT_WF_RFCR1_DROP_BA

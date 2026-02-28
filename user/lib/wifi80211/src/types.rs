@@ -215,8 +215,17 @@ pub enum MgmtSubtype {
 pub enum ApAction<'a> {
     /// Transmit a raw 802.11 frame (no TXD — driver prepends its own)
     TxFrame(&'a [u8]),
-    /// Tell firmware about a new associated STA
-    RegisterSta { mac: [u8; 6], aid: u16 },
+    /// Tell firmware about a new associated STA (with HT capabilities)
+    RegisterSta {
+        mac: [u8; 6],
+        aid: u16,
+        /// HT capability info from IE 45 (0 if not HT)
+        ht_cap: u16,
+        /// A-MPDU parameters from IE 45 byte 3
+        ht_param: u8,
+        /// STA_FLAG_HT, STA_FLAG_QOS, STA_FLAG_SGI20
+        flags: u16,
+    },
     /// Remove STA from firmware (mac needed for DISCONNECT MCU command)
     RemoveSta { mac: [u8; 6], aid: u16, wlan_idx: u16 },
     /// Notify firmware about a BA session start/stop (STA_REC_BA MCU command).

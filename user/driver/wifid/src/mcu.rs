@@ -1920,16 +1920,23 @@ impl Mt7996Dev {
     ///   - muar_idx = omac_idx (maps to specific OMAC, not wildcard)
     ///
     /// Source: Linux mt76_connac_mcu.c:388-415 (link_sta != NULL path)
+    ///         mt7996/mcu.c:1391-1407 mt7996_mcu_sta_ht_tlv()
     pub fn mcu_add_client_sta(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
                               omac_idx: u8, conn_state: u8, mac_addr: &[u8; 6],
                               aid: u16, newly: bool, seq: u8,
-                              irq: Option<&mut FwIrq>, wait: bool) -> Result<(), i32> {
-        let mut data = [0u8; 44];
+                              irq: Option<&mut FwIrq>, wait: bool,
+                              ht_cap: u16, ht_param: u8, sta_flags: u16,
+                              ) -> Result<(), i32> {
+        let has_ht = sta_flags & wifi80211::types::STA_FLAG_HT != 0;
+        // Buffer: sta_req_hdr(8) + BASIC(20) + HDR_TRANS(8) + TX_PROC(8) + HT(12) = 56
+        let tlv_count: u16 = if has_ht { 4 } else { 3 };
+        let total_size: usize = if has_ht { 56 } else { 44 };
+        let mut data = [0u8; 56];
 
         // === sta_req_hdr (8 bytes) ===
         data[0] = bss_idx;
         data[1] = wlan_idx as u8;
-        data[2..4].copy_from_slice(&3u16.to_le_bytes()); // tlv_num = 3
+        data[2..4].copy_from_slice(&tlv_count.to_le_bytes());
         data[4] = 1; // is_tlv_append
         // muar_idx: for real STAs with link_sta, use omac_idx
         // Linux: mt76_connac_mcu.c:280 — if (wcid->sta) muar_idx = mvif->omac_idx
@@ -1963,10 +1970,152 @@ impl Mt7996Dev {
         data[off..off + 2].copy_from_slice(&STA_REC_TX_PROC.to_le_bytes());
         data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
 
+        // === STA_REC_HT TLV (12 bytes) — mt7996/mcu.c:1391-1407 ===
+        // struct sta_rec_ht_uni: tag(2) + len(2) + ht_cap(2) + ht_cap_ext(2) + ampdu_param(1) + rsv(3)
+        // Without this, firmware uses legacy (non-HT) mode — no aggregation, PLE stall.
+        if has_ht {
+            let off = 44;
+            data[off..off + 2].copy_from_slice(&STA_REC_HT.to_le_bytes());  // tag = 9
+            data[off + 2..off + 4].copy_from_slice(&12u16.to_le_bytes());   // len = 12
+            data[off + 4..off + 6].copy_from_slice(&ht_cap.to_le_bytes());  // ht_cap
+            // ht_cap_ext: leave 0 (we don't parse extended HT caps from assoc req)
+            data[off + 8] = ht_param;                                       // ampdu_param
+            // rsv[3] = 0
+        }
+
         let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
 
-        udebug!("mcu", "add_client_sta"; bss = bss_idx, wlan = wlan_idx, state = conn_state, aid = aid);
-        self.mcu_send_uni_cmd(ring, cmd, &data, wait, seq, irq)
+        udebug!("mcu", "add_client_sta"; bss = bss_idx, wlan = wlan_idx, state = conn_state,
+                aid = aid, ht = has_ht as u8, ht_cap = ht_cap);
+        self.mcu_send_uni_cmd(ring, cmd, &data[..total_size], wait, seq, irq)
+    }
+
+    /// Send STA_REC_RA TLV for rate adaptation.
+    /// Source: Linux mt7996/mcu.c:2169-2274 mt7996_mcu_sta_rate_ctrl_tlv()
+    ///
+    /// Must be sent AFTER mcu_add_client_sta so firmware has the STA record.
+    /// Sets auto_rate=true so firmware does dynamic rate adaptation.
+    ///
+    /// Layout: sta_req_hdr(8) + sta_rec_ra_uni(58) = 66 bytes
+    pub fn mcu_sta_rate_ctrl(&self, ring: &mut TxRing, bss_idx: u8, wlan_idx: u16,
+                             omac_idx: u8, channel: u8, ht_cap: u16, ht_param: u8,
+                             sta_flags: u16, seq: u8) -> Result<(), i32> {
+        let has_ht = sta_flags & wifi80211::types::STA_FLAG_HT != 0;
+        let is_5g = channel >= 36;
+        let mut data = [0u8; 66]; // sta_req_hdr(8) + sta_rec_ra_uni(58)
+
+        // === sta_req_hdr (8 bytes) ===
+        data[0] = bss_idx;
+        data[1] = wlan_idx as u8;
+        data[2..4].copy_from_slice(&1u16.to_le_bytes()); // tlv_num = 1
+        data[4] = 1; // is_tlv_append
+        data[5] = omac_idx;
+        data[6] = (wlan_idx >> 8) as u8;
+
+        // === STA_REC_RA TLV (58 bytes) — mt7996/mcu.c:2169-2274 ===
+        // struct sta_rec_ra_uni: see mt7996/mcu.h
+        let off = 8;
+        data[off..off + 2].copy_from_slice(&STA_REC_RA.to_le_bytes());     // tag = 1
+        data[off + 2..off + 4].copy_from_slice(&58u16.to_le_bytes());      // len = 58
+
+        data[off + 4] = 1; // valid = true
+        data[off + 5] = 1; // auto_rate = true
+
+        // phy_mode — mt76_connac_get_phy_mode() in mt76_connac_mcu.c:922-965
+        let phy_mode: u8 = if is_5g {
+            if has_ht { PHY_MODE_A | PHY_MODE_AN } else { PHY_MODE_A }
+        } else {
+            if has_ht { PHY_MODE_B | PHY_MODE_G | PHY_MODE_GN } else { PHY_MODE_B | PHY_MODE_G }
+        };
+        data[off + 6] = phy_mode;   // phy_mode
+        data[off + 7] = channel;    // channel
+
+        data[off + 8] = 0;          // bw = 0 (20MHz)
+        data[off + 9] = if is_5g { 1 } else { 0 }; // disable_cck (5GHz = no CCK)
+
+        // ht_mcs32, ht_gf: leave 0 (not supported)
+
+        // ht_mcs[4] at offset 12 — MCS bitmask (1 byte per spatial stream)
+        // MCS 0-7 = 1 spatial stream. Linux: mt7996_mcu_set_sta_ht_mcs()
+        // copies from ht_cap.mcs.rx_mask[0..3]
+        if has_ht {
+            data[off + 12] = 0xFF;  // MCS 0-7 supported (1 stream)
+            // ht_mcs[1..3] = 0 for 1-stream (conservative — we don't parse MCS set from assoc)
+        }
+
+        // mmps_mode at offset 16: 3 = disabled (static SMPS)
+        // Linux: mt7996_mcu_get_mmps_mode() — returns 3 if SMPS_OFF
+        data[off + 16] = 3; // SMPS disabled
+
+        // af (AMPDU factor) at offset 18 — from HT capabilities AMPDU params
+        // Linux: max of HT and VHT factors. We only have HT.
+        // AMPDU factor = bits[1:0] of ht_param
+        data[off + 18] = ht_param & 0x03; // af = ampdu_factor
+
+        // rate_len at offset 20 — number of legacy rates
+        data[off + 20] = if is_5g { 8 } else { 12 }; // OFDM=8, CCK+OFDM=4+8=12
+
+        // supp_mode at offset 21 — same as phy_mode
+        data[off + 21] = phy_mode;
+
+        // supp_cck_rate at offset 22 — 4 CCK rates (1, 2, 5.5, 11 Mbps)
+        data[off + 22] = if is_5g { 0 } else { 0x0F };
+
+        // supp_ofdm_rate at offset 23 — 8 OFDM rates (6-54 Mbps)
+        data[off + 23] = 0xFF;
+
+        // supp_ht_mcs at offset 24 (le32) — same as ht_mcs
+        if has_ht {
+            data[off + 24..off + 28].copy_from_slice(&0x000000FFu32.to_le_bytes());
+        }
+
+        // supp_vht_mcs[4] at offset 28 — leave 0 (no VHT for now)
+
+        // op_mode at offset 36: leave 0
+        // op_vht_chan_width at offset 37: leave 0
+
+        // sta_cap at offset 40 (le32) — capability flags for firmware rate control
+        // Linux: mt7996_mcu_sta_rate_ctrl_tlv() lines 2237-2274
+        let mut sta_cap_val: u32 = STA_CAP_WMM; // always WMM
+        if has_ht {
+            sta_cap_val |= STA_CAP_HT;
+            // Short GI 20MHz: ht_cap bit 5
+            if ht_cap & 0x0020 != 0 {
+                sta_cap_val |= STA_CAP_SGI_20;
+            }
+            // Short GI 40MHz: ht_cap bit 6
+            if ht_cap & 0x0040 != 0 {
+                sta_cap_val |= STA_CAP_SGI_40;
+            }
+            // TX STBC: ht_cap bit 7
+            if ht_cap & 0x0080 != 0 {
+                sta_cap_val |= STA_CAP_TX_STBC;
+            }
+            // RX STBC: ht_cap bits [9:8]
+            if ht_cap & 0x0300 != 0 {
+                sta_cap_val |= STA_CAP_RX_STBC;
+            }
+            // LDPC: ht_cap bit 0
+            if ht_cap & 0x0001 != 0 {
+                sta_cap_val |= STA_CAP_LDPC;
+            }
+        }
+        data[off + 40..off + 44].copy_from_slice(&sta_cap_val.to_le_bytes());
+
+        // phy sub-struct at offset 44 (10 bytes): type, flag, stbc, sgi, bw, ldpc, mcs, nss, he_ltf, rsv[3]
+        // Leave all 0 for auto-rate mode — firmware fills in.
+
+        // rx_rcpi[4] at offset 54 — initialize to INIT_RCPI (180)
+        // Linux: mt76_connac_mcu.c uses INIT_RCPI = 180
+        data[off + 54] = INIT_RCPI;
+        data[off + 55] = INIT_RCPI;
+        data[off + 56] = INIT_RCPI;
+        data[off + 57] = INIT_RCPI;
+
+        let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
+
+        udebug!("mcu", "sta_rate_ctrl"; wlan = wlan_idx, phy = phy_mode, sta_cap = sta_cap_val);
+        self.mcu_send_uni_cmd(ring, cmd, &data, false, seq, None)
     }
 
     /// Send STA_REC_BA TLV to notify firmware about a BA session start/stop.

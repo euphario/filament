@@ -285,6 +285,9 @@ impl ApManager {
         }
 
         let aid = sta.aid;
+        let ht_cap = sta.ht_cap;
+        let ht_param = sta.ht_param;
+        let flags = sta.flags;
         let is_new = !was_associated;
 
         let seq = self.next_seq();
@@ -297,14 +300,14 @@ impl ApManager {
             (true, true) => {
                 ApResult::two(
                     ApAction::TxFrame(&tx_buf[..len]),
-                    ApAction::RegisterSta { mac: frame.addr2, aid },
+                    ApAction::RegisterSta { mac: frame.addr2, aid, ht_cap, ht_param, flags },
                 )
             }
             (true, false) => {
                 ApResult::one(ApAction::TxFrame(&tx_buf[..len]))
             }
             (false, true) => {
-                ApResult::one(ApAction::RegisterSta { mac: frame.addr2, aid })
+                ApResult::one(ApAction::RegisterSta { mac: frame.addr2, aid, ht_cap, ht_param, flags })
             }
             (false, false) => ApResult::none(),
         }
