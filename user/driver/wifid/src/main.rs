@@ -1685,23 +1685,32 @@ impl WifiDriverWrapper {
                                      frame_buf[3], frame_buf[4], frame_buf[5]];
             let is_multicast = (dst_mac[0] & 0x01) != 0;
 
-            // PS buffering DISABLED — firmware handles PS via WTBL/TIM.
-            // Software PS buffering was holding frames hostage: client enters
-            // power save → frames buffered → no ACKs → smoltcp send queue fills
-            // → heartbeat freezes until user input wakes the client.
-            // The firmware delivers PS-buffered frames via PS-Poll/U-APSD
-            // without software intervention.
+            // PS buffering gated by SoC capability.
+            // MT7996 firmware handles PS natively via WTBL gating + PS-Poll/U-APSD,
+            // so software buffering is redundant and was causing SSH heartbeat freeze
+            // (frames held hostage → no CQEs → smoltcp send queue fills).
             //
-            // We still track ps_mode for diagnostics but don't divert frames.
+            // Simpler chipsets without firmware-assisted PS would need the software
+            // path: check ps_mode, divert to ps_buf, flush on PM=0 transition.
+            let firmware_handles_ps = true; // MT7996: firmware PS via WTBL/TIM
 
-            let wcid = if is_multicast {
-                MT7996_WTBL_RESERVED
+            let (wcid, sta_sleeping) = if is_multicast {
+                (MT7996_WTBL_RESERVED, false)
             } else {
                 self.0.ap.as_ref()
                     .and_then(|ap| ap.find_sta(&dst_mac))
-                    .map(|sta| sta.wlan_idx)
-                    .unwrap_or(MT7996_WTBL_RESERVED)
+                    .map(|sta| (sta.wlan_idx, sta.ps_mode))
+                    .unwrap_or((MT7996_WTBL_RESERVED, false))
             };
+
+            // Software PS buffering: divert frames for sleeping STAs.
+            // Skipped when firmware handles PS natively (MT7996 WTBL gating).
+            if !firmware_handles_ps && !is_multicast && sta_sleeping {
+                if self.0.ps_buf.push(&dst_mac, &frame_buf[..frame_len]).is_ok() {
+                    udebug!("wifid", "ps_buf_enqueue"; wcid = wcid as u32, len = frame_len as u32);
+                }
+                continue;
+            }
 
             // Copy-based TX: frame data copied into DMA buffer by tx_enqueue_data
             let result = if let Some(ref mut tx_ring) = self.0.tx_band0 {
@@ -2191,8 +2200,10 @@ impl Driver for WifiDriverWrapper {
             if let Some(ref mut ap) = self.0.ap {
                 for i in 0..pm_count {
                     let changed = ap.handle_rx_data_pm(&pm_events[i].mac, pm_events[i].pm, self.0.drain_ticks);
-                    // PM=0 transition: flush all buffered frames for this STA
-                    if changed && !pm_events[i].pm {
+                    // PM=0 transition: flush all buffered frames for this STA.
+                    // Only needed when software PS buffering is active.
+                    let firmware_handles_ps = true; // MT7996: firmware PS via WTBL/TIM
+                    if !firmware_handles_ps && changed && !pm_events[i].pm {
                         let mac = &pm_events[i].mac;
                         let wcid = ap.find_sta(mac).map(|s| s.wlan_idx).unwrap_or(MT7996_WTBL_RESERVED);
                         let mut indices = [0usize; PS_MAX_PER_STA];
