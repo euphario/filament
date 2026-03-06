@@ -38,7 +38,7 @@ mod mac;
 mod event;
 
 use regs::*;
-use dma::{TxRing, TxFreeResult, RxDataFrame, RxPmEvent, flush_buffer};
+use dma::{TxRing, RxDataFrame, RxPmEvent, flush_buffer};
 use device::Mt7996Dev;
 use event::RxMibCounters;
 
@@ -72,6 +72,17 @@ enum SerL1State {
 }
 
 // ============================================================================
+// Frame Size Constants
+// ============================================================================
+
+/// Ethernet header: dst(6) + src(6) + ethertype(2).
+const ETH_HEADER_LEN: usize = 14;
+/// IP MTU for the WiFi data path.
+const MTU: usize = 1500;
+/// Maximum Ethernet frame size (header + payload, no FCS).
+const MAX_FRAME_SIZE: usize = MTU + ETH_HEADER_LEN;
+
+// ============================================================================
 // Power Save Frame Buffering
 // ============================================================================
 
@@ -79,8 +90,6 @@ enum SerL1State {
 const PS_MAX_PER_STA: usize = 4;
 /// Max total PS buffered frames across all STAs.
 const PS_BUF_TOTAL: usize = 32;
-/// Max frame size for PS buffering (Ethernet + payload).
-const PS_MAX_FRAME: usize = 1514;
 
 /// A buffered frame for a sleeping STA.
 struct PsBufferedFrame {
@@ -89,7 +98,7 @@ struct PsBufferedFrame {
     /// DataPort SQE tag for deferred CQE posting
     sqe_tag: u32,
     /// Frame data (Ethernet header + payload)
-    data: [u8; PS_MAX_FRAME],
+    data: [u8; MAX_FRAME_SIZE],
     /// Actual frame length
     len: u16,
     /// Whether this slot is in use
@@ -100,7 +109,7 @@ impl PsBufferedFrame {
     const EMPTY: Self = Self {
         dst_mac: [0; 6],
         sqe_tag: 0,
-        data: [0; PS_MAX_FRAME],
+        data: [0; MAX_FRAME_SIZE],
         len: 0,
         valid: false,
     };
@@ -147,7 +156,7 @@ impl PsBuffer {
             if !f.valid {
                 f.dst_mac = *dst_mac;
                 f.sqe_tag = sqe_tag;
-                let len = data.len().min(PS_MAX_FRAME);
+                let len = data.len().min(MAX_FRAME_SIZE);
                 f.data[..len].copy_from_slice(&data[..len]);
                 f.len = len as u16;
                 f.valid = true;
@@ -204,11 +213,20 @@ struct WifiDataPathStats {
     rx_pool_drops: u32,
     tx_pool_drops: u32,
     rx_pool_reclaimed: u32,
+    /// How many times data_ready() was called for the DataPort.
+    data_ready_calls: u32,
+    /// SQEs consumed but TX'd to PS buffer (client in power save).
+    tx_ps_buffered: u32,
+    /// SQEs consumed but TX failed (DMA ring full, bad frame, etc).
+    tx_errors: u32,
 }
 
 impl WifiDataPathStats {
     const fn new() -> Self {
-        Self { rx_frames: 0, tx_frames: 0, rx_pool_drops: 0, tx_pool_drops: 0, rx_pool_reclaimed: 0 }
+        Self {
+            rx_frames: 0, tx_frames: 0, rx_pool_drops: 0, tx_pool_drops: 0,
+            rx_pool_reclaimed: 0, data_ready_calls: 0, tx_ps_buffered: 0, tx_errors: 0,
+        }
     }
 }
 
@@ -1025,13 +1043,14 @@ impl WifiDriver {
     dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR_OFS), rfcr_val);
     dev.reg_wr(mt_wf_rmac(0, MT_WF_RFCR1_OFS), rfcr1_val);
 
-    // TX BAND0 ring setup — for probe responses and management frames
+    // TX BAND0 ring setup — for data + management frames.
     // Descriptors already allocated at offset 0 in desc_pool during DMA init.
     // Hardware ring programmed with MT7996_TX_RING_SIZE=2048 — must match.
-    // Allocate buffer pool: 2048 entries × 256 bytes = 512KB
-    const TX_BAND0_BUF_STRIDE: usize = 256;
+    // Must fit TXD+fw_txp (MT_TXWI_SIZE=76) + max frame (1514), rounded to power of 2.
+    // 76 + 1514 = 1590 → next power of 2 = 2048.
+    const TX_BAND0_BUF_STRIDE: usize = 2048;
     const TX_BAND0_NDESC: u32 = MT7996_TX_RING_SIZE; // Must match hardware ring size
-    const TX_BAND0_BUF_SIZE: usize = TX_BAND0_NDESC as usize * TX_BAND0_BUF_STRIDE;
+    const TX_BAND0_BUF_SIZE: usize = TX_BAND0_NDESC as usize * TX_BAND0_BUF_STRIDE; // 4MB
     let tx_band0_pool = DmaPool::alloc_high(TX_BAND0_BUF_SIZE).or_else(|| {
         DmaPool::alloc(TX_BAND0_BUF_SIZE)
     }).ok_or_else(|| {
@@ -1273,7 +1292,6 @@ fn tx_sweep_and_complete(
 
     if let Some(port) = ctx.block_port(dp) {
         let mask = port.ring_mask();
-        let mut posted = false;
         for i in 0..count {
             let tok = tokens[i];
             let idx = (tok as usize) & (TX_INFLIGHT_SIZE - 1);
@@ -1297,12 +1315,11 @@ fn tx_sweep_and_complete(
                     drv.cq_offsets[cq_slot] = u32::MAX; // no pool slot for TX CQEs
                 }
                 drv.cq_post_seq = drv.cq_post_seq.wrapping_add(1);
-                posted = true;
             }
         }
-        if posted {
-            port.notify();
-        }
+        // No notify — TX completions are just pool reclaim.
+        // ipd will drain them on its next 10ms timer tick.
+        // Notifying here causes spurious smoltcp polls → extra TCP retransmissions.
     }
 }
 
@@ -1597,6 +1614,20 @@ const WIFI_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_only(b"stats"),
 ];
 
+/// Post an error CQE for a TX SQE, tracking cq_offsets and cq_post_seq.
+fn post_tx_error(drv: &mut WifiDriver, dp: PortId, tag: u32, status: u16, ctx: &mut dyn BusCtx) {
+    if let Some(port) = ctx.block_port(dp) {
+        let mask = port.ring_mask();
+        let cq_slot = (drv.cq_post_seq & mask) as usize;
+        if port.complete_error(tag, status) {
+            if cq_slot < drv.cq_offsets.len() {
+                drv.cq_offsets[cq_slot] = u32::MAX;
+            }
+            drv.cq_post_seq = drv.cq_post_seq.wrapping_add(1);
+        }
+    }
+}
+
 impl WifiDriverWrapper {
     fn copy_to_buf(buf: &mut [u8], s: &[u8]) -> usize {
         let n = s.len().min(buf.len());
@@ -1613,46 +1644,30 @@ impl WifiDriverWrapper {
             Some(id) => id,
             None => return,
         };
-        // Drain up to 16 SQEs per event
-        let mut had_errors = false;
-        for _ in 0..16 {
+        // Drain all pending SQEs (up to ring_size). Previous 16-per-call limit
+        // caused SQE accumulation: ipd burst-submits during iface.poll(), shmem
+        // notify collapses to one wake, wifid processes 16, rest stranded until
+        // next 500ms timer tick.
+        for _ in 0..256 {
             let sqe = match ctx.block_port(dp).and_then(|p| p.recv_request()) {
                 Some(s) => s,
                 None => break,
             };
             if sqe.opcode != io_op::NET_SEND {
-                if let Some(port) = ctx.block_port(dp) {
-                    let mask = port.ring_mask();
-                    let cq_slot = (self.0.cq_post_seq & mask) as usize;
-                    if port.complete_error(sqe.tag, io_status::INVALID) {
-                        if cq_slot < self.0.cq_offsets.len() {
-                            self.0.cq_offsets[cq_slot] = u32::MAX;
-                        }
-                        self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
-                    }
-                    had_errors = true;
-                }
+                post_tx_error(&mut self.0, dp, sqe.tag, io_status::INVALID, ctx);
+
                 continue;
             }
 
             let frame_len = sqe.data_len as usize;
-            if frame_len < 14 || frame_len > 1514 {
-                if let Some(port) = ctx.block_port(dp) {
-                    let mask = port.ring_mask();
-                    let cq_slot = (self.0.cq_post_seq & mask) as usize;
-                    if port.complete_error(sqe.tag, io_status::INVALID) {
-                        if cq_slot < self.0.cq_offsets.len() {
-                            self.0.cq_offsets[cq_slot] = u32::MAX;
-                        }
-                        self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
-                    }
-                    had_errors = true;
-                }
+            if frame_len < ETH_HEADER_LEN || frame_len > MAX_FRAME_SIZE {
+                post_tx_error(&mut self.0, dp, sqe.tag, io_status::INVALID, ctx);
+
                 continue;
             }
 
             // Read full frame from pool for TX (copy to stack buffer)
-            let mut frame_buf = [0u8; 1514];
+            let mut frame_buf = [0u8; MAX_FRAME_SIZE];
             let got_frame = ctx.block_port(dp).and_then(|port| {
                 port.pool_slice(sqe.data_offset, frame_len as u32).map(|s| {
                     frame_buf[..frame_len].copy_from_slice(s);
@@ -1661,7 +1676,7 @@ impl WifiDriverWrapper {
             if got_frame.is_none() {
                 if let Some(port) = ctx.block_port(dp) {
                     port.complete_error(sqe.tag, io_status::INVALID);
-                    had_errors = true;
+    
                 }
                 continue;
             }
@@ -1670,23 +1685,14 @@ impl WifiDriverWrapper {
                                      frame_buf[3], frame_buf[4], frame_buf[5]];
             let is_multicast = (dst_mac[0] & 0x01) != 0;
 
-            // PS buffering: if unicast dest STA is sleeping, buffer instead of TX
-            if !is_multicast {
-                let sta_sleeping = self.0.ap.as_ref()
-                    .and_then(|ap| ap.find_sta(&dst_mac))
-                    .map(|sta| sta.ps_mode)
-                    .unwrap_or(false);
-                if sta_sleeping {
-                    if !self.0.ps_buf.push(&dst_mac, sqe.tag, &frame_buf[..frame_len]) {
-                        // Buffer full — post error CQE
-                        if let Some(port) = ctx.block_port(dp) {
-                            port.complete_error(sqe.tag, io_status::IO_ERROR);
-                        }
-                    }
-                    // Skip normal TX path — frame is buffered or dropped
-                    continue;
-                }
-            }
+            // PS buffering DISABLED — firmware handles PS via WTBL/TIM.
+            // Software PS buffering was holding frames hostage: client enters
+            // power save → frames buffered → no ACKs → smoltcp send queue fills
+            // → heartbeat freezes until user input wakes the client.
+            // The firmware delivers PS-buffered frames via PS-Poll/U-APSD
+            // without software intervention.
+            //
+            // We still track ps_mode for diagnostics but don't divert frames.
 
             let wcid = if is_multicast {
                 MT7996_WTBL_RESERVED
@@ -1707,6 +1713,9 @@ impl WifiDriverWrapper {
                     let idx = (tok as usize) & (TX_INFLIGHT_SIZE - 1);
                     self.0.tx_inflight_tags[idx] = sqe.tag;
                     self.0.dp_stats.tx_frames += 1;
+                    udebug!("wifid", "tx_enqueue"; len = frame_len as u32,
+                        mcast = is_multicast as u32, wcid = wcid as u32,
+                        tok = tok as u32, total = self.0.dp_stats.tx_frames);
                 }
                 r
             } else {
@@ -1714,7 +1723,10 @@ impl WifiDriverWrapper {
             };
 
             // Only post immediate CQE on error (hardware never saw the frame)
-            if let Err(_) = result {
+            if let Err(e) = result {
+                self.0.dp_stats.tx_errors += 1;
+                udebug!("wifid", "tx_enqueue_err"; err = e as u32, len = frame_len as u32,
+                    total_err = self.0.dp_stats.tx_errors);
                 if let Some(port) = ctx.block_port(dp) {
                     let mask = port.ring_mask();
                     let cq_slot = (self.0.cq_post_seq & mask) as usize;
@@ -1730,19 +1742,15 @@ impl WifiDriverWrapper {
                         }
                         self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
                     }
-                    had_errors = true;
+
                 }
                 self.0.dp_stats.tx_pool_drops += 1;
             }
             // On success: CQE deferred until tx_sweep confirms hardware completion
         }
 
-        // Notify only if we posted error CQEs
-        if had_errors {
-            if let Some(port) = ctx.block_port(dp) {
-                port.notify();
-            }
-        }
+        // No notify for TX error CQEs — pool reclaim only.
+        // ipd drains them on its next 10ms timer tick.
     }
 
 }
@@ -1756,7 +1764,7 @@ impl Driver for WifiDriverWrapper {
         self.0.command(msg, ctx)
     }
 
-    fn handle_event(&mut self, tag: u32, _handle: userlib::syscall::Handle, _ctx: &mut dyn BusCtx) {
+    fn handle_event(&mut self, tag: u32, _handle: userlib::syscall::Handle, ctx: &mut dyn BusCtx) {
         const TAG_WIFI_TIMER: u32 = 100;
         const TAG_WIFI_IRQ: u32 = 101;
 
@@ -1853,8 +1861,8 @@ impl Driver for WifiDriverWrapper {
         let mut pm_count = 0usize;
         // Copy buffer for data frame payloads — rx_classify copies frame data
         // here before resetting DMA descriptors (avoids use-after-free).
-        // 16 frames × 1514 bytes max = ~24KB
-        let mut data_buf = [0u8; 16 * 1514];
+        // 16 frames × MAX_FRAME_SIZE bytes max = ~24KB
+        let mut data_buf = [0u8; 16 * MAX_FRAME_SIZE];
         if intr & MT_INT_RX_DONE_BAND0 != 0 && qc > 2 {
             let (_n, mc, dc, pc) = dev.rx_classify(
                 &mut self.0.rx_queues[2], &mut self.0.mib[0],
@@ -1898,6 +1906,12 @@ impl Driver for WifiDriverWrapper {
             let r = dev.rx_process_tx_free(&mut self.0.rx_queues[5]);
             self.0.tx_freed += r.tokens_freed;
         }
+
+        // Sweep completed TX descriptors and post CQEs to ipd.
+        // This runs on every timer tick (not just data_ready) so that
+        // TX completions flow back to ipd even when no new RX/TX events
+        // arrive — breaking the TX↔RX coupling.
+        tx_sweep_and_complete(&mut self.0, dev, ctx);
 
         // Dispatch management frames through AP state machine.
         // We process one frame at a time: get actions from AP, then execute them.
@@ -2216,9 +2230,8 @@ impl Driver for WifiDriverWrapper {
                 }
             }
             if let Some(dp) = self.0.data_port {
-                if let Some(port) = _ctx.block_port(dp) {
+                if let Some(port) = ctx.block_port(dp) {
                     let mask = port.ring_mask();
-                    let mut posted = false;
                     for i in 0..data_count {
                         let frame = &data_frames[i];
                         let flen = frame.len as u32;
@@ -2258,25 +2271,25 @@ impl Driver for WifiDriverWrapper {
                             }
                             self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
                             self.0.dp_stats.rx_frames += 1;
-                            posted = true;
                         } else {
                             port.free(offset);
                             self.0.dp_stats.rx_pool_drops += 1;
                         }
                     }
-                    if posted {
-                        port.notify();
-                    }
+                    // Notify ipd that RX frames are available. ipd defers
+                    // poll_smoltcp() by a 2ms coalescing window so multiple
+                    // frames accumulate before a single iface.poll().
+                    port.notify();
                 }
             }
         }
 
         // Process TX frames from ipd and sweep completed TX descriptors
         if let Some(dp) = self.0.data_port {
-            if _ctx.block_port(dp).is_some() {
-                self.process_tx_from_ipd(dev, _ctx);
-                tx_sweep_and_complete(&mut self.0, dev, _ctx);
-                reclaim_rx_pool(&mut self.0, _ctx);
+            if ctx.block_port(dp).is_some() {
+                self.process_tx_from_ipd(dev, ctx);
+                tx_sweep_and_complete(&mut self.0, dev, ctx);
+                reclaim_rx_pool(&mut self.0, ctx);
             }
         }
 
@@ -2452,6 +2465,8 @@ impl Driver for WifiDriverWrapper {
             let rfcr_actual = dev.reg_rr(mt_wf_rmac(0, MT_WF_RFCR_OFS));
 
             let dp = &self.0.dp_stats;
+            let sq_pend = self.0.data_port.and_then(|id| ctx.block_port(id))
+                .map(|p| p.sq_pending()).unwrap_or(0);
             // Split into two log lines to avoid uinfo buffer truncation
             uinfo!("wifid", "bcn_diag";
                 t = secs,
@@ -2492,6 +2507,10 @@ impl Driver for WifiDriverWrapper {
                 dp_tx = dp.tx_frames,
                 dp_rxd = dp.rx_pool_drops,
                 dp_txd = dp.tx_pool_drops,
+                dp_sqp = sq_pend,
+                dp_dr = dp.data_ready_calls,
+                dp_ps = dp.tx_ps_buffered,
+                dp_te = dp.tx_errors,
                 napi = self.0.irq_suppressed as u32
             );
 
@@ -2566,6 +2585,7 @@ impl Driver for WifiDriverWrapper {
     }
 
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
+        self.0.dp_stats.data_ready_calls += 1;
         let dp = match self.0.data_port {
             Some(id) if id == port => id,
             _ => return,

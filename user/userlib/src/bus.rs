@@ -978,7 +978,7 @@ pub trait BlockTransport {
     fn peek_completion(&mut self) -> Option<crate::ring::IoCqe>;
 
     /// Batch-advance shared cq_head by `n` (provider can now reclaim).
-    fn ack_completions(&self, n: u32);
+    fn ack_completions(&mut self, n: u32);
 
     /// Read shared cq_head (for provider-side pool reclaim).
     fn cq_consumer_head(&self) -> u32;
@@ -988,6 +988,9 @@ pub trait BlockTransport {
 
     /// Ring size.
     fn ring_size(&self) -> u16;
+
+    /// Number of pending SQ entries (submitted but not yet consumed by provider).
+    fn sq_pending(&self) -> u32;
 }
 
 /// Stream data transport (byte ring pattern).

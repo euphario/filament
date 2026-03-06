@@ -210,7 +210,7 @@ impl BlockTransport for ShmemBlockPort {
         self.port.peek_completion()
     }
 
-    fn ack_completions(&self, n: u32) {
+    fn ack_completions(&mut self, n: u32) {
         self.port.ack_completions(n);
     }
 
@@ -224,5 +224,9 @@ impl BlockTransport for ShmemBlockPort {
 
     fn ring_size(&self) -> u16 {
         self.port.ring_size()
+    }
+
+    fn sq_pending(&self) -> u32 {
+        self.port.sq_pending()
     }
 }

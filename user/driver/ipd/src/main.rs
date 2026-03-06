@@ -59,10 +59,15 @@ const TAG_RSH_SHELL_RESPONSE: u32 = 4;
 const TAG_SOCKET_SVC_PORT: u32 = 5;
 /// Socket service client channels: TAG_SOCKET_CLIENT_BASE + slot_index
 const TAG_SOCKET_CLIENT_BASE: u32 = 0x100;
+/// Socket service DataPort wake: TAG_SOCKET_DATA_BASE + slot_index
+const TAG_SOCKET_DATA_BASE: u32 = 0x200;
 const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
 const DHCP_FALLBACK_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
+/// Coalescing window: drain all pending RX/TX CQEs, then poll smoltcp once.
+/// 2ms balances latency (interactive SSH) vs. batching (throughput).
+const COALESCE_MS: u64 = 2;
 const NIC_PORT_NAMES: &[&[u8]] = &[b"wifi:0"];
-const MAX_FRAME_SIZE: usize = 1514;
+use crate::device::MAX_FRAME_SIZE;
 /// AP mode: ipd IS the gateway — use a private subnet.
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const AP_PREFIX_LEN: u8 = 24;
@@ -73,6 +78,7 @@ const STATIC_PREFIX_LEN: u8 = 24;
 const TFTP_PORT: u16 = 69;
 const HTTP_PORT: u16 = 80;
 const RSH_PORT: u16 = 23;
+const ECHO_PORT: u16 = 7;
 
 // =============================================================================
 // Static smoltcp buffer arrays
@@ -82,8 +88,8 @@ const RSH_PORT: u16 = 23;
 // of the SmolStack that holds the SocketSet.
 // =============================================================================
 
-/// 6 base sockets + 8 socket service connections
-const SOCKET_SLOTS: usize = 6 + SocketService::extra_socket_slots();
+/// 7 base sockets + 8 socket service connections
+const SOCKET_SLOTS: usize = 7 + SocketService::extra_socket_slots();
 const UDP_META_SLOTS: usize = 8;
 const UDP_BUF_SIZE: usize = 4096;
 const TCP_BUF_SIZE: usize = 4096;
@@ -112,6 +118,11 @@ static mut DHCP_SRV_TX_META: [udp::PacketMetadata; UDP_META_SLOTS] =
     [udp::PacketMetadata::EMPTY; UDP_META_SLOTS];
 static mut DHCP_SRV_TX_BUF: [u8; UDP_BUF_SIZE] = [0u8; UDP_BUF_SIZE];
 
+// TCP echo (port 7) — 16KB buffers to match socket_svc sizing
+const TCP_ECHO_BUF_SIZE: usize = 16384;
+static mut TCP_ECHO_RX_BUF: [u8; TCP_ECHO_BUF_SIZE] = [0u8; TCP_ECHO_BUF_SIZE];
+static mut TCP_ECHO_TX_BUF: [u8; TCP_ECHO_BUF_SIZE] = [0u8; TCP_ECHO_BUF_SIZE];
+
 // =============================================================================
 // SmolStack — persistent smoltcp state
 // =============================================================================
@@ -128,6 +139,8 @@ struct SmolStack {
     dhcp_handle: Option<SocketHandle>,
     /// DHCP server socket (AP mode only, port 67).
     dhcp_srv_handle: Option<SocketHandle>,
+    /// TCP echo socket (port 7) — pure recv→send, no DataPort.
+    tcp_echo_handle: SocketHandle,
 }
 
 /// Global smoltcp stack. Initialized once, never moved.
@@ -206,6 +219,18 @@ struct IpdDriver {
     pool_base_diag: u64,
     /// Socket service: exposes TCP sockets to external processes via DataPorts.
     socket_svc: SocketService,
+    /// Tracked DataPort handles for socket service connections.
+    /// When a connection is established, its DataPort is watched in the Mux.
+    /// When it closes, the watch is removed. This enables immediate wake on
+    /// client TX instead of waiting for the 10ms poll timer.
+    socket_data_watched: [bool; 8],
+    /// True when the poll timer is armed at COALESCE_MS, awaiting a deferred
+    /// poll_smoltcp(). Set by arm_coalesce(), cleared by TAG_POLL_TIMER handler.
+    coalescing: bool,
+    /// Rate-limiter for echo state logging.
+    echo_log_counter: u32,
+    /// Poll cycle counter for diagnostics.
+    poll_count: u32,
 }
 
 impl IpdDriver {
@@ -239,6 +264,10 @@ impl IpdDriver {
             last_rx_offset: 0,
             pool_base_diag: 0,
             socket_svc: SocketService::new(),
+            socket_data_watched: [false; 8],
+            coalescing: false,
+            echo_log_counter: 0,
+            poll_count: 0,
         }
     }
 
@@ -348,7 +377,8 @@ impl IpdDriver {
         // buffer arrays are never accessed directly again.
         let (socket_storage, rx_meta, rx_buf, tx_meta, tx_buf, tcp_rx, tcp_tx,
              tcp_rsh_rx, tcp_rsh_tx,
-             dhcp_srv_rx_meta, dhcp_srv_rx_buf, dhcp_srv_tx_meta, dhcp_srv_tx_buf) = unsafe {
+             dhcp_srv_rx_meta, dhcp_srv_rx_buf, dhcp_srv_tx_meta, dhcp_srv_tx_buf,
+             tcp_echo_rx, tcp_echo_tx) = unsafe {
             (
                 &mut *(&raw mut SOCKET_STORAGE),
                 &mut *(&raw mut UDP_RX_META),
@@ -363,6 +393,8 @@ impl IpdDriver {
                 &mut *(&raw mut DHCP_SRV_RX_BUF),
                 &mut *(&raw mut DHCP_SRV_TX_META),
                 &mut *(&raw mut DHCP_SRV_TX_BUF),
+                &mut *(&raw mut TCP_ECHO_RX_BUF),
+                &mut *(&raw mut TCP_ECHO_TX_BUF),
             )
         };
 
@@ -417,6 +449,16 @@ impl IpdDriver {
             None
         };
 
+        // Create TCP echo socket (port 7) — pure recv→send for network testing
+        let echo_rx = tcp::SocketBuffer::new(&mut tcp_echo_rx[..]);
+        let echo_tx = tcp::SocketBuffer::new(&mut tcp_echo_tx[..]);
+        let mut echo_socket = tcp::Socket::new(echo_rx, echo_tx);
+        echo_socket.set_nagle_enabled(false);
+        if echo_socket.listen(ECHO_PORT).is_err() {
+            uerror!("ipd", "tcp_listen_failed"; port = ECHO_PORT as u32);
+        }
+        let tcp_echo_handle = sockets.add(echo_socket);
+
         // Store persistent stack
         // SAFETY: SMOL_STACK is only written here (once) and read in poll_smoltcp.
         unsafe {
@@ -428,6 +470,7 @@ impl IpdDriver {
                 tcp_rsh_handle,
                 dhcp_handle,
                 dhcp_srv_handle,
+                tcp_echo_handle,
             });
         }
 
@@ -450,6 +493,10 @@ impl IpdDriver {
         }
 
         udebug!("ipd", "smoltcp_ready"; sockets = SOCKET_SLOTS as u32);
+
+        // Start the poll timer — drives smoltcp housekeeping (retransmissions,
+        // keepalives, delayed ACKs). Re-armed only in TAG_POLL_TIMER handler.
+        self.arm_poll_timer(None, ctx);
     }
 
     // =========================================================================
@@ -485,18 +532,16 @@ impl IpdDriver {
 
     fn arm_poll_timer(&mut self, delay_ms: Option<u64>, ctx: &mut dyn BusCtx) {
         let ns = match delay_ms {
-            Some(ms) if ms > 0 => ms * 1_000_000,
-            _ => {
-                // When TCP connections are active, poll every 10ms so we
-                // promptly drain DataPort SQEs (TX from clients).  Without
-                // this, the default 1s sleep starves client writes — the
-                // consumer pool fills up and the client blocks.
-                if self.socket_svc.has_established() {
-                    10_000_000 // 10ms
+            Some(ms) => {
+                if ms == 0 {
+                    // smoltcp wants immediate re-poll (sub-millisecond timer
+                    // truncated to 0). Use 1ms — the minimum useful interval.
+                    1_000_000
                 } else {
-                    1_000_000_000 // 1s
+                    ms * 1_000_000
                 }
             }
+            None => 1_000_000_000, // 1s default housekeeping
         };
 
         if let Some(ref mut timer) = self.poll_timer {
@@ -517,6 +562,31 @@ impl IpdDriver {
                 }
                 Err(_) => uerror!("ipd", "timer_create_failed"; tag = "poll"),
             }
+        }
+    }
+
+    /// Re-arm the poll timer based on smoltcp's requested delay.
+    /// Called only from TAG_POLL_TIMER handler after poll_smoltcp().
+    fn rearm_poll_timer(&mut self, ctx: &mut dyn BusCtx) {
+        let delay = unsafe { &mut *(&raw mut SMOL_STACK) }
+            .as_mut()
+            .and_then(|stack| {
+                let now = Self::smoltcp_now();
+                stack.iface.poll_delay(now, &stack.sockets)
+                    .map(|d| d.total_millis() as u64)
+            });
+        self.arm_poll_timer(delay, ctx);
+    }
+
+    /// Arm the coalescing timer if not already armed.
+    ///
+    /// Called from data_ready() and socket event handlers instead of
+    /// poll_smoltcp(). Defers the poll by COALESCE_MS so multiple events
+    /// accumulate before a single iface.poll() processes them all.
+    fn arm_coalesce(&mut self, ctx: &mut dyn BusCtx) {
+        if !self.coalescing {
+            self.arm_poll_timer(Some(COALESCE_MS), ctx);
+            self.coalescing = true;
         }
     }
 
@@ -773,13 +843,18 @@ impl IpdDriver {
         // Process DHCP server socket (AP mode)
         if let Some(dhcp_srv_handle) = stack.dhcp_srv_handle {
             let sock = stack.sockets.get_mut::<udp::Socket>(dhcp_srv_handle);
+            let mut dhcp_rx_count = 0u32;
             while let Ok((data, _meta)) = sock.recv() {
+                dhcp_rx_count += 1;
                 let mut resp_buf = [0u8; 576];
                 if let Some((resp_len, dest)) = self.dhcp_server.handle(data, &mut resp_buf) {
                     if sock.send_slice(&resp_buf[..resp_len], dest).is_err() {
                         uerror!("ipd", "dhcp_srv_send_failed"; len = resp_len as u32);
                     }
                 }
+            }
+            if dhcp_rx_count > 0 {
+                uinfo!("ipd", "dhcp_srv_poll"; rx_count = dhcp_rx_count);
             }
         }
 
@@ -793,6 +868,10 @@ impl IpdDriver {
 
         // Process remote shell socket (TCP port 23)
         self.rsh.process(&mut stack.sockets, stack.tcp_rsh_handle);
+
+        // Process TCP echo socket (port 7)
+        Self::process_echo(&mut stack.sockets, stack.tcp_echo_handle, &mut self.echo_log_counter,
+                           &self.stats);
 
         // Watch/unwatch rsh pending IPC channel for responsive wake
         let new_handle = self.rsh.pending_handle();
@@ -827,18 +906,58 @@ impl IpdDriver {
         // Poll socket service: bridge TCP sockets ↔ DataPorts
         self.socket_svc.poll(&mut stack.sockets);
 
+        // Watch/unwatch DataPort handles for socket service connections.
+        // When a connection becomes Established, watch its DataPort so
+        // client TX writes wake ipd immediately instead of waiting 10ms.
+        for slot in 0..8 {
+            let has_dp = self.socket_svc.data_port_handle(slot).is_some();
+            if has_dp && !self.socket_data_watched[slot] {
+                if let Some(h) = self.socket_svc.data_port_handle(slot) {
+                    let tag = TAG_SOCKET_DATA_BASE + slot as u32;
+                    if ctx.watch_handle(h, tag).is_err() {
+                        uerror!("ipd", "watch_failed"; tag = tag);
+                    } else {
+                        self.socket_data_watched[slot] = true;
+                        uinfo!("ipd", "dataport_watch_ok"; slot = slot as u32, tag = tag);
+                    }
+                }
+            } else if !has_dp && self.socket_data_watched[slot] {
+                self.socket_data_watched[slot] = false;
+                // Handle already gone — no unwatch needed, Mux auto-cleans.
+            }
+        }
+
         // Re-poll after socket processing (smoltcp may have TX to send)
+        let tx_before = self.stats.tx_frames;
         if let Some(port) = ctx.block_port(self.nic_port) {
             let mut device = SmolDevice::new(port, &mut self.rx_queue, &mut self.tx_tracker, &mut self.stats, self.group_id);
             stack.iface.poll(now, &mut device, &mut stack.sockets);
         }
 
-        // Schedule next poll based on smoltcp's delay
-        let delay = stack
-            .iface
-            .poll_delay(now, &stack.sockets)
-            .map(|d| d.total_millis() as u64);
-        self.arm_poll_timer(delay, ctx);
+        // Periodic TCP diagnostic: every 50 polls, dump socket state
+        self.poll_count += 1;
+        if self.poll_count % 50 == 0 {
+            let tx_total = self.stats.tx_frames;
+            let tx_this = tx_total - tx_before;
+            // Log TCP socket state for active connections
+            for slot in 0..8 {
+                if let Some(h) = self.socket_svc.smol_handle(slot) {
+                    let sock = stack.sockets.get::<tcp::Socket>(h);
+                    udebug!("ipd", "tcp_diag";
+                        poll = self.poll_count,
+                        slot = slot as u32,
+                        sq = sock.send_queue() as u32,
+                        sc = sock.send_capacity() as u32,
+                        rq = sock.recv_queue() as u32,
+                        tx_t = tx_total as u32,
+                        tx2 = tx_this as u32,
+                        tx_drop = self.stats.tx_pool_drops,
+                        tx_pf = self.stats.tx_pool_full
+                    );
+                }
+            }
+        }
+
     }
 
     // =========================================================================
@@ -936,9 +1055,9 @@ impl IpdDriver {
         let s = &self.stats;
         let _ = core::write!(w,
             "rx_frames={}\nrx_bytes={}\ntx_frames={}\ntx_bytes={}\n\
-             tx_pool_drops={}\nrx_pool_full={}\ntx_cqe_reclaimed={}\n",
+             tx_pool_drops={}\nrx_pool_full={}\ntx_cqe_reclaimed={}\ntx_pool_full={}\n",
             s.rx_frames, s.rx_bytes, s.tx_frames, s.tx_bytes,
-            s.tx_pool_drops, s.rx_pool_full, s.tx_cqe_reclaimed);
+            s.tx_pool_drops, s.rx_pool_full, s.tx_cqe_reclaimed, s.tx_pool_full);
         w.pos
     }
 
@@ -1091,6 +1210,74 @@ impl IpdDriver {
     // =========================================================================
 
     /// Process the HTTP TCP socket: read request, send response, re-listen.
+    /// TCP echo (port 7): recv → send, re-listen on disconnect.
+    /// Pure smoltcp — no DataPort, no IPC. For isolating WiFi TX issues.
+    fn process_echo(sockets: &mut SocketSet<'static>, handle: SocketHandle, echo_log_counter: &mut u32,
+                    stats: &DataPathStats) {
+        let sock = sockets.get_mut::<tcp::Socket>(handle);
+
+        if !sock.is_active() && !sock.is_listening() {
+            if sock.listen(ECHO_PORT).is_err() {
+                uerror!("ipd", "echo_relisten_failed";);
+            }
+            return;
+        }
+
+        // Log state once per ~64 polls when socket is active (not listening)
+        if sock.is_active() {
+            *echo_log_counter = echo_log_counter.wrapping_add(1);
+            if *echo_log_counter & 63 == 1 {
+                let recv_q = sock.recv_queue();
+                let send_q = sock.send_queue();
+                let state = sock.state() as u8;
+                udebug!("ipd", "echo_state";
+                    state = state as u32,
+                    may_r = sock.may_recv() as u32,
+                    may_s = sock.may_send() as u32,
+                    recv_q = recv_q as u32,
+                    send_q = send_q as u32,
+                    dp_rx = stats.rx_frames,
+                    dp_tx = stats.tx_frames);
+            }
+        }
+
+        // Echo: drain RX → TX in a loop until blocked.
+        let mut total_echoed = 0u32;
+        while sock.may_recv() && sock.may_send() {
+            let mut buf = [0u8; 2048];
+            match sock.recv_slice(&mut buf) {
+                Ok(n) if n > 0 => {
+                    match sock.send_slice(&buf[..n]) {
+                        Ok(sent) => {
+                            total_echoed += sent as u32;
+                            if sent < n {
+                                udebug!("ipd", "echo_tx_full"; wanted = n as u32,
+                                    sent = sent as u32);
+                                break; // TX buffer full
+                            }
+                        }
+                        Err(_) => {
+                            uerror!("ipd", "echo_send_failed"; len = n as u32);
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        if total_echoed > 0 {
+            uinfo!("ipd", "echo"; bytes = total_echoed,
+                may_r = sock.may_recv() as u32, may_s = sock.may_send() as u32);
+        }
+
+        // Only close when peer has closed and we've drained all RX data.
+        // Never close during SynReceived (may_recv/may_send are both false
+        // during handshake, which previously triggered premature close).
+        if sock.state() == tcp::State::CloseWait && sock.recv_queue() == 0 {
+            sock.close();
+        }
+    }
+
     fn process_http(sockets: &mut SocketSet<'static>, handle: SocketHandle, ip: [u8; 4], ip_source: &str) {
         let sock = sockets.get_mut::<tcp::Socket>(handle);
 
@@ -1362,7 +1549,7 @@ impl Driver for IpdDriver {
         }
 
         self.drain_rx(ctx);
-        self.poll_smoltcp(ctx);
+        self.arm_coalesce(ctx);
     }
 
     fn handle_event(&mut self, tag: u32, _handle: Handle, ctx: &mut dyn BusCtx) {
@@ -1383,11 +1570,12 @@ impl Driver for IpdDriver {
                 }
             }
             TAG_POLL_TIMER => {
-                // Timer already consumed by Mux poll — no timer.wait() needed.
                 if self.nic_state == NicState::Up {
                     self.drain_rx(ctx);
                     self.poll_smoltcp(ctx);
                 }
+                self.coalescing = false;
+                self.rearm_poll_timer(ctx);
             }
             TAG_DHCP_FALLBACK_TIMER => {
                 // Timer already consumed by Mux poll — no timer.wait() needed.
@@ -1415,12 +1603,8 @@ impl Driver for IpdDriver {
                         }
                     }
 
-                    // Re-poll to flush any TCP data
-                    let now = Self::smoltcp_now();
-                    if let Some(port) = ctx.block_port(self.nic_port) {
-                        let mut device = SmolDevice::new(port, &mut self.rx_queue, &mut self.tx_tracker, &mut self.stats, self.group_id);
-                        stack.iface.poll(now, &mut device, &mut stack.sockets);
-                    }
+                    // Defer poll to coalescing timer — flushes TCP data
+                    self.arm_coalesce(ctx);
                 }
             }
             TAG_SOCKET_SVC_PORT => {
@@ -1436,19 +1620,22 @@ impl Driver for IpdDriver {
                     self.socket_svc.poll(&mut stack.sockets);
                 }
             }
+            t if t >= TAG_SOCKET_DATA_BASE && t < TAG_SOCKET_DATA_BASE + 256 => {
+                // DataPort wake from client TX — defer poll to coalescing timer
+                let slot = (t - TAG_SOCKET_DATA_BASE) as usize;
+                self.socket_svc.ack_data_port(slot);
+                if self.nic_state == NicState::Up {
+                    self.arm_coalesce(ctx);
+                }
+            }
             t if t >= TAG_SOCKET_CLIENT_BASE && t < TAG_SOCKET_CLIENT_BASE + 256 => {
                 // Client channel readable — process control message
                 let slot = (t - TAG_SOCKET_CLIENT_BASE) as usize;
                 if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
                     self.socket_svc.process_client_msg(slot, &mut stack.sockets);
-
-                    // Re-poll to flush TCP data from new connections
-                    let now = Self::smoltcp_now();
-                    if let Some(port) = ctx.block_port(self.nic_port) {
-                        let mut device = SmolDevice::new(port, &mut self.rx_queue, &mut self.tx_tracker, &mut self.stats, self.group_id);
-                        stack.iface.poll(now, &mut device, &mut stack.sockets);
-                    }
                 }
+                // Defer poll to coalescing timer — flushes TCP data
+                self.arm_coalesce(ctx);
             }
             _ => {}
         }

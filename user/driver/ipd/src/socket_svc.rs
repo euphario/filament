@@ -36,7 +36,9 @@ use userlib::{udebug, uerror, uinfo};
 const MAX_CONNECTIONS: usize = 8;
 
 /// TCP buffer size per socket direction (RX and TX).
-const SOCK_TCP_BUF_SIZE: usize = 4096;
+/// 16KB gives room for SSH bursts (ps -vvv ≈ 4-8KB). Previously 4KB
+/// caused data loss when send_slice() returned partial during bursts.
+const SOCK_TCP_BUF_SIZE: usize = 16384;
 
 /// DataPort pool size per connection (shared memory).
 const CONN_POOL_SIZE: u32 = 65536; // 64KB
@@ -97,6 +99,8 @@ struct TcpConn {
     conn_id: u32,
     /// True if we already sent STREAM_EOF to the client
     eof_sent: bool,
+    /// Poll counter for periodic diagnostics
+    poll_count: u32,
 }
 
 impl TcpConn {
@@ -109,6 +113,7 @@ impl TcpConn {
             local_port: 0,
             conn_id: 0,
             eof_sent: false,
+            poll_count: 0,
         }
     }
 
@@ -120,6 +125,7 @@ impl TcpConn {
         self.local_port = 0;
         self.conn_id = 0;
         self.eof_sent = false;
+        self.poll_count = 0;
     }
 }
 
@@ -393,6 +399,11 @@ impl SocketService {
 
         // Socket transitioned from listening to connected
         if sock.may_send() && sock.may_recv() {
+            // Disable Nagle — send segments immediately without waiting for ACK.
+            // Interactive protocols (SSH, chat) need low latency; smoltcp's 10ms
+            // poll interval still provides natural coalescing of multiple send_slice()
+            // calls into one TCP segment.
+            sock.set_nagle_enabled(false);
             let (remote_ip, remote_port) = match sock.remote_endpoint() {
                 Some(ep) => {
                     let ip = match ep.addr {
@@ -457,6 +468,8 @@ impl SocketService {
             None => return,
         };
 
+        conn.poll_count += 1;
+
         {
             let sock = sockets.get_mut::<tcp::Socket>(handle);
 
@@ -465,6 +478,16 @@ impl SocketService {
                 drop(sock);
                 self.notify_closed(slot, close_reason::RST, sockets);
                 return;
+            }
+
+            // Periodic TCP socket state diagnostic (every ~5s at 10ms poll = 500 polls)
+            if conn.poll_count % 500 == 0 {
+                udebug!("ipd", "tcp_sock_state"; slot = slot as u32,
+                    state = sock.state() as u8 as u32,
+                    send_q = sock.send_queue() as u32,
+                    recv_q = sock.recv_queue() as u32,
+                    may_send = sock.may_send() as u32,
+                    may_recv = sock.may_recv() as u32);
             }
         }
 
@@ -508,8 +531,10 @@ impl SocketService {
 
         let mut posted = 0u32;
 
-        // Read up to 4 chunks per poll cycle
-        for _ in 0..4 {
+        // Drain all available TCP data into the client DataPort.
+        // Previously limited to 4 chunks — too few for large pastes or
+        // bulk transfers. Pool alloc failure provides natural backpressure.
+        for _ in 0..32 {
             if !sock.may_recv() {
                 break;
             }
@@ -561,6 +586,9 @@ impl SocketService {
     }
 
     /// Drain SQEs from DataPort into TCP socket (TX direction: client→ipd).
+    ///
+    /// Only dequeues when TCP has send space. When TCP is full, SQEs stay
+    /// in the ring — pool backpressure propagates naturally to the consumer.
     fn drain_port_to_tcp(&mut self, slot: usize, sockets: &mut SocketSet<'static>) {
         let conn = &mut self.conns[slot];
         let handle = match conn.smol_handle {
@@ -577,7 +605,16 @@ impl SocketService {
             return;
         }
 
+        let mut posted = 0u32;
+
         for _ in 0..8 {
+            // Check TCP send space before dequeuing. If TCP is full,
+            // leave SQEs in the ring — the consumer will back off.
+            let send_avail = sock.send_capacity() - sock.send_queue();
+            if send_avail < 128 {
+                break;
+            }
+
             let sqe = match data_port.recv() {
                 Some(s) => s,
                 None => break,
@@ -589,25 +626,19 @@ impl SocketService {
                     let len = sqe.data_len;
 
                     if let Some(data) = data_port.pool_slice(offset, len) {
-                        if sock.send_slice(data).is_err() {
-                            uerror!("ipd", "socket_tx_failed"; slot = slot as u32);
-                        }
+                        let _ = sock.send_slice(data);
                     }
 
-                    // Post TX completion CQE so the consumer can free its own pool slot.
-                    // (Provider's PoolAlloc can't free consumer-half offsets.)
-                    let cqe = IoCqe {
+                    data_port.complete(&IoCqe {
                         status: io_status::OK,
                         flags: io_status::CQE_STREAM_TX_DONE,
                         tag: 0,
                         transferred: 0,
                         result: offset,
-                    };
-                    data_port.complete(&cqe);
-                    data_port.notify();
+                    });
+                    posted += 1;
                 }
                 io_op::STREAM_RX_DONE => {
-                    // Consumer is done with this RX buffer; free provider-half slot.
                     data_port.free(sqe.data_offset);
                 }
                 io_op::STREAM_EOF => {
@@ -615,6 +646,10 @@ impl SocketService {
                 }
                 _ => {}
             }
+        }
+
+        if posted > 0 {
+            data_port.notify();
         }
     }
 
@@ -738,5 +773,34 @@ impl SocketService {
             return None;
         }
         self.conns[slot].client_channel.as_ref().map(|ch| ch.handle())
+    }
+
+    /// Get the DataPort mux handle for a specific slot (for Mux watching).
+    /// Returns the handle when the connection is Established and has a DataPort.
+    pub fn data_port_handle(&self, slot: usize) -> Option<Handle> {
+        if slot >= MAX_CONNECTIONS {
+            return None;
+        }
+        let conn = &self.conns[slot];
+        if conn.state == ConnState::Established {
+            conn.data_port.as_ref().map(|dp| dp.mux_handle())
+        } else {
+            None
+        }
+    }
+
+    /// Get the smoltcp socket handle for a connection slot (diagnostics).
+    pub fn smol_handle(&self, slot: usize) -> Option<smoltcp::iface::SocketHandle> {
+        if slot >= MAX_CONNECTIONS { return None; }
+        self.conns[slot].smol_handle
+    }
+
+    /// Acknowledge a DataPort doorbell for a slot.
+    pub fn ack_data_port(&self, slot: usize) {
+        if slot < MAX_CONNECTIONS {
+            if let Some(ref dp) = self.conns[slot].data_port {
+                dp.ack();
+            }
+        }
     }
 }
