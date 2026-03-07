@@ -1,0 +1,14 @@
+[package]
+name = "wifi2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+userlib = { path = "../../userlib" }
+wifi80211 = { path = "../../lib/wifi80211" }
+libf = { path = "../../libf" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

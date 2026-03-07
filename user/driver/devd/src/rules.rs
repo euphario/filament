@@ -163,15 +163,8 @@ pub static PORT_RULES: &[PortRule] = &[
     // =========================================================================
     // Driver layer (driver ports → children)
     // =========================================================================
-    PortRule {
-        class: PortClass::Console,
-        subclass: SubclassMatch::Any,
-        driver: "shell",
-        caps: userlib::devd::caps::USER_ADMIN,
-        priority: abi::priority::NORMAL,
-        context: &[],
-        mount_path: Some("/dev/console"),
-    },
+    // NOTE: Console→shell rule removed. Consoled and sshd spawn shell directly
+    // via exec_with_mailbox (child process, not port-based discovery).
     PortRule {
         class: PortClass::StorageController,
         subclass: SubclassMatch::Exact(port_subclass::STORAGE_NVME),
@@ -228,7 +221,7 @@ pub static PORT_RULES: &[PortRule] = &[
     PortRule {
         class: PortClass::Network,
         subclass: SubclassMatch::Exact(port_subclass::NET_WIFI),
-        driver: "wifid",
+        driver: "wifi2",
         caps: userlib::devd::caps::DRIVER,
         priority: abi::priority::HIGH,
         context: &[],
@@ -288,14 +281,14 @@ pub const DEFAULT_PRESET: ResourcePreset = ResourcePreset {
 /// Look up resource limits for a driver binary name.
 pub fn resource_preset(driver: &str) -> &'static ResourcePreset {
     static PRESETS: &[(&str, ResourcePreset)] = &[
-        ("shell",    ResourcePreset { max_channels: 4,  max_ports: 1, max_shmem: 2, max_children: 0 }),
-        ("consoled", ResourcePreset { max_channels: 8,  max_ports: 2, max_shmem: 4, max_children: 1 }),
+        ("shell",    ResourcePreset { max_channels: 4,  max_ports: 0, max_shmem: 2, max_children: 0 }),
+        ("consoled", ResourcePreset { max_channels: 8,  max_ports: 2, max_shmem: 4, max_children: 2 }),
         ("pcied",    ResourcePreset { max_channels: 16, max_ports: 8, max_shmem: 8, max_children: 8 }),
         ("nvmed",    ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 8, max_children: 4 }),
         ("usbd",     ResourcePreset { max_channels: 16, max_ports: 8, max_shmem: 8, max_children: 4 }),
         ("fatfsd",   ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 8, max_children: 0 }),
         ("partd",    ResourcePreset { max_channels: 8,  max_ports: 4, max_shmem: 4, max_children: 4 }),
-        ("sshd",     ResourcePreset { max_channels: 8,  max_ports: 1, max_shmem: 8, max_children: 0 }),
+        ("sshd",     ResourcePreset { max_channels: 8,  max_ports: 1, max_shmem: 8, max_children: 4 }),
     ];
 
     for (name, preset) in PRESETS.iter() {
@@ -384,11 +377,11 @@ mod tests {
 
     // Driver-layer rules
     #[test]
-    fn test_rule_console() {
+    fn test_rule_console_no_match() {
+        // Console→shell rule removed (consoled spawns shell directly)
         let info = make_port_info(PortClass::Console, 0);
         let rule = find_port_rule(&info);
-        assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "shell");
+        assert!(rule.is_none());
     }
 
     #[test]
@@ -420,7 +413,7 @@ mod tests {
         let info = make_port_info(PortClass::Network, port_subclass::NET_WIFI);
         let rule = find_port_rule(&info);
         assert!(rule.is_some());
-        assert_eq!(rule.unwrap().driver, "wifid");
+        assert_eq!(rule.unwrap().driver, "wifi2");
     }
 
     #[test]
