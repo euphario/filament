@@ -68,6 +68,23 @@ impl DriverState {
 }
 
 // ============================================================================
+// SER L1 Recovery State Machine
+// ============================================================================
+
+/// SER (System Error Recovery) Level 1 — firmware-cooperative DMA reset.
+/// Source: Linux mt7996/mac.c:2534-2648 mt7996_mac_reset_work()
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SerState {
+    Idle,
+    /// DMA_STOPPED signaled, waiting for firmware RESET_DONE.
+    WaitResetDone,
+    /// DMA reset done, DMA_INIT signaled, waiting for RECOVERY_DONE.
+    WaitRecoveryDone,
+    /// RESET_DONE signaled, waiting for firmware NORMAL_STATE.
+    WaitNormalState,
+}
+
+// ============================================================================
 // Timer/IRQ Tags
 // ============================================================================
 
@@ -154,6 +171,16 @@ struct Wifi2 {
     tick: u32,
     // Sub-tick counter (counts 50ms timer fires, resets at 10 = 500ms)
     subtick: u8,
+
+    // Beacon template (re-armed after SER recovery)
+    beacon_buf: [u8; 256],
+    beacon_len: usize,
+    beacon_rearm_pending: bool,
+
+    // SER L1 recovery
+    ser_state: SerState,
+    ser_count: u32,
+    ser_step_tick: u32,
 }
 
 impl Wifi2 {
@@ -193,6 +220,12 @@ impl Wifi2 {
             wlan_idx_used: 0,
             tick: 0,
             subtick: 0,
+            beacon_buf: [0u8; 256],
+            beacon_len: 0,
+            beacon_rearm_pending: false,
+            ser_state: SerState::Idle,
+            ser_count: 0,
+            ser_step_tick: 0,
         }
     }
 
@@ -307,10 +340,11 @@ impl Wifi2 {
 
         let rx_queue_configs: [(u32, u32, u32, u32); 6] = [
             // (hw_idx, ring_base, ndesc, buf_size)
+            // Ring sizes match Linux dma.c:680-778 exactly
             (MT7996_RXQ_MCU_WM,      MT_WFDMA0_RX_RING_BASE, MT7996_RX_MCU_RING_SIZE,    MT7996_RX_MCU_BUF_SIZE),
-            (MT7996_RXQ_MCU_WA,      MT_WFDMA0_RX_RING_BASE, MT7996_RX_MCU_RING_SIZE,    MT7996_RX_MCU_BUF_SIZE),
-            (MT7996_RXQ_MCU_WA_MAIN, MT_WFDMA0_RX_RING_BASE, MT7996_RX_MCU_RING_SIZE_WA, MT7996_RX_BUF_SIZE),
-            (MT7996_RXQ_MCU_WA_TRI,  MT_WFDMA0_RX_RING_BASE, MT7996_RX_MCU_RING_SIZE_WA, MT7996_RX_BUF_SIZE),
+            (MT7996_RXQ_MCU_WA,      MT_WFDMA0_RX_RING_BASE, MT7996_RX_MCU_RING_SIZE_WA, MT7996_RX_MCU_BUF_SIZE),
+            (MT7996_RXQ_MCU_WA_MAIN, MT_WFDMA0_RX_RING_BASE, MT7996_RX_MCU_RING_SIZE,    MT7996_RX_BUF_SIZE),
+            (MT7996_RXQ_MCU_WA_TRI,  MT_WFDMA0_RX_RING_BASE, MT7996_RX_MCU_RING_SIZE,    MT7996_RX_BUF_SIZE),
             (MT7996_RXQ_BAND0,       MT_WFDMA0_RX_RING_BASE, MT7996_RX_RING_SIZE,         MT7996_RX_BUF_SIZE),
             (MT7996_RXQ_BAND2,       rx_base_band2,           MT7996_RX_RING_SIZE,         MT7996_RX_BUF_SIZE),
         ];
@@ -338,6 +372,7 @@ impl Wifi2 {
                 regs_base,
                 ndesc,
                 desc_virt: q_desc_virt,
+                desc_phys: q_desc_phys,
                 buf_size,
                 buf_phys: q_buf_phys,
                 buf_virt: q_buf_virt,
@@ -730,11 +765,11 @@ impl Wifi2 {
             1, CMD_CBW_20MHZ, 0, 0, *seq, None).map_err(mcu_err)?;
         *seq = seq.wrapping_add(1);
 
-        // BSS cipher mode — tell firmware this BSS uses AES-CCMP (WPA2)
-        // Must be set BEFORE any per-STA key installation.
-        // Source: Linux mt7996/main.c:240-244 mt7996_set_key(), first group key path
-        mcu::update_bss_sec(dev, ring, 0, MCU_CIPHER_AES_CCMP, *seq, None).map_err(mcu_err)?;
-        *seq = seq.wrapping_add(1);
+        // BSS cipher mode — deferred to WPA handshake (not in wifid init sequence).
+        // Calling update_bss_sec before any STA keys are installed may cause
+        // firmware inconsistency. Re-enable after SER root cause is found.
+        // mcu::update_bss_sec(dev, ring, 0, MCU_CIPHER_AES_CCMP, *seq, None).map_err(mcu_err)?;
+        // *seq = seq.wrapping_add(1);
 
         // Second STA_REC (newly=false, update existing)
         mcu::add_sta(dev, ring, 0, MT7996_WTBL_RESERVED, 0,
@@ -766,7 +801,9 @@ impl Wifi2 {
             let empty_tim = [0u8; 8];
             let mut bcn_buf = [0u8; 256];
             let bcn_len = wifi80211::frame::build_beacon(&mut bcn_buf, &bss, 0, 0, &empty_tim);
-            mcu::set_beacon(dev, ring, 0, HW_BSSID_0, &bcn_buf[..bcn_len], true, *seq, None).map_err(mcu_err)?;
+            mcu::set_beacon(dev, ring, 0, HW_BSSID_0, &bcn_buf[..bcn_len], true, *seq, None, true).map_err(mcu_err)?;
+            self.beacon_buf[..bcn_len].copy_from_slice(&bcn_buf[..bcn_len]);
+            self.beacon_len = bcn_len;
         }
         *seq = seq.wrapping_add(1);
 
@@ -1227,11 +1264,23 @@ impl Wifi2 {
     }
 
     /// Drain auxiliary RX queues (MCU, WA, BAND2) — responses consumed elsewhere.
+    /// WA_MAIN (queue[2]) is processed with diagnostic logging to detect firmware events.
     fn drain_auxiliary_queues(&mut self, dev: &Mt76Device) {
         for q in self.rx_queues[..2.min(self.rx_queue_count)].iter_mut() {
             q.drain(dev);
         }
-        if self.rx_queue_count > 2 { self.rx_queues[2].drain(dev); }
+        // WA_MAIN (queue[2]): process with diagnostic callback to see firmware events.
+        // This queue carries TXFree notifications, RX events, and firmware status.
+        if self.rx_queue_count > 2 {
+            self.rx_queues[2].process(dev, |buf| {
+                if buf.len() >= 4 {
+                    let rxd0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let pkt_type = (rxd0 >> 27) & 0x1f;
+                    // Log first occurrence of each packet type per tick
+                    udebug!("wifi2", "wa_main_rx"; pkt_type = pkt_type, len = buf.len() as u32);
+                }
+            });
+        }
         if self.rx_queue_count > 3 { self.rx_queues[3].drain(dev); }
         if self.rx_queue_count > 5 { self.rx_queues[5].drain(dev); }
     }
@@ -1776,9 +1825,29 @@ impl Wifi2 {
         self.last_cq_head = new_head;
     }
 
-    /// Slow tick (500ms): clear MIB counters, age out idle STAs.
+    /// Slow tick (500ms): clear MIB counters, beacon diagnostics, age out idle STAs.
     fn slow_tick_housekeeping(&mut self, dev: &Mt76Device) {
         mac::update_stats(dev, 0);
+
+        // Heartbeat: log MCU_CMD and firmware state every 2 ticks (1 second)
+        // for the first 10 seconds, then every 10 ticks (5 seconds).
+        let heartbeat = if self.tick <= 20 { self.tick % 2 == 0 } else { self.tick % 10 == 0 };
+        if heartbeat {
+            let mcu_cmd = dev.rr(MT_MCU_CMD);
+            let fw_state = dev.rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
+            udebug!("wifi2", "heartbeat"; tick = self.tick, mcu_cmd = mcu_cmd, fw_state = fw_state);
+        }
+
+        // Beacon re-arm after SER recovery (deferred from ser_l1_finish)
+        if self.beacon_rearm_pending {
+            self.beacon_rearm_pending = false;
+            if let Some(ref mut ring) = self.wa_ring {
+                let _ = mcu::set_beacon(dev, ring, 0, HW_BSSID_0,
+                    &self.beacon_buf[..self.beacon_len], true, self.seq, None, true);
+                self.seq = self.seq.wrapping_add(1);
+                uinfo!("wifi2", "beacon_rearmed_after_ser");
+            }
+        }
 
         if let Some(ref mut ap) = self.ap {
             let mut evicted = [([0u8; 6], 0u16, 0u16); 4];
@@ -1789,6 +1858,199 @@ impl Wifi2 {
                 udebug!("wifi2", "sta_aged"; wlan_idx = wlan_idx as u32);
             }
         }
+    }
+
+    // ====================================================================
+    // SER L1 Recovery — firmware-cooperative DMA reset
+    // Source: Linux mt7996/mac.c:2534-2648
+    // ====================================================================
+
+    /// Dump hardware state when firmware signals SER — diagnostic for root cause analysis.
+    /// Logs raw register values, queue states, and interrupt sources.
+    fn dump_pre_ser_state(&self, dev: &Mt76Device, mcu_cmd: u32) {
+        unotice!("wifi2", "ser_diag_mcu_cmd"; raw = mcu_cmd,
+            stop_dma = ((mcu_cmd & MT_MCU_CMD_STOP_DMA) != 0) as u32,
+            reset_done = ((mcu_cmd & MT_MCU_CMD_RESET_DONE) != 0) as u32,
+            recovery_done = ((mcu_cmd & MT_MCU_CMD_RECOVERY_DONE) != 0) as u32,
+            normal_state = ((mcu_cmd & MT_MCU_CMD_NORMAL_STATE) != 0) as u32,
+            wm_wdt = ((mcu_cmd & MT_MCU_CMD_WM_WDT) != 0) as u32,
+            wa_wdt = ((mcu_cmd & MT_MCU_CMD_WA_WDT) != 0) as u32);
+
+        // RX queue states: DMA_IDX (firmware write pointer) vs CPU_IDX (host release pointer)
+        // If DMA_IDX == CPU_IDX for any queue, firmware has zero slots → starvation
+        for i in 0..self.rx_queue_count.min(NUM_RX_QUEUES) {
+            let q = &self.rx_queues[i];
+            let dma_idx = dev.rr(q.regs_base + MT_QUEUE_DMA_IDX);
+            let cpu_idx = dev.rr(q.regs_base + MT_QUEUE_CPU_IDX);
+            unotice!("wifi2", "ser_diag_rxq"; qi = i as u32,
+                dma_idx = dma_idx, cpu_idx = cpu_idx,
+                queued = q.queued as u32, tail = q.tail);
+        }
+
+        // TX ring states: MCU WM, MCU WA, Band0
+        if let Some(ref ring) = self.mcu_ring {
+            let dma_idx = dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX);
+            let cpu_idx = dev.rr(ring.regs_base + MT_QUEUE_CPU_IDX);
+            unotice!("wifi2", "ser_diag_tx_wm"; dma_idx = dma_idx, cpu_idx = cpu_idx);
+        }
+        if let Some(ref ring) = self.wa_ring {
+            let dma_idx = dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX);
+            let cpu_idx = dev.rr(ring.regs_base + MT_QUEUE_CPU_IDX);
+            unotice!("wifi2", "ser_diag_tx_wa"; dma_idx = dma_idx, cpu_idx = cpu_idx);
+        }
+        if let Some(ref ring) = self.tx_band0 {
+            let dma_idx = dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX);
+            let cpu_idx = dev.rr(ring.regs_base + MT_QUEUE_CPU_IDX);
+            unotice!("wifi2", "ser_diag_tx_b0"; dma_idx = dma_idx, cpu_idx = cpu_idx);
+        }
+
+        // Pending interrupt sources
+        let int_src = dev.rr(MT_INT_SOURCE_CSR);
+        unotice!("wifi2", "ser_diag_int"; src = int_src);
+
+        // Firmware state
+        let fw_state = dev.rr(MT_TOP_MISC) & MT_TOP_MISC_FW_STATE;
+        unotice!("wifi2", "ser_diag_fw"; fw_state = fw_state,
+            tick = self.tick, ser_count = self.ser_count);
+        ulog::flush();
+    }
+
+    /// Timeout per SER step: 10 seconds (20 × 500ms ticks).
+    const SER_STEP_TIMEOUT_TICKS: u32 = 20;
+
+    /// Maximum SER recovery attempts before giving up (prevents infinite loop).
+    const SER_MAX_COUNT: u32 = 5;
+
+    /// Begin SER L1 recovery: signal DMA_STOPPED to firmware.
+    fn ser_l1_start(&mut self, dev: &Mt76Device) {
+        self.ser_count += 1;
+        if self.ser_count > Self::SER_MAX_COUNT {
+            uerror!("wifi2", "ser_l1_limit_reached"; count = self.ser_count);
+            // Stop trying — leave DMA running so diagnostic logs keep flowing.
+            // Beacons are dead but the driver stays alive for inspection.
+            return;
+        }
+        unotice!("wifi2", "ser_l1_start"; count = self.ser_count);
+        dev.wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
+        self.ser_state = SerState::WaitResetDone;
+        self.ser_step_tick = self.tick;
+    }
+
+    /// Advance SER L1 state machine — called on every event (IRQ or timer).
+    /// Firmware signals state transitions via MT_INT_MCU_CMD interrupt which
+    /// sets bits in MT_MCU_CMD. We poll the register each call.
+    fn ser_l1_tick(&mut self, dev: &Mt76Device) {
+        let elapsed = self.tick.wrapping_sub(self.ser_step_tick);
+        let mcu_cmd = dev.rr(MT_MCU_CMD);
+        match self.ser_state {
+            SerState::Idle => {}
+            SerState::WaitResetDone => {
+                if mcu_cmd & MT_MCU_CMD_RESET_DONE != 0 {
+                    uinfo!("wifi2", "ser_l1_reset_done"; mcu_cmd = mcu_cmd);
+                    dev.wr(MT_MCU_CMD, mcu_cmd); // W1C
+                    self.ser_l1_dma_reset(dev);
+                    dev.wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+                    self.ser_state = SerState::WaitRecoveryDone;
+                    self.ser_step_tick = self.tick;
+                } else if elapsed > Self::SER_STEP_TIMEOUT_TICKS {
+                    uerror!("wifi2", "ser_l1_timeout"; step = 1u32, mcu_cmd = mcu_cmd);
+                    self.ser_l1_dma_reset(dev);
+                    dev.wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+                    self.ser_state = SerState::WaitRecoveryDone;
+                    self.ser_step_tick = self.tick;
+                }
+            }
+            SerState::WaitRecoveryDone => {
+                if mcu_cmd & MT_MCU_CMD_RECOVERY_DONE != 0 {
+                    uinfo!("wifi2", "ser_l1_recovery_done"; mcu_cmd = mcu_cmd);
+                    dev.wr(MT_MCU_CMD, mcu_cmd); // W1C
+                    dev.wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+                    self.ser_state = SerState::WaitNormalState;
+                    self.ser_step_tick = self.tick;
+                } else if elapsed > Self::SER_STEP_TIMEOUT_TICKS {
+                    uerror!("wifi2", "ser_l1_timeout"; step = 2u32, mcu_cmd = mcu_cmd);
+                    dev.wr(MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+                    self.ser_state = SerState::WaitNormalState;
+                    self.ser_step_tick = self.tick;
+                }
+            }
+            SerState::WaitNormalState => {
+                if mcu_cmd & MT_MCU_CMD_NORMAL_STATE != 0 {
+                    uinfo!("wifi2", "ser_l1_normal"; mcu_cmd = mcu_cmd);
+                    dev.wr(MT_MCU_CMD, mcu_cmd); // W1C
+                    self.ser_l1_finish(dev);
+                } else if elapsed > Self::SER_STEP_TIMEOUT_TICKS {
+                    uerror!("wifi2", "ser_l1_timeout"; step = 3u32, mcu_cmd = mcu_cmd);
+                    self.ser_l1_finish(dev);
+                }
+            }
+        }
+    }
+
+    /// DMA reset: disable engines, zero all rings, re-program queue registers, refill RX.
+    /// Must re-program desc_base + ring_size after reset (Linux: mt76_dma_sync_idx).
+    fn ser_l1_dma_reset(&mut self, dev: &Mt76Device) {
+        // Disable DMA engines (no logic reset — firmware is still alive)
+        dma::dma_disable(dev, false);
+
+        // Helper: zero descriptors and re-program queue for a TX ring
+        fn reset_tx(dev: &Mt76Device, ring: &mut TxRing) {
+            for i in 0..ring.ndesc as usize {
+                let desc = ring.desc(i as u32);
+                unsafe {
+                    core::ptr::write_volatile(&mut (*desc).buf0, 0);
+                    core::ptr::write_volatile(&mut (*desc).buf1, 0);
+                    core::ptr::write_volatile(&mut (*desc).info, 0);
+                    core::ptr::write_volatile(&mut (*desc).ctrl, MT_DMA_CTL_DMA_DONE);
+                }
+            }
+            // Re-program queue registers (Linux: mt76_dma_sync_idx)
+            dma::program_queue(dev, ring.regs_base, ring.desc_phys, ring.ndesc);
+            ring.cpu_idx = 0;
+            ring.sweep_idx = 0;
+        }
+
+        if let Some(ref mut ring) = self.tx_band0 { reset_tx(dev, ring); }
+        if let Some(ref mut ring) = self.wa_ring { reset_tx(dev, ring); }
+        if let Some(ref mut ring) = self.mcu_ring { reset_tx(dev, ring); }
+
+        // Reset all RX rings: zero descriptors, re-program queue, refill
+        for qi in 0..self.rx_queue_count {
+            let q = &mut self.rx_queues[qi];
+            for i in 0..q.ndesc as usize {
+                let desc = q.desc(i as u32);
+                unsafe {
+                    core::ptr::write_volatile(&mut (*desc).buf0, 0);
+                    core::ptr::write_volatile(&mut (*desc).buf1, 0);
+                    core::ptr::write_volatile(&mut (*desc).info, 0);
+                    core::ptr::write_volatile(&mut (*desc).ctrl, MT_DMA_CTL_DMA_DONE);
+                }
+            }
+            // Re-program queue registers (Linux: mt76_dma_sync_idx)
+            dma::program_queue(dev, q.regs_base, q.desc_phys, q.ndesc);
+            q.reset_counters();
+            q.fill(dev);
+        }
+
+        // Clear TX inflight tokens (all orphaned after reset)
+        for i in 0..TX_INFLIGHT_SIZE {
+            self.tx_inflight_tags[i] = TX_TAG_FREE;
+        }
+        self.tx_token = 0;
+    }
+
+    /// Finalize SER L1: re-enable DMA, schedule beacon re-arm, return to normal.
+    fn ser_l1_finish(&mut self, dev: &Mt76Device) {
+        dma::dma_enable(dev, false);
+        dma::dma_start(dev, false);
+
+        // Defer beacon re-arm to next slow tick — DMA needs time to stabilize.
+        if self.beacon_len > 0 {
+            self.beacon_rearm_pending = true;
+        }
+
+        self.ser_state = SerState::Idle;
+        unotice!("wifi2", "ser_l1_done"; count = self.ser_count);
     }
 
     /// Process TX from ipd: drain SQ, enqueue frames on band0.
@@ -1972,20 +2234,49 @@ impl Driver for Wifi2 {
             }
         }
 
-        // RX pipeline
-        self.drain_auxiliary_queues(dev);
-        let mut rx = self.collect_rx_frames(dev);
-        rx.log_stats();
-        self.dispatch_mgmt_frames(dev, &mut rx);
-        self.dispatch_eapol_frames(dev, &mut rx);
-        self.forward_rx_data(&mut rx, ctx);
+        // SER L1 recovery in progress — skip all DMA work, advance state machine.
+        // Check MT_MCU_CMD on every event (IRQ or timer) since firmware signals
+        // state transitions via MT_INT_MCU_CMD interrupt.
+        if self.ser_state != SerState::Idle {
+            self.ser_l1_tick(dev);
+            if is_irq {
+                dev.wr(MT_INT_MASK_CSR, MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_MCU | MT_INT_TX_DONE_BAND0 | MT_INT_MCU_CMD);
+            }
+            return;
+        }
 
-        // TX completions + pool reclaim
-        self.tx_sweep_and_complete(dev, ctx);
-        self.reclaim_rx_pool(ctx);
+        // Check for firmware SER request on EVERY event (not just slow ticks).
+        // Catching SER early gives better diagnostics and prevents stale DMA work.
+        // Source: Linux mt7996/mmio.c:781-788 mt7996_irq_tasklet()
+        let mcu_cmd = dev.rr(MT_MCU_CMD);
+        if mcu_cmd & (MT_MCU_CMD_ERROR_MASK | MT_MCU_CMD_WDT_MASK) != 0 {
+            // Dump hardware state before starting recovery — this is our
+            // primary diagnostic for finding the SER root cause.
+            self.dump_pre_ser_state(dev, mcu_cmd);
+            dev.wr(MT_MCU_CMD, mcu_cmd); // W1C
+            if mcu_cmd & MT_MCU_CMD_WDT_MASK != 0 {
+                uerror!("wifi2", "firmware_wdt";
+                    wm = ((mcu_cmd & MT_MCU_CMD_WM_WDT) != 0) as u32,
+                    wa = ((mcu_cmd & MT_MCU_CMD_WA_WDT) != 0) as u32);
+            } else if mcu_cmd & MT_MCU_CMD_STOP_DMA != 0 {
+                self.ser_l1_start(dev);
+            }
+        } else {
+            // Normal path: process RX and TX
+            self.drain_auxiliary_queues(dev);
+            let mut rx = self.collect_rx_frames(dev);
+            rx.log_stats();
+            self.dispatch_mgmt_frames(dev, &mut rx);
+            self.dispatch_eapol_frames(dev, &mut rx);
+            self.forward_rx_data(&mut rx, ctx);
 
-        // Periodic housekeeping
-        if is_slow_tick { self.slow_tick_housekeeping(dev); }
+            self.tx_sweep_and_complete(dev, ctx);
+            self.reclaim_rx_pool(ctx);
+
+            if is_slow_tick {
+                self.slow_tick_housekeeping(dev);
+            }
+        }
 
         // Re-enable IRQ
         if is_irq {

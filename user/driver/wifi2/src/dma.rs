@@ -67,7 +67,7 @@ pub struct TxRing {
     pub cpu_idx: u32,
     pub sweep_idx: u32,
     desc_virt: u64,
-    desc_phys: u64,
+    pub desc_phys: u64,
     buf_virt: u64,
     buf_phys: u64,
     pub buf_stride: usize,
@@ -217,6 +217,7 @@ pub struct RxRing {
     pub regs_base: u32,
     pub ndesc: u32,
     pub desc_virt: u64,
+    pub desc_phys: u64,
     pub buf_size: u32,
     pub buf_phys: u64,
     pub buf_virt: u64,
@@ -227,7 +228,7 @@ pub struct RxRing {
 
 impl RxRing {
     pub const ZERO: Self = Self {
-        hw_idx: 0, regs_base: 0, ndesc: 0, desc_virt: 0,
+        hw_idx: 0, regs_base: 0, ndesc: 0, desc_virt: 0, desc_phys: 0,
         buf_size: 0, buf_phys: 0, buf_virt: 0,
         head: 0, tail: 0, queued: 0,
     };
@@ -555,6 +556,8 @@ pub fn dma_enable(dev: &Mt76Device, reset: bool) {
 
 /// Hardware layout of mt76_connac_fw_txp (44 bytes at TXD + 32).
 /// Source: mt76_connac.h struct mt76_connac_fw_txp
+///   buf[6] at offset 8  (24 bytes) — buffer physical addresses (lower 32 bits)
+///   len[6] at offset 32 (12 bytes) — buffer lengths | upper 4 addr bits
 #[repr(C, packed)]
 struct FwTxp {
     flags: u16,       // CT info flags
@@ -562,9 +565,8 @@ struct FwTxp {
     _rsvd: u8,
     rept_wds_wcid: u16, // STA WCID (unaligned — LE)
     nbuf: u8,
-    buf_addr: [u32; 4], // buffer physical addresses (lower 32 bits)
-    _pad: [u8; 16],
-    buf_len: [u16; 4],  // buffer lengths | upper 4 addr bits
+    buf_addr: [u32; 6], // MT_TXP_MAX_BUF_NUM = 6
+    buf_len: [u16; 6],  // buffer lengths | upper 4 addr bits
 }
 
 /// Write a fw_txp into a DMA buffer and the frame after it.
