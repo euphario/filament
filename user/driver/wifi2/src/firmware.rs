@@ -100,14 +100,20 @@ struct FwRegion {
 // Loading functions
 // ============================================================================
 
+/// Reborrow an IRQ option for passing to MCU functions that consume `Option<&mut FwIrq>`.
+fn irq<'a, 'b>(opt: &'a mut Option<&'b mut FwIrq>) -> Option<&'a mut FwIrq>
+where 'b: 'a {
+    opt.as_mut().map(|r| &mut **r)
+}
+
 /// Upload firmware data in 4KB chunks via FWDL ring.
 fn upload_chunks(
     dev: &Mt76Device, ring: &mut TxRing,
     data: &[u8], seq: &mut u8,
-    irq: &mut Option<&mut FwIrq>,
+    fw_irq: &mut Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
     for chunk in data.chunks(MCU_FW_DL_BUF_SIZE) {
-        mcu::send_fw_chunk(dev, ring, chunk, *seq, irq.as_mut().map(|r| &mut **r))?;
+        mcu::send_fw_chunk(dev, ring, chunk, *seq, irq(fw_irq))?;
         *seq = seq.wrapping_add(1);
     }
     Ok(())
@@ -117,7 +123,7 @@ fn upload_chunks(
 /// Source: mcu.c:2208-2296
 fn load_patch(
     dev: &Mt76Device, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing,
-    seq: &mut u8, irq: &mut Option<&mut FwIrq>,
+    seq: &mut u8, fw_irq: &mut Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
     let fw = FW_ROM_PATCH;
 
@@ -133,7 +139,7 @@ fn load_patch(
     let n_region = u32::from_be(hdr.desc.n_region);
 
     // Acquire semaphore
-    mcu::patch_sem_ctrl(dev, mcu_ring, true, *seq, irq.as_mut().map(|r| &mut **r))?;
+    mcu::patch_sem_ctrl(dev, mcu_ring, true, *seq, irq(fw_irq))?;
     *seq = seq.wrapping_add(1);
 
     for i in 0..n_region {
@@ -171,15 +177,15 @@ fn load_patch(
             return Err(McuError::TxTimeout { cmd: "patch_data_oob" });
         }
 
-        mcu::init_download(dev, mcu_ring, addr, len, mode, *seq, irq.as_mut().map(|r| &mut **r))?;
+        mcu::init_download(dev, mcu_ring, addr, len, mode, *seq, irq(fw_irq))?;
         *seq = seq.wrapping_add(1);
 
-        upload_chunks(dev, fwdl_ring, &fw[data_offs..data_offs + len as usize], seq, irq)?;
+        upload_chunks(dev, fwdl_ring, &fw[data_offs..data_offs + len as usize], seq, fw_irq)?;
     }
 
     userlib::delay_ms(100);
 
-    mcu::start_firmware(dev, mcu_ring, true, 0, 0, *seq, irq.as_mut().map(|r| &mut **r))?;
+    mcu::start_firmware(dev, mcu_ring, true, 0, 0, *seq, irq(fw_irq))?;
     *seq = seq.wrapping_add(1);
 
     uinfo!("firmware", "patch_loaded"; regions = n_region, bytes = fw.len());
@@ -191,7 +197,7 @@ fn load_patch(
 fn load_ram(
     dev: &Mt76Device, mcu_ring: &mut TxRing, fwdl_ring: &mut TxRing,
     fw: &[u8], name: &str, fw_start_bits: u32,
-    seq: &mut u8, irq: &mut Option<&mut FwIrq>,
+    seq: &mut u8, fw_irq: &mut Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
     if fw.len() < core::mem::size_of::<FwTrailer>() {
         uerror!("firmware", "ram_too_small"; name = name, bytes = fw.len());
@@ -223,10 +229,10 @@ fn load_ram(
 
         unsafe { core::arch::asm!("dsb sy", "isb") };
 
-        mcu::init_download(dev, mcu_ring, addr, len, mode, *seq, irq.as_mut().map(|r| &mut **r))?;
+        mcu::init_download(dev, mcu_ring, addr, len, mode, *seq, irq(fw_irq))?;
         *seq = seq.wrapping_add(1);
 
-        upload_chunks(dev, fwdl_ring, &fw[data_offset..data_offset + len as usize], seq, irq)?;
+        upload_chunks(dev, fwdl_ring, &fw[data_offset..data_offset + len as usize], seq, fw_irq)?;
         data_offset += len as usize;
     }
 
@@ -234,7 +240,7 @@ fn load_ram(
     if override_addr != 0 { option |= fw_start::OVERRIDE; }
     option |= fw_start_bits;
 
-    mcu::start_firmware(dev, mcu_ring, false, option, override_addr, *seq, irq.as_mut().map(|r| &mut **r))?;
+    mcu::start_firmware(dev, mcu_ring, false, option, override_addr, *seq, irq(fw_irq))?;
     *seq = seq.wrapping_add(1);
 
     uinfo!("firmware", "ram_loaded"; name = name, regions = n_region, bytes = fw.len());
@@ -258,25 +264,25 @@ pub fn load_all(
     let mut seq: u8 = 1;
 
     // 1. Patch
-    load_patch(dev, mcu_ring, fwdl_ring, &mut seq, &mut irq.as_mut().map(|r| &mut **r))?;
+    load_patch(dev, mcu_ring, fwdl_ring, &mut seq, &mut irq)?;
     uinfo!("firmware", "patch_done"; seq = seq);
     ulog::flush();
     userlib::delay_ms(100);
 
     // 2. WM
-    load_ram(dev, mcu_ring, fwdl_ring, FW_WM, "WM", 0, &mut seq, &mut irq.as_mut().map(|r| &mut **r))?;
+    load_ram(dev, mcu_ring, fwdl_ring, FW_WM, "WM", 0, &mut seq, &mut irq)?;
     uinfo!("firmware", "wm_done"; seq = seq);
     ulog::flush();
     userlib::delay_ms(100);
 
     // 3. DSP
-    load_ram(dev, mcu_ring, fwdl_ring, FW_DSP, "DSP", fw_start::WORKING_PDA_DSP, &mut seq, &mut irq.as_mut().map(|r| &mut **r))?;
+    load_ram(dev, mcu_ring, fwdl_ring, FW_DSP, "DSP", fw_start::WORKING_PDA_DSP, &mut seq, &mut irq)?;
     uinfo!("firmware", "dsp_done"; seq = seq);
     ulog::flush();
     userlib::delay_ms(100);
 
     // 4. WA
-    load_ram(dev, mcu_ring, fwdl_ring, FW_WA, "WA", fw_start::WORKING_PDA_CR4, &mut seq, &mut irq.as_mut().map(|r| &mut **r))?;
+    load_ram(dev, mcu_ring, fwdl_ring, FW_WA, "WA", fw_start::WORKING_PDA_CR4, &mut seq, &mut irq)?;
     uinfo!("firmware", "wa_done"; seq = seq);
     ulog::flush();
 

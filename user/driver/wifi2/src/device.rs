@@ -153,40 +153,18 @@ impl Mt76Device {
         self.wr(reg, (old & !mask) | val);
     }
 
-    /// Poll register until (read & mask) == expected, or timeout.
-    /// Returns Ok(value) on success, Err(DeviceError) on timeout.
+    /// Poll register until (read & mask) == expected, or timeout (milliseconds).
     ///
-    /// Uses 1ms sleep per iteration to avoid syscall storms from
-    /// `delay_us(10)` spinning on `gettime()`. Hardware registers
-    /// typically clear BUSY in < 1μs, so the first read usually succeeds.
-    pub fn poll(&self, reg: u32, mask: u32, expected: u32, timeout_us: u32) -> Result<u32, DeviceError> {
-        // First try without sleeping — hardware is usually ready immediately
+    /// Tries once without sleeping (hardware usually responds immediately),
+    /// then falls back to a 1ms sleep loop.
+    pub fn poll(&self, reg: u32, mask: u32, expected: u32, timeout_ms: u32) -> Result<u32, DeviceError> {
         let val = self.rr(reg);
-        if (val & mask) == expected {
-            return Ok(val);
-        }
+        if (val & mask) == expected { return Ok(val); }
 
-        // Fall back to 1ms sleep loop
-        let timeout_ms = (timeout_us / 1000).max(1);
-        for _ in 0..timeout_ms {
-            let val = self.rr(reg);
-            if (val & mask) == expected {
-                return Ok(val);
-            }
-            userlib::delay_ms(1);
-        }
-        let got = self.rr(reg) & mask;
-        Err(DeviceError::PollTimeout { reg, mask, expected, got })
-    }
-
-    /// Poll register with millisecond granularity.
-    pub fn poll_msec(&self, reg: u32, mask: u32, expected: u32, timeout_ms: u32) -> Result<u32, DeviceError> {
         for _ in 0..timeout_ms.max(1) {
-            let val = self.rr(reg);
-            if (val & mask) == expected {
-                return Ok(val);
-            }
             userlib::delay_ms(1);
+            let val = self.rr(reg);
+            if (val & mask) == expected { return Ok(val); }
         }
         let got = self.rr(reg) & mask;
         Err(DeviceError::PollTimeout { reg, mask, expected, got })
@@ -286,9 +264,9 @@ impl Mt76Device {
     }
 
     /// Poll a translated register.
-    pub fn reg_poll(&self, addr: u32, mask: u32, val: u32, timeout_us: u32) -> Result<u32, DeviceError> {
+    pub fn reg_poll(&self, addr: u32, mask: u32, val: u32, timeout_ms: u32) -> Result<u32, DeviceError> {
         let mapped = self.translate(addr);
-        self.poll(mapped, mask, val, timeout_us)
+        self.poll(mapped, mask, val, timeout_ms)
     }
 
     // ========================================================================
@@ -335,7 +313,7 @@ impl Mt76Device {
     pub fn driver_own(&self, band: u32) -> Result<(), DeviceError> {
         self.wr(mt_top_lpcr_host_band(band), MT_TOP_LPCR_HOST_DRV_OWN);
 
-        self.poll_msec(
+        self.poll(
             mt_top_lpcr_host_band(band),
             MT_TOP_LPCR_HOST_FW_OWN_STAT,
             0,

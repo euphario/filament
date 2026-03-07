@@ -1213,157 +1213,196 @@ impl RxCollector {
 }
 
 // ============================================================================
-// Driver trait impl
+// Event processing — named methods for each phase of handle_event
 // ============================================================================
 
-/// Wrapper to implement the Driver trait.
-struct Wifi2Driver(Wifi2);
-
-impl Driver for Wifi2Driver {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.init_hardware(ctx)?;
-        self.0.init_radio(ctx)?;
-
-        // Start poll timer (50ms) — fast enough for STA auth/assoc timeouts
-        ctx.start_timer(TAG_WIFI_TIMER, 50_000_000)?;
-
-        unotice!("wifi2", "ready"; state = self.0.state.name());
-        Ok(())
+impl Wifi2 {
+    /// Get a raw pointer to the device, for use in handle_event/data_ready
+    /// where we need both `&Mt76Device` reads and `&mut self` method calls.
+    ///
+    /// SAFETY: `dev` is never mutated after init_hardware(). The returned
+    /// pointer is valid for the driver's lifetime (bus framework owns us).
+    fn dev_ptr(&self) -> Option<*const Mt76Device> {
+        self.dev.as_ref().map(|d| d as *const Mt76Device)
     }
 
-    fn command(&mut self, _msg: &BusMsg, _ctx: &mut dyn BusCtx) -> Disposition {
-        Disposition::Forward
-    }
-
-    fn handle_event(&mut self, tag: u32, _handle: userlib::syscall::Handle, ctx: &mut dyn BusCtx) {
-        let is_timer = tag == TAG_WIFI_TIMER;
-        let is_irq = tag == TAG_WIFI_IRQ;
-        if !is_timer && !is_irq { return; }
-        if self.0.state != DriverState::ApActive { return; }
-
-        // Use raw pointer for dev to avoid borrow conflicts with &mut self.0
-        let dev_ptr = match self.0.dev.as_ref() {
-            Some(d) => d as *const Mt76Device,
-            None => return,
-        };
-        // SAFETY: self.0.dev is Some (checked above) and not modified during handle_event.
-        let dev = unsafe { &*dev_ptr };
-
-        // ================================================================
-        // IRQ handling: mask, read source, clear, then process
-        // ================================================================
-        if is_irq {
-            if let Some(ref mut irq) = self.0.irq {
-                dev.wr(MT_INT_MASK_CSR, 0);
-                let src = dev.rr(MT_INT_SOURCE_CSR);
-                if src != 0 {
-                    dev.wr(MT_INT_SOURCE_CSR, src);
-                }
-                let _ = irq.ack();
-            }
-        }
-
-        // Housekeeping tick: 10 sub-ticks (50ms each) = 500ms
-        let mut is_slow_tick = false;
-        if is_timer {
-            self.0.subtick += 1;
-            if self.0.subtick >= 10 {
-                self.0.subtick = 0;
-                self.0.tick = self.0.tick.wrapping_add(1);
-                is_slow_tick = true;
-            }
-        }
-
-        // ================================================================
-        // Queue 0 (MCU WM) + Queue 1 (MCU WA): drain only
-        // ================================================================
-        for q in self.0.rx_queues[..2.min(self.0.rx_queue_count)].iter_mut() {
+    /// Drain auxiliary RX queues (MCU, WA, BAND2) — responses consumed elsewhere.
+    fn drain_auxiliary_queues(&mut self, dev: &Mt76Device) {
+        for q in self.rx_queues[..2.min(self.rx_queue_count)].iter_mut() {
             q.drain(dev);
         }
+        if self.rx_queue_count > 2 { self.rx_queues[2].drain(dev); }
+        if self.rx_queue_count > 3 { self.rx_queues[3].drain(dev); }
+        if self.rx_queue_count > 5 { self.rx_queues[5].drain(dev); }
+    }
 
-        // ================================================================
-        // Queue 2 (WA_MAIN) + Queue 3 (WA_TRI): drain (TX free notifications)
-        // ================================================================
-        if self.0.rx_queue_count > 2 { self.0.rx_queues[2].drain(dev); }
-        if self.0.rx_queue_count > 3 { self.0.rx_queues[3].drain(dev); }
-
-        // ================================================================
-        // Queue 5 (BAND2): drain
-        // ================================================================
-        if self.0.rx_queue_count > 5 { self.0.rx_queues[5].drain(dev); }
-
-        // ================================================================
-        // Queue 4 (BAND0 data): classify and collect frames
-        // ================================================================
-        // Collect frames on stack — DMA buffers are freed during process(),
-        // so we snapshot everything we need before the closure returns.
+    /// Collect RX frames from BAND0 queue into a stack-local RxCollector.
+    fn collect_rx_frames(&mut self, dev: &Mt76Device) -> RxCollector {
         let mut rx = RxCollector::new();
+        if self.rx_queue_count <= 4 { return rx; }
 
-        if self.0.rx_queue_count > 4 {
-            self.0.rx_queues[4].process(dev, |buf| {
-                let rxd = event::classify_rxd(buf);
-                rx.total += 1;
-                if rxd.fcs_err {
-                    rx.fcs_errors += 1;
-                    // Log first FCS error details for diagnosis
-                    if rx.fcs_errors == 1 {
+        self.rx_queues[4].process(dev, |buf| {
+            let rxd = event::classify_rxd(buf);
+            rx.total += 1;
+
+            if rxd.fcs_err {
+                rx.fcs_errors += 1;
+                if rx.fcs_errors == 1 {
+                    let rxd0 = if buf.len() >= 4 { u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) } else { 0 };
+                    let rxd3 = if buf.len() >= 16 { u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) } else { 0 };
+                    uwarn!("wifi2", "fcs_err_detail";
+                        rxd0 = rxd0, rxd1 = rxd.rxd1, rxd3 = rxd3,
+                        hdr_trans = rxd.hdr_trans as u32,
+                        wlan_idx = rxd.wlan_idx as u32,
+                        byte_cnt = rxd.byte_cnt as u32);
+                }
+                return;
+            }
+
+            let mut class = rxd.class;
+            if !rxd.hdr_trans && matches!(class, RxFrameClass::Data | RxFrameClass::Mgmt) {
+                if rxd.frame_ofs + 2 <= buf.len() {
+                    class = event::reclassify_by_fc(buf[rxd.frame_ofs]);
+                }
+            }
+
+            let frame_end = (rxd.byte_cnt as usize).min(buf.len());
+            match class {
+                RxFrameClass::Mgmt if !rxd.hdr_trans =>
+                    rx.collect_mgmt(buf, &rxd, frame_end),
+                RxFrameClass::Data if rxd.hdr_trans =>
+                    rx.collect_eth_data(&buf[rxd.frame_ofs..frame_end]),
+                RxFrameClass::Data if !rxd.hdr_trans =>
+                    rx.collect_raw_data(buf, &rxd),
+                _ => {
+                    if rx.dropped == 0 {
                         let rxd0 = if buf.len() >= 4 { u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) } else { 0 };
-                        let rxd3 = if buf.len() >= 16 { u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) } else { 0 };
-                        uwarn!("wifi2", "fcs_err_detail";
-                            rxd0 = rxd0,
-                            rxd1 = rxd.rxd1,
-                            rxd3 = rxd3,
+                        uwarn!("wifi2", "drop_detail";
+                            pkt_type = (rxd0 >> 27) & 0x1f,
                             hdr_trans = rxd.hdr_trans as u32,
                             wlan_idx = rxd.wlan_idx as u32,
                             byte_cnt = rxd.byte_cnt as u32);
                     }
-                    return;
+                    rx.record_drop(buf, &rxd, class);
                 }
+            }
+        });
+        rx
+    }
 
-                let mut class = rxd.class;
+    /// Transmit a management frame (TXD + 802.11 frame) on band0.
+    fn tx_mgmt(&mut self, dev: &Mt76Device, frame: &[u8]) {
+        let mut txd_buf = [0u8; 576];
+        let total = dma::wrap_mgmt_txd(&mut txd_buf, frame);
+        if total == 0 { return; }
+        let tok = self.next_tx_token();
+        if let Some(ref mut ring) = self.tx_band0 {
+            match dma::tx_enqueue_mgmt(ring, dev, &txd_buf[..total], tok) {
+                Ok(()) => udebug!("wifi2", "tx_mgmt_ok"; tok = tok as u32, len = total as u32),
+                Err(_) => uerror!("wifi2", "tx_mgmt_full"; tok = tok as u32),
+            }
+        }
+    }
 
-                // Reclassify non-HDR_TRANS frames by reading FC byte
-                // (NDATA bit is unreliable for unicast management)
-                if !rxd.hdr_trans && matches!(class, RxFrameClass::Data | RxFrameClass::Mgmt) {
-                    if rxd.frame_ofs + 2 <= buf.len() {
-                        class = event::reclassify_by_fc(buf[rxd.frame_ofs]);
-                    }
-                }
+    /// Transmit a data frame (Ethernet) on band0 with optional cipher bypass.
+    fn tx_data(&mut self, dev: &Mt76Device, frame: &[u8], wcid: u16, no_cipher: bool) -> Result<u16, ()> {
+        let tok = self.next_tx_token();
+        if let Some(ref mut ring) = self.tx_band0 {
+            dma::tx_enqueue_data(ring, dev, frame, wcid, tok, no_cipher)
+                .map(|()| tok)
+                .map_err(|_| ())
+        } else {
+            Err(())
+        }
+    }
 
-                let frame_end = (rxd.byte_cnt as usize).min(buf.len());
+    /// Register a STA with firmware: add_client_sta + rate_ctrl + hdr_trans.
+    fn register_sta_mcu(
+        &mut self, dev: &Mt76Device,
+        mac: &[u8; 6], aid: u16, ht_cap: u16, ht_param: u8, flags: u16,
+    ) -> Option<u16> {
+        let wlan_idx = self.alloc_wlan_idx()?;
+        let ring = self.wa_ring.as_mut()?;
+        let seq = &mut self.seq;
 
-                match class {
-                    RxFrameClass::Mgmt if !rxd.hdr_trans =>
-                        rx.collect_mgmt(buf, &rxd, frame_end),
+        let r1 = mcu::add_client_sta(
+            dev, ring, 0, wlan_idx, 0, CONN_STATE_CONNECT,
+            mac, aid, true, ht_cap, ht_param, flags, *seq, None, true,
+        );
+        *seq = seq.wrapping_add(1);
 
-                    RxFrameClass::Data if rxd.hdr_trans =>
-                        rx.collect_eth_data(&buf[rxd.frame_ofs..frame_end]),
-
-                    RxFrameClass::Data if !rxd.hdr_trans =>
-                        rx.collect_raw_data(buf, &rxd),
-
-                    _ => {
-                        // Log first drop details for diagnosis
-                        if rx.dropped == 0 {
-                            let rxd0 = if buf.len() >= 4 { u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) } else { 0 };
-                            let pkt_type = (rxd0 >> 27) & 0x1f;
-                            uwarn!("wifi2", "drop_detail";
-                                pkt_type = pkt_type,
-                                hdr_trans = rxd.hdr_trans as u32,
-                                wlan_idx = rxd.wlan_idx as u32,
-                                byte_cnt = rxd.byte_cnt as u32);
-                        }
-                        rx.record_drop(buf, &rxd, class);
-                    }
-                }
-            });
+        if r1.is_err() {
+            uerror!("wifi2", "register_sta_mcu_failed"; wlan_idx = wlan_idx as u32);
+            self.free_wlan_idx(wlan_idx);
+            return None;
         }
 
-        rx.log_stats();
+        let r2 = mcu::sta_rate_ctrl(
+            dev, ring, 0, wlan_idx, 0,
+            self.channel, 0, ht_cap, ht_param, flags, *seq,
+        );
+        *seq = seq.wrapping_add(1);
+        if r2.is_err() {
+            uwarn!("wifi2", "sta_rate_ctrl_failed"; wlan_idx = wlan_idx as u32);
+        }
 
-        // ================================================================
-        // Management frame dispatch through AP state machine
-        // ================================================================
+        let r3 = mcu::wtbl_update_hdr_trans(dev, ring, 0, wlan_idx, 0, *seq);
+        *seq = seq.wrapping_add(1);
+        if r3.is_err() {
+            uwarn!("wifi2", "hdr_trans_enable_failed"; wlan_idx = wlan_idx as u32);
+        }
+
+        Some(wlan_idx)
+    }
+
+    /// Disconnect a STA via firmware and free its WLAN index.
+    fn disconnect_sta_mcu(&mut self, dev: &Mt76Device, mac: &[u8; 6], wlan_idx: u16) {
+        if let Some(ref mut ring) = self.wa_ring {
+            let seq = &mut self.seq;
+            if mcu::add_client_sta(
+                dev, ring, 0, wlan_idx, 0, CONN_STATE_DISCONNECT,
+                mac, 0, false, 0, 0, 0, *seq, None, true,
+            ).is_err() {
+                uerror!("wifi2", "disconnect_sta_failed"; wlan_idx = wlan_idx as u32);
+            }
+            *seq = seq.wrapping_add(1);
+        }
+        self.free_wlan_idx(wlan_idx);
+    }
+
+    /// Start WPA2 handshake by sending M1 to a newly registered STA.
+    fn start_wpa_handshake(&mut self, dev: &Mt76Device, mac: &[u8; 6], wlan_idx: u16) {
+        let wpa_ctx = match self.wpa_ctx.as_mut() {
+            Some(w) => w,
+            None => return,
+        };
+        let mut anonce = [0u8; 32];
+        let mut replay: u64 = 0;
+        let mut m1_buf = [0u8; 256];
+        let m1_len = wpa_ctx.build_m1(mac, &mut anonce, &mut replay, &mut m1_buf);
+        if m1_len == 0 {
+            uerror!("wifi2", "m1_build_failed"; wlan_idx = wlan_idx as u32);
+            return;
+        }
+
+        match self.tx_data(dev, &m1_buf[..m1_len], wlan_idx, true) {
+            Ok(tok) => uinfo!("wifi2", "m1_sent"; wlan_idx = wlan_idx as u32,
+                tok = tok as u32, len = m1_len as u32),
+            Err(_) => uerror!("wifi2", "m1_tx_full"; wlan_idx = wlan_idx as u32),
+        }
+
+        if let Some(ref mut ap) = self.ap {
+            if let Some(sta) = ap.find_sta_mut(mac) {
+                sta.hs_state = HandshakeState::WaitM2;
+                sta.anonce = anonce;
+                sta.replay_counter = replay;
+                sta.hs_retries = 0;
+            }
+        }
+    }
+
+    /// Dispatch collected management frames through the AP state machine.
+    fn dispatch_mgmt_frames(&mut self, dev: &Mt76Device, rx: &mut RxCollector) {
         for i in 0..rx.mgmt_count {
             let mf = match rx.mgmt_frames[i].take() {
                 Some(m) => m,
@@ -1371,9 +1410,9 @@ impl Driver for Wifi2Driver {
             };
 
             let subtype = wifi80211::types::parse_mgmt_subtype(mf.fc0);
-            let fc_subtype = (mf.fc0 >> 4) & 0xF;
-            udebug!("wifi2", "rx_mgmt"; subtype = fc_subtype as u32,
+            udebug!("wifi2", "rx_mgmt"; subtype = ((mf.fc0 >> 4) & 0xF) as u32,
                 fc0 = mf.fc0 as u32, body_len = mf.body_len as u32, rssi = mf.rssi as i32);
+
             let frame = RxMgmtFrame {
                 subtype,
                 addr2: mf.addr2,
@@ -1385,22 +1424,11 @@ impl Driver for Wifi2Driver {
             };
 
             let mut tx_buf = [0u8; 512];
-            let ap = match self.0.ap.as_mut() {
+            let ap = match self.ap.as_mut() {
                 Some(a) => a,
                 None => continue,
             };
-            let result = ap.handle_rx_mgmt(&frame, &mut tx_buf, self.0.tick);
-            // Log AP actions for debugging
-            for j2 in 0..result.count {
-                match &result.actions[j2] {
-                    Some(ApAction::TxFrame(_)) => { udebug!("wifi2", "ap_action"; action = 1u32); }
-                    Some(ApAction::RegisterSta { .. }) => { udebug!("wifi2", "ap_action"; action = 2u32); }
-                    Some(ApAction::RemoveSta { .. }) => { udebug!("wifi2", "ap_action"; action = 3u32); }
-                    Some(ApAction::NotifyBaSession { .. }) => { udebug!("wifi2", "ap_action"; action = 4u32); }
-                    Some(ApAction::StaPsChanged { .. }) => { udebug!("wifi2", "ap_action"; action = 5u32); }
-                    _ => {}
-                }
-            }
+            let result = ap.handle_rx_mgmt(&frame, &mut tx_buf, self.tick);
 
             for j in 0..result.count {
                 let action = match &result.actions[j] {
@@ -1408,138 +1436,41 @@ impl Driver for Wifi2Driver {
                     None => continue,
                 };
                 match action {
-                    ApAction::TxFrame(data) => {
-                        let mut txd_buf = [0u8; 576];
-                        let total = dma::wrap_mgmt_txd(&mut txd_buf, data);
-                        if total > 0 {
-                            let tok = self.0.next_tx_token();
-                            if let Some(ref mut ring) = self.0.tx_band0 {
-                                match dma::tx_enqueue_mgmt(ring, dev, &txd_buf[..total], tok) {
-                                    Ok(()) => {
-                                        udebug!("wifi2", "tx_mgmt_ok"; tok = tok as u32, len = total as u32);
-                                    }
-                                    Err(_) => {
-                                        uerror!("wifi2", "tx_mgmt_full"; tok = tok as u32);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    ApAction::TxFrame(data) => self.tx_mgmt(dev, data),
+
                     ApAction::RegisterSta { mac, aid, ht_cap, ht_param, flags } => {
                         uinfo!("wifi2", "register_sta";
                             aid = *aid as u32,
                             mac4 = u32::from_be_bytes([mac[0], mac[1], mac[2], mac[3]]));
 
-                        if let Some(wlan_idx) = self.0.alloc_wlan_idx() {
-                            let mut sta_ok = false;
-                            if let Some(ref mut ring) = self.0.wa_ring {
-                                let seq = &mut self.0.seq;
-                                let r1 = mcu::add_client_sta(
-                                    dev, ring, 0, wlan_idx, 0, CONN_STATE_CONNECT,
-                                    mac, *aid, true, *ht_cap, *ht_param, *flags,
-                                    *seq, None, true,
-                                );
-                                *seq = seq.wrapping_add(1);
-
-                                if r1.is_ok() {
-                                    let r2 = mcu::sta_rate_ctrl(
-                                        dev, ring, 0, wlan_idx, 0,
-                                        self.0.channel, 0, *ht_cap, *ht_param, *flags, *seq,
-                                    );
-                                    *seq = seq.wrapping_add(1);
-                                    if r2.is_err() {
-                                        uwarn!("wifi2", "sta_rate_ctrl_failed"; wlan_idx = wlan_idx as u32);
-                                    }
-
-                                    // Enable RX header translation (decap offload)
-                                    // Linux: sta_set_decap_offload → wtbl_update_hdr_trans
-                                    let r3 = mcu::wtbl_update_hdr_trans(
-                                        dev, ring, 0, wlan_idx, 0, *seq,
-                                    );
-                                    *seq = seq.wrapping_add(1);
-                                    if r3.is_err() {
-                                        uwarn!("wifi2", "hdr_trans_enable_failed"; wlan_idx = wlan_idx as u32);
-                                    }
-
-                                    sta_ok = true;
-                                } else {
-                                    uerror!("wifi2", "register_sta_mcu_failed"; wlan_idx = wlan_idx as u32);
-                                    self.0.free_wlan_idx(wlan_idx);
-                                }
+                        if let Some(wlan_idx) = self.register_sta_mcu(dev, mac, *aid, *ht_cap, *ht_param, *flags) {
+                            if let Some(ref mut ap) = self.ap {
+                                ap.set_sta_wlan_idx(mac, wlan_idx);
                             }
-
-                            if sta_ok {
-                                if let Some(ref mut ap) = self.0.ap {
-                                    ap.set_sta_wlan_idx(mac, wlan_idx);
-                                }
-                                uinfo!("wifi2", "sta_registered"; wlan_idx = wlan_idx as u32);
-
-                                // Start WPA2 handshake if enabled
-                                if let Some(ref mut wpa_ctx) = self.0.wpa_ctx {
-                                    let mut anonce = [0u8; 32];
-                                    let mut replay: u64 = 0;
-                                    let mut m1_buf = [0u8; 256];
-                                    let m1_len = wpa_ctx.build_m1(mac, &mut anonce, &mut replay, &mut m1_buf);
-                                    if m1_len > 0 {
-                                        let tok = self.0.next_tx_token();
-                                        if let Some(ref mut ring) = self.0.tx_band0 {
-                                            match dma::tx_enqueue_data(ring, dev, &m1_buf[..m1_len], wlan_idx, tok, true) {
-                                                Ok(()) => {
-                                                    uinfo!("wifi2", "m1_sent"; wlan_idx = wlan_idx as u32,
-                                                        tok = tok as u32, len = m1_len as u32);
-                                                }
-                                                Err(_) => {
-                                                    uerror!("wifi2", "m1_tx_full"; wlan_idx = wlan_idx as u32);
-                                                }
-                                            }
-                                        }
-                                        // Record handshake state on STA
-                                        if let Some(ref mut ap) = self.0.ap {
-                                            if let Some(sta) = ap.find_sta_mut(mac) {
-                                                sta.hs_state = HandshakeState::WaitM2;
-                                                sta.anonce = anonce;
-                                                sta.replay_counter = replay;
-                                                sta.hs_retries = 0;
-                                            }
-                                        }
-                                    } else {
-                                        uerror!("wifi2", "m1_build_failed"; wlan_idx = wlan_idx as u32);
-                                    }
-                                }
-                            }
+                            uinfo!("wifi2", "sta_registered"; wlan_idx = wlan_idx as u32);
+                            self.start_wpa_handshake(dev, mac, wlan_idx);
                         } else {
                             uerror!("wifi2", "wlan_idx_exhausted");
                         }
                     }
+
                     ApAction::RemoveSta { mac, aid: _, wlan_idx } => {
-                        if let Some(ref mut ring) = self.0.wa_ring {
-                            let seq = &mut self.0.seq;
-                            if mcu::add_client_sta(
-                                dev, ring, 0, *wlan_idx, 0, CONN_STATE_DISCONNECT,
-                                mac, 0, false, 0, 0, 0,
-                                *seq, None, true,
-                            ).is_err() {
-                                uerror!("wifi2", "remove_sta_failed"; wlan_idx = *wlan_idx as u32);
-                            }
-                            *seq = seq.wrapping_add(1);
-                        }
-                        self.0.free_wlan_idx(*wlan_idx);
-                        // Clear handshake state
-                        if let Some(ref mut ap) = self.0.ap {
+                        self.disconnect_sta_mcu(dev, mac, *wlan_idx);
+                        if let Some(ref mut ap) = self.ap {
                             if let Some(sta) = ap.find_sta_mut(mac) {
                                 sta.hs_state = HandshakeState::None;
                             }
                         }
                     }
+
                     ApAction::NotifyBaSession { mac: _, tid, ssn, win_size, start } => {
-                        // Find wlan_idx for this STA
-                        let wlan_idx = self.0.ap.as_ref()
+                        let wlan_idx = self.ap.as_ref()
                             .and_then(|ap| ap.find_sta(&mf.addr2))
                             .map(|s| s.wlan_idx)
                             .unwrap_or(0);
                         if wlan_idx >= STA_WLAN_IDX_BASE {
-                            if let Some(ref mut ring) = self.0.wa_ring {
-                                let seq = &mut self.0.seq;
+                            if let Some(ref mut ring) = self.wa_ring {
+                                let seq = &mut self.seq;
                                 if mcu::sta_ba(
                                     dev, ring, 0, wlan_idx, 0,
                                     *tid, *ssn, *win_size, *start, *seq,
@@ -1550,16 +1481,17 @@ impl Driver for Wifi2Driver {
                             }
                         }
                     }
+
                     ApAction::StaPsChanged { .. } => {
-                        // MT7996 firmware handles PS natively — no software action needed
+                        // MT7996 firmware handles PS natively
                     }
                 }
             }
         }
+    }
 
-        // ================================================================
-        // EAPOL dispatch (WPA2 4-way handshake)
-        // ================================================================
+    /// Dispatch collected EAPOL frames through the WPA2 handshake state machine.
+    fn dispatch_eapol_frames(&mut self, dev: &Mt76Device, rx: &mut RxCollector) {
         for i in 0..rx.eapol_count {
             let ef = match rx.eapol_frames[i].take() {
                 Some(e) => e,
@@ -1569,379 +1501,298 @@ impl Driver for Wifi2Driver {
             udebug!("wifi2", "rx_eapol"; len = ef.body_len as u32,
                 src = u32::from_be_bytes([ef.src_mac[0], ef.src_mac[1], ef.src_mac[2], ef.src_mac[3]]));
 
-            // Find STA's handshake state
-            let sta_info = self.0.ap.as_ref().and_then(|ap| {
+            let sta_info = self.ap.as_ref().and_then(|ap| {
                 ap.find_sta(&ef.src_mac).map(|s| (s.wlan_idx, s.hs_state, s.anonce, s.replay_counter))
             });
-            let (wlan_idx, hs_state, anonce, mut replay) = match sta_info {
+            let (wlan_idx, hs_state, anonce, replay) = match sta_info {
                 Some(info) => info,
                 None => continue,
             };
 
             match hs_state {
-                HandshakeState::WaitM2 => {
-                    let wpa_ctx = match self.0.wpa_ctx.as_mut() {
-                        Some(w) => w,
-                        None => continue,
-                    };
-                    let mut ptk = [0u8; 48];
-                    let mut snonce = [0u8; 32];
-                    if wpa_ctx.process_m2(&ef.src_mac, &anonce, replay, eapol_body, &mut ptk, &mut snonce) {
-                        // Build and send M3
-                        replay += 1;
-                        let kck: &[u8; 16] = ptk[..16].try_into().unwrap();
-                        let kek: &[u8; 16] = ptk[16..32].try_into().unwrap();
-                        let mut m3_buf = [0u8; 512];
-                        let m3_len = wpa_ctx.build_m3(&ef.src_mac, &anonce, &mut replay, kck, kek, &mut m3_buf);
-                        if m3_len > 0 {
-                            let tok = self.0.next_tx_token();
-                            if let Some(ref mut ring) = self.0.tx_band0 {
-                                let _ = dma::tx_enqueue_data(ring, dev, &m3_buf[..m3_len], wlan_idx, tok, true);
-                            }
-                        }
-                        // Update STA state
-                        if let Some(ref mut ap) = self.0.ap {
-                            if let Some(sta) = ap.find_sta_mut(&ef.src_mac) {
-                                sta.hs_state = HandshakeState::WaitM4;
-                                sta.ptk = ptk;
-                                sta.snonce = snonce;
-                                sta.replay_counter = replay;
-                                sta.hs_retries = 0;
-                            }
-                        }
-                        uinfo!("wifi2", "wpa_m2_ok"; wlan_idx = wlan_idx as u32);
-                    }
-                }
-                HandshakeState::WaitM4 => {
-                    // Get PTK from STA
-                    let ptk = self.0.ap.as_ref()
-                        .and_then(|ap| ap.find_sta(&ef.src_mac))
-                        .map(|s| s.ptk);
-                    let ptk = match ptk {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    let kck = &ptk[..16];
-                    let wpa_ctx = match self.0.wpa_ctx.as_ref() {
-                        Some(w) => w,
-                        None => continue,
-                    };
-                    if wpa_ctx.process_m4(kck, eapol_body) {
-                        // Install keys via MCU
-                        // Linux order: PORT_SECURE first (sta_state AUTHORIZED),
-                        // then set_key() — firmware needs STA authorized before
-                        // installing keys.
-                        let ptk_tk: [u8; 16] = ptk[32..48].try_into().unwrap_or([0; 16]);
-                        let mut keys_ok = false;
-                        if let Some(ref mut ring) = self.0.wa_ring {
-                            let seq = &mut self.0.seq;
-
-                            // Linux AP mode key install order:
-                            // 0. Re-send BSS_INFO with cipher (first key install only)
-                            // 1. install_key (GTK + PTK)
-                            // 2. PORT_SECURE
-                            // Source: mt7996/main.c:240-244 mt7996_set_hw_key()
-
-                            // 0. Re-send full BSS_INFO with cipher=CCMP
-                            // Linux: mt7996_set_hw_key() calls mt7996_mcu_add_bss_info()
-                            // when link->mt76.cipher was 0 (first key install).
-                            // Firmware needs BSS cipher set before WTBL keys take effect.
-                            let _ = mcu::add_bss_info(
-                                dev, ring, 0, HW_BSSID_0, 0, &self.0.mac_addr,
-                                true, self.0.channel, CMD_CBW_20MHZ, 0,
-                                MCU_CIPHER_AES_CCMP, *seq, None,
-                            );
-                            *seq = seq.wrapping_add(1);
-
-                            // 1. Install GTK (group key) on BMC STA
-                            // muar_idx=0x0e for BMC (broadcast/multicast)
-                            // Linux: mt76_connac_mcu.c:285-286 alloc_sta_req
-                            let r1 = mcu::install_key(
-                                dev, ring, 0, MT7996_WTBL_RESERVED, 0x0e,
-                                wpa_ctx.gtk_idx(), wpa_ctx.gtk(), *seq, None,
-                            );
-                            *seq = seq.wrapping_add(1);
-
-                            // 2. Install PTK (pairwise key) on this STA
-                            uinfo!("wifi2", "ptk_install";
-                                wlan_idx = wlan_idx as u32,
-                                tk0 = u32::from_le_bytes([ptk_tk[0], ptk_tk[1], ptk_tk[2], ptk_tk[3]]),
-                                tk4 = u32::from_le_bytes([ptk_tk[4], ptk_tk[5], ptk_tk[6], ptk_tk[7]]),
-                                tk8 = u32::from_le_bytes([ptk_tk[8], ptk_tk[9], ptk_tk[10], ptk_tk[11]]),
-                                tk12 = u32::from_le_bytes([ptk_tk[12], ptk_tk[13], ptk_tk[14], ptk_tk[15]]));
-                            let r2 = mcu::install_key(
-                                dev, ring, 0, wlan_idx, 0,
-                                0, &ptk_tk, *seq, None,
-                            );
-                            *seq = seq.wrapping_add(1);
-
-                            // 3. Transition STA to PORT_SECURE (after keys installed)
-                            let r3 = mcu::add_client_sta(
-                                dev, ring, 0, wlan_idx, 0, CONN_STATE_PORT_SECURE,
-                                &ef.src_mac, 0, false, 0, 0, 0,
-                                *seq, None, true,
-                            );
-                            *seq = seq.wrapping_add(1);
-
-                            if r1.is_err() || r2.is_err() || r3.is_err() {
-                                uerror!("wifi2", "wpa_key_install_failed"; wlan_idx = wlan_idx as u32,
-                                    gtk = r1.is_err() as u32, ptk = r2.is_err() as u32, secure = r3.is_err() as u32);
-                            } else {
-                                keys_ok = true;
-                            }
-                        }
-
-                        if keys_ok {
-                            if let Some(ref mut ap) = self.0.ap {
-                                if let Some(sta) = ap.find_sta_mut(&ef.src_mac) {
-                                    sta.hs_state = HandshakeState::Complete;
-                                }
-                            }
-                            unotice!("wifi2", "wpa_complete"; wlan_idx = wlan_idx as u32);
-                        }
-                    }
-                }
-                _ => {} // Not in handshake — ignore
+                HandshakeState::WaitM2 => self.handle_m2(dev, &ef.src_mac, wlan_idx, &anonce, replay, eapol_body),
+                HandshakeState::WaitM4 => self.handle_m4(dev, &ef.src_mac, wlan_idx, eapol_body),
+                _ => {}
             }
-        }
-
-        // ================================================================
-        // Data frame forwarding to ipd via DataPort
-        // ================================================================
-        if rx.data_count > 0 {
-            if let Some(dp) = self.0.data_port {
-                let mut forwarded = 0u32;
-                let mut alloc_fail = 0u32;
-                let mut port_fail = 0u32;
-                for i in 0..rx.data_count {
-                    let df = match rx.data_frames[i].take() {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    let frame_data = &rx.data_buf[df.offset..df.offset + df.len];
-
-                    // Touch STA last_seen for aging
-                    if df.len >= 12 {
-                        let mut src_mac = [0u8; 6];
-                        src_mac.copy_from_slice(&frame_data[6..12]);
-                        if let Some(ref mut ap) = self.0.ap {
-                            ap.touch_sta(&src_mac, self.0.tick);
-                        }
-                    }
-
-                    // Allocate pool space and post CQE
-                    let port = match ctx.block_port(dp) {
-                        Some(p) => p,
-                        None => { port_fail += 1; continue; }
-                    };
-                    let offset = match port.alloc(df.len as u32) {
-                        Some(o) => o,
-                        None => { alloc_fail += 1; continue; }
-                    };
-                    if let Some(dst) = port.pool_slice_mut(offset, df.len as u32) {
-                        dst.copy_from_slice(frame_data);
-                    }
-                    let tag = self.0.net_rx_seq;
-                    self.0.net_rx_seq = self.0.net_rx_seq.wrapping_add(1);
-                    let cqe = IoCqe {
-                        status: io_status::OK,
-                        flags: 0,
-                        tag,
-                        transferred: df.len as u32,
-                        result: offset,
-                    };
-                    port.complete(&cqe);
-                    // Track pool offset for reclaim
-                    let mask = TX_INFLIGHT_SIZE - 1;
-                    self.0.cq_offsets[(self.0.cq_post_seq as usize) & mask] = offset;
-                    self.0.cq_post_seq = self.0.cq_post_seq.wrapping_add(1);
-                    forwarded += 1;
-
-                    // Log first frame details for debugging
-                    if forwarded == 1 && df.len >= 14 {
-                        let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
-                        uinfo!("wifi2", "rx_data_fwd";
-                            count = rx.data_count as u32,
-                            len = df.len as u32,
-                            ethertype = ethertype as u32,
-                            dst0 = frame_data[0] as u32,
-                            dst1 = frame_data[1] as u32,
-                            offset = offset);
-                    }
-                }
-                if alloc_fail > 0 || port_fail > 0 {
-                    uwarn!("wifi2", "rx_fwd_drop"; alloc_fail = alloc_fail, port_fail = port_fail);
-                }
-                // Notify consumer (ipd) that completions are available
-                if forwarded > 0 {
-                    if let Some(port) = ctx.block_port(dp) {
-                        port.notify();
-                    }
-                }
-            } else {
-                uinfo!("wifi2", "rx_data_no_port"; count = rx.data_count as u32);
-            }
-        }
-
-        // ================================================================
-        // TX sweep: reclaim completed TX descriptors
-        // ================================================================
-        if let Some(ref mut ring) = self.0.tx_band0 {
-            let mut tokens = [0u16; 32];
-            let swept = dma::tx_sweep(ring, dev, &mut tokens);
-            if swept > 0 {
-                udebug!("wifi2", "tx_sweep"; swept = swept as u32,
-                    cpu = ring.cpu_idx, sweep = ring.sweep_idx);
-                if let Some(dp) = self.0.data_port {
-                    let mask = TX_INFLIGHT_SIZE - 1;
-                    for k in 0..swept {
-                        let tok = tokens[k] as usize;
-                        let tag = self.0.tx_inflight_tags[tok & mask];
-                        if tag != TX_TAG_FREE {
-                            // Post TX completion CQE to ipd
-                            if let Some(port) = ctx.block_port(dp) {
-                                port.complete_ok(tag, 0);
-                            }
-                            self.0.tx_inflight_tags[tok & mask] = TX_TAG_FREE;
-                        }
-                    }
-                    if let Some(port) = ctx.block_port(dp) {
-                        port.notify();
-                    }
-                }
-            }
-        }
-
-        // ================================================================
-        // Pool reclaim: free CQ offsets that consumer has acknowledged
-        // ================================================================
-        if let Some(dp) = self.0.data_port {
-            if let Some(port) = ctx.block_port(dp) {
-                let new_head = port.cq_consumer_head();
-                let mask = TX_INFLIGHT_SIZE - 1;
-                let mut h = self.0.last_cq_head;
-                while h != new_head {
-                    let offset = self.0.cq_offsets[(h as usize) & mask];
-                    if offset != 0 {
-                        port.free(offset);
-                    }
-                    h = h.wrapping_add(1);
-                }
-                self.0.last_cq_head = new_head;
-            }
-        }
-
-        // ================================================================
-        // Slow tick (500ms): MIB stats, STA aging
-        // ================================================================
-        if is_slow_tick {
-            mac::update_stats(dev, 0);
-
-            // STA aging
-            if let Some(ref mut ap) = self.0.ap {
-                let mut evicted = [([0u8; 6], 0u16, 0u16); 4];
-                let evict_count = ap.age_stas(self.0.tick, &mut evicted);
-                for k in 0..evict_count {
-                    let (mac, _aid, wlan_idx) = evicted[k];
-                    if let Some(ref mut ring) = self.0.wa_ring {
-                        let seq = &mut self.0.seq;
-                        if mcu::add_client_sta(
-                            dev, ring, 0, wlan_idx, 0, CONN_STATE_DISCONNECT,
-                            &mac, 0, false, 0, 0, 0, *seq, None, true,
-                        ).is_err() {
-                            uerror!("wifi2", "age_disconnect_failed"; wlan_idx = wlan_idx as u32);
-                        }
-                        *seq = seq.wrapping_add(1);
-                    }
-                    self.0.free_wlan_idx(wlan_idx);
-                    udebug!("wifi2", "sta_aged"; wlan_idx = wlan_idx as u32);
-                }
-            }
-        }
-
-        // ================================================================
-        // Re-enable IRQ mask
-        // ================================================================
-        if is_irq {
-            let irq_mask = MT_INT_MCU_CMD
-                | MT_INT_RX_DONE_MCU
-                | MT_INT_TX_DONE_MCU
-                | MT_INT_RX_DONE_BAND0
-                | MT_INT_RX_DONE_WA_MAIN
-                | MT_INT_TX_DONE_BAND0;
-            dev.wr(MT_INT_MASK_CSR, irq_mask);
         }
     }
 
-    fn data_ready(&mut self, port_id: PortId, ctx: &mut dyn BusCtx) {
-        if self.0.state != DriverState::ApActive { return; }
-        let dev_ptr = match self.0.dev.as_ref() {
-            Some(d) => d as *const Mt76Device,
+    /// Process M2 message: derive PTK, send M3.
+    fn handle_m2(
+        &mut self, dev: &Mt76Device,
+        src_mac: &[u8; 6], wlan_idx: u16,
+        anonce: &[u8; 32], replay: u64, eapol_body: &[u8],
+    ) {
+        let wpa_ctx = match self.wpa_ctx.as_mut() {
+            Some(w) => w,
             None => return,
         };
-        // SAFETY: self.0.dev is Some (checked above) and not modified during data_ready.
-        let dev = unsafe { &*dev_ptr };
-        let dp = match self.0.data_port {
-            Some(id) if id == port_id => id,
-            _ => return,
+        let mut ptk = [0u8; 48];
+        let mut snonce = [0u8; 32];
+        if !wpa_ctx.process_m2(src_mac, anonce, replay, eapol_body, &mut ptk, &mut snonce) {
+            return;
+        }
+
+        let mut replay = replay + 1;
+        let kck: &[u8; 16] = ptk[..16].try_into().unwrap();
+        let kek: &[u8; 16] = ptk[16..32].try_into().unwrap();
+        let mut m3_buf = [0u8; 512];
+        let m3_len = wpa_ctx.build_m3(src_mac, anonce, &mut replay, kck, kek, &mut m3_buf);
+        if m3_len > 0 {
+            let _ = self.tx_data(dev, &m3_buf[..m3_len], wlan_idx, true);
+        }
+
+        if let Some(ref mut ap) = self.ap {
+            if let Some(sta) = ap.find_sta_mut(src_mac) {
+                sta.hs_state = HandshakeState::WaitM4;
+                sta.ptk = ptk;
+                sta.snonce = snonce;
+                sta.replay_counter = replay;
+                sta.hs_retries = 0;
+            }
+        }
+        uinfo!("wifi2", "wpa_m2_ok"; wlan_idx = wlan_idx as u32);
+    }
+
+    /// Process M4 message: verify MIC, install keys, transition to PORT_SECURE.
+    fn handle_m4(&mut self, dev: &Mt76Device, src_mac: &[u8; 6], wlan_idx: u16, eapol_body: &[u8]) {
+        let ptk = self.ap.as_ref()
+            .and_then(|ap| ap.find_sta(src_mac))
+            .map(|s| s.ptk);
+        let ptk = match ptk {
+            Some(p) => p,
+            None => return,
         };
-        udebug!("wifi2", "data_ready"; port = port_id.0 as u32);
+        let kck = &ptk[..16];
+        let (gtk_idx, gtk, m4_ok) = match self.wpa_ctx.as_ref() {
+            Some(w) => (w.gtk_idx(), *w.gtk(), w.process_m4(kck, eapol_body)),
+            None => return,
+        };
+        if !m4_ok { return; }
 
-        // ================================================================
-        // Handle sidechannel queries (QUERY_INFO from ipd)
-        // ================================================================
-        let mut queries: [Option<SideEntry>; 4] = [None; 4];
-        let mut qcount = 0;
+        // Install keys via MCU
+        // Source: mt7996/main.c:240-244 mt7996_set_hw_key()
+        let ptk_tk: [u8; 16] = ptk[32..48].try_into().unwrap_or([0; 16]);
+        let keys_ok = self.install_wpa_keys(dev, src_mac, wlan_idx, gtk_idx, &gtk, &ptk_tk);
+
+        if keys_ok {
+            if let Some(ref mut ap) = self.ap {
+                if let Some(sta) = ap.find_sta_mut(src_mac) {
+                    sta.hs_state = HandshakeState::Complete;
+                }
+            }
+            unotice!("wifi2", "wpa_complete"; wlan_idx = wlan_idx as u32);
+        }
+    }
+
+    /// Install GTK + PTK + PORT_SECURE via MCU commands.
+    fn install_wpa_keys(
+        &mut self, dev: &Mt76Device,
+        src_mac: &[u8; 6], wlan_idx: u16,
+        gtk_idx: u8, gtk: &[u8; 16], ptk_tk: &[u8; 16],
+    ) -> bool {
+        let ring = match self.wa_ring.as_mut() {
+            Some(r) => r,
+            None => return false,
+        };
+        let seq = &mut self.seq;
+
+        // 0. BSS_INFO with cipher=CCMP (firmware needs this before WTBL keys)
+        let _ = mcu::add_bss_info(
+            dev, ring, 0, HW_BSSID_0, 0, &self.mac_addr,
+            true, self.channel, CMD_CBW_20MHZ, 0,
+            MCU_CIPHER_AES_CCMP, *seq, None,
+        );
+        *seq = seq.wrapping_add(1);
+
+        // 1. GTK (group key) on BMC STA
+        let r1 = mcu::install_key(
+            dev, ring, 0, MT7996_WTBL_RESERVED, 0x0e,
+            gtk_idx, gtk, *seq, None,
+        );
+        *seq = seq.wrapping_add(1);
+
+        // 2. PTK (pairwise key) on this STA
+        uinfo!("wifi2", "ptk_install";
+            wlan_idx = wlan_idx as u32,
+            tk0 = u32::from_le_bytes([ptk_tk[0], ptk_tk[1], ptk_tk[2], ptk_tk[3]]),
+            tk4 = u32::from_le_bytes([ptk_tk[4], ptk_tk[5], ptk_tk[6], ptk_tk[7]]),
+            tk8 = u32::from_le_bytes([ptk_tk[8], ptk_tk[9], ptk_tk[10], ptk_tk[11]]),
+            tk12 = u32::from_le_bytes([ptk_tk[12], ptk_tk[13], ptk_tk[14], ptk_tk[15]]));
+        let r2 = mcu::install_key(
+            dev, ring, 0, wlan_idx, 0,
+            0, ptk_tk, *seq, None,
+        );
+        *seq = seq.wrapping_add(1);
+
+        // 3. PORT_SECURE (after keys installed)
+        let r3 = mcu::add_client_sta(
+            dev, ring, 0, wlan_idx, 0, CONN_STATE_PORT_SECURE,
+            src_mac, 0, false, 0, 0, 0, *seq, None, true,
+        );
+        *seq = seq.wrapping_add(1);
+
+        if r1.is_err() || r2.is_err() || r3.is_err() {
+            uerror!("wifi2", "wpa_key_install_failed"; wlan_idx = wlan_idx as u32,
+                gtk = r1.is_err() as u32, ptk = r2.is_err() as u32, secure = r3.is_err() as u32);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Forward collected RX data frames to ipd via DataPort.
+    fn forward_rx_data(&mut self, rx: &mut RxCollector, ctx: &mut dyn BusCtx) {
+        if rx.data_count == 0 { return; }
+        let dp = match self.data_port {
+            Some(dp) => dp,
+            None => {
+                uinfo!("wifi2", "rx_data_no_port"; count = rx.data_count as u32);
+                return;
+            }
+        };
+
+        let mut forwarded = 0u32;
+        let mut alloc_fail = 0u32;
+        let mut port_fail = 0u32;
+        let mask = TX_INFLIGHT_SIZE - 1;
+
+        for i in 0..rx.data_count {
+            let df = match rx.data_frames[i].take() {
+                Some(d) => d,
+                None => continue,
+            };
+            let frame_data = &rx.data_buf[df.offset..df.offset + df.len];
+
+            if df.len >= 12 {
+                let mut src_mac = [0u8; 6];
+                src_mac.copy_from_slice(&frame_data[6..12]);
+                if let Some(ref mut ap) = self.ap {
+                    ap.touch_sta(&src_mac, self.tick);
+                }
+            }
+
+            let port = match ctx.block_port(dp) {
+                Some(p) => p,
+                None => { port_fail += 1; continue; }
+            };
+            let offset = match port.alloc(df.len as u32) {
+                Some(o) => o,
+                None => { alloc_fail += 1; continue; }
+            };
+            if let Some(dst) = port.pool_slice_mut(offset, df.len as u32) {
+                dst.copy_from_slice(frame_data);
+            }
+
+            let tag = self.net_rx_seq;
+            self.net_rx_seq = self.net_rx_seq.wrapping_add(1);
+            port.complete(&IoCqe {
+                status: io_status::OK,
+                flags: 0,
+                tag,
+                transferred: df.len as u32,
+                result: offset,
+            });
+
+            self.cq_offsets[(self.cq_post_seq as usize) & mask] = offset;
+            self.cq_post_seq = self.cq_post_seq.wrapping_add(1);
+            forwarded += 1;
+
+            if forwarded == 1 && df.len >= 14 {
+                let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
+                uinfo!("wifi2", "rx_data_fwd";
+                    count = rx.data_count as u32,
+                    len = df.len as u32,
+                    ethertype = ethertype as u32,
+                    dst0 = frame_data[0] as u32,
+                    dst1 = frame_data[1] as u32,
+                    offset = offset);
+            }
+        }
+
+        if alloc_fail > 0 || port_fail > 0 {
+            uwarn!("wifi2", "rx_fwd_drop"; alloc_fail = alloc_fail, port_fail = port_fail);
+        }
+        if forwarded > 0 {
+            if let Some(port) = ctx.block_port(dp) {
+                port.notify();
+            }
+        }
+    }
+
+    /// Sweep completed TX descriptors, post CQEs for inflight tokens.
+    fn tx_sweep_and_complete(&mut self, dev: &Mt76Device, ctx: &mut dyn BusCtx) {
+        let ring = match self.tx_band0.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        let mut tokens = [0u16; 32];
+        let swept = dma::tx_sweep(ring, dev, &mut tokens);
+        if swept == 0 { return; }
+
+        udebug!("wifi2", "tx_sweep"; swept = swept as u32,
+            cpu = ring.cpu_idx, sweep = ring.sweep_idx);
+
+        let dp = match self.data_port {
+            Some(dp) => dp,
+            None => return,
+        };
+        let mask = TX_INFLIGHT_SIZE - 1;
+        for k in 0..swept {
+            let tok = tokens[k] as usize;
+            let tag = self.tx_inflight_tags[tok & mask];
+            if tag != TX_TAG_FREE {
+                if let Some(port) = ctx.block_port(dp) {
+                    port.complete_ok(tag, 0);
+                }
+                self.tx_inflight_tags[tok & mask] = TX_TAG_FREE;
+            }
+        }
         if let Some(port) = ctx.block_port(dp) {
-            while qcount < 4 {
-                if let Some(entry) = port.poll_side_request() {
-                    queries[qcount] = Some(entry);
-                    qcount += 1;
-                } else {
-                    break;
-                }
-            }
+            port.notify();
         }
-        for k in 0..qcount {
-            if let Some(entry) = queries[k].take() {
-                match entry.msg_type {
-                    side_msg::QUERY_INFO => {
-                        uinfo!("wifi2", "side_query_info"; tag = entry.tag);
-                        let mut response = SideEntry {
-                            msg_type: entry.msg_type,
-                            flags: 0,
-                            tag: entry.tag,
-                            status: side_status::OK,
-                            payload: [0; 24],
-                        };
-                        response.payload[0..6].copy_from_slice(&self.0.mac_addr);
-                        response.payload[6] = 1; // link up
-                        response.payload[7..9].copy_from_slice(&1500u16.to_le_bytes());
-                        if let Some(port) = ctx.block_port(dp) {
-                            port.side_send(&response);
-                            port.notify();
-                        }
-                    }
-                    _ => {
-                        let response = SideEntry {
-                            msg_type: entry.msg_type,
-                            flags: 0,
-                            tag: entry.tag,
-                            status: side_status::EOL,
-                            payload: [0; 24],
-                        };
-                        if let Some(port) = ctx.block_port(dp) {
-                            port.side_send(&response);
-                            port.notify();
-                        }
-                    }
-                }
-            }
-        }
+    }
 
-        // ================================================================
-        // Process TX from ipd (SQ drain)
-        // ================================================================
+    /// Free pool offsets that ipd has consumed.
+    fn reclaim_rx_pool(&mut self, ctx: &mut dyn BusCtx) {
+        let dp = match self.data_port {
+            Some(dp) => dp,
+            None => return,
+        };
+        let port = match ctx.block_port(dp) {
+            Some(p) => p,
+            None => return,
+        };
+        let new_head = port.cq_consumer_head();
+        let mask = TX_INFLIGHT_SIZE - 1;
+        let mut h = self.last_cq_head;
+        while h != new_head {
+            let offset = self.cq_offsets[(h as usize) & mask];
+            if offset != 0 {
+                port.free(offset);
+            }
+            h = h.wrapping_add(1);
+        }
+        self.last_cq_head = new_head;
+    }
+
+    /// Slow tick (500ms): clear MIB counters, age out idle STAs.
+    fn slow_tick_housekeeping(&mut self, dev: &Mt76Device) {
+        mac::update_stats(dev, 0);
+
+        if let Some(ref mut ap) = self.ap {
+            let mut evicted = [([0u8; 6], 0u16, 0u16); 4];
+            let evict_count = ap.age_stas(self.tick, &mut evicted);
+            for k in 0..evict_count {
+                let (mac, _aid, wlan_idx) = evicted[k];
+                self.disconnect_sta_mcu(dev, &mac, wlan_idx);
+                udebug!("wifi2", "sta_aged"; wlan_idx = wlan_idx as u32);
+            }
+        }
+    }
+
+    /// Process TX from ipd: drain SQ, enqueue frames on band0.
+    fn process_tx_from_ipd(&mut self, dev: &Mt76Device, dp: PortId, ctx: &mut dyn BusCtx) {
         for _ in 0..256 {
             let sqe = match ctx.block_port(dp).and_then(|p| p.recv_request()) {
                 Some(s) => s,
@@ -1962,7 +1813,6 @@ impl Driver for Wifi2Driver {
                 continue;
             }
 
-            // Read frame from pool
             let mut frame_buf = [0u8; MAX_FRAME_SIZE];
             let got = ctx.block_port(dp).and_then(|port| {
                 port.pool_slice(sqe.data_offset, frame_len as u32).map(|s| {
@@ -1983,29 +1833,26 @@ impl Driver for Wifi2Driver {
             let wcid = if is_multicast {
                 MT7996_WTBL_RESERVED
             } else {
-                self.0.ap.as_ref()
+                self.ap.as_ref()
                     .and_then(|ap| ap.find_sta(&dst_mac))
                     .map(|sta| sta.wlan_idx)
                     .unwrap_or(MT7996_WTBL_RESERVED)
             };
 
-            // Check WPA2 handshake state for cipher decision
-            let no_cipher = if self.0.wpa_ctx.is_some() && !is_multicast {
-                self.0.ap.as_ref()
+            let no_cipher = if self.wpa_ctx.is_some() && !is_multicast {
+                self.ap.as_ref()
                     .and_then(|ap| ap.find_sta(&dst_mac))
                     .map(|sta| sta.hs_state != HandshakeState::Complete)
                     .unwrap_or(true)
-            } else if self.0.wpa_ctx.is_some() {
-                // Multicast: check if GTK is installed (any STA completed handshake)
-                let any_complete = self.0.ap.as_ref()
+            } else if self.wpa_ctx.is_some() {
+                let any_complete = self.ap.as_ref()
                     .map(|ap| ap.iter_stas().any(|s| s.hs_state == HandshakeState::Complete))
                     .unwrap_or(false);
                 !any_complete
             } else {
-                true // No WPA2
+                true
             };
 
-            let tok = self.0.next_tx_token();
             uinfo!("wifi2", "tx_from_ipd";
                 len = frame_len as u32,
                 wcid = wcid as u32,
@@ -2013,44 +1860,154 @@ impl Driver for Wifi2Driver {
                 dst0 = dst_mac[0] as u32,
                 dst1 = dst_mac[1] as u32,
                 mcast = is_multicast as u32);
-            if let Some(ref mut ring) = self.0.tx_band0 {
-                match dma::tx_enqueue_data(ring, dev, &frame_buf[..frame_len], wcid, tok, no_cipher) {
-                    Ok(()) => {
-                        let mask = TX_INFLIGHT_SIZE - 1;
-                        self.0.tx_inflight_tags[(tok as usize) & mask] = sqe.tag;
-                    }
-                    Err(_) => {
-                        if let Some(port) = ctx.block_port(dp) {
-                            port.complete_error(sqe.tag, io_status::NOT_READY);
-                        }
+
+            match self.tx_data(dev, &frame_buf[..frame_len], wcid, no_cipher) {
+                Ok(tok) => {
+                    let mask = TX_INFLIGHT_SIZE - 1;
+                    self.tx_inflight_tags[(tok as usize) & mask] = sqe.tag;
+                }
+                Err(_) => {
+                    if let Some(port) = ctx.block_port(dp) {
+                        port.complete_error(sqe.tag, io_status::NOT_READY);
                     }
                 }
             }
         }
+    }
 
-        // ================================================================
-        // TX sweep + CQ post for completed TX tokens
-        // ================================================================
-        if let Some(ref mut ring) = self.0.tx_band0 {
-            let mut tokens = [0u16; 32];
-            let swept = dma::tx_sweep(ring, dev, &mut tokens);
-            if swept > 0 {
-                let mask = TX_INFLIGHT_SIZE - 1;
-                for k in 0..swept {
-                    let tok = tokens[k] as usize;
-                    let tag = self.0.tx_inflight_tags[tok & mask];
-                    if tag != TX_TAG_FREE {
-                        if let Some(port) = ctx.block_port(dp) {
-                            port.complete_ok(tag, 0);
-                        }
-                        self.0.tx_inflight_tags[tok & mask] = TX_TAG_FREE;
-                    }
+    /// Handle sidechannel queries from ipd (QUERY_INFO etc.)
+    fn handle_side_queries(&mut self, dp: PortId, ctx: &mut dyn BusCtx) {
+        let mut queries: [Option<SideEntry>; 4] = [None; 4];
+        let mut qcount = 0;
+        if let Some(port) = ctx.block_port(dp) {
+            while qcount < 4 {
+                if let Some(entry) = port.poll_side_request() {
+                    queries[qcount] = Some(entry);
+                    qcount += 1;
+                } else {
+                    break;
                 }
+            }
+        }
+        for k in 0..qcount {
+            if let Some(entry) = queries[k].take() {
+                let (status, payload) = match entry.msg_type {
+                    side_msg::QUERY_INFO => {
+                        uinfo!("wifi2", "side_query_info"; tag = entry.tag);
+                        let mut p = [0u8; 24];
+                        p[0..6].copy_from_slice(&self.mac_addr);
+                        p[6] = 1; // link up
+                        p[7..9].copy_from_slice(&1500u16.to_le_bytes());
+                        (side_status::OK, p)
+                    }
+                    _ => (side_status::EOL, [0u8; 24]),
+                };
+                let response = SideEntry {
+                    msg_type: entry.msg_type,
+                    flags: 0,
+                    tag: entry.tag,
+                    status,
+                    payload,
+                };
                 if let Some(port) = ctx.block_port(dp) {
+                    port.side_send(&response);
                     port.notify();
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// Driver trait impl
+// ============================================================================
+
+impl Driver for Wifi2 {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
+        self.init_hardware(ctx)?;
+        self.init_radio(ctx)?;
+
+        // Start poll timer (50ms) — fast enough for STA auth/assoc timeouts
+        ctx.start_timer(TAG_WIFI_TIMER, 50_000_000)?;
+
+        unotice!("wifi2", "ready"; state = self.state.name());
+        Ok(())
+    }
+
+    fn command(&mut self, _msg: &BusMsg, _ctx: &mut dyn BusCtx) -> Disposition {
+        Disposition::Forward
+    }
+
+    fn handle_event(&mut self, tag: u32, _handle: userlib::syscall::Handle, ctx: &mut dyn BusCtx) {
+        let is_timer = tag == TAG_WIFI_TIMER;
+        let is_irq = tag == TAG_WIFI_IRQ;
+        if !is_timer && !is_irq { return; }
+        if self.state != DriverState::ApActive { return; }
+
+        let dev_ptr = match self.dev_ptr() {
+            Some(p) => p,
+            None => return,
+        };
+        // SAFETY: dev is never mutated after init_hardware; pointer valid for driver lifetime.
+        let dev = unsafe { &*dev_ptr };
+
+        // IRQ: mask, read source, clear, ack
+        if is_irq {
+            if let Some(ref mut irq) = self.irq {
+                dev.wr(MT_INT_MASK_CSR, 0);
+                let src = dev.rr(MT_INT_SOURCE_CSR);
+                if src != 0 { dev.wr(MT_INT_SOURCE_CSR, src); }
+                let _ = irq.ack();
+            }
+        }
+
+        // Slow tick: 10 sub-ticks (50ms each) = 500ms
+        let mut is_slow_tick = false;
+        if is_timer {
+            self.subtick += 1;
+            if self.subtick >= 10 {
+                self.subtick = 0;
+                self.tick = self.tick.wrapping_add(1);
+                is_slow_tick = true;
+            }
+        }
+
+        // RX pipeline
+        self.drain_auxiliary_queues(dev);
+        let mut rx = self.collect_rx_frames(dev);
+        rx.log_stats();
+        self.dispatch_mgmt_frames(dev, &mut rx);
+        self.dispatch_eapol_frames(dev, &mut rx);
+        self.forward_rx_data(&mut rx, ctx);
+
+        // TX completions + pool reclaim
+        self.tx_sweep_and_complete(dev, ctx);
+        self.reclaim_rx_pool(ctx);
+
+        // Periodic housekeeping
+        if is_slow_tick { self.slow_tick_housekeeping(dev); }
+
+        // Re-enable IRQ
+        if is_irq {
+            dev.wr(MT_INT_MASK_CSR, MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_MCU | MT_INT_TX_DONE_BAND0 | MT_INT_MCU_CMD);
+        }
+    }
+
+    fn data_ready(&mut self, port_id: PortId, ctx: &mut dyn BusCtx) {
+        if self.state != DriverState::ApActive { return; }
+        let dev_ptr = match self.dev_ptr() {
+            Some(p) => p,
+            None => return,
+        };
+        let dev = unsafe { &*dev_ptr };
+        let dp = match self.data_port {
+            Some(id) if id == port_id => id,
+            _ => return,
+        };
+
+        self.handle_side_queries(dp, ctx);
+        self.process_tx_from_ipd(dev, dp, ctx);
+        self.tx_sweep_and_complete(dev, ctx);
     }
 
     fn config_keys(&self) -> &[ConfigKey] {
@@ -2058,7 +2015,7 @@ impl Driver for Wifi2Driver {
     }
 
     fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
-        config::config_get(&self.0.state, self.0.channel, key, buf)
+        config::config_get(&self.state, self.channel, key, buf)
     }
 }
 
@@ -2068,5 +2025,5 @@ impl Driver for Wifi2Driver {
 
 #[unsafe(no_mangle)]
 fn main() {
-    driver_main(b"wifi2", Wifi2Driver(Wifi2::new()));
+    driver_main(b"wifi2", Wifi2::new());
 }

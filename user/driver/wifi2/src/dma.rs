@@ -110,37 +110,72 @@ impl TxRing {
         self.buf_phys + (idx as u64 * self.buf_stride as u64)
     }
 
-    /// Submit data to the ring. Writes buffer, programs descriptor, kicks DMA.
-    pub fn submit(&mut self, dev: &Mt76Device, data: &[u8]) -> Result<(), RingFull> {
-        let next = (self.cpu_idx + 1) % self.ndesc;
-        if next == self.sweep_idx {
-            return Err(RingFull);
-        }
+    /// Index of the most recently submitted descriptor.
+    pub fn last_submitted(&self) -> u32 {
+        if self.cpu_idx == 0 { self.ndesc - 1 } else { self.cpu_idx - 1 }
+    }
 
+    /// Write header + payload to a buffer, program the descriptor, and kick DMA.
+    ///
+    /// This is the single submission path for all MCU commands and firmware chunks.
+    /// The header is written first, then the payload appended. The total length
+    /// is `header.len() + payload.len()`.
+    pub fn submit_cmd(
+        &mut self, dev: &Mt76Device,
+        header: &[u8], payload: &[u8],
+    ) {
+        let idx = self.cpu_idx;
+        let total = header.len() + payload.len();
+        let buf = self.buf(idx);
+        unsafe {
+            core::ptr::write_bytes(buf, 0, total);
+            core::ptr::copy_nonoverlapping(header.as_ptr(), buf, header.len());
+            if !payload.is_empty() {
+                core::ptr::copy_nonoverlapping(payload.as_ptr(), buf.add(header.len()), payload.len());
+            }
+        }
+        self.write_desc_and_kick(dev, idx, total);
+    }
+
+    /// Write raw data to a buffer, program the descriptor, and kick DMA.
+    ///
+    /// Used for firmware scatter chunks that have no header/payload split.
+    pub fn submit_raw(&mut self, dev: &Mt76Device, data: &[u8]) {
         let idx = self.cpu_idx;
         let buf = self.buf(idx);
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
         }
+        self.write_desc_and_kick(dev, idx, data.len());
+    }
 
+    /// Submit data to the ring (legacy fw download path with full-check).
+    pub fn submit(&mut self, dev: &Mt76Device, data: &[u8]) -> Result<(), RingFull> {
+        let next = (self.cpu_idx + 1) % self.ndesc;
+        if next == self.sweep_idx {
+            return Err(RingFull);
+        }
+        self.submit_raw(dev, data);
+        Ok(())
+    }
+
+    /// Program a descriptor and kick DMA. Shared by all submission paths.
+    fn write_desc_and_kick(&mut self, dev: &Mt76Device, idx: u32, len: usize) {
         let phys = self.buf_phys_at(idx);
         let desc = self.desc(idx);
-        let ctrl = ((data.len() as u32) << 16) | MT_DMA_CTL_LAST_SEC0;
+        let ctrl = ((len as u32) << 16) | MT_DMA_CTL_LAST_SEC0;
         unsafe {
             core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(phys));
             core::ptr::write_volatile(&mut (*desc).buf1, 0);
             core::ptr::write_volatile(&mut (*desc).info, dma_addr_hi(phys));
             core::ptr::write_volatile(&mut (*desc).ctrl, ctrl);
         }
-
-        flush_buffer(buf as u64, data.len());
+        flush_buffer(self.buf(idx) as u64, len);
         flush_buffer(desc as u64, core::mem::size_of::<Descriptor>());
 
-        self.cpu_idx = next;
+        self.cpu_idx = (self.cpu_idx + 1) % self.ndesc;
         dma_wmb();
         dev.wr(self.regs_base + MT_QUEUE_CPU_IDX, self.cpu_idx);
-
-        Ok(())
     }
 
     /// Reclaim completed TX descriptors (sweep from sweep_idx to DMA_IDX).
@@ -470,7 +505,7 @@ pub fn dma_enable(dev: &Mt76Device, reset: bool) {
     }
 
     // Wait for HIF not busy
-    if dev.poll(MT_WFDMA_EXT_CSR_HIF_MISC, MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000).is_err() {
+    if dev.poll(MT_WFDMA_EXT_CSR_HIF_MISC, MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1).is_err() {
         uwarn!("dma", "hif_misc_busy_timeout");
     }
 
@@ -518,6 +553,70 @@ pub fn dma_enable(dev: &Mt76Device, reset: bool) {
 // TX — Management and Data Frame Enqueue
 // ============================================================================
 
+/// Hardware layout of mt76_connac_fw_txp (44 bytes at TXD + 32).
+/// Source: mt76_connac.h struct mt76_connac_fw_txp
+#[repr(C, packed)]
+struct FwTxp {
+    flags: u16,       // CT info flags
+    token: u16,       // TX token for completion matching
+    _rsvd: u8,
+    rept_wds_wcid: u16, // STA WCID (unaligned — LE)
+    nbuf: u8,
+    buf_addr: [u32; 4], // buffer physical addresses (lower 32 bits)
+    _pad: [u8; 16],
+    buf_len: [u16; 4],  // buffer lengths | upper 4 addr bits
+}
+
+/// Write a fw_txp into a DMA buffer and the frame after it.
+/// Shared by both management and data TX paths.
+unsafe fn write_txp_and_frame(
+    buf: *mut u8, buf_phys: u64,
+    flags: u16, token: u16, wcid: u16,
+    frame: &[u8],
+) {
+    let txp = buf.add(MT_TXD_SIZE) as *mut FwTxp;
+    core::ptr::write_bytes(txp, 0, 1);
+
+    let frame_phys = buf_phys + MT_TXWI_SIZE as u64;
+    let addr_hi = ((frame_phys >> 32) & 0xF) as u16;
+
+    (*txp).flags = flags.to_le();
+    (*txp).token = token.to_le();
+    (*txp).rept_wds_wcid = wcid.to_le();
+    (*txp).nbuf = 1;
+    (*txp).buf_addr[0] = (frame_phys as u32).to_le();
+    (*txp).buf_len[0] = ((frame.len() as u16 & 0x0FFF) | (addr_hi << 12)).to_le();
+
+    core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(MT_TXWI_SIZE), frame.len());
+}
+
+/// Program a 2-buffer TX descriptor and kick DMA.
+/// buf0 = TXD+TXP region, buf1 = frame region (for firmware CT parsing).
+fn commit_tx_desc(ring: &mut TxRing, dev: &Mt76Device, idx: u32, frame_len: usize) {
+    let buf_phys = ring.buf_phys_at(idx);
+    let frame_phys = buf_phys + MT_TXWI_SIZE as u64;
+
+    let ctrl = (MT_TXWI_SIZE as u32) << 16
+        | (MT_CT_PARSE_LEN as u32 & MT_DMA_CTL_SD_LEN1_MASK)
+        | MT_DMA_CTL_LAST_SEC1;
+    let info = dma_addr_hi(buf_phys) | (dma_addr_hi(frame_phys) << 16);
+
+    let desc = ring.desc(idx);
+    unsafe {
+        core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(buf_phys));
+        core::ptr::write_volatile(&mut (*desc).buf1, dma_addr_lo(frame_phys));
+        core::ptr::write_volatile(&mut (*desc).info, info);
+        core::ptr::write_volatile(&mut (*desc).ctrl, ctrl);
+    }
+
+    flush_buffer(ring.buf(idx) as u64, MT_TXWI_SIZE + frame_len);
+    flush_buffer(desc as u64, core::mem::size_of::<Descriptor>());
+
+    ring.cpu_idx = (ring.cpu_idx + 1) % ring.ndesc;
+    dma_wmb();
+    dev.wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
+}
+
 /// Build a management frame TXD (32 bytes) + copy 802.11 frame into `buf`.
 /// Returns total length (TXD + frame), or 0 on error.
 ///
@@ -535,37 +634,38 @@ pub fn wrap_mgmt_txd(buf: &mut [u8], frame: &[u8]) -> usize {
     let is_beacon = subtype == 0x8;
     let is_bcast = frame.len() >= 10 && frame[4..10] == [0xFF; 6];
 
-    // TXD0: TX_BYTES | PKT_FMT(CT=0) | Q_IDX(ALTX0=0x10)
+    // TXD0: TX_BYTES | PKT_FMT(CT) | Q_IDX(ALTX0)
     let txd0 = (total as u32)
-        | ((MT_TX_TYPE_CT as u32) << 23)
-        | ((MT_LMAC_ALTX0 as u32) << 25);
+        | ((MT_TX_TYPE_CT as u32) << MT_TXD0_PKT_FMT_SHIFT)
+        | ((MT_LMAC_ALTX0 as u32) << MT_TXD0_Q_IDX_SHIFT);
     buf[0..4].copy_from_slice(&txd0.to_le_bytes());
 
-    // TXD1: WLAN_IDX(BMC) | FIXED_RATE | OWN_MAC | HDR_FORMAT(802.11) | HDR_INFO(24/2=12) | TID(0)
-    let txd1 = (1u32 << 31)                         // FIXED_RATE
-        | ((MT_HDR_FORMAT_802_11 as u32) << 14)  // HDR_FORMAT = 802.11
-        | (12u32 << 16)                          // HDR_INFO = 24/2
-        | (MT_TX_NORMAL << 21)                   // TID = 0
-        | ((HW_BSSID_0 as u32) << 25)           // OWN_MAC = 0
-        | (MT7996_WTBL_RESERVED as u32);         // WLAN_IDX = BMC STA
+    // TXD1: FIXED_RATE | HDR_FORMAT(802.11) | HDR_INFO(24/2=12) | OWN_MAC | WLAN_IDX(BMC)
+    let txd1 = MT_TXD1_FIXED_RATE
+        | ((MT_HDR_FORMAT_802_11 as u32) << MT_TXD1_HDR_FORMAT_SHIFT)
+        | (12u32 << MT_TXD1_HDR_INFO_SHIFT)
+        | (MT_TX_NORMAL << MT_TXD1_TID_SHIFT)
+        | ((HW_BSSID_0 as u32) << MT_TXD1_OWN_MAC_SHIFT)
+        | (MT7996_WTBL_RESERVED as u32);
     buf[4..8].copy_from_slice(&txd1.to_le_bytes());
 
     // TXD2: SUB_TYPE from FC
-    let txd2 = subtype as u32;
-    buf[8..12].copy_from_slice(&txd2.to_le_bytes());
+    buf[8..12].copy_from_slice(&(subtype as u32).to_le_bytes());
 
     // TXD3: retry/ACK control
     let txd3 = if is_beacon {
-        1u32 | MT_TXD3_BCM | (0x1Fu32 << 11) | (1u32 << 28) // NO_ACK + BCM + rem=31 + BA_DISABLE
+        MT_TXD3_NO_ACK | MT_TXD3_BCM | (31u32 << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE
     } else {
-        (1u32 << 29) | (15u32 << 11) | (1u32 << 28) // SW_POWER_MGMT + rem=15 + BA_DISABLE
+        MT_TXD3_SW_POWER_MGMT | (15u32 << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE
             | if is_bcast { MT_TXD3_BCM } else { 0 }
     };
     buf[12..16].copy_from_slice(&txd3.to_le_bytes());
 
     // TXD6: DAS | VTA | DIS_MAT | MSDU_CNT(1) | TX_RATE(basic) | FIXED_BW
-    let txd6 = (1u32 << 2) | (1u32 << 28) | (1u32 << 3) | (1u32 << 4)
-        | ((MT7996_BASIC_RATES_TBL as u32) << 16) | (1u32 << 25);
+    let txd6 = MT_TXD6_DAS | MT_TXD6_VTA | MT_TXD6_DIS_MAT
+        | (1u32 << MT_TXD6_MSDU_CNT_SHIFT)
+        | ((MT7996_BASIC_RATES_TBL as u32) << MT_TXD6_TX_RATE_SHIFT)
+        | MT_TXD6_FIXED_BW;
     buf[24..28].copy_from_slice(&txd6.to_le_bytes());
 
     buf[MT_TXD_SIZE..total].copy_from_slice(frame);
@@ -574,178 +674,49 @@ pub fn wrap_mgmt_txd(buf: &mut [u8], frame: &[u8]) -> usize {
 
 /// Enqueue a pre-built [TXD(32B) | 802.11 frame] on a CT-mode TX ring.
 ///
-/// Inserts a fw_txp (44 bytes) between TXD and frame in the DMA buffer,
-/// producing [TXD | fw_txp | frame]. Programs 2-buffer descriptor.
-///
 /// Source: wifid/dma.rs:1266-1370 tx_enqueue()
 pub fn tx_enqueue_mgmt(ring: &mut TxRing, dev: &Mt76Device, data: &[u8], token: u16) -> Result<(), RingFull> {
-    if data.len() < MT_TXD_SIZE {
-        return Err(RingFull);
-    }
-
+    if data.len() < MT_TXD_SIZE { return Err(RingFull); }
     let next = (ring.cpu_idx + 1) % ring.ndesc;
-    if next == ring.sweep_idx {
-        return Err(RingFull);
-    }
-
-    let txd = &data[..MT_TXD_SIZE];
-    let frame = &data[MT_TXD_SIZE..];
-    let frame_len = frame.len();
+    if next == ring.sweep_idx { return Err(RingFull); }
 
     let idx = ring.cpu_idx;
     let buf = ring.buf(idx);
-    let buf_phys = ring.buf_phys_at(idx);
+    let frame = &data[MT_TXD_SIZE..];
 
-    // Write TXD at offset 0 (32 bytes)
-    unsafe { core::ptr::copy_nonoverlapping(txd.as_ptr(), buf, MT_TXD_SIZE); }
+    // Write TXD at offset 0
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf, MT_TXD_SIZE); }
 
-    // Build fw_txp at offset 32 (44 bytes)
-    // Source: mt76_connac.h struct mt76_connac_fw_txp
-    let txp = unsafe { buf.add(MT_TXD_SIZE) };
-    unsafe { core::ptr::write_bytes(txp, 0, MT_FW_TXP_SIZE); }
+    let flags = MT_CT_INFO_APPLY_TXD | MT_CT_INFO_NONE_CIPHER_FRAME
+        | MT_CT_INFO_MGMT_FRAME | MT_CT_INFO_FROM_HOST;
+    unsafe { write_txp_and_frame(buf, ring.buf_phys_at(idx), flags, token, 0xfff, frame); }
 
-    let frame_phys = buf_phys + MT_TXWI_SIZE as u64;
-
-    // flags: APPLY_TXD | NONE_CIPHER | MGMT_FRAME | FROM_HOST
-    let flags: u16 = MT_CT_INFO_APPLY_TXD | MT_CT_INFO_NONE_CIPHER_FRAME
-                   | MT_CT_INFO_MGMT_FRAME | MT_CT_INFO_FROM_HOST;
-    unsafe { core::ptr::copy_nonoverlapping(flags.to_le_bytes().as_ptr(), txp, 2); }
-
-    // token at offset 2
-    unsafe { core::ptr::copy_nonoverlapping(token.to_le_bytes().as_ptr(), txp.add(2), 2); }
-
-    // rept_wds_wcid = 0xfff at offset 5
-    let wcid: u16 = 0xfff;
-    unsafe { core::ptr::copy_nonoverlapping(wcid.to_le_bytes().as_ptr(), txp.add(5), 2); }
-
-    // nbuf = 1 at offset 7
-    unsafe { *txp.add(7) = 1; }
-
-    // buf[0] at offset 8: frame phys lower 32 bits
-    unsafe { core::ptr::copy_nonoverlapping(
-        (frame_phys as u32).to_le_bytes().as_ptr(), txp.add(8), 4); }
-
-    // len[0] at offset 32: frame length + upper 4 address bits
-    let addr_h = ((frame_phys >> 32) & 0xF) as u16;
-    let len0: u16 = (frame_len as u16 & 0x0FFF) | (addr_h << 12);
-    unsafe { core::ptr::copy_nonoverlapping(len0.to_le_bytes().as_ptr(), txp.add(32), 2); }
-
-    // Write frame data at offset 76
-    unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(MT_TXWI_SIZE), frame_len); }
-
-    // 2-buffer descriptor: buf0 = TXD+TXP (76B), buf1 = frame header (72B for FW parsing)
-    let sd_len0 = MT_TXWI_SIZE as u32;
-    let sd_len1 = MT_CT_PARSE_LEN as u32;
-    let ctrl_val = (sd_len0 << 16)
-        | (sd_len1 & MT_DMA_CTL_SD_LEN1_MASK)
-        | MT_DMA_CTL_LAST_SEC1;
-
-    let info_val = dma_addr_hi(buf_phys)
-        | (dma_addr_hi(frame_phys) << 16);
-
-    let desc = ring.desc(idx);
-    unsafe {
-        core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(buf_phys));
-        core::ptr::write_volatile(&mut (*desc).buf1, dma_addr_lo(frame_phys));
-        core::ptr::write_volatile(&mut (*desc).info, info_val);
-        core::ptr::write_volatile(&mut (*desc).ctrl, ctrl_val);
-    }
-
-    let total_write = MT_TXWI_SIZE + frame_len;
-    flush_buffer(buf as u64, total_write);
-    flush_buffer(desc as u64, core::mem::size_of::<Descriptor>());
-
-    ring.cpu_idx = next;
-    dma_wmb();
-    dev.wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
-
+    commit_tx_desc(ring, dev, idx, frame.len());
     Ok(())
 }
 
 /// Enqueue an Ethernet (802.3) data frame for TX.
-///
-/// TXD is zeroed (firmware fills from CT info). fw_txp carries FROM_HOST
-/// and optionally NONE_CIPHER. rept_wds_wcid = actual STA WCID.
 ///
 /// Source: wifid/dma.rs:1380-1464 tx_enqueue_data()
 pub fn tx_enqueue_data(
     ring: &mut TxRing, dev: &Mt76Device,
     frame: &[u8], wcid: u16, token: u16, no_cipher: bool,
 ) -> Result<(), RingFull> {
-    let frame_len = frame.len();
-    if frame_len < 14 || frame_len > 1514 {
-        return Err(RingFull);
-    }
-
+    if frame.len() < 14 || frame.len() > 1514 { return Err(RingFull); }
     let next = (ring.cpu_idx + 1) % ring.ndesc;
-    if next == ring.sweep_idx {
-        return Err(RingFull);
-    }
+    if next == ring.sweep_idx { return Err(RingFull); }
 
     let idx = ring.cpu_idx;
     let buf = ring.buf(idx);
-    let buf_phys = ring.buf_phys_at(idx);
 
-    // TXD: zeroed for 802.3 mode
+    // TXD: zeroed for 802.3 mode — firmware fills from CT info
     unsafe { core::ptr::write_bytes(buf, 0, MT_TXD_SIZE); }
 
-    // Build fw_txp at offset 32
-    let txp = unsafe { buf.add(MT_TXD_SIZE) };
-    unsafe { core::ptr::write_bytes(txp, 0, MT_FW_TXP_SIZE); }
+    let flags = MT_CT_INFO_FROM_HOST
+        | if no_cipher { MT_CT_INFO_NONE_CIPHER_FRAME } else { 0 };
+    unsafe { write_txp_and_frame(buf, ring.buf_phys_at(idx), flags, token, wcid, frame); }
 
-    let frame_phys = buf_phys + MT_TXWI_SIZE as u64;
-
-    // flags: FROM_HOST, optionally NONE_CIPHER
-    let flags: u16 = MT_CT_INFO_FROM_HOST | if no_cipher { MT_CT_INFO_NONE_CIPHER_FRAME } else { 0 };
-    unsafe { core::ptr::copy_nonoverlapping(flags.to_le_bytes().as_ptr(), txp, 2); }
-
-    // token at offset 2
-    unsafe { core::ptr::copy_nonoverlapping(token.to_le_bytes().as_ptr(), txp.add(2), 2); }
-
-    // rept_wds_wcid at offset 5
-    unsafe { core::ptr::copy_nonoverlapping(wcid.to_le_bytes().as_ptr(), txp.add(5), 2); }
-
-    // nbuf = 1 at offset 7
-    unsafe { *txp.add(7) = 1; }
-
-    // buf[0] at offset 8
-    unsafe { core::ptr::copy_nonoverlapping(
-        (frame_phys as u32).to_le_bytes().as_ptr(), txp.add(8), 4); }
-
-    // len[0] at offset 32
-    let addr_h = ((frame_phys >> 32) & 0xF) as u16;
-    let len0: u16 = (frame_len as u16 & 0x0FFF) | (addr_h << 12);
-    unsafe { core::ptr::copy_nonoverlapping(len0.to_le_bytes().as_ptr(), txp.add(32), 2); }
-
-    // Write Ethernet frame at offset 76
-    unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(MT_TXWI_SIZE), frame_len); }
-
-    // 2-buffer descriptor
-    let sd_len0 = MT_TXWI_SIZE as u32;
-    let sd_len1 = MT_CT_PARSE_LEN as u32;
-    let ctrl_val = (sd_len0 << 16)
-        | (sd_len1 & MT_DMA_CTL_SD_LEN1_MASK)
-        | MT_DMA_CTL_LAST_SEC1;
-
-    let info_val = dma_addr_hi(buf_phys)
-        | (dma_addr_hi(frame_phys) << 16);
-
-    let desc = ring.desc(idx);
-    unsafe {
-        core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(buf_phys));
-        core::ptr::write_volatile(&mut (*desc).buf1, dma_addr_lo(frame_phys));
-        core::ptr::write_volatile(&mut (*desc).info, info_val);
-        core::ptr::write_volatile(&mut (*desc).ctrl, ctrl_val);
-    }
-
-    let total_write = MT_TXWI_SIZE + frame_len;
-    flush_buffer(buf as u64, total_write);
-    flush_buffer(desc as u64, core::mem::size_of::<Descriptor>());
-
-    ring.cpu_idx = next;
-    dma_wmb();
-    dev.wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
-
+    commit_tx_desc(ring, dev, idx, frame.len());
     Ok(())
 }
 

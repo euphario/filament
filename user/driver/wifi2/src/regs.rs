@@ -676,8 +676,31 @@ pub const MT_TXWI_SIZE: usize = MT_TXD_SIZE + MT_FW_TXP_SIZE; // 76
 pub const MT_DMA_CTL_SD_LEN1_MASK: u32 = 0x3FFF;
 pub const MT_DMA_CTL_LAST_SEC1: u32 = 1 << 14;
 
-/// TXD3 broadcast/multicast flag — mt76_connac3_mac.h
+// TXD0 bitfields — mt76_connac3_mac.h:216-219
+pub const MT_TXD0_Q_IDX_SHIFT: u32 = 25;       // GENMASK(31,25)
+pub const MT_TXD0_PKT_FMT_SHIFT: u32 = 23;     // GENMASK(24,23)
+
+// TXD1 bitfields — mt76_connac3_mac.h:221-229
+pub const MT_TXD1_FIXED_RATE: u32 = 1 << 31;
+pub const MT_TXD1_OWN_MAC_SHIFT: u32 = 25;     // GENMASK(30,25)
+pub const MT_TXD1_TID_SHIFT: u32 = 21;          // GENMASK(24,21)
+pub const MT_TXD1_HDR_INFO_SHIFT: u32 = 16;     // GENMASK(20,16)
+pub const MT_TXD1_HDR_FORMAT_SHIFT: u32 = 14;   // GENMASK(15,14)
+
+// TXD3 bitfields — mt76_connac3_mac.h:243-255
+pub const MT_TXD3_SW_POWER_MGMT: u32 = 1 << 29;
+pub const MT_TXD3_BA_DISABLE: u32 = 1 << 28;
+pub const MT_TXD3_REM_TX_COUNT_SHIFT: u32 = 11; // GENMASK(15,11)
 pub const MT_TXD3_BCM: u32 = 1 << 4;
+pub const MT_TXD3_NO_ACK: u32 = 1 << 0;
+
+// TXD6 bitfields — mt76_connac3_mac.h:269-281
+pub const MT_TXD6_VTA: u32 = 1 << 28;
+pub const MT_TXD6_FIXED_BW: u32 = 1 << 25;
+pub const MT_TXD6_TX_RATE_SHIFT: u32 = 16;      // GENMASK(21,16)
+pub const MT_TXD6_MSDU_CNT_SHIFT: u32 = 4;      // GENMASK(9,4)
+pub const MT_TXD6_DIS_MAT: u32 = 1 << 3;
+pub const MT_TXD6_DAS: u32 = 1 << 2;
 
 // ============================================================================
 // MIB counter registers — from regs.h

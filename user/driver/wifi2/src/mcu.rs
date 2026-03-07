@@ -7,7 +7,7 @@ use userlib::{uerror, udebug, ulog};
 use userlib::ipc::{Irq, Mux, MuxFilter};
 use crate::regs::*;
 use crate::device::{Mt76Device, DeviceError};
-use crate::dma::{TxRing, Descriptor, dma_wmb, flush_buffer};
+use crate::dma::TxRing;
 
 // ============================================================================
 // Error types
@@ -226,6 +226,29 @@ impl UniTxd {
 }
 
 // ============================================================================
+// Buffer construction helpers
+// ============================================================================
+
+/// Write a TLV header (tag + len) at the given offset. Returns offset past the header (off + 4).
+#[inline]
+fn write_tlv(buf: &mut [u8], off: usize, tag: u16, len: u16) -> usize {
+    buf[off..off + 2].copy_from_slice(&tag.to_le_bytes());
+    buf[off + 2..off + 4].copy_from_slice(&len.to_le_bytes());
+    off + 4
+}
+
+/// Write the 8-byte STA request header at offset 0.
+/// Layout: bss_idx(1) + wlan_idx_lo(1) + tlv_num(2) + is_tlv_append(1) + muar_idx(1) + wlan_idx_hi(1) + rsv(1).
+fn write_sta_hdr(buf: &mut [u8], bss_idx: u8, wlan_idx: u16, omac_idx: u8, tlv_num: u16) {
+    buf[0] = bss_idx;
+    buf[1] = wlan_idx as u8;
+    buf[2..4].copy_from_slice(&tlv_num.to_le_bytes());
+    buf[4] = 1; // is_tlv_append
+    buf[5] = omac_idx;
+    buf[6] = (wlan_idx >> 8) as u8;
+}
+
+// ============================================================================
 // Send helpers
 // ============================================================================
 
@@ -234,36 +257,8 @@ pub fn send_cmd(
     dev: &Mt76Device, ring: &mut TxRing,
     cmd: u8, data: &[u8], seq: u8,
 ) -> Result<(), McuError> {
-    let idx = ring.cpu_idx;
     let txd = McuTxd::new(cmd, data.len(), seq);
-    let total = McuTxd::SIZE + data.len();
-
-    let buf = ring.buf(idx);
-    unsafe {
-        core::ptr::write_bytes(buf, 0, total);
-        core::ptr::copy_nonoverlapping(txd.as_bytes().as_ptr(), buf, McuTxd::SIZE);
-        if !data.is_empty() {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), buf.add(McuTxd::SIZE), data.len());
-        }
-    }
-
-    let phys = ring.buf_phys_at(idx);
-    let desc = ring.desc(idx);
-    let ctrl = ((total as u32) << 16) | MT_DMA_CTL_LAST_SEC0;
-    unsafe {
-        core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(phys));
-        core::ptr::write_volatile(&mut (*desc).buf1, 0);
-        core::ptr::write_volatile(&mut (*desc).info, dma_addr_hi(phys));
-        core::ptr::write_volatile(&mut (*desc).ctrl, ctrl);
-    }
-
-    flush_buffer(buf as u64, total);
-    flush_buffer(desc as u64, core::mem::size_of::<Descriptor>());
-
-    ring.cpu_idx = (ring.cpu_idx + 1) % ring.ndesc;
-    dma_wmb();
-    dev.wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
-
+    ring.submit_cmd(dev, txd.as_bytes(), data);
     clear_pending_interrupts(dev);
     Ok(())
 }
@@ -273,36 +268,8 @@ pub fn send_cmd_ext(
     dev: &Mt76Device, ring: &mut TxRing,
     cid: u8, ext_cid: u8, s2d: u8, data: &[u8], seq: u8,
 ) -> Result<(), McuError> {
-    let idx = ring.cpu_idx;
     let txd = McuTxd::new_ext(cid, ext_cid, data.len(), seq, s2d);
-    let total = McuTxd::SIZE + data.len();
-
-    let buf = ring.buf(idx);
-    unsafe {
-        core::ptr::write_bytes(buf, 0, total);
-        core::ptr::copy_nonoverlapping(txd.as_bytes().as_ptr(), buf, McuTxd::SIZE);
-        if !data.is_empty() {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), buf.add(McuTxd::SIZE), data.len());
-        }
-    }
-
-    let phys = ring.buf_phys_at(idx);
-    let desc = ring.desc(idx);
-    let ctrl = ((total as u32) << 16) | MT_DMA_CTL_LAST_SEC0;
-    unsafe {
-        core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(phys));
-        core::ptr::write_volatile(&mut (*desc).buf1, 0);
-        core::ptr::write_volatile(&mut (*desc).info, dma_addr_hi(phys));
-        core::ptr::write_volatile(&mut (*desc).ctrl, ctrl);
-    }
-
-    flush_buffer(buf as u64, total);
-    flush_buffer(desc as u64, core::mem::size_of::<Descriptor>());
-
-    ring.cpu_idx = (ring.cpu_idx + 1) % ring.ndesc;
-    dma_wmb();
-    dev.wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
-
+    ring.submit_cmd(dev, txd.as_bytes(), data);
     clear_pending_interrupts(dev);
     Ok(())
 }
@@ -313,7 +280,6 @@ pub fn send_uni_cmd(
     cmd: u32, data: &[u8], wait: bool, seq: u8,
     irq: Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
-    let idx = ring.cpu_idx;
     let mcu_cmd = (cmd & 0xFF) as u16;
     let total = UniTxd::SIZE + data.len();
 
@@ -345,39 +311,12 @@ pub fn send_uni_cmd(
 
     let rx_snap = if wait { dev.rr(ring.rx_regs + MT_QUEUE_DMA_IDX) } else { 0 };
 
-    let buf = ring.buf(idx);
-    unsafe {
-        core::ptr::write_bytes(buf, 0, total);
-        core::ptr::copy_nonoverlapping(uni.as_bytes().as_ptr(), buf, UniTxd::SIZE);
-        if !data.is_empty() {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), buf.add(UniTxd::SIZE), data.len());
-        }
-    }
-
-    let phys = ring.buf_phys_at(idx);
-    let desc = ring.desc(idx);
-    let ctrl = ((total as u32) << 16) | MT_DMA_CTL_LAST_SEC0;
-    unsafe {
-        core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(phys));
-        core::ptr::write_volatile(&mut (*desc).buf1, 0);
-        core::ptr::write_volatile(&mut (*desc).info, dma_addr_hi(phys));
-        core::ptr::write_volatile(&mut (*desc).ctrl, ctrl);
-    }
-
-    flush_buffer(buf as u64, total);
-    flush_buffer(desc as u64, core::mem::size_of::<Descriptor>());
-
-    ring.cpu_idx = (ring.cpu_idx + 1) % ring.ndesc;
-    dma_wmb();
-    dev.wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
-
+    ring.submit_cmd(dev, uni.as_bytes(), data);
     if irq.is_some() {
         clear_pending_interrupts(dev);
     }
 
-    // Wait for TX completion
-    let prev = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
-    wait_tx_done(dev, ring, prev, 2000, "uni_cmd")?;
+    wait_tx_done(dev, ring, ring.last_submitted(), 2000, "uni_cmd")?;
 
     // Wait for RX response
     if wait {
@@ -509,7 +448,7 @@ pub fn patch_sem_ctrl(
     let rx_snap = dev.rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX);
     send_cmd(dev, ring, mcu_cmd::PATCH_SEM_CTRL, &data, seq)?;
 
-    let prev = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
+    let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 1000, "patch_sem")?;
     wait_rx_wm(dev, rx_snap, 2000, irq, "patch_sem")
 }
@@ -534,7 +473,7 @@ pub fn init_download(
     let rx_snap = dev.rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX);
     send_cmd(dev, ring, cmd, &data, seq)?;
 
-    let prev = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
+    let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 1000, "init_dl")?;
     wait_rx_wm(dev, rx_snap, 2000, irq, "init_dl")
 }
@@ -549,8 +488,7 @@ pub fn send_fw_chunk(
     dev: &Mt76Device, ring: &mut TxRing,
     chunk: &[u8], _seq: u8, _irq: Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
-    let idx = ring.cpu_idx;
-    let next = (idx + 1) % ring.ndesc;
+    let next = (ring.cpu_idx + 1) % ring.ndesc;
 
     // Ring full check — wait for DMA to consume at least one entry
     if next == dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX) {
@@ -560,28 +498,7 @@ pub fn send_fw_chunk(
         }
     }
 
-    let buf = ring.buf(idx);
-    unsafe {
-        core::ptr::copy_nonoverlapping(chunk.as_ptr(), buf, chunk.len());
-    }
-
-    let phys = ring.buf_phys_at(idx);
-    let desc = ring.desc(idx);
-    let ctrl = ((chunk.len() as u32) << 16) | MT_DMA_CTL_LAST_SEC0;
-    unsafe {
-        core::ptr::write_volatile(&mut (*desc).buf0, dma_addr_lo(phys));
-        core::ptr::write_volatile(&mut (*desc).buf1, 0);
-        core::ptr::write_volatile(&mut (*desc).info, dma_addr_hi(phys));
-        core::ptr::write_volatile(&mut (*desc).ctrl, ctrl);
-    }
-
-    flush_buffer(buf as u64, chunk.len());
-    flush_buffer(desc as u64, core::mem::size_of::<Descriptor>());
-
-    ring.cpu_idx = next;
-    dma_wmb();
-    dev.wr(ring.regs_base + MT_QUEUE_CPU_IDX, ring.cpu_idx);
-
+    ring.submit_raw(dev, chunk);
     Ok(())
 }
 
@@ -607,7 +524,7 @@ pub fn start_firmware(
         send_cmd(dev, ring, mcu_cmd::FW_START_REQ, &data, seq)?;
     }
 
-    let prev = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
+    let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 1000, "fw_start")?;
     wait_rx_wm(dev, rx_snap, 5000, irq, "fw_start")
 }
@@ -694,8 +611,7 @@ pub fn fw_log_2_host(
     fw_type: u8, ctrl: u8, seq: u8, irq: Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
     let mut data = [0u8; 12];
-    data[4..6].copy_from_slice(&UNI_WSYS_CONFIG_FW_LOG_CTRL.to_le_bytes());
-    data[6..8].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, 4, UNI_WSYS_CONFIG_FW_LOG_CTRL, 8);
     data[8] = ctrl;
 
     let cmd = if fw_type == 1 {
@@ -715,7 +631,7 @@ pub fn set_mwds(
     req[0] = if enabled { 1 } else { 0 };
 
     send_cmd_ext(dev, ring, mcu_cmd::EXT_CID, MCU_EXT_CMD_MWDS_SUPPORT, S2D_H2C, &req, seq)?;
-    let prev = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
+    let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 2000, "mwds")?;
     userlib::delay_ms(10);
     Ok(())
@@ -760,7 +676,7 @@ pub fn wa_cmd(
     args[8..12].copy_from_slice(&a3.to_le_bytes());
 
     send_cmd_ext(dev, ring, mcu_cmd::WA_PARAM, 1, S2D_H2C, &args, seq)?;
-    let prev = if ring.cpu_idx == 0 { ring.ndesc - 1 } else { ring.cpu_idx - 1 };
+    let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 2000, "wa_cmd")?;
     userlib::delay_ms(10);
     Ok(())
@@ -773,8 +689,7 @@ pub fn set_rro(
     tag: u16, val: u16, seq: u8, irq: Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
     let mut data = [0u8; 16];
-    data[4..6].copy_from_slice(&tag.to_le_bytes());
-    data[6..8].copy_from_slice(&12u16.to_le_bytes());
+    write_tlv(&mut data, 4, tag, 12);
 
     match tag {
         UNI_RRO_SET_PLATFORM_TYPE | UNI_RRO_SET_BYPASS_MODE | UNI_RRO_SET_TXFREE_PATH => {
@@ -799,8 +714,7 @@ pub fn get_eeprom_free_block(
     dev: &Mt76Device, ring: &mut TxRing, seq: u8, irq: Option<&mut FwIrq>,
 ) -> Result<u8, McuError> {
     let mut data = [0u8; 12];
-    data[4..6].copy_from_slice(&UNI_EFUSE_FREE_BLOCK.to_le_bytes());
-    data[6..8].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, 4, UNI_EFUSE_FREE_BLOCK, 8);
     data[9] = 2; // version
 
     let rx_snap = dev.rr(ring.rx_regs + MT_QUEUE_DMA_IDX);
@@ -827,8 +741,7 @@ pub fn set_eeprom(
     dev: &Mt76Device, ring: &mut TxRing, seq: u8, irq: Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
     let mut data = [0u8; 12];
-    data[4..6].copy_from_slice(&UNI_EFUSE_BUFFER_MODE.to_le_bytes());
-    data[6..8].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, 4, UNI_EFUSE_BUFFER_MODE, 8);
     data[8] = EE_MODE_EFUSE;
     data[9] = EE_FORMAT_WHOLE;
 
@@ -843,8 +756,7 @@ pub fn get_eeprom(
     offset: u32, seq: u8, irq: Option<&mut FwIrq>,
 ) -> Result<[u8; 16], McuError> {
     let mut data = [0u8; 32];
-    data[4..6].copy_from_slice(&UNI_EFUSE_ACCESS.to_le_bytes());
-    data[6..8].copy_from_slice(&28u16.to_le_bytes());
+    write_tlv(&mut data, 4, UNI_EFUSE_ACCESS, 28);
     let aligned = offset & !0xF;
     data[8..12].copy_from_slice(&aligned.to_le_bytes());
 
@@ -899,8 +811,7 @@ pub fn set_eeprom_flash(
         let mut data = [0u8; 4 + 8 + PER_PAGE_SIZE];
         let data = &mut data[..msg_len];
 
-        data[4..6].copy_from_slice(&UNI_EFUSE_BUFFER_MODE.to_le_bytes());
-        data[6..8].copy_from_slice(&((msg_len - 4) as u16).to_le_bytes());
+        write_tlv(data, 4, UNI_EFUSE_BUFFER_MODE, (msg_len - 4) as u16);
         data[8] = EE_MODE_BUFFER;
         data[9] = format;
         data[10..12].copy_from_slice(&(eep_len as u16).to_le_bytes());
@@ -919,8 +830,7 @@ pub fn rf_regval(
     regidx: u32, seq: u8, irq: Option<&mut FwIrq>,
 ) -> Result<u32, McuError> {
     let mut data = [0u8; 20];
-    data[4..6].copy_from_slice(&UNI_CMD_ACCESS_RF_REG_BASIC.to_le_bytes());
-    data[6..8].copy_from_slice(&16u16.to_le_bytes());
+    write_tlv(&mut data, 4, UNI_CMD_ACCESS_RF_REG_BASIC, 16);
     let idx = ((regidx >> 24) & 0xFF) as u16;
     data[8..10].copy_from_slice(&idx.to_le_bytes());
     let ofs = regidx & 0x00FFFFFF;
@@ -954,8 +864,7 @@ pub fn set_radio_en(
 ) -> Result<(), McuError> {
     let mut data = [0u8; 12];
     data[0] = band;
-    data[4..6].copy_from_slice(&UNI_BAND_CONFIG_RADIO_ENABLE.to_le_bytes());
-    data[6..8].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, 4, UNI_BAND_CONFIG_RADIO_ENABLE, 8);
     data[8] = if enable { 1 } else { 0 };
 
     let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BAND_CONFIG as u32) | CMD_FIELD_WM;
@@ -973,8 +882,7 @@ pub fn set_thermal_protect(
     // Always send DISABLE first
     {
         let mut data = [0u8; 12];
-        data[4..6].copy_from_slice(&UNI_CMD_THERMAL_PROTECT_DISABLE.to_le_bytes());
-        data[6..8].copy_from_slice(&8u16.to_le_bytes());
+        write_tlv(&mut data, 4, UNI_CMD_THERMAL_PROTECT_DISABLE, 8);
         data[9] = band;
         data[10] = 1; // protect_type
         data[11] = 1; // trigger_type
@@ -986,8 +894,7 @@ pub fn set_thermal_protect(
     // ENABLE with temperature thresholds
     {
         let mut data = [0u8; 24];
-        data[4..6].copy_from_slice(&UNI_CMD_THERMAL_PROTECT_ENABLE.to_le_bytes());
-        data[6..8].copy_from_slice(&20u16.to_le_bytes());
+        write_tlv(&mut data, 4, UNI_CMD_THERMAL_PROTECT_ENABLE, 20);
         data[9] = band;
         data[10] = 1; // protect_type
         data[11] = 1; // trigger_type
@@ -1010,8 +917,7 @@ pub fn set_thermal_throttling(
 
     for level in 0u8..4 {
         let mut data = [0u8; 12];
-        data[4..6].copy_from_slice(&UNI_CMD_THERMAL_PROTECT_DUTY_CONFIG.to_le_bytes());
-        data[6..8].copy_from_slice(&8u16.to_le_bytes());
+        write_tlv(&mut data, 4, UNI_CMD_THERMAL_PROTECT_DUTY_CONFIG, 8);
         data[9] = band;
         data[10] = level;
         data[11] = duty_cycle;
@@ -1029,8 +935,7 @@ pub fn set_rts_thresh(
 ) -> Result<(), McuError> {
     let mut data = [0u8; 16];
     data[0] = band;
-    data[4..6].copy_from_slice(&UNI_BAND_CONFIG_RTS_THRESHOLD.to_le_bytes());
-    data[6..8].copy_from_slice(&12u16.to_le_bytes());
+    write_tlv(&mut data, 4, UNI_BAND_CONFIG_RTS_THRESHOLD, 12);
     data[8..12].copy_from_slice(&val.to_le_bytes());
     data[12..16].copy_from_slice(&2u32.to_le_bytes()); // pkt_thresh
 
@@ -1046,8 +951,7 @@ pub fn set_chan_info(
     sec_ch_offset: i8, seq: u8, irq: Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
     let mut data = [0u8; 80];
-    data[4..6].copy_from_slice(&tag.to_le_bytes());
-    data[6..8].copy_from_slice(&76u16.to_le_bytes());
+    write_tlv(&mut data, 4, tag, 76);
     data[8] = channel; // control_ch
     // center_ch: for 40MHz, primary +/- 2
     data[9] = match (bw, sec_ch_offset) {
@@ -1076,8 +980,7 @@ pub fn set_txpower_sku(
     const TOTAL_SIZE: usize = HEADER_SIZE + MT7996_SKU_PATH_NUM;
     let mut data = [0u8; TOTAL_SIZE];
 
-    data[4..6].copy_from_slice(&UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL.to_le_bytes());
-    data[6..8].copy_from_slice(&((HEADER_SIZE + MT7996_SKU_PATH_NUM - 4) as u16).to_le_bytes());
+    write_tlv(&mut data, 4, UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL, (HEADER_SIZE + MT7996_SKU_PATH_NUM - 4) as u16);
     data[8] = UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL as u8;
     data[10] = band;
 
@@ -1099,20 +1002,17 @@ pub fn set_hdr_trans(
     let mut off = 4usize;
 
     // TLV1: HDR_TRANS_EN
-    data[off..off + 2].copy_from_slice(&UNI_HDR_TRANS_EN.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
-    data[off + 4] = if enable { 1 } else { 0 };
-    off += 8;
+    off = write_tlv(&mut data, off, UNI_HDR_TRANS_EN, 8);
+    data[off] = if enable { 1 } else { 0 };
+    off += 4;
 
     // TLV2: HDR_TRANS_VLAN
-    data[off..off + 2].copy_from_slice(&UNI_HDR_TRANS_VLAN.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
-    off += 8;
+    off = write_tlv(&mut data, off, UNI_HDR_TRANS_VLAN, 8);
+    off += 4;
 
     // TLV3: HDR_TRANS_BLACKLIST (only if enable)
     if enable {
-        data[off..off + 2].copy_from_slice(&UNI_HDR_TRANS_BLACKLIST.to_le_bytes());
-        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        write_tlv(&mut data, off, UNI_HDR_TRANS_BLACKLIST, 8);
         data[off + 5] = 1; // enable
         data[off + 6..off + 8].copy_from_slice(&ETH_P_PAE.to_le_bytes());
     }
@@ -1133,8 +1033,7 @@ pub fn add_dev_info(
     let mut data = [0u8; 16];
     data[0] = omac_idx;
     data[1] = band;
-    data[4..6].copy_from_slice(&DEV_INFO_ACTIVE.to_le_bytes());
-    data[6..8].copy_from_slice(&12u16.to_le_bytes());
+    write_tlv(&mut data, 4, DEV_INFO_ACTIVE, 12);
     data[8] = if enable { 1 } else { 0 };
     data[10..16].copy_from_slice(mac_addr);
 
@@ -1155,8 +1054,7 @@ pub fn add_bss_info(
 
     // BSS_INFO_BASIC TLV (32 bytes)
     let off = 4;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_BASIC.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&32u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_BASIC, 32);
     data[off + 4] = if enable { 1 } else { 0 };
     data[off + 5] = omac_idx;
     data[off + 6] = hw_bss_idx;
@@ -1173,14 +1071,12 @@ pub fn add_bss_info(
 
     // BSS_INFO_SEC TLV (8 bytes)
     let off = 36;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_SEC.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_SEC, 8);
     data[off + 6] = cipher;
 
     // BSS_INFO_RLM TLV (16 bytes)
     let off = 44;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_RLM.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_RLM, 16);
     data[off + 4] = channel;
     data[off + 5] = if bw >= 1 { (channel as i8 + sec_ch_offset * 2) as u8 } else { channel };
     data[off + 7] = bw;
@@ -1190,28 +1086,24 @@ pub fn add_bss_info(
 
     // BSS_INFO_RA TLV (16 bytes)
     let off = 60;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_RA.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_RA, 16);
     data[off + 4] = 1; // short_preamble
 
     // BSS_INFO_RATE TLV (24 bytes)
     let off = 76;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_RATE.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&24u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_RATE, 24);
     data[off + 12] = 1; // short_preamble
     data[off + 13] = MT7996_BASIC_RATES_TBL;
     data[off + 14] = MT7996_BASIC_RATES_TBL;
 
     // BSS_INFO_TXCMD TLV (8 bytes)
     let off = 100;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_TXCMD.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_TXCMD, 8);
     data[off + 4] = 1; // txcmd_mode
 
     // BSS_INFO_IFS_TIME TLV (20 bytes)
     let off = 108;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_IFS_TIME.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_IFS_TIME, 20);
     data[off + 4] = 1; data[off + 5] = 1; data[off + 6] = 1; data[off + 7] = 1; // valid flags
     data[off + 8..off + 10].copy_from_slice(&9u16.to_le_bytes());    // slot_time
     data[off + 10..off + 12].copy_from_slice(&10u16.to_le_bytes());  // sifs_time
@@ -1222,8 +1114,7 @@ pub fn add_bss_info(
 
     // BSS_INFO_MLD TLV (16 bytes) — mandatory even for non-MLD
     let off = 128;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_MLD.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_MLD, 16);
     data[off + 4] = 0xff; // group_mld_id
     data[off + 5] = hw_bss_idx; // own_mld_id
     data[off + 12] = 0xff; // remap_idx
@@ -1244,17 +1135,11 @@ pub fn add_sta(
     let mut data = [0u8; 44];
 
     // sta_req_hdr (8 bytes)
-    data[0] = bss_idx;
-    data[1] = wlan_idx as u8;
-    data[2..4].copy_from_slice(&3u16.to_le_bytes()); // tlv_num
-    data[4] = 1; // is_tlv_append
-    data[5] = 0x0e; // muar_idx (wildcard for BMC)
-    data[6] = (wlan_idx >> 8) as u8;
+    write_sta_hdr(&mut data, bss_idx, wlan_idx, 0x0e, 3); // muar_idx 0x0e = wildcard for BMC
 
     // STA_REC_BASIC (20 bytes)
     let off = 8;
-    data[off..off + 2].copy_from_slice(&STA_REC_BASIC.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());
+    write_tlv(&mut data, off, STA_REC_BASIC, 20);
     data[off + 4..off + 8].copy_from_slice(&CONNECTION_INFRA_BC.to_le_bytes());
     data[off + 8] = conn_state;
     data[off + 12..off + 18].copy_from_slice(&[0xff; 6]); // broadcast
@@ -1264,15 +1149,13 @@ pub fn add_sta(
 
     // STA_REC_HDR_TRANS (8 bytes)
     let off = 28;
-    data[off..off + 2].copy_from_slice(&STA_REC_HDR_TRANS.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, off, STA_REC_HDR_TRANS, 8);
     data[off + 4] = 1; // from_ds (AP mode)
     data[off + 6] = 1; // dis_rx_hdr_tran (new WCID)
 
     // STA_REC_TX_PROC (8 bytes)
     let off = 36;
-    data[off..off + 2].copy_from_slice(&STA_REC_TX_PROC.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, off, STA_REC_TX_PROC, 8);
 
     let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_STA_REC_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
     send_uni_cmd(dev, ring, cmd, &data, true, seq, irq)
@@ -1305,17 +1188,11 @@ pub fn add_client_sta(
     let mut data = [0u8; 64];
 
     // sta_req_hdr
-    data[0] = bss_idx;
-    data[1] = wlan_idx as u8;
-    data[2..4].copy_from_slice(&tlv_count.to_le_bytes());
-    data[4] = 1;
-    data[5] = omac_idx;
-    data[6] = (wlan_idx >> 8) as u8;
+    write_sta_hdr(&mut data, bss_idx, wlan_idx, omac_idx, tlv_count);
 
     // STA_REC_BASIC
     let off = 8;
-    data[off..off + 2].copy_from_slice(&STA_REC_BASIC.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());
+    write_tlv(&mut data, off, STA_REC_BASIC, 20);
     data[off + 4..off + 8].copy_from_slice(&CONNECTION_INFRA_STA.to_le_bytes());
     data[off + 8] = conn_state;
     data[off + 9] = 1; // qos
@@ -1329,27 +1206,23 @@ pub fn add_client_sta(
         // STA_REC_HDR_TRANS — initially disabled (Linux: dis_rx_hdr_tran=true)
         // Enabled later via wtbl_update_hdr_trans() after decap offload setup.
         let off = 28;
-        data[off..off + 2].copy_from_slice(&STA_REC_HDR_TRANS.to_le_bytes());
-        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        write_tlv(&mut data, off, STA_REC_HDR_TRANS, 8);
         data[off + 4] = 1; // from_ds
         data[off + 6] = 1; // dis_rx_hdr_tran (disabled initially)
 
         // STA_REC_TX_PROC
         let off = 36;
-        data[off..off + 2].copy_from_slice(&STA_REC_TX_PROC.to_le_bytes());
-        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        write_tlv(&mut data, off, STA_REC_TX_PROC, 8);
 
         // STA_REC_HDRT — connac3 header translation mode
         let off = 44;
-        data[off..off + 2].copy_from_slice(&STA_REC_HDRT.to_le_bytes());
-        data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        write_tlv(&mut data, off, STA_REC_HDRT, 8);
         data[off + 4] = 1; // hdrt_mode
 
         // STA_REC_HT (12 bytes, only if HT)
         if has_ht {
             let off = 52;
-            data[off..off + 2].copy_from_slice(&STA_REC_HT.to_le_bytes());
-            data[off + 2..off + 4].copy_from_slice(&12u16.to_le_bytes());
+            write_tlv(&mut data, off, STA_REC_HT, 12);
             data[off + 4..off + 6].copy_from_slice(&ht_cap.to_le_bytes());
             data[off + 8] = ht_param;
         }
@@ -1372,17 +1245,11 @@ pub fn wtbl_update_hdr_trans(
     let mut data = [0u8; 16];
 
     // sta_req_hdr (8 bytes)
-    data[0] = bss_idx;
-    data[1] = wlan_idx as u8;
-    data[2..4].copy_from_slice(&1u16.to_le_bytes()); // tlv_num = 1
-    data[4] = 1; // is_tlv_append
-    data[5] = omac_idx;
-    data[6] = (wlan_idx >> 8) as u8;
+    write_sta_hdr(&mut data, bss_idx, wlan_idx, omac_idx, 1);
 
     // STA_REC_HDR_TRANS (8 bytes)
     let off = 8;
-    data[off..off + 2].copy_from_slice(&STA_REC_HDR_TRANS.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, off, STA_REC_HDR_TRANS, 8);
     data[off + 4] = 1; // from_ds (AP mode)
     // data[off + 5] = 0; // to_ds
     // data[off + 6] = 0; // dis_rx_hdr_tran = 0 → ENABLED
@@ -1405,17 +1272,11 @@ pub fn sta_rate_ctrl(
     let mut data = [0u8; 68];
 
     // sta_req_hdr
-    data[0] = bss_idx;
-    data[1] = wlan_idx as u8;
-    data[2..4].copy_from_slice(&1u16.to_le_bytes());
-    data[4] = 1;
-    data[5] = omac_idx;
-    data[6] = (wlan_idx >> 8) as u8;
+    write_sta_hdr(&mut data, bss_idx, wlan_idx, omac_idx, 1);
 
     // STA_REC_RA (60 bytes)
     let off = 8;
-    data[off..off + 2].copy_from_slice(&STA_REC_RA.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&60u16.to_le_bytes());
+    write_tlv(&mut data, off, STA_REC_RA, 60);
     data[off + 4] = 1; // valid
     data[off + 5] = 1; // auto_rate
 
@@ -1470,16 +1331,10 @@ pub fn sta_ba(
 ) -> Result<(), McuError> {
     let mut data = [0u8; 24];
 
-    data[0] = bss_idx;
-    data[1] = wlan_idx as u8;
-    data[2..4].copy_from_slice(&1u16.to_le_bytes());
-    data[4] = 1;
-    data[5] = omac_idx;
-    data[6] = (wlan_idx >> 8) as u8;
+    write_sta_hdr(&mut data, bss_idx, wlan_idx, omac_idx, 1);
 
     let off = 8;
-    data[off..off + 2].copy_from_slice(&STA_REC_BA.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
+    write_tlv(&mut data, off, STA_REC_BA, 16);
     data[off + 4] = tid;
     data[off + 5] = 2; // ba_type = RECIPIENT
     data[off + 7] = if enable { 1u8 << tid } else { 0 };
@@ -1500,16 +1355,10 @@ pub fn install_key(
 ) -> Result<(), McuError> {
     let mut data = [0u8; 112]; // sta_req_hdr(8) + sta_rec_sec_uni(104)
 
-    data[0] = bss_idx;
-    data[1] = wlan_idx as u8;
-    data[2..4].copy_from_slice(&1u16.to_le_bytes());
-    data[4] = 1;
-    data[5] = omac_idx;
-    data[6] = (wlan_idx >> 8) as u8;
+    write_sta_hdr(&mut data, bss_idx, wlan_idx, omac_idx, 1);
 
     let off = 8;
-    data[off..off + 2].copy_from_slice(&STA_REC_KEY_V2.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&104u16.to_le_bytes());
+    write_tlv(&mut data, off, STA_REC_KEY_V2, 104);
     data[off + 4] = 0; // add = SET_KEY (Linux enum: SET_KEY=0, DISABLE_KEY=1)
     data[off + 5] = 1; // n_cipher
 
@@ -1536,8 +1385,7 @@ pub fn update_bss_sec(
     data[0] = hw_bss_idx;
 
     let off = 4;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_SEC.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_SEC, 8);
     data[off + 6] = cipher;
 
     let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BSS_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
@@ -1554,8 +1402,7 @@ pub fn add_group(
     let mut data = [0u8; 24];
 
     let off = 4;
-    data[off..off + 2].copy_from_slice(&UNI_VOW_DRR_CTRL.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&20u16.to_le_bytes());
+    write_tlv(&mut data, off, UNI_VOW_DRR_CTRL, 20);
     data[off + 4..off + 6].copy_from_slice(&wlan_idx.to_le_bytes());
     data[off + 8..off + 12].copy_from_slice(&1u32.to_le_bytes()); // action = MT_STA_BSS_GROUP
     data[off + 12..off + 16].copy_from_slice(&((bss_idx as u32) % 16).to_le_bytes());
@@ -1577,8 +1424,7 @@ pub fn txbf_init(
     // BF_MOD_EN_CTRL (tag=20)
     {
         let mut data = [0u8; 20];
-        data[4..6].copy_from_slice(&20u16.to_le_bytes());
-        data[6..8].copy_from_slice(&16u16.to_le_bytes());
+        write_tlv(&mut data, 4, 20, 16);
         data[8] = 3;    // bf_num
         data[9] = 0x07; // bf_bitmap
         send_uni_cmd(dev, ring, cmd, &data, true, *seq, irq.as_deref_mut())?;
@@ -1588,8 +1434,7 @@ pub fn txbf_init(
     // BF_SOUNDING_ON (tag=1)
     {
         let mut data = [0u8; 24];
-        data[4..6].copy_from_slice(&1u16.to_le_bytes());
-        data[6..8].copy_from_slice(&20u16.to_le_bytes());
+        write_tlv(&mut data, 4, 1, 20);
         data[8] = 4; // snd_mode = BF_PROCESSING
         send_uni_cmd(dev, ring, cmd, &data, true, *seq, irq.as_deref_mut())?;
         *seq = seq.wrapping_add(1);
@@ -1598,8 +1443,7 @@ pub fn txbf_init(
     // BF_HW_EN_UPDATE (tag=17)
     {
         let mut data = [0u8; 12];
-        data[4..6].copy_from_slice(&17u16.to_le_bytes());
-        data[6..8].copy_from_slice(&8u16.to_le_bytes());
+        write_tlv(&mut data, 4, 17, 8);
         data[8] = 1; // ebf = true
         send_uni_cmd(dev, ring, cmd, &data, true, *seq, irq)?;
         *seq = seq.wrapping_add(1);
@@ -1627,7 +1471,7 @@ pub fn set_edca(
 
     for (i, &(queue, cw_min, cw_max, txop, aifs)) in EDCA.iter().enumerate() {
         let off = 4 + i * 12;
-        data[off + 2..off + 4].copy_from_slice(&12u16.to_le_bytes());
+        write_tlv(&mut data, off, 0, 12);
         data[off + 4] = queue;
         data[off + 5] = 0x0F; // WMM_PARAM_SET
         data[off + 6] = cw_min;
@@ -1661,8 +1505,7 @@ pub fn set_beacon(
 
     // bcn_content_tlv header (14 bytes)
     let off = 4usize;
-    data[off..off + 2].copy_from_slice(&UNI_BSS_INFO_BCN_CONTENT.to_le_bytes());
-    data[off + 2..off + 4].copy_from_slice(&(tlv_aligned as u16).to_le_bytes());
+    write_tlv(&mut data, off, UNI_BSS_INFO_BCN_CONTENT, tlv_aligned as u16);
     let tim_pos = find_ie_offset(beacon_frame, 5).unwrap_or(59) as u16;
     data[off + 4..off + 6].copy_from_slice(&tim_pos.to_le_bytes());
     data[off + 10] = if enable { 1 } else { 0 };
@@ -1710,7 +1553,7 @@ pub fn set_fixed_rate_table(
     seq: u8, irq: Option<&mut FwIrq>,
 ) -> Result<(), McuError> {
     let mut data = [0u8; 20];
-    data[6..8].copy_from_slice(&16u16.to_le_bytes());
+    write_tlv(&mut data, 4, 0, 16);
     data[8] = table_idx;
     data[10..12].copy_from_slice(&rate_idx.to_le_bytes());
     if is_beacon {
@@ -1733,7 +1576,7 @@ pub fn background_chain_ctrl(
     seq: u8,
 ) -> Result<(), McuError> {
     let mut data = [0u8; 24];
-    data[6..8].copy_from_slice(&20u16.to_le_bytes());
+    write_tlv(&mut data, 4, 0, 20);
     data[20] = 2; // monitor_scan_type
 
     if scan_mode == 1 {
@@ -1766,8 +1609,7 @@ pub fn get_all_sta_info(
     dev: &Mt76Device, ring: &mut TxRing, tag: u16, seq: u8,
 ) -> Result<(), McuError> {
     let mut data = [0u8; 8];
-    data[4..6].copy_from_slice(&tag.to_le_bytes());
-    data[6..8].copy_from_slice(&4u16.to_le_bytes());
+    write_tlv(&mut data, 4, tag, 4);
 
     let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_ALL_STA_INFO as u32) | CMD_FIELD_WM;
     send_uni_cmd(dev, ring, cmd, &data, false, seq, None)
@@ -1790,8 +1632,7 @@ pub fn get_chan_mib_info(
 
     for i in 0..4 {
         let base = 4 + i * 8;
-        data[base..base + 2].copy_from_slice(&UNI_CMD_MIB_DATA.to_le_bytes());
-        data[base + 2..base + 4].copy_from_slice(&8u16.to_le_bytes());
+        write_tlv(&mut data, base, UNI_CMD_MIB_DATA, 8);
         data[base + 4..base + 8].copy_from_slice(&offsets[i].to_le_bytes());
     }
 

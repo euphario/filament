@@ -56,6 +56,23 @@ impl RxEapolFrame {
     };
 }
 
+/// Compute byte offset from base RXD (32B) through RXD groups.
+///
+/// Group order: G4(16), G1(16), G2(16), G3(16), G5(96).
+/// Pass `include_g3 = false` to stop before Group 3 (for RSSI extraction),
+/// or `true` to include all groups (for frame data offset).
+fn group_offset(rxd1: u32, include_g3: bool) -> usize {
+    let mut ofs: usize = 32;
+    if rxd1 & MT_RXD1_NORMAL_GROUP_4 != 0 { ofs += 16; }
+    if rxd1 & MT_RXD1_NORMAL_GROUP_1 != 0 { ofs += 16; }
+    if rxd1 & MT_RXD1_NORMAL_GROUP_2 != 0 { ofs += 16; }
+    if include_g3 {
+        if rxd1 & MT_RXD1_NORMAL_GROUP_3 != 0 { ofs += 16; }
+        if rxd1 & MT_RXD1_NORMAL_GROUP_5 != 0 { ofs += 96; }
+    }
+    ofs
+}
+
 /// Classify an RX buffer by parsing RXD0-RXD3.
 ///
 /// Returns RxdInfo with frame class, WLAN index, header translation flag,
@@ -97,31 +114,17 @@ pub fn classify_rxd(buf: &[u8]) -> RxdInfo {
         _ => RxFrameClass::Other,
     };
 
-    // Calculate frame offset: skip RXD groups to reach 802.11/Ethernet header
-    // Base RXD = 32 bytes (8 DWORDs, though we only read first 4 here)
-    // Group order: G4(16), G1(16), G2(16), G3(16), G5(96)
-    // Source: Linux mt76/mt7996/mac.c mt7996_mac_fill_rx()
-    let mut frame_ofs: usize = 32;
-    if rxd1 & MT_RXD1_NORMAL_GROUP_4 != 0 { frame_ofs += 16; }
-    if rxd1 & MT_RXD1_NORMAL_GROUP_1 != 0 { frame_ofs += 16; }
-    if rxd1 & MT_RXD1_NORMAL_GROUP_2 != 0 { frame_ofs += 16; }
-    if rxd1 & MT_RXD1_NORMAL_GROUP_3 != 0 { frame_ofs += 16; }
-    if rxd1 & MT_RXD1_NORMAL_GROUP_5 != 0 { frame_ofs += 96; }
-
-    // Header padding removal (firmware pads for alignment)
+    // Frame data offset: skip all groups + padding
+    let mut frame_ofs = group_offset(rxd1, true);
     let remove_pad = ((rxd2 >> 13) & 0x7) as usize;
     frame_ofs += 2 * remove_pad;
 
-    // RSSI from Group 3 (P-RXV) DW3 byte 0 = RCPI chain 0
+    // RSSI from Group 3 DW3 byte 0 = RCPI chain 0
     // Source: Linux mt76/mac.c mt76_connac3_mac_fill_rx()
     let rssi = if rxd1 & MT_RXD1_NORMAL_GROUP_3 != 0 {
-        let mut g3_ofs: usize = 32;
-        if rxd1 & MT_RXD1_NORMAL_GROUP_4 != 0 { g3_ofs += 16; }
-        if rxd1 & MT_RXD1_NORMAL_GROUP_1 != 0 { g3_ofs += 16; }
-        if rxd1 & MT_RXD1_NORMAL_GROUP_2 != 0 { g3_ofs += 16; }
+        let g3_ofs = group_offset(rxd1, false);
         if g3_ofs + 16 <= buf.len() {
-            let g3_dw3_ofs = g3_ofs + 12;
-            let rcpi = buf[g3_dw3_ofs]; // chain 0 RCPI
+            let rcpi = buf[g3_ofs + 12];
             (((rcpi as i32) - 220) / 2).clamp(-128, 0) as i8
         } else {
             -128i8
@@ -164,28 +167,29 @@ pub fn mgmt_subtype(fc0: u8) -> u8 {
     (fc0 >> 4) & 0xF
 }
 
+// 802.11 frame header sizes
+const DOT11_HDR_LEN: usize = 24;
+const DOT11_QOS_HDR_LEN: usize = 26;
+
+// LLC/SNAP + EAPOL EtherType (AA:AA:03:00:00:00:88:8E)
+const LLC_SNAP_EAPOL: [u8; 8] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E];
+
 /// Check if a non-header-translated data frame contains EAPOL.
 ///
-/// Looks for LLC/SNAP header (AA AA 03 00 00 00) + EtherType 0x888E
-/// after the 802.11 data header.
-///
+/// Looks for LLC/SNAP header + EtherType 0x888E after the 802.11 header.
 /// Returns (eapol_body_offset, eapol_body_len) if EAPOL detected.
 pub fn detect_eapol(buf: &[u8], frame_ofs: usize, fc0: u8, byte_cnt: usize) -> Option<(usize, usize)> {
     let subtype = (fc0 >> 4) & 0xF;
     let is_qos = (subtype & 0x8) != 0;
-    let hdr_len = if is_qos { 26usize } else { 24usize };
+    let hdr_len = if is_qos { DOT11_QOS_HDR_LEN } else { DOT11_HDR_LEN };
     let llc_ofs = frame_ofs + hdr_len;
 
-    if llc_ofs + 8 > byte_cnt || byte_cnt > buf.len() {
+    if llc_ofs + LLC_SNAP_EAPOL.len() > byte_cnt || byte_cnt > buf.len() {
         return None;
     }
 
-    let llc = &buf[llc_ofs..llc_ofs + 8];
-    if llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03
-        && llc[3] == 0x00 && llc[4] == 0x00 && llc[5] == 0x00
-        && llc[6] == 0x88 && llc[7] == 0x8E
-    {
-        let eapol_start = llc_ofs + 8;
+    if buf[llc_ofs..llc_ofs + 8] == LLC_SNAP_EAPOL {
+        let eapol_start = llc_ofs + LLC_SNAP_EAPOL.len();
         let eapol_len = byte_cnt - eapol_start;
         if eapol_len <= 256 {
             return Some((eapol_start, eapol_len));

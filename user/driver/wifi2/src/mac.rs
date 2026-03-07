@@ -42,7 +42,7 @@ pub fn cca_stats_reset(dev: &Mt76Device, band: u32) {
 pub fn wtbl_update(dev: &Mt76Device, idx: u32, mask: u32) -> bool {
     dev.reg_rmw(MT_WTBL_UPDATE, MT_WTBL_UPDATE_WLAN_IDX,
             (idx & MT_WTBL_UPDATE_WLAN_IDX) | mask);
-    dev.reg_poll(MT_WTBL_UPDATE, MT_WTBL_UPDATE_BUSY, 0, 5000).is_ok()
+    dev.reg_poll(MT_WTBL_UPDATE, MT_WTBL_UPDATE_BUSY, 0, 5).is_ok()
 }
 
 /// Read-to-clear all hardware MIB counters for a band.
