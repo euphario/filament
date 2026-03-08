@@ -543,6 +543,10 @@ impl ApManager {
         self.stas.iter().find(|s| s.state != StaState::Free && s.mac == *mac)
     }
 
+    pub fn find_sta_mut(&mut self, mac: &[u8; 6]) -> Option<&mut StaEntry> {
+        self.stas.iter_mut().find(|s| s.state != StaState::Free && s.mac == *mac)
+    }
+
     /// Iterate over all active (non-Free) STAs for diagnostics.
     pub fn iter_stas(&self) -> impl Iterator<Item = &StaEntry> {
         self.stas.iter().filter(|s| s.state != StaState::Free)

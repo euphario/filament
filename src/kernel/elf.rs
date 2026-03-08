@@ -612,6 +612,16 @@ pub fn spawn_from_path(
     spawn_process(data, name, parent_id, Some(caps))
 }
 
+/// Spawn from path, inheriting parent's capabilities (no explicit grant).
+pub fn spawn_from_path_inherit(
+    path: &str,
+    parent_id: task::TaskId,
+) -> Result<(task::TaskId, usize), ElfError> {
+    let data = find_executable(path).ok_or(ElfError::NotExecutable)?;
+    let name = path.rsplit('/').next().unwrap_or(path);
+    spawn_process(data, name, parent_id, None)
+}
+
 /// Spawn a process from ramfs path with a mailbox shmem page.
 ///
 /// Creates a 4KB shmem page, copies mailbox_data into it, and installs

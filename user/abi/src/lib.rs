@@ -1793,8 +1793,8 @@ pub mod supervision {
 
 /// Input line state shared between shell and consoled via shmem.
 ///
-/// Lives at the end of the ConsoleRing shmem region:
-///   [RingHeader 64B][TX ring][RX ring][InputState 192B]
+/// Originally lived at the end of the console pipe shmem region.
+/// Currently unused — retained for future split-screen rendering.
 ///
 /// Shell updates this struct on every edit; consoled reads it to render
 /// the input line at the bottom of the terminal.

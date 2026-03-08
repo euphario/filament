@@ -1,30 +1,27 @@
 //! Console Daemon (consoled)
 //!
 //! Bus-framework driver that manages the serial console.
-//! Connects to kernel UART bus, exposes `console:` port for shell.
+//! Thin transport: UART ↔ SharedPipe. Spawns shell as a child process.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! ┌────────────┐     ┌──────────┐     ┌────────────┐
 //! │   Shell    │ ←── │ consoled │ ←── │ Kernel     │
-//! │ (connects  │ ring│ (driver) │uart │ UART bus   │
-//! │  console:) │     │          │     │ /kernel/   │
-//! └────────────┘     └──────────┘     │ bus/uart0  │
-//!                                     └────────────┘
+//! │  (child)   │ ring│ (driver) │uart │ UART bus   │
+//! └────────────┘     └──────────┘     └────────────┘
 //! ```
 //!
-//! Uses ConsoleRing for lock-free bidirectional I/O with shell:
-//! - TX ring: shell output -> consoled -> UART
-//! - RX ring: UART input -> consoled -> shell
+//! Shell is spawned via exec_with_mailbox. The mailbox carries the
+//! SharedPipe shmem_id + terminal dimensions. No port discovery needed.
 
 #![no_std]
 #![no_main]
 
 use userlib::syscall::{self, Handle, ObjectType};
-use userlib::ipc::{Port, Channel, Timer, ObjHandle};
-use userlib::console_ring::ConsoleRing;
-use userlib::error::SysError;
+use userlib::ipc::{Timer, ObjHandle};
+use libf::sync::SharedPipe;
+use userlib::supervision::SupervisionHandle;
 use userlib::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition,
     PortInfo, PortClass, PortState, port_subclass,
@@ -37,10 +34,8 @@ use userlib::{uinfo, unotice, uerror};
 // =============================================================================
 
 const TAG_STDIN: u32 = 1;
-const TAG_PORT: u32 = 2;
 const TAG_SHMEM: u32 = 3;
-const TAG_HANDSHAKE: u32 = 4;
-const TAG_STATUS_TIMER: u32 = 5;
+const TAG_SUPERQ: u32 = 6;
 
 // =============================================================================
 // ANSI helpers
@@ -71,7 +66,6 @@ mod ansi {
                     break;
                 }
             } else {
-                // Short wait for terminal CPR response (~1ms)
                 syscall::sleep_us(1000);
             }
         }
@@ -131,22 +125,11 @@ mod ansi {
 // Console Driver State
 // =============================================================================
 
-/// Console state
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConsoleState {
-    /// Waiting for shell to connect
-    WaitingForShell,
-    /// Shell connected, forwarding I/O via ring
-    Connected,
-}
-
 pub struct ConsoledDriver {
-    state: ConsoleState,
-    port: Option<Port>,
-    /// Ring buffer for shell I/O
-    shell_ring: Option<ConsoleRing>,
-    /// Channel used during handshake (to send shmem_id)
-    handshake_channel: Option<Channel>,
+    /// Bidirectional pipe for shell I/O
+    shell_ring: Option<SharedPipe>,
+    /// Supervision handle for watching child shell
+    superq: Option<SupervisionHandle>,
     stdin_handle: ObjHandle,
     cols: u16,
     rows: u16,
@@ -154,530 +137,112 @@ pub struct ConsoledDriver {
     split_enabled: bool,
     /// Number of lines for log region (top)
     log_lines: u16,
-    /// PID of the connected shell (for signal delivery)
+    /// PID of the child shell (for signal delivery)
     shell_pid: Option<u32>,
-    /// Input rendering mode (consoled owns the input line)
-    input_mode: bool,
-    /// Prompt for input mode (e.g., "\x1b[1m\x1b[34m/\x1b[32m > \x1b[0m")
-    input_prompt: [u8; 48],
-    input_prompt_len: u8,
-    /// Visible prompt width (excluding ANSI escapes) for cursor positioning
-    input_prompt_visible: u8,
-    /// Last seen InputState sequence number
-    last_input_seq: u32,
-    /// Column position in scroll region after last output write (1-based).
-    /// Used to resume multi-chunk output at the correct position.
-    output_col: u16,
-    /// 1-second periodic timer for status bar updates
-    status_timer: Option<Timer>,
-    /// Alternates heartbeat symbol each tick
-    heartbeat_toggle: bool,
 }
 
 impl ConsoledDriver {
     pub const fn new() -> Self {
         Self {
-            state: ConsoleState::WaitingForShell,
-            port: None,
             shell_ring: None,
-            handshake_channel: None,
+            superq: None,
             stdin_handle: Handle::INVALID,
             cols: 80,
             rows: 24,
             split_enabled: false,
             log_lines: 5,
             shell_pid: None,
-            input_mode: false,
-            input_prompt: [0u8; 48],
-            input_prompt_len: 0,
-            input_prompt_visible: 0,
-            last_input_seq: 0,
-            output_col: 1,
-            status_timer: None,
-            heartbeat_toggle: false,
         }
     }
 
     // =========================================================================
-    // Input Line Rendering (consoled-owned input area)
+    // Shell Spawn / Exit
     // =========================================================================
 
-    /// Check InputState flags and enter/exit input mode accordingly.
-    /// Called on every shmem event.
-    fn check_input_flags(&mut self) {
-        let ring = match self.shell_ring.as_ref() {
+    /// Spawn shell as a child process via exec_with_mailbox.
+    fn spawn_shell(&mut self, ctx: &mut dyn BusCtx) {
+        // Create shared pipe for shell I/O (64K output, 4K input)
+        let ring = match SharedPipe::console() {
             Some(r) => r,
-            None => return,
+            None => {
+                uerror!("consoled", "ring_create_failed";);
+                return;
+            }
         };
 
-        let input = ring.input_state();
-        let flags = input.flags;
-        let active = (flags & userlib::console_ring::input_flags::ACTIVE) != 0;
+        // Build mailbox: MailboxHeader (64 bytes) + shmem_id(4) + cols(2) + rows(2)
+        let mut mailbox = [0u8; 72];
+        // MailboxHeader magic
+        mailbox[0..4].copy_from_slice(&0x4D424F58u32.to_le_bytes()); // "MBOX"
+        mailbox[4..6].copy_from_slice(&1u16.to_le_bytes()); // version
+        // Console fields at offset 64
+        mailbox[64..68].copy_from_slice(&ring.shmem_id().to_le_bytes());
+        mailbox[68..70].copy_from_slice(&self.cols.to_le_bytes());
+        mailbox[70..72].copy_from_slice(&self.rows.to_le_bytes());
 
-        if active && !self.input_mode {
-            // Read prompt from InputState
-            let plen = (input.prompt_len as usize).min(48);
-            self.input_prompt[..plen].copy_from_slice(&input.prompt[..plen]);
-            self.input_prompt_len = plen as u8;
-            self.input_prompt_visible = input.prompt_visible_len;
-            self.enter_input_mode();
-        } else if !active && self.input_mode {
-            self.exit_input_mode();
+        let caps = userlib::devd::caps::USER_ADMIN;
+        match syscall::exec_with_mailbox("shell", caps, &mailbox) {
+            Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
+                // Grant child access to the ring shmem
+                ring.allow(child_pid);
+
+                unotice!("consoled", "shell_spawned"; pid = child_pid);
+
+                // Watch ring shmem for shell TX data
+                let _ = ctx.watch_handle(ring.handle(), TAG_SHMEM);
+
+                // Watch SuperQ for child exit
+                let superq = SupervisionHandle::from_handle(parent_superq_handle);
+                let _ = ctx.watch_handle(parent_superq_handle, TAG_SUPERQ);
+
+                self.shell_ring = Some(ring);
+                self.superq = Some(superq);
+                self.shell_pid = Some(child_pid);
+            }
+            Err(e) => {
+                uerror!("consoled", "shell_spawn_failed"; err = e as i32);
+            }
         }
     }
 
-    /// Enter input mode: set up scroll region, render prompt on input row.
-    ///
-    /// Output position is tracked via `output_col` — no ESC[s/ESC[u needed.
-    /// This is resilient to external UART writes (klog) that would corrupt
-    /// terminal save/restore state.
-    fn enter_input_mode(&mut self) {
-        if self.input_mode {
-            return;
-        }
-        self.last_input_seq = 0;
-        self.output_col = 1;
-
-        // Disable split if it was on — input mode replaces it
-        if self.split_enabled {
-            self.split_enabled = false;
+    /// Handle child exit — respawn shell.
+    /// Idempotent: safe to call from both SuperQ event and CHILD_EXIT signal.
+    fn handle_child_exit(&mut self, ctx: &mut dyn BusCtx) {
+        if self.shell_pid.is_none() {
+            return; // Already handled
         }
 
-        // Scroll screen up to make room for separator + input + status lines.
-        // Without this, short output (e.g., `uptime`) at the bottom of the
-        // screen gets overwritten by the separator drawn at rows-2.
-        let mut scroll = [0u8; 16];
-        let mut spos = 0;
-        // Move to bottom of screen
-        scroll[spos..spos+2].copy_from_slice(b"\x1b[");
-        spos += 2;
-        spos += write_u16_to_buf(&mut scroll[spos..], self.rows);
-        scroll[spos..spos+3].copy_from_slice(b";1H");
-        spos += 3;
-        // Print newlines to push content up (3 = separator + input + status)
-        scroll[spos] = b'\n';
-        scroll[spos+1] = b'\n';
-        scroll[spos+2] = b'\n';
-        spos += 3;
-        self.write_uart(&scroll[..spos]);
+        if let Some(superq) = &self.superq {
+            // Drain EXIT note
+            let _ = superq.try_recv();
+        }
 
+        unotice!("consoled", "shell_exited";);
+
+        // Clean up
+        if let Some(ring) = &self.shell_ring {
+            let _ = ctx.unwatch_handle(ring.handle());
+        }
+        if let Some(superq) = &self.superq {
+            let _ = ctx.unwatch_handle(superq.handle());
+        }
+        self.shell_ring = None;
+        self.superq = None;
+        self.shell_pid = None;
+
+        // Respawn after brief delay
+        syscall::sleep_us(100_000); // 100ms
+
+        // Drain stale UART input
         let mut buf = [0u8; 64];
-        let mut pos = 0;
-
-        // Set scroll region: rows 1..rows-3 for output
-        // Row rows-2 = separator, row rows-1 = input, row rows = status
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        buf[pos..pos+2].copy_from_slice(b"1;");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 3);
-        buf[pos] = b'r';
-        pos += 1;
-
-        self.write_uart(&buf[..pos]);
-
-        // Draw separator line on row rows-2
-        self.draw_separator();
-
-        // Move cursor to input row (rows-1) and draw prompt
-        let mut buf2 = [0u8; 32];
-        let mut pos2 = 0;
-        buf2[pos2..pos2+2].copy_from_slice(b"\x1b[");
-        pos2 += 2;
-        pos2 += write_u16_to_buf(&mut buf2[pos2..], self.rows - 1);
-        buf2[pos2..pos2+3].copy_from_slice(b";1H");
-        pos2 += 3;
-        buf2[pos2..pos2+3].copy_from_slice(b"\x1b[K");
-        pos2 += 3;
-        self.write_uart(&buf2[..pos2]);
-
-        // Draw prompt
-        self.write_uart(&self.input_prompt[..self.input_prompt_len as usize]);
-
-        self.input_mode = true;
-
-        // Draw initial status line
-        self.render_status_line();
-    }
-
-    /// Draw horizontal separator line on row rows-2
-    fn draw_separator(&mut self) {
-        let mut buf = [0u8; 1024];
-        let mut pos = 0;
-
-        // Move to separator row
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 2);
-        buf[pos..pos+3].copy_from_slice(b";1H");
-        pos += 3;
-
-        // Dim color for separator
-        buf[pos..pos+4].copy_from_slice(b"\x1b[2m");
-        pos += 4;
-
-        // Fill with ─ (U+2500 = 0xE2 0x94 0x80), 3 bytes per character
-        let max_chars = ((buf.len() - pos - 8) / 3).min(self.cols as usize);
-        for _ in 0..max_chars {
-            buf[pos] = 0xe2;
-            buf[pos+1] = 0x94;
-            buf[pos+2] = 0x80;
-            pos += 3;
-        }
-
-        // Reset color
-        buf[pos..pos+4].copy_from_slice(b"\x1b[0m");
-        pos += 4;
-
-        self.write_uart(&buf[..pos]);
-    }
-
-    /// Exit input mode: reset scroll region, position cursor after output.
-    fn exit_input_mode(&mut self) {
-        if !self.input_mode {
-            return;
-        }
-        self.input_mode = false;
-
-        let mut buf = [0u8; 80];
-        let mut pos = 0;
-
-        // Clear separator line (row=rows-2)
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 2);
-        buf[pos..pos+6].copy_from_slice(b";1H\x1b[K");
-        pos += 6;
-
-        // Clear the input line (row=rows-1)
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
-        buf[pos..pos+6].copy_from_slice(b";1H\x1b[K");
-        pos += 6;
-
-        // Clear the status line (row=rows)
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows);
-        buf[pos..pos+6].copy_from_slice(b";1H\x1b[K");
-        pos += 6;
-
-        // Reset scroll region (ESC[r moves cursor to 1,1 — VT100 spec)
-        buf[pos..pos+3].copy_from_slice(b"\x1b[r");
-        pos += 3;
-
-        // Reposition cursor to where output was (ESC[r reset it to 1,1)
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 3);
-        buf[pos..pos+3].copy_from_slice(b";1H");
-        pos += 3;
-
-        self.write_uart(&buf[..pos]);
-    }
-
-    /// Render the input line from InputState in shmem.
-    ///
-    /// Moves directly to the input row (row=rows-1) without save/restore —
-    /// ESC[s/ESC[u is reserved for the output cursor position.
-    fn render_input_line(&mut self) {
-        use core::sync::atomic::Ordering;
-
-        let ring = match self.shell_ring.as_ref() {
-            Some(r) => r,
-            None => return,
-        };
-
-        let input = ring.input_state();
-        let seq = input.seq.load(Ordering::Acquire);
-        if seq == self.last_input_seq {
-            return; // No change
-        }
-        self.last_input_seq = seq;
-
-        // Check if input mode should change
-        let active = (input.flags & userlib::console_ring::input_flags::ACTIVE) != 0;
-        if !active {
-            if self.input_mode {
-                self.exit_input_mode();
-            }
-            return;
-        }
-
-        let len = (input.len as usize).min(128);
-        let cursor = (input.cursor as usize).min(len);
-        let prompt_bytes = self.input_prompt_len as usize;
-        let prompt_vis = self.input_prompt_visible as usize;
-
-        // Build the entire UART write in one buffer to minimize syscalls
-        let mut buf = [0u8; 256];
-        let mut pos = 0;
-
-        // Move to input row (rows-1), column 1
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
-        buf[pos..pos+3].copy_from_slice(b";1H");
-        pos += 3;
-
-        // Write prompt (may contain ANSI escapes)
-        let prompt = &self.input_prompt[..prompt_bytes];
-        let copy_len = prompt.len().min(buf.len() - pos);
-        buf[pos..pos+copy_len].copy_from_slice(&prompt[..copy_len]);
-        pos += copy_len;
-
-        // Write input text
-        let text_copy = len.min(buf.len() - pos);
-        buf[pos..pos+text_copy].copy_from_slice(&input.buf[..text_copy]);
-        pos += text_copy;
-
-        // Clear to end of line
-        buf[pos..pos+3].copy_from_slice(b"\x1b[K");
-        pos += 3;
-
-        // Position cursor using visible prompt width (not byte length)
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows - 1);
-        buf[pos] = b';';
-        pos += 1;
-        pos += write_u16_to_buf(&mut buf[pos..], (prompt_vis + cursor + 1) as u16);
-        buf[pos] = b'H';
-        pos += 1;
-
-        self.write_uart(&buf[..pos]);
-    }
-
-    /// Write output while in input mode — output goes into scroll region,
-    /// then cursor returns to input line position.
-    ///
-    /// Uses explicit column tracking (`output_col`) instead of ESC[s/ESC[u,
-    /// which is resilient to external UART writes (klog) that corrupt
-    /// terminal save/restore state.
-    fn write_output_input_mode(&mut self, data: &[u8]) {
-        let ring = match self.shell_ring.as_ref() {
-            Some(r) => r,
-            None => return,
-        };
-
-        let input = ring.input_state();
-        let len = (input.len as usize).min(128);
-        let cursor = (input.cursor as usize).min(len);
-        let prompt_vis = self.input_prompt_visible as usize;
-
-        // Move to output position in scroll region (bottom row = rows-3, tracked column)
-        let mut pre = [0u8; 16];
-        let mut ppos = 0;
-        pre[ppos..ppos+2].copy_from_slice(b"\x1b[");
-        ppos += 2;
-        ppos += write_u16_to_buf(&mut pre[ppos..], self.rows - 3);
-        pre[ppos] = b';';
-        ppos += 1;
-        ppos += write_u16_to_buf(&mut pre[ppos..], self.output_col);
-        pre[ppos] = b'H';
-        ppos += 1;
-        self.write_uart(&pre[..ppos]);
-
-        // Write the output data (scroll region handles scrolling)
-        self.write_uart(data);
-
-        // Update output_col by scanning data, properly skipping ANSI escapes
-        let cols = self.cols;
-        let mut esc: u8 = 0; // 0=normal, 1=after ESC, 2=in CSI
-        for &b in data {
-            match esc {
-                1 => {
-                    // After ESC: '[' starts CSI, anything else = 2-char escape
-                    esc = if b == b'[' { 2 } else { 0 };
-                }
-                2 => {
-                    // In CSI: terminated by 0x40..=0x7e (letter)
-                    if b >= 0x40 && b <= 0x7e {
-                        esc = 0;
-                    }
-                }
-                _ => match b {
-                    0x1b => esc = 1,
-                    b'\n' | b'\r' => self.output_col = 1,
-                    0x20..=0x7e => {
-                        self.output_col += 1;
-                        if self.output_col > cols {
-                            self.output_col = 1; // Line wrap
-                        }
-                    }
-                    _ => {}
-                },
+        loop {
+            match syscall::read(self.stdin_handle, &mut buf) {
+                Ok(n) if n > 0 => {}
+                _ => break,
             }
         }
 
-        // Return cursor to input line (rows-1)
-        let mut post = [0u8; 16];
-        let mut qpos = 0;
-        post[qpos..qpos+2].copy_from_slice(b"\x1b[");
-        qpos += 2;
-        qpos += write_u16_to_buf(&mut post[qpos..], self.rows - 1);
-        post[qpos] = b';';
-        qpos += 1;
-        qpos += write_u16_to_buf(&mut post[qpos..], (prompt_vis + cursor + 1) as u16);
-        post[qpos] = b'H';
-        qpos += 1;
-        self.write_uart(&post[..qpos]);
-    }
-
-    /// Render the status line on row=rows (below input line).
-    /// Shows uptime and heartbeat indicator, returns cursor to input line.
-    fn render_status_line(&mut self) {
-        let now_ns = syscall::gettime();
-        let total_secs = (now_ns / 1_000_000_000) as u32;
-        let hours = total_secs / 3600;
-        let mins = (total_secs % 3600) / 60;
-        let secs = total_secs % 60;
-
-        // ♥ = U+2665 (E2 99 A5), ♡ = U+2661 (E2 99 A1)
-        let heart: &[u8] = if self.heartbeat_toggle {
-            &[0xe2, 0x99, 0xa5] // ♥
-        } else {
-            &[0xe2, 0x99, 0xa1] // ♡
-        };
-
-        let mut buf = [0u8; 1024];
-        let mut pos = 0;
-
-        // Hide cursor during status line render to prevent flicker
-        buf[pos..pos+6].copy_from_slice(b"\x1b[?25l");
-        pos += 6;
-
-        // Move to status row
-        buf[pos..pos+2].copy_from_slice(b"\x1b[");
-        pos += 2;
-        pos += write_u16_to_buf(&mut buf[pos..], self.rows);
-        buf[pos..pos+3].copy_from_slice(b";1H");
-        pos += 3;
-
-        // Dim color
-        buf[pos..pos+4].copy_from_slice(b"\x1b[2m");
-        pos += 4;
-
-        // Leading "── up "
-        // ─ = U+2500 (E2 94 80)
-        buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
-        pos += 3;
-        buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
-        pos += 3;
-        buf[pos..pos+4].copy_from_slice(b" up ");
-        pos += 4;
-
-        // Format uptime
-        if hours > 0 {
-            pos += write_u16_to_buf(&mut buf[pos..], hours as u16);
-            buf[pos] = b'h';
-            pos += 1;
-        }
-        pos += write_u16_to_buf(&mut buf[pos..], mins as u16);
-        buf[pos] = b'm';
-        pos += 1;
-        // Zero-pad seconds
-        if secs < 10 {
-            buf[pos] = b'0';
-            pos += 1;
-        }
-        pos += write_u16_to_buf(&mut buf[pos..], secs as u16);
-        buf[pos] = b's';
-        pos += 1;
-
-        // " ── "
-        buf[pos] = b' ';
-        pos += 1;
-        buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
-        pos += 3;
-        buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
-        pos += 3;
-        buf[pos] = b' ';
-        pos += 1;
-
-        // Heartbeat (reset dim, show heart in red or dim red)
-        buf[pos..pos+4].copy_from_slice(b"\x1b[0m"); // reset
-        pos += 4;
-        if self.heartbeat_toggle {
-            buf[pos..pos+5].copy_from_slice(b"\x1b[31m"); // red
-            pos += 5;
-        } else {
-            buf[pos..pos+7].copy_from_slice(b"\x1b[2;31m"); // dim red
-            pos += 7;
-        }
-        buf[pos..pos+3].copy_from_slice(heart);
-        pos += 3;
-        buf[pos..pos+4].copy_from_slice(b"\x1b[0m"); // reset
-        pos += 4;
-        buf[pos..pos+4].copy_from_slice(b"\x1b[2m"); // dim again
-        pos += 4;
-
-        // " ──────..." fill remaining with ─
-        buf[pos] = b' ';
-        pos += 1;
-
-        // Calculate how many chars we've drawn so far (visible)
-        // "── up XhYYmZZs ── ♥ " = ~20-25 chars depending on uptime
-        // Each ─ and ♥ is 1 display column despite multi-byte UTF-8
-        let used_cols: u16 = {
-            // "── up " = 6
-            let mut c: u16 = 6;
-            if hours > 0 {
-                c += if hours >= 10 { 3 } else { 2 }; // Nh
-            }
-            c += if mins >= 10 { 3 } else { 2 }; // Nm or NNm
-            c += 3; // NNs (always 2 digits + s)
-            c += 6; // " ── ♥ "
-            c
-        };
-
-        let remaining = if self.cols > used_cols {
-            (self.cols - used_cols) as usize
-        } else {
-            0
-        };
-        let fill = remaining.min((buf.len() - pos - 8) / 3);
-        for _ in 0..fill {
-            buf[pos..pos+3].copy_from_slice(&[0xe2, 0x94, 0x80]);
-            pos += 3;
-        }
-
-        // Reset color
-        buf[pos..pos+4].copy_from_slice(b"\x1b[0m");
-        pos += 4;
-
-        self.write_uart(&buf[..pos]);
-
-        // Return cursor to input line (rows-1)
-        if self.input_mode {
-            let ring = match self.shell_ring.as_ref() {
-                Some(r) => r,
-                None => return,
-            };
-            let input = ring.input_state();
-            let len = (input.len as usize).min(128);
-            let cursor = (input.cursor as usize).min(len);
-            let prompt_vis = self.input_prompt_visible as usize;
-
-            let mut ret = [0u8; 32];
-            let mut rpos = 0;
-            ret[rpos..rpos+2].copy_from_slice(b"\x1b[");
-            rpos += 2;
-            rpos += write_u16_to_buf(&mut ret[rpos..], self.rows - 1);
-            ret[rpos] = b';';
-            rpos += 1;
-            rpos += write_u16_to_buf(&mut ret[rpos..], (prompt_vis + cursor + 1) as u16);
-            ret[rpos] = b'H';
-            rpos += 1;
-            // Show cursor again after repositioning
-            ret[rpos..rpos+6].copy_from_slice(b"\x1b[?25h");
-            rpos += 6;
-            self.write_uart(&ret[..rpos]);
-        } else {
-            // Not in input mode — just show cursor
-            self.write_uart(b"\x1b[?25h");
-        }
+        self.spawn_shell(ctx);
     }
 
     // =========================================================================
@@ -749,24 +314,10 @@ impl ConsoledDriver {
             return;
         }
         self.split_enabled = false;
-
-        // Reset scroll region to full screen, clear, home cursor
         self.write_uart(b"\x1b[r\x1b[2J\x1b[H");
     }
 
-    /// Write to shell output region
-    fn write_output(&mut self, data: &[u8]) {
-        // Just pass through - scroll region handles positioning
-        self.write_uart(data);
-    }
-
-    /// Write directly to UART (blocking — retries on partial write)
-    ///
-    /// With event-driven TX drain, write(STDOUT) pushes into a 4KB kernel
-    /// ring buffer. The TX interrupt drains the ring to the UART FIFO
-    /// asynchronously. When the ring is full, write returns partial or
-    /// WouldBlock. We sleep briefly and retry — the TX IRQ frees space
-    /// within ~1ms at 115200 baud.
+    /// Write directly to UART (blocking)
     fn write_uart(&self, data: &[u8]) {
         let mut offset = 0;
         while offset < data.len() {
@@ -775,126 +326,45 @@ impl ConsoledDriver {
                     offset += n;
                 }
                 _ => {
-                    // WouldBlock or 0 bytes: UART ring full — wait for TX IRQ to drain
-                    syscall::sleep_us(500); // ~0.5ms, enough for 16 bytes at 115200
+                    syscall::sleep_us(500);
                 }
             }
         }
     }
 
     // =========================================================================
-    // Port Connection Handling
+    // STDIN Handling
     // =========================================================================
 
-    fn handle_port_readable(&mut self, ctx: &mut dyn BusCtx) {
-        if self.shell_ring.is_some() {
-            return; // Already have a shell
-        }
-
-        if let Some(port) = &mut self.port {
-            match port.accept_with_pid() {
-                Ok((channel, client_pid)) => {
-                    // Create ring for shell communication
-                    let ring = match ConsoleRing::create() {
-                        Some(r) => r,
-                        None => {
-                            uerror!("consoled", "ring_create_failed";);
-                            return;
-                        }
-                    };
-
-                    // Grant shell access to shmem and send shmem_id
-                    if !ring.allow(client_pid) {
-                        uerror!("consoled", "shmem_allow_failed";);
-                        return;
-                    }
-                    let shmem_id = ring.shmem_id();
-                    let mut msg = [0u8; 12];
-                    msg[..4].copy_from_slice(b"RING");
-                    msg[4..8].copy_from_slice(&shmem_id.to_le_bytes());
-                    msg[8..10].copy_from_slice(&self.cols.to_le_bytes());
-                    msg[10..12].copy_from_slice(&self.rows.to_le_bytes());
-
-                    if channel.send(&msg[..12]).is_err() {
-                        uerror!("consoled", "send_ring_info_failed";);
-                        return;
-                    }
-
-                    self.shell_pid = Some(client_pid);
-                    unotice!("consoled", "shell_connected"; pid = client_pid);
-
-                    // Drain any stale UART input before shell starts
-                    let mut buf = [0u8; 64];
-                    loop {
-                        match syscall::read(self.stdin_handle, &mut buf) {
-                            Ok(n) if n > 0 => {}
-                            _ => break,
-                        }
-                    }
-
-                    // Watch shmem and handshake channel for events
-                    let _ = ctx.watch_handle(ring.handle(), TAG_SHMEM);
-                    let _ = ctx.watch_handle(channel.handle(), TAG_HANDSHAKE);
-
-                    // Store ring and handshake channel
-                    self.shell_ring = Some(ring);
-                    self.handshake_channel = Some(channel);
-                    self.state = ConsoleState::Connected;
-                }
-                Err(SysError::WouldBlock) => {} // No pending connections
-                Err(_e) => {
-                    uerror!("consoled", "accept_error";);
-                }
-            }
-        }
-    }
-
-    fn handle_stdin_readable(&mut self, ctx: &mut dyn BusCtx) {
+    fn handle_stdin_readable(&mut self, _ctx: &mut dyn BusCtx) {
         let mut rx_buf = [0u8; 64];
 
         match syscall::read(self.stdin_handle, &mut rx_buf) {
             Ok(n) if n > 0 => {
-                // Check if shell is still connected by probing the handshake channel
-                if self.shell_ring.is_some() {
-                    if let Some(ch) = &mut self.handshake_channel {
-                        // Non-blocking probe: try to receive
-                        let mut probe = [0u8; 1];
-                        match ch.try_recv(&mut probe) {
-                            Err(SysError::ConnectionReset) => {
-                                unotice!("consoled", "shell_dead_on_stdin";);
-                                self.disconnect_shell(ctx);
-                                return;
-                            }
-                            _ => {} // Ok(None)=WouldBlock, Ok(Some)=got data - shell alive
-                        }
-                    }
-                }
-
-                // Ctrl+C (0x03): INTERRUPT signal + pass byte to ring (readline ^C cancel)
-                // Ctrl+\ (0x1c): SHUTDOWN signal, strip from ring (hard kill)
+                // Signal relay: Ctrl+C and Ctrl+\
                 if let Some(pid) = self.shell_pid {
                     if rx_buf[..n].iter().any(|&b| b == 0x03 || b == 0x1c) {
                         let mut seg_start = 0;
                         for i in 0..n {
                             if rx_buf[i] == 0x03 {
-                                // Send signal; keep 0x03 in stream for readline
-                                let _ = syscall::signal(pid, 4, 0);
+                                // Ctrl+C: INTERRUPT signal, keep byte in stream
+                                let _ = syscall::signal(pid, syscall::signal_event::INTERRUPT, 0);
                             } else if rx_buf[i] == 0x1c {
-                                // Write segment before Ctrl+\, skip the byte itself
+                                // Ctrl+\: SHUTDOWN signal, strip byte
                                 if i > seg_start {
                                     if let Some(ring) = &self.shell_ring {
-                                        let written = ring.rx_write(&rx_buf[seg_start..i]);
+                                        let written = ring.push(&rx_buf[seg_start..i]);
                                         if written > 0 { ring.notify(); }
                                     }
                                 }
-                                let _ = syscall::signal(pid, 2, 0);
+                                let _ = syscall::signal(pid, syscall::signal_event::SHUTDOWN, 0);
                                 seg_start = i + 1;
                             }
                         }
                         // Write remaining (includes Ctrl+C bytes, excludes Ctrl+\)
                         if seg_start < n {
                             if let Some(ring) = &self.shell_ring {
-                                let written = ring.rx_write(&rx_buf[seg_start..n]);
+                                let written = ring.push(&rx_buf[seg_start..n]);
                                 if written > 0 { ring.notify(); }
                             }
                         }
@@ -903,42 +373,36 @@ impl ConsoledDriver {
                 }
 
                 if let Some(ring) = &self.shell_ring {
-                    let written = ring.rx_write(&rx_buf[..n]);
+                    let written = ring.push(&rx_buf[..n]);
                     if written > 0 {
                         ring.notify();
                     }
                 }
-                // If no shell connected, discard input
             }
             _ => {}
         }
     }
 
     /// Poll STDIN for Ctrl+C / Ctrl+\ between TX drain chunks.
-    /// Returns true if a kill signal was sent (caller should stop output).
     fn poll_stdin_for_ctrl(&mut self) -> bool {
         let mut byte = [0u8; 1];
-        // Non-blocking read — drain any pending input
         loop {
             match syscall::read(self.stdin_handle, &mut byte) {
                 Ok(1) => {
                     if let Some(pid) = self.shell_pid {
                         if byte[0] == 0x03 {
-                            // Ctrl+C: INTERRUPT + pass to ring for readline
-                            let _ = syscall::signal(pid, 4, 0);
+                            let _ = syscall::signal(pid, syscall::signal_event::INTERRUPT, 0);
                             if let Some(ring) = &self.shell_ring {
-                                ring.rx_write(&byte);
+                                ring.push(&byte);
                                 ring.notify();
                             }
                             return true;
                         } else if byte[0] == 0x1c {
-                            // Ctrl+\: SHUTDOWN (hard kill), strip from ring
-                            let _ = syscall::signal(pid, 2, 0);
+                            let _ = syscall::signal(pid, syscall::signal_event::SHUTDOWN, 0);
                             return true;
                         } else {
-                            // Normal byte — write to ring
                             if let Some(ring) = &self.shell_ring {
-                                ring.rx_write(&byte);
+                                ring.push(&byte);
                                 ring.notify();
                             }
                         }
@@ -950,30 +414,12 @@ impl ConsoledDriver {
         false
     }
 
-    /// Handle shmem event: drain TX ring to UART.
-    ///
-    /// Tight loop is fine — write_uart() blocks at UART speed, which IS
-    /// the natural pacing. write_uart() retries internally when the UART
-    /// ring is full, yielding CPU via sleep (not spinning). The TX IRQ
-    /// drains the UART ring to the FIFO asynchronously.
-    ///
-    /// After reading each chunk, if the shmem ring drops below 50% full,
-    /// notify the shell so it can resume writing (back-pressure).
-    ///
-    /// Drains ALL available data from the shmem ring into a 4KB accumulation
-    /// buffer before writing to UART. This prevents ANSI escape sequences in
-    /// the shell's output from being split across multiple write_output calls,
-    /// where consoled's cursor-positioning ANSI would be inserted between
-    /// chunks, breaking the terminal's escape sequence parser.
+    // =========================================================================
+    // Shmem TX Drain
+    // =========================================================================
+
+    /// Drain TX ring to UART. Accumulates 4KB chunks to avoid splitting ANSI.
     fn handle_shmem_readable(&mut self, _ctx: &mut dyn BusCtx) {
-        // Outer loop: process all available data in 4KB chunks.
-        // Each chunk is accumulated fully before writing, preventing ANSI
-        // escape sequences from being split by consoled's cursor-positioning.
-        //
-        // Carry buffer: if a chunk ends mid-ANSI-escape (e.g. \x1b[2;3 at
-        // the 4KB boundary), the incomplete tail is carried to the next chunk
-        // so it isn't split by cursor-positioning sequences between writes.
-        let mut did_output = false;
         let mut carry = [0u8; 16];
         let mut carry_len: usize = 0;
 
@@ -981,50 +427,38 @@ impl ConsoledDriver {
             let mut acc = [0u8; 4096];
             let mut acc_len: usize = 0;
 
-            // Prepend any carried-over bytes from previous chunk
+            // Prepend carried-over bytes
             if carry_len > 0 {
                 acc[..carry_len].copy_from_slice(&carry[..carry_len]);
                 acc_len = carry_len;
                 carry_len = 0;
             }
 
-            // Accumulate up to 4KB from ring
+            // Accumulate from ring
             loop {
                 let ring = match self.shell_ring.as_ref() {
                     Some(r) => r,
                     None => return,
                 };
-                let tx_avail = ring.tx_available();
-                if tx_avail == 0 {
-                    break;
-                }
+                let tx_avail = ring.readable();
+                if tx_avail == 0 { break; }
                 let space = acc.len() - acc_len;
-                if space == 0 {
-                    break;
-                }
+                if space == 0 { break; }
                 let to_read = tx_avail.min(space);
-                let n = ring.tx_read(&mut acc[acc_len..acc_len + to_read]);
-                if n == 0 {
-                    break;
-                }
+                let n = ring.pull(&mut acc[acc_len..acc_len + to_read]);
+                if n == 0 { break; }
                 acc_len += n;
-
-                // Notify shell after each drain chunk so it can refill
                 ring.notify();
             }
 
-            if acc_len == 0 {
-                break; // Ring empty — exit outer loop
-            }
+            if acc_len == 0 { break; }
 
-            // Check if ring has more data (we'll loop again).
-            // If so, scan for an incomplete ANSI escape at the end and carry it over.
+            // Check for incomplete ANSI escape at end
             let more_data = match self.shell_ring.as_ref() {
-                Some(r) => r.tx_available() > 0 || acc_len == acc.len(),
+                Some(r) => r.readable() > 0 || acc_len == acc.len(),
                 None => false,
             };
             if more_data {
-                // Find last ESC (0x1B) in the final 16 bytes
                 let scan_start = if acc_len > 16 { acc_len - 16 } else { 0 };
                 let mut last_esc = None;
                 for i in (scan_start..acc_len).rev() {
@@ -1034,7 +468,6 @@ impl ConsoledDriver {
                     }
                 }
                 if let Some(esc_pos) = last_esc {
-                    // Check if the escape sequence is complete (terminated by a letter)
                     let mut complete = false;
                     for j in (esc_pos + 1)..acc_len {
                         if acc[j] >= b'A' && acc[j] <= b'z' {
@@ -1043,45 +476,31 @@ impl ConsoledDriver {
                         }
                     }
                     if !complete {
-                        // Incomplete ANSI escape — carry it to next chunk
                         let tail_len = acc_len - esc_pos;
                         if tail_len <= carry.len() {
                             carry[..tail_len].copy_from_slice(&acc[esc_pos..acc_len]);
                             carry_len = tail_len;
                             acc_len = esc_pos;
-                            if acc_len == 0 {
-                                continue; // Entire chunk was just a partial escape
-                            }
+                            if acc_len == 0 { continue; }
                         }
                     }
                 }
             }
 
-            did_output = true;
-
-            // Poll STDIN so Ctrl+C/Ctrl+\ remain responsive between chunks
+            // Poll STDIN for Ctrl+C/Ctrl+\ between chunks
             if self.poll_stdin_for_ctrl() {
                 break;
             }
 
-            // Check InputState flags for input mode transitions
-            self.check_input_flags();
-
-            // First chunk: scan for commands (SPLIT, NOSPLIT, GETSIZE).
-            // Commands are only sent as complete messages from the shell, never
-            // interleaved with bulk output data. They start at byte 0 after
-            // any leading newlines.
+            // Scan for commands (SPLIT, NOSPLIT, GETSIZE)
             let mut data_start = 0;
             while data_start < acc_len && (acc[data_start] == b'\n' || acc[data_start] == b'\r') {
                 data_start += 1;
             }
 
-            // Write leading newlines
             if data_start > 0 {
-                if self.input_mode {
-                    self.write_output_input_mode(&acc[..data_start]);
-                } else if self.split_enabled {
-                    self.write_output(&acc[..data_start]);
+                if self.split_enabled {
+                    self.write_uart(&acc[..data_start]);
                 } else {
                     self.write_uart(&acc[..data_start]);
                 }
@@ -1104,35 +523,26 @@ impl ConsoledDriver {
                 }
                 self.enable_split();
                 if let Some(ring) = &self.shell_ring {
-                    ring.rx_write(b"OK\n");
+                    ring.push(b"OK\n");
                     ring.notify();
                 }
             } else if cmd_len >= 7 && &cmd_buf[..7] == b"NOSPLIT" {
                 self.disable_split();
                 if let Some(ring) = &self.shell_ring {
-                    ring.rx_write(b"OK\n");
+                    ring.push(b"OK\n");
                     ring.notify();
                 }
             } else if cmd_len >= 7 && &cmd_buf[..7] == b"GETSIZE" {
-                let was_input = self.input_mode;
-                if was_input {
-                    self.write_uart(b"\x1b[r");
-                } else if self.split_enabled {
+                if self.split_enabled {
                     self.write_uart(b"\x1b[r");
                 }
 
-                match ansi::query_screen_size() {
-                    Some((cols, rows)) => {
-                        self.cols = cols;
-                        self.rows = rows;
-                    }
-                    None => {}
+                if let Some((cols, rows)) = ansi::query_screen_size() {
+                    self.cols = cols;
+                    self.rows = rows;
                 }
 
-                if was_input {
-                    self.input_mode = false;
-                    self.enter_input_mode();
-                } else if self.split_enabled {
+                if self.split_enabled {
                     self.split_enabled = false;
                     self.enable_split();
                 }
@@ -1140,74 +550,17 @@ impl ConsoledDriver {
                 let mut msg = [0u8; 32];
                 let len = format_size_msg(&mut msg, self.cols, self.rows);
                 if let Some(ring) = &self.shell_ring {
-                    ring.rx_write(&msg[..len]);
+                    ring.push(&msg[..len]);
                     ring.notify();
                 }
             } else if cmd_len > 0 {
-                // Bulk data output — write accumulated chunk at once.
-                if self.input_mode {
-                    self.write_output_input_mode(cmd_buf);
-                } else if self.split_enabled {
-                    self.write_output(cmd_buf);
+                if self.split_enabled {
+                    self.write_uart(cmd_buf);
                 } else {
                     self.write_uart(cmd_buf);
                 }
             }
-        } // end outer loop
-
-        if !did_output {
-            // No TX data — shell may have only updated InputState (echo).
-            // Check flags and render input line from shared memory.
-            self.check_input_flags();
         }
-
-        if self.input_mode {
-            self.render_input_line();
-        }
-    }
-
-    fn handle_channel_readable(&mut self, ctx: &mut dyn BusCtx) {
-        // Channel fired - try to recv to check if it's closed
-        if let Some(ch) = &mut self.handshake_channel {
-            let mut probe = [0u8; 1];
-            match ch.recv(&mut probe) {
-                Err(SysError::PeerClosed) | Err(SysError::ConnectionReset) => {
-                    unotice!("consoled", "shell_disconnected";);
-                    self.disconnect_shell(ctx);
-                }
-                _ => {} // Got data or would block - shell still alive
-            }
-        }
-    }
-
-    fn disconnect_shell(&mut self, ctx: &mut dyn BusCtx) {
-        // Exit input mode if active
-        if self.input_mode {
-            self.exit_input_mode();
-        }
-
-        // Unwatch handles before dropping
-        if let Some(ring) = &self.shell_ring {
-            let _ = ctx.unwatch_handle(ring.handle());
-        }
-        if let Some(ch) = &self.handshake_channel {
-            let _ = ctx.unwatch_handle(ch.handle());
-        }
-
-        self.shell_ring = None;
-        self.handshake_channel = None;
-        self.shell_pid = None;
-
-        // Notify port that connection is closed (allows new connections)
-        if let Some(port) = &mut self.port {
-            port.connection_closed();
-        }
-        self.state = ConsoleState::WaitingForShell;
-
-        // Transition port Safe → devd fires spawn rule → new shell
-        let _ = ctx.set_port_state(b"console:0", PortState::Safe);
-
-        unotice!("consoled", "awaiting_shell";);
     }
 }
 
@@ -1219,9 +572,7 @@ impl Driver for ConsoledDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         unotice!("consoled", "init";);
 
-        // Claim the kernel UART bus. With Phase 2 NotifyParentExit, devd only
-        // restarts consoled after the previous instance's bus handle is released,
-        // so uart0 is guaranteed Safe here — no retry needed.
+        // Claim the kernel UART bus
         let uart_path = b"/uart:0";
         match ctx.claim_kernel_bus(uart_path) {
             Ok((_bus_id, _info)) => {
@@ -1242,7 +593,7 @@ impl Driver for ConsoledDriver {
             }
         };
 
-        // Drain any stale input
+        // Drain stale input
         let mut buf = [0u8; 64];
         loop {
             match syscall::read(self.stdin_handle, &mut buf) {
@@ -1251,48 +602,20 @@ impl Driver for ConsoledDriver {
             }
         }
 
-        // Detect terminal size via CPR
+        // Detect terminal size
         if let Some((cols, rows)) = ansi::query_screen_size() {
             self.cols = cols;
             self.rows = rows;
             unotice!("consoled", "terminal_size"; cols = cols, rows = rows);
         }
 
-        // Create console port
-        let port = match Port::with_limit(b"console:0", 1) {
-            Ok(p) => p,
-            Err(_) => {
-                uerror!("consoled", "port_create_failed";);
-                return Err(BusError::Internal);
-            }
-        };
-
-        // Watch stdin and port for events
+        // Watch stdin for events
         if let Err(e) = ctx.watch_handle(self.stdin_handle, TAG_STDIN) {
             uerror!("consoled", "watch_stdin_failed";);
             return Err(e);
         }
-        if let Err(e) = ctx.watch_handle(port.handle(), TAG_PORT) {
-            uerror!("consoled", "watch_port_failed";);
-            return Err(e);
-        }
 
-        self.port = Some(port);
-
-        // Create 1-second status bar timer
-        if let Ok(timer) = Timer::new() {
-            if let Err(e) = ctx.watch_handle(timer.handle(), TAG_STATUS_TIMER) {
-                uerror!("consoled", "watch_timer_failed";);
-                return Err(e);
-            }
-            self.status_timer = Some(timer);
-            // Arm for 1 second
-            if let Some(t) = &mut self.status_timer {
-                let _ = t.set(1_000_000_000);
-            }
-        }
-
-        // Register console: port with devd
+        // Register console port with devd (for port tree visibility, no spawn rule)
         let mut info = PortInfo::empty();
         info.set_name(b"console:0");
         info.port_class = PortClass::Console;
@@ -1302,34 +625,32 @@ impl Driver for ConsoledDriver {
             uerror!("consoled", "register_port_failed";);
             return Err(e);
         }
-        // Port starts Safe. Supervisor (devd) fires spawn rules when port transitions to Claimed.
+
+        // Spawn shell directly as child
+        self.spawn_shell(ctx);
 
         unotice!("consoled", "ready";);
         Ok(())
     }
 
     fn command(&mut self, _msg: &BusMsg, _ctx: &mut dyn BusCtx) -> Disposition {
-        // consoled doesn't handle any bus commands
         Disposition::Handled
+    }
+
+    fn signal(&mut self, signal_event: u16, signal_value: u64, ctx: &mut dyn BusCtx) {
+        if signal_event as u32 & userlib::syscall::signal_event::CHILD_EXIT != 0 {
+            let child_pid = (signal_value >> 32) as u32;
+            if self.shell_pid == Some(child_pid) {
+                self.handle_child_exit(ctx);
+            }
+        }
     }
 
     fn handle_event(&mut self, tag: u32, _handle: Handle, ctx: &mut dyn BusCtx) {
         match tag {
             TAG_STDIN => self.handle_stdin_readable(ctx),
-            TAG_PORT => self.handle_port_readable(ctx),
             TAG_SHMEM => self.handle_shmem_readable(ctx),
-            TAG_HANDSHAKE => self.handle_channel_readable(ctx),
-            TAG_STATUS_TIMER => {
-                // Re-arm timer for 1 second
-                if let Some(t) = &mut self.status_timer {
-                    let _ = t.set(1_000_000_000);
-                }
-                // Toggle heartbeat and render if in input mode
-                self.heartbeat_toggle = !self.heartbeat_toggle;
-                if self.input_mode {
-                    self.render_status_line();
-                }
-            }
+            TAG_SUPERQ => self.handle_child_exit(ctx),
             _ => {}
         }
     }
@@ -1412,6 +733,10 @@ impl Driver for ConsoledWrapper {
 
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         self.0.command(msg, ctx)
+    }
+
+    fn signal(&mut self, signal_event: u16, signal_value: u64, ctx: &mut dyn BusCtx) {
+        self.0.signal(signal_event, signal_value, ctx)
     }
 
     fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {

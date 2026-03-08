@@ -263,7 +263,7 @@ bpi-r4-kernel/
 │       ├── devd/           # Device supervisor (PID 1)
 │       ├── pcied/          # PCIe bus driver
 │       ├── usbd/           # USB daemon
-│       ├── wifid/          # MT7996 WiFi driver
+│       ├── wifi2/           # MT7996 WiFi driver
 │       └── fatfs/          # FAT filesystem
 ├── docs/                   # Documentation
 │   ├── PRINCIPLES.md       # Design philosophy
@@ -366,16 +366,15 @@ load_patch()?;  // Nested spans show call hierarchy
 
 Documentation in [docs/drivers/mt7996-linux/](docs/drivers/mt7996-linux/).
 
-### Translation Rules (MANDATORY)
+### Design Rules
 
-The wifid driver MUST follow Linux mt76/mt7996 driver code exactly:
+The wifi2 driver references Linux mt76/mt7996 for hardware behavior:
 
-1. **EXACT BIT MANIPULATION** - Identical bit operations
-2. **EXACT REGISTER ACCESS ORDER** - Same sequence as Linux
-3. **EXACT RMW PATTERN** - `mt76_set` = read | bits, `mt76_clear` = read & ~bits
-4. **EXACT TIMING** - Same delays
-5. **NO IMPROVEMENTS** - Use C way even if Rust is "better"
-6. **DOCUMENT EVERY LINE** - Comment with Linux source file:line
+1. **Correct register sequences** - Same init order, same RMW patterns as Linux
+2. **Correct timing** - Same delays where hardware requires them
+3. **Cite Linux source** - Comment with source file:line for register sequences
+4. **Idiomatic Rust** - Don't mimic C-shaped control flow or function-pointer tables
+5. **State machine design** - Explicit state enums, validated transitions
 
 ### Key Registers
 
@@ -700,7 +699,7 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
   - Removed dead `user/driver/msc/` (usbd handles MSC directly)
   - Removed deprecated syscalls: `pci_enumerate`, `pci_bar_map`, `pci_claim`
   - Documented partial implementations and logging migration status
-- **Logging migration** - Migrated all drivers (except wifid) to structured ulog
+- **Logging migration** - Migrated all drivers to structured ulog
   - usbd, fatfs, gpio, pwm, nvmed, pciepoke now use uinfo!/uerror!/uwarn!
   - Removed verbose debug output, kept only state changes and errors
 - Added kernel unit tests for lock.rs, dma_pool.rs, shmem.rs
@@ -709,7 +708,7 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
 ### 2026-01-16
 - Added logd daemon for log distribution
 - Added KlogReady event type
-- Consolidated WiFi drivers (wifid3 → wifid)
+- Consolidated WiFi drivers (wifid3 → wifid → wifi2)
 - Added capability checking infrastructure
 
 ### 2026-01-15
@@ -737,7 +736,6 @@ See [docs/decisions/ADR.md](docs/decisions/ADR.md) for architecture decisions.
 | `src/platform/mt7988/sd.rs:307` | CSD capacity hardcoded 512MB | Parse from register |
 | `src/kernel/elf.rs:167` | Signature verification stub | Always passes, ready for crypto |
 | `user/driver/usbd/src/main.rs:4739` | SCSI WRITE(10) not impl | Read works |
-| `user/driver/wifid/src/main.rs:2221` | RX response uses delay | Replace with event |
 | `user/userlib/src/byte_ring.rs:45` | No futex notification | Optimization |
 
 ### Logging Migration Status
@@ -752,5 +750,5 @@ See [docs/decisions/ADR.md](docs/decisions/ADR.md) for architecture decisions.
 | pciepoke | ✓ Migrated |
 | devd | ✓ Migrated |
 | pcied | ✓ Migrated |
-| wifid | Partial (pending) |
+| wifi2 | ✓ Migrated |
 

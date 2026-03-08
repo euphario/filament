@@ -92,8 +92,18 @@ enum SerState {
 const TAG_WIFI_TIMER: u32 = 100;
 const TAG_WIFI_IRQ: u32 = 101;
 
-/// TX inflight table size (must be power of 2).
-const TX_INFLIGHT_SIZE: usize = 256;
+// NAPI-style adaptive polling intervals
+const POLL_INTERVAL_NS: u64 = 1_000_000;    // 1ms — active polling
+const NORMAL_INTERVAL_NS: u64 = 50_000_000; // 50ms — idle
+const SLOW_TICK_NS: u64 = 500_000_000;      // 500ms — housekeeping
+const POLL_IDLE_EXIT: u8 = 4;               // 4 empty polls → exit poll mode
+
+/// TX inflight table size — matches HW TX ring (2048 descriptors).
+/// Token is a wrapping u16 indexed by `tok & (TX_INFLIGHT_SIZE - 1)`.
+/// Must be power of 2 and >= MT7996_TX_RING_SIZE to prevent token aliasing.
+const TX_INFLIGHT_SIZE: usize = 2048;
+/// CQ ring size — matches BlockPortConfig.ring_size (256).
+const CQ_RING_SIZE: usize = 256;
 /// Sentinel value for unused TX inflight slots.
 const TX_TAG_FREE: u32 = u32::MAX;
 /// Maximum Ethernet frame size (header + MTU).
@@ -159,7 +169,7 @@ struct Wifi2 {
 
     // CQ tracking (provider side, for pool reclaim)
     cq_post_seq: u32,
-    cq_offsets: [u32; TX_INFLIGHT_SIZE],
+    cq_offsets: [u32; CQ_RING_SIZE],
     last_cq_head: u32,
 
     // RX frame counter for CQ tags
@@ -170,8 +180,11 @@ struct Wifi2 {
 
     // Housekeeping tick counter (incremented every 500ms, used for STA aging)
     tick: u32,
-    // Sub-tick counter (counts 50ms timer fires, resets at 10 = 500ms)
-    subtick: u8,
+
+    // NAPI-style adaptive polling
+    poll_active: bool,
+    idle_polls: u8,
+    last_housekeeping: u64,
 
     // Beacon template (re-armed after SER recovery)
     beacon_buf: [u8; 256],
@@ -215,12 +228,14 @@ impl Wifi2 {
             tx_token: 0,
             tx_inflight_tags: [TX_TAG_FREE; TX_INFLIGHT_SIZE],
             cq_post_seq: 0,
-            cq_offsets: [0; TX_INFLIGHT_SIZE],
+            cq_offsets: [0; CQ_RING_SIZE],
             last_cq_head: 0,
             net_rx_seq: 0,
             wlan_idx_used: 0,
             tick: 0,
-            subtick: 0,
+            poll_active: false,
+            idle_polls: 0,
+            last_housekeeping: 0,
             beacon_buf: [0u8; 256],
             beacon_len: 0,
             beacon_rearm_pending: false,
@@ -922,7 +937,7 @@ impl Wifi2 {
         self.tx_token = 0;
         self.tx_inflight_tags = [TX_TAG_FREE; TX_INFLIGHT_SIZE];
         self.cq_post_seq = 0;
-        self.cq_offsets = [0; TX_INFLIGHT_SIZE];
+        self.cq_offsets = [0; CQ_RING_SIZE];
         self.last_cq_head = 0;
         self.net_rx_seq = 0;
         self.wlan_idx_used = 0;
@@ -1259,15 +1274,16 @@ impl Wifi2 {
         for q in self.rx_queues[..2.min(self.rx_queue_count)].iter_mut() {
             q.drain(dev);
         }
-        // WA_MAIN (queue[2]): process with diagnostic callback to see firmware events.
-        // This queue carries TXFree notifications, RX events, and firmware status.
+        // WA_MAIN (queue[2]): mostly TXFree notifications (pkt_type=0).
+        // Drain silently — only log unexpected packet types.
         if self.rx_queue_count > 2 {
             self.rx_queues[2].process(dev, |buf| {
                 if buf.len() >= 4 {
                     let rxd0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let pkt_type = (rxd0 >> 27) & 0x1f;
-                    // Log first occurrence of each packet type per tick
-                    udebug!("wifi2", "wa_main_rx"; pkt_type = pkt_type, len = buf.len() as u32);
+                    if pkt_type != 0 {
+                        udebug!("wifi2", "wa_main_rx"; pkt_type = pkt_type, len = buf.len() as u32);
+                    }
                 }
             });
         }
@@ -1694,7 +1710,7 @@ impl Wifi2 {
         let mut forwarded = 0u32;
         let mut alloc_fail = 0u32;
         let mut port_fail = 0u32;
-        let mask = TX_INFLIGHT_SIZE - 1;
+        let cq_mask = CQ_RING_SIZE - 1;
 
         for i in 0..rx.data_count {
             let df = match rx.data_frames[i].take() {
@@ -1733,7 +1749,7 @@ impl Wifi2 {
                 result: offset,
             });
 
-            self.cq_offsets[(self.cq_post_seq as usize) & mask] = offset;
+            self.cq_offsets[(self.cq_post_seq as usize) & cq_mask] = offset;
             self.cq_post_seq = self.cq_post_seq.wrapping_add(1);
             forwarded += 1;
 
@@ -1803,10 +1819,10 @@ impl Wifi2 {
             None => return,
         };
         let new_head = port.cq_consumer_head();
-        let mask = TX_INFLIGHT_SIZE - 1;
+        let cq_mask = CQ_RING_SIZE - 1;
         let mut h = self.last_cq_head;
         while h != new_head {
-            let offset = self.cq_offsets[(h as usize) & mask];
+            let offset = self.cq_offsets[(h as usize) & cq_mask];
             if offset != 0 {
                 port.free(offset);
             }
@@ -2096,7 +2112,7 @@ impl Wifi2 {
                 true
             };
 
-            uinfo!("wifi2", "tx_from_ipd";
+            udebug!("wifi2", "tx_from_ipd";
                 len = frame_len as u32,
                 wcid = wcid as u32,
                 no_cipher = no_cipher as u32,
@@ -2168,8 +2184,9 @@ impl Driver for Wifi2 {
         self.init_hardware(ctx)?;
         self.init_radio(ctx)?;
 
-        // Start poll timer (50ms) — fast enough for STA auth/assoc timeouts
-        ctx.start_timer(TAG_WIFI_TIMER, 50_000_000)?;
+        // Start poll timer — begins in normal (50ms) mode
+        ctx.start_timer(TAG_WIFI_TIMER, NORMAL_INTERVAL_NS)?;
+        self.last_housekeeping = userlib::syscall::gettime();
 
         unotice!("wifi2", "ready"; state = self.state.name());
         Ok(())
@@ -2199,17 +2216,6 @@ impl Driver for Wifi2 {
                 let src = dev.rr(MT_INT_SOURCE_CSR);
                 if src != 0 { dev.wr(MT_INT_SOURCE_CSR, src); }
                 let _ = irq.ack();
-            }
-        }
-
-        // Slow tick: 10 sub-ticks (50ms each) = 500ms
-        let mut is_slow_tick = false;
-        if is_timer {
-            self.subtick += 1;
-            if self.subtick >= 10 {
-                self.subtick = 0;
-                self.tick = self.tick.wrapping_add(1);
-                is_slow_tick = true;
             }
         }
 
@@ -2249,10 +2255,37 @@ impl Driver for Wifi2 {
             self.dispatch_eapol_frames(dev, &mut rx);
             self.forward_rx_data(&mut rx, ctx);
 
+            // Drain pending TX from ipd on every event — not just data_ready.
+            // Without this, coalesced shmem notifies cause up to 50ms TX gaps.
+            if let Some(dp) = self.data_port {
+                self.process_tx_from_ipd(dev, dp, ctx);
+            }
+
             self.tx_sweep_and_complete(dev, ctx);
             self.reclaim_rx_pool(ctx);
 
-            if is_slow_tick {
+            // Adaptive polling: enter poll mode when work found, exit after idle streak
+            let work_done = rx.total > 0;
+            if work_done {
+                self.idle_polls = 0;
+                if !self.poll_active {
+                    self.poll_active = true;
+                    let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, POLL_INTERVAL_NS);
+                }
+            } else if self.poll_active {
+                self.idle_polls += 1;
+                if self.idle_polls >= POLL_IDLE_EXIT {
+                    self.poll_active = false;
+                    self.idle_polls = 0;
+                    let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, NORMAL_INTERVAL_NS);
+                }
+            }
+
+            // Slow tick: wall-clock based (works at any timer interval)
+            let now = userlib::syscall::gettime();
+            if now.wrapping_sub(self.last_housekeeping) >= SLOW_TICK_NS {
+                self.last_housekeeping = now;
+                self.tick = self.tick.wrapping_add(1);
                 self.slow_tick_housekeeping(dev);
             }
         }
@@ -2278,6 +2311,14 @@ impl Driver for Wifi2 {
         self.handle_side_queries(dp, ctx);
         self.process_tx_from_ipd(dev, dp, ctx);
         self.tx_sweep_and_complete(dev, ctx);
+        self.reclaim_rx_pool(ctx);
+
+        // TX work arrived — enter poll mode to catch completions quickly
+        if !self.poll_active {
+            self.poll_active = true;
+            self.idle_polls = 0;
+            let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, POLL_INTERVAL_NS);
+        }
     }
 
     fn config_keys(&self) -> &[ConfigKey] {

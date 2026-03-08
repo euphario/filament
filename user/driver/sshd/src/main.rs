@@ -6,7 +6,7 @@
 //!   1. Connects to ipd's "tcp:" socket service to listen on port 22
 //!   2. Accepts TCP connections → gets DataPort for each
 //!   3. Runs SSH-2 protocol (KEX, auth, channel) over the DataPort
-//!   4. Bridges authenticated sessions to shell via "shell-cmd:" port
+//!   4. Spawns shell as child via exec_with_mailbox + SharedPipe
 //!
 //! Cipher suite (modern minimum):
 //!   - Key exchange: curve25519-sha256
@@ -24,10 +24,14 @@ mod ssh;
 use alloc::vec::Vec;
 
 use libf::crypto;
-use libf::io::{Read, Write};
+use libf::io::{self, Read, Write};
 use libf::net::{TcpListener, TcpStream, SocketAddr, Ipv4Addr};
 
 use userlib::syscall;
+use userlib::syscall::Handle;
+use userlib::ipc::{Mux, MuxFilter};
+use libf::sync::SharedPipe;
+use userlib::supervision::SupervisionHandle;
 use userlib::{uinfo, udebug, uerror};
 
 // =============================================================================
@@ -36,7 +40,6 @@ use userlib::{uinfo, udebug, uerror};
 
 const SSH_PORT: u16 = 22;
 /// Hardcoded host key seed for development.
-/// In production, this would be generated on first boot and stored.
 const DEV_HOST_KEY_SEED: [u8; 32] = [
     0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
     0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
@@ -44,8 +47,15 @@ const DEV_HOST_KEY_SEED: [u8; 32] = [
     0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
 ];
 
-/// Default password for development (plaintext comparison).
+/// Default password for development.
 const DEV_PASSWORD: &[u8] = b"filament";
+
+/// Window size we advertise to the client (how much it can send us).
+const LOCAL_WINDOW_SIZE: u32 = 131072; // 128K
+
+/// Send WINDOW_ADJUST when we've consumed this many bytes from the client.
+/// Half the window — keeps the client flowing without excessive messages.
+const WINDOW_ADJUST_THRESHOLD: u32 = LOCAL_WINDOW_SIZE / 2;
 
 // =============================================================================
 // SSH Session State Machine
@@ -53,23 +63,14 @@ const DEV_PASSWORD: &[u8] = b"filament";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SshState {
-    /// Waiting for client version string.
     ProtocolExchange,
-    /// Sent/received KEXINIT, waiting for KEX_ECDH_INIT.
     AlgorithmNegotiation,
-    /// Processing key exchange.
     KeyExchange,
-    /// Sent NEWKEYS, waiting for client NEWKEYS.
     NewKeys,
-    /// Waiting for service request (ssh-userauth).
     ServiceRequest,
-    /// Waiting for authentication.
     Authentication,
-    /// Waiting for channel open.
     ChannelOpen,
-    /// Shell session active, forwarding data.
     ShellRunning,
-    /// Connection closing.
     Closing,
 }
 
@@ -102,14 +103,38 @@ struct SshSession {
     // Channel state
     remote_channel_id: u32,
     local_channel_id: u32,
+    /// How many bytes the client allows us to send (decremented on send).
     remote_window: u32,
+    /// How many bytes we've consumed from the client without telling it.
+    /// When this crosses WINDOW_THRESHOLD, we send WINDOW_ADJUST.
+    local_consumed: u32,
 
-    // Sequence numbers (count all binary packets, not version exchange)
+    // Sequence numbers
     tx_seqno: u64,
     rx_seqno: u64,
 
-    // Read buffer for accumulating TCP data
-    read_buf: Vec<u8>,
+    // PTY dimensions from pty-req
+    pty_cols: u16,
+    pty_rows: u16,
+
+    // Shell child process
+    shell_ring: Option<SharedPipe>,
+    shell_pid: Option<u32>,
+    superq: Option<SupervisionHandle>,
+
+    // Residual buffer: data pulled from pipe but not yet sent (window exhausted).
+    tx_residual: [u8; 4096],
+    tx_residual_off: usize,
+    tx_residual_len: usize,
+
+    // SSH-level receive buffer: raw TCP bytes awaiting SSH framing parse.
+    // Decouples TCP reads from SSH packet parsing so recv never blocks.
+    ssh_rx: [u8; 16384],
+    ssh_rx_pos: usize,
+    ssh_rx_len: usize,
+
+    // Diagnostic: count CHANNEL_DATA packets logged for hex dump.
+    tx_diag_count: u32,
 }
 
 impl SshSession {
@@ -134,9 +159,21 @@ impl SshSession {
             remote_channel_id: 0,
             local_channel_id: 0,
             remote_window: 0,
+            local_consumed: 0,
             tx_seqno: 0,
             rx_seqno: 0,
-            read_buf: Vec::new(),
+            pty_cols: 80,
+            pty_rows: 24,
+            shell_ring: None,
+            shell_pid: None,
+            superq: None,
+            tx_residual: [0u8; 4096],
+            tx_residual_off: 0,
+            tx_residual_len: 0,
+            ssh_rx: [0u8; 16384],
+            tx_diag_count: 0,
+            ssh_rx_pos: 0,
+            ssh_rx_len: 0,
         }
     }
 
@@ -149,55 +186,45 @@ impl SshSession {
         version_line[vlen] = b'\r';
         version_line[vlen + 1] = b'\n';
         if self.stream.write_all(&version_line[..vlen + 2]).is_err() {
+            uerror!("sshd", "version_write_failed";);
+            userlib::ulog::flush();
             return;
         }
 
         // Main session loop
         loop {
-            match self.state {
-                SshState::ProtocolExchange => {
-                    if !self.do_protocol_exchange() {
-                        return;
-                    }
-                }
-                SshState::AlgorithmNegotiation => {
-                    if !self.do_algorithm_negotiation() {
-                        return;
-                    }
-                }
-                SshState::KeyExchange => {
-                    if !self.do_key_exchange() {
-                        return;
-                    }
-                }
-                SshState::NewKeys => {
-                    if !self.do_new_keys() {
-                        return;
-                    }
-                }
-                SshState::ServiceRequest => {
-                    if !self.do_service_request() {
-                        return;
-                    }
-                }
-                SshState::Authentication => {
-                    if !self.do_authentication() {
-                        return;
-                    }
-                }
-                SshState::ChannelOpen => {
-                    if !self.do_channel_open() {
-                        return;
-                    }
-                }
-                SshState::ShellRunning => {
-                    if !self.do_shell_running() {
-                        return;
-                    }
-                }
+            let state_id = match self.state {
+                SshState::ProtocolExchange => 0u32,
+                SshState::AlgorithmNegotiation => 1,
+                SshState::KeyExchange => 2,
+                SshState::NewKeys => 3,
+                SshState::ServiceRequest => 4,
+                SshState::Authentication => 5,
+                SshState::ChannelOpen => 6,
+                SshState::ShellRunning => 7,
+                SshState::Closing => 8,
+            };
+
+            let ok = match self.state {
+                SshState::ProtocolExchange => self.do_protocol_exchange(),
+                SshState::AlgorithmNegotiation => self.do_algorithm_negotiation(),
+                SshState::KeyExchange => self.do_key_exchange(),
+                SshState::NewKeys => self.do_new_keys(),
+                SshState::ServiceRequest => self.do_service_request(),
+                SshState::Authentication => self.do_authentication(),
+                SshState::ChannelOpen => self.do_channel_open(),
+                SshState::ShellRunning => self.do_shell_running(),
                 SshState::Closing => {
+                    uinfo!("sshd", "closing";);
+                    userlib::ulog::flush();
                     return;
                 }
+            };
+
+            if !ok {
+                uerror!("sshd", "state_failed"; state = state_id);
+                userlib::ulog::flush();
+                return;
             }
         }
     }
@@ -206,17 +233,15 @@ impl SshSession {
     // Read helpers
     // =========================================================================
 
-    /// Read a line from the TCP stream (for version exchange).
     fn read_line(&mut self) -> Option<Vec<u8>> {
         let mut buf = [0u8; 1];
         let mut line = Vec::new();
 
         loop {
             match self.stream.read(&mut buf) {
-                Ok(0) => return None, // EOF
+                Ok(0) => return None,
                 Ok(1) => {
                     if buf[0] == b'\n' {
-                        // Strip trailing \r if present
                         if line.last() == Some(&b'\r') {
                             line.pop();
                         }
@@ -224,7 +249,7 @@ impl SshSession {
                     }
                     line.push(buf[0]);
                     if line.len() > 255 {
-                        return None; // Line too long
+                        return None;
                     }
                 }
                 _ => return None,
@@ -232,9 +257,7 @@ impl SshSession {
         }
     }
 
-    /// Read an unencrypted SSH packet.
     fn read_packet(&mut self) -> Option<Vec<u8>> {
-        // Read 4-byte length
         let mut len_buf = [0u8; 4];
         if self.stream.read_exact(&mut len_buf).is_err() {
             return None;
@@ -244,7 +267,6 @@ impl SshSession {
             return None;
         }
 
-        // Read remaining data
         let mut data = alloc::vec![0u8; packet_length];
         if self.stream.read_exact(&mut data).is_err() {
             return None;
@@ -252,7 +274,6 @@ impl SshSession {
 
         self.rx_seqno += 1;
 
-        // Parse: padding_length(1) + payload + padding
         let padding_length = data[0] as usize;
         if padding_length + 1 > packet_length {
             return None;
@@ -261,33 +282,52 @@ impl SshSession {
         Some(data[1..1 + payload_length].to_vec())
     }
 
-    /// Read an encrypted SSH packet.
     fn read_encrypted_packet(&mut self) -> Option<Vec<u8>> {
         let rx = self.rx_transport.as_mut()?;
 
-        // Step 1: Read 4 encrypted bytes (packet_length)
+        let rx_seq = rx.seqno();
+
+        // Read the 4-byte encrypted length. This is the ONLY read that may
+        // timeout (WouldBlock) — no data consumed yet, framing stays intact.
         let mut enc_len = [0u8; 4];
-        if self.stream.read_exact(&mut enc_len).is_err() {
-            return None;
+        match self.stream.read_exact(&mut enc_len) {
+            Ok(()) => {}
+            Err(e) => {
+                // WouldBlock = timeout, no data arrived. Not an error.
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    uerror!("sshd", "recv_read_len_failed"; seq = rx_seq as u32);
+                    userlib::ulog::flush();
+                }
+                return None;
+            }
         }
 
-        // Step 2: Decrypt length to know how much more to read
         let packet_length = rx.decrypt_length(&enc_len) as usize;
         if packet_length < 1 || packet_length > 35000 {
+            uerror!("sshd", "recv_bad_pkt_len"; len = packet_length as u32, seq = rx_seq as u32);
+            userlib::ulog::flush();
             return None;
         }
 
-        // Step 3: Read encrypted payload + 16-byte Poly1305 tag
+        // Once we've read the header, the rest of the packet MUST arrive.
+        // Clear any read timeout to avoid corrupting the framing.
+        self.stream.set_read_timeout(0);
+
         let mut data = alloc::vec![0u8; packet_length + 16];
-        if self.stream.read_exact(&mut data).is_err() {
+        if let Err(_) = self.stream.read_exact(&mut data) {
+            uerror!("sshd", "recv_read_data_failed"; pkt_len = packet_length as u32);
+            userlib::ulog::flush();
             return None;
         }
 
-        // Step 4: Decrypt and verify MAC
-        rx.decrypt_packet(&enc_len, &data)
+        let result = rx.decrypt_packet(&enc_len, &data);
+        if result.is_none() {
+            uerror!("sshd", "recv_decrypt_failed"; pkt_len = packet_length as u32);
+            userlib::ulog::flush();
+        }
+        result
     }
 
-    /// Read a packet (encrypted or plaintext depending on state).
     fn recv_packet(&mut self) -> Option<Vec<u8>> {
         if self.encrypted {
             self.read_encrypted_packet()
@@ -296,25 +336,158 @@ impl SshSession {
         }
     }
 
-    /// Send a packet (encrypted or plaintext depending on state).
+    // =========================================================================
+    // Non-blocking SSH receive (buffered)
+    // =========================================================================
+
+    /// Drain any available TCP data into the SSH receive buffer.
+    ///
+    /// Non-blocking: only reads data that is already queued as CQEs.
+    /// Call this before try_recv_packet() to feed the parser.
+    fn buffer_available_tcp(&mut self) {
+        // Compact: slide unconsumed bytes to front
+        if self.ssh_rx_pos > 0 {
+            let remaining = self.ssh_rx_len - self.ssh_rx_pos;
+            self.ssh_rx.copy_within(self.ssh_rx_pos..self.ssh_rx_len, 0);
+            self.ssh_rx_len = remaining;
+            self.ssh_rx_pos = 0;
+        }
+
+        // Read whatever TCP data is immediately available
+        while self.ssh_rx_len < self.ssh_rx.len() {
+            if !self.stream.has_pending_data() {
+                break;
+            }
+            match self.stream.read(&mut self.ssh_rx[self.ssh_rx_len..]) {
+                Ok(0) => break,
+                Ok(n) => self.ssh_rx_len += n,
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Try to parse one complete SSH packet from the receive buffer.
+    ///
+    /// Returns None if insufficient data — never blocks.
+    fn try_recv_packet(&mut self) -> Option<Vec<u8>> {
+        if self.encrypted {
+            self.try_recv_encrypted_packet()
+        } else {
+            self.try_recv_plain_packet()
+        }
+    }
+
+    fn try_recv_encrypted_packet(&mut self) -> Option<Vec<u8>> {
+        let avail = self.ssh_rx_len - self.ssh_rx_pos;
+        if avail < 4 {
+            return None; // Need at least the encrypted length header
+        }
+
+        let rx = self.rx_transport.as_ref()?;
+
+        // Peek at the 4-byte encrypted length (side-effect-free)
+        let enc_len: [u8; 4] = self.ssh_rx[self.ssh_rx_pos..self.ssh_rx_pos + 4]
+            .try_into()
+            .unwrap();
+        let packet_length = rx.decrypt_length(&enc_len) as usize;
+
+        if packet_length < 1 || packet_length > 35000 {
+            uerror!("sshd", "recv_bad_pkt_len"; len = packet_length as u32);
+            userlib::ulog::flush();
+            // Skip these 4 bytes to avoid getting stuck
+            self.ssh_rx_pos += 4;
+            return None;
+        }
+
+        // Total bytes needed: 4 (header) + packet_length + 16 (poly1305 tag)
+        let total = 4 + packet_length + 16;
+        if avail < total {
+            return None; // Incomplete packet — wait for more TCP data
+        }
+
+        // We have a complete packet. Now decrypt (mutates seqno).
+        let rx = self.rx_transport.as_mut()?;
+        let body = &self.ssh_rx[self.ssh_rx_pos + 4..self.ssh_rx_pos + total];
+        let result = rx.decrypt_packet(&enc_len, body);
+        self.ssh_rx_pos += total;
+
+        if result.is_none() {
+            uerror!("sshd", "recv_decrypt_failed"; pkt_len = packet_length as u32);
+            userlib::ulog::flush();
+        }
+        result
+    }
+
+    fn try_recv_plain_packet(&mut self) -> Option<Vec<u8>> {
+        let avail = self.ssh_rx_len - self.ssh_rx_pos;
+        if avail < 4 {
+            return None;
+        }
+
+        let buf = &self.ssh_rx[self.ssh_rx_pos..self.ssh_rx_len];
+        let packet_length = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+        if packet_length < 2 || packet_length > 35000 {
+            self.ssh_rx_pos += 4;
+            return None;
+        }
+
+        let total = 4 + packet_length;
+        if avail < total {
+            return None; // Incomplete
+        }
+
+        let data = &buf[4..total];
+        let padding_length = data[0] as usize;
+        if padding_length + 1 > packet_length {
+            self.ssh_rx_pos += total;
+            return None;
+        }
+        let payload_length = packet_length - 1 - padding_length;
+        let payload = data[1..1 + payload_length].to_vec();
+        self.ssh_rx_pos += total;
+        self.rx_seqno += 1;
+        Some(payload)
+    }
+
     fn send_packet(&mut self, payload: &[u8]) -> bool {
         if self.encrypted {
             if let Some(tx) = &mut self.tx_transport {
+                let seq_before = tx.seqno();
                 let mut out = [0u8; 8192];
                 let n = tx.encrypt_packet(payload, &mut out);
                 if n == 0 {
+                    uerror!("sshd", "encrypt_failed"; payload_len = payload.len() as u32);
+                    userlib::ulog::flush();
                     return false;
                 }
-                self.stream.write_all(&out[..n]).is_ok()
+
+                // Log first encrypted CHANNEL_DATA packets for diagnosis.
+                if self.tx_diag_count < 3 && payload.len() > 0 && payload[0] == ssh::msg::CHANNEL_DATA {
+                    // Log first 16 bytes of encrypted output + seqno
+                    let h0 = if n > 0 { out[0] } else { 0 };
+                    let h1 = if n > 1 { out[1] } else { 0 };
+                    let h2 = if n > 2 { out[2] } else { 0 };
+                    let h3 = if n > 3 { out[3] } else { 0 };
+                    udebug!("sshd", "tx_enc"; seq = seq_before as u32, plain_len = payload.len() as u32, enc_len = n as u32,
+                        h0 = h0 as u32, h1 = h1 as u32, h2 = h2 as u32, h3 = h3 as u32);
+                    self.tx_diag_count += 1;
+                }
+
+                match self.stream.write_all(&out[..n]) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        uerror!("sshd", "write_all_failed"; enc_len = n as u32, kind = e.kind() as u8 as u32);
+                        userlib::ulog::flush();
+                        false
+                    }
+                }
             } else {
                 false
             }
         } else {
             let mut out = [0u8; 8192];
             let n = ssh::frame_packet(payload, &mut out);
-            if n == 0 {
-                return false;
-            }
+            if n == 0 { return false; }
             self.tx_seqno += 1;
             self.stream.write_all(&out[..n]).is_ok()
         }
@@ -325,7 +498,6 @@ impl SshSession {
     // =========================================================================
 
     fn do_protocol_exchange(&mut self) -> bool {
-        // Read client version string
         let line = match self.read_line() {
             Some(l) => l,
             None => return false,
@@ -341,18 +513,14 @@ impl SshSession {
 
         udebug!("sshd", "client_version_ok";);
 
-        // Generate ephemeral key for this session
-        // Use a simple counter-based seed (in production, use hardware RNG)
-        let time = userlib::syscall::gettime();
+        let time = syscall::gettime();
         let mut seed_material = [0u8; 64];
         seed_material[..8].copy_from_slice(&time.to_le_bytes());
         seed_material[8..40].copy_from_slice(&self.host_key_seed);
-        // Mix with SHA-256 to get ephemeral secret
         self.server_ephemeral_secret = crypto::sha256(&seed_material);
         self.server_ephemeral_public = crypto::x25519_public(&self.server_ephemeral_secret);
 
-        // Send KEXINIT
-        let cookie = crypto::sha256(b"sshd_cookie"); // deterministic for now
+        let cookie = crypto::sha256(b"sshd_cookie");
         let mut kexinit = [0u8; 512];
         let n = ssh::build_kexinit(&mut kexinit, &cookie[..16].try_into().unwrap());
         self.server_kexinit_payload = kexinit[..n].to_vec();
@@ -366,7 +534,6 @@ impl SshSession {
     }
 
     fn do_algorithm_negotiation(&mut self) -> bool {
-        // Read client KEXINIT
         let payload = match self.recv_packet() {
             Some(p) => p,
             None => return false,
@@ -384,7 +551,6 @@ impl SshSession {
     }
 
     fn do_key_exchange(&mut self) -> bool {
-        // Read KEX_ECDH_INIT from client
         let payload = match self.recv_packet() {
             Some(p) => p,
             None => return false,
@@ -394,7 +560,6 @@ impl SshSession {
             return false;
         }
 
-        // Parse client's ephemeral public key Q_C
         let (q_c_data, _) = match ssh::read_string(&payload[1..]) {
             Some(r) => r,
             None => return false,
@@ -406,14 +571,11 @@ impl SshSession {
         let mut q_c = [0u8; 32];
         q_c.copy_from_slice(q_c_data);
 
-        // Compute shared secret K = X25519(server_secret, client_public)
         let shared_secret = crypto::x25519(&self.server_ephemeral_secret, &q_c);
 
-        // Build host key blob
         let mut k_s = [0u8; 64];
         let k_s_len = ssh::build_host_key_blob(&self.host_key_public, &mut k_s);
 
-        // Compute exchange hash H
         let h = ssh::compute_exchange_hash(
             &self.client_version[..self.client_version_len],
             ssh::SSH_VERSION,
@@ -425,16 +587,13 @@ impl SshSession {
             &shared_secret,
         );
 
-        // Set session ID (first exchange hash)
         if !self.session_id_set {
             self.session_id = h;
             self.session_id_set = true;
         }
 
-        // Sign the exchange hash with host key
         let signature = crypto::ed25519_sign(&self.host_key_seed, &h);
 
-        // Send KEX_ECDH_REPLY
         let mut reply = [0u8; 512];
         let reply_len = ssh::build_kex_reply(
             &k_s[..k_s_len],
@@ -446,28 +605,20 @@ impl SshSession {
             return false;
         }
 
-        // Send NEWKEYS
         if !self.send_packet(&[ssh::msg::NEWKEYS]) {
             return false;
         }
 
-        // Derive encryption keys (64 bytes each for chacha20-poly1305@openssh.com)
-        // Key c2s = HASH(K||H||'C'||sid) || HASH(K||H||K1)  (64 bytes: main + header)
-        // Key s2c = HASH(K||H||'D'||sid) || HASH(K||H||K1)  (64 bytes: main + header)
         let key_c2s = ssh::derive_key_64(&shared_secret, &h, b'C', &self.session_id);
         let key_s2c = ssh::derive_key_64(&shared_secret, &h, b'D', &self.session_id);
 
-        // seqno tracks all binary packets sent/received.
-        // TX: KEXINIT(0) + KEX_REPLY(1) + NEWKEYS(2) already sent → tx_seqno is 3
-        // RX: KEXINIT(0) + KEX_INIT(1) received → rx_seqno is 2, client NEWKEYS
-        //     will be received in do_new_keys (incrementing to 3)
         self.tx_transport = Some(ssh::EncryptedTransport::new(
             &key_s2c,
-            self.tx_seqno, // NEWKEYS already sent and counted
+            self.tx_seqno,
         ));
         self.rx_transport = Some(ssh::EncryptedTransport::new(
             &key_c2s,
-            self.rx_seqno + 1, // +1 for the client's NEWKEYS we'll receive next
+            self.rx_seqno + 1,
         ));
 
         self.state = SshState::NewKeys;
@@ -477,7 +628,6 @@ impl SshSession {
     }
 
     fn do_new_keys(&mut self) -> bool {
-        // Read client NEWKEYS
         let payload = match self.recv_packet() {
             Some(p) => p,
             None => return false,
@@ -487,7 +637,6 @@ impl SshSession {
             return false;
         }
 
-        // Switch to encrypted transport
         self.encrypted = true;
         self.state = SshState::ServiceRequest;
 
@@ -514,7 +663,6 @@ impl SshSession {
             return false;
         }
 
-        // Send SERVICE_ACCEPT
         let mut resp = [0u8; 64];
         resp[0] = ssh::msg::SERVICE_ACCEPT;
         let n = 1 + ssh::write_string(&mut resp[1..], b"ssh-userauth");
@@ -540,7 +688,6 @@ impl SshSession {
 
         let rest = &payload[1..];
 
-        // Parse: user(string) + service(string) + method(string) + ...
         let (username, rest) = match ssh::read_string(rest) {
             Some(r) => r,
             None => return false,
@@ -555,19 +702,6 @@ impl SshSession {
         };
 
         if method == b"none" {
-            // Reject "none" method, tell client what we support
-            let mut resp = [0u8; 64];
-            resp[0] = ssh::msg::USERAUTH_FAILURE;
-            let n = 1 + ssh::write_string(&mut resp[1..], b"password");
-            resp[n] = 0; // partial success = false
-            if !self.send_packet(&resp[..n + 1]) {
-                return false;
-            }
-            return true; // Stay in Authentication state
-        }
-
-        if method != b"password" {
-            // Reject unsupported methods
             let mut resp = [0u8; 64];
             resp[0] = ssh::msg::USERAUTH_FAILURE;
             let n = 1 + ssh::write_string(&mut resp[1..], b"password");
@@ -578,11 +712,21 @@ impl SshSession {
             return true;
         }
 
-        // Password method: boolean(change_password) + string(password)
+        if method != b"password" {
+            let mut resp = [0u8; 64];
+            resp[0] = ssh::msg::USERAUTH_FAILURE;
+            let n = 1 + ssh::write_string(&mut resp[1..], b"password");
+            resp[n] = 0;
+            if !self.send_packet(&resp[..n + 1]) {
+                return false;
+            }
+            return true;
+        }
+
         if rest.is_empty() {
             return false;
         }
-        let _change = rest[0]; // false expected
+        let _change = rest[0];
         let (password, _) = match ssh::read_string(&rest[1..]) {
             Some(r) => r,
             None => return false,
@@ -590,6 +734,7 @@ impl SshSession {
 
         if password == DEV_PASSWORD {
             uinfo!("sshd", "auth_ok"; user_len = username.len() as u32);
+            userlib::ulog::flush();
             if !self.send_packet(&[ssh::msg::USERAUTH_SUCCESS]) {
                 return false;
             }
@@ -611,10 +756,15 @@ impl SshSession {
     fn do_channel_open(&mut self) -> bool {
         let payload = match self.recv_packet() {
             Some(p) => p,
-            None => return false,
+            None => {
+                uinfo!("sshd", "channel_open_recv_failed";);
+                userlib::ulog::flush();
+                return false;
+            }
         };
 
         if payload.is_empty() {
+            uinfo!("sshd", "channel_open_empty";);
             return false;
         }
 
@@ -647,20 +797,18 @@ impl SshSession {
                 self.local_channel_id = 0;
                 self.remote_window = initial_window;
 
-                // Send CHANNEL_OPEN_CONFIRMATION
                 let mut resp = [0u8; 32];
                 resp[0] = ssh::msg::CHANNEL_OPEN_CONFIRMATION;
                 let mut pos = 1;
-                pos += ssh::write_u32(&mut resp[pos..], sender_channel); // recipient channel
-                pos += ssh::write_u32(&mut resp[pos..], self.local_channel_id); // sender channel
-                pos += ssh::write_u32(&mut resp[pos..], 32768); // initial window
+                pos += ssh::write_u32(&mut resp[pos..], sender_channel);
+                pos += ssh::write_u32(&mut resp[pos..], self.local_channel_id);
+                pos += ssh::write_u32(&mut resp[pos..], LOCAL_WINDOW_SIZE);
                 pos += ssh::write_u32(&mut resp[pos..], 32768); // max packet size
                 if !self.send_packet(&resp[..pos]) {
                     return false;
                 }
 
                 udebug!("sshd", "channel_opened";);
-                // Stay in ChannelOpen to wait for shell/exec request
                 true
             }
             ssh::msg::CHANNEL_REQUEST => {
@@ -674,7 +822,7 @@ impl SshSession {
                 }
                 true
             }
-            _ => true, // Ignore unknown messages
+            _ => true,
         }
     }
 
@@ -689,10 +837,20 @@ impl SshSession {
             None => return false,
         };
         let want_reply = if !rest.is_empty() { rest[0] != 0 } else { false };
+        let body = if rest.len() > 1 { &rest[1..] } else { &[] };
 
         match request_type {
             b"pty-req" => {
-                // Accept PTY request (we don't actually do anything with it)
+                // Parse: TERM(string) + cols(u32) + rows(u32) + ...
+                if let Some((_term, rest2)) = ssh::read_string(body) {
+                    if let Some((cols, rest3)) = ssh::read_u32(rest2) {
+                        if let Some((rows, _)) = ssh::read_u32(rest3) {
+                            if cols > 0 && cols <= 500 { self.pty_cols = cols as u16; }
+                            if rows > 0 && rows <= 500 { self.pty_rows = rows as u16; }
+                        }
+                    }
+                }
+
                 if want_reply {
                     let mut resp = [0u8; 8];
                     resp[0] = ssh::msg::CHANNEL_SUCCESS;
@@ -708,29 +866,54 @@ impl SshSession {
                     ssh::write_u32(&mut resp[1..], self.remote_channel_id);
                     self.send_packet(&resp[..5]);
                 }
+
+                // Spawn shell via exec_with_mailbox + SharedPipe
+                if !self.spawn_shell() {
+                    self.send_channel_data(b"Failed to spawn shell\r\n");
+                    self.state = SshState::Closing;
+                    return true;
+                }
+
                 self.state = SshState::ShellRunning;
-
-                // Send banner and prompt
-                self.send_channel_data(b"FilamentOS remote shell\r\nType 'help' for commands.\r\n$ ");
-
                 uinfo!("sshd", "shell_started";);
+                userlib::ulog::flush();
+                true
+            }
+            b"window-change" => {
+                // Parse: cols(u32) + rows(u32) + ...
+                if let Some((cols, rest2)) = ssh::read_u32(body) {
+                    if let Some((rows, _)) = ssh::read_u32(rest2) {
+                        if cols > 0 && cols <= 500 { self.pty_cols = cols as u16; }
+                        if rows > 0 && rows <= 500 { self.pty_rows = rows as u16; }
+
+                        // Write SIZE message to ring RX
+                        if let Some(ring) = &self.shell_ring {
+                            let mut msg = [0u8; 32];
+                            let mut i = 0;
+                            for &b in b"SIZE " { msg[i] = b; i += 1; }
+                            i += fmt_u16(&mut msg[i..], cols as u16);
+                            msg[i] = b' '; i += 1;
+                            i += fmt_u16(&mut msg[i..], rows as u16);
+                            msg[i] = b'\n'; i += 1;
+                            ring.push(&msg[..i]);
+                            ring.notify();
+                        }
+                    }
+                }
+                // window-change never wants a reply
                 true
             }
             b"exec" => {
-                // For SCP support: exec a command
                 if want_reply {
                     let mut resp = [0u8; 8];
                     resp[0] = ssh::msg::CHANNEL_SUCCESS;
                     ssh::write_u32(&mut resp[1..], self.remote_channel_id);
                     self.send_packet(&resp[..5]);
                 }
-                // TODO: implement exec for SCP
                 true
             }
             _ => {
-                // Unknown request — reject if reply wanted
                 if want_reply {
-                    // CHANNEL_FAILURE = 100
                     let mut resp = [0u8; 8];
                     resp[0] = 100; // CHANNEL_FAILURE
                     ssh::write_u32(&mut resp[1..], self.remote_channel_id);
@@ -741,20 +924,193 @@ impl SshSession {
         }
     }
 
-    fn do_shell_running(&mut self) -> bool {
-        // Bridge SSH channel data ↔ shell IPC
-        let payload = match self.recv_packet() {
-            Some(p) => p,
-            None => return false,
+    // =========================================================================
+    // Shell spawn + bridge
+    // =========================================================================
+
+    /// Spawn shell as child process via exec_with_mailbox.
+    fn spawn_shell(&mut self) -> bool {
+        // Create shared pipe for shell I/O (64K output, 4K input)
+        let ring = match SharedPipe::console() {
+            Some(r) => r,
+            None => {
+                uerror!("sshd", "ring_create_failed";);
+                return false;
+            }
         };
 
+        // Build mailbox
+        let mut mailbox = [0u8; 73];
+        mailbox[0..4].copy_from_slice(&0x4D424F58u32.to_le_bytes()); // "MBOX"
+        mailbox[4..6].copy_from_slice(&1u16.to_le_bytes()); // version
+        mailbox[64..68].copy_from_slice(&ring.shmem_id().to_le_bytes());
+        mailbox[68..70].copy_from_slice(&self.pty_cols.to_le_bytes());
+        mailbox[70..72].copy_from_slice(&self.pty_rows.to_le_bytes());
+        mailbox[72] = 0x01; // flags: bit 0 = SSH transport (enable diagnostics)
+
+        let caps = userlib::devd::caps::USER_ADMIN;
+        match syscall::exec_with_mailbox("shell", caps, &mailbox) {
+            Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
+                ring.allow(child_pid);
+                uinfo!("sshd", "shell_spawned"; pid = child_pid);
+                userlib::ulog::flush();
+                self.superq = Some(SupervisionHandle::from_handle(parent_superq_handle));
+                self.shell_pid = Some(child_pid);
+                self.shell_ring = Some(ring);
+                true
+            }
+            Err(e) => {
+                uerror!("sshd", "shell_spawn_failed"; err = e as i32);
+                userlib::ulog::flush();
+                false
+            }
+        }
+    }
+
+    /// Shell running — bridge SSH ↔ SharedPipe.
+    ///
+    /// Multiplexes pipe output and TCP input using a Mux. Pipe data and
+    /// TCP data are both processed non-blockingly each iteration. recv_packet
+    /// never blocks because TCP bytes are buffered incrementally and SSH
+    /// packets are parsed only when complete.
+    fn do_shell_running(&mut self) -> bool {
+        uinfo!("sshd", "shell_loop_enter";);
+        userlib::ulog::flush();
+
+        // Diagnostic: send a known test string to verify the data path.
+        let test_sent = self.send_channel_data(b"[sshd: data path test]\r\n");
+        udebug!("sshd", "test_probe"; sent = test_sent, window = self.remote_window, pool = self.stream.pool_remaining());
+        userlib::ulog::flush();
+
+        // Create a Mux to watch pipe shmem, TCP DataPort, and SuperQ.
+        let mux = match Mux::new() {
+            Ok(m) => m,
+            Err(_) => {
+                uerror!("sshd", "mux_create_failed";);
+                return false;
+            }
+        };
+
+        let tcp_handle = self.stream.poll_handle();
+        let pipe_handle = self.shell_ring.as_ref().map(|r| r.handle()).unwrap_or(Handle::INVALID);
+        let superq_handle = self.superq.as_ref().map(|s| s.handle()).unwrap_or(Handle::INVALID);
+
+        let _ = mux.add(tcp_handle, MuxFilter::Readable);
+        if pipe_handle != Handle::INVALID {
+            let _ = mux.add(pipe_handle, MuxFilter::Readable);
+        }
+        if superq_handle != Handle::INVALID {
+            let _ = mux.add(superq_handle, MuxFilter::Readable);
+        }
+
+        udebug!("sshd", "mux_handles"; tcp = tcp_handle.0, pipe = pipe_handle.0, superq = superq_handle.0);
+        userlib::ulog::flush();
+
+        let _ = mux.set_timeout(100);
+        let mut loop_count = 0u32;
+        let mut pipe_wake_count = 0u32;
+        let mut tcp_wake_count = 0u32;
+        let mut timeout_count = 0u32;
+
+        loop {
+            loop_count += 1;
+
+            // Periodic status every ~5s (50 iterations at 100ms timeout)
+            if loop_count % 50 == 0 {
+                let pipe_readable = self.shell_ring.as_ref().map(|r| r.readable()).unwrap_or(0);
+                let pipe_writable = self.shell_ring.as_ref().map(|r| r.writable()).unwrap_or(0);
+                udebug!("sshd", "loop_status"; iter = loop_count,
+                    pipe_rd = pipe_readable, pipe_wr = pipe_writable,
+                    window = self.remote_window, ssh_buf = self.ssh_rx_len - self.ssh_rx_pos,
+                    pipe_w = pipe_wake_count, tcp_w = tcp_wake_count, tmo = timeout_count);
+                userlib::ulog::flush();
+                pipe_wake_count = 0;
+                tcp_wake_count = 0;
+                timeout_count = 0;
+            }
+
+            // 1. Drain pipe → SSH (non-blocking)
+            if !self.drain_ring_tx() {
+                uerror!("sshd", "drain_tx_failed";);
+                userlib::ulog::flush();
+                return false;
+            }
+
+            // 2. Buffer any available TCP data (non-blocking)
+            self.buffer_available_tcp();
+
+            // 3. Parse and process complete SSH packets from buffer
+            loop {
+                match self.try_recv_packet() {
+                    Some(payload) => {
+                        if !self.handle_shell_packet(&payload) {
+                            if self.state == SshState::Closing {
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            // 4. Check for EOF after buffering
+            if self.stream.is_eof() && self.ssh_rx_pos >= self.ssh_rx_len {
+                uinfo!("sshd", "shell_tcp_eof";);
+                userlib::ulog::flush();
+                return false;
+            }
+
+            // 5. Check for state transition
+            if self.state != SshState::ShellRunning {
+                return true;
+            }
+
+            // 6. Check for child exit via SuperQ (non-blocking)
+            if let Some(superq) = &self.superq {
+                if let Ok(Some(_note)) = superq.try_recv() {
+                    let _ = self.drain_ring_tx();
+                    uinfo!("sshd", "shell_exited_superq";);
+                    userlib::ulog::flush();
+                    self.send_channel_data(b"\r\n[Shell exited]\r\n");
+                    let mut resp = [0u8; 8];
+                    resp[0] = ssh::msg::CHANNEL_CLOSE;
+                    ssh::write_u32(&mut resp[1..], self.remote_channel_id);
+                    self.send_packet(&resp[..5]);
+                    self.state = SshState::Closing;
+                    return true;
+                }
+            }
+
+            // 7. Wait for activity on any watched handle (100ms timeout)
+            match mux.wait() {
+                Ok(event) => {
+                    if event.handle == pipe_handle {
+                        pipe_wake_count += 1;
+                    } else if event.handle == tcp_handle {
+                        tcp_wake_count += 1;
+                    } else if event.is_signal() {
+                        // signal, not counted
+                    }
+                }
+                Err(_) => {
+                    timeout_count += 1;
+                }
+            }
+        }
+    }
+
+    /// Process a single SSH packet during shell-running state.
+    /// Returns true to continue, false to stop (state changed or error).
+    fn handle_shell_packet(&mut self, payload: &[u8]) -> bool {
         if payload.is_empty() {
+            uerror!("sshd", "shell_empty_payload";);
+            userlib::ulog::flush();
             return false;
         }
 
         match payload[0] {
             ssh::msg::CHANNEL_DATA => {
-                // Data from SSH client → shell
                 let rest = &payload[1..];
                 let (_channel, rest) = match ssh::read_u32(rest) {
                     Some(r) => r,
@@ -765,237 +1121,202 @@ impl SshSession {
                     None => return false,
                 };
 
-                self.process_shell_input(data)
+                // Signal relay
+                if let Some(pid) = self.shell_pid {
+                    for &b in data {
+                        if b == 0x03 {
+                            let _ = syscall::signal(pid, syscall::signal_event::INTERRUPT, 0);
+                        }
+                    }
+                }
+
+                // Forward client input to shell
+                if let Some(ring) = &self.shell_ring {
+                    ring.push(data);
+                    ring.notify();
+                }
+
+                // Track bytes consumed so we can replenish the client's window.
+                self.local_consumed += data.len() as u32;
+                self.send_window_adjust();
+                true
             }
             ssh::msg::CHANNEL_WINDOW_ADJUST => {
                 if payload.len() >= 9 {
                     let (_, rest) = ssh::read_u32(&payload[1..]).unwrap();
                     let (bytes, _) = ssh::read_u32(rest).unwrap();
+                    let old_window = self.remote_window;
                     self.remote_window = self.remote_window.saturating_add(bytes);
+                    udebug!("sshd", "window_adjust"; added = bytes, old = old_window, new = self.remote_window);
                 }
                 true
             }
+            ssh::msg::CHANNEL_REQUEST => {
+                self.handle_channel_request(payload)
+            }
             ssh::msg::CHANNEL_EOF | ssh::msg::CHANNEL_CLOSE => {
-                // Client closed the channel
+                if let Some(pid) = self.shell_pid {
+                    let _ = syscall::signal(pid, syscall::signal_event::SHUTDOWN, 0);
+                }
                 let mut resp = [0u8; 8];
                 resp[0] = ssh::msg::CHANNEL_CLOSE;
                 ssh::write_u32(&mut resp[1..], self.remote_channel_id);
                 self.send_packet(&resp[..5]);
                 self.state = SshState::Closing;
-                true
+                false
             }
             _ => true,
         }
     }
 
-    /// Process input data from SSH client, send to shell.
-    fn process_shell_input(&mut self, data: &[u8]) -> bool {
-        // Accumulate data until we get a line
-        for &b in data {
-            match b {
-                b'\r' | b'\n' => {
-                    if self.read_buf.is_empty() {
-                        self.send_channel_data(b"\r\n$ ");
-                        continue;
-                    }
-
-                    // Echo the newline
-                    self.send_channel_data(b"\r\n");
-
-                    let cmd = core::mem::take(&mut self.read_buf);
-                    self.execute_command(&cmd);
-                }
-                0x7F | 0x08 => {
-                    // Backspace
-                    if !self.read_buf.is_empty() {
-                        self.read_buf.pop();
-                        self.send_channel_data(b"\x08 \x08");
-                    }
-                }
-                0x03 => {
-                    // Ctrl-C
-                    self.read_buf.clear();
-                    self.send_channel_data(b"^C\r\n$ ");
-                }
-                0x04 => {
-                    // Ctrl-D → close
-                    self.state = SshState::Closing;
-                    return true;
-                }
-                _ if b >= 0x20 => {
-                    self.read_buf.push(b);
-                    // Echo
-                    self.send_channel_data(&[b]);
-                }
-                _ => {} // Ignore other control chars
-            }
-        }
-        true
-    }
-
-    /// Execute a command directly using syscalls.
+    /// Drain shell pipe → SSH channel data.
     ///
-    /// No IPC to shell — avoids blocking the shell's console and deadlocks.
-    /// Implements basic commands for remote management.
-    fn execute_command(&mut self, cmd: &[u8]) {
-        let cmd = trim(cmd);
-        if cmd.is_empty() {
-            self.send_channel_data(b"$ ");
-            return;
-        }
-
-        let (verb, args) = split_first_word(cmd);
-
-        match verb {
-            b"exit" | b"quit" => {
-                self.send_channel_data(b"Goodbye.\r\n");
-                self.state = SshState::Closing;
-                return;
+    /// Accumulates all available pipe data first, then sends in one shot.
+    /// This coalesces many small shell writes (decoration, per-character
+    /// output) into a single SSH packet instead of one packet per write.
+    /// Returns false if the connection is broken.
+    fn drain_ring_tx(&mut self) -> bool {
+        // First, flush any residual data from a previous partial send.
+        if self.tx_residual_len > self.tx_residual_off {
+            if self.remote_window == 0 {
+                return true; // Can't send yet — wait for WINDOW_ADJUST
             }
-            b"help" | b"?" => self.cmd_help(),
-            b"ps" => self.cmd_ps(),
-            b"uptime" => self.cmd_uptime(),
-            b"ls" => self.cmd_ls(),
-            b"kill" => self.cmd_kill(args),
-            b"uname" => { self.send_channel_data(b"FilamentOS 0.1 aarch64 MT7988A\r\n"); }
-            _ => {
-                self.send_channel_data(b"Unknown command. Type 'help' for available commands.\r\n");
+            let remaining = self.tx_residual_len - self.tx_residual_off;
+            let mut tmp = [0u8; 4096];
+            tmp[..remaining].copy_from_slice(
+                &self.tx_residual[self.tx_residual_off..self.tx_residual_len]
+            );
+            let sent = self.send_channel_data(&tmp[..remaining]);
+            self.tx_residual_off += sent;
+            if self.tx_residual_off < self.tx_residual_len {
+                return true; // Window or pool exhausted — retry after next mux wake
+            }
+            self.tx_residual_len = 0;
+            self.tx_residual_off = 0;
+        }
+
+        // Accumulate all available pipe data before sending. This is the
+        // key optimization: the shell writes many small fragments (ANSI
+        // escapes, per-row cursor ops, individual characters). By draining
+        // the entire pipe first, we coalesce them into one or two SSH
+        // packets instead of dozens of 1-byte packets.
+        let mut tx_buf = [0u8; 4096];
+        let mut total = 0usize;
+
+        if let Some(ring) = &self.shell_ring {
+            loop {
+                let n = ring.pull(&mut tx_buf[total..]);
+                if n == 0 { break; }
+                total += n;
+                // Stop if buffer is nearly full — leave room for next pull
+                if total >= tx_buf.len() - 256 { break; }
+            }
+            if total > 0 {
+                ring.notify(); // Signal shell that pipe space is available
             }
         }
 
-        self.send_channel_data(b"$ ");
-    }
-
-    fn cmd_help(&mut self) {
-        self.send_channel_data(
-            b"Commands:\r\n\
-              \x20 help      Show this help\r\n\
-              \x20 ps        Process list\r\n\
-              \x20 uptime    System uptime\r\n\
-              \x20 ls        List ramfs files\r\n\
-              \x20 kill N    Kill process by PID\r\n\
-              \x20 uname     System info\r\n\
-              \x20 exit      Close session\r\n"
-        );
-    }
-
-    fn cmd_ps(&mut self) {
-        let mut procs = [syscall::ProcessInfo::empty(); 32];
-        let count = syscall::ps_info(&mut procs);
-
-        let mut out = [0u8; 2048];
-        let mut pos = 0;
-        pos += copy_str(&mut out[pos..], "PID  PPID  CPU  STATE     NAME\r\n");
-
-        for i in 0..count {
-            let p = &procs[i];
-            pos += fmt_u32_pad(&mut out[pos..], p.pid, 3);
-            pos += copy_str(&mut out[pos..], "  ");
-            pos += fmt_u32_pad(&mut out[pos..], p.ppid, 4);
-            pos += copy_str(&mut out[pos..], "  ");
-            pos += fmt_u32_pad(&mut out[pos..], p.cpu as u32, 3);
-            pos += copy_str(&mut out[pos..], "  ");
-            let state = p.state_str();
-            pos += copy_str(&mut out[pos..], state);
-            for _ in state.len()..10 {
-                if pos < out.len() { out[pos] = b' '; pos += 1; }
-            }
-            let name = name_str(&p.name);
-            pos += copy_bytes(&mut out[pos..], name);
-            pos += copy_str(&mut out[pos..], "\r\n");
-            if pos > out.len() - 64 { break; }
-        }
-        self.send_channel_data(&out[..pos]);
-    }
-
-    fn cmd_uptime(&mut self) {
-        let ns = syscall::gettime();
-        let secs = ns / 1_000_000_000;
-        let mins = secs / 60;
-        let hours = mins / 60;
-
-        let mut out = [0u8; 64];
-        let mut pos = 0;
-        pos += copy_str(&mut out[pos..], "Up ");
-        if hours > 0 {
-            pos += fmt_u64(&mut out[pos..], hours);
-            pos += copy_str(&mut out[pos..], "h ");
-        }
-        if mins > 0 || hours > 0 {
-            pos += fmt_u64(&mut out[pos..], mins % 60);
-            pos += copy_str(&mut out[pos..], "m ");
-        }
-        pos += fmt_u64(&mut out[pos..], secs % 60);
-        pos += copy_str(&mut out[pos..], "s\r\n");
-        self.send_channel_data(&out[..pos]);
-    }
-
-    fn cmd_ls(&mut self) {
-        let mut entries = [syscall::RamfsListEntry::empty(); 32];
-        let count = syscall::ramfs_list(&mut entries);
-        if count < 0 {
-            self.send_channel_data(b"ramfs_list failed\r\n");
-            return;
-        }
-
-        let mut out = [0u8; 2048];
-        let mut pos = 0;
-        for i in 0..count as usize {
-            let e = &entries[i];
-            let name = e.name_str();
-            pos += copy_bytes(&mut out[pos..], name);
-            for _ in name.len()..20 {
-                if pos < out.len() { out[pos] = b' '; pos += 1; }
-            }
-            pos += fmt_u64(&mut out[pos..], e.size);
-            pos += copy_str(&mut out[pos..], "\r\n");
-            if pos > out.len() - 128 { break; }
-        }
-        if count == 0 {
-            pos += copy_str(&mut out[pos..], "(empty)\r\n");
-        }
-        self.send_channel_data(&out[..pos]);
-    }
-
-    fn cmd_kill(&mut self, args: &[u8]) {
-        let args = trim(args);
-        if args.is_empty() {
-            self.send_channel_data(b"Usage: kill <pid>\r\n");
-            return;
-        }
-
-        let pid = parse_u32(args);
-        if pid == 0 {
-            self.send_channel_data(b"Invalid PID\r\n");
-            return;
-        }
-
-        let ret = syscall::kill(pid);
-        let mut out = [0u8; 64];
-        let mut pos = 0;
-        if ret == 0 {
-            pos += copy_str(&mut out[pos..], "Killed PID ");
-            pos += fmt_u64(&mut out[pos..], pid as u64);
-            pos += copy_str(&mut out[pos..], "\r\n");
-        } else {
-            pos += copy_str(&mut out[pos..], "kill failed\r\n");
-        }
-        self.send_channel_data(&out[..pos]);
-    }
-
-
-    /// Send data on the SSH channel.
-    fn send_channel_data(&mut self, data: &[u8]) -> bool {
-        if data.is_empty() {
+        if total == 0 {
             return true;
         }
 
-        let mut pkt = [0u8; 4128];
-        pkt[0] = ssh::msg::CHANNEL_DATA;
+        // If window is exhausted, stash everything for later.
+        if self.remote_window == 0 {
+            self.tx_residual[..total].copy_from_slice(&tx_buf[..total]);
+            self.tx_residual_len = total;
+            self.tx_residual_off = 0;
+            udebug!("sshd", "drain_stall_window"; stashed = total as u32, window = 0u32);
+            return true;
+        }
+
+        let sent = self.send_channel_data(&tx_buf[..total]);
+
+        // Stash unsent bytes so we don't lose them.
+        if sent < total {
+            let leftover = total - sent;
+            self.tx_residual[..leftover].copy_from_slice(&tx_buf[sent..total]);
+            self.tx_residual_len = leftover;
+            self.tx_residual_off = 0;
+        }
+
+        udebug!("sshd", "drain_ok"; pulled = total as u32, sent = sent as u32,
+            window = self.remote_window, pool = self.stream.pool_remaining());
+
+        true
+    }
+
+    /// Send data on the SSH channel, respecting the remote window.
+    ///
+    /// Chunks large payloads to fit within pool slots. Stops early if
+    /// the remote window is exhausted or the TCP pool is full — caller
+    /// should stash unsent bytes and retry after the next Mux wake.
+    /// Returns the number of bytes actually sent (may be partial).
+    /// Returns 0 only on genuine connection error (encrypted write failed).
+    fn send_channel_data(&mut self, data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+
+        // Max data per SSH packet (see pool slot size constraints).
+        const MAX_CHUNK: usize = 1024;
+
+        let mut offset = 0;
+        let mut packets = 0u32;
+        while offset < data.len() {
+            // Respect the remote window — stop if exhausted.
+            if self.remote_window == 0 {
+                break;
+            }
+
+            // Check TCP pool capacity before building the packet.
+            // Each encrypted SSH packet uses one 2048-byte pool slot.
+            // If fewer than 2 slots remain, yield to let ipd post TX_DONEs.
+            let pool_free = self.stream.pool_remaining();
+            if pool_free < 2 {
+                break;
+            }
+
+            let remaining = data.len() - offset;
+            let chunk = remaining
+                .min(MAX_CHUNK)
+                .min(self.remote_window as usize);
+
+            let mut pkt = [0u8; 1100];
+            pkt[0] = ssh::msg::CHANNEL_DATA;
+            let mut pos = 1;
+            pos += ssh::write_u32(&mut pkt[pos..], self.remote_channel_id);
+            pos += ssh::write_string(&mut pkt[pos..], &data[offset..offset + chunk]);
+            if !self.send_packet(&pkt[..pos]) {
+                return if offset > 0 { offset } else { 0 };
+            }
+
+            self.remote_window -= chunk as u32;
+            offset += chunk;
+            packets += 1;
+        }
+
+        if offset > 0 {
+            udebug!("sshd", "chan_data_tx"; offered = data.len() as u32,
+                sent = offset as u32, pkts = packets,
+                window = self.remote_window, pool = self.stream.pool_remaining());
+        }
+
+        offset
+    }
+
+    /// Send WINDOW_ADJUST to let the client send more data.
+    fn send_window_adjust(&mut self) {
+        if self.local_consumed < WINDOW_ADJUST_THRESHOLD {
+            return;
+        }
+
+        let mut pkt = [0u8; 16];
+        pkt[0] = ssh::msg::CHANNEL_WINDOW_ADJUST;
         let mut pos = 1;
         pos += ssh::write_u32(&mut pkt[pos..], self.remote_channel_id);
-        pos += ssh::write_string(&mut pkt[pos..], data);
-        self.send_packet(&pkt[..pos])
+        pos += ssh::write_u32(&mut pkt[pos..], self.local_consumed);
+        self.send_packet(&pkt[..pos]);
+        self.local_consumed = 0;
     }
 }
 
@@ -1003,81 +1324,25 @@ impl SshSession {
 // Helpers
 // =============================================================================
 
-fn trim(s: &[u8]) -> &[u8] {
-    let start = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
-    let end = s.iter().rposition(|&b| b != b' ' && b != b'\t').map(|p| p + 1).unwrap_or(start);
-    &s[start..end]
-}
-
-fn split_first_word(s: &[u8]) -> (&[u8], &[u8]) {
-    if let Some(pos) = s.iter().position(|&b| b == b' ' || b == b'\t') {
-        (&s[..pos], &s[pos + 1..])
-    } else {
-        (s, &[])
-    }
-}
-
-fn copy_str(dst: &mut [u8], s: &str) -> usize {
-    let len = s.len().min(dst.len());
-    dst[..len].copy_from_slice(&s.as_bytes()[..len]);
-    len
-}
-
-fn copy_bytes(dst: &mut [u8], s: &[u8]) -> usize {
-    let len = s.len().min(dst.len());
-    dst[..len].copy_from_slice(&s[..len]);
-    len
-}
-
-fn fmt_u64(buf: &mut [u8], val: u64) -> usize {
-    if val == 0 {
+fn fmt_u16(buf: &mut [u8], n: u16) -> usize {
+    if n == 0 {
         if !buf.is_empty() { buf[0] = b'0'; }
         return 1;
     }
-    let mut tmp = [0u8; 20];
-    let mut v = val;
-    let mut i = 0;
-    while v > 0 {
-        tmp[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        i += 1;
+    let mut tmp = [0u8; 5];
+    let mut val = n;
+    let mut len = 0;
+    while val > 0 {
+        tmp[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
     }
-    let len = i.min(buf.len());
-    for j in 0..len {
-        buf[j] = tmp[i - 1 - j];
+    for i in 0..len {
+        if i < buf.len() {
+            buf[i] = tmp[len - 1 - i];
+        }
     }
     len
-}
-
-fn fmt_u32_pad(buf: &mut [u8], val: u32, width: usize) -> usize {
-    let mut tmp = [0u8; 10];
-    let digits = fmt_u64(&mut tmp, val as u64);
-    let mut pos = 0;
-    if digits < width {
-        for _ in 0..(width - digits) {
-            if pos < buf.len() { buf[pos] = b' '; pos += 1; }
-        }
-    }
-    let copy_len = digits.min(buf.len() - pos);
-    buf[pos..pos + copy_len].copy_from_slice(&tmp[..copy_len]);
-    pos + copy_len
-}
-
-fn parse_u32(s: &[u8]) -> u32 {
-    let mut val: u32 = 0;
-    for &b in s {
-        if b >= b'0' && b <= b'9' {
-            val = val.wrapping_mul(10).wrapping_add((b - b'0') as u32);
-        } else {
-            break;
-        }
-    }
-    val
-}
-
-fn name_str(name: &[u8; 16]) -> &[u8] {
-    let len = name.iter().position(|&b| b == 0).unwrap_or(16);
-    &name[..len]
 }
 
 // =============================================================================
@@ -1087,6 +1352,7 @@ fn name_str(name: &[u8; 16]) -> &[u8] {
 #[unsafe(no_mangle)]
 fn main() {
     uinfo!("sshd", "starting";);
+    userlib::ulog::flush();
 
     // Retry binding until ipd is ready
     let mut listener = loop {
@@ -1094,39 +1360,46 @@ fn main() {
         match TcpListener::bind(addr) {
             Ok(l) => break l,
             Err(_) => {
-                syscall::sleep_ns(1_000_000_000); // 1s retry
+                syscall::sleep_ns(1_000_000_000);
             }
         }
     };
 
     uinfo!("sshd", "listening"; port = SSH_PORT as u32);
+    userlib::ulog::flush();
 
-    // Accept loop — re-bind after each connection since ipd's
-    // listening socket is consumed on accept.
     loop {
         match listener.accept() {
             Ok((stream, remote)) => {
                 uinfo!("sshd", "connection"; remote_port = remote.port as u32);
+                userlib::ulog::flush();
 
                 let mut session = SshSession::new(stream, DEV_HOST_KEY_SEED);
                 session.run();
 
+                // Kill shell if still alive
+                if let Some(pid) = session.shell_pid {
+                    let _ = syscall::kill(pid);
+                }
+
                 uinfo!("sshd", "session_ended";);
+                userlib::ulog::flush();
             }
             Err(_) => {
                 uerror!("sshd", "accept_failed";);
+                userlib::ulog::flush();
             }
         }
 
-        // Drop old listener and re-bind for the next connection
+        // Re-bind for next connection
         drop(listener);
-        syscall::sleep_ns(100_000_000); // 100ms grace for socket cleanup
+        syscall::sleep_ns(100_000_000);
         listener = loop {
             let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED, SSH_PORT);
             match TcpListener::bind(addr) {
                 Ok(l) => break l,
                 Err(_) => {
-                    syscall::sleep_ns(500_000_000); // 500ms retry
+                    syscall::sleep_ns(500_000_000);
                 }
             }
         };

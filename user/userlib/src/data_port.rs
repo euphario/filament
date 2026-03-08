@@ -335,8 +335,10 @@ impl DataPort {
     ///
     /// Call after processing peeked CQEs. The provider can now see that
     /// those CQ slots are consumed and reclaim pool memory.
-    pub fn ack_completions(&self, n: u32) {
+    pub fn ack_completions(&mut self, n: u32) {
         self.ring.cq_advance(n);
+        // Adjust local cursor: head moved forward by n, so our offset shrinks
+        self.local_cq_cursor = self.local_cq_cursor.wrapping_sub(n);
     }
 
     /// Read the shared cq_head (for provider-side pool reclaim).

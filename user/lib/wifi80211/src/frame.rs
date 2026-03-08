@@ -234,6 +234,110 @@ fn write_tim_ie(buf: &mut [u8], bitmap_control: u8, tim_bitmap: &[u8; 8]) -> usi
 }
 
 // ============================================================================
+// RSN IE (WPA2)
+// ============================================================================
+
+/// RSN IE length: element ID(1) + length(1) + body(20) = 22 bytes.
+pub const RSN_IE_LEN: usize = 22;
+
+/// Write RSN Information Element for WPA2-PSK with CCMP.
+/// Returns bytes written (22 = 2 header + 20 body).
+///
+/// IEEE 802.11-2020 §9.4.2.25
+/// - Version: 1
+/// - Group cipher: 00:0F:AC:04 (CCMP-128)
+/// - Pairwise cipher count: 1, suite: 00:0F:AC:04 (CCMP-128)
+/// - AKM count: 1, suite: 00:0F:AC:02 (PSK)
+/// - RSN capabilities: 0x0000
+fn write_rsn_ie(buf: &mut [u8]) -> usize {
+    if buf.len() < RSN_IE_LEN {
+        return 0;
+    }
+    buf[0] = 48;   // Element ID: RSN
+    buf[1] = 20;   // Length
+
+    // Version: 1
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+    // Group Data Cipher Suite: 00:0F:AC:04 (CCMP-128)
+    buf[4] = 0x00; buf[5] = 0x0F; buf[6] = 0xAC; buf[7] = 0x04;
+    // Pairwise Cipher Suite Count: 1
+    buf[8..10].copy_from_slice(&1u16.to_le_bytes());
+    // Pairwise Cipher Suite: 00:0F:AC:04 (CCMP-128)
+    buf[10] = 0x00; buf[11] = 0x0F; buf[12] = 0xAC; buf[13] = 0x04;
+    // AKM Suite Count: 1
+    buf[14..16].copy_from_slice(&1u16.to_le_bytes());
+    // AKM Suite: 00:0F:AC:02 (PSK)
+    buf[16] = 0x00; buf[17] = 0x0F; buf[18] = 0xAC; buf[19] = 0x02;
+    // RSN Capabilities: 0x0000
+    buf[20..22].copy_from_slice(&0u16.to_le_bytes());
+
+    RSN_IE_LEN
+}
+
+/// Build the RSN IE into a standalone buffer (for embedding in EAPOL M3).
+/// Returns the number of bytes written.
+pub fn build_rsn_ie(buf: &mut [u8]) -> usize {
+    write_rsn_ie(buf)
+}
+
+/// Parsed RSN Information Element
+pub struct RsnInfo {
+    /// Group cipher suite type (4 = CCMP)
+    pub group_cipher: u8,
+    /// Pairwise cipher suite type (4 = CCMP)
+    pub pairwise_cipher: u8,
+    /// AKM suite type (2 = PSK)
+    pub akm: u8,
+}
+
+/// Parse RSN IE body (after element ID and length).
+/// Validates WPA2-PSK with CCMP cipher selection.
+pub fn parse_rsn_ie(data: &[u8]) -> Option<RsnInfo> {
+    if data.len() < 20 {
+        return None;
+    }
+    // Version must be 1
+    let version = u16::from_le_bytes([data[0], data[1]]);
+    if version != 1 {
+        return None;
+    }
+    // Group cipher OUI must be 00:0F:AC
+    if data[2] != 0x00 || data[3] != 0x0F || data[4] != 0xAC {
+        return None;
+    }
+    let group_cipher = data[5];
+
+    // Pairwise cipher count
+    let pw_count = u16::from_le_bytes([data[6], data[7]]);
+    if pw_count < 1 || data.len() < 8 + 4 * pw_count as usize + 2 {
+        return None;
+    }
+    // Use first pairwise cipher suite
+    let pw_off = 8;
+    if data[pw_off] != 0x00 || data[pw_off + 1] != 0x0F || data[pw_off + 2] != 0xAC {
+        return None;
+    }
+    let pairwise_cipher = data[pw_off + 3];
+
+    // AKM suite count
+    let akm_off = 8 + 4 * pw_count as usize;
+    if data.len() < akm_off + 6 {
+        return None;
+    }
+    let akm_count = u16::from_le_bytes([data[akm_off], data[akm_off + 1]]);
+    if akm_count < 1 {
+        return None;
+    }
+    let akm_suite_off = akm_off + 2;
+    if data[akm_suite_off] != 0x00 || data[akm_suite_off + 1] != 0x0F || data[akm_suite_off + 2] != 0xAC {
+        return None;
+    }
+    let akm = data[akm_suite_off + 3];
+
+    Some(RsnInfo { group_cipher, pairwise_cipher, akm })
+}
+
+// ============================================================================
 // Beacon
 // ============================================================================
 
@@ -246,9 +350,9 @@ fn write_tim_ie(buf: &mut [u8], bitmap_control: u8, tim_bitmap: &[u8; 8]) -> usi
 pub fn build_beacon(buf: &mut [u8], bss: &BssConfig, seq: u16,
                     tim_bitmap_ctrl: u8, tim_bitmap: &[u8; 8]) -> usize {
     // Max IE size: SSID(2+32) + Rates(10) + DS(3) + TIM(2+3+8) + Country(8) + ERP(3) +
-    // HT_Cap(28) + ExtRates(6) + HT_Oper(24) + WMM(26) = max ~153
+    // HT_Cap(28) + RSN(22) + ExtRates(6) + HT_Oper(24) + WMM(26) = max ~175
     // Use conservative upper bound for buffer check
-    let max_total = 24 + 12 + 34 + 10 + 3 + 13 + 8 + 3 + 28 + 6 + 24 + 26;
+    let max_total = 24 + 12 + 34 + 10 + 3 + 13 + 8 + 3 + 28 + 22 + 6 + 24 + 26;
     if buf.len() < max_total {
         return 0;
     }
@@ -273,7 +377,9 @@ pub fn build_beacon(buf: &mut [u8], bss: &BssConfig, seq: u16,
     // beacon_interval: 100 TU
     buf[body + 8..body + 10].copy_from_slice(&100u16.to_le_bytes());
     // capability: ESS | Short Preamble | Short Slot Time = 0x0421
-    buf[body + 10..body + 12].copy_from_slice(&0x0421u16.to_le_bytes());
+    // Add Privacy bit (0x0010) when WPA2 enabled
+    let cap: u16 = if bss.wpa2 { 0x0431 } else { 0x0421 };
+    buf[body + 10..body + 12].copy_from_slice(&cap.to_le_bytes());
 
     // Encode secondary channel offset for HT Oper IE (802.11: 1=above, 3=below)
     let sec_ch_offset = match bss.secondary_channel_offset {
@@ -291,6 +397,7 @@ pub fn build_beacon(buf: &mut [u8], bss: &BssConfig, seq: u16,
     p += write_country_ie(&mut buf[p..], bss.channel);          // ID 7
     p += write_erp_ie(&mut buf[p..], bss.erp_protection);       // ID 42
     p += write_ht_cap_ie(&mut buf[p..], bss.bandwidth);                         // ID 45
+    if bss.wpa2 { p += write_rsn_ie(&mut buf[p..]); }           // ID 48
     p += write_ext_rates_ie(&mut buf[p..]);                      // ID 50
     p += write_ht_oper_ie(&mut buf[p..], bss.channel, sec_ch_offset, bss.ht_protection); // ID 61
     p += write_wmm_ie(&mut buf[p..]);                            // ID 221 (vendor)
@@ -306,8 +413,9 @@ pub fn build_beacon(buf: &mut [u8], bss: &BssConfig, seq: u16,
 /// Returns bytes written into `buf`.
 pub fn build_probe_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], seq: u16) -> usize {
     // SSID(2+n) + Rates(10) + DS(3) + Country(8) + ERP(3) + HT_Cap(28) +
-    // ExtRates(6) + HT_Oper(24) + WMM(26)
-    let ie_len = (2 + bss.ssid_len as usize) + 10 + 3 + 8 + 3 + 28 + 6 + 24 + 26;
+    // RSN(22) + ExtRates(6) + HT_Oper(24) + WMM(26)
+    let rsn_len = if bss.wpa2 { RSN_IE_LEN } else { 0 };
+    let ie_len = (2 + bss.ssid_len as usize) + 10 + 3 + 8 + 3 + 28 + rsn_len + 6 + 24 + 26;
     let total = 24 + 8 + 2 + 2 + ie_len;
     if buf.len() < total {
         return 0;
@@ -326,7 +434,8 @@ pub fn build_probe_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], seq
 
     let body = 24;
     buf[body + 8..body + 10].copy_from_slice(&100u16.to_le_bytes());
-    buf[body + 10..body + 12].copy_from_slice(&0x0421u16.to_le_bytes());
+    let cap: u16 = if bss.wpa2 { 0x0431 } else { 0x0421 };
+    buf[body + 10..body + 12].copy_from_slice(&cap.to_le_bytes());
 
     let sec_ch_offset = match bss.secondary_channel_offset {
         1 => 1u8, -1 => 3u8, _ => 0u8,
@@ -340,6 +449,7 @@ pub fn build_probe_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], seq
     p += write_country_ie(&mut buf[p..], bss.channel);
     p += write_erp_ie(&mut buf[p..], bss.erp_protection);
     p += write_ht_cap_ie(&mut buf[p..], bss.bandwidth);
+    if bss.wpa2 { p += write_rsn_ie(&mut buf[p..]); }           // ID 48
     p += write_ext_rates_ie(&mut buf[p..]);
     p += write_ht_oper_ie(&mut buf[p..], bss.channel, sec_ch_offset, bss.ht_protection);
     p += write_wmm_ie(&mut buf[p..]);
@@ -432,7 +542,8 @@ pub fn build_reassoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], a
 
 fn build_assoc_or_reassoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 6], aid: u16, seq: u16, reassoc: bool) -> usize {
     const FIXED: usize = 24 + 2 + 2 + 2; // header + cap + status + AID
-    let total = FIXED + 10 + 3 + 28 + 6 + 24 + 26; // Rates+ERP+HT_Cap+ExtRates+HT_Oper+WMM
+    let rsn_len = if bss.wpa2 { RSN_IE_LEN } else { 0 };
+    let total = FIXED + 10 + 3 + 28 + rsn_len + 6 + 24 + 26; // Rates+ERP+HT_Cap+RSN+ExtRates+HT_Oper+WMM
     if buf.len() < total {
         return 0;
     }
@@ -447,8 +558,9 @@ fn build_assoc_or_reassoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 
     buf[22..24].copy_from_slice(&(seq << 4).to_le_bytes());
 
     let body = 24;
-    // Capability: ESS | Short Preamble | Short Slot Time = 0x0421
-    buf[body..body + 2].copy_from_slice(&0x0421u16.to_le_bytes());
+    // Capability: ESS | Short Preamble | Short Slot Time (+ Privacy if WPA2)
+    let cap: u16 = if bss.wpa2 { 0x0431 } else { 0x0421 };
+    buf[body..body + 2].copy_from_slice(&cap.to_le_bytes());
     // Status: Success = 0
     buf[body + 2..body + 4].copy_from_slice(&0u16.to_le_bytes());
     // AID: bits [15:14] must be 0b11 per spec (§9.4.1.8)
@@ -464,6 +576,7 @@ fn build_assoc_or_reassoc_response(buf: &mut [u8], bss: &BssConfig, dest: &[u8; 
     p += write_rates_ie(&mut buf[p..]);
     p += write_erp_ie(&mut buf[p..], bss.erp_protection);
     p += write_ht_cap_ie(&mut buf[p..], bss.bandwidth);
+    if bss.wpa2 { p += write_rsn_ie(&mut buf[p..]); }           // ID 48
     p += write_ext_rates_ie(&mut buf[p..]);
     p += write_ht_oper_ie(&mut buf[p..], bss.channel, sec_ch_offset, bss.ht_protection);
     p += write_wmm_ie(&mut buf[p..]);
@@ -603,6 +716,12 @@ pub struct AssocIes {
     /// SSID from IE 0 (length, then bytes). ssid_len=0 if not found.
     pub ssid: [u8; 32],
     pub ssid_len: u8,
+    /// Whether RSN IE was present and valid for WPA2-PSK/CCMP
+    pub has_rsn: bool,
+    /// Pairwise cipher type from RSN IE (4 = CCMP)
+    pub rsn_pairwise_cipher: u8,
+    /// AKM type from RSN IE (2 = PSK)
+    pub rsn_akm: u8,
 }
 
 /// Parse IEs from an assoc/reassoc request frame body (after MAC header).
@@ -626,6 +745,9 @@ pub fn parse_assoc_ies(body: &[u8], is_reassoc: bool) -> Option<AssocIes> {
         has_ht: false,
         ssid: [0; 32],
         ssid_len: 0,
+        has_rsn: false,
+        rsn_pairwise_cipher: 0,
+        rsn_akm: 0,
     };
 
     // Walk IEs
@@ -655,9 +777,14 @@ pub fn parse_assoc_ies(body: &[u8], is_reassoc: bool) -> Option<AssocIes> {
                     result.ht_ampdu_param = ie_data[2];
                 }
             }
-            // RSN (IE 48) — stub, no validation yet
-            // TODO: parse RSN IE for security negotiation
-            48 => {}
+            // RSN (IE 48) — validate STA's cipher selection
+            48 => {
+                if let Some(rsn) = parse_rsn_ie(ie_data) {
+                    result.has_rsn = true;
+                    result.rsn_pairwise_cipher = rsn.pairwise_cipher;
+                    result.rsn_akm = rsn.akm;
+                }
+            }
             _ => {}
         }
 

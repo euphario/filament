@@ -1,217 +1,182 @@
-//! Console I/O via ring buffer
+//! Console I/O via shared pipe
 //!
-//! High-performance I/O using ConsoleRing shared memory.
-//! Shell connects to consoled port, receives shmem_id, maps the ring.
+//! Shell reads its SharedPipe shmem_id from the mailbox page provided by
+//! its parent (consoled or sshd) via exec_with_mailbox.
 //!
-//! ## Protocol
+//! ## Mailbox format (offset 64+)
 //!
-//! 1. Connect to "console:0" port (Channel)
-//! 2. Receive "RING" + shmem_id + cols + rows message
-//! 3. Open shmem by ID and map as ConsoleRing
-//! 4. Use TX ring for output, RX ring for input
+//! | Offset | Size | Field                           |
+//! |--------|------|---------------------------------|
+//! | 64     | 4    | console_shmem_id (u32 LE)       |
+//! | 68     | 2    | cols (u16 LE)                   |
+//! | 70     | 2    | rows (u16 LE)                   |
 
-use userlib::ipc::{Channel, Mux, MuxFilter};
-use userlib::console_ring::ConsoleRing;
-use userlib::syscall::Handle;
-
-/// IPC poll callback type — called during read_byte() when the shell-cmd port
-/// has a pending connection. This lets the shell service remote commands even
-/// while blocked waiting for console input.
-pub type IpcPollFn = fn();
+use libf::sync::SharedPipe;
+use userlib::syscall;
+use userlib::Handle;
 
 /// Console I/O state
 pub struct Console {
-    /// Ring buffer for I/O (primary path once connected)
-    ring: Option<ConsoleRing>,
-    /// Channel used during handshake (kept alive to maintain connection)
-    handshake_channel: Option<Channel>,
+    /// Bidirectional pipe for I/O with parent (consoled or sshd)
+    pipe: Option<SharedPipe>,
     /// Terminal dimensions
     pub cols: u16,
     pub rows: u16,
     /// Log split enabled
     pub log_split: bool,
-    /// Number of log lines (top region)
-    pub log_lines: u16,
-    /// IPC port handle to watch during read_byte() (for shell-cmd port)
-    ipc_port_handle: Option<Handle>,
-    /// Callback to drain IPC commands when port has activity
-    ipc_poll_fn: Option<IpcPollFn>,
-    /// Mux for watching both ring and IPC port (created once, reused)
-    read_mux: Option<Mux>,
+    /// True when connected via SSH (enables data path diagnostics).
+    /// Set from mailbox flags byte (offset 72, bit 0).
+    pub ssh_mode: bool,
 }
 
 impl Console {
-    /// Create new console I/O (does not connect yet)
     pub const fn new() -> Self {
         Self {
-            ring: None,
-            handshake_channel: None,
+            pipe: None,
             cols: 80,
             rows: 24,
             log_split: false,
-            log_lines: 5,
-            ipc_port_handle: None,
-            ipc_poll_fn: None,
-            read_mux: None,
+            ssh_mode: false,
         }
     }
 
-    /// Connect to consoled
-    /// Returns true if connected, false if falling back to direct UART
+    /// Connect by reading shmem_id from Handle::MAILBOX.
+    /// Returns true if connected.
     pub fn connect(&mut self) -> bool {
-        // Connect to consoled port
-        let mut channel = match Channel::connect(b"console:0") {
-            Ok(ch) => ch,
-            Err(_) => return false,
-        };
-
-        // Wait for RING message using mux
-        let mux = match Mux::new() {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-
-        if mux.add(channel.handle(), MuxFilter::Readable).is_err() {
-            return false;
-        }
-
-        // Block until channel is readable
-        if mux.wait().is_err() {
-            return false;
-        }
-
-        // Read the RING message with shmem_id
-        let mut buf = [0u8; 16];
-        let n = match channel.try_recv(&mut buf) {
-            Ok(Some(n)) => n,
+        let addr = match syscall::map(Handle::MAILBOX, 0) {
+            Ok(a) if a != 0 => a,
             _ => return false,
         };
 
-        // Parse: "RING" (4) + shmem_id (4) + cols (2) + rows (2)
-        if n < 12 || &buf[..4] != b"RING" {
+        // Read console fields at offset 64
+        let page = addr as *const u8;
+        let shmem_id = unsafe {
+            let mut buf = [0u8; 4];
+            core::ptr::copy_nonoverlapping(page.add(64), buf.as_mut_ptr(), 4);
+            u32::from_le_bytes(buf)
+        };
+        let cols = unsafe {
+            let mut buf = [0u8; 2];
+            core::ptr::copy_nonoverlapping(page.add(68), buf.as_mut_ptr(), 2);
+            u16::from_le_bytes(buf)
+        };
+        let rows = unsafe {
+            let mut buf = [0u8; 2];
+            core::ptr::copy_nonoverlapping(page.add(70), buf.as_mut_ptr(), 2);
+            u16::from_le_bytes(buf)
+        };
+        let flags = unsafe { *page.add(72) };
+
+        if shmem_id == 0 {
             return false;
         }
 
-        let shmem_id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let cols = u16::from_le_bytes([buf[8], buf[9]]);
-        let rows = u16::from_le_bytes([buf[10], buf[11]]);
-
-        // Open and map the shared memory ring
-        let ring = match ConsoleRing::map(shmem_id) {
-            Some(r) => r,
-            None => return false,
+        // Retry shmem map — on SMP the parent may not have called allow()
+        // yet when we start running on another core.
+        let pipe = {
+            let mut p = None;
+            for _ in 0..50 {
+                if let Some(pipe) = SharedPipe::open(shmem_id) {
+                    p = Some(pipe);
+                    break;
+                }
+                syscall::sleep_ns(1_000_000); // 1ms
+            }
+            match p {
+                Some(pipe) => pipe,
+                None => return false,
+            }
         };
 
-        self.ring = Some(ring);
-        self.handshake_channel = Some(channel);
-        self.cols = cols;
-        self.rows = rows;
+        self.pipe = Some(pipe);
+        if cols >= 10 && cols <= 500 {
+            self.cols = cols;
+        }
+        if rows >= 10 && rows <= 500 {
+            self.rows = rows;
+        }
+        self.ssh_mode = (flags & 0x01) != 0;
 
         true
     }
 
-    /// Check if connected to consoled
+    /// Check if connected
     pub fn is_connected(&self) -> bool {
-        self.ring.is_some()
+        self.pipe.is_some()
+    }
+
+    /// Bytes available in the outgoing pipe (for diagnostic delta).
+    pub fn pipe_writable(&self) -> usize {
+        self.pipe.as_ref().map(|p| p.writable()).unwrap_or(0)
     }
 
     /// Read a single byte (blocking)
-    /// Uses RX ring (consoled -> shell).
-    /// If an IPC port handle is registered via set_ipc_poll(), also watches
-    /// it and calls the poll callback when the port has activity (allowing
-    /// remote shell commands to be serviced while waiting for console input).
     pub fn read_byte(&mut self) -> Option<u8> {
-        let ring = self.ring.as_ref()?;
+        let pipe = self.pipe.as_ref()?;
+        let mut byte = [0u8; 1];
 
         // Fast path: data already available
-        if ring.rx_available() > 0 {
-            let mut byte = [0u8; 1];
-            if ring.rx_read(&mut byte) > 0 {
+        if pipe.pull(&mut byte) > 0 {
+            return Some(byte[0]);
+        }
+
+        // Blocking wait with safety-net timeout against missed wakes
+        loop {
+            pipe.wait(5000);
+            if pipe.pull(&mut byte) > 0 {
                 return Some(byte[0]);
             }
         }
+    }
 
-        // Mux-based wait: watches both ring and IPC port
-        if let (Some(mux), Some(port_handle), Some(poll_fn)) =
-            (&self.read_mux, self.ipc_port_handle, self.ipc_poll_fn)
-        {
-            loop {
-                if ring.rx_available() > 0 {
-                    let mut byte = [0u8; 1];
-                    if ring.rx_read(&mut byte) > 0 {
-                        return Some(byte[0]);
-                    }
-                }
+    /// Read a single byte with timeout.
+    /// Returns `None` if no data arrives within `timeout_ms` milliseconds.
+    pub fn read_byte_timeout(&mut self, timeout_ms: u32) -> Option<u8> {
+        let pipe = self.pipe.as_ref()?;
+        let mut byte = [0u8; 1];
 
-                match mux.wait() {
-                    Ok(event) => {
-                        if event.handle.0 == port_handle.0 {
-                            poll_fn();
-                        }
-                    }
-                    Err(_) => {
-                        userlib::syscall::sleep_us(100_000);
-                    }
-                }
-            }
+        // Fast path: data already available
+        if pipe.pull(&mut byte) > 0 {
+            return Some(byte[0]);
         }
 
-        // Fallback: no IPC port registered, simple ring.wait()
+        // Wait with deadline — shmem wakes on any notify (including our own TX),
+        // so we must loop until the deadline actually expires.
+        let deadline_ns = syscall::gettime() + (timeout_ms as u64) * 1_000_000;
         loop {
-            if ring.rx_available() > 0 {
-                let mut byte = [0u8; 1];
-                if ring.rx_read(&mut byte) > 0 {
-                    return Some(byte[0]);
-                }
+            let now = syscall::gettime();
+            if now >= deadline_ns {
+                return None;
             }
+            let remaining_ms = ((deadline_ns - now) / 1_000_000) as u32;
+            pipe.wait(remaining_ms.max(1));
 
-            // Use 5-second timeout as safety net against missed wakes.
-            // Normally consoled's notify wakes us immediately; the timeout
-            // only fires if a notification was lost (SMP race).
-            ring.wait(5000);
+            if pipe.pull(&mut byte) > 0 {
+                return Some(byte[0]);
+            }
         }
     }
 
-    /// Write bytes to console
-    /// Uses TX ring (shell -> consoled)
-    ///
-    /// Blocking: writes all data, waiting for consoled to drain when ring is full.
-    /// Back-pressure: when ring is full, waits until consoled drains to 50% free
-    /// before resuming, reducing context switch overhead.
+    /// Write bytes to console.
+    /// Blocking: writes all data, waiting when the pipe is full.
     pub fn write(&self, data: &[u8]) {
-        let ring = match &self.ring {
-            Some(r) => r,
-            None => return, // Not connected, drop output
+        let pipe = match &self.pipe {
+            Some(p) => p,
+            None => return,
         };
 
-        let mut offset = 0;
-        let mut needs_notify = false;
-        while offset < data.len() {
-            let written = ring.tx_write(&data[offset..]);
-            offset += written;
-            needs_notify |= written > 0;
-
-            if offset < data.len() {
-                // Ring full — notify consoled to start draining, then wait
-                if needs_notify {
-                    ring.notify();
-                    needs_notify = false;
-                }
-                loop {
-                    ring.wait(1000); // 1 second timeout (safety)
-                    if ring.tx_space() >= ring.tx_size() / 2 {
-                        break; // 50% free, resume writing
-                    }
-                    // Re-notify consoled on timeout — if a notification was
-                    // lost, this ensures consoled re-enters its drain loop.
-                    ring.notify();
-                }
-            }
+        let writable_before = pipe.writable();
+        if data.len() > writable_before {
+            userlib::udebug!("shell", "pipe_write_backpressure"; len = data.len(), writable = writable_before, capacity = pipe.outgoing().capacity());
+            userlib::ulog::flush();
         }
 
-        // One notification per write() call — tells consoled data is available
-        if needs_notify {
-            ring.notify();
+        // SharedPipe::push_all handles the write loop with backpressure.
+        pipe.push_all(data);
+
+        if data.len() > writable_before {
+            userlib::udebug!("shell", "pipe_write_resumed"; len = data.len());
+            userlib::ulog::flush();
         }
     }
 
@@ -220,32 +185,30 @@ impl Console {
         self.write(s.as_bytes());
     }
 
-    /// Query terminal size from consoled
-    /// Returns (cols, rows) on success
+    /// Query terminal size from parent transport.
+    /// Returns (cols, rows) on success.
     pub fn query_size(&mut self) -> Option<(u16, u16)> {
-        let ring = self.ring.as_ref()?;
+        let pipe = self.pipe.as_ref()?;
 
-        // Send GETSIZE query via TX ring
-        ring.tx_write(b"GETSIZE\n");
-        ring.notify();
+        // Send GETSIZE query to parent (consoled/sshd reads this)
+        pipe.push(b"GETSIZE\n");
+        pipe.notify();
 
-        // Wait for SIZE response in RX ring
+        // Wait for SIZE response from parent
         for _ in 0..100 {
-            if ring.rx_available() >= 5 {
+            if pipe.readable() >= 5 {
                 let mut buf = [0u8; 32];
-                let n = ring.rx_read(&mut buf);
+                let n = pipe.pull(&mut buf);
                 if n >= 5 && &buf[..5] == b"SIZE " {
                     self.parse_size_msg(&buf[..n]);
                     return Some((self.cols, self.rows));
                 }
             }
-            // If wait fails, use sleep_us backoff to prevent storm
-            if !ring.wait(10) {
-                userlib::syscall::sleep_us(10_000); // 10ms backoff
+            if !pipe.wait(10) {
+                syscall::sleep_us(10_000);
             }
         }
 
-        // Timeout - return cached size
         Some((self.cols, self.rows))
     }
 
@@ -256,24 +219,19 @@ impl Console {
         }
 
         let rest = &data[5..];
-
-        // Find space between cols and rows
         let mut cols: u16 = 0;
         let mut rows: u16 = 0;
         let mut i = 0;
 
-        // Parse cols
         while i < rest.len() && rest[i] >= b'0' && rest[i] <= b'9' {
             cols = cols.saturating_mul(10).saturating_add((rest[i] - b'0') as u16);
             i += 1;
         }
 
-        // Skip space
         if i < rest.len() && rest[i] == b' ' {
             i += 1;
         }
 
-        // Parse rows
         while i < rest.len() && rest[i] >= b'0' && rest[i] <= b'9' {
             rows = rows.saturating_mul(10).saturating_add((rest[i] - b'0') as u16);
             i += 1;
@@ -287,44 +245,37 @@ impl Console {
 
     /// Set log split mode
     pub fn set_log_split(&mut self, enabled: bool) {
-        let ring = match &self.ring {
-            Some(r) => r,
+        let pipe = match &self.pipe {
+            Some(p) => p,
             None => return,
         };
 
         if enabled {
-            // Send SPLIT command with current log_lines setting
-            // For now use default 5 lines
-            ring.tx_write(b"SPLIT 5\n");
+            pipe.push(b"SPLIT 5\n");
         } else {
-            ring.tx_write(b"NOSPLIT\n");
+            pipe.push(b"NOSPLIT\n");
         }
-        ring.notify();
+        pipe.notify();
 
         // Wait for OK response
         for _ in 0..50 {
-            if ring.rx_available() >= 2 {
+            if pipe.readable() >= 2 {
                 let mut buf = [0u8; 16];
-                let n = ring.rx_read(&mut buf);
-                if n >= 2 && &buf[..2] == b"OK" {
-                    self.log_split = enabled;
-                    return;
-                }
+                pipe.pull(&mut buf);
+                break;
             }
-            ring.wait(10);
+            pipe.wait(10);
         }
-        // Timeout - assume it worked
         self.log_split = enabled;
     }
 
-    /// Set number of log lines (only effective when split is enabled)
+    /// Set number of log lines
     pub fn set_log_lines(&mut self, lines: u8) {
-        let ring = match &self.ring {
-            Some(r) => r,
+        let pipe = match &self.pipe {
+            Some(p) => p,
             None => return,
         };
 
-        // Send SPLIT command with specified lines
         let mut cmd = [0u8; 16];
         cmd[..6].copy_from_slice(b"SPLIT ");
         let mut pos = 6;
@@ -337,157 +288,31 @@ impl Console {
         cmd[pos] = b'\n';
         pos += 1;
 
-        ring.tx_write(&cmd[..pos]);
-        ring.notify();
+        pipe.push(&cmd[..pos]);
+        pipe.notify();
 
-        // Wait for OK response
         for _ in 0..50 {
-            if ring.rx_available() >= 2 {
+            if pipe.readable() >= 2 {
                 let mut buf = [0u8; 16];
-                ring.rx_read(&mut buf);
+                pipe.pull(&mut buf);
                 break;
             }
-            ring.wait(10);
+            pipe.wait(10);
         }
     }
 
-    /// Enter input rendering mode by setting InputState flags in shmem.
-    /// Consoled detects the ACTIVE flag and sets up scroll region + renders.
-    /// `prompt` may contain ANSI escapes; `visible_width` is the printable char count.
-    pub fn send_input_on(&self, prompt: &[u8], visible_width: u8) {
-        if let Some(ptr) = self.input_state_ptr() {
-            use core::sync::atomic::Ordering;
-            let plen = prompt.len().min(48);
-            unsafe {
-                // Write prompt
-                let prompt_ptr = core::ptr::addr_of_mut!((*ptr).prompt) as *mut u8;
-                core::ptr::copy_nonoverlapping(prompt.as_ptr(), prompt_ptr, plen);
-                core::ptr::write(core::ptr::addr_of_mut!((*ptr).prompt_len), plen as u8);
-                core::ptr::write(core::ptr::addr_of_mut!((*ptr).prompt_visible_len), visible_width);
-                // Set ACTIVE flag
-                core::ptr::write(
-                    core::ptr::addr_of_mut!((*ptr).flags),
-                    userlib::console_ring::input_flags::ACTIVE,
-                );
-                // Bump seq so consoled notices
-                (*ptr).seq.fetch_add(1, Ordering::Release);
-            }
-        }
-        // Notify consoled to check InputState
-        self.notify_ring();
-    }
-
-    /// Exit input rendering mode by clearing InputState flags in shmem.
-    pub fn send_input_off(&self) {
-        if let Some(ptr) = self.input_state_ptr() {
-            use core::sync::atomic::Ordering;
-            unsafe {
-                // Clear ACTIVE flag
-                core::ptr::write(core::ptr::addr_of_mut!((*ptr).flags), 0u8);
-                // Bump seq so consoled notices
-                (*ptr).seq.fetch_add(1, Ordering::Release);
-            }
-        }
-        self.notify_ring();
-    }
-
-    /// Get reference to InputState in shmem (for reading)
-    pub fn input_state(&self) -> Option<&userlib::console_ring::InputState> {
-        self.ring.as_ref().map(|r| r.input_state())
-    }
-
-    /// Get raw mutable pointer to InputState in shmem (for shell-side writes).
-    /// Safety: Shell is the only writer of buf/len/cursor fields.
-    pub fn input_state_ptr(&self) -> Option<*mut userlib::console_ring::InputState> {
-        self.ring.as_ref().map(|r| r.input_state() as *const _ as *mut _)
-    }
-
-    /// Notify consoled that shmem has changed (e.g., InputState updated)
-    pub fn notify_ring(&self) {
-        if let Some(ring) = &self.ring {
-            ring.notify();
-        }
-    }
-
-    /// Connect/disconnect from logd (placeholder - logd integration not yet implemented)
+    /// Connect/disconnect from logd (placeholder)
     pub fn set_logd_connected(&self, _connected: bool) {
-        // Future: tell consoled to connect/disconnect from logd
-    }
-
-    /// Register an IPC port handle and poll callback. During read_byte(),
-    /// the console will watch this handle alongside the ring and call the
-    /// callback when the port has activity (pending connection).
-    /// Creates a persistent Mux for efficient multiplexed waiting.
-    pub fn set_ipc_poll(&mut self, handle: Handle, poll_fn: IpcPollFn) {
-        self.ipc_port_handle = Some(handle);
-        self.ipc_poll_fn = Some(poll_fn);
-
-        // Create Mux and add both handles now (ring + port)
-        if let Some(ref ring) = self.ring {
-            if let Ok(mux) = Mux::new() {
-                let _ = mux.add(ring.handle(), MuxFilter::Readable);
-                let _ = mux.add(handle, MuxFilter::Readable);
-                // Safety timeout: if a shmem notification is ever lost,
-                // we wake up after 2 seconds and re-check rx_available.
-                let _ = mux.set_timeout(2000);
-                self.read_mux = Some(mux);
-            }
-        }
-    }
-}
-
-/// Capture buffer for redirecting shell output to IPC responses.
-/// Used when executing commands on behalf of remote shell clients.
-pub struct CaptureBuffer {
-    data: [u8; 8192],
-    len: usize,
-}
-
-impl CaptureBuffer {
-    pub const fn new() -> Self {
-        Self {
-            data: [0u8; 8192],
-            len: 0,
-        }
-    }
-
-    pub fn push(&mut self, bytes: &[u8]) {
-        let available = self.data.len() - self.len;
-        let to_copy = bytes.len().min(available);
-        self.data[self.len..self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
-        self.len += to_copy;
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn clear(&mut self) {
-        self.len = 0;
+        // Future: tell parent transport to connect/disconnect from logd
     }
 }
 
 /// Global console instance
 static mut CONSOLE: Console = Console::new();
 
-/// Pointer to active capture buffer (set during IPC command execution)
-static mut CAPTURE_BUF: Option<*mut CaptureBuffer> = None;
-
-/// Initialize and connect to console (with retry)
+/// Initialize and connect to console via mailbox
 pub fn init() -> bool {
-    // Retry a few times - consoled might not be ready yet
-    for _ in 0..10 {
-        if unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).connect() } {
-            return true;
-        }
-        // Small delay before retry
-        userlib::syscall::sleep_us(100_000); // 100ms
-    }
-    false
+    unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).connect() }
 }
 
 /// Get reference to global console
@@ -500,37 +325,8 @@ pub fn console_mut() -> &'static mut Console {
     unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) }
 }
 
-/// Begin capturing output into the given buffer.
-/// While capturing, write() pushes to the buffer instead of ConsoleRing.
-///
-/// SAFETY: Caller must ensure the buffer outlives the capture session
-/// and that end_capture() is called before the buffer is dropped.
-pub fn begin_capture(buf: &mut CaptureBuffer) {
-    unsafe {
-        *core::ptr::addr_of_mut!(CAPTURE_BUF) = Some(buf as *mut CaptureBuffer);
-    }
-}
-
-/// End output capture. Returns to normal console output.
-pub fn end_capture() {
-    unsafe {
-        *core::ptr::addr_of_mut!(CAPTURE_BUF) = None;
-    }
-}
-
-/// Check if output is currently being captured (for ANSI escape suppression).
-pub fn is_capturing() -> bool {
-    unsafe { (*core::ptr::addr_of!(CAPTURE_BUF)).is_some() }
-}
-
 /// Write bytes to console (convenience function)
 pub fn write(data: &[u8]) {
-    unsafe {
-        if let Some(ptr) = *core::ptr::addr_of!(CAPTURE_BUF) {
-            (*ptr).push(data);
-            return;
-        }
-    }
     console().write(data);
 }
 
@@ -544,8 +340,12 @@ pub fn read_byte() -> Option<u8> {
     console_mut().read_byte()
 }
 
+/// Read a byte with timeout (convenience function)
+pub fn read_byte_timeout(timeout_ms: u32) -> Option<u8> {
+    console_mut().read_byte_timeout(timeout_ms)
+}
+
 /// Writer for core::fmt::Write trait
-/// Used by the shell's print!/println! macros
 pub struct ConsoleWriter;
 
 impl core::fmt::Write for ConsoleWriter {

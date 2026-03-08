@@ -4,6 +4,9 @@
 //! with the same API shape as `std::net`. Backed by ipd's socket service:
 //! control plane over IPC channel, data plane over DataPort shared memory.
 //!
+//! Also provides link-layer types ([`EthAddr`], [`eth`]) for Ethernet frame
+//! processing shared across drivers (wifi2, ethd, switchd, ipd).
+//!
 //! # Example
 //!
 //! ```ignore
@@ -17,10 +20,96 @@
 //! stream.write_all(&buf[..n])?;
 //! ```
 
+extern crate alloc;
+
+use alloc::collections::VecDeque;
 use crate::io;
 use userlib::data_port::DataPort;
 use userlib::ipc::Channel;
-use userlib::ring::{io_op, io_status, IoSqe};
+use userlib::ring::{io_op, io_status, IoCqe, IoSqe};
+
+// =============================================================================
+// Ethernet — link-layer types shared across drivers
+// =============================================================================
+
+/// Ethernet MAC address (6 bytes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct EthAddr(pub [u8; 6]);
+
+impl EthAddr {
+    pub const BROADCAST: Self = Self([0xFF; 6]);
+    pub const ZERO: Self = Self([0; 6]);
+
+    pub fn is_broadcast(&self) -> bool { self.0 == [0xFF; 6] }
+    pub fn is_multicast(&self) -> bool { self.0[0] & 0x01 != 0 }
+}
+
+/// Well-known EtherType constants.
+pub mod ethertype {
+    pub const IPV4: u16  = 0x0800;
+    pub const ARP: u16   = 0x0806;
+    pub const VLAN: u16  = 0x8100;
+    pub const IPV6: u16  = 0x86DD;
+    pub const EAPOL: u16 = 0x888E;
+}
+
+/// Ethernet II frame helpers.
+///
+/// ```ignore
+/// use libf::net::eth;
+/// if let Some(hdr) = eth::parse(&buf[offset..]) {
+///     if hdr.ethertype == libf::net::ethertype::EAPOL {
+///         let payload = &buf[offset + eth::HEADER_LEN..];
+///     }
+/// }
+/// ```
+pub mod eth {
+    use super::EthAddr;
+
+    /// Ethernet header length (DST + SRC + EtherType = 14 bytes).
+    pub const HEADER_LEN: usize = 14;
+    /// Standard Ethernet MTU.
+    pub const MTU: usize = 1500;
+    /// Maximum Ethernet frame (header + MTU, no FCS).
+    pub const FRAME_MAX: usize = HEADER_LEN + MTU;
+
+    /// Parsed Ethernet header.
+    #[derive(Clone, Copy)]
+    pub struct Header {
+        pub dst: EthAddr,
+        pub src: EthAddr,
+        pub ethertype: u16,
+    }
+
+    /// Parse an Ethernet header from a byte slice.
+    pub fn parse(frame: &[u8]) -> Option<Header> {
+        if frame.len() < HEADER_LEN {
+            return None;
+        }
+        let mut dst = [0u8; 6];
+        let mut src = [0u8; 6];
+        dst.copy_from_slice(&frame[..6]);
+        src.copy_from_slice(&frame[6..12]);
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        Some(Header { dst: EthAddr(dst), src: EthAddr(src), ethertype })
+    }
+
+    /// Payload slice (everything after the 14-byte header).
+    pub fn payload(frame: &[u8]) -> &[u8] {
+        if frame.len() > HEADER_LEN { &frame[HEADER_LEN..] } else { &[] }
+    }
+
+    /// Write an Ethernet header into `buf`. Returns `HEADER_LEN` on success.
+    pub fn write_header(buf: &mut [u8], dst: &EthAddr, src: &EthAddr, ethertype: u16) -> Option<usize> {
+        if buf.len() < HEADER_LEN {
+            return None;
+        }
+        buf[..6].copy_from_slice(&dst.0);
+        buf[6..12].copy_from_slice(&src.0);
+        buf[12..14].copy_from_slice(&ethertype.to_be_bytes());
+        Some(HEADER_LEN)
+    }
+}
 
 // =============================================================================
 // Address types
@@ -161,6 +250,8 @@ impl TcpListener {
                 rx_pos: 0,
                 rx_len: 0,
                 eof: false,
+                read_timeout_ms: 0,
+                pending_cqes: VecDeque::new(),
             },
             remote_addr,
         ))
@@ -197,6 +288,8 @@ impl TcpListener {
                         rx_pos: 0,
                         rx_len: 0,
                         eof: false,
+                        read_timeout_ms: 0,
+                        pending_cqes: VecDeque::new(),
                     },
                     remote_addr,
                 )))
@@ -249,9 +342,87 @@ pub struct TcpStream {
     rx_len: usize,
     /// True when EOF has been received.
     eof: bool,
+    /// Read timeout in milliseconds. 0 = infinite (default).
+    read_timeout_ms: u32,
+    /// CQEs consumed during drain_tx_completions but not yet processed.
+    /// Prevents data loss when RX CQEs arrive while writing.
+    pending_cqes: VecDeque<IoCqe>,
 }
 
 impl TcpStream {
+    /// Set the read timeout in milliseconds.
+    ///
+    /// When set to a non-zero value, read operations will return
+    /// `WouldBlock` if no data arrives within the timeout period.
+    /// Set to 0 for infinite blocking (the default).
+    ///
+    /// Mirrors `std::net::TcpStream::set_read_timeout()`.
+    pub fn set_read_timeout(&mut self, timeout_ms: u32) {
+        self.read_timeout_ms = timeout_ms;
+    }
+
+    /// Handle suitable for registering with a Mux.
+    ///
+    /// Returns the DataPort's underlying shmem (or doorbell) handle.
+    /// When ipd posts a CQE, this handle becomes readable.
+    pub fn poll_handle(&self) -> userlib::syscall::Handle {
+        self.data_port.mux_handle()
+    }
+
+    /// Free consumer pool slots (for backpressure-aware sends).
+    ///
+    /// Drains TX completions first to reclaim recently freed slots,
+    /// then returns the number of available slots.
+    pub fn pool_remaining(&mut self) -> u32 {
+        self.drain_tx_completions();
+        self.data_port.pool_remaining()
+    }
+
+    /// Non-blocking check for pending data.
+    ///
+    /// Returns true if buffered RX data or pending CQEs exist.
+    /// Does NOT wait for new CQEs — only checks what's already queued.
+    pub fn has_pending_data(&mut self) -> bool {
+        if self.rx_pos < self.rx_len { return true; }
+        if self.eof { return true; }
+        self.drain_tx_completions();
+        !self.pending_cqes.is_empty()
+    }
+
+    /// Returns true if the stream has reached end-of-file (peer closed).
+    pub fn is_eof(&self) -> bool {
+        self.eof
+    }
+
+    /// Wait until data is available to read, or timeout expires.
+    ///
+    /// Returns `true` if data is available (buffered or pending CQE),
+    /// `false` if the timeout expired with no data.
+    /// Also returns `true` if the stream is at EOF (so the caller
+    /// discovers EOF via the subsequent read returning 0).
+    pub fn wait_readable(&mut self, timeout_ms: u32) -> bool {
+        // Already have buffered data
+        if self.rx_pos < self.rx_len {
+            return true;
+        }
+        if self.eof {
+            return true;
+        }
+        // Drain TX completions so they don't cause false wakeups.
+        // TX_DONE CQEs just free pool slots — they're not "readable data".
+        // drain_tx_completions empties the entire CQ, sorting entries into
+        // freed TX slots (TX_DONE) and pending_cqes (DATA/EOF/RST).
+        self.drain_tx_completions();
+        if !self.pending_cqes.is_empty() {
+            return true;
+        }
+        // Wait for notification (from ipd: new data or TX_DONE)
+        self.data_port.wait(timeout_ms);
+        // Drain again — the wake may have been for TX_DONE only
+        self.drain_tx_completions();
+        !self.pending_cqes.is_empty()
+    }
+
     /// Drain any TX completion CQEs, freeing consumer pool slots.
     ///
     /// When the provider (ipd) finishes sending data from our pool slots,
@@ -265,38 +436,13 @@ impl TcpStream {
             match self.data_port.poll_cq() {
                 Some(cqe) => {
                     let stream_type = cqe.flags & 0x00FF;
-                    match stream_type {
-                        io_status::CQE_STREAM_TX_DONE => {
-                            // Free our consumer pool slot
-                            self.data_port.free(cqe.result);
-                        }
-                        io_status::CQE_STREAM_DATA => {
-                            // RX data arrived while draining — buffer it
-                            let offset = cqe.result;
-                            if self.rx_pos >= self.rx_len && !self.eof {
-                                let len = cqe.transferred as usize;
-                                let to_copy = len.min(self.rx_buf.len());
-                                if let Some(data) = self.data_port.pool_slice(offset, len as u32) {
-                                    self.rx_buf[..to_copy].copy_from_slice(&data[..to_copy]);
-                                    self.rx_len = to_copy;
-                                    self.rx_pos = 0;
-                                }
-                            }
-                            // Return RX buffer to ipd (provider-half offset)
-                            let done = IoSqe {
-                                opcode: io_op::STREAM_RX_DONE,
-                                flags: 0, priority: 0, tag: 0, lba: 0,
-                                data_offset: offset, data_len: 0, param: 0,
-                            };
-                            self.data_port.submit(&done);
-                        }
-                        io_status::CQE_STREAM_EOF => {
-                            self.eof = true;
-                        }
-                        io_status::CQE_STREAM_RST => {
-                            self.eof = true;
-                        }
-                        _ => {}
+                    if stream_type == io_status::CQE_STREAM_TX_DONE {
+                        // Free our consumer pool slot
+                        self.data_port.free(cqe.result);
+                    } else {
+                        // Non-TX CQE (STREAM_DATA, EOF, RST) — queue it for
+                        // fill_rx_buf to process later.
+                        self.pending_cqes.push_back(cqe);
                     }
                 }
                 None => break,
@@ -317,9 +463,17 @@ impl TcpStream {
         self.rx_pos = 0;
         self.rx_len = 0;
 
-        // Poll for a CQE from ipd
+        // Poll for a CQE from ipd (check pending first)
+        let wait_ms = if self.read_timeout_ms > 0 { self.read_timeout_ms } else { 1000 };
+        let mut waited = false;
         loop {
-            match self.data_port.poll_cq() {
+            // Check for CQEs saved by drain_tx_completions first
+            let next_cqe = if let Some(cqe) = self.pending_cqes.pop_front() {
+                Some(cqe)
+            } else {
+                self.data_port.poll_cq()
+            };
+            match next_cqe {
                 Some(cqe) => {
                     let stream_type = cqe.flags & 0x00FF;
                     match stream_type {
@@ -346,6 +500,7 @@ impl TcpStream {
                                 param: 0,
                             };
                             self.data_port.submit(&done);
+                            self.data_port.notify();
                             return Ok(());
                         }
                         io_status::CQE_STREAM_EOF => {
@@ -368,8 +523,13 @@ impl TcpStream {
                     }
                 }
                 None => {
+                    // With a read timeout, return WouldBlock after waiting once
+                    if waited && self.read_timeout_ms > 0 {
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock));
+                    }
                     // No CQE available — wait for notification
-                    self.data_port.wait(1000); // 1s timeout
+                    self.data_port.wait(wait_ms);
+                    waited = true;
                 }
             }
         }
@@ -443,7 +603,13 @@ impl io::Write for TcpStream {
             data_len: len,
             param: 0,
         };
-        self.data_port.submit(&sqe);
+        if !self.data_port.submit(&sqe) {
+            // SQ ring full — data lost! Log this.
+            userlib::uerror!("net", "sq_full"; data_len = len);
+            userlib::ulog::flush();
+            self.data_port.free(offset);
+            return Err(io::Error::new(io::ErrorKind::WouldBlock));
+        }
         self.data_port.notify();
 
         Ok(len as usize)

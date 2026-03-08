@@ -708,6 +708,9 @@ pub trait BusCtx {
     /// Stop a recurring timer (identified by tag).
     fn stop_timer(&mut self, tag: u32) -> Result<(), BusError>;
 
+    /// Change interval of a managed timer. Rearms immediately + updates auto-rearm.
+    fn set_timer_interval(&mut self, tag: u32, interval_ns: u64) -> Result<(), BusError>;
+
     // === Kernel bus ===
 
     /// Connect to a kernel bus as owner (claim it).

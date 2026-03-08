@@ -291,7 +291,7 @@ impl ProcessOps for KernelProcessOps {
     fn spawn(&self, parent: TaskId, source: SpawnSource) -> Result<TaskId, ProcessError> {
         match source {
             SpawnSource::Path(path) => {
-                match elf::spawn_from_path(path, parent, Capabilities::from_bits(0)) {
+                match elf::spawn_from_path_inherit(path, parent) {
                     Ok((child_id, _)) => Ok(child_id),
                     Err(elf::ElfError::NotExecutable) => Err(ProcessError::NotFound),
                     Err(_) => Err(ProcessError::OutOfMemory),

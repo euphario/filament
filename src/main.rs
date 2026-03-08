@@ -1323,8 +1323,10 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
     }
 
     // Use only direct UART output - no println! which may fault
-    // Use \r\n for proper terminal line endings
-    print_str_uart("\r\n=== EXCEPTION ===\r\n");
+    // Push past any scroll region with blank lines (escape sequences
+    // don't work reliably — shell on another CPU keeps refreshing)
+    for _ in 0..30 { print_str_uart("\r\n"); }
+    print_str_uart("=== EXCEPTION ===\r\n");
     print_str_uart("  ESR: 0x");
     print_hex_uart(esr);
     print_str_uart("\r\n  ELR: 0x");

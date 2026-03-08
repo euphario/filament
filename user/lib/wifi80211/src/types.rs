@@ -17,6 +17,8 @@ pub struct BssConfig {
     pub erp_protection: bool,
     /// HT protection mode (0=none, 1=nonmember, 2=20MHz, 3=non-HT mixed)
     pub ht_protection: u8,
+    /// WPA2-PSK enabled
+    pub wpa2: bool,
 }
 
 /// STA lifecycle state machine
@@ -139,6 +141,19 @@ pub const STA_FLAG_NON_ERP: u16 = 0x0010;
 pub const STA_FLAG_HT40: u16  = 0x0020;
 pub const STA_FLAG_SGI40: u16 = 0x0040;
 
+/// WPA2 4-way handshake state machine
+#[derive(Clone, Copy, PartialEq)]
+pub enum HandshakeState {
+    /// No handshake in progress (open auth or not yet started)
+    None,
+    /// M1 sent, waiting for M2
+    WaitM2,
+    /// M3 sent, waiting for M4
+    WaitM4,
+    /// Handshake complete, keys installed
+    Complete,
+}
+
 /// Per-STA table entry
 #[derive(Clone, Copy)]
 pub struct StaEntry {
@@ -166,6 +181,18 @@ pub struct StaEntry {
     pub flags: u16,
     /// Power save mode. Placeholder, always false for now.
     pub ps_mode: bool,
+    /// WPA2 4-way handshake state
+    pub hs_state: HandshakeState,
+    /// AP nonce for current handshake
+    pub anonce: [u8; 32],
+    /// STA nonce from M2
+    pub snonce: [u8; 32],
+    /// Pairwise Transient Key: KCK(16) + KEK(16) + TK(16)
+    pub ptk: [u8; 48],
+    /// EAPOL replay counter
+    pub replay_counter: u64,
+    /// Handshake retry count (for M1/M3 timeout retransmission)
+    pub hs_retries: u8,
 }
 
 impl StaEntry {
@@ -183,6 +210,12 @@ impl StaEntry {
         ht_param: 0,
         flags: 0,
         ps_mode: false,
+        hs_state: HandshakeState::None,
+        anonce: [0; 32],
+        snonce: [0; 32],
+        ptk: [0; 48],
+        replay_counter: 0,
+        hs_retries: 0,
     };
 }
 

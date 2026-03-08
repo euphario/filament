@@ -62,8 +62,8 @@ pub mod caps {
     pub const SERVICE: u64 = 0x0007;
     /// IPC | MEM | SPAWN
     pub const USER: u64 = 0x0007;
-    /// IPC | MEM | SPAWN | KILL — interactive admin shell
-    pub const USER_ADMIN: u64 = 0x0807;
+    /// IPC | MEM | SPAWN | GRANT | KILL — interactive admin shell
+    pub const USER_ADMIN: u64 = 0x0C07;
 }
 use crate::ipc::{Channel, ObjHandle};
 use crate::query::{

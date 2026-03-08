@@ -5,17 +5,127 @@
 //!
 //! # Algorithms
 //!
-//! | Algorithm | Crate | SSH use |
-//! |-----------|-------|---------|
-//! | SHA-256 | `sha2` | KEX hash, HMAC |
-//! | HMAC-SHA-256 | `hmac` | Packet integrity |
-//! | ChaCha20-Poly1305 | `chacha20poly1305` | Packet encryption |
-//! | X25519 ECDH | `curve25519-dalek` | Key exchange |
-//! | Ed25519 | `ed25519-dalek` | Host key signing/verification |
+//! | Algorithm | Crate | Use |
+//! |-----------|-------|-----|
+//! | SHA-256 | `sha2` | SSH KEX hash, HMAC |
+//! | HMAC-SHA-256 | `hmac` | SSH packet integrity |
+//! | SHA-1 | `sha1` | WPA2 PBKDF2, EAPOL MIC |
+//! | HMAC-SHA-1 | `hmac` | WPA2 key derivation |
+//! | AES-128 ECB | `aes` | WPA2 AES Key Wrap (RFC 3394) |
+//! | ChaCha20-Poly1305 | `chacha20poly1305` | SSH packet encryption |
+//! | X25519 ECDH | `curve25519-dalek` | SSH key exchange |
+//! | Ed25519 | `ed25519-dalek` | SSH host key signing/verification |
 
 extern crate alloc;
 
 use sha2::Digest;
+
+// =============================================================================
+// SHA-1
+// =============================================================================
+
+/// Compute SHA-1 hash of `data` in one shot.
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Incremental SHA-1 hasher.
+pub struct Sha1 {
+    inner: sha1::Sha1,
+}
+
+impl Sha1 {
+    pub fn new() -> Self {
+        Self { inner: sha1::Sha1::new() }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    pub fn finalize(self) -> [u8; 20] {
+        let result = self.inner.finalize();
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&result);
+        out
+    }
+}
+
+// =============================================================================
+// HMAC-SHA-1
+// =============================================================================
+
+/// HMAC-SHA-1 for WPA2 key derivation and EAPOL MIC.
+pub struct HmacSha1 {
+    inner: hmac::Hmac<sha1::Sha1>,
+}
+
+impl HmacSha1 {
+    /// Create a new HMAC-SHA-1 instance with the given key.
+    pub fn new(key: &[u8]) -> Self {
+        use hmac::Mac;
+        Self {
+            inner: hmac::Hmac::<sha1::Sha1>::new_from_slice(key)
+                .expect("HMAC key length is always valid"),
+        }
+    }
+
+    /// Feed data into the HMAC.
+    pub fn update(&mut self, data: &[u8]) {
+        use hmac::Mac;
+        self.inner.update(data);
+    }
+
+    /// Finalize and return the 20-byte MAC.
+    pub fn finalize(self) -> [u8; 20] {
+        use hmac::Mac;
+        let result = self.inner.finalize();
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&result.into_bytes());
+        out
+    }
+
+    /// Compute HMAC-SHA-1 in one shot.
+    pub fn mac(key: &[u8], data: &[u8]) -> [u8; 20] {
+        let mut hmac = Self::new(key);
+        hmac.update(data);
+        hmac.finalize()
+    }
+
+    /// Verify a MAC against expected value (constant-time).
+    pub fn verify(key: &[u8], data: &[u8], expected: &[u8; 20]) -> bool {
+        let computed = Self::mac(key, data);
+        let mut diff = 0u8;
+        for i in 0..20 {
+            diff |= computed[i] ^ expected[i];
+        }
+        diff == 0
+    }
+}
+
+// =============================================================================
+// AES-128 ECB (single block)
+// =============================================================================
+
+/// Encrypt a single 16-byte block with AES-128 in ECB mode.
+///
+/// Used for AES Key Wrap (RFC 3394) — wrapping GTK for EAPOL M3.
+pub fn aes128_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::generic_array::GenericArray;
+
+    let cipher = aes::Aes128::new(GenericArray::from_slice(key));
+    let mut out = GenericArray::clone_from_slice(block);
+    cipher.encrypt_block(&mut out);
+    let mut result = [0u8; 16];
+    result.copy_from_slice(&out);
+    result
+}
 
 // =============================================================================
 // SHA-256

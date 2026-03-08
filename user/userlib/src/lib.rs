@@ -15,7 +15,7 @@ pub mod error;
 pub mod syscall;
 pub mod ipc;
 pub mod io;
-pub mod console_ring;
+pub mod half_ring;
 pub mod query;
 pub mod mmio;
 pub mod dma;

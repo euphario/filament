@@ -50,62 +50,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::marker::PhantomData;
 
-// ============================================================================
-// Cache management for shared memory coherency
-// ============================================================================
-
-/// Data synchronization barrier
-#[inline]
-fn dsb() {
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-    }
-}
-
-/// Flush (clean) a cache line to memory
-#[inline]
-fn flush_cache_line(addr: u64) {
-    unsafe {
-        core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack, preserves_flags));
-    }
-}
-
-/// Invalidate a cache line
-#[inline]
-fn invalidate_cache_line(addr: u64) {
-    unsafe {
-        core::arch::asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags));
-    }
-}
-
-/// Flush a buffer to memory (after CPU writes, before other process reads)
-#[inline]
-fn flush_buffer(addr: u64, size: usize) {
-    const CACHE_LINE: usize = 64;
-    let start = addr & !(CACHE_LINE as u64 - 1);
-    let end = (addr + size as u64 + CACHE_LINE as u64 - 1) & !(CACHE_LINE as u64 - 1);
-    let mut a = start;
-    while a < end {
-        flush_cache_line(a);
-        a += CACHE_LINE as u64;
-    }
-    dsb();
-}
-
-/// Invalidate a buffer from cache (before CPU reads data written by other process)
-#[inline]
-fn invalidate_buffer(addr: u64, size: usize) {
-    const CACHE_LINE: usize = 64;
-    let start = addr & !(CACHE_LINE as u64 - 1);
-    let end = (addr + size as u64 + CACHE_LINE as u64 - 1) & !(CACHE_LINE as u64 - 1);
-    dsb();
-    let mut a = start;
-    while a < end {
-        invalidate_cache_line(a);
-        a += CACHE_LINE as u64;
-    }
-    dsb();
-}
+use crate::half_ring::TypedRing;
 
 /// Ring buffer magic number
 pub const RING_MAGIC: u32 = 0x52494E47; // "RING"
@@ -346,29 +291,6 @@ impl<S: Copy, C: Copy> Ring<S, C> {
                 self.header().data_size as usize
             )
         }
-    }
-
-    // === DMA Cache Management ===
-
-    /// Prepare data buffer region for DMA read (device writes to memory)
-    /// Call BEFORE starting DMA to ensure no dirty cache lines interfere
-    pub fn prepare_dma_read(&self, offset: usize, len: usize) {
-        let addr = self.data_ptr() as u64 + offset as u64;
-        invalidate_buffer(addr, len);
-    }
-
-    /// Complete DMA read (device wrote to memory)
-    /// Call AFTER DMA completes to ensure CPU sees fresh data
-    pub fn complete_dma_read(&self, offset: usize, len: usize) {
-        let addr = self.data_ptr() as u64 + offset as u64;
-        invalidate_buffer(addr, len);
-    }
-
-    /// Prepare data buffer region for DMA write (device reads from memory)
-    /// Call BEFORE starting DMA to flush CPU writes to memory
-    pub fn prepare_dma_write(&self, offset: usize, len: usize) {
-        let addr = self.data_ptr() as u64 + offset as u64;
-        flush_buffer(addr, len);
     }
 
     // === Submission Queue (Client -> Server) ===
@@ -934,15 +856,59 @@ impl LayeredRingHeader {
     }
 }
 
-/// Layered I/O ring with sidechannel
+/// Layered I/O ring with sidechannel.
+///
+/// Internally uses [`TypedRing`] for all queue operations, ensuring
+/// consistent lock-free SPSC semantics across SQ, CQ, and sidechannel.
 pub struct LayeredRing {
     /// Shared memory wrapper
     shmem: crate::ipc::Shmem,
+    /// Submission queue (upper layer → lower layer)
+    sq: TypedRing<IoSqe>,
+    /// Completion queue (lower layer → upper layer)
+    cq: TypedRing<IoCqe>,
+    /// Sidechannel for queries/control (bidirectional)
+    side: Option<TypedRing<SideEntry>>,
+    /// Offset to data pool within shmem
+    pool_offset: u32,
+    /// Size of data pool in bytes
+    pool_size: u32,
 }
 
 unsafe impl Send for LayeredRing {}
 
 impl LayeredRing {
+    /// Build TypedRings from an already-initialized shmem region.
+    ///
+    /// # Safety
+    ///
+    /// The header at `base` must be valid and the shmem region must be
+    /// large enough for all ring arrays described by the header.
+    unsafe fn rings_from_shmem(base: *mut u8) -> (TypedRing<IoSqe>, TypedRing<IoCqe>, Option<TypedRing<SideEntry>>) {
+        let header = &*(base as *const LayeredRingHeader);
+
+        let sq_ptr = base.add(LayeredRingHeader::sq_offset()) as *mut IoSqe;
+        let sq_head = &*(&header.sq_head as *const AtomicU32);
+        let sq_tail = &*(&header.sq_tail as *const AtomicU32);
+        let sq = TypedRing::from_raw_parts(sq_ptr, header.ring_size as usize, sq_head, sq_tail);
+
+        let cq_ptr = base.add(header.cq_offset()) as *mut IoCqe;
+        let cq_head = &*(&header.cq_head as *const AtomicU32);
+        let cq_tail = &*(&header.cq_tail as *const AtomicU32);
+        let cq = TypedRing::from_raw_parts(cq_ptr, header.ring_size as usize, cq_head, cq_tail);
+
+        let side = if header.side_size > 0 {
+            let side_ptr = base.add(header.side_offset()) as *mut SideEntry;
+            let side_head = &*(&header.side_head as *const AtomicU32);
+            let side_tail = &*(&header.side_tail as *const AtomicU32);
+            Some(TypedRing::from_raw_parts(side_ptr, header.side_size as usize, side_head, side_tail))
+        } else {
+            None
+        };
+
+        (sq, cq, side)
+    }
+
     /// Create a new layered ring
     ///
     /// # Arguments
@@ -993,7 +959,16 @@ impl LayeredRing {
             (*header)._reserved = [0; 3];
         }
 
-        Some(Self { shmem })
+        let (sq, cq, side) = unsafe { Self::rings_from_shmem(base) };
+
+        Some(Self {
+            shmem,
+            sq,
+            cq,
+            side,
+            pool_offset: struct_size as u32,
+            pool_size,
+        })
     }
 
     /// Map an existing layered ring
@@ -1006,14 +981,24 @@ impl LayeredRing {
         }
 
         // Validate header
-        unsafe {
-            let header = base as *const LayeredRingHeader;
-            if !(*header).is_valid() {
+        let (pool_offset, pool_size) = unsafe {
+            let header = &*(base as *const LayeredRingHeader);
+            if !header.is_valid() {
                 return None;
             }
-        }
+            (header.pool_offset, header.pool_size)
+        };
 
-        Some(Self { shmem })
+        let (sq, cq, side) = unsafe { Self::rings_from_shmem(base) };
+
+        Some(Self {
+            shmem,
+            sq,
+            cq,
+            side,
+            pool_offset,
+            pool_size,
+        })
     }
 
     /// Get shared memory ID
@@ -1058,166 +1043,67 @@ impl LayeredRing {
 
     /// Space available in SQ
     pub fn sq_space(&self) -> u32 {
-        if self.base().is_null() { return 0; }
-        let h = self.header();
-        let head = h.sq_head.load(Ordering::Acquire);
-        let tail = h.sq_tail.load(Ordering::Relaxed);
-        h.ring_size as u32 - tail.wrapping_sub(head)
+        self.sq.writable() as u32
     }
 
     /// Submit a request
     pub fn sq_submit(&self, sqe: &IoSqe) -> bool {
-        if self.base().is_null() { return false; }
-        let h = self.header();
-        if self.sq_space() == 0 {
-            return false;
-        }
-
-        let tail = h.sq_tail.load(Ordering::Relaxed);
-        let idx = (tail & h.ring_mask()) as usize;
-
-        unsafe {
-            let sq = self.base().add(LayeredRingHeader::sq_offset()) as *mut IoSqe;
-            core::ptr::write_volatile(sq.add(idx), *sqe);
-        }
-
-        core::sync::atomic::fence(Ordering::Release);
-        h.sq_tail.store(tail.wrapping_add(1), Ordering::Release);
-        true
+        self.sq.push(sqe)
     }
 
     /// Pending SQ entries
     pub fn sq_pending(&self) -> u32 {
-        if self.base().is_null() { return 0; }
-        let h = self.header();
-        let head = h.sq_head.load(Ordering::Relaxed);
-        let tail = h.sq_tail.load(Ordering::Acquire);
-        tail.wrapping_sub(head)
+        self.sq.readable() as u32
     }
 
     /// Consume next SQ entry
     pub fn sq_consume(&self) -> Option<IoSqe> {
-        if self.base().is_null() { return None; }
-        let h = self.header();
-        if self.sq_pending() == 0 {
-            return None;
-        }
-
-        let head = h.sq_head.load(Ordering::Relaxed);
-        let idx = (head & h.ring_mask()) as usize;
-
-        let sqe = unsafe {
-            let sq = self.base().add(LayeredRingHeader::sq_offset()) as *const IoSqe;
-            core::ptr::read_volatile(sq.add(idx))
-        };
-
-        core::sync::atomic::fence(Ordering::Acquire);
-        h.sq_head.store(head.wrapping_add(1), Ordering::Release);
-        Some(sqe)
+        self.sq.pull()
     }
 
     // === Completion Queue ===
 
     /// Post a completion. Returns false if CQ is full.
     pub fn cq_complete(&self, cqe: &IoCqe) -> bool {
-        if self.base().is_null() { return false; }
-        let h = self.header();
-        let tail = h.cq_tail.load(Ordering::Relaxed);
-        let head = h.cq_head.load(Ordering::Acquire);
-        let next_tail = tail.wrapping_add(1);
-
-        // CQ full — consumer hasn't drained completions
-        if next_tail.wrapping_sub(head) > h.ring_size as u32 {
-            return false;
-        }
-
-        let idx = (tail & h.ring_mask()) as usize;
-
-        unsafe {
-            let cq = self.base().add(h.cq_offset()) as *mut IoCqe;
-            core::ptr::write_volatile(cq.add(idx), *cqe);
-        }
-
-        core::sync::atomic::fence(Ordering::Release);
-        h.cq_tail.store(next_tail, Ordering::Release);
-        true
+        self.cq.push(cqe)
     }
 
     /// Pending CQ entries
     pub fn cq_pending(&self) -> u32 {
-        if self.base().is_null() { return 0; }
-        let h = self.header();
-        let head = h.cq_head.load(Ordering::Relaxed);
-        let tail = h.cq_tail.load(Ordering::Acquire);
-        tail.wrapping_sub(head)
+        self.cq.readable() as u32
     }
 
     /// Consume next CQ entry (advances cq_head in shared memory).
     pub fn cq_consume(&self) -> Option<IoCqe> {
-        if self.base().is_null() { return None; }
-        let h = self.header();
-        if self.cq_pending() == 0 {
-            return None;
-        }
-
-        let head = h.cq_head.load(Ordering::Relaxed);
-        let idx = (head & h.ring_mask()) as usize;
-
-        let cqe = unsafe {
-            let cq = self.base().add(h.cq_offset()) as *const IoCqe;
-            core::ptr::read_volatile(cq.add(idx))
-        };
-
-        core::sync::atomic::fence(Ordering::Acquire);
-        h.cq_head.store(head.wrapping_add(1), Ordering::Release);
-        Some(cqe)
+        self.cq.pull()
     }
 
     /// Peek at CQ entry at a given local cursor WITHOUT advancing cq_head.
     ///
     /// Used by deferred-ack consumers: read CQEs locally, then batch-advance
     /// cq_head via `cq_advance()` after processing. `cursor` is the caller's
-    /// local head counter (not the shared cq_head).
+    /// local head counter relative to the shared cq_head.
     pub fn cq_peek_at(&self, cursor: u32) -> Option<IoCqe> {
-        if self.base().is_null() { return None; }
-        let h = self.header();
-        let tail = h.cq_tail.load(Ordering::Acquire);
-        if cursor == tail {
-            return None; // Nothing new
-        }
-
-        let idx = (cursor & h.ring_mask()) as usize;
-        let cqe = unsafe {
-            let cq = self.base().add(h.cq_offset()) as *const IoCqe;
-            core::ptr::read_volatile(cq.add(idx))
-        };
-        core::sync::atomic::fence(Ordering::Acquire);
-        Some(cqe)
+        self.cq.peek_at(cursor)
     }
 
     /// Advance cq_head by `n` entries (batch ack after deferred peek).
     pub fn cq_advance(&self, n: u32) {
-        if self.base().is_null() || n == 0 { return; }
-        let h = self.header();
-        let head = h.cq_head.load(Ordering::Relaxed);
-        h.cq_head.store(head.wrapping_add(n), Ordering::Release);
+        self.cq.advance(n);
     }
 
     /// Read the current cq_head from shared memory (for provider-side reclaim).
     pub fn cq_consumer_head(&self) -> u32 {
-        if self.base().is_null() { return 0; }
         self.header().cq_head.load(Ordering::Acquire)
     }
 
     /// Get ring_size - 1 mask for index wrapping.
     pub fn ring_mask(&self) -> u32 {
-        if self.base().is_null() { return 0; }
         self.header().ring_mask()
     }
 
     /// Get ring_size.
     pub fn ring_size(&self) -> u16 {
-        if self.base().is_null() { return 0; }
         self.header().ring_size
     }
 
@@ -1225,139 +1111,56 @@ impl LayeredRing {
 
     /// Is sidechannel enabled?
     pub fn has_sidechannel(&self) -> bool {
-        if self.base().is_null() { return false; }
-        self.header().side_size > 0
-    }
-
-    /// Space in sidechannel
-    pub fn side_space(&self) -> u32 {
-        if self.base().is_null() { return 0; }
-        let h = self.header();
-        if h.side_size == 0 {
-            return 0;
-        }
-        let head = h.side_head.load(Ordering::Acquire);
-        let tail = h.side_tail.load(Ordering::Relaxed);
-        h.side_size as u32 - tail.wrapping_sub(head)
+        self.side.is_some()
     }
 
     /// Send sidechannel entry
     pub fn side_send(&self, entry: &SideEntry) -> bool {
-        if self.base().is_null() { return false; }
-        let h = self.header();
-        if h.side_size == 0 || self.side_space() == 0 {
-            return false;
+        match &self.side {
+            Some(side) => side.push(entry),
+            None => false,
         }
-
-        let tail = h.side_tail.load(Ordering::Relaxed);
-        let idx = (tail & h.side_mask()) as usize;
-
-        unsafe {
-            let side = self.base().add(h.side_offset()) as *mut SideEntry;
-            core::ptr::write_volatile(side.add(idx), *entry);
-        }
-
-        core::sync::atomic::fence(Ordering::Release);
-        h.side_tail.store(tail.wrapping_add(1), Ordering::Release);
-        true
     }
 
     /// Pending sidechannel entries
     pub fn side_pending(&self) -> u32 {
-        if self.base().is_null() { return 0; }
-        let h = self.header();
-        if h.side_size == 0 {
-            return 0;
+        match &self.side {
+            Some(side) => side.readable() as u32,
+            None => 0,
         }
-        let head = h.side_head.load(Ordering::Relaxed);
-        let tail = h.side_tail.load(Ordering::Acquire);
-        tail.wrapping_sub(head)
     }
 
     /// Receive sidechannel entry (consumes it)
     pub fn side_recv(&self) -> Option<SideEntry> {
-        if self.base().is_null() { return None; }
-        let h = self.header();
-        if h.side_size == 0 || self.side_pending() == 0 {
-            return None;
-        }
-
-        let head = h.side_head.load(Ordering::Relaxed);
-        let idx = (head & h.side_mask()) as usize;
-
-        // Bounds check: verify the side entry address is within the shmem region.
-        let side_off = h.side_offset();
-        let entry_end = side_off + (idx + 1) * core::mem::size_of::<SideEntry>();
-        if entry_end > self.shmem.size() {
-            return None;
-        }
-
-        let entry = unsafe {
-            let side = self.base().add(side_off) as *const SideEntry;
-            core::ptr::read_volatile(side.add(idx))
-        };
-
-        core::sync::atomic::fence(Ordering::Acquire);
-        h.side_head.store(head.wrapping_add(1), Ordering::Release);
-        Some(entry)
+        self.side.as_ref()?.pull()
     }
 
     /// Peek at next sidechannel entry without consuming
     pub fn side_peek(&self) -> Option<SideEntry> {
-        if self.base().is_null() { return None; }
-        let h = self.header();
-        if h.side_size == 0 || self.side_pending() == 0 {
-            return None;
-        }
-
-        let head = h.side_head.load(Ordering::Relaxed);
-        let idx = (head & h.side_mask()) as usize;
-
-        // Bounds check: verify the side entry address is within the shmem region.
-        // Defends against corrupted ring_size/side_size producing out-of-bounds pointers.
-        let side_off = h.side_offset();
-        let entry_end = side_off + (idx + 1) * core::mem::size_of::<SideEntry>();
-        if entry_end > self.shmem.size() {
-            return None;
-        }
-
-        let entry = unsafe {
-            let side = self.base().add(side_off) as *const SideEntry;
-            core::ptr::read_volatile(side.add(idx))
-        };
-
-        core::sync::atomic::fence(Ordering::Acquire);
-        // Don't advance head - just peek
-        Some(entry)
+        self.side.as_ref()?.peek()
     }
 
     // === Data Pool ===
 
     /// Get data pool base pointer
     pub fn pool_ptr(&self) -> *mut u8 {
-        if self.base().is_null() { return core::ptr::null_mut(); }
-        let h = self.header();
-        unsafe { self.base().add(h.pool_offset as usize) }
+        unsafe { self.base().add(self.pool_offset as usize) }
     }
 
     /// Get data pool size
     pub fn pool_size(&self) -> u32 {
-        if self.base().is_null() { return 0; }
-        self.header().pool_size
+        self.pool_size
     }
 
     /// Get data pool physical address (for DMA)
     pub fn pool_phys(&self) -> u64 {
-        if self.base().is_null() { return 0; }
-        self.shmem.paddr() + self.header().pool_offset as u64
+        self.shmem.paddr() + self.pool_offset as u64
     }
 
     /// Get slice at offset in pool
     pub fn pool_slice(&self, offset: u32, len: u32) -> Option<&[u8]> {
-        if self.base().is_null() { return None; }
-        let h = self.header();
         let end = offset.checked_add(len)?;
-        if end > h.pool_size {
+        if end > self.pool_size {
             return None;
         }
         unsafe {
@@ -1370,10 +1173,8 @@ impl LayeredRing {
 
     /// Get mutable slice at offset in pool
     pub fn pool_slice_mut(&self, offset: u32, len: u32) -> Option<&mut [u8]> {
-        if self.base().is_null() { return None; }
-        let h = self.header();
         let end = offset.checked_add(len)?;
-        if end > h.pool_size {
+        if end > self.pool_size {
             return None;
         }
         unsafe {
@@ -1404,7 +1205,11 @@ pub struct PoolAlloc {
     free_bitmap: [u64; 16],
 }
 
-/// Default slot size: 2048 bytes (fits 1514-byte Ethernet frame, 64B aligned).
+///// Default slot size: 2048 bytes.
+///
+/// Sized for standard Ethernet (MTU 1500 + 14-byte header = 1514, rounded up).
+/// For jumbo frames (MTU 9000), use `PoolAlloc::with_slot_size()` with a
+/// larger value (e.g., 10240).
 pub const POOL_SLOT_SIZE: u32 = 2048;
 
 impl PoolAlloc {

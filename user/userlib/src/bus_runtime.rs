@@ -903,6 +903,19 @@ impl BusCtx for RuntimeCtx {
         Err(BusError::NotFound)
     }
 
+    fn set_timer_interval(&mut self, tag: u32, interval_ns: u64) -> Result<(), BusError> {
+        for slot in self.managed_timers.iter_mut() {
+            if let Some(mt) = slot {
+                if mt.tag == tag {
+                    mt.interval_ns = interval_ns;
+                    let _ = mt.timer.set(interval_ns);
+                    return Ok(());
+                }
+            }
+        }
+        Err(BusError::NotFound)
+    }
+
     fn name(&self) -> &[u8] {
         &self.name[..self.name_len]
     }
@@ -1259,11 +1272,10 @@ impl<D: Driver> DriverRuntime<D> {
                     self.handle_child_exit(child_pid);
                 }
 
-                // Pass remaining signals to the driver.
-                let framework_mask = abi::signal_event::CHILD_EXIT;
-                if sig & !framework_mask != 0 {
-                    self.driver.signal(event.signal_event, event.signal_value, &mut self.ctx);
-                }
+                // Pass all signals to the driver (including CHILD_EXIT —
+                // bus-managed children are already handled above, but drivers
+                // that spawn children directly need to see CHILD_EXIT too).
+                self.driver.signal(event.signal_event, event.signal_value, &mut self.ctx);
                 continue;
             }
 

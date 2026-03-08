@@ -9,9 +9,14 @@ use smoltcp::time::Instant;
 
 use userlib::bus::BlockTransport;
 use userlib::ring::{IoSqe, IoCqe, io_op, io_status};
+use userlib::udebug;
 
+/// Ethernet header: dst(6) + src(6) + ethertype(2).
+const ETH_HEADER_LEN: usize = 14;
+/// IP MTU — matches smoltcp capabilities and NIC sidechannel.
+pub(crate) const MTU: usize = 1500;
 /// Maximum Ethernet frame size (header + payload, no FCS).
-const MAX_FRAME_SIZE: usize = 1514;
+pub(crate) const MAX_FRAME_SIZE: usize = MTU + ETH_HEADER_LEN;
 
 /// Number of buffered RX frame references.
 const RX_QUEUE_SIZE: usize = 16;
@@ -142,6 +147,7 @@ pub struct DataPathStats {
     pub tx_pool_drops: u32,
     pub rx_pool_full: u32,
     pub tx_cqe_reclaimed: u32,
+    pub tx_pool_full: u32,
 }
 
 impl DataPathStats {
@@ -154,6 +160,7 @@ impl DataPathStats {
             tx_pool_drops: 0,
             rx_pool_full: 0,
             tx_cqe_reclaimed: 0,
+            tx_pool_full: 0,
         }
     }
 }
@@ -210,12 +217,17 @@ impl<'a> Device for SmolDevice<'a> {
                 offset: r.offset,
                 len: r.len,
             };
+            // RX path: don't pre-allocate for the response TX token.
+            // Processing the incoming frame (TCP ACK, etc.) is more important
+            // than sending a response. If pool is full, consume() uses a
+            // scratch buffer and the response is silently dropped.
             let tx = IpdTxToken {
                 port: self.port,
                 tx_tracker: self.tx_tracker,
                 stats: self.stats,
                 group_id: self.group_id,
                 ring_mask: self.ring_mask,
+                pre_offset: None,
             };
             Some((rx, tx))
         } else {
@@ -224,20 +236,31 @@ impl<'a> Device for SmolDevice<'a> {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        // Pre-allocate a pool slot. If the pool is full, return None so
+        // smoltcp backs off and retries on the next poll cycle.
+        // This prevents the panic from handing smoltcp a 0-byte buffer.
+        let offset = match self.port.alloc(MAX_FRAME_SIZE as u32) {
+            Some(o) => o,
+            None => {
+                self.stats.tx_pool_full += 1;
+                return None;
+            }
+        };
         Some(IpdTxToken {
             port: self.port,
             tx_tracker: self.tx_tracker,
             stats: self.stats,
             group_id: self.group_id,
             ring_mask: self.ring_mask,
+            pre_offset: Some(offset),
         })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = 1500;
-        caps.max_burst_size = Some(1);
+        caps.max_transmission_unit = MTU;
+        caps.max_burst_size = None;
         caps
     }
 }
@@ -283,12 +306,18 @@ impl phy::RxToken for IpdRxToken {
 /// MTK special tag destination port mask for this bridge group.
 /// A unique tag is assigned via TxTracker so the TX CQE can be matched
 /// for pool reclaim.
+///
+/// `pre_offset` holds a pre-allocated pool slot from `transmit()`.
+/// When set, `consume()` uses it directly (guaranteed space).
+/// When None (from `receive()` fallback), `consume()` tries to alloc
+/// on demand, using a scratch buffer if the pool is full.
 pub struct IpdTxToken<'a> {
     port: &'a mut dyn BlockTransport,
     tx_tracker: &'a mut TxTracker,
     stats: &'a mut DataPathStats,
     group_id: u8,
     ring_mask: u32,
+    pre_offset: Option<u32>,
 }
 
 impl<'a> phy::TxToken for IpdTxToken<'a> {
@@ -296,13 +325,16 @@ impl<'a> phy::TxToken for IpdTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        if let Some(offset) = self.port.alloc(len as u32) {
+        let offset = self.pre_offset.or_else(|| self.port.alloc(len as u32));
+
+        if let Some(offset) = offset {
             // Zero-copy: smoltcp writes directly into pool memory.
             let result = if let Some(buf) = self.port.pool_slice_mut(offset, len as u32) {
                 f(buf)
             } else {
-                let mut empty = [0u8; 0];
-                f(&mut empty)
+                // pool_slice_mut failed (shouldn't happen) — scratch buffer.
+                let mut scratch = [0u8; MAX_FRAME_SIZE];
+                f(&mut scratch[..len.min(MAX_FRAME_SIZE)])
             };
 
             let tag = self.tx_tracker.track(offset, self.ring_mask);
@@ -317,17 +349,29 @@ impl<'a> phy::TxToken for IpdTxToken<'a> {
                 lba: 0,
                 param: 0,
             };
-            self.port.submit(&sqe);
+            if !self.port.submit(&sqe) {
+                udebug!("ipd", "tx_sq_full"; len = len as u32);
+            }
             self.port.notify();
             self.stats.tx_frames += 1;
             self.stats.tx_bytes += len as u64;
 
+            // Log first few TX frames for diagnostics
+            if self.stats.tx_frames <= 5 || self.stats.tx_frames % 1000 == 0 {
+                udebug!("ipd", "tx_frame"; len = len as u32,
+                    total = self.stats.tx_frames, drops = self.stats.tx_pool_drops);
+            }
+
             result
         } else {
-            // No pool space — drop the frame.
+            // No pool space — absorb the frame into a scratch buffer.
+            // smoltcp considers this "sent" but no packet goes on the wire.
+            // TCP will retransmit when RTO fires.
             self.stats.tx_pool_drops += 1;
-            let mut empty = [0u8; 0];
-            f(&mut empty)
+            udebug!("ipd", "tx_pool_drop"; len = len as u32,
+                drops = self.stats.tx_pool_drops);
+            let mut scratch = [0u8; MAX_FRAME_SIZE];
+            f(&mut scratch[..len.min(MAX_FRAME_SIZE)])
         }
     }
 }

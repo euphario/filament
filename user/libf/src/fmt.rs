@@ -164,6 +164,76 @@ pub fn format_hex32_into(buf: &mut [u8], val: u32) -> usize {
     pos
 }
 
+/// A `core::fmt::Write` wrapper for `&mut [u8]` buffers.
+///
+/// Silently truncates on overflow — no panics, no errors. Use `finish()` to
+/// get the number of bytes written.
+///
+/// ```ignore
+/// let mut buf = [0u8; 128];
+/// let mut w = BufWriter::new(&mut buf);
+/// w.kv("channel", 6);
+/// w.on_off(true);
+/// let n = w.finish();
+/// ```
+pub struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> BufWriter<'a> {
+    /// Create a new BufWriter over `buf`.
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    /// Append raw bytes, silently truncating if full.
+    pub fn put(&mut self, s: &[u8]) {
+        let avail = self.buf.len() - self.pos;
+        let n = s.len().min(avail);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&s[..n]);
+        self.pos += n;
+    }
+
+    /// Write `key=val\n` where val is any `Display` type.
+    pub fn kv(&mut self, key: &str, val: impl fmt::Display) {
+        self.put(key.as_bytes());
+        self.put(b"=");
+        let _ = fmt::Write::write_fmt(self, format_args!("{}", val));
+        self.put(b"\n");
+    }
+
+    /// Write `"on"` or `"off"`.
+    pub fn on_off(&mut self, val: bool) {
+        self.put(if val { b"on" } else { b"off" });
+    }
+
+    /// Write 6-byte MAC as 12 lowercase hex chars (no colons).
+    pub fn mac(&mut self, addr: &[u8; 6]) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for &b in addr {
+            self.put(&[HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize]]);
+        }
+    }
+
+    /// Bytes written so far.
+    pub fn len(&self) -> usize {
+        self.pos
+    }
+
+    /// Consume the writer, returning bytes written.
+    pub fn finish(self) -> usize {
+        self.pos
+    }
+}
+
+impl fmt::Write for BufWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.put(s.as_bytes());
+        Ok(())
+    }
+}
+
 /// Format a u64 as hex with `0x` prefix, minimal digits. Returns bytes written.
 pub fn format_hex64_into(buf: &mut [u8], val: u64) -> usize {
     if buf.len() < 3 {

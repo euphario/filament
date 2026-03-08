@@ -7,6 +7,7 @@
 use smoltcp::wire::{
     DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, IpAddress, IpEndpoint, Ipv4Address,
 };
+use userlib::{uinfo, udebug};
 
 const LEASE_SECS: u32 = 3600;
 const POOL_START: u8 = 100;
@@ -23,6 +24,10 @@ pub struct DhcpServer {
     server_ip: Ipv4Address,
     subnet_mask: Ipv4Address,
     leases: [Option<Lease>; MAX_LEASES],
+    /// Last processed transaction ID (for deduplication).
+    last_xid: u32,
+    /// Timestamp (ns) when last_xid was processed.
+    last_xid_ns: u64,
 }
 
 impl DhcpServer {
@@ -31,6 +36,8 @@ impl DhcpServer {
             server_ip,
             subnet_mask,
             leases: [const { None }; MAX_LEASES],
+            last_xid: 0,
+            last_xid_ns: 0,
         }
     }
 
@@ -41,6 +48,28 @@ impl DhcpServer {
         let repr = DhcpRepr::parse(&packet).ok()?;
 
         let now_ns = userlib::syscall::gettime();
+
+        let msg_type_num = match repr.message_type {
+            DhcpMessageType::Discover => 1u32,
+            DhcpMessageType::Offer => 2,
+            DhcpMessageType::Request => 3,
+            DhcpMessageType::Ack => 5,
+            _ => 99,
+        };
+
+        udebug!("dhcp", "rx"; xid = repr.transaction_id, msg = msg_type_num,
+            last_xid = self.last_xid);
+
+        // Dedup: suppress duplicate requests with the same XID within 1 second.
+        // The RX path can deliver multiple copies of the same broadcast frame.
+        if repr.transaction_id == self.last_xid
+            && now_ns.wrapping_sub(self.last_xid_ns) < 1_000_000_000
+        {
+            udebug!("dhcp", "dedup_suppressed"; xid = repr.transaction_id);
+            return None;
+        }
+        self.last_xid = repr.transaction_id;
+        self.last_xid_ns = now_ns;
 
         match repr.message_type {
             DhcpMessageType::Discover => {

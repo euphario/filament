@@ -11,7 +11,7 @@ mod color;
 mod completion;
 mod console;
 mod cwd;
-mod input_box;
+mod decoration;
 mod output;
 mod readline;
 
@@ -37,8 +37,8 @@ macro_rules! println {
     }};
 }
 
-use userlib::ipc::{Port, Process, Mux, MuxFilter};
 use userlib::syscall;
+use userlib::ipc::{Process, Mux, MuxFilter};
 use userlib::vfs_client::VfsClient;
 
 // Re-export libf utilities so builtins can use crate::trim, crate::cmd_eq, etc.
@@ -76,62 +76,51 @@ static mut HISTORY: readline::History = readline::History::new();
 /// Background job PIDs (0 = empty slot)
 static mut BG_PIDS: [u32; MAX_BG_JOBS] = [0; MAX_BG_JOBS];
 
-/// Retry counter for console connection
-static mut CONSOLE_RETRY: u8 = 0;
-
 /// Current working directory
 static mut CWD: cwd::WorkingDir = cwd::WorkingDir::new();
 
 /// Cached VFS client (discovered once, reused)
 static mut VFS_CLIENT: Option<VfsClient> = None;
 
-/// Command server port for remote shell IPC
-static mut CMD_PORT: Option<Port> = None;
-
 #[unsafe(no_mangle)]
 fn main() {
-    // Initialize console connection (falls back to direct UART if consoled not available)
-    console::init();
+    userlib::uinfo!("shell", "starting";);
+    userlib::ulog::flush();
 
-    // Register shell command server port for remote shell access
-    if let Ok(port) = Port::register(b"shell-cmd:") {
-        let handle = port.handle();
-        unsafe { CMD_PORT = Some(port); }
-        // Register IPC poll callback so read_byte() services remote commands
-        // even while blocked waiting for console input
-        console::console_mut().set_ipc_poll(handle, drain_ipc_commands);
+    // Connect to console via mailbox (shmem_id from parent)
+    if !console::init() {
+        // No mailbox — exit (shell must be spawned by a transport)
+        userlib::uerror!("shell", "init_failed";);
+        userlib::ulog::flush();
+        syscall::exit(1);
     }
 
-    // Colored welcome banner
+    userlib::uinfo!("shell", "connected";);
+    userlib::ulog::flush();
+
+    // Set up decoration: clear screen, scroll region, separator, status bar
+    {
+        let con = console::console();
+        decoration::setup(con.cols, con.rows);
+    }
+
+    userlib::uinfo!("shell", "decoration_done";);
+    userlib::ulog::flush();
+
+    // Welcome banner (prints inside scroll region after setup)
     color::set(color::BOLD);
     color::set(color::CYAN);
     console::write(b"BPI-R4 Shell");
     color::reset();
     console::write(b" v0.3\r\n");
+    console::write(b"Connected\r\n");
     color::set(color::DIM);
-    if console::console().is_connected() {
-        console::write(b"Connected to consoled\r\n");
-    } else {
-        console::write(b"Direct UART mode (consoled not ready)\r\n");
-    }
     console::write(b"Type 'help' for commands\r\n\r\n");
     color::reset();
 
     loop {
-        // Drain any pending IPC command requests from remote shell
-        drain_ipc_commands();
-
-        // Try to connect to consoled if not connected yet (lazy connection)
-        if !console::console().is_connected() {
-            let retry = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE_RETRY) };
-            *retry = retry.wrapping_add(1);
-            // Retry every 10 prompts
-            if *retry % 10 == 0 {
-                if console::console_mut().connect() {
-                    console::write(b"\r\n[Connected to consoled]\r\n");
-                }
-            }
-        }
+        // Move cursor to fixed prompt row (between separator and status bar)
+        decoration::move_to_input();
 
         // Build prompt: bold-blue cwd + green " > " + reset
         let cwd_str = unsafe {
@@ -139,16 +128,12 @@ fn main() {
             cwd.as_bytes()
         };
 
-        let use_input_mode = console::console().is_connected();
-        if !use_input_mode {
-            // Legacy mode: write prompt directly
-            color::set(color::BOLD);
-            color::set(color::BLUE);
-            console::write(cwd_str);
-            color::set(color::GREEN);
-            console::write(b" > ");
-            color::reset();
-        }
+        color::set(color::BOLD);
+        color::set(color::BLUE);
+        console::write(cwd_str);
+        color::set(color::GREEN);
+        console::write(b" > ");
+        color::reset();
 
         // Read a line using readline with history
         let (buf_slice, history) = unsafe {
@@ -162,35 +147,12 @@ fn main() {
         };
 
         let mut editor = readline::LineEditor::new(buf_slice, history);
-
-        // Build colored prompt for input mode
-        if use_input_mode {
-            let mut pbuf = [0u8; 48];
-            let mut p = 0;
-            // Bold blue
-            pbuf[p..p+4].copy_from_slice(b"\x1b[1m");
-            p += 4;
-            pbuf[p..p+5].copy_from_slice(b"\x1b[34m");
-            p += 5;
-            // CWD (truncate if needed)
-            let clen = cwd_str.len().min(48 - p - 12); // reserve for " > " + color codes
-            pbuf[p..p+clen].copy_from_slice(&cwd_str[..clen]);
-            p += clen;
-            // Green
-            pbuf[p..p+5].copy_from_slice(b"\x1b[32m");
-            p += 5;
-            // " > "
-            pbuf[p..p+3].copy_from_slice(b" > ");
-            p += 3;
-            // Reset
-            pbuf[p..p+4].copy_from_slice(b"\x1b[0m");
-            p += 4;
-
-            let visible_width = (clen + 3) as u8; // cwd + " > "
-            editor.set_prompt(&pbuf[..p], visible_width);
-        }
-
+        // Prompt visible width: cwd + " > " = cwd_len + 3
+        editor.set_prompt_width(cwd_str.len() as u16 + 3);
         let len = editor.read();
+
+        // Move cursor back to scroll region for output
+        decoration::move_to_output();
 
         if len == 0 {
             continue;
@@ -202,56 +164,24 @@ fn main() {
             continue;
         }
 
+        // Log command execution for data path tracing (SSH only)
+        let ssh = console::console().ssh_mode;
+        let pipe_before = if ssh { console::console().pipe_writable() } else { 0 };
+        let t0 = if ssh { syscall::gettime() } else { 0 };
+
         execute_command(cmd);
-    }
-}
 
-/// Drain pending IPC command requests from remote shell clients.
-/// Accepts connections on the "shell-cmd:" port, executes commands with
-/// output capture, and sends the response back over the channel.
-fn drain_ipc_commands() {
-    let port = match unsafe { &mut *core::ptr::addr_of_mut!(CMD_PORT) } {
-        Some(p) => p,
-        None => return,
-    };
-
-    // Process up to 4 pending requests per drain cycle
-    for _ in 0..4 {
-        let mut channel = match port.try_accept() {
-            Some(ch) => ch,
-            None => break,
-        };
-
-        let mut cmd_buf = [0u8; 256];
-        let n = match channel.recv(&mut cmd_buf) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-
-        if n == 0 {
-            continue;
+        if ssh {
+            let t1 = syscall::gettime();
+            let pipe_after = console::console().pipe_writable();
+            let elapsed_ms = (t1.saturating_sub(t0)) / 1_000_000;
+            let bytes_out = pipe_before.saturating_sub(pipe_after);
+            userlib::udebug!("shell", "cmd_done";
+                elapsed_ms = elapsed_ms as u32,
+                bytes_out = bytes_out as u32,
+                pipe_free = pipe_after as u32);
+            userlib::ulog::flush();
         }
-
-        let cmd = trim(&cmd_buf[..n]);
-        if cmd.is_empty() {
-            continue;
-        }
-
-        // Execute command with output captured
-        let mut capture = console::CaptureBuffer::new();
-        console::begin_capture(&mut capture);
-        execute_command(cmd);
-        console::end_capture();
-
-        // Send response in chunks (576 byte IPC limit, use 512 for data)
-        let data = capture.as_slice();
-        let mut offset = 0;
-        while offset < data.len() {
-            let chunk_end = (offset + 512).min(data.len());
-            let _ = channel.send(&data[offset..chunk_end]);
-            offset = chunk_end;
-        }
-        // Channel drops here -> closes -> signals EOF to client
     }
 }
 
@@ -264,6 +194,13 @@ fn print_dec(val: usize) {
 
 /// Execute a command
 fn execute_command(cmd: &[u8]) {
+    // Log which command is about to run (SSH diagnostics only)
+    if console::console().ssh_mode {
+        let cmd_str = core::str::from_utf8(cmd).unwrap_or("?");
+        let log_name = if cmd_str.len() > 24 { &cmd_str[..24] } else { cmd_str };
+        userlib::udebug!("shell", "cmd_exec"; cmd = log_name, len = cmd.len() as u32);
+    }
+
     // Built-in commands
     if cmd_eq(cmd, b"help") || cmd_eq(cmd, b"?") {
         cmd_help();
@@ -313,7 +250,7 @@ fn execute_command(cmd: &[u8]) {
     } else if cmd_eq(cmd, b"pcied") {
         cmd_run_program("bin/pcied");
     } else if cmd_eq(cmd, b"wifi") {
-        cmd_run_program("bin/wifid");
+        cmd_run_program("bin/wifi2");
     } else if cmd_eq(cmd, b"fan") {
         // Start PWM driver in background
         cmd_bg(b"bin/pwm");
@@ -611,6 +548,8 @@ fn cmd_uptime() {
 fn cmd_clear() {
     // ANSI: clear screen + cursor home
     console::write(b"\x1b[2J\x1b[H");
+    // Redraw decoration (separator + status bar + scroll region)
+    decoration::redraw();
 }
 
 fn cmd_uname() {

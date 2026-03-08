@@ -17,6 +17,7 @@ pub mod io;
 pub mod net;
 pub mod parse;
 pub mod str;
+pub mod sync;
 
 /// Prelude — import everything a typical program needs.
 ///
@@ -33,7 +34,7 @@ pub mod prelude {
     pub use alloc::format;
 
     // libf utilities
-    pub use crate::fmt::StackStr;
+    pub use crate::fmt::{StackStr, BufWriter};
     pub use crate::str::{trim, eq_ignore_ascii_case};
     pub use crate::parse::parse_u32;
 
