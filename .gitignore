@@ -26,8 +26,7 @@ Thumbs.db
 linux
 
 # Build artifacts in subdirectories
-user/driver/devd/target/
-user/userlib/target/
+user/**/target/
 
 # Debug logs
 *.log
