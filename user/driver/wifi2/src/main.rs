@@ -820,7 +820,8 @@ impl Wifi2 {
             let empty_tim = [0u8; 8];
             let mut bcn_buf = [0u8; 256];
             let bcn_len = wifi80211::frame::build_beacon(&mut bcn_buf, &bss_config, 0, 0, &empty_tim);
-            mcu::set_beacon(dev, ring, 0, HW_BSSID_0, &bcn_buf[..bcn_len], true, *seq, None, true).map_err(mcu_err)?;
+            let bmc_idx = MT7996_WTBL_RESERVED - HW_BSSID_0 as u16;
+            mcu::set_beacon(dev, ring, 0, HW_BSSID_0, bmc_idx, &bcn_buf[..bcn_len], true, *seq, None, true).map_err(mcu_err)?;
             self.beacon_buf[..bcn_len].copy_from_slice(&bcn_buf[..bcn_len]);
             self.beacon_len = bcn_len;
         }
@@ -1858,7 +1859,8 @@ impl Wifi2 {
         if self.beacon_rearm_pending {
             self.beacon_rearm_pending = false;
             if let Some(ref mut ring) = self.wa_ring {
-                let _ = mcu::set_beacon(dev, ring, 0, HW_BSSID_0,
+                let bmc_idx = MT7996_WTBL_RESERVED - HW_BSSID_0 as u16;
+                let _ = mcu::set_beacon(dev, ring, 0, HW_BSSID_0, bmc_idx,
                     &self.beacon_buf[..self.beacon_len], true, self.seq, None, true);
                 self.seq = self.seq.wrapping_add(1);
                 uinfo!("wifi2", "beacon_rearmed_after_ser");

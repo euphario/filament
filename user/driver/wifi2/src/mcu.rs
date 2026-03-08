@@ -1518,7 +1518,7 @@ pub fn set_edca(
 /// Linux: mt7996/mcu.c:2766 mt7996_mcu_add_beacon()
 pub fn set_beacon(
     dev: &Mt76Device, ring: &mut TxRing,
-    band: u8, omac_idx: u8, beacon_frame: &[u8], enable: bool,
+    band: u8, omac_idx: u8, bmc_wlan_idx: u16, beacon_frame: &[u8], enable: bool,
     seq: u8, irq: Option<&mut FwIrq>, wait: bool,
 ) -> Result<(), McuError> {
     const MAX_BEACON: usize = 256;
@@ -1548,16 +1548,24 @@ pub fn set_beacon(
         | ((MT_LMAC_BCN0 as u32) << 25);
     data[txd_off..txd_off + 4].copy_from_slice(&txd0.to_le_bytes());
 
-    let txd1 = ((MT_HDR_FORMAT_802_11 as u32) << 14)
+    // Linux: mt7996/mac.c:953 (base) + mac.c:815 (80211 writer)
+    // WLAN_IDX[11:0] | HDR_FORMAT[15:14] | HDR_INFO[20:16] | OWN_MAC[30:25] | FIXED_RATE[31]
+    let txd1 = (bmc_wlan_idx as u32)
+        | ((MT_HDR_FORMAT_802_11 as u32) << 14)
         | (12u32 << 16)
         | ((omac_idx as u32) << 25)
         | (1u32 << 31);
     data[txd_off + 4..txd_off + 8].copy_from_slice(&txd1.to_le_bytes());
 
-    let txd2 = 8u32; // FRAME_TYPE(mgmt) + SUB_TYPE(beacon=8)
+    let txd2 = 8u32; // FRAME_TYPE(mgmt=0) | SUB_TYPE(beacon=8)
     data[txd_off + 8..txd_off + 12].copy_from_slice(&txd2.to_le_bytes());
 
-    let txd3 = 1u32 | (1u32 << 4) | (0x1Fu32 << 11) | (1u32 << 28);
+    // Linux: mac.c:962 SW_POWER_MGMT | REM_TX_COUNT(15) | NO_ACK
+    // mac.c:1013 BA_DISABLE added for FIXED_RATE frames
+    let txd3 = (1u32)              // NO_ACK (beacons aren't acked)
+        | (15u32 << 11)            // REM_TX_COUNT
+        | (1u32 << 28)             // BA_DISABLE (fixed-rate frames)
+        | (1u32 << 29);            // SW_POWER_MGMT — tells firmware to manage PS/TIM
     data[txd_off + 12..txd_off + 16].copy_from_slice(&txd3.to_le_bytes());
 
     let txd6 = (1u32 << 2) | (1u32 << 3) | (1u32 << 4)
