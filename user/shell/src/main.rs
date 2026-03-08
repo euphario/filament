@@ -239,6 +239,18 @@ fn execute_command(cmd: &[u8]) {
         cmd_spawn(&cmd[6..]);
     } else if cmd_eq(cmd, b"panic") {
         panic!("User requested panic");
+    } else if cmd_eq(cmd, b"kpanic") {
+        println!("Triggering kernel panic...");
+        syscall::kernel_panic();
+    } else if cmd_eq(cmd, b"deco") || cmd_eq(cmd, b"deco on") {
+        if !decoration::is_active() {
+            let con = console::console();
+            decoration::setup(con.cols, con.rows);
+            println!("Decoration enabled");
+        }
+    } else if cmd_starts_with(cmd, b"deco ") && cmd_eq(&cmd[5..], b"off") {
+        decoration::teardown();
+        println!("Decoration disabled");
     } else if cmd_eq(cmd, b"usb") {
         cmd_run_program("bin/usbd");
     } else if cmd_eq(cmd, b"gpio") {
@@ -503,6 +515,8 @@ fn cmd_help() {
         ("log <level>", "Set log level (error/warn/info/notice/debug/trace)"),
         ("logs [on|off|n]", "Control console log region"),
         ("resize", "Detect/display terminal size"),
+        ("deco [on|off]", "Toggle status bar decoration"),
+        ("kpanic", "Trigger kernel panic (debug)"),
         ("reset, reboot", "Graceful shutdown + reset"),
     ];
 

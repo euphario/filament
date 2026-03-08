@@ -428,6 +428,16 @@ pub(super) fn sys_shutdown(exit_code: u8) -> i64 {
     }
 }
 
+/// Trigger a kernel panic — for debugging exception dump output.
+/// Requires KILL capability.
+pub(super) fn sys_kernel_panic() -> i64 {
+    let ctx = create_syscall_context();
+    if let Err(_) = ctx.require_capability(Capabilities::KILL.bits()) {
+        return KernelError::PermDenied.to_errno();
+    }
+    panic!("User-requested kernel panic via syscall 91");
+}
+
 // sys_signal_allow REMOVED - Microkernel design: permission model uses capabilities.
 // Signal permissions are controlled via the capability system, not explicit allowlists.
 

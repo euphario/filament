@@ -405,6 +405,12 @@ pub fn shutdown(exit_code: u8) -> i64 {
     syscall1(sys::SHUTDOWN, exit_code as u64)
 }
 
+/// Trigger a kernel panic for debugging exception dump output.
+/// Requires KILL capability.
+pub fn kernel_panic() -> i64 {
+    syscall0(sys::KERNEL_PANIC)
+}
+
 
 // ============================================================================
 // Unified Object Interface (the 5 syscalls)

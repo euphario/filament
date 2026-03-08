@@ -68,6 +68,18 @@ pub fn redraw() {
     setup(cols, rows);
 }
 
+/// Tear down decoration: reset scroll region, clear screen.
+pub fn teardown() {
+    unsafe { ACTIVE = false; }
+    // Reset scroll region to full screen, clear, home
+    console::write(b"\x1b[r\x1b[2J\x1b[1;1H");
+}
+
+/// Whether decoration is currently active.
+pub fn is_active() -> bool {
+    unsafe { ACTIVE }
+}
+
 /// Move cursor to the prompt row (rows-1), clear it.
 pub fn move_to_input() {
     if !unsafe { ACTIVE } {

@@ -86,6 +86,7 @@ pub enum SyscallNumber {
     SetExceptionChannel = 88, // Register exception channel on child task
     ExceptionResume = 89,     // Resume or kill a frozen (faulted) child task
     SetResourceLimits = 90,   // Set per-task resource limits on child
+    KernelPanic = 91,          // Trigger kernel panic (debug, requires CAP_SYS_ADMIN)
 
     // Unified interface (100-105) - THE 6 SYSCALLS
     Open = 100,
@@ -146,6 +147,7 @@ impl From<u64> for SyscallNumber {
             88 => SyscallNumber::SetExceptionChannel,
             89 => SyscallNumber::ExceptionResume,
             90 => SyscallNumber::SetResourceLimits,
+            91 => SyscallNumber::KernelPanic,
             // Unified interface (100-105)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
@@ -271,6 +273,7 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         // SignalAllow removed - use capability-based permissions
         // CpuStats removed - use userspace service
         SyscallNumber::RamfsList => misc::sys_ramfs_list(args.arg0, args.arg1 as usize),
+        SyscallNumber::KernelPanic => misc::sys_kernel_panic(),
 
         // Memory management (memory.rs)
         SyscallNumber::Mmap => memory::sys_mmap(args.arg0, args.arg1 as usize, args.arg2 as u32),
@@ -354,6 +357,7 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::SetExceptionChannel => "set_exception_channel",
         SyscallNumber::ExceptionResume => "exception_resume",
         SyscallNumber::SetResourceLimits => "set_resource_limits",
+        SyscallNumber::KernelPanic => "kernel_panic",
         // Unified interface (100-105)
         SyscallNumber::Open => "open",
         SyscallNumber::Read => "read",
