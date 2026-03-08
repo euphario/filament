@@ -56,6 +56,16 @@ pub struct Descriptor {
     pub info: u32,
 }
 
+impl Descriptor {
+    /// Zero all fields and set DMA_DONE — used during SER ring reset.
+    pub unsafe fn zero_and_mark_done(desc: *mut Self) {
+        core::ptr::write_volatile(&mut (*desc).buf0, 0);
+        core::ptr::write_volatile(&mut (*desc).buf1, 0);
+        core::ptr::write_volatile(&mut (*desc).info, 0);
+        core::ptr::write_volatile(&mut (*desc).ctrl, MT_DMA_CTL_DMA_DONE);
+    }
+}
+
 // ============================================================================
 // TX Ring
 // ============================================================================
@@ -178,8 +188,8 @@ impl TxRing {
         dev.wr(self.regs_base + MT_QUEUE_CPU_IDX, self.cpu_idx);
     }
 
-    /// Reclaim completed TX descriptors (sweep from sweep_idx to DMA_IDX).
-    pub fn reclaim(&mut self, dev: &Mt76Device) -> u32 {
+    /// Reclaim completed TX descriptors (sweep from sweep_idx to cpu_idx).
+    pub fn reclaim(&mut self, _dev: &Mt76Device) -> u32 {
         let mut count = 0u32;
         loop {
             if self.sweep_idx == self.cpu_idx {
@@ -193,7 +203,6 @@ impl TxRing {
             self.sweep_idx = (self.sweep_idx + 1) % self.ndesc;
             count += 1;
         }
-        let _ = dev; // used for potential register reads
         count
     }
 }
@@ -451,22 +460,26 @@ pub fn dma_start(dev: &Mt76Device, reset: bool) {
 
 /// Configure DMA prefetch registers.
 /// Source: dma.c:167-240, 520-523
+///
+/// Each register encodes [start_offset : ndesc_to_prefetch] packed as:
+///   bits[31:16] = ring start offset (ring_idx × ndesc × 16)
+///   bits[15:0]  = number of descriptors to prefetch
 fn dma_prefetch_hif(dev: &Mt76Device, ofs: u32) {
-    // TX prefetch
-    dev.wr(MT_WFDMA0_BASE + 0x640 + ofs, 0x00000002);
-    dev.wr(MT_WFDMA0_BASE + 0x644 + ofs, 0x00200002);
-    dev.wr(MT_WFDMA0_BASE + 0x648 + ofs, 0x00400008);
-    dev.wr(MT_WFDMA0_BASE + 0x64c + ofs, 0x00c00008);
-    dev.wr(MT_WFDMA0_BASE + 0x650 + ofs, 0x01400002);
-    dev.wr(MT_WFDMA0_BASE + 0x654 + ofs, 0x01600008);
+    // TX prefetch — dma.c:182-194
+    dev.wr(MT_WFDMA0_BASE + 0x640 + ofs, 0x00000002); // BAND0, 2 desc
+    dev.wr(MT_WFDMA0_BASE + 0x644 + ofs, 0x00200002); // ring 1, 2 desc
+    dev.wr(MT_WFDMA0_BASE + 0x648 + ofs, 0x00400008); // MCU_WM, 8 desc
+    dev.wr(MT_WFDMA0_BASE + 0x64c + ofs, 0x00c00008); // MCU_WA, 8 desc
+    dev.wr(MT_WFDMA0_BASE + 0x650 + ofs, 0x01400002); // FWDL, 2 desc
+    dev.wr(MT_WFDMA0_BASE + 0x654 + ofs, 0x01600008); // ring 5, 8 desc
 
-    // RX prefetch
-    dev.wr(MT_WFDMA0_BASE + 0x680 + ofs, 0x01e00002);
-    dev.wr(MT_WFDMA0_BASE + 0x684 + ofs, 0x02000002);
-    dev.wr(MT_WFDMA0_BASE + 0x688 + ofs, 0x02200002);
-    dev.wr(MT_WFDMA0_BASE + 0x68c + ofs, 0x02400002);
-    dev.wr(MT_WFDMA0_BASE + 0x690 + ofs, 0x02600010);
-    dev.wr(MT_WFDMA0_BASE + 0x694 + ofs, 0x03600010);
+    // RX prefetch — dma.c:206-230
+    dev.wr(MT_WFDMA0_BASE + 0x680 + ofs, 0x01e00002); // MCU_WM, 2 desc
+    dev.wr(MT_WFDMA0_BASE + 0x684 + ofs, 0x02000002); // MCU_WA, 2 desc
+    dev.wr(MT_WFDMA0_BASE + 0x688 + ofs, 0x02200002); // WA_MAIN, 2 desc
+    dev.wr(MT_WFDMA0_BASE + 0x68c + ofs, 0x02400002); // WA_TRI, 2 desc
+    dev.wr(MT_WFDMA0_BASE + 0x690 + ofs, 0x02600010); // BAND0, 16 desc
+    dev.wr(MT_WFDMA0_BASE + 0x694 + ofs, 0x03600010); // BAND2, 16 desc
 
     dev.set(WF_WFDMA0_GLO_CFG_EXT1 + ofs, WF_WFDMA0_GLO_CFG_EXT1_CALC_MODE);
 }
@@ -598,6 +611,8 @@ fn commit_tx_desc(ring: &mut TxRing, dev: &Mt76Device, idx: u32, frame_len: usiz
     let buf_phys = ring.buf_phys_at(idx);
     let frame_phys = buf_phys + MT_TXWI_SIZE as u64;
 
+    // ctrl: SD_LEN0 (TXD+TXP size) in [29:16], SD_LEN1 (CT parse len) in [13:0], LAST_SEC1 flag
+    // Source: Linux mt76/dma.c mt76_dma_add_buf() CT mode descriptor layout
     let ctrl = (MT_TXWI_SIZE as u32) << 16
         | (MT_CT_PARSE_LEN as u32 & MT_DMA_CTL_SD_LEN1_MASK)
         | MT_DMA_CTL_LAST_SEC1;

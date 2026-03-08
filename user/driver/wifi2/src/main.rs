@@ -18,6 +18,7 @@ use userlib::bus::{
 use userlib::bus_runtime::driver_main;
 use userlib::ring::{IoSqe, IoCqe, SideEntry, io_op, io_status, side_msg, side_status};
 
+#[allow(dead_code)]
 mod regs;
 mod device;
 mod dma;
@@ -765,11 +766,9 @@ impl Wifi2 {
             1, CMD_CBW_20MHZ, 0, 0, *seq, None).map_err(mcu_err)?;
         *seq = seq.wrapping_add(1);
 
-        // BSS cipher mode — deferred to WPA handshake (not in wifid init sequence).
-        // Calling update_bss_sec before any STA keys are installed may cause
-        // firmware inconsistency. Re-enable after SER root cause is found.
-        // mcu::update_bss_sec(dev, ring, 0, MCU_CIPHER_AES_CCMP, *seq, None).map_err(mcu_err)?;
-        // *seq = seq.wrapping_add(1);
+        // DEFERRED: BSS cipher mode (update_bss_sec) is intentionally not called here.
+        // wifid's working init sequence does not include it. The cipher mode is set
+        // implicitly when per-STA keys are installed during the WPA2 handshake.
 
         // Second STA_REC (newly=false, update existing)
         mcu::add_sta(dev, ring, 0, MT7996_WTBL_RESERVED, 0,
@@ -784,8 +783,8 @@ impl Wifi2 {
         mcu::set_edca(dev, ring, 0, *seq, None).map_err(mcu_err)?;
         *seq = seq.wrapping_add(1);
 
-        // Beacon offload
-        {
+        // Build BSS config shared between beacon template and AP state machine
+        let bss_config = {
             let mut bss = BssConfig {
                 bssid: mac_addr,
                 ssid: [0u8; MAX_SSID_LEN],
@@ -798,9 +797,14 @@ impl Wifi2 {
                 wpa2: true,
             };
             bss.ssid[..8].copy_from_slice(b"Filament");
+            bss
+        };
+
+        // Beacon offload
+        {
             let empty_tim = [0u8; 8];
             let mut bcn_buf = [0u8; 256];
-            let bcn_len = wifi80211::frame::build_beacon(&mut bcn_buf, &bss, 0, 0, &empty_tim);
+            let bcn_len = wifi80211::frame::build_beacon(&mut bcn_buf, &bss_config, 0, 0, &empty_tim);
             mcu::set_beacon(dev, ring, 0, HW_BSSID_0, &bcn_buf[..bcn_len], true, *seq, None, true).map_err(mcu_err)?;
             self.beacon_buf[..bcn_len].copy_from_slice(&bcn_buf[..bcn_len]);
             self.beacon_len = bcn_len;
@@ -875,19 +879,7 @@ impl Wifi2 {
         // AP state machine + WPA2
         // ================================================================
 
-        let mut ssid = [0u8; MAX_SSID_LEN];
-        ssid[..8].copy_from_slice(b"Filament");
-        self.ap = Some(ApManager::new(BssConfig {
-            bssid: mac_addr,
-            ssid,
-            ssid_len: 8,
-            channel: 1,
-            bandwidth: 0,
-            secondary_channel_offset: 0,
-            erp_protection: false,
-            ht_protection: 0,
-            wpa2: true,
-        }));
+        self.ap = Some(ApManager::new(bss_config));
 
         // WPA2-PSK handshake context
         let mut rsn_ie = [0u8; 22];
@@ -976,10 +968,8 @@ impl Wifi2 {
         if rxd1 & MT_RXD1_NORMAL_GROUP_3 == 0 {
             return RxPhyInfo::UNKNOWN;
         }
-        let mut g3_ofs: usize = 32;
-        if rxd1 & MT_RXD1_NORMAL_GROUP_4 != 0 { g3_ofs += 16; }
-        if rxd1 & MT_RXD1_NORMAL_GROUP_1 != 0 { g3_ofs += 16; }
-        if rxd1 & MT_RXD1_NORMAL_GROUP_2 != 0 { g3_ofs += 16; }
+        // Group 3 starts after G4/G1/G2 (each 16B if present)
+        let g3_ofs = event::group_offset(rxd1, false);
         if g3_ofs + 16 > buf.len() {
             return RxPhyInfo::UNKNOWN;
         }
@@ -1825,12 +1815,22 @@ impl Wifi2 {
         self.last_cq_head = new_head;
     }
 
-    /// Slow tick (500ms): clear MIB counters, beacon diagnostics, age out idle STAs.
+    /// Slow tick (500ms): clear MIB + CCA counters, beacon diagnostics, age out idle STAs.
     fn slow_tick_housekeeping(&mut self, dev: &Mt76Device) {
+        // Hardware MIB register clearing
+        // Source: Linux mac.c:2743-2882 mt7996_mac_update_stats()
         mac::update_stats(dev, 0);
 
-        // Heartbeat: log MCU_CMD and firmware state every 2 ticks (1 second)
-        // for the first 10 seconds, then every 10 ticks (5 seconds).
+        // Firmware CCA counter clearing — without this, firmware channel assessment
+        // counters accumulate indefinitely and the MAC assesses the channel as
+        // permanently busy, stopping all TX after ~42 seconds.
+        // Source: Linux mt7996/mac.c:2155-2170, mcu.c:3948-4025
+        if let Some(ref mut ring) = self.wa_ring {
+            let _ = mcu::get_chan_mib_info(dev, ring, 0, self.seq);
+            self.seq = self.seq.wrapping_add(1);
+        }
+
+        // Heartbeat: log MCU_CMD and firmware state periodically.
         let heartbeat = if self.tick <= 20 { self.tick % 2 == 0 } else { self.tick % 10 == 0 };
         if heartbeat {
             let mcu_cmd = dev.rr(MT_MCU_CMD);
@@ -1990,21 +1990,12 @@ impl Wifi2 {
     /// DMA reset: disable engines, zero all rings, re-program queue registers, refill RX.
     /// Must re-program desc_base + ring_size after reset (Linux: mt76_dma_sync_idx).
     fn ser_l1_dma_reset(&mut self, dev: &Mt76Device) {
-        // Disable DMA engines (no logic reset — firmware is still alive)
         dma::dma_disable(dev, false);
 
-        // Helper: zero descriptors and re-program queue for a TX ring
         fn reset_tx(dev: &Mt76Device, ring: &mut TxRing) {
-            for i in 0..ring.ndesc as usize {
-                let desc = ring.desc(i as u32);
-                unsafe {
-                    core::ptr::write_volatile(&mut (*desc).buf0, 0);
-                    core::ptr::write_volatile(&mut (*desc).buf1, 0);
-                    core::ptr::write_volatile(&mut (*desc).info, 0);
-                    core::ptr::write_volatile(&mut (*desc).ctrl, MT_DMA_CTL_DMA_DONE);
-                }
+            for i in 0..ring.ndesc {
+                unsafe { dma::Descriptor::zero_and_mark_done(ring.desc(i)); }
             }
-            // Re-program queue registers (Linux: mt76_dma_sync_idx)
             dma::program_queue(dev, ring.regs_base, ring.desc_phys, ring.ndesc);
             ring.cpu_idx = 0;
             ring.sweep_idx = 0;
@@ -2014,28 +2005,17 @@ impl Wifi2 {
         if let Some(ref mut ring) = self.wa_ring { reset_tx(dev, ring); }
         if let Some(ref mut ring) = self.mcu_ring { reset_tx(dev, ring); }
 
-        // Reset all RX rings: zero descriptors, re-program queue, refill
         for qi in 0..self.rx_queue_count {
             let q = &mut self.rx_queues[qi];
-            for i in 0..q.ndesc as usize {
-                let desc = q.desc(i as u32);
-                unsafe {
-                    core::ptr::write_volatile(&mut (*desc).buf0, 0);
-                    core::ptr::write_volatile(&mut (*desc).buf1, 0);
-                    core::ptr::write_volatile(&mut (*desc).info, 0);
-                    core::ptr::write_volatile(&mut (*desc).ctrl, MT_DMA_CTL_DMA_DONE);
-                }
+            for i in 0..q.ndesc {
+                unsafe { dma::Descriptor::zero_and_mark_done(q.desc(i)); }
             }
-            // Re-program queue registers (Linux: mt76_dma_sync_idx)
             dma::program_queue(dev, q.regs_base, q.desc_phys, q.ndesc);
             q.reset_counters();
             q.fill(dev);
         }
 
-        // Clear TX inflight tokens (all orphaned after reset)
-        for i in 0..TX_INFLIGHT_SIZE {
-            self.tx_inflight_tags[i] = TX_TAG_FREE;
-        }
+        self.tx_inflight_tags.fill(TX_TAG_FREE);
         self.tx_token = 0;
     }
 
@@ -2053,6 +2033,13 @@ impl Wifi2 {
         unotice!("wifi2", "ser_l1_done"; count = self.ser_count);
     }
 
+    /// Post an error CQE to a DataPort.
+    fn complete_tx_error(ctx: &mut dyn BusCtx, dp: PortId, tag: u32, status: u16) {
+        if let Some(port) = ctx.block_port(dp) {
+            port.complete_error(tag, status);
+        }
+    }
+
     /// Process TX from ipd: drain SQ, enqueue frames on band0.
     fn process_tx_from_ipd(&mut self, dev: &Mt76Device, dp: PortId, ctx: &mut dyn BusCtx) {
         for _ in 0..256 {
@@ -2061,17 +2048,13 @@ impl Wifi2 {
                 None => break,
             };
             if sqe.opcode != io_op::NET_SEND {
-                if let Some(port) = ctx.block_port(dp) {
-                    port.complete_error(sqe.tag, io_status::INVALID);
-                }
+                Self::complete_tx_error(ctx, dp, sqe.tag, io_status::INVALID);
                 continue;
             }
 
             let frame_len = sqe.data_len as usize;
             if frame_len < libf::net::eth::HEADER_LEN || frame_len > MAX_FRAME_SIZE {
-                if let Some(port) = ctx.block_port(dp) {
-                    port.complete_error(sqe.tag, io_status::INVALID);
-                }
+                Self::complete_tx_error(ctx, dp, sqe.tag, io_status::INVALID);
                 continue;
             }
 
@@ -2082,9 +2065,7 @@ impl Wifi2 {
                 })
             });
             if got.is_none() {
-                if let Some(port) = ctx.block_port(dp) {
-                    port.complete_error(sqe.tag, io_status::INVALID);
-                }
+                Self::complete_tx_error(ctx, dp, sqe.tag, io_status::INVALID);
                 continue;
             }
 
@@ -2129,9 +2110,7 @@ impl Wifi2 {
                     self.tx_inflight_tags[(tok as usize) & mask] = sqe.tag;
                 }
                 Err(_) => {
-                    if let Some(port) = ctx.block_port(dp) {
-                        port.complete_error(sqe.tag, io_status::NOT_READY);
-                    }
+                    Self::complete_tx_error(ctx, dp, sqe.tag, io_status::NOT_READY);
                 }
             }
         }

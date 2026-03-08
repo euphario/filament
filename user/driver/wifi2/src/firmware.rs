@@ -227,6 +227,8 @@ fn load_ram(
             override_addr = addr;
         }
 
+        // Ensure all MMIO writes complete before issuing MCU download command.
+        // Source: Linux mt7996/mcu.c:3012 wmb() before mt76_mcu_send_firmware()
         unsafe { core::arch::asm!("dsb sy", "isb") };
 
         mcu::init_download(dev, mcu_ring, addr, len, mode, *seq, irq(fw_irq))?;

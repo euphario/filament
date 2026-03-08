@@ -61,7 +61,7 @@ impl RxEapolFrame {
 /// Group order: G4(16), G1(16), G2(16), G3(16), G5(96).
 /// Pass `include_g3 = false` to stop before Group 3 (for RSSI extraction),
 /// or `true` to include all groups (for frame data offset).
-fn group_offset(rxd1: u32, include_g3: bool) -> usize {
+pub fn group_offset(rxd1: u32, include_g3: bool) -> usize {
     let mut ofs: usize = 32;
     if rxd1 & MT_RXD1_NORMAL_GROUP_4 != 0 { ofs += 16; }
     if rxd1 & MT_RXD1_NORMAL_GROUP_1 != 0 { ofs += 16; }

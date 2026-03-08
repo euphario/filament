@@ -647,6 +647,9 @@ pub const MT_TX_NORMAL: u32 = 0;
 /// ALTX queue index for management frames — mt76_connac3_mac.h:15
 pub const MT_LMAC_ALTX0: u8 = 0x10;
 
+/// MCU port RX queue index — mt76.h:78 MT_TX_MCU_PORT_RX_Q0
+pub const MCU_PORT_RX: u8 = 0x20;
+
 // ============================================================================
 // CT mode TXP (TX Packet) — mt76_connac3_mac.h, mt76_connac.h
 // In CT mode (PKT_FMT=0), a fw_txp follows the 32-byte TXD. The MAC reads

@@ -100,7 +100,7 @@ pub mod mcu_cmd {
 
 pub mod mcu_q {
     pub const SET: u8 = 1;
-    #[allow(dead_code)]
+    /// Used by McuTxd::new for firmware download commands
     pub const NA: u8 = 3;
 }
 
@@ -172,7 +172,11 @@ impl McuTxd {
     fn new(cmd: u8, payload_len: usize, seq: u8) -> Self {
         let mut txd = Self::default();
         let total = Self::SIZE + payload_len;
-        txd.txd[0] = (total as u32 & 0xffff) | (2 << 23) | (0x20 << 25);
+        // TXD0: total_len | PKT_FMT=CT(2) | Q_IDX=MCU_PORT_RX(0x20)
+        // Source: mt76_connac3_mac.h GENMASK(24,23) PKT_FMT, GENMASK(31,25) Q_IDX
+        txd.txd[0] = (total as u32 & 0xffff)
+            | (MT_TX_TYPE_CT as u32) << MT_TXD0_PKT_FMT_SHIFT
+            | (MCU_PORT_RX as u32) << MT_TXD0_Q_IDX_SHIFT;
         txd.txd[1] = 1 << 14; // HDR_FORMAT_CMD
         txd.len = ((total - 32) as u16).to_le();
         txd.pq_id = 0x8000u16.to_le();
@@ -350,6 +354,39 @@ fn wait_tx_done(
     Err(McuError::TxTimeout { cmd: cmd_name })
 }
 
+// MCU response buffer field offsets (after 32-byte RXD)
+// Source: mt76/mcu.h struct mt76_mcu_rxd
+const MCU_RXD_EID: usize = 36;   // event ID
+const MCU_RXD_SEQ: usize = 37;   // sequence number
+// UNI event response (eid=1) sub-fields
+const MCU_UNI_RESP_CID: usize = 44;    // command ID echo
+const MCU_UNI_RESP_STATUS: usize = 48; // status word (0 = success)
+
+/// Read MCU response fields from an RX buffer.
+/// Isolates all unsafe raw-pointer reads into one function.
+fn read_mcu_response(buf_ptr: *const u8) -> (u8, u8) {
+    unsafe {
+        let eid = core::ptr::read_volatile(buf_ptr.add(MCU_RXD_EID));
+        let seq = core::ptr::read_volatile(buf_ptr.add(MCU_RXD_SEQ));
+        (eid, seq)
+    }
+}
+
+/// Check UNI event response status (eid=1). Returns Err if firmware rejected.
+fn check_uni_response(buf_ptr: *const u8, cmd_name: &'static str, seq: u8) -> Result<(), McuError> {
+    let (cid, status) = unsafe {
+        let cid = core::ptr::read_volatile(buf_ptr.add(MCU_UNI_RESP_CID));
+        let status = u32::from_le(core::ptr::read_volatile(buf_ptr.add(MCU_UNI_RESP_STATUS) as *const u32));
+        (cid, status)
+    };
+    if status != 0 {
+        uerror!("mcu", "cmd_rejected"; cmd = cmd_name, cid = cid,
+            status = status, seq = seq as u32);
+        return Err(McuError::Rejected { cmd: cmd_name, status });
+    }
+    Ok(())
+}
+
 /// Wait for MCU response on the RX queue associated with the TX ring.
 fn wait_rx_response(
     dev: &Mt76Device, ring: &TxRing,
@@ -357,12 +394,7 @@ fn wait_rx_response(
     timeout_ms: u32, mut irq: Option<&mut FwIrq>,
     cmd_name: &'static str,
 ) -> Result<(), McuError> {
-    let rx_ndesc = if ring.rx_regs == MCU_WA_RX_REGS {
-        MT7996_RX_MCU_RING_SIZE_WA
-    } else {
-        MT7996_RX_MCU_RING_SIZE
-    };
-
+    let rx_ndesc = rx_ring_size(ring.rx_regs);
     let mut check_pos = pre_dma_idx;
     let iterations = if irq.is_some() { (timeout_ms + 19) / 20 } else { timeout_ms };
 
@@ -373,23 +405,15 @@ fn wait_rx_response(
 
             if ring.rx_buf_virt != 0 {
                 let buf_ptr = (ring.rx_buf_virt + check_pos as u64 * ring.rx_buf_size as u64) as *const u8;
-                let rxd_seq = unsafe { core::ptr::read_volatile(buf_ptr.add(37)) };
+                let (eid, seq) = read_mcu_response(buf_ptr);
 
-                if rxd_seq != expected_seq {
+                if seq != expected_seq {
                     check_pos = (check_pos + 1) % rx_ndesc;
                     continue;
                 }
 
-                // Check status for UNI event responses (eid=1)
-                let rxd_eid = unsafe { core::ptr::read_volatile(buf_ptr.add(36)) };
-                if rxd_eid == 1 {
-                    let resp_cid = unsafe { core::ptr::read_volatile(buf_ptr.add(44)) };
-                    let status = unsafe { u32::from_le(core::ptr::read_volatile(buf_ptr.add(48) as *const u32)) };
-                    if status != 0 {
-                        uerror!("mcu", "cmd_rejected"; cmd = cmd_name, cid = resp_cid,
-                            status = status, seq = expected_seq as u32);
-                        return Err(McuError::Rejected { cmd: cmd_name, status });
-                    }
+                if eid == 1 {
+                    check_uni_response(buf_ptr, cmd_name, expected_seq)?;
                 }
             }
             return Ok(());
@@ -490,11 +514,15 @@ pub fn send_fw_chunk(
 ) -> Result<(), McuError> {
     let next = (ring.cpu_idx + 1) % ring.ndesc;
 
-    // Ring full check — wait for DMA to consume at least one entry
+    // Wait up to 100ms for DMA to consume at least one entry
     if next == dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX) {
         for _ in 0..100u32 {
             if next != dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX) { break; }
             userlib::delay_ms(1);
+        }
+        if next == dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX) {
+            uerror!("mcu", "fw_chunk_ring_full");
+            return Err(McuError::TxTimeout { cmd: "fw_chunk" });
         }
     }
 
@@ -633,6 +661,7 @@ pub fn set_mwds(
     send_cmd_ext(dev, ring, mcu_cmd::EXT_CID, MCU_EXT_CMD_MWDS_SUPPORT, S2D_H2C, &req, seq)?;
     let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 2000, "mwds")?;
+    // WA EXT commands need settling time — Linux mcu.c:3265
     userlib::delay_ms(10);
     Ok(())
 }
@@ -668,16 +697,17 @@ pub fn init_rx_airtime(
 /// Linux: mt7996/mcu.c:365 mt7996_mcu_wa_cmd()
 pub fn wa_cmd(
     dev: &Mt76Device, ring: &mut TxRing,
-    a1: u32, a2: u32, a3: u32, seq: u8,
+    param1: u32, param2: u32, param3: u32, seq: u8,
 ) -> Result<(), McuError> {
     let mut args = [0u8; 12];
-    args[0..4].copy_from_slice(&a1.to_le_bytes());
-    args[4..8].copy_from_slice(&a2.to_le_bytes());
-    args[8..12].copy_from_slice(&a3.to_le_bytes());
+    args[0..4].copy_from_slice(&param1.to_le_bytes());
+    args[4..8].copy_from_slice(&param2.to_le_bytes());
+    args[8..12].copy_from_slice(&param3.to_le_bytes());
 
     send_cmd_ext(dev, ring, mcu_cmd::WA_PARAM, 1, S2D_H2C, &args, seq)?;
     let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 2000, "wa_cmd")?;
+    // WA needs settling time before next command — Linux mcu.c:375
     userlib::delay_ms(10);
     Ok(())
 }
@@ -1489,7 +1519,7 @@ pub fn set_edca(
 pub fn set_beacon(
     dev: &Mt76Device, ring: &mut TxRing,
     band: u8, omac_idx: u8, beacon_frame: &[u8], enable: bool,
-    seq: u8, irq: Option<&mut FwIrq>,
+    seq: u8, irq: Option<&mut FwIrq>, wait: bool,
 ) -> Result<(), McuError> {
     const MAX_BEACON: usize = 256;
     let bcn_len = beacon_frame.len().min(MAX_BEACON);
@@ -1542,7 +1572,7 @@ pub fn set_beacon(
     data[bcn_off + 23] = 0;
 
     let cmd = CMD_FIELD_UNI | (MCU_UNI_CMD_BSS_INFO_UPDATE as u32) | CMD_FIELD_WM | CMD_FIELD_WA;
-    send_uni_cmd(dev, ring, cmd, &data[..data_len], true, seq, irq)
+    send_uni_cmd(dev, ring, cmd, &data[..data_len], wait, seq, irq)
 }
 
 /// Program a fixed rate table entry.

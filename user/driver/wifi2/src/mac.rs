@@ -198,7 +198,9 @@ pub fn init(
     }
 
     // RRO module init
-    mcu::set_rro(dev, ring, UNI_RRO_SET_PLATFORM_TYPE, 2, *seq, irq.as_deref_mut())?;
+    // Source: init.c:610-614 — platform_type=2 for dual PCIe (hif2), 0 for single PCIe
+    let platform_type: u16 = if dev.has_hif2 { 2 } else { 0 };
+    mcu::set_rro(dev, ring, UNI_RRO_SET_PLATFORM_TYPE, platform_type, *seq, irq.as_deref_mut())?;
     *seq = seq.wrapping_add(1);
     mcu::set_rro(dev, ring, UNI_RRO_SET_BYPASS_MODE, 3, *seq, irq.as_deref_mut())?;
     *seq = seq.wrapping_add(1);
