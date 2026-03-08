@@ -534,6 +534,24 @@ pub fn print_str_uart(s: &str) {
     }
 }
 
+pub fn print_dec_uart(val: u32) {
+    if val == 0 {
+        uart::putc('0');
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut n = val;
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    for j in (0..i).rev() {
+        uart::putc(buf[j] as char);
+    }
+}
+
 /// Diagnostic: called from assembly when CURRENT_TTBR0 is 0 before eret
 /// caller_id: 1=exception_from_user, 2=irq_kernel_to_user, 3=irq_from_user, 4=svc_handler
 #[no_mangle]
@@ -1323,38 +1341,12 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
     }
 
     // Use only direct UART output - no println! which may fault
-    // Push past any scroll region with blank lines (escape sequences
-    // don't work reliably — shell on another CPU keeps refreshing)
+    // Push past any scroll region with blank lines
     for _ in 0..30 { print_str_uart("\r\n"); }
-    print_str_uart("=== EXCEPTION ===\r\n");
-    print_str_uart("  ESR: 0x");
-    print_hex_uart(esr);
-    print_str_uart("\r\n  ELR: 0x");
-    print_hex_uart(elr);
-    print_str_uart("\r\n  FAR: 0x");
-    print_hex_uart(far);
-
-    // Print SP_EL0 (user stack pointer)
-    let sp_el0: u64;
-    unsafe { core::arch::asm!("mrs {}, sp_el0", out(reg) sp_el0); }
-    print_str_uart("\r\n  SP:  0x");
-    print_hex_uart(sp_el0);
-
-    // Print current slot and PID
-    let slot = kernel::task::current_slot();
-    print_str_uart("\r\n  SLOT: ");
-    print_hex_uart(slot as u64);
-    let pid = unsafe {
-        kernel::task::scheduler().current_task_id().unwrap_or(0)
-    };
-    print_str_uart("\r\n  PID: ");
-    print_hex_uart(pid as u64);
+    print_str_uart("=== KERNEL EXCEPTION ===\r\n");
 
     // Decode exception class
     let ec = (esr >> 26) & 0x3f;
-    print_str_uart("\r\n  EC:  0x");
-    print_hex_uart(ec);
-    print_str_uart(" = ");
     let exception_name = match ec {
         0b000000 => "Unknown reason",
         0b000001 => "Trapped WFI/WFE",
@@ -1370,8 +1362,78 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
         0b111100 => "BRK instruction (breakpoint)",
         _ => "Other",
     };
+    print_str_uart("  ");
     print_str_uart(exception_name);
-    print_str_uart("\r\n=================\r\nSystem halted.\r\n");
+    print_str_uart("\r\n");
+
+    print_str_uart("  ESR:  0x");
+    print_hex_uart(esr);
+    print_str_uart("\r\n  ELR:  0x");
+    print_hex_uart(elr);
+    print_str_uart("\r\n  FAR:  0x");
+    print_hex_uart(far);
+
+    // SP_EL0 (user stack pointer) and LR
+    let sp_el0: u64;
+    let lr: u64;
+    let fp: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, sp_el0", out(reg) sp_el0);
+        core::arch::asm!("mov {}, lr", out(reg) lr);
+        core::arch::asm!("mov {}, x29", out(reg) fp);
+    }
+    print_str_uart("\r\n  SP:   0x");
+    print_hex_uart(sp_el0);
+    print_str_uart("\r\n  LR:   0x");
+    print_hex_uart(lr);
+    print_str_uart("\r\n  FP:   0x");
+    print_hex_uart(fp);
+
+    // Current task info
+    let slot = kernel::task::current_slot();
+    print_str_uart("\r\n  SLOT: ");
+    print_dec_uart(slot as u32);
+    let (pid, name) = unsafe {
+        let sched = kernel::task::scheduler();
+        if let Some(t) = sched.task(slot) {
+            (t.id, t.name)
+        } else {
+            (0, [0u8; 16])
+        }
+    };
+    print_str_uart("  PID: ");
+    print_dec_uart(pid);
+    print_str_uart(" (");
+    for &c in &name {
+        if c == 0 { break; }
+        uart::putc(c as char);
+    }
+    print_str_uart(")\r\n");
+
+    // Uptime
+    let ns = crate::platform::current::timer::now_ns();
+    let secs = ns / 1_000_000_000;
+    print_str_uart("  UP:   ");
+    print_dec_uart(secs as u32);
+    print_str_uart("s\r\n");
+
+    // Stack backtrace (FP chain)
+    print_str_uart("  Backtrace:\r\n");
+    let mut frame = fp;
+    for i in 0..16u32 {
+        if frame == 0 || frame & 7 != 0 { break; }
+        let prev_fp = unsafe { *(frame as *const u64) };
+        let ret_addr = unsafe { *((frame + 8) as *const u64) };
+        if ret_addr == 0 { break; }
+        print_str_uart("    #");
+        print_dec_uart(i);
+        print_str_uart(": 0x");
+        print_hex_uart(ret_addr);
+        print_str_uart("\r\n");
+        frame = prev_fp;
+    }
+
+    print_str_uart("========================\r\nSystem halted.\r\n");
 
     loop {
         unsafe { core::arch::asm!("wfe"); }
