@@ -44,3 +44,5 @@ panic = "abort"
 lto = true
 opt-level = "z"
 codegen-units = 1
+debug = 1                      # line tables for addr2line
+force-frame-pointers = true    # reliable FP-chain backtraces
