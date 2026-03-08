@@ -3,7 +3,7 @@
 //! This module contains syscall handlers for process lifecycle management:
 //! - Process creation (exec, exec_with_mailbox)
 //! - Process termination (exit, kill)
-//! - Process synchronization (wait, daemonize)
+//! - Process synchronization (wait)
 //! - Process information (ps_info, get_capabilities)
 //!
 //! # Design
@@ -232,22 +232,6 @@ pub(super) fn sys_wait(pid: i32, status_ptr: u64, flags: u32) -> i64 {
     }
 }
 
-/// Daemonize - detach from parent and become a daemon
-///
-/// Delegates to ProcessOps::daemonize() for parent-child detachment.
-pub(super) fn sys_daemonize() -> i64 {
-    let ctx = create_syscall_context();
-    let caller_pid = match ctx.current_task_id() {
-        Some(id) => id,
-        None => return KernelError::NoProcess.to_errno(),
-    };
-
-    match ctx.process().daemonize(caller_pid) {
-        Ok(()) => 0,
-        Err(e) => e.to_errno(),
-    }
-}
-
 /// Kill a process by PID
 ///
 /// Delegates to ProcessOps::kill() for state transition and parent notification.
@@ -440,7 +424,11 @@ pub(super) fn sys_signal_peek(target_pid: u32, buf_ptr: u64, max_count: usize) -
         return uaccess_to_errno(e);
     }
 
-    // Read signal queue under scheduler lock
+    // Copy signals to stack buffer under scheduler lock, then copy_to_user after release
+    const MAX_STACK_SIGNALS: usize = 16;
+    let mut sig_buf = [abi::PendingSignal { event: 0, value: 0 }; MAX_STACK_SIGNALS];
+    let actual_max = max_count.min(MAX_STACK_SIGNALS);
+
     let result: Result<usize, i64> = task::with_scheduler(|sched| {
         let slot = sched.slot_by_pid(target_pid).ok_or(KernelError::NoProcess.to_errno())?;
         let target = sched.task(slot).ok_or(KernelError::NoProcess.to_errno())?;
@@ -457,28 +445,33 @@ pub(super) fn sys_signal_peek(target_pid: u32, buf_ptr: u64, max_count: usize) -
             return Err(KernelError::PermDenied.to_errno());
         }
 
-        // Walk the ring buffer without consuming
-        let count = (target.signal_count as usize).min(max_count);
+        // Copy to stack buffer under lock
+        let count = (target.signal_count as usize).min(actual_max);
         for i in 0..count {
             let idx = ((target.signal_tail as usize) + i) % crate::kernel::task::tcb::MAX_PENDING_SIGNALS;
-            let sig = target.signal_queue[idx];
-            let offset = (i * entry_size) as u64;
-            let sig_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &sig as *const abi::PendingSignal as *const u8,
-                    entry_size,
-                )
-            };
-            if uaccess::copy_to_user(buf_ptr + offset, sig_bytes).is_err() {
-                return Ok(i);
-            }
+            sig_buf[i] = target.signal_queue[idx];
         }
 
         Ok(count)
     });
 
+    // Copy to userspace outside scheduler lock
     match result {
-        Ok(count) => count as i64,
+        Ok(count) => {
+            for i in 0..count {
+                let offset = (i * entry_size) as u64;
+                let sig_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &sig_buf[i] as *const abi::PendingSignal as *const u8,
+                        entry_size,
+                    )
+                };
+                if uaccess::copy_to_user(buf_ptr + offset, sig_bytes).is_err() {
+                    return i as i64;
+                }
+            }
+            count as i64
+        }
         Err(e) => e,
     }
 }

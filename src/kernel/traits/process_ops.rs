@@ -6,7 +6,7 @@
 //! - `exit` - Terminate current process
 //! - `kill` - Terminate another process (with capability check)
 //! - `spawn` - Create new process from ELF (multiple source types)
-//! - `daemonize` - Detach from parent (become a daemon)
+//! - `wait_child` - Wait for a child to exit
 
 use super::task::{TaskId, Capabilities};
 
@@ -100,11 +100,6 @@ pub trait ProcessOps: Send + Sync {
     /// Child inherits subset of parent's capabilities.
     fn spawn(&self, parent: TaskId, source: SpawnSource) -> Result<TaskId, ProcessError>;
 
-    /// Detach from parent process (become a daemon)
-    ///
-    /// Removes the parent-child relationship. The parent is woken if blocked.
-    fn daemonize(&self, task_id: TaskId) -> Result<(), ProcessError>;
-
     /// Get capabilities of a process
     ///
     /// Returns the capability bitmask for the given task, or error if not found.
@@ -196,10 +191,6 @@ impl ProcessOps for MockProcessOps {
 
     fn spawn(&self, _parent: TaskId, _source: SpawnSource) -> Result<TaskId, ProcessError> {
         self.spawn_result
-    }
-
-    fn daemonize(&self, _task_id: TaskId) -> Result<(), ProcessError> {
-        Ok(())
     }
 
     fn get_capabilities(&self, _task_id: TaskId) -> Result<u64, ProcessError> {

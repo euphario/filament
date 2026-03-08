@@ -622,9 +622,13 @@ pub(crate) fn send_reschedule_ipi() {
 ///
 /// Does NOT reschedule - caller must do that after setting up wait condition.
 ///
-/// # Returns
-/// true if state transition succeeded
-pub fn sleep_current(reason: task::SleepReason) -> bool {
+/// Block current task with a given block operation (sleep or wait).
+///
+/// Shared logic for sleep_current and wait_current:
+/// idle check → state transition → mark saved → set stack owner → notify.
+///
+/// Does NOT reschedule — caller must do that after setting up wait condition.
+fn block_current(op: BlockReason) -> bool {
     let mut sched = task::scheduler();
     let slot = current_slot();
 
@@ -633,62 +637,51 @@ pub fn sleep_current(reason: task::SleepReason) -> bool {
         return false;
     }
 
-    let ok = if let Some(task) = sched.task_mut(slot) {
-        if task.set_sleeping(reason).is_err() {
-            kerror!("sched", "invalid_sleep_transition"; from = task.state().name());
-            return false;
-        }
-        // CRITICAL: Mark task as needing full context restore and set
-        // kernel_stack_owner. Between sleep_current() returning and the caller's
-        // reschedule(), a wake could make this task Ready + on bitset. Without
-        // kernel_stack_owner, another CPU could select it while our kernel stack
-        // is still live. The pending_stack_release handler clears this after
-        // context_switch.
-        task.mark_context_saved();
-        task.set_kernel_stack_owner(percpu::cpu_id());
-        true
-    } else {
-        false
+    let Some(task) = sched.task_mut(slot) else {
+        return false;
     };
-    if ok {
-        sched.notify_blocked(slot);
-    }
-    ok
-}
 
-/// Put current task into waiting state with deadline.
-///
-/// Does NOT reschedule - caller must do that after setting up wait condition.
-///
-/// # Returns
-/// true if state transition succeeded
-pub fn wait_current(reason: task::WaitReason, deadline: u64) -> bool {
-    let mut sched = task::scheduler();
-    let slot = current_slot();
+    let transition_ok = match op {
+        BlockReason::Sleep(reason) => task.set_sleeping(reason).is_ok(),
+        BlockReason::Wait(reason, deadline) => task.set_waiting(reason, deadline).is_ok(),
+        BlockReason::None => return false,
+    };
 
-    if is_idle_slot(slot) {
-        kerror!("sched", "block_idle_attempt");
+    if !transition_ok {
+        kerror!("sched", "invalid_block_transition"; from = task.state().name());
         return false;
     }
 
-    let (ok, pid) = if let Some(task) = sched.task_mut(slot) {
-        if task.set_waiting(reason, deadline).is_err() {
-            kerror!("sched", "invalid_wait_transition"; from = task.state().name());
-            return false;
-        }
-        // CRITICAL: Same as sleep_current — prevent race with wake paths
-        task.mark_context_saved();
-        task.set_kernel_stack_owner(percpu::cpu_id());
-        (true, task.id)
-    } else {
-        (false, 0)
-    };
-    if ok {
-        sched.notify_blocked(slot);
+    // CRITICAL: Mark task as needing full context restore and set
+    // kernel_stack_owner. Between block_current() returning and the caller's
+    // reschedule(), a wake could make this task Ready + on bitset. Without
+    // kernel_stack_owner, another CPU could select it while our kernel stack
+    // is still live. The pending_stack_release handler clears this after
+    // context_switch.
+    task.mark_context_saved();
+    task.set_kernel_stack_owner(percpu::cpu_id());
+    let pid = task.id;
+
+    sched.notify_blocked(slot);
+
+    if let BlockReason::Wait(_, deadline) = op {
         kdebug!("sched", "blocked"; pid = pid as u64, deadline = deadline);
         sched.note_deadline(deadline);
     }
-    ok
+
+    true
+}
+
+/// Put current task into sleeping state.
+/// Does NOT reschedule — caller must do that after setting up wait condition.
+pub fn sleep_current(reason: task::SleepReason) -> bool {
+    block_current(BlockReason::Sleep(reason))
+}
+
+/// Put current task into waiting state with deadline.
+/// Does NOT reschedule — caller must do that after setting up wait condition.
+pub fn wait_current(reason: task::WaitReason, deadline: u64) -> bool {
+    block_current(BlockReason::Wait(reason, deadline))
 }
 
 /// Voluntarily yield the CPU to another task.

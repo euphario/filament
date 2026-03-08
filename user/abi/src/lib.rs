@@ -29,7 +29,7 @@ pub mod syscall {
 
     // Process control
     pub const EXEC: u64 = 31;
-    pub const DAEMONIZE: u64 = 32;
+    // 32: Daemonize removed
     pub const KILL: u64 = 33;
     pub const PS_INFO: u64 = 34;
     pub const SET_LOG_LEVEL: u64 = 35;

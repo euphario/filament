@@ -868,21 +868,26 @@ impl ObjectService {
 
         let obj = Object::Shmem(ShmemObject::new(shmem_id, paddr, size, vaddr));
 
-        match table.alloc(ObjectType::Shmem, obj) {
-            Some(handle) => {
-                // Update limit counter via scheduler
-                crate::kernel::task::with_scheduler(|sched| {
-                    if let Some(task) = sched.task_mut(slot) {
-                        task.add_shmem();
-                    }
-                });
-                Ok((handle, shmem_id))
-            }
+        let result = match table.alloc(ObjectType::Shmem, obj) {
+            Some(handle) => Ok((handle, shmem_id)),
             None => {
                 let _ = shmem::destroy(shmem_id, task_id);
                 Err(KernelError::OutOfHandles)
             }
+        };
+
+        // Drop table lock before acquiring scheduler lock (lock ordering)
+        drop(guard);
+
+        if result.is_ok() {
+            crate::kernel::task::with_scheduler(|sched| {
+                if let Some(task) = sched.task_mut(slot) {
+                    task.add_shmem();
+                }
+            });
         }
+
+        result
     }
 
     /// Open an existing shared memory region

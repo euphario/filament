@@ -128,30 +128,6 @@ impl ProcessOps for KernelProcessOps {
         result
     }
 
-    fn daemonize(&self, task_id: TaskId) -> Result<(), ProcessError> {
-        task::with_scheduler(|sched| {
-            let parent_id = if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(task) = sched.task_mut(slot) {
-                    task.detach_from_parent()
-                } else {
-                    return Err(ProcessError::NotFound);
-                }
-            } else {
-                return Err(ProcessError::NotFound);
-            };
-
-            if parent_id != 0 {
-                if let Some(parent_slot) = sched.slot_by_pid(parent_id) {
-                    if let Some(parent) = sched.task_mut(parent_slot) {
-                        parent.remove_child(task_id);
-                    }
-                    sched.wake_task(parent_slot);
-                }
-            }
-            Ok(())
-        })
-    }
-
     fn get_capabilities(&self, task_id: TaskId) -> Result<u64, ProcessError> {
         task::with_scheduler(|sched| {
             if let Some(slot) = sched.slot_by_pid(task_id) {

@@ -1285,64 +1285,7 @@ impl<D: Driver> DriverRuntime<D> {
             };
 
             if tag == TAG_DEVD {
-                // Devd channel is readable — read raw bytes first.
-                // Check if the message is a response to a forwarded child request.
-                // If so, relay it to the child and skip normal dispatch.
-                let mut raw_buf = [0u8; 512];
-                match self.ctx.devd.raw_recv(&mut raw_buf) {
-                    Ok(Some(n)) if n >= QueryHeader::SIZE => {
-                        if !self.try_relay_to_child(&raw_buf, n) {
-                            // Routing layer: check if message is ADDRESSED
-                            let action = self.route_inbound(&raw_buf[..n]);
-                            match action {
-                                RouteAction::Local => {
-                                    // No route or resolved to this node
-                                    self.dispatch_raw_command(&raw_buf[..n]);
-                                }
-                                RouteAction::LocalOnly => {
-                                    // Addressed to self — handle locally, no children
-                                    self.routing = RoutingMode::LocalOnly;
-                                    self.dispatch_raw_command(&raw_buf[..n]);
-                                    self.routing = RoutingMode::Broadcast;
-                                }
-                                RouteAction::ForwardTo(child_idx, child_route) => {
-                                    // Route to a specific child — dispatch with routing
-                                    // set so config forward targets only this child.
-                                    if child_route.is_empty() {
-                                        self.routing = RoutingMode::ForwardTo { child: child_idx };
-                                    } else {
-                                        let mut route = [0u8; 128];
-                                        let rlen = child_route.len().min(128);
-                                        route[..rlen].copy_from_slice(&child_route[..rlen]);
-                                        self.routing = RoutingMode::ForwardWithRoute {
-                                            child: child_idx, route, route_len: rlen,
-                                        };
-                                    }
-                                    self.dispatch_raw_command(&raw_buf[..n]);
-                                    self.routing = RoutingMode::Broadcast;
-                                }
-                                RouteAction::LocalAndForward(child_route) => {
-                                    // Handle locally AND forward to all children
-                                    self.dispatch_raw_command(&raw_buf[..n]);
-                                    self.forward_to_all_children(&raw_buf[..n], child_route);
-                                }
-                                RouteAction::ForwardAll(child_route) => {
-                                    // Forward to all children only
-                                    self.forward_to_all_children(&raw_buf[..n], child_route);
-                                }
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        // Devd channel broken — remove from Mux to prevent hot-loop.
-                        // Driver continues running with existing state but cannot
-                        // receive new commands from devd.
-                        crate::uwarn!("bus", "devd_recv_failed"; err = e.as_str());
-                        let _ = self.ctx.mux.remove(handle);
-                        self.ctx.handles.remove(handle);
-                    }
-                }
+                self.handle_devd_event(handle);
             } else if tag == TAG_PARENT_SUPERQ {
                 // Parent sent us a command via SuperQ (tree mode)
                 self.handle_parent_superq_command();
@@ -2459,6 +2402,58 @@ impl<D: Driver> DriverRuntime<D> {
     }
 
     /// Handle child SuperQ readable event — child sent a FORWARD note.
+    /// Handle devd channel readable event.
+    ///
+    /// Reads a raw message, checks for child relay, applies routing, and dispatches.
+    fn handle_devd_event(&mut self, handle: Handle) {
+        let mut raw_buf = [0u8; 512];
+        match self.ctx.devd.raw_recv(&mut raw_buf) {
+            Ok(Some(n)) if n >= QueryHeader::SIZE => {
+                if !self.try_relay_to_child(&raw_buf, n) {
+                    let action = self.route_inbound(&raw_buf[..n]);
+                    match action {
+                        RouteAction::Local => {
+                            self.dispatch_raw_command(&raw_buf[..n]);
+                        }
+                        RouteAction::LocalOnly => {
+                            self.routing = RoutingMode::LocalOnly;
+                            self.dispatch_raw_command(&raw_buf[..n]);
+                            self.routing = RoutingMode::Broadcast;
+                        }
+                        RouteAction::ForwardTo(child_idx, child_route) => {
+                            if child_route.is_empty() {
+                                self.routing = RoutingMode::ForwardTo { child: child_idx };
+                            } else {
+                                let mut route = [0u8; 128];
+                                let rlen = child_route.len().min(128);
+                                route[..rlen].copy_from_slice(&child_route[..rlen]);
+                                self.routing = RoutingMode::ForwardWithRoute {
+                                    child: child_idx, route, route_len: rlen,
+                                };
+                            }
+                            self.dispatch_raw_command(&raw_buf[..n]);
+                            self.routing = RoutingMode::Broadcast;
+                        }
+                        RouteAction::LocalAndForward(child_route) => {
+                            self.dispatch_raw_command(&raw_buf[..n]);
+                            self.forward_to_all_children(&raw_buf[..n], child_route);
+                        }
+                        RouteAction::ForwardAll(child_route) => {
+                            self.forward_to_all_children(&raw_buf[..n], child_route);
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Devd channel broken — remove from Mux to prevent hot-loop.
+                crate::uwarn!("bus", "devd_recv_failed"; err = e.as_str());
+                let _ = self.ctx.mux.remove(handle);
+                self.ctx.handles.remove(handle);
+            }
+        }
+    }
+
     /// Handle parent command received via SuperQ (tree mode).
     ///
     /// Reads FORWARD notes from our SupervisionChild handle and dispatches

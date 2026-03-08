@@ -52,7 +52,7 @@ pub enum SyscallNumber {
     Sleep = 11,
     // 12-30: legacy IPC/FD/scheme (removed)
     Exec = 31,
-    Daemonize = 32,
+    // 32: Daemonize removed — zero callers
     Kill = 33,
     PsInfo = 34,
     SetLogLevel = 35,
@@ -88,13 +88,13 @@ pub enum SyscallNumber {
     SetResourceLimits = 90,   // Set per-task resource limits on child
     KernelPanic = 91,          // Trigger kernel panic (debug, requires CAP_SYS_ADMIN)
 
-    // Unified interface (100-105) - THE 6 SYSCALLS
+    // Unified interface (100-104) - THE 5 SYSCALLS
     Open = 100,
     Read = 101,
     Write = 102,
     Map = 103,
     Close = 104,
-    UnifiedExit = 105,  // Exit via unified interface (same as Exit=0)
+    // 105: UnifiedExit removed — zero callers (duplicate of Exit=0)
 
     /// Invalid/unknown syscall
     Invalid = 0xFFFF,
@@ -114,7 +114,7 @@ impl From<u64> for SyscallNumber {
             10 => SyscallNumber::GetTime,
             11 => SyscallNumber::Sleep,
             31 => SyscallNumber::Exec,
-            32 => SyscallNumber::Daemonize,
+            // 32: Daemonize removed
             33 => SyscallNumber::Kill,
             34 => SyscallNumber::PsInfo,
             35 => SyscallNumber::SetLogLevel,
@@ -148,13 +148,13 @@ impl From<u64> for SyscallNumber {
             89 => SyscallNumber::ExceptionResume,
             90 => SyscallNumber::SetResourceLimits,
             91 => SyscallNumber::KernelPanic,
-            // Unified interface (100-105)
+            // Unified interface (100-104)
             100 => SyscallNumber::Open,
             101 => SyscallNumber::Read,
             102 => SyscallNumber::Write,
             103 => SyscallNumber::Map,
             104 => SyscallNumber::Close,
-            105 => SyscallNumber::UnifiedExit,
+            // 105: UnifiedExit removed
             // All other numbers (legacy IPC, FD, handle, event) -> Invalid
             _ => SyscallNumber::Invalid,
         }
@@ -240,7 +240,6 @@ pub fn handle(args: &SyscallArgs) -> i64 {
         SyscallNumber::Exit => process::sys_exit(args.arg0 as i32),
         SyscallNumber::Wait => process::sys_wait(args.arg0 as i32, args.arg1, args.arg2 as u32),
         SyscallNumber::Exec => process::sys_exec(args.arg0, args.arg1 as usize),
-        SyscallNumber::Daemonize => process::sys_daemonize(),
         SyscallNumber::Kill => process::sys_kill(args.arg0 as u32),
         SyscallNumber::PsInfo => process::sys_ps_info(args.arg0, args.arg1 as usize),
         SyscallNumber::PsInfoEx => process::sys_ps_info_ex(args.arg0, args.arg1 as usize),
@@ -302,7 +301,6 @@ pub fn handle(args: &SyscallArgs) -> i64 {
             let ctx = create_syscall_context();
             ctx.raw_objects().close(args.arg0 as u32)
         }
-        SyscallNumber::UnifiedExit => process::sys_exit(args.arg0 as i32),
 
         // Invalid or legacy syscall numbers -> ENOSYS
         SyscallNumber::Invalid => {
@@ -332,7 +330,6 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::GetTime => "gettime",
         SyscallNumber::Sleep => "sleep",
         SyscallNumber::Exec => "exec",
-        SyscallNumber::Daemonize => "daemonize",
         SyscallNumber::Kill => "kill",
         SyscallNumber::PsInfo => "ps_info",
         SyscallNumber::PsInfoEx => "ps_info_ex",
@@ -364,7 +361,6 @@ fn syscall_name(syscall: SyscallNumber) -> &'static str {
         SyscallNumber::Write => "write",
         SyscallNumber::Map => "map",
         SyscallNumber::Close => "close",
-        SyscallNumber::UnifiedExit => "exit",
         SyscallNumber::Invalid => "invalid",
     }
 }

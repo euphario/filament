@@ -1310,15 +1310,6 @@ impl Task {
         self.trap_frame.x0 = value as u64;
     }
 
-    /// Detach task from its parent, returning the old parent ID
-    /// Used by daemonize to orphan a process
-    #[inline]
-    pub fn detach_from_parent(&mut self) -> TaskId {
-        let old_parent = self.parent_id;
-        self.parent_id = 0;
-        old_parent
-    }
-
     /// Total heap pages across all heap mappings
     pub fn total_heap_pages(&self) -> u32 {
         let mut total: u32 = 0;

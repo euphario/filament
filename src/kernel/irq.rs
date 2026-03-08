@@ -12,19 +12,32 @@ pub enum IrqError {
     TableFull,
 }
 
+/// IRQ delivery state machine.
+///
+/// Transitions:
+///   Idle → WaitingForIrq (driver calls wait/blocks)
+///   Idle → Pending       (IRQ fires while driver is busy)
+///   WaitingForIrq → Idle (IRQ fires → wake blocked driver, consume)
+///   Pending → Idle       (driver calls check_pending → consume)
+#[derive(Clone, Copy)]
+pub enum IrqState {
+    /// No IRQ pending, no one waiting
+    Idle,
+    /// Driver is blocked waiting for the next IRQ
+    WaitingForIrq { pid: u32 },
+    /// One or more IRQs arrived while driver was not waiting
+    Pending { count: u32 },
+}
+
 /// IRQ registration entry
 #[derive(Clone, Copy)]
 pub struct IrqRegistration {
-    /// IRQ number
+    /// IRQ number (0xFFFFFFFF = empty slot)
     pub irq_num: u32,
     /// Process that registered for this IRQ
     pub owner_pid: u32,
-    /// Whether an IRQ is pending (occurred but not yet read)
-    pub pending: bool,
-    /// Count of pending IRQs (allows coalescing)
-    pub pending_count: u32,
-    /// PID of process blocked waiting for this IRQ (0 = none)
-    pub blocked_pid: u32,
+    /// Delivery state
+    pub state: IrqState,
 }
 
 impl IrqRegistration {
@@ -32,9 +45,7 @@ impl IrqRegistration {
         Self {
             irq_num: 0xFFFFFFFF,
             owner_pid: 0,
-            pending: false,
-            pending_count: 0,
-            blocked_pid: 0,
+            state: IrqState::Idle,
         }
     }
 
@@ -75,8 +86,7 @@ pub fn register(irq_num: u32, pid: u32) -> Result<(), IrqError> {
             if reg.is_empty() {
                 reg.irq_num = irq_num;
                 reg.owner_pid = pid;
-                reg.pending = false;
-                reg.pending_count = 0;
+                reg.state = IrqState::Idle;
 
                 // Enable the IRQ in the GIC (skip for virtual MSI IRQs)
                 if !crate::kernel::pci::MsiAllocator::is_msi_irq(irq_num) {
@@ -135,8 +145,8 @@ pub fn process_cleanup(pid: u32) {
     })
 }
 
-/// Called from IRQ handler when an interrupt fires
-/// Returns the PID to wake up, if any
+/// Called from IRQ handler when an interrupt fires.
+/// Returns the PID to wake up, if any.
 pub fn notify(irq_num: u32) -> Option<u32> {
     // Mask the IRQ immediately to prevent interrupt storm.
     // For virtual MSI IRQs, masking is done at the MAC level by the dispatch
@@ -145,19 +155,26 @@ pub fn notify(irq_num: u32) -> Option<u32> {
         crate::platform::current::gic::disable_irq(irq_num);
     }
 
-    // Update IRQ table state and collect wake info
-    let (wake_blocked, owner_pid) = with_irq_table(|table| {
+    // Update state and collect wake info
+    let (wake_pid, owner_pid) = with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num {
-                reg.pending = true;
-                reg.pending_count = reg.pending_count.saturating_add(1);
-
-                if reg.blocked_pid != 0 {
-                    let pid = reg.blocked_pid;
-                    reg.blocked_pid = 0;
-                    return (Some(pid), reg.owner_pid);
-                } else {
-                    return (None, reg.owner_pid);
+                match reg.state {
+                    IrqState::WaitingForIrq { pid } => {
+                        // Driver was blocked — wake it, transition to Idle
+                        reg.state = IrqState::Idle;
+                        return (Some(pid), reg.owner_pid);
+                    }
+                    IrqState::Pending { count } => {
+                        // Already pending — coalesce
+                        reg.state = IrqState::Pending { count: count.saturating_add(1) };
+                        return (None, reg.owner_pid);
+                    }
+                    IrqState::Idle => {
+                        // Driver not waiting — mark pending
+                        reg.state = IrqState::Pending { count: 1 };
+                        return (None, reg.owner_pid);
+                    }
                 }
             }
         }
@@ -165,7 +182,7 @@ pub fn notify(irq_num: u32) -> Option<u32> {
     });
 
     // Wake process outside the IRQ table lock
-    if let Some(pid) = wake_blocked {
+    if let Some(pid) = wake_pid {
         super::task::with_scheduler(|sched| {
             sched.wake_by_pid(pid);
         });
@@ -182,16 +199,14 @@ pub fn notify(irq_num: u32) -> Option<u32> {
     }
 }
 
-/// Check if an IRQ is pending for a process
-/// If pending, clears the flag and re-enables the IRQ
+/// Check if an IRQ is pending for a process.
+/// If pending, consumes the event and re-enables the IRQ.
 pub fn check_pending(irq_num: u32, pid: u32) -> Option<u32> {
     with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
-                if reg.pending {
-                    let count = reg.pending_count;
-                    reg.pending = false;
-                    reg.pending_count = 0;
+                if let IrqState::Pending { count } = reg.state {
+                    reg.state = IrqState::Idle;
                     // Re-enable at GIC (skip for virtual MSI IRQs — MAC handles it)
                     if !crate::kernel::pci::MsiAllocator::is_msi_irq(irq_num) {
                         crate::platform::current::gic::enable_irq(irq_num);
@@ -212,7 +227,7 @@ pub fn check_pending_peek(irq_num: u32, pid: u32) -> bool {
     with_irq_table(|table| {
         for reg in table.iter() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
-                return reg.pending;
+                return matches!(reg.state, IrqState::Pending { .. });
             }
         }
         false
@@ -226,11 +241,11 @@ pub fn wait(irq_num: u32, pid: u32) -> Result<u32, i32> {
         return Ok(count);
     }
 
-    // Set up for blocking
+    // Transition to WaitingForIrq
     let found = with_irq_table(|table| {
         for reg in table.iter_mut() {
             if !reg.is_empty() && reg.irq_num == irq_num && reg.owner_pid == pid {
-                reg.blocked_pid = pid;
+                reg.state = IrqState::WaitingForIrq { pid };
                 return true;
             }
         }

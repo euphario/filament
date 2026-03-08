@@ -528,8 +528,9 @@ impl TimerState {
         match (*self, new) {
             // Can always disarm
             (_, TimerState::Disarmed) => true,
-            // Can arm from disarmed or fired (re-arm)
+            // Can arm from any non-armed state, or re-arm from armed
             (TimerState::Disarmed, TimerState::Armed) => true,
+            (TimerState::Armed, TimerState::Armed) => true,
             (TimerState::Fired, TimerState::Armed) => true,
             // Can fire only from armed
             (TimerState::Armed, TimerState::Fired) => true,
@@ -603,9 +604,11 @@ impl TimerObject {
         self.state.is_armed()
     }
 
-    /// Arm the timer with deadline and optional interval
-    /// Always succeeds (can arm from any state)
+    /// Arm the timer with deadline and optional interval.
+    /// Valid from Disarmed, Armed (re-arm), or Fired.
     pub fn arm(&mut self, deadline: u64, interval: u64) {
+        debug_assert!(self.state.can_transition_to(TimerState::Armed),
+            "invalid timer transition: {:?} → Armed", self.state.name());
         self.deadline = deadline;
         self.interval = interval;
         self.state = TimerState::Armed;
@@ -1790,8 +1793,9 @@ mod tests {
     fn test_timer_state_transitions() {
         // Test valid transitions
         assert!(TimerState::Disarmed.can_transition_to(TimerState::Armed));
+        assert!(TimerState::Armed.can_transition_to(TimerState::Armed)); // re-arm while armed
         assert!(TimerState::Armed.can_transition_to(TimerState::Fired));
-        assert!(TimerState::Fired.can_transition_to(TimerState::Armed)); // re-arm
+        assert!(TimerState::Fired.can_transition_to(TimerState::Armed)); // re-arm after fired
         assert!(TimerState::Armed.can_transition_to(TimerState::Disarmed));
         assert!(TimerState::Fired.can_transition_to(TimerState::Disarmed));
 
