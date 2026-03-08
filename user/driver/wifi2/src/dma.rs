@@ -671,8 +671,8 @@ pub fn wrap_mgmt_txd(buf: &mut [u8], frame: &[u8]) -> usize {
 
     // TXD3: retry/ACK control
     let txd3 = if is_beacon {
-        MT_TXD3_SW_POWER_MGMT | MT_TXD3_NO_ACK
-            | (15u32 << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE
+        MT_TXD3_SW_POWER_MGMT | MT_TXD3_NO_ACK | MT_TXD3_BCM
+            | (0x1Fu32 << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE
     } else {
         MT_TXD3_SW_POWER_MGMT | (15u32 << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE
             | if is_bcast { MT_TXD3_BCM } else { 0 }
