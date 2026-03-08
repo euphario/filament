@@ -1560,12 +1560,8 @@ pub fn set_beacon(
     let txd2 = 8u32; // FRAME_TYPE(mgmt=0) | SUB_TYPE(beacon=8)
     data[txd_off + 8..txd_off + 12].copy_from_slice(&txd2.to_le_bytes());
 
-    // Linux: mac.c:962 SW_POWER_MGMT | REM_TX_COUNT(15) | NO_ACK
-    // mac.c:1013 BA_DISABLE added for FIXED_RATE frames
-    let txd3 = (1u32)              // NO_ACK (beacons aren't acked)
-        | (15u32 << 11)            // REM_TX_COUNT
-        | (1u32 << 28)             // BA_DISABLE (fixed-rate frames)
-        | (1u32 << 29);            // SW_POWER_MGMT — tells firmware to manage PS/TIM
+    // Original + SW_POWER_MGMT for PS/TIM management
+    let txd3 = 1u32 | (1u32 << 4) | (0x1Fu32 << 11) | (1u32 << 28) | (1u32 << 29);
     data[txd_off + 12..txd_off + 16].copy_from_slice(&txd3.to_le_bytes());
 
     let txd6 = (1u32 << 2) | (1u32 << 3) | (1u32 << 4)
