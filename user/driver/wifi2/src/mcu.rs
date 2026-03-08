@@ -1518,7 +1518,7 @@ pub fn set_edca(
 /// Linux: mt7996/mcu.c:2766 mt7996_mcu_add_beacon()
 pub fn set_beacon(
     dev: &Mt76Device, ring: &mut TxRing,
-    band: u8, omac_idx: u8, bmc_wlan_idx: u16, beacon_frame: &[u8], enable: bool,
+    band: u8, omac_idx: u8, beacon_frame: &[u8], enable: bool,
     seq: u8, irq: Option<&mut FwIrq>, wait: bool,
 ) -> Result<(), McuError> {
     const MAX_BEACON: usize = 256;
@@ -1549,9 +1549,9 @@ pub fn set_beacon(
     data[txd_off..txd_off + 4].copy_from_slice(&txd0.to_le_bytes());
 
     // Linux: mt7996/mac.c:953 (base) + mac.c:815 (80211 writer)
-    // WLAN_IDX[11:0] | HDR_FORMAT[15:14] | HDR_INFO[20:16] | OWN_MAC[30:25] | FIXED_RATE[31]
-    let txd1 = (bmc_wlan_idx as u32)
-        | ((MT_HDR_FORMAT_802_11 as u32) << 14)
+    // WLAN_IDX[11:0]=0 | HDR_FORMAT[15:14] | HDR_INFO[20:16] | OWN_MAC[30:25] | FIXED_RATE[31]
+    // Note: Linux uses global_wcid.idx here but firmware works with 0
+    let txd1 = ((MT_HDR_FORMAT_802_11 as u32) << 14)
         | (12u32 << 16)
         | ((omac_idx as u32) << 25)
         | (1u32 << 31);
