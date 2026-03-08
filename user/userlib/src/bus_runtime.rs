@@ -21,7 +21,7 @@ use crate::bus::{
 };
 use crate::bus_block::ShmemBlockPort;
 use crate::devd::{DevdClient, DevdCommand};
-use crate::ipc::{Channel, Irq, Mux, MuxFilter, Timer};
+use crate::ipc::{Channel, Irq, Mux, MuxFilter};
 use crate::mailbox::Mailbox;
 use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, query_flags, port_type as qport_type, error as query_error};
 use crate::syscall::{self, Handle, LogLevel};
@@ -60,7 +60,7 @@ const TAG_PARENT_SUPERQ: u32 = 0xFFFF_FB00;
 /// Maximum managed IRQs per driver.
 const MAX_MANAGED_IRQS: usize = 4;
 
-/// Maximum managed timers per driver.
+/// Maximum managed timers per driver (tracked for stop/interval change).
 const MAX_MANAGED_TIMERS: usize = 4;
 
 // ============================================================================
@@ -76,9 +76,8 @@ struct ManagedIrq {
     policy: IrqPolicy,
 }
 
-/// A recurring timer managed by the runtime — auto-rearmed after handle_event.
+/// A recurring timer managed by the runtime — kernel auto-rearms via inline timer.
 struct ManagedTimer {
-    timer: Timer,
     tag: u32,
     interval_ns: u64,
 }
@@ -869,22 +868,14 @@ impl BusCtx for RuntimeCtx {
     }
 
     fn start_timer(&mut self, tag: u32, interval_ns: u64) -> Result<(), BusError> {
-        let mut timer = Timer::new().map_err(|_| BusError::Internal)?;
-        let _ = timer.set(interval_ns);
-        let handle = timer.handle();
-        self.mux.add(handle, MuxFilter::Readable).map_err(|_| BusError::Internal)?;
-        if !self.handles.add(handle, tag) {
-            let _ = self.mux.remove(handle);
-            return Err(BusError::NoSpace);
-        }
+        self.mux.add_recurring_timer(tag, interval_ns).map_err(|_| BusError::Internal)?;
         for slot in self.managed_timers.iter_mut() {
             if slot.is_none() {
-                *slot = Some(ManagedTimer { timer, tag, interval_ns });
+                *slot = Some(ManagedTimer { tag, interval_ns });
                 return Ok(());
             }
         }
-        let _ = self.mux.remove(handle);
-        self.handles.remove(handle);
+        let _ = self.mux.remove_timer(tag);
         Err(BusError::NoSpace)
     }
 
@@ -892,9 +883,7 @@ impl BusCtx for RuntimeCtx {
         for slot in self.managed_timers.iter_mut() {
             if let Some(mt) = slot {
                 if mt.tag == tag {
-                    let handle = mt.timer.handle();
-                    let _ = self.mux.remove(handle);
-                    self.handles.remove(handle);
+                    let _ = self.mux.remove_timer(tag);
                     *slot = None;
                     return Ok(());
                 }
@@ -904,11 +893,11 @@ impl BusCtx for RuntimeCtx {
     }
 
     fn set_timer_interval(&mut self, tag: u32, interval_ns: u64) -> Result<(), BusError> {
+        self.mux.set_timer_interval(tag, interval_ns).map_err(|_| BusError::NotFound)?;
         for slot in self.managed_timers.iter_mut() {
             if let Some(mt) = slot {
                 if mt.tag == tag {
                     mt.interval_ns = interval_ns;
-                    let _ = mt.timer.set(interval_ns);
                     return Ok(());
                 }
             }
@@ -1281,6 +1270,14 @@ impl<D: Driver> DriverRuntime<D> {
 
             let handle = event.handle;
 
+            // Inline timer events: handle field carries the tag directly
+            if event.event == abi::mux_filter::TIMER {
+                let tag = handle.0;
+                self.driver.handle_event(tag, Handle(0), &mut self.ctx);
+                crate::ulog::flush();
+                continue;
+            }
+
             // Look up what this handle maps to
             let tag = match self.ctx.handles.find_tag(handle) {
                 Some(t) => t,
@@ -1383,15 +1380,6 @@ impl<D: Driver> DriverRuntime<D> {
                     }
                 }
 
-                // Auto-rearm managed timers
-                for slot in self.ctx.managed_timers.iter_mut() {
-                    if let Some(mt) = slot {
-                        if mt.tag == tag {
-                            let _ = mt.timer.set(mt.interval_ns);
-                            break;
-                        }
-                    }
-                }
             }
 
             // Flush any structured logs emitted during dispatch

@@ -452,6 +452,40 @@ impl Mux {
         write(self.handle, &cmd)?;
         Ok(())
     }
+
+    /// Add a recurring inline timer. Fires as MuxEvent with TIMER filter,
+    /// auto-rearmed by the kernel (no WRITE syscall needed to rearm).
+    /// The tag is returned in MuxEvent.handle when the timer fires.
+    pub fn add_recurring_timer(&self, tag: u32, interval_ns: u64) -> SysResult<()> {
+        let mut cmd = [0u8; 16];
+        cmd[0] = 5; // op: ADD_RECURRING_TIMER
+        cmd[4..8].copy_from_slice(&tag.to_le_bytes());
+        cmd[8..16].copy_from_slice(&interval_ns.to_le_bytes());
+        write(self.handle, &cmd)?;
+        Ok(())
+    }
+
+    /// Change the interval of an existing inline timer.
+    /// Rearms immediately with the new interval.
+    pub fn set_timer_interval(&self, tag: u32, interval_ns: u64) -> SysResult<()> {
+        let mut cmd = [0u8; 16];
+        cmd[0] = 6; // op: SET_TIMER_INTERVAL
+        cmd[4..8].copy_from_slice(&tag.to_le_bytes());
+        cmd[8..16].copy_from_slice(&interval_ns.to_le_bytes());
+        write(self.handle, &cmd)?;
+        Ok(())
+    }
+
+    /// Set the WFE spin budget for this Mux. Before blocking, the kernel
+    /// spins with WFE for up to `budget_ns` nanoseconds, re-polling on
+    /// each wake. 0 = disabled (default).
+    pub fn set_spin_budget(&self, budget_ns: u64) -> SysResult<()> {
+        let mut cmd = [0u8; 16];
+        cmd[0] = 7; // op: SET_SPIN_BUDGET
+        cmd[8..16].copy_from_slice(&budget_ns.to_le_bytes());
+        write(self.handle, &cmd)?;
+        Ok(())
+    }
 }
 
 impl Drop for Mux {
@@ -723,6 +757,21 @@ impl EventLoop {
     /// Remove an inline timer by tag.
     pub fn remove_timer(&self, tag: u32) -> SysResult<()> {
         self.mux.remove_timer(tag)
+    }
+
+    /// Add a recurring inline timer (auto-rearmed by kernel).
+    pub fn add_recurring_timer(&self, tag: u32, interval_ns: u64) -> SysResult<()> {
+        self.mux.add_recurring_timer(tag, interval_ns)
+    }
+
+    /// Change interval of an existing inline timer.
+    pub fn set_timer_interval(&self, tag: u32, interval_ns: u64) -> SysResult<()> {
+        self.mux.set_timer_interval(tag, interval_ns)
+    }
+
+    /// Set WFE spin budget (0 = disabled).
+    pub fn set_spin_budget(&self, budget_ns: u64) -> SysResult<()> {
+        self.mux.set_spin_budget(budget_ns)
     }
 }
 

@@ -1121,22 +1121,26 @@ pub struct MuxInlineTimer {
     pub tag: u32,
     /// Absolute deadline in counter ticks
     pub deadline: u64,
+    /// Recurring interval in counter ticks (0 = one-shot, >0 = recurring)
+    pub interval: u64,
 }
 
 pub struct MuxObject {
     /// Watched handles
     watches: [Option<MuxWatch>; MAX_MUX_WATCHES],
-    /// Inline timer slots (one-shot, auto-removed on fire)
+    /// Inline timer slots (one-shot or recurring)
     timers: [Option<MuxInlineTimer>; MAX_MUX_TIMERS],
     /// Wait queue for the mux itself (task blocked in mux.wait())
     wait_queue: WaitQueue,
     /// Timeout in nanoseconds for wait (0 = no timeout, block forever)
     timeout_ns: u64,
+    /// WFE spin budget in counter ticks (0 = disabled)
+    spin_budget: u64,
 }
 
 impl MuxObject {
     pub fn new() -> Self {
-        Self { watches: [None; MAX_MUX_WATCHES], timers: [None; MAX_MUX_TIMERS], wait_queue: WaitQueue::new(), timeout_ns: 0 }
+        Self { watches: [None; MAX_MUX_WATCHES], timers: [None; MAX_MUX_TIMERS], wait_queue: WaitQueue::new(), timeout_ns: 0, spin_budget: 0 }
     }
     /// Get first subscriber (bridge for existing callers)
     pub fn subscriber(&self) -> Option<Subscriber> {
@@ -1154,25 +1158,54 @@ impl MuxObject {
     /// Access wait queue
     pub fn wait_queue(&self) -> &WaitQueue { &self.wait_queue }
     pub fn wait_queue_mut(&mut self) -> &mut WaitQueue { &mut self.wait_queue }
+    /// WFE spin budget in counter ticks (0 = disabled)
+    pub fn spin_budget(&self) -> u64 { self.spin_budget }
+    /// Set WFE spin budget in counter ticks (0 = disabled)
+    pub fn set_spin_budget(&mut self, ticks: u64) { self.spin_budget = ticks; }
 
-    /// Add an inline timer. Returns Ok(()) or Err if full.
+    /// Add a one-shot inline timer. Returns Ok(()) or Err if full.
     pub fn add_timer(&mut self, tag: u32, deadline: u64) -> Result<(), ()> {
+        self.add_timer_with_interval(tag, deadline, 0)
+    }
+
+    /// Add a recurring inline timer. Returns Ok(()) or Err if full.
+    pub fn add_recurring_timer(&mut self, tag: u32, deadline: u64, interval: u64) -> Result<(), ()> {
+        self.add_timer_with_interval(tag, deadline, interval)
+    }
+
+    /// Add an inline timer with optional interval. Returns Ok(()) or Err if full.
+    fn add_timer_with_interval(&mut self, tag: u32, deadline: u64, interval: u64) -> Result<(), ()> {
         // Replace existing timer with same tag, or find empty slot
         for slot in self.timers.iter_mut() {
             if let Some(t) = slot {
                 if t.tag == tag {
                     t.deadline = deadline;
+                    t.interval = interval;
                     return Ok(());
                 }
             }
         }
         for slot in self.timers.iter_mut() {
             if slot.is_none() {
-                *slot = Some(MuxInlineTimer { tag, deadline });
+                *slot = Some(MuxInlineTimer { tag, deadline, interval });
                 return Ok(());
             }
         }
         Err(())
+    }
+
+    /// Update interval of an existing timer. Returns true if found.
+    pub fn set_timer_interval(&mut self, tag: u32, interval: u64, new_deadline: u64) -> bool {
+        for slot in self.timers.iter_mut() {
+            if let Some(t) = slot {
+                if t.tag == tag {
+                    t.interval = interval;
+                    t.deadline = new_deadline;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Remove an inline timer by tag. Returns true if found.

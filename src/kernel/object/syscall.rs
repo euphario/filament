@@ -1710,8 +1710,9 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             return Err(KernelError::BadHandle);
         };
 
-        // Snapshot watches and timeout before mutating
+        // Snapshot watches, timeout, and spin budget before mutating
         let timeout_ns = mux.timeout_ns();
+        let spin_budget = mux.spin_budget();
         let mut watches = [(None::<super::MuxWatch>, 0u32); super::MAX_MUX_WATCHES];
         for i in 0..super::MAX_MUX_WATCHES {
             if let Some(watch) = mux.watches()[i] {
@@ -1813,7 +1814,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             }
         }
 
-        // Poll inline timers — expired timers fire and auto-remove
+        // Poll inline timers — expired timers fire; one-shot auto-remove, recurring auto-rearm
         if let Some(mux_entry) = table.get_mut(mux_handle) {
             if let Object::Mux(ref mut mux) = mux_entry.object {
                 for slot in mux.timers_mut() {
@@ -1828,17 +1829,21 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                                 signal_value: 0,
                             };
                             event_count += 1;
-                            *slot = None; // auto-remove
+                            if t.interval > 0 {
+                                t.deadline += t.interval; // rearm from deadline, not now (no drift)
+                            } else {
+                                *slot = None; // one-shot: auto-remove
+                            }
                         }
                     }
                 }
             }
         }
 
-        Ok((watches, earliest_deadline, timeout_ns, events, event_count))
+        Ok((watches, earliest_deadline, timeout_ns, spin_budget, events, event_count))
     });
 
-    let (watches, earliest_deadline, timeout_ns, mut events, mut event_count) = match subscribe_and_poll_result {
+    let (watches, earliest_deadline, timeout_ns, spin_budget, mut events, mut event_count) = match subscribe_and_poll_result {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => return e.to_errno(),
         Err(_) => return KernelError::BadHandle.to_errno(),
@@ -1869,6 +1874,81 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
     if event_count > 0 {
         uart::clear_blocked_if_pid(task_id);
         return copy_mux_events_to_user(buf_ptr, &events, event_count);
+    }
+
+    // ── Phase 1.5: WFE spin (low-latency poll before blocking) ──
+    //
+    // If spin_budget > 0 and there's a timer deadline, spin with WFE instead
+    // of immediately blocking. WFE pauses the core until any interrupt, then
+    // we re-poll inline timers and watched handles. This avoids the full
+    // sleep/wake context switch overhead for short intervals.
+    if spin_budget > 0 && earliest_deadline != u64::MAX {
+        let spin_end = crate::platform::current::timer::counter().saturating_add(spin_budget);
+        while crate::platform::current::timer::counter() < spin_end {
+            // WFE: low-power wait, wakes on any event (interrupt, SEV)
+            unsafe { core::arch::asm!("wfe"); }
+
+            // Yield to higher-priority tasks if needed
+            if crate::kernel::arch::sync::cpu_flags().need_resched() {
+                break;
+            }
+
+            // Re-poll inline timers + watched handles
+            let spin_found = object_service().with_table_mut(task_id, |table| {
+                let mut ev_count = 0usize;
+                let max_ev = buf_len / core::mem::size_of::<super::MuxEvent>();
+                let current_tick = crate::platform::current::timer::counter();
+
+                // Poll watched handles
+                for watch_opt in &watches {
+                    if ev_count >= max_ev { break; }
+                    let Some(watch) = watch_opt.0 else { continue };
+                    let channel_id = watch_opt.1;
+                    let watched_handle = Handle::from_raw(watch.handle());
+                    let Some(entry) = table.get_mut(watched_handle) else { continue };
+                    if poll_watched_object_mut(entry, watch.filter(), channel_id, current_tick) {
+                        events[ev_count] = super::MuxEvent {
+                            handle: abi::Handle::from_raw(watch.handle()),
+                            event: watch.filter(),
+                            signal_event: 0, _pad: 0, signal_value: 0,
+                        };
+                        ev_count += 1;
+                    }
+                }
+
+                // Poll inline timers
+                if let Some(mux_entry) = table.get_mut(mux_handle) {
+                    if let Object::Mux(ref mut mux) = mux_entry.object {
+                        for slot in mux.timers_mut() {
+                            if ev_count >= max_ev { break; }
+                            if let Some(t) = slot {
+                                if crate::platform::current::timer::is_expired(t.deadline) {
+                                    events[ev_count] = super::MuxEvent {
+                                        handle: abi::Handle::from_raw(t.tag),
+                                        event: abi::mux_filter::TIMER,
+                                        signal_event: 0, _pad: 0, signal_value: 0,
+                                    };
+                                    ev_count += 1;
+                                    if t.interval > 0 {
+                                        t.deadline += t.interval;
+                                    } else {
+                                        *slot = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ev_count
+            }).unwrap_or(0);
+
+            if spin_found > 0 {
+                event_count = spin_found;
+                uart::clear_blocked_if_pid(task_id);
+                return copy_mux_events_to_user(buf_ptr, &events, event_count);
+            }
+        }
     }
 
     // ── Phase 2: Block (task sleeps until event or timeout) ──
@@ -2083,7 +2163,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
             }
         }
 
-        // Poll inline timers — expired timers fire and auto-remove
+        // Poll inline timers — expired timers fire; one-shot auto-remove, recurring auto-rearm
         if let Some(mux_entry) = table.get_mut(mux_handle) {
             if let Object::Mux(ref mut mux) = mux_entry.object {
                 for slot in mux.timers_mut() {
@@ -2098,7 +2178,11 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                                 signal_value: 0,
                             };
                             event_count += 1;
-                            *slot = None; // auto-remove
+                            if t.interval > 0 {
+                                t.deadline += t.interval; // rearm from deadline, not now (no drift)
+                            } else {
+                                *slot = None; // one-shot: auto-remove
+                            }
                         }
                     }
                 }
@@ -2558,7 +2642,8 @@ fn write_console(c: &mut super::ConsoleObject, buf_ptr: u64, buf_len: usize) -> 
 
 fn write_mux(m: &mut super::MuxObject, buf_ptr: u64, buf_len: usize) -> i64 {
     // Format: [op:1][filter:1][pad:2][handle:4]
-    // op: 0=Add, 1=Remove, 2=SetTimeout, 3=AddTimer, 4=RemoveTimer
+    // op: 0=Add, 1=Remove, 2=SetTimeout, 3=AddTimer, 4=RemoveTimer,
+    //     5=AddRecurringTimer, 6=SetTimerInterval, 7=SetSpinBudget
     if buf_len < 8 {
         return KernelError::InvalidArg.to_errno();
     }
@@ -2604,7 +2689,7 @@ fn write_mux(m: &mut super::MuxObject, buf_ptr: u64, buf_len: usize) -> i64 {
             0
         }
         3 => {
-            // Add inline timer: [3:1][pad:3][tag:4][duration_ns:8] = 16 bytes
+            // Add one-shot inline timer: [3:1][pad:3][tag:4][duration_ns:8] = 16 bytes
             if buf_len < 16 {
                 return KernelError::InvalidArg.to_errno();
             }
@@ -2624,6 +2709,48 @@ fn write_mux(m: &mut super::MuxObject, buf_ptr: u64, buf_len: usize) -> i64 {
             } else {
                 KernelError::NotFound.to_errno()
             }
+        }
+        5 => {
+            // Add recurring inline timer: [5:1][pad:3][tag:4][interval_ns:8] = 16 bytes
+            if buf_len < 16 {
+                return KernelError::InvalidArg.to_errno();
+            }
+            let tag = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let interval_ns = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+            let freq = crate::platform::current::timer::frequency();
+            let interval_ticks = ((interval_ns as u128 * freq as u128) / 1_000_000_000) as u64;
+            let deadline = crate::platform::current::timer::deadline_ns(interval_ns);
+            if m.add_recurring_timer(tag, deadline, interval_ticks).is_err() {
+                return KernelError::NoSpace.to_errno();
+            }
+            0
+        }
+        6 => {
+            // Set timer interval: [6:1][pad:3][tag:4][interval_ns:8] = 16 bytes
+            if buf_len < 16 {
+                return KernelError::InvalidArg.to_errno();
+            }
+            let tag = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let interval_ns = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+            let freq = crate::platform::current::timer::frequency();
+            let interval_ticks = ((interval_ns as u128 * freq as u128) / 1_000_000_000) as u64;
+            let new_deadline = crate::platform::current::timer::deadline_ns(interval_ns);
+            if m.set_timer_interval(tag, interval_ticks, new_deadline) {
+                0
+            } else {
+                KernelError::NotFound.to_errno()
+            }
+        }
+        7 => {
+            // Set spin budget: [7:1][pad:3][pad:4][budget_ns:8] = 16 bytes
+            if buf_len < 16 {
+                return KernelError::InvalidArg.to_errno();
+            }
+            let budget_ns = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+            let freq = crate::platform::current::timer::frequency();
+            let budget_ticks = ((budget_ns as u128 * freq as u128) / 1_000_000_000) as u64;
+            m.set_spin_budget(budget_ticks);
+            0
         }
         _ => KernelError::InvalidArg.to_errno(),
     }
