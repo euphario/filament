@@ -72,19 +72,18 @@ pub enum VfsError {
 impl VfsError {
     fn from_cqe(cqe: &IoCqe) -> Self {
         use crate::vfs_proto::vfs_error;
-        if cqe.status != io_status::OK {
-            return VfsError::IoError;
-        }
+        // Check result code first — error status CQEs carry the specific
+        // error in `result` (e.g., NOT_FOUND, PERMISSION).
         match cqe.result {
             vfs_error::NOT_FOUND => VfsError::NotFound,
             vfs_error::PERMISSION => VfsError::Permission,
             vfs_error::NO_SPACE => VfsError::PoolFull,
             vfs_error::NOT_DIR => VfsError::NotDir,
             vfs_error::IS_DIR => VfsError::IsDir,
-            vfs_error::IO_ERROR => VfsError::IoError,
             vfs_error::NO_MOUNT => VfsError::NoMount,
             vfs_error::TOO_MANY => VfsError::TooMany,
             vfs_error::READ_ONLY => VfsError::ReadOnly,
+            _ if cqe.status != io_status::OK => VfsError::IoError,
             _ => VfsError::IoError,
         }
     }
@@ -256,42 +255,57 @@ impl VfsClient {
             return Err(VfsError::NotFound);
         }
 
-        let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
+        // Read in pool-slot-sized chunks (pool allocator rejects > slot_size)
+        let slot_size = crate::ring::POOL_SLOT_SIZE as usize;
+        let mut total = 0usize;
 
-        let buf_len = buf.len() as u32;
-        let offset = port.alloc(buf_len).ok_or(VfsError::PoolFull)?;
+        while total < buf.len() {
+            let chunk = (buf.len() - total).min(slot_size);
+            let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
 
-        let tag = port.next_tag();
-        let sqe = IoSqe {
-            opcode: fs_op::READ,
-            flags: 0,
-            priority: 0,
-            tag,
-            lba: file_offset,
-            data_offset: offset,
-            data_len: buf_len,
-            param: fs_handle as u64,
-        };
+            let chunk_len = chunk as u32;
+            let offset = port.alloc(chunk_len).ok_or(VfsError::PoolFull)?;
 
-        if !port.submit(&sqe) {
-            return Err(VfsError::RingFull);
-        }
-        port.notify();
+            let tag = port.next_tag();
+            let sqe = IoSqe {
+                opcode: fs_op::READ,
+                flags: 0,
+                priority: 0,
+                tag,
+                lba: file_offset + total as u64,
+                data_offset: offset,
+                data_len: chunk_len,
+                param: fs_handle as u64,
+            };
 
-        let cqe = poll_completion(port, tag)?;
+            if !port.submit(&sqe) {
+                port.reset_pool();
+                return Err(VfsError::RingFull);
+            }
+            port.notify();
 
-        if cqe.status != io_status::OK {
+            let cqe = poll_completion(port, tag)?;
+
+            if cqe.status != io_status::OK {
+                port.reset_pool();
+                return Err(VfsError::from_cqe(&cqe));
+            }
+
+            let transferred = cqe.transferred as usize;
+            if transferred > 0 {
+                port.pool_read(offset, &mut buf[total..total + transferred]);
+            }
+
             port.reset_pool();
-            return Err(VfsError::from_cqe(&cqe));
+            total += transferred;
+
+            // Short read = EOF
+            if transferred < chunk {
+                break;
+            }
         }
 
-        let transferred = cqe.transferred as usize;
-        if transferred > 0 {
-            port.pool_read(offset, &mut buf[..transferred]);
-        }
-
-        port.reset_pool();
-        Ok(transferred)
+        Ok(total)
     }
 
     /// Close an open file handle.

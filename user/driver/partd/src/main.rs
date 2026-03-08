@@ -232,14 +232,17 @@ impl PartitionDriver {
                     if cqe.status == io_status::OK as u16 {
                         if let Some(pool_slice) = port.pool_slice(offset, len) {
                             buf.copy_from_slice(pool_slice);
+                            port.free(offset);
                             return true;
                         }
                     }
+                    port.free(offset);
                     return false;
                 }
             }
             syscall::sleep_us(1000);
         }
+        port.free(offset);
         false
     }
 

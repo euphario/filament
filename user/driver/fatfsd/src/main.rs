@@ -167,14 +167,17 @@ impl FatfsDriver {
                     if cqe.status == io_status::OK as u16 {
                         if let Some(pool_slice) = port.pool_slice(offset, len) {
                             buf.copy_from_slice(pool_slice);
+                            port.free(offset);
                             return true;
                         }
                     }
+                    port.free(offset);
                     return false;
                 }
             }
             port.wait(10);
         }
+        port.free(offset);
         false
     }
 

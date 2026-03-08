@@ -111,7 +111,11 @@ pub fn print_vfs_error(cmd: &[u8], path: &[u8], e: userlib::vfs_client::VfsError
         VfsError::ReadOnly => b"read-only filesystem",
         VfsError::Timeout => b"timeout",
         VfsError::NotAvailable => b"vfsd not available",
-        _ => b"I/O error",
+        VfsError::PoolFull => b"pool full",
+        VfsError::RingFull => b"ring full",
+        VfsError::ConnectFailed => b"connect failed",
+        VfsError::TooMany => b"too many open files",
+        VfsError::IoError => b"I/O error",
     };
     crate::console::write(msg);
     println!();
